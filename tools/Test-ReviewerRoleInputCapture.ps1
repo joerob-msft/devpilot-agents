@@ -1190,17 +1190,26 @@ exit 91
         # The substitution must be provably confined: a global Replace that hit
         # nonce-shaped bytes elsewhere could mask a real difference, so count the
         # occurrences on both sides before rewriting anything.
+        # Under the v2 generalist contract the nonce is issued TWICE on purpose:
+        # once inside the wrapper-owned v1 scaffold (kept as a prompt aid) and
+        # once as the standalone challenge line the model is asked to copy. What
+        # matters for this proof is not the count but that the count is known and
+        # that every occurrence is rewritten, so the alignment below cannot mask a
+        # real difference between the two stimuli.
+        $expectedNonceSites = if ($env:DEVPILOT_REVIEWER_GENERALIST_CONTRACT -ceq 'v1') { 1 } else { 2 }
         $captureNonceCount = ($promptText.Split([string[]]@($captureNonce), [StringSplitOptions]::None).Length - 1)
         $acqNonceInCapture = ($promptText.Split([string[]]@($acqNonce), [StringSplitOptions]::None).Length - 1)
-        Check 'the capture nonce occurs exactly once in the captured prompt' ($captureNonceCount -eq 1) `
-            "occurrences=$captureNonceCount"
+        Check 'the capture nonce occurs at every contract-defined site in the captured prompt' (
+            $captureNonceCount -eq $expectedNonceSites) "occurrences=$captureNonceCount expected=$expectedNonceSites"
         Check 'the acquisition nonce does not already occur in the captured prompt' ($acqNonceInCapture -eq 0) `
             "occurrences=$acqNonceInCapture"
         $aligned = $promptText.Replace($captureNonce, $acqNonce)
         Check 'the capture nonce actually occurs in the captured prompt' ($aligned -cne $promptText)
+        Check 'aligning the nonce left no capture nonce behind' (
+            ($aligned.Split([string[]]@($captureNonce), [StringSplitOptions]::None).Length - 1) -eq 0)
         Check 'aligning the nonce changed the prompt length by exactly the nonce delta' (
-            ($aligned.Length - $promptText.Length) -eq ($acqNonce.Length - $captureNonce.Length)) `
-            "delta=$($aligned.Length - $promptText.Length) expected=$($acqNonce.Length - $captureNonce.Length)"
+            ($aligned.Length - $promptText.Length) -eq (($acqNonce.Length - $captureNonce.Length) * $expectedNonceSites)) `
+            "delta=$($aligned.Length - $promptText.Length) expected=$(($acqNonce.Length - $captureNonce.Length) * $expectedNonceSites)"
         Check 'captured prompt bytes equal the PR49 adapter prompt bytes' (
             (TextSha $aligned) -ceq [string]$acqManifest.digests.inputSha256) `
             "capture=$((TextSha $aligned).Substring(0,12)) acquisition=$(([string]$acqManifest.digests.inputSha256).Substring(0,12))"

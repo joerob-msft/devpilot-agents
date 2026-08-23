@@ -168,7 +168,15 @@
       },
     {
       "sha256": "188345f9fc878e9913281baa4cf901b43d806200d0c676b154a4656a70efe3c5",
-      "reason": "CURRENT and authoritative. Read the generalist answer under the v2 two-part response contract in addition to the v1 marker, seal the result into a signed response envelope that is persisted per attempt, and classify an answer whose nonce challenge line is absent as evidenceOnly - kept and counted, never voted."
+      "reason": "History only, superseded below. Read the generalist answer under the v2 two-part response contract in addition to the v1 marker, seal the result into a signed response envelope that is persisted per attempt, and classify an answer whose nonce challenge line is absent as evidenceOnly - kept and counted, never voted."
+    },
+    {
+      "sha256": "8d3ff78f94829f1ae01a2a7e34d84cbe5c768bbe7fe4043b1a2dd4274a4fea5d",
+      "reason": "History only, superseded below. Adversarial-review fixes to the v2 read: pass the run's effective -MaxFindings to the extractor and the envelope so the bound the prompt promises is the bound the parser enforces; re-validate the rebuilt marker against the real v1 schema so content v1 refuses is a retryable slip here instead of a lost cycle at the merged round trip; refuse the attempt when a v1 marker and an authenticated v2 payload disagree; label the rebuilt marker with its source contract and tier; and deny census credit when the sealed envelope did not reach disk."
+    },
+    {
+      "sha256": "0af3e6f72165210be1ee3a7e25ecbd14ea85a7402caeb80591c7a063ec1197e6",
+      "reason": "CURRENT and authoritative. Seal each response envelope under the startup-resolved run key rather than the state-directory key directly, so a state directory nested inside a readable root relocates the key instead of aborting the run, and record that key origin inside the sealed bytes."
     }
     ],
     "Invoke-ReviewerPullRequest": [
@@ -206,7 +214,11 @@
       },
     {
       "sha256": "000a76163440579cffc881e7cfc58e4ec48ff4237b2c6d555b60114015736928",
-      "reason": "CURRENT and authoritative. Record the v2 auth tier per attempt and per pass so an evidenceOnly reviewer appears in the census as a reviewer that answered, and make evidenceOnly terminal rather than spending a retry on evidence already in hand."
+      "reason": "History only, superseded below. Record the v2 auth tier per attempt and per pass so an evidenceOnly reviewer appears in the census as a reviewer that answered, and make evidenceOnly terminal rather than spending a retry on evidence already in hand."
+    },
+    {
+      "sha256": "7709cc16a632f22fc258db0d0db71719b37946288f26b20ce827162541705d99",
+      "reason": "CURRENT and authoritative. Require the sealed v2 response envelope to have reached disk before the pass counts in the census, and publish that persistence fact on the attempt-accounting record. A tier held only in the memory of a process about to exit is not evidence anyone can audit, and counting it would reproduce the same silent census gap in a new place."
     }
     ],
     "Write-ReviewerConventionSpecialistPreview": [

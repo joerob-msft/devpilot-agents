@@ -142,9 +142,11 @@ function New-TestEnvelope {
         [string]$UseNonce = $Nonce,
         [string]$RequestedModel = 'claude-opus-5',
         $ReportedModel = 'claude-opus-5',
-        [int]$PrId = 4242
+        [int]$PrId = 4242,
+        [int]$MaxFindingItems = $script:ReviewerResponseMaxFindingItemsV2
     )
     return New-ReviewerModelResponseEnvelopeV2 -Extraction $Extraction -RunId $RunId `
+        -MaxFindingItems $MaxFindingItems `
         -AttemptId $AttemptId -AttemptIndex $AttemptIndex -Nonce $UseNonce `
         -Binding @{
             organization    = 'contoso'
@@ -445,8 +447,12 @@ $overCapStream = New-Stream -Events @(
     (New-ResultEvent)
 )
 $overCap = Invoke-Extract -StdOut $overCapStream
-Assert-True ($overCap.ReasonCode -ceq 'payloadOverflow' -and $overCap.Terminal) `
-    "A findings array over the cap produced '$($overCap.ReasonCode)'."
+# Retryable, and named: reporting one finding too many is a model writing too
+# much in one place, which a fresh attempt can fix. Only an overflow with NO
+# field - a payload larger than this build can read at all - is terminal.
+Assert-True ($overCap.ReasonCode -ceq 'payloadOverflow' -and -not $overCap.Terminal -and
+    $overCap.Field -ceq 'findings') `
+    "A findings array over the cap produced '$($overCap.ReasonCode)' (field '$($overCap.Field)', terminal=$($overCap.Terminal))."
 
 # Over the per-field byte cap.
 $fatComment = 'x' * ($script:ReviewerResponseMaxFieldBytesV2 + 1)
@@ -983,5 +989,180 @@ Assert-True ($adapterNoEvents.ExtractionSource -ceq 'rawStdoutFallback') `
     'The offline adapter''s event-free output did not fall back to raw stdout.'
 Assert-True ($adapterNoEvents.AuthTier -ceq 'evidenceOnly') `
     'A raw-stdout fallback was allowed to authenticate.'
+
+# ======================================= 18. bounds parity with the v1 marker
+# Every accepted v2 finding is rebuilt into a v1-shaped marker and re-validated
+# under the v1 schema. If v2 accepted content v1 refuses, the refusal would land
+# several stages later - at the merged round trip, where it is neither retryable
+# nor attributable to the pass that caused it, and where it costs the WHOLE
+# cycle. So the v2 bounds must be no wider than v1's.
+
+$v1SchemaSource = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $repoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'), [ref]$null, [ref]$null)
+$v1SchemaFunc = $v1SchemaSource.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Get-ReviewerMarkerSchema'
+    }, $true) | Select-Object -First 1
+Assert-True ($null -ne $v1SchemaFunc) 'The v1 marker schema function could not be located to compare bounds against.'
+$script:ReviewerSeverities = @('critical', 'important', 'suggestion')
+# Lifted from the agent script rather than copied: a bound that drifts there and
+# not here would make this parity check quietly meaningless.
+. ([scriptblock]::Create($v1SchemaFunc.Extent.Text))
+
+$v1MarkerSchema = Get-ReviewerMarkerSchema -ExpectedProject 'Toolkit' -ExpectedNonce $Nonce -MaxFindingItems 12
+$v1FindingFields = $v1MarkerSchema.Fields['findings'].Item.Fields
+$v2PayloadSchema = Get-ReviewerResponsePayloadSchemaV2
+$v2FindingFields = $v2PayloadSchema.Fields['findings'].Item.Fields
+foreach ($pair in @(
+        @{ Key = 'filePath'; Where = 'findings' },
+        @{ Key = 'comment'; Where = 'findings' })) {
+    $v1Max = [int]$v1FindingFields[$pair.Key].MaxLength
+    $v2Max = [int]$v2FindingFields[$pair.Key].MaxLength
+    Assert-True ($v2Max -gt 0 -and $v2Max -le $v1Max) `
+        "The v2 bound for '$($pair.Key)' ($v2Max) is not within the v1 marker bound ($v1Max)."
+}
+Assert-True ([int]$v2PayloadSchema.Fields['summary'].MaxLength -le [int]$v1MarkerSchema.Fields['summary'].MaxLength) `
+    'The v2 summary bound is wider than the v1 marker summary bound.'
+
+$overLongComment = ('x' * ([int]$v1FindingFields['comment'].MaxLength + 1))
+$overLong = Invoke-Extract -StdOut (New-Stream -Events @(
+        (New-AssistantEvent -Content ("REVIEWER_NONCE_V2: $Nonce`nREVIEWER_PAYLOAD_V2: " +
+                (New-PayloadJson -Findings @((New-Finding -Comment $overLongComment))))),
+        (New-ResultEvent)))
+Assert-True ($overLong.AuthTier -ceq 'none') `
+    'A finding comment too long for the v1 marker was accepted by the v2 extractor.'
+Assert-True ($overLong.ReasonCode -ceq $script:ReviewerResponseReasonV2.PayloadOverflow) `
+    "An over-long comment was refused as '$($overLong.ReasonCode)' rather than a field overflow."
+Assert-True ($overLong.Field -ceq 'findings[0].comment') `
+    "An over-long comment was refused without naming the field (got '$($overLong.Field)')."
+Assert-True ($overLong.Retryable) `
+    'An over-long comment was made terminal; a length slip is exactly what a fresh attempt can fix.'
+
+# ================================== 19. the parser honours the promised cap
+# The prompt tells the model "report at most N findings", where N is the run's
+# effective -MaxFindings and may be up to 25. A parser that enforced a smaller,
+# hard-coded number would terminally refuse a model for obeying its brief.
+
+$thirteen = [object[]]@(1..13 | ForEach-Object { New-Finding -Line $_ -Comment "Finding $_." })
+$thirteenStream = New-Stream -Events @(
+    (New-AssistantEvent -Content ("REVIEWER_NONCE_V2: $Nonce`nREVIEWER_PAYLOAD_V2: " +
+            (New-PayloadJson -Findings $thirteen))),
+    (New-ResultEvent))
+$cappedLow = Invoke-Extract -StdOut $thirteenStream
+Assert-True ($cappedLow.ReasonCode -ceq $script:ReviewerResponseReasonV2.PayloadOverflow) `
+    'Thirteen findings were not refused under the default twelve-finding bound.'
+Assert-True ($cappedLow.Retryable -and $cappedLow.Field -ceq 'findings') `
+    'Reporting one finding too many was made terminal instead of a retryable, named-field slip.'
+$cappedHigh = Get-ReviewerModelResponseV2 -StdOutText $thirteenStream -ExpectedNonce $Nonce `
+    -ExpectedSourceCommit $Commit -MaxFindingItems 13
+Assert-True ($cappedHigh.AuthTier -ceq 'authenticated') `
+    'Thirteen findings were refused even though the run raised its bound to thirteen.'
+Assert-True ($cappedHigh.Findings.Count -eq 13) 'The raised bound lost findings.'
+$cappedEnvelope = New-TestEnvelope -Extraction $cappedHigh -MaxFindingItems 13
+Assert-True ([bool]$cappedEnvelope.derived.invariants.findingsWithinCap) `
+    'The sealed envelope recorded a cap violation for a payload inside the run''s own bound.'
+Assert-Throws -Action { Get-ReviewerModelResponseV2 -StdOutText $thirteenStream -ExpectedNonce $Nonce `
+        -ExpectedSourceCommit $Commit -MaxFindingItems 26 } -Pattern 'hard ceiling' `
+    'A finding bound above the wrapper''s own ceiling was accepted.'
+
+# ============================== 20. an unreadable restatement is still evidence
+# One payload that parses plus one that does not is a transcript saying two
+# things about one attempt. Dropping the unreadable one because the other
+# happened to parse would authenticate on the readable half.
+
+$mixed = Invoke-Extract -StdOut (New-Stream -Events @(
+        (New-AssistantEvent -Content ("REVIEWER_NONCE_V2: $Nonce`nREVIEWER_PAYLOAD_V2: " +
+                (New-PayloadJson -Findings @((New-Finding))) +
+                "`nREVIEWER_PAYLOAD_V2: {`"schemaVersion`": 2, `"reviewedSourceCommit`": ")),
+        (New-ResultEvent)))
+Assert-True ($mixed.AuthTier -ceq 'none') `
+    'A transcript with one readable and one unreadable payload authenticated on the readable half.'
+Assert-True ($mixed.ReasonCode -ceq $script:ReviewerResponseReasonV2.ConflictingPayload) `
+    "A mixed readable/unreadable pair was reported as '$($mixed.ReasonCode)', not a conflict."
+Assert-True (-not $mixed.Retryable) `
+    'A transcript that already says two things was made retryable; asking again cannot resolve it.'
+
+# ============================== 21. scanning is bounded in model-controlled text
+# The payload scan is per anchor and each scan is window-bounded, so without a
+# cap enforced AS anchors are found, N anchors over an L-character body is
+# O(N*L) work on text the model chooses. stdout is not size-capped and this runs
+# after the subprocess timeout has already been satisfied, so nothing else
+# bounds it.
+
+$anchorFlood = ("$script:ReviewerResponsePayloadPrefixV2 {`"a`": " + ('b' * 24) + "`n") * 4000
+$floodSw = [System.Diagnostics.Stopwatch]::StartNew()
+$floodOccurrences = Get-ReviewerResponsePayloadOccurrences -Text $anchorFlood
+$floodSw.Stop()
+Assert-True ($floodOccurrences.Count -le ($script:ReviewerResponseMaxOccurrencesV2 + 1)) `
+    "A 4000-anchor body produced $($floodOccurrences.Count) occurrences; the cap is $script:ReviewerResponseMaxOccurrencesV2."
+Assert-True ($floodSw.Elapsed.TotalSeconds -lt 5) `
+    "Scanning a 4000-anchor body took $([Math]::Round($floodSw.Elapsed.TotalSeconds, 1))s; the scan is not bounded."
+$floodExtract = Invoke-Extract -StdOut (New-Stream -Events @(
+        (New-AssistantEvent -Content ("REVIEWER_NONCE_V2: $Nonce`n" + $anchorFlood)),
+        (New-ResultEvent)))
+Assert-True ($floodExtract.AuthTier -ceq 'none') 'An anchor flood was allowed to authenticate.'
+
+# ================== 22. the published schema accepts what the builder produces
+# The schema document is what other repositories read. A real JSON-Schema
+# validator - not the structural walk above - has to accept the envelopes this
+# code actually writes, including the ones that record a refusal.
+
+$publishedSchema = Get-Content -LiteralPath (Join-Path $repoRoot 'src\Agents\reviewer\schemas\reviewer.result-envelope.v2.json') -Raw
+foreach ($case in @(
+        @{ Name = 'authenticated'; Extraction = $authenticated },
+        @{ Name = 'evidenceOnly'; Extraction = (Invoke-Extract -StdOut (New-Stream -Events @(
+                        (New-AssistantEvent -Content ("REVIEWER_PAYLOAD_V2: " + (New-PayloadJson))),
+                        (New-ResultEvent)))) },
+        @{ Name = 'terminal'; Extraction = $mixed },
+        @{ Name = 'modelSlip'; Extraction = (Invoke-Extract -StdOut (New-Stream -Events @(
+                        (New-AssistantEvent -Content 'I could not find the diff.'),
+                        (New-ResultEvent)))) })) {
+    $caseKey = New-TestRunKey
+    $doc = ConvertTo-Json -InputObject (Protect-ReviewerModelResponseEnvelope `
+            -Envelope (New-TestEnvelope -Extraction $case.Extraction) -RunKey $caseKey) -Depth 64 -Compress
+    $valid = $false
+    try { $valid = [bool](Test-Json -Json $doc -Schema $publishedSchema -ErrorAction Stop) }
+    catch { throw "The published v2 schema rejected a '$($case.Name)' envelope this code produces: $($_.Exception.Message)" }
+    Assert-True $valid "The published v2 schema rejected a '$($case.Name)' envelope this code produces."
+}
+
+# 23. The run key relocation. A state directory nested inside a readable root is
+# a placement problem, not a reason to lose the run: the fallback root must be a
+# real per-user location that passes the same refusal the state directory failed,
+# and the origin must survive into the sealed bytes so a consumer can tell the
+# two provenances apart.
+$fallbackRoot = Get-ReviewerResponseRunKeyFallbackRoot
+Assert-True ([IO.Path]::IsPathRooted($fallbackRoot)) 'The run key fallback root must be absolute.'
+$repoRootForKey = Split-Path -Parent $PSScriptRoot
+Assert-True (-not $fallbackRoot.StartsWith($repoRootForKey, [StringComparison]::OrdinalIgnoreCase)) `
+    'The run key fallback root must not sit inside the repository it protects.'
+$fallbackKey = Join-Path $fallbackRoot 'reviewer-response-abc.key'
+$fallbackCheck = Assert-ReviewerResponseRunKeyPath -KeyPath $fallbackKey -RepoRoot $repoRootForKey `
+    -ArtifactRoot (Join-Path $repoRootForKey 'artifacts') -ModelReadableRoots @($repoRootForKey)
+Assert-True ([string]$fallbackCheck.keyPath -ceq [IO.Path]::GetFullPath($fallbackKey)) `
+    'The accepted fallback key path must be reported back in full.'
+Assert-True ((Get-ReviewerResponseRunKeyFallbackRoot) -ceq $fallbackRoot) `
+    'The fallback root must be stable across calls; a per-run root would make substitution undetectable.'
+$nestedStateKey = Join-Path (Join-Path $repoRootForKey '_tmp_state') 'artifact-signing.key'
+$nestedRefused = $false
+try {
+    [void](Assert-ReviewerResponseRunKeyPath -KeyPath $nestedStateKey -RepoRoot $repoRootForKey `
+            -ArtifactRoot (Join-Path $repoRootForKey 'artifacts') -ModelReadableRoots @($repoRootForKey))
+}
+catch { $nestedRefused = $true }
+Assert-True $nestedRefused 'A key inside a model-readable root must still be refused.'
+$originKey = New-TestRunKey
+$originEnvelope = New-TestEnvelope -Extraction (Invoke-Extract -StdOut (New-Stream -Events @(
+                (New-AssistantEvent -Content ("$script:ReviewerResponseNoncePrefixV2 $Nonce`n" +
+                    "$script:ReviewerResponsePayloadPrefixV2 " + (New-PayloadJson))),
+                (New-ResultEvent))))
+$originEnvelope.run.runKeyOrigin = 'relocated'
+$originDoc = ConvertTo-Json -InputObject (Protect-ReviewerModelResponseEnvelope -Envelope $originEnvelope `
+        -RunKey $originKey) -Depth 64 -Compress
+Assert-True ([bool](Test-Json -Json $originDoc -Schema $publishedSchema -ErrorAction Stop)) `
+    'The published schema must accept a relocated key origin.'
+Assert-True ($originDoc.Contains('"runKeyOrigin":"relocated"')) `
+    'The key origin must be inside the sealed document, not alongside it.'
 
 Write-Host "Reviewer model response envelope v2 checks passed ($script:Checks checks)." -ForegroundColor Green

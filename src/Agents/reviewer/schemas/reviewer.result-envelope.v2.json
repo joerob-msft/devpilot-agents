@@ -49,7 +49,12 @@
         },
         "sessionId": { "type": ["string", "null"] },
         "processId": { "type": ["integer", "null"] },
-        "host": { "type": ["string", "null"] }
+        "host": { "type": ["string", "null"] },
+        "runKeyOrigin": {
+          "description": "Where the key that sealed this envelope lived. 'stateDirectory' is the normal case; 'relocated' means the agent's state directory sat inside a root the reviewed material can read, so the run key was minted under a per-user root instead. Consumers comparing seals across runs must treat the two origins as different key provenances.",
+          "type": "string",
+          "enum": ["stateDirectory", "relocated"]
+        }
       }
     },
     "nonce": {
@@ -171,7 +176,7 @@
         "reasonCode": { "$ref": "#/$defs/reasonCode" },
         "classification": {
           "type": "string",
-          "enum": ["accepted", "model", "environment"]
+          "enum": ["accepted", "modelSlip", "terminal", "environment"]
         },
         "retryable": {
           "description": "False for every terminal outcome. Overflow, conflicts, a forged nonce, a wrong commit and a vote contradiction are never retried: repeating them would only spend another attempt on the same refusal.",
@@ -422,9 +427,9 @@
                 "type": "string",
                 "enum": ["critical", "important", "suggestion"]
               },
-              "filePath": { "type": "string", "minLength": 1 },
-              "line": { "type": "integer", "minimum": 1 },
-              "comment": { "type": "string", "minLength": 1 }
+              "filePath": { "type": "string", "maxLength": 400 },
+              "line": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+              "comment": { "type": "string", "minLength": 1, "maxLength": 1200 }
             }
           }
         },
@@ -433,7 +438,7 @@
           "type": "string",
           "enum": ["approve", "approveWithSuggestions", "waitForAuthor", "none"]
         },
-        "summary": { "type": "string", "minLength": 1 }
+        "summary": { "type": "string", "maxLength": 1500 }
       }
     }
   }

@@ -82,6 +82,10 @@ $script:ReviewerResponseVotesV2 = [string[]]@('approve', 'approveWithSuggestions
 $script:ReviewerResponseMaxPayloadBytesV2 = 262144      # 256 KiB
 $script:ReviewerResponseMaxFieldBytesV2 = 8192          # per string field
 $script:ReviewerResponseMaxFindingItemsV2 = 12
+# The wrapper's own -MaxFindings ceiling. A run may raise its finding bound this
+# far; anything above it is refused before a model is launched, under v1 and v2
+# alike, so the two contracts admit exactly the same legal answers.
+$script:ReviewerResponseMaxFindingCeilingV2 = 25
 $script:ReviewerResponseMaxSummaryBytesV2 = 6144
 $script:ReviewerResponseMaxOccurrencesV2 = 16           # retained nonce/payload occurrences
 $script:ReviewerResponseMaxAssistantMessagesV2 = 512
@@ -249,14 +253,20 @@ function Get-ReviewerResponsePayloadSchemaV2 {
                     Keys   = [string[]]@($script:ReviewerResponseFindingKeysV2)
                     Fields = @{
                         severity = @{ Type = 'enum'; Values = [string[]]@($script:ReviewerResponseSeveritiesV2) }
-                        filePath = @{ Type = 'string'; MaxBytes = 1200; AllowEmpty = $true; Pattern = '^(/[^\\:*?"<>|]*)?$' }
+                        # The character bounds match the v1 marker schema exactly.
+                        # A byte bound alone is not enough: the accepted content is
+                        # later rebuilt into a v1 marker and re-parsed under v1's
+                        # own limits, so anything v2 accepts that v1 refuses would
+                        # be discarded a stage later, taking the whole cycle with
+                        # it rather than one retryable attempt.
+                        filePath = @{ Type = 'string'; MaxLength = 400; MaxBytes = 1200; AllowEmpty = $true; Pattern = '^(/[^\\:*?"<>|]*)?$' }
                         line     = @{ Type = 'int'; Min = 0; Max = 1000000 }
-                        comment  = @{ Type = 'string'; MaxBytes = $MaxFieldBytes }
+                        comment  = @{ Type = 'string'; MaxLength = 1200; MaxBytes = $MaxFieldBytes }
                     }
                 }
             }
             recommendedVote      = @{ Type = 'enum'; Values = [string[]]@($script:ReviewerResponseVotesV2) }
-            summary              = @{ Type = 'string'; MaxBytes = $MaxSummaryBytes; AllowEmpty = $true }
+            summary              = @{ Type = 'string'; MaxLength = 1500; MaxBytes = $MaxSummaryBytes; AllowEmpty = $true }
         }
     }
 }
@@ -311,9 +321,15 @@ function Test-ReviewerResponseFieldValue {
             }
             # Control characters would be handed straight to a provider as a
             # thread location or body, so they are refused here rather than
-            # sanitized somewhere further downstream.
-            if ($text -match '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]') {
+            # sanitized somewhere further downstream. TAB, CR and LF are refused
+            # with the rest: the v1 marker schema this content is later rebuilt
+            # into refuses them, and a value accepted here but rejected there
+            # would lose the whole cycle instead of one retryable attempt.
+            if ($text -match '[\x00-\x1f\x7f]') {
                 return (& $bad $script:ReviewerResponseReasonV2.PayloadSchemaInvalid)
+            }
+            if ($Spec.ContainsKey('MaxLength') -and $text.Length -gt [int]$Spec.MaxLength) {
+                return (& $bad $script:ReviewerResponseReasonV2.PayloadOverflow)
             }
             if ($Spec.ContainsKey('Pattern') -and $text -notmatch [string]$Spec.Pattern) {
                 return (& $bad $script:ReviewerResponseReasonV2.PayloadSchemaInvalid)
@@ -680,21 +696,34 @@ function Get-ReviewerResponsePayloadOccurrences {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
         [int]$ScanWindowChars = $script:ReviewerResponseScanWindowCharsV2,
-        [int]$MaxPayloadBytes = $script:ReviewerResponseMaxPayloadBytesV2
+        [int]$MaxPayloadBytes = $script:ReviewerResponseMaxPayloadBytesV2,
+        [int]$MaxOccurrences = $script:ReviewerResponseMaxOccurrencesV2
     )
 
     $occurrences = [System.Collections.Generic.List[object]]::new()
     $body = [string]$Text
     $anchorPattern = '(?m)^[ \t]*' + [regex]::Escape($script:ReviewerResponsePayloadPrefixV2)
+    # Scanning is per anchor and each scan is window-bounded, so N anchors over
+    # an L-character transcript is O(N*L) work on text the model controls. The
+    # occurrence cap is therefore enforced HERE, as anchors are found, and not
+    # after the whole unit has already been scanned: a cap that is checked once
+    # the expensive part is over bounds the answer, not the work.
+    $scanned = 0
     foreach ($anchor in [regex]::Matches($body, $anchorPattern)) {
+        if ($occurrences.Count -gt $MaxOccurrences) { break }
+        if ($scanned -ge $ScanWindowChars) {
+            [void]$occurrences.Add(@{ Text = ''; Bytes = 0; Status = $script:ReviewerResponseReasonV2.PayloadOverflow })
+            break
+        }
         $searchStart = $anchor.Index + $anchor.Length
         if ($searchStart -ge $body.Length) {
             [void]$occurrences.Add(@{ Text = ''; Bytes = 0; Status = $script:ReviewerResponseReasonV2.TruncatedPayload })
             continue
         }
-        $windowEnd = [Math]::Min($body.Length, $searchStart + $ScanWindowChars)
+        $windowEnd = [Math]::Min($body.Length, $searchStart + ($ScanWindowChars - $scanned))
         $jsonStart = $body.IndexOf('{', $searchStart, $windowEnd - $searchStart)
         if ($jsonStart -lt 0) {
+            $scanned += ($windowEnd - $searchStart)
             [void]$occurrences.Add(@{ Text = ''; Bytes = 0; Status = $script:ReviewerResponseReasonV2.MissingPayload })
             continue
         }
@@ -702,7 +731,8 @@ function Get-ReviewerResponsePayloadOccurrences {
         $inString = $false
         $escaped = $false
         $jsonEnd = -1
-        $limit = [Math]::Min($body.Length, $jsonStart + $ScanWindowChars)
+        $windowLeft = $ScanWindowChars - $scanned
+        $limit = [Math]::Min($body.Length, $jsonStart + $windowLeft)
         for ($i = $jsonStart; $i -lt $limit; $i++) {
             $ch = $body[$i]
             if ($inString) {
@@ -718,12 +748,13 @@ function Get-ReviewerResponsePayloadOccurrences {
                 if ($depth -eq 0) { $jsonEnd = $i; break }
             }
         }
+        $scanned += ($limit - $jsonStart)
         if ($jsonEnd -lt 0) {
             # Why the object never closed decides whether retrying can help. If
             # the scan ran out of WINDOW the object is larger than this build
             # will ever accept, which is overflow and terminal. If it ran out of
             # TEXT the stream was cut short, which is truncation and retryable.
-            $hitWindowLimit = (($limit - $jsonStart) -ge $ScanWindowChars)
+            $hitWindowLimit = (($limit - $jsonStart) -ge $windowLeft)
             $status = $script:ReviewerResponseReasonV2.TruncatedPayload
             if ($hitWindowLimit) { $status = $script:ReviewerResponseReasonV2.PayloadOverflow }
             [void]$occurrences.Add(@{ Text = ''; Bytes = ($limit - $jsonStart); Status = $status })
@@ -851,12 +882,22 @@ function Get-ReviewerModelResponseV2 {
         [Parameter(Mandatory)][string]$ExpectedNonce,
         [Parameter(Mandatory)][string]$ExpectedSourceCommit,
         [hashtable]$Schema,
+        [int]$MaxFindingItems = $script:ReviewerResponseMaxFindingItemsV2,
         [int]$MaxOccurrences = $script:ReviewerResponseMaxOccurrencesV2,
         [int]$MaxPayloadBytes = $script:ReviewerResponseMaxPayloadBytesV2,
         [int]$ScanWindowChars = $script:ReviewerResponseScanWindowCharsV2
     )
 
-    if (-not $Schema) { $Schema = Get-ReviewerResponsePayloadSchemaV2 }
+    # The finding cap is a RUN parameter, not a module constant. The wrapper's
+    # own -MaxFindings reaches 25, and a v2 extractor that always capped at its
+    # default 12 would make a 13-finding answer that v1 accepts terminal under
+    # v2 - a new way to lose a complete review, which is the opposite of why
+    # this contract exists.
+    if ($MaxFindingItems -lt 0 -or $MaxFindingItems -gt $script:ReviewerResponseMaxFindingCeilingV2) {
+        throw ("The v2 extractor was asked for a finding bound of $MaxFindingItems; the hard ceiling is " +
+            "$script:ReviewerResponseMaxFindingCeilingV2.")
+    }
+    if (-not $Schema) { $Schema = Get-ReviewerResponsePayloadSchemaV2 -MaxFindingItems $MaxFindingItems }
     if ($ExpectedNonce -notmatch '^[0-9a-f]{8,128}$') {
         throw "The v2 extractor was given a malformed expected nonce."
     }
@@ -899,18 +940,30 @@ function Get-ReviewerModelResponseV2 {
     $nonceValues = [System.Collections.Generic.List[string]]::new()
     $payloadTexts = [System.Collections.Generic.List[string]]::new()
     $payloadStatuses = [System.Collections.Generic.List[string]]::new()
+    # Whether any single assistant message carried the challenge line AND the
+    # payload, challenge first. Without this, a nonce echoed early in a reply
+    # would authenticate a payload produced independently later in that same
+    # reply, which is precisely the binding the challenge is supposed to make.
+    $nonceBoundToPayload = $false
     foreach ($unit in $units) {
         $unitNonces = Get-ReviewerResponseNonceOccurrences -Text $unit
         foreach ($value in $unitNonces) {
             [void]$nonceValues.Add($value)
         }
         $unitPayloads = Get-ReviewerResponsePayloadOccurrences -Text $unit `
-            -ScanWindowChars $ScanWindowChars -MaxPayloadBytes $MaxPayloadBytes
+            -ScanWindowChars $ScanWindowChars -MaxPayloadBytes $MaxPayloadBytes -MaxOccurrences $MaxOccurrences
+        $unitAcceptedPayloads = 0
         foreach ($occurrence in $unitPayloads) {
             [void]$payloadStatuses.Add([string]$occurrence.Status)
             if ([string]$occurrence.Status -ceq $script:ReviewerResponseReasonV2.Ok) {
                 [void]$payloadTexts.Add([string]$occurrence.Text)
+                $unitAcceptedPayloads++
             }
+        }
+        if ($unitAcceptedPayloads -gt 0 -and $unitNonces.Count -gt 0) {
+            $nonceAt = $unit.IndexOf($script:ReviewerResponseNoncePrefixV2, [StringComparison]::Ordinal)
+            $payloadAt = $unit.IndexOf($script:ReviewerResponsePayloadPrefixV2, [StringComparison]::Ordinal)
+            if ($nonceAt -ge 0 -and $payloadAt -gt $nonceAt) { $nonceBoundToPayload = $true }
         }
     }
 
@@ -967,6 +1020,17 @@ function Get-ReviewerModelResponseV2 {
             'No assistant message carried a v2 payload.' 'payload')
     }
 
+    # An unreadable restatement is still a restatement. Dropping it because some
+    # OTHER occurrence parsed would mean a transcript that says two things about
+    # one attempt authenticates on the half that happens to be readable, which is
+    # precisely the unresolvable case the agreement rule exists for.
+    $unreadable = [object[]]@($payloadStatuses | Where-Object { $_ -cne $script:ReviewerResponseReasonV2.Ok })
+    if ($unreadable.Count -gt 0) {
+        return (& $fail $script:ReviewerResponseReasonV2.ConflictingPayload $false 'terminal' `
+            ("One v2 payload occurrence parsed and $($unreadable.Count) other occurrence(s) did not " +
+                "($($unreadable[0])); a transcript that states one attempt twice must state it identically.") 'payload')
+    }
+
     # Agreement across occurrences, by canonical rendering rather than raw
     # bytes, so a compact copy and a pretty copy of ONE answer agree.
     $canonical = $null
@@ -1001,7 +1065,13 @@ function Get-ReviewerModelResponseV2 {
 
     $validated = Test-ReviewerResponsePayloadV2 -Parsed $parsedPayload -Schema $Schema
     if (-not $validated.Ok) {
-        $retryable = ([string]$validated.Reason -cne $script:ReviewerResponseReasonV2.PayloadOverflow)
+        # An overflow of a NAMED field or item is a model writing too much in one
+        # place - the same emission slip v1 classifies as retryable, and exactly
+        # what a fresh attempt with a fresh nonce can fix. An overflow with no
+        # field is transport-level: the payload itself is larger than this build
+        # will ever read, and no retry changes that.
+        $overflow = ([string]$validated.Reason -ceq $script:ReviewerResponseReasonV2.PayloadOverflow)
+        $retryable = (-not $overflow) -or ([string]$validated.Field -ne '')
         $classification = if ($retryable) { 'modelSlip' } else { 'terminal' }
         return (& $fail ([string]$validated.Reason) $retryable $classification ([string]$validated.Detail) ([string]$validated.Field))
     }
@@ -1023,9 +1093,13 @@ function Get-ReviewerModelResponseV2 {
     # well-formed its payload.
     $tier = $script:ReviewerResponseAuthTierV2.EvidenceOnly
     $detail = 'The payload is valid and correctly bound but the attempt emitted no nonce challenge line.'
-    if ($nonceValues.Count -gt 0 -and $authorityClass -ceq 'full') {
+    if ($nonceValues.Count -gt 0 -and $authorityClass -ceq 'full' -and $nonceBoundToPayload) {
         $tier = $script:ReviewerResponseAuthTierV2.Authenticated
         $detail = ''
+    }
+    elseif ($nonceValues.Count -gt 0 -and $authorityClass -ceq 'full') {
+        $detail = ('The nonce challenge and the payload never appeared together in one assistant message, ' +
+            'challenge first, so the challenge is not bound to this answer.')
     }
     elseif ($nonceValues.Count -gt 0) {
         $detail = 'The nonce challenge was present but arrived on raw stdout, which this build cannot attribute to the model.'
@@ -1076,6 +1150,28 @@ function Test-ReviewerResponseNoNonceReinjection {
 # ---------------------------------------------------------------------------
 # Run-key path startup self-check
 # ---------------------------------------------------------------------------
+
+function Get-ReviewerResponseRunKeyFallbackRoot {
+    <#
+        Where a v2 run key goes when the agent's state directory sits inside a
+        root the reviewed material can read.
+
+        This is a per-user location, never a temp directory: a key regenerated
+        every run would make cross-run substitution undetectable, because every
+        envelope would verify under whatever key happened to exist when it was
+        checked. Stability is the property that makes the seal worth taking.
+    #>
+    param()
+
+    $local = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    if ([string]::IsNullOrWhiteSpace($local)) {
+        $local = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    }
+    if ([string]::IsNullOrWhiteSpace($local)) {
+        throw 'No per-user root is available to hold a v2 response run key outside the readable roots.'
+    }
+    return (Join-Path (Join-Path (Join-Path $local 'devpilot') 'reviewer') 'run-keys')
+}
 
 function Assert-ReviewerResponseRunKeyPath {
     <#
@@ -1202,7 +1298,8 @@ function New-ReviewerModelResponseEnvelopeV2 {
         [Parameter(Mandatory)][hashtable]$Hashes,
         [hashtable]$Process = @{},
         [hashtable]$Timings = @{},
-        [hashtable]$Session = @{}
+        [hashtable]$Session = @{},
+        [int]$MaxFindingItems = $script:ReviewerResponseMaxFindingItemsV2
     )
 
     $guard = Test-ReviewerResponseNoNonceReinjection -Extraction $Extraction -ExpectedNonce $Nonce
@@ -1277,6 +1374,7 @@ function New-ReviewerModelResponseEnvelopeV2 {
             sessionId    = (& $sessionValue 'sessionId' $null)
             processId    = (& $sessionValue 'processId' $null)
             host         = (& $sessionValue 'host' $null)
+            runKeyOrigin = [string](& $sessionValue 'runKeyOrigin' 'stateDirectory')
         }
         nonce         = [string]$Nonce
         binding       = [pscustomobject][ordered]@{
@@ -1328,7 +1426,7 @@ function New-ReviewerModelResponseEnvelopeV2 {
             invariants      = [pscustomobject][ordered]@{
                 voteConsistent      = [bool]$voteCheck.Ok
                 commitBound         = [bool]$commitBound
-                findingsWithinCap   = ([int]$findings.Count -le $script:ReviewerResponseMaxFindingItemsV2)
+                findingsWithinCap   = ([int]$findings.Count -le $MaxFindingItems)
                 payloadClosed       = [bool]$payloadClosed
                 nonceNotReinjected  = $true
             }
@@ -1503,6 +1601,11 @@ function Read-ReviewerModelResponseEnvelope {
     param(
         [Parameter(Mandatory)]$Envelope,
         [Parameter(Mandatory)][byte[]]$RunKey,
+        [AllowNull()]$ExpectedRunId = $null,
+        [AllowNull()]$ExpectedAttemptId = $null,
+        [AllowNull()]$ExpectedNonce = $null,
+        [AllowNull()]$ExpectedPrId = $null,
+        [AllowNull()]$ExpectedSourceCommit = $null,
         [switch]$AllowUnsealed
     )
 
@@ -1524,6 +1627,45 @@ function Read-ReviewerModelResponseEnvelope {
         if (-not (Test-ReviewerModelResponseEnvelopeSeal -Envelope $Envelope -RunKey $RunKey)) {
             throw 'The v2 result envelope failed its seal; downstream consumes verified envelopes only.'
         }
+    }
+
+    # A valid seal proves the bytes were written by something holding the run
+    # key. It does NOT prove they describe the attempt in front of us: the key
+    # outlives a run, so a whole intact envelope from an earlier run, attempt,
+    # pull request, or commit verifies perfectly. The caller therefore states
+    # what it expects, and a mismatch is a refusal rather than a silent
+    # substitution.
+    $expectations = [ordered]@{
+        'run.runId'           = @($ExpectedRunId, [string]$Envelope.run.runId)
+        'run.attemptId'       = @($ExpectedAttemptId, [string]$Envelope.run.attemptId)
+        'nonce'               = @($ExpectedNonce, [string]$Envelope.nonce)
+        'binding.prId'        = @($ExpectedPrId, [string]$Envelope.binding.prId)
+        'binding.sourceCommit' = @($ExpectedSourceCommit, [string]$Envelope.binding.sourceCommit)
+    }
+    foreach ($name in [string[]]@($expectations.Keys)) {
+        $expected = $expectations[$name][0]
+        if ($null -eq $expected) { continue }
+        if ([string]$expected -cne [string]$expectations[$name][1]) {
+            throw ("A v2 result envelope was presented for $name '$expected' but describes " +
+                "'$($expectations[$name][1])'. A sealed envelope from another attempt is not this attempt.")
+        }
+    }
+
+    # Capabilities are rederived from the tier rather than believed. The stored
+    # booleans are sealed, so a mismatch means the writer and this reader
+    # disagree about what a tier permits - which is exactly the drift that would
+    # let a future edit hand `evidenceOnly` a vote.
+    $tier = [string](Get-ReviewerResponseProperty -Object $Envelope -Name 'authTier' -Default '')
+    $eligible = Test-ReviewerModelResponseEligible -AuthTier $tier
+    $capabilities = $Envelope.capabilities
+    foreach ($name in [string[]]@('mayVote', 'mayMarkReviewed', 'mayBecomeEligible', 'mayReconcile', 'mayDeliver')) {
+        if ([bool](Get-ReviewerResponseProperty -Object $capabilities -Name $name -Default $false) -ne $eligible) {
+            throw "A v2 result envelope claims '$name' inconsistent with auth tier '$tier'."
+        }
+    }
+    if ([bool](Get-ReviewerResponseProperty -Object $capabilities -Name 'mayCountInCensus' -Default $false) -ne
+        ($tier -cne $script:ReviewerResponseAuthTierV2.None)) {
+        throw "A v2 result envelope claims a census capability inconsistent with auth tier '$tier'."
     }
     return $Envelope
 }
