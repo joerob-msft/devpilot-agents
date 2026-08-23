@@ -216,8 +216,10 @@ when the agent loads. Thread completeness is then **accounted** rather than prob
 - more threads than the operator's cap → `CE406`;
 - a list that reaches the page the reviewer asks for → `CE408`, because a full page is what a
   truncated list and a complete-and-exactly-full list both look like;
-- a request whose `maxThreads` is above that page → `CE408` at validation, since it declares a
-  ceiling this build could never watch being crossed.
+- a request whose `maxThreads` is above that page → `CE113` at validation, since it declares a
+  ceiling this build could never watch being crossed. It is a request-band code because the
+  operator fixes it by editing the request; `CE408` means the subject itself is too large and no
+  edit to the request helps.
 
 The two identity reads are the same question asked twice, and the second one is **declared in
 the plan before the first read is issued**, carrying `DuplicateOf` naming the first. That is
@@ -426,10 +428,10 @@ process exit code, because an exit code is one byte and the catalogue is not.
 
 | Range | Exit | Refuses |
 | --- | --- | --- |
-| `CE1xx` | 2 | The request: schema, version, missing or extra field, unreadable file, BOM, path shape, toolkit head or ref drift. |
+| `CE1xx` | 2 | The request: schema, version, missing or extra field, unreadable file, BOM, path shape, toolkit head or ref drift, a `maxThreads` above the page the reviewer's own thread read asks for (`CE113`). |
 | `CE2xx` | 3 | The subject: pull request drift, draft, inactive; repository or project id **shape** mismatch; branch mismatch; the raw provider shape where the reduced contract shape is required (`CE203`); a change set that arrived as a singleton object (`CE210`); a toolkit working tree carrying tracked modifications (`CE213`). |
 | `CE3xx` | 4 | The capture: a planned read never performed (`CE300`), a read performed but never planned or performed more times than planned (`CE301`), a MIME outside the allow-list (`CE302`), a resource URI that did not match exactly (`CE304`), a payload count outside its bound (`CE305`), a byte-order mark (`CE306`), a replay that has no record of a planned read and will not reach the provider for it (`CE307`), a write or a write authorization in a replay (`CE308`), an undeclared duplicate request key or a re-read that asks a different question (`CE309`), a rule section drifted from its pin (`CE310`). |
-| `CE4xx` | 5 | The census and coverage: ordering, duplicates, path traversal, reparse points, the changed-file cap (`CE402`), the thread cap (`CE406`), the byte cap, a right-hand path whose content was not stored or a content coverage under the declared floor (`CE403`), a span that runs past the end of the file it describes (`CE404`), an empty census (`CE407`), target ref or config mismatch. |
+| `CE4xx` | 5 | The census and coverage: ordering, duplicates, path traversal, reparse points, the changed-file cap (`CE402`), the thread cap (`CE406`), a thread list that reaches the reviewer's own page and so cannot be proven complete (`CE408`), the byte cap, a right-hand path whose content was not stored or a content coverage under the declared floor (`CE403`), a span that runs past the end of the file it describes (`CE404`), an empty census (`CE407`), target ref or config mismatch. |
 | `CE5xx` | 6 | The package: a staging or publish failure, a package that is not read-only including its own inventory and seal (`CE502`), an inventoried file whose bytes changed, an unlisted file, or a declared file that is absent (`CE503`), a reparse point (`CE505`), an inventory path that is not a plain relative path inside the package (`CE506`), a seal that does not authenticate. |
 | `CE6xx` | 7 | The preflight: the coordinator did not reach its target (`CE600`), or it consumed a slot, a model or a launch token (`CE601`). |
 | `CE7xx` | 10 | The execution plan: declared at a version that does not carry it (`CE700`), the wrong slot count or the wrong names in the wrong order (`CE701`), colliding slot state directories or terminal artifacts (`CE702`), a reviewer script that is absent or drifted from its declared digest (`CE703`), a model outside the shared registry (`CE704`), a generalist pair that is not the derived pair or a specialist that is one of the generalists (`CE705`), models the reviewer configuration does not configure (`CE706`), any delivery capability enabled or a non-zero provider write budget (`CE707`), reconciliation disabled or requiring a run count that is not the slot count (`CE708`), a slot count that is not the planned run count (`CE709`), a per-call timeout that outlives its slot (`CE710`), an output path outside the preparation root or a derived launch authorization that landed inside the sealed package (`CE711`), a model-start bound that is not a positive finite estimate (`CE712`), a bound that could not be derived or that does not bind this request (`CE714`), a slots-carrying entry with no declared run set and launch authorization to run under (`CE715`), and a request that names a launch authorization the builder derives for itself (`CE716`). |

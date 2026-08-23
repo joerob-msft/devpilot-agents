@@ -1034,9 +1034,24 @@ Assert-CohortEntry -Name 'the planned thread read is the shared thread-list requ
         (@($sharedThreadRequest.Arguments.Keys | Where-Object {
                     [string]$threadPlanRead.Arguments[$_] -cne [string]$sharedThreadRequest.Arguments[$_]
                 }).Count -eq 0))
+# Built again under a cap that is NOT the production page, so "asks for the page"
+# and "asks for the cap plus one" are two different numbers and the assertion can
+# actually tell them apart. Under a 200-thread fixture the two coincide at the
+# first conjunct and the check proves nothing.
+$offCapPlan = @(Get-ReviewerCohortEntryIdentityReadPlan -Request ([pscustomobject]@{
+            Project = 'Contoso'; RepositoryName = 'toolkit'; RepositoryId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            PullRequestId = 1; TargetRefName = 'refs/heads/main'; MaxThreads = 50; MaxChangedFiles = 300
+        }))
+$offCapThreadRead = @($offCapPlan | Where-Object { $_.Id -ceq 'threads' })[0]
 Assert-CohortEntry -Name 'the planned thread read asks for the production page, not the declared cap plus one' `
     -Condition ([int]$threadPlanRead.Arguments['top'] -eq (Get-ReviewerThreadListTop) -and
-        [int]$threadPlanRead.Arguments['top'] -ne 201)
+        [int]$offCapThreadRead.Arguments['top'] -eq (Get-ReviewerThreadListTop) -and
+        [int]$offCapThreadRead.Arguments['top'] -ne 51 -and
+        [int]$offCapThreadRead.Arguments['top'] -ne 50)
+# and the change reads, whose cap IS the builder's own, still move with it.
+Assert-CohortEntry -Name 'the change reads still track the declared cap the thread read ignores' `
+    -Condition (@($offCapPlan | Where-Object { $_.Arguments['action'] -ceq 'get_changes' } |
+            Where-Object { [int]$_.Arguments['top'] -ne 301 }).Count -eq 0)
 # The value itself, pinned. 200 is what the shipping fact policy caps threads at
 # and what the live cycle asks for; a change to either is a change to the corpus
 # every existing entry was built under, so it is not allowed to happen quietly.
@@ -1046,18 +1061,105 @@ Assert-CohortEntry -Name 'the shared thread page is the production 200' `
 # The live agent must not carry its own copy of the vector. Two copies is how the
 # first one drifted: the reviewer's literal and the builder's cap+1 were each
 # individually defensible and jointly fatal.
-Assert-CohortEntry -Name 'the live reviewer builds its thread reads through the shared constructor only' `
+#
+# Read the agent's syntax tree rather than its text. A text guard can only ban
+# the byte shape of the code that was already deleted; every plausible way to
+# reintroduce the read - different quoting, a hoisted variable, the tool name
+# behind the accessor - writes different bytes and the same tree. This walks
+# every Invoke-AgentMcpTool call and refuses any that names the thread tool for
+# a list action. The action=create write elsewhere in the file is a different
+# contract; its arguments are assembled in a variable, so the walk resolves the
+# variable against the hashtable literals assigned to it inside the same
+# function rather than waving through anything it cannot read inline.
+$reviewerAgentAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $repoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1'), [ref]$null, [ref]$null)
+$threadListActionInHashtable = {
+    param($hashtableAst)
+    foreach ($pair in $hashtableAst.KeyValuePairs) {
+        if ([string]$pair.Item1.Extent.Text -notmatch 'action') { continue }
+        if ([string]$pair.Item2.Extent.Text -match 'list') { return $true }
+    }
+    return $false
+}
+$inlineThreadListReads = @(
+    $reviewerAgentAst.FindAll({
+            param($node)
+            if ($node -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
+            if ([string]$node.GetCommandName() -cne 'Invoke-AgentMcpTool') { return $false }
+            $elements = @($node.CommandElements)
+            $named = @{}
+            for ($i = 0; $i -lt $elements.Count - 1; $i++) {
+                if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst]) {
+                    $named[[string]$elements[$i].ParameterName] = $elements[$i + 1]
+                }
+            }
+            $nameAst = $named['Name']
+            if ($nameAst -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
+            if ([string]$nameAst.Value -cne (Get-ReviewerThreadListToolName)) { return $false }
+            return $true
+        }, $true) |
+        Where-Object {
+            $elements = @($_.CommandElements)
+            $argumentsAst = $null
+            for ($i = 0; $i -lt $elements.Count - 1; $i++) {
+                if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
+                    [string]$elements[$i].ParameterName -eq 'Arguments') { $argumentsAst = $elements[$i + 1] }
+            }
+            if ($argumentsAst -is [System.Management.Automation.Language.HashtableAst]) {
+                return (& $threadListActionInHashtable $argumentsAst)
+            }
+            if ($argumentsAst -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $true }
+            $scope = $_
+            while ($null -ne $scope -and
+                $scope -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $scope = $scope.Parent }
+            if ($null -eq $scope) { return $true }
+            $variableName = [string]$argumentsAst.VariablePath.UserPath
+            $seeded = @($scope.FindAll({
+                        param($inner)
+                        if ($inner -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { return $false }
+                        if ($inner.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
+                        return ([string]$inner.Left.VariablePath.UserPath -eq $variableName)
+                    }, $true) |
+                    ForEach-Object { $_.Right.Find({
+                                param($inner) $inner -is [System.Management.Automation.Language.HashtableAst]
+                            }, $true) } |
+                    Where-Object { $null -ne $_ })
+            if ($seeded.Count -eq 0) { return $true }
+            return (@($seeded | Where-Object { & $threadListActionInHashtable $_ }).Count -gt 0)
+        })
+Assert-CohortEntry -Name "the live reviewer builds its thread reads through the shared constructor only ($($inlineThreadListReads.Count) inline)" `
     -Condition (
         ([regex]::Matches($reviewerAgentBody, 'New-ReviewerThreadListRequest\s+-Project').Count -ge 2) -and
-        ($reviewerAgentBody -cnotmatch '(?m)^\s*.*repo_pull_request_thread"\s+-Arguments\s*@\{'))
-# and neither may the builder. The literal is allowed in exactly one function.
+        ($inlineThreadListReads.Count -eq 0))
+# and neither may the builder. Counted, not shape-matched: any new mention moves
+# the number whatever quotes it wears. CohortEntryEvidence.ps1 keeps exactly one,
+# in the prose above the read plan; the builder names it nowhere.
 Assert-CohortEntry -Name 'the builder restates neither the thread tool name nor its page size' `
     -Condition (
-        ($evidenceBody -cnotmatch "'repo_pull_request_thread'") -and
-        ($evidenceBody -cnotmatch '(?m)top\s*=\s*\(\$Request\.MaxThreads') -and
-        ($builderBody -cnotmatch "'repo_pull_request_thread'"))
-Assert-CohortEntry -Name 'the shared thread page size is written down exactly once' `
-    -Condition ([regex]::Matches($sourceTransportBody, '(?m)^\s*return\s+200\s*$').Count -eq 1)
+        ([regex]::Matches($evidenceBody, 'repo_pull_request_thread').Count -eq 1) -and
+        ([regex]::Matches($builderBody, 'repo_pull_request_thread').Count -eq 0) -and
+        ($evidenceBody -cnotmatch '(?m)top\s*=\s*\(?\s*\$Request\.MaxThreads'))
+# "Exactly once" means across every file that could author it, not just inside
+# the one that does. A restated page in the agent or the builder is the failure
+# this whole change exists to prevent, so that is where it is looked for.
+$threadPageRestatements = 0
+foreach ($restatementBody in @($reviewerAgentBody, $evidenceBody, $builderBody)) {
+    $threadPageRestatements += [regex]::Matches($restatementBody, '\btop\s*=\s*200\b').Count
+}
+Assert-CohortEntry -Name "the shared thread page size is written down exactly once ($threadPageRestatements restatements)" `
+    -Condition ($threadPageRestatements -eq 0 -and
+        [regex]::Matches($sourceTransportBody, '(?m)^\s*return\s+200\b').Count -eq 1)
+# The two thread ceilings are different failures with opposite operator answers -
+# "edit maxThreads in your request" versus "this subject is too large to build an
+# entry from" - so they carry different codes and each is raised in exactly one
+# band. Collapsing them would leave callers, which match on the code, unable to
+# tell a fixable request from an unbuildable subject.
+Assert-CohortEntry -Name 'the request thread ceiling and the full-page evidence carry different codes' `
+    -Condition (
+        ($evidenceBody -cmatch "-Code\s+'CE113'") -and
+        ($evidenceBody -cnotmatch "-Code\s+'CE408'") -and
+        ($builderBody -cmatch "-Code\s+'CE408'") -and
+        ($builderBody -cnotmatch "-Code\s+'CE113'"))
 Assert-CohortEntry -Name 'the identity plan reads the repository by GUID under repositoryNameOrId' `
     -Condition (@($plainPlan | Where-Object { $_.Tool -ceq 'repo_repository' })[0].Arguments['repositoryNameOrId'] -ceq 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
 Assert-CohortEntry -Name 'the identity plan reads the pull request by repository NAME' `
@@ -1806,8 +1908,10 @@ Invoke-CohortEntryCase -Name 'a corpus recording the thread list for another pul
 
 # The cap policy, stated where it is decided. The read asks for the production
 # page, so a cap ABOVE that page is a ceiling this build could never watch being
-# crossed - it would call a truncated census complete.
-Invoke-CohortEntryCase -Name 'a request capping threads above the page the reviewer asks for' -ExpectedCode 'CE408' -Mutate {
+# crossed - it would call a truncated census complete. A request the operator can
+# fix by editing JSON gets the request band; the evidence band below means the
+# subject itself is too large and no edit helps.
+Invoke-CohortEntryCase -Name 'a request capping threads above the page the reviewer asks for' -ExpectedCode 'CE113' -Mutate {
     param($state) $state.MaxThreads = (Get-ReviewerThreadListTop) + 1
 }
 

@@ -89,6 +89,7 @@ $script:ReviewerCohortEntryErrorCatalog = [ordered]@{
     CE110 = 'The rule bundle declares one path twice.'
     CE111 = 'A declared path escapes its own root or is not a plain relative path.'
     CE112 = 'The rule bundle declaration does not match its declared digest.'
+    CE113 = 'The request caps threads above the page the reviewer''s own thread read asks for.'
     CE200 = 'The toolkit head does not match the repository the request names.'
     CE201 = 'The required ref does not resolve to the pinned toolkit head.'
     CE202 = 'The authoritative repository identity is not the reduced wrapper-contract shape.'
@@ -961,10 +962,16 @@ function Read-ReviewerCohortEntryRequest {
     # above that page is a ceiling this build could never observe being crossed:
     # it would admit a subject with more threads than the operator authorized and
     # call the census complete. Refuse the request rather than the evidence.
+    #
+    # This is a REQUEST defect, so it carries a request-band code. The evidence
+    # band's CE408 means something the operator cannot fix by editing JSON - the
+    # subject itself carries a full page - and the two want opposite responses.
+    # One code for both would make them indistinguishable to anything that
+    # matches on the code, which is what every caller does.
     $declaredThreadCap = Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxThreads' `
         -Where 'request coverage' -Minimum 1 -Maximum 1000
     if ($declaredThreadCap -gt (Get-ReviewerThreadListTop)) {
-        New-ReviewerCohortEntryRefusal -Code 'CE408' `
+        New-ReviewerCohortEntryRefusal -Code 'CE113' `
             -Detail ("The request caps threads at $declaredThreadCap and the reviewer's own thread read asks " +
                 "for $(Get-ReviewerThreadListTop).")
     }
