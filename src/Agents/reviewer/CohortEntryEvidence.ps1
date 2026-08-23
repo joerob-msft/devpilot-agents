@@ -145,6 +145,8 @@ $script:ReviewerCohortEntryErrorCatalog = [ordered]@{
     CE712 = 'The execution plan does not bound a non-zero finite model start and verifier estimate.'
     CE713 = 'The execution plan reconciliation and delivery outputs are the same directory.'
     CE714 = 'The model start bound could not be derived, or the derived bound does not bind this request.'
+    CE715 = 'A runnable execution plan entry has no declared run set and launch authorization to run under.'
+    CE716 = 'The execution plan names a launch authorization path; the builder derives that path itself.'
     CE800 = 'A live identity read carries no value for a field the corpus seal binds by name.'
     CE802 = 'A changed path carries right-hand content but no right-hand span.'
     CE803 = 'The pinned toolkit ships no source-transport policy to derive the seal under.'
@@ -158,6 +160,55 @@ function Get-ReviewerCohortEntryErrorCatalog {
         The exact refusal catalogue, as an ordered code-to-condition map.
     #>
     return $script:ReviewerCohortEntryErrorCatalog
+}
+
+<#
+    The run-set layout the SHIPPING qualification publishes into, stated once.
+
+    'Invoke-ReviewerReplayQualification -Mode Declare' mints the launch token
+    inside its publish transaction and renames it into <root>/qualification/
+    runset/launch-authorization.token together with the sealed declaration. Every
+    consumer here derives that path from these two constants rather than
+    restating it, because the whole defect this binding exists to remove was a
+    request naming a token path the run set would never publish to.
+#>
+$script:ReviewerCohortEntryRunSetDirectoryName = 'qualification/runset'
+$script:ReviewerCohortEntryLaunchTokenFileName = 'launch-authorization.token'
+
+function Get-ReviewerCohortEntryPreparationRoot {
+    <#
+    .SYNOPSIS
+        The coordinator's output root for a package published at $OutputRoot.
+
+    .DESCRIPTION
+        A SIBLING of the package, never inside it: the package is sealed
+        read-only the moment it is published and the coordinator writes state,
+        audit and a lease every time it runs.
+
+        Derived in exactly one place because two callers need it - the request
+        reader, to stamp the launch authorization path into the execution plan
+        before anything is hashed, and the builder, to run the coordinator. Two
+        derivations would be two answers, and the request would name a token the
+        coordinator never publishes.
+    #>
+    param([Parameter(Mandatory)][string]$OutputRoot)
+    return [IO.Path]::GetFullPath(($OutputRoot.TrimEnd('\', '/') + '.preparation'))
+}
+
+function Get-ReviewerCohortEntryLaunchAuthorizationPath {
+    <#
+    .SYNOPSIS
+        The one path a launch authorization for this entry can ever be at.
+
+    .DESCRIPTION
+        Deliberately NOT an operator input. An operator who could name this path
+        could name one the declaration never publishes to, and the resulting
+        entry would seal, pass a cohort walk and reach runSetReady before failing
+        at the first launch with a token that was never going to be there.
+    #>
+    param([Parameter(Mandatory)][string]$PreparationOutputRoot)
+    $runSetRoot = Join-Path ([IO.Path]::GetFullPath($PreparationOutputRoot)) $script:ReviewerCohortEntryRunSetDirectoryName
+    return [IO.Path]::GetFullPath((Join-Path $runSetRoot $script:ReviewerCohortEntryLaunchTokenFileName))
 }
 
 function New-ReviewerCohortEntryRefusal {
@@ -447,6 +498,30 @@ function Get-ReviewerCohortEntryBool {
     return [bool]$value
 }
 
+function Assert-ReviewerCohortEntryDerivedLaunchAuthorization {
+    <#
+    .SYNOPSIS
+        Refuses an execution plan section that still names its own launch
+        authorization path.
+
+    .DESCRIPTION
+        Named explicitly rather than left to the exact-keys check, which would
+        report it as an unexpected field and tell an operator nothing about why
+        the field went away or what replaced it. A request written against the
+        earlier shape is a request whose token path was very probably never
+        going to resolve, so this refusal is the one that matters most.
+    #>
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Where
+    )
+    if ($null -ne $Object -and $null -ne $Object.PSObject.Properties['launchAuthorizationTokenPath']) {
+        New-ReviewerCohortEntryRefusal -Code 'CE716' `
+            -Detail ("The $Where names 'launchAuthorizationTokenPath'. Remove it: the builder derives that path from the " +
+                "preparation root, at the exact location the run set declaration publishes its token to.")
+    }
+}
+
 function Read-ReviewerCohortEntryExecutionPlan {
     <#
     .SYNOPSIS
@@ -472,11 +547,23 @@ function Read-ReviewerCohortEntryExecutionPlan {
         itself, so there is no string an operator can write here that puts a
         run's output anywhere else - not next to the sealed package, not inside
         it, not on another volume.
+
+        THIRD, and for the same reason: the launch authorization is NOT an
+        operator field at all. It is derived from the preparation root, at the
+        exact path the shipping declaration publishes its token to. An operator
+        who could name it could name a path no declaration ever writes, and the
+        entry would seal, pass a cohort walk and reach runSetReady before dying
+        at the first launch on a token that was never going to exist. A plan that
+        still carries the field is refused by name rather than ignored, because
+        an ignored path is a path an operator believes is in force.
     #>
     param(
         [Parameter(Mandatory)]$Plan,
-        [Parameter(Mandatory)][int]$PlannedRunCount
+        [Parameter(Mandatory)][int]$PlannedRunCount,
+        [Parameter(Mandatory)][string]$PreparationOutputRoot
     )
+
+    $launchTokenPath = Get-ReviewerCohortEntryLaunchAuthorizationPath -PreparationOutputRoot $PreparationOutputRoot
 
     Assert-ReviewerCohortEntryExactKeys -Object $Plan -Where 'request executionPlan' -Required @(
         'shadowSlotsEnabled', 'reviewerScript', 'models', 'timeouts', 'slots', 'reconciliation', 'delivery')
@@ -545,8 +632,9 @@ function Read-ReviewerCohortEntryExecutionPlan {
     $seenDirs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     for ($i = 0; $i -lt $slots.Count; $i++) {
         $slot = $slots[$i]
+        Assert-ReviewerCohortEntryDerivedLaunchAuthorization -Object $slot -Where "request executionPlan slot $($i + 1)"
         Assert-ReviewerCohortEntryExactKeys -Object $slot -Where "request executionPlan slot $($i + 1)" -Required @(
-            'name', 'stateDirName', 'terminalName', 'launchAuthorizationTokenPath', 'modelPlan')
+            'name', 'stateDirName', 'terminalName', 'modelPlan')
         $name = Get-ReviewerCohortEntryString -Object $slot -Name 'name' -Where "request executionPlan slot $($i + 1)" -MaxLength 16
         # By POSITION, not by set membership. The coordinator reads declaration
         # zero as slot1 and declaration one as slot2; a plan that listed them the
@@ -569,7 +657,6 @@ function Read-ReviewerCohortEntryExecutionPlan {
                     -Detail "The execution plan uses '$component' for more than one slot state or terminal; two runs would share one path."
             }
         }
-        $tokenPath = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $slot -Name 'launchAuthorizationTokenPath' -Where "request executionPlan slot $name"))
         $modelPlan = $slot.modelPlan
         Assert-ReviewerCohortEntryExactKeys -Object $modelPlan -Where "request executionPlan slot $name modelPlan" -Required @('bindSealedArguments', 'opaqueArguments')
         $bind = Get-ReviewerCohortEntryBool -Object $modelPlan -Name 'bindSealedArguments' -Where "request executionPlan slot $name modelPlan"
@@ -598,26 +685,27 @@ function Read-ReviewerCohortEntryExecutionPlan {
                 Name = $name
                 StateDirName = $stateDir
                 TerminalName = $terminal
-                LaunchAuthorizationTokenPath = $tokenPath
+                LaunchAuthorizationTokenPath = $launchTokenPath
                 BindSealedArguments = $bind
                 OpaqueArguments = $opaque
             })
     }
 
     $reconciliation = $Plan.reconciliation
+    Assert-ReviewerCohortEntryDerivedLaunchAuthorization -Object $reconciliation -Where 'request executionPlan reconciliation'
     Assert-ReviewerCohortEntryExactKeys -Object $reconciliation -Where 'request executionPlan reconciliation' -Required @(
-        'reconciliationEnabled', 'outputDirName', 'launchAuthorizationTokenPath')
+        'reconciliationEnabled', 'outputDirName')
     if (-not (Get-ReviewerCohortEntryBool -Object $reconciliation -Name 'reconciliationEnabled' -Where 'request executionPlan reconciliation')) {
         New-ReviewerCohortEntryRefusal -Code 'CE701' `
             -Detail 'The execution plan disables reconciliation; two runs nobody compares are not a cross-check.'
     }
     $reconciliationDir = Get-ReviewerCohortEntryString -Object $reconciliation -Name 'outputDirName' -Where 'request executionPlan reconciliation' `
         -Pattern $script:ReviewerCohortEntryPathComponentPattern -MaxLength 128
-    $reconciliationToken = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $reconciliation -Name 'launchAuthorizationTokenPath' -Where 'request executionPlan reconciliation'))
 
     $delivery = $Plan.delivery
+    Assert-ReviewerCohortEntryDerivedLaunchAuthorization -Object $delivery -Where 'request executionPlan delivery'
     Assert-ReviewerCohortEntryExactKeys -Object $delivery -Where 'request executionPlan delivery' -Required @(
-        'deliveryEnabled', 'authorizationKind', 'outputDirName', 'launchAuthorizationTokenPath',
+        'deliveryEnabled', 'authorizationKind', 'outputDirName',
         'commentsEnabled', 'votesEnabled', 'gatesEnabled', 'providerWriteBudget')
     if (-not (Get-ReviewerCohortEntryBool -Object $delivery -Name 'deliveryEnabled' -Where 'request executionPlan delivery')) {
         New-ReviewerCohortEntryRefusal -Code 'CE701' -Detail 'The execution plan disables delivery; a plan present is a plan declared in full.'
@@ -643,7 +731,6 @@ function Read-ReviewerCohortEntryExecutionPlan {
     }
     $deliveryDir = Get-ReviewerCohortEntryString -Object $delivery -Name 'outputDirName' -Where 'request executionPlan delivery' `
         -Pattern $script:ReviewerCohortEntryPathComponentPattern -MaxLength 128
-    $deliveryToken = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $delivery -Name 'launchAuthorizationTokenPath' -Where 'request executionPlan delivery'))
     if ($deliveryDir.Equals($reconciliationDir, [StringComparison]::OrdinalIgnoreCase)) {
         New-ReviewerCohortEntryRefusal -Code 'CE713' `
             -Detail "The execution plan writes reconciliation and delivery both into '$deliveryDir'; the coordinator requires two distinct directories."
@@ -666,9 +753,10 @@ function Read-ReviewerCohortEntryExecutionPlan {
         SupervisionGraceSeconds = $grace
         Slots = [object[]]$slotList.ToArray()
         ReconciliationOutputDirName = $reconciliationDir
-        ReconciliationTokenPath = $reconciliationToken
+        ReconciliationTokenPath = $launchTokenPath
         DeliveryOutputDirName = $deliveryDir
-        DeliveryTokenPath = $deliveryToken
+        DeliveryTokenPath = $launchTokenPath
+        LaunchAuthorizationTokenPath = $launchTokenPath
         DeliveryAuthorizationKind = 'PreviewOnly'
     }
 }
@@ -844,11 +932,19 @@ function Read-ReviewerCohortEntryRequest {
     $plannedRunCount = Get-ReviewerCohortEntryInt -Object $reviewer -Name 'plannedRunCount' -Where 'request reviewer' -Minimum 2 -Maximum 16
     $executionPlan = $null
     if ($hasExecutionPlan) {
-        $executionPlan = Read-ReviewerCohortEntryExecutionPlan -Plan $root.executionPlan -PlannedRunCount $plannedRunCount
+        # The preparation root is derived HERE, before the plan is read, so the
+        # launch authorization path is stamped into the plan the emitted request
+        # carries rather than patched in afterwards. Nothing is rewritten after
+        # the request is hashed because nothing needs to be: the path was known
+        # from the output root the operator declared.
+        $preparationOutputRoot = Get-ReviewerCohortEntryPreparationRoot -OutputRoot $outputRoot
+        $executionPlan = Read-ReviewerCohortEntryExecutionPlan -Plan $root.executionPlan `
+            -PlannedRunCount $plannedRunCount -PreparationOutputRoot $preparationOutputRoot
         # A launch authorization inside the package would be published with it,
         # frozen read-only with it, and inventoried with it - which is to say the
-        # entry would ship the very token that lets it run. The builder mints no
-        # token; it also refuses to be pointed at one it would end up sealing.
+        # entry would ship the very token that lets it run. The derived path is a
+        # sibling of the package rather than a child, and this asserts that the
+        # derivation actually kept it there instead of trusting that it did.
         foreach ($tokenPath in @(
                 @($executionPlan.Slots | ForEach-Object { [string]$_.LaunchAuthorizationTokenPath }) +
                 @($executionPlan.ReconciliationTokenPath, $executionPlan.DeliveryTokenPath))) {

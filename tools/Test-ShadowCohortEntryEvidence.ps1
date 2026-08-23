@@ -622,10 +622,10 @@ function New-CohortEntryFixture {
         [void](New-Item -ItemType Directory -Force -Path $policyDirectory)
         [IO.File]::WriteAllBytes((Join-Path $policyDirectory 'policy.json'),
             $script:Utf8.GetBytes("{`n  `"maxVerifierRuns`": $($state.FixtureVerifierPolicyRuns)`n}`n"))
-        # Deliberately NOT created. The builder records the path and never mints,
-        # reads or requires a launch authorization; a fixture that pre-created one
-        # would be testing a builder that could launch itself.
-        $tokenPath = Join-Path $Sandbox 'launch/authorization.token'
+        # No token path is written here, and none may be: the builder derives the
+        # one path a launch authorization can occupy from the output root, and
+        # refuses a request that names its own. A fixture that supplied one would
+        # be testing the defect this contract exists to remove.
         $executionPlan = [ordered]@{
             shadowSlotsEnabled = $true
             reviewerScript = [ordered]@{
@@ -649,27 +649,23 @@ function New-CohortEntryFixture {
                     name = 'slot1'
                     stateDirName = 'slot1-state'
                     terminalName = 'slot1-terminal.json'
-                    launchAuthorizationTokenPath = $tokenPath
                     modelPlan = [ordered]@{ bindSealedArguments = $false; opaqueArguments = @() }
                 },
                 [ordered]@{
                     name = 'slot2'
                     stateDirName = 'slot2-state'
                     terminalName = 'slot2-terminal.json'
-                    launchAuthorizationTokenPath = $tokenPath
                     modelPlan = [ordered]@{ bindSealedArguments = $false; opaqueArguments = @() }
                 }
             )
             reconciliation = [ordered]@{
                 reconciliationEnabled = $true
                 outputDirName = 'reconciliation'
-                launchAuthorizationTokenPath = $tokenPath
             }
             delivery = [ordered]@{
                 deliveryEnabled = $true
                 authorizationKind = 'PreviewOnly'
                 outputDirName = 'delivery'
-                launchAuthorizationTokenPath = $tokenPath
                 commentsEnabled = $false
                 votesEnabled = $false
                 gatesEnabled = $false
@@ -782,12 +778,18 @@ function Invoke-CohortEntryCase {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$ExpectedCode,
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][scriptblock]$Mutate
+        [Parameter(Mandatory)][scriptblock]$Mutate,
+        # Builds WITHOUT the preparation-only acknowledgement, for the one case
+        # that is about that acknowledgement being required.
+        [switch]$ClaimingCohortReady
     )
     $sandbox = New-CohortEntrySandbox -Name 'sabotage'
     try {
         $fixture = New-CohortEntryFixture -Sandbox $sandbox -Mutate $Mutate
-        $observed = Get-CohortEntryRefusalCode -Action { New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath }
+        $observed = Get-CohortEntryRefusalCode -Action {
+            if ($ClaimingCohortReady) { New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath }
+            else { New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath -PreparationOnly }
+        }
         # An empty expectation is a case that must be ACCEPTED. Those matter as
         # much as the refusals: a check that refuses something the reviewer would
         # have run is a false refusal, not a stricter check.
@@ -986,7 +988,7 @@ Write-Host 'exact wrapper fixture: the happy path' -ForegroundColor Cyan
 $sandbox = New-CohortEntrySandbox -Name 'exact'
 try {
     $fixture = New-CohortEntryFixture -Sandbox $sandbox
-    $result = New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath
+    $result = New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath -PreparationOnly
 
     Assert-CohortEntry -Name 'the package publishes' -Condition (Test-Path -LiteralPath $result.Root -PathType Container)
     Assert-CohortEntry -Name 'it starts no model' -Condition ($result.ModelStarts -eq 0)
@@ -1386,7 +1388,7 @@ try {
 
     # The output root already holds a package, so a second build must refuse.
     Assert-CohortEntry -Name 'a second build into an occupied root refuses CE500' `
-        -Condition ((Get-CohortEntryRefusalCode -Action { New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath }) -ceq 'CE500')
+        -Condition ((Get-CohortEntryRefusalCode -Action { New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath -PreparationOnly }) -ceq 'CE500')
 }
 finally { Remove-CohortEntrySandbox -Path $sandbox }
 
@@ -1408,7 +1410,7 @@ try {
     $noPolicyRequest = [IO.File]::ReadAllText($fixture.RequestPath) | ConvertFrom-Json -Depth 32
     $noPolicyRequest.toolkit.head = $noPolicyHead
     Write-CohortEntryJsonFile -Path $fixture.RequestPath -Value $noPolicyRequest
-    $noPolicyCode = Get-CohortEntryRefusalCode -Action { New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath }
+    $noPolicyCode = Get-CohortEntryRefusalCode -Action { New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath -PreparationOnly }
     Assert-CohortEntry -Name "a pinned toolkit shipping no source-transport policy refuses CE803 (observed '$noPolicyCode')" `
         -Condition ($noPolicyCode -ceq 'CE803')
 }
@@ -1448,7 +1450,7 @@ try {
         }
         $state.FileTexts = [ordered]@{ '/src/a.ps1' = "function A {`n    'right hand'`n}`n" }
     }
-    $oneResult = New-ReviewerCohortEntryEvidence -RequestPath $oneFile.RequestPath
+    $oneResult = New-ReviewerCohortEntryEvidence -RequestPath $oneFile.RequestPath -PreparationOnly
     $oneCorpusRoot = Join-Path ([string]$oneResult.Root) 'corpus'
     $oneCensusText = [IO.File]::ReadAllText((Join-Path $oneCorpusRoot 'census/right-hand-hunks.json'))
     Assert-CohortEntry -Name 'a one-path census is still a JSON array' `
@@ -1485,7 +1487,7 @@ try {
         [Text.UTF8Encoding]::new($false).GetBytes("# fixture review cycle`nedited after the commit`n"))
     Assert-CohortEntry -Name 'a tracked uncommitted toolkit edit refuses CE213' `
         -Condition ((Get-CohortEntryRefusalCode -Action {
-                New-ReviewerCohortEntryEvidence -RequestPath $dirtyFixture.RequestPath
+                New-ReviewerCohortEntryEvidence -RequestPath $dirtyFixture.RequestPath -PreparationOnly
             }) -ceq 'CE213')
     # An UNTRACKED file changes nothing the builder reads and must not refuse,
     # or the builder is unusable in the working directories operators have.
@@ -1494,7 +1496,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $dirtyToolkit 'src/scratch.tmp'), 'scratch')
     Assert-CohortEntry -Name 'an untracked scratch file in the toolkit is accepted' `
         -Condition ((Get-CohortEntryRefusalCode -Action {
-                New-ReviewerCohortEntryEvidence -RequestPath $dirtyFixture.RequestPath
+                New-ReviewerCohortEntryEvidence -RequestPath $dirtyFixture.RequestPath -PreparationOnly
             }) -ceq '')
 }
 finally { Remove-CohortEntrySandbox -Path $dirtySandbox }
@@ -1773,7 +1775,7 @@ Write-Host 'the entry feeds the typed cohort runner without translation' -Foregr
 $sandbox = New-CohortEntrySandbox -Name 'typed'
 try {
     $fixture = New-CohortEntryFixture -Sandbox $sandbox
-    $result = New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath
+    $result = New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath -PreparationOnly
     $entry = [IO.File]::ReadAllText((Join-Path $result.Root 'entry/cohort-entry.json')) | ConvertFrom-Json -Depth 32
 
     # The C# reader's required field set, taken from CohortEntry.Read. The entry
@@ -1855,7 +1857,7 @@ foreach ($section in @('reconciliation', 'delivery')) {
 $v1Sandbox = New-CohortEntrySandbox -Name 'v1-noslot'
 try {
     $v1Fixture = New-CohortEntryFixture -Sandbox $v1Sandbox
-    $v1Result = New-ReviewerCohortEntryEvidence -RequestPath $v1Fixture.RequestPath
+    $v1Result = New-ReviewerCohortEntryEvidence -RequestPath $v1Fixture.RequestPath -PreparationOnly
     $v1Request = [IO.File]::ReadAllText((Join-Path $v1Result.Root 'entry/coordinator-request.json')) | ConvertFrom-Json -Depth 32
     Assert-CohortEntry -Name 'a v1 request still emits no slots section' `
         -Condition (-not $v1Request.PSObject.Properties['slots'])
@@ -1869,7 +1871,7 @@ finally { Remove-CohortEntrySandbox -Path $v1Sandbox }
 $v2BareSandbox = New-CohortEntrySandbox -Name 'v2-bare'
 try {
     $v2BareFixture = New-CohortEntryFixture -Sandbox $v2BareSandbox -Mutate { param($s) $s.SchemaVersion = 2 }
-    $v2BareResult = New-ReviewerCohortEntryEvidence -RequestPath $v2BareFixture.RequestPath
+    $v2BareResult = New-ReviewerCohortEntryEvidence -RequestPath $v2BareFixture.RequestPath -PreparationOnly
     $v2BareRequest = [IO.File]::ReadAllText((Join-Path $v2BareResult.Root 'entry/coordinator-request.json')) | ConvertFrom-Json -Depth 32
     Assert-CohortEntry -Name 'a v2 request without a plan emits no slots section' `
         -Condition (-not $v2BareRequest.PSObject.Properties['slots'])
@@ -1883,7 +1885,7 @@ try {
     $v2Fixture = New-CohortEntryFixture -Sandbox $v2Sandbox -Mutate {
         param($s) $s.SchemaVersion = 2; $s.WithExecutionPlan = $true
     }
-    $v2Result = New-ReviewerCohortEntryEvidence -RequestPath $v2Fixture.RequestPath
+    $v2Result = New-ReviewerCohortEntryEvidence -RequestPath $v2Fixture.RequestPath -PreparationOnly
     $v2RequestPath = Join-Path $v2Result.Root 'entry/coordinator-request.json'
     $v2RequestText = [IO.File]::ReadAllText($v2RequestPath)
     $v2Request = $v2RequestText | ConvertFrom-Json -Depth 32
@@ -2005,10 +2007,27 @@ try {
         -Condition ([int]$v2Entry.planEstimate.wallClockSeconds -eq ((5400 + 120) * 4))
     Assert-CohortEntry -Name 'the v2 build started no model' -Condition ($v2Result.ModelStarts -eq 0)
     Assert-CohortEntry -Name 'the v2 build wrote nothing to a provider' -Condition ($v2Result.ProviderWrites -eq 0)
-    # The builder mints no launch authorization, so the token the plan names must
-    # still not exist after a complete build.
+    # The builder mints no launch authorization, so the one path a launch
+    # authorization can occupy must still be empty after a complete build - and
+    # the entry must say so rather than claim a readiness it cannot substantiate.
+    $v2Prep = $v2Result.Root.TrimEnd('\', '/') + '.preparation'
+    $v2Token = Join-Path (Join-Path $v2Prep 'qualification/runset') 'launch-authorization.token'
     Assert-CohortEntry -Name 'the builder minted no launch authorization' `
-        -Condition (-not (Test-Path -LiteralPath (Join-Path $v2Sandbox 'launch/authorization.token')))
+        -Condition (-not (Test-Path -LiteralPath $v2Token))
+    Assert-CohortEntry -Name 'a preparation-only build does not claim to be cohort-ready' `
+        -Condition (-not $v2Result.CohortReady)
+    $v2Emitted = [IO.File]::ReadAllText((Join-Path (Join-Path $v2Result.Root 'entry') 'coordinator-request.json')) |
+        ConvertFrom-Json -Depth 32
+    $v2Stamped = [string[]]@(@($v2Emitted.slots.declared | ForEach-Object { [string]$_.launchAuthorizationTokenPath }) +
+        @([string]$v2Emitted.slots.reconciliation.launchAuthorizationTokenPath,
+            [string]$v2Emitted.slots.delivery.launchAuthorizationTokenPath))
+    Assert-CohortEntry -Name 'the emitted request derives one launch authorization for both slots, the reconciliation and the delivery' `
+        -Condition (($v2Stamped.Count -eq 4) -and (@($v2Stamped | Sort-Object -Unique).Count -eq 1))
+    Assert-CohortEntry -Name 'the derived launch authorization sits where the run set declaration publishes one' `
+        -Condition ([IO.Path]::GetFullPath($v2Stamped[0]) -ceq [IO.Path]::GetFullPath($v2Token))
+    Assert-CohortEntry -Name 'the derived launch authorization is outside the sealed package' `
+        -Condition (-not ([IO.Path]::GetFullPath($v2Stamped[0]).StartsWith(
+                [IO.Path]::GetFullPath($v2Result.Root).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)))
     Assert-CohortEntry -Name 'the published v2 package is sealed and read-only' `
         -Condition (Assert-ReviewerCohortEntryPublished -Root $v2Result.Root -SealKeyPath $v2Fixture.SealKeyPath)
 }
@@ -2132,11 +2151,25 @@ Invoke-CohortEntryCase -ExpectedCode 'CE709' -Name 'a plan whose slot count is n
 }
 Invoke-CohortEntryCase -ExpectedCode 'CE710' -Name 'a per-call timeout that outlives the slot supervising it' `
     -Mutate (& $withPlan { param($p, $s) $p.timeouts.perCallTimeoutSeconds = 7200 })
-Invoke-CohortEntryCase -ExpectedCode 'CE711' -Name 'a launch authorization inside the sealed package' `
+Invoke-CohortEntryCase -ExpectedCode 'CE715' -ClaimingCohortReady `
+    -Name 'a slots-carrying build that declared no run set' -Mutate (& $withPlan { param($p, $s) })
+Invoke-CohortEntryCase -ExpectedCode 'CE716' -Name 'a slot naming its own launch authorization' `
     -Mutate (& $withPlan {
         param($p, $s)
-        $inside = Join-Path (Join-Path (Split-Path ([string]$p.reviewerScript.path) -Parent) 'private/entry') 'authorization.token'
-        $p.slots[0].launchAuthorizationTokenPath = $inside
+        # The exact shape every request written before this contract carried, and
+        # the exact defect it caused: a path nothing was ever going to publish,
+        # accepted at build, detected at the first prelaunch.
+        $p.slots[0]['launchAuthorizationTokenPath'] = 'C:\operator\launch\authorization.token'
+    })
+Invoke-CohortEntryCase -ExpectedCode 'CE716' -Name 'a reconciliation naming its own launch authorization' `
+    -Mutate (& $withPlan {
+        param($p, $s)
+        $p.reconciliation['launchAuthorizationTokenPath'] = 'C:\operator\launch\authorization.token'
+    })
+Invoke-CohortEntryCase -ExpectedCode 'CE716' -Name 'a delivery naming its own launch authorization' `
+    -Mutate (& $withPlan {
+        param($p, $s)
+        $p.delivery['launchAuthorizationTokenPath'] = 'C:\operator\launch\authorization.token'
     })
 Invoke-CohortEntryCase -ExpectedCode 'CE308' -Name 'a model plan carrying a fault-injection argument' `
     -Mutate (& $withPlan {
@@ -2166,7 +2199,7 @@ try {
     $boundFixture = New-CohortEntryFixture -Sandbox $boundSandbox -Mutate {
         param($s) $s.SchemaVersion = 2; $s.WithExecutionPlan = $true
     }
-    $boundResult = New-ReviewerCohortEntryEvidence -RequestPath $boundFixture.RequestPath
+    $boundResult = New-ReviewerCohortEntryEvidence -RequestPath $boundFixture.RequestPath -PreparationOnly
     $boundEntry = [IO.File]::ReadAllText((Join-Path $boundResult.Root 'entry/cohort-entry.json')) | ConvertFrom-Json -Depth 32
     $derivedPath = Join-Path $boundResult.Root 'entry/model-start-bound.json'
     $derivedText = [IO.File]::ReadAllText($derivedPath)
@@ -2326,7 +2359,7 @@ try {
     # package is discarded and built again with a bound supplied against that
     # exact digest. Identical inputs emit an identical request, so the supplied
     # bound binds the second build as tightly as the first.
-    $firstResult = New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath
+    $firstResult = New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath -PreparationOnly
     $firstEntry = [IO.File]::ReadAllText((Join-Path $firstResult.Root 'entry/cohort-entry.json')) | ConvertFrom-Json -Depth 32
     $firstBound = [IO.File]::ReadAllText((Join-Path $firstResult.Root 'entry/model-start-bound.json')) | ConvertFrom-Json -Depth 32
     Assert-CohortEntry -Name 'a preparation-only entry derives a bound of zero real model starts' `
@@ -2344,7 +2377,7 @@ try {
     # derives an identical bound. That reproducibility is what makes supplying a
     # bound meaningful at all: the second build states what the first did, or it
     # refuses.
-    $secondResult = New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath -BoundArtifactPath $supplied
+    $secondResult = New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath -PreparationOnly -BoundArtifactPath $supplied
     Assert-CohortEntry -Name 'a rebuild derives the same bound it was handed and is accepted' `
         -Condition ($null -ne $secondResult -and (Test-Path -LiteralPath (Join-Path $secondResult.Root 'entry/model-start-bound.json') -PathType Leaf))
     Remove-CohortEntrySandbox -Path $secondResult.Root
@@ -2360,7 +2393,7 @@ try {
     [IO.File]::WriteAllBytes($supplied, $overstatedBytes)
     Assert-CohortEntry -Name 'a supplied bound this build does not derive is refused as CE714' `
         -Condition ((Get-CohortEntryRefusalCode -Action {
-                New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath -BoundArtifactPath $supplied
+                New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath -PreparationOnly -BoundArtifactPath $supplied
             }) -ceq 'CE714')
 
     # The same supplied bound, with the slot count it never declared. Two files
@@ -2374,7 +2407,7 @@ try {
     [IO.File]::WriteAllBytes($supplied, $miscountedBytes)
     Assert-CohortEntry -Name 'a supplied bound counting slots this entry never declared is refused as CE714' `
         -Condition ((Get-CohortEntryRefusalCode -Action {
-                New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath -BoundArtifactPath $supplied
+                New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath -PreparationOnly -BoundArtifactPath $supplied
             }) -ceq 'CE714')
 }
 finally { Remove-CohortEntrySandbox -Path $underSandbox }
@@ -2426,7 +2459,7 @@ if ($IncludePreflight) {
                 New-CohortEntryFixture -Sandbox $sandbox -RealToolkitRoot $RealToolkitRoot -Mutate $mutate
             }
             else { New-CohortEntryFixture -Sandbox $sandbox -RealToolkitRoot $RealToolkitRoot }
-            $result = New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath
+            $result = New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath -PreparationOnly
             $preparationRoot = ($result.Root.TrimEnd('\', '/') + '.preparation')
             $coordinatorRequestPath = Join-Path $result.Root 'entry/coordinator-request.json'
             $coordinatorRequest = [IO.File]::ReadAllText($coordinatorRequestPath) | ConvertFrom-Json -Depth 32

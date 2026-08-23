@@ -1042,6 +1042,20 @@ function New-ReviewerCohortEntryCoordinatorRequest {
     # not '..', not a rooted path, not another volume - because none of what they
     # wrote is used as a path.
     $preparationRoot = [IO.Path]::GetFullPath($PreparationOutputRoot)
+    # The plan derived its launch authorization from the output root the request
+    # reader saw; this emitter was handed a preparation root by the builder. They
+    # are the same derivation applied twice, and this is where they are made to
+    # agree - so a future refactor that moves one of them cannot quietly emit a
+    # request naming a token the declaration will publish somewhere else.
+    $derivedToken = Get-ReviewerCohortEntryLaunchAuthorizationPath -PreparationOutputRoot $preparationRoot
+    foreach ($stamped in @(
+            @($plan.Slots | ForEach-Object { [string]$_.LaunchAuthorizationTokenPath }) +
+            @([string]$plan.ReconciliationTokenPath, [string]$plan.DeliveryTokenPath))) {
+        if ($stamped -cne $derivedToken) {
+            New-ReviewerCohortEntryRefusal -Code 'CE716' `
+                -Detail "The execution plan carries the launch authorization '$stamped' and this preparation publishes '$derivedToken'."
+        }
+    }
     $reconciliationDirectory = [IO.Path]::GetFullPath((Join-Path $preparationRoot $plan.ReconciliationOutputDirName))
     $deliveryDirectory = [IO.Path]::GetFullPath((Join-Path $preparationRoot $plan.DeliveryOutputDirName))
     foreach ($directory in @($reconciliationDirectory, $deliveryDirectory)) {
@@ -1601,4 +1615,156 @@ function Publish-ReviewerCohortEntryPackage {
     Protect-ReviewerCohortEntryRoot -Root $destination
     [void](Assert-ReviewerCohortEntryPublished -Root $destination -SealKeyPath $SealKeyPath)
     return $destination
+}
+
+function Assert-ReviewerCohortEntryLaunchAuthorization {
+    <#
+    .SYNOPSIS
+        Requires a runnable entry to have a real, declared run set and a real
+        launch authorization sitting beside it, and returns what it bound to.
+
+    .DESCRIPTION
+        The defect this exists to remove: a slots-carrying entry could seal, pass
+        a cohort walk and reach runSetReady while naming a launch authorization
+        that no declaration was ever going to publish. The first thing to notice
+        would have been the first launch, after a cohort had been assembled
+        around it and an operator had spent their one authorized execution.
+
+        Deliberately NOT a second verification of the declaration. The typed
+        coordinator has already run runSetDeclare, runSetVerify and runSetStatus
+        by the time this is called, and its own runSetVerify result carries the
+        digest it verified. Re-verifying the signature here would be a second
+        answer to a question the coordinator already answered under the operator
+        key; instead its recorded answer is bound to the bytes actually on disk.
+
+        What IS checked here is everything the coordinator does not check until
+        the moment of launch: that the token file exists at the one derived path,
+        that it is an ordinary file rather than a reparse point, that it holds
+        exactly the 64 lowercase hex characters the launch reader accepts, and
+        that the declaration it sits beside is the single one this preparation
+        verified. The cryptographic binding between token and plan is checked by
+        the reviewed launch path itself, which reproduces the plan digest only
+        from the matching token - so a substituted token is refused there, and
+        the digest returned here is what lets an operator see that it changed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$PreparationOutputRoot,
+        [Parameter(Mandatory)][string]$CoordinatorRequestSha256
+    )
+    $tokenPath = Get-ReviewerCohortEntryLaunchAuthorizationPath -PreparationOutputRoot $PreparationOutputRoot
+    $runSetRoot = Split-Path -Parent $tokenPath
+    if (-not (Test-Path -LiteralPath $runSetRoot -PathType Container)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "No run set is declared under '$runSetRoot'; a runnable entry is not cohort-ready until its preparation declares one."
+    }
+
+    $tokenItem = Get-Item -LiteralPath $tokenPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $tokenItem -or $tokenItem -is [IO.DirectoryInfo]) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The launch authorization '$tokenPath' is not a file; the declaration publishes one there and nothing else may stand in for it."
+    }
+    if (($tokenItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The launch authorization '$tokenPath' is a reparse point; what a launch reads must be the file the declaration published, not a link to one."
+    }
+    # The declaration publishes the token read-only inside its transaction. A
+    # writable token is one something has been able to change since.
+    if (-not $tokenItem.IsReadOnly) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The launch authorization '$tokenPath' is writable; the declaration publishes it read-only."
+    }
+    $tokenBytes = [byte[]]([IO.File]::ReadAllBytes($tokenPath))
+    if ($tokenBytes.Length -ge 3 -and $tokenBytes[0] -eq 0xEF -and $tokenBytes[1] -eq 0xBB -and $tokenBytes[2] -eq 0xBF) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The launch authorization '$tokenPath' begins with a byte-order mark; the launch reader hashes the text and would hash a different one."
+    }
+    $tokenText = $script:ReviewerCohortEntryUtf8.GetString($tokenBytes)
+    if ($tokenText -cne $tokenText.Trim()) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The launch authorization '$tokenPath' carries leading or trailing whitespace."
+    }
+    if ($tokenText -cnotmatch '^[0-9a-f]{64}$') {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The launch authorization '$tokenPath' is not 64 lowercase hex characters; the reviewed launch reader accepts nothing else."
+    }
+
+    $declarations = [object[]]@(Get-ChildItem -LiteralPath $runSetRoot -File -Force -Filter 'runset-*.json' |
+            Sort-Object -Property Name)
+    if ($declarations.Count -ne 1) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The run set directory '$runSetRoot' holds $($declarations.Count) declaration(s); exactly one set is declared per preparation."
+    }
+    $declarationPath = [string]$declarations[0].FullName
+    $declarationSha = (Get-FileHash -LiteralPath $declarationPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    $statePath = Join-Path (Join-Path $PreparationOutputRoot 'coordinator') 'state.json'
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' -Detail "The preparation under '$PreparationOutputRoot' wrote no coordinator state."
+    }
+    $state = $null
+    try { $state = [IO.File]::ReadAllText($statePath) | ConvertFrom-Json -Depth 32 }
+    catch { New-ReviewerCohortEntryRefusal -Code 'CE715' -Detail "The coordinator state at '$statePath' is unreadable." }
+    if (([string]$state.state) -cne 'runSetReady') {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The preparation stands at '$([string]$state.state)'; a runnable entry is cohort-ready only from runSetReady."
+    }
+    # The run set that was declared has to belong to the request this entry pins,
+    # or the entry would carry a bound and a subject the declaration never saw.
+    $stateRequestSha = ([string]$state.requestSha256).Trim().ToLowerInvariant()
+    if ($stateRequestSha -cne $CoordinatorRequestSha256.Trim().ToLowerInvariant()) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The preparation declared its run set against request $stateRequestSha and this entry pins $CoordinatorRequestSha256."
+    }
+
+    # The coordinator's OWN answer about the declaration it verified, bound to
+    # the bytes on disk now. It lives in the state transition rather than in the
+    # child result, and the state carries an HMAC over the whole transition list,
+    # so this is the authenticated record of what was verified.
+    $verifiedTransition = [object[]]@($state.transitions | Where-Object { ([string]$_.state) -ceq 'runSetVerified' })
+    if ($verifiedTransition.Count -ne 1) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The preparation records $($verifiedTransition.Count) run set verification(s); a runnable entry records exactly one."
+    }
+    $verifiedSha = ([string]$verifiedTransition[0].evidence.runSetSha256).Trim().ToLowerInvariant()
+    if ($verifiedSha -cne $declarationSha) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The preparation verified a declaration digesting to $verifiedSha and '$declarationPath' now digests to $declarationSha."
+    }
+    if (-not [bool]$verifiedTransition[0].evidence.signatureVerified) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The preparation did not verify the run set declaration signature at '$declarationPath'."
+    }
+    $setId = ([string]$verifiedTransition[0].evidence.setId).Trim()
+    $expectedName = "runset-$setId.json"
+    if (([string]$declarations[0].Name) -cne $expectedName) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The preparation verified set '$setId' and the declaration beside the launch authorization is '$($declarations[0].Name)'."
+    }
+    # The readiness transition is the coordinator's own statement that it saw a
+    # launch token and started nothing with it. Both halves matter: a ready
+    # preparation that had already attempted a slot is not a fresh entry.
+    $readyTransition = [object[]]@($state.transitions | Where-Object { ([string]$_.state) -ceq 'runSetReady' })
+    if ($readyTransition.Count -ne 1 -or -not [bool]$readyTransition[0].evidence.launchTokenPresent) {
+        New-ReviewerCohortEntryRefusal -Code 'CE715' `
+            -Detail "The preparation under '$PreparationOutputRoot' does not record exactly one readiness with a launch authorization present."
+    }
+    foreach ($consumed in @('slotAttemptCount', 'slotAttemptRecordCount', 'preLaunchRunRootCount', 'realModelStartCount')) {
+        $value = [int]$readyTransition[0].evidence.$consumed
+        if ($value -ne 0) {
+            New-ReviewerCohortEntryRefusal -Code 'CE601' `
+                -Detail "The preparation reports $consumed=$value; a published entry has consumed nothing."
+        }
+    }
+
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $digest = (($sha.ComputeHash($script:ReviewerCohortEntryUtf8.GetBytes($tokenText)) | ForEach-Object { $_.ToString('x2') }) -join '') }
+    finally { $sha.Dispose() }
+
+    return [pscustomobject][ordered]@{
+        TokenPath = $tokenPath
+        TokenSha256 = $digest
+        SetId = $setId
+        DeclarationPath = $declarationPath
+        DeclarationSha256 = $declarationSha
+    }
 }

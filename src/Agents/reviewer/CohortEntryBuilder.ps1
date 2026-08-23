@@ -294,7 +294,16 @@ function New-ReviewerCohortEntryEvidence {
         # cannot. It is validated against this build's request and head exactly as
         # a freshly derived one is, so supplying it can only ever supply the same
         # answer sooner - never a different one.
-        [string]$BoundArtifactPath = ''
+        [string]$BoundArtifactPath = '',
+        # Builds a slots-carrying entry that states it is NOT cohort-ready. The
+        # launch authorization a run set publishes cannot exist until the run set
+        # is declared, and declaring one needs an operator-held key - so without
+        # this switch a slots-carrying build that did not reach runSetReady is
+        # refused rather than published as though it could launch. This is how a
+        # slots-carrying request is exercised on a machine that holds no key; the
+        # entry it produces is refused by the cohort runner's pre-walk pass, by
+        # the same rule, for the same reason.
+        [switch]$PreparationOnly
     )
 
     $request = Read-ReviewerCohortEntryRequest -Path $RequestPath
@@ -717,8 +726,10 @@ function New-ReviewerCohortEntryEvidence {
     # The preparation root is a SIBLING of the package, never inside it. The
     # package is sealed and read-only the moment it is published; the coordinator
     # writes state, audit and a lease every time it runs, and a run that mutated
-    # the thing it was verifying would break the seal it just checked.
-    $preparationOutputRoot = [IO.Path]::GetFullPath(($request.OutputRoot.TrimEnd('\', '/') + '.preparation'))
+    # the thing it was verifying would break the seal it just checked. Derived by
+    # the same function the request reader used, so the launch authorization the
+    # plan carries and the run set this build declares cannot disagree.
+    $preparationOutputRoot = Get-ReviewerCohortEntryPreparationRoot -OutputRoot $request.OutputRoot
     $coordinatorRequest = New-ReviewerCohortEntryCoordinatorRequest -Request $request -Identity $identity `
         -IterationId $iteration.IterationId -Corpus $corpus -CorpusRoot $publishedCorpusRoot `
         -RecipePath (Join-Path $publishedEntryRoot 'corpus-seal-recipe.json') `
@@ -813,6 +824,38 @@ function New-ReviewerCohortEntryEvidence {
             -PreparationOutputRoot $preparationOutputRoot -Target $PreflightTarget
     }
 
+    # A slots-carrying entry is a claim that a cohort may LAUNCH it. Nothing in
+    # the package can substantiate that claim on its own: the launch
+    # authorization is minted by the run set declaration, which happens after
+    # publish, against the published request. So the claim is settled here, on
+    # the real preparation, and an entry that cannot substantiate it is refused
+    # rather than published as if it could - which is exactly what a cohort
+    # spending its one authorized execution on a token that was never going to
+    # exist would otherwise discover at the first slot prelaunch.
+    $launchAuthorization = $null
+    $cohortReady = $false
+    if ($null -ne $executionPlan) {
+        if ($PreparationOnly) {
+            # An explicit, recorded claim of NOT being ready. The entry is still
+            # built and still sealed - that is how a slots-carrying request is
+            # exercised without an operator key - but the operator is told in the
+            # result, and the cohort runner refuses it at its pre-walk pass
+            # because the authorization it names does not exist yet.
+            Write-Verbose "The entry declares $(@($executionPlan.Slots).Count) slot(s) and was built -PreparationOnly; it is not cohort-ready."
+        }
+        elseif ($preflightState -cne 'runSetReady') {
+            New-ReviewerCohortEntryRefusal -Code 'CE715' `
+                -Detail ("The request declares $(@($executionPlan.Slots).Count) slot(s) and this build reached '$preflightState'. " +
+                    "Run with -Preflight -PreflightTarget runSetReady so the preparation declares the run set and mints the launch authorization this entry names, " +
+                    "or pass -PreparationOnly to build an entry that states it is not cohort-ready.")
+        }
+        else {
+            $launchAuthorization = Assert-ReviewerCohortEntryLaunchAuthorization `
+                -PreparationOutputRoot $preparationOutputRoot -CoordinatorRequestSha256 $coordinatorRequestSha
+            $cohortReady = $true
+        }
+    }
+
     return [pscustomobject][ordered]@{
         Root = $published
         EntryId = $request.EntryId
@@ -838,6 +881,11 @@ function New-ReviewerCohortEntryEvidence {
         ModelStarts = 0
         ProviderWrites = 0
         PreflightState = $preflightState
+        CohortReady = $cohortReady
+        LaunchAuthorizationPath = $(if ($null -ne $launchAuthorization) { $launchAuthorization.TokenPath } else { $null })
+        LaunchAuthorizationSha256 = $(if ($null -ne $launchAuthorization) { $launchAuthorization.TokenSha256 } else { $null })
+        RunSetId = $(if ($null -ne $launchAuthorization) { $launchAuthorization.SetId } else { $null })
+        RunSetSha256 = $(if ($null -ne $launchAuthorization) { $launchAuthorization.DeclarationSha256 } else { $null })
     }
 }
 
