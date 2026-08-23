@@ -381,6 +381,11 @@ function New-CohortEntryFixture {
         FixtureVerifierAttempts = 1
         FixtureVerifierCeiling = 7
         FixtureVerifierPolicyRuns = 5
+        # Names the shipping agent instead of the fixture one. A run set
+        # declaration pins the toolkit repository the reviewer script lives in
+        # and refuses a script outside it, so the single case that declares a
+        # real set has to name the real agent - and gets the real bound with it.
+        UseRealReviewerScript = $false
     }
     if ($Mutate) { & $Mutate $state }
 
@@ -483,15 +488,83 @@ function New-CohortEntryFixture {
         }
     }
     $configPath = Join-Path $Sandbox 'reviewer.config.json'
-    Write-CohortEntryJsonFile -Path $configPath -Value ([ordered]@{
-            repository = [ordered]@{
-                organization = $state.Organization
-                project = $state.Project
-                name = $state.RepositoryName
-                id = $state.RepositoryId
+    $configValue = [ordered]@{
+        repository = [ordered]@{
+            organization = $state.Organization
+            project = $state.Project
+            name = $state.RepositoryName
+            id = $state.RepositoryId
+        }
+        review = $reviewSection
+    }
+    if ($state.UseRealReviewerScript) {
+        # A run set declaration loads this file through the agent's own loader,
+        # which needs the whole shape rather than the handful of keys the builder
+        # reads. The shipped sample is that shape, so the one case that declares
+        # a real set starts from it instead of from a second hand-written copy
+        # that could drift from what the agent actually accepts.
+        $sample = ([IO.File]::ReadAllText((Join-Path $toolkit 'samples/reviewer-ado.config.json'))) |
+            ConvertFrom-Json -Depth 32 -AsHashtable
+        # The sample's convention sources name the sample's own organization, and
+        # the agent refuses a source outside the reviewed repository's. The
+        # section cannot simply go, because naming a convention specialist
+        # requires it - so it is rewritten to this fixture's organization, with
+        # a pack whose globs match nothing. The catalogue is then present and
+        # consistent while selecting no pack, which keeps this case about the
+        # launch authorization rather than about convention transport.
+        $sample['repoConventions'] = [ordered]@{
+            conventionDocPaths = @()
+            customRules = ''
+            conventionPacks = [ordered]@{
+                schemaVersion = 1
+                requireAllSourcesReferenced = $true
+                authoritativeSources = [ordered]@{
+                    transportVersion = 1
+                    maxTotalBytes = 1024
+                    sources = @(
+                        [ordered]@{
+                            name = 'fixture-source'
+                            organization = $state.Organization
+                            project = $state.Project
+                            repositoryId = '22222222-2222-3333-4444-555555555555'
+                            path = '/docs/conventions.md'
+                            branch = 'main'
+                            maxBytes = 1024
+                        }
+                    )
+                }
+                packs = @(
+                    [ordered]@{
+                        name = 'fixture-pack'
+                        priority = 100
+                        changedPathGlobs = @('never-matches/**/*.nope')
+                        authoritativeSourceRefs = @('fixture-source')
+                        repositorySources = @([ordered]@{ path = '/docs/rules/review.md'; maxBytes = 1024 })
+                        maxBytes = 4096
+                    }
+                )
             }
-            review = $reviewSection
-        })
+        }
+        foreach ($key in @($configValue.Keys)) {
+            if ($key -ceq 'review') {
+                foreach ($reviewKey in @($reviewSection.Keys)) {
+                    if ($reviewKey -ceq 'verification' -and $sample['review'].ContainsKey('verification')) {
+                        # Merged rather than replaced: the fixture states which
+                        # models verify and whether verification runs, and the
+                        # sample states the shape the agent's loader requires.
+                        foreach ($inner in @($reviewSection[$reviewKey].Keys)) {
+                            $sample['review']['verification'][$inner] = $reviewSection[$reviewKey][$inner]
+                        }
+                        continue
+                    }
+                    $sample['review'][$reviewKey] = $reviewSection[$reviewKey]
+                }
+            }
+            else { $sample[$key] = $configValue[$key] }
+        }
+        $configValue = $sample
+    }
+    Write-CohortEntryJsonFile -Path $configPath -Value $configValue
 
     $rulePath = '/docs/rules/review.md'
     $ruleBytes = $script:Utf8.GetBytes($state.RuleText)
@@ -611,6 +684,10 @@ function New-CohortEntryFixture {
                     '}'
                     ''
                 ) -join "`n"))
+        if ($state.UseRealReviewerScript) {
+            $reviewerScriptPath = [string]([IO.Path]::GetFullPath(
+                    (Join-Path $toolkit 'src\Agents\reviewer\Start-ReviewerAgent.ps1')))
+        }
         # The two siblings the runner bound is read from: the launch ceiling the
         # runner narrows policy by, and the policy that states how many verifier
         # launches one run may make.
@@ -2609,6 +2686,22 @@ if ($IncludePreflight) {
                     finally { $PSNativeCommandUseErrorActionPreference = $previous }
                 }
 
+                if ($WithExecutionPlan) {
+                    # Every assertion below is about an entry whose preparation
+                    # has ALREADY declared its run set: before that point the
+                    # declaration has not minted an authorization yet, and a
+                    # cohort demanding one would refuse every entry that had not
+                    # run. This preparation stopped short of declaring, so its
+                    # recorded state is advanced to the point the question starts
+                    # being answerable. Only the state name matters here; the
+                    # cohort refuses the entry before it reads anything else.
+                    $walkStatePath = Join-Path ($result.Root.TrimEnd('\', '/') + '.preparation') 'coordinator/state.json'
+                    $walkState = ([IO.File]::ReadAllText($walkStatePath)) | ConvertFrom-Json -Depth 32
+                    $walkState.state = 'runSetDeclared'
+                    [IO.File]::WriteAllBytes($walkStatePath,
+                        $script:Utf8.GetBytes([string]($walkState | ConvertTo-Json -Depth 32)))
+                }
+
                 $walkAccepted = & $runWalk 'accepted' $entryNode
                 Assert-CohortEntry -Name "${Label}: the derived bound survives RequireSealedModelStartBounds" `
                     -Condition ($walkAccepted -notmatch 'model start bound|bounds admit')
@@ -2620,7 +2713,7 @@ if ($IncludePreflight) {
                     # reaches its entry is asserted below only for the
                     # preparation-only shape, because this one must not.
                     Assert-CohortEntry -Name "${Label}: a cohort refuses an entry whose launch authorization was never published" `
-                        -Condition ($walkAccepted -match 'declares slots authorized by')
+                        -Condition ($walkAccepted -match 'with its slots authorized by')
                     Assert-CohortEntry -Name "${Label}: that refusal happens before any entry starts" `
                         -Condition ($walkAccepted -notmatch 'shadow-cohort-runner-entry-start')
                 }
@@ -2640,7 +2733,7 @@ if ($IncludePreflight) {
                     $writeWalkToken = { param([string]$Text) [IO.File]::WriteAllBytes($walkToken, $script:Utf8.GetBytes($Text)) }
                     & $writeWalkToken ('a' * 64)
                     Assert-CohortEntry -Name "${Label}: a published launch authorization lets the cohort reach its entry" `
-                        -Condition ((& $runWalk 'authorized' $entryNode) -notmatch 'declares slots authorized by')
+                        -Condition ((& $runWalk 'authorized' $entryNode) -notmatch 'with its slots authorized by')
                     & $writeWalkToken ('a' * 63)
                     Assert-CohortEntry -Name "${Label}: a launch authorization of the wrong length is refused" `
                         -Condition ((& $runWalk 'shorttoken' $entryNode) -match 'not the 64 lowercase hex characters')
@@ -2655,10 +2748,10 @@ if ($IncludePreflight) {
                     # settle that question itself.
                     & $writeWalkToken ('b' * 64)
                     Assert-CohortEntry -Name "${Label}: a substituted well-formed token is left for the prelaunch to refuse" `
-                        -Condition ((& $runWalk 'substituted' $entryNode) -notmatch 'declares slots authorized by')
+                        -Condition ((& $runWalk 'substituted' $entryNode) -notmatch 'with its slots authorized by')
                     Remove-Item -LiteralPath $walkToken -Force
                     Assert-CohortEntry -Name "${Label}: a launch authorization removed after publication is refused" `
-                        -Condition ((& $runWalk 'removedtoken' $entryNode) -match 'declares slots authorized by')
+                        -Condition ((& $runWalk 'removedtoken' $entryNode) -match 'with its slots authorized by')
                 }
 
                 # The exact defect this fix exists for: an entry whose estimate
@@ -2717,7 +2810,7 @@ if ($IncludePreflight) {
     $readySandbox = New-CohortEntrySandbox -Name 'cohort-ready'
     try {
         $readyFixture = New-CohortEntryFixture -Sandbox $readySandbox -RealToolkitRoot $realToolkit `
-            -Mutate { param($s) $s.SchemaVersion = 2; $s.WithExecutionPlan = $true }
+            -Mutate { param($s) $s.SchemaVersion = 2; $s.WithExecutionPlan = $true; $s.UseRealReviewerScript = $true }
         $readyResult = New-ReviewerCohortEntryEvidence -RequestPath $readyFixture.RequestPath `
             -Preflight -PreflightTarget 'runSetReady'
         Assert-CohortEntry -Name 'a build that reached runSetReady reports itself cohort-ready' `
@@ -2794,7 +2887,7 @@ if ($IncludePreflight) {
             }
             finally { $PSNativeCommandUseErrorActionPreference = $previousReady }
             Assert-CohortEntry -Name 'the cohort accepts a builder-produced entry that declared its own run set' `
-                -Condition ($readyWalk -notmatch 'declares slots authorized by|not the 64 lowercase hex')
+                -Condition ($readyWalk -notmatch 'with its slots authorized by|not the 64 lowercase hex')
             Assert-CohortEntry -Name 'the cohort walked past every pre-walk check and started the entry' `
                 -Condition ($readyWalk -match 'shadow-cohort-runner')
             Assert-CohortEntry -Name 'the cohort walk started no model' `
