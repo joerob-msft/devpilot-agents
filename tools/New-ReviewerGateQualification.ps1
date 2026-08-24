@@ -184,8 +184,9 @@
         -VerificationPromptPath .\src\Agents\reviewer\prompts\cross-verification.prompt.md `
         -VerificationPolicyPath .\src\Agents\reviewer\verification\v1\policy.json `
         -VerificationSchemaPath .\src\Agents\reviewer\verification\v1\decision.schema.json `
-        -GeneralistModels @('claude-opus-5', 'gpt-5.6-sol') `
-        -ConventionSpecialistModel 'claude-opus-5' -ConventionVerifierModel 'gpt-5.6-sol' `
+        -GeneralistModels (Get-AgentGeneralistModelPair).Models `
+        -ConventionSpecialistModel (Get-AgentGeneralistModelPair).First `
+        -ConventionVerifierModel (Get-AgentGeneralistModelPair).Second `
         -ApprovalSampleCount 400 -ApprovalWouldApproveCount 210 -ApprovalFalseApprovalCount 0 `
         -ApprovalFalseApprovalUpperBound95 0.009 -ApprovalBoundMethod wilson `
         -ApprovalRecall 0.97 -ApprovalRecallLowerBound95 0.94

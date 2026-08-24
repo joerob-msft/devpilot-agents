@@ -111,6 +111,13 @@ What that does and does not buy you, stated precisely:
 That last point is why the reviewer is preview-first, and why publishing a
 review you have actually read is a first-class mode rather than a re-run:
 
+The reviewer requires PowerShell 7, GitHub Copilot CLI, and access to the
+configured Azure DevOps MCP server. Its optional, explicitly enabled
+Azure DevOps CLI identity fallback additionally requires Azure CLI, the
+`azure-devops` extension, and tenant-bound browser authentication. Installation,
+Conditional Access troubleshooting, trust boundaries, and disable/uninstall
+steps are documented in [Sealed source transport](docs/source-transport.md#optional-azure-devops-cli-identity-fallback).
+
 ```powershell
 # Offline validation
 ./src/Agents/reviewer/Start-ReviewerAgent.ps1 -DryRun `
@@ -243,7 +250,7 @@ discovery-only pass:
 The model must be named explicitly on the CLI or in
 `review.conventionSpecialistModel`; there is no default. This specialist receives
 sealed deterministic facts and commit/hash-verified matched convention sources,
-not either generalist's output. Its strict `CONVENTION_REVIEW_RESULT_V1`
+not either generalist's output. Its strict `CONVENTION_REVIEW_RESULT_V2`
 candidates are stored in separate sealed previews and are not merged, posted, or
 used for voting. Failures are recorded as degraded specialist diagnostics without
 changing the generalist review.
@@ -453,6 +460,36 @@ arrived. See [docs/source-transport.md](docs/source-transport.md).
 Posted findings appear under **your** identity, since that is who the session is
 authenticated as. That is why every write is opt-in.
 
+#### Offline snapshot replay (layer 9)
+
+A pull request moves on. Once it has, the evidence that produced a particular
+review is gone, and "we fixed the miss" is an assertion nobody can check.
+
+Replay records the reads one cycle made and re-runs the **whole** stack against
+those exact bytes - transport, packs, facts, both generalist passes, the
+specialist, cross-verification, the gate and every preview - with no repository
+contacted. It is served at the one seam every read goes through, so the layers
+above it are unchanged and still apply their full hostile-input validation to
+replayed payloads.
+
+It is permanently preview-only: every write and gate switch and both promotion
+paths are refused at startup, the authorization is forced to `PreviewOnly`, the
+artifacts are sealed under a separate key domain so promotion cannot verify
+them, and replay state lives apart from live state. The model's entire tool
+ceiling is denied at launch, because a model tool would reach the host through
+the CLI's own credentials rather than the replayed session - so a replay is a
+stated *lower bound* on a live run, not a reproduction of one. See
+[docs/replay-snapshots.md](docs/replay-snapshots.md).
+
+A qualification set is sealed before its runs exist, so an invocation that
+cannot start spoils the set. `tools/Invoke-ReviewerReplayQualification.ps1`
+builds the one argument vector each slot will run, validates every input the
+agent validates at startup, and runs that exact vector through the agent itself,
+which stops at its own model-launch boundary - all before anything is declared.
+The declaration is then sealed under a digest of the whole plan, argv included.
+Preflight creates no state and launches no model; the only file it writes is the
+report you ask for, so looking first costs nothing.
+
 ### Two passes, two models
 
 A single model's coverage of real defects is both incomplete and *idiosyncratic*
@@ -522,6 +559,18 @@ How it works, and why it is arranged this way:
 Both models must be named explicitly: pairing a chosen model against "whatever
 the CLI defaults to today" is not reproducible, and naming the same model twice
 is refused outright — it doubles the cost to miss the same things twice.
+
+The pairing the agent currently accepts is *derived*, not written down: it comes
+from `Get-AgentGeneralistModelPair`, which reads the harness's supported-model
+registry, and the same derivation drives startup validation, CI and the
+qualification wrapper. The model ids in the examples above are illustrative —
+ask the module which pair is current rather than copying a version out of a
+document:
+
+```powershell
+Import-Module ./src/DevPilot.AgentHarness/DevPilot.AgentHarness.psd1
+(Get-AgentGeneralistModelPair).Models
+```
 
 ---
 

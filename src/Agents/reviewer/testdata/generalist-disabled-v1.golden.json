@@ -11,7 +11,8 @@
     "Get-ReviewerPostableFindings": "df41352b7f8e49ef33b57a50ec76facf2d8cda0e3d80d6bc2bfe5f4f67ac39a7",
     "Split-ReviewerFindingsByChangeSet": "662dc52aefdaf9c5de7b9e8d7bf614a42a2030227495606ffb3e6fd9b941d6e0",
     "Invoke-ReviewerPullRequest": "62432a88a734669cfe06220131db07429ea8940eb8eb35078ad925748efce719",
-    "Invoke-ReviewerDelivery": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb"
+    "Invoke-ReviewerDelivery": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb",
+    "Write-ReviewerConventionSpecialistPreview": "606bee25c5dcebd1471dccd81576b46d44d6cf5dc6c71a96a95becba4518c8b5"
   },
   "authorizedFunctionDeltas": {
     "Write-ReviewerPreview": [
@@ -62,6 +63,30 @@
       {
         "sha256": "e9b8d101c6e5d37f2b39bf4240866353b92ae758f950fcbd02a1d05b5dd4facc",
         "reason": "Break out how many of those uncorroborated excusals are paths the host alone called non-text. That subset is the one where the pull request's own path says 'ordinary source' and only the untrusted party disagrees, and it now has its own reason code in the accounting table."
+      },
+      {
+        "sha256": "f55fe5c67f929648108348abe3af8610a6d8d5fbd7cc15f8a5ee8e5e838f903b",
+        "reason": "State in the preview when the run was an offline snapshot replay: which snapshot, its manifest digest, the replay nonce, the wrapper-computed input digest and the normalized outcome digest, that the model was launched with the narrowed offline tool grant, and that the artifact is sealed under the replay key domain and can never be promoted."
+      },
+      {
+        "sha256": "63b7fe6b70bf104473b81f0bd4ef1664596e63bc54e8f4716fb7fc61f4fcf592",
+        "reason": "STACK CONTEXT, kept as history only - the acceptance rule reads the LAST entry, so this one is inert as a control and is here to explain the chain, not to authorize anything. The parent PR31 (daviburg-recover-ado-source-spans, head 11335a7) edited this function to report recovered source spans and did not append its own authorized delta, so the golden fails at the parent head 357d08e with this layer absent, which was verified directly. Recorded because this layer was restacked onto that parent and inherits its text; the entry belongs to PR31 and should move there if that PR ever records it itself."
+      },
+      {
+        "sha256": "4bc2794694805ea039fa686a4d328a3e6dce337017f51232835acd0f306e44de",
+        "reason": "History only, superseded below. This layer's replay reporting re-expressed on top of the parent's recovered-span text after the restack: which snapshot, manifest digest, replay nonce, input and outcome digests, narrowed tool grant, sealed under the replay key and never promotable."
+      },
+      {
+        "sha256": "13a5ad8233f9a38c2f628f9656bb3706f617ec581fa8f9efa5a8d7f84c9ac324",
+        "reason": "History only, superseded below. First version of the suppressed-live-fallback disclosure, before the capability-probe substitution was disclosed alongside it."
+      },
+      {
+        "sha256": "b6a5a00d94d81a598c2215d672638ab0e8bb295646d938ec3717d816be882a28",
+        "reason": "History only, superseded below. Disclosed snapshotLegacy transport substitution and suppression of capability probing and the live Azure CLI fallback."
+      },
+      {
+        "sha256": "f94a0f0dc39789f3671194b808d3e36b88af51008a35ff75b31f6e58deb9ba72",
+        "reason": "CURRENT and authoritative. Disclose schema-v2 replay as exact reconstruction from the canonical sealed source-transport artifact, including its recorded live mode, while retaining an explicit snapshotLegacy warning only for schema-v1 compatibility snapshots."
       }
     ],
     "Invoke-ReviewerDelivery": [
@@ -78,6 +103,10 @@
       {
         "sha256": "24bfc80213e33e9ee61ce2eaeef1699faca371e5b0aa4de6b9dda4aeb4fef247",
         "reason": "State it in as many words when NO sealed block was produced. The block was simply omitted when empty, so a one-line regression that blanked it left the model with no source and no notice of that, while the prompt still told it the accounting table was binding."
+      },
+      {
+        "sha256": "f3bf51bbef917da38c52c84ea490277ddf0e69f1f6903cbe10aec05a61313b02",
+        "reason": "In offline replay, say that this pass holds no repository read tool and that the wrapper already verified the binding against the sealed snapshot. Without it a correct pass fails closed for the wrong reason: the prompt tells it to re-read the pull request and stop without a marker if it cannot, and in replay it cannot."
       }
     ],
     "Invoke-ReviewerModelPass": [
@@ -96,12 +125,58 @@
       {
         "sha256": "8c5e2be6e4b8827de4afdcf8892ea5b76821ae3c24b8cd9ad8ec68c88684f036",
         "reason": "Mark that oversized-input refusal a pull-request failure rather than an environment fault. Exempting it re-attempted every cycle forever, burning a full transport, the specialist and the gate each time, while never appearing in attempts state where an operator could see it."
+      },
+      {
+        "sha256": "6e451d1c86898c0c08fa0c59cb3dc795dcba2c2803bb8cf871ee2fe51d42f491",
+        "reason": "Route the generalist tool grant through Get-ReviewerLaunchAllowTools so an offline snapshot replay narrows it to the code-defined offline set instead of leaving the model its own live repository tools, which would mix live facts into a replayed review."
+      },
+      {
+        "sha256": "47a9eb2a83bf2c6cbabe7c309508da917d238cede2b3d69f198b20ce0c1936b5",
+        "reason": "Layer A typed model-result extraction: classify the marker outcome through ConvertFrom-AgentResultMarkerOutcome and surface RejectionClass, Nonce, ModelRan and typed Usage accounting so a missing-nonce marker is schemaInvalid (retryable, fresh nonce) rather than a generic invalid marker, and a wrong-binding echo is refused without retry."
+      },
+      {
+        "sha256": "a0d7cd76a8204e036ace2898a3bbfa71787e05205c5ed8f0e953e950da80fe1b",
+        "reason": "Layer A audit fixes: compare the typed status against public literal strings instead of the module-scoped $script:AgentMarkerStatus (invisible here, so every marker was rejected as null), and add a real pre-launch result-contract gate (Assert-ReviewerModelResultContractFits) that proves the generalist schema's largest legal marker fits the declared scan window and output byte cap before Invoke-TimedProcess, handing the same window to the typed extractor."
       }
     ],
     "Invoke-ReviewerPullRequest": [
       {
         "sha256": "62432a88a734669cfe06220131db07429ea8940eb8eb35078ad925748efce719",
         "reason": "Pinned so the source-coverage wiring cannot be dropped silently: this function carries the marker retry loop and the preview call that publishes pinned source coverage and the convention authority summary."
+      },
+      {
+        "sha256": "622990544b78fdcae4206846f29458c2ca01673746adbc9eb737e3d8ece17faf",
+        "reason": "Layer A typed retry accounting: the generalist retry loop now gates on Test-AgentMarkerStatusRetryable against the typed RejectionClass, accumulates exact per-pass attempt/premiumRequest/nanoAiu/duration accounting, and emits pass-accounting cycle metadata while preserving the pinned missing-or-invalid-result-marker refusal substring."
+      },
+      {
+        "sha256": "280f6b3559714bad8757a3b41079f9c5a4bc37897d8163b9813093e3a90dc686",
+        "reason": "Layer A audit fixes: the generalist retry now gates solely on the typed Test-AgentMarkerStatusRetryable classification (the prose 'missing or invalid result marker' dependency is removed), and accounting is emitted once per ACTUAL attempt as model-attempt-accounting (attempt number, nonce SHA-256 not the raw nonce, typed rejection, modelRan, per-attempt usage/nulls); cumulative session totals are recorded per attempt and never summed across the separate sessions a retry creates."
+      },
+      {
+        "sha256": "3c83cac8c722e0f80db4c8a6261842989177afd2216f03985fe4aa22ba0aba90",
+        "reason": "Layer A merged-marker contract: the seal-time re-validation now sizes its scan window from the dedicated merged-marker contract (25 findings times the two-pass maximum = 50), asserts Assert-ReviewerModelResultContractFits for the merged review before serializing, and hands that same window to ConvertFrom-AgentResultMarker so a maximal two-pass review is never truncated by the harness 65536 default and sealed into an unpromotable artifact. No change to the disabled generalist discovery or delivery path."
+      },
+      {
+        "sha256": "6f6c02324459e6a98dada749a1253f65bc2fab5e437c70b06205f334e19bf224",
+        "reason": "Thread the cycle-level authoritative-source configured/resolved counts and the withheld-degrade flag onto the bound item and into the convention-source summary call, so an offline replay that could not answer a configured generalist authoritative source is reported honestly (N of M resolved; K withheld) and degrades cross-verification instead of being silently summarized as a configuration gap. No change to the disabled generalist discovery or delivery path."
+      }
+    ],
+    "Write-ReviewerConventionSpecialistPreview": [
+      {
+        "sha256": "871ae332707c8f0f59d01ec50fc730e6bd011ead39262ca6941facaf99cb73f9",
+        "reason": "History only, superseded below. Authorized structured-remediation preview fields on top of the snapshotLegacy replay disclosure."
+      },
+      {
+        "sha256": "38af213211e5422a81d180e9435d556d58c693348763412cb8a6f303a8c5b75e",
+        "reason": "History only, superseded below. Preserve structured remediation evidence while reporting the exact sealed source-transport mode reconstructed by schema-v2 replay, with snapshotLegacy retained only for schema-v1 compatibility."
+      },
+      {
+        "sha256": "e172b0267cd87a521b71120bfca1350293c492c5b10926ff659edec7f091a279",
+        "reason": "History only, superseded below. Count explicit changed-file line targets alongside lexical construct coverage without changing the disabled generalist discovery or delivery path."
+      },
+      {
+        "sha256": "d9c05cece0a6464f793221223da98853c7cca47d554e515b59b38b7543c1e79e",
+        "reason": "CURRENT and authoritative. Emit the replay identity block from one shared definition instead of an inline copy, byte-for-byte identical, so the cross-verification decision carries the same snapshot, digest and nonce and an empty run can be bound to the recording it replayed."
       }
     ]
   },

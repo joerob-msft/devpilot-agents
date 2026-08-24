@@ -168,7 +168,7 @@
 param(
     [string]$RepoPath,
 
-    [ValidatePattern('^[A-Za-z0-9._-]+$')]
+    [ValidatePattern('^[A-Za-z0-9._-]+\z')]
     [string]$AgentName = "reviewer",
 
     [string]$PromptFile,
@@ -230,7 +230,7 @@ param(
     # re-verified (see docs/delivery-gates.md); supplying it closes the gate
     # on a mismatch instead. Never satisfiable by repository config - this is
     # a third out-of-band operator input, like -GatePolicyFile/-GateQualificationFile.
-    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [ValidatePattern('^[0-9a-fA-F]{64}\z')]
     [string]$GateEvaluationToolSha256,
 
     # Publish a sealed gate DECISION - never a raw preview/verification
@@ -313,7 +313,47 @@ param(
     [int]$ConventionSpecialistTimeoutSeconds = 900,
 
     [ValidateRange(30, 3600)]
-    [int]$VerificationTimeoutSeconds = 900
+    [int]$VerificationTimeoutSeconds = 900,
+
+    # --- Offline snapshot replay. Re-runs the WHOLE stack against reads that
+    # were recorded earlier, so a fix can be demonstrated against the exact
+    # evidence that produced a miss after the pull request has moved on.
+    # Permanently preview-only: see the replay block below the parameter
+    # validation, which refuses every write switch and every promotion, seals
+    # replay artifacts under a separate key domain so they can never be
+    # promoted, and isolates replay state from live state.
+    [string]$ReplayRoot,
+
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z')]
+    [string]$ReplaySnapshotName,
+
+    # Required with -ReplaySnapshotName. The manifest's own digest is unkeyed,
+    # so it only proves internal consistency; naming the digest an operator
+    # actually vouched for is what binds this run to that snapshot.
+    [ValidatePattern('^[0-9a-fA-F]{64}\z')]
+    [string]$ReplayManifestDigest,
+
+    # Optional private capture seam for schema-v2 replay snapshots. The file is
+    # canonical, identity-bound source evidence, not a delivery artifact.
+    [string]$CaptureSourceTransportArtifactPath,
+
+    # Capture a passing source-transport artifact and stop before authoritative
+    # source reads or model launches. Requires the capture path above.
+    [switch]$CaptureSourceTransportOnly,
+
+    # --- Qualification prelaunch. Runs THIS script's own startup validation -
+    # config, prompt closure, models, permissions, replay snapshot load and
+    # binding, repository and state-directory resolution - against the exact
+    # argument vector a qualification slot will run, then stops at the last
+    # instruction before any state directory is created, and prints what it
+    # resolved. It grants nothing: it is a strictly earlier exit on the normal
+    # path, so a command that survives it is the command that would have run.
+    #
+    # It exists because a qualification run set is sealed BEFORE its runs, and
+    # a set declared against an invocation that cannot start is spoiled. A
+    # wrapper that only re-checked its own copy of this script's parameter
+    # metadata would still miss everything decided by the body below.
+    [switch]$QualificationPrelaunch
 )
 
 $ErrorActionPreference = "Stop"
@@ -420,6 +460,13 @@ if (-not $importedHarness) {
         "or run this script from a checkout of the devpilot-agents repository.")
 }
 $HarnessPath = $importedHarness.Path
+# The independent generalist pairing is DERIVED from the harness's
+# supported-model registry, never spelled out here. Startup validation, the
+# sealed-decision re-verification below, and every out-of-repo qualification
+# wrapper read the SAME derivation, so retiring a model moves all of them at
+# once instead of leaving one of them asking for a version this script has
+# already stopped accepting.
+$script:ReviewerGeneralistModelPair = Get-AgentGeneralistModelPair
 $ConventionPackLibrary = Join-Path $PSScriptRoot "ConventionPacks.ps1"
 if (-not (Test-Path -LiteralPath $ConventionPackLibrary)) {
     throw "Convention-pack library '$ConventionPackLibrary' does not exist."
@@ -451,11 +498,20 @@ foreach ($sourcePolicyProperty in $SourceTransportPolicyRaw.PSObject.Properties)
     $SourceTransportPolicyProperties[$sourcePolicyProperty.Name] = $sourcePolicyProperty.Value
 }
 $SourceTransportPolicy = New-ReviewerSourceTransportPolicy -Policy ([pscustomobject]$SourceTransportPolicyProperties)
+$SourceTransportAzFallbackSchemaPath = Join-Path $PSScriptRoot "source/v1/azure-devops-cli-fallback.schema.json"
+if (-not (Test-Path -LiteralPath $SourceTransportAzFallbackSchemaPath)) {
+    throw "Source-transport Azure CLI fallback schema '$SourceTransportAzFallbackSchemaPath' does not exist."
+}
 $ConventionSpecialistLibrary = Join-Path $PSScriptRoot "ConventionSpecialist.ps1"
 if (-not (Test-Path -LiteralPath $ConventionSpecialistLibrary)) {
     throw "Convention-specialist library '$ConventionSpecialistLibrary' does not exist."
 }
 . $ConventionSpecialistLibrary
+$ChangedConstructLibrary = Join-Path $PSScriptRoot "ChangedConstructs.ps1"
+if (-not (Test-Path -LiteralPath $ChangedConstructLibrary)) {
+    throw "Changed-construct library '$ChangedConstructLibrary' does not exist."
+}
+. $ChangedConstructLibrary
 $ConventionSpecialistPromptPath = Join-Path $PSScriptRoot "convention-review.prompt.md"
 if (-not (Test-Path -LiteralPath $ConventionSpecialistPromptPath)) {
     throw "Convention-specialist prompt '$ConventionSpecialistPromptPath' does not exist."
@@ -515,6 +571,73 @@ $ResultMarkerPrefix = "REVIEWER_RESULT_V1:"
 # review, and it is worth exactly one more attempt. A timeout, a nonzero exit,
 # or a marker bound to the wrong PR is NOT retried: those are real failures.
 $script:ReviewerMarkerRetryAttempts = 2
+# How much of a specialist answer the wrapper will scan for a marker. The pass
+# is asked to account for every transported rule against every changed
+# construct, and a model that shows that work as it goes writes a long answer;
+# 64 KB turned out to be a cap on thinking out loud rather than on payload. The
+# marker itself stays bounded by its schema, and overflow is retried once
+# rather than costing the pass.
+#
+# Sized so the LEGAL MAXIMUM marker this schema can produce still fits: eight
+# candidates, every string field at its MaxLength, worst-case UTF-8 (a non-ASCII
+# string field can reach three bytes per character) comes to ~453 KB. A cap
+# below that would let a wholly legitimate, maximal review overflow and retry
+# forever instead of ever being accepted, so the cap sits above the schema's
+# own ceiling rather than below it. The pre-launch contract gate
+# (Assert-ReviewerModelResultContractFits) proves this relationship at startup.
+$script:ReviewerConventionSpecialistMaxOutputBytes = 524288
+# The specialist gets a larger retry budget than a generalist pass because it
+# emits a much larger hand-built marker: a row per transported rule, each naming
+# the constructs it checked, plus the candidate array. Observed failures are all
+# formatting - the marker restated with re-worded prose, a missing final key, an
+# answer over the output cap - on top of work that was done correctly. Each
+# attempt is an independent request, so a third one is worth more than it costs.
+# None of the real failures became retryable.
+$script:ReviewerConventionSpecialistMarkerRetryAttempts = 3
+
+# ---------------------------------------------------------------------------
+# Per-surface result-contract scan/capture bounds. Each model surface that
+# emits a result marker (the generalist pass, the convention specialist, and
+# the cross-verifier) declares ONE explicit scan window (characters the
+# extractor will scan for the closing brace) and ONE hard output byte cap. A
+# marker whose largest legal serialization does not fit BOTH bounds could never
+# be captured on a real review, so Assert-ReviewerModelResultContractFits proves
+# the fit before any Invoke-TimedProcess launch and the same window is handed to
+# the typed extractor. The windows are sized above each surface schema's
+# measured worst case (see Measure-AgentMarkerSchemaWorstCaseChars /
+# ...WorstCaseBytes) with headroom, so a production surface never refuses to
+# launch; the gate only fires if a schema is widened past its declared window.
+#
+# The generalist marker window/cap must cover the LARGEST legal generalist
+# schema, which is MaxFindings = 25 (the -MaxFindings CLI ceiling), not the
+# default 12. At 25 findings the schema's measured worst case is 84990 chars /
+# 126490 UTF-8 bytes (the byte figure already assumes the worst-case multi-byte
+# encoding of every free-text field), so a 65536-char window would have refused
+# every legal MaxFindings >= 20 - silently clamping a legal option. These bounds
+# sit above that worst case with headroom and remain hard, finite caps.
+$script:ReviewerMarkerScanWindowChars = 131072
+$script:ReviewerMarkerMaxOutputBytes = 196608
+$script:ReviewerConventionSpecialistScanWindowChars = 327680
+$script:ReviewerVerificationScanWindowChars = 65536
+$script:ReviewerVerificationMaxOutputBytes = 131072
+
+# The MERGED marker is the largest marker this agent ever re-parses. It is not a
+# model's answer but the wrapper's own re-serialization of a completed multi-pass
+# review, and it can legally carry one full generalist cap PER PASS: up to the
+# -MaxFindings CLI ceiling of 25 times the two-pass maximum, i.e. 50 findings.
+# Its measured worst case is 166724 chars / 248224 UTF-8 bytes (the byte figure
+# already assumes the worst-case multi-byte encoding of every free-text field),
+# far past the single-pass generalist window. Seal-time re-validation and
+# promotion-time re-validation both size their scan window from THIS contract and
+# assert the actual merged schema fits it before parsing, so a legal maximal
+# two-pass review is never silently truncated below its own bound and then sealed
+# into an artifact that could never be promoted. Hard, finite caps above that
+# worst case with headroom; the fit gate fires only if the schema is widened past
+# this window. $script:ReviewerMergedMarkerMaxFindingItems is the ABSOLUTE legal
+# ceiling (25 * 2); a live cycle's runtime $MergedMarkerMaxFindingItems is <= it.
+$script:ReviewerMergedMarkerMaxFindingItems = 50
+$script:ReviewerMergedMarkerScanWindowChars = 262144
+$script:ReviewerMergedMarkerMaxOutputBytes = 393216
 
 # ---------------------------------------------------------------------------
 # CODE-DEFINED security policy (never config-supplied; a forked config file
@@ -582,6 +705,46 @@ $script:ReviewerConventionSpecialistAllowToolCeiling = @(
     "ado(repo_pull_request)",
     "ado(repo_file)"
 )
+
+# Replay is offline, so the model must not keep working repository tools: those
+# reach the host through the CLI's own credentials, not through the wrapper's
+# replayed session, and a run that mixed snapshot facts with live facts would
+# be worse than either alone. Local file tools are no better - they would read
+# the working tree, which is neither the snapshot nor the reviewed commit.
+#
+# The whole code-defined ceiling is DENIED in replay (see
+# Get-ReviewerEffectiveDenyTools) rather than the allow list being emptied: an
+# empty allow list makes Get-AgentCopilotArgs omit the tool flags entirely,
+# which restores Copilot CLI default tool discovery and would hand the model
+# back more than a live run ever grants it.
+#
+# This is a real difference from a live run and is disclosed as one: in replay
+# the model cannot look anything up for itself, so a replay is a LOWER bound on
+# live behaviour, not a reproduction of it.
+$script:ReviewerReplayActive = $false
+# Clear before anything can read it. This is set later, and only, by the replay
+# startup path; inherited from an operator's shell it would refuse the live
+# Azure CLI fallback in a run that is not replaying at all, skipping every pull
+# request with a message asserting a replay that is not happening.
+Clear-ReviewerSourceReplayEnvironment
+# True when a replay ran with the live az CLI fallback enabled in config and
+# suppressed it. Recorded in the sealed artifact, because such a replay read
+# through a different transport than the live run it is evidence of, and a
+# warning on the console is gone by the time anyone reads the file.
+$script:ReviewerReplayAzFallbackSuppressed = $false
+$script:ReviewerReplaySourceTransportMode = $null
+$script:ReviewerReplaySnapshot = $null
+# Told to every model pass in replay, generalist and specialist alike. Each of
+# their prompts instructs the pass to re-read the pull request and stop without
+# a marker if it cannot; in replay it cannot, because it holds no repository
+# tool. Left unsaid, a correct pass fails closed for a reason that has nothing
+# to do with the change under review - which is exactly what a live gpt-5.6-sol
+# pass did the first time this ran.
+$script:ReviewerReplayModelNotice = @"
+This cycle is an OFFLINE REPLAY of a sealed snapshot. You have NO repository read tools - not the pull-request tool, not the file tool. That is deliberate and is not a failure.
+The wrapper already read the pull request, its change set and its threads from the snapshot, verified the binding in the runtime data against the snapshot's own recorded identity, and hashed every byte it delivered to you. Treat that binding as established fact.
+Work from what the wrapper delivered. Do NOT stop without a marker merely because you cannot re-read the pull request; emit your marker as usual. If a question cannot be answered from what you were given, say so or leave it alone - do not guess.
+"@
 
 $script:ReviewerVerificationAllowToolCeiling = @(
     "ado(repo_pull_request)",
@@ -686,8 +849,11 @@ $script:ReviewerVerifiedMultiPassMaxGrantAgeSeconds = 120
 function Get-ReviewerHashValue {
     param($Container, [string]$Key, $Default = $null)
     if ($null -eq $Container) { return $Default }
-    if ($Container -is [hashtable]) {
-        if ($Container.ContainsKey($Key)) { return $Container[$Key] }
+    # IDictionary, not just [hashtable]: an [ordered] literal is an
+    # OrderedDictionary, which is not a Hashtable, and falling through to the
+    # $Default for one silently returns nothing for every key it holds.
+    if ($Container -is [System.Collections.IDictionary]) {
+        if ($Container.Contains($Key)) { return $Container[$Key] }
         return $Default
     }
     if ($Container -is [System.Management.Automation.PSCustomObject]) {
@@ -696,6 +862,57 @@ function Get-ReviewerHashValue {
         return $Default
     }
     return $Default
+}
+
+function Get-ReviewerCandidateSourceRequest {
+    <#
+        THE one place the candidate-discovery read is composed.
+
+        A run that names its pull request resolves THAT pull request directly; a
+        repository-wide census is only asked for when the run has to choose its
+        own candidate. This is a correctness property rather than an
+        optimization: an offline replay snapshot is sealed around the bounded
+        set of reads a run actually needs, and a cycle that always asked for the
+        census demanded a recorded list no bounded snapshot carries - which
+        killed both slots of a qualification set before a model ever launched.
+
+        The prelaunch probe and the live cycle both call this, so a snapshot
+        that answers the preflight is a snapshot that answers the run.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Project,
+        [Parameter(Mandatory)][string]$RepositoryName,
+        [ValidateRange(0, 2147483647)][int]$TargetPullRequestId = 0,
+        [string]$TargetRefName = "",
+        [ValidateRange(1, 1000)][int]$Top = 100
+    )
+    if ($TargetPullRequestId -gt 0) {
+        return [pscustomobject][ordered]@{
+            Name      = "repo_pull_request"
+            Action    = "get"
+            Arguments = [ordered]@{
+                action        = 'get'
+                project       = $Project
+                repositoryId  = $RepositoryName
+                pullRequestId = $TargetPullRequestId
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($TargetRefName)) {
+        throw "An untargeted candidate list requires a target ref name; a census with no target ref is not a bounded read."
+    }
+    return [pscustomobject][ordered]@{
+        Name      = "repo_pull_request"
+        Action    = "list"
+        Arguments = [ordered]@{
+            action        = 'list'
+            project       = $Project
+            repositoryId  = $RepositoryName
+            status        = 'Active'
+            targetRefName = $TargetRefName
+            top           = $Top
+        }
+    }
 }
 
 function Get-ReviewerCanonicalJson {
@@ -717,9 +934,15 @@ function Get-ReviewerCanonicalJson {
         [void]$script:ReviewerUtf8.GetByteCount($Value)
         return (ConvertTo-Json -InputObject $Value -Compress)
     }
-    if ($Value -is [hashtable] -or $Value -is [System.Management.Automation.PSCustomObject]) {
+    if ($Value -is [System.Collections.IDictionary] -or $Value -is [System.Management.Automation.PSCustomObject]) {
+        # IDictionary, not just [hashtable]. An [ordered] literal is an
+        # OrderedDictionary; it reached the IEnumerable branch below, where
+        # @($Value) wraps rather than enumerates it, so the same object
+        # recursed into itself until this function's own depth bound stopped
+        # it - turning an ordinary record into a fatal "maximum object depth"
+        # in the middle of a run.
         $keys = @()
-        if ($Value -is [hashtable]) { $keys = @($Value.Keys | ForEach-Object { [string]$_ }) }
+        if ($Value -is [System.Collections.IDictionary]) { $keys = @($Value.Keys | ForEach-Object { [string]$_ }) }
         else { $keys = @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }
         $orderedKeys = [System.Collections.Generic.List[string]]::new()
         foreach ($key in $keys) { [void]$orderedKeys.Add($key) }
@@ -800,6 +1023,26 @@ function Get-ReviewerArtifactSigningKey {
     }
     Set-Content -LiteralPath $KeyPath -Value ("${storedFormat}:" + [System.Convert]::ToBase64String($toStore)) -Encoding ascii
     return $key
+}
+
+function Get-ReviewerRunArtifactKey {
+    <#
+        The key every artifact this RUN writes is sealed with.
+
+        Outside replay it is the raw per-user master key, unchanged. Inside
+        replay it is a key derived from that master under a dedicated label, so
+        a replay artifact cannot verify against the raw key that -PromotePreview
+        and -PromoteVerifiedPreview read with. That is the enforcement behind
+        "a replay artifact is never promotable": not a boolean an editor can
+        strip, but a signature that cannot be produced. Same H-7 pattern the
+        gate and verification artifacts already use.
+    #>
+    param([Parameter(Mandatory)][string]$KeyPath)
+    $master = Get-ReviewerArtifactSigningKey -KeyPath $KeyPath
+    if (-not $script:ReviewerReplayActive) { return , $master }
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($master)
+    try { return , $hmac.ComputeHash($script:ReviewerUtf8.GetBytes("devpilot.reviewer.replay.artifact.v1")) }
+    finally { $hmac.Dispose() }
 }
 
 function Get-ReviewerNormalizedDocumentText {
@@ -1227,6 +1470,35 @@ function Get-ReviewerMarkerSchema {
     }
 }
 
+function Assert-ReviewerModelResultContractFits {
+    <#
+        A hard pre-launch gate. Before any model that emits a result marker is
+        launched, the largest legal marker its schema can produce must fit BOTH
+        the character scan window the extractor will use AND the surface's hard
+        UTF-8 output byte cap. A schema that cannot fit has a legal, correct
+        answer the wrapper could never capture, so this refuses to launch rather
+        than discover the loss on a real review. The declared window is returned
+        so the caller hands the SAME window to the typed extractor - one
+        contract, measured once, enforced at both ends.
+
+        Throws a precise, non-retryable contract error naming the surface and
+        the bound exceeded. This is a code/schema defect, never a model slip, so
+        it is deliberately fatal rather than a retryable pass failure.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Surface,
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [Parameter(Mandatory)][int]$ScanWindowChars,
+        [Parameter(Mandatory)][int]$MaxOutputBytes
+    )
+    $fit = Test-AgentMarkerSchemaFitsLaunchContract -Schema $Schema `
+        -ScanWindowChars $ScanWindowChars -MaxOutputBytes $MaxOutputBytes
+    if (-not $fit.Fits) {
+        throw "The $Surface result-marker contract cannot fit its declared bounds and must not launch: $($fit.Reason)."
+    }
+    return $ScanWindowChars
+}
+
 function Test-ReviewerMarkerBinding {
     <# The parsed marker must reference exactly the PR/repo/commit the wrapper
        bound. project & nonce are already exact-matched by the schema. #>
@@ -1503,8 +1775,24 @@ function New-ReviewerDeliveryAuthorization {
         only until a later verification layer explicitly mints VerifiedMultiPass.
         There is deliberately no config, parameter or environment override.
     #>
-    param([Parameter(Mandatory)][ValidateRange(1, 100)][int]$PassCount)
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, 100)][int]$PassCount,
+        # Replay is preview-only by construction, at every pass count. Forcing
+        # it here rather than relying on the startup switch refusal means even a
+        # future call site that forgets the refusal cannot obtain a grant that
+        # would let a replayed run write anything.
+        [switch]$ReplayPreviewOnly
+    )
 
+    if ($ReplayPreviewOnly) {
+        return [ReviewerDeliveryAuthorization]::new(
+            $script:ReviewerDeliveryAuthorizationSeal,
+            $null,
+            [ReviewerDeliveryAuthorizationKind]::PreviewOnly,
+            $PassCount,
+            "offline snapshot replay is permanently preview-only"
+        )
+    }
     if ($PassCount -eq 1) {
         return [ReviewerDeliveryAuthorization]::new(
             $script:ReviewerDeliveryAuthorizationSeal,
@@ -1858,12 +2146,68 @@ function Get-ReviewerEffectiveAllowTools {
 
 function Get-ReviewerEffectiveDenyTools {
     param([string[]]$ConfigDeny)
-    return , @(@(@($ConfigDeny) + $script:ReviewerMandatoryDenyTools) | Select-Object -Unique)
+    $deny = @(@($ConfigDeny) + $script:ReviewerMandatoryDenyTools)
+    if ($script:ReviewerReplayActive) {
+        # In replay the model gets no usable tool at all. The whole code-defined
+        # ceiling is denied - not just one pass's slice - so this holds however
+        # a pass's own allow list is computed, and the deny list always wins.
+        #
+        # It has to be done by denying rather than by emptying the allow list:
+        # an empty allow list makes Get-AgentCopilotArgs omit the tool flags
+        # entirely, which restores Copilot CLI's default tool discovery and
+        # hands the model more than any grant here ever would.
+        $deny += @($script:ReviewerAllowToolCeiling)
+    }
+    return , @($deny | Select-Object -Unique)
+}
+
+function Get-ReviewerUsableLaunchTools {
+    <#
+        The permissions a launch actually leaves the model holding: what it was
+        granted, minus what the same launch denied. The deny list always wins,
+        so a denied entry is not a capability - and asking about anything else
+        makes the MCP pre-flight demand a server for a tool nobody can call,
+        which is how a fully offline replay came to be refused for want of a
+        repository connection it never used.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Allow,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Deny
+    )
+    return , @(@($Allow) | Where-Object { @($Deny) -cnotcontains $_ })
+}
+
+function Get-ReviewerLaunchAllowTools {
+    <#
+        The permission list a model pass is actually launched with.
+
+        It is the caller's own list in every mode, including replay. Replacing
+        it in replay looked tidier and was wrong: the specialist and verifier
+        ceilings are repository-tool-only and contain no local-read entry, so
+        substituting one would have OFFERED those passes a tool their own
+        code-defined ceiling withholds - visible to a model that never sees it
+        in a live run, and outside the ceiling the startup guards check.
+
+        What makes replay offline is Get-ReviewerEffectiveDenyTools, which
+        denies the entire code-defined ceiling. The grant stays non-empty and
+        within its own bound; nothing in it survives the deny.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Intended)
+    return , @($Intended)
 }
 
 $script:ReviewerAuthoritativeTransportVersion = 1
 $script:ReviewerAuthoritativeMaxSources = 8
 $script:ReviewerAuthoritativeMaxFileBytes = 131072
+# How large a changed file the verifier will open to cut seven lines out of it.
+# It was 128 KB, which is a sensible bound on a document but not on a source
+# file: a changed test file over that size yielded no hunk at all, so the
+# verifier was asked to confirm a finding and correctly refused, having been
+# shown nothing. This is the ceiling `Get-ReviewerFactSourceFile` itself
+# accepts, and it only decides what the verifier may OPEN - what a model sees
+# stays seven lines either way. A file larger than this still yields no hunk,
+# and the verifier still refuses rather than guessing.
+$script:ReviewerVerificationMaxSourceFileBytes = 262144
 $script:ReviewerAuthoritativeMaxTotalBytes = 262144
 # A section-scoped source fetches the WHOLE document and then cuts the named
 # heading out of it, so the fetch bound has to admit a real engineering-guidance
@@ -1871,10 +2215,10 @@ $script:ReviewerAuthoritativeMaxTotalBytes = 262144
 # to a few. Without this split, naming a section in a large document still
 # failed the read, which is exactly how large rule documents ended up never
 # reaching the reviewer at all.
-# The decoder's own hard ceiling. The source transport reads up to this and
-# then applies its policy's per-file bound itself, so an oversized file is
-# accounted `fileTooLarge` - which is what the docs promise and what tells an
-# operator to raise the cap - instead of surfacing as an opaque decode failure.
+# The decoder's absolute hard ceiling. Each source read supplies a tighter
+# purpose-specific limit: ordinary delivery uses policy, while exact recovery
+# may use only its 2 MiB per-side algorithm cap. Structural sizing classifies an
+# oversized response before this decoder allocates it.
 $script:ReviewerSourceDecoderCeilingBytes = 5242880
 $script:ReviewerAuthoritativeMaxDocumentBytes = 524288
 $script:ReviewerMaxModelInputBytes = 393216
@@ -2118,6 +2462,35 @@ if ($deliveryGatesCfgProperty) {
             -Where "config.review.deliveryGates"
     }
 }
+$CfgAzCliFallbackEnabled = $false
+$CfgAzCliFallbackTenantId = ""
+$sourceTransportCfgProperty = $reviewCfg.PSObject.Properties["sourceTransport"]
+if ($sourceTransportCfgProperty) {
+    $sourceTransportCfg = $sourceTransportCfgProperty.Value
+    Assert-ReviewerExactObjectKeys -Object $sourceTransportCfg `
+        -Allowed @("note", "azureDevOpsCliFallback") -Required @("azureDevOpsCliFallback") `
+        -Where "config.review.sourceTransport"
+    $azFallbackCfg = Get-AgentConfigObject -Object $sourceTransportCfg `
+        -Name "azureDevOpsCliFallback" -Where "config.review.sourceTransport"
+    $azFallbackJson = $azFallbackCfg | ConvertTo-Json -Depth 8
+    if (-not ($azFallbackJson | Test-Json -SchemaFile $SourceTransportAzFallbackSchemaPath -ErrorAction Stop)) {
+        throw "config.review.sourceTransport.azureDevOpsCliFallback does not satisfy its schema."
+    }
+    Assert-ReviewerExactObjectKeys -Object $azFallbackCfg `
+        -Allowed @("note", "enabled", "tenantId") -Required @("enabled", "tenantId") `
+        -Where "config.review.sourceTransport.azureDevOpsCliFallback"
+    $CfgAzCliFallbackEnabled = Get-AgentConfigBool -Object $azFallbackCfg -Name "enabled" `
+        -Where "config.review.sourceTransport.azureDevOpsCliFallback"
+    $CfgAzCliFallbackTenantId = Get-AgentConfigString -Object $azFallbackCfg -Name "tenantId" `
+        -Where "config.review.sourceTransport.azureDevOpsCliFallback" -MaxLength 36 -AllowEmpty `
+        -Pattern '^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?$'
+    if ($CfgAzCliFallbackEnabled -and -not $CfgAzCliFallbackTenantId) {
+        throw "config.review.sourceTransport.azureDevOpsCliFallback.tenantId is required when the fallback is enabled."
+    }
+    if ($CfgAzCliFallbackTenantId) {
+        $CfgAzCliFallbackTenantId = $CfgAzCliFallbackTenantId.ToLowerInvariant()
+    }
+}
 foreach ($sev in @($PostSeverities)) {
     if ($script:ReviewerSeverities -cnotcontains $sev) {
         throw "config.review.postSeverities contains '$sev', which is not one of: $($script:ReviewerSeverities -join ', ')."
@@ -2224,6 +2597,36 @@ foreach ($a in @($AuthorAliases)) {
     if ($a -notmatch '^[A-Za-z0-9._-]+$') { throw "-AuthorAliases entry '$a' is not a safe alias." }
 }
 
+# ---------------------------------------------------------------------------
+# Qualification prelaunch. A strictly earlier exit on the normal path: every
+# validation below still runs, and the process stops immediately before the
+# first state directory is created. It is refused in combination with anything
+# that delivers, promotes, captures, mutates state, or diverts into the
+# self-check fixtures, because a prelaunch that could do any of those would be
+# a new capability rather than an earlier stop.
+# ---------------------------------------------------------------------------
+if ($QualificationPrelaunch) {
+    $prelaunchRefusedSwitches = @(
+        @{ Name = "-DryRun"; Set = [bool]$DryRun },
+        @{ Name = "-ShowState"; Set = [bool]$ShowState },
+        @{ Name = "-ResetStarvedCandidates"; Set = [bool]$ResetStarvedCandidates },
+        @{ Name = "-CaptureSourceTransportOnly"; Set = [bool]$CaptureSourceTransportOnly },
+        @{ Name = "-CaptureSourceTransportArtifactPath"; Set = [bool]$CaptureSourceTransportArtifactPath },
+        @{ Name = "-EnableFindingComments"; Set = [bool]$EnableFindingComments },
+        @{ Name = "-EnableSummaryComment"; Set = [bool]$EnableSummaryComment },
+        @{ Name = "-EnableApprovalVote"; Set = [bool]$EnableApprovalVote },
+        @{ Name = "-EnableVerifiedCommentGate"; Set = [bool]$EnableVerifiedCommentGate },
+        @{ Name = "-EnableVerifiedSuggestionGate"; Set = [bool]$EnableVerifiedSuggestionGate },
+        @{ Name = "-EnableVerifiedApprovalGate"; Set = [bool]$EnableVerifiedApprovalGate },
+        @{ Name = "-PromotePreview"; Set = [bool]$PromotePreview },
+        @{ Name = "-PromoteVerifiedPreview"; Set = [bool]$PromoteVerifiedPreview }
+    )
+    $prelaunchRefused = @($prelaunchRefusedSwitches | Where-Object { $_.Set } | ForEach-Object { [string]$_.Name })
+    if ($prelaunchRefused.Count -gt 0) {
+        throw ("-QualificationPrelaunch validates an invocation and exits before any state exists; it cannot be " +
+            "combined with $($prelaunchRefused -join ', ').")
+    }
+}
 # A vote with no visible reasoning is an unexplained verdict on someone else's
 # work. Refuse the combination at startup rather than discovering it per-PR.
 if ($EnableApprovalVote -and -not $EnableFindingComments) {
@@ -2254,11 +2657,162 @@ if ($SecondPassModel) {
     }
 }
 $EffectiveSecondPassModel = $ResolvedSecondPassModel
+if ($CaptureSourceTransportOnly -and -not $CaptureSourceTransportArtifactPath) {
+    throw "-CaptureSourceTransportOnly requires -CaptureSourceTransportArtifactPath."
+}
+if ($CaptureSourceTransportOnly) {
+    if (-not $Once) {
+        throw "-CaptureSourceTransportOnly requires -Once."
+    }
+    if ($PullRequestId -lt 1) {
+        throw "-CaptureSourceTransportOnly requires an explicit -PullRequestId."
+    }
+    $captureRefusedSwitches = @(
+        @{ Name = "-EnableFindingComments"; Set = [bool]$EnableFindingComments },
+        @{ Name = "-EnableSummaryComment"; Set = [bool]$EnableSummaryComment },
+        @{ Name = "-EnableApprovalVote"; Set = [bool]$EnableApprovalVote },
+        @{ Name = "-EnableVerifiedCommentGate"; Set = [bool]$EnableVerifiedCommentGate },
+        @{ Name = "-EnableVerifiedSuggestionGate"; Set = [bool]$EnableVerifiedSuggestionGate },
+        @{ Name = "-EnableVerifiedApprovalGate"; Set = [bool]$EnableVerifiedApprovalGate },
+        @{ Name = "-PromotePreview"; Set = [bool]$PromotePreview },
+        @{ Name = "-PromoteVerifiedPreview"; Set = [bool]$PromoteVerifiedPreview }
+    )
+    $captureRefused = @($captureRefusedSwitches | Where-Object { $_.Set } | ForEach-Object { [string]$_.Name })
+    if ($captureRefused.Count -gt 0) {
+        throw ("Source-transport-only capture cannot deliver, promote or vote. Remove: " +
+            "$($captureRefused -join ', ').")
+    }
+}
+
+# Two children, two different scrubs, and the asymmetry is deliberate rather
+# than an oversight - it is worth stating because the "obviously stricter"
+# version of this is broken.
+#
+# The Copilot child AUTHENTICATES to GitHub with COPILOT_GITHUB_TOKEN, GH_TOKEN
+# or GITHUB_TOKEN. Stripping those does not harden it, it stops it starting: on
+# a host where GITHUB_TOKEN is the only one set, a stricter scrub is
+# indistinguishable from a broken agent, and the failure surfaces as an
+# authentication error nobody will connect to a credential-hygiene change. It
+# gets the ADO-PAT-shaped names, which it has no use for and must not carry.
+#
+# The `agency mcp ado` child is the reverse. It authenticates through agency's
+# own credential flow, so it needs neither family, and a GitHub token in its
+# environment is pure blast radius. It gets both.
+#
+# Neither list is a substitute for the tool grant: the model has no shell and no
+# outbound-network tool, so it cannot read an environment variable at all. This
+# bounds what a COMPROMISED CHILD PROCESS holds, not what the model can ask for.
+#
+# Defined here, above the qualification prelaunch boundary, so the prelaunch
+# source probe opens its session with the SAME scrub the cycle uses rather than
+# a second copy of the list that could drift from it.
+$CopilotSensitiveEnvironmentVariables = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
+$McpSensitiveEnvironmentVariables = $CopilotSensitiveEnvironmentVariables +
+@("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+
+# ---------------------------------------------------------------------------
+# Offline snapshot replay. Resolved BEFORE the delivery authorization is minted
+# and before the state directory is chosen, because it changes both.
+# ---------------------------------------------------------------------------
+if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
+    if ($CaptureSourceTransportArtifactPath) {
+        throw "Offline replay cannot capture a new source-transport artifact."
+    }
+    if (-not $ReplayRoot -or -not $ReplaySnapshotName -or -not $ReplayManifestDigest) {
+        throw "Offline replay requires all of -ReplayRoot, -ReplaySnapshotName and -ReplayManifestDigest."
+    }
+    if ($DryRun) {
+        throw "-DryRun runs this agent's self-checks against its own fixtures and never opens a session; it cannot be combined with offline replay."
+    }
+    # Refused here, individually and by name, so an operator learns which switch
+    # is the problem. The authorization forced below is what makes it true even
+    # if this list is ever missed.
+    $replayRefusedSwitches = @(
+        @{ Name = "-EnableFindingComments"; Set = [bool]$EnableFindingComments },
+        @{ Name = "-EnableSummaryComment"; Set = [bool]$EnableSummaryComment },
+        @{ Name = "-EnableApprovalVote"; Set = [bool]$EnableApprovalVote },
+        @{ Name = "-EnableVerifiedCommentGate"; Set = [bool]$EnableVerifiedCommentGate },
+        @{ Name = "-EnableVerifiedSuggestionGate"; Set = [bool]$EnableVerifiedSuggestionGate },
+        @{ Name = "-EnableVerifiedApprovalGate"; Set = [bool]$EnableVerifiedApprovalGate },
+        @{ Name = "-PromotePreview"; Set = [bool]$PromotePreview },
+        @{ Name = "-PromoteVerifiedPreview"; Set = [bool]$PromoteVerifiedPreview }
+    )
+    $replayRefused = @($replayRefusedSwitches | Where-Object { $_.Set } | ForEach-Object { [string]$_.Name })
+    if ($replayRefused.Count -gt 0) {
+        throw ("Offline snapshot replay is permanently preview-only and cannot deliver, promote or vote. " +
+            "Remove: $($replayRefused -join ', ').")
+    }
+    $script:ReviewerReplaySnapshot = New-AgentReplaySnapshot -ReplayRoot $ReplayRoot `
+        -SnapshotName $ReplaySnapshotName -ExpectedManifestDigest $ReplayManifestDigest
+    $script:ReviewerReplayActive = $true
+    # A classified snapshot has permanently withdrawn its own promotability, and
+    # the withdrawal rides in the manifest digest rather than in a file someone
+    # can delete. Replay already refuses every promote and write switch above, so
+    # this is belt-and-braces - but it is the check that stays correct if that
+    # list is ever missed, and it says out loud in the log what the run is built
+    # on, so nobody reads a corpus-sealed result as a live one later.
+    $script:ReviewerReplayClassification = $script:ReviewerReplaySnapshot.Classification
+    if ([bool]$script:ReviewerReplayClassification.NonPromotable) {
+        Write-Warning ("Replay snapshot '$ReplaySnapshotName' is classified " +
+            "'$($script:ReviewerReplayClassification.SealKind)' and is permanently non-promotable: it was sealed " +
+            "offline from captured material and contacted no live host. This run is research evidence and can " +
+            "never be promoted or published.")
+    }
+    # Publish replay where scope cannot hide it. $script: is invisible from a
+    # module, a thread job, or a child pwsh, and a guard that cannot see the
+    # flag would read that as permission to go live. The environment is visible
+    # from all of them, so the refusal in New-ReviewerSourceAzCliInvoker holds
+    # wherever that function ends up being loaded.
+    Publish-ReviewerSourceReplayEnvironment
+    # Say once, here, that a configured live fallback will be ignored, and
+    # remember it for the artifact. The transport itself must stay free of
+    # statement-position calls, and an operator who set the flag deserves to
+    # know it did nothing rather than wonder later why the CLI never ran.
+    if ($CfgAzCliFallbackEnabled) {
+        $script:ReviewerReplayAzFallbackSuppressed = $true
+        Write-Warning ("Offline replay ignores review.sourceTransport.azureDevOpsCliFallback.enabled: " +
+            "that fallback resolves and runs the az CLI and then contacts the REST API, and every read in a " +
+            "replayed run comes from the sealed snapshot instead.")
+    }
+
+    # A snapshot answers every question consistently, including the wrong ones.
+    # Bind it to the configuration this process is actually running under, or a
+    # snapshot of one repository replayed while configured for another produces
+    # a fully self-consistent artifact stamped with the wrong identity.
+    $replayBinding = $script:ReviewerReplaySnapshot.Binding
+    if ([string]$replayBinding.Organization -cne $Organization -or
+        [string]$replayBinding.Project -cne $ExpectedProject -or
+        [string]$replayBinding.RepositoryId -cne $cfgRepoId) {
+        throw ("Replay snapshot '$ReplaySnapshotName' was captured for " +
+            "$($replayBinding.Organization)/$($replayBinding.Project)/$($replayBinding.RepositoryId) " +
+            "and cannot be replayed under this configuration ($Organization/$ExpectedProject/$cfgRepoId).")
+    }
+    if ($PullRequestId -gt 0 -and $PullRequestId -ne [int]$replayBinding.PullRequestId) {
+        throw "Replay snapshot '$ReplaySnapshotName' records pull request $($replayBinding.PullRequestId), not $PullRequestId."
+    }
+    if ($PullRequestId -le 0) {
+        # Never let a replay drive candidate SELECTION: the recorded list is a
+        # moment in that repository's history, and reviewing "whatever it held"
+        # would silently make the run about a different pull request than the
+        # operator pinned.
+        throw "Offline replay requires -PullRequestId naming the pull request the snapshot was captured for ($($replayBinding.PullRequestId))."
+    }
+    if ($script:ReviewerReplaySnapshot.Bindings.ConfigSha256 -cne (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash.ToLowerInvariant()) {
+        Write-Warning ("Replay snapshot '$ReplaySnapshotName' was captured under a different reviewer config; " +
+            "the reads it needs may differ from the reads recorded.")
+    }
+    if ($script:ReviewerReplaySnapshot.Bindings.ScriptSha256 -cne (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()) {
+        Write-Warning ("Replay snapshot '$ReplaySnapshotName' was captured under a different build of this agent; " +
+            "a transport change since then can ask for reads the snapshot does not carry, which fails closed.")
+    }
+}
+
 # The ordered pass list is the single source of truth for how many model runs a
 # PR costs, so every consumer (launch loop, preview, manifest, log) agrees.
 $ReviewPassModels = if ($EffectiveSecondPassModel) { @($EffectiveModel, $EffectiveSecondPassModel) } else { @($EffectiveModel) }
 $IsTwoPass = (@($ReviewPassModels).Count -gt 1)
-$DeliveryAuthorization = New-ReviewerDeliveryAuthorization -PassCount @($ReviewPassModels).Count
+$DeliveryAuthorization = New-ReviewerDeliveryAuthorization -PassCount @($ReviewPassModels).Count `
+    -ReplayPreviewOnly:$script:ReviewerReplayActive
 $StartupWritesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) `
     -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)
 # Promotion is write intent even before its individual capabilities are checked.
@@ -2340,10 +2894,10 @@ if ($EffectiveEnableVerificationPreview) {
     if (-not $IsTwoPass) {
         throw "Verification preview requires two explicitly named independent generalist passes."
     }
-    if (@($ReviewPassModels | Where-Object {
-                $_ -ceq "claude-opus-5" -or $_ -ceq "gpt-5.6-sol"
-            }).Count -ne 2) {
-        throw "Verification preview requires the explicit claude-opus-5 and gpt-5.6-sol generalist pairing."
+    if (-not (Test-AgentGeneralistModelPair -Models @($ReviewPassModels))) {
+        throw ("Verification preview requires the explicit " +
+            "$($script:ReviewerGeneralistModelPair.First) and " +
+            "$($script:ReviewerGeneralistModelPair.Second) generalist pairing.")
     }
     if (-not $EnableConventionSpecialist) {
         throw "Verification preview requires -EnableConventionSpecialist so all layer-5 inputs are present."
@@ -2354,8 +2908,10 @@ if ($EffectiveEnableVerificationPreview) {
     }
     $EffectiveConventionVerifierModel = Assert-AgentSupportedModel `
         -ModelId $selectedConventionVerifierModel -Where "convention verifier model"
-    if ($EffectiveConventionVerifierModel -ceq $EffectiveConventionSpecialistModel) {
-        throw "The convention verifier model must differ from the convention-specialist discovery model."
+    if (@($ReviewPassModels | Where-Object {
+                $_ -ceq $EffectiveConventionSpecialistModel
+            }).Count -gt 0) {
+        throw "The convention-specialist discovery model must differ from both generalist cross-check models."
     }
     Test-AgentAllowToolCeiling -Candidates $script:ReviewerVerificationAllowToolCeiling `
         -Ceiling $script:ReviewerAllowToolCeiling -MandatoryDeny $script:ReviewerMandatoryDenyTools `
@@ -2392,6 +2948,106 @@ if (-not $StateDir) {
     $base = $env:LOCALAPPDATA
     if (-not $base) { $base = Join-Path $HOME ".local-state" }
     $StateDir = Join-Path (Join-Path (Join-Path $base $stateNamespace) "Reviewer") $AgentName
+}
+if ($script:ReviewerReplayActive) {
+    # Replay state is separate state. Sharing the live directory would let a
+    # replay burn a real pull request's attempt budget, supersede its recorded
+    # gate decisions, and drop preview artifacts a later live run reads back -
+    # external mutation by another name, and reached without any write switch.
+    $StateDir = Join-Path (Join-Path $StateDir "replay") $script:ReviewerReplaySnapshot.SnapshotId
+}
+# THE model-launch boundary for qualification. Everything above is this agent's
+# real startup validation, run against the exact argument vector the slot will
+# run; the next statement is the first one that creates anything. Stopping here
+# means a preflight that passes has proven the invocation starts, without a
+# state directory, a signing key, a session, a host call or a model.
+if ($QualificationPrelaunch) {
+    if (-not $script:ReviewerReplayActive) {
+        throw "-QualificationPrelaunch is restricted to offline replay; a live prelaunch probe is not permitted."
+    }
+    if ($PullRequestId -le 0) {
+        throw "-QualificationPrelaunch requires an explicit -PullRequestId so its source probe is bounded."
+    }
+
+    # Exercise the exact first wrapper-owned source request while the replay
+    # seam still guarantees zero host access - no process is started for a
+    # replay session, so this probe cannot reach the network even in principle.
+    # It catches a snapshot/config request-contract mismatch (a snapshot keyed
+    # on a repository identity the config does not name, a snapshot that carries
+    # no bounded direct read for this pull request) before a run set is
+    # declared, which is the only place that mismatch can still be fixed.
+    $probeRequest = Get-ReviewerCandidateSourceRequest -Project $ExpectedProject `
+        -RepositoryName $RepositoryName -TargetPullRequestId $PullRequestId -TargetRefName $TargetRefName
+    if ([string]$probeRequest.Action -cne "get") {
+        throw "-QualificationPrelaunch must probe a bounded direct read, not a '$($probeRequest.Action)'."
+    }
+    $probeKey = Get-AgentReplayRequestKey -Name $probeRequest.Name -Arguments $probeRequest.Arguments
+    $prelaunchSession = $null
+    $probeResolvedPullRequestId = 0
+    try {
+        $prelaunchSession = Open-AgentMcpSession -AgencyPath "offline-replay-not-executed" -Server "ado" `
+            -Organization $Organization -Toolsets @("repos") -TimeoutSeconds 30 `
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+            -ReplaySnapshot $script:ReviewerReplaySnapshot
+        $prelaunchPr = Invoke-AgentMcpTool -Session $prelaunchSession -Name $probeRequest.Name `
+            -Arguments $probeRequest.Arguments
+        if (-not $prelaunchPr) {
+            throw "Qualification prelaunch did not resolve the explicitly requested pull request."
+        }
+        $probeResolvedPullRequestId = [int](Get-ReviewerHashValue -Container $prelaunchPr -Key 'pullRequestId' -Default 0)
+        if ($probeResolvedPullRequestId -ne $PullRequestId) {
+            throw ("Qualification prelaunch resolved pull request $probeResolvedPullRequestId from the snapshot's " +
+                "recorded direct read, not the requested $PullRequestId.")
+        }
+    }
+    finally {
+        if ($prelaunchSession) { Close-AgentMcpSession -Session $prelaunchSession }
+    }
+
+    $prelaunch = [ordered]@{
+        seam                 = "reviewer.qualification-prelaunch.v1"
+        agentScriptSha256    = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        configFile           = $ConfigFile
+        configSha256         = (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash.ToLowerInvariant()
+        promptFile           = $PromptFile
+        repoPath             = $RepoPath
+        # Resolved, deliberately NOT created: the caller is told exactly where
+        # this run would have written, and nothing is written.
+        plannedStateDir      = $StateDir
+        stateDirExists       = [bool](Test-Path -LiteralPath $StateDir)
+        operatorAlias        = $OperatorAlias
+        pullRequestId        = $PullRequestId
+        organization         = $Organization
+        project              = $ExpectedProject
+        repositoryId         = $cfgRepoId
+        model                = $EffectiveModel
+        secondPassModel      = $EffectiveSecondPassModel
+        isTwoPass            = [bool]$IsTwoPass
+        conventionSpecialist = [bool]$EnableConventionSpecialist
+        conventionSpecialistModel = $EffectiveConventionSpecialistModel
+        verificationPreview  = [bool]$EffectiveEnableVerificationPreview
+        conventionVerifierModel = $EffectiveConventionVerifierModel
+        deliveryAuthorization = [string]$DeliveryAuthorization.Kind
+        deliveryAuthorizationReason = [string]$DeliveryAuthorization.Reason
+        replayActive         = [bool]$script:ReviewerReplayActive
+        replaySnapshotId     = $(if ($script:ReviewerReplayActive) { [string]$script:ReviewerReplaySnapshot.SnapshotId } else { "" })
+        replayManifestDigest = $(if ($script:ReviewerReplayActive) { [string]$script:ReviewerReplaySnapshot.ManifestDigest } else { "" })
+        replayNonPromotable  = $(if ($script:ReviewerReplayActive) { [bool]$script:ReviewerReplayClassification.NonPromotable } else { $false })
+        # Evidence of the probe, not a claim that one happened: the exact tool,
+        # action, arguments and request key the cycle will ask with, plus the
+        # pull request the snapshot answered with. A caller can recompute the
+        # key from the arguments and look it up in the snapshot it planned
+        # against, so "the run's first read is recorded" is checkable outside
+        # this process.
+        sourceProbeTool          = [string]$probeRequest.Name
+        sourceProbeAction        = [string]$probeRequest.Action
+        sourceProbeArguments     = [pscustomobject]$probeRequest.Arguments
+        sourceProbeRequestSha256 = [string]$probeKey.Key
+        sourceProbePullRequestId = [int]$probeResolvedPullRequestId
+    }
+    Write-Output ("REVIEWER_QUALIFICATION_PRELAUNCH_V1 " +
+        (ConvertTo-Json -InputObject ([pscustomobject]$prelaunch) -Depth 6 -Compress))
+    exit 0
 }
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 $StateDir = (Resolve-Path -LiteralPath $StateDir).Path
@@ -2439,27 +3095,6 @@ $ReviewFactScriptClosure = @(
         sha256 = (Get-FileHash -LiteralPath $ReviewFactLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 )
-# Two children, two different scrubs, and the asymmetry is deliberate rather
-# than an oversight - it is worth stating because the "obviously stricter"
-# version of this is broken.
-#
-# The Copilot child AUTHENTICATES to GitHub with COPILOT_GITHUB_TOKEN, GH_TOKEN
-# or GITHUB_TOKEN. Stripping those does not harden it, it stops it starting: on
-# a host where GITHUB_TOKEN is the only one set, a stricter scrub is
-# indistinguishable from a broken agent, and the failure surfaces as an
-# authentication error nobody will connect to a credential-hygiene change. It
-# gets the ADO-PAT-shaped names, which it has no use for and must not carry.
-#
-# The `agency mcp ado` child is the reverse. It authenticates through agency's
-# own credential flow, so it needs neither family, and a GitHub token in its
-# environment is pure blast radius. It gets both.
-#
-# Neither list is a substitute for the tool grant: the model has no shell and no
-# outbound-network tool, so it cannot read an environment variable at all. This
-# bounds what a COMPROMISED CHILD PROCESS holds, not what the model can ask for.
-$CopilotSensitiveEnvironmentVariables = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
-$McpSensitiveEnvironmentVariables = $CopilotSensitiveEnvironmentVariables +
-@("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 
 # Operator state inspection / recovery. These run before any cycle so a starved
 # or confusing state can be examined and cleared without hand-editing JSON.
@@ -2648,6 +3283,13 @@ function Get-ReviewerGateQualification {
         return @{ Qualification = $null; Sha256 = ("0" * 64) }
     }
     $resolvedQualificationPath = (Resolve-Path -LiteralPath $GateQualificationFile).Path
+    # The RAW master key, deliberately: a qualification artifact is minted out
+    # of band by tools/New-ReviewerGateQualification.ps1, so this reads someone
+    # else's artifact, like the two promotion readers - not something this run
+    # sealed, which is what the derived per-run domain is for. Under replay it
+    # fails verification regardless, because the redirected state directory
+    # holds a freshly generated master key of its own; that is fail-closed and
+    # harmless, since replay can never deliver anything anyway.
     $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
     $read = Read-ReviewerGateQualification -Path $resolvedQualificationPath -MasterKey $masterKey
     if (-not $read.Ok) {
@@ -2792,14 +3434,25 @@ function Invoke-ReviewerConventionSession {
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)][scriptblock]$Action,
         [scriptblock]$OpenSession,
-        [scriptblock]$CloseSession
+        [scriptblock]$CloseSession,
+        # A caller working against a hard wall-clock deadline may lower the
+        # transport's per-request timeout so the session it opens cannot outlive
+        # the bound it was started under. Zero keeps the configured timeout.
+        [ValidateRange(0, [int]::MaxValue)][int]$RequestTimeoutSeconds = 0
     )
+    $effectiveTimeoutSeconds = if ($RequestTimeoutSeconds -gt 0) {
+        [Math]::Min([int]$RequestTimeoutSeconds, [int]$McpTimeoutSeconds)
+    }
+    else {
+        [int]$McpTimeoutSeconds
+    }
     if (-not $OpenSession) {
         $OpenSession = {
             param([string]$Path)
             Open-AgentMcpSession -AgencyPath $Path -Server "ado" `
-                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $effectiveTimeoutSeconds `
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+                -ReplaySnapshot $script:ReviewerReplaySnapshot
         }
     }
     if (-not $CloseSession) {
@@ -2844,7 +3497,8 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
             try {
                 $sourceSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
                     -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-                    -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+                    -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+                    -ReplaySnapshot $script:ReviewerReplaySnapshot
             }
             catch {
                 if ($ConventionPackMode) {
@@ -2862,6 +3516,23 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
         $snapshots = New-Object System.Collections.Generic.List[hashtable]
         $totalBytes = 0
         foreach ($source in $sources) {
+            # Offline replay withholds a convention authoritative source that was
+            # never captured, at candidate level, rather than issuing a read the
+            # sealed snapshot cannot answer. This applies to BOTH the convention
+            # pack path and the generalist-context (repoConventions.authoritative
+            # Sources) path: an unrecorded read must degrade the affected source,
+            # never abort the whole cycle and take blind functional discovery down
+            # with it. The probe issues no request; the matching live path is
+            # unchanged (issue-and-throw on a real fault when replay is inactive).
+            if ($script:ReviewerReplayActive) {
+                $probeRepoArgs = @{ action = "get"; project = $source.Project; repositoryNameOrId = $source.RepositoryId }
+                $probeBranchArgs = @{ action = "get"; project = $source.Project; repositoryId = $source.RepositoryId; branchName = $source.Branch }
+                if (-not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_repository" -Arguments $probeRepoArgs) -or
+                    -not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_branch" -Arguments $probeBranchArgs)) {
+                    Write-Warning "Convention authoritative source '$(if ($source.Name) { $source.Name } else { $source.Path })' is not present in the sealed replay snapshot; withholding it (candidate-level convention degrade)."
+                    continue
+                }
+            }
             $repositoryKey = "$($source.Project)`n$($source.RepositoryId)"
             if (-not $repositoryCache.ContainsKey($repositoryKey)) {
                 try {
@@ -2902,6 +3573,14 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
                     -BranchResult $branchResult -ExpectedBranch $source.Branch
             }
             $commitSha = [string]$commitCache[$commitKey]
+
+            if ($script:ReviewerReplayActive) {
+                $probeFileArgs = @{ action = "get_content"; project = $source.Project; repositoryId = $source.RepositoryId; path = $source.Path; versionType = "Commit"; version = $commitSha }
+                if (-not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_file" -Arguments $probeFileArgs)) {
+                    Write-Warning "Convention authoritative source content '$($source.Path)' is not present in the sealed replay snapshot; withholding it (candidate-level convention degrade)."
+                    continue
+                }
+            }
 
             # Agency ADO repo_file accepts versionType=Commit and version=<sha>.
             # Live smoke proved historical commits return distinct bytes and a
@@ -2984,9 +3663,53 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
     }
 }
 
+function Test-ReviewerReplayConventionReadRecorded {
+    <#
+        Answers whether a convention-source read was captured in the sealed
+        replay snapshot, so an offline planner can withhold an unavailable
+        source at candidate level instead of issuing a request the snapshot
+        cannot answer (which would fail-closed and abort the whole cycle) or
+        falling through to a forbidden live read. Live mode always returns
+        true, so the readers keep their existing issue-and-throw behavior.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][hashtable]$Arguments
+    )
+    if (-not $script:ReviewerReplayActive) { return $true }
+    # Replay is active but this session carries no sealed snapshot. That is an
+    # inconsistent wiring state, not a licence to issue a live read: fail closed
+    # so the source is withheld (candidate-level convention degrade) rather than
+    # risk falling through to the forbidden live transport.
+    if (-not $Session.ContainsKey("Replay") -or $null -eq $Session["Replay"]) { return $false }
+    return (Test-AgentReplaySnapshotHasResponse -Snapshot $Session["Replay"] -Name $Name -Arguments $Arguments)
+}
+
 function Get-ReviewerConventionTargetCommit {
     param([Parameter(Mandatory)][hashtable]$Session)
     $targetBranch = $TargetRefName -replace '^refs/heads/', ''
+    # Offline replay resolves the reviewed target commit from the sealed
+    # snapshot binding, never from a live-shaped repo_branch read. The target
+    # commit is already an authoritatively bound corpus fact - it is checked at
+    # seal time against the corpus's own captured PR identity
+    # (lastMergeTargetCommit) and is covered by the manifest digest the operator
+    # pins - so re-deriving it by asking for the branch tip would only invite a
+    # request a replay cannot answer. A missing or malformed sealed commit is a
+    # candidate-level convention fault (it degrades the convention path), not a
+    # reason to fall through to a live read.
+    if ($script:ReviewerReplayActive) {
+        $sealedTarget = ""
+        if ($script:ReviewerReplaySnapshot -and $script:ReviewerReplaySnapshot.Binding) {
+            $sealedTarget = ([string]$script:ReviewerReplaySnapshot.Binding.targetCommit).ToLowerInvariant()
+        }
+        if ($sealedTarget -notmatch '^[0-9a-f]{40}$') {
+            throw (New-ReviewerConventionEnvironmentException -Operation "resolve reviewed target branch" `
+                    -InnerException ([InvalidOperationException]::new(
+                        "The sealed replay snapshot does not carry an exact reviewed-target commit for branch '$targetBranch'.")))
+        }
+        return $sealedTarget
+    }
     try {
         $branchResult = Invoke-AgentMcpTool -Session $Session -Name "repo_branch" -Arguments @{
             action       = "get"
@@ -3013,6 +3736,13 @@ function Get-ReviewerConventionRepositorySnapshots {
     foreach ($source in @($RepositorySources)) {
         $path = [string]$source.Path
         if (-not $seen.Add($path)) { continue }
+        if ($script:ReviewerReplayActive) {
+            $probeFileArgs = @{ action = "get_content"; project = $ExpectedProject; repositoryId = $cfgRepoId; path = $path; versionType = "Commit"; version = $TargetCommit }
+            if (-not (Test-ReviewerReplayConventionReadRecorded -Session $Session -Name "repo_file" -Arguments $probeFileArgs)) {
+                Write-Warning "Convention repository source '$path' is not present in the sealed replay snapshot; withholding it (candidate-level convention degrade)."
+                continue
+            }
+        }
         try {
             $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
                 name      = "repo_file"
@@ -3057,14 +3787,14 @@ function Save-ReviewerConventionPlan {
     )
     $planHash = Get-ReviewerConventionSpecialistObjectSha256 -Value $Plan
     $baseName = "pr$PrId-$SourceCommit-$($planHash.Substring(0, 16))"
-    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     return Save-ReviewerConventionPlanFile -Plan $Plan -Directory $conventionPlanDir `
         -BaseName $baseName -MasterKey $key
 }
 
 function Read-ReviewerConventionPlan {
     param([Parameter(Mandatory)][string]$Path)
-    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     return Read-ReviewerConventionPlanFile -Path $Path -MasterKey $key
 }
 
@@ -3327,13 +4057,13 @@ function Save-ReviewerFactPlan {
     $planHash = [string](Get-ReviewerFactValue $Plan "planSha256" "")
     if ($planHash -notmatch '^[0-9a-f]{64}$') { throw "A persisted fact plan requires a valid planSha256." }
     $baseName = "pr$PrId-$SourceCommit-$($planHash.Substring(0, 16))"
-    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     return Save-ReviewerFactPlanFile -Plan $Plan -Directory $factPlanDir -BaseName $baseName -Key $key
 }
 
 function Read-ReviewerFactPlan {
     param([Parameter(Mandatory)][string]$Path)
-    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     return Read-ReviewerFactPlanFile -Path $Path -SchemaPath $ReviewFactSchemaPath -Key $key
 }
 
@@ -3342,7 +4072,12 @@ function Format-ReviewerAuthoritativeSources {
         [hashtable[]]$Snapshots = @(),
         [ValidateRange(0, 262144)][int]$MaxTotalBytes = 0
     )
-    $items = @($Snapshots)
+    # Defensive against a caller that hands us $null or an array that coerces a
+    # withheld/empty snapshot set into a phantom single $null element: filter nulls
+    # so a fully-withheld authoritative context collapses to the empty early-return
+    # instead of running Measure-Object -Sum over nothing (which throws under
+    # StrictMode: "The property 'Sum' cannot be found on this object").
+    $items = @($Snapshots | Where-Object { $null -ne $_ })
     if ($items.Count -eq 0) { return "" }
     $actualBytes = [int](($items | Measure-Object -Property ByteLength -Sum).Sum)
     if ($MaxTotalBytes -lt 1 -or $actualBytes -gt $MaxTotalBytes) {
@@ -3422,6 +4157,18 @@ function Get-ReviewerRuntimeContext {
     $lines.Add("")
     $lines.Add("You have NO write tools this cycle, and never will: you do not post comments and you do not vote. Report findings in the marker; the wrapper performs any write. Do not attempt a write and do not treat its absence as an error.")
     $lines.Add("")
+    if ($script:ReviewerReplayActive) {
+        # Without this the run fails closed for the wrong reason: the prompt
+        # tells the model to re-read the pull request and stop without a marker
+        # if it cannot, and in replay it cannot, because it has no repository
+        # tool. The binding above was verified by the wrapper against a sealed
+        # snapshot before this text was written, so re-reading would add nothing
+        # even if it were possible.
+        $lines.Add("## Offline replay (wrapper-verified binding)")
+        $lines.Add("")
+        $lines.Add($script:ReviewerReplayModelNotice.TrimEnd())
+        $lines.Add("")
+    }
     if ($RepoConventionsText) {
         $lines.Add("## Repository conventions (supplied by this repository's config, not by the prompt)")
         $lines.Add("")
@@ -3596,13 +4343,39 @@ function Get-ReviewerConventionSourceSummary {
        is injected into the generalist's runtime context directly, while
        `repoConventions.conventionPacks` produces a sealed plan. Reporting on
        only one of them would make this line false for a config that uses the
-       other. #>
+       other.
+
+       When the caller supplies the configured/resolved authoritative-source
+       counts, a replay that withheld a configured source (one it never sealed)
+       is reported as "N of M resolved; K withheld" rather than misdiagnosed as a
+       configuration gap. #>
     param(
         [AllowEmptyString()][string]$ConventionPlanPath = "",
-        [AllowEmptyString()][string]$AuthoritativeSourcesText = ""
+        [AllowEmptyString()][string]$AuthoritativeSourcesText = "",
+        [int]$AuthoritativeSourceConfiguredCount = 0,
+        [int]$AuthoritativeSourceResolvedCount = -1
     )
     $authorityParts = [System.Collections.Generic.List[string]]::new()
-    if ($AuthoritativeSourcesText) {
+    if ($AuthoritativeSourceConfiguredCount -gt 0) {
+        # When the caller knows how many authoritative sources the config declared
+        # AND how many actually resolved, report both. Offline replay can withhold
+        # a configured source it never sealed; reporting only the resolved count
+        # (or, when all are withheld, the empty-text "declares no authoritative
+        # sources" line below) would misdiagnose a replay-capture gap as a config
+        # gap. The run is already degraded and non-postable in that case; this only
+        # keeps the human-facing artifact honest.
+        $resolved = [Math]::Max(0, $AuthoritativeSourceResolvedCount)
+        if ($resolved -ge $AuthoritativeSourceConfiguredCount) {
+            [void]$authorityParts.Add("$resolved commit-pinned authoritative source(s) in the generalist context")
+        }
+        else {
+            $withheldCount = $AuthoritativeSourceConfiguredCount - $resolved
+            [void]$authorityParts.Add(
+                "$resolved of $AuthoritativeSourceConfiguredCount configured authoritative source(s) resolved in the " +
+                "generalist context; $withheldCount withheld because the offline replay snapshot could not answer them")
+        }
+    }
+    elseif ($AuthoritativeSourcesText) {
         $sourceCount = ([regex]::Matches($AuthoritativeSourcesText, '(?m)^Source \d+ provenance:')).Count
         [void]$authorityParts.Add("$sourceCount commit-pinned authoritative source(s) in the generalist context")
     }
@@ -3638,6 +4411,91 @@ function Format-ReviewerCoveragePathCell {
     param([AllowEmptyString()][string]$Path)
     if ((ConvertTo-ReviewerSourcePath -Path $Path) -ceq $Path) { return "``$Path``" }
     return "(unsafe path, not shown)"
+}
+
+function Get-ReviewerReplayDeterminismDigests {
+    <#
+        Two digests, deliberately separate, because they make two different
+        claims.
+
+        replayInputDigest covers only what the WRAPPER computed from the
+        snapshot: the change-set digest, the whole source-coverage record, and
+        the tool grant. Nothing a model wrote enters it, so two replays of one
+        snapshot MUST produce the same value. A difference here is a
+        determinism defect in this toolkit.
+
+        replayOutcomeDigest covers the wrapper's normalized DECISIONS: the
+        anchor and severity of every candidate it would post, in sorted order,
+        plus the counts and the recommended vote. Comment prose is excluded, so
+        two models that say the same thing differently agree here - but the set
+        of anchors is still downstream of a live model, so a difference is a
+        real semantic difference and is reported as one rather than smoothed
+        over.
+    #>
+    param(
+        $SourceCoverage,
+        [object[]]$Postable = @(),
+        [object[]]$AllFindings = @(),
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RecommendedVote,
+        [string[]]$AllowTools = @()
+    )
+    $counts = Get-ReviewerSeverityCounts -Findings $AllFindings
+    # Named fields, not a blanket canonicalization of the whole coverage record:
+    # that record nests deeply enough to blow the canonical-JSON depth bound,
+    # and a digest that can throw is a digest that takes the run with it. These
+    # are the wrapper-computed facts a replay must reproduce exactly.
+    $coverageRecord = [ordered]@{}
+    if ($null -ne $SourceCoverage) {
+        foreach ($field in @(
+                "coveredFiles", "sourceBearingFileCount", "coveragePercent",
+                "totalSliceBytes", "totalSiblingBytes", "deliveredSpanCount",
+                "requestedSpanCount", "spanPercent", "changeSetExcusedFileCount",
+                "readerExcusedFileCount")) {
+            $coverageRecord[$field] = [int](Get-ReviewerHashValue -Container $SourceCoverage -Key $field -Default 0)
+        }
+        $coverageRecord["files"] = @(@(Get-ReviewerHashValue -Container $SourceCoverage -Key 'files' -Default @()) |
+            ForEach-Object {
+                "{0}|{1}|{2}|{3}" -f `
+                (Get-ReviewerNormalizedPath -Path ([string](Get-ReviewerHashValue -Container $_ -Key 'path' -Default ''))),
+                ([string](Get-ReviewerHashValue -Container $_ -Key 'status' -Default '')),
+                ([string](Get-ReviewerHashValue -Container $_ -Key 'reason' -Default '')),
+                ([int](Get-ReviewerHashValue -Container $_ -Key 'deliveredSpanCount' -Default 0))
+            })
+        # Ordinal, not Sort-Object: the canonical renderer preserves array order,
+        # so a culture comparison here would make the digest a function of the
+        # operator's locale - and this digest's whole claim is that a difference
+        # in it means a defect in this toolkit.
+        $coverageFiles = [string[]]@($coverageRecord["files"])
+        [Array]::Sort($coverageFiles, [StringComparer]::Ordinal)
+        $coverageRecord["files"] = @($coverageFiles)
+    }
+    $allowToolsSorted = [string[]]@($AllowTools)
+    [Array]::Sort($allowToolsSorted, [StringComparer]::Ordinal)
+    $inputRecord = [ordered]@{
+        coverage   = $coverageRecord
+        allowTools = @($allowToolsSorted)
+    }
+    $anchors = @(@($Postable) | ForEach-Object {
+            "{0}|{1}|{2}" -f `
+            ([string](Get-ReviewerHashValue -Container $_ -Key 'severity' -Default '')).ToLowerInvariant(),
+            (Get-ReviewerNormalizedPath -Path ([string](Get-ReviewerHashValue -Container $_ -Key 'filePath' -Default ''))),
+            ([int](Get-ReviewerHashValue -Container $_ -Key 'line' -Default 0))
+        })
+    $anchorsSorted = [string[]]@($anchors)
+    [Array]::Sort($anchorsSorted, [StringComparer]::Ordinal)
+    $outcomeRecord = [ordered]@{
+        anchors = @($anchorsSorted)
+        counts  = [ordered]@{
+            critical   = [int]$counts['critical']
+            important  = [int]$counts['important']
+            suggestion = [int]$counts['suggestion']
+        }
+        vote    = $RecommendedVote
+    }
+    return @{
+        InputDigest   = Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value $inputRecord)
+        OutcomeDigest = Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value $outcomeRecord)
+    }
 }
 
 function Write-ReviewerPreview {
@@ -3733,6 +4591,25 @@ function Write-ReviewerPreview {
         [void]$lines.Add("- Convention authority consulted: $ConventionSourceSummary")
     }
     [void]$lines.Add($(if ($Quiet) { "- Posting was enabled for this run; see the agent log for what was actually posted." } else { "- Nothing was posted: this is a preview." }))
+    if ($script:ReviewerReplayActive) {
+        $replayDigests = Get-ReviewerReplayDeterminismDigests -SourceCoverage $SourceCoverage `
+            -Postable $Postable -AllFindings $AllFindings -RecommendedVote $RecommendedVote `
+            -AllowTools (Get-ReviewerLaunchAllowTools -Intended (Get-ReviewerEffectiveAllowTools -BaseAllow $ConfigAllowTools))
+        [void]$lines.Add("- OFFLINE REPLAY of snapshot ``$($script:ReviewerReplaySnapshot.SnapshotId)`` (manifest digest ``$($script:ReviewerReplaySnapshot.ManifestDigest)``, replay nonce ``$($script:ReviewerReplaySnapshot.ReplayNonce)``). Every repository read came from that snapshot; no repository was contacted.")
+        [void]$lines.Add("- Replay input digest (wrapper-computed, must be identical on every replay of this snapshot): ``$($replayDigests.InputDigest)``")
+        [void]$lines.Add("- Replay outcome digest (wrapper-normalized decisions, excludes comment prose): ``$($replayDigests.OutcomeDigest)``")
+        [void]$lines.Add("- This is NOT a reproduction of a live run: every tool this agent can grant was denied at launch, so the model had no usable tool and could not look anything up for itself. A replay is therefore a LOWER bound on what a live run would find, and its marker-emission behaviour is not comparable to live: each pass is told not to stop merely because it cannot re-read the pull request.")
+        [void]$lines.Add("- This artifact is evidence, not an approved review: it is sealed under the replay key domain and can never be promoted.")
+        if ($script:ReviewerReplaySourceTransportMode) {
+            [void]$lines.Add("- Source was reproduced from the snapshot's canonical sealed source-transport artifact (``sourceTransportMode: $($script:ReviewerReplaySourceTransportMode)``). Its report, coverage, gate, and rendered source block were verified before use; replay made no live source request.")
+        }
+        else {
+            [void]$lines.Add("- Source was served by the schema-v1 snapshot-backed legacy path (``sourceTransportMode: snapshotLegacy``). This compatibility path can differ from the transport used by the recorded live run.")
+        }
+        if ($script:ReviewerReplayAzFallbackSuppressed) {
+            [void]$lines.Add("- The live Azure CLI source fallback was enabled in config and was SUPPRESSED for this replay: it resolves and runs the az CLI and then contacts the REST API. Source was read from the snapshot instead.")
+        }
+    }
     [void]$lines.Add("")
     if ($passCount -gt 1) {
         # Which model said what is the first thing a reader of a two-pass review
@@ -3837,6 +4714,11 @@ function Write-ReviewerPreview {
                 scriptSha256     = $ScriptSelfSha256
                 previewPath      = $path
                 previewSha256    = (Get-ReviewerTextSha256 -Text (Get-ReviewerNormalizedDocumentText -Text $text))
+                sourceCoverageJson = $(if ($null -eq $SourceCoverage) {
+                        ""
+                    } else {
+                        Get-ReviewerCanonicalJson -Value $SourceCoverage
+                    })
                 approvedComments = @(@($Postable) | ForEach-Object {
                         @{
                             severity = [string](Get-ReviewerHashValue -Container $_ -Key 'severity' -Default '')
@@ -3858,7 +4740,34 @@ function Write-ReviewerPreview {
             $artifact = @{
                 manifestJson = $manifestJson
                 signatureAlg = "HMACSHA256"
-                signature    = (Get-ReviewerArtifactSignature -ManifestJson $manifestJson -Key (Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath))
+                signature    = (Get-ReviewerArtifactSignature -ManifestJson $manifestJson -Key (Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath))
+            }
+            if ($script:ReviewerReplayActive) {
+                # Labelling, not enforcement. The enforcement is that the
+                # signature above was produced under the replay key domain and
+                # therefore cannot verify against the raw key -PromotePreview
+                # reads with; stripping this block does not make the artifact
+                # promotable. It is here so a human reading the file knows what
+                # it is without having to reason about key derivation.
+                $artifact["replay"] = [ordered]@{
+                    snapshotId     = $script:ReviewerReplaySnapshot.SnapshotId
+                    manifestDigest = $script:ReviewerReplaySnapshot.ManifestDigest
+                    replayNonce    = $script:ReviewerReplaySnapshot.ReplayNonce
+                    promotable     = $false
+                    # What actually served source here, and why that may not be
+                    # what a live run would have used. Replay declines the MCP
+                    # capability probe outright and declines the live az CLI
+                    # fallback if config asked for it, so source always comes
+                    # from the snapshot-backed legacy path. If the recorded run
+                    # used the newer contract or the CLI, coverage and span
+                    # basis can differ from this. Recorded rather than warned,
+                    # because the warning is gone by the time anyone reads this.
+                    sourceTransportMode     = $(if ($script:ReviewerReplaySourceTransportMode) {
+                            $script:ReviewerReplaySourceTransportMode
+                        } else { "snapshotLegacy" })
+                    capabilityProbeSuppressed = $true
+                    azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
+                }
             }
             Set-Content -LiteralPath $artifactPath -Value (ConvertTo-Json -InputObject $artifact -Depth 4) -Encoding UTF8
         }
@@ -3877,7 +4786,12 @@ function Write-ReviewerPreview {
         Write-Host $text
         Write-Host "===== end preview; saved to $path =====" -ForegroundColor Magenta
         if ($artifactPath) {
-            Write-Host "Publish exactly this review with: -PromotePreview `"$artifactPath`" -EnableFindingComments" -ForegroundColor Cyan
+            if ($script:ReviewerReplayActive) {
+                Write-Host "This is a REPLAY artifact and is not promotable: it is sealed under the replay key domain, so -PromotePreview cannot verify it." -ForegroundColor DarkYellow
+            }
+            else {
+                Write-Host "Publish exactly this review with: -PromotePreview `"$artifactPath`" -EnableFindingComments" -ForegroundColor Cyan
+            }
         }
     }
     Write-Host ""
@@ -3992,7 +4906,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 47
+    $total = 48
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -5165,7 +6079,8 @@ function Invoke-DryRunSelfChecks {
     }
     $rtParsed = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + (ConvertTo-Json -InputObject $rtMerged -Depth 8 -Compress)) `
         -MarkerPrefix $ResultMarkerPrefix `
-        -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $rtNonce -MaxFindingItems $MergedMarkerMaxFindingItems)
+        -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $rtNonce -MaxFindingItems $MergedMarkerMaxFindingItems) `
+        -ScanWindowChars $script:ReviewerMergedMarkerScanWindowChars
     if (-not $rtParsed) {
         $failures.Add("A merged marker built the way a live cycle builds it does not survive the marker schema, so every merged review would seal an artifact that can never be promoted.")
     }
@@ -5541,6 +6456,31 @@ function Invoke-DryRunSelfChecks {
         $renderA -cnotmatch '"commitSha":"a{40}"' -or
         $renderA -cnotmatch '"sha256":"82ae4e259f55c0fb1ac8aa1239e210ad0c3b2a43ab006b394affe94a10e16f72"') {
         $failures.Add("Authoritative source rendering did not preserve provenance behind a fresh collision-resistant boundary.")
+    }
+    # Regression: the offline all-convention-sources-withheld path. When every
+    # configured authoritative source is withheld, Get-ReviewerAuthoritativeSource
+    # Snapshots returns an empty array that collapses to AutomationNull, the caller
+    # coerces it to $null through Format-ReviewerAuthoritativeSources' [hashtable[]]
+    # parameter, and @($null) becomes a phantom single-element collection. This
+    # drives the exact deterministic pre-model sequence to the model-launch boundary
+    # under StrictMode and asserts it fails closed to empty text instead of throwing
+    # "The property 'Sum' cannot be found on this object".
+    $withheldRenderFailed = $false
+    foreach ($withheldInput in @(@(), $null, @($null), @($null, $null))) {
+        try {
+            $withheldText = Format-ReviewerAuthoritativeSources -Snapshots $withheldInput -MaxTotalBytes 35
+            if ($null -ne $withheldText -and [string]$withheldText -cne "") { $withheldRenderFailed = $true }
+        }
+        catch { $withheldRenderFailed = $true }
+    }
+    # A phantom $null next to a real snapshot must render only the real source.
+    try {
+        $mixedText = Format-ReviewerAuthoritativeSources -Snapshots @($null, $renderSnapshot) -MaxTotalBytes 35
+        if ([string]$mixedText -cnotmatch '"sha256":"82ae4e259f55c0fb1ac8aa1239e210ad0c3b2a43ab006b394affe94a10e16f72"') { $withheldRenderFailed = $true }
+    }
+    catch { $withheldRenderFailed = $true }
+    if ($withheldRenderFailed) {
+        $failures.Add("The all-authoritative-sources-withheld path did not fail closed to empty rendering under StrictMode.")
     }
     $legacyContext = Get-ReviewerRuntimeContext "nonce" 4242 $cfgRepoId ("a" * 40) "feature/x" "colleague" "[]"
     if (-not $legacyContext) { $failures.Add("Adding authoritative source text changed the positional runtime-context call contract.") }
@@ -6638,7 +7578,7 @@ function Invoke-DryRunSelfChecks {
             runOk = $true; runReasonCodes = @(); allWithheldReasonsSafe = $true
             verificationInputSha256 = ("1" * 64); verificationDecisionSha256 = ("2" * 64)
             passesRequested = 2; generalistPairComplete = $true
-            generalistPassModels = ((@("claude-opus-5", "gpt-5.6-sol") | Sort-Object) -join '|')
+            generalistPassModels = $script:ReviewerGeneralistModelPair.SortedKey
             decisionExpiresAtUtc = ([DateTime]::UtcNow.AddHours(1).ToString("o"))
             candidates = @($candidate); unattendedComments = @($candidate); unattendedSuggestions = @()
             humanPromotableComments = @($candidate)
@@ -6722,7 +7662,7 @@ function Invoke-DryRunSelfChecks {
         @{ Name = "verification decision sha missing"; Args = @{ DecisionOverrides = @{ verificationDecisionSha256 = ("0" * 64) } }; Reason = "verificationDecisionShaMissing" }
         @{ Name = "sealed pass count below two"; Args = @{ DecisionOverrides = @{ passesRequested = 1 } }; Reason = "sealedPassCountBelowTwo" }
         @{ Name = "generalist pair incomplete"; Args = @{ DecisionOverrides = @{ generalistPairComplete = $false } }; Reason = "generalistPassIncomplete" }
-        @{ Name = "generalist model pair mismatch"; Args = @{ DecisionOverrides = @{ generalistPassModels = "claude-opus-5" } }; Reason = "generalistPairMismatch" }
+        @{ Name = "generalist model pair mismatch"; Args = @{ DecisionOverrides = @{ generalistPassModels = $script:ReviewerGeneralistModelPair.First } }; Reason = "generalistPairMismatch" }
         @{ Name = "revalidation failed"; Args = @{ RevalidationOk = $false }; Reason = "revalidationFailed" }
         @{ Name = "PR not active"; Args = @{ PrIsActive = $false }; Reason = "prNotActive" }
         @{ Name = "PR is draft"; Args = @{ PrIsDraft = $true }; Reason = "prIsDraft" }
@@ -7253,8 +8193,8 @@ function Invoke-DryRunSelfChecks {
     $sc47NullPassAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $sc47NullPassManifest
     $sc47DegradedManifest = [pscustomobject]@{
         rawGeneralistPasses = @(
-            [pscustomobject]@{ status = "degraded"; model = "claude-opus-5"; markerJson = "" },
-            [pscustomobject]@{ status = "degraded"; model = "gpt-5.6-sol"; markerJson = "" }
+            [pscustomobject]@{ status = "degraded"; model = $script:ReviewerGeneralistModelPair.First; markerJson = "" },
+            [pscustomobject]@{ status = "degraded"; model = $script:ReviewerGeneralistModelPair.Second; markerJson = "" }
         )
     }
     $sc47DegradedAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $sc47DegradedManifest
@@ -7302,6 +8242,44 @@ function Invoke-DryRunSelfChecks {
         # never a broad delete of anything under the real -StateDir.
         Remove-Item -LiteralPath $gateSelfCheckSandboxDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+
+    Write-Host "[DRY-RUN] Self-check 48/$total : candidate discovery is a direct get when a pull request is named, and a list only when it is not" -ForegroundColor Cyan
+    # The third pre-model defect: the cycle always asked for a repository-wide
+    # census, and a bounded offline snapshot carries no such list, so both slots
+    # of a declared qualification set died before a model launched. The shape of
+    # each request is asserted here rather than left to a live read.
+    $sc48Targeted = Get-ReviewerCandidateSourceRequest -Project "ExampleProject" -RepositoryName "Example-Service" `
+        -TargetPullRequestId 4242 -TargetRefName "refs/heads/main"
+    $sc48TargetedKeys = @($sc48Targeted.Arguments.Keys | ForEach-Object { [string]$_ } | Sort-Object)
+    if ([string]$sc48Targeted.Name -cne "repo_pull_request" -or [string]$sc48Targeted.Action -cne "get" -or
+        ($sc48TargetedKeys -join ',') -cne "action,project,pullRequestId,repositoryId" -or
+        [string]$sc48Targeted.Arguments['action'] -cne "get" -or
+        [int]$sc48Targeted.Arguments['pullRequestId'] -ne 4242 -or
+        [string]$sc48Targeted.Arguments['repositoryId'] -cne "Example-Service") {
+        $failures.Add("A targeted run's candidate request is not the bounded direct get for exactly that pull request.")
+    }
+    else { Write-Host "  OK - a named pull request is resolved by a bounded direct get" -ForegroundColor Green }
+
+    $sc48Untargeted = Get-ReviewerCandidateSourceRequest -Project "ExampleProject" -RepositoryName "Example-Service" `
+        -TargetRefName "refs/heads/main"
+    $sc48UntargetedKeys = @($sc48Untargeted.Arguments.Keys | ForEach-Object { [string]$_ } | Sort-Object)
+    if ([string]$sc48Untargeted.Action -cne "list" -or
+        ($sc48UntargetedKeys -join ',') -cne "action,project,repositoryId,status,targetRefName,top" -or
+        [string]$sc48Untargeted.Arguments['status'] -cne "Active" -or
+        [string]$sc48Untargeted.Arguments['targetRefName'] -cne "refs/heads/main") {
+        $failures.Add("An untargeted run's candidate request is not the active-pull-request list for the target ref.")
+    }
+    else { Write-Host "  OK - only an untargeted run asks the repository for a census" -ForegroundColor Green }
+
+    $sc48RefusedUnbounded = $false
+    try {
+        Get-ReviewerCandidateSourceRequest -Project "ExampleProject" -RepositoryName "Example-Service" | Out-Null
+    }
+    catch { $sc48RefusedUnbounded = $true }
+    if (-not $sc48RefusedUnbounded) {
+        $failures.Add("A census with neither a pull request nor a target ref was composed instead of refused.")
+    }
+    else { Write-Host "  OK - a request bounded by neither a pull request nor a target ref is refused" -ForegroundColor Green }
 
     Write-Host ""
     if ($failures.Count -eq 0) {
@@ -7396,6 +8374,133 @@ function Get-ReviewerChangedPaths {
     }
 }
 
+function Get-ReviewerBoundSourceContent {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$CommitSha,
+        [Parameter(Mandatory)][string[]]$ChangeKinds,
+        [ValidateRange(0, [int]::MaxValue)][int]$MaxBytesPerFile = 0,
+        $Binding = $null
+    )
+    $effectiveMaxBytes = if ($MaxBytesPerFile -gt 0) {
+        $MaxBytesPerFile
+    } else {
+        [int]$SourceTransportPolicy.maxFetchBytesPerFile
+    }
+    if ($effectiveMaxBytes -gt $script:ReviewerSourceDecoderCeilingBytes) {
+        throw "The source-content read ceiling exceeds the decoder's hard byte ceiling."
+    }
+    $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
+        name = "repo_file"
+        arguments = @{
+            action = "get_content"
+            project = $ExpectedProject
+            repositoryId = $cfgRepoId
+            path = $Path
+            versionType = "Commit"
+            version = $CommitSha
+        }
+    }
+    $classified = Get-ReviewerSourceReaderResult -ToolResult $toolResult -Path $Path `
+        -Policy $SourceTransportPolicy -MaxBytesPerFile $effectiveMaxBytes -Decoder {
+        param($InnerToolResult, [string]$InnerPath)
+        ConvertFrom-AgentMcpResourceContent -ToolResult $InnerToolResult -ExpectedUri $InnerPath `
+            -MaxBytes $effectiveMaxBytes `
+            -AllowedMimeTypes @($SourceTransportPolicy.allowedMimeTypes)
+    }
+    if ($null -eq $classified) { return $null }
+    $result = [ordered]@{
+        Text = Get-ReviewerHashValue -Container $classified -Key "Text" -Default ""
+        MimeType = Get-ReviewerHashValue -Container $classified -Key "MimeType" -Default ""
+        ByteLength = [int](Get-ReviewerHashValue -Container $classified -Key "ByteLength" -Default 0)
+        Sha256 = Get-ReviewerHashValue -Container $classified -Key "Sha256" -Default ""
+        Rejected = Get-ReviewerHashValue -Container $classified -Key "Rejected" -Default ""
+        Path = $Path
+        CommitSha = $CommitSha
+        ChangeKinds = @($ChangeKinds)
+    }
+    if ($null -ne $Binding) {
+        foreach ($name in @("Organization", "Project", "RepositoryId", "PullRequestId",
+                "IterationId", "SourceCommit", "TargetCommit", "BaseCommit")) {
+            $result[$name] = $Binding.$name
+        }
+    }
+    return [pscustomobject]$result
+}
+
+function Resolve-ReviewerGetChangesCapability {
+    <# Detects the authoritative flat get_changes contract WITHOUT touching the
+       shared ordinary-transport session.
+
+       tools/list is a probe, and any failure Send-AgentMcpRequest raises has
+       already aborted the session it ran on. The shared session owns every
+       remaining PR read this cycle plus the pending PR writes, so probing on it
+       and then falling through to the legacy body would run that body on a closed
+       session and take out the whole cycle. Instead the probe runs on a dedicated,
+       short-lived, repos-only MCP session that is ALWAYS closed, whatever happens.
+
+       The structured capability - or $null on the old schema, a probe open
+       failure, or a tools/list failure - is cached on the shared session hashtable
+       (including the null), so the probe runs at most once per cycle and never
+       re-opens a second child. The seams are injected so the whole decision can be
+       replayed offline. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [scriptblock]$OpenProbeSession,
+        [scriptblock]$CloseProbeSession
+    )
+    if ($Session.ContainsKey('GetChangesCapability')) { return $Session['GetChangesCapability'] }
+    # Replay owns this decision before the probe does. The probe opens its own
+    # short-lived MCP session, and in replay that session would be a LIVE one -
+    # the snapshot is never handed to it - so the one thing offline replay
+    # promises would be broken by a capability check.
+    #
+    # Returning $null is not a workaround: it is the documented outcome for the
+    # old schema or a probe failure, and the caller already handles it by
+    # running the legacy body on an untouched session. Cached like any other
+    # answer so the decision is made once.
+    if ($script:ReviewerReplayActive) {
+        $Session['GetChangesCapability'] = $null
+        return $null
+    }
+    if (-not $OpenProbeSession) {
+        $OpenProbeSession = {
+            param([string]$Path)
+            Open-AgentMcpSession -AgencyPath $Path -Server "ado" `
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+        }
+    }
+    if (-not $CloseProbeSession) {
+        $CloseProbeSession = { param([hashtable]$ProbeSession) Close-AgentMcpSession -Session $ProbeSession -Abort }
+    }
+    $capability = $null
+    $probeSession = $null
+    try {
+        $probeSession = & $OpenProbeSession $AgencyPath
+        if ($probeSession -is [hashtable] -and [string]$probeSession.Server -ceq "ado" -and
+            [string]$probeSession.Organization -ceq $Organization) {
+            $toolsListResult = Send-AgentMcpRequest -Session $probeSession -Method "tools/list" -Params @{}
+            $capability = Test-ReviewerSourceGetChangesCapability -ToolsListResult $toolsListResult
+        }
+    }
+    catch {
+        # A probe open or tools/list failure leaves the shared session untouched and
+        # the legacy body runs against it. Never rethrow: the probe is best-effort.
+        $capability = $null
+    }
+    finally {
+        if ($probeSession) {
+            try { & $CloseProbeSession $probeSession }
+            catch { Write-Warning "Could not close the get_changes capability probe session: $($_.Exception.Message)" }
+        }
+    }
+    $Session['GetChangesCapability'] = $capability
+    return $capability
+}
+
 function Get-ReviewerSourceTransport {
     <# Reads the pinned bytes of every changed file itself and returns the sealed
        block plus its coverage report.
@@ -7410,20 +8515,83 @@ function Get-ReviewerSourceTransport {
 
        Failure is never silent: a file that cannot be read, is too large, is not
        text, or does not fit the budget is recorded with a reason code and shown
-       to the model in the accounting table. #>
+       to the model in the accounting table.
+
+       When the MCP server exposes the authoritative get_changes contract
+       (detected via tools/list: the flat additive input schema carries
+       iterationId/top/skip alongside the get_changes action), the wrapper reads
+       the change set as bounded, iteration-pinned pages that each carry a
+       consistent identity - commonRefCommit/sourceRefCommit/targetRefCommit,
+       iterationReason and retarget names - and re-reads the whole set after the
+       content reads, failing closed on any identity or change-list movement. The
+       common->source content fallback then feeds the dormant deterministic
+       recovery of pure same-path degenerate edits. #>
     param(
         [Parameter(Mandatory)][hashtable]$Session,
         [Parameter(Mandatory)][int]$PrId,
-        [Parameter(Mandatory)][string]$SourceCommit
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$AgencyPath
     )
     if ($SourceCommit -notmatch '^[0-9a-f]{40}$') {
         throw "The sealed source transport requires an exact lowercase 40-hex source commit."
     }
+    if ($script:ReviewerReplayActive -and $script:ReviewerReplaySnapshot -and $script:ReviewerReplaySnapshot.SourceTransport) {
+        $sourceReplay = $script:ReviewerReplaySnapshot.SourceTransport
+        $artifactText = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$sourceReplay.ArtifactBytes)
+        $artifactEnvelope = $artifactText | ConvertFrom-Json -AsHashtable -Depth 64 -ErrorAction Stop
+        $expectedBinding = [ordered]@{
+            organization = $Organization
+            project = $ExpectedProject
+            repositoryId = $cfgRepoId.ToLowerInvariant()
+            pullRequestId = $PrId
+            iterationId = [int]$script:ReviewerReplaySnapshot.Binding.iterationId
+            commonCommit = [string]$script:ReviewerReplaySnapshot.Binding.commonCommit
+            sourceCommit = $SourceCommit
+            targetCommit = [string]$script:ReviewerReplaySnapshot.Binding.targetCommit
+            changeSetSha256 = [string]$script:ReviewerReplaySnapshot.Binding.changeSetSha256
+        }
+        $transport = Import-ReviewerSourceTransportReplayArtifact -Bytes ([byte[]]$sourceReplay.ArtifactBytes) `
+            -ExpectedBinding $expectedBinding -Policy $SourceTransportPolicy `
+            -PolicySha256 $SourceTransportPolicySha256
+        if ([string]$transport.Mode -cne [string]$sourceReplay.Mode) {
+            throw "Sealed source-transport mode does not match the replay manifest descriptor."
+        }
+        $script:ReviewerReplaySourceTransportMode = [string]$transport.Mode
+        return $transport
+    }
+    # -- Capability gate: detect authoritative get_changes contract via tools/list.
+    #    The probe NEVER runs on the shared ordinary-transport session: a tools/list
+    #    failure aborts the session it runs on, and this session owns every remaining
+    #    PR read plus the pending PR writes, so a probe failure on it would take out
+    #    the whole cycle. Resolve-ReviewerGetChangesCapability runs the probe on a
+    #    dedicated short-lived repos-only session, always closes it, and caches the
+    #    structured capability (or $null) on the shared session so the legacy body
+    #    below runs on an untouched session on the old schema or on any probe failure. --
+    $capability = Resolve-ReviewerGetChangesCapability -Session $Session -AgencyPath $AgencyPath
+    if ($null -ne $capability) {
+        return Get-ReviewerSourceTransportNewContract -Session $Session -PrId $PrId `
+            -SourceCommit $SourceCommit -Capability $capability
+    }
+    if ($CfgAzCliFallbackEnabled) {
+        # In replay the fallback is not merely unnecessary, it is wrong. Replay's
+        # whole contract is that every byte came from the sealed snapshot; the
+        # CLI fallback is a second, LIVE transport that shells out to `az` and
+        # then talks to the REST API. Taking it here would mix live data into a
+        # sealed run, which is worse than failing - so replay falls through to
+        # the legacy body below and reads the snapshot like everything else. A
+        # read the snapshot does not carry still fails closed there, with the
+        # exact request named. The operator is told once, at startup.
+        if (-not $script:ReviewerReplayActive) {
+            return Get-ReviewerSourceTransportAzCliFallback -Session $Session -PrId $PrId `
+                -SourceCommit $SourceCommit
+        }
+    }
+    # -- Legacy get_changes path (unchanged) --
     $changes = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
         action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
         pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
     }
-    $spansByPath = Get-ReviewerSourceChangedSpans -Response $changes
+    $aggregateSpansByPath = Get-ReviewerSourceChangedSpans -Response $changes
     $changeKindsByPath = Get-ReviewerSourceChangeKindsByPath -Response $changes
     # Assign directly: Get-ReviewerChangePathsFromResponse returns its array
     # behind a unary comma so a one-path change set does not unroll to a bare
@@ -7431,40 +8599,38 @@ function Get-ReviewerSourceTransport {
     # which collapses every path into one space-joined string - a shape that
     # still looks like a legal change set and shows up only as zero coverage.
     $paths = Get-ReviewerChangePathsFromResponse -Response $changes
-    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $paths -SpansByPath $spansByPath `
+    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $paths -SpansByPath $aggregateSpansByPath `
         -ObservedRightHandBlockCount (Measure-ReviewerSourceRightHandBlocks -Response $changes)
-    $reader = {
+    $defaultReader = {
         param([string]$Path)
-        # The request and the decode are separated deliberately. EVERY failure
-        # Send-AgentMcpRequest raises has already aborted the session, and the
-        # session is shared by every PR in this cycle - so absorbing one as
-        # "this file was unreadable" would grind through the rest of the change
-        # set and then take out the whole cycle with a misleading reason.
-        $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
-            name = "repo_file"
-            arguments = @{
-                action = "get_content"
-                project = $ExpectedProject
-                repositoryId = $cfgRepoId
-                path = $Path
-                versionType = "Commit"
-                version = $SourceCommit
-            }
-        }
-        # Classification lives in the library so the seam is exercisable
-        # offline; the strict decode is injected so nothing about its
-        # safety contract is duplicated or relaxed here.
-        return Get-ReviewerSourceReaderResult -ToolResult $toolResult -Path $Path -Policy $SourceTransportPolicy -Decoder {
-            param($InnerToolResult, [string]$InnerPath)
-            ConvertFrom-AgentMcpResourceContent -ToolResult $InnerToolResult -ExpectedUri $InnerPath `
-                -MaxBytes $script:ReviewerSourceDecoderCeilingBytes `
-                -AllowedMimeTypes @($SourceTransportPolicy.allowedMimeTypes)
-        }
+        $kinds = @()
+        if ($changeKindsByPath.Contains($Path)) { $kinds = @($changeKindsByPath[$Path]) }
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit -ChangeKinds $kinds
+    }.GetNewClosure()
+    $recoveryContext = [pscustomobject]@{
+        SpansByPath = $aggregateSpansByPath; SpanBasisByPath = $null
+        ExpectedSpanCountByPath = $null; AttemptedFileCount = 0
+        RecoveredPaths = @(); EvidenceBlockCount = 0; Reader = $defaultReader
+        BaseCommit = ""; IterationId = 0
     }
+    $spansByPath = $recoveryContext.SpansByPath
+    $spanBasisByPath = $recoveryContext.SpanBasisByPath
+    $expectedSpanCountByPath = $recoveryContext.ExpectedSpanCountByPath
+    $recoveryAttemptedFileCount = [int]$recoveryContext.AttemptedFileCount
+    $recoveryRecoveredFileCount = @($recoveryContext.RecoveredPaths).Count
+    $recoveryEvidenceBlockCount = [int]$recoveryContext.EvidenceBlockCount
+    $recoveryBaseCommit = [string]$recoveryContext.BaseCommit
+    $recoveryIterationId = [int]$recoveryContext.IterationId
+    $reader = $recoveryContext.Reader
     $report = New-ReviewerSourceTransportReport -CommitSha $SourceCommit -ChangedPaths $paths `
         -SpansByPath $spansByPath -Policy $SourceTransportPolicy -Reader $reader `
-        -ChangeKindsByPath $changeKindsByPath
-    # The spans come from the PR's CURRENT iteration while the bytes come from
+        -ChangeKindsByPath $changeKindsByPath -SpanBasisByPath $spanBasisByPath `
+        -ExpectedSpanCountByPath $expectedSpanCountByPath `
+        -RecoveryAttemptedFileCount $recoveryAttemptedFileCount `
+        -RecoveryRecoveredFileCount $recoveryRecoveredFileCount `
+        -RecoveryEvidenceBlockCount $recoveryEvidenceBlockCount `
+        -RecoveryBaseCommit $recoveryBaseCommit -RecoveryIterationId $recoveryIterationId
+    # The spans come from the PR's aggregate change set while the bytes come from
     # the pinned commit. If the author pushed in between, the slices would be
     # correct bytes at the wrong lines, hashed cleanly, with nothing to notice
     # it. Re-read the head and refuse if it moved.
@@ -7478,11 +8644,6 @@ function Get-ReviewerSourceTransport {
     }
     $blockText = ""
     if (@($report.Files).Count -gt 0) {
-        # Rendered whenever there is anything to account for, not only when
-        # something was delivered. The accounting table IS the property this
-        # layer sells; suppressing it exactly when the model has no source
-        # would leave the model with no source and no statement that any is
-        # missing - and both prompts promise the block is there.
         $blockText = Format-ReviewerSealedSourceBlock -Report $report -NonceFactory { New-AgentNonce }
     }
     return @{
@@ -7490,7 +8651,149 @@ function Get-ReviewerSourceTransport {
         BlockText = $blockText
         Gate      = (Test-ReviewerSourceCoverageGate -Report $report -Policy $SourceTransportPolicy)
         Record    = (ConvertTo-ReviewerSourceCoverageRecord -Report $report -PolicySha256 $SourceTransportPolicySha256)
+        Mode      = "legacyMcp"
     }
+}
+
+function Get-ReviewerSourceTransportNewContract {
+    <# Authoritative get_changes path: a thin adapter over the library orchestrator
+       Invoke-ReviewerSourceNewContractTransport. It supplies the three live seams -
+       the repo_pull_request tool invoker and the pinned source/base content readers -
+       plus the validated capability, policy, and nonce factory, and returns whatever
+       bundle the orchestrator produces. All validation, path selection, fileDiff
+       handling, recovery, reporting, and the post-read iteration re-read live in the
+       library so they can be replayed offline; nothing about the decision is made
+       here. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)]$Capability
+    )
+    $toolInvoker = {
+        param([hashtable]$Arguments)
+        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments $Arguments
+    }.GetNewClosure()
+    $aggregateReader = {
+        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
+            pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
+        }
+    }.GetNewClosure()
+    $sourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit -ChangeKinds @($Kinds)
+    }.GetNewClosure()
+    $baseReader = {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit -ChangeKinds @($Kinds)
+    }.GetNewClosure()
+    [int]$recoveryBytesPerSide = [int]$script:ReviewerSourceMaxRecoveryBytesPerSide
+    $recoverySourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit `
+            -ChangeKinds @($Kinds) -MaxBytesPerFile $recoveryBytesPerSide
+    }.GetNewClosure()
+    $recoveryBaseReader = {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit `
+            -ChangeKinds @($Kinds) -MaxBytesPerFile $recoveryBytesPerSide
+    }.GetNewClosure()
+    $result = Invoke-ReviewerSourceNewContractTransport -ToolInvoker $toolInvoker -Reader $sourceReader `
+        -BaseReader $baseReader -RecoveryReader $recoverySourceReader -RecoveryBaseReader $recoveryBaseReader `
+        -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+        -PrId $PrId -SourceCommit $SourceCommit -Capability $Capability -Policy $SourceTransportPolicy `
+        -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce } `
+        -AggregateReader $aggregateReader
+    return @{
+        Report = $result.Report; BlockText = $result.BlockText; Gate = $result.Gate
+        Record = $result.Record; Binding = $result.Binding; Mode = "mcpFlat"
+    }
+}
+
+function Get-ReviewerSourceTransportAzCliFallback {
+    <# Explicitly enabled fallback for hosts that still expose aggregate line-diff
+       blocks but not authoritative iteration identity. Azure CLI supplies only
+       the latest iteration and its common-to-source change pages; the existing
+       MCP aggregate response and pinned file readers remain the content seams. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    $azInvoker = New-ReviewerSourceAzCliInvoker -Organization $Organization `
+        -ExpectedTenantId $CfgAzCliFallbackTenantId
+    $azCaptureFunction = ${function:Get-ReviewerSourceAzIdentityCapture}
+    $identityReader = {
+        return & $azCaptureFunction -AzInvoker $azInvoker -Project $ExpectedProject `
+            -RepositoryId $cfgRepoId.ToLowerInvariant() -PrId $PrId -SourceCommit $SourceCommit
+    }.GetNewClosure()
+    $aggregateReader = {
+        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
+            pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
+        }
+    }.GetNewClosure()
+    $sourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+            -CommitSha $SourceCommit -ChangeKinds @($Kinds)
+    }.GetNewClosure()
+    $baseReader = {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+            -CommitSha $BaseCommit -ChangeKinds @($Kinds)
+    }.GetNewClosure()
+    [int]$recoveryBytesPerSide = [int]$script:ReviewerSourceMaxRecoveryBytesPerSide
+    $recoverySourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+            -CommitSha $SourceCommit -ChangeKinds @($Kinds) `
+            -MaxBytesPerFile $recoveryBytesPerSide
+    }.GetNewClosure()
+    $recoveryBaseReader = {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+            -CommitSha $BaseCommit -ChangeKinds @($Kinds) `
+            -MaxBytesPerFile $recoveryBytesPerSide
+    }.GetNewClosure()
+    $result = Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
+        -Reader $sourceReader -BaseReader $baseReader -RecoveryReader $recoverySourceReader `
+        -RecoveryBaseReader $recoveryBaseReader -AggregateReader $aggregateReader `
+        -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+        -PrId $PrId -SourceCommit $SourceCommit -Policy $SourceTransportPolicy `
+        -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce }
+    return @{
+        Report = $result.Report; BlockText = $result.BlockText; Gate = $result.Gate
+        Record = $result.Record; Binding = $result.Binding; Mode = "azureDevOpsCliFallback"
+    }
+}
+
+function Save-ReviewerSourceTransportReplayCapture {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][hashtable]$Transport
+    )
+    if (-not $Transport.Binding) {
+        throw "The selected source transport does not expose authoritative iteration binding and cannot be captured for exact replay."
+    }
+    $capturePath = [IO.Path]::GetFullPath($Path)
+    $repoPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\..")).TrimEnd('\') + '\'
+    if ($capturePath.StartsWith($repoPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Source-transport replay artifacts are private and must be captured outside the repository."
+    }
+    if (Test-Path -LiteralPath $capturePath) {
+        throw "Source-transport replay artifact '$capturePath' already exists; immutable capture refuses overwrite."
+    }
+    $captureParent = Split-Path -Parent $capturePath
+    if (-not (Test-Path -LiteralPath $captureParent -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $captureParent -Force)
+    }
+    $captureBytes = New-ReviewerSourceTransportReplayArtifact -Binding $Transport.Binding `
+        -Mode ([string]$Transport.Mode) -PolicySha256 $SourceTransportPolicySha256 `
+        -Policy $SourceTransportPolicy -Report $Transport.Report `
+        -BlockText ([string]$Transport.BlockText)
+    [IO.File]::WriteAllBytes($capturePath, $captureBytes)
 }
 
 function Get-ReviewerPinnedConventionChangeSet {
@@ -7558,6 +8861,208 @@ function Get-ReviewerPinnedConventionChangeSet {
         Entries      = $second
         Digest       = $secondDigest
         TargetCommit = $targetAfter
+    }
+}
+
+function Test-ReviewerConstructFileHadChangedLines {
+    <#
+        Did this changed file have source lines the enumerator should have
+        seen? `RawSpans` only exists on the entry the slicer builds, so a file
+        omitted earlier - too large, unreadable, past the file cap, a rejected
+        path - has none. `RawRequestedSpanCount` survives every omission path.
+    #>
+    param([Parameter(Mandatory)]$File)
+    if (@($File.RawSpans).Count -gt 0) { return $true }
+    return ([int](Get-ReviewerHashValue -Container $File -Key "RawRequestedSpanCount" -Default 0) -gt 0)
+}
+
+function Get-ReviewerConstructFilesFromReport {
+    <#
+        Turns the source-transport report into the shape the construct
+        enumerator reads.
+
+        Only DELIVERED lines are offered. A construct enumerated over source
+        nobody read would be worse than none: the accounting would demand an
+        answer about a call the model was never shown. Sibling slices are
+        included as context but never as changed lines, so a rule can see what
+        the surrounding code already does without the change set appearing to
+        contain it.
+    #>
+    param([Parameter(Mandatory)]$Report)
+    $files = [System.Collections.Generic.List[object]]::new()
+    # Paths the enumerator will never see. A file nobody read contributes no
+    # anchors, so no row owes a verdict for it, and every row is then an exact
+    # cover of a change set with a hole in it. An unmodelled language and a
+    # lexer that gave up are both recorded as partly-understood; a file that was
+    # never delivered is the same kind of gap and has to be recorded too, or
+    # "Complete: True" is a claim about less code than the pull request changed.
+    $undelivered = [System.Collections.Generic.List[string]]::new()
+    foreach ($file in @($Report.Files)) {
+        $slices = @($file.Slices)
+        $siblings = @($file.SiblingSlices)
+        $path = ([string]$file.Path).TrimStart("/")
+        if ($slices.Count -eq 0) {
+            # `RawSpans` is only populated by the entry the SLICER builds. A
+            # file omitted before that - too large, unreadable, past the file
+            # cap, a rejected path - carries no spans at all, so gating on them
+            # missed precisely the files nobody read.
+            # `RawRequestedSpanCount` survives every omission path and is what
+            # "this file had changed lines" actually means.
+            if (Test-ReviewerConstructFileHadChangedLines -File $file) { [void]$undelivered.Add($path) }
+            continue
+        }
+        $maxLine = 0
+        foreach ($slice in ($slices + $siblings)) {
+            if ([int]$slice.EndLine -gt $maxLine) { $maxLine = [int]$slice.EndLine }
+        }
+        if ($maxLine -lt 1) {
+            if (Test-ReviewerConstructFileHadChangedLines -File $file) { [void]$undelivered.Add($path) }
+            continue
+        }
+        # A sparse image of the file: delivered lines in place, gaps blank. The
+        # enumerator works on line positions, so keeping the real numbering is
+        # what makes a construct's anchor mean the same thing to a human
+        # reading the pull request.
+        $lines = New-Object string[] $maxLine
+        for ($index = 0; $index -lt $maxLine; $index++) { $lines[$index] = "" }
+        $changedLines = [System.Collections.Generic.List[int]]::new()
+        $deliveredLines = [System.Collections.Generic.HashSet[int]]::new()
+        foreach ($slice in ($slices + $siblings)) {
+            $sliceLines = ([string]$slice.Text) -split "`n"
+            $start = [int]$slice.StartLine
+            for ($offset = 0; $offset -lt $sliceLines.Count; $offset++) {
+                $lineNumber = $start + $offset
+                if ($lineNumber -lt 1 -or $lineNumber -gt $maxLine) { continue }
+                $lines[$lineNumber - 1] = ([string]$sliceLines[$offset]).TrimEnd("`r")
+                [void]$deliveredLines.Add($lineNumber)
+            }
+        }
+        $wholeFileLineCount = [int](Get-ReviewerHashValue -Container $file -Key "LineCount" -Default 0)
+        $wholeFileSha256 = [string](Get-ReviewerHashValue -Container $file -Key "FileSha256" -Default "")
+        $wholeFileComplete = (
+            [string](Get-ReviewerHashValue -Container $file -Key "Status" -Default "") -ceq "delivered" -and
+            -not [string](Get-ReviewerHashValue -Container $file -Key "Reason" -Default "") -and
+            $wholeFileLineCount -gt 0 -and $wholeFileSha256 -cmatch '^[0-9a-f]{64}$' -and
+            $deliveredLines.Count -eq $wholeFileLineCount)
+        if ($wholeFileComplete) {
+            for ($lineNumber = 1; $lineNumber -le $wholeFileLineCount; $lineNumber++) {
+                if (-not $deliveredLines.Contains($lineNumber)) {
+                    $wholeFileComplete = $false
+                    break
+                }
+            }
+        }
+        # The pull request's OWN hunks, intersected with what was delivered - not
+        # the whole slice. A slice is a hunk plus a context radius, so treating
+        # every delivered line as changed would hand the model sixty untouched
+        # lines per hunk to rule on, and would let a comment land on code this
+        # pull request never wrote.
+        #
+        # Merged into disjoint intervals FIRST. The clamp below bounds one span;
+        # it does nothing about two thousand overlapping ones, and spans
+        # accumulate per path across change entries. Two thousand whole-file
+        # spans over a four-thousand-line file walked eight million line
+        # positions - about four minutes and half a gigabyte, on the mandatory
+        # path of every review.
+        #
+        # Both the changed-line walk and the spanned-line total read the merged
+        # set. That matters: the partial-delivery test below compares them, and
+        # it is only correct because each counts every line exactly once.
+        # De-duplicating one side alone would invent a partial file.
+        $rawSpans = @($file.RawSpans)
+        $mergedSpans = [System.Collections.Generic.List[object]]::new()
+        foreach ($span in @($rawSpans | Sort-Object -Property @{ Expression = { [long]$_.Start } }, @{ Expression = { [long]$_.End } })) {
+            $spanStart = [long][Math]::Max([long]1, [long]$span.Start)
+            $spanEnd = [long]$span.End
+            if ($spanEnd -lt $spanStart) { continue }
+            if ($mergedSpans.Count -gt 0 -and $spanStart -le ([long]$mergedSpans[$mergedSpans.Count - 1].End + 1)) {
+                if ($spanEnd -gt [long]$mergedSpans[$mergedSpans.Count - 1].End) {
+                    $mergedSpans[$mergedSpans.Count - 1].End = $spanEnd
+                }
+                continue
+            }
+            [void]$mergedSpans.Add([pscustomobject]@{ Start = $spanStart; End = $spanEnd })
+        }
+        foreach ($span in $mergedSpans) {
+            # Clamp to the image we actually built. `RawSpans` carries the
+            # provider's own `modifiedLineNumberStart` + `modifiedLinesCount`
+            # unclamped and on purpose, and nothing upstream bounds the count -
+            # so a change set that overstates it (a truncated generated file, a
+            # provider counting against the pre-truncation text, a hostile
+            # snapshot) would spin here. A hang is not an exception, so the
+            # caller's try/catch cannot save it.
+            $spanStart = [long]$span.Start
+            $spanEnd = [long][Math]::Min([long]$maxLine, [long]$span.End)
+            if ($spanStart -gt $maxLine -or $spanEnd -lt $spanStart) { continue }
+            for ($lineNumber = $spanStart; $lineNumber -le $spanEnd; $lineNumber++) {
+                if ($deliveredLines.Contains([int]$lineNumber)) { [void]$changedLines.Add([int]$lineNumber) }
+            }
+        }
+        if ($rawSpans.Count -eq 0) {
+            # No hunk record for this path: fall back to the delivered changed
+            # slices rather than enumerating nothing, and let the construct
+            # status carry the imprecision.
+            foreach ($slice in $slices) {
+                for ($lineNumber = [int]$slice.StartLine; $lineNumber -le [int]$slice.EndLine; $lineNumber++) {
+                    [void]$changedLines.Add($lineNumber)
+                }
+            }
+        }
+        [void]$files.Add(@{
+                Path = ([string]$file.Path).TrimStart("/")
+                Lines = $lines
+                ChangedLines = $changedLines.ToArray()
+                DeliveredLines = @($deliveredLines)
+                WholeFileLineCount = $wholeFileLineCount
+                WholeFileSha256 = $wholeFileSha256
+                WholeFileComplete = $wholeFileComplete
+            })
+        # Delivered, but only in part: the hunks that fell outside the delivered
+        # lines contributed nothing either, and the enumerator cannot tell the
+        # difference between a line nobody wrote and a line nobody sent.
+        $spannedLines = [long]0
+        foreach ($span in $mergedSpans) {
+            # The MERGED spans, so this counts each changed line once - exactly
+            # as the walk above does. Long, because the raw ends are unbounded
+            # and summing them in an int is one hostile change set away from
+            # wrapping negative and reporting a short file as fully delivered.
+            $spannedLines += ([long][Math]::Max([long]0, [long]$span.End - [long]$span.Start + 1))
+        }
+        if ($spannedLines -gt 0 -and $changedLines.Count -lt $spannedLines) {
+            [void]$undelivered.Add(([string]$file.Path).TrimStart("/"))
+        }
+    }
+    return @{ Files = @($files.ToArray()); UndeliveredPaths = @($undelivered.ToArray()) }
+}
+
+function Get-ReviewerConstructFilesFromReportSafely {
+    <#
+        Construct enumeration is an aid to accounting, not a gate. If it cannot
+        run, the specialist still runs with an empty construct set and the
+        accounting degrades visibly, which is a far better outcome than losing
+        the pass.
+    #>
+    param([Parameter(Mandatory)]$Report)
+    try {
+        $selection = Get-ReviewerConstructFilesFromReport -Report $Report
+        $result = Get-ReviewerChangedConstructs -Files @($selection.Files)
+        # Fold the paths that never reached the enumerator into the same signal
+        # a lexer failure uses. Both mean the same thing to a reader: the anchor
+        # set is short, so an accounting that covers it is not a claim about the
+        # whole change set.
+        foreach ($path in @($selection.UndeliveredPaths)) {
+            if (@($result.PartiallyUnderstoodFiles) -cnotcontains $path) {
+                $result.PartiallyUnderstoodFiles = @(@($result.PartiallyUnderstoodFiles) + $path)
+            }
+        }
+        return $result
+    }
+    catch {
+        Write-Warning "Changed-construct enumeration failed; the specialist will account without construct anchors: $($_.Exception.Message)"
+        # Truncated, not clean-empty. The deterministic backstop did not run, so
+        # an accounting that covers every rule still has not been checked
+        # against the code, and the report must not claim otherwise.
+        return @{ Constructs = @(); Files = @(); IdRangesByKind = $null; Truncated = $true; PartiallyUnderstoodFiles = @() }
     }
 }
 
@@ -7634,6 +9139,41 @@ function Get-ReviewerConventionSpecialistResolvedSources {
     return $resolved.ToArray()
 }
 
+function New-ReviewerReplayArtifactIdentity {
+    <#
+        The replay identity block every run artifact carries.
+
+        One definition, because two artifacts of the same run that disagreed
+        about which snapshot produced them would be worse than either being
+        absent - and because an artifact WITHOUT this block cannot be bound to
+        the recording it replayed, which is what reconciliation compares.
+
+        Returns $null outside replay: a live run is not a replay of anything.
+    #>
+    if (-not $script:ReviewerReplayActive) { return $null }
+    return [pscustomobject][ordered]@{
+        snapshotId = [string]$script:ReviewerReplaySnapshot.SnapshotId
+        manifestDigest = [string]$script:ReviewerReplaySnapshot.ManifestDigest
+        replayNonce = [string]$script:ReviewerReplaySnapshot.ReplayNonce
+        promotable = $false
+        # What actually served source here. Replay declines the MCP
+        # capability probe, and declines the live az CLI fallback if
+        # config asked for it, so source always comes from the
+        # snapshot-backed legacy path - which may not be the
+        # transport the recorded run used.
+        sourceTransportMode = $(if ($script:ReviewerReplaySourceTransportMode) {
+                $script:ReviewerReplaySourceTransportMode
+            } else { "snapshotLegacy" })
+        capabilityProbeSuppressed = $true
+        azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
+        # Machine-readable counterpart to the residual risk above, so
+        # a consumer cannot mistake one run for a reconciled result.
+        runsReconciled = 1
+        reconciled = $false
+        reconciliationNote = "One replay run. Statuses are unreconciled until compared against another run with a distinct nonce."
+    }
+}
+
 function Write-ReviewerConventionSpecialistPreview {
     param(
         [Parameter(Mandatory)][int]$PrId,
@@ -7643,12 +9183,17 @@ function Write-ReviewerConventionSpecialistPreview {
         [Parameter(Mandatory)][string]$Model,
         [Parameter(Mandatory)][string]$ConventionPlanSha256,
         [Parameter(Mandatory)][string]$FactPlanSha256,
+        $FactPlan = $null,
         [string[]]$PackNames = @(),
         [int]$ContextBytes = 0,
         [hashtable]$ToolAudit = @{},
         [object[]]$Candidates = @(),
         [object[]]$Withheld = @(),
-        [object[]]$ResidualRisks = @()
+        [object[]]$ResidualRisks = @(),
+        [hashtable]$RuleCoverage = $null,
+        [object[]]$ChangedFileIndex = @(),
+        [object[]]$ChangedConstructs = @(),
+        [object[]]$ConstructFiles = @()
     )
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
     $baseName = "pr$PrId-$($SourceCommit.Substring(0, 12))-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
@@ -7663,6 +9208,10 @@ function Write-ReviewerConventionSpecialistPreview {
     [void]$lines.Add("- Context bytes: $ContextBytes")
     [void]$lines.Add("- Candidates: $(@($Candidates).Count)")
     [void]$lines.Add("- Nothing in this preview was merged, posted, or voted.")
+    if ($script:ReviewerReplayActive) {
+        [void]$lines.Add("- OFFLINE REPLAY of snapshot ``$($script:ReviewerReplaySnapshot.SnapshotId)`` (manifest digest ``$($script:ReviewerReplaySnapshot.ManifestDigest)``, replay nonce ``$($script:ReviewerReplaySnapshot.ReplayNonce)``); sealed under the replay key domain and never promotable.")
+        [void]$lines.Add("- UNRECONCILED: this is ONE run. The model is not deterministic, so a status here is one reading, not a calibrated result. Compare two or more runs with distinct nonces (``tools/Compare-ReviewerReplayRuns.ps1``); anything they disagree about resolves to unknown and the candidate is withheld.")
+    }
     if ($Diagnostic) { [void]$lines.Add("- Diagnostic: $Diagnostic") }
     [void]$lines.Add("")
     [void]$lines.Add("## Candidates")
@@ -7699,6 +9248,103 @@ function Write-ReviewerConventionSpecialistPreview {
         foreach ($risk in @($ResidualRisks)) {
             [void]$lines.Add("- $([string](Get-ReviewerConventionSpecialistValue $risk 'text' ''))")
         }
+        [void]$lines.Add("")
+    }
+    if ($null -ne $RuleCoverage) {
+        # The point of this section is the rules that produced NOTHING. A
+        # reviewer that reports two findings has said nothing about the other
+        # six rules it was given, and "nothing" is exactly what a miss looks
+        # like. Printing every row makes the difference between "checked and
+        # clean" and "never looked" visible without reading the JSON.
+        [void]$lines.Add("## Rule accounting")
+        [void]$lines.Add("")
+        # One lookup, built once. A degraded row's expanded id lists can hold
+        # thousands of entries, and resolving each with a fresh scan of the
+        # whole construct table made a hostile row both slow and enormous.
+        $constructLookup = @{}
+        foreach ($construct in @($ChangedConstructs)) {
+            $constructLookup[[string]$construct.constructId] = $construct
+        }
+        [void]$lines.Add("- Transported rule sources: $([int]$RuleCoverage.ExpectedSourceCount); requested: $([int]$RuleCoverage.RequestedSourceCount); accounted for: $([int]$RuleCoverage.AccountedSourceCount)")
+        [void]$lines.Add("- Complete: $([bool]$RuleCoverage.Complete)")
+        # Complete over what. "Complete: True" beside "weighed 1, ruled out of
+        # reach 119" is a very different claim from "weighed 120", and a reader
+        # has to be able to tell which one this is.
+        [void]$lines.Add(("- Changed constructs enumerated: {0}; row-construct pairs weighed against a rule: {1}; ruled out of the rule's reach: {2}" -f `
+                [int]$RuleCoverage.EnumeratedConstructCount, [int]$RuleCoverage.CheckedConstructCount,
+            [int]$RuleCoverage.NotInReachConstructCount))
+        [void]$lines.Add("- Exact changed-file line targets weighed as violations: $([int]$RuleCoverage.CheckedChangedFileTargetCount)")
+        if ([bool]$RuleCoverage.ConstructsIncomplete) {
+            [void]$lines.Add("- The construct enumeration itself was incomplete, so this accounting does not cover the whole change set.")
+        }
+        if ([int]$RuleCoverage.DegradedRowCount -gt 0) {
+            [void]$lines.Add("- Rows the wrapper degraded to unknown: $([int]$RuleCoverage.DegradedRowCount)")
+        }
+        if (@($RuleCoverage.Missing).Count -gt 0) {
+            [void]$lines.Add("- NOT accounted for: $(@($RuleCoverage.Missing) -join ', ')")
+        }
+        if (@($RuleCoverage.Duplicates).Count -gt 0) {
+            [void]$lines.Add("- Accounted for more than once: $(@($RuleCoverage.Duplicates) -join ', ')")
+        }
+        if (@($RuleCoverage.Unknown).Count -gt 0) {
+            [void]$lines.Add("- Rows naming a source that was never transported: $(@($RuleCoverage.Unknown) -join ', ')")
+        }
+        if (@($RuleCoverage.UnaccountedCandidates).Count -gt 0) {
+            [void]$lines.Add("- Candidates with no accounting row: $(@($RuleCoverage.UnaccountedCandidates) -join ', ')")
+        }
+        [void]$lines.Add("")
+        if (@($ChangedFileIndex).Count -gt 0) {
+            [void]$lines.Add("Anchor ids: " + (@(@($ChangedFileIndex) | ForEach-Object {
+                        "$([string](Get-ReviewerConventionSpecialistValue $_ 'anchorId' ''))=$([string](Get-ReviewerConventionSpecialistValue $_ 'path' ''))"
+                    }) -join ', '))
+            [void]$lines.Add("")
+        }
+        foreach ($row in @($RuleCoverage.Rows)) {
+            [void]$lines.Add("### $([string](Get-ReviewerConventionSpecialistValue $row 'ruleSourceId' '')) - $([string](Get-ReviewerConventionSpecialistValue $row 'status' 'unknown'))")
+            [void]$lines.Add("")
+            [void]$lines.Add("- Pack: $([string](Get-ReviewerConventionSpecialistValue $row 'packName' ''))")
+            [void]$lines.Add("- Rule quote: $([string](Get-ReviewerConventionSpecialistValue $row 'ruleQuote' '(none)'))")
+            [void]$lines.Add("- Scope: $([string](Get-ReviewerConventionSpecialistValue $row 'scope' '(none)'))")
+            # The whole partition, not a collapsed "checked" count. What a
+            # reader needs from a row is which anchors it convicted, which it
+            # cleared, which it ruled out of reach and which it could not
+            # decide - "checked 3" hides all four of those.
+            $violatingIds = @(Get-ReviewerConventionSpecialistValue $row 'violatingConstructs' @())
+            foreach ($verdict in @(
+                    @{ Label = "violating"; Ids = $violatingIds; Locate = $true },
+                    @{ Label = "compliant"; Ids = @(Get-ReviewerConventionSpecialistValue $row 'compliantConstructs' @()); Locate = $false },
+                    @{ Label = "out of the rule's reach"; Ids = @(Get-ReviewerConventionSpecialistValue $row 'notInReachConstructs' @()); Locate = $false },
+                    @{ Label = "undecided"; Ids = @(Get-ReviewerConventionSpecialistValue $row 'unknownConstructs' @()); Locate = $true })) {
+                $ids = @($verdict.Ids)
+                if ($ids.Count -eq 0) { continue }
+                $rendered = $(if ([bool]$verdict.Locate) {
+                        @($ids | Select-Object -First 60 | ForEach-Object {
+                                $id = [string]$_
+                                if ($constructLookup.ContainsKey($id)) {
+                                    $at = $constructLookup[$id]
+                                    "$id ($([string]$at.path):$([int]$at.line))"
+                                }
+                                else { $id }
+                            }) -join ', '
+                    }
+                    else { @($ids | Select-Object -First 60) -join ', ' })
+                if ($ids.Count -gt 60) { $rendered += ", and $($ids.Count - 60) more" }
+                [void]$lines.Add("- Anchors $($verdict.Label) ($($ids.Count)): $rendered")
+            }
+            $lineTargets = @(Get-ReviewerConventionSpecialistValue `
+                $row 'violatingChangedFileTargets' @())
+            if ($lineTargets.Count -gt 0) {
+                [void]$lines.Add("- Changed-file line targets violating ($($lineTargets.Count)): $($lineTargets -join ', ')")
+            }
+            [void]$lines.Add("- Code evidence: $([string](Get-ReviewerConventionSpecialistValue $row 'codeEvidence' ''))")
+            [void]$lines.Add("- Sibling: $([string](Get-ReviewerConventionSpecialistValue $row 'siblingStatus' '')) - $([string](Get-ReviewerConventionSpecialistValue $row 'siblingEvidence' ''))")
+            $linked = [string](Get-ReviewerConventionSpecialistValue $row 'candidateId' '')
+            [void]$lines.Add("- Candidate: $(if ($linked) { $linked } else { 'none' })")
+            [void]$lines.Add("- Notes: $([string](Get-ReviewerConventionSpecialistValue $row 'notes' ''))")
+            $degraded = [string](Get-ReviewerConventionSpecialistValue $row 'degradedReason' '')
+            if ($degraded) { [void]$lines.Add("- Wrapper note: $degraded.") }
+            [void]$lines.Add("")
+        }
     }
     $markdown = $lines.ToArray() -join "`n"
     [IO.File]::WriteAllText($markdownPath, $markdown, $script:ReviewerConventionSpecialistUtf8)
@@ -7723,13 +9369,47 @@ function Write-ReviewerConventionSpecialistPreview {
         contextBytes = $ContextBytes
         toolAudit = $ToolAudit
         candidates = @($Candidates)
+        ruleCoverage = $(if ($null -eq $RuleCoverage) {
+                $null
+            }
+            else {
+                [pscustomobject][ordered]@{
+                    complete = [bool]$RuleCoverage.Complete
+                    expectedSourceCount = [int]$RuleCoverage.ExpectedSourceCount
+                    requestedSourceCount = [int]$RuleCoverage.RequestedSourceCount
+                    accountedSourceCount = [int]$RuleCoverage.AccountedSourceCount
+                    degradedRowCount = [int]$RuleCoverage.DegradedRowCount
+                    enumeratedConstructCount = [int]$RuleCoverage.EnumeratedConstructCount
+                    checkedConstructCount = [int]$RuleCoverage.CheckedConstructCount
+                    checkedChangedFileTargetCount = [int]$RuleCoverage.CheckedChangedFileTargetCount
+                    notInReachConstructCount = [int]$RuleCoverage.NotInReachConstructCount
+                    missing = @($RuleCoverage.Missing)
+                    duplicates = @($RuleCoverage.Duplicates)
+                    unknown = @($RuleCoverage.Unknown)
+                    unaccountedCandidates = @($RuleCoverage.UnaccountedCandidates)
+                    rows = @($RuleCoverage.Rows)
+                    changedFileAnchors = @($ChangedFileIndex)
+                    constructsIncomplete = [bool]$RuleCoverage.ConstructsIncomplete
+                    changedConstructs = @($RuleCoverage.Constructs)
+                    constructFiles = @($ConstructFiles)
+                    remediationFacts = @((Get-ReviewerConventionSpecialistValue $FactPlan "facts" @()) |
+                        Where-Object {
+                            $factId = [string](Get-ReviewerConventionSpecialistValue $_ "id" "")
+                            @($Candidates | Where-Object {
+                                    $fix = Get-ReviewerConventionSpecialistValue $_ "changedCodeFix" $null
+                                    @(([string](Get-ReviewerConventionSpecialistValue $fix "evidenceFactIds" "")) -split ',') -ccontains $factId
+                                }).Count -gt 0
+                        })
+                }
+            })
         withheld = @($Withheld)
         residualRisks = @($ResidualRisks)
         markdownPath = $markdownPath
         markdownSha256 = Get-ReviewerConventionSpecialistSha256 -Text $markdown
+        replay = New-ReviewerReplayArtifactIdentity
         createdAt = [DateTime]::UtcNow.ToString("o")
     }
-    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     $artifactPath = Save-ReviewerConventionSpecialistPreview -Directory $conventionSpecialistPreviewDir `
         -BaseName $baseName -Manifest $manifest -MasterKey $masterKey
     Write-Host "Convention specialist preview for PR $PrId saved to $markdownPath" -ForegroundColor DarkCyan
@@ -7774,6 +9454,8 @@ function Invoke-ReviewerConventionSpecialistPass {
     $candidates = @()
     $withheld = @()
     $residualRisks = @()
+    $ruleCoverage = $null
+    $changedFileIndex = @()
     $run = $null
     $preview = $null
     $markerSource = ""
@@ -7822,82 +9504,235 @@ function Invoke-ReviewerConventionSpecialistPass {
                             -Session $specialistSession -ConventionPlan $conventionPlan)
                 }
             }
-            $nonce = New-AgentNonce
-            $promptText = [IO.File]::ReadAllText($ConventionSpecialistPromptPath, $script:ReviewerUtf8)
-            $specialistInput = New-ReviewerConventionSpecialistInput -PromptText $promptText -Nonce $nonce `
-                -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
-                -PrId $PrId -SourceCommit $SourceCommit -TargetCommit $targetCommit `
-                -ChangeSetDigest $changeSetDigest -ConventionPlanSha256 $conventionPlanSha256 `
-                -FactPlanSha256 $factPlanSha256 -ConfigSha256 $ConfigSha256 `
-                -ScriptSha256 $ScriptSelfSha256 -PromptSha256 $ConventionSpecialistPromptSha256 `
-                -ConventionPlan $conventionPlan -FactPlan $factPlan `
-                -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
-                -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText
-            $contextBytes = [int]$specialistInput.Bytes
-            if ([bool]$specialistInput.PinnedSourceDropped) {
-                Write-Warning ("PR $PrId's pinned source did not fit the convention specialist's input bound; " +
-                    "the specialist was told to treat every changed file as unread.")
-                $toolAudit.pinnedSourceDropped = $true
-            }
-            $allowTools = @($script:ReviewerConventionSpecialistAllowToolCeiling)
-            $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
-            $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
-            $toolAudit.availableTools = @($availableTools)
-            $toolAudit.deniedPermissions = @($denyTools)
-            $agencyArgs = Get-AgentCopilotArgs -AgentName "" -Source "" `
-                -AvailableTools $availableTools -AllowTools $allowTools -DenyTools $denyTools `
-                -Model $EffectiveConventionSpecialistModel -JsonOutput
-            Write-Host "Launching convention specialist ($EffectiveConventionSpecialistModel, discovery only, timeout=${ConventionSpecialistTimeoutSeconds}s)..." -ForegroundColor Cyan
-            $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
-                -StandardInputContent $specialistInput.Text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
-                -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
-                -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
-            $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
-            $markerSource = [string]$run.StdOut
+            $marker = $null
+            $nonce = ""
+            $contextBytes = 0
+            $run = $null
+            $cliOutcome = $null
+            $markerSource = ""
             $boundedRawRequestedTools = @()
-            if ($cliOutcome) {
-                if ($cliOutcome.Answer) { $markerSource = [string]$cliOutcome.Answer }
-                $allRequestedTools = @($cliOutcome.ToolRequests)
-                $toolAudit.toolRequestAuditTruncated = ($allRequestedTools.Count -gt 64)
-                $boundedRawRequestedTools = @($allRequestedTools | Select-Object -First 64)
-                $toolAudit.requestedTools = @($boundedRawRequestedTools | ForEach-Object {
-                        Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
-                    })
-                $toolAudit.modifiedFiles = @($cliOutcome.ModifiedFiles)
-                if ($cliOutcome.Model -and [string]$cliOutcome.Model -cne $EffectiveConventionSpecialistModel) {
-                    throw "Copilot reported specialist model '$($cliOutcome.Model)' instead of '$EffectiveConventionSpecialistModel'."
+            # Typed marker status for the most recent attempt and the retry gate.
+            # A parse that yields a schema/shape slip is retryable with a fresh
+            # nonce; a wrong binding (the schema's own project/nonce exact fields
+            # mismatched) is terminal and never retried.
+            $specialistMarkerStatus = $null
+            # One accounting record per ACTUAL specialist attempt: its number, the
+            # SHA-256 of the nonce it was launched with (never the raw nonce), the
+            # typed rejection, whether the model ran, and the exact usage this
+            # attempt reported (null when the CLI did not). Cumulative session
+            # totals (totalNanoAiu/totalPremiumRequests) are recorded per attempt,
+            # never summed across the separate sessions a retry creates.
+            $emitSpecialistAcct = {
+                param([int]$Attempt, [string]$AttemptNonce, [string]$RejectionClass, [bool]$ModelRan, $Usage)
+                Write-ReviewerCycleMetadata -Fields @{
+                    cycle = $CycleNumber; mode = "specialist-attempt-accounting"; prId = $PrId
+                    sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
+                    attempt = $Attempt
+                    nonceSha256 = (Get-ReviewerTextSha256 -Text $AttemptNonce)
+                    rejectionClass = $RejectionClass
+                    modelRan = $ModelRan
+                    premiumRequests = $(if ($Usage) { $Usage.PremiumRequests } else { $null })
+                    totalNanoAiu = $(if ($Usage) { $Usage.TotalNanoAiu } else { $null })
+                    totalApiDurationMs = $(if ($Usage) { $Usage.TotalApiDurationMs } else { $null })
+                    sessionDurationMs = $(if ($Usage) { $Usage.SessionDurationMs } else { $null })
+                    totalPremiumRequests = $(if ($Usage) { $Usage.TotalPremiumRequests } else { $null })
                 }
             }
-            if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt 65536) {
-                throw "Convention specialist output exceeded the 65536-byte cap."
+            for ($specialistAttempt = 1; $specialistAttempt -le $script:ReviewerConventionSpecialistMarkerRetryAttempts; $specialistAttempt++) {
+                # A fresh nonce and a rebuilt input per attempt, so the second
+                # attempt is a new request rather than a second chance to answer
+                # the first one.
+                $nonce = New-AgentNonce
+                $promptText = [IO.File]::ReadAllText($ConventionSpecialistPromptPath, $script:ReviewerUtf8)
+                $specialistInput = New-ReviewerConventionSpecialistInput -PromptText $promptText -Nonce $nonce `
+                    -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+                    -PrId $PrId -SourceCommit $SourceCommit -TargetCommit $targetCommit `
+                    -ChangeSetDigest $changeSetDigest -ConventionPlanSha256 $conventionPlanSha256 `
+                    -FactPlanSha256 $factPlanSha256 -ConfigSha256 $ConfigSha256 `
+                    -ScriptSha256 $ScriptSelfSha256 -PromptSha256 $ConventionSpecialistPromptSha256 `
+                    -ConventionPlan $conventionPlan -FactPlan $factPlan `
+                    -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
+                    -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
+                    -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
+                    -ConstructIdRanges (Get-ReviewerHashValue -Container $Bound -Key 'ConstructIdRanges' -Default $null) `
+                    -RightHandRangesByPath (Get-ReviewerHashValue -Container $Bound -Key 'ChangedFileRangesByPath' -Default @{}) `
+                    -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText `
+                    -ReplayNotice $(if ($script:ReviewerReplayActive) { $script:ReviewerReplayModelNotice } else { "" })
+                $contextBytes = [int]$specialistInput.Bytes
+                if ([bool]$specialistInput.PinnedSourceDropped) {
+                    Write-Warning ("PR $PrId's pinned source did not fit the convention specialist's input bound; " +
+                        "the specialist was told to treat every changed file as unread.")
+                    $toolAudit.pinnedSourceDropped = $true
+                }
+                $allowTools = Get-ReviewerLaunchAllowTools -Intended $script:ReviewerConventionSpecialistAllowToolCeiling
+                $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
+                $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
+                $toolAudit.availableTools = @($availableTools)
+                $toolAudit.deniedPermissions = @($denyTools)
+                $agencyArgs = Get-AgentCopilotArgs -AgentName "" -Source "" `
+                    -AvailableTools $availableTools -AllowTools $allowTools -DenyTools $denyTools `
+                    -Model $EffectiveConventionSpecialistModel -JsonOutput
+                Write-Host "Launching convention specialist ($EffectiveConventionSpecialistModel, discovery only, timeout=${ConventionSpecialistTimeoutSeconds}s)..." -ForegroundColor Cyan
+                # Pre-launch result-contract gate. The specialist emits the
+                # largest marker this agent produces; its largest legal
+                # serialization must fit BOTH the declared scan window and the
+                # hard output byte cap before the process is launched, so a
+                # complete, correct discovery pass can never be silently lost to
+                # a too-small window or cap. The same window is handed to the
+                # typed extractor below.
+                $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
+                    -ExpectedProject $ExpectedProject -ExpectedNonce $nonce
+                try {
+                    $specialistScanWindow = Assert-ReviewerModelResultContractFits -Surface "convention specialist" `
+                        -Schema $specialistSchema -ScanWindowChars $script:ReviewerConventionSpecialistScanWindowChars `
+                        -MaxOutputBytes $script:ReviewerConventionSpecialistMaxOutputBytes
+                }
+                catch {
+                    # A contract-fit refusal happens BEFORE any launch, so it is
+                    # deliberately NOT an attempt-accounting record (no model ran).
+                    # It is surfaced under its own launch-refusal metadata so the
+                    # refusal stays visible and is never mistaken for a failed run.
+                    Write-ReviewerCycleMetadata -Fields @{
+                        cycle = $CycleNumber; mode = "specialist-launch-refused"; prId = $PrId
+                        sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
+                        attempt = $specialistAttempt; reason = "contractFit"; detail = [string]$_.Exception.Message
+                    }
+                    throw
+                }
+                $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
+                    -StandardInputContent $specialistInput.Text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
+                    -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
+                    -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
+                $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
+                $specialistUsage = if ($cliOutcome -and $cliOutcome.Usage) { $cliOutcome.Usage } else { $null }
+                $specialistModelRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
+                $markerSource = [string]$run.StdOut
+                # Deferred terminal classification. A LAUNCHED attempt that fails
+                # on the process (timeout/exit/model identity) or the tool grant
+                # is classified here rather than thrown immediately, so its single
+                # accounting record is emitted BEFORE the terminal throw below and
+                # no launched attempt is ever invisible to accounting.
+                $specialistTerminalClass = $null
+                $specialistTerminalThrow = $null
+                $boundedRawRequestedTools = @()
+                # Reset the audit at the top of every attempt. Carrying a failed
+                # attempt's requested tools into a clean one would either report
+                # a tool this attempt never asked for, or - worse - let an
+                # attempt that asked for a forbidden one disappear behind a
+                # quieter retry.
+                $toolAudit.requestedTools = @()
+                $toolAudit.unrecognizedTools = @()
+                $toolAudit.modifiedFiles = @()
+                $toolAudit.toolRequestAuditTruncated = $false
+                if ($cliOutcome) {
+                    if ($cliOutcome.Answer) { $markerSource = [string]$cliOutcome.Answer }
+                    $allRequestedTools = @($cliOutcome.ToolRequests)
+                    $toolAudit.toolRequestAuditTruncated = ($allRequestedTools.Count -gt 64)
+                    $boundedRawRequestedTools = @($allRequestedTools | Select-Object -First 64)
+                    $toolAudit.requestedTools = @($boundedRawRequestedTools | ForEach-Object {
+                            Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
+                        })
+                    $toolAudit.modifiedFiles = @($cliOutcome.ModifiedFiles)
+                    if ($cliOutcome.Model -and [string]$cliOutcome.Model -cne $EffectiveConventionSpecialistModel) {
+                        $specialistTerminalClass = 'modelMismatch'
+                        $specialistTerminalThrow = "Copilot reported specialist model '$($cliOutcome.Model)' instead of '$EffectiveConventionSpecialistModel'."
+                    }
+                }
+                # A timeout or a nonzero exit is a real failure and is never
+                # retried: a second identical attempt would not fix it. Classified
+                # (timeout vs processFailure) rather than thrown immediately.
+                if (-not $specialistTerminalClass) {
+                    $processFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut ([bool]$run.TimedOut) `
+                        -ExitCode ([int]$run.ExitCode) -MarkerValid $true `
+                        -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
+                    if ($processFailure) {
+                        $specialistTerminalClass = if ([bool]$run.TimedOut) { 'timeout' } else { 'processFailure' }
+                        $specialistTerminalThrow = $processFailure
+                    }
+                }
+                if (-not $specialistTerminalClass -and @($toolAudit.modifiedFiles).Count -gt 0) {
+                    $specialistTerminalClass = 'toolViolation'
+                    $specialistTerminalThrow = "Convention specialist reported modified files despite its read-only grant."
+                }
+                $forbiddenRequestedTools = @($boundedRawRequestedTools | Where-Object {
+                        $rawName = [string]$_
+                        $script:ReviewerMandatoryDenyTools -ccontains $rawName -or
+                        @($script:ReviewerForbiddenToolFamilies | Where-Object {
+                                $rawName.StartsWith($_, [StringComparison]::OrdinalIgnoreCase)
+                            }).Count -gt 0 -or
+                        $rawName -match '(?i)(^|[_(-])(write|edit|create|task|shell|web)([_)-]|$)'
+                    })
+                if (-not $specialistTerminalClass -and $forbiddenRequestedTools.Count -gt 0) {
+                    $specialistTerminalClass = 'toolViolation'
+                    $specialistTerminalThrow = "Convention specialist requested forbidden tool(s): $($forbiddenRequestedTools -join ', ')."
+                }
+                # Exactly one accounting record for this launched attempt, emitted
+                # BEFORE the terminal throw, with the precise typed process/tool
+                # class and this attempt's usage (null when the CLI reported none).
+                if ($specialistTerminalClass) {
+                    & $emitSpecialistAcct $specialistAttempt $nonce $specialistTerminalClass $specialistModelRan $specialistUsage
+                    throw $specialistTerminalThrow
+                }
+                $toolAudit.unrecognizedTools = @($boundedRawRequestedTools | Where-Object {
+                        -not (ConvertTo-ReviewerConventionSpecialistToolIdentity -Name ([string]$_))
+                    } | ForEach-Object {
+                        Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
+                    })
+                # The wrapper will scan this much untrusted text for a marker and
+                # no more. Generous rather than tight: this pass is asked to
+                # account for every rule against every changed construct, and a
+                # model that narrates that work as it goes legitimately writes a
+                # long answer. The marker itself is bounded by its schema.
+                if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt $script:ReviewerConventionSpecialistMaxOutputBytes) {
+                    # Overflow is not proof the work was not done - it is proof
+                    # the model talked too much on the way. That is the same
+                    # class of slip as an unusable marker, so it gets the same
+                    # one retry rather than costing the pass outright.
+                    $specialistMarkerStatus = 'overflow'
+                    & $emitSpecialistAcct $specialistAttempt $nonce 'overflow' $specialistModelRan $specialistUsage
+                    if ($specialistAttempt -ge $script:ReviewerConventionSpecialistMarkerRetryAttempts) {
+                        throw "Convention specialist output exceeded the $($script:ReviewerConventionSpecialistMaxOutputBytes)-byte cap."
+                    }
+                    Write-Warning ("PR {0}'s convention specialist wrote more than the {1}-byte output cap; retrying once in a fresh session." -f `
+                            $PrId, $script:ReviewerConventionSpecialistMaxOutputBytes)
+                    Write-ReviewerCycleMetadata -Fields @{
+                        cycle = $CycleNumber; mode = "convention-specialist-output-overflow"; prId = $PrId
+                        sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
+                    }
+                    $marker = $null
+                    continue
+                }
+                # Typed extraction so a schema/shape slip (retryable, fresh nonce)
+                # is told apart from a wrong binding (the schema's own exact
+                # project/nonce fields mismatched - terminal, never retried) and
+                # from a clean success. The same window the pre-launch gate
+                # validated is used, so launch bound and capture bound are one.
+                $markerOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $markerSource `
+                    -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
+                    -Schema $specialistSchema -ScanWindowChars $specialistScanWindow
+                $specialistMarkerStatus = [string]$markerOutcome.Status
+                $marker = if ($specialistMarkerStatus -ceq 'success') { $markerOutcome.Value } else { $null }
+                & $emitSpecialistAcct $specialistAttempt $nonce $specialistMarkerStatus $specialistModelRan $specialistUsage
+                # A successful parse is terminal for the marker loop: a PR16769813
+                # specialist marker that parses cleanly and only later fails a
+                # SEMANTIC remediation check must NOT be re-launched - that is not
+                # a marker-emission slip, and retrying it would burn a full,
+                # independent specialist run for nothing.
+                if ($null -ne $marker) { break }
+                if ($specialistAttempt -ge $script:ReviewerConventionSpecialistMarkerRetryAttempts) { break }
+                # Retry ONLY a typed-retryable emission slip. A wrong binding is
+                # terminal (a fresh attempt cannot un-mismatch the schema's exact
+                # fields, and retrying one is exactly how a replay would be handed
+                # extra tries).
+                if (-not (Test-AgentMarkerStatusRetryable -Status $specialistMarkerStatus)) { break }
+                Write-Warning ("PR {0}'s convention specialist produced an unusable result marker (attempt {1} of {2}, {3}); retrying in a fresh session." -f `
+                        $PrId, $specialistAttempt, $script:ReviewerConventionSpecialistMarkerRetryAttempts, $specialistMarkerStatus)
+                Write-ReviewerCycleMetadata -Fields @{
+                    cycle = $CycleNumber; mode = "convention-specialist-marker-retry"; prId = $PrId
+                    sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
+                    rejectionClass = $specialistMarkerStatus
+                }
             }
-            $processFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut ([bool]$run.TimedOut) `
-                -ExitCode ([int]$run.ExitCode) -MarkerValid $true `
-                -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
-            if ($processFailure) { throw $processFailure }
-            if (@($toolAudit.modifiedFiles).Count -gt 0) {
-                throw "Convention specialist reported modified files despite its read-only grant."
-            }
-            $forbiddenRequestedTools = @($boundedRawRequestedTools | Where-Object {
-                    $rawName = [string]$_
-                    $script:ReviewerMandatoryDenyTools -ccontains $rawName -or
-                    @($script:ReviewerForbiddenToolFamilies | Where-Object {
-                            $rawName.StartsWith($_, [StringComparison]::OrdinalIgnoreCase)
-                        }).Count -gt 0 -or
-                    $rawName -match '(?i)(^|[_(-])(write|edit|create|task|shell|web)([_)-]|$)'
-                })
-            if ($forbiddenRequestedTools.Count -gt 0) {
-                throw "Convention specialist requested forbidden tool(s): $($forbiddenRequestedTools -join ', ')."
-            }
-            $toolAudit.unrecognizedTools = @($boundedRawRequestedTools | Where-Object {
-                    -not (ConvertTo-ReviewerConventionSpecialistToolIdentity -Name ([string]$_))
-                } | ForEach-Object {
-                    Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
-                })
-            $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
-                -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
-                -Schema (Get-ReviewerConventionSpecialistMarkerSchema `
-                    -ExpectedProject $ExpectedProject -ExpectedNonce $nonce)
             $markerFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut $false -ExitCode 0 `
                 -MarkerValid ($null -ne $marker) -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
             if ($markerFailure) { throw $markerFailure }
@@ -7910,10 +9745,16 @@ function Invoke-ReviewerConventionSpecialistPass {
             }
             $validated = Resolve-ReviewerConventionSpecialistCandidates -Marker $marker `
                 -ConventionPlan $conventionPlan -FactPlan $factPlan `
-                -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes)
+                -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
+                -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
+                -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
+                -ConstructsIncomplete ([bool](Get-ReviewerHashValue -Container $Bound -Key 'ConstructsIncomplete' -Default $false)) `
+                -RightHandRangesByPath (Get-ReviewerHashValue -Container $Bound -Key 'ChangedFileRangesByPath' -Default @{})
             $candidates = @($validated.Candidates)
             $withheld = @($validated.Withheld)
             $residualRisks = @($validated.ResidualRisks)
+            $ruleCoverage = $validated.RuleCoverage
+            $changedFileIndex = @($validated.ChangedFileIndex)
             foreach ($unknownTool in @($toolAudit.unrecognizedTools)) {
                 if (@($residualRisks).Count -ge 12) { break }
                 $residualRisks += [pscustomobject][ordered]@{
@@ -7923,6 +9764,19 @@ function Invoke-ReviewerConventionSpecialistPass {
             if ($toolAudit.toolRequestAuditTruncated -and @($residualRisks).Count -lt 12) {
                 $residualRisks += [pscustomobject][ordered]@{
                     text = "CLI tool-request audit exceeded 64 entries and was truncated; the enforced availability ceiling remained unchanged."
+                }
+            }
+            # A replay is deterministic in its inputs and not in its model. One
+            # run is one reading, and a reader looking at a single sealed
+            # artifact has no way to tell a stable verdict from a coin toss that
+            # landed well. Say it inside the artifact rather than hoping the
+            # operator remembers.
+            if ($script:ReviewerReplayActive -and @($residualRisks).Count -lt 12) {
+                $residualRisks += [pscustomobject][ordered]@{
+                    text = ("Single unreconciled replay run: the statuses in this artifact are one model reading of the " +
+                        "frozen input, not a calibrated result. Reconcile two or more runs with distinct nonces " +
+                        "(tools/Compare-ReviewerReplayRuns.ps1) before treating any status as stable; disagreement " +
+                        "between runs resolves to unknown and withholds the candidate.")
                 }
             }
             $status = "complete"
@@ -7961,12 +9815,19 @@ function Invoke-ReviewerConventionSpecialistPass {
         $preview = Write-ReviewerConventionSpecialistPreview -PrId $PrId -SourceCommit $SourceCommit `
             -Status $status -Diagnostic $diagnostic -Model $EffectiveConventionSpecialistModel `
             -ConventionPlanSha256 $conventionPlanSha256 -FactPlanSha256 $factPlanSha256 `
+            -FactPlan $factPlan `
             -PackNames $packNames -ContextBytes $contextBytes -ToolAudit $toolAudit `
-            -Candidates $candidates -Withheld $withheld -ResidualRisks $residualRisks
+            -Candidates $candidates -Withheld $withheld -ResidualRisks $residualRisks `
+            -RuleCoverage $ruleCoverage -ChangedFileIndex $changedFileIndex `
+            -ChangedConstructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
+            -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @())
         Write-ReviewerCycleMetadata -Fields @{
             cycle = $CycleNumber; mode = "convention-specialist"; result = $status; prId = $PrId
             sourceCommit = $SourceCommit; model = $EffectiveConventionSpecialistModel
             candidateCount = @($candidates).Count; withheldCount = @($withheld).Count
+            ruleCoverageComplete = $(if ($null -eq $ruleCoverage) { $false } else { [bool]$ruleCoverage.Complete })
+            ruleCoverageAccounted = $(if ($null -eq $ruleCoverage) { 0 } else { [int]$ruleCoverage.AccountedSourceCount })
+            ruleCoverageExpected = $(if ($null -eq $ruleCoverage) { 0 } else { [int]$ruleCoverage.ExpectedSourceCount })
             previewPath = $preview.MarkdownPath; artifactPath = $preview.ArtifactPath
             diagnostic = $diagnostic
         }
@@ -7981,6 +9842,7 @@ function Invoke-ReviewerConventionSpecialistPass {
         Diagnostic = $diagnostic
         ArtifactPath = $(if ($preview) { [string]$preview.ArtifactPath } else { "" })
         Manifest = $(if ($preview) { $preview.Manifest } else { $null })
+        RuleCoverage = $ruleCoverage
     }
 }
 
@@ -8078,6 +9940,7 @@ function Write-ReviewerVerificationDecisionPreview {
         # is not eligible, and a decision record carries no comment, anchor or
         # evidence to render.
         [object[]]$AllCandidates = @(),
+        $ReconciliationManifest = $null,
         [object[]]$InputArtifactHashes = @(),
         [ValidateRange(0, [int]::MaxValue)][int]$TotalCandidateCount = 0,
         [AllowEmptyString()][string]$ReplaySha256 = ""
@@ -8173,12 +10036,18 @@ function Write-ReviewerVerificationDecisionPreview {
         decisions = @($Decisions)
         withheld = @($Withheld)
         eligiblePreviewCandidates = @($Eligible)
+        reconciliationManifest = $ReconciliationManifest
         replaySha256 = $ReplaySha256
+        # The same replay identity the specialist preview carries. Without it a
+        # decision that embeds no reconciliation manifest - the shape a degraded
+        # specialist produces - could not be bound to the recording it replayed,
+        # and an honest empty run would be unreconcilable.
+        replay = New-ReviewerReplayArtifactIdentity
         markdownPath = $markdownPath
         markdownSha256 = Get-ReviewerVerificationSha256 -Text $markdown
         createdAt = [DateTime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
     }
-    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     $artifactPath = Save-ReviewerVerificationPreview -Manifest $manifest `
         -Directory $verificationPreviewDir -BaseName $baseName -MasterKey $masterKey `
         -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes)
@@ -8211,7 +10080,24 @@ function Invoke-ReviewerVerificationModelRun {
         -DeterministicFacts $DeterministicFacts -SanitizedThreads $ThreadFacts `
         -MinimalDiffHunk (ConvertTo-ReviewerVerificationCanonicalArray -Items @($EvidenceHunks)) `
         -MaxInputBytes ([int]$EffectiveCrossVerificationPolicy.maxInputBytes)
-    $allowTools = @($script:ReviewerVerificationAllowToolCeiling)
+    if ($script:ReviewerReplayActive) {
+        # Same reason as the other two passes: the verifier is told it may read
+        # the pull request, and in replay it holds no tool that can. Appended
+        # after the sealed input so it cannot displace any of it, and still
+        # inside the same bound the builder enforced.
+        $replayText = ([string]$modelInput.text) + "`n---`n## Offline replay (wrapper-verified binding)`n`n" +
+        $script:ReviewerReplayModelNotice.TrimEnd() + "`n"
+        $replayBytes = $script:ReviewerUtf8.GetByteCount($replayText)
+        # The same effective ceiling the builder applied: policy may narrow the
+        # code-defined bound but never widen it, and the replay path must not
+        # be the one place that admits input the ordinary path would refuse.
+        $replayCeiling = [Math]::Min([int]$EffectiveCrossVerificationPolicy.maxInputBytes, $script:ReviewerVerificationMaxInputBytes)
+        if ($replayBytes -gt $replayCeiling) {
+            throw "Verification model input with the replay notice is $replayBytes bytes, above the effective $replayCeiling-byte bound."
+        }
+        $modelInput = [pscustomobject][ordered]@{ text = $replayText; bytes = $replayBytes }
+    }
+    $allowTools = Get-ReviewerLaunchAllowTools -Intended $script:ReviewerVerificationAllowToolCeiling
     $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
     $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
     $agencyArgs = Get-AgentCopilotArgs -AgentName "" -Source "" `
@@ -8220,6 +10106,17 @@ function Invoke-ReviewerVerificationModelRun {
     Write-Host ("Launching cross-verifier {0} for {1} ({2} candidate(s), timeout={3}s)..." -f `
             $VerifierModel, [string]$Cluster.clusterId, @($AssignedCandidates).Count,
             $TimeoutSeconds) -ForegroundColor Cyan
+    # Pre-launch result-contract gate. The verifier's verdict array is sized to
+    # exactly the candidates assigned to this cluster, so its largest legal
+    # marker must fit both the declared scan window and the hard output byte cap
+    # for THIS assignment before the process is launched. The same schema and
+    # window are reused by the extractor below.
+    $verificationSchema = Get-ReviewerVerificationMarkerSchema -ExpectedProject $ExpectedProject `
+        -ExpectedNonce $nonce -ExpectedVerifierModel $VerifierModel `
+        -MaxVerdicts @($AssignedCandidates).Count
+    $verificationScanWindow = Assert-ReviewerModelResultContractFits -Surface "cross-verifier ($VerifierModel)" `
+        -Schema $verificationSchema -ScanWindowChars $script:ReviewerVerificationScanWindowChars `
+        -MaxOutputBytes $script:ReviewerVerificationMaxOutputBytes
     $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
         -StandardInputContent $modelInput.text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
         -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
@@ -8290,20 +10187,44 @@ function Invoke-ReviewerVerificationModelRun {
         }
     }
     $marker = $null
+    $markerStatus = $null
+    $markerField = $null
     if (-not $failureReason) {
-        if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt 65536) {
-            $failureReason = "invalidMarker"
-            $failureDetail = "Verifier output exceeded the 65536-byte cap."
+        if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt $script:ReviewerVerificationMaxOutputBytes) {
+            # Output-cap overflow is the typed 'overflow' class, not a generic
+            # invalid marker: the verdict work may be sound and only the model's
+            # surrounding prose too long. There is no verifier retry loop, so this
+            # is terminal, but it is recorded under its precise class.
+            $failureReason = "overflow"
+            $failureDetail = "Verifier output exceeded the $($script:ReviewerVerificationMaxOutputBytes)-byte cap."
         }
         else {
-            $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
+            # Typed extraction so an extraction failure is recorded under its
+            # precise class (missingMarker / malformedMarker / truncated /
+            # nonObject / schemaInvalid / wrongBinding / ambiguousMarker) rather
+            # than a generic invalidMarker. The SAME prevalidated window and
+            # schema the pre-launch gate proved are reused here, so the launch
+            # bound and the capture bound are one.
+            $markerOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $markerSource `
                 -MarkerPrefix $script:ReviewerVerificationMarkerPrefix `
-                -Schema (Get-ReviewerVerificationMarkerSchema -ExpectedProject $ExpectedProject `
-                    -ExpectedNonce $nonce -ExpectedVerifierModel $VerifierModel `
-                    -MaxVerdicts @($AssignedCandidates).Count)
-            if (-not $marker) {
-                $failureReason = "invalidMarker"
-                $failureDetail = "Verifier produced a missing or invalid result marker."
+                -Schema $verificationSchema -ScanWindowChars $verificationScanWindow
+            $markerStatus = [string]$markerOutcome.Status
+            $markerField = [string]$markerOutcome.Field
+            if ($markerStatus -ceq 'success') {
+                $marker = $markerOutcome.Value
+            }
+            else {
+                # A schema exact-field mismatch (project/nonce/verifierModel) is
+                # the typed wrongBinding; every other non-success status is its
+                # own typed emission class. None is retried - there is no verifier
+                # retry loop - but the run record carries the precise reason.
+                $failureReason = $markerStatus
+                $failureDetail = if ($markerField) {
+                    "Verifier result marker rejected: $markerStatus (field '$markerField')."
+                }
+                else {
+                    "Verifier result marker rejected: $markerStatus."
+                }
             }
         }
     }
@@ -8314,6 +10235,10 @@ function Invoke-ReviewerVerificationModelRun {
             -VerificationInputSha256 $InputManifestSha256 -ClusterId ([string]$Cluster.clusterId) `
             -ConfigSha256 ([string]$Binding.configSha256) -ScriptSha256 ([string]$Binding.scriptSha256) `
             -PromptSha256 ([string]$Binding.promptSha256) -VerifierModel $VerifierModel)) {
+        # The caller binding covers the sealed fields the schema does not exact-
+        # match (candidate/source/input/cluster/commit binding); a marker that
+        # parsed cleanly but points at the wrong sealed work is a stale binding -
+        # terminal, never retried.
         $marker = $null
         $failureReason = "staleBinding"
         $failureDetail = "Verifier result marker binding is stale."
@@ -8322,8 +10247,13 @@ function Invoke-ReviewerVerificationModelRun {
         $expectedIds = @($AssignedCandidates | ForEach-Object { [string]$_.candidateId } | Sort-Object)
         $actualIds = @($marker.verdicts | ForEach-Object { [string]$_.candidateId } | Sort-Object)
         if (($expectedIds -join "|") -cne ($actualIds -join "|")) {
+            # A clean, correctly bound marker whose verdict SET does not match the
+            # assigned candidates is a semantic rejection after successful
+            # extraction, not a marker-emission slip. It is terminal (non-
+            # retryable) and recorded under its own precise class rather than a
+            # generic invalidMarker.
             $marker = $null
-            $failureReason = "invalidMarker"
+            $failureReason = "verdictSetMismatch"
             $failureDetail = "Verifier verdict set did not exactly match its assigned candidates."
         }
     }
@@ -8346,42 +10276,145 @@ function Get-ReviewerVerificationSourceHunks {
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)][string]$SourceCommit,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ChangedPaths
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ChangedPaths,
+        $SourceReport = $null,
+        [AllowEmptyCollection()][object[]]$ChangedFileAnchors = @()
     )
-    $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $changed = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     foreach ($changedPath in @($ChangedPaths)) {
-        $normalized = (ConvertTo-ReviewerVerificationPath -Path ([string]$changedPath)).TrimStart("/")
-        if ($normalized) { [void]$changed.Add($normalized) }
+        $normalized = ConvertTo-ReviewerVerificationPath -Path ([string]$changedPath)
+        $readPath = ConvertTo-ReviewerVerificationReadPath -Path ([string]$changedPath)
+        if (-not $normalized -or -not $readPath) { continue }
+        if ($changed.ContainsKey($normalized) -and $changed[$normalized] -cne $readPath) {
+            throw "Pinned change set contains ambiguous path identity '$normalized'."
+        }
+        $changed[$normalized] = $readPath
+    }
+    $sealedFiles = @{}
+    foreach ($file in @(Get-ReviewerVerificationValue $SourceReport "Files" @())) {
+        $normalized = ConvertTo-ReviewerVerificationPath -Path (
+            [string](Get-ReviewerVerificationValue $file "Path" ""))
+        if (-not $normalized -or $sealedFiles.ContainsKey($normalized)) {
+            if ($normalized) { throw "Sealed source report contains ambiguous path '$normalized'." }
+            continue
+        }
+        $sealedFiles[$normalized] = $file
     }
     return Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
         param([hashtable]$verificationSession)
         $fileCache = @{}
         $hunks = [System.Collections.Generic.List[object]]::new()
-        foreach ($candidate in @($Candidates)) {
-            if ([string]$candidate.anchorKind -cne "changedFile" -or
-                -not [string]$candidate.filePath -or [int]$candidate.line -lt 1) {
-                continue
+        # A candidate's semantic identity is its primary anchor plus its ordered-
+        # independent cross-file manifestation set. The verifier must rule on the
+        # WHOLE sealed evidence set, so one hunk is rendered for the anchor line
+        # and one for every manifestation line the candidate binds; each is a
+        # sealed changed-right-hand slice. Dedupe keeps a manifestation that
+        # coincides with the anchor from being rendered twice.
+        $emittedHunkKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        # A convention candidate's required form is often set by a nearby changed
+        # line that is NOT itself a violation target (for example a subscriptionKey
+        # binding that mandates a "Global." prefix on a definition several lines
+        # below). Such a governing line is neither the anchor nor a legal
+        # manifestation, so the anchor/manifestation +-3 windows never surface it.
+        # For convention candidates the verifier therefore also receives one bounded
+        # "context" hunk spanning the sealed changed-right-hand range that encloses
+        # the anchor, capped to keep evidence bounded. Every rendered line stays
+        # sealed changed-right-hand evidence; nothing unsealed is ever added.
+        $maxContextSpan = 120
+        function Add-ReviewerVerificationSourceHunk {
+            param(
+                [string]$CandidateId,
+                [AllowEmptyString()][string]$RawPath,
+                [int]$AnchorLine,
+                [string]$Role,
+                [int]$SpanStart = 0,
+                [int]$SpanEnd = 0
+            )
+            if (-not $CandidateId -or -not $RawPath -or $AnchorLine -lt 1) { return }
+            $normalizedPath = ConvertTo-ReviewerVerificationPath -Path $RawPath
+            if (-not $normalizedPath -or -not $changed.ContainsKey($normalizedPath)) { return }
+            $path = $changed[$normalizedPath]
+            if ($SpanStart -ge 1 -and $SpanEnd -ge $SpanStart) {
+                $reqStart = $SpanStart
+                $reqEnd = $SpanEnd
+                if (($reqEnd - $reqStart + 1) -gt $maxContextSpan) {
+                    $half = [int]($maxContextSpan / 2)
+                    # Center the bounded window on the anchor, but keep the full
+                    # $maxContextSpan span even when the anchor sits near a range
+                    # edge: clamp the start into [SpanStart, SpanEnd-span+1] first,
+                    # then derive the end from it. Both bounds stay inside the
+                    # sealed changed-right-hand range, so no unsealed line is added.
+                    $maxStart = $SpanEnd - $maxContextSpan + 1
+                    $reqStart = [Math]::Max($SpanStart, [Math]::Min($maxStart, $AnchorLine - $half))
+                    $reqEnd = [Math]::Min($SpanEnd, $reqStart + $maxContextSpan - 1)
+                }
             }
-            $normalizedPath = (ConvertTo-ReviewerVerificationPath -Path (
-                    [string]$candidate.filePath)).TrimStart("/")
-            $path = ConvertTo-ReviewerVerificationReadPath -Path ([string]$candidate.filePath)
-            $segments = @($normalizedPath -split '/')
-            if (-not $changed.Contains($normalizedPath) -or
-                $normalizedPath -notmatch '^[a-z0-9._ /-]+$' -or
-                @($segments | Where-Object { $_ -eq "" -or $_ -eq "." -or $_ -eq ".." }).Count -gt 0) {
-                continue
+            else {
+                $reqStart = $AnchorLine - 3
+                $reqEnd = $AnchorLine + 3
+            }
+            $dedupeKey = $CandidateId + "|" + $normalizedPath + "|" +
+                [Convert]::ToString($reqStart, [Globalization.CultureInfo]::InvariantCulture) + "|" +
+                [Convert]::ToString($reqEnd, [Globalization.CultureInfo]::InvariantCulture)
+            if (-not $emittedHunkKeys.Add($dedupeKey)) { return }
+            if ($sealedFiles.ContainsKey($normalizedPath)) {
+                $line = [int]$AnchorLine
+                $matchingSlices = @((Get-ReviewerVerificationValue `
+                            $sealedFiles[$normalizedPath] "Slices" @()) | Where-Object {
+                        $line -ge [int](Get-ReviewerVerificationValue $_ "StartLine" 0) -and
+                        $line -le [int](Get-ReviewerVerificationValue $_ "EndLine" 0)
+                    })
+                if ($matchingSlices.Count -gt 1) {
+                    throw "Sealed source report contains overlapping slices for '$path' line $line."
+                }
+                if ($matchingSlices.Count -eq 1) {
+                    $slice = $matchingSlices[0]
+                    $sliceStart = [int](Get-ReviewerVerificationValue $slice "StartLine" 0)
+                    $sliceEnd = [int](Get-ReviewerVerificationValue $slice "EndLine" 0)
+                    $sliceLines = @(([string](Get-ReviewerVerificationValue `
+                                $slice "Text" "")).Replace("`r`n", "`n").Replace("`r", "`n") -split "`n")
+                    if ($sliceStart -lt 1 -or $sliceEnd -lt $sliceStart -or
+                        $sliceLines.Count -ne ($sliceEnd - $sliceStart + 1)) {
+                        throw "Sealed source report contains malformed slice line accounting for '$path'."
+                    }
+                    $start = [Math]::Max($sliceStart, $reqStart)
+                    $end = [Math]::Min($sliceEnd, $reqEnd)
+                    if ($end -lt $start) { return }
+                    $rendered = [System.Collections.Generic.List[string]]::new()
+                    for ($index = $start; $index -le $end; $index++) {
+                        [void]$rendered.Add((
+                                [Convert]::ToString($index, [Globalization.CultureInfo]::InvariantCulture) +
+                                ": " + [string]$sliceLines[$index - $sliceStart]))
+                    }
+                    $text = $rendered.ToArray() -join "`n"
+                    [void]$hunks.Add([pscustomobject][ordered]@{
+                            candidateId = [string]$CandidateId
+                            filePath = $normalizedPath
+                            line = $line
+                            startLine = $start
+                            endLine = $end
+                            sourceCommit = $SourceCommit
+                            sourceKind = "sealedSourceSlice"
+                            role = [string]$Role
+                            text = $text
+                            sha256 = Get-ReviewerVerificationSha256 -Text $text
+                        })
+                    return
+                }
             }
             try {
                 if (-not $fileCache.ContainsKey($normalizedPath)) {
                     $fileCache[$normalizedPath] = Get-ReviewerFactSourceFile -Session $verificationSession `
-                        -Path $path -SourceCommit $SourceCommit -MaxBytes 131072
+                        -Path $path -SourceCommit $SourceCommit `
+                        -MaxBytes $script:ReviewerVerificationMaxSourceFileBytes
                 }
                 $content = [string]$fileCache[$normalizedPath].Content
                 $lines = @($content.Replace("`r`n", "`n").Replace("`r", "`n") -split "`n")
-                $line = [int]$candidate.line
-                if ($line -gt $lines.Count) { continue }
-                $start = [Math]::Max(1, $line - 3)
-                $end = [Math]::Min($lines.Count, $line + 3)
+                $line = [int]$AnchorLine
+                if ($line -gt $lines.Count) { return }
+                $start = [Math]::Max(1, $reqStart)
+                $end = [Math]::Min($lines.Count, $reqEnd)
+                if ($end -lt $start) { return }
                 $rendered = [System.Collections.Generic.List[string]]::new()
                 for ($index = $start; $index -le $end; $index++) {
                     [void]$rendered.Add((
@@ -8390,18 +10423,76 @@ function Get-ReviewerVerificationSourceHunks {
                 }
                 $text = $rendered.ToArray() -join "`n"
                 [void]$hunks.Add([pscustomobject][ordered]@{
-                        candidateId = [string]$candidate.candidateId
-                        filePath = [string]$candidate.filePath
+                        candidateId = [string]$CandidateId
+                        filePath = $normalizedPath
                         line = $line
                         startLine = $start
                         endLine = $end
                         sourceCommit = $SourceCommit
+                        sourceKind = "commitPinnedFile"
+                        role = [string]$Role
                         text = $text
                         sha256 = Get-ReviewerVerificationSha256 -Text $text
                     })
             }
             catch {
                 Write-Warning "Could not build verifier source hunk for '$path': $($_.Exception.Message)"
+            }
+        }
+        foreach ($candidate in @($Candidates)) {
+            if ([string]$candidate.anchorKind -cne "changedFile" -or
+                -not [string]$candidate.filePath -or [int]$candidate.line -lt 1) {
+                continue
+            }
+            $candidateId = [string]$candidate.candidateId
+            $readPath = ConvertTo-ReviewerVerificationReadPath -Path ([string]$candidate.filePath)
+            if ($readPath) {
+                Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
+                    -RawPath ([string]$candidate.filePath) -AnchorLine ([int]$candidate.line) -Role "anchor"
+            }
+            # A convention candidate frequently spans files: the anchor sits in one
+            # changed file while the governing line (for example the subscriptionKey
+            # that mandates a "Global." prefix) is a changed line in a *different*
+            # file that the candidate names as a manifestation target. Collect the
+            # anchor plus every sealed changed-line manifestation target as context
+            # points so the enclosing sealed range of each (below) is delivered.
+            $contextPoints = [System.Collections.Generic.List[object]]::new()
+            $contextPoints.Add([pscustomobject]@{ path = [string]$candidate.filePath; line = [int]$candidate.line })
+            $manifestationText = [string](Get-ReviewerVerificationValue $candidate "manifestations" "")
+            if ($manifestationText -and
+                (Get-Command Resolve-ReviewerConventionSpecialistTargets -ErrorAction SilentlyContinue)) {
+                $resolvedTargets = Resolve-ReviewerConventionSpecialistTargets -Text $manifestationText `
+                    -ChangedFileAnchors @($ChangedFileAnchors) -ChangedLinesOnly
+                if ($resolvedTargets.Ok) {
+                    foreach ($target in @($resolvedTargets.Targets)) {
+                        if ([string]$target.kind -cne "changedLine") { continue }
+                        Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
+                            -RawPath ([string]$target.path) -AnchorLine ([int]$target.line) -Role "manifestation"
+                        $contextPoints.Add([pscustomobject]@{ path = [string]$target.path; line = [int]$target.line })
+                    }
+                }
+            }
+            $isConvention = (([string](Get-ReviewerVerificationValue $candidate "originKind" "") -ceq "convention") -or
+                [bool](Get-ReviewerVerificationValue $candidate "conventionBound" $false))
+            if ($isConvention -and @($ChangedFileAnchors).Count -gt 0) {
+                foreach ($point in $contextPoints) {
+                    $pointNormalizedPath = ConvertTo-ReviewerVerificationPath -Path ([string]$point.path)
+                    if (-not $pointNormalizedPath) { continue }
+                    foreach ($anchor in @($ChangedFileAnchors)) {
+                        $anchorNormalizedPath = ConvertTo-ReviewerVerificationPath -Path (
+                            [string](Get-ReviewerVerificationValue $anchor "path" ""))
+                        if (-not $anchorNormalizedPath -or $anchorNormalizedPath -cne $pointNormalizedPath) { continue }
+                        foreach ($range in @(Get-ReviewerVerificationValue $anchor "rightHandRanges" @())) {
+                            $rangeStart = [int](Get-ReviewerVerificationValue $range "startLine" 0)
+                            $rangeEnd = [int](Get-ReviewerVerificationValue $range "endLine" 0)
+                            if ($rangeStart -lt 1 -or $rangeEnd -lt $rangeStart) { continue }
+                            if ([int]$point.line -lt $rangeStart -or [int]$point.line -gt $rangeEnd) { continue }
+                            Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
+                                -RawPath ([string]$point.path) -AnchorLine ([int]$point.line) `
+                                -Role "context" -SpanStart $rangeStart -SpanEnd $rangeEnd
+                        }
+                    }
+                }
             }
         }
         return $hunks.ToArray()
@@ -8445,7 +10536,7 @@ function Invoke-ReviewerCrossVerificationPass {
             throw "Cross-verification source/change-set binding moved before verification."
         }
         $sources = @()
-        if ($SpecialistResult -and @($SpecialistResult.Candidates).Count -gt 0) {
+        if (@(Get-ReviewerVerificationValue $conventionPlan "selectedPacks" @()).Count -gt 0) {
             $sources = @(Get-ReviewerConventionSpecialistResolvedSources `
                     -Session $verificationSession -ConventionPlan $conventionPlan)
         }
@@ -8477,10 +10568,44 @@ function Invoke-ReviewerCrossVerificationPass {
                 sha256 = $markerSha
             })
     }
+    if ($rawPasses.Count -ne @($ReviewPassModels).Count -or
+        @($ReviewPassModels | Where-Object {
+                $expectedModel = [string]$_
+                @($rawPasses | Where-Object {
+                        [string]$_.model -ceq $expectedModel -and
+                        [string]$_.status -ceq "complete"
+                    }).Count -ne 1
+            }).Count -gt 0) {
+        throw "Cross-verification requires one completed blind generalist pass from every configured generalist model."
+    }
     $specialistStatus = [string](Get-ReviewerVerificationValue $SpecialistResult "Status" "degraded")
     $specialistCandidates = @((Get-ReviewerVerificationValue $SpecialistResult "Candidates" @()))
     $specialistManifest = Get-ReviewerVerificationValue $SpecialistResult "Manifest"
     $specialistArtifactPath = [string](Get-ReviewerVerificationValue $SpecialistResult "ArtifactPath" "")
+    # A degraded specialist no longer aborts the whole cross-verification. The
+    # blind generalist candidate union is constructed and sealed on its own, so
+    # a generalist finding that needs no specialist-only convention evidence
+    # still gets its full fresh GPT + fresh Opus cross-check. Only convention-
+    # ORIGIN candidates - the ones a degraded specialist can no longer stand
+    # behind - are withheld, candidate by candidate, by the replay's
+    # SpecialistDegraded handling downstream (reason "specialistDegraded"). The
+    # complete-blind-generalist requirement above still holds; only the
+    # specialist's completeness is now allowed to be partial.
+    $specialistDegraded = ($specialistStatus -cne "complete" -or $null -eq $specialistManifest)
+    if ($specialistDegraded) {
+        Write-Warning ("PR $prId convention specialist degraded; cross-verifying the blind generalist union alone. " +
+            "Convention-only candidates are withheld candidate-by-candidate.")
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-specialist-degraded"; prId = $prId
+            sourceCommit = $sourceCommit; specialistStatus = $specialistStatus
+        }
+        # A degraded specialist's own discovery is untrusted: the union carries
+        # only the blind generalist findings, and the sealed manifest records
+        # the specialist as degraded so replay withholds convention candidates.
+        $specialistCandidates = @()
+        $specialistManifest = $null
+        $specialistStatus = "degraded"
+    }
     $specialistArtifactSha = if ($specialistArtifactPath -and
         (Test-Path -LiteralPath $specialistArtifactPath -PathType Leaf)) {
         (Get-FileHash -LiteralPath $specialistArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -8524,20 +10649,77 @@ function Invoke-ReviewerCrossVerificationPass {
                 marker = $(if ($_.markerJson) { [string]$_.markerJson | ConvertFrom-Json -Depth 32 } else { $null })
             }
         })
+    # Get-ReviewerConventionSpecialistChangedFileIndex returns a `,`-protected
+    # array so a zero- or one-file change set still round-trips as an array.
+    # Wrapping that call in @() does NOT flatten it - it nests the whole index
+    # as a single Object[] element, so the resolver below would see one bogus
+    # anchor with no anchorId/path and EVERY cross-file manifestation would fail
+    # to resolve, stripping the verifier of the cross-file evidence it must rule
+    # on (the anchor hunk still emits because it needs no resolver). Assign the
+    # protected array directly so the cf<n> references resolve against the real
+    # per-file anchors, exactly as the specialist index they were bound to.
+    $changedFileAnchors = Get-ReviewerConventionSpecialistChangedFileIndex `
+        -ChangeEntries $changeEntries `
+        -RightHandRangesByPath $(if ($Bound.ContainsKey('ChangedFileRangesByPath')) {
+                $Bound['ChangedFileRangesByPath']
+            } else { @{} })
     $candidatePlan = Get-ReviewerVerificationCandidatePlan -GeneralistPasses $normalizedPasses `
         -ConventionCandidates $specialistCandidates -ConventionModel $EffectiveConventionSpecialistModel `
         -ConventionArtifactSha256 $specialistArtifactSha `
+        -ConventionPlan $conventionPlan -ResolvedSources $resolvedSources `
+        -ChangedFileAnchors $changedFileAnchors `
         -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates)
-    $candidates = @($candidatePlan.candidates)
-    $preVerificationWithheld = @($candidatePlan.withheld)
-    $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
-        -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
-        -MaxClusterSize ([int]$EffectiveCrossVerificationPolicy.maxClusterSize) `
-        -NearExactJaccard ([double]$EffectiveCrossVerificationPolicy.nearExactJaccard) `
-        -SemanticJaccard ([double]$EffectiveCrossVerificationPolicy.semanticJaccard))
+    $factPartition = Get-ReviewerVerificationCandidateFactPartition `
+        -Candidates @($candidatePlan.candidates) -FactPlan $factPlan
+    $candidates = @($factPartition.candidates)
+    $preVerificationWithheld = @($candidatePlan.withheld) + @($factPartition.withheld)
+    if ($specialistDegraded -and @($candidates).Count -gt 0) {
+        # A degraded specialist can no longer supply convention evidence, so
+        # every candidate that DEPENDS on that evidence - a convention-origin
+        # finding, or a generalist finding bound to a convention rule - is
+        # withheld candidate by candidate, before clustering and before any
+        # launch. Functional generalist findings that need no convention-only
+        # evidence are kept untouched and receive their full fresh GPT + fresh
+        # Opus cross-check. The total candidate count is preserved (kept +
+        # withheld), so the sealed artifact still reconciles on replay.
+        $degradedKept = [System.Collections.Generic.List[object]]::new()
+        foreach ($candidate in @($candidates)) {
+            $isConventionOrigin = ([string](Get-ReviewerVerificationValue $candidate "originKind" "") -ceq "convention")
+            $isConventionBound = [bool](Get-ReviewerVerificationValue $candidate "conventionBound" $false)
+            if ($isConventionOrigin -or $isConventionBound) {
+                $preVerificationWithheld += [pscustomobject][ordered]@{
+                    candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+                    clusterId   = ""
+                    reason      = "specialistDegraded"
+                    detail      = "The convention specialist was degraded, so this candidate's required convention evidence is unavailable."
+                }
+            }
+            else {
+                [void]$degradedKept.Add($candidate)
+            }
+        }
+        $candidates = @($degradedKept.ToArray())
+    }
+    do {
+        $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
+            -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
+            -MaxClusterSize ([int]$EffectiveCrossVerificationPolicy.maxClusterSize) `
+            -NearExactJaccard ([double]$EffectiveCrossVerificationPolicy.nearExactJaccard) `
+            -SemanticJaccard ([double]$EffectiveCrossVerificationPolicy.semanticJaccard))
+        $clusterFactPartition = Get-ReviewerVerificationClusterFactPartition `
+            -Candidates $candidates -Clusters $clusters -FactPlan $factPlan
+        $clusterFactWithheld = @($clusterFactPartition.withheld)
+        if ($clusterFactWithheld.Count -gt 0) {
+            $candidates = @($clusterFactPartition.candidates)
+            $preVerificationWithheld += $clusterFactWithheld
+        }
+    } while ($clusterFactWithheld.Count -gt 0)
     $assignments = @(Get-ReviewerVerificationAssignments -Clusters $clusters `
         -GeneralistModels $ReviewPassModels -ConventionVerifierModel $EffectiveConventionVerifierModel `
         -ChangedPaths @($Bound.ChangedPaths))
+    $assignmentCoverage = Assert-ReviewerVerificationAssignmentCoverage -Clusters $clusters `
+        -Assignments $assignments -RequiredVerifierModels $ReviewPassModels `
+        -MaxVerifierRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns)
     $readyCandidateIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($cluster in @($clusters | Where-Object { [string]$_.status -ceq "ready" })) {
         foreach ($member in @($cluster.members)) { [void]$readyCandidateIds.Add([string]$member.candidateId) }
@@ -8546,7 +10728,12 @@ function Invoke-ReviewerCrossVerificationPass {
             $readyCandidateIds.Contains([string]$_.candidateId)
         })
     $evidenceHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath $AgencyPath `
-        -SourceCommit $sourceCommit -Candidates $verifiableCandidates -ChangedPaths @($Bound.ChangedPaths))
+        -SourceCommit $sourceCommit -Candidates $verifiableCandidates `
+        -ChangedPaths @($Bound.ChangedPaths) `
+        -ChangedFileAnchors $changedFileAnchors `
+        -SourceReport $(if ($Bound.ContainsKey('SourceTransportReport')) {
+                $Bound['SourceTransportReport']
+            } else { $null }))
     $threadFacts = @(Get-ReviewerVerificationThreadFacts -FactPlan $factPlan)
     $candidateEvidenceOptions = [System.Collections.Generic.List[object]]::new()
     foreach ($candidate in $verifiableCandidates) {
@@ -8605,8 +10792,10 @@ function Invoke-ReviewerCrossVerificationPass {
         evidenceHunks = @($evidenceHunks)
         changedEntries = @($changeEntries)
         changedPaths = @($Bound.ChangedPaths)
+        crossCheckModels = @($ReviewPassModels | Sort-Object)
         threadFacts = @($threadFacts)
         candidateEvidenceOptions = $candidateEvidenceOptions.ToArray()
+        assignmentCoverage = $assignmentCoverage
         candidates = @($candidates)
         totalCandidateCount = [int]$candidatePlan.totalCandidateCount
         preVerificationWithheld = @($preVerificationWithheld)
@@ -8632,8 +10821,10 @@ function Invoke-ReviewerCrossVerificationPass {
         evidenceHunks = $inputBody.evidenceHunks
         changedEntries = $inputBody.changedEntries
         changedPaths = $inputBody.changedPaths
+        crossCheckModels = $inputBody.crossCheckModels
         threadFacts = $inputBody.threadFacts
         candidateEvidenceOptions = $inputBody.candidateEvidenceOptions
+        assignmentCoverage = $inputBody.assignmentCoverage
         candidates = $inputBody.candidates
         totalCandidateCount = $inputBody.totalCandidateCount
         preVerificationWithheld = $inputBody.preVerificationWithheld
@@ -8642,7 +10833,7 @@ function Invoke-ReviewerCrossVerificationPass {
         allInputArtifactHashes = $inputBody.allInputArtifactHashes
     }
     $baseName = "pr$prId-$($sourceCommit.Substring(0, 12))-$($inputManifestSha.Substring(0, 16))"
-    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     $inputArtifactPath = Save-ReviewerVerificationInput -Manifest $inputManifest `
         -Directory $verificationInputDir -BaseName $baseName -MasterKey $masterKey `
         -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes)
@@ -8658,25 +10849,56 @@ function Invoke-ReviewerCrossVerificationPass {
     $orderedGroupKeys = [System.Collections.Generic.List[string]]::new()
     foreach ($groupKey in $groups.Keys) { [void]$orderedGroupKeys.Add([string]$groupKey) }
     $orderedGroupKeys.Sort([StringComparer]::Ordinal)
-    $verifierRunsLaunched = 0
-    foreach ($key in $orderedGroupKeys) {
-        $groupAssignments = @($groups[$key])
-        $clusterId = [string]$groupAssignments[0].clusterId
-        $verifierModel = [string]$groupAssignments[0].verifierModel
-        $budget = Get-ReviewerVerificationRunBudget -RunsLaunched $verifierRunsLaunched `
-            -MaxRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns) `
-            -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds `
-            -MaxPhaseSeconds ([int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds) `
-            -ConfiguredRunTimeoutSeconds $EffectiveVerificationTimeoutSeconds
-        if (-not [bool]$budget.canRun) {
-            foreach ($assignment in $groupAssignments) {
+    # Deterministic 2N preflight: prove the WHOLE required verifier ASSIGNMENT set
+    # fits the declared run and time budget BEFORE launching a single model. The
+    # unit is assignments - every candidate once by GPT and once by Opus - not the
+    # grouped invocations they happen to be batched into, because grouping is an
+    # implementation detail and budgeting it would make the reservation a promise
+    # about batching rather than about the work. Either every required assignment
+    # can launch or none does: no partial launch that would cross-check some
+    # candidates and silently degrade the rest when the phase clock expires
+    # mid-loop.
+    #
+    # The plan is also the ONLY source of the per-invocation timeout and of the
+    # absolute phase deadline: the phase (less a reserved overhead slice for
+    # setup, fresh binding, reconciliation and artifact writes) is divided among
+    # the required assignments, and each admitted group is handed exactly the
+    # share the preflight reserved, so admission and invocation cannot disagree
+    # about how long a run may take.
+    $budgetPreflight = Assert-ReviewerVerificationBudgetPreflight `
+        -RequiredAssignmentCount ([int]$assignmentCoverage.requiredAssignmentCount) `
+        -InvocationCount $orderedGroupKeys.Count `
+        -MaxVerifierRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns) `
+        -MaxPhaseSeconds ([int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds) `
+        -ConfiguredRunTimeoutSeconds $EffectiveVerificationTimeoutSeconds `
+        -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
+    $admittedRunTimeoutSeconds = [int]$budgetPreflight.perInvocationTimeoutSeconds
+    $verificationPhaseDeadlineSeconds = [int]$budgetPreflight.phaseDeadlineSeconds
+    if (-not [bool]$budgetPreflight.canLaunch) {
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-budget-preflight"; prId = $prId
+            sourceCommit = $sourceCommit; result = "degraded"; reason = [string]$budgetPreflight.reason
+            requiredAssignmentCount = [int]$budgetPreflight.requiredAssignmentCount
+            invocationCount = [int]$budgetPreflight.invocationCount
+            effectiveMaxAssignments = [int]$budgetPreflight.effectiveMaxAssignments
+            requiredSeconds = [int]$budgetPreflight.requiredSeconds
+            remainingSeconds = [int]$budgetPreflight.remainingSeconds
+            reservedOverheadSeconds = [int]$budgetPreflight.reservedOverheadSeconds
+            perAssignmentTimeoutSeconds = [int]$budgetPreflight.perAssignmentTimeoutSeconds
+            perInvocationTimeoutSeconds = [int]$budgetPreflight.perInvocationTimeoutSeconds
+            minAssignmentSeconds = [int]$budgetPreflight.minAssignmentSeconds
+            maxSupportedAssignmentCount = [int]$budgetPreflight.maxSupportedAssignmentCount
+        }
+        # No launch: mark every planned assignment degraded up front.
+        foreach ($key in $orderedGroupKeys) {
+            foreach ($assignment in @($groups[$key])) {
                 [void]$runRecords.Add([pscustomobject][ordered]@{
                         assignmentId = [string]$assignment.assignmentId
                         status = "degraded"
-                        reason = [string]$budget.reason
-                        detail = "Verification aggregate run/time budget was exhausted before this assignment."
-                        model = $verifierModel
-                        clusterId = $clusterId
+                        reason = [string]$budgetPreflight.reason
+                        detail = "Verification budget preflight refused to launch: the full required assignment set does not fit the declared run/time budget."
+                        model = [string]$assignment.verifierModel
+                        clusterId = [string]$assignment.clusterId
                         nonceSha256 = "0" * 64
                         promptSha256 = $CrossVerificationPromptSha256
                         inputBytes = 0
@@ -8687,8 +10909,20 @@ function Invoke-ReviewerCrossVerificationPass {
                         marker = $null
                     })
             }
-            continue
         }
+        $orderedGroupKeys = [System.Collections.Generic.List[string]]::new()
+    }
+    foreach ($key in $orderedGroupKeys) {
+        $groupAssignments = @($groups[$key])
+        $clusterId = [string]$groupAssignments[0].clusterId
+        $verifierModel = [string]$groupAssignments[0].verifierModel
+        # No mid-loop budget re-check. The deterministic preflight above already
+        # proved the WHOLE admitted set fits the run and time budget by dividing
+        # the remaining phase among the required runs, so every admitted group
+        # launches with the exact share the preflight reserved for it. Re-checking
+        # the phase clock here is what re-opened the partial-launch window: a run
+        # that consumed most of its bound could strand a later planned group even
+        # though room had already been reserved for it.
         $cluster = @($clusters | Where-Object { [string]$_.clusterId -ceq $clusterId })[0]
         $candidateIds = @($groupAssignments | ForEach-Object { [string]$_.candidateId })
         $assignedCandidates = @($cluster.members | Where-Object {
@@ -8719,20 +10953,8 @@ function Invoke-ReviewerCrossVerificationPass {
                             -ExistingThreadJaccard ([double]$EffectiveCrossVerificationPolicy.existingThreadJaccard)
                     }).Count -gt 0
             })
-        $relevantFactIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($assignedCandidate in $assignedCandidates) {
-            foreach ($factId in @(([string]$assignedCandidate.factIds) -split ',' | Where-Object { $_ })) {
-                [void]$relevantFactIds.Add($factId)
-            }
-        }
-        $relevantFacts = @($factPlan.facts | Where-Object {
-                $fact = $_
-                $factId = [string]$fact.id
-                $relevantFactIds.Contains($factId) -or
-                (@($assignedCandidates | Where-Object {
-                            [string]$_.anchorKind -ceq "prMetadata"
-                        }).Count -gt 0 -and [string]$fact.domain -ceq "metadata")
-            })
+        $relevantFacts = @(Get-ReviewerVerificationDeterministicFacts `
+            -Candidates $assignedCandidates -FactPlan $factPlan)
         $eligibleSiblingCandidates = @($cluster.members | Where-Object {
                 [string]$_.originModel -cne $verifierModel
             })
@@ -8750,8 +10972,7 @@ function Invoke-ReviewerCrossVerificationPass {
             -AssignedCandidates $assignedCandidates -SiblingEvidence $siblingEvidence `
             -EvidenceHunks $assignedHunks -CandidateEvidence $assignedEvidence `
             -DeterministicFacts $relevantFacts -ThreadFacts $relevantThreads `
-            -TimeoutSeconds ([int]$budget.timeoutSeconds)
-        $verifierRunsLaunched++
+            -TimeoutSeconds $admittedRunTimeoutSeconds
         foreach ($assignment in $groupAssignments) {
             [void]$runRecords.Add([pscustomobject][ordered]@{
                     assignmentId = [string]$assignment.assignmentId
@@ -8768,26 +10989,138 @@ function Invoke-ReviewerCrossVerificationPass {
                 })
         }
     }
-    $freshBinding = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
-        param([hashtable]$verificationSession)
-        return Get-ReviewerPinnedConventionChangeSet -Session $verificationSession -PrId $prId `
-            -ExpectedSourceCommit $sourceCommit
+    # The cap is a bound on the PHASE, not on the launches inside it. The reserved
+    # overhead slice above is what setup, this fresh binding, reconciliation and
+    # the artifact write are supposed to fit into. If the phase has nonetheless
+    # crossed its absolute deadline, the phase STOPS here: it does not spend more
+    # wall clock on a live fresh binding it cannot afford, and it does not publish
+    # findings that were produced outside the bound the operator declared.
+    # Recording the overrun and continuing was the earlier behaviour, and a bound
+    # that is only ever logged is not a bound.
+    $phaseDeadlineState = Get-ReviewerVerificationPhaseDeadlineState `
+        -PhaseDeadlineSeconds $verificationPhaseDeadlineSeconds `
+        -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
+    $phaseDeadlineOverrun = [bool]$phaseDeadlineState.exceeded
+    if ($phaseDeadlineOverrun) {
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-phase-deadline"; prId = $prId
+            sourceCommit = $sourceCommit
+            result = [string]$phaseDeadlineState.result
+            phaseDeadlineSeconds = [int]$phaseDeadlineState.phaseDeadlineSeconds
+            phaseElapsedSeconds = [int]$phaseDeadlineState.elapsedSeconds
+            phaseRemainingSeconds = [int]$phaseDeadlineState.remainingSeconds
+            minPostprocessingSeconds = [int]$phaseDeadlineState.minPostprocessingSeconds
+            reservedOverheadSeconds = [int]$budgetPreflight.reservedOverheadSeconds
+            requiredAssignmentCount = [int]$budgetPreflight.requiredAssignmentCount
+            invocationCount = [int]$budgetPreflight.invocationCount
+        }
+        foreach ($runRecord in $runRecords) {
+            $runRecord.status = "degraded"
+            $runRecord.reason = "phaseDeadline"
+            $runRecord.detail = [string]$phaseDeadlineState.detail
+            $runRecord.marker = $null
+        }
     }
-    if ($freshBinding.TargetCommit -cne $targetCommit -or $freshBinding.Digest -cne $changeSetDigest) {
+    # The fresh binding is a LIVE read, so it is only attempted while the phase
+    # still has deadline left, AND only under a transport timeout whose worst
+    # case fits in what is left. Checking the deadline and then starting an
+    # unbounded live call would let the call itself breach the bound. Skipping it
+    # is not a weakening: the results it would have re-bound are already withheld.
+    $freshBindingBudget = Get-ReviewerVerificationFreshBindingBudget `
+        -DeadlineState $phaseDeadlineState -RequestTimeoutSeconds ([int]$McpTimeoutSeconds)
+    if (-not [bool]$freshBindingBudget.allowed -and -not $phaseDeadlineOverrun) {
+        # The deadline has not passed, but the binding cannot be bounded inside
+        # it. Fail closed exactly as an overrun would: unre-bound results are not
+        # published as if they had been re-bound.
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-fresh-binding-skipped"; prId = $prId
+            sourceCommit = $sourceCommit
+            reason = [string]$freshBindingBudget.reason
+            availableSeconds = [int]$freshBindingBudget.availableSeconds
+            phaseRemainingSeconds = [int]$phaseDeadlineState.remainingSeconds
+        }
         foreach ($runRecord in $runRecords) {
             $runRecord.status = "degraded"
             $runRecord.reason = "staleBinding"
-            $runRecord.detail = "The source/change-set binding moved during verification."
+            $runRecord.detail = [string]$freshBindingBudget.detail
             $runRecord.marker = $null
+        }
+    }
+    if ([bool]$freshBindingBudget.allowed) {
+        $freshBinding = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath `
+            -RequestTimeoutSeconds ([int]$freshBindingBudget.requestTimeoutSeconds) -Action {
+            param([hashtable]$verificationSession)
+            return Get-ReviewerPinnedConventionChangeSet -Session $verificationSession -PrId $prId `
+                -ExpectedSourceCommit $sourceCommit
+        }
+        if ($freshBinding.TargetCommit -cne $targetCommit -or $freshBinding.Digest -cne $changeSetDigest) {
+            foreach ($runRecord in $runRecords) {
+                $runRecord.status = "degraded"
+                $runRecord.reason = "staleBinding"
+                $runRecord.detail = "The source/change-set binding moved during verification."
+                $runRecord.marker = $null
+            }
+        }
+        # The binding is bounded, not instantaneous: the deadline is re-evaluated
+        # immediately after it and BEFORE anything is published, so a phase that
+        # crossed the line while re-binding still withholds everything.
+        $phaseDeadlineState = Get-ReviewerVerificationPhaseDeadlineState `
+            -PhaseDeadlineSeconds $verificationPhaseDeadlineSeconds `
+            -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
+        if ([bool]$phaseDeadlineState.exceeded -and -not $phaseDeadlineOverrun) {
+            $phaseDeadlineOverrun = $true
+            Write-ReviewerCycleMetadata -Fields @{
+                cycle = $CycleNumber; mode = "verification-phase-deadline"; prId = $prId
+                sourceCommit = $sourceCommit
+                result = [string]$phaseDeadlineState.result
+                phaseDeadlineSeconds = [int]$phaseDeadlineState.phaseDeadlineSeconds
+                phaseElapsedSeconds = [int]$phaseDeadlineState.elapsedSeconds
+                phaseRemainingSeconds = [int]$phaseDeadlineState.remainingSeconds
+                minPostprocessingSeconds = [int]$phaseDeadlineState.minPostprocessingSeconds
+                stage = "afterFreshBinding"
+            }
+            foreach ($runRecord in $runRecords) {
+                $runRecord.status = "degraded"
+                $runRecord.reason = "phaseDeadline"
+                $runRecord.detail = [string]$phaseDeadlineState.detail
+                $runRecord.marker = $null
+            }
         }
     }
     $replay = Invoke-ReviewerVerificationReplay -InputManifest $inputManifest `
         -VerifierRuns $runRecords.ToArray()
-    $status = if (@($runRecords | Where-Object { $_.status -cne "complete" }).Count -eq 0) {
-        "complete"
-    }
-    else {
-        "degraded"
+    $replay = Limit-ReviewerVerificationToPhaseDeadline -Replay $replay -DeadlineState $phaseDeadlineState
+    $allVerifierRunsComplete = (@($runRecords | Where-Object { $_.status -cne "complete" }).Count -eq 0)
+    # Partial convention-evidence degradation - a sealed authoritative source the
+    # offline replay could not answer, withheld candidate-by-candidate while the
+    # specialist still stood behind the packs it did receive - must not be
+    # reported as a complete review, otherwise unavailable convention evidence is
+    # silently treated as success. Fold all four coverage signals (every verifier
+    # run complete, specialist not degraded, convention plan not degraded, and
+    # every configured generalist authoritative source resolved) through one pure
+    # decision. A degraded result still surfaces the eligible blind-generalist
+    # findings in this pass's sealed preview/eligible set, but a degraded run's
+    # candidates are then withheld from posting by the separate, already-tested
+    # delivery gate (typed reason verificationDegraded): "preserved" here means
+    # preview/decision-visible, not auto-postable.
+    $conventionEvidenceDegraded = [bool](Get-ReviewerVerificationValue $conventionPlan "evidenceDegraded" $false)
+    # A configured generalist authoritative source that offline replay withheld
+    # (threaded onto the bound item at cycle-level source resolution) means the
+    # blind generalist never saw convention text it was configured to carry, so
+    # this pass must degrade the same way a degraded convention plan does.
+    $authoritativeSourceDegraded = [bool]$Bound['AuthoritativeSourceDegraded']
+    $status = Get-ReviewerVerificationConventionCoverageStatus `
+        -AllVerifierRunsComplete $allVerifierRunsComplete `
+        -SpecialistDegraded $specialistDegraded `
+        -ConventionEvidenceDegraded $conventionEvidenceDegraded `
+        -AuthoritativeSourceDegraded $authoritativeSourceDegraded
+    $reconciliationManifest = $null
+    if ($specialistManifest) {
+        $reconciliationManifest = Copy-ReviewerVerificationJsonValue -Value $specialistManifest
+        $reconciliationManifest.candidates = @(
+            Get-ReviewerVerificationAcceptedReconciliationCandidates `
+                -Eligible @($replay.eligible) -Decisions @($replay.decisions) -Clusters $clusters)
+        if ($status -cne "complete") { $reconciliationManifest.status = "degraded" }
     }
     $preview = Write-ReviewerVerificationDecisionPreview -PrId $prId -SourceCommit $sourceCommit `
         -Status $status -Diagnostic "" -InputArtifactPath $inputArtifactPath `
@@ -8795,6 +11128,7 @@ function Invoke-ReviewerCrossVerificationPass {
         -VerifierRuns $runRecords.ToArray() -Decisions @($replay.decisions) `
         -Withheld @($replay.withheld) -Eligible @($replay.eligible) `
         -AllCandidates @($candidatePlan.candidates) `
+        -ReconciliationManifest $reconciliationManifest `
         -InputArtifactHashes $inputHashes.ToArray() `
         -TotalCandidateCount ([int]$candidatePlan.totalCandidateCount) `
         -ReplaySha256 ([string]$replay.replaySha256)
@@ -9105,8 +11439,12 @@ function Invoke-ReviewerModelPass {
         follows would quietly erase exactly the disagreement the second pass was
         added to surface.
 
-        Returns @{ Model; Marker; Reason; EnvironmentFault } - Marker is $null
-        when this pass produced nothing usable.
+        Returns @{ Model; Marker; Reason; EnvironmentFault; RejectionClass; Nonce;
+        ModelRan; Usage } - Marker is $null when this pass produced nothing
+        usable. RejectionClass is the typed terminal reason ('success', a marker
+        status like 'schemaInvalid'/'wrongBinding', or 'timeout'/'processFailure'/
+        'environment'/'oversize'); Usage is the CLI's exact accounting (null
+        fields when unavailable).
     #>
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
@@ -9150,7 +11488,8 @@ function Invoke-ReviewerModelPass {
         # it. Counting it retires the pull request after the configured
         # threshold, visibly, which is the honest outcome for a condition that
         # cannot improve on its own.
-        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false }
+        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false
+            RejectionClass = 'oversize'; Nonce = $nonce; ModelRan = $false; Usage = $null }
     }
 
     # -- Launch the model -----------------------------------------------------
@@ -9158,7 +11497,7 @@ function Invoke-ReviewerModelPass {
     # passed, nor on which pass this is: the model's privileges are identical on
     # every run, which is what makes a preview a faithful rehearsal of a posting
     # run.
-    $allowTools = Get-ReviewerEffectiveAllowTools -BaseAllow $ConfigAllowTools
+    $allowTools = Get-ReviewerLaunchAllowTools -Intended (Get-ReviewerEffectiveAllowTools -BaseAllow $ConfigAllowTools)
     $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
     $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
     $modelArg = if ($PassModel -eq (Get-AgentDefaultModelSentinel)) { $null } else { $PassModel }
@@ -9167,6 +11506,17 @@ function Invoke-ReviewerModelPass {
     $label = if ($PassCount -gt 1) { "pass $PassNumber of $PassCount, $PassModel, read-only" } else { "read-only" }
     Write-Host "Launching Copilot ($label, timeout=${CycleTimeoutSeconds}s)..." -ForegroundColor Cyan
 
+    # Pre-launch result-contract gate. The generalist marker schema, at this
+    # pass's own MaxFindingItems, must have a largest legal serialization that
+    # fits both the declared scan window and the hard output byte cap BEFORE the
+    # process is launched - otherwise a complete, correct review could be emitted
+    # and silently lost. The same window this gate validated is handed to the
+    # typed extractor below, so the launch bound and the capture bound are one.
+    $markerSchema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -MaxFindingItems $EffectiveMaxFindings
+    $scanWindow = Assert-ReviewerModelResultContractFits -Surface "generalist pass ($PassModel)" `
+        -Schema $markerSchema -ScanWindowChars $script:ReviewerMarkerScanWindowChars `
+        -MaxOutputBytes $script:ReviewerMarkerMaxOutputBytes
+
     $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs -StandardInputContent $stdin `
         -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
         -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables -TimeoutSeconds $CycleTimeoutSeconds
@@ -9174,6 +11524,7 @@ function Invoke-ReviewerModelPass {
     # -- Marker validation (hostile input) ------------------------------------
     $markerSource = [string]$run.StdOut
     $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
+    $usage = $null
     if ($cliOutcome -and $cliOutcome.Answer) {
         $markerSource = [string]$cliOutcome.Answer
         if ($cliOutcome.Model) { Write-Host "Model reported by CLI: $($cliOutcome.Model)" -ForegroundColor DarkGray }
@@ -9183,25 +11534,69 @@ function Invoke-ReviewerModelPass {
             Write-Warning "The CLI reported $(@($cliOutcome.ModifiedFiles).Count) modified file(s) in a review that was granted no write tool: $((@($cliOutcome.ModifiedFiles) | Select-Object -First 5) -join ', ')"
         }
     }
+    # Exact per-attempt accounting, read from the CLI's own usage events. Every
+    # figure is null when the CLI did not report it, so a caller can tell an
+    # unavailable figure from a real zero.
+    if ($cliOutcome -and $cliOutcome.Usage) { $usage = $cliOutcome.Usage }
     $marker = $null
+    # Typed extraction so a caller can distinguish a missing marker from a
+    # schema-shape slip (retryable, fresh nonce) from a wrong-binding replay
+    # signal (never retried) - instead of collapsing every one to a generic
+    # "invalid marker". The status values are the parser's public literal
+    # strings: $script:AgentMarkerStatus lives in the harness MODULE scope and
+    # is not visible to this script, so comparing against it here would always
+    # be $null and reject every marker. Compare against the literals the typed
+    # API documents and returns.
+    $markerStatus = $null
+    $markerField = $null
     if ($run.ExitCode -eq 0 -and -not $run.TimedOut) {
-        $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource -MarkerPrefix $ResultMarkerPrefix `
-            -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -MaxFindingItems $EffectiveMaxFindings)
+        $markerOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $markerSource -MarkerPrefix $ResultMarkerPrefix `
+            -Schema $markerSchema `
+            -ScanWindowChars $scanWindow
+        $markerStatus = [string]$markerOutcome.Status
+        $markerField = [string]$markerOutcome.Field
+        if ($markerStatus -ceq 'success') { $marker = $markerOutcome.Value }
     }
     if ($marker -and -not (Test-ReviewerMarkerBinding -Marker $marker -PrId $prId -RepositoryId $cfgRepoId -SourceCommit $sourceCommit)) {
         Write-Warning "The result marker did not match the bound PR/repository/commit; discarding it."
         $marker = $null
         # A distinct reason so the pass-level retry can tell a formatting slip
-        # from a marker bound to the wrong work. The latter is never retried.
+        # from a marker bound to the wrong work. The extractor only enforces the
+        # schema's `exact` fields (project/nonce); this caller check is what
+        # binds the marker to THIS pull request/repository/source commit, and a
+        # marker that parsed cleanly but points at the wrong work is a wrong
+        # binding - terminal, never retried.
         $bindingRejected = $true
+        $markerStatus = 'wrongBinding'
+        $markerField = 'binding'
     }
     else { $bindingRejected = $false }
-    if ($marker) { return @{ Model = $PassModel; Marker = $marker; Reason = ""; EnvironmentFault = $false } }
+    if ($marker) {
+        return @{ Model = $PassModel; Marker = $marker; Reason = ""; EnvironmentFault = $false
+            RejectionClass = 'success'; Nonce = $nonce; ModelRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan); Usage = $usage }
+    }
 
+    # A precise, typed reason - never a generic "invalid marker". A schema-shape
+    # slip names the offending field (e.g. "schemaInvalid (field 'nonce')"),
+    # which is exactly the PR16769165 case where the marker omitted its nonce.
     $reason = if ($run.TimedOut) { "cycle timed out after ${CycleTimeoutSeconds}s" }
     elseif ($run.ExitCode -ne 0) { "copilot exited $($run.ExitCode)" }
     elseif ($bindingRejected) { "result marker bound to the wrong pull request" }
-    else { "missing or invalid result marker" }
+    elseif ($markerStatus) {
+        if ($markerField) { "result marker rejected: $markerStatus (field '$markerField')" }
+        else { "result marker rejected: $markerStatus" }
+    }
+    else { "missingMarker" }
+
+    # The typed rejection class the pass-level retry gates on. Marker-emission
+    # slips (missing/malformed/truncated/overflow/nonObject/schemaInvalid/
+    # ambiguous) are retryable with a fresh nonce; a wrong binding, a timeout, a
+    # nonzero exit and an environment fault are not.
+    $rejectionClass = if ($run.TimedOut) { 'timeout' }
+    elseif ($run.ExitCode -ne 0) { 'processFailure' }
+    elseif ($bindingRejected) { 'wrongBinding' }
+    elseif ($markerStatus) { $markerStatus }
+    else { 'missingMarker' }
 
     # A PR is not "unreviewable" because the host lost its credentials.
     # Launch signatures are read from STDERR ONLY, and only when the model
@@ -9211,7 +11606,7 @@ function Invoke-ReviewerModelPass {
     $modelActuallyRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
     $launchFailureReason = $null
     if (-not $modelActuallyRan) { $launchFailureReason = Get-AgentLaunchFailureReason -StdErrText ([string]$run.StdErr) }
-    if ($launchFailureReason) { $reason = "environment: $launchFailureReason" }
+    if ($launchFailureReason) { $reason = "environment: $launchFailureReason"; $rejectionClass = 'environment' }
     if ($PassCount -gt 1) { $reason = "pass $PassNumber ($PassModel): $reason" }
 
     # The transcript is the only way to diagnose a silent refusal, and it
@@ -9238,7 +11633,8 @@ function Invoke-ReviewerModelPass {
     }
     catch { Write-Warning "Could not write the failure transcript: $($_.Exception.Message)" }
 
-    return @{ Model = $PassModel; Marker = $null; Reason = $reason; EnvironmentFault = [bool]$launchFailureReason }
+    return @{ Model = $PassModel; Marker = $null; Reason = $reason; EnvironmentFault = [bool]$launchFailureReason
+        RejectionClass = $rejectionClass; Nonce = $nonce; ModelRan = $modelActuallyRan; Usage = $usage }
 }
 
 # ---------------------------------------------------------------------------
@@ -9349,7 +11745,7 @@ function Write-ReviewerGatePreview {
     )
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ", [Globalization.CultureInfo]::InvariantCulture)
     $baseName = "pr$PrId-$($Decision.sourceCommit.Substring(0, 12))-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
-    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     $artifactPath = Save-ReviewerGateDecision -Manifest $Decision -Directory $gateDecisionDir -BaseName $baseName -MasterKey $masterKey
     $markdownPath = ""
     if ($RenderMarkdown) {
@@ -9442,7 +11838,7 @@ function Get-ReviewerGateGeneralistPassAccounting {
     $completedModels = @($completed | ForEach-Object {
             [string](Get-ReviewerHashValue -Container $_ -Key 'model' -Default '')
         } | Where-Object { $_ } | Sort-Object)
-    $expectedModels = @("claude-opus-5", "gpt-5.6-sol") | Sort-Object
+    $expectedModels = @($script:ReviewerGeneralistModelPair.Models) | Sort-Object
     return @{
         Passes          = $passes
         Completed       = $completed
@@ -9512,7 +11908,7 @@ function New-ReviewerVerifiedMultiPassAuthorization {
             "VerifiedMultiPass mint for '$Purpose' on PR ${PrId}: refused (decisionArtifactMissing)."
         )
     }
-    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     try {
         $decision = Read-ReviewerGateDecision -Path $DecisionArtifactPath -MasterKey $masterKey
     }
@@ -9543,7 +11939,7 @@ function New-ReviewerVerifiedMultiPassAuthorization {
     # gateComments/gateApproval (including replay, which uses gateComments)
     # keep the EXISTING live-process requirement unchanged: those purposes
     # only ever run within the SAME cycle that just produced the passes.
-    $expectedGeneralistPair = (@("claude-opus-5", "gpt-5.6-sol") | Sort-Object) -join '|'
+    $expectedGeneralistPair = $script:ReviewerGeneralistModelPair.SortedKey
     $structurallyPossible = if ($Purpose -ceq "gatePromotion") {
         ([int](Get-ReviewerHashValue -Container $decision -Key 'passesRequested' -Default 0) -eq 2) -and
         ([bool](Get-ReviewerHashValue -Container $decision -Key 'generalistPairComplete' -Default $false)) -and
@@ -9552,7 +11948,7 @@ function New-ReviewerVerifiedMultiPassAuthorization {
     }
     else {
         [bool]$IsTwoPass -and [bool]$EffectiveEnableVerificationPreview -and [bool]$EnableConventionSpecialist -and
-        (@($ReviewPassModels | Where-Object { $_ -ceq "claude-opus-5" -or $_ -ceq "gpt-5.6-sol" }).Count -eq 2)
+        (Test-AgentGeneralistModelPair -Models @($ReviewPassModels))
     }
 
     $targetBranchName = $TargetRefName -replace '^refs/heads/', ''
@@ -9612,7 +12008,8 @@ function New-ReviewerVerifiedMultiPassAuthorization {
         $script:ReviewerVerifiedMultiPassSeal,
         [ReviewerDeliveryAuthorizationKind]::VerifiedMultiPass,
         2,
-        "independent claude-opus-5/gpt-5.6-sol two-pass union, cross-verified and gate-sealed for '$Purpose'",
+        ("independent $($script:ReviewerGeneralistModelPair.First)/$($script:ReviewerGeneralistModelPair.Second) " +
+            "two-pass union, cross-verified and gate-sealed for '$Purpose'"),
         $PrId,
         $ExpectedSourceCommit,
         $coverageDigest
@@ -9758,7 +12155,8 @@ function Invoke-ReviewerGateDelivery {
     try {
         $sessionForWrite = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
             -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+            -ReplaySnapshot $script:ReviewerReplaySnapshot
         $existingFingerprints = $FirstRevalidation.ExistingFingerprints
         foreach ($entry in $stillEligible) {
             $finding = @{ severity = [string]$entry.severity; filePath = [string]$entry.filePath; line = [int]$entry.line; comment = [string]$entry.comment }
@@ -9955,7 +12353,7 @@ function Invoke-ReviewerGateForPullRequest {
         $eligible = @(Get-ReviewerHashValue -Container $VerificationResult -Key 'Eligible' -Default @())
         $withheld = @(Get-ReviewerHashValue -Container $VerificationResult -Key 'Withheld' -Default @())
 
-        $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
         $inputManifest = $null
         $verificationInputSha256 = "0" * 64
         $verificationDecisionSha256 = "0" * 64
@@ -10396,7 +12794,7 @@ function Invoke-ReviewerGateReplay {
             Write-Warning "PR $PrId has an unfinished gate delivery whose sealed decision is no longer on disk; it will be re-sealed on the next full review instead of replayed."
             return
         }
-        $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
         $decision = Read-ReviewerGateDecision -Path $artifactPath -MasterKey $masterKey
 
         # Fatal, before any revalidation session or write: a decision whose
@@ -10786,24 +13184,96 @@ function Invoke-ReviewerPullRequest {
     foreach ($passModel in @($ReviewPassModels)) {
         $passNumber++
         $passResult = $null
+        # Exact per-attempt accounting. Two classes of usage figure need
+        # different treatment across a retry: a per-RUN figure (this session's
+        # own premium requests / API / session duration) is additive across
+        # attempts, but a CUMULATIVE checkpoint figure (totalNanoAiu,
+        # totalPremiumRequests) is a running session total, and each retry is a
+        # SEPARATE session, so summing them would double-count. The per-run
+        # figures are summed; the cumulative figures are recorded per attempt and
+        # only the terminal attempt's snapshot is carried to the aggregate. Every
+        # figure stays $null until the CLI reports one, so a genuinely
+        # unavailable figure is never reported as a real zero.
+        $acctAttempts = 0
+        $acctPremiumRequests = $null
+        $acctTotalApiDurationMs = $null
+        $acctSessionDurationMs = $null
+        $acctTermTotalNanoAiu = $null
+        $acctTermTotalPremiumRequests = $null
+        $addAcct = {
+            param($Current, $Value)
+            if ($null -eq $Value) { return $Current }
+            if ($null -eq $Current) { return [long]$Value }
+            return ([long]$Current + [long]$Value)
+        }
         for ($attempt = 1; $attempt -le $script:ReviewerMarkerRetryAttempts; $attempt++) {
             $passResult = Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
                 -Bound $Bound -PassModel ([string]$passModel) -PassNumber $passNumber -PassCount $passCount
+            $acctAttempts++
+            $u = $passResult.Usage
+            if ($u) {
+                $acctPremiumRequests = (& $addAcct $acctPremiumRequests $u.PremiumRequests)
+                $acctTotalApiDurationMs = (& $addAcct $acctTotalApiDurationMs $u.TotalApiDurationMs)
+                $acctSessionDurationMs = (& $addAcct $acctSessionDurationMs $u.SessionDurationMs)
+                if ($null -ne $u.TotalNanoAiu) { $acctTermTotalNanoAiu = [long]$u.TotalNanoAiu }
+                if ($null -ne $u.TotalPremiumRequests) { $acctTermTotalPremiumRequests = [long]$u.TotalPremiumRequests }
+            }
+            # One accounting record per ACTUAL attempt: its number, the SHA-256 of
+            # the nonce it was launched with (never the raw nonce), the typed
+            # rejection, whether the model ran, and the exact usage this attempt
+            # reported (null when the CLI did not). This preserves each attempt's
+            # figures instead of collapsing them into a single aggregate that
+            # loses every nonce, rejection and per-run usage.
+            Write-ReviewerCycleMetadata -Fields @{
+                cycle = $CycleNumber; mode = "model-attempt-accounting"; prId = $prId; sourceCommit = $sourceCommit
+                pass = $passNumber; model = [string]$passModel
+                attempt = $attempt
+                nonceSha256 = (Get-ReviewerTextSha256 -Text ([string]$passResult.Nonce))
+                rejectionClass = [string]$passResult.RejectionClass
+                modelRan = [bool]$passResult.ModelRan
+                premiumRequests = $(if ($u) { $u.PremiumRequests } else { $null })
+                totalNanoAiu = $(if ($u) { $u.TotalNanoAiu } else { $null })
+                totalApiDurationMs = $(if ($u) { $u.TotalApiDurationMs } else { $null })
+                sessionDurationMs = $(if ($u) { $u.SessionDurationMs } else { $null })
+                totalPremiumRequests = $(if ($u) { $u.TotalPremiumRequests } else { $null })
+            }
             if ($null -ne $passResult.Marker) { break }
-            # Retry only an unusable marker from an otherwise clean run, and
-            # only once. Anything else - a timeout, a nonzero exit, an
-            # environment fault, a marker bound to the wrong PR - is a real
-            # failure that a second identical attempt would not fix.
+            # Retry only a RETRYABLE result-emission slip from an otherwise
+            # clean run, and only within the configured attempt bound. A
+            # timeout, a nonzero exit, an environment fault, and - crucially -
+            # a marker echoing the WRONG binding (a replay signal) are never
+            # retried: a second identical attempt cannot fix them, and retrying
+            # a wrong binding is exactly how a replay would be handed extra
+            # tries. The typed RejectionClass alone decides retryability - a
+            # missing/malformed/truncated/overflow/schemaInvalid/nonObject/
+            # ambiguous emission slip is retryable; everything else is terminal.
             if ($attempt -ge $script:ReviewerMarkerRetryAttempts) { break }
-            if ([bool]$passResult.EnvironmentFault -or
-                ([string]$passResult.Reason) -notmatch 'missing or invalid result marker') {
+            $retryable = (Test-AgentMarkerStatusRetryable -Status ([string]$passResult.RejectionClass))
+            if ([bool]$passResult.EnvironmentFault -or -not $retryable) {
                 break
             }
             Write-Warning ("PR {0} pass {1} produced an unusable result marker; retrying once in a fresh session." -f $prId, $passNumber)
             Write-ReviewerCycleMetadata -Fields @{
                 cycle = $CycleNumber; mode = "marker-retry"; prId = $prId
                 sourceCommit = $sourceCommit; pass = $passNumber; model = [string]$passModel
+                rejectionClass = [string]$passResult.RejectionClass
             }
+        }
+        # A terminal aggregate over the pass: attempts made, the terminal typed
+        # reason, the summed per-run usage, and the terminal cumulative snapshot
+        # (labelled as such, since cumulative session totals are non-additive
+        # across the separate sessions a retry creates).
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "pass-accounting"; prId = $prId; sourceCommit = $sourceCommit
+            pass = $passNumber; model = [string]$passModel
+            attempts = $acctAttempts
+            succeeded = ($null -ne $passResult.Marker)
+            terminalRejectionClass = [string]$passResult.RejectionClass
+            premiumRequests = $acctPremiumRequests
+            totalApiDurationMs = $acctTotalApiDurationMs
+            sessionDurationMs = $acctSessionDurationMs
+            terminalTotalNanoAiu = $acctTermTotalNanoAiu
+            terminalTotalPremiumRequests = $acctTermTotalPremiumRequests
         }
         [void]$passResults.Add($passResult)
     }
@@ -10900,11 +13370,25 @@ function Invoke-ReviewerPullRequest {
     # unpromotable into a cycle that fails immediately, next to the code that
     # caused it. It re-parses through the real validator, not a re-implementation
     # of it, because only the real one can prove promotion will accept this.
+    #
+    # The merged schema carries up to one full generalist cap per pass, so its
+    # largest legal serialization is far bigger than a single pass's and MUST be
+    # scanned under the dedicated merged-marker window, not the harness default:
+    # a 50-finding merged marker is ~166 KB and would be silently truncated by
+    # the 65536-char fallback, sealing an artifact that could never be promoted.
+    # The pre-parse contract gate proves the actual merged schema fits that
+    # window (and the hard output byte cap) before parsing, and the SAME window
+    # is handed to the extractor - one contract, measured once, enforced at both
+    # ends. A schema too big to fit is a code defect, so it is fatal here.
+    $mergedSchema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject `
+        -ExpectedNonce ([string]$marker['nonce']) -MaxFindingItems $MergedMarkerMaxFindingItems
+    Assert-ReviewerModelResultContractFits -Surface "merged review" -Schema $mergedSchema `
+        -ScanWindowChars $script:ReviewerMergedMarkerScanWindowChars `
+        -MaxOutputBytes $script:ReviewerMergedMarkerMaxOutputBytes | Out-Null
     $mergedRoundTrip = ConvertFrom-AgentResultMarker `
         -StdOutText ("$ResultMarkerPrefix " + (ConvertTo-Json -InputObject $marker -Depth 8 -Compress)) `
-        -MarkerPrefix $ResultMarkerPrefix `
-        -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject `
-            -ExpectedNonce ([string]$marker['nonce']) -MaxFindingItems $MergedMarkerMaxFindingItems)
+        -MarkerPrefix $ResultMarkerPrefix -Schema $mergedSchema `
+        -ScanWindowChars $script:ReviewerMergedMarkerScanWindowChars
     if (-not $mergedRoundTrip) {
         # Deterministic, so it will fail identically next cycle: count it as a
         # real (non-environment) failure. That bounds the retry loop, and
@@ -10974,7 +13458,9 @@ function Invoke-ReviewerPullRequest {
         -SourceCoverage (Get-ReviewerHashValue -Container $Bound -Key 'SourceCoverage' -Default $null) `
         -ConventionSourceSummary (Get-ReviewerConventionSourceSummary `
                 -ConventionPlanPath ([string](Get-ReviewerHashValue -Container $Bound -Key 'ConventionPlanPath' -Default '')) `
-                -AuthoritativeSourcesText ([string](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourcesText' -Default '')))
+                -AuthoritativeSourcesText ([string](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourcesText' -Default '')) `
+                -AuthoritativeSourceConfiguredCount ([int](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourceConfiguredCount' -Default 0)) `
+                -AuthoritativeSourceResolvedCount ([int](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourceResolvedCount' -Default -1)))
     $previewPath = [string]$preview.MarkdownPath
 
     # -- Record the delivery plan BEFORE writing anything ----------------------
@@ -11198,6 +13684,14 @@ function Invoke-ReviewerPromotion {
 
     $manifestJson = [string](Get-ReviewerHashValue -Container $raw -Key 'manifestJson' -Default '')
     $signature = [string](Get-ReviewerHashValue -Container $raw -Key 'signature' -Default '')
+    if ($raw.PSObject.Properties['replay']) {
+        # Defence in depth with a readable message. The real barrier is the key
+        # domain - a replay artifact's signature cannot verify below - but an
+        # operator who tries this deserves to be told why rather than shown a
+        # generic tampering error.
+        throw ("Artifact '$ArtifactPath' was produced by an offline snapshot replay. Replay output is evidence about " +
+            "a recorded pull request state, never an approved review, and is permanently non-promotable.")
+    }
     if (-not $manifestJson) {
         throw ("This preview artifact predates artifact sealing (no signed manifest) and cannot be promoted. " +
             "Re-run the reviewer to produce a sealed artifact: $ArtifactPath")
@@ -11225,11 +13719,23 @@ function Invoke-ReviewerPromotion {
         "prId", "prTitle", "sourceCommit", "markerPrefix", "maxFindingItems",
         "reviewModels", "passesRequested", "passesCompleted", "createdAt", "scriptSha256",
         "previewPath", "previewSha256", "approvedComments", "approvedSummary",
-        "approvedVote", "reportedFindings", "markerBody"
+        "approvedVote", "reportedFindings", "markerBody", "sourceCoverageJson"
     )
+    $requiredDeliveryManifestKeys = @($deliveryManifestKeys | Where-Object { $_ -cne "sourceCoverageJson" })
     Assert-ReviewerExactObjectKeys -Object $signed -Allowed $deliveryManifestKeys `
-        -Required $deliveryManifestKeys -Where "delivery preview artifact"
+        -Required $requiredDeliveryManifestKeys -Where "delivery preview artifact"
     if ([int]$signed.artifactVersion -ne 3) { throw "Unsupported preview artifact version $($signed.artifactVersion)." }
+    if ($signed.PSObject.Properties["sourceCoverageJson"] -and [string]$signed.sourceCoverageJson) {
+        try {
+            $sourceCoverage = ([string]$signed.sourceCoverageJson) | ConvertFrom-Json -Depth 64
+            if ((Get-ReviewerCanonicalJson -Value $sourceCoverage) -cne [string]$signed.sourceCoverageJson) {
+                throw "coverage JSON is not canonical"
+            }
+        }
+        catch {
+            throw "Preview artifact carries invalid sealed source coverage: $($_.Exception.Message)"
+        }
+    }
 
     # A review is only meaningful against the repository it was produced for.
     if (([string]$signed.organization) -ine $Organization -or ([string]$signed.project) -ine $ExpectedProject -or
@@ -11322,6 +13828,15 @@ function Invoke-ReviewerPromotion {
     }
     $maxItems = [int](Get-ReviewerHashValue -Container $signed -Key 'maxFindingItems' -Default $EffectiveMaxFindings)
     if ($maxItems -lt 1) { $maxItems = $EffectiveMaxFindings }
+    # Defence in depth on top of the signature: the stored bound decides how large
+    # a marker the re-parse will admit, so it is held to the same absolute ceiling
+    # a live merge is - the -MaxFindings cap of 25 times the two-pass maximum. A
+    # value past that is impossible for an honest artifact and must never be
+    # allowed to widen the scan window, so it is refused rather than trusted.
+    if ($maxItems -gt $script:ReviewerMergedMarkerMaxFindingItems) {
+        throw ("The stored review declares a finding bound ($maxItems) above the legal maximum " +
+            "($($script:ReviewerMergedMarkerMaxFindingItems)); refusing to promote it.")
+    }
     # A review that was short a pass when it was sealed is still short a pass
     # now. The operator promoting it has read and approved the FINDINGS; that is
     # not the same as approving a verdict reached by fewer models than they
@@ -11334,9 +13849,26 @@ function Invoke-ReviewerPromotion {
         Write-Warning ("This review was produced by $sealedCompleted of $sealedRequested configured pass(es); " +
             "its findings will publish but no vote will be cast.")
     }
-    $marker = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + [string]$signed.markerBody) `
-        -MarkerPrefix $ResultMarkerPrefix `
-        -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $storedNonce -MaxFindingItems $maxItems)
+    # The stored marker is re-parsed under the SAME merged contract the seal
+    # proved it against. Its largest legal serialization can be ~166 KB, so it is
+    # scanned under the dedicated merged-marker window, not the harness default
+    # that would silently truncate a maximal two-pass review and reject a review
+    # the operator legitimately approved. The hard byte cap bounds the input text
+    # independently of the schema, and the contract gate proves the schema (with
+    # the sealed bound) fits the window before parsing; the SAME window is handed
+    # to the extractor - one contract, enforced at both ends.
+    $storedMarkerBody = [string]$signed.markerBody
+    if ($script:ReviewerUtf8.GetByteCount($storedMarkerBody) -gt $script:ReviewerMergedMarkerMaxOutputBytes) {
+        throw ("The stored review marker exceeds the $($script:ReviewerMergedMarkerMaxOutputBytes)-byte cap; refusing to promote it.")
+    }
+    $promotionSchema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject `
+        -ExpectedNonce $storedNonce -MaxFindingItems $maxItems
+    Assert-ReviewerModelResultContractFits -Surface "stored review" -Schema $promotionSchema `
+        -ScanWindowChars $script:ReviewerMergedMarkerScanWindowChars `
+        -MaxOutputBytes $script:ReviewerMergedMarkerMaxOutputBytes | Out-Null
+    $marker = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + $storedMarkerBody) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $promotionSchema `
+        -ScanWindowChars $script:ReviewerMergedMarkerScanWindowChars
     if (-not $marker) { throw "The stored review did not survive re-validation; refusing to promote it." }
     if (-not (Test-ReviewerMarkerBinding -Marker $marker -PrId $prId -RepositoryId $cfgRepoId -SourceCommit $sourceCommit)) {
         throw "The stored review is not bound to PR $prId at commit $sourceCommit; refusing to promote it."
@@ -11353,7 +13885,8 @@ function Invoke-ReviewerPromotion {
         if ($ownsSession) {
             $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
                 -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+                -ReplaySnapshot $script:ReviewerReplaySnapshot
         }
 
         $allFindings = @($marker['findings'])
@@ -11659,7 +14192,8 @@ function Invoke-ReviewerPromoteVerifiedPreview {
         if ($ownsSession) {
             $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
                 -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+                -ReplaySnapshot $script:ReviewerReplaySnapshot
         }
         $existingFingerprints = $dedicatedRevalidation.ExistingFingerprints
         $failures = 0
@@ -11731,25 +14265,24 @@ function Invoke-ReviewerCycle {
     try {
         $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
             -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+            -ReplaySnapshot $script:ReviewerReplaySnapshot
 
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
-        $rawPrs = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
-            action = 'list'; project = $ExpectedProject; repositoryId = $RepositoryName
-            status = 'Active'; targetRefName = $TargetRefName; top = 100
-        }
+        # Composed in ONE place, shared with the qualification prelaunch probe:
+        # a targeted run resolves its pull request directly and never asks for a
+        # repository-wide census it does not need (and that a bounded offline
+        # snapshot does not carry).
+        $candidateRequest = Get-ReviewerCandidateSourceRequest -Project $ExpectedProject `
+            -RepositoryName $RepositoryName -TargetPullRequestId $PullRequestId -TargetRefName $TargetRefName
+        $rawCandidateResponse = Invoke-AgentMcpTool -Session $session -Name $candidateRequest.Name `
+            -Arguments $candidateRequest.Arguments
+        $rawPrs = @(@($rawCandidateResponse) | Where-Object { $_ })
         $reviewedState = Get-JsonState -Path $reviewedStatePath
         $attemptsState = Get-JsonState -Path $attemptsStatePath
 
         if ($PullRequestId -gt 0) {
             $candidates = @(@($rawPrs) | Where-Object { $_ -and [int](Get-ReviewerHashValue -Container $_ -Key 'pullRequestId' -Default 0) -eq $PullRequestId })
-            if ($candidates.Count -eq 0) {
-                # It may exist but not be in the listed slice; ask for it directly.
-                $direct = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
-                    action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PullRequestId
-                }
-                if ($direct) { $candidates = @($direct) }
-            }
             Write-Host "Candidates: restricted to PR $PullRequestId ($($candidates.Count) found)." -ForegroundColor Cyan
         }
         else {
@@ -11779,6 +14312,8 @@ function Invoke-ReviewerCycle {
         $bound = New-Object System.Collections.Generic.List[hashtable]
         # Unfinished deliveries retried from their own sealed plan this cycle.
         $retried = New-Object System.Collections.Generic.List[string]
+        $captureCompleted = $false
+        $capturedPrId = 0
         foreach ($pr in $candidates) {
             if ($bound.Count -ge $PullRequestsPerCycle) { break }
             if ($selectionDeadline -and [DateTime]::UtcNow -gt $selectionDeadline) {
@@ -11933,13 +14468,25 @@ function Invoke-ReviewerCycle {
             # than no review, because it publishes an "approve" nobody earned.
             $pinnedSourceText = ""
             $sourceCoverageRecord = $null
+            $changedConstructs = @()
+            $constructFileSummaries = @()
+            $constructIdRanges = $null
+            $constructsIncomplete = $false
+            $changedFileRangesByPath = @{}
             try {
-                $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit
+                $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit -AgencyPath $AgencyPath
                 $pinnedSourceText = [string]$sourceTransport.BlockText
                 $sourceCoverageRecord = $sourceTransport.Record
-                Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) that could carry source text covered ({3}%), {4} path(s) the pull request itself calls source-free, {5} changed-source byte(s) + {6} sibling byte(s)." -f `
+                $constructResult = Get-ReviewerConstructFilesFromReportSafely -Report $sourceTransport.Report
+                $changedConstructs = @($constructResult.Constructs)
+                $constructFileSummaries = @($constructResult.Files)
+                $constructIdRanges = $constructResult.IdRangesByKind
+                $constructsIncomplete = ([bool]$constructResult.Truncated -or @($constructResult.PartiallyUnderstoodFiles).Count -gt 0)
+                $changedFileRangesByPath = Get-ReviewerSourceRightHandRangesByPath -Report $sourceTransport.Report
+                Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) that could carry source text covered ({3}%), {4} path(s) the pull request itself calls source-free, {5} path(s) exact comparison proves deletion-only, {6} changed-source byte(s) + {7} sibling byte(s)." -f `
                         $prId, $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.SourceBearingFileCount,
-                        $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.NoSourceFileCount,
+                        $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.ChangeSetExcusedFileCount,
+                        $sourceTransport.Report.AuthoritativeDeletionOnlyFileCount,
                         $sourceTransport.Report.TotalSliceBytes, $sourceTransport.Report.TotalSiblingBytes) -ForegroundColor Cyan
                 Write-ReviewerCycleMetadata -Fields @{
                     cycle = $CycleNumber; mode = "source-transport"; prId = $prId; sourceCommit = $sourceCommit
@@ -11947,17 +14494,28 @@ function Invoke-ReviewerCycle {
                     changedFileCount = [int]$sourceTransport.Report.ChangedFileCount
                     sourceBearingFileCount = [int]$sourceTransport.Report.SourceBearingFileCount
                     noSourceFileCount = [int]$sourceTransport.Report.NoSourceFileCount
+                    changeSetExcusedFileCount = [int]$sourceTransport.Report.ChangeSetExcusedFileCount
+                    authoritativeDeletionOnlyFileCount = [int]$sourceTransport.Report.AuthoritativeDeletionOnlyFileCount
                     readerExcusedFileCount = [int]$sourceTransport.Report.ReaderExcusedFileCount
                     readerExcusedUncorroboratedCount = [int]$sourceTransport.Report.ReaderExcusedUncorroboratedCount
                     readerNonTextUncorroboratedCount = [int]$sourceTransport.Report.ReaderNonTextUncorroboratedCount
-                    changeSetExcusedFileCount = [int]$sourceTransport.Report.ChangeSetExcusedFileCount
                     readerExcusedAllowance = [int]$sourceTransport.Report.ReaderExcusedAllowance
                     coveredFiles = [int]$sourceTransport.Report.CoveredFiles
                     coveragePercent = [int]$sourceTransport.Report.CoveragePercent
+                    # The percentage alone cannot be audited: 100% of nothing
+                    # and 100% of thirty hunks read the same in a log.
+                    requestedSpanCount = [int]$sourceTransport.Report.RequestedSpanCount
+                    deliveredSpanCount = [int]$sourceTransport.Report.DeliveredSpanCount
                     spanPercent = [int]$sourceTransport.Report.SpanPercent
                     totalSliceBytes = [int]$sourceTransport.Report.TotalSliceBytes
                     totalSiblingBytes = [int]$sourceTransport.Report.TotalSiblingBytes
                     spansUnavailableFileCount = [int]$sourceTransport.Report.SpansUnavailableFileCount
+                    spanBasisVersion = [int]$sourceTransport.Report.SpanBasisVersion
+                    recoveryAttemptedFileCount = [int]$sourceTransport.Report.RecoveryAttemptedFileCount
+                    recoveryRecoveredFileCount = [int]$sourceTransport.Report.RecoveryRecoveredFileCount
+                    recoveryEvidenceBlockCount = [int]$sourceTransport.Report.RecoveryEvidenceBlockCount
+                    recoveryBaseCommit = [string]$sourceTransport.Report.RecoveryBaseCommit
+                    recoveryIterationId = [int]$sourceTransport.Report.RecoveryIterationId
                     reasonCodes = @($sourceTransport.Gate.ReasonCodes)
                 }
                 if (-not $sourceTransport.Gate.Ok) {
@@ -11979,6 +14537,19 @@ function Invoke-ReviewerCycle {
                     $result.ExitCode = 1
                     [void]$retried.Add("PR $prId skipped (no sealed source block)")
                     continue
+                }
+                if ($CaptureSourceTransportArtifactPath) {
+                    Save-ReviewerSourceTransportReplayCapture -Path $CaptureSourceTransportArtifactPath `
+                        -Transport $sourceTransport
+                    if ($CaptureSourceTransportOnly) {
+                        Write-ReviewerCycleMetadata -Fields @{
+                            cycle = $CycleNumber; mode = "source-transport"; prId = $prId
+                            sourceCommit = $sourceCommit; result = "captured"
+                        }
+                        $captureCompleted = $true
+                        $capturedPrId = $prId
+                        break
+                    }
                 }
             }
             catch {
@@ -12032,7 +14603,8 @@ function Invoke-ReviewerCycle {
                                 TargetCommit = $pinnedChanges.TargetCommit; ChangeSetDigest = $pinnedChanges.Digest
                             } -AuthoritativeSnapshots $packAuthoritativeSnapshots `
                             -RepositorySnapshots $packRepositorySnapshots `
-                            -ScriptSha256 $ScriptSelfSha256 -ConfigSha256 $ConfigSha256
+                            -ScriptSha256 $ScriptSelfSha256 -ConfigSha256 $ConfigSha256 `
+                            -AllowDegradedSources:$script:ReviewerReplayActive
                         $readyPlanPath = Save-ReviewerConventionPlan -Plan $conventionPlan `
                             -PrId $prId -SourceCommit $sourceCommit
                         $factBinding = [pscustomobject][ordered]@{
@@ -12103,9 +14675,15 @@ function Invoke-ReviewerCycle {
                                 $prId, @($conventionPlan.selectedPacks).Count, @($conventionPlan.withheldPacks).Count,
                                 $conventionPlan.totalContextBytes, $conventionPlan.maxTotalBytes) -ForegroundColor Cyan
                         Write-ReviewerCycleMetadata -Fields @{
-                            cycle = $CycleNumber; mode = "convention-plan"; result = "ready"; prId = $prId
+                            cycle = $CycleNumber; mode = "convention-plan"
+                            result = $(if ($conventionPlan.evidenceDegraded) { "degraded" } else { "ready" })
+                            prId = $prId
                             sourceCommit = $sourceCommit; changeSetDigest = $pinnedChanges.Digest
                             selectedPackCount = @($conventionPlan.selectedPacks).Count
+                            withheldPackCount = @($conventionPlan.withheldPacks).Count
+                            evidenceStatus = [string]$conventionPlan.evidenceStatus
+                            evidenceDegraded = [bool]$conventionPlan.evidenceDegraded
+                            degradedReason = [string]$conventionPlan.degradedReason
                             totalContextBytes = $conventionPlan.totalContextBytes; planPath = $readyPlanPath
                         }
                         return @{ PlanPath = $readyPlanPath; FactPlanPath = $factPlanPath }
@@ -12158,7 +14736,18 @@ function Invoke-ReviewerCycle {
                     DigestText           = $digest.Text
                     ChangedPaths         = $changedPaths
                     PinnedSourceText     = $pinnedSourceText
+                    SourceTransportReport = $sourceTransport.Report
                     SourceCoverage       = $sourceCoverageRecord
+                    # The constructs the change set touched, enumerated from the
+                    # slices that were actually delivered. Carried on the bound
+                    # record so the specialist reconciles its accounting against
+                    # exactly the source the wrapper read, never against a file
+                    # nobody opened.
+                    ChangedConstructs    = $changedConstructs
+                    ConstructFiles       = $constructFileSummaries
+                    ConstructIdRanges    = $constructIdRanges
+                    ChangedFileRangesByPath = $changedFileRangesByPath
+                    ConstructsIncomplete = $constructsIncomplete
                     ConventionPlanPath   = $conventionPlanPath
                     FactPlanPath         = $factPlanPath
                     ExistingFingerprints = (Get-ReviewerExistingFingerprints -Threads $threads)
@@ -12174,6 +14763,22 @@ function Invoke-ReviewerCycle {
                 })
         }
 
+        if ($CaptureSourceTransportOnly) {
+            if ($captureCompleted) {
+                $result.ExitCode = 0
+                $result.Summary = "PR $capturedPrId source transport captured"
+                Write-ReviewerCycleMetadata -Fields @{
+                    cycle = $CycleNumber; mode = "live"; result = "captured"; prId = $capturedPrId
+                }
+                return $result
+            }
+            $result.ExitCode = 1
+            $result.Summary = "source transport capture did not complete"
+            Write-ReviewerCycleMetadata -Fields @{
+                cycle = $CycleNumber; mode = "live"; result = "captureFailed"; prId = $PullRequestId
+            }
+            return $result
+        }
         if ($bound.Count -eq 0) {
             if ($retried.Count -gt 0) {
                 $result.Summary = ($retried.ToArray() -join "; ")
@@ -12190,12 +14795,45 @@ function Invoke-ReviewerCycle {
         # a separate MCP session. A transport failure can fail this fresh review
         # closed without closing the session that owns delivery and PR state.
         $authoritativeSourcesText = ""
+        $authoritativeSourceDegraded = $false
+        $authoritativeSourceConfiguredCount = 0
+        $authoritativeSourceResolvedCount = 0
         if (@($AuthoritativeSourcePolicy.Sources).Count -gt 0) {
+            $configuredSourceCount = @($AuthoritativeSourcePolicy.Sources).Count
             $sourceSnapshots = Get-ReviewerAuthoritativeSourceSnapshots -AgencyPath $AgencyPath -Policy $AuthoritativeSourcePolicy
+            $resolvedSourceCount = @($sourceSnapshots).Count
+            $authoritativeSourceConfiguredCount = $configuredSourceCount
+            $authoritativeSourceResolvedCount = $resolvedSourceCount
+            # Offline replay withholds a configured authoritative source that was
+            # never sealed (candidate-level convention degrade above). When any
+            # configured source did not resolve, the blind generalist context is
+            # missing convention text it was configured to carry, so the fresh
+            # cross-verification pass must degrade rather than report a complete
+            # review with silently-missing authoritative evidence. Live runs never
+            # reach here partial (an unresolved source throws upstream), so this
+            # only ever trips under replay withholding.
+            $authoritativeSourceDegraded = ($resolvedSourceCount -lt $configuredSourceCount)
             $authoritativeSourcesText = Format-ReviewerAuthoritativeSources `
                 -Snapshots $sourceSnapshots -MaxTotalBytes $AuthoritativeSourcePolicy.MaxTotalBytes
-            Write-Host ("Authoritative sources: {0} file(s), {1} decoded byte(s), commit-pinned with SHA-256 provenance." -f `
-                    @($sourceSnapshots).Count, (($sourceSnapshots | Measure-Object -Property ByteLength -Sum).Sum)) -ForegroundColor Cyan
+            # Offline replay can withhold every configured authoritative source, so
+            # $sourceSnapshots may legitimately be empty here. Measure-Object -Sum on
+            # an empty pipeline emits no object at all, and reading .Sum off nothing
+            # throws under StrictMode - so the byte total is guarded on the resolved
+            # count rather than assumed to exist.
+            $authoritativeSourceBytes = 0
+            if ($resolvedSourceCount -gt 0) {
+                $authoritativeSourceBytes = [int](($sourceSnapshots | Measure-Object -Property ByteLength -Sum).Sum)
+            }
+            Write-Host ("Authoritative sources: {0} of {1} configured file(s), {2} decoded byte(s), commit-pinned with SHA-256 provenance." -f `
+                    $resolvedSourceCount, $configuredSourceCount, $authoritativeSourceBytes) -ForegroundColor Cyan
+            if ($authoritativeSourceDegraded) {
+                Write-Warning ("Authoritative sources degraded: {0} of {1} configured source(s) withheld from the blind generalist context; cross-verification will degrade this pass." -f `
+                        ($configuredSourceCount - $resolvedSourceCount), $configuredSourceCount)
+                Write-ReviewerCycleMetadata -Fields @{
+                    cycle = $CycleNumber; mode = "source-degraded"
+                    configuredSources = $configuredSourceCount; resolvedSources = $resolvedSourceCount
+                }
+            }
             foreach ($entry in $sourceSnapshots) {
                 Write-ReviewerCycleMetadata -Fields @{
                     cycle = $CycleNumber; mode = "source"; repositoryId = $entry.RepositoryId
@@ -12204,7 +14842,12 @@ function Invoke-ReviewerCycle {
                 }
             }
         }
-        foreach ($item in $bound) { $item.AuthoritativeSourcesText = $authoritativeSourcesText }
+        foreach ($item in $bound) {
+            $item.AuthoritativeSourcesText = $authoritativeSourcesText
+            $item.AuthoritativeSourceDegraded = $authoritativeSourceDegraded
+            $item.AuthoritativeSourceConfiguredCount = $authoritativeSourceConfiguredCount
+            $item.AuthoritativeSourceResolvedCount = $authoritativeSourceResolvedCount
+        }
 
         # -- Step 3: review each bound PR -------------------------------------
         $summaries = New-Object System.Collections.Generic.List[string]
@@ -12274,7 +14917,13 @@ $lock = Enter-AgentLock -Path $lockPath -AgentName $AgentName
 try {
     # Fail closed on a missing MCP server rather than running a cycle in which
     # the model silently has no tools, produces no marker, and starves the PR.
-    $missingMcpServers = @(Get-AgentMissingMcpServers -AllowToolEntries @($ConfigAllowTools) -RepositoryPath $RepoPath)
+    # Asked about the tools the launch actually leaves usable: an offline replay
+    # denies the whole ceiling, so demanding a repository server for it would
+    # refuse a run that never needed one.
+    $launchAllow = Get-ReviewerLaunchAllowTools -Intended (Get-ReviewerEffectiveAllowTools -BaseAllow $ConfigAllowTools)
+    $launchDeny = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
+    $usableLaunchTools = Get-ReviewerUsableLaunchTools -Allow $launchAllow -Deny $launchDeny
+    $missingMcpServers = @(Get-AgentMissingMcpServers -AllowToolEntries $usableLaunchTools -RepositoryPath $RepoPath)
     if ($missingMcpServers.Count -gt 0) {
         throw ("This repository does not declare MCP server(s) required by the allow-list: $($missingMcpServers -join ', '). " +
             "Copilot would start normally but the model would have none of those tools - it could not read the pull request, " +
