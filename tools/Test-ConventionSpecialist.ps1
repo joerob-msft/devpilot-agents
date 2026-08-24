@@ -1263,6 +1263,144 @@ if ($golden.PSObject.Properties['authorizedPromptDeltas']) {
 }
 Assert-Specialist ($allowedPromptHashes -ccontains (Get-ReviewerConventionSpecialistSha256 -Text $generalistPrompt)) `
     "Disabled-path golden changed for the generalist prompt."
+
+# The generalist now receives the same kind of wrapper-built marker scaffold as
+# the specialist. Exercise the production renderer and production parser: this
+# is a formatting aid only, and changing or dropping a binding must still fail
+# at the existing strict parser/binding boundaries.
+& {
+    Invoke-Expression (Get-FunctionText -Text $wrapperText -Name 'Get-ReviewerRuntimeContext')
+    Invoke-Expression (Get-FunctionText -Text $wrapperText -Name 'Get-ReviewerMarkerSchema')
+    Invoke-Expression (Get-FunctionText -Text $wrapperText -Name 'Test-ReviewerMarkerBinding')
+
+    $script:ReviewerSeverities = @('critical', 'important', 'suggestion')
+    $script:ReviewerReplayActive = $false
+    $ResultMarkerPrefix = 'REVIEWER_RESULT_V1:'
+    $Organization = 'example-org'
+    $ExpectedProject = 'WrongAmbientProject'
+    $scaffoldProject = 'Example'
+    $RepositoryName = 'widgets'
+    $EffectiveMaxFindings = 12
+    $PostSeverities = @('critical', 'important')
+    $RepoConventionsText = ''
+    $repositoryId = '11111111-2222-3333-4444-555555555555'
+    $sourceCommit = ('a' * 40)
+    $issuedNonce = 'issued-generalist-nonce'
+
+    $context = Get-ReviewerRuntimeContext -Nonce $issuedNonce -PrId 42 `
+        -RepositoryId $repositoryId -Project $scaffoldProject -SourceCommit $sourceCommit `
+        -SourceBranch 'feature/scaffold' -AuthorAlias 'colleague' `
+        -ThreadDigestText '[]'
+    $runtimeMatch = [regex]::Match($context,
+        '(?s)Wrapper runtime data .*?```json\r?\n(\{.*?\})\r?\n```')
+    Assert-Specialist $runtimeMatch.Success `
+        'The rendered generalist runtime context must contain wrapper runtime data as JSON.'
+    if (-not $runtimeMatch.Success) { return }
+
+    $runtimeJson = $runtimeMatch.Groups[1].Value
+    $runtime = $runtimeJson | ConvertFrom-Json
+    $scaffold = $runtime.markerScaffold
+    $schema = Get-ReviewerMarkerSchema -ExpectedProject $scaffoldProject `
+        -ExpectedNonce $issuedNonce -MaxFindingItems $EffectiveMaxFindings
+    $scaffoldKeys = @($scaffold.PSObject.Properties | ForEach-Object { $_.Name })
+    Assert-Specialist (($scaffoldKeys -join '|') -ceq (@($schema.Keys) -join '|')) `
+        'The generalist marker scaffold must have exactly the schema top-level keys, in order.'
+    Assert-Specialist ([int]$scaffold.schemaVersion -eq 1 -and
+        [int]$scaffold.prId -eq 42 -and
+        [string]$scaffold.repositoryId -ceq $repositoryId -and
+        [string]$scaffold.project -ceq $scaffoldProject -and
+        [string]$scaffold.reviewedSourceCommit -ceq $sourceCommit -and
+        [string]$scaffold.nonce -ceq $issuedNonce) `
+        'The generalist scaffold must carry every wrapper-known scalar and the issued nonce.'
+    Assert-Specialist (@($scaffold.findings).Count -eq 0 -and
+        [string]$scaffold.recommendedVote -ceq '' -and
+        [string]$scaffold.summary -ceq '') `
+        'The generalist scaffold must contain an empty findings array and empty model-owned placeholders.'
+    Assert-Specialist ($runtimeJson -cmatch '"findings":\[\]' -and
+        $runtimeJson -cmatch ('"nonce":"' + [regex]::Escape($issuedNonce) + '"') -and
+        $runtimeJson -cnotmatch '"severity"|"comment":|"recommendedVote":"(?:approve|approveWithSuggestions|waitForAuthor|none)"') `
+        'Scaffold serialization must preserve the empty array and nonce without supplying judgement content.'
+
+    $renderedPrompt = $generalistPrompt + "`n---`n" + $context
+    Assert-Specialist ($renderedPrompt -cmatch [regex]::Escape($runtimeJson) -and
+        $renderedPrompt -cmatch 'Fill in \*\*only\*\* its' -and
+        $renderedPrompt -cmatch 'change nothing else' -and
+        $renderedPrompt -cmatch 'Emit the inner `markerScaffold` object itself' -and
+        $renderedPrompt -cmatch 'Every `findings` element has exactly these keys' -and
+        $renderedPrompt -cmatch '(?s)`severity`.*`filePath`.*`line`.*`comment`') `
+        'The rendered generalist prompt must restrict scaffold edits and define the exact finding item shape.'
+    Assert-Specialist ($context -cmatch 'project `Example`' -and
+        $context -cnotmatch 'WrongAmbientProject') `
+        'The generalist scaffold and rendered scope must use the explicit project, not ambient dynamic scope.'
+    Assert-Specialist ($renderedPrompt -cnotmatch '<runtime nonce>|Copy the Runtime context|Nonce you MUST copy exactly') `
+        'The rendered generalist prompt must not retain a manual template that asks the model to retype the nonce.'
+
+    $unfilledOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+        $ResultMarkerPrefix + ' ' + ($scaffold | ConvertTo-Json -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    Assert-Specialist ([string]$unfilledOutcome.Status -ceq 'schemaInvalid' -and
+        [string]$unfilledOutcome.Field -ceq 'recommendedVote' -and [bool]$unfilledOutcome.Retryable) `
+        'An unfilled scaffold must fail closed at the empty recommendedVote placeholder.'
+
+    $filled = Copy-SpecialistObject $scaffold
+    $filled.findings = @([pscustomobject][ordered]@{
+            severity = 'important'; filePath = '/src/Widget.cs'; line = 42
+            comment = 'This path can return stale state.'
+        })
+    $filled.recommendedVote = 'approve'
+    $filled.summary = 'One important finding.'
+    $validOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+        $ResultMarkerPrefix + ' ' + ($filled | ConvertTo-Json -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    Assert-Specialist ([string]$validOutcome.Status -ceq 'success' -and
+        (Test-ReviewerMarkerBinding -Marker $validOutcome.Value -PrId 42 `
+            -RepositoryId $repositoryId -SourceCommit $sourceCommit)) `
+        'A filled generalist scaffold with a real finding must pass the existing strict parser and binding check.'
+
+    $missingNonce = Copy-SpecialistObject $filled
+    $missingNonce.PSObject.Properties.Remove('nonce')
+    $missingNonceOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+        $ResultMarkerPrefix + ' ' + ($missingNonce | ConvertTo-Json -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    Assert-Specialist ([string]$missingNonceOutcome.Status -ceq 'schemaInvalid' -and
+        [string]$missingNonceOutcome.Field -ceq 'nonce' -and [bool]$missingNonceOutcome.Retryable) `
+        'A prior-shape generalist marker missing its nonce must remain schemaInvalid/nonce and retryable.'
+
+    $wrongNonce = Copy-SpecialistObject $filled
+    $wrongNonce.nonce = 'changed-generalist-nonce'
+    $wrongNonceOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+        $ResultMarkerPrefix + ' ' + ($wrongNonce | ConvertTo-Json -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    Assert-Specialist ([string]$wrongNonceOutcome.Status -ceq 'wrongBinding' -and
+        [string]$wrongNonceOutcome.Field -ceq 'nonce' -and -not [bool]$wrongNonceOutcome.Retryable) `
+        'Changing the scaffold nonce must remain a terminal wrong-binding rejection.'
+
+    $missingPr = Copy-SpecialistObject $filled
+    $missingPr.PSObject.Properties.Remove('prId')
+    $missingPrOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+        $ResultMarkerPrefix + ' ' + ($missingPr | ConvertTo-Json -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    Assert-Specialist ([string]$missingPrOutcome.Status -ceq 'schemaInvalid' -and
+        [string]$missingPrOutcome.Field -ceq 'prId') `
+        'Dropping a wrapper-known scaffold binding must remain schema-invalid.'
+
+    foreach ($sabotage in @(
+            @{ Name = 'prId'; Value = 43 },
+            @{ Name = 'repositoryId'; Value = '99999999-8888-7777-6666-555555555555' },
+            @{ Name = 'reviewedSourceCommit'; Value = ('b' * 40) }
+        )) {
+        $changed = Copy-SpecialistObject $filled
+        $changed.($sabotage.Name) = $sabotage.Value
+        $changedOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+            $ResultMarkerPrefix + ' ' + ($changed | ConvertTo-Json -Depth 8 -Compress)) `
+            -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+        Assert-Specialist ([string]$changedOutcome.Status -ceq 'success' -and
+            -not (Test-ReviewerMarkerBinding -Marker $changedOutcome.Value -PrId 42 `
+                -RepositoryId $repositoryId -SourceCommit $sourceCommit)) `
+            "Changing scaffold binding '$($sabotage.Name)' must be rejected by the existing exact binding check."
+    }
+}
+
 # A drift pin that accepts an older authorized hash is not a pin. Assert on the
 # ACCEPTANCE RULE, not on the source file: checking that the current function
 # text differs from a superseded hash would pass just as happily with the pin
@@ -1954,7 +2092,7 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $script:ReviewerOfflineModelAdapterActive = $false
 
     function New-AgentNonce { $script:knownNonce }
-    function Get-ReviewerRuntimeContext { param($Nonce, $PrId, $RepositoryId, $SourceCommit, $SourceBranch, $AuthorAlias, $ThreadDigestText, $AuthoritativeSourcesText, $PinnedSourceText) '' }
+    function Get-ReviewerRuntimeContext { param($Nonce, $PrId, $RepositoryId, $Project, $SourceCommit, $SourceBranch, $AuthorAlias, $ThreadDigestText, $AuthoritativeSourcesText, $PinnedSourceText) '' }
     function Write-ReviewerCycleMetadata { param($Fields) }
     # The real launch-intent writer publishes to the cycle log, which this
     # harness does not stand up. Counted rather than ignored so the simulated

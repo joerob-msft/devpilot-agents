@@ -177,19 +177,26 @@ explicitly enabled voting. Never assume a vote happened.
 
 ## Step 6 — Emit the result marker
 
-The **final non-blank output line** must be exactly one line of the form:
-
-```text
-REVIEWER_RESULT_V1: {"schemaVersion":1,"prId":<int>,"repositoryId":"<guid>","project":"<string>","reviewedSourceCommit":"<40-hex>","findings":[{"severity":"<critical|important|suggestion>","filePath":"<path>","line":<int>,"comment":"<text>"}],"recommendedVote":"<approve|approveWithSuggestions|waitForAuthor|none>","summary":"<text>","nonce":"<runtime nonce>"}
-```
+The top-level result object is already built as `markerScaffold` in the wrapper
+runtime data. Use that object exactly as supplied. Fill in **only** its
+`findings`, `recommendedVote`, and `summary` values; change nothing else,
+preserve every key and its order, and emit the resulting scaffold as the single
+result marker object. Emit the inner `markerScaffold` object itself, not the
+enclosing runtime-data object. The empty `recommendedVote` placeholder is
+intentionally not a valid final vote: you must replace it with your Step 5
+recommendation.
 
 Requirements:
 
-- Copy the Runtime context **nonce** exactly and case-sensitively into `nonce`.
-- Copy the wrapper-bound `project`, `repositoryId` GUID, `prId`, and
-  `reviewedSourceCommit` (the injected 40-hex source commit) exactly.
+- Do not reconstruct the top-level object or retype any wrapper-owned scalar.
+  The scaffold already contains the exact schema version, PR, repository,
+  project, source commit, and nonce bindings.
 - `findings` is a JSON array. Emit `[]` when you found nothing — never omit the
   key, and never emit a bare object instead of an array.
+- Every `findings` element has exactly these keys, all present and in this order:
+  `severity` (`critical`, `important`, or `suggestion`), `filePath` (repo-root
+  path or empty string), `line` (integer), and `comment` (one plain-text line).
+  Do not add, rename, or omit any finding key.
 - `summary` is one plain-text line describing what the PR does and your overall
   assessment. It is posted verbatim when summary posting is enabled.
 - Emit exactly **one** marker-prefixed line, and make it the final non-blank
@@ -197,11 +204,9 @@ Requirements:
 - The marker must be **one line**: the literal prefix, one space, then the whole
   JSON object compacted onto that line. Do not pretty-print it and do not wrap
   it in a code fence.
-- **Re-read the JSON before you emit it.** It is several kilobytes of
-  hand-written JSON on a single line, and one stray bracket or missing comma
-  discards the entire review — the wrapper cannot repair it and will not guess.
-  Check that every `{` and `[` is closed, that `findings` closes with `}]`
-  before `"recommendedVote"`, and that the object ends with exactly one `}`.
+- **Re-read the JSON before you emit it.** The wrapper cannot repair it and will
+  not guess. Confirm that you changed only the three model-owned values and
+  retained every scaffold key and wrapper-owned value exactly.
 
 Before the marker, print a short plain-text summary: the bound PR and source
 commit, how many findings you are reporting at each severity, what you
