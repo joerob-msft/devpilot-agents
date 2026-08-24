@@ -87,6 +87,9 @@ internal abstract class Node
     /// <summary>The integer this node carries, or null when it is not a number.</summary>
     internal virtual long? AsInteger => null;
 
+    /// <summary>The boolean this node carries, or null when it is not a boolean.</summary>
+    internal virtual bool? AsFlag => null;
+
     private sealed class TextNode(string value) : Node
     {
         internal override string? AsText => value;
@@ -105,6 +108,8 @@ internal abstract class Node
 
     private sealed class FlagNode(bool value) : Node
     {
+        internal override bool? AsFlag => value;
+
         internal override void Write(StringBuilder builder, bool canonical, int indent) =>
             builder.Append(value ? "true" : "false");
     }
@@ -163,6 +168,9 @@ internal sealed class MapNode : Node
 
     /// <summary>The integer stored under a name, or null when it is absent or not a number.</summary>
     internal long? GetInteger(string name) => Get(name)?.AsInteger;
+
+    /// <summary>The boolean stored under a name, or null when it is absent or not a boolean.</summary>
+    internal bool? GetFlag(string name) => Get(name)?.AsFlag;
 
     internal override void Write(StringBuilder builder, bool canonical, int indent)
     {

@@ -48,25 +48,63 @@ internal static class StrictJson
     /// </summary>
     internal static JsonElement ReadObjectFile(string path, string label, long maximumBytes = 32L * 1024 * 1024)
     {
+        // Every check this used to make about the file before opening it - that
+        // it exists, that it is not empty, that it is not larger than the
+        // ceiling - is made by the read itself now. Asking the filesystem for
+        // metadata and then opening the file is two questions about a thing that
+        // can change between them, and the metadata question could throw from
+        // underneath in exactly the cases the read is guarded against.
+        return ReadObjectBytes(ReadFileBytes(path, label, maximumBytes), path, label);
+    }
+
+    /// <summary>
+    /// The bytes of a contract file, read once, with every way of failing to
+    /// acquire them turned into a refusal that names the file.
+    /// </summary>
+    /// <remarks>
+    /// A contract file that cannot be read is a fact about the artifact, and the
+    /// caller's next sentence is always which artifact could not be read. Letting
+    /// the filesystem's own exception out instead loses that sentence twice over:
+    /// it arrives without the label, and it arrives as a runtime fault rather than
+    /// as a refusal callers already know how to turn into an exit code. Callers
+    /// that must both digest a file and obey it take the bytes from here once and
+    /// hash the same bytes they parsed.
+    ///
+    /// The ceiling is applied to the length the opened file reports, before
+    /// anything is allocated for it. A read that allocated first and measured
+    /// afterwards would turn an oversized artifact into memory exhaustion, which
+    /// is the one way of failing that cannot be reported as a refusal.
+    /// </remarks>
+    internal static byte[] ReadFileBytes(string path, string label, long maximumBytes = 32L * 1024 * 1024)
+    {
         if (string.IsNullOrWhiteSpace(path))
         {
             throw new ContractException($"The {label} path is empty.");
         }
-        var info = new FileInfo(path);
-        if (!info.Exists)
+        try
         {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var length = stream.Length;
+            if (length > maximumBytes)
+            {
+                throw new ContractException($"The {label} file '{path}' is {length} bytes, above the {maximumBytes} byte limit.");
+            }
+            var bytes = new byte[length];
+            stream.ReadExactly(bytes);
+            return bytes;
+        }
+        catch (Exception error) when (error is FileNotFoundException or DirectoryNotFoundException)
+        {
+            // One sentence for both, because a file under a directory that is not
+            // there and a file that is not there are the same fact to the caller,
+            // and this is the sentence every reader of these artifacts already
+            // knows.
             throw new ContractException($"The {label} file '{path}' does not exist.");
         }
-        if (info.Length == 0)
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException or System.Security.SecurityException)
         {
-            throw new ContractException($"The {label} file '{path}' is empty; a partial write must not read as an empty result.");
+            throw new ContractException($"The {label} file '{path}' could not be read: {error.Message}");
         }
-        if (info.Length > maximumBytes)
-        {
-            throw new ContractException($"The {label} file '{path}' is {info.Length} bytes, above the {maximumBytes} byte limit.");
-        }
-
-        return ReadObjectBytes(File.ReadAllBytes(path), path, label);
     }
 
     /// <summary>

@@ -109,7 +109,7 @@ internal sealed class PreparationMachine(
         // only written when a run ends well is an audit that is missing exactly
         // when it is wanted, and a resumed run would read a record describing a
         // state the coordinator has already left.
-        WriteAuditSafely(AuditReasonRunning, "the run is in progress");
+        WriteOpeningAudit();
         var targetRank = PreparationStateNames.RankOf(target);
         var haltRank = haltAfter is { } halt ? PreparationStateNames.RankOf(halt) : -1;
         try
@@ -1077,7 +1077,8 @@ internal sealed class PreparationMachine(
             "launchTokenPresent",
             "plannedRunCount",
             "slotAttemptCount",
-            "modelInvocationCount");
+            "slotAttemptRecordCount",
+            "preLaunchRunRootCount");
 
         const string label = "'runSetStatus' child result";
         // The declaration this step reports on has to be the one the previous
@@ -1114,10 +1115,19 @@ internal sealed class PreparationMachine(
         // Observed the same way, rather than asserted. A hard-coded zero here
         // would be a policy statement dressed as an audit: it would read exactly
         // the same on a run that had invoked a model as on one that had not.
-        var models = StrictJson.RequireInt(outcome.Result, "modelInvocationCount", label, 0, int.MaxValue);
-        if (models != 0)
+        var attemptRecords = StrictJson.RequireInt(outcome.Result, "slotAttemptRecordCount", label, 0, int.MaxValue);
+        if (attemptRecords != 0)
         {
-            throw new ContractException($"The preparation observed {models.ToString(CultureInfo.InvariantCulture)} model invocation(s); this coordinator invokes no model.");
+            throw new ContractException($"The preparation observed {attemptRecords.ToString(CultureInfo.InvariantCulture)} reviewer attempt record(s); this coordinator prepares a run set and launches nothing.");
+        }
+        // A model start needs a run directory to publish its evidence into, and
+        // this counts those directories. Zero of them is a measurement that this
+        // preparation started no model - not the same statement as "this code does
+        // not start models", which no audit could check.
+        var runRoots = StrictJson.RequireInt(outcome.Result, "preLaunchRunRootCount", label, 0, int.MaxValue);
+        if (runRoots != 0)
+        {
+            throw new ContractException($"The preparation observed {runRoots.ToString(CultureInfo.InvariantCulture)} reviewer run director(ies) before any launch; a prepared run set has none.");
         }
 
         var evidence = new MapNode()
@@ -1125,7 +1135,9 @@ internal sealed class PreparationMachine(
             .Set("setId", reportedSetId)
             .Set("plannedRunCount", planned)
             .Set("slotAttemptCount", attempts)
-            .Set("modelInvocationCount", models)
+            .Set("slotAttemptRecordCount", attemptRecords)
+            .Set("preLaunchRunRootCount", runRoots)
+            .Set("realModelStartCount", 0)
             .Set("childResultSha256", outcome.ResultSha256);
         return (evidence, $"plannedRunCount={planned.ToString(CultureInfo.InvariantCulture)} slotAttempts=0");
     }
@@ -1553,7 +1565,19 @@ internal sealed class PreparationMachine(
             "signatureVerified",
             "inventoryVerified",
             "slotAttemptCount",
-            "modelInvocationCount");
+            "slotAttemptRecordCount",
+            "realModelStartCount",
+            "realModelStartsGeneralist",
+            "realModelStartsSpecialist",
+            "realModelStartsVerifier",
+            "realModelStartCensusComplete",
+            "realModelStartCensusExact",
+            "realModelStartUnmeasuredAllowance",
+            "realVerifierAssignmentCount",
+            "realVerifierAssignmentsByModel",
+            "realVerifierAssignmentCensusComplete",
+            "realVerifierAssignmentUnmeasuredAllowance",
+            "verifierProcessStartCount");
         var label = $"'{stage.VerifyStep}' child result";
 
         // The bytes the verifier read must be the bytes this run observed. The
@@ -1592,9 +1616,105 @@ internal sealed class PreparationMachine(
                 $"exactly {stage.Ordinal.ToString(CultureInfo.InvariantCulture)} launch(es) can have been made by this point.");
         }
         // Observed, not asserted. This coordinator invokes no model, but the run
-        // it supervised may have invoked several, and reporting the census it was
+        // it supervised may have started several, and reporting the census it was
         // given is the only honest thing to do with it.
-        var models = StrictJson.RequireInt(outcome.Result, "modelInvocationCount", label, 0, int.MaxValue);
+        //
+        // Two different questions, kept apart because conflating them is the
+        // defect this replaced. The attempt record count is how many REVIEWER
+        // PROCESSES the run set launched - one per slot - and is a diagnostic. The
+        // real model start count is how many MODEL SUBPROCESSES those reviewers
+        // actually started, across every role and every attempt, and is the figure
+        // a budget is spent in. A two-slot run that starts four models reports two
+        // and four, and it is the four that a ceiling has to be measured against.
+        var attemptRecords = StrictJson.RequireInt(outcome.Result, "slotAttemptRecordCount", label, 0, int.MaxValue);
+        var realStarts = StrictJson.RequireInt(outcome.Result, "realModelStartCount", label, 0, int.MaxValue);
+        var realGeneralist = StrictJson.RequireInt(outcome.Result, "realModelStartsGeneralist", label, 0, int.MaxValue);
+        var realSpecialist = StrictJson.RequireInt(outcome.Result, "realModelStartsSpecialist", label, 0, int.MaxValue);
+        var realVerifier = StrictJson.RequireInt(outcome.Result, "realModelStartsVerifier", label, 0, int.MaxValue);
+        // The breakdown has to add up to the total it is a breakdown of. A
+        // disagreement here is a census this build cannot publish, not one it
+        // picks the more convenient half of.
+        if (realGeneralist + realSpecialist + realVerifier != realStarts)
+        {
+            throw new ContractException(
+                $"The slot reports {realStarts.ToString(CultureInfo.InvariantCulture)} real model start(s) and a role breakdown summing to " +
+                $"{(realGeneralist + realSpecialist + realVerifier).ToString(CultureInfo.InvariantCulture)}. A census whose parts contradict its total is refused.");
+        }
+        // Completeness is about evidence, not about outcome. False means a role
+        // this run was authorized to use published nothing to count, so the spend
+        // is unknown rather than zero, and everything downstream must refuse to
+        // treat it as measured.
+        var censusComplete = StrictJson.RequireBool(outcome.Result, "realModelStartCensusComplete", label);
+        // Exactness is about interruption. A run that ended complete published
+        // every attempt record it was going to; a run that failed or timed out may
+        // have spent more than it recorded, so its census is a floor.
+        var censusExact = StrictJson.RequireBool(outcome.Result, "realModelStartCensusExact", label);
+        // And the size of that gap, computed on the reviewed side against the
+        // run's own sealed plan. It is deliberately not a constant here: an
+        // interrupted cross-verification phase hides every launch it made rather
+        // than one, because those launches are sealed together at the end of the
+        // phase, and a flat allowance would under-count them without bound.
+        var unmeasuredAllowance = StrictJson.RequireInt(
+            outcome.Result, "realModelStartUnmeasuredAllowance", label, 0, 65536);
+        if (censusExact && unmeasuredAllowance != 0)
+        {
+            throw new ContractException(
+                $"The slot reports an exact census and an unmeasured allowance of {unmeasuredAllowance.ToString(CultureInfo.InvariantCulture)}. " +
+                "A run that published everything it was going to publish has nothing left unaccounted, and the two statements contradict each other.");
+        }
+
+        // The assignment census, read on the same terms and kept in its own unit.
+        // A cross-verifier ASSIGNMENT is one candidate paired with one required
+        // reciprocal model; a verifier PROCESS may serve a whole cluster of them.
+        // The first is what a cohort's verifier ceiling is spent in, the second is
+        // a diagnostic, and this build refuses to let either stand in for the
+        // other.
+        var assignments = StrictJson.RequireInt(outcome.Result, "realVerifierAssignmentCount", label, 0, int.MaxValue);
+        var assignmentsByModel = ReadVerifierAssignmentsByModel(outcome.Result, label, assignments);
+        var assignmentCensusComplete = StrictJson.RequireBool(outcome.Result, "realVerifierAssignmentCensusComplete", label);
+        var assignmentAllowance = StrictJson.RequireInt(
+            outcome.Result, "realVerifierAssignmentUnmeasuredAllowance", label, 0, 65536);
+        var verifierProcessStarts = StrictJson.RequireInt(outcome.Result, "verifierProcessStartCount", label, 0, int.MaxValue);
+        // The one contradiction that is always a contradiction. Grouping and
+        // retries make the two censuses differ in either direction, so equality is
+        // never required; but a run cannot have started a verifier process without
+        // an assignment for it to serve, and a build that reported so would be
+        // reporting a phase whose evidence disagrees with itself.
+        if (assignments == 0 && verifierProcessStarts > 0)
+        {
+            throw new ContractException(
+                $"The slot reports {verifierProcessStarts.ToString(CultureInfo.InvariantCulture)} verifier process start(s) and no " +
+                "verifier assignment at all. A launch serves assignments, so the two halves of that census contradict each other.");
+        }
+        // The same contradiction against the other witness, and the one that
+        // matters most. The assignment census has exactly one source - the
+        // phase's sealed preview - and the reviewed side's fault path seals that
+        // preview with an EMPTY assignment list and returns normally. The model
+        // start census survives that, because every verifier launch publishes its
+        // own record as it returns. So a slot that started verifier models and
+        // reports no assignment is a slot whose assignment evidence was lost,
+        // and it is refused HERE, per slot, where both figures are for the same
+        // run. Checked only on the entry's totals it would be vacuous: one slot
+        // reporting forty would carry another reporting nothing.
+        if (assignments == 0 && realVerifier > 0)
+        {
+            throw new ContractException(
+                $"The slot reports {realVerifier.ToString(CultureInfo.InvariantCulture)} real model start(s) in the verifier role and no " +
+                "verifier assignment at all. Those two censuses are taken over the same phase of the same run, so the assignments it " +
+                "stood on were lost rather than never made, and this build refuses to publish the loss as a zero.");
+        }
+        // No ordering is required between the two censuses. Grouping pushes
+        // launches below assignments within one pass, and a re-verification of
+        // the same candidates pushes them above it across passes: identities are
+        // content digests and dedupe, launch nonces are minted fresh and do not.
+        // The one relationship that always holds is checked per sealed preview,
+        // on the reviewed side, where both figures belong to a single pass.
+        if (assignmentCensusComplete && censusExact && assignmentAllowance != 0)
+        {
+            throw new ContractException(
+                $"The slot reports a complete assignment census on a run that ended cleanly and an unmeasured allowance of " +
+                $"{assignmentAllowance.ToString(CultureInfo.InvariantCulture)}. Those two statements contradict each other.");
+        }
 
         var status = StrictJson.RequireString(outcome.Result, "terminalStatus", label);
         var timedOut = StrictJson.RequireBool(outcome.Result, "terminalTimedOut", label);
@@ -1625,9 +1745,67 @@ internal sealed class PreparationMachine(
             .Set("signatureVerified", true)
             .Set("inventoryVerified", true)
             .Set("slotAttemptCount", attempts)
-            .Set("modelInvocationCount", models)
+            .Set("slotAttemptRecordCount", attemptRecords)
+            .Set("realModelStartCount", realStarts)
+            .Set("realModelStartsGeneralist", realGeneralist)
+            .Set("realModelStartsSpecialist", realSpecialist)
+            .Set("realModelStartsVerifier", realVerifier)
+            .Set("realModelStartCensusComplete", censusComplete)
+            .Set("realModelStartCensusExact", censusExact)
+            .Set("realModelStartUnmeasuredAllowance", unmeasuredAllowance)
+            .Set("realVerifierAssignmentCount", assignments)
+            .Set("realVerifierAssignmentsByModel", assignmentsByModel)
+            .Set("realVerifierAssignmentCensusComplete", assignmentCensusComplete)
+            .Set("realVerifierAssignmentUnmeasuredAllowance", assignmentAllowance)
+            .Set("verifierProcessStartCount", verifierProcessStarts)
             .Set("childResultSha256", outcome.ResultSha256);
-        return (state, evidence, $"terminalStatus={status} attempts={attempts.ToString(CultureInfo.InvariantCulture)} modelInvocations={models.ToString(CultureInfo.InvariantCulture)}");
+        return (state, evidence, $"terminalStatus={status} attempts={attempts.ToString(CultureInfo.InvariantCulture)} realModelStarts={realStarts.ToString(CultureInfo.InvariantCulture)} realVerifierAssignments={assignments.ToString(CultureInfo.InvariantCulture)}");
+    }
+
+    /// <summary>
+    /// Reads a slot's per-model assignment breakdown, refusing one that does not
+    /// account for the total it is published beside.
+    /// </summary>
+    private static ListNode ReadVerifierAssignmentsByModel(JsonElement result, string label, int total)
+    {
+        if (!result.TryGetProperty("realVerifierAssignmentsByModel", out var byModel) || byModel.ValueKind != JsonValueKind.Array)
+        {
+            throw new ContractException($"The {label} carries no 'realVerifierAssignmentsByModel' array.");
+        }
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var carried = new ListNode();
+        var sum = 0;
+        var index = 0;
+        foreach (var entry in byModel.EnumerateArray())
+        {
+            var entryLabel = $"{label} verifier assignment breakdown {index.ToString(CultureInfo.InvariantCulture)}";
+            if (entry.ValueKind != JsonValueKind.Object)
+            {
+                throw new ContractException($"The {entryLabel} is not an object.");
+            }
+            var model = StrictJson.RequireString(entry, "verifierModel", entryLabel);
+            if (model.Length is 0 or > 128)
+            {
+                throw new ContractException($"The {entryLabel} names a verifier model of an unusable length.");
+            }
+            if (!seen.Add(model))
+            {
+                throw new ContractException($"The {label} breaks its verifier assignments down by a model it names twice, so the breakdown is ambiguous.");
+            }
+            var count = StrictJson.RequireInt(entry, "assignmentCount", entryLabel, 0, int.MaxValue);
+            sum += count;
+            carried.Add(new MapNode().Set("verifierModel", model).Set("assignmentCount", count));
+            index++;
+        }
+        // The breakdown has to account for the total, or one of the two is being
+        // read as the census and the other is decoration.
+        if (sum != total)
+        {
+            throw new ContractException(
+                $"The {label} reports {total.ToString(CultureInfo.InvariantCulture)} verifier assignment(s) and a per-model " +
+                $"breakdown summing to {sum.ToString(CultureInfo.InvariantCulture)}, so its census does not account for itself.");
+        }
+        return carried;
     }
 
     /// <summary>
@@ -3230,6 +3408,116 @@ internal sealed class PreparationMachine(
     private const string AuditReasonUnresolvedLaunch = "unresolvedLaunch";
     private const string AuditReasonUnexpectedFault = "unexpectedFault";
 
+    /// <summary>
+    /// Replaces whatever audit stands over this root with one that says the run
+    /// is in progress, and refuses to start if it cannot.
+    /// </summary>
+    /// <remarks>
+    /// Every other audit write may be absorbed, because by then the signed state
+    /// record is authoritative and losing a derived report is not worth
+    /// destroying work over. This one is different in both directions.
+    ///
+    /// Nothing has been attempted yet, so faulting here destroys nothing. And a
+    /// resumed run finds a previous invocation's audit already standing here,
+    /// which is an ENDING and says so. Absorb a failure to overwrite it and this
+    /// invocation walks on beneath a document that claims a finished run and
+    /// carries that run's smaller spend; kill this process at any point after,
+    /// or let its later audit writes fail the same way, and a reader is handed a
+    /// stale ending it cannot tell from a fresh one.
+    ///
+    /// So the stale copy is removed FIRST and the opening audit written second.
+    /// A fault between the two leaves no audit at all, which every reader of
+    /// this root already refuses; a fault is never allowed to leave the previous
+    /// run's ending in place while this one runs.
+    ///
+    /// What is refused is precisely the hazard and no more. The danger is a
+    /// readable FILE that an earlier invocation left behind, because that is the
+    /// only thing a reader can mistake for this run's report. A path that holds
+    /// nothing, or holds a directory, carries no earlier ending and can be read
+    /// as none, so a write that fails there is absorbed exactly as every other
+    /// audit write is - the run has done what the record says it did, and the
+    /// next run over the root rebuilds the report from that record.
+    ///
+    /// The distinction is drawn with <see cref="File.GetAttributes(string)"/>
+    /// and not <c>File.Exists</c>. <c>File.Exists</c> answers false for a path
+    /// it was not allowed to look at, which is exactly the shape of the file
+    /// this method must never walk underneath: a stale ending the process cannot
+    /// read is still a stale ending a reader with other rights can. An answer
+    /// that cannot be trusted is treated as the hazard.
+    /// </remarks>
+    private void WriteOpeningAudit()
+    {
+        if (ProbeAuditPathOrRefuse("before this run starts") is AuditPathKind.File)
+        {
+            try
+            {
+                File.Delete(_request.AuditPath);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                throw new ContractException(
+                    $"The audit at '{_request.AuditPath}' could not be replaced before this run starts: {error.Message}. " +
+                    "An audit left over from an earlier run would describe this root as finished while this run walks it, " +
+                    "so the run is refused rather than started underneath it.");
+            }
+        }
+
+        try
+        {
+            WriteAudit(AuditReasonRunning, "the run is in progress");
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            if (ProbeAuditPathOrRefuse("after the opening audit could not be written") is AuditPathKind.File)
+            {
+                throw new ContractException(
+                    $"The opening audit at '{_request.AuditPath}' could not be written and a file stands there anyway: {error.Message}. " +
+                    "A reader would take that file for this run's report, so the run is refused rather than started underneath it.");
+            }
+            _log.WriteLine(
+                $"audit not written ({AuditReasonRunning}): {error.Message}. " +
+                "No audit stands over this root, which every reader of it refuses, " +
+                "and the next run over this root rewrites the audit from the record.");
+        }
+    }
+
+    /// <summary>What, if anything, occupies the audit path.</summary>
+    private enum AuditPathKind
+    {
+        /// <summary>Nothing is there, so no earlier ending can be read from it.</summary>
+        Absent,
+
+        /// <summary>A directory is there. No reader can parse it as an audit.</summary>
+        Directory,
+
+        /// <summary>A file is there, and a reader would take it for this run's report.</summary>
+        File,
+    }
+
+    /// <summary>
+    /// Answers what occupies the audit path, refusing the run rather than
+    /// guessing when it cannot tell.
+    /// </summary>
+    private AuditPathKind ProbeAuditPathOrRefuse(string moment)
+    {
+        try
+        {
+            FileAttributes attributes = File.GetAttributes(_request.AuditPath);
+            return attributes.HasFlag(FileAttributes.Directory) ? AuditPathKind.Directory : AuditPathKind.File;
+        }
+        catch (Exception error) when (error is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return AuditPathKind.Absent;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            throw new ContractException(
+                $"The audit path '{_request.AuditPath}' could not be examined {moment}: {error.Message}. " +
+                "An ending this process cannot look at is still an ending a reader can, " +
+                "so the run is refused rather than started underneath a file it cannot rule out.");
+        }
+    }
+
     /// <summary>Writes the audit, and refuses to let a failure to write it end the run.</summary>
     /// <remarks>
     /// The asymmetry here is deliberate and is the whole reason this wrapper
@@ -3301,6 +3589,34 @@ internal sealed class PreparationMachine(
     /// cannot lag the state by more than the moment between the two writes - and
     /// it lags in the recoverable direction, never the other way.
     /// </remarks>
+    /// <summary>
+    /// Whether the signed launch ledger holds an intent for a step that a child
+    /// process may have been started under.
+    /// </summary>
+    /// <remarks>
+    /// 'notStarted' is the one phase that proves no process exists: the ledger
+    /// records it after a start that failed. Every other phase - including
+    /// 'intended', which is the unknown case, and a record too damaged to verify,
+    /// which the ledger reports as 'intended' - leaves open that a reviewer ran.
+    /// Read that way on purpose: this feeds a budget, and the only safe direction
+    /// for a budget is to say a launch happened.
+    /// </remarks>
+    private bool LedgerSawLaunch(string step)
+    {
+        foreach (var standing in _ledger.ReadAll())
+        {
+            if (!string.Equals(standing.Step, step, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (!string.Equals(standing.Phase, LaunchLedger.PhaseNotStarted, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void WriteAudit(string terminalReason, string terminalDetail)
     {
         var stages = new MapNode();
@@ -3330,7 +3646,7 @@ internal sealed class PreparationMachine(
             }
         }
         var audit = new MapNode()
-            .Set("contractVersion", "devpilot.shadow-run-coordinator.audit.v1")
+            .Set("contractVersion", "devpilot.shadow-run-coordinator.audit.v2")
             .Set("kind", "shadow-run-coordinator-audit")
             .Set("correlationId", _request.CorrelationId)
             .Set("requestSha256", _request.RequestSha256)
@@ -3346,7 +3662,7 @@ internal sealed class PreparationMachine(
         if (observed)
         {
             audit
-                .Set("modelInvocationCount", readiness!.Get("modelInvocationCount") ?? Node.Null())
+                .Set("preparationAttemptRecordCount", readiness!.Get("slotAttemptRecordCount") ?? Node.Null())
                 .Set("slotLaunchCount", readiness.Get("slotAttemptCount") ?? Node.Null());
         }
         // The supervised slice reports separately, and only for the slots that
@@ -3355,14 +3671,129 @@ internal sealed class PreparationMachine(
         // like a slot that ran and did nothing.
         var slotRecords = new ListNode();
         var supervisedCount = 0;
+        var realStartTotal = 0;
+        var realStartGeneralist = 0;
+        var realStartSpecialist = 0;
+        var realStartVerifier = 0;
+        var censusComplete = true;
+        var unmeasuredAllowance = 0;
+        var launchedSlots = 0;
+        var assignmentTotal = 0;
+        var assignmentCensusComplete = true;
+        var assignmentAllowance = 0;
+        var verifierProcessTotal = 0;
+        var assignmentsByModel = new SortedDictionary<string, int>(StringComparer.Ordinal);
         foreach (var stage in Stages)
         {
+            // A slot that was launched but never reached a durable ending
+            // contributes no census, and the difference between the two counts is
+            // what tells a reader the audit's total is short rather than small.
+            //
+            // Asked of BOTH the committed state and the signed launch ledger. The
+            // supervisor creates the process before it returns, and the 'running'
+            // rank is committed on the line after, so a coordinator killed in that
+            // instant leaves a child that really started and a state that never
+            // recorded it. Reading only the state there would publish a spend of
+            // zero for a reviewer that may have started every model its plan
+            // allowed; the ledger commits its intent one step EARLIER than the
+            // process exists, which is exactly the witness that window needs.
+            if (_state.EvidenceFor(stage.Running) is not null || LedgerSawLaunch(stage.RunStep))
+            {
+                launchedSlots++;
+            }
             var terminal = _state.EvidenceAtRank(PreparationStateNames.RankOf(stage.TerminalVerified));
             if (terminal is null)
             {
                 continue;
             }
             supervisedCount++;
+            var slotStarts = terminal.Get("realModelStartCount");
+            if (slotStarts is null)
+            {
+                // Every terminal this build commits carries a census. One that does
+                // not is evidence written by an older build, and an audit that
+                // treated its silence as a zero would publish a spend of nothing
+                // for a run that may have started forty models.
+                censusComplete = false;
+            }
+            else
+            {
+                realStartTotal += (int)(terminal.GetInteger("realModelStartCount") ?? 0);
+                realStartGeneralist += (int)(terminal.GetInteger("realModelStartsGeneralist") ?? 0);
+                realStartSpecialist += (int)(terminal.GetInteger("realModelStartsSpecialist") ?? 0);
+                realStartVerifier += (int)(terminal.GetInteger("realModelStartsVerifier") ?? 0);
+                if (terminal.GetFlag("realModelStartCensusComplete") != true)
+                {
+                    censusComplete = false;
+                }
+                // A run interrupted mid-attempt may have started models whose
+                // records it never wrote, and the reviewed side has already
+                // computed how many against that run's own sealed plan. Carried
+                // as an explicit allowance so a ceiling is checked against an
+                // upper bound rather than against a floor. An audit whose slot
+                // does not state it cannot be spent.
+                var slotAllowance = terminal.GetInteger("realModelStartUnmeasuredAllowance");
+                if (slotAllowance is null)
+                {
+                    censusComplete = false;
+                }
+                else
+                {
+                    unmeasuredAllowance += (int)slotAllowance;
+                }
+            }
+            // The assignment census, summed in its own unit. A slot whose terminal
+            // does not carry one was written by an older build, and an audit that
+            // read that silence as zero would publish a verifier spend of nothing
+            // for a run that stood on forty assignments - which is precisely the
+            // under-count this replaced.
+            var slotAssignments = terminal.GetInteger("realVerifierAssignmentCount");
+            if (slotAssignments is null)
+            {
+                assignmentCensusComplete = false;
+            }
+            else
+            {
+                assignmentTotal += (int)slotAssignments;
+                verifierProcessTotal += (int)(terminal.GetInteger("verifierProcessStartCount") ?? 0);
+                if (terminal.GetFlag("realVerifierAssignmentCensusComplete") != true)
+                {
+                    assignmentCensusComplete = false;
+                }
+                var slotAssignmentAllowance = terminal.GetInteger("realVerifierAssignmentUnmeasuredAllowance");
+                if (slotAssignmentAllowance is null)
+                {
+                    assignmentCensusComplete = false;
+                }
+                else
+                {
+                    assignmentAllowance += (int)slotAssignmentAllowance;
+                }
+                if (terminal.Get("realVerifierAssignmentsByModel") is ListNode slotByModel)
+                {
+                    foreach (var item in slotByModel.Items)
+                    {
+                        if (item is not MapNode row)
+                        {
+                            continue;
+                        }
+                        var model = row.GetText("verifierModel");
+                        var count = row.GetInteger("assignmentCount");
+                        if (model is not { Length: > 0 } || count is null)
+                        {
+                            assignmentCensusComplete = false;
+                            continue;
+                        }
+                        assignmentsByModel[model] = assignmentsByModel.TryGetValue(model, out var running)
+                            ? running + (int)count
+                            : (int)count;
+                    }
+                }
+                else
+                {
+                    assignmentCensusComplete = false;
+                }
+            }
             // Every one of these is a passthrough of what the reviewed verifier
             // read out of the owner's immutable artifact. This coordinator adds
             // no interpretation, and the audit must not read as though it had.
@@ -3376,9 +3807,58 @@ internal sealed class PreparationMachine(
                 .Set("slotTerminalTimedOut", terminal.Get("terminalTimedOut") ?? Node.Null())
                 .Set("slotTerminalSha256", terminal.Get("terminalSha256") ?? Node.Null())
                 .Set("slotAttemptCount", terminal.Get("slotAttemptCount") ?? Node.Null())
-                .Set("slotModelInvocationCount", terminal.Get("modelInvocationCount") ?? Node.Null())
+                .Set("slotAttemptRecordCount", terminal.Get("slotAttemptRecordCount") ?? Node.Null())
+                .Set("slotRealModelStartCount", terminal.Get("realModelStartCount") ?? Node.Null())
+                .Set("slotRealModelStartsGeneralist", terminal.Get("realModelStartsGeneralist") ?? Node.Null())
+                .Set("slotRealModelStartsSpecialist", terminal.Get("realModelStartsSpecialist") ?? Node.Null())
+                .Set("slotRealModelStartsVerifier", terminal.Get("realModelStartsVerifier") ?? Node.Null())
+                .Set("slotRealModelStartCensusComplete", terminal.Get("realModelStartCensusComplete") ?? Node.Null())
+                .Set("slotRealModelStartCensusExact", terminal.Get("realModelStartCensusExact") ?? Node.Null())
+                .Set("slotRealVerifierAssignmentCount", terminal.Get("realVerifierAssignmentCount") ?? Node.Null())
+                .Set("slotRealVerifierAssignmentsByModel", terminal.Get("realVerifierAssignmentsByModel") ?? Node.Null())
+                .Set("slotRealVerifierAssignmentCensusComplete", terminal.Get("realVerifierAssignmentCensusComplete") ?? Node.Null())
+                .Set("slotRealVerifierAssignmentUnmeasuredAllowance", terminal.Get("realVerifierAssignmentUnmeasuredAllowance") ?? Node.Null())
+                .Set("slotVerifierProcessStartCount", terminal.Get("verifierProcessStartCount") ?? Node.Null())
                 .Set("slotSupervision", _state.EvidenceFor(stage.TerminalObserved)?.Get("supervision") ?? Node.Null()));
         }
+        if (launchedSlots > supervisedCount)
+        {
+            censusComplete = false;
+            assignmentCensusComplete = false;
+        }
+        // THE figure a cohort budget is spent in: real model subprocess starts,
+        // every role, every attempt, summed from the per-slot censuses this run
+        // committed. It is deliberately not derivable from any count of cycles,
+        // slots or reviewer processes - that derivation is the defect this
+        // replaced, and a two-slot run that starts four models must publish four.
+        audit.Set("realModelStartsObserved", supervisedCount > 0);
+        audit.Set("realModelStartCount", realStartTotal);
+        audit.Set("realModelStartsGeneralist", realStartGeneralist);
+        audit.Set("realModelStartsSpecialist", realStartSpecialist);
+        audit.Set("realModelStartsVerifier", realStartVerifier);
+        audit.Set("realModelStartCensusComplete", censusComplete);
+        audit.Set("realModelStartUnmeasuredAllowance", unmeasuredAllowance);
+        audit.Set("realModelStartLaunchedSlotCount", launchedSlots);
+        // THE figure a cohort's VERIFIER ceiling is spent in, and a different unit
+        // from the one above: one assignment is one candidate paired with one
+        // required reciprocal model, counted from the sealed per-slot preview
+        // manifests. It is deliberately not derivable from any count of terminal
+        // states - that derivation is the defect this replaced, and a run that
+        // stood on forty assignments must publish forty rather than four.
+        audit.Set("realVerifierAssignmentsObserved", supervisedCount > 0);
+        audit.Set("realVerifierAssignmentCount", assignmentTotal);
+        var assignmentBreakdown = new ListNode();
+        foreach (var pair in assignmentsByModel)
+        {
+            assignmentBreakdown.Add(new MapNode().Set("verifierModel", pair.Key).Set("assignmentCount", pair.Value));
+        }
+        audit.Set("realVerifierAssignmentsByModel", assignmentBreakdown);
+        audit.Set("realVerifierAssignmentCensusComplete", assignmentCensusComplete);
+        audit.Set("realVerifierAssignmentUnmeasuredAllowance", assignmentAllowance);
+        // Grouped launches. A cluster of candidates can be verified by one
+        // subprocess, so this is always a diagnostic and never a budget unit: a
+        // ceiling checked against it would shrink every time grouping worked.
+        audit.Set("verifierProcessStartCount", verifierProcessTotal);
         audit.Set("declaredSlotCount", CoordinatorRequest.DeclaredSlotCount);
         audit.Set("supervisedSlotCount", supervisedCount);
         audit.Set("slots", slotRecords);
@@ -3456,6 +3936,24 @@ internal sealed class PreparationMachine(
         // from an earlier walk.
         audit.Set("terminalReason", terminalReason);
         audit.Set("terminalDetail", terminalDetail);
+        // Whether this audit describes a run that is at rest, stated as a flag
+        // rather than left to be inferred from the reason word.
+        //
+        // The audit is rewritten after every commit, so at any instant the copy
+        // on disk describes the run as it then stood. A coordinator killed
+        // outright - a hard kill, a lost machine - never writes the final one,
+        // and the copy left behind is whichever mid-walk audit was written last.
+        // Read as an ending, that copy would report the spend of a run that had
+        // only reached its own middle, and a cohort would charge it and launch
+        // the next entry. It cannot be told apart by counters: the honest ones
+        // for the point it was written at are the same zeros a preparation that
+        // really refused before launching anything publishes. This flag is the
+        // difference, and a reader that requires it true is refusing exactly the
+        // audit nobody finished.
+        audit.Set(
+            "preparationEnded",
+            !string.Equals(terminalReason, AuditReasonRunning, StringComparison.Ordinal)
+            && !string.Equals(terminalReason, AuditReasonTransitionCommitted, StringComparison.Ordinal));
         audit.Set("stateSha256", File.Exists(_request.StatePath) ? CanonicalJson.Sha256HexOfFile(_request.StatePath) : "none");
         // The launch census comes from the intent ledger rather than from a
         // counter in this process, for the reason the child-result census does:

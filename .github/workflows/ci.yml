@@ -218,6 +218,17 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ShadowRunCoordinator.ps1
 
+      # The sequential cohort above that coordinator. Runs a three-entry cohort
+      # of stand-in preparations through a success, a supervised run that ended
+      # other than complete, and a fault, under both stop policies; kills the
+      # runner between entries and proves the resume neither re-attempts what
+      # ended nor runs beside a live child; and exercises the global ceiling,
+      # every identity refusal, the write and audit blocks, and the rebuildable
+      # index. No model, no provider, nothing outside a temporary sandbox.
+      - name: shadow cohort runner
+        shell: pwsh
+        run: ./tools/Test-ShadowCohortRunner.ps1
+
       # Every inventoried collection field at zero, one, many, maximum,
       # duplicate, null-versus-missing, and wrong-scalar, plus the escape-shape
       # properties and the sabotage suite that proves each historical collapse
