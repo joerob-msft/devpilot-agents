@@ -3899,6 +3899,60 @@ try {
     Assert-Cohort (@($imposterRow).Count -ge 1) `
         "The imposter rebuild changed the held row it had no evidence about; $(@($imposterRow).Count) row(s) remain."
 
+    # A manifest cannot vouch for itself. The exemption that lets a resume walk past
+    # the row it wrote is settled by the manifest digest, and on its own that is also
+    # the way around the account: spend a subject, remove the journal, its key and the
+    # output root, and run the byte-identical manifest again - the hold reads as this
+    # run's own earlier attempt and the pull request goes in front of the models
+    # twice. So the journal in this root has to ACCOUNT for the row before the
+    # exemption is granted, and a hold left by a rebuild that had no journal to read
+    # can never be accounted for by one.
+    $masqDir = Join-Path $caseReg 'masquerade'
+    [void](New-Item -ItemType Directory -Path $masqDir -Force)
+    $rgMasq = New-CohortEntryRequest -Sandbox $masqDir -EntryId 'entry-masquerade' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429330
+    [void](New-StubControl -Path $rgMasq.ControlPath -ExitCode 0)
+    $masqRegistry = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'masquerade-account\gate5-registry.json')))
+    # An account that already exists, so the manifest can pin the revision it was
+    # authorized against the way a real one does.
+    $masqSeed = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $masqRegistry,
+        '--from-cohort', $manifestUnlaunched) -OmitCohort
+    Assert-Cohort ($masqSeed.ExitCode -eq 0) `
+        "The rebuild that seeded the masquerade account exited $($masqSeed.ExitCode); expected 0. $($masqSeed.Output)"
+    $manifestMasq = New-CohortManifestFile -Path (Join-Path $masqDir 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-masquerade' `
+        -CorrelationId 'cohort-correlation-masquerade' `
+        -JournalRoot (Join-Path $masqDir 'journal') -IndexPath (Join-Path $masqDir 'index\masquerade.json') `
+        -StubPath $stub -RegistryPath $masqRegistry -RegistrySha256 (Get-JsonFile -Path $masqRegistry).registrySha256 `
+        -Entries @((New-CohortEntryDeclaration -Request $rgMasq -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $masqFirst = Invoke-Cohort -ManifestPath $manifestMasq
+    Assert-Cohort ($masqFirst.ExitCode -eq 0) `
+        "The masquerade fixture's first run exited $($masqFirst.ExitCode); expected 0. $($masqFirst.Output)"
+    $masqSpent = @((Get-JsonFile -Path $masqRegistry).samples | Where-Object { $_.pullRequestId -eq 4429330 })
+    Assert-Cohort (@($masqSpent).Count -eq 1 -and $masqSpent[0].countsTowardThreshold -eq $true) `
+        "The masquerade fixture's first run left $(@($masqSpent).Count) row(s); expected one counted."
+    # The loss: the journal, its key and everything the child wrote are removed, which
+    # is the state an operator reaches by deleting a cohort root and keeping the
+    # manifest. Nothing about the pull request has been undone.
+    Remove-Item -LiteralPath (Join-Path $masqDir 'journal') -Recurse -Force
+    Remove-Item -LiteralPath $rgMasq.OutputRoot -Recurse -Force
+    $masqAgain = Invoke-Cohort -ManifestPath $manifestMasq
+    Assert-Cohort ($masqAgain.ExitCode -eq 11) `
+        "A manifest ran past the row its own digest was on after losing its journal; exit $($masqAgain.ExitCode), expected 11. $($masqAgain.Output)"
+    Assert-Cohort ($masqAgain.Output -match 'does not account for') `
+        "The refusal did not say the journal cannot account for the row. $($masqAgain.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $rgMasq.OutputRoot 'coordinator'))) `
+        'The refused masquerade cohort started its child anyway.'
+    $masqStill = @((Get-JsonFile -Path $masqRegistry).samples | Where-Object { $_.pullRequestId -eq 4429330 })
+    Assert-Cohort (@($masqStill).Count -eq 1 -and $masqStill[0].countsTowardThreshold -eq $true) `
+        "The refused re-run changed the counted row it could not account for; $(@($masqStill).Count) row(s) remain."
+    # Nor can the retraction reach it: the flag only ever moves a placeholder, and a
+    # row that recorded a real spend is not one.
+    $masqKeep = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $masqRegistry,
+        '--from-cohort', $manifestUnlaunched, '--from-cohort', $manifestMasq, '--retract-cleared-holds') -OmitCohort
+    Assert-Cohort ($masqKeep.ExitCode -eq 2) `
+        "A rebuild over the destroyed root reported success; exit $($masqKeep.ExitCode), expected 2. $($masqKeep.Output)"
+
     # An account with an open question in it cannot prove a subject is free, so a
     # COUNTING cohort bound to one is refused before any child. The same account in
     # diagnostic mode is fine: nothing there can occupy anything.

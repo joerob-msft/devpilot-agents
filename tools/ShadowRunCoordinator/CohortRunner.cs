@@ -264,23 +264,30 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             try
             {
                 PublishIndexSafely(journal, key, CohortIndex.ReasonRunning, "the cohort is in progress");
+                RequireLiveToolkitHead();
+                RequireSealedModelStartBounds();
+                RequireRegistryAdmissible(journal, key);
             }
             catch (Exception error) when (error is ContractException or CohortBlockedException or IOException or UnauthorizedAccessException)
             {
-                // Publishing re-reads every ended entry's evidence, so the resume
-                // that finds one of those artifacts damaged stops HERE - before the
-                // walk below, and before the account has even been opened. An entry
-                // that ended and never reached the account would be stranded by that:
-                // spent, unheld, and free for the next selection. So the subjects go
-                // on record first, best effort and without adopting anything, and the
-                // refusal still stops the run.
+                // Everything above runs BEFORE the walk reaches the first entry, and
+                // every one of these four can refuse a resume: damaged artifacts from
+                // an entry that already ended, a toolkit checkout that moved, a plan
+                // whose bounds no longer read, or an account that took one of this
+                // cohort's remaining subjects while it was stopped. An entry that
+                // ended and never reached the account would be stranded by any of
+                // them - spent, unheld, and free for the next selection - because the
+                // row is written by the walk below, which is never reached. So the
+                // subjects go on record first, best effort and without adopting
+                // anything, and the refusal still stops the run.
+                //
+                // A checkout that moved is the ordinary trigger, not the exotic one:
+                // the window between an entry's ending and its row is one kill, and
+                // the operator who comes back to a stopped cohort is the same person
+                // who pulls before resuming it.
                 HoldSpentSubjectsBeforeFailing(journal);
                 throw;
             }
-
-            RequireLiveToolkitHead();
-            RequireSealedModelStartBounds();
-            RequireRegistryAdmissible(journal, key);
 
             var stopped = false;
             var anyUnsuccessful = false;
@@ -1250,6 +1257,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             var subject = CohortRegistry.SubjectKeyOf(entry);
             if (!registry.HoldsSubjectFromAnotherRun(subject, _manifest.ManifestSha256))
             {
+                RequireOwnRowsCorroborated(journal, registry, binding, entry);
                 continue;
             }
             var held = registry.AnySampleFor(subject)!;
@@ -1307,6 +1315,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         var subject = CohortRegistry.SubjectKeyOf(entry);
         if (!registry.HoldsSubjectFromAnotherRun(subject, _manifest.ManifestSha256))
         {
+            RequireOwnRowsCorroborated(journal, registry, binding, entry);
             return;
         }
         var held = registry.AnySampleFor(subject)!;
@@ -1315,6 +1324,70 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             $"'{CohortRegistry.RepositoryIdOf(entry)}', and the registry at '{binding.Path}' has taken that subject since this cohort was " +
             $"admitted - cohort '{held.CohortId}' under manifest {held.ManifestSha256}. Another run claimed it while this one was working, " +
             "and starting now would spend it twice. Nothing has been launched for this entry.");
+    }
+
+    /// <summary>
+    /// Refuses to launch an entry whose subject the account already holds under THIS
+    /// manifest's digest, unless this root's own journal accounts for that row.
+    /// </summary>
+    /// <remarks>
+    /// The exemption a resume depends on is that a run may proceed past a row it
+    /// wrote itself, settled by the manifest digest. Left alone, that exemption is
+    /// also the way around the whole account: a cohort spends its subject for real,
+    /// the journal, its key and the output root are removed, and the byte-identical
+    /// manifest is run again. The digest still matches, so the row the account is
+    /// holding the subject with reads as this run's own earlier attempt, and the
+    /// pull request goes in front of the models a second time - the one thing the
+    /// registry exists to prevent, reached without touching the account at all.
+    ///
+    /// So 'its own' is not settled by the digest alone. The journal in this root has
+    /// to account for the row: an ended row needs an ended record, and a row that
+    /// holds an open launch needs that launch. A journal minted after the original
+    /// was lost has neither, and neither has one that never ran - which is exactly
+    /// why this cannot decide the question by itself and refuses instead.
+    ///
+    /// A hold left by a rebuild that could not read a journal at all can never be
+    /// corroborated, and that is the intended reading: the account is saying it
+    /// cannot rule out a spend, and the manifest that produced it is no better placed
+    /// to rule one out than any other. The escape is the same one the rebuild
+    /// advertises - restore the journal, or assert with --retract-cleared-holds that
+    /// the launch never happened - and both are the operator on the record.
+    ///
+    /// The rebuild records NO row for an entry its journal shows as pending, so an
+    /// ordinary resume of a partially finished cohort passes here untouched: its
+    /// ended entries are corroborated by their endings, and its pending ones are not
+    /// held by anything.
+    /// </remarks>
+    private void RequireOwnRowsCorroborated(
+        CohortJournal journal,
+        CohortRegistry registry,
+        CohortRegistryBinding binding,
+        CohortEntry entry)
+    {
+        var subject = CohortRegistry.SubjectKeyOf(entry);
+        foreach (var row in registry.Samples)
+        {
+            if (!string.Equals(row.SubjectKey, subject, StringComparison.Ordinal)
+                || !string.Equals(row.ManifestSha256, _manifest.ManifestSha256, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            var record = journal.RecordFor(row.EntryId);
+            var placeholder = CohortRegistryAdmission.IsPlaceholder(row);
+            if (placeholder ? (record.HasOpenLaunch || record.HasEnded) : record.HasEnded)
+            {
+                continue;
+            }
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' names pull request {entry.PullRequestId.ToString(CultureInfo.InvariantCulture)} in " +
+                $"'{CohortRegistry.RepositoryIdOf(entry)}', and the registry at '{binding.Path}' holds that subject with a row this manifest " +
+                $"produced (cohort '{row.CohortId}', entry '{row.EntryId}', classified '{row.Classification}') that the journal at " +
+                $"'{_manifest.JournalPath}' does not account for: the row stands on evidence of a run, and this journal records no launch and " +
+                "no ending for that entry. A journal written after the original was removed reads exactly like one that never ran, so this " +
+                "cannot be read as the same run coming back and the subject is not offered again. Restore the journal this account was built " +
+                "from, or - if the launch demonstrably never happened - clear the hold deliberately with " +
+                "--rebuild-registry --retract-cleared-holds naming this cohort root.");
+        }
     }
 
     /// <summary>

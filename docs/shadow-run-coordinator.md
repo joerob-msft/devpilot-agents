@@ -950,9 +950,13 @@ somebody else's launch. If that intent is missing or no longer
 digests to what the journal committed, the entry's subject is held by a row that counts toward nothing
 and the cohort stops — the subject goes on record *before* the refusal, never after it.
 
-The same ordering covers the way in. Publishing the running index re-reads every ended entry's evidence,
-so a resume that finds one of those artifacts damaged stops before the walk and before the account has
-been opened at all; every already-ended entry missing from the account is put on record first, best
+The same ordering covers the way in. Everything a resume does before it reaches its first entry can
+refuse it — publishing the running index re-reads every ended entry's evidence, the toolkit head is
+re-checked, the sealed bounds are re-read, and the account is walked — and a refusal from any of them
+would otherwise strand an entry that ended while the runner was away: spent, unheld, and free for the
+next selection. A checkout that moved is the ordinary trigger, not the exotic one, since the operator
+who comes back to a stopped cohort is the same person who pulls before resuming it. So all four sit
+inside one guard: every already-ended entry missing from the account is put on record first, best
 effort and without adopting anything, and only then does the refusal stop the run.
 
 A sample counts only when all of it holds: the mode is `count`; the subject is not already held; the
@@ -985,6 +989,26 @@ a string an operator types, and a manifest copied from a finished one keeps it: 
 the subject it is about to spend a second time as its own earlier attempt. The journal already
 refuses a manifest edited between runs, so a genuine resume presents byte-identical bytes and the
 same digest, while a copy — new journal root, new output root, re-pointed revision — cannot.
+
+**And the digest alone is not enough: the journal has to account for the row.** Left there, the
+exemption is the way around the whole account. Spend a subject, delete the journal, its key and the
+output root, and run the byte-identical manifest again: the digest still matches, the hold reads as
+this run's own earlier attempt, and the pull request goes in front of the models a second time —
+reached without touching the account at all, by an operator who thinks they are starting over. So
+every row the account holds for a subject under *this* manifest's digest has to be corroborated by
+this root's own journal before the entry may launch: a row about an entry that ended needs an ended
+record, and a row holding an open launch needs that launch. A journal minted after the original was
+lost has neither, and neither has one that never ran — which is precisely why the runner cannot
+settle it and refuses instead, exit 11, naming the row and the journal that cannot speak for it.
+
+A hold left by a rebuild that had no journal to read can never be corroborated, and that is the
+intended reading rather than a wedge: the account is saying it cannot rule out a spend, and the
+manifest that produced the hold is no better placed to rule one out than any other. The escapes are
+the ones the rebuild already advertises — restore the journal, or assert with `--retract-cleared-holds`
+that the launch never happened — and both put the operator on the record. Nothing here can reach a
+row that recorded a real spend: the retraction only ever moves a placeholder. An ordinary resume of a
+partly finished cohort is untouched, because the rebuild records no row at all for an entry its
+journal shows as pending.
 
 The account is also re-read from disk in the last moment before each child starts. The pre-walk
 settles admission for the whole cohort at once, which is what lets a two-entry cohort refuse both
@@ -1227,7 +1251,19 @@ Four things it does **not** establish, none of which a local file can:
   threshold read off that total is a statement about the toolkit in general, not about any one
   version of it.
 
-Four narrower residuals, recorded rather than fixed:
+Six narrower residuals, recorded rather than fixed:
+
+- **A defect is answered by the path being named again, not by the same bytes coming back.** An
+  unreadable root that is replaced at its own path by an unrelated but readable manifest clears the
+  defect it left, and the subjects that root may have touched — which by definition could not be
+  listed — stop being fenced by it. Binding the defect to a digest is not available, because the
+  reason it exists is that the bytes would not read. This is the same threat model the censuses
+  already accept: an operator who can rewrite a run root can already rewrite what the run root claims.
+- **The account has no anchor outside itself.** Every revision authenticates under the same key, so
+  restoring an older copy of the registry file is indistinguishable from never having advanced, and
+  the rows the later revisions carried are gone with it. The manifest pins a digest, but a stale
+  digest is a valid one. The check that exists is the rebuild: the account is re-derivable from the
+  immutable roots, and a restored copy that disagrees with them shows up as soon as it is rebuilt.
 
 - **A cohort root that is deleted outright cannot be reconciled in place.** Naming a manifest that is
   gone throws, and not naming it fails the lost-subject or dropped-defect guard, so an account whose
