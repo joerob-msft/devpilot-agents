@@ -73,7 +73,9 @@ re-verifies it through `Read-ReviewerGateDecision` (HMAC domain + kind +
 binding + expiry), performs its **own** dedicated, fresh, isolated-session
 revalidation, and requires - among other things - that the *sealed* decision
 itself (never the live `-SecondPassModel`/config) records exactly two
-completed passes with the literal `claude-opus-5`/`gpt-5.6-sol` pair
+completed passes with the derived generalist pairing
+(`Get-AgentGeneralistModelPair`, read from the harness's supported-model
+registry - the mint never names a model version of its own)
 (`passesRequested`/`generalistPassModels`, part of the sealed binding). Policy,
 qualification, and CLI switches can only **narrow** what the mint is willing
 to grant - never supply positive evidence on their own - and gate mode `"off"`

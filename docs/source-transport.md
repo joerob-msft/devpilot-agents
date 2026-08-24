@@ -35,16 +35,21 @@ artifact says so.
 
 For each bound PR the wrapper:
 
-1. reads the change set **with** line diff blocks and derives, per changed path,
-   the right-hand (post-change) line spans of every add and edit;
-2. expands each span by a policy context radius, clamps it to the file, and
+1. reads authoritative paginated iteration identity, then reads the matching
+   aggregate diff and derives, per changed path, the right-hand (post-change)
+   line spans of every add and edit;
+2. recovers a pure same-path edit whose aggregate blocks contain only
+   context/deletes — the case ADO drops from the right-hand view — by reading the
+   authoritative common-base and source versions the flat contract now pins and
+   keeping only the spans that content difference proves;
+3. expands each span by a policy context radius, clamps it to the file, and
    merges overlaps so no line travels twice;
-3. reads each changed file's bytes itself at the exact 40-hex source commit,
+4. reads each changed file's bytes itself at the exact 40-hex source commit,
    through the same validated resource contract it already uses;
-4. cuts the merged spans into whole-line slices, hashing each one;
-5. renders a **sealed block** — collision-checked fences, per-slice provenance
+5. cuts the merged spans into whole-line slices, hashing each one;
+6. renders a **sealed block** — collision-checked fences, per-slice provenance
    JSON, and a leading content-accounting table;
-6. refuses to review at all if coverage falls below the policy floor.
+7. refuses to review at all if coverage falls below the policy floor.
 
 Nothing about the model's tool grant changes. It gains content, not capability.
 
@@ -61,7 +66,12 @@ The block opens with every changed path and whether its source actually arrived:
 set: `budgetExhausted`, `sliceCountCapExceeded`, `fileTooLarge`, `notTextual`,
 `decodeRejected`, `transportFailed`, `noChangedSpans`, `binaryNoText`,
 `readerReportedNonTextUncorroborated`, `emptyFile`, `spansUnavailable`,
-`fileCountCapExceeded`, `pathRejected`, `spanOutsideFile`, `unsafeSliceText`.
+`fileCountCapExceeded`, `pathRejected`, `spanOutsideFile`, `unsafeSliceText`,
+`recoveredHunkShortfall`, `authoritativeDeletionOnly`, and the closed recovery
+cap reasons `recoveryByteCapExceeded`, `recoveryLineCapExceeded`,
+`recoveryEditDistanceCapExceeded`, `recoveryOperationCapExceeded`,
+`recoveryFrontierCapExceeded`, `recoveryTraceCapExceeded`, and
+`recoveryHunkCapExceeded`.
 
 Those causes are told apart at the reader seam, before the strict decoder runs.
 The decoder's job is safety and it refuses everything it dislikes the same way,
@@ -72,11 +82,12 @@ now read structurally and judged against policy first; only content policy would
 accept reaches the decoder, and only the decoder's own refusals become
 `decodeRejected`. Nothing about its strictness changes.
 
-**A change set with no right-hand lines is not a failure — but only the pull
-request may say so.** Delete-only and rename-only changes legitimately
+**A change set with no right-hand lines is not a failure — but that state must
+be proven authoritatively.** Delete-only and rename-only changes legitimately
 have paths and no changed lines: those paths are counted apart and are **excluded
-from the coverage denominator**, because the change set itself says there is no
-source for the transport to deliver and they therefore cannot be uncovered. A
+from the coverage denominator** when either the change set itself says there is
+no source to deliver or exact common-to-source comparison proves only deletions.
+A
 binary or an empty file is *not* in that category — only the reader says those
 hold nothing, so they stay counted; see the denominator rule below. Leaving
 deletes in meant a pull request that edited two files and deleted four scored
@@ -102,6 +113,258 @@ kind carries content is read anyway, and what comes back decides:
 | a length that is not decodable | `decodeRejected` | **yes** — a malformed payload, not an oversized one |
 | real text content | `spansUnavailable` | **yes** — its diff was lost |
 | unreadable | `transportFailed` | **yes** |
+
+Recovery is deliberately narrower than this spanless classification. It runs only
+for a pure `edit` on the same path when the aggregate entry supplies at least one
+well-formed delete block, optional context blocks, and no right-hand block. The
+delete-block count is retained as independent evidence: requested-span accounting
+uses at least that count, so a shorter recovered hunk list cannot award itself
+100% coverage. When all proved recovered hunks arrive but that evidence floor is
+still higher, the file is partial with `recoveredHunkShortfall`; it is not
+misreported as a byte-budget failure. Adds, deletes, any rename mixture,
+context-only/empty/malformed
+block sets, ordinary diffs, binary/empty/recovery-oversized/decode-rejected content,
+missing versions, equal versions, stale identity, and work over the
+request/byte/line/edit-distance/operation/frontier-trace/hunk caps remain
+unrecovered. Recovery has separate source/base reader delegates that may privately
+decode at most the exact algorithm's 2 MiB per-side ceiling. The source read is
+cached: when it also fits `maxFetchBytesPerFile`, normal slicing reuses it; when it
+does not, reporting receives only an ordinary `fileTooLarge` classification, never
+the wider text, hash, line census, slices, or model content. Ordinary
+missing-path/read errors disable recovery for that file; a session-fatal transport
+failure still propagates. Every unsuccessful attempt retains a closed omission
+reason and stays in both coverage floors. Cap exhaustion never emits partial or
+fabricated spans.
+
+The exact comparison uses deterministic bounded Myers shortest-edit recovery,
+`O((N+M)D)` work for edit distance `D`, with deletion-preferred ties. Independent
+hard ceilings bound each side to 100,000 lines and 2 MiB, edit distance to 4,096,
+the frontier to 8,195 entries, operations to 20,000,000, retained trace entries
+to 4,000,000, and recovered hunks to 2,000. Exceeding any ceiling fails closed.
+The reverse frontier reconstructs the former matrix oracle's deletion-first
+canonical minimal script, including repeated-line ambiguities. The algorithm
+does not call Git, a shell, another diff implementation, or a model.
+The 2 MiB content ceiling is code-defined and reused by the private reader; it is
+not a consumer-configurable delivery allowance. Ordinary files remain subject to
+the separate `maxFetchBytesPerFile` policy before any slice can be delivered.
+
+Recovery additionally requires an authoritative binding to the configured
+organization, project, repository ID, PR ID, exact iteration ID, source, target,
+and common-base commit. When the MCP server exposes the authoritative flat
+paginated `get_changes` contract (microsoft/azure-devops-mcp PR #1499, head
+`276d802a53`), the wrapper detects it via `tools/list` input-schema inspection.
+Detection is structured, not a boolean: the `repo_pull_request` input schema must
+expose `get_changes` in the `action` enum together with `iterationId`, pagination
+controls `top` and `skip`, and Agency's existing aggregate-span inputs
+`includeDiffs` and `includeLineContent`. A successful probe yields a
+structured capability (bounded `PageSize` and `ChangeLimit`) rather than a flag.
+The detection is strict: any missing property, malformed schema, null response,
+or `tools/list` error causes the wrapper to fall back to legacy `get_changes`
+behavior with recovery dormant and its body semantically unchanged. The probe
+never touches the shared ordinary-transport session: it runs on a dedicated,
+short-lived repos-only MCP session that is always closed, and its result
+(including a null) is cached on the shared session so it is computed at most once.
+The public local PR #1499 server intentionally exposes identity-only changes and
+does not advertise aggregate line diffs, so that schema alone remains dormant:
+hosted Agency must deploy the identity fields additively on its existing diff
+response before recovery activates.
+
+When the flat contract is detected the wrapper drives a single bounded paginator.
+Each page is a flat record that carries its own full identity, and the wrapper
+binds every field strictly before trusting the page:
+
+1. **Per-page identity** — `iterationId` (positive), `iterationReason`
+   (`{ value, names, unrecognizedBits }`, where a null value forces empty names
+   and zero unrecognized bits), the exact lowercase 40-hex `commonRefCommit`,
+   `sourceRefCommit`, and `targetRefCommit`, and a retarget pair
+   (`oldTargetRefName`/`newTargetRefName`) that is either both-null or both
+   well-formed `refs/heads/*`. `commitsTruncated` is retained as identity metadata
+   (the exact common/source/target commits remain available), and the
+   continuation fields `hasMoreChanges`/`nextSkip`/`nextTop` must be internally
+   consistent (a terminal page pins both continuation cursors to zero; a
+   continuing page advances `nextSkip` by exactly the delivered count and keeps
+   `nextTop` within the server's 1000-entry bound).
+2. **Bounded pagination** — the first page is fetched with `top` clamped to 200,
+   `skip = 0`, and no explicit iteration (any iteration is accepted to *discover*
+   the identity). Every subsequent page pins the discovered `iterationId`
+   explicitly and must match the first page's identity exactly; a page whose
+   identity differs fails closed as mixed-identity. Advertised page sizes are
+   capped to the 1000 hard ceiling on the wire, a page returning more than the
+   requested `top` is refused, and a change set that would exceed the bounded
+   total of 1000 fails closed rather than reading forever. The source commit
+   discovered on the first page must equal the pinned source commit.
+3. **Bracketed aggregate read and final latest re-read** — only after the first
+   complete identity read does the orchestrator request aggregate spans. After
+   all content and report reads it re-reads the latest iteration whole with the
+   same bounded page/limit and fails closed on any movement: a force push (new
+   iteration), a rebase (common commit moved), a retarget (target commit or refs
+   changed), a reason change, or any change to the aggregated change list. The
+   pre-read and post-read pagination digests must be equal.
+
+The identity paginator supplements rather than replaces the existing aggregate
+diff read: its complete path/original-path/change-type digest must exactly match
+the aggregate response. The aggregate response remains the authoritative source
+of ordinary Add/Edit right-hand blocks, which are delivered with
+`spanBasis = "changeSet"` and take no recovery reads. Every raw aggregate path,
+including a path rejected by the safe-path grammar, remains in the coverage
+denominator (`pathRejected` rather than silently disappearing). Recovery runs
+only for the degenerate context/delete-only case on a pure same-path edit carrying
+at least one delete block: the wrapper reads the authoritative `commonRefCommit`
+base version and the `sourceRefCommit` version (which must equal the pinned source
+commit) and keeps only the right-hand spans that common→source content difference
+proves, presented as `spanBasis = "recovered"`. Add/delete/rename/mixed changes,
+an edit whose `originalPath` differs, and identical common/source content are
+never recovered. Incomplete pagination is rejected before any content read begins.
+When that exact comparison proves a non-empty pure edit contains deletions and no
+right-hand insertions, the path is recorded as `authoritativeDeletionOnly` with
+`noSourceBasis = "authoritativeComparison"` and recovered provenance. It leaves
+the denominator because there is no reviewable right-hand source. Missing reads,
+rejected content, equal versions, malformed aggregate evidence, and cap exhaustion
+cannot enter that state and remain uncovered. The final iteration identity and
+change-list digest are rechecked after all reads before this signed record is
+returned.
+
+Every file carries a versioned `spanBasis`: `changeSet` for ADO-declared
+right-hand blocks and `recovered` for deterministic common-base/source evidence.
+The basis is present in the model-facing accounting row, every slice's provenance,
+the persisted coverage record, preview/cycle metadata, and therefore artifact
+digests. Recovery attempted/recovered/evidence counts, the exact common-base
+commit, and the iteration ID are bounded accounting fields rather than hidden
+implementation details.
+
+The MCP contract remains the first preference. An explicitly enabled Azure
+DevOps CLI fallback can supply the same authoritative identity when hosted MCP
+still exposes aggregate line-diff blocks but not the flat iteration fields.
+Without that opt-in, against an older or partial deployment, the structured
+probe fails, recovery stays dormant, and the wrapper reviews exactly as it did
+before — the degenerate pure-edit case is simply left uncovered rather than
+recovered.
+
+### Optional Azure DevOps CLI identity fallback
+
+The fallback removes the need to wait for a hosted MCP identity-contract
+deployment. It does **not** replace MCP source transport: the wrapper still reads
+the aggregate `lineDiffBlocks` and exact pinned file contents through the hosted
+MCP session. Azure CLI supplies only the latest pull-request iteration and that
+iteration's common-to-source change pages. Their canonical path/original-path/
+change-type digest must equal the MCP aggregate response before any span is
+trusted.
+
+The fallback is off when `review.sourceTransport` is absent and in the shipped
+sample:
+
+```json
+{
+  "review": {
+    "sourceTransport": {
+      "azureDevOpsCliFallback": {
+        "enabled": false,
+        "tenantId": "00000000-0000-0000-0000-000000000000"
+      }
+    }
+  }
+}
+```
+
+To enable it, set `enabled` to `true` and replace `tenantId` with the exact
+Microsoft Entra tenant expected for the Azure DevOps organization. The wrapper
+refuses an empty or different tenant. The object is closed by
+`source/v1/azure-devops-cli-fallback.schema.json`; unknown keys fail startup.
+
+The flag is ignored in an offline snapshot replay, and deliberately so: this
+fallback is a live transport that runs `az` and then calls the REST API, which
+would contradict a replay's only claim about itself. Replay suppresses it,
+warns once at startup, and records `azCliFallbackSuppressed` in the sealed
+artifact. If you see the reviewer refuse this fallback in a run that is not a
+replay, `DEVPILOT_REVIEWER_REPLAY_ACTIVE` is left over in your shell from an
+earlier replay; the refusal names it. See
+[replay-snapshots.md](replay-snapshots.md).
+
+#### Installation and authentication
+
+Install Azure CLI by your platform's supported method, then install its
+`azure-devops` extension:
+
+```powershell
+az extension add --name azure-devops
+az extension show --name azure-devops --query "{name:name,version:version}" --output json
+```
+
+Authenticate in the tenant named by config. On Conditional Access-managed
+corporate hosts where device code or Windows Account Manager can be restricted,
+the validated browser flow is to disable the Windows broker **for this process**
+and allow tenant-only accounts:
+
+```powershell
+$env:AZURE_CORE_ENABLE_BROKER_ON_WINDOWS = 'false'
+az login --tenant <tenant-id> --allow-no-subscriptions
+```
+
+Use your organization's tenant ID in place of `<tenant-id>`. On hosts that allow
+the default broker, a normal `az login --tenant <tenant-id>
+--allow-no-subscriptions` is also supported. Do not put credentials, refresh
+tokens, or access tokens in reviewer config.
+
+Verify the selected tenant and Azure DevOps resource access without displaying
+an access token:
+
+```powershell
+az account show --query tenantId --output tsv
+az account get-access-token `
+    --resource 499b84ac-1321-427f-aa17-267ca6975798 `
+    --query "{expiresOn:expiresOn,tenant:tenant}" --output json
+```
+
+The first value must equal `tenantId` in config. The second command prints only
+expiry and tenant metadata; never remove its `--query` in logs or automation.
+
+`AADSTS53003` means Conditional Access blocked token acquisition. Device-code
+login and brokered WAM login can each be disallowed independently; retry with
+the broker-disabled browser flow above in the correct tenant. If that remains
+blocked, an administrator must satisfy the applicable Conditional Access policy.
+The reviewer fails closed and sanitizes the CLI error rather than printing the
+private response body.
+
+#### Trust boundary and limits
+
+- The model receives no shell tool, Azure CLI command, environment token, or
+  access token. Only deterministic wrapper code starts `az.cmd`/`az`.
+- The command is fixed to `az rest --method get` against one of two
+  wrapper-constructed Azure DevOps Git paths: pull-request iterations or exact
+  iteration changes. It pins the Azure DevOps resource application ID, API
+  `7.1`, JSON output, and validated organization/project/repository/PR/iteration
+  route values. No arbitrary URL, command text, `compareTo`, or model value is
+  accepted. `az rest` deliberately bypasses `az devops login` PAT credentials;
+  the read uses the tenant-bound Azure CLI account token.
+- Startup verifies the `azure-devops` extension and exact signed-in tenant.
+  It also acquires only token metadata for the configured tenant and Azure
+  DevOps resource before any REST read. Reads are capped at 30 seconds, 1 MiB
+  stdout, 16 KiB stderr, 200 changes per page, 1,000 changes total, and 25 Azure
+  CLI process requests for the bracketed
+  capture. Malformed, duplicate, truncated, moving, unauthorized, or mismatched
+  data fails the PR closed.
+- The least Azure DevOps permission required for these endpoints is Code (Read)
+  (`vso.code`) where the authentication mechanism exposes scoped permissions.
+  The Entra bearer token for the Azure DevOps resource is the signed-in user's
+  resource token; the wrapper does not down-scope it to `vso.code`, and it may
+  authorize other actions granted to that identity. Runtime read-only
+  enforcement comes from the wrapper's fixed `az rest --method get` calls to
+  the two allowlisted endpoint families above, with no arbitrary URL or write
+  method. The fallback itself never writes a comment, vote, reviewer, pull
+  request, repository object, or work item.
+- After pinned content reads, the wrapper re-reads both latest iteration identity
+  and all pinned iteration changes. Identity or digest movement fails closed.
+
+To disable the fallback, set `enabled` back to `false` or remove the entire
+`sourceTransport` object; default behavior is restored immediately. To remove
+the optional dependency:
+
+```powershell
+az extension remove --name azure-devops
+```
+
+`az logout` additionally removes Azure CLI sign-in state, but affects every
+Azure CLI workload for that user, not only this reviewer.
 
 `binaryNoText` and `readerReportedNonTextUncorroborated` are the same reader
 answer split by whether anyone else corroborates it. When the change set's own
@@ -262,7 +525,9 @@ every line-diff block, where every probe returns real text and the coverage floo
 is going to refuse the pull request anyway; a pull request that adds forty icons
 returns forty non-text answers and spends no budget. Past the cap a path is
 counted uncovered without being read, which is the fail-closed direction. All
-reads remain bounded by `maxFiles` and `maxFetchBytesPerFile`.
+ordinary delivery reads remain bounded by `maxFiles` and
+`maxFetchBytesPerFile`. Exact recovery additionally permits only its candidate
+paths to use the private, code-defined 2 MiB per-side reader ceiling.
 
 One consequence is worth stating plainly. A pull request consisting of **nothing
 but** assets — an icon set, a fixture directory, a localization bundle — leaves
@@ -437,7 +702,7 @@ against 1.6 MB for the raw diff channel and 0 bytes for the file-read tool — a
 | key | default | what it bounds |
 |---|---|---|
 | `contextRadiusLines` | 30 | unchanged lines kept on each side of a changed span |
-| `maxFetchBytesPerFile` | 1048576 | largest file the wrapper will read; larger is `fileTooLarge` |
+| `maxFetchBytesPerFile` | 1048576 | largest file eligible for ordinary census, slices, or model delivery; larger is `fileTooLarge` even if privately compared for recovery |
 | `maxSliceBytesPerFile` | 32768 | delivered slice bytes for one file |
 | `maxTotalSliceBytes` | 196608 | delivered CHANGED slice bytes for the whole PR |
 | `maxSlicesPerFile` | 24 | slices for one file |
@@ -539,5 +804,9 @@ schema:
 - **Coverage is measured in files, not in judgement.** A `delivered` file whose
   changed span is a one-line edit inside a 3,000-line class still gives the model
   only a local view.
-- **A file larger than `maxFetchBytesPerFile` is reported, not read.** That is a
-  deliberate refusal, and the accounting says so.
+- **A file larger than `maxFetchBytesPerFile` is never delivered.** It may be
+  privately read only when it is a qualified degenerate recovery candidate and
+  still fits the code-defined 2 MiB exact-comparison ceiling. That private object
+  can prove deletion-only or bounded right-hand spans, but it never becomes
+  ordinary whole-file census, slices, or model input; accounting still reports
+  `fileTooLarge` when reviewable right-hand source exists.

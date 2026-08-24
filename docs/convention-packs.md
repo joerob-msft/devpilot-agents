@@ -165,10 +165,28 @@ The specialist receives only the dedicated prompt, the sealed fact and
 convention plans, exact convention text re-resolved at each recorded commit and
 SHA-256, the pinned changed-file records, sanitized thread metadata, and two
 read-only tools: pull-request and repository-file reads. Its nonce-bound
-`CONVENTION_REVIEW_RESULT_V1` marker permits `suggestion` and `important`
+`CONVENTION_REVIEW_RESULT_V2` marker permits `suggestion` and `important`
 convention candidates only. Wrapper validation rechecks source quotes, pack
 membership, fact IDs, severity rules, sibling evidence, and current changed-file
 anchors. Invalid anchors are withheld rather than relocated.
+
+Each candidate carries two exact remediation parts. `changedCodeFix` is the
+required stop-the-bleed action on sealed changed constructs. It identifies the
+generic convention key and whether an exact value comes from deterministic facts
+or must be obtained from the authoritative rule; the wrapper never guesses an
+identity or assignee. `existingDebtFollowUp` is explicitly `none` unless a
+complete wrapper-generated `rdf1:` file summary proves a bounded systematic
+pattern. An authoritative-rule `selectorKey` must identify at least four
+declarations in the sealed frequency table, the required convention key must
+appear on zero declarations, counts must be complete, and the sealed
+generated-code classifier must be false. Complete means the source transport
+delivered every textual line of the exact pinned file without gaps or
+truncation; the census fact binds that proof to the pinned whole-file digest.
+Hunk and sibling slices alone can never establish a complete census.
+When supported it requests recording or linking a scoped follow-up issue/PR,
+never unrelated cleanup in the current pull request. Partial counts,
+counterexamples, generated code, unrelated paths, ambiguous boundaries, and
+repo-wide claims fail closed to `none`.
 
 Every run, including timeout, process failure, or invalid output, writes a
 separate Markdown preview and domain-separated HMAC artifact under
@@ -176,3 +194,139 @@ separate Markdown preview and domain-separated HMAC artifact under
 config/plan/fact hashes, pack names, context bytes, granted and observed tools,
 withheld reasons, and residual risks. Degradation is diagnostic in this layer;
 it does not change generalist publication or voting.
+
+## Rule-coverage accounting
+
+Transporting a rule is not the same as checking it. A specialist that reads
+eight rules, checks two, and reports one finding has said nothing at all about
+the other six - and "nothing" is exactly what a miss looks like from the
+outside.
+
+So the marker carries a bounded `ruleCoverage` array alongside `candidates`, and
+the wrapper tells the model exactly which rows it expects. `ruleCoverageRequest`
+in the runtime data names one required row per transported source, the `cf<n>`
+anchor ids for the changed files the wrapper delivered, and the wrapper's own
+enumeration of every **changed construct** in the change set. Each row states:
+
+- the pack, source id and source hash it is about, and an exact quote from it;
+- a `status` of `violation`, `compliant`, `notApplicable` or `unknown` - which
+  the wrapper **derives** from the verdicts below rather than taking on trust;
+- a `scope`: the construct kinds the rule governs, or `none`;
+- a verdict for **every** anchor in the sealed construct table, split across
+  four disjoint lists that together equal that full universe exactly:
+  `violatingConstructs`,
+  `compliantConstructs`, `notInReachConstructs` (examined, and the rule does
+  not reach it) and `unknownConstructs` (could not decide);
+- the code evidence, and the sibling evidence or why none was needed;
+- the id of the candidate it produced, or a note saying why none was emitted.
+
+`unknown` is a first-class answer. Source that was not delivered, sibling
+practice that could not be established and ambiguous rule text are all honest
+`unknown`s, and each says which in its note.
+
+### Changed constructs
+
+The wrapper enumerates four kinds of changed construct, lexically and without
+knowing anything about the repository, its language's testing framework, or what
+any attribute means:
+
+| Kind | Id | What it is | Shape facts carried |
+| --- | --- | --- | --- |
+| `invocation` | `mi<n>` | a call spanning more than one line | callee, argument count, and one character per argument: `n` syntactically named, `p` positional |
+| `declaration` | `dc<n>` | a changed declaration | the attributes on it, the attributes on its nearest unchanged neighbours, and `absentHere` - attribute names present on unchanged declarations elsewhere in the file but not on this one |
+| `comment` | `cm<n>` | a run of contiguous changed comment lines | first and last line |
+| `assignment` | `as<n>` | a changed statement writing to a name that already exists | the target |
+
+`constructFileSummaries` additionally counts how often each attribute appears
+across each whole file, so "the surrounding code already does this" is a number
+rather than an impression.
+
+The enumeration decides *shape*, never *meaning*. It cannot declare a violation:
+only the transported rule text, read by the model, decides whether a construct
+is in a rule's reach and whether it breaks it. There are no employer-specific or
+framework-specific patterns anywhere in it.
+
+Budgets are split evenly across kinds and taken round-robin across files, so
+neither a call-heavy change set nor a file that sorts first can starve a kind or
+a file of anchors. When a cap or an unlexable file means the enumeration is
+incomplete, the accounting is reported incomplete too - a checklist that covers
+every rule over a construct set that is missing entries has not covered the
+change set.
+
+Construct id lists accept inclusive same-kind ranges (`mi0-mi37,dc0-dc18`).
+Without that a complete answer over a real change set does not fit in a field
+short enough to survive the marker's length bound, and an answer that cannot be
+written gets written incompletely.
+
+The wrapper then reconciles the rows against the set it transported, which it
+computed itself:
+
+- a source with no row is reported **missing**; a source with two rows is
+  reported **duplicated**; a row naming a source that was never transported is
+  reported **unknown** and is not counted toward coverage;
+- a row whose source hash or quote does not match what was actually transported
+  is degraded to `unknown` with the reason recorded;
+- a row that leaves any sealed anchor out of **all four**
+  verdict lists is degraded, and the reason names the exact ids it left out; so
+  is a row that gives the same anchor two verdicts, or a verdict to an anchor
+  that does not exist;
+- `notInReachConstructs` is the cheapest verdict to give, so it is fail-closed
+  in every direction. The universe is the wrapper's full sealed enumeration,
+  not the model's; `scope` names only the applicable kinds. Anchors of every
+  other kind must still be accounted for, and may appear only in
+  `notInReachConstructs`. An applicable anchor may be ruled out only with code
+  evidence. A kind the wrapper does not enumerate cannot define a scope; an id
+  repeated inside one list is refused rather than
+  quietly deduplicated - including when the repeat is hidden inside overlapping
+  ranges - because collapsing it would let a short list impersonate an exact
+  cover;
+- the row's `status` is **derived from the verdicts**: `unknown` if any anchor
+  is undecided, else `violation` if any anchor violates, else `notApplicable`
+  if none was weighed, else `compliant`. Where the model's own `status`
+  disagrees, the anchors decide and the disagreement is recorded. This is what
+  stops one chosen method standing in for a rule;
+- a row that declares `scope: none` while constructs exist, or that puts every
+  anchor in its scope out of reach, may only be `notApplicable` or `unknown` -
+  a `compliant` row that weighed nothing is an answer about nothing;
+- a row whose linked candidate is anchored outside every construct it called
+  violating is degraded: a row about one place cannot account for a finding
+  about another. The anchor may fall anywhere inside the construct's
+  `line`..`endLine` span, because a comment about a multi-line call belongs on
+  the offending argument rather than on the line the call opens on;
+- a candidate whose rule has no row is reported as unaccounted.
+
+Any of those makes the accounting incomplete, and the preview says so. It never
+silently annotates and continues.
+
+The accounting is deliberately powerless. It cannot create a finding, widen one,
+or bypass cross-verification: only `candidates[]` produces comment text, and
+every candidate still has to satisfy every rule it already did. A row that
+claims a `violation` with no emitted candidate is recorded through the existing
+`withheld` list under `accountedNotEmitted` - one channel, not two, because two
+lists that both mean "nearly a finding" is where a later edit promotes one.
+Sibling evidence describes unchanged code and can never be the subject of a
+candidate or the anchor of a row.
+
+Local practice does not repeal a transported rule. Code that breaks a rule its
+unchanged neighbours also break is still a violation; what the precedent changes
+is severity, confidence, and whether the finding is worth a comment - not the
+row's status. Otherwise the most-broken rule in a repository is the one that
+reports cleanest, which is the opposite of what an operator asked for when they
+transported it.
+
+The anchor ids are deterministic and are the wrapper's own: the changed files,
+ordinally sorted, from the change set it delivered, and the changed constructs
+enumerated from them. Pattern hints for particular rule shapes are deliberately
+**not** generated. They would steer the model toward exactly the categories the
+hint generator enumerates, so measured recall would become a property of that
+generator rather than of the specialist - which is the opposite of calibration.
+Construct enumeration is the boundary: it says a call spans four lines and its
+last argument is positional; it never says that is wrong.
+
+### One reading is not a verdict
+
+A row's status is one model's reading of the frozen input. Replayed again, the
+same rule can read differently. `tools/Compare-ReviewerReplayRuns.ps1` compares
+sealed runs of an identical binding and collapses anything they disagree about
+to `unknown`, withholding any candidate that not every run proposed. There is no
+majority vote: see `docs/replay-snapshots.md`.

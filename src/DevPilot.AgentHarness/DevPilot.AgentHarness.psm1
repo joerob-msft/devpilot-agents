@@ -32,6 +32,15 @@ $ErrorActionPreference = "Stop"
 # takes exactly one separate following argv entry. "auto" is intentionally
 # excluded: agents want reproducible behavior, and "auto" is non-deterministic.
 # Update ONLY this array when Copilot CLI adds/retires a model.
+#
+# ORDERING IS PART OF THE CONTRACT: within each family the entries are listed
+# NEWEST FIRST. Get-AgentGeneralistModelPair derives the current independent
+# generalist pairing from that order, so retiring a model or adding its
+# successor here is the ONE edit that moves every consumer - the reviewer's
+# startup validation, its sealed-decision re-verification, and the offline
+# qualification wrapper - at the same time. Nothing downstream may name a
+# version of its own; that is precisely how a wrapper ends up asking for a
+# model the agent no longer accepts.
 # ---------------------------------------------------------------------------
 $script:AgentHarnessSupportedModels = @(
     "claude-sonnet-5",
@@ -57,12 +66,88 @@ $script:AgentHarnessSupportedModels = @(
 )
 $script:AgentHarnessDefaultModelSentinel = "copilot-cli-default"
 
+# The two families an independent generalist cross-check is drawn from, and
+# what disqualifies a member of each. Small/specialized variants are excluded
+# by name-shape rather than by listing survivors, so a new "-mini" or "-codex"
+# entry cannot quietly become a generalist by being added to the registry.
+$script:AgentHarnessGeneralistFamilies = @(
+    [ordered]@{ Family = "claude-opus"; Include = '^claude-opus-'; Exclude = '(?:-mini|-codex|-flash|-haiku)' },
+    [ordered]@{ Family = "gpt"; Include = '^gpt-'; Exclude = '(?:-mini|-codex|-flash)' }
+)
+
 function Get-AgentSupportedModels {
     return , @($script:AgentHarnessSupportedModels)
 }
 
 function Get-AgentDefaultModelSentinel {
     return $script:AgentHarnessDefaultModelSentinel
+}
+
+function Get-AgentGeneralistModelPair {
+    <#
+        THE single source of truth for "which two models is an independent
+        two-pass generalist review made of".
+
+        Derived from the supported-model registry above rather than declared
+        separately, because a second declaration is a second thing to forget:
+        the defect this closes is a qualification wrapper that named
+        claude-opus-4.8 while the agent's startup validation required
+        claude-opus-5, so every slot died before a model was ever launched.
+        With the pair derived, a registry edit moves the agent and every
+        wrapper together and a stale version cannot be written down anywhere.
+
+        Returns the ordered pair (first pass, second pass) plus the sorted
+        '|'-joined key the reviewer seals into a decision as
+        `generalistPassModels`, so callers never re-derive that string either.
+    #>
+    param([string[]]$SupportedModels)
+
+    $allowed = if ($SupportedModels -and @($SupportedModels).Count -gt 0) {
+        @($SupportedModels)
+    }
+    else { @($script:AgentHarnessSupportedModels) }
+
+    $selected = @(foreach ($family in $script:AgentHarnessGeneralistFamilies) {
+            $candidate = @($allowed | Where-Object {
+                    $_ -cmatch $family.Include -and $_ -cnotmatch $family.Exclude
+                }) | Select-Object -First 1
+            if (-not $candidate) {
+                throw ("The supported-model registry carries no '$($family.Family)' generalist. An independent " +
+                    "two-pass review needs one model from each family; add the current one to " +
+                    "`$script:AgentHarnessSupportedModels, newest first.")
+            }
+            [string]$candidate
+        })
+    if ($selected.Count -ne 2 -or $selected[0] -ceq $selected[1]) {
+        throw "The derived generalist pairing is not two distinct models: $($selected -join ', ')."
+    }
+    foreach ($model in $selected) {
+        [void](Assert-AgentSupportedModel -ModelId $model -SupportedModels $allowed -Where "derived generalist pairing")
+    }
+    return [ordered]@{
+        First  = $selected[0]
+        Second = $selected[1]
+        Models = [string[]]@($selected)
+        # Sorted, '|'-joined - the exact shape sealed into a gate decision's
+        # generalistPassModels and re-verified on promotion.
+        SortedKey = (@($selected) | Sort-Object) -join '|'
+    }
+}
+
+function Test-AgentGeneralistModelPair {
+    <#
+        True only when the supplied models are exactly the derived pairing -
+        both members, no third model, no repeat. Case-sensitive, because a
+        model id is an exact argv token.
+    #>
+    param(
+        [AllowNull()][AllowEmptyCollection()][string[]]$Models,
+        [string[]]$SupportedModels
+    )
+    $pair = Get-AgentGeneralistModelPair -SupportedModels $SupportedModels
+    $supplied = @(@($Models) | Where-Object { $_ })
+    if ($supplied.Count -ne 2) { return $false }
+    return ((@($supplied) | Sort-Object) -join '|') -ceq $pair.SortedKey
 }
 
 function Assert-AgentSupportedModel {
@@ -449,7 +534,7 @@ function Get-AgentCopilotArgs {
         $engineArgs += @("--model", $validated)
     }
     if ($ResumeSessionId) {
-        if ($ResumeSessionId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        if ($ResumeSessionId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z') {
             throw "Get-AgentCopilotArgs: -ResumeSessionId '$ResumeSessionId' is not a valid session GUID."
         }
         $engineArgs += @("--resume", $ResumeSessionId)
@@ -615,10 +700,9 @@ function ConvertTo-AgentMarkerFieldValue {
         [int]$Depth = 0
     )
     $bad = @{ Ok = $false; Value = $null }
-    # objectArray may not contain objectArray. Bounding the nesting keeps the
-    # validator's cost linear in the payload and stops a crafted marker from
-    # driving deep recursion.
-    if ($Depth -gt 1) { return $bad }
+    # A top-level array may contain exact objects with scalar fields. Bounding
+    # the nesting still rejects recursive object/array structures.
+    if ($Depth -gt 2) { return $bad }
 
     switch ([string]$Spec.Type) {
         "int" {
@@ -626,7 +710,7 @@ function ConvertTo-AgentMarkerFieldValue {
             return @{ Ok = $true; Value = [int]$Value }
         }
         "guid" {
-            if ($Value -isnot [string] -or $Value -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { return $bad }
+            if ($Value -isnot [string] -or $Value -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z') { return $bad }
             return @{ Ok = $true; Value = [string]$Value }
         }
         "exact" {
@@ -634,12 +718,12 @@ function ConvertTo-AgentMarkerFieldValue {
             return @{ Ok = $true; Value = [string]$Value }
         }
         "hex" {
-            if ($Value -isnot [string] -or $Value -notmatch "^[0-9a-fA-F]{$([int]$Spec.Length)}$") { return $bad }
+            if ($Value -isnot [string] -or $Value -notmatch "^[0-9a-fA-F]{$([int]$Spec.Length)}\z") { return $bad }
             return @{ Ok = $true; Value = [string]$Value }
         }
         "hexOrNull" {
             if ($null -eq $Value) { return @{ Ok = $true; Value = $null } }
-            if ($Value -is [string] -and $Value -match "^[0-9a-fA-F]{$([int]$Spec.Length)}$") { return @{ Ok = $true; Value = [string]$Value } }
+            if ($Value -is [string] -and $Value -match "^[0-9a-fA-F]{$([int]$Spec.Length)}\z") { return @{ Ok = $true; Value = [string]$Value } }
             return $bad
         }
         "enum" {
@@ -658,18 +742,69 @@ function ConvertTo-AgentMarkerFieldValue {
             # Tab and newline are allowed only when the schema opts in.
             if ($Value -isnot [string]) { return $bad }
             $text = [string]$Value
+            if ($Spec.ContainsKey('NormalizeTypography') -and [bool]$Spec.NormalizeTypography) {
+                # A fixed, meaning-preserving transliteration of the typographic
+                # characters a model reaches for without thinking. Markers have
+                # been lost whole - candidates, accounting and all - over a
+                # single em dash inside an otherwise perfect sentence.
+                #
+                # This is not a relaxation of the ASCII rule. The rule exists so
+                # that text destined for a comment cannot carry structure or
+                # controls, and every one of these maps to the character a
+                # reader would have read anyway. Anything NOT in this table is
+                # still rejected, and so is every control character.
+                $text = $text.
+                Replace([string][char]0x2018, "'").Replace([string][char]0x2019, "'").
+                Replace([string][char]0x201A, "'").Replace([string][char]0x201B, "'").
+                Replace([string][char]0x201C, '"').Replace([string][char]0x201D, '"').
+                Replace([string][char]0x201E, '"').Replace([string][char]0x201F, '"').
+                Replace([string][char]0x2010, "-").Replace([string][char]0x2011, "-").
+                Replace([string][char]0x2012, "-").Replace([string][char]0x2013, "-").
+                Replace([string][char]0x2014, "-").Replace([string][char]0x2015, "-").
+                Replace([string][char]0x2026, "...").Replace([string][char]0x00A0, " ").
+                Replace([string][char]0x2032, "'").Replace([string][char]0x2033, '"').
+                Replace([string][char]0x00AB, '"').Replace([string][char]0x00BB, '"')
+            }
             $max = if ($Spec.ContainsKey('MaxLength')) { [int]$Spec.MaxLength } else { 1000 }
-            if ($text.Length -gt $max) { return $bad }
-            if (-not ($Spec.ContainsKey('AllowEmpty') -and [bool]$Spec.AllowEmpty) -and $text.Trim() -eq "") { return $bad }
+            # Keep the text as it arrived: the control-character scan and the
+            # pattern are checked against this, not against a shortened copy.
+            $original = $text
+            if ($text.Length -gt $max) {
+                # A field may opt into being SHORTENED rather than rejected. Only
+                # fields that never become external text may do so: a comment
+                # body must be exactly what the model wrote or nothing at all.
+                # For a reporting field, though, rejecting the whole marker over
+                # a long sentence throws away every finding the marker carries -
+                # the report destroying the thing it reports on. Twice now a
+                # complete accounting was lost that way.
+                if (-not ($Spec.ContainsKey('Truncate') -and [bool]$Spec.Truncate)) { return $bad }
+                if ($max -le 3) { return $bad }
+                $cut = $max - 3
+                # Never cut between a surrogate pair. A lone half is not a
+                # control character and has no pattern to fail, so it survives
+                # validation and then throws when the preview is written as
+                # strict UTF-8 - losing the whole pass to the very mechanism
+                # added to stop passes being lost.
+                if ($cut -gt 0 -and [char]::IsHighSurrogate($text[$cut - 1])) { $cut-- }
+                $text = $text.Substring(0, $cut) + "..."
+            }
+            # Against the ORIGINAL, like the control-character scan and the
+            # pattern below. Checked after truncation, a field of four hundred
+            # spaces becomes "..." and passes as non-empty.
+            if (-not ($Spec.ContainsKey('AllowEmpty') -and [bool]$Spec.AllowEmpty) -and $original.Trim() -eq "") { return $bad }
             $allowNewlines = ($Spec.ContainsKey('AllowNewlines') -and [bool]$Spec.AllowNewlines)
-            foreach ($ch in $text.ToCharArray()) {
+            foreach ($ch in $original.ToCharArray()) {
                 if ([char]::IsControl($ch)) {
                     if ($allowNewlines -and ($ch -eq "`n" -or $ch -eq "`r" -or $ch -eq "`t")) { continue }
                     return $bad
                 }
             }
             if ($Spec.ContainsKey('Pattern') -and $Spec.Pattern) {
-                if ($text -notmatch [string]$Spec.Pattern) { return $bad }
+                # Against the ORIGINAL, not the shortened text. Checking the cut
+                # version would accept a string whose only violation happened to
+                # sit past the cut, which is a pattern that does not mean what
+                # it says.
+                if ($original -notmatch [string]$Spec.Pattern) { return $bad }
             }
             return @{ Ok = $true; Value = $text }
         }
@@ -712,6 +847,30 @@ function ConvertTo-AgentMarkerFieldValue {
                 [void]$out.Add($record)
             }
             return @{ Ok = $true; Value = $out.ToArray() }
+        }
+        "object" {
+            if ($Value -isnot [System.Management.Automation.PSCustomObject]) { return $bad }
+            if (-not $Spec.ContainsKey('Schema')) { return $bad }
+            $objectSchema = $Spec.Schema
+            if ($objectSchema -isnot [hashtable] -or
+                -not $objectSchema.ContainsKey('Keys') -or
+                -not $objectSchema.ContainsKey('Fields')) {
+                return $bad
+            }
+            $objectKeys = @($objectSchema.Keys)
+            $valueKeys = @($Value.PSObject.Properties | ForEach-Object { $_.Name })
+            foreach ($name in $valueKeys) { if ($objectKeys -notcontains $name) { return $bad } }
+            foreach ($name in $objectKeys) { if (-not $Value.PSObject.Properties[$name]) { return $bad } }
+            $record = @{}
+            foreach ($name in $objectKeys) {
+                $fieldSpec = $objectSchema.Fields[$name]
+                if ($null -eq $fieldSpec) { return $bad }
+                $converted = ConvertTo-AgentMarkerFieldValue -Spec $fieldSpec `
+                    -Value $Value.PSObject.Properties[$name].Value -Depth ($Depth + 1)
+                if (-not $converted.Ok) { return $bad }
+                $record[$name] = $converted.Value
+            }
+            return @{ Ok = $true; Value = $record }
         }
         default { return $bad }
     }
@@ -758,80 +917,148 @@ function ConvertTo-AgentCanonicalMarkerJson {
     throw "Marker payload contained an unsupported JSON type."
 }
 
-function ConvertFrom-AgentResultMarker {
+# ---------------------------------------------------------------------------
+# Result-marker extraction budget (shared by extraction AND schema sizing).
+#
+# The scan window is expressed in CHARACTERS because the brace-matching scan
+# below indexes $StdOutText by UTF-16 code unit. Sharing ONE budget between the
+# extraction scan and the worst-case schema sizing (Measure-AgentMarkerSchema
+# WorstCaseChars) is what lets a caller PROVE, before it ever launches a model,
+# that the largest object its declared schema can legally produce still fits the
+# window the extractor will scan - or fail closed at startup if it cannot.
+# ---------------------------------------------------------------------------
+$script:AgentMarkerScanWindowChars = 65536   # per-anchor brace-scan window
+$script:AgentMarkerMaxPrefixScans = 20000    # bare-prefix occurrences examined
+$script:AgentMarkerMaxExaminedPayloads = 512 # payload-bearing anchors examined
+$script:AgentMarkerMaxRetainedCandidates = 16
+
+# Typed extraction outcome status values. A caller uses these to decide, with no
+# prose matching, whether a failed extraction is a retryable result-EMISSION
+# slip (retry with a fresh nonce) or a terminal rejection (never retried).
+$script:AgentMarkerStatus = @{
+    Success         = 'success'         # a single schema-valid, bound marker
+    MissingMarker   = 'missingMarker'   # no prefixed line carried a payload
+    MalformedMarker = 'malformedMarker' # a payload was present but not JSON
+    NonObject       = 'nonObject'       # the JSON payload was an array/scalar
+    Truncated       = 'truncated'       # the object never closed within window
+    Overflow        = 'overflow'        # too many carrying-the-nonce occurrences
+    SchemaInvalid   = 'schemaInvalid'   # parsed object failed the typed schema
+    WrongBinding    = 'wrongBinding'    # an exact field carried the wrong value
+    AmbiguousMarker = 'ambiguousMarker' # two occurrences meant different things
+}
+
+function Test-AgentMarkerStatusRetryable {
     <#
-        Parses a single strict `<PREFIX>: <json>` result line as HOSTILE input.
-        All body logic is wrapped in one try/catch; any invalid condition
-        returns $null (fail closed). Enforces, in order:
-          - exactly one non-blank line starts with $MarkerPrefix, and it is the
-            FINAL non-blank line, byte-identical to that single prefixed line;
-          - the JSON payload is exactly one object (never array/scalar);
-          - top-level keys are EXACTLY the schema's key set (no extra, none
-            missing);
-          - each field validates against its typed schema entry (strict int
-            typing, exact-format GUID, case-sensitive string/enum/nonce
-            equality, fixed-length hex, nullable hex, bounded control-character
-            -free text, and bounded arrays of flat objects).
+        A result-EMISSION failure - the model did the work but did not frame the
+        answer the wrapper can read - is worth exactly one fresh-nonce retry. A
+        marker that carries the WRONG binding (an exact field echoed with the
+        wrong value, e.g. a replayed nonce) is not: a second attempt would not
+        change what the model chose to bind to, and retrying it is how a replay
+        would be handed extra tries. Process/timeout/environment failures are
+        classified by the caller, not here.
+    #>
+    param([Parameter(Mandatory)][string]$Status)
+    switch ($Status) {
+        'success' { return $false }
+        'wrongBinding' { return $false }
+        'missingMarker' { return $true }
+        'malformedMarker' { return $true }
+        'nonObject' { return $true }
+        'truncated' { return $true }
+        'overflow' { return $true }
+        'schemaInvalid' { return $true }
+        'ambiguousMarker' { return $true }
+        default { return $false }
+    }
+}
+
+function Get-AgentResultMarkerOutcome {
+    <#
+        Typed core of result-marker extraction. Parses a single strict
+        `<PREFIX>: <json>` result line as HOSTILE input and returns a typed
+        outcome instead of a bare object/$null, so a caller can tell a missing
+        marker from a malformed one from a schema-invalid one from a
+        wrong-binding one and act (retry/accounting) deterministically.
+
+        Returns a hashtable:
+          @{
+            Status    = one of $script:AgentMarkerStatus values
+            Value     = parsed marker hashtable (only when Status -eq 'success')
+            Field     = offending field name for schemaInvalid/wrongBinding, or $null
+            Retryable = [bool] (see Test-AgentMarkerStatusRetryable)
+            Reason    = short human string
+          }
+
+        Behaviour is byte-for-byte identical to the historical
+        ConvertFrom-AgentResultMarker for the accept/reject decision: the same
+        anchors are scanned, the same candidates are collected, the same
+        canonical-agreement and schema checks run in the same order. The ONLY
+        addition is that each fail-closed exit now records WHY. A schema-invalid
+        or wrong-binding occurrence is still DROPPED as a candidate (never a
+        veto), so a later valid marker still wins - the typed reason is reported
+        only when no valid marker exists.
 
         $Schema = @{
             Keys   = @(<ordered allowed/required key names>)
-            Fields = @{ <name> = @{ Type = 'int'|'guid'|'exact'|'hex'|'hexOrNull'|'enum'|'bool'|'string'|'objectArray'; ... } }
+            Fields = @{ <name> = @{ Type = 'int'|'guid'|'exact'|'hex'|'hexOrNull'|'enum'|'bool'|'string'|'object'|'objectArray'; ... } }
         }
-
-        'string'      = @{ MaxLength = <int>; AllowEmpty = <bool>; AllowNewlines = <bool>; Pattern = <regex> }
-        'objectArray' = @{ MaxItems = <int>; Item = @{ Keys = @(...); Fields = @{...} } }
-
-        'objectArray' exists so an agent can return STRUCTURED results that the
-        wrapper acts on itself. That is what lets a wrapper own every write
-        instead of handing the model a write tool: the model reports findings,
-        the schema bounds them, and the wrapper decides what to do with them.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
         [Parameter(Mandatory)][string]$MarkerPrefix,
-        [Parameter(Mandatory)][hashtable]$Schema
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars
     )
+    $mk = {
+        param([string]$Status, $Value, $Field, [string]$Reason)
+        return @{
+            Status    = $Status
+            Value     = $Value
+            Field     = $Field
+            Retryable = (Test-AgentMarkerStatusRetryable -Status $Status)
+            Reason    = $Reason
+        }
+    }
     try {
-        if ([string]::IsNullOrWhiteSpace($StdOutText)) { return $null }
+        if ($ScanWindowChars -lt 2) { $ScanWindowChars = $script:AgentMarkerScanWindowChars }
+        if ([string]::IsNullOrWhiteSpace($StdOutText)) {
+            return (& $mk $script:AgentMarkerStatus.MissingMarker $null $null "No output was produced.")
+        }
 
-        # Copilot's stdout framing does NOT guarantee the marker sits alone on
-        # the final line: a following message can be concatenated onto the same
-        # line without a newline, and the model may restate the marker in a
-        # closing summary turn. Both happen in practice, and the earlier
-        # "exactly one prefixed line, and it must be last" rule rejected those
-        # cycles even though the work had completed correctly.
-        #
-        # Extract EVERY marker occurrence by brace-matching the JSON that
-        # follows it, then require every occurrence to MEAN the same thing.
-        # Comparison is canonical rather than byte-for-byte, because a model
-        # that prints a pretty, fenced copy in its closing summary and a
-        # compact copy on the final line has emitted one result, not two. The
-        # anti-injection property survives:
-        #   - two markers that genuinely differ still fail closed;
-        #   - a marker the model never produced cannot match the expected
-        #     nonce, which is generated per cycle AFTER the PR content was
-        #     authored.
+        # The strongest diagnostic seen while collecting candidates, reported
+        # only if no valid candidate survives. Higher rank = more informative /
+        # more terminal, so a definite wrong-binding signal is surfaced ahead of
+        # a mere "the payload did not parse". Held in FUNCTION-LOCAL state (a
+        # hashtable the $note closure mutates by member, never reassigns) so the
+        # parse is reentrant and leaves no module-global residue.
+        $rankOf = {
+            param([string]$s)
+            switch ($s) {
+                'wrongBinding' { return 6 }
+                'schemaInvalid' { return 5 }
+                'nonObject' { return 4 }
+                'truncated' { return 3 }
+                'malformedMarker' { return 2 }
+                'missingMarker' { return 1 }
+                default { return 0 }
+            }
+        }
+        $best = @{ Rank = -1; Status = $null; Field = $null }
+        $note = {
+            param([string]$Status, $Field)
+            $r = (& $rankOf $Status)
+            if ($r -gt $best.Rank) {
+                $best.Rank = $r
+                $best.Status = $Status
+                $best.Field = $Field
+            }
+        }
+
         $parsedCandidates = New-Object System.Collections.Generic.List[object]
         $quoteChar = [char]'"'
         $escapeChar = [char]'\'
         $openBrace = [char]'{'
         $closeBrace = [char]'}'
-        # Anchored to a line start. Matching the prefix ANYWHERE would let a
-        # finding that quotes attacker-planted source such as
-        # "// REVIEWER_RESULT_V1: {...}" manufacture a second, different
-        # candidate and fail the whole review closed - an author-controlled
-        # kill switch on being reviewed. Leading whitespace and trailing text
-        # on the same line stay tolerated, which is what the relaxation was
-        # for in the first place.
-        #
-        # Filtering happens DURING collection, not after it. An occurrence that
-        # does not parse, has no JSON after the prefix, or does not carry the
-        # schema's exact-valued fields is simply not a candidate - it is text
-        # that happens to look like one. Treating any of those as a global veto
-        # reopened the same kill switch by a different door: the wrapper now
-        # injects raw pull-request lines into the model's context and asks it to
-        # quote evidence, so a planted "<PREFIX>: not json" echoed at a line
-        # start would discard a complete, valid review.
         $exactFields = @($Schema.Keys | Where-Object {
                 $spec = $Schema.Fields[$_]
                 $null -ne $spec -and [string]$spec.Type -ceq 'exact'
@@ -840,55 +1067,25 @@ function ConvertFrom-AgentResultMarker {
         $scanned = 0
         $examined = 0
         foreach ($anchor in [regex]::Matches($StdOutText, $anchorPattern)) {
-            # Bounded scan: a transcript carrying an implausible number of
-            # prefix occurrences is an attack surface, not a formatting quirk.
-            # The outer bound is deliberately far above any plausible transcript
-            # because a bare prefix line costs one IndexOf and nothing else; the
-            # tight bounds are the payload-examination cap below and the
-            # retained-candidate cap further down.
             $scanned++
-            if ($scanned -gt 200000) {
-                Write-Verbose "Result-marker scan stopped after $scanned prefix occurrence(s); a marker beyond that point is not seen."
+            if ($scanned -gt $script:AgentMarkerMaxPrefixScans) {
+                Write-Verbose "Result-marker scan stopped after $scanned prefix occurrence(s)."
                 break
             }
             $hit = $anchor.Index
-            # The opening brace must be on the anchor's OWN line. Searching the
-            # whole remaining transcript let a planted prefix line carrying no
-            # brace reach forward and adopt the JSON of a genuine marker further
-            # down: sixteen such lines filled the retained-candidate cap with
-            # duplicates of the real marker, and the duplicate-marker rule then
-            # discarded a complete, correct review.
             $lineEnd = $StdOutText.IndexOf("`n", $hit, [StringComparison]::Ordinal)
             if ($lineEnd -lt 0) { $lineEnd = $StdOutText.Length }
-            # Two-argument IndexOf would scan to the end of the transcript on
-            # every anchor that has no brace at all, which a hostile transcript
-            # can make quadratic - measured at 14 seconds on 8 MB. The (char,
-            # int, int) count overload bounds it to this anchor's own line. The
-            # anchor pattern cannot match a newline, so the count is never
-            # negative. Passing a StringComparison here instead would ALSO bind
-            # this overload and coerce the enum to 4, searching four characters
-            # and discarding every marker with a longer lead-in.
             $searchStart = $hit + $anchor.Length
             if ($searchStart -ge $lineEnd) { continue }
             $jsonStart = $StdOutText.IndexOf($openBrace, $searchStart, $lineEnd - $searchStart)
             if ($jsonStart -lt 0) { continue }
-            # Only an anchor that really could carry a payload costs scan budget.
-            # Counting the ones discarded here made a review killable by quoting
-            # enough bare prefix lines, which is free for an attacker.
             $examined++
-            if ($examined -gt 512) { break }
-            # Bounded brace-depth scan. String contents are respected so a brace
-            # inside a JSON string value cannot terminate the object early.
-            # The bound is generous rather than tight because a marker carrying
-            # an objectArray of findings is legitimately tens of KB; the schema
-            # (MaxItems / MaxLength) is what actually constrains the payload,
-            # while this bound only stops an unterminated brace from scanning an
-            # entire multi-megabyte transcript.
+            if ($examined -gt $script:AgentMarkerMaxExaminedPayloads) { break }
             $depth = 0
             $inString = $false
             $escaped = $false
             $jsonEnd = -1
-            $limit = [Math]::Min($StdOutText.Length, $jsonStart + 65536)
+            $limit = [Math]::Min($StdOutText.Length, $jsonStart + $ScanWindowChars)
             for ($i = $jsonStart; $i -lt $limit; $i++) {
                 $ch = $StdOutText[$i]
                 if ($inString) {
@@ -904,17 +1101,41 @@ function ConvertFrom-AgentResultMarker {
                     if ($depth -eq 0) { $jsonEnd = $i; break }
                 }
             }
-            if ($jsonEnd -lt 0) { continue }
+            if ($jsonEnd -lt 0) {
+                # The object never closed inside the window: either it was cut
+                # off (truncated) or an over-long/over-nested payload overflowed
+                # the bounded scan. Both are the same fail-closed exit.
+                & $note $script:AgentMarkerStatus.Truncated $null
+                continue
+            }
             $parsed = $null
             try { $parsed = $StdOutText.Substring($jsonStart, $jsonEnd - $jsonStart + 1) | ConvertFrom-Json -ErrorAction Stop }
-            catch { continue }
-            if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { continue }
+            catch {
+                & $note $script:AgentMarkerStatus.MalformedMarker $null
+                continue
+            }
+            if ($parsed -isnot [System.Management.Automation.PSCustomObject]) {
+                & $note $script:AgentMarkerStatus.NonObject $null
+                continue
+            }
             if ($exactFields.Count -gt 0) {
                 $bound = $true
                 foreach ($name in $exactFields) {
                     $property = $parsed.PSObject.Properties[$name]
-                    if ($null -eq $property -or $property.Value -isnot [string] -or
-                        [string]$property.Value -cne [string]$Schema.Fields[$name].Expected) {
+                    if ($null -eq $property -or $property.Value -isnot [string]) {
+                        # The binding field is absent or not even a string: the
+                        # model failed to EMIT it. That is a schema-shape slip,
+                        # not evidence of a marker bound to the wrong work, so it
+                        # is retryable with a fresh nonce.
+                        & $note $script:AgentMarkerStatus.SchemaInvalid $name
+                        $bound = $false
+                        break
+                    }
+                    if ([string]$property.Value -cne [string]$Schema.Fields[$name].Expected) {
+                        # The field is present but carries the WRONG value (a
+                        # replayed or invented nonce, a foreign project). Never
+                        # retried.
+                        & $note $script:AgentMarkerStatus.WrongBinding $name
                         $bound = $false
                         break
                     }
@@ -922,16 +1143,26 @@ function ConvertFrom-AgentResultMarker {
                 if (-not $bound) { continue }
             }
             [void]$parsedCandidates.Add($parsed)
-            # More than a handful of occurrences that all carry this cycle's
-            # nonce is not a formatting quirk either.
-            if ($parsedCandidates.Count -gt 16) { return $null }
+            if ($parsedCandidates.Count -gt $script:AgentMarkerMaxRetainedCandidates) {
+                return (& $mk $script:AgentMarkerStatus.Overflow $null $null `
+                        "More than $script:AgentMarkerMaxRetainedCandidates marker occurrences carried this cycle's nonce.")
+            }
         }
-        if ($parsedCandidates.Count -eq 0) { return $null }
-        # Every surviving occurrence must MEAN the same thing. Whitespace and
-        # key order may differ - a fenced, pretty-printed restatement of the
-        # same result is the same result - but any semantic difference between
-        # two markers that both carry this cycle's nonce fails closed.
+        if ($parsedCandidates.Count -eq 0) {
+            $status = if ($best.Status) { $best.Status } else { $script:AgentMarkerStatus.MissingMarker }
+            $field = $best.Field
+            $reason = switch ($status) {
+                'wrongBinding' { "A marker echoed the wrong '$field' value." }
+                'schemaInvalid' { "A marker omitted or malformed the required '$field' field." }
+                'nonObject' { "The marker payload was not a JSON object." }
+                'truncated' { "The marker payload did not close inside the $ScanWindowChars-character scan window." }
+                'malformedMarker' { "A marker prefix was present but its payload was not valid JSON." }
+                default { "No valid result marker was found." }
+            }
+            return (& $mk $status $null $field $reason)
+        }
 
+        # Every surviving occurrence must MEAN the same thing.
         $obj = $null
         $canonical = $null
         foreach ($parsed in $parsedCandidates) {
@@ -941,31 +1172,288 @@ function ConvertFrom-AgentResultMarker {
                 $obj = $parsed
                 continue
             }
-            if ($parsedCanonical -cne $canonical) { return $null }
+            if ($parsedCanonical -cne $canonical) {
+                return (& $mk $script:AgentMarkerStatus.AmbiguousMarker $null $null `
+                        "Two marker occurrences carried this cycle's nonce but disagreed.")
+            }
         }
-        if ($obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+        if ($obj -isnot [System.Management.Automation.PSCustomObject]) {
+            return (& $mk $script:AgentMarkerStatus.NonObject $null $null "The marker payload was not a JSON object.")
+        }
 
         $allowedKeys = @($Schema.Keys)
         $actualKeys = @($obj.PSObject.Properties | ForEach-Object { $_.Name })
         foreach ($name in $actualKeys) {
-            if ($allowedKeys -notcontains $name) { return $null }
+            if ($allowedKeys -notcontains $name) {
+                return (& $mk $script:AgentMarkerStatus.SchemaInvalid $null $name "The marker carried an unexpected key '$name'.")
+            }
         }
         foreach ($name in $allowedKeys) {
-            if (-not $obj.PSObject.Properties[$name]) { return $null }
+            if (-not $obj.PSObject.Properties[$name]) {
+                return (& $mk $script:AgentMarkerStatus.SchemaInvalid $null $name "The marker omitted the required key '$name'.")
+            }
         }
 
         $out = @{}
         foreach ($name in $allowedKeys) {
             $spec = $Schema.Fields[$name]
-            if ($null -eq $spec) { return $null }
+            if ($null -eq $spec) {
+                return (& $mk $script:AgentMarkerStatus.SchemaInvalid $null $name "The schema declared no rule for key '$name'.")
+            }
             $converted = ConvertTo-AgentMarkerFieldValue -Spec $spec -Value $obj.PSObject.Properties[$name].Value
-            if (-not $converted.Ok) { return $null }
+            if (-not $converted.Ok) {
+                # A present-but-wrong exact field is a wrong binding; every other
+                # field failure is a schema-shape failure.
+                $status = if ([string]$spec.Type -ceq 'exact') { $script:AgentMarkerStatus.WrongBinding } else { $script:AgentMarkerStatus.SchemaInvalid }
+                return (& $mk $status $null $name "The marker field '$name' failed its typed schema rule.")
+            }
             $out[$name] = $converted.Value
         }
-        return $out
+        return (& $mk $script:AgentMarkerStatus.Success $out $null "")
     }
     catch {
-        return $null
+        return (& $mk $script:AgentMarkerStatus.MalformedMarker $null $null "The marker could not be parsed: $($_.Exception.Message)")
+    }
+}
+
+function ConvertFrom-AgentResultMarker {
+    <#
+        Compatibility wrapper preserved for every existing caller: returns the
+        parsed marker hashtable on success and $null on any fail-closed
+        condition, exactly as before. New callers that need to distinguish
+        WHY extraction failed (for retry/accounting) use
+        ConvertFrom-AgentResultMarkerOutcome instead. Both share one
+        implementation (Get-AgentResultMarkerOutcome) so the accept/reject
+        decision can never drift between them.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
+        [Parameter(Mandatory)][string]$MarkerPrefix,
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars
+    )
+    $outcome = Get-AgentResultMarkerOutcome -StdOutText $StdOutText -MarkerPrefix $MarkerPrefix `
+        -Schema $Schema -ScanWindowChars $ScanWindowChars
+    if ($outcome.Status -ceq $script:AgentMarkerStatus.Success) { return $outcome.Value }
+    return $null
+}
+
+function ConvertFrom-AgentResultMarkerOutcome {
+    <#
+        Public typed extraction entry point. Identical parse to
+        ConvertFrom-AgentResultMarker but returns the full typed outcome
+        (Status/Value/Field/Retryable/Reason). See Get-AgentResultMarkerOutcome.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
+        [Parameter(Mandatory)][string]$MarkerPrefix,
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars
+    )
+    return Get-AgentResultMarkerOutcome -StdOutText $StdOutText -MarkerPrefix $MarkerPrefix `
+        -Schema $Schema -ScanWindowChars $ScanWindowChars
+}
+
+function Measure-AgentMarkerSchemaWorstCaseChars {
+    <#
+        Upper bound, in CHARACTERS, on the compact JSON serialization of the
+        largest object a marker schema can legally produce. Character-based to
+        match the extractor's character-indexed scan window, so the two share
+        one budget: a schema whose worst case exceeds the window has a legal
+        object the extractor could never capture, and the caller can refuse to
+        launch rather than discover it on a real review.
+
+        String fields forbid control characters, so the only in-string
+        expansion is the escaping of `"` and `\` (one char -> two), bounded by
+        MaxLength; hence MaxLength*2 + 2 quotes is a true upper bound per string.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$Depth = 0
+    )
+    if ($Depth -gt 24) { throw "Marker schema exceeded the maximum measurable depth." }
+    $fieldChars = {
+        param([hashtable]$Spec)
+        switch ([string]$Spec.Type) {
+            'int' {
+                $max = if ($Spec.ContainsKey('Max')) { [long]$Spec.Max } else { [long][int]::MaxValue }
+                $min = if ($Spec.ContainsKey('Min')) { [long]$Spec.Min } else { [long][int]::MinValue }
+                $digits = [Math]::Max(([string][Math]::Abs($max)).Length, ([string][Math]::Abs($min)).Length)
+                $sign = if ($min -lt 0) { 1 } else { 0 }
+                return $digits + $sign
+            }
+            'guid' { return 38 }                                  # 36 + 2 quotes
+            'bool' { return 5 }                                   # "false"
+            'hex' { return ([int]$Spec.Length) + 2 }
+            'hexOrNull' { return [Math]::Max((([int]$Spec.Length) + 2), 4) }
+            'exact' { return (ConvertTo-Json -InputObject ([string]$Spec.Expected) -Compress).Length }
+            'enum' {
+                $m = 0
+                foreach ($v in @($Spec.Values)) {
+                    $len = (ConvertTo-Json -InputObject ([string]$v) -Compress).Length
+                    if ($len -gt $m) { $m = $len }
+                }
+                return $m
+            }
+            'string' {
+                $maxLen = if ($Spec.ContainsKey('MaxLength')) { [int]$Spec.MaxLength } else { 0 }
+                return ($maxLen * 2) + 2
+            }
+            'object' {
+                return (Measure-AgentMarkerSchemaWorstCaseChars -Schema ([hashtable]$Spec.Schema) -Depth ($Depth + 1))
+            }
+            'objectArray' {
+                $maxItems = if ($Spec.ContainsKey('MaxItems')) { [int]$Spec.MaxItems } else { 25 }
+                $itemSchema = @{ Keys = @($Spec.Item.Keys); Fields = $Spec.Item.Fields }
+                $itemChars = Measure-AgentMarkerSchemaWorstCaseChars -Schema $itemSchema -Depth ($Depth + 1)
+                # [ ] plus each item and a separating comma.
+                return 2 + ($maxItems * ($itemChars + 1))
+            }
+            default { throw "Cannot size unknown marker field type '$($Spec.Type)'." }
+        }
+    }
+    $total = 2   # the object's own braces
+    $keys = @($Schema.Keys)
+    for ($i = 0; $i -lt $keys.Count; $i++) {
+        $name = [string]$keys[$i]
+        $spec = $Schema.Fields[$name]
+        if ($null -eq $spec) { throw "Schema key '$name' has no field rule." }
+        $keyChars = (ConvertTo-Json -InputObject $name -Compress).Length   # "name"
+        $total += $keyChars + 1 + (& $fieldChars ([hashtable]$spec))       # "name":value
+        if ($i -lt $keys.Count - 1) { $total += 1 }                        # comma
+    }
+    return $total
+}
+
+function Test-AgentMarkerSchemaFitsScanWindow {
+    <#
+        Returns whether the largest legal object a schema can produce still fits
+        the extractor's scan window. A caller asserts Fits before launching a
+        model so a schema/window mismatch fails at startup (deterministically),
+        not on a real review whose complete, valid marker the window would
+        silently truncate.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars,
+        [string]$MarkerPrefix = ""
+    )
+    $worst = Measure-AgentMarkerSchemaWorstCaseChars -Schema $Schema
+    # The extractor scans from the opening brace; the prefix and the single
+    # space before the brace sit OUTSIDE the window, so they do not count here.
+    return [pscustomobject][ordered]@{
+        Fits           = ($worst -le $ScanWindowChars)
+        WorstCaseChars = $worst
+        WindowChars    = $ScanWindowChars
+    }
+}
+
+function Measure-AgentMarkerSchemaWorstCaseBytes {
+    <#
+        Upper bound, in UTF-8 BYTES, on the compact JSON serialization of the
+        largest object a marker schema can legally produce. The char-based
+        Measure-AgentMarkerSchemaWorstCaseChars sizes the extractor's scan
+        window; this sizes the surface's hard output byte cap, which is what a
+        model process is actually bounded by. They differ whenever a string
+        field permits non-ASCII: a JSON string escapes only `"` and `\` (one
+        char -> two ASCII bytes), but an unescaped non-ASCII BMP code unit costs
+        up to THREE UTF-8 bytes. Three bytes per character dominates the doubled
+        escape, so a string field's worst case is MaxLength*3 + 2 quote bytes -
+        conservative regardless of whether a field's pattern happens to forbid
+        non-ASCII. Numeric, guid, hex and boolean literals are ASCII, so their
+        byte cost equals their char cost; exact/enum values are measured as the
+        actual UTF-8 byte length of their JSON.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$Depth = 0
+    )
+    if ($Depth -gt 24) { throw "Marker schema exceeded the maximum measurable depth." }
+    $fieldBytes = {
+        param([hashtable]$Spec)
+        switch ([string]$Spec.Type) {
+            'int' {
+                $max = if ($Spec.ContainsKey('Max')) { [long]$Spec.Max } else { [long][int]::MaxValue }
+                $min = if ($Spec.ContainsKey('Min')) { [long]$Spec.Min } else { [long][int]::MinValue }
+                $digits = [Math]::Max(([string][Math]::Abs($max)).Length, ([string][Math]::Abs($min)).Length)
+                $sign = if ($min -lt 0) { 1 } else { 0 }
+                return $digits + $sign
+            }
+            'guid' { return 38 }
+            'bool' { return 5 }
+            'hex' { return ([int]$Spec.Length) + 2 }
+            'hexOrNull' { return [Math]::Max((([int]$Spec.Length) + 2), 4) }
+            'exact' { return [System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject ([string]$Spec.Expected) -Compress)) }
+            'enum' {
+                $m = 0
+                foreach ($v in @($Spec.Values)) {
+                    $len = [System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject ([string]$v) -Compress))
+                    if ($len -gt $m) { $m = $len }
+                }
+                return $m
+            }
+            'string' {
+                $maxLen = if ($Spec.ContainsKey('MaxLength')) { [int]$Spec.MaxLength } else { 0 }
+                return ($maxLen * 3) + 2
+            }
+            'object' {
+                return (Measure-AgentMarkerSchemaWorstCaseBytes -Schema ([hashtable]$Spec.Schema) -Depth ($Depth + 1))
+            }
+            'objectArray' {
+                $maxItems = if ($Spec.ContainsKey('MaxItems')) { [int]$Spec.MaxItems } else { 25 }
+                $itemSchema = @{ Keys = @($Spec.Item.Keys); Fields = $Spec.Item.Fields }
+                $itemBytes = Measure-AgentMarkerSchemaWorstCaseBytes -Schema $itemSchema -Depth ($Depth + 1)
+                return 2 + ($maxItems * ($itemBytes + 1))
+            }
+            default { throw "Cannot size unknown marker field type '$($Spec.Type)'." }
+        }
+    }
+    $total = 2   # the object's own braces
+    $keys = @($Schema.Keys)
+    for ($i = 0; $i -lt $keys.Count; $i++) {
+        $name = [string]$keys[$i]
+        $spec = $Schema.Fields[$name]
+        if ($null -eq $spec) { throw "Schema key '$name' has no field rule." }
+        $keyBytes = [System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject $name -Compress))   # "name"
+        $total += $keyBytes + 1 + (& $fieldBytes ([hashtable]$spec))                                            # "name":value
+        if ($i -lt $keys.Count - 1) { $total += 1 }                                                            # comma
+    }
+    return $total
+}
+
+function Test-AgentMarkerSchemaFitsLaunchContract {
+    <#
+        A surface's complete result-contract fit check: the largest legal marker
+        the schema can produce must fit BOTH the character scan window the
+        extractor will use AND the surface's hard UTF-8 output byte cap. Callers
+        assert Fits before launching a model, so a schema/window/cap mismatch
+        fails deterministically at startup rather than silently dropping a
+        complete, valid marker on a real review. Returns the measured worst
+        cases so a refusal can name exactly which bound was exceeded.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [Parameter(Mandatory)][int]$ScanWindowChars,
+        [Parameter(Mandatory)][int]$MaxOutputBytes
+    )
+    $worstChars = Measure-AgentMarkerSchemaWorstCaseChars -Schema $Schema
+    $worstBytes = Measure-AgentMarkerSchemaWorstCaseBytes -Schema $Schema
+    $fitsWindow = ($worstChars -le $ScanWindowChars)
+    $fitsCap = ($worstBytes -le $MaxOutputBytes)
+    $reason = $null
+    if (-not $fitsWindow) {
+        $reason = "largest legal marker is $worstChars chars, above the ${ScanWindowChars}-char scan window"
+    }
+    elseif (-not $fitsCap) {
+        $reason = "largest legal marker is $worstBytes bytes, above the ${MaxOutputBytes}-byte output cap"
+    }
+    return [pscustomobject][ordered]@{
+        Fits           = ($fitsWindow -and $fitsCap)
+        WorstCaseChars = $worstChars
+        WorstCaseBytes = $worstBytes
+        ScanWindowChars = $ScanWindowChars
+        MaxOutputBytes = $MaxOutputBytes
+        Reason         = $reason
     }
 }
 
@@ -1057,6 +1545,34 @@ function Set-TimedProcessArguments {
 
 function Stop-ProcessTree {
     param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
+    # A direct child can exit while one of its descendants still owns a copied
+    # stdout/stderr handle. Process.Kill(true) can no longer discover that tree
+    # once the root has exited, but Win32_Process retains each descendant's
+    # ParentProcessId. Snapshot and stop deepest-first before the normal kill
+    # fallbacks so output-drain timeouts do not leave detached pipe holders.
+    if ($IsWindows) {
+        try {
+            $rootStartedAt = $Process.StartTime.ToUniversalTime()
+            $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+            $frontier = @([int]$Process.Id)
+            $descendants = [System.Collections.Generic.List[int]]::new()
+            while ($frontier.Count -gt 0) {
+                $next = [System.Collections.Generic.List[int]]::new()
+                foreach ($candidate in $allProcesses) {
+                    if ($frontier -contains [int]$candidate.ParentProcessId -and
+                        [DateTime]$candidate.CreationDate -ge $rootStartedAt.AddSeconds(-1)) {
+                        [void]$descendants.Add([int]$candidate.ProcessId)
+                        [void]$next.Add([int]$candidate.ProcessId)
+                    }
+                }
+                $frontier = @($next)
+            }
+            for ($index = $descendants.Count - 1; $index -ge 0; $index--) {
+                Stop-Process -Id $descendants[$index] -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {}
+    }
     try { $Process.Kill($true); return } catch {}
     try { & taskkill.exe /PID $Process.Id /T /F 2>$null 1>$null } catch {}
     try { $Process.Kill() } catch {}
@@ -1095,6 +1611,8 @@ function Invoke-TimedProcess {
         [switch]$CaptureStdErr,
         [string]$WorkingDirectory,
         [string[]]$EnvironmentVariablesToRemove = @(),
+        [string]$ProgressPath = "",
+        [ValidateRange(0, 86400)][int]$ProgressTimeoutSeconds = 0,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -1112,7 +1630,10 @@ function Invoke-TimedProcess {
     foreach ($variableName in @($EnvironmentVariablesToRemove)) { [void]$psi.EnvironmentVariables.Remove($variableName) }
     foreach ($variableName in (Get-AgentSessionIsolationEnvVars)) { [void]$psi.EnvironmentVariables.Remove($variableName) }
 
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $startedAtUtc = [DateTime]::UtcNow
+    $deadline = $startedAtUtc.AddSeconds($TimeoutSeconds)
+    $lastProgressUtc = $startedAtUtc
+    $progressObserved = $false
     $proc = $null
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
@@ -1136,20 +1657,64 @@ function Invoke-TimedProcess {
         }
 
         $exited = $false
+        $timeoutReason = ""
         if (-not $timedOut) {
-            $remainingMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-            $exited = $proc.WaitForExit($remainingMs)
-            $timedOut = -not $exited
+            if (-not $ProgressPath -or $ProgressTimeoutSeconds -le 0) {
+                $remainingMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+                $exited = $proc.WaitForExit($remainingMs)
+                $timedOut = -not $exited
+                if ($timedOut) { $timeoutReason = "hardDeadline" }
+            }
+            else {
+                while (-not $exited) {
+                    $nowUtc = [DateTime]::UtcNow
+                    if ($nowUtc -ge $deadline) {
+                        $timedOut = $true
+                        $timeoutReason = "hardDeadline"
+                        break
+                    }
+                    if (Test-Path -LiteralPath $ProgressPath) {
+                        $progressItems = [System.Collections.Generic.List[object]]::new()
+                        $rootProgress = Get-Item -LiteralPath $ProgressPath -ErrorAction SilentlyContinue
+                        if ($rootProgress) { [void]$progressItems.Add($rootProgress) }
+                        foreach ($progressItem in @(Get-ChildItem -LiteralPath $ProgressPath -File -Recurse `
+                                    -ErrorAction SilentlyContinue)) {
+                            [void]$progressItems.Add($progressItem)
+                        }
+                        $latestProgress = @($progressItems |
+                                Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1)
+                        if ($latestProgress.Count -eq 1) {
+                            if (-not $progressObserved -or $latestProgress[0].LastWriteTimeUtc -gt $lastProgressUtc) {
+                                $lastProgressUtc = $latestProgress[0].LastWriteTimeUtc
+                            }
+                            $progressObserved = $true
+                        }
+                    }
+                    if ($progressObserved -and
+                        ($nowUtc - $lastProgressUtc).TotalSeconds -ge $ProgressTimeoutSeconds) {
+                        $timedOut = $true
+                        $timeoutReason = "progressDeadline"
+                        break
+                    }
+                    $remainingMs = [Math]::Max(1, [int]($deadline - $nowUtc).TotalMilliseconds)
+                    $exited = $proc.WaitForExit([Math]::Min(250, $remainingMs))
+                }
+            }
         }
 
         if ($timedOut) {
+            if (-not $timeoutReason) { $timeoutReason = "standardInputDeadline" }
             Stop-ProcessTree -Process $proc
             $proc.WaitForExit(5000) | Out-Null
         }
 
         $stdoutResult = Get-TaskTextBeforeDeadline -Task $stdoutTask -DeadlineUtc $deadline
         $stderrResult = Get-TaskTextBeforeDeadline -Task $stderrTask -DeadlineUtc $deadline
-        if (-not $stdoutResult.Completed -or -not $stderrResult.Completed) { $timedOut = $true }
+        if (-not $stdoutResult.Completed -or -not $stderrResult.Completed) {
+            $timedOut = $true
+            if (-not $timeoutReason) { $timeoutReason = "outputDrainDeadline" }
+            Stop-ProcessTree -Process $proc
+        }
 
         $exitCode = -1
         if ($exited -and -not $timedOut) {
@@ -1162,11 +1727,866 @@ function Invoke-TimedProcess {
             StdOut    = $stdoutResult.Text
             StdErr    = $stderrResult.Text
             ProcessId = $proc.Id
+            TimeoutReason = $timeoutReason
+            StartedAtUtc = $startedAtUtc.ToString("o")
+            EndedAtUtc = [DateTime]::UtcNow.ToString("o")
+            LastProgressUtc = $lastProgressUtc.ToString("o")
         }
     }
     finally {
         if ($proc) { $proc.Dispose() }
     }
+}
+
+# ---------------------------------------------------------------------------
+# Offline snapshot replay of the MCP read seam.
+#
+# Every repository read in this toolkit funnels through Send-AgentMcpRequest,
+# so a snapshot served THERE drives the entire stack above it - transport,
+# convention packs, facts, model passes, verification, gates and previews -
+# without changing a line of it, and without the tool response shapes those
+# layers validate differing by a byte from a live run.
+#
+# The snapshot is operator-supplied local input, so it is treated as hostile:
+# named as a single child of an explicit replay root, canonicalized, refused
+# if any component is a reparse point, hashed at load, held in memory so
+# nothing on disk can change under it, and re-hashed at every serve. A
+# resource that was not recorded is a failure, never a reason to reach the
+# network.
+# ---------------------------------------------------------------------------
+
+# Code-defined, not manifest-defined: a bound a snapshot can raise is not a bound.
+$script:AgentReplaySchemaVersions = @(1, 2)
+$script:AgentReplayKind = "agent-replay-snapshot"
+$script:AgentReplayMaxResources = 4096
+$script:AgentReplayMaxPayloadBytes = 25165824
+$script:AgentReplayMaxTotalPayloadBytes = 67108864
+$script:AgentReplayMaxManifestBytes = 8388608
+$script:AgentReplayMaxSourceTransportBytes = 16777216
+$script:AgentReplaySnapshotNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z'
+$script:AgentReplayPayloadSegmentPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,126}[A-Za-z0-9_-]\z|^[A-Za-z0-9]\z'
+$script:AgentReplayHexPattern = '^[0-9a-f]{64}\z'
+# Seal kinds a manifest classification may declare. A classification only ever
+# WITHDRAWS promotability, so every kind here is non-promotable by definition;
+# the list exists so an unknown label is refused rather than honoured blindly.
+$script:AgentReplayNonPromotableSealKinds = @("offlineCorpusSeal")
+# Reference-identity seal, not a string: a constant that a hand-built hashtable
+# can carry would let any in-process caller present itself as a loaded snapshot
+# and skip every check in New-AgentReplaySnapshot. Same pattern as the
+# reviewer's delivery-authorization seal.
+$script:AgentReplaySnapshotSeal = [object]::new()
+# A code-defined CEILING of the exact {tool, action} pairs the wrappers in this
+# toolkit issue as reads - not a blocklist of writes. A tool or action this
+# table does not name cannot be recorded in a snapshot and cannot be served
+# from one, so a new write action added upstream is refused by default rather
+# than admitted until someone notices.
+$script:AgentReplayReadCeiling = [System.Collections.Generic.Dictionary[string, string[]]]::new([StringComparer]::Ordinal)
+$script:AgentReplayReadCeiling.Add("repo_pull_request", @("get", "get_changes", "list"))
+$script:AgentReplayReadCeiling.Add("repo_pull_request_thread", @("list"))
+$script:AgentReplayReadCeiling.Add("repo_file", @("get_content"))
+$script:AgentReplayReadCeiling.Add("repo_branch", @("get"))
+$script:AgentReplayReadCeiling.Add("repo_repository", @("get", "list"))
+
+function ConvertTo-AgentReplayJsonString {
+    <#
+        Explicit JSON string escaping. Delegating this to ConvertTo-Json would
+        make every lookup key and the manifest digest a function of the host
+        PowerShell build's serializer choices; a snapshot has to survive that.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    $builder = [System.Text.StringBuilder]::new($Value.Length + 2)
+    [void]$builder.Append('"')
+    foreach ($character in $Value.ToCharArray()) {
+        $code = [int]$character
+        switch ($character) {
+            '"' { [void]$builder.Append('\"'); continue }
+            '\' { [void]$builder.Append('\\'); continue }
+            "`b" { [void]$builder.Append('\b'); continue }
+            "`f" { [void]$builder.Append('\f'); continue }
+            "`n" { [void]$builder.Append('\n'); continue }
+            "`r" { [void]$builder.Append('\r'); continue }
+            "`t" { [void]$builder.Append('\t'); continue }
+            default {
+                if ($code -lt 32 -or $code -eq 127) { [void]$builder.AppendFormat('\u{0:x4}', $code) }
+                else { [void]$builder.Append($character) }
+            }
+        }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-AgentReplaySortedNames {
+    <#
+        ORDINAL ordering. Sort-Object is a culture comparison: 'aa','Aa','ab'
+        orders differently under da-DK than under en-US, which would make both
+        the lookup key and the manifest digest depend on the locale of the host
+        that computed them. A snapshot captured on one machine has to load on
+        another.
+    #>
+    param([string[]]$Names)
+    $sorted = [string[]]@($Names)
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    return , $sorted
+}
+
+function ConvertTo-AgentReplayCanonicalJson {
+    <#
+        Deterministic JSON rendering used for BOTH the resource lookup key and
+        the manifest digest. Object keys are sorted ordinally, so key order can
+        never change a key or a digest, and dictionaries are rendered as objects
+        rather than as the DictionaryEntry sequence a generic enumerable walk
+        would produce.
+    #>
+    param($Value, [int]$Depth = 0)
+    if ($Depth -gt 24) { throw "Replay payload exceeded the maximum canonical depth." }
+    if ($null -eq $Value) { return "null" }
+    if ($Value -is [bool]) { return $(if ($Value) { "true" } else { "false" }) }
+    if ($Value -is [string]) { return (ConvertTo-AgentReplayJsonString -Value $Value) }
+    if ($Value -is [int] -or $Value -is [long]) { return [Convert]::ToString([long]$Value, [System.Globalization.CultureInfo]::InvariantCulture) }
+    if ($Value -is [double] -or $Value -is [decimal]) {
+        # A non-integral number in a lookup key or a digest would make the key
+        # depend on round-tripping; refuse rather than render one ambiguously.
+        throw "Replay canonical JSON does not accept non-integral numbers."
+    }
+    if ($Value -is [DateTime] -or $Value -is [DateTimeOffset]) {
+        # PowerShell's JSON reader turns extended-format ISO-8601 strings into
+        # DateTime objects. Rendering one here would make the digest depend on
+        # a formatting choice the manifest never stated, so it is refused: a
+        # timestamp that must survive a snapshot is written in the basic form
+        # this schema requires, which stays a string on both sides.
+        throw "Replay canonical JSON does not accept date values; write timestamps in the basic yyyyMMddTHHmmssZ form."
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $names = Get-AgentReplaySortedNames -Names @($Value.Keys | ForEach-Object { [string]$_ })
+        $parts = @($names | ForEach-Object {
+                (ConvertTo-AgentReplayJsonString -Value $_) + ":" +
+                (ConvertTo-AgentReplayCanonicalJson -Value $Value[$_] -Depth ($Depth + 1))
+            })
+        return "{" + ($parts -join ",") + "}"
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $names = Get-AgentReplaySortedNames -Names @($Value.PSObject.Properties.Name)
+        $parts = @($names | ForEach-Object {
+                (ConvertTo-AgentReplayJsonString -Value $_) + ":" +
+                (ConvertTo-AgentReplayCanonicalJson -Value $Value.PSObject.Properties[$_].Value -Depth ($Depth + 1))
+            })
+        return "{" + ($parts -join ",") + "}"
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $parts = @()
+        foreach ($item in $Value) { $parts += (ConvertTo-AgentReplayCanonicalJson -Value $item -Depth ($Depth + 1)) }
+        return "[" + ($parts -join ",") + "]"
+    }
+    throw "Replay canonical JSON encountered an unsupported type."
+}
+
+function Get-AgentReplayTextSha256 {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $bytes = ([System.Text.UTF8Encoding]::new($false, $true)).GetBytes($Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+    return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+function Get-AgentReplayBytesSha256 {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash($Bytes) } finally { $sha.Dispose() }
+    return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+function Get-AgentReplayRequestKey {
+    <#
+        The identity of one recorded read: the tool name and the EXACT argument
+        set the wrapper asked with. Two calls that differ in any argument are
+        two different resources, so a snapshot can never answer a question it
+        was not asked at capture time.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Arguments
+    )
+    $canonical = ConvertTo-AgentReplayCanonicalJson -Value ([ordered]@{ arguments = $Arguments; name = $Name })
+    return @{ Canonical = $canonical; Key = (Get-AgentReplayTextSha256 -Text $canonical) }
+}
+
+function Test-AgentReplayToolPermitted {
+    <#
+        Fail-closed read CEILING. Applied when a snapshot is LOADED (so a
+        recorded write cannot sit in a snapshot at all) and again when a call is
+        SERVED (so no code path can ask replay to answer a write). A tool the
+        ceiling does not name, or an action it does not name for that tool, is
+        refused - including a call that carries no action at all.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Arguments
+    )
+    if ([string]::IsNullOrWhiteSpace($Name)) { return @{ Permitted = $false; Reason = "an unnamed tool" } }
+    if (-not $script:AgentReplayReadCeiling.ContainsKey($Name)) {
+        return @{ Permitted = $false; Reason = "'$Name' is not in the replay read ceiling" }
+    }
+    $action = $null
+    $actionSeen = $false
+    if ($Arguments -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Arguments.Keys)) {
+            if ([string]$key -ceq "action") { $action = $Arguments[$key]; $actionSeen = $true }
+        }
+    }
+    elseif ($Arguments -is [System.Management.Automation.PSCustomObject] -and $Arguments.PSObject.Properties["action"]) {
+        $action = $Arguments.PSObject.Properties["action"].Value
+        $actionSeen = $true
+    }
+    if (-not $actionSeen) {
+        return @{ Permitted = $false; Reason = "'$Name' was asked without an action" }
+    }
+    if ($action -isnot [string] -or $script:AgentReplayReadCeiling[$Name] -cnotcontains [string]$action) {
+        return @{ Permitted = $false; Reason = "'$Name' was asked for an action outside the replay read ceiling" }
+    }
+    return @{ Permitted = $true; Reason = "" }
+}
+
+function Assert-AgentReplayPathSafe {
+    <#
+        Windows-shaped path defence. A snapshot is operator input, and the
+        interesting attack here is not "../.." in the manifest - it is a
+        junction or symlink that makes a name inside the replay root resolve to
+        bytes outside it. Hard links are deliberately NOT chased: a hard link
+        can only ever supply the exact bytes the manifest already pins by
+        SHA-256, so aliasing buys nothing that content pinning does not already
+        cover.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Within,
+        [Parameter(Mandatory)][ValidateSet("Directory", "File")][string]$Kind
+    )
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($Kind -eq "Directory" -and -not $item.PSIsContainer) { throw "Replay path '$Path' is not a directory." }
+    if ($Kind -eq "File" -and $item.PSIsContainer) { throw "Replay path '$Path' is not a file." }
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Replay path '$Path' is a reparse point; a replay snapshot may not redirect outside its own root."
+    }
+    if ($item.PSObject.Properties["LinkType"] -and $item.LinkType) {
+        throw "Replay path '$Path' is a $($item.LinkType); a replay snapshot may not alias other content."
+    }
+    # Resolve through the filesystem's own casing/short-name normalization, then
+    # confirm the resolved name is still strictly inside the boundary. Comparing
+    # the manifest string alone would accept an 8.3 short name or a name that
+    # only becomes an escape after resolution.
+    $resolved = [System.IO.Path]::GetFullPath($item.FullName)
+    $boundary = [System.IO.Path]::GetFullPath($Within).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $resolved.StartsWith($boundary, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Replay path '$Path' resolved outside the replay boundary '$Within'."
+    }
+    return $resolved
+}
+
+function Get-AgentReplayManifestField {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet("string", "sha256", "int", "bool", "object", "array")][string]$Type,
+        [long]$Min = 0,
+        [long]$Max = 2147483647,
+        [string]$Pattern
+    )
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { throw "Replay manifest is missing required field '$Name'." }
+    $value = $property.Value
+    switch ($Type) {
+        "string" {
+            if ($value -isnot [string]) { throw "Replay manifest field '$Name' must be a string." }
+            if ($Pattern -and [string]$value -cnotmatch $Pattern) { throw "Replay manifest field '$Name' does not match its required shape." }
+            return [string]$value
+        }
+        "sha256" {
+            if ($value -isnot [string] -or [string]$value -cnotmatch $script:AgentReplayHexPattern) {
+                throw "Replay manifest field '$Name' must be a lowercase SHA-256 hex digest."
+            }
+            return [string]$value
+        }
+        "int" {
+            if (-not (Test-StrictJsonInt -Value $value -Min $Min -Max $Max)) {
+                throw "Replay manifest field '$Name' must be an integer in [$Min,$Max]."
+            }
+            return [long]$value
+        }
+        "bool" {
+            if ($value -isnot [bool]) { throw "Replay manifest field '$Name' must be a boolean." }
+            return [bool]$value
+        }
+        "object" {
+            if ($value -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest field '$Name' must be an object." }
+            return $value
+        }
+        "array" {
+            if ($value -isnot [System.Object[]]) { throw "Replay manifest field '$Name' must be an array." }
+            return @($value)
+        }
+    }
+}
+
+function Assert-AgentReplayExactKeys {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string[]]$Expected,
+        [Parameter(Mandatory)][string]$Where
+    )
+    $actual = @($Object.PSObject.Properties.Name)
+    $unexpected = @($actual | Where-Object { $Expected -cnotcontains $_ })
+    if ($unexpected.Count -gt 0) { throw "$Where carries unexpected field(s): $($unexpected -join ', ')." }
+    $missing = @($Expected | Where-Object { -not $Object.PSObject.Properties[$_] })
+    if ($missing.Count -gt 0) { throw "$Where is missing field(s): $($missing -join ', ')." }
+}
+
+function New-AgentReplaySnapshot {
+    <#
+        Loads and seals one replay snapshot. Every payload is read into memory
+        here: a snapshot verified on disk and re-read later is a snapshot that
+        can change between the check and the use, and holding the bytes removes
+        that window entirely. Returns a hashtable the MCP session layer serves
+        from; it carries a fresh per-run nonce so two replays of the same
+        snapshot are distinguishable, and a domain-separated seal so a replay
+        artifact can be recognized as one wherever it surfaces.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ReplayRoot,
+        [Parameter(Mandatory)][string]$SnapshotName,
+        [string]$ExpectedManifestDigest
+    )
+    if ($SnapshotName -cnotmatch $script:AgentReplaySnapshotNamePattern) {
+        throw "Replay snapshot name '$SnapshotName' must be a single path-free name of at most 64 characters."
+    }
+    if (-not (Test-Path -LiteralPath $ReplayRoot -PathType Container)) {
+        throw "Replay root '$ReplayRoot' does not exist."
+    }
+    $rootFull = [System.IO.Path]::GetFullPath((Get-Item -LiteralPath $ReplayRoot -Force -ErrorAction Stop).FullName)
+    $rootItem = Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Replay root '$rootFull' is a reparse point."
+    }
+    $snapshotPath = Join-Path $rootFull $SnapshotName
+    if (-not (Test-Path -LiteralPath $snapshotPath -PathType Container)) {
+        throw "Replay snapshot '$SnapshotName' does not exist under '$rootFull'."
+    }
+    $snapshotFull = Assert-AgentReplayPathSafe -Path $snapshotPath -Within $rootFull -Kind Directory
+
+    $manifestPath = Join-Path $snapshotFull "manifest.json"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "Replay snapshot '$SnapshotName' has no manifest.json."
+    }
+    [void](Assert-AgentReplayPathSafe -Path $manifestPath -Within $snapshotFull -Kind File)
+    $manifestBytes = [System.IO.File]::ReadAllBytes($manifestPath)
+    if ($manifestBytes.Length -lt 2 -or $manifestBytes.Length -gt $script:AgentReplayMaxManifestBytes) {
+        throw "Replay manifest is $($manifestBytes.Length) bytes; expected 2..$script:AgentReplayMaxManifestBytes."
+    }
+    $manifestText = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($manifestBytes)
+    try { $manifest = $manifestText | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "Replay manifest is not valid JSON." }
+    if ($manifest -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest must be a JSON object." }
+
+    $schemaVersion = Get-AgentReplayManifestField -Object $manifest -Name "schemaVersion" -Type int -Min 1 -Max 2
+    $manifestKeys = @(
+        "schemaVersion", "kind", "snapshotId", "capturedUtc", "provider",
+        "binding", "bindings", "resources", "manifestDigest"
+    )
+    if ($schemaVersion -eq 2) { $manifestKeys += "sourceTransport" }
+    # `classification` is the ONE optional manifest key. It is optional because
+    # every snapshot sealed before it existed has to keep loading and keep its
+    # digest; it is a manifest key rather than a free-standing sidecar because a
+    # label that is not covered by the digest is a label anyone can delete. A
+    # snapshot that omits it is an ordinary promotable snapshot, which is what
+    # schema v1 and pre-existing v2 snapshots are.
+    $hasClassification = [bool]$manifest.PSObject.Properties["classification"]
+    if ($hasClassification) {
+        if ($schemaVersion -ne 2) {
+            throw "Replay manifest carries a classification but declares schema version $schemaVersion; classification is a schema-v2 field."
+        }
+        $manifestKeys += "classification"
+    }
+    Assert-AgentReplayExactKeys -Object $manifest -Where "Replay manifest" -Expected $manifestKeys
+    if ($script:AgentReplaySchemaVersions -notcontains $schemaVersion) {
+        throw "Replay manifest declares schema version $schemaVersion; this build reads versions $($script:AgentReplaySchemaVersions -join ', ')."
+    }
+    $kind = Get-AgentReplayManifestField -Object $manifest -Name "kind" -Type string
+    if ($kind -cne $script:AgentReplayKind) { throw "Replay manifest kind '$kind' is not '$script:AgentReplayKind'." }
+    $snapshotId = Get-AgentReplayManifestField -Object $manifest -Name "snapshotId" -Type string -Pattern $script:AgentReplaySnapshotNamePattern
+    if ($snapshotId -cne $SnapshotName) {
+        throw "Replay manifest declares snapshotId '$snapshotId' but was loaded as '$SnapshotName'."
+    }
+    $capturedUtc = Get-AgentReplayManifestField -Object $manifest -Name "capturedUtc" -Type string -Pattern '^\d{8}T\d{6}Z\z'
+    $provider = Get-AgentReplayManifestField -Object $manifest -Name "provider" -Type string -Pattern '^[a-z][a-z0-9-]{0,31}\z'
+
+    $binding = Get-AgentReplayManifestField -Object $manifest -Name "binding" -Type object
+    $bindingKeys = @(
+        "organization", "project", "repositoryId", "pullRequestId",
+        "sourceCommit", "targetCommit", "changeSetSha256"
+    )
+    if ($schemaVersion -eq 2) { $bindingKeys += @("iterationId", "commonCommit") }
+    Assert-AgentReplayExactKeys -Object $binding -Where "Replay manifest binding" -Expected $bindingKeys
+    $bindingRecord = [ordered]@{
+        Organization    = Get-AgentReplayManifestField -Object $binding -Name "organization" -Type string -Pattern '^[^\s]{1,128}\z'
+        Project         = Get-AgentReplayManifestField -Object $binding -Name "project" -Type string -Pattern '^[^\s]{1,128}\z'
+        RepositoryId    = Get-AgentReplayManifestField -Object $binding -Name "repositoryId" -Type string -Pattern '^[^\s]{1,128}\z'
+        PullRequestId   = Get-AgentReplayManifestField -Object $binding -Name "pullRequestId" -Type int -Min 1 -Max 2147483647
+        SourceCommit    = Get-AgentReplayManifestField -Object $binding -Name "sourceCommit" -Type string -Pattern '^[0-9a-f]{40}\z'
+        TargetCommit    = Get-AgentReplayManifestField -Object $binding -Name "targetCommit" -Type string -Pattern '^[0-9a-f]{40}\z'
+        ChangeSetSha256 = Get-AgentReplayManifestField -Object $binding -Name "changeSetSha256" -Type sha256
+    }
+    if ($schemaVersion -eq 2) {
+        $bindingRecord["IterationId"] = Get-AgentReplayManifestField -Object $binding -Name "iterationId" `
+            -Type int -Min 1 -Max 2147483647
+        $bindingRecord["CommonCommit"] = Get-AgentReplayManifestField -Object $binding -Name "commonCommit" `
+            -Type string -Pattern '^[0-9a-f]{40}\z'
+    }
+
+    $bindings = Get-AgentReplayManifestField -Object $manifest -Name "bindings" -Type object
+    Assert-AgentReplayExactKeys -Object $bindings -Where "Replay manifest bindings" -Expected @(
+        "configSha256", "scriptSha256", "promptSha256", "models"
+    )
+    $models = @(Get-AgentReplayManifestField -Object $bindings -Name "models" -Type array)
+    if ($models.Count -gt 8) { throw "Replay manifest binds more than 8 models." }
+    foreach ($model in $models) {
+        if ($model -isnot [string] -or [string]$model -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
+            throw "Replay manifest model binding is not a plain model name."
+        }
+    }
+    $bindingsRecord = [ordered]@{
+        ConfigSha256 = Get-AgentReplayManifestField -Object $bindings -Name "configSha256" -Type sha256
+        ScriptSha256 = Get-AgentReplayManifestField -Object $bindings -Name "scriptSha256" -Type sha256
+        PromptSha256 = Get-AgentReplayManifestField -Object $bindings -Name "promptSha256" -Type sha256
+        Models       = @($models | ForEach-Object { [string]$_ })
+    }
+
+    $resources = @(Get-AgentReplayManifestField -Object $manifest -Name "resources" -Type array)
+    if ($resources.Count -lt 1 -or $resources.Count -gt $script:AgentReplayMaxResources) {
+        throw "Replay manifest declares $($resources.Count) resource(s); expected 1..$script:AgentReplayMaxResources."
+    }
+    $recordedDigest = Get-AgentReplayManifestField -Object $manifest -Name "manifestDigest" -Type sha256
+
+    $served = @{}
+    $totalBytes = [long]0
+    $resourceSummaries = [System.Collections.Generic.List[object]]::new()
+    $sourceTransportRecord = $null
+    $sourceTransportDigestRecord = $null
+    if ($schemaVersion -eq 2) {
+        $sourceTransport = Get-AgentReplayManifestField -Object $manifest -Name "sourceTransport" -Type object
+        Assert-AgentReplayExactKeys -Object $sourceTransport -Where "Replay manifest sourceTransport" -Expected @(
+            "mode", "artifactFile", "artifactSha256", "artifactByteLength"
+        )
+        $sourceMode = Get-AgentReplayManifestField -Object $sourceTransport -Name "mode" -Type string `
+            -Pattern '^(mcpFlat|azureDevOpsCliFallback|legacyMcp)$'
+        $artifactRelative = Get-AgentReplayManifestField -Object $sourceTransport -Name "artifactFile" -Type string
+        if ($artifactRelative.Length -lt 1 -or $artifactRelative.Length -gt 512) {
+            throw "Replay source-transport artifactFile must be 1..512 characters."
+        }
+        $artifactSegments = @($artifactRelative -split '/')
+        foreach ($segment in $artifactSegments) {
+            if ($segment -cnotmatch $script:AgentReplayPayloadSegmentPattern) {
+                throw "Replay source-transport artifactFile '$artifactRelative' is not a plain relative path inside the snapshot."
+            }
+        }
+        $artifactPath = $snapshotFull
+        for ($segmentIndex = 0; $segmentIndex -lt $artifactSegments.Count; $segmentIndex++) {
+            $artifactPath = Join-Path $artifactPath $artifactSegments[$segmentIndex]
+            $segmentKind = if ($segmentIndex -eq ($artifactSegments.Count - 1)) { "File" } else { "Directory" }
+            [void](Assert-AgentReplayPathSafe -Path $artifactPath -Within $snapshotFull -Kind $segmentKind)
+        }
+        $artifactLength = Get-AgentReplayManifestField -Object $sourceTransport -Name "artifactByteLength" `
+            -Type int -Min 2 -Max $script:AgentReplayMaxSourceTransportBytes
+        $artifactSha = Get-AgentReplayManifestField -Object $sourceTransport -Name "artifactSha256" -Type sha256
+        $artifactBytes = [IO.File]::ReadAllBytes($artifactPath)
+        if ($artifactBytes.Length -ne $artifactLength) {
+            throw "Replay source-transport artifact '$artifactRelative' is $($artifactBytes.Length) bytes; the manifest records $artifactLength."
+        }
+        if ((Get-AgentReplayBytesSha256 -Bytes $artifactBytes) -cne $artifactSha) {
+            throw "Replay source-transport artifact '$artifactRelative' does not match its recorded SHA-256."
+        }
+        $totalBytes += $artifactBytes.Length
+        if ($totalBytes -gt $script:AgentReplayMaxTotalPayloadBytes) {
+            throw "Replay snapshot '$SnapshotName' carries more than $script:AgentReplayMaxTotalPayloadBytes payload bytes."
+        }
+        $sourceTransportRecord = @{
+            Mode = $sourceMode
+            ArtifactFile = $artifactRelative
+            ArtifactSha256 = $artifactSha
+            ArtifactBytes = $artifactBytes
+        }
+        $sourceTransportDigestRecord = [ordered]@{
+            mode = $sourceMode
+            artifactFile = $artifactRelative
+            artifactSha256 = $artifactSha
+            artifactByteLength = [long]$artifactBytes.Length
+        }
+    }
+
+    # -- classification, and the sidecar it binds ---------------------------
+    # Default: an ordinary, promotable snapshot. Stated explicitly rather than
+    # left null, because a consumer that has to test for absence before it can
+    # tell whether something is promotable will eventually forget to.
+    $classificationRecord = @{
+        SealKind      = "standard"
+        NonPromotable = $false
+        SidecarFile   = ""
+        SidecarSha256 = ""
+        Sidecar       = $null
+    }
+    $classificationDigestRecord = $null
+    if ($hasClassification) {
+        $classification = Get-AgentReplayManifestField -Object $manifest -Name "classification" -Type object
+        Assert-AgentReplayExactKeys -Object $classification -Where "Replay manifest classification" -Expected @(
+            "sealKind", "nonPromotable", "sidecarFile", "sidecarSha256"
+        )
+        $sealKind = Get-AgentReplayManifestField -Object $classification -Name "sealKind" -Type string `
+            -Pattern '^[a-z][A-Za-z0-9]{0,31}\z'
+        if ($script:AgentReplayNonPromotableSealKinds -cnotcontains $sealKind) {
+            throw "Replay manifest classification declares sealKind '$sealKind', which this build does not recognize."
+        }
+        $nonPromotable = Get-AgentReplayManifestField -Object $classification -Name "nonPromotable" -Type bool
+        if (-not $nonPromotable) {
+            # A classification block exists ONLY to withdraw promotability. If it
+            # could also assert promotability it would be a way to launder a
+            # sealed snapshot into a promotable one by editing four fields, and
+            # the whole point is that this label can never be talked out of.
+            throw "Replay manifest classification declares nonPromotable = false; a classification may only withdraw promotability, never grant it."
+        }
+        $sidecarRelative = Get-AgentReplayManifestField -Object $classification -Name "sidecarFile" -Type string
+        if ($sidecarRelative.Length -lt 1 -or $sidecarRelative.Length -gt 512) {
+            throw "Replay classification sidecarFile must be 1..512 characters."
+        }
+        $sidecarSegments = @($sidecarRelative -split '/')
+        foreach ($segment in $sidecarSegments) {
+            if ($segment -cnotmatch $script:AgentReplayPayloadSegmentPattern) {
+                throw "Replay classification sidecarFile '$sidecarRelative' is not a plain relative path inside the snapshot."
+            }
+        }
+        $sidecarSha = Get-AgentReplayManifestField -Object $classification -Name "sidecarSha256" -Type sha256
+        $sidecarPath = $snapshotFull
+        for ($segmentIndex = 0; $segmentIndex -lt $sidecarSegments.Count; $segmentIndex++) {
+            $sidecarPath = Join-Path $sidecarPath $sidecarSegments[$segmentIndex]
+            $segmentKind = if ($segmentIndex -eq ($sidecarSegments.Count - 1)) { "File" } else { "Directory" }
+            if (-not (Test-Path -LiteralPath $sidecarPath)) {
+                # Deleting the sidecar is the obvious way to try to shed the
+                # label, so it fails the LOAD rather than merely being noticed.
+                throw "Replay snapshot '$SnapshotName' is classified '$sealKind' but its sidecar '$sidecarRelative' is missing."
+            }
+            [void](Assert-AgentReplayPathSafe -Path $sidecarPath -Within $snapshotFull -Kind $segmentKind)
+        }
+        $sidecarBytes = [System.IO.File]::ReadAllBytes($sidecarPath)
+        if ($sidecarBytes.Length -lt 2 -or $sidecarBytes.Length -gt $script:AgentReplayMaxManifestBytes) {
+            throw "Replay classification sidecar '$sidecarRelative' is $($sidecarBytes.Length) bytes; expected 2..$script:AgentReplayMaxManifestBytes."
+        }
+        if ((Get-AgentReplayBytesSha256 -Bytes $sidecarBytes) -cne $sidecarSha) {
+            throw "Replay classification sidecar '$sidecarRelative' does not match its recorded SHA-256."
+        }
+        $sidecarText = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($sidecarBytes)
+        try { $sidecar = $sidecarText | ConvertFrom-Json -ErrorAction Stop }
+        catch { throw "Replay classification sidecar '$sidecarRelative' is not valid JSON." }
+        if ($sidecar -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "Replay classification sidecar '$sidecarRelative' must be a JSON object."
+        }
+        # The sidecar has to agree with the manifest about what it is about. The
+        # binding runs manifest -> sidecar only: the manifest pins the sidecar's
+        # hash and the digest pins the manifest, so a sidecar that also carried
+        # the manifest digest would close a cycle neither side could compute.
+        foreach ($pair in @(
+                @("snapshotId", $snapshotId),
+                @("sealKind", $sealKind))) {
+            $name = [string]$pair[0]
+            if (-not $sidecar.PSObject.Properties[$name]) {
+                throw "Replay classification sidecar '$sidecarRelative' omits '$name'."
+            }
+            if ([string]$sidecar.PSObject.Properties[$name].Value -cne [string]$pair[1]) {
+                throw "Replay classification sidecar '$sidecarRelative' disagrees with the manifest about '$name'."
+            }
+        }
+        if (-not $sidecar.PSObject.Properties["nonPromotable"] -or -not [bool]$sidecar.nonPromotable) {
+            throw "Replay classification sidecar '$sidecarRelative' does not record nonPromotable = true."
+        }
+        $totalBytes += $sidecarBytes.Length
+        if ($totalBytes -gt $script:AgentReplayMaxTotalPayloadBytes) {
+            throw "Replay snapshot '$SnapshotName' carries more than $script:AgentReplayMaxTotalPayloadBytes payload bytes."
+        }
+        $classificationRecord = @{
+            SealKind      = $sealKind
+            NonPromotable = $true
+            SidecarFile   = $sidecarRelative
+            SidecarSha256 = $sidecarSha
+            Sidecar       = $sidecar
+        }
+        $classificationDigestRecord = [ordered]@{
+            sealKind      = $sealKind
+            nonPromotable = $true
+            sidecarFile   = $sidecarRelative
+            sidecarSha256 = $sidecarSha
+        }
+    }
+
+    foreach ($resource in $resources) {
+        if ($resource -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest resource must be an object." }
+        Assert-AgentReplayExactKeys -Object $resource -Where "Replay manifest resource" -Expected @(
+            "tool", "arguments", "requestSha256", "payloadFile", "payloadSha256", "payloadByteLength"
+        )
+        $tool = Get-AgentReplayManifestField -Object $resource -Name "tool" -Type string -Pattern '^[a-z][a-z0-9_]{0,63}$'
+        $arguments = Get-AgentReplayManifestField -Object $resource -Name "arguments" -Type object
+        $permitted = Test-AgentReplayToolPermitted -Name $tool -Arguments $arguments
+        if (-not $permitted.Permitted) {
+            throw "Replay snapshot '$SnapshotName' records $($permitted.Reason); a replay snapshot may only carry reads."
+        }
+        $requestKey = Get-AgentReplayRequestKey -Name $tool -Arguments $arguments
+        $recordedRequestSha = Get-AgentReplayManifestField -Object $resource -Name "requestSha256" -Type sha256
+        if ($requestKey.Key -cne $recordedRequestSha) {
+            throw "Replay resource for '$tool' records a requestSha256 that does not match its own arguments."
+        }
+        if ($served.ContainsKey($requestKey.Key)) {
+            throw "Replay snapshot '$SnapshotName' records the same '$tool' request twice; a snapshot must answer each request one way."
+        }
+
+        $payloadRelative = Get-AgentReplayManifestField -Object $resource -Name "payloadFile" -Type string
+        if ($payloadRelative.Length -lt 1 -or $payloadRelative.Length -gt 512) {
+            throw "Replay resource payloadFile must be 1..512 characters."
+        }
+        $segments = @($payloadRelative -split '/')
+        foreach ($segment in $segments) {
+            if ($segment -cnotmatch $script:AgentReplayPayloadSegmentPattern) {
+                throw "Replay resource payloadFile '$payloadRelative' is not a plain relative path inside the snapshot."
+            }
+        }
+        $payloadPath = $snapshotFull
+        for ($segmentIndex = 0; $segmentIndex -lt $segments.Count; $segmentIndex++) {
+            $payloadPath = Join-Path $payloadPath $segments[$segmentIndex]
+            # By index, not by value: a payload at "a/b/a" would otherwise have
+            # its first directory checked as a file because it happens to share
+            # the leaf's name.
+            $segmentKind = if ($segmentIndex -eq ($segments.Count - 1)) { "File" } else { "Directory" }
+            [void](Assert-AgentReplayPathSafe -Path $payloadPath -Within $snapshotFull -Kind $segmentKind)
+        }
+
+        $expectedBytes = Get-AgentReplayManifestField -Object $resource -Name "payloadByteLength" -Type int -Min 2 -Max $script:AgentReplayMaxPayloadBytes
+        $expectedSha = Get-AgentReplayManifestField -Object $resource -Name "payloadSha256" -Type sha256
+        # The safety check above and this read are two operations on one name,
+        # so the name can in principle be swapped between them. That window is
+        # harmless rather than unclosed: whatever the read returns is hashed
+        # against the manifest immediately below, so a swapped file fails the
+        # load. The worst a race can do here is refuse a snapshot.
+        $payloadBytes = [System.IO.File]::ReadAllBytes($payloadPath)
+        if ($payloadBytes.Length -ne $expectedBytes) {
+            throw "Replay payload '$payloadRelative' is $($payloadBytes.Length) bytes; the manifest records $expectedBytes."
+        }
+        $actualSha = Get-AgentReplayBytesSha256 -Bytes $payloadBytes
+        if ($actualSha -cne $expectedSha) { throw "Replay payload '$payloadRelative' does not match its recorded SHA-256." }
+        $totalBytes += $payloadBytes.Length
+        if ($totalBytes -gt $script:AgentReplayMaxTotalPayloadBytes) {
+            throw "Replay snapshot '$SnapshotName' carries more than $script:AgentReplayMaxTotalPayloadBytes payload bytes."
+        }
+
+        # Reject a recorded failure at load, not at serve: a snapshot that
+        # cannot answer is a broken snapshot, and finding that out halfway
+        # through a replay would leave a half-run to interpret.
+        $payloadText = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($payloadBytes)
+        try { $envelope = $payloadText | ConvertFrom-Json -ErrorAction Stop }
+        catch { throw "Replay payload '$payloadRelative' is not valid JSON." }
+        if ($envelope -isnot [System.Management.Automation.PSCustomObject] -or
+            -not $envelope.PSObject.Properties["jsonrpc"] -or [string]$envelope.jsonrpc -cne "2.0" -or
+            -not $envelope.PSObject.Properties["result"] -or $envelope.PSObject.Properties["error"]) {
+            throw "Replay payload '$payloadRelative' is not a successful JSON-RPC response envelope."
+        }
+        # A well-formed envelope is not the same as a readable one. Every reader
+        # in this toolkit consumes a tool result through Invoke-AgentMcpTool,
+        # which requires the MCP content shape; a raw REST body wrapped in a
+        # JSON-RPC envelope loads, hashes and binds perfectly and then fails at
+        # the read that needs it - after a run has already started. Checking it
+        # here means a snapshot that cannot answer is refused whole, at load,
+        # for EVERY recorded read rather than only the first one a run happens
+        # to reach.
+        if (-not (Test-AgentMcpToolResultShape -Result $envelope.result)) {
+            throw ("Replay payload '$payloadRelative' is not an MCP tool result: it carries no content array " +
+                "with text or an embedded resource, so no reader could consume it. Record the response the MCP " +
+                "server returns, not the REST body it wraps.")
+        }
+
+        $served[$requestKey.Key] = @{
+            Tool          = $tool
+            PayloadFile   = $payloadRelative
+            PayloadBytes  = $payloadBytes
+            PayloadSha256 = $expectedSha
+        }
+        [void]$resourceSummaries.Add([ordered]@{
+                tool              = $tool
+                requestSha256     = $requestKey.Key
+                payloadFile       = $payloadRelative
+                payloadSha256     = $expectedSha
+                payloadByteLength = [long]$payloadBytes.Length
+                arguments         = $arguments
+            })
+    }
+
+    # The digest covers everything the manifest asserts EXCEPT the digest field
+    # itself, so editing any binding, argument, payload hash or ordering changes
+    # it. Payload bytes are covered transitively through payloadSha256, each of
+    # which was verified against the bytes just read. It is built from the
+    # manifest's OWN field names so that a writer can compute the same value
+    # without reproducing this function's internal record shapes.
+    $digestInput = [ordered]@{
+        schemaVersion = $schemaVersion
+        kind          = $kind
+        snapshotId    = $snapshotId
+        capturedUtc   = $capturedUtc
+        provider      = $provider
+        binding       = [ordered]@{
+            organization    = $bindingRecord.Organization
+            project         = $bindingRecord.Project
+            repositoryId    = $bindingRecord.RepositoryId
+            pullRequestId   = $bindingRecord.PullRequestId
+            sourceCommit    = $bindingRecord.SourceCommit
+            targetCommit    = $bindingRecord.TargetCommit
+            changeSetSha256 = $bindingRecord.ChangeSetSha256
+        }
+        bindings      = [ordered]@{
+            configSha256 = $bindingsRecord.ConfigSha256
+            scriptSha256 = $bindingsRecord.ScriptSha256
+            promptSha256 = $bindingsRecord.PromptSha256
+            models       = @($bindingsRecord.Models)
+        }
+        resources     = @($resourceSummaries.ToArray())
+    }
+    if ($schemaVersion -eq 2) {
+        $digestInput.binding["iterationId"] = $bindingRecord.IterationId
+        $digestInput.binding["commonCommit"] = $bindingRecord.CommonCommit
+    }
+    if ($schemaVersion -eq 2) { $digestInput["sourceTransport"] = $sourceTransportDigestRecord }
+    # The classification is part of what the manifest ASSERTS, so it is part of
+    # what the digest covers. Editing the sealKind, flipping nonPromotable,
+    # repointing the sidecar or swapping the sidecar's bytes all change this
+    # value, which is what makes the label survive an edit rather than merely
+    # describe one. Absent classification contributes nothing, so every snapshot
+    # sealed before this field existed keeps exactly the digest it had.
+    if ($null -ne $classificationDigestRecord) { $digestInput["classification"] = $classificationDigestRecord }
+    $computedDigest = Get-AgentReplayTextSha256 -Text (ConvertTo-AgentReplayCanonicalJson -Value $digestInput)
+    if ($computedDigest -cne $recordedDigest) {
+        # Deliberately not worded as tamper detection. This digest is unkeyed:
+        # anyone who edits a snapshot can recompute it. What it does catch is a
+        # manifest that no longer describes its own payloads - corruption, a
+        # partial edit, or a recorder that disagrees with this reader. Binding a
+        # replay to a snapshot an operator actually vouched for is the job of
+        # -ExpectedManifestDigest, which is why the reviewer requires one.
+        throw "Replay manifest digest does not match its own contents; the manifest and its payloads disagree."
+    }
+    if ($ExpectedManifestDigest -and $computedDigest -cne $ExpectedManifestDigest.ToLowerInvariant()) {
+        throw "Replay manifest digest $computedDigest does not match the operator-supplied $ExpectedManifestDigest."
+    }
+
+    return @{
+        SchemaVersion  = $schemaVersion
+        SnapshotId     = $snapshotId
+        SnapshotPath   = $snapshotFull
+        ReplayRoot     = $rootFull
+        CapturedUtc    = $capturedUtc
+        Provider       = $provider
+        Binding        = $bindingRecord
+        Bindings       = $bindingsRecord
+        ManifestDigest = $computedDigest
+        ResourceCount  = $served.Count
+        PayloadBytes   = $totalBytes
+        ReplayNonce    = (New-AgentNonce)
+        Seal           = $script:AgentReplaySnapshotSeal
+        Served         = $served
+        ServedKeys     = @($served.Keys)
+        SourceTransport = $sourceTransportRecord
+        Classification = $classificationRecord
+    }
+}
+
+function Assert-AgentReplaySnapshotPromotable {
+    <#
+        The one gate every promotable flow calls before it treats a replayed
+        result as something that can be published, promoted or counted as a
+        qualification. A snapshot that carries a classification has withdrawn
+        its own promotability permanently, and the withdrawal is covered by the
+        manifest digest, so it cannot be shed by deleting a file.
+
+        Deliberately a THROW rather than a boolean. A caller that has to
+        remember to test the answer is a caller that can forget to.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Snapshot,
+        [string]$Operation = "Promotion"
+    )
+    if ($Snapshot["Seal"] -isnot [object] -or -not [object]::ReferenceEquals($Snapshot["Seal"], $script:AgentReplaySnapshotSeal)) {
+        throw "$Operation requires a snapshot produced by New-AgentReplaySnapshot."
+    }
+    $classification = $Snapshot["Classification"]
+    if ($null -eq $classification) { return $true }
+    if ([bool]$classification.NonPromotable) {
+        throw ("$Operation refused: replay snapshot '$($Snapshot.SnapshotId)' is classified " +
+            "'$($classification.SealKind)' and is permanently non-promotable. It was sealed offline from captured " +
+            "material, contacted no live host, and cannot stand behind a published or promoted result.")
+    }
+    return $true
+}
+
+function Get-AgentReplayResponse {
+    <#
+        Answers one recorded read. Re-hashes the held bytes before parsing, so a
+        snapshot object that was tampered with in memory is caught here too, and
+        parses fresh on every call so no caller can mutate a shared object out
+        from under a later one.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Snapshot,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Arguments
+    )
+    $permitted = Test-AgentReplayToolPermitted -Name $Name -Arguments $Arguments
+    if (-not $permitted.Permitted) {
+        throw "Replay refused $($permitted.Reason): a replay never writes and never authorizes a write."
+    }
+    $requestKey = Get-AgentReplayRequestKey -Name $Name -Arguments $Arguments
+    if (-not $Snapshot.Served.ContainsKey($requestKey.Key)) {
+        # Naming the exact request is the difference between "this snapshot is
+        # incomplete" and a day of guessing which argument differed. Bounded,
+        # because the arguments are operator input like everything else here.
+        $described = $requestKey.Canonical
+        if ($described.Length -gt 512) { $described = $described.Substring(0, 512) + "..." }
+        throw ("Replay snapshot '$($Snapshot.SnapshotId)' has no recorded response for '$Name' with these exact arguments; " +
+            "a replay never falls through to a live read. Requested: $described")
+    }
+    $entry = $Snapshot.Served[$requestKey.Key]
+    $actualSha = Get-AgentReplayBytesSha256 -Bytes $entry.PayloadBytes
+    if ($actualSha -cne $entry.PayloadSha256) {
+        throw "Replay payload '$($entry.PayloadFile)' changed after it was sealed."
+    }
+    $payloadText = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($entry.PayloadBytes)
+    $envelope = $payloadText | ConvertFrom-Json -ErrorAction Stop
+    return $envelope.result
+}
+
+function Test-AgentReplaySnapshotHasResponse {
+    <#
+        A non-throwing availability probe over the same request key
+        Get-AgentReplayResponse serves from. It exists so an offline planner can
+        tell a source that was never captured (a reason to degrade a candidate,
+        not to fall through to a live read) apart from a source that is present.
+        It never returns payload bytes and never contacts anything: like the
+        serve path it refuses a write tool outright, and otherwise answers only
+        whether this exact tool-and-arguments read was recorded. Probing and
+        then skipping keeps a replay from even issuing a request it knows the
+        snapshot cannot answer.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Snapshot,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Arguments
+    )
+    if ($Snapshot["Seal"] -isnot [object] -or -not [object]::ReferenceEquals($Snapshot["Seal"], $script:AgentReplaySnapshotSeal)) {
+        throw "Replay availability probe requires a snapshot produced by New-AgentReplaySnapshot."
+    }
+    $permitted = Test-AgentReplayToolPermitted -Name $Name -Arguments $Arguments
+    if (-not $permitted.Permitted) { return $false }
+    $requestKey = Get-AgentReplayRequestKey -Name $Name -Arguments $Arguments
+    return [bool]$Snapshot.Served.ContainsKey($requestKey.Key)
 }
 
 # ---------------------------------------------------------------------------
@@ -1180,6 +2600,20 @@ function Send-AgentMcpRequest {
         [hashtable]$Params = @{},
         [Nullable[DateTime]]$DeadlineUtc
     )
+    if ($Session.ContainsKey("Replay") -and $null -ne $Session.Replay) {
+        # A replay session has no process and no socket. Every branch below this
+        # one is unreachable from here, which is the point: there is no code path
+        # from a replay session to the network. -DeadlineUtc is deliberately not
+        # consulted - a serve is a bounded in-memory hash and parse with nothing
+        # to wait for, so honouring a deadline here would only ever be theatre.
+        if ($Method -cne "tools/call") {
+            throw "Replay session refuses JSON-RPC method '$Method'; a replay answers recorded tool reads only."
+        }
+        if (-not $Params.ContainsKey("name") -or -not $Params.ContainsKey("arguments")) {
+            throw "Replay session received a tools/call without a name and arguments."
+        }
+        return (Get-AgentReplayResponse -Snapshot $Session.Replay -Name ([string]$Params["name"]) -Arguments $Params["arguments"])
+    }
     if (-not $Session.Process) { throw "Agent MCP session is closed." }
     $Session.NextId = [long]$Session.NextId + 1
     $requestId = [long]$Session.NextId
@@ -1235,6 +2669,9 @@ function Send-AgentMcpRequest {
 
 function Send-AgentMcpNotification {
     param([Parameter(Mandatory)][hashtable]$Session, [Parameter(Mandatory)][string]$Method, [hashtable]$Params = @{})
+    if ($Session.ContainsKey("Replay") -and $null -ne $Session.Replay) {
+        throw "Replay session refuses JSON-RPC notification '$Method'; a replay answers recorded tool reads only."
+    }
     $notification = [ordered]@{ jsonrpc = "2.0"; method = $Method; params = $Params } | ConvertTo-Json -Compress -Depth 10
     try {
         $Session.Process.StandardInput.WriteLine($notification)
@@ -1248,7 +2685,15 @@ function Send-AgentMcpNotification {
 
 function Close-AgentMcpSession {
     param([hashtable]$Session, [switch]$Abort)
-    if (-not $Session -or -not $Session.Process) { return }
+    if (-not $Session) { return }
+    if ($Session.ContainsKey("Replay") -and $null -ne $Session.Replay) {
+        # Dropping the snapshot reference ends the session; there was never a
+        # process to stop. Serving after this point fails on the null check
+        # in Send-AgentMcpRequest, exactly as a closed live session does.
+        $Session.Replay = $null
+        return
+    }
+    if (-not $Session.Process) { return }
     $process = [System.Diagnostics.Process]$Session.Process
     try { $process.StandardInput.Close() } catch {}
     if ($Abort -or -not $process.WaitForExit(2000)) {
@@ -1274,8 +2719,34 @@ function Open-AgentMcpSession {
         [ValidateRange(5, 120)][int]$TimeoutSeconds = 30,
         [string]$ProtocolVersion = "2024-11-05",
         [string]$ClientName = "copilot-agent-harness",
-        [string[]]$EnvironmentVariablesToRemove = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
+        [string[]]$EnvironmentVariablesToRemove = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN"),
+        [hashtable]$ReplaySnapshot
     )
+    if ($ReplaySnapshot) {
+        # Offline replay: no process is started, so -AgencyPath is never
+        # executed and the child-environment scrubbing below has nothing to
+        # scrub. The returned session carries the same Server/Organization the
+        # caller asked for, because callers assert on those before using it.
+        if (-not [object]::ReferenceEquals($ReplaySnapshot.Seal, $script:AgentReplaySnapshotSeal)) {
+            throw "Replay session requires a snapshot produced by New-AgentReplaySnapshot."
+        }
+        # A snapshot captured against a different organization would answer
+        # every question consistently and wrongly. Bind it here, at the one
+        # place a session is created, rather than trusting each caller.
+        if ($Organization -and [string]$ReplaySnapshot.Binding.Organization -cne $Organization) {
+            throw "Replay snapshot '$($ReplaySnapshot.SnapshotId)' was captured against organization '$($ReplaySnapshot.Binding.Organization)', not '$Organization'."
+        }
+        return @{
+            Process        = $null
+            NextId         = [long]0
+            ReadTask       = $null
+            ErrorDrainTask = $null
+            TimeoutSeconds = $TimeoutSeconds
+            Server         = $Server
+            Organization   = $Organization
+            Replay         = $ReplaySnapshot
+        }
+    }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $AgencyPath
     $args = @("mcp", $Server)
@@ -1320,6 +2791,75 @@ function Open-AgentMcpSession {
         Close-AgentMcpSession -Session $session -Abort
         throw
     }
+}
+
+function Test-AgentMcpToolResultShape {
+    <#
+        True when a JSON-RPC `result` is something a reader could actually
+        consume: the MCP tool-result shape, a content array whose first item
+        carries text or an embedded resource. This is the load-time and
+        seal-time mirror of what Invoke-AgentMcpTool requires at read time, so
+        a recorded response that no reader could parse is refused while it is
+        still being written down rather than in the middle of a run.
+    #>
+    param([Parameter(Mandatory)][AllowNull()]$Result)
+    if ($Result -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    if ($Result.PSObject.Properties["isError"] -and $Result.isError -eq $true) { return $false }
+    $contentProperty = $Result.PSObject.Properties["content"]
+    if ($null -eq $contentProperty) { return $false }
+    $content = @($contentProperty.Value)
+    if ($content.Count -lt 1 -or $content[0] -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    $first = $content[0]
+    $textTypeValid = (-not $first.PSObject.Properties["type"] -or [string]$first.type -ceq "text")
+    if ($textTypeValid -and $first.PSObject.Properties["text"] -and
+        $first.text -is [string] -and $first.text.Length -le 20MB) {
+        return $true
+    }
+    if ($first.PSObject.Properties["resource"] -and
+        $first.PSObject.Properties["type"] -and [string]$first.type -ceq "resource" -and
+        $first.resource -is [System.Management.Automation.PSCustomObject]) {
+        if ($content.Count -ne 1) { return $false }
+        if (@($first.PSObject.Properties.Name | Where-Object { @("resource", "type") -cnotcontains $_ }).Count -gt 0) {
+            return $false
+        }
+        $resource = $first.resource
+        if (@("blob", "mimeType", "uri") | Where-Object { -not $resource.PSObject.Properties[$_] }) {
+            return $false
+        }
+        if (@($resource.PSObject.Properties.Name | Where-Object {
+                    @("blob", "mimeType", "uri") -cnotcontains $_
+                }).Count -gt 0) {
+            return $false
+        }
+        if ($resource.uri -isnot [string] -or [string]::IsNullOrWhiteSpace($resource.uri) -or
+            $resource.uri.Length -gt 2048 -or
+            $resource.mimeType -isnot [string] -or [string]::IsNullOrWhiteSpace($resource.mimeType) -or
+            $resource.mimeType.Length -gt 128 -or
+            $resource.blob -isnot [string] -or [string]::IsNullOrWhiteSpace($resource.blob)) {
+            return $false
+        }
+        $blob = [string]$resource.blob
+        if (($blob.Length % 4) -ne 0 -or $blob -notmatch '^[A-Za-z0-9+/]*={0,2}$') { return $false }
+        try { $bytes = [Convert]::FromBase64String($blob) }
+        catch { return $false }
+        if ($bytes.Length -lt 1 -or $bytes.Length -gt 5MB -or
+            [Convert]::ToBase64String($bytes) -cne $blob -or
+            ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) {
+            return $false
+        }
+        try {
+            $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        }
+        catch { return $false }
+        foreach ($character in $text.ToCharArray()) {
+            $code = [int]$character
+            if (($code -lt 32 -and $code -notin @(9, 10, 13)) -or $code -eq 127) {
+                return $false
+            }
+        }
+        return $true
+    }
+    return $false
 }
 
 function Invoke-AgentMcpTool {
@@ -1479,9 +3019,19 @@ function Get-AgentCliJsonOutcome {
         events are streaming fragments of the SAME message, so including them
         would duplicate the answer (and any result marker inside it).
 
-        Returns @{ Answer; Model; ModifiedFiles; ToolRequests; ExitCode } or $null when the
-        output is not JSONL - an older CLI, or a run without --output-format -
-        so the caller falls back to raw stdout instead of failing the cycle.
+        Usage accounting is read from two events, when present, so a caller can
+        record exact per-attempt cost even for a run that produced no marker:
+          {"type":"result","usage":{"premiumRequests":N,"totalApiDurationMs":N,"sessionDurationMs":N}}
+          {"type":"session.usage_checkpoint","data":{"totalNanoAiu":N,"totalPremiumRequests":N}}
+        The checkpoint is cumulative, so the LAST one seen wins. Every usage
+        figure is null when its event/field is absent - never zero, so a caller
+        can tell "the CLI did not report this" from "the CLI reported zero".
+
+        Returns @{ Answer; Model; ModifiedFiles; ToolRequests; ExitCode; ModelActuallyRan; Usage }
+        or $null when the output is not JSONL - an older CLI, or a run without
+        --output-format - so the caller falls back to raw stdout instead of
+        failing the cycle. Usage is a hashtable whose values are null when the
+        CLI did not report them.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText)
     if ([string]::IsNullOrWhiteSpace($StdOutText)) { return $null }
@@ -1492,8 +3042,27 @@ function Get-AgentCliJsonOutcome {
     $toolRequests = New-Object System.Collections.Generic.List[string]
     $model = ""
     $exitCode = $null
+    $usagePremiumRequests = $null
+    $usageTotalApiDurationMs = $null
+    $usageSessionDurationMs = $null
+    $usageTotalNanoAiu = $null
+    $usageTotalPremiumRequests = $null
     $sawJson = $false
     $sawAssistantMessage = $false
+    # A CLI usage figure may exceed [int]::MaxValue (nano-AIU totals are large),
+    # so these are read as [long] with a strict non-negative integral check that
+    # rejects strings, fractions, and negatives - never coercing junk to a number.
+    $readLong = {
+        param($Value)
+        if ($null -eq $Value) { return $null }
+        if ($Value -is [double] -or $Value -is [single]) {
+            if ([double]$Value -ne [Math]::Floor([double]$Value)) { return $null }
+        }
+        [long]$parsed = 0
+        if (-not [long]::TryParse(([string]$Value), [ref]$parsed)) { return $null }
+        if ($parsed -lt 0) { return $null }
+        return $parsed
+    }
     foreach ($line in ($StdOutText -split "`r?`n")) {
         $trimmed = "$line".Trim()
         if ($trimmed.Length -lt 2 -or -not $trimmed.StartsWith("{")) { continue }
@@ -1557,7 +3126,20 @@ function Get-AgentCliJsonOutcome {
                         foreach ($v in @($fmProp.Value)) { if ($v -is [string] -and $v.Trim() -ne "") { [void]$modified.Add([string]$v) } }
                     }
                 }
+                $prProp = $usageProp.Value.PSObject.Properties["premiumRequests"]
+                if ($prProp) { $usagePremiumRequests = (& $readLong $prProp.Value) }
+                $adProp = $usageProp.Value.PSObject.Properties["totalApiDurationMs"]
+                if ($adProp) { $usageTotalApiDurationMs = (& $readLong $adProp.Value) }
+                $sdProp = $usageProp.Value.PSObject.Properties["sessionDurationMs"]
+                if ($sdProp) { $usageSessionDurationMs = (& $readLong $sdProp.Value) }
             }
+        }
+        elseif ($eventType -eq "session.usage_checkpoint" -and $data) {
+            # Cumulative: the last checkpoint carries the run's running totals.
+            $naProp = $data.PSObject.Properties["totalNanoAiu"]
+            if ($naProp) { $v = (& $readLong $naProp.Value); if ($null -ne $v) { $usageTotalNanoAiu = $v } }
+            $tprProp = $data.PSObject.Properties["totalPremiumRequests"]
+            if ($tprProp) { $v = (& $readLong $tprProp.Value); if ($null -ne $v) { $usageTotalPremiumRequests = $v } }
         }
     }
     if (-not $sawJson) { return $null }
@@ -1575,6 +3157,13 @@ function Get-AgentCliJsonOutcome {
         ToolRequests   = @($toolRequests.ToArray())
         ExitCode       = $exitCode
         ModelActuallyRan = $sawAssistantMessage
+        Usage          = @{
+            PremiumRequests      = $usagePremiumRequests
+            TotalApiDurationMs   = $usageTotalApiDurationMs
+            SessionDurationMs    = $usageSessionDurationMs
+            TotalNanoAiu         = $usageTotalNanoAiu
+            TotalPremiumRequests = $usageTotalPremiumRequests
+        }
     }
 }
 
@@ -2897,6 +4486,8 @@ Export-ModuleMember -Function @(
     "Get-AgentRequiredProperty",
     "Get-AgentDefaultModelSentinel",
     "Assert-AgentSupportedModel",
+    "Get-AgentGeneralistModelPair",
+    "Test-AgentGeneralistModelPair",
     "Test-ParserValidity",
     "Get-OnceFinalExitCode",
     "Test-StrictJsonInt",
@@ -2918,6 +4509,13 @@ Export-ModuleMember -Function @(
     "Set-JsonState",
     "Write-AgentMetadata",
     "ConvertFrom-AgentResultMarker",
+    "ConvertFrom-AgentResultMarkerOutcome",
+    "Get-AgentResultMarkerOutcome",
+    "Test-AgentMarkerStatusRetryable",
+    "Measure-AgentMarkerSchemaWorstCaseChars",
+    "Measure-AgentMarkerSchemaWorstCaseBytes",
+    "Test-AgentMarkerSchemaFitsScanWindow",
+    "Test-AgentMarkerSchemaFitsLaunchContract",
     "ConvertTo-AgentCanonicalMarkerJson",
     "Find-CopilotSessionForBranch",
     "Set-TimedProcessArguments",
@@ -2929,7 +4527,15 @@ Export-ModuleMember -Function @(
     "Send-AgentMcpRequest",
     "Send-AgentMcpNotification",
     "Invoke-AgentMcpTool",
+    "Test-AgentMcpToolResultShape",
     "ConvertFrom-AgentMcpResourceContent",
+    "ConvertTo-AgentReplayCanonicalJson",
+    "Get-AgentReplayRequestKey",
+    "Test-AgentReplayToolPermitted",
+    "New-AgentReplaySnapshot",
+    "Assert-AgentReplaySnapshotPromotable",
+    "Get-AgentReplayResponse",
+    "Test-AgentReplaySnapshotHasResponse",
     "Get-AgentSupportedProvider",
     "Test-AgentProviderSupported",
     "New-AgentProviderContext",

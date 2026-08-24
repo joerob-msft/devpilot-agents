@@ -38,6 +38,13 @@
       "conventionVerifierModel": "",
       "timeoutSeconds": 900
     },
+    "sourceTransport": {
+      "note": "MCP remains first preference. This read-only Azure CLI fallback is used only when hosted MCP lacks authoritative iteration identity. Enabling it requires an exact tenant binding and local Azure CLI authentication; see docs/source-transport.md.",
+      "azureDevOpsCliFallback": {
+        "enabled": false,
+        "tenantId": "12121212-3434-5656-7878-909090909090"
+      }
+    },
     "maxFindings": 8,
     "postSeverities": [
       "critical",

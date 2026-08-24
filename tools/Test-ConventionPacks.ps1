@@ -392,6 +392,58 @@ Assert-ConventionThrows {
         -ScriptSha256 ("e" * 64) -ConfigSha256 ("f" * 64)
 } "A one-byte total context overflow was accepted."
 
+# ---------------------------------------------------------------------------
+# Offline-replay convention-source degrade.
+#
+# When the immutable corpus never captured an authoritative/repository source
+# (a legitimate offline condition, not a hostile one), the planner must withhold
+# only that pack at candidate level and flag the plan evidence-degraded, instead
+# of throwing - which would abort the whole cycle, taking functional generalist
+# discovery down with it. The plan must stay structurally "ready" (a usable,
+# digest-bound object) and keep an exact target commit and change-set digest so
+# reciprocal cross-verification still runs for the functional candidates.
+# ---------------------------------------------------------------------------
+$policy.Packs[0].MaxBytes = $exactPackBytes
+$policy.MaxTotalBytes = $exactPackBytes
+
+# Default (live) behavior is unchanged: a selected pack whose source did not
+# resolve is a hard configuration/transport error.
+Assert-ConventionThrows {
+    New-ReviewerConventionContextPlan -Policy $policy -Selection $selection -Binding $binding `
+        -AuthoritativeSnapshots @() -RepositorySnapshots @() `
+        -ScriptSha256 ("e" * 64) -ConfigSha256 ("f" * 64)
+} "A missing convention source was accepted without -AllowDegradedSources."
+
+$degradedPlan = New-ReviewerConventionContextPlan -Policy $policy -Selection $selection -Binding $binding `
+    -AuthoritativeSnapshots @() -RepositorySnapshots @() `
+    -ScriptSha256 ("e" * 64) -ConfigSha256 ("f" * 64) -AllowDegradedSources
+Assert-ConventionTest ([string]$degradedPlan.status -ceq "ready") `
+    "A degraded convention plan must remain structurally ready."
+Assert-ConventionTest ([bool]$degradedPlan.evidenceDegraded -and [string]$degradedPlan.evidenceStatus -ceq "degraded") `
+    "A withheld-source plan must report evidenceStatus=degraded."
+Assert-ConventionTest (@($degradedPlan.selectedPacks).Count -eq 0) `
+    "A pack whose only source is unavailable must not be selected."
+Assert-ConventionTest (@($degradedPlan.withheldPacks | Where-Object {
+            [string]$_.reason -ceq "authoritative-source-unavailable" -and [bool]$_.degraded -eq $true
+        }).Count -ge 1) `
+    "A degraded pack must be withheld with a typed authoritative-source-unavailable reason."
+Assert-ConventionTest ([string]$degradedPlan.targetCommit -ceq [string]$binding.TargetCommit -and
+    [string]$degradedPlan.changeSetDigest -ceq [string]$binding.ChangeSetDigest) `
+    "A degraded plan must still carry the exact sealed target commit and change-set digest."
+Assert-ConventionTest ([string]$degradedPlan.degradedReason -match "unavailable") `
+    "A degraded plan must name why its evidence is incomplete."
+
+# With the same switch on and the source PRESENT, the plan is not degraded and
+# selects the pack exactly as the default path would - the switch only changes
+# the unavailable-source case, never a fully-evidenced one.
+$notDegradedPlan = New-ReviewerConventionContextPlan -Policy $policy -Selection $selection -Binding $binding `
+    -AuthoritativeSnapshots @($snapshot) -RepositorySnapshots @() `
+    -ScriptSha256 ("e" * 64) -ConfigSha256 ("f" * 64) -AllowDegradedSources
+Assert-ConventionTest (-not [bool]$notDegradedPlan.evidenceDegraded -and
+    [string]$notDegradedPlan.evidenceStatus -ceq "complete" -and
+    @($notDegradedPlan.selectedPacks).Count -eq 1) `
+    "-AllowDegradedSources must not degrade a plan whose sources are all present."
+
 $policy.Packs[0].MaxBytes = $exactPackBytes
 $policy.MaxTotalBytes = $exactPackBytes
 $plan = New-ReviewerConventionContextPlan -Policy $policy -Selection $selection -Binding $binding `
