@@ -300,9 +300,14 @@ function Get-ReviewerConventionChangeArray {
 }
 
 function Test-ReviewerConventionResponseTruncated {
+    <# The page is the CALLER's to state, and there is no default. This function
+       once carried its own copy of 1000, which is one more author than a page
+       size is allowed to have: the number belongs to the shared change-list
+       constructor, and a silent fallback here is how a future caller compares a
+       response against a page nobody asked for. #>
     param(
         [Parameter(Mandatory)]$Response,
-        [int]$Limit = 1000
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$Limit
     )
     return @(Get-ReviewerConventionChangeArray -Response $Response).Count -ge $Limit
 }

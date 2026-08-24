@@ -64,6 +64,28 @@ $script:ReviewerSourceCommitIdPattern = '^[0-9a-f]{40}$'
 $script:ReviewerSourceRefHeadPattern = '^refs/heads/[^\x00-\x1f\x7f\\]+$'
 $script:ReviewerSourceChangePageSize = 200
 $script:ReviewerSourceChangeLimit = 1000
+# The thread-list tool contract, in exactly one place.
+#
+# WHY IT LIVES HERE. A replay answers the arguments it recorded and nothing else:
+# there is no live seam to fall through to. So the offline corpus must be
+# captured under the SAME argument vector the live cycle issues, byte for byte,
+# or the reviewer stops mid-cycle on a read it can prove it needs and cannot get.
+# That is not hypothetical - a builder that asked for one thread MORE than the
+# reviewer asks for (a cap+1 overflow probe, correct for the change-set reads
+# where the builder itself enforces the cap) produced a corpus whose thread read
+# no answer matched, and the slot died before its first model start.
+#
+# The cap+1 trick cannot apply to this read, because this read is not the
+# builder's to shape: it belongs to the live cycle. Completeness is therefore
+# ACCOUNTED rather than probed - a count that reaches the top is a count that
+# cannot be proven complete, and the builder refuses instead of guessing.
+#
+# The two values are held INSIDE their accessors rather than in $script: state,
+# for the reason this file already gives above: a dot-sourced library resolves
+# $script: against whoever runs it, and these accessors are reached through
+# several different load chains (the live agent, the evidence builder, the
+# builder's own callers). A function that carries its answer cannot be reached
+# from a scope that never got the variable.
 $script:ReviewerSourceAzMaxResponseBytes = 1048576
 $script:ReviewerSourceAzMaxErrorBytes = 16384
 $script:ReviewerSourceAzTimeoutSeconds = 30
@@ -221,6 +243,120 @@ function Add-ReviewerSourceResourceBinding {
         }
     }
     return $Resource
+}
+
+function Get-ReviewerThreadListTop {
+    <# The one thread-list page size. Read it; never restate it. #>
+    return 200
+}
+
+function Get-ReviewerThreadListToolName {
+    <# The one thread-list tool name. Read it; never restate it. #>
+    return 'repo_pull_request_thread'
+}
+
+function New-ReviewerThreadListRequest {
+    <#
+    .SYNOPSIS
+        The one construction of the reviewer's thread-list tool call: its name
+        and its exact argument vector.
+
+    .DESCRIPTION
+        Both the live cycle and the offline-corpus builder call this. They must,
+        because a replay matches a recorded request exactly and never falls
+        through to a live read - so a second copy of these five keys anywhere is
+        a corpus that stops a slot the first time the copies drift.
+
+        The vector is returned in the live cycle's own key order. Callers that
+        need a plain hashtable (the MCP wrapper takes one) cast it; the cast
+        preserves both the keys and their types.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Project,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryName,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId
+    )
+    return [pscustomobject]@{
+        Name = (Get-ReviewerThreadListToolName)
+        Arguments = [ordered]@{
+            action = 'list'
+            project = $Project
+            repositoryId = $RepositoryName
+            pullRequestId = $PullRequestId
+            top = (Get-ReviewerThreadListTop)
+        }
+    }
+}
+
+function Get-ReviewerChangeListTop {
+    <# The one flat change-list page size. Read it; never restate it.
+
+       It is the same number as $script:ReviewerSourceChangeLimit - the bound the
+       authoritative paginated contract accumulates up to - because a flat read
+       that asked for less would answer a smaller set than the paginated read
+       does for the same subject, and the two would disagree about what "the
+       change set" is. Held inside the accessor for the scope reason above; the
+       agent asserts the two agree at load. #>
+    return 1000
+}
+
+function Get-ReviewerChangeListToolName {
+    <# The one change-list tool name. Read it; never restate it. #>
+    return 'repo_pull_request'
+}
+
+function New-ReviewerChangeListRequest {
+    <#
+    .SYNOPSIS
+        The one construction of the reviewer's flat change-list tool call: its
+        name and its exact argument vector, in both variants the cycle issues.
+
+    .DESCRIPTION
+        Same contract as the thread list, and it exists for the same reason. A
+        replay answers the arguments it recorded and never falls through to a
+        live read, so the offline corpus has to be captured under the SAME
+        vector the live cycle issues. A builder that asked for one change MORE
+        than the reviewer asks for - a cap+1 overflow probe, defensible on its
+        face - produced a corpus whose change reads no answer matched, and the
+        slot died in convention-context planning before its first model start.
+
+        TWO VARIANTS, because the cycle issues two distinct read keys: the plain
+        change list (paths and change kinds) and the diff-bearing one that also
+        carries line content. A snapshot holding only the plain one leaves the
+        second unanswered at the moment it is issued.
+
+        The cap+1 trick cannot apply here either, now that this read belongs to
+        the live cycle rather than to the builder. Completeness is ACCOUNTED
+        instead: above the operator's cap is CE402, and a count that reaches
+        this page - or a response that says a page follows it - is CE409,
+        because a full page is what a truncated set and an exactly-full one both
+        look like.
+
+        The paginated authoritative contract is a DIFFERENT read with its own
+        top/skip/iterationId vector and its own bound; it is built inside this
+        library already and is deliberately not routed through here.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Project,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryName,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [switch]$IncludeDiffs
+    )
+    $arguments = [ordered]@{
+        action = 'get_changes'
+        project = $Project
+        repositoryId = $RepositoryName
+        pullRequestId = $PullRequestId
+    }
+    if ($IncludeDiffs) {
+        $arguments['includeDiffs'] = $true
+        $arguments['includeLineContent'] = $true
+    }
+    $arguments['top'] = (Get-ReviewerChangeListTop)
+    return [pscustomobject]@{
+        Name = (Get-ReviewerChangeListToolName)
+        Arguments = $arguments
+    }
 }
 
 function Test-ReviewerSourceGetChangesCapability {

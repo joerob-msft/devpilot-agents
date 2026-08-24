@@ -603,6 +603,13 @@ function New-CohortEntryRequest {
         targetCommit = (New-FakeCommit)
     }
     $token = [string]([IO.Path]::GetFullPath((Join-Path $Sandbox "inputs\$EntryId.token")))
+    # Written, not merely named. These entries declare slots authorized by this
+    # token, and a cohort refuses an entry whose authorization was never
+    # published - which is the correction that made a fixture declaring one it
+    # never wrote a fixture describing an entry that could not have run.
+    [void](New-Item -ItemType Directory -Force -Path (Split-Path -Parent $token))
+    [IO.File]::WriteAllBytes($token,
+        ([System.Text.UTF8Encoding]::new($false)).GetBytes(((1..32 | ForEach-Object { '{0:x2}' -f (Get-Random -Minimum 0 -Maximum 256) }) -join '')))
     $slot = {
         param($name, $stateDir, $terminal)
         [ordered]@{
@@ -2378,6 +2385,24 @@ try {
     Assert-Cohort ($runLegacy.ExitCode -eq 2) "A v1 manifest exited $($runLegacy.ExitCode); expected 2."
     Assert-Cohort ($runLegacy.Output -match 'model-start budget') `
         'The refusal of a v1 manifest did not say that its model start budget is the reason.'
+
+    # The bound this runner reads is produced by one reviewed tool and consumed
+    # here, and the two agree on the kind only by writing the same literal down
+    # twice. A producer that moved to a new kind while this reader stayed on the
+    # old one would refuse every entry in the field; a reader that moved while
+    # the producer stayed would accept a bound nobody derived. Compared directly
+    # so neither can move alone.
+    $producerPath = Join-Path $PSScriptRoot 'New-ShadowModelStartBound.ps1'
+    $runnerPath = Join-Path $PSScriptRoot 'ShadowRunCoordinator\CohortRunner.cs'
+    $producerKind = @([regex]::Matches([IO.File]::ReadAllText($producerPath),
+            '(?m)^\$BoundKind\s*=\s*''(?<value>[^'']+)''\s*$'))
+    $runnerKind = @([regex]::Matches([IO.File]::ReadAllText($runnerPath),
+            'ModelStartBoundKind\s*=\s*"(?<value>[^"]+)"'))
+    Assert-Cohort ((@($producerKind).Count -eq 1) -and (@($runnerKind).Count -eq 1)) `
+        'The model start bound kind is declared other than exactly once in the producer and exactly once in the runner.'
+    Assert-Cohort ([string]@($producerKind)[0].Groups['value'].Value -ceq [string]@($runnerKind)[0].Groups['value'].Value) `
+        ("The bound producer emits kind '$(@($producerKind)[0].Groups['value'].Value)' and this runner reads " +
+        "'$(@($runnerKind)[0].Groups['value'].Value)'. A cohort cannot load a bound its own producer no longer writes.")
 
     # -----------------------------------------------------------------------
     Write-Host '26/35 a production cohort cannot pass a fault argument' -ForegroundColor Cyan

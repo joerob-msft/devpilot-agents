@@ -7646,6 +7646,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -7694,6 +7695,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -7742,6 +7744,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -7790,6 +7793,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -7838,6 +7842,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -7886,6 +7891,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -7934,6 +7940,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -7982,6 +7989,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8030,6 +8038,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8078,6 +8087,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8126,6 +8136,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8174,6 +8185,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8222,6 +8234,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8270,6 +8283,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8318,6 +8332,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8366,6 +8381,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8414,6 +8430,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8462,6 +8479,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8510,6 +8528,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8558,6 +8577,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8606,6 +8626,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8654,6 +8675,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8702,6 +8724,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
@@ -8750,6 +8773,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/CohortEntryPackage.ps1",
         "src/Agents/reviewer/CorpusSeal.ps1",
         "src/Agents/reviewer/ShadowPreparation.ps1"
       ],

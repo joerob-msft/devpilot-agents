@@ -266,15 +266,18 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 PublishIndexSafely(journal, key, CohortIndex.ReasonRunning, "the cohort is in progress");
                 RequireLiveToolkitHead();
                 RequireSealedModelStartBounds();
+                RequireDeclaredLaunchAuthorizations();
                 RequireRegistryAdmissible(journal, key);
             }
             catch (Exception error) when (error is ContractException or CohortBlockedException or IOException or UnauthorizedAccessException)
             {
                 // Everything above runs BEFORE the walk reaches the first entry, and
-                // every one of these four can refuse a resume: damaged artifacts from
+                // every one of these can refuse a resume: damaged artifacts from
                 // an entry that already ended, a toolkit checkout that moved, a plan
-                // whose bounds no longer read, or an account that took one of this
-                // cohort's remaining subjects while it was stopped. An entry that
+                // whose bounds no longer read, a declared launch authorization that
+                // is no longer the one its run set was sealed against, or an account
+                // that took one of this cohort's remaining subjects while it was
+                // stopped. An entry that
                 // ended and never reached the account would be stranded by any of
                 // them - spent, unheld, and free for the next selection - because the
                 // row is written by the walk below, which is never reached. So the
@@ -1852,6 +1855,108 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             seconds += record.ElapsedSeconds;
         }
         return new CohortRegistryAdmission.Spent(models, verifiers, seconds);
+    }
+
+    /// <summary>
+    /// Requires every entry that declares slots to have the launch authorization
+    /// its own request names, before any entry is started.
+    /// </summary>
+    /// <remarks>
+    /// A slots-carrying entry can be sealed, sealable, walkable and standing at
+    /// runSetReady while naming a launch authorization that no declaration ever
+    /// published. Everything about it reads as ready; the first thing that
+    /// notices is the first slot prelaunch, which is after the cohort has been
+    /// assembled around it and after an operator has spent the one execution
+    /// they were authorized. That is the wrong place to find out, so the whole
+    /// set is checked here, in the same pre-walk pass that proves the model
+    /// start bounds, where refusing costs nothing.
+    ///
+    /// Only EXISTENCE and shape are checked here, deliberately. The token's
+    /// digest is sealed into the run set's plan, and the reviewed prelaunch path
+    /// reproduces that plan from the token it reads - so a substituted token is
+    /// already refused there, by the party that holds the plan. Re-deriving the
+    /// plan digest in this pass would be a second answer to a question the
+    /// signed declaration already answers.
+    ///
+    /// And only for entries whose preparation has ALREADY declared its run set.
+    /// An entry starting from nothing mints its authorization during the run, as
+    /// part of declaring the set; demanding one before it has run would refuse
+    /// every fresh entry. What this catches is the other case - a preparation
+    /// that is past that point, so its authorization exists somewhere, and the
+    /// path its request names is not where.
+    ///
+    /// The state record is read here for that one fact and is NOT authenticated
+    /// here: this pass holds no coordinator key, and the key for a foreign entry
+    /// stands in that entry's own root. Nothing rests on it. A record that
+    /// understates its state - truncated, stale, or edited to slip past this pass
+    /// - buys nothing, because the very next thing the entry does is run its
+    /// coordinator, which loads the same record under its signing key and refuses
+    /// a signature, correlation or request digest that does not match. This pass
+    /// brings the refusal EARLIER for the honest case; it is not the thing that
+    /// makes forgery unprofitable.
+    /// </remarks>
+    private void RequireDeclaredLaunchAuthorizations()
+    {
+        foreach (var entry in _manifest.Entries)
+        {
+            var label = $"entry '{entry.EntryId}' request";
+            var request = StrictJson.ReadObjectFile(entry.RequestPath, label);
+            if (!request.TryGetProperty("slots", out var slots) || slots.ValueKind != System.Text.Json.JsonValueKind.Object)
+            {
+                // A preparation-only entry authorizes no launch and needs no
+                // authorization to launch with.
+                continue;
+            }
+
+            var statePath = Path.Combine(entry.OutputRoot, "coordinator", "state.json");
+            if (!File.Exists(statePath))
+            {
+                continue;
+            }
+            var stateLabel = $"entry '{entry.EntryId}' coordinator state";
+            var declared = PreparationStateNames.Parse(
+                StrictJson.RequireString(StrictJson.ReadObjectFile(statePath, stateLabel), "state", stateLabel));
+            if (PreparationStateNames.RankOf(declared) < PreparationStateNames.RankOf(PreparationState.RunSetDeclared))
+            {
+                continue;
+            }
+
+            var seen = new SortedSet<string>(StringComparer.Ordinal);
+            foreach (var slot in StrictJson.RequireArray(slots, "declared", label))
+            {
+                seen.Add(StrictJson.RequireString(slot, "launchAuthorizationTokenPath", label));
+            }
+            seen.Add(StrictJson.RequireString(StrictJson.RequireObject(slots, "reconciliation", label), "launchAuthorizationTokenPath", label));
+            // Delivery is optional in this contract; a preparation may declare
+            // slots and reconcile them without publishing anything at all.
+            if (slots.TryGetProperty("delivery", out var delivery) && delivery.ValueKind == System.Text.Json.JsonValueKind.Object)
+            {
+                seen.Add(StrictJson.RequireString(delivery, "launchAuthorizationTokenPath", label));
+            }
+            if (seen.Count != 1)
+            {
+                throw new ContractException(
+                    $"Entry '{entry.EntryId}' names {seen.Count.ToString(CultureInfo.InvariantCulture)} distinct launch authorizations across its slots, " +
+                    "reconciliation and delivery. One preparation declares one run set and one run set publishes one authorization, so more than one path " +
+                    "means at least one of them belongs to a different run.");
+            }
+
+            var tokenPath = seen.Min!;
+            if (!File.Exists(tokenPath))
+            {
+                throw new ContractException(
+                    $"Entry '{entry.EntryId}' stands at '{PreparationStateNames.ToName(declared)}' with its slots authorized by '{tokenPath}', and there is " +
+                    "no such file. Its run set declaration published a token somewhere; an entry naming one that was never published cannot launch a single " +
+                    "slot, and the cohort refuses it here rather than at the first prelaunch, after the run it was going to spend is gone.");
+            }
+            var text = StrictJson.StrictUtf8.GetString(StrictJson.ReadFileBytes(tokenPath, $"entry '{entry.EntryId}' launch authorization", 4096));
+            if (text.Length != 64 || !StrictJson.IsLowerHex(text))
+            {
+                throw new ContractException(
+                    $"Entry '{entry.EntryId}' declares a launch authorization at '{tokenPath}' that is not the 64 lowercase hex characters a published " +
+                    "authorization holds. What the prelaunch hashes has to be the token the declaration minted.");
+            }
+        }
     }
 
     /// <summary>
