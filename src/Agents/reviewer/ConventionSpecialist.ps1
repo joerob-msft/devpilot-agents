@@ -927,6 +927,44 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
     }
 }
 
+function ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$ScanWindowChars = 327680
+    )
+    $normalizer = {
+        param($MarkerCandidate)
+        $normalizedFields = [System.Collections.Generic.List[object]]::new()
+        $candidatesProperty = $MarkerCandidate.PSObject.Properties['candidates']
+        if ($candidatesProperty -and $candidatesProperty.Value -is [System.Object[]]) {
+            $candidates = [System.Object[]]$candidatesProperty.Value
+            for ($index = 0; $index -lt $candidates.Count; $index++) {
+                $candidateItem = $candidates[$index]
+                if ($candidateItem -isnot [System.Management.Automation.PSCustomObject]) { continue }
+                $fixProperty = $candidateItem.PSObject.Properties['changedCodeFix']
+                if (-not $fixProperty -or
+                    $fixProperty.Value -isnot [System.Management.Automation.PSCustomObject]) { continue }
+                $evidenceProperty = $fixProperty.Value.PSObject.Properties['evidenceFactIds']
+                if (-not $evidenceProperty -or $evidenceProperty.Value -isnot [System.Object[]] -or
+                    ([System.Object[]]$evidenceProperty.Value).Count -ne 0) { continue }
+                $field = "candidates[$index].changedCodeFix.evidenceFactIds"
+                $evidenceProperty.Value = ''
+                [void]$normalizedFields.Add([ordered]@{
+                        Field = $field
+                        From = 'emptyJsonArray'
+                        To = 'emptyString'
+                        OriginalTypedReason = "The marker field '$field' failed its typed schema rule."
+                    })
+            }
+        }
+        return @{ Value = $MarkerCandidate; NormalizedFields = @($normalizedFields) }
+    }
+    return ConvertFrom-AgentResultMarkerOutcome -StdOutText $StdOutText `
+        -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix -Schema $Schema `
+        -ScanWindowChars $ScanWindowChars -CandidateNormalizer $normalizer
+}
+
 function Test-ReviewerConventionSpecialistBinding {
     param(
         [Parameter(Mandatory)][hashtable]$Marker,

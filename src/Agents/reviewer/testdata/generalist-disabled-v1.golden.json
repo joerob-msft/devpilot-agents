@@ -137,6 +137,10 @@
       {
         "sha256": "a0d7cd76a8204e036ace2898a3bbfa71787e05205c5ed8f0e953e950da80fe1b",
         "reason": "Layer A audit fixes: compare the typed status against public literal strings instead of the module-scoped $script:AgentMarkerStatus (invisible here, so every marker was rejected as null), and add a real pre-launch result-contract gate (Assert-ReviewerModelResultContractFits) that proves the generalist schema's largest legal marker fits the declared scan window and output byte cap before Invoke-TimedProcess, handing the same window to the typed extractor."
+      },
+      {
+        "sha256": "b7d74eb08b5025689274c248c468ec9a01f53bc38eeb7a5ab83edbcd58194622",
+        "reason": "Route the already-gated generalist launch through the production-test-only offline subprocess boundary. Live execution still reaches Invoke-TimedProcess with the same arguments; sealed replay may select only the digest-bound deterministic adapter."
       }
     ],
     "Invoke-ReviewerPullRequest": [
@@ -159,6 +163,10 @@
       {
         "sha256": "6f6c02324459e6a98dada749a1253f65bc2fab5e437c70b06205f334e19bf224",
         "reason": "Thread the cycle-level authoritative-source configured/resolved counts and the withheld-degrade flag onto the bound item and into the convention-source summary call, so an offline replay that could not answer a configured generalist authoritative source is reported honestly (N of M resolved; K withheld) and degrades cross-verification instead of being silently summarized as a configuration gap. No change to the disabled generalist discovery or delivery path."
+      },
+      {
+        "sha256": "620d9b32c0b0b7fae72a811685ecb5a0082b123b9b198ce3f03abb7220fb1a82",
+        "reason": "CURRENT and authoritative. Route the generalist role through the existing single-role acquisition dispatch so a no-model role input capture drives the EXACT production cycle rather than a hand-built projection Bound. The guard that already returned early for the specialist now also does so for the generalist, which is what lets capture emit a production-derived role-scoped projection instead of consuming one. The disabled generalist discovery, cross-verification and delivery paths are unchanged: the dispatch is reachable only while an acquisition or capture target role is active."
       }
     ],
     "Write-ReviewerConventionSpecialistPreview": [

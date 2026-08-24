@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "fixtureId",
+    "expectedBaseCommit",
+    "adapterScript",
+    "adapterScriptSha256",
+    "classification",
+    "roles"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "reviewer-offline-model-adapter" },
+    "fixtureId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "expectedBaseCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "adapterScript": { "type": "string", "minLength": 1, "maxLength": 400 },
+    "adapterScriptSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "offlineOnly",
+        "nonPromotable",
+        "writesPermitted",
+        "outputsPreAuthored",
+        "oracleDerivedAtRuntime"
+      ],
+      "properties": {
+        "offlineOnly": { "const": true },
+        "nonPromotable": { "const": true },
+        "writesPermitted": { "const": false },
+        "outputsPreAuthored": { "const": true },
+        "oracleDerivedAtRuntime": { "const": false }
+      }
+    },
+    "roles": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["model", "behavior"],
+        "properties": {
+          "model": { "type": "string", "minLength": 1 },
+          "behavior": {
+            "enum": [
+              "success",
+              "missingMarker",
+              "truncatedMarker",
+              "multipleMarkers",
+              "wrongBinding",
+              "schemaInvalidMarker",
+              "timeout",
+              "crash",
+              "stdoutSaturation",
+              "stderrSaturation"
+            ]
+          },
+          "markerPrefix": { "type": "string" },
+          "markerTemplate": { "type": "object" }
+        }
+      }
+    }
+  }
+}

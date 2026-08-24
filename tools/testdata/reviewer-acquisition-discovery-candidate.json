@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-discovery-candidate-input",
+  "sourceFixtureId": "synthetic-generalist-acq",
+  "sourceRole": "generalist",
+  "sourceModel": "claude-opus-5",
+  "resultMarkerPrefix": "REVIEWER_RESULT_V1:",
+  "resultMarkerBinding": {
+    "prId": 4242,
+    "repositoryId": "11111111-2222-3333-4444-555555555555",
+    "project": "Widgets",
+    "sourceCommit": "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0"
+  },
+  "clusterId": "cluster-widget-lifecycle-01",
+  "candidates": [
+    {
+      "candidateId": "cand-001",
+      "candidateHash": "0badc0de1234abcd",
+      "severity": "important",
+      "filePath": "/src/Widget.cs",
+      "line": 15,
+      "comment": "Construction-stable identifier is mutated by the new Rename method."
+    }
+  ]
+}

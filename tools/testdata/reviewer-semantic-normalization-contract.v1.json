@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-semantic-decision-normalization-contract",
+  "excludedKeyPatterns": [
+    "(?i)(?:run|session|attempt|assignment)Id$|nonce(?:Sha256)?$",
+    "(?i)(timestamp|^(?:at|(?:child)?processId|pid)$|(?:created|updated|started|ended|generated|captured|frozen|recorded)At|timeUtc|atUtc|epochSeconds|duration(?:Ms|Seconds)?|elapsed(?:Ms|Seconds)?)$",
+    "(?i)(hmac|signature|signingKey|keyMaterial|secretKey)$"
+  ],
+  "setArrayPaths": [
+    "$.eligibleCandidateIds",
+    "$.blockedCandidateIds",
+    "$.residualRisks",
+    "$.verdicts"
+  ],
+  "setArrayPathPatterns": [
+    "(?i)\\.(?:assignments|verifierRuns|verifierModels)$"
+  ],
+  "derivedOperationalValuePathPatterns": [
+    "(?i)\\.(?:nonce|replayNonce|nonceSha256|hmac|signature|hmacSignature)$",
+    "(?i)\\.(?:candidateId|candidateHash|clusterId)$",
+    "(?i)\\.(?:markerSha256|originArtifactSha256|specialistArtifactSha256|inputManifestSha256|previewSha256|markdownSha256|replaySha256|reviewDigest)$",
+    "(?i)\\.(?:allInputArtifactHashes|inputArtifactHashes)\\[\\]\\.sha256$"
+  ],
+  "rules": {
+    "objectKeys": "ordinal case-sensitive sort",
+    "numbers": "JSON numeric value",
+    "strings": "preserved exactly",
+    "ordinaryArrays": "preserve order",
+    "setArrays": "sort by normalized compact JSON",
+    "embeddedJsonStrings": "parse recursively before normalization",
+    "operationalRoots": "replace caller-declared absolute roots and generated timestamped artifact leaf names with stable placeholders",
+    "derivedOperationalValues": "replace nonce-derived candidate, assignment, cluster, and artifact identities with relationship-preserving ordinal aliases",
+    "renderedArtifacts": "retain Markdown content while replacing only registered operational identities and roots"
+  }
+}

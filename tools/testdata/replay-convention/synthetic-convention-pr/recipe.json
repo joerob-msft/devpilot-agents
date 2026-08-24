@@ -89,5 +89,14 @@
       "version": "f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9"
     },
     "payloadFile": "payloads/file-conventions.json"
+  },
+  {
+    "tool": "repo_repository",
+    "arguments": {
+      "action": "get",
+      "project": "Widgets",
+      "repositoryNameOrId": "11111111-2222-3333-4444-555555555555"
+    },
+    "payloadFile": "payloads/repo-identity.json"
   }
 ]

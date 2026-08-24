@@ -160,6 +160,10 @@ jobs:
         shell: pwsh
         run: ./tools/Test-Provider.ps1
 
+      - name: empty-to-null AST analyzer fixture measurement
+        shell: pwsh
+        run: ./tools/Test-PowerShellEmptyNullHazardAnalyzer.ps1
+
       - name: convention-pack schema and replay checks
         shell: pwsh
         run: ./tools/Test-ConventionPacks.ps1
@@ -202,6 +206,38 @@ jobs:
       - name: reviewer replay-qualification invocation checks
         shell: pwsh
         run: ./tools/Test-ReviewerReplayQualification.ps1
+
+      - name: reviewer deterministic adapter process and parser checks
+        shell: pwsh
+        run: ./tools/Test-ReviewerAdapterBehaviors.ps1
+
+      - name: exact-path deterministic reviewer orchestration
+        shell: pwsh
+        run: ./tools/Test-ReviewerExactPath.ps1
+
+      - name: reviewer structural coverage golden
+        shell: pwsh
+        run: ./tools/Test-ReviewerStructuralCoverage.ps1
+
+      # Blinded transcript acquisition: the outer supervisor and the reviewer's
+      # gated acquisition mode, driven only by the sealed offline stub adapter.
+      # Offline and deterministic: no network, no ADO/GitHub, no provider process,
+      # no real model - it captures raw stimulus and seals an oracle-free package.
+      - name: blinded transcript acquisition runner
+        shell: pwsh
+        run: ./tools/Test-ReviewerBlindedAcquisition.ps1
+
+      - name: blinded benchmark-pack materializer and no-model preflight
+        shell: pwsh
+        run: ./tools/Test-ReviewerBenchmarkPackMaterializer.ps1
+
+      # Proves the no-model production role input capture builds the EXACT
+      # production prompt for one role, byte-identical to the blinded adapter
+      # path, while starting zero model/agency/provider processes and writing
+      # zero plans, tokens, leases or provider state.
+      - name: reviewer - no-model production role input capture
+        shell: pwsh
+        run: ./tools/Test-ReviewerRoleInputCapture.ps1
 
       - name: reviewer - offline replay is fail-closed and preview-only
         shell: pwsh

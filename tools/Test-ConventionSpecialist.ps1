@@ -88,11 +88,12 @@ function New-TestFactPlan {
 
 function ConvertTo-TestMarker {
     param([Parameter(Mandatory)]$Marker, [Parameter(Mandatory)][string]$Nonce)
-    return ConvertFrom-AgentResultMarker `
+    $outcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
         -StdOutText ($script:ReviewerConventionSpecialistMarkerPrefix + " " +
             (ConvertTo-Json -InputObject $Marker -Depth 32 -Compress)) `
-        -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
         -Schema (Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Example" -ExpectedNonce $Nonce)
+    if ([string]$outcome.Status -ceq 'success') { return $outcome.Value }
+    return $null
 }
 
 function Assert-MarkerRejected {
@@ -323,6 +324,87 @@ $validated = Resolve-ReviewerConventionSpecialistCandidates -Marker $parsed `
     -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
 Assert-Specialist (@($validated.Candidates).Count -eq 1 -and @($validated.Withheld).Count -eq 0) `
     "A valid provenance-bound candidate was not accepted."
+
+# Narrow compatibility normalization for the exact Sonnet structural slip:
+# ONLY an empty JSON array at candidates[*].changedCodeFix.evidenceFactIds is
+# canonicalized to the schema's no-evidence string. The raw transcript remains
+# evidence of what the model emitted; the typed value carries no invented fact.
+$emptyArrayMarker = Copy-SpecialistObject $markerObject
+$emptyArrayMarker.candidates[0].changedCodeFix.evidenceFactIds = @()
+$emptyArrayText = $script:ReviewerConventionSpecialistMarkerPrefix + " " +
+    ($emptyArrayMarker | ConvertTo-Json -Depth 32 -Compress)
+$emptyArrayOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+    -StdOutText $emptyArrayText `
+    -Schema (Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Example" -ExpectedNonce "nonce-1")
+Assert-Specialist ([string]$emptyArrayOutcome.Status -ceq 'success' -and
+    [string]$emptyArrayOutcome.Value.candidates[0].changedCodeFix.evidenceFactIds -ceq '' -and
+    @($emptyArrayOutcome.NormalizedFields).Count -eq 1 -and
+    [string]$emptyArrayOutcome.NormalizedFields[0].Field -ceq
+        'candidates[0].changedCodeFix.evidenceFactIds' -and
+    [string]$emptyArrayOutcome.NormalizedFields[0].OriginalTypedReason -match
+        'candidates\[0\]\.changedCodeFix\.evidenceFactIds') `
+    "The exact empty-array evidenceFactIds compatibility shape was not normalized and diagnosed."
+
+$stringMarker = Copy-SpecialistObject $markerObject
+$stringOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+    -StdOutText ($script:ReviewerConventionSpecialistMarkerPrefix + " " +
+        ($stringMarker | ConvertTo-Json -Depth 32 -Compress)) `
+    -Schema (Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Example" -ExpectedNonce "nonce-1")
+Assert-Specialist ([string]$stringOutcome.Status -ceq 'success' -and
+    @($stringOutcome.NormalizedFields).Count -eq 0 -and
+    [string]$stringOutcome.Value.candidates[0].changedCodeFix.evidenceFactIds -ceq '' -and
+    [string]$stringOutcome.Value.nonce -ceq [string]$parsed.nonce -and
+    [string]$stringOutcome.Value.conventionPlanSha256 -ceq [string]$parsed.conventionPlanSha256) `
+    "The already-valid successful marker changed under compatibility parsing."
+
+$invalidEvidenceCases = @(
+    @{ Name = 'nonempty array'; Value = [object[]]@($factId) },
+    @{ Name = 'null'; Value = $null },
+    @{ Name = 'object'; Value = [pscustomobject]@{ id = $factId } }
+)
+foreach ($invalidEvidenceCase in $invalidEvidenceCases) {
+    $invalidMarker = Copy-SpecialistObject $markerObject
+    $invalidMarker.candidates[0].changedCodeFix.evidenceFactIds = $invalidEvidenceCase.Value
+    $invalidOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+        -StdOutText ($script:ReviewerConventionSpecialistMarkerPrefix + " " +
+            ($invalidMarker | ConvertTo-Json -Depth 32 -Compress)) `
+        -Schema (Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Example" -ExpectedNonce "nonce-1")
+    Assert-Specialist ([string]$invalidOutcome.Status -ceq 'schemaInvalid' -and
+        [string]$invalidOutcome.Field -ceq 'candidates[0].changedCodeFix.evidenceFactIds' -and
+        [string]$invalidOutcome.Reason -match 'candidates\[0\]\.changedCodeFix\.evidenceFactIds' -and
+        @($invalidOutcome.NormalizedFields).Count -eq 0) `
+        "A $($invalidEvidenceCase.Name) evidenceFactIds value was accepted or lacked its nested diagnostic."
+}
+
+$otherArrayMarker = Copy-SpecialistObject $markerObject
+$otherArrayMarker.candidates[0].factIds = @()
+$otherArrayOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+    -StdOutText ($script:ReviewerConventionSpecialistMarkerPrefix + " " +
+        ($otherArrayMarker | ConvertTo-Json -Depth 32 -Compress)) `
+    -Schema (Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Example" -ExpectedNonce "nonce-1")
+Assert-Specialist ([string]$otherArrayOutcome.Status -ceq 'schemaInvalid' -and
+    [string]$otherArrayOutcome.Field -ceq 'candidates[0].factIds' -and
+    @($otherArrayOutcome.NormalizedFields).Count -eq 0) `
+    "Compatibility parsing normalized an empty array outside changedCodeFix.evidenceFactIds."
+
+$wrongNormalizedNonce = Copy-SpecialistObject $emptyArrayMarker
+$wrongNormalizedNonce.nonce = 'other-nonce'
+$wrongNormalizedOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+    -StdOutText ($script:ReviewerConventionSpecialistMarkerPrefix + " " +
+        ($wrongNormalizedNonce | ConvertTo-Json -Depth 32 -Compress)) `
+    -Schema (Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Example" -ExpectedNonce "nonce-1")
+Assert-Specialist ([string]$wrongNormalizedOutcome.Status -ceq 'wrongBinding' -and
+    [string]$wrongNormalizedOutcome.Field -ceq 'nonce') `
+    "Compatibility normalization weakened nonce binding."
+Assert-Specialist ([string]$emptyArrayOutcome.Value.conventionPlanSha256 -ceq $conventionPlanSha -and
+    [string]$emptyArrayOutcome.Value.factPlanSha256 -ceq $factPlan.planSha256 -and
+    (Test-ReviewerConventionSpecialistBinding -Marker $emptyArrayOutcome.Value -PrId 42 `
+        -RepositoryId $repositoryId -SourceCommit $sourceCommit -TargetCommit $targetCommit `
+        -ChangeSetDigest $changeSetDigest -ConventionPlanSha256 $conventionPlanSha `
+        -FactPlanSha256 $factPlan.planSha256 -ConfigSha256 $configSha -ScriptSha256 $scriptSha `
+        -PromptSha256 $promptSha)) `
+    "Compatibility normalization changed a hash or complete binding field."
+
 $validRemediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
         -Candidate $candidate -Constructs $remediationConstructs)
 Assert-Specialist ($validRemediationErrors.Count -eq 0) `
@@ -1498,10 +1580,13 @@ Assert-Specialist ($gateThrew -and $gateErr -match 'convention specialist' -and 
 foreach ($surfaceFn in @('Invoke-ReviewerModelPass', 'Invoke-ReviewerConventionSpecialistPass', 'Invoke-ReviewerVerificationModelRun')) {
     $surfaceText = Get-FunctionText -Text $wrapperText -Name $surfaceFn
     $gateIndex = $surfaceText.IndexOf('Assert-ReviewerModelResultContractFits', [StringComparison]::Ordinal)
-    $launchIndex = $surfaceText.IndexOf('Invoke-TimedProcess', [StringComparison]::Ordinal)
+    $launchIndex = $surfaceText.IndexOf('Invoke-ReviewerModelSubprocess', [StringComparison]::Ordinal)
     Assert-Specialist ($gateIndex -ge 0 -and $launchIndex -ge 0 -and $gateIndex -lt $launchIndex) `
-        "$surfaceFn does not run the pre-launch contract gate before Invoke-TimedProcess."
+        "$surfaceFn does not run the pre-launch contract gate before the shared production subprocess boundary."
 }
+$subprocessText = Get-FunctionText -Text $wrapperText -Name 'Invoke-ReviewerModelSubprocess'
+Assert-Specialist ($subprocessText -match 'Invoke-TimedProcess') `
+    "The shared production subprocess boundary no longer reaches Invoke-TimedProcess."
 
 # ---------------------------------------------------------------------------
 # Layer A (item 2/this turn): the generalist marker window/cap must fit the
@@ -1707,7 +1792,7 @@ Assert-Specialist ($promoteSiteText -match '\$maxItems -gt \$script:ReviewerMerg
 # generic-null retry.
 # ---------------------------------------------------------------------------
 $specialistPassText = Get-FunctionText -Text $wrapperText -Name 'Invoke-ReviewerConventionSpecialistPass'
-Assert-Specialist ($specialistPassText -match 'ConvertFrom-AgentResultMarkerOutcome') `
+Assert-Specialist ($specialistPassText -match 'ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome') `
     "The specialist loop does not classify the marker through the typed outcome."
 Assert-Specialist ($specialistPassText -notmatch '=\s*ConvertFrom-AgentResultMarker\b') `
     "The specialist loop still assigns from the untyped compatibility parser."
@@ -1723,7 +1808,13 @@ Assert-Specialist ($specialistPassText -match 'specialist-attempt-accounting' -a
     $specialistPassText -match 'nonceSha256 = \(Get-ReviewerTextSha256') `
     "The specialist loop does not emit per-attempt accounting keyed by a hashed nonce."
 # The accounting records the nonce only as a SHA-256, never the raw nonce value.
-Assert-Specialist ($specialistPassText -notmatch 'nonce = \$AttemptNonce' -and $specialistPassText -notmatch 'nonce = \$nonce\b') `
+$accountingStart = $specialistPassText.IndexOf('$emitSpecialistAcct = {', [StringComparison]::Ordinal)
+$accountingEnd = $specialistPassText.IndexOf('$specialistAttempt = 1', [StringComparison]::Ordinal)
+$accountingText = if ($accountingStart -ge 0 -and $accountingEnd -gt $accountingStart) {
+    $specialistPassText.Substring($accountingStart, $accountingEnd - $accountingStart)
+} else { '' }
+Assert-Specialist ($accountingText -and $accountingText -notmatch 'nonce = \$AttemptNonce' -and
+    $accountingText -notmatch 'nonce = \$nonce\b') `
     "The specialist accounting leaks a raw nonce instead of its hash."
 
 # ---------------------------------------------------------------------------
@@ -1767,7 +1858,7 @@ Assert-Specialist ($specialistPassText -match 'mode = "specialist-launch-refused
     $specialistPassText -match 'reason = "contractFit"') `
     "A specialist contract-fit refusal does not emit its own launch-refusal metadata."
 $refuseStart = $specialistPassText.IndexOf('specialist-launch-refused', [StringComparison]::Ordinal)
-$refuseLaunch = $specialistPassText.IndexOf('Invoke-TimedProcess', [StringComparison]::Ordinal)
+$refuseLaunch = $specialistPassText.IndexOf('Invoke-ReviewerModelSubprocess', [StringComparison]::Ordinal)
 $refuseBlock = if ($refuseStart -ge 0 -and $refuseLaunch -gt $refuseStart) {
     $specialistPassText.Substring($refuseStart, $refuseLaunch - $refuseStart)
 } else { '' }
@@ -1793,7 +1884,8 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
 # mocks and $script: config never leak into later tests.
 # ---------------------------------------------------------------------------
 & {
-    foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue', 'Invoke-ReviewerModelPass') {
+    foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue',
+        'Invoke-ReviewerModelSubprocess', 'Invoke-ReviewerModelPass') {
         Invoke-Expression (Get-FunctionText -Text $wrapperText -Name $fn)
     }
     # Assert-ReviewerModelResultContractFits was already defined above; the pass
@@ -1803,6 +1895,8 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $script:ReviewerMaxModelInputBytes = 10485760
     $script:ReviewerMarkerScanWindowChars = 65536
     $script:ReviewerMarkerMaxOutputBytes = 131072
+    $script:ReviewerGeneralistModelPair = Get-AgentGeneralistModelPair
+    $script:ReviewerOfflineModelAdapterActive = $false
     $ExpectedProject = 'One'
     $EffectiveMaxFindings = 12
     $ResultMarkerPrefix = 'REVIEWER_RESULT_V1:'
@@ -1819,6 +1913,20 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $script:knownNonce = ('abc123' * 6)
     $script:timedProcessCalled = $false
     $script:cannedStdOut = ''
+    # This block exercises the REAL extracted model-pass/subprocess functions, so
+    # it must also stand up the module-scope state Start-ReviewerAgent.ps1 sets up
+    # before any pass runs. Their production defaults are all "inactive": without
+    # them StrictMode aborts at the capture boundary before the pass is reached.
+    $script:ReviewerRoleInputCaptureActive = $false
+    $script:ReviewerRoleInputCapture = $null
+    $script:ReviewerRoleInputCaptureBoundaryHits = 0
+    $script:ReviewerRoleInputConventionPlan = $null
+    $script:ReviewerRoleInputFactPlan = $null
+    $script:ReviewerAcquisitionActive = $false
+    $script:ReviewerAcquisitionSingleShot = $false
+    $script:ReviewerAcquisitionCaptures = [System.Collections.Generic.List[object]]::new()
+    $script:ReviewerAcquisitionTargetRole = ''
+    $script:ReviewerOfflineModelAdapterActive = $false
 
     function New-AgentNonce { $script:knownNonce }
     function Get-ReviewerRuntimeContext { param($Nonce, $PrId, $RepositoryId, $SourceCommit, $SourceBranch, $AuthorAlias, $ThreadDigestText, $AuthoritativeSourcesText, $PinnedSourceText) '' }
@@ -1829,6 +1937,7 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     function Get-ReviewerEffectiveDenyTools { param($ConfigDeny) @() }
     function Get-AgentDefaultModelSentinel { 'DEFAULT_SENTINEL' }
     function Get-AgentCopilotArgs { param($AgentName, $Source, $AvailableTools, $AllowTools, $DenyTools, $Model, [switch]$JsonOutput) @('--json') }
+    function Add-ReviewerAcquisitionCapture { param($Run, $Role, $Model, $StandardInputContent, $Binding) }
     function Invoke-TimedProcess {
         param($FilePath, $ArgumentList, $StandardInputContent, [switch]$CaptureStdOut, [switch]$CaptureStdErr, $WorkingDirectory, $EnvironmentVariablesToRemove, $TimeoutSeconds)
         $script:timedProcessCalled = $true
@@ -2009,13 +2118,13 @@ else {
         $specText = [IO.File]::ReadAllText($specFile.FullName)
         $specNonce = '88ec21531dce5d416a6b2109a59c88feee12'
         $specSchema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "One" -ExpectedNonce $specNonce
-        $specOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $specText `
-            -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix -Schema $specSchema
+        $specOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+            -StdOutText $specText -Schema $specSchema
         Assert-Specialist ([string]$specOutcome.Status -ceq "success" -and -not [bool]$specOutcome.Retryable) `
             "Replayed pr16769813 specialist marker was not a clean success, so its semantic failure would be misread as a marker slip."
-        $specWrong = ConvertFrom-AgentResultMarkerOutcome -StdOutText $specText `
-            -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
-            -Schema (Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "One" -ExpectedNonce 'replayed-nonce')
+        $specWrong = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+            -StdOutText $specText -Schema (
+                Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "One" -ExpectedNonce 'replayed-nonce')
         Assert-Specialist ([string]$specWrong.Status -ceq "wrongBinding" -and -not [bool]$specWrong.Retryable) `
             "A replayed specialist nonce was not the terminal, non-retryable wrongBinding outcome."
     }

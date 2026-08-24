@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-offline-model-adapter",
+  "expectedBaseCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "classification": { "offlineOnly": true, "nonPromotable": true, "writesPermitted": false, "outputsPreAuthored": true, "oracleDerivedAtRuntime": false },
+  "roles": {
+    "blind-gpt": { "model": "gpt-5.6-sol", "behavior": "stdoutSaturation", "byteCount": 1048576 },
+    "blind-opus": { "model": "claude-opus-5", "behavior": "stderrSaturation", "byteCount": 1048576 }
+  }
+}
+
