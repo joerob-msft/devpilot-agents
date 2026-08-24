@@ -36,6 +36,16 @@ internal static class Program
         string? haltAfterName = null;
         string? cohortPath = null;
         string? operatorAlias = null;
+        string? registryPath = null;
+        string? candidatesPath = null;
+        string? selectCount = null;
+        string? selectionOutPath = null;
+        var fromCohorts = new List<string>();
+        var rebuildRegistry = false;
+        var selectSubjects = false;
+        var acceptUnresolvedDefects = false;
+        var acceptUnstartedRegistry = false;
+        var retractClearedHolds = false;
         var rebuildIndex = false;
 
         // The parse runs inside the same guard as the rest of the entry point.
@@ -67,6 +77,36 @@ internal static class Program
                     case "--rebuild-index":
                         rebuildIndex = true;
                         break;
+                    case "--rebuild-registry":
+                        rebuildRegistry = true;
+                        break;
+                    case "--select-subjects":
+                        selectSubjects = true;
+                        break;
+                    case "--candidates":
+                        candidatesPath = Next(args, ref index, "--candidates");
+                        break;
+                    case "--select-count":
+                        selectCount = Next(args, ref index, "--select-count");
+                        break;
+                    case "--accept-unresolved-defects":
+                        acceptUnresolvedDefects = true;
+                        break;
+                    case "--accept-unstarted-registry":
+                        acceptUnstartedRegistry = true;
+                        break;
+                    case "--retract-cleared-holds":
+                        retractClearedHolds = true;
+                        break;
+                    case "--out":
+                        selectionOutPath = Next(args, ref index, "--out");
+                        break;
+                    case "--registry":
+                        registryPath = Next(args, ref index, "--registry");
+                        break;
+                    case "--from-cohort":
+                        fromCohorts.Add(Next(args, ref index, "--from-cohort"));
+                        break;
                     case "--help":
                         Console.Out.WriteLine(Usage);
                         return ExitOk;
@@ -75,6 +115,91 @@ internal static class Program
                         Console.Error.WriteLine(Usage);
                         return ExitUsage;
                 }
+            }
+
+            if (selectSubjects)
+            {
+                if (rebuildRegistry || cohortPath is not null || requestPath is not null || rebuildIndex)
+                {
+                    Console.Error.WriteLine("--select-subjects chooses subjects and starts nothing; it does not combine with the other modes.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                if (registryPath is null || candidatesPath is null || selectionOutPath is null)
+                {
+                    Console.Error.WriteLine("--select-subjects needs --registry <path>, --candidates <path> and --out <path>.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                if (!int.TryParse(selectCount ?? "1", NumberStyles.None, CultureInfo.InvariantCulture, out var count)
+                    || count < 1
+                    || count > 64)
+                {
+                    Console.Error.WriteLine("--select-count takes a whole number between 1 and 64.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                return CohortSubjectSelection.Run(
+                    registryPath,
+                    candidatesPath,
+                    count,
+                    selectionOutPath,
+                    acceptUnresolvedDefects,
+                    acceptUnstartedRegistry,
+                    Console.Out);
+            }
+
+            if (rebuildRegistry)
+            {
+                // A rebuild is its own mode. It reads immutable cohort roots the
+                // caller names and writes one registry; it never runs a cohort, so
+                // pairing it with --cohort would be asking for two different jobs
+                // in one invocation and is refused rather than ordered arbitrarily.
+                if (cohortPath is not null)
+                {
+                    Console.Error.WriteLine("--rebuild-registry rebuilds an account from finished cohort roots and does not run one; drop --cohort.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                if (registryPath is null)
+                {
+                    Console.Error.WriteLine("--rebuild-registry needs --registry <path> to say which account is being rebuilt.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                if (fromCohorts.Count == 0)
+                {
+                    Console.Error.WriteLine("--rebuild-registry needs at least one --from-cohort <manifest path>. It reports what roots hold; it does not search for them.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                if (requestPath is not null || targetName is not null || haltAfterName is not null || rebuildIndex)
+                {
+                    Console.Error.WriteLine("--rebuild-registry takes only --registry, --from-cohort, --retract-cleared-holds and --authorized-by.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                return RebuildRegistry(registryPath, fromCohorts, operatorAlias, retractClearedHolds);
+            }
+
+            if (registryPath is not null || fromCohorts.Count > 0)
+            {
+                Console.Error.WriteLine("--registry and --from-cohort belong to --rebuild-registry.");
+                Console.Error.WriteLine(Usage);
+                return ExitUsage;
+            }
+            if (retractClearedHolds)
+            {
+                Console.Error.WriteLine("--retract-cleared-holds belongs to --rebuild-registry.");
+                Console.Error.WriteLine(Usage);
+                return ExitUsage;
+            }
+            if (candidatesPath is not null || selectCount is not null || selectionOutPath is not null || acceptUnresolvedDefects || acceptUnstartedRegistry)
+            {
+                Console.Error.WriteLine(
+                    "--candidates, --select-count, --out, --accept-unresolved-defects and --accept-unstarted-registry belong to --select-subjects.");
+                Console.Error.WriteLine(Usage);
+                return ExitUsage;
             }
 
             if (cohortPath is not null)
@@ -200,6 +325,34 @@ internal static class Program
         return CohortRunner.Run(manifest, operatorAlias, rebuildIndex, Console.Out);
     }
 
+    /// <summary>
+    /// The rebuild mode: read finished cohort roots, write one account, start
+    /// nothing.
+    /// </summary>
+    /// <remarks>
+    /// The alias is required here for the same reason it is required to run a
+    /// cohort. A rebuilt account is what a later run refuses against, so the file
+    /// records who produced it. Nothing about the rebuild is unattended: it names
+    /// its roots explicitly and never searches for them, because an account
+    /// assembled from whatever happened to be on a disk is not an account anyone
+    /// can defend.
+    /// </remarks>
+    private static int RebuildRegistry(
+        string registryPath,
+        IReadOnlyList<string> manifestPaths,
+        string? operatorAlias,
+        bool retractClearedHolds)
+    {
+        if (operatorAlias is null)
+        {
+            Console.Error.WriteLine("--rebuild-registry requires --authorized-by <alias>: an account records who assembled it.");
+            Console.Error.WriteLine(Usage);
+            return ExitUsage;
+        }
+        CohortManifest.RequireOpaqueShape(operatorAlias, "registry rebuild", "--authorized-by", 3, 64);
+        return CohortRegistryRebuild.Run(registryPath, manifestPaths, operatorAlias, retractClearedHolds, Console.Out);
+    }
+
     private static int Run(CoordinatorRequest request, PreparationState target, PreparationState? haltAfter)
     {
         Directory.CreateDirectory(request.OutputRoot);
@@ -263,6 +416,11 @@ internal static class Program
     private const string Usage = """
         ShadowRunCoordinator --request <path> [--target <state>] [--halt-after <state>]
         ShadowRunCoordinator --cohort <path> --authorized-by <alias> [--rebuild-index]
+        ShadowRunCoordinator --rebuild-registry --registry <path> --from-cohort <manifest> [...]
+                             --authorized-by <alias> [--retract-cleared-holds]
+        ShadowRunCoordinator --select-subjects --registry <path> --candidates <path>
+                             --out <path> [--select-count <n>]
+                             [--accept-unresolved-defects] [--accept-unstarted-registry]
 
           --request       Path to a devpilot.shadow-run-coordinator.request.v2 JSON file.
           --target        Stop once this state is reached. Defaults to runSetReady.
@@ -276,6 +434,36 @@ internal static class Program
                           defaulted: a cohort is an operator action, not a timer's.
           --rebuild-index Rebuild the cohort index from the journal and the published
                           per-entry audits, and start nothing.
+          --rebuild-registry
+                          Rebuild the durable subject account from finished cohort roots
+                          and start nothing. Every root is read through its own signed
+                          journal and per-entry audits; nothing is taken from a summary.
+          --registry      Where the account lives. Kept OUTSIDE the repository, because
+                          it records what has been spent across branches and heads.
+          --from-cohort   A finished cohort's manifest. Repeatable. Roots that cannot be
+                          read are reported as defects in the rebuilt account rather
+                          than dropped from it.
+          --retract-cleared-holds
+                          Let go of a subject held ONLY by rows about entries the
+                          journals in this rebuild say were never launched. Off by
+                          default: a journal minted after the original was lost also
+                          reads as never launched, so this is the operator vouching
+                          that the journal being read is the original.
+          --select-subjects
+                          Choose the next subjects from a candidate list, with every
+                          subject the account already holds removed. Writes a selection
+                          file and starts nothing.
+          --candidates    Path to a devpilot.shadow-cohort.candidates.v1 JSON file.
+          --select-count  How many unspent subjects to choose. Defaults to 1.
+          --out           Where the selection is written.
+          --accept-unresolved-defects
+                          Choose even though the account records roots it could not
+                          read. The exclusion may be incomplete; the acknowledgement
+                          is written into the selection file.
+          --accept-unstarted-registry
+                          Choose against an account file that does not exist yet.
+                          Nothing is excluded; the acknowledgement is written into
+                          the selection file.
 
         States: requestValidated corpusStaging corpusPublished corpusValidated
                 recipePlanned snapshotValidateOnly snapshotSealed snapshotVerified

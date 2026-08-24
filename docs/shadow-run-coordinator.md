@@ -843,6 +843,413 @@ every entry ended complete; 5 means the cohort was walked but an entry ended oth
 operator; 6 means a committed launch could not be resolved and needs one too. Re-running the same
 command resumes; it never retries.
 
+## The subject account
+
+A cohort spends a pull request. The evidence it produces is a *sample* of what this toolkit does on
+real work, and a sample is only worth something if it is taken over a subject nobody has taken it
+over before. Which pull requests have been used therefore has to be a fact on disk, not a sentence
+in somebody's notes — a list maintained by hand is a list that drifts, and a drifted list is how the
+same pull request gets counted twice.
+
+The account is a signed file that lives **outside the repository**, because it records what has been
+spent across branches, heads and worktrees, and a file inside a branch would say different things
+depending on which branch was checked out. It holds one row per run — a *sample* — and each row
+carries the subject it was taken over, the run root and manifest that produced it, the contract
+version the cohort was declared under, who authorized it, the terminal it reached, the real model
+starts and real verifier assignments it actually spent, the provider writes it made, and its own
+digest. The file digests itself and is signed with an HMAC key written beside it.
+
+**One subject, one counting sample.** The threshold is counted in *distinct pull requests*, so at
+most one sample per `repositoryId + pullRequestId` may carry `countsTowardThreshold`. A repeat over
+the same pull request — even at a new source commit — is kept as history and cannot count: a second
+look at work this toolkit has already seen is not a second independent observation. The subject key
+is a digest of the case-folded repository identity and the pull request number, so retyping the
+repository in another case cannot spend the same subject twice, and the same number in two
+repositories is two subjects.
+
+**What a manifest binds.** A v3 manifest may carry a `registry` section naming the account file, the
+revision it was authorized against, the subject it intends to occupy, and a mode:
+
+```json
+"registry": {
+  "path": "D:/shadow/registry/gate5-cohort-registry.json",
+  "sha256": "none",
+  "targetSubjectKey": "6d36015b4d63f04d37b220299afaa98a327b8da41a0f479eb86c899df97889ce",
+  "mode": "count"
+}
+```
+
+`sha256` is the revision digest the operator authorized against, or `none` when this cohort is
+starting the account. `targetSubjectKey` is recomputed from a declared entry's own pins rather than
+typed beside one, so a binding that names a subject no entry runs is refused. `mode` is `count` —
+the cohort occupies its subject and refuses one already held — or `diagnostic`, which may repeat a
+subject on purpose and can never produce a counting sample. A `diagnostic` cohort may only name a
+subject the account **already holds**: a diagnostic row is deliberately invisible to the settle pass so
+that repeating a subject does not evict the row it repeats, and if such a row were the only thing
+holding a fresh pull request the models would have seen it while a later cohort stayed free to count it
+as a first, independent observation. A first look has to be the counting one.
+
+The section is **optional in shape and required in effect**. It is optional to *read*, because every
+manifest written before the account existed binds nothing and those roots still have to be
+rebuildable. It is required to *launch*: a cohort that names the shipping preparation and binds no
+registry is refused with exit 11 before any child exists.
+
+**Refusal comes before the child.** The registry is verified and every declared entry's subject is
+checked in the pre-walk, beside the toolkit-head and sealed-bound checks — a two-entry cohort whose
+*second* subject is already held refuses both rather than spending the first. The revision on disk
+must equal either the revision the manifest bound or the revision this cohort itself last produced;
+anything else means the account moved under the authorization and is refused. One further revision is
+accepted: the account's `previousRegistrySha256` names the revision it replaced, so a file that says it
+succeeded exactly the revision this cohort last committed is a write that landed while the journal
+entry recording it did not. One step, never two — an account further ahead than a single interrupted
+write moved for reasons this cohort cannot account for. Nothing is lost by accepting a successor that
+another cohort wrote: its rows arrive with the file, and if one of them holds a subject *this* manifest
+declares, the held-subject refusal still stops the run.
+
+**Two runs, one account.** Nothing outside the account serializes two cohorts writing to it, and two
+runners that both read revision 5 and both composed a 6 would each publish a file holding their own row
+and not the other's — freeing the subject the loser recorded. So every write takes a `.lock` gate beside
+the file for the whole read-modify-write and, inside it, re-reads the bytes on disk and refuses if their
+`registrySha256` is no longer the one this run loaded. The gate narrows the window; the re-read closes
+it, because it does not depend on the gate being honoured. Inside that same gate the key on disk wins:
+two runs that both open an account nobody has started yet each mint a key of their own, and if one
+persists its key and then stops, the other would otherwise sign the first revision with a key no reader
+will ever load — a file that authenticates against nothing and can only be rebuilt over, never opened.
+The key is read through the same strict reader a load uses, and it is flushed to the device before the
+revision it signs is published.
+
+**Recording comes before refusing.** The revision-binding refusal above is raised by the very event
+that can strand a row: another cohort writing to the shared account between this one's ending and its
+sample. So before that refusal is thrown, every entry the journal already shows as *ended* whose row is
+missing is re-derived from the same signed evidence a rebuild would read and written to the account —
+and the journal is deliberately **not** moved to the new revision, because recording what was spent must
+not double as adopting a registry this cohort was never authorized against. The refusal still stops the
+run, and it names what it recovered.
+
+**Budgets are compared cumulatively.** A sample counts only if what the cohort had spent *before* this
+entry, plus what this entry spent, is inside the manifest's global ceilings — the same total the runner
+itself refuses to cross. Comparing one entry against a whole-cohort ceiling would let a three-entry
+cohort record three counting rows that together spent more than it was ever authorized for.
+
+**Recording comes after the ending.** Once an entry's ending is committed, its sample is composed
+from the authenticated audit and appended atomically, and the new revision digest is committed to
+the journal. A runner killed between the two leaves a closed entry with no sample; the resume
+re-derives the same sample from the same evidence, and because the sample key is derived from the
+audit digest it lands on the same bytes rather than adding a row. Every finished entry leaves a
+sample — failed, refused, over-budget and unauthorized runs are recorded as history that does not
+count, because an account that only remembered its successes could not answer the question it exists
+for.
+
+That resume records the alias the entry actually **launched** under, read from the launch intent the
+signed journal pins by digest — not the alias on the resuming process's command line. A cohort started
+by one operator and resumed with a different `--authorized-by` would otherwise record an authorization
+that operator never gave, and a rebuild, which reads the intent, would silently correct it: two signed
+accounts over one root disagreeing about who spent the subject. The same reading is used for the
+holding rows an unreadable ending leaves, so no path records the resuming operator's name against
+somebody else's launch. If that intent is missing or no longer
+digests to what the journal committed, the entry's subject is held by a row that counts toward nothing
+and the cohort stops — the subject goes on record *before* the refusal, never after it.
+
+The same ordering covers the way in. Publishing the running index re-reads every ended entry's evidence,
+so a resume that finds one of those artifacts damaged stops before the walk and before the account has
+been opened at all; every already-ended entry missing from the account is put on record first, best
+effort and without adopting anything, and only then does the refusal stop the run.
+
+A sample counts only when all of it holds: the mode is `count`; the subject is not already held; the
+manifest contract is v3; an operator alias and `PreviewOnly` authorization are recorded; the entry
+reached the cohort's target and ended complete; the model-start and verifier-assignment censuses are
+complete with no unmeasured allowance; the actual counts and wall clock are inside the declared
+ceilings; and the provider write and write-tool counters are zero. The first clause that fails is
+the classification the row carries, so a row never blames one of several reasons.
+
+The order of the first two clauses is deliberate. The mode is asked first, so a diagnostic run that
+wrote is filed under the mode rather than under the write. Every non-counting classification except
+the diagnostic ones is an *observation*, and observations hold their subject; filing a diagnostic run
+under its write would start holding subjects, and the non-counting mode would quietly begin spending
+pull requests — the one thing it exists not to do. The write itself is not hidden: the row carries
+the counters, the digest covers them, and a live cohort is refused at the write gate long before any
+of this is reached. Past the mode, the write clause is asked ahead of everything else, because every
+remaining clause is a reason a run did not qualify while that one is a reason the run was not the run
+it was authorized to be.
+
+**A run that did not qualify still looked.** A subject is claimed by the first row that qualified for
+it — and then demoted again if some *other* run already put that pull request in front of the models.
+A run that completed under a refused contract, or ended over its ceiling, did not qualify; it did
+observe, and a second look at work this toolkit has already seen is not a second independent
+observation. Runs that observed nothing claim nothing, and a run the operator declared as a repeat —
+diagnostic mode, or a row already demoted for repeating — does not evict the row it repeats.
+
+**Own is settled by the manifest digest, not the cohort id.** The pre-walk has to let a cohort past
+its own recorded sample, or every resume would refuse the work it had already done. But `cohortId` is
+a string an operator types, and a manifest copied from a finished one keeps it: that copy would read
+the subject it is about to spend a second time as its own earlier attempt. The journal already
+refuses a manifest edited between runs, so a genuine resume presents byte-identical bytes and the
+same digest, while a copy — new journal root, new output root, re-pointed revision — cannot.
+
+The account is also re-read from disk in the last moment before each child starts. The pre-walk
+settles admission for the whole cohort at once, which is what lets a two-entry cohort refuse both
+rather than spend the first; nothing outside the account serializes two cohorts, so a second one
+launched in between would spend the same pull request for real. The re-read does not close that
+window — nothing local does, short of reserving a subject before any evidence exists to record it —
+but it narrows it from the length of a cohort to the length of a launch.
+
+**An account with an open question cannot admit a counting cohort.** If the bound account records any
+root it could not read, a `count` cohort is refused before any child, exit 11, naming the roots. A run
+that was spent and cannot be read may have spent *this* cohort's subject, so the exclusion the pre-walk
+performs is known to be incomplete, and admitting on it would produce a refusal that looks authoritative
+and is not. The remedy is named in the refusal: repair or restore those roots and rebuild the account
+naming every root, or declare the cohort `diagnostic`, where nothing counts and nothing has to be
+provable. Diagnostic cohorts pass the gate unchanged.
+
+**Rebuilding it.** The account can be re-derived from the immutable run roots:
+
+```
+ShadowRunCoordinator --rebuild-registry --registry <path> --from-cohort <manifest> [...] \
+                     --authorized-by <alias>
+```
+
+It reads the same artifacts a run reads — the sealed manifest, the signed journal beside it, each
+entry's authenticated preparation audit, and the launch intent the journal pins by digest for the
+authorization — and takes nothing from a published index or summary. Roots it cannot read are
+recorded as defects in the rebuilt file rather than dropped, because an account that quietly
+forgot a root would report a smaller reach than the toolkit really has. Roots declared under the v1
+or v2 contracts are recorded as history that cannot count: those contracts declared their budgets in
+the units that undercounted, so a run under them cannot occupy a subject however clean it looks.
+
+A defect carries a **kind**, because two very different facts would otherwise be filed under one word.
+`unreadable` means nobody could read the root: what it ran is unknown, and every conclusion drawn
+around it is provisional. `noted` means the root was read in full and merely does not qualify — a v2
+contract, a root named twice — and it leaves no question open at all. Anything that reads defects has
+to know which it is holding: refusing to choose a next subject is right in the face of an unread root
+and wrong in the face of a v2 root whose subjects are already on the rows, and a reader that could not
+tell them apart would either stop forever or never stop.
+
+One run read twice is one sample. A caller who names a root and a mirror of it — a pre-resume
+backup, a copied directory — has named one run, and the sample key says so: it is derived from the
+cohort, the entry and the audit digest, all of which a copy preserves. Those rows collapse, and the
+collapse is only silent when the two agree about what happened; two rows sharing a key and
+disagreeing about their contents are recorded as a defect, and **neither** of them counts. One key
+naming two different runs means at least one of the two roots is not what it claims, and letting the
+one that happened to be named first occupy the subject would let argv order decide what the account
+asserts. The subject stays held, by a row that says plainly that what happened to it is not known.
+
+An entry that ended and whose evidence will not read is not the same as an entry that never ran. The
+first spent its subject; only its result is missing. The rebuild records it as an `evidenceUnreadable`
+row — holding the subject, counting toward nothing, its census and budget compliance both false — and
+files a `noted` defect beside it. Falling back to *no row* would free a pull request that had provably
+already been used, which is the one mistake this account exists to prevent. The same happens inside a
+live cohort when an entry is refused for evidence: the row is written **before** the refusal is
+re-thrown, and a failure to write it is logged rather than allowed to mask the refusal itself.
+
+The two defect kinds do not grade how bad a root is. They say whether the account is left with an open
+**question**. When the journal names the exact subject an entry spent and a row holds it, coverage is
+settled: what is missing is detail about one run, not the possibility of an unaccounted spend, and the
+defect is `noted`. `unreadable` is reserved for roots that could not be read far enough to say *which*
+subjects they touched — a manifest that will not parse, an entry that declares no readable identity —
+because only those leave open the chance that a candidate on some future list was already used. It
+matters because an `unreadable` defect fails every counting cohort and every selection closed, and a
+root that cannot hand out a pull request twice should not be able to do that.
+
+A refused ending is the same story from the other end. It commits no audit digest — there was no audit
+this build would read — so holding its artifacts to a committed digest fails every time, on evidence
+that is immutable and correct. Filed as an open question it would stop every counting cohort bound to
+the account, for good, with no repair possible. It is instead recorded as what it is: a closed fact.
+The entry ran, its evidence was refused, its subject is held, and nothing about that is still to be
+decided.
+
+An entry with a committed launch and no ending — `launchIntended` or `running` — is the one state
+that cannot be decided from disk at all. The intent is signed *before* the child starts, so the entry
+either put its subject in front of the models or was a moment away from it. It is held, by a
+non-counting row and a `noted` defect. An entry that is merely `pending` or `blocked` committed no
+launch, so it records nothing: a manifest that declares a pull request and never launches has not
+spent it, and a row for it would put a subject out of reach on the strength of an intention.
+
+A cohort root with a readable manifest and no signed journal committed no prelaunch intent, no
+authorization and no digest to hold its entries' artifacts to — the journal is written and signed
+before any child starts. Nothing that root did can be asserted in either direction, so **every**
+subject it declares is held by a non-counting row. The tempting refinement — free the entries whose
+output root holds no `coordinator` directory, since that is where a child's state lives — reads the
+file system as though it were evidence. It is not: the runner's own child creates that output root
+before it writes anything into it, an operator may have made it by hand, a deleted root looks exactly
+like one that was never written, and deleting just the `coordinator` directory looks identical to
+never having written one. With no signed journal to hold any of it to, absence proves nothing. The
+root is a `noted` defect rather than an `unreadable` one, because the account is left with an answer
+rather than an open question.
+
+The rebuild also holds each entry's artifacts to the digests the journal committed when the entry
+ended, exactly as a resuming runner does — and a resuming runner applies the same check before
+recording a row for an entry that ended while it was away, so a resume and a rebuild over the same
+root cannot produce two different signed answers. An audit that no longer matches the digest it was
+accounted for under is not re-scored into the account; it becomes an unreadable row.
+
+A path with nothing at it is refused outright, with exit 2 and nothing written. It is a caller's
+mistake, not evidence: filed as a defect it would be signed into the account, every later rebuild
+would have to name it again, and — because an unread root stops a counting cohort — one mistyped
+argument would deadlock Gate5 against a root that never existed to be repaired. A path that *is*
+there and will not read is the opposite case, and that one is recorded rather than dropped.
+
+A rebuild writes the account whole, so a caller who names the newest root and forgets the rest would
+publish a smaller file that authenticates perfectly and frees every subject it no longer mentions —
+the same silent loss an unreadable root is refused for, arriving through the front door. The rebuilt
+rows must therefore reach every subject the current revision reaches; a rebuild that would let one go
+is refused with exit 2, naming the pull request, the cohort and the run root to add. Subjects alone
+are not enough to hold it to: every sample key and every recorded defect must be reached too. A
+rebuild that reached a subject by a different run would satisfy a subject-only test while dropping
+the rows that said what else had happened to it — and a defect is the record of a root that was read
+and refused, or one nobody could read at all, which is exactly the record worth losing if one wanted a
+cleaner-looking account.
+
+A **placeholder** row is a row about an entry with **no ending** — a launch that is still open, whose
+journal outcome is `none`, or an entry in a root whose journal did not survive at all, whose outcome is
+`unknown`. It is a statement of ignorance: *this could not be read, so its subject is held rather than
+handed out.* An entry that ended — complete, failed, or with its evidence refused — is never one,
+however unreadable its artifacts turned out to be, because that row is a closed fact about a spend.
+
+A placeholder is allowed to be **superseded** by a later reading of the same run: same cohort, same
+entry, same subject. A root that was held while its launch was open is keyed on what was knowable then;
+when that run finishes, the ending arrives keyed on an audit digest that did not exist at the time.
+Holding the account to the older key would refuse every rebuild after the run completed, freezing it at
+the moment it was least informed. For the same reason a run does not read its own earlier hold as
+somebody else's prior observation, which would otherwise demote it to a repeat of itself and put its
+subject permanently out of reach — and *its own* means same cohort, same entry **and the same manifest
+digest**, so a different cohort that reused a cohort id and an entry id cannot claim the exemption.
+
+A placeholder is also **retractable** — but only by the entry's own **authenticated journal** saying
+the launch never happened, bound to the same manifest digest, and only when the operator asks for it
+in as many words with `--retract-cleared-holds`.
+
+The flag is not ceremony. If a journal and its key are both lost, a later run of the same manifest
+*mints a fresh journal*, and a fresh journal's entries are `pending` — indistinguishable, from the
+outside, from an original that never launched. Automatic retraction would therefore let the exact
+accident this account exists to prevent walk straight through it: lose a journal, re-run, rebuild, and
+a pull request that really was put in front of the models comes back as fresh. Leaving no escape at
+all is not the answer either — a root whose key alone went missing would hold its subjects forever
+with no argument that could ever clear them, and the only way out would be deleting the account. So
+the escape exists, is off by default, and is the operator asserting under their own recorded alias
+that the journal now being read is the original. The refusal says so when, and only when, the flag
+would actually have helped.
+
+Binding to the manifest digest is what makes "the same run" mean something. A cohort id and an entry
+id are strings an operator types, and `entry1` is the obvious collision; without the digest, a later
+manifest that reused both over the same pull request could speak for a run it had nothing to do with.
+Both placeholder shapes already record the digest of the manifest that produced them, and every
+legitimate retraction re-reads the same manifest bytes.
+
+Only a placeholder, and only in those directions. A row that recorded a real observation is never
+superseded, and a supersession must match the producing manifest's digest as well as the cohort, entry
+and subject. Unknown may become known, about the same run; known is never quietly replaced. The same
+replacement happens on the live path when a resuming runner records the ending of an entry it had
+already held, so a resume and a rebuild over one root do not disagree about how many rows that run
+left.
+
+A prior defect is held to being **named again**, not to failing again. Repairing an unreadable root is
+the remedy the selection message and this document both advertise, and a guard that demanded the defect
+back would wedge the account permanently on the very fix it asked for. Naming a cohort root also names
+anything the account recorded a defect against inside it — its journal root and its entries' output
+roots — since offering the cohort is the only way a caller can offer its entries for re-reading. That
+ownership is **exact**: a defect is answered by naming the manifest it belongs to, or the declared root
+it was raised against, and never by naming something that merely contains them. A declared root is an
+arbitrary caller-supplied string, so a rule that cleared everything beneath one would let a single
+manifest declaring a wide enough path erase every open question on the machine — and free the subjects
+they hold — without one of those roots being re-read. Paths are compared the way the file system
+compares them, so a different drive-letter case is not a lost root. A root named twice in one
+invocation is logged and read once; it is not persisted as evidence, because an argv accident is not a
+property of the run.
+
+The file also carries an `evidenceSha256` over its rows and defects alone — not the revision, not the
+publication time, not the path it was written to. It is the account's claim about the roots and nothing
+else, so two rebuilds over the same roots agree on it even when they land at different revisions or in
+different directories, and a caller can compare two machines' accounts without comparing their
+histories. The `inventory` block is derived from the rows but is *held* to them on load rather than
+recomputed, because an operator reads those headline numbers and a reader that recomputed them would
+authenticate a summary nobody ever signed.
+
+**Reading a journal written before the account existed.** A cohort records the account revision it
+stands on in its own signed journal, and that field is written only once there is one. A journal
+that has accepted no revision composes exactly the bytes it composed before the account was added,
+so every journal signed by an earlier build still authenticates and every cohort interrupted under
+one can still be resumed. Presence is the version marker; there is no separate number to keep in
+step, and there is no build in which a historical root becomes unreadable evidence.
+
+**Choosing what to run next.** The selection reads the account and drops every subject it holds:
+
+```
+ShadowRunCoordinator --select-subjects --registry <path> --candidates <path> --out <path> \
+                     [--select-count <n>] [--accept-unresolved-defects] \
+                     [--accept-unstarted-registry]
+```
+
+or, from PowerShell, `tools/Get-ShadowCohortSelection.ps1`, which is a thin wrapper over the same
+mode so that the account has exactly one reader. The candidate list is the operator's, in preference
+order; the exclusion is not. A sample that does not count still excludes, because a subject that has
+been run before is a subject whose next run is not a fresh observation.
+
+It **stops** when the account records a root it could not read — an `unreadable` defect, not merely a
+`noted` one. An unread root may hold any subject on the candidate list, so the exclusion is known to be
+incomplete and the answer would look more certain than its evidence. A `noted` root was read, its
+subjects are on the rows, and it excludes exactly as any other row does, so it stops nothing.
+`--accept-unresolved-defects` chooses in spite of an unread root, and the acknowledgement is written
+into the selection file so the next reader knows it was used.
+
+It also **stops** when there is no account file at the path it was given. An account that does not
+exist excludes nothing, so the answer would be the head of the candidate list whether or not those
+pull requests had already been spent — and a mistyped path is by far the likeliest way to arrive
+there. The rebuild refuses a root that is not there for the same reason, and a command that *answers*
+where the rebuild refuses is the worse of the two. Starting genuinely fresh is a real case, so
+`--accept-unstarted-registry` allows it, and the acknowledgement is written into the selection as
+`acceptedUnstartedRegistry`.
+
+## What the account proves, and what it does not
+
+It is worth being exact about the claim, because the number it produces is easy to over-read. What
+the account supports is:
+
+> Given these run roots, these keys and this caller-supplied root list, N qualifying runs were
+> observed over N distinct pull request identifiers, each ending at its declared target, inside its
+> declared ceilings, with no provider write.
+
+Four things it does **not** establish, none of which a local file can:
+
+- **It is not evidence against the operator.** The registry, its key, the manifests, the journals and
+  the intents are all in one person's hands; anyone who can edit the rows can re-sign them. The
+  signatures detect accident and drift, not an adversary. `evidenceSha256` is only worth something to
+  someone who already holds a trusted earlier value of it. Making this auditor-grade needs an
+  independent identity — a CI job that enumerates roots from an append-only catalogue, rebuilds, and
+  publishes the digest somewhere the operator cannot rewrite.
+- **It does not establish that the root list is complete.** The rebuild reads the roots it is given.
+  It refuses to *lose* evidence it already holds, and it records what it could not read, but a root
+  nobody ever names is a run nobody ever hears about.
+- **Distinct pull requests are not independent observations.** Different pull requests can share
+  authors, repositories and code, and the candidates are operator-chosen. The count is a count of
+  identifiers, not a sampling frame.
+- **There is no campaign digest.** Nothing binds the toolkit head and reviewer configuration into the
+  subject, so rows produced by materially different pipeline variants aggregate into one total. A
+  threshold read off that total is a statement about the toolkit in general, not about any one
+  version of it.
+
+Four narrower residuals, recorded rather than fixed:
+
+- **A cohort root that is deleted outright cannot be reconciled in place.** Naming a manifest that is
+  gone throws, and not naming it fails the lost-subject or dropped-defect guard, so an account whose
+  evidence has been destroyed can only be carried forward by rebuilding to a new path and reconciling
+  the two deliberately. That is the sound outcome — the alternative is an account that forgets on
+  request — but it is an operational cost, and the answer is to keep cohort roots immutable rather
+  than to soften the guard.
+
+- **A subject is not reserved before its child starts.** A row reaches the account when the entry
+  ends, so a cohort killed between `launchIntended` and its ending leaves a subject that the *live*
+  account does not yet hold. The journal holds it — a committed launch with no ending is held on
+  rebuild, and a resume records the ending's row — so the remedy is the ordinary one: rebuild the
+  account over the roots before selecting. An account that has not been rebuilt since a crash is not
+  an account that has been read.
+- **The subject key is built from display names.** `Organization/Project/Repository` plus the pull
+  request id, not an immutable repository GUID, because the manifest contract pins the names a
+  reviewer configuration uses. Renaming a repository therefore frees its subjects, and re-using a name
+  merges them. Changing it would invalidate every row already signed.
+- **The lock is not a compare-and-swap.** The gate plus the re-read narrows the window between two
+  writers to the width of a file replace; it does not eliminate it, and nothing outside the file
+  system arbitrates.
+
 ## Rollback
 
 The PowerShell preparation path is unchanged and remains the default; nothing routes to the

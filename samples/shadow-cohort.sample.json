@@ -30,6 +30,12 @@
   "audit": {
     "indexPath": "D:/shadow/pilot-two-active/index/cohort-index.json"
   },
+  "registry": {
+    "path": "D:/shadow/registry/gate5-cohort-registry.json",
+    "sha256": "none",
+    "targetSubjectKey": "6d36015b4d63f04d37b220299afaa98a327b8da41a0f479eb86c899df97889ce",
+    "mode": "count"
+  },
   "entries": [
     {
       "ordinal": 1,

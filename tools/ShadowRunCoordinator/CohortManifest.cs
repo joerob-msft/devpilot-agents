@@ -147,6 +147,12 @@ internal sealed record CohortManifest
     /// <summary>The declared entries, in the only order this cohort runs them.</summary>
     internal required IReadOnlyList<CohortEntry> Entries { get; init; }
 
+    /// <summary>
+    /// The durable subject account this cohort is declared against, when it has
+    /// one. Required of any manifest that can reach the shipping preparation.
+    /// </summary>
+    internal CohortRegistryBinding? Registry { get; init; }
+
     /// <summary>The digest of the exact manifest bytes, so a journal cannot be resumed under a different manifest.</summary>
     internal required string ManifestSha256 { get; init; }
 
@@ -177,6 +183,7 @@ internal sealed record CohortManifest
             "budgets",
             "journal",
             "audit",
+            "registry",
             "entries");
 
         // A v1 manifest declared a model-start estimate with nothing behind it,
@@ -264,6 +271,23 @@ internal sealed record CohortManifest
 
         RequireEstimatesWithinBudget(entries, budgets, label);
 
+        // The registry binding is optional in SHAPE and mandatory in EFFECT, and
+        // the two are deliberately separated. A manifest written before this build
+        // existed binds nothing, and refusing to READ one would make every finished
+        // root unrebuildable and every published index unverifiable - which is the
+        // opposite of what an account is for. So the shape stays optional here, and
+        // the runner refuses to LAUNCH a shipping cohort that binds no registry.
+        CohortRegistryBinding? registry = null;
+        if (root.TryGetProperty("registry", out var registryNode))
+        {
+            if (registryNode.ValueKind != JsonValueKind.Object)
+            {
+                throw new ContractException($"The {label} field 'registry' is {StrictJson.Describe(registryNode.ValueKind)} rather than an object.");
+            }
+            registry = CohortRegistryBinding.Read(registryNode, label + " registry");
+            RequireRegistryTargetDeclared(registry, entries, label);
+        }
+
         var manifest = new CohortManifest
         {
             CohortId = cohortId,
@@ -277,10 +301,36 @@ internal sealed record CohortManifest
             JournalRoot = RequireRootedPath(StrictJson.RequireString(journal, "root", label + " journal"), "journal root", label),
             IndexPath = RequireRootedPath(StrictJson.RequireString(audit, "indexPath", label + " audit"), "audit index path", label),
             Entries = entries,
+            Registry = registry,
             ManifestSha256 = CanonicalJson.Sha256Hex(bytes)
         };
         RequireIndexIsolated(manifest, label, path);
         return manifest;
+    }
+
+    /// <summary>
+    /// Requires the bound subject to be one this cohort actually declares.
+    /// </summary>
+    /// <remarks>
+    /// The binding is what an operator reads to see which pull request a cohort
+    /// occupies, and a binding that named a subject no entry runs would be a
+    /// statement about a run that never happens - while the entries quietly
+    /// occupied something else. Recomputed from the entry's own pins rather than
+    /// compared to a restatement, so the two cannot be written to disagree.
+    /// </remarks>
+    private static void RequireRegistryTargetDeclared(
+        CohortRegistryBinding registry,
+        IReadOnlyList<CohortEntry> entries,
+        string label)
+    {
+        var matches = entries.Count(entry =>
+            string.Equals(CohortRegistry.SubjectKeyOf(entry), registry.TargetSubjectKey, StringComparison.Ordinal));
+        if (matches == 0)
+        {
+            throw new ContractException(
+                $"The {label} binds registry subject {registry.TargetSubjectKey} and no declared entry is taken over that subject. " +
+                "The binding names the pull request this cohort occupies, so it is derived from an entry rather than typed beside one.");
+        }
     }
 
     /// <summary>
@@ -302,7 +352,7 @@ internal sealed record CohortManifest
     private static void RequireIndexIsolated(CohortManifest manifest, string label, string manifestPath)
     {
         var index = NormalizeRoot(manifest.IndexPath);
-        foreach (var (path, what) in new[]
+        var protectedPaths = new List<(string Path, string What)>
         {
             (manifest.JournalPath, "the cohort journal"),
             (manifest.JournalKeyPath, "the cohort journal's signing key"),
@@ -310,7 +360,17 @@ internal sealed record CohortManifest
             (manifest.IntentRoot, "the cohort intent root"),
             (manifest.LogRoot, "the cohort log root"),
             (manifestPath, "this manifest")
-        })
+        };
+        if (manifest.Registry is { } registry)
+        {
+            // The registry outlives every cohort that writes to it, so an index
+            // declared over it would destroy the account of every subject already
+            // spent - and would do it on the first publish, before this cohort had
+            // read the account it was about to overwrite.
+            protectedPaths.Add((registry.Path, "the durable subject registry"));
+            protectedPaths.Add((CohortRegistry.KeyPathFor(registry.Path), "the registry's signing key"));
+        }
+        foreach (var (path, what) in protectedPaths)
         {
             if (string.Equals(index, NormalizeRoot(path), StringComparison.OrdinalIgnoreCase))
             {

@@ -81,6 +81,20 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     /// <summary>Each entry's declared correlation, read from its own request once.</summary>
     private readonly Dictionary<string, string> _correlations = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// The registry revision this walk stands on, once it has been authenticated.
+    /// </summary>
+    /// <remarks>
+    /// Held rather than re-read per entry so that the revision an entry records
+    /// against is the revision the pre-walk accepted, not whatever is on disk by
+    /// then. A second writer that moved the file underneath is caught by the
+    /// atomic write's own revision chain rather than silently merged into.
+    /// </remarks>
+    private CohortRegistry? _registry;
+
+    /// <summary>The key the accepted registry is signed with, read once beside it.</summary>
+    private byte[]? _registryKey;
+
     /// <summary>How long a killed entry tree is given to go before the runner stops waiting on it.</summary>
     private const int DrainMilliseconds = 30_000;
 
@@ -247,10 +261,26 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             // raised, and a refusal raised here has to reach the handler that
             // records it rather than escaping past a journal this call has already
             // moved to 'running'.
-            PublishIndexSafely(journal, key, CohortIndex.ReasonRunning, "the cohort is in progress");
+            try
+            {
+                PublishIndexSafely(journal, key, CohortIndex.ReasonRunning, "the cohort is in progress");
+            }
+            catch (Exception error) when (error is ContractException or CohortBlockedException or IOException or UnauthorizedAccessException)
+            {
+                // Publishing re-reads every ended entry's evidence, so the resume
+                // that finds one of those artifacts damaged stops HERE - before the
+                // walk below, and before the account has even been opened. An entry
+                // that ended and never reached the account would be stranded by that:
+                // spent, unheld, and free for the next selection. So the subjects go
+                // on record first, best effort and without adopting anything, and the
+                // refusal still stops the run.
+                HoldSpentSubjectsBeforeFailing(journal);
+                throw;
+            }
 
             RequireLiveToolkitHead();
             RequireSealedModelStartBounds();
+            RequireRegistryAdmissible(journal, key);
 
             var stopped = false;
             var anyUnsuccessful = false;
@@ -260,6 +290,14 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
 
                 if (record.EndedRefused)
                 {
+                    // The subject is held first, then the cohort stops. The refusal
+                    // is committed; if this throw escaped before the row was written,
+                    // a resume would find a closed entry it cannot summarize and a
+                    // pull request that had been put in front of the models with
+                    // nothing on record - free to be selected again. Idempotent: the
+                    // row keys on the refused ending, so recording it on every resume
+                    // lands on the same bytes.
+                    RecordUnreadableEntrySample(journal, key, entry, record);
                     // A refused entry is not a failed entry that the continue
                     // policy may walk past. Its own published evidence could not be
                     // read as this build's, which says nothing reliable about what
@@ -277,6 +315,12 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                     // to start it again would be the duplicate launch this whole
                     // design exists to prevent.
                     _log.WriteLine($"entry {entry.Ordinal.ToString(CultureInfo.InvariantCulture)} '{entry.EntryId}' already ended '{record.Outcome}'; not started again.");
+                    // The ending is committed before the sample is recorded, so a
+                    // runner killed between the two leaves a spent subject with no
+                    // row. Re-derived here from the same signed evidence rather than
+                    // left out: an account missing a spend is the one failure that
+                    // lets the next cohort spend it again.
+                    RecordEndedEntrySample(journal, key, entry, record);
                     if (!CountsAsComplete(entry, record))
                     {
                         anyUnsuccessful = true;
@@ -393,6 +437,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         // request drifted, whose subject drifted, or whose rule bundle changed is
         // refused without ever appearing as a launch that has to be accounted for.
         var request = VerifyEntryPins(entry);
+        RequireSubjectStillFree(journal, entry);
 
         var specification = DescribeLaunch(entry);
         var intentSha256 = CanonicalJson.Sha256HexOfText(CanonicalJson.Canonical(specification));
@@ -565,23 +610,30 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             // the file system rather than the contract: the child is equally gone
             // in all of them.
             var blocked = error as CohortBlockedException;
+            var refused = intended with
+            {
+                State = CohortEntryStates.Ended,
+                EndedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+                ExitCode = exitCode,
+                Outcome = CohortEntryOutcomes.EvidenceRefused,
+                ElapsedSeconds = elapsed,
+                // Carried out of the refusal rather than defaulted. An entry
+                // closed BECAUSE its audit reported a write must not be summed
+                // into the index as having written nothing.
+                ProviderWriteCount = blocked?.ObservedProviderWriteCount ?? 0,
+                WriteToolInvocationCount = blocked?.ObservedWriteToolInvocationCount ?? 0
+            };
             journal.Commit(
                 key,
-                intended with
-                {
-                    State = CohortEntryStates.Ended,
-                    EndedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
-                    ExitCode = exitCode,
-                    Outcome = CohortEntryOutcomes.EvidenceRefused,
-                    ElapsedSeconds = elapsed,
-                    // Carried out of the refusal rather than defaulted. An entry
-                    // closed BECAUSE its audit reported a write must not be summed
-                    // into the index as having written nothing.
-                    ProviderWriteCount = blocked?.ObservedProviderWriteCount ?? 0,
-                    WriteToolInvocationCount = blocked?.ObservedWriteToolInvocationCount ?? 0
-                },
+                refused,
                 "ended",
                 "the entry's published evidence could not be read as this build's, and the entry is closed rather than left open");
+            // The subject was spent whatever the evidence says. This entry only got
+            // here by running its preparation, so the pull request really was put in
+            // front of it, and an account that recorded nothing would offer the same
+            // pull request again as a fresh subject. The row is composed from the
+            // journal alone - the one thing still readable - and can never count.
+            RecordUnreadableEntrySample(journal, key, entry, refused);
             if (blocked is not null)
             {
                 throw;
@@ -635,6 +687,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             SummarySha256 = CanonicalJson.Sha256HexOfText(CanonicalJson.Canonical((summary with { Record = ending }).Describe()))
         };
         journal.Commit(key, ended, "ended", detail);
+        RecordRegistrySample(journal, key, entry, summary with { Record = ended }, outcome, _operatorAlias);
         _log.WriteLine(
             $"entry '{entry.EntryId}' ended {outcome} in {elapsed.ToString(CultureInfo.InvariantCulture)}s " +
             $"modelStarts={summary.ModelStartCount.ToString(CultureInfo.InvariantCulture)} " +
@@ -1068,6 +1121,667 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     }
 
     /// <summary>
+    /// Proves, before any child of this cohort exists, that the registry the
+    /// manifest binds is the registry on disk and that no declared subject has
+    /// already been spent.
+    /// </summary>
+    /// <remarks>
+    /// This is the whole point of the registry: the refusal has to land before a
+    /// preparation is launched, because once a model has run the spend is real
+    /// whatever the runner decides afterwards. So it sits in the pre-walk beside
+    /// the toolkit-head and sealed-bound checks, and it walks EVERY declared entry
+    /// rather than checking each one as its turn comes - a two-entry cohort whose
+    /// second subject is already counted refuses both, rather than spending the
+    /// first and then stopping.
+    ///
+    /// Which registry revision is acceptable is deliberately two values and not a
+    /// range. The manifest binds the revision the operator authorized against;
+    /// this cohort then MOVES the registry forward by recording its own samples,
+    /// so a resume would refuse its own work if the bound digest were the only
+    /// acceptable one. The journal records the revision this cohort last accepted
+    /// or produced, and that is the second acceptable value. Anything else - a
+    /// revision some other cohort appended to in between, or an edited file - is
+    /// refused, because a registry that changed under an authorization is not the
+    /// registry that was authorized.
+    ///
+    /// A subject held by a sample from THIS cohort is not a duplicate; it is this
+    /// cohort's own record, seen again on a resume. Only a sample from another
+    /// cohort blocks.
+    /// </remarks>
+    private void RequireRegistryAdmissible(CohortJournal journal, byte[] key)
+    {
+        if (_manifest.Registry is not { } binding)
+        {
+            if (_manifest.Execution.IsShippingLaunchProfile)
+            {
+                // The requirement lives here rather than in the manifest reader on
+                // purpose. Reading a registry-less manifest has to keep working -
+                // every finished root holds one - but LAUNCHING one that can spend a
+                // real pull request without recording which one it spent is how a
+                // subject gets spent twice.
+                throw new CohortBlockedException(
+                    "This cohort names the shipping preparation and binds no registry. A cohort that can spend a real pull request records " +
+                    "which one it spent, or the next cohort has no way to know it was spent. Declare a 'registry' section naming the account " +
+                    "file, the revision this cohort was authorized against and the subject it occupies, and build the account first with " +
+                    "--rebuild-registry if there is not one yet.");
+            }
+            return;
+        }
+
+        var registry = LoadBoundRegistry(journal, binding);
+        _registry = registry;
+
+        if (!string.Equals(binding.Mode, CohortRegistryModes.Count, StringComparison.Ordinal))
+        {
+            // A diagnostic cohort may repeat a subject on purpose - that is what
+            // the mode is for - and its samples can never count.
+            //
+            // What it may NOT do is be the first run over a fresh pull request. A
+            // diagnostic row is deliberately invisible to the settle pass, so that
+            // repeating a subject does not evict the row it repeats; if such a row
+            // were the ONLY thing holding a subject, the models would have seen that
+            // pull request and a later cohort would still be free to count it as a
+            // first, independent observation. Requiring the subject to be held
+            // already keeps the mode exactly what it says it is - a repeat - and
+            // leaves the invisibility harmless.
+            foreach (var entry in _manifest.Entries)
+            {
+                var subject = CohortRegistry.SubjectKeyOf(entry);
+                if (registry.AnySampleFor(subject) is not null)
+                {
+                    continue;
+                }
+                throw new CohortBlockedException(
+                    $"Entry '{entry.EntryId}' names pull request {entry.PullRequestId.ToString(CultureInfo.InvariantCulture)} in " +
+                    $"'{CohortRegistry.RepositoryIdOf(entry)}', which the registry at '{binding.Path}' has never seen, and registry mode " +
+                    $"'{binding.Mode}' records history that cannot count. A first look at a fresh pull request has to be the counting one, " +
+                    $"or the subject is spent and the account never learns it. Declare mode '{CohortRegistryModes.Count}', or name a subject " +
+                    "the account already holds.");
+            }
+            _log.WriteLine(
+                $"registry {registry.RegistrySha256} accepted in '{binding.Mode}' mode; " +
+                $"{registry.CountingSampleCount.ToString(CultureInfo.InvariantCulture)} counted subject(s) on record, none of which this cohort may occupy.");
+            return;
+        }
+
+        // An unreadable defect is a root that was spent and cannot be read, so the
+        // account does not know which subject it holds. A counting cohort asks the
+        // account to prove its subject is free, and an account with an open question
+        // in it cannot prove that. Diagnostic cohorts are unaffected: they occupy
+        // nothing, so nothing has to be provable about them.
+        if (registry.UnreadableDefectCount > 0)
+        {
+            var named = string.Join(
+                "; ",
+                registry.Defects
+                    .Where(defect => string.Equals(defect.Kind, CohortRegistryDefectKinds.Unreadable, StringComparison.Ordinal))
+                    .Take(4)
+                    .Select(defect => $"'{defect.Source}' ({defect.Reason})"));
+            throw new CohortBlockedException(
+                $"The registry at '{binding.Path}' records " +
+                $"{registry.UnreadableDefectCount.ToString(CultureInfo.InvariantCulture)} root(s) whose evidence could not be read: {named}. " +
+                "A run that was spent and cannot be read may have spent this cohort's subject, so a counting cohort cannot prove its subject " +
+                "is free. Repair or restore those roots and rebuild the account with --rebuild-registry naming every root, or run under " +
+                $"registry mode '{CohortRegistryModes.Diagnostic}' where nothing counts.");
+        }
+
+        // Two entries over one pull request in a COUNTING cohort. The manifest's
+        // distinctness rule folds the iteration in, so this is a legal manifest; the
+        // account cannot honour it, because the second run is history and the operator
+        // asked for a count. Said here, before either one spends a model, rather than
+        // by the second one's recording failing after it already has.
+        var declaredSubjects = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var entry in _manifest.Entries)
+        {
+            var subject = CohortRegistry.SubjectKeyOf(entry);
+            if (declaredSubjects.TryGetValue(subject, out var first))
+            {
+                throw new CohortBlockedException(
+                    $"Entries '{first}' and '{entry.EntryId}' both name pull request " +
+                    $"{entry.PullRequestId.ToString(CultureInfo.InvariantCulture)} in '{CohortRegistry.RepositoryIdOf(entry)}', and a counting " +
+                    $"cohort spends a subject once. Declare one of them, or run under registry mode '{CohortRegistryModes.Diagnostic}' where a " +
+                    "repeat is kept as history and cannot count.");
+            }
+            declaredSubjects.Add(subject, entry.EntryId);
+        }
+
+        foreach (var entry in _manifest.Entries)
+        {
+            var subject = CohortRegistry.SubjectKeyOf(entry);
+            if (!registry.HoldsSubjectFromAnotherRun(subject, _manifest.ManifestSha256))
+            {
+                continue;
+            }
+            var held = registry.AnySampleFor(subject)!;
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' names pull request {entry.PullRequestId.ToString(CultureInfo.InvariantCulture)} in " +
+                $"'{CohortRegistry.RepositoryIdOf(entry)}', and the registry at '{binding.Path}' already holds that subject from cohort " +
+                $"'{held.CohortId}' under manifest {held.ManifestSha256} (classified '{held.Classification}'). A counting cohort does not spend " +
+                $"a subject twice, and this manifest is not the one that recorded it. Run it under registry mode " +
+                $"'{CohortRegistryModes.Diagnostic}' if a repeat is wanted as history, in which case it cannot count.");
+        }
+
+        _log.WriteLine(
+            $"registry {registry.RegistrySha256} accepted; " +
+            $"{registry.CountingSampleCount.ToString(CultureInfo.InvariantCulture)} counted subject(s) on record, " +
+            $"{registry.DistinctSubjectCount.ToString(CultureInfo.InvariantCulture)} distinct subject(s) seen, none of them this cohort's.");
+
+        // Recorded once the revision has been authenticated and accepted, so a
+        // resume of a cohort that has not yet appended anything still knows which
+        // revision it stood on.
+        journal.RecordRegistryRevision(key, registry.RegistrySha256);
+    }
+
+    /// <summary>
+    /// Re-reads the account immediately before a child starts, and refuses a subject
+    /// another run has claimed since the pre-walk.
+    /// </summary>
+    /// <remarks>
+    /// The pre-walk settles admission for the whole cohort at once, which is what
+    /// lets a two-entry cohort refuse both rather than spend the first. But nothing
+    /// outside the account serializes two cohorts, and a second cohort launched
+    /// against the same pull request after the pre-walk and before this entry starts
+    /// would spend it for real - the write gate would stop the second ROW, and by
+    /// then the models have already run.
+    ///
+    /// So the account is read again here, from disk, in the last moment before the
+    /// process exists. It does not close the window - nothing local does, short of
+    /// reserving the subject before any evidence exists to record - but it narrows it
+    /// from the length of a cohort to the length of a launch, and it costs one read.
+    /// A revision that has moved is admitted on the same terms the pre-walk admits
+    /// one: bound, this cohort's own, or one step past it.
+    /// </remarks>
+    private void RequireSubjectStillFree(CohortJournal journal, CohortEntry entry)
+    {
+        if (_manifest.Registry is not { } binding)
+        {
+            return;
+        }
+        if (!string.Equals(binding.Mode, CohortRegistryModes.Count, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var registry = LoadBoundRegistry(journal, binding);
+        _registry = registry;
+        var subject = CohortRegistry.SubjectKeyOf(entry);
+        if (!registry.HoldsSubjectFromAnotherRun(subject, _manifest.ManifestSha256))
+        {
+            return;
+        }
+        var held = registry.AnySampleFor(subject)!;
+        throw new CohortBlockedException(
+            $"Entry '{entry.EntryId}' names pull request {entry.PullRequestId.ToString(CultureInfo.InvariantCulture)} in " +
+            $"'{CohortRegistry.RepositoryIdOf(entry)}', and the registry at '{binding.Path}' has taken that subject since this cohort was " +
+            $"admitted - cohort '{held.CohortId}' under manifest {held.ManifestSha256}. Another run claimed it while this one was working, " +
+            "and starting now would spend it twice. Nothing has been launched for this entry.");
+    }
+
+    /// <summary>
+    /// Reads and authenticates the bound registry, and settles which revision this
+    /// cohort is allowed to stand on.
+    /// </summary>
+    private CohortRegistry LoadBoundRegistry(CohortJournal journal, CohortRegistryBinding binding)
+    {
+        CohortRegistry registry;
+        try
+        {
+            var registryKey = CohortRegistry.LoadOrMintKey(binding.Path, out var keyPreexisted);
+            registry = CohortRegistry.LoadOrFresh(binding.Path, registryKey, keyPreexisted);
+            _registryKey = registryKey;
+        }
+        catch (ContractException error)
+        {
+            // A registry that cannot be read is not an absent registry. Absent is
+            // recoverable by starting the account; unreadable means the account
+            // exists and its integrity is unknown, and running against it would
+            // produce a count nobody can defend.
+            throw new CohortBlockedException(
+                $"The registry at '{binding.Path}' could not be read as this build's: {error.Message} " +
+                "Rebuild it from the immutable cohort roots with --rebuild-registry before running a counting cohort against it.");
+        }
+
+        var acceptable = string.Equals(registry.RegistrySha256, binding.Sha256, StringComparison.Ordinal)
+            || (!string.Equals(journal.RegistrySha256, "none", StringComparison.Ordinal)
+                && string.Equals(registry.RegistrySha256, journal.RegistrySha256, StringComparison.Ordinal))
+            || IsOwnUncommittedSuccessor(registry, journal, binding);
+        if (!acceptable)
+        {
+            // Before refusing: an entry that ENDED and whose row never reached the
+            // account is the one failure this feature cannot tolerate, and this
+            // refusal is raised by the very event that causes it - another cohort
+            // writing to the shared account while this one was between its ending and
+            // its row. Refusing first and recovering never would leave that subject
+            // spent, unheld, and free to be selected again.
+            //
+            // The rows are derived from the same signed evidence a rebuild would read,
+            // and they are written to the account WITHOUT committing a revision to this
+            // cohort's journal. That distinction is the whole point: recording what was
+            // spent must not double as adopting the registry this cohort was not
+            // authorized against, or the refusal would quietly cure itself on the next
+            // run.
+            var recovered = RecoverEndedSamples(journal, registry);
+            var declared = string.Equals(binding.Sha256, CohortRegistryBinding.UnstartedRegistry, StringComparison.Ordinal)
+                ? "an unstarted registry"
+                : binding.Sha256;
+            throw new CohortBlockedException(
+                $"The manifest binds {declared} at '{binding.Path}' and the registry there is revision " +
+                $"{registry.Revision.ToString(CultureInfo.InvariantCulture)} digesting to {registry.RegistrySha256}" +
+                (string.Equals(journal.RegistrySha256, "none", StringComparison.Ordinal)
+                    ? "."
+                    : $", and this cohort last stood on {journal.RegistrySha256}.") +
+                " A registry that moved under an authorization is not the registry that was authorized; re-declare the cohort against the current revision." +
+                (recovered.Count == 0
+                    ? string.Empty
+                    : $" {recovered.Count.ToString(CultureInfo.InvariantCulture)} subject(s) this cohort had already spent were not on record " +
+                      $"and were recorded before stopping: {string.Join("; ", recovered)}."));
+        }
+
+        return registry;
+    }
+
+    /// <summary>
+    /// True when the account on disk is exactly one write past what this cohort last
+    /// committed to its journal.
+    /// </summary>
+    /// <remarks>
+    /// The one window the ordering leaves open. A sample is recorded in the account
+    /// first and the revision it produced is committed to the journal second, so a
+    /// runner killed between the two comes back to an account holding a revision the
+    /// journal never heard of - which is neither the revision the manifest bound nor
+    /// the revision the journal records, and would otherwise block the cohort for
+    /// good with its own subjects already held.
+    ///
+    /// One step, and only one: the revision on disk must say it succeeded exactly
+    /// the revision this cohort last stood on. That it authenticates is settled
+    /// before this is asked. If the writer was another cohort rather than this one's
+    /// dead predecessor, nothing is lost by accepting it - the rows it added were
+    /// read in with the file and are carried forward - and if what it added was a
+    /// subject THIS cohort declared, the duplicate refusal below still stops the run.
+    /// A registry further ahead than one step is not recognised, because the account
+    /// moved more than a single interrupted write can explain.
+    /// </remarks>
+    private bool IsOwnUncommittedSuccessor(
+        CohortRegistry registry,
+        CohortJournal journal,
+        CohortRegistryBinding binding)
+    {
+        var committed = string.Equals(journal.RegistrySha256, "none", StringComparison.Ordinal)
+            ? binding.Sha256
+            : journal.RegistrySha256;
+        return !string.Equals(committed, CohortRegistryBinding.UnstartedRegistry, StringComparison.Ordinal)
+            && string.Equals(registry.PreviousRegistrySha256, committed, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Records the sample for an entry that ended before this run started, when the
+    /// account does not already hold it.
+    /// </summary>
+    /// <remarks>
+    /// The other half of the ordering. An ending is committed to the journal before
+    /// its sample reaches the account, so a kill between the two leaves a subject
+    /// that was really spent with nothing on record saying so - and the walk skips
+    /// an ended entry, so nothing would ever go back for it. That is the single
+    /// failure this whole feature cannot tolerate: the next cohort would offer the
+    /// pull request again and admission would let it through.
+    ///
+    /// Re-derived from the same signed evidence a rebuild would use, and idempotent
+    /// by sample key, so the ordinary case - the sample is already there - costs a
+    /// lookup and writes nothing.
+    /// </remarks>
+    private void RecordEndedEntrySample(CohortJournal journal, byte[] key, CohortEntry entry, CohortEntryRecord record)
+    {
+        if (_manifest.Registry is null || _registry is not { } registry)
+        {
+            return;
+        }
+        var subject = CohortRegistry.SubjectKeyOf(entry);
+        var sampleKey = CohortRegistry.SampleKeyOf(subject, _manifest.CohortId, entry.EntryId, record.AuditSha256);
+        if (registry.SampleFor(sampleKey) is not null)
+        {
+            return;
+        }
+        CohortEntrySummary summary;
+        string authorizedBy;
+        try
+        {
+            summary = CohortSummaryReader.Read(entry, record, record.ElapsedSeconds, CorrelationOf(entry));
+            // The same check the rebuild applies. Without it a resumed runner would
+            // score an audit the journal never committed to, and the account it
+            // wrote would disagree with the account a rebuild derives from the very
+            // same root - two signed answers to one question.
+            RequireCommittedDigests(entry, record, summary);
+            // And the alias this entry actually launched under, not the one on this
+            // process's command line. A cohort started by one operator and resumed
+            // with a different --authorized-by would otherwise record an authorization
+            // that operator never gave, and a rebuild - which reads the alias from the
+            // launch intent the journal pins by digest - would silently correct it,
+            // so two accounts over one root would disagree about who spent the subject.
+            authorizedBy = CohortRegistryRebuild.ReadAuthorizedBy(_manifest, entry, record);
+        }
+        catch (Exception error) when (error is ContractException or CohortBlockedException or IOException or UnauthorizedAccessException)
+        {
+            // The subject is held first, then the cohort stops. This entry ended, so
+            // its pull request really was put in front of whatever the run started;
+            // letting the refusal escape with no row would leave that subject free for
+            // the next selection, which is the one failure the account exists to
+            // prevent. The row says exactly what is true - the evidence would not read
+            // - and it counts toward nothing.
+            RecordUnreadableEntrySample(journal, key, entry, record);
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' ended before this run and the account does not hold its sample, and its evidence could not be " +
+                $"re-read to record one: {error.Message} Its subject is held by a row that counts toward nothing so it is not offered " +
+                "again, and this cohort stops rather than going on.");
+        }
+        _log.WriteLine($"entry '{entry.EntryId}' ended earlier with no sample on record; recording it now.");
+        RecordRegistrySample(journal, key, entry, summary, record.Outcome, authorizedBy);
+    }
+
+    /// <summary>
+    /// The row one finished entry leaves, built from the journal and its evidence.
+    /// </summary>
+    /// <remarks>
+    /// Held by anything but this same run: another cohort's row, or an earlier entry
+    /// of THIS cohort over the same pull request. A manifest may declare the same
+    /// subject twice at two iterations - the distinctness rule folds the iteration in
+    /// and the subject key deliberately does not - and the second one is history, not
+    /// a second spend.
+    ///
+    /// Same run means same cohort AND same entry AND the same manifest digest, not
+    /// merely the same sample key. A rebuild run over this root before the entry ended
+    /// leaves a placeholder row keyed on the manifest digest rather than on an audit
+    /// that did not exist yet; the real ending arrives under a different sample key,
+    /// and reading that placeholder as somebody else's observation would demote this
+    /// run to a repeat of itself and put its subject permanently out of reach. The
+    /// manifest digest is what keeps that exemption from being claimable by a DIFFERENT
+    /// cohort that happens to reuse a cohort id and an entry id - 'entry1' is the
+    /// obvious collision - and so quietly counting a second spend of one subject. This
+    /// run's manifest digest cannot change under it: a manifest re-bound to another
+    /// registry is a different manifest, and the journal refuses to resume under one.
+    /// </remarks>
+    private CohortRegistrySample BuildRegistrySample(
+        CohortJournal journal,
+        CohortRegistry registry,
+        CohortEntry entry,
+        CohortEntrySummary summary,
+        string outcome,
+        string authorizedBy)
+    {
+        var subject = CohortRegistry.SubjectKeyOf(entry);
+        var sampleKey = CohortRegistry.SampleKeyOf(subject, _manifest.CohortId, entry.EntryId, summary.AuditSha256);
+        var heldElsewhere = registry.Samples.Any(existing =>
+            string.Equals(existing.SubjectKey, subject, StringComparison.Ordinal)
+            && !string.Equals(existing.SampleKey, sampleKey, StringComparison.Ordinal)
+            && !(string.Equals(existing.CohortId, _manifest.CohortId, StringComparison.Ordinal)
+                && string.Equals(existing.EntryId, entry.EntryId, StringComparison.Ordinal)
+                && string.Equals(existing.ManifestSha256, _manifest.ManifestSha256, StringComparison.Ordinal))
+            && (existing.CountsTowardThreshold
+                || CohortRegistryClassifications.IsPriorObservation(existing.Classification, existing.RealModelStarts)));
+        return CohortRegistryAdmission.SampleFor(
+            _manifest,
+            entry,
+            summary,
+            outcome,
+            authorizedBy,
+            heldElsewhere,
+            summary.Record.EndedAtUtc,
+            SpentBefore(journal, entry));
+    }
+
+    /// <summary>
+    /// Records the rows of entries that already ended and are missing from the
+    /// account, without adopting the revision they are written into.
+    /// </summary>
+    /// <remarks>
+    /// Called on the one path that would otherwise strand them: the registry moved
+    /// out from under this cohort's authorization, so the run is about to be refused
+    /// for good, and the same concurrent write that moved it is what stops an ending
+    /// from reaching the account in the first place.
+    ///
+    /// Best effort by construction. Every row here is re-derived from signed evidence
+    /// and idempotent by sample key, so a rebuild over this root produces the same
+    /// rows; an entry whose evidence will not read is held by the row that says so
+    /// rather than left free. Nothing here writes the journal, and nothing here is
+    /// allowed to replace the refusal the caller is raising - a failure to record is
+    /// logged and named, and the refusal still stops the run.
+    /// </remarks>
+    private List<string> RecoverEndedSamples(CohortJournal journal, CohortRegistry registry)
+    {
+        var recovered = new List<string>();
+        if (_manifest.Registry is not { } binding || _registryKey is not { } registryKey)
+        {
+            return recovered;
+        }
+        foreach (var entry in _manifest.Entries)
+        {
+            var record = journal.RecordFor(entry.EntryId);
+            if (!record.HasEnded)
+            {
+                continue;
+            }
+            var subject = CohortRegistry.SubjectKeyOf(entry);
+            if (registry.SampleFor(CohortRegistry.SampleKeyOf(subject, _manifest.CohortId, entry.EntryId, record.AuditSha256)) is not null)
+            {
+                continue;
+            }
+            CohortRegistrySample sample;
+            try
+            {
+                var summary = CohortSummaryReader.Read(entry, record, record.ElapsedSeconds, CorrelationOf(entry));
+                RequireCommittedDigests(entry, record, summary);
+                sample = BuildRegistrySample(
+                    journal,
+                    registry,
+                    entry,
+                    summary,
+                    record.Outcome,
+                    CohortRegistryRebuild.ReadAuthorizedBy(_manifest, entry, record));
+            }
+            catch (Exception error) when (error is ContractException or CohortBlockedException or IOException or UnauthorizedAccessException)
+            {
+                sample = CohortRegistryAdmission.UnreadableSampleFor(
+                    _manifest,
+                    entry,
+                    record,
+                    CohortRegistryRebuild.ReadAuthorizedByOrUnknown(_manifest, entry, record));
+            }
+            if (registry.SampleFor(sample.SampleKey) is not null)
+            {
+                continue;
+            }
+            try
+            {
+                registry.Record(registryKey, sample);
+                recovered.Add(
+                    $"pull request {entry.PullRequestId.ToString(CultureInfo.InvariantCulture)} from entry '{entry.EntryId}' " +
+                    $"as '{sample.Classification}'");
+            }
+            catch (Exception error) when (error is ContractException or IOException or UnauthorizedAccessException)
+            {
+                _log.WriteLine(
+                    $"registry {binding.Path} could not be told that entry '{entry.EntryId}' spent its subject: {error.Message} " +
+                    "The subject may be offered again; rebuild the account from this cohort's root before selecting.");
+            }
+        }
+        return recovered;
+    }
+
+    /// <summary>
+    /// Puts every already-ended entry on record before a refusal raised on the way in
+    /// stops the cohort, without adopting the account it writes to.
+    /// </summary>
+    /// <remarks>
+    /// The one ordering hole the account has. A runner is killed between an entry's
+    /// ending and its row; the resume re-publishes the index first, and if that
+    /// entry's artifacts are the damaged ones, the refusal is raised before the
+    /// account has been opened at all - so the walk that would have recorded the row
+    /// never runs, and the subject is spent with nothing on record.
+    ///
+    /// Every failure here is swallowed and named. This is the error path already; a
+    /// second fault while trying to hold a subject must not replace the refusal the
+    /// caller is raising, which is the more informative of the two. What the operator
+    /// is told, either way, is to rebuild the account from this root before selecting
+    /// - the rebuild reads the same evidence and reaches the same rows.
+    /// </remarks>
+    private void HoldSpentSubjectsBeforeFailing(CohortJournal journal)
+    {
+        if (_manifest.Registry is not { } binding || !File.Exists(binding.Path))
+        {
+            return;
+        }
+        try
+        {
+            // Read, never minted. An account that is not there cannot be holding
+            // anything, and minting a key beside a file that does not exist would
+            // leave a signing key for an account nobody ever wrote.
+            var registryKey = CohortRegistry.LoadOrMintKey(binding.Path, out _);
+            _registryKey ??= registryKey;
+            var registry = CohortRegistry.Load(binding.Path, registryKey);
+            var recovered = RecoverEndedSamples(journal, registry);
+            if (recovered.Count > 0)
+            {
+                _log.WriteLine(
+                    $"registry {binding.Path} recorded {recovered.Count.ToString(CultureInfo.InvariantCulture)} subject(s) this cohort had " +
+                    $"already spent before stopping: {string.Join("; ", recovered)}.");
+            }
+        }
+        catch (Exception error) when (error is ContractException or CohortBlockedException or IOException or UnauthorizedAccessException)
+        {
+            _log.WriteLine(
+                $"registry {binding.Path} could not be told what this cohort had already spent: {error.Message} " +
+                "Rebuild the account from this cohort's root with --rebuild-registry before selecting again.");
+        }
+    }
+
+    /// <summary>
+    /// Records what one finished entry proved about its subject, counted or not.
+    /// </summary>
+    /// <remarks>
+    /// Called after the ending is committed, never before: the sample carries the
+    /// summary digest and the terminal outcome as the journal holds them, so a
+    /// runner killed between the two leaves a closed entry with no sample rather
+    /// than a sample for an entry with no ending. The resume re-derives the same
+    /// sample from the same evidence and records it then, and because the sample
+    /// key is derived from the audit digest the second recording lands on the same
+    /// bytes rather than adding a row.
+    ///
+    /// Every finished entry leaves a sample. A failed, refused, over-budget or
+    /// unauthorized entry is recorded as history that does not count, because an
+    /// account that only remembers its successes cannot answer 'has this pull
+    /// request been used before'.
+    /// </remarks>
+    private void RecordRegistrySample(
+        CohortJournal journal,
+        byte[] key,
+        CohortEntry entry,
+        CohortEntrySummary summary,
+        string outcome,
+        string authorizedBy)
+    {
+        if (_manifest.Registry is not { } binding || _registry is not { } registry)
+        {
+            return;
+        }
+
+        var sample = BuildRegistrySample(journal, registry, entry, summary, outcome, authorizedBy);
+
+        try
+        {
+            registry.Record(_registryKey!, sample);
+        }
+        catch (ContractException error)
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' finished and its sample could not be recorded in the registry at '{binding.Path}': {error.Message} " +
+                "The entry's own artifacts stand; the cohort stops rather than going on with an account it could not update.");
+        }
+        journal.RecordRegistryRevision(key, registry.RegistrySha256);
+        _log.WriteLine(
+            $"registry {binding.Path} revision {registry.Revision.ToString(CultureInfo.InvariantCulture)} " +
+            $"({registry.RegistrySha256}) recorded entry '{entry.EntryId}' as '{sample.Classification}' " +
+            $"countsTowardThreshold={(sample.CountsTowardThreshold ? "true" : "false")}; " +
+            $"{registry.CountingSampleCount.ToString(CultureInfo.InvariantCulture)} counted subject(s) on record.");
+    }
+
+    /// <summary>
+    /// Records the row an entry leaves when its own evidence could not be read.
+    /// </summary>
+    /// <remarks>
+    /// The refusal path's other half. The ending is committed first, exactly as it
+    /// is for an entry that ended cleanly, and the row follows; a runner killed in
+    /// between comes back to an ended entry with no sample, which the resume walk's
+    /// <see cref="RecordEndedEntrySample"/> goes back for.
+    ///
+    /// The refusal that brought us here is re-thrown by the caller, so this must not
+    /// replace it with a failure of its own. An account that cannot be updated is
+    /// reported and the original refusal stands: the entry is closed either way, and
+    /// the cohort is stopping regardless.
+    /// </remarks>
+    private void RecordUnreadableEntrySample(CohortJournal journal, byte[] key, CohortEntry entry, CohortEntryRecord record)
+    {
+        if (_manifest.Registry is not { } binding || _registry is not { } registry)
+        {
+            return;
+        }
+        var sample = CohortRegistryAdmission.UnreadableSampleFor(
+            _manifest,
+            entry,
+            record,
+            CohortRegistryRebuild.ReadAuthorizedByOrUnknown(_manifest, entry, record));
+        if (registry.SampleFor(sample.SampleKey) is not null)
+        {
+            return;
+        }
+        try
+        {
+            registry.Record(_registryKey!, sample);
+            journal.RecordRegistryRevision(key, registry.RegistrySha256);
+            _log.WriteLine(
+                $"registry {binding.Path} revision {registry.Revision.ToString(CultureInfo.InvariantCulture)} " +
+                $"({registry.RegistrySha256}) holds subject of entry '{entry.EntryId}' as '{sample.Classification}': its evidence " +
+                "could not be read, and an unheld subject would be offered again.");
+        }
+        catch (Exception error) when (error is ContractException or CohortBlockedException or IOException or UnauthorizedAccessException)
+        {
+            _log.WriteLine(
+                $"registry {binding.Path} could not be told that entry '{entry.EntryId}' spent its subject: {error.Message} " +
+                "The subject may be offered again; rebuild the account from this cohort's root before selecting.");
+        }
+    }
+
+    /// <summary>
+    /// What the cohort's earlier entries had already spent, from the signed journal.
+    /// </summary>
+    /// <remarks>
+    /// Read the same way the budget stop reads it - ended entries only, actuals plus
+    /// whatever allowance was left unmeasured - so a sample is held to the same total
+    /// the runner itself refuses to cross. Entries after this one contribute nothing:
+    /// they had not run when it did.
+    /// </remarks>
+    private CohortRegistryAdmission.Spent SpentBefore(CohortJournal journal, CohortEntry entry)
+    {
+        long models = 0;
+        long verifiers = 0;
+        long seconds = 0;
+        foreach (var declared in _manifest.Entries)
+        {
+            if (declared.Ordinal >= entry.Ordinal)
+            {
+                continue;
+            }
+            var record = journal.RecordFor(declared.EntryId);
+            if (!record.HasEnded)
+            {
+                continue;
+            }
+            models += record.ModelStartCount + record.ModelStartUnmeasuredAllowance;
+            verifiers += record.VerifierAssignmentCount + record.VerifierAssignmentUnmeasuredAllowance;
+            seconds += record.ElapsedSeconds;
+        }
+        return new CohortRegistryAdmission.Spent(models, verifiers, seconds);
+    }
+
+    /// <summary>
     /// Names the global ceiling the next entry would cross, or null when it fits.
     /// </summary>
     /// <remarks>
@@ -1461,7 +2175,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         return CohortCompletionAdoption.Evaluate(_manifest, summary).Adopted;
     }
 
-    private static void RequireCommittedDigests(CohortEntry entry, CohortEntryRecord record, CohortEntrySummary summary)
+    internal static void RequireCommittedDigests(CohortEntry entry, CohortEntryRecord record, CohortEntrySummary summary)
     {
         if (!string.Equals(record.AuditSha256, summary.AuditSha256, StringComparison.Ordinal))
         {

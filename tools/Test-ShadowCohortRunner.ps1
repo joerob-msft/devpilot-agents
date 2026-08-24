@@ -574,6 +574,7 @@ function New-CohortEntryRequest {
         [switch]$WithoutDelivery,
         [string]$DeliveryAuthorizationKind = 'PreviewOnly',
         [int]$ProviderWriteBudget = 0,
+        [string]$Organization = 'contoso-shadow-org',
         [string]$ConfiguredTargetRefName = 'refs/heads/main'
     )
     if (-not $OutputRoot) { $OutputRoot = Join-Path $Sandbox "roots\$EntryId" }
@@ -592,7 +593,7 @@ function New-CohortEntryRequest {
         $Digests = @{ configSha256 = (Get-Sha256 -Path $configPath); promptSha256 = (New-FakeDigest); schemaSha256 = (New-FakeDigest) }
     }
     $subject = [ordered]@{
-        organization = 'contoso-shadow-org'
+        organization = $Organization
         project = 'contoso-shadow-project'
         repository = 'contoso-shadow-repository'
         pullRequestId = $PullRequestId
@@ -824,6 +825,22 @@ function New-CohortEntryDeclaration {
     }
 }
 
+function Get-CohortSubjectKey {
+    param(
+        [Parameter(Mandatory)][string]$RepositoryId,
+        [Parameter(Mandatory)][int]$PullRequestId
+    )
+    # The same fold the runner applies: trimmed, lower-cased, then the number,
+    # so a repository retyped in another case cannot spend a pull request twice.
+    $folded = ($RepositoryId.Trim().ToLowerInvariant() + '#' + $PullRequestId.ToString([Globalization.CultureInfo]::InvariantCulture))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($folded))
+        return -join ($bytes | ForEach-Object { $_.ToString('x2') })
+    }
+    finally { $sha.Dispose() }
+}
+
 function New-CohortManifestFile {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -850,6 +867,11 @@ function New-CohortManifestFile {
         [int]$ProviderWriteBudget = 0,
         [string]$ContractVersion = 'devpilot.shadow-cohort.manifest.v3',
         [string]$Kind = '',
+        [string]$RegistryPath = '',
+        [string]$RegistrySha256 = 'none',
+        [string]$RegistryMode = 'count',
+        [string]$RegistryTargetSubjectKey = '',
+        [switch]$OmitRegistry,
         [hashtable]$ExtraRoot
     )
     $resolvedPrefix = [string[]]@('-NoProfile', '-NonInteractive', '-File', $StubPath)
@@ -893,6 +915,30 @@ function New-CohortManifestFile {
         audit = [ordered]@{ indexPath = $IndexPath }
         entries = @($Entries)
     }
+    # A manifest that names the shipping preparation is refused at launch without
+    # a registry binding, so the fixture supplies one by default in exactly the
+    # cases the runner requires it. Scenarios that are ABOUT the binding pass
+    # -RegistryPath or -OmitRegistry explicitly.
+    $needsRegistry = ($Kind -eq 'shadow-cohort-run')
+    if ($RegistryPath -or ($needsRegistry -and -not $OmitRegistry.IsPresent)) {
+        $resolvedRegistry = $RegistryPath
+        if (-not $resolvedRegistry) { $resolvedRegistry = Join-Path (Split-Path -Parent $Path) 'registry\cohort-registry.json' }
+        $resolvedSubject = $RegistryTargetSubjectKey
+        if (-not $resolvedSubject) {
+            $first = @($Entries)[0]
+            if ($first) {
+                $resolvedSubject = Get-CohortSubjectKey `
+                    -RepositoryId ("{0}/{1}/{2}" -f $first.subject.organization, $first.subject.project, $first.subject.repository) `
+                    -PullRequestId ([int]$first.subject.pullRequestId)
+            }
+        }
+        $manifest['registry'] = [ordered]@{
+            path = $resolvedRegistry
+            sha256 = $RegistrySha256
+            targetSubjectKey = $resolvedSubject
+            mode = $RegistryMode
+        }
+    }
     if ($ExtraRoot) { foreach ($name in $ExtraRoot.Keys) { $manifest[$name] = $ExtraRoot[$name] } }
     return (Write-StrictJsonFile -Path $Path -Value ([pscustomobject]$manifest) -Depth 24)
 }
@@ -903,11 +949,12 @@ function Invoke-Cohort {
         [string]$AuthorizedBy = 'test-operator',
         [switch]$RebuildIndex,
         [switch]$OmitAuthorization,
+        [switch]$OmitCohort,
         [string[]]$Extra
     )
     $argv = [System.Collections.Generic.List[string]]::new()
     [void]$argv.Add($script:CohortDll)
-    [void]$argv.Add('--cohort'); [void]$argv.Add($ManifestPath)
+    if (-not $OmitCohort.IsPresent) { [void]$argv.Add('--cohort'); [void]$argv.Add($ManifestPath) }
     if (-not $OmitAuthorization.IsPresent) { [void]$argv.Add('--authorized-by'); [void]$argv.Add($AuthorizedBy) }
     if ($RebuildIndex.IsPresent) { [void]$argv.Add('--rebuild-index') }
     if ($Extra) { foreach ($item in $Extra) { [void]$argv.Add($item) } }
@@ -939,7 +986,7 @@ Write-Host "sandbox: $sandboxRoot" -ForegroundColor DarkGray
 
 try {
     # -----------------------------------------------------------------------
-    Write-Host '1/30 build the shipping coordinator' -ForegroundColor Cyan
+    Write-Host '1/35 build the shipping coordinator' -ForegroundColor Cyan
     $project = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\ShadowRunCoordinator.csproj'
     $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     $env:DOTNET_NOLOGO = '1'
@@ -964,7 +1011,7 @@ try {
         })
 
     # -----------------------------------------------------------------------
-    Write-Host '2/30 three-entry cohort: complete, not-complete, complete' -ForegroundColor Cyan
+    Write-Host '2/35 three-entry cohort: complete, not-complete, complete' -ForegroundColor Cyan
     $caseA = Join-Path $sandboxRoot 'case-a'
     $a1 = New-CohortEntryRequest -Sandbox $caseA -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $a2 = New-CohortEntryRequest -Sandbox $caseA -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1028,7 +1075,7 @@ try {
         'An entry signing key is not the 32 raw bytes the preparation writes.'
 
     # -----------------------------------------------------------------------
-    Write-Host '3/30 the summary carries no subject, finding text or judgement' -ForegroundColor Cyan
+    Write-Host '3/35 the summary carries no subject, finding text or judgement' -ForegroundColor Cyan
     $indexText = Get-Content -LiteralPath (Join-Path $caseA 'index\cohort-index.json') -Raw
     # The sentinel names are chosen not to occur inside a hexadecimal digest, so
     # their absence is evidence rather than luck. The field names are checked
@@ -1043,7 +1090,7 @@ try {
     Assert-Cohort ($null -ne $indexA.indexSha256 -and $null -ne $indexA.signature) 'The index is neither self-hashed nor signed.'
 
     # -----------------------------------------------------------------------
-    Write-Host '4/30 an ended entry is never re-attempted' -ForegroundColor Cyan
+    Write-Host '4/35 an ended entry is never re-attempted' -ForegroundColor Cyan
     $rerunA = Invoke-Cohort -ManifestPath $manifestA
     Assert-Cohort ($rerunA.ExitCode -eq 5) "Re-running a finished cohort exited $($rerunA.ExitCode); expected the same 5."
     $journalA = Get-JsonFile -Path (Join-Path $caseA 'journal\cohort-journal.json')
@@ -1055,7 +1102,7 @@ try {
     Assert-Cohort ($launchEvents.Count -eq 3) "The journal records $($launchEvents.Count) launch intents for three entries; expected exactly three."
 
     # -----------------------------------------------------------------------
-    Write-Host '5/30 the index is rebuildable from the journal and the entry audits' -ForegroundColor Cyan
+    Write-Host '5/35 the index is rebuildable from the journal and the entry audits' -ForegroundColor Cyan
     $indexPathA = Join-Path $caseA 'index\cohort-index.json'
     $beforeRebuild = Get-JsonFile -Path $indexPathA
     Remove-Item -LiteralPath $indexPathA -Force
@@ -1112,7 +1159,7 @@ try {
         "The rebuilt index says '$($afterRebuild.terminalReason)' and the run published '$($beforeRebuild.terminalReason)'."
 
     # -----------------------------------------------------------------------
-    Write-Host '6/30 failFast leaves the remaining entries pending' -ForegroundColor Cyan
+    Write-Host '6/35 failFast leaves the remaining entries pending' -ForegroundColor Cyan
     $caseB = Join-Path $sandboxRoot 'case-b'
     $b1 = New-CohortEntryRequest -Sandbox $caseB -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $b2 = New-CohortEntryRequest -Sandbox $caseB -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1188,7 +1235,7 @@ try {
     Assert-Cohort ($recordB2c3.outcome -eq 'complete') 'The continue policy did not carry on past an accounted-for failure.'
 
     # -----------------------------------------------------------------------
-    Write-Host '7/30 a child that hangs is killed at its declared ceiling' -ForegroundColor Cyan
+    Write-Host '7/35 a child that hangs is killed at its declared ceiling' -ForegroundColor Cyan
     $caseC = Join-Path $sandboxRoot 'case-c'
     $c1 = New-CohortEntryRequest -Sandbox $caseC -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $c2 = New-CohortEntryRequest -Sandbox $caseC -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1232,7 +1279,7 @@ try {
         'A resume over a refused entry started the entry after it.'
 
     # -----------------------------------------------------------------------
-    Write-Host '8/30 kill at a cohort transition, then refuse to run beside a live child' -ForegroundColor Cyan
+    Write-Host '8/35 kill at a cohort transition, then refuse to run beside a live child' -ForegroundColor Cyan
     $caseD = Join-Path $sandboxRoot 'case-d'
     $d1 = New-CohortEntryRequest -Sandbox $caseD -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $d2 = New-CohortEntryRequest -Sandbox $caseD -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1288,7 +1335,7 @@ try {
         Start-Sleep -Milliseconds 500
     }
     # -----------------------------------------------------------------------
-    Write-Host '9/30 resume is idempotent and starts exactly the next entry' -ForegroundColor Cyan
+    Write-Host '9/35 resume is idempotent and starts exactly the next entry' -ForegroundColor Cyan
     [void](New-StubControl -Path $d2.ControlPath -ExitCode 0 -StartedMarker $markerD)
     $resumed = Invoke-Cohort -ManifestPath $manifestD
     Assert-Cohort ($resumed.ExitCode -eq 0) "The resumed cohort exited $($resumed.ExitCode); expected 0."
@@ -1304,7 +1351,7 @@ try {
         'The resumed cohort did not publish a completed index over all three entries.'
 
     # -----------------------------------------------------------------------
-    Write-Host '10/30 a journal edited after it was written is refused' -ForegroundColor Cyan
+    Write-Host '10/35 a journal edited after it was written is refused' -ForegroundColor Cyan
     $journalPathD = Join-Path $journalD 'cohort-journal.json'
     $tamperedJournal = (Get-Content -LiteralPath $journalPathD -Raw) -replace '"attempt": 2', '"attempt": 3'
     [IO.File]::WriteAllBytes($journalPathD, ([Text.UTF8Encoding]::new($false)).GetBytes($tamperedJournal))
@@ -1313,7 +1360,7 @@ try {
     Assert-Cohort ($tamperRun.Output -match 'signature') 'The refusal did not name the signature that failed.'
 
     # -----------------------------------------------------------------------
-    Write-Host '11/30 a manifest edited between runs is refused' -ForegroundColor Cyan
+    Write-Host '11/35 a manifest edited between runs is refused' -ForegroundColor Cyan
     $caseE = Join-Path $sandboxRoot 'case-e'
     $e1 = New-CohortEntryRequest -Sandbox $caseE -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     [void](New-StubControl -Path $e1.ControlPath -ExitCode 0)
@@ -1329,7 +1376,7 @@ try {
     Assert-Cohort ($editedRun.ExitCode -eq 2) "Resuming under an edited manifest exited $($editedRun.ExitCode); expected 2."
 
     # -----------------------------------------------------------------------
-    Write-Host '12/30 a journal key without its journal is not started over' -ForegroundColor Cyan
+    Write-Host '12/35 a journal key without its journal is not started over' -ForegroundColor Cyan
     Remove-Item -LiteralPath (Join-Path $caseE 'journal\cohort-journal.json') -Force
     $orphanKey = Invoke-Cohort -ManifestPath $manifestE
     Assert-Cohort ($orphanKey.ExitCode -eq 2) "A key without a journal exited $($orphanKey.ExitCode); expected 2."
@@ -1412,7 +1459,7 @@ try {
         "Resuming over a journal holding a negative exit code exited $($rerunE3.ExitCode); expected 11."
 
     # -----------------------------------------------------------------------
-    Write-Host '13/30 global budget exhaustion stops before the next entry' -ForegroundColor Cyan
+    Write-Host '13/35 global budget exhaustion stops before the next entry' -ForegroundColor Cyan
     $caseF = Join-Path $sandboxRoot 'case-f'
     $f1 = New-CohortEntryRequest -Sandbox $caseF -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $f2 = New-CohortEntryRequest -Sandbox $caseF -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1479,7 +1526,7 @@ try {
         'The index does not report the unaccounted entry as ended.'
 
     # -----------------------------------------------------------------------
-    Write-Host '14/30 an observed provider write blocks the whole cohort' -ForegroundColor Cyan
+    Write-Host '14/35 an observed provider write blocks the whole cohort' -ForegroundColor Cyan
     $caseG = Join-Path $sandboxRoot 'case-g'
     $g1 = New-CohortEntryRequest -Sandbox $caseG -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $g2 = New-CohortEntryRequest -Sandbox $caseG -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1525,7 +1572,7 @@ try {
         'The index totals report no provider write for a cohort that stopped because it observed one.'
 
     # -----------------------------------------------------------------------
-    Write-Host '15/30 an entry audit this build cannot read blocks the whole cohort' -ForegroundColor Cyan
+    Write-Host '15/35 an entry audit this build cannot read blocks the whole cohort' -ForegroundColor Cyan
     $caseH = Join-Path $sandboxRoot 'case-h'
     $h1 = New-CohortEntryRequest -Sandbox $caseH -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $h2 = New-CohortEntryRequest -Sandbox $caseH -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1740,7 +1787,7 @@ try {
         "A completed entry with no audit published terminal reason '$($indexHollow.terminalReason)'; expected blocked."
 
     # -----------------------------------------------------------------------
-    Write-Host '16/30 identity drift between the manifest and the request is refused' -ForegroundColor Cyan
+    Write-Host '16/35 identity drift between the manifest and the request is refused' -ForegroundColor Cyan
     $caseI = Join-Path $sandboxRoot 'case-i'
     $i1 = New-CohortEntryRequest -Sandbox $caseI -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     [void](New-StubControl -Path $i1.ControlPath -ExitCode 0)
@@ -1757,7 +1804,7 @@ try {
     Assert-Cohort ($indexI.terminalReason -eq 'contractRefusal') 'The refusal was not published in the index.'
 
     # -----------------------------------------------------------------------
-    Write-Host '17/30 a request edited after the manifest sealed it is refused' -ForegroundColor Cyan
+    Write-Host '17/35 a request edited after the manifest sealed it is refused' -ForegroundColor Cyan
     $caseJ = Join-Path $sandboxRoot 'case-j'
     $j1 = New-CohortEntryRequest -Sandbox $caseJ -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     [void](New-StubControl -Path $j1.ControlPath -ExitCode 0)
@@ -1772,7 +1819,7 @@ try {
     Assert-Cohort ($runJ.Output -match 'nobody authorized') 'The refusal did not say the request was never authorized.'
 
     # -----------------------------------------------------------------------
-    Write-Host '18/30 a rule bundle that changed under the declaration is refused' -ForegroundColor Cyan
+    Write-Host '18/35 a rule bundle that changed under the declaration is refused' -ForegroundColor Cyan
     $caseK = Join-Path $sandboxRoot 'case-k'
     $bundleK = Write-StrictJsonFile -Path (Join-Path $caseK 'inputs\rule-bundle.json') -Value ([pscustomobject]@{ declaredPaths = @('a') })
     $k1 = New-CohortEntryRequest -Sandbox $caseK -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
@@ -1786,7 +1833,7 @@ try {
     Assert-Cohort ($runK.ExitCode -eq 2) "A changed rule bundle exited $($runK.ExitCode); expected 2."
 
     # -----------------------------------------------------------------------
-    Write-Host '19/30 a toolkit that moved under the cohort is refused' -ForegroundColor Cyan
+    Write-Host '19/35 a toolkit that moved under the cohort is refused' -ForegroundColor Cyan
     $caseL = Join-Path $sandboxRoot 'case-l'
     $movedToolkit = New-CohortToolkit -Root (Join-Path $caseL 'toolkit') -Head $head
     $l1 = New-CohortEntryRequest -Sandbox $caseL -EntryId 'entry-one' -ToolkitRoot $movedToolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
@@ -1803,7 +1850,7 @@ try {
         'An entry was started under a checkout the manifest no longer describes.'
 
     # -----------------------------------------------------------------------
-    Write-Host '20/30 manifest shapes this build never runs' -ForegroundColor Cyan
+    Write-Host '20/35 manifest shapes this build never runs' -ForegroundColor Cyan
     $caseM = Join-Path $sandboxRoot 'case-m'
     $m1 = New-CohortEntryRequest -Sandbox $caseM -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $m2 = New-CohortEntryRequest -Sandbox $caseM -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1957,7 +2004,7 @@ try {
     Assert-Cohort ((Invoke-Cohort -ManifestPath $writeBudget).ExitCode -eq 2) 'A cohort asking for a write budget was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '21/30 an entry that declares less than the full pipeline is refused' -ForegroundColor Cyan
+    Write-Host '21/35 an entry that declares less than the full pipeline is refused' -ForegroundColor Cyan
     $caseN = Join-Path $sandboxRoot 'case-n'
     $n1 = New-CohortEntryRequest -Sandbox $caseN -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273 -WithoutDelivery
     [void](New-StubControl -Path $n1.ControlPath -ExitCode 0)
@@ -1971,7 +2018,7 @@ try {
         'An entry declaring less than the full pipeline was started anyway.'
 
     # -----------------------------------------------------------------------
-    Write-Host '22/30 a cohort is an operator action, not an invocation shape' -ForegroundColor Cyan
+    Write-Host '22/35 a cohort is an operator action, not an invocation shape' -ForegroundColor Cyan
     $noAlias = Invoke-Cohort -ManifestPath $manifestA -OmitAuthorization
     Assert-Cohort ($noAlias.ExitCode -eq 1) "A cohort without --authorized-by exited $($noAlias.ExitCode); expected 1."
     Assert-Cohort ($noAlias.Output -match 'never by a timer') 'The refusal did not say a cohort is started by an operator.'
@@ -1991,7 +2038,7 @@ try {
     Assert-Cohort ($rebuildAlone.ExitCode -eq 1) "--rebuild-index outside a cohort exited $($rebuildAlone.ExitCode); expected 1."
 
     # -----------------------------------------------------------------------
-    Write-Host '23/30 the key a real preparation writes is the key the cohort reads' -ForegroundColor Cyan
+    Write-Host '23/35 the key a real preparation writes is the key the cohort reads' -ForegroundColor Cyan
     # The one entry in this suite that is NOT a stub. Everything else here proves
     # accounting across processes and is faster and sharper for being stubbed;
     # this proves the one thing a stub cannot, which is that the bytes the real
@@ -2133,7 +2180,7 @@ try {
         'A real preparation that ran to its target published an audit that does not declare itself finished.'
 
     # -----------------------------------------------------------------------
-    Write-Host '24/30 the cohort budget is spent in real model starts' -ForegroundColor Cyan
+    Write-Host '24/35 the cohort budget is spent in real model starts' -ForegroundColor Cyan
     # Two slots reviewed by a generalist pair each is four model subprocess
     # starts. The shipped defect budgeted three for exactly this shape, because
     # it counted reviewer processes - one for the first slot, two after the
@@ -2272,7 +2319,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '25/30 an estimate is an upper bound or the cohort does not start' -ForegroundColor Cyan
+    Write-Host '25/35 an estimate is an upper bound or the cohort does not start' -ForegroundColor Cyan
     # The ceiling of three was not a typo. Nothing in the shipped build required
     # an estimate to be anything in particular, so an operator number that had
     # never been checked against the plan became the budget. Every refusal here
@@ -2333,7 +2380,7 @@ try {
         'The refusal of a v1 manifest did not say that its model start budget is the reason.'
 
     # -----------------------------------------------------------------------
-    Write-Host '26/30 a production cohort cannot pass a fault argument' -ForegroundColor Cyan
+    Write-Host '26/35 a production cohort cannot pass a fault argument' -ForegroundColor Cyan
     # A real operator cohort forwarded '--halt-after deliveryTerminalVerified' to
     # three live pull requests. The first entry did exactly as it was told, exited
     # 9, and was recorded as a fault; the two behind it never ran. The argument
@@ -2497,7 +2544,7 @@ try {
     Assert-Cohort ($runBadKind.ExitCode -eq 2) "A manifest declaring an unknown kind exited $($runBadKind.ExitCode); expected 2."
 
     # -----------------------------------------------------------------------
-    Write-Host '27/30 an entry is reviewed against the branch it merges into' -ForegroundColor Cyan
+    Write-Host '27/35 an entry is reviewed against the branch it merges into' -ForegroundColor Cyan
     # The second entry of that same real cohort targeted a release branch and was
     # reviewed under a configuration bound to the trunk. Nothing compared the two,
     # so the mismatch was discovered by the preparation, halfway through, after it
@@ -2588,7 +2635,7 @@ try {
         "A cohort whose reviewer configuration is missing exited $($runGoneTarget.ExitCode); expected 11."
 
     # -----------------------------------------------------------------------
-    Write-Host '28/30 a chosen ending is read from the audit, not from the exit code' -ForegroundColor Cyan
+    Write-Host '28/35 a chosen ending is read from the audit, not from the exit code' -ForegroundColor Cyan
     # The first entry of the real cohort reached deliveryTerminalVerified, wrote
     # every artifact, wrote its ending, and exited 9 because it had been told to
     # stop there. It was recorded as a fault and the cohort abandoned the rest.
@@ -2831,7 +2878,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '29/30 the verifier ceiling is spent in real assignments' -ForegroundColor Cyan
+    Write-Host '29/35 the verifier ceiling is spent in real assignments' -ForegroundColor Cyan
     # The defect this section is about. A shadow run whose two slots stood on
     # forty cross-verifier assignments published a cohort index saying four,
     # because the figure was derived by counting how many verifier-backed
@@ -3041,7 +3088,7 @@ try {
         "A rebuild over an adopted entry recorded $($adoptVerJson.consumed.verifierAssignments) assignments; expected 40."
 
     # -----------------------------------------------------------------------
-    Write-Host '30/30 the real assignment census over a frozen operator root' -ForegroundColor Cyan
+    Write-Host '30/35 the real assignment census over a frozen operator root' -ForegroundColor Cyan
     # The run this whole change exists for, read where it still stands. Nothing
     # is launched, no model is started and nothing in the root is written: the
     # census is taken over the sealed previews the run left behind.
@@ -3082,6 +3129,1170 @@ try {
     else {
         Write-Host '  frozen verifier root not present; skipped' -ForegroundColor DarkGray
     }
+
+    # -----------------------------------------------------------------------
+    Write-Host '31/35 a subject the account already holds is refused before any child' -ForegroundColor Cyan
+    # The whole point of the account, exercised end to end. The first cohort runs
+    # and occupies its subject; the second names the same pull request and is
+    # refused before a child exists, which is the only moment a refusal is free.
+    $caseReg = Join-Path $sandboxRoot 'case-registry'
+    $registryPath = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'account\gate5-registry.json')))
+    $rg1 = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 4410001
+    [void](New-StubControl -Path $rg1.ControlPath -ExitCode 0)
+    $manifestReg1 = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-one.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-one' `
+        -JournalRoot (Join-Path $caseReg 'journal-one') -IndexPath (Join-Path $caseReg 'index\one.json') `
+        -StubPath $stub -RegistryPath $registryPath `
+        -Entries @((New-CohortEntryDeclaration -Request $rg1 -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runReg1 = Invoke-Cohort -ManifestPath $manifestReg1
+    Assert-Cohort ($runReg1.ExitCode -eq 0) "The first registry cohort exited $($runReg1.ExitCode); expected 0. $($runReg1.Output)"
+    Assert-Cohort (Test-Path -LiteralPath $registryPath -PathType Leaf) 'A completed counting cohort wrote no account.'
+    $registryOne = Get-JsonFile -Path $registryPath
+    Assert-Cohort ($registryOne.contractVersion -eq 'devpilot.shadow-cohort.registry.v1') `
+        "The account declares contract '$($registryOne.contractVersion)'."
+    Assert-Cohort (@($registryOne.samples).Count -eq 1) 'One completed entry did not leave exactly one sample.'
+    Assert-Cohort ($registryOne.samples[0].countsTowardThreshold -eq $true -and $registryOne.samples[0].classification -eq 'counted') `
+        "A clean completed entry was classified '$($registryOne.samples[0].classification)'; expected counted."
+    Assert-Cohort ($registryOne.samples[0].pullRequestId -eq 4410001) 'The sample does not name the pull request it was taken over.'
+    Assert-Cohort ($registryOne.inventory.countingSampleCount -eq 1 -and $registryOne.inventory.distinctSubjectCount -eq 1) `
+        'The account inventory does not agree with its own rows.'
+    Assert-Cohort ((Get-Sha256 -Path (Join-Path $caseReg 'account\gate5-registry.json.key')) -and `
+        ([IO.File]::ReadAllBytes((Join-Path $caseReg 'account\gate5-registry.json.key')).Length -eq 32)) `
+        'The account key is not the 32 raw bytes this build writes.'
+    # The journal committed the revision it stands on, so a resume can accept an
+    # account this cohort itself moved forward.
+    $journalOne = Get-JsonFile -Path (Join-Path $caseReg 'journal-one\cohort-journal.json')
+    Assert-Cohort ($journalOne.registrySha256 -eq $registryOne.registrySha256) `
+        'The journal did not commit the account revision the cohort produced.'
+
+    # The same pull request, a different cohort, a new source commit and a new
+    # request: still the same subject, still refused, and refused before the
+    # child rather than after it has spent a model.
+    $rg2 = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 4410001 -IterationId 2
+    [void](New-StubControl -Path $rg2.ControlPath -ExitCode 0)
+    $manifestReg2 = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-two.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-two' `
+        -CorrelationId 'cohort-correlation-two' `
+        -JournalRoot (Join-Path $caseReg 'journal-two') -IndexPath (Join-Path $caseReg 'index\two.json') `
+        -StubPath $stub -RegistryPath $registryPath -RegistrySha256 $registryOne.registrySha256 `
+        -Entries @((New-CohortEntryDeclaration -Request $rg2 -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runReg2 = Invoke-Cohort -ManifestPath $manifestReg2
+    Assert-Cohort ($runReg2.ExitCode -eq 11) `
+        "A cohort over a subject the account holds exited $($runReg2.ExitCode); expected 11. $($runReg2.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $rg2.OutputRoot 'coordinator\audit.json'))) `
+        'A cohort over a held subject launched its child before it was refused.'
+    Assert-Cohort ($runReg2.Output -match 'already holds that subject') `
+        'The refusal did not say the account already holds the subject.'
+
+    # The same pull request NUMBER in another repository is another subject.
+    $rg3 = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-three' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -PullRequestId 4410001 -Organization 'contoso-other-org'
+    [void](New-StubControl -Path $rg3.ControlPath -ExitCode 0)
+    $manifestReg3 = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-three.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-three' `
+        -CorrelationId 'cohort-correlation-three' `
+        -JournalRoot (Join-Path $caseReg 'journal-three') -IndexPath (Join-Path $caseReg 'index\three.json') `
+        -StubPath $stub -RegistryPath $registryPath -RegistrySha256 $registryOne.registrySha256 `
+        -Entries @((New-CohortEntryDeclaration -Request $rg3 -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runReg3 = Invoke-Cohort -ManifestPath $manifestReg3
+    Assert-Cohort ($runReg3.ExitCode -eq 0) `
+        "The same pull request number in another repository exited $($runReg3.ExitCode); expected 0. $($runReg3.Output)"
+    $registryThree = Get-JsonFile -Path $registryPath
+    Assert-Cohort ($registryThree.inventory.countingSampleCount -eq 2 -and $registryThree.inventory.distinctSubjectCount -eq 2) `
+        'Two pull requests in two repositories were not accounted as two distinct subjects.'
+
+    # Diagnostic mode may repeat a subject on purpose, and its sample can never
+    # count. This is the escape hatch, and it is deliberately not a way to raise
+    # the number.
+    $rg4 = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-four' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 4410001 -IterationId 3
+    [void](New-StubControl -Path $rg4.ControlPath -ExitCode 0)
+    $manifestReg4 = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-four.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-four' `
+        -CorrelationId 'cohort-correlation-four' `
+        -JournalRoot (Join-Path $caseReg 'journal-four') -IndexPath (Join-Path $caseReg 'index\four.json') `
+        -StubPath $stub -RegistryPath $registryPath -RegistrySha256 $registryThree.registrySha256 -RegistryMode 'diagnostic' `
+        -Entries @((New-CohortEntryDeclaration -Request $rg4 -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runReg4 = Invoke-Cohort -ManifestPath $manifestReg4
+    Assert-Cohort ($runReg4.ExitCode -eq 0) `
+        "A diagnostic repeat exited $($runReg4.ExitCode); expected 0. $($runReg4.Output)"
+    $registryFour = Get-JsonFile -Path $registryPath
+    Assert-Cohort ($registryFour.inventory.countingSampleCount -eq 2) `
+        "A diagnostic repeat moved the counted total to $($registryFour.inventory.countingSampleCount); it must not count."
+    Assert-Cohort (@($registryFour.samples).Count -eq 3) 'A diagnostic repeat did not leave a history row.'
+    $diagnosticRow = @($registryFour.samples | Where-Object { $_.cohortId -eq 'cohort-registry-four' })[0]
+    Assert-Cohort ($diagnosticRow.classification -eq 'diagnosticMode' -and $diagnosticRow.countsTowardThreshold -eq $false) `
+        "A diagnostic repeat was classified '$($diagnosticRow.classification)'."
+    # A diagnostic run that WROTE is still a diagnostic run. Filing it under the
+    # write instead would make it an observation, observations hold subjects, and a
+    # mode whose whole purpose is to leave the account undisturbed would quietly
+    # start spending pull requests. The write is not lost - the row carries the
+    # counts and the digest covers them - and the cohort is refused at the write
+    # gate regardless.
+    $rg4w = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-four-write' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4410001 -IterationId 4
+    [void](New-StubControl -Path $rg4w.ControlPath -ExitCode 0 -ProviderWriteCount 1 -WriteToolInvocations 1)
+    $manifestReg4w = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-four-write.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-four-write' `
+        -CorrelationId 'cohort-correlation-four-write' `
+        -JournalRoot (Join-Path $caseReg 'journal-four-write') -IndexPath (Join-Path $caseReg 'index\four-write.json') `
+        -StubPath $stub -RegistryPath $registryPath -RegistrySha256 $registryFour.registrySha256 -RegistryMode 'diagnostic' `
+        -Entries @((New-CohortEntryDeclaration -Request $rg4w -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runReg4w = Invoke-Cohort -ManifestPath $manifestReg4w
+    Assert-Cohort ($runReg4w.ExitCode -ne 0) `
+        "A diagnostic cohort whose child wrote exited $($runReg4w.ExitCode); expected a refusal."
+    $registryFourWrite = Get-JsonFile -Path $registryPath
+    Assert-Cohort ($registryFourWrite.inventory.countingSampleCount -eq 2) `
+        "A diagnostic cohort that wrote moved the counted total to $($registryFourWrite.inventory.countingSampleCount); expected the 2 it had."
+    # Rebuilt, the same root reaches the classifier - which the live run never does,
+    # because the write gate stops the cohort before any evidence is accepted. The
+    # classifier must file it under the MODE and not under the write: a diagnostic
+    # row is one a later counting run may still be allowed over, and a
+    # providerWriteObserved row is an observation that holds the subject for good.
+    # Filing diagnostics under the write would make the non-counting mode spend
+    # pull requests, which is the one thing it exists not to do.
+    $writeRebuiltPath = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'rebuilt-diagnostic-write\gate5-registry.json')))
+    $writeRebuild = Invoke-Cohort -ManifestPath $manifestReg4w -Extra @('--rebuild-registry', '--registry', $writeRebuiltPath,
+        '--from-cohort', $manifestReg4w) -OmitCohort
+    Assert-Cohort ($writeRebuild.ExitCode -eq 0) `
+        "A rebuild over a diagnostic root whose child wrote exited $($writeRebuild.ExitCode); expected 0. $($writeRebuild.Output)"
+    $writeRebuilt = Get-JsonFile -Path $writeRebuiltPath
+    $writeRow = @($writeRebuilt.samples | Where-Object { $_.cohortId -eq 'cohort-registry-four-write' })
+    Assert-Cohort (@($writeRow).Count -eq 1 -and $writeRow[0].countsTowardThreshold -eq $false) `
+        "The rebuilt diagnostic-write root left $(@($writeRow).Count) row(s); expected 1 that counts toward nothing."
+    if (@($writeRow).Count -eq 1) {
+        Assert-Cohort ($writeRow[0].classification -ne 'providerWriteObserved') `
+            'A diagnostic run was filed under its write, which would make the non-counting mode spend its subject.'
+        Assert-Cohort ($writeRow[0].providerWrites -ge 1 -or $writeRow[0].classification -eq 'evidenceUnreadable') `
+            'The diagnostic row hid the write it observed.'
+    }
+
+    # -----------------------------------------------------------------------
+    Write-Host '32/35 an account that moved, vanished or was edited is not run against' -ForegroundColor Cyan
+    $registryBytes = [IO.File]::ReadAllBytes($registryPath)
+    $registryKeyPath = $registryPath + '.key'
+    $registryKeyBytes = [IO.File]::ReadAllBytes($registryKeyPath)
+
+    # A revision the manifest did not bind and this cohort never produced. The
+    # account moved under an authorization, so the authorization is stale.
+    $rg5 = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-five' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 4410002
+    [void](New-StubControl -Path $rg5.ControlPath -ExitCode 0)
+    $manifestStale = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-stale.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-stale' `
+        -CorrelationId 'cohort-correlation-stale' `
+        -JournalRoot (Join-Path $caseReg 'journal-stale') -IndexPath (Join-Path $caseReg 'index\stale.json') `
+        -StubPath $stub -RegistryPath $registryPath -RegistrySha256 (New-FakeDigest) `
+        -Entries @((New-CohortEntryDeclaration -Request $rg5 -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runStaleReg = Invoke-Cohort -ManifestPath $manifestStale
+    Assert-Cohort ($runStaleReg.ExitCode -eq 11) `
+        "A cohort bound to a revision the account is not at exited $($runStaleReg.ExitCode); expected 11."
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $rg5.OutputRoot 'coordinator\audit.json'))) `
+        'A cohort bound to a stale account revision launched its child anyway.'
+
+    # An edited account. The HMAC is over the bytes that are no longer there. Edited
+    # as text for the same reason the digest cases are: an object round-trip would
+    # reshape timestamps and refuse the run for something other than the edit.
+    $tamperText = [IO.File]::ReadAllText($registryPath)
+    $tamperOriginal = ([regex]'"countsTowardThreshold": true').Match($tamperText)
+    Assert-Cohort ($tamperOriginal.Success) 'The account carries no counting row to edit.'
+    $tamperEdited = [regex]::new('"countsTowardThreshold": true').Replace($tamperText, '"countsTowardThreshold": false', 1)
+    [IO.File]::WriteAllText($registryPath, $tamperEdited)
+    $manifestTamper = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-tamper.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-tamper' `
+        -CorrelationId 'cohort-correlation-tamper' `
+        -JournalRoot (Join-Path $caseReg 'journal-tamper') -IndexPath (Join-Path $caseReg 'index\tamper.json') `
+        -StubPath $stub -RegistryPath $registryPath -RegistrySha256 $registryFour.registrySha256 `
+        -Entries @((New-CohortEntryDeclaration -Request $rg5 -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runTamperReg = Invoke-Cohort -ManifestPath $manifestTamper
+    Assert-Cohort ($runTamperReg.ExitCode -eq 11) `
+        "A cohort over an edited account exited $($runTamperReg.ExitCode); expected 11."
+    [IO.File]::WriteAllBytes($registryPath, $registryBytes)
+
+    # An edited evidence digest. The rows, the defects and the inventory are all
+    # untouched and all authenticate; the one value two machines would compare
+    # their accounts on does not follow from any of them. Recomposing it on read
+    # would have made it the single field in the envelope no signature covers.
+    #
+    # Edited as TEXT, one field, rather than round-tripped through an object.
+    # ConvertFrom-Json turns every ISO 8601 string into a DateTime and writes it
+    # back in whatever shape .NET round-trips that instant to, so a timestamp whose
+    # fractional seconds happen to end in a zero comes back a different string - and
+    # the run would then be refused for a per-sample digest nobody meant to touch,
+    # passing the exit-code check and failing the one that says WHY.
+    $evidenceText = [IO.File]::ReadAllText($registryPath)
+    $evidenceOriginal = ([regex]'"evidenceSha256": "([0-9a-f]{64})"').Match($evidenceText)
+    Assert-Cohort ($evidenceOriginal.Success) 'The account carries no evidenceSha256 to edit.'
+    [IO.File]::WriteAllText($registryPath, $evidenceText.Replace($evidenceOriginal.Value, '"evidenceSha256": "' + (New-FakeDigest) + '"'))
+    $runEvidence = Invoke-Cohort -ManifestPath $manifestTamper
+    Assert-Cohort ($runEvidence.ExitCode -eq 11) `
+        "A cohort over an account whose evidence digest was edited exited $($runEvidence.ExitCode); expected 11."
+    Assert-Cohort ($runEvidence.Output -match 'evidence digest') `
+        "The refusal did not say the evidence digest disagreed with the evidence. $($runEvidence.Output)"
+    [IO.File]::WriteAllBytes($registryPath, $registryBytes)
+
+    # A manifest copied from one that already spent its subject, with the cohort
+    # id kept. The id is a string an operator types; if 'this cohort's own row'
+    # were settled by it, the copy would read the subject it is about to spend
+    # again as its own earlier attempt and go straight past the refusal.
+    $rgCopy = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-one-copied' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4410001 -IterationId 7
+    [void](New-StubControl -Path $rgCopy.ControlPath -ExitCode 0)
+    $manifestCopy = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-copy.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-one' `
+        -CorrelationId 'cohort-correlation-copy' `
+        -JournalRoot (Join-Path $caseReg 'journal-copy') -IndexPath (Join-Path $caseReg 'index\copy.json') `
+        -StubPath $stub -RegistryPath $registryPath -RegistrySha256 $registryFour.registrySha256 `
+        -Entries @((New-CohortEntryDeclaration -Request $rgCopy -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runCopy = Invoke-Cohort -ManifestPath $manifestCopy
+    Assert-Cohort ($runCopy.ExitCode -eq 11) `
+        "A manifest reusing a spent cohort id exited $($runCopy.ExitCode); expected 11. $($runCopy.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $rgCopy.OutputRoot 'coordinator\audit.json'))) `
+        'A manifest reusing a spent cohort id launched its child anyway.'
+
+    # An edited inventory. The rows are untouched and still authenticate; the
+    # headline numbers an operator reads do not follow from them. A reader that
+    # recomputed the inventory instead of holding the file to it would have
+    # authenticated a document whose summary nobody ever signed.
+    $inventoryText = [IO.File]::ReadAllText($registryPath)
+    $inventoryOriginal = ([regex]'"countingSampleCount": (\d+)').Match($inventoryText)
+    Assert-Cohort ($inventoryOriginal.Success) 'The account carries no countingSampleCount to edit.'
+    $inventoryBumped = '"countingSampleCount": ' + ([int]$inventoryOriginal.Groups[1].Value + 1).ToString()
+    [IO.File]::WriteAllText($registryPath, $inventoryText.Replace($inventoryOriginal.Value, $inventoryBumped))
+    $runInventory = Invoke-Cohort -ManifestPath $manifestTamper
+    Assert-Cohort ($runInventory.ExitCode -eq 11) `
+        "A cohort over an account whose inventory was edited exited $($runInventory.ExitCode); expected 11."
+    Assert-Cohort ($runInventory.Output -match 'inventory') `
+        "The refusal did not say the inventory disagreed with the rows. $($runInventory.Output)"
+    [IO.File]::WriteAllBytes($registryPath, $registryBytes)
+
+    # Two entries over one pull request in a counting cohort. The manifest is
+    # legal - the distinctness rule folds the iteration in and the subject key
+    # deliberately does not - but the account cannot honour it, and saying so
+    # after the first one has already spent a model would be saying it too late.
+    $rgDupA = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-dup-a' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4410009 -IterationId 3
+    $rgDupB = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-dup-b' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4410009 -IterationId 4
+    [void](New-StubControl -Path $rgDupA.ControlPath -ExitCode 0)
+    [void](New-StubControl -Path $rgDupB.ControlPath -ExitCode 0)
+    $manifestDup = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-dup.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-dup' `
+        -CorrelationId 'cohort-correlation-dup' `
+        -JournalRoot (Join-Path $caseReg 'journal-dup') -IndexPath (Join-Path $caseReg 'index\dup.json') `
+        -StubPath $stub -RegistryPath $registryPath -RegistrySha256 $registryFour.registrySha256 `
+        -Entries @(
+        (New-CohortEntryDeclaration -Request $rgDupA -Ordinal 1 -RuleBundlePath $ruleBundle),
+        (New-CohortEntryDeclaration -Request $rgDupB -Ordinal 2 -RuleBundlePath $ruleBundle))
+    $runDup = Invoke-Cohort -ManifestPath $manifestDup
+    Assert-Cohort ($runDup.ExitCode -eq 11) `
+        "A counting cohort declaring one pull request twice exited $($runDup.ExitCode); expected 11. $($runDup.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $rgDupA.OutputRoot 'coordinator\audit.json'))) `
+        'A counting cohort declaring one pull request twice launched its first entry anyway.'
+
+    # A deleted account with its key still beside it. Starting an empty one there
+    # would let every subject it held be spent again, so it is refused and the
+    # operator is sent to the rebuild.
+    Remove-Item -LiteralPath $registryPath -Force
+    $runVanished = Invoke-Cohort -ManifestPath $manifestTamper
+    Assert-Cohort ($runVanished.ExitCode -eq 11) `
+        "A cohort over a deleted account exited $($runVanished.ExitCode); expected 11."
+    Assert-Cohort ($runVanished.Output -match 'rebuild-registry') `
+        'The refusal did not name the rebuild as the way back.'
+    [IO.File]::WriteAllBytes($registryPath, $registryBytes)
+    [IO.File]::WriteAllBytes($registryKeyPath, $registryKeyBytes)
+
+    # A cohort that binds no account writes no revision into its journal, and a
+    # journal that names no revision composes exactly the bytes it composed
+    # before the account existed. That equivalence is what lets every root
+    # written by an earlier build still authenticate and still be resumed; a
+    # field written unconditionally would have made all of them unreadable, and
+    # an unreadable journal is an unresumable cohort.
+    $journalNoRegistry = Get-JsonFile -Path (Join-Path $caseA 'journal\cohort-journal.json')
+    Assert-Cohort ($null -eq $journalNoRegistry.PSObject.Properties['registrySha256']) `
+        'A cohort that bound no account still wrote a registry revision into its journal.'
+    $resumeNoRegistry = Invoke-Cohort -ManifestPath $manifestA
+    Assert-Cohort ($resumeNoRegistry.ExitCode -eq 5) `
+        "A cohort journal carrying no registry revision resumed with exit $($resumeNoRegistry.ExitCode); expected 5."
+
+    # -----------------------------------------------------------------------
+    Write-Host '33/35 a run that cannot count is recorded as history that does not' -ForegroundColor Cyan
+    # Every clause of the counting test, one cohort each. What matters is not
+    # only that the total does not move but that the row says WHY, because an
+    # account that recorded a refusal as an absence would let the same subject
+    # be offered again as though it had never been tried.
+    $caseCls = Join-Path $sandboxRoot 'case-registry-class'
+    $classifyRegistry = [string]([IO.Path]::GetFullPath((Join-Path $caseCls 'account\gate5-registry.json')))
+    $classifyCases = @(
+        @{ Name = 'targetNotReached'; PullRequestId = 4420001; ExpectedExit = 5; Control = @{
+                ExitCode = 5; FinalState = 'slot2TerminalFailed'; TerminalReason = 'supervisedRunNotComplete'
+                Slot2AttemptRecordCount = 1; Slot1RealModelStartCount = 2; Slot2RealModelStartCount = 0
+                RealModelStartCount = 2; RealModelStartsGeneralist = 2
+                TransitionStates = @('requestValidated', 'snapshotVerified', 'runSetReady', 'slot1TerminalVerified', 'slot2TerminalFailed')
+            }
+        },
+        @{ Name = 'providerWriteObserved'; PullRequestId = 4420002; ExpectedExit = 11; Control = @{ ExitCode = 0; ProviderWriteCount = 1; WriteToolInvocations = 1 } },
+        @{ Name = 'censusIncomplete'; PullRequestId = 4420003; ExpectedExit = 0; Control = @{ ExitCode = 0; RealModelStartUnmeasuredAllowance = 3 } },
+        @{ Name = 'budgetExceeded'; PullRequestId = 4420004; ExpectedExit = 10; MaxVerifierAssignments = 4; Control = @{ ExitCode = 0 } }
+    )
+    $classifyIndex = 0
+    foreach ($classifyCase in $classifyCases) {
+        $classifyIndex++
+        $cl = New-CohortEntryRequest -Sandbox $caseCls -EntryId "entry-$classifyIndex" -ToolkitRoot $toolkit -Head $head `
+            -RequiredRef $requiredRef -PullRequestId ([int]$classifyCase.PullRequestId)
+        $controlArgs = [hashtable]$classifyCase.Control
+        [void](New-StubControl -Path $cl.ControlPath @controlArgs)
+        $classifyOverrides = @{}
+        if ($classifyCase.ContainsKey('MaxVerifierAssignments')) { $classifyOverrides['MaxVerifierAssignments'] = [int]$classifyCase.MaxVerifierAssignments }
+        $manifestCls = New-CohortManifestFile -Path (Join-Path $caseCls "cohort-$classifyIndex.json") `
+            -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId "cohort-class-$classifyIndex" `
+            -CorrelationId "cohort-class-correlation-$classifyIndex" `
+            -JournalRoot (Join-Path $caseCls "journal-$classifyIndex") -IndexPath (Join-Path $caseCls "index\$classifyIndex.json") `
+            -StubPath $stub -RegistryPath $classifyRegistry `
+            -RegistrySha256 $(if ($classifyIndex -eq 1) { 'none' } else { (Get-JsonFile -Path $classifyRegistry).registrySha256 }) `
+            -Entries @((New-CohortEntryDeclaration -Request $cl -Ordinal 1 -RuleBundlePath $ruleBundle `
+                    -EstimatedVerifierAssignments $(if ($classifyCase.ContainsKey('MaxVerifierAssignments')) { 4 } else { 8 }) `
+                    -BoundMaxVerifierAssignments $(if ($classifyCase.ContainsKey('MaxVerifierAssignments')) { 4 } else { -1 }))) @classifyOverrides
+        $runCls = Invoke-Cohort -ManifestPath $manifestCls -OmitAuthorization:([bool]($classifyCase.ContainsKey('OmitAuthorization') -and $classifyCase['OmitAuthorization']))
+        Assert-Cohort ($runCls.ExitCode -eq [int]$classifyCase.ExpectedExit) `
+            "The '$($classifyCase.Name)' cohort exited $($runCls.ExitCode); expected $($classifyCase.ExpectedExit). $($runCls.Output)"
+        # A provider write blocks the whole cohort before any evidence is
+        # accepted, so it never reaches a sample. That refusal IS the guarantee;
+        # the classification exists for a rebuild over a root written elsewhere.
+        if ($classifyCase.Name -eq 'providerWriteObserved') { continue }
+        $accountCls = Get-JsonFile -Path $classifyRegistry
+        $row = @($accountCls.samples | Where-Object { $_.pullRequestId -eq [int]$classifyCase.PullRequestId })
+        Assert-Cohort (@($row).Count -eq 1) "The '$($classifyCase.Name)' entry left $(@($row).Count) rows; expected 1."
+        if (@($row).Count -ne 1) { continue }
+        Assert-Cohort ($row[0].countsTowardThreshold -eq $false) `
+            "The '$($classifyCase.Name)' entry counted toward the threshold."
+        Assert-Cohort ($row[0].classification -eq $classifyCase.Name) `
+            "The '$($classifyCase.Name)' entry was classified '$($row[0].classification)'."
+    }
+    $accountFinal = Get-JsonFile -Path $classifyRegistry
+    Assert-Cohort ($accountFinal.inventory.countingSampleCount -eq 0) `
+        "Runs that cannot count moved the counted total to $($accountFinal.inventory.countingSampleCount)."
+
+    # And the alias itself: a cohort that names no operator does not start, so
+    # 'authorizationMissing' can only ever be reached by a rebuild reading a root
+    # that was written before this build required one. There is no way to run an
+    # unattributed cohort and have it recorded as unattributed history.
+    $noAlias = Invoke-Cohort -ManifestPath (Join-Path $caseCls 'cohort-1.json') -OmitAuthorization
+    Assert-Cohort ($noAlias.ExitCode -eq 1) `
+        "A cohort run with no operator alias exited $($noAlias.ExitCode); expected 1."
+
+    # -----------------------------------------------------------------------
+    Write-Host '34/35 the rebuild re-derives the account, and the selection excludes it' -ForegroundColor Cyan
+    # The claim the account makes about itself, made executable. Nothing is read
+    # from a published index or summary: the rebuild reads the sealed manifests,
+    # the signed journals and each entry's authenticated audit.
+    $rebuiltPath = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'rebuilt\gate5-registry.json')))
+    $rebuild = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $rebuiltPath,
+        '--from-cohort', $manifestReg1, '--from-cohort', $manifestReg3, '--from-cohort', $manifestReg4) -OmitCohort
+    Assert-Cohort ($rebuild.ExitCode -eq 0) "The rebuild exited $($rebuild.ExitCode); expected 0. $($rebuild.Output)"
+    $rebuilt = Get-JsonFile -Path $rebuiltPath
+    Assert-Cohort ($null -ne $rebuilt) 'The rebuild wrote no account.'
+    Assert-Cohort ($rebuilt.inventory.countingSampleCount -eq 2) `
+        "The rebuild counted $($rebuilt.inventory.countingSampleCount) subject(s); expected 2."
+    Assert-Cohort ($rebuilt.inventory.distinctSubjectCount -eq 2) `
+        "The rebuild found $($rebuilt.inventory.distinctSubjectCount) distinct subject(s); expected 2."
+    # The diagnostic repeat is history in the rebuild too, derived from the
+    # binding that cohort declared rather than from what it looked like.
+    $rebuiltRepeat = @($rebuilt.samples | Where-Object { $_.cohortId -eq 'cohort-registry-four' })
+    Assert-Cohort (@($rebuiltRepeat).Count -eq 1 -and $rebuiltRepeat[0].countsTowardThreshold -eq $false) `
+        'The rebuild counted the diagnostic repeat.'
+    # Deterministic: the same roots rebuild to the same rows and the same digest.
+    $rebuiltTwicePath = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'rebuilt-twice\gate5-registry.json')))
+    $rebuildTwice = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $rebuiltTwicePath,
+        '--from-cohort', $manifestReg1, '--from-cohort', $manifestReg3, '--from-cohort', $manifestReg4) -OmitCohort
+    Assert-Cohort ($rebuildTwice.ExitCode -eq 0) "The second rebuild exited $($rebuildTwice.ExitCode); expected 0."
+    $rebuiltTwice = Get-JsonFile -Path $rebuiltTwicePath
+    Assert-Cohort (($rebuilt.samples | ForEach-Object { $_.sampleSha256 }) -join ',') `
+        'The rebuild produced rows without their own digests.'
+    Assert-Cohort ((($rebuilt.samples | ForEach-Object { $_.sampleSha256 }) -join ',') -eq (($rebuiltTwice.samples | ForEach-Object { $_.sampleSha256 }) -join ',')) `
+        'Two rebuilds over the same roots produced different rows.'
+    # A path with nothing at it is the caller's mistake, not evidence, and it is
+    # refused before anything is written. Filed as a defect it would be signed into
+    # the account, every later rebuild would have to name it again, and - because an
+    # unread root stops a counting cohort - one mistyped argument would deadlock
+    # Gate5 against a root that never existed to be repaired.
+    $missingRootPath = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'rebuilt-missing\gate5-registry.json')))
+    $rebuildMissing = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $missingRootPath,
+        '--from-cohort', $manifestReg1, '--from-cohort', (Join-Path $caseReg 'no-such-cohort.json')) -OmitCohort
+    Assert-Cohort ($rebuildMissing.ExitCode -eq 2) `
+        "A rebuild naming a path with nothing at it exited $($rebuildMissing.ExitCode); expected 2. $($rebuildMissing.Output)"
+    Assert-Cohort ($rebuildMissing.Output -match 'no cohort manifest at') `
+        "The refusal did not name the path that held nothing. $($rebuildMissing.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath $missingRootPath)) `
+        'A rebuild refused for a mistyped path wrote an account anyway.'
+    # A root that IS there and cannot be read is the other case, and that one is
+    # reported rather than dropped: something exists, nobody could read it, and the
+    # question stays open until someone settles it.
+    $defectRootDir = Join-Path $caseReg 'defect-root'
+    [void](New-Item -ItemType Directory -Path $defectRootDir -Force)
+    $defectRootManifest = Join-Path $defectRootDir 'cohort.json'
+    Set-Content -LiteralPath $defectRootManifest -Value 'this is not json' -Encoding utf8NoBOM
+    $rebuiltDefectPath = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'rebuilt-defect\gate5-registry.json')))
+    $rebuildDefect = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $rebuiltDefectPath,
+        '--from-cohort', $manifestReg1, '--from-cohort', $defectRootManifest) -OmitCohort
+    Assert-Cohort ($rebuildDefect.ExitCode -eq 0) "A rebuild over an unreadable root exited $($rebuildDefect.ExitCode); expected 0."
+    $rebuiltDefect = Get-JsonFile -Path $rebuiltDefectPath
+    Assert-Cohort ($rebuiltDefect.inventory.defectCount -ge 1) 'An unreadable root was dropped rather than reported.'
+    # A root nobody could read and a root read-and-refused are not the same fact, and
+    # the account files them under different kinds so a reader can tell which question
+    # is still open.
+    Assert-Cohort ($rebuiltDefect.inventory.unreadableDefectCount -ge 1) `
+        'An unreadable root was not recorded as unreadable.'
+    Assert-Cohort (@($rebuiltDefect.defects | Where-Object { $_.kind -eq 'unreadable' }).Count -ge 1) `
+        'The unreadable root carried no defect kind.'
+    # A root and a mirror of it are one run, not two. A pre-resume backup keeps
+    # the manifest that names the same journal and the same audits, so the rows
+    # it produces carry the same sample key; the account holds one of them.
+    $mirrorPath = Join-Path $caseReg 'mirror-of-cohort-one.json'
+    Copy-Item -LiteralPath $manifestReg1 -Destination $mirrorPath -Force
+    $rebuiltMirrorPath = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'rebuilt-mirror\gate5-registry.json')))
+    $rebuildMirror = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $rebuiltMirrorPath,
+        '--from-cohort', $manifestReg1, '--from-cohort', $mirrorPath) -OmitCohort
+    Assert-Cohort ($rebuildMirror.ExitCode -eq 0) `
+        "A rebuild over a root and its mirror exited $($rebuildMirror.ExitCode); expected 0. $($rebuildMirror.Output)"
+    $rebuiltMirror = Get-JsonFile -Path $rebuiltMirrorPath
+    $mirrorRows = @($rebuiltMirror.samples | Where-Object { $_.cohortId -eq 'cohort-registry-one' })
+    Assert-Cohort (@($mirrorRows).Count -eq 1) `
+        "A root and its mirror produced $(@($mirrorRows).Count) row(s); expected 1."
+    Assert-Cohort ($rebuiltMirror.inventory.countingSampleCount -eq 1) `
+        "A root and its mirror counted $($rebuiltMirror.inventory.countingSampleCount) subject(s); expected 1."
+
+    # The evidence digest is the account's claim about the roots and nothing
+    # else - not the revision the destination happened to be at, not the moment
+    # of publication, not the path. Two rebuilds agree on it, and so does a
+    # rebuild that names the same roots in a different order.
+    Assert-Cohort ($rebuilt.evidenceSha256 -eq $rebuiltTwice.evidenceSha256) `
+        'Two rebuilds over the same roots disagreed about their evidence digest.'
+    $rebuiltReorderPath = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'rebuilt-reorder\gate5-registry.json')))
+    $rebuildReorder = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $rebuiltReorderPath,
+        '--from-cohort', $manifestReg4, '--from-cohort', $manifestReg3, '--from-cohort', $manifestReg1) -OmitCohort
+    Assert-Cohort ($rebuildReorder.ExitCode -eq 0) `
+        "A rebuild over reordered roots exited $($rebuildReorder.ExitCode); expected 0. $($rebuildReorder.Output)"
+    $rebuiltReorder = Get-JsonFile -Path $rebuiltReorderPath
+    Assert-Cohort ($rebuiltReorder.evidenceSha256 -eq $rebuilt.evidenceSha256) `
+        'Naming the same roots in a different order produced different evidence.'
+
+    # And a rebuild that would let go of a subject the account already holds is
+    # refused. Naming only the newest root would otherwise publish a smaller
+    # account that authenticates perfectly and frees every subject it forgot -
+    # the same silent loss an unreadable root is refused for, by the front door.
+    $shrinkPath = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'rebuilt-shrink\gate5-registry.json')))
+    $shrinkSeed = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $shrinkPath,
+        '--from-cohort', $manifestReg1, '--from-cohort', $manifestReg3) -OmitCohort
+    Assert-Cohort ($shrinkSeed.ExitCode -eq 0) "Seeding the shrink account exited $($shrinkSeed.ExitCode); expected 0."
+    $shrink = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $shrinkPath,
+        '--from-cohort', $manifestReg3) -OmitCohort
+    Assert-Cohort ($shrink.ExitCode -eq 2) `
+        "A rebuild that dropped a held subject exited $($shrink.ExitCode); expected 2. $($shrink.Output)"
+    Assert-Cohort ($shrink.Output -match 'spent again') `
+        'The refusal did not say what publishing the smaller account would have freed.'
+    $shrunk = Get-JsonFile -Path $shrinkPath
+    Assert-Cohort ($shrunk.inventory.distinctSubjectCount -eq 2) `
+        "The refused rebuild left the account at $($shrunk.inventory.distinctSubjectCount) distinct subject(s); expected the 2 it had."
+
+    # And the selection: the operator's candidates in preference order, with
+    # every subject the account holds removed. No list is maintained by hand.
+    $candidatePath = Join-Path $caseReg 'candidates.json'
+    [void](Write-StrictJsonFile -Path $candidatePath -Value ([pscustomobject][ordered]@{
+                contractVersion = 'devpilot.shadow-cohort.candidates.v1'
+                kind = 'shadow-cohort-candidates'
+                candidates = @(
+                    [pscustomobject][ordered]@{
+                        organization = 'contoso-shadow-org'; project = 'contoso-shadow-project'; repository = 'contoso-shadow-repository'
+                        pullRequestId = 4410001; iterationId = 9; sourceCommit = (New-FakeCommit); targetRefName = 'refs/heads/main'
+                    },
+                    [pscustomobject][ordered]@{
+                        organization = 'contoso-shadow-org'; project = 'contoso-shadow-project'; repository = 'contoso-shadow-repository'
+                        pullRequestId = 4499001; iterationId = 1; sourceCommit = (New-FakeCommit); targetRefName = 'refs/heads/main'
+                    },
+                    [pscustomobject][ordered]@{
+                        organization = 'contoso-shadow-org'; project = 'contoso-shadow-project'; repository = 'contoso-shadow-repository'
+                        pullRequestId = 4499002; iterationId = 1; sourceCommit = (New-FakeCommit); targetRefName = 'refs/heads/main'
+                    })
+            }) -Depth 8)
+    $selectionPath = Join-Path $caseReg 'selection.json'
+    $selectRun = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--select-subjects', '--registry', $rebuiltPath,
+        '--candidates', $candidatePath, '--out', $selectionPath, '--select-count', '1') -OmitCohort -OmitAuthorization
+    Assert-Cohort ($selectRun.ExitCode -eq 0) "The selection exited $($selectRun.ExitCode); expected 0. $($selectRun.Output)"
+    $selection = Get-JsonFile -Path $selectionPath
+    Assert-Cohort ($selection.selectedCount -eq 1) "The selection chose $($selection.selectedCount) subject(s); expected 1."
+    Assert-Cohort ($selection.selected[0].pullRequestId -eq 4499001) `
+        "The selection chose pull request $($selection.selected[0].pullRequestId); expected the first unspent one."
+    $excludedHeld = @($selection.excluded | Where-Object { $_.pullRequestId -eq 4410001 })
+    Assert-Cohort (@($excludedHeld).Count -eq 1 -and $excludedHeld[0].reason -match 'already holds') `
+        'The selection offered a subject the account already holds.'
+    Assert-Cohort ($selection.registrySha256 -eq $rebuilt.registrySha256) `
+        'The selection did not name the account revision it was derived from.'
+    # And the collapsed account is one the readers accept: a duplicated key would
+    # be refused at load, so a rebuild that emitted one would poison every later read.
+    $mirrorProbePath = Join-Path $caseReg 'mirror-selection.json'
+    $mirrorProbe = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--select-subjects', '--registry', $rebuiltMirrorPath,
+        '--candidates', $candidatePath, '--out', $mirrorProbePath, '--select-count', '1') -OmitCohort -OmitAuthorization
+    Assert-Cohort ($mirrorProbe.ExitCode -eq 0) `
+        "The account rebuilt from a root and its mirror did not load: exit $($mirrorProbe.ExitCode). $($mirrorProbe.Output)"
+
+    # An account with a root nobody could read is an exclusion list known to be
+    # incomplete: the unread root may hold any subject on the candidate list. The
+    # selection stops rather than handing back an answer more confident than its
+    # evidence, and says so when the caller overrides it.
+    $defectSelectionPath = Join-Path $caseReg 'defect-selection.json'
+    $defectSelect = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--select-subjects', '--registry', $rebuiltDefectPath,
+        '--candidates', $candidatePath, '--out', $defectSelectionPath, '--select-count', '1') -OmitCohort -OmitAuthorization
+    Assert-Cohort ($defectSelect.ExitCode -eq 2) `
+        "A selection over an account with unread roots exited $($defectSelect.ExitCode); expected 2. $($defectSelect.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath $defectSelectionPath)) `
+        'A selection over an account with unread roots wrote a selection anyway.'
+    $defectSelectOk = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--select-subjects', '--registry', $rebuiltDefectPath,
+        '--candidates', $candidatePath, '--out', $defectSelectionPath, '--select-count', '1',
+        '--accept-unresolved-defects') -OmitCohort -OmitAuthorization
+    Assert-Cohort ($defectSelectOk.ExitCode -eq 0) `
+        "An acknowledged selection over an account with unread roots exited $($defectSelectOk.ExitCode); expected 0. $($defectSelectOk.Output)"
+    $defectSelection = Get-JsonFile -Path $defectSelectionPath
+    Assert-Cohort ($defectSelection.acceptedUnresolvedDefects -eq $true -and $defectSelection.unresolvedDefectCount -ge 1) `
+        'The selection did not record that it was made over an account with unread roots.'
+
+    # A caller who names one root twice has repeated themselves, not lost evidence:
+    # that root was read in full, and an argv accident is not a property of the run,
+    # so nothing about it is persisted into the account.
+    $rebuiltNotedPath = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'rebuilt-noted\gate5-registry.json')))
+    $rebuildNoted = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $rebuiltNotedPath,
+        '--from-cohort', $manifestReg1, '--from-cohort', $manifestReg1) -OmitCohort
+    Assert-Cohort ($rebuildNoted.ExitCode -eq 0) "A rebuild over a doubly-named root exited $($rebuildNoted.ExitCode); expected 0."
+    $rebuiltNoted = Get-JsonFile -Path $rebuiltNotedPath
+    Assert-Cohort ($rebuiltNoted.inventory.defectCount -eq 0) `
+        "A doubly-named root was persisted as a defect: defects=$($rebuiltNoted.inventory.defectCount); expected 0."
+    Assert-Cohort (@($rebuiltNoted.samples).Count -eq 1) `
+        "A doubly-named root produced $(@($rebuiltNoted.samples).Count) sample(s); expected 1."
+
+    # A cohort declared under a contract this build refuses WAS read in full: its
+    # subjects are on the rows and nothing about it is unknown. It is noted, and it
+    # stops no selection.
+    $notedRootDir = Join-Path $caseReg 'noted-v2'
+    [void](New-Item -ItemType Directory -Path $notedRootDir -Force)
+    $notedManifest = Join-Path $notedRootDir 'cohort.v2.json'
+    $notedBody = [ordered]@{
+        contractVersion = 'devpilot.gate5.cohort-manifest.v2'
+        cohortId        = 'cohort-noted-v2'
+        toolkit         = [ordered]@{ head = $head }
+        entries         = @(
+            [ordered]@{
+                entryId    = 'entry-noted-v2'
+                outputRoot = (Join-Path $notedRootDir 'output')
+                subject    = [ordered]@{
+                    organization  = 'contoso'
+                    project       = 'One'
+                    repository    = 'Widgets'
+                    pullRequestId = 4429001
+                    iterationId   = 1
+                    sourceCommit  = ('a' * 40)
+                    targetRefName = 'refs/heads/main'
+                }
+            })
+    }
+    Set-Content -LiteralPath $notedManifest -Value ($notedBody | ConvertTo-Json -Depth 8 -Compress:$false) -Encoding utf8NoBOM
+    $rebuiltNotedV2Path = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'rebuilt-noted-v2\gate5-registry.json')))
+    $rebuildNotedV2 = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $rebuiltNotedV2Path,
+        '--from-cohort', $notedManifest) -OmitCohort
+    Assert-Cohort ($rebuildNotedV2.ExitCode -eq 0) `
+        "A rebuild over a refused-contract root exited $($rebuildNotedV2.ExitCode); expected 0. $($rebuildNotedV2.Output)"
+    $rebuiltNotedV2 = Get-JsonFile -Path $rebuiltNotedV2Path
+    Assert-Cohort ($rebuiltNotedV2.inventory.defectCount -ge 1 -and $rebuiltNotedV2.inventory.unreadableDefectCount -eq 0) `
+        "A refused-contract root was filed as unreadable: defects=$($rebuiltNotedV2.inventory.defectCount), unreadable=$($rebuiltNotedV2.inventory.unreadableDefectCount)."
+    $notedSelectionPath = Join-Path $caseReg 'noted-selection.json'
+    $notedSelect = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--select-subjects', '--registry', $rebuiltNotedV2Path,
+        '--candidates', $candidatePath, '--out', $notedSelectionPath, '--select-count', '1') -OmitCohort -OmitAuthorization
+    Assert-Cohort ($notedSelect.ExitCode -eq 0) `
+        "A selection over an account whose only defects were read roots exited $($notedSelect.ExitCode); expected 0. $($notedSelect.Output)"
+    $notedSelection = Get-JsonFile -Path $notedSelectionPath
+    Assert-Cohort ($notedSelection.unresolvedDefectCount -eq 0 -and $notedSelection.notedDefectCount -ge 1) `
+        'The selection did not separate read roots from unread ones.'
+
+    # A root that was named, read and repaired must not be held to failing again:
+    # naming it is the whole remedy the refusal advertises.
+    $repairedDir = Join-Path $caseReg 'repaired'
+    [void](New-Item -ItemType Directory -Path $repairedDir -Force)
+    $repairedManifest = Join-Path $repairedDir 'cohort.json'
+    $brokenBody = [ordered]@{ contractVersion = 'devpilot.gate5.cohort-manifest.v2'; cohortId = 'cohort-repaired' }
+    Set-Content -LiteralPath $repairedManifest -Value ($brokenBody | ConvertTo-Json -Depth 8 -Compress:$false) -Encoding utf8NoBOM
+    $repairedRegistry = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'repaired-account\gate5-registry.json')))
+    $repairBefore = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $repairedRegistry,
+        '--from-cohort', $repairedManifest) -OmitCohort
+    Assert-Cohort ($repairBefore.ExitCode -eq 0) `
+        "The rebuild over a defective root exited $($repairBefore.ExitCode); expected 0. $($repairBefore.Output)"
+    $repairBeforeAccount = Get-JsonFile -Path $repairedRegistry
+    Assert-Cohort ($repairBeforeAccount.inventory.unreadableDefectCount -ge 1) `
+        'A manifest with no readable entries was not filed as unreadable.'
+    Set-Content -LiteralPath $repairedManifest -Value ($notedBody | ConvertTo-Json -Depth 8 -Compress:$false) -Encoding utf8NoBOM
+    $repairAfter = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $repairedRegistry,
+        '--from-cohort', $repairedManifest) -OmitCohort
+    Assert-Cohort ($repairAfter.ExitCode -eq 0) `
+        "A rebuild over a REPAIRED root exited $($repairAfter.ExitCode); expected 0. $($repairAfter.Output)"
+    $repairAfterAccount = Get-JsonFile -Path $repairedRegistry
+    Assert-Cohort ($repairAfterAccount.inventory.unreadableDefectCount -eq 0) `
+        "The repaired root kept $($repairAfterAccount.inventory.unreadableDefectCount) unreadable defect(s); expected 0."
+
+    # A cohort root with a readable manifest and no signed journal asserts nothing
+    # about what it ran, in either direction. Every subject it declares is held by a
+    # row that counts toward nothing - including one whose output root exists and is
+    # empty, and one whose output root is not there at all, because the file system
+    # is not evidence: the runner's own child makes that root before it writes into
+    # it, an operator may have made it by hand, and a deleted root looks exactly like
+    # an unused one.
+    $unlaunchedDir = Join-Path $caseReg 'unlaunched'
+    [void](New-Item -ItemType Directory -Path $unlaunchedDir -Force)
+    $rgUnlaunched = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-unlaunched' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429300
+    $rgOrphaned = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-orphaned' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429301
+    $rgVanished = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-vanished' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429302
+    # Declared, and its destination is there and empty.
+    [void](New-Item -ItemType Directory -Path $rgUnlaunched.OutputRoot -Force)
+    # Output where a child ran, and no journal left to say what it did.
+    [void](New-Item -ItemType Directory -Path (Join-Path $rgOrphaned.OutputRoot 'coordinator') -Force)
+    # No output root at all.
+    $manifestUnlaunched = New-CohortManifestFile -Path (Join-Path $unlaunchedDir 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-unlaunched' `
+        -CorrelationId 'cohort-correlation-unlaunched' `
+        -JournalRoot (Join-Path $unlaunchedDir 'journal') -IndexPath (Join-Path $unlaunchedDir 'index\unlaunched.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $rgUnlaunched -Ordinal 1 -RuleBundlePath $ruleBundle),
+        (New-CohortEntryDeclaration -Request $rgOrphaned -Ordinal 2 -RuleBundlePath $ruleBundle),
+        (New-CohortEntryDeclaration -Request $rgVanished -Ordinal 3 -RuleBundlePath $ruleBundle))
+    $unlaunchedRegistry = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'unlaunched-account\gate5-registry.json')))
+    $unlaunchedRebuild = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $unlaunchedRegistry,
+        '--from-cohort', $manifestUnlaunched) -OmitCohort
+    Assert-Cohort ($unlaunchedRebuild.ExitCode -eq 0) `
+        "A rebuild over a journal-less root exited $($unlaunchedRebuild.ExitCode); expected 0. $($unlaunchedRebuild.Output)"
+    $unlaunchedAccount = Get-JsonFile -Path $unlaunchedRegistry
+    Assert-Cohort ($unlaunchedAccount.inventory.unreadableDefectCount -eq 0 -and $unlaunchedAccount.inventory.defectCount -ge 1) `
+        "A journal-less root left unreadable=$($unlaunchedAccount.inventory.unreadableDefectCount) defects=$($unlaunchedAccount.inventory.defectCount); expected 0 and at least 1."
+    $unlaunchedRow = @($unlaunchedAccount.samples | Where-Object { $_.pullRequestId -eq 4429300 })
+    Assert-Cohort (@($unlaunchedRow).Count -eq 1 -and $unlaunchedRow[0].countsTowardThreshold -eq $false) `
+        "An entry with an empty output root and no journal left $(@($unlaunchedRow).Count) row(s); expected one holding row."
+    $orphanedRow = @($unlaunchedAccount.samples | Where-Object { $_.pullRequestId -eq 4429301 })
+    Assert-Cohort (@($orphanedRow).Count -eq 1 -and $orphanedRow[0].countsTowardThreshold -eq $false) `
+        'A child that ran and lost its journal left its subject free.'
+    $vanishedRow = @($unlaunchedAccount.samples | Where-Object { $_.pullRequestId -eq 4429302 })
+    Assert-Cohort (@($vanishedRow).Count -eq 1 -and $vanishedRow[0].countsTowardThreshold -eq $false) `
+        'An entry whose output root is gone was treated as proof that nothing ran, and its subject was freed.'
+
+    # Re-reading the same journal-less root changes nothing: the rows are keyed on the
+    # manifest digest, so the same reading produces the same rows and the account
+    # neither grows nor forgets. Restoring the missing output root is not an argument
+    # either - it was never the reason the subject was held.
+    [void](New-Item -ItemType Directory -Path $rgVanished.OutputRoot -Force)
+    $unlaunchedAgain = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $unlaunchedRegistry,
+        '--from-cohort', $manifestUnlaunched) -OmitCohort
+    Assert-Cohort ($unlaunchedAgain.ExitCode -eq 0) `
+        "A rebuild that re-read a journal-less root exited $($unlaunchedAgain.ExitCode); expected 0. $($unlaunchedAgain.Output)"
+    $unlaunchedAgainAccount = Get-JsonFile -Path $unlaunchedRegistry
+    $stillVanished = @($unlaunchedAgainAccount.samples | Where-Object { $_.pullRequestId -eq 4429302 })
+    Assert-Cohort (@($stillVanished).Count -eq 1) `
+        "An output root coming back empty retracted a hold no file system fact could answer; $(@($stillVanished).Count) row(s) remain."
+    Assert-Cohort (@($unlaunchedAgainAccount.samples).Count -eq @($unlaunchedAccount.samples).Count) `
+        "Re-reading the same journal-less root changed the row count from $(@($unlaunchedAccount.samples).Count) to $(@($unlaunchedAgainAccount.samples).Count)."
+
+    # The one thing that CAN speak to a hold is an authenticated journal saying the
+    # entry was never launched - and even then only when the operator asks for the
+    # retraction in as many words, because a journal minted after the original was
+    # lost reads exactly the same. A cohort stops at its first failure; its second
+    # entry is left pending. Lose the journal's key and the root reads as
+    # journal-less, so both subjects are held; put the key back and the rebuild
+    # refuses by default, and lets the second subject go only under the flag.
+    $retractDir = Join-Path $caseReg 'retract'
+    [void](New-Item -ItemType Directory -Path $retractDir -Force)
+    $rgRetractSpent = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-retract-spent' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429310
+    [void](New-StubControl -Path $rgRetractSpent.ControlPath -ExitCode 4)
+    $rgRetractPending = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-retract-pending' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429311
+    [void](New-StubControl -Path $rgRetractPending.ControlPath -ExitCode 0)
+    $retractJournalRoot = Join-Path $retractDir 'journal'
+    $manifestRetract = New-CohortManifestFile -Path (Join-Path $retractDir 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-retract' `
+        -CorrelationId 'cohort-correlation-retract' `
+        -JournalRoot $retractJournalRoot -IndexPath (Join-Path $retractDir 'index\retract.json') `
+        -StubPath $stub -StopPolicy 'failFast' -Entries @(
+        (New-CohortEntryDeclaration -Request $rgRetractSpent -Ordinal 1 -RuleBundlePath $ruleBundle),
+        (New-CohortEntryDeclaration -Request $rgRetractPending -Ordinal 2 -RuleBundlePath $ruleBundle))
+    $runRetract = Invoke-Cohort -ManifestPath $manifestRetract
+    Assert-Cohort ($runRetract.ExitCode -ne 0) `
+        "The fail-fast cohort behind the retraction test exited 0; it was supposed to stop at its first entry. $($runRetract.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $rgRetractPending.OutputRoot 'coordinator'))) `
+        'The fail-fast cohort launched its second entry, so there is no pending entry to retract.'
+    $retractKeyPath = Join-Path $retractJournalRoot 'cohort-journal.key'
+    $retractKeyHidden = Join-Path $retractDir 'cohort-journal.key.hidden'
+    Move-Item -LiteralPath $retractKeyPath -Destination $retractKeyHidden -Force
+    $retractRegistry = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'retract-account\gate5-registry.json')))
+    $retractBefore = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $retractRegistry,
+        '--from-cohort', $manifestRetract) -OmitCohort
+    Assert-Cohort ($retractBefore.ExitCode -eq 0) `
+        "A rebuild over a root whose journal key was lost exited $($retractBefore.ExitCode); expected 0. $($retractBefore.Output)"
+    $retractBeforeAccount = Get-JsonFile -Path $retractRegistry
+    $pendingHeld = @($retractBeforeAccount.samples | Where-Object { $_.pullRequestId -eq 4429311 })
+    Assert-Cohort (@($pendingHeld).Count -eq 1 -and $pendingHeld[0].countsTowardThreshold -eq $false) `
+        "Losing the journal key left $(@($pendingHeld).Count) row(s) for the pending entry; expected one holding row."
+    Move-Item -LiteralPath $retractKeyHidden -Destination $retractKeyPath -Force
+    $retractDefault = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $retractRegistry,
+        '--from-cohort', $manifestRetract) -OmitCohort
+    Assert-Cohort ($retractDefault.ExitCode -eq 2) `
+        "A rebuild that would have to retract a hold exited $($retractDefault.ExitCode); expected 2. $($retractDefault.Output)"
+    Assert-Cohort ($retractDefault.Output -match '--retract-cleared-holds') `
+        "The refusal did not tell the operator the retraction argument exists. $($retractDefault.Output)"
+    $retractAfter = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $retractRegistry,
+        '--from-cohort', $manifestRetract, '--retract-cleared-holds') -OmitCohort
+    Assert-Cohort ($retractAfter.ExitCode -eq 0) `
+        "A rebuild that was asked to retract exited $($retractAfter.ExitCode); expected 0. $($retractAfter.Output)"
+    $retractAfterAccount = Get-JsonFile -Path $retractRegistry
+    $pendingRetracted = @($retractAfterAccount.samples | Where-Object { $_.pullRequestId -eq 4429311 })
+    Assert-Cohort (@($pendingRetracted).Count -eq 0) `
+        "A signed journal proving the entry never launched left $(@($pendingRetracted).Count) row(s) behind; expected none."
+    $spentKept = @($retractAfterAccount.samples | Where-Object { $_.pullRequestId -eq 4429310 })
+    Assert-Cohort (@($spentKept).Count -eq 1) `
+        'The restored journal dropped the row of the entry that really did launch.'
+
+    # A cohort id and an entry id are strings an operator types. A DIFFERENT manifest
+    # that reuses both over the same pull request is not the run the placeholder was
+    # about, and its journal may not speak for it - not even under the flag.
+    $imposterDir = Join-Path $caseReg 'retract-imposter'
+    [void](New-Item -ItemType Directory -Path $imposterDir -Force)
+    $rgImposterHeld = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-imposter' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429320
+    $manifestImposterHeld = New-CohortManifestFile -Path (Join-Path $imposterDir 'held.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-imposter' `
+        -CorrelationId 'cohort-correlation-imposter-a' `
+        -JournalRoot (Join-Path $imposterDir 'journal-held') -IndexPath (Join-Path $imposterDir 'index\held.json') `
+        -StubPath $stub -Entries @((New-CohortEntryDeclaration -Request $rgImposterHeld -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $imposterRegistry = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'imposter-account\gate5-registry.json')))
+    $imposterBefore = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $imposterRegistry,
+        '--from-cohort', $manifestImposterHeld) -OmitCohort
+    Assert-Cohort ($imposterBefore.ExitCode -eq 0) `
+        "The rebuild that placed the imposter fixture's hold exited $($imposterBefore.ExitCode); expected 0. $($imposterBefore.Output)"
+    # A second manifest: same cohort id, same entry id, same pull request, different
+    # bytes - and a real signed journal whose entry never launched, exactly what a
+    # re-run against an account that already holds the subject leaves behind.
+    $rgImposterFree = New-CohortEntryRequest -Sandbox $imposterDir -EntryId 'entry-imposter' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429320
+    [void](New-StubControl -Path $rgImposterFree.ControlPath -ExitCode 0)
+    $imposterHeldAccount = Get-JsonFile -Path $imposterRegistry
+    $manifestImposterFree = New-CohortManifestFile -Path (Join-Path $imposterDir 'free.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-imposter' `
+        -CorrelationId 'cohort-correlation-imposter-b' `
+        -JournalRoot (Join-Path $imposterDir 'journal-free') -IndexPath (Join-Path $imposterDir 'index\free.json') `
+        -StubPath $stub -RegistryPath $imposterRegistry -RegistrySha256 $imposterHeldAccount.registrySha256 `
+        -Entries @((New-CohortEntryDeclaration -Request $rgImposterFree -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runImposter = Invoke-Cohort -ManifestPath $manifestImposterFree
+    Assert-Cohort ($runImposter.ExitCode -eq 11) `
+        "The imposter cohort over a held subject exited $($runImposter.ExitCode); expected 11. $($runImposter.Output)"
+    Assert-Cohort (Test-Path -LiteralPath (Join-Path $imposterDir 'journal-free\cohort-journal.json')) `
+        'The refused imposter cohort left no signed journal, so it does not test the retraction binding.'
+    $imposterAfter = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $imposterRegistry,
+        '--from-cohort', $manifestImposterFree, '--retract-cleared-holds') -OmitCohort
+    Assert-Cohort ($imposterAfter.ExitCode -eq 2) `
+        "A journal from a DIFFERENT manifest reusing the same cohort and entry id retracted a hold; exit $($imposterAfter.ExitCode), expected 2. $($imposterAfter.Output)"
+    $imposterAccount = Get-JsonFile -Path $imposterRegistry
+    $imposterRow = @($imposterAccount.samples | Where-Object { $_.pullRequestId -eq 4429320 })
+    Assert-Cohort (@($imposterRow).Count -ge 1) `
+        "The imposter rebuild changed the held row it had no evidence about; $(@($imposterRow).Count) row(s) remain."
+
+    # An account with an open question in it cannot prove a subject is free, so a
+    # COUNTING cohort bound to one is refused before any child. The same account in
+    # diagnostic mode is fine: nothing there can occupy anything.
+    $gateAccount = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'gate-account\gate5-registry.json')))
+    $gateBrokenDir = Join-Path $caseReg 'gate-broken'
+    [void](New-Item -ItemType Directory -Path $gateBrokenDir -Force)
+    $gateBrokenManifest = Join-Path $gateBrokenDir 'cohort.json'
+    Set-Content -LiteralPath $gateBrokenManifest -Value ($brokenBody | ConvertTo-Json -Depth 8 -Compress:$false) -Encoding utf8NoBOM
+    $gateRebuild = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--rebuild-registry', '--registry', $gateAccount,
+        '--from-cohort', $gateBrokenManifest, '--from-cohort', $manifestUnlaunched) -OmitCohort
+    Assert-Cohort ($gateRebuild.ExitCode -eq 0) "The rebuild for the admission gate exited $($gateRebuild.ExitCode); expected 0."
+    $gateAccountBody = Get-JsonFile -Path $gateAccount
+    Assert-Cohort ($gateAccountBody.inventory.unreadableDefectCount -ge 1) `
+        'The admission-gate fixture account holds no unreadable defect, so it does not test the gate.'
+    $rgGate = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-gate' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429100
+    [void](New-StubControl -Path $rgGate.ControlPath -ExitCode 0)
+    $manifestGate = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-gate.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-gate' `
+        -CorrelationId 'cohort-correlation-gate' `
+        -JournalRoot (Join-Path $caseReg 'journal-gate') -IndexPath (Join-Path $caseReg 'index\gate.json') `
+        -StubPath $stub -RegistryPath $gateAccount -RegistrySha256 $gateAccountBody.registrySha256 `
+        -Entries @((New-CohortEntryDeclaration -Request $rgGate -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runGate = Invoke-Cohort -ManifestPath $manifestGate
+    Assert-Cohort ($runGate.ExitCode -eq 11) `
+        "A counting cohort over an account with unread roots exited $($runGate.ExitCode); expected 11. $($runGate.Output)"
+    Assert-Cohort ($runGate.Output -match 'could not be read') `
+        "The refusal did not say the account holds roots it could not read. $($runGate.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $rgGate.OutputRoot 'coordinator'))) `
+        'A counting cohort over an account with unread roots launched a child anyway.'
+    # Diagnostic mode is a REPEAT, so the subject has to be one the account already
+    # holds. 4429301 is held by the journal-less root the gate account was rebuilt
+    # from; the same cohort over a pull request the account has never seen is refused,
+    # because a diagnostic row is invisible to the settle pass and would let a spent
+    # subject come back as a fresh one.
+    $rgGateDiag = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-gate-diagnostic' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429301
+    [void](New-StubControl -Path $rgGateDiag.ControlPath -ExitCode 0)
+    $manifestGateDiag = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-gate-diagnostic.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-gate-diagnostic' `
+        -CorrelationId 'cohort-correlation-gate-diagnostic' `
+        -JournalRoot (Join-Path $caseReg 'journal-gate-diagnostic') -IndexPath (Join-Path $caseReg 'index\gate-diagnostic.json') `
+        -StubPath $stub -RegistryPath $gateAccount -RegistrySha256 $gateAccountBody.registrySha256 -RegistryMode 'diagnostic' `
+        -Entries @((New-CohortEntryDeclaration -Request $rgGateDiag -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runGateDiag = Invoke-Cohort -ManifestPath $manifestGateDiag
+    Assert-Cohort ($runGateDiag.ExitCode -eq 0) `
+        "A diagnostic cohort over an account with unread roots exited $($runGateDiag.ExitCode); expected 0. $($runGateDiag.Output)"
+
+    $rgGateFresh = New-CohortEntryRequest -Sandbox $caseReg -EntryId 'entry-gate-fresh' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429101
+    [void](New-StubControl -Path $rgGateFresh.ControlPath -ExitCode 0)
+    $gateAccountAfterDiag = Get-JsonFile -Path $gateAccount
+    $manifestGateFresh = New-CohortManifestFile -Path (Join-Path $caseReg 'cohort-gate-fresh.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-gate-fresh' `
+        -CorrelationId 'cohort-correlation-gate-fresh' `
+        -JournalRoot (Join-Path $caseReg 'journal-gate-fresh') -IndexPath (Join-Path $caseReg 'index\gate-fresh.json') `
+        -StubPath $stub -RegistryPath $gateAccount -RegistrySha256 $gateAccountAfterDiag.registrySha256 -RegistryMode 'diagnostic' `
+        -Entries @((New-CohortEntryDeclaration -Request $rgGateFresh -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runGateFresh = Invoke-Cohort -ManifestPath $manifestGateFresh
+    Assert-Cohort ($runGateFresh.ExitCode -eq 11) `
+        "A diagnostic cohort over a pull request the account has never seen exited $($runGateFresh.ExitCode); expected 11. $($runGateFresh.Output)"
+    Assert-Cohort ($runGateFresh.Output -match 'has never seen') `
+        "The refusal did not say the account has never seen that pull request. $($runGateFresh.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $rgGateFresh.OutputRoot 'coordinator'))) `
+        'A diagnostic cohort over a fresh pull request launched a child anyway.'
+
+    # An entry that ended with evidence nobody could authenticate still spent its
+    # subject. It is recorded holding that subject and counting toward nothing, and
+    # the next counting cohort over the same pull request is refused because of it.
+    $caseRefused = Join-Path $sandboxRoot 'case-registry-refused'
+    $refusedAccount = [string]([IO.Path]::GetFullPath((Join-Path $caseRefused 'account\gate5-registry.json')))
+    $rgRefused = New-CohortEntryRequest -Sandbox $caseRefused -EntryId 'entry-refused' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429200
+    [void](New-StubControl -Path $rgRefused.ControlPath -ExitCode 0 -TamperSignature $true)
+    $manifestRefused = New-CohortManifestFile -Path (Join-Path $caseRefused 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-refused' `
+        -CorrelationId 'cohort-correlation-refused' `
+        -JournalRoot (Join-Path $caseRefused 'journal') -IndexPath (Join-Path $caseRefused 'index\refused.json') `
+        -StubPath $stub -RegistryPath $refusedAccount -RegistrySha256 'none' `
+        -Entries @((New-CohortEntryDeclaration -Request $rgRefused -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runRefused = Invoke-Cohort -ManifestPath $manifestRefused
+    Assert-Cohort ($runRefused.ExitCode -eq 11) `
+        "The evidence-refused cohort exited $($runRefused.ExitCode); expected 11."
+    Assert-Cohort (Test-Path -LiteralPath $refusedAccount) `
+        'An entry that ended with unreadable evidence left no account row at all, so its subject was freed.'
+    $refusedAccountBody = Get-JsonFile -Path $refusedAccount
+    $refusedRow = @($refusedAccountBody.samples | Where-Object { $_.pullRequestId -eq 4429200 })
+    Assert-Cohort (@($refusedRow).Count -eq 1) `
+        "The evidence-refused entry left $(@($refusedRow).Count) row(s) for its subject; expected 1."
+    Assert-Cohort ($refusedRow[0].classification -eq 'evidenceUnreadable' -and $refusedRow[0].countsTowardThreshold -eq $false) `
+        "The evidence-refused row was '$($refusedRow[0].classification)' counts=$($refusedRow[0].countsTowardThreshold); expected evidenceUnreadable and false."
+    $rgRefusedNext = New-CohortEntryRequest -Sandbox $caseRefused -EntryId 'entry-refused-next' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429200 -IterationId 7
+    [void](New-StubControl -Path $rgRefusedNext.ControlPath -ExitCode 0)
+    $manifestRefusedNext = New-CohortManifestFile -Path (Join-Path $caseRefused 'cohort-next.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-refused-next' `
+        -CorrelationId 'cohort-correlation-refused-next' `
+        -JournalRoot (Join-Path $caseRefused 'journal-next') -IndexPath (Join-Path $caseRefused 'index\refused-next.json') `
+        -StubPath $stub -RegistryPath $refusedAccount -RegistrySha256 $refusedAccountBody.registrySha256 `
+        -Entries @((New-CohortEntryDeclaration -Request $rgRefusedNext -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runRefusedNext = Invoke-Cohort -ManifestPath $manifestRefusedNext
+    Assert-Cohort ($runRefusedNext.ExitCode -eq 11) `
+        "A counting cohort over a subject held by an unread run exited $($runRefusedNext.ExitCode); expected 11. $($runRefusedNext.Output)"
+    # A run that did not qualify still looked. The budget-exceeded cohort of the
+    # previous scenario put pull request 4420004 in front of the models and could
+    # not count; a later clean run over the same pull request is a second look at
+    # work this toolkit has already seen, and the account is counted in distinct
+    # subjects precisely so that does not read as a fresh observation. Rebuilt over
+    # both roots, the clean row is demoted rather than counted.
+    $caseObs = Join-Path $sandboxRoot 'case-registry-observed'
+    $obsRegistry = [string]([IO.Path]::GetFullPath((Join-Path $caseObs 'account\gate5-registry.json')))
+    $obs = New-CohortEntryRequest -Sandbox $caseObs -EntryId 'entry-observed' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4420004 -IterationId 5
+    [void](New-StubControl -Path $obs.ControlPath -ExitCode 0)
+    $manifestObs = New-CohortManifestFile -Path (Join-Path $caseObs 'cohort-observed.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-observed' `
+        -CorrelationId 'cohort-correlation-observed' `
+        -JournalRoot (Join-Path $caseObs 'journal') -IndexPath (Join-Path $caseObs 'index\observed.json') `
+        -StubPath $stub -RegistryPath $obsRegistry -RegistrySha256 'none' `
+        -Entries @((New-CohortEntryDeclaration -Request $obs -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runObs = Invoke-Cohort -ManifestPath $manifestObs
+    Assert-Cohort ($runObs.ExitCode -eq 0) "The clean repeat cohort exited $($runObs.ExitCode); expected 0. $($runObs.Output)"
+    $obsAccount = Get-JsonFile -Path $obsRegistry
+    Assert-Cohort ($obsAccount.inventory.countingSampleCount -eq 1) `
+        "Against an account that had never seen it, the clean run counted $($obsAccount.inventory.countingSampleCount); expected 1."
+    $obsRebuiltPath = [string]([IO.Path]::GetFullPath((Join-Path $caseObs 'rebuilt\gate5-registry.json')))
+    $obsRebuild = Invoke-Cohort -ManifestPath $manifestObs -Extra @('--rebuild-registry', '--registry', $obsRebuiltPath,
+        '--from-cohort', (Join-Path $caseCls 'cohort-4.json'), '--from-cohort', $manifestObs) -OmitCohort
+    Assert-Cohort ($obsRebuild.ExitCode -eq 0) "The rebuild over both roots exited $($obsRebuild.ExitCode); expected 0. $($obsRebuild.Output)"
+    $obsRebuilt = Get-JsonFile -Path $obsRebuiltPath
+    Assert-Cohort ($obsRebuilt.inventory.countingSampleCount -eq 0) `
+        "A clean run over a pull request the models had already seen counted $($obsRebuilt.inventory.countingSampleCount); expected 0."
+    $obsRow = @($obsRebuilt.samples | Where-Object { $_.cohortId -eq 'cohort-registry-observed' })
+    Assert-Cohort (@($obsRow).Count -eq 1 -and $obsRow[0].classification -eq 'diagnosticRepeat') `
+        "The clean row was classified '$(if (@($obsRow).Count -eq 1) { $obsRow[0].classification } else { 'missing' })'; expected diagnosticRepeat."
+
+    Write-Host '35/35 an account that cannot be rebuilt is an account that cannot be used' -ForegroundColor Cyan
+    # Every case here is a way the account could have been made permanently
+    # unusable by evidence that is immutable and correct - a wedge rather than a
+    # refusal. Each one is a rebuild that must keep working.
+
+    # A refused ending commits no audit digest, because there was no audit this
+    # build would read. Held to one it would fail forever, and because an unread
+    # root stops a counting cohort the whole gate would be shut by a fact nobody
+    # can change. It is a CLOSED question - the entry ran and its evidence was
+    # refused - so it is noted, and the subject is still held.
+    $refusedRebuiltPath = [string]([IO.Path]::GetFullPath((Join-Path $caseRefused 'rebuilt\gate5-registry.json')))
+    $refusedRebuild = Invoke-Cohort -ManifestPath $manifestRefused -Extra @('--rebuild-registry', '--registry', $refusedRebuiltPath,
+        '--from-cohort', $manifestRefused) -OmitCohort
+    Assert-Cohort ($refusedRebuild.ExitCode -eq 0) `
+        "A rebuild over a refused-evidence root exited $($refusedRebuild.ExitCode); expected 0. $($refusedRebuild.Output)"
+    $refusedRebuilt = Get-JsonFile -Path $refusedRebuiltPath
+    Assert-Cohort ($refusedRebuilt.inventory.unreadableDefectCount -eq 0) `
+        "A refused ending left $($refusedRebuilt.inventory.unreadableDefectCount) unreadable defect(s); expected 0, or the gate is wedged shut."
+    Assert-Cohort ($refusedRebuilt.inventory.defectCount -ge 1) `
+        'A refused ending was rebuilt with nothing recorded about it at all.'
+    $refusedRebuiltRow = @($refusedRebuilt.samples | Where-Object { $_.pullRequestId -eq 4429200 })
+    Assert-Cohort (@($refusedRebuiltRow).Count -eq 1 -and $refusedRebuiltRow[0].countsTowardThreshold -eq $false) `
+        'The rebuild let go of the subject a refused entry had already spent.'
+    # And the account it produces is usable: a counting cohort bound to it is
+    # admitted, and refused only for the subject that is genuinely held.
+    $rgAfterRefused = New-CohortEntryRequest -Sandbox $caseRefused -EntryId 'entry-after-refused' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429201
+    [void](New-StubControl -Path $rgAfterRefused.ControlPath -ExitCode 0)
+    $manifestAfterRefused = New-CohortManifestFile -Path (Join-Path $caseRefused 'cohort-after.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-after-refused' `
+        -CorrelationId 'cohort-correlation-after-refused' `
+        -JournalRoot (Join-Path $caseRefused 'journal-after') -IndexPath (Join-Path $caseRefused 'index\after.json') `
+        -StubPath $stub -RegistryPath $refusedRebuiltPath -RegistrySha256 $refusedRebuilt.registrySha256 `
+        -Entries @((New-CohortEntryDeclaration -Request $rgAfterRefused -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runAfterRefused = Invoke-Cohort -ManifestPath $manifestAfterRefused
+    Assert-Cohort ($runAfterRefused.ExitCode -eq 0) `
+        "A counting cohort over a rebuilt refused-evidence account exited $($runAfterRefused.ExitCode); expected 0. $($runAfterRefused.Output)"
+
+    # A defect raised inside one cohort's roots is answered by naming THAT cohort,
+    # not by naming a manifest that happens to sit in the same directory. These
+    # roots are laid out side by side, so a directory-wide rule would let any one
+    # of them clear every other one's open questions - and free the subjects they
+    # hold - without ever reading them.
+    $caseSib = Join-Path $sandboxRoot 'case-registry-siblings'
+    [void](New-Item -ItemType Directory -Path $caseSib -Force)
+    $sibBroken = Join-Path $caseSib 'cohort-broken.json'
+    Set-Content -LiteralPath $sibBroken -Value 'not a manifest' -Encoding utf8NoBOM
+    $rgSib = New-CohortEntryRequest -Sandbox $caseSib -EntryId 'entry-sibling' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429500
+    [void](New-StubControl -Path $rgSib.ControlPath -ExitCode 0)
+    $sibGood = New-CohortManifestFile -Path (Join-Path $caseSib 'cohort-good.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-sibling' `
+        -CorrelationId 'cohort-correlation-sibling' `
+        -JournalRoot (Join-Path $caseSib 'journal') -IndexPath (Join-Path $caseSib 'index\sibling.json') `
+        -StubPath $stub -Entries @((New-CohortEntryDeclaration -Request $rgSib -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $sibAccount = [string]([IO.Path]::GetFullPath((Join-Path $caseSib 'account\gate5-registry.json')))
+    $sibSeed = Invoke-Cohort -ManifestPath $sibGood -Extra @('--rebuild-registry', '--registry', $sibAccount,
+        '--from-cohort', $sibBroken) -OmitCohort
+    Assert-Cohort ($sibSeed.ExitCode -eq 0) "Seeding the sibling account exited $($sibSeed.ExitCode); expected 0. $($sibSeed.Output)"
+    $sibSeeded = Get-JsonFile -Path $sibAccount
+    Assert-Cohort ($sibSeeded.inventory.unreadableDefectCount -ge 1) `
+        'The sibling fixture recorded no unreadable defect, so it does not test the scope.'
+    $sibDrop = Invoke-Cohort -ManifestPath $sibGood -Extra @('--rebuild-registry', '--registry', $sibAccount,
+        '--from-cohort', $sibGood) -OmitCohort
+    Assert-Cohort ($sibDrop.ExitCode -eq 2) `
+        "A rebuild naming only a SIBLING of the defective root exited $($sibDrop.ExitCode); expected 2. $($sibDrop.Output)"
+
+    # A committed launch with no ending is the one state that cannot be decided
+    # from disk: the intent is signed before the child starts, so the subject may
+    # or may not have been put in front of the models. Held either way - freeing it
+    # is the single mistake the account exists to prevent.
+    $caseOpen = Join-Path $sandboxRoot 'case-registry-open-launch'
+    $openAccount = [string]([IO.Path]::GetFullPath((Join-Path $caseOpen 'account\gate5-registry.json')))
+    $markerOpen = Join-Path $caseOpen 'entry-open.started'
+    $rgOpen = New-CohortEntryRequest -Sandbox $caseOpen -EntryId 'entry-open' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429600
+    [void](New-StubControl -Path $rgOpen.ControlPath -ExitCode 0 -SleepSeconds 300 -WriteAudit $false -StartedMarker $markerOpen)
+    $journalOpen = Join-Path $caseOpen 'journal'
+    $manifestOpen = New-CohortManifestFile -Path (Join-Path $caseOpen 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-open' `
+        -CorrelationId 'cohort-correlation-open' -EntryTimeoutSeconds 600 `
+        -JournalRoot $journalOpen -IndexPath (Join-Path $caseOpen 'index\open.json') `
+        -StubPath $stub -Entries @((New-CohortEntryDeclaration -Request $rgOpen -Ordinal 1 -RuleBundlePath $ruleBundle))
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path $caseOpen 'logs'))
+    $openRunner = Start-Process -FilePath 'dotnet' -PassThru -NoNewWindow `
+        -ArgumentList @($script:CohortDll, '--cohort', $manifestOpen, '--authorized-by', 'test-operator') `
+        -RedirectStandardOutput (Join-Path $caseOpen 'logs\runner.out') `
+        -RedirectStandardError (Join-Path $caseOpen 'logs\runner.err')
+    $openDeadline = (Get-Date).AddSeconds(120)
+    $openChildPid = 0
+    while ((Get-Date) -lt $openDeadline) {
+        Start-Sleep -Milliseconds 250
+        $openRecord = Get-CohortJournalEntry -JournalRoot $journalOpen -EntryId 'entry-open'
+        if ($openRecord -and $openRecord.state -eq 'running' -and $openRecord.childProcessId -gt 0) {
+            $openChildPid = [int]$openRecord.childProcessId
+            break
+        }
+    }
+    Assert-Cohort ($openChildPid -gt 0) 'The open-launch fixture never recorded a running child.'
+    Stop-Process -Id $openRunner.Id -Force
+    $openRunner.WaitForExit()
+    if ($openChildPid -gt 0 -and (Get-Process -Id $openChildPid -ErrorAction SilentlyContinue)) {
+        Stop-Process -Id $openChildPid -Force
+        Start-Sleep -Milliseconds 500
+    }
+    $openRebuild = Invoke-Cohort -ManifestPath $manifestOpen -Extra @('--rebuild-registry', '--registry', $openAccount,
+        '--from-cohort', $manifestOpen) -OmitCohort
+    Assert-Cohort ($openRebuild.ExitCode -eq 0) `
+        "A rebuild over an open launch exited $($openRebuild.ExitCode); expected 0. $($openRebuild.Output)"
+    $openAccountBody = Get-JsonFile -Path $openAccount
+    $openRow = @($openAccountBody.samples | Where-Object { $_.pullRequestId -eq 4429600 })
+    Assert-Cohort (@($openRow).Count -eq 1 -and $openRow[0].countsTowardThreshold -eq $false) `
+        "An entry launched and never ended left $(@($openRow).Count) row(s); expected 1 that counts toward nothing."
+    Assert-Cohort ($openAccountBody.inventory.unreadableDefectCount -eq 0) `
+        'An open launch was filed as an unreadable root; expected a noted one, or a crash shuts the gate.'
+    # And when that same run is resumed and finishes, the ending arrives keyed on an
+    # audit digest that did not exist when the hold was written. Rebuilding must
+    # accept that as the same run superseding its own placeholder rather than
+    # refusing for letting go of a row - otherwise the account is frozen at the
+    # moment it was least informed, and every crash is permanent.
+    [void](New-StubControl -Path $rgOpen.ControlPath -ExitCode 0 -StartedMarker $markerOpen)
+    $openResume = Invoke-Cohort -ManifestPath $manifestOpen
+    Assert-Cohort ($openResume.ExitCode -eq 0) `
+        "Resuming the open-launch cohort exited $($openResume.ExitCode); expected 0. $($openResume.Output)"
+    $openRebuildAgain = Invoke-Cohort -ManifestPath $manifestOpen -Extra @('--rebuild-registry', '--registry', $openAccount,
+        '--from-cohort', $manifestOpen) -OmitCohort
+    Assert-Cohort ($openRebuildAgain.ExitCode -eq 0) `
+        "Rebuilding a root that had finished since the hold exited $($openRebuildAgain.ExitCode); expected 0. $($openRebuildAgain.Output)"
+    $openFinal = Get-JsonFile -Path $openAccount
+    $openFinalRows = @($openFinal.samples | Where-Object { $_.pullRequestId -eq 4429600 })
+    Assert-Cohort (@($openFinalRows).Count -eq 1 -and $openFinalRows[0].countsTowardThreshold -eq $true) `
+        "The finished run left $(@($openFinalRows).Count) row(s) and counts=$(if (@($openFinalRows).Count -eq 1) { $openFinalRows[0].countsTowardThreshold } else { 'n/a' }); expected 1 that counts."
+    # Only a PLACEHOLDER may be superseded, and only by its own run. A later manifest
+    # that reuses a cohort id and an entry id - 'entry1' is the obvious collision -
+    # must not be able to drop a row that recorded a real observation and stand in
+    # its place, or an accident of naming would rewrite what the account asserts.
+    $caseSup = Join-Path $sandboxRoot 'case-registry-supersede'
+    $supAccount = [string]([IO.Path]::GetFullPath((Join-Path $caseSup 'account\gate5-registry.json')))
+    $rgSup = New-CohortEntryRequest -Sandbox $caseSup -EntryId 'entry-supersede' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429700
+    [void](New-StubControl -Path $rgSup.ControlPath -ExitCode 0)
+    $manifestSup = New-CohortManifestFile -Path (Join-Path $caseSup 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-supersede' `
+        -CorrelationId 'cohort-correlation-supersede' `
+        -JournalRoot (Join-Path $caseSup 'journal') -IndexPath (Join-Path $caseSup 'index\supersede.json') `
+        -StubPath $stub -RegistryPath $supAccount -RegistrySha256 'none' `
+        -Entries @((New-CohortEntryDeclaration -Request $rgSup -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runSup = Invoke-Cohort -ManifestPath $manifestSup
+    Assert-Cohort ($runSup.ExitCode -eq 0) "The supersession fixture cohort exited $($runSup.ExitCode); expected 0. $($runSup.Output)"
+    $supSeeded = Get-JsonFile -Path $supAccount
+    Assert-Cohort ($supSeeded.inventory.countingSampleCount -eq 1) `
+        "The supersession fixture counted $($supSeeded.inventory.countingSampleCount) subject(s); expected 1."
+    # The impostor: the same cohort id, the same entry id and the same pull request,
+    # in a root of its own, with no journal and output that says a child ran. It
+    # produces a placeholder for exactly the run key the counted row carries.
+    $caseSupB = Join-Path $sandboxRoot 'case-registry-supersede-impostor'
+    $rgSupB = New-CohortEntryRequest -Sandbox $caseSupB -EntryId 'entry-supersede' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429700
+    [void](New-Item -ItemType Directory -Path (Join-Path $rgSupB.OutputRoot 'coordinator') -Force)
+    $manifestSupB = New-CohortManifestFile -Path (Join-Path $caseSupB 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-supersede' `
+        -CorrelationId 'cohort-correlation-supersede' `
+        -JournalRoot (Join-Path $caseSupB 'journal') -IndexPath (Join-Path $caseSupB 'index\supersede.json') `
+        -StubPath $stub -Entries @((New-CohortEntryDeclaration -Request $rgSupB -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $supDrop = Invoke-Cohort -ManifestPath $manifestSup -Extra @('--rebuild-registry', '--registry', $supAccount,
+        '--from-cohort', $manifestSupB) -OmitCohort
+    Assert-Cohort ($supDrop.ExitCode -eq 2) `
+        "A rebuild that replaced a counted row with a placeholder for the same ids exited $($supDrop.ExitCode); expected 2. $($supDrop.Output)"
+    $supStill = Get-JsonFile -Path $supAccount
+    Assert-Cohort ($supStill.inventory.countingSampleCount -eq 1) `
+        "The refused rebuild changed the account: countingSampleCount=$($supStill.inventory.countingSampleCount); expected 1."
+    # Naming both roots is not a loss, so it is allowed: the counted row is reached
+    # and the placeholder is recorded beside it.
+    $supBoth = Invoke-Cohort -ManifestPath $manifestSup -Extra @('--rebuild-registry', '--registry', $supAccount,
+        '--from-cohort', $manifestSup, '--from-cohort', $manifestSupB) -OmitCohort
+    Assert-Cohort ($supBoth.ExitCode -eq 0) `
+        "A rebuild naming both the real root and the impostor exited $($supBoth.ExitCode); expected 0. $($supBoth.Output)"
+
+    # A defect belongs to the root it was raised against, and naming an ANCESTOR of
+    # that root is not naming it. A manifest may declare any rooted path it likes as
+    # a journal or output root, so a rule that cleared everything beneath a declared
+    # path would let one manifest declaring a wide enough root erase every open
+    # question the account holds - without a single one of those roots being re-read.
+    $ancGood = New-CohortManifestFile -Path (Join-Path $caseSib 'cohort-ancestor.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-ancestor' `
+        -CorrelationId 'cohort-correlation-ancestor' `
+        -JournalRoot $caseSib -IndexPath (Join-Path $caseSib 'index\ancestor.json') `
+        -StubPath $stub -Entries @((New-CohortEntryDeclaration -Request $rgSib -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $ancDrop = Invoke-Cohort -ManifestPath $sibGood -Extra @('--rebuild-registry', '--registry', $sibAccount,
+        '--from-cohort', $ancGood) -OmitCohort
+    Assert-Cohort ($ancDrop.ExitCode -eq 2) `
+        "A rebuild naming a manifest whose declared root merely CONTAINS the defective one exited $($ancDrop.ExitCode); expected 2. $($ancDrop.Output)"
+    Assert-Cohort ($ancDrop.Output -match 'did not name') `
+        "The refusal did not say which defective root went unnamed. $($ancDrop.Output)"
+
+    # An entry that ENDED and whose evidence will not read leaves a closed question,
+    # not an open one: the journal names the exact subject it spent, and the row
+    # above holds it. Filed as unreadable it would fail every unrelated counting
+    # cohort closed, machine-wide, over a root that cannot hand out a pull request
+    # twice.
+    $caseTorn = Join-Path $sandboxRoot 'case-registry-torn-audit'
+    $tornAccount = [string]([IO.Path]::GetFullPath((Join-Path $caseTorn 'account\gate5-registry.json')))
+    $rgTorn = New-CohortEntryRequest -Sandbox $caseTorn -EntryId 'entry-torn' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429800
+    [void](New-StubControl -Path $rgTorn.ControlPath -ExitCode 0)
+    $manifestTorn = New-CohortManifestFile -Path (Join-Path $caseTorn 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-torn' `
+        -CorrelationId 'cohort-correlation-torn' `
+        -JournalRoot (Join-Path $caseTorn 'journal') -IndexPath (Join-Path $caseTorn 'index\torn.json') `
+        -StubPath $stub -Entries @((New-CohortEntryDeclaration -Request $rgTorn -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runTorn = Invoke-Cohort -ManifestPath $manifestTorn
+    Assert-Cohort ($runTorn.ExitCode -eq 0) "The torn-audit fixture cohort exited $($runTorn.ExitCode); expected 0. $($runTorn.Output)"
+    $tornAuditPath = Join-Path $rgTorn.OutputRoot 'coordinator\audit.json'
+    Set-Content -LiteralPath $tornAuditPath -Value 'this audit no longer reads' -Encoding utf8NoBOM
+    $tornRebuild = Invoke-Cohort -ManifestPath $manifestTorn -Extra @('--rebuild-registry', '--registry', $tornAccount,
+        '--from-cohort', $manifestTorn) -OmitCohort
+    Assert-Cohort ($tornRebuild.ExitCode -eq 0) `
+        "A rebuild over an ended entry with an unreadable audit exited $($tornRebuild.ExitCode); expected 0. $($tornRebuild.Output)"
+    $tornAccountBody = Get-JsonFile -Path $tornAccount
+    $tornRow = @($tornAccountBody.samples | Where-Object { $_.pullRequestId -eq 4429800 })
+    Assert-Cohort (@($tornRow).Count -eq 1 -and $tornRow[0].countsTowardThreshold -eq $false) `
+        'An ended entry whose audit will not read let go of the subject it had already spent.'
+    Assert-Cohort ($tornAccountBody.inventory.unreadableDefectCount -eq 0 -and $tornAccountBody.inventory.defectCount -ge 1) `
+        "A torn audit left unreadable=$($tornAccountBody.inventory.unreadableDefectCount) defects=$($tornAccountBody.inventory.defectCount); expected 0 and at least 1."
+    # And the account stays usable: a counting cohort over an unrelated subject runs.
+    $rgAfterTorn = New-CohortEntryRequest -Sandbox $caseTorn -EntryId 'entry-after-torn' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 4429801
+    [void](New-StubControl -Path $rgAfterTorn.ControlPath -ExitCode 0)
+    $manifestAfterTorn = New-CohortManifestFile -Path (Join-Path $caseTorn 'cohort-after.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -CohortId 'cohort-registry-after-torn' `
+        -CorrelationId 'cohort-correlation-after-torn' `
+        -JournalRoot (Join-Path $caseTorn 'journal-after') -IndexPath (Join-Path $caseTorn 'index\after-torn.json') `
+        -StubPath $stub -RegistryPath $tornAccount -RegistrySha256 $tornAccountBody.registrySha256 `
+        -Entries @((New-CohortEntryDeclaration -Request $rgAfterTorn -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runAfterTorn = Invoke-Cohort -ManifestPath $manifestAfterTorn
+    Assert-Cohort ($runAfterTorn.ExitCode -eq 0) `
+        "A counting cohort over an account holding a torn audit exited $($runAfterTorn.ExitCode); expected 0. $($runAfterTorn.Output)"
+
+    # A registry path with no file at it excludes nothing, so a selection made
+    # against one hands back the head of the candidate list whether or not those
+    # pull requests have been spent. A mistyped path is the likely cause, and a
+    # command that ANSWERS where the rebuild would refuse is the worse of the two.
+    $missingRegistry = [string]([IO.Path]::GetFullPath((Join-Path $caseReg 'no-such-account\gate5-registry.json')))
+    $missingSelectionPath = Join-Path $caseReg 'missing-selection.json'
+    $missingSelect = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--select-subjects', '--registry', $missingRegistry,
+        '--candidates', $candidatePath, '--out', $missingSelectionPath, '--select-count', '1') -OmitCohort -OmitAuthorization
+    Assert-Cohort ($missingSelect.ExitCode -eq 2) `
+        "A selection against a registry that does not exist exited $($missingSelect.ExitCode); expected 2. $($missingSelect.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath $missingSelectionPath)) `
+        'A selection against a registry that does not exist wrote a selection anyway.'
+    $missingSelectOk = Invoke-Cohort -ManifestPath $manifestReg1 -Extra @('--select-subjects', '--registry', $missingRegistry,
+        '--candidates', $candidatePath, '--out', $missingSelectionPath, '--select-count', '1',
+        '--accept-unstarted-registry') -OmitCohort -OmitAuthorization
+    Assert-Cohort ($missingSelectOk.ExitCode -eq 0) `
+        "An acknowledged selection against an unstarted registry exited $($missingSelectOk.ExitCode); expected 0. $($missingSelectOk.Output)"
+    $missingSelection = Get-JsonFile -Path $missingSelectionPath
+    Assert-Cohort ($missingSelection.acceptedUnstartedRegistry -eq $true -and $missingSelection.countedSubjectsOnRecord -eq 0) `
+        'The selection did not record that it was made against an account nobody has started.'
 }
 finally {
     if (-not $KeepSandbox.IsPresent) {

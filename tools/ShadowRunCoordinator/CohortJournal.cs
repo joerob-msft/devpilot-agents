@@ -370,6 +370,52 @@ internal sealed class CohortJournal
     /// <summary>True when this journal carries a published word about the cohort as a whole.</summary>
     internal bool HasTerminal => !string.Equals(TerminalReason, "none", StringComparison.Ordinal);
 
+    /// <summary>
+    /// The registry revision this cohort has accepted, or "none" before it has
+    /// verified one.
+    /// </summary>
+    internal string RegistrySha256 { get; private set; } = "none";
+
+    /// <summary>
+    /// Commits the registry revision this cohort now stands on.
+    /// </summary>
+    /// <remarks>
+    /// Committed AFTER the registry file it names has been written, so a runner
+    /// killed between the two leaves a journal naming the previous revision beside
+    /// a registry holding the new one. That pair is resolvable: the sample the
+    /// registry gained is keyed by the run that produced it, so the resume records
+    /// the same sample again and lands on the same bytes. The opposite order would
+    /// leave a journal naming a revision that does not exist.
+    /// </remarks>
+    internal void RecordRegistryRevision(byte[] key, string registrySha256)
+    {
+        if (string.Equals(RegistrySha256, registrySha256, StringComparison.Ordinal))
+        {
+            return;
+        }
+        var previous = RegistrySha256;
+        var previousSequence = Sequence;
+        RegistrySha256 = registrySha256;
+        Sequence++;
+        _events.Add(new MapNode()
+            .Set("sequence", Sequence)
+            .Set("atUtc", DateTime.UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'", CultureInfo.InvariantCulture))
+            .Set("entryId", "none")
+            .Set("kind", "registry")
+            .Set("detail", "the cohort accepted a registry revision"));
+        try
+        {
+            Save(key);
+        }
+        catch
+        {
+            _events.RemoveAt(_events.Count - 1);
+            RegistrySha256 = previous;
+            Sequence = previousSequence;
+            throw;
+        }
+    }
+
     /// <summary>The record for a declared entry, which always exists once the journal is open.</summary>
     internal CohortEntryRecord RecordFor(string entryId) =>
         _entries.TryGetValue(entryId, out var record)
@@ -470,6 +516,7 @@ internal sealed class CohortJournal
             "entries",
             "events",
             "terminal",
+            "registrySha256",
             "signature");
 
         StrictJson.RequireLiteral(root, "contractVersion", ContractVersionValue, Label);
@@ -503,6 +550,23 @@ internal sealed class CohortJournal
         journal.TerminalReason = terminalReason;
         journal.TerminalDetail = StrictJson.RequireString(terminal, "detail", Label + " terminal");
         journal.TerminalDetailSha256 = terminalDetailSha256;
+
+        // Absent means 'this cohort has never accepted a registry revision', which
+        // is exactly what every journal written before the account existed says.
+        // Reading it as a required field would make those journals unreadable, and
+        // an unreadable journal is an unresumable cohort - so a historical root
+        // would become unrecoverable evidence rather than evidence.
+        var registrySha256 = "none";
+        if (root.TryGetProperty("registrySha256", out _))
+        {
+            registrySha256 = StrictJson.RequireString(root, "registrySha256", Label);
+        }
+        if (!string.Equals(registrySha256, "none", StringComparison.Ordinal)
+            && (registrySha256.Length != 64 || !StrictJson.IsLowerHex(registrySha256)))
+        {
+            throw new ContractException($"The {Label} records a registry revision that is neither 'none' nor 64 lower-case hexadecimal characters.");
+        }
+        journal.RegistrySha256 = registrySha256;
 
         foreach (var entryNode in StrictJson.RequireArray(root, "entries", Label))
         {
@@ -840,7 +904,7 @@ internal sealed class CohortJournal
         {
             events.Add(recorded);
         }
-        return new MapNode()
+        var composed = new MapNode()
             .Set("contractVersion", ContractVersionValue)
             .Set("kind", KindValue)
             .Set("cohortId", _manifest.CohortId)
@@ -853,6 +917,23 @@ internal sealed class CohortJournal
                 .Set("reason", TerminalReason)
                 .Set("detail", TerminalDetail)
                 .Set("detailSha256", TerminalDetailSha256));
+        // The registry revision this cohort last accepted or produced. A cohort
+        // that records a subject moves the registry forward, so the revision the
+        // manifest bound is no longer the revision on disk - and a resume that
+        // insisted on the bound one would refuse its own work. Kept here rather
+        // than inferred, so the acceptable revisions are exactly two: the one
+        // declared and the one this cohort itself wrote.
+        //
+        // Written only once there IS one. A cohort that has accepted no revision
+        // composes exactly the bytes it composed before this field existed, so
+        // every journal signed by an earlier build still authenticates and every
+        // cohort interrupted under one can still be resumed. Presence is the
+        // version marker; there is no separate number to keep in step.
+        if (!string.Equals(RegistrySha256, "none", StringComparison.Ordinal))
+        {
+            composed.Set("registrySha256", RegistrySha256);
+        }
+        return composed;
     }
 
     /// <summary>
