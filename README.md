@@ -678,6 +678,9 @@ documents cover what is checked and what is not:
   a coverage matrix that states plainly which dimension is uncovered.
 - [Stage file contract](docs/stage-file-contract.md) — a versioned, fail-closed envelope for
   stage child output. No production stage has adopted it yet; that is stated up front.
+- [Generalist model response envelope v2](docs/model-response-envelope-v2.md) — a standalone
+  nonce challenge line separated from a content-only payload, so a model that omits the
+  challenge loses its vote without losing its place in the verifier census.
 - [Empty and null static analysis](docs/empty-null-static-analysis.md) — eleven analyzer
   rules, a fixture corpus that measures them, and a baseline that blocks new findings while
   recording existing ones as debt.

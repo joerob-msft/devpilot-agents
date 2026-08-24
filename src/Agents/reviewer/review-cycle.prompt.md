@@ -175,16 +175,57 @@ This is a **recommendation**. The wrapper re-verifies it against your own
 severity list and the PR's current state, and casts a vote only if the operator
 explicitly enabled voting. Never assume a vote happened.
 
-## Step 6 — Emit the result marker
+## Step 6 — Emit the result
 
-The top-level result object is already built as `markerScaffold` in the wrapper
-runtime data. Use that object exactly as supplied. Fill in **only** its
-`findings`, `recommendedVote`, and `summary` values; change nothing else,
-preserve every key and its order, and emit the resulting scaffold as the single
-result marker object. Emit the inner `markerScaffold` object itself, not the
-enclosing runtime-data object. The empty `recommendedVote` placeholder is
-intentionally not a valid final vote: you must replace it with your Step 5
-recommendation.
+Which contract applies is stated in the wrapper runtime data. Follow whichever
+one the runtime data supplies; do not choose between them yourself.
+
+### 6a — The two-part response contract (v2, current)
+
+When the runtime data carries a **"Result contract (version 2)"** section, that
+section is the contract, and it contains this attempt's nonce and the exact
+shapes to emit. Emit **two** things:
+
+1. A standalone line that is nothing but the challenge prefix and the nonce the
+   runtime data issued. Nothing else on the line, no code fence, no surrounding
+   prose.
+2. A line beginning with the payload prefix followed by one closed JSON object.
+
+The payload object carries **only** what you decided: `schemaVersion` (always
+`2`), `reviewedSourceCommit`, `findings`, `recommendedVote`, and `summary`. It
+carries no PR id, no repository, no project, and no hashes — the wrapper owns
+those, and it will not read them from you even if you send them.
+
+- `findings` is a JSON array. Emit `[]` when you found nothing.
+- Every `findings` element has exactly these keys: `severity` (`critical`,
+  `important`, or `suggestion`), `filePath` (repo-root path or empty string),
+  `line` (integer), and `comment` (one plain-text line).
+- `summary` is one plain-text line. It is posted verbatim when summary posting
+  is enabled.
+- `recommendedVote` is your Step 5 recommendation. There is no placeholder value
+  and an empty string is not a vote.
+- You may restate the nonce line and the payload later in the same reply, but
+  every restatement must be **identical**. Two payloads that disagree end the
+  attempt.
+- The nonce goes on its own line and nowhere else. Do not put it inside the
+  payload object.
+
+The two parts are read independently, and that is the point of the split. A
+payload without the nonce line is still recorded, still sealed, and still read
+by the other reviewers — but it cannot be cast as a vote and cannot mark this
+pull request reviewed. A nonce that is not this attempt's nonce ends the attempt
+outright. Forgetting the credential and forging one are not the same event, and
+the wrapper does not treat them the same.
+
+### 6b — The single result marker (v1, legacy)
+
+When the runtime data supplies a `markerScaffold` and no version-2 result
+contract section, use that object exactly as supplied. Fill in **only** its `findings`,
+`recommendedVote`, and `summary` values; change nothing else, preserve every key
+and its order, and emit the resulting scaffold as the single result marker
+object. Emit the inner `markerScaffold` object itself, not the enclosing
+runtime-data object. The empty `recommendedVote` placeholder is intentionally not
+a valid final vote: you must replace it with your Step 5 recommendation.
 
 Requirements:
 
@@ -208,7 +249,7 @@ Requirements:
   not guess. Confirm that you changed only the three model-owned values and
   retained every scaffold key and wrapper-owned value exactly.
 
-Before the marker, print a short plain-text summary: the bound PR and source
+Before the result, print a short plain-text summary: the bound PR and source
 commit, how many findings you are reporting at each severity, what you
 deliberately did *not* report because another reviewer already had, and
 confirmation that you made no writes of any kind.

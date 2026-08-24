@@ -710,6 +710,35 @@ if ([int]$script:ReviewerSourceChangeLimit -ne (Get-ReviewerChangeListTop)) {
 }
 
 $ResultMarkerPrefix = "REVIEWER_RESULT_V1:"
+# The versioned generalist response contract. v1 asked the model for one marker
+# carrying its findings AND the wrapper's own bindings AND a trailing nonce; a
+# model that emitted a complete, correct review but omitted the nonce lost the
+# entire pass, and with it its place in the verifier census. v2 splits that into
+# a standalone nonce challenge line and a payload of model-owned content only,
+# so a missing nonce costs the pass its VOTE and not its EVIDENCE. Loaded after
+# the marker prefix because both contracts are read from the same transcript
+# during migration.
+$ModelResponseEnvelopeLibrary = Join-Path $PSScriptRoot "ModelResponseEnvelope.ps1"
+if (-not (Test-Path -LiteralPath $ModelResponseEnvelopeLibrary)) {
+    throw "Model response envelope library '$ModelResponseEnvelopeLibrary' does not exist."
+}
+. $ModelResponseEnvelopeLibrary
+# Whether generalist passes are read under the v2 contract. On by default: the
+# failure it removes - a complete review discarded, and the reviewer erased from
+# the census, because a nonce was omitted from the tail of a 4 KB object - is a
+# loss of evidence, and evidence lost is not recoverable later. The v1 marker is
+# still read as a fallback in the same pass, so nothing that works today stops
+# working. DEVPILOT_REVIEWER_GENERALIST_CONTRACT=v1 turns it off for a run,
+# which is a diagnostic escape hatch and not a supported configuration.
+$script:ReviewerGeneralistContractV2 = ($env:DEVPILOT_REVIEWER_GENERALIST_CONTRACT -cne 'v1')
+# One identity for this process's whole run, minted once. It goes inside the
+# sealed bytes of every v2 response envelope, which is what makes an envelope
+# from another run fail to verify against this one rather than merely look out
+# of place.
+$script:ReviewerRunId = [guid]::NewGuid().ToString('N')
+# Attempt ordinals per (pr, cycle, pass), so a persisted envelope is named by
+# WHICH attempt it was rather than by the nonce that attempt happened to draw.
+$script:ReviewerResponseEnvelopeOrdinals = @{}
 # One retry, in a fresh session with a fresh nonce, and only when the pass ran
 # cleanly but its final line was not a usable marker. A ~4 KB single-line JSON
 # object is emitted by hand, and one stray bracket loses the whole review even
@@ -3511,6 +3540,44 @@ $lockPath = Join-Path $StateDir "agent.lock"
 $reviewedStatePath = Join-Path $StateDir "reviewed.json"
 $attemptsStatePath = Join-Path $StateDir "attempts.json"
 $artifactKeyPath = Join-Path $StateDir "artifact-signing.key"
+# Startup self-check on the key that seals every v2 response envelope. It runs
+# HERE, before any pass, because discovering at signing time that the key sits
+# somewhere the sealed material can reach means a run has already happened under
+# a key that proves nothing. The forbidden roots are the repository (a key there
+# would ship in a clone), the artifact output tree (whoever can rewrite an
+# artifact could re-sign it), and every root the model can read.
+#
+# A state directory nested inside a readable root is legitimate and common
+# (replay checkouts, temp harness trees), so the answer there is NOT to abort the
+# run: it is to keep the v2 run key out of that root entirely. The key is then
+# minted under a per-user root that no reviewed material can reach, and the
+# relocation is recorded so an envelope never silently claims a stronger key
+# provenance than it has. Only a relocation target that is ITSELF unsafe aborts.
+$script:ReviewerResponseRunKeyPath = $artifactKeyPath
+$script:ReviewerResponseRunKeyOrigin = 'stateDirectory'
+if ($script:ReviewerGeneralistContractV2) {
+    $modelReadableRoots = [string[]]@($RepoPath, $logDir) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $keyCheck = $null
+    try {
+        $keyCheck = Assert-ReviewerResponseRunKeyPath -KeyPath $artifactKeyPath -RepoRoot $RepoPath `
+            -ArtifactRoot $logDir -ModelReadableRoots $modelReadableRoots
+    }
+    catch {
+        $keyCheck = $null
+        $relocatedRoot = Get-ReviewerResponseRunKeyFallbackRoot
+        $stateTag = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                $script:ReviewerUtf8.GetBytes($StateDir.ToLowerInvariant()))).Substring(0, 24).ToLowerInvariant()
+        New-Item -ItemType Directory -Force -Path $relocatedRoot | Out-Null
+        $relocatedKey = Join-Path $relocatedRoot ("reviewer-response-$stateTag.key")
+        [void](Assert-ReviewerResponseRunKeyPath -KeyPath $relocatedKey -RepoRoot $RepoPath `
+                -ArtifactRoot $logDir -ModelReadableRoots $modelReadableRoots)
+        $script:ReviewerResponseRunKeyPath = $relocatedKey
+        $script:ReviewerResponseRunKeyOrigin = 'relocated'
+    }
+    if ($null -eq $keyCheck -and $script:ReviewerResponseRunKeyOrigin -cne 'relocated') {
+        throw 'The v2 response run key could not be placed outside every readable root.'
+    }
+}
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 $ConfigSha256 = (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash
@@ -4641,6 +4708,21 @@ function Get-ReviewerRuntimeContext {
     $lines.Add(($runtimeData | ConvertTo-Json -Depth 4 -Compress))
     $lines.Add('```')
     $lines.Add("")
+    if ($script:ReviewerGeneralistContractV2) {
+        # The authoritative contract for this pass. The v1 scaffold above stays
+        # as a prompt aid - it is the shape most of the surrounding prose still
+        # describes - but the wrapper reads the v2 nonce line and payload, and
+        # takes no wrapper-owned field from anything the model emits.
+        $lines.Add("## Result contract (version 2 - this is what the wrapper reads)")
+        $lines.Add("")
+        $lines.Add((Get-ReviewerResponseContractTextV2 -Nonce $Nonce -SourceCommit $SourceCommit `
+                    -MaxFindings $EffectiveMaxFindings))
+        $lines.Add("")
+        $lines.Add("The scaffold above remains a convenient shape to think in, but its wrapper-owned fields - PR id, " +
+            "repository, project - are read from the wrapper's own state and never from you. Emitting the v1 marker " +
+            "as well is harmless; emitting the v2 nonce line and payload is what counts.")
+        $lines.Add("")
+    }
     $lines.Add("Maximum findings you may report: ``$EffectiveMaxFindings``. Severities this repository posts: $((@($PostSeverities) -join ', ')). Findings at other severities still belong in your marker - the wrapper decides what to post.")
     $lines.Add("")
     $lines.Add("You have NO write tools this cycle, and never will: you do not post comments and you do not vote. Report findings in the marker; the wrapper performs any write. Do not attempt a write and do not treat its absence as an error.")
@@ -5488,7 +5570,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 48
+    $total = 50
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -8884,6 +8966,162 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("A census with neither a pull request nor a target ref was composed instead of refused.")
     }
     else { Write-Host "  OK - a request bounded by neither a pull request nor a target ref is refused" -ForegroundColor Green }
+
+    Write-Host "[DRY-RUN] Self-check 49/$total : the v2 generalist response contract separates the nonce challenge from the payload, and an absent nonce is evidence that cannot vote" -ForegroundColor Cyan
+    # The whole reason v2 exists is that a complete review used to be discarded
+    # for a missing trailing nonce. These run the real extractor over real
+    # transcript text so the tier boundaries are proven by this agent, in this
+    # process, and not only by an out-of-band test tool.
+    $sc49Nonce = '0123456789abcdef0123456789abcdef0123'
+    $sc49Commit = 'a' * 40
+    $sc49Payload = ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{
+            schemaVersion        = 2
+            reviewedSourceCommit = $sc49Commit
+            findings             = @([ordered]@{
+                    severity = 'important'; filePath = '/src/a.ps1'; line = 12; comment = 'Bounded.'
+                })
+            recommendedVote      = 'waitForAuthor'
+            summary              = 'One important finding.'
+        })
+    # The model id is the one this run would actually use. Writing a version down
+    # here would make a registry edit leave a stale literal behind in the wrapper.
+    $sc49Model = [string]$Model
+    $sc49Transcript = {
+        param([string]$Text)
+        return (ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{
+                    type = 'assistant.message'
+                    data = [ordered]@{ model = $sc49Model; content = $Text }
+                }))
+    }.GetNewClosure()
+    $sc49Full = & $sc49Transcript ("$script:ReviewerResponseNoncePrefixV2 $sc49Nonce`n" +
+        "$script:ReviewerResponsePayloadPrefixV2 $sc49Payload")
+    $sc49Authenticated = Get-ReviewerModelResponseV2 -StdOutText $sc49Full `
+        -ExpectedNonce $sc49Nonce -ExpectedSourceCommit $sc49Commit
+    if ([string]$sc49Authenticated.AuthTier -cne 'authenticated' -or
+        -not (Test-ReviewerModelResponseEligible -AuthTier ([string]$sc49Authenticated.AuthTier))) {
+        $failures.Add("A generalist answer carrying the exact nonce challenge and payload was not authenticated.")
+    }
+    else { Write-Host "  OK - the exact nonce line plus a valid payload authenticates and may vote" -ForegroundColor Green }
+
+    # The exact reported failure: everything correct except the challenge line.
+    $sc49NoNonce = Get-ReviewerModelResponseV2 -StdOutText (& $sc49Transcript "$script:ReviewerResponsePayloadPrefixV2 $sc49Payload") `
+        -ExpectedNonce $sc49Nonce -ExpectedSourceCommit $sc49Commit
+    if ([string]$sc49NoNonce.AuthTier -cne 'evidenceOnly' -or
+        $null -eq $sc49NoNonce.Payload -or
+        (Test-ReviewerModelResponseEligible -AuthTier ([string]$sc49NoNonce.AuthTier))) {
+        $failures.Add("A complete payload with no nonce line was not kept as non-voting evidence.")
+    }
+    else { Write-Host "  OK - an omitted nonce keeps the evidence and withholds the vote" -ForegroundColor Green }
+
+    # A wrong nonce is not a lesser missing nonce: there is no downgrade path.
+    $sc49Wrong = Get-ReviewerModelResponseV2 -StdOutText (& $sc49Transcript (
+            "$script:ReviewerResponseNoncePrefixV2 $('b' * 36)`n$script:ReviewerResponsePayloadPrefixV2 $sc49Payload")) `
+        -ExpectedNonce $sc49Nonce -ExpectedSourceCommit $sc49Commit
+    if ([string]$sc49Wrong.AuthTier -ceq 'evidenceOnly' -or [string]$sc49Wrong.AuthTier -ceq 'authenticated' -or
+        [bool]$sc49Wrong.Retryable) {
+        $failures.Add("A wrong nonce was downgraded to evidence or made retryable instead of being terminal.")
+    }
+    else { Write-Host "  OK - a wrong nonce is terminal and never downgrades to evidence" -ForegroundColor Green }
+
+    # Two different answers in one attempt is a compromise indicator, not a slip.
+    $sc49Conflict = Get-ReviewerModelResponseV2 -StdOutText ((& $sc49Transcript (
+                "$script:ReviewerResponseNoncePrefixV2 $sc49Nonce`n$script:ReviewerResponsePayloadPrefixV2 $sc49Payload")) +
+        "`n" + (& $sc49Transcript ("$script:ReviewerResponsePayloadPrefixV2 " + ($sc49Payload -creplace 'waitForAuthor', 'approve')))) `
+        -ExpectedNonce $sc49Nonce -ExpectedSourceCommit $sc49Commit
+    if ([string]$sc49Conflict.AuthTier -ceq 'authenticated' -or [bool]$sc49Conflict.Retryable) {
+        $failures.Add("Two conflicting payloads in one attempt were not treated as a terminal conflict.")
+    }
+    else { Write-Host "  OK - conflicting payloads in one attempt are terminal" -ForegroundColor Green }
+
+    # Approval alongside a critical or important finding is refused from the
+    # wrapper's own counts, never from anything the model asserts about itself.
+    $sc49Vote = Get-ReviewerModelResponseV2 -StdOutText (& $sc49Transcript (
+            "$script:ReviewerResponseNoncePrefixV2 $sc49Nonce`n$script:ReviewerResponsePayloadPrefixV2 " +
+            ($sc49Payload -creplace 'waitForAuthor', 'approve'))) `
+        -ExpectedNonce $sc49Nonce -ExpectedSourceCommit $sc49Commit
+    if ([string]$sc49Vote.AuthTier -ceq 'authenticated') {
+        $failures.Add("An approval carrying an important finding was accepted as an authenticated vote.")
+    }
+    else { Write-Host "  OK - approval with an important finding is refused on wrapper-derived counts" -ForegroundColor Green }
+
+    # A payload bound to a commit this run never sent cannot authenticate, so a
+    # replayed answer from another commit cannot vote here.
+    $sc49OtherCommit = Get-ReviewerModelResponseV2 -StdOutText $sc49Full `
+        -ExpectedNonce $sc49Nonce -ExpectedSourceCommit ('c' * 40)
+    if ([string]$sc49OtherCommit.AuthTier -ceq 'authenticated') {
+        $failures.Add("A payload bound to another source commit authenticated against this run.")
+    }
+    else { Write-Host "  OK - a payload bound to another commit cannot authenticate here" -ForegroundColor Green }
+
+    Write-Host "[DRY-RUN] Self-check 50/$total : a v2 review that reaches the vote must also fit the v1 marker schema, and the two contracts must agree" -ForegroundColor Cyan
+    # Everything an authenticated v2 attempt produces is rebuilt into the
+    # internal v1-shaped marker that the rest of the cycle - including the merged
+    # round trip at the end - validates. Two ways that can go wrong, both silent
+    # and both expensive: content v2 accepts and v1 refuses (the whole cycle is
+    # lost several stages later), and a v1 marker that disagrees with the sealed
+    # v2 envelope (one review delivered, a different one attested).
+    $sc50RepositoryId = [Guid]::NewGuid().ToString()
+    $sc50Marker = ConvertTo-ReviewerBoundMarkerFromEnvelope -Extraction $sc49Authenticated `
+        -Nonce $sc49Nonce -PrId 4242 -RepositoryId $sc50RepositoryId `
+        -Project $ExpectedProject -SourceCommit $sc49Commit
+    $sc50Schema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $sc49Nonce `
+        -MaxFindingItems $EffectiveMaxFindings
+    $sc50RoundTrip = ConvertFrom-AgentResultMarkerOutcome `
+        -StdOutText ("$ResultMarkerPrefix " + (ConvertTo-Json -InputObject $sc50Marker -Depth 12 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $sc50Schema -ScanWindowChars 262144
+    if ([string]$sc50RoundTrip.Status -cne 'success') {
+        $failures.Add("A marker rebuilt from an authenticated v2 payload did not validate under the v1 schema ($($sc50RoundTrip.Status)).")
+    }
+    else { Write-Host "  OK - a rebuilt v2 marker validates under the v1 schema the rest of the cycle uses" -ForegroundColor Green }
+
+    # The bound the model is TOLD and the bound the parser ENFORCES have to be
+    # the same number, or a model is refused for obeying its instructions.
+    $sc50Findings = [object[]]@(1..$EffectiveMaxFindings | ForEach-Object {
+            [ordered]@{ severity = 'suggestion'; filePath = '/src/a.ps1'; line = $_; comment = "Finding $_." } })
+    $sc50Full = ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{
+            schemaVersion        = 2
+            reviewedSourceCommit = $sc49Commit
+            findings             = $sc50Findings
+            recommendedVote      = 'approveWithSuggestions'
+            summary              = 'Suggestions only.'
+        })
+    $sc50AtCap = Get-ReviewerModelResponseV2 -StdOutText (& $sc49Transcript (
+            "$script:ReviewerResponseNoncePrefixV2 $sc49Nonce`n$script:ReviewerResponsePayloadPrefixV2 $sc50Full")) `
+        -ExpectedNonce $sc49Nonce -ExpectedSourceCommit $sc49Commit -MaxFindingItems $EffectiveMaxFindings
+    if ([string]$sc50AtCap.AuthTier -cne 'authenticated' -or @($sc50AtCap.Findings).Count -ne $EffectiveMaxFindings) {
+        $failures.Add("A payload reporting exactly the promised $EffectiveMaxFindings finding(s) was refused by the parser.")
+    }
+    else { Write-Host "  OK - the parser enforces exactly the finding bound the prompt promised" -ForegroundColor Green }
+
+    # Content v1 refuses must be caught HERE, where it is one retryable attempt.
+    $sc50LongComment = ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{
+            schemaVersion        = 2
+            reviewedSourceCommit = $sc49Commit
+            findings             = @([ordered]@{
+                    severity = 'suggestion'; filePath = '/src/a.ps1'; line = 3; comment = ('x' * 1201)
+                })
+            recommendedVote      = 'approveWithSuggestions'
+            summary              = 'Long.'
+        })
+    $sc50TooLong = Get-ReviewerModelResponseV2 -StdOutText (& $sc49Transcript (
+            "$script:ReviewerResponseNoncePrefixV2 $sc49Nonce`n$script:ReviewerResponsePayloadPrefixV2 $sc50LongComment")) `
+        -ExpectedNonce $sc49Nonce -ExpectedSourceCommit $sc49Commit
+    if ([string]$sc50TooLong.AuthTier -ceq 'authenticated' -or -not [bool]$sc50TooLong.Retryable) {
+        $failures.Add("A finding comment too long for the v1 marker was accepted, or was refused without a retry.")
+    }
+    else { Write-Host "  OK - content the v1 marker would refuse is a retryable slip, not a lost cycle" -ForegroundColor Green }
+
+    # Two contracts, one attempt: if they disagree there is no safe winner.
+    $sc50OtherSummary = Get-ReviewerModelResponseV2 -StdOutText (& $sc49Transcript (
+            "$script:ReviewerResponseNoncePrefixV2 $sc49Nonce`n$script:ReviewerResponsePayloadPrefixV2 " +
+            ($sc49Payload -creplace 'One important finding\.', 'A different review entirely.'))) `
+        -ExpectedNonce $sc49Nonce -ExpectedSourceCommit $sc49Commit
+    $sc50Agree = Test-ReviewerMarkerMatchesResponsePayload -Marker $sc50Marker -Extraction $sc49Authenticated
+    $sc50Disagree = Test-ReviewerMarkerMatchesResponsePayload -Marker $sc50Marker -Extraction $sc50OtherSummary
+    if (-not [bool]$sc50Agree.Match -or [bool]$sc50Disagree.Match) {
+        $failures.Add("The v1/v2 agreement check did not separate an identical review from a divergent one.")
+    }
+    else { Write-Host "  OK - a v1 marker that disagrees with the sealed v2 payload is detected" -ForegroundColor Green }
 
     Write-Host ""
     if ($failures.Count -eq 0) {
@@ -12517,6 +12755,231 @@ function Invoke-ReviewerDelivery {
     return $outcome
 }
 
+function ConvertTo-ReviewerBoundMarkerFromEnvelope {
+    <#
+        Rebuilds the internal v1-shaped marker from an AUTHENTICATED v2 attempt.
+
+        Only the findings, the vote and the summary come from the model. Every
+        binding - prId, repositoryId, project, reviewedSourceCommit, nonce - is
+        written from the wrapper's own arguments. That is the whole point of the
+        v2 payload being closed: there is no path by which a model-supplied
+        field can reach a binding, so this conversion cannot launder one.
+
+        Called only for the authenticated tier. An evidenceOnly attempt has no
+        marker by design; giving it one here would hand it a vote through the
+        back door.
+    #>
+    param(
+        [Parameter(Mandatory)]$Extraction,
+        [Parameter(Mandatory)][string]$Nonce,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$RepositoryId,
+        [Parameter(Mandatory)][string]$Project,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    if ([string]$Extraction.AuthTier -cne 'authenticated') {
+        throw ("Refusing to build a bound marker from a '$($Extraction.AuthTier)' attempt: only an authenticated " +
+            'attempt may become a vote.')
+    }
+    if ($null -eq $Extraction.Payload) { throw 'Refusing to build a bound marker from an attempt with no payload.' }
+    $findings = [object[]]@($Extraction.Findings)
+    $rebuilt = [System.Collections.Generic.List[object]]::new()
+    foreach ($finding in $findings) {
+        [void]$rebuilt.Add([pscustomobject][ordered]@{
+                severity = [string]$finding.severity
+                filePath = [string]$finding.filePath
+                line     = [int]$finding.line
+                comment  = [string]$finding.comment
+            })
+    }
+    # A [hashtable], not a [pscustomobject]: the v1 parser hands downstream a
+    # hashtable, and every consumer - including the [hashtable]-typed binding
+    # check - indexes it by key. A rebuilt marker has to be the same kind of
+    # thing as a parsed one or it is not a drop-in at all.
+    return @{
+        schemaVersion        = 1
+        prId                 = [int]$PrId
+        repositoryId         = [string]$RepositoryId
+        project              = [string]$Project
+        reviewedSourceCommit = [string]$SourceCommit
+        findings             = [object[]]@($rebuilt.ToArray())
+        recommendedVote      = [string]$Extraction.Payload.recommendedVote
+        summary              = [string]$Extraction.Payload.summary
+        nonce                = [string]$Nonce
+    }
+}
+
+function Test-ReviewerMarkerMatchesResponsePayload {
+    <#
+        Whether a v1 marker and an authenticated v2 payload describe the SAME
+        review: same vote, same summary, same findings in the same order.
+
+        Bindings are deliberately not compared - both sides are already bound to
+        this pass by their own checks, and re-comparing them here would report a
+        binding failure as a content disagreement.
+
+        Returns @{ Match; Reason; Field }.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Marker,
+        [Parameter(Mandatory)]$Extraction
+    )
+    $payload = $Extraction.Payload
+    if ($null -eq $payload) { return @{ Match = $false; Reason = 'the v2 attempt carried no payload'; Field = 'payload' } }
+    $markerVote = [string](Get-ReviewerHashValue -Container $Marker -Key 'recommendedVote' -Default '')
+    if ($markerVote -cne [string]$payload.recommendedVote) {
+        return @{ Match = $false
+            Reason = "the v1 marker recommends '$markerVote' and the v2 payload recommends '$([string]$payload.recommendedVote)'"
+            Field  = 'recommendedVote' }
+    }
+    $markerSummary = [string](Get-ReviewerHashValue -Container $Marker -Key 'summary' -Default '')
+    if ($markerSummary -cne [string]$payload.summary) {
+        return @{ Match = $false; Reason = 'the v1 marker summary and the v2 payload summary differ'; Field = 'summary' }
+    }
+    $markerFindings = [object[]]@(Get-ReviewerHashValue -Container $Marker -Key 'findings' -Default @())
+    $payloadFindings = [object[]]@($Extraction.Findings)
+    if ($markerFindings.Count -ne $payloadFindings.Count) {
+        return @{ Match = $false
+            Reason = "the v1 marker reports $($markerFindings.Count) finding(s) and the v2 payload reports $($payloadFindings.Count)"
+            Field  = 'findings' }
+    }
+    for ($i = 0; $i -lt $markerFindings.Count; $i++) {
+        $a = $markerFindings[$i]
+        $b = $payloadFindings[$i]
+        foreach ($key in @('severity', 'filePath', 'comment')) {
+            if ([string]$a.$key -cne [string]$b.$key) {
+                return @{ Match = $false; Reason = "finding $i differs in '$key'"; Field = "findings[$i].$key" }
+            }
+        }
+        if ([int]$a.line -ne [int]$b.line) {
+            return @{ Match = $false; Reason = "finding $i differs in 'line'"; Field = "findings[$i].line" }
+        }
+    }
+    return @{ Match = $true; Reason = ''; Field = '' }
+}
+
+function Add-ReviewerBoundMarkerProvenance {
+    <#
+        Stamps a rebuilt marker with the contract and tier it came from.
+
+        Applied only AFTER the v1 shape check, which validates the closed key set
+        v1 defines. A marker that came from a v2 payload should never be
+        indistinguishable from one a model emitted in v1 form: the accounting and
+        any later reader can see which contract produced this review.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Marker,
+        [Parameter(Mandatory)][string]$SourceContract,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$AuthTier
+    )
+    $Marker['sourceContract'] = $SourceContract
+    $Marker['authTier'] = $AuthTier
+}
+
+function New-ReviewerResponsePassEnvelope {
+    <#
+        Builds and seals the `reviewer-result-envelope.v2` record for one
+        generalist pass.
+
+        Sealed for every tier, including the tiers that produced nothing usable.
+        An attempt whose refusal leaves no record is exactly how a complete
+        review became silence in the first place; the envelope is the artifact
+        that makes the census complete regardless of how the attempt ended.
+    #>
+    param(
+        [Parameter(Mandatory)]$Extraction,
+        [Parameter(Mandatory)][string]$Nonce,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][hashtable]$Bound,
+        [Parameter(Mandatory)][int]$CycleNumber,
+        [Parameter(Mandatory)][int]$PassNumber,
+        [Parameter(Mandatory)][string]$PassModel,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Stdin,
+        [Parameter(Mandatory)]$Run,
+        [AllowNull()]$CliOutcome,
+        [int]$MaxFindingItems = $script:ReviewerResponseMaxFindingItemsV2,
+        [Parameter(Mandatory)][datetime]$StartedAtUtc,
+        [Parameter(Mandatory)][datetime]$CompletedAtUtc
+    )
+    $stdOutText = [string]$Run.StdOut
+    $stdErrText = [string]$Run.StdErr
+    $finalAssistantText = $stdOutText
+    $reportedModel = $null
+    if ($null -ne $CliOutcome) {
+        if ($CliOutcome.Answer) { $finalAssistantText = [string]$CliOutcome.Answer }
+        if ($CliOutcome.Model) { $reportedModel = [string]$CliOutcome.Model }
+    }
+    $configText = ''
+    if (Test-Path -LiteralPath $ConfigFile) { $configText = (Get-Content -LiteralPath $ConfigFile -Raw) }
+    # The wrapper already hashed itself once at startup. Re-reading an
+    # 18k-line script on every pass to recompute the same digest would be
+    # waste, and $PSCommandPath is a per-scope automatic that does not survive
+    # into a harness that lifts this function out of the file.
+    $scriptSha256 = ([string]$ScriptSelfSha256).ToLowerInvariant()
+    $promptText = (Get-Content -LiteralPath $PromptFile -Raw)
+    $snapshotText = ''
+    if ($script:ReviewerReplayActive -and $script:ReviewerReplaySnapshot) {
+        $snapshotText = [string]$script:ReviewerReplaySnapshot.SnapshotId
+    }
+    $runKeyOrigin = [string](Get-Variable -Name 'ReviewerResponseRunKeyOrigin' -Scope Script -ValueOnly `
+            -ErrorAction SilentlyContinue)
+    if ([string]::IsNullOrWhiteSpace($runKeyOrigin)) { $runKeyOrigin = 'stateDirectory' }
+    $envelope = New-ReviewerModelResponseEnvelopeV2 -Extraction $Extraction `
+        -RunId ([string]$script:ReviewerRunId) `
+        -MaxFindingItems $MaxFindingItems `
+        -AttemptId ("pr$PrId-cycle$CycleNumber-pass$PassNumber-$Nonce") `
+        -AttemptIndex $PassNumber -Nonce $Nonce `
+        -Binding @{
+            organization    = [string]$Organization
+            project         = [string]$ExpectedProject
+            repositoryId    = [string]$cfgRepoId
+            repositoryName  = [string]$RepositoryName
+            prId            = [int]$PrId
+            sourceCommit    = [string]$SourceCommit
+            sourceBranch    = [string]$Bound.SourceBranch
+            targetBranch    = [string]$TargetRefName
+            changeSetDigest = (Get-ReviewerResponseTextSha256 -Text ([string]$Bound.DigestText))
+        } `
+        -Model @{ requested = [string]$PassModel; reported = $reportedModel } `
+        -Hashes @{
+            prompt         = (Get-ReviewerResponseTextSha256 -Text $promptText)
+            input          = (Get-ReviewerResponseTextSha256 -Text $Stdin)
+            config         = (Get-ReviewerResponseTextSha256 -Text $configText)
+            script         = $scriptSha256
+            snapshot       = (Get-ReviewerResponseTextSha256 -Text $snapshotText)
+            finalAssistant = (Get-ReviewerResponseTextSha256 -Text $finalAssistantText)
+            rawStdOut      = (Get-ReviewerResponseTextSha256 -Text $stdOutText)
+            stdErr         = (Get-ReviewerResponseTextSha256 -Text $stdErrText)
+        } `
+        -Process @{
+            exitCode    = $Run.ExitCode
+            timedOut    = [bool]$Run.TimedOut
+            stdOutBytes = $script:ReviewerUtf8.GetByteCount($stdOutText)
+            stdErrBytes = $script:ReviewerUtf8.GetByteCount($stdErrText)
+        } `
+        -Timings @{
+            startedAtUtc   = $StartedAtUtc.ToString('o')
+            completedAtUtc = $CompletedAtUtc.ToString('o')
+            durationMs     = [int][Math]::Round(($CompletedAtUtc - $StartedAtUtc).TotalMilliseconds)
+        } `
+        -Session @{
+            sessionId  = [string]$script:ReviewerRunId
+            processId  = $PID
+            host       = [string][System.Environment]::MachineName
+            runKeyOrigin = [string]$runKeyOrigin
+        }
+    # The run key path is resolved at startup (and relocated there if the state
+    # directory sits inside a readable root). Read it defensively so a harness
+    # that lifts this function out of the script still seals with the state
+    # directory key rather than failing to produce evidence at all.
+    $runKeyPath = [string](Get-Variable -Name 'ReviewerResponseRunKeyPath' -Scope Script -ValueOnly `
+            -ErrorAction SilentlyContinue)
+    if ([string]::IsNullOrWhiteSpace($runKeyPath)) { $runKeyPath = $artifactKeyPath }
+    $runKey = Get-ReviewerRunArtifactKey -KeyPath $runKeyPath
+    return Protect-ReviewerModelResponseEnvelope -Envelope $envelope -RunKey $runKey
+}
+
 function Invoke-ReviewerModelPass {
     <#
         ONE model run over one bound pull request: build the payload, launch,
@@ -12583,7 +13046,8 @@ function Invoke-ReviewerModelPass {
         # launched here: the input was refused for size before the subprocess, so
         # this attempt spent no model start and must not be counted as one.
         return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false
-            RejectionClass = 'oversize'; Nonce = $nonce; ModelRan = $false; ProcessStarted = $false; Usage = $null }
+            RejectionClass = 'oversize'; Nonce = $nonce; ModelRan = $false; ProcessStarted = $false; Usage = $null
+            ResponseEnvelope = $null; AuthTier = $null }
     }
 
     # -- Launch the model -----------------------------------------------------
@@ -12620,12 +13084,14 @@ function Invoke-ReviewerModelPass {
     else {
         "compatibility-generalist"
     }
+    $passStartedAtUtc = [datetime]::UtcNow
     $run = Invoke-ReviewerModelSubprocess -AgencyPath $AgencyPath -AgencyArguments $agencyArgs `
         -StandardInputContent $stdin -Role $generalistRole -CensusRole 'generalist' -Model $PassModel `
         -Binding @{
             nonce = $nonce; prId = $prId; repositoryId = $cfgRepoId; project = $ExpectedProject
             reviewedSourceCommit = $sourceCommit
         } -TimeoutSeconds $CycleTimeoutSeconds
+    $passCompletedAtUtc = [datetime]::UtcNow
 
     # -- Marker validation (hostile input) ------------------------------------
     $markerSource = [string]$run.StdOut
@@ -12663,6 +13129,115 @@ function Invoke-ReviewerModelPass {
         $markerField = [string]$markerOutcome.Field
         if ($markerStatus -ceq 'success') { $marker = $markerOutcome.Value }
     }
+
+    # -- v2 response contract -------------------------------------------------
+    # Read from the RAW stdout, not from the flattened answer: the v2 extractor
+    # walks the ordered assistant events itself so it can tell a model-emitted
+    # nonce from one echoed back by a tool result, which a flattened answer has
+    # already lost. The v1 read above is left exactly as it was, so a pass that
+    # succeeds today succeeds identically.
+    $responseEnvelope = $null
+    $responseExtraction = $null
+    $responseTier = $null
+    $responsePersisted = $false
+    if ($script:ReviewerGeneralistContractV2 -and $run.ExitCode -eq 0 -and -not $run.TimedOut) {
+        try {
+            # The SAME finding cap the prompt promised the model. A parser that
+            # enforces a smaller number than the contract text stated would
+            # terminally refuse a model for obeying its instructions.
+            $responseExtraction = Get-ReviewerModelResponseV2 -StdOutText ([string]$run.StdOut) `
+                -ExpectedNonce $nonce -ExpectedSourceCommit $sourceCommit `
+                -MaxFindingItems $EffectiveMaxFindings
+            $responseTier = [string]$responseExtraction.AuthTier
+            $responseEnvelope = New-ReviewerResponsePassEnvelope -Extraction $responseExtraction `
+                -Nonce $nonce -PrId $prId -SourceCommit $sourceCommit -Bound $Bound `
+                -CycleNumber $CycleNumber -PassNumber $PassNumber -PassModel $PassModel `
+                -Stdin $stdin -Run $run -CliOutcome $cliOutcome -MaxFindingItems $EffectiveMaxFindings `
+                -StartedAtUtc $passStartedAtUtc -CompletedAtUtc $passCompletedAtUtc
+            # Persisted for every tier. The census entry that says "this reviewer
+            # answered and could not vote" is only worth anything if the sealed
+            # record behind it survives the process that produced it.
+            try {
+                $envelopeDir = Join-Path $logDir 'response-envelopes'
+                New-Item -ItemType Directory -Force -Path $envelopeDir | Out-Null
+                # The leaf name carries the attempt ordinal, not the nonce. A nonce
+                # in the name would make the artifact tree of two identical runs
+                # differ by name alone, which is noise an exact-path comparison
+                # cannot tell apart from a real divergence.
+                $envelopeKey = "pr{0}-cycle{1}-pass{2}" -f $prId, $CycleNumber, $PassNumber
+                if (-not $script:ReviewerResponseEnvelopeOrdinals.ContainsKey($envelopeKey)) {
+                    $script:ReviewerResponseEnvelopeOrdinals[$envelopeKey] = 0
+                }
+                $script:ReviewerResponseEnvelopeOrdinals[$envelopeKey] =
+                    [int]$script:ReviewerResponseEnvelopeOrdinals[$envelopeKey] + 1
+                $envelopePath = Join-Path $envelopeDir ("{0}-attempt{1}.json" -f $envelopeKey,
+                    [int]$script:ReviewerResponseEnvelopeOrdinals[$envelopeKey])
+                ConvertTo-Json -InputObject $responseEnvelope -Depth 64 -Compress |
+                    Set-Content -LiteralPath $envelopePath -Encoding utf8NoBOM
+                $responsePersisted = $true
+            }
+            catch { Write-Warning "The sealed v2 response envelope could not be written: $($_.Exception.Message)" }
+        }
+        catch {
+            # A wrapper-side failure to READ the response must not be reported as
+            # the model failing to answer. It is recorded and the v1 read stands.
+            Write-Warning "The v2 response contract could not be applied to this pass: $($_.Exception.Message)"
+            $responseExtraction = $null
+            $responseEnvelope = $null
+            $responseTier = $null
+            $responsePersisted = $false
+        }
+    }
+    if ($null -ne $marker -and $null -ne $responseExtraction -and $responseTier -ceq 'authenticated') {
+        # Both contracts spoke. They must say the same thing: the v1 marker is
+        # what votes and posts, the v2 envelope is what is sealed and audited,
+        # and if those two disagree the run would deliver one review while
+        # attesting to another. There is no safe way to pick a winner, so the
+        # attempt is refused - terminally, because a transcript that already
+        # contains both answers cannot be improved by asking again.
+        $agreement = Test-ReviewerMarkerMatchesResponsePayload -Marker $marker -Extraction $responseExtraction
+        if (-not $agreement.Match) {
+            Write-Warning ("The v1 marker and the authenticated v2 payload disagree ($($agreement.Reason)); " +
+                'refusing the attempt rather than delivering one review and sealing another.')
+            $marker = $null
+            $markerStatus = 'contractDisagreement'
+            $markerField = [string]$agreement.Field
+        }
+    }
+    if ($null -eq $marker -and $null -ne $responseExtraction -and
+        $responseTier -ceq 'authenticated' -and $markerStatus -cne 'contractDisagreement') {
+        # An authenticated v2 attempt IS a usable review. The internal marker is
+        # rebuilt from wrapper state plus the model-owned payload - never by
+        # re-serializing the model's text and re-parsing it, which would hand
+        # the model a second chance to supply a binding.
+        $marker = ConvertTo-ReviewerBoundMarkerFromEnvelope -Extraction $responseExtraction `
+            -Nonce $nonce -PrId $prId -RepositoryId $cfgRepoId -Project $ExpectedProject `
+            -SourceCommit $sourceCommit
+        $markerStatus = 'success'
+        $markerField = $null
+        # The rebuilt marker is re-validated against the SAME v1 schema every
+        # downstream stage uses, including the merged round trip at the end of
+        # the cycle. Only the verdict is taken from this re-parse; the marker
+        # itself stays the wrapper-built one, so the model gets no second chance
+        # to supply a binding. Without this a v2 field that v1 refuses would be
+        # accepted here and destroy the whole cycle several stages later, where
+        # the failure is neither retryable nor attributable to this pass.
+        $rebuiltCheck = ConvertFrom-AgentResultMarkerOutcome `
+            -StdOutText ("$ResultMarkerPrefix " + (ConvertTo-Json -InputObject $marker -Depth 12 -Compress)) `
+            -MarkerPrefix $ResultMarkerPrefix -Schema $markerSchema -ScanWindowChars $scanWindow
+        if ([string]$rebuiltCheck.Status -cne 'success') {
+            Write-Warning ("The authenticated v2 payload does not fit the v1 marker schema " +
+                "($($rebuiltCheck.Status), field '$($rebuiltCheck.Field)'); refusing it here rather than losing the cycle later.")
+            $marker = $null
+            $markerStatus = [string]$rebuiltCheck.Status
+            $markerField = [string]$rebuiltCheck.Field
+        }
+        else {
+            # Provenance, added only AFTER the v1 shape check so the check sees
+            # exactly the closed key set v1 defines.
+            Add-ReviewerBoundMarkerProvenance -Marker $marker -SourceContract 'v2' -AuthTier ([string]$responseTier)
+        }
+    }
     if ($marker -and -not (Test-ReviewerMarkerBinding -Marker $marker -PrId $prId -RepositoryId $cfgRepoId -SourceCommit $sourceCommit)) {
         Write-Warning "The result marker did not match the bound PR/repository/commit; discarding it."
         $marker = $null
@@ -12680,7 +13255,8 @@ function Invoke-ReviewerModelPass {
     if ($marker) {
         return @{ Model = $PassModel; Marker = $marker; Reason = ""; EnvironmentFault = $false
             RejectionClass = 'success'; Nonce = $nonce; ModelRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
-            ProcessStarted = $true; Usage = $usage }
+            ProcessStarted = $true; Usage = $usage
+            ResponseEnvelope = $responseEnvelope; AuthTier = $responseTier; EnvelopePersisted = $responsePersisted }
     }
 
     # A precise, typed reason - never a generic "invalid marker". A schema-shape
@@ -12714,6 +13290,18 @@ function Invoke-ReviewerModelPass {
     $launchFailureReason = $null
     if (-not $modelActuallyRan) { $launchFailureReason = Get-AgentLaunchFailureReason -StdErrText ([string]$run.StdErr) }
     if ($launchFailureReason) { $reason = "environment: $launchFailureReason"; $rejectionClass = 'environment' }
+    # An evidenceOnly attempt is a REVIEW, not a failure: the payload was valid
+    # and bound to this commit, and only the nonce challenge line was absent. It
+    # cannot vote and it cannot mark this pull request reviewed, but it is named
+    # for what it is, so the census records a reviewer that answered rather than
+    # a reviewer that was never heard from. Retrying would spend an attempt to
+    # obtain something already in hand, so it is terminal. Placed after the
+    # environment check on purpose: a run whose model never started is an
+    # environment fault first, whatever else was in the transcript.
+    if ($rejectionClass -cne 'environment' -and $responseTier -ceq 'evidenceOnly') {
+        $reason = 'the model answered without the nonce challenge line; kept as evidence, not eligible to vote'
+        $rejectionClass = 'evidenceOnly'
+    }
     if ($PassCount -gt 1) { $reason = "pass $PassNumber ($PassModel): $reason" }
 
     # The transcript is the only way to diagnose a silent refusal, and it
@@ -12742,7 +13330,8 @@ function Invoke-ReviewerModelPass {
 
     return @{ Model = $PassModel; Marker = $null; Reason = $reason; EnvironmentFault = [bool]$launchFailureReason
         RejectionClass = $rejectionClass; Nonce = $nonce; ModelRan = $modelActuallyRan
-        ProcessStarted = $true; Usage = $usage }
+        ProcessStarted = $true; Usage = $usage
+        ResponseEnvelope = $responseEnvelope; AuthTier = $responseTier; EnvelopePersisted = $responsePersisted }
 }
 
 # ---------------------------------------------------------------------------
@@ -14393,6 +14982,13 @@ function Invoke-ReviewerPullRequest {
                 attempt = $attempt
                 nonceSha256 = (Get-ReviewerTextSha256 -Text ([string]$passResult.Nonce))
                 rejectionClass = [string]$passResult.RejectionClass
+                # The v2 auth tier for this attempt, recorded alongside the
+                # rejection so the accounting can distinguish "answered but
+                # cannot vote" from "produced nothing". Null on a pass read
+                # under the v1 contract only.
+                authTier = [string]$passResult.AuthTier
+                responseEnvelopeSealed = ($null -ne $passResult.ResponseEnvelope)
+                responseEnvelopePersisted = [bool]$passResult.EnvelopePersisted
                 # Whether a subprocess was actually launched for this attempt.
                 # Distinct from modelRan, which says whether the CLI reported an
                 # assistant turn: a process that started and produced nothing is
@@ -14418,6 +15014,13 @@ function Invoke-ReviewerPullRequest {
             # missing/malformed/truncated/overflow/schemaInvalid/nonObject/
             # ambiguous emission slip is retryable; everything else is terminal.
             if ($attempt -ge $script:ReviewerMarkerRetryAttempts) { break }
+            # evidenceOnly is terminal for the same reason a wrong binding is:
+            # the attempt already produced everything a retry could produce. The
+            # answer is in hand; only the credential is missing, and spending a
+            # second model start to ask for it again trades a real cost for a
+            # possibility. Test-AgentMarkerStatusRetryable returns false for it
+            # by default; naming it here keeps that from being an accident.
+            if ([string]$passResult.RejectionClass -ceq 'evidenceOnly') { break }
             $retryable = (Test-AgentMarkerStatusRetryable -Status ([string]$passResult.RejectionClass))
             if ([bool]$passResult.EnvironmentFault -or -not $retryable) {
                 break
@@ -14439,6 +15042,20 @@ function Invoke-ReviewerPullRequest {
             attempts = $acctAttempts
             succeeded = ($null -ne $passResult.Marker)
             terminalRejectionClass = [string]$passResult.RejectionClass
+            # The census line for this pass. It is written for EVERY terminal
+            # outcome, including evidenceOnly, because a reviewer that answered
+            # and could not vote is a different fact from a reviewer that was
+            # never heard from, and only the first of those was recoverable
+            # before this contract existed.
+            terminalAuthTier = [string]$passResult.AuthTier
+            # Census credit requires the sealed record to have REACHED DISK. A
+            # tier held only in the memory of a process that is about to exit is
+            # not evidence anyone can audit later, and claiming the census is
+            # complete on the strength of it would be the same silent gap in a
+            # new place.
+            countsInCensus = ($null -ne $passResult.AuthTier -and [string]$passResult.AuthTier -cne 'none' -and
+                [bool]$passResult.EnvelopePersisted)
+            eligibleToVote = ([string]$passResult.AuthTier -ceq 'authenticated')
             premiumRequests = $acctPremiumRequests
             totalApiDurationMs = $acctTotalApiDurationMs
             sessionDurationMs = $acctSessionDurationMs

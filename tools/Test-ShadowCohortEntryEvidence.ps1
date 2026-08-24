@@ -1349,9 +1349,10 @@ Assert-CohortEntry -Name "no change-read vector is written outside the shared co
     -Condition (@($getChangesLiterals.Values | Where-Object { $_ -ne 0 }).Count -eq 0)
 # and the same scan finds the one in the library, so it is not passing by
 # looking for something that never existed.
+$transportChangeAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1'), [ref]$null, [ref]$null)
 $transportGetChangesLiterals = @(
-    [System.Management.Automation.Language.Parser]::ParseFile(
-        (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1'), [ref]$null, [ref]$null).FindAll({
+    $transportChangeAst.FindAll({
             param($node) $node -is [System.Management.Automation.Language.HashtableAst]
         }, $true) | Where-Object { & $getChangesActionInHashtable $_ })
 Assert-CohortEntry -Name "the change-read vector is written in the library that owns it ($($transportGetChangesLiterals.Count))" `
@@ -1408,10 +1409,14 @@ function Probe { Invoke-AgentMcpTool -Session $s -Name 'repo_pull_request' -Argu
 function Probe { param($Arguments)
     Invoke-AgentMcpTool -Session $s -Name 'repo_pull_request' -Arguments $Arguments }
 '@ })
-$guardBypassMisses = @($guardBypassCases | Where-Object {
-        @(Get-InlineMcpReads -ToolName (Get-ReviewerChangeListToolName) -ActionMatcher $getChangesActionInHashtable `
-                -Ast ([System.Management.Automation.Language.Parser]::ParseInput($_.Body, [ref]$null, [ref]$null))).Count -ne $_.Expect
-    })
+$guardBypassMisses = [System.Collections.Generic.List[object]]::new()
+foreach ($guardBypassCase in $guardBypassCases) {
+    $bypassAst = [System.Management.Automation.Language.Parser]::ParseInput(
+        [string]$guardBypassCase.Body, [ref]$null, [ref]$null)
+    $bypassHits = @(Get-InlineMcpReads -ToolName (Get-ReviewerChangeListToolName) `
+            -ActionMatcher $getChangesActionInHashtable -Ast $bypassAst)
+    if ($bypassHits.Count -ne $guardBypassCase.Expect) { [void]$guardBypassMisses.Add($guardBypassCase) }
+}
 Assert-CohortEntry -Name "the read guard answers every known bypass shape correctly ($($guardBypassCases.Count - $guardBypassMisses.Count)/$($guardBypassCases.Count)$(if ($guardBypassMisses.Count) { ': ' + (($guardBypassMisses | ForEach-Object { $_.Name }) -join '; ') }))" `
     -Condition ($guardBypassMisses.Count -eq 0)
 # The optional-field reader answers the same way over both shapes the JSON

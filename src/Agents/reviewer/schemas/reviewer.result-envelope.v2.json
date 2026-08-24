@@ -1,0 +1,445 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer.result-envelope.v2.json",
+  "title": "Reviewer model response envelope, version 2",
+  "description": "The wrapper-owned record of one generalist model attempt. Version 1 asked the model to emit a single result marker carrying both its findings and the wrapper's own bindings, including a trailing nonce; a model that omitted the nonce lost its entire pass and vanished from the verifier census. Version 2 splits that contract: the model emits a standalone nonce challenge line and a payload containing only model-owned content, and the wrapper supplies every binding itself. The envelope is closed - an unknown field is a contract violation, not forward compatibility - and is sealed under a domain-separated subkey of the out-of-repo run key, so downstream stages consume only a verified envelope.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "schemaVersion",
+    "run",
+    "nonce",
+    "binding",
+    "model",
+    "inputs",
+    "outputs",
+    "extraction",
+    "payload",
+    "derived",
+    "authTier",
+    "capabilities",
+    "process",
+    "timings",
+    "seal"
+  ],
+  "properties": {
+    "kind": {
+      "description": "Artifact kind. Dispatch is strict: a reader states the kind it expects and refuses anything else, so a v1 marker artifact is never upgraded in place.",
+      "type": "string",
+      "const": "reviewer-result-envelope.v2"
+    },
+    "schemaVersion": {
+      "description": "Version of this envelope. A build reads exactly the version it was written against; a higher version fails closed rather than being parsed optimistically.",
+      "type": "integer",
+      "const": 2
+    },
+    "run": {
+      "description": "Identity of the attempt. These fields are inside the sealed bytes, which is what defeats cross-run substitution: an envelope minted for another run cannot verify against this one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "attemptId", "attemptIndex"],
+      "properties": {
+        "runId": { "type": "string", "minLength": 1 },
+        "attemptId": { "type": "string", "minLength": 1 },
+        "attemptIndex": {
+          "description": "Ordinal of this attempt within the slot, so a retry cannot be replayed as the first attempt.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "sessionId": { "type": ["string", "null"] },
+        "processId": { "type": ["integer", "null"] },
+        "host": { "type": ["string", "null"] },
+        "runKeyOrigin": {
+          "description": "Where the key that sealed this envelope lived. 'stateDirectory' is the normal case; 'relocated' means the agent's state directory sat inside a root the reviewed material can read, so the run key was minted under a per-user root instead. Consumers comparing seals across runs must treat the two origins as different key provenances.",
+          "type": "string",
+          "enum": ["stateDirectory", "relocated"]
+        }
+      }
+    },
+    "nonce": {
+      "description": "The challenge value the wrapper issued for this attempt. Recorded from wrapper state, never from the model's output; the extractor compares the model's standalone nonce line against it and never re-injects it into a payload that lacked one.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{16,128}$"
+    },
+    "binding": {
+      "description": "What was under review, entirely from wrapper state. Nothing here may originate in the model payload, which is why the v2 payload has no PR, repository, project or hash fields at all.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "organization",
+        "project",
+        "repositoryId",
+        "repositoryName",
+        "prId",
+        "sourceCommit",
+        "sourceBranch",
+        "targetBranch",
+        "changeSetDigest"
+      ],
+      "properties": {
+        "organization": { "type": "string", "minLength": 1 },
+        "project": { "type": "string", "minLength": 1 },
+        "repositoryId": { "type": "string", "minLength": 1 },
+        "repositoryName": { "type": "string", "minLength": 1 },
+        "prId": { "type": "integer", "minimum": 1 },
+        "sourceCommit": {
+          "description": "The exact commit the attempt reviewed. The model must echo this in its payload; a mismatch is terminal, because a review of other bytes is not a review of these.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "sourceBranch": { "type": "string", "minLength": 1 },
+        "targetBranch": { "type": "string", "minLength": 1 },
+        "changeSetDigest": {
+          "description": "Digest of the change set presented to the model, so an envelope cannot be re-read against a different diff.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "model": {
+      "description": "The model that was requested and the identity the event stream claimed. The claim is recorded and classified, never substituted for the requested model.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "reported", "claimStatus"],
+      "properties": {
+        "requested": { "type": "string", "minLength": 1 },
+        "reported": {
+          "description": "Null when the CLI build emitted no model field. Absence is recorded as absence rather than backfilled from the request.",
+          "type": ["string", "null"]
+        },
+        "claimStatus": {
+          "type": "string",
+          "enum": ["match", "mismatch", "unreported"]
+        }
+      }
+    },
+    "inputs": {
+      "description": "Digests of everything fed into the attempt, so the exact conditions can be re-identified later without retaining the bytes.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["promptSha256", "inputSha256", "configSha256", "scriptSha256", "snapshotSha256"],
+      "properties": {
+        "promptSha256": { "$ref": "#/$defs/sha256OrNull" },
+        "inputSha256": { "$ref": "#/$defs/sha256OrNull" },
+        "configSha256": { "$ref": "#/$defs/sha256OrNull" },
+        "scriptSha256": { "$ref": "#/$defs/sha256OrNull" },
+        "snapshotSha256": { "$ref": "#/$defs/sha256OrNull" }
+      }
+    },
+    "outputs": {
+      "description": "Digests of everything the attempt produced. The transcript digests are recorded even for a refused attempt, because a refusal that keeps no evidence cannot be investigated.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["finalAssistantSha256", "rawStdOutSha256", "stdErrSha256", "payloadSha256"],
+      "properties": {
+        "finalAssistantSha256": { "$ref": "#/$defs/sha256OrNull" },
+        "rawStdOutSha256": { "$ref": "#/$defs/sha256OrNull" },
+        "stdErrSha256": { "$ref": "#/$defs/sha256OrNull" },
+        "payloadSha256": {
+          "description": "Digest of the canonical payload text. Null when no payload was extracted.",
+          "$ref": "#/$defs/sha256OrNull"
+        }
+      }
+    },
+    "extraction": {
+      "description": "How the payload was obtained and what the reader saw while obtaining it. Recorded in full so a later reviewer can tell a model that misbehaved from a harness that changed shape underneath it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "authorityClass",
+        "environmentClassification",
+        "reasonCode",
+        "classification",
+        "retryable",
+        "nonceOccurrenceCount",
+        "payloadOccurrenceCount",
+        "nonceObserved",
+        "eventShape"
+      ],
+      "properties": {
+        "source": {
+          "description": "assistantMessages is the only attributable source. rawStdoutFallback is used only when the stream carried no assistant events at all, and can never reach the authenticated tier.",
+          "type": "string",
+          "enum": ["assistantMessages", "rawStdoutFallback"]
+        },
+        "authorityClass": {
+          "type": "string",
+          "enum": ["full", "reduced"]
+        },
+        "environmentClassification": {
+          "description": "Set when the attempt was shaped by the environment rather than the model, for example a stream with no assistant events.",
+          "type": ["string", "null"],
+          "enum": ["noAssistantEvents", "eventShapeCanaryFailed", null]
+        },
+        "reasonCode": { "$ref": "#/$defs/reasonCode" },
+        "classification": {
+          "type": "string",
+          "enum": ["accepted", "modelSlip", "terminal", "environment"]
+        },
+        "retryable": {
+          "description": "False for every terminal outcome. Overflow, conflicts, a forged nonce, a wrong commit and a vote contradiction are never retried: repeating them would only spend another attempt on the same refusal.",
+          "type": "boolean"
+        },
+        "nonceOccurrenceCount": { "type": "integer", "minimum": 0 },
+        "payloadOccurrenceCount": { "type": "integer", "minimum": 0 },
+        "nonceObserved": {
+          "description": "Whether a standalone nonce line was present at all. False with a valid payload is precisely the evidenceOnly case this version exists to keep.",
+          "type": "boolean"
+        },
+        "eventShape": { "$ref": "#/$defs/eventShape" }
+      }
+    },
+    "payload": {
+      "description": "The validated model-owned payload, or null when none was extracted. Closed to exactly five keys; nothing wrapper-owned may appear here, and the parser never adds a nonce field to it.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/payload" }
+      ]
+    },
+    "derived": {
+      "description": "Everything the wrapper computed from the payload. Vote policy reads these counts, never a count the model stated about itself.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["findingCount", "severityCounts", "recommendedVote", "invariants"],
+      "properties": {
+        "findingCount": { "type": "integer", "minimum": 0 },
+        "severityCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["critical", "important", "suggestion"],
+          "properties": {
+            "critical": { "type": "integer", "minimum": 0 },
+            "important": { "type": "integer", "minimum": 0 },
+            "suggestion": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "recommendedVote": { "type": "string" },
+        "invariants": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "voteConsistent",
+            "commitBound",
+            "findingsWithinCap",
+            "payloadClosed",
+            "nonceNotReinjected"
+          ],
+          "properties": {
+            "voteConsistent": {
+              "description": "False when a plain approve accompanies a critical or important finding, or when the vote is the empty placeholder.",
+              "type": "boolean"
+            },
+            "commitBound": { "type": "boolean" },
+            "findingsWithinCap": { "type": "boolean" },
+            "payloadClosed": { "type": "boolean" },
+            "nonceNotReinjected": {
+              "description": "Asserts the parser did not write the expected nonce into a payload that arrived without one. Sealing is refused if this cannot be asserted.",
+              "type": "boolean",
+              "const": true
+            }
+          }
+        }
+      }
+    },
+    "authTier": {
+      "description": "authenticated: the exact nonce line, the exact reviewed commit and a valid payload; the attempt may enter normal cross-verification, reconciliation and vote policy. evidenceOnly: a valid payload whose nonce line was ABSENT - kept for diagnostics and cross-verification, counted in the census, but never a vote and never deliverable. none: the attempt produced no usable answer, or produced a wrong or conflicting nonce, which is terminal and never downgraded to a tier.",
+      "type": "string",
+      "enum": ["authenticated", "evidenceOnly", "none"]
+    },
+    "capabilities": {
+      "description": "What this attempt may do, stated once here so no downstream stage re-derives it from the tier and disagrees.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mayVote",
+        "mayMarkReviewed",
+        "mayBecomeEligible",
+        "mayReconcile",
+        "mayDeliver",
+        "mayCountInCensus"
+      ],
+      "properties": {
+        "mayVote": { "type": "boolean" },
+        "mayMarkReviewed": { "type": "boolean" },
+        "mayBecomeEligible": { "type": "boolean" },
+        "mayReconcile": { "type": "boolean" },
+        "mayDeliver": { "type": "boolean" },
+        "mayCountInCensus": {
+          "description": "True for evidenceOnly as well as authenticated. A complete review recorded as silence is the failure this version removes.",
+          "type": "boolean"
+        }
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exitCode", "timedOut", "stdOutBytes", "stdErrBytes"],
+      "properties": {
+        "exitCode": { "type": ["integer", "null"] },
+        "timedOut": { "type": "boolean" },
+        "stdOutBytes": { "type": "integer", "minimum": 0 },
+        "stdErrBytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startedAtUtc", "completedAtUtc", "durationMs"],
+      "properties": {
+        "startedAtUtc": { "type": ["string", "null"] },
+        "completedAtUtc": { "type": ["string", "null"] },
+        "durationMs": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "seal": {
+      "description": "HMAC-SHA256 over the canonical text of this envelope with the signature field emptied, under a subkey derived from the out-of-repo run key and the seal domain. The key path is checked at startup to be absolute and outside the repository, the run state directory and every model-readable root.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "domain", "keyId", "inventory", "signature"],
+      "properties": {
+        "algorithm": { "type": "string", "const": "HMACSHA256" },
+        "domain": {
+          "description": "Domain separation, so a signature over this envelope cannot be replayed as a signature over any other artifact sealed under the same run key.",
+          "type": "string",
+          "const": "devpilot.reviewer.result-envelope.v2"
+        },
+        "keyId": {
+          "description": "Non-secret identifier derived from the run key, so a verifier can tell 'wrong key' from 'tampered bytes'.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$"
+        },
+        "inventory": {
+          "description": "The external byte artifacts this envelope asserts digests for, in ordinal name order. Enumerated from a fixed name list rather than by reflecting over a section, so type internals can never be recorded as digests.",
+          "type": "array",
+          "maxItems": 9,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "sha256"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        },
+        "signature": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  },
+  "$defs": {
+    "sha256OrNull": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "reasonCode": {
+      "description": "Why the attempt ended as it did. Every code is either retryable or terminal; none is silent.",
+      "type": "string",
+      "enum": [
+        "ok",
+        "missingPayload",
+        "malformedPayload",
+        "nonObjectPayload",
+        "truncatedPayload",
+        "payloadOverflow",
+        "payloadSchemaInvalid",
+        "conflictingPayload",
+        "conflictingNonce",
+        "wrongNonce",
+        "wrongSourceCommit",
+        "voteInvariantViolated",
+        "noAssistantEvents",
+        "eventShapeCanaryFailed"
+      ]
+    },
+    "eventShape": {
+      "description": "A canary over the CLI event stream. Its purpose is to distinguish a model that answered badly from a harness whose stream shape changed, which v1 could not tell apart.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sawJsonLines",
+        "jsonLineCount",
+        "typedEventCount",
+        "unparsedJsonLineCount",
+        "assistantMessageCount",
+        "ephemeralSkippedCount",
+        "deltaEventCount",
+        "toolEventCount",
+        "resultEventCount",
+        "reportedModels",
+        "reportedModelCount",
+        "reportedPhases",
+        "phaseFieldPresent",
+        "messagesTruncatedAt"
+      ],
+      "properties": {
+        "sawJsonLines": { "type": "boolean" },
+        "jsonLineCount": { "type": "integer", "minimum": 0 },
+        "typedEventCount": {
+          "description": "JSON lines carrying a type field. Zero while JSON lines exist means this build cannot read the stream, which fails the canary as an environment condition.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "unparsedJsonLineCount": { "type": "integer", "minimum": 0 },
+        "assistantMessageCount": { "type": "integer", "minimum": 0 },
+        "ephemeralSkippedCount": { "type": "integer", "minimum": 0 },
+        "deltaEventCount": {
+          "description": "Streaming fragments, skipped deliberately: counting them would turn one answer into an apparent pair.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "toolEventCount": { "type": "integer", "minimum": 0 },
+        "resultEventCount": { "type": "integer", "minimum": 0 },
+        "reportedModels": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "reportedModelCount": { "type": "integer", "minimum": 0 },
+        "reportedPhases": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "phaseFieldPresent": {
+          "description": "False on builds that emit no phase field. Absence is recorded, not treated as a fault, so a harness upgrade does not discard completed reviews.",
+          "type": "boolean"
+        },
+        "messagesTruncatedAt": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "payload": {
+      "description": "The model-owned payload, version 2. Exactly five keys. schemaVersion discriminates the contract and reviewedSourceCommit is the first bound field, so a reader can reject a payload for other bytes before interpreting anything else in it. Key order is documented but not enforced: enforcing order was part of what made v1 brittle.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "reviewedSourceCommit", "findings", "recommendedVote", "summary"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 2 },
+        "reviewedSourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "findings": {
+          "type": "array",
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["severity", "filePath", "line", "comment"],
+            "properties": {
+              "severity": {
+                "type": "string",
+                "enum": ["critical", "important", "suggestion"]
+              },
+              "filePath": { "type": "string", "maxLength": 400 },
+              "line": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+              "comment": { "type": "string", "minLength": 1, "maxLength": 1200 }
+            }
+          }
+        },
+        "recommendedVote": {
+          "description": "The empty placeholder is refused: an attempt that reached a conclusion must state one, and an attempt that did not must not appear to have voted. 'none' is an explicit no-recommendation, which is a decision; '' is the absence of one.",
+          "type": "string",
+          "enum": ["approve", "approveWithSuggestions", "waitForAuthor", "none"]
+        },
+        "summary": { "type": "string", "maxLength": 1500 }
+      }
+    }
+  }
+}
