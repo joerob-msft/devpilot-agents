@@ -62,6 +62,21 @@
 
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot 'ModelStartCensusManifest.ps1')
+
+# How a census treats evidence it cannot authenticate. 'require' - the default,
+# and the only value a budget should ever run under - reports an unauthenticated
+# run INCOMPLETE, so the caller stops rather than budgeting against numbers
+# nobody can vouch for. 'report' publishes the same verdict without letting it
+# decide completeness, and exists so that a survey of historical runs sealed
+# before authentication existed can say how many of them are unverifiable
+# instead of failing to load at all.
+#
+# Neither mode ever lowers a count. Authentication decides whether a number may
+# be RELIED ON, never what the number is; an unverified run is blocked, not
+# cheap.
+$script:ReviewerCensusAuthenticationModes = @('require', 'report')
+
 # The three roles a reviewer run can start a model in. Fixed here so that a
 # breakdown always carries all three keys: a role that did not run must report a
 # zero it measured, never a key a reader has to guess the absence of.
@@ -346,10 +361,20 @@ function Get-ReviewerVerifierAssignmentCensus {
         The sealed argument vector, which says whether the run was authorized to
         verify at all. A run never authorized is complete with zero; a run
         authorized that left no preview is incomplete.
+
+    .PARAMETER MasterKey
+        The run's artifact signing key. Without it the previews read here are
+        believed for their shape alone, which is what this census no longer does.
+
+    .PARAMETER AuthenticationMode
+        'require' (default) reports an unauthenticated run incomplete. 'report'
+        publishes the verdict without letting it decide completeness.
     #>
     param(
         [Parameter(Mandatory)][string]$RunRoot,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv,
+        [byte[]]$MasterKey,
+        [ValidateSet('require', 'report')][string]$AuthenticationMode = 'require'
     )
     if (-not (Test-Path -LiteralPath $RunRoot -PathType Container)) {
         throw ("The run root '$RunRoot' does not exist, so the verifier assignments made under it cannot be counted. " +
@@ -539,6 +564,17 @@ function Get-ReviewerVerifierAssignmentCensus {
                 assignmentCount = [int]$byModel[$model]
             })
     }
+    # Same rule as the start census: authenticity can block, never discount. The
+    # assignment identities counted above stay exactly as counted; what an
+    # unauthenticated run loses is the right to be called a complete measurement.
+    $authenticity = Test-ReviewerModelStartCensusAuthenticity -RunRoot $RunRoot -MasterKey $MasterKey
+    if ($AuthenticationMode -ceq 'require' -and -not $authenticity.authenticated) {
+        $complete = $false
+        $authenticationDetail = (@($authenticity.objections) -join ' ')
+        $incompleteReason = (("The verification previews under this run root are not authenticated " +
+                "($([string]$authenticity.basis)), so the assignments read from them are unproven. ") + $authenticationDetail).Trim() +
+        $(if ($incompleteReason.Length -gt 0) { " $incompleteReason" } else { '' })
+    }
     return [pscustomobject][ordered]@{
         censusVersion = 1
         runRoot = [string]([IO.Path]::GetFullPath($RunRoot))
@@ -553,6 +589,10 @@ function Get-ReviewerVerifierAssignmentCensus {
         verificationAuthorized = [bool]$verificationEnabled
         verificationPreviewCount = [int]$previewCount
         verificationEvidenceLostPreviewCount = [int]$evidenceLostPreviewCount
+        authenticated = [bool]$authenticity.authenticated
+        authenticationBasis = [string]$authenticity.basis
+        authenticationMode = [string]$AuthenticationMode
+        authenticationObjections = ([string[]]@($authenticity.objections))
         basis = 'sealedVerificationPreviewAssignments'
     }
 }
@@ -603,15 +643,27 @@ function Get-ReviewerModelStartCensus {
         either 'that role was never enabled' or 'evidence this census needs is
         missing'.
 
+    .PARAMETER MasterKey
+        The run's artifact signing key. The census manifest is signed under a key
+        derived from it, so without this nothing in the run root can be
+        authenticated and the census says so rather than trusting file shapes.
+
+    .PARAMETER AuthenticationMode
+        'require' (default) reports an unauthenticated run incomplete. 'report'
+        publishes the same verdict without letting it decide completeness.
+
     .OUTPUTS
         An object carrying the total, the per-role breakdown, and an explicit
         completeness flag. 'complete' false means a role that was enabled left no
-        evidence to count; the caller must treat the census as unproven rather
+        evidence to count, or that the evidence present is not the evidence the
+        run attested to; the caller must treat the census as unproven rather
         than as the zero it would otherwise read as.
     #>
     param(
         [Parameter(Mandatory)][string]$RunRoot,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv,
+        [byte[]]$MasterKey,
+        [ValidateSet('require', 'report')][string]$AuthenticationMode = 'require'
     )
     if (-not (Test-Path -LiteralPath $RunRoot -PathType Container)) {
         throw ("The run root '$RunRoot' does not exist, so the model starts made under it cannot be counted. " +
@@ -670,6 +722,20 @@ function Get-ReviewerModelStartCensus {
     # the caller decides. Flagging it incomplete here would turn every legitimate
     # pre-launch refusal into a stop for the whole cohort that entry was part of.
 
+    # Authenticity is decided LAST and folded into completeness, never into the
+    # counts. An unauthenticated run keeps every start this census could see -
+    # blocking must never be able to make a run look cheaper than its own
+    # evidence says it was - and is reported as unproven so the caller stops.
+    $authenticity = Test-ReviewerModelStartCensusAuthenticity -RunRoot $RunRoot -MasterKey $MasterKey `
+        -Records $records -CompareRecordInventory
+    if ($AuthenticationMode -ceq 'require' -and -not $authenticity.authenticated) {
+        $complete = $false
+        $authenticationDetail = (@($authenticity.objections) -join ' ')
+        $incompleteReason = (("The accounting artifacts under this run root are not authenticated " +
+                "($([string]$authenticity.basis)), so the starts counted from them are unproven. ") + $authenticationDetail).Trim() +
+        $(if ($incompleteReason.Length -gt 0) { " $incompleteReason" } else { '' })
+    }
+
     $total = [int]$breakdown.generalist + [int]$breakdown.specialist + [int]$breakdown.verifier
     return [pscustomobject][ordered]@{
         censusVersion = 1
@@ -688,6 +754,12 @@ function Get-ReviewerModelStartCensus {
         # unmeasured gap needs to know that, and cannot read it from the count.
         verificationSealed = [bool]([int]$verifier.previewCount -gt 0)
         logRecordCount = [int]@($records).Count
+        authenticated = [bool]$authenticity.authenticated
+        authenticationBasis = [string]$authenticity.basis
+        authenticationMode = [string]$AuthenticationMode
+        authenticationObjections = ([string[]]@($authenticity.objections))
+        authenticatedPreviewCount = [int]$authenticity.previewsVerified
+        authenticatedInputCount = [int]$authenticity.inputsVerified
         basis = 'publishedAttemptRecords'
     }
 }

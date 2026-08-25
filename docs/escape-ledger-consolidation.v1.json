@@ -1,0 +1,101 @@
+{
+  "commonBaseCommit": "8d66afc8b31b0878152de846ebf0ad8644c996e1",
+  "description": "Maps pre-consolidation commits cited by the frozen escape ledger onto the consolidated replacement lineage. The ledger citations are never rewritten; this map is how the reachability contradiction check finds the work they name in a branch that no longer contains their commits. Every identity here is recomputed from git at verification time, and the map is consulted only for reachability - never for the merged-versus-not baseline that classifies a finding.",
+  "kind": "reviewer-escape-ledger-consolidation-map",
+  "lineageAnchors": [
+    {
+      "name": "reviewer-format-guard",
+      "replacementCommit": "dd9f661711936d7c124fccc89dbc1bc7a6388ec5",
+      "sourceCommit": "ccbf14632064118f008539becec2fef77030cf54",
+      "tree": "6a0a443397f7117ce42f01dba3e872675890da6b"
+    },
+    {
+      "name": "reviewer-result-retries",
+      "replacementCommit": "79df38bcf588edcc6302a51b1648c58bcc2d3817",
+      "sourceCommit": "535fa9e3f398d8a885849265ecd3f92371f7d52a",
+      "tree": "348f445b83a7f0841aa11dfdd6632030e2c447ac"
+    }
+  ],
+  "mappingDigest": "fd1404b7de01097cbb4fc40f46b1e93d282d3d517c77a0e137b13ca0c292b706",
+  "mappings": [
+    {
+      "anchor": "reviewer-result-retries",
+      "carriedEvidence": [
+        {
+          "blob": "43368f4025283bf9d43784cc256f0734e22fd4a2",
+          "path": "tools/Test-PowerShellBoundaryHardening.ps1"
+        },
+        {
+          "blob": "74694d0f760d251a971b522a1baee0811829a7cc",
+          "path": "tools/Test-ReviewerCollectionCardinality.ps1"
+        },
+        {
+          "blob": "fa6097d48b8bbfefab45f1e4a8404c524540f8ab",
+          "path": "tools/testdata/boundary-hardening-analyzer.fixtures.ps1"
+        }
+      ],
+      "deltaIdentity": "c53f648d333c05bb366097fd2d7c775fe18233d86617f8004628623dd3956619",
+      "equivalenceBasis": "segmentConsolidation",
+      "note": "Cited by near miss NM-0001 as introducedCommit. The stage-boundary hardening this commit introduced was squashed into the consolidated hardening change; the regression guards NM-0001 names are carried at the recorded blobs.",
+      "replacementCommit": "64c2e3ae1136ccca04bba49e7b695a3bb85d964b",
+      "replacementTree": "4bcc11c8a6e409213c96570ae49d21b46a2f5e9a",
+      "sourceCommit": "fc11fae765ac1145866720e141aaff738dca1e35",
+      "sourceSubject": "Harden stage boundaries before deciding on a typed control plane",
+      "sourceTree": "f6d06546686bd2e9a1bcffab9ddc5e1843ee6173"
+    },
+    {
+      "anchor": "reviewer-result-retries",
+      "carriedEvidence": [
+        {
+          "blob": "43368f4025283bf9d43784cc256f0734e22fd4a2",
+          "path": "tools/Test-PowerShellBoundaryHardening.ps1"
+        },
+        {
+          "blob": "5fb6dce21be2bce005e63db84c5c832411cd3020",
+          "path": "tools/Test-EscapeLedger.ps1"
+        }
+      ],
+      "deltaIdentity": "e1b60ca6c608a66fae798a333b8149f8b991e3a3f857a02570784c99410f23ea",
+      "equivalenceBasis": "segmentConsolidation",
+      "note": "Cited by near miss NM-0002 as introducedCommit and by NM-0001 as remediatedCommit. Squashed into the same consolidated hardening change; the falsifiable cross-file gate and the extracted coverage-clock derivation are carried at the recorded blobs.",
+      "replacementCommit": "64c2e3ae1136ccca04bba49e7b695a3bb85d964b",
+      "replacementTree": "4bcc11c8a6e409213c96570ae49d21b46a2f5e9a",
+      "sourceCommit": "cc5983c6ce02150562b5ae11ebbe3d2dc683cb78",
+      "sourceSubject": "Close three fail-open holes in the hardening layer's own detectors",
+      "sourceTree": "223079916e50faea07346f9403352ebd626d2a5e"
+    },
+    {
+      "anchor": "reviewer-result-retries",
+      "carriedEvidence": [
+        {
+          "blob": "e04287cd400f191a26844163f480fd1c757763b9",
+          "path": "docs/escape-ledger.v2.json"
+        },
+        {
+          "blob": "3c8291a775bdff51ba864d4a9ea531a0492d70c2",
+          "path": "tools/Test-EscapeLedger.ps1"
+        }
+      ],
+      "deltaIdentity": "bbfa57392533490248375de231093a78817dc742c5efcfd860bc76559ee2a3ae",
+      "equivalenceBasis": "segmentConsolidation",
+      "note": "The commit the escape ledger coverage window was evaluated at. Its replacement is the tip of the consolidated segment, so the window end is measured against the branch that actually carries the work rather than against a history this branch does not have.",
+      "replacementCommit": "3149955f1268012b2af159c0dbe7ae6582f07aa3",
+      "replacementTree": "951ea73dca9d605983d78bcce6fb7d819bf482ed",
+      "sourceCommit": "5a8f10610bf142b7d4cd0a59bd770407994fb290",
+      "sourceSubject": "Inline the validator calls so a neutered assertion drops the count",
+      "sourceTree": "996a27f0155cc5be20bb3098f4969169749b04da"
+    }
+  ],
+  "mappingVersion": 1,
+  "replacementLineage": {
+    "headCommit": "3149955f1268012b2af159c0dbe7ae6582f07aa3",
+    "headTree": "951ea73dca9d605983d78bcce6fb7d819bf482ed",
+    "name": "consolidated-cohort-protocol"
+  },
+  "schemaVersion": 1,
+  "sourceLineage": {
+    "headCommit": "5a8f10610bf142b7d4cd0a59bd770407994fb290",
+    "headTree": "996a27f0155cc5be20bb3098f4969169749b04da",
+    "name": "pre-consolidation-reviewer-stack"
+  }
+}

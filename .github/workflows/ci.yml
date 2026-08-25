@@ -258,6 +258,45 @@ jobs:
         shell: pwsh
         run: ./tools/Test-EscapeLedger.ps1 -VerifyCommits
 
+      # The signed map from the pre-consolidation commits the ledger cites to the
+      # replacement commits that carry them. A ledger citation that is no longer
+      # an ancestor of HEAD is satisfied only through an exact mapping whose
+      # anchors, trees and carried evidence all verify, so a squashed history
+      # cannot quietly erase - or quietly invent - a reachability claim.
+      - name: escape ledger consolidation mapping
+        shell: pwsh
+        run: ./tools/Test-EscapeLedgerConsolidation.ps1
+
+      # The versioned reviewer-base contract that replaced 'is this legacy commit
+      # an ancestor'. Identity is the accepted tree plus the reviewer script,
+      # config and schema hashes, so an unrelated tree with a copied commit
+      # message still fails.
+      - name: reviewer base lineage contract
+        shell: pwsh
+        run: ./tools/Test-ReviewerBaseContract.ps1
+
+      # The census of what a run actually spent, believed because it is signed
+      # rather than because the files on disk have the right shape: forged logs,
+      # added, removed and rewritten previews, swapped inputs, wrong and missing
+      # keys, and the proof that blocking never lowers a count.
+      - name: model start census authenticity
+        shell: pwsh
+        run: ./tools/Test-ShadowModelStartCensus.ps1
+
+      # The oversized-input refusal is bounded: every branch publishes the closed
+      # result shape, the attempt is charged, and it terminates.
+      - name: bounded refusal result shape
+        shell: pwsh
+        run: ./tools/Test-ReviewerModelPassResultShape.ps1
+
+      # Publishing state atomically while a reader holds the file open. On
+      # Windows a sharing violation used to leave the launch-intent and state
+      # files wedged; this drives real concurrent readers and writers and proves
+      # the published file is only ever the old bytes or the new ones.
+      - name: atomic state publish under concurrent readers
+        shell: pwsh
+        run: ./tools/Test-AtomicStatePublish.ps1
+
       - name: convention-pack schema and replay checks
         shell: pwsh
         run: ./tools/Test-ConventionPacks.ps1

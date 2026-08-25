@@ -1,0 +1,48 @@
+{
+  "boundArtifacts": [
+    {
+      "path": "src/Agents/reviewer/acquisition/v1/acquisition-plan.schema.json",
+      "sha256": "2319d5951638388238b232282814086a5ab5b51ce26cb655722465ba459f40cf"
+    },
+    {
+      "path": "src/Agents/reviewer/offline/Invoke-ReviewerModelAdapter.ps1",
+      "sha256": "dd700f09b82bca0c1503ff0adf66987d98efa4407cfb519d46dc29887ff4658b"
+    },
+    {
+      "path": "src/Agents/reviewer/offline/v1/adapter-manifest.schema.json",
+      "sha256": "3482d08d724af36473b822f0528acd2cafdaddcce3d09a405d23f72a26753ca5"
+    },
+    {
+      "path": "src/Agents/reviewer/ReviewerBaseContract.ps1",
+      "sha256": "3124e51715c3f811f8e5224536dcd26681ba0f2e7c97e4191a72ae827f4ebaf3"
+    },
+    {
+      "path": "src/Agents/reviewer/testdata/exact-path/reviewer.config.json",
+      "sha256": "7ff03acf4eb55bb1919d25b15d0913fb9a8dd9035fca304d4d46591e26f60dd3"
+    }
+  ],
+  "contractDigest": "d9e978b268c6cd3c09667c03e213b8be939182ac619c9ec6dbed958cc4e8f789",
+  "contractId": "reviewer-base-lineage/v1",
+  "description": "The base identities a sealed reviewer fixture may be bound to. A superseded identity is accepted only through an active lineage whose boundary commit is an ancestor of the checkout and whose tree is exactly equal to the superseded identity tree. Regenerate with tools/New-ReviewerBaseContract.ps1.",
+  "kind": "reviewer-base-lineage-contract",
+  "lineageVersion": 2,
+  "lineages": [
+    {
+      "baseCommit": "ccbf14632064118f008539becec2fef77030cf54",
+      "baseTree": "6a0a443397f7117ce42f01dba3e872675890da6b",
+      "lineageVersion": 1,
+      "name": "pre-consolidation",
+      "status": "superseded",
+      "supersededByLineageVersion": 2
+    },
+    {
+      "baseCommit": "dd9f661711936d7c124fccc89dbc1bc7a6388ec5",
+      "baseTree": "6a0a443397f7117ce42f01dba3e872675890da6b",
+      "lineageVersion": 2,
+      "name": "consolidated-replacement",
+      "status": "active",
+      "supersededByLineageVersion": 0
+    }
+  ],
+  "schemaVersion": 1
+}

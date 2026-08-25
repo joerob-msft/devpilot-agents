@@ -723,6 +723,15 @@ if (-not (Test-Path -LiteralPath $ModelResponseEnvelopeLibrary)) {
     throw "Model response envelope library '$ModelResponseEnvelopeLibrary' does not exist."
 }
 . $ModelResponseEnvelopeLibrary
+# The census reader and, more to the point for this script, its SEALER. A run
+# attests at the end to exactly which accounting artifacts it left behind, so
+# that whoever later counts this run's model starts is counting the run's own
+# evidence rather than whatever is on disk under its name.
+$ModelStartCensusLibrary = Join-Path $PSScriptRoot "ModelStartCensus.ps1"
+if (-not (Test-Path -LiteralPath $ModelStartCensusLibrary)) {
+    throw "Model start census library '$ModelStartCensusLibrary' does not exist."
+}
+. $ModelStartCensusLibrary
 # Whether generalist passes are read under the v2 contract. On by default: the
 # failure it removes - a complete review discarded, and the reviewer erased from
 # the census, because a nonce was omitted from the tail of a 4 KB object - is a
@@ -3221,10 +3230,28 @@ if ($offlineAdapterRequested) {
         throw "Offline model adapter expected-base binding does not match -ExpectedReviewerBaseCommit."
     }
     $repoRootForCommit = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..\..")).Path
-    & git -C $repoRootForCommit merge-base --is-ancestor $expectedBase HEAD
-    if ($LASTEXITCODE -ne 0) {
-        throw "Expected reviewer base commit '$expectedBase' is not an ancestor of the running checkout."
+    # The expected-base binding is decided by the versioned reviewer base lineage
+    # contract, not by graph ancestry alone.
+    #
+    # Ancestry answered only "is this commit somewhere behind HEAD", which
+    # accepted a commit for its position and said nothing about the reviewer's
+    # content - and which broke outright when the stack was consolidated and the
+    # same trees acquired new commit identities. The contract keeps the failure
+    # closed and makes it mean more: the identity must be one the contract names,
+    # its recorded tree must match what git says that commit contains, the
+    # reviewer-side files this fixture is replayed through must still hash to
+    # what was sealed, and the active boundary carrying that identity's tree must
+    # be an ancestor of this checkout. A superseded identity is accepted only
+    # through a replacement boundary whose tree is EXACTLY EQUAL to it.
+    . (Join-Path $PSScriptRoot 'ReviewerBaseContract.ps1')
+    $baseAcceptance = $null
+    try {
+        $baseAcceptance = Assert-ReviewerBaseCommitAccepted -RepoRoot $repoRootForCommit -ExpectedBaseCommit $expectedBase
     }
+    catch {
+        throw ("Expected reviewer base commit '$expectedBase' is not accepted by this checkout: $($_.Exception.Message)")
+    }
+    $script:ReviewerOfflineModelAdapterBaseAcceptance = $baseAcceptance
     $adapterScriptPath = Join-Path (Split-Path $adapterManifestPath -Parent) ([string]$adapterManifest.adapterScript)
     if (-not (Test-Path -LiteralPath $adapterScriptPath -PathType Leaf)) {
         throw "Offline model adapter script '$adapterScriptPath' does not exist."
@@ -12980,6 +13007,91 @@ function New-ReviewerResponsePassEnvelope {
     return Protect-ReviewerModelResponseEnvelope -Envelope $envelope -RunKey $runKey
 }
 
+function New-ReviewerModelPassResult {
+    <#
+    .SYNOPSIS
+        The single, closed shape every Invoke-ReviewerModelPass return has.
+    .DESCRIPTION
+        WHY THIS EXISTS. Every consumer of a pass result reads it under
+        Set-StrictMode -Version Latest, where a key the producer left out is not
+        a $null - it is a terminating error raised inside the caller, several
+        stack frames away from the branch that actually omitted it.
+
+        The oversized-input branch was exactly that defect: it returned a
+        bounded refusal without 'EnvelopePersisted', so the accounting writer
+        threw on the first read of that key. The throw escaped the whole review,
+        which is precisely what a BOUNDED refusal exists not to do - it took out
+        every pull request queued behind the oversized one - and it happened
+        before the attempt reached the starvation and retry accounting, so the
+        oversized pull request was never charged an attempt and never retired.
+        Nothing about an oversized change set improves on its own, so that is a
+        permanent, invisible loop.
+
+        Building every return here makes that class of defect impossible to
+        reintroduce: a branch cannot omit a key it never writes, and a key added
+        later is added once, with a default, for every branch at the same time.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Model,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RejectionClass,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Nonce,
+        $Marker = $null,
+        [AllowEmptyString()][string]$Reason = "",
+        [bool]$EnvironmentFault = $false,
+        [bool]$ModelRan = $false,
+        [bool]$ProcessStarted = $false,
+        $Usage = $null,
+        $ResponseEnvelope = $null,
+        $AuthTier = $null,
+        [bool]$EnvelopePersisted = $false
+    )
+    return @{
+        Model             = $Model
+        Marker            = $Marker
+        Reason            = $Reason
+        EnvironmentFault  = $EnvironmentFault
+        RejectionClass    = $RejectionClass
+        Nonce             = $Nonce
+        ModelRan          = $ModelRan
+        ProcessStarted    = $ProcessStarted
+        Usage             = $Usage
+        ResponseEnvelope  = $ResponseEnvelope
+        AuthTier          = $AuthTier
+        EnvelopePersisted = $EnvelopePersisted
+    }
+}
+
+# The exact key set New-ReviewerModelPassResult publishes. Named once so the
+# consumers can assert the shape they are about to read rather than discovering
+# a missing key as a terminating error inside an accounting writer.
+$script:ReviewerModelPassResultKeys = @(
+    'AuthTier', 'EnvelopePersisted', 'EnvironmentFault', 'Marker', 'Model', 'ModelRan',
+    'Nonce', 'ProcessStarted', 'Reason', 'RejectionClass', 'ResponseEnvelope', 'Usage'
+)
+
+function Assert-ReviewerModelPassResultShape {
+    <#
+    .SYNOPSIS
+        Refuses a pass result that does not carry every key its consumers read.
+    .DESCRIPTION
+        Fails at the boundary, naming the missing keys, instead of letting
+        Set-StrictMode raise 'the property cannot be found' from inside whichever
+        consumer happened to read the missing key first. A refusal here is still
+        a throw, but it is an attributable one; the point of the check is that
+        New-ReviewerModelPassResult makes it unreachable.
+    #>
+    param([Parameter(Mandatory)]$Result)
+    if ($Result -isnot [System.Collections.IDictionary]) {
+        throw "A model pass result must be a dictionary; got '$(if ($null -eq $Result) { 'null' } else { $Result.GetType().FullName })'."
+    }
+    $missing = @($script:ReviewerModelPassResultKeys | Where-Object { -not $Result.Contains($_) })
+    if (@($missing).Count -gt 0) {
+        throw ("A model pass result omits $(@($missing).Count) required key(s): $((@($missing) | Sort-Object) -join ', '). " +
+            'Every branch must publish the closed shape New-ReviewerModelPassResult defines.')
+    }
+    return $Result
+}
+
 function Invoke-ReviewerModelPass {
     <#
         ONE model run over one bound pull request: build the payload, launch,
@@ -13045,9 +13157,9 @@ function Invoke-ReviewerModelPass {
         # PROCESS accounting, deliberately separate from ModelRan. Nothing was
         # launched here: the input was refused for size before the subprocess, so
         # this attempt spent no model start and must not be counted as one.
-        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false
-            RejectionClass = 'oversize'; Nonce = $nonce; ModelRan = $false; ProcessStarted = $false; Usage = $null
-            ResponseEnvelope = $null; AuthTier = $null }
+        return (New-ReviewerModelPassResult -Model $PassModel -RejectionClass 'oversize' -Nonce $nonce `
+                -Reason $oversizeReason -ModelRan $false -ProcessStarted $false `
+                -EnvelopePersisted $false)
     }
 
     # -- Launch the model -----------------------------------------------------
@@ -13253,10 +13365,10 @@ function Invoke-ReviewerModelPass {
     }
     else { $bindingRejected = $false }
     if ($marker) {
-        return @{ Model = $PassModel; Marker = $marker; Reason = ""; EnvironmentFault = $false
-            RejectionClass = 'success'; Nonce = $nonce; ModelRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
-            ProcessStarted = $true; Usage = $usage
-            ResponseEnvelope = $responseEnvelope; AuthTier = $responseTier; EnvelopePersisted = $responsePersisted }
+        return (New-ReviewerModelPassResult -Model $PassModel -RejectionClass 'success' -Nonce $nonce `
+                -Marker $marker -Reason "" -ModelRan ([bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)) `
+                -ProcessStarted $true -Usage $usage -ResponseEnvelope $responseEnvelope `
+                -AuthTier $responseTier -EnvelopePersisted ([bool]$responsePersisted))
     }
 
     # A precise, typed reason - never a generic "invalid marker". A schema-shape
@@ -13328,10 +13440,11 @@ function Invoke-ReviewerModelPass {
     }
     catch { Write-Warning "Could not write the failure transcript: $($_.Exception.Message)" }
 
-    return @{ Model = $PassModel; Marker = $null; Reason = $reason; EnvironmentFault = [bool]$launchFailureReason
-        RejectionClass = $rejectionClass; Nonce = $nonce; ModelRan = $modelActuallyRan
-        ProcessStarted = $true; Usage = $usage
-        ResponseEnvelope = $responseEnvelope; AuthTier = $responseTier; EnvelopePersisted = $responsePersisted }
+    return (New-ReviewerModelPassResult -Model $PassModel -RejectionClass $rejectionClass -Nonce $nonce `
+            -Marker $null -Reason $reason -EnvironmentFault ([bool]$launchFailureReason) `
+            -ModelRan $modelActuallyRan -ProcessStarted $true -Usage $usage `
+            -ResponseEnvelope $responseEnvelope -AuthTier $responseTier `
+            -EnvelopePersisted ([bool]$responsePersisted))
 }
 
 # ---------------------------------------------------------------------------
@@ -14870,9 +14983,10 @@ function Invoke-ReviewerAcquisitionRoleCapture {
     if ($script:ReviewerRoleInputCaptureActive) { $script:ReviewerRoleInputCaptureBound = $Bound }
     $role = [string]$script:ReviewerAcquisitionTargetRole
     if ($role -ceq 'generalist') {
-        $script:ReviewerAcquisitionRolePassResult = Invoke-ReviewerModelPass `
-            -AgencyPath $AgencyPath -CycleNumber $CycleNumber -Bound $Bound `
-            -PassModel $CaptureRoleInputModel -PassNumber 1 -PassCount 1
+        $script:ReviewerAcquisitionRolePassResult = Assert-ReviewerModelPassResultShape -Result (
+            Invoke-ReviewerModelPass `
+                -AgencyPath $AgencyPath -CycleNumber $CycleNumber -Bound $Bound `
+                -PassModel $CaptureRoleInputModel -PassNumber 1 -PassCount 1)
         return @{ ExitCode = 0; Summary = "role-input-generalist-capture" }
     }
     if ($role -ceq 'specialist') {
@@ -14959,8 +15073,9 @@ function Invoke-ReviewerPullRequest {
             return ([long]$Current + [long]$Value)
         }
         for ($attempt = 1; $attempt -le $script:ReviewerMarkerRetryAttempts; $attempt++) {
-            $passResult = Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
-                -Bound $Bound -PassModel ([string]$passModel) -PassNumber $passNumber -PassCount $passCount
+            $passResult = Assert-ReviewerModelPassResultShape -Result (
+                Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
+                    -Bound $Bound -PassModel ([string]$passModel) -PassNumber $passNumber -PassCount $passCount)
             $acctAttempts++
             $u = $passResult.Usage
             if ($u) {
@@ -17534,8 +17649,9 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         try {
             for ($attempt = 1; $attempt -le $script:ReviewerMarkerRetryAttempts; $attempt++) {
                 $beforeCount = $script:ReviewerAcquisitionCaptures.Count
-                $passResult = Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber 1 `
-                    -Bound $Bound -PassModel $model -PassNumber 1 -PassCount 1
+                $passResult = Assert-ReviewerModelPassResultShape -Result (
+                    Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber 1 `
+                        -Bound $Bound -PassModel $model -PassNumber 1 -PassCount 1)
                 $cap = if ($script:ReviewerAcquisitionCaptures.Count -gt $beforeCount) {
                     $script:ReviewerAcquisitionCaptures[$script:ReviewerAcquisitionCaptures.Count - 1]
                 }
@@ -19255,7 +19371,47 @@ try {
     exit (Get-OnceFinalExitCode -IsOnce:$Once -IsDryRun:$false -LastCycleExitCode $lastCycleExitCode)
 }
 finally {
-    Exit-AgentLock -Stream $lock
+    try {
+        Exit-AgentLock -Stream $lock
+    }
+    finally {
+        # The census attestation is sealed LAST, after the lock is released and
+        # after every artifact this run could still write, because it digests
+        # them. Anything sealed earlier would attest to a state the run then
+        # moves past, and a manifest that disagrees with its own honest run is
+        # worse than no manifest: it reports tampering on clean runs until
+        # someone switches the check off.
+        #
+        # Every early exit in this script runs this block, and most of them do so
+        # before the state directory or the artifact key exist. Those paths are
+        # no-ops by construction rather than by exception: a run that got nowhere
+        # has no accounting to attest to, and it is correct for it to read as
+        # unauthenticated later. A failure to seal is likewise swallowed - the
+        # census is designed to treat a missing manifest as unproven, so the
+        # worst a failed seal can do is block a budget, never inflate one.
+        try {
+            $censusStateDir = Get-Variable -Name 'StateDir' -ValueOnly -ErrorAction SilentlyContinue
+            $censusKeyPath = Get-Variable -Name 'artifactKeyPath' -ValueOnly -ErrorAction SilentlyContinue
+            if (-not [string]::IsNullOrWhiteSpace([string]$censusStateDir) -and
+                -not [string]::IsNullOrWhiteSpace([string]$censusKeyPath) -and
+                (Test-Path -LiteralPath ([string]$censusStateDir) -PathType Container) -and
+                (Test-Path -LiteralPath ([string]$censusKeyPath) -PathType Leaf)) {
+                $censusLogPath = Join-Path ([string]$censusStateDir) 'logs\reviewer.log.jsonl'
+                $censusRecords = @()
+                if (Test-Path -LiteralPath $censusLogPath -PathType Leaf) {
+                    $censusRecords = @(Get-ReviewerModelStartLogRecord -LogPath $censusLogPath)
+                }
+                [void](Save-ReviewerModelStartCensusManifest `
+                        -RunRoot ([string]$censusStateDir) `
+                        -MasterKey (Get-ReviewerArtifactSigningKey -KeyPath ([string]$censusKeyPath)) `
+                        -Records $censusRecords)
+            }
+        }
+        catch {
+            Write-Warning ("The census attestation could not be sealed: $($_.Exception.Message) " +
+                'This run''s accounting will read as unauthenticated.')
+        }
+    }
 }
 
 }

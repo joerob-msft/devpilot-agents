@@ -83,7 +83,12 @@ internal static class StrictJson
         }
         try
         {
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            // Delete-sharing for the same reason CanonicalJson.Sha256HexOfFile
+            // uses it: a reader that withholds it blocks the atomic replace half
+            // of a concurrent publish, turning a routine read into a wedged
+            // publish. This handle keeps serving the bytes it opened.
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
             var length = stream.Length;
             if (length > maximumBytes)
             {

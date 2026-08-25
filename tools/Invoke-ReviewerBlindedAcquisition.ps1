@@ -1537,8 +1537,23 @@ else {
         if ($refCommit -cne $ExpectedHeadCommit.ToLowerInvariant() -and $refCommit -cne $ExpectedHeadCommit) {
             throw "Expected ref '$ExpectedRef' resolves to '$refCommit', not the expected head commit '$ExpectedHeadCommit'."
         }
-        & git merge-base --is-ancestor $ExpectedReviewerBaseCommit HEAD
-        if ($LASTEXITCODE -ne 0) { throw "Expected reviewer base commit '$ExpectedReviewerBaseCommit' is not an ancestor of HEAD." }
+        # The expected reviewer base is decided by the versioned lineage contract
+        # rather than by ancestry. Ancestry accepted a commit for its position in
+        # a graph and stopped being answerable at all once the stack was
+        # consolidated onto new commit identities carrying the same trees. The
+        # contract still fails closed - it additionally pins the identity's tree,
+        # the reviewer-side files an acquisition depends on, and the active
+        # boundary that must be an ancestor of this worktree.
+        . (Join-Path $PSScriptRoot '..\src\Agents\reviewer\ReviewerBaseContract.ps1')
+        try {
+            $acceptance = Assert-ReviewerBaseCommitAccepted -RepoRoot $RepoRoot `
+                -ExpectedBaseCommit ([string]$ExpectedReviewerBaseCommit)
+            Write-Verbose ("Reviewer base '$ExpectedReviewerBaseCommit' accepted via lineage " +
+                "$($acceptance.lineageVersion) ($($acceptance.mode), boundary $($acceptance.boundaryCommit)).")
+        }
+        catch {
+            throw "Expected reviewer base commit '$ExpectedReviewerBaseCommit' is not accepted by this worktree: $($_.Exception.Message)"
+        }
     }
     finally {
         Pop-Location

@@ -47,6 +47,7 @@ internal static class Program
         var acceptUnstartedRegistry = false;
         var retractClearedHolds = false;
         var rebuildIndex = false;
+        string? atomicPublishSelfTestRoot = null;
 
         // The parse runs inside the same guard as the rest of the entry point.
         // A missing option value is a usage fault, and a usage fault that escapes
@@ -107,6 +108,9 @@ internal static class Program
                     case "--from-cohort":
                         fromCohorts.Add(Next(args, ref index, "--from-cohort"));
                         break;
+                    case "--selftest-atomic-publish":
+                        atomicPublishSelfTestRoot = Next(args, ref index, "--selftest-atomic-publish");
+                        break;
                     case "--help":
                         Console.Out.WriteLine(Usage);
                         return ExitOk;
@@ -115,6 +119,22 @@ internal static class Program
                         Console.Error.WriteLine(Usage);
                         return ExitUsage;
                 }
+            }
+
+            if (atomicPublishSelfTestRoot is not null)
+            {
+                // A diagnostic mode, and deliberately an exclusive one: it writes
+                // only under the scratch root it is given, starts no cohort, and
+                // touches no request, so combining it with a real mode could only
+                // ever mean the caller wanted two different jobs at once.
+                if (requestPath is not null || cohortPath is not null || registryPath is not null
+                    || rebuildRegistry || rebuildIndex || selectSubjects)
+                {
+                    Console.Error.WriteLine("--selftest-atomic-publish runs the atomic state publish checks and starts nothing; it does not combine with the other modes.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                return AtomicPublishSelfTest.Run(atomicPublishSelfTestRoot, Console.Out);
             }
 
             if (selectSubjects)
@@ -421,6 +441,7 @@ internal static class Program
         ShadowRunCoordinator --select-subjects --registry <path> --candidates <path>
                              --out <path> [--select-count <n>]
                              [--accept-unresolved-defects] [--accept-unstarted-registry]
+        ShadowRunCoordinator --selftest-atomic-publish <scratch directory>
 
           --request       Path to a devpilot.shadow-run-coordinator.request.v2 JSON file.
           --target        Stop once this state is reached. Defaults to runSetReady.
@@ -434,6 +455,13 @@ internal static class Program
                           defaulted: a cohort is an operator action, not a timer's.
           --rebuild-index Rebuild the cohort index from the journal and the published
                           per-entry audits, and start nothing.
+          --selftest-atomic-publish
+                          Run the atomic state publish checks under a scratch
+                          directory and start nothing. Proves a concurrent reader
+                          cannot wedge a publish, that a transient sharing
+                          violation is survived, and that an exhausted budget
+                          leaves whole old content behind a typed recoverable
+                          error rather than a half-published state.
           --rebuild-registry
                           Rebuild the durable subject account from finished cohort roots
                           and start nothing. Every root is read through its own signed

@@ -309,7 +309,14 @@ internal static class CanonicalJson
 
     internal static string Sha256HexOfFile(string path)
     {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        // FileShare.Delete is the load-bearing flag, not politeness. Without it a
+        // reader that merely wants a digest takes a Windows lock that blocks the
+        // replace half of WriteFileAtomic, which is how a routine verification
+        // read used to wedge a state publish. Delete-sharing lets the publisher
+        // swap the name underneath us; this handle keeps reading the bytes it
+        // opened, which is exactly the snapshot semantics a digest wants.
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
         return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
     }
 
@@ -317,10 +324,103 @@ internal static class CanonicalJson
         Convert.ToHexString(HMACSHA256.HashData(key, StrictJson.StrictUtf8.GetBytes(text))).ToLowerInvariant();
 
     /// <summary>
+    /// Raised when an atomic publish exhausted its retry budget against a
+    /// transient Windows sharing violation. Recoverable on purpose: the
+    /// destination still holds exactly the old content or exactly the new one,
+    /// and the temporary has been removed, so a resumed run may simply try
+    /// again.
+    /// </summary>
+    internal sealed class AtomicPublishTimeoutException : Exception
+    {
+        internal AtomicPublishTimeoutException(string path, int attempts, int elapsedMilliseconds, Exception inner)
+            : base($"Publishing '{path}' did not complete within {attempts} attempt(s) over {elapsedMilliseconds}ms " +
+                   "because the destination stayed locked by another process. The destination was left unchanged " +
+                   "and the temporary file was removed; this is recoverable and may be retried.", inner)
+        {
+            Path = path;
+            Attempts = attempts;
+            ElapsedMilliseconds = elapsedMilliseconds;
+        }
+
+        internal string Path { get; }
+
+        internal int Attempts { get; }
+
+        internal int ElapsedMilliseconds { get; }
+
+        /// <summary>Always true; named so a caller does not have to know the type.</summary>
+        internal bool Recoverable => true;
+    }
+
+    // Windows returns these when the destination is momentarily held by someone
+    // else. Recognised BY CODE rather than by message, and enumerated rather
+    // than treated as "any IOException", because retrying a genuine failure - a
+    // full disk, a bad path, a permission the process will never have - would
+    // turn a fast, honest error into a slow one and still fail.
+    private const int ErrorAccessDenied = 5;
+    private const int ErrorSharingViolation = 32;
+    private const int ErrorLockViolation = 33;
+
+    // ReplaceFile's own two partial outcomes. 1176 leaves the destination under
+    // its original name; 1177 leaves it under the internal backup name, which
+    // means the destination is momentarily ABSENT. Both are retryable, and the
+    // retry recovers the 1177 case on its own: with the destination gone the
+    // next attempt falls through to the rename, which puts the new content
+    // there. What must never happen is treating either as success.
+    private const int ErrorUnableToMoveReplacement = 1176;
+    private const int ErrorUnableToMoveReplacement2 = 1177;
+
+    private static bool IsTransientSharingViolation(Exception exception, string path)
+    {
+        // ERROR_ACCESS_DENIED reaches us as UnauthorizedAccessException, and only
+        // from the rename fallback - the path taken when the destination did not
+        // exist. If it exists now, somebody raced us into creating and holding
+        // it, which is transient. If it still does not, this is a real permission
+        // problem and must fail immediately: retrying it would spend the budget
+        // and then report a lock that was never the cause.
+        if (exception is UnauthorizedAccessException)
+        {
+            return File.Exists(path);
+        }
+        if (exception is not IOException)
+        {
+            return false;
+        }
+        var code = exception.HResult & 0xFFFF;
+        return code is ErrorSharingViolation or ErrorLockViolation or ErrorAccessDenied
+            or ErrorUnableToMoveReplacement or ErrorUnableToMoveReplacement2;
+    }
+
+    /// <summary>
     /// Replace-in-place through a temporary file in the destination directory, so
-    /// a reader never observes a half-written record. Windows and the POSIX hosts
-    /// both give a same-directory move replace semantics; a cross-directory one
-    /// would not, which is why the temporary is a sibling.
+    /// a reader never observes a half-written record. The temporary is a sibling
+    /// because both of the replace primitives used below require the two paths to
+    /// share a volume, and a cross-directory move would not give replace
+    /// semantics at all.
+    ///
+    /// The replace prefers a rename (atomic, no instant at which the destination
+    /// is missing) and falls back to Win32 ReplaceFile only when the destination
+    /// is being held - because on Windows a rename over an open destination
+    /// CANNOT succeed: MoveFileEx with MOVEFILE_REPLACE_EXISTING fails with
+    /// ERROR_ACCESS_DENIED whenever anyone holds it, no matter what sharing that
+    /// reader granted. ReplaceFile does succeed, provided the reader granted
+    /// FILE_SHARE_DELETE - which is why every reader in this tool now does. The
+    /// two changes are one fix; neither works alone.
+    ///
+    /// That combination is what makes the wedge impossible. Before it, an
+    /// ordinary concurrent read - a digest check, a state read, a virus scanner -
+    /// made the publish throw from its middle. Because the cohort journal records
+    /// the intent to launch BEFORE the state describing it is published, the run
+    /// was left with a journal asserting a launch and a state file that never
+    /// agreed, and a resume could neither continue nor honestly abandon.
+    ///
+    /// The bounded retry below covers what remains: a reader that granted no
+    /// delete sharing at all, which this tool no longer creates but other
+    /// processes on the machine certainly do. It never weakens atomicity. Each
+    /// attempt is the same single replace, so the destination holds the whole old
+    /// content or the whole new content and never a blend. Only recognised
+    /// sharing violations are retried; anything else is reported at once. The
+    /// temporary is removed on every path out, including the timeout.
     /// </summary>
     internal static void WriteFileAtomic(string path, string content)
     {
@@ -339,7 +439,7 @@ internal static class CanonicalJson
                 stream.Write(bytes, 0, bytes.Length);
                 stream.Flush(flushToDisk: true);
             }
-            File.Move(temporary, path, overwrite: true);
+            PublishWithBoundedRetry(temporary, path);
         }
         finally
         {
@@ -347,6 +447,140 @@ internal static class CanonicalJson
             {
                 File.Delete(temporary);
             }
+        }
+    }
+
+    // The budget: eleven attempts backing off 2,4,8,...,512ms, capped, for a
+    // little over a second of tolerance in total. Long enough to outlast the
+    // foreign scanner that causes this in practice, short enough that a
+    // genuinely stuck destination is reported while the run still has somewhere
+    // to report it.
+    private const int AtomicPublishMaxAttempts = 11;
+    private const int AtomicPublishInitialBackoffMilliseconds = 2;
+    private const int AtomicPublishMaxBackoffMilliseconds = 512;
+
+    /// <summary>
+    /// Hook for fault injection. When set, it is consulted before every replace
+    /// attempt and may throw to simulate a sharing violation. Tests need to
+    /// exercise the retry deterministically; racing a real reader proves the
+    /// integration but cannot prove the budget is ever exhausted.
+    /// </summary>
+    internal static Action<string, int>? AtomicPublishAttemptHook;
+
+    /// <summary>Counters the self-test reads to prove which primitive did the work.</summary>
+    internal static long AtomicPublishRenameCount;
+
+    internal static long AtomicPublishReplaceCount;
+
+    internal static long AtomicPublishPosixRenameCount;
+
+    // One publish at a time per destination, within this process.
+    //
+    // ReplaceFile is not safe to race against itself: two concurrent replaces of
+    // one destination can end with ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, where the
+    // destination has been renamed to the internal backup name and is, for a
+    // moment, absent. Retrying recovers it, but a publish that briefly loses the
+    // state file is not the guarantee this method advertises, and the honest fix
+    // is not to create the race.
+    //
+    // In-process serialisation is sufficient BECAUSE a state file belongs to one
+    // run and a run holds an exclusive lease (RunLease) for as long as it
+    // publishes. Two processes publishing one path would already be a lease
+    // violation, which is detected where leases are, not here.
+    private static readonly Dictionary<string, object> PublishGates = new(StringComparer.OrdinalIgnoreCase);
+
+    private static object GateFor(string path)
+    {
+        lock (PublishGates)
+        {
+            if (!PublishGates.TryGetValue(path, out var gate))
+            {
+                gate = new object();
+                PublishGates[path] = gate;
+            }
+            return gate;
+        }
+    }
+
+    private static void PublishOnce(string temporary, string path)
+    {
+        // A rename first, because it is the only genuinely atomic option: the
+        // destination goes from whole old content to whole new content with no
+        // instant in between at which it does not exist. In the ordinary case -
+        // nobody reading - this is the whole story and the publish is perfect.
+        try
+        {
+            File.Move(temporary, path, overwrite: true);
+            Interlocked.Increment(ref AtomicPublishRenameCount);
+            return;
+        }
+        catch (Exception exception) when (IsTransientSharingViolation(exception, path))
+        {
+            // Somebody is holding the destination. A rename through MoveFileEx
+            // can NEVER succeed against that on Windows, however long it is
+            // retried, so retrying this call would spend the budget and then
+            // wedge exactly as before.
+        }
+
+        // The kernel's POSIX rename does the same atomic swap and does tolerate
+        // an open destination. This is the case the whole fix exists for, and it
+        // keeps the guarantee intact: the path never stops resolving.
+        if (NativeAtomicReplace.TryReplaceInPlace(temporary, path))
+        {
+            Interlocked.Increment(ref AtomicPublishPosixRenameCount);
+            return;
+        }
+
+        // Last resort, for a host or filesystem with no POSIX rename. ReplaceFile
+        // tolerates readers but works by renaming the destination aside and the
+        // replacement into place, so for a brief instant the path does not
+        // resolve. A reader arriving precisely then is turned away and can ask
+        // again; that is a retry, not a torn read, and it is still far better
+        // than a publish that fails outright and leaves the journal asserting a
+        // launch whose state was never written.
+        try
+        {
+            File.Replace(temporary, path, destinationBackupFileName: null, ignoreMetadataErrors: true);
+            Interlocked.Increment(ref AtomicPublishReplaceCount);
+        }
+        catch (FileNotFoundException)
+        {
+            // The destination went away between the two calls. Nothing to
+            // replace, so the atomic rename is available again.
+            File.Move(temporary, path, overwrite: true);
+            Interlocked.Increment(ref AtomicPublishRenameCount);
+        }
+    }
+
+    private static void PublishWithBoundedRetry(string temporary, string path)
+    {
+        var gate = GateFor(Path.GetFullPath(path));
+        lock (gate)
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var backoff = AtomicPublishInitialBackoffMilliseconds;
+            Exception? last = null;
+            for (var attempt = 1; attempt <= AtomicPublishMaxAttempts; attempt++)
+            {
+                try
+                {
+                    AtomicPublishAttemptHook?.Invoke(path, attempt);
+                    PublishOnce(temporary, path);
+                    return;
+                }
+                catch (Exception exception) when (IsTransientSharingViolation(exception, path))
+                {
+                    last = exception;
+                    if (attempt == AtomicPublishMaxAttempts)
+                    {
+                        break;
+                    }
+                    Thread.Sleep(backoff);
+                    backoff = Math.Min(backoff * 2, AtomicPublishMaxBackoffMilliseconds);
+                }
+            }
+            throw new AtomicPublishTimeoutException(path, AtomicPublishMaxAttempts,
+                (int)stopwatch.ElapsedMilliseconds, last!);
         }
     }
 }
