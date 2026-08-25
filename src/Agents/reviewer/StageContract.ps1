@@ -583,6 +583,101 @@ function Add-ReviewerStageContractLedgerEntry {
     if ($overflow -gt 0) { $script:ReviewerStageContractLedger.RemoveRange(0, $overflow) }
 }
 
+function ConvertTo-ReviewerStageDeterministicKeyOrder {
+    <#
+    .SYNOPSIS
+        A payload whose object keys have been given a stable, ordinal order.
+    .DESCRIPTION
+        The published bytes are the hashed artifact, so any part of serialization
+        that is not a function of the payload's content becomes a digest that
+        differs between two runs that observed exactly the same evidence. A plain
+        hashtable enumerates in whatever order its buckets happen to sit in, which
+        is not part of what the caller expressed, so two identical payloads can
+        serialize to two different byte streams and defeat the differential the
+        artifact exists to support.
+
+        EVERY object is ordered, whatever PowerShell type it arrived as. Ordering
+        only the unordered types would make wire identity a function of the type
+        the producer happened to build with: the same logical object would hash
+        one way as a hashtable, another as an ordered dictionary and a third as a
+        PSCustomObject. A JSON object has no order to preserve, so there is no
+        author intent to lose here - and where order genuinely carries meaning it
+        belongs in an array, which is left exactly as given.
+
+        The comparison is ordinal, not cultural. Sort-Object collates under the
+        current culture even with -CaseSensitive, so a key set containing paths or
+        mixed case can order differently on two hosts, or on one host after an ICU
+        update, and the artifact digest would then be a function of the machine's
+        locale rather than of the evidence.
+    #>
+    param([AllowNull()]$Node, [int]$Depth = 0)
+
+    if ($Depth -gt 64) {
+        throw 'Stage payload nested deeper than 64 levels while ordering keys.'
+    }
+    if ($null -eq $Node) { return $null }
+    if ($Node -is [string] -or $Node -is [System.ValueType]) { return $Node }
+
+    if ($Node -is [System.Collections.IDictionary]) {
+        $ordered = [ordered]@{}
+        # The ORIGINAL key object is kept alongside its string projection: a
+        # dictionary may be keyed by something that is not a string, and looking
+        # the value up by the projection would silently miss it and publish a
+        # null where evidence was. Two keys whose projections collide are a
+        # refusal, not a last-writer-wins.
+        $byName = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+        $names = [System.Collections.Generic.List[string]]::new()
+        foreach ($key in $Node.Keys) {
+            $name = [string]$key
+            if ($byName.ContainsKey($name)) {
+                throw "Stage payload holds two keys that render as '$name'; a JSON object cannot carry both."
+            }
+            $byName[$name] = $Node[$key]
+            [void]$names.Add($name)
+        }
+        $keys = [string[]]$names.ToArray()
+        [Array]::Sort($keys, [StringComparer]::Ordinal)
+        foreach ($key in $keys) {
+            $ordered[$key] = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $byName[$key] -Depth ($Depth + 1)
+        }
+        return $ordered
+    }
+
+    if ($Node -is [System.Management.Automation.PSCustomObject]) {
+        $ordered = [ordered]@{}
+        $properties = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+        $names = [System.Collections.Generic.List[string]]::new()
+        foreach ($property in $Node.PSObject.Properties) {
+            $name = [string]$property.Name
+            if ($properties.ContainsKey($name)) {
+                throw "Stage payload holds two properties named '$name'; a JSON object cannot carry both."
+            }
+            $properties[$name] = $property.Value
+            [void]$names.Add($name)
+        }
+        $sorted = [string[]]$names.ToArray()
+        [Array]::Sort($sorted, [StringComparer]::Ordinal)
+        foreach ($name in $sorted) {
+            $ordered[$name] = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $properties[$name] -Depth ($Depth + 1)
+        }
+        return [pscustomobject]$ordered
+    }
+
+    if ($Node -is [System.Collections.IEnumerable]) {
+        $items = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Node) {
+            [void]$items.Add((ConvertTo-ReviewerStageDeterministicKeyOrder -Node $item -Depth ($Depth + 1)))
+        }
+        # Rebuilt as object[] and returned through the comma operator rather than
+        # bare: a returned array unrolls, so an empty one would come back as null
+        # and a single-element one as a scalar, collapsing exactly the cardinality
+        # the collection normalizer just finished protecting.
+        return ,([object[]]$items.ToArray())
+    }
+
+    return $Node
+}
+
 function Measure-ReviewerStageFieldCardinality {
     <#
     .SYNOPSIS
@@ -754,7 +849,7 @@ function Write-ReviewerStageArtifact {
         contractVersion = $contract.ContractVersion
         form = $Form
         depth = $Depth
-        payload = $normalized
+        payload = (ConvertTo-ReviewerStageDeterministicKeyOrder -Node $normalized)
     }
     $compact = ($Form -ceq 'compact')
     $json = ConvertTo-Json -InputObject $envelope -Depth $Depth -Compress:$compact

@@ -692,11 +692,24 @@ function Import-ReviewerCorpusSealRecipe {
         recipe that silently carries one is a recipe whose author believes
         something is being enforced that is not.
     #>
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ExpectedSha256 = ""
+    )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Corpus seal recipe '$Path' does not exist." }
     $bytes = [System.IO.File]::ReadAllBytes($Path)
     if ($bytes.Length -lt 2 -or $bytes.Length -gt 8388608) {
         throw "Corpus seal recipe is $($bytes.Length) bytes; expected 2..8388608."
+    }
+    # Binding by content, over the EXACT bytes that are about to be parsed. A
+    # caller that hashes the path and then names it is trusting the file not to
+    # change in between; this closes that window, because these bytes are the
+    # ones the seal is built from and they are never read a second time.
+    if ($ExpectedSha256) {
+        $actualSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        if ($actualSha -cne $ExpectedSha256.ToLowerInvariant()) {
+            throw "Corpus seal recipe '$Path' hashes to $actualSha and the caller bound $ExpectedSha256."
+        }
     }
     $text = $script:ReviewerCorpusSealUtf8.GetString($bytes)
     try { $recipe = $text | ConvertFrom-Json -Depth 64 -ErrorAction Stop }

@@ -525,7 +525,26 @@ try {
     Assert-Composition -Name "the seal recorded the toolkit-policy provenance" `
         -Condition ([string]$sidecar.sourceTransport.policyProvenance -ceq "toolkitSealTime")
 
-    # The production qualification loader accepts the seal and binds its identity.
+    # The recipe importer binds by CONTENT when the caller asks it to, over the
+    # exact bytes it parses. A caller that hashes a path and then names it leaves
+    # a window; this is what closes it, so it is checked in both directions.
+    $recipeFile = Join-Path $sandbox "recipe-binding.json"
+    $recipeText = (ConvertTo-Json -InputObject (ConvertTo-RecipeObject -Recipe $recipe) -Depth 64) + "`n"
+    [IO.File]::WriteAllBytes($recipeFile, ([Text.UTF8Encoding]::new($false)).GetBytes($recipeText))
+    $recipeFileSha = (Get-FileHash -LiteralPath $recipeFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    $boundRecipe = Import-ReviewerCorpusSealRecipe -Path $recipeFile -ExpectedSha256 $recipeFileSha
+    Assert-Composition -Name "a recipe matching its bound digest is imported" `
+        -Condition ([string]$boundRecipe.snapshotId -ceq [string]$recipe.snapshotId)
+    $recipeRefusal = $null
+    try {
+        $null = Import-ReviewerCorpusSealRecipe -Path $recipeFile `
+            -ExpectedSha256 ("0" * 64)
+    }
+    catch { $recipeRefusal = [string]$_.Exception.Message }
+    Assert-Composition -Name "a recipe that does not match its bound digest is refused" `
+        -Condition ($recipeRefusal -match 'hashes to .* and the caller bound')
+
+
     $loaded = New-AgentReplaySnapshot -ReplayRoot $replayRoot -SnapshotName $snapshotName -ExpectedManifestDigest $manifestDigest
     Assert-Composition -Name "the qualification loader binds the seal as non-promotable" `
         -Condition ([bool]$loaded.Classification.NonPromotable -and

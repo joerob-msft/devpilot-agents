@@ -52,6 +52,112 @@ $script:ReviewerQualificationPrelaunchMarker = "REVIEWER_QUALIFICATION_PRELAUNCH
 $script:ReviewerQualificationPrelaunchSwitch = "-QualificationPrelaunch"
 $script:ReviewerQualificationPlanDigestKind = "reviewer.replay-qualification.plan.v1"
 
+# --- Typed qualification faults ------------------------------------------
+# The classification of a published run set as CORRUPT is a decision, and a
+# decision must not be made by reading English. Matching an exception message
+# against words like 'corrupt' or 'tampered' means the verdict depends on
+# prose that was written to be read by a person, and on text this code does not
+# own: a qualification root at C:\work\corrupt-repro\ or a run-set directory
+# whose absolute path carries the word 'tampered' interpolates into a perfectly
+# benign message - "Expected exactly one sealed run-set declaration under
+# 'C:\work\corrupt-repro\runset'" - and the reader calls a healthy set corrupt.
+# Reworded messages break it the other way, silently, by declaring a genuinely
+# corrupt set healthy.
+#
+# So every fault this library raises about a published set carries a CODE, set
+# on the exception's Data and again as the error id, and the corrupt/not-corrupt
+# question is answered by membership in a list that lives here beside the
+# throws. Messages stay exactly as they were - they are for people - and no
+# reader has to parse them.
+$script:ReviewerQualificationFaultCodeKey = "reviewerQualificationFaultCode"
+
+# The faults that mean the PUBLISHED SET ITSELF is unusable: an envelope that no
+# longer verifies, a verification that could not be performed, an inventory that
+# a complete publish always carries and this one does not, or a token that is
+# not a token. Each is a property of the published bytes alone.
+$script:ReviewerQualificationCorruptFaultCodes = @(
+    "declarationSignatureUnverified",
+    "declarationVerificationFaulted",
+    "publishedTokenMissing",
+    "publishedTokenMalformed",
+    "launchTokenMalformed"
+)
+
+# Named here so that every caller spells them the same way, and so that reading
+# this block is enough to see which faults are deliberately NOT corruption.
+# 'declarationVerificationUnavailable' is the important one: a verifier that
+# could not be RUN - no tool at that path, no key file, an unreadable file -
+# says something about this machine and nothing about the published bytes, and
+# reporting it as corruption would put the verdict back on something other than
+# the set itself. 'planReconstructionFailed' is a fault in rebuilding the
+# CALLER'S plan, which a healthy published set cannot be blamed for.
+$script:ReviewerQualificationVerificationUnavailableFaultCode = "declarationVerificationUnavailable"
+$script:ReviewerQualificationPlanReconstructionFaultCode = "planReconstructionFailed"
+
+function New-ReviewerQualificationFault {
+    <#
+        Builds a terminating error that carries a machine-readable code as well
+        as its human message. Thrown with 'throw', it reaches the caller's catch
+        with the code on $_.Exception.Data and on $_.FullyQualifiedErrorId, and
+        with the message byte-for-byte unchanged - so a caller that classifies
+        by code and an operator who reads the text see the same event.
+
+        When the fault is a re-raise of one that crossed a tool boundary, the
+        original goes in as the inner exception. That is not decoration: the code
+        reader below walks the inner chain, so a code carried by a fault that was
+        wrapped on its way out - by this function or by the engine - is still
+        found, and an operator reading the fault still has the original beneath
+        it rather than a message copied away from its cause.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Message,
+        $InnerError = $null
+    )
+    $inner = $null
+    if ($InnerError -is [Management.Automation.ErrorRecord]) { $inner = $InnerError.Exception }
+    elseif ($InnerError -is [Exception]) { $inner = $InnerError }
+    if ($null -eq $inner) { $exception = [InvalidOperationException]::new($Message) }
+    else { $exception = [InvalidOperationException]::new($Message, $inner) }
+    $exception.Data[$script:ReviewerQualificationFaultCodeKey] = $Code
+    return [Management.Automation.ErrorRecord]::new(
+        $exception, $Code, [Management.Automation.ErrorCategory]::InvalidData, $null)
+}
+
+function Get-ReviewerQualificationFaultCode {
+    <#
+        Reads the code off a caught error, following the inner-exception chain
+        because a fault raised inside a called tool arrives wrapped. Returns the
+        empty string when the error carries no code, which is the conservative
+        answer: an unclassified fault is never treated as corruption.
+    #>
+    param($ErrorRecord)
+    if ($null -eq $ErrorRecord) { return "" }
+    $exception = $null
+    if ($ErrorRecord -is [Management.Automation.ErrorRecord]) { $exception = $ErrorRecord.Exception }
+    elseif ($ErrorRecord -is [Exception]) { $exception = $ErrorRecord }
+    $depth = 0
+    while ($null -ne $exception -and $depth -lt 16) {
+        if ($null -ne $exception.Data -and $exception.Data.Contains($script:ReviewerQualificationFaultCodeKey)) {
+            return [string]$exception.Data[$script:ReviewerQualificationFaultCodeKey]
+        }
+        $exception = $exception.InnerException
+        $depth++
+    }
+    return ""
+}
+
+function Test-ReviewerQualificationCorruptFaultCode {
+    <#
+        The single answer to "does this fault mean the published set is
+        corrupt". Kept here, beside the throws that raise the codes, so adding a
+        fault and classifying it are one edit rather than two files apart.
+    #>
+    param([AllowEmptyString()][string]$Code)
+    if ([string]::IsNullOrEmpty($Code)) { return $false }
+    return [bool]($script:ReviewerQualificationCorruptFaultCodes -ccontains $Code)
+}
+
 function Get-ReviewerQualificationFullPath {
     <#
         Normalizes an operator path to a rooted, separator-stable full path
@@ -770,7 +876,8 @@ function Get-ReviewerQualificationLaunchTokenHash {
     param([Parameter(Mandatory)][string]$Token)
     $trimmed = $Token.Trim()
     if ($trimmed -notmatch '^[0-9a-f]{64}\z') {
-        throw "Launch-authorization token is malformed; expected 64 lowercase hex characters."
+        throw (New-ReviewerQualificationFault -Code "launchTokenMalformed" `
+                -Message "Launch-authorization token is malformed; expected 64 lowercase hex characters.")
     }
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($trimmed)
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
@@ -956,19 +1063,22 @@ function Assert-ReviewerQualificationReconciliationReady {
         $terminalPath = Resolve-ReviewerQualificationSlotTerminalPath -RunDirectory $runDirectory -SlotName ([string]$slot.Name)
         $terminal = if ($terminalPath) { Read-ReviewerQualificationSlotTerminal -TerminalPath $terminalPath } else { $null }
         if (-not $terminal) {
-            throw ("Reconciliation requires every slot to have a terminal result; '$($slot.Name)' has no case-exact " +
-                "'$($slot.Name)-terminal.json' under '$runDirectory'. Run and complete all $($Plan.SlotCount) slots first.")
+            throw (New-ReviewerQualificationFault -Code "reconciliationSlotTerminalAbsent" -Message (
+                    "Reconciliation requires every slot to have a terminal result; '$($slot.Name)' has no case-exact " +
+                    "'$($slot.Name)-terminal.json' under '$runDirectory'. Run and complete all $($Plan.SlotCount) slots first."))
         }
         Assert-ReviewerQualificationTerminalBoundToDeclaration -Terminal $terminal -SlotName ([string]$slot.Name) `
             -ExpectedSetId $ExpectedSetId -ExpectedPlanDigest $ExpectedPlanDigest
         if ([string]$terminal.status -cne "complete") {
-            throw ("Reconciliation requires every slot to have completed successfully; '$($slot.Name)' terminated " +
-                "'$([string]$terminal.status)'. A partial or failed set is never reconciled.")
+            throw (New-ReviewerQualificationFault -Code "reconciliationSlotNotComplete" -Message (
+                    "Reconciliation requires every slot to have completed successfully; '$($slot.Name)' terminated " +
+                    "'$([string]$terminal.status)'. A partial or failed set is never reconciled."))
         }
         if (Test-ReviewerQualificationRecordedProcessAlive -ProcessId ([int]$terminal.childProcessId) `
                 -StartedAtUtc ([string]$terminal.startedAtUtc) -EndedAtUtc ([string]$terminal.endedAtUtc)) {
-            throw ("Reconciliation refuses a live model process: '$($slot.Name)' recorded child " +
-                "$([int]$terminal.childProcessId) is still running. No reconciliation while a slot's process lives.")
+            throw (New-ReviewerQualificationFault -Code "reconciliationSlotChildAlive" -Message (
+                    "Reconciliation refuses a live model process: '$($slot.Name)' recorded child " +
+                    "$([int]$terminal.childProcessId) is still running. No reconciliation while a slot's process lives."))
         }
         [void]$reconciled.Add([pscustomobject][ordered]@{
                 slot           = [string]$slot.Name
@@ -1010,16 +1120,63 @@ function Get-VerifiedRunSetDeclaration {
                 ForEach-Object { $_.FullName })
     }
     if ($declarationPaths.Count -ne 1) {
-        throw ("Expected exactly one sealed run-set declaration under '$RunSetDirectory'; " +
-            "found $($declarationPaths.Count). Declare the set first (-Mode Declare).")
+        throw (New-ReviewerQualificationFault -Code "declarationCountNotOne" -Message (
+                "Expected exactly one sealed run-set declaration under '$RunSetDirectory'; " +
+                "found $($declarationPaths.Count). Declare the set first (-Mode Declare)."))
     }
-    $verifiedOutput = & $CompareTool -VerifyRunSet -RunSetPath $declarationPaths[0] -KeyPath $RunSetKeyPath
+    # The verifier is a separate tool and it throws its own refusal when the
+    # signature does not hold. Caught and re-raised with a code here, because a
+    # fault that crosses a tool boundary untyped is a fault the caller can only
+    # classify by reading its text - which is exactly what this contract exists
+    # to stop. The message is carried through unchanged and the original becomes
+    # the inner exception, so a typed fault raised inside the tool is still
+    # readable through the wrapper and nothing is lost by the re-raise.
+    #
+    # Two codes, not one, and the split is the whole point. A verifier that RAN
+    # and refused is evidence about the published bytes. A verifier that could
+    # not be run at all - a tool path that does not resolve, a key file that is
+    # missing or unreadable, a locked file - is evidence about this machine, and
+    # calling that corruption would put the verdict back where this contract took
+    # it from: on something other than the bytes. The inputs are proven first so
+    # the ordinary operator error (a mistyped -RunSetKeyPath) never reaches the
+    # catch at all.
+    foreach ($required in @(
+            @{ Path = [string]$CompareTool; What = "The run-set comparison tool" },
+            @{ Path = [string]$RunSetKeyPath; What = "The run-set signing key" })) {
+        $requiredPath = [string]$required.Path
+        $requiredWhat = [string]$required.What
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw (New-ReviewerQualificationFault -Code "declarationVerificationUnavailable" -Message (
+                    "$requiredWhat at '$requiredPath' does not exist, so the declaration under " +
+                    "'$RunSetDirectory' could not be verified. This says nothing about the published set."))
+        }
+    }
+    try {
+        $verifiedOutput = & $CompareTool -VerifyRunSet -RunSetPath $declarationPaths[0] -KeyPath $RunSetKeyPath
+    }
+    catch [Management.Automation.CommandNotFoundException] {
+        throw (New-ReviewerQualificationFault -Code "declarationVerificationUnavailable" `
+                -Message ([string]$_.Exception.Message) -InnerError $_)
+    }
+    catch [IO.IOException] {
+        throw (New-ReviewerQualificationFault -Code "declarationVerificationUnavailable" `
+                -Message ([string]$_.Exception.Message) -InnerError $_)
+    }
+    catch [UnauthorizedAccessException] {
+        throw (New-ReviewerQualificationFault -Code "declarationVerificationUnavailable" `
+                -Message ([string]$_.Exception.Message) -InnerError $_)
+    }
+    catch {
+        throw (New-ReviewerQualificationFault -Code "declarationVerificationFaulted" `
+                -Message ([string]$_.Exception.Message) -InnerError $_)
+    }
     $verifiedJson = @(@($verifiedOutput) |
             Where-Object { $_ -is [string] -and $_.TrimStart().StartsWith("{") } |
             Select-Object -Last 1)
     if (@($verifiedJson).Count -ne 1) {
-        throw ("Verification of '$($declarationPaths[0])' returned no manifest; the declaration did not verify " +
-            "under '$RunSetKeyPath'. A published declaration that no longer verifies is corrupt or tampered and is never launchable.")
+        throw (New-ReviewerQualificationFault -Code "declarationSignatureUnverified" -Message (
+                "Verification of '$($declarationPaths[0])' returned no manifest; the declaration did not verify " +
+                "under '$RunSetKeyPath'. A published declaration that no longer verifies is corrupt or tampered and is never launchable."))
     }
     $declaration = [string]$verifiedJson[0] | ConvertFrom-Json
     return [pscustomobject]@{ Declaration = $declaration; Path = $declarationPaths[0] }
@@ -1045,24 +1202,28 @@ function Assert-ReviewerQualificationDeclarationMatchesPlan {
     )
     if ([string]$Declaration.snapshotName -cne [string]$Plan.Snapshot.Name -or
         [string]$Declaration.snapshotManifestDigest -cne [string]$Plan.Snapshot.ManifestDigest) {
-        throw ("The sealed declaration names snapshot '$($Declaration.snapshotName)' at digest " +
-            "$($Declaration.snapshotManifestDigest); this plan replays '$($Plan.Snapshot.Name)' at " +
-            "$($Plan.Snapshot.ManifestDigest). A slot never runs against a declaration it does not match.")
+        throw (New-ReviewerQualificationFault -Code "declarationSnapshotMismatch" -Message (
+                "The sealed declaration names snapshot '$($Declaration.snapshotName)' at digest " +
+                "$($Declaration.snapshotManifestDigest); this plan replays '$($Plan.Snapshot.Name)' at " +
+                "$($Plan.Snapshot.ManifestDigest). A slot never runs against a declaration it does not match."))
     }
     if ([int]$Declaration.plannedRunCount -ne [int]$Plan.SlotCount) {
-        throw ("The sealed declaration plans $([int]$Declaration.plannedRunCount) run(s) and this plan has " +
-            "$($Plan.SlotCount) slot(s).")
+        throw (New-ReviewerQualificationFault -Code "declarationRunCountMismatch" -Message (
+                "The sealed declaration plans $([int]$Declaration.plannedRunCount) run(s) and this plan has " +
+                "$($Plan.SlotCount) slot(s)."))
     }
     $declaredPlanDigest = ""
     if ($Declaration.PSObject.Properties["planDigest"]) { $declaredPlanDigest = [string]$Declaration.planDigest }
     if (-not $declaredPlanDigest) {
-        throw ("The sealed declaration $($Declaration.setId) carries no plan digest, so it cannot say which commands " +
-            "it authorized. Declare a new set with this build of the tool.")
+        throw (New-ReviewerQualificationFault -Code "declarationPlanDigestAbsent" -Message (
+                "The sealed declaration $($Declaration.setId) carries no plan digest, so it cannot say which commands " +
+                "it authorized. Declare a new set with this build of the tool."))
     }
     if ($ExpectedPlanDigest -and $declaredPlanDigest -cne $ExpectedPlanDigest) {
-        throw ("The sealed declaration $($Declaration.setId) was made for plan $declaredPlanDigest and this plan " +
-            "hashes to $ExpectedPlanDigest. Every slot of a set runs the plan that was declared - the reviewed " +
-            "repository, the models, the timeouts and every other plan input, not the snapshot and slot count alone.")
+        throw (New-ReviewerQualificationFault -Code "declarationPlanDigestMismatch" -Message (
+                "The sealed declaration $($Declaration.setId) was made for plan $declaredPlanDigest and this plan " +
+                "hashes to $ExpectedPlanDigest. Every slot of a set runs the plan that was declared - the reviewed " +
+                "repository, the models, the timeouts and every other plan input, not the snapshot and slot count alone."))
     }
 }
 
@@ -1085,13 +1246,15 @@ function Assert-ReviewerQualificationPublishedInventory {
     param([Parameter(Mandatory)][string]$RunSetDirectory)
     $tokenPath = Join-Path $RunSetDirectory "launch-authorization.token"
     if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
-        throw ("The published run set under '$RunSetDirectory' is missing its launch-authorization token; " +
-            "the publish is incomplete or corrupt. A partial published set is never reconcilable or launchable.")
+        throw (New-ReviewerQualificationFault -Code "publishedTokenMissing" -Message (
+                "The published run set under '$RunSetDirectory' is missing its launch-authorization token; " +
+                "the publish is incomplete or corrupt. A partial published set is never reconcilable or launchable."))
     }
     $tokenText = ([IO.File]::ReadAllText($tokenPath)).Trim()
     if ($tokenText -notmatch '^[0-9a-f]{64}\z') {
-        throw ("The published launch-authorization token under '$RunSetDirectory' is malformed (expected 64 " +
-            "lowercase hex characters); the published set is corrupt and never reconcilable or launchable.")
+        throw (New-ReviewerQualificationFault -Code "publishedTokenMalformed" -Message (
+                "The published launch-authorization token under '$RunSetDirectory' is malformed (expected 64 " +
+                "lowercase hex characters); the published set is corrupt and never reconcilable or launchable."))
     }
     return $tokenText
 }

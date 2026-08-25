@@ -1337,6 +1337,112 @@ exit 0
         & $sandboxTool -Mode Reconcile @missTokenArguments -RunSetKeyPath $keyPath
     } "Reconcile accepted a published set missing its launch-authorization token." "launch-authorization token"
 
+    # (c) Classification comes from the TYPED FAULT CODE, never from the words in
+    #     a refusal message. The corrupt verdicts above must be reachable under a
+    #     root name that carries none of the words the old text match looked for,
+    #     and the codes must be exactly the ones the library raised - so a
+    #     reworded message cannot silently stop reporting a corrupt set.
+    Assert-Qualification ([string]$corruptStatus[0].declarationFaultCode -ceq "declarationVerificationFaulted") `
+        "Status did not report the typed fault code for a tampered published declaration."
+    Assert-Qualification ([string]$missTokenStatus[0].declarationFaultCode -ceq "publishedTokenMissing") `
+        "Status did not report the typed fault code for a published set missing its launch token."
+    $plainRoot = Join-Path $sandbox "plain-root"
+    $plainArguments = $planArguments.Clone()
+    $plainArguments["QualificationRoot"] = $plainRoot
+    $plainArguments["ReviewerScriptPath"] = $failingAgent
+    $plainArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @plainArguments -RunSetKeyPath $keyPath -Purpose "neutral name" | Out-Null
+    $plainTokenPath = Join-Path $plainRoot "runset\launch-authorization.token"
+    Set-ItemProperty -LiteralPath $plainTokenPath -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+    [IO.File]::WriteAllText($plainTokenPath, "not-a-token", [Text.UTF8Encoding]::new($false))
+    $plainStatus = @(& $statusTool @plainArguments -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($plainStatus).Count -eq 1 -and [bool]$plainStatus[0].parityMode -and
+        [bool]$plainStatus[0].declarationCorrupt -and
+        [string]$plainStatus[0].declarationFaultCode -ceq "publishedTokenMalformed" -and
+        -not [bool]$plainStatus[0].reconciliationReady) `
+        "Status did not classify a malformed launch token as corrupt under a root whose name carries no fault words."
+
+    # (d) The false-positive the text match produced. This root is HEALTHY: its
+    #     declaration verifies, its inventory is complete, its plan matches. Only
+    #     slot2 has not run yet, which is an ordinary incomplete set. But the
+    #     'corrupt' and 'tampered' - so the old message match read the operator's
+    #     own directory name and declared a sound published set corrupt. A code
+    #     cannot be produced by a path.
+    $selfMatchRoot = Join-Path $sandbox "corrupt-tampered-repro"
+    $selfMatchArguments = $planArguments.Clone()
+    $selfMatchArguments["QualificationRoot"] = $selfMatchRoot
+    $selfMatchArguments["ReviewerScriptPath"] = $failingAgent
+    $selfMatchArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @selfMatchArguments -RunSetKeyPath $keyPath -Purpose "self-match repro" | Out-Null
+    $selfMatchTokenPath = Join-Path $selfMatchRoot "runset\launch-authorization.token"
+    $selfMatchStatus = @(& $statusTool @selfMatchArguments -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($selfMatchStatus).Count -eq 1 -and [bool]$selfMatchStatus[0].parityMode -and
+        -not [bool]$selfMatchStatus[0].signatureUnverified -and
+        [bool]$selfMatchStatus[0].declaration.signatureVerified -and
+        -not [bool]$selfMatchStatus[0].reconciliationReady -and
+        [string]$selfMatchStatus[0].reconciliationReason -match "terminal result") `
+        "Status did not report an incomplete set under a fault-worded root as signature-verified and not-ready."
+    Assert-Qualification (-not [bool]$selfMatchStatus[0].declarationCorrupt) `
+        "Status called a healthy incomplete set corrupt because its own root path contains the words 'corrupt' and 'tampered'."
+    Assert-Qualification ([string]$selfMatchStatus[0].declarationFaultCode -ceq "reconciliationSlotTerminalAbsent") `
+        "Status did not report the typed fault code for an ordinary incomplete set."
+    Assert-Qualification ([string]$selfMatchStatus[0].reconciliationReason -match "corrupt" -and
+        [string]$selfMatchStatus[0].reconciliationReason -match "tampered") `
+        "The self-match fixture no longer carries the fault words in its reported reason, so it cannot prove the classification ignores them."
+    # And the same root, now genuinely corrupt, is still reported corrupt: the
+    # fixture proves the classifier ignores the path in BOTH directions rather
+    # than merely reporting 'not corrupt' for everything.
+    Set-ItemProperty -LiteralPath $selfMatchTokenPath -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $selfMatchTokenPath -Force
+    $selfMatchCorrupt = @(& $statusTool @selfMatchArguments -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($selfMatchCorrupt).Count -eq 1 -and
+        [bool]$selfMatchCorrupt[0].declarationCorrupt -and
+        [string]$selfMatchCorrupt[0].declarationFaultCode -ceq "publishedTokenMissing") `
+        "Status stopped reporting a genuinely corrupt set as corrupt under a fault-worded root path."
+
+    # (e) The classification list is the only place the verdict is decided, and
+    #     no reader may go back to matching prose. A message match would
+    #     reintroduce exactly the defect above the moment a path or a wording
+    #     changed, so the shape of the check is asserted, not just its answers.
+    $statusText = Get-Content -LiteralPath (Join-Path $RepoRoot "tools\Get-ReviewerReplayQualificationStatus.ps1") -Raw
+    Assert-Qualification ($statusText -notmatch '\$reconciliationReason\s+-match') `
+        "The status reader matches its own refusal text again; corruption must be classified by typed fault code."
+    Assert-Qualification ($statusText -match 'Test-ReviewerQualificationCorruptFaultCode') `
+        "The status reader no longer classifies corruption through the shared typed-fault classifier."
+
+    # (f) The other direction of the same mistake. Treating every failure of the
+    #     verification step as corruption is as wrong as reading its words: a
+    #     verifier that could not be RUN - a mistyped key path, a missing tool -
+    #     has said nothing about the published bytes, and answering 'corrupt'
+    #     there condemns a healthy set for an operator's typo. This set is the
+    #     same healthy one used above; only the key path is wrong.
+    $unavailableRoot = Join-Path $sandbox "unavailable-root"
+    $unavailableArguments = $planArguments.Clone()
+    $unavailableArguments["QualificationRoot"] = $unavailableRoot
+    $unavailableArguments["ReviewerScriptPath"] = $failingAgent
+    $unavailableArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @unavailableArguments -RunSetKeyPath $keyPath -Purpose "unavailable verifier" | Out-Null
+    $missingKeyPath = Join-Path $sandbox "no-such-directory\runset.key"
+    $unavailableStatus = @(& $statusTool @unavailableArguments -RunSetKeyPath $missingKeyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($unavailableStatus).Count -eq 1 -and [bool]$unavailableStatus[0].parityMode) `
+        "Status did not produce a parity-mode reading when the run-set key path does not exist."
+    Assert-Qualification ([string]$unavailableStatus[0].declarationFaultCode -ceq "declarationVerificationUnavailable") `
+        "Status did not report a verification that could not be performed as its own typed fault code."
+    Assert-Qualification (-not [bool]$unavailableStatus[0].declarationCorrupt) `
+        "Status called a published set corrupt because the caller named a run-set key that does not exist."
+    Assert-Qualification (-not [bool]$unavailableStatus[0].reconciliationReady) `
+        "Status claimed reconciliation readiness for a set whose declaration was never verified."
+    # And the code vocabulary itself: 'unavailable' must never be listed as
+    # corruption, or the split above would be undone by one edit in the library.
+    Assert-Qualification (-not (Test-ReviewerQualificationCorruptFaultCode -Code "declarationVerificationUnavailable")) `
+        "A verification that could not be performed is classified as corruption of the published set."
+    Assert-Qualification (Test-ReviewerQualificationCorruptFaultCode -Code "declarationVerificationFaulted") `
+        "A verifier that ran and refused is no longer classified as corruption of the published set."
+
     # -- 13. No fragile stdout consumer anywhere in the production path -------
     Write-Host "13/13 production execution path uses no Tee-Object" -ForegroundColor Cyan
     foreach ($productionPath in @(
