@@ -663,6 +663,27 @@ See [`docs/adding-an-agent.md`](docs/adding-an-agent.md).
 
 ---
 
+## Boundary hardening
+
+The coordinator hands work to child processes and reads the results back. Almost every
+defect worth calling an escape has happened at that boundary, where a collection becomes a
+scalar, an empty result becomes null, and a partial write reads as a clean one. Four
+documents cover what is checked and what is not:
+
+- [Collection cardinality corpus](docs/collection-cardinality-corpus.md) — every
+  collection-bearing field in the pipeline, driven through seven cardinality variants, with
+  a coverage matrix that states plainly which dimension is uncovered.
+- [Stage file contract](docs/stage-file-contract.md) — a versioned, fail-closed envelope for
+  stage child output. No production stage has adopted it yet; that is stated up front.
+- [Empty and null static analysis](docs/empty-null-static-analysis.md) — eleven analyzer
+  rules, a fixture corpus that measures them, and a baseline that blocks new findings while
+  recording existing ones as debt.
+- [Escape ledger and budget](docs/escape-ledger.md) — every escape since the first gate,
+  classified, with a registered trigger that decides a pending architectural question
+  mechanically rather than by argument.
+
+---
+
 ## Known limitations
 
 - **Azure DevOps only, today.** A provider abstraction for GitHub is designed

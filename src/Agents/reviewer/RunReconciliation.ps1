@@ -17,6 +17,21 @@
 
 Set-StrictMode -Version Latest
 
+# The twelve stage producer boundaries are declared in one shared file, so a
+# stage and the corpus that drives it can never exercise two different copies of
+# the same contract.
+#
+# The guard asks whether THIS script scope already holds the producer table, not
+# whether the commands are merely visible. A dot-sourced library resolves
+# $script: variables against the scope of whoever is running it, so a script that
+# can see an outer scope's functions but never loaded the libraries itself would
+# reach a registry that does not exist there - and it would only find out at the
+# first boundary call, which is exactly the call that must not fail for the wrong
+# reason.
+if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'StageProducers.ps1')
+}
+
 $script:ReviewerRunReconciliationKind = "reviewer.run-reconciliation"
 $script:ReviewerRunReconciliationSetKind = "reviewer.run-reconciliation-set"
 $script:ReviewerRunReconciliationVersion = 2
@@ -858,7 +873,16 @@ function Get-ReviewerRunReconciliationDifference {
     foreach ($id in @($Left)) { if (-not $b.Contains([string]$id)) { [void]$onlyLeft.Add([string]$id) } }
     $onlyRight = [System.Collections.Generic.List[string]]::new()
     foreach ($id in @($Right)) { if (-not $a.Contains([string]$id)) { [void]$onlyRight.Add([string]$id) } }
-    return @{ OnlyLeft = @($onlyLeft.ToArray()); OnlyRight = @($onlyRight.ToArray()) }
+    # The reconciliation stage boundary, in force. Both difference censuses are
+    # judged, and the empty ones are the whole point: "the two runs agreed about
+    # everything" and "one side's difference list was lost" are indistinguishable
+    # downstream unless the emptiness is proved to be a census of zero rather than
+    # an absent census.
+    $asserted = New-ReviewerReconciliationStageContract -OnlyLeft $onlyLeft -OnlyRight $onlyRight
+    return @{
+        OnlyLeft = [object[]]$asserted.onlyLeft
+        OnlyRight = [object[]]$asserted.onlyRight
+    }
 }
 
 function Resolve-ReviewerRunReconciliation {

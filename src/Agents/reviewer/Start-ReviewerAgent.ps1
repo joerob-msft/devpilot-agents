@@ -4736,7 +4736,7 @@ function Get-ReviewerExistingFingerprints {
             if ($fp) { [void]$set.Add($fp) }
         }
     }
-    return $set
+    Write-Output -NoEnumerate $set
 }
 
 function Get-ReviewerFindingFingerprint {
@@ -5862,8 +5862,30 @@ function Invoke-DryRunSelfChecks {
     elseif ($fpA -ceq (Get-ReviewerCommentFingerprint -Content "**[CRITICAL]** A completely different problem.")) { $failures.Add("The fingerprint collided across different comments.") }
     else { Write-Host "  OK - the fingerprint ignores whitespace but still distinguishes content" -ForegroundColor Green }
     $existing = Get-ReviewerExistingFingerprints -Threads @(@{ comments = @(@{ content = $body }) })
-    if (-not $existing.Contains($fpA)) { $failures.Add("An already-posted comment was not recognized from the PR, so it would be posted twice.") }
+    if ($existing -isnot [Collections.Generic.HashSet[string]]) {
+        $failures.Add("A nonempty fingerprint result did not retain its HashSet[string] type.")
+    }
+    elseif (-not $existing.Contains($fpA)) { $failures.Add("An already-posted comment was not recognized from the PR, so it would be posted twice.") }
+    elseif (-not $existing.Add('self-check-add') -or -not $existing.Contains('self-check-add')) {
+        $failures.Add("A nonempty fingerprint result no longer supports HashSet Add/Contains semantics.")
+    }
     else { Write-Host "  OK - an already-posted comment is recognized from the PR itself, not from local state" -ForegroundColor Green }
+    $zeroThreadSet = Get-ReviewerExistingFingerprints -Threads @()
+    $emptyCommentsSet = Get-ReviewerExistingFingerprints -Threads @(@{ comments = @() })
+    foreach ($emptySet in @($zeroThreadSet, $emptyCommentsSet)) {
+        if ($null -eq $emptySet -or
+            $emptySet -isnot [Collections.Generic.HashSet[string]] -or
+            $emptySet.Count -ne 0 -or
+            -not [object]::ReferenceEquals($emptySet.Comparer, [StringComparer]::Ordinal)) {
+            $failures.Add("Zero threads or a thread with zero comments did not return one empty ordinal HashSet[string].")
+            break
+        }
+    }
+    $pipelineSet = Get-ReviewerExistingFingerprints -Threads @()
+    if ($pipelineSet -isnot [Collections.Generic.HashSet[string]] -or $pipelineSet.Count -ne 0) {
+        $failures.Add("Pipeline assignment enumerated an empty fingerprint set into null.")
+    }
+    else { Write-Host "  OK - empty and nonempty fingerprint scans retain one mutable ordinal HashSet through the pipeline" -ForegroundColor Green }
     # The same sentence at two call sites is two findings. A body-only
     # fingerprint would treat the second as already posted, drop it, and still
     # count it - which then satisfies the "everything is visible" precondition
@@ -9110,38 +9132,47 @@ function Get-ReviewerSourceTransportNewContract {
         [Parameter(Mandatory)][string]$SourceCommit,
         [Parameter(Mandatory)]$Capability
     )
+    [string]$project = [string]$ExpectedProject
+    [string]$repositoryId = ([string]$cfgRepoId).ToLowerInvariant()
+    [string]$repositoryName = [string]$RepositoryName
+    if ([string]::IsNullOrWhiteSpace($project) -or [string]::IsNullOrWhiteSpace($repositoryId) -or
+        [string]::IsNullOrWhiteSpace($repositoryName)) {
+        throw "The MCP source transport requires nonempty project, repository ID, and repository name."
+    }
+    $mcpInvokerFunction = ${function:Invoke-AgentMcpTool}
+    $boundSourceFunction = ${function:Get-ReviewerBoundSourceContent}
     $toolInvoker = {
         param([hashtable]$Arguments)
-        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments $Arguments
+        return & $mcpInvokerFunction -Session $Session -Name "repo_pull_request" -Arguments $Arguments
     }.GetNewClosure()
     $aggregateReader = {
-        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
-            action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
+        return & $mcpInvokerFunction -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = 'get_changes'; project = $project; repositoryId = $repositoryName
             pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
         }
     }.GetNewClosure()
     $sourceReader = {
         param([string]$Path, [string[]]$Kinds)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit -ChangeKinds @($Kinds)
+        return & $boundSourceFunction -Session $Session -Path $Path -CommitSha $SourceCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
     $baseReader = {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit -ChangeKinds @($Kinds)
+        return & $boundSourceFunction -Session $Session -Path $Path -CommitSha $BaseCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
     [int]$recoveryBytesPerSide = [int]$script:ReviewerSourceMaxRecoveryBytesPerSide
     $recoverySourceReader = {
         param([string]$Path, [string[]]$Kinds)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit `
+        return & $boundSourceFunction -Session $Session -Path $Path -CommitSha $SourceCommit `
             -ChangeKinds @($Kinds) -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     $recoveryBaseReader = {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit `
+        return & $boundSourceFunction -Session $Session -Path $Path -CommitSha $BaseCommit `
             -ChangeKinds @($Kinds) -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     $result = Invoke-ReviewerSourceNewContractTransport -ToolInvoker $toolInvoker -Reader $sourceReader `
         -BaseReader $baseReader -RecoveryReader $recoverySourceReader -RecoveryBaseReader $recoveryBaseReader `
-        -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+        -Organization $Organization -Project $project -RepositoryId $repositoryId `
         -PrId $PrId -SourceCommit $SourceCommit -Capability $Capability -Policy $SourceTransportPolicy `
         -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce } `
         -AggregateReader $aggregateReader
@@ -9161,46 +9192,55 @@ function Get-ReviewerSourceTransportAzCliFallback {
         [Parameter(Mandatory)][int]$PrId,
         [Parameter(Mandatory)][string]$SourceCommit
     )
+    [string]$project = [string]$ExpectedProject
+    [string]$repositoryId = ([string]$cfgRepoId).ToLowerInvariant()
+    [string]$repositoryName = [string]$RepositoryName
+    if ([string]::IsNullOrWhiteSpace($project) -or [string]::IsNullOrWhiteSpace($repositoryId) -or
+        [string]::IsNullOrWhiteSpace($repositoryName)) {
+        throw "The Azure DevOps CLI fallback requires nonempty project, repository ID, and repository name."
+    }
     $azInvoker = New-ReviewerSourceAzCliInvoker -Organization $Organization `
         -ExpectedTenantId $CfgAzCliFallbackTenantId
     $azCaptureFunction = ${function:Get-ReviewerSourceAzIdentityCapture}
+    $mcpInvokerFunction = ${function:Invoke-AgentMcpTool}
+    $boundSourceFunction = ${function:Get-ReviewerBoundSourceContent}
     $identityReader = {
-        return & $azCaptureFunction -AzInvoker $azInvoker -Project $ExpectedProject `
-            -RepositoryId $cfgRepoId.ToLowerInvariant() -PrId $PrId -SourceCommit $SourceCommit
+        return & $azCaptureFunction -AzInvoker $azInvoker -Project $project `
+            -RepositoryId $repositoryId -PrId $PrId -SourceCommit $SourceCommit
     }.GetNewClosure()
     $aggregateReader = {
-        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
-            action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
+        return & $mcpInvokerFunction -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = 'get_changes'; project = $project; repositoryId = $repositoryName
             pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
         }
     }.GetNewClosure()
     $sourceReader = {
         param([string]$Path, [string[]]$Kinds)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+        return & $boundSourceFunction -Session $Session -Path $Path `
             -CommitSha $SourceCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
     $baseReader = {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+        return & $boundSourceFunction -Session $Session -Path $Path `
             -CommitSha $BaseCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
     [int]$recoveryBytesPerSide = [int]$script:ReviewerSourceMaxRecoveryBytesPerSide
     $recoverySourceReader = {
         param([string]$Path, [string[]]$Kinds)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+        return & $boundSourceFunction -Session $Session -Path $Path `
             -CommitSha $SourceCommit -ChangeKinds @($Kinds) `
             -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     $recoveryBaseReader = {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+        return & $boundSourceFunction -Session $Session -Path $Path `
             -CommitSha $BaseCommit -ChangeKinds @($Kinds) `
             -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     $result = Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
         -Reader $sourceReader -BaseReader $baseReader -RecoveryReader $recoverySourceReader `
         -RecoveryBaseReader $recoveryBaseReader -AggregateReader $aggregateReader `
-        -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+        -Organization $Organization -Project $project -RepositoryId $repositoryId `
         -PrId $PrId -SourceCommit $SourceCommit -Policy $SourceTransportPolicy `
         -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce }
     return @{
@@ -12567,7 +12607,10 @@ function Invoke-ReviewerGateRevalidation {
         catch {
             return @{ Ok = $false; Reason = "the change set could not be pinned during dedicated gate revalidation: $($_.Exception.Message)" }
         }
-        $threads = @(Get-ReviewerPullRequestThreads -Session $gateSession -PrId $PrId)
+        # Never wrap in @(): the helper protects its array, so @() would nest the
+        # whole thread list as one element and the fingerprint scan below would
+        # read no comments at all, defeating duplicate-post prevention.
+        $threads = Get-ReviewerPullRequestThreads -Session $gateSession -PrId $PrId
         $capabilities = Get-ReviewerGateProviderCapabilities -Provider $provider -TargetBranch $TargetBranch `
             -HeadSha $(if ($currentSourceCommit -match '^[0-9a-fA-F]{40}$') { $currentSourceCommit } else { "0" * 40 }) `
             -RequiredCheckNames $RequiredCheckNames
@@ -18104,6 +18147,10 @@ function Invoke-ReviewerRoleInputCaptureRun {
                     byteLength = [long]$_.Length
                 }
             })
+        # Assigned before the manifest literal: the inventory helper protects its
+        # array, so @() around the call would nest it and serialize the resource
+        # list one level too deep.
+        $sealedResourceInventory = Get-ReviewerRoleInputSealedResourceInventory
         $captureManifest = [ordered]@{
             schemaVersion  = 1
             kind           = 'reviewer-production-role-input-capture'
@@ -18141,7 +18188,7 @@ function Invoke-ReviewerRoleInputCaptureRun {
                 manifestDigest = ([string]$ReplayManifestDigest).ToLowerInvariant()
                 nonPromotable  = $true
                 sealKind       = [string]$script:ReviewerReplaySnapshot.Classification.SealKind
-                resources      = @(Get-ReviewerRoleInputSealedResourceInventory)
+                resources      = $sealedResourceInventory
             }
             build          = [ordered]@{
                 repoPath           = $resolvedRepoPath

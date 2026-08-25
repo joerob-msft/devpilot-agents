@@ -56,6 +56,21 @@
 
 Set-StrictMode -Version Latest
 
+# The twelve stage producer boundaries are declared in one shared file, so a
+# stage and the corpus that drives it can never exercise two different copies of
+# the same contract.
+#
+# The guard asks whether THIS script scope already holds the producer table, not
+# whether the commands are merely visible. A dot-sourced library resolves
+# $script: variables against the scope of whoever is running it, so a script that
+# can see an outer scope's functions but never loaded the libraries itself would
+# reach a registry that does not exist there - and it would only find out at the
+# first boundary call, which is exactly the call that must not fail for the wrong
+# reason.
+if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot '../StageProducers.ps1')
+}
+
 foreach ($requiredVerificationFunction in @(
         "ConvertTo-ReviewerVerificationCanonicalJson", "Get-ReviewerVerificationSha256",
         "Get-ReviewerVerificationObjectSha256", "Get-ReviewerVerificationSignature",
@@ -1008,6 +1023,32 @@ function Get-ReviewerEvalPartitionAssignment {
     }
 }
 
+function New-ReviewerEvalGroundTruthResolution {
+    <#
+        The corpus stage boundary for one reconciled ground-truth record.
+
+        Every resolution leaves through here - concordant, disputed and
+        adjudicated alike - because the disputed ones are the whole point: an
+        empty issue-id list and an empty reason-code list are what "this example
+        contributes to no denominator" looks like, and a collapse there reads
+        downstream as "this example agreed about nothing in particular" instead.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Resolution,
+        [Parameter(Mandatory)][AllowNull()]$IssueIds,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Decision,
+        [Parameter(Mandatory)][AllowNull()]$ReasonCodes
+    )
+
+    $asserted = New-ReviewerCorpusStageContract -IssueIds $IssueIds -ReasonCodes $ReasonCodes
+    return [pscustomobject][ordered]@{
+        resolution = $Resolution
+        issueIds = [object[]]$asserted.issueIds
+        decision = $Decision
+        ReasonCodes = [object[]]$asserted.reasonCodes
+    }
+}
+
 function Get-ReviewerEvalGroundTruth {
     <# Deterministic reconciliation of >=2 independent blind labels.
 
@@ -1032,44 +1073,32 @@ function Get-ReviewerEvalGroundTruth {
     foreach ($signature in $issueSignatures) { [void]$distinctSignatures.Add($signature) }
 
     if ($Labels.Count -lt 2 -or $distinctLabelers.Count -lt 2) {
-        return [pscustomobject][ordered]@{
-            resolution = "disputed"; issueIds = @(); decision = "abstain"
-            ReasonCodes = @("corpusLabelerCountBelowFloor")
-        }
+        return New-ReviewerEvalGroundTruthResolution -Resolution "disputed" -IssueIds ([object[]]@()) `
+            -Decision "abstain" -ReasonCodes ([object[]]@("corpusLabelerCountBelowFloor"))
     }
     if ($distinctSignatures.Count -eq 1) {
         $first = $Labels[0]
-        return [pscustomobject][ordered]@{
-            resolution = "concordant"
-            issueIds = @(Get-ReviewerEvalOrdinalSorted -Values @(@(Get-ReviewerVerificationValue $first "issueIds" @()) |
-                    ForEach-Object { [string]$_ }))
-            decision = [string](Get-ReviewerVerificationValue $first "decision" "")
-            ReasonCodes = @()
-        }
+        return New-ReviewerEvalGroundTruthResolution -Resolution "concordant" `
+            -IssueIds ([object[]]@(Get-ReviewerEvalOrdinalSorted -Values @(@(Get-ReviewerVerificationValue $first "issueIds" @()) |
+                        ForEach-Object { [string]$_ }))) `
+            -Decision ([string](Get-ReviewerVerificationValue $first "decision" "")) -ReasonCodes ([object[]]@())
     }
     if ($null -eq $Adjudication) {
         # A genuinely unresolved disagreement is a normal, recordable outcome,
         # not a malformed corpus. It resolves to nothing, contributes to no
         # denominator, and is counted as a disagreement.
-        return [pscustomobject][ordered]@{
-            resolution = "disputed"; issueIds = @(); decision = "abstain"
-            ReasonCodes = @()
-        }
+        return New-ReviewerEvalGroundTruthResolution -Resolution "disputed" -IssueIds ([object[]]@()) `
+            -Decision "abstain" -ReasonCodes ([object[]]@())
     }
     $adjudicatorId = [string](Get-ReviewerVerificationValue $Adjudication "adjudicatorId" "")
     if ($distinctLabelers.Contains($adjudicatorId)) {
-        return [pscustomobject][ordered]@{
-            resolution = "disputed"; issueIds = @(); decision = "abstain"
-            ReasonCodes = @("corpusAdjudicatorNotIndependent")
-        }
+        return New-ReviewerEvalGroundTruthResolution -Resolution "disputed" -IssueIds ([object[]]@()) `
+            -Decision "abstain" -ReasonCodes ([object[]]@("corpusAdjudicatorNotIndependent"))
     }
-    return [pscustomobject][ordered]@{
-        resolution = "adjudicated"
-        issueIds = @(Get-ReviewerEvalOrdinalSorted -Values @(@(Get-ReviewerVerificationValue $Adjudication "issueIds" @()) |
-                ForEach-Object { [string]$_ }))
-        decision = [string](Get-ReviewerVerificationValue $Adjudication "decision" "")
-        ReasonCodes = @()
-    }
+    return New-ReviewerEvalGroundTruthResolution -Resolution "adjudicated" `
+        -IssueIds ([object[]]@(Get-ReviewerEvalOrdinalSorted -Values @(@(Get-ReviewerVerificationValue $Adjudication "issueIds" @()) |
+                    ForEach-Object { [string]$_ }))) `
+        -Decision ([string](Get-ReviewerVerificationValue $Adjudication "decision" "")) -ReasonCodes ([object[]]@())
 }
 
 function Test-ReviewerEvalCorpusIntegrity {

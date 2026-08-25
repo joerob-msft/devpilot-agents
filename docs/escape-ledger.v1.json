@@ -1,0 +1,477 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-escape-ledger",
+  "ledgerVersion": 1,
+  "description": "Employer-neutral record of defects that escaped review into a merged coordinator change, the escape budget that governs the conditional typed control-plane decision, and the gate observations that motivated it. Incidents are identified by this repository's own public commit hashes; no external identifiers, programme code names, or private review references appear here.",
+  "coverageWindow": {
+    "startGate": "Gate 0",
+    "startCommit": "ac2c592",
+    "endCommit": "74e476a",
+    "notes": "Gate 0 is the first coordinator-authored change merged into this repository (introduction of the reviewer agent). The window closes at the head this hardening layer is stacked on. Ten coordinator changes have been merged in the window; every incident below was found in deterministic execution because no shadow or live coordinator run has ever been performed.",
+    "coordinatorChangesObserved": 10,
+    "coordinatorChangesObservedRule": "Derived, not asserted: the highest coordinatorChangeOrdinal recorded on any incident. CI recomputes it and fails when this published value disagrees.",
+    "evaluatedOnRule": "Derived, not asserted: the committer date of endCommit, which must also equal the newest incident detectedOn. CI recomputes both and fails when this published value disagrees.",
+    "staleAfterCommitsBehindHead": 40,
+    "evaluatedOn": "2026-08-18"
+  },
+  "vocabulary": {
+    "categories": [
+      {
+        "id": "typeBinding",
+        "definition": "The runtime bound a value to the wrong shape: a collection collapsed to a scalar or to null, a scalar was widened to a collection, or a collection was nested inside another collection. The logic was correct for the shape the author intended."
+      },
+      {
+        "id": "logic",
+        "definition": "The intended shape was preserved but the computation, guard, or control flow was wrong, including state captured at the wrong time by a closure."
+      },
+      {
+        "id": "modelProtocol",
+        "definition": "A model produced output that did not satisfy the contract the caller assumed: missing field, wrong envelope, prose where structured output was required, or a refusal handled as data."
+      },
+      {
+        "id": "supervision",
+        "definition": "A human or automated supervisor approved a change whose defect was visible in the diff or in existing test output."
+      },
+      {
+        "id": "external",
+        "definition": "A dependency, host, runtime, or service behaved differently from its documented contract."
+      }
+    ],
+    "executionStages": [
+      {
+        "id": "deterministic",
+        "definition": "Reached only code paths that run without a model and without external writes: unit and structural tests, replay, dry runs."
+      },
+      {
+        "id": "shadow",
+        "definition": "Reached a run that invoked models against real inputs but discarded its output rather than delivering it."
+      },
+      {
+        "id": "live",
+        "definition": "Reached a run whose output was delivered to a consumer outside the repository."
+      }
+    ],
+    "statuses": [
+      {
+        "id": "remediated",
+        "definition": "The defect was fixed and a named regression guard now fails if it returns."
+      },
+      {
+        "id": "openDebt",
+        "definition": "The defect class is detected and recorded but the affected sites have not been rewritten; the guard blocks new instances only."
+      },
+      {
+        "id": "accepted",
+        "definition": "The behaviour was reviewed and deliberately kept; the entry exists so the budget count stays honest."
+      }
+    ]
+  },
+  "budget": {
+    "id": "typed-control-plane-trigger",
+    "operationalStatus": "historicalSnapshot",
+    "asOfCommit": "74e476a",
+    "statement": "If two or more type-binding escapes reach shadow or live execution within either the last ten merged coordinator changes or the last sixty days, the conditional typed control-plane pivot stops being optional and is scheduled as the next coordinator change.",
+    "threshold": {
+      "category": "typeBinding",
+      "reachedExecutionStages": [
+        "shadow",
+        "live"
+      ],
+      "count": 2
+    },
+    "window": {
+      "days": 60,
+      "combinator": "either",
+      "coordinatorChanges": 10
+    },
+    "action": "Schedule the typed control-plane pivot as the next coordinator change and record the decision transition in this ledger.",
+    "state": {
+      "qualifyingIncidentIds": [],
+      "qualifyingCount": 0,
+      "triggered": false,
+      "inWindowIncidentIds": [
+        "ESC-0001",
+        "ESC-0002",
+        "ESC-0003",
+        "ESC-0004",
+        "ESC-0005",
+        "ESC-0006",
+        "ESC-0007",
+        "ESC-0008",
+        "ESC-0009",
+        "ESC-0010",
+        "ESC-0011",
+        "ESC-0012"
+      ]
+    }
+  },
+  "incidents": [
+    {
+      "id": "ESC-0001",
+      "title": "Empty fingerprint set returned as null",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "A helper built a set of candidate fingerprints in a local hash set and returned it with a bare return. The pipeline enumerated the set, so an empty result arrived at the caller as null and a one-element result arrived as its single member. Callers that counted the result crashed or silently treated an empty set as an absent one.",
+      "detector": "PSEN004 (local collection returned bare) in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "tools/Test-PowerShellBoundaryHardening.ps1 keeps the PSEN004 baseline at zero findings, so any new bare collection return blocks; tools/Test-ReviewerCollectionCardinality.ps1 exercises the zero and singleton variants of every inventoried hash-set field.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "74e476a",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10
+    },
+    {
+      "id": "ESC-0002",
+      "title": "Anchor arrays nested one level deeper by array-subexpression wrapping",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "Two call sites wrapped a helper that deliberately emits its collection as a single non-enumerated object in an array subexpression. Because the value crosses the pipeline as one object, the wrapper nested it instead of flattening it, producing a one-element array whose only element was the real array. Cross-file convention verification saw one anchor where there were none or many.",
+      "detector": "PSEN011 (array subexpression wrapping a protected collection return) in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "PSEN011 fixtures in tools/testdata/boundary-hardening-analyzer.fixtures.ps1 assert both the hazard and its counterexample; the nesting property is proved directly by the protected-return escape shape in tools/Test-ReviewerCollectionCardinality.ps1.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "0bb809f",
+      "siteCount": 2,
+      "detectedOn": "2026-08-12",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0003",
+      "title": "Specialist capture plan arrays collapsed across the plan boundary",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "Plan fields that carry a list of capture targets lost their array shape when a plan with a single target, or none, was serialised and read back. Downstream consumers indexed the field and received a character or a property instead of a target.",
+      "detector": "Boundary variant harness in tools/Test-ReviewerCollectionCardinality.ps1 (specialistPlan stage, zero and singleton variants)",
+      "regressionGuard": "Every specialistPlan collection field in tools/testdata/reviewer-collection-inventory.v1.json is exercised at zero, one, many, maximum, duplicate, null-versus-missing, and wrong-scalar.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "91cabd3",
+      "detectedOn": "2026-08-17",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0004",
+      "title": "Verifier JSON value shapes not preserved on round trip",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "Verifier payload values changed shape when written and re-read: single-element arrays came back as bare values and absent collections came back as null rather than empty. Verdict comparison then treated two identical verdicts as different.",
+      "detector": "Boundary variant harness in tools/Test-ReviewerCollectionCardinality.ps1 (verifierAssignment and verdict stages)",
+      "regressionGuard": "src/Agents/reviewer/StageContract.ps1 normalises declared collection fields on write and fails closed on scalar-collapsed fields on read; tools/Test-ReviewerStageContract.ps1 asserts both directions.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "39c8ed1",
+      "detectedOn": "2026-08-10",
+      "coordinatorChangeOrdinal": 8
+    },
+    {
+      "id": "ESC-0005",
+      "title": "Shared inventory return flattened at the boundary",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "A shared inventory helper returned its rows through the pipeline, so an inventory with one row was indistinguishable from a bare row and an empty inventory from a missing one. Containment checks then anchored on the wrong root.",
+      "detector": "PSEN004 and PSEN009 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "tools/Test-ReviewerStageContract.ps1 asserts that the artifact inventory is returned non-enumerated at zero, one, and many artifacts and that the returned collection is read-only.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "48eadd0",
+      "detectedOn": "2026-08-16",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0006",
+      "title": "Source transport helper closures captured the wrong binding",
+      "category": "logic",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "Script blocks referenced helper functions and script-scope variables by unqualified name and were invoked after the enclosing scope had moved on, so they observed a later value than the author intended.",
+      "detector": "PSEN006 and PSEN010 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "PSEN006 and PSEN010 fixtures assert detection of unqualified script-scope reads and of closures that call repository functions by name; explicit closure-state capture is property-tested in tools/Test-ReviewerCollectionCardinality.ps1.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "99f7b66",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10
+    },
+    {
+      "id": "ESC-0007",
+      "title": "Live source closure captured a mutated loop variable",
+      "category": "logic",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "A closure created inside a loop read the loop variable rather than a copy of it, so every deferred invocation used the final iteration's value.",
+      "detector": "PSEN010 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "Same as ESC-0006; the explicit closure-state capture property test asserts that a captured copy is immune to later mutation while an uncaptured reference is not.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "0191f8a",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10
+    },
+    {
+      "id": "ESC-0008",
+      "title": "Recovery reader closure captured state after reassignment",
+      "category": "logic",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "A recovery path built a reader script block whose captured state was reassigned before the block ran, so recovery read from the wrong location.",
+      "detector": "PSEN006 and PSEN010 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "Same as ESC-0006.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "acb1273",
+      "detectedOn": "2026-08-08",
+      "coordinatorChangeOrdinal": 5
+    },
+    {
+      "id": "ESC-0009",
+      "title": "Aggregate over an empty selection crashed under strict mode",
+      "category": "logic",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "A byte total was computed by aggregating a filtered collection and reading the aggregate's sum property. When every item was withheld the filter produced nothing, the aggregate produced nothing, and reading the property threw under strict mode instead of yielding zero.",
+      "detector": "PSEN003 (property read on a possibly-empty aggregate) in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "The zero variant of every inventoried numeric-bearing collection is exercised in tools/Test-ReviewerCollectionCardinality.ps1, and PSEN003 is part of the blocking boundary gate.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "696fb3a",
+      "detectedOn": "2026-08-13",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0010",
+      "title": "Second all-withheld aggregate crash in a sibling renderer",
+      "category": "logic",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "The same empty-aggregate crash existed in a second renderer that the first fix did not cover, which is why the guard was subsequently tightened to reject the pattern rather than the instance.",
+      "detector": "PSEN003 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "The tightened guard requires the numeric-zero form in the same block, so a sibling site cannot pass by accident.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "05d96d7",
+      "detectedOn": "2026-08-13",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0011",
+      "title": "Empty-aggregate guard accepted a same-block dominance loophole",
+      "category": "supervision",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "The first regression guard for the empty-aggregate class was written narrowly enough that a second instance of the same defect passed it. The guard, not the code, was the escape: review accepted a test that asserted the fix rather than the property.",
+      "detector": "Review of the guard itself; recorded so the ledger counts guard escapes as escapes.",
+      "regressionGuard": "Guards added by this hardening layer assert properties over an inventory rather than individual sites: the cardinality corpus is generated from tools/testdata/reviewer-collection-inventory.v1.json and the analyzer gate is baseline-diffed rather than site-listed.",
+      "introducedCommit": "696fb3a",
+      "remediatedCommit": "3a338a7",
+      "detectedOn": "2026-08-13",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0012",
+      "title": "Latent protected-return wrapping sites present in current code",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "openDebt",
+      "summary": "The rule introduced for ESC-0002 finds eleven further sites in current source and test code that wrap a protected collection return in an array subexpression. Each was read against its producer and consumer rather than baselined in bulk: three were live production defects and are fixed in this change, one is latent behind a caller-side non-empty precondition, one is compensated by an explicit flattening step at the consumer, and six are test-harness assertions. The eight that remain are carried as debt because rewriting them means changing producer contracts and call sites that this prerequisite layer must not touch.",
+      "detector": "PSEN011 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "The eight sites that were not rewritten are recorded in tools/testdata/powershell-boundary-baseline.v1.json with rationale - two in production code and six in test harnesses; tools/Test-PowerShellBoundaryHardening.ps1 blocks any further site. The analyzer fixture corpus is excluded from the repository scan by name and is not part of that count.",
+      "introducedCommit": "74e476a",
+      "siteCount": 11,
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10,
+      "sites": [
+        {
+          "location": "source transport change-kind accumulation",
+          "risk": "remediated",
+          "assessment": "The wrap nested a protected string array, so the caller cast the whole array to one string and recorded a space-joined kind, or an empty string when the change carried no kinds. Fixed in this change by iterating the assigned result."
+        },
+        {
+          "location": "coordinator dedicated-gate thread revalidation",
+          "risk": "remediated",
+          "assessment": "The wrap nested the protected thread list, so the fingerprint scan read a single array element that carried no comments and returned an empty set - the duplicate-post guard silently disabled. Fixed in this change by assigning the protected result directly."
+        },
+        {
+          "location": "role-input capture manifest sealed resource inventory",
+          "risk": "remediated",
+          "assessment": "The wrap nested the protected inventory, serializing the resource list one level deeper than the manifest declares. Fixed in this change by assigning before the manifest literal."
+        },
+        {
+          "location": "convention pack authoritative snapshot selection",
+          "risk": "latent",
+          "assessment": "The producer is mixed: it protects only its empty return and emits the populated case bare. The wrap therefore misreports only the empty case, which the caller already guards against by requiring at least one configured source. Correcting it properly means changing the producer contract and every call site, which is outside a hardening change that must not rewrite unrelated code. Carried as debt with the analyzer finding baselined."
+        },
+        {
+          "location": "convention specialist changed-path acquisition",
+          "risk": "compensated",
+          "assessment": "The wrap nests, and the next statement flattens that exact layer with an explicit projection and an inline comment explaining why. Behaviour is correct today; the finding is retained so the compensation is not silently removed."
+        },
+        {
+          "location": "convention specialist remediation-error test harness",
+          "risk": "testOnly",
+          "assessment": "Test-side assertion helper. A nested result would fail the assertion it feeds rather than reach any execution stage."
+        },
+        {
+          "location": "cross-verification changed-file index test harness",
+          "risk": "testOnly",
+          "assessment": "Test-side assertion helper, same reasoning."
+        },
+        {
+          "location": "source transport change-kind test assertions",
+          "risk": "testOnly",
+          "assessment": "Test-side assertions over a protected helper; the assertions themselves pin the shape."
+        },
+        {
+          "location": "source transport deterministic diff-span test assertions (three sites)",
+          "risk": "testOnly",
+          "assessment": "Test-side assertions over a protected helper; the assertions themselves pin the shape."
+        },
+        {
+          "location": "analyzer fixture corpus",
+          "risk": "testOnly",
+          "assessment": "Deliberate hazards authored so the rule can be shown to fire. Excluded from the repository scan by name."
+        }
+      ]
+    }
+  ],
+  "nearMisses": [
+    {
+      "id": "NM-0001",
+      "title": "Verification tooling failed open: exemption holes, name-collision silencing, and container-for-leaf citation matching",
+      "category": "verificationLogic",
+      "executionStage": "deterministic",
+      "mergedBeforeDetection": false,
+      "reachedShadowOrLive": false,
+      "whyNotAnEscape": "Introduced and detected inside the same unmerged change, so it never entered a merged coordinator change. The mechanism is verification logic - exit-shape inference, cross-file name resolution, and citation token selection - not runtime type binding. Counting it as a type-binding escape would bias the budget evidence toward the typed pivot without establishing that a typed host would have prevented it.",
+      "status": "remediated",
+      "summary": "Independent review of this prerequisite layer found three ways its own detectors reported green while not checking what they claimed. The protected-return exemption counted an unrecognised exit as nothing, so one protected exit silenced the assignment rules for a whole function even when another exit returned a multi-element pipeline or a cast to an enumerating collection type. Cross-file name resolution skipped the nesting fact along with the exemption, so a single unprotected same-named stub in a test file disabled the bare-collection-return rule on every production call site of that name and raised a false flattening finding there. And the inventory citation check accepted any path segment, so a citation pointing at the wrong file passed whenever that file mentioned the generic container name; five live citations were wrong under that rule. A detector that fails open is worse than no detector, because it is recorded as evidence.",
+      "detector": "Independent review of the change, reproduced by fixtures in tools/testdata/boundary-hardening-analyzer.fixtures.ps1 and sabotage checks in tools/Test-ReviewerCollectionCardinality.ps1",
+      "regressionGuard": "Two exemption-soundness fixtures (multi-element pipeline exit and enumerating-cast exit) and a cross-file gate that builds a producer, a consumer, and a same-named unprotected mock in a temporary tree and requires identical findings with and without the mock, all in tools/Test-PowerShellBoundaryHardening.ps1. Three citation sabotage checks pin container-is-not-leaf, short-leaf retention, and prose-suffix rejection; the five wrong citations are corrected and the unverifiable rows are published as citationsUnverified rather than counted as checked.",
+      "introducedCommit": "fc11fae",
+      "classifiedAgainstCommit": "74e476a",
+      "remediatedCommit": "cc5983c",
+      "siteCount": 3,
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10,
+      "sites": [
+        {
+          "location": "protected-return exemption, unrecognised exit shapes",
+          "risk": "remediated",
+          "assessment": "A return whose pipeline had more than one element, and a cast to List/ArrayList/Collection, were both counted as neither protected nor unprotected. One protected exit then bought the exemption for the whole function. Latent in this repository today - no current finding changed - but it is the exact escape shape the rules exist to catch."
+        },
+        {
+          "location": "cross-file function name resolution",
+          "risk": "remediated",
+          "assessment": "When a name was defined in more than one file and not locally, both the exemption and the nesting fact were skipped. Skipping the nesting fact disabled PSEN011, the rule that found three live defects in this change, on every production call site of that name. Now split: exemption stays conservative, nesting stays permissive."
+        },
+        {
+          "location": "inventory citation field matching",
+          "risk": "remediated",
+          "assessment": "Any path segment satisfied the check, so the container name stood in for the leaf. Five citations named the wrong file and passed. The leaf is now required, both path notations are handled, no minimum token length is applied, and rows with no leaf are published as unverified."
+        }
+      ]
+    },
+    {
+      "id": "NM-0002",
+      "title": "Two of the new verification checks were unfalsifiable, and one asserted a property the analyzer deliberately does not hold",
+      "category": "verificationLogic",
+      "executionStage": "deterministic",
+      "mergedBeforeDetection": false,
+      "reachedShadowOrLive": false,
+      "whyNotAnEscape": "Introduced by the previous round of fixes in this same unmerged change and found by the next round of review before merge. Like NM-0001 the mechanism is verification logic, not runtime type binding, and counting it against the type-binding budget would bias the pivot decision with evidence about test authorship rather than about the language.",
+      "status": "remediated",
+      "summary": "The cross-file gate added for NM-0001 asserted that a same-named mock does not raise a flattening finding on a production call site, using an @()-preserved consumer. A preserved assignment can never draw that rule, so the assertion was structurally always true. Worse, the property it named is one the analyzer deliberately does not hold: on an unwrapped call site the conservative exemption withdraws and the finding does fire, which is the accepted imprecision behind two baseline entries. Separately, the two new coverage-clock sabotage checks set a value and then asserted it differed from a value it had been constructed to differ from, never re-running the derivation on the mutated copy, so neither exercised the detection it was written to guard.",
+      "detector": "Independent review of the change",
+      "regressionGuard": "The cross-file gate now asserts only the falsifiable property - identical bare-collection-return findings on the wrapped call site with and without the mock - and pins the conservative-exemption imprecision on a second unwrapped consumer as an expectation, so a future improvement is reported rather than passing silently. Reverting the exemption/nesting split makes the gate fail. The coverage-clock derivation is extracted into Measure-LedgerCoverageClock and the sabotage checks re-run that function on the mutated ledger, with a positive control asserting it agrees on the unmutated one.",
+      "introducedCommit": "cc5983c",
+      "classifiedAgainstCommit": "74e476a",
+      "remediatedCommit": "4a3c3ec",
+      "siteCount": 2,
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10,
+      "sites": [
+        {
+          "location": "cross-file name-resolution gate, flattening-rule half",
+          "risk": "remediated",
+          "assessment": "Structurally always zero on an @()-preserved consumer, so the assertion could not fail. Replaced by a falsifiable identity assertion plus an explicit pin of the known imprecision on an unwrapped consumer."
+        },
+        {
+          "location": "coverage-window clock sabotage checks",
+          "risk": "remediated",
+          "assessment": "Tautologies of the form n+1 != n. The derivation is now a function that the sabotage checks re-invoke on the mutated ledger, with a positive control."
+        }
+      ]
+    }
+  ],
+  "categoryAnchorExceptions": [
+    {
+      "id": "ESC-0011",
+      "category": "supervision",
+      "rationale": "The escape was the regression guard itself, found by reading the guard rather than by any analyzer rule, so there is no cited detector whose family could imply a category. Listing it here is what makes the absence of an anchor a reviewable fact: its category cannot be edited to typeBinding, because a category the budget counts must be implied by a detector, and de-anchoring any other finding changes this list."
+    }
+  ],
+  "gateObservations": [
+    {
+      "gate": "Gate 5",
+      "observation": "The gate produced no deliverable decision: every candidate was withheld or reconciled away, so the decision yield was zero per cent. No incident in this ledger reached shadow or live execution because no shadow or live run has ever been performed - not because those runs were contained. Separately, the no-write invariant held throughout: zero external writes were made. The two are independent, since a shadow run invokes models and discards its output and is therefore compatible with zero writes.",
+      "decisionYieldPercent": 0,
+      "externalWrites": 0,
+      "noWriteInvariantHeld": true,
+      "shadowRunsPerformed": 0,
+      "liveRunsPerformed": 0
+    }
+  ],
+  "decision": {
+    "id": "typed-control-plane-pivot",
+    "status": "conditional",
+    "statement": "Porting the coordinator's stage control plane to a typed, compiled host remains conditional. It is not taken in this change. It becomes mandatory if the escape budget above triggers; it may be reconsidered earlier if the prerequisites below prove insufficient to detect a new type-binding escape class.",
+    "prerequisites": [
+      {
+        "id": "cardinality-corpus",
+        "title": "Cardinality and property corpus over every collection-bearing stage contract",
+        "complete": true,
+        "inForce": false,
+        "inForceNote": "Built, not in force: the corpus drives the shared contract, not the owning stages. All 1652 producer-path cells are open, so no live stage boundary is covered by it today.",
+        "evidence": "tools/testdata/reviewer-collection-inventory.v1.json inventories 236 collection fields across twelve stages; tools/Test-ReviewerCollectionCardinality.ps1 exercises all of them at seven cardinality variants, routes the five map-valued fields through the stage contract's map validator rather than its list normalizer, proves eleven escape shapes as properties, runs nine sabotage checks, and checks 419 producer and consumer citations, of which 258 resolve to a file that mentions the field's leaf token and 161 name a variable with no leaf to match and are published as unverified rather than counted as checked - a liveness check on the rows that exist, not a completeness check on the inventory, whose completeness remains unverified; tools/testdata/reviewer-collection-cardinality-matrix.v1.json records coverage per field, keeps the uncovered producer-path dimension separate, and does not claim full coverage."
+      },
+      {
+        "id": "file-contract",
+        "title": "Versioned file contract for stage child outputs",
+        "complete": true,
+        "inForce": false,
+        "inForceNote": "Built, not in force: no stage writes or reads its child outputs through this contract yet. Adoption is a separate change.",
+        "evidence": "src/Agents/reviewer/StageContract.ps1 and src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json require a contract version and kind, write UTF-8 without a byte order mark to a caller-specified file, fix the JSON depth and form explicitly, and fail closed on unknown, missing, truncated, empty, scalar-collapsed, or stream-contaminated payloads, and validate declared maps separately from declared collections because a map has no correct repair from an array or a scalar; tools/Test-ReviewerStageContract.ps1 covers every rejection plus atomicity and the read-only inventory."
+      },
+      {
+        "id": "boundary-analyzer",
+        "title": "Boundary hardening analyzer with a blocking new-violation gate",
+        "complete": true,
+        "inForce": true,
+        "inForceNote": "In force: every push is scanned and any finding absent from the baseline fails CI.",
+        "evidence": "tools/Find-PowerShellEmptyNullHazard.ps1 implements eleven rules; tools/Test-PowerShellBoundaryHardening.ps1 proves each rule against labelled fixtures and blocks any finding absent from tools/testdata/powershell-boundary-baseline.v1.json, whose entries carry per-rule rationale."
+      },
+      {
+        "id": "escape-ledger",
+        "title": "Escape ledger and budget with a registered trigger",
+        "complete": true,
+        "inForce": false,
+        "inForceNote": "Built, not in force. Counts, the rolling window, and the trigger are recomputed from the incident data on every push, and the staleness bound is derived from git history. The window clock itself is not: coordinatorChangesObserved advances only when an incident carries a higher ordinal, so an incident-free coordinator change does not move it, and evaluatedOn tracks the newest incident rather than the present. Until an authoritative coordinator-change registry exists, Gate 5 must refuse to read the trigger as current and must require an externally supplied ordinal and date.",
+        "clockAuthority": "authoredOrdinals",
+        "evidence": "This ledger, its schema, and tools/Test-EscapeLedger.ps1, which validates the schema, recomputes every count from the incident list, and re-evaluates the trigger."
+      }
+    ],
+    "exposureObligation": {
+      "statement": "A zero escape rate observed without running the pipeline is abstention, not evidence. The conditional decision is therefore due for re-evaluation only after the recorded shadow exposure has actually been performed; until then the escape rate carries no weight in either direction.",
+      "requiredShadowRuns": 10,
+      "byCoordinatorChange": 20,
+      "shadowRunsPerformed": 0,
+      "satisfied": false
+    }
+  }
+}

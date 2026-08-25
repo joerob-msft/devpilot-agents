@@ -25,6 +25,21 @@
 
 Set-StrictMode -Version Latest
 
+# The twelve stage producer boundaries are declared in one shared file, so a
+# stage and the corpus that drives it can never exercise two different copies of
+# the same contract.
+#
+# The guard asks whether THIS script scope already holds the producer table, not
+# whether the commands are merely visible. A dot-sourced library resolves
+# $script: variables against the scope of whoever is running it, so a script that
+# can see an outer scope's functions but never loaded the libraries itself would
+# reach a registry that does not exist there - and it would only find out at the
+# first boundary call, which is exactly the call that must not fail for the wrong
+# reason.
+if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'StageProducers.ps1')
+}
+
 foreach ($requiredVerificationFunction in @(
         "ConvertTo-ReviewerVerificationCanonicalJson", "Get-ReviewerVerificationSha256",
         "Get-ReviewerVerificationObjectSha256", "Get-ReviewerVerificationSignature",
@@ -857,7 +872,13 @@ function Select-ReviewerGateSubset {
     foreach ($item in @($Approved)) {
         if ($allowedKeys.Contains((Get-ReviewerGateManifestKey -Entry $item))) { [void]$kept.Add($item) }
     }
-    return , ($kept.ToArray())
+    # The delivery-decision stage boundary, in force. This is the last remove-only
+    # narrowing before anything is published, and the empty result is the one that
+    # matters most: "every approved entry was filtered out" must reach the caller
+    # as an empty set, never as a null that a later @() would silently re-read as
+    # "nothing was filtered".
+    $asserted = New-ReviewerDeliveryDecisionStageContract -SelectedEntries $kept
+    return , ([object[]]$asserted.selectedEntries)
 }
 
 # ---------------------------------------------------------------------------
@@ -1202,16 +1223,25 @@ function Get-ReviewerGateApprovalCoverageKey {
         [Parameter(Mandatory)]$Decision,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ConfirmedImportantOrHigherKeys
     )
+    # The fingerprints stage boundary, in force. Both key censuses are judged
+    # before they are hashed, because a census that collapsed on the way in still
+    # hashes to a perfectly stable digest - one that binds an approval to fewer
+    # findings than actually existed. A zero-key grant is legitimate; a zero-key
+    # grant that used to be a one-key grant is the replay this digest exists to
+    # stop, and only the boundary can tell them apart.
+    $asserted = New-ReviewerFingerprintsStageContract `
+        -GateImportantOrHigherKeys ([object[]]@(
+            @(Get-ReviewerVerificationValue $Decision "gateImportantOrHigherKeys" @()) |
+                ForEach-Object { [string]$_ } | Sort-Object -Unique)) `
+        -ConfirmedImportantOrHigherKeys ([object[]]@(
+            @($ConfirmedImportantOrHigherKeys) | ForEach-Object { [string]$_ } | Sort-Object -Unique))
     $digest = Get-ReviewerVerificationObjectSha256 -Value ([ordered]@{
             prId                           = [int](Get-ReviewerVerificationValue $Decision "prId" 0)
             sourceCommit                   = ([string](Get-ReviewerVerificationValue $Decision "sourceCommit" "")).ToLowerInvariant()
             gateHumanPromotableCount       = [int](Get-ReviewerVerificationValue $Decision "gateHumanPromotableCount" 0)
             gateImportantOrHigherCount     = [int](Get-ReviewerVerificationValue $Decision "gateImportantOrHigherCount" 0)
-            gateImportantOrHigherKeys      = @(
-                @(Get-ReviewerVerificationValue $Decision "gateImportantOrHigherKeys" @()) |
-                    ForEach-Object { [string]$_ } | Sort-Object -Unique)
-            confirmedImportantOrHigherKeys = @(
-                @($ConfirmedImportantOrHigherKeys) | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+            gateImportantOrHigherKeys      = [object[]]$asserted.gateImportantOrHigherKeys
+            confirmedImportantOrHigherKeys = [object[]]$asserted.confirmedImportantOrHigherKeys
         })
     return "approval:$digest"
 }

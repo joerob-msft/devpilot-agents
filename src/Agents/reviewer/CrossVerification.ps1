@@ -2,6 +2,21 @@
 
 Set-StrictMode -Version Latest
 
+# The twelve stage producer boundaries are declared in one shared file, so a
+# stage and the corpus that drives it can never exercise two different copies of
+# the same contract.
+#
+# The guard asks whether THIS script scope already holds the producer table, not
+# whether the commands are merely visible. A dot-sourced library resolves
+# $script: variables against the scope of whoever is running it, so a script that
+# can see an outer scope's functions but never loaded the libraries itself would
+# reach a registry that does not exist there - and it would only find out at the
+# first boundary call, which is exactly the call that must not fail for the wrong
+# reason.
+if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'StageProducers.ps1')
+}
+
 $script:ReviewerVerificationMarkerPrefix = "VERIFICATION_RESULT_V1:"
 $script:ReviewerVerificationInputKind = "verification-input-preview"
 $script:ReviewerVerificationPreviewKind = "verification-decision-preview"
@@ -1311,7 +1326,17 @@ function Get-ReviewerVerificationClusters {
                 [string](Get-ReviewerVerificationValue $left "clusterId" ""),
                 [string](Get-ReviewerVerificationValue $right "clusterId" ""))
         })
-    return $clusters.ToArray()
+    # The candidate-union stage boundary, in force. The cluster census and the
+    # overflow census are judged together because they are read together: an
+    # overflow list that collapsed to null downstream reads as "nothing was
+    # dropped for budget", which is the one thing a bounded union must never be
+    # able to say by accident.
+    $overflowHashes = [System.Collections.Generic.List[string]]::new()
+    foreach ($overflowItem in $overflowItems) {
+        [void]$overflowHashes.Add([string](Get-ReviewerVerificationValue $overflowItem "candidateHash" ""))
+    }
+    $asserted = New-ReviewerCandidateUnionStageContract -Clusters $clusters -OverflowCandidateHashes $overflowHashes
+    return ([object[]]@($asserted.clusters))
 }
 
 function Get-ReviewerVerificationAcceptedConventionCandidateDecisions {
@@ -1392,7 +1417,12 @@ function Get-ReviewerVerificationAcceptedConventionCandidates {
         }
         [void]$result.Add($candidate)
     }
-    return $result.ToArray()
+    # The verdict stage boundary, in force. An accepted set of zero is the shape
+    # that has to survive intact: "cross-verification accepted nothing" and
+    # "cross-verification produced no answer" are different runs, and only one of
+    # them is allowed to look like an empty delivery.
+    $asserted = New-ReviewerVerdictStageContract -AcceptedCandidates $result
+    return ([object[]]@($asserted.acceptedCandidates))
 }
 
 function Get-ReviewerVerificationAcceptedConventionCandidateIds {
@@ -1694,7 +1724,12 @@ function Get-ReviewerVerificationAssignments {
                 [string](Get-ReviewerVerificationValue $left "assignmentId" ""),
                 [string](Get-ReviewerVerificationValue $right "assignmentId" ""))
         })
-    return $assignments.ToArray()
+    # The verifier-assignment stage boundary, in force. A plan of exactly one
+    # assignment, or of none at all, is a legitimate outcome; a plan that lost
+    # its cardinality on the way out is what lets the coverage check downstream
+    # count a scalar as a full two-verifier census.
+    $asserted = New-ReviewerVerifierAssignmentStageContract -Assignments $assignments -VerifierModels $models
+    return ([object[]]@($asserted.assignments))
 }
 
 function Assert-ReviewerVerificationAssignmentCoverage {

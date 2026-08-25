@@ -39,6 +39,21 @@
 
 Set-StrictMode -Version Latest
 
+# The twelve stage producer boundaries are declared in one shared file, so a
+# stage and the corpus that drives it can never exercise two different copies of
+# the same contract.
+#
+# The guard asks whether THIS script scope already holds the producer table, not
+# whether the commands are merely visible. A dot-sourced library resolves
+# $script: variables against the scope of whoever is running it, so a script that
+# can see an outer scope's functions but never loaded the libraries itself would
+# reach a registry that does not exist there - and it would only find out at the
+# first boundary call, which is exactly the call that must not fail for the wrong
+# reason.
+if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'StageProducers.ps1')
+}
+
 $script:ReviewerSourceTransportVersion = 1
 $script:ReviewerSourceSpanBasisVersion = 1
 $script:ReviewerSourceSpanBases = @("changeSet", "recovered")
@@ -992,6 +1007,8 @@ function Invoke-ReviewerSourceNewContractTransport {
     }
     if ($null -eq $RecoveryReader) { $RecoveryReader = $Reader }
     if ($null -eq $RecoveryBaseReader) { $RecoveryBaseReader = $BaseReader }
+    $addResourceBindingFunction = ${function:Add-ReviewerSourceResourceBinding}
+    $getSourceValueFunction = ${function:Get-ReviewerSourceValue}
     $cache = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
     $recoverySourceCache = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
     $recoverySourceAttempted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -1002,7 +1019,7 @@ function Invoke-ReviewerSourceNewContractTransport {
         $actualKinds = if ($kindsByPath.Contains($Path)) { @($kindsByPath[$Path]) } else { @($Kinds) }
         $resource = $null
         try {
-            $resource = Add-ReviewerSourceResourceBinding -Resource (
+            $resource = & $addResourceBindingFunction -Resource (
                 & $RecoveryReader $Path $actualKinds) -Binding $recoveryBinding
         }
         catch {
@@ -1023,16 +1040,16 @@ function Invoke-ReviewerSourceNewContractTransport {
                 $cache[$Path] = $null
                 return $null
             }
-            $rejected = [string](Get-ReviewerSourceValue -Object $recoveryResource -Name "Rejected" -Default "")
-            $byteLength = [int](Get-ReviewerSourceValue -Object $recoveryResource -Name "ByteLength" -Default -1)
+            $rejected = [string](& $getSourceValueFunction -Object $recoveryResource -Name "Rejected" -Default "")
+            $byteLength = [int](& $getSourceValueFunction -Object $recoveryResource -Name "ByteLength" -Default -1)
             if ($byteLength -gt [int]$Policy.maxFetchBytesPerFile) {
                 # Recovery may privately inspect more bytes than ordinary
                 # delivery. Do not let that wider object or its private decode
                 # classification reach slicing or the sealed block; retain only
                 # the ordinary oversize census.
-                $resource = Add-ReviewerSourceResourceBinding -Resource ([pscustomobject]@{
+                $resource = & $addResourceBindingFunction -Resource ([pscustomobject]@{
                         Rejected = "fileTooLarge"
-                        MimeType = [string](Get-ReviewerSourceValue -Object $recoveryResource -Name "MimeType" -Default "")
+                        MimeType = [string](& $getSourceValueFunction -Object $recoveryResource -Name "MimeType" -Default "")
                         ByteLength = $byteLength
                         Path = $Path
                         CommitSha = $SourceCommit
@@ -1047,7 +1064,7 @@ function Invoke-ReviewerSourceNewContractTransport {
             }
         }
         if ($null -eq $resource) {
-            $resource = Add-ReviewerSourceResourceBinding -Resource (
+            $resource = & $addResourceBindingFunction -Resource (
                 & $Reader $Path $actualKinds) -Binding $recoveryBinding
         }
         $cache[$Path] = $resource
@@ -1055,7 +1072,7 @@ function Invoke-ReviewerSourceNewContractTransport {
     }.GetNewClosure()
     $baseReader = {
         param([string]$Path, [string[]]$Kinds)
-        return Add-ReviewerSourceResourceBinding -Resource (
+        return & $addResourceBindingFunction -Resource (
             & $RecoveryBaseReader $Path $Kinds ([string]$recoveryBinding.BaseCommit)) -Binding $recoveryBinding
     }.GetNewClosure()
     $recovery = Get-ReviewerSourceRecoveredSpans -Response $aggregateResponse -SpansByPath $spans `
@@ -1472,7 +1489,13 @@ function Get-ReviewerSourceRawChangedPaths {
         if (-not $path) { $path = [string](Get-ReviewerSourceValue -Object $change -Name "path" -Default "") }
         if ($path) { [void]$paths.Add($path) }
     }
-    return $paths.ToArray()
+    # The source stage boundary, in force. The census is judged before any caller
+    # sees it - including the empty one, which is the shape that used to reach a
+    # consumer as "no change set was read" instead of "the change set named no
+    # file". The answer below is read back out of the judged payload, so a
+    # removed assertion is a missing variable, not a silently unchecked return.
+    $asserted = New-ReviewerSourceStageContract -ChangedPaths $paths
+    return ([string[]]@($asserted.changedPaths))
 }
 
 function Get-ReviewerSourceChangeIdentityDigest {
@@ -1586,7 +1609,7 @@ function Get-ReviewerSourceDegenerateChanges {
                     $originalPath = ConvertTo-ReviewerSourcePath -Path $rawOriginalPath
                     if (-not $originalPath -or $originalPath -cne $path) { $state.SamePath = $false }
                 }
-                foreach ($kind in @(Get-ReviewerSourceChangeKinds -Value (
+                foreach ($kind in (Get-ReviewerSourceChangeKinds -Value (
                             Get-ReviewerSourceValue -Object $change -Name "changeType" -Default $null))) {
                     if (-not $state.ChangeKinds.Contains([string]$kind)) { [void]$state.ChangeKinds.Add([string]$kind) }
                 }
