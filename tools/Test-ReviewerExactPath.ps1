@@ -7,13 +7,46 @@ Set-StrictMode -Version Latest
 
 $reviewer = Join-Path $RepoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
 $fixtureRoot = Join-Path $RepoRoot 'src\Agents\reviewer\testdata\exact-path'
-$replayRoot = Join-Path $RepoRoot 'src\Agents\reviewer\testdata\replay-v1'
+$sourceReplayRoot = Join-Path $RepoRoot 'src\Agents\reviewer\testdata\replay-v1'
 $adapterManifest = Join-Path $fixtureRoot 'adapter-manifest.json'
 $oracle = Get-Content (Join-Path $fixtureRoot 'expected-oracle.json') -Raw | ConvertFrom-Json
-$digest = [string]((Get-Content (Join-Path $replayRoot 'synthetic-pr\manifest.json') -Raw | ConvertFrom-Json).manifestDigest)
 $expectedBase = [string]((Get-Content $adapterManifest -Raw | ConvertFrom-Json).expectedBaseCommit)
 $normalizer = Join-Path $PSScriptRoot 'ConvertTo-ReviewerSemanticDecision.ps1'
 $contract = Join-Path $PSScriptRoot 'testdata\reviewer-semantic-normalization-contract.v1.json'
+Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
+
+function New-EmptyThreadReplay {
+    param([Parameter(Mandatory)][string]$Sandbox)
+
+    $replayRoot = Join-Path $Sandbox 'replay'
+    $snapshotRoot = Join-Path $replayRoot 'synthetic-pr'
+    New-Item -ItemType Directory -Path $replayRoot -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $sourceReplayRoot 'synthetic-pr') -Destination $snapshotRoot -Recurse
+
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $payloadPath = Join-Path $snapshotRoot 'payloads\pr-threads.json'
+    $payloadBytes = $utf8.GetBytes('{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"[]"}]}}')
+    [IO.File]::WriteAllBytes($payloadPath, $payloadBytes)
+    $payloadSha = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($payloadBytes)).ToLowerInvariant()
+
+    $manifestPath = Join-Path $snapshotRoot 'manifest.json'
+    $manifest = [IO.File]::ReadAllText($manifestPath, $utf8) | ConvertFrom-Json -Depth 32
+    $threadResource = @($manifest.resources | Where-Object {
+            [string]$_.tool -ceq 'repo_pull_request_thread'
+        })
+    if ($threadResource.Count -ne 1) { throw 'Exact-path replay did not contain exactly one thread resource.' }
+    $threadResource[0].payloadSha256 = $payloadSha
+    $threadResource[0].payloadByteLength = $payloadBytes.Length
+    $manifest.PSObject.Properties.Remove('manifestDigest')
+    $canonical = ConvertTo-AgentReplayCanonicalJson -Value $manifest
+    $digest = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($utf8.GetBytes($canonical))).ToLowerInvariant()
+    $manifest | Add-Member -NotePropertyName manifestDigest -NotePropertyValue $digest
+    [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 32), $utf8)
+
+    return @{ Root = $replayRoot; Digest = $digest }
+}
 
 function Get-TypedArtifactGraph {
     param(
@@ -73,6 +106,7 @@ function Invoke-ExactPathRun {
     $stateDir = Join-Path $sandbox 'state'
     $telemetryPath = Join-Path $sandbox 'offline-telemetry.jsonl'
     New-Item -ItemType Directory -Path $configDir, $stateDir -Force | Out-Null
+    $emptyThreadReplay = New-EmptyThreadReplay -Sandbox $sandbox
     Copy-Item (Join-Path $fixtureRoot 'reviewer.config.json') (Join-Path $configDir 'reviewer.config.json')
     Copy-Item (Join-Path $RepoRoot 'src\Agents\reviewer\review-cycle.prompt.md') (Join-Path $configDir 'review-cycle.prompt.md')
     $output = & pwsh -NoProfile -File $reviewer -Once -RepoPath $RepoRoot `
@@ -82,7 +116,7 @@ function Invoke-ExactPathRun {
         -EnableConventionSpecialist -ConventionSpecialistModel claude-sonnet-5 `
         -EnableVerificationPreview -ConventionVerifierModel claude-opus-5 `
         -CycleTimeoutSeconds 30 -ConventionSpecialistTimeoutSeconds 30 -VerificationTimeoutSeconds 30 `
-        -ReplayRoot $replayRoot -ReplaySnapshotName synthetic-pr -ReplayManifestDigest $digest `
+        -ReplayRoot $emptyThreadReplay.Root -ReplaySnapshotName synthetic-pr -ReplayManifestDigest $emptyThreadReplay.Digest `
         -EnableOfflineModelAdapter -OfflineModelAdapterManifest $adapterManifest `
         -ExpectedReviewerBaseCommit $expectedBase -OfflineTelemetryPath $telemetryPath 2>&1
     if ($LASTEXITCODE -ne 0) { throw "Exact-path reviewer failed: $($output -join [Environment]::NewLine)" }

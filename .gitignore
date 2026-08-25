@@ -1,6 +1,8 @@
 # PowerShell / module build output
 *.nupkg
 output/
+bin/
+obj/
 
 # Agent runtime state must never be committed: it contains repository
 # identifiers, PR numbers, and per-cycle activity logs.

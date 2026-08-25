@@ -4595,6 +4595,367 @@ Assert-Source (Test-Throws {
             -SourceCommit $fcSource -Policy $policy -PolicySha256 "" -NonceFactory { 'n' * 32 }
     }) "CLI iteration change-set movement during pinned content reads fails closed"
 
+# The live wrapper runs as a child script, where GetNewClosure creates a dynamic
+# module that cannot resolve the caller's script variables. Execute the exact
+# production function in that shape: only function locals may cross the closure.
+$gate5Project = "gate5-project"
+$gate5RepositoryIdConfig = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+$gate5RepositoryId = $gate5RepositoryIdConfig.ToLowerInvariant()
+$gate5RepositoryName = "gate5-repository-name"
+$gate5Module = $null
+$global:Gate5LiveCaptureFixture = @{
+    CliCalls = [System.Collections.Generic.List[object]]::new()
+    IdentityCalls = [System.Collections.Generic.List[object]]::new()
+    McpCalls = [System.Collections.Generic.List[object]]::new()
+    ReaderCalls = [System.Collections.Generic.List[object]]::new()
+    TransportCalls = [System.Collections.Generic.List[object]]::new()
+}
+try {
+    $gate5Module = New-Module -ArgumentList @(
+        (Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportNewContract'),
+        (Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportAzCliFallback'),
+        $gate5Project,
+        $gate5RepositoryIdConfig,
+        $gate5RepositoryName,
+        $recoveryBinding.Organization,
+        $largePolicy,
+        ""
+    ) -ScriptBlock {
+        param(
+            [string]$NewContractFunctionText,
+            [string]$FallbackFunctionText,
+            [string]$OuterProject,
+            [string]$OuterRepositoryId,
+            [string]$OuterRepositoryName,
+            [string]$OuterOrganization,
+            [hashtable]$OuterPolicy,
+            [string]$OuterPolicySha256
+        )
+        $script:ExpectedProject = $OuterProject
+        $script:cfgRepoId = $OuterRepositoryId
+        $script:RepositoryName = $OuterRepositoryName
+        $script:Organization = $OuterOrganization
+        $script:CfgAzCliFallbackTenantId = "00000000-0000-0000-0000-000000000000"
+        $script:SourceTransportPolicy = $OuterPolicy
+        $script:SourceTransportPolicySha256 = $OuterPolicySha256
+        $script:ReviewerSourceMaxRecoveryBytesPerSide = 2097152
+        function New-ReviewerSourceAzCliInvoker {
+            param([string]$Organization, [string]$ExpectedTenantId)
+            [void]$global:Gate5LiveCaptureFixture.CliCalls.Add([pscustomobject]@{
+                    Organization = $Organization
+                    ExpectedTenantId = $ExpectedTenantId
+                })
+            return { throw "the Gate5 live-capture identity stub must not invoke a CLI process" }
+        }
+        function Get-ReviewerSourceAzIdentityCapture {
+            param(
+                [scriptblock]$AzInvoker,
+                [string]$Project,
+                [string]$RepositoryId,
+                [int]$PrId,
+                [string]$SourceCommit
+            )
+            [void]$global:Gate5LiveCaptureFixture.IdentityCalls.Add([pscustomobject]@{
+                    Project = $Project; RepositoryId = $RepositoryId
+                    PrId = $PrId; SourceCommit = $SourceCommit
+                })
+            return [pscustomobject]@{ Stub = "identity" }
+        }
+        function Invoke-AgentMcpTool {
+            param([hashtable]$Session, [string]$Name, [hashtable]$Arguments)
+            [void]$global:Gate5LiveCaptureFixture.McpCalls.Add([pscustomobject]@{
+                    SessionMarker = [string]$Session.Marker
+                    Name = $Name
+                    Arguments = $Arguments
+                })
+            return [pscustomobject]@{ Stub = "aggregate" }
+        }
+        function Get-ReviewerBoundSourceContent {
+            param(
+                [hashtable]$Session,
+                [string]$Path,
+                [string]$CommitSha,
+                [string[]]$ChangeKinds,
+                [int]$MaxBytesPerFile = 0
+            )
+            [void]$global:Gate5LiveCaptureFixture.ReaderCalls.Add([pscustomobject]@{
+                    SessionMarker = [string]$Session.Marker
+                    Path = $Path
+                    CommitSha = $CommitSha
+                    ChangeKinds = @($ChangeKinds)
+                    MaxBytesPerFile = $MaxBytesPerFile
+                })
+            return [pscustomobject]@{ Stub = "reader" }
+        }
+        function Invoke-ReviewerSourceNewContractTransport {
+            param(
+                [scriptblock]$IdentityReader,
+                [scriptblock]$Reader,
+                [scriptblock]$BaseReader,
+                [scriptblock]$RecoveryReader,
+                [scriptblock]$RecoveryBaseReader,
+                [scriptblock]$AggregateReader,
+                [scriptblock]$ToolInvoker,
+                [string]$Organization,
+                [string]$Project,
+                [string]$RepositoryId,
+                [int]$PrId,
+                [string]$SourceCommit,
+                [hashtable]$Policy,
+                [string]$PolicySha256,
+                $Capability,
+                [scriptblock]$NonceFactory
+            )
+            [void]$global:Gate5LiveCaptureFixture.TransportCalls.Add([pscustomobject]@{
+                    Mode = $(if ($IdentityReader) { "fallback" } else { "flat" })
+                    Project = $Project
+                    RepositoryId = $RepositoryId
+                })
+            if ($ToolInvoker) {
+                [void](& $ToolInvoker @{
+                        action = "get_changes"; project = $Project
+                        repositoryId = $RepositoryId; pullRequestId = $PrId
+                    })
+            }
+            if ($IdentityReader) {
+                [void](& $IdentityReader)
+            }
+            [void](& $AggregateReader)
+            [void](& $Reader "/src/gate5.cs" @("edit"))
+            [void](& $BaseReader "/src/gate5.cs" @("edit") ("b" * 40))
+            [void](& $RecoveryReader "/src/gate5.cs" @("edit"))
+            [void](& $RecoveryBaseReader "/src/gate5.cs" @("edit") ("b" * 40))
+            return [pscustomobject]@{
+                Report = @{}; BlockText = ""; Gate = @{ Ok = $true }
+                Record = @{}; Binding = @{}
+            }
+        }
+        . ([scriptblock]::Create($NewContractFunctionText))
+        . ([scriptblock]::Create($FallbackFunctionText))
+
+        function Invoke-Gate5LiveCapture {
+            $session = @{ Marker = "gate5-session" }
+            $project = [string]$script:ExpectedProject
+            $repositoryId = ([string]$script:cfgRepoId).ToLowerInvariant()
+            $repositoryName = [string]$script:RepositoryName
+            $precondition = {
+                [pscustomobject]@{
+                    Project = $project
+                    RepositoryId = $repositoryId
+                    RepositoryName = $repositoryName
+                }
+            }.GetNewClosure()
+            return [pscustomobject]@{
+                Captured = (& $precondition)
+                FallbackResult = (Get-ReviewerSourceTransportAzCliFallback -Session $session -PrId 62 `
+                        -SourceCommit ("a" * 40))
+                FlatResult = (Get-ReviewerSourceTransportNewContract -Session $session -PrId 62 `
+                        -SourceCommit ("a" * 40) -Capability ([pscustomobject]@{ Stub = "capability" }))
+            }
+        }
+        Export-ModuleMember -Function Invoke-Gate5LiveCapture
+    }
+    $gate5Probe = & $gate5Module { Invoke-Gate5LiveCapture }
+    $gate5Identity = @($global:Gate5LiveCaptureFixture.IdentityCalls)
+    $gate5Mcp = @($global:Gate5LiveCaptureFixture.McpCalls)
+    Assert-Source (
+        [string]$gate5Probe.Captured.Project -ceq $gate5Project -and
+        [string]$gate5Probe.Captured.RepositoryId -ceq $gate5RepositoryId -and
+        [string]$gate5Probe.Captured.RepositoryName -ceq $gate5RepositoryName
+    ) "Gate5 dynamic-module precondition proves function locals retain all three exact script inputs"
+    Assert-Source (
+        [string]$gate5Probe.FallbackResult.Mode -ceq "azureDevOpsCliFallback" -and
+        [string]$gate5Probe.FlatResult.Mode -ceq "mcpFlat" -and
+        $global:Gate5LiveCaptureFixture.CliCalls.Count -eq 1 -and
+        [string]$global:Gate5LiveCaptureFixture.CliCalls[0].Organization -ceq $recoveryBinding.Organization -and
+        [string]$global:Gate5LiveCaptureFixture.CliCalls[0].ExpectedTenantId -ceq
+            "00000000-0000-0000-0000-000000000000" -and
+        $gate5Identity.Count -eq 1 -and
+        [string]$gate5Identity[0].Project -ceq $gate5Project -and
+        [string]$gate5Identity[0].RepositoryId -ceq $gate5RepositoryId -and
+        [int]$gate5Identity[0].PrId -eq 62 -and
+        [string]$gate5Identity[0].SourceCommit -ceq ("a" * 40) -and
+        @($global:Gate5LiveCaptureFixture.TransportCalls | Where-Object {
+                [string]$_.Mode -ceq "fallback" -and
+                [string]$_.Project -ceq $gate5Project -and
+                [string]$_.RepositoryId -ceq $gate5RepositoryId
+            }).Count -eq 1 -and
+        @($global:Gate5LiveCaptureFixture.TransportCalls | Where-Object {
+                [string]$_.Mode -ceq "flat" -and
+                [string]$_.Project -ceq $gate5Project -and
+                [string]$_.RepositoryId -ceq $gate5RepositoryId
+            }).Count -eq 1 -and
+        $gate5Mcp.Count -eq 3 -and
+        @($gate5Mcp | Where-Object {
+                [string]$_.Name -ceq "repo_pull_request" -and
+                [string]$_.SessionMarker -ceq "gate5-session" -and
+                [string]$_.Arguments.action -ceq "get_changes" -and
+                [string]$_.Arguments.project -ceq $gate5Project -and
+                [string]$_.Arguments.repositoryId -ceq $gate5RepositoryId -and
+                [int]$_.Arguments.pullRequestId -eq 62
+            }).Count -eq 1 -and
+        @($gate5Mcp | Where-Object {
+                [string]$_.Name -ceq "repo_pull_request" -and
+                [string]$_.SessionMarker -ceq "gate5-session" -and
+                [string]$_.Arguments.action -ceq "get_changes" -and
+                [string]$_.Arguments.project -ceq $gate5Project -and
+                [string]$_.Arguments.repositoryId -ceq $gate5RepositoryName -and
+                [int]$_.Arguments.pullRequestId -eq 62 -and
+                [bool]$_.Arguments.includeDiffs -and
+                [bool]$_.Arguments.includeLineContent -and
+                [int]$_.Arguments.top -eq 1000
+            }).Count -eq 2 -and
+        $global:Gate5LiveCaptureFixture.ReaderCalls.Count -eq 8 -and
+        @($global:Gate5LiveCaptureFixture.ReaderCalls | Where-Object {
+                [string]$_.SessionMarker -ceq "gate5-session" -and
+                [string]$_.Path -ceq "/src/gate5.cs" -and
+                @($_.ChangeKinds).Count -eq 1 -and
+                [string]$_.ChangeKinds[0] -ceq "edit" -and
+                [string]$_.CommitSha -ceq ("a" * 40)
+            }).Count -eq 4 -and
+        @($global:Gate5LiveCaptureFixture.ReaderCalls | Where-Object {
+                [string]$_.SessionMarker -ceq "gate5-session" -and
+                [string]$_.Path -ceq "/src/gate5.cs" -and
+                @($_.ChangeKinds).Count -eq 1 -and
+                [string]$_.ChangeKinds[0] -ceq "edit" -and
+                [string]$_.CommitSha -ceq ("b" * 40)
+            }).Count -eq 4 -and
+        @($global:Gate5LiveCaptureFixture.ReaderCalls |
+            Where-Object MaxBytesPerFile -EQ 0).Count -eq 4 -and
+        @($global:Gate5LiveCaptureFixture.ReaderCalls |
+            Where-Object MaxBytesPerFile -EQ 2097152).Count -eq 4
+    ) "Gate5 live wrappers capture routing values and callable seams before all closures"
+}
+finally {
+    if ($gate5Module) {
+        Remove-Module $gate5Module -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Variable -Name Gate5LiveCaptureFixture -Scope Global -ErrorAction SilentlyContinue
+}
+
+# Execute the real library orchestrator from a child module. Its nested closures
+# must capture library helpers just as the live child-script wrapper does.
+$gate6Identity = [pscustomobject]@{
+    Binding = $fcBinding
+    Response = $azAggregateDegenerate
+    ChangeSetSha256 = (Get-ReviewerSourceChangeIdentityDigest -Response $azAggregateDegenerate)
+}
+$gate6OrdinaryIdentity = [pscustomobject]@{
+    Binding = $fcBinding
+    Response = $fcSingle
+    ChangeSetSha256 = (Get-ReviewerSourceChangeIdentityDigest -Response $fcSingle)
+}
+$gate6Module = New-Module -ArgumentList @(
+    (Join-Path $repoRoot "src/Agents/reviewer/SourceTransport.ps1"),
+    $gate6Identity,
+    $azAggregateDegenerate,
+    $gate6OrdinaryIdentity,
+    $fcSingle,
+    $policy,
+    $fcSource,
+    $fcRepoId,
+    $fcPr,
+    $sourceText,
+    $targetText
+) -ScriptBlock {
+    param(
+        [string]$SourceTransportPath,
+        $Identity,
+        $Aggregate,
+        $OrdinaryIdentity,
+        $OrdinaryAggregate,
+        [hashtable]$TransportPolicy,
+        [string]$SourceCommit,
+        [string]$RepositoryId,
+        [int]$PrId,
+        [string]$SourceText,
+        [string]$BaseText
+    )
+    . $SourceTransportPath
+    $script:Gate6Identity = $Identity
+    $script:Gate6Aggregate = $Aggregate
+    $script:Gate6OrdinaryIdentity = $OrdinaryIdentity
+    $script:Gate6OrdinaryAggregate = $OrdinaryAggregate
+    $script:Gate6Policy = $TransportPolicy
+    $script:Gate6SourceCommit = $SourceCommit
+    $script:Gate6RepositoryId = $RepositoryId
+    $script:Gate6PrId = $PrId
+    $script:Gate6SourceText = $SourceText
+    $script:Gate6BaseText = $BaseText
+    function Invoke-Gate6Orchestrator {
+        param([ValidateSet("ordinary", "recovery", "oversize")][string]$Shape)
+        $identity = if ($Shape -ceq "ordinary") {
+            $script:Gate6OrdinaryIdentity
+        } else {
+            $script:Gate6Identity
+        }
+        $aggregate = if ($Shape -ceq "ordinary") {
+            $script:Gate6OrdinaryAggregate
+        } else {
+            $script:Gate6Aggregate
+        }
+        $transportPolicy = $script:Gate6Policy
+        $sourceCommit = $script:Gate6SourceCommit
+        $repositoryId = $script:Gate6RepositoryId
+        $prId = $script:Gate6PrId
+        $sourceText = $script:Gate6SourceText
+        $baseText = $script:Gate6BaseText
+        $identityReader = { $identity }.GetNewClosure()
+        $aggregateReader = { $aggregate }.GetNewClosure()
+        $reader = {
+            param([string]$Path, [string[]]$Kinds)
+            if ($Shape -ceq "oversize") {
+                return [pscustomobject]@{
+                    Text = ""; MimeType = "text/plain"
+                    ByteLength = [int]$transportPolicy.maxFetchBytesPerFile + 1
+                    Sha256 = ""; Rejected = "fileTooLarge"; Path = $Path
+                    CommitSha = $sourceCommit; ChangeKinds = @($Kinds)
+                }
+            }
+            [pscustomobject]@{
+                Text = $sourceText; MimeType = "text/plain"
+                ByteLength = [Text.Encoding]::UTF8.GetByteCount($sourceText)
+                Sha256 = "0" * 64; Rejected = ""; Path = $Path
+                CommitSha = $sourceCommit; ChangeKinds = @($Kinds)
+            }
+        }.GetNewClosure()
+        $baseReader = {
+            param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+            [pscustomobject]@{
+                Text = $baseText; MimeType = "text/plain"
+                ByteLength = [Text.Encoding]::UTF8.GetByteCount($baseText)
+                Sha256 = "0" * 64; Rejected = ""; Path = $Path
+                CommitSha = $BaseCommit; ChangeKinds = @($Kinds)
+            }
+        }.GetNewClosure()
+        Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
+            -Reader $reader -BaseReader $baseReader -AggregateReader $aggregateReader `
+            -Organization "contoso" -Project "widgets" -RepositoryId $repositoryId `
+            -PrId $prId -SourceCommit $sourceCommit -Policy $transportPolicy `
+            -PolicySha256 "" -NonceFactory { "n" * 32 }
+    }
+    Export-ModuleMember -Function Invoke-Gate6Orchestrator
+}
+try {
+    $gate6Ordinary = & $gate6Module { Invoke-Gate6Orchestrator -Shape "ordinary" }
+    $gate6Recovery = & $gate6Module { Invoke-Gate6Orchestrator -Shape "recovery" }
+    $gate6Oversize = & $gate6Module { Invoke-Gate6Orchestrator -Shape "oversize" }
+    Assert-Source ($gate6Ordinary.Gate.Ok -and [int]$gate6Ordinary.Report.CoveredFiles -eq 1 -and
+        [int]$gate6Ordinary.Report.RecoveryAttemptedFileCount -eq 0) `
+        "Gate6 child-module ordinary reads resolve the captured binding helper"
+    Assert-Source ($gate6Recovery.Gate.Ok -and [int]$gate6Recovery.Report.CoveredFiles -eq 1 -and
+        [int]$gate6Recovery.Report.RecoveryAttemptedFileCount -eq 1 -and
+        [int]$gate6Recovery.Report.RecoveryRecoveredFileCount -eq 1 -and
+        $gate6Recovery.BlockText -match '"spanBasis":"recovered"') `
+        "Gate6 child-module recovery resolves captured library helpers inside every nested closure"
+    Assert-Source (-not $gate6Oversize.Gate.Ok -and
+        @($gate6Oversize.Report.Files | Where-Object Reason -CEQ "fileTooLarge").Count -eq 1) `
+        "Gate6 child-module oversize recovery resolves captured value and binding helpers"
+}
+finally {
+    Remove-Module $gate6Module -Force -ErrorAction SilentlyContinue
+}
+
 # -- Executable production-wrapper recovery readers --------------------------
 # Load only the two thin adapters from the production wrapper. Their dependencies
 # below are deterministic in-process recorders; no MCP, CLI process, or model runs.

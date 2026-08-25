@@ -62,7 +62,11 @@ jobs:
     name: Agent self-checks (-DryRun)
     runs-on: windows-latest
     steps:
+      # Full history: the escape ledger cites this repository's own commits and
+      # the ledger check verifies that each one exists.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Offline by design: no network, no Azure DevOps, no Copilot process.
       - name: review-handler -DryRun
@@ -163,6 +167,61 @@ jobs:
       - name: empty-to-null AST analyzer fixture measurement
         shell: pwsh
         run: ./tools/Test-PowerShellEmptyNullHazardAnalyzer.ps1
+
+      # Boundary hardening. The fixture half proves each rule still detects its
+      # own hazard and still ignores its own counterexample; the repository half
+      # blocks any finding that is not in the recorded baseline. Existing
+      # findings are debt, not approval.
+      - name: PowerShell boundary hardening gate
+        shell: pwsh
+        run: ./tools/Test-PowerShellBoundaryHardening.ps1
+
+      # The versioned file contract for stage child outputs: required kind and
+      # contract version, caller-specified file, explicit depth and form, UTF-8
+      # with no byte order mark, and fail-closed reads.
+      - name: stage file contract enforcement
+        shell: pwsh
+        run: ./tools/Test-ReviewerStageContract.ps1
+
+      # Adoption of that contract by the twelve real stage producers: each one
+      # must call its boundary, consume the verdict, and reach it from its own
+      # entry point. The suite reads the producers' syntax trees, so deleting a
+      # call or assigning its verdict to $null fails here rather than silently
+      # unwiring a boundary.
+      - name: stage producer contract adoption
+        shell: pwsh
+        run: ./tools/Test-ReviewerStageProducerContract.ps1
+
+      # The opt-in shadow path that puts the on-disk half of that contract in
+      # force: all twelve boundaries publish through the atomic writer and read
+      # straight back through the strict reader, and the reread verdict is
+      # consumed. The suite proves the switch is off by default, refuses to open
+      # while any delivery capability is live, and fails on every fault the
+      # boundary exists to catch.
+      - name: stage contract shadow adoption
+        shell: pwsh
+        run: ./tools/Test-ReviewerStageShadow.ps1
+
+      # The rule a future C# coordinator has to satisfy, fixed before the port:
+      # it consumes these schemas and may not carry prompt or verdict logic.
+      - name: coordinator stage contract architecture
+        shell: pwsh
+        run: ./tools/Test-ReviewerCoordinatorContract.ps1
+
+      # Every inventoried collection field at zero, one, many, maximum,
+      # duplicate, null-versus-missing, and wrong-scalar, plus the escape-shape
+      # properties and the sabotage suite that proves each historical collapse
+      # is still detected.
+      - name: collection cardinality corpus
+        shell: pwsh
+        run: ./tools/Test-ReviewerCollectionCardinality.ps1
+
+      # The escape ledger must agree with its own arithmetic: counts recomputed
+      # from the incident list, the registered budget trigger re-evaluated, and
+      # the narrative kept in step with the data.
+      - name: escape ledger and budget
+        shell: pwsh
+        run: ./tools/Test-EscapeLedger.ps1 -VerifyCommits
 
       - name: convention-pack schema and replay checks
         shell: pwsh

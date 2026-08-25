@@ -1,0 +1,252 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-stage-producer-contracts",
+  "description": "The stage producer/consumer boundaries in force. Generated from src/Agents/reviewer/StageProducers.ps1 and compared against it by tools/Test-ReviewerStageProducerContract.ps1; the runtime table is the source of truth, this file is the pin.",
+  "boundaries": [
+    {
+      "stage": "capture",
+      "kind": "reviewer.stage.capture.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerCaptureStageContract",
+      "producer": "Assert-ReviewerAcquisitionTranscriptPackage",
+      "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
+      "summary": "The authenticated transcript package, as the set of bound files, bound directories, and per-attempt marker statuses the capture published.",
+      "requiredFields": [
+        "packageFiles",
+        "packageDirectories",
+        "attemptMarkerStatuses"
+      ],
+      "collectionFields": [
+        "packageFiles",
+        "packageDirectories",
+        "attemptMarkerStatuses"
+      ],
+      "mapFields": [],
+      "collectionSlot": "packageFiles",
+      "mapSlot": ""
+    },
+    {
+      "stage": "source",
+      "kind": "reviewer.stage.source.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerSourceStageContract",
+      "producer": "Get-ReviewerSourceRawChangedPaths",
+      "producerFile": "src/Agents/reviewer/SourceTransport.ps1",
+      "summary": "The raw changed-path census a change set named, before normalization, so a rejected path stays in the denominator.",
+      "requiredFields": [
+        "changedPaths"
+      ],
+      "collectionFields": [
+        "changedPaths"
+      ],
+      "mapFields": [],
+      "collectionSlot": "changedPaths",
+      "mapSlot": ""
+    },
+    {
+      "stage": "snapshot",
+      "kind": "reviewer.stage.snapshot.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerSnapshotStageContract",
+      "producer": "Get-ReviewerCorpusSealSpanEvidence",
+      "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
+      "summary": "The authoritative right-hand span census derived from captured evidence: the ordered path list and the keyed path-to-spans map.",
+      "requiredFields": [
+        "spanPaths",
+        "spansByPath"
+      ],
+      "collectionFields": [
+        "spanPaths"
+      ],
+      "mapFields": [
+        "spansByPath"
+      ],
+      "collectionSlot": "spanPaths",
+      "mapSlot": "spansByPath"
+    },
+    {
+      "stage": "corpus",
+      "kind": "reviewer.stage.corpus.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerCorpusStageContract",
+      "producer": "Get-ReviewerEvalGroundTruth",
+      "producerFile": "src/Agents/reviewer/evaluation/Evaluation.ps1",
+      "summary": "The reconciled ground truth for one corpus example: the resolved issue set and the reason codes that explain a refusal to resolve.",
+      "requiredFields": [
+        "issueIds",
+        "reasonCodes"
+      ],
+      "collectionFields": [
+        "issueIds",
+        "reasonCodes"
+      ],
+      "mapFields": [],
+      "collectionSlot": "issueIds",
+      "mapSlot": ""
+    },
+    {
+      "stage": "blindResults",
+      "kind": "reviewer.stage.blindresults.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerBlindResultsStageContract",
+      "producer": "Expand-ReviewerConventionSpecialistConstructIds",
+      "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
+      "summary": "The construct ids a blind specialist row accounted for, and the ids it named more than once.",
+      "requiredFields": [
+        "constructIds",
+        "duplicatedConstructIds"
+      ],
+      "collectionFields": [
+        "constructIds",
+        "duplicatedConstructIds"
+      ],
+      "mapFields": [],
+      "collectionSlot": "constructIds",
+      "mapSlot": ""
+    },
+    {
+      "stage": "candidateUnion",
+      "kind": "reviewer.stage.candidateunion.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerCandidateUnionStageContract",
+      "producer": "Get-ReviewerVerificationClusters",
+      "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
+      "summary": "The clustered union of discovered candidates, plus the candidate hashes pushed past the active cap.",
+      "requiredFields": [
+        "clusters",
+        "overflowCandidateHashes"
+      ],
+      "collectionFields": [
+        "clusters",
+        "overflowCandidateHashes"
+      ],
+      "mapFields": [],
+      "collectionSlot": "clusters",
+      "mapSlot": ""
+    },
+    {
+      "stage": "fingerprints",
+      "kind": "reviewer.stage.fingerprints.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerFingerprintsStageContract",
+      "producer": "Get-ReviewerGateApprovalCoverageKey",
+      "producerFile": "src/Agents/reviewer/DeliveryGates.ps1",
+      "summary": "The two important-or-higher key sets an approval grant is bound to: the sealed gate set and the freshly confirmed set.",
+      "requiredFields": [
+        "gateImportantOrHigherKeys",
+        "confirmedImportantOrHigherKeys"
+      ],
+      "collectionFields": [
+        "gateImportantOrHigherKeys",
+        "confirmedImportantOrHigherKeys"
+      ],
+      "mapFields": [],
+      "collectionSlot": "gateImportantOrHigherKeys",
+      "mapSlot": ""
+    },
+    {
+      "stage": "specialistPlan",
+      "kind": "reviewer.stage.specialistplan.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerSpecialistPlanStageContract",
+      "producer": "Get-ReviewerChangedConstructs",
+      "producerFile": "src/Agents/reviewer/ChangedConstructs.ps1",
+      "summary": "The deterministic construct census the specialist plan is anchored to, and the files it could only partially model.",
+      "requiredFields": [
+        "invocations",
+        "declarations",
+        "comments",
+        "assignments",
+        "partialFiles",
+        "fileSummaries"
+      ],
+      "collectionFields": [
+        "invocations",
+        "declarations",
+        "comments",
+        "assignments",
+        "partialFiles",
+        "fileSummaries"
+      ],
+      "mapFields": [],
+      "collectionSlot": "invocations",
+      "mapSlot": ""
+    },
+    {
+      "stage": "verifierAssignment",
+      "kind": "reviewer.stage.verifierassignment.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerVerifierAssignmentStageContract",
+      "producer": "Get-ReviewerVerificationAssignments",
+      "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
+      "summary": "The sealed verifier assignment plan: one row per candidate and verifier model, and the model pair it was cut against.",
+      "requiredFields": [
+        "assignments",
+        "verifierModels"
+      ],
+      "collectionFields": [
+        "assignments",
+        "verifierModels"
+      ],
+      "mapFields": [],
+      "collectionSlot": "assignments",
+      "mapSlot": ""
+    },
+    {
+      "stage": "verdict",
+      "kind": "reviewer.stage.verdict.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerVerdictStageContract",
+      "producer": "Get-ReviewerVerificationAcceptedConventionCandidates",
+      "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
+      "summary": "The candidates the verifiers accepted, after severity correction and debt follow-up resolution.",
+      "requiredFields": [
+        "acceptedCandidates"
+      ],
+      "collectionFields": [
+        "acceptedCandidates"
+      ],
+      "mapFields": [],
+      "collectionSlot": "acceptedCandidates",
+      "mapSlot": ""
+    },
+    {
+      "stage": "reconciliation",
+      "kind": "reviewer.stage.reconciliation.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerReconciliationStageContract",
+      "producer": "Get-ReviewerRunReconciliationDifference",
+      "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
+      "summary": "The exact-key difference between two runs of the same frozen input, kept as two ordered sides rather than one merged set.",
+      "requiredFields": [
+        "onlyLeft",
+        "onlyRight"
+      ],
+      "collectionFields": [
+        "onlyLeft",
+        "onlyRight"
+      ],
+      "mapFields": [],
+      "collectionSlot": "onlyLeft",
+      "mapSlot": ""
+    },
+    {
+      "stage": "deliveryDecision",
+      "kind": "reviewer.stage.deliverydecision.v1",
+      "contractVersion": 1,
+      "builder": "New-ReviewerDeliveryDecisionStageContract",
+      "producer": "Select-ReviewerGateSubset",
+      "producerFile": "src/Agents/reviewer/DeliveryGates.ps1",
+      "summary": "The remove-only delivery subset: the approved entries whose key survived the allow-list, in the approved order.",
+      "requiredFields": [
+        "selectedEntries"
+      ],
+      "collectionFields": [
+        "selectedEntries"
+      ],
+      "mapFields": [],
+      "collectionSlot": "selectedEntries",
+      "mapSlot": ""
+    }
+  ]
+}

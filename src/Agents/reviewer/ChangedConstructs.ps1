@@ -25,6 +25,21 @@
 
 Set-StrictMode -Version Latest
 
+# The twelve stage producer boundaries are declared in one shared file, so a
+# stage and the corpus that drives it can never exercise two different copies of
+# the same contract.
+#
+# The guard asks whether THIS script scope already holds the producer table, not
+# whether the commands are merely visible. A dot-sourced library resolves
+# $script: variables against the scope of whoever is running it, so a script that
+# can see an outer scope's functions but never loaded the libraries itself would
+# reach a registry that does not exist there - and it would only find out at the
+# first boundary call, which is exactly the call that must not fail for the wrong
+# reason.
+if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'StageProducers.ps1')
+}
+
 $script:ReviewerConstructVersion = 1
 $script:ReviewerConstructMaxPerFile = 30
 $script:ReviewerConstructMaxTotal = 120
@@ -1124,15 +1139,25 @@ function Get-ReviewerChangedConstructs {
             })
     }
 
+    # The specialist-plan stage boundary, in force. Six censuses decide what the
+    # specialists are allowed to see: four construct kinds, the files this
+    # enumerator understood only partially, and the per-file summaries the
+    # precedent arguments are built on. Each of them is legitimately empty on some
+    # change set, and each of them, collapsed, reads downstream as a smaller and
+    # more confident scope than was actually enumerated - a partial file list that
+    # lost its single entry is a file silently promoted to fully understood.
+    $planned = New-ReviewerSpecialistPlanStageContract -Invocations $invocations -Declarations $declarations `
+        -Comments $comments -Assignments $assignments -PartialFiles $partialFiles -FileSummaries $fileSummaries
+
     # Fair split, not first-come. Filling the budget with whichever kind happens
     # to be emitted first would starve a whole kind on a change set that leans
     # one way - which is exactly the change set where the starved kind's rule
     # most needs its anchors.
     $sets = [ordered]@{
-        invocation = $invocations
-        declaration = $declarations
-        comment = $comments
-        assignment = $assignments
+        invocation = [object[]]$planned.invocations
+        declaration = [object[]]$planned.declarations
+        comment = [object[]]$planned.comments
+        assignment = [object[]]$planned.assignments
     }
     $prefixes = @{ invocation = "mi"; declaration = "dc"; comment = "cm"; assignment = "as" }
     $counts = @{}
@@ -1213,9 +1238,9 @@ function Get-ReviewerChangedConstructs {
     return @{
         Version = $script:ReviewerConstructVersion
         Constructs = $constructs
-        Files = @($fileSummaries.ToArray())
+        Files = [object[]]$planned.fileSummaries
         IdRangesByKind = $idsByKind
         Truncated = ($truncated -or $perFileTruncated)
-        PartiallyUnderstoodFiles = @($partialFiles.ToArray())
+        PartiallyUnderstoodFiles = [object[]]$planned.partialFiles
     }
 }
