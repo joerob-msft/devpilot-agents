@@ -218,6 +218,31 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ShadowRunCoordinator.ps1
 
+      # The sequential cohort above that coordinator. Runs a three-entry cohort
+      # of stand-in preparations through a success, a supervised run that ended
+      # other than complete, and a fault, under both stop policies; kills the
+      # runner between entries and proves the resume neither re-attempts what
+      # ended nor runs beside a live child; and exercises the global ceiling,
+      # every identity refusal, the write and audit blocks, and the rebuildable
+      # index. No model, no provider, nothing outside a temporary sandbox.
+      - name: shadow cohort runner
+        shell: pwsh
+        run: ./tools/Test-ShadowCohortRunner.ps1
+
+      # The typed cohort-entry evidence builder that feeds the cohort above:
+      # exact wrapper-contract fixtures, one sabotage case per historical
+      # operator-assembly incident (BOM, identity aliases, the raw ADO repository
+      # shape, singleton arrays, exact-key nulls, a missing get_changes variant,
+      # a drifted resource URI, a target-config mismatch, census ordering, and a
+      # mutated read-only package), the cross-implementation prompt-asset digest
+      # parity, and the typed coordinator driven over a package this builder
+      # published. -IncludePreflight runs the coordinator assembly the step
+      # above built from an empty offline feed, so nothing here reaches a
+      # network. No model, no provider, nothing outside a temporary sandbox.
+      - name: typed cohort-entry evidence builder
+        shell: pwsh
+        run: ./tools/Test-ShadowCohortEntryEvidence.ps1 -IncludePreflight
+
       # Every inventoried collection field at zero, one, many, maximum,
       # duplicate, null-versus-missing, and wrong-scalar, plus the escape-shape
       # properties and the sabotage suite that proves each historical collapse
@@ -253,6 +278,14 @@ jobs:
       - name: convention-specialist isolation and schema checks
         shell: pwsh
         run: ./tools/Test-ConventionSpecialist.ps1
+
+      # The v2 generalist response contract: nonce challenge extraction, payload
+      # bounds, auth-tier classification, envelope sealing, and the offline
+      # adapter round trip. Offline by construction - the only process it starts
+      # is the committed deterministic adapter.
+      - name: generalist model response envelope v2
+        shell: pwsh
+        run: ./tools/Test-ReviewerModelResponseEnvelope.ps1
 
       # Layer 9: offline snapshot replay of the whole read seam, and the
       # specialist's rule-coverage accounting. Offline by construction: the

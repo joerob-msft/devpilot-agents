@@ -1263,6 +1263,184 @@ if ($golden.PSObject.Properties['authorizedPromptDeltas']) {
 }
 Assert-Specialist ($allowedPromptHashes -ccontains (Get-ReviewerConventionSpecialistSha256 -Text $generalistPrompt)) `
     "Disabled-path golden changed for the generalist prompt."
+
+# The generalist now receives the same kind of wrapper-built marker scaffold as
+# the specialist. Exercise the production renderer and production parser: this
+# is a formatting aid only, and changing or dropping a binding must still fail
+# at the existing strict parser/binding boundaries.
+& {
+    Invoke-Expression (Get-FunctionText -Text $wrapperText -Name 'Get-ReviewerRuntimeContext')
+    Invoke-Expression (Get-FunctionText -Text $wrapperText -Name 'Get-ReviewerMarkerSchema')
+    Invoke-Expression (Get-FunctionText -Text $wrapperText -Name 'Test-ReviewerMarkerBinding')
+    # The v2 response contract is rendered into the same runtime context, so the
+    # library that owns its text has to be present for this to exercise what the
+    # generalist actually receives.
+    . (Join-Path $PSScriptRoot '..\src\Agents\reviewer\ModelResponseEnvelope.ps1')
+    $script:ReviewerGeneralistContractV2 = $true
+
+    $script:ReviewerSeverities = @('critical', 'important', 'suggestion')
+    $script:ReviewerReplayActive = $false
+    $ResultMarkerPrefix = 'REVIEWER_RESULT_V1:'
+    $Organization = 'example-org'
+    $ExpectedProject = 'WrongAmbientProject'
+    $scaffoldProject = 'Example'
+    $RepositoryName = 'widgets'
+    $EffectiveMaxFindings = 12
+    $PostSeverities = @('critical', 'important')
+    $RepoConventionsText = ''
+    $repositoryId = '11111111-2222-3333-4444-555555555555'
+    $sourceCommit = ('a' * 40)
+    $issuedNonce = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'
+
+    $context = Get-ReviewerRuntimeContext -Nonce $issuedNonce -PrId 42 `
+        -RepositoryId $repositoryId -Project $scaffoldProject -SourceCommit $sourceCommit `
+        -SourceBranch 'feature/scaffold' -AuthorAlias 'colleague' `
+        -ThreadDigestText '[]'
+    $runtimeMatch = [regex]::Match($context,
+        '(?s)Wrapper runtime data .*?```json\r?\n(\{.*?\})\r?\n```')
+    Assert-Specialist $runtimeMatch.Success `
+        'The rendered generalist runtime context must contain wrapper runtime data as JSON.'
+    if (-not $runtimeMatch.Success) { return }
+
+    $runtimeJson = $runtimeMatch.Groups[1].Value
+    $runtime = $runtimeJson | ConvertFrom-Json
+    $scaffold = $runtime.markerScaffold
+    $schema = Get-ReviewerMarkerSchema -ExpectedProject $scaffoldProject `
+        -ExpectedNonce $issuedNonce -MaxFindingItems $EffectiveMaxFindings
+    $scaffoldKeys = @($scaffold.PSObject.Properties | ForEach-Object { $_.Name })
+    Assert-Specialist (($scaffoldKeys -join '|') -ceq (@($schema.Keys) -join '|')) `
+        'The generalist marker scaffold must have exactly the schema top-level keys, in order.'
+    Assert-Specialist ([int]$scaffold.schemaVersion -eq 1 -and
+        [int]$scaffold.prId -eq 42 -and
+        [string]$scaffold.repositoryId -ceq $repositoryId -and
+        [string]$scaffold.project -ceq $scaffoldProject -and
+        [string]$scaffold.reviewedSourceCommit -ceq $sourceCommit -and
+        [string]$scaffold.nonce -ceq $issuedNonce) `
+        'The generalist scaffold must carry every wrapper-known scalar and the issued nonce.'
+    Assert-Specialist (@($scaffold.findings).Count -eq 0 -and
+        [string]$scaffold.recommendedVote -ceq '' -and
+        [string]$scaffold.summary -ceq '') `
+        'The generalist scaffold must contain an empty findings array and empty model-owned placeholders.'
+    Assert-Specialist ($runtimeJson -cmatch '"findings":\[\]' -and
+        $runtimeJson -cmatch ('"nonce":"' + [regex]::Escape($issuedNonce) + '"') -and
+        $runtimeJson -cnotmatch '"severity"|"comment":|"recommendedVote":"(?:approve|approveWithSuggestions|waitForAuthor|none)"') `
+        'Scaffold serialization must preserve the empty array and nonce without supplying judgement content.'
+
+    $renderedPrompt = $generalistPrompt + "`n---`n" + $context
+    Assert-Specialist ($renderedPrompt -cmatch [regex]::Escape($runtimeJson) -and
+        $renderedPrompt -cmatch 'Fill in \*\*only\*\* its' -and
+        $renderedPrompt -cmatch 'change nothing else' -and
+        $renderedPrompt -cmatch 'Emit the inner `markerScaffold` object itself' -and
+        $renderedPrompt -cmatch 'Every `findings` element has exactly these keys' -and
+        $renderedPrompt -cmatch '(?s)`severity`.*`filePath`.*`line`.*`comment`') `
+        'The rendered generalist prompt must restrict scaffold edits and define the exact finding item shape.'
+    Assert-Specialist ($context -cmatch 'project `Example`' -and
+        $context -cnotmatch 'WrongAmbientProject') `
+        'The generalist scaffold and rendered scope must use the explicit project, not ambient dynamic scope.'
+    Assert-Specialist ($renderedPrompt -cnotmatch '<runtime nonce>|Copy the Runtime context|Nonce you MUST copy exactly') `
+        'The rendered generalist prompt must not retain a manual template that asks the model to retype the nonce.'
+
+    # The v2 two-part contract, rendered into the same context. The scaffold
+    # above is now a thinking aid; these lines are what the wrapper reads.
+    Assert-Specialist ($context -cmatch ('(?m)^' + [regex]::Escape("REVIEWER_NONCE_V2: $issuedNonce") + '$')) `
+        'The generalist context must issue the nonce as a standalone challenge line carrying the exact issued nonce.'
+    Assert-Specialist ($context -cmatch [regex]::Escape('REVIEWER_PAYLOAD_V2: {"schemaVersion":2,"reviewedSourceCommit":')) `
+        'The generalist context must show the exact v2 payload prefix and the commit-first payload shape.'
+    Assert-Specialist ($context -cnotmatch '(?m)^REVIEWER_PAYLOAD_V2:.*"prId"' -and
+        $context -cnotmatch '(?m)^REVIEWER_PAYLOAD_V2:.*"nonce"') `
+        'The v2 payload shape must not ask the generalist for a wrapper-owned binding or for the nonce.'
+    Assert-Specialist ($context -cmatch 'cannot be cast as a vote') `
+        'The v2 contract must tell the generalist what omitting the nonce line actually costs.'
+
+    # The same rendered context, read back by the production v2 parser. A model
+    # that copies what it was shown must authenticate, and the same answer with
+    # the challenge line dropped must survive as evidence rather than vanish.
+    $v2Payload = '{"schemaVersion":2,"reviewedSourceCommit":"' + $sourceCommit +
+    '","findings":[],"recommendedVote":"approve","summary":"No additional finding."}'
+    $v2Transcript = { param($IncludeNonce)
+        $content = if ($IncludeNonce) { "REVIEWER_NONCE_V2: $issuedNonce`nREVIEWER_PAYLOAD_V2: $v2Payload" }
+        else { "REVIEWER_PAYLOAD_V2: $v2Payload" }
+        return (ConvertTo-Json -Depth 8 -Compress -InputObject ([pscustomobject]@{
+                    type = 'assistant.message'
+                    data = [pscustomobject]@{ content = $content; model = 'claude-opus-5' }
+                }))
+    }
+    $v2Authenticated = Get-ReviewerModelResponseV2 -StdOutText (& $v2Transcript $true) `
+        -ExpectedNonce $issuedNonce -ExpectedSourceCommit $sourceCommit
+    Assert-Specialist ([string]$v2Authenticated.AuthTier -ceq 'authenticated') `
+        'A generalist that copies the issued v2 contract exactly must authenticate.'
+    $v2EvidenceOnly = Get-ReviewerModelResponseV2 -StdOutText (& $v2Transcript $false) `
+        -ExpectedNonce $issuedNonce -ExpectedSourceCommit $sourceCommit
+    Assert-Specialist ([string]$v2EvidenceOnly.AuthTier -ceq 'evidenceOnly' -and
+        $null -ne $v2EvidenceOnly.Payload -and $null -eq $v2EvidenceOnly.NonceObserved) `
+        'The same v2 answer without the challenge line must survive as evidence and be credited with no nonce.'
+
+    $unfilledOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+        $ResultMarkerPrefix + ' ' + ($scaffold | ConvertTo-Json -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    Assert-Specialist ([string]$unfilledOutcome.Status -ceq 'schemaInvalid' -and
+        [string]$unfilledOutcome.Field -ceq 'recommendedVote' -and [bool]$unfilledOutcome.Retryable) `
+        'An unfilled scaffold must fail closed at the empty recommendedVote placeholder.'
+
+    $filled = Copy-SpecialistObject $scaffold
+    $filled.findings = @([pscustomobject][ordered]@{
+            severity = 'important'; filePath = '/src/Widget.cs'; line = 42
+            comment = 'This path can return stale state.'
+        })
+    $filled.recommendedVote = 'approve'
+    $filled.summary = 'One important finding.'
+    $validOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+        $ResultMarkerPrefix + ' ' + ($filled | ConvertTo-Json -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    Assert-Specialist ([string]$validOutcome.Status -ceq 'success' -and
+        (Test-ReviewerMarkerBinding -Marker $validOutcome.Value -PrId 42 `
+            -RepositoryId $repositoryId -SourceCommit $sourceCommit)) `
+        'A filled generalist scaffold with a real finding must pass the existing strict parser and binding check.'
+
+    $missingNonce = Copy-SpecialistObject $filled
+    $missingNonce.PSObject.Properties.Remove('nonce')
+    $missingNonceOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+        $ResultMarkerPrefix + ' ' + ($missingNonce | ConvertTo-Json -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    Assert-Specialist ([string]$missingNonceOutcome.Status -ceq 'schemaInvalid' -and
+        [string]$missingNonceOutcome.Field -ceq 'nonce' -and [bool]$missingNonceOutcome.Retryable) `
+        'A prior-shape generalist marker missing its nonce must remain schemaInvalid/nonce and retryable.'
+
+    $wrongNonce = Copy-SpecialistObject $filled
+    $wrongNonce.nonce = 'changed-generalist-nonce'
+    $wrongNonceOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+        $ResultMarkerPrefix + ' ' + ($wrongNonce | ConvertTo-Json -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    Assert-Specialist ([string]$wrongNonceOutcome.Status -ceq 'wrongBinding' -and
+        [string]$wrongNonceOutcome.Field -ceq 'nonce' -and -not [bool]$wrongNonceOutcome.Retryable) `
+        'Changing the scaffold nonce must remain a terminal wrong-binding rejection.'
+
+    $missingPr = Copy-SpecialistObject $filled
+    $missingPr.PSObject.Properties.Remove('prId')
+    $missingPrOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+        $ResultMarkerPrefix + ' ' + ($missingPr | ConvertTo-Json -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    Assert-Specialist ([string]$missingPrOutcome.Status -ceq 'schemaInvalid' -and
+        [string]$missingPrOutcome.Field -ceq 'prId') `
+        'Dropping a wrapper-known scaffold binding must remain schema-invalid.'
+
+    foreach ($sabotage in @(
+            @{ Name = 'prId'; Value = 43 },
+            @{ Name = 'repositoryId'; Value = '99999999-8888-7777-6666-555555555555' },
+            @{ Name = 'reviewedSourceCommit'; Value = ('b' * 40) }
+        )) {
+        $changed = Copy-SpecialistObject $filled
+        $changed.($sabotage.Name) = $sabotage.Value
+        $changedOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText (
+            $ResultMarkerPrefix + ' ' + ($changed | ConvertTo-Json -Depth 8 -Compress)) `
+            -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+        Assert-Specialist ([string]$changedOutcome.Status -ceq 'success' -and
+            -not (Test-ReviewerMarkerBinding -Marker $changedOutcome.Value -PrId 42 `
+                -RepositoryId $repositoryId -SourceCommit $sourceCommit)) `
+            "Changing scaffold binding '$($sabotage.Name)' must be rejected by the existing exact binding check."
+    }
+}
+
 # A drift pin that accepts an older authorized hash is not a pin. Assert on the
 # ACCEPTANCE RULE, not on the source file: checking that the current function
 # text differs from a superseded hash would pass just as happily with the pin
@@ -1884,12 +2062,65 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
 # mocks and $script: config never leak into later tests.
 # ---------------------------------------------------------------------------
 & {
-    foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue',
-        'Invoke-ReviewerModelSubprocess', 'Invoke-ReviewerModelPass') {
-        Invoke-Expression (Get-FunctionText -Text $wrapperText -Name $fn)
+    $logDir = Join-Path ([IO.Path]::GetTempPath()) ("SIMULATED-OFFLINE-reviewer-item1-{0}" -f ([guid]::NewGuid()))
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $sentinelProcessName = "devpilot-never-run-$([guid]::NewGuid().ToString('N'))"
+    $sentinelAgencyPath = Join-Path $logDir "$sentinelProcessName.exe"
+    $telemetryPath = Join-Path $logDir 'offline-telemetry.jsonl'
+    $priorTelemetryMode = [Environment]::GetEnvironmentVariable('DEVPILOT_OFFLINE_TELEMETRY_MODE', 'Process')
+    $priorTelemetryPath = [Environment]::GetEnvironmentVariable('DEVPILOT_OFFLINE_TELEMETRY_PATH', 'Process')
+    $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = 'production-test-only'
+    $env:DEVPILOT_OFFLINE_TELEMETRY_PATH = $telemetryPath
+
+    $script:timedProcessCallCount = 0
+    $script:timedProcessCalls = [System.Collections.Generic.List[object]]::new()
+    $script:cannedStdOut = ''
+    # Define the interception boundary before importing the production functions.
+    # If command binding ever stops selecting this local function, the deliberately
+    # nonexistent AgencyPath below can only fail at Process.Start.
+    function Invoke-TimedProcess {
+        param($FilePath, $ArgumentList, $StandardInputContent, [switch]$CaptureStdOut, [switch]$CaptureStdErr, $WorkingDirectory, $EnvironmentVariablesToRemove, $TimeoutSeconds)
+        $script:timedProcessCallCount++
+        [void]$script:timedProcessCalls.Add([pscustomobject]@{
+                FilePath = [string]$FilePath
+                ProcessId = 0
+                Simulated = $true
+            })
+        Write-Host "[SIMULATED/OFFLINE STUB] Intercepted process call; no executable, model, provider, or network was started." -ForegroundColor DarkGray
+        @{ ProcessId = 0; StdOut = $script:cannedStdOut; StdErr = ''; ExitCode = 0; TimedOut = $false }
     }
-    # Assert-ReviewerModelResultContractFits was already defined above; the pass
-    # calls it as the real pre-launch gate.
+
+    try {
+        foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue',
+            'Invoke-ReviewerModelSubprocess', 'Invoke-ReviewerModelPass',
+            'ConvertTo-ReviewerBoundMarkerFromEnvelope', 'New-ReviewerResponsePassEnvelope',
+            'Test-ReviewerMarkerMatchesResponsePayload', 'Add-ReviewerBoundMarkerProvenance') {
+            Invoke-Expression (Get-FunctionText -Text $wrapperText -Name $fn)
+        }
+        # The v2 response contract is part of the real pass now, so the harness
+        # stands up the same library and the same out-of-repo run key the
+        # production script does. Without them the pass would silently fall back
+        # to v1 and this block would stop measuring what it claims to.
+        . (Join-Path $repoRoot 'src\Agents\reviewer\ModelResponseEnvelope.ps1')
+        $script:ReviewerGeneralistContractV2 = $true
+        $script:ReviewerRunId = 'selfcheck-run-0000'
+        $script:ReviewerResponseEnvelopeOrdinals = @{}
+        $script:ReviewerReplayActive = $false
+        $script:ReviewerReplaySnapshot = $null
+        $Organization = 'example-org'
+        $RepositoryName = 'widgets'
+        $TargetRefName = 'refs/heads/main'
+        $ConfigFile = Join-Path $logDir 'harness-config.json'
+        Set-Content -LiteralPath $ConfigFile -Value '{}' -Encoding UTF8
+        $artifactKeyPath = Join-Path $logDir 'harness-run.key'
+        $ScriptSelfSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (
+                Join-Path $repoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1')).Hash
+        # A fixed harness key. The real key loader reads a per-user file outside
+        # this sandbox; the property under test here is what the pass does with a
+        # sealed envelope, not where the key came from.
+        function Get-ReviewerRunArtifactKey { param([string]$KeyPath) return , [byte[]](1..32) }
+        # Assert-ReviewerModelResultContractFits was already defined above; the
+        # pass calls it as the real pre-launch gate.
     $script:ReviewerUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
     $script:ReviewerSeverities = @("critical", "important", "suggestion")
     $script:ReviewerMaxModelInputBytes = 10485760
@@ -1906,13 +2137,9 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $CopilotSensitiveEnvironmentVariables = @()
     $RepoPath = $repoRoot
     $CycleTimeoutSeconds = 60
-    $logDir = Join-Path ([IO.Path]::GetTempPath()) ("reviewer-item1-{0}" -f ([guid]::NewGuid()))
-    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $PromptFile = Join-Path $logDir 'prompt.md'
     Set-Content -LiteralPath $PromptFile -Value 'PROMPT' -Encoding UTF8
     $script:knownNonce = ('abc123' * 6)
-    $script:timedProcessCalled = $false
-    $script:cannedStdOut = ''
     # This block exercises the REAL extracted model-pass/subprocess functions, so
     # it must also stand up the module-scope state Start-ReviewerAgent.ps1 sets up
     # before any pass runs. Their production defaults are all "inactive": without
@@ -1929,8 +2156,16 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $script:ReviewerOfflineModelAdapterActive = $false
 
     function New-AgentNonce { $script:knownNonce }
-    function Get-ReviewerRuntimeContext { param($Nonce, $PrId, $RepositoryId, $SourceCommit, $SourceBranch, $AuthorAlias, $ThreadDigestText, $AuthoritativeSourcesText, $PinnedSourceText) '' }
+    function Get-ReviewerRuntimeContext { param($Nonce, $PrId, $RepositoryId, $Project, $SourceCommit, $SourceBranch, $AuthorAlias, $ThreadDigestText, $AuthoritativeSourcesText, $PinnedSourceText) '' }
     function Write-ReviewerCycleMetadata { param($Fields) }
+    # The real launch-intent writer publishes to the cycle log, which this
+    # harness does not stand up. Counted rather than ignored so the simulated
+    # boundary still shows one intent per intercepted process call.
+    $script:launchIntentCalls = [System.Collections.Generic.List[object]]::new()
+    function Write-ReviewerModelLaunchIntent {
+        param([string]$CensusRole, [string]$Model)
+        [void]$script:launchIntentCalls.Add([pscustomobject]@{ CensusRole = $CensusRole; Model = $Model })
+    }
     function Get-ReviewerEffectiveAllowTools { param($BaseAllow) @() }
     function Get-ReviewerLaunchAllowTools { param($Intended) @() }
     function ConvertTo-ReviewerAvailableToolNames { param($PermissionTools) @() }
@@ -1938,11 +2173,6 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     function Get-AgentDefaultModelSentinel { 'DEFAULT_SENTINEL' }
     function Get-AgentCopilotArgs { param($AgentName, $Source, $AvailableTools, $AllowTools, $DenyTools, $Model, [switch]$JsonOutput) @('--json') }
     function Add-ReviewerAcquisitionCapture { param($Run, $Role, $Model, $StandardInputContent, $Binding) }
-    function Invoke-TimedProcess {
-        param($FilePath, $ArgumentList, $StandardInputContent, [switch]$CaptureStdOut, [switch]$CaptureStdErr, $WorkingDirectory, $EnvironmentVariablesToRemove, $TimeoutSeconds)
-        $script:timedProcessCalled = $true
-        @{ StdOut = $script:cannedStdOut; StdErr = ''; ExitCode = 0; TimedOut = $false }
-    }
 
     $sourceCommit = ('a' * 40)
     $Bound = @{ PrId = 42; SourceCommit = $sourceCommit; SourceBranch = 'b'; AuthorAlias = 'x'; DigestText = '' }
@@ -1958,9 +2188,9 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
 
     # (1) A valid, correctly bound marker succeeds - the whole point of the fix.
     $script:cannedStdOut = New-Transcript -Marker $validMarker
-    $script:timedProcessCalled = $false
-    $okRes = Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
-    Assert-Specialist ($script:timedProcessCalled -and [string]$okRes.RejectionClass -ceq 'success' -and
+    Write-Host "[SIMULATED/OFFLINE CASE: valid marker] The following production launch text is exercised with canned output only." -ForegroundColor DarkCyan
+    $okRes = Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Assert-Specialist ($script:timedProcessCallCount -eq 1 -and [string]$okRes.RejectionClass -ceq 'success' -and
         $null -ne $okRes.Marker -and [int]$okRes.Marker['prId'] -eq 42) `
         "The live Invoke-ReviewerModelPass rejected a valid, correctly bound marker (the module-scope status regression)."
     Assert-Specialist ([long]$okRes.Usage.PremiumRequests -eq 3 -and [long]$okRes.Usage.TotalApiDurationMs -eq 100 -and [bool]$okRes.ModelRan) `
@@ -1972,7 +2202,8 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $noNonce = [ordered]@{ schemaVersion = 1; prId = 42; repositoryId = $cfgRepoId; project = 'One'
         reviewedSourceCommit = $sourceCommit; findings = @(); recommendedVote = 'approve'; summary = '' }
     $script:cannedStdOut = New-Transcript -Marker $noNonce
-    $noNonceRes = Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Write-Host "[SIMULATED/OFFLINE CASE: missing nonce] The following production launch text is exercised with canned output only." -ForegroundColor DarkCyan
+    $noNonceRes = Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
     Assert-Specialist ([string]$noNonceRes.RejectionClass -ceq 'schemaInvalid' -and $null -eq $noNonceRes.Marker -and
         $noNonceRes.Reason -match 'nonce') `
         "The live pass did not classify a missing-nonce marker as the typed schemaInvalid (field nonce) slip."
@@ -1985,25 +2216,141 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $wrongPr = [ordered]@{ schemaVersion = 1; prId = 999; repositoryId = $cfgRepoId; project = 'One'
         reviewedSourceCommit = $sourceCommit; findings = @(); recommendedVote = 'approve'; summary = ''; nonce = $script:knownNonce }
     $script:cannedStdOut = New-Transcript -Marker $wrongPr
-    $wrongRes = Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Write-Host "[SIMULATED/OFFLINE CASE: wrong PR] The following production launch text is exercised with canned output only." -ForegroundColor DarkCyan
+    $wrongRes = Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
     Assert-Specialist ([string]$wrongRes.RejectionClass -ceq 'wrongBinding' -and $null -eq $wrongRes.Marker) `
         "The live pass did not refuse a marker bound to the wrong pull request as wrongBinding."
     Assert-Specialist (-not (Test-AgentMarkerStatusRetryable -Status ([string]$wrongRes.RejectionClass))) `
         "The live pass reported a wrong-binding marker as retryable, which is how a replay would be handed extra tries."
+    Assert-Specialist ($script:timedProcessCallCount -eq 3) `
+        "The three simulated marker cases did not make exactly three stub calls."
+
+    # (7) The v2 two-part contract, end to end through the real pass. This is the
+    # PR16769165 shape one contract version later: the model answers completely
+    # and simply does not write the challenge line. Under v1 the whole pass was
+    # discarded and the reviewer vanished from the census; under v2 it must come
+    # back as a named, sealed, non-voting review.
+    $v2Payload = '{"schemaVersion":2,"reviewedSourceCommit":"' + $sourceCommit +
+    '","findings":[{"severity":"important","filePath":"/src/Widget.cs","line":15,' +
+    '"comment":"This path can return stale state."}],' +
+    '"recommendedVote":"waitForAuthor","summary":"One finding requires clarification."}'
+    $newV2Transcript = {
+        param([string]$Content)
+        $assistant = @{ type = 'assistant.message'; data = @{ content = $Content; model = 'claude-opus-5' } } |
+            ConvertTo-Json -Compress -Depth 8
+        $result = @{ type = 'result'; exitCode = 0; usage = @{ premiumRequests = 1; totalApiDurationMs = 10
+                sessionDurationMs = 12; codeChanges = @{ filesModified = @() }
+            }
+        } | ConvertTo-Json -Compress -Depth 8
+        return (($assistant, $result) -join "`n")
+    }
+
+    $script:cannedStdOut = & $newV2Transcript "REVIEWER_PAYLOAD_V2: $v2Payload"
+    Write-Host "[SIMULATED/OFFLINE CASE: v2 nonce absent] The following production launch text is exercised with canned output only." -ForegroundColor DarkCyan
+    $evidenceRes = Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Assert-Specialist ([string]$evidenceRes.RejectionClass -ceq 'evidenceOnly' -and
+        [string]$evidenceRes.AuthTier -ceq 'evidenceOnly' -and $null -eq $evidenceRes.Marker) `
+        "A complete v2 answer without the nonce line did not come back from the live pass as a named evidenceOnly review."
+    Assert-Specialist ($null -ne $evidenceRes.ResponseEnvelope -and
+        [string]$evidenceRes.ResponseEnvelope.kind -ceq 'reviewer-result-envelope.v2' -and
+        (Test-ReviewerModelResponseEnvelopeSeal -Envelope $evidenceRes.ResponseEnvelope `
+                -RunKey ([byte[]](1..32)))) `
+        "An evidenceOnly pass did not carry a sealed response envelope, which is what keeps the census complete."
+    Assert-Specialist ([int]$evidenceRes.ResponseEnvelope.binding.prId -eq 42 -and
+        [string]$evidenceRes.ResponseEnvelope.binding.sourceCommit -ceq $sourceCommit -and
+        [int]$evidenceRes.ResponseEnvelope.derived.severityCounts.important -eq 1) `
+        "An evidenceOnly envelope lost the wrapper bindings or the finding counts a census reads."
+    Assert-Specialist (-not (Test-AgentMarkerStatusRetryable -Status ([string]$evidenceRes.RejectionClass))) `
+        "evidenceOnly was reported as retryable, spending a model start to re-obtain evidence already in hand."
+    Assert-Specialist (-not (Test-ReviewerModelResponseEligible `
+                -AuthTier ([string]$evidenceRes.ResponseEnvelope.authTier))) `
+        "An evidenceOnly envelope was granted the right to vote."
+    $censusRecord = Get-ReviewerModelResponseCensusRecord -Envelope $evidenceRes.ResponseEnvelope `
+        -RunKey ([byte[]](1..32))
+    Assert-Specialist ([bool]$censusRecord.counted -and -not [bool]$censusRecord.eligible -and
+        [string]$censusRecord.authTier -ceq 'evidenceOnly' -and [int]$censusRecord.prId -eq 42) `
+        "An evidenceOnly envelope was dropped from the census, which is the exact loss this contract exists to stop."
+
+    # (8) The same answer WITH the challenge line and no v1 marker at all: the
+    # pass must succeed, and the marker it succeeds with must be rebuilt from
+    # wrapper state - never from anything the model said about the binding.
+    $script:cannedStdOut = & $newV2Transcript "REVIEWER_NONCE_V2: $($script:knownNonce)`nREVIEWER_PAYLOAD_V2: $v2Payload"
+    Write-Host "[SIMULATED/OFFLINE CASE: v2 authenticated] The following production launch text is exercised with canned output only." -ForegroundColor DarkCyan
+    $v2Res = Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Assert-Specialist ([string]$v2Res.RejectionClass -ceq 'success' -and
+        [string]$v2Res.AuthTier -ceq 'authenticated' -and $null -ne $v2Res.Marker) `
+        "A v2-only answer carrying the exact challenge line did not produce a usable pass."
+    Assert-Specialist ([int]$v2Res.Marker['prId'] -eq 42 -and
+        [string]$v2Res.Marker['repositoryId'] -ceq $cfgRepoId -and
+        [string]$v2Res.Marker['project'] -ceq $ExpectedProject -and
+        [string]$v2Res.Marker['nonce'] -ceq $script:knownNonce -and
+        [string]$v2Res.Marker['recommendedVote'] -ceq 'waitForAuthor') `
+        "The marker rebuilt from a v2 payload did not carry exactly the wrapper's own bindings plus the model's judgement."
+
+    # (9) A v2 payload bound to a DIFFERENT commit is terminal and never becomes
+    # evidence: forgetting the credential and pointing at other work are not the
+    # same event, and only the first one is survivable.
+    $script:cannedStdOut = & $newV2Transcript ("REVIEWER_NONCE_V2: $($script:knownNonce)`nREVIEWER_PAYLOAD_V2: " +
+        ($v2Payload -replace [regex]::Escape($sourceCommit), ('b' * 40)))
+    Write-Host "[SIMULATED/OFFLINE CASE: v2 wrong commit] The following production launch text is exercised with canned output only." -ForegroundColor DarkCyan
+    $v2WrongCommit = Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Assert-Specialist ($null -eq $v2WrongCommit.Marker -and
+        [string]$v2WrongCommit.AuthTier -ceq 'none' -and
+        [string]$v2WrongCommit.RejectionClass -cne 'evidenceOnly') `
+        "A v2 payload bound to another commit was allowed to survive as evidence or to produce a marker."
+
+    Assert-Specialist ($script:timedProcessCallCount -eq 6) `
+        "The v2 contract cases did not make exactly one stub call each."
+    Assert-Specialist (@($script:timedProcessCalls | Where-Object {
+                [string]$_.FilePath -cne $sentinelAgencyPath -or [int]$_.ProcessId -ne 0 -or -not [bool]$_.Simulated
+            }).Count -eq 0) `
+        "A simulated marker case did not stay bound to the ProcessId=0 nonexistent-executable stub."
+    Assert-Specialist (-not (Test-Path -LiteralPath $sentinelAgencyPath) -and
+        $null -eq (Get-Process -Name $sentinelProcessName -ErrorAction SilentlyContinue) -and
+        -not (Test-Path -LiteralPath $telemetryPath)) `
+        "A sentinel executable/process or offline telemetry/model/provider event was observed."
 
     # (4) When the declared scan window cannot hold the schema's largest legal
     # marker, the pre-launch gate must refuse to launch: Invoke-TimedProcess is
     # never reached. Shrinking the window below the generalist worst case proves
     # the gate is a real launch barrier, not an isolated helper.
     $script:ReviewerMarkerScanWindowChars = 8
-    $script:timedProcessCalled = $false
     $gateBlocked = $false
-    try { Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1 | Out-Null }
+    Write-Host "[SIMULATED/OFFLINE CASE: contract gate] No process-stub call is permitted." -ForegroundColor DarkCyan
+    try { Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1 | Out-Null }
     catch { $gateBlocked = $true }
-    Assert-Specialist ($gateBlocked -and -not $script:timedProcessCalled) `
+    Assert-Specialist ($gateBlocked -and $script:timedProcessCallCount -eq 6) `
         "An un-fittable generalist result contract still reached Invoke-TimedProcess instead of refusing to launch."
 
-    Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue
+        # Deliberately remove the interception boundary once. The production
+        # Invoke-TimedProcess is then visible, but the nonexistent AgencyPath must
+        # fail at Process.Start, before a child or telemetry event can exist.
+        $script:ReviewerMarkerScanWindowChars = 65536
+        Remove-Item Function:\Invoke-TimedProcess
+        Write-Host "[SIMULATED/OFFLINE SABOTAGE] Stub removed; nonexistent sentinel must fail closed before any real launch." -ForegroundColor DarkCyan
+        $sabotageBlocked = $false
+        $sabotageError = $null
+        try {
+            Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1 | Out-Null
+        }
+        catch { $sabotageBlocked = $true; $sabotageError = $_ }
+        $nativeLaunchError = if ($null -ne $sabotageError) {
+            $sabotageError.Exception.GetBaseException()
+        } else { $null }
+        Assert-Specialist ($sabotageBlocked -and $script:timedProcessCallCount -eq 6 -and
+            $nativeLaunchError -is [System.ComponentModel.Win32Exception] -and
+            [int]$nativeLaunchError.NativeErrorCode -eq 2) `
+            "Removing the local process stub did not fail closed on the nonexistent sentinel executable."
+        Assert-Specialist (-not (Test-Path -LiteralPath $sentinelAgencyPath) -and
+            $null -eq (Get-Process -Name $sentinelProcessName -ErrorAction SilentlyContinue) -and
+            -not (Test-Path -LiteralPath $telemetryPath)) `
+            "Stub sabotage started a sentinel process or emitted offline telemetry/model/provider activity."
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('DEVPILOT_OFFLINE_TELEMETRY_MODE', $priorTelemetryMode, 'Process')
+        [Environment]::SetEnvironmentVariable('DEVPILOT_OFFLINE_TELEMETRY_PATH', $priorTelemetryPath, 'Process')
+        Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ---------------------------------------------------------------------------

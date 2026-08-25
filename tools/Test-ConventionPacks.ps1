@@ -135,26 +135,106 @@ foreach ($unsafePath in @("C:\repo\src\a.cs", "\\server\share\a.cs", "/src/../se
 }
 
 $globCases = @(
-    @{ Glob = "src/**/*.cs"; Path = "SRC/Api/Handler.CS"; Expect = $true },
-    @{ Glob = "**/*.cs"; Path = "Root.cs"; Expect = $true },
+    @{ Glob = "src/**/*.cs"; Path = "/src/a.cs"; Expect = $true },
+    @{ Glob = "src/**/*.cs"; Path = "src/a.cs"; Expect = $true },
+    @{ Glob = "src/**/*.cs"; Path = "\src\Api\Handler.cs"; Expect = $true },
+    @{ Glob = "src/**/*.cs"; Path = "/SRC/Api/Handler.CS"; Expect = $true },
+    @{ Glob = "src/flow/Tests/**/*.cs"; Path = "/src/flow/Tests/Tests.Flow.Web/EdifactEncodeTests.cs"; Expect = $true },
+    @{ Glob = "**/*.cs"; Path = "/Root.cs"; Expect = $true },
     @{ Glob = "src/**/x.cs"; Path = "src/x.cs"; Expect = $true },
     @{ Glob = "src/*.cs"; Path = "src/Api/x.cs"; Expect = $false },
-    @{ Glob = "docs/?.md"; Path = "docs/a.md"; Expect = $true }
+    @{ Glob = "docs/?.md"; Path = "docs/a.md"; Expect = $true },
+    @{ Glob = "src/flow/Tests/**/*.cs"; Path = "/src/a.cs"; Expect = $false },
+    @{ Glob = "src/**/*.cs"; Path = "/other/a.cs"; Expect = $false },
+    @{ Glob = "src/**/*.cs"; Path = "/src//a.cs"; Expect = $false },
+    @{ Glob = "src/**/*.cs"; Path = "/src/./a.cs"; Expect = $false },
+    @{ Glob = "src/**/*.cs"; Path = "/src/../a.cs"; Expect = $false },
+    @{ Glob = "src/**/*.cs"; Path = "/$([char]0x017f)rc/a.cs"; Expect = $false },
+    @{ Glob = "src"; Path = "/src"; Expect = $true },
+    @{ Glob = "src"; Path = "/src/x"; Expect = $false },
+    @{ Glob = "src"; Path = "/src2"; Expect = $false },
+    @{ Glob = "*"; Path = ("a" * $script:ReviewerConventionMaxPathLength); Expect = $false }
 )
 foreach ($case in $globCases) {
     Assert-ConventionTest ((Test-ReviewerConventionGlobMatch -Glob $case.Glob -Path $case.Path) -eq $case.Expect) `
         "Glob '$($case.Glob)' produced the wrong result for '$($case.Path)'."
 }
+Assert-ConventionTest (-not (Test-ReviewerConventionNormalizedGlobMatch -Glob "src/**/*.cs" -Path "/src/a.cs")) `
+    "Sabotage failed: the raw, unnormalized anchored path unexpectedly matched."
 foreach ($unsafeGlob in @("**", "/src/**/*.cs", "src\**\*.cs", "src/**foo.cs", "src/[ab].cs", "src/{a,b}.cs", "src/**/**/a.cs", "src/../a.cs")) {
     Assert-ConventionTest (-not (Test-ReviewerConventionGlob -Glob $unsafeGlob)) "Unsupported glob '$unsafeGlob' was accepted."
 }
+
+$exactPathRaw = New-TestRawPolicy
+$exactPathRaw.packs[0].changedPathGlobs = @("src")
+$exactPathPolicy = ConvertTo-ReviewerConventionPackPolicy -RawPolicy $exactPathRaw `
+    -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $exactPathRaw.authoritativeSources)
+$exactPathEntries = @(ConvertTo-ReviewerConventionChangeSet -Response (ConvertTo-TestChangeResponse -Paths @("/src")))
+$exactPathSelection = Select-ReviewerConventionPacks -Policy $exactPathPolicy -ChangeEntries $exactPathEntries
+Assert-ConventionTest ($exactPathEntries.Count -eq 1 -and $exactPathEntries[0].Path -ceq "/src") `
+    "The exact /src change did not retain its canonical anchor."
+Assert-ConventionTest ($exactPathSelection.Selected.Count -eq 1 -and
+    $exactPathSelection.Selected[0].Matches.Count -eq 1 -and
+    $exactPathSelection.Selected[0].Matches[0].path -ceq "/src") `
+    "The exact src glob did not preserve /src routing evidence."
+
+$maximumAnchoredPath = "/" + ("a" * ($script:ReviewerConventionMaxPathLength - 1))
+$maximumAnchoredEntries = @(ConvertTo-ReviewerConventionChangeSet -Response (
+        ConvertTo-TestChangeResponse -Paths @($maximumAnchoredPath)))
+Assert-ConventionTest ($maximumAnchoredEntries.Count -eq 1 -and
+    $maximumAnchoredEntries[0].Path.Length -eq $script:ReviewerConventionMaxPathLength) `
+    "A maximum-length canonical anchored path was rejected."
+Assert-ConventionThrows {
+    ConvertTo-ReviewerConventionChangeSet -Response (
+        ConvertTo-TestChangeResponse -Paths @((
+                "a" * $script:ReviewerConventionMaxPathLength))) | Out-Null
+} "A relative path that exceeds the canonical anchored limit was accepted."
+
+$realGate5Response = [pscustomobject]@{
+    iterationId = 5
+    nextSkip = 10
+    nextTop = 1000
+    changes = @(
+        @{ changeId = 1; changeType = "Edit"; item = @{ path = "/src/flow/Roles/Flow.Integration/Engines/EdifactMessageEncodingEngine.cs"; isFolder = $false; gitObjectType = "blob" }; diff = @{} },
+        @{ changeId = 2; changeType = "Edit"; item = @{ path = "/src/flow/Tests/Tests.Flow.Web/EdifactEncodeTests.cs"; isFolder = $false; gitObjectType = "blob" }; diff = @{} },
+        @{ changeId = 3; changeType = "Edit"; item = @{ path = "/.config/.inc/versions.xml"; isFolder = $false; gitObjectType = "blob" }; diff = @{} },
+        @{ changeId = 4; changeType = "Edit"; item = @{ path = "/src/flow/Roles/Flow.Data.Edge/Providers/BuiltInApiOperationsDataProvider.cs"; isFolder = $false; gitObjectType = "blob" }; diff = @{} },
+        @{ changeId = 5; changeType = "Edit"; item = @{ path = "/src/flow/Roles/Flow.Integration/Operations/Edifact/EdifactBatchEncodeActionInput.cs"; isFolder = $false; gitObjectType = "blob" }; diff = @{} },
+        @{ changeId = 6; changeType = "Edit"; item = @{ path = "/src/flow/Roles/Flow.Integration/Operations/Edifact/EdifactEncodeActionInput.cs"; isFolder = $false; gitObjectType = "blob" }; diff = @{} },
+        @{ changeId = 7; changeType = "Edit"; item = @{ path = "/src/flow/Roles/Flow.Web.Edge/Engines/EdgeFlowDefinitionValidationEngine.cs"; isFolder = $false; gitObjectType = "blob" }; diff = @{} },
+        @{ changeId = 8; changeType = "Edit"; item = @{ path = "/src/flow/Roles/Flow.Worker.Common/Jobs/Actions/EdifactBatchEncodeActionJob.cs"; isFolder = $false; gitObjectType = "blob" }; diff = @{} },
+        @{ changeId = 9; changeType = "Edit"; item = @{ path = "/src/flow/Roles/Flow.Worker.Common/Jobs/Actions/EdifactEncodeActionJob.cs"; isFolder = $false; gitObjectType = "blob" }; diff = @{} },
+        @{ changeId = 10; changeType = "Edit"; item = @{ path = "/src/flow/Tests/Tests.Flow.Web/EdifactBatchEncodeTests.cs"; isFolder = $false; gitObjectType = "blob" }; diff = @{} }
+    )
+}
+$realGate5Raw = New-TestRawPolicy
+$realGate5Raw.packs[0].name = "csharp-localization"
+$realGate5Raw.packs[0].changedPathGlobs = @("src/**/*.cs", "src/flow/Tests/**/*.cs")
+$realGate5Policy = ConvertTo-ReviewerConventionPackPolicy -RawPolicy $realGate5Raw `
+    -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $realGate5Raw.authoritativeSources)
+$realGate5Entries = @(ConvertTo-ReviewerConventionChangeSet -Response $realGate5Response)
+$realGate5Selection = Select-ReviewerConventionPacks -Policy $realGate5Policy -ChangeEntries $realGate5Entries
+Assert-ConventionTest ((@($realGate5Selection.Selected.Pack.Name) -join "|") -ceq "csharp-localization") `
+    "The exact PR16833498 change-response shape did not select the C# localization pack."
+Assert-ConventionTest ($realGate5Entries.Count -eq 10 -and
+    @($realGate5Entries | Where-Object { -not $_.Path.StartsWith("/", [StringComparison]::Ordinal) }).Count -eq 0) `
+    "The exact PR16833498 paths were not retained as canonical anchored paths."
+Assert-ConventionTest (@($realGate5Selection.Selected[0].Matches | Where-Object {
+            $_.path -ceq "/src/flow/Tests/Tests.Flow.Web/EdifactEncodeTests.cs" -and
+            (@($_.globs) -join "|") -ceq "src/**/*.cs|src/flow/Tests/**/*.cs"
+        }).Count -eq 1) `
+    "The nested test path did not retain its anchored evidence or both intended matching globs."
+Assert-ConventionTest (@($realGate5Selection.Selected[0].Matches | Where-Object {
+            $_.path -ceq "/.config/.inc/versions.xml"
+        }).Count -eq 0) `
+    "Convention routing widened beyond the intended C# globs."
 
 $renameResponse = @{ changes = @{ value = @(
             @{ item = @{ path = "/src/New.cs" }; sourceServerItem = "/docs/Old.md"; changeType = "edit, Rename" }
         ) } }
 $renameEntries = @(ConvertTo-ReviewerConventionChangeSet -Response $renameResponse)
 Assert-ConventionTest ($renameEntries.Count -eq 2) "Rename extraction did not retain both old and new paths."
-Assert-ConventionTest (@($renameEntries | Where-Object { $_.Role -eq "previous" -and $_.Path -ceq "docs/Old.md" }).Count -eq 1) `
+Assert-ConventionTest (@($renameEntries | Where-Object { $_.Role -eq "previous" -and $_.Path -ceq "/docs/Old.md" }).Count -eq 1) `
     "Rename extraction lost the previous path."
 $deleteEntries = @(ConvertTo-ReviewerConventionChangeSet -Response @{
         changeEntries = @(@{ item = @{ path = "/deployment/old.json" }; changeType = 16 })

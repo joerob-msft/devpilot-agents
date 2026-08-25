@@ -107,7 +107,19 @@
       {
         "sha256": "f3bf51bbef917da38c52c84ea490277ddf0e69f1f6903cbe10aec05a61313b02",
         "reason": "In offline replay, say that this pass holds no repository read tool and that the wrapper already verified the binding against the sealed snapshot. Without it a correct pass fails closed for the wrong reason: the prompt tells it to re-read the pull request and stop without a marker if it cannot, and in replay it cannot."
-      }
+      },
+      {
+        "sha256": "155df6c4da3408de56c061b0e3bd1106e14c51eac71592d8697bb4fcadb55661",
+        "reason": "History only, superseded below. Give the generalist an ordered wrapper-built result scaffold with every trusted binding and nonce already present, empty findings, and deliberately empty model-owned vote and summary placeholders, so it never has to transcribe wrapper-known values."
+      },
+      {
+        "sha256": "f09eb97aefdd2ef05aaa303a1e57167e176280d06d3ccfa3be1a90cefecba37e",
+        "reason": "History only, superseded below. Accept the bound project explicitly instead of through dynamic scope, and fail closed before launch if the ordered scaffold keys ever drift from the production marker schema."
+      },
+    {
+      "sha256": "d4de522080a6463da9a85bdc33b781f4c943447c897801b2eab500de974ba71e",
+      "reason": "CURRENT and authoritative. Issue the nonce to the generalist as a standalone challenge line and publish the closed v2 payload shape alongside the existing scaffold, which remains a formatting aid only."
+    }
     ],
     "Invoke-ReviewerModelPass": [
       {
@@ -141,7 +153,31 @@
       {
         "sha256": "b7d74eb08b5025689274c248c468ec9a01f53bc38eeb7a5ab83edbcd58194622",
         "reason": "Route the already-gated generalist launch through the production-test-only offline subprocess boundary. Live execution still reaches Invoke-TimedProcess with the same arguments; sealed replay may select only the digest-bound deterministic adapter."
-      }
+      },
+      {
+        "sha256": "190a9dbe572739288692eb7a6fa742bb0c52e0a8a7b94302f03049dda0467016",
+        "reason": "History only, superseded below. Report ProcessStarted alongside ModelRan on every return of the generalist pass, so the shadow cohort budget census can tell an attempt that launched a subprocess from an input refused for size before any process existed. The two flags are deliberately distinct: a process that started and reported no assistant turn is still a real model start and is still spent. Nothing about the launch, the tool grant, the gating or the disabled discovery/delivery paths changes; the returned hashtable gains one boolean."
+      },
+      {
+        "sha256": "04db3321210d1a35b27a18ec525be69539ea2e64aa7a1c53f878c094cd177841",
+        "reason": "History only, superseded below. Name the counted role at the generalist launch call, passing -CensusRole 'generalist' so the subprocess boundary can publish a launch intent before a process can exist. The intent closes the window between Process.Start succeeding inside the harness and the accounting record being written after it returns, during which a throw would lose a real model start. Only the argument list of the existing call changes; the launch, its arguments, the tool grant, the gating and the disabled discovery/delivery paths are untouched."
+      },
+      {
+        "sha256": "2d61a146e738376f65a954fb5eced57a8e47948882217ed149e3113dd56ddf40",
+        "reason": "History only, superseded below. Pass the expected project explicitly into the runtime-context builder so the scaffold's trusted project binding cannot depend on PowerShell dynamic scope; model launch behavior is otherwise unchanged."
+      },
+    {
+      "sha256": "188345f9fc878e9913281baa4cf901b43d806200d0c676b154a4656a70efe3c5",
+      "reason": "History only, superseded below. Read the generalist answer under the v2 two-part response contract in addition to the v1 marker, seal the result into a signed response envelope that is persisted per attempt, and classify an answer whose nonce challenge line is absent as evidenceOnly - kept and counted, never voted."
+    },
+    {
+      "sha256": "8d3ff78f94829f1ae01a2a7e34d84cbe5c768bbe7fe4043b1a2dd4274a4fea5d",
+      "reason": "History only, superseded below. Adversarial-review fixes to the v2 read: pass the run's effective -MaxFindings to the extractor and the envelope so the bound the prompt promises is the bound the parser enforces; re-validate the rebuilt marker against the real v1 schema so content v1 refuses is a retryable slip here instead of a lost cycle at the merged round trip; refuse the attempt when a v1 marker and an authenticated v2 payload disagree; label the rebuilt marker with its source contract and tier; and deny census credit when the sealed envelope did not reach disk."
+    },
+    {
+      "sha256": "0af3e6f72165210be1ee3a7e25ecbd14ea85a7402caeb80591c7a063ec1197e6",
+      "reason": "CURRENT and authoritative. Seal each response envelope under the startup-resolved run key rather than the state-directory key directly, so a state directory nested inside a readable root relocates the key instead of aborting the run, and record that key origin inside the sealed bytes."
+    }
     ],
     "Invoke-ReviewerPullRequest": [
       {
@@ -167,7 +203,23 @@
       {
         "sha256": "620d9b32c0b0b7fae72a811685ecb5a0082b123b9b198ce3f03abb7220fb1a82",
         "reason": "CURRENT and authoritative. Route the generalist role through the existing single-role acquisition dispatch so a no-model role input capture drives the EXACT production cycle rather than a hand-built projection Bound. The guard that already returned early for the specialist now also does so for the generalist, which is what lets capture emit a production-derived role-scoped projection instead of consuming one. The disabled generalist discovery, cross-verification and delivery paths are unchanged: the dispatch is reachable only while an acquisition or capture target role is active."
-      }
+      },
+      {
+        "sha256": "507a017ae2af441756ed142256c785561fa68e9451b380542505e2252e55a25f",
+        "reason": "History only, superseded below. Publish processStarted on the generalist attempt-accounting record so the shadow cohort budget counts real model subprocess starts rather than attempt records."
+      },
+      {
+        "sha256": "404ec46ae7d3875731a9ed0c7d153b02d2b7af290016e4b2a6d09edfd4ff5d69",
+        "reason": "History only, superseded below. Publish the generalist attempt-accounting record through Write-ReviewerModelStartAccounting instead of the plain cycle writer, so a failure to record a model start that was really made is fatal rather than swallowed into a run that would still report a complete, exact census. Only the writer the record travels through changed: the record's own fields, and every gate, launch, retry, discovery, cross-verification and delivery decision in this function, are untouched, and the disabled generalist paths are unchanged."
+      },
+    {
+      "sha256": "000a76163440579cffc881e7cfc58e4ec48ff4237b2c6d555b60114015736928",
+      "reason": "History only, superseded below. Record the v2 auth tier per attempt and per pass so an evidenceOnly reviewer appears in the census as a reviewer that answered, and make evidenceOnly terminal rather than spending a retry on evidence already in hand."
+    },
+    {
+      "sha256": "7709cc16a632f22fc258db0d0db71719b37946288f26b20ce827162541705d99",
+      "reason": "CURRENT and authoritative. Require the sealed v2 response envelope to have reached disk before the pass counts in the census, and publish that persistence fact on the attempt-accounting record. A tier held only in the memory of a process about to exit is not evidence anyone can audit, and counting it would reproduce the same silent census gap in a new place."
+    }
     ],
     "Write-ReviewerConventionSpecialistPreview": [
       {
@@ -217,6 +269,18 @@
     {
       "sha256": "965539c145efca0accecfe7ec962ce4c9884356b481dd9f7c62fdf3a18fe7fcd",
       "reason": "Name the new reason for a path the repository host ALONE called non-text, and tell the model to treat it with particular care: the pull request's own path for it looks like ordinary source, so that omission rests entirely on the party this layer exists to distrust."
-    }
+    },
+    {
+      "sha256": "02630ea03577d5cf64f2a40f846d38380df34378eb3550553cbc87caaa0cb320",
+      "reason": "History only, superseded below. Tell the generalist to fill only findings, recommendedVote and summary in the wrapper-built marker scaffold, preserve every wrapper-owned scalar and key position, and emit that scaffold instead of hand-transcribing a nonce-bearing result template."
+    },
+    {
+      "sha256": "2078d187724bbf545e4c34c7284cac955b01d911e9c31a1416b75f3c5cc8f4bf",
+      "reason": "History only, superseded below. Preserve the scaffold-only top-level contract while restoring the exact ordered finding-item keys that an empty findings array cannot demonstrate, and explicitly emit the inner scaffold rather than its runtime-data envelope."
+    },
+  {
+    "sha256": "c79337f2fb57b0fac1b34c11a01c47c16c6252ea188f19ec001582ba98c04017",
+    "reason": "CURRENT and authoritative. Describe the v2 two-part response contract as the current generalist emission path, keep the v1 single-marker contract as the documented legacy path, and state what omitting the nonce line costs."
+  }
   ]
 }

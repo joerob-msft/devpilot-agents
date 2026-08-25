@@ -4,7 +4,7 @@
   "fixtureId": "synthetic-exact-path",
   "expectedBaseCommit": "ccbf14632064118f008539becec2fef77030cf54",
   "adapterScript": "../../offline/Invoke-ReviewerModelAdapter.ps1",
-  "adapterScriptSha256": "61999931274dad7057d92658c357def2ce834d717fa7e1e397f4c269eb91bcee",
+  "adapterScriptSha256": "dd700f09b82bca0c1503ff0adf66987d98efa4407cfb519d46dc29887ff4658b",
   "classification": {
     "offlineOnly": true,
     "nonPromotable": true,
@@ -94,7 +94,7 @@
             "siblingStatus": "notRequired",
             "siblingEvidence": "",
             "siblingNotRequiredReason": "The violation is fully established by the changed assignment.",
-            "factIds": "rf1:0598f799001881145e16f00c3a9b70a2fa602ed7b061a04f970acaf2ea4027eb",
+            "factIds": "rf1:5765ca9a7be5fc1f2a2a42838b33e1f95cfdf8b1cadc16c732dd0d4bd1221396",
             "confidence": "high",
             "residualRiskSummary": "",
             "semanticCandidateVersion": 2,

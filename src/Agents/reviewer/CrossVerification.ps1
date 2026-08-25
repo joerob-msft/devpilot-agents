@@ -27,19 +27,18 @@ $script:ReviewerVerificationMaxInputBytes = 524288
 $script:ReviewerVerificationMaxArtifactBytes = 2097152
 $script:ReviewerVerificationMaxVerifierRuns = 128
 $script:ReviewerVerificationMaxPhaseSeconds = 3600
-# Evidence-based floor for ONE verifier assignment, in seconds.
+# Policy floor for ONE serial verifier invocation, in seconds.
 #
-# Measured, not guessed. Across the sealed replay runs kept as qualification
-# evidence, a bounded single-model cross-verifier CLI phase completed in 136 to
-# 295 wall-clock seconds; 295 is the slowest interval observed. The floor is set
-# at 300 - just above the worst measurement - because that is the smallest slice
-# for which a run is expected to finish rather than be killed on its own timeout.
+# This is an explicit admission threshold, not an empirical worst-case timing
+# guarantee. With the 120 second overhead reserve it permits at most 23 serial
+# invocations under the 3600 second phase cap, while refusing any larger set
+# wholesale instead of handing each process an arbitrarily small timeout.
 #
-# It is a FLOOR on what may be handed to a run, not a reservation of what a run
-# will take. Below it a launch is not a shorter review, it is a review that ends
-# in `timeout` and produces nothing, so admitting one would spend the whole phase
-# to learn nothing.
-$script:ReviewerVerificationMinAssignmentSeconds = 300
+# This is a FLOOR on what may be handed to an invocation, not a reservation of
+# what an assignment costs. A grouped invocation may cover several of the exact
+# 2N assignments, but it is still one serial process with one timeout; prompt
+# size and cluster cardinality are bounded independently.
+$script:ReviewerVerificationMinInvocationSeconds = 150
 # Wall-clock the phase keeps back for work that is not a verifier invocation:
 # sealing the assignment plan, minting fresh nonces, reconciling verdicts,
 # writing the artifact. Reserving it is what makes the phase cap a bound on the
@@ -1828,31 +1827,27 @@ function Get-ReviewerVerificationPhaseBudgetPlan {
         per-invocation launch both read this one function, so the number a run is
         launched with is by construction the number the preflight reserved.
 
-        WHAT IS BUDGETED IS ASSIGNMENTS, NOT INVOCATIONS. The requirement is that
-        every candidate is cross-checked once by GPT and once by Opus, so the unit
-        the phase must be able to afford is the 2N assignment set - the same unit
-        the acceptance boundaries are stated in. Budgeting the GROUPED invocation
-        count instead was the earlier defect: grouping is an optimisation, and an
-        optimisation that shrinks the reservation makes the reservation a promise
-        about the implementation rather than about the work.
+        Assignment coverage and time admission use deliberately different units.
+        The exact 2N assignment set remains subject to the 128-assignment hard cap
+        and is validated before this function. Wall-clock admission uses the actual
+        serial invocation count, because grouped assignments execute under one
+        process timeout rather than one timeout per assignment.
 
         The bug this replaces: preflight reserved the CONFIGURED per-run timeout
         for every planned run and compared the product against the phase. With the
         shipped defaults that is 10 x 900s = 9000s against a 3600s phase, so a
         perfectly ordinary 5-candidate pull request was refused wholesale and zero
         verifiers ran - while the runs it refused would each have finished in
-        roughly 150 to 300 seconds. The reservation was treating a per-run CEILING
+        only a fraction of that ceiling. The reservation was treating a per-run CEILING
         as if it were a per-run COST.
 
         The fix is to stop reserving the ceiling and start dividing the phase:
 
             remaining     = maxPhase - elapsed - reservedOverhead
-            share         = floor(remaining / assignments)
             perInvocation = min(configured, floor(remaining / invocations))
 
-        Admission is decided on `share`, the conservative per-ASSIGNMENT slice.
-        Time is handed out per INVOCATION, which is never more numerous than the
-        assignments it covers, so the worst case
+        Admission is decided on `perInvocation`. Invocations are never more
+        numerous than the assignments they cover, so the worst case
 
             invocations x perInvocation <= invocations x (remaining / invocations)
                                         <= remaining
@@ -1864,10 +1859,8 @@ function Get-ReviewerVerificationPhaseBudgetPlan {
         or fully refused.
 
         Admission needs one more thing, or dividing would just relabel starvation
-        as success: a run given too little time does not review faster, it dies on
-        its own timeout and returns nothing. So a share below the evidence floor
-        ($script:ReviewerVerificationMinAssignmentSeconds, measured at 300s against
-        a 136-295s observed range) is refused rather than launched.
+        as success: an invocation below the 150s policy floor is refused. This
+        threshold is explicit policy rather than an empirical worst-case guarantee.
 
         The floor is capped by what the operator configured -
         min(configured, floor) - because a deployment that deliberately configures
@@ -1882,10 +1875,11 @@ function Get-ReviewerVerificationPhaseBudgetPlan {
         whole phase - setup, launches and postprocessing alike - rather than only
         on the part of it that happens to be a launch.
 
-        Returns @{ canLaunch; reason; requiredAssignmentCount; invocationCount;
+        Returns @{ budgetPlanVersion; canLaunch; reason;
+                   requiredAssignmentCount; invocationCount;
                    effectiveMaxAssignments; effectiveMaxSeconds;
-                   perAssignmentTimeoutSeconds; perInvocationTimeoutSeconds;
-                   minAssignmentSeconds; maxSupportedAssignmentCount;
+                   perInvocationTimeoutSeconds; minInvocationSeconds;
+                   maxSupportedInvocationCount;
                    requiredSeconds; remainingSeconds; reservedOverheadSeconds;
                    phaseDeadlineSeconds }.
     #>
@@ -1916,21 +1910,22 @@ function Get-ReviewerVerificationPhaseBudgetPlan {
     $remaining = [long][Math]::Max(
         [long]0, [long][Math]::Floor($effectiveMaxSeconds - $ElapsedSeconds - $ReservedOverheadSeconds))
     # Never above what the operator configured: a deployment that declares short
-    # runs is describing its own runs, and this policy does not overrule it.
-    $minAssignment = [long][Math]::Min(
-        [long]$ConfiguredRunTimeoutSeconds, [long]$script:ReviewerVerificationMinAssignmentSeconds)
-    $maxSupported = [long][Math]::Min([long]$effectiveMaxAssignments, [long][Math]::Floor($remaining / $minAssignment))
+    # invocations is describing its own runs, and this policy does not overrule it.
+    $minInvocation = [long][Math]::Min(
+        [long]$ConfiguredRunTimeoutSeconds, [long]$script:ReviewerVerificationMinInvocationSeconds)
+    $maxSupportedInvocations = [long][Math]::Min(
+        [long]$effectiveMaxAssignments, [long][Math]::Floor($remaining / $minInvocation))
     $result = [ordered]@{
+        budgetPlanVersion           = 2
         canLaunch                   = $true
         reason                      = ""
         requiredAssignmentCount     = $RequiredAssignmentCount
         invocationCount             = $InvocationCount
         effectiveMaxAssignments     = $effectiveMaxAssignments
         effectiveMaxSeconds         = $effectiveMaxSeconds
-        perAssignmentTimeoutSeconds = 0
         perInvocationTimeoutSeconds = 0
-        minAssignmentSeconds        = [int]$minAssignment
-        maxSupportedAssignmentCount = [int]$maxSupported
+        minInvocationSeconds        = [int]$minInvocation
+        maxSupportedInvocationCount = [int]$maxSupportedInvocations
         requiredSeconds             = [long]0
         remainingSeconds            = $remaining
         reservedOverheadSeconds     = [int]$ReservedOverheadSeconds
@@ -1940,24 +1935,20 @@ function Get-ReviewerVerificationPhaseBudgetPlan {
     if ($RequiredAssignmentCount -gt $effectiveMaxAssignments) {
         $result.reason = "candidateLimit"
         $result.canLaunch = $false
-        # Still report what the set would have cost at the floor, so the refusal
-        # record says how far outside the budget the plan was.
-        $result.requiredSeconds = [long]$RequiredAssignmentCount * $minAssignment
+        # The assignment cap and serial-time cost are distinct diagnostics.
+        $result.requiredSeconds = [long]$InvocationCount * $minInvocation
         return [pscustomobject]$result
     }
-    # Overflow-safe by construction: the shares are divisions of a bounded
+    # Overflow-safe by construction: the timeout is a division of a bounded
     # remaining budget, and the product below is taken in [long] regardless.
-    $share = [long][Math]::Floor($remaining / [long]$RequiredAssignmentCount)
-    $perAssignment = [long][Math]::Min([long]$ConfiguredRunTimeoutSeconds, $share)
-    if ($perAssignment -lt $minAssignment) {
-        $result.canLaunch = $false
-        $result.reason = "timeout"
-        $result.requiredSeconds = [long]$RequiredAssignmentCount * $minAssignment
-        return [pscustomobject]$result
-    }
     $perInvocation = [long][Math]::Min(
         [long]$ConfiguredRunTimeoutSeconds, [long][Math]::Floor($remaining / [long]$InvocationCount))
-    $result.perAssignmentTimeoutSeconds = [int]$perAssignment
+    if ($perInvocation -lt $minInvocation) {
+        $result.canLaunch = $false
+        $result.reason = "timeout"
+        $result.requiredSeconds = [long]$InvocationCount * $minInvocation
+        return [pscustomobject]$result
+    }
     $result.perInvocationTimeoutSeconds = [int]$perInvocation
     $result.requiredSeconds = [long]$InvocationCount * $perInvocation
     if ($result.requiredSeconds -gt $remaining) {
@@ -1972,10 +1963,10 @@ function Get-ReviewerVerificationPhaseBudgetPlan {
 function Assert-ReviewerVerificationBudgetPreflight {
     <#
         Deterministic, launch-free budget check run ONCE before any verifier model
-        starts. Given the full required ASSIGNMENT count for the sealed plan - the
-        2N of "every candidate, once by GPT and once by Opus" - it proves the
-        declared run AND time budget can cover EVERY assignment, or refuses the
-        whole set. This closes the partial-launch window the per-run budget alone
+        starts. Given the full required ASSIGNMENT count for the sealed 2N plan and
+        the actual serial INVOCATION count, it proves both that assignment coverage
+        fits the run cap and that every invocation fits the time budget, or refuses
+        the whole set. This closes the partial-launch window the per-run budget alone
         left open, where early clusters would launch and later ones silently
         degrade when the phase clock expired mid-loop: either every required
         assignment is launched, or none is.
