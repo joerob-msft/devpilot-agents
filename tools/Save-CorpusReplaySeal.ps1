@@ -22,6 +22,11 @@
     -CorpusIndexSha256 is mandatory. An index that is only self-consistent proves
     nothing, because whoever edited it could recompute whatever it contains.
 
+    -RecipeSha256 is optional and binds the recipe by CONTENT rather than by path.
+    A caller that hashed the recipe and then named it is trusting the file not to
+    change in between; supplying the digest makes this tool check it over the exact
+    bytes it parses, so there is no window between the check and the use.
+
     The result is permanently NON-PROMOTABLE. The snapshot id must say
     `offlinecorpusseal`, an `offline-corpus-seal.json` sidecar records the same
     thing under its own digest, and the seal explicitly records that no live
@@ -41,6 +46,7 @@ param(
     [Parameter(Mandatory)][string]$CorpusRoot,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$CorpusIndexSha256,
     [Parameter(Mandatory)][string]$Recipe,
+    [ValidatePattern('^$|^[0-9a-fA-F]{64}$')][string]$RecipeSha256 = "",
     [Parameter(Mandatory)][string]$ReplayRoot,
     [switch]$Force,
     [switch]$ValidateOnly
@@ -77,7 +83,7 @@ foreach ($boundary in @($repoFull, [System.IO.Path]::GetFullPath($repoRoot))) {
 $index = Import-ReviewerCorpusIndex -CorpusRoot $corpusFull -ExpectedIndexSha256 $CorpusIndexSha256
 Write-Host ("Corpus index verified: {0} payload(s), SHA-256 {1}" -f $index.PayloadCount, $index.IndexSha256) -ForegroundColor DarkCyan
 
-$recipeObject = Import-ReviewerCorpusSealRecipe -Path $Recipe
+$recipeObject = Import-ReviewerCorpusSealRecipe -Path $Recipe -ExpectedSha256 $RecipeSha256
 $plan = New-ReviewerCorpusSealPlan -Index $index -Recipe $recipeObject -ToolkitRoot $repoRoot
 Write-Host ("Recipe validated: {0} recorded read(s), {1} changed path(s), source transport '{2}' ({3})" -f `
         @($plan.Resources).Count, [int]$plan.Census.rightHandCoveredPathCount,
