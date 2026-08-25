@@ -35,6 +35,23 @@ function Copy-FactObject {
     return (($Value | ConvertTo-Json -Depth 32) | ConvertFrom-Json -Depth 32)
 }
 
+foreach ($case in @(
+        @{ Path = "/tests/Example/CheckInTests.cs"; Pattern = "tests/**/*.cs"; Expect = $true },
+        @{ Path = "tests/Example/CheckInTests.cs"; Pattern = "tests/**/*.cs"; Expect = $true },
+        @{ Path = "\tests\Example\CheckInTests.cs"; Pattern = "tests/**/*.cs"; Expect = $true },
+        @{ Path = "/TESTS/Example/CheckInTests.CS"; Pattern = "tests/**/*.cs"; Expect = $true },
+        @{ Path = "/CheckIn.Tests.cs"; Pattern = "**/*.Tests.cs"; Expect = $true },
+        @{ Path = "/tests//Example/CheckInTests.cs"; Pattern = "tests/**/*.cs"; Expect = $false },
+        @{ Path = "/tests/./Example/CheckInTests.cs"; Pattern = "tests/**/*.cs"; Expect = $false },
+        @{ Path = "/tests/../src/CheckInTests.cs"; Pattern = "tests/**/*.cs"; Expect = $false },
+        @{ Path = "/src/Example.cs"; Pattern = "tests/**/*.cs"; Expect = $false },
+        @{ Path = "/$([char]0x017f)ests/Example/CheckInTests.cs"; Pattern = "tests/**/*.cs"; Expect = $false },
+        @{ Path = ("a" * $script:ReviewerConventionMaxPathLength); Pattern = "*"; Expect = $false }
+    )) {
+    Assert-Fact ((Test-ReviewerFactPathPattern -Path $case.Path -Pattern $case.Pattern) -eq $case.Expect) `
+        "Fact source/read glob '$($case.Pattern)' produced the wrong result for '$($case.Path)'."
+}
+
 function Get-Fact {
     param($Plan, [string]$Domain, [string]$Kind, [string]$Subject = "")
     return , @($Plan.facts | Where-Object {
@@ -148,6 +165,17 @@ Assert-Fact (@($plan.facts | Where-Object { $_.state -notin @("true", "false", "
 Assert-Fact (@($plan.facts | Where-Object { $_.state -eq "unknown" -and -not $_.unknownReason }).Count -eq 0) "An unknown fact omitted unknownReason."
 Assert-Fact (Test-Json -Json ($plan | ConvertTo-Json -Depth 32 -Compress) -SchemaFile $schemaPath) "A generated plan failed the versioned JSON schema."
 Assert-Fact (Test-ReviewerFactPlanIntegrity -Plan $plan) "A generated plan failed its canonical byte/hash integrity check."
+$anchoredInputs = Copy-FactObject $baseInputs
+$anchoredInputs.cloudTest.Data.ChangedFiles = @(
+    @{ Path = "/tests/Example/CheckInTests.cs" },
+    @{ Path = "/tests/Example/Example.Tests.csproj" }
+)
+$anchoredPlan = New-ReviewerFactPlan -Binding $binding -Hashes $hashes -Inputs $anchoredInputs -Policy $policy
+$anchoredChangedTest = (Get-Fact $anchoredPlan cloudTest changedTestFile "/tests/Example/CheckInTests.cs")[0]
+Assert-Fact ($anchoredChangedTest.subject -ceq "/tests/Example/CheckInTests.cs" -and
+    $anchoredChangedTest.value.path -ceq "/tests/Example/CheckInTests.cs" -and
+    $anchoredChangedTest.evidence[0].path -ceq "/tests/Example/CheckInTests.cs") `
+    "Fact matching normalized the anchored changed-test evidence."
 $tamperedPlan = Copy-FactObject $plan
 $tamperedPlan.status = "failed"
 Assert-Fact (-not (Test-ReviewerFactPlanIntegrity -Plan $tamperedPlan)) "A tampered fact plan retained valid integrity."
@@ -273,6 +301,16 @@ Assert-Fact (@($identifierFacts | Where-Object { $_.value.identifier -ceq "Owner
 $companions = Get-Fact $plan fanOut companionSurfacePresent
 Assert-Fact ($companions.Count -eq 1 -and $companions[0].state -ceq "false") "Same-namespace precedent did not produce an exact missing-surface fact."
 Assert-Fact (@($companions | Where-Object { $_.subject -like "Owner#*" }).Count -eq 0) "Non-established Owner usage invented a companion rule."
+$anchoredFanOut = Copy-FactObject $baseInputs
+$anchoredFanOut.fanOut.Data.ChangedFiles[0].Path = "/config/RegionA/service.settings.json"
+$anchoredFanOutPlan = New-ReviewerFactPlan -Binding $binding -Hashes $hashes -Inputs $anchoredFanOut -Policy $policy
+$anchoredIdentifier = @((Get-Fact $anchoredFanOutPlan fanOut changedIdentifier) | Where-Object {
+        $_.value.identifier -ceq "Feature.Enabled"
+    })[0]
+Assert-Fact ($anchoredIdentifier.subject.StartsWith("/config/RegionA/service.settings.json#", [StringComparison]::Ordinal) -and
+    $anchoredIdentifier.value.path -ceq "/config/RegionA/service.settings.json" -and
+    $anchoredIdentifier.evidence[0].path -ceq "/config/RegionA/service.settings.json") `
+    "Fan-out matching normalized the anchored changed-file evidence."
 $fanUnknown = Copy-FactObject $baseInputs
 $fanUnknown.fanOut.Data.SurfaceFiles = @()
 $fanUnknownPlan = New-ReviewerFactPlan -Binding $binding -Hashes $hashes -Inputs $fanUnknown -Policy $policy

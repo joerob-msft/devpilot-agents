@@ -180,7 +180,8 @@ function Test-ReviewerConventionSegmentMatch {
     while ($valueIndex -lt $Value.Length) {
         if ($patternIndex -lt $Pattern.Length -and
             ($Pattern[$patternIndex] -eq '?' -or
-                [char]::ToUpperInvariant($Pattern[$patternIndex]) -eq [char]::ToUpperInvariant($Value[$valueIndex]))) {
+                [string]::Equals([string]$Pattern[$patternIndex], [string]$Value[$valueIndex],
+                    [StringComparison]::OrdinalIgnoreCase))) {
             $patternIndex++
             $valueIndex++
             continue
@@ -203,11 +204,18 @@ function Test-ReviewerConventionSegmentMatch {
     return $patternIndex -eq $Pattern.Length
 }
 
-function Test-ReviewerConventionGlobMatch {
+function Test-ReviewerConventionNormalizedGlobMatch {
     param(
         [Parameter(Mandatory)][string]$Glob,
         [Parameter(Mandatory)][string]$Path
     )
+    try {
+        $validatedPath = ConvertTo-ReviewerConventionRelativePath -Path $Path -Where "normalized glob match path"
+    }
+    catch {
+        return $false
+    }
+    if ($validatedPath -cne $Path -or $Path.Length + 1 -gt $script:ReviewerConventionMaxPathLength) { return $false }
     $patternSegments = @($Glob -split '/')
     $pathSegments = @($Path -split '/')
     $memo = @{}
@@ -234,6 +242,21 @@ function Test-ReviewerConventionGlobMatch {
         return [bool]$matched
     }
     return (& $visit 0 0)
+}
+
+function Test-ReviewerConventionGlobMatch {
+    param(
+        [Parameter(Mandatory)][string]$Glob,
+        [Parameter(Mandatory)][string]$Path
+    )
+    if (-not (Test-ReviewerConventionGlob -Glob $Glob)) { return $false }
+    try {
+        $matchPath = ConvertTo-ReviewerConventionRelativePath -Path $Path -Where "glob match path"
+    }
+    catch {
+        return $false
+    }
+    return Test-ReviewerConventionNormalizedGlobMatch -Glob $Glob -Path $matchPath
 }
 
 function Get-ReviewerConventionChangeTypes {
@@ -277,9 +300,14 @@ function Get-ReviewerConventionChangeArray {
 }
 
 function Test-ReviewerConventionResponseTruncated {
+    <# The page is the CALLER's to state, and there is no default. This function
+       once carried its own copy of 1000, which is one more author than a page
+       size is allowed to have: the number belongs to the shared change-list
+       constructor, and a silent fallback here is how a future caller compares a
+       response against a page nobody asked for. #>
     param(
         [Parameter(Mandatory)]$Response,
-        [int]$Limit = 1000
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$Limit
     )
     return @(Get-ReviewerConventionChangeArray -Response $Response).Count -ge $Limit
 }
@@ -310,9 +338,13 @@ function ConvertTo-ReviewerConventionChangeSet {
             [void]$paths.Add([pscustomobject]@{ RawPath = $previous; Role = "previous" })
         }
         foreach ($pathRecord in $paths) {
-            $normalized = ConvertTo-ReviewerConventionRelativePath -Path $pathRecord.RawPath -Where "changed path '$($pathRecord.RawPath)'"
+            $relative = ConvertTo-ReviewerConventionRelativePath -Path $pathRecord.RawPath -Where "changed path '$($pathRecord.RawPath)'"
+            $anchored = "/" + $relative
+            if ($anchored.Length -gt $script:ReviewerConventionMaxPathLength) {
+                throw "Changed path '$($pathRecord.RawPath)' exceeds $script:ReviewerConventionMaxPathLength characters when anchored."
+            }
             [void]$records.Add([pscustomobject]@{
-                    Path        = $normalized
+                    Path        = $anchored
                     OriginalPath = [string]$pathRecord.RawPath
                     Role        = [string]$pathRecord.Role
                     ChangeTypes = @($types)

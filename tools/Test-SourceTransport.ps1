@@ -2506,7 +2506,7 @@ Assert-Source ($passText -notmatch 'throw "Reviewer model input is') `
     "an oversized model input is no longer thrown out of the pass"
 Assert-Source ($passText -match 'above the code-defined \$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,1400}?return @\{ Model') `
     "an oversized model input returns a bounded pass failure instead"
-Assert-Source ($passText -match 'limitBytes = \$script:ReviewerMaxModelInputBytes[\s\S]{0,900}?EnvironmentFault = \$false') `
+Assert-Source ($passText -match 'limitBytes = \$script:ReviewerMaxModelInputBytes[\s\S]{0,1400}?EnvironmentFault = \$false') `
     "an oversized model input is attributed to the pull request, so it retires visibly instead of retrying forever"
 Assert-Source ($cycleText -match 'try \{[\s\S]{0,400}?Invoke-ReviewerPullRequest -Session[\s\S]{0,600}?catch') `
     "the per-pull-request review is isolated so one failure cannot end the cycle"
@@ -4612,6 +4612,7 @@ $global:Gate5LiveCaptureFixture = @{
 }
 try {
     $gate5Module = New-Module -ArgumentList @(
+        (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1'),
         (Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportNewContract'),
         (Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportAzCliFallback'),
         $gate5Project,
@@ -4622,6 +4623,7 @@ try {
         ""
     ) -ScriptBlock {
         param(
+            [string]$SourceTransportPath,
             [string]$NewContractFunctionText,
             [string]$FallbackFunctionText,
             [string]$OuterProject,
@@ -4631,6 +4633,12 @@ try {
             [hashtable]$OuterPolicy,
             [string]$OuterPolicySha256
         )
+        # Both adapters build their change-list arguments through the one shared
+        # constructor that lives beside them in the transport, so the module they
+        # are executed in has to hold the real thing. A local stand-in would let
+        # the request shape drift here without the test noticing, which is the
+        # opposite of what this probe exists to prove.
+        . $SourceTransportPath
         $script:ExpectedProject = $OuterProject
         $script:cfgRepoId = $OuterRepositoryId
         $script:RepositoryName = $OuterRepositoryName

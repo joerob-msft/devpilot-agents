@@ -175,21 +175,69 @@ This is a **recommendation**. The wrapper re-verifies it against your own
 severity list and the PR's current state, and casts a vote only if the operator
 explicitly enabled voting. Never assume a vote happened.
 
-## Step 6 — Emit the result marker
+## Step 6 — Emit the result
 
-The **final non-blank output line** must be exactly one line of the form:
+Which contract applies is stated in the wrapper runtime data. Follow whichever
+one the runtime data supplies; do not choose between them yourself.
 
-```text
-REVIEWER_RESULT_V1: {"schemaVersion":1,"prId":<int>,"repositoryId":"<guid>","project":"<string>","reviewedSourceCommit":"<40-hex>","findings":[{"severity":"<critical|important|suggestion>","filePath":"<path>","line":<int>,"comment":"<text>"}],"recommendedVote":"<approve|approveWithSuggestions|waitForAuthor|none>","summary":"<text>","nonce":"<runtime nonce>"}
-```
+### 6a — The two-part response contract (v2, current)
+
+When the runtime data carries a **"Result contract (version 2)"** section, that
+section is the contract, and it contains this attempt's nonce and the exact
+shapes to emit. Emit **two** things:
+
+1. A standalone line that is nothing but the challenge prefix and the nonce the
+   runtime data issued. Nothing else on the line, no code fence, no surrounding
+   prose.
+2. A line beginning with the payload prefix followed by one closed JSON object.
+
+The payload object carries **only** what you decided: `schemaVersion` (always
+`2`), `reviewedSourceCommit`, `findings`, `recommendedVote`, and `summary`. It
+carries no PR id, no repository, no project, and no hashes — the wrapper owns
+those, and it will not read them from you even if you send them.
+
+- `findings` is a JSON array. Emit `[]` when you found nothing.
+- Every `findings` element has exactly these keys: `severity` (`critical`,
+  `important`, or `suggestion`), `filePath` (repo-root path or empty string),
+  `line` (integer), and `comment` (one plain-text line).
+- `summary` is one plain-text line. It is posted verbatim when summary posting
+  is enabled.
+- `recommendedVote` is your Step 5 recommendation. There is no placeholder value
+  and an empty string is not a vote.
+- You may restate the nonce line and the payload later in the same reply, but
+  every restatement must be **identical**. Two payloads that disagree end the
+  attempt.
+- The nonce goes on its own line and nowhere else. Do not put it inside the
+  payload object.
+
+The two parts are read independently, and that is the point of the split. A
+payload without the nonce line is still recorded, still sealed, and still read
+by the other reviewers — but it cannot be cast as a vote and cannot mark this
+pull request reviewed. A nonce that is not this attempt's nonce ends the attempt
+outright. Forgetting the credential and forging one are not the same event, and
+the wrapper does not treat them the same.
+
+### 6b — The single result marker (v1, legacy)
+
+When the runtime data supplies a `markerScaffold` and no version-2 result
+contract section, use that object exactly as supplied. Fill in **only** its `findings`,
+`recommendedVote`, and `summary` values; change nothing else, preserve every key
+and its order, and emit the resulting scaffold as the single result marker
+object. Emit the inner `markerScaffold` object itself, not the enclosing
+runtime-data object. The empty `recommendedVote` placeholder is intentionally not
+a valid final vote: you must replace it with your Step 5 recommendation.
 
 Requirements:
 
-- Copy the Runtime context **nonce** exactly and case-sensitively into `nonce`.
-- Copy the wrapper-bound `project`, `repositoryId` GUID, `prId`, and
-  `reviewedSourceCommit` (the injected 40-hex source commit) exactly.
+- Do not reconstruct the top-level object or retype any wrapper-owned scalar.
+  The scaffold already contains the exact schema version, PR, repository,
+  project, source commit, and nonce bindings.
 - `findings` is a JSON array. Emit `[]` when you found nothing — never omit the
   key, and never emit a bare object instead of an array.
+- Every `findings` element has exactly these keys, all present and in this order:
+  `severity` (`critical`, `important`, or `suggestion`), `filePath` (repo-root
+  path or empty string), `line` (integer), and `comment` (one plain-text line).
+  Do not add, rename, or omit any finding key.
 - `summary` is one plain-text line describing what the PR does and your overall
   assessment. It is posted verbatim when summary posting is enabled.
 - Emit exactly **one** marker-prefixed line, and make it the final non-blank
@@ -197,13 +245,11 @@ Requirements:
 - The marker must be **one line**: the literal prefix, one space, then the whole
   JSON object compacted onto that line. Do not pretty-print it and do not wrap
   it in a code fence.
-- **Re-read the JSON before you emit it.** It is several kilobytes of
-  hand-written JSON on a single line, and one stray bracket or missing comma
-  discards the entire review — the wrapper cannot repair it and will not guess.
-  Check that every `{` and `[` is closed, that `findings` closes with `}]`
-  before `"recommendedVote"`, and that the object ends with exactly one `}`.
+- **Re-read the JSON before you emit it.** The wrapper cannot repair it and will
+  not guess. Confirm that you changed only the three model-owned values and
+  retained every scaffold key and wrapper-owned value exactly.
 
-Before the marker, print a short plain-text summary: the bound PR and source
+Before the result, print a short plain-text summary: the bound PR and source
 commit, how many findings you are reporting at each severity, what you
 deliberately did *not* report because another reviewer already had, and
 confirmation that you made no writes of any kind.
