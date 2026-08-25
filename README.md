@@ -234,6 +234,8 @@ Other properties worth knowing:
 - **The summary describes the review, not the delivery.** Its bounded,
   structured sections record the applied review guidance, verified behavior,
   rollout and validation analysis, security assessment, and recommendation.
+  A summary with no findings is created as a closed thread because it is
+  informational and requires no action; a summary with findings remains active.
   The body also quotes how much of the review is *eligible* to post - never how
   much actually posted, and never a claim that anything was published. That is both honest
   (what lands depends on which write switches the run carried and on whether
