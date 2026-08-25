@@ -2489,6 +2489,15 @@ function Get-ReviewerFindingThreadStatus {
     return 'Active'
 }
 
+function Get-ReviewerSummaryThreadStatus {
+    <# A clean summary is informational, not an unresolved request to the PR
+       author. Keep summaries active only when the review reported at least one
+       actionable finding. #>
+    param([int]$ReportedFindingCount = 0)
+    if ($ReportedFindingCount -eq 0) { return 'Closed' }
+    return 'Active'
+}
+
 # ---------------------------------------------------------------------------
 # Cycle metadata helper
 # ---------------------------------------------------------------------------
@@ -3498,6 +3507,11 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("Suggestion findings are not closed/non-blocking while higher-severity findings remain active.")
     }
     else { Write-Host "  OK - suggestion findings post as closed threads and do not create unresolved blockers" -ForegroundColor Green }
+    if ((Get-ReviewerSummaryThreadStatus -ReportedFindingCount 0) -cne 'Closed' -or
+        (Get-ReviewerSummaryThreadStatus -ReportedFindingCount 1) -cne 'Active') {
+        $failures.Add("Clean summaries are not closed while summaries with actionable findings remain active.")
+    }
+    else { Write-Host "  OK - clean summaries are closed and finding-bearing summaries remain active" -ForegroundColor Green }
     $counts = Get-ReviewerSeverityCounts -Findings $rawFindings
     if ($counts['critical'] -ne 2 -or $counts['important'] -ne 1 -or $counts['suggestion'] -ne 1) { $failures.Add("Severity counts are wrong.") }
     else { Write-Host "  OK - severity counts cover every reported finding, not only the postable ones" -ForegroundColor Green }
@@ -4760,7 +4774,8 @@ function Invoke-ReviewerDelivery {
             $outcome.SummaryPosted = $true
         }
         else {
-            $post = Add-ReviewerThread -Session $Session -PrId $PrId -Content $summaryBody
+            $post = Add-ReviewerThread -Session $Session -PrId $PrId -Content $summaryBody `
+                -Status (Get-ReviewerSummaryThreadStatus -ReportedFindingCount $ReportedFindingCount)
             if ($post.Error) { Write-Warning "  could not post the summary on PR ${PrId}: $($post.Error)" }
             else { $outcome.SummaryPosted = $true; Write-Host "  posted the review summary." -ForegroundColor Green }
         }
