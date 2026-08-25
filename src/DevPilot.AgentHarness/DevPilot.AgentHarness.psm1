@@ -697,9 +697,10 @@ function ConvertTo-AgentMarkerFieldValue {
     param(
         [Parameter(Mandatory)][hashtable]$Spec,
         [AllowNull()]$Value,
-        [int]$Depth = 0
+        [int]$Depth = 0,
+        [string]$Path = ''
     )
-    $bad = @{ Ok = $false; Value = $null }
+    $bad = @{ Ok = $false; Value = $null; Field = $Path }
     # A top-level array may contain exact objects with scalar fields. Bounding
     # the nesting still rejects recursive object/array structures.
     if ($Depth -gt 2) { return $bad }
@@ -831,17 +832,31 @@ function ConvertTo-AgentMarkerFieldValue {
             if ($itemSchema -isnot [hashtable] -or -not $itemSchema.ContainsKey('Keys') -or -not $itemSchema.ContainsKey('Fields')) { return $bad }
             $itemKeys = @($itemSchema.Keys)
             $out = New-Object System.Collections.Generic.List[hashtable]
-            foreach ($element in $items) {
+            for ($itemIndex = 0; $itemIndex -lt $items.Count; $itemIndex++) {
+                $element = $items[$itemIndex]
+                $itemPath = if ($Path) { "$Path[$itemIndex]" } else { "[$itemIndex]" }
                 if ($element -isnot [System.Management.Automation.PSCustomObject]) { return $bad }
                 $elementKeys = @($element.PSObject.Properties | ForEach-Object { $_.Name })
-                foreach ($name in $elementKeys) { if ($itemKeys -notcontains $name) { return $bad } }
-                foreach ($name in $itemKeys) { if (-not $element.PSObject.Properties[$name]) { return $bad } }
+                foreach ($name in $elementKeys) {
+                    if ($itemKeys -notcontains $name) {
+                        return @{ Ok = $false; Value = $null; Field = "$itemPath.$name" }
+                    }
+                }
+                foreach ($name in $itemKeys) {
+                    if (-not $element.PSObject.Properties[$name]) {
+                        return @{ Ok = $false; Value = $null; Field = "$itemPath.$name" }
+                    }
+                }
                 $record = @{}
                 foreach ($name in $itemKeys) {
                     $fieldSpec = $itemSchema.Fields[$name]
-                    if ($null -eq $fieldSpec) { return $bad }
-                    $converted = ConvertTo-AgentMarkerFieldValue -Spec $fieldSpec -Value $element.PSObject.Properties[$name].Value -Depth ($Depth + 1)
-                    if (-not $converted.Ok) { return $bad }
+                    if ($null -eq $fieldSpec) {
+                        return @{ Ok = $false; Value = $null; Field = "$itemPath.$name" }
+                    }
+                    $converted = ConvertTo-AgentMarkerFieldValue -Spec $fieldSpec `
+                        -Value $element.PSObject.Properties[$name].Value -Depth ($Depth + 1) `
+                        -Path "$itemPath.$name"
+                    if (-not $converted.Ok) { return $converted }
                     $record[$name] = $converted.Value
                 }
                 [void]$out.Add($record)
@@ -859,15 +874,26 @@ function ConvertTo-AgentMarkerFieldValue {
             }
             $objectKeys = @($objectSchema.Keys)
             $valueKeys = @($Value.PSObject.Properties | ForEach-Object { $_.Name })
-            foreach ($name in $valueKeys) { if ($objectKeys -notcontains $name) { return $bad } }
-            foreach ($name in $objectKeys) { if (-not $Value.PSObject.Properties[$name]) { return $bad } }
+            foreach ($name in $valueKeys) {
+                if ($objectKeys -notcontains $name) {
+                    return @{ Ok = $false; Value = $null; Field = $(if ($Path) { "$Path.$name" } else { $name }) }
+                }
+            }
+            foreach ($name in $objectKeys) {
+                if (-not $Value.PSObject.Properties[$name]) {
+                    return @{ Ok = $false; Value = $null; Field = $(if ($Path) { "$Path.$name" } else { $name }) }
+                }
+            }
             $record = @{}
             foreach ($name in $objectKeys) {
                 $fieldSpec = $objectSchema.Fields[$name]
-                if ($null -eq $fieldSpec) { return $bad }
+                $fieldPath = if ($Path) { "$Path.$name" } else { $name }
+                if ($null -eq $fieldSpec) {
+                    return @{ Ok = $false; Value = $null; Field = $fieldPath }
+                }
                 $converted = ConvertTo-AgentMarkerFieldValue -Spec $fieldSpec `
-                    -Value $Value.PSObject.Properties[$name].Value -Depth ($Depth + 1)
-                if (-not $converted.Ok) { return $bad }
+                    -Value $Value.PSObject.Properties[$name].Value -Depth ($Depth + 1) -Path $fieldPath
+                if (-not $converted.Ok) { return $converted }
                 $record[$name] = $converted.Value
             }
             return @{ Ok = $true; Value = $record }
@@ -1007,16 +1033,18 @@ function Get-AgentResultMarkerOutcome {
         [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
         [Parameter(Mandatory)][string]$MarkerPrefix,
         [Parameter(Mandatory)][hashtable]$Schema,
-        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars
+        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars,
+        [scriptblock]$CandidateNormalizer
     )
     $mk = {
-        param([string]$Status, $Value, $Field, [string]$Reason)
+        param([string]$Status, $Value, $Field, [string]$Reason, [object[]]$NormalizedFields = @())
         return @{
-            Status    = $Status
-            Value     = $Value
-            Field     = $Field
-            Retryable = (Test-AgentMarkerStatusRetryable -Status $Status)
-            Reason    = $Reason
+            Status           = $Status
+            Value            = $Value
+            Field            = $Field
+            Retryable        = (Test-AgentMarkerStatusRetryable -Status $Status)
+            Reason           = $Reason
+            NormalizedFields = @($NormalizedFields)
         }
     }
     try {
@@ -1142,7 +1170,19 @@ function Get-AgentResultMarkerOutcome {
                 }
                 if (-not $bound) { continue }
             }
-            [void]$parsedCandidates.Add($parsed)
+            $normalizations = @()
+            if ($CandidateNormalizer) {
+                $normalized = & $CandidateNormalizer $parsed
+                if ($normalized -isnot [hashtable] -or -not $normalized.ContainsKey('Value') -or
+                    $normalized.Value -isnot [System.Management.Automation.PSCustomObject]) {
+                    throw "The trusted marker candidate normalizer returned an invalid result."
+                }
+                $parsed = $normalized.Value
+                if ($normalized.ContainsKey('NormalizedFields')) {
+                    $normalizations = @($normalized.NormalizedFields)
+                }
+            }
+            [void]$parsedCandidates.Add(@{ Value = $parsed; NormalizedFields = $normalizations })
             if ($parsedCandidates.Count -gt $script:AgentMarkerMaxRetainedCandidates) {
                 return (& $mk $script:AgentMarkerStatus.Overflow $null $null `
                         "More than $script:AgentMarkerMaxRetainedCandidates marker occurrences carried this cycle's nonce.")
@@ -1165,7 +1205,16 @@ function Get-AgentResultMarkerOutcome {
         # Every surviving occurrence must MEAN the same thing.
         $obj = $null
         $canonical = $null
-        foreach ($parsed in $parsedCandidates) {
+        $allNormalizations = [System.Collections.Generic.List[object]]::new()
+        foreach ($candidate in $parsedCandidates) {
+            $parsed = $candidate.Value
+            foreach ($normalization in @($candidate.NormalizedFields)) {
+                if (-not @($allNormalizations | Where-Object {
+                            [string]$_.Field -ceq [string]$normalization.Field
+                        }).Count) {
+                    [void]$allNormalizations.Add($normalization)
+                }
+            }
             $parsedCanonical = ConvertTo-AgentCanonicalMarkerJson -Value $parsed
             if ($null -eq $canonical) {
                 $canonical = $parsedCanonical
@@ -1200,16 +1249,18 @@ function Get-AgentResultMarkerOutcome {
             if ($null -eq $spec) {
                 return (& $mk $script:AgentMarkerStatus.SchemaInvalid $null $name "The schema declared no rule for key '$name'.")
             }
-            $converted = ConvertTo-AgentMarkerFieldValue -Spec $spec -Value $obj.PSObject.Properties[$name].Value
+            $converted = ConvertTo-AgentMarkerFieldValue -Spec $spec `
+                -Value $obj.PSObject.Properties[$name].Value -Path $name
             if (-not $converted.Ok) {
                 # A present-but-wrong exact field is a wrong binding; every other
                 # field failure is a schema-shape failure.
                 $status = if ([string]$spec.Type -ceq 'exact') { $script:AgentMarkerStatus.WrongBinding } else { $script:AgentMarkerStatus.SchemaInvalid }
-                return (& $mk $status $null $name "The marker field '$name' failed its typed schema rule.")
+                $field = if ([string]$converted.Field) { [string]$converted.Field } else { $name }
+                return (& $mk $status $null $field "The marker field '$field' failed its typed schema rule." @($allNormalizations))
             }
             $out[$name] = $converted.Value
         }
-        return (& $mk $script:AgentMarkerStatus.Success $out $null "")
+        return (& $mk $script:AgentMarkerStatus.Success $out $null "" @($allNormalizations))
     }
     catch {
         return (& $mk $script:AgentMarkerStatus.MalformedMarker $null $null "The marker could not be parsed: $($_.Exception.Message)")
@@ -1248,10 +1299,11 @@ function ConvertFrom-AgentResultMarkerOutcome {
         [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
         [Parameter(Mandatory)][string]$MarkerPrefix,
         [Parameter(Mandatory)][hashtable]$Schema,
-        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars
+        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars,
+        [scriptblock]$CandidateNormalizer
     )
     return Get-AgentResultMarkerOutcome -StdOutText $StdOutText -MarkerPrefix $MarkerPrefix `
-        -Schema $Schema -ScanWindowChars $ScanWindowChars
+        -Schema $Schema -ScanWindowChars $ScanWindowChars -CandidateNormalizer $CandidateNormalizer
 }
 
 function Measure-AgentMarkerSchemaWorstCaseChars {
@@ -1538,6 +1590,31 @@ function Find-CopilotSessionForBranch {
 # Timed subprocess execution (real Copilot invocation + -DryRun timeout test)
 # ---------------------------------------------------------------------------
 
+function Add-AgentOfflineTelemetryEvent {
+    param(
+        [Parameter(Mandatory)][string]$Event,
+        [hashtable]$Data = @{}
+    )
+    if ($env:DEVPILOT_OFFLINE_TELEMETRY_MODE -cne "production-test-only" -or
+        [string]::IsNullOrWhiteSpace($env:DEVPILOT_OFFLINE_TELEMETRY_PATH)) {
+        return
+    }
+    $record = [ordered]@{
+        schemaVersion = 1
+        event = $Event
+        processId = $PID
+        recordedAtUtc = [DateTime]::UtcNow.ToString("o")
+        data = [ordered]@{}
+    }
+    foreach ($key in @($Data.Keys | Sort-Object -CaseSensitive)) {
+        $record.data[[string]$key] = $Data[$key]
+    }
+    [IO.File]::AppendAllText(
+        $env:DEVPILOT_OFFLINE_TELEMETRY_PATH,
+        (ConvertTo-Json -InputObject $record -Depth 12 -Compress) + [Environment]::NewLine,
+        [Text.UTF8Encoding]::new($false))
+}
+
 function Set-TimedProcessArguments {
     param([Parameter(Mandatory)][System.Diagnostics.ProcessStartInfo]$Psi, [string[]]$ArgumentList)
     foreach ($argument in @($ArgumentList)) { $Psi.ArgumentList.Add($argument) }
@@ -1637,6 +1714,17 @@ function Invoke-TimedProcess {
     $proc = $null
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
+        $telemetryArguments = @($ArgumentList)
+        for ($argumentIndex = 0; $argumentIndex -lt $telemetryArguments.Count - 1; $argumentIndex++) {
+            if ([string]$telemetryArguments[$argumentIndex] -ceq '-BindingBase64') {
+                $telemetryArguments[$argumentIndex + 1] = '$OPERATIONAL_BINDING'
+            }
+        }
+        Add-AgentOfflineTelemetryEvent -Event "process.started" -Data @{
+            executable = [string]$psi.FileName
+            childProcessId = [int]$proc.Id
+            arguments = $telemetryArguments
+        }
 
         $stdoutTask = $null
         $stderrTask = $null
@@ -1756,7 +1844,7 @@ function Invoke-TimedProcess {
 # ---------------------------------------------------------------------------
 
 # Code-defined, not manifest-defined: a bound a snapshot can raise is not a bound.
-$script:AgentReplaySchemaVersions = @(1, 2)
+$script:AgentReplaySchemaVersions = @(1, 2, 3)
 $script:AgentReplayKind = "agent-replay-snapshot"
 $script:AgentReplayMaxResources = 4096
 $script:AgentReplayMaxPayloadBytes = 25165824
@@ -1769,7 +1857,7 @@ $script:AgentReplayHexPattern = '^[0-9a-f]{64}\z'
 # Seal kinds a manifest classification may declare. A classification only ever
 # WITHDRAWS promotability, so every kind here is non-promotable by definition;
 # the list exists so an unknown label is refused rather than honoured blindly.
-$script:AgentReplayNonPromotableSealKinds = @("offlineCorpusSeal")
+$script:AgentReplayNonPromotableSealKinds = @("offlineCorpusSeal", "benchmarkPackMaterialization")
 # Reference-identity seal, not a string: a constant that a hand-built hashtable
 # can carry would let any in-process caller present itself as a loaded snapshot
 # and skip every check in New-AgentReplaySnapshot. Same pattern as the
@@ -2087,7 +2175,7 @@ function New-AgentReplaySnapshot {
     catch { throw "Replay manifest is not valid JSON." }
     if ($manifest -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest must be a JSON object." }
 
-    $schemaVersion = Get-AgentReplayManifestField -Object $manifest -Name "schemaVersion" -Type int -Min 1 -Max 2
+    $schemaVersion = Get-AgentReplayManifestField -Object $manifest -Name "schemaVersion" -Type int -Min 1 -Max 3
     $manifestKeys = @(
         "schemaVersion", "kind", "snapshotId", "capturedUtc", "provider",
         "binding", "bindings", "resources", "manifestDigest"
@@ -2101,10 +2189,13 @@ function New-AgentReplaySnapshot {
     # schema v1 and pre-existing v2 snapshots are.
     $hasClassification = [bool]$manifest.PSObject.Properties["classification"]
     if ($hasClassification) {
-        if ($schemaVersion -ne 2) {
-            throw "Replay manifest carries a classification but declares schema version $schemaVersion; classification is a schema-v2 field."
+        if ($schemaVersion -eq 1) {
+            throw "Replay manifest carries a classification but declares schema version 1; classification is a schema-v2 field or a schema-v3 required field."
         }
         $manifestKeys += "classification"
+    }
+    elseif ($schemaVersion -eq 3) {
+        throw "Replay manifest schema version 3 requires a non-promotable classification."
     }
     Assert-AgentReplayExactKeys -Object $manifest -Where "Replay manifest" -Expected $manifestKeys
     if ($script:AgentReplaySchemaVersions -notcontains $schemaVersion) {
@@ -2612,6 +2703,10 @@ function Send-AgentMcpRequest {
         if (-not $Params.ContainsKey("name") -or -not $Params.ContainsKey("arguments")) {
             throw "Replay session received a tools/call without a name and arguments."
         }
+        Add-AgentOfflineTelemetryEvent -Event "provider.replayServed" -Data @{
+            method = $Method
+            tool = [string]$Params["name"]
+        }
         return (Get-AgentReplayResponse -Snapshot $Session.Replay -Name ([string]$Params["name"]) -Arguments $Params["arguments"])
     }
     if (-not $Session.Process) { throw "Agent MCP session is closed." }
@@ -2620,6 +2715,10 @@ function Send-AgentMcpRequest {
     $request = [ordered]@{ jsonrpc = "2.0"; id = $requestId; method = $Method; params = $Params }
     $line = $request | ConvertTo-Json -Compress -Depth 20
     try {
+        Add-AgentOfflineTelemetryEvent -Event "provider.liveWrite" -Data @{
+            method = $Method
+            childProcessId = [int]$Session.Process.Id
+        }
         $Session.Process.StandardInput.WriteLine($line)
         $Session.Process.StandardInput.Flush()
     }
@@ -2736,6 +2835,10 @@ function Open-AgentMcpSession {
         if ($Organization -and [string]$ReplaySnapshot.Binding.Organization -cne $Organization) {
             throw "Replay snapshot '$($ReplaySnapshot.SnapshotId)' was captured against organization '$($ReplaySnapshot.Binding.Organization)', not '$Organization'."
         }
+        Add-AgentOfflineTelemetryEvent -Event "provider.replaySessionOpened" -Data @{
+            server = $Server
+            snapshotId = [string]$ReplaySnapshot.SnapshotId
+        }
         return @{
             Process        = $null
             NextId         = [long]0
@@ -2765,6 +2868,11 @@ function Open-AgentMcpSession {
     foreach ($variableName in (Get-AgentSessionIsolationEnvVars)) { [void]$psi.EnvironmentVariables.Remove($variableName) }
 
     $process = [System.Diagnostics.Process]::Start($psi)
+    Add-AgentOfflineTelemetryEvent -Event "provider.liveProcessStarted" -Data @{
+        executable = [string]$psi.FileName
+        childProcessId = [int]$process.Id
+        server = $Server
+    }
     $session = @{
         Process        = $process
         NextId         = [long]0
@@ -4536,6 +4644,7 @@ Export-ModuleMember -Function @(
     "Assert-AgentReplaySnapshotPromotable",
     "Get-AgentReplayResponse",
     "Test-AgentReplaySnapshotHasResponse",
+    "Add-AgentOfflineTelemetryEvent",
     "Get-AgentSupportedProvider",
     "Test-AgentProviderSupported",
     "New-AgentProviderContext",

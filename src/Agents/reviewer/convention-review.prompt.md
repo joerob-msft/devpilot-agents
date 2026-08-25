@@ -208,8 +208,9 @@ not a candidate. Do not invent a resolution.
     `conventionKey` names the generic required construct from the authoritative
     rule. `valueSource` is `deterministicFact` only when sealed facts establish
     the exact value; otherwise use `authoritativeRule` and request the correct
-    value without guessing it. `authoritativeRule` requires empty
-    `changedCodeFix.evidenceFactIds`; its remediation evidence is the pinned
+    value without guessing it. `changedCodeFix.evidenceFactIds` is ALWAYS a
+    comma-separated JSON string: use exactly `""` when there are none, and never
+    emit an array or `null`. `authoritativeRule` requires that empty string; its remediation evidence is the pinned
     provenance, section, and exact quote. Candidate-level `factIds` may still
     support impact. `deterministicFact` may cite only wrapper-supplied `rf1:` facts whose
     state and value are canonical booleans or strings. Never infer an identifier,
@@ -270,7 +271,8 @@ or empty), `confidence` (`low|medium|high`), `residualRiskSummary`,
 `action` (`add|modify|remove|rename|replace|validate`), `targets`
 (comma-separated canonical sealed targets: exact `cf<n>:<line>` or truthful
 lexical construct ids), `conventionKey`, `valueSource`
-(`authoritativeRule|deterministicFact`), and `evidenceFactIds`), and
+(`authoritativeRule|deterministicFact`), and `evidenceFactIds` (always a
+comma-separated string, none=`""`, never an array or `null`)), and
 `existingDebtFollowUp` (an exact object with `status` (`none|required`),
 `evidenceFactId`, `selectorKey`, `scopeKind` (`""|file`), `scopePath`, `comparableCount`,
 `compliantCount`, and `action`

@@ -102,6 +102,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Assert-AgentReplaySnapshotPromotable',
                'Get-AgentReplayResponse',
                'Test-AgentReplaySnapshotHasResponse',
+               'Add-AgentOfflineTelemetryEvent',
     'Get-AgentSupportedProvider', 'Test-AgentProviderSupported', 'New-AgentProviderContext', 'Assert-AgentProviderContext',
     'Invoke-AgentGitHubApi', 'Invoke-AgentGitHubGraphQl', 'ConvertTo-AgentProviderPullRequestStatus', 'ConvertTo-AgentProviderVote',
     'ConvertTo-AgentProviderSnapshot', 'ConvertTo-AgentProviderThreadStatus', 'Get-AgentProviderPullRequestSnapshot',

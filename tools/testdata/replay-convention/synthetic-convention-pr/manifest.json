@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "kind": "agent-replay-snapshot",
-  "snapshotId": "synthetic-pr",
+  "snapshotId": "synthetic-convention-pr",
   "capturedUtc": "20260101T000000Z",
   "provider": "ado",
   "binding": {
@@ -136,7 +136,19 @@
       "payloadFile": "payloads/file-conventions.json",
       "payloadSha256": "68c4f41ba0285c1dc46a07492813b7a3bee4ef4b0b3d78bab414887768e448c7",
       "payloadByteLength": 439
+    },
+    {
+      "tool": "repo_repository",
+      "arguments": {
+        "action": "get",
+        "project": "Widgets",
+        "repositoryNameOrId": "11111111-2222-3333-4444-555555555555"
+      },
+      "requestSha256": "58e172c7591c8bc9c8054257f8f14e037067eb4ee76494f045b58c3b8143f621",
+      "payloadFile": "payloads/repo-identity.json",
+      "payloadSha256": "31da36c6365ee9607cbd36a3e5c0698befaa848fb9068b68e0e6648ffe68e2f3",
+      "payloadByteLength": 191
     }
   ],
-  "manifestDigest": "904bb81c21ee3ed4a18c14daff65484b5807820e63d4e1ab05b5d307a78592db"
+  "manifestDigest": "2b75bc21539276e22ee5b01e6c6b3f06442b59806a8c14528b831472cf14ed65"
 }

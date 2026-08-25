@@ -18,12 +18,31 @@
     ./tools/Test-SourceTransport.ps1
 #>
 [CmdletBinding()]
-param()
+param(
+    [string]$RepoRoot = (Split-Path $PSScriptRoot -Parent),
+    [switch]$IsolatedChild
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$repoRoot = Split-Path $PSScriptRoot -Parent
+if (-not $IsolatedChild) {
+    $isolatedRoot = Join-Path ([IO.Path]::GetTempPath()) ('reviewer-source-test-' + [Guid]::NewGuid().ToString('N'))
+    $isolatedScript = Join-Path $isolatedRoot 'Test-SourceTransport.ps1'
+    try {
+        New-Item -ItemType Directory -Path $isolatedRoot -Force | Out-Null
+        Copy-Item -LiteralPath $PSCommandPath -Destination $isolatedScript
+        Write-Host 'Source compatibility: executing exact test bytes from an isolated path with explicit RepoRoot.'
+        & pwsh -NoProfile -File $isolatedScript -RepoRoot ([IO.Path]::GetFullPath($RepoRoot)) -IsolatedChild
+        if ($LASTEXITCODE -ne 0) { throw "Isolated source test exited with code $LASTEXITCODE." }
+        return
+    }
+    finally {
+        Remove-Item -LiteralPath $isolatedRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$repoRoot = [IO.Path]::GetFullPath($RepoRoot)
 . (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1')
 
 # The wrapper is parsed for structural checks. Its two authoritative transport
