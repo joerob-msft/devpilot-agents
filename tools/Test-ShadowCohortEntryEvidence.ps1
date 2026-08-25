@@ -474,7 +474,12 @@ function New-CohortEntryFixture {
             $harnessTarget = Join-Path $toolkit 'src/DevPilot.AgentHarness'
             [void](New-Item -ItemType Directory -Force -Path $harnessTarget)
             Copy-Item -Path (Join-Path $harnessSource '*') -Destination $harnessTarget -Recurse -Force
-            foreach ($module in @('QualificationPreflight.ps1', 'ReplayQualification.ps1', 'ModelStartCensus.ps1')) {
+            foreach ($module in @(
+                    'QualificationPreflight.ps1',
+                    'ReplayQualification.ps1',
+                    'ModelStartCensus.ps1',
+                    'ModelStartCensusManifest.ps1',
+                    'ReviewerBaseContract.ps1')) {
                 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "../src/Agents/reviewer/$module") `
                     -Destination (Join-Path $toolkit "src/Agents/reviewer/$module") -Force
             }

@@ -176,7 +176,11 @@
     },
     {
       "sha256": "0af3e6f72165210be1ee3a7e25ecbd14ea85a7402caeb80591c7a063ec1197e6",
-      "reason": "CURRENT and authoritative. Seal each response envelope under the startup-resolved run key rather than the state-directory key directly, so a state directory nested inside a readable root relocates the key instead of aborting the run, and record that key origin inside the sealed bytes."
+      "reason": "History only, superseded below. Seal each response envelope under the startup-resolved run key rather than the state-directory key directly, so a state directory nested inside a readable root relocates the key instead of aborting the run, and record that key origin inside the sealed bytes."
+    },
+    {
+      "sha256": "910d953e7ba8429c133d85c8c358ab502c54363059e481469ce49200bfa4c74d",
+      "reason": "CURRENT and authoritative. Return every model-pass outcome through the New-ReviewerModelPassResult factory so each result - including the oversized-input rejection, which previously returned a bare hashtable - states EnvelopePersisted explicitly. Under Set-StrictMode the missing key made the oversize refusal throw where callers read it, which neither advanced starvation accounting nor terminated the retry, so a persistently oversized input could refuse forever without ever being counted. The decisions this function makes are unchanged; only the shape of what it returns is now closed and asserted."
     }
     ],
     "Invoke-ReviewerPullRequest": [
@@ -218,7 +222,11 @@
     },
     {
       "sha256": "7709cc16a632f22fc258db0d0db71719b37946288f26b20ce827162541705d99",
-      "reason": "CURRENT and authoritative. Require the sealed v2 response envelope to have reached disk before the pass counts in the census, and publish that persistence fact on the attempt-accounting record. A tier held only in the memory of a process about to exit is not evidence anyone can audit, and counting it would reproduce the same silent census gap in a new place."
+      "reason": "History only, superseded below. Require the sealed v2 response envelope to have reached disk before the pass counts in the census, and publish that persistence fact on the attempt-accounting record. A tier held only in the memory of a process about to exit is not evidence anyone can audit, and counting it would reproduce the same silent census gap in a new place."
+    },
+    {
+      "sha256": "fff240feb44031fa30efcb3d5eef276ce76b45515bec9c9bd6867869a9b3f2f3",
+      "reason": "CURRENT and authoritative. Bind the census signing key through an explicitly typed byte array so the boundary analyzer's array-preservation rule is satisfied at the point the key is handed to the census seal; the key value, its origin, and every gate, launch, retry, discovery, cross-verification and delivery decision in this function are unchanged, and the disabled generalist paths are untouched."
     }
     ],
     "Write-ReviewerConventionSpecialistPreview": [

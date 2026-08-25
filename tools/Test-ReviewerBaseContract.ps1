@@ -97,7 +97,7 @@ function New-MutatedContract {
         $contract.contractDigest = Get-ReviewerBaseContractDigest -Contract $contract
     }
     $path = Join-Path $sandbox ($Name + '.json')
-    [IO.File]::WriteAllText($path, (($contract | ConvertTo-Json -Depth 32).Replace("`r`n", "`n") + "`n"), $script:Utf8)
+    [IO.File]::WriteAllText($path, (($contract | ConvertTo-Json -Depth 32 -Compress:$false).Replace("`r`n", "`n") + "`n"), $script:Utf8)
     return $path
 }
 
@@ -138,8 +138,8 @@ try {
     }
 
     Assert-Pass 'the equivalence the supersession rests on is a real tree equality in git' {
-        $legacyTree = Get-ReviewerBaseContractTree -RepoRoot $RepoRoot -Commit ([string]$legacy.baseCommit)
-        $activeTree = Get-ReviewerBaseContractTree -RepoRoot $RepoRoot -Commit ([string]$active.baseCommit)
+        [string]$legacyTree = Get-ReviewerBaseContractTree -RepoRoot $RepoRoot -Commit ([string]$legacy.baseCommit)
+        [string]$activeTree = Get-ReviewerBaseContractTree -RepoRoot $RepoRoot -Commit ([string]$active.baseCommit)
         if ($legacyTree.Length -eq 0 -or $activeTree.Length -eq 0) { throw 'a boundary object is missing' }
         if ($legacyTree -cne $activeTree) { throw "$legacyTree vs $activeTree" }
     }

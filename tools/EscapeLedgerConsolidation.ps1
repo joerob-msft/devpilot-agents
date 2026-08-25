@@ -295,6 +295,22 @@ function Read-EscapeLedgerConsolidationMap {
             throw ("The escape-ledger consolidation map '$Path' maps source commit " +
                 "'$([string]$mapping.sourceCommit)' more than once; a source commit resolves to one replacement or to none.")
         }
+        # AT LEAST ONE, ALWAYS. For 'segmentConsolidation' - the basis every
+        # mapping in the committed map uses - the anchor tree-equality check does
+        # not apply, so carried evidence is the ONLY content-level link between a
+        # source commit and the replacement claimed to carry it. An empty list
+        # makes the acceptance loop below run zero times and fall through to
+        # accepted, reducing the whole proof to "both commits are somewhere in
+        # their respective segments", which any unrelated pair satisfies. The
+        # delta identity does not close it either: it binds the two commits and
+        # their trees, not the evidence. This mirrors the reviewer base
+        # contract's refusal of an empty bound-artifact list, and for the same
+        # reason - a binding that binds nothing is not a binding.
+        if (@($mapping.carriedEvidence).Count -lt 1) {
+            throw ("The mapping for source commit '$([string]$mapping.sourceCommit)' in '$Path' carries no evidence, " +
+                'so nothing links it to its replacement except the segment ranges both happen to fall in. ' +
+                'A mapping must name at least one blob the replacement demonstrably carries.')
+        }
         foreach ($evidence in @($mapping.carriedEvidence)) {
             $evidenceKeys = @(@($evidence.PSObject.Properties | ForEach-Object { [string]$_.Name }) | Sort-Object -CaseSensitive)
             $expectedEvidence = @(@($script:EscapeLedgerConsolidationEvidenceKeys) | Sort-Object -CaseSensitive)

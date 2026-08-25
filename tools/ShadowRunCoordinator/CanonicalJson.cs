@@ -327,15 +327,16 @@ internal static class CanonicalJson
     /// Raised when an atomic publish exhausted its retry budget against a
     /// transient Windows sharing violation. Recoverable on purpose: the
     /// destination still holds exactly the old content or exactly the new one,
-    /// and the temporary has been removed, so a resumed run may simply try
-    /// again.
+    /// so a resumed run may simply try again. Removal of the temporary is
+    /// attempted but not promised - a foreign handle can hold that file too, and
+    /// failing the publish over a cleanup would be the worse trade.
     /// </summary>
     internal sealed class AtomicPublishTimeoutException : Exception
     {
         internal AtomicPublishTimeoutException(string path, int attempts, int elapsedMilliseconds, Exception inner)
             : base($"Publishing '{path}' did not complete within {attempts} attempt(s) over {elapsedMilliseconds}ms " +
-                   "because the destination stayed locked by another process. The destination was left unchanged " +
-                   "and the temporary file was removed; this is recoverable and may be retried.", inner)
+                   "because the destination stayed locked by another process. The destination was left holding whole " +
+                   "content; this is recoverable and may be retried.", inner)
         {
             Path = path;
             Attempts = attempts;
@@ -362,11 +363,15 @@ internal static class CanonicalJson
     private const int ErrorLockViolation = 33;
 
     // ReplaceFile's own two partial outcomes. 1176 leaves the destination under
-    // its original name; 1177 leaves it under the internal backup name, which
-    // means the destination is momentarily ABSENT. Both are retryable, and the
-    // retry recovers the 1177 case on its own: with the destination gone the
-    // next attempt falls through to the rename, which puts the new content
-    // there. What must never happen is treating either as success.
+    // its original name; 1177 leaves it under the backup name this code chooses,
+    // which means the destination is momentarily ABSENT. Both are retryable, and
+    // an earlier attempt recovers the 1177 case on its own: with the destination
+    // gone the next attempt falls through to the rename, which puts the new
+    // content there. On the LAST attempt there is no next one, so the publish
+    // path restores the invariant explicitly instead - see PublishOnce's catch,
+    // which puts the backup back, and PublishWithBoundedRetry's final check,
+    // which will not report "unchanged" over a path that does not resolve. What
+    // must never happen is treating either code as success.
     private const int ErrorUnableToMoveReplacement = 1176;
     private const int ErrorUnableToMoveReplacement2 = 1177;
 
@@ -420,7 +425,13 @@ internal static class CanonicalJson
     /// attempt is the same single replace, so the destination holds the whole old
     /// content or the whole new content and never a blend. Only recognised
     /// sharing violations are retried; anything else is reported at once. The
-    /// temporary is removed on every path out, including the timeout.
+    /// temporary is removed on every path out, including the timeout, on a best
+    /// effort basis: the same foreign handle that can hold the destination can
+    /// hold the temporary, and a cleanup that threw from the finally would
+    /// REPLACE the typed publish result with a bare IOException, costing the
+    /// caller the very Recoverable flag it is being handed. A leftover .tmp is
+    /// the lesser harm and is what every other cleanup in this file already
+    /// chooses.
     /// </summary>
     internal static void WriteFileAtomic(string path, string content)
     {
@@ -443,9 +454,18 @@ internal static class CanonicalJson
         }
         finally
         {
-            if (File.Exists(temporary))
+            try
             {
-                File.Delete(temporary);
+                if (File.Exists(temporary))
+                {
+                    File.Delete(temporary);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
             }
         }
     }
@@ -502,6 +522,15 @@ internal static class CanonicalJson
         }
     }
 
+    // TEST ONLY. The POSIX rename succeeds on every NTFS volume this tool runs
+    // on, which means the ReplaceFile fallback below - and the backup, restore
+    // and cleanup logic that guards it - is never executed by a passing test on
+    // a healthy host. That is precisely the code whose failure mode destroyed a
+    // state file, so leaving it to be exercised only by the hosts that have no
+    // POSIX rename is not acceptable. Setting this makes the self-test take the
+    // fallback deliberately. It is never set by production code.
+    internal static bool ForceReplaceFileFallbackForTests;
+
     private static void PublishOnce(string temporary, string path)
     {
         // A rename first, because it is the only genuinely atomic option: the
@@ -510,11 +539,17 @@ internal static class CanonicalJson
         // nobody reading - this is the whole story and the publish is perfect.
         try
         {
+            if (ForceReplaceFileFallbackForTests && File.Exists(path))
+            {
+                throw new IOException("Forced onto the ReplaceFile fallback by a test.");
+            }
             File.Move(temporary, path, overwrite: true);
             Interlocked.Increment(ref AtomicPublishRenameCount);
             return;
         }
-        catch (Exception exception) when (IsTransientSharingViolation(exception, path))
+        catch (Exception exception) when (
+            (ForceReplaceFileFallbackForTests && exception is IOException && File.Exists(path)) ||
+            IsTransientSharingViolation(exception, path))
         {
             // Somebody is holding the destination. A rename through MoveFileEx
             // can NEVER succeed against that on Windows, however long it is
@@ -525,7 +560,7 @@ internal static class CanonicalJson
         // The kernel's POSIX rename does the same atomic swap and does tolerate
         // an open destination. This is the case the whole fix exists for, and it
         // keeps the guarantee intact: the path never stops resolving.
-        if (NativeAtomicReplace.TryReplaceInPlace(temporary, path))
+        if (!ForceReplaceFileFallbackForTests && NativeAtomicReplace.TryReplaceInPlace(temporary, path))
         {
             Interlocked.Increment(ref AtomicPublishPosixRenameCount);
             return;
@@ -538,9 +573,19 @@ internal static class CanonicalJson
         // again; that is a retry, not a torn read, and it is still far better
         // than a publish that fails outright and leaves the journal asserting a
         // launch whose state was never written.
+        //
+        // The aside copy is given a NAME WE CHOOSE rather than left to the
+        // kernel's internal one. ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 means the
+        // destination was successfully renamed aside and the replacement then
+        // failed to move in - so at that instant the destination does not exist,
+        // and with an unnameable backup the old content would be unreachable
+        // forever. Naming it makes that outcome recoverable: the old bytes go
+        // back where they were, and the caller still sees old-or-new.
+        var backup = path + "." + Guid.NewGuid().ToString("N") + ".bak";
+        var backupIsTheOnlyCopy = false;
         try
         {
-            File.Replace(temporary, path, destinationBackupFileName: null, ignoreMetadataErrors: true);
+            File.Replace(temporary, path, destinationBackupFileName: backup, ignoreMetadataErrors: true);
             Interlocked.Increment(ref AtomicPublishReplaceCount);
         }
         catch (FileNotFoundException)
@@ -550,6 +595,77 @@ internal static class CanonicalJson
             File.Move(temporary, path, overwrite: true);
             Interlocked.Increment(ref AtomicPublishRenameCount);
         }
+        catch (Exception replaceFailure)
+        {
+            // Whatever the failure was, the invariant is restored before it is
+            // reported: if the destination is gone and the old content is
+            // sitting in the backup, put it back. Restoring first and rethrowing
+            // second means no caller ever observes a missing state file.
+            if (File.Exists(path) || !File.Exists(backup))
+            {
+                throw;
+            }
+            try
+            {
+                File.Move(backup, path, overwrite: false);
+            }
+            catch (Exception restoreFailure)
+            {
+                // The old content exists but could not be put back, and the new
+                // content is about to be discarded with the temporary. Say so in
+                // the one type that means "neither old nor new", and keep the
+                // backup: a leftover file an operator can find beats deleting the
+                // last copy of the old state in the name of tidiness.
+                backupIsTheOnlyCopy = true;
+                throw new AtomicPublishIndeterminateException(
+                    path,
+                    new AggregateException(replaceFailure, restoreFailure));
+            }
+            throw;
+        }
+        finally
+        {
+            // Best effort by design. A leftover backup is untidy; a publish
+            // failed on account of tidying up would be a defect. The one case
+            // where the backup is deliberately kept is the case where it holds
+            // the only surviving copy of the state.
+            try
+            {
+                if (!backupIsTheOnlyCopy && File.Exists(backup))
+                {
+                    File.Delete(backup);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
+    /// <summary>
+    /// Raised when a publish could not be completed AND the destination could
+    /// not be left holding either the old content or the new. Deliberately a
+    /// different type from the timeout: the timeout says "nothing changed, try
+    /// again", and a caller that hears that about a missing file will resume
+    /// against a path that no longer exists.
+    /// </summary>
+    internal sealed class AtomicPublishIndeterminateException : Exception
+    {
+        internal AtomicPublishIndeterminateException(string path, Exception inner)
+            : base($"Publishing '{path}' failed and the destination could not be restored to either the old or the " +
+                   "new content. This is NOT recoverable by retrying: the state at that path is unknown and must be " +
+                   "rebuilt before the run resumes.", inner)
+        {
+            Path = path;
+        }
+
+        internal string Path { get; }
+
+        /// <summary>Always false; named so a caller does not have to know the type.</summary>
+        internal bool Recoverable => false;
     }
 
     private static void PublishWithBoundedRetry(string temporary, string path)
@@ -579,6 +695,33 @@ internal static class CanonicalJson
                     backoff = Math.Min(backoff * 2, AtomicPublishMaxBackoffMilliseconds);
                 }
             }
+
+            // THE LAST ATTEMPT IS NOT LIKE THE OTHERS. Every earlier failure is
+            // followed by another publish, which is what makes a momentarily
+            // absent destination self-correcting. After the final one there is
+            // no next attempt, so the absence would be permanent - and the
+            // caller would be told, in as many words, that the destination was
+            // left unchanged. The invariant is therefore re-established here
+            // explicitly rather than assumed: if the path does not resolve, the
+            // new content goes there, which is a legal outcome of a publish.
+            if (!File.Exists(path))
+            {
+                try
+                {
+                    if (File.Exists(temporary))
+                    {
+                        File.Move(temporary, path, overwrite: true);
+                        Interlocked.Increment(ref AtomicPublishRenameCount);
+                        return;
+                    }
+                }
+                catch (Exception recovery) when (recovery is IOException or UnauthorizedAccessException)
+                {
+                    throw new AtomicPublishIndeterminateException(path, recovery);
+                }
+                throw new AtomicPublishIndeterminateException(path, last!);
+            }
+
             throw new AtomicPublishTimeoutException(path, AtomicPublishMaxAttempts,
                 (int)stopwatch.ElapsedMilliseconds, last!);
         }

@@ -148,7 +148,7 @@ $mappings = foreach ($declared in $mappingDeclarations) {
     }
 }
 
-$map = [ordered]@{
+[System.Collections.Specialized.OrderedDictionary]$map = [ordered]@{
     commonBaseCommit   = Resolve-Object -Revision $commonBase
     description        = 'Maps pre-consolidation commits cited by the frozen escape ledger onto the consolidated replacement lineage. The ledger citations are never rewritten; this map is how the reachability contradiction check finds the work they name in a branch that no longer contains their commits. Every identity here is recomputed from git at verification time, and the map is consulted only for reachability - never for the merged-versus-not baseline that classifies a finding.'
     kind               = 'reviewer-escape-ledger-consolidation-map'

@@ -129,7 +129,7 @@ $keysAssignment = $reviewerAst.FindAll({
 if (-not $keysAssignment) { throw 'The reviewer script does not name its closed pass-result key set.' }
 . ([scriptblock]::Create([string]$keysAssignment.Extent.Text))
 
-$minimal = New-ReviewerModelPassResult -Model 'm' -RejectionClass 'oversize' -Nonce 'n'
+[hashtable]$minimal = New-ReviewerModelPassResult -Model 'm' -RejectionClass 'oversize' -Nonce 'n'
 $expectedKeys = @($script:ReviewerModelPassResultKeys | Sort-Object)
 $actualKeys = @(@($minimal.Keys) | Sort-Object)
 Assert-PassShape ((($actualKeys) -join ',') -ceq (($expectedKeys) -join ',')) `

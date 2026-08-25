@@ -14,14 +14,14 @@
     },
     {
       "path": "src/Agents/reviewer/ReviewerBaseContract.ps1",
-      "sha256": "3124e51715c3f811f8e5224536dcd26681ba0f2e7c97e4191a72ae827f4ebaf3"
+      "sha256": "ecef74b86c7cf2f7e4a070edc007ef0bc372b19c582c2333720ac47cd8eae841"
     },
     {
       "path": "src/Agents/reviewer/testdata/exact-path/reviewer.config.json",
       "sha256": "7ff03acf4eb55bb1919d25b15d0913fb9a8dd9035fca304d4d46591e26f60dd3"
     }
   ],
-  "contractDigest": "d9e978b268c6cd3c09667c03e213b8be939182ac619c9ec6dbed958cc4e8f789",
+  "contractDigest": "1f8f1d648c14086948001a4b5e4e3cfefd7d983ca739b7bd26edc3b6c9d37e2d",
   "contractId": "reviewer-base-lineage/v1",
   "description": "The base identities a sealed reviewer fixture may be bound to. A superseded identity is accepted only through an active lineage whose boundary commit is an ancestor of the checkout and whose tree is exactly equal to the superseded identity tree. Regenerate with tools/New-ReviewerBaseContract.ps1.",
   "kind": "reviewer-base-lineage-contract",

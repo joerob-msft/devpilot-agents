@@ -1450,7 +1450,7 @@ try {
                     manifestJson = [string](ConvertTo-Json -InputObject $bodyObject -Depth 16 -Compress)
                     signature = [string]$envelopeObject.signature
                     signatureAlg = 'HMACSHA256'
-                }) -Depth 8), [Text.UTF8Encoding]::new($false))
+                }) -Depth 8 -Compress:$false), [Text.UTF8Encoding]::new($false))
     $tamperedCensus = Get-ReviewerModelStartCensus -RunRoot $tamperedManifestRoot -Argv $quietArgv
     Assert-Census (-not [bool]$tamperedCensus.authenticated) 'A census manifest body was rewritten under its old signature.'
     Assert-Census ([string]$tamperedCensus.authenticationBasis -ceq 'censusManifestRejected') `
@@ -1497,6 +1497,88 @@ try {
         -AuthenticationMode 'report'
     Assert-Census (-not [bool]$zeroPoisoned.authenticated) `
         'A preview dropped into a run that attested to having none was accepted.'
+
+    # -----------------------------------------------------------------------
+    # A SIGNATURE IS ONLY WORTH THE KEY THAT MADE IT. The three cases below are
+    # the ones where every digest matches, every inventory agrees and the
+    # signature verifies - and the manifest still proves nothing about this run.
+    # Each was reachable before these checks existed, and each produces an
+    # UNDERCOUNT that carries a valid signature, which is strictly worse than an
+    # unsigned one because it reads as proof.
+    # -----------------------------------------------------------------------
+
+    # 1. THE KEY FOUND NEXT TO THE EVIDENCE. Anything that can rewrite a run's
+    # log can also write a key file beside it and re-sign over its own edits.
+    # A verifier that picks that key up is checking the forger's arithmetic.
+    $selfKeyRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\self-sourced-key') -GeneralistAttempts 2 `
+        -SealCensusManifest $false
+    $forgedKey = [byte[]]@(1..32)
+    Save-ReviewerModelStartCensusManifest -RunRoot $selfKeyRoot -MasterKey $forgedKey `
+        -Records @(Get-ReviewerModelStartLogRecord -LogPath (Join-Path $selfKeyRoot 'logs\reviewer.log.jsonl')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $selfKeyRoot 'artifact-signing.key'),
+        'raw:' + [Convert]::ToBase64String($forgedKey))
+    $selfKeyCensus = Get-ReviewerModelStartCensus -RunRoot $selfKeyRoot -Argv $quietArgv -MasterKey $null
+    Assert-Census (-not [bool]$selfKeyCensus.authenticated) `
+        ('A manifest signed with a key taken from the run root it attests to was reported as authenticated ' +
+        "(basis '$($selfKeyCensus.authenticationBasis)').")
+    Assert-Census ([string]$selfKeyCensus.authenticationBasis -ceq 'selfAttestedCensusKey') `
+        "A self-sourced key reported basis '$($selfKeyCensus.authenticationBasis)' rather than naming what it is."
+    Assert-Census (-not [bool]$selfKeyCensus.complete) 'A self-attested run was accounted complete.'
+    # And the count itself is untouched, because blocking is the safe direction
+    # and discounting never is.
+    Assert-Census ([int]$selfKeyCensus.realModelStarts -eq 2) `
+        "A blocked census reported $($selfKeyCensus.realModelStarts) start(s) rather than the 2 its log shows."
+
+    # 2. THE MANIFEST BORROWED FROM A CHEAPER RUN. Every run of one operator
+    # seals under the same master key, so without a run identity in the signed
+    # body a correctly signed manifest travels with its evidence and reports the
+    # other run's smaller number here.
+    $cheapRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\replay-source') -GeneralistAttempts 1
+    $costlyRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\replay-target') -GeneralistAttempts 1
+    Copy-Item -LiteralPath (Join-Path $cheapRoot 'model-start-census.manifest.json') `
+        -Destination (Join-Path $costlyRoot 'model-start-census.manifest.json') -Force
+    Copy-Item -LiteralPath (Join-Path $cheapRoot 'logs\reviewer.log.jsonl') `
+        -Destination (Join-Path $costlyRoot 'logs\reviewer.log.jsonl') -Force
+    $replayedCensus = Get-ReviewerModelStartCensus -RunRoot $costlyRoot -Argv $quietArgv
+    Assert-Census (-not [bool]$replayedCensus.authenticated) `
+        ('A correctly signed census manifest sealed over a different run root verified here, so accounting is ' +
+        'transferable between runs.')
+    Assert-Census ((@($replayedCensus.authenticationObjections) -match 'different run root').Count -gt 0) `
+        'The replayed manifest was refused without saying that it belongs to another run.'
+
+    # 3. THE INPUT THAT LIVES SOMEWHERE ELSE. A preview names its own input, and
+    # a preview is a file an attacker may have written, so an unconstrained path
+    # lets the rehash be satisfied by any file on the machine carrying the
+    # expected digest - including one the attacker placed outside the run root
+    # precisely so that nothing auditing the run root would notice it.
+    $escapeRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\input-escape') `
+        -Cluster @(@{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') }) -SealCensusManifest $false
+    $outsideDirectory = Join-Path $sandbox 'auth\outside-the-run'
+    [void](New-Item -ItemType Directory -Force -Path $outsideDirectory)
+    $outsideInput = Join-Path $outsideDirectory 'input.json'
+    Copy-Item -LiteralPath (Join-Path $escapeRoot 'verification-inputs\input.json') -Destination $outsideInput -Force
+    $escapePreviewPath = @(Get-ChildItem -LiteralPath (Join-Path $escapeRoot 'verification-previews') -File)[0].FullName
+    $escapeEnvelope = [IO.File]::ReadAllText($escapePreviewPath) | ConvertFrom-Json -Depth 32
+    $escapeBody = [string]$escapeEnvelope.manifestJson | ConvertFrom-Json -Depth 32
+    $escapeBody.inputArtifactPath = $outsideInput
+    [IO.File]::WriteAllText($escapePreviewPath, (ConvertTo-Json -InputObject ([ordered]@{
+                    manifestJson = [string](ConvertTo-Json -InputObject $escapeBody -Depth 32 -Compress)
+                    signature    = [string]$escapeEnvelope.signature
+                    signatureAlg = 'HMACSHA256'
+                }) -Depth 8 -Compress:$false), [Text.UTF8Encoding]::new($false))
+    # Sealed AFTER the edit, so the preview's own digest matches and the ONLY
+    # thing left to object to is where the input lives. A fixture sealed before
+    # the edit would be refused for the preview's digest and would never reach
+    # the containment check at all.
+    Add-CensusSeal -Root $escapeRoot
+    # The input is removed from inside the run root, so the rebasing fallback
+    # cannot quietly rescue the check and make the assertion vacuous.
+    Remove-Item -LiteralPath (Join-Path $escapeRoot 'verification-inputs\input.json') -Force
+    $escapeCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $escapeRoot -Argv $verifyingArgv
+    Assert-Census (-not [bool]$escapeCensus.authenticated) `
+        'A preview standing on an input artifact outside the run root was accepted as proof of this run.'
+    Assert-Census ((@($escapeCensus.authenticationObjections) -match 'outside the run root').Count -gt 0) `
+        'An escaping input path was refused without naming containment as the reason.'
 }
 finally {
     if (-not $KeepSandbox -and (Test-Path -LiteralPath $sandbox)) {

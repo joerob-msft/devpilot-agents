@@ -2,11 +2,12 @@
   "schemaVersion": 1,
   "kind": "reviewer-orchestration-expected-oracle",
   "fixtureId": "synthetic-exact-path",
-  "expectedSemanticSha256": "616cd94eee1e1167822ffa444a54054614523915c1a8cc718539f76f36af99e2",
+  "expectedSemanticSha256": "e8501f28d52775651cc58b6f40071e84bbe0dd6c2fde1d270afba18e7790bea5",
   "provenance": {
     "author": "hand-authored synthetic fixture",
     "modelQualityClaim": false,
-    "purpose": "orchestration correctness only"
+    "purpose": "orchestration correctness only",
+    "lastRebaseline": "The run now seals a signed model-start census manifest into the run root, so the typed artifact graph gained state/replay/<pr>/model-start-census.manifest.json. Every field of that manifest that is derived from run-specific bytes - the accounting log digest, the preview leaf names and digests, and the run-root identity - is registered in the semantic normalization contract as a derived operational value, so the graph is deterministic across repeated runs. The orchestration decision the oracle asserts below is unchanged."
   },
   "expected": {
     "generalistPassesComplete": 2,

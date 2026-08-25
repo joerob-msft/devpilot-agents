@@ -40,7 +40,7 @@ if ($sha -cne $expectedSha) {
 }
 $contractPath = Join-Path $RepoRoot 'tools\testdata\reviewer-semantic-normalization-contract.v1.json'
 $contractSha = (Get-FileHash -LiteralPath $contractPath -Algorithm SHA256).Hash.ToLowerInvariant()
-$expectedContractSha = 'ab55f13be2bb3cc5193d9c56978094e1f34aec6d0acba703f276532949857c15'
+$expectedContractSha = 'e238578c8d0e0f621c1614dcf57493c7a2f78032bc6e98fac38b484738eaebf5'
 if ($contractSha -cne $expectedContractSha) {
     throw "Semantic normalization contract drifted ($contractSha); review exclusions and update the explicit golden."
 }

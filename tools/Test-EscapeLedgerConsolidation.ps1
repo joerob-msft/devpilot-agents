@@ -67,7 +67,7 @@ function New-MutatedMap {
         $copy.mappingDigest = Get-EscapeLedgerConsolidationDigest -Map $roundTripped
     }
     $path = Join-Path $scratch "$Name.json"
-    [IO.File]::WriteAllText($path, (($copy | ConvertTo-Json -Depth 32) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false, $true))
+    [IO.File]::WriteAllText($path, (($copy | ConvertTo-Json -Depth 32 -Compress:$false) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false, $true))
     return $path
 }
 
@@ -134,6 +134,19 @@ try {
 
     # --- 3. Editing an entry without resealing ---------------------------------------------
 
+    # A mapping that carries no evidence proves nothing, and a RESEALED one is
+    # the dangerous shape: the digest is honest, the delta identity is honest,
+    # and neither of them covers the evidence list. For 'segmentConsolidation' -
+    # the basis every committed mapping uses - anchor tree equality does not
+    # apply either, so with the evidence gone the acceptance collapses to "both
+    # commits fall in their segments", which any unrelated pair satisfies. This
+    # is the fail-open a reviewer found by reading the loop rather than the data.
+    $evidenceless = New-MutatedMap -Name 'evidence-stripped' -Reseal -Mutate {
+        param($m) $m.mappings[0].carriedEvidence = @()
+    }
+    Assert-Consolidation (Test-MapRefused -Path $evidenceless) `
+        'A resealed mapping carrying no evidence was accepted, so segment membership alone can carry an incident.'
+
     $unsealed = New-MutatedMap -Name 'edited-not-resealed' -Mutate {
         param($m) $m.mappings[0].replacementCommit = '0e8507f67b91e2d2c16bcbf3ee74c5ca39af0178'
     }
@@ -179,12 +192,14 @@ try {
 
     # dd9f661 is a genuine replacement-lineage commit with a genuine tree, reachable from HEAD.
     # It is also BEFORE the anchor this entry cites, so it is outside the range the
-    # consolidation covered. Nothing but segment containment refuses this one.
+    # consolidation covered. The carried evidence is left exactly as the sealed map
+    # records it, so this case turns purely on segment containment: the evidence would
+    # also refuse dd9f661 (it does not carry those blobs), but containment is checked
+    # first, which is what the reason assertion below pins down.
     $outsideSegment = New-MutatedMap -Name 'outside-replacement-segment' -Reseal -Mutate {
         param($m)
         $m.mappings[0].replacementCommit = 'dd9f661711936d7c124fccc89dbc1bc7a6388ec5'
         $m.mappings[0].replacementTree = '6a0a443397f7117ce42f01dba3e872675890da6b'
-        $m.mappings[0].carriedEvidence = @()
         $m.mappings[0].deltaIdentity = Get-EscapeLedgerConsolidationDeltaIdentity `
             -SourceCommit ([string]$m.mappings[0].sourceCommit) -SourceTree ([string]$m.mappings[0].sourceTree) `
             -ReplacementCommit ([string]$m.mappings[0].replacementCommit) -ReplacementTree ([string]$m.mappings[0].replacementTree) `

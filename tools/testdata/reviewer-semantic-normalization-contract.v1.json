@@ -21,6 +21,9 @@
     "(?i)\\.(?:candidateId|candidateHash|clusterId)$",
     "(?i)\\.(?:markerSha256|originArtifactSha256|specialistArtifactSha256|inputManifestSha256|previewSha256|markdownSha256|replaySha256|reviewDigest)$",
     "(?i)\\.(?:inputSha256|finalAssistantSha256|rawStdOutSha256|stdErrSha256)$",
+    "(?i)\\.runRootIdentitySha256$",
+    "(?i)\\.logSha256$",
+    "(?i)\\.previews\\[\\]\\.(?:name|sha256)$",
     "(?i)\\.inventory\\[\\]\\.sha256$",
     "(?i)\\.(?:allInputArtifactHashes|inputArtifactHashes)\\[\\]\\.sha256$"
   ],

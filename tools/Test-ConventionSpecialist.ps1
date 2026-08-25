@@ -2092,7 +2092,7 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
 
     try {
         foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue',
-            'Invoke-ReviewerModelSubprocess', 'Invoke-ReviewerModelPass',
+            'New-ReviewerModelPassResult', 'Invoke-ReviewerModelSubprocess', 'Invoke-ReviewerModelPass',
             'ConvertTo-ReviewerBoundMarkerFromEnvelope', 'New-ReviewerResponsePassEnvelope',
             'Test-ReviewerMarkerMatchesResponsePayload', 'Add-ReviewerBoundMarkerProvenance') {
             Invoke-Expression (Get-FunctionText -Text $wrapperText -Name $fn)

@@ -19401,9 +19401,14 @@ finally {
                 if (Test-Path -LiteralPath $censusLogPath -PathType Leaf) {
                     $censusRecords = @(Get-ReviewerModelStartLogRecord -LogPath $censusLogPath)
                 }
+                # The key is bound through a typed local rather than inline: a
+                # command result that is a byte array unrolls on its way into a
+                # parameter, and an array parameter that receives an unrolled
+                # array is at the mercy of how the pipeline re-collects it.
+                [byte[]]$censusMasterKey = @(Get-ReviewerArtifactSigningKey -KeyPath ([string]$censusKeyPath))
                 [void](Save-ReviewerModelStartCensusManifest `
                         -RunRoot ([string]$censusStateDir) `
-                        -MasterKey (Get-ReviewerArtifactSigningKey -KeyPath ([string]$censusKeyPath)) `
+                        -MasterKey $censusMasterKey `
                         -Records $censusRecords)
             }
         }

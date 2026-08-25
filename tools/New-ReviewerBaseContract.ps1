@@ -94,7 +94,7 @@ $boundArtifactPaths = @(
 
 $lineages = @()
 foreach ($declaration in $lineageDeclarations) {
-    $tree = Get-ReviewerBaseContractTree -RepoRoot $RepoRoot -Commit ([string]$declaration.baseCommit)
+    [string]$tree = Get-ReviewerBaseContractTree -RepoRoot $RepoRoot -Commit ([string]$declaration.baseCommit)
     if ($tree.Length -eq 0) {
         throw ("Lineage $([int]$declaration.lineageVersion) names commit $([string]$declaration.baseCommit), which is " +
             "not present in '$RepoRoot'. The contract cannot be sealed from a clone that cannot see the identities it pins.")

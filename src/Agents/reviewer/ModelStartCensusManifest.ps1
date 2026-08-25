@@ -112,6 +112,49 @@ function Get-ReviewerCensusManifestSignature {
     finally { $hmac.Dispose() }
 }
 
+function Get-ReviewerCensusRunRootIdentity {
+    <#
+    .SYNOPSIS
+        The digest of a run root's own location, used to pin an attestation to
+        the run it was sealed over.
+
+    .DESCRIPTION
+        WHY AN IDENTITY IS BOUND AT ALL. Without one, a census manifest is a
+        statement about a SET OF FILES and says nothing about WHICH RUN produced
+        them. Every run belonging to one operator is sealed under the same master
+        key, so a correctly signed manifest from a cheap run - together with its
+        log and previews - can simply be copied over an expensive run's evidence
+        and will verify perfectly. The result is an authenticated, complete
+        census reporting the cheap run's smaller number: an undercount that
+        carries a valid signature, which is worse than no signature at all.
+
+        Binding the run root closes that. A manifest is now a statement about
+        this run's files in this run's place.
+
+        The digest rather than the path itself, because the manifest is committed
+        to being free of absolute paths: a reader that ships a manifest around
+        should not be shipping someone's directory layout with it. A digest binds
+        the identity without publishing it.
+
+        A run root that is legitimately MOVED will no longer authenticate. That
+        is the safe direction and it is deliberate: the census blocks, reports
+        exactly which check failed, and never lowers a count.
+    #>
+    param([Parameter(Mandatory)][string]$RunRoot)
+    $full = $RunRoot
+    try { $full = [IO.Path]::GetFullPath($RunRoot) } catch { $full = $RunRoot }
+    $full = $full.TrimEnd([char]'\', [char]'/')
+    # Case-insensitively on the platforms whose file systems are, so that a run
+    # root reached through a differently-cased but identical path is the same
+    # run rather than a tamper report.
+    if ($IsWindows) { $full = $full.ToLowerInvariant() }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([Convert]::ToHexString($sha.ComputeHash($script:ReviewerCensusManifestUtf8.GetBytes($full)))).ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
 function Get-ReviewerCensusFileDigest {
     <#
     .SYNOPSIS
@@ -230,14 +273,15 @@ function New-ReviewerModelStartCensusManifestContent {
     if ($null -ne $logDigest) { $logBytes = [int]([IO.FileInfo]::new($logPath).Length) }
     $inventory = Get-ReviewerCensusRecordInventory -Records @($Records)
     return [ordered]@{
-        kind            = $script:ReviewerCensusManifestKind
-        logBytes        = [int]$logBytes
-        logPath         = $script:ReviewerCensusManifestLogRelativePath
-        logPresent      = [bool]($null -ne $logDigest)
-        logSha256       = [string]$(if ($null -eq $logDigest) { '' } else { $logDigest })
-        manifestVersion = [int]$script:ReviewerCensusManifestVersion
-        previews        = @(Get-ReviewerCensusPreviewInventory -RunRoot $RunRoot)
-        recordInventory = $inventory
+        kind                  = $script:ReviewerCensusManifestKind
+        logBytes              = [int]$logBytes
+        logPath               = $script:ReviewerCensusManifestLogRelativePath
+        logPresent            = [bool]($null -ne $logDigest)
+        logSha256             = [string]$(if ($null -eq $logDigest) { '' } else { $logDigest })
+        manifestVersion       = [int]$script:ReviewerCensusManifestVersion
+        previews              = @(Get-ReviewerCensusPreviewInventory -RunRoot $RunRoot)
+        recordInventory       = $inventory
+        runRootIdentitySha256 = Get-ReviewerCensusRunRootIdentity -RunRoot $RunRoot
     }
 }
 
@@ -268,7 +312,7 @@ function Save-ReviewerModelStartCensusManifest {
     $path = Get-ReviewerModelStartCensusManifestPath -RunRoot $RunRoot
     $temporary = "$path." + [Guid]::NewGuid().ToString('n') + '.tmp'
     try {
-        [IO.File]::WriteAllText($temporary, ($envelope | ConvertTo-Json -Depth 8), $script:ReviewerCensusManifestUtf8)
+        [IO.File]::WriteAllText($temporary, ($envelope | ConvertTo-Json -Depth 8 -Compress:$false), $script:ReviewerCensusManifestUtf8)
         Move-Item -LiteralPath $temporary -Destination $path -Force
     }
     finally {
@@ -337,6 +381,18 @@ function Get-ReviewerCensusKeyFromRunRoot {
         nothing and then report success under a key it had just invented.
         Absence is reported as absence.
 
+        WHAT THIS KEY IS AND IS NOT GOOD FOR. It lives INSIDE the directory it
+        would be authenticating. Anything that can rewrite this run's log or
+        previews can also drop its own key here and re-sign the manifest over the
+        doctored evidence, so a signature checked with this key proves only
+        self-consistency: that whoever wrote the evidence also wrote the
+        attestation. It cannot establish that the reviewer wrote either. Callers
+        therefore get this key clearly labelled as run-root-sourced, and the
+        authenticity verdict refuses to call a run AUTHENTICATED on the strength
+        of it - see Test-ReviewerModelStartCensusAuthenticity. It is still worth
+        reading, because a self-consistency failure is a real finding, but it is
+        never the basis for believing a count.
+
         The census manifest is sealed under the per-user MASTER key rather than
         the replay-derived run key. The replay derivation exists so that a replay
         artifact can never verify against the key that promotion reads with -
@@ -370,6 +426,38 @@ function Get-ReviewerCensusKeyFromRunRoot {
         }
         default { return $null }
     }
+}
+
+function Test-ReviewerCensusPathInsideRunRoot {
+    <#
+    .SYNOPSIS
+        Whether a resolved path is genuinely inside the run root being audited.
+
+    .DESCRIPTION
+        Compared after full resolution, so '..' segments, mixed separators and a
+        differently-cased spelling of the same directory all reduce to the same
+        answer. A path that cannot be resolved at all is not inside anything and
+        is refused: this is a containment check, and it fails closed.
+
+        The separator is appended to both sides before comparing so that a
+        sibling directory whose name merely STARTS with the run root's name -
+        'run-42-evil' next to 'run-42' - is not mistaken for a child of it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Path
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $rootFull = ''
+    $pathFull = ''
+    try {
+        $rootFull = [IO.Path]::GetFullPath($RunRoot).TrimEnd([char]'\', [char]'/') + [IO.Path]::DirectorySeparatorChar
+        $pathFull = [IO.Path]::GetFullPath($Path)
+    }
+    catch { return $false }
+    $comparison = [StringComparison]::Ordinal
+    if ($IsWindows) { $comparison = [StringComparison]::OrdinalIgnoreCase }
+    return $pathFull.StartsWith($rootFull, $comparison)
 }
 
 function Test-ReviewerModelStartCensusAuthenticity {
@@ -428,8 +516,19 @@ function Test-ReviewerModelStartCensusAuthenticity {
         $result.objections = @($objections.ToArray())
         return [pscustomobject]$result
     }
+    # WHERE THE KEY CAME FROM IS PART OF THE VERDICT. A key handed in by the
+    # caller was held somewhere this run root could not reach. A key found inside
+    # the run root was reachable by whatever wrote the evidence, so verifying
+    # against it proves self-consistency and nothing more - and self-consistency
+    # is exactly what a forger produces for free by re-signing the files they
+    # just doctored. The distinction is carried all the way to the verdict rather
+    # than resolved here, because the checks below are still worth running: they
+    # say WHICH artifact disagrees, which is useful even when the key proves
+    # nothing about who wrote it.
+    $keyIsSelfSourced = $false
     if ($null -eq $MasterKey -or @($MasterKey).Count -eq 0) {
         $MasterKey = Get-ReviewerCensusKeyFromRunRoot -RunRoot $RunRoot
+        $keyIsSelfSourced = ($null -ne $MasterKey -and @($MasterKey).Count -gt 0)
     }
     if ($null -eq $MasterKey -or @($MasterKey).Count -eq 0) {
         $result.basis = 'noCensusKey'
@@ -445,6 +544,26 @@ function Test-ReviewerModelStartCensusAuthenticity {
         $objections.Add([string]$_.Exception.Message)
         $result.objections = @($objections.ToArray())
         return [pscustomobject]$result
+    }
+
+    # THE MANIFEST MUST BE ABOUT THIS RUN. Every run belonging to one operator
+    # seals under the same master key, so without this check a correctly signed
+    # manifest from a cheaper run - carried in alongside that run's log and
+    # previews - verifies perfectly here and reports its own smaller count as
+    # authenticated. That is a signed undercount, which is the one outcome this
+    # whole mechanism exists to make impossible.
+    $expectedRunIdentity = Get-ReviewerCensusRunRootIdentity -RunRoot $RunRoot
+    $attestedRunIdentity = ''
+    if ($manifest.PSObject.Properties['runRootIdentitySha256']) {
+        $attestedRunIdentity = [string]$manifest.runRootIdentitySha256
+    }
+    if ($attestedRunIdentity.Length -eq 0) {
+        $objections.Add(('The census manifest binds no run identity, so it cannot be told apart from a manifest sealed ' +
+                'over a different run and copied here.'))
+    }
+    elseif ($attestedRunIdentity -cne $expectedRunIdentity) {
+        $objections.Add(('The census manifest was sealed over a different run root than the one being audited, so the ' +
+                'accounting it attests to belongs to another run.'))
     }
 
     $logPath = Join-Path $RunRoot ([string]$manifest.logPath -replace '/', [IO.Path]::DirectorySeparatorChar)
@@ -538,6 +657,17 @@ function Test-ReviewerModelStartCensusAuthenticity {
             $rebased = Join-Path $RunRoot (Join-Path 'verification-inputs' ([IO.Path]::GetFileName($declaredPath)))
             if (Test-Path -LiteralPath $rebased -PathType Leaf) { $resolved = $rebased }
         }
+        # CONTAINMENT. The path is named by the preview, and the preview is a
+        # file an attacker may have written, so an unconstrained path lets the
+        # attestation be satisfied by ANY readable file on the machine that
+        # happens to carry the expected digest - including one the attacker put
+        # there. Everything this census attests to must live inside the run root
+        # it is auditing, so the resolved path is required to.
+        if (-not (Test-ReviewerCensusPathInsideRunRoot -RunRoot $RunRoot -Path $resolved)) {
+            $objections.Add(("The verification preview '$name' names an input artifact outside the run root being " +
+                    'audited, so what it stands on is not this run''s evidence and is not accepted as proof of it.'))
+            continue
+        }
         $actual = Get-ReviewerCensusFileDigest -Path $resolved
         if ($null -eq $actual) {
             $objections.Add(("The verification preview '$name' stands on the input artifact '$declaredPath', which is not " +
@@ -553,6 +683,19 @@ function Test-ReviewerModelStartCensusAuthenticity {
         $result.inputsVerified = [int]$result.inputsVerified + 1
     }
 
+    if ($objections.Count -eq 0 -and $keyIsSelfSourced) {
+        # Every check passed, and every check was made with a key that lived
+        # inside the directory it was checking. Whoever wrote the evidence could
+        # have written this key and re-signed over their own edits, so what has
+        # been established is that the run root is internally consistent - not
+        # that the reviewer produced it. Reporting that as authentication would
+        # hand an attacker the exact word an operator is looking for.
+        $result.basis = 'selfAttestedCensusKey'
+        $objections.Add(('The census manifest verified only under a signing key read from the run root it attests to. ' +
+                'Anything able to rewrite this run''s accounting could also have written that key, so the manifest ' +
+                'shows the run root is self-consistent and cannot show who made it so. Supply the operator-held ' +
+                'master key to authenticate this run.'))
+    }
     if ($objections.Count -eq 0) {
         $result.authenticated = $true
         $result.basis = 'signedCensusManifest'

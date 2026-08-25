@@ -391,7 +391,7 @@ function Assert-ReviewerBaseCommitAccepted {
     if ([string]::IsNullOrWhiteSpace($path)) { $path = Get-ReviewerBaseContractDefaultPath -RepoRoot $repoFull }
     $contract = Read-ReviewerBaseContract -Path $path
 
-    $artifactObjection = Test-ReviewerBaseContractBoundArtifact -Contract $contract -RepoRoot $repoFull
+    [string]$artifactObjection = Test-ReviewerBaseContractBoundArtifact -Contract $contract -RepoRoot $repoFull
     if ($artifactObjection.Length -gt 0) {
         throw ("The reviewer base identity cannot be accepted: $artifactObjection " +
             'A sealed fixture is bound to reviewer-side content, not only to a place in the commit graph.')
@@ -414,7 +414,7 @@ function Assert-ReviewerBaseCommitAccepted {
     # a failure - the acceptance below does not depend on them - but a clone that
     # DOES carry them and finds a different tree is a re-used commit id and is
     # refused.
-    $requestedTree = Get-ReviewerBaseContractTree -RepoRoot $repoFull -Commit $requested
+    [string]$requestedTree = Get-ReviewerBaseContractTree -RepoRoot $repoFull -Commit $requested
     $requestedTreePresent = ($requestedTree.Length -gt 0)
     if ($requestedTreePresent -and $requestedTree -cne ([string]$lineage.baseTree).ToLowerInvariant()) {
         throw ("The expected reviewer base commit '$requested' names tree $requestedTree in this repository, but the " +
@@ -449,7 +449,7 @@ function Assert-ReviewerBaseCommitAccepted {
     }
 
     $boundary = ([string]$active.baseCommit).ToLowerInvariant()
-    $boundaryTree = Get-ReviewerBaseContractTree -RepoRoot $repoFull -Commit $boundary
+    [string]$boundaryTree = Get-ReviewerBaseContractTree -RepoRoot $repoFull -Commit $boundary
     if ($boundaryTree.Length -eq 0) {
         throw ("The active reviewer base boundary '$boundary' is not present in '$repoFull', so the expected base " +
             "'$requested' cannot be shown to be carried by this checkout.")

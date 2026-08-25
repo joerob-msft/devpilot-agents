@@ -16,7 +16,7 @@ namespace DevPilot.ShadowRunCoordinator;
 ///
 /// WHAT WENT WRONG BEFORE. The publish moved a temporary over the destination
 /// with no retry, while every reader in the tool opened files with FileShare.Read
-/// and withheld FileShare.Delete. On Windows that combination makes the replace
+/// and denied FileShare.Delete. On Windows that combination makes the replace
 /// fail with a sharing violation whenever a reader happens to hold the file - a
 /// digest check, a state read, a virus scanner. The exception escaped from the
 /// middle of the publish, and because the cohort journal had already recorded
@@ -189,6 +189,51 @@ internal static class AtomicPublishSelfTest
                 // The whole point of the failure mode: state is old-or-new, and
                 // here it is old, entire, and readable.
                 Require(File.ReadAllText(path) == oldContent,
+                    "the destination was left holding neither the whole old content nor the whole new content");
+                RequireNoTemporaries(directory);
+            });
+
+            Check("a destination lost on the final attempt is restored to the new content, not reported as unchanged", () =>
+            {
+                // ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 reproduced by its effect
+                // rather than by its cause, because provoking the real code
+                // requires a filesystem state no test can arrange reliably: the
+                // destination has been renamed aside and the replacement has not
+                // moved in, so at that instant the path does not resolve.
+                //
+                // Every attempt but the last recovers from that on its own - the
+                // next attempt finds no destination and renames into place. The
+                // LAST one does not, and before this case existed the code threw
+                // a "recoverable, destination unchanged" timeout over a path
+                // that had ceased to exist while deleting the only copy of the
+                // new content. That is the wedge the whole change exists to
+                // remove, reintroduced at the bottom of the retry loop.
+                CanonicalJson.WriteFileAtomic(path, oldContent);
+                CanonicalJson.AtomicPublishAttemptHook = (target, _) =>
+                {
+                    if (File.Exists(target))
+                    {
+                        File.Delete(target);
+                    }
+                    throw SharingViolation();
+                };
+                Exception? caught = null;
+                try
+                {
+                    CanonicalJson.WriteFileAtomic(path, newContent);
+                }
+                catch (Exception exception)
+                {
+                    caught = exception;
+                }
+                finally
+                {
+                    CanonicalJson.AtomicPublishAttemptHook = null;
+                }
+                Require(caught is null,
+                    $"a recoverable publish over a vanished destination raised {caught?.GetType().Name}");
+                Require(File.Exists(path), "the destination was left missing entirely");
+                Require(File.ReadAllText(path) == newContent,
                     "the destination was left holding neither the whole old content nor the whole new content");
                 RequireNoTemporaries(directory);
             });
@@ -390,8 +435,9 @@ internal static class AtomicPublishSelfTest
                 var final = File.ReadAllText(contendedPath);
                 Require(published.Contains(final), $"the destination ended holding '{final}', which nobody published");
                 RequireNoTemporaries(directory);
-                // No backup name was ever requested, so a leftover one would mean
-                // a racing ReplaceFile left the state under a name nothing reads.
+                // A backup is requested on every replace, so a leftover one would
+                // mean a racing ReplaceFile left the state under a name nothing
+                // reads instead of tidying it away.
                 var strays = Directory.GetFiles(directory, "contended.json*")
                     .Where(candidate => !string.Equals(candidate, contendedPath, StringComparison.OrdinalIgnoreCase))
                     .ToArray();
@@ -405,6 +451,116 @@ internal static class AtomicPublishSelfTest
                 CanonicalJson.WriteFileAtomic(freshPath, newContent);
                 Require(File.ReadAllText(freshPath) == newContent, "the first publish did not land whole");
                 RequireNoTemporaries(Path.GetDirectoryName(freshPath)!);
+            });
+
+            // EVERYTHING ABOVE TOOK THE POSIX RENAME. On NTFS the kernel rename
+            // always succeeds, so the ReplaceFile last resort - and with it the
+            // named backup, the restore that puts the old content back, and the
+            // cleanup that removes the backup afterwards - never executed once.
+            // That is exactly the code whose earlier version could leave a state
+            // file with no content at all, so it is run here deliberately rather
+            // than left to the hosts that happen to lack a POSIX rename.
+            CanonicalJson.ForceReplaceFileFallbackForTests = true;
+            try
+            {
+                var replacePath = Path.Combine(directory, "replace", "state.json");
+                Check("the ReplaceFile fallback publishes whole content", () =>
+                {
+                    CanonicalJson.WriteFileAtomic(replacePath, oldContent);
+                    var before = CanonicalJson.AtomicPublishReplaceCount;
+                    CanonicalJson.WriteFileAtomic(replacePath, newContent);
+                    Require(CanonicalJson.AtomicPublishReplaceCount > before,
+                        "the forced fallback did not actually reach File.Replace");
+                    Require(File.ReadAllText(replacePath) == newContent,
+                        "the fallback publish did not land whole");
+                    RequireNoTemporaries(Path.GetDirectoryName(replacePath)!);
+                });
+
+                Check("the ReplaceFile fallback publishes past a reader that grants delete sharing", () =>
+                {
+                    // The sharing mode every reader in this tool uses. ReplaceFile
+                    // renames the destination aside, which needs DELETE sharing
+                    // just as a rename does, so this is the reader it can pass.
+                    using var reader = new FileStream(
+                        replacePath, FileMode.Open, FileAccess.Read,
+                        FileShare.Read | FileShare.Write | FileShare.Delete);
+                    CanonicalJson.WriteFileAtomic(replacePath, oldContent);
+                    Require(File.ReadAllText(replacePath) == oldContent,
+                        "the fallback could not publish over an open reader");
+                });
+
+                Check("the ReplaceFile fallback fails typed and recoverable against a reader that denies delete sharing", () =>
+                {
+                    // Honest limit of the last resort: with no POSIX rename and no
+                    // DELETE share there is no way to publish at all. What matters
+                    // is that this is reported as the recoverable, old-or-new
+                    // outcome rather than wedging or losing the file.
+                    using var reader = new FileStream(
+                        replacePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    CanonicalJson.AtomicPublishTimeoutException? caught = null;
+                    try
+                    {
+                        CanonicalJson.WriteFileAtomic(replacePath, newContent);
+                    }
+                    catch (CanonicalJson.AtomicPublishTimeoutException exception)
+                    {
+                        caught = exception;
+                    }
+                    Require(caught is not null, "an impossible fallback publish did not report the typed error");
+                    Require(caught!.Recoverable, "the typed error did not declare itself recoverable");
+                    Require(File.ReadAllText(replacePath) == oldContent,
+                        "the fallback left the destination holding neither whole old nor whole new content");
+                });
+
+                Check("a fallback destination lost on the final attempt still ends whole", () =>
+                {
+                    CanonicalJson.WriteFileAtomic(replacePath, oldContent);
+                    CanonicalJson.AtomicPublishAttemptHook = (target, _) =>
+                    {
+                        if (File.Exists(target))
+                        {
+                            File.Delete(target);
+                        }
+                        throw SharingViolation();
+                    };
+                    Exception? caught = null;
+                    try
+                    {
+                        CanonicalJson.WriteFileAtomic(replacePath, newContent);
+                    }
+                    catch (Exception exception)
+                    {
+                        caught = exception;
+                    }
+                    finally
+                    {
+                        CanonicalJson.AtomicPublishAttemptHook = null;
+                    }
+                    Require(caught is null,
+                        $"a recoverable fallback publish raised {caught?.GetType().Name}");
+                    Require(File.ReadAllText(replacePath) == newContent,
+                        "the fallback left the destination holding neither whole old nor whole new content");
+                });
+            }
+            finally
+            {
+                CanonicalJson.ForceReplaceFileFallbackForTests = false;
+            }
+
+            // The named backup exists so the old content survives a failed
+            // replace. It must not survive anything else: a successful publish
+            // that left one behind would accumulate a stale copy of state beside
+            // every state file, which is exactly the sort of thing a later reader
+            // picks up by mistake. Placed after the forced-fallback group so that
+            // it is asserting about a tree in which backups were really created.
+            Check("a successful publish leaves no backup copy of the old state behind", () =>
+            {
+                var leftovers = Directory
+                    .EnumerateFiles(directory, "*.bak", SearchOption.AllDirectories)
+                    .ToArray();
+                Require(
+                    leftovers.Length == 0,
+                    $"publishing left {leftovers.Length} backup file(s) behind: {string.Join(", ", leftovers)}");
             });
         }
         finally
