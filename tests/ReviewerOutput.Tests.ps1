@@ -46,9 +46,10 @@ Describe 'Reviewer output modes' {
         foreach ($line in $script:reviewerLines) {
             $event = $line | ConvertFrom-Json
             $event.PSObject.Properties.Name | Should -Be @(
-                'agent', 'instanceId', 'processId', 'timestamp', 'sequence', 'eventType',
+                'schemaVersion', 'agent', 'instanceId', 'processId', 'timestamp', 'sequence', 'eventType',
                 'level', 'cycleNumber', 'pullRequestId', 'sourceCommit', 'data', 'message'
             )
+            $event.schemaVersion | Should -Be 2
             $event.agent | Should -Be 'reviewer'
             $event.instanceId | Should -Not -BeNullOrEmpty
             $event.processId | Should -BeGreaterThan 0
@@ -191,6 +192,72 @@ Describe 'Reviewer output modes' {
         Test-Path -LiteralPath "$path.2" | Should -BeTrue
         Get-Content -LiteralPath $path | ForEach-Object { { $_ | ConvertFrom-Json } | Should -Not -Throw }
     }
+
+    It 'writes heartbeat and lifecycle events to an isolated instance stream' {
+        $directory = Join-Path $TestDrive 'instance-events\reviewer'
+        $context = New-AgentOutputContext -Agent reviewer -OutputMode Compact `
+            -PerInstanceLogDirectory $directory -HeartbeatIntervalMilliseconds 1000 `
+            -WriteLine { param($line) }
+        try {
+            Publish-AgentEvent $context agent.started -Data @{ repository = 'sample' } | Out-Null
+            Start-Sleep -Milliseconds 1250
+        }
+        finally {
+            Close-AgentOutputContext $context
+        }
+
+        $context.LogPath | Should -Be (Join-Path $directory "$($context.InstanceId).jsonl")
+        $events = @(Get-Content -LiteralPath $context.LogPath | ForEach-Object { $_ | ConvertFrom-Json })
+        @($events.eventType) | Should -Be @('agent.started', 'agent.heartbeat', 'agent.stopped')
+        @($events.sequence) | Should -Be @(1, 2, 3)
+        @($events.instanceId | Select-Object -Unique) | Should -Be @($context.InstanceId)
+    }
+
+    It 'serializes foreground events and heartbeats in sequence order' {
+        $directory = Join-Path $TestDrive 'concurrent-events\reviewer'
+        $context = New-AgentOutputContext -Agent reviewer -OutputMode Compact `
+            -PerInstanceLogDirectory $directory -HeartbeatIntervalMilliseconds 1000 `
+            -WriteLine { param($line) }
+        try {
+            Publish-AgentEvent $context agent.started | Out-Null
+            1..300 | ForEach-Object {
+                Publish-AgentEvent $context phase.changed -Cycle 1 -PrId 42 `
+                    -Data @{ phase = 'running'; elapsedMilliseconds = $_ } | Out-Null
+                Start-Sleep -Milliseconds 5
+            }
+        }
+        finally {
+            Close-AgentOutputContext $context
+        }
+
+        $events = @(Get-Content -LiteralPath $context.LogPath | ForEach-Object { $_ | ConvertFrom-Json })
+        @($events.sequence) | Should -Be @(1..$events.Count)
+        $events[-1].eventType | Should -Be 'agent.stopped'
+        @($events[0..($events.Count - 2)].eventType) | Should -Contain 'agent.heartbeat'
+    }
+
+    It 'retains only the twenty newest per-instance event streams' {
+        $directory = Join-Path $TestDrive 'retained-events\reviewer'
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        1..21 | ForEach-Object {
+            $path = Join-Path $directory ('{0:D2}.jsonl' -f $_)
+            Set-Content -LiteralPath $path -Value '{}'
+            (Get-Item -LiteralPath $path).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes($_)
+        }
+
+        $context = New-AgentOutputContext -Agent reviewer -OutputMode Compact `
+            -PerInstanceLogDirectory $directory -WriteLine { param($line) }
+        try {
+            Publish-AgentEvent $context cycle.started | Out-Null
+        }
+        finally {
+            Close-AgentOutputContext $context
+        }
+
+        @(Get-ChildItem -LiteralPath $directory -File -Filter '*.jsonl').Count | Should -Be 20
+        Test-Path -LiteralPath (Join-Path $directory '01.jsonl') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $directory '02.jsonl') | Should -BeFalse
+    }
 }
 
 Describe 'Shared reviewer and review-handler event contract' {
@@ -235,6 +302,72 @@ Describe 'Shared reviewer and review-handler event contract' {
         $source | Should -Match 'agent\.waiting'
     }
 
+    It 'emits bounded PR identity and outcome fields for the dashboard' {
+        $path = Join-Path "$PSScriptRoot\..\src\Agents\reviewer" 'Start-ReviewerAgent.ps1'
+        $source = Get-Content -LiteralPath $path -Raw
+        foreach ($field in @('title', 'author', 'url', 'sourceBranch', 'targetBranch', 'threadCount', 'actionableThreadCount', 'changedFileCount')) {
+            $source | Should -Match ("(?m)^\s*{0}\s*=" -f [regex]::Escape($field))
+        }
+        foreach ($field in @('requested', 'delivered', 'summary', 'previewArtifact')) {
+            $source | Should -Match ("(?m)^\s*{0}\s*=" -f [regex]::Escape($field))
+        }
+        $source | Should -Match 'prUrl\s*=\s*Get-ReviewerPullRequestLink\s+-PrId'
+    }
+
+    It 'provides preview-only shared watcher launchers and attach mode' {
+        $toolsRoot = Join-Path "$PSScriptRoot\.." 'tools'
+        $path = Join-Path $toolsRoot 'Watch-DevPilotAgents.ps1'
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path $path), [ref]$tokens, [ref]$errors)
+        $errors | Should -BeNullOrEmpty
+        $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+        foreach ($parameterName in @(
+            'Agent', 'AttachOnly', 'Continuous', 'IntervalSeconds',
+            'ReviewerConfigFile', 'ReviewHandlerConfigFile',
+            'ReviewerPullRequestId', 'ReviewHandlerPullRequestId'
+        )) {
+            $parameterNames | Should -Contain $parameterName
+        }
+        $source = Get-Content -LiteralPath $path -Raw
+        $source | Should -Match "OutputMode = 'Json'"
+        $source | Should -Match 'Once = \$true'
+        $source | Should -Match 'IntervalSeconds = \$IntervalSeconds'
+        $source | Should -Match "\[ValidateSet\('Reviewer', 'ReviewHandler', 'Both'\)\]"
+        $source | Should -Match '\$Continuous\s+-and\s+\(\$ReviewerPullRequestId\s+-gt\s+0\s+-or\s+\$ReviewHandlerPullRequestId\s+-gt\s+0\)'
+        $source | Should -Not -Match 'EnableFindingComments\s*='
+        $source | Should -Not -Match 'EnableThreadReplies\s*='
+        $source | Should -Not -Match 'EnableSummaryComment\s*='
+        $source | Should -Not -Match 'EnableApprovalVote\s*='
+        $source | Should -Not -Match 'EnableTeamsNotifications\s*='
+        $source | Should -Not -Match 'EnableCodeChanges\s*='
+        $source | Should -Not -Match 'EnablePush\s*='
+        $source | Should -Not -Match 'EnableAutoComplete\s*='
+        $source | Should -Not -Match 'EnableBuddyRequeue\s*='
+        $source.IndexOf('& $dashboardLauncher -StateDir $StateDir -ValidateOnly') |
+            Should -BeLessThan $source.IndexOf('$process = Start-Process')
+        $source | Should -Match '\$dashboardCompletedNormally\s*=\s*\$false'
+        $source | Should -Match '\$Process\.Kill\(\$true\)'
+        $source | Should -Match 'if \(-not \$dashboardCompletedNormally -or \$Continuous\)'
+
+        foreach ($wrapper in @(
+            @{ File = 'Watch-DevPilotReviewer.ps1'; Agent = 'Reviewer'; Config = 'ReviewerConfigFile' }
+            @{ File = 'Watch-DevPilotReviewHandler.ps1'; Agent = 'ReviewHandler'; Config = 'ReviewHandlerConfigFile' }
+        )) {
+            $wrapperPath = Join-Path $toolsRoot $wrapper.File
+            $wrapperTokens = $null
+            $wrapperErrors = $null
+            $wrapperAst = [System.Management.Automation.Language.Parser]::ParseFile(
+                (Resolve-Path $wrapperPath), [ref]$wrapperTokens, [ref]$wrapperErrors)
+            $wrapperErrors | Should -BeNullOrEmpty
+            $wrapperSource = Get-Content -LiteralPath $wrapperPath -Raw
+            $wrapperSource | Should -Match ("Agent\s*=\s*'{0}'" -f $wrapper.Agent)
+            $wrapperSource | Should -Match $wrapper.Config
+            $wrapperSource | Should -Match 'Watch-DevPilotAgents\.ps1'
+        }
+    }
+
     It 'prefers the co-located harness over a stale loaded module' -ForEach @(
         @{ Script = 'reviewer\Start-ReviewerAgent.ps1'; Config = 'reviewer-ado.config.json' }
         @{ Script = 'review-handler\Start-ReviewHandlerAgent.ps1'; Config = 'handler-ado.config.json' }
@@ -259,7 +392,12 @@ exit $LASTEXITCODE
         $lines = @(& pwsh -NoProfile -File $runner $staleManifest $agentScript $configFile)
 
         $LASTEXITCODE | Should -Be 0
-        $lines.Count | Should -Be 2
-        $lines | ForEach-Object { { $_ | ConvertFrom-Json } | Should -Not -Throw }
+        $events = @($lines | ForEach-Object { $_ | ConvertFrom-Json })
+        $events.Count | Should -BeGreaterOrEqual 3
+        $events[0].eventType | Should -Be 'agent.started'
+        $events[-1].eventType | Should -Be 'agent.stopped'
+        @($events.eventType | Where-Object { $_ -notin @(
+                    'agent.started', 'agent.heartbeat', 'work.completed', 'agent.stopped'
+                ) }) | Should -BeNullOrEmpty
     }
 }

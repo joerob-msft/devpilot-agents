@@ -76,6 +76,33 @@ jobs:
               throw "Pester reported $($result.FailedCount) failed test(s)."
           }
 
+  dashboard:
+    name: Operations dashboard
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src/DevPilot.Dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: src/DevPilot.Dashboard/package-lock.json
+
+      - name: Restore locked dependencies
+        shell: pwsh
+        run: npm ci
+
+      - name: Build and run logic tests
+        shell: pwsh
+        run: npm test
+
+      - name: Run native renderer smoke test
+        shell: pwsh
+        run: npm run test:renderer
+
   selfcheck:
     name: Agent self-checks (-DryRun)
     runs-on: windows-latest

@@ -810,14 +810,16 @@ $StateDir = (Resolve-Path -LiteralPath $StateDir).Path
 $logDir = Join-Path $StateDir "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $logPath = Join-Path $logDir "review-handler.log.jsonl"
-$eventLogPath = Join-Path $logDir "review-handler.events.jsonl"
+$eventLogDirectory = Join-Path (Join-Path $logDir "events") "review-handler"
 $lockPath = Join-Path $StateDir "agent.lock"
 $handledStatePath = Join-Path $StateDir "handled.json"
 $attemptsStatePath = Join-Path $StateDir "attempts.json"
 $sessionsStatePath = Join-Path $StateDir "sessions.json"
 $notificationsStatePath = Join-Path $StateDir "notifications.json"
 
-$script:HandlerOutputContext = New-AgentOutputContext -Agent review-handler -OutputMode $OutputMode -LogPath $eventLogPath
+$script:HandlerOutputContext = New-AgentOutputContext -Agent review-handler -OutputMode $OutputMode `
+    -PerInstanceLogDirectory $eventLogDirectory
+$eventLogPath = [string]$script:HandlerOutputContext.LogPath
 if ($script:HandlerOutputContext.Mode -ne 'Detailed' -and (-not $DryRun -or $OutputMode -eq 'Json')) {
     $InformationPreference = 'SilentlyContinue'
     $WarningPreference = 'SilentlyContinue'
@@ -2402,4 +2404,9 @@ catch {
     }
     Write-Error $_
     exit 1
+}
+finally {
+    if ($script:HandlerOutputContext) {
+        Close-AgentOutputContext -Context $script:HandlerOutputContext
+    }
 }

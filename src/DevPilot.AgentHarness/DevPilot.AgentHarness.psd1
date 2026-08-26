@@ -81,7 +81,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Test-AgentValidatedParamRebind', 
                'Test-AgentInteractiveOutput', 'New-AgentOutputContext', 'Set-AgentOutputLegacySuppression',
                'Get-AgentNormalizedSkipReason', 'Format-AgentCount',
-               'Format-AgentSkipSummary', 'Publish-AgentEvent',
+               'Format-AgentSkipSummary', 'Publish-AgentEvent', 'Close-AgentOutputContext',
                'Test-AgentProtectedBranch', 'Get-AgentConfigProperty', 
                'Get-AgentConfigString', 'Get-AgentConfigInt', 'Get-AgentConfigBool', 
                'Get-AgentConfigObject', 'Get-AgentConfigStringArray', 

@@ -135,8 +135,223 @@ namespace DevPilot
 }
 $script:AgentInteractiveTimerAvailable = $null -ne ('DevPilot.AgentInteractiveStatusTimer' -as [type])
 
+if (-not ('DevPilot.AgentEventStream' -as [type])) {
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+
+namespace DevPilot
+{
+    public sealed class AgentEventWriteResult
+    {
+        public long Sequence { get; set; }
+        public string Timestamp { get; set; }
+        public string Json { get; set; }
+    }
+
+    public sealed class AgentEventStream : IDisposable
+    {
+        private readonly object gate = new object();
+        private readonly string path;
+        private readonly string agent;
+        private readonly string instanceId;
+        private readonly int processId;
+        private readonly TextWriter jsonOutput;
+        private readonly Timer heartbeatTimer;
+        private readonly int heartbeatIntervalMilliseconds;
+        private long sequence;
+        private int cycleNumber;
+        private int pullRequestId;
+        private string sourceCommit = "";
+        private bool heartbeatStarted;
+        private bool disposed;
+
+        public long MaxBytes { get; set; } = 10 * 1024 * 1024;
+        public int RetentionCount { get; set; } = 5;
+
+        public AgentEventStream(
+            string path,
+            string agent,
+            string instanceId,
+            int processId,
+            int heartbeatIntervalMilliseconds,
+            TextWriter jsonOutput)
+        {
+            this.path = path;
+            this.agent = agent;
+            this.instanceId = instanceId;
+            this.processId = processId;
+            this.jsonOutput = jsonOutput;
+            this.heartbeatIntervalMilliseconds = Math.Max(1000, heartbeatIntervalMilliseconds);
+            heartbeatTimer = new Timer(WriteHeartbeat, null, Timeout.Infinite, Timeout.Infinite);
+        }
+
+        public AgentEventWriteResult WriteEvent(
+            string eventType,
+            string level,
+            int cycleNumber,
+            int pullRequestId,
+            string sourceCommit,
+            string dataJson,
+            string message)
+        {
+            lock (gate)
+            {
+                if (disposed) return null;
+                if (eventType == "agent.stopped")
+                {
+                    heartbeatStarted = false;
+                    heartbeatTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                }
+                this.cycleNumber = cycleNumber;
+                this.pullRequestId = pullRequestId;
+                this.sourceCommit = sourceCommit ?? "";
+                var nextSequence = ++sequence;
+                var timestamp = DateTime.UtcNow.ToString("o");
+                object data = new Dictionary<string, object>();
+                try
+                {
+                    using (var document = JsonDocument.Parse(
+                        string.IsNullOrEmpty(dataJson) ? "{}" : dataJson))
+                    {
+                        data = document.RootElement.Clone();
+                    }
+                }
+                catch { }
+                var agentEvent = new Dictionary<string, object>
+                {
+                    ["schemaVersion"] = 2,
+                    ["agent"] = agent,
+                    ["instanceId"] = instanceId,
+                    ["processId"] = processId,
+                    ["timestamp"] = timestamp,
+                    ["sequence"] = nextSequence,
+                    ["eventType"] = eventType ?? "",
+                    ["level"] = level ?? "info",
+                    ["cycleNumber"] = cycleNumber,
+                    ["pullRequestId"] = pullRequestId,
+                    ["sourceCommit"] = this.sourceCommit,
+                    ["data"] = data,
+                    ["message"] = message ?? ""
+                };
+                var json = JsonSerializer.Serialize(agentEvent);
+                AppendUnsafe(json);
+                if (eventType == "agent.started" && !heartbeatStarted)
+                {
+                    heartbeatStarted = true;
+                    heartbeatTimer.Change(heartbeatIntervalMilliseconds, heartbeatIntervalMilliseconds);
+                }
+                return new AgentEventWriteResult
+                {
+                    Sequence = nextSequence,
+                    Timestamp = timestamp,
+                    Json = json
+                };
+            }
+        }
+
+        private void WriteHeartbeat(object state)
+        {
+            try
+            {
+                lock (gate)
+                {
+                    if (disposed || !heartbeatStarted) return;
+                    var heartbeat = new Dictionary<string, object>
+                    {
+                        ["schemaVersion"] = 2,
+                        ["agent"] = agent,
+                        ["instanceId"] = instanceId,
+                        ["processId"] = processId,
+                        ["timestamp"] = DateTime.UtcNow.ToString("o"),
+                        ["sequence"] = ++sequence,
+                        ["eventType"] = "agent.heartbeat",
+                        ["level"] = "debug",
+                        ["cycleNumber"] = cycleNumber,
+                        ["pullRequestId"] = pullRequestId,
+                        ["sourceCommit"] = sourceCommit,
+                        ["data"] = new Dictionary<string, object>(),
+                        ["message"] = ""
+                    };
+                    AppendUnsafe(JsonSerializer.Serialize(heartbeat));
+                }
+            }
+            catch
+            {
+                // Telemetry is observational and must never affect the agent.
+            }
+        }
+
+        private void AppendUnsafe(string json)
+        {
+            try
+            {
+                RotateUnsafe();
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                File.AppendAllText(path, json + Environment.NewLine, new UTF8Encoding(false));
+            }
+            catch
+            {
+                // A durable log failure must not change agent behavior.
+            }
+            try
+            {
+                if (jsonOutput != null)
+                {
+                    jsonOutput.WriteLine(json);
+                    jsonOutput.Flush();
+                }
+            }
+            catch
+            {
+                // A JSON sink failure must not change agent behavior.
+            }
+        }
+
+        private void RotateUnsafe()
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+            if (new FileInfo(path).Length < MaxBytes) return;
+            var retention = Math.Max(1, RetentionCount);
+            var oldest = path + "." + retention;
+            if (File.Exists(oldest)) File.Delete(oldest);
+            for (var index = retention - 1; index >= 1; index--)
+            {
+                var source = path + "." + index;
+                if (File.Exists(source)) File.Move(source, path + "." + (index + 1), true);
+            }
+            File.Move(path, path + ".1", true);
+        }
+
+        public void Dispose()
+        {
+            lock (gate)
+            {
+                if (disposed) return;
+                heartbeatStarted = false;
+                heartbeatTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                disposed = true;
+            }
+            heartbeatTimer.Dispose();
+        }
+    }
+}
+'@
+    }
+    catch { }
+}
+$script:AgentEventStreamAvailable = $null -ne ('DevPilot.AgentEventStream' -as [type])
+
 $script:AgentOutputEventTypes = @(
     'agent.started',
+    'agent.heartbeat',
+    'agent.stopped',
     'cycle.started',
     'candidates.enumerated',
     'candidate.skipped',
@@ -165,6 +380,8 @@ function New-AgentOutputContext {
         [ValidateSet('Auto', 'Compact', 'Detailed', 'Json')]
         [string]$OutputMode = 'Auto',
         [string]$LogPath,
+        [string]$PerInstanceLogDirectory,
+        [int]$HeartbeatIntervalMilliseconds = 5000,
         [bool]$IsOutputRedirected = [Console]::IsOutputRedirected,
         [bool]$SupportsAnsi = ($null -ne $PSStyle -and $PSStyle.OutputRendering -ne 'PlainText'),
         [int]$WindowWidth = $(try { [Console]::WindowWidth } catch { 0 }),
@@ -195,14 +412,50 @@ function New-AgentOutputContext {
             $null
         }
     }
+    $instanceId = [Guid]::NewGuid().ToString('D')
+    $instanceLogPath = if ($PerInstanceLogDirectory) {
+        Join-Path $PerInstanceLogDirectory "$instanceId.jsonl"
+    } else {
+        $LogPath
+    }
+    if ($PerInstanceLogDirectory) {
+        try {
+            [IO.Directory]::CreateDirectory($PerInstanceLogDirectory) | Out-Null
+            $baseLogs = @(Get-ChildItem -LiteralPath $PerInstanceLogDirectory -File -Filter '*.jsonl' |
+                Sort-Object LastWriteTimeUtc -Descending)
+            # Keep nineteen previous streams so creating the current stream
+            # leaves at most twenty base JSONL files per agent.
+            foreach ($stale in @($baseLogs | Select-Object -Skip 19)) {
+                Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction SilentlyContinue
+                1..5 | ForEach-Object {
+                    Remove-Item -LiteralPath "$($stale.FullName).$_" -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        catch { }
+    }
+    $eventStream = if ($PerInstanceLogDirectory -and $script:AgentEventStreamAvailable) {
+        try {
+            $jsonOutput = if ($resolved -eq 'Json') { [Console]::Out } else { $null }
+            New-Object DevPilot.AgentEventStream(
+                $instanceLogPath,
+                $Agent,
+                $instanceId,
+                $PID,
+                [Math]::Max(1000, $HeartbeatIntervalMilliseconds),
+                $jsonOutput)
+        }
+        catch { $null }
+    }
     return @{
         Agent = $Agent
-        InstanceId = [Guid]::NewGuid().ToString('D')
+        InstanceId = $instanceId
         ProcessId = $PID
         Sequence = [long]0
         RequestedMode = $OutputMode
         Mode = $resolved
-        LogPath = $LogPath
+        LogPath = $instanceLogPath
+        EventStream = $eventStream
         WriteLine = $WriteLine
         WriteRaw = $WriteRaw
         StatusActive = $false
@@ -439,24 +692,47 @@ function Publish-AgentEvent {
         [AllowEmptyString()][string]$Message = ''
     )
     try {
-        $Context.Sequence = [long]$Context.Sequence + 1
+        $safeData = ConvertTo-ReviewerSafeEventValue -Value $Data
+        $safeMessage = ConvertTo-ReviewerSafeEventValue -Value $Message
+        $writeResult = $null
+        if ($Context.EventStream) {
+            $Context.EventStream.MaxBytes = [long]$Context.LogMaxBytes
+            $Context.EventStream.RetentionCount = [int]$Context.LogRetentionCount
+            $dataJson = ConvertTo-Json -InputObject $safeData -Depth 6 -Compress
+            $writeResult = $Context.EventStream.WriteEvent(
+                $EventType, $Level, $Cycle, $PrId, $SourceCommit, $dataJson, $safeMessage)
+            if (-not $writeResult) { return $null }
+            $sequence = [long]$writeResult.Sequence
+            $timestamp = [string]$writeResult.Timestamp
+        }
+        else {
+            $Context.Sequence = [long]$Context.Sequence + 1
+            $sequence = [long]$Context.Sequence
+            $timestamp = [DateTime]::UtcNow.ToString('o')
+        }
         $event = [ordered]@{
+            schemaVersion = 2
             agent = [string]$Context.Agent
             instanceId = [string]$Context.InstanceId
             processId = [int]$Context.ProcessId
-            timestamp = [DateTime]::UtcNow.ToString('o')
-            sequence = [long]$Context.Sequence
+            timestamp = $timestamp
+            sequence = $sequence
             eventType = $EventType
             level = $Level
             cycleNumber = $Cycle
             pullRequestId = $PrId
             sourceCommit = $SourceCommit
-            data = ConvertTo-ReviewerSafeEventValue -Value $Data
-            message = ConvertTo-ReviewerSafeEventValue -Value $Message
+            data = $safeData
+            message = $safeMessage
         }
-        $json = ConvertTo-Json -InputObject $event -Depth 8 -Compress
+        $json = if ($writeResult) {
+            [string]$writeResult.Json
+        }
+        else {
+            ConvertTo-Json -InputObject $event -Depth 8 -Compress
+        }
         try {
-            if ($Context.LogPath) {
+            if (-not $Context.EventStream -and $Context.LogPath) {
                 Rotate-ReviewerEventLog -Context $Context
                 $directory = Split-Path -Parent ([string]$Context.LogPath)
                 if ($directory) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
@@ -465,8 +741,12 @@ function Publish-AgentEvent {
         }
         catch { }
         try {
-            if ($Context.Mode -eq 'Json') { & $Context.WriteLine $json }
-            else { Write-ReviewerHumanEvent -Context $Context -Event $event }
+            if ($Context.Mode -eq 'Json') {
+                if (-not $Context.EventStream) { & $Context.WriteLine $json }
+            }
+            else {
+                Write-ReviewerHumanEvent -Context $Context -Event $event
+            }
         }
         catch { }
         return [pscustomobject]$event
@@ -477,6 +757,24 @@ function Publish-AgentEvent {
     }
 }
 
+function Close-AgentOutputContext {
+    param([Parameter(Mandatory)][hashtable]$Context)
+    try {
+        Publish-AgentEvent -Context $Context -EventType agent.stopped -Data @{
+            reason = 'process exiting'
+        } -Message 'Agent process is exiting.' | Out-Null
+    }
+    catch { }
+    try {
+        if ($Context.InteractiveTimer) { $Context.InteractiveTimer.Dispose() }
+    }
+    catch { }
+    try {
+        if ($Context.EventStream) { $Context.EventStream.Dispose() }
+    }
+    catch { }
+}
+
 Export-ModuleMember -Function @(
     'Test-AgentInteractiveOutput',
     'New-AgentOutputContext',
@@ -484,5 +782,6 @@ Export-ModuleMember -Function @(
     'Get-AgentNormalizedSkipReason',
     'Format-AgentCount',
     'Format-AgentSkipSummary',
-    'Publish-AgentEvent'
+    'Publish-AgentEvent',
+    'Close-AgentOutputContext'
 )
