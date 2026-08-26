@@ -2089,14 +2089,16 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $previewDir = Join-Path $StateDir "previews"
 New-Item -ItemType Directory -Force -Path $previewDir | Out-Null
 $logPath = Join-Path $logDir "reviewer.log.jsonl"
-$eventLogPath = Join-Path $logDir "reviewer.events.jsonl"
+$eventLogDirectory = Join-Path (Join-Path $logDir "events") "reviewer"
 $lockPath = Join-Path $StateDir "agent.lock"
 $reviewedStatePath = Join-Path $StateDir "reviewed.json"
 $attemptsStatePath = Join-Path $StateDir "attempts.json"
 $notificationsStatePath = Join-Path $StateDir "notifications.json"
 $artifactKeyPath = Join-Path $StateDir "artifact-signing.key"
 
-$script:ReviewerOutputContext = New-AgentOutputContext -Agent reviewer -OutputMode $OutputMode -LogPath $eventLogPath
+$script:ReviewerOutputContext = New-AgentOutputContext -Agent reviewer -OutputMode $OutputMode `
+    -PerInstanceLogDirectory $eventLogDirectory
+$eventLogPath = [string]$script:ReviewerOutputContext.LogPath
 if ($script:ReviewerOutputContext.Mode -ne 'Detailed' -and (-not $DryRun -or $OutputMode -eq 'Json')) {
     # Legacy host output remains available in Detailed. Other modes are fed
     # exclusively by the structured event boundary.
@@ -6224,4 +6226,9 @@ catch {
     }
     Write-Error $_
     exit 1
+}
+finally {
+    if ($script:ReviewerOutputContext) {
+        Close-AgentOutputContext -Context $script:ReviewerOutputContext
+    }
 }

@@ -1,0 +1,32 @@
+{
+  "name": "@devpilot/operations-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc --noEmit -p tsconfig.json && node build.mjs",
+    "start": "bun --conditions=browser dist/src/index.js",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "test:renderer": "bun --conditions=browser test dist/test/app.test.js"
+  },
+  "dependencies": {
+    "@opentui/core": "0.5.4",
+    "@opentui/solid": "0.5.4",
+    "solid-js": "1.9.12"
+  },
+  "overrides": {
+    "@babel/core": "7.29.7"
+  },
+  "devDependencies": {
+    "@babel/core": "7.29.7",
+    "@babel/preset-typescript": "7.27.1",
+    "@types/babel__core": "7.20.5",
+    "@types/node": "24.3.0",
+    "babel-preset-solid": "1.9.12",
+    "bun": "1.3.14",
+    "typescript": "5.9.2"
+  }
+}

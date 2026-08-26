@@ -46,9 +46,10 @@ Describe 'Reviewer output modes' {
         foreach ($line in $script:reviewerLines) {
             $event = $line | ConvertFrom-Json
             $event.PSObject.Properties.Name | Should -Be @(
-                'agent', 'instanceId', 'processId', 'timestamp', 'sequence', 'eventType',
+                'schemaVersion', 'agent', 'instanceId', 'processId', 'timestamp', 'sequence', 'eventType',
                 'level', 'cycleNumber', 'pullRequestId', 'sourceCommit', 'data', 'message'
             )
+            $event.schemaVersion | Should -Be 2
             $event.agent | Should -Be 'reviewer'
             $event.instanceId | Should -Not -BeNullOrEmpty
             $event.processId | Should -BeGreaterThan 0
@@ -191,6 +192,72 @@ Describe 'Reviewer output modes' {
         Test-Path -LiteralPath "$path.2" | Should -BeTrue
         Get-Content -LiteralPath $path | ForEach-Object { { $_ | ConvertFrom-Json } | Should -Not -Throw }
     }
+
+    It 'writes heartbeat and lifecycle events to an isolated instance stream' {
+        $directory = Join-Path $TestDrive 'instance-events\reviewer'
+        $context = New-AgentOutputContext -Agent reviewer -OutputMode Compact `
+            -PerInstanceLogDirectory $directory -HeartbeatIntervalMilliseconds 1000 `
+            -WriteLine { param($line) }
+        try {
+            Publish-AgentEvent $context agent.started -Data @{ repository = 'sample' } | Out-Null
+            Start-Sleep -Milliseconds 1250
+        }
+        finally {
+            Close-AgentOutputContext $context
+        }
+
+        $context.LogPath | Should -Be (Join-Path $directory "$($context.InstanceId).jsonl")
+        $events = @(Get-Content -LiteralPath $context.LogPath | ForEach-Object { $_ | ConvertFrom-Json })
+        @($events.eventType) | Should -Be @('agent.started', 'agent.heartbeat', 'agent.stopped')
+        @($events.sequence) | Should -Be @(1, 2, 3)
+        @($events.instanceId | Select-Object -Unique) | Should -Be @($context.InstanceId)
+    }
+
+    It 'serializes foreground events and heartbeats in sequence order' {
+        $directory = Join-Path $TestDrive 'concurrent-events\reviewer'
+        $context = New-AgentOutputContext -Agent reviewer -OutputMode Compact `
+            -PerInstanceLogDirectory $directory -HeartbeatIntervalMilliseconds 1000 `
+            -WriteLine { param($line) }
+        try {
+            Publish-AgentEvent $context agent.started | Out-Null
+            1..300 | ForEach-Object {
+                Publish-AgentEvent $context phase.changed -Cycle 1 -PrId 42 `
+                    -Data @{ phase = 'running'; elapsedMilliseconds = $_ } | Out-Null
+                Start-Sleep -Milliseconds 5
+            }
+        }
+        finally {
+            Close-AgentOutputContext $context
+        }
+
+        $events = @(Get-Content -LiteralPath $context.LogPath | ForEach-Object { $_ | ConvertFrom-Json })
+        @($events.sequence) | Should -Be @(1..$events.Count)
+        $events[-1].eventType | Should -Be 'agent.stopped'
+        @($events[0..($events.Count - 2)].eventType) | Should -Contain 'agent.heartbeat'
+    }
+
+    It 'retains only the twenty newest per-instance event streams' {
+        $directory = Join-Path $TestDrive 'retained-events\reviewer'
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        1..21 | ForEach-Object {
+            $path = Join-Path $directory ('{0:D2}.jsonl' -f $_)
+            Set-Content -LiteralPath $path -Value '{}'
+            (Get-Item -LiteralPath $path).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes($_)
+        }
+
+        $context = New-AgentOutputContext -Agent reviewer -OutputMode Compact `
+            -PerInstanceLogDirectory $directory -WriteLine { param($line) }
+        try {
+            Publish-AgentEvent $context cycle.started | Out-Null
+        }
+        finally {
+            Close-AgentOutputContext $context
+        }
+
+        @(Get-ChildItem -LiteralPath $directory -File -Filter '*.jsonl').Count | Should -Be 20
+        Test-Path -LiteralPath (Join-Path $directory '01.jsonl') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $directory '02.jsonl') | Should -BeFalse
+    }
 }
 
 Describe 'Shared reviewer and review-handler event contract' {
@@ -259,7 +326,12 @@ exit $LASTEXITCODE
         $lines = @(& pwsh -NoProfile -File $runner $staleManifest $agentScript $configFile)
 
         $LASTEXITCODE | Should -Be 0
-        $lines.Count | Should -Be 2
-        $lines | ForEach-Object { { $_ | ConvertFrom-Json } | Should -Not -Throw }
+        $events = @($lines | ForEach-Object { $_ | ConvertFrom-Json })
+        $events.Count | Should -BeGreaterOrEqual 3
+        $events[0].eventType | Should -Be 'agent.started'
+        $events[-1].eventType | Should -Be 'agent.stopped'
+        @($events.eventType | Where-Object { $_ -notin @(
+                    'agent.started', 'agent.heartbeat', 'work.completed', 'agent.stopped'
+                ) }) | Should -BeNullOrEmpty
     }
 }

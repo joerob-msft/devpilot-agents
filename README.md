@@ -206,16 +206,22 @@ Both `reviewer` and `review-handler` expose the same
     -ConfigFile <path> -OperatorAlias <alias> > reviewer-events.jsonl
 ```
 
-Every mode also writes a bounded diagnostic event log under the agent state
-directory: `logs/reviewer.events.jsonl` or
-`logs/review-handler.events.jsonl`. A file rotates at 10 MiB and five rotated
-files are retained. Existing cycle metadata logs and failed-cycle transcripts
-remain unchanged.
+Every mode also writes a bounded, process-isolated diagnostic event stream
+under the agent state directory:
+
+```text
+logs/events/reviewer/<instanceId>.jsonl
+logs/events/review-handler/<instanceId>.jsonl
+```
+
+Each stream rotates at 10 MiB with five rotated files. The twenty most recent
+instance streams per agent are retained. Existing cycle metadata logs and
+failed-cycle transcripts remain unchanged.
 
 The shared event envelope is:
 
 ```text
-agent, instanceId, processId, timestamp, sequence, eventType, level,
+schemaVersion, agent, instanceId, processId, timestamp, sequence, eventType, level,
 cycleNumber, pullRequestId, sourceCommit, data, message
 ```
 
@@ -225,10 +231,47 @@ instances can be merged without parsing human console strings. Event data is
 depth-, count-, and string-bounded, and sensitive key names are redacted.
 Candidate, phase, blocked-delivery, completion, failure, and waiting events use
 the same envelope in both agents while retaining agent-specific payloads.
+Schema version 2 adds periodic `agent.heartbeat` events during long blocking
+operations and an `agent.stopped` lifecycle event on orderly shutdown. These
+events are diagnostic only and cannot change agent selection or delivery.
 
-This schema intentionally supports a future combined reviewer and
-review-handler dashboard (for example, `Start-DevPilotDashboard.ps1`), while
-the dashboard/TUI itself is intentionally deferred.
+### Live operations dashboard
+
+`Start-DevPilotDashboard.ps1` is a read-only, OpenCode-inspired terminal UI
+over the reviewer and review-handler event streams. It observes existing agent
+processes; it cannot start, stop, retry, promote, or otherwise control them.
+
+Install and build its locked dependencies once:
+
+```powershell
+Set-Location ./src/DevPilot.Dashboard
+$env:npm_config_cache = "$PWD/.npm-cache"
+npm install
+npm run build
+npm test
+npm run test:renderer
+Set-Location ../..
+```
+
+Then point the dashboard at one or more agent state roots:
+
+```powershell
+./tools/Start-DevPilotDashboard.ps1 `
+    -StateDir "$env:LOCALAPPDATA/<state-namespace>"
+```
+
+The observer searches below each root for both agents' per-instance streams,
+including state layouts with agent-name subdirectories. It can also read an
+explicit capture with `-EventLogPath`. The layout adapts from three panes on a
+wide terminal to a single overview/detail route below 80 columns. Use arrows
+or `j`/`k` to select, `Enter` for detail, `i` for the inspector, `e` for
+events, `Ctrl+P` for the command palette, `?` for help, and `q` to quit.
+
+The package keeps its OpenTUI, SolidJS, TypeScript, and Bun versions locked
+under `src/DevPilot.Dashboard`. Bun is restored locally by `npm install`; no
+global Bun installation is required. See
+[`src/DevPilot.Dashboard/README.md`](src/DevPilot.Dashboard/README.md) for
+architecture and troubleshooting.
 
 `-PromotePreview` publishes the artifact's **delivery manifest** — the exact
 comment and thread-reply lists, summary and vote that appeared in the Markdown you read — and
