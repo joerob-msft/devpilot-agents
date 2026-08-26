@@ -10,8 +10,9 @@ and binds the work, owns all state, performs every external write, and validates
 everything the model returns. The model never selects its own work and never
 writes to the PR host directly.
 
-> **Status: pilot.** One agent (`review-handler`) is implemented and running
-> against Azure DevOps. Interfaces will change.
+> **Status: pilot.** Two agents (`reviewer` and `review-handler`) are
+> implemented for Azure DevOps, with a shared read-only operations dashboard
+> for observing either or both. Interfaces will change.
 
 ---
 
@@ -38,11 +39,12 @@ marker. Anything else it prints is ignored.
 ```text
 src/
   DevPilot.AgentHarness/     # the shared, provider-agnostic module
+  DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
   Agents/
     review-handler/          # an agent: script + prompt + fixtures
     reviewer/                # an agent: script + prompt
 samples/                     # example configs for real repositories
-tools/                       # repo hygiene checks
+tools/                       # launchers, dashboard entry point, and repo checks
 docs/                        # how to add an agent
 ```
 
@@ -56,24 +58,24 @@ person-specific lives in this repo outside `samples/` — a CI check enforces th
 
 ```powershell
 # 1. Load the harness (from a checkout; a published module is planned)
-Import-Module ./src/DevPilot.AgentHarness/DevPilot.AgentHarness.psd1
+Import-Module .\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1
 
 # 2. Copy a sample config into the repository you want the agent to work on
-#    e.g. <your-repo>/.github/copilot/agents/review-handler.config.json
+#    e.g. <your-repo>\.github\copilot\agents\review-handler.config.json
 
 # 3. Prove it works offline — no network, no Copilot process
-./src/Agents/review-handler/Start-ReviewHandlerAgent.ps1 -DryRun `
-    -ConfigFile <your-repo>/.github/copilot/agents/review-handler.config.json
+.\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1 -DryRun `
+    -ConfigFile <your-repo>\.github\copilot\agents\review-handler.config.json
 
 # 4. First live cycle. Every mutating capability is OFF by default:
 #    this analyses a PR and writes nothing.
-./src/Agents/review-handler/Start-ReviewHandlerAgent.ps1 -Once `
-    -ConfigFile <your-repo>/.github/copilot/agents/review-handler.config.json `
+.\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1 -Once `
+    -ConfigFile <your-repo>\.github\copilot\agents\review-handler.config.json `
     -OperatorAlias <your-alias>
 
 # Target one of your PRs explicitly:
-./src/Agents/review-handler/Start-ReviewHandlerAgent.ps1 -Once `
-    -ConfigFile <your-repo>/.github/copilot/agents/review-handler.config.json `
+.\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1 -Once `
+    -ConfigFile <your-repo>\.github\copilot\agents\review-handler.config.json `
     -OperatorAlias <your-alias> -PullRequestId 12345
 ```
 
@@ -155,24 +157,24 @@ review you have actually read is a first-class mode rather than a re-run:
 
 ```powershell
 # Offline validation
-./src/Agents/reviewer/Start-ReviewerAgent.ps1 -DryRun `
-    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json
+.\src\Agents\reviewer\Start-ReviewerAgent.ps1 -DryRun `
+    -ConfigFile <your-repo>\.github\copilot\agents\reviewer.config.json
 
 # 1. Preview one specific PR. Posts nothing; writes a .md to read and a .json beside it.
-./src/Agents/reviewer/Start-ReviewerAgent.ps1 -Once `
-    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+.\src\Agents\reviewer\Start-ReviewerAgent.ps1 -Once `
+    -ConfigFile <your-repo>\.github\copilot\agents\reviewer.config.json `
     -OperatorAlias <your-alias> -PullRequestId 12345
 
 # 2. Read the .md. If you agree, publish EXACTLY that review - no second model run.
-./src/Agents/reviewer/Start-ReviewerAgent.ps1 `
-    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+.\src\Agents\reviewer\Start-ReviewerAgent.ps1 `
+    -ConfigFile <your-repo>\.github\copilot\agents\reviewer.config.json `
     -OperatorAlias <your-alias> `
-    -PromotePreview <state-dir>/previews/pr12345-<commit>-<stamp>.json `
+    -PromotePreview <state-dir>\previews\pr12345-<commit>-<stamp>.json `
     -EnableFindingComments -EnableThreadReplies -EnableSummaryComment
 
 # Unattended alternative: review and post in one run. Faster, and nobody read it first.
-./src/Agents/reviewer/Start-ReviewerAgent.ps1 -Once `
-    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+.\src\Agents\reviewer\Start-ReviewerAgent.ps1 -Once `
+    -ConfigFile <your-repo>\.github\copilot\agents\reviewer.config.json `
     -OperatorAlias <your-alias> `
     -EnableFindingComments -EnableThreadReplies -EnableSummaryComment
 ```
@@ -194,15 +196,15 @@ Both `reviewer` and `review-handler` expose the same
 
 ```powershell
 # Bounded output for a service log
-./src/Agents/reviewer/Start-ReviewerAgent.ps1 -OutputMode Compact `
+.\src\Agents\reviewer\Start-ReviewerAgent.ps1 -OutputMode Compact `
     -ConfigFile <path> -OperatorAlias <alias>
 
 # Full operator diagnostics
-./src/Agents/review-handler/Start-ReviewHandlerAgent.ps1 -OutputMode Detailed `
+.\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1 -OutputMode Detailed `
     -ConfigFile <path> -OperatorAlias <alias>
 
 # Feed an external monitor
-./src/Agents/reviewer/Start-ReviewerAgent.ps1 -OutputMode Json `
+.\src\Agents\reviewer\Start-ReviewerAgent.ps1 -OutputMode Json `
     -ConfigFile <path> -OperatorAlias <alias> > reviewer-events.jsonl
 ```
 
@@ -237,32 +239,56 @@ events are diagnostic only and cannot change agent selection or delivery.
 
 ### Live operations dashboard
 
-`Start-DevPilotDashboard.ps1` is a read-only, OpenCode-inspired terminal UI
-over the reviewer and review-handler event streams. It observes existing agent
-processes; it cannot start, stop, retry, promote, or otherwise control them.
+`tools\Start-DevPilotDashboard.ps1` is a read-only, OpenCode-inspired terminal
+UI over reviewer and review-handler event streams. The observer itself cannot
+start, stop, retry, promote, or otherwise control an agent. The
+`Watch-DevPilot*.ps1` launchers provide the separate convenience layer that
+starts preview-only child agents and points the observer at their shared state
+root.
 
-For the simplest workflow, launch preview-only agents and watch them together
-in the current terminal:
+The dashboard requires Node.js 24 or newer, PowerShell 7 for the watch
+launchers, and an interactive terminal at least 60 columns wide. Restore and
+build the locked dashboard dependencies once from the toolkit checkout:
 
 ```powershell
-# Both agents, one cycle each:
+Set-Location .\src\DevPilot.Dashboard
+$env:npm_config_cache = "$PWD\.npm-cache"
+npm ci
+npm test
+npm run test:renderer
+Set-Location ..\..
+```
+
+The launchers deliberately never install dependencies. If public npm is
+blocked, configure npm to use your organization's approved registry mirror
+before running `npm ci`.
+
+For the simplest workflow, run the launcher while the current directory is the
+consumer repository whose conventional agent configs should be used:
+
+```powershell
+# Both preview-only agents, one cycle each:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both
 
 # Both agents, continuous 15-minute cadence:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
 
-# One agent:
+# One agent, or one specific PR:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Reviewer -Continuous
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent ReviewHandler -Continuous
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Reviewer `
+    -ReviewerPullRequestId 12345
 ```
 
 The shared launcher resolves the conventional
 `.github\copilot\agents\reviewer.config.json` and
 `.github\copilot\agents\review-handler.config.json` paths from the current
-consumer repository. It starts each selected agent in a separate process with
-`-OutputMode Json` and no mutating or notification switches. The agents share
-one generated session root, so one dashboard can group their live and retained
-instances.
+consumer repository. Only the selected agents' configs are required. Override
+them with `-ReviewerConfigFile` or `-ReviewHandlerConfigFile` when necessary.
+The launcher starts each selected agent in a separate process with
+`-OutputMode Json` and no mutating or notification switches. Unless
+`-StateDir` is supplied, the agents share a generated temporary session root,
+so one dashboard can group their live and retained instances.
 
 Compatibility wrappers provide the shorter single-agent names:
 
@@ -292,38 +318,46 @@ with `-Continuous` to prevent repeatedly processing one pull request. Use the
 ordinary agent entry points, not the watch launchers, for code changes,
 publishing, votes, requeues, auto-complete, or notifications.
 
-Install and build its locked dependencies once:
-
-```powershell
-Set-Location .\src\DevPilot.Dashboard
-$env:npm_config_cache = "$PWD/.npm-cache"
-npm install
-npm run build
-npm test
-npm run test:renderer
-Set-Location ../..
-```
-
-Then point the dashboard at one or more agent state roots:
+To observe agents started separately, point the standalone dashboard at one or
+more state roots:
 
 ```powershell
 .\tools\Start-DevPilotDashboard.ps1 `
-    -StateDir "$env:LOCALAPPDATA/<state-namespace>"
+    -StateDir "$env:LOCALAPPDATA\<state-namespace>"
 ```
 
-The standalone observer searches below each root for both agents' per-instance streams,
-including state layouts with agent-name subdirectories. It can also read an
-explicit capture with `-EventLogPath`. The layout adapts from three panes on a
-wide terminal to a single overview/detail route below 80 columns. Use arrows
-or `j`/`k` to select, `Enter` for detail, `i` for the inspector, `e` for
-events, `o` to open a validated PR link, `Ctrl+P` for the contextual command
-palette, `?` for help, and `q` to quit.
+The standalone observer searches below each root for both agents' per-instance
+streams, including state layouts with agent-name subdirectories. It can also
+read explicit captures with `-EventLogPath`. The default **Current session**
+view shows every live instance plus the newest retained outcome per
+agent/session group. **Live** keeps active running, waiting, failed, blocked,
+and stale processes visible. **History** shows stopped or completed retained
+runs with timestamps and outcomes. `x` and `Shift+x` forget selected or all
+history rows only from the current dashboard process; they never change agent
+state or event logs.
+
+The layout adapts from three panes on a wide terminal to a single
+overview/detail route below 80 columns:
+
+| Key | Action |
+|---|---|
+| Left / Right | Focus a visible pane |
+| Up / Down / `j` / `k` | Select an instance |
+| `Enter` / `Esc` | Drill into or back out of detail and timeline views |
+| `Tab` / `Shift+Tab` | Cycle all, reviewer, and review-handler roles |
+| `f` / `Shift+f` | Cycle Live, Current session, and History |
+| `x` / `Shift+x` | Forget selected/all history from dashboard view state |
+| `i` / `e` | Toggle the inspector or bounded raw-events overlay |
+| `w` | Select the next failed, blocked, or diagnostic-bearing instance |
+| `o` | Open the selected PR's validated HTTP(S) URL |
+| `Ctrl+P` / `?` | Open the command palette or help |
+| `q` | Quit |
 
 The package keeps its OpenTUI, SolidJS, TypeScript, and Bun versions locked
-under `src/DevPilot.Dashboard`. Bun is restored locally by `npm install`; no
-global Bun installation is required. See
+under `src\DevPilot.Dashboard`. Bun is restored locally by `npm ci`; no global
+Bun installation is required. See
 [`src/DevPilot.Dashboard/README.md`](src/DevPilot.Dashboard/README.md) for
-architecture and troubleshooting.
+architecture, controls, filtering semantics, and direct-debugging commands.
 
 `-PromotePreview` publishes the artifact's **delivery manifest** — the exact
 comment and thread-reply lists, summary and vote that appeared in the Markdown you read — and
@@ -519,7 +553,7 @@ See [`docs/adding-an-agent.md`](docs/adding-an-agent.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Run `./tools/Test-NoEmployerSpecifics.ps1`
+See [CONTRIBUTING.md](CONTRIBUTING.md). Run `.\tools\Test-NoEmployerSpecifics.ps1`
 and the agent `-DryRun` suite before opening a pull request.
 
 ## License
