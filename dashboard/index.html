@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Agent Review Dashboard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07111f;
+      --panel: rgba(13, 28, 47, 0.86);
+      --panel-strong: #10253d;
+      --border: rgba(148, 177, 206, 0.18);
+      --text: #f4f8fc;
+      --muted: #9db0c5;
+      --blue: #63b3ff;
+      --teal: #42d3b0;
+      --gold: #f4c86a;
+      --violet: #ad8cff;
+      --rose: #ff8298;
+      --shadow: 0 20px 50px rgba(0, 0, 0, 0.24);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% 0%, rgba(64, 153, 255, 0.18), transparent 34rem),
+        radial-gradient(circle at 90% 10%, rgba(66, 211, 176, 0.12), transparent 28rem),
+        var(--bg);
+    }
+    main { width: min(1240px, calc(100% - 32px)); margin: 0 auto; padding: 44px 0 56px; }
+    header { display: flex; justify-content: space-between; gap: 28px; align-items: flex-start; margin-bottom: 28px; }
+    h1 { margin: 0; font-size: clamp(2rem, 5vw, 3.65rem); letter-spacing: -0.055em; line-height: 0.98; }
+    .eyebrow { margin: 0 0 10px; color: var(--teal); text-transform: uppercase; letter-spacing: 0.16em; font-size: 0.75rem; font-weight: 800; }
+    .subtitle { max-width: 680px; margin: 16px 0 0; color: var(--muted); line-height: 1.6; }
+    .freshness { min-width: 235px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 16px; background: rgba(9, 23, 39, 0.68); box-shadow: var(--shadow); }
+    .freshness strong, .freshness span { display: block; }
+    .freshness strong { margin-bottom: 5px; font-size: 0.86rem; }
+    .freshness span { color: var(--muted); font-size: 0.8rem; line-height: 1.45; }
+    .notice { display: none; margin-bottom: 20px; padding: 16px 18px; border: 1px solid rgba(244, 200, 106, 0.38); border-radius: 16px; color: #ffe2a6; background: rgba(89, 62, 10, 0.28); }
+    .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+    .card, .panel {
+      border: 1px solid var(--border);
+      background: linear-gradient(145deg, rgba(18, 42, 68, 0.9), rgba(10, 24, 41, 0.9));
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(16px);
+    }
+    .card { min-height: 174px; padding: 22px; border-radius: 20px; position: relative; overflow: hidden; }
+    .card::after { content: ""; position: absolute; width: 120px; height: 120px; border-radius: 999px; right: -56px; top: -52px; background: var(--accent, var(--blue)); opacity: 0.12; filter: blur(2px); }
+    .card-label { color: var(--muted); font-size: 0.78rem; font-weight: 750; letter-spacing: 0.08em; text-transform: uppercase; }
+    .card-value { margin-top: 18px; font-size: clamp(2rem, 4vw, 3rem); font-weight: 800; letter-spacing: -0.05em; }
+    .card-detail { margin-top: 8px; color: var(--muted); font-size: 0.85rem; line-height: 1.45; }
+    .quality-value { font-size: clamp(1.35rem, 3vw, 2.35rem); letter-spacing: -0.035em; }
+    .badge { display: inline-flex; margin-top: 10px; padding: 5px 9px; border-radius: 999px; color: #ffe3a8; background: rgba(244, 200, 106, 0.13); border: 1px solid rgba(244, 200, 106, 0.28); font-size: 0.72rem; font-weight: 750; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.75fr); gap: 18px; margin-top: 18px; }
+    .panel { padding: 22px; border-radius: 20px; }
+    .panel-heading { display: flex; justify-content: space-between; gap: 18px; align-items: baseline; margin-bottom: 18px; }
+    .panel h2 { margin: 0; font-size: 1.05rem; }
+    .panel-heading span { color: var(--muted); font-size: 0.78rem; }
+    .week-list { display: grid; gap: 15px; }
+    .week { display: grid; grid-template-columns: 88px 1fr; gap: 14px; align-items: start; }
+    .week-label { color: var(--muted); font-size: 0.78rem; padding-top: 3px; }
+    .bar-list { display: grid; gap: 7px; }
+    .bar-row { display: grid; grid-template-columns: 84px minmax(0, 1fr) 30px; gap: 9px; align-items: center; font-size: 0.72rem; }
+    .bar-track { height: 8px; overflow: hidden; border-radius: 999px; background: rgba(255, 255, 255, 0.06); }
+    .bar-fill { height: 100%; min-width: 2px; border-radius: inherit; background: var(--bar-color); }
+    .bar-value { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+    .outcome-list { display: grid; gap: 11px; }
+    .outcome-row { display: flex; justify-content: space-between; gap: 20px; padding-bottom: 11px; border-bottom: 1px solid var(--border); }
+    .outcome-row:last-child { border-bottom: 0; padding-bottom: 0; }
+    .outcome-row span { color: var(--muted); }
+    .outcome-row strong { font-variant-numeric: tabular-nums; }
+    .table-panel { margin-top: 18px; overflow: hidden; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td { padding: 13px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.82rem; }
+    th { color: var(--muted); font-size: 0.7rem; letter-spacing: 0.075em; text-transform: uppercase; }
+    td { font-variant-numeric: tabular-nums; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .yes { color: var(--teal); font-weight: 750; }
+    .no { color: var(--muted); }
+    .sort-button { border: 0; padding: 0; color: inherit; background: transparent; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; }
+    .sort-button::after { content: " ↕"; color: var(--muted); }
+    .sort-button[data-direction="asc"]::after { content: " ↑"; color: var(--teal); }
+    .sort-button[data-direction="desc"]::after { content: " ↓"; color: var(--teal); }
+    .operator-toggle { border: 0; padding: 0; color: var(--text); background: transparent; font: inherit; font-weight: 750; cursor: pointer; text-align: left; }
+    .operator-toggle::before { content: "▸"; display: inline-block; width: 18px; color: var(--teal); }
+    .operator-toggle[aria-expanded="true"]::before { content: "▾"; }
+    .operator-team { display: block; margin: 3px 0 0 18px; color: var(--muted); font-size: 0.72rem; }
+    .status-pill { display: inline-flex; padding: 4px 8px; border-radius: 999px; border: 1px solid var(--border); font-size: 0.7rem; font-weight: 750; }
+    .status-pill.fresh { color: var(--teal); background: rgba(66, 211, 176, 0.09); }
+    .status-pill.stale { color: var(--gold); background: rgba(244, 200, 106, 0.09); }
+    .status-pill.no-snapshot { color: var(--muted); }
+    .operator-detail td { padding: 0 12px 18px 42px; background: rgba(4, 13, 24, 0.34); }
+    .history-table { min-width: 680px; }
+    .history-table th, .history-table td { padding: 9px 10px; font-size: 0.76rem; }
+    .empty { padding: 26px; color: var(--muted); text-align: center; border: 1px dashed var(--border); border-radius: 16px; }
+    footer { margin-top: 20px; color: var(--muted); font-size: 0.75rem; line-height: 1.55; }
+    @media (max-width: 900px) {
+      header { display: block; }
+      .freshness { margin-top: 20px; }
+      .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 580px) {
+      main { width: min(100% - 20px, 1240px); padding-top: 28px; }
+      .cards { grid-template-columns: 1fr; }
+      .card { min-height: 150px; }
+      .week { grid-template-columns: 1fr; }
+      .bar-row { grid-template-columns: 78px minmax(0, 1fr) 26px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">Operational review signals</p>
+        <h1>Agent Review Dashboard</h1>
+        <p class="subtitle">A privacy-safe rollup of reviewer and review-handler activity. It shows adoption and follow-through, not model precision or an employee productivity score.</p>
+      </div>
+      <div class="freshness">
+        <strong id="period">No reporting period</strong>
+        <span id="freshness">No snapshots loaded</span>
+      </div>
+    </header>
+
+    <div id="no-data" class="notice">No current agent snapshots were found. The dashboard shell is ready; export a snapshot and rebuild to populate it.</div>
+
+    <section id="cards" class="cards" aria-label="Key metrics"></section>
+
+    <section class="grid">
+      <article class="panel">
+        <div class="panel-heading">
+          <h2>Weekly activity</h2>
+          <span>Distinct PRs; posted comments include thread assessments</span>
+        </div>
+        <div id="weekly-chart" class="week-list"></div>
+      </article>
+      <article class="panel">
+        <div class="panel-heading">
+          <h2>Comment outcomes</h2>
+          <span>Reviewer finding threads only</span>
+        </div>
+        <div id="outcomes" class="outcome-list"></div>
+      </article>
+    </section>
+
+    <section id="operator-panel" class="panel table-panel" hidden>
+      <div class="panel-heading">
+        <h2>Operator activity</h2>
+        <span>Sortable reviewer-agent activity; no composite score or rank</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th><button class="sort-button" data-sort="displayName">Operator</button></th>
+              <th><button class="sort-button" data-sort="status">Status</button></th>
+              <th><button class="sort-button" data-sort="prsReviewed">PRs reviewed</button></th>
+              <th><button class="sort-button" data-sort="findings">Findings</button></th>
+              <th><button class="sort-button" data-sort="commentsPosted">Comments</button></th>
+              <th><button class="sort-button" data-sort="prsApproved">Approved</button></th>
+              <th><button class="sort-button" data-sort="lastActivityAt">Last activity</button></th>
+            </tr>
+          </thead>
+          <tbody id="operators"></tbody>
+        </table>
+      </div>
+      <div id="operators-empty" class="empty" hidden>No rostered reviewer activity in this period.</div>
+    </section>
+
+    <section class="panel table-panel">
+      <div class="panel-heading">
+        <h2>Recent pull requests</h2>
+        <span>No titles, authors, comments, code, or file paths</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>PR</th>
+              <th>Date</th>
+              <th>Findings</th>
+              <th>Posted comments</th>
+              <th>Vote</th>
+              <th>Commit pushed</th>
+              <th>Auto-complete</th>
+            </tr>
+          </thead>
+          <tbody id="recent-prs"></tbody>
+        </table>
+      </div>
+      <div id="recent-empty" class="empty" hidden>No pull-request activity in this period.</div>
+    </section>
+
+    <footer id="footer"></footer>
+  </main>
+
+  <script>
+    "use strict";
+    const DATA = __DASHBOARD_DATA__;
+    const number = new Intl.NumberFormat();
+    const date = value => value ? new Date(value).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" }) : "Unavailable";
+    const dateTime = value => value ? new Date(value).toLocaleString() : "Unavailable";
+
+    const cards = [
+      { label: "PRs reviewed", value: DATA.metrics.prsReviewed, detail: "Distinct PRs with a completed reviewer cycle", accent: "var(--blue)" },
+      { label: "Comments posted", value: DATA.metrics.commentsPosted, detail: "Finding comments plus replies to existing threads", accent: "var(--teal)" },
+      { label: "Team comment usefulness", quality: true, accent: "var(--gold)" },
+      { label: "PRs approved", value: DATA.metrics.prsApproved, detail: "Approved or approved with suggestions", accent: "var(--violet)" },
+      { label: "PRs with code pushed", value: DATA.metrics.prsWithCommitsPushed, detail: "Distinct PRs where review-handler pushed a commit", accent: "var(--rose)" },
+      { label: "PRs auto-completed", value: DATA.metrics.prsAutoCompleted, detail: "Distinct PRs where review-handler confirmed auto-complete", accent: "var(--teal)" }
+    ];
+
+    const cardsRoot = document.getElementById("cards");
+    cards.forEach(item => {
+      const card = document.createElement("article");
+      card.className = "card";
+      card.style.setProperty("--accent", item.accent);
+      const label = document.createElement("div");
+      label.className = "card-label";
+      label.textContent = item.label;
+      const value = document.createElement("div");
+      value.className = "card-value";
+      const detail = document.createElement("div");
+      detail.className = "card-detail";
+      if (item.quality) {
+        value.classList.add("quality-value");
+        if (!DATA.quality.lowVolume) {
+          value.textContent = `${DATA.quality.usefulnessPercent}%`;
+          detail.textContent = `${number.format(DATA.quality.fixed)} of ${number.format(DATA.quality.decided)} decided finding threads marked fixed. Workflow-resolution proxy — not a correctness or employee score.`;
+        } else {
+          value.textContent = `Accumulating (${number.format(DATA.quality.decided)} of 5 decided)`;
+          detail.textContent = `Workflow-resolution proxy — not a correctness or employee score.${DATA.quality.available ? "" : " Run the outcome collector to add decided thread statuses."}`;
+        }
+      } else {
+        value.textContent = number.format(item.value);
+        detail.textContent = item.detail;
+      }
+      card.append(label, value, detail);
+      cardsRoot.append(card);
+    });
+
+    document.getElementById("no-data").style.display = DATA.snapshotCount === 0 ? "block" : "none";
+    document.getElementById("period").textContent = DATA.periodStart && DATA.periodEnd
+      ? `${date(DATA.periodStart)} – ${date(new Date(new Date(DATA.periodEnd).getTime() - 1))}`
+      : "No reporting period";
+    document.getElementById("freshness").textContent = DATA.dataAsOf
+      ? `Data as of ${dateTime(DATA.dataAsOf)} from ${number.format(DATA.snapshotCount)} snapshot${DATA.snapshotCount === 1 ? "" : "s"}`
+      : "No snapshots loaded";
+
+    const series = [
+      ["Reviewed", "prsReviewed", "var(--blue)"],
+      ["Comments", "commentsPosted", "var(--teal)"],
+      ["Approved", "prsApproved", "var(--violet)"],
+      ["Code pushed", "prsWithCommitsPushed", "var(--rose)"]
+    ];
+    const chart = document.getElementById("weekly-chart");
+    if (DATA.weeklyActivity.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "No weekly activity in this period.";
+      chart.append(empty);
+    } else {
+      const maximum = Math.max(1, ...DATA.weeklyActivity.flatMap(week => series.map(([, key]) => week[key])));
+      DATA.weeklyActivity.forEach(week => {
+        const row = document.createElement("div");
+        row.className = "week";
+        const weekLabel = document.createElement("div");
+        weekLabel.className = "week-label";
+        weekLabel.textContent = `Week of ${date(`${week.weekStart}T00:00:00Z`)}`;
+        const barList = document.createElement("div");
+        barList.className = "bar-list";
+        series.forEach(([label, key, color]) => {
+          const barRow = document.createElement("div");
+          barRow.className = "bar-row";
+          const name = document.createElement("span");
+          name.textContent = label;
+          const track = document.createElement("div");
+          track.className = "bar-track";
+          const fill = document.createElement("div");
+          fill.className = "bar-fill";
+          fill.style.setProperty("--bar-color", color);
+          fill.style.width = `${Math.max(2, (week[key] / maximum) * 100)}%`;
+          fill.setAttribute("aria-label", `${label}: ${week[key]}`);
+          track.append(fill);
+          const count = document.createElement("span");
+          count.className = "bar-value";
+          count.textContent = number.format(week[key]);
+          barRow.append(name, track, count);
+          barList.append(barRow);
+        });
+        row.append(weekLabel, barList);
+        chart.append(row);
+      });
+    }
+
+    const outcomeRows = DATA.quality.available
+      ? [
+          ["Fixed", DATA.quality.fixed],
+          ["Won't fix", DATA.quality.wontFix],
+          ["By design", DATA.quality.byDesign],
+          ["Closed", DATA.quality.closed],
+          ["Merged unresolved", DATA.quality.mergedUnresolved],
+          ["Open awaiting decision", DATA.quality.stillOpen]
+        ]
+      : [["Status", "Data accumulating"]];
+    const outcomes = document.getElementById("outcomes");
+    outcomeRows.forEach(([label, value]) => {
+      const row = document.createElement("div");
+      row.className = "outcome-row";
+      const name = document.createElement("span");
+      name.textContent = label;
+      const count = document.createElement("strong");
+      count.textContent = typeof value === "number" ? number.format(value) : value;
+      row.append(name, count);
+      outcomes.append(row);
+    });
+
+    const voteLabels = {
+      none: "None",
+      Approved: "Approved",
+      ApprovedWithSuggestions: "Approved with suggestions",
+      WaitingForAuthor: "Waiting for author"
+    };
+
+    const operatorPanel = document.getElementById("operator-panel");
+    const operatorBody = document.getElementById("operators");
+    const operatorEmpty = document.getElementById("operators-empty");
+    let operatorSort = { key: "prsReviewed", direction: "desc" };
+    const operatorSortValue = (operator, key) => {
+      if (key === "lastActivityAt") return operator.lastActivityAt ? new Date(operator.lastActivityAt).getTime() : 0;
+      const value = operator[key];
+      return typeof value === "string" ? value.toLocaleLowerCase() : value;
+    };
+    const renderOperators = () => {
+      operatorBody.replaceChildren();
+      const sorted = [...DATA.operators].sort((left, right) => {
+        const a = operatorSortValue(left, operatorSort.key);
+        const b = operatorSortValue(right, operatorSort.key);
+        let comparison = typeof a === "string" ? a.localeCompare(b) : a - b;
+        if (comparison === 0) return left.displayName.localeCompare(right.displayName);
+        return operatorSort.direction === "asc" ? comparison : -comparison;
+      });
+      operatorEmpty.hidden = sorted.length !== 0;
+      sorted.forEach((operator, index) => {
+        const summary = document.createElement("tr");
+        const details = document.createElement("tr");
+        details.className = "operator-detail";
+        details.hidden = true;
+        const detailId = `operator-history-${index}`;
+
+        const identityCell = document.createElement("td");
+        const toggle = document.createElement("button");
+        toggle.className = "operator-toggle";
+        toggle.type = "button";
+        toggle.setAttribute("aria-expanded", "false");
+        toggle.setAttribute("aria-controls", detailId);
+        toggle.textContent = operator.displayName;
+        const team = document.createElement("span");
+        team.className = "operator-team";
+        team.textContent = operator.team || "No team label";
+        identityCell.append(toggle, team);
+
+        const statusCell = document.createElement("td");
+        const status = document.createElement("span");
+        status.className = `status-pill ${operator.status.toLowerCase().replace(" ", "-")}`;
+        status.textContent = `${operator.status} · ${operator.installationCount} install${operator.installationCount === 1 ? "" : "s"}`;
+        statusCell.append(status);
+
+          const values = [
+          number.format(operator.prsReviewed),
+          number.format(operator.findings),
+          number.format(operator.commentsPosted),
+          number.format(operator.prsApproved),
+          operator.lastActivityAt ? dateTime(operator.lastActivityAt) : "No activity"
+        ];
+        summary.append(identityCell, statusCell);
+        values.forEach(value => {
+          const cell = document.createElement("td");
+          cell.textContent = value;
+          summary.append(cell);
+        });
+
+        const detailCell = document.createElement("td");
+        detailCell.colSpan = 7;
+        detailCell.id = detailId;
+        if (operator.history.length === 0) {
+          detailCell.textContent = "No reviewer PR activity in this period.";
+        } else {
+          const table = document.createElement("table");
+          table.className = "history-table";
+          const head = document.createElement("thead");
+          const headRow = document.createElement("tr");
+          ["PR", "Date", "Reviewed", "Findings", "Posted comments", "Vote", "Approved"].forEach(label => {
+            const th = document.createElement("th");
+            th.textContent = label;
+            headRow.append(th);
+          });
+          head.append(headRow);
+          const body = document.createElement("tbody");
+          operator.history.forEach(pr => {
+            const row = document.createElement("tr");
+            [
+              `#${pr.prId}`,
+              date(`${pr.date}T00:00:00Z`),
+              pr.reviewed ? "Yes" : "No",
+              number.format(pr.findings),
+              number.format(pr.postedComments),
+              voteLabels[pr.vote] || pr.vote,
+              pr.approved ? "Yes" : "No"
+            ].forEach(value => {
+              const td = document.createElement("td");
+              td.textContent = value;
+              row.append(td);
+            });
+            body.append(row);
+          });
+          table.append(head, body);
+          detailCell.append(table);
+        }
+        details.append(detailCell);
+        toggle.addEventListener("click", () => {
+          const expanded = toggle.getAttribute("aria-expanded") === "true";
+          toggle.setAttribute("aria-expanded", String(!expanded));
+          details.hidden = expanded;
+        });
+        operatorBody.append(summary, details);
+      });
+      document.querySelectorAll(".sort-button").forEach(button => {
+        const active = button.dataset.sort === operatorSort.key;
+        button.dataset.direction = active ? operatorSort.direction : "";
+      });
+    };
+    operatorPanel.hidden = !DATA.rosterEnabled;
+    if (DATA.rosterEnabled) {
+      document.querySelectorAll(".sort-button").forEach(button => {
+        button.addEventListener("click", () => {
+          const key = button.dataset.sort;
+          operatorSort = operatorSort.key === key
+            ? { key, direction: operatorSort.direction === "desc" ? "asc" : "desc" }
+            : { key, direction: key === "displayName" || key === "status" ? "asc" : "desc" };
+          renderOperators();
+        });
+      });
+      renderOperators();
+    }
+
+    const recentBody = document.getElementById("recent-prs");
+    document.getElementById("recent-empty").hidden = DATA.recentPullRequests.length !== 0;
+    DATA.recentPullRequests.forEach(pr => {
+      const row = document.createElement("tr");
+      const values = [
+        `#${pr.prId}`,
+        date(`${pr.date}T00:00:00Z`),
+        number.format(pr.findings),
+        number.format(pr.postedComments),
+        voteLabels[pr.vote] || pr.vote,
+        pr.commitPushed ? "Yes" : "No",
+        pr.autoComplete ? "Yes" : "No"
+      ];
+      values.forEach((value, index) => {
+        const cell = document.createElement("td");
+        cell.textContent = value;
+        if (index >= 5) cell.className = value === "Yes" ? "yes" : "no";
+        row.append(cell);
+      });
+      recentBody.append(row);
+    });
+
+    const ignored = DATA.ignoredSnapshotCount > 0
+      ? ` ${number.format(DATA.ignoredSnapshotCount)} older snapshot${DATA.ignoredSnapshotCount === 1 ? " was" : "s were"} ignored.`
+      : "";
+    document.getElementById("footer").textContent =
+      `Built ${dateTime(DATA.generatedAt)}. Comment usefulness is a workflow proxy: Fixed / (Fixed + Won\u2019t fix + By design + Closed) on completed PRs, not a precision score.${DATA.unmappedFindingThreads > 0 ? ` ${number.format(DATA.unmappedFindingThreads)} finding thread(s) could not be mapped to the roster.` : ""}${ignored}`;
+  </script>
+</body>
+</html>

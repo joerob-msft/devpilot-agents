@@ -8,6 +8,11 @@ state/
 *.log.jsonl
 failed-cycles/
 
+# Dashboard operational data: live snapshots, identity roster, and collected
+# comment outcomes. These files may contain display names and PR activity and
+# must never be committed.
+dashboard-data/
+
 # Editors / OS
 .vs/
 .vscode/

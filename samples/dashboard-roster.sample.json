@@ -1,0 +1,20 @@
+{
+  "kind": "devpilot-agent-dashboard-roster",
+  "schemaVersion": 1,
+  "people": [
+    {
+      "personId": "reviewer-a",
+      "displayName": "Reviewer A",
+      "team": "Platform",
+      "publisherIds": [
+        "aaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "adoIdentityIds": [
+        "synthetic-identity-a"
+      ],
+      "adoUniqueNames": [
+        "reviewer-a@example.test"
+      ]
+    }
+  ]
+}

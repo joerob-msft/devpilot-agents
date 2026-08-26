@@ -1,0 +1,10 @@
+{
+  "kind": "devpilot-agent-dashboard-config",
+  "schemaVersion": 1,
+  "reportingWindow": {
+    "policy": "calendar-month",
+    "year": 2026,
+    "month": 8
+  },
+  "staleAfterHours": 48
+}

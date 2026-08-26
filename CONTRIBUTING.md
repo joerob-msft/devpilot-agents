@@ -13,6 +13,13 @@ Both checks are fast and run offline:
     -ConfigFile ./samples/handler-ado.config.json
 ```
 
+For dashboard-related changes, also run:
+
+```powershell
+# 3. Dashboard offline self-checks (covers template, config, rendering, security)
+./tools/Test-AgentDashboard.ps1
+```
+
 ## Principles
 
 **Keep the toolkit generic.** Anything specific to one organization, repository,
