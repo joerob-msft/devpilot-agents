@@ -1,3 +1,4 @@
+import { basename, dirname, normalize } from "node:path";
 import {
   boundedText,
   eventKey,
@@ -11,12 +12,14 @@ import {
   type InstanceState,
   type InstanceStatus,
   type SourceDiagnostic,
+  type ViewFilter,
 } from "./domain.js";
 
 export const TIMELINE_LIMIT = 500;
 export const DIAGNOSTIC_LIMIT = 20;
 export const CYCLE_LIMIT = 20;
 export const STALE_AFTER_MS = 20_000;
+export const FORGOTTEN_HISTORY_LIMIT = 500;
 
 const STATUS_ORDER: Record<InstanceStatus, number> = {
   failed: 0,
@@ -44,7 +47,20 @@ function isResolvedCompletion(result: string): boolean {
   );
 }
 
-function newState(event: AgentEvent): InstanceState {
+export function sessionNamespaceFromSource(source: string, agent: AgentRole): string {
+  if (!source) return "dashboard";
+  const normalized = normalize(source).replaceAll("\\", "/").replace(/\.jsonl(?:\.\d+)?$/i, ".jsonl");
+  const marker = `/logs/events/${agent}/`;
+  const markerIndex = normalized.toLowerCase().lastIndexOf(marker);
+  const namespacePath = markerIndex >= 0 ? normalized.slice(0, markerIndex) : dirname(normalized);
+  const namespaceLeaf = basename(namespacePath) || "root";
+  const normalizedLeaf = namespaceLeaf.toLowerCase().replace(/[\s_-]+/g, "");
+  const roleContainer = normalizedLeaf === "reviewer" || normalizedLeaf === "reviewhandler";
+  const namespace = roleContainer ? basename(dirname(namespacePath)) || namespaceLeaf : namespaceLeaf;
+  return boundedText(namespace, 48) || "root";
+}
+
+function newState(event: AgentEvent, source: string): InstanceState {
   return {
     key: eventKey(event),
     agent: event.agent,
@@ -93,6 +109,7 @@ function newState(event: AgentEvent): InstanceState {
     cycles: [],
     sourceDiagnostics: [],
     sources: [],
+    sessionNamespace: sessionNamespaceFromSource(source, event.agent),
   };
 }
 
@@ -127,6 +144,10 @@ function calculateStatus(state: InstanceState, now: number): InstanceStatus {
   return "running";
 }
 
+function isHistorical(state: InstanceState): boolean {
+  return state.lifecycle === "stopped" || state.status === "completed";
+}
+
 export function liveElapsedMilliseconds(state: InstanceState, now = Date.now()): number {
   if (!state.phaseTimestampMs) return state.phaseElapsedMilliseconds;
   if (state.status === "running" || state.status === "stale") {
@@ -146,10 +167,11 @@ export class OperationsReducer {
   private readonly sourceKeys = new Map<string, Set<string>>();
   private readonly pendingSourceDiagnostics = new Map<string, SourceDiagnostic[]>();
   private readonly diagnostics: SourceDiagnostic[] = [];
+  private readonly forgottenHistory = new Set<string>();
 
   apply(event: AgentEvent, source = ""): boolean {
     const key = eventKey(event);
-    const state = this.states.get(key) ?? newState(event);
+    const state = this.states.get(key) ?? newState(event, source);
     if (event.sequence <= state.lastSequence) {
       state.duplicateCount++;
       this.states.set(key, state);
@@ -177,6 +199,9 @@ export class OperationsReducer {
       state.timeline = addBounded(state.timeline, event, TIMELINE_LIMIT);
     }
     if (source && !state.sources.includes(source)) state.sources = addBounded(state.sources, source, 10);
+    if (source && state.sessionNamespace === "dashboard") {
+      state.sessionNamespace = sessionNamespaceFromSource(source, event.agent);
+    }
     if (source) {
       const keys = this.sourceKeys.get(source) ?? new Set<string>();
       keys.add(key);
@@ -190,6 +215,7 @@ export class OperationsReducer {
 
     this.reduceEvent(state, event);
     state.status = calculateStatus(state, event.timestampMs);
+    if (!isHistorical(state)) this.forgottenHistory.delete(key);
     this.states.set(key, state);
     return true;
   }
@@ -407,11 +433,36 @@ export class OperationsReducer {
     );
   }
 
-  list(now = Date.now(), role?: AgentRole): InstanceState[] {
-    const items = [...this.states.values()].filter((state) => !role || state.agent === role);
-    for (const state of items) state.status = calculateStatus(state, now);
+  list(now = Date.now(), role?: AgentRole, view?: ViewFilter): InstanceState[] {
+    const visible = [...this.states.values()].filter((state) => {
+      state.status = calculateStatus(state, now);
+      if (role && state.agent !== role) return false;
+      return !isHistorical(state) || !this.forgottenHistory.has(state.key);
+    });
+    const newestRetainedByNamespace = new Map<string, string>();
+    for (const state of visible) {
+      if (!isHistorical(state)) continue;
+      const group = `${state.agent}\0${state.sessionNamespace}`;
+      const newestKey = newestRetainedByNamespace.get(group);
+      const newest = newestKey ? this.states.get(newestKey) : undefined;
+      if (!newest || state.lastEventMs > newest.lastEventMs ||
+          (state.lastEventMs === newest.lastEventMs && state.key.localeCompare(newest.key) < 0)) {
+        newestRetainedByNamespace.set(group, state.key);
+      }
+    }
+    const items = visible.filter((state) => {
+      if (view === "live") return !isHistorical(state);
+      if (view === "history") return isHistorical(state);
+      if (view === "current") {
+        return !isHistorical(state) ||
+          newestRetainedByNamespace.get(`${state.agent}\0${state.sessionNamespace}`) === state.key;
+      }
+      return true;
+    });
     return items.sort(
       (a, b) =>
+        a.agent.localeCompare(b.agent) ||
+        a.sessionNamespace.localeCompare(b.sessionNamespace) ||
         statusOrder(a) - statusOrder(b) ||
         b.lastEventMs - a.lastEventMs ||
         a.key.localeCompare(b.key),
@@ -424,7 +475,7 @@ export class OperationsReducer {
     return state;
   }
 
-  counts(now = Date.now()): Record<InstanceStatus, number> {
+  counts(now = Date.now(), role?: AgentRole, view?: ViewFilter): Record<InstanceStatus, number> {
     const result: Record<InstanceStatus, number> = {
       failed: 0,
       blocked: 0,
@@ -433,8 +484,37 @@ export class OperationsReducer {
       waiting: 0,
       completed: 0,
     };
-    for (const state of this.list(now)) result[state.status]++;
+    for (const state of this.list(now, role, view)) result[state.status]++;
     return result;
+  }
+
+  forgetHistorical(key: string): boolean {
+    const state = this.states.get(key);
+    if (!state) return false;
+    state.status = calculateStatus(state, Date.now());
+    if (!isHistorical(state)) return false;
+    if (!this.forgottenHistory.has(key) && this.forgottenHistory.size >= FORGOTTEN_HISTORY_LIMIT) {
+      const oldest = this.forgottenHistory.values().next().value;
+      if (oldest) this.forgottenHistory.delete(oldest);
+    }
+    this.forgottenHistory.add(key);
+    return true;
+  }
+
+  forgetAllHistorical(limit = FORGOTTEN_HISTORY_LIMIT): number {
+    const boundedLimit = Math.min(FORGOTTEN_HISTORY_LIMIT, Math.max(0, Math.floor(limit)));
+    const historical = [...this.states.values()]
+      .filter((state) => {
+        state.status = calculateStatus(state, Date.now());
+        return isHistorical(state) && !this.forgottenHistory.has(state.key);
+      })
+      .sort((a, b) => a.lastEventMs - b.lastEventMs)
+      .slice(0, boundedLimit);
+    let forgotten = 0;
+    for (const state of historical) {
+      if (!this.forgottenHistory.has(state.key) && this.forgetHistorical(state.key)) forgotten++;
+    }
+    return forgotten;
   }
 
   globalDiagnostics(): SourceDiagnostic[] {

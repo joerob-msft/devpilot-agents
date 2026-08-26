@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { testRender } from "@opentui/solid";
 import type { TestRendererSetup } from "@opentui/core/testing";
-import { App, BRAND_PLANE, completionResultColor, safeHttpUrl } from "../src/app.js";
+import { App, BRAND_PLANE, HELP_LEGEND, completionResultColor, safeHttpUrl } from "../src/app.js";
 import { parseAgentEvent } from "../src/domain.js";
 import { OperationsReducer } from "../src/reducer.js";
 import { EventTailer } from "../src/tailer.js";
@@ -92,6 +92,11 @@ function createFixture(prUrl = "https://github.com/joerob-msft/devpilot-agents/p
       elapsedMilliseconds: 7_500,
     },
   }));
+  reducer.apply(parseAgentEvent({
+    ...base,
+    sequence: 8,
+    eventType: "agent.stopped",
+  }));
   const tailer = new EventTailer({
     stateDirectories: [],
     eventLogPaths: [],
@@ -134,6 +139,14 @@ test("brand plane rows share one centered monospace geometry", () => {
   assert.equal(BRAND_PLANE[0].length, BRAND_PLANE[1].length);
   assert.equal(BRAND_PLANE[0].indexOf("|"), BRAND_PLANE[1].indexOf("_"));
   assert.equal(BRAND_PLANE[0].indexOf("|"), Math.floor(BRAND_PLANE[0].length / 2));
+});
+
+test("help legend spells out view meaning and local-only forget behavior", () => {
+  assert.deepEqual(HELP_LEGEND, [
+    "Live = active work; Current session = Live plus newest retained per group.",
+    "History = stopped/completed retained runs; Stale = heartbeat overdue.",
+    "Forget never deletes agent state or event logs; unavailable actions report status.",
+  ]);
 });
 
 test("brand plane renders on one center column", async (context) => {
@@ -193,7 +206,9 @@ test("renderer geometry and narrative remain readable at 140, 100, and 70 column
     const wide = wideSetup.captureCharFrame();
     const wideLines = wide.split("\n");
     assert.match(wide, /DEVPILOT OPERATIONS/);
-    assert.match(wide, /Live \/ blocked/);
+    assert.match(wide, /REVIEWER \/ dashboard/);
+    assert.match(wide, /History \/ partially/);
+    assert.match(wide, /Ended 12:00:00Z/);
     assert.match(wide, /CURRENT PHASE/);
     assert.match(wide, /MODEL ACTIVITY/);
     assert.match(wide, /CANDIDATE STORY/);
@@ -212,7 +227,7 @@ test("renderer geometry and narrative remain readable at 140, 100, and 70 column
     const standardSetup = await renderAt(context, setups, 100, 30);
     assert.ok(standardSetup);
     const standard = standardSetup.captureCharFrame();
-    assert.match(standard, /ALL \| STANDARD \| FOCUS RAIL/);
+    assert.match(standard, /CURRENT SESSION \| ALL \| FOCUS RAIL/);
     assert.match(standard, /CURRENT PHASE/);
     assert.match(standard, /CURRENT-RUN TIMELINE/);
     assert.doesNotMatch(standard, /TIMELINEe/);
@@ -220,10 +235,10 @@ test("renderer geometry and narrative remain readable at 140, 100, and 70 column
     const compactSetup = await renderAt(context, setups, 70, 24);
     assert.ok(compactSetup);
     const compact = compactSetup.captureCharFrame();
-    assert.match(compact, /ALL \| COMPACT \| FOCUS RAIL/);
+    assert.match(compact, /CURRENT \| ALL \| FOCUS RAIL/);
     assert.match(compact, /INSTANCES 1/);
-    assert.match(compact, /Live 1  Completed 0  Stale 0/);
-    assert.match(compact, /Enter detail/);
+    assert.match(compact, /Current session 1 \| L 0 H 1 S 0/);
+    assert.match(compact, /Enter/);
   } finally {
     for (const setup of setups.reverse()) setup.renderer.destroy();
   }
@@ -260,6 +275,20 @@ test("native keyboard controls provide contextual effects and feedback in every 
     assert.match(wide.captureCharFrame(), /STATUS: Live narrative is already focused/);
     wide.mockInput.pressEscape();
     await wide.flush();
+    wide.mockInput.pressKey("f");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /HISTORY \| ALL \| WIDE \| FOCUS RAIL/);
+    assert.match(wide.captureCharFrame(), /STATUS: View filter changed to History/);
+    wide.mockInput.pressKey("f");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /LIVE \| ALL \| WIDE \| FOCUS RAIL/);
+    assert.match(wide.captureCharFrame(), /INSTANCES 0/);
+    wide.mockInput.pressKey("x");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /STATUS: No historical instance is selected/);
+    wide.mockInput.pressKey("f", { shift: true });
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /HISTORY \| ALL \| WIDE \| FOCUS RAIL/);
 
     const standard = await renderAt(context, setups, 100, 30);
     assert.ok(standard);
@@ -270,6 +299,15 @@ test("native keyboard controls provide contextual effects and feedback in every 
     standard.mockInput.pressEscape();
     await standard.flush();
     assert.match(standard.captureCharFrame(), /FOCUS DETAIL/);
+    standard.mockInput.pressKey("?");
+    await standard.flush();
+    assert.match(standard.captureCharFrame(), /STATUS: Help opened/);
+    standard.mockInput.pressEscape();
+    await standard.flush();
+    standard.mockInput.pressKey("x", { shift: true });
+    await standard.flush();
+    assert.match(standard.captureCharFrame(), /STATUS: 1 historical row\(s\) forgotten for this dashboard process/);
+    assert.match(standard.captureCharFrame(), /INSTANCES 0/);
 
     const compact = await renderAt(context, setups, 70, 24);
     assert.ok(compact);
@@ -287,6 +325,13 @@ test("native keyboard controls provide contextual effects and feedback in every 
     compact.mockInput.pressEscape();
     await compact.flush();
     assert.match(compact.captureCharFrame(), /STATUS: Instance rail is already focused/);
+    compact.mockInput.pressKey("f");
+    await compact.flush();
+    assert.match(compact.captureCharFrame(), /HISTORY \| ALL \| FOCUS RAIL/);
+    compact.mockInput.pressKey("x");
+    await compact.flush();
+    assert.match(compact.captureCharFrame(), /STATUS: Historical row forgotten for this dashboard process/);
+    assert.match(compact.captureCharFrame(), /INSTANCES 0/);
 
     const missingUrl = await renderAt(context, setups, 70, 24, undefined, "");
     assert.ok(missingUrl);

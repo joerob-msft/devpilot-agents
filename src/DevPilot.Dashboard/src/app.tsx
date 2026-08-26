@@ -14,10 +14,15 @@ import {
   statusColor,
 } from "./format.js";
 import { liveElapsedMilliseconds, OperationsReducer, totalElapsedMilliseconds } from "./reducer.js";
-import type { AgentRole, BlockedWarning, Completion, InstanceState } from "./domain.js";
+import type { AgentRole, BlockedWarning, Completion, InstanceState, ViewFilter } from "./domain.js";
 import type { EventTailer } from "./tailer.js";
 
 export const BRAND_PLANE = ["       __|__       ", "--o--o--(_)--o--o--"] as const;
+export const HELP_LEGEND = [
+  "Live = active work; Current session = Live plus newest retained per group.",
+  "History = stopped/completed retained runs; Stale = heartbeat overdue.",
+  "Forget never deletes agent state or event logs; unavailable actions report status.",
+] as const;
 
 const COLORS = {
   bg: "#08090a",
@@ -140,9 +145,18 @@ function Empty() {
 }
 
 function streamLabel(instance: InstanceState): string {
+  if (instance.lifecycle === "stopped" || instance.status === "completed") return "History";
   if (instance.status === "stale") return "Stale";
-  if (instance.lifecycle === "stopped" || instance.status === "completed") return "Completed";
   return "Live";
+}
+
+function isHistoricalInstance(instance: InstanceState | undefined): boolean {
+  return Boolean(instance && (instance.lifecycle === "stopped" || instance.status === "completed"));
+}
+
+function viewLabel(view: ViewFilter): string {
+  if (view === "current") return "Current session";
+  return view[0]?.toUpperCase() + view.slice(1);
 }
 
 function Rail(props: {
@@ -163,29 +177,43 @@ function Rail(props: {
           <For each={props.instances}>
             {(instance, index) => {
               const selected = () => index() === props.selected;
+              const startsGroup = () => {
+                const previous = props.instances[index() - 1];
+                return !previous ||
+                  previous.agent !== instance.agent ||
+                  previous.sessionNamespace !== instance.sessionNamespace;
+              };
+              const historical = () => isHistoricalInstance(instance);
               return (
-                <box
-                  height={6}
-                  backgroundColor={selected() ? COLORS.panelAlt : COLORS.panel}
-                  paddingX={1}
-                  border={selected() ? ["left"] : false}
-                  borderColor={statusColor(instance.status)}
-                  flexDirection="column"
-                >
-                  <text height={1} fg={statusColor(instance.status)}>
-                    {selected() ? "> " : "  "}{streamLabel(instance)} / {instance.status}
-                  </text>
-                  <text height={1} fg={COLORS.text}>
-                    {roleLabel(instance.agent)} {shortId(instance.instanceId)}
-                  </text>
-                  <text height={1} fg={COLORS.muted}>{line(instance.repository || "repository unknown", 26)}</text>
-                  <text height={1} fg={COLORS.text}>
-                    {instance.pullRequestId ? `PR #${instance.pullRequestId} ${line(instance.pullRequestTitle, 15)}` : `cycle ${instance.cycleNumber || "-"}`}
-                  </text>
-                  <text height={1} fg={COLORS.muted}>
-                    {new Date(instance.lastEventMs).toISOString().slice(11, 19)}Z | {age(instance.lastEventMs, props.now)}
-                  </text>
-                </box>
+                <>
+                  <Show when={startsGroup()}>
+                    <text height={1} fg={COLORS.accent}>
+                      {roleLabel(instance.agent)} / {line(instance.sessionNamespace, 18)}
+                    </text>
+                  </Show>
+                  <box
+                    height={6}
+                    backgroundColor={selected() ? COLORS.panelAlt : COLORS.panel}
+                    paddingX={1}
+                    border={selected() ? ["left"] : false}
+                    borderColor={statusColor(instance.status)}
+                    flexDirection="column"
+                  >
+                    <text height={1} fg={statusColor(instance.status)}>
+                      {selected() ? "> " : "  "}{streamLabel(instance)} / {historical() ? instance.completion?.result || instance.status : instance.status}
+                    </text>
+                    <text height={1} fg={COLORS.text}>
+                      {shortId(instance.instanceId)} {historical() ? `| ${instance.completion?.result || instance.status}` : `| PID ${instance.processId}`}
+                    </text>
+                    <text height={1} fg={COLORS.muted}>{line(instance.repository || "repository unknown", 26)}</text>
+                    <text height={1} fg={COLORS.text}>
+                      {instance.pullRequestId ? `PR #${instance.pullRequestId} ${line(instance.pullRequestTitle, 15)}` : `cycle ${instance.cycleNumber || "-"}`}
+                    </text>
+                    <text height={1} fg={COLORS.muted}>
+                      {historical() ? "Ended " : "Event "}{new Date(instance.completion?.timestampMs ?? instance.lastEventMs).toISOString().slice(11, 19)}Z | {age(instance.completion?.timestampMs ?? instance.lastEventMs, props.now)}
+                    </text>
+                  </box>
+                </>
               );
             }}
           </For>
@@ -424,6 +452,7 @@ export function App(props: AppProps) {
   const [focus, setFocus] = createSignal<PaneFocus>("rail");
   const [overlay, setOverlay] = createSignal<Overlay>("none");
   const [role, setRole] = createSignal<RoleFilter>("all");
+  const [view, setView] = createSignal<ViewFilter>("current");
   const [eventWarningsOnly, setEventWarningsOnly] = createSignal(false);
   const [paletteIndex, setPaletteIndex] = createSignal(0);
   const [feedback, setFeedback] = createSignal("Observer is read-only");
@@ -447,7 +476,7 @@ export function App(props: AppProps) {
   const instances = createMemo(() => {
     revision();
     const selectedRole = role();
-    return props.reducer.list(now(), selectedRole === "all" ? undefined : selectedRole);
+    return props.reducer.list(now(), selectedRole === "all" ? undefined : selectedRole, view());
   });
   const current = createMemo(() => instances()[Math.min(selected(), Math.max(0, instances().length - 1))]);
   const layout = createMemo(() => decideLayout(dimensions().width, detailOpen(), inspectorOpen()));
@@ -514,12 +543,43 @@ export function App(props: AppProps) {
       notify("PR URL is missing or unsupported");
       return;
     }
+
     try {
       await (props.openUrl ?? defaultOpenUrl)(url);
       notify("Opened validated PR URL");
     } catch (error) {
       notify(`Could not open PR URL: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  function cycleView(direction = 1): void {
+    const values: ViewFilter[] = ["live", "current", "history"];
+    const next = values[(values.indexOf(view()) + direction + values.length) % values.length] ?? "current";
+    setView(next);
+    setSelected(0);
+    setFocus("rail");
+    if (layout().mode === "compact") setDetailOpen(false);
+    notify(`View filter changed to ${viewLabel(next)}`);
+  }
+
+  function forgetCurrentHistory(): void {
+    const instance = current();
+    if (!instance || !props.reducer.forgetHistorical(instance.key)) {
+      notify(instance ? "Selected instance is not historical" : "No historical instance is selected");
+      return;
+    }
+    setRevision((value) => value + 1);
+    notify("Historical row forgotten for this dashboard process");
+  }
+
+  function forgetAllHistory(): void {
+    const forgotten = props.reducer.forgetAllHistorical();
+    if (!forgotten) {
+      notify("No visible historical rows are available to forget");
+      return;
+    }
+    setRevision((value) => value + 1);
+    notify(`${forgotten} historical row(s) forgotten for this dashboard process`);
   }
 
   const warningAvailable = createMemo(() =>
@@ -560,6 +620,18 @@ export function App(props: AppProps) {
       enabled: safeHttpUrl(current()?.pullRequestUrl ?? "") !== null,
       unavailable: "PR URL is missing or unsupported",
       run: () => void openCurrentUrl(),
+    },
+    {
+      label: "Forget selected historical row (view only)",
+      enabled: isHistoricalInstance(current()),
+      unavailable: current() ? "Selected instance is not historical" : "No historical instance is selected",
+      run: forgetCurrentHistory,
+    },
+    {
+      label: "Forget all historical rows (view only)",
+      enabled: props.reducer.list(now(), undefined, "history").length > 0,
+      unavailable: "No visible historical rows are available to forget",
+      run: forgetAllHistory,
     },
     {
       label: "Show keyboard help",
@@ -660,6 +732,11 @@ export function App(props: AppProps) {
       notify("Raw events overlay opened");
     } else if (key.name === "w") void nextWarning();
     else if (key.name === "o") void openCurrentUrl();
+    else if (key.name === "f") cycleView(key.shift ? -1 : 1);
+    else if (key.name === "x") {
+      if (key.shift) forgetAllHistory();
+      else forgetCurrentHistory();
+    }
     else if (key.name === "?") {
       setOverlay("help");
       notify("Help opened");
@@ -684,19 +761,30 @@ export function App(props: AppProps) {
   });
   const footer = createMemo(() => {
     const live = instances().filter((item) => streamLabel(item) === "Live").length;
-    const completed = instances().filter((item) => streamLabel(item) === "Completed").length;
+    const history = instances().filter((item) => streamLabel(item) === "History").length;
     const stale = instances().filter((item) => streamLabel(item) === "Stale").length;
-    const summary = `Live ${live}  Completed ${completed}  Stale ${stale}`;
-    if (dimensions().width >= 120) return { summary, hint: "←/→ pane | ↑/↓ select | Enter drill | Esc back | i/e | o link | Tab role | Ctrl+P | ? | q" };
-    if (dimensions().width >= 80) return { summary, hint: "←/→ pane | Enter/Esc | i/e | o | Tab | ? | q" };
-    return { summary, hint: layout().showDetail ? "Esc back | i/e | o | ? | q" : "↑/↓ select | Enter detail | Tab | ? | q" };
+    const summary = dimensions().width < 80
+      ? `${viewLabel(view())} ${instances().length} | L ${live} H ${history} S ${stale}`
+      : `${viewLabel(view())} ${instances().length} | Live ${live} History ${history} Stale ${stale}`;
+    if (dimensions().width >= 120) return { summary, hint: "←/→ pane | ↑/↓ select | f view | Tab role | x/X forget | Enter/Esc | i/e/o/w | Ctrl+P | ? | q" };
+    if (dimensions().width >= 80) return { summary, hint: "f view | Tab role | x/X forget | Enter/Esc | i/e/o | ? | q" };
+    return { summary, hint: layout().showDetail ? "Esc | f view | x forget | i/e/o | ? | q" : "↑/↓ | Enter | f view | Tab | x/X | ? | q" };
+  });
+  const headerContext = createMemo(() => {
+    if (dimensions().width >= 120) {
+      return `${viewLabel(view()).toUpperCase()} | ${role().toUpperCase()} | ${layout().mode.toUpperCase()} | FOCUS ${activeFocus().toUpperCase()}`;
+    }
+    if (dimensions().width >= 80) {
+      return `${viewLabel(view()).toUpperCase()} | ${role().toUpperCase()} | FOCUS ${activeFocus().toUpperCase()}`;
+    }
+    return `${view().toUpperCase()} | ${role().toUpperCase()} | FOCUS ${activeFocus().toUpperCase()}`;
   });
 
   return (
     <box width="100%" height="100%" flexDirection="column" backgroundColor={COLORS.bg}>
       <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
         <text height={1} fg={COLORS.brand}>DEVPILOT OPERATIONS</text>
-        <text height={1} fg={COLORS.muted}>OBSERVE ONLY | {role().toUpperCase()} | {layout().mode.toUpperCase()} | FOCUS {activeFocus().toUpperCase()}</text>
+        <text height={1} fg={COLORS.muted}>OBSERVE ONLY | {headerContext()}</text>
       </box>
       <box flexGrow={1} flexDirection="row" gap={1} padding={1} overflow="hidden">
         <Show when={layout().showRail}>
@@ -743,7 +831,7 @@ export function App(props: AppProps) {
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "palette"}>
-        <OverlayPanel title="CONTEXT COMMANDS - READ ONLY" width={64} height={16}>
+        <OverlayPanel title="CONTEXT COMMANDS - VIEW ONLY" width={64} height={19}>
           <For each={palette()}>
             {(command, index) => (
               <text height={1} fg={!command.enabled ? COLORS.muted : index() === paletteIndex() ? COLORS.accent : COLORS.text}>
@@ -755,12 +843,14 @@ export function App(props: AppProps) {
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "help"}>
-        <OverlayPanel title="HELP - OBSERVE MODE" width={74} height={21}>
+        <OverlayPanel title="HELP - OBSERVE MODE" width={78} height={24}>
           <text height={1} fg={COLORS.text}>Left / Right      Focus visible pane</text>
           <text height={1} fg={COLORS.text}>Up/Down or j/k    Select instance when rail is focused</text>
           <text height={1} fg={COLORS.text}>Enter              Drill rail → narrative → timeline</text>
           <text height={1} fg={COLORS.text}>Esc / b            Back timeline/inspector → detail → rail</text>
           <text height={1} fg={COLORS.text}>Tab / Shift+Tab    Cycle role filter</text>
+          <text height={1} fg={COLORS.text}>f / Shift+f        Cycle Live, Current session, History view</text>
+          <text height={1} fg={COLORS.text}>x / Shift+x        Forget selected/all history in this view only</text>
           <text height={1} fg={COLORS.text}>i                  Open/close inspector</text>
           <text height={1} fg={COLORS.text}>e                  Raw events; arrows change filter</text>
           <text height={1} fg={COLORS.text}>w                  Next attention item</text>
@@ -768,7 +858,9 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
           <text height={1} fg={COLORS.text}>?                  Help</text>
           <text height={1} fg={COLORS.text}>q                  Quit</text>
-          <text height={1} fg={COLORS.warning}>Unavailable actions report status; no process writes exist.</text>
+          <text height={1} fg={COLORS.muted}>{HELP_LEGEND[0]}</text>
+          <text height={1} fg={COLORS.muted}>{HELP_LEGEND[1]}</text>
+          <text height={1} fg={COLORS.warning}>{HELP_LEGEND[2]}</text>
         </OverlayPanel>
       </Show>
     </box>

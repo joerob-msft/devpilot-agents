@@ -241,50 +241,61 @@ events are diagnostic only and cannot change agent selection or delivery.
 over the reviewer and review-handler event streams. It observes existing agent
 processes; it cannot start, stop, retry, promote, or otherwise control them.
 
-For the simplest reviewer workflow, launch one isolated, preview-only review
-and watch it in the current terminal:
+For the simplest workflow, launch preview-only agents and watch them together
+in the current terminal:
 
 ```powershell
-# From a consumer repository with the conventional config path:
-<toolkit-root>/tools/Watch-DevPilotReviewer.ps1 -PullRequestId 12345
+# Both agents, one cycle each:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both
 
-# Or pass a config explicitly:
-./tools/Watch-DevPilotReviewer.ps1 `
-    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
-    -PullRequestId 12345
+# Both agents, continuous 15-minute cadence:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
+
+# One agent:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Reviewer -Continuous
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent ReviewHandler -Continuous
 ```
 
-The watcher starts the reviewer in a separate process with `-Once`,
-`-OutputMode Json`, and no write or notification switches. The TUI is scoped
-to the generated state directory, so the new live run is not mixed with older
-history. In the default one-cycle mode, closing the dashboard does not
-terminate a review that is still running. Reattach later with the state path
-printed by the watcher:
+The shared launcher resolves the conventional
+`.github\copilot\agents\reviewer.config.json` and
+`.github\copilot\agents\review-handler.config.json` paths from the current
+consumer repository. It starts each selected agent in a separate process with
+`-OutputMode Json` and no mutating or notification switches. The agents share
+one generated session root, so one dashboard can group their live and retained
+instances.
+
+Compatibility wrappers provide the shorter single-agent names:
 
 ```powershell
-./tools/Watch-DevPilotReviewer.ps1 -AttachOnly -StateDir <printed-state-path>
+.\tools\Watch-DevPilotReviewer.ps1 -Continuous
+.\tools\Watch-DevPilotReviewHandler.ps1 -Continuous
 ```
 
-To run the same read-only workflow continuously from one command, omit
-`-PullRequestId` and use `-Continuous`:
+In the default one-cycle mode, closing the dashboard does not terminate an
+agent that is still running. Reattach later with the state path printed by the
+launcher:
 
 ```powershell
-# Test cadence:
-./tools/Watch-DevPilotReviewer.ps1 -Continuous -IntervalSeconds 60
-
-# Normal 15-minute cadence:
-./tools/Watch-DevPilotReviewer.ps1 -Continuous
+.\tools\Watch-DevPilotAgents.ps1 -AttachOnly -StateDir <printed-state-path>
 ```
 
-The continuous reviewer remains preview-only. It scans until the dashboard
-exits, then the watcher stops the reviewer process tree so no hidden background
-agent is left running. `-PullRequestId` is intentionally incompatible with
-`-Continuous` to prevent repeatedly reviewing one pull request.
+For a short continuous test cadence:
+
+```powershell
+.\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous -IntervalSeconds 60
+```
+
+Continuous agents remain preview-only. They scan until the dashboard exits,
+then the launcher stops every process tree it owns so no hidden background
+agent is left running. Fixed pull request IDs are intentionally incompatible
+with `-Continuous` to prevent repeatedly processing one pull request. Use the
+ordinary agent entry points, not the watch launchers, for code changes,
+publishing, votes, requeues, auto-complete, or notifications.
 
 Install and build its locked dependencies once:
 
 ```powershell
-Set-Location ./src/DevPilot.Dashboard
+Set-Location .\src\DevPilot.Dashboard
 $env:npm_config_cache = "$PWD/.npm-cache"
 npm install
 npm run build
@@ -296,7 +307,7 @@ Set-Location ../..
 Then point the dashboard at one or more agent state roots:
 
 ```powershell
-./tools/Start-DevPilotDashboard.ps1 `
+.\tools\Start-DevPilotDashboard.ps1 `
     -StateDir "$env:LOCALAPPDATA/<state-namespace>"
 ```
 

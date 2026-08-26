@@ -314,34 +314,58 @@ Describe 'Shared reviewer and review-handler event contract' {
         $source | Should -Match 'prUrl\s*=\s*Get-ReviewerPullRequestLink\s+-PrId'
     }
 
-    It 'provides a preview-only one-command reviewer watcher and attach mode' {
-        $path = Join-Path "$PSScriptRoot\..\tools" 'Watch-DevPilotReviewer.ps1'
+    It 'provides preview-only shared watcher launchers and attach mode' {
+        $toolsRoot = Join-Path "$PSScriptRoot\.." 'tools'
+        $path = Join-Path $toolsRoot 'Watch-DevPilotAgents.ps1'
         $tokens = $null
         $errors = $null
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             (Resolve-Path $path), [ref]$tokens, [ref]$errors)
         $errors | Should -BeNullOrEmpty
-        @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) |
-            Should -Contain 'AttachOnly'
-        @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) |
-            Should -Contain 'Continuous'
-        @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) |
-            Should -Contain 'IntervalSeconds'
+        $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+        foreach ($parameterName in @(
+            'Agent', 'AttachOnly', 'Continuous', 'IntervalSeconds',
+            'ReviewerConfigFile', 'ReviewHandlerConfigFile',
+            'ReviewerPullRequestId', 'ReviewHandlerPullRequestId'
+        )) {
+            $parameterNames | Should -Contain $parameterName
+        }
         $source = Get-Content -LiteralPath $path -Raw
         $source | Should -Match "OutputMode = 'Json'"
         $source | Should -Match 'Once = \$true'
         $source | Should -Match 'IntervalSeconds = \$IntervalSeconds'
-        $source | Should -Match '\$Continuous\s+-and\s+\$PullRequestId\s+-gt\s+0'
+        $source | Should -Match "\[ValidateSet\('Reviewer', 'ReviewHandler', 'Both'\)\]"
+        $source | Should -Match '\$Continuous\s+-and\s+\(\$ReviewerPullRequestId\s+-gt\s+0\s+-or\s+\$ReviewHandlerPullRequestId\s+-gt\s+0\)'
         $source | Should -Not -Match 'EnableFindingComments\s*='
         $source | Should -Not -Match 'EnableThreadReplies\s*='
         $source | Should -Not -Match 'EnableSummaryComment\s*='
         $source | Should -Not -Match 'EnableApprovalVote\s*='
         $source | Should -Not -Match 'EnableTeamsNotifications\s*='
+        $source | Should -Not -Match 'EnableCodeChanges\s*='
+        $source | Should -Not -Match 'EnablePush\s*='
+        $source | Should -Not -Match 'EnableAutoComplete\s*='
+        $source | Should -Not -Match 'EnableBuddyRequeue\s*='
         $source.IndexOf('& $dashboardLauncher -StateDir $StateDir -ValidateOnly') |
-            Should -BeLessThan $source.IndexOf('$reviewerProcess = Start-Process')
+            Should -BeLessThan $source.IndexOf('$process = Start-Process')
         $source | Should -Match '\$dashboardCompletedNormally\s*=\s*\$false'
-        $source | Should -Match '\$reviewerProcess\.Kill\(\$true\)'
-        $source | Should -Match '\(-not \$dashboardCompletedNormally -or \$Continuous\)'
+        $source | Should -Match '\$Process\.Kill\(\$true\)'
+        $source | Should -Match 'if \(-not \$dashboardCompletedNormally -or \$Continuous\)'
+
+        foreach ($wrapper in @(
+            @{ File = 'Watch-DevPilotReviewer.ps1'; Agent = 'Reviewer'; Config = 'ReviewerConfigFile' }
+            @{ File = 'Watch-DevPilotReviewHandler.ps1'; Agent = 'ReviewHandler'; Config = 'ReviewHandlerConfigFile' }
+        )) {
+            $wrapperPath = Join-Path $toolsRoot $wrapper.File
+            $wrapperTokens = $null
+            $wrapperErrors = $null
+            $wrapperAst = [System.Management.Automation.Language.Parser]::ParseFile(
+                (Resolve-Path $wrapperPath), [ref]$wrapperTokens, [ref]$wrapperErrors)
+            $wrapperErrors | Should -BeNullOrEmpty
+            $wrapperSource = Get-Content -LiteralPath $wrapperPath -Raw
+            $wrapperSource | Should -Match ("Agent\s*=\s*'{0}'" -f $wrapper.Agent)
+            $wrapperSource | Should -Match $wrapper.Config
+            $wrapperSource | Should -Match 'Watch-DevPilotAgents\.ps1'
+        }
     }
 
     It 'prefers the co-located harness over a stale loaded module' -ForEach @(

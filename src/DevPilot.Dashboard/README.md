@@ -56,6 +56,8 @@ polled until they appear.
 | `Enter` | Drill from rail to narrative to current-run timeline |
 | `Esc` / `b` | Dismiss overlay or move back toward the instance rail |
 | `Tab` / `Shift+Tab` | Cycle all, reviewer, and review-handler roles |
+| `f` / `Shift+f` | Cycle Live, Current session, and History views |
+| `x` / `Shift+x` | Forget the selected/all historical rows for this dashboard process |
 | `i` | Open or close the inspector |
 | `e` | Bounded raw-events overlay; Left/Right changes filter |
 | `w` | Next failed, blocked, or diagnostic-bearing instance |
@@ -67,6 +69,27 @@ polled until they appear.
 Unavailable actions produce a brief status message instead of silently doing
 nothing. The focused pane is visible in both the header and pane border.
 
+The default **Current session** view contains every live instance plus only the
+newest retained instance in each agent/session namespace group. This keeps old
+runs out of the default view without hiding the most relevant recent outcome.
+**Live** contains nonterminal derived statuses while lifecycle remains active,
+including active failed, blocked, waiting, or stale agents. A completion event
+followed by `agent.waiting` therefore remains Live. **History** contains
+terminal retained runs whose lifecycle stopped or whose derived status is
+completed.
+Instances are grouped by agent and a deterministic session namespace: for
+normal state roots, the namespace is the directory immediately above
+`logs\events`; shared launcher role containers such as `reviewer` and
+`review-handler` use their parent watch directory; for explicit event files,
+it is the containing directory.
+History rows include their completion timestamp and reported outcome.
+
+Forget is deliberately bounded to 500 hidden keys and affects only in-memory
+dashboard view state. It never removes an instance from the reducer, changes an
+agent process, edits agent state, or deletes/truncates event logs. A forgotten
+row remains hidden until this dashboard process exits (unless that instance
+becomes active again).
+
 ## Architecture
 
 - `domain.ts` validates and bounds the additive event envelope, including PR
@@ -76,7 +99,8 @@ nothing. The focused pane is visible in both the header and pane border.
   buffered until a newline arrives.
 - `reducer.ts` deduplicates by instance sequence, surfaces gaps, derives
   lifecycle and attention state, preserves bounded review completion details,
-  and retains at most 500 non-heartbeat timeline events per instance.
+  retains at most 500 non-heartbeat timeline events per instance, and owns the
+  bounded process-local history visibility state.
 - `layout.ts` is a pure responsive decision function used by the SolidJS UI.
 - `app.tsx` renders focus-aware OpenTUI panes and overlays. At 120 columns it
   shows three panes, at 80-119 it overlays the inspector, and below 80 it uses

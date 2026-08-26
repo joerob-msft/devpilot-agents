@@ -34,6 +34,8 @@ export type InstanceStatus =
   | "completed"
   | "stale";
 
+export type ViewFilter = "live" | "current" | "history";
+
 export interface Completion {
   result: string;
   requested: string[];
@@ -113,6 +115,7 @@ export interface InstanceState {
   cycles: CycleSummary[];
   sourceDiagnostics: SourceDiagnostic[];
   sources: string[];
+  sessionNamespace: string;
 }
 
 const MAX_TEXT = 512;

@@ -8,6 +8,7 @@ import {
   TIMELINE_LIMIT,
   liveElapsedMilliseconds,
   totalElapsedMilliseconds,
+  sessionNamespaceFromSource,
 } from "../src/reducer.js";
 
 const BASE_TIME = Date.parse("2026-08-25T12:00:00.000Z");
@@ -376,4 +377,129 @@ test("source diagnostics remain visible before any valid instance event", () => 
   reducer.addSourceDiagnostic(diagnostic);
   reducer.addSourceDiagnostic(diagnostic);
   assert.deepEqual(reducer.globalDiagnostics(), [diagnostic]);
+});
+
+test("view filters distinguish live, current-session, and retained history", () => {
+  const reducer = new OperationsReducer();
+  const source = String.raw`C:\watch\session-a\logs\events\reviewer\events.jsonl`;
+  reducer.apply(event("live", 1, "agent.started"), source);
+  reducer.apply(event("older-history", 1, "agent.started"), source);
+  reducer.apply(event("older-history", 2, "work.completed", { data: { result: "reviewed" } }), source);
+  reducer.apply(event("older-history", 3, "agent.stopped"), source);
+  reducer.apply(event("newer-history", 1, "agent.started"), source);
+  reducer.apply(event("newer-history", 4, "work.completed", { data: { result: "passed" } }), source);
+  reducer.apply(event("newer-history", 5, "agent.stopped"), source);
+
+  assert.deepEqual(reducer.list(BASE_TIME + 1_000, undefined, "live").map((item) => item.instanceId), ["live"]);
+  assert.deepEqual(
+    reducer.list(BASE_TIME + 1_000, undefined, "current").map((item) => item.instanceId),
+    ["live", "newer-history"],
+  );
+  const history = reducer.list(BASE_TIME + 1_000, undefined, "history");
+  assert.deepEqual(history.map((item) => item.instanceId), ["newer-history", "older-history"]);
+  assert.equal(history[0]?.completion?.result, "passed");
+  assert.equal(history[0]?.completion?.timestampMs, BASE_TIME + 400);
+});
+
+test("continuous completion followed by waiting remains live until the agent stops", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(event("continuous", 1, "agent.started"));
+  reducer.apply(event("continuous", 2, "work.completed", { data: { result: "reviewed" } }));
+  reducer.apply(event("continuous", 3, "agent.waiting", {
+    data: { kind: "cycle", delayMilliseconds: 30_000 },
+  }));
+
+  assert.equal(reducer.get("reviewer:continuous", BASE_TIME + 500)?.status, "waiting");
+  assert.deepEqual(reducer.list(BASE_TIME + 500, undefined, "live").map((item) => item.instanceId), ["continuous"]);
+  assert.equal(reducer.list(BASE_TIME + 500, undefined, "history").length, 0);
+  assert.equal(reducer.forgetHistorical("reviewer:continuous"), false);
+
+  reducer.apply(event("continuous", 4, "agent.stopped"));
+  assert.equal(reducer.list(BASE_TIME + 500, undefined, "live").length, 0);
+  assert.deepEqual(reducer.list(BASE_TIME + 500, undefined, "history").map((item) => item.instanceId), ["continuous"]);
+  assert.equal(reducer.forgetHistorical("reviewer:continuous"), true);
+});
+
+test("active failed, blocked, and stale instances are live rather than history", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(event("failed-active", 1, "agent.started"));
+  reducer.apply(event("failed-active", 2, "cycle.failed", { data: { reason: "transient failure" } }));
+  reducer.apply(event("blocked-active", 1, "agent.started"));
+  reducer.apply(event("blocked-active", 2, "delivery.blocked", {
+    data: { reason: "delivery pending", retryable: true },
+  }));
+  reducer.apply(event("stale-active", 1, "agent.started"));
+
+  const now = BASE_TIME + STALE_AFTER_MS + 500;
+  assert.deepEqual(
+    reducer.list(now, undefined, "live").map((item) => `${item.instanceId}:${item.status}`),
+    ["failed-active:failed", "blocked-active:blocked", "stale-active:stale"],
+  );
+  assert.equal(reducer.list(now, undefined, "history").length, 0);
+  assert.equal(reducer.forgetHistorical("reviewer:failed-active"), false);
+  assert.equal(reducer.forgetHistorical("reviewer:blocked-active"), false);
+  assert.equal(reducer.forgetHistorical("reviewer:stale-active"), false);
+});
+
+test("instances group deterministically by agent and source-derived session namespace", () => {
+  assert.equal(
+    sessionNamespaceFromSource(String.raw`C:\watch\session-42\logs\events\reviewer\events.jsonl.2`, "reviewer"),
+    "session-42",
+  );
+  assert.equal(
+    sessionNamespaceFromSource(String.raw`C:\captures\named-events.jsonl`, "reviewer"),
+    "captures",
+  );
+  assert.equal(
+    sessionNamespaceFromSource(
+      String.raw`C:\watch\watch-20260826\Reviewer\logs\events\reviewer\events.jsonl`,
+      "reviewer",
+    ),
+    "watch-20260826",
+  );
+  assert.equal(
+    sessionNamespaceFromSource(
+      String.raw`C:\watch\watch-20260826\review_handler\logs\events\review-handler\events.jsonl`,
+      "review-handler",
+    ),
+    "watch-20260826",
+  );
+
+  const reducer = new OperationsReducer();
+  reducer.apply(event("z", 1, "agent.started"), String.raw`C:\watch\session-z\logs\events\reviewer\events.jsonl`);
+  reducer.apply(event("a", 1, "agent.started"), String.raw`C:\watch\session-a\logs\events\reviewer\events.jsonl`);
+  assert.deepEqual(
+    reducer.list(BASE_TIME + 500).map((item) => `${item.sessionNamespace}:${item.instanceId}`),
+    ["session-a:a", "session-z:z"],
+  );
+});
+
+test("forget controls hide only bounded historical view state and never active state", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(event("live", 1, "agent.started"));
+  reducer.apply(event("old-1", 1, "agent.started"));
+  reducer.apply(event("old-1", 2, "agent.stopped"));
+  reducer.apply(event("old-2", 1, "agent.started"));
+  reducer.apply(event("old-2", 2, "work.completed", { data: { result: "passed" } }));
+  reducer.apply(event("old-2", 3, "agent.stopped"));
+
+  assert.equal(reducer.forgetHistorical("reviewer:live"), false);
+  assert.equal(reducer.forgetHistorical("reviewer:old-1"), true);
+  assert.deepEqual(reducer.list(BASE_TIME + 500, undefined, "history").map((item) => item.instanceId), ["old-2"]);
+  assert.equal(reducer.get("reviewer:old-1")?.instanceId, "old-1");
+  assert.equal(reducer.forgetAllHistorical(1), 1);
+  assert.equal(reducer.list(BASE_TIME + 500, undefined, "history").length, 0);
+  assert.equal(reducer.list(BASE_TIME + 500, undefined, "live").length, 1);
+});
+
+test("forget all history covers the full documented in-memory bound", () => {
+  const reducer = new OperationsReducer();
+  for (let index = 0; index < 201; index++) {
+    const instanceId = `history-${index}`;
+    reducer.apply(event(instanceId, 1, "agent.started"));
+    reducer.apply(event(instanceId, 2, "agent.stopped"));
+  }
+
+  assert.equal(reducer.forgetAllHistorical(), 201);
+  assert.equal(reducer.list(BASE_TIME + 500, undefined, "history").length, 0);
 });

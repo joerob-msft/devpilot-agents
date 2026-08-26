@@ -2,10 +2,10 @@
 
 <#
 .SYNOPSIS
-    Launches a preview-only reviewer and opens the dashboard on that run.
+    Launches a preview-only review-handler and opens the dashboard on that run.
 
 .DESCRIPTION
-    Compatibility wrapper for Watch-DevPilotAgents.ps1 -Agent Reviewer.
+    Compatibility wrapper for Watch-DevPilotAgents.ps1 -Agent ReviewHandler.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Launch')]
 param(
@@ -41,24 +41,20 @@ param(
     [string]$AgentName,
 
     [Parameter(ParameterSetName = 'Launch')]
-    [string]$Model,
-
-    [Parameter(ParameterSetName = 'Launch')]
-    [switch]$IncludeOwnPullRequests
+    [string]$Model
 )
 
 $parameters = @{}
 if ($AttachOnly) { $parameters.AttachOnly = $true }
-else { $parameters.Agent = 'Reviewer' }
+else { $parameters.Agent = 'ReviewHandler' }
 if ($StateDir) { $parameters.StateDir = $StateDir }
-if ($ConfigFile) { $parameters.ReviewerConfigFile = $ConfigFile }
-if ($PullRequestId -gt 0) { $parameters.ReviewerPullRequestId = $PullRequestId }
+if ($ConfigFile) { $parameters.ReviewHandlerConfigFile = $ConfigFile }
+if ($PullRequestId -gt 0) { $parameters.ReviewHandlerPullRequestId = $PullRequestId }
 if ($Continuous) { $parameters.Continuous = $true }
 if ($PSBoundParameters.ContainsKey('IntervalSeconds')) { $parameters.IntervalSeconds = $IntervalSeconds }
 if ($OperatorAlias) { $parameters.OperatorAlias = $OperatorAlias }
-if ($AgentName) { $parameters.ReviewerAgentName = $AgentName }
-if ($Model) { $parameters.ReviewerModel = $Model }
-if ($IncludeOwnPullRequests) { $parameters.IncludeOwnPullRequests = $true }
+if ($AgentName) { $parameters.ReviewHandlerAgentName = $AgentName }
+if ($Model) { $parameters.ReviewHandlerModel = $Model }
 
 & (Join-Path $PSScriptRoot 'Watch-DevPilotAgents.ps1') @parameters
 exit $LASTEXITCODE
