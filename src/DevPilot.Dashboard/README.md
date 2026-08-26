@@ -51,29 +51,39 @@ polled until they appear.
 
 | Key | Action |
 | --- | --- |
-| Arrow keys / `j` / `k` | Select instance |
-| `Enter` | Open detail |
-| `Esc` / `b` | Dismiss overlay or return to the instance rail |
+| Left / Right | Focus a visible pane |
+| Up / Down / `j` / `k` | Select instance while the rail is focused |
+| `Enter` | Drill from rail to narrative to current-run timeline |
+| `Esc` / `b` | Dismiss overlay or move back toward the instance rail |
 | `Tab` / `Shift+Tab` | Cycle all, reviewer, and review-handler roles |
-| `i` | Inspector |
-| `e` | Bounded events overlay; Left/Right changes filter |
+| `i` | Open or close the inspector |
+| `e` | Bounded raw-events overlay; Left/Right changes filter |
 | `w` | Next failed, blocked, or diagnostic-bearing instance |
-| `Ctrl+P` | Read-only command palette |
+| `o` | Open the selected PR's validated HTTP(S) URL |
+| `Ctrl+P` | Contextual read-only command palette |
 | `?` | Help |
 | `q` | Quit |
 
+Unavailable actions produce a brief status message instead of silently doing
+nothing. The focused pane is visible in both the header and pane border.
+
 ## Architecture
 
-- `domain.ts` validates and bounds the additive event envelope.
+- `domain.ts` validates and bounds the additive event envelope, including PR
+  title, author, URL, and source/target branch context.
 - `tailer.ts` discovers streams and maintains one rotation-safe byte cursor per
   file. Complete malformed lines become bounded diagnostics; partial lines stay
   buffered until a newline arrives.
 - `reducer.ts` deduplicates by instance sequence, surfaces gaps, derives
-  lifecycle and attention state, and retains at most 500 timeline events per
-  instance.
+  lifecycle and attention state, preserves bounded review completion details,
+  and retains at most 500 non-heartbeat timeline events per instance.
 - `layout.ts` is a pure responsive decision function used by the SolidJS UI.
-- `app.tsx` renders OpenTUI panes and overlays. At 120 columns it shows three
-  panes, at 80-119 it overlays the inspector, and below 80 it uses one pane.
+- `app.tsx` renders focus-aware OpenTUI panes and overlays. At 120 columns it
+  shows three panes, at 80-119 it overlays the inspector, and below 80 it uses
+  one pane. The primary hierarchy is current phase, elapsed/model activity,
+  candidate story, completion summary, and the current-run narrative.
 
 The UI displays only bounded summaries. Unknown envelope or `data` fields are
-accepted but are not rendered as unbounded raw content.
+accepted but are not rendered as unbounded raw content. Browser opening is
+fail-closed: only credential-free `http:` and `https:` URLs are passed as a
+process argument to a platform opener, never interpolated into a shell command.

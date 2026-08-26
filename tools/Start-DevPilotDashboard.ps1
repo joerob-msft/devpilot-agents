@@ -5,7 +5,10 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string[]]$EventLogPath = @()
+    [string[]]$EventLogPath = @(),
+
+    [Parameter(DontShow)]
+    [switch]$ValidateOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -147,6 +150,8 @@ if ($newestSource -gt $buildTime) {
         'npm run build'
     )
 }
+
+if ($ValidateOnly) { return }
 
 $arguments = New-Object System.Collections.Generic.List[string]
 [void]$arguments.Add('--conditions=browser')

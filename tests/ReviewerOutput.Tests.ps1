@@ -302,6 +302,41 @@ Describe 'Shared reviewer and review-handler event contract' {
         $source | Should -Match 'agent\.waiting'
     }
 
+    It 'emits bounded PR identity and outcome fields for the dashboard' {
+        $path = Join-Path "$PSScriptRoot\..\src\Agents\reviewer" 'Start-ReviewerAgent.ps1'
+        $source = Get-Content -LiteralPath $path -Raw
+        foreach ($field in @('title', 'author', 'url', 'sourceBranch', 'targetBranch', 'threadCount', 'actionableThreadCount', 'changedFileCount')) {
+            $source | Should -Match ("(?m)^\s*{0}\s*=" -f [regex]::Escape($field))
+        }
+        foreach ($field in @('requested', 'delivered', 'summary', 'previewArtifact')) {
+            $source | Should -Match ("(?m)^\s*{0}\s*=" -f [regex]::Escape($field))
+        }
+        $source | Should -Match 'prUrl\s*=\s*Get-ReviewerPullRequestLink\s+-PrId'
+    }
+
+    It 'provides a preview-only one-command reviewer watcher and attach mode' {
+        $path = Join-Path "$PSScriptRoot\..\tools" 'Watch-DevPilotReviewer.ps1'
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path $path), [ref]$tokens, [ref]$errors)
+        $errors | Should -BeNullOrEmpty
+        @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) |
+            Should -Contain 'AttachOnly'
+        $source = Get-Content -LiteralPath $path -Raw
+        $source | Should -Match "OutputMode = 'Json'"
+        $source | Should -Match 'Once = \$true'
+        $source | Should -Not -Match 'EnableFindingComments\s*='
+        $source | Should -Not -Match 'EnableThreadReplies\s*='
+        $source | Should -Not -Match 'EnableSummaryComment\s*='
+        $source | Should -Not -Match 'EnableApprovalVote\s*='
+        $source | Should -Not -Match 'EnableTeamsNotifications\s*='
+        $source.IndexOf('& $dashboardLauncher -StateDir $StateDir -ValidateOnly') |
+            Should -BeLessThan $source.IndexOf('$reviewerProcess = Start-Process')
+        $source | Should -Match '\$dashboardCompletedNormally\s*=\s*\$false'
+        $source | Should -Match 'Stop-Process\s+-Id\s+\$reviewerProcess\.Id'
+    }
+
     It 'prefers the co-located harness over a stale loaded module' -ForEach @(
         @{ Script = 'reviewer\Start-ReviewerAgent.ps1'; Config = 'reviewer-ado.config.json' }
         @{ Script = 'review-handler\Start-ReviewHandlerAgent.ps1'; Config = 'handler-ado.config.json' }

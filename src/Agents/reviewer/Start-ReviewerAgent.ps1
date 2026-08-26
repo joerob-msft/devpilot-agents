@@ -5017,6 +5017,16 @@ function Invoke-ReviewerPullRequest {
     $prId = [int]$Bound.PrId
     $sourceCommit = [string]$Bound.SourceCommit
     $prTitle = [string]$Bound.Title
+    $prContext = @{
+        title = $prTitle
+        author = [string]$Bound.AuthorDisplay
+        url = [string]$Bound.Url
+        sourceBranch = [string]$Bound.SourceBranch
+        targetBranch = [string]$Bound.TargetBranch
+        threadCount = [int]$Bound.ThreadCount
+        actionableThreadCount = [int]$Bound.ActionableThreadCount
+        changedFileCount = [int]$Bound.ChangedFileCount
+    }
     $reviewTimer = [Diagnostics.Stopwatch]::StartNew()
 
     Send-ReviewerEvent phase.changed -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
@@ -5145,10 +5155,10 @@ function Invoke-ReviewerPullRequest {
             -Body ("$reason" + $(if ($launchFailureReason) { " This is an environment fault on the agent host, not a problem with the pull request." } else { "" })) `
             -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) `
             -Links @(Get-ReviewerPullRequestLink -PrId $prId)
-        Send-ReviewerEvent work.completed -Level error -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
-            title = $prTitle; result = 'failed'; elapsedMilliseconds = $reviewTimer.ElapsedMilliseconds
+        Send-ReviewerEvent work.completed -Level error -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data ($prContext + @{
+            result = 'failed'; elapsedMilliseconds = $reviewTimer.ElapsedMilliseconds
             critical = 0; important = 0; suggestion = 0; delivered = 'none'; reason = $reason
-        } -Message "PR $prId failed: $reason"
+        }) -Message "PR $prId failed: $reason"
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -5161,6 +5171,8 @@ function Invoke-ReviewerPullRequest {
     $postable = @($scoped.Postable)
     $withheld = @($scoped.Withheld)
     $summaryText = [string]$marker['summary']
+    $eventSummary = ($summaryText -replace '\s+', ' ').Trim()
+    if ($eventSummary.Length -gt 240) { $eventSummary = $eventSummary.Substring(0, 237) + '...' }
     $recommendedVote = [string]$marker['recommendedVote']
 
     Write-Host ("PR {0} reviewed: {1} critical, {2} important, {3} suggestion; {4} postable; {5} human-comment assessment(s); recommended vote '{6}'; finding cap reached={7}, omitted={8}." -f `
@@ -5364,18 +5376,23 @@ function Invoke-ReviewerPullRequest {
     if ($castVote) { [void]$deliveredParts.Add("vote '$castVote'") }
     if ($deliveredParts.Count -eq 0) { [void]$deliveredParts.Add($(if ($writesRequested) { 'none' } else { 'preview only' })) }
     if ($writesRequested -and @($unresolved).Count -gt 0) {
-        Send-ReviewerEvent delivery.blocked -Level warning -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
-            title = $prTitle; reason = [string]$delivery.Reason; outstanding = @($unresolved)
+        Send-ReviewerEvent delivery.blocked -Level warning -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data ($prContext + @{
+            reason = [string]$delivery.Reason; outstanding = @($unresolved)
             retryable = (-not [bool]$delivery.TerminalAbort); nextRetry = $(if ($Once) { 'manual rerun' } else { 'after cycle backoff' })
-        } -Message "PR $prId delivery blocked: $($delivery.Reason). Outstanding: $(@($unresolved) -join ', ')."
+        }) -Message "PR $prId delivery blocked: $($delivery.Reason). Outstanding: $(@($unresolved) -join ', ')."
     }
     Send-ReviewerEvent work.completed -Level $(if ($exit -eq 0) { 'info' } else { 'warning' }) `
-        -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
-            title = $prTitle; result = $(if ($exit -eq 0) { $(if ($writesRequested) { 'reviewed' } else { 'previewed' }) } else { 'partially delivered' })
+        -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data ($prContext + @{
+            result = $(if ($exit -eq 0) { $(if ($writesRequested) { 'reviewed' } else { 'previewed' }) } else { 'partially delivered' })
             elapsedMilliseconds = $reviewTimer.ElapsedMilliseconds; critical = $counts['critical']
             important = $counts['important']; suggestion = $counts['suggestion']
-            delivered = ($deliveredParts -join ', '); previewPath = $previewPath; reason = [string]$delivery.Reason
-        } -Message "PR $prId reviewed with $($allFindings.Count) finding(s); $postedCount comment(s) and $threadRepliesPosted reply/replies delivered."
+            requested = $(if (@($planCapabilities).Count -gt 0) { @($planCapabilities) -join ', ' } else { 'preview only' })
+            delivered = ($deliveredParts -join ', ')
+            previewPath = $previewPath
+            previewArtifact = $previewPath
+            summary = $eventSummary
+            reason = [string]$delivery.Reason
+        }) -Message "PR $prId reviewed with $($allFindings.Count) finding(s); $postedCount comment(s) and $threadRepliesPosted reply/replies delivered."
     return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted, $threadRepliesPosted thread assessment(s))" }
 }
 
@@ -5464,7 +5481,7 @@ function Invoke-ReviewerPromotion {
     $sourceCommit = [string]$signed.sourceCommit
     $prTitle = [string](Get-ReviewerHashValue -Container $signed -Key 'prTitle' -Default "PR $prId")
     Send-ReviewerEvent candidate.selected -PrId $prId -SourceCommit $sourceCommit -Data @{
-        title = $prTitle
+        title = $prTitle; url = (Get-ReviewerPullRequestLink -PrId $prId)
     } -Message "Selected stored review for PR $prId - $prTitle"
 
     # The Markdown is what the operator actually read. Publishing a manifest
@@ -6033,13 +6050,27 @@ function Invoke-ReviewerCycle {
 
             $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
 
+            $createdBy = Get-ReviewerHashValue -Container $prRecord -Key 'createdBy'
+            $authorAlias = Get-ReviewerAlias -UniqueName ([string](Get-ReviewerHashValue -Container $createdBy -Key 'uniqueName' -Default ''))
+            $authorDisplay = [string](Get-ReviewerHashValue -Container $createdBy -Key 'displayName' -Default $authorAlias)
+            if ([string]::IsNullOrWhiteSpace($authorDisplay)) { $authorDisplay = $authorAlias }
+            $sourceBranch = (([string](Get-ReviewerHashValue -Container $prRecord -Key 'sourceRefName' -Default '')) -replace '^refs/heads/', '')
+            $targetBranch = (([string](Get-ReviewerHashValue -Container $prRecord -Key 'targetRefName' -Default '')) -replace '^refs/heads/', '')
+            $prTitle = [string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId")
+            $prUrl = Get-ReviewerPullRequestLink -PrId $prId
             [void]$bound.Add(@{
                     PrId                 = $prId
-                    Title                = [string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId")
+                    Title                = $prTitle
                     SourceCommit         = $sourceCommit
-                    SourceBranch         = (([string](Get-ReviewerHashValue -Container $prRecord -Key 'sourceRefName' -Default '')) -replace '^refs/heads/', '')
-                    AuthorAlias          = (Get-ReviewerAlias -UniqueName ([string](Get-ReviewerHashValue -Container (Get-ReviewerHashValue -Container $prRecord -Key 'createdBy') -Key 'uniqueName' -Default '')))
+                    SourceBranch         = $sourceBranch
+                    TargetBranch         = $targetBranch
+                    AuthorAlias          = $authorAlias
+                    AuthorDisplay        = $authorDisplay
                     AuthorUpn            = (Get-ReviewerAuthorUpn -Pr $prRecord)
+                    Url                  = $prUrl
+                    ThreadCount          = @($threads).Count
+                    ActionableThreadCount = @($digest.AssessmentTargets).Count
+                    ChangedFileCount     = @($changedPaths).Count
                     DigestText           = $digest.Text
                     ThreadReplyTargets    = @($digest.AssessmentTargets)
                     ThreadReplyTargetSet  = (Get-ReviewerThreadAssessmentTargetSet -Targets $digest.AssessmentTargets)
@@ -6050,8 +6081,11 @@ function Invoke-ReviewerCycle {
                     ExistingFingerprints = (Get-ReviewerExistingFingerprints -Threads $threads)
                 })
             Send-ReviewerEvent candidate.selected -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
-                title = [string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId")
-            } -Message "Selected PR $prId - $([string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId"))"
+                title = $prTitle; author = $authorDisplay; url = $prUrl
+                sourceBranch = $sourceBranch; targetBranch = $targetBranch
+                threadCount = @($threads).Count; actionableThreadCount = @($digest.AssessmentTargets).Count
+                changedFileCount = @($changedPaths).Count
+            } -Message "Selected PR $prId - $prTitle"
         }
 
         Send-ReviewerEvent candidates.enumerated -Cycle $CycleNumber -Data @{

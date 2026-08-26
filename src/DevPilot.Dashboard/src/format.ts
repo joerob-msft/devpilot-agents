@@ -49,6 +49,34 @@ export function eventSummary(event: AgentEvent): string {
   return `${event.eventType}${pr}${detail ? ` - ${boundedText(detail, 120)}` : ""}`;
 }
 
+const EVENT_NARRATIVE: Record<string, string> = {
+  "agent.started": "Observer connected",
+  "cycle.started": "New scan cycle started",
+  "candidates.enumerated": "Candidate scan completed",
+  "candidate.selected": "Pull request selected",
+  "reviewer.started": "Review started",
+  "review.completed": "Review completed",
+  "work.completed": "Delivery completed",
+  "delivery.retrying": "Delivery will retry",
+  "delivery.blocked": "Delivery is blocked",
+  "agent.waiting": "Waiting for next scan",
+  "cycle.completed": "Scan cycle completed",
+  "cycle.failed": "Scan cycle failed",
+  "agent.stopped": "Observer stopped",
+};
+
+export function eventNarrative(event: AgentEvent): string {
+  const label =
+    event.eventType === "phase.changed"
+      ? `Phase: ${typeof event.data.phase === "string" ? boundedText(event.data.phase, 80) : "changed"}`
+      : EVENT_NARRATIVE[event.eventType] ?? "Agent activity";
+  const detail =
+    event.message ||
+    (typeof event.data.reason === "string" ? event.data.reason : "") ||
+    (typeof event.data.summary === "string" ? event.data.summary : "");
+  return `${label}${detail ? ` - ${boundedText(detail, 100)}` : ""}`;
+}
+
 export function line(value: string, width: number): string {
   return value.length <= width ? value : `${value.slice(0, Math.max(0, width - 3))}...`;
 }

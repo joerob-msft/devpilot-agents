@@ -7,6 +7,7 @@ import {
   STALE_AFTER_MS,
   TIMELINE_LIMIT,
   liveElapsedMilliseconds,
+  totalElapsedMilliseconds,
 } from "../src/reducer.js";
 
 const BASE_TIME = Date.parse("2026-08-25T12:00:00.000Z");
@@ -75,6 +76,116 @@ test("reducer tracks scope, work state, completion, and live elapsed", () => {
     important: 2,
     suggestion: 3,
   });
+
+  test("PR context is additive across candidate, reviewer, and completion events", () => {
+    const reducer = new OperationsReducer();
+    reducer.apply(event("context", 1, "agent.started"));
+    reducer.apply(event("context", 2, "candidate.selected", {
+      pullRequestId: 94,
+      data: {
+        title: "Contextual operations",
+        author: "Ada",
+        url: "https://github.com/org/repo/pull/94",
+        sourceBranch: "feature/context",
+        targetBranch: "main",
+        threadCount: 12,
+        actionableThreadCount: 4,
+        changedFileCount: 7,
+      },
+    }));
+    reducer.apply(event("context", 3, "reviewer.started", {
+      data: { title: "Updated contextual operations", sourceBranch: "feature/context-v2" },
+    }));
+    reducer.apply(event("context", 4, "work.completed", {
+      data: {
+        author: "Grace",
+        result: "partial",
+        reason: "comments unavailable",
+        summary: "Preview generated",
+        requested: "summary, comments",
+        delivered: ["summary"],
+        previewArtifact: "preview.md",
+        nextScan: "30 seconds",
+        elapsedMilliseconds: 9_000,
+        critical: 1,
+        important: 2,
+        suggestion: 3,
+        threadCount: 15,
+        actionableThreadCount: 5,
+        changedFileCount: 9,
+      },
+    }));
+    reducer.apply(event("context", 5, "agent.stopped"));
+
+    const state = reducer.get("reviewer:context", BASE_TIME + 2_000);
+    assert.ok(state);
+    assert.equal(state.pullRequestId, 94);
+    assert.equal(state.pullRequestTitle, "Updated contextual operations");
+    assert.equal(state.pullRequestAuthor, "Grace");
+    assert.equal(state.pullRequestUrl, "https://github.com/org/repo/pull/94");
+    assert.equal(state.sourceBranch, "feature/context-v2");
+    assert.equal(state.targetBranch, "main");
+    assert.equal(state.threadCount, 15);
+    assert.equal(state.actionableThreadCount, 5);
+    assert.equal(state.changedFileCount, 9);
+    assert.deepEqual(state.completion, {
+      result: "partial",
+      requested: ["summary", "comments"],
+      delivered: ["summary"],
+      reason: "comments unavailable",
+      findings: { critical: 1, important: 2, suggestion: 3 },
+      summary: "Preview generated",
+      previewArtifact: "preview.md",
+      nextScan: "30 seconds",
+      elapsedMilliseconds: 9_000,
+      timestampMs: BASE_TIME + 400,
+    });
+    assert.equal(totalElapsedMilliseconds(state, BASE_TIME + 20_000), 9_000);
+  });
+
+  test("PR progress counts are non-negative bounded integers", () => {
+    const reducer = new OperationsReducer();
+    reducer.apply(event("counts", 1, "candidate.selected", {
+      data: {
+        threadCount: 1_000_001.9,
+        actionableThreadCount: -4,
+        changedFileCount: 12.8,
+      },
+    }));
+    const state = reducer.get("reviewer:counts", BASE_TIME + 500);
+    assert.equal(state?.threadCount, 1_000_000);
+    assert.equal(state?.actionableThreadCount, 0);
+    assert.equal(state?.changedFileCount, 12);
+  });
+
+  test("a new cycle resets current narrative but stopped runs retain their summary", () => {
+    const reducer = new OperationsReducer();
+    reducer.apply(event("run", 1, "agent.started"));
+    reducer.apply(event("run", 2, "cycle.started"));
+    reducer.apply(event("run", 3, "review.completed", {
+      data: { result: "reviewed", summary: "first run", elapsedMilliseconds: 100 },
+    }));
+    reducer.apply(event("run", 4, "agent.stopped"));
+    assert.equal(reducer.get("reviewer:run", BASE_TIME + 1_000)?.completion?.summary, "first run");
+
+    reducer.apply(event("run", 5, "cycle.started"));
+    const state = reducer.get("reviewer:run", BASE_TIME + 1_000);
+    assert.equal(state?.completion, null);
+    assert.equal(state?.candidateStory, "Scanning candidates");
+    assert.equal(state?.currentRunStartedMs, BASE_TIME + 500);
+  });
+
+  test("active work sorts before older stopped failure records", () => {
+    const reducer = new OperationsReducer();
+    reducer.apply(event("historical", 1, "agent.started"));
+    reducer.apply(event("historical", 2, "cycle.failed", { data: { reason: "old failure" } }));
+    reducer.apply(event("historical", 3, "agent.stopped"));
+    reducer.apply(event("active", 1, "agent.started"));
+    assert.deepEqual(
+      reducer.list(BASE_TIME + 1_000).map((item) => item.instanceId),
+      ["active", "historical"],
+    );
+  });
 });
 
 test("attention ordering is failed, blocked, running, waiting, completed", () => {
@@ -95,6 +206,102 @@ test("attention ordering is failed, blocked, running, waiting, completed", () =>
     reducer.list(BASE_TIME + 1_000).map((item) => item.instanceId),
     ["failed", "blocked", "running", "waiting", "completed"],
   );
+});
+
+test("partially delivered completion preserves an earlier production-order block", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(event("partial", 1, "agent.started"));
+  reducer.apply(event("partial", 2, "candidate.selected", {
+    pullRequestId: 94,
+    data: { title: "Partial delivery" },
+  }));
+  reducer.apply(event("partial", 3, "delivery.blocked", {
+    level: "warning",
+    data: {
+      reason: "comments remain outstanding",
+      outstanding: ["comments", "threads"],
+      retryable: true,
+      nextRetry: "next cycle",
+    },
+  }));
+  reducer.apply(event("partial", 4, "work.completed", {
+    data: {
+      result: "partially delivered",
+      reason: "summary delivered; comments unresolved",
+      delivered: ["summary"],
+    },
+  }));
+  reducer.apply(event("running-peer", 1, "agent.started"));
+
+  const state = reducer.get("reviewer:partial", BASE_TIME + 1_000);
+  assert.equal(state?.status, "blocked");
+  assert.deepEqual(state?.blocked, {
+    reason: "comments remain outstanding",
+    outstanding: ["comments", "threads"],
+    retryable: true,
+    nextRetry: "next cycle",
+    timestampMs: BASE_TIME + 300,
+  });
+  assert.equal(state?.retryable, true);
+  assert.deepEqual(state?.outstanding, ["comments", "threads"]);
+  assert.deepEqual(
+    reducer.list(BASE_TIME + 1_000).map((item) => item.instanceId),
+    ["partial", "running-peer"],
+  );
+});
+
+test("successful terminal results clear retry state for both agents", () => {
+  for (const result of ["handled", "passed", "previewed", "promoted", "reviewed"]) {
+    const reducer = new OperationsReducer();
+    reducer.apply(event(result, 1, "agent.started"));
+    reducer.apply(event(result, 2, "delivery.retrying", {
+      data: { outstanding: ["comments"] },
+    }));
+    reducer.apply(event(result, 3, "work.completed", { data: { result } }));
+
+    const state = reducer.get(`reviewer:${result}`, BASE_TIME + 1_000);
+    assert.equal(state?.retryable, false, result);
+    assert.deepEqual(state?.outstanding, [], result);
+  }
+});
+
+test("a zero-candidate second cycle cannot retain stale current-PR context", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(event("cycles", 1, "agent.started"));
+  reducer.apply(event("cycles", 2, "cycle.started"));
+  reducer.apply(event("cycles", 3, "candidate.selected", {
+    pullRequestId: 94,
+    sourceCommit: "abcdef123456",
+    data: {
+      title: "First cycle PR",
+      author: "Ada",
+      url: "https://github.com/org/repo/pull/94",
+      sourceBranch: "feature/first",
+      targetBranch: "main",
+      threadCount: 12,
+      actionableThreadCount: 4,
+      changedFileCount: 7,
+    },
+  }));
+  reducer.apply(event("cycles", 4, "cycle.started", { cycleNumber: 2 }));
+  reducer.apply(event("cycles", 5, "candidates.enumerated", {
+    cycleNumber: 2,
+    data: { scanned: 0, selected: 0, skipped: {} },
+  }));
+
+  const state = reducer.get("reviewer:cycles", BASE_TIME + 1_000);
+  assert.ok(state);
+  assert.equal(state.pullRequestId, 0);
+  assert.equal(state.pullRequestTitle, "");
+  assert.equal(state.pullRequestAuthor, "");
+  assert.equal(state.pullRequestUrl, "");
+  assert.equal(state.sourceBranch, "");
+  assert.equal(state.targetBranch, "");
+  assert.equal(state.threadCount, 0);
+  assert.equal(state.actionableThreadCount, 0);
+  assert.equal(state.changedFileCount, 0);
+  assert.equal(state.sourceCommit, "");
+  assert.equal(state.candidateStory, "Scanned 0; none selected; skipped 0");
 });
 
 test("duplicates are ignored and sequence gaps are surfaced", () => {

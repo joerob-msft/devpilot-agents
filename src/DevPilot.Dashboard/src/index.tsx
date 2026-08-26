@@ -58,7 +58,7 @@ async function main(): Promise<void> {
     clearOnShutdown: true,
     exitOnCtrlC: true,
     consoleMode: "disabled",
-    backgroundColor: "#101319",
+    backgroundColor: "#08090a",
     onDestroy: () => void tailer.stop(),
   });
 

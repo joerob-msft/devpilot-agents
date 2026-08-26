@@ -5,6 +5,7 @@ import {
   getNumber,
   getString,
   getStringArray,
+  getStringList,
   type AgentEvent,
   type AgentRole,
   type InstanceState,
@@ -25,6 +26,23 @@ const STATUS_ORDER: Record<InstanceStatus, number> = {
   waiting: 3,
   completed: 4,
 };
+
+function statusOrder(state: InstanceState): number {
+  if (state.lifecycle === "stopped" || state.status === "completed") {
+    return state.status === "failed" ? 5 : 6;
+  }
+  return STATUS_ORDER[state.status];
+}
+
+function boundedCount(data: Record<string, unknown>, key: string): number {
+  return Math.min(1_000_000, Math.max(0, Math.floor(getNumber(data, key))));
+}
+
+function isResolvedCompletion(result: string): boolean {
+  return ["completed", "delivered", "handled", "passed", "previewed", "promoted", "reviewed", "succeeded", "success"].includes(
+    result.trim().toLowerCase(),
+  );
+}
 
 function newState(event: AgentEvent): InstanceState {
   return {
@@ -47,14 +65,24 @@ function newState(event: AgentEvent): InstanceState {
     cycleNumber: event.cycleNumber,
     pullRequestId: event.pullRequestId,
     pullRequestTitle: "",
+    pullRequestAuthor: "",
+    pullRequestUrl: "",
+    sourceBranch: "",
+    targetBranch: "",
+    threadCount: 0,
+    actionableThreadCount: 0,
+    changedFileCount: 0,
     sourceCommit: event.sourceCommit,
     candidates: { scanned: 0, selected: 0, skipped: 0 },
+    candidateStory: "Waiting for candidate scan",
     blocked: null,
     retryable: false,
     outstanding: [],
     completion: null,
     waiting: null,
     lifecycle: "starting",
+    currentRunStartedMs: event.timestampMs,
+    modelActivity: "Not started",
     lastEventMs: event.timestampMs,
     lastHeartbeatMs: event.timestampMs,
     lastSequence: 0,
@@ -74,6 +102,15 @@ function skippedTotal(value: unknown): number {
     (sum, item) => sum + (typeof item === "number" && Number.isFinite(item) ? item : 0),
     0,
   );
+}
+
+function findingCount(data: Record<string, unknown>, severity: string): number {
+  const direct = getNumber(data, severity) || getNumber(data, `${severity}Count`);
+  if (direct) return direct;
+  const findings = data.findings;
+  return findings !== null && typeof findings === "object" && !Array.isArray(findings)
+    ? getNumber(findings as Record<string, unknown>, severity)
+    : 0;
 }
 
 function addBounded<T>(items: T[], item: T, limit: number): T[] {
@@ -96,6 +133,12 @@ export function liveElapsedMilliseconds(state: InstanceState, now = Date.now()):
     return Math.max(0, state.phaseElapsedMilliseconds + now - state.phaseTimestampMs);
   }
   return state.phaseElapsedMilliseconds;
+}
+
+export function totalElapsedMilliseconds(state: InstanceState, now = Date.now()): number {
+  if (state.completion?.elapsedMilliseconds) return state.completion.elapsedMilliseconds;
+  const end = state.lifecycle === "stopped" ? state.lastEventMs : now;
+  return Math.max(0, end - state.currentRunStartedMs);
 }
 
 export class OperationsReducer {
@@ -181,6 +224,23 @@ export class OperationsReducer {
         break;
       case "cycle.started":
         state.lifecycle = "active";
+        state.currentRunStartedMs = event.timestampMs;
+        state.phase = "starting cycle";
+        state.phaseElapsedMilliseconds = 0;
+        state.phaseTimestampMs = event.timestampMs;
+        state.modelActivity = "Preparing review";
+        state.candidates = { scanned: 0, selected: 0, skipped: 0 };
+        state.candidateStory = "Scanning candidates";
+        state.pullRequestId = 0;
+        state.pullRequestTitle = "";
+        state.pullRequestAuthor = "";
+        state.pullRequestUrl = "";
+        state.sourceBranch = "";
+        state.targetBranch = "";
+        state.threadCount = 0;
+        state.actionableThreadCount = 0;
+        state.changedFileCount = 0;
+        state.sourceCommit = "";
         state.waiting = null;
         state.completion = null;
         state.blocked = null;
@@ -192,9 +252,15 @@ export class OperationsReducer {
         state.phaseElapsedMilliseconds = Math.max(0, getNumber(data, "elapsedMilliseconds"));
         state.phaseTimestampMs = event.timestampMs;
         state.waiting = null;
+        state.modelActivity = /model|prompt|inference|review/i.test(state.phase)
+          ? `Active: ${state.phase}`
+          : `Last phase: ${state.phase}`;
         break;
       case "candidate.selected":
-        state.pullRequestTitle = getString(data, "title");
+        this.reducePullRequestContext(state, data);
+        state.candidateStory = state.pullRequestId
+          ? `Selected PR #${state.pullRequestId} after scanning ${state.candidates.scanned || "available"} candidate(s)`
+          : "Candidate selected";
         break;
       case "candidates.enumerated":
         state.candidates = {
@@ -202,6 +268,13 @@ export class OperationsReducer {
           selected: getNumber(data, "selected"),
           skipped: skippedTotal(data.skipped),
         };
+        state.candidateStory = state.candidates.selected
+          ? `Scanned ${state.candidates.scanned}; selected ${state.candidates.selected}; skipped ${state.candidates.skipped}`
+          : `Scanned ${state.candidates.scanned}; none selected; skipped ${state.candidates.skipped}`;
+        break;
+      case "reviewer.started":
+        this.reducePullRequestContext(state, data);
+        state.modelActivity = "Review started";
         break;
       case "delivery.retrying":
         state.retryable = true;
@@ -218,21 +291,32 @@ export class OperationsReducer {
         state.retryable = state.blocked.retryable;
         state.outstanding = state.blocked.outstanding;
         break;
+      case "review.completed":
       case "work.completed": {
+        this.reducePullRequestContext(state, data);
         const result = getString(data, "result") || "completed";
         state.completion = {
           result,
-          delivered: getString(data, "delivered"),
+          requested: getStringList(data, "requested"),
+          delivered: getStringList(data, "delivered"),
           reason: getString(data, "reason"),
           findings: {
-            critical: getNumber(data, "critical"),
-            important: getNumber(data, "important"),
-            suggestion: getNumber(data, "suggestion"),
+            critical: findingCount(data, "critical"),
+            important: findingCount(data, "important"),
+            suggestion: findingCount(data, "suggestion"),
           },
           summary: getString(data, "summary"),
+          previewArtifact: getString(data, "previewArtifact"),
+          nextScan: getString(data, "nextScan") || getString(data, "nextRetry"),
+          elapsedMilliseconds: Math.max(0, getNumber(data, "elapsedMilliseconds")),
           timestampMs: event.timestampMs,
         };
-        if (result !== "failed") state.blocked = null;
+        state.modelActivity = `Completed: ${result}`;
+        if (isResolvedCompletion(result)) {
+          state.blocked = null;
+          state.retryable = false;
+          state.outstanding = [];
+        }
         break;
       }
       case "cycle.completed":
@@ -254,10 +338,14 @@ export class OperationsReducer {
         if (event.eventType === "cycle.failed") {
           state.completion = {
             result: "failed",
-            delivered: "",
+            requested: [],
+            delivered: [],
             reason: getString(data, "reason") || event.message,
             findings: { critical: 0, important: 0, suggestion: 0 },
             summary: "",
+            previewArtifact: "",
+            nextScan: "",
+            elapsedMilliseconds: Math.max(0, event.timestampMs - state.currentRunStartedMs),
             timestampMs: event.timestampMs,
           };
         }
@@ -270,6 +358,22 @@ export class OperationsReducer {
           sinceMs: event.timestampMs,
         };
         break;
+    }
+  }
+
+  private reducePullRequestContext(state: InstanceState, data: Record<string, unknown>): void {
+    state.pullRequestId = Math.max(state.pullRequestId, getNumber(data, "pullRequestId"), getNumber(data, "id"));
+    state.pullRequestTitle = getString(data, "title") || state.pullRequestTitle;
+    state.pullRequestAuthor = getString(data, "author") || state.pullRequestAuthor;
+    state.pullRequestUrl = getString(data, "url") || state.pullRequestUrl;
+    state.sourceBranch = getString(data, "sourceBranch") || state.sourceBranch;
+    state.targetBranch = getString(data, "targetBranch") || state.targetBranch;
+    if (Object.hasOwn(data, "threadCount")) state.threadCount = boundedCount(data, "threadCount");
+    if (Object.hasOwn(data, "actionableThreadCount")) {
+      state.actionableThreadCount = boundedCount(data, "actionableThreadCount");
+    }
+    if (Object.hasOwn(data, "changedFileCount")) {
+      state.changedFileCount = boundedCount(data, "changedFileCount");
     }
   }
 
@@ -308,7 +412,7 @@ export class OperationsReducer {
     for (const state of items) state.status = calculateStatus(state, now);
     return items.sort(
       (a, b) =>
-        STATUS_ORDER[a.status] - STATUS_ORDER[b.status] ||
+        statusOrder(a) - statusOrder(b) ||
         b.lastEventMs - a.lastEventMs ||
         a.key.localeCompare(b.key),
     );

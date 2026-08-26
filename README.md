@@ -241,6 +241,29 @@ events are diagnostic only and cannot change agent selection or delivery.
 over the reviewer and review-handler event streams. It observes existing agent
 processes; it cannot start, stop, retry, promote, or otherwise control them.
 
+For the simplest reviewer workflow, launch one isolated, preview-only review
+and watch it in the current terminal:
+
+```powershell
+# From a consumer repository with the conventional config path:
+<toolkit-root>/tools/Watch-DevPilotReviewer.ps1 -PullRequestId 12345
+
+# Or pass a config explicitly:
+./tools/Watch-DevPilotReviewer.ps1 `
+    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+    -PullRequestId 12345
+```
+
+The watcher starts the reviewer in a separate process with `-Once`,
+`-OutputMode Json`, and no write or notification switches. The TUI is scoped
+to the generated state directory, so the new live run is not mixed with older
+history. Closing the dashboard does not terminate a review that is still
+running. Reattach later with the state path printed by the watcher:
+
+```powershell
+./tools/Watch-DevPilotReviewer.ps1 -AttachOnly -StateDir <printed-state-path>
+```
+
 Install and build its locked dependencies once:
 
 ```powershell
@@ -260,12 +283,13 @@ Then point the dashboard at one or more agent state roots:
     -StateDir "$env:LOCALAPPDATA/<state-namespace>"
 ```
 
-The observer searches below each root for both agents' per-instance streams,
+The standalone observer searches below each root for both agents' per-instance streams,
 including state layouts with agent-name subdirectories. It can also read an
 explicit capture with `-EventLogPath`. The layout adapts from three panes on a
 wide terminal to a single overview/detail route below 80 columns. Use arrows
 or `j`/`k` to select, `Enter` for detail, `i` for the inspector, `e` for
-events, `Ctrl+P` for the command palette, `?` for help, and `q` to quit.
+events, `o` to open a validated PR link, `Ctrl+P` for the contextual command
+palette, `?` for help, and `q` to quit.
 
 The package keeps its OpenTUI, SolidJS, TypeScript, and Bun versions locked
 under `src/DevPilot.Dashboard`. Bun is restored locally by `npm install`; no

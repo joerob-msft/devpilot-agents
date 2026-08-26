@@ -36,10 +36,14 @@ export type InstanceStatus =
 
 export interface Completion {
   result: string;
-  delivered: string;
+  requested: string[];
+  delivered: string[];
   reason: string;
   findings: { critical: number; important: number; suggestion: number };
   summary: string;
+  previewArtifact: string;
+  nextScan: string;
+  elapsedMilliseconds: number;
   timestampMs: number;
 }
 
@@ -81,14 +85,24 @@ export interface InstanceState {
   cycleNumber: number;
   pullRequestId: number;
   pullRequestTitle: string;
+  pullRequestAuthor: string;
+  pullRequestUrl: string;
+  sourceBranch: string;
+  targetBranch: string;
+  threadCount: number;
+  actionableThreadCount: number;
+  changedFileCount: number;
   sourceCommit: string;
   candidates: { scanned: number; selected: number; skipped: number };
+  candidateStory: string;
   blocked: BlockedWarning | null;
   retryable: boolean;
   outstanding: string[];
   completion: Completion | null;
   waiting: { kind: string; delayMilliseconds: number; sinceMs: number } | null;
   lifecycle: "starting" | "active" | "stopped";
+  currentRunStartedMs: number;
+  modelActivity: string;
   lastEventMs: number;
   lastHeartbeatMs: number;
   lastSequence: number;
@@ -213,6 +227,17 @@ export function getStringArray(data: Record<string, unknown>, key: string): stri
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string").slice(0, 20).map((item) => boundedString(item).slice(0, 120))
     : [];
+}
+
+export function getStringList(data: Record<string, unknown>, key: string): string[] {
+  const values = getStringArray(data, key);
+  if (values.length) return values;
+  const value = getString(data, key);
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, 20);
 }
 
 export function boundedText(value: unknown, max = 160): string {
