@@ -65,6 +65,25 @@ Describe 'Reviewer output modes' {
                 -SupportsAnsi $true -WindowWidth 40).Mode | Should -Be 'Compact'
     }
 
+    It 'refreshes elapsed time while an interactive phase is running' {
+        $writer = [IO.StringWriter]::new()
+        $context = New-AgentOutputContext -Agent reviewer -OutputMode Auto `
+            -IsOutputRedirected $false -SupportsAnsi $true -WindowWidth 120 `
+            -InteractiveWriter $writer -InteractiveRefreshIntervalMilliseconds 100 `
+            -UseLiveConsoleWidth $false
+        try {
+            Publish-AgentEvent $context phase.changed -Cycle 1 -PrId 42 -Data @{
+                phase = 'running the model'
+                elapsedMilliseconds = 0
+            } | Out-Null
+            Start-Sleep -Milliseconds 1250
+            $writer.ToString() | Should -Match 'PR 42  running the model  1s'
+        }
+        finally {
+            if ($context.InteractiveTimer) { $context.InteractiveTimer.Dispose() }
+        }
+    }
+
     It 'makes blocked unfinished delivery prominent with outstanding work' {
         $context = New-TestReviewerContext
         Publish-AgentEvent $context delivery.blocked -Level warning -Cycle 2 -PrId 99 -Data @{

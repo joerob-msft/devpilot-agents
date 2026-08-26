@@ -1,5 +1,140 @@
 Set-StrictMode -Version Latest
 
+if (-not ('DevPilot.AgentInteractiveStatusTimer' -as [type])) {
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+
+namespace DevPilot
+{
+    public sealed class AgentInteractiveStatusTimer : IDisposable
+    {
+        private readonly object gate = new object();
+        private readonly TextWriter writer;
+        private readonly Timer timer;
+        private readonly int intervalMilliseconds;
+        private readonly int configuredWidth;
+        private readonly bool useLiveConsoleWidth;
+        private readonly Stopwatch stopwatch = new Stopwatch();
+        private string scope = "";
+        private string phase = "";
+        private long baseElapsedMilliseconds;
+        private bool active;
+
+        public AgentInteractiveStatusTimer(
+            TextWriter writer,
+            int intervalMilliseconds,
+            int configuredWidth,
+            bool useLiveConsoleWidth)
+        {
+            this.writer = writer;
+            this.intervalMilliseconds = Math.Max(100, intervalMilliseconds);
+            this.configuredWidth = configuredWidth;
+            this.useLiveConsoleWidth = useLiveConsoleWidth;
+            timer = new Timer(Render, null, Timeout.Infinite, Timeout.Infinite);
+        }
+
+        public void Start(string scope, string phase, long elapsedMilliseconds)
+        {
+            lock (gate)
+            {
+                this.scope = scope ?? "";
+                this.phase = phase ?? "";
+                baseElapsedMilliseconds = Math.Max(0, elapsedMilliseconds);
+                stopwatch.Restart();
+                active = true;
+                RenderUnsafe();
+                timer.Change(intervalMilliseconds, intervalMilliseconds);
+            }
+        }
+
+        public void Stop()
+        {
+            lock (gate)
+            {
+                active = false;
+                timer.Change(Timeout.Infinite, Timeout.Infinite);
+                stopwatch.Stop();
+            }
+        }
+
+        private void Render(object state)
+        {
+            try
+            {
+                lock (gate)
+                {
+                    if (active)
+                    {
+                        RenderUnsafe();
+                    }
+                }
+            }
+            catch
+            {
+                // Rendering is observational and must never affect the agent.
+            }
+        }
+
+        private void RenderUnsafe()
+        {
+            try
+            {
+                var elapsed = TimeSpan.FromMilliseconds(baseElapsedMilliseconds + stopwatch.ElapsedMilliseconds);
+                var duration = elapsed.TotalHours >= 1
+                    ? string.Format("{0}h {1}m {2}s", (int)elapsed.TotalHours, elapsed.Minutes, elapsed.Seconds)
+                    : elapsed.TotalMinutes >= 1
+                        ? string.Format("{0}m {1}s", (int)elapsed.TotalMinutes, elapsed.Seconds)
+                        : string.Format("{0}s", Math.Max(0, (int)elapsed.TotalSeconds));
+                var text = string.Format("{0}  {1}  {2}", scope, phase, duration);
+                var width = configuredWidth;
+                if (useLiveConsoleWidth)
+                {
+                    width = 0;
+                    try
+                    {
+                        if (Console.WindowWidth > 0)
+                        {
+                            width = Console.WindowWidth;
+                        }
+                    }
+                    catch { }
+                }
+                if (width < 20)
+                {
+                    return;
+                }
+                var max = width - 1;
+                if (text.Length > max)
+                {
+                    text = text.Substring(0, max - 3) + "...";
+                }
+                writer.Write("\r\u001b[2K" + text);
+                writer.Flush();
+            }
+            catch
+            {
+                // Rendering is observational and must never affect the agent.
+            }
+        }
+
+        public void Dispose()
+        {
+            Stop();
+            timer.Dispose();
+            stopwatch.Stop();
+        }
+    }
+}
+'@
+    }
+    catch { }
+}
+$script:AgentInteractiveTimerAvailable = $null -ne ('DevPilot.AgentInteractiveStatusTimer' -as [type])
+
 $script:AgentOutputEventTypes = @(
     'agent.started',
     'cycle.started',
@@ -34,12 +169,31 @@ function New-AgentOutputContext {
         [bool]$SupportsAnsi = ($null -ne $PSStyle -and $PSStyle.OutputRendering -ne 'PlainText'),
         [int]$WindowWidth = $(try { [Console]::WindowWidth } catch { 0 }),
         [scriptblock]$WriteLine = { param($Line) [Console]::Out.WriteLine($Line) },
-        [scriptblock]$WriteRaw = { param($Text) [Console]::Out.Write($Text) }
+        [scriptblock]$WriteRaw = { param($Text) [Console]::Out.Write($Text) },
+        [System.IO.TextWriter]$InteractiveWriter = [Console]::Out,
+        [int]$InteractiveRefreshIntervalMilliseconds = 1000,
+        [bool]$UseLiveConsoleWidth = $true
     )
     $resolved = $OutputMode
     if ($OutputMode -eq 'Auto') {
         $resolved = if (Test-AgentInteractiveOutput -IsOutputRedirected $IsOutputRedirected `
                 -SupportsAnsi $SupportsAnsi -WindowWidth $WindowWidth) { 'Interactive' } else { 'Compact' }
+    }
+    if ($resolved -eq 'Interactive' -and -not $script:AgentInteractiveTimerAvailable) {
+        $resolved = 'Compact'
+    }
+    $interactiveTimer = if ($resolved -eq 'Interactive') {
+        try {
+            New-Object DevPilot.AgentInteractiveStatusTimer(
+                $InteractiveWriter,
+                [Math]::Max(100, $InteractiveRefreshIntervalMilliseconds),
+                $WindowWidth,
+                $UseLiveConsoleWidth)
+        }
+        catch {
+            $resolved = 'Compact'
+            $null
+        }
     }
     return @{
         Agent = $Agent
@@ -52,6 +206,7 @@ function New-AgentOutputContext {
         WriteLine = $WriteLine
         WriteRaw = $WriteRaw
         StatusActive = $false
+        InteractiveTimer = $interactiveTimer
         LastWorkCompletedCycle = -1
         LogMaxBytes = 10MB
         LogRetentionCount = 5
@@ -174,17 +329,23 @@ function Format-AgentSkipSummary {
 }
 
 function Write-ReviewerInteractiveStatus {
-    param([hashtable]$Context, [string]$Text)
-    $width = try { [Console]::WindowWidth } catch { 80 }
-    $max = [Math]::Max(20, $width - 1)
-    if ($Text.Length -gt $max) { $Text = $Text.Substring(0, $max - 3) + '...' }
-    & $Context.WriteRaw ("`r$([char]27)[2K$Text")
-    $Context.StatusActive = $true
+    param(
+        [hashtable]$Context,
+        [string]$Scope,
+        [string]$Phase,
+        [long]$ElapsedMilliseconds
+    )
+    try {
+        $Context.InteractiveTimer.Start($Scope, $Phase, $ElapsedMilliseconds)
+        $Context.StatusActive = $true
+    }
+    catch { }
 }
 
 function Write-ReviewerOutputLine {
     param([hashtable]$Context, [string]$Text)
     if ($Context.Mode -eq 'Interactive' -and $Context.StatusActive) {
+        try { $Context.InteractiveTimer.Stop() } catch { }
         & $Context.WriteRaw ("`r$([char]27)[2K")
         $Context.StatusActive = $false
     }
@@ -226,9 +387,13 @@ function Write-ReviewerHumanEvent {
         'candidate.selected' { Write-ReviewerOutputLine $Context ("Selected PR {0} - {1}" -f $prId, $data.title) }
         'phase.changed' {
             $scope = if ($prId -gt 0) { "PR $prId" } else { "Cycle $cycle" }
-            $text = "$scope  $($data.phase)  $([string](Format-ReviewerDuration ([long]$data.elapsedMilliseconds)))"
-            if ($Context.Mode -eq 'Interactive') { Write-ReviewerInteractiveStatus $Context $text }
-            else { Write-ReviewerOutputLine $Context $text }
+            if ($Context.Mode -eq 'Interactive') {
+                Write-ReviewerInteractiveStatus $Context $scope ([string]$data.phase) ([long]$data.elapsedMilliseconds)
+            }
+            else {
+                $text = "$scope  $($data.phase)  $([string](Format-ReviewerDuration ([long]$data.elapsedMilliseconds)))"
+                Write-ReviewerOutputLine $Context $text
+            }
         }
         'delivery.retrying' { Write-ReviewerOutputLine $Context ("Retrying unfinished delivery for PR {0} - {1}" -f $prId, $data.title) }
         'delivery.blocked' {
