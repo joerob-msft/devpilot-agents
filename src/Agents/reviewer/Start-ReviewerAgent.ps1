@@ -254,13 +254,22 @@ $script:ReviewerOutputContext = $null
 try {
 
 $HarnessPath = $null
-$importedHarness = Get-Module DevPilot.AgentHarness
-if (-not $importedHarness) {
-    # Prefer a co-located source checkout (development), then an installed module.
-    $localManifest = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "DevPilot.AgentHarness\DevPilot.AgentHarness.psd1"
-    if (Test-Path -LiteralPath $localManifest) { Import-Module $localManifest -Force }
-    else { Import-Module DevPilot.AgentHarness -ErrorAction Stop }
+$localManifest = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "DevPilot.AgentHarness\DevPilot.AgentHarness.psd1"
+if (Test-Path -LiteralPath $localManifest) {
+    # A caller may already have another toolkit version loaded. Always bind the
+    # agent to its co-located harness so script and module contracts cannot mix.
+    Import-Module $localManifest -Force
+    $localModuleRoot = Split-Path $localManifest -Parent
+    $importedHarness = Get-Module DevPilot.AgentHarness |
+        Where-Object { $_.ModuleBase -eq $localModuleRoot } |
+        Select-Object -First 1
+}
+else {
     $importedHarness = Get-Module DevPilot.AgentHarness
+    if (-not $importedHarness) {
+        Import-Module DevPilot.AgentHarness -ErrorAction Stop
+        $importedHarness = Get-Module DevPilot.AgentHarness
+    }
 }
 if (-not $importedHarness) {
     throw ("DevPilot.AgentHarness module could not be loaded. Install it (Install-Module DevPilot.AgentHarness) " +

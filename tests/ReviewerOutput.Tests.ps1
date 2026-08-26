@@ -179,4 +179,32 @@ Describe 'Shared reviewer and review-handler event contract' {
         $source | Should -Match 'candidates\.enumerated'
         $source | Should -Match 'agent\.waiting'
     }
+
+    It 'prefers the co-located harness over a stale loaded module' -ForEach @(
+        @{ Script = 'reviewer\Start-ReviewerAgent.ps1'; Config = 'reviewer-ado.config.json' }
+        @{ Script = 'review-handler\Start-ReviewHandlerAgent.ps1'; Config = 'handler-ado.config.json' }
+    ) {
+        $staleModule = Join-Path $TestDrive 'stale\DevPilot.AgentHarness'
+        New-Item -ItemType Directory -Path $staleModule -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $staleModule 'DevPilot.AgentHarness.psm1') `
+            -Value 'function Get-StaleHarnessMarker { $true }'
+        $staleManifest = Join-Path $staleModule 'DevPilot.AgentHarness.psd1'
+        New-ModuleManifest -Path $staleManifest -RootModule 'DevPilot.AgentHarness.psm1' `
+            -FunctionsToExport 'Get-StaleHarnessMarker'
+
+        $runner = Join-Path $TestDrive 'run-with-stale-harness.ps1'
+        Set-Content -LiteralPath $runner -Value @'
+param($StaleManifest, $AgentScript, $ConfigFile)
+Import-Module $StaleManifest -Force
+& $AgentScript -DryRun -OutputMode Json -ConfigFile $ConfigFile
+exit $LASTEXITCODE
+'@
+        $agentScript = Join-Path "$PSScriptRoot\..\src\Agents" $Script
+        $configFile = Join-Path "$PSScriptRoot\..\samples" $Config
+        $lines = @(& pwsh -NoProfile -File $runner $staleManifest $agentScript $configFile)
+
+        $LASTEXITCODE | Should -Be 0
+        $lines.Count | Should -Be 2
+        $lines | ForEach-Object { { $_ | ConvertFrom-Json } | Should -Not -Throw }
+    }
 }
