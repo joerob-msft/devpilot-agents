@@ -57,6 +57,20 @@ function New-AgentOutputContext {
     }
 }
 
+function Set-AgentOutputLegacySuppression {
+    <#
+        Preference variables are scoped to the module that executes a command.
+        A wrapper cannot suppress Write-Warning calls made inside this harness
+        merely by changing its own $WarningPreference. Set both module-local
+        preferences here so Compact/Interactive/Json output remains owned by
+        the event renderer, including when harness helpers emit diagnostics.
+    #>
+    $script:InformationPreference = 'SilentlyContinue'
+    $script:WarningPreference = 'SilentlyContinue'
+    $script:PSDefaultParameterValues['Write-Host:InformationAction'] = 'Ignore'
+    $script:PSDefaultParameterValues['Write-Warning:WarningAction'] = 'SilentlyContinue'
+}
+
 function Get-AgentNormalizedSkipReason {
     param([AllowEmptyString()][string]$Reason)
     $value = $Reason.Trim().ToLowerInvariant()
@@ -288,6 +302,7 @@ function Publish-AgentEvent {
 Export-ModuleMember -Function @(
     'Test-AgentInteractiveOutput',
     'New-AgentOutputContext',
+    'Set-AgentOutputLegacySuppression',
     'Get-AgentNormalizedSkipReason',
     'Format-AgentCount',
     'Format-AgentSkipSummary',

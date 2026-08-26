@@ -814,6 +814,7 @@ if ($script:HandlerOutputContext.Mode -ne 'Detailed' -and (-not $DryRun -or $Out
     $WarningPreference = 'SilentlyContinue'
     $PSDefaultParameterValues['Write-Host:InformationAction'] = 'Ignore'
     $PSDefaultParameterValues['Write-Warning:WarningAction'] = 'SilentlyContinue'
+    Set-AgentOutputLegacySuppression
 }
 
 function Send-HandlerEvent {

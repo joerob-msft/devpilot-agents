@@ -2095,6 +2095,7 @@ if ($script:ReviewerOutputContext.Mode -ne 'Detailed' -and (-not $DryRun -or $Ou
     $WarningPreference = 'SilentlyContinue'
     $PSDefaultParameterValues['Write-Host:InformationAction'] = 'Ignore'
     $PSDefaultParameterValues['Write-Warning:WarningAction'] = 'SilentlyContinue'
+    Set-AgentOutputLegacySuppression
 }
 
 function Send-ReviewerEvent {

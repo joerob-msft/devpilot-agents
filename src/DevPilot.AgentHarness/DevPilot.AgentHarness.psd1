@@ -79,7 +79,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Assert-AgentSupportedModel', 'Test-ParserValidity', 
                'Get-OnceFinalExitCode', 'Test-StrictJsonInt', 'New-AgentNonce', 
                'Test-AgentValidatedParamRebind', 
-               'Test-AgentInteractiveOutput', 'New-AgentOutputContext',
+               'Test-AgentInteractiveOutput', 'New-AgentOutputContext', 'Set-AgentOutputLegacySuppression',
                'Get-AgentNormalizedSkipReason', 'Format-AgentCount',
                'Format-AgentSkipSummary', 'Publish-AgentEvent',
                'Test-AgentProtectedBranch', 'Get-AgentConfigProperty', 
@@ -158,4 +158,3 @@ PrivateData = @{
 # DefaultCommandPrefix = ''
 
 }
-
