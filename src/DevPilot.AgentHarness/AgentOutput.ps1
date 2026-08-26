@@ -52,6 +52,7 @@ function New-AgentOutputContext {
         WriteLine = $WriteLine
         WriteRaw = $WriteRaw
         StatusActive = $false
+        LastWorkCompletedCycle = -1
         LogMaxBytes = 10MB
         LogRetentionCount = 5
     }
@@ -87,7 +88,7 @@ function Get-AgentNormalizedSkipReason {
 
 function ConvertTo-ReviewerSafeEventValue {
     param($Value, [int]$Depth = 0, [string]$Key = '')
-    if ($Key -match '(?i)(token|secret|password|authorization|credential|pat)') { return '[REDACTED]' }
+    if ($Key -match '(?i)(token|secret|password|authorization|credential|^pat$|[_-]pat(?:$|[_-]))') { return '[REDACTED]' }
     if ($Depth -ge 4) { return '[TRUNCATED]' }
     if ($null -eq $Value -or $Value -is [bool] -or $Value -is [byte] -or
         $Value -is [int16] -or $Value -is [int32] -or $Value -is [int64] -or
@@ -214,11 +215,18 @@ function Write-ReviewerHumanEvent {
         'candidates.enumerated' {
             Write-ReviewerOutputLine $Context ("Scanned {0} across {1}" -f
                 (Format-AgentCount ([int]$data.scanned) 'PR'), (Format-AgentCount ([int]$data.pages) 'page'))
-            Write-ReviewerOutputLine $Context (Format-AgentSkipSummary -Counts $data.skipped)
+            $skipTotal = [int](($data.skipped.Values | Measure-Object -Sum).Sum)
+            if ($skipTotal -eq 0 -and [int]$data.selected -gt 0) {
+                Write-ReviewerOutputLine $Context 'Selected the first eligible candidate; remaining PRs were not evaluated'
+            }
+            else {
+                Write-ReviewerOutputLine $Context (Format-AgentSkipSummary -Counts $data.skipped)
+            }
         }
         'candidate.selected' { Write-ReviewerOutputLine $Context ("Selected PR {0} - {1}" -f $prId, $data.title) }
         'phase.changed' {
-            $text = "PR $prId  $($data.phase)  $([string](Format-ReviewerDuration ([long]$data.elapsedMilliseconds)))"
+            $scope = if ($prId -gt 0) { "PR $prId" } else { "Cycle $cycle" }
+            $text = "$scope  $($data.phase)  $([string](Format-ReviewerDuration ([long]$data.elapsedMilliseconds)))"
             if ($Context.Mode -eq 'Interactive') { Write-ReviewerInteractiveStatus $Context $text }
             else { Write-ReviewerOutputLine $Context $text }
         }
@@ -240,8 +248,13 @@ function Write-ReviewerHumanEvent {
             Write-ReviewerOutputLine $Context ("Delivered: {0}" -f $data.delivered)
             if ($data.previewPath) { Write-ReviewerOutputLine $Context ("Preview: {0}" -f $data.previewPath) }
             if ($data.reason) { Write-ReviewerOutputLine $Context ("Result detail: {0}" -f $data.reason) }
+            $Context.LastWorkCompletedCycle = $cycle
         }
-        'cycle.completed' { if ($message) { Write-ReviewerOutputLine $Context $message } }
+        'cycle.completed' {
+            if ($message -and [int]$Context.LastWorkCompletedCycle -ne $cycle) {
+                Write-ReviewerOutputLine $Context $message
+            }
+        }
         'cycle.failed' { Write-ReviewerOutputLine $Context ("ERROR: Cycle {0} failed: {1}" -f $cycle, $data.reason) }
         'agent.waiting' {
             Write-ReviewerOutputLine $Context ("Next {0} in {1}" -f $data.kind, (Format-ReviewerDuration ([long]$data.delayMilliseconds)))

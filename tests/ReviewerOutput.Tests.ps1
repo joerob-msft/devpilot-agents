@@ -101,6 +101,42 @@ Describe 'Reviewer output modes' {
         (Format-AgentSkipSummary @{}) | Should -Be 'Skipped 0: 0 routine skips'
     }
 
+    It 'renders pre-selection phases without a fake PR and explains first-candidate selection' {
+        $context = New-TestReviewerContext
+        Publish-AgentEvent $context phase.changed -Cycle 3 `
+            -Data @{ phase = 'enumerating candidates'; elapsedMilliseconds = 0 } | Out-Null
+        Publish-AgentEvent $context candidates.enumerated -Cycle 3 -Data @{
+            scanned = 169
+            pages = 2
+            selected = 1
+            skipped = @{}
+        } | Out-Null
+
+        $script:reviewerLines[0] | Should -Be 'Cycle 3  enumerating candidates  0s'
+        $script:reviewerLines | Should -Not -Match 'PR 0'
+        $script:reviewerLines[-1] | Should -Be 'Selected the first eligible candidate; remaining PRs were not evaluated'
+    }
+
+    It 'retains bounded preview paths and avoids duplicate cycle completion lines' {
+        $context = New-TestReviewerContext
+        $previewPath = 'C:\state\previews\pr42-abcdef.json'
+        Publish-AgentEvent $context work.completed -Cycle 4 -PrId 42 -Data @{
+            result = 'previewed'
+            elapsedMilliseconds = 1000
+            critical = 0
+            important = 0
+            suggestion = 0
+            delivered = 'preview only'
+            previewPath = $previewPath
+            reason = 'preview run; no write was requested'
+        } | Out-Null
+        Publish-AgentEvent $context cycle.completed -Cycle 4 `
+            -Message 'PR 42 reviewed (0 findings)' | Out-Null
+
+        $script:reviewerLines | Should -Contain "Preview: $previewPath"
+        $script:reviewerLines | Should -Not -Contain 'PR 42 reviewed (0 findings)'
+    }
+
     It 'cannot let rendering failures escape into the reviewer cycle' {
         $context = New-AgentOutputContext -Agent reviewer -OutputMode Compact -WriteLine { throw 'renderer failed' }
         { Publish-AgentEvent $context cycle.started -Cycle 1 | Out-Null } | Should -Not -Throw
