@@ -129,9 +129,45 @@ async function renderAt(
   }
 }
 
-test("brand plane keeps the mast and center fuselage in the same column", () => {
-  assert.deepEqual(BRAND_PLANE, ["       __|__", "--o--o--(_)--o--o--"]);
+test("brand plane rows share one centered monospace geometry", () => {
+  assert.deepEqual(BRAND_PLANE, ["       __|__       ", "--o--o--(_)--o--o--"]);
+  assert.equal(BRAND_PLANE[0].length, BRAND_PLANE[1].length);
   assert.equal(BRAND_PLANE[0].indexOf("|"), BRAND_PLANE[1].indexOf("_"));
+  assert.equal(BRAND_PLANE[0].indexOf("|"), Math.floor(BRAND_PLANE[0].length / 2));
+});
+
+test("brand plane renders on one center column", async (context) => {
+  const reducer = new OperationsReducer();
+  const tailer = new EventTailer({
+    stateDirectories: [],
+    eventLogPaths: [],
+    onEvent: () => {},
+    onDiagnostic: () => {},
+  });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={reducer} tailer={tailer} />, {
+      width: 70,
+      height: 24,
+      kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    const rows = setup.captureCharFrame().split("\n");
+    const tail = rows.find((row) => row.includes("__|__"));
+    const fuselage = rows.find((row) => row.includes("--o--o--(_)--o--o--"));
+    assert.ok(tail);
+    assert.ok(fuselage);
+    assert.equal(tail.indexOf("|"), fuselage.indexOf("_"));
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await tailer.stop();
+  }
 });
 
 test("URL validation only permits credential-free HTTP(S) URLs", () => {

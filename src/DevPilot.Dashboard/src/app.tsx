@@ -17,7 +17,7 @@ import { liveElapsedMilliseconds, OperationsReducer, totalElapsedMilliseconds } 
 import type { AgentRole, BlockedWarning, Completion, InstanceState } from "./domain.js";
 import type { EventTailer } from "./tailer.js";
 
-export const BRAND_PLANE = ["       __|__", "--o--o--(_)--o--o--"] as const;
+export const BRAND_PLANE = ["       __|__       ", "--o--o--(_)--o--o--"] as const;
 
 const COLORS = {
   bg: "#08090a",
