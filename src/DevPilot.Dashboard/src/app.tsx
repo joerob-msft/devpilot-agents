@@ -116,17 +116,18 @@ function WarningBlock(props: { instance: InstanceState }) {
           borderStyle="single"
           borderColor={COLORS.warning}
           backgroundColor="#282117"
+          height={blocked().nextRetry ? 5 : 4}
           paddingX={1}
           flexDirection="column"
           marginBottom={1}
         >
-          <text fg={COLORS.warning}>BLOCKED: {line(blocked().reason, 100)}</text>
-          <text fg={COLORS.text}>
+          <text height={1} fg={COLORS.warning}>BLOCKED: {line(blocked().reason, 100)}</text>
+          <text height={1} fg={COLORS.text}>
             Outstanding: {blocked().outstanding.join(", ") || "not reported"} | Retryable:{" "}
             {blocked().retryable ? "yes" : "no"}
           </text>
           <Show when={blocked().nextRetry}>
-            <text fg={COLORS.muted}>Next retry: {blocked().nextRetry}</text>
+            <text height={1} fg={COLORS.muted}>Next retry: {blocked().nextRetry}</text>
           </Show>
         </box>
       )}
@@ -146,6 +147,23 @@ function waitingLabel(instance: InstanceState): string {
     : "no wait scheduled";
 }
 
+function FieldColumn(props: {
+  label: string;
+  value: string;
+  detail?: string;
+  valueColor?: string;
+}) {
+  return (
+    <box flexDirection="column" flexGrow={1} minWidth={0} height={3}>
+      <text height={1} fg={COLORS.muted}>{props.label}</text>
+      <text height={1} fg={props.valueColor ?? COLORS.text}>{props.value}</text>
+      <Show when={props.detail !== undefined}>
+        <text height={1} fg={COLORS.muted}>{props.detail}</text>
+      </Show>
+    </box>
+  );
+}
+
 function Detail(props: { instance: InstanceState | undefined; now: number }) {
   return (
     <Panel
@@ -157,60 +175,59 @@ function Detail(props: { instance: InstanceState | undefined; now: number }) {
         {(instance: () => InstanceState) => (
           <box flexDirection="column" flexGrow={1}>
             <WarningBlock instance={instance()} />
-            <box flexDirection="row" gap={2} marginBottom={1}>
-              <box flexDirection="column" flexGrow={1}>
-                <text fg={COLORS.muted}>CURRENT PHASE</text>
-                <text fg={COLORS.accent}>{line(instance().phase, 60)}</text>
-                <text fg={COLORS.text}>
-                  elapsed {duration(liveElapsedMilliseconds(instance(), props.now))} | cycle {instance().cycleNumber || "-"}
-                </text>
-              </box>
-              <box flexDirection="column" flexGrow={1}>
-                <text fg={COLORS.muted}>PULL REQUEST</text>
-                <text fg={COLORS.text}>
-                  {instance().pullRequestId ? `#${instance().pullRequestId} ${line(instance().pullRequestTitle, 42)}` : "none selected"}
-                </text>
-                <text fg={COLORS.muted}>commit {shortCommit(instance().sourceCommit)}</text>
-              </box>
+            <box flexDirection="row" gap={2} height={3} marginBottom={1}>
+              <FieldColumn
+                label="CURRENT PHASE"
+                value={line(instance().phase, 60)}
+                detail={`elapsed ${duration(liveElapsedMilliseconds(instance(), props.now))} | cycle ${instance().cycleNumber || "-"}`}
+                valueColor={COLORS.accent}
+              />
+              <FieldColumn
+                label="PULL REQUEST"
+                value={instance().pullRequestId ? `#${instance().pullRequestId} ${line(instance().pullRequestTitle, 42)}` : "none selected"}
+                detail={`commit ${shortCommit(instance().sourceCommit)}`}
+              />
             </box>
 
-            <box flexDirection="row" gap={2} marginBottom={1}>
-              <box flexDirection="column" flexGrow={1}>
-                <text fg={COLORS.muted}>CANDIDATES</text>
-                <text fg={COLORS.text}>
-                  scanned {instance().candidates.scanned} | selected {instance().candidates.selected} | skipped{" "}
-                  {instance().candidates.skipped}
-                </text>
-              </box>
-              <box flexDirection="column" flexGrow={1}>
-                <text fg={COLORS.muted}>COMPLETION / NEXT WAIT</text>
-                <text fg={instance().completion?.result === "failed" ? COLORS.error : COLORS.text}>
-                  {completionLabel(instance())}
-                </text>
-                <text fg={COLORS.muted}>{waitingLabel(instance())}</text>
-              </box>
+            <box flexDirection="row" gap={2} height={3} marginBottom={1}>
+              <FieldColumn
+                label="CANDIDATES"
+                value={`scanned ${instance().candidates.scanned} | selected ${instance().candidates.selected} | skipped ${instance().candidates.skipped}`}
+              />
+              <FieldColumn
+                label="COMPLETION / NEXT WAIT"
+                value={completionLabel(instance())}
+                detail={waitingLabel(instance())}
+                valueColor={instance().completion?.result === "failed" ? COLORS.error : COLORS.text}
+              />
             </box>
 
-            <text fg={COLORS.muted}>RECENT CYCLES</text>
-            <text fg={COLORS.text}>
-              {instance().cycles.length
-                ? instance()
-                    .cycles.slice(-4)
-                    .map((cycle) => `#${cycle.cycleNumber} ${cycle.result} (${cycle.selected}/${cycle.scanned})`)
-                    .join(" | ")
-                : "no completed cycles"}
-            </text>
+            <box flexDirection="column" height={2} marginBottom={1}>
+              <text height={1} fg={COLORS.muted}>RECENT CYCLES</text>
+              <text height={1} fg={COLORS.text}>
+                {instance().cycles.length
+                  ? instance()
+                      .cycles.slice(-4)
+                      .map((cycle) => `#${cycle.cycleNumber} ${cycle.result} (${cycle.selected}/${cycle.scanned})`)
+                      .join(" | ")
+                  : "no completed cycles"}
+              </text>
+            </box>
 
             <Show when={instance().completion}>
               {(completion: () => Completion) => (
-                <box flexDirection="column" marginBottom={1}>
-                  <text fg={COLORS.muted}>FINDINGS / DELIVERY</text>
-                  <text fg={COLORS.text}>
+                <box
+                  flexDirection="column"
+                  height={completion().summary || completion().reason ? 3 : 2}
+                  marginBottom={1}
+                >
+                  <text height={1} fg={COLORS.muted}>FINDINGS / DELIVERY</text>
+                  <text height={1} fg={COLORS.text}>
                     critical {completion().findings.critical} | important {completion().findings.important} | suggestion{" "}
                     {completion().findings.suggestion}
                   </text>
                   <Show when={completion().summary || completion().reason}>
-                    <text fg={completion().reason ? COLORS.warning : COLORS.muted}>
+                    <text height={1} fg={completion().reason ? COLORS.warning : COLORS.muted}>
                       {line(completion().reason || completion().summary, 110)}
                     </text>
                   </Show>
@@ -218,11 +235,11 @@ function Detail(props: { instance: InstanceState | undefined; now: number }) {
               )}
             </Show>
 
-            <text fg={COLORS.muted}>TIMELINE (latest)</text>
+            <text height={1} fg={COLORS.muted}>TIMELINE (latest)</text>
             <scrollbox flexGrow={1} scrollY stickyScroll stickyStart="bottom">
               <For each={instance().timeline.slice(-30)}>
                 {(event) => (
-                  <text fg={event.level === "error" ? COLORS.error : event.level === "warning" ? COLORS.warning : COLORS.text}>
+                  <text height={1} fg={event.level === "error" ? COLORS.error : event.level === "warning" ? COLORS.warning : COLORS.text}>
                     {new Date(event.timestampMs).toISOString().slice(11, 19)} {line(eventSummary(event), 112)}
                   </text>
                 )}
@@ -332,6 +349,24 @@ export function App(props: AppProps) {
     revision();
     return props.reducer.counts(now());
   });
+  const footer = createMemo(() => {
+    const longCounts = `FAILED ${counts().failed} | BLOCKED ${counts().blocked} | RUNNING ${counts().running} | WAITING ${counts().waiting} | COMPLETED ${counts().completed} | STALE ${counts().stale}`;
+    const shortCounts = `F ${counts().failed}  B ${counts().blocked}  R ${counts().running}  W ${counts().waiting}  C ${counts().completed}  S ${counts().stale}`;
+    const wideHint = "arrows/jk select | Enter detail | Esc overview | Tab role | i/e overlays | Ctrl+P | ? | q";
+    if (dimensions().width >= longCounts.length + wideHint.length + 4) {
+      return { counts: longCounts, hint: wideHint };
+    }
+    if (dimensions().width >= 100) {
+      return { counts: shortCounts, hint: "arrows/jk | Enter | Tab role | i/e | ? | q" };
+    }
+    if (dimensions().width >= 75) {
+      return { counts: shortCounts, hint: "Enter detail | ? | q" };
+    }
+    return {
+      counts: `F${counts().failed} B${counts().blocked} R${counts().running}`,
+      hint: "Enter | ? | q",
+    };
+  });
 
   createEffect(() => {
     if (selected() >= instances().length) setSelected(Math.max(0, instances().length - 1));
@@ -435,7 +470,7 @@ export function App(props: AppProps) {
 
   return (
     <box width="100%" height="100%" flexDirection="column" backgroundColor={COLORS.bg}>
-      <box height={2} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
+      <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
         <text fg={COLORS.accent}>DEVPILOT OPERATIONS</text>
         <text fg={COLORS.muted}>OBSERVE ONLY | role: {role().toUpperCase()} | {layout().mode.toUpperCase()}</text>
       </box>
@@ -459,9 +494,9 @@ export function App(props: AppProps) {
       </Show>
       <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
         <text fg={COLORS.text}>
-          F {counts().failed}  B {counts().blocked}  R {counts().running}  W {counts().waiting}  C {counts().completed}  S {counts().stale}
+          {footer().counts}
         </text>
-        <text fg={COLORS.muted}>arrows/jk select | Enter detail | Esc overview | Tab role | i/e overlays | Ctrl+P | ? | q</text>
+        <text fg={COLORS.muted}>{footer().hint}</text>
       </box>
 
       <Show when={layout().showInspector && layout().inspectorOverlay}>

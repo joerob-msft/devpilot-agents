@@ -49,12 +49,14 @@ test("operations console renders through the OpenTUI Solid renderer", async (con
     onEvent: () => {},
     onDiagnostic: () => {},
   });
+  const setups: TestRendererSetup[] = [];
   let setup: TestRendererSetup;
   try {
     setup = await testRender(() => <App reducer={reducer} tailer={tailer} />, {
       width: 140,
       height: 30,
     });
+    setups.push(setup);
   } catch (error) {
     if (error instanceof Error && error.message.includes("native FFI is not available")) {
       context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
@@ -65,15 +67,47 @@ test("operations console renders through the OpenTUI Solid renderer", async (con
   try {
     await setup.renderOnce();
     const wide = setup.captureCharFrame();
+    const lines = wide.split("\n");
     assert.match(wide, /DEVPILOT OPERATIONS/);
     assert.match(wide, /API Hub/);
     assert.match(wide, /BLOCKED/);
     assert.match(wide, /INSPECTOR/);
-    setup.resize(70, 24);
-    await setup.renderOnce();
-    assert.match(setup.captureCharFrame(), /INSTANCES/);
+    assert.match(wide, /CURRENT PHASE/);
+    assert.match(wide, /COMPLETION \/ NEXT WAIT/);
+    assert.match(wide, /work in progress/);
+    assert.match(wide, /RECENT CYCLES/);
+    assert.match(wide, /no completed cycles/);
+    assert.match(wide, /TIMELINE \(latest\)/);
+    assert.match(wide, /Next retry: next cycle/);
+    assert.equal(lines.some((line) => line.includes("COMPLETION / NEXT WAIT") && line.includes("work in progress")), false);
+    assert.equal(lines.some((line) => line.includes("RECENT CYCLES") && line.includes("no completed cycles")), false);
+    assert.equal(lines.some((line) => line.includes("BLOCKED:") && line.includes("Outstanding:")), false);
+    assert.equal(lines.some((line) => line.includes("Outstanding:") && line.includes("Next retry:")), false);
+    const standardSetup = await testRender(() => <App reducer={reducer} tailer={tailer} />, {
+      width: 100,
+      height: 26,
+    });
+    setups.push(standardSetup);
+    await standardSetup.renderOnce();
+    const standard = standardSetup.captureCharFrame();
+    assert.match(standard, /role: ALL \| STANDARD/);
+    assert.match(standard, /COMPLETION \/ NEXT WAIT/);
+    assert.match(standard, /RECENT CYCLES/);
+    assert.doesNotMatch(standard, /TIMELINEe\(latest\)es/);
+
+    const compactSetup = await testRender(() => <App reducer={reducer} tailer={tailer} />, {
+      width: 70,
+      height: 24,
+    });
+    setups.push(compactSetup);
+    await compactSetup.renderOnce();
+    const compact = compactSetup.captureCharFrame();
+    assert.match(compact, /role: ALL \| COMPACT/);
+    assert.match(compact, /INSTANCES/);
+    assert.match(compact, /F0 B1 R0/);
+    assert.match(compact, /Enter \| \? \| q/);
   } finally {
-    setup.renderer.destroy();
+    for (const item of setups.reverse()) item.renderer.destroy();
     await tailer.stop();
   }
 });
