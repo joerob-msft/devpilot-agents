@@ -323,9 +323,15 @@ Describe 'Shared reviewer and review-handler event contract' {
         $errors | Should -BeNullOrEmpty
         @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) |
             Should -Contain 'AttachOnly'
+        @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) |
+            Should -Contain 'Continuous'
+        @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) |
+            Should -Contain 'IntervalSeconds'
         $source = Get-Content -LiteralPath $path -Raw
         $source | Should -Match "OutputMode = 'Json'"
         $source | Should -Match 'Once = \$true'
+        $source | Should -Match 'IntervalSeconds = \$IntervalSeconds'
+        $source | Should -Match '\$Continuous\s+-and\s+\$PullRequestId\s+-gt\s+0'
         $source | Should -Not -Match 'EnableFindingComments\s*='
         $source | Should -Not -Match 'EnableThreadReplies\s*='
         $source | Should -Not -Match 'EnableSummaryComment\s*='
@@ -334,7 +340,8 @@ Describe 'Shared reviewer and review-handler event contract' {
         $source.IndexOf('& $dashboardLauncher -StateDir $StateDir -ValidateOnly') |
             Should -BeLessThan $source.IndexOf('$reviewerProcess = Start-Process')
         $source | Should -Match '\$dashboardCompletedNormally\s*=\s*\$false'
-        $source | Should -Match 'Stop-Process\s+-Id\s+\$reviewerProcess\.Id'
+        $source | Should -Match '\$reviewerProcess\.Kill\(\$true\)'
+        $source | Should -Match '\(-not \$dashboardCompletedNormally -or \$Continuous\)'
     }
 
     It 'prefers the co-located harness over a stale loaded module' -ForEach @(

@@ -257,12 +257,29 @@ and watch it in the current terminal:
 The watcher starts the reviewer in a separate process with `-Once`,
 `-OutputMode Json`, and no write or notification switches. The TUI is scoped
 to the generated state directory, so the new live run is not mixed with older
-history. Closing the dashboard does not terminate a review that is still
-running. Reattach later with the state path printed by the watcher:
+history. In the default one-cycle mode, closing the dashboard does not
+terminate a review that is still running. Reattach later with the state path
+printed by the watcher:
 
 ```powershell
 ./tools/Watch-DevPilotReviewer.ps1 -AttachOnly -StateDir <printed-state-path>
 ```
+
+To run the same read-only workflow continuously from one command, omit
+`-PullRequestId` and use `-Continuous`:
+
+```powershell
+# Test cadence:
+./tools/Watch-DevPilotReviewer.ps1 -Continuous -IntervalSeconds 60
+
+# Normal 15-minute cadence:
+./tools/Watch-DevPilotReviewer.ps1 -Continuous
+```
+
+The continuous reviewer remains preview-only. It scans until the dashboard
+exits, then the watcher stops the reviewer process tree so no hidden background
+agent is left running. `-PullRequestId` is intentionally incompatible with
+`-Continuous` to prevent repeatedly reviewing one pull request.
 
 Install and build its locked dependencies once:
 
