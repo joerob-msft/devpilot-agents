@@ -177,6 +177,59 @@ review you have actually read is a first-class mode rather than a re-run:
     -EnableFindingComments -EnableThreadReplies -EnableSummaryComment
 ```
 
+### Console output and event stream
+
+Both `reviewer` and `review-handler` expose the same
+`-OutputMode Auto|Compact|Detailed|Json` contract:
+
+- **`Auto`** (default) uses a single bounded, cursor-refreshed phase line on an
+  interactive ANSI-capable terminal. It falls back to `Compact` when stdout is
+  redirected, the terminal is narrow, or cursor rendering is unavailable.
+- **`Compact`** emits bounded cycle summaries. Routine candidate exclusions are
+  aggregated by reason instead of printing one line per pull request.
+- **`Detailed`** retains individual candidate skip and delivery diagnostics.
+- **`Json`** writes only JSON Lines events to stdout. Human status text is
+  suppressed; failures are represented as error events and still preserve the
+  process exit code.
+
+```powershell
+# Bounded output for a service log
+./src/Agents/reviewer/Start-ReviewerAgent.ps1 -OutputMode Compact `
+    -ConfigFile <path> -OperatorAlias <alias>
+
+# Full operator diagnostics
+./src/Agents/review-handler/Start-ReviewHandlerAgent.ps1 -OutputMode Detailed `
+    -ConfigFile <path> -OperatorAlias <alias>
+
+# Feed an external monitor
+./src/Agents/reviewer/Start-ReviewerAgent.ps1 -OutputMode Json `
+    -ConfigFile <path> -OperatorAlias <alias> > reviewer-events.jsonl
+```
+
+Every mode also writes a bounded diagnostic event log under the agent state
+directory: `logs/reviewer.events.jsonl` or
+`logs/review-handler.events.jsonl`. A file rotates at 10 MiB and five rotated
+files are retained. Existing cycle metadata logs and failed-cycle transcripts
+remain unchanged.
+
+The shared event envelope is:
+
+```text
+agent, instanceId, processId, timestamp, sequence, eventType, level,
+cycleNumber, pullRequestId, sourceCommit, data, message
+```
+
+`instanceId` is stable for one process and `sequence` increases monotonically
+within that process, so events from concurrent reviewer and review-handler
+instances can be merged without parsing human console strings. Event data is
+depth-, count-, and string-bounded, and sensitive key names are redacted.
+Candidate, phase, blocked-delivery, completion, failure, and waiting events use
+the same envelope in both agents while retaining agent-specific payloads.
+
+This schema intentionally supports a future combined reviewer and
+review-handler dashboard (for example, `Start-DevPilotDashboard.ps1`), while
+the dashboard/TUI itself is intentionally deferred.
+
 `-PromotePreview` publishes the artifact's **delivery manifest** — the exact
 comment and thread-reply lists, summary and vote that appeared in the Markdown you read — and
 three things have to hold before any of it goes out. The artifact's HMAC seal
