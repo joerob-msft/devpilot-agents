@@ -109,6 +109,12 @@
     Run exactly one cycle then exit. Never masks a failed/timed-out cycle as
     exit 0.
 
+.PARAMETER OutputMode
+    Controls reviewer console output. Auto (the default) uses a bounded
+    interactive status line when safe and otherwise falls back to Compact.
+    Compact emits concise cycle summaries, Detailed retains individual
+    diagnostic records, and Json emits one structured event per stdout line.
+
 .EXAMPLE
     .\Start-ReviewerAgent.ps1 -DryRun -ConfigFile ..\repo\.github\copilot\agents\reviewer.config.json
     Validate the agent end-to-end (all self-checks) without any side effects.
@@ -229,7 +235,10 @@ param(
     [int]$MaxBackoffSeconds = 1800,
 
     [ValidateRange(30, 7200)]
-    [int]$CycleTimeoutSeconds = 1800
+    [int]$CycleTimeoutSeconds = 1800,
+
+    [ValidateSet('Auto', 'Compact', 'Detailed', 'Json')]
+    [string]$OutputMode = 'Auto'
 )
 
 $ErrorActionPreference = "Stop"
@@ -237,6 +246,8 @@ Set-StrictMode -Version Latest
 $script:ReviewerUtf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $script:ReviewerUtf8
 $OutputEncoding = $script:ReviewerUtf8
+$script:ReviewerOutputContext = $null
+
 
 # One top-level try/catch so ANY uncaught error surfaces as a nonzero exit,
 # never a silently-masked exit 0. Explicit `exit N` bypasses this catch.
@@ -1309,12 +1320,7 @@ function Get-ReviewerActivePullRequests {
             $prId = [int]$rawId
             if ($seen.Add($prId)) { [void]$records.Add($pr) }
         }
-        if ($page.Count -lt $PageSize) {
-            Write-Host (("Enumerated {0} unique active PR record(s) across {1} ADO page(s). " +
-                    "Offset pagination can still miss a PR that moves between pages while enumeration is running.") -f
-                $records.Count, ($pageNumber + 1)) -ForegroundColor DarkGray
-            return , ($records.ToArray())
-        }
+        if ($page.Count -lt $PageSize) { return , ($records.ToArray()) }
     }
     throw "ADO pull-request listing filled all $MaxPages page(s) of $PageSize; refusing to return a silently truncated candidate set."
 }
@@ -2074,11 +2080,36 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $previewDir = Join-Path $StateDir "previews"
 New-Item -ItemType Directory -Force -Path $previewDir | Out-Null
 $logPath = Join-Path $logDir "reviewer.log.jsonl"
+$eventLogPath = Join-Path $logDir "reviewer.events.jsonl"
 $lockPath = Join-Path $StateDir "agent.lock"
 $reviewedStatePath = Join-Path $StateDir "reviewed.json"
 $attemptsStatePath = Join-Path $StateDir "attempts.json"
 $notificationsStatePath = Join-Path $StateDir "notifications.json"
 $artifactKeyPath = Join-Path $StateDir "artifact-signing.key"
+
+$script:ReviewerOutputContext = New-AgentOutputContext -Agent reviewer -OutputMode $OutputMode -LogPath $eventLogPath
+if ($script:ReviewerOutputContext.Mode -ne 'Detailed' -and (-not $DryRun -or $OutputMode -eq 'Json')) {
+    # Legacy host output remains available in Detailed. Other modes are fed
+    # exclusively by the structured event boundary.
+    $InformationPreference = 'SilentlyContinue'
+    $WarningPreference = 'SilentlyContinue'
+    $PSDefaultParameterValues['Write-Host:InformationAction'] = 'Ignore'
+    $PSDefaultParameterValues['Write-Warning:WarningAction'] = 'SilentlyContinue'
+}
+
+function Send-ReviewerEvent {
+    param(
+        [Parameter(Mandatory)][string]$EventType,
+        [ValidateSet('debug', 'info', 'warning', 'error')][string]$Level = 'info',
+        [int]$Cycle = 0,
+        [int]$PrId = 0,
+        [string]$SourceCommit = '',
+        [System.Collections.IDictionary]$Data = @{},
+        [AllowEmptyString()][string]$Message = ''
+    )
+    Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType $EventType -Level $Level `
+        -Cycle $Cycle -PrId $PrId -SourceCommit $SourceCommit -Data $Data -Message $Message | Out-Null
+}
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 # Two children, two different scrubs, and the asymmetry is deliberate rather
@@ -4974,8 +5005,11 @@ function Invoke-ReviewerPullRequest {
     $prId = [int]$Bound.PrId
     $sourceCommit = [string]$Bound.SourceCommit
     $prTitle = [string]$Bound.Title
+    $reviewTimer = [Diagnostics.Stopwatch]::StartNew()
 
-    Write-Host ("Reviewing PR {0}  '{1}'  author={2}  commit={3}" -f $prId, $prTitle, $Bound.AuthorAlias, $sourceCommit.Substring(0, 12)) -ForegroundColor Yellow
+    Send-ReviewerEvent phase.changed -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
+        -Data @{ phase = 'preparing bounded model input'; elapsedMilliseconds = $reviewTimer.ElapsedMilliseconds } `
+        -Message ("Reviewing PR {0} '{1}' author={2} commit={3}" -f $prId, $prTitle, $Bound.AuthorAlias, $sourceCommit.Substring(0, 12))
 
     # -- Build the bounded stdin payload -------------------------------------
     $nonce = New-AgentNonce
@@ -4993,7 +5027,9 @@ function Invoke-ReviewerPullRequest {
     $modelArg = if ($EffectiveModel -eq (Get-AgentDefaultModelSentinel)) { $null } else { $EffectiveModel }
     $agencyArgs = Get-AgentCopilotArgs -AgentName $CopilotAgentName -Source $CopilotAgentSource `
         -AllowTools $allowTools -DenyTools $denyTools -Model $modelArg -JsonOutput
-    Write-Host "Launching Copilot (read-only, timeout=${CycleTimeoutSeconds}s)..." -ForegroundColor Cyan
+    Send-ReviewerEvent phase.changed -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
+        -Data @{ phase = 'running the model'; elapsedMilliseconds = $reviewTimer.ElapsedMilliseconds } `
+        -Message "Launching Copilot (read-only, timeout=${CycleTimeoutSeconds}s)..."
 
     $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs -StandardInputContent $stdin `
         -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
@@ -5012,6 +5048,9 @@ function Invoke-ReviewerPullRequest {
         }
     }
     $marker = $null
+    Send-ReviewerEvent phase.changed -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
+        -Data @{ phase = 'validating findings'; elapsedMilliseconds = $reviewTimer.ElapsedMilliseconds } `
+        -Message "Validating the model result and findings for PR $prId."
     if ($run.ExitCode -eq 0 -and -not $run.TimedOut) {
         $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource -MarkerPrefix $ResultMarkerPrefix `
             -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce `
@@ -5094,6 +5133,10 @@ function Invoke-ReviewerPullRequest {
             -Body ("$reason" + $(if ($launchFailureReason) { " This is an environment fault on the agent host, not a problem with the pull request." } else { "" })) `
             -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) `
             -Links @(Get-ReviewerPullRequestLink -PrId $prId)
+        Send-ReviewerEvent work.completed -Level error -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+            title = $prTitle; result = 'failed'; elapsedMilliseconds = $reviewTimer.ElapsedMilliseconds
+            critical = 0; important = 0; suggestion = 0; delivered = 'none'; reason = $reason
+        } -Message "PR $prId failed: $reason"
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -5189,6 +5232,11 @@ function Invoke-ReviewerPullRequest {
     # -- Wrapper-owned writes (each behind its own switch) --------------------
     # An empty change set means the read failed; it is fine for a preview (the
     # findings are shown to a human) but delivery must refuse it.
+    if ($writesRequested) {
+        Send-ReviewerEvent phase.changed -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
+            -Data @{ phase = 'publishing comments, replies, summary, and vote'; elapsedMilliseconds = $reviewTimer.ElapsedMilliseconds } `
+            -Message "Publishing enabled review capabilities for PR $prId."
+    }
     $delivery = Invoke-ReviewerDelivery -Session $Session -PrId $prId -SourceCommit $sourceCommit `
         -Postable $postable -ThreadReplies $threadReplies -ThreadTargets $Bound.ThreadReplyTargets `
         -SummaryText $summaryText -Presentation $presentation -SummaryFindings $allFindings `
@@ -5297,6 +5345,25 @@ function Invoke-ReviewerPullRequest {
             -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) -Links @($prLink)
     }
 
+    $deliveredParts = New-Object System.Collections.Generic.List[string]
+    if ($postedCount -gt 0) { [void]$deliveredParts.Add((Format-AgentCount $postedCount 'comment')) }
+    if ($threadRepliesPosted -gt 0) { [void]$deliveredParts.Add((Format-AgentCount $threadRepliesPosted 'reply' 'replies')) }
+    if ($summaryPosted) { [void]$deliveredParts.Add('summary') }
+    if ($castVote) { [void]$deliveredParts.Add("vote '$castVote'") }
+    if ($deliveredParts.Count -eq 0) { [void]$deliveredParts.Add($(if ($writesRequested) { 'none' } else { 'preview only' })) }
+    if ($writesRequested -and @($unresolved).Count -gt 0) {
+        Send-ReviewerEvent delivery.blocked -Level warning -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+            title = $prTitle; reason = [string]$delivery.Reason; outstanding = @($unresolved)
+            retryable = (-not [bool]$delivery.TerminalAbort); nextRetry = $(if ($Once) { 'manual rerun' } else { 'after cycle backoff' })
+        } -Message "PR $prId delivery blocked: $($delivery.Reason). Outstanding: $(@($unresolved) -join ', ')."
+    }
+    Send-ReviewerEvent work.completed -Level $(if ($exit -eq 0) { 'info' } else { 'warning' }) `
+        -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+            title = $prTitle; result = $(if ($exit -eq 0) { $(if ($writesRequested) { 'reviewed' } else { 'previewed' }) } else { 'partially delivered' })
+            elapsedMilliseconds = $reviewTimer.ElapsedMilliseconds; critical = $counts['critical']
+            important = $counts['important']; suggestion = $counts['suggestion']
+            delivered = ($deliveredParts -join ', '); previewPath = $previewPath; reason = [string]$delivery.Reason
+        } -Message "PR $prId reviewed with $($allFindings.Count) finding(s); $postedCount comment(s) and $threadRepliesPosted reply/replies delivered."
     return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted, $threadRepliesPosted thread assessment(s))" }
 }
 
@@ -5338,6 +5405,9 @@ function Invoke-ReviewerPromotion {
         # retry reuses the cycle's session instead of opening a second one.
         [hashtable]$ExistingSession
     )
+    $promotionTimer = [Diagnostics.Stopwatch]::StartNew()
+    Send-ReviewerEvent phase.changed -Data @{ phase = 'reading and validating the sealed review'; elapsedMilliseconds = 0 } `
+        -Message "Reading sealed reviewer artifact '$ArtifactPath'."
     if (-not (Test-Path -LiteralPath $ArtifactPath)) { throw "Preview artifact not found: $ArtifactPath" }
     $raw = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json
 
@@ -5381,6 +5451,9 @@ function Invoke-ReviewerPromotion {
     $prId = [int]$signed.prId
     $sourceCommit = [string]$signed.sourceCommit
     $prTitle = [string](Get-ReviewerHashValue -Container $signed -Key 'prTitle' -Default "PR $prId")
+    Send-ReviewerEvent candidate.selected -PrId $prId -SourceCommit $sourceCommit -Data @{
+        title = $prTitle
+    } -Message "Selected stored review for PR $prId - $prTitle"
 
     # The Markdown is what the operator actually read. Publishing a manifest
     # while that document says something else breaks the only guarantee this
@@ -5594,6 +5667,9 @@ function Invoke-ReviewerPromotion {
         }
         Set-JsonState -Path $reviewedStatePath -State $reviewedState
 
+        Send-ReviewerEvent phase.changed -PrId $prId -SourceCommit $sourceCommit -Data @{
+            phase = 'publishing comments, replies, summary, and vote'; elapsedMilliseconds = $promotionTimer.ElapsedMilliseconds
+        } -Message "Promoting the sealed review for PR $prId."
         $delivery = Invoke-ReviewerDelivery -Session $session -PrId $prId -SourceCommit $sourceCommit `
             -Postable $postable -ThreadReplies $threadReplies -ThreadTargets $reviewedThreadTargets `
             -SummaryText ([string]$signed.approvedSummary) -Presentation $approvedPresentation -SummaryFindings $allFindings `
@@ -5681,8 +5757,22 @@ function Invoke-ReviewerPromotion {
             deliveryAborted = [bool]$delivery.Aborted; deliveryReason = [string]$delivery.Reason
         }
 
-        if ($delivery.Aborted) { Write-Warning "Nothing was published: $($delivery.Reason)."; return 1 }
-        if (-not $delivery.Delivered) { Write-Warning "The promotion did not fully land: $($delivery.Reason)."; return 1 }
+        if ($delivery.Aborted -or -not $delivery.Delivered) {
+            Send-ReviewerEvent delivery.blocked -Level warning -PrId $prId -SourceCommit $sourceCommit -Data @{
+                title = $prTitle; reason = [string]$delivery.Reason; outstanding = @($promotedUnresolved)
+                retryable = (-not [bool]$delivery.TerminalAbort)
+                nextRetry = $(if ($ExistingSession) { 'after cycle backoff' } else { 'manual rerun' })
+            } -Message "PR $prId promotion is incomplete: $($delivery.Reason)."
+            Send-ReviewerEvent work.completed -Level warning -PrId $prId -SourceCommit $sourceCommit -Data @{
+                title = $prTitle; result = 'partially delivered'; elapsedMilliseconds = $promotionTimer.ElapsedMilliseconds
+                critical = $counts['critical']; important = $counts['important']; suggestion = $counts['suggestion']
+                delivered = "$(Format-AgentCount ([int]$delivery.PostedCount) 'comment'), $(Format-AgentCount ([int]$delivery.ThreadRepliesPosted) 'reply' 'replies')"
+                previewPath = $previewPath; reason = [string]$delivery.Reason
+            } -Message "Stored review promotion for PR $prId did not fully land."
+            if ($delivery.Aborted) { Write-Warning "Nothing was published: $($delivery.Reason)." }
+            else { Write-Warning "The promotion did not fully land: $($delivery.Reason)." }
+            return 1
+        }
         Send-ReviewerTeamsNotification -NotificationEvent 'reviewCompleted' -AgencyPath $AgencyPath `
             -Title "Review posted on PR $prId" `
             -Body ("$($allFindings.Count) finding(s): $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion. " +
@@ -5691,6 +5781,12 @@ function Invoke-ReviewerPromotion {
             -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$delivery.AuthorUpn) `
             -Links @(Get-ReviewerPullRequestLink -PrId $prId)
         Write-Host "Promoted the stored review of PR $prId." -ForegroundColor Green
+        Send-ReviewerEvent work.completed -PrId $prId -SourceCommit $sourceCommit -Data @{
+            title = $prTitle; result = 'promoted'; elapsedMilliseconds = $promotionTimer.ElapsedMilliseconds
+            critical = $counts['critical']; important = $counts['important']; suggestion = $counts['suggestion']
+            delivered = "$(Format-AgentCount ([int]$delivery.PostedCount) 'comment'), $(Format-AgentCount ([int]$delivery.ThreadRepliesPosted) 'reply' 'replies')"
+            previewPath = $previewPath; reason = ''
+        } -Message "Promoted the stored review of PR $prId."
         return 0
     }
     finally {
@@ -5705,6 +5801,10 @@ function Invoke-ReviewerCycle {
     )
 
     $result = @{ ExitCode = 0; Summary = "no PR needed review" }
+    $cycleTimer = [Diagnostics.Stopwatch]::StartNew()
+    Send-ReviewerEvent cycle.started -Cycle $CycleNumber -Data @{} -Message "Cycle $CycleNumber started."
+    Send-ReviewerEvent phase.changed -Cycle $CycleNumber -Data @{ phase = 'enumerating candidates'; elapsedMilliseconds = 0 } `
+        -Message "Enumerating active pull requests."
     $session = $null
     try {
         $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
@@ -5723,7 +5823,7 @@ function Invoke-ReviewerCycle {
                 action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PullRequestId
             }
             $candidates = if ($direct) { @($direct) } else { @() }
-            Write-Host "Candidates: restricted to PR $PullRequestId ($($candidates.Count) found)." -ForegroundColor Cyan
+            $candidatePages = 1
         }
         else {
             $rawPrs = Get-ReviewerActivePullRequests -Session $session -Project $ExpectedProject `
@@ -5737,7 +5837,7 @@ function Invoke-ReviewerCycle {
             $candidates = @(@($rawPrs) | Where-Object { $_ } | Sort-Object `
                 @{ Expression = { Get-ReviewerLastReviewedSortKey -ReviewedState $reviewedState -PrId ([int](Get-ReviewerHashValue -Container $_ -Key 'pullRequestId' -Default 0)) }; Ascending = $true },
                 @{ Expression = { [int](Get-ReviewerHashValue -Container $_ -Key 'pullRequestId' -Default 0) }; Descending = $true })
-            Write-Host "Candidates: $($candidates.Count) active PR(s) targeting $TargetRefName, least-recently-reviewed first." -ForegroundColor Cyan
+            $candidatePages = [Math]::Max(1, [Math]::Ceiling($candidates.Count / 100.0))
         }
 
         $pruned = Remove-StaleAgentAttempts -AttemptsState $attemptsState -MaxAgeDays $MaxSourceCommitAgeDays
@@ -5752,12 +5852,22 @@ function Invoke-ReviewerCycle {
 
         # -- Step 2: bind up to -PullRequestsPerCycle reviewable PRs ----------
         $bound = New-Object System.Collections.Generic.List[hashtable]
+        $skipCounts = [ordered]@{
+            draft = 0; delivered = 0; own = 0; notReady = 0; starved = 0
+            invalidCommit = 0; budgetExhausted = 0; unfinishedDelivery = 0; other = 0
+        }
+        Send-ReviewerEvent phase.changed -Cycle $CycleNumber -Data @{ phase = 'selecting a PR'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds } `
+            -Message "Selecting up to $PullRequestsPerCycle reviewable pull request(s)."
         # Unfinished deliveries retried from their own sealed plan this cycle.
         $retried = New-Object System.Collections.Generic.List[string]
+        $blocked = New-Object System.Collections.Generic.List[string]
         foreach ($pr in $candidates) {
             if ($bound.Count -ge $PullRequestsPerCycle) { break }
             if ($selectionDeadline -and [DateTime]::UtcNow -gt $selectionDeadline) {
-                Write-Host "  Selection budget of ${SelectionBudgetSeconds}s exhausted; deferring the rest to the next cycle." -ForegroundColor DarkYellow
+                $skipCounts.budgetExhausted++
+                Send-ReviewerEvent candidate.skipped -Level warning -Cycle $CycleNumber -Data @{
+                    reason = 'selection budget exhausted'; normalizedReason = 'budgetExhausted'
+                } -Message "Selection budget of ${SelectionBudgetSeconds}s exhausted; deferring remaining candidates."
                 break
             }
 
@@ -5766,14 +5876,23 @@ function Invoke-ReviewerCycle {
                 -TargetRefName $TargetRefName -SkipTitlePatterns $SkipTitlePatterns
             $prId = [int](Get-ReviewerHashValue -Container $pr -Key 'pullRequestId' -Default 0)
             if (-not $decision.Eligible) {
-                if ($prId -gt 0) { Write-Host "  PR $prId skipped ($($decision.Reason))." -ForegroundColor DarkGray }
+                $normalizedReason = Get-AgentNormalizedSkipReason ([string]$decision.Reason)
+                $skipCounts[$normalizedReason]++
+                if ($prId -gt 0) {
+                    Send-ReviewerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -Data @{
+                        reason = [string]$decision.Reason; normalizedReason = $normalizedReason
+                    } -Message "PR $prId skipped ($($decision.Reason))."
+                }
                 continue
             }
 
             $attemptRecord = $attemptsState[[string]$prId]
             $attempts = if ($attemptRecord -is [int]) { [int]$attemptRecord } else { [int](Get-ReviewerHashValue -Container $attemptRecord -Key 'count' -Default 0) }
             if ($attempts -ge $ConsecutiveFailureThreshold) {
-                Write-Host "  PR $prId skipped (starved: $attempts consecutive failures). Clear with -ResetStarvedCandidates." -ForegroundColor DarkYellow
+                $skipCounts.starved++
+                Send-ReviewerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId -Data @{
+                    reason = "starved after $attempts consecutive failures"; normalizedReason = 'starved'; retryable = $true
+                } -Message "PR $prId skipped (starved: $attempts consecutive failures). Clear with -ResetStarvedCandidates."
                 # The most valuable notification this agent sends. A starved PR
                 # is silent by construction: the loop keeps running, exits 0,
                 # and reviews nothing - indistinguishable from having no work,
@@ -5787,6 +5906,9 @@ function Invoke-ReviewerCycle {
                 continue
             }
 
+            Send-ReviewerEvent phase.changed -Cycle $CycleNumber -PrId $prId -Data @{
+                phase = 'reading PR metadata, threads, and changed files'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+            } -Message "Reading metadata and review threads for PR $prId."
             # The list record usually already carries the merge source commit;
             # only pay for a detail read when it does not.
             $sourceCommit = Get-ReviewerSourceCommit -Pr $pr
@@ -5798,7 +5920,10 @@ function Invoke-ReviewerCycle {
                 $sourceCommit = Get-ReviewerSourceCommit -Pr $prRecord
             }
             if (-not $sourceCommit) {
-                Write-Host "  PR $prId skipped (no valid 40-hex source commit)." -ForegroundColor DarkYellow
+                $skipCounts.invalidCommit++
+                Send-ReviewerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId -Data @{
+                    reason = 'no valid 40-hex source commit'; normalizedReason = 'invalidCommit'
+                } -Message "PR $prId skipped (no valid 40-hex source commit)."
                 continue
             }
 
@@ -5829,7 +5954,10 @@ function Invoke-ReviewerCycle {
                     -WantComments ([bool]$EnableFindingComments) -WantThreadReplies ([bool]$EnableThreadReplies) `
                     -ThreadTargetsKnown $true -CurrentThreadReplyTargets @($digest.AllAssessmentTargets) `
                     -WantSummary ([bool]$EnableSummaryComment) -WantVote ([bool]$EnableApprovalVote)) {
-                Write-Host "  PR $prId skipped (already reviewed and delivered at this commit)." -ForegroundColor DarkGray
+                $skipCounts.delivered++
+                Send-ReviewerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                    reason = 'already reviewed and delivered'; normalizedReason = 'delivered'
+                } -Message "PR $prId skipped (already reviewed and delivered at this commit)."
                 continue
             }
 
@@ -5847,6 +5975,11 @@ function Invoke-ReviewerCycle {
                     Write-Warning ("PR $prId has an unfinished delivery whose sealed plan is no longer on disk " +
                         "($([string](Get-ReviewerHashValue -Container $stale -Key 'artifactPath' -Default '<none>'))). " +
                         "It will be reviewed again, and a finding that failed to post earlier may not be reported again.")
+                    Send-ReviewerEvent delivery.retrying -Level warning -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                        title = [string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId")
+                        reason = 'the sealed unfinished-delivery plan is missing from disk'
+                        outstanding = @((Get-ReviewerHashValue -Container $stale -Key 'pendingCapabilities' -Default @()))
+                    } -Message "PR $prId has an unfinished delivery whose sealed plan is missing; producing a replacement review."
                 }
             }
             if ($pendingPlan) {
@@ -5863,12 +5996,22 @@ function Invoke-ReviewerCycle {
                     Write-Warning ("PR $prId has an unfinished delivery sealed by a different version of the reviewer. " +
                         "Replaying it could duplicate comments and re-reviewing could lose a finding that never posted, " +
                         "so this PR is skipped. " + (Get-ReviewerVersionMismatchGuidance -ArtifactPath $pendingPlan))
-                    [void]$retried.Add("PR $prId skipped (delivery plan sealed by another build)")
+                    [void]$blocked.Add("PR $prId blocked (delivery plan sealed by another build)")
+                    $skipCounts.unfinishedDelivery++
+                    Send-ReviewerEvent delivery.blocked -Level warning -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                        title = [string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId")
+                        reason = 'unfinished delivery plan was sealed by another reviewer build'
+                        outstanding = @((Get-ReviewerHashValue -Container $reviewedState[[string]$prId] -Key 'pendingCapabilities' -Default @()))
+                        retryable = $true; nextRetry = 'after operator resolves the version mismatch'
+                    } -Message "PR $prId unfinished delivery is blocked by a reviewer version mismatch."
                     continue
                 }
             }
             if ($pendingPlan) {
-                Write-Host "  PR $prId has an unfinished delivery at this commit; retrying that exact review instead of re-reviewing." -ForegroundColor Yellow
+                Send-ReviewerEvent delivery.retrying -Level warning -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                    title = [string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId")
+                    outstanding = @((Get-ReviewerHashValue -Container $reviewedState[[string]$prId] -Key 'pendingCapabilities' -Default @()))
+                } -Message "PR $prId has an unfinished delivery; retrying the exact sealed review."
                 $retryCode = Invoke-ReviewerPromotion -AgencyPath $AgencyPath -ArtifactPath $pendingPlan -ExistingSession $session
                 if ([int]$retryCode -ne 0) { $result.ExitCode = 1 }
                 [void]$retried.Add("PR $prId delivery retried")
@@ -5894,16 +6037,38 @@ function Invoke-ReviewerCycle {
                     ChangedPaths         = $changedPaths
                     ExistingFingerprints = (Get-ReviewerExistingFingerprints -Threads $threads)
                 })
+            Send-ReviewerEvent candidate.selected -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                title = [string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId")
+            } -Message "Selected PR $prId - $([string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId"))"
         }
 
+        Send-ReviewerEvent candidates.enumerated -Cycle $CycleNumber -Data @{
+            scanned = $candidates.Count; pages = $candidatePages; skipped = $skipCounts
+            selected = $bound.Count; retried = $retried.Count; blocked = $blocked.Count
+        } -Message "Scanned $($candidates.Count) active PR(s) across $candidatePages page(s)."
+
         if ($bound.Count -eq 0) {
+            if ($blocked.Count -gt 0 -and $retried.Count -eq 0) {
+                $result.Summary = ($blocked.ToArray() -join "; ")
+                Write-ReviewerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "blocked"; blockedCount = $blocked.Count }
+                Send-ReviewerEvent cycle.completed -Cycle $CycleNumber -Data @{
+                    result = 'blocked'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+                } -Message $result.Summary
+                return $result
+            }
             if ($retried.Count -gt 0) {
-                $result.Summary = ($retried.ToArray() -join "; ")
+                $result.Summary = (@($retried.ToArray()) + @($blocked.ToArray()) -join "; ")
                 Write-ReviewerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "retried"; retryCount = $retried.Count }
+                Send-ReviewerEvent cycle.completed -Cycle $CycleNumber -Data @{
+                    result = 'retried'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+                } -Message $result.Summary
                 return $result
             }
             Write-Host "No PR needs a review right now." -ForegroundColor Green
             Write-ReviewerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "idle" }
+            Send-ReviewerEvent cycle.completed -Cycle $CycleNumber -Data @{
+                result = 'idle'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+            } -Message "No PR needs a review right now."
             return $result
         }
 
@@ -5917,6 +6082,10 @@ function Invoke-ReviewerCycle {
             [void]$summaries.Add([string]$one.Summary)
         }
         $result.Summary = ($summaries.ToArray() -join "; ")
+        Send-ReviewerEvent cycle.completed -Cycle $CycleNumber -Data @{
+            result = $(if ($result.ExitCode -eq 0) { 'completed' } else { 'partial' })
+            elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+        } -Message $result.Summary
         return $result
     }
     catch {
@@ -5924,6 +6093,9 @@ function Invoke-ReviewerCycle {
         Write-ReviewerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "error"; message = $_.Exception.Message }
         $result.ExitCode = 1
         $result.Summary = "cycle error: $($_.Exception.Message)"
+        Send-ReviewerEvent cycle.failed -Level error -Cycle $CycleNumber -Data @{
+            reason = $_.Exception.Message; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+        } -Message $result.Summary
         return $result
     }
     finally {
@@ -5938,8 +6110,22 @@ function Invoke-ReviewerCycle {
 if ($DryRun) {
     $lock = $null
     try {
+        if ($OutputMode -eq 'Json') {
+            Send-ReviewerEvent agent.started -Data @{
+                organization = $Organization; project = $ExpectedProject; repository = $RepositoryName
+                target = $TargetRefName; operator = $OperatorAlias; writes = 'dry run'; vote = 'off'
+                outputMode = 'Json'; diagnosticLog = $eventLogPath
+            } -Message 'Reviewer dry-run self-checks started.'
+        }
         $lock = Enter-AgentLock -Path $lockPath -AgentName $AgentName
         $selfCheckExit = Invoke-DryRunSelfChecks
+        if ($OutputMode -eq 'Json') {
+            Send-ReviewerEvent work.completed -Level $(if ($selfCheckExit -eq 0) { 'info' } else { 'error' }) -Data @{
+                title = 'reviewer self-checks'; result = $(if ($selfCheckExit -eq 0) { 'passed' } else { 'failed' })
+                elapsedMilliseconds = 0; critical = 0; important = 0; suggestion = 0
+                delivered = 'no writes'; reason = $(if ($selfCheckExit -eq 0) { '' } else { 'one or more self-checks failed' })
+            } -Message "Reviewer dry-run self-checks exited $selfCheckExit."
+        }
     }
     finally {
         if ($lock) { Exit-AgentLock -Stream $lock }
@@ -5980,6 +6166,17 @@ try {
     else {
         Write-Host "Writes: NONE. This is a preview run: candidate findings and thread assessments are printed and saved to $previewDir, and nothing is posted." -ForegroundColor Green
     }
+    $writeNames = New-Object System.Collections.Generic.List[string]
+    if ($EnableFindingComments) { [void]$writeNames.Add('comments') }
+    if ($EnableThreadReplies) { [void]$writeNames.Add('replies') }
+    if ($EnableSummaryComment) { [void]$writeNames.Add('summary') }
+    if ($writeNames.Count -eq 0) { [void]$writeNames.Add('preview only') }
+    Send-ReviewerEvent agent.started -Data @{
+        organization = $Organization; project = $ExpectedProject; repository = $RepositoryName
+        target = $TargetRefName; operator = $OperatorAlias; writes = ($writeNames -join ', ')
+        vote = $(if ($EnableApprovalVote) { 'on' } else { 'off' }); outputMode = $script:ReviewerOutputContext.Mode
+        diagnosticLog = $eventLogPath
+    } -Message "reviewer: operator=$OperatorAlias org=$Organization project=$ExpectedProject repo=$RepositoryName target=$TargetRefName"
 
     if ($PromotePreview) {
         exit (Invoke-ReviewerPromotion -AgencyPath $agencyPath -ArtifactPath $PromotePreview)
@@ -5997,6 +6194,10 @@ try {
 
         if ($Once) { break }
         $delay = if ($lastCycleExitCode -eq 0) { $IntervalSeconds } else { [Math]::Min($consecutiveBackoff, $MaxBackoffSeconds) }
+        Send-ReviewerEvent agent.waiting -Cycle $cycleNumber -Data @{
+            kind = $(if ($lastCycleExitCode -eq 0) { 'scan' } else { 'retry' })
+            delayMilliseconds = ([long]$delay * 1000); retryable = ($lastCycleExitCode -ne 0)
+        } -Message "Waiting ${delay}s before the next $(if ($lastCycleExitCode -eq 0) { 'scan' } else { 'retry' })."
         Start-Sleep -Seconds $delay
     } while ($true)
 
@@ -6008,6 +6209,9 @@ finally {
 
 }
 catch {
+    if ($script:ReviewerOutputContext) {
+        Send-ReviewerEvent cycle.failed -Level error -Data @{ reason = $_.Exception.Message } -Message $_.Exception.Message
+    }
     Write-Error $_
     exit 1
 }

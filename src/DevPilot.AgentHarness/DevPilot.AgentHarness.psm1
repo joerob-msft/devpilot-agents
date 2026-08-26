@@ -26,6 +26,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot 'AgentOutput.ps1')
+
 # ---------------------------------------------------------------------------
 # Code-defined Copilot CLI model allowlist (NOT config-supplied - a forked or
 # compromised config file must never be able to widen this). `--model <id>`
@@ -2470,5 +2472,4 @@ Export-ModuleMember -Function @(
     "Get-AgentProviderValidationRun",
     "Set-AgentProviderPullRequestVote"
 )
-
 

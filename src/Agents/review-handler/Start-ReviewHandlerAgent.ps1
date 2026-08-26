@@ -46,6 +46,11 @@
     Run exactly one cycle then exit. Never masks a failed/timed-out cycle as
     exit 0.
 
+.PARAMETER OutputMode
+    Controls console output. Auto uses a bounded interactive status line when
+    safe and otherwise falls back to Compact. Compact emits concise summaries,
+    Detailed retains individual diagnostics, and Json emits JSON Lines events.
+
 .EXAMPLE
     .\Start-ReviewHandlerAgent.ps1 -DryRun
     Validate the agent end-to-end (all self-checks) without any side effects.
@@ -141,7 +146,10 @@ param(
     [int]$MaxBackoffSeconds = 1800,
 
     [ValidateRange(30, 7200)]
-    [int]$CycleTimeoutSeconds = 1800
+    [int]$CycleTimeoutSeconds = 1800,
+
+    [ValidateSet('Auto', 'Compact', 'Detailed', 'Json')]
+    [string]$OutputMode = 'Auto'
 )
 
 $ErrorActionPreference = "Stop"
@@ -149,6 +157,7 @@ Set-StrictMode -Version Latest
 $script:HandlerUtf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $script:HandlerUtf8
 $OutputEncoding = $script:HandlerUtf8
+$script:HandlerOutputContext = $null
 
 # One top-level try/catch so ANY uncaught error surfaces as a nonzero exit,
 # never a silently-masked exit 0. Explicit `exit N` bypasses this catch.
@@ -792,11 +801,34 @@ $StateDir = (Resolve-Path -LiteralPath $StateDir).Path
 $logDir = Join-Path $StateDir "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $logPath = Join-Path $logDir "review-handler.log.jsonl"
+$eventLogPath = Join-Path $logDir "review-handler.events.jsonl"
 $lockPath = Join-Path $StateDir "agent.lock"
 $handledStatePath = Join-Path $StateDir "handled.json"
 $attemptsStatePath = Join-Path $StateDir "attempts.json"
 $sessionsStatePath = Join-Path $StateDir "sessions.json"
 $notificationsStatePath = Join-Path $StateDir "notifications.json"
+
+$script:HandlerOutputContext = New-AgentOutputContext -Agent review-handler -OutputMode $OutputMode -LogPath $eventLogPath
+if ($script:HandlerOutputContext.Mode -ne 'Detailed' -and (-not $DryRun -or $OutputMode -eq 'Json')) {
+    $InformationPreference = 'SilentlyContinue'
+    $WarningPreference = 'SilentlyContinue'
+    $PSDefaultParameterValues['Write-Host:InformationAction'] = 'Ignore'
+    $PSDefaultParameterValues['Write-Warning:WarningAction'] = 'SilentlyContinue'
+}
+
+function Send-HandlerEvent {
+    param(
+        [Parameter(Mandatory)][string]$EventType,
+        [ValidateSet('debug', 'info', 'warning', 'error')][string]$Level = 'info',
+        [int]$Cycle = 0,
+        [int]$PrId = 0,
+        [string]$SourceCommit = '',
+        [System.Collections.IDictionary]$Data = @{},
+        [AllowEmptyString()][string]$Message = ''
+    )
+    Publish-AgentEvent -Context $script:HandlerOutputContext -EventType $EventType -Level $Level `
+        -Cycle $Cycle -PrId $PrId -SourceCommit $SourceCommit -Data $Data -Message $Message | Out-Null
+}
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 $SensitiveEnvironmentVariables = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN", "GITHUB_TOKEN")
@@ -1711,6 +1743,10 @@ function Invoke-HandlerCycle {
     )
 
     $result = @{ ExitCode = 0; PrId = $null; Summary = "no actionable PR" }
+    $cycleTimer = [Diagnostics.Stopwatch]::StartNew()
+    Send-HandlerEvent cycle.started -Cycle $CycleNumber -Data @{} -Message "Cycle $CycleNumber started."
+    Send-HandlerEvent phase.changed -Cycle $CycleNumber -Data @{ phase = 'enumerating candidates'; elapsedMilliseconds = 0 } `
+        -Message 'Enumerating active pull requests.'
     $session = $null
     try {
         $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
@@ -1734,12 +1770,34 @@ function Invoke-HandlerCycle {
                 ([string](Get-HandlerHashValue -Container $_ -Key 'status' -Default '')) -ieq 'Active' -and
                 ((Get-HandlerAlias -UniqueName ([string](Get-HandlerHashValue -Container (Get-HandlerHashValue -Container $_ -Key 'createdBy') -Key 'uniqueName' -Default ''))) -ieq $OperatorAlias)
             } | Sort-Object { [int](Get-HandlerHashValue -Container $_ -Key 'pullRequestId' -Default 0) })
-
-        if ($PullRequestId -gt 0) {
-            Write-Host "Candidates: restricted to PR $PullRequestId ($($candidates.Count) eligible)." -ForegroundColor Cyan
+        $skipCounts = [ordered]@{
+            draft = @(@($rawPrs) | Where-Object { $_ -and [bool](Get-HandlerHashValue -Container $_ -Key 'isDraft' -Default $false) }).Count
+            delivered = 0; own = 0; notReady = 0; starved = 0; invalidCommit = 0
+            budgetExhausted = 0; unfinishedDelivery = 0
+            other = [Math]::Max(0, @($rawPrs).Count - $candidates.Count -
+                @(@($rawPrs) | Where-Object { $_ -and [bool](Get-HandlerHashValue -Container $_ -Key 'isDraft' -Default $false) }).Count)
         }
-        else {
-            Write-Host "Candidates: $($candidates.Count) active non-draft PR(s) authored by '$OperatorAlias'." -ForegroundColor Cyan
+        foreach ($filtered in @($rawPrs)) {
+            if (-not $filtered) { continue }
+            $filteredId = [int](Get-HandlerHashValue -Container $filtered -Key 'pullRequestId' -Default 0)
+            $filteredReason = $null
+            $filteredNormalized = 'other'
+            if ([bool](Get-HandlerHashValue -Container $filtered -Key 'isDraft' -Default $false)) {
+                $filteredReason = 'draft'
+                $filteredNormalized = 'draft'
+            }
+            elseif (([string](Get-HandlerHashValue -Container $filtered -Key 'status' -Default '')) -ine 'Active') {
+                $filteredReason = 'not active'
+            }
+            elseif ((Get-HandlerAlias -UniqueName ([string](Get-HandlerHashValue -Container `
+                            (Get-HandlerHashValue -Container $filtered -Key 'createdBy') -Key 'uniqueName' -Default ''))) -ine $OperatorAlias) {
+                $filteredReason = 'not authored by the operator'
+            }
+            if ($filteredReason) {
+                Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $filteredId -Data @{
+                    reason = $filteredReason; normalizedReason = $filteredNormalized
+                } -Message "PR $filteredId skipped ($filteredReason)."
+            }
         }
 
         $handledState = Get-JsonState -Path $handledStatePath
@@ -1759,9 +1817,14 @@ function Invoke-HandlerCycle {
 
         # -- Step 2: bind the first PR with unaddressed feedback --------------
         $bound = $null
+        Send-HandlerEvent phase.changed -Cycle $CycleNumber -Data @{ phase = 'selecting a PR'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds } `
+            -Message 'Selecting a pull request with actionable feedback.'
         foreach ($pr in $candidates) {
             if ($selectionDeadline -and [DateTime]::UtcNow -gt $selectionDeadline) {
-                Write-Host "  Selection budget of ${SelectionBudgetSeconds}s exhausted; deferring remaining candidates to the next cycle." -ForegroundColor DarkYellow
+                $skipCounts.budgetExhausted++
+                Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -Data @{
+                    reason = 'selection budget exhausted'; normalizedReason = 'budgetExhausted'
+                } -Message "Selection budget of ${SelectionBudgetSeconds}s exhausted; deferring remaining candidates."
                 break
             }
             $prId = [int](Get-HandlerHashValue -Container $pr -Key 'pullRequestId' -Default 0)
@@ -1773,10 +1836,22 @@ function Invoke-HandlerCycle {
             $attemptRecord = $attemptsState[[string]$prId]
             $attempts = if ($attemptRecord -is [int]) { [int]$attemptRecord } else { [int](Get-HandlerHashValue -Container $attemptRecord -Key 'count' -Default 0) }
             if ($attempts -ge $ConsecutiveFailureThreshold) {
-                Write-Host "  PR $prId skipped (starved: $attempts consecutive failures). Clear with -ResetStarvedCandidates." -ForegroundColor DarkYellow
+                $skipCounts.starved++
+                Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId -Data @{
+                    reason = "starved after $attempts consecutive failures"; normalizedReason = 'starved'; retryable = $true
+                } -Message "PR $prId skipped (starved: $attempts consecutive failures). Clear with -ResetStarvedCandidates."
+                Send-HandlerEvent delivery.blocked -Level warning -Cycle $CycleNumber -PrId $prId -Data @{
+                    title = [string](Get-HandlerHashValue -Container $pr -Key 'title' -Default "PR $prId")
+                    reason = "$attempts consecutive failures reached the starvation threshold"
+                    outstanding = @('review feedback handling'); retryable = $true
+                    nextRetry = 'after -ResetStarvedCandidates'
+                } -Message "PR $prId is starved and blocked until its failure state is reset."
                 continue
             }
 
+            Send-HandlerEvent phase.changed -Cycle $CycleNumber -PrId $prId -Data @{
+                phase = 'reading PR metadata, threads, and changed files'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+            } -Message "Reading metadata and review threads for PR $prId."
             $rawThreads = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request_thread" -Arguments @{
                 action = 'list'; project = $ExpectedProject; repositoryId = $RepositoryName
                 pullRequestId = $prId; top = 200
@@ -1788,7 +1863,13 @@ function Invoke-HandlerCycle {
             $cls = Get-HandlerClassifiedThreads -Threads $threads -OperatorAlias $OperatorAlias `
                 -AgentSignatureMarkers $AgentSignatureMarkers -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
             $actionable = Get-HandlerActionableThreadCount -Classifications $cls
-            if ($actionable -le 0) { continue }
+            if ($actionable -le 0) {
+                $skipCounts.other++
+                Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -Data @{
+                    reason = 'no actionable reviewer feedback'; normalizedReason = 'other'
+                } -Message "PR $prId skipped (no actionable reviewer feedback)."
+                continue
+            }
 
             $prDetail = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
                 action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $prId
@@ -1796,13 +1877,19 @@ function Invoke-HandlerCycle {
             $mergeSrc = Get-HandlerHashValue -Container $prDetail -Key 'lastMergeSourceCommit'
             $sourceCommit = [string](Get-HandlerHashValue -Container $mergeSrc -Key 'commitId' -Default '')
             if ($sourceCommit -notmatch '^[0-9a-fA-F]{40}$') {
-                Write-Host "  PR $prId skipped (no valid 40-hex source commit)." -ForegroundColor DarkYellow
+                $skipCounts.invalidCommit++
+                Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId -Data @{
+                    reason = 'no valid 40-hex source commit'; normalizedReason = 'invalidCommit'
+                } -Message "PR $prId skipped (no valid 40-hex source commit)."
                 continue
             }
 
             $maxThreadDate = Get-HandlerMaxThreadDate -Threads $threads
             if (Test-HandlerAlreadyHandled -HandledState $handledState -PrId $prId -SourceCommit $sourceCommit -MaxThreadDate $maxThreadDate) {
-                Write-Host "  PR $prId skipped (already handled at this commit + comment state)." -ForegroundColor DarkGray
+                $skipCounts.delivered++
+                Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                    reason = 'already handled and delivered'; normalizedReason = 'delivered'
+                } -Message "PR $prId skipped (already handled at this commit and comment state)."
                 continue
             }
 
@@ -1818,7 +1905,10 @@ function Invoke-HandlerCycle {
                     -Sessions (Find-CopilotSessionForBranch -Branch $candidateBranch) `
                     -RejectedSessionIds $script:HandlerRejectedResumeSessionIds
                 if (-not $candidateSessions -or $candidateSessions.Count -eq 0) {
-                    Write-Host "  PR $prId skipped (no local coding session for '$candidateBranch'; -RequireCodingSession is set, so another Dev Box owns it)." -ForegroundColor DarkGray
+                    $skipCounts.other++
+                    Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                        reason = 'no local coding session; another host owns this PR'; normalizedReason = 'other'
+                    } -Message "PR $prId skipped (no local coding session for '$candidateBranch')."
                     continue
                 }
             }
@@ -1829,23 +1919,40 @@ function Invoke-HandlerCycle {
                 Threads = $threads; Classifications = $cls; ActionableCount = $actionable; MaxThreadDate = $maxThreadDate
                 Sessions = $candidateSessions
             }
+            Send-HandlerEvent candidate.selected -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                title = [string](Get-HandlerHashValue -Container $prDetail -Key 'title' -Default "PR $prId")
+            } -Message "Selected PR $prId - $([string](Get-HandlerHashValue -Container $prDetail -Key 'title' -Default "PR $prId"))"
             break
         }
+
+        Send-HandlerEvent candidates.enumerated -Cycle $CycleNumber -Data @{
+            scanned = @($rawPrs).Count; pages = 1; skipped = $skipCounts; selected = $(if ($bound) { 1 } else { 0 })
+        } -Message "Scanned $(@($rawPrs).Count) active pull request record(s)."
 
         if (-not $bound) {
             Write-Host "No PR has unaddressed reviewer feedback right now." -ForegroundColor Green
             Write-HandlerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "idle" }
+            Send-HandlerEvent cycle.completed -Cycle $CycleNumber -Data @{
+                result = 'idle'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+            } -Message 'No PR has unaddressed reviewer feedback right now.'
             return $result
         }
 
         $prId = [int]$bound.PrId
         $result.PrId = $prId
-        Write-Host "Bound PR $prId  branch=$($bound.SourceBranch)  commit=$($bound.SourceCommit.Substring(0,12))  actionableThreads=$($bound.ActionableCount)" -ForegroundColor Yellow
+        Send-HandlerEvent phase.changed -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
+            phase = 'resolving capabilities and worktree'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+        } -Message "Bound PR $prId branch=$($bound.SourceBranch) commit=$($bound.SourceCommit.Substring(0,12)) actionableThreads=$($bound.ActionableCount)"
 
         # -- Step 3: protected-branch gate, then capability resolution --------
         $branchProtected = Test-AgentProtectedBranch -Branch $bound.SourceBranch -ProtectedPatterns $EffectiveProtectedBranches
         if ($branchProtected) {
             Write-Warning "PR $prId source branch '$($bound.SourceBranch)' is protected; code-change and push tools will NOT be granted."
+            Send-HandlerEvent delivery.blocked -Level warning -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
+                title = [string](Get-HandlerHashValue -Container $bound.Pr -Key 'title' -Default "PR $prId")
+                reason = "source branch '$($bound.SourceBranch)' is protected"
+                outstanding = @('code changes', 'push'); retryable = $false; nextRetry = 'not applicable'
+            } -Message "PR $prId uses protected branch '$($bound.SourceBranch)'; code-change and push capabilities are blocked."
         }
         $needWritable = ([bool]$EnableCodeChanges -and -not $branchProtected)
         $worktreePath = Resolve-HandlerWorktree -SourceBranch $bound.SourceBranch -PrId $prId -NeedWritable $needWritable
@@ -1899,7 +2006,9 @@ function Invoke-HandlerCycle {
         else {
             $agencyArgs
         }
-        Write-Host "Launching Copilot (mode=$permissionMode, timeout=${CycleTimeoutSeconds}s, resume=$([bool]$resumeId))..." -ForegroundColor Cyan
+        Send-HandlerEvent phase.changed -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
+            phase = 'running the model'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+        } -Message "Launching Copilot (mode=$permissionMode, timeout=${CycleTimeoutSeconds}s, resume=$([bool]$resumeId))..."
 
         $launch = Invoke-HandlerCopilotLaunch -AgencyPath $AgencyPath `
             -ResumeArgumentList $agencyArgs -FreshArgumentList $freshAgencyArgs `
@@ -1922,6 +2031,9 @@ function Invoke-HandlerCycle {
             }
         }
         $marker = $null
+        Send-HandlerEvent phase.changed -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
+            phase = 'validating the result'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+        } -Message "Validating the model result for PR $prId."
         if ($run.ExitCode -eq 0 -and -not $run.TimedOut) {
             $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
                 -MarkerPrefix $ResultMarkerPrefix `
@@ -1995,6 +2107,11 @@ function Invoke-HandlerCycle {
                 -Title "Review-handler could not process PR $prId" `
                 -Body "$reason. Branch $($bound.SourceBranch). See the failure transcript on the agent host." `
                 -Links @("https://dev.azure.com/$Organization/$ExpectedProject/_git/$RepositoryName/pullrequest/$prId")
+            Send-HandlerEvent work.completed -Level error -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
+                title = [string](Get-HandlerHashValue -Container $bound.Pr -Key 'title' -Default "PR $prId")
+                result = 'failed'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+                delivered = 'none'; reason = $reason; summary = 'No review feedback was handled.'
+            } -Message $result.Summary
             return $result
         }
 
@@ -2002,6 +2119,9 @@ function Invoke-HandlerCycle {
                 $prId, $marker.threadsAddressed, $marker.threadsReplied, $marker.commitsPushed, $marker.validation, $marker.readyToComplete) -ForegroundColor Green
 
         # -- Step 8: wrapper-owned post-actions (each behind its own switch) --
+        Send-HandlerEvent phase.changed -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
+            phase = 'publishing replies, builds, and completion state'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+        } -Message "Applying enabled wrapper-owned actions for PR $prId."
         $pushedCommit = if ($marker.pushedCommit -is [string]) { [string]$marker.pushedCommit } else { $null }
         $requeued = $false
         $autoCompleted = $false
@@ -2120,6 +2240,18 @@ function Invoke-HandlerCycle {
             requireCodingSession = [bool]$RequireCodingSession
         }
         $result.Summary = "PR $prId handled ($($marker.threadsAddressed) thread(s) addressed)"
+        $delivered = @(
+            "$(Format-AgentCount ([int]$marker.threadsReplied) 'reply' 'replies')"
+            "$(Format-AgentCount ([int]$marker.commitsPushed) 'commit') pushed"
+            $(if ($requeued) { 'buddy build queued' })
+            $(if ($autoCompleted) { 'auto-complete set' })
+        ) | Where-Object { $_ }
+        Send-HandlerEvent work.completed -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
+            title = [string](Get-HandlerHashValue -Container $bound.Pr -Key 'title' -Default "PR $prId")
+            result = 'handled'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+            delivered = ($delivered -join ', '); reason = ''
+            summary = "$(Format-AgentCount ([int]$marker.threadsAddressed) 'thread') addressed; validation $($marker.validation)."
+        } -Message $result.Summary
 
         # The notification the operator actually wants: this PR is clean,
         # approved, and green - a human can complete it. Sent whether or not
@@ -2132,6 +2264,9 @@ function Invoke-HandlerCycle {
                 -Body "$prTitle - all $($bound.ActionableCount) actionable review thread(s) addressed, validation $($marker.validation)$(if ($autoCompleted) { ', auto-complete set' } else { '' })." `
                 -Links @("https://dev.azure.com/$Organization/$ExpectedProject/_git/$RepositoryName/pullrequest/$prId")
         }
+        Send-HandlerEvent cycle.completed -Cycle $CycleNumber -Data @{
+            result = 'completed'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+        } -Message $result.Summary
         return $result
     }
     catch {
@@ -2139,6 +2274,9 @@ function Invoke-HandlerCycle {
         Write-HandlerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "error"; message = $_.Exception.Message }
         $result.ExitCode = 1
         $result.Summary = "cycle error: $($_.Exception.Message)"
+        Send-HandlerEvent cycle.failed -Level error -Cycle $CycleNumber -Data @{
+            reason = $_.Exception.Message; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+        } -Message $result.Summary
         return $result
     }
     finally {
@@ -2153,8 +2291,23 @@ function Invoke-HandlerCycle {
 if ($DryRun) {
     $lock = $null
     try {
+        if ($OutputMode -eq 'Json') {
+            Send-HandlerEvent agent.started -Data @{
+                organization = $Organization; project = $ExpectedProject; repository = $RepositoryName
+                target = 'operator pull requests'; operator = $OperatorAlias; writes = 'dry run'; vote = 'n/a'
+                outputMode = 'Json'; diagnosticLog = $eventLogPath
+            } -Message 'Review-handler dry-run self-checks started.'
+        }
         $lock = Enter-AgentLock -Path $lockPath -AgentName $AgentName
         $rc = Invoke-DryRunSelfChecks
+        if ($OutputMode -eq 'Json') {
+            Send-HandlerEvent work.completed -Level $(if ($rc -eq 0) { 'info' } else { 'error' }) -Data @{
+                title = 'review-handler self-checks'; result = $(if ($rc -eq 0) { 'passed' } else { 'failed' })
+                elapsedMilliseconds = 0; delivered = 'no writes'
+                reason = $(if ($rc -eq 0) { '' } else { 'one or more self-checks failed' })
+                summary = "Self-check exit code: $rc."
+            } -Message "Review-handler dry-run self-checks exited $rc."
+        }
     }
     finally {
         if ($lock) { Exit-AgentLock -Stream $lock }
@@ -2192,6 +2345,19 @@ try {
     if ($PullRequestId -gt 0) { Write-Host "Target: PR $PullRequestId only." -ForegroundColor Cyan }
     Write-Host "Capabilities: codeChanges=$([bool]$EnableCodeChanges) push=$([bool]$EnablePush) threadReplies=$([bool]$EnableThreadReplies) localValidation=$([bool]$LocalValidation) buddyRequeue=$([bool]$EnableBuddyRequeue) autoComplete=$([bool]$EnableAutoComplete) teams=$([bool]$EnableTeamsNotifications)" -ForegroundColor Cyan
     Write-Host "Session: resume=$([bool]$ResumeCodingSession) requireLocalSession=$([bool]$RequireCodingSession)$(if ($RequireCodingSession) { ' (ownership mode - only PRs coded on this box)' })" -ForegroundColor Cyan
+    $handlerWrites = @(
+        $(if ($EnableCodeChanges) { 'code changes' })
+        $(if ($EnablePush) { 'push' })
+        $(if ($EnableThreadReplies) { 'replies' })
+        $(if ($EnableBuddyRequeue) { 'build requeue' })
+        $(if ($EnableAutoComplete) { 'auto-complete' })
+    ) | Where-Object { $_ }
+    if (@($handlerWrites).Count -eq 0) { $handlerWrites = @('analysis only') }
+    Send-HandlerEvent agent.started -Data @{
+        organization = $Organization; project = $ExpectedProject; repository = $RepositoryName
+        target = 'operator pull requests'; operator = $OperatorAlias; writes = ($handlerWrites -join ', ')
+        vote = 'n/a'; outputMode = $script:HandlerOutputContext.Mode; diagnosticLog = $eventLogPath
+    } -Message "review-handler: operator=$OperatorAlias org=$Organization project=$ExpectedProject repo=$RepositoryName"
 
     $consecutiveBackoff = $MinBackoffSeconds
     $lastCycleExitCode = 0
@@ -2205,6 +2371,10 @@ try {
 
         if ($Once) { break }
         $delay = if ($lastCycleExitCode -eq 0) { $IntervalSeconds } else { [Math]::Min($consecutiveBackoff, $MaxBackoffSeconds) }
+        Send-HandlerEvent agent.waiting -Cycle $cycleNumber -Data @{
+            kind = $(if ($lastCycleExitCode -eq 0) { 'scan' } else { 'retry' })
+            delayMilliseconds = ([long]$delay * 1000); retryable = ($lastCycleExitCode -ne 0)
+        } -Message "Waiting ${delay}s before the next $(if ($lastCycleExitCode -eq 0) { 'scan' } else { 'retry' })."
         Start-Sleep -Seconds $delay
     } while ($true)
 
@@ -2217,6 +2387,9 @@ finally {
 
 }
 catch {
+    if ($script:HandlerOutputContext) {
+        Send-HandlerEvent cycle.failed -Level error -Data @{ reason = $_.Exception.Message } -Message $_.Exception.Message
+    }
     Write-Error $_
     exit 1
 }
