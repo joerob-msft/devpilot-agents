@@ -292,10 +292,10 @@ them with `-ReviewerConfigFile` or `-ReviewHandlerConfigFile` when necessary.
 The launcher starts each selected agent in a separate process with
 `-OutputMode Json`. Without `-Operational`, it passes no mutating or
 notification switches. Operational reviewer runs enable finding comments,
-thread replies, summaries, and approval votes. Operational review-handler runs
-enable code changes, pushes, thread replies, buddy requeues, auto-complete, and
-local validation. Teams delivery is separate and requires the appropriate
-`-EnableReviewerTeamsNotifications` or
+thread replies, and summaries. Operational review-handler runs enable thread
+replies and buddy requeues. Code changes, pushes, votes, auto-complete, and
+local validation remain disabled. Teams delivery is separate and requires the
+appropriate `-EnableReviewerTeamsNotifications` or
 `-EnableReviewHandlerTeamsNotifications` switch. Unless `-StateDir` is
 supplied, the agents share a generated temporary session root, so one dashboard
 can group their live and retained instances.
