@@ -2,7 +2,7 @@
 
 <#
 .SYNOPSIS
-    Launches a preview-only reviewer and opens the dashboard on that run.
+    Launches a reviewer and opens the dashboard on that run.
 
 .DESCRIPTION
     Compatibility wrapper for Watch-DevPilotAgents.ps1 -Agent Reviewer.
@@ -27,6 +27,12 @@ param(
 
     [Parameter(ParameterSetName = 'Launch')]
     [switch]$Continuous,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$Operational,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableTeamsNotifications,
 
     [Parameter(ParameterSetName = 'Launch')]
     [ValidateRange(30, 86400)]
@@ -54,6 +60,8 @@ if ($StateDir) { $parameters.StateDir = $StateDir }
 if ($ConfigFile) { $parameters.ReviewerConfigFile = $ConfigFile }
 if ($PullRequestId -gt 0) { $parameters.ReviewerPullRequestId = $PullRequestId }
 if ($Continuous) { $parameters.Continuous = $true }
+if ($Operational) { $parameters.Operational = $true }
+if ($EnableTeamsNotifications) { $parameters.EnableReviewerTeamsNotifications = $true }
 if ($PSBoundParameters.ContainsKey('IntervalSeconds')) { $parameters.IntervalSeconds = $IntervalSeconds }
 if ($OperatorAlias) { $parameters.OperatorAlias = $OperatorAlias }
 if ($AgentName) { $parameters.ReviewerAgentName = $AgentName }
