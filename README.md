@@ -11,8 +11,8 @@ everything the model returns. The model never selects its own work and never
 writes to the PR host directly.
 
 > **Status: pilot.** Two agents (`reviewer` and `review-handler`) are
-> implemented for Azure DevOps, with a shared read-only operations dashboard
-> for observing either or both. Interfaces will change.
+> implemented for Azure DevOps, with a shared read-only dashboard and trusted
+> launchers for observing or operating either or both. Interfaces will change.
 
 ---
 
@@ -243,8 +243,8 @@ events are diagnostic only and cannot change agent selection or delivery.
 UI over reviewer and review-handler event streams. The observer itself cannot
 start, stop, retry, promote, or otherwise control an agent. The
 `Watch-DevPilot*.ps1` launchers provide the separate convenience layer that
-starts preview-only child agents and points the observer at their shared state
-root.
+starts child agents and points the observer at their shared state root. The
+launcher remains preview-only unless `-Operational` is passed.
 
 The dashboard requires Node.js 24 or newer, PowerShell 7 for the watch
 launchers, and an interactive terminal at least 60 columns wide. Restore and
@@ -270,6 +270,10 @@ consumer repository whose conventional agent configs should be used:
 # Both preview-only agents, one cycle each:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both
 
+# Both operational agents. Notification delivery is independently opt-in:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Operational `
+    -EnableReviewerTeamsNotifications
+
 # Both agents, continuous 15-minute cadence:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
 
@@ -286,9 +290,15 @@ The shared launcher resolves the conventional
 consumer repository. Only the selected agents' configs are required. Override
 them with `-ReviewerConfigFile` or `-ReviewHandlerConfigFile` when necessary.
 The launcher starts each selected agent in a separate process with
-`-OutputMode Json` and no mutating or notification switches. Unless
-`-StateDir` is supplied, the agents share a generated temporary session root,
-so one dashboard can group their live and retained instances.
+`-OutputMode Json`. Without `-Operational`, it passes no mutating or
+notification switches. Operational reviewer runs enable finding comments,
+thread replies, summaries, and approval votes. Operational review-handler runs
+enable code changes, pushes, thread replies, buddy requeues, auto-complete, and
+local validation. Teams delivery is separate and requires the appropriate
+`-EnableReviewerTeamsNotifications` or
+`-EnableReviewHandlerTeamsNotifications` switch. Unless `-StateDir` is
+supplied, the agents share a generated temporary session root, so one dashboard
+can group their live and retained instances.
 
 Compatibility wrappers provide the shorter single-agent names:
 
@@ -297,8 +307,8 @@ Compatibility wrappers provide the shorter single-agent names:
 .\tools\Watch-DevPilotReviewHandler.ps1 -Continuous
 ```
 
-In the default one-cycle mode, closing the dashboard does not terminate an
-agent that is still running. Reattach later with the state path printed by the
+In a preview one-cycle run, closing the dashboard does not terminate an agent
+that is still running. Reattach later with the state path printed by the
 launcher:
 
 ```powershell
@@ -311,12 +321,13 @@ For a short continuous test cadence:
 .\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous -IntervalSeconds 60
 ```
 
-Continuous agents remain preview-only. They scan until the dashboard exits,
-then the launcher stops every process tree it owns so no hidden background
-agent is left running. Fixed pull request IDs are intentionally incompatible
-with `-Continuous` to prevent repeatedly processing one pull request. Use the
-ordinary agent entry points, not the watch launchers, for code changes,
-publishing, votes, requeues, auto-complete, or notifications.
+Continuous agents scan until the dashboard exits, then the launcher stops every
+process tree it owns so no hidden background agent is left running. Operational
+agents are also always stopped when the dashboard exits, including one-cycle
+runs. Shutdown is immediate and can interrupt an in-flight wrapper operation;
+quit while agents are waiting between cycles when possible. Fixed pull request
+IDs are intentionally incompatible with `-Continuous` to prevent repeatedly
+processing one pull request.
 
 To observe agents started separately, point the standalone dashboard at one or
 more state roots:

@@ -2,14 +2,17 @@
 
 <#
 .SYNOPSIS
-    Launches preview-only DevPilot agents and observes them in one dashboard.
+    Launches DevPilot agents and observes them in one dashboard.
 
 .DESCRIPTION
     Starts the reviewer, review-handler, or both in isolated child processes
-    without enabling any mutating or notification capability. By default each
-    selected agent runs one cycle. Continuous keeps the agents cycling until
-    the dashboard exits, then stops every process tree owned by this launcher.
-    AttachOnly observes an existing state root without launching an agent.
+    and observes their event streams. Runs are preview-only unless Operational
+    is passed. Operational binds the agents' fixed production capability set;
+    notification delivery remains independently opt-in per role. By default
+    each selected agent runs one cycle. Continuous keeps the agents cycling
+    until the dashboard exits, then stops every process tree owned by this
+    launcher. AttachOnly observes an existing state root without launching an
+    agent.
 
 .EXAMPLE
     .\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
@@ -54,6 +57,15 @@ param(
     [switch]$Continuous,
 
     [Parameter(ParameterSetName = 'Launch')]
+    [switch]$Operational,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableReviewerTeamsNotifications,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableReviewHandlerTeamsNotifications,
+
+    [Parameter(ParameterSetName = 'Launch')]
     [ValidateRange(30, 86400)]
     [int]$IntervalSeconds = 900,
 
@@ -86,6 +98,20 @@ $toolkitRoot = Split-Path $PSScriptRoot -Parent
 $dashboardLauncher = Join-Path $PSScriptRoot 'Start-DevPilotDashboard.ps1'
 $reviewerScript = Join-Path $toolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
 $reviewHandlerScript = Join-Path $toolkitRoot 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1'
+$reviewerOperationalCapabilities = @(
+    'EnableFindingComments',
+    'EnableThreadReplies',
+    'EnableSummaryComment',
+    'EnableApprovalVote'
+)
+$reviewHandlerOperationalCapabilities = @(
+    'EnableCodeChanges',
+    'EnablePush',
+    'EnableThreadReplies',
+    'EnableBuddyRequeue',
+    'EnableAutoComplete',
+    'LocalValidation'
+)
 
 function ConvertTo-PowerShellLiteral {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
@@ -135,9 +161,18 @@ if ($AttachOnly) {
 if ($Continuous -and ($ReviewerPullRequestId -gt 0 -or $ReviewHandlerPullRequestId -gt 0)) {
     throw 'A pull request ID cannot be combined with -Continuous because that would repeatedly process one pull request.'
 }
+if (-not $Operational -and ($EnableReviewerTeamsNotifications -or $EnableReviewHandlerTeamsNotifications)) {
+    throw 'Teams notifications require -Operational. Preview runs never send notifications.'
+}
 
 $launchReviewer = $Agent -in @('Reviewer', 'Both')
 $launchReviewHandler = $Agent -in @('ReviewHandler', 'Both')
+if ($EnableReviewerTeamsNotifications -and -not $launchReviewer) {
+    throw '-EnableReviewerTeamsNotifications requires -Agent Reviewer or -Agent Both.'
+}
+if ($EnableReviewHandlerTeamsNotifications -and -not $launchReviewHandler) {
+    throw '-EnableReviewHandlerTeamsNotifications requires -Agent ReviewHandler or -Agent Both.'
+}
 $defaultConfigRoot = Join-Path (Get-Location) '.github\copilot\agents'
 if ($launchReviewer) {
     $ReviewerConfigFile = [IO.Path]::GetFullPath($(if ($ReviewerConfigFile) {
@@ -232,6 +267,24 @@ try {
         if ($spec.PullRequestId -gt 0) { [void]$parameterLines.Add("PullRequestId = $($spec.PullRequestId)") }
         if ($spec.Model) { [void]$parameterLines.Add("Model = $(ConvertTo-PowerShellLiteral $spec.Model)") }
         if ($spec.IncludeOwn) { [void]$parameterLines.Add('IncludeOwnPullRequests = $true') }
+        if ($Operational) {
+            if ($spec.Role -eq 'reviewer') {
+                foreach ($capability in $reviewerOperationalCapabilities) {
+                    [void]$parameterLines.Add("$capability = `$true")
+                }
+                if ($EnableReviewerTeamsNotifications) {
+                    [void]$parameterLines.Add('EnableTeamsNotifications = $true')
+                }
+            }
+            else {
+                foreach ($capability in $reviewHandlerOperationalCapabilities) {
+                    [void]$parameterLines.Add("$capability = `$true")
+                }
+                if ($EnableReviewHandlerTeamsNotifications) {
+                    [void]$parameterLines.Add('EnableTeamsNotifications = $true')
+                }
+            }
+        }
 
         $childCommand = @"
 `$ErrorActionPreference = 'Stop'
@@ -263,7 +316,14 @@ catch {
 }
 
 Write-Host "Shared state root: $StateDir" -ForegroundColor Cyan
-Write-Host 'All launched agents are preview-only: no code changes, pushes, replies, comments, summaries, votes, requeues, auto-complete, or notifications are enabled.' -ForegroundColor Green
+if ($Operational) {
+    Write-Information 'OPERATIONAL: code changes, pushes, replies, comments, summaries, votes, requeues, auto-complete, and local validation are enabled for the selected roles.' -InformationAction Continue
+    Write-Information "Teams notifications: reviewer=$([bool]$EnableReviewerTeamsNotifications) review-handler=$([bool]$EnableReviewHandlerTeamsNotifications)." -InformationAction Continue
+    Write-Warning 'Closing the dashboard immediately stops owned agent process trees. Quit while agents are waiting when possible to avoid interrupting an in-flight operation.'
+}
+else {
+    Write-Information 'PREVIEW ONLY: no code changes, pushes, replies, comments, summaries, votes, requeues, auto-complete, or notifications are enabled.' -InformationAction Continue
+}
 if ($Continuous) {
     Write-Host "Agents will scan every $IntervalSeconds second(s) until the dashboard exits." -ForegroundColor Green
 }
@@ -294,7 +354,7 @@ try {
     $dashboardCompletedNormally = $true
 }
 finally {
-    if (-not $dashboardCompletedNormally -or $Continuous) {
+    if (-not $dashboardCompletedNormally -or $Continuous -or $Operational) {
         foreach ($child in $children) {
             Close-OwnedAgentProcess -Process $child.Process -Role $child.Role
         }

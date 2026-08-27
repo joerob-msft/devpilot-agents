@@ -314,7 +314,7 @@ Describe 'Shared reviewer and review-handler event contract' {
         $source | Should -Match 'prUrl\s*=\s*Get-ReviewerPullRequestLink\s+-PrId'
     }
 
-    It 'provides preview-only shared watcher launchers and attach mode' {
+    It 'provides shared preview and operational watcher launchers with attach mode' {
         $toolsRoot = Join-Path "$PSScriptRoot\.." 'tools'
         $path = Join-Path $toolsRoot 'Watch-DevPilotAgents.ps1'
         $tokens = $null
@@ -324,7 +324,8 @@ Describe 'Shared reviewer and review-handler event contract' {
         $errors | Should -BeNullOrEmpty
         $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
         foreach ($parameterName in @(
-            'Agent', 'AttachOnly', 'Continuous', 'IntervalSeconds',
+            'Agent', 'AttachOnly', 'Continuous', 'Operational', 'IntervalSeconds',
+            'EnableReviewerTeamsNotifications', 'EnableReviewHandlerTeamsNotifications',
             'ReviewerConfigFile', 'ReviewHandlerConfigFile',
             'ReviewerPullRequestId', 'ReviewHandlerPullRequestId'
         )) {
@@ -336,20 +337,40 @@ Describe 'Shared reviewer and review-handler event contract' {
         $source | Should -Match 'IntervalSeconds = \$IntervalSeconds'
         $source | Should -Match "\[ValidateSet\('Reviewer', 'ReviewHandler', 'Both'\)\]"
         $source | Should -Match '\$Continuous\s+-and\s+\(\$ReviewerPullRequestId\s+-gt\s+0\s+-or\s+\$ReviewHandlerPullRequestId\s+-gt\s+0\)'
-        $source | Should -Not -Match 'EnableFindingComments\s*='
-        $source | Should -Not -Match 'EnableThreadReplies\s*='
-        $source | Should -Not -Match 'EnableSummaryComment\s*='
-        $source | Should -Not -Match 'EnableApprovalVote\s*='
-        $source | Should -Not -Match 'EnableTeamsNotifications\s*='
-        $source | Should -Not -Match 'EnableCodeChanges\s*='
-        $source | Should -Not -Match 'EnablePush\s*='
-        $source | Should -Not -Match 'EnableAutoComplete\s*='
-        $source | Should -Not -Match 'EnableBuddyRequeue\s*='
+        $reviewerCapabilities = [regex]::Match(
+            $source, '(?s)\$reviewerOperationalCapabilities\s*=\s*@\((.*?)\)').Groups[1].Value
+        $handlerCapabilities = [regex]::Match(
+            $source, '(?s)\$reviewHandlerOperationalCapabilities\s*=\s*@\((.*?)\)').Groups[1].Value
+        foreach ($capability in @(
+            'EnableFindingComments', 'EnableThreadReplies',
+            'EnableSummaryComment', 'EnableApprovalVote'
+        )) {
+            $reviewerCapabilities | Should -Match ("'{0}'" -f $capability)
+        }
+        foreach ($capability in @(
+            'EnableCodeChanges', 'EnablePush', 'EnableThreadReplies',
+            'EnableBuddyRequeue', 'EnableAutoComplete', 'LocalValidation'
+        )) {
+            $handlerCapabilities | Should -Match ("'{0}'" -f $capability)
+        }
+        foreach ($capability in @('EnableCodeChanges', 'EnablePush', 'EnableBuddyRequeue', 'EnableAutoComplete', 'LocalValidation')) {
+            $reviewerCapabilities | Should -Not -Match ("'{0}'" -f $capability)
+        }
+        foreach ($capability in @('EnableFindingComments', 'EnableSummaryComment', 'EnableApprovalVote')) {
+            $handlerCapabilities | Should -Not -Match ("'{0}'" -f $capability)
+        }
+        $source | Should -Match "'EnableTeamsNotifications = \`$true'"
+        $source | Should -Match '\$parameterLines\.Add\("\$capability = `\$true"\)'
+        $source | Should -Match 'if \(\$Operational\)'
+        $source | Should -Match 'Teams notifications require -Operational'
+        $source | Should -Match 'EnableReviewerTeamsNotifications requires -Agent Reviewer or -Agent Both'
+        $source | Should -Match 'EnableReviewHandlerTeamsNotifications requires -Agent ReviewHandler or -Agent Both'
+        $source | Should -Not -Match '(?i)\bYolo\s*='
         $source.IndexOf('& $dashboardLauncher -StateDir $StateDir -ValidateOnly') |
             Should -BeLessThan $source.IndexOf('$process = Start-Process')
         $source | Should -Match '\$dashboardCompletedNormally\s*=\s*\$false'
         $source | Should -Match '\$Process\.Kill\(\$true\)'
-        $source | Should -Match 'if \(-not \$dashboardCompletedNormally -or \$Continuous\)'
+        $source | Should -Match 'if \(-not \$dashboardCompletedNormally -or \$Continuous -or \$Operational\)'
 
         foreach ($wrapper in @(
             @{ File = 'Watch-DevPilotReviewer.ps1'; Agent = 'Reviewer'; Config = 'ReviewerConfigFile' }
@@ -365,6 +386,8 @@ Describe 'Shared reviewer and review-handler event contract' {
             $wrapperSource | Should -Match ("Agent\s*=\s*'{0}'" -f $wrapper.Agent)
             $wrapperSource | Should -Match $wrapper.Config
             $wrapperSource | Should -Match 'Watch-DevPilotAgents\.ps1'
+            $wrapperSource | Should -Match 'Operational'
+            $wrapperSource | Should -Match 'EnableTeamsNotifications'
         }
     }
 
