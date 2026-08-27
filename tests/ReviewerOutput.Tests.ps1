@@ -343,20 +343,25 @@ Describe 'Shared reviewer and review-handler event contract' {
             $source, '(?s)\$reviewHandlerOperationalCapabilities\s*=\s*@\((.*?)\)').Groups[1].Value
         foreach ($capability in @(
             'EnableFindingComments', 'EnableThreadReplies',
-            'EnableSummaryComment', 'EnableApprovalVote'
+            'EnableSummaryComment'
         )) {
             $reviewerCapabilities | Should -Match ("'{0}'" -f $capability)
         }
         foreach ($capability in @(
-            'EnableCodeChanges', 'EnablePush', 'EnableThreadReplies',
-            'EnableBuddyRequeue', 'EnableAutoComplete', 'LocalValidation'
+            'EnableThreadReplies', 'EnableBuddyRequeue'
         )) {
             $handlerCapabilities | Should -Match ("'{0}'" -f $capability)
         }
-        foreach ($capability in @('EnableCodeChanges', 'EnablePush', 'EnableBuddyRequeue', 'EnableAutoComplete', 'LocalValidation')) {
+        foreach ($capability in @(
+            'EnableApprovalVote', 'EnableCodeChanges', 'EnablePush',
+            'EnableBuddyRequeue', 'EnableAutoComplete', 'LocalValidation'
+        )) {
             $reviewerCapabilities | Should -Not -Match ("'{0}'" -f $capability)
         }
-        foreach ($capability in @('EnableFindingComments', 'EnableSummaryComment', 'EnableApprovalVote')) {
+        foreach ($capability in @(
+            'EnableFindingComments', 'EnableSummaryComment', 'EnableApprovalVote',
+            'EnableCodeChanges', 'EnablePush', 'EnableAutoComplete', 'LocalValidation'
+        )) {
             $handlerCapabilities | Should -Not -Match ("'{0}'" -f $capability)
         }
         $source | Should -Match "'EnableTeamsNotifications = \`$true'"

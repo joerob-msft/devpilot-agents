@@ -101,16 +101,11 @@ $reviewHandlerScript = Join-Path $toolkitRoot 'src\Agents\review-handler\Start-R
 $reviewerOperationalCapabilities = @(
     'EnableFindingComments',
     'EnableThreadReplies',
-    'EnableSummaryComment',
-    'EnableApprovalVote'
+    'EnableSummaryComment'
 )
 $reviewHandlerOperationalCapabilities = @(
-    'EnableCodeChanges',
-    'EnablePush',
     'EnableThreadReplies',
-    'EnableBuddyRequeue',
-    'EnableAutoComplete',
-    'LocalValidation'
+    'EnableBuddyRequeue'
 )
 
 function ConvertTo-PowerShellLiteral {
@@ -317,7 +312,7 @@ catch {
 
 Write-Host "Shared state root: $StateDir" -ForegroundColor Cyan
 if ($Operational) {
-    Write-Information 'OPERATIONAL: code changes, pushes, replies, comments, summaries, votes, requeues, auto-complete, and local validation are enabled for the selected roles.' -InformationAction Continue
+    Write-Information 'OPERATIONAL: reviewer comments, replies, and summaries plus review-handler replies and requeues are enabled. Code changes, pushes, votes, auto-complete, and local validation remain disabled.' -InformationAction Continue
     Write-Information "Teams notifications: reviewer=$([bool]$EnableReviewerTeamsNotifications) review-handler=$([bool]$EnableReviewHandlerTeamsNotifications)." -InformationAction Continue
     Write-Warning 'Closing the dashboard immediately stops owned agent process trees. Quit while agents are waiting when possible to avoid interrupting an in-flight operation.'
 }
