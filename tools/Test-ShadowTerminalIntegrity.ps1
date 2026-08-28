@@ -144,8 +144,13 @@ try {
         status = 'complete'
         exitCode = 0
         timedOut = $false
+        startedAtUtc = '2026-08-28T14:42:25.0143792Z'
+        endedAtUtc = '2026-08-28T14:42:25.0143931Z'
+        lastProgressUtc = '2026-08-28T14:42:25.0144010Z'
         runExecutionId = $executionId
     }
+    Assert-Terminal ([string]$signedTerminal.lastProgressUtc -match '0Z\z') `
+        'the JSON date-round-trip fixture retains the trailing fractional zero that caused signature drift'
     $signedTerminal = Protect-ReviewerQualificationSlotTerminal -Terminal $signedTerminal `
         -RunSetKeyPath $keyPath
     $signedPath = Join-Path $scratch 'signed-slot1-terminal.json'
@@ -154,7 +159,29 @@ try {
     $acceptedTerminal = Read-ReviewerQualificationSlotTerminal -TerminalPath $signedPath `
         -RunSetKeyPath $keyPath -ExpectedRunExecutionId $executionId
     Assert-Terminal ([string]$acceptedTerminal.status -ceq 'complete') `
-        'an externally signed terminal bound to the expected execution is accepted'
+        'an externally signed terminal survives JSON date parsing when a fractional second ends in zero'
+    $ambiguousTerminal = $acceptedTerminal.PSObject.Copy()
+    $ambiguousTerminal.startedAtUtc = '2026-08-28T14:42:25.0143792'
+    $ambiguousTimestampRefused = $false
+    try {
+        Protect-ReviewerQualificationSlotTerminal -Terminal $ambiguousTerminal `
+            -RunSetKeyPath $keyPath | Out-Null
+    }
+    catch {
+        $ambiguousTimestampRefused = [string]$_.Exception.Message -match 'must include an explicit UTC offset'
+    }
+    Assert-Terminal $ambiguousTimestampRefused `
+        'a zone-less UTC timestamp is refused instead of being reinterpreted in the host time zone'
+    $crossSlotRefused = $false
+    try {
+        Assert-ReviewerQualificationTerminalBoundToDeclaration -Terminal $acceptedTerminal `
+            -SlotName 'slot2' -ExpectedSetId 'set-a' -ExpectedPlanDigest ('d' * 64)
+    }
+    catch {
+        $crossSlotRefused = [string]$_.Exception.Message -match 'copied from another slot'
+    }
+    Assert-Terminal $crossSlotRefused `
+        'an authenticated slot1 terminal presented as slot2 reaches and fails the slot-identity gate'
 
     Set-ItemProperty -LiteralPath $signedPath -Name IsReadOnly -Value $false
     $forgedTerminal = [IO.File]::ReadAllText($signedPath, $utf8) | ConvertFrom-Json

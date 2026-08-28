@@ -969,7 +969,36 @@ function Get-ReviewerQualificationTerminalSignature {
     $signed = [ordered]@{}
     foreach ($property in $Terminal.PSObject.Properties) {
         if ($property.Name -in @('signatureAlg', 'signature')) { continue }
-        $signed[$property.Name] = $property.Value
+        $value = $property.Value
+        if ($property.Name -in @('startedAtUtc', 'endedAtUtc', 'lastProgressUtc') -and
+            $null -ne $value -and -not [string]::IsNullOrEmpty([string]$value)) {
+            if ($value -is [DateTime]) {
+                $timestamp = [DateTime]$value
+                if ($timestamp.Kind -eq [DateTimeKind]::Unspecified) {
+                    throw "Slot terminal timestamp '$($property.Name)' must include an explicit UTC offset."
+                }
+                $value = $timestamp.ToUniversalTime().ToString(
+                    'o', [Globalization.CultureInfo]::InvariantCulture)
+            }
+            elseif ($value -is [DateTimeOffset]) {
+                $value = ([DateTimeOffset]$value).UtcDateTime.ToString(
+                    'o', [Globalization.CultureInfo]::InvariantCulture)
+            }
+            else {
+                if ([string]$value -notmatch '(?:Z|[+-][0-9]{2}:[0-9]{2})\z') {
+                    throw "Slot terminal timestamp '$($property.Name)' must include an explicit UTC offset."
+                }
+                $parsed = [DateTimeOffset]::MinValue
+                if (-not [DateTimeOffset]::TryParseExact(
+                        [string]$value, 'o', [Globalization.CultureInfo]::InvariantCulture,
+                        [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+                    throw "Slot terminal timestamp '$($property.Name)' must use invariant round-trip format."
+                }
+                $value = $parsed.UtcDateTime.ToString(
+                    'o', [Globalization.CultureInfo]::InvariantCulture)
+            }
+        }
+        $signed[$property.Name] = $value
     }
     $payload = ConvertTo-Json -InputObject $signed -Depth 8 -Compress
     $utf8 = [Text.UTF8Encoding]::new($false)
