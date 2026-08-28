@@ -38,6 +38,29 @@ $script:Checks = 0
 $script:Failures = [System.Collections.Generic.List[string]]::new()
 $script:PwshPath = (Get-Process -Id $PID).Path
 
+# The shipping child recomputes childRequestSha256 over the request it reads and
+# refuses one whose fields were altered under a stale digest (finding F11). A few
+# tests below replay a real child request with its result path repointed; such a
+# request must carry the digest the coordinator itself would have written, not the
+# original's. The child's own canonicaliser is lifted out by name here so the
+# replay digest is computed by exactly the code that will verify it, and the two
+# can never drift.
+$script:ShadowChildUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+$shadowChildAdapterSource = Join-Path $RepoRoot 'tools\Invoke-ShadowCoordinatorChild.ps1'
+$shadowChildAstErrors = $null
+$shadowChildAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $shadowChildAdapterSource, [ref]$null, [ref]$shadowChildAstErrors)
+if ($shadowChildAstErrors) {
+    throw "The child adapter '$shadowChildAdapterSource' did not parse: $($shadowChildAstErrors -join '; ')"
+}
+$shadowChildDigestFunctions = @('ConvertTo-ShadowCanonicalScalarText', 'ConvertTo-ShadowCanonicalText', 'Get-ShadowChildRequestDigest')
+foreach ($shadowChildFn in $shadowChildAst.FindAll(
+        { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    if ($shadowChildDigestFunctions -contains $shadowChildFn.Name) {
+        . ([scriptblock]::Create($shadowChildFn.Extent.Text))
+    }
+}
+
 function Assert-Coordinator {
     param([Parameter(Mandatory)][AllowNull()]$Condition, [Parameter(Mandatory)][string]$Message)
     $script:Checks++
@@ -226,14 +249,19 @@ function New-FaultyChildAdapter {
     $path = Join-Path $ToolkitCopy 'tools\Invoke-ShadowCoordinatorChild.ps1'
     $body = @'
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$RequestPath)
+param(
+    [Parameter(Mandatory)][string]$RequestPath,
+    [Parameter(Mandatory)][string]$ExpectedRequestSha256,
+    [Parameter(Mandatory)][string]$ExpectedResultPath,
+    [Parameter(Mandatory)][string]$ExpectedToolkitRoot
+)
 Set-StrictMode -Version Latest
 $ProgressPreference = 'SilentlyContinue'
 $fault = '__FAULT__'
 $stray = '__STRAY__'
 $real = '__REAL__'
 $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json -Depth 24
-$resultPath = [string]$request.resultPath
+$resultPath = $ExpectedResultPath
 $correlationId = [string]$request.correlationId
 $step = [string]$request.step
 $digest = [string]$request.childRequestSha256
@@ -241,7 +269,8 @@ if ($fault -eq 'mutateResult') {
     # Everything the reviewed child would do, then a single field of the result
     # rewritten. What the coordinator sees is a genuine, correlated, correctly
     # digested result that disagrees with its own record about one fact.
-    & $real -RequestPath $RequestPath
+    & $real -RequestPath $RequestPath -ExpectedRequestSha256 $ExpectedRequestSha256 `
+        -ExpectedResultPath $ExpectedResultPath -ExpectedToolkitRoot $ExpectedToolkitRoot
     if ($step -eq '__MUTATESTEP__') {
         $document = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json -Depth 24
         $document.'__MUTATEPROPERTY__' = '__MUTATEVALUE__'
@@ -254,7 +283,8 @@ if ($fault -eq 'mutateResult') {
 if ($fault -eq 'publishThenDie') {
     # Do the real work, including the durable side effect, then vanish exactly
     # the way a killed child does: no result for the coordinator to commit.
-    & $real -RequestPath $RequestPath
+    & $real -RequestPath $RequestPath -ExpectedRequestSha256 $ExpectedRequestSha256 `
+        -ExpectedResultPath $ExpectedResultPath -ExpectedToolkitRoot $ExpectedToolkitRoot
     if ($step -eq '__DIESTEP__') {
         Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
         exit 9
@@ -373,7 +403,12 @@ function New-SlotStubAdapter {
     $path = Join-Path $ToolkitCopy 'tools\Invoke-ShadowCoordinatorChild.ps1'
     $body = @'
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$RequestPath)
+param(
+    [Parameter(Mandatory)][string]$RequestPath,
+    [Parameter(Mandatory)][string]$ExpectedRequestSha256,
+    [Parameter(Mandatory)][string]$ExpectedResultPath,
+    [Parameter(Mandatory)][string]$ExpectedToolkitRoot
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -387,7 +422,7 @@ $runDelaySeconds = __RUNDELAY__
 
 $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json -Depth 24
 $step = [string]$request.step
-$resultPath = [string]$request.resultPath
+$resultPath = $ExpectedResultPath
 $correlationId = [string]$request.correlationId
 $childRequestSha256 = [string]$request.childRequestSha256
 
@@ -395,7 +430,8 @@ $childRequestSha256 = [string]$request.childRequestSha256
 # delivery decision are.
 if (-not ($step.StartsWith('slot') -or $step.StartsWith('reconcile') -or $step.StartsWith('delivery'))) {
     $global:LASTEXITCODE = 0
-    & $real -RequestPath $RequestPath
+    & $real -RequestPath $RequestPath -ExpectedRequestSha256 $ExpectedRequestSha256 `
+        -ExpectedResultPath $ExpectedResultPath -ExpectedToolkitRoot $ExpectedToolkitRoot
     exit ([int]$global:LASTEXITCODE)
 }
 
@@ -419,6 +455,27 @@ function Get-StubSha256Text {
     param([Parameter(Mandatory)][string]$Text)
     $bytes = ([Text.UTF8Encoding]::new($false, $true)).GetBytes($Text)
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Get-StubRunExecutionId {
+    <#
+    .SYNOPSIS
+        The 32-hex execution identity this stub echoes back for one slot run.
+    .DESCRIPTION
+        ECHOED, NOT MINTED. The coordinator mints the identity and sends it down in
+        the run step's request; the real adapter writes it where its verify process
+        can read it and returns it unchanged, and this stub stands in for exactly
+        that. Reading it here rather than deriving one is also the assertion that
+        the coordinator really does send it: a build that stopped sending it makes
+        every supervised slot in this suite fail rather than quietly agreeing with
+        an identity the child chose.
+    #>
+    param([Parameter(Mandatory)]$Request)
+    $value = [string]$Request.runExecutionId
+    if ($value -cnotmatch '^[0-9a-f]{32}\z') {
+        throw "The stub adapter was given run execution identity '$value', which the coordinator did not mint."
+    }
+    return $value
 }
 
 $qualificationRoot = [string]$request.qualificationRoot
@@ -931,6 +988,7 @@ if ($phase -eq 'Run') {
                 slotName = $slotName
                 setId = $setId
                 planDigest = $planDigest
+                runExecutionId = (Get-StubRunExecutionId -Request $request)
             })
         exit 0
     }
@@ -970,6 +1028,7 @@ if ($phase -eq 'Run') {
             slotName = $slotName
             setId = $setId
             planDigest = $planDigest
+            runExecutionId = (Get-StubRunExecutionId -Request $request)
         })
     # The reviewed runner propagates the reviewed run's own exit code, so a
     # failed slot exits non-zero with perfectly good evidence. Mirrored here so
@@ -1650,10 +1709,16 @@ try {
     $replayRequest = Join-Path $sandbox 'declare-replay.request.json'
     $replayDocument = Get-Content -LiteralPath $declareChildRequest -Raw | ConvertFrom-Json -Depth 24
     $replayDocument.resultPath = $replayResult
+    # Repointing the result path is a field change, so both the request's self
+    # digest and the independent authority a coordinator would pass must name the
+    # new bytes and path.
+    $replayDocument.childRequestSha256 = Get-ShadowChildRequestDigest -Request $replayDocument
     $replayText = (ConvertTo-Json -InputObject $replayDocument -Depth 24 -Compress:$false) + "`n"
     [IO.File]::WriteAllBytes($replayRequest, ([Text.UTF8Encoding]::new($false)).GetBytes($replayText))
     $adapter = Join-Path $fixture.ToolkitCopy 'tools\Invoke-ShadowCoordinatorChild.ps1'
-    $replayOutput = & pwsh -NoProfile -File $adapter -RequestPath $replayRequest 2>&1 | Out-String
+    $replayOutput = & pwsh -NoProfile -File $adapter -RequestPath $replayRequest `
+        -ExpectedRequestSha256 ([string]$replayDocument.childRequestSha256) `
+        -ExpectedResultPath $replayResult -ExpectedToolkitRoot $fixture.ToolkitCopy 2>&1 | Out-String
     $replayExit = $LASTEXITCODE
     Assert-Coordinator ($replayExit -eq 0) `
         "Replaying the declaration child against its own published run set exited $replayExit.`n$replayOutput"
@@ -1880,10 +1945,17 @@ try {
     $foreignReplayResult = Join-Path $sandbox 'foreign-declare.result.json'
     $foreignReplayDocument = Get-Content -LiteralPath $foreignChildRequest -Raw | ConvertFrom-Json -Depth 24
     $foreignReplayDocument.resultPath = $foreignReplayResult
+    # As above (F11): a repointed result path is a field change, so both the request
+    # digest and the independent authority a coordinator would pass must name it.
+    # The child must then refuse for the reason under test - the declaration belongs
+    # to another preparation - rather than at the authority boundary.
+    $foreignReplayDocument.childRequestSha256 = Get-ShadowChildRequestDigest -Request $foreignReplayDocument
     $foreignReplayText = (ConvertTo-Json -InputObject $foreignReplayDocument -Depth 24 -Compress:$false) + "`n"
     [IO.File]::WriteAllBytes($foreignReplayRequest, ([Text.UTF8Encoding]::new($false)).GetBytes($foreignReplayText))
     $foreignAdapter = Join-Path $fixture.ToolkitCopy 'tools\Invoke-ShadowCoordinatorChild.ps1'
-    $foreignChildOutput = & pwsh -NoProfile -File $foreignAdapter -RequestPath $foreignReplayRequest 2>&1 | Out-String
+    $foreignChildOutput = & pwsh -NoProfile -File $foreignAdapter -RequestPath $foreignReplayRequest `
+        -ExpectedRequestSha256 ([string]$foreignReplayDocument.childRequestSha256) `
+        -ExpectedResultPath $foreignReplayResult -ExpectedToolkitRoot $fixture.ToolkitCopy 2>&1 | Out-String
     Assert-Coordinator ($LASTEXITCODE -ne 0) `
         "The child adopted a run set belonging to another preparation.`n$foreignChildOutput"
     Assert-Coordinator ($foreignChildOutput -match 'another preparation') `
@@ -4331,10 +4403,6 @@ if ($script:Failures.Count -gt 0) {
 }
 Write-Host "Shadow run coordinator: $($script:Checks) check(s) passed." -ForegroundColor Green
 exit 0
-
-
-
-
 
 
 

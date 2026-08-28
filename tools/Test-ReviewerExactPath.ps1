@@ -224,6 +224,45 @@ if ((Get-SemanticHash -GraphPath $operationalDriftPath -Sandbox $first.sandbox) 
     throw 'Semantic normalization retained an explicitly excluded operational-field change.'
 }
 
+$logMeasurementDriftPath = Join-Path $first.sandbox 'log-measurement-drift.json'
+$logMeasurementGraph = Get-Content -LiteralPath $first.graphPath -Raw | ConvertFrom-Json -Depth 100
+$logMeasurementRoundTripPath = Join-Path $first.sandbox 'log-measurement-round-trip.json'
+$logMeasurementGraph | ConvertTo-Json -Depth 100 -Compress:$false |
+    Set-Content -LiteralPath $logMeasurementRoundTripPath -Encoding utf8NoBOM
+if ((Get-SemanticHash -GraphPath $logMeasurementRoundTripPath -Sandbox $first.sandbox) -cne
+    $first.semanticSha256) {
+    throw 'Semantic artifact graph JSON round-trip changed the digest before the log measurement mutation.'
+}
+$censusArtifacts = @($logMeasurementGraph.artifacts | Where-Object {
+        [string]$_.logicalKind -ceq 'model-start-census.manifest'
+    })
+if ($censusArtifacts.Count -ne 1) {
+    throw "Expected one model-start census manifest artifact, found $($censusArtifacts.Count)."
+}
+$censusManifest = [string]$censusArtifacts[0].document.manifestJson | ConvertFrom-Json -Depth 32
+$censusManifest.logBytes = [int]$censusManifest.logBytes + 27
+$censusArtifacts[0].document.manifestJson = $censusManifest | ConvertTo-Json -Depth 32 -Compress
+$logMeasurementGraph | ConvertTo-Json -Depth 100 -Compress:$false |
+    Set-Content -LiteralPath $logMeasurementDriftPath -Encoding utf8NoBOM
+if ((Get-SemanticHash -GraphPath $logMeasurementDriftPath -Sandbox $first.sandbox) -cne $first.semanticSha256) {
+    throw 'Semantic normalization retained the operational raw log byte count.'
+}
+
+$logSemanticDriftPath = Join-Path $first.sandbox 'log-semantic-drift.json'
+$logSemanticGraph = Get-Content -LiteralPath $first.graphPath -Raw | ConvertFrom-Json -Depth 100
+$logArtifacts = @($logSemanticGraph.artifacts | Where-Object {
+        [string]$_.logicalKind -ceq 'logs' -and [string]$_.mediaType -ceq 'application/x-ndjson'
+    })
+if ($logArtifacts.Count -ne 1 -or @($logArtifacts[0].document).Count -eq 0) {
+    throw 'Expected one non-empty semantic reviewer log artifact.'
+}
+$logArtifacts[0].document[0] | Add-Member semanticMutation 'changed-log-meaning' -Force
+$logSemanticGraph | ConvertTo-Json -Depth 100 -Compress:$false |
+    Set-Content -LiteralPath $logSemanticDriftPath -Encoding utf8NoBOM
+if ((Get-SemanticHash -GraphPath $logSemanticDriftPath -Sandbox $first.sandbox) -ceq $first.semanticSha256) {
+    throw 'Semantic normalization failed to detect a retained reviewer log change.'
+}
+
 $setAPath = Join-Path $first.sandbox 'set-order-a.json'
 $setBPath = Join-Path $first.sandbox 'set-order-b.json'
 $setCPath = Join-Path $first.sandbox 'set-order-regenerated.json'

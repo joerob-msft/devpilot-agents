@@ -924,19 +924,140 @@ function Resolve-ReviewerQualificationSlotTerminalPath {
     return $aliases[0].FullName
 }
 
+function Get-ReviewerQualificationRunSetMasterKey {
+    <#
+        Reads an existing run-set signing key without ever minting one. Terminal
+        evidence is authenticated under this external custody, so a key missing
+        from the run root is a refusal rather than an invitation to create one.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $infoRows = @(Get-Item -LiteralPath $Path)
+    $info = $infoRows[0]
+    if ($info.Length -gt 8192) {
+        throw "The signing key at '$Path' is $($info.Length) bytes; a key file is a single short line."
+    }
+    $line = ([IO.File]::ReadAllText($Path)).Trim()
+    $format = $(if ($IsWindows) { 'dpapi' } else { 'raw' })
+    $separator = $line.IndexOf(':')
+    if ($separator -gt 0) {
+        $format = $line.Substring(0, $separator)
+        $line = $line.Substring($separator + 1)
+    }
+    $stored = [Convert]::FromBase64String($line)
+    [byte[]]$master = switch ($format) {
+        'raw' { $stored }
+        'dpapi' {
+            try {
+                [System.Security.Cryptography.ProtectedData]::Unprotect(
+                    $stored, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+            }
+            catch {
+                throw "The signing key at '$Path' could not be decrypted for this user: $($_.Exception.Message)"
+            }
+        }
+        default { throw "The signing key at '$Path' declares an unknown storage format '$format'." }
+    }
+    if ($master.Length -lt 32) { throw "The signing key at '$Path' is too short." }
+    return , $master
+}
+
+function Get-ReviewerQualificationTerminalSignature {
+    param(
+        [Parameter(Mandatory)]$Terminal,
+        [Parameter(Mandatory)][byte[]]$MasterKey
+    )
+    $signed = [ordered]@{}
+    foreach ($property in $Terminal.PSObject.Properties) {
+        if ($property.Name -in @('signatureAlg', 'signature')) { continue }
+        $signed[$property.Name] = $property.Value
+    }
+    $payload = ConvertTo-Json -InputObject $signed -Depth 8 -Compress
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $keyDeriver = [Security.Cryptography.HMACSHA256]::new($MasterKey)
+    try {
+        [byte[]]$terminalKey = $keyDeriver.ComputeHash(
+            $utf8.GetBytes('devpilot.reviewer.replay-qualification.terminal.v1'))
+    }
+    finally { $keyDeriver.Dispose() }
+    $signer = [Security.Cryptography.HMACSHA256]::new($terminalKey)
+    try {
+        return [Convert]::ToHexString($signer.ComputeHash($utf8.GetBytes($payload))).ToLowerInvariant()
+    }
+    finally { $signer.Dispose() }
+}
+
+function Protect-ReviewerQualificationSlotTerminal {
+    param(
+        [Parameter(Mandatory)]$Terminal,
+        [Parameter(Mandatory)][string]$RunSetKeyPath
+    )
+    $masterKeyOutput = Get-ReviewerQualificationRunSetMasterKey -Path $RunSetKeyPath
+    [byte[]]$masterKey = $masterKeyOutput
+    $Terminal | Add-Member -NotePropertyName signatureAlg -NotePropertyValue 'HMACSHA256' -Force
+    $Terminal | Add-Member -NotePropertyName signature -NotePropertyValue (
+        Get-ReviewerQualificationTerminalSignature -Terminal $Terminal -MasterKey $masterKey) -Force
+    return $Terminal
+}
+
 function Read-ReviewerQualificationSlotTerminal {
     <#
         Reads one slot's immutable terminal evidence. A terminal record that is
         absent, writable, or unparsable is not evidence a reader may act on.
     #>
-    param([Parameter(Mandatory)][string]$TerminalPath)
+    param(
+        [Parameter(Mandatory)][string]$TerminalPath,
+        [Parameter(Mandatory)][string]$RunSetKeyPath,
+        [AllowEmptyString()][string]$ExpectedRunExecutionId = '',
+        [switch]$IncludeSnapshot
+    )
     if (-not (Test-Path -LiteralPath $TerminalPath -PathType Leaf)) {
         return $null
+    }
+    [byte[]]$bytes = [IO.File]::ReadAllBytes($TerminalPath)
+    if ($bytes.Length -eq 0) { throw "Slot terminal evidence '$TerminalPath' is empty." }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw "Slot terminal evidence '$TerminalPath' begins with a byte-order mark."
+    }
+    $utf8 = [Text.UTF8Encoding]::new($false, $true)
+    try { $terminal = $utf8.GetString($bytes) | ConvertFrom-Json -Depth 16 -ErrorAction Stop }
+    catch { throw "Slot terminal evidence '$TerminalPath' is not strict terminal JSON: $($_.Exception.Message)" }
+    $signatureAlg = if ($terminal.PSObject.Properties['signatureAlg']) {
+        [string]$terminal.signatureAlg
+    } else { '' }
+    $signature = if ($terminal.PSObject.Properties['signature']) {
+        [string]$terminal.signature
+    } else { '' }
+    if ($signatureAlg -cne 'HMACSHA256' -or $signature -cnotmatch '^[0-9a-f]{64}\z') {
+        throw "Slot terminal evidence '$TerminalPath' has no valid HMACSHA256 signature."
+    }
+    $masterKeyOutput = Get-ReviewerQualificationRunSetMasterKey -Path $RunSetKeyPath
+    [byte[]]$masterKey = $masterKeyOutput
+    $expectedSignature = Get-ReviewerQualificationTerminalSignature -Terminal $terminal -MasterKey $masterKey
+    if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+            [Convert]::FromHexString($expectedSignature),
+            [Convert]::FromHexString($signature))) {
+        throw "Slot terminal evidence '$TerminalPath' failed authentication under the run-set key."
+    }
+    if (-not $terminal.PSObject.Properties['runExecutionId'] -or
+        [string]$terminal.runExecutionId -cnotmatch '^[0-9a-f]{32}\z') {
+        throw "Slot terminal evidence '$TerminalPath' carries no valid run execution identity."
+    }
+    if ($ExpectedRunExecutionId -and [string]$terminal.runExecutionId -cne $ExpectedRunExecutionId) {
+        throw ("Slot terminal evidence '$TerminalPath' names execution '$([string]$terminal.runExecutionId)', " +
+            "not the coordinator-committed '$ExpectedRunExecutionId'.")
     }
     if (-not (Get-Item -LiteralPath $TerminalPath).IsReadOnly) {
         throw "Slot terminal evidence '$TerminalPath' is writable; immutable terminal evidence is required."
     }
-    return (Get-Content -LiteralPath $TerminalPath -Raw | ConvertFrom-Json)
+    if ($IncludeSnapshot) {
+        return [pscustomobject]@{
+            Terminal = $terminal
+            Bytes = $bytes
+            Sha256 = [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        }
+    }
+    return $terminal
 }
 
 function Test-ReviewerQualificationRecordedProcessAlive {
@@ -1016,6 +1137,7 @@ function Assert-ReviewerQualificationSlotPredecessorComplete {
     param(
         [Parameter(Mandatory)][string]$SlotName,
         [Parameter(Mandatory)][string]$RunDirectory,
+        [Parameter(Mandatory)][string]$RunSetKeyPath,
         [string]$ExpectedSetId = "",
         [string]$ExpectedPlanDigest = ""
     )
@@ -1030,7 +1152,8 @@ function Assert-ReviewerQualificationSlotPredecessorComplete {
         throw ("Slot '$SlotName' cannot start before '$predecessor' records an immutable successful terminal " +
             "result: no case-exact '$predecessor-terminal.json' exists under '$RunDirectory'. One authorized slot proceeds at a time.")
     }
-    $predecessorTerminal = Read-ReviewerQualificationSlotTerminal -TerminalPath $predecessorTerminalPath
+    $predecessorTerminal = Read-ReviewerQualificationSlotTerminal -TerminalPath $predecessorTerminalPath `
+        -RunSetKeyPath $RunSetKeyPath
     Assert-ReviewerQualificationTerminalBoundToDeclaration -Terminal $predecessorTerminal -SlotName $predecessor `
         -ExpectedSetId $ExpectedSetId -ExpectedPlanDigest $ExpectedPlanDigest
     if ([string]$predecessorTerminal.status -cne "complete") {
@@ -1054,6 +1177,7 @@ function Assert-ReviewerQualificationReconciliationReady {
     #>
     param(
         [Parameter(Mandatory)]$Plan,
+        [Parameter(Mandatory)][string]$RunSetKeyPath,
         [string]$ExpectedSetId = "",
         [string]$ExpectedPlanDigest = ""
     )
@@ -1061,7 +1185,9 @@ function Assert-ReviewerQualificationReconciliationReady {
     $reconciled = [System.Collections.Generic.List[object]]::new()
     foreach ($slot in @($Plan.Slots)) {
         $terminalPath = Resolve-ReviewerQualificationSlotTerminalPath -RunDirectory $runDirectory -SlotName ([string]$slot.Name)
-        $terminal = if ($terminalPath) { Read-ReviewerQualificationSlotTerminal -TerminalPath $terminalPath } else { $null }
+        $terminal = if ($terminalPath) {
+            Read-ReviewerQualificationSlotTerminal -TerminalPath $terminalPath -RunSetKeyPath $RunSetKeyPath
+        } else { $null }
         if (-not $terminal) {
             throw (New-ReviewerQualificationFault -Code "reconciliationSlotTerminalAbsent" -Message (
                     "Reconciliation requires every slot to have a terminal result; '$($slot.Name)' has no case-exact " +
@@ -1300,7 +1426,7 @@ function Assert-ReviewerQualificationSetReconcilable {
     # Plan-identity boundary: bind the FULL plan, not snapshot and count alone.
     Assert-ReviewerQualificationDeclarationMatchesPlan -Declaration $verified.Declaration -Plan $Plan `
         -ExpectedPlanDigest $currentDigest
-    $slots = Assert-ReviewerQualificationReconciliationReady -Plan $Plan `
+    $slots = Assert-ReviewerQualificationReconciliationReady -Plan $Plan -RunSetKeyPath $RunSetKeyPath `
         -ExpectedSetId ([string]$verified.Declaration.setId) `
         -ExpectedPlanDigest ([string]$verified.Declaration.planDigest)
     return [pscustomobject]@{ Declaration = $verified.Declaration; Slots = @($slots) }

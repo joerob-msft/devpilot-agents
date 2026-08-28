@@ -1439,6 +1439,11 @@ Assert-Ledger ($docText -match 'Gate 5') 'docs/escape-ledger.md does not record 
 
 $commitsVerified = 0
 $script:CommitsBehindHead = -1
+$script:CoverageWindowBoundary = ''
+$script:CoverageWindowBoundaryVia = 'none'
+$script:ConsolidationMap = $null
+$script:ConsolidationMappingDigest = ''
+$script:BranchPresenceObjections = @{}
 # A near miss was introduced and detected inside the same unmerged change, so it never
 # entered a merged coordinator change and is not an escape. Keeping the two collections
 # separate is load-bearing: the budget decision reads escape category totals, and a
@@ -1847,6 +1852,71 @@ if ($unanchoredProbe.Count -eq 1) {
 }
 
 if ($VerifyCommits) {
+    # The ledger's commit citations are frozen evidence and are never rewritten. When the
+    # reviewer stack was consolidated, one hundred and forty-eight commits became five, and
+    # three of those citations stopped being reachable from this branch - not because the
+    # work vanished, but because its commit identities did. The consolidation map is how a
+    # citation is located in the replacement lineage: a sealed, versioned statement of which
+    # replacement commit carries which source commit's work, every identity in it recomputed
+    # from git before it is believed. See tools/EscapeLedgerConsolidation.ps1 for exactly what
+    # is proven and, just as importantly, what is not.
+    #
+    # The map is consulted for ONE question only - is this branch carrying the change this
+    # record describes - and never for the merged-versus-not baseline below, which keeps using
+    # strict ancestry. No mapping can therefore reclassify a near miss as an escape or the
+    # reverse.
+    . (Join-Path $PSScriptRoot 'EscapeLedgerConsolidation.ps1')
+    $consolidationMapPath = Get-EscapeLedgerConsolidationDefaultPath -RepoRoot $repoRoot
+    $consolidationLoadError = $null
+    try {
+        $script:ConsolidationMap = Read-EscapeLedgerConsolidationMap -Path $consolidationMapPath
+        $script:ConsolidationMappingDigest = [string]$script:ConsolidationMap.mappingDigest
+    }
+    catch { $consolidationLoadError = $_.Exception.Message }
+    Assert-Ledger ($null -eq $consolidationLoadError) `
+        "The escape-ledger consolidation map did not verify, so no pre-consolidation citation can be resolved: $consolidationLoadError"
+
+    function Get-BranchPresenceObjection {
+        <#
+            .SYNOPSIS
+            Why this branch does not carry the change a frozen citation names, or $null.
+
+            .DESCRIPTION
+            Direct ancestry is asked first and is unchanged, so a commit that never moved
+            never touches the map. Only a commit the original question rejects is offered to
+            the map, and the map accepts it only when every identity obligation is discharged
+            against live git objects. The refusal text names the obligation that failed, so a
+            broken map reads as a broken map rather than as a missing commit.
+
+            Verdicts are memoised because the validator-consumption gate below requires every
+            shared validator call to sit inside Assert-Ledger's verdict argument. The failure
+            message therefore reads the reason out of this cache rather than calling again,
+            which keeps one question to one answer instead of asking git twice and hoping for
+            the same result.
+        #>
+        param(
+            [Parameter(Mandatory)][string]$Sha,
+            [string]$HeadRef = 'HEAD'
+        )
+        $cacheKey = "$Sha|$HeadRef"
+        if ($script:BranchPresenceObjections.ContainsKey($cacheKey)) { return $script:BranchPresenceObjections[$cacheKey] }
+        & git -C $repoRoot merge-base --is-ancestor $Sha $HeadRef 2>$null
+        $objection = $null
+        if ($LASTEXITCODE -ne 0) {
+            if ($null -eq $script:ConsolidationMap) {
+                $objection = "commit $Sha is not reachable from $HeadRef and no verified consolidation map is available"
+            }
+            else {
+                $resolved = Resolve-EscapeLedgerConsolidatedCommit -RepoRoot $repoRoot -Map $script:ConsolidationMap -SourceCommit $Sha -HeadRef $HeadRef
+                if (-not $resolved.Accepted) {
+                    $objection = "commit $Sha is not reachable from $HeadRef and cannot be resolved through the consolidation map: $($resolved.Reason)"
+                }
+            }
+        }
+        $script:BranchPresenceObjections[$cacheKey] = $objection
+        return $objection
+    }
+
     foreach ($incident in (@($incidents) + @($nearMisses))) {
         foreach ($property in @('introducedCommit', 'remediatedCommit')) {
             if ($incident.PSObject.Properties.Name -notcontains $property) { continue }
@@ -2129,8 +2199,8 @@ if ($VerifyCommits) {
         $nearMissNames = @($nearMiss.PSObject.Properties | ForEach-Object { $_.Name })
         if ($nearMissNames -notcontains 'introducedCommit' -or $nearMissNames -notcontains 'classifiedAgainstCommit') { continue }
         $introduced = [string]$nearMiss.introducedCommit
-        Assert-Ledger (Test-CommitMerged -Sha $introduced -WindowEnd 'HEAD' -RepoRoot $repoRoot) `
-            "Near miss $($nearMiss.id) cites an introducing commit $introduced that is not reachable from HEAD, so this branch does not contain the change it describes."
+        Assert-Ledger ($null -eq (Get-BranchPresenceObjection -Sha $introduced)) `
+            "Near miss $($nearMiss.id) cites an introducing commit $introduced that this branch does not carry: $($script:BranchPresenceObjections["$introduced|HEAD"])"
         Assert-Ledger (-not (Test-CommitMerged -Sha $introduced -WindowEnd ([string]$nearMiss.classifiedAgainstCommit) -RepoRoot $repoRoot)) `
             "Near miss $($nearMiss.id) is reachable from its own classification baseline, so the baseline distinguishes nothing."
     }
@@ -2147,9 +2217,27 @@ if ($VerifyCommits) {
         Assert-Ledger ([string]$ledger.coverageWindow.evaluatedOn -eq $endCommitDate) `
             "The coverage window is evaluated on $($ledger.coverageWindow.evaluatedOn) but its end commit $endCommit was committed on $endCommitDate."
 
+        # The window end is the same question in a different place: does this branch carry the
+        # state the window was evaluated against? Under the consolidation it does, through the
+        # replacement segment tip, and the boundary the staleness clock is then measured from
+        # is that replacement commit rather than a commit this branch does not have. Measuring
+        # from the source commit would count the five replacement commits as drift when they
+        # are the same work re-expressed - an honest-looking number derived from a history
+        # that no longer exists.
+        Assert-Ledger ($null -eq (Get-BranchPresenceObjection -Sha $endCommit)) `
+            "The coverage window ends at commit $endCommit, which this branch does not carry: $($script:BranchPresenceObjections["$endCommit|HEAD"])"
+
+        $boundaryCommit = $endCommit
+        $script:CoverageWindowBoundaryVia = 'direct'
         & git -C $repoRoot merge-base --is-ancestor $endCommit HEAD 2>$null
-        Assert-Ledger ($LASTEXITCODE -eq 0) `
-            "The coverage window ends at commit $endCommit, which is not an ancestor of HEAD; the ledger is describing a history this branch does not have."
+        if ($LASTEXITCODE -ne 0 -and $null -ne $script:ConsolidationMap) {
+            $resolvedEnd = Resolve-EscapeLedgerConsolidatedCommit -RepoRoot $repoRoot -Map $script:ConsolidationMap -SourceCommit $endCommit -HeadRef 'HEAD'
+            if ($resolvedEnd.Accepted) {
+                $boundaryCommit = [string]$resolvedEnd.ReplacementCommit
+                $script:CoverageWindowBoundaryVia = 'consolidation'
+            }
+        }
+        $script:CoverageWindowBoundary = $boundaryCommit
 
         # A rolling budget that is never re-evaluated is a running total. Once the head has
         # moved further than the declared bound, the ledger has to be brought forward before
@@ -2162,7 +2250,11 @@ if ($VerifyCommits) {
         # it spans divided by the changes it observed. The declared bound must stay inside two
         # coordinator changes at that observed rate, so the clock can never fall behind by a
         # fifth of the ten-change budget window.
-        $behind = [int]((& git -C $repoRoot rev-list --count "$endCommit..HEAD").Trim())
+        #
+        # The declared bound itself is NOT relaxed for the consolidation. It stays where the
+        # frozen snapshot put it; what moved is the boundary the distance is measured from,
+        # and that move is a verified mapping rather than an adjustment to the threshold.
+        $behind = [int]((& git -C $repoRoot rev-list --count "$boundaryCommit..HEAD").Trim())
         $staleAfter = [int]$ledger.coverageWindow.staleAfterCommitsBehindHead
         Assert-Ledger ($staleAfter -ge 1) 'The coverage window declares no staleness bound, so it can never be forced forward.'
 
@@ -2217,7 +2309,8 @@ function Get-DiscardedValidatorVerdicts {
         'Get-ExceptionObjection',
         'Get-ClassificationBaselineObjection',
         'Test-NearMissBaseline',
-        'Get-AcceptanceCommitObjection'
+        'Get-AcceptanceCommitObjection',
+        'Get-BranchPresenceObjection'
     )
     $objections = New-Object System.Collections.Generic.List[string]
     $calls = $ast.FindAll({
@@ -2314,6 +2407,9 @@ $report = [ordered]@{
     unauthorizedWrites = [int]$snapshot.unauthorizedWrites
     commitsVerified = $commitsVerified
     commitsBehindHead = $script:CommitsBehindHead
+    coverageWindowBoundary = $script:CoverageWindowBoundary
+    coverageWindowBoundaryVia = $script:CoverageWindowBoundaryVia
+    consolidationMappingDigest = $script:ConsolidationMappingDigest
     checks = $script:Checks
     failed = $script:Failures.Count
 }

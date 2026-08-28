@@ -51,7 +51,7 @@ internal static class CohortEntryOutcomes
     /// <summary>The preparation refused, faulted, or exited for a reason of its own.</summary>
     internal const string PreparationFaulted = "preparationFaulted";
 
-    /// <summary>The entry exceeded its declared wall-clock budget and its tree was killed.</summary>
+    /// <summary>A legacy entry timeout recorded before custody became uniformly fail-closed.</summary>
     internal const string TimedOut = "timedOut";
 
     /// <summary>The child could not be proven stopped, so nothing may run against this root again.</summary>
@@ -72,6 +72,26 @@ internal static class CohortEntryOutcomes
 
     internal static bool IsKnown(string outcome) =>
         outcome is Complete or RunNotComplete or PreparationFaulted or TimedOut or Abandoned or EvidenceRefused;
+
+    /// <summary>
+    /// The outcomes a runner reaches ONLY after it has positively witnessed the
+    /// supervised coordinator's output streams reach EOF and its process tree stop
+    /// under an ending whose contract says its own children were accounted for.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="TimedOut"/> and <see cref="Abandoned"/> are the recorded facts
+    /// that this witness was NOT obtained: the entry's own process exited or was
+    /// killed, but a descendant may still hold its output pipes and still be
+    /// writing into its root. Completion adoption is allowed only over a
+    /// drain-witnessed outcome, so an entry whose tree could not be confirmed
+    /// stopped is never later re-read as a finished, fully-accounted run - not on
+    /// the live path and not on a rebuild that sees the same committed outcome.
+    /// This is a positive test for the drained-and-stopped fact rather than a
+    /// list of names to exclude: a future non-witnessed outcome is refused by
+    /// default until it is added here deliberately.
+    /// </remarks>
+    internal static bool IsDrainWitnessed(string outcome) =>
+        outcome is Complete or RunNotComplete;
 }
 
 /// <summary>The durable record of one entry inside a cohort journal.</summary>
@@ -100,6 +120,27 @@ internal sealed record CohortEntryRecord
     internal required int ExitCode { get; init; }
 
     internal required string Outcome { get; init; }
+
+    /// <summary>
+    /// The ending the runner derived from the supervised run itself, captured
+    /// before any completion adoption could overwrite <see cref="Outcome"/> with
+    /// 'complete'. This is the immutable witness of whether the run's output
+    /// drained to EOF and the supervised process exited: an adopted entry carries
+    /// 'complete' in <see cref="Outcome"/> but keeps its pre-adoption ending here,
+    /// so a later reader can tell an adoption that rested on that witness from one
+    /// that never had it. A record from a build that did not persist this reads it
+    /// as 'none', which is not drain-witnessed, so such an entry is never adopted
+    /// as complete again.
+    ///
+    /// What the witness covers is bounded and is stated here rather than implied:
+    /// the supervised process exited AND every descendant holding its inherited
+    /// output handles released them. A descendant that never inherited those
+    /// handles, or closed them before exiting, is outside it - no job object
+    /// contains the tree, so such a descendant can outlive the ending. That
+    /// residual is the reason the witness is recorded rather than assumed, but it
+    /// is not eliminated by recording it.
+    /// </summary>
+    internal required string PreAdoptionOutcome { get; init; }
 
     internal required int ElapsedSeconds { get; init; }
 
@@ -152,6 +193,7 @@ internal sealed record CohortEntryRecord
         EndedAtUtc = "none",
         ExitCode = -1,
         Outcome = "none",
+        PreAdoptionOutcome = "none",
         ElapsedSeconds = 0,
         ModelStartCount = 0,
         ModelStartUnmeasuredAllowance = 0,
@@ -164,28 +206,45 @@ internal sealed record CohortEntryRecord
         SummarySha256 = "none"
     };
 
-    internal MapNode Describe() => new MapNode()
-        .Set("ordinal", Ordinal)
-        .Set("entryId", EntryId)
-        .Set("state", State)
-        .Set("attempt", Attempt)
-        .Set("intentSha256", IntentSha256)
-        .Set("childProcessId", ChildProcessId)
-        .Set("childStartedAtUtc", ChildStartedAtUtc)
-        .Set("startedAtUtc", StartedAtUtc)
-        .Set("endedAtUtc", EndedAtUtc)
-        .Set("exitCode", ExitCode)
-        .Set("outcome", Outcome)
-        .Set("elapsedSeconds", ElapsedSeconds)
-        .Set("modelStartCount", ModelStartCount)
-        .Set("modelStartUnmeasuredAllowance", ModelStartUnmeasuredAllowance)
-        .Set("verifierAssignmentCount", VerifierAssignmentCount)
-        .Set("verifierAssignmentUnmeasuredAllowance", VerifierAssignmentUnmeasuredAllowance)
-        .Set("slotLaunchCount", SlotLaunchCount)
-        .Set("providerWriteCount", ProviderWriteCount)
-        .Set("writeToolInvocationCount", WriteToolInvocationCount)
-        .Set("auditSha256", AuditSha256)
-        .Set("summarySha256", SummarySha256);
+    internal MapNode Describe()
+    {
+        var composed = new MapNode()
+            .Set("ordinal", Ordinal)
+            .Set("entryId", EntryId)
+            .Set("state", State)
+            .Set("attempt", Attempt)
+            .Set("intentSha256", IntentSha256)
+            .Set("childProcessId", ChildProcessId)
+            .Set("childStartedAtUtc", ChildStartedAtUtc)
+            .Set("startedAtUtc", StartedAtUtc)
+            .Set("endedAtUtc", EndedAtUtc)
+            .Set("exitCode", ExitCode)
+            .Set("outcome", Outcome);
+        // Written only once there IS one, for the same reason registrySha256 is:
+        // a record with no pre-adoption ending composes exactly the bytes it
+        // composed before this field existed, so every journal signed by an
+        // earlier build still authenticates and every cohort interrupted under
+        // one can still be resumed. Composing 'none' instead would change the
+        // signed bytes of every record ever written and turn a legitimate resume
+        // into a tamper refusal, which is unrepairable by design. Every record
+        // this build ends carries a real value, so presence is also the marker
+        // that the witness was recorded at all.
+        if (!string.Equals(PreAdoptionOutcome, "none", StringComparison.Ordinal))
+        {
+            composed.Set("preAdoptionOutcome", PreAdoptionOutcome);
+        }
+        return composed
+            .Set("elapsedSeconds", ElapsedSeconds)
+            .Set("modelStartCount", ModelStartCount)
+            .Set("modelStartUnmeasuredAllowance", ModelStartUnmeasuredAllowance)
+            .Set("verifierAssignmentCount", VerifierAssignmentCount)
+            .Set("verifierAssignmentUnmeasuredAllowance", VerifierAssignmentUnmeasuredAllowance)
+            .Set("slotLaunchCount", SlotLaunchCount)
+            .Set("providerWriteCount", ProviderWriteCount)
+            .Set("writeToolInvocationCount", WriteToolInvocationCount)
+            .Set("auditSha256", AuditSha256)
+            .Set("summarySha256", SummarySha256);
+    }
 
     internal static CohortEntryRecord Read(JsonElement node, string label)
     {
@@ -207,6 +266,7 @@ internal sealed record CohortEntryRecord
             "endedAtUtc",
             "exitCode",
             "outcome",
+            "preAdoptionOutcome",
             "elapsedSeconds",
             "modelStartCount",
             "modelStartUnmeasuredAllowance",
@@ -252,6 +312,39 @@ internal sealed record CohortEntryRecord
                 "rather than accounted for, so this journal was not written by this build and is not resumed.");
         }
 
+        // Optional on read, and absent reads as 'none' on purpose. A journal
+        // written by a build that did not record the pre-adoption ending has no
+        // such field; 'none' is not drain-witnessed, so an entry that build
+        // adopted as 'complete' over an unconfirmed tree is not adopted again
+        // rather than trusted on the word 'complete' alone. The completion is
+        // dropped from the index rather than blocking it, because nothing about
+        // such a record contradicts itself - the witness simply was never taken.
+        var preAdoptionOutcome = "none";
+        if (node.TryGetProperty("preAdoptionOutcome", out var preAdoptionNode))
+        {
+            if (preAdoptionNode.ValueKind != JsonValueKind.String)
+            {
+                throw new ContractException($"The {label} field 'preAdoptionOutcome' is a {StrictJson.Describe(preAdoptionNode.ValueKind)}, not a string.");
+            }
+            preAdoptionOutcome = preAdoptionNode.GetString()!;
+            // A literally-present 'none' is refused rather than accepted,
+            // because the writer OMITS the field at that value: accepting it
+            // would load a journal that then fails its own signature and be
+            // reported as tampering no operator could repair. The mirror of the
+            // writable bound below - a value only the reader accepts is as
+            // wedging as a value only the reader refuses.
+            if (string.Equals(preAdoptionOutcome, "none", StringComparison.Ordinal))
+            {
+                throw new ContractException(
+                    $"The {label} records preAdoptionOutcome 'none' as a field. A record with no pre-adoption ending omits the " +
+                    "field entirely, so a journal that writes it out cannot reproduce the signature it was written with.");
+            }
+            if (!CohortEntryOutcomes.IsKnown(preAdoptionOutcome))
+            {
+                throw new ContractException($"The {label} records preAdoptionOutcome '{preAdoptionOutcome}', which is not an outcome this build writes.");
+            }
+        }
+
         return new CohortEntryRecord
         {
             Ordinal = StrictJson.RequireInt(node, "ordinal", label, 1, 64),
@@ -270,6 +363,7 @@ internal sealed record CohortEntryRecord
             // which would wedge a signed journal no operator can edit.
             ExitCode = StrictJson.RequireInt(node, "exitCode", label, int.MinValue, int.MaxValue),
             Outcome = outcome,
+            PreAdoptionOutcome = preAdoptionOutcome,
             ElapsedSeconds = StrictJson.RequireInt(node, "elapsedSeconds", label, 0, int.MaxValue),
             ModelStartCount = StrictJson.RequireInt(node, "modelStartCount", label, 0, int.MaxValue),
             ModelStartUnmeasuredAllowance = StrictJson.RequireInt(node, "modelStartUnmeasuredAllowance", label, 0, int.MaxValue),
@@ -816,6 +910,15 @@ internal sealed class CohortJournal
         if (!string.Equals(record.Outcome, "none", StringComparison.Ordinal) && !CohortEntryOutcomes.IsKnown(record.Outcome))
         {
             throw new ContractException($"Entry '{record.EntryId}' would be committed with outcome '{record.Outcome}', which is not an outcome this build writes.");
+        }
+        // The same bound the reader applies to the pre-adoption ending, applied
+        // here first. A value only the reader refuses would produce a journal
+        // that saves and then will not load, and a journal that will not load
+        // cannot be repaired.
+        if (!string.Equals(record.PreAdoptionOutcome, "none", StringComparison.Ordinal)
+            && !CohortEntryOutcomes.IsKnown(record.PreAdoptionOutcome))
+        {
+            throw new ContractException($"Entry '{record.EntryId}' would be committed with pre-adoption outcome '{record.PreAdoptionOutcome}', which is not an outcome this build writes.");
         }
         if (record.HasEnded && string.Equals(record.Outcome, "none", StringComparison.Ordinal))
         {

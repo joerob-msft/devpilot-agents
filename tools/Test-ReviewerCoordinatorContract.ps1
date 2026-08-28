@@ -536,7 +536,7 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
     # Every cohort document is versioned and every one of them is a file. Nothing
     # here answers on a stream.
     foreach ($contract in @('devpilot.shadow-cohort.manifest.v3', 'devpilot.shadow-cohort.journal.v3',
-            'devpilot.shadow-cohort.index.v3', 'devpilot.shadow-cohort.launch-intent.v1',
+            'devpilot.shadow-cohort.index.v4', 'devpilot.shadow-cohort.launch-intent.v1',
             'devpilot.shadow-cohort.lease.v1', 'devpilot.shadow-cohort.model-start-bound.v2')) {
         Assert-Coordinator ($cohortText.Contains($contract)) `
             "The cohort does not name the versioned contract '$contract'."
@@ -740,6 +740,21 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
     }
     Assert-Coordinator (-not $runnerText.Contains('Sha256HexOfFile')) `
         'The cohort runner digests a declared artifact by a read of its own, so a bundle it cannot open ends the run as a fault rather than as a refusal - and with no ceiling on what it reads.'
+
+    # A child's result is admitted and then reported on. Parsing it from one read
+    # and digesting it from another lets a result be validated and then replaced
+    # before the digest that names it is taken - the digest would describe bytes
+    # nothing ever admitted.
+    $invokerText = [IO.File]::ReadAllText((Join-Path $repoRoot 'tools\ShadowRunCoordinator\ChildToolInvoker.cs'))
+    $supervisorText = [IO.File]::ReadAllText((Join-Path $repoRoot 'tools\ShadowRunCoordinator\SlotSupervisor.cs'))
+    Assert-Coordinator ($invokerText -match 'ReadValidatedResult\([\s\S]{0,400}?out string resultSha256') `
+        'The child-result reader does not hand back the digest of the bytes it validated, so every caller must read the file a second time to name what it admitted.'
+    Assert-Coordinator ($invokerText -match 'StrictJson\.ReadFileBytes\([\s\S]{0,600}?CanonicalJson\.Sha256Hex\(') `
+        'The child-result reader digests something other than the single buffer it acquired.'
+    foreach ($resultConsumer in @(@{ Name = 'ChildToolInvoker.cs'; Text = $invokerText }, @{ Name = 'SlotSupervisor.cs'; Text = $supervisorText })) {
+        Assert-Coordinator (-not $resultConsumer.Text.Contains('Sha256HexOfFile')) `
+            "$($resultConsumer.Name) digests a child result by reading it again, so the digest it reports need not be of the result it admitted."
+    }
 
     # The word a cohort publishes about itself is committed before it is published,
     # so a rebuild reports the record rather than inferring one from entry states

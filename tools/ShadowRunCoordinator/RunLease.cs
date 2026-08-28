@@ -148,18 +148,20 @@ internal sealed class RunLease : IDisposable
                 // than of a live run. Remove it and try once more; if that second
                 // attempt loses the CreateNew race to somebody else, the loop ends
                 // and the conflict is reported rather than forced.
+                //
+                // The removal is NOT a delete by path. Between reading the holder
+                // above and removing the file, the stale holder can exit and a
+                // fresh coordinator can win the CreateNew race at the very same
+                // path; a blind File.Delete would then destroy a LIVE replacement
+                // lease. Reclaiming through an exclusive handle binds the removal to
+                // the identity actually on disk: the open succeeds only when no live
+                // holder currently holds the file, and the delete happens through
+                // that same handle, so a replacement acquired in the race window is
+                // never touched.
                 tookOver = true;
-                try
-                {
-                    File.Delete(request.LeasePath);
-                }
-                catch (IOException)
+                if (!TryReclaimAbandonedLease(request.LeasePath))
                 {
                     throw new LeaseConflictException($"The coordinator lease at '{request.LeasePath}' is held open by another process.");
-                }
-                catch (UnauthorizedAccessException)
-                {
-                    throw new LeaseConflictException($"The coordinator lease at '{request.LeasePath}' cannot be removed by this user.");
                 }
             }
         }
@@ -225,7 +227,64 @@ internal sealed class RunLease : IDisposable
         }
     }
 
-    private static (int ProcessId, DateTime StartedAtUtc)? ReadHolder(string path)    {
+    /// <summary>
+    /// Removes an abandoned lease file, and ONLY an abandoned one, binding the
+    /// removal to the identity actually on disk rather than to a path.
+    /// </summary>
+    /// <remarks>
+    /// The whole race F8 describes is the gap between deciding a lease is stale
+    /// and acting on that decision: the stale holder exits, a fresh coordinator
+    /// wins the CreateNew race at the same path, and a delete-by-path then removes
+    /// a LIVE replacement. This closes that gap with an ownership test the file
+    /// system itself arbitrates. A live holder keeps its write handle open for its
+    /// whole life while sharing only <see cref="FileShare.Read"/>, so an exclusive
+    /// open that also asks for write access is DENIED for exactly as long as a live
+    /// holder - the original or a replacement - holds the file. The open therefore
+    /// succeeds only in the one state where removal is correct: no process holds
+    /// the lease open at all. Delete-on-close removes precisely that file through
+    /// the same handle, so there is no second window between proving the file
+    /// unheld and deleting it.
+    /// </remarks>
+    private static bool TryReclaimAbandonedLease(string path)
+    {
+        try
+        {
+            using var _ = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1,
+                FileOptions.DeleteOnClose);
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            // Somebody removed it between the CreateNew failure and here. The
+            // path is free by the same result reclaiming it would have produced.
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return true;
+        }
+        catch (IOException)
+        {
+            // A live holder - the original that has not died after all, or a
+            // replacement that won the race - holds the file open. It is NOT
+            // reclaimed, which is the safe direction: refusing beside a live lease
+            // never runs two coordinators over one output root.
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+
+    private static (int ProcessId, DateTime StartedAtUtc)? ReadHolder(string path)
+    {
         try
         {
             const string label = "coordinator lease";
@@ -316,5 +375,144 @@ internal sealed class RunLease : IDisposable
         catch (UnauthorizedAccessException)
         {
         }
+    }
+
+    /// <summary>
+    /// Proves that abandoned-lease reclamation is bound to the lease's ownership
+    /// rather than to its path, so a live replacement acquired in the race window
+    /// is never removed.
+    /// </summary>
+    /// <remarks>
+    /// This is a mode of the binary for the same reason the atomic-publish checks
+    /// are: the property under test is a real Windows file-sharing interaction
+    /// between two handles, and it cannot be reproduced by reasoning or a mock.
+    /// The falsifying case is deterministic - a handle held open across the
+    /// reclaim decision - not a racy sleep.
+    /// </remarks>
+    internal static int SelfTestReclaim(string root, TextWriter log)
+    {
+        var failures = 0;
+        var passes = 0;
+
+        void Check(string name, Action body)
+        {
+            try
+            {
+                body();
+                passes++;
+                log.WriteLine($"  PASS  {name}");
+            }
+            catch (Exception exception)
+            {
+                failures++;
+                log.WriteLine($"  FAIL  {name} :: {exception.Message}");
+            }
+        }
+
+        static void Require(bool condition, string message)
+        {
+            if (!condition)
+            {
+                throw new ContractException(message);
+            }
+        }
+
+        Directory.CreateDirectory(root);
+        var directory = Path.Combine(root, "lease-reclaim-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        log.WriteLine("Stale-lease reclamation");
+
+        // The exact handle a live RunLease holder keeps open for its whole life:
+        // write access, sharing only reads. Nothing else may take the file.
+        static FileStream OpenAsLiveHolder(string path) =>
+            new(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read);
+
+        try
+        {
+            Check("a truly abandoned lease - no open handle - is reclaimed", () =>
+            {
+                var path = Path.Combine(directory, "abandoned.lease.json");
+                File.WriteAllText(path, "{}");
+                Require(TryReclaimAbandonedLease(path), "an unheld lease file was not reclaimed");
+                Require(!File.Exists(path), "the abandoned lease file was left on disk");
+            });
+
+            Check("a lease a live holder holds open is NOT reclaimed", () =>
+            {
+                var path = Path.Combine(directory, "live.lease.json");
+                using var live = OpenAsLiveHolder(path);
+                Require(!TryReclaimAbandonedLease(path), "a live-held lease was reclaimed");
+                Require(File.Exists(path), "a live-held lease file was removed");
+            });
+
+            // THE RACE F8 DESCRIBES, staged deterministically. A contender has just
+            // decided the recorded holder is dead and is about to reclaim. In that
+            // instant a fresh coordinator wins the CreateNew race and now holds a
+            // LIVE lease at the same path. The contender must not remove it.
+            Check("a replacement lease acquired in the race window is preserved", () =>
+            {
+                var path = Path.Combine(directory, "raced.lease.json");
+                // Stale holder wrote and then died: the file exists with no open
+                // handle. The contender's decision that it is stale is correct AT
+                // THIS POINT.
+                File.WriteAllText(path, "{\"processId\":123456}");
+                // The replacement wins the race and opens its live handle before
+                // the contender acts.
+                using var replacement = OpenAsLiveHolder(path);
+                // The contender acts now. Bound to identity, it refuses.
+                Require(!TryReclaimAbandonedLease(path), "the contender removed a live replacement lease");
+                Require(File.Exists(path), "the live replacement lease file was destroyed");
+            });
+
+            // The regression proof: the OLD reclamation removed by path, which
+            // succeeds against any holder that grants delete-sharing - the very
+            // portability gap the design worried about in prose. The new reclaim,
+            // asked for the same file, refuses because it does not hold the file
+            // exclusively. Same input, opposite and correct outcome.
+            Check("delete-by-path would remove a live lease that grants delete-sharing; the identity-bound reclaim does not", () =>
+            {
+                var path = Path.Combine(directory, "deleteshare.lease.json");
+                using (var granting = new FileStream(
+                           path, FileMode.OpenOrCreate, FileAccess.Write,
+                           FileShare.Read | FileShare.Delete))
+                {
+                    // What the removed code did: File.Delete(path). Against a holder
+                    // that grants delete-sharing this SUCCEEDS and unlinks a live
+                    // lease - the F8 defect, reproduced.
+                    var oldStyleRemovedLive = false;
+                    try
+                    {
+                        File.Delete(path);
+                        oldStyleRemovedLive = !File.Exists(path);
+                    }
+                    catch (IOException)
+                    {
+                    }
+                    Require(oldStyleRemovedLive,
+                        "the environment did not let delete-by-path remove a delete-sharing live lease, so this proves nothing");
+                }
+                // Re-establish the same live, delete-sharing holder and show the new
+                // reclaim refuses it.
+                using var granting2 = new FileStream(
+                    path, FileMode.OpenOrCreate, FileAccess.Write,
+                    FileShare.Read | FileShare.Delete);
+                Require(!TryReclaimAbandonedLease(path),
+                    "the identity-bound reclaim removed a live lease that granted delete-sharing");
+                Require(File.Exists(path), "the identity-bound reclaim unlinked a live lease");
+            });
+        }
+        finally
+        {
+            try { Directory.Delete(directory, recursive: true); } catch (IOException) { }
+        }
+
+        log.WriteLine(string.Empty);
+        if (failures > 0)
+        {
+            log.WriteLine($"FAILED: {failures} check(s), {passes} passed.");
+            return CoordinatorExitCodes.Contract;
+        }
+        log.WriteLine($"All {passes} stale-lease reclamation checks passed.");
+        return CoordinatorExitCodes.Ok;
     }
 }

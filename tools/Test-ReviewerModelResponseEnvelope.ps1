@@ -654,12 +654,22 @@ Assert-Throws { Protect-ReviewerModelResponseEnvelope -Envelope ([pscustomobject
 
 # ============================== 12. downstream consumption, slots and delivery
 
-$verified = Get-ReviewerVerifiedModelResponse -Envelope $sealed -RunKey $runKey
+# Every downstream entry point now REQUIRES the caller to state which attempt it
+# is asking for. These are the expectations for $sealed.
+$expectSealed = @{
+    ExpectedRunId        = 'run-0001'
+    ExpectedAttemptId    = 'attempt-0001'
+    ExpectedNonce        = $Nonce
+    ExpectedPrId         = 4242
+    ExpectedSourceCommit = $Commit
+}
+
+$verified = Get-ReviewerVerifiedModelResponse -Envelope $sealed -RunKey $runKey @expectSealed
 Assert-True ($verified.Verified -and $verified.MayVote -and $verified.MayDeliver -and $verified.MayReconcile) `
     'An authenticated, sealed envelope was denied its capabilities downstream.'
 
 $evidenceEnvelope = Protect-ReviewerModelResponseEnvelope -Envelope (New-TestEnvelope -Extraction $echoed) -RunKey $runKey
-$evidenceVerified = Get-ReviewerVerifiedModelResponse -Envelope $evidenceEnvelope -RunKey $runKey
+$evidenceVerified = Get-ReviewerVerifiedModelResponse -Envelope $evidenceEnvelope -RunKey $runKey @expectSealed
 Assert-True ([string]$evidenceVerified.AuthTier -ceq 'evidenceOnly') `
     'A sealed evidenceOnly envelope changed tier on the way downstream.'
 foreach ($capability in @('MayVote', 'MayDeliver', 'MayReconcile')) {
@@ -672,7 +682,7 @@ Assert-True (-not [bool]$evidenceEnvelope.capabilities.mayMarkReviewed -and
 Assert-True ([bool]$evidenceVerified.CountsInCensus) `
     'An evidenceOnly attempt was excluded from the census - the exact loss this change removes.'
 
-$evidenceCensus = Get-ReviewerModelResponseCensusRecord -Envelope $evidenceEnvelope -RunKey $runKey
+$evidenceCensus = Get-ReviewerModelResponseCensusRecord -Envelope $evidenceEnvelope -RunKey $runKey @expectSealed
 Assert-True ([bool]$evidenceCensus.counted -and -not [bool]$evidenceCensus.eligible -and
     [bool]$evidenceCensus.sealed) `
     'The evidenceOnly census record was not complete-but-ineligible.'
@@ -682,8 +692,55 @@ Assert-True ([string]$evidenceCensus.authTier -ceq 'evidenceOnly' -and
 Assert-True ([int]$evidenceCensus.prId -eq 4242 -and [string]$evidenceCensus.sourceCommit -ceq $Commit) `
     'The census record lost the assignment binding, leaving the slot unknown.'
 
-$authenticatedCensus = Get-ReviewerModelResponseCensusRecord -Envelope $sealed -RunKey $runKey
+$authenticatedCensus = Get-ReviewerModelResponseCensusRecord -Envelope $sealed -RunKey $runKey @expectSealed
 Assert-True ([bool]$authenticatedCensus.eligible) 'An authenticated census record was not eligible.'
+
+# ------------------------------------------------------------------ 12a. whole-
+# envelope substitution. The run key is a per-run-root secret reused by every
+# pass and retry, so an envelope minted for ANOTHER attempt under the same key
+# carries a perfectly valid seal. Nothing inside it is tampered with - the whole
+# document is the wrong one. Before the downstream entry points required stated
+# expectations, that foreign envelope was consumed as this attempt's answer.
+$foreignAttempt = Protect-ReviewerModelResponseEnvelope `
+    -Envelope (New-TestEnvelope -Extraction $authenticated -RunId 'run-9999' `
+        -AttemptId 'attempt-9999' -AttemptIndex 7 -PrId 777) `
+    -RunKey $runKey
+Assert-True (Test-ReviewerModelResponseEnvelopeSeal -Envelope $foreignAttempt -RunKey $runKey) `
+    'The substitution fixture was not itself validly sealed, so the test would prove nothing.'
+Assert-Throws { Get-ReviewerVerifiedModelResponse -Envelope $foreignAttempt -RunKey $runKey @expectSealed } `
+    'is not this attempt' 'A whole sealed envelope from another run/attempt/PR was consumed downstream.'
+Assert-Throws { Get-ReviewerModelResponseCensusRecord -Envelope $foreignAttempt -RunKey $runKey @expectSealed } `
+    'is not this attempt' 'A whole sealed envelope from another run/attempt/PR was counted in the census.'
+
+# Each individual binding is load-bearing: flipping exactly one expectation at a
+# time must refuse, so no single field is decorative.
+foreach ($field in @('ExpectedRunId', 'ExpectedAttemptId', 'ExpectedNonce', 'ExpectedSourceCommit')) {
+    $wrong = @{} + $expectSealed
+    $wrong[$field] = 'not-the-value-this-envelope-carries'
+    Assert-Throws { Get-ReviewerVerifiedModelResponse -Envelope $sealed -RunKey $runKey @wrong } `
+        'is not this attempt' "A wrong $field was accepted downstream."
+}
+$wrongPr = @{} + $expectSealed
+$wrongPr['ExpectedPrId'] = 4243
+Assert-Throws { Get-ReviewerVerifiedModelResponse -Envelope $sealed -RunKey $runKey @wrongPr } `
+    'is not this attempt' 'A wrong ExpectedPrId was accepted downstream.'
+
+# The expectations are MANDATORY, not merely supported: a caller cannot opt out
+# by omitting them. PowerShell would prompt for a missing mandatory parameter in
+# an interactive host, so this asserts on the parameter metadata rather than by
+# calling with the arguments omitted.
+foreach ($entryPoint in @('Get-ReviewerVerifiedModelResponse', 'Get-ReviewerModelResponseCensusRecord')) {
+    [System.Management.Automation.FunctionInfo]$entryCommand = Get-Command -Name $entryPoint -CommandType Function
+    $parameters = $entryCommand.Parameters
+    foreach ($required in @('ExpectedRunId', 'ExpectedAttemptId', 'ExpectedNonce', 'ExpectedPrId',
+            'ExpectedSourceCommit')) {
+        Assert-True ($parameters.ContainsKey($required)) "$entryPoint does not accept -$required."
+        [object[]]$mandatoryAttributes = @($parameters[$required].Attributes |
+                Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] -and $_.Mandatory })
+        Assert-True ($mandatoryAttributes.Count -gt 0) `
+            "$entryPoint left -$required optional, so a consumer can skip the binding check."
+    }
+}
 
 # A model claim that disagrees with the authorized model is recorded, never
 # substituted for it.

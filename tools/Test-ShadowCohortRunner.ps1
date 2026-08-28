@@ -85,6 +85,261 @@ function Assert-Cohort {
     }
 }
 
+function Test-CohortIndexHas {
+    param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $false }
+    return ($null -ne $Object.PSObject.Properties[$Name])
+}
+
+function Get-CohortIndexList {
+    <#
+    .SYNOPSIS
+        A published ordinal list as an ARRAY, whether it holds two, one, or no
+        ordinals - or was never written at all.
+
+    .DESCRIPTION
+        Two hazards, both of which have hidden a real fault before. Assigning an
+        array through an 'if' expression unrolls it, so a one-element list
+        becomes a bare number and an empty one becomes $null, and reading .Count
+        off either is a terminating error under StrictMode. And '@($missing)' on
+        a property that does not exist is not empty - it is a one-element array
+        holding $null, which silently reads as a count of one.
+    #>
+    param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name)
+    if (-not (Test-CohortIndexHas -Object $Object -Name $Name)) { return , @() }
+    $value = $Object.PSObject.Properties[$Name].Value
+    if ($null -eq $value) { return , @() }
+    return , @($value)
+}
+
+function Get-CohortIndexUnwitnessedVersion {
+    <#
+    .SYNOPSIS
+        The index contract version at which 'unwitnessedCompleteEntryOrdinals' is
+        stated by construction.
+
+    .DESCRIPTION
+        The list was added to the published index without bumping the version, so
+        a v3 index that lacks it may simply predate it. v4 is the version at
+        which the absence of that list is a fact about the run rather than a fact
+        about the era it was written in. Asserted against the writer's own
+        constant by this suite, so the two cannot drift apart silently.
+    #>
+    return 'devpilot.shadow-cohort.index.v4'
+}
+
+function Get-CohortFrozenIndexFault {
+    <#
+    .SYNOPSIS
+        Every way a rebuilt cohort index disagrees with the index it replaced,
+        named. Empty means the rebuild is consistent with what was already
+        published; anything else is a completion or a spend that moved.
+
+    .DESCRIPTION
+        Held as a function rather than inline assertions because the frozen root
+        it was written for belongs to an operator's machine and is absent on CI -
+        an oracle nothing can run is an oracle nobody can falsify. The synthetic
+        cases in this suite drive exactly this code.
+
+        The properties, and why each is not implied by the others:
+
+        - Ordinals are whole numbers, unique, in range, and disjoint between the
+          two lists. A fractional value defeats every one of those rules at once:
+          [int]0.6 rounds up into range, [int]3.4 rounds down into it, and 1 and
+          1.2 sort as two distinct ordinals while naming - and charging - the
+          same entry twice. A repeated ordinal makes the count arithmetic below
+          charge one entry twice; an out-of-range one names an entry that does
+          not exist; one in both lists claims a completion was adopted AND could
+          not be re-proved.
+
+        - The adopted list is held to the count it explains, and to the
+          adoptions already published. A completion is counted when it is
+          adopted, and also when the entry simply ended well - so the list may be
+          shorter than the count but never longer. And an ordinal the previous
+          index published as adopted must still be named by the rebuild, as
+          adopted or as unre-provable: a rebuild that stops naming it while the
+          arithmetic still balances has erased a completion, or invented one to
+          pay for it, without saying so.
+
+        - An ordinal published as unre-provable STAYS unre-provable. Journal
+          records are signed and immutable, so a witness that was never recorded
+          cannot appear later. A rebuild moving an ordinal back into the adopted
+          list is therefore claiming evidence that cannot exist, and would slip
+          past the count arithmetic alone.
+
+        - The count follows exactly from the two lists, counting the previously
+          unre-provable ordinals as already uncounted so a root rebuilt twice
+          holds steady rather than being charged the witness cost twice.
+
+        - Spend never falls, and is stated in whole numbers. Spend accumulates
+          before a completion is classified, so dropping an unre-provable
+          completion must not lower the models, verifiers, seconds or provider
+          writes recorded for reaching it. Compared without an [int] cast, which
+          would round a fractional under-report back up to the value it left.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Before,
+        [Parameter(Mandatory)][AllowNull()]$After,
+        [Parameter(Mandatory)][int]$EntryCount
+    )
+
+    $faults = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $Before -or $null -eq $After) {
+        [void]$faults.Add('an index was missing')
+        return , $faults.ToArray()
+    }
+
+    # This build always writes all three. An index of its own that does not is
+    # not a legacy shape to be read charitably - it is a rebuild that did not say
+    # what it did.
+    foreach ($required in 'adoptedCompleteEntryOrdinals', 'unwitnessedCompleteEntryOrdinals', 'completedEntryCount', 'consumed') {
+        if (-not (Test-CohortIndexHas -Object $After -Name $required)) {
+            [void]$faults.Add("the rebuilt index does not state '$required'")
+        }
+    }
+    # Both are read below, and reading a property that is not there is a
+    # terminating error under StrictMode - which would leave the suite with an
+    # unhandled exception rather than a named fault.
+    foreach ($required in 'completedEntryCount', 'consumed') {
+        if (-not (Test-CohortIndexHas -Object $Before -Name $required)) {
+            [void]$faults.Add("the index being replaced does not state '$required'")
+        }
+    }
+    if ($faults.Count -ne 0) { return , $faults.ToArray() }
+
+    # A count is a number of entries, so it is a whole number in both indexes or
+    # the arithmetic below is comparing something else. Checked before any cast:
+    # [int]2.6 is 3, so a fractional count would be rounded into agreement with a
+    # total it does not actually state.
+    foreach ($side in @(@{ Name = 'rebuilt index'; Object = $After }, @{ Name = 'index being replaced'; Object = $Before })) {
+        $stated = $side.Object.PSObject.Properties['completedEntryCount'].Value
+        if ($stated -isnot [int] -and $stated -isnot [long]) {
+            [void]$faults.Add("the $($side.Name) states a completion count of '$stated', which is not a whole number")
+        }
+    }
+    # A charitable reading of a missing list belongs to an index written before
+    # that list existed. The list arrived in the index contract's v4; a v3 index
+    # cannot be told apart from one written before it, so v3 keeps the charitable
+    # reading and v4 does not. Keyed on the version that actually carries the
+    # list, not on whatever the rebuild happens to call itself - otherwise a
+    # rebuild could pick its own version string and decide how its predecessor is
+    # read.
+    if ((Test-CohortIndexHas -Object $Before -Name 'contractVersion') -and
+        ([string]$Before.contractVersion -eq (Get-CohortIndexUnwitnessedVersion)) -and
+        -not (Test-CohortIndexHas -Object $Before -Name 'unwitnessedCompleteEntryOrdinals')) {
+        [void]$faults.Add(
+            "the index being replaced is $(Get-CohortIndexUnwitnessedVersion) but does not state 'unwitnessedCompleteEntryOrdinals'")
+    }
+    # The entries are the cohort, and a rebuild of a frozen root rebuilds the
+    # same ones. The ordinal range below is measured against the REBUILT entry
+    # array, so a rebuild that padded itself with an entry the previous index
+    # never had would widen its own range and adopt an ordinal that names
+    # nothing.
+    $beforeEntries = Get-CohortIndexList -Object $Before -Name 'entries'
+    if ($beforeEntries.Count -ne 0 -and $beforeEntries.Count -ne $EntryCount) {
+        [void]$faults.Add(
+            "the rebuild describes $EntryCount entries; the index it replaced described $($beforeEntries.Count)")
+    }
+    if ($faults.Count -ne 0) { return , $faults.ToArray() }
+
+    $adopted = Get-CohortIndexList -Object $After -Name 'adoptedCompleteEntryOrdinals'
+    $unwitnessed = Get-CohortIndexList -Object $After -Name 'unwitnessedCompleteEntryOrdinals'
+    # A root written before the drain witness existed has no such list, which
+    # means none were published as unre-provable - not one unnamed one.
+    $unwitnessedBefore = Get-CohortIndexList -Object $Before -Name 'unwitnessedCompleteEntryOrdinals'
+
+    foreach ($named in 'adopted', 'unre-provable') {
+        $list = if ($named -eq 'adopted') { @($adopted) } else { @($unwitnessed) }
+        $list = @($list)
+        # Whole numbers first, because every comparison below is defeated by a
+        # value that is not one - and because casting one to [int] to find out
+        # throws rather than naming a fault.
+        $notWhole = @($list | Where-Object { $_ -isnot [int] -and $_ -isnot [long] })
+        if ($notWhole.Count -ne 0) {
+            [void]$faults.Add("the $named completion list names '$($notWhole[0])', which is not a whole ordinal")
+            continue
+        }
+        $distinct = @($list | Sort-Object -Unique)
+        if ($distinct.Count -ne $list.Count) {
+            [void]$faults.Add("an ordinal is named twice in the $named completion list")
+        }
+        foreach ($ordinal in $list) {
+            if ([int]$ordinal -lt 1 -or [int]$ordinal -gt $EntryCount) {
+                [void]$faults.Add("the $named completion list names ordinal $ordinal, outside the $EntryCount entries")
+            }
+        }
+    }
+
+    $both = @($adopted | Where-Object { $unwitnessed -contains $_ })
+    if ($both.Count -ne 0) {
+        [void]$faults.Add('the same ordinal is named as both adopted and unre-provable')
+    }
+
+    foreach ($ordinal in $unwitnessedBefore) {
+        if ($unwitnessed -notcontains $ordinal) {
+            [void]$faults.Add(
+                "ordinal $ordinal was published as a completion that could not be re-proved and is no longer named as one")
+        }
+    }
+
+    # A completion is counted when it is adopted, and also when the entry simply
+    # ended well and needed no adoption at all - so the adopted list may be
+    # shorter than the count, never longer.
+    if ($adopted.Count -gt [int]$After.completedEntryCount) {
+        [void]$faults.Add(
+            "the rebuild named $($adopted.Count) adopted completions but counted only $($After.completedEntryCount)")
+    }
+
+    # And an adoption already published must still be accounted for by name. An
+    # index that never named its adoptions cannot hold the rebuild to them, which
+    # is the same charity the unre-provable list above is read with; one that did
+    # name them holds. Without this, an ordinal can be dropped from the adopted
+    # list and another invented to pay for it with the arithmetic still balancing.
+    $adoptedBefore = Get-CohortIndexList -Object $Before -Name 'adoptedCompleteEntryOrdinals'
+    foreach ($ordinal in $adoptedBefore) {
+        if ($adopted -notcontains $ordinal -and $unwitnessed -notcontains $ordinal) {
+            [void]$faults.Add(
+                "ordinal $ordinal was published as an adopted completion and the rebuild names it in neither list")
+        }
+    }
+
+    $expected = [int]$Before.completedEntryCount - @($unwitnessed).Count + @($unwitnessedBefore).Count
+    if ([int]$After.completedEntryCount -ne $expected) {
+        [void]$faults.Add(
+            "the rebuild counted $($After.completedEntryCount) complete entries; $expected follows from the lists")
+    }
+
+    foreach ($field in 'modelStarts', 'verifierAssignments', 'verifierProcessStarts', 'wallClockSeconds', 'providerWrites') {
+        if (-not (Test-CohortIndexHas -Object $After.consumed -Name $field)) {
+            [void]$faults.Add("the rebuilt index does not state what it spent in $field")
+            continue
+        }
+        $spentNow = $After.consumed.PSObject.Properties[$field].Value
+        if ($spentNow -isnot [int] -and $spentNow -isnot [long]) {
+            [void]$faults.Add("the rebuild stated $field as '$spentNow', which is not a whole number")
+            continue
+        }
+        # Spend is a count of things that happened, so it has a floor of its own
+        # whatever the older index said. Without this, an index that never
+        # carried a field - which is read below as having no floor to hold this
+        # one to - could be replaced by one reporting a negative spend.
+        if ([long]$spentNow -lt 0) {
+            [void]$faults.Add("the rebuild reported $spentNow $field, which is not a count of anything")
+            continue
+        }
+        # A field the older index never carried has no floor to hold this one to.
+        # Said rather than assumed: silently reading a missing value as zero would
+        # turn an absent floor into a passing comparison.
+        if (-not (Test-CohortIndexHas -Object $Before.consumed -Name $field)) { continue }
+        $spentBefore = $Before.consumed.PSObject.Properties[$field].Value
+        if ([double]$spentNow -lt [double]$spentBefore) {
+            [void]$faults.Add("the rebuild reported $spentNow $field; the index it replaced reported $spentBefore")
+        }
+    }
+
+    return , $faults.ToArray()
+}
+
 function Write-StrictJsonFile {
     <#
     .SYNOPSIS
@@ -1002,6 +1257,297 @@ try {
     $script:CohortDll = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\bin\Release\net10.0\ShadowRunCoordinator.dll'
     Assert-Cohort (Test-Path -LiteralPath $script:CohortDll -PathType Leaf) 'The coordinator assembly was not produced.'
 
+    # -----------------------------------------------------------------------
+    # F13: the durable subject reservation that stops two concurrent cohort
+    # runners spending one subject twice. The property is a real per-subject
+    # file-create race arbitrated by the operating system and a crash-recovery
+    # reclaim of a dead holder, so the checks live in the coordinator binary and
+    # are driven here through the same Release build the rest of the suite uses.
+    Write-Host '1b/35 durable subject reservation: concurrency refusal and crash recovery' -ForegroundColor Cyan
+    $reservationScratch = Join-Path $sandboxRoot 'subject-reservation'
+    [void](New-Item -ItemType Directory -Force -Path $reservationScratch)
+    $reservationOutput = & dotnet $script:CohortDll '--selftest-subject-reservation' $reservationScratch 2>&1 | Out-String
+    Write-Host $reservationOutput.TrimEnd()
+    Assert-Cohort ($LASTEXITCODE -eq 0) "The subject-reservation checks failed (exit $LASTEXITCODE)."
+
+    # -----------------------------------------------------------------------
+    # How a rebuild treats a completion published by a build that predates the
+    # pre-adoption drain witness: adopted when it re-proves, dropped and NAMED
+    # when the proof was never recorded, and blocked only when the record and
+    # its artifacts disagree. Driven here for the same reason as the reservation
+    # checks - the property lives inside the binary, and a check nothing calls
+    # is a check that cannot fail.
+    # -----------------------------------------------------------------------
+    Write-Host '1c/35 completion adoption: re-proved, dropped and blocked completions on a rebuild' -ForegroundColor Cyan
+    $adoptionScratch = Join-Path $sandboxRoot 'completion-adoption'
+    [void](New-Item -ItemType Directory -Force -Path $adoptionScratch)
+    $adoptionOutput = & dotnet $script:CohortDll '--selftest-completion-adoption' $adoptionScratch 2>&1 | Out-String
+    Write-Host $adoptionOutput.TrimEnd()
+    Assert-Cohort ($LASTEXITCODE -eq 0) "The completion-adoption checks failed (exit $LASTEXITCODE)."
+    # Run twice over the SAME root. The literal-'none' case leaves a journal it
+    # deliberately edited, and a second pass that loaded it would abort partway
+    # through with no failing check printed - a suite that silently stops being
+    # a suite.
+    $adoptionAgain = & dotnet $script:CohortDll '--selftest-completion-adoption' $adoptionScratch 2>&1 | Out-String
+    Assert-Cohort ($LASTEXITCODE -eq 0) "The completion-adoption checks failed on a second pass over the same root (exit $LASTEXITCODE)."
+    # Exit 0 already implies the summary line, so asserting on it would assert
+    # nothing. What exit 0 does NOT imply is that the same checks ran: a pass
+    # that skipped part of itself and failed nothing still exits 0. Compare the
+    # work both passes actually did.
+    $adoptionFirstCount = @([regex]::Matches($adoptionOutput, '(?m)^\s*PASS\s')).Count
+    $adoptionAgainCount = @([regex]::Matches($adoptionAgain, '(?m)^\s*PASS\s')).Count
+    Assert-Cohort ($adoptionFirstCount -gt 0 -and $adoptionAgainCount -eq $adoptionFirstCount) `
+        ("The second completion-adoption pass ran $adoptionAgainCount checks against the first pass's " +
+            "$adoptionFirstCount over a root the first pass had written.")
+
+    # -----------------------------------------------------------------------
+    # The oracle that reads a rebuilt index against the one it replaced. Its
+    # real subject is an operator's frozen root, which is absent here and on CI,
+    # so the predicate is driven directly against indexes written for the
+    # purpose - including the ones a rebuild would use to over-count completions
+    # or under-report spend while satisfying every arithmetic check.
+    # -----------------------------------------------------------------------
+    Write-Host '1d/35 frozen-index oracle: what a rebuild may and may not change' -ForegroundColor Cyan
+    # The oracle reads a missing unre-provable list charitably only below the
+    # version that always states it. That version is the writer's, so it is read
+    # off the writer rather than remembered here: a bump that this suite did not
+    # follow would otherwise hand every new index the charitable reading.
+    $cohortAuditSource = [IO.File]::ReadAllText((Join-Path $RepoRoot 'tools\ShadowRunCoordinator\CohortAudit.cs'))
+    Assert-Cohort ($cohortAuditSource.Contains(
+            'internal const string ContractVersionValue = "' + (Get-CohortIndexUnwitnessedVersion) + '"')) `
+        "The published index contract version is no longer $(Get-CohortIndexUnwitnessedVersion), so the oracle would read a current index as one written before the unre-provable list existed."
+    $frozenSpend = [pscustomobject]@{
+        modelStarts           = 26
+        verifierAssignments   = 14
+        verifierProcessStarts = 7
+        wallClockSeconds      = 900
+        providerWrites        = 0
+    }
+    function New-FrozenIndexFixture {
+        param([int]$Completed, [int[]]$Adopted, [int[]]$Unwitnessed, $Consumed = $null)
+        return [pscustomobject]@{
+            completedEntryCount               = $Completed
+            adoptedCompleteEntryOrdinals      = $Adopted
+            unwitnessedCompleteEntryOrdinals  = $Unwitnessed
+            consumed                          = if ($null -eq $Consumed) { $frozenSpend } else { $Consumed }
+        }
+    }
+    $frozenCases = @(
+        @{ Name = 'a rebuild that re-proves everything it counted changes nothing'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            Expect = '' }
+        @{ Name = 'a completion that cannot be re-proved is dropped and named'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 2 -Adopted @(2, 3) -Unwitnessed @(1))
+            Expect = '' }
+        @{ Name = 'a root already rebuilt once is not charged the witness cost twice'
+            Before = (New-FrozenIndexFixture -Completed 2 -Adopted @(2, 3) -Unwitnessed @(1))
+            After = (New-FrozenIndexFixture -Completed 2 -Adopted @(2, 3) -Unwitnessed @(1))
+            Expect = '' }
+        @{ Name = 'an ordinal cannot come back from unre-provable to adopted'
+            Before = (New-FrozenIndexFixture -Completed 0 -Adopted @() -Unwitnessed @(1))
+            After = (New-FrozenIndexFixture -Completed 1 -Adopted @(1) -Unwitnessed @())
+            Expect = 'no longer named as one' }
+        @{ Name = 'a completion cannot appear from nowhere'
+            Before = (New-FrozenIndexFixture -Completed 2 -Adopted @(1, 2) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            Expect = 'follows from the lists' }
+        @{ Name = 'an ordinal named twice does not pay for a lost completion'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 1 -Adopted @(3) -Unwitnessed @(1, 1))
+            Expect = 'named twice' }
+        @{ Name = 'an ordinal outside the entries is not evidence'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 2 -Adopted @(2, 3) -Unwitnessed @(9))
+            Expect = 'outside the' }
+        @{ Name = 'a completion cannot be adopted and unre-provable at once'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 2 -Adopted @(1, 2, 3) -Unwitnessed @(3))
+            Expect = 'both adopted and unre-provable' }
+        @{ Name = 'spend cannot fall'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @() `
+                    -Consumed ([pscustomobject]@{ modelStarts = 0; verifierAssignments = 14
+                        verifierProcessStarts = 7; wallClockSeconds = 900; providerWrites = 0 }))
+            Expect = 'the index it replaced reported' }
+        @{ Name = 'spend cannot be shaved by a fraction an int cast would round away'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @() `
+                    -Consumed ([pscustomobject]@{ modelStarts = 25.9; verifierAssignments = 14
+                        verifierProcessStarts = 7; wallClockSeconds = 900; providerWrites = 0 }))
+            Expect = 'not a whole number' }
+        # A root written before the drain witness existed carries no
+        # unre-provable list at all. Read as 'none published', it must still
+        # allow an honest first rebuild and still refuse an over-count - and the
+        # charitable reading must not become a phantom ordinal that pays for one.
+        @{ Name = "a legacy index carrying no unre-provable list rebuilds honestly"
+            Before = ([pscustomobject]@{ completedEntryCount = 3
+                    adoptedCompleteEntryOrdinals = @(1, 2, 3); consumed = $frozenSpend })
+            After = (New-FrozenIndexFixture -Completed 2 -Adopted @(2, 3) -Unwitnessed @(1))
+            Expect = '' }
+        @{ Name = 'a legacy index carrying no unre-provable list does not pay for an over-count'
+            Before = ([pscustomobject]@{ completedEntryCount = 2
+                    adoptedCompleteEntryOrdinals = @(1, 2); consumed = $frozenSpend })
+            After = (New-FrozenIndexFixture -Completed 1 -Adopted @() -Unwitnessed @(1, 2))
+            Expect = 'follows from the lists' }
+        @{ Name = 'a rebuild that does not say what it spent is refused'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @() `
+                    -Consumed ([pscustomobject]@{ modelStarts = 26; verifierAssignments = 14
+                        verifierProcessStarts = 7; wallClockSeconds = 900 }))
+            Expect = 'does not state what it spent' }
+        @{ Name = 'a rebuild that does not name its completion lists is refused'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = ([pscustomobject]@{ completedEntryCount = 3; consumed = $frozenSpend })
+            Expect = 'does not state' }
+        # A legacy index missing a spend field it never carried has no floor to
+        # hold the rebuild to; one that carries it does.
+        @{ Name = 'a spend field the older index never carried is not read as a zero floor'
+            Before = ([pscustomobject]@{ completedEntryCount = 3
+                    adoptedCompleteEntryOrdinals = @(1, 2, 3)
+                    unwitnessedCompleteEntryOrdinals = @()
+                    consumed = ([pscustomobject]@{ modelStarts = 26; verifierAssignments = 14
+                        wallClockSeconds = 900; providerWrites = 0 }) })
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            Expect = '' }
+        # The adopted list is not a free variable: it answers to the count it
+        # explains and to the adoptions already published.
+        @{ Name = 'an adopted list cannot outgrow the count it explains'
+            Before = ([pscustomobject]@{ completedEntryCount = 2
+                    adoptedCompleteEntryOrdinals = @(1, 2)
+                    unwitnessedCompleteEntryOrdinals = @(); consumed = $frozenSpend })
+            After = (New-FrozenIndexFixture -Completed 2 -Adopted @(1, 2, 3) -Unwitnessed @())
+            Expect = 'counted only' }
+        @{ Name = 'an adoption already published cannot be left out of both lists'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @() -Unwitnessed @())
+            Expect = 'names it in neither list' }
+        @{ Name = 'an adoption dropped and paid for by repeating another is refused'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 2) -Unwitnessed @())
+            Expect = 'named twice' }
+        # An index that says nothing at all about its spend is refused before
+        # anything reads into it - reading a property that is not there is a
+        # terminating error, which would end the suite without naming a fault.
+        @{ Name = 'a rebuild carrying no spend map at all is refused, not thrown on'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = ([pscustomobject]@{ completedEntryCount = 3
+                    adoptedCompleteEntryOrdinals = @(1, 2, 3)
+                    unwitnessedCompleteEntryOrdinals = @() })
+            Expect = "does not state 'consumed'" }
+        @{ Name = 'an index being replaced that carries no spend map is refused, not thrown on'
+            Before = ([pscustomobject]@{ completedEntryCount = 3
+                    adoptedCompleteEntryOrdinals = @(1, 2, 3)
+                    unwitnessedCompleteEntryOrdinals = @() })
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            Expect = "the index being replaced does not state 'consumed'" }
+        # A fractional ordinal defeats the range rule in both directions and the
+        # uniqueness rule as well, so it is refused as what it is rather than
+        # rounded into a whole one.
+        @{ Name = 'an ordinal below the first entry cannot round its way into range'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = ([pscustomobject]@{ completedEntryCount = 2
+                    adoptedCompleteEntryOrdinals = @(2, 3)
+                    unwitnessedCompleteEntryOrdinals = @(0.6); consumed = $frozenSpend })
+            Expect = 'not a whole ordinal' }
+        @{ Name = 'an ordinal past the last entry cannot round its way into range'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = ([pscustomobject]@{ completedEntryCount = 2
+                    adoptedCompleteEntryOrdinals = @(1, 2)
+                    unwitnessedCompleteEntryOrdinals = @(3.4); consumed = $frozenSpend })
+            Expect = 'not a whole ordinal' }
+        @{ Name = 'one entry named as two fractional ordinals is not two lost completions'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = ([pscustomobject]@{ completedEntryCount = 1
+                    adoptedCompleteEntryOrdinals = @(2, 3)
+                    unwitnessedCompleteEntryOrdinals = @(1, 1.2); consumed = $frozenSpend })
+            Expect = 'not a whole ordinal' }
+        @{ Name = 'an ordinal that is not a number at all is named, not thrown on'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = ([pscustomobject]@{ completedEntryCount = 2
+                    adoptedCompleteEntryOrdinals = @(2, 3)
+                    unwitnessedCompleteEntryOrdinals = @('x'); consumed = $frozenSpend })
+            Expect = 'not a whole ordinal' }
+        # A count that is not a whole number would be rounded into agreement with
+        # a total it does not state: [int]2.6 is 3.
+        @{ Name = 'a fractional completion count cannot round into agreement'
+            Before = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            After = ([pscustomobject]@{ completedEntryCount = 2.6
+                    adoptedCompleteEntryOrdinals = @(1, 2, 3)
+                    unwitnessedCompleteEntryOrdinals = @(); consumed = $frozenSpend })
+            Expect = 'not a whole number' }
+        # A field the older index never carried has no floor from that index -
+        # but spend has a floor of its own.
+        @{ Name = 'an unfloored spend field still cannot go negative'
+            Before = ([pscustomobject]@{ completedEntryCount = 3
+                    adoptedCompleteEntryOrdinals = @(1, 2, 3)
+                    unwitnessedCompleteEntryOrdinals = @()
+                    consumed = ([pscustomobject]@{ verifierAssignments = 14
+                        verifierProcessStarts = 7; wallClockSeconds = 900; providerWrites = 0 }) })
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @() `
+                    -Consumed ([pscustomobject]@{ modelStarts = -9; verifierAssignments = 14
+                        verifierProcessStarts = 7; wallClockSeconds = 900; providerWrites = 0 }))
+            Expect = 'not a count of anything' }
+        # A rebuild cannot widen the range its own ordinals are checked against.
+        @{ Name = 'a rebuild cannot pad itself an entry to adopt'
+            Before = ([pscustomobject]@{ completedEntryCount = 3
+                    adoptedCompleteEntryOrdinals = @(1, 2, 3)
+                    unwitnessedCompleteEntryOrdinals = @()
+                    entries = @(1, 2); consumed = $frozenSpend })
+            After = (New-FrozenIndexFixture -Completed 3 -Adopted @(1, 2, 3) -Unwitnessed @())
+            Expect = 'the index it replaced described' }
+        # The charitable reading of a missing list belongs to an index written
+        # before that list existed, not to one that states the version in which
+        # the list is always written.
+        @{ Name = 'an index at the version that states the unre-provable list cannot omit it'
+            Before = ([pscustomobject]@{ contractVersion = 'devpilot.shadow-cohort.index.v4'
+                    completedEntryCount = 3
+                    adoptedCompleteEntryOrdinals = @(1, 2, 3); consumed = $frozenSpend })
+            After = ([pscustomobject]@{ contractVersion = 'devpilot.shadow-cohort.index.v4'
+                    completedEntryCount = 2
+                    adoptedCompleteEntryOrdinals = @(2, 3)
+                    unwitnessedCompleteEntryOrdinals = @(1); consumed = $frozenSpend })
+            Expect = "does not state 'unwitnessedCompleteEntryOrdinals'" }
+        # The real shape an operator's frozen root has: v3, written when the list
+        # did not exist yet. A rebuild over one of those is not a fault.
+        @{ Name = 'a v3 index written before the list existed is still read charitably'
+            Before = ([pscustomobject]@{ contractVersion = 'devpilot.shadow-cohort.index.v3'
+                    completedEntryCount = 3
+                    adoptedCompleteEntryOrdinals = @(1, 2, 3); consumed = $frozenSpend })
+            After = ([pscustomobject]@{ contractVersion = 'devpilot.shadow-cohort.index.v4'
+                    completedEntryCount = 2
+                    adoptedCompleteEntryOrdinals = @(2, 3)
+                    unwitnessedCompleteEntryOrdinals = @(1); consumed = $frozenSpend })
+            Expect = '' }
+        # A rebuild does not get to decide how its predecessor is read by naming
+        # itself something else.
+        @{ Name = 'a rebuild cannot excuse a v4 predecessor by calling itself something else'
+            Before = ([pscustomobject]@{ contractVersion = 'devpilot.shadow-cohort.index.v4'
+                    completedEntryCount = 3
+                    adoptedCompleteEntryOrdinals = @(1, 2, 3); consumed = $frozenSpend })
+            After = ([pscustomobject]@{ contractVersion = 'devpilot.shadow-cohort.index.v99'
+                    completedEntryCount = 2
+                    adoptedCompleteEntryOrdinals = @(2, 3)
+                    unwitnessedCompleteEntryOrdinals = @(1); consumed = $frozenSpend })
+            Expect = "does not state 'unwitnessedCompleteEntryOrdinals'" }
+    )
+    foreach ($frozenCase in $frozenCases) {
+        # Cast rather than '@(...)': the oracle returns its faults as one array
+        # object, and an array subexpression around that wraps it a second time,
+        # so every case would read as exactly one unnamed fault.
+        $observed = [string[]](Get-CohortFrozenIndexFault -Before $frozenCase.Before -After $frozenCase.After -EntryCount 3)
+        $joined = ($observed -join '; ')
+        if ($frozenCase.Expect -eq '') {
+            Assert-Cohort ($observed.Count -eq 0) `
+                "The frozen-index oracle refused a legitimate rebuild - $($frozenCase.Name): $joined"
+        }
+        else {
+            Assert-Cohort ($joined -like "*$($frozenCase.Expect)*") `
+                "The frozen-index oracle accepted a rebuild it must refuse - $($frozenCase.Name): '$joined'"
+        }
+    }
+
     $head = New-FakeCommit
     # Entry declarations seal their model-start bound to the toolkit head they
     # were taken at, and every one of the several dozen declarations in this file
@@ -1211,9 +1757,9 @@ try {
     Assert-Cohort ($indexBRebuilt.pendingEntryCount -eq 1) `
         "The rebuilt failFast index reports $($indexBRebuilt.pendingEntryCount) pending; expected 1."
 
-    # The other policy, over the same shape. An entry that failed and published its
-    # audit is an entry the cohort can account for, so continuing past it is a
-    # decision about policy rather than a guess about what happened.
+    # The other policy, over the same shape. A generic preparation failure does not
+    # prove that preparation accounted for all of its children, even when an audit
+    # exists, so custody uncertainty overrides the ordinary continue policy.
     $caseB2 = Join-Path $sandboxRoot 'case-b2'
     $bc1 = New-CohortEntryRequest -Sandbox $caseB2 -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $bc2 = New-CohortEntryRequest -Sandbox $caseB2 -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1231,15 +1777,16 @@ try {
     $runB2 = Invoke-Cohort -ManifestPath $manifestB2
     Assert-Cohort ($runB2.ExitCode -eq 5) "The continuing cohort exited $($runB2.ExitCode); expected 5."
     $indexB2 = Get-JsonFile -Path (Join-Path $caseB2 'index\cohort-index.json')
-    Assert-Cohort ($indexB2.terminalReason -eq 'completedWithEntryFailure') `
-        "The continuing cohort left terminal reason '$($indexB2.terminalReason)'; expected completedWithEntryFailure."
-    Assert-Cohort ($indexB2.pendingEntryCount -eq 0) `
-        "The continuing cohort left $($indexB2.pendingEntryCount) entries pending; expected 0."
+    Assert-Cohort ($indexB2.terminalReason -eq 'stoppedOnEntryFailure') `
+        "The continuing cohort left terminal reason '$($indexB2.terminalReason)'; expected stoppedOnEntryFailure."
+    Assert-Cohort ($indexB2.pendingEntryCount -eq 1) `
+        "The continuing cohort left $($indexB2.pendingEntryCount) entries pending; expected 1."
     $recordB2c2 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseB2 'journal') -EntryId 'entry-two'
     Assert-Cohort ($recordB2c2.outcome -eq 'preparationFaulted' -and $recordB2c2.auditSha256 -ne 'none') `
         'The failed entry the cohort continued past did not end faulted with its own audit recorded.'
     $recordB2c3 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseB2 'journal') -EntryId 'entry-three'
-    Assert-Cohort ($recordB2c3.outcome -eq 'complete') 'The continue policy did not carry on past an accounted-for failure.'
+    Assert-Cohort ($recordB2c3.state -eq 'pending' -and $recordB2c3.attempt -eq 0) `
+        'The continue policy walked past a preparation fault whose process-tree custody was uncertain.'
 
     # -----------------------------------------------------------------------
     Write-Host '7/35 a child that hangs is killed at its declared ceiling' -ForegroundColor Cyan
@@ -2853,7 +3400,7 @@ try {
         'A resume did not name the entry it adopted.'
     Assert-Cohort ($resumeLateJson.terminalReason -eq 'completed') `
         "A resume over an adopted entry published '$($resumeLateJson.terminalReason)'; expected 'completed'."
-    Assert-Cohort ($resumeLateJson.entries[0].outcome -eq 'preparationFaulted') `
+    Assert-Cohort ($resumeLateJson.entries[0].outcome -eq 'runNotComplete') `
         'A resume rewrote the per-entry summary it is digest-bound to.'
 
     # The real cohort this whole section is about, re-read where it still stands.
@@ -2884,10 +3431,31 @@ try {
                 Assert-Cohort ($runFrozen.ExitCode -eq 0) `
                     "Rebuilding the frozen cohort index exited $($runFrozen.ExitCode); expected 0. $($runFrozen.Output)"
                 $frozenJson = Get-Content -LiteralPath $frozenIndexPath -Raw | ConvertFrom-Json -Depth 24
-                Assert-Cohort ($frozenJson.completedEntryCount -ge 1) `
-                    "The frozen cohort rebuilt with $($frozenJson.completedEntryCount) complete entries; expected at least 1."
-                Assert-Cohort (@($frozenJson.adoptedCompleteEntryOrdinals) -contains 1) `
-                    'The frozen cohort did not adopt its first entry, which halted at the declared target.'
+                $frozenBefore = Get-Content -LiteralPath $frozenBackup -Raw | ConvertFrom-Json -Depth 24
+                # Two honest answers, because a frozen root may predate the
+                # pre-adoption drain witness. A journal that recorded the witness
+                # re-proves its completion and is adopted; a journal written
+                # before the field existed cannot re-prove it and cannot be
+                # re-signed either, so this build publishes the ordinal as a
+                # completion it could not re-derive rather than counting it or
+                # wedging the rebuild. What is NOT acceptable is the ordinal
+                # disappearing from both lists, appearing in both at once, or a
+                # count that does not follow from the two lists.
+                $frozenAdopted = @($frozenJson.adoptedCompleteEntryOrdinals) -contains 1
+                $frozenUnwitnessed = @($frozenJson.unwitnessedCompleteEntryOrdinals) -contains 1
+                Assert-Cohort ($frozenAdopted -or $frozenUnwitnessed) `
+                    'The frozen cohort neither adopted its first entry nor published it as a completion it could not re-prove.'
+                Assert-Cohort (-not ($frozenAdopted -and $frozenUnwitnessed)) `
+                    'The frozen cohort published its first entry as both adopted and unre-provable.'
+                # Every remaining property of the rebuild - well-formed ordinal
+                # lists, an unre-provable set that only ever grows, a count that
+                # follows from those lists, and spend that never falls or turns
+                # fractional - is asked of the same predicate the synthetic cases
+                # above drive, so this oracle is one CI has already falsified.
+                $frozenEntryCount = @($frozenJson.entries).Count
+                $frozenFaults = [string[]](Get-CohortFrozenIndexFault -Before $frozenBefore -After $frozenJson -EntryCount $frozenEntryCount)
+                Assert-Cohort ($frozenFaults.Count -eq 0) `
+                    ("The frozen cohort rebuilt inconsistently with the index it replaced: " + ($frozenFaults -join '; '))
                 Assert-Cohort ($frozenJson.entries[1].outcome -eq 'evidenceRefused') `
                     "The frozen cohort's second entry rebuilt as '$($frozenJson.entries[1].outcome)'; expected 'evidenceRefused'."
                 Assert-Cohort ($frozenJson.consumed.providerWrites -eq 0) `
@@ -3126,7 +3694,7 @@ try {
         foreach ($slotRoot in @(Get-ChildItem -LiteralPath $FrozenVerifierRunRoot -Directory -Recurse -Filter 'verification-previews')) {
             $frozenSlots++
             $census = Get-ReviewerVerifierAssignmentCensus -RunRoot ([string]$slotRoot.Parent.FullName) `
-                -Argv @('-EnableVerificationPreview')
+                -Argv @('-EnableVerificationPreview') -CorroborateExecutionFromRecords
             $frozenTotal += [int]$census.realVerifierAssignments
             $frozenProcesses += [int]$census.verifierProcessStarts
             foreach ($row in @($census.byVerifierModel)) {

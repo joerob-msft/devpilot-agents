@@ -126,8 +126,14 @@ $specialistCandidates = @()
 if ($sourceRole -ceq 'specialist') {
     $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
         -ExpectedProject ([string]$core.snapshotIdentity.project) -ExpectedNonce ([string]$core.nonce)
-    $specialistOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $markerText `
-        -MarkerPrefix $markerPrefix -Schema $specialistSchema `
+    # Route the specialist capture through the specialist-specific wrapper the
+    # production reviewer uses, not the generic reader. The wrapper supplies the
+    # -CandidateNormalizer that rewrites an empty changedCodeFix.evidenceFactIds
+    # JSON array to the schema's no-evidence empty string; parsing with the bare
+    # ConvertFrom-AgentResultMarkerOutcome bypasses it and rejects a specialist
+    # marker every production call site accepts.
+    $specialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+        -StdOutText $markerText -Schema $specialistSchema `
         -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
     if ([string]$specialistOutcome.Status -cne 'success') {
         throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."

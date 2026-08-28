@@ -83,7 +83,12 @@ internal static class StrictJson
         }
         try
         {
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            // Use the shared published-file opener, not a merely delete-sharing
+            // FileStream. In the ReplaceFile fallback the destination has a
+            // bounded interval in which its named backup is the only old-or-new
+            // copy; the opener recognizes exactly that publication window and
+            // waits for the destination name to settle.
+            using var stream = CanonicalJson.OpenPublishedFileForRead(path);
             var length = stream.Length;
             if (length > maximumBytes)
             {

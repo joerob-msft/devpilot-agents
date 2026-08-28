@@ -237,7 +237,12 @@ $digestInput = [ordered]@{
     resources     = @($digestResources.ToArray())
 }
 if ($schemaVersion -eq 2) { $digestInput["sourceTransport"] = $sourceTransport }
-$digest = Get-Sha256Hex -Bytes ($utf8.GetBytes((ConvertTo-AgentReplayCanonicalJson -Value $digestInput)))
+# The canonical text is materialized into a typed local first: a mandatory
+# array parameter fed straight from an expression that contains a command call
+# has no proof the argument survives as an array, which is the shape the
+# boundary analyzer refuses.
+[string]$digestJson = ConvertTo-AgentReplayCanonicalJson -Value $digestInput
+$digest = Get-Sha256Hex -Bytes ([byte[]]$utf8.GetBytes($digestJson))
 
 $manifest = [ordered]@{
     schemaVersion  = $schemaVersion

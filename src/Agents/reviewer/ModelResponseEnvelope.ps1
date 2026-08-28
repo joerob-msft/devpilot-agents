@@ -1679,13 +1679,33 @@ function Get-ReviewerVerifiedModelResponse {
         code path rather than a convention. The returned record states the tier
         and the capabilities it implies, so a caller cannot accidentally treat
         evidence as a vote.
+
+        Every binding expectation is MANDATORY. The run key outlives a single
+        attempt - it is a per-run-root key, reused by every pass and retry - so
+        a seal proves authorship, never aboutness. When this function accepted
+        an envelope with no stated expectations, a whole intact envelope from
+        another attempt, pull request, or commit passed verification unchanged
+        and was consumed as this attempt's answer: substitution of the entire
+        document, not tampering inside it, which is precisely what a seal cannot
+        see. Requiring the caller to state what it is asking for turns that into
+        a refusal. The parameters are declared mandatory rather than optional so
+        the failure mode is a missing-argument error at the call site instead of
+        a silently unchecked binding at run time.
     #>
     param(
         [Parameter(Mandatory)]$Envelope,
-        [Parameter(Mandatory)][byte[]]$RunKey
+        [Parameter(Mandatory)][byte[]]$RunKey,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedRunId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedAttemptId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedNonce,
+        [Parameter(Mandatory)][int]$ExpectedPrId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedSourceCommit
     )
 
-    $verified = Read-ReviewerModelResponseEnvelope -Envelope $Envelope -RunKey $RunKey
+    $verified = Read-ReviewerModelResponseEnvelope -Envelope $Envelope -RunKey $RunKey `
+        -ExpectedRunId $ExpectedRunId -ExpectedAttemptId $ExpectedAttemptId `
+        -ExpectedNonce $ExpectedNonce -ExpectedPrId $ExpectedPrId `
+        -ExpectedSourceCommit $ExpectedSourceCommit
     $tier = [string]$verified.authTier
     $findings = [object[]]@()
     if ($null -ne $verified.payload) { $findings = [object[]]@($verified.payload.findings) }
@@ -1726,13 +1746,25 @@ function Get-ReviewerModelResponseCensusRecord {
         including `evidenceOnly` and including a terminal rejection, because an
         attempt that is missing from the census is the failure this whole change
         exists to remove.
+
+        The binding expectations are mandatory here for the same reason they are
+        mandatory in Get-ReviewerVerifiedModelResponse: a census that can be fed
+        a foreign sealed envelope does not count attempts, it counts documents.
     #>
     param(
         [Parameter(Mandatory)]$Envelope,
-        [Parameter(Mandatory)][byte[]]$RunKey
+        [Parameter(Mandatory)][byte[]]$RunKey,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedRunId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedAttemptId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedNonce,
+        [Parameter(Mandatory)][int]$ExpectedPrId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedSourceCommit
     )
 
-    $verified = Read-ReviewerModelResponseEnvelope -Envelope $Envelope -RunKey $RunKey
+    $verified = Read-ReviewerModelResponseEnvelope -Envelope $Envelope -RunKey $RunKey `
+        -ExpectedRunId $ExpectedRunId -ExpectedAttemptId $ExpectedAttemptId `
+        -ExpectedNonce $ExpectedNonce -ExpectedPrId $ExpectedPrId `
+        -ExpectedSourceCommit $ExpectedSourceCommit
     return [pscustomobject][ordered]@{
         runId          = [string]$verified.run.runId
         attemptId      = [string]$verified.run.attemptId

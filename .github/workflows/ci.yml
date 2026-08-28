@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+  # Deliberately unfiltered. A stacked review layer targets the branch below it,
+  # not main, so a `branches: [main]` filter meant every layer opened without a
+  # hosted run and the stack could only ever be checked after it landed - which
+  # is exactly the moment the check stops being useful. Naming the feature
+  # branches instead would rot on the next rename, so every pull request runs.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -208,6 +212,33 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ReviewerCoordinatorContract.ps1
 
+      # Custody and identity regressions exercise the shipping child boundaries
+      # directly. They remain separate so a failure identifies the exact
+      # authorization, wait, or evidence contract that drifted.
+      - name: bounded coordinator child wait
+        shell: pwsh
+        run: ./tools/Test-ChildBoundedWait.ps1
+
+      - name: stale run lease reclaim
+        shell: pwsh
+        run: ./tools/Test-RunLeaseReclaim.ps1
+
+      - name: child request integrity
+        shell: pwsh
+        run: ./tools/Test-ShadowChildRequestIntegrity.ps1
+
+      - name: slot terminal integrity
+        shell: pwsh
+        run: ./tools/Test-ShadowTerminalIntegrity.ps1
+
+      - name: externally witnessed run execution
+        shell: pwsh
+        run: ./tools/Test-ShadowRunExecutionNonce.ps1
+
+      - name: discovery candidate specialist parser
+        shell: pwsh
+        run: ./tools/Test-ReviewerDiscoveryCandidateSpecialistParser.ps1
+
       # The typed control plane itself. Restores and builds offline against an
       # empty feed, drives the full preparation from a typed request to an
       # immutable run-set-ready with no model and no slot, and proves the durable
@@ -257,6 +288,55 @@ jobs:
       - name: escape ledger and budget
         shell: pwsh
         run: ./tools/Test-EscapeLedger.ps1 -VerifyCommits
+
+      # The signed map from the pre-consolidation commits the ledger cites to the
+      # replacement commits that carry them. A ledger citation that is no longer
+      # an ancestor of HEAD is satisfied only through an exact mapping whose
+      # anchors, trees and carried evidence all verify, so a squashed history
+      # cannot quietly erase - or quietly invent - a reachability claim.
+      - name: escape ledger consolidation mapping
+        shell: pwsh
+        run: ./tools/Test-EscapeLedgerConsolidation.ps1
+
+      # The versioned reviewer-base contract that replaced 'is this legacy commit
+      # an ancestor'. Identity is the accepted tree plus the reviewer script,
+      # config and schema hashes, so an unrelated tree with a copied commit
+      # message still fails.
+      - name: reviewer base lineage contract
+        shell: pwsh
+        run: ./tools/Test-ReviewerBaseContract.ps1
+
+      # The census of what a run actually spent, believed because it is signed
+      # rather than because the files on disk have the right shape: forged logs,
+      # added, removed and rewritten previews, swapped inputs, wrong and missing
+      # keys, and the proof that blocking never lowers a count.
+      - name: model start census authenticity
+        shell: pwsh
+        run: ./tools/Test-ShadowModelStartCensus.ps1
+
+      # The oversized-input refusal is bounded: every branch publishes the closed
+      # result shape, the attempt is charged, and it terminates.
+      - name: bounded refusal result shape
+        shell: pwsh
+        run: ./tools/Test-ReviewerModelPassResultShape.ps1
+
+      # Publishing state atomically while a reader holds the file open. On
+      # Windows a sharing violation used to leave the launch-intent and state
+      # files wedged; this drives real concurrent readers and writers and proves
+      # the published file is only ever the old bytes or the new ones.
+      - name: atomic state publish under concurrent readers
+        shell: pwsh
+        run: ./tools/Test-AtomicStatePublish.ps1
+
+      # The managed sealing helper and the PowerShell canonicalizers must agree
+      # byte for byte, or a seal written by one and verified by the other would
+      # disagree about what was sealed. The script restores and builds the
+      # helper from an empty offline source, so this step proves the offline
+      # build too. Private parity samples are optional and absent here; the
+      # script says so rather than pretending it checked them.
+      - name: seal canonicalization parity (offline build)
+        shell: pwsh
+        run: ./tools/Test-SealParity.ps1
 
       - name: convention-pack schema and replay checks
         shell: pwsh

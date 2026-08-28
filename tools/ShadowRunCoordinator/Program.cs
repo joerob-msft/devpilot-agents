@@ -47,6 +47,14 @@ internal static class Program
         var acceptUnstartedRegistry = false;
         var retractClearedHolds = false;
         var rebuildIndex = false;
+        string? atomicPublishSelfTestRoot = null;
+        string? leaseReclaimSelfTestRoot = null;
+        string? childWaitSelfTestRoot = null;
+        string? subjectReservationSelfTestRoot = null;
+        string? completionAdoptionSelfTestRoot = null;
+        string? emitChildRequestsRoot = null;
+        string? sleepSeconds = null;
+        string? lingerGrandchildSeconds = null;
 
         // The parse runs inside the same guard as the rest of the entry point.
         // A missing option value is a usage fault, and a usage fault that escapes
@@ -107,6 +115,30 @@ internal static class Program
                     case "--from-cohort":
                         fromCohorts.Add(Next(args, ref index, "--from-cohort"));
                         break;
+                    case "--selftest-atomic-publish":
+                        atomicPublishSelfTestRoot = Next(args, ref index, "--selftest-atomic-publish");
+                        break;
+                    case "--selftest-lease-reclaim":
+                        leaseReclaimSelfTestRoot = Next(args, ref index, "--selftest-lease-reclaim");
+                        break;
+                    case "--selftest-child-wait":
+                        childWaitSelfTestRoot = Next(args, ref index, "--selftest-child-wait");
+                        break;
+                    case "--selftest-subject-reservation":
+                        subjectReservationSelfTestRoot = Next(args, ref index, "--selftest-subject-reservation");
+                        break;
+                    case "--selftest-completion-adoption":
+                        completionAdoptionSelfTestRoot = Next(args, ref index, "--selftest-completion-adoption");
+                        break;
+                    case "--selftest-emit-child-requests":
+                        emitChildRequestsRoot = Next(args, ref index, "--selftest-emit-child-requests");
+                        break;
+                    case "--selftest-sleep":
+                        sleepSeconds = Next(args, ref index, "--selftest-sleep");
+                        break;
+                    case "--selftest-spawn-lingering-grandchild":
+                        lingerGrandchildSeconds = Next(args, ref index, "--selftest-spawn-lingering-grandchild");
+                        break;
                     case "--help":
                         Console.Out.WriteLine(Usage);
                         return ExitOk;
@@ -115,6 +147,115 @@ internal static class Program
                         Console.Error.WriteLine(Usage);
                         return ExitUsage;
                 }
+            }
+
+            if (atomicPublishSelfTestRoot is not null)
+            {
+                // A diagnostic mode, and deliberately an exclusive one: it writes
+                // only under the scratch root it is given, starts no cohort, and
+                // touches no request, so combining it with a real mode could only
+                // ever mean the caller wanted two different jobs at once.
+                if (requestPath is not null || cohortPath is not null || registryPath is not null
+                    || rebuildRegistry || rebuildIndex || selectSubjects)
+                {
+                    Console.Error.WriteLine("--selftest-atomic-publish runs the atomic state publish checks and starts nothing; it does not combine with the other modes.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                return AtomicPublishSelfTest.Run(atomicPublishSelfTestRoot, Console.Out);
+            }
+
+            if (sleepSeconds is not null)
+            {
+                // A hidden helper mode: sleep, then exit. It exists only so the
+                // bounded-child-wait self-test can spawn a real long-lived child
+                // without depending on any external tool being on the path.
+                if (!int.TryParse(sleepSeconds, NumberStyles.None, CultureInfo.InvariantCulture, out var seconds)
+                    || seconds < 0
+                    || seconds > 86400)
+                {
+                    Console.Error.WriteLine("--selftest-sleep takes a whole number of seconds between 0 and 86400.");
+                    return ExitUsage;
+                }
+                Thread.Sleep(TimeSpan.FromSeconds(seconds));
+                return ExitOk;
+            }
+
+            if (lingerGrandchildSeconds is not null)
+            {
+                // A hidden helper mode paired with --selftest-sleep: it spawns a
+                // grandchild that inherits this process's redirected stdout/stderr and
+                // outlives it, then returns at once. It exists only so the
+                // bounded-child-wait self-test can reproduce the inherited-pipe hang
+                // the parameterless WaitForExit suffers.
+                if (!int.TryParse(lingerGrandchildSeconds, NumberStyles.None, CultureInfo.InvariantCulture, out var lingerSeconds)
+                    || lingerSeconds < 0
+                    || lingerSeconds > 86400)
+                {
+                    Console.Error.WriteLine("--selftest-spawn-lingering-grandchild takes a whole number of seconds between 0 and 86400.");
+                    return ExitUsage;
+                }
+                return ChildToolInvoker.SpawnLingeringGrandchild(lingerSeconds);
+            }
+
+            if (leaseReclaimSelfTestRoot is not null)
+            {
+                if (requestPath is not null || cohortPath is not null || registryPath is not null
+                    || rebuildRegistry || rebuildIndex || selectSubjects)
+                {
+                    Console.Error.WriteLine("--selftest-lease-reclaim runs the stale-lease reclamation checks and starts nothing; it does not combine with the other modes.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                return RunLease.SelfTestReclaim(leaseReclaimSelfTestRoot, Console.Out);
+            }
+
+            if (childWaitSelfTestRoot is not null)
+            {
+                if (requestPath is not null || cohortPath is not null || registryPath is not null
+                    || rebuildRegistry || rebuildIndex || selectSubjects)
+                {
+                    Console.Error.WriteLine("--selftest-child-wait runs the bounded child-wait checks and starts nothing; it does not combine with the other modes.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                return ChildToolInvoker.SelfTestBoundedWait(childWaitSelfTestRoot, Console.Out);
+            }
+
+            if (subjectReservationSelfTestRoot is not null)
+            {
+                if (requestPath is not null || cohortPath is not null || registryPath is not null
+                    || rebuildRegistry || rebuildIndex || selectSubjects)
+                {
+                    Console.Error.WriteLine("--selftest-subject-reservation runs the cohort subject-reservation checks and starts nothing; it does not combine with the other modes.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                return SubjectReservation.SelfTest(subjectReservationSelfTestRoot, Console.Out);
+            }
+
+            if (completionAdoptionSelfTestRoot is not null)
+            {
+                if (requestPath is not null || cohortPath is not null || registryPath is not null
+                    || rebuildRegistry || rebuildIndex || selectSubjects)
+                {
+                    Console.Error.WriteLine("--selftest-completion-adoption runs the completion adoption checks and starts nothing; it does not combine with the other modes.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                return CohortCompletionAdoption.SelfTest(completionAdoptionSelfTestRoot, Console.Out);
+            }
+
+            if (emitChildRequestsRoot is not null)
+            {
+                if (requestPath is not null || cohortPath is not null || registryPath is not null
+                    || rebuildRegistry || rebuildIndex || selectSubjects)
+                {
+                    Console.Error.WriteLine("--selftest-emit-child-requests writes sample child requests and starts nothing; it does not combine with the other modes.");
+                    Console.Error.WriteLine(Usage);
+                    return ExitUsage;
+                }
+                return ChildToolInvoker.SelfTestEmitChildRequests(emitChildRequestsRoot, Console.Out);
             }
 
             if (selectSubjects)
@@ -421,6 +562,7 @@ internal static class Program
         ShadowRunCoordinator --select-subjects --registry <path> --candidates <path>
                              --out <path> [--select-count <n>]
                              [--accept-unresolved-defects] [--accept-unstarted-registry]
+        ShadowRunCoordinator --selftest-atomic-publish <scratch directory>
 
           --request       Path to a devpilot.shadow-run-coordinator.request.v2 JSON file.
           --target        Stop once this state is reached. Defaults to runSetReady.
@@ -434,6 +576,13 @@ internal static class Program
                           defaulted: a cohort is an operator action, not a timer's.
           --rebuild-index Rebuild the cohort index from the journal and the published
                           per-entry audits, and start nothing.
+          --selftest-atomic-publish
+                          Run the atomic state publish checks under a scratch
+                          directory and start nothing. Proves a concurrent reader
+                          cannot wedge a publish, that a transient sharing
+                          violation is survived, and that an exhausted budget
+                          leaves whole old content behind a typed recoverable
+                          error rather than a half-published state.
           --rebuild-registry
                           Rebuild the durable subject account from finished cohort roots
                           and start nothing. Every root is read through its own signed

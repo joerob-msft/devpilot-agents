@@ -418,3 +418,59 @@ explicitly outstanding.
    should be.
 6. Add a row to the table above. The check fails if the ledger and this document disagree
    about which incidents exist.
+
+## History consolidation and the frozen citations
+
+Every incident and near miss in this ledger cites the commit that introduced it and the
+commit that remediated it. Those citations are evidence, and evidence that is rewritten
+whenever a branch is rearranged is not evidence. They are never edited.
+
+The reviewer stack was later consolidated: one hundred and forty-eight commits were replaced
+by five with the same content at the boundaries but new identities. Three citations that had
+always been true stopped being reachable from the branch — near miss NM-0001's
+`introducedCommit`, near miss NM-0002's `introducedCommit`, and `coverageWindow.endCommit`.
+Nothing about the work changed; only its commit names did.
+
+Two easy responses were available and both are dishonest. Repointing the citations at
+replacement commits falsifies the record and teaches the codebase that these identities are
+editable. Dropping the reachability question removes the contradiction detector that makes
+the record falsifiable at all.
+
+What is shipped instead is `docs/escape-ledger-consolidation.v1.json`: a sealed, versioned
+map from each affected source commit to the replacement commit that carries its work, and
+a verifier in `tools/EscapeLedgerConsolidation.ps1` that recomputes every identity in the map
+from git before believing any of it. Acceptance requires all of: the map matches its own
+domain-separated digest; the two lineages share a declared common base; the declared anchors
+are tree-equal in this checkout, so the two histories are demonstrably one history at those
+points; both commits of an entry lie inside the consolidated segments; both recorded trees
+match the trees git reports; the per-entry delta identity rebinds the four object names and
+the declared basis; the replacement commit is reachable from the checkout; and every
+carried-evidence path resolves in the replacement commit to exactly the recorded blob.
+
+What the map does **not** claim is that a source commit's diff survives byte-for-byte inside
+its replacement's diff. It does not, and that was measured rather than assumed: changed-path
+blob identity between these source commits and their replacements runs between zero and four
+paths out of fifteen to nineteen. Calling the per-entry digest a delta *proof* would be a
+lie, so it is named `deltaIdentity` and is exactly what its name says — a binding over four
+verified identities and a declared basis. The honest content evidence is the anchor tree
+equality plus the carried-evidence blobs, and both are recomputed, never asserted.
+
+The map answers one question — does this branch carry the change this record describes — at
+two places in `tools/Test-EscapeLedger.ps1`. Everywhere else, including the merged-versus-not
+baseline that decides whether a finding is an escape or a near miss, still uses strict
+ancestry with no map in the path. A mapping therefore cannot reclassify anything, and
+`tools/Test-EscapeLedgerConsolidation.ps1` pins that by asserting the trigger verdict and
+every budget count are identical with and without commit verification.
+
+### The staleness clock
+
+`staleAfterCommitsBehindHead` was **not** widened for the consolidation. It stays at the
+value the frozen snapshot declared, and the derived bound that constrains it is still
+computed from the frozen window's own span. What moved is the point the distance is measured
+*from*: the clock now counts commits from the verified replacement boundary rather than from
+a source commit this branch does not contain. Measuring from the source commit would have
+counted the five replacement commits as drift when they are the same work re-expressed —
+a plausible-looking number derived from a history that no longer exists. The boundary
+actually used, and whether it was reached directly or through the map, are both published in
+the check's report as `coverageWindowBoundary` and `coverageWindowBoundaryVia`, so a reader
+never has to guess which path a passing run took.

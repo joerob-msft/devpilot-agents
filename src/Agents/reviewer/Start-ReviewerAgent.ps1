@@ -482,6 +482,11 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $script:ReviewerUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+# The domain label the blinded-acquisition plan signing key is derived under.
+# It must stay byte-identical to the supervisor's own label in
+# tools/Invoke-ReviewerBlindedAcquisition.ps1: the two derive the same key from
+# the same token only because they agree on this string.
+$script:ReviewerAcquisitionPlanSignatureKeyLabel = 'devpilot.reviewer.blinded-acquisition.plan-signature.v1'
 [Console]::OutputEncoding = $script:ReviewerUtf8
 $OutputEncoding = $script:ReviewerUtf8
 
@@ -723,6 +728,39 @@ if (-not (Test-Path -LiteralPath $ModelResponseEnvelopeLibrary)) {
     throw "Model response envelope library '$ModelResponseEnvelopeLibrary' does not exist."
 }
 . $ModelResponseEnvelopeLibrary
+# The census reader and, more to the point for this script, its SEALER. A run
+# attests at the end to exactly which accounting artifacts it left behind, so
+# that whoever later counts this run's model starts is counting the run's own
+# evidence rather than whatever is on disk under its name.
+$ModelStartCensusLibrary = Join-Path $PSScriptRoot "ModelStartCensus.ps1"
+if (-not (Test-Path -LiteralPath $ModelStartCensusLibrary)) {
+    throw "Model start census library '$ModelStartCensusLibrary' does not exist."
+}
+. $ModelStartCensusLibrary
+
+function Get-ReviewerLauncherCensusMasterKey {
+    <#
+        Reads the census-only key supplied by a launcher that will later audit
+        this run. Empty means this is an ordinary standalone run and the legacy
+        local artifact key remains the census authority.
+    #>
+    param(
+        [AllowEmptyString()]
+        [string]$EncodedKey = [string]$env:DEVPILOT_REVIEWER_CENSUS_MASTER_KEY
+    )
+    if ([string]::IsNullOrWhiteSpace($EncodedKey)) { return }
+    try { [byte[]]$key = [Convert]::FromBase64String($EncodedKey) }
+    catch {
+        throw ('DEVPILOT_REVIEWER_CENSUS_MASTER_KEY must be a base64-encoded 32-byte key. ' +
+            'A run cannot publish census evidence under a key its launcher cannot reproduce.')
+    }
+    if ($key.Length -ne 32) {
+        throw ("DEVPILOT_REVIEWER_CENSUS_MASTER_KEY decoded to $($key.Length) bytes; expected exactly 32. " +
+            'A run cannot publish census evidence under a key its launcher cannot reproduce.')
+    }
+    return $key
+}
+
 # Whether generalist passes are read under the v2 contract. On by default: the
 # failure it removes - a complete review discarded, and the reviewer erased from
 # the census, because a nonce was omitted from the tail of a 4 KB object - is a
@@ -735,7 +773,34 @@ $script:ReviewerGeneralistContractV2 = ($env:DEVPILOT_REVIEWER_GENERALIST_CONTRA
 # sealed bytes of every v2 response envelope, which is what makes an envelope
 # from another run fail to verify against this one rather than merely look out
 # of place.
-$script:ReviewerRunId = [guid]::NewGuid().ToString('N')
+#
+# A LAUNCHER MAY NAME IT INSTEAD. A census that only ever learns the run
+# identity from artifacts written by the run itself can be satisfied by a whole
+# self-consistent evidence set kept from an earlier, cheaper execution in the
+# same directory: everything agrees, because everything was written together.
+# The only witness that breaks that replay is one the replayed run could not
+# have known, so a launcher that will later audit this run may hand it an
+# execution nonce it minted and kept outside the run root. Constrained to the
+# same 32-hex shape a minted identity has, and rejected outright rather than
+# quietly re-minted when it is malformed - silently minting a different identity
+# than the auditor expects would turn every subsequent audit into a false alarm.
+$script:ReviewerRunId = [string]$env:DEVPILOT_REVIEWER_RUN_EXECUTION_ID
+if ([string]::IsNullOrWhiteSpace($script:ReviewerRunId)) {
+    $script:ReviewerRunId = [guid]::NewGuid().ToString('N')
+}
+elseif ($script:ReviewerRunId -cnotmatch '^[0-9a-f]{32}\z') {
+    throw ("DEVPILOT_REVIEWER_RUN_EXECUTION_ID must be 32 lowercase hexadecimal characters; " +
+        "got '$script:ReviewerRunId'. A run whose execution identity is not the one its launcher " +
+        'expects cannot be audited against that expectation.')
+}
+# A shadow launcher supplies a census-only key beside the execution identity.
+# It never becomes the run's general artifact key and is never written into the
+# run root. Malformed custody is rejected before the first model can launch.
+[byte[]]$script:ReviewerLauncherCensusMasterKey = @(Get-ReviewerLauncherCensusMasterKey)
+# The reviewer retains the decoded bytes in process memory. Removing the
+# transport variable now prevents every model subprocess it later launches from
+# inheriting a census-signing capability it never needs.
+$env:DEVPILOT_REVIEWER_CENSUS_MASTER_KEY = $null
 # Attempt ordinals per (pr, cycle, pass), so a persisted envelope is named by
 # WHICH attempt it was rather than by the nonce that attempt happened to draw.
 $script:ReviewerResponseEnvelopeOrdinals = @{}
@@ -3221,10 +3286,28 @@ if ($offlineAdapterRequested) {
         throw "Offline model adapter expected-base binding does not match -ExpectedReviewerBaseCommit."
     }
     $repoRootForCommit = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..\..")).Path
-    & git -C $repoRootForCommit merge-base --is-ancestor $expectedBase HEAD
-    if ($LASTEXITCODE -ne 0) {
-        throw "Expected reviewer base commit '$expectedBase' is not an ancestor of the running checkout."
+    # The expected-base binding is decided by the versioned reviewer base lineage
+    # contract, not by graph ancestry alone.
+    #
+    # Ancestry answered only "is this commit somewhere behind HEAD", which
+    # accepted a commit for its position and said nothing about the reviewer's
+    # content - and which broke outright when the stack was consolidated and the
+    # same trees acquired new commit identities. The contract keeps the failure
+    # closed and makes it mean more: the identity must be one the contract names,
+    # its recorded tree must match what git says that commit contains, the
+    # reviewer-side files this fixture is replayed through must still hash to
+    # what was sealed, and the active boundary carrying that identity's tree must
+    # be an ancestor of this checkout. A superseded identity is accepted only
+    # through a replacement boundary whose tree is EXACTLY EQUAL to it.
+    . (Join-Path $PSScriptRoot 'ReviewerBaseContract.ps1')
+    $baseAcceptance = $null
+    try {
+        $baseAcceptance = Assert-ReviewerBaseCommitAccepted -RepoRoot $repoRootForCommit -ExpectedBaseCommit $expectedBase
     }
+    catch {
+        throw ("Expected reviewer base commit '$expectedBase' is not accepted by this checkout: $($_.Exception.Message)")
+    }
+    $script:ReviewerOfflineModelAdapterBaseAcceptance = $baseAcceptance
     $adapterScriptPath = Join-Path (Split-Path $adapterManifestPath -Parent) ([string]$adapterManifest.adapterScript)
     if (-not (Test-Path -LiteralPath $adapterScriptPath -PathType Leaf)) {
         throw "Offline model adapter script '$adapterScriptPath' does not exist."
@@ -4891,6 +4974,20 @@ function Write-ReviewerCycleMetadata {
         reviewModels = @($ReviewPassModels)
         promptFile   = (Split-Path -Leaf $PromptFile)
         scriptSha256 = $ScriptSelfSha256
+    }
+    # WHICH EXECUTION WROTE THIS RECORD. A run root is re-used, so a census that
+    # reads a log here cannot otherwise tell this run's records from the ones the
+    # previous run left in the same file. Stamping the execution identity on every
+    # record gives the census a witness it can compare against the manifest that
+    # claims to describe them: a stale manifest kept beside a log this run
+    # actually wrote no longer passes. Resolved defensively because this function
+    # is also lifted into harnesses that never start a run.
+    [string]$executionIdentity = ''
+    if (Get-Variable -Name 'ReviewerRunId' -Scope Script -ErrorAction SilentlyContinue) {
+        $executionIdentity = [string]$script:ReviewerRunId
+    }
+    if ($executionIdentity.Length -gt 0) {
+        $base['session'] = [ordered]@{ sessionId = $executionIdentity }
     }
     foreach ($k in $Fields.Keys) { $base[$k] = $Fields[$k] }
     Write-AgentMetadata -LogPath $logPath -Fields $base
@@ -11090,6 +11187,7 @@ function Write-ReviewerVerificationDecisionPreview {
         [Parameter(Mandatory)][AllowEmptyString()][string]$Diagnostic,
         [Parameter(Mandatory)][AllowEmptyString()][string]$InputArtifactPath,
         [Parameter(Mandatory)][AllowEmptyString()][string]$InputManifestSha256,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$InputArtifactSha256,
         [object[]]$Clusters = @(),
         [object[]]$Assignments = @(),
         [object[]]$VerifierRuns = @(),
@@ -11181,8 +11279,10 @@ function Write-ReviewerVerificationDecisionPreview {
         promptSha256 = $CrossVerificationPromptSha256
         policySha256 = $CrossVerificationPolicySha256
         schemaSha256 = $CrossVerificationSchemaSha256
+        runExecutionId = [string]$script:ReviewerRunId
         inputArtifactPath = $InputArtifactPath
         inputManifestSha256 = $InputManifestSha256
+        inputArtifactSha256 = $InputArtifactSha256
         inputArtifactHashes = @($InputArtifactHashes)
         totalCandidateCount = $TotalCandidateCount
         clusters = @($Clusters | ForEach-Object {
@@ -11212,7 +11312,9 @@ function Write-ReviewerVerificationDecisionPreview {
     $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     $artifactPath = Save-ReviewerVerificationPreview -Manifest $manifest `
         -Directory $verificationPreviewDir -BaseName $baseName -MasterKey $masterKey `
-        -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes)
+        -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes) `
+        -CensusMasterKey $script:ReviewerLauncherCensusMasterKey `
+        -RunExecutionId ([string]$script:ReviewerRunId)
     Write-Host "Cross-verification preview for PR $PrId saved to $markdownPath" -ForegroundColor DarkCyan
     return @{ MarkdownPath = $markdownPath; ArtifactPath = $artifactPath; Manifest = $manifest }
 }
@@ -12097,6 +12199,7 @@ function Invoke-ReviewerCrossVerificationPass {
         -ChangedPaths @($Bound.ChangedPaths))
     $assignmentCoverage = Assert-ReviewerVerificationAssignmentCoverage -Clusters $clusters `
         -Assignments $assignments -RequiredVerifierModels $ReviewPassModels `
+        -ChangedPaths @($Bound.ChangedPaths) `
         -MaxVerifierRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns)
     $readyCandidateIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($cluster in @($clusters | Where-Object { [string]$_.status -ceq "ready" })) {
@@ -12186,9 +12289,12 @@ function Invoke-ReviewerCrossVerificationPass {
     }
     $baseName = "pr$prId-$($sourceCommit.Substring(0, 12))-$($inputManifestSha.Substring(0, 16))"
     $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
+    $inputArtifactShaOutput = ''
     $inputArtifactPath = Save-ReviewerVerificationInput -Manifest $inputManifest `
         -Directory $verificationInputDir -BaseName $baseName -MasterKey $masterKey `
-        -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes)
+        -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes) `
+        -ArtifactSha256 ([ref]$inputArtifactShaOutput)
+    $inputArtifactSha = [string]$inputArtifactShaOutput
     $runRecords = [System.Collections.Generic.List[object]]::new()
     $groups = @{}
     foreach ($assignment in $assignments) {
@@ -12447,7 +12553,8 @@ function Invoke-ReviewerCrossVerificationPass {
     }
     $preview = Write-ReviewerVerificationDecisionPreview -PrId $prId -SourceCommit $sourceCommit `
         -Status $status -Diagnostic "" -InputArtifactPath $inputArtifactPath `
-        -InputManifestSha256 $inputManifestSha -Clusters $clusters -Assignments $assignments `
+        -InputManifestSha256 $inputManifestSha -InputArtifactSha256 $inputArtifactSha `
+        -Clusters $clusters -Assignments $assignments `
         -VerifierRuns $runRecords.ToArray() -Decisions @($replay.decisions) `
         -Withheld @($replay.withheld) -Eligible @($replay.eligible) `
         -AllCandidates @($candidatePlan.candidates) `
@@ -12503,7 +12610,7 @@ function Invoke-ReviewerCrossVerificationSafely {
         try {
             [void](Write-ReviewerVerificationDecisionPreview -PrId $prId -SourceCommit $sourceCommit `
                     -Status "degraded" -Diagnostic $diagnostic -InputArtifactPath "" `
-                    -InputManifestSha256 ("0" * 64) -Withheld @(
+                    -InputManifestSha256 ("0" * 64) -InputArtifactSha256 ("0" * 64) -Withheld @(
                         [pscustomobject][ordered]@{
                             candidateId = ""; clusterId = ""; reason = "incompleteVerifier"
                             detail = $diagnostic
@@ -12894,6 +13001,7 @@ function New-ReviewerResponsePassEnvelope {
         [Parameter(Mandatory)][hashtable]$Bound,
         [Parameter(Mandatory)][int]$CycleNumber,
         [Parameter(Mandatory)][int]$PassNumber,
+        [Parameter(Mandatory)][int]$AttemptIndex,
         [Parameter(Mandatory)][string]$PassModel,
         [Parameter(Mandatory)][AllowEmptyString()][string]$Stdin,
         [Parameter(Mandatory)]$Run,
@@ -12928,8 +13036,8 @@ function New-ReviewerResponsePassEnvelope {
     $envelope = New-ReviewerModelResponseEnvelopeV2 -Extraction $Extraction `
         -RunId ([string]$script:ReviewerRunId) `
         -MaxFindingItems $MaxFindingItems `
-        -AttemptId ("pr$PrId-cycle$CycleNumber-pass$PassNumber-$Nonce") `
-        -AttemptIndex $PassNumber -Nonce $Nonce `
+        -AttemptId ("pr$PrId-cycle$CycleNumber-pass$PassNumber-attempt$AttemptIndex-$Nonce") `
+        -AttemptIndex $AttemptIndex -Nonce $Nonce `
         -Binding @{
             organization    = [string]$Organization
             project         = [string]$ExpectedProject
@@ -12980,6 +13088,91 @@ function New-ReviewerResponsePassEnvelope {
     return Protect-ReviewerModelResponseEnvelope -Envelope $envelope -RunKey $runKey
 }
 
+function New-ReviewerModelPassResult {
+    <#
+    .SYNOPSIS
+        The single, closed shape every Invoke-ReviewerModelPass return has.
+    .DESCRIPTION
+        WHY THIS EXISTS. Every consumer of a pass result reads it under
+        Set-StrictMode -Version Latest, where a key the producer left out is not
+        a $null - it is a terminating error raised inside the caller, several
+        stack frames away from the branch that actually omitted it.
+
+        The oversized-input branch was exactly that defect: it returned a
+        bounded refusal without 'EnvelopePersisted', so the accounting writer
+        threw on the first read of that key. The throw escaped the whole review,
+        which is precisely what a BOUNDED refusal exists not to do - it took out
+        every pull request queued behind the oversized one - and it happened
+        before the attempt reached the starvation and retry accounting, so the
+        oversized pull request was never charged an attempt and never retired.
+        Nothing about an oversized change set improves on its own, so that is a
+        permanent, invisible loop.
+
+        Building every return here makes that class of defect impossible to
+        reintroduce: a branch cannot omit a key it never writes, and a key added
+        later is added once, with a default, for every branch at the same time.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Model,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RejectionClass,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Nonce,
+        $Marker = $null,
+        [AllowEmptyString()][string]$Reason = "",
+        [bool]$EnvironmentFault = $false,
+        [bool]$ModelRan = $false,
+        [bool]$ProcessStarted = $false,
+        $Usage = $null,
+        $ResponseEnvelope = $null,
+        $AuthTier = $null,
+        [bool]$EnvelopePersisted = $false
+    )
+    return @{
+        Model             = $Model
+        Marker            = $Marker
+        Reason            = $Reason
+        EnvironmentFault  = $EnvironmentFault
+        RejectionClass    = $RejectionClass
+        Nonce             = $Nonce
+        ModelRan          = $ModelRan
+        ProcessStarted    = $ProcessStarted
+        Usage             = $Usage
+        ResponseEnvelope  = $ResponseEnvelope
+        AuthTier          = $AuthTier
+        EnvelopePersisted = $EnvelopePersisted
+    }
+}
+
+# The exact key set New-ReviewerModelPassResult publishes. Named once so the
+# consumers can assert the shape they are about to read rather than discovering
+# a missing key as a terminating error inside an accounting writer.
+$script:ReviewerModelPassResultKeys = @(
+    'AuthTier', 'EnvelopePersisted', 'EnvironmentFault', 'Marker', 'Model', 'ModelRan',
+    'Nonce', 'ProcessStarted', 'Reason', 'RejectionClass', 'ResponseEnvelope', 'Usage'
+)
+
+function Assert-ReviewerModelPassResultShape {
+    <#
+    .SYNOPSIS
+        Refuses a pass result that does not carry every key its consumers read.
+    .DESCRIPTION
+        Fails at the boundary, naming the missing keys, instead of letting
+        Set-StrictMode raise 'the property cannot be found' from inside whichever
+        consumer happened to read the missing key first. A refusal here is still
+        a throw, but it is an attributable one; the point of the check is that
+        New-ReviewerModelPassResult makes it unreachable.
+    #>
+    param([Parameter(Mandatory)]$Result)
+    if ($Result -isnot [System.Collections.IDictionary]) {
+        throw "A model pass result must be a dictionary; got '$(if ($null -eq $Result) { 'null' } else { $Result.GetType().FullName })'."
+    }
+    $missing = @($script:ReviewerModelPassResultKeys | Where-Object { -not $Result.Contains($_) })
+    if (@($missing).Count -gt 0) {
+        throw ("A model pass result omits $(@($missing).Count) required key(s): $((@($missing) | Sort-Object) -join ', '). " +
+            'Every branch must publish the closed shape New-ReviewerModelPassResult defines.')
+    }
+    return $Result
+}
+
 function Invoke-ReviewerModelPass {
     <#
         ONE model run over one bound pull request: build the payload, launch,
@@ -13013,6 +13206,24 @@ function Invoke-ReviewerModelPass {
 
     # -- Build the bounded stdin payload -------------------------------------
     $nonce = New-AgentNonce
+    # The attempt ordinal is RESERVED here, before anything can fail, and is the
+    # real retry ordinal for this (pr, cycle, pass) triple: attempt 1, 2, 3...
+    # The pass NUMBER is not that ordinal - it identifies WHICH reviewer of the
+    # pass set is running, and every retry of that reviewer repeats it. Sealing
+    # the pass number as the envelope's attemptIndex made two attempts of the
+    # same pass indistinguishable on that field, so a consumer that keyed or
+    # de-duplicated on (runId, attemptIndex) would treat a retry as a replay of
+    # the first attempt - or accept the earlier, superseded envelope in place of
+    # the later one. Reserving before the launch (rather than at envelope-write
+    # time) also means an attempt that dies before it can seal anything still
+    # consumes its ordinal, so the sequence never silently re-uses a number.
+    $attemptOrdinalKey = "pr{0}-cycle{1}-pass{2}" -f $prId, $CycleNumber, $PassNumber
+    if (-not $script:ReviewerResponseEnvelopeOrdinals.ContainsKey($attemptOrdinalKey)) {
+        $script:ReviewerResponseEnvelopeOrdinals[$attemptOrdinalKey] = 0
+    }
+    $script:ReviewerResponseEnvelopeOrdinals[$attemptOrdinalKey] =
+        [int]$script:ReviewerResponseEnvelopeOrdinals[$attemptOrdinalKey] + 1
+    [int]$attemptOrdinal = [int]$script:ReviewerResponseEnvelopeOrdinals[$attemptOrdinalKey]
     $runtimeContext = Get-ReviewerRuntimeContext -Nonce $nonce -PrId $prId -RepositoryId $cfgRepoId -Project $ExpectedProject `
         -SourceCommit $sourceCommit -SourceBranch $Bound.SourceBranch -AuthorAlias $Bound.AuthorAlias `
         -ThreadDigestText $Bound.DigestText `
@@ -13045,9 +13256,9 @@ function Invoke-ReviewerModelPass {
         # PROCESS accounting, deliberately separate from ModelRan. Nothing was
         # launched here: the input was refused for size before the subprocess, so
         # this attempt spent no model start and must not be counted as one.
-        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false
-            RejectionClass = 'oversize'; Nonce = $nonce; ModelRan = $false; ProcessStarted = $false; Usage = $null
-            ResponseEnvelope = $null; AuthTier = $null }
+        return (New-ReviewerModelPassResult -Model $PassModel -RejectionClass 'oversize' -Nonce $nonce `
+                -Reason $oversizeReason -ModelRan $false -ProcessStarted $false `
+                -EnvelopePersisted $false)
     }
 
     # -- Launch the model -----------------------------------------------------
@@ -13152,6 +13363,7 @@ function Invoke-ReviewerModelPass {
             $responseEnvelope = New-ReviewerResponsePassEnvelope -Extraction $responseExtraction `
                 -Nonce $nonce -PrId $prId -SourceCommit $sourceCommit -Bound $Bound `
                 -CycleNumber $CycleNumber -PassNumber $PassNumber -PassModel $PassModel `
+                -AttemptIndex $attemptOrdinal `
                 -Stdin $stdin -Run $run -CliOutcome $cliOutcome -MaxFindingItems $EffectiveMaxFindings `
                 -StartedAtUtc $passStartedAtUtc -CompletedAtUtc $passCompletedAtUtc
             # Persisted for every tier. The census entry that says "this reviewer
@@ -13163,15 +13375,11 @@ function Invoke-ReviewerModelPass {
                 # The leaf name carries the attempt ordinal, not the nonce. A nonce
                 # in the name would make the artifact tree of two identical runs
                 # differ by name alone, which is noise an exact-path comparison
-                # cannot tell apart from a real divergence.
-                $envelopeKey = "pr{0}-cycle{1}-pass{2}" -f $prId, $CycleNumber, $PassNumber
-                if (-not $script:ReviewerResponseEnvelopeOrdinals.ContainsKey($envelopeKey)) {
-                    $script:ReviewerResponseEnvelopeOrdinals[$envelopeKey] = 0
-                }
-                $script:ReviewerResponseEnvelopeOrdinals[$envelopeKey] =
-                    [int]$script:ReviewerResponseEnvelopeOrdinals[$envelopeKey] + 1
-                $envelopePath = Join-Path $envelopeDir ("{0}-attempt{1}.json" -f $envelopeKey,
-                    [int]$script:ReviewerResponseEnvelopeOrdinals[$envelopeKey])
+                # cannot tell apart from a real divergence. The ordinal is the one
+                # reserved for this attempt at launch, so the file name and the
+                # sealed run.attemptIndex are the same number by construction.
+                $envelopeKey = $attemptOrdinalKey
+                $envelopePath = Join-Path $envelopeDir ("{0}-attempt{1}.json" -f $envelopeKey, $attemptOrdinal)
                 ConvertTo-Json -InputObject $responseEnvelope -Depth 64 -Compress |
                     Set-Content -LiteralPath $envelopePath -Encoding utf8NoBOM
                 $responsePersisted = $true
@@ -13253,10 +13461,10 @@ function Invoke-ReviewerModelPass {
     }
     else { $bindingRejected = $false }
     if ($marker) {
-        return @{ Model = $PassModel; Marker = $marker; Reason = ""; EnvironmentFault = $false
-            RejectionClass = 'success'; Nonce = $nonce; ModelRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
-            ProcessStarted = $true; Usage = $usage
-            ResponseEnvelope = $responseEnvelope; AuthTier = $responseTier; EnvelopePersisted = $responsePersisted }
+        return (New-ReviewerModelPassResult -Model $PassModel -RejectionClass 'success' -Nonce $nonce `
+                -Marker $marker -Reason "" -ModelRan ([bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)) `
+                -ProcessStarted $true -Usage $usage -ResponseEnvelope $responseEnvelope `
+                -AuthTier $responseTier -EnvelopePersisted ([bool]$responsePersisted))
     }
 
     # A precise, typed reason - never a generic "invalid marker". A schema-shape
@@ -13328,10 +13536,11 @@ function Invoke-ReviewerModelPass {
     }
     catch { Write-Warning "Could not write the failure transcript: $($_.Exception.Message)" }
 
-    return @{ Model = $PassModel; Marker = $null; Reason = $reason; EnvironmentFault = [bool]$launchFailureReason
-        RejectionClass = $rejectionClass; Nonce = $nonce; ModelRan = $modelActuallyRan
-        ProcessStarted = $true; Usage = $usage
-        ResponseEnvelope = $responseEnvelope; AuthTier = $responseTier; EnvelopePersisted = $responsePersisted }
+    return (New-ReviewerModelPassResult -Model $PassModel -RejectionClass $rejectionClass -Nonce $nonce `
+            -Marker $null -Reason $reason -EnvironmentFault ([bool]$launchFailureReason) `
+            -ModelRan $modelActuallyRan -ProcessStarted $true -Usage $usage `
+            -ResponseEnvelope $responseEnvelope -AuthTier $responseTier `
+            -EnvelopePersisted ([bool]$responsePersisted))
 }
 
 # ---------------------------------------------------------------------------
@@ -14870,9 +15079,10 @@ function Invoke-ReviewerAcquisitionRoleCapture {
     if ($script:ReviewerRoleInputCaptureActive) { $script:ReviewerRoleInputCaptureBound = $Bound }
     $role = [string]$script:ReviewerAcquisitionTargetRole
     if ($role -ceq 'generalist') {
-        $script:ReviewerAcquisitionRolePassResult = Invoke-ReviewerModelPass `
-            -AgencyPath $AgencyPath -CycleNumber $CycleNumber -Bound $Bound `
-            -PassModel $CaptureRoleInputModel -PassNumber 1 -PassCount 1
+        $script:ReviewerAcquisitionRolePassResult = Assert-ReviewerModelPassResultShape -Result (
+            Invoke-ReviewerModelPass `
+                -AgencyPath $AgencyPath -CycleNumber $CycleNumber -Bound $Bound `
+                -PassModel $CaptureRoleInputModel -PassNumber 1 -PassCount 1)
         return @{ ExitCode = 0; Summary = "role-input-generalist-capture" }
     }
     if ($role -ceq 'specialist') {
@@ -14959,8 +15169,9 @@ function Invoke-ReviewerPullRequest {
             return ([long]$Current + [long]$Value)
         }
         for ($attempt = 1; $attempt -le $script:ReviewerMarkerRetryAttempts; $attempt++) {
-            $passResult = Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
-                -Bound $Bound -PassModel ([string]$passModel) -PassNumber $passNumber -PassCount $passCount
+            $passResult = Assert-ReviewerModelPassResultShape -Result (
+                Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
+                    -Bound $Bound -PassModel ([string]$passModel) -PassNumber $passNumber -PassCount $passCount)
             $acctAttempts++
             $u = $passResult.Usage
             if ($u) {
@@ -16848,6 +17059,7 @@ function Invoke-ReviewerAcquisitionVerifierCapture {
             -ChangedPaths $changedPaths)
     $assignmentCoverage = Assert-ReviewerVerificationAssignmentCoverage -Clusters $Clusters `
         -Assignments $assignments -RequiredVerifierModels $ReviewPassModels `
+        -ChangedPaths $changedPaths `
         -MaxVerifierRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns)
     # Production groups assignments by (clusterId, verifierModel) and launches ONE
     # run per group with only that group's candidates. Selecting the same group is
@@ -17075,16 +17287,34 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         $presentedToken = $null
         throw "The presented authorization token does not match the plan's authorizationTokenSha256; acquisition is refused before any launch."
     }
-    # Token-derived HMAC key = SHA-256(token) bytes. Verifying the signature over
-    # the exact plan bytes proves BOTH that the token is authentic AND that not a
-    # single plan field was edited after the supervisor authored and signed it.
-    $planKeyBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash($script:ReviewerUtf8.GetBytes($presentedToken))
+    # THE SIGNING KEY IS NOT A VALUE THE PLAN PUBLISHES. It is derived from the
+    # RAW token under a domain label, so reading the plan file - which carries
+    # SHA-256(token) as its authorization binding - yields nothing that can sign
+    # one. A sidecar that does not name this derivation is refused rather than
+    # verified under the old, disclosed key: a signature made with a key its
+    # verifier's own inputs reveal proves nothing, and failing closed is the only
+    # safe way to retire it.
+    $planKeyMac = [System.Security.Cryptography.HMACSHA256]::new($script:ReviewerUtf8.GetBytes($presentedToken))
+    try {
+        $planKeyBytes = $planKeyMac.ComputeHash(
+            $script:ReviewerUtf8.GetBytes($script:ReviewerAcquisitionPlanSignatureKeyLabel))
+    }
+    finally { $planKeyMac.Dispose() }
     $presentedToken = $null
     $planSigPath = "$((Resolve-Path -LiteralPath $AcquisitionPlanFile).Path).sig"
     if (-not (Test-Path -LiteralPath $planSigPath -PathType Leaf)) {
         throw "The acquisition plan is missing its authenticated signature sidecar; a plan the supervisor did not sign is refused."
     }
     $planSig = ([IO.File]::ReadAllText($planSigPath, $script:ReviewerUtf8)) | ConvertFrom-Json -Depth 8
+    [string]$planSigKeyDerivation = if ($planSig.PSObject.Properties['keyDerivation']) {
+        [string]$planSig.keyDerivation
+    }
+    else { '' }
+    if ($planSigKeyDerivation -cne 'hmac-token-domain-v1') {
+        throw ("The acquisition plan signature declares key derivation '$planSigKeyDerivation', not " +
+            "'hmac-token-domain-v1'. A sidecar signed under a key derivable from the plan's own published " +
+            'token digest is refused; re-author the plan with a supervisor that signs under the domain-separated key.')
+    }
     if (-not (Test-ReviewerArtifactSignature -ManifestJson $planText -Key $planKeyBytes -Signature ([string]$planSig.signature))) {
         throw "The acquisition plan signature does not match the plan bytes under the presented token; a tampered or replayed plan is refused before any launch."
     }
@@ -17534,8 +17764,9 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         try {
             for ($attempt = 1; $attempt -le $script:ReviewerMarkerRetryAttempts; $attempt++) {
                 $beforeCount = $script:ReviewerAcquisitionCaptures.Count
-                $passResult = Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber 1 `
-                    -Bound $Bound -PassModel $model -PassNumber 1 -PassCount 1
+                $passResult = Assert-ReviewerModelPassResultShape -Result (
+                    Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber 1 `
+                        -Bound $Bound -PassModel $model -PassNumber 1 -PassCount 1)
                 $cap = if ($script:ReviewerAcquisitionCaptures.Count -gt $beforeCount) {
                     $script:ReviewerAcquisitionCaptures[$script:ReviewerAcquisitionCaptures.Count - 1]
                 }
@@ -19255,7 +19486,70 @@ try {
     exit (Get-OnceFinalExitCode -IsOnce:$Once -IsDryRun:$false -LastCycleExitCode $lastCycleExitCode)
 }
 finally {
-    Exit-AgentLock -Stream $lock
+    # ORDER MATTERS, AND IT IS THE OPPOSITE OF WHAT IT LOOKS LIKE. The census
+    # attestation is sealed while this run still HOLDS the agent lock, and the
+    # lock is released only afterwards.
+    #
+    # Sealing after the release was a real hazard: the moment the lock goes, the
+    # next reviewer generation may start writing into this same state directory,
+    # and this block would then be digesting a log and a preview set that are
+    # partly the next run's. The attestation would be sealed over a mixture of
+    # two generations - either reporting tampering on an honest run, or, worse,
+    # attesting to a set of files nobody actually produced as a unit.
+    #
+    # Sealing last WITHIN the lock keeps the property that made it last in the
+    # first place - it digests every artifact this run could still write - while
+    # removing the window in which someone else can write them.
+    try {
+        # Every early exit in this script runs this block, and most of them do so
+        # before the state directory or the artifact key exist. Those paths are
+        # no-ops by construction rather than by exception: a run that got nowhere
+        # has no accounting to attest to, and it is correct for it to read as
+        # unauthenticated later. A failure to seal is likewise swallowed - the
+        # census is designed to treat a missing manifest as unproven, so the
+        # worst a failed seal can do is block a budget, never inflate one.
+        try {
+            $censusStateDir = Get-Variable -Name 'StateDir' -ValueOnly -ErrorAction SilentlyContinue
+            $censusKeyPath = Get-Variable -Name 'artifactKeyPath' -ValueOnly -ErrorAction SilentlyContinue
+            [byte[]]$launcherCensusMasterKey = $script:ReviewerLauncherCensusMasterKey
+            $hasLauncherCensusKey = ($launcherCensusMasterKey.Length -eq 32)
+            $hasLocalCensusKey = (-not [string]::IsNullOrWhiteSpace([string]$censusKeyPath) -and
+                (Test-Path -LiteralPath ([string]$censusKeyPath) -PathType Leaf))
+            if (-not [string]::IsNullOrWhiteSpace([string]$censusStateDir) -and
+                (Test-Path -LiteralPath ([string]$censusStateDir) -PathType Container) -and
+                ($hasLauncherCensusKey -or $hasLocalCensusKey)) {
+                $censusLogPath = Join-Path ([string]$censusStateDir) 'logs\reviewer.log.jsonl'
+                $censusRecords = @()
+                if (Test-Path -LiteralPath $censusLogPath -PathType Leaf) {
+                    $censusRecords = @(Get-ReviewerModelStartLogRecord -LogPath $censusLogPath)
+                }
+                # The key is bound through a typed local rather than inline: a
+                # command result that is a byte array unrolls on its way into a
+                # parameter, and an array parameter that receives an unrolled
+                # array is at the mercy of how the pipeline re-collects it.
+                [byte[]]$censusMasterKey = $null
+                if ($hasLauncherCensusKey) {
+                    $censusMasterKey = $launcherCensusMasterKey
+                }
+                else {
+                    $localCensusKeyOutput = @(Get-ReviewerArtifactSigningKey -KeyPath ([string]$censusKeyPath))
+                    $censusMasterKey = [byte[]]$localCensusKeyOutput
+                }
+                [void](Save-ReviewerModelStartCensusManifest `
+                        -RunRoot ([string]$censusStateDir) `
+                        -MasterKey $censusMasterKey `
+                        -RunExecutionId ([string]$script:ReviewerRunId) `
+                        -Records $censusRecords)
+            }
+        }
+        catch {
+            Write-Warning ("The census attestation could not be sealed: $($_.Exception.Message) " +
+                'This run''s accounting will read as unauthenticated.')
+        }
+    }
+    finally {
+        Exit-AgentLock -Stream $lock
+    }
 }
 
 }

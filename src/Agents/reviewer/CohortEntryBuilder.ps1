@@ -61,7 +61,13 @@ function Assert-ReviewerCohortEntryToolkit {
     }
     $head = ''
     try {
-        $head = ([string](& git -C $Request.ToolkitRoot rev-parse HEAD 2>$null)).Trim()
+        # Joined out of an array rather than cast straight to string. A command
+        # that writes nothing at all yields PowerShell's automation null, and
+        # casting THAT to [string] produces $null rather than the empty string -
+        # so the direct cast turns 'git resolved nothing' into a null-reference
+        # crash and the catalogued refusal below is never reached.
+        $head = [string]::Join('', [string[]]@(& git -C $Request.ToolkitRoot rev-parse HEAD 2>$null |
+                    Where-Object { $null -ne $_ })).Trim()
     }
     catch {
         New-ReviewerCohortEntryRefusal -Code 'CE200' -Detail "The toolkit root '$($Request.ToolkitRoot)' is not a readable git repository."
@@ -73,7 +79,13 @@ function Assert-ReviewerCohortEntryToolkit {
         New-ReviewerCohortEntryRefusal -Code 'CE200' `
             -Detail "The toolkit is at $head and the request pins $($Request.ToolkitHead)."
     }
-    $refCommit = ([string](& git -C $Request.ToolkitRoot rev-parse --verify --quiet "$($Request.RequiredRef)^{commit}" 2>$null)).Trim()
+    # '--verify --quiet' writes NOTHING when the ref does not resolve, which is
+    # exactly the case CE201 exists for. Read as an array for the same reason as
+    # the head above: the direct cast would make an unresolvable ref crash here
+    # instead of being refused two lines down.
+    $refCommit = [string]::Join('', [string[]]@(
+            & git -C $Request.ToolkitRoot rev-parse --verify --quiet "$($Request.RequiredRef)^{commit}" 2>$null |
+                Where-Object { $null -ne $_ })).Trim()
     if ($refCommit -cnotmatch '^[0-9a-f]{40}$') {
         New-ReviewerCohortEntryRefusal -Code 'CE201' -Detail "The required ref '$($Request.RequiredRef)' does not resolve in the toolkit."
     }
@@ -770,8 +782,15 @@ function New-ReviewerCohortEntryEvidence {
     # refuses an entry whose estimate is below its own sealed bound. Taking it
     # FROM the derived maxima makes "estimate is an upper bound" true by
     # construction rather than by an operator getting the arithmetic right.
-    # A preparation-only entry declares no slots, so its bound is zero real model
-    # starts and the run count it plans stays its published estimate.
+    # A preparation-only entry declares NO slots, so its sealed bound is zero real
+    # model starts and zero verifier assignments. It used to publish
+    # PlannedRunCount for both units anyway, which is an over-declaration in the
+    # one direction nothing checks: the cohort budget reserved model spend for an
+    # entry that is authorized to spend none, and every other entry in the cohort
+    # competed against that phantom reservation. The honest published figure is
+    # the derived bound - zero - and the preparation work the entry really does is
+    # accounted separately, as preparation runs, not as model starts.
+    [int]$preparationRunCount = 0
     if ($null -ne $executionPlan) {
         $supervisedChildren = @($executionPlan.Slots).Count + 2
         $wallClock = ([long]$executionPlan.SlotTimeoutSeconds + [long]$executionPlan.SupervisionGraceSeconds) * $supervisedChildren
@@ -780,18 +799,34 @@ function New-ReviewerCohortEntryEvidence {
         $estimatedWallClockSeconds = [int]$wallClock
     }
     else {
-        $estimatedModelStarts = [int]$request.PlannedRunCount
-        $estimatedVerifierAssignments = [int]$request.PlannedRunCount
+        $preparationRunCount = [int]$request.PlannedRunCount
+        $estimatedModelStarts = [int]$derivedBound.MaxRealModelStarts
+        $estimatedVerifierAssignments = [int]$derivedBound.MaxVerifierAssignments
+        # Wall clock is real work either way: a preparation run occupies the
+        # cohort for as long as it takes, whether or not it starts a model.
         $estimatedWallClockSeconds = [int]($request.ChildTimeoutSeconds * $request.PlannedRunCount)
     }
     # A zero estimate is a budget that authorizes nothing and passes every check
     # by being empty, which is the one way a bound can be wrong without anything
-    # noticing. Asserted rather than assumed, because both branches above compute
-    # it and only one of them is exercised by any given build.
+    # noticing - UNLESS the derived bound for that unit is itself zero, in which
+    # case zero is the only truthful figure and a positive one would be the
+    # over-declaration. The comparison is against the derived bound, never
+    # against a flag or an operator's intent, so the exemption cannot be claimed
+    # by an entry that really does declare slots. Wall clock has no such
+    # exemption: a build that takes no time did not happen.
     foreach ($pair in @(
-            @{ Name = 'modelStarts'; Value = $estimatedModelStarts },
-            @{ Name = 'verifierAssignments'; Value = $estimatedVerifierAssignments },
-            @{ Name = 'wallClockSeconds'; Value = $estimatedWallClockSeconds })) {
+            @{ Name = 'modelStarts'; Value = $estimatedModelStarts; Bound = [int]$derivedBound.MaxRealModelStarts },
+            @{ Name = 'verifierAssignments'; Value = $estimatedVerifierAssignments
+                Bound = [int]$derivedBound.MaxVerifierAssignments },
+            @{ Name = 'wallClockSeconds'; Value = $estimatedWallClockSeconds; Bound = 1 })) {
+        if ([int]$pair['Bound'] -le 0) {
+            if ([int]$pair['Value'] -ne 0) {
+                New-ReviewerCohortEntryRefusal -Code 'CE712' `
+                    -Detail ("The model start bound field '$($pair['Name'])' is '$($pair['Value'])' against a derived bound of 0; " +
+                        'an entry that is authorized to spend none of a unit publishes exactly zero of it.')
+            }
+            continue
+        }
         if ([int]$pair['Value'] -le 0) {
             New-ReviewerCohortEntryRefusal -Code 'CE712' `
                 -Detail "The model start bound field '$($pair['Name'])' is '$($pair['Value'])'; a bound estimate is a positive 32-bit integer."
@@ -894,6 +929,10 @@ function New-ReviewerCohortEntryEvidence {
         MaxVerifierAssignments = [int]$derivedBound.MaxVerifierAssignments
         EstimatedModelStarts = $estimatedModelStarts
         EstimatedVerifierAssignments = $estimatedVerifierAssignments
+        # Preparation runs are real work that starts no model. They are reported
+        # as their own unit so the cohort budget is not asked to reserve model
+        # spend for an entry whose sealed bound authorizes none.
+        PreparationRunCount = $preparationRunCount
         ModelStarts = 0
         ProviderWrites = 0
         PreflightState = $preflightState

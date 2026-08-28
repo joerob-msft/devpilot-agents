@@ -2,10 +2,11 @@
   "schemaVersion": 1,
   "kind": "reviewer-semantic-decision-normalization-contract",
   "excludedKeyPatterns": [
-    "(?i)(?:run|session|attempt|assignment)Id$|nonce(?:Sha256)?$",
+    "(?i)(?:run|session|attempt|assignment)(?:Execution)?Id$|nonce(?:Sha256)?$",
     "(?i)(timestamp|^(?:at|(?:child)?processId|pid|remainingSeconds|phaseRemainingSeconds|availableSeconds|maxSupportedInvocationCount)$|(?:created|updated|started|ended|generated|captured|frozen|recorded)At|timeUtc|atUtc|epochSeconds|duration(?:Ms|Seconds)?|elapsed(?:Ms|Seconds)?)$",
     "(?i)(hmac|signature|signingKey|keyMaterial|secretKey)$",
-    "(?i)^(?:host|keyId)$"
+    "(?i)^(?:host|keyId)$",
+    "(?i)^logBytes$"
   ],
   "setArrayPaths": [
     "$.eligibleCandidateIds",
@@ -19,8 +20,11 @@
   "derivedOperationalValuePathPatterns": [
     "(?i)\\.(?:nonce|replayNonce|nonceSha256|hmac|signature|hmacSignature)$",
     "(?i)\\.(?:candidateId|candidateHash|clusterId)$",
-    "(?i)\\.(?:markerSha256|originArtifactSha256|specialistArtifactSha256|inputManifestSha256|previewSha256|markdownSha256|replaySha256|reviewDigest)$",
+    "(?i)\\.(?:markerSha256|originArtifactSha256|specialistArtifactSha256|inputManifestSha256|inputArtifactSha256|previewSha256|markdownSha256|replaySha256|reviewDigest)$",
     "(?i)\\.(?:inputSha256|finalAssistantSha256|rawStdOutSha256|stdErrSha256)$",
+    "(?i)\\.runRootIdentitySha256$",
+    "(?i)\\.logSha256$",
+    "(?i)\\.previews\\[\\]\\.(?:name|sha256)$",
     "(?i)\\.inventory\\[\\]\\.sha256$",
     "(?i)\\.(?:allInputArtifactHashes|inputArtifactHashes)\\[\\]\\.sha256$"
   ],
@@ -32,6 +36,7 @@
     "setArrays": "sort by normalized compact JSON",
     "embeddedJsonStrings": "parse recursively before normalization",
     "operationalRoots": "replace caller-declared absolute roots and generated timestamped artifact leaf names with stable placeholders",
+    "logMeasurements": "exclude redundant raw log byte counts while retaining the parsed log records and their semantic fields",
     "derivedOperationalValues": "replace nonce-derived candidate, assignment, cluster, artifact, and model-transcript identities with relationship-preserving ordinal aliases",
     "renderedArtifacts": "retain Markdown content while replacing only registered operational identities and roots"
   }

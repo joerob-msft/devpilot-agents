@@ -214,6 +214,12 @@ internal sealed class SlotSupervisor(CoordinatorRequest request, LaunchLedger le
         start.ArgumentList.Add(scriptPath);
         start.ArgumentList.Add("-RequestPath");
         start.ArgumentList.Add(requestPath);
+        start.ArgumentList.Add("-ExpectedRequestSha256");
+        start.ArgumentList.Add(childRequestSha256);
+        start.ArgumentList.Add("-ExpectedResultPath");
+        start.ArgumentList.Add(resultPath);
+        start.ArgumentList.Add("-ExpectedToolkitRoot");
+        start.ArgumentList.Add(_request.ToolkitRoot);
 
         // The supervised launch is the one this coordinator can least afford to
         // repeat: the authorization is single-use and the owner mints its attempt
@@ -506,12 +512,13 @@ internal sealed class SlotSupervisor(CoordinatorRequest request, LaunchLedger le
                 _request.CorrelationId,
                 launch.ResultPath,
                 launch.ChildRequestSha256,
-                expectedResultFields);
+                expectedResultFields,
+                out var resultSha256);
             if (!StrictJson.RequireBool(result, "ok", $"'{launch.Step}' child result"))
             {
                 throw new ChildFailureException($"The '{launch.Step}' supervised child reported failure in its result file.");
             }
-            return new ChildOutcome(0, launch.ResultPath, result, CanonicalJson.Sha256HexOfFile(launch.ResultPath));
+            return new ChildOutcome(0, launch.ResultPath, result, resultSha256);
         }
         catch (ContractException error)
         {

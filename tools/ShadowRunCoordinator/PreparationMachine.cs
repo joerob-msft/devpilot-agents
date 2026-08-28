@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text.Json;
 
 namespace DevPilot.ShadowRunCoordinator;
@@ -1408,6 +1409,17 @@ internal sealed class PreparationMachine(
         var childRequest = SlotChildRequest(plan.Authorization)
             .Set("expectedPlanDigest", plan.PlanDigest)
             .Set("expectedSetId", plan.SetId);
+        // Minted HERE, by the coordinator, and handed DOWN. The adapter echoes it
+        // and the run result is required to carry exactly this value back, so the
+        // identity does not originate in anything the reviewed run can write. It
+        // could not be taken from the child result: that result lands in the
+        // exchange directory, which the reviewed run can compute, and its
+        // validation checks only fields that are readable from the request sitting
+        // beside it - so an identity minted below would be an identity the reviewed
+        // run could substitute in the window between the adapter's write and this
+        // coordinator's read.
+        var runExecutionId = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+        childRequest.Set("runExecutionId", runExecutionId);
         // Re-bound now that the plan is known, so the intent this launch commits
         // names the set, the slot and the terminal artifact it is supposed to
         // produce rather than only the transition it happened at.
@@ -1430,6 +1442,10 @@ internal sealed class PreparationMachine(
             .Set("setId", plan.SetId)
             .Set("planDigest", plan.PlanDigest)
             .Set("slotName", plan.SlotName)
+            // Committed with the launch, before the wait, so a coordinator killed
+            // mid-slot comes back knowing which execution it authorized rather
+            // than learning it from whatever the child left behind.
+            .Set("runExecutionId", runExecutionId)
             .Set("deadlines", plan.Deadlines.Describe())
             .Set("child", launch.DescribeIdentity())
             .Set("supervisionStartedAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
@@ -1492,7 +1508,8 @@ internal sealed class PreparationMachine(
             "childExitCode",
             "slotName",
             "setId",
-            "planDigest");
+            "planDigest",
+            "runExecutionId");
         var label = $"'{stage.RunStep}' child result";
         if (!StrictJson.RequireBool(outcome.Result, "terminalWritten", label))
         {
@@ -1504,6 +1521,18 @@ internal sealed class PreparationMachine(
         StrictJson.RequireLiteral(outcome.Result, "setId", plan.SetId, label);
         StrictJson.RequireLiteral(outcome.Result, "planDigest", plan.PlanDigest, label);
         var terminalPath = StrictJson.RequireString(outcome.Result, "terminalPath", label);
+        // The identity this coordinator minted for this slot and committed with the
+        // launch. The result is required to echo it exactly, so the reviewed run
+        // gets no say in it: rewriting the result file - or the copy the adapter
+        // leaves for its verify process - can only produce a refusal, never a
+        // substitution. Read from the committed record rather than from the result
+        // so that a resumed coordinator holds the same authority the launching one
+        // did.
+        var runExecutionId = running.GetText("runExecutionId")
+            ?? throw new ContractException(
+                "The slot running record carries no run execution identity. It was committed by a build that did not mint one, " +
+                "and an execution this coordinator cannot name is not one it will summarise.");
+        StrictJson.RequireLiteral(outcome.Result, "runExecutionId", runExecutionId, label);
         if (!PathsAreSame(terminalPath, plan.SlotTerminalPath))
         {
             throw new ContractException($"The supervised slot reports terminal evidence at '{terminalPath}' and the plan places it at '{plan.SlotTerminalPath}'.");
@@ -1520,6 +1549,7 @@ internal sealed class PreparationMachine(
             .Set("terminalPath", terminalPath)
             .Set("terminalSha256", CanonicalJson.Sha256HexOfFile(terminalPath))
             .Set("supervision", observation.Describe())
+            .Set("runExecutionId", runExecutionId)
             .Set("childResultSha256", outcome.ResultSha256);
         return (evidence, $"disposition={observation.Disposition} childExitCode={observation.ExitCode.ToString(CultureInfo.InvariantCulture)}");
     }
@@ -1546,9 +1576,19 @@ internal sealed class PreparationMachine(
         var plan = _slotPlans[stage.Ordinal];
         var observedTerminalSha = observed.GetText("terminalSha256")
             ?? throw new ContractException($"The {PreparationStateNames.ToName(stage.TerminalObserved)} record carries no terminal digest.");
+        // Handed back to the verify step rather than left for it to find on disk.
+        // A record committed before this fix carries no identity, and a verify
+        // step with none refuses, so an interrupted run prepared by an older build
+        // is resumed into a refusal instead of into the weaker witness.
+        var observedRunExecutionId = observed.GetText("runExecutionId")
+            ?? throw new ContractException(
+                $"The {PreparationStateNames.ToName(stage.TerminalObserved)} record carries no run-execution identity. " +
+                "The identity the reviewed run was told to adopt is committed with that transition, and a verification " +
+                "that cannot name it would have to trust the copy the audited run can reach.");
 
         var childRequest = SlotChildRequest(plan.Authorization)
             .Set("expectedPlanDigest", plan.PlanDigest)
+            .Set("expectedRunExecutionId", observedRunExecutionId)
             .Set("expectedSetId", plan.SetId);
         var outcome = _invoker.Invoke(
             stage.VerifyStep,
