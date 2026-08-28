@@ -35,6 +35,9 @@ param(
     [switch]$EnableTeamsNotifications,
 
     [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableCodeUpdates,
+
+    [Parameter(ParameterSetName = 'Launch')]
     [ValidateRange(30, 86400)]
     [int]$IntervalSeconds = 900,
 
@@ -59,6 +62,7 @@ if ($PullRequestId -gt 0) { $parameters.ReviewHandlerPullRequestId = $PullReques
 if ($Continuous) { $parameters.Continuous = $true }
 if ($Operational) { $parameters.Operational = $true }
 if ($EnableTeamsNotifications) { $parameters.EnableReviewHandlerTeamsNotifications = $true }
+if ($EnableCodeUpdates) { $parameters.EnableReviewHandlerCodeUpdates = $true }
 if ($PSBoundParameters.ContainsKey('IntervalSeconds')) { $parameters.IntervalSeconds = $IntervalSeconds }
 if ($OperatorAlias) { $parameters.OperatorAlias = $OperatorAlias }
 if ($AgentName) { $parameters.ReviewHandlerAgentName = $AgentName }

@@ -274,6 +274,10 @@ consumer repository whose conventional agent configs should be used:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Operational `
     -EnableReviewerTeamsNotifications
 
+# Let the review-handler resume the originating session, fix, validate, reply, and push:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent ReviewHandler -Operational `
+    -EnableReviewHandlerCodeUpdates
+
 # Both agents, continuous 15-minute cadence:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
 
@@ -294,7 +298,13 @@ The launcher starts each selected agent in a separate process with
 notification switches. Operational reviewer runs enable finding comments,
 thread replies, and summaries. Operational review-handler runs enable thread
 replies and buddy requeues. Code changes, pushes, votes, auto-complete, and
-local validation remain disabled. Teams delivery is separate and requires the
+local validation remain disabled by default. Add
+`-EnableReviewHandlerCodeUpdates` to let the review-handler find and resume the
+originating Copilot coding session when available, make code changes, run local
+validation, and push to the PR source branch. A missing local session starts a
+fresh coding session; this option does not require local ownership. Reviewer
+votes and review-handler auto-complete remain disabled. Teams delivery is
+separate and requires the
 appropriate `-EnableReviewerTeamsNotifications` or
 `-EnableReviewHandlerTeamsNotifications` switch. Unless `-StateDir` is
 supplied, the agents share a generated temporary session root, so one dashboard
