@@ -66,6 +66,9 @@ param(
     [switch]$EnableReviewHandlerTeamsNotifications,
 
     [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableReviewHandlerCodeUpdates,
+
+    [Parameter(ParameterSetName = 'Launch')]
     [ValidateRange(30, 86400)]
     [int]$IntervalSeconds = 900,
 
@@ -106,6 +109,12 @@ $reviewerOperationalCapabilities = @(
 $reviewHandlerOperationalCapabilities = @(
     'EnableThreadReplies',
     'EnableBuddyRequeue'
+)
+$reviewHandlerCodeUpdateCapabilities = @(
+    'EnableCodeChanges',
+    'EnablePush',
+    'LocalValidation',
+    'ResumeCodingSession'
 )
 
 function ConvertTo-PowerShellLiteral {
@@ -156,8 +165,12 @@ if ($AttachOnly) {
 if ($Continuous -and ($ReviewerPullRequestId -gt 0 -or $ReviewHandlerPullRequestId -gt 0)) {
     throw 'A pull request ID cannot be combined with -Continuous because that would repeatedly process one pull request.'
 }
-if (-not $Operational -and ($EnableReviewerTeamsNotifications -or $EnableReviewHandlerTeamsNotifications)) {
-    throw 'Teams notifications require -Operational. Preview runs never send notifications.'
+if (-not $Operational -and (
+        $EnableReviewerTeamsNotifications -or
+        $EnableReviewHandlerTeamsNotifications -or
+        $EnableReviewHandlerCodeUpdates
+    )) {
+    throw 'Notifications and review-handler code updates require -Operational. Preview runs never enable side effects.'
 }
 
 $launchReviewer = $Agent -in @('Reviewer', 'Both')
@@ -167,6 +180,9 @@ if ($EnableReviewerTeamsNotifications -and -not $launchReviewer) {
 }
 if ($EnableReviewHandlerTeamsNotifications -and -not $launchReviewHandler) {
     throw '-EnableReviewHandlerTeamsNotifications requires -Agent ReviewHandler or -Agent Both.'
+}
+if ($EnableReviewHandlerCodeUpdates -and -not $launchReviewHandler) {
+    throw '-EnableReviewHandlerCodeUpdates requires -Agent ReviewHandler or -Agent Both.'
 }
 $defaultConfigRoot = Join-Path (Get-Location) '.github\copilot\agents'
 if ($launchReviewer) {
@@ -275,6 +291,11 @@ try {
                 foreach ($capability in $reviewHandlerOperationalCapabilities) {
                     [void]$parameterLines.Add("$capability = `$true")
                 }
+                if ($EnableReviewHandlerCodeUpdates) {
+                    foreach ($capability in $reviewHandlerCodeUpdateCapabilities) {
+                        [void]$parameterLines.Add("$capability = `$true")
+                    }
+                }
                 if ($EnableReviewHandlerTeamsNotifications) {
                     [void]$parameterLines.Add('EnableTeamsNotifications = $true')
                 }
@@ -312,7 +333,8 @@ catch {
 
 Write-Host "Shared state root: $StateDir" -ForegroundColor Cyan
 if ($Operational) {
-    Write-Information 'OPERATIONAL: reviewer comments, replies, and summaries plus review-handler replies and requeues are enabled. Code changes, pushes, votes, auto-complete, and local validation remain disabled.' -InformationAction Continue
+    Write-Information 'OPERATIONAL: reviewer comments, replies, and summaries plus review-handler replies and requeues are enabled. Reviewer votes and review-handler auto-complete remain disabled.' -InformationAction Continue
+    Write-Information "Review-handler code updates: $([bool]$EnableReviewHandlerCodeUpdates) (code changes, local validation, session resume, and push)." -InformationAction Continue
     Write-Information "Teams notifications: reviewer=$([bool]$EnableReviewerTeamsNotifications) review-handler=$([bool]$EnableReviewHandlerTeamsNotifications)." -InformationAction Continue
     Write-Warning 'Closing the dashboard immediately stops owned agent process trees. Quit while agents are waiting when possible to avoid interrupting an in-flight operation.'
 }

@@ -326,6 +326,7 @@ Describe 'Shared reviewer and review-handler event contract' {
         foreach ($parameterName in @(
             'Agent', 'AttachOnly', 'Continuous', 'Operational', 'IntervalSeconds',
             'EnableReviewerTeamsNotifications', 'EnableReviewHandlerTeamsNotifications',
+            'EnableReviewHandlerCodeUpdates',
             'ReviewerConfigFile', 'ReviewHandlerConfigFile',
             'ReviewerPullRequestId', 'ReviewHandlerPullRequestId'
         )) {
@@ -341,6 +342,8 @@ Describe 'Shared reviewer and review-handler event contract' {
             $source, '(?s)\$reviewerOperationalCapabilities\s*=\s*@\((.*?)\)').Groups[1].Value
         $handlerCapabilities = [regex]::Match(
             $source, '(?s)\$reviewHandlerOperationalCapabilities\s*=\s*@\((.*?)\)').Groups[1].Value
+        $handlerCodeUpdateCapabilities = [regex]::Match(
+            $source, '(?s)\$reviewHandlerCodeUpdateCapabilities\s*=\s*@\((.*?)\)').Groups[1].Value
         foreach ($capability in @(
             'EnableFindingComments', 'EnableThreadReplies',
             'EnableSummaryComment'
@@ -364,12 +367,24 @@ Describe 'Shared reviewer and review-handler event contract' {
         )) {
             $handlerCapabilities | Should -Not -Match ("'{0}'" -f $capability)
         }
+        foreach ($capability in @(
+            'EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession'
+        )) {
+            $handlerCodeUpdateCapabilities | Should -Match ("'{0}'" -f $capability)
+        }
+        foreach ($capability in @(
+            'EnableThreadReplies', 'EnableBuddyRequeue', 'EnableTeamsNotifications',
+            'EnableAutoComplete', 'RequireCodingSession', 'EnableApprovalVote'
+        )) {
+            $handlerCodeUpdateCapabilities | Should -Not -Match ("'{0}'" -f $capability)
+        }
         $source | Should -Match "'EnableTeamsNotifications = \`$true'"
         $source | Should -Match '\$parameterLines\.Add\("\$capability = `\$true"\)'
         $source | Should -Match 'if \(\$Operational\)'
-        $source | Should -Match 'Teams notifications require -Operational'
+        $source | Should -Match 'review-handler code updates require -Operational'
         $source | Should -Match 'EnableReviewerTeamsNotifications requires -Agent Reviewer or -Agent Both'
         $source | Should -Match 'EnableReviewHandlerTeamsNotifications requires -Agent ReviewHandler or -Agent Both'
+        $source | Should -Match 'EnableReviewHandlerCodeUpdates requires -Agent ReviewHandler or -Agent Both'
         $source | Should -Not -Match '(?i)\bYolo\s*='
         $source.IndexOf('& $dashboardLauncher -StateDir $StateDir -ValidateOnly') |
             Should -BeLessThan $source.IndexOf('$process = Start-Process')
@@ -393,6 +408,10 @@ Describe 'Shared reviewer and review-handler event contract' {
             $wrapperSource | Should -Match 'Watch-DevPilotAgents\.ps1'
             $wrapperSource | Should -Match 'Operational'
             $wrapperSource | Should -Match 'EnableTeamsNotifications'
+            if ($wrapper.Agent -eq 'ReviewHandler') {
+                $wrapperSource | Should -Match '\$EnableCodeUpdates\b'
+                $wrapperSource | Should -Match 'EnableReviewHandlerCodeUpdates'
+            }
         }
     }
 
