@@ -709,13 +709,28 @@ function Invoke-CapturedRolePipeline {
                 }
                 [void]$acquisitionArgs.Add($args[$i])
             }
+            foreach ($argument in @(
+                    '-OfflineModelAdapterManifest', $AdapterManifest,
+                    '-UseOfflineStubAdapter')) {
+                [void]$acquisitionArgs.Add($argument)
+            }
             $acquired = & pwsh -NoProfile -File $AcquireTool @($acquisitionArgs.ToArray()) 2>&1
             $acquiredText = ($acquired | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0 -or
-                -not (Test-Path -LiteralPath (Join-Path $acquisitionOut 'package\transcript-package.json'))) {
+            $acquisitionManifestPath = Join-Path $acquisitionOut 'package\transcript-package.json'
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $acquisitionManifestPath)) {
                 return [pscustomobject]@{
                     Ready = $false
                     Detail = "Preflight passed, but acquisition from the same materialized replay failed: $acquiredText"
+                }
+            }
+            $acquisitionManifest = Get-Content -LiteralPath $acquisitionManifestPath -Raw -Encoding UTF8 |
+                ConvertFrom-Json -Depth 64
+            if ([int]$acquisitionManifest.telemetry.modelSubprocessStarts -ne 1 -or
+                [int]$acquisitionManifest.telemetry.realModelStarts -ne 0 -or
+                -not [bool]$acquisitionManifest.telemetry.zeroWriteVerified) {
+                return [pscustomobject]@{
+                    Ready = $false
+                    Detail = "Materialized verifier acquisition did not prove one sealed adapter process, zero real models, and zero writes."
                 }
             }
         }
