@@ -437,6 +437,12 @@ jobs:
               '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr',
               '-ReplayManifestDigest', $digest
           )
+          function ConvertTo-FlatDiagnostic {
+              param([Parameter(Mandatory)][string]$Text)
+              $flat = $Text -replace "`e\][^`a`e]*(`a|`e\\)", ''
+              $flat = $flat -replace "`e\[[0-9;?]*[A-Za-z]", ''
+              return (($flat -replace '\s*\|\s*', ' ') -replace '\s+', ' ').Trim()
+          }
           # Every one of these must be refused at startup, before any session
           # exists. A replay that could post is not a replay.
           $blocked = @(
@@ -455,20 +461,23 @@ jobs:
               foreach ($case in $blocked) {
                   $caseArgs = [string[]]$case.Args
                   $output = & pwsh @common @caseArgs 2>&1 | Out-String
-                  if ($LASTEXITCODE -eq 0 -or $output -notmatch [regex]::Escape($case.Expect)) {
+                  $normalizedOutput = ConvertTo-FlatDiagnostic -Text $output
+                  if ($LASTEXITCODE -eq 0 -or $normalizedOutput -notmatch [regex]::Escape($case.Expect)) {
                       throw "Replay with $($case.Name) did not fail closed at startup: $output"
                   }
               }
               # An incomplete replay invocation is refused rather than guessed at.
               $partial = & pwsh -NoProfile -File $scriptPath -ConfigFile './samples/reviewer-ado.config.json' `
                   -Model $pair.First -OperatorAlias 'example-operator' -ReplayRoot $replayRoot 2>&1 | Out-String
-              if ($LASTEXITCODE -eq 0 -or $partial -notmatch 'requires all of') {
+              if ($LASTEXITCODE -eq 0 -or
+                  (ConvertTo-FlatDiagnostic -Text $partial) -notmatch [regex]::Escape('requires all of')) {
                   throw "A partial replay invocation was not refused: $partial"
               }
               # The snapshot itself is not for this repository's configuration,
               # so a replay of it must refuse rather than review the wrong PR.
               $mismatch = & pwsh @common -PullRequestId 4242 2>&1 | Out-String
-              if ($LASTEXITCODE -eq 0 -or $mismatch -notmatch 'cannot be replayed under this configuration') {
+              if ($LASTEXITCODE -eq 0 -or
+                  (ConvertTo-FlatDiagnostic -Text $mismatch) -notmatch [regex]::Escape('cannot be replayed under this configuration')) {
                   throw "A snapshot captured for another repository was not refused: $mismatch"
               }
           }
