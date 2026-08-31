@@ -442,7 +442,7 @@ jobs:
           $blocked = @(
               @{ Name = 'finding comments'; Args = @('-EnableFindingComments'); Expect = 'preview-only' },
               @{ Name = 'summary comment'; Args = @('-EnableSummaryComment'); Expect = 'preview-only' },
-              @{ Name = 'approval vote'; Args = @('-EnableApprovalVote'); Expect = 'preview-only' },
+              @{ Name = 'approval vote'; Args = @('-EnableFindingComments', '-EnableApprovalVote'); Expect = 'preview-only' },
               @{ Name = 'raw promotion'; Args = @('-PromotePreview', 'not-needed.json'); Expect = 'preview-only' },
               @{ Name = 'verified promotion'; Args = @('-PromoteVerifiedPreview', 'not-needed.json'); Expect = 'preview-only' },
               @{ Name = 'comment gate'; Args = @('-EnableVerifiedCommentGate'); Expect = 'preview-only' },
