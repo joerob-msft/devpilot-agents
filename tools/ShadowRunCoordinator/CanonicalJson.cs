@@ -331,6 +331,16 @@ internal static class CanonicalJson
     private const int ReaderRecoveryInitialBackoffMilliseconds = 2;
     private const int ReaderRecoveryMaxBackoffMilliseconds = 512;
 
+    // TEST ONLY. Pauses evidence classification after the destination has been
+    // observed absent so the self-test can complete a fallback publication before
+    // the backup enumeration. Production never sets this hook.
+    internal static Action<string>? AtomicReadEvidenceHook;
+
+    // TEST ONLY. Announces that a reader found the per-path publish gate held,
+    // allowing the stress test to prove a real read/write overlap rather than
+    // merely running the two operations before and after one another.
+    internal static Action<string>? AtomicReadContentionHook;
+
     /// <summary>
     /// Opens a state file for a shared, snapshot read, recovering ONLY across the
     /// transient absence a ReplaceFile-fallback publish exposes and failing fast on
@@ -347,25 +357,42 @@ internal static class CanonicalJson
     /// </remarks>
     internal static FileStream OpenPublishedFileForRead(string path)
     {
+        var gate = GateFor(Path.GetFullPath(path));
         var backoff = ReaderRecoveryInitialBackoffMilliseconds;
         for (var attempt = 1; ; attempt++)
         {
+            var gateHeld = Monitor.TryEnter(gate);
+            if (!gateHeld)
+            {
+                AtomicReadContentionHook?.Invoke(path);
+                Monitor.Enter(gate);
+                gateHeld = true;
+            }
             try
             {
-                return new FileStream(path, FileMode.Open, FileAccess.Read,
-                    FileShare.ReadWrite | FileShare.Delete);
+                try
+                {
+                    return new FileStream(path, FileMode.Open, FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete);
+                }
+                catch (Exception transient) when (
+                    attempt < ReaderRecoveryMaxAttempts && IsReaderRecoverable(path, transient))
+                {
+                    // A publisher outside this process is swapping the destination
+                    // underneath us. In-process publishers cannot expose this
+                    // window: readers share their per-path gate and wait until the
+                    // directory entry has settled before opening a snapshot handle.
+                }
             }
-            catch (Exception transient) when (
-                attempt < ReaderRecoveryMaxAttempts && IsReaderRecoverable(path, transient))
+            finally
             {
-                // A publish is swapping the destination underneath us: the path is
-                // momentarily renamed aside, or briefly held while the replace
-                // primitive moves it. Give the swap the rest of its window and look
-                // again. A genuine absence or a real lock is NOT recoverable here
-                // and travels on the first look.
-                Thread.Sleep(backoff);
-                backoff = Math.Min(backoff * 2, ReaderRecoveryMaxBackoffMilliseconds);
+                if (gateHeld)
+                {
+                    Monitor.Exit(gate);
+                }
             }
+            Thread.Sleep(backoff);
+            backoff = Math.Min(backoff * 2, ReaderRecoveryMaxBackoffMilliseconds);
         }
     }
 
@@ -417,6 +444,7 @@ internal static class CanonicalJson
         {
             return true;
         }
+        AtomicReadEvidenceHook?.Invoke(path);
         var full = Path.GetFullPath(path);
         var directory = Path.GetDirectoryName(full);
         if (string.IsNullOrEmpty(directory))
@@ -432,13 +460,23 @@ internal static class CanonicalJson
             using var matches = Directory
                 .EnumerateFiles(directory, Path.GetFileName(full) + ".*.bak")
                 .GetEnumerator();
-            return matches.MoveNext();
+            if (matches.MoveNext())
+            {
+                return true;
+            }
         }
         catch (Exception error) when (
             error is IOException or UnauthorizedAccessException or DirectoryNotFoundException)
         {
-            return false;
+            // The directory query itself raced a filesystem transition. It
+            // supplied no durable evidence, so the target recheck below remains
+            // the only safe completed-publication signal.
         }
+        // The failed open and the evidence query are not one filesystem
+        // operation. A fast fallback can restore the target and remove its backup
+        // between them; rechecking the target closes that completed-publication
+        // side of the race without classifying a still-missing path as transient.
+        return File.Exists(path);
     }
 
     internal static string HmacHex(byte[] key, string text) =>

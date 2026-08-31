@@ -658,6 +658,71 @@ internal static class AtomicPublishSelfTest
                     }
                 });
 
+                Check("a StrictJson reader recovers when fallback evidence disappears during classification", () =>
+                {
+                    var classified = Path.Combine(directory, "reader-classification", "state.json");
+                    CanonicalJson.WriteFileAtomic(classified, oldContent);
+                    var backup = classified + "." + Guid.NewGuid().ToString("N") + ".bak";
+                    File.Move(classified, backup);
+
+                    using var classificationStarted = new ManualResetEventSlim(false);
+                    using var allowClassification = new ManualResetEventSlim(false);
+                    byte[]? observed = null;
+                    Exception? readerFault = null;
+                    Thread? reader = null;
+                    CanonicalJson.AtomicReadEvidenceHook = target =>
+                    {
+                        if (string.Equals(target, classified, StringComparison.OrdinalIgnoreCase))
+                        {
+                            classificationStarted.Set();
+                            if (!allowClassification.Wait(TimeSpan.FromSeconds(10)))
+                            {
+                                throw new TimeoutException("the fallback did not settle while classification was paused");
+                            }
+                        }
+                    };
+                    try
+                    {
+                        reader = new Thread(() =>
+                        {
+                            try
+                            {
+                                observed = StrictJson.ReadFileBytes(classified, "classification state");
+                            }
+                            catch (Exception exception)
+                            {
+                                readerFault = exception;
+                            }
+                        })
+                        { IsBackground = true };
+                        reader.Start();
+                        Require(classificationStarted.Wait(TimeSpan.FromSeconds(10)),
+                            "the reader never reached fallback evidence classification");
+
+                        // Complete the exact publication transition that exposed
+                        // the hosted race: the target returns and the backup
+                        // evidence disappears before the reader enumerates it.
+                        File.Move(backup, classified);
+                        allowClassification.Set();
+                        Require(reader.Join(TimeSpan.FromSeconds(10)),
+                            "the reader did not finish after the fallback settled");
+                        Require(readerFault is null,
+                            $"the StrictJson reader rejected a completed fallback: {readerFault?.GetType().Name}: {readerFault?.Message}");
+                        Require(observed is not null && Encoding.UTF8.GetString(observed) == oldContent,
+                            "the StrictJson reader did not recover the whole published content");
+                    }
+                    finally
+                    {
+                        allowClassification.Set();
+                        CanonicalJson.AtomicReadEvidenceHook = null;
+                        reader?.Join(TimeSpan.FromSeconds(10));
+                        if (File.Exists(backup) && !File.Exists(classified))
+                        {
+                            File.Move(backup, classified);
+                        }
+                    }
+                });
+
                 Check("a genuinely missing state file still fails fast, with no backup sibling to recover from", () =>
                 {
                     // The other half of the contract: recovery is ONLY for the
@@ -688,46 +753,118 @@ internal static class AtomicPublishSelfTest
 
                 Check("a reader never observes absence while forced fallbacks publish concurrently", () =>
                 {
-                    // The integration form: real forced-fallback publishes running
-                    // while a reader reads in a tight loop. Every read must land on
-                    // whole old or whole new content, and none may throw the absence
-                    // the recovery exists to absorb.
-                    var racePath = Path.Combine(directory, "reader-race", "state.json");
-                    CanonicalJson.WriteFileAtomic(racePath, oldContent);
+                    // The integration form, repeated enough to exercise distinct
+                    // thread schedules: real forced-fallback publishes running
+                    // while a StrictJson-backed digest reader reads in a tight
+                    // loop. Every read must land on whole old or whole new content.
                     var oldDigest = CanonicalJson.Sha256HexOfText(oldContent);
                     var newDigest = CanonicalJson.Sha256HexOfText(newContent);
-                    var stop = new ManualResetEventSlim(false);
-                    Exception? readerFault = null;
-                    var sawUnexpected = false;
-                    var reader = new Thread(() =>
+                    const int stressIterations = 10;
+                    const int publishesPerIteration = 60;
+                    var totalReads = 0;
+                    var replacesBefore = Interlocked.Read(ref CanonicalJson.AtomicPublishReplaceCount);
+                    for (var iteration = 0; iteration < stressIterations; iteration++)
                     {
-                        try
+                        var racePath = Path.Combine(
+                            directory,
+                            "reader-race",
+                            iteration.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                            "state.json");
+                        CanonicalJson.WriteFileAtomic(racePath, oldContent);
+                        using var stop = new ManualResetEventSlim(false);
+                        using var firstAttempt = new ManualResetEventSlim(false);
+                        using var readAttemptedDuringPublish = new ManualResetEventSlim(false);
+                        Exception? readerFault = null;
+                        var sawUnexpected = false;
+                        var reads = 0;
+                        CanonicalJson.AtomicReadContentionHook = target =>
                         {
-                            while (!stop.IsSet)
+                            if (string.Equals(target, racePath, StringComparison.OrdinalIgnoreCase))
                             {
-                                var digest = CanonicalJson.Sha256HexOfFile(racePath);
-                                if (digest != oldDigest && digest != newDigest)
+                                readAttemptedDuringPublish.Set();
+                            }
+                        };
+                        var reader = new Thread(() =>
+                        {
+                            try
+                            {
+                                while (!stop.IsSet)
                                 {
-                                    sawUnexpected = true;
+                                    var digest = CanonicalJson.Sha256Hex(
+                                        StrictJson.ReadFileBytes(racePath, "fallback race state"));
+                                    Interlocked.Increment(ref reads);
+                                    firstAttempt.Set();
+                                    if (digest != oldDigest && digest != newDigest)
+                                    {
+                                        sawUnexpected = true;
+                                    }
                                 }
                             }
-                        }
-                        catch (Exception exception)
+                            catch (Exception exception)
+                            {
+                                readerFault = exception;
+                                firstAttempt.Set();
+                            }
+                        })
+                        { IsBackground = true };
+                        try
                         {
-                            readerFault = exception;
+                            reader.Start();
+                            Require(firstAttempt.Wait(TimeSpan.FromSeconds(10)),
+                                $"stress iteration {iteration} never attempted a read");
+                            Require(readerFault is null,
+                                $"stress iteration {iteration} faulted before publishing: {readerFault?.Message}");
+                            CanonicalJson.AtomicPublishAttemptHook = (target, attempt) =>
+                            {
+                                if (attempt == 1 &&
+                                    string.Equals(target, racePath, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    if (!readAttemptedDuringPublish.Wait(TimeSpan.FromSeconds(10)))
+                                    {
+                                        throw new TimeoutException(
+                                            $"stress iteration {iteration} made no read attempt during a publish");
+                                    }
+                                }
+                            };
+                            try
+                            {
+                                CanonicalJson.WriteFileAtomic(
+                                    racePath,
+                                    newContent);
+                            }
+                            finally
+                            {
+                                CanonicalJson.AtomicPublishAttemptHook = null;
+                            }
+                            for (var publish = 1; publish < publishesPerIteration; publish++)
+                            {
+                                CanonicalJson.WriteFileAtomic(
+                                    racePath,
+                                    publish % 2 == 0 ? newContent : oldContent);
+                            }
                         }
-                    })
-                    { IsBackground = true };
-                    reader.Start();
-                    for (var i = 0; i < 60; i++)
-                    {
-                        CanonicalJson.WriteFileAtomic(racePath, i % 2 == 0 ? newContent : oldContent);
+                        finally
+                        {
+                            CanonicalJson.AtomicPublishAttemptHook = null;
+                            CanonicalJson.AtomicReadContentionHook = null;
+                            stop.Set();
+                            reader.Join(TimeSpan.FromSeconds(10));
+                        }
+                        Require(!reader.IsAlive, $"stress iteration {iteration} left its reader running");
+                        Require(readerFault is null,
+                            $"the reader faulted in stress iteration {iteration}: {readerFault?.GetType().Name}: {readerFault?.Message}");
+                        Require(!sawUnexpected,
+                            $"the reader observed unpublished content in stress iteration {iteration}");
+                        Require(reads > 0, $"stress iteration {iteration} completed no reads");
+                        Require(readAttemptedDuringPublish.IsSet,
+                            $"stress iteration {iteration} made no read attempt while a publish was active");
+                        totalReads += reads;
                     }
-                    stop.Set();
-                    reader.Join();
-                    Require(readerFault is null,
-                        $"the reader faulted across concurrent fallback publishes: {readerFault?.GetType().Name}: {readerFault?.Message}");
-                    Require(!sawUnexpected, "the reader observed content that was neither the whole old nor the whole new value");
+                    var replaces = Interlocked.Read(ref CanonicalJson.AtomicPublishReplaceCount) - replacesBefore;
+                    Require(replaces == stressIterations * publishesPerIteration,
+                        $"the stress used {replaces} fallback replace(s), not {stressIterations * publishesPerIteration}");
+                    log.WriteLine(
+                        $"        ({stressIterations} iterations, {replaces} forced fallback publishes, {totalReads} whole reads)");
                 });
             }
             finally
@@ -754,6 +891,8 @@ internal static class AtomicPublishSelfTest
         finally
         {
             CanonicalJson.AtomicPublishAttemptHook = null;
+            CanonicalJson.AtomicReadEvidenceHook = null;
+            CanonicalJson.AtomicReadContentionHook = null;
             try { Directory.Delete(directory, recursive: true); } catch (IOException) { }
         }
 
