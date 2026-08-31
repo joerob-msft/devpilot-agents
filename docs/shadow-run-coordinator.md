@@ -775,7 +775,7 @@ blocks the cohort, never as a filesystem fault from underneath. The distinction 
 failure to *write* the index is treated leniently — the journal is authoritative and the next run
 rewrites the report — and a failure to *read* an audit must never be mistaken for one.
 
-**The index says what ran, never what was concluded.** `devpilot.shadow-cohort.index.v3` carries
+**The index says what ran, never what was concluded.** `devpilot.shadow-cohort.index.v4` carries
 one summary per declared entry, in declared order: the preparation's final state and terminal
 reason, the snapshot, run-set, reconciliation and delivery evidence digests, the model start, slot,
 supervised slot, verifier assignment and provider write counts, the wall time, and the entry's
@@ -783,6 +783,10 @@ subject *digest*. It carries no organization, repository, pull request id, findi
 or verdict, and it is self-hashed and signed. A refusal's own words can name an output root, and an
 output root can encode the subject it was taken over, so the index publishes a closed phrase plus
 `terminalDetailSha256` and the words themselves go to the operator's log.
+
+Version 4 makes `unwitnessedCompleteEntryOrdinals` mandatory. Version 3 remains readable because
+indexes written before that list existed cannot be distinguished from later v3 indexes that carry
+it; a missing list in v3 is therefore legacy absence, while a v4 index that omits it is malformed.
 
 The word the cohort publishes about itself is committed into the signed journal *before* the index
 is written, so the two can never disagree and a kill between them leaves a record the next rebuild
@@ -1400,6 +1404,22 @@ serialized once, and written *empty* by the degraded fallback, which returns nor
 that seal cannot prove is charged. That allowance is what lets a ceiling be checked against an
 upper bound rather than against a floor. `slotAttemptRecordCount` remains, renamed, as a
 diagnostic.
+
+The census seal has an authority outside the run root it authenticates. For each slot execution,
+the child adapter derives a dedicated census master key from the run-set signing key, the set ID,
+the slot name and the coordinator-minted execution ID. It passes that derived key only through the
+reviewer process's launch environment; the reviewer validates it before any model can launch, uses
+it only for the final census seal, and never writes it into the run root or uses it as the general
+artifact key. Verification derives the same bytes again from run-set custody and supplies them
+explicitly to both census readers. It never asks the audited run root which key should authenticate
+it. Replaying another slot or an earlier execution therefore changes both the expected execution
+ID and the key under which its census must verify.
+
+Each verification preview binds its input twice for two different purposes:
+`inputManifestSha256` is the canonical-object identity used by verifier prompts and markers, while
+`inputArtifactSha256` is the digest of the signed envelope bytes saved on disk. The census compares
+the latter to the file it reopens; comparing the former to envelope bytes would reject every honest
+preview because those are intentionally different preimages.
 
 A **real verifier assignment** is a third and separate unit, and it is the one the verifier
 ceiling is spent in. It is one candidate paired with one required reciprocal verifier model, and

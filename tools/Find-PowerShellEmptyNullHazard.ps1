@@ -842,10 +842,23 @@ foreach ($document in $parsed) {
                 }
             }
             else {
+                # A SPLATTED argument (@hash) is not positional: it supplies named
+                # parameters whose contents this analyzer cannot see. Counting it
+                # as the next positional argument mis-attributes every later
+                # argument in the call, and - because a call may legitimately have
+                # no mandatory array parameter at that position at all - the
+                # lookup below can match nothing, which under Set-StrictMode made
+                # `.Key` on the empty result throw and abort the entire scan. A
+                # crashed analyzer reports zero findings, so this was a gate that
+                # could be silently switched off by an ordinary call site.
+                if ($element -is [Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) {
+                    continue
+                }
                 $argument = $element
-                $parameterName = @($mandatoryArrays.GetEnumerator() |
+                $positionalMatch = @($mandatoryArrays.GetEnumerator() |
                         Where-Object Value -eq $positionalIndex |
-                        Select-Object -First 1).Key
+                        Select-Object -First 1)
+                $parameterName = $(if ($positionalMatch.Count -gt 0) { [string]$positionalMatch[0].Key } else { $null })
                 $positionalIndex++
             }
             if ([string]::IsNullOrWhiteSpace($parameterName) -or

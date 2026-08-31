@@ -560,6 +560,57 @@ Assert-Verification (@($originUnionAssignments | Where-Object { [string]$_.verif
     @($originUnionAssignments | Where-Object { [string]$_.verifierModel -ceq "gpt-5.6-sol" }).Count -eq 3) `
     "The named convention verifier reduced the reciprocal pair instead of leaving both cross-checks intact."
 
+# F1 (review fix): the assignment builder and the coverage assertion must share
+# ONE eligibility predicate. This drives the exact production sequence -
+# ConvertTo-ReviewerVerificationCandidates -> Get-ReviewerVerificationClusters ->
+# Get-ReviewerVerificationAssignments -> Assert-ReviewerVerificationAssignmentCoverage,
+# with -ChangedPaths threaded into BOTH plan and coverage exactly as the wrapper
+# does - over a MIXED union: one on-change eligible candidate and one off-change
+# ineligible candidate. Before the fix the coverage census counted the
+# ineligible candidate, required an assignment that the builder never planned,
+# and threw pass-wide, suppressing verification of the valid candidate. The fix
+# must leave the eligible candidate fully verified and report the withheld one.
+$mixedPasses = @(
+    (New-GeneralistPass -Model $sol -Findings @(
+            (New-GeneralistFinding -FilePath "/src/onchange.cs" -Line 11 `
+                -Comment "The on-change finding reports a bounded retry defect that loses prior state."))),
+    (New-GeneralistPass -Model $opus -Findings @(
+            (New-GeneralistFinding -FilePath "/src/offchange.cs" -Line 22 `
+                -Comment "The off-change finding reports a bounded validation defect on an untouched file.")))
+)
+$mixedCandidates = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses $mixedPasses)
+$mixedClusters = @(Get-ReviewerVerificationClusters -Candidates $mixedCandidates)
+$mixedChangedPaths = @("/src/onchange.cs")
+$mixedAssignments = @(Get-ReviewerVerificationAssignments -Clusters $mixedClusters `
+        -GeneralistModels @($opus, $sol) -ChangedPaths $mixedChangedPaths)
+$mixedCoverage = Assert-ReviewerVerificationAssignmentCoverage -Clusters $mixedClusters `
+    -Assignments $mixedAssignments -RequiredVerifierModels @($opus, $sol) -MaxVerifierRuns 14 `
+    -ChangedPaths $mixedChangedPaths -WarningAction SilentlyContinue
+$mixedEligibleId = @($mixedCandidates | Where-Object {
+        [string]$_.filePath -ceq "/src/onchange.cs" })[0].candidateId
+$mixedEligibleModels = @($mixedAssignments | Where-Object {
+        [string]$_.candidateId -ceq [string]$mixedEligibleId } |
+        ForEach-Object { [string]$_.verifierModel } | Sort-Object -Unique)
+Assert-Verification ($mixedCandidates.Count -eq 2 -and $mixedClusters.Count -eq 2 -and
+    $mixedAssignments.Count -eq 2 -and [bool]$mixedCoverage.complete -and
+    [int]$mixedCoverage.eligibleCandidateCount -eq 1 -and
+    [int]$mixedCoverage.requiredAssignmentCount -eq 2 -and
+    (@($mixedEligibleModels) -join "|") -ceq "claude-opus-5|gpt-5.6-sol") `
+    "A single off-change candidate threw the whole coverage assertion instead of being withheld while the on-change candidate stayed fully verified."
+Assert-Verification ([int]$mixedCoverage.withheldCandidateCount -eq 1 -and
+    @($mixedCoverage.withheldCandidates).Count -eq 1 -and
+    [string]$mixedCoverage.withheldCandidates[0].reason -ceq "offChangeChangedFileAnchor" -and
+    [string]$mixedCoverage.withheldCandidates[0].candidateId -cne "" -and
+    [string]$mixedCoverage.withheldCandidates[0].candidateId -cne [string]$mixedEligibleId) `
+    "The coverage assertion did not report the withheld off-change candidate and its reason to the caller."
+# The shared predicate must judge identically on both sides: the candidate the
+# coverage withholds is exactly the candidate the builder planned no assignment
+# for, so no eligible candidate is ever silently discarded.
+$mixedAssignedIds = @($mixedAssignments | ForEach-Object { [string]$_.candidateId } | Sort-Object -Unique)
+Assert-Verification ($mixedAssignedIds.Count -eq 1 -and
+    $mixedAssignedIds[0] -ceq [string]$mixedEligibleId) `
+    "The assignment builder and coverage assertion disagreed about which candidate was assignment-eligible."
+
 # Phase 2b (review fix): the pass status decision must fold three independent
 # coverage signals so a PARTIAL convention-evidence degradation (some packs
 # resolved, some withheld because the sealed replay could not answer them) is
@@ -2980,9 +3031,20 @@ function Get-ReviewerRunArtifactKey {
 }
 function Save-ReviewerVerificationInput {
     param($Manifest, [string]$Directory, [string]$BaseName, [byte[]]$MasterKey,
-        [int]$MaxArtifactBytes)
+        [int]$MaxArtifactBytes, [ref]$ArtifactSha256)
     $script:capturedVerificationInput = $Manifest
-    return Join-Path ([IO.Path]::GetTempPath()) "$BaseName.json"
+    [void][IO.Directory]::CreateDirectory($Directory)
+    $path = Join-Path $Directory "$BaseName.json"
+    [IO.File]::WriteAllBytes(
+        $path,
+        [Text.Encoding]::UTF8.GetBytes(($Manifest | ConvertTo-Json -Depth 20 -Compress)))
+    if ($null -ne $ArtifactSha256) {
+        $ArtifactSha256.Value = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData(
+                [IO.File]::ReadAllBytes($path))).ToLowerInvariant()
+    }
+    $script:capturedVerificationInputPath = $path
+    return $path
 }
 function Invoke-ReviewerVerificationModelRun {
     param($AgencyPath, $Binding, $InputManifestSha256, $Cluster, $VerifierModel,
@@ -3011,10 +3073,11 @@ function Invoke-ReviewerVerificationReplay {
 }
 function Write-ReviewerVerificationDecisionPreview {
     param([int]$PrId, [string]$SourceCommit, [string]$Status, [string]$Diagnostic,
-        [string]$InputArtifactPath, [string]$InputManifestSha256, $Clusters,
+        [string]$InputArtifactPath, [string]$InputManifestSha256, [string]$InputArtifactSha256, $Clusters,
         $Assignments, $VerifierRuns, $Decisions, $Withheld, $Eligible,
         $AllCandidates, $ReconciliationManifest, $InputArtifactHashes, [int]$TotalCandidateCount,
         [string]$ReplaySha256)
+    $script:capturedVerificationInputArtifactSha256 = $InputArtifactSha256
     return [pscustomobject]@{
         MarkdownPath = Join-Path ([IO.Path]::GetTempPath()) "preview.md"
         ArtifactPath = Join-Path ([IO.Path]::GetTempPath()) "preview.json"
@@ -3051,6 +3114,11 @@ Assert-Verification ($duplicatePass.Status -ceq "complete" -and
     @($duplicatePass.Withheld).Count -eq 1 -and
     [string]$duplicatePass.Withheld[0].candidateId -ceq "duplicate-fact-candidate") `
     "Production cross-verification pass degraded or discarded a good candidate beside a duplicate subset."
+Assert-Verification (
+    $script:capturedVerificationInputArtifactSha256 -ceq [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [IO.File]::ReadAllBytes($script:capturedVerificationInputPath))).ToLowerInvariant()) `
+    "Production cross-verification did not bind the preview to the saved input envelope bytes."
 # The live fresh binding ran, and it ran under a bounded transport timeout that
 # never exceeds the wrapper's configured one.
 Assert-Verification ([int]$script:passFreshBindingCalls -ge 1 -and

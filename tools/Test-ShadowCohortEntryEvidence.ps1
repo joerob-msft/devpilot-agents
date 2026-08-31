@@ -246,6 +246,124 @@ function Write-CohortEntrySnapshot {
     return $digest
 }
 
+function Get-CohortEntryGitLine {
+    <#
+    .SYNOPSIS
+        One line of git output, or the empty string when git wrote nothing.
+
+    .DESCRIPTION
+        A command that writes nothing at all yields PowerShell's automation null,
+        and casting THAT to [string] produces $null rather than '' - so the direct
+        cast turns 'git resolved nothing' into a null-reference crash. Joining out
+        of an explicitly null-filtered array keeps the empty answer an empty
+        answer, which is what every caller here has to be able to read.
+    #>
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    $emitted = [string[]]@(& git @Arguments 2>$null | Where-Object { $null -ne $_ })
+    return [string]::Join('', $emitted).Trim()
+}
+
+$script:CohortEntryCreatedRefs = @()
+
+function Get-CohortEntryToolkitRef {
+    <#
+    .SYNOPSIS
+        A ref that actually resolves to the checkout's head commit.
+
+    .DESCRIPTION
+        'rev-parse --abbrev-ref HEAD' answers the literal word 'HEAD' on a
+        detached checkout, and 'refs/heads/HEAD' resolves nowhere - which is what
+        every hosted pull_request run gets, because the runner checks out a merge
+        commit rather than a branch. Pinning that ref made the builder refuse its
+        own toolkit on CI while passing on every developer machine.
+
+        A ref pointing AT the head is asked for first, so an attached checkout
+        still pins the branch it is on. When no ref points at it - a detached
+        merge commit that exists only in the runner's clone - one is CREATED at
+        that commit, under a name of this fixture's own. 'HEAD' itself would
+        resolve, but the request schema requires a ref path, so pinning it would
+        trade a crash for a malformed-field refusal in the same scenario.
+
+        A created ref is RECORDED, because this helper also runs against the real
+        checkout the suite lives in - and in a worktree a ref lands in the shared
+        common store, visible to every other worktree and holding the commit
+        against gc forever. A fixture leaves nothing behind in a repository it
+        did not make, so Remove-CohortEntryCreatedRef takes each one back.
+
+        The name is unique per call and the creation states an all-zero expected
+        old value, so it can only ever SUCCEED against a name nothing holds. A
+        fixed name would let this overwrite a ref another worktree or a
+        concurrent run was already using, and the cleanup - which can only check
+        the value it wrote - would then delete a ref it did not create.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ToolkitRoot,
+        [Parameter(Mandatory)][string]$Head
+    )
+    $branch = Get-CohortEntryGitLine -Arguments @('-C', $ToolkitRoot, 'rev-parse', '--abbrev-ref', 'HEAD')
+    if ($branch -cne 'HEAD' -and $branch -cne '') {
+        $branchRef = "refs/heads/$branch"
+        $resolved = Get-CohortEntryGitLine -Arguments @('-C', $ToolkitRoot, 'rev-parse', '--verify', '--quiet',
+            "$branchRef^{commit}")
+        if ($resolved -ceq $Head) { return $branchRef }
+    }
+    $pointing = [string[]]@(& git -C $ToolkitRoot for-each-ref --points-at $Head --format='%(refname)' 2>$null |
+            Where-Object { $null -ne $_ -and ([string]$_).Trim() -cne '' })
+    if ($pointing.Count -gt 0) { return ([string]$pointing[0]).Trim() }
+    $created = 'refs/cohort-entry-fixture/' + [guid]::NewGuid().ToString('N')
+    # The all-zero old value is git's way of saying 'this must not exist yet'.
+    # Creation is therefore also the ownership proof the deletion rests on - so
+    # the CREATE's own exit status is what is checked, not merely that the name
+    # now resolves to the right commit. A name that already existed at this very
+    # commit resolves identically while belonging to somebody else, and deleting
+    # it later on the strength of that reading would take another holder's ref.
+    & git -C $ToolkitRoot update-ref $created $Head ('0' * 40) 2>&1 | Out-Null
+    $createdOk = ($LASTEXITCODE -eq 0)
+    # Recorded the moment the create succeeds, BEFORE the read below. Ownership
+    # is established by that exit status; a ref another process moves in between
+    # would otherwise be created, owned, and then thrown away with nothing left
+    # to retry it or name it.
+    if ($createdOk) {
+        $script:CohortEntryCreatedRefs += , [pscustomobject]@{ Root = $ToolkitRoot; Ref = $created; Commit = $Head }
+    }
+    $createdCommit = Get-CohortEntryGitLine -Arguments @('-C', $ToolkitRoot, 'rev-parse', '--verify', '--quiet',
+        "$created^{commit}")
+    if (-not $createdOk -or $createdCommit -cne $Head) {
+        throw "No ref points at '$Head' in '$ToolkitRoot' and one could not be created there."
+    }
+    return $created
+}
+
+function Remove-CohortEntryCreatedRef {
+    <#
+    .SYNOPSIS
+        Deletes every ref this fixture created, and only those.
+
+    .DESCRIPTION
+        Each name was created against an all-zero expected old value, so nothing
+        else held it at creation time; the delete then states the commit it is
+        expected to still hold. A ref something else moved in the meantime is
+        left alone rather than removed on the strength of its name.
+
+        A delete that does not take - a lock, a permission, a ref another process
+        moved - keeps its record rather than dropping it, so a later call retries
+        it and the suite can say what it left behind. Silently clearing the record
+        would turn a failed cleanup into a fixture that holds a commit in an
+        operator's repository against gc forever, with nothing left to say so.
+    #>
+    $remaining = @()
+    foreach ($record in $script:CohortEntryCreatedRefs) {
+        & git -C $record.Root update-ref -d $record.Ref $record.Commit 2>&1 | Out-Null
+        # Asked for RAW, unpeeled: a ref moved to a tag or a blob no longer
+        # answers '<ref>^{commit}', and reading absence from that would drop the
+        # record while the ref itself still sits there pinning an object.
+        $still = Get-CohortEntryGitLine -Arguments @('-C', $record.Root, 'rev-parse', '--verify', '--quiet',
+            $record.Ref)
+        if ($still -cne '') { $remaining += , $record }
+    }
+    $script:CohortEntryCreatedRefs = @($remaining)
+}
+
 function New-CohortEntryFixture {
     <#
     .SYNOPSIS
@@ -433,8 +551,7 @@ function New-CohortEntryFixture {
     if ($state.RealToolkitRoot) {
         $toolkit = [string]$state.RealToolkitRoot
         $toolkitHead = ([string](& git -C $toolkit rev-parse HEAD)).Trim()
-        $branch = ([string](& git -C $toolkit rev-parse --abbrev-ref HEAD)).Trim()
-        $toolkitRef = "refs/heads/$branch"
+        $toolkitRef = Get-CohortEntryToolkitRef -ToolkitRoot $toolkit -Head $toolkitHead
     }
     else {
         $toolkit = Join-Path $Sandbox 'toolkit'
@@ -474,7 +591,8 @@ function New-CohortEntryFixture {
             $harnessTarget = Join-Path $toolkit 'src/DevPilot.AgentHarness'
             [void](New-Item -ItemType Directory -Force -Path $harnessTarget)
             Copy-Item -Path (Join-Path $harnessSource '*') -Destination $harnessTarget -Recurse -Force
-            foreach ($module in @('QualificationPreflight.ps1', 'ReplayQualification.ps1', 'ModelStartCensus.ps1')) {
+            foreach ($module in @('QualificationPreflight.ps1', 'ReplayQualification.ps1', 'ModelStartCensus.ps1',
+                    'ModelStartCensusManifest.ps1', 'ReviewerBaseContract.ps1')) {
                 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "../src/Agents/reviewer/$module") `
                     -Destination (Join-Path $toolkit "src/Agents/reviewer/$module") -Force
             }
@@ -2086,6 +2204,144 @@ try {
 }
 finally { Remove-CohortEntrySandbox -Path $dirtySandbox }
 
+# A hosted pull_request run checks out a MERGE COMMIT, not a branch, so the
+# checkout is detached. Two separate defects met there and only there: the
+# fixture pinned 'refs/heads/HEAD', which resolves nowhere, and the builder read
+# git's empty answer with a direct [string] cast - which yields $null for a
+# command that wrote nothing - so the ref that did not resolve crashed with a
+# null-reference instead of raising the catalogued CE201. The suite passed on
+# every attached developer checkout and failed on every hosted one.
+Write-Host 'sabotage: a detached checkout and a ref that resolves nowhere' -ForegroundColor Cyan
+$detachedSandbox = New-CohortEntrySandbox -Name 'detached'
+try {
+    $detachedFixture = New-CohortEntryFixture -Sandbox $detachedSandbox
+    $detachedToolkit = Join-Path $detachedSandbox 'toolkit'
+    $detachedHead = Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', 'HEAD')
+
+    # The unresolvable ref must be REFUSED, by code, rather than crash.
+    $detachedRequestPath = Join-Path $detachedSandbox 'unresolvable-ref-request.json'
+    $detachedRequest = ([IO.File]::ReadAllText($detachedFixture.RequestPath)) | ConvertFrom-Json -Depth 32
+    $detachedRequest.toolkit.requiredRef = 'refs/heads/HEAD'
+    [IO.File]::WriteAllBytes($detachedRequestPath,
+        $script:Utf8.GetBytes([string]($detachedRequest | ConvertTo-Json -Depth 32 -Compress)))
+    $unresolvableCode = Get-CohortEntryRefusalCode -Action {
+        New-ReviewerCohortEntryEvidence -RequestPath $detachedRequestPath -PreparationOnly
+    }
+    Assert-CohortEntry -Name 'a required ref that resolves nowhere refuses CE201 rather than crashing' `
+        -Condition ($unresolvableCode -ceq 'CE201')
+
+    # And the ref this suite derives has to resolve on a detached checkout, which
+    # is the state every hosted run is in.
+    & git -C $detachedToolkit checkout --quiet --detach $detachedHead 2>&1 | Out-Null
+    $abbrev = Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', '--abbrev-ref', 'HEAD')
+    Assert-CohortEntry -Name 'the fixture toolkit really is detached' -Condition ($abbrev -ceq 'HEAD')
+    $detachedBuildCode = Get-CohortEntryRefusalCode -Action {
+        New-ReviewerCohortEntryEvidence -RequestPath $detachedFixture.RequestPath -PreparationOnly
+    }
+    Assert-CohortEntry -Name 'a build against a detached toolkit is not refused' `
+        -Condition ($detachedBuildCode -ceq '')
+    $derivedRef = Get-CohortEntryToolkitRef -ToolkitRoot $detachedToolkit -Head $detachedHead
+    $derivedCommit = Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', '--verify', '--quiet',
+        "$derivedRef^{commit}")
+    Assert-CohortEntry -Name 'the ref derived for a detached checkout resolves to its head' `
+        -Condition ($derivedCommit -ceq $detachedHead)
+    Assert-CohortEntry -Name 'the ref derived for a detached checkout is never refs/heads/HEAD' `
+        -Condition ($derivedRef -cne 'refs/heads/HEAD')
+
+    # The runner's case exactly: a commit no ref points at, because the merge
+    # commit it checks out exists only in its own clone.
+    & git -C $detachedToolkit commit --quiet --allow-empty -m 'detached tip' 2>&1 | Out-Null
+    $tip = Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', 'HEAD')
+    # A ref another worktree or a concurrent run already holds is not this
+    # fixture's to take. The squatter sits on the name a fixed-name fixture
+    # would have used, pointing at a DIFFERENT commit, and is planted BEFORE the
+    # derivation below so the derivation actually has to route around an
+    # occupied name - a squatter planted afterwards would leave that property
+    # untested and survive cleanup even under the fixed-name code.
+    $squatter = 'refs/cohort-entry-fixture/head'
+    & git -C $detachedToolkit update-ref $squatter $detachedHead 2>&1 | Out-Null
+    $tipRef = Get-CohortEntryToolkitRef -ToolkitRoot $detachedToolkit -Head $tip
+    $tipCommit = Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', '--verify', '--quiet',
+        "$tipRef^{commit}")
+    Assert-CohortEntry -Name 'a head no ref points at still derives a ref that resolves to it' `
+        -Condition ($tipCommit -ceq $tip -and $tip -cne $detachedHead)
+
+    # Resolving is not the property that matters: the derived ref has to be a
+    # value a REQUEST can carry. 'HEAD' resolves and is refused as malformed, so
+    # the only assertion that covers the runner's case is a build pinned to it.
+    $tipRequestPath = Join-Path $detachedSandbox 'derived-ref-request.json'
+    $tipRequest = ([IO.File]::ReadAllText($detachedFixture.RequestPath)) | ConvertFrom-Json -Depth 32
+    $tipRequest.toolkit.requiredRef = $tipRef
+    $tipRequest.toolkit.head = $tip
+    # A fresh output root: the build above already populated the fixture's, and a
+    # destination that already holds evidence is refused on its own terms (CE500),
+    # which would mask whatever this case is actually asking about.
+    $tipRequest.output.root = Join-Path $detachedSandbox 'private/derived-ref-entry'
+    [IO.File]::WriteAllBytes($tipRequestPath,
+        $script:Utf8.GetBytes([string]($tipRequest | ConvertTo-Json -Depth 32 -Compress)))
+    $tipBuildCode = Get-CohortEntryRefusalCode -Action {
+        New-ReviewerCohortEntryEvidence -RequestPath $tipRequestPath -PreparationOnly
+    }
+    Assert-CohortEntry -Name "a request pinned to the derived ref is accepted, not refused as malformed (observed '$tipBuildCode')" `
+        -Condition ($tipBuildCode -ceq '')
+    # A delete that does not take keeps its record. The ref is moved out from
+    # under the fixture here - exactly what a concurrent holder would do - so the
+    # value-checked delete refuses it. A cleanup that cleared its records anyway
+    # would leave that ref sitting in a repository the fixture did not make, with
+    # nothing left to retry it or name it.
+    & git -C $detachedToolkit update-ref $tipRef $detachedHead 2>&1 | Out-Null
+    Remove-CohortEntryCreatedRef
+    Assert-CohortEntry -Name 'a ref moved out from under the fixture is neither deleted nor forgotten' `
+        -Condition (@($script:CohortEntryCreatedRefs).Count -eq 1 -and
+            (Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', '--verify', '--quiet',
+                "$tipRef^{commit}")) -ceq $detachedHead)
+    # Put it back at the value the fixture recorded, so the cleanup below is the
+    # one actually under test rather than a second refusal.
+    & git -C $detachedToolkit update-ref $tipRef $tip 2>&1 | Out-Null
+
+    # Moved to a NON-COMMIT object. The value-checked delete still refuses, and a
+    # cleanup that read absence from '<ref>^{commit}' would see nothing there and
+    # forget the record while the ref went on pinning that object forever.
+    $tipTree = Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', 'HEAD^{tree}')
+    & git -C $detachedToolkit update-ref $tipRef $tipTree 2>&1 | Out-Null
+    $tipTreeHeld = Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', '--verify', '--quiet',
+        $tipRef)
+    Assert-CohortEntry -Name 'a fixture ref can be pointed at a non-commit object at all' `
+        -Condition ($tipTreeHeld -ceq $tipTree -and $tipTree -cne $tip)
+    Remove-CohortEntryCreatedRef
+    Assert-CohortEntry -Name 'a ref moved to a non-commit object is neither deleted nor forgotten' `
+        -Condition (@($script:CohortEntryCreatedRefs).Count -eq 1 -and
+            (Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', '--verify', '--quiet',
+                $tipRef)) -ceq $tipTree)
+    & git -C $detachedToolkit update-ref $tipRef $tip 2>&1 | Out-Null
+
+    # Nothing this fixture created in a repository it did not make is left
+    # behind - a ref in a worktree lands in the shared common store and holds
+    # its commit against gc forever. Removed here rather than at the end of the
+    # suite, so a case that throws still cleans up after itself.
+    #
+    # The name is unique per call and the creation states an all-zero old value,
+    # so the occupied name planted above is never overwritten - and the cleanup,
+    # which can only check the value it wrote, can never delete a ref it did not
+    # create.
+    Assert-CohortEntry -Name 'the derived ref takes a name of its own rather than a shared one' `
+        -Condition ($tipRef -cne $squatter -and $tipRef -cmatch '^refs/cohort-entry-fixture/[0-9a-f]{32}$')
+    $createdBefore = @($script:CohortEntryCreatedRefs).Count
+    Remove-CohortEntryCreatedRef
+    Assert-CohortEntry -Name 'the fixture created a ref for the head no ref pointed at' -Condition ($createdBefore -ge 1)
+    $tipAfterRemoval = Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', '--verify', '--quiet',
+        "$tipRef^{commit}")
+    Assert-CohortEntry -Name 'the ref the fixture created is taken back, leaving the repository as it was' `
+        -Condition ($tipAfterRemoval -ceq '' -and @($script:CohortEntryCreatedRefs).Count -eq 0)
+    Assert-CohortEntry -Name 'a ref the fixture did not create survives its cleanup' `
+        -Condition ((Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', '--verify', '--quiet',
+                "$squatter^{commit}")) -ceq $detachedHead)
+    Assert-CohortEntry -Name 'taking the ref back leaves the commit itself alone' `
+        -Condition ((Get-CohortEntryGitLine -Arguments @('-C', $detachedToolkit, 'rev-parse', '--verify', '--quiet',
+                "$tip^{commit}")) -ceq $tip)
+}
+finally { Remove-CohortEntryCreatedRef; Remove-CohortEntrySandbox -Path $detachedSandbox }
+
 Invoke-CohortEntryCase -Name 'a RAW repository body with a flat project' -ExpectedCode 'CE203' -Mutate {
     param($state)
     $state.RepositoryBody = [ordered]@{
@@ -3110,8 +3366,22 @@ try {
     $firstBound = [IO.File]::ReadAllText((Join-Path $firstResult.Root 'entry/model-start-bound.json')) | ConvertFrom-Json -Depth 32
     Assert-CohortEntry -Name 'a preparation-only entry derives a bound of zero real model starts' `
         -Condition (([int]$firstBound.maxRealModelStarts -eq 0) -and ([int]$firstBound.declaredSlotCount -eq 0))
-    Assert-CohortEntry -Name 'a preparation-only entry still estimates the runs it plans' `
-        -Condition ([int]$firstEntry.planEstimate.modelStarts -eq 2)
+    # A preparation-only entry is authorized to start ZERO models and to make
+    # ZERO verifier assignments, and that is exactly what it must publish. It
+    # used to publish PlannedRunCount (2) for both units, which reserved model
+    # spend in the cohort budget for an entry that can spend none - every other
+    # entry then competed against a reservation that could never be drawn on.
+    # The planned runs are real work and are accounted as their own unit.
+    Assert-CohortEntry -Name 'a preparation-only entry publishes the zero model-start budget it is bound to' `
+        -Condition (([int]$firstEntry.planEstimate.modelStarts -eq 0) -and
+            ([int]$firstEntry.planEstimate.modelStarts -eq [int]$firstBound.maxRealModelStarts))
+    Assert-CohortEntry -Name 'a preparation-only entry publishes the zero verifier-assignment budget it is bound to' `
+        -Condition (([int]$firstEntry.planEstimate.verifierAssignments -eq 0) -and
+            ([int]$firstEntry.planEstimate.verifierAssignments -eq [int]$firstBound.maxVerifierAssignments))
+    Assert-CohortEntry -Name 'a preparation-only entry accounts its planned runs as preparation, not as model starts' `
+        -Condition ([int]$firstResult.PreparationRunCount -eq 2)
+    Assert-CohortEntry -Name 'a preparation-only entry still declares the wall clock its preparation occupies' `
+        -Condition ([int]$firstEntry.planEstimate.wallClockSeconds -gt 0)
 
     $supplied = Join-Path $underSandbox 'supplied.json'
     # Read the bytes out rather than copying the file: a published package is
@@ -3483,13 +3753,23 @@ if ($IncludePreflight) {
                     -Condition ($walkTampered -match "model start bound")
             }
         }
-        finally { if (-not $KeepSandbox) { Remove-CohortEntrySandbox -Path $sandbox } else { Write-Host "sandbox kept: $sandbox" } }
+        finally {
+            Remove-CohortEntryCreatedRef
+            if (-not $KeepSandbox) { Remove-CohortEntrySandbox -Path $sandbox } else { Write-Host "sandbox kept: $sandbox" }
+        }
     }
 
     Write-Host "preflight: $PreflightTarget with zero models" -ForegroundColor Cyan
     $realToolkit = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     Invoke-CohortEntryPreflightVariant -Label 'v1' -RealToolkitRoot $realToolkit
     Invoke-CohortEntryPreflightVariant -Label 'v2' -RealToolkitRoot $realToolkit -WithExecutionPlan
+    # The suite runs against the real checkout here, and on a detached one - every
+    # hosted run - the fixture has to create a ref to pin. It does not get to keep
+    # it: in a worktree that ref is visible to every sibling worktree and holds the
+    # commit against gc, which is a fixture editing the repository it is testing.
+    Assert-CohortEntry -Name 'the preflight leaves no fixture ref behind in the real checkout' `
+        -Condition ((Get-CohortEntryGitLine -Arguments @('-C', $realToolkit, 'for-each-ref',
+                '--format=%(refname)', 'refs/cohort-entry-fixture')) -ceq '')
 
     # ------------------------------------------------------------------
     # The whole claim, in one run: a slots-carrying build that DECLARES its
@@ -3600,7 +3880,13 @@ if ($IncludePreflight) {
                 -Condition ($readyWalk -match 'modelStarts=0' -and $readyWalk -notmatch 'modelStarts=[1-9]')
         }
     }
-    finally { if (-not $KeepSandbox) { Remove-CohortEntrySandbox -Path $readySandbox } else { Write-Host "sandbox kept: $readySandbox" } }
+    finally {
+        Remove-CohortEntryCreatedRef
+        if (-not $KeepSandbox) { Remove-CohortEntrySandbox -Path $readySandbox } else { Write-Host "sandbox kept: $readySandbox" }
+    }
+    Assert-CohortEntry -Name 'the cohort-ready proof leaves no fixture ref behind in the real checkout' `
+        -Condition ((Get-CohortEntryGitLine -Arguments @('-C', $realToolkit, 'for-each-ref',
+                '--format=%(refname)', 'refs/cohort-entry-fixture')) -ceq '')
 }
 
 # -------------------------------------------------------------------------

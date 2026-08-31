@@ -2092,7 +2092,7 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
 
     try {
         foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue',
-            'Invoke-ReviewerModelSubprocess', 'Invoke-ReviewerModelPass',
+            'New-ReviewerModelPassResult', 'Invoke-ReviewerModelSubprocess', 'Invoke-ReviewerModelPass',
             'ConvertTo-ReviewerBoundMarkerFromEnvelope', 'New-ReviewerResponsePassEnvelope',
             'Test-ReviewerMarkerMatchesResponsePayload', 'Add-ReviewerBoundMarkerProvenance') {
             Invoke-Expression (Get-FunctionText -Text $wrapperText -Name $fn)
@@ -2265,8 +2265,22 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     Assert-Specialist (-not (Test-ReviewerModelResponseEligible `
                 -AuthTier ([string]$evidenceRes.ResponseEnvelope.authTier))) `
         "An evidenceOnly envelope was granted the right to vote."
+    # The census entry point requires the caller to state which attempt it is
+    # asking for, so a sealed envelope from another attempt cannot be counted in
+    # this one's place. The attempt id is REBUILT here from wrapper state - the
+    # pass coordinates, the reserved retry ordinal and the pinned nonce - so a
+    # wrapper that stopped deriving it that way is caught rather than believed.
+    [int]$evidenceOrdinal = [int]$evidenceRes.ResponseEnvelope.run.attemptIndex
+    $expectedEvidenceAttemptId = "pr42-cycle1-pass1-attempt$evidenceOrdinal-$($script:knownNonce)"
+    Assert-Specialist ($evidenceOrdinal -ge 1 -and
+        [string]$evidenceRes.ResponseEnvelope.run.attemptId -ceq $expectedEvidenceAttemptId) `
+        "The sealed attempt id was not derived from the pass coordinates, the retry ordinal and the wrapper's own nonce."
     $censusRecord = Get-ReviewerModelResponseCensusRecord -Envelope $evidenceRes.ResponseEnvelope `
-        -RunKey ([byte[]](1..32))
+        -RunKey ([byte[]](1..32)) `
+        -ExpectedRunId ([string]$script:ReviewerRunId) `
+        -ExpectedAttemptId $expectedEvidenceAttemptId `
+        -ExpectedNonce ([string]$script:knownNonce) -ExpectedPrId 42 `
+        -ExpectedSourceCommit $sourceCommit
     Assert-Specialist ([bool]$censusRecord.counted -and -not [bool]$censusRecord.eligible -and
         [string]$censusRecord.authTier -ceq 'evidenceOnly' -and [int]$censusRecord.prId -eq 42) `
         "An evidenceOnly envelope was dropped from the census, which is the exact loss this contract exists to stop."
@@ -2299,7 +2313,29 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
         [string]$v2WrongCommit.RejectionClass -cne 'evidenceOnly') `
         "A v2 payload bound to another commit was allowed to survive as evidence or to produce a marker."
 
-    Assert-Specialist ($script:timedProcessCallCount -eq 6) `
+    # (10) RETRY ORDINAL. Two attempts of the SAME pass are two different attempts.
+    # The pass number identifies which reviewer of the pass set ran, and every
+    # retry of that reviewer repeats it; sealing it as run.attemptIndex made a
+    # retry indistinguishable from the attempt it replaced, so a consumer keyed
+    # on (runId, attemptIndex) would treat the second attempt as a replay of the
+    # first - or keep the superseded envelope. The ordinal must advance while the
+    # pass number stays put.
+    $script:cannedStdOut = & $newV2Transcript "REVIEWER_NONCE_V2: $($script:knownNonce)`nREVIEWER_PAYLOAD_V2: $v2Payload"
+    Write-Host "[SIMULATED/OFFLINE CASE: v2 retry ordinal] The following production launch text is exercised with canned output only." -ForegroundColor DarkCyan
+    $v2Retry = Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Assert-Specialist ($null -ne $v2Retry.ResponseEnvelope -and $null -ne $v2Res.ResponseEnvelope) `
+        "The retry-ordinal case did not produce the two sealed envelopes it compares."
+    Assert-Specialist ([int]$v2Retry.ResponseEnvelope.run.attemptIndex -gt
+        [int]$v2Res.ResponseEnvelope.run.attemptIndex) `
+        ("A retry of the same pass sealed the same run.attemptIndex " +
+        "($([int]$v2Res.ResponseEnvelope.run.attemptIndex)) as the attempt it replaced, so the pass number - " +
+        "not the retry ordinal - is being recorded as the attempt index.")
+    Assert-Specialist ([string]$v2Retry.ResponseEnvelope.run.attemptId -cne
+        [string]$v2Res.ResponseEnvelope.run.attemptId) `
+        ("Two attempts of the same pass shared one attemptId. The harness pins the nonce, which is exactly the " +
+        "point: attempt identity must come from the reserved ordinal, not from hoping the nonce differs.")
+
+    Assert-Specialist ($script:timedProcessCallCount -eq 7) `
         "The v2 contract cases did not make exactly one stub call each."
     Assert-Specialist (@($script:timedProcessCalls | Where-Object {
                 [string]$_.FilePath -cne $sentinelAgencyPath -or [int]$_.ProcessId -ne 0 -or -not [bool]$_.Simulated
@@ -2319,7 +2355,7 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     Write-Host "[SIMULATED/OFFLINE CASE: contract gate] No process-stub call is permitted." -ForegroundColor DarkCyan
     try { Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1 | Out-Null }
     catch { $gateBlocked = $true }
-    Assert-Specialist ($gateBlocked -and $script:timedProcessCallCount -eq 6) `
+    Assert-Specialist ($gateBlocked -and $script:timedProcessCallCount -eq 7) `
         "An un-fittable generalist result contract still reached Invoke-TimedProcess instead of refusing to launch."
 
         # Deliberately remove the interception boundary once. The production
@@ -2337,7 +2373,7 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
         $nativeLaunchError = if ($null -ne $sabotageError) {
             $sabotageError.Exception.GetBaseException()
         } else { $null }
-        Assert-Specialist ($sabotageBlocked -and $script:timedProcessCallCount -eq 6 -and
+        Assert-Specialist ($sabotageBlocked -and $script:timedProcessCallCount -eq 7 -and
             $nativeLaunchError -is [System.ComponentModel.Win32Exception] -and
             [int]$nativeLaunchError.NativeErrorCode -eq 2) `
             "Removing the local process stub did not fail closed on the nonexistent sentinel executable."

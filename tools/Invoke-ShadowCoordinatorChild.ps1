@@ -25,11 +25,16 @@
     refuses.
 
 .EXAMPLE
-    ./tools/Invoke-ShadowCoordinatorChild.ps1 -RequestPath <request>.json
+    ./tools/Invoke-ShadowCoordinatorChild.ps1 -RequestPath <request>.json `
+        -ExpectedRequestSha256 <sha256> -ExpectedResultPath <result>.json `
+        -ExpectedToolkitRoot <toolkit-root>
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string]$RequestPath
+    [Parameter(Mandatory)][string]$RequestPath,
+    [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}\z')][string]$ExpectedRequestSha256,
+    [Parameter(Mandatory)][string]$ExpectedResultPath,
+    [Parameter(Mandatory)][string]$ExpectedToolkitRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,6 +59,116 @@ $script:ShadowDeliveryPreviewOnlyKind = 'PreviewOnly'
 # what the gate library's binding means by an absent dependency.
 $script:ShadowDeliveryAbsentDigest = '0' * 64
 $script:ShadowChildUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+
+function ConvertTo-ShadowCanonicalScalarText {
+    <#
+    .SYNOPSIS
+        Escapes one string exactly as the coordinator's C# CanonicalJson.WriteString
+        does, so a digest recomputed here is byte-identical to the one it computed.
+    .DESCRIPTION
+        The short escapes for backspace, form feed, newline, carriage return and
+        tab matter: the coordinator writes '\n' where a naive escaper would write
+        '\u000a', and a digest taken over the wrong one would reject every request
+        that happened to carry one. Characters below 32 or exactly 127 that are not
+        one of those five are written as '\uXXXX'; everything from 32 up (including
+        every character at or above 128) is passed through unchanged.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    foreach ($character in $Text.ToCharArray()) {
+        $code = [int]$character
+        switch ($code) {
+            34 { [void]$builder.Append('\"'); continue }
+            92 { [void]$builder.Append('\\'); continue }
+            8 { [void]$builder.Append('\b'); continue }
+            12 { [void]$builder.Append('\f'); continue }
+            10 { [void]$builder.Append('\n'); continue }
+            13 { [void]$builder.Append('\r'); continue }
+            9 { [void]$builder.Append('\t'); continue }
+            default {
+                if ($code -lt 32 -or $code -eq 127) {
+                    [void]$builder.Append('\u' + $code.ToString('x4'))
+                } else {
+                    [void]$builder.Append($character)
+                }
+            }
+        }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function ConvertTo-ShadowCanonicalText {
+    <#
+    .SYNOPSIS
+        The coordinator's own canonical form: object keys sorted ordinally, no
+        whitespace, integers unquoted, booleans and null bare. Matches the C#
+        CanonicalJson.Canonical the child request's digest is taken over.
+    #>
+    param([Parameter(Mandatory)][AllowNull()]$Value)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [string]) { return (ConvertTo-ShadowCanonicalScalarText -Text $Value) }
+    if ($Value -is [bool]) { if ($Value) { return 'true' } else { return 'false' } }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [sbyte] -or $Value -is [uint16] -or $Value -is [uint32]) {
+        return ([long]$Value).ToString([Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [decimal]) {
+        # The coordinator records only integers; a fractional number is not one it
+        # wrote. Accept an integral decimal, refuse a fractional one.
+        if ([decimal]::Truncate($Value) -ne $Value) {
+            throw "The child request holds the non-integer number '$Value'."
+        }
+        return ([long]$Value).ToString([Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $names = [System.Collections.Generic.List[string]]::new()
+        foreach ($property in $Value.PSObject.Properties) { [void]$names.Add([string]$property.Name) }
+        $names.Sort([StringComparer]::Ordinal)
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($name in $names) {
+            [void]$parts.Add((ConvertTo-ShadowCanonicalScalarText -Text $name) + ':' + (ConvertTo-ShadowCanonicalText -Value $Value.$name))
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $names = [System.Collections.Generic.List[string]]::new()
+        foreach ($key in $Value.Keys) { [void]$names.Add([string]$key) }
+        $names.Sort([StringComparer]::Ordinal)
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($name in $names) {
+            [void]$parts.Add((ConvertTo-ShadowCanonicalScalarText -Text $name) + ':' + (ConvertTo-ShadowCanonicalText -Value $Value[$name]))
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = [System.Collections.Generic.List[string]]::new()
+        foreach ($item in $Value) { [void]$items.Add((ConvertTo-ShadowCanonicalText -Value $item)) }
+        return '[' + ($items -join ',') + ']'
+    }
+    throw "The child cannot canonicalize a value of type $($Value.GetType().FullName)."
+}
+
+function Get-ShadowChildRequestDigest {
+    <#
+    .SYNOPSIS
+        Recomputes childRequestSha256 over the request as read, minus that field.
+    .DESCRIPTION
+        The coordinator computes the digest over the child request BEFORE it adds
+        childRequestSha256, then adds the field and writes the file. To reproduce
+        the digest the child drops that one field and canonicalizes the rest.
+    #>
+    param([Parameter(Mandatory)][psobject]$Request)
+    $subject = [ordered]@{}
+    foreach ($property in $Request.PSObject.Properties) {
+        if ($property.Name -ceq 'childRequestSha256') { continue }
+        $subject[$property.Name] = $property.Value
+    }
+    $canonical = ConvertTo-ShadowCanonicalText -Value ([pscustomobject]$subject)
+    [byte[]]$encoded = $script:ShadowChildUtf8.GetBytes($canonical)
+    [byte[]]$hash = [System.Security.Cryptography.SHA256]::HashData($encoded)
+    return ([BitConverter]::ToString($hash)).Replace('-', '').ToLowerInvariant()
+}
 
 function Read-ShadowChildRequest {
     param([Parameter(Mandatory)][string]$Path)
@@ -80,7 +195,55 @@ function Read-ShadowChildRequest {
     if ([string]$request.contractVersion -cne $script:ShadowChildRequestContract) {
         throw "The child request '$Path' declares contract '$($request.contractVersion)'."
     }
+    # Recomputed, not trusted. The digest handed to this child is worthless as an
+    # integrity check if the child merely echoes it: a request whose fields were
+    # altered after it was written would be obeyed and then have its stale digest
+    # copied into the result, binding a result to work that was never asked for.
+    # So the child recomputes the canonical digest over the request it actually
+    # read and refuses when it disagrees with the one supplied.
+    $supplied = [string]$request.childRequestSha256
+    if ($supplied -cnotmatch '^[0-9a-f]{64}$') {
+        throw "The child request '$Path' carries a malformed childRequestSha256 '$supplied'."
+    }
+    $computed = Get-ShadowChildRequestDigest -Request $request
+    if ($computed -cne $supplied) {
+        throw ("The child request '$Path' failed its integrity check: the supplied childRequestSha256 " +
+            "'$supplied' does not match '$computed' recomputed over the request as read. The request was " +
+            "altered after it was written, or is not one this coordinator produced.")
+    }
     return $request
+}
+
+function ConvertFrom-ShadowImmutableJsonBytes {
+    <#
+    .SYNOPSIS
+        Parses a JSON object out of a byte buffer already read from disk, so a
+        caller can hash and parse the SAME bytes rather than reading the file twice.
+    .DESCRIPTION
+        Finding F12: an immutable record parsed in one read and hashed in a
+        separate read can have its recorded digest describe bytes that were never
+        parsed, if the file is replaced between the two reads. Feeding a single
+        in-memory buffer to both the parser and the hash closes that gap - the
+        digest then describes exactly the content of record. The UTF-8 and BOM
+        hygiene mirrors Read-ShadowChildRequest so the two readers refuse the same
+        malformed input.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes,
+        [Parameter(Mandatory)][string]$Path
+    )
+    if ($Bytes.Length -eq 0) { throw "The evidence at '$Path' is empty." }
+    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
+        throw "The evidence at '$Path' begins with a byte-order mark; the contract is UTF-8 with no BOM."
+    }
+    try { $text = $script:ShadowChildUtf8.GetString($Bytes) }
+    catch { throw "The evidence at '$Path' is not strict UTF-8." }
+    try { $parsed = $text | ConvertFrom-Json -Depth 64 -ErrorAction Stop }
+    catch { throw "The evidence at '$Path' is not valid JSON." }
+    if ($parsed -isnot [System.Management.Automation.PSCustomObject]) {
+        throw "The evidence at '$Path' is not a JSON object."
+    }
+    return $parsed
 }
 
 function Get-ShadowChildField {
@@ -748,6 +911,192 @@ function Invoke-ShadowChildSlotPlan {
     }
 }
 
+function Get-ShadowChildRunExecutionNoncePath {
+    <#
+    .SYNOPSIS
+        Where this adapter keeps the execution nonce it minted for one slot.
+    .DESCRIPTION
+        IN THE COORDINATOR'S OWN EXCHANGE DIRECTORY, NOT THE AUDITED TREE. The
+        reviewer is handed -QualificationRoot, -StateDir and -ReplayRoot; the
+        exchange directory the coordinator writes its request and result files
+        into is not handed to it at all. That directory is the parent of this
+        adapter's own -RequestPath, which both the run step and the verify step of
+        a slot receive, because the coordinator places every step's exchange file
+        in one root.
+
+        NOT HANDED A PATH IS NOT THE SAME AS UNREACHABLE, and this file is not the
+        authority. Two independent reviews of the previous revision demonstrated
+        the difference: the exchange root is a fixed sibling of the qualification
+        root under one output root, so a run that wants to escape the strong
+        witness can COMPUTE this path even though nothing gave it to it, and
+        rewriting the record is strictly more powerful than deleting it. The
+        identity of record therefore travels through the coordinator's signed
+        state - minted here, returned in the run step's result, committed with the
+        slotNTerminalObserved transition, and handed back to the verify step as
+        expectedRunExecutionId. This file remains so that the two separate
+        adapter processes can hand the value to the reviewed tool at all, and the
+        verify step requires it to still agree with what the coordinator holds, so
+        a rewrite is now a detected tamper rather than a substitution.
+
+        A subdirectory rather than a file beside the exchange files, so that every
+        inventory taken over the exchange root - all of which are file-filtered on
+        the coordinator's own stems - continues to see exactly what it saw before.
+
+        Keyed by set and slot because slot-run and slot-verify are separate
+        invocations of this adapter, in separate processes: nothing is carried
+        between them in memory, and the nonce has to be found again by the same
+        rule that wrote it. Set and slot are SEPARATE PATH SEGMENTS rather than
+        one hyphen-joined stem: joined, set 'a' slot 'b-slot1' and set 'a-b' slot
+        'slot1' name the same file, and an encoding two different identities can
+        collide in is not an identity.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$CustodyRoot,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SetId,
+        [Parameter(Mandatory)][string]$SlotName
+    )
+    foreach ($component in @(@{ Value = $SetId; What = "set '$SetId'" },
+            @{ Value = $SlotName; What = "slot '$SlotName'" })) {
+        if ([string]$component.Value -cnotmatch '^[A-Za-z0-9._-]+\z') {
+            throw ("The run-execution expectation for slot '$SlotName' cannot be named from $($component.What): a " +
+                'set or slot name that is not a plain identifier is refused rather than resolved into a path of ' +
+                'its choosing.')
+        }
+    }
+    return (Join-Path (Join-Path (Join-Path $CustodyRoot 'run-execution') $SetId) ("$SlotName.json"))
+}
+
+function Write-ShadowChildRunExecutionExpectation {
+    <#
+    .SYNOPSIS
+        Records, where a slot's separate verify process can find it, the execution
+        identity the coordinator minted for that slot.
+    .DESCRIPTION
+        MINTED BY THE COORDINATOR, NOT HERE. The value arrives in the run step's
+        child request, so neither this adapter nor the reviewed run it starts
+        chooses it, and the coordinator requires the run result to echo exactly it.
+        The reviewer adopts it and seals it into its accounting manifest, so the
+        verify step can later demand that the evidence under the run root names
+        THIS execution. Without it, a whole self-consistent evidence set kept from
+        an earlier, cheaper execution in the same re-used run root audits clean,
+        because every artifact in it agrees with every other - they were written
+        together.
+
+        The file written here is how the value crosses from this process to the
+        separate verify process of a slot; it is not the authority for it. The
+        authority is the coordinator's committed state, which hands the same value
+        back to the verify step. See Get-ShadowChildRunExecutionNoncePath for why
+        that distinction is the whole point.
+
+        CreateNew, so a slot that somehow reached this line twice fails rather
+        than overwriting the expectation the first attempt is being audited
+        against.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$CustodyRoot,
+        [Parameter(Mandatory)][string]$SlotName,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SetId,
+        [Parameter(Mandatory)][string]$RunExecutionId
+    )
+    if ([string]$RunExecutionId -cnotmatch '^[0-9a-f]{32}\z') {
+        throw ("The coordinator supplied run execution identity '$RunExecutionId', which is not 32 lowercase hex " +
+            'characters. A slot is not run under an identity its own evidence could not be bound to.')
+    }
+    $path = Get-ShadowChildRunExecutionNoncePath -CustodyRoot $CustodyRoot -SetId $SetId -SlotName $SlotName
+    $runExecutionId = [string]$RunExecutionId
+    [void](New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path))
+    $stream = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        [string]$recordJson = ConvertTo-Json -InputObject ([ordered]@{
+                kind = 'shadow.child.run-execution.v1'
+                slot = [string]$SlotName
+                setId = [string]$SetId
+                runExecutionId = $runExecutionId
+            }) -Depth 6 -Compress
+        [byte[]]$bytes = ([Text.UTF8Encoding]::new($false)).GetBytes($recordJson)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+    return $runExecutionId
+}
+
+function Read-ShadowChildRunExecutionExpectation {
+    <#
+    .SYNOPSIS
+        The execution identity the run step told this slot's reviewer to be.
+    .DESCRIPTION
+        THE COORDINATOR'S COPY DECIDES; THIS FILE ONLY HAS TO AGREE. The identity
+        of record is -CommittedRunExecutionId, which reached this step through the
+        coordinator's signed state rather than through the filesystem the audited
+        run shares. The on-disk expectation is still read and still has to match,
+        because a mismatch is evidence that something rewrote it, and evidence of
+        tampering is worth more than the byte it costs to check.
+
+        ABSENCE IS A REFUSAL, NOT A DOWNGRADE. Every slot this adapter launches is
+        minted an expectation before the tool starts, so a slot being verified by
+        this adapter and having no expectation is a fact about the expectation,
+        not about the run: either it was removed, or the run was launched by
+        something that is not this adapter. Returning an empty identity there
+        would select the weaker record-corroborated witness, and the weaker
+        witness accepts exactly the self-consistent replayed evidence set the
+        expectation exists to catch. Missing, unreadable, wrong-slot, wrong-set,
+        malformed and disagreeing-with-the-coordinator all refuse.
+
+        -AllowMissing exists for callers that are deliberately auditing a tree no
+        run step of this adapter ever launched. It is not used on the supervised
+        path, and it is the only way to call this without a committed identity.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$CustodyRoot,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SetId,
+        [Parameter(Mandatory)][string]$SlotName,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$CommittedRunExecutionId,
+        [switch]$AllowMissing
+    )
+    if (-not $AllowMissing -and [string]$CommittedRunExecutionId -cnotmatch '^[0-9a-f]{32}\z') {
+        throw ("Slot '$SlotName' was verified without the run-execution identity the coordinator committed for it. " +
+            'The identity of record travels through the coordinator state, not through the tree the audited run ' +
+            'shares, so a verify step that was handed none refuses rather than trusting the copy on disk.')
+    }
+    $path = Get-ShadowChildRunExecutionNoncePath -CustodyRoot $CustodyRoot -SetId $SetId -SlotName $SlotName
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        if ($AllowMissing) { return '' }
+        throw ("Slot '$SlotName' has no run-execution expectation at '$path'. Every slot this adapter launches is " +
+            'minted one before the reviewed tool starts, so a missing expectation is refused rather than audited ' +
+            'under the weaker record-corroborated witness alone.')
+    }
+    $record = $null
+    try { $record = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json -Depth 8 }
+    catch {
+        throw ("The run-execution expectation for slot '$SlotName' at '$path' could not be read: " +
+            "$($_.Exception.Message) A slot whose expectation exists but cannot be read is refused rather than " +
+            'audited against no expectation at all.')
+    }
+    if ($null -eq $record -or -not $record.PSObject.Properties['slot'] -or
+        -not $record.PSObject.Properties['setId'] -or
+        -not $record.PSObject.Properties['runExecutionId']) {
+        throw "The run-execution expectation at '$path' is not a run-execution record."
+    }
+    if ([string]$record.slot -cne [string]$SlotName) {
+        throw "The run-execution expectation at '$path' names slot '$([string]$record.slot)', not '$SlotName'."
+    }
+    if ([string]$record.setId -cne [string]$SetId) {
+        throw "The run-execution expectation at '$path' names set '$([string]$record.setId)', not '$SetId'."
+    }
+    if ([string]$record.runExecutionId -cnotmatch '^[0-9a-f]{32}\z') {
+        throw "The run-execution expectation at '$path' does not name a 32-hex execution identity."
+    }
+    if ($CommittedRunExecutionId -and [string]$record.runExecutionId -cne [string]$CommittedRunExecutionId) {
+        throw ("The run-execution expectation at '$path' names execution " +
+            "'$([string]$record.runExecutionId)', and the coordinator committed " +
+            "'$CommittedRunExecutionId' for slot '$SlotName'. The copy on disk disagreeing with the identity the " +
+            'coordinator carried is a rewrite, not a discrepancy to resolve, and it is refused.')
+    }
+    if ($CommittedRunExecutionId) { return [string]$CommittedRunExecutionId }
+    return [string]$record.runExecutionId
+}
+
 function Invoke-ShadowChildSlotRun {
     <#
     .SYNOPSIS
@@ -764,7 +1113,11 @@ function Invoke-ShadowChildSlotRun {
         Loads the reviewed sources at this scope for the reason given on
         Invoke-ShadowChildSlotPlan.
     #>
-    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    param(
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][string]$ToolkitRoot,
+        [Parameter(Mandatory)][string]$CustodyRoot
+    )
     Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
     . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
     . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
@@ -796,12 +1149,35 @@ function Invoke-ShadowChildSlotRun {
         LaunchAuthorizationTokenPath = $context.LaunchTokenPath
     }
 
+    # The expectation this run will be audited against. The identity is the
+    # COORDINATOR'S: it arrives in the request, this step only writes it where its
+    # separate verify process can find it and echoes it back in the result. See
+    # Write-ShadowChildRunExecutionExpectation for why nothing here mints one.
+    $runExecutionId = [string](Get-ShadowChildField -Request $Request -Name 'runExecutionId')
+    [void](Write-ShadowChildRunExecutionExpectation -CustodyRoot $CustodyRoot `
+            -SlotName ([string]$target.Name) -SetId ([string]$context.SetId) -RunExecutionId $runExecutionId)
+
+    # The reviewer signs its census with a key supplied only to this launch, and
+    # verification reproduces it without asking the audited run root which key
+    # should authenticate it.
+    [byte[]]$censusMasterKey = @(Get-ShadowChildCensusMasterKey -Path ([string]$context.RunSetKeyPath) `
+            -SetId ([string]$context.SetId) -SlotName ([string]$target.Name) `
+            -RunExecutionId $runExecutionId)
+
     # Invoked as a child script rather than dot-sourced. The tool ends in `exit`,
     # which dot-sourced would terminate this adapter before it could write its
     # own result file - and a supervised step that leaves no result is exactly
     # the fault the file contract exists to catch.
     $global:LASTEXITCODE = 0
-    & $tool @arguments
+    $previousExecutionId = $env:DEVPILOT_REVIEWER_RUN_EXECUTION_ID
+    $previousCensusMasterKey = $env:DEVPILOT_REVIEWER_CENSUS_MASTER_KEY
+    $env:DEVPILOT_REVIEWER_RUN_EXECUTION_ID = $runExecutionId
+    $env:DEVPILOT_REVIEWER_CENSUS_MASTER_KEY = [Convert]::ToBase64String($censusMasterKey)
+    try { & $tool @arguments }
+    finally {
+        $env:DEVPILOT_REVIEWER_RUN_EXECUTION_ID = $previousExecutionId
+        $env:DEVPILOT_REVIEWER_CENSUS_MASTER_KEY = $previousCensusMasterKey
+    }
     $slotExitCode = if ($null -eq $global:LASTEXITCODE) { -1 } else { [int]$global:LASTEXITCODE }
 
     $terminalPath = Resolve-ReviewerQualificationSlotTerminalPath -RunDirectory $plan.RunDirectory `
@@ -813,6 +1189,10 @@ function Invoke-ShadowChildSlotRun {
         slotName = [string]$target.Name
         setId = $context.SetId
         planDigest = $context.PlanDigest
+        # Echoed, not minted. The coordinator sent this value down in the request
+        # and requires the result to carry exactly it back, so a rewritten result
+        # file is a refusal rather than a substitution.
+        runExecutionId = [string]$runExecutionId
     }
 }
 
@@ -830,7 +1210,11 @@ function Invoke-ShadowChildSlotVerify {
         Loads the reviewed sources at this scope for the reason given on
         Invoke-ShadowChildSlotPlan.
     #>
-    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    param(
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][string]$ToolkitRoot,
+        [Parameter(Mandatory)][string]$CustodyRoot
+    )
     Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
     . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
     . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
@@ -846,7 +1230,21 @@ function Invoke-ShadowChildSlotVerify {
     }
     # Refuses a writable terminal on the caller's behalf, so immutability is
     # asserted by the reviewed reader rather than re-implemented here.
-    $terminal = Read-ReviewerQualificationSlotTerminal -TerminalPath $terminalPath
+    #
+    # Finding F12: the terminal must be parsed and hashed from the SAME bytes. It
+    # is read from disk exactly once below, and that one buffer feeds both the
+    # parse-of-record and the terminalSha256 recorded in the result, so the digest
+    # can no longer describe bytes that were never parsed. The reviewed reader is
+    # still consulted purely for its immutability refusal; its own parse is
+    # discarded so the content of record comes from the single buffer.
+    $terminalSnapshot = Read-ReviewerQualificationSlotTerminal -TerminalPath $terminalPath `
+        -RunSetKeyPath ([string]$context.RunSetKeyPath) `
+        -ExpectedRunExecutionId ([string](Get-ShadowChildField -Request $Request -Name 'expectedRunExecutionId')) `
+        -IncludeSnapshot
+    if ($null -eq $terminalSnapshot) {
+        throw "Slot '$($target.Name)' terminal evidence at '$terminalPath' could not be read."
+    }
+    $terminal = $terminalSnapshot.Terminal
     if ($null -eq $terminal) {
         throw "Slot '$($target.Name)' terminal evidence at '$terminalPath' could not be read."
     }
@@ -864,7 +1262,19 @@ function Invoke-ShadowChildSlotVerify {
 
     $attempts = @(Get-ChildItem -LiteralPath $plan.RunDirectory -Filter 'slot*-attempt.json' `
             -File -ErrorAction SilentlyContinue)
-    $bytes = [IO.File]::ReadAllBytes($terminalPath)
+
+    # The execution the run step told this slot's reviewer to be. The identity of
+    # record arrives in the request, from the coordinator's signed state; the copy
+    # in the exchange directory is read too and has to agree with it. Neither a
+    # deletion nor a rewrite of that copy can change what this step demands, and
+    # both are refusals. There is no unauthenticated fallback.
+    $committedRunExecutionId = [string](Get-ShadowChildField -Request $Request -Name 'expectedRunExecutionId')
+    $expectedRunExecutionId = Read-ShadowChildRunExecutionExpectation -CustodyRoot $CustodyRoot `
+        -SetId ([string]$context.SetId) -SlotName ([string]$target.Name) `
+        -CommittedRunExecutionId $committedRunExecutionId
+    [byte[]]$censusMasterKey = @(Get-ShadowChildCensusMasterKey -Path ([string]$context.RunSetKeyPath) `
+            -SetId ([string]$context.SetId) -SlotName ([string]$target.Name) `
+            -RunExecutionId $expectedRunExecutionId)
 
     # The census of what this slot's run actually started, by role, taken from the
     # run's own published per-attempt evidence. A run that ended 'complete'
@@ -878,7 +1288,17 @@ function Invoke-ShadowChildSlotVerify {
     $censusFault = ''
     if (Test-Path -LiteralPath $runRoot -PathType Container) {
         try {
-            $census = Get-ReviewerModelStartCensus -RunRoot $runRoot -Argv ([string[]]$target.Arguments)
+            # THE EXECUTION THIS SLOT WAS TOLD TO BE. Carried here through the
+            # coordinator's signed state, so an evidence set kept from an
+            # earlier execution in this same re-used run root fails to name it
+            # however self-consistent that set is, and rewriting the copy in the
+            # exchange directory does not move it. The record-corroborated
+            # witness travels alongside as a second opinion; it never stands
+            # alone, because a missing expectation is now a refusal rather than
+            # a downgrade.
+            $census = Get-ReviewerModelStartCensus -RunRoot $runRoot -MasterKey $censusMasterKey `
+                -Argv ([string[]]$target.Arguments) `
+                -ExpectedRunExecutionId $expectedRunExecutionId -CorroborateExecutionFromRecords
         }
         catch {
             # A run that ended cleanly and left evidence this build cannot read is
@@ -945,7 +1365,10 @@ function Invoke-ShadowChildSlotVerify {
     $assignmentFault = ''
     if (Test-Path -LiteralPath $runRoot -PathType Container) {
         try {
-            $assignmentCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $runRoot -Argv ([string[]]$target.Arguments)
+            # Same witnesses as the model-start census above, for the same reason.
+            $assignmentCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $runRoot -MasterKey $censusMasterKey `
+                -Argv ([string[]]$target.Arguments) -ExpectedRunExecutionId $expectedRunExecutionId `
+                -CorroborateExecutionFromRecords
         }
         catch {
             # Same asymmetry as the model-start census above: a run that ended
@@ -990,7 +1413,7 @@ function Invoke-ShadowChildSlotVerify {
         terminalPlanDigest = [string]$terminal.planDigest
         terminalSlot = [string]$terminal.slot
         terminalPath = [string]$terminalPath
-        terminalSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        terminalSha256 = [string]$terminalSnapshot.Sha256
         # Reaching this line means the declaration verified under its key and the
         # published inventory was complete: both are asserted by the shared
         # context builder, which throws rather than returning a false.
@@ -1033,19 +1456,10 @@ function Invoke-ShadowChildSlotVerify {
     }
 }
 
-function Get-ShadowChildReplayDerivedKey {
+function Read-ShadowChildSigningMasterKey {
     <#
     .SYNOPSIS
-        The replay-domain key for one signing key file, so a sealed comparison
-        can be opened rather than merely parsed.
-    .DESCRIPTION
-        The chain this walks - key file, replay artifact domain, then the preview
-        domain the envelope is signed under - is pinned by the seal-parity vector
-        'replay-runset-domain-chain', so a divergence between this derivation and
-        the one the comparison sealed with is a failing parity vector rather than
-        a signature error nobody can explain. Read-only: the reviewer's own
-        reader mints a key when the file is absent, and a comparison verified
-        against a freshly-invented key would have verified nothing.
+        Reads an existing reviewer-format signing key without ever minting one.
     #>
     param([Parameter(Mandatory)][string]$Path)
     # A signing key is 32 bytes plus a short format prefix; reading an operator
@@ -1065,7 +1479,7 @@ function Get-ShadowChildReplayDerivedKey {
         $line = $line.Substring($separator + 1)
     }
     $stored = [Convert]::FromBase64String($line)
-    $master = switch ($format) {
+    [byte[]]$master = switch ($format) {
         'raw' { $stored }
         'dpapi' {
             try {
@@ -1077,6 +1491,55 @@ function Get-ShadowChildReplayDerivedKey {
         default { throw "The signing key at '$Path' declares an unknown storage format '$format'." }
     }
     if ($master.Length -lt 32) { throw "Artifact signing key '$Path' is too short." }
+    return $master
+}
+
+function Get-ShadowChildCensusMasterKey {
+    <#
+    .SYNOPSIS
+        Derives the artifact key for one slot execution from the run-set key.
+    .DESCRIPTION
+        The verifier can reproduce this key without reading anything from the
+        audited run root. Set, slot and execution are all in the derivation, so
+        no other slot or earlier generation can authenticate this census.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$SetId,
+        [Parameter(Mandatory)][string]$SlotName,
+        [Parameter(Mandatory)][string]$RunExecutionId
+    )
+    foreach ($component in @($SetId, $SlotName)) {
+        if ($component -cnotmatch '^[A-Za-z0-9._-]+\z') {
+            throw "A census key cannot be derived from set or slot identity '$component'."
+        }
+    }
+    if ($RunExecutionId -cnotmatch '^[0-9a-f]{32}\z') {
+        throw "A census key cannot be derived from malformed execution identity '$RunExecutionId'."
+    }
+    [byte[]]$master = @(Read-ShadowChildSigningMasterKey -Path $Path)
+    $binding = "devpilot.shadow.census.master.v1`nset=$SetId`nslot=$SlotName`nexecution=$RunExecutionId"
+    $hmac = [Security.Cryptography.HMACSHA256]::new($master)
+    try { return $hmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($binding)) }
+    finally { $hmac.Dispose() }
+}
+
+function Get-ShadowChildReplayDerivedKey {
+    <#
+    .SYNOPSIS
+        The replay-domain key for one signing key file, so a sealed comparison
+        can be opened rather than merely parsed.
+    .DESCRIPTION
+        The chain this walks - key file, replay artifact domain, then the preview
+        domain the envelope is signed under - is pinned by the seal-parity vector
+        'replay-runset-domain-chain', so a divergence between this derivation and
+        the one the comparison sealed with is a failing parity vector rather than
+        a signature error nobody can explain. Read-only: the reviewer's own
+        reader mints a key when the file is absent, and a comparison verified
+        against a freshly-invented key would have verified nothing.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    [byte[]]$master = @(Read-ShadowChildSigningMasterKey -Path $Path)
     $hmac = [Security.Cryptography.HMACSHA256]::new($master)
     try { return , $hmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes('devpilot.reviewer.replay.artifact.v1')) }
     finally { $hmac.Dispose() }
@@ -1729,6 +2192,52 @@ function Get-ShadowChildPathKey {
     return ([IO.Path]::GetFullPath($Path)).TrimEnd('\', '/').ToLowerInvariant()
 }
 
+function Test-ShadowChildPathEquals {
+    param(
+        [Parameter(Mandatory)][string]$Left,
+        [Parameter(Mandatory)][string]$Right
+    )
+    $comparison = if ($IsWindows) {
+        [StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [StringComparison]::Ordinal
+    }
+    $leftFull = [IO.Path]::GetFullPath($Left).TrimEnd('\', '/')
+    $rightFull = [IO.Path]::GetFullPath($Right).TrimEnd('\', '/')
+    return [string]::Equals($leftFull, $rightFull, $comparison)
+}
+
+function Assert-ShadowChildRequestAuthority {
+    param(
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][string]$RequestPath,
+        [Parameter(Mandatory)][string]$ExpectedRequestSha256,
+        [Parameter(Mandatory)][string]$ExpectedResultPath,
+        [Parameter(Mandatory)][string]$ExpectedToolkitRoot
+    )
+    $childRequestSha256 = [string]$Request.childRequestSha256
+    if ($childRequestSha256 -cne $ExpectedRequestSha256) {
+        throw ("The child request '$RequestPath' digests to '$childRequestSha256', not the independently supplied " +
+            "'$ExpectedRequestSha256'. No request field is obeyed until this coordinator-held identity matches.")
+    }
+    $requestedResultPath = [string]$Request.resultPath
+    if (-not (Test-ShadowChildPathEquals -Left $requestedResultPath -Right $ExpectedResultPath)) {
+        throw ("The child request '$RequestPath' names result path '$requestedResultPath', not the independently supplied " +
+            "'$ExpectedResultPath'. No request-controlled path is written.")
+    }
+    $requestedToolkitRoot = Get-ShadowChildField -Request $Request -Name 'toolkitRoot'
+    if (-not (Test-ShadowChildPathEquals -Left $requestedToolkitRoot -Right $ExpectedToolkitRoot)) {
+        throw ("The child request '$RequestPath' names toolkit root '$requestedToolkitRoot', not the independently supplied " +
+            "'$ExpectedToolkitRoot'. No request-controlled script is loaded.")
+    }
+    return [pscustomobject]@{
+        ChildRequestSha256 = $childRequestSha256
+        ResultPath = [IO.Path]::GetFullPath($ExpectedResultPath)
+        ToolkitRoot = [IO.Path]::GetFullPath($ExpectedToolkitRoot)
+    }
+}
+
 function Invoke-ShadowChildDeliveryPlan {
     <#
     .SYNOPSIS
@@ -2129,13 +2638,23 @@ function Read-ShadowChildDeliveryInput {
 # One step, one tool, one result file.
 # ---------------------------------------------------------------------------
 $request = Read-ShadowChildRequest -Path $RequestPath
+$authority = Assert-ShadowChildRequestAuthority -Request $request -RequestPath $RequestPath `
+    -ExpectedRequestSha256 $ExpectedRequestSha256 -ExpectedResultPath $ExpectedResultPath `
+    -ExpectedToolkitRoot $ExpectedToolkitRoot
+$childRequestSha256 = [string]$authority.ChildRequestSha256
 $correlationId = [string]$request.correlationId
 $step = [string]$request.step
-$resultPath = [string]$request.resultPath
-$childRequestSha256 = [string]$request.childRequestSha256
+$resultPath = [string]$authority.ResultPath
+$toolkitRoot = [string]$authority.ToolkitRoot
+# The coordinator's own exchange directory: where the request this adapter was
+# handed came from, and where the result it is about to write will go. The
+# reviewed run is given the repository, the replay root, the qualification root
+# and its state directory, and none of those is this. That is the whole reason
+# the run-execution expectation lives here - see
+# Get-ShadowChildRunExecutionNoncePath.
+[string]$custodyRoot = [IO.Path]::GetFullPath((Split-Path -Parent $RequestPath))
 
 try {
-    $toolkitRoot = Get-ShadowChildField -Request $request -Name 'toolkitRoot'
     if (-not (Test-Path -LiteralPath $toolkitRoot -PathType Container)) {
         throw "The toolkit root '$toolkitRoot' does not exist."
     }
@@ -2166,8 +2685,8 @@ try {
         # immediately before the irreversible launch, and a distinct step keeps
         # that probe out of the adoption path the committed plan result lives in.
         '^slot[0-9]+Prelaunch$' { Invoke-ShadowChildSlotPlan -Request $request -ToolkitRoot $toolkitRoot }
-        '^slot[0-9]+Run$' { Invoke-ShadowChildSlotRun -Request $request -ToolkitRoot $toolkitRoot }
-        '^slot[0-9]+Verify$' { Invoke-ShadowChildSlotVerify -Request $request -ToolkitRoot $toolkitRoot }
+        '^slot[0-9]+Run$' { Invoke-ShadowChildSlotRun -Request $request -ToolkitRoot $toolkitRoot -CustodyRoot $custodyRoot }
+        '^slot[0-9]+Verify$' { Invoke-ShadowChildSlotVerify -Request $request -ToolkitRoot $toolkitRoot -CustodyRoot $custodyRoot }
         '^reconcilePlan$' { Invoke-ShadowChildReconcilePlan -Request $request -ToolkitRoot $toolkitRoot }
         '^reconcilePrelaunch$' { Invoke-ShadowChildReconcilePlan -Request $request -ToolkitRoot $toolkitRoot }
         '^reconcileRun$' { Invoke-ShadowChildReconcileRun -Request $request -ToolkitRoot $toolkitRoot }

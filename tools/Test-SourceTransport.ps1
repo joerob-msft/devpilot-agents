@@ -2504,10 +2504,20 @@ Write-Host "[17/17] One pull request cannot end the cycle" -ForegroundColor Cyan
 $passText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerModelPass'
 Assert-Source ($passText -notmatch 'throw "Reviewer model input is') `
     "an oversized model input is no longer thrown out of the pass"
-Assert-Source ($passText -match 'above the code-defined \$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,1400}?return @\{ Model') `
+# The refusal now leaves through the closed-shape factory rather than a bare
+# hashtable literal. That is the stronger statement: a literal could - and once
+# did - omit EnvelopePersisted, and the accounting writer's first read of the
+# missing key threw out of the whole review, so the oversized pull request took
+# every pull request queued behind it with it and was never charged an attempt.
+# Asserting the factory asserts the whole closed key set at once.
+Assert-Source ($passText -match 'above the code-defined \$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,1400}?return \(New-ReviewerModelPassResult ') `
     "an oversized model input returns a bounded pass failure instead"
-Assert-Source ($passText -match 'limitBytes = \$script:ReviewerMaxModelInputBytes[\s\S]{0,1400}?EnvironmentFault = \$false') `
+Assert-Source ($passText -match "above the code-defined \`$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,1400}?New-ReviewerModelPassResult [\s\S]{0,400}?-EnvelopePersisted \`$false") `
+    "the oversize refusal states its envelope disposition rather than leaving the key absent"
+Assert-Source ($passText -notmatch 'above the code-defined \$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,1400}?New-ReviewerModelPassResult [\s\S]{0,400}?-EnvironmentFault \$true') `
     "an oversized model input is attributed to the pull request, so it retires visibly instead of retrying forever"
+Assert-Source ($passText -match 'limitBytes = \$script:ReviewerMaxModelInputBytes') `
+    "the oversize refusal records the bound it enforced, so an operator can see why the pull request retired"
 Assert-Source ($cycleText -match 'try \{[\s\S]{0,400}?Invoke-ReviewerPullRequest -Session[\s\S]{0,600}?catch') `
     "the per-pull-request review is isolated so one failure cannot end the cycle"
 Assert-Source ($cycleText -match 'isolatedFailure') `

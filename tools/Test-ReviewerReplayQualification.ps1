@@ -1004,7 +1004,7 @@ exit 0
 
     # -- 12b. Identity binding: a terminal that does not name this verified set
     #         is refused by reconciliation, the predecessor gate, and status
-    #         readiness - even when it is a well-formed, immutable, "complete"
+    #         readiness - even when it is an authenticated, immutable, "complete"
     #         terminal. Only slot1 is forged; a forged slot2 terminal would trip
     #         RunSlot's own target no-resume check before the predecessor gate.
     Write-Host "12b/13 terminals are bound to the verified declaration" -ForegroundColor Cyan
@@ -1018,22 +1018,25 @@ exit 0
     $bindRunsDir = Join-Path $bindRoot "runs"
     New-Item -ItemType Directory -Force -Path $bindRunsDir | Out-Null
     $forgedTerminal = [pscustomobject][ordered]@{
-        kind = "reviewer.replay-qualification.terminal.v1"; slot = "slot1"; setId = "forged-set-id"
-        planDigest = "forged-digest"; status = "complete"; exitCode = 0; timedOut = $false
+        kind = "reviewer.replay-qualification.terminal.v1"; slot = "slot1"; setId = ("e" * 32)
+        planDigest = ("f" * 64); status = "complete"; exitCode = 0; timedOut = $false
         timeoutReason = ""; childProcessId = 0; startedAtUtc = ""; endedAtUtc = ""
+        runExecutionId = ("d" * 32)
     }
+    $forgedTerminal = Protect-ReviewerQualificationSlotTerminal -Terminal $forgedTerminal `
+        -RunSetKeyPath $keyPath
     $forgedTerminalPath = Join-Path $bindRunsDir "slot1-terminal.json"
     Set-Content -LiteralPath $forgedTerminalPath -Value (ConvertTo-Json $forgedTerminal -Depth 5) -Encoding utf8NoBOM
     Set-ItemProperty -LiteralPath $forgedTerminalPath -Name IsReadOnly -Value $true
 
     Assert-QualificationThrows {
         & $sandboxTool -Mode Reconcile @bindArguments -RunSetKeyPath $keyPath
-    } "Reconciliation accepted a terminal that does not name the verified set." "names run set"
+    } "Reconciliation accepted an authenticated terminal that does not name the verified set." "names run set"
 
     Assert-QualificationThrows {
         & $sandboxTool -Mode RunSlot @bindArguments -Slot "slot2" -RunSetKeyPath $keyPath `
             -LaunchAuthorizationTokenPath $bindTokenPath
-    } "The predecessor gate accepted a forged slot1 terminal." "names run set"
+    } "The predecessor gate accepted an authenticated wrong-set slot1 terminal." "names run set"
 
     $bindStatus = @(& $statusTool -QualificationRoot $bindRoot -RunSetKeyPath $keyPath | Where-Object { $_ -is [pscustomobject] -and $_.kind })
     Assert-Qualification (-not [bool]$bindStatus[0].reconciliationReady -and -not [bool]$bindStatus[0].evidenceComplete) `

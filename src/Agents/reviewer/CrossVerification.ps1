@@ -357,6 +357,21 @@ function Test-ReviewerVerificationSignature {
         [Convert]::FromHexString($Signature))
 }
 
+function Get-ReviewerVerificationCensusSignature {
+    param(
+        [Parameter(Mandatory)][string]$ManifestJson,
+        [Parameter(Mandatory)][byte[]]$MasterKey,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}\z')][string]$RunExecutionId
+    )
+    $payload = "devpilot.reviewer.census-preview.v1`0$RunExecutionId`0$ManifestJson"
+    $signer = [Security.Cryptography.HMACSHA256]::new($MasterKey)
+    try {
+        return [Convert]::ToHexString(
+            $signer.ComputeHash($script:ReviewerVerificationUtf8.GetBytes($payload))).ToLowerInvariant()
+    }
+    finally { $signer.Dispose() }
+}
+
 function Save-ReviewerVerificationArtifact {
     param(
         [Parameter(Mandatory)]$Manifest,
@@ -364,7 +379,10 @@ function Save-ReviewerVerificationArtifact {
         [Parameter(Mandatory)][string]$BaseName,
         [Parameter(Mandatory)][byte[]]$MasterKey,
         [Parameter(Mandatory)][ValidateSet("input", "preview")][string]$Domain,
-        [ValidateRange(1024, [int]::MaxValue)][int]$MaxArtifactBytes = $script:ReviewerVerificationMaxArtifactBytes
+        [ValidateRange(1024, [int]::MaxValue)][int]$MaxArtifactBytes = $script:ReviewerVerificationMaxArtifactBytes,
+        [byte[]]$CensusMasterKey,
+        [AllowEmptyString()][string]$RunExecutionId = '',
+        [ref]$ArtifactSha256
     )
     if ($BaseName -notmatch '^[A-Za-z0-9._-]+$') { throw "Verification artifact base name is unsafe." }
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
@@ -380,16 +398,30 @@ function Save-ReviewerVerificationArtifact {
     $envelope = [ordered]@{
         manifestJson = $manifestJson
         signatureAlg = "HMACSHA256"
-        signature = Get-ReviewerVerificationSignature -Json $manifestJson -Key $key
+        signature = ''
+    }
+    $envelope['signature'] = Get-ReviewerVerificationSignature -Json $manifestJson -Key $key
+    if ($null -ne $CensusMasterKey -and $CensusMasterKey.Length -gt 0) {
+        if ($Domain -cne 'preview' -or $CensusMasterKey.Length -ne 32 -or
+            $RunExecutionId -cnotmatch '^[0-9a-f]{32}\z') {
+            throw 'Census preview signing requires a 32-byte key, a valid run execution identity, and the preview domain.'
+        }
+        $envelope['censusSignatureAlg'] = 'HMACSHA256'
+        $envelope['censusRunExecutionId'] = $RunExecutionId
+        $envelope['censusSignature'] = Get-ReviewerVerificationCensusSignature `
+            -ManifestJson $manifestJson -MasterKey $CensusMasterKey -RunExecutionId $RunExecutionId
+    }
+    $artifactText = ConvertTo-Json -InputObject $envelope -Depth 4
+    [byte[]]$artifactBytes = $script:ReviewerVerificationUtf8.GetBytes($artifactText)
+    if ($null -ne $ArtifactSha256) {
+        $ArtifactSha256.Value = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($artifactBytes)).ToLowerInvariant()
     }
     $path = Join-Path $Directory ($BaseName + ".json")
     $nonce = [Guid]::NewGuid().ToString("N")
     $tempPath = "$path.$nonce.tmp"
     try {
-        [IO.File]::WriteAllText(
-            $tempPath,
-            ($envelope | ConvertTo-Json -Depth 4),
-            $script:ReviewerVerificationUtf8)
+        [IO.File]::WriteAllBytes($tempPath, $artifactBytes)
         Move-Item -LiteralPath $tempPath -Destination $path -Force
     }
     finally {
@@ -436,10 +468,19 @@ function Save-ReviewerVerificationInput {
         [Parameter(Mandatory)][string]$Directory,
         [Parameter(Mandatory)][string]$BaseName,
         [Parameter(Mandatory)][byte[]]$MasterKey,
-        [ValidateRange(1024, [int]::MaxValue)][int]$MaxArtifactBytes = $script:ReviewerVerificationMaxArtifactBytes
+        [ValidateRange(1024, [int]::MaxValue)][int]$MaxArtifactBytes = $script:ReviewerVerificationMaxArtifactBytes,
+        [ref]$ArtifactSha256
     )
-    return Save-ReviewerVerificationArtifact -Manifest $Manifest -Directory $Directory `
-        -BaseName $BaseName -MasterKey $MasterKey -Domain input -MaxArtifactBytes $MaxArtifactBytes
+    $arguments = @{
+        Manifest = $Manifest
+        Directory = $Directory
+        BaseName = $BaseName
+        MasterKey = $MasterKey
+        Domain = 'input'
+        MaxArtifactBytes = $MaxArtifactBytes
+    }
+    if ($null -ne $ArtifactSha256) { $arguments['ArtifactSha256'] = $ArtifactSha256 }
+    return Save-ReviewerVerificationArtifact @arguments
 }
 
 function Read-ReviewerVerificationInput {
@@ -453,10 +494,13 @@ function Save-ReviewerVerificationPreview {
         [Parameter(Mandatory)][string]$Directory,
         [Parameter(Mandatory)][string]$BaseName,
         [Parameter(Mandatory)][byte[]]$MasterKey,
-        [ValidateRange(1024, [int]::MaxValue)][int]$MaxArtifactBytes = $script:ReviewerVerificationMaxArtifactBytes
+        [ValidateRange(1024, [int]::MaxValue)][int]$MaxArtifactBytes = $script:ReviewerVerificationMaxArtifactBytes,
+        [byte[]]$CensusMasterKey,
+        [AllowEmptyString()][string]$RunExecutionId = ''
     )
     return Save-ReviewerVerificationArtifact -Manifest $Manifest -Directory $Directory `
-        -BaseName $BaseName -MasterKey $MasterKey -Domain preview -MaxArtifactBytes $MaxArtifactBytes
+        -BaseName $BaseName -MasterKey $MasterKey -Domain preview -MaxArtifactBytes $MaxArtifactBytes `
+        -CensusMasterKey $CensusMasterKey -RunExecutionId $RunExecutionId
 }
 
 function Read-ReviewerVerificationPreview {
@@ -1652,6 +1696,47 @@ function Test-ReviewerVerificationThreadRelevant {
         $ExistingThreadJaccard)
 }
 
+function Get-ReviewerVerificationChangedPathSet {
+    param([AllowEmptyCollection()][string[]]$ChangedPaths = @())
+    $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($path in @($ChangedPaths)) {
+        $normalized = ConvertTo-ReviewerVerificationPath -Path ([string]$path)
+        if ($normalized) { [void]$changed.Add($normalized) }
+    }
+    return , $changed
+}
+
+function Test-ReviewerVerificationAssignmentEligibility {
+    # The single eligibility predicate shared by the assignment builder and the
+    # coverage assertion. A candidate that is not assignment-eligible produces
+    # zero assignments, so counting it into the required-assignment census is
+    # what made one off-change candidate throw the whole pass. Returns the
+    # verdict AND the reason, so the coverage assertion can report the
+    # degradation instead of hiding it.
+    param(
+        [Parameter(Mandatory)]$Candidate,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.HashSet[string]]$ChangedPathSet
+    )
+    if ($ChangedPathSet.Count -le 0) {
+        return [pscustomobject][ordered]@{ eligible = $true; reason = "" }
+    }
+    if ([string](Get-ReviewerVerificationValue $Candidate "anchorKind" "") -cne "changedFile") {
+        return [pscustomobject][ordered]@{ eligible = $true; reason = "" }
+    }
+    $candidatePath = ConvertTo-ReviewerVerificationPath -Path (
+        [string](Get-ReviewerVerificationValue $Candidate "filePath" ""))
+    if (-not $candidatePath) {
+        return [pscustomobject][ordered]@{ eligible = $false; reason = "unresolvableChangedFilePath" }
+    }
+    if ([int](Get-ReviewerVerificationValue $Candidate "line" 0) -lt 1) {
+        return [pscustomobject][ordered]@{ eligible = $false; reason = "nonPositiveChangedFileLine" }
+    }
+    if (-not $ChangedPathSet.Contains($candidatePath)) {
+        return [pscustomobject][ordered]@{ eligible = $false; reason = "offChangeChangedFileAnchor" }
+    }
+    return [pscustomobject][ordered]@{ eligible = $true; reason = "" }
+}
+
 function Get-ReviewerVerificationAssignments {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Clusters,
@@ -1672,11 +1757,7 @@ function Get-ReviewerVerificationAssignments {
     if ($ConventionVerifierModel -and -not $modelSet.Contains($ConventionVerifierModel)) {
         throw "The compatibility convention verifier model must name one of the two generalist cross-check models."
     }
-    $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($path in @($ChangedPaths)) {
-        $normalized = ConvertTo-ReviewerVerificationPath -Path ([string]$path)
-        if ($normalized) { [void]$changed.Add($normalized) }
-    }
+    $changed = Get-ReviewerVerificationChangedPathSet -ChangedPaths $ChangedPaths
     $assignments = [System.Collections.Generic.List[object]]::new()
     foreach ($cluster in @($Clusters)) {
         if ([string](Get-ReviewerVerificationValue $cluster "status" "ready") -cne "ready") {
@@ -1688,12 +1769,9 @@ function Get-ReviewerVerificationAssignments {
             if ($originKind -ceq "convention" -and $modelSet.Contains($originModel)) {
                 throw "The convention-specialist discovery model cannot be a generalist cross-check model."
             }
-            if ($changed.Count -gt 0 -and [string]$candidate.anchorKind -ceq "changedFile") {
-                $candidatePath = ConvertTo-ReviewerVerificationPath -Path ([string]$candidate.filePath)
-                if (-not $candidatePath -or [int]$candidate.line -lt 1 -or
-                    -not $changed.Contains($candidatePath)) {
-                    continue
-                }
+            if (-not (Test-ReviewerVerificationAssignmentEligibility `
+                        -Candidate $candidate -ChangedPathSet $changed).eligible) {
+                continue
             }
             foreach ($target in $models) {
                 [void]$assignments.Add([pscustomobject][ordered]@{
@@ -1736,22 +1814,42 @@ function Assert-ReviewerVerificationAssignmentCoverage {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Clusters,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Assignments,
         [Parameter(Mandatory)][string[]]$RequiredVerifierModels,
-        [ValidateRange(1, [int]::MaxValue)][int]$MaxVerifierRuns
+        [ValidateRange(1, [int]::MaxValue)][int]$MaxVerifierRuns,
+        [AllowEmptyCollection()][string[]]$ChangedPaths = @()
     )
     $models = @($RequiredVerifierModels | Where-Object { $_ } | Sort-Object -Unique)
     if ($models.Count -ne 2) {
         throw "Assignment coverage validation requires exactly two verifier models."
     }
-    $ready = [System.Collections.Generic.List[object]]::new()
+    # Count only the candidates the assignment builder could actually plan for.
+    # The builder and this assertion share ONE eligibility predicate, so an
+    # off-change (or otherwise assignment-ineligible) candidate no longer
+    # inflates the required-assignment census and throws the whole pass; it is
+    # withheld candidate-by-candidate and reported back to the caller.
+    $changed = Get-ReviewerVerificationChangedPathSet -ChangedPaths $ChangedPaths
+    $readyCount = 0
+    $eligible = [System.Collections.Generic.List[object]]::new()
+    $withheld = [System.Collections.Generic.List[object]]::new()
     foreach ($cluster in @($Clusters)) {
         if ([string](Get-ReviewerVerificationValue $cluster "status" "ready") -cne "ready") {
             continue
         }
         foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
-            [void]$ready.Add($candidate)
+            $readyCount++
+            $verdict = Test-ReviewerVerificationAssignmentEligibility `
+                -Candidate $candidate -ChangedPathSet $changed
+            if ($verdict.eligible) {
+                [void]$eligible.Add($candidate)
+            }
+            else {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+                        reason = [string]$verdict.reason
+                    })
+            }
         }
     }
-    $requiredAssignments = 2 * $ready.Count
+    $requiredAssignments = 2 * $eligible.Count
     if ($requiredAssignments -gt $script:ReviewerVerificationMaxVerifierRuns) {
         throw "The bounded candidate union requires $requiredAssignments verifier assignments, above the code-defined $($script:ReviewerVerificationMaxVerifierRuns)-assignment hard cap."
     }
@@ -1761,7 +1859,7 @@ function Assert-ReviewerVerificationAssignmentCoverage {
     if (@($Assignments).Count -ne $requiredAssignments) {
         throw "The assignment plan contains $(@($Assignments).Count) assignments; exactly $requiredAssignments are required."
     }
-    foreach ($candidate in $ready) {
+    foreach ($candidate in $eligible) {
         $candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
         $assignedModels = @($Assignments | Where-Object {
                 [string](Get-ReviewerVerificationValue $_ "candidateId" "") -ceq $candidateId
@@ -1773,8 +1871,18 @@ function Assert-ReviewerVerificationAssignmentCoverage {
             throw "Candidate '$candidateId' does not have exactly one assignment for each required verifier model."
         }
     }
+    if ($withheld.Count -gt 0) {
+        $withheldReasons = @($withheld | ForEach-Object {
+                "$([string]$_.candidateId) ($([string]$_.reason))" }) -join ', '
+        Write-Warning ("Assignment coverage withheld $($withheld.Count) assignment-ineligible " +
+            "candidate(s) from cross-verification: $withheldReasons. The remaining " +
+            "$($eligible.Count) eligible candidate(s) are still verified.")
+    }
     return [pscustomobject][ordered]@{
-        readyCandidateCount = $ready.Count
+        readyCandidateCount = $readyCount
+        eligibleCandidateCount = $eligible.Count
+        withheldCandidateCount = $withheld.Count
+        withheldCandidates = [object[]]@($withheld.ToArray())
         requiredAssignmentCount = $requiredAssignments
         declaredMaxVerifierRuns = $MaxVerifierRuns
         complete = $true

@@ -788,6 +788,38 @@ function Assert-ReviewerStageContract {
     return $normalized
 }
 
+function Assert-ReviewerStageArtifactOnDisk {
+    <#
+    .SYNOPSIS
+        Re-reads a just-written artifact and returns its VERIFIED on-disk digest.
+
+    .DESCRIPTION
+        Hashes the bytes actually on disk and compares them against the digest of
+        the bytes the writer intended to publish. A length-only check would pass
+        a same-length substitution made after the move, and hashing the intended
+        bytes to report the digest would then publish a digest that does not
+        describe the file. Both are refused here; the returned digest is the one
+        taken over the bytes that are really on disk.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][byte[]]$IntendedBytes
+    )
+    $written = [IO.File]::ReadAllBytes($Path)
+    if ($written.Length -ne $IntendedBytes.Length) {
+        throw "Stage contract '$Kind' did not land intact at '$Path'."
+    }
+    $intendedDigest = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($IntendedBytes)).ToLowerInvariant()
+    $digest = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($written)).ToLowerInvariant()
+    if ($digest -cne $intendedDigest) {
+        throw "Stage contract '$Kind' bytes on disk at '$Path' do not match the intended digest; the artifact was altered between write and verification."
+    }
+    return $digest
+}
+
 function Write-ReviewerStageArtifact {
     <#
     .SYNOPSIS
@@ -873,15 +905,11 @@ function Write-ReviewerStageArtifact {
     }
 
     $written = [IO.File]::ReadAllBytes($Path)
-    if ($written.Length -ne $bytes.Length) {
-        throw "Stage contract '$Kind' did not land intact at '$Path'."
-    }
-    $digest = [Convert]::ToHexString(
-        [Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
-    # The digest is taken over the bytes that were written, never over a second
-    # serialization of the same payload: re-serializing to hash would let the
-    # recorded digest and the published file drift apart the moment the
-    # serializer's output depended on anything but the payload.
+    # Verify the bytes ON DISK against the digest of the bytes we intended to
+    # write, and report the verified on-disk digest. Factored out so a test can
+    # substitute same-length bytes between the write and this verification and
+    # prove the substitution is caught rather than hidden behind a length check.
+    $digest = Assert-ReviewerStageArtifactOnDisk -Path $Path -Kind $Kind -IntendedBytes $bytes
     Add-ReviewerStageContractLedgerEntry -Kind $contract.Kind -Producer 'Write-ReviewerStageArtifact' -Operation 'write'
     return [pscustomobject][ordered]@{
         Path = $Path
@@ -892,6 +920,60 @@ function Write-ReviewerStageArtifact {
         ByteLength = $bytes.Length
         Sha256 = $digest
     }
+}
+
+function ConvertTo-ReviewerStageIntegerField {
+    <#
+    .SYNOPSIS
+        Returns a genuinely integral envelope field as an [int], rejecting the
+        shapes a bare [int] cast would silently accept.
+
+    .DESCRIPTION
+        [int] coerces a quoted "3" to 3, $true to 1, and a fractional 3.7 to 4,
+        so a schema check that casts before it validates lets strings, booleans
+        and fractional numbers pass as integers. A JSON number parses to an
+        integer CLR type when it is whole and to a double when it carries a
+        fraction; this accepts the integer types, accepts a double or decimal
+        only when it is exactly integral (a JSON 3.0), and rejects everything
+        else - including strings, booleans and fractional numbers.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][string]$FieldName,
+        [AllowNull()]$Value
+    )
+    if ($null -eq $Value) {
+        throw "Stage contract '$Kind' field '$FieldName' is null where a JSON integer is required."
+    }
+    $base = $Value
+    if ($base -is [psobject] -and $null -ne $base.PSObject.BaseObject) {
+        $base = $base.PSObject.BaseObject
+    }
+    if ($base -is [bool]) {
+        throw "Stage contract '$Kind' field '$FieldName' is a boolean where a JSON integer is required."
+    }
+    if ($base -is [string] -or $base -is [char]) {
+        throw "Stage contract '$Kind' field '$FieldName' is a string where a JSON integer is required."
+    }
+    $decimalValue = $null
+    if ($base -is [byte] -or $base -is [sbyte] -or $base -is [int16] -or $base -is [uint16] -or
+        $base -is [int32] -or $base -is [uint32] -or $base -is [int64] -or $base -is [uint64] -or
+        $base -is [System.Numerics.BigInteger]) {
+        $decimalValue = [decimal]$base
+    }
+    elseif ($base -is [double] -or $base -is [single] -or $base -is [decimal]) {
+        $decimalValue = [decimal]$base
+        if ([decimal][math]::Truncate($decimalValue) -ne $decimalValue) {
+            throw "Stage contract '$Kind' field '$FieldName' is a fractional number where a JSON integer is required."
+        }
+    }
+    else {
+        throw "Stage contract '$Kind' field '$FieldName' is a $($base.GetType().Name) where a JSON integer is required."
+    }
+    if ($decimalValue -lt [int]::MinValue -or $decimalValue -gt [int]::MaxValue) {
+        throw "Stage contract '$Kind' field '$FieldName' value $decimalValue is outside the supported integer range."
+    }
+    return [int]$decimalValue
 }
 
 function Read-ReviewerStageArtifact {
@@ -952,7 +1034,8 @@ function Read-ReviewerStageArtifact {
     if ($unknownEnvelope.Count -gt 0) {
         throw "Stage contract '$Kind' envelope has unknown field(s): $($unknownEnvelope -join ', ')."
     }
-    if ([int]$envelope.envelopeVersion -ne $script:ReviewerStageContractEnvelopeVersion) {
+    if ((ConvertTo-ReviewerStageIntegerField -Kind $Kind -FieldName 'envelopeVersion' `
+                -Value $envelope.envelopeVersion) -ne $script:ReviewerStageContractEnvelopeVersion) {
         throw "Stage contract '$Kind' envelope version $($envelope.envelopeVersion) is not supported."
     }
     if ([string]$envelope.kind -cne $contract.Kind) {
@@ -961,7 +1044,7 @@ function Read-ReviewerStageArtifact {
     if ($script:ReviewerStageContractForms -cnotcontains [string]$envelope.form) {
         throw "Stage contract '$Kind' declares an unsupported form '$($envelope.form)'."
     }
-    $declaredDepth = [int]$envelope.depth
+    $declaredDepth = ConvertTo-ReviewerStageIntegerField -Kind $Kind -FieldName 'depth' -Value $envelope.depth
     if ($declaredDepth -lt 2 -or $declaredDepth -gt 64) {
         throw "Stage contract '$Kind' declares an out-of-range depth $declaredDepth."
     }
@@ -972,7 +1055,8 @@ function Read-ReviewerStageArtifact {
         throw "Stage contract '$Kind' artifact '$Path' declares form '$($envelope.form)' but its bytes are $(if ($isCompactOnDisk) { 'compact' } else { 'indented' })."
     }
 
-    $observedVersion = [int]$envelope.contractVersion
+    $observedVersion = ConvertTo-ReviewerStageIntegerField -Kind $Kind -FieldName 'contractVersion' `
+        -Value $envelope.contractVersion
     if ($contract.SupportedVersions -notcontains $observedVersion) {
         throw "Stage contract '$Kind' artifact '$Path' is version $observedVersion; supported versions are $($contract.SupportedVersions -join ', ')."
     }

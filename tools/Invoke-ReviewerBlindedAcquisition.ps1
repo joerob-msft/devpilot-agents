@@ -187,6 +187,11 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $Utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+# The domain label the acquisition plan's signing key is derived under. It is a
+# constant, not a secret: its job is to make the derived key a value that is
+# specific to this one use, so a key that ever leaks cannot be replayed against
+# another artifact signed from the same token.
+$script:AcquisitionPlanSignatureKeyLabel = 'devpilot.reviewer.blinded-acquisition.plan-signature.v1'
 $leaseStream = $null
 $configGuardStream = $null
 $SupervisorTeardownMarginSeconds = 30
@@ -714,6 +719,156 @@ function Get-ReviewerSupervisorTimeoutReason {
     return ''
 }
 
+function Get-ReviewerChildTreeSnapshot {
+    <#
+        The owned process tree, by PID and creation time, taken while the root is
+        still alive. Identity is (pid, creationTime): a PID on its own is not an
+        identity on Windows, where the number is recycled, and a teardown check
+        that only asked "does this PID exist" would report a survivor every time
+        the operating system handed the number to something unrelated.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
+        [ref]$EnumerationFailure
+    )
+    $snapshot = [System.Collections.Generic.List[hashtable]]::new()
+    if (-not $IsWindows) { return $snapshot.ToArray() }
+    try {
+        [DateTime]$rootStartedAt = $Process.StartTime.ToUniversalTime()
+        $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        [int[]]$frontier = @([int]$Process.Id)
+        [int[]]$seen = @([int]$Process.Id)
+        while (@($frontier).Count -gt 0) {
+            $next = [System.Collections.Generic.List[int]]::new()
+            foreach ($candidate in $allProcesses) {
+                [int]$candidateId = [int]$candidate.ProcessId
+                if (@($seen) -contains $candidateId) { continue }
+                if (-not (@($frontier) -contains [int]$candidate.ParentProcessId)) { continue }
+                # Win32_Process.CreationDate comes back as a LOCAL DateTime while the
+                # root start time is normalised to UTC. Comparing the two without
+                # converting first silently rejected every descendant on any machine
+                # whose offset is behind UTC, which made this snapshot - and therefore
+                # the whole orphan proof built on it - vacuously empty.
+                [DateTime]$candidateCreatedUtc = ([DateTime]$candidate.CreationDate).ToUniversalTime()
+                if ($candidateCreatedUtc -lt $rootStartedAt.AddSeconds(-1)) { continue }
+                [void]$snapshot.Add(@{
+                        ProcessId = $candidateId
+                        CreatedUtc = $candidateCreatedUtc
+                    })
+                [void]$next.Add($candidateId)
+                $seen += $candidateId
+            }
+            [int[]]$frontier = @($next.ToArray())
+        }
+    }
+    catch {
+        # An unreadable process table is not evidence that the tree is gone. The
+        # caller is told so explicitly, so that "no descendants enumerated" can
+        # never be mistaken for "no descendants survive".
+        if ($PSBoundParameters.ContainsKey('EnumerationFailure')) {
+            $EnumerationFailure.Value = [string]$_.Exception.Message
+        }
+        return $snapshot.ToArray()
+    }
+    return $snapshot.ToArray()
+}
+
+function Get-ReviewerSurvivingChildProcess {
+    <#
+        Which of a snapshot's processes are still the same live process. A PID
+        whose current start time differs from the recorded one is a different
+        process that inherited the number, not a survivor.
+    #>
+    param([hashtable[]]$Snapshot = @())
+    $alive = [System.Collections.Generic.List[int]]::new()
+    foreach ($entry in @($Snapshot)) {
+        $existing = $null
+        try { $existing = Get-Process -Id ([int]$entry.ProcessId) -ErrorAction Stop }
+        catch { continue }
+        if ($null -eq $existing) { continue }
+        try {
+            if (([DateTime]$existing.StartTime.ToUniversalTime() - [DateTime]$entry.CreatedUtc).Duration().TotalSeconds -le 2) {
+                [void]$alive.Add([int]$entry.ProcessId)
+            }
+        }
+        catch {
+            # A process whose start time cannot be read is still a process that
+            # answered to this PID. Counting it as a survivor is the safe
+            # direction: the worst outcome is a terminal verdict on a run that
+            # was in fact clean, never a silent orphan.
+            [void]$alive.Add([int]$entry.ProcessId)
+        }
+        finally { if ($null -ne $existing) { $existing.Dispose() } }
+    }
+    return $alive.ToArray()
+}
+
+function Stop-ReviewerSupervisedChildTree {
+    <#
+        Stop the owned tree and PROVE it stopped, in bounded time.
+
+        Stop-ProcessTree swallows every failure it meets - by design, because it
+        tries several mechanisms in turn - so a caller that simply invoked it and
+        moved on had no idea whether anything died. Combined with an ignored
+        WaitForExit that told nobody it had expired, a supervisor timeout could
+        return a tidy 'timeout' result while the model child was still running,
+        still spending, and no longer supervised by anyone.
+
+        This returns what actually happened: whether the root exited, which
+        descendants outlived it, and what the stop attempts reported. Every wait
+        here is bounded; nothing blocks indefinitely.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
+        [ValidateRange(1, 10)][int]$AttemptCount = 3,
+        [ValidateRange(100, 60000)][int]$WaitMillisecondsPerAttempt = 5000
+    )
+    $details = [System.Collections.Generic.List[string]]::new()
+    $enumerationFailure = [ref]([string]'')
+    [hashtable[]]$snapshot = @(Get-ReviewerChildTreeSnapshot -Process $Process -EnumerationFailure $enumerationFailure)
+    [bool]$treeEnumerated = [string]::IsNullOrWhiteSpace([string]$enumerationFailure.Value)
+    if (-not $treeEnumerated) {
+        [void]$details.Add("the owned process tree could not be enumerated: $([string]$enumerationFailure.Value)")
+    }
+    for ($attempt = 1; $attempt -le $AttemptCount; $attempt++) {
+        $rootAlive = $true
+        try { $rootAlive = -not $Process.HasExited } catch { $rootAlive = $false }
+        [int[]]$survivors = @(Get-ReviewerSurvivingChildProcess -Snapshot $snapshot)
+        if (-not $rootAlive -and @($survivors).Count -eq 0) { break }
+        try { Stop-ProcessTree -Process $Process }
+        catch { [void]$details.Add("stop attempt ${attempt}: $($_.Exception.Message)") }
+        foreach ($survivor in @($survivors)) {
+            try { Stop-Process -Id ([int]$survivor) -Force -ErrorAction Stop }
+            catch {
+                # A descendant that Stop-ProcessTree already took down is not a
+                # failure to report; only a descendant that is still answering is.
+                [bool]$survivorStillListed = (
+                    @(Get-ReviewerSurvivingChildProcess -Snapshot @(
+                            @($snapshot) | Where-Object { [int]$_.ProcessId -eq [int]$survivor })).Count -gt 0)
+                if ($survivorStillListed) {
+                    [void]$details.Add("descendant ${survivor} attempt ${attempt}: $($_.Exception.Message)")
+                }
+            }
+        }
+        try { [void]$Process.WaitForExit($WaitMillisecondsPerAttempt) }
+        catch { [void]$details.Add("wait attempt ${attempt}: $($_.Exception.Message)") }
+    }
+    $rootStopped = $false
+    try { $rootStopped = [bool]$Process.HasExited } catch { $rootStopped = $false }
+    [int[]]$stillAlive = @(Get-ReviewerSurvivingChildProcess -Snapshot $snapshot)
+    if (-not $rootStopped) { [void]$details.Add("the child root process $($Process.Id) is still running") }
+    if (@($stillAlive).Count -gt 0) {
+        [void]$details.Add("descendant process id(s) still running: $((@($stillAlive) | Sort-Object) -join ', ')")
+    }
+    return [ordered]@{
+        Stopped = ($rootStopped -and $treeEnumerated -and @($stillAlive).Count -eq 0)
+        RootStopped = $rootStopped
+        TreeEnumerated = $treeEnumerated
+        SurvivingProcessIds = @($stillAlive)
+        Detail = ((@($details.ToArray()) -join '; '))
+    }
+}
+
 function Invoke-SupervisedReviewer {
     param(
         [Parameter(Mandatory)][string[]]$Arguments,
@@ -771,61 +926,115 @@ function Invoke-SupervisedReviewer {
             -Paths $allActivityPaths -NowUtc $startedUtc)
     $timedOut = $false
     $timeoutReason = ''
-    while ($true) {
-        # WaitForExit is the bounded clock (never Start-Sleep). It returns as soon
-        # as the child exits, or after the small slice for a liveness check.
-        if ($proc.WaitForExit(250)) { break }
-        $nowUtc = [DateTime]::UtcNow
-        [void](Measure-ReviewerSupervisorActivity -State $activityState `
-                -Paths $allActivityPaths -NowUtc $nowUtc)
-        $timeoutReason = Get-ReviewerSupervisorTimeoutReason -NowUtc $nowUtc `
-            -TotalDeadlineUtc $deadline -LastActivityUtc ([datetime]$activityState.LastActivityUtc) `
-            -ActivitySeconds $ActivitySeconds
-        if ($timeoutReason) {
-            $timedOut = $true
-            break
-        }
-    }
-    if ($timedOut) {
-        # Recursive cancellation of the owned tree by PID/handle - never by
-        # command-text matching. A hung grandchild dies with its parent.
-        try { Stop-ProcessTree -Process $proc } catch { }
-        [void]$proc.WaitForExit(5000)
-    }
     $drainFailure = ''
+    $stopDetail = ''
+    $childStopped = $true
+    $streamsDisposed = $false
+    # EVERYTHING FROM HERE IS INSIDE A FINALLY THAT OWNS THE CHILD. The loop
+    # below measures files and does arithmetic; either can throw. Before, such a
+    # throw returned control to the caller with the model child still running and
+    # nobody watching it. The child is now stopped on every exit from this
+    # function, and a tree that cannot be proven stopped is a typed terminal
+    # failure rather than a result that reads as an ordinary timeout.
     try {
+        while ($true) {
+            # WaitForExit is the bounded clock (never Start-Sleep). It returns as soon
+            # as the child exits, or after the small slice for a liveness check.
+            if ($proc.WaitForExit(250)) { break }
+            $nowUtc = [DateTime]::UtcNow
+            [void](Measure-ReviewerSupervisorActivity -State $activityState `
+                    -Paths $allActivityPaths -NowUtc $nowUtc)
+            $timeoutReason = Get-ReviewerSupervisorTimeoutReason -NowUtc $nowUtc `
+                -TotalDeadlineUtc $deadline -LastActivityUtc ([datetime]$activityState.LastActivityUtc) `
+                -ActivitySeconds $ActivitySeconds
+            if ($timeoutReason) {
+                $timedOut = $true
+                break
+            }
+        }
+        if ($timedOut) {
+            # Recursive cancellation of the owned tree by PID/handle - never by
+            # command-text matching. A hung grandchild dies with its parent, and
+            # the outcome is verified rather than assumed.
+            $stopResult = Stop-ReviewerSupervisedChildTree -Process $proc
+            if (-not [bool]$stopResult.Stopped) {
+                $childStopped = $false
+                $stopDetail = [string]$stopResult.Detail
+            }
+        }
         try {
-            $drained = [Threading.Tasks.Task]::WaitAll(
-                [Threading.Tasks.Task[]]@($stdOutCopy, $stdErrCopy), 5000)
-            if (-not $drained) { $drainFailure = 'outputDrainDeadline' }
+            try {
+                $drained = [Threading.Tasks.Task]::WaitAll(
+                    [Threading.Tasks.Task[]]@($stdOutCopy, $stdErrCopy), 5000)
+                if (-not $drained) { $drainFailure = 'outputDrainDeadline' }
+            }
+            catch [AggregateException] {
+                $drainFailure = 'outputDrainFailure'
+            }
+            if ($drainFailure) {
+                $stopResult = Stop-ReviewerSupervisedChildTree -Process $proc
+                if (-not [bool]$stopResult.Stopped) {
+                    $childStopped = $false
+                    $stopDetail = [string]$stopResult.Detail
+                }
+                if ($childStopped) {
+                    $postStopDrained = $false
+                    try {
+                        $postStopDrained = [Threading.Tasks.Task]::WaitAll(
+                            [Threading.Tasks.Task[]]@($stdOutCopy, $stdErrCopy), 5000)
+                    }
+                    catch [AggregateException] {
+                        $postStopDrained = $false
+                    }
+                    if (-not $postStopDrained) {
+                        $childStopped = $false
+                        $stopDetail = ('The direct child exited, but an owned descendant still held its output ' +
+                            'handles after bounded teardown, so the process tree cannot be reported stopped.')
+                    }
+                }
+            }
         }
-        catch [AggregateException] {
-            $drainFailure = 'outputDrainFailure'
+        finally {
+            $stdOutStream.Dispose()
+            $stdErrStream.Dispose()
+            $streamsDisposed = $true
         }
-        if ($drainFailure -and -not $proc.HasExited) {
-            try { Stop-ProcessTree -Process $proc } catch { }
-            [void]$proc.WaitForExit(5000)
+        $exitCode = -1
+        if (-not $timedOut -and -not $drainFailure -and $childStopped) {
+            try { $exitCode = [int]$proc.ExitCode } catch { $exitCode = -1 }
         }
+        # A tree that outlived its supervisor OUTRANKS the drain verdict: an
+        # undrained pipe is a lost log, an unstopped child is a live model run.
+        $failureReason = if (-not $childStopped) { 'childProcessNotStopped' } else { $drainFailure }
+        $result = [ordered]@{
+            ProcessId     = $processId
+            ExitCode      = $exitCode
+            TimedOut      = $timedOut
+            TimeoutReason = $timeoutReason
+            FailureReason = $failureReason
+            ChildStopped  = $childStopped
+            StopDetail    = $stopDetail
+            StartedUtc    = $startedUtc.ToString('o')
+            EndedUtc      = [DateTime]::UtcNow.ToString('o')
+        }
+        return $result
     }
     finally {
-        $stdOutStream.Dispose()
-        $stdErrStream.Dispose()
+        $stillRunning = $false
+        try { $stillRunning = -not $proc.HasExited } catch { $stillRunning = $false }
+        if ($stillRunning) {
+            $finalStop = Stop-ReviewerSupervisedChildTree -Process $proc
+            if (-not [bool]$finalStop.Stopped) {
+                Write-Warning ('The supervised reviewer child could not be stopped: ' +
+                    [string]$finalStop.Detail)
+            }
+        }
+        if (-not $streamsDisposed) {
+            $stdOutStream.Dispose()
+            $stdErrStream.Dispose()
+        }
+        $proc.Dispose()
     }
-    $exitCode = -1
-    if (-not $timedOut -and -not $drainFailure) {
-        try { $exitCode = [int]$proc.ExitCode } catch { $exitCode = -1 }
-    }
-    $result = [ordered]@{
-        ProcessId     = $processId
-        ExitCode      = $exitCode
-        TimedOut      = $timedOut
-        TimeoutReason = $timeoutReason
-        FailureReason = $drainFailure
-        StartedUtc    = $startedUtc.ToString('o')
-        EndedUtc      = [DateTime]::UtcNow.ToString('o')
-    }
-    $proc.Dispose()
-    return $result
 }
 
 # ---------------------------------------------------------------------------
@@ -1406,8 +1615,15 @@ if ($Role -eq 'verifier') {
         }
         $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
             -ExpectedProject ([string]$planTarget.project) -ExpectedNonce ([string]$discoveryCore.nonce)
-        $specialistOutcome = ConvertFrom-AgentResultMarkerOutcome `
-            -StdOutText $discoveryMarkerText -MarkerPrefix $discoveryPrefix `
+        # The SPECIALIST parser, not the generic one. The generic reader has no
+        # normalizer, so a schema-valid specialist marker whose
+        # changedCodeFix.evidenceFactIds is an empty array - which the specialist
+        # contract explicitly supports - is rejected here while production
+        # accepts it. That divergence would refuse authentic sealed packages,
+        # and, being a refusal, would look like a provenance failure rather than
+        # a parser mismatch.
+        $specialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+            -StdOutText $discoveryMarkerText `
             -Schema $specialistSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
         if ([string]$specialistOutcome.Status -cne 'success') {
             throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
@@ -1537,8 +1753,23 @@ else {
         if ($refCommit -cne $ExpectedHeadCommit.ToLowerInvariant() -and $refCommit -cne $ExpectedHeadCommit) {
             throw "Expected ref '$ExpectedRef' resolves to '$refCommit', not the expected head commit '$ExpectedHeadCommit'."
         }
-        & git merge-base --is-ancestor $ExpectedReviewerBaseCommit HEAD
-        if ($LASTEXITCODE -ne 0) { throw "Expected reviewer base commit '$ExpectedReviewerBaseCommit' is not an ancestor of HEAD." }
+        # The expected reviewer base is decided by the versioned lineage contract
+        # rather than by ancestry. Ancestry accepted a commit for its position in
+        # a graph and stopped being answerable at all once the stack was
+        # consolidated onto new commit identities carrying the same trees. The
+        # contract still fails closed - it additionally pins the identity's tree,
+        # the reviewer-side files an acquisition depends on, and the active
+        # boundary that must be an ancestor of this worktree.
+        . (Join-Path $PSScriptRoot '..\src\Agents\reviewer\ReviewerBaseContract.ps1')
+        try {
+            $acceptance = Assert-ReviewerBaseCommitAccepted -RepoRoot $RepoRoot `
+                -ExpectedBaseCommit ([string]$ExpectedReviewerBaseCommit)
+            Write-Verbose ("Reviewer base '$ExpectedReviewerBaseCommit' accepted via lineage " +
+                "$($acceptance.lineageVersion) ($($acceptance.mode), boundary $($acceptance.boundaryCommit)).")
+        }
+        catch {
+            throw "Expected reviewer base commit '$ExpectedReviewerBaseCommit' is not accepted by this worktree: $($_.Exception.Message)"
+        }
     }
     finally {
         Pop-Location
@@ -1754,17 +1985,32 @@ try { $planStream.Write($planBytes, 0, $planBytes.Length); $planStream.Flush() }
 finally { $planStream.Dispose() }
 
 # -- Authenticated plan signature (blocker C) --------------------------------
-# HMAC-SHA256 over the EXACT plan bytes with a key DERIVED from the authorization
-# token (SHA-256 of the token). The child re-derives the same key from the env
-# token and constant-time verifies this signature over the plan bytes, so every
-# identity the plan binds (role, model, repoPath, outputRoot, config, refs,
-# head, nonce, digests) is authenticated in one check. The sidecar carries only
-# the signature - never the token - and is authored exactly once (CreateNew).
-$planSigKey = [System.Security.Cryptography.SHA256]::Create().ComputeHash($Utf8.GetBytes($AuthorizationToken))
+# HMAC-SHA256 over the EXACT plan bytes. The child re-derives the same key from
+# the env token and constant-time verifies this signature over the plan bytes,
+# so every identity the plan binds (role, model, repoPath, outputRoot, config,
+# refs, head, nonce, digests) is authenticated in one check. The sidecar carries
+# only the signature - never the token - and is authored exactly once (CreateNew).
+#
+# THE KEY IS NOT THE VALUE THE PLAN PUBLISHES. The signing key used to be
+# SHA-256(token) - the very value written into the plan as
+# authorizationTokenSha256. Anyone who could read the plan file therefore held
+# the signing key and could re-sign a plan of their own authorship: the
+# signature proved only that its author had read the plan it signed. The key is
+# now derived from the RAW token under a domain label, so it is a value that
+# exists only in the memory of a process that was given the token, and knowing
+# the published digest yields nothing. The domain label keeps this key distinct
+# from any other key that may later be derived from the same token.
+$planSigKeyDerivation = 'hmac-token-domain-v1'
+$planSigKeyMac = [System.Security.Cryptography.HMACSHA256]::new($Utf8.GetBytes($AuthorizationToken))
+try {
+    $planSigKey = $planSigKeyMac.ComputeHash($Utf8.GetBytes($script:AcquisitionPlanSignatureKeyLabel))
+}
+finally { $planSigKeyMac.Dispose() }
 $planSigJson = ConvertTo-Json -InputObject ([ordered]@{
         schemaVersion = 1
         kind          = 'reviewer-blinded-acquisition-plan-signature'
         algorithm     = 'HMACSHA256'
+        keyDerivation = $planSigKeyDerivation
         signature     = (Get-HmacHex -Text $planJson -Key $planSigKey)
     }) -Depth 8
 $planSigBytes = $Utf8.GetBytes($planSigJson)
@@ -1919,7 +2165,17 @@ $telemetry = Get-TelemetrySummary -TelemetryPath $telemetryPath
 
 # -- Finalize: seal on success, terminal evidence on timeout/crash -----------
 $capturePath = Join-Path $packageDir 'capture-core.json'
-if ($supervisorResult.TimedOut) {
+if ([string]$supervisorResult.FailureReason -ceq 'childProcessNotStopped') {
+    # A supervisor that could not prove it stopped its own tree has lost custody
+    # of a model process. That is a distinct terminal status from a timeout: a
+    # timeout ended the run, this one may not have, and the operator has to be
+    # told which it was rather than reading a tidy 'timeout' over a live child.
+    $terminalStatus = 'childProcessNotStoppedTerminal'
+    $exitCode = 125
+    Write-Warning ("The supervised child could not be confirmed stopped: " +
+        "$([string]$supervisorResult.StopDetail)")
+}
+elseif ($supervisorResult.TimedOut) {
     $terminalStatus = 'timeout'
     $exitCode = 124
 }

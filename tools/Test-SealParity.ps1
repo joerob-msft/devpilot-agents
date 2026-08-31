@@ -6,6 +6,22 @@ param()
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repoRoot = Split-Path $PSScriptRoot -Parent
+
+# The hosted CI shell DOT-SOURCES this script and then exits with whatever
+# $LASTEXITCODE holds. The refusal vectors below run the parity binary and
+# REQUIRE it to fail, so the last native exit code left behind here is
+# deliberately non-zero - which reported a failed step for a run in which all
+# seventeen vectors passed in both directions. The script states its own result
+# at the end instead. Asserted here on itself, so removing that trailing exit
+# fails this suite rather than quietly restoring a green run reported as red.
+$sealParitySelf = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)
+$sealParityLast = @($sealParitySelf.EndBlock.Statements | Select-Object -Last 1)
+if (@($sealParityLast).Count -ne 1 -or
+    $sealParityLast[0] -isnot [System.Management.Automation.Language.ExitStatementAst]) {
+    throw ('Test-SealParity must end in an explicit exit: the hosted CI shell dot-sources it and reports ' +
+        '$LASTEXITCODE, which the refusal vectors deliberately leave non-zero.')
+}
+
 $project = Join-Path $PSScriptRoot 'SealParity\SealParity.csproj'
 $vectorsPath = Join-Path $PSScriptRoot 'SealParity\vectors.v1.json'
 $utf8 = [Text.UTF8Encoding]::new($false, $true)
@@ -254,3 +270,4 @@ finally {
 
 if ($failures.Count -gt 0) { throw ($failures -join [Environment]::NewLine) }
 Write-Host "Seal parity: $(@($vectors.vectors).Count) PowerShell/C# vectors passed in both directions."
+exit 0

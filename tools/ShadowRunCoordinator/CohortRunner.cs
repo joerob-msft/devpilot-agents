@@ -372,7 +372,15 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 if (!string.Equals(outcome, CohortEntryOutcomes.Complete, StringComparison.Ordinal))
                 {
                     anyUnsuccessful = true;
-                    if (_manifest.Execution.StopsOnFirstFailure)
+                    // A preparation fault is not a custody witness. Unlike the
+                    // typed run-not-complete exit, it can occur before the
+                    // preparation's own child supervisor accounted for its tree.
+                    // An abandoned timeout is explicitly the same uncertainty.
+                    // Neither may be followed by another entry even when the
+                    // manifest's ordinary failure policy says continue.
+                    if (_manifest.Execution.StopsOnFirstFailure
+                        || string.Equals(outcome, CohortEntryOutcomes.PreparationFaulted, StringComparison.Ordinal)
+                        || string.Equals(outcome, CohortEntryOutcomes.Abandoned, StringComparison.Ordinal))
                     {
                         _log.WriteLine($"stop policy '{_manifest.Execution.StopPolicy}': entry '{entry.EntryId}' ended '{outcome}' and the remaining entries stay pending.");
                         stopped = true;
@@ -447,6 +455,14 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         // request drifted, whose subject drifted, or whose rule bundle changed is
         // refused without ever appearing as a launch that has to be accounted for.
         var request = VerifyEntryPins(entry);
+        // The subject is reserved BEFORE the registry is re-checked, and the
+        // reservation is held for the whole launch and account window below. Taking
+        // it first is what closes F13: two runners that both read the registry as
+        // free cannot both be here at once, because only one can hold this subject's
+        // reservation, and the re-check under it catches a spend a prior holder
+        // recorded and released. A cohort with no counting registry has no shared
+        // account to protect, so it takes no reservation.
+        using var reservation = ReserveSubject(entry, record);
         RequireSubjectStillFree(journal, entry);
 
         var specification = DescribeLaunch(entry);
@@ -544,10 +560,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 "running",
                 $"the preparation for entry '{entry.EntryId}' was started and its identity recorded");
 
-            process.OutputDataReceived += (_, args) => { if (args.Data is not null) { lock (standardOut) { standardOut.AppendLine(args.Data); } } };
-            process.ErrorDataReceived += (_, args) => { if (args.Data is not null) { lock (standardError) { standardError.AppendLine(args.Data); } } };
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
+            var (outputDrained, errorDrained) = ChildToolInvoker.BeginDrainableReaders(process, standardOut, standardError);
             process.StandardInput.Close();
 
             if (!process.WaitForExit(_manifest.Execution.EntryTimeoutSeconds * 1000))
@@ -560,16 +573,50 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 // honest account and the one that refuses to resume the entry.
                 // The log builders are read under their own lock, so a reader that
                 // is still appending is not a race.
-                process.WaitForExit(DrainMilliseconds);
-                outcome = CohortEntryOutcomes.TimedOut;
-                detail = $"the entry exceeded its {_manifest.Execution.EntryTimeoutSeconds.ToString(CultureInfo.InvariantCulture)} second budget and its tree was killed";
+                var rootExited = process.WaitForExit(DrainMilliseconds);
+                var outputClosed = rootExited
+                    && ChildToolInvoker.DrainWithin(outputDrained, errorDrained, DrainMilliseconds);
+                // EOF proves only that no surviving descendant inherited these two
+                // pipes. Without an OS-enforced job/process group, a separately
+                // redirected descendant can survive both the tree-kill snapshot and
+                // the pipe drain. A timeout therefore always retains custody instead
+                // of allowing the cohort to continue on those two weak signals.
+                outcome = ClassifyTimedOutPreparation(rootExited, outputClosed);
+                detail = rootExited && outputClosed
+                    ? $"the entry exceeded its {_manifest.Execution.EntryTimeoutSeconds.ToString(CultureInfo.InvariantCulture)} second budget; its root exited and inherited output closed after cancellation, but no OS containment proves every descendant stopped"
+                    : $"the entry exceeded its {_manifest.Execution.EntryTimeoutSeconds.ToString(CultureInfo.InvariantCulture)} second budget, but its process tree did not close every inherited output handle within {DrainMilliseconds.ToString(CultureInfo.InvariantCulture)}ms";
             }
             else
             {
-                process.WaitForExit();
+                // A REAL drain, not a process-exit check. WaitForExit(ms) returns on
+                // process exit and, by the runtime's contract, does NOT wait for the
+                // redirected streams ("if we have a hard timeout, we cannot wait for
+                // the streams"), so it cannot tell a fully-drained entry from one
+                // whose stdout/stderr write ends a grandchild still holds. The EOF
+                // signals from BeginDrainableReaders are the only honest witness; a
+                // bounded miss is a genuine drain failure. The entry has already
+                // exited here, so its exit code is read before the drain.
                 exitCode = process.ExitCode;
-                outcome = OutcomeFor(exitCode);
-                detail = $"the preparation exited {exitCode.ToString(CultureInfo.InvariantCulture)}";
+                if (ChildToolInvoker.DrainWithin(outputDrained, errorDrained, DrainMilliseconds))
+                {
+                    outcome = OutcomeFor(exitCode);
+                    detail = $"the preparation exited {exitCode.ToString(CultureInfo.InvariantCulture)}";
+                }
+                else
+                {
+                    // The entry exited but a descendant outlived it holding the log
+                    // pipes. Stop the tree best-effort - only best-effort, because
+                    // once the entry process has exited the kill can no longer follow
+                    // a grandchild reparented away from it - and record the entry as
+                    // abandoned rather than reading its exit code as a clean result.
+                    // The truncation and the unconfirmed stop are both named so a
+                    // later reader refuses to resume the entry as if it had finished.
+                    ChildJournal.KillTree(process, DrainMilliseconds);
+                    outcome = CohortEntryOutcomes.Abandoned;
+                    detail =
+                        $"the entry exited {exitCode.ToString(CultureInfo.InvariantCulture)} but its output pipes were still held after "
+                        + $"{DrainMilliseconds.ToString(CultureInfo.InvariantCulture)}ms, so a descendant outlived it, the log may be truncated, and the tree could not be confirmed stopped";
+                }
             }
         }
         finally
@@ -626,6 +673,11 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 EndedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
                 ExitCode = exitCode,
                 Outcome = CohortEntryOutcomes.EvidenceRefused,
+                // This ending is its own pre-adoption ending: a refused entry is
+                // never adopted, and recording the refusal here keeps the ended
+                // record from carrying a 'none' witness that reads as a build that
+                // did not persist one.
+                PreAdoptionOutcome = CohortEntryOutcomes.EvidenceRefused,
                 ElapsedSeconds = elapsed,
                 // Carried out of the refusal rather than defaulted. An entry
                 // closed BECAUSE its audit reported a write must not be summed
@@ -658,6 +710,13 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             EndedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
             ExitCode = exitCode,
             Outcome = outcome,
+            // The ending the run itself reached, kept immutable across an adoption
+            // that overwrites Outcome with 'complete'. This is the witness the
+            // adoption gate reads: an adoption is allowed only over an outcome the
+            // clean-drain branch produced, so a later reader can never mistake a
+            // 'complete' written by adoption for one whose tree was confirmed
+            // stopped when it was not.
+            PreAdoptionOutcome = outcome,
             ElapsedSeconds = elapsed,
             ModelStartCount = summary.ModelStartCount,
             ModelStartUnmeasuredAllowance = summary.ModelStartUnmeasuredAllowance,
@@ -739,9 +798,22 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     private static string OutcomeFor(int exitCode) => exitCode switch
     {
         CoordinatorExitCodes.Ok => CohortEntryOutcomes.Complete,
-        CoordinatorExitCodes.SlotNotComplete => CohortEntryOutcomes.RunNotComplete,
+        // Both are typed coordinator endings whose own contract accounts the
+        // supervised run. A deliberate halt may later be adopted when its
+        // authenticated audit proves the requested target was reached.
+        CoordinatorExitCodes.SlotNotComplete or CoordinatorExitCodes.Halted => CohortEntryOutcomes.RunNotComplete,
         _ => CohortEntryOutcomes.PreparationFaulted
     };
+
+    /// <summary>
+    /// Classifies an outer cohort timeout when no OS containment proves descendant
+    /// custody. Root exit and inherited-pipe EOF are diagnostic only.
+    /// </summary>
+    internal static string ClassifyTimedOutPreparation(bool rootExited, bool outputClosed) =>
+        (rootExited, outputClosed) switch
+        {
+            _ => CohortEntryOutcomes.Abandoned
+        };
 
     /// <summary>
     /// Proves the request on disk is the request this cohort authorized, and that
@@ -1284,22 +1356,56 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     }
 
     /// <summary>
+    /// Takes a durable, identity-bound reservation over an entry's subject when the
+    /// cohort counts against a shared registry, or returns null when it does not.
+    /// </summary>
+    /// <remarks>
+    /// The reservation is the missing serialiser the finding F13 names: the pre-walk
+    /// and the per-entry re-read both only READ the registry, so two cohorts can each
+    /// read a subject as free and each launch it. Holding this across the launch and
+    /// the sample the launch produces means the second runner refuses at the door
+    /// rather than after its models have run. It is only meaningful for a counting
+    /// registry; a diagnostic run may repeat a subject on purpose, and a cohort with
+    /// no registry has no shared account to guard.
+    /// </remarks>
+    private SubjectReservation? ReserveSubject(CohortEntry entry, CohortEntryRecord record)
+    {
+        if (_manifest.Registry is not { } binding)
+        {
+            return null;
+        }
+        if (!string.Equals(binding.Mode, CohortRegistryModes.Count, StringComparison.Ordinal))
+        {
+            return null;
+        }
+        return SubjectReservation.Acquire(
+            binding.Path,
+            CohortRegistry.SubjectKeyOf(entry),
+            _manifest.CohortId,
+            entry.EntryId,
+            _manifest.ManifestSha256,
+            // If no intent exists, the signed journal proves process creation was
+            // never reached: launch intent is committed before Process.Start. If an
+            // intent does exist, RequireResumable above permits this point only for
+            // a complete recorded child identity that is now dead.
+            allowOwnerRecovery: SubjectReservation.OwnerRecoveryAuthorizedAfterResumable(
+                record.HasOpenLaunch,
+                record.ChildProcessId,
+                record.ChildStartedAtUtc));
+    }
+
+    /// <summary>
     /// Re-reads the account immediately before a child starts, and refuses a subject
     /// another run has claimed since the pre-walk.
     /// </summary>
     /// <remarks>
     /// The pre-walk settles admission for the whole cohort at once, which is what
-    /// lets a two-entry cohort refuse both rather than spend the first. But nothing
-    /// outside the account serializes two cohorts, and a second cohort launched
-    /// against the same pull request after the pre-walk and before this entry starts
-    /// would spend it for real - the write gate would stop the second ROW, and by
-    /// then the models have already run.
-    ///
-    /// So the account is read again here, from disk, in the last moment before the
-    /// process exists. It does not close the window - nothing local does, short of
-    /// reserving the subject before any evidence exists to record - but it narrows it
-    /// from the length of a cohort to the length of a launch, and it costs one read.
-    /// A revision that has moved is admitted on the same terms the pre-walk admits
+    /// lets a two-entry cohort refuse both rather than spend the first. This re-read
+    /// is the last check before the process exists, and it now runs UNDER the
+    /// subject reservation taken in <see cref="ReserveSubject"/>: the reservation
+    /// serialises two cohorts over one subject, and this read catches a spend a
+    /// prior reservation holder recorded and released before this run took it. A
+    /// revision that has moved is admitted on the same terms the pre-walk admits
     /// one: bound, this cohort's own, or one step past it.
     /// </remarks>
     private void RequireSubjectStillFree(CohortJournal journal, CohortEntry entry)
@@ -2543,5 +2649,563 @@ internal sealed class CohortLease : IDisposable
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
         }
+    }
+}
+
+/// <summary>
+/// A durable, identity-bound claim over one SUBJECT taken before that subject's
+/// preparation is started, so two cohort runners pointed at one shared registry
+/// cannot both pass the free-subject check and both launch the same pull request.
+/// </summary>
+/// <remarks>
+/// The cohort lease serialises runners over one JOURNAL ROOT, and the registry
+/// records which subjects have been SPENT. Neither closes the window F13 names:
+/// two cohorts with different manifests both read a registry that does not yet
+/// hold the subject, both decide it is free, and both start a preparation for it -
+/// duplicate spend that no later reader can undo, because by then both sets of
+/// models have run.
+///
+/// This closes it with the same mechanism the leases use, keyed on the subject
+/// rather than the root. The reservation is a file created with
+/// <see cref="FileMode.CreateNew"/> at a path folded from the subject key, so only
+/// one runner wins the create; the loser reads the holder record and refuses while
+/// that holder is live. The winner holds the handle open for the whole launch and
+/// account window. Graceful release removes the durable file through an exclusive
+/// identity-bound handle; a crash closes the live handle but deliberately leaves the
+/// record standing. Only the SAME cohort entry may reclaim that record, and only
+/// after its signed journal proves a previously recorded child identity is no longer
+/// live. A different cohort can never reinterpret a crashed runner as a free subject
+/// while that runner's unaccounted preparation may still exist.
+/// </remarks>
+internal sealed class SubjectReservation : IDisposable
+{
+    private const string ContractVersionValue = "devpilot.shadow-cohort.subject-reservation.v1";
+    private const int PublishGraceSeconds = 30;
+
+    private FileStream? _handle;
+    private readonly string _path;
+    private bool _released;
+
+    private SubjectReservation(FileStream handle, string path)
+    {
+        _handle = handle;
+        _path = path;
+    }
+
+    /// <summary>
+    /// Whether a journal that already passed <see cref="CohortJournal.RequireResumable"/>
+    /// can authorize the exact recorded owner to recover its stale reservation.
+    /// </summary>
+    internal static bool OwnerRecoveryAuthorizedAfterResumable(
+        bool hasOpenLaunch,
+        int childProcessId,
+        string childStartedAtUtc) =>
+        !hasOpenLaunch
+        || (childProcessId > 0 && CohortJournal.IsUsableStartTime(childStartedAtUtc));
+
+    /// <summary>The directory reservations for one registry live in, folded from its path.</summary>
+    internal static string DirectoryFor(string registryPath) => registryPath + ".reservations";
+
+    /// <summary>
+    /// Takes the reservation for one subject, or refuses if a live runner holds it.
+    /// </summary>
+    /// <param name="registryPath">The shared registry the subject is counted against.</param>
+    /// <param name="subjectKey">The folded subject identity; already filename-safe hex.</param>
+    /// <param name="cohortId">The cohort taking the reservation, for a reader.</param>
+    /// <param name="entryId">The entry taking it, for a reader.</param>
+    /// <param name="manifestSha256">The manifest digest, for a reader.</param>
+    internal static SubjectReservation Acquire(
+        string registryPath,
+        string subjectKey,
+        string cohortId,
+        string entryId,
+        string manifestSha256,
+        bool allowOwnerRecovery = false)
+    {
+        var directory = DirectoryFor(registryPath);
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, subjectKey + ".reservation.json");
+        var current = Process.GetCurrentProcess();
+        var record = new MapNode()
+            .Set("contractVersion", ContractVersionValue)
+            .Set("subjectKey", subjectKey)
+            .Set("cohortId", cohortId)
+            .Set("entryId", entryId)
+            .Set("manifestSha256", manifestSha256)
+            .Set("processId", current.Id)
+            .Set("processStartedAtUtc", current.StartTime.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture))
+            .Set("reservedAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+        var bytes = StrictJson.StrictUtf8.GetBytes(CanonicalJson.Readable(record));
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var stagedPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                // Publish a COMPLETE owner record before it becomes the contested
+                // path. File.Move without overwrite is the CreateNew operation: one
+                // candidate wins atomically, while a crash can leave either no
+                // reservation or a fully attributable one, never a half-written
+                // fixed-path record that no owner could recover.
+                using (var staged = new FileStream(
+                    stagedPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    bufferSize: 4096,
+                    FileOptions.None))
+                {
+                    staged.Write(bytes, 0, bytes.Length);
+                    staged.Flush(flushToDisk: true);
+                }
+                File.Move(stagedPath, path);
+                // No delete-on-close: an OS closes handles when a runner crashes,
+                // and deleting here would erase the only cross-cohort custody record
+                // while the runner's preparation may still be alive.
+                var handle = new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Write,
+                    FileShare.Read,
+                    bufferSize: 4096,
+                    FileOptions.None);
+                return new SubjectReservation(handle, path);
+            }
+            catch (IOException) when (File.Exists(path))
+            {
+                var holder = ReadHolder(path);
+                if (holder is not null && IsHolderLive(holder.Value.ProcessId, holder.Value.StartedAtUtc))
+                {
+                    throw new CohortBlockedException(
+                        $"Subject '{subjectKey}' is reserved by process {holder.Value.ProcessId.ToString(CultureInfo.InvariantCulture)} " +
+                        $"(cohort '{holder.Value.CohortId}', entry '{holder.Value.EntryId}') at '{path}'. Another cohort runner is between " +
+                        "reading the registry as free and recording the spend for this subject, and starting now would spend it twice. " +
+                        "Nothing has been launched for this entry.");
+                }
+                if (holder is null && IsWithinPublishGrace(path))
+                {
+                    // Current writers atomically move a complete record into place,
+                    // but an unreadable fixed-path file may have been created by an
+                    // older writer or external interference. A recent one is treated
+                    // as live rather than stolen while it may still be publishing.
+                    throw new CohortBlockedException(
+                        $"The reservation for subject '{subjectKey}' at '{path}' was created within the last " +
+                        $"{PublishGraceSeconds.ToString(CultureInfo.InvariantCulture)} second(s) and has not published its holder record yet; " +
+                        "it is treated as live rather than stolen.");
+                }
+                var sameOwner = holder is not null
+                    && string.Equals(holder.Value.CohortId, cohortId, StringComparison.Ordinal)
+                    && string.Equals(holder.Value.EntryId, entryId, StringComparison.Ordinal)
+                    && string.Equals(holder.Value.ManifestSha256, manifestSha256, StringComparison.Ordinal);
+                if (!allowOwnerRecovery || !sameOwner)
+                {
+                    throw new CohortBlockedException(
+                        $"Subject '{subjectKey}' retains a reservation from a stopped runner at '{path}'. Only the same cohort entry may recover it, "
+                        + "and only after its signed journal proves the recorded preparation child is no longer live. A different cohort cannot "
+                        + "treat a crashed runner as free while its unaccounted preparation may still be running.");
+                }
+                // The same entry's signed journal has already passed RequireResumable:
+                // either it proves no launch intent was committed, or it names a
+                // complete child identity and that exact child is gone. Reclaim
+                // through an exclusive handle, never by path.
+                if (!TryReclaimAbandoned(path))
+                {
+                    throw new CohortBlockedException(
+                        $"The reservation for subject '{subjectKey}' at '{path}' is held open by another process; " +
+                        "a live runner won the reservation while this one was reclaiming an abandoned holder, and starting now would spend the subject twice. " +
+                        "Nothing has been launched for this entry.");
+                }
+            }
+            finally
+            {
+                try { File.Delete(stagedPath); } catch (IOException) { }
+            }
+        }
+        throw new CohortBlockedException($"The reservation for subject '{subjectKey}' at '{path}' was taken by another process.");
+    }
+
+    private static (int ProcessId, DateTime StartedAtUtc, string CohortId, string EntryId, string ManifestSha256)? ReadHolder(string path)
+    {
+        try
+        {
+            const string label = "cohort subject reservation";
+            var root = StrictJson.ReadObjectFile(path, label, maximumBytes: 64 * 1024);
+            var processId = StrictJson.RequireInt(root, "processId", label, 1, int.MaxValue);
+            var startedText = StrictJson.RequireString(root, "processStartedAtUtc", label);
+            var cohortId = StrictJson.RequireString(root, "cohortId", label);
+            var entryId = StrictJson.RequireString(root, "entryId", label);
+            var manifestSha256 = StrictJson.RequireString(root, "manifestSha256", label);
+            if (!DateTime.TryParse(startedText, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var started))
+            {
+                return null;
+            }
+            return (processId, started.ToUniversalTime(), cohortId, entryId, manifestSha256);
+        }
+        catch (Exception error) when (error is ContractException or FormatException or IOException)
+        {
+            return null;
+        }
+    }
+
+    private static bool IsWithinPublishGrace(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            var stamped = info.CreationTimeUtc > info.LastWriteTimeUtc ? info.CreationTimeUtc : info.LastWriteTimeUtc;
+            var age = DateTime.UtcNow - stamped;
+            return age >= TimeSpan.Zero && age < TimeSpan.FromSeconds(PublishGraceSeconds);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsHolderLive(int processId, DateTime startedAtUtc)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            if (process.HasExited)
+            {
+                return false;
+            }
+            return Math.Abs((process.StartTime.ToUniversalTime() - startedAtUtc).TotalSeconds) < 1.0;
+        }
+        catch (Exception error) when (error is ArgumentException or InvalidOperationException)
+        {
+            return false;
+        }
+        // A holder this user cannot inspect is deliberately NOT treated as dead:
+        // stealing a reservation from a process we cannot see is the one direction
+        // where being wrong spends a subject twice.
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return true;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_released)
+        {
+            return;
+        }
+        _released = true;
+        _handle?.Dispose();
+        _handle = null;
+        // A cooperating contender that arrives in this narrow window reads this
+        // process as live and refuses; it never replaces the path. Short-lived
+        // reader probes may deny the exclusive reopen, so give them a bounded chance
+        // to close. Failure leaves a safe stale reservation rather than deleting by
+        // path and risking a fresh winner's identity.
+        for (var attempt = 0; attempt < 11; attempt++)
+        {
+            if (TryReclaimAbandoned(_path))
+            {
+                break;
+            }
+            Thread.Sleep(Math.Min(512, 2 << attempt));
+        }
+    }
+
+    /// <summary>
+    /// Removes a reservation file, and ONLY one no live runner holds open, binding
+    /// the removal to the identity on disk rather than to a path.
+    /// </summary>
+    /// <remarks>
+    /// The window this closes is between deciding a reservation is abandoned (or
+    /// releasing our own) and acting on it: another runner wins the CreateNew race
+    /// at the same path and becomes a live holder, and a delete-by-path then
+    /// destroys that LIVE reservation - two runners hold one subject and spend its
+    /// models twice. A live holder shares only <see cref="FileShare.Read"/>, so an
+    /// exclusive open that also asks for write is denied for exactly as long as any
+    /// holder keeps the file open. The open therefore succeeds only when no process
+    /// holds the reservation, and delete-on-close removes precisely that file
+    /// through the same handle with no second window. This matters more off Windows
+    /// than on it: a by-path File.Delete throws against a live FileShare.Read holder
+    /// on Windows but UNLINKS the entry regardless of open handles on Linux and
+    /// macOS, so only this identity test stops the live holder's reservation from
+    /// being unlinked out from under it there.
+    /// </remarks>
+    private static bool TryReclaimAbandoned(string path)
+    {
+        try
+        {
+            using var _ = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1,
+                FileOptions.DeleteOnClose);
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            // Already gone: the path is free by the same result reclaiming it would
+            // have produced.
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return true;
+        }
+        catch (IOException)
+        {
+            // A live holder - a replacement that won the race, or our own handle not
+            // yet closed - holds the file open. It is NOT reclaimed, the safe
+            // direction: never delete a reservation another runner is holding.
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Test seam: exercises <see cref="TryReclaimAbandoned"/> directly.</summary>
+    internal static bool ReclaimForTests(string path) => TryReclaimAbandoned(path);
+
+    /// <summary>
+    /// Exercises the reservation's mutual exclusion and crash recovery without
+    /// starting any real preparation. Returns 0 when every check holds.
+    /// </summary>
+    internal static int SelfTest(string root, TextWriter log)
+    {
+        Directory.CreateDirectory(root);
+        var registryPath = Path.Combine(root, "cohort-registry.json");
+        var subject = CanonicalJson.Sha256HexOfText("contoso/widgets/api#42");
+        var failures = 0;
+
+        void Check(bool ok, string message)
+        {
+            log.WriteLine((ok ? "  PASS  " : "  FAIL  ") + message);
+            if (!ok)
+            {
+                failures++;
+            }
+        }
+
+        log.WriteLine("Subject reservation");
+
+        // A live holder refuses a second acquisition of the same subject. The
+        // held reservation stands in for the concurrent runner: this process IS a
+        // live holder while the handle is open, so a second Acquire must refuse.
+        using (var first = Acquire(registryPath, subject, "cohort-a", "entry-1", "manifest-aaa"))
+        {
+            var refused = false;
+            try
+            {
+                using var _ = Acquire(registryPath, subject, "cohort-b", "entry-1", "manifest-bbb");
+            }
+            catch (CohortBlockedException)
+            {
+                refused = true;
+            }
+            Check(refused, "a second runner is refused the subject a live runner holds");
+
+            // A DIFFERENT subject is never blocked by this one.
+            var otherSubject = CanonicalJson.Sha256HexOfText("contoso/widgets/api#43");
+            var tookOther = false;
+            try
+            {
+                using var other = Acquire(registryPath, otherSubject, "cohort-b", "entry-2", "manifest-bbb");
+                tookOther = true;
+            }
+            catch (CohortBlockedException)
+            {
+            }
+            Check(tookOther, "a different subject is not blocked by an unrelated live reservation");
+        }
+
+        // Release frees it: the same subject can be reserved again once the holder
+        // disposed.
+        var reacquired = false;
+        try
+        {
+            using var again = Acquire(registryPath, subject, "cohort-c", "entry-1", "manifest-ccc");
+            reacquired = true;
+        }
+        catch (CohortBlockedException)
+        {
+        }
+        Check(reacquired, "a released subject can be reserved again");
+
+        // Crash recovery is owner-bound. A different cohort may not reclaim a
+        // reservation left by a dead runner because its preparation may survive.
+        // Stage one by hand with a process identity that cannot be live -
+        // this process's own id paired with a start time a full day in the past, so
+        // the liveness test's one-second tolerance rejects it as a recycled id.
+        var directory = DirectoryFor(registryPath);
+        Directory.CreateDirectory(directory);
+        var stalePath = Path.Combine(directory, subject + ".reservation.json");
+        var stale = new MapNode()
+            .Set("contractVersion", ContractVersionValue)
+            .Set("subjectKey", subject)
+            .Set("cohortId", "cohort-crashed")
+            .Set("entryId", "entry-1")
+            .Set("manifestSha256", "manifest-dead")
+            .Set("processId", Process.GetCurrentProcess().Id)
+            .Set("processStartedAtUtc", DateTime.UtcNow.AddDays(-1).ToString("O", CultureInfo.InvariantCulture))
+            .Set("reservedAtUtc", DateTime.UtcNow.AddDays(-1).ToString("O", CultureInfo.InvariantCulture));
+        File.WriteAllBytes(stalePath, StrictJson.StrictUtf8.GetBytes(CanonicalJson.Readable(stale)));
+        // Age it past the publish grace so it cannot be mistaken for a fresh winner.
+        var aged = DateTime.UtcNow.AddSeconds(-(PublishGraceSeconds + 5));
+        File.SetCreationTimeUtc(stalePath, aged);
+        File.SetLastWriteTimeUtc(stalePath, aged);
+        var foreignRefused = false;
+        try
+        {
+            using var recovered = Acquire(registryPath, subject, "cohort-recovery", "entry-1", "manifest-eee");
+        }
+        catch (CohortBlockedException)
+        {
+            foreignRefused = true;
+        }
+        Check(foreignRefused, "a different cohort cannot reclaim a crashed holder while its preparation may survive");
+        var ownerMismatchRefused = false;
+        try
+        {
+            using var recovered = Acquire(
+                registryPath,
+                subject,
+                "cohort-other",
+                "entry-9",
+                "manifest-other",
+                allowOwnerRecovery: true);
+        }
+        catch (CohortBlockedException)
+        {
+            ownerMismatchRefused = true;
+        }
+        Check(ownerMismatchRefused, "journal recovery authority cannot cross the crashed reservation's owner identity");
+        Check(
+            OwnerRecoveryAuthorizedAfterResumable(
+                hasOpenLaunch: false,
+                childProcessId: 0,
+                childStartedAtUtc: "none")
+            && !OwnerRecoveryAuthorizedAfterResumable(
+                hasOpenLaunch: true,
+                childProcessId: 0,
+                childStartedAtUtc: "none")
+            && OwnerRecoveryAuthorizedAfterResumable(
+                hasOpenLaunch: true,
+                childProcessId: 7,
+                childStartedAtUtc: DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)),
+            "a pending journal recovers the pre-intent crash window while an incomplete open launch remains blocked");
+        var reclaimed = false;
+        try
+        {
+            using var recovered = Acquire(
+                registryPath,
+                subject,
+                "cohort-crashed",
+                "entry-1",
+                "manifest-dead",
+                allowOwnerRecovery: true);
+            reclaimed = true;
+        }
+        catch (CohortBlockedException)
+        {
+        }
+        Check(reclaimed, "the original entry reclaims its reservation only after journal-backed child recovery");
+
+        // A fresh, unflushed-looking reservation inside the publish grace is NOT
+        // stolen: stage a holder record that does not parse, dated now.
+        var graceDir = DirectoryFor(Path.Combine(root, "grace-registry.json"));
+        Directory.CreateDirectory(graceDir);
+        var gracePath = Path.Combine(graceDir, subject + ".reservation.json");
+        File.WriteAllBytes(gracePath, StrictJson.StrictUtf8.GetBytes("{ this is not the holder record yet"));
+        var refusedFresh = false;
+        try
+        {
+            using var _ = Acquire(Path.Combine(root, "grace-registry.json"), subject, "cohort-x", "entry-1", "manifest-fff");
+        }
+        catch (CohortBlockedException)
+        {
+            refusedFresh = true;
+        }
+        Check(refusedFresh, "a just-created reservation with no readable holder record is treated as live, not stolen");
+
+        // Finding B regression: reclaim and release are bound to the file's
+        // IDENTITY, not its path. Stage a reservation file and hold it open exactly
+        // as a live runner does - FileShare.Read, no share-delete - then ask the
+        // reclaim path to remove it. The identity-bound reopen is denied while any
+        // holder keeps the file open, so the reservation SURVIVES.
+        //
+        // Windows honesty: on Windows even the pre-fix by-path File.Delete throws
+        // against a live FileShare.Read holder, so the file would survive there too;
+        // this check therefore cannot, on Windows alone, distinguish the old code
+        // from the new. On .NET for Linux and macOS the pre-fix File.Delete UNLINKS
+        // the entry regardless of the open handle, so there the old code fails this
+        // check while the identity-bound reopen passes. What it proves everywhere is
+        // that the release/reclaim path refuses to remove a reservation a live
+        // holder is holding.
+        var identityDir = DirectoryFor(Path.Combine(root, "identity-registry.json"));
+        Directory.CreateDirectory(identityDir);
+        var heldPath = Path.Combine(identityDir, subject + ".reservation.json");
+        File.WriteAllBytes(heldPath, StrictJson.StrictUtf8.GetBytes("{ \"subjectKey\": \"held\" }"));
+        using (var liveHolder = new FileStream(heldPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            var reclaimedLive = ReclaimForTests(heldPath);
+            Check(!reclaimedLive, "reclaim refuses a reservation a live holder is holding open");
+            Check(File.Exists(heldPath), "a live holder's reservation survives an identity-bound reclaim attempt");
+        }
+
+        // Once no holder holds it, the same identity-bound reopen removes it
+        // atomically through the delete-on-close handle - no by-path delete.
+        var reclaimedFree = ReclaimForTests(heldPath);
+        Check(reclaimedFree, "reclaim removes a reservation no process is holding");
+        Check(!File.Exists(heldPath), "an unheld reservation is gone after an identity-bound reclaim");
+
+        // A normal ReadHolder probe is short-lived. Release closes the durable live
+        // handle, then retries the identity-bound exclusive removal until that probe
+        // closes; it never falls back to deleting by path.
+        var releaseRegistry = Path.Combine(root, "release-registry.json");
+        var releaseDir = DirectoryFor(releaseRegistry);
+        Directory.CreateDirectory(releaseDir);
+        var releasePath = Path.Combine(releaseDir, subject + ".reservation.json");
+        FileStream? readerProbe = null;
+        try
+        {
+            var held = Acquire(releaseRegistry, subject, "cohort-rel", "entry-1", "manifest-rel");
+            readerProbe = new FileStream(
+                releasePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            var probeToClose = readerProbe;
+            var closeProbe = Task.Run(() =>
+            {
+                Thread.Sleep(50);
+                probeToClose.Dispose();
+            });
+            held.Dispose();
+            closeProbe.Wait();
+            readerProbe = null;
+            Check(!File.Exists(releasePath), "release removes the reservation after a concurrent reader probe closes");
+            var reReserved = false;
+            try
+            {
+                using var again = Acquire(releaseRegistry, subject, "cohort-rel2", "entry-1", "manifest-rel2");
+                reReserved = true;
+            }
+            catch (CohortBlockedException)
+            {
+            }
+            Check(reReserved, "the subject is immediately re-reservable after a release that overlapped a reader probe");
+        }
+        finally
+        {
+            readerProbe?.Dispose();
+        }
+
+        if (failures == 0)
+        {
+            log.WriteLine();
+            log.WriteLine("All 14 subject reservation checks passed.");
+        }
+        return failures == 0 ? 0 : 1;
     }
 }

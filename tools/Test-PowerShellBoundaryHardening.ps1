@@ -204,6 +204,63 @@ $cmdArgs[0]
 } finally {
     if (Test-Path -LiteralPath $crossFileRoot) { Remove-Item -LiteralPath $crossFileRoot -Recurse -Force }
 }
+
+# ------------------------------------- analyzer survivability on ordinary calls
+#
+# The scan must not be abortable by a call site. A function with a mandatory
+# array parameter that is NOT the first positional one, called with a splat or
+# with a plain positional argument, used to make the PSEN001 positional-mapping
+# lookup match nothing; under Set-StrictMode reading .Key off that empty result
+# threw, the analyzer exited non-zero, and the repository gate above got no
+# findings at all. A crashed analyzer is a disabled gate, so this asserts the
+# scan completes AND still reports the real finding in the same files.
+$survivalRoot = Join-Path ([IO.Path]::GetTempPath()) ("boundary-survival-" + [guid]::NewGuid().ToString('N').Substring(0, 12))
+$survivalFailures = [System.Collections.Generic.List[string]]::new()
+try {
+    [void](New-Item -ItemType Directory -Path $survivalRoot)
+    $survivalEncoding = [Text.UTF8Encoding]::new($false)
+    [IO.File]::WriteAllText((Join-Path $survivalRoot 'producer.ps1'), @'
+function Invoke-SurvivalProducer {
+    param(
+        [Parameter(Mandatory)]$Envelope,
+        [Parameter(Mandatory)][byte[]]$RunKey,
+        [Parameter(Mandatory)][string]$ExpectedRunId
+    )
+    return "$Envelope/$($RunKey.Count)/$ExpectedRunId"
+}
+'@, $survivalEncoding)
+    [IO.File]::WriteAllText((Join-Path $survivalRoot 'consumer.ps1'), @'
+$expectations = @{ ExpectedRunId = 'run-1' }
+$key = [byte[]]@(1, 2, 3)
+Invoke-SurvivalProducer -Envelope 'e' -RunKey $key @expectations
+Invoke-SurvivalProducer 'e' $key 'run-1'
+$rows = Get-ChildItem
+$rows.Count
+'@, $survivalEncoding)
+
+    $survival = [object[]]@()
+    $survivalError = ''
+    try {
+        $survival = [object[]]@(& $analyzer -Path $survivalRoot -Recurse -RuleId $boundaryRules -OutputFormat Json |
+                Out-String | ConvertFrom-Json)
+    }
+    catch { $survivalError = [string]$_.Exception.Message }
+    if ($survivalError) {
+        [void]$survivalFailures.Add("The analyzer threw on a splatted/positional call of a function with a mandatory array parameter ($survivalError); a scan that crashes reports no findings and silently disables the gate.")
+    }
+    $survivalCounted = @($survival | Where-Object {
+            ([string]$_.File).EndsWith('consumer.ps1') -and [string]$_.RuleId -ceq 'PSEN009'
+        }).Count
+    if ($survivalCounted -lt 1) {
+        [void]$survivalFailures.Add("The analyzer completed but stopped reporting the PSEN009 site in the same file as the splatted call; got $survivalCounted.")
+    }
+} finally {
+    if (Test-Path -LiteralPath $survivalRoot) { Remove-Item -LiteralPath $survivalRoot -Recurse -Force }
+}
+if ($survivalFailures.Count -gt 0) {
+    foreach ($failure in $survivalFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }
+    exit 1
+}
 if ($crossFileFailures.Count -gt 0) {
     foreach ($failure in $crossFileFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }
     exit 1

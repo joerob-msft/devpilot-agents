@@ -410,6 +410,66 @@ try {
             -Action { param($ArtifactPath) Read-ReviewerStageArtifact -Path $ArtifactPath -Kind 'fixture.stage.union' }
     }
 
+    # -----------------------------------------------------------------------
+    # F5: scalar envelope integers are validated as genuine JSON integers.
+    # A bare [int] cast silently accepts a quoted "3", a boolean $true, and a
+    # fractional 3.7, so the reader must reject those shapes and accept only
+    # integral numerics (including an exactly-integral JSON double such as 2.0).
+    # -----------------------------------------------------------------------
+    $integerRejectionCases = [object[]]@(
+        @{ Name = 'read/rejects-string-envelope-version'; Text = (New-Envelope -Overrides @{ envelopeVersion = '1' }); Expect = "field 'envelopeVersion' is a string" }
+        @{ Name = 'read/rejects-boolean-envelope-version'; Text = (New-Envelope -Overrides @{ envelopeVersion = $true }); Expect = "field 'envelopeVersion' is a boolean" }
+        @{ Name = 'read/rejects-string-depth'; Text = (New-Envelope -Overrides @{ depth = '12' }); Expect = "field 'depth' is a string" }
+        @{ Name = 'read/rejects-fractional-depth'; Text = (New-Envelope -Overrides @{ depth = 3.7 }); Expect = "field 'depth' is a fractional number" }
+        @{ Name = 'read/rejects-string-contract-version'; Text = (New-Envelope -Overrides @{ contractVersion = '2' }); Expect = "field 'contractVersion' is a string" }
+        @{ Name = 'read/rejects-boolean-contract-version'; Text = (New-Envelope -Overrides @{ contractVersion = $true }); Expect = "field 'contractVersion' is a boolean" }
+        @{ Name = 'read/rejects-fractional-contract-version'; Text = (New-Envelope -Overrides @{ contractVersion = 2.7 }); Expect = "field 'contractVersion' is a fractional number" }
+    )
+    foreach ($case in $integerRejectionCases) {
+        $path = Write-RawArtifact -Name ("intfield-" + ($case.Name -replace '[^a-z0-9]', '-') + '.json') -Text $case.Text
+        Assert-Throws -Name $case.Name -Expect $case.Expect -Arguments @($path) `
+            -Action { param($ArtifactPath) Read-ReviewerStageArtifact -Path $ArtifactPath -Kind 'fixture.stage.union' }
+    }
+
+    # An exactly-integral JSON double (2.0) is a valid integer and still reads.
+    $integralDoublePath = Write-RawArtifact -Name 'intfield-integral-double.json' -Text (New-Envelope -Overrides @{ contractVersion = 2.0 })
+    $integralDoubleRead = Read-ReviewerStageArtifact -Path $integralDoublePath -Kind 'fixture.stage.union'
+    Assert-True -Name 'read/accepts-integral-double-contract-version' `
+        -Condition ($null -ne $integralDoubleRead -and $integralDoubleRead.ContractVersion -eq 2) `
+        -Detail 'an exactly-integral JSON double must read as an integer'
+
+    # -----------------------------------------------------------------------
+    # F6: the write verifier hashes the bytes actually on disk, not the bytes
+    # it intended to write, and returns that verified digest. A same-length
+    # substitution made after the atomic move must be caught rather than blessed
+    # with the intended digest.
+    # -----------------------------------------------------------------------
+    $faultPath = Join-Path $root 'fault-injection.json'
+    $faultWrite = Write-ReviewerStageArtifact -Path $faultPath -Kind 'fixture.stage.union' `
+        -Payload (New-FixturePayload -ItemCount 1) -Depth 12 -Form compact
+    $onDiskBytes = [IO.File]::ReadAllBytes($faultPath)
+    $independentDigest = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($onDiskBytes)).ToLowerInvariant()
+    Assert-True -Name 'write/returns-verified-on-disk-digest' `
+        -Condition ($faultWrite.Sha256 -ceq $independentDigest) `
+        -Detail 'the returned digest did not describe the bytes on disk'
+
+    # The intended bytes are the bytes that were really written; substitute a
+    # single byte of the same length and confirm the verifier refuses the file.
+    $intendedBytes = [byte[]]::new($onDiskBytes.Length)
+    [Array]::Copy($onDiskBytes, $intendedBytes, $onDiskBytes.Length)
+    $tampered = [byte[]]::new($onDiskBytes.Length)
+    [Array]::Copy($onDiskBytes, $tampered, $onDiskBytes.Length)
+    $flipIndex = 5
+    $tampered[$flipIndex] = [byte]($tampered[$flipIndex] -bxor 0x20)
+    [IO.File]::WriteAllBytes($faultPath, $tampered)
+    Assert-True -Name 'fault/substitution-preserves-length' `
+        -Condition ((([IO.File]::ReadAllBytes($faultPath)).Length) -eq $intendedBytes.Length) `
+        -Detail 'the fault-injection test must keep the byte length identical'
+    Assert-Throws -Name 'fault/on-disk-verifier-rejects-substitution' `
+        -Expect 'altered between write and verification' -Arguments @($faultPath, $intendedBytes) `
+        -Action { param($ArtifactPath, $Original) Assert-ReviewerStageArtifactOnDisk -Path $ArtifactPath -Kind 'fixture.stage.union' -IntendedBytes $Original }
+
     $indentedText = [IO.File]::ReadAllText($indentedPath)
     $mislabeled = $indentedText.Trim() | ConvertFrom-Json -Depth 32 -AsHashtable
     $mislabeled.form = 'compact'

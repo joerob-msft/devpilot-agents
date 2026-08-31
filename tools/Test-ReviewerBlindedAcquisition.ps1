@@ -521,9 +521,25 @@ function Invoke-ChildDirect {
 # every identity is authentically bound under a KNOWN token - the same construction the
 # inner gate verifies. Used only to prove fail-closed refusals (non-git RepoPath, etc.).
 function Get-TestPlanHmacHex {
-    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][string]$Token)
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$Token,
+        # 'domain' is the shipping derivation. 'disclosed' reproduces the retired
+        # one - the key that is simply SHA-256(token), the value the plan itself
+        # publishes as authorizationTokenSha256 - so a test can sign exactly the
+        # way anyone who has merely READ a plan file could sign, and watch the
+        # child refuse it.
+        [ValidateSet('domain', 'disclosed')][string]$KeyDerivation = 'domain'
+    )
     $u = [System.Text.UTF8Encoding]::new($false, $true)
-    $keyBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash($u.GetBytes($Token))
+    $keyBytes = if ($KeyDerivation -ceq 'disclosed') {
+        [System.Security.Cryptography.SHA256]::Create().ComputeHash($u.GetBytes($Token))
+    }
+    else {
+        $derive = [System.Security.Cryptography.HMACSHA256]::new($u.GetBytes($Token))
+        try { $derive.ComputeHash($u.GetBytes('devpilot.reviewer.blinded-acquisition.plan-signature.v1')) }
+        finally { $derive.Dispose() }
+    }
     $h = [System.Security.Cryptography.HMACSHA256]::new($keyBytes)
     try { return ([BitConverter]::ToString($h.ComputeHash($u.GetBytes($Text)))).Replace('-', '').ToLowerInvariant() }
     finally { $h.Dispose() }
@@ -550,6 +566,7 @@ function New-ResignedPlan {
         schemaVersion = 1
         kind          = 'reviewer-blinded-acquisition-plan-signature'
         algorithm     = 'HMACSHA256'
+        keyDerivation = 'hmac-token-domain-v1'
         signature     = (Get-TestPlanHmacHex -Text $text -Token $Token)
     }
     [IO.File]::WriteAllText("$DstPlan.sig", (($sig | ConvertTo-Json -Depth 8)), $u)
@@ -2101,6 +2118,7 @@ else {
             schemaVersion = 1
             kind = 'reviewer-blinded-acquisition-plan-signature'
             algorithm = 'HMACSHA256'
+            keyDerivation = 'hmac-token-domain-v1'
             signature = (Get-TestPlanHmacHex -Text $timeoutTamperText -Token $knownToken)
         }
         [IO.File]::WriteAllText("$resignedTimeoutPlan.sig",
@@ -2112,6 +2130,45 @@ else {
         Check 're-signed timeout substitution fails the runtime plan binding' (
             $resignedTimeout.Exit -ne 0 -and -not $resignedTimeout.Captured -and
             $resignedTimeout.Log -match 'does not match the signed plan timeout binding')
+
+        # -- The signing key must not be a value the plan hands out ----------
+        # The plan publishes authorizationTokenSha256 in clear. When that same
+        # digest was the HMAC key, reading a plan file was enough to sign one:
+        # the two fixtures below sign EXACTLY the way a reader of the plan could,
+        # over unmodified plan bytes, and both must be refused before any launch.
+        $disclosedKeyPlan = Join-Path $runRoot 'plan-disclosed-key.json'
+        $kcPlanText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $kcPlan).Path, $u8)
+        [IO.File]::WriteAllText($disclosedKeyPlan, $kcPlanText, $u8)
+        [IO.File]::WriteAllText("$disclosedKeyPlan.sig", (([ordered]@{
+                        schemaVersion = 1
+                        kind = 'reviewer-blinded-acquisition-plan-signature'
+                        algorithm = 'HMACSHA256'
+                        keyDerivation = 'hmac-token-domain-v1'
+                        signature = (Get-TestPlanHmacHex -Text $kcPlanText -Token $knownToken -KeyDerivation 'disclosed')
+                    } | ConvertTo-Json -Depth 8 -Compress:$false)), $u8)
+        $disclosedKey = Invoke-ChildDirect -Label 'disclosedKeySignature' `
+            -PlanFile $disclosedKeyPlan -Projection $genProjection `
+            -Env @{ REVIEWER_ACQUISITION_TOKEN = $knownToken }
+        Check 'a plan signed with the digest the plan itself publishes is refused' (
+            $disclosedKey.Exit -ne 0 -and -not $disclosedKey.Captured -and
+            $disclosedKey.Log -match 'tampered or replayed')
+
+        # And a sidecar from before the derivation changed fails CLOSED: it is
+        # refused for naming no derivation, never verified under the old key.
+        $legacySigPlan = Join-Path $runRoot 'plan-legacy-derivation.json'
+        [IO.File]::WriteAllText($legacySigPlan, $kcPlanText, $u8)
+        [IO.File]::WriteAllText("$legacySigPlan.sig", (([ordered]@{
+                        schemaVersion = 1
+                        kind = 'reviewer-blinded-acquisition-plan-signature'
+                        algorithm = 'HMACSHA256'
+                        signature = (Get-TestPlanHmacHex -Text $kcPlanText -Token $knownToken -KeyDerivation 'disclosed')
+                    } | ConvertTo-Json -Depth 8 -Compress:$false)), $u8)
+        $legacySig = Invoke-ChildDirect -Label 'legacyDerivationSignature' `
+            -PlanFile $legacySigPlan -Projection $genProjection `
+            -Env @{ REVIEWER_ACQUISITION_TOKEN = $knownToken }
+        Check 'a sidecar naming no key derivation is refused rather than verified under the old key' (
+            $legacySig.Exit -ne 0 -and -not $legacySig.Captured -and
+            $legacySig.Log -match 'key derivation')
 
         # Even a correctly re-signed plan cannot substitute the second model: the
         # child binds that authenticated field to its one configured argv value.
@@ -2369,12 +2426,12 @@ if (Test-Path -LiteralPath $spCandidate) {
             [IO.File]::ReadAllText($mutableSnapshotMarker, $testUtf8) -and
         (Get-ReviewerAcquisitionPackageBytesSha256 -Bytes ([byte[]]$verifiedByteSnapshot.MarkerBytes)) -ceq
             [string]$verifiedByteSnapshot.MarkerSha256)
-    $acquisitionToolText = [IO.File]::ReadAllText($tool, $testUtf8)
+    $toolText = [IO.File]::ReadAllText($tool, $testUtf8)
     $captureToolText = [IO.File]::ReadAllText(
         (Join-Path $PSScriptRoot 'Invoke-ReviewerRoleInputCapture.ps1'), $testUtf8)
     Check 'verifier supervisors stage authenticated bytes instead of reopening package payload paths' (
-        $acquisitionToolText -match 'discoveryPackage\.MarkerBytes' -and
-        $acquisitionToolText -notmatch 'ReadAllText\(\$discoveryMarkerPath' -and
+        $toolText -match 'discoveryPackage\.MarkerBytes' -and
+        $toolText -notmatch 'ReadAllText\(\$discoveryMarkerPath' -and
         $captureToolText -match 'discoveryPackage\.MarkerBytes' -and
         $captureToolText -notmatch 'ReadAllText\(\[string\]\$discoveryPackage\.MarkerPath')
 
@@ -2462,6 +2519,112 @@ if (Test-Path -LiteralPath $spCandidate) {
             ("exit=$($staleRun.Exit)")
     }
 }
+
+# ---------------------------------------------------------------------------
+# Supervisor custody: the owned process tree really stops, and a tree that does
+# not is a typed terminal outcome rather than a tidy timeout.
+# ---------------------------------------------------------------------------
+Write-Host "`n== supervisor child-tree custody ==" -ForegroundColor Cyan
+$custodyScope = {
+    Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psm1') -Force -ErrorAction Stop
+    foreach ($lifted in @('Get-ReviewerChildTreeSnapshot', 'Get-ReviewerSurvivingChildProcess',
+            'Stop-ReviewerSupervisedChildTree')) {
+        . ([scriptblock]::Create((Get-LiveFunctionText -Path $tool -Name $lifted)))
+    }
+
+    # A child that outlives naive teardown: it spawns a DETACHED grandchild and
+    # then sleeps. Killing only the root leaves the grandchild running, which is
+    # exactly the orphan the supervisor is accused of leaving behind.
+    $grandchildMarker = Join-Path $runRoot 'custody-grandchild.pid'
+    $childCommand = (
+        '$p = Start-Process pwsh -ArgumentList ''-NoProfile'',''-Command'',''Start-Sleep -Seconds 300'' ' +
+        '-PassThru -WindowStyle Hidden; ' +
+        "[IO.File]::WriteAllText('$($grandchildMarker.Replace("\", "\\"))', [string]`$p.Id); " +
+        'Start-Sleep -Seconds 300')
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = (Get-Command pwsh -ErrorAction Stop).Source
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    foreach ($argument in @('-NoProfile', '-Command', $childCommand)) { [void]$psi.ArgumentList.Add($argument) }
+    $custodyProc = [System.Diagnostics.Process]::new()
+    $custodyProc.StartInfo = $psi
+    [void]$custodyProc.Start()
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(60)
+        while (-not (Test-Path -LiteralPath $grandchildMarker) -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 200
+        }
+        Check 'custody probe spawned a detached grandchild' (Test-Path -LiteralPath $grandchildMarker) ''
+        [int]$grandchildId = 0
+        if (Test-Path -LiteralPath $grandchildMarker) {
+            [int]$grandchildId = [int]([IO.File]::ReadAllText($grandchildMarker).Trim())
+        }
+        # Give the grandchild a moment to be visible in the process table before
+        # the snapshot is taken; the snapshot is what teardown is verified against.
+        Start-Sleep -Milliseconds 500
+        [hashtable[]]$snapshot = @(Get-ReviewerChildTreeSnapshot -Process $custodyProc)
+        $snapshotIds = @(@($snapshot) | ForEach-Object { [int]$_.ProcessId })
+        Check 'the owned tree snapshot sees the detached grandchild' (
+            $grandchildId -gt 0 -and (@($snapshotIds) -contains $grandchildId)) `
+            ("snapshot=$((@($snapshotIds) | Sort-Object) -join ',') grandchild=$grandchildId")
+        # The detection that drives the typed failure is not vacuous: it reports
+        # a live process as a survivor BEFORE anything is stopped.
+        Check 'surviving-process detection reports a live member of the tree' (
+            (@(Get-ReviewerSurvivingChildProcess -Snapshot $snapshot)).Count -gt 0) ''
+
+        $stopResult = Stop-ReviewerSupervisedChildTree -Process $custodyProc
+        Check 'the supervisor teardown proves the whole tree stopped' ([bool]$stopResult.Stopped) `
+            ("detail=$([string]$stopResult.Detail)")
+        Check 'teardown leaves no surviving descendant' (
+            (@($stopResult.SurvivingProcessIds)).Count -eq 0) ''
+        Check 'teardown reports that the owned tree was actually enumerated' (
+            [bool]$stopResult.TreeEnumerated) ("detail=$([string]$stopResult.Detail)")
+        $grandchildGone = $true
+        if ($grandchildId -gt 0) {
+            $stillThere = $null
+            try { $stillThere = Get-Process -Id $grandchildId -ErrorAction Stop } catch { $stillThere = $null }
+            if ($null -ne $stillThere) {
+                try { $grandchildGone = [bool]$stillThere.HasExited } catch { $grandchildGone = $false }
+                $stillThere.Dispose()
+            }
+        }
+        Check 'the detached grandchild is gone after teardown' $grandchildGone ''
+    }
+    finally {
+        try { if (-not $custodyProc.HasExited) { Stop-ProcessTree -Process $custodyProc } } catch { }
+        $custodyProc.Dispose()
+        if ((Test-Path -LiteralPath $grandchildMarker)) {
+            $strayId = 0
+            try { $strayId = [int]([IO.File]::ReadAllText($grandchildMarker).Trim()) } catch { $strayId = 0 }
+            if ($strayId -gt 0) { Stop-Process -Id $strayId -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+& $custodyScope
+
+# The structural half of the same defect: no exit from Invoke-SupervisedReviewer
+# may return control while the child is alive, so the stop must be reachable
+# from a finally that encloses the whole supervised body.
+$supervisorText = Get-LiveFunctionText -Path $tool -Name 'Invoke-SupervisedReviewer'
+$supervisorAst = [Management.Automation.Language.Parser]::ParseInput($supervisorText, [ref]$null, [ref]$null)
+$supervisorFinallyStops = @($supervisorAst.FindAll({
+            param($node)
+            if (-not ($node -is [Management.Automation.Language.TryStatementAst])) { return $false }
+            if (-not $node.Finally) { return $false }
+            return (@($node.Finally.FindAll({
+                            param($inner)
+                            $inner -is [Management.Automation.Language.CommandAst] -and
+                            [string]$inner.GetCommandName() -ceq 'Stop-ReviewerSupervisedChildTree'
+                        }, $true)).Count -gt 0)
+        }, $true))
+Check 'the supervisor stops its child from a finally, on every exit path' (
+    @($supervisorFinallyStops).Count -gt 0) ''
+Check 'the supervisor no longer discards the outcome of a kill' (
+    $supervisorText -notmatch 'Stop-ProcessTree -Process \$proc \} catch \{ \}') ''
+$toolText = [IO.File]::ReadAllText($tool)
+Check 'an unstoppable child tree is a typed terminal status, not a plain timeout' (
+    $toolText -match "childProcessNotStopped" -and
+    $toolText -match "childProcessNotStoppedTerminal") ''
 
 # ---------------------------------------------------------------------------
 # Summary

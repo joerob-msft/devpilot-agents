@@ -123,14 +123,25 @@ function New-CensusRunRoot {
         [bool]$WritePreviewDirectory = $true,
         [bool]$WritePreviewFile = $true,
         [string[]]$ExtraLogLine = @(),
-        [bool]$WriteLog = $true
+        [bool]$WriteLog = $true,
+        [AllowEmptyString()][string]$RunExecutionId = '',
+        [bool]$SealCensusManifest = $true
     )
     [void](New-Item -ItemType Directory -Force -Path (Join-Path $Root 'logs'))
+    # The execution this fixture run stands for, stamped on the cycle record the
+    # same way the reviewer stamps its own metadata. This is the witness the
+    # census corroborates a manifest against, so a fixture without it would be a
+    # run whose log cannot say who wrote it.
+    $fixtureExecution = Get-CensusFixtureExecutionId -Root $Root -RunExecutionId $RunExecutionId
     $lines = [System.Collections.Generic.List[string]]::new()
     # A real cycle log is mostly records this census ignores. Including some is
     # not decoration: a census that counted lines rather than modes would pass a
     # log made only of the records it looks for.
-    [void]$lines.Add((ConvertTo-Json -InputObject ([ordered]@{ mode = 'cycle-start'; cycle = 1 }) -Depth 8 -Compress))
+    [void]$lines.Add((ConvertTo-Json -InputObject ([ordered]@{
+                    mode = 'cycle-start'
+                    cycle = 1
+                    session = [ordered]@{ sessionId = $fixtureExecution }
+                }) -Depth 8 -Compress))
     # The record written in the last statement before a subprocess can exist.
     # Emitted first for every role so the log reads in the order a real run
     # writes it: intent, then whatever the launch came back to publish.
@@ -197,7 +208,10 @@ function New-CensusRunRoot {
     if ($WritePreviewDirectory) {
         $previewDirectory = Join-Path $Root 'verification-previews'
         [void](New-Item -ItemType Directory -Force -Path $previewDirectory)
-        if (-not $WritePreviewFile) { return [string]([IO.Path]::GetFullPath($Root)) }
+        if (-not $WritePreviewFile) {
+            Add-CensusSeal -Root $Root -RunExecutionId $RunExecutionId -SealCensusManifest $SealCensusManifest
+            return [string]([IO.Path]::GetFullPath($Root))
+        }
         $runs = @()
         foreach ($nonce in @($VerifierNonce)) {
             for ($index = 1; $index -le $AssignmentsPerNonce; $index++) {
@@ -207,16 +221,16 @@ function New-CensusRunRoot {
                 }
             }
         }
-        $manifest = ConvertTo-Json -InputObject ([ordered]@{ verifierRuns = @($runs) }) -Depth 8 -Compress
-        $envelope = ConvertTo-Json -InputObject ([ordered]@{
-                kind = 'reviewer.verification.preview.v1'
-                manifestJson = [string]$manifest
-                signature = ('0' * 64)
-            }) -Depth 8
+        $manifest = ConvertTo-Json -InputObject ([ordered]@{
+                runExecutionId = $fixtureExecution
+                verifierRuns = @($runs)
+            }) -Depth 8 -Compress
+        $envelope = New-CensusPreviewEnvelopeText -ManifestJson $manifest -RunExecutionId $fixtureExecution
         [IO.File]::WriteAllBytes(
             (Join-Path $previewDirectory 'preview-001.json'),
             ([Text.UTF8Encoding]::new($false)).GetBytes($envelope))
     }
+    Add-CensusSeal -Root $Root -RunExecutionId $RunExecutionId -SealCensusManifest $SealCensusManifest
     return [string]([IO.Path]::GetFullPath($Root))
 }
 
@@ -266,10 +280,23 @@ function New-CensusAssignmentRoot {
         [ValidateSet('', 'diagnostic', 'inputArtifactPath', 'inputManifestSha256')][string]$NullTupleField = '',
         [bool]$NumericInputDigest = $false,
         [string]$ConflictingRepublishModel = '',
-        [string]$RepublishNonceSuffix = ''
+        [string]$RepublishNonceSuffix = '',
+        [bool]$OmitExecutionWitnessLog = $false,
+        [bool]$SealCensusManifest = $true
     )
     [void](New-Item -ItemType Directory -Force -Path $Root)
-    if (-not $WritePreviewDirectory) { return [string]([IO.Path]::GetFullPath($Root)) }
+    # The assignment census reads sealed previews, not records - but it still has
+    # to know WHICH execution sealed them, and the only witness a fixture without
+    # a strong expectation has is the log. So every assignment fixture writes the
+    # one cycle record a real run would have written, stamped with the same
+    # execution its manifest is sealed under.
+    if (-not $OmitExecutionWitnessLog) {
+        Add-CensusExecutionWitnessLog -Root $Root
+    }
+    if (-not $WritePreviewDirectory) {
+        Add-CensusSeal -Root $Root -SealCensusManifest $SealCensusManifest
+        return [string]([IO.Path]::GetFullPath($Root))
+    }
     $previewDirectory = Join-Path $Root 'verification-previews'
     [void](New-Item -ItemType Directory -Force -Path $previewDirectory)
 
@@ -304,6 +331,8 @@ function New-CensusAssignmentRoot {
     # tuple, and that - never the review's own 'degraded' conclusion - is what
     # marks a pass as unmeasured.
     $manifestBody = [ordered]@{ status = [string]$Status }
+    $fixtureExecution = Get-CensusFixtureExecutionId -Root $Root
+    $manifestBody['runExecutionId'] = $fixtureExecution
     if (-not $OmitDiagnostic) {
         $manifestBody['diagnostic'] = [string]$(if ($EmergencySeal -or $LossMarker -eq 'diagnostic') {
                 'the cross-verification pass faulted' } else { '' })
@@ -313,6 +342,27 @@ function New-CensusAssignmentRoot {
     $manifestBody['inputManifestSha256'] = [string]$(if ($EmergencySeal -or $LossMarker -eq 'digest') { '0' * 64 } else {
             [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
                 [Text.Encoding]::UTF8.GetBytes($Root))).ToLowerInvariant() })
+    $manifestBody['inputArtifactSha256'] = [string]$(if ($EmergencySeal -or
+            $LossMarker -eq 'inputPath' -or $LossMarker -eq 'digest') { '0' * 64 } else { '' })
+    if (-not ($EmergencySeal -or $LossMarker -eq 'inputPath' -or $LossMarker -eq 'digest')) {
+        # The input the preview stands on, written for real. A preview that names
+        # an input nobody can produce is exactly the case the census now refuses,
+        # so a fixture that omitted it would be modelling the attack rather than
+        # the ordinary run these assertions are about.
+        [void](New-Item -ItemType Directory -Force -Path (Join-Path $Root 'verification-inputs'))
+        $inputManifestJson = ConvertTo-Json -InputObject ([ordered]@{
+                inputManifestSha256 = [string]$manifestBody['inputManifestSha256']
+            }) -Depth 4 -Compress
+        $inputBytesOutput = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject ([ordered]@{
+                        manifestJson = $inputManifestJson
+                        signatureAlg = 'HMACSHA256'
+                        signature = ('0' * 64)
+                    }) -Depth 4))
+        [byte[]]$inputBytes = $inputBytesOutput
+        [IO.File]::WriteAllBytes((Join-Path $Root 'verification-inputs\input.json'), $inputBytes)
+        $manifestBody['inputArtifactSha256'] = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($inputBytes)).ToLowerInvariant()
+    }
     if ($NumericInputDigest) { $manifestBody['inputManifestSha256'] = 64 }
     if ($NullTupleField.Length -gt 0) { $manifestBody[$NullTupleField] = $null }
     if (-not $OmitAssignmentsKey) {
@@ -328,11 +378,7 @@ function New-CensusAssignmentRoot {
     $manifestBody['verifierRuns'] = @($runs)
     $manifestJson = ConvertTo-Json -InputObject ([pscustomobject]$manifestBody) -Depth 12 -Compress
     if ($TamperManifestJson) { $manifestJson = '{"assignments": [' }
-    $envelope = ConvertTo-Json -InputObject ([ordered]@{
-            kind = 'reviewer.verification.preview.v1'
-            manifestJson = [string]$manifestJson
-            signature = ('0' * 64)
-        }) -Depth 8
+    $envelope = New-CensusPreviewEnvelopeText -ManifestJson $manifestJson -RunExecutionId $fixtureExecution
     if ($TruncateEnvelope) { $envelope = ([string]$envelope).Substring(0, 24) }
     $encoding = [Text.UTF8Encoding]::new($false)
     [IO.File]::WriteAllBytes((Join-Path $previewDirectory 'preview-001.json'), $encoding.GetBytes($envelope))
@@ -353,11 +399,9 @@ function New-CensusAssignmentRoot {
             $freshBody = [ordered]@{}
             foreach ($key in @($manifestBody.Keys)) { $freshBody[$key] = $manifestBody[$key] }
             $freshBody['verifierRuns'] = $freshRuns.ToArray()
-            $republished = ConvertTo-Json -InputObject ([ordered]@{
-                    kind = 'reviewer.verification.preview.v1'
-                    manifestJson = [string](ConvertTo-Json -InputObject ([pscustomobject]$freshBody) -Depth 12 -Compress)
-                    signature = ('0' * 64)
-                }) -Depth 8
+            $republishedManifest = ConvertTo-Json -InputObject ([pscustomobject]$freshBody) -Depth 12 -Compress
+            $republished = New-CensusPreviewEnvelopeText -ManifestJson $republishedManifest `
+                -RunExecutionId $fixtureExecution
         }
         [IO.File]::WriteAllBytes((Join-Path $previewDirectory 'preview-002.json'), $encoding.GetBytes($republished))
     }
@@ -376,24 +420,147 @@ function New-CensusAssignmentRoot {
         $conflictJson = ConvertTo-Json -InputObject ([pscustomobject][ordered]@{
                 status = 'complete'
                 diagnostic = ''
+                runExecutionId = $fixtureExecution
                 inputArtifactPath = [string]$manifestBody['inputArtifactPath']
                 inputManifestSha256 = [string]$manifestBody['inputManifestSha256']
+                inputArtifactSha256 = [string]$manifestBody['inputArtifactSha256']
                 assignments = @($conflicting)
                 verifierRuns = @($runs)
             }) -Depth 12 -Compress
-        $conflictEnvelope = ConvertTo-Json -InputObject ([ordered]@{
-                kind = 'reviewer.verification.preview.v1'
-                manifestJson = [string]$conflictJson
-                signature = ('0' * 64)
-            }) -Depth 8
+        $conflictEnvelope = New-CensusPreviewEnvelopeText -ManifestJson $conflictJson `
+            -RunExecutionId $fixtureExecution
         [IO.File]::WriteAllBytes((Join-Path $previewDirectory 'preview-003.json'), $encoding.GetBytes($conflictEnvelope))
     }
+    Add-CensusSeal -Root $Root -SealCensusManifest $SealCensusManifest
     return [string]([IO.Path]::GetFullPath($Root))
+}
+
+function Get-CensusFixtureExecutionId {
+    <#
+    .SYNOPSIS
+        The execution identity one fixture run stands for.
+    .DESCRIPTION
+        A fixture that does not care which execution produced it gets a stable
+        one derived from its root, so the manifest AND the records under it name
+        the same real execution and the tests that DO care can pass their own.
+        Shared by the seal and the log writer precisely so that a fixture cannot
+        accidentally seal one execution while logging another - that mismatch is
+        a case the tests ask for explicitly, never one they stumble into.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [AllowEmptyString()][string]$RunExecutionId = ''
+    )
+    if ([string]::IsNullOrWhiteSpace($RunExecutionId)) {
+        return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                [Text.Encoding]::UTF8.GetBytes([string]$Root))).ToLowerInvariant().Substring(0, 32)
+    }
+    return [string]$RunExecutionId
+}
+
+function New-CensusPreviewEnvelopeText {
+    param(
+        [Parameter(Mandatory)][string]$ManifestJson,
+        [Parameter(Mandatory)][string]$RunExecutionId
+    )
+    return ConvertTo-Json -InputObject ([ordered]@{
+            kind = 'reviewer.verification.preview.v1'
+            manifestJson = $ManifestJson
+            signature = ('0' * 64)
+            censusSignatureAlg = 'HMACSHA256'
+            censusRunExecutionId = $RunExecutionId
+            censusSignature = Get-ReviewerCensusPreviewSignature -ManifestJson $ManifestJson `
+                -MasterKey $script:CensusTestKey -RunExecutionId $RunExecutionId
+        }) -Depth 8
+}
+
+function Add-CensusExecutionWitnessLog {
+    <#
+    .SYNOPSIS
+        The one cycle record a real run always writes, stamped with the execution
+        that wrote it.
+    .DESCRIPTION
+        A census with no strong expectation corroborates the manifest against the
+        execution named by the records under the run root. A fixture that writes
+        no records is therefore a run whose log can witness nothing, which is a
+        refusal in its own right - true, but not what most fixtures here are
+        about. This gives them the witness a real run would have left.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [AllowEmptyString()][string]$RunExecutionId = ''
+    )
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path $Root 'logs'))
+    $witnessLine = ConvertTo-Json -InputObject ([ordered]@{
+            mode = 'cycle-start'
+            cycle = 1
+            session = [ordered]@{ sessionId = (Get-CensusFixtureExecutionId -Root $Root -RunExecutionId $RunExecutionId) }
+        }) -Depth 8 -Compress
+    [IO.File]::WriteAllBytes(
+        (Join-Path (Join-Path $Root 'logs') 'reviewer.log.jsonl'),
+        ([Text.UTF8Encoding]::new($false)).GetBytes($witnessLine + "`n"))
+}
+
+function Add-CensusSeal {
+    <#
+    .SYNOPSIS
+        Seals the census attestation a real reviewer run would have sealed.
+
+    .DESCRIPTION
+        Every fixture here stands for a run that FINISHED, and a run that
+        finishes seals a manifest over the accounting artifacts it leaves. Not
+        sealing would make every fixture a legacy run and every assertion below
+        an assertion about legacy handling, which is one case out of many rather
+        than the norm.
+
+        Sealed here, at the end of fixture construction, for the same reason the
+        reviewer seals last: the digests have to be taken over the bytes the
+        assertions will read. A test that wants tampering asks for it by editing
+        AFTER this, which is exactly the attack being modelled.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [AllowEmptyString()][string]$RunExecutionId = '',
+        [bool]$SealCensusManifest = $true
+    )
+    if (-not $SealCensusManifest) { return }
+    $executionId = Get-CensusFixtureExecutionId -Root $Root -RunExecutionId $RunExecutionId
+    $records = @()
+    $sealLogPath = Join-Path $Root 'logs\reviewer.log.jsonl'
+    if (Test-Path -LiteralPath $sealLogPath -PathType Leaf) {
+        # A fixture that deliberately writes an unreadable log is still a run
+        # that ended; it seals over whatever bytes are there and attests to an
+        # empty record inventory, which is what the reviewer's own best-effort
+        # seal does when its log cannot be re-read.
+        try { $records = @(Get-ReviewerModelStartLogRecord -LogPath $sealLogPath) } catch { $records = @() }
+    }
+    [void](Save-ReviewerModelStartCensusManifest -RunRoot $Root -MasterKey $script:CensusTestKey `
+            -RunExecutionId $executionId -Records $records)
 }
 
 $repo = [string]([IO.Path]::GetFullPath($RepoRoot))
 $reviewerScript = Join-Path $repo 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
 . (Join-Path $repo 'src\Agents\reviewer\ModelStartCensus.ps1')
+
+# The key every fixture seals under. A fixed vector rather than a random one so
+# that a failure is reproducible, and a literal rather than a run root read so
+# that the tests below can hand the census a DIFFERENT key and watch it refuse.
+$script:CensusTestKey = [byte[]]@(
+    0x9c, 0x1d, 0x4e, 0x77, 0x02, 0xb5, 0x3a, 0xe8, 0x61, 0x0f, 0xd2, 0x48, 0x93, 0x7b, 0xc6, 0x15,
+    0x2a, 0xf4, 0x88, 0x30, 0x5d, 0xa9, 0x11, 0xbe, 0x6c, 0x07, 0xe3, 0x52, 0xcd, 0x74, 0x19, 0xab)
+
+# Supplied by default so that the assertions below read as they always did -
+# about counting - and the authentication-specific cases pass the key, or a
+# wrong key, or none, explicitly.
+$PSDefaultParameterValues['Get-ReviewerModelStartCensus:MasterKey'] = $script:CensusTestKey
+$PSDefaultParameterValues['Get-ReviewerVerifierAssignmentCensus:MasterKey'] = $script:CensusTestKey
+# Every census must now name the witness it is trusting for run-execution
+# identity. The default here is the WEAKER one - corroborate against the records
+# under the run root - because that is what the production caller can supply and
+# what the counting assertions below are about. The cases that model an attacker
+# who can rewrite the run root pass an explicit -ExpectedRunExecutionId instead.
+$PSDefaultParameterValues['Get-ReviewerModelStartCensus:CorroborateExecutionFromRecords'] = $true
+$PSDefaultParameterValues['Get-ReviewerVerifierAssignmentCensus:CorroborateExecutionFromRecords'] = $true
 
 $sandbox = Join-Path ([IO.Path]::GetTempPath()) ('shadow-census-' + [Guid]::NewGuid().ToString('N').Substring(0, 12))
 [void](New-Item -ItemType Directory -Force -Path $sandbox)
@@ -1176,6 +1343,8 @@ try {
     # phase runs.
     $emptyDirRoot = Join-Path $sandbox 'assign\empty-directory'
     [void](New-Item -ItemType Directory -Force -Path (Join-Path $emptyDirRoot 'verification-previews'))
+    Add-CensusExecutionWitnessLog -Root $emptyDirRoot
+    Add-CensusSeal -Root $emptyDirRoot
     $emptyDirCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $emptyDirRoot -Argv $verifyingArgv
     Assert-Census (-not [bool]$emptyDirCensus.complete) `
         'An authorized run whose preview directory was created and never filled was accounted as a complete zero.'
@@ -1255,6 +1424,603 @@ try {
         "A re-verified candidate counted $($reverifiedCensus.verifierProcessStarts) launches where two nonces were minted."
     Assert-Census ([bool]$reverifiedCensus.complete) `
         'A legitimate second verification pass was refused or read as unmeasured.'
+
+    Write-Host ''
+    Write-Host '36. Accounting evidence is believed because it is signed, never because of its shape' -ForegroundColor Cyan
+    # THE DEFECT THIS GROUP EXISTS FOR. The census used to believe any file under
+    # a run root that parsed and carried the right property names. Anyone able to
+    # write into that directory could move every number downstream while leaving
+    # something that looked exactly like a clean measurement. Each case below is
+    # an edit an attacker - or a careless replay - can make after a run ends.
+    $authRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\baseline') -GeneralistAttempts 2 `
+        -VerifierNonce @('n1') -AssignmentsPerNonce 1
+    $authBaseline = Get-ReviewerModelStartCensus -RunRoot $authRoot -Argv $verifyingArgv
+    Assert-Census ([bool]$authBaseline.authenticated) `
+        "A run that sealed its own census manifest read as unauthenticated ($($authBaseline.authenticationBasis))."
+    Assert-Census ([string]$authBaseline.authenticationBasis -ceq 'signedCensusManifest') `
+        "A signed run reported authentication basis '$($authBaseline.authenticationBasis)'."
+    Assert-Census ([bool]$authBaseline.complete) 'A signed, fully witnessed run was reported incomplete.'
+
+    # A key that is not the run's key proves nothing about the run's files, and
+    # neither does no key at all. Both are refusals to certify, not findings of
+    # tampering, and both block.
+    $wrongKeyCensus = Get-ReviewerModelStartCensus -RunRoot $authRoot -Argv $verifyingArgv `
+        -MasterKey ([byte[]]@(1..32))
+    Assert-Census (-not [bool]$wrongKeyCensus.authenticated) `
+        'A census manifest verified under a key that did not seal it.'
+    Assert-Census ([string]$wrongKeyCensus.authenticationBasis -ceq 'censusManifestRejected') `
+        "A wrong-key census reported basis '$($wrongKeyCensus.authenticationBasis)'."
+    Assert-Census (-not [bool]$wrongKeyCensus.complete) 'A census that could not be authenticated was still called complete.'
+    $noKeyCensus = Get-ReviewerModelStartCensus -RunRoot $authRoot -Argv $verifyingArgv -MasterKey ([byte[]]@())
+    Assert-Census ([string]$noKeyCensus.authenticationBasis -ceq 'noCensusKey') `
+        "A keyless census reported basis '$($noKeyCensus.authenticationBasis)'."
+    Assert-Census (-not [bool]$noKeyCensus.complete) 'A keyless census was called complete.'
+
+    # NEVER AN UNDERCOUNT. The counts a blocked census reports are still every
+    # start its evidence shows. Blocking must not be a way to make a run look
+    # cheaper than it was.
+    Assert-Census ([int]$wrongKeyCensus.realModelStarts -eq [int]$authBaseline.realModelStarts) `
+        ("An unauthenticated census reported $($wrongKeyCensus.realModelStarts) starts where the same evidence " +
+        "shows $($authBaseline.realModelStarts). Authentication must block, never discount.")
+
+    # Appending an attempt record after the fact is the cheapest forgery there
+    # is, and the one that inflates a budget's denominator.
+    $forgedLogRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\forged-log') -GeneralistAttempts 1
+    [IO.File]::AppendAllText((Join-Path $forgedLogRoot 'logs\reviewer.log.jsonl'),
+        (ConvertTo-Json -InputObject ([ordered]@{
+                    mode = 'model-attempt-accounting'; attempt = 2
+                    model = 'opaque-model-identifier'; processStarted = $true
+                }) -Depth 8 -Compress) + "`n")
+    $forgedLogCensus = Get-ReviewerModelStartCensus -RunRoot $forgedLogRoot -Argv $quietArgv
+    Assert-Census (-not [bool]$forgedLogCensus.authenticated) `
+        'A cycle log with a record appended after the run sealed its manifest was accepted.'
+    Assert-Census (-not [bool]$forgedLogCensus.complete) 'A forged cycle log produced a complete census.'
+    Assert-Census ([int]$forgedLogCensus.realModelStarts -eq 2) `
+        ("A forged log was counted at $($forgedLogCensus.realModelStarts) rather than at every start its own bytes " +
+        'claim. A blocked census still reports the larger number.')
+
+    # Deleting a preview is the forgery that makes a run look like it verified
+    # less than it did; adding one makes it look like it verified more. Both are
+    # differences from an exact inventory, which is why the inventory is exact.
+    $droppedRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\dropped-preview') -RepublishPreview $true `
+        -Cluster @(@{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })
+    Remove-Item -LiteralPath (Join-Path $droppedRoot 'verification-previews\preview-002.json') -Force
+    $droppedCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $droppedRoot -Argv $verifyingArgv
+    Assert-Census (-not [bool]$droppedCensus.authenticated) 'A preview removed after the seal was not detected.'
+    Assert-Census (-not [bool]$droppedCensus.complete) 'An assignment census missing an attested preview was called complete.'
+
+    $addedRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\added-preview') `
+        -Cluster @(@{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })
+    Copy-Item -LiteralPath (Join-Path $addedRoot 'verification-previews\preview-001.json') `
+        -Destination (Join-Path $addedRoot 'verification-previews\preview-009.json')
+    $addedCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $addedRoot -Argv $verifyingArgv
+    Assert-Census (-not [bool]$addedCensus.authenticated) 'A preview added after the seal was not detected.'
+    Assert-Census (($addedCensus.authenticationObjections -join ' ') -match 'preview-009\.json') `
+        'The objection about an added preview did not name it.'
+
+    # A preview whose bytes changed under an unchanged name.
+    $rewrittenRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\rewritten-preview') `
+        -Cluster @(@{ Candidates = 2; Models = @('verifier-alpha'); Nonce = @('n1') })
+    $rewrittenPath = Join-Path $rewrittenRoot 'verification-previews\preview-001.json'
+    [IO.File]::WriteAllBytes($rewrittenPath, ([IO.File]::ReadAllBytes($rewrittenPath) + [byte[]]@(0x20)))
+    $rewrittenCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $rewrittenRoot -Argv $verifyingArgv
+    Assert-Census (-not [bool]$rewrittenCensus.authenticated) 'A preview rewritten after the seal was not detected.'
+
+    # THE GAP THE SIGNATURE ALONE DOES NOT CLOSE. A preview names the input it
+    # stands on but does not seal that input, so a perfectly valid preview can
+    # describe a file that has since been replaced. Rehashing the named input
+    # against the digest the preview published is what closes it.
+    $swappedRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\swapped-input') `
+        -Cluster @(@{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })
+    [IO.File]::WriteAllBytes((Join-Path $swappedRoot 'verification-inputs\input.json'),
+        [Text.Encoding]::UTF8.GetBytes('a different input entirely'))
+    $swappedCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $swappedRoot -Argv $verifyingArgv
+    Assert-Census (-not [bool]$swappedCensus.authenticated) `
+        'A preview standing on an input that had been replaced was accepted.'
+    Assert-Census (($swappedCensus.authenticationObjections -join ' ') -match 'has since been replaced') `
+        'The swapped-input objection did not say what had happened.'
+    # And an input that is simply gone is unknown, not innocent.
+    Remove-Item -LiteralPath (Join-Path $swappedRoot 'verification-inputs\input.json') -Force
+    $lostInputCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $swappedRoot -Argv $verifyingArgv
+    Assert-Census (-not [bool]$lostInputCensus.authenticated) `
+        'A preview standing on an input that is no longer present was accepted.'
+
+    # A preview whose file name differs only in case is a different row in an
+    # attestation even where the file system disagrees. On a case-insensitive
+    # volume the rename replaces the attested name, so the attested row goes
+    # missing; on a case-sensitive one it is an addition. Both are objections.
+    $caseRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\case-variant') `
+        -Cluster @(@{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })
+    $casePreview = Join-Path $caseRoot 'verification-previews\preview-001.json'
+    $caseBytes = [IO.File]::ReadAllBytes($casePreview)
+    Remove-Item -LiteralPath $casePreview -Force
+    [IO.File]::WriteAllBytes((Join-Path $caseRoot 'verification-previews\PREVIEW-001.JSON'), $caseBytes)
+    $caseCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $caseRoot -Argv $verifyingArgv
+    Assert-Census (-not [bool]$caseCensus.authenticated) `
+        'A preview renamed to a case variant of its attested name was accepted as that name.'
+
+    # The forgery the manifest itself invites: rewrite the body and leave the
+    # signature, or re-sign under a key of the forger's own choosing. Neither
+    # verifies, and a manifest whose envelope is mangled is a refusal rather
+    # than an absence.
+    $tamperedManifestRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\tampered-manifest') -GeneralistAttempts 1
+    $manifestPath = Join-Path $tamperedManifestRoot 'model-start-census.manifest.json'
+    $envelopeObject = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 16
+    $bodyObject = [string]$envelopeObject.manifestJson | ConvertFrom-Json -Depth 16
+    $bodyObject.logSha256 = ('f' * 64)
+    [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json -InputObject ([ordered]@{
+                    manifestJson = [string](ConvertTo-Json -InputObject $bodyObject -Depth 16 -Compress)
+                    signature = [string]$envelopeObject.signature
+                    signatureAlg = 'HMACSHA256'
+                }) -Depth 8 -Compress:$false), [Text.UTF8Encoding]::new($false))
+    $tamperedCensus = Get-ReviewerModelStartCensus -RunRoot $tamperedManifestRoot -Argv $quietArgv
+    Assert-Census (-not [bool]$tamperedCensus.authenticated) 'A census manifest body was rewritten under its old signature.'
+    Assert-Census ([string]$tamperedCensus.authenticationBasis -ceq 'censusManifestRejected') `
+        "A tampered manifest reported basis '$($tamperedCensus.authenticationBasis)'."
+
+    # OLD ARTIFACTS. Every run sealed before this existed has no manifest. It is
+    # reported for exactly what it is - unverifiable - and it blocks. It is not
+    # rejected as corrupt, and it is emphatically not trusted.
+    $legacyAuthRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\legacy') -GeneralistAttempts 3 `
+        -SealCensusManifest $false
+    $legacyAuthCensus = Get-ReviewerModelStartCensus -RunRoot $legacyAuthRoot -Argv $quietArgv
+    Assert-Census ([string]$legacyAuthCensus.authenticationBasis -ceq 'noCensusManifest') `
+        "A run with no census manifest reported basis '$($legacyAuthCensus.authenticationBasis)'."
+    Assert-Census (-not [bool]$legacyAuthCensus.complete) 'A run with no census manifest was silently trusted.'
+    Assert-Census ([int]$legacyAuthCensus.realModelStarts -eq 3) `
+        "A blocked legacy run was counted at $($legacyAuthCensus.realModelStarts) rather than 3."
+    # 'report' publishes the same verdict without letting it decide completeness,
+    # so a survey of historical runs can say how many are unverifiable instead of
+    # failing to load at all. It never claims they are authentic.
+    $legacyReport = Get-ReviewerModelStartCensus -RunRoot $legacyAuthRoot -Argv $quietArgv -AuthenticationMode 'report'
+    Assert-Census ([bool]$legacyReport.complete) 'Report mode blocked a legacy run instead of reporting it.'
+    Assert-Census (-not [bool]$legacyReport.authenticated) 'Report mode called a legacy run authentic.'
+
+    # ZERO-CANDIDATE COMPLETE PROOF. A run authorized to verify that legitimately
+    # had nothing to verify seals a manifest attesting to an empty preview
+    # inventory. That is a proof of zero, and it is the one zero the census is
+    # allowed to call complete.
+    $zeroRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\zero-candidate') -GeneralistAttempts 1 `
+        -VerifierNonce @() -WritePreviewFile $false
+    $zeroAssignments = Get-ReviewerVerifierAssignmentCensus -RunRoot $zeroRoot -Argv $quietArgv
+    Assert-Census ([bool]$zeroAssignments.authenticated) `
+        "A run that attested to an empty preview inventory read as unauthenticated ($($zeroAssignments.authenticationBasis))."
+    Assert-Census ([int]$zeroAssignments.realVerifierAssignments -eq 0) `
+        'A run with no previews reported assignments.'
+    Assert-Census ([bool]$zeroAssignments.complete) `
+        'A proven zero was not accounted as a complete zero.'
+    # And dropping a preview into that run root afterwards is an addition against
+    # an attested EMPTY inventory, which is the case an inventory of names alone
+    # would miss entirely.
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path $zeroRoot 'verification-previews'))
+    Copy-Item -LiteralPath (Join-Path $addedRoot 'verification-previews\preview-001.json') `
+        -Destination (Join-Path $zeroRoot 'verification-previews\preview-001.json')
+    $zeroPoisoned = Get-ReviewerVerifierAssignmentCensus -RunRoot $zeroRoot -Argv $quietArgv `
+        -AuthenticationMode 'report'
+    Assert-Census (-not [bool]$zeroPoisoned.authenticated) `
+        'A preview dropped into a run that attested to having none was accepted.'
+
+    # -----------------------------------------------------------------------
+    # A SIGNATURE IS ONLY WORTH THE KEY THAT MADE IT. The three cases below are
+    # the ones where every digest matches, every inventory agrees and the
+    # signature verifies - and the manifest still proves nothing about this run.
+    # Each was reachable before these checks existed, and each produces an
+    # UNDERCOUNT that carries a valid signature, which is strictly worse than an
+    # unsigned one because it reads as proof.
+    # -----------------------------------------------------------------------
+
+    # 1. THE KEY FOUND NEXT TO THE EVIDENCE. Anything that can rewrite a run's
+    # log can also write a key file beside it and re-sign over its own edits.
+    # A verifier that picks that key up is checking the forger's arithmetic.
+    $selfKeyRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\self-sourced-key') -GeneralistAttempts 2 `
+        -SealCensusManifest $false
+    $forgedKey = [byte[]]@(1..32)
+    # Sealed under the SAME execution the fixture's records name, so the only
+    # thing wrong with this manifest is the key it was signed with. A mismatched
+    # execution here would add a second objection and this case would stop being
+    # about self-attested keys at all.
+    [string]$selfKeyExecution = [string](@(Get-ReviewerModelStartLogRecord -LogPath (
+                Join-Path $selfKeyRoot 'logs\reviewer.log.jsonl')) |
+        Where-Object { $_.PSObject.Properties['session'] } |
+        Select-Object -First 1).session.sessionId
+    Save-ReviewerModelStartCensusManifest -RunRoot $selfKeyRoot -MasterKey $forgedKey `
+        -RunExecutionId $selfKeyExecution `
+        -Records @(Get-ReviewerModelStartLogRecord -LogPath (Join-Path $selfKeyRoot 'logs\reviewer.log.jsonl')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $selfKeyRoot 'artifact-signing.key'),
+        'raw:' + [Convert]::ToBase64String($forgedKey))
+    $selfKeyCensus = Get-ReviewerModelStartCensus -RunRoot $selfKeyRoot -Argv $quietArgv -MasterKey $null
+    Assert-Census (-not [bool]$selfKeyCensus.authenticated) `
+        ('A manifest signed with a key taken from the run root it attests to was reported as authenticated ' +
+        "(basis '$($selfKeyCensus.authenticationBasis)').")
+    Assert-Census ([string]$selfKeyCensus.authenticationBasis -ceq 'selfAttestedCensusKey') `
+        "A self-sourced key reported basis '$($selfKeyCensus.authenticationBasis)' rather than naming what it is."
+    Assert-Census (-not [bool]$selfKeyCensus.complete) 'A self-attested run was accounted complete.'
+    # And the count itself is untouched, because blocking is the safe direction
+    # and discounting never is.
+    Assert-Census ([int]$selfKeyCensus.realModelStarts -eq 2) `
+        "A blocked census reported $($selfKeyCensus.realModelStarts) start(s) rather than the 2 its log shows."
+
+    # 2. THE MANIFEST BORROWED FROM A CHEAPER RUN. Every run of one operator
+    # seals under the same master key, so without a run identity in the signed
+    # body a correctly signed manifest travels with its evidence and reports the
+    # other run's smaller number here.
+    $cheapRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\replay-source') -GeneralistAttempts 1
+    $costlyRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\replay-target') -GeneralistAttempts 1
+    Copy-Item -LiteralPath (Join-Path $cheapRoot 'model-start-census.manifest.json') `
+        -Destination (Join-Path $costlyRoot 'model-start-census.manifest.json') -Force
+    Copy-Item -LiteralPath (Join-Path $cheapRoot 'logs\reviewer.log.jsonl') `
+        -Destination (Join-Path $costlyRoot 'logs\reviewer.log.jsonl') -Force
+    $replayedCensus = Get-ReviewerModelStartCensus -RunRoot $costlyRoot -Argv $quietArgv
+    Assert-Census (-not [bool]$replayedCensus.authenticated) `
+        ('A correctly signed census manifest sealed over a different run root verified here, so accounting is ' +
+        'transferable between runs.')
+    Assert-Census ((@($replayedCensus.authenticationObjections) -match 'different run root').Count -gt 0) `
+        'The replayed manifest was refused without saying that it belongs to another run.'
+
+    # 3. THE INPUT THAT LIVES SOMEWHERE ELSE. A preview names its own input, and
+    # a preview is a file an attacker may have written, so an unconstrained path
+    # lets the rehash be satisfied by any file on the machine carrying the
+    # expected digest - including one the attacker placed outside the run root
+    # precisely so that nothing auditing the run root would notice it.
+    $escapeRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\input-escape') `
+        -Cluster @(@{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') }) -SealCensusManifest $false
+    $outsideDirectory = Join-Path $sandbox 'auth\outside-the-run'
+    [void](New-Item -ItemType Directory -Force -Path $outsideDirectory)
+    $outsideInput = Join-Path $outsideDirectory 'input.json'
+    Copy-Item -LiteralPath (Join-Path $escapeRoot 'verification-inputs\input.json') -Destination $outsideInput -Force
+    $escapePreviewPath = @(Get-ChildItem -LiteralPath (Join-Path $escapeRoot 'verification-previews') -File)[0].FullName
+    $escapeEnvelope = [IO.File]::ReadAllText($escapePreviewPath) | ConvertFrom-Json -Depth 32
+    $escapeBody = [string]$escapeEnvelope.manifestJson | ConvertFrom-Json -Depth 32
+    $escapeBody.inputArtifactPath = $outsideInput
+    [IO.File]::WriteAllText($escapePreviewPath, (ConvertTo-Json -InputObject ([ordered]@{
+                    manifestJson = [string](ConvertTo-Json -InputObject $escapeBody -Depth 32 -Compress)
+                    signature    = [string]$escapeEnvelope.signature
+                    signatureAlg = 'HMACSHA256'
+                }) -Depth 8 -Compress:$false), [Text.UTF8Encoding]::new($false))
+    # Sealed AFTER the edit, so the preview's own digest matches and the ONLY
+    # thing left to object to is where the input lives. A fixture sealed before
+    # the edit would be refused for the preview's digest and would never reach
+    # the containment check at all.
+    Add-CensusSeal -Root $escapeRoot
+    # The input is removed from inside the run root, so the rebasing fallback
+    # cannot quietly rescue the check and make the assertion vacuous.
+    Remove-Item -LiteralPath (Join-Path $escapeRoot 'verification-inputs\input.json') -Force
+    $escapeCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $escapeRoot -Argv $verifyingArgv
+    Assert-Census (-not [bool]$escapeCensus.authenticated) `
+        'A preview standing on an input artifact outside the run root was accepted as proof of this run.'
+    # 3b. THE PREVIEW THAT WAS COUNTED IS THE PREVIEW THAT MUST BE VERIFIED. The
+    # census parses each preview to count its assignments and then authenticates
+    # the previews under the run root. If those are two separate reads, a writer
+    # can show a thinner preview to the counting read and put the genuine
+    # attested bytes back before the verifying read - and the result is a
+    # SIGNED, self-consistent undercount, which is the one outcome this census
+    # exists to make impossible.
+    #
+    # Driven through the authenticity function directly with the bytes a count
+    # claims to have read, rather than by racing a background writer, because a
+    # race would only sometimes land in the window and a check that sometimes
+    # proves nothing is not a check.
+    $twoReadRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\counted-not-verified') `
+        -Cluster @(@{ Candidates = 2; Models = @('verifier-alpha'); Nonce = @('n1') })
+    $twoReadName = @(Get-ChildItem -LiteralPath (Join-Path $twoReadRoot 'verification-previews') -File)[0].Name
+    $twoReadPath = Join-Path (Join-Path $twoReadRoot 'verification-previews') $twoReadName
+    # The bytes a tampered counting read would have seen: the same envelope with
+    # its assignment list emptied. Never written to disk - the disk keeps the
+    # genuine, attested bytes throughout, which is precisely the attack.
+    $thinEnvelope = [IO.File]::ReadAllText($twoReadPath) | ConvertFrom-Json -Depth 32
+    $thinBody = [string]$thinEnvelope.manifestJson | ConvertFrom-Json -Depth 32
+    $thinBody.assignments = @()
+    [string]$thinText = ConvertTo-Json -InputObject ([ordered]@{
+            manifestJson = [string](ConvertTo-Json -InputObject $thinBody -Depth 32 -Compress)
+            signature    = [string]$thinEnvelope.signature
+            signatureAlg = 'HMACSHA256'
+        }) -Depth 8 -Compress:$false
+    $thinSnapshot = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $thinSnapshot[[string]$twoReadName] = [pscustomobject][ordered]@{
+        sha256 = [string]([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                    ([Text.UTF8Encoding]::new($false)).GetBytes($thinText)))).ToLowerInvariant()
+        text = $thinText
+    }
+    # The control: with no caller bytes supplied the run root is clean, so a
+    # refusal below cannot be blamed on the fixture.
+    $twoReadClean = Test-ReviewerModelStartCensusAuthenticity -RunRoot $twoReadRoot `
+        -MasterKey $script:CensusTestKey -ExpectedRunExecutionId (Get-CensusFixtureExecutionId -Root $twoReadRoot)
+    Assert-Census ([bool]$twoReadClean.authenticated) `
+        ("The two-read fixture was refused before any substitution, so the case proves nothing: " +
+        "$(@($twoReadClean.objections) -join ' ')")
+    $twoReadSubstituted = Test-ReviewerModelStartCensusAuthenticity -RunRoot $twoReadRoot `
+        -MasterKey $script:CensusTestKey -ExpectedRunExecutionId (Get-CensusFixtureExecutionId -Root $twoReadRoot) -PreviewSnapshot $thinSnapshot
+    Assert-Census (-not [bool]$twoReadSubstituted.authenticated) `
+        ('A census that counted one set of preview bytes was allowed to authenticate a different set still on ' +
+        'disk, which signs an undercount.')
+    Assert-Census ((@($twoReadSubstituted.objections) -match 'does not hash to the digest').Count -gt 0) `
+        ('The substituted preview was refused without saying that the bytes read do not match the attested ' +
+        "digest: $(@($twoReadSubstituted.objections) -join ' ')")
+    # And the counting census itself, taken normally, still authenticates and
+    # still counts every assignment - the single-read path is not a refusal path.
+    $twoReadCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $twoReadRoot -Argv $verifyingArgv
+    Assert-Census ([bool]$twoReadCensus.authenticated -and [int]$twoReadCensus.realVerifierAssignments -eq 2) `
+        ("A single-read assignment census reported authenticated=$($twoReadCensus.authenticated) with " +
+        "$($twoReadCensus.realVerifierAssignments) assignment(s) rather than an authenticated 2.")
+    # 3c. AND THE PREVIEWS THAT WERE COUNTED ARE ALL THE PREVIEWS THERE ARE.
+    # Substituting a preview's CONTENT is refused by 3b; hiding a whole preview
+    # from the counting enumeration is a different half of the same race. The
+    # counting pass and the authenticating inventory are two separate directory
+    # reads, so a writer can rename one preview aside for the count and back
+    # before the check. Assignment identities are deduplicated ACROSS previews
+    # precisely because different previews carry different sets - a resumed phase
+    # seals in parts - so a dropped preview drops real assignments, and verifying
+    # it from a second read would count it toward previewsVerified and object to
+    # nothing at all.
+    $hiddenRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\hidden-from-the-count') `
+        -Cluster @(@{ Candidates = 2; Models = @('verifier-alpha'); Nonce = @('n1') }) -RepublishPreview $true
+    $hiddenDirectory = Join-Path $hiddenRoot 'verification-previews'
+    $hiddenNames = @(@(Get-ChildItem -LiteralPath $hiddenDirectory -File | Sort-Object -Property Name) |
+            ForEach-Object { [string]$_.Name })
+    Assert-Census (@($hiddenNames).Count -eq 2) `
+        "The hidden-preview fixture sealed $(@($hiddenNames).Count) preview(s) rather than the 2 the case needs."
+    $fullSnapshot = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($hiddenName in $hiddenNames) {
+        $hiddenBytes = [IO.File]::ReadAllBytes((Join-Path $hiddenDirectory $hiddenName))
+        $fullSnapshot[[string]$hiddenName] = [pscustomobject][ordered]@{
+            sha256 = [string]([Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData($hiddenBytes))).ToLowerInvariant()
+            text = [string](([Text.UTF8Encoding]::new($false, $true)).GetString($hiddenBytes))
+        }
+    }
+    # The control: the honest count read both previews, so the same fixture and
+    # the same code path authenticate. A refusal below therefore cannot be blamed
+    # on the fixture or on supplying a snapshot at all.
+    $hiddenExecution = Get-CensusFixtureExecutionId -Root $hiddenRoot
+    $hiddenControl = Test-ReviewerModelStartCensusAuthenticity -RunRoot $hiddenRoot `
+        -MasterKey $script:CensusTestKey -ExpectedRunExecutionId $hiddenExecution -PreviewSnapshot $fullSnapshot
+    Assert-Census ([bool]$hiddenControl.authenticated -and [int]$hiddenControl.previewsVerified -eq 2) `
+        ("A census that read both previews was refused or verified $($hiddenControl.previewsVerified) of them: " +
+        "$(@($hiddenControl.objections) -join ' ')")
+    # The attack: the count saw one preview, the disk holds two.
+    $partialSnapshot = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $partialSnapshot[[string]@($hiddenNames)[0]] = $fullSnapshot[[string]@($hiddenNames)[0]]
+    $hiddenAttack = Test-ReviewerModelStartCensusAuthenticity -RunRoot $hiddenRoot `
+        -MasterKey $script:CensusTestKey -ExpectedRunExecutionId $hiddenExecution -PreviewSnapshot $partialSnapshot
+    Assert-Census (-not [bool]$hiddenAttack.authenticated) `
+        ('A preview hidden from the counting read was authenticated from a second read of the directory, so a ' +
+        'census that counted one preview signed a manifest describing two.')
+    Assert-Census ((@($hiddenAttack.objections) -match 'was not read by the census').Count -gt 0) `
+        ('The hidden preview was refused without saying that the census never read it: ' +
+        "$(@($hiddenAttack.objections) -join ' ')")
+    Assert-Census ([int]$hiddenAttack.previewsVerified -lt 2) `
+        ("A preview the census never read still counted toward previewsVerified " +
+        "($($hiddenAttack.previewsVerified)).")
+    # 3d. THE SAME DISCIPLINE IN THE OTHER CENSUS. The model-start census counts
+    # log records, but it also reads the sealed previews for their launch nonces,
+    # and until now it authenticated from a SECOND read of that directory. An
+    # independent review called that an inconsistent guarantee rather than a
+    # demonstrated undercount - the logged and intended floors bound the number
+    # either way - so this closes it and proves the plumbing rather than
+    # describing it. Get-ReviewerVerifierLaunchNonce now returns the bytes it
+    # counted, and the census hands exactly those to the authenticity check.
+    $launchSnapshotRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\launch-nonce-snapshot') `
+        -Cluster @(@{ Candidates = 2; Models = @('verifier-alpha'); Nonce = @('s1') }) -RepublishPreview $true
+    $launchDirectory = Join-Path $launchSnapshotRoot 'verification-previews'
+    $launchNonce = Get-ReviewerVerifierLaunchNonce -RunRoot $launchSnapshotRoot
+    $launchOnDisk = @(@(Get-ChildItem -LiteralPath $launchDirectory -Filter '*.json' -File) |
+            ForEach-Object { [string]$_.Name })
+    Assert-Census ([int]@($launchNonce.previewSnapshot.Keys).Count -eq [int]@($launchOnDisk).Count) `
+        ("The launch-nonce read returned $([int]@($launchNonce.previewSnapshot.Keys).Count) preview(s) of the " +
+        "$([int]@($launchOnDisk).Count) it read, so what it counted is not what it can hand on.")
+    foreach ($launchName in $launchOnDisk) {
+        $launchDigest = [string]([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                    [IO.File]::ReadAllBytes((Join-Path $launchDirectory $launchName))))).ToLowerInvariant()
+        Assert-Census ([string]$launchNonce.previewSnapshot[$launchName].sha256 -ceq $launchDigest) `
+            "The launch-nonce snapshot of '$launchName' does not digest to the bytes on disk."
+    }
+    # The race itself: a preview that appears after the counting read is refused
+    # rather than authenticated from the later read of the directory.
+    $launchExecution = Get-CensusFixtureExecutionId -Root $launchSnapshotRoot
+    $launchControl = Test-ReviewerModelStartCensusAuthenticity -RunRoot $launchSnapshotRoot `
+        -MasterKey $script:CensusTestKey -ExpectedRunExecutionId $launchExecution `
+        -PreviewSnapshot $launchNonce.previewSnapshot
+    Assert-Census ([bool]$launchControl.authenticated) `
+        ('The previews the launch-nonce read counted were refused by the check it hands them to: ' +
+        "$(@($launchControl.objections) -join ' ')")
+    $launchPartial = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $launchPartial[[string]@($launchOnDisk)[0]] = $launchNonce.previewSnapshot[[string]@($launchOnDisk)[0]]
+    $launchAttack = Test-ReviewerModelStartCensusAuthenticity -RunRoot $launchSnapshotRoot `
+        -MasterKey $script:CensusTestKey -ExpectedRunExecutionId $launchExecution -PreviewSnapshot $launchPartial
+    Assert-Census (-not [bool]$launchAttack.authenticated) `
+        'A preview the launch-nonce read never saw was authenticated from a second read of the directory.'
+    # 4. THE MANIFEST LEFT BEHIND IN THE SAME DIRECTORY. Run roots are re-used:
+    # the next run lands in the same slot, under the same key, and hashes to the
+    # same run-root identity. Everything case 2 relies on therefore agrees, and
+    # a whole self-consistent evidence set kept from an earlier, cheaper
+    # execution in this very directory reads as this run's accounting.
+    $sameDirRoot = Join-Path $sandbox 'auth\same-directory-replay'
+    [void](New-CensusRunRoot -Root $sameDirRoot -GeneralistAttempts 1 -RunExecutionId ('1' * 32))
+    $cheapGeneration = Join-Path $sandbox 'auth\same-directory-cheap-generation'
+    Copy-Item -LiteralPath $sameDirRoot -Destination $cheapGeneration -Recurse -Force
+    Remove-Item -LiteralPath $sameDirRoot -Recurse -Force
+    [void](New-CensusRunRoot -Root $sameDirRoot -GeneralistAttempts 4 -RunExecutionId ('2' * 32))
+    # The honest run first, so the check below cannot pass by refusing everything.
+    $honestExecution = Get-ReviewerModelStartCensus -RunRoot $sameDirRoot -Argv $quietArgv `
+        -ExpectedRunExecutionId ('2' * 32)
+    Assert-Census ([bool]$honestExecution.authenticated) `
+        ('A run audited against its own execution identity was refused: ' +
+        "$(@($honestExecution.authenticationObjections) -join ' ')")
+    Assert-Census ([int]$honestExecution.realModelStarts -eq 4) `
+        "The honest run reported $($honestExecution.realModelStarts) start(s) rather than the 4 it made."
+    # Now the replay: the costly generation's evidence is replaced wholesale by
+    # the cheap generation's, in place.
+    Remove-Item -LiteralPath $sameDirRoot -Recurse -Force
+    Copy-Item -LiteralPath $cheapGeneration -Destination $sameDirRoot -Recurse -Force
+    $sameDirReplay = Get-ReviewerModelStartCensus -RunRoot $sameDirRoot -Argv $quietArgv `
+        -ExpectedRunExecutionId ('2' * 32)
+    Assert-Census (-not [bool]$sameDirReplay.authenticated) `
+        ('An earlier execution''s evidence, replayed in the directory it was produced in, was accepted as this ' +
+        'execution''s accounting.')
+    Assert-Census ((@($sameDirReplay.authenticationObjections) -match 'execution this').Count -gt 0) `
+        'The same-directory replay was refused without naming the execution identity as the reason.'
+    Assert-Census (-not [bool]$sameDirReplay.complete) 'A same-directory replay was accounted complete.'
+    # Blocking still never rewrites the counts: what the replayed log shows is
+    # reported as-is, and only its right to be called this run's is withdrawn.
+    Assert-Census ([int]$sameDirReplay.realModelStarts -eq 1) `
+        "A blocked replay reported $($sameDirReplay.realModelStarts) start(s) rather than the 1 its log shows."
+    # And the honest reason this check has to be external: with no expectation
+    # handed in, the copied set is internally consistent and the census has
+    # nothing left to catch it with. Asserted rather than glossed over, so the
+    # limit of the weaker witness is a stated property of the design. The
+    # production caller no longer relies on that weaker witness alone - the
+    # coordinator child mints an execution expectation outside the run root and
+    # hands it in (Test-ShadowRunExecutionNonce.ps1) - but the weaker witness is
+    # still what a hand-launched run is audited under, so its limit is measured
+    # here rather than assumed away.
+    $sameDirUnaudited = Get-ReviewerModelStartCensus -RunRoot $sameDirRoot -Argv $quietArgv
+    Assert-Census ([bool]$sameDirUnaudited.authenticated) `
+        ('A census run without an expected execution identity changed its verdict on a self-consistent evidence ' +
+        'set, which means this assertion is no longer describing what it was written to describe.')
+    # 4b. WHAT THE WEAKER WITNESS DOES CATCH, and why it is worth having in the
+    # caller that cannot know the execution it is auditing. The realistic replay
+    # is not a wholesale directory swap - it is a STALE MANIFEST left beside the
+    # log the current execution really did write, because the manifest is the
+    # cheap thing to keep and the log is the thing the run overwrites. The
+    # records then name one execution and the manifest another, and the census
+    # says so without ever being handed an expectation from outside.
+    #
+    # Sealed IN PLACE under the earlier execution rather than copied in from
+    # another directory. A copied manifest disagrees about the run root, the log
+    # digest and the record inventory as well, so every assertion below would be
+    # satisfied by checks that already existed and this case would prove nothing
+    # about the witness it was written for. Sealing here leaves the execution
+    # stamp as the ONLY disagreement.
+    $staleRoot = Join-Path $sandbox 'auth\stale-manifest-live-log'
+    [void](New-CensusRunRoot -Root $staleRoot -GeneralistAttempts 4 -RunExecutionId ('3' * 32))
+    Add-CensusSeal -Root $staleRoot -RunExecutionId ('4' * 32)
+    $staleCensus = Get-ReviewerModelStartCensus -RunRoot $staleRoot -Argv $quietArgv
+    Assert-Census (-not [bool]$staleCensus.authenticated) `
+        ('A manifest sealed by an earlier execution, left beside the log this execution wrote, was accepted with ' +
+        'no external expectation at all.')
+    Assert-Census ((@($staleCensus.authenticationObjections) -match 'wrote none of').Count -gt 0) `
+        ('The stale manifest was refused for some reason other than the execution stamp, so this case is not ' +
+        "measuring the record witness: $(@($staleCensus.authenticationObjections) -join ' ')")
+    Assert-Census ((@($staleCensus.authenticationObjections) -match 'different run root').Count -eq 0) `
+        'The stale-manifest fixture disagreed about its run root, so the execution stamp was not the only difference.'
+    Assert-Census (-not [bool]$staleCensus.complete) 'A stale-manifest run was accounted complete.'
+    Assert-Census ([int]$staleCensus.realModelStarts -eq 4) `
+        "A blocked stale-manifest run reported $($staleCensus.realModelStarts) start(s) rather than the 4 its log shows."
+    # 4c. NO WITNESS AT ALL. The record witness is only a witness while there are
+    # records naming an execution. A run root whose log says nothing about who
+    # wrote it must be refused, not quietly accepted the way an unchecked census
+    # would accept it - otherwise deleting the log would be the cheapest way to
+    # make a replay authentic.
+    $mutePath = Join-Path (Join-Path $staleRoot 'logs') 'reviewer.log.jsonl'
+    [string[]]$muteLines = @([IO.File]::ReadAllLines($mutePath) | Where-Object { ([string]$_).Trim().Length -gt 0 })
+    [string[]]$muted = @($muteLines | ForEach-Object {
+            $record = $_ | ConvertFrom-Json -Depth 32
+            if ($record.PSObject.Properties['session']) { $record.PSObject.Properties.Remove('session') }
+            ConvertTo-Json -InputObject $record -Depth 32 -Compress
+        })
+    [IO.File]::WriteAllBytes($mutePath, ([Text.UTF8Encoding]::new($false)).GetBytes(($muted -join "`n") + "`n"))
+    Add-CensusSeal -Root $staleRoot -RunExecutionId ('3' * 32)
+    $muteCensus = Get-ReviewerModelStartCensus -RunRoot $staleRoot -Argv $quietArgv
+    Assert-Census (-not [bool]$muteCensus.authenticated) `
+        ('A run root whose records name no execution was authenticated against the record witness, so a census ' +
+        'can be made to pass by stripping the very field it corroborates against.')
+    Assert-Census ((@($muteCensus.authenticationObjections) -match 'witness nothing').Count -gt 0) `
+        'A census with no execution witness was refused without saying that the log could witness nothing.'
+    # 4d. A CALLER MUST CHOOSE. Neither witness named is a programming error, not
+    # a quiet acceptance: the old, replayable behaviour must not be reachable by
+    # leaving a parameter off.
+    $unwitnessed = Get-CensusRefusal {
+        Get-ReviewerModelStartCensus -RunRoot $staleRoot -Argv $quietArgv -CorroborateExecutionFromRecords:$false
+    }
+    Assert-Census ($unwitnessed -match 'cannot be authenticated without saying which execution') `
+        "A census with no witness named at all was taken rather than refused: $unwitnessed"
+    $unwitnessedAssignmentRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'auth\unwitnessed-assignment') `
+        -Cluster @(@{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })
+    $unwitnessedAssignment = Get-CensusRefusal {
+        Get-ReviewerVerifierAssignmentCensus -RunRoot $unwitnessedAssignmentRoot -Argv $verifyingArgv `
+            -CorroborateExecutionFromRecords:$false
+    }
+    Assert-Census ($unwitnessedAssignment -match 'cannot be authenticated without saying which execution') `
+        "An assignment census with no witness named at all was taken rather than refused: $unwitnessedAssignment"
+
+    # 5. THE MANIFEST FROM BEFORE EXECUTION IDENTITY EXISTED. A v1 manifest is
+    # correctly signed and internally consistent; it simply cannot say which
+    # execution sealed it. It must fail closed rather than be read as a v2
+    # manifest that happens to be missing the field.
+    $legacyRoot = New-CensusRunRoot -Root (Join-Path $sandbox 'auth\legacy-manifest') -GeneralistAttempts 2
+    $legacyManifestPath = Join-Path $legacyRoot 'model-start-census.manifest.json'
+    $legacyEnvelope = [IO.File]::ReadAllText($legacyManifestPath) | ConvertFrom-Json -Depth 32
+    $legacyBody = [string]$legacyEnvelope.manifestJson | ConvertFrom-Json -Depth 32
+    $legacyBody.manifestVersion = 1
+    $legacyBody.PSObject.Properties.Remove('runExecutionId')
+    [string]$legacyBodyJson = ConvertTo-Json -InputObject $legacyBody -Depth 32 -Compress
+    $legacyMac = [Security.Cryptography.HMACSHA256]::new($script:CensusTestKey)
+    try {
+        [string]$legacySignature = [BitConverter]::ToString(
+            $legacyMac.ComputeHash(([Text.UTF8Encoding]::new($false)).GetBytes($legacyBodyJson))).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $legacyMac.Dispose() }
+    [IO.File]::WriteAllText($legacyManifestPath, (ConvertTo-Json -InputObject ([ordered]@{
+                    kind = 'reviewer.model-start-census.manifest.v1'
+                    manifestJson = $legacyBodyJson
+                    signature = $legacySignature
+                    signatureAlg = 'HMACSHA256'
+                }) -Depth 8 -Compress:$false), [Text.UTF8Encoding]::new($false))
+    $legacyCensus = Get-ReviewerModelStartCensus -RunRoot $legacyRoot -Argv $quietArgv -MasterKey $script:CensusTestKey
+    Assert-Census (-not [bool]$legacyCensus.authenticated) `
+        'A validly signed manifest from before execution identity existed was accepted as proof of a run.'
+    Assert-Census ([int]$legacyCensus.realModelStarts -eq 2) `
+        "A blocked legacy manifest reported $($legacyCensus.realModelStarts) start(s) rather than the 2 its log shows."
+
+    # 6. THE SEAL MUST HAPPEN UNDER THE LOCK. The reviewer digests its own log
+    # and previews to seal the manifest; if it does that after releasing the
+    # agent lock, the next generation is free to start writing those same files
+    # mid-digest and the attestation covers a mixture of two runs. The ordering
+    # is a property of the script's terminating handler, so it is asserted
+    # against the script's syntax tree rather than by racing two reviewers.
+    $reviewerAst = [Management.Automation.Language.Parser]::ParseFile($reviewerScript, [ref]$null, [ref]$null)
+    $sealCall = @($reviewerAst.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and
+                [string]$node.GetCommandName() -ceq 'Save-ReviewerModelStartCensusManifest'
+            }, $true))
+    Assert-Census (@($sealCall).Count -eq 1) `
+        "The reviewer seals the census manifest at $(@($sealCall).Count) site(s); this check assumes exactly one."
+    if (@($sealCall).Count -eq 1) {
+        # The property being asserted is structural, not positional: SOME try
+        # statement must have the seal in its body and the lock release in its
+        # finally. That is what makes the release happen after the seal on every
+        # path, including the ones where the seal throws.
+        [int]$sealStart = [int]$sealCall[0].Extent.StartOffset
+        [int]$sealEnd = [int]$sealCall[0].Extent.EndOffset
+        $guardingTry = @($reviewerAst.FindAll({
+                    param($node)
+                    if (-not ($node -is [Management.Automation.Language.TryStatementAst])) { return $false }
+                    if (-not $node.Finally) { return $false }
+                    if ([int]$node.Body.Extent.StartOffset -ge $sealStart) { return $false }
+                    if ([int]$node.Body.Extent.EndOffset -le $sealEnd) { return $false }
+                    return (@($node.Finally.FindAll({
+                                    param($inner)
+                                    $inner -is [Management.Automation.Language.CommandAst] -and
+                                    [string]$inner.GetCommandName() -ceq 'Exit-AgentLock'
+                                }, $true)).Count -gt 0)
+                }, $true))
+        Assert-Census (@($guardingTry).Count -gt 0) `
+            ('The reviewer does not release the agent lock in the finally of a block that contains the census seal, ' +
+            'so a second generation can write into the run root while its evidence is being digested.')
+        # And no lock release may run BEFORE the seal inside that guarding block,
+        # which is exactly the shape the defect had: release first, seal second.
+        if (@($guardingTry).Count -gt 0) {
+            $earlyRelease = @($guardingTry[0].Body.FindAll({
+                        param($inner)
+                        $inner -is [Management.Automation.Language.CommandAst] -and
+                        [string]$inner.GetCommandName() -ceq 'Exit-AgentLock' -and
+                        [int]$inner.Extent.StartOffset -lt $sealStart
+                    }, $true))
+            Assert-Census (@($earlyRelease).Count -eq 0) `
+                'The agent lock is released before the census seal inside the very block that is meant to guard it.'
+        }
+    }
 }
 finally {
     if (-not $KeepSandbox -and (Test-Path -LiteralPath $sandbox)) {

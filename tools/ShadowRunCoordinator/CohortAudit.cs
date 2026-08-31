@@ -932,6 +932,25 @@ internal static class CohortSummaryReader
 /// </remarks>
 internal static class CohortCompletionAdoption
 {
+    /// <summary>
+    /// How a completion that a previous build published stands when this build
+    /// re-derives it.
+    /// </summary>
+    internal enum CompletionStanding
+    {
+        /// <summary>The proof re-ran and reproduced.</summary>
+        Adopted,
+
+        /// <summary>
+        /// The proof cannot be re-run because the journal predates the witness it
+        /// would rest on, and nothing else about the record contradicts it.
+        /// </summary>
+        DroppedUnwitnessed,
+
+        /// <summary>The record and the artifacts disagree.</summary>
+        Blocked
+    }
+
     /// <summary>The preparation stopped because it had nothing left to do.</summary>
     private const string ReasonCompleted = "completed";
 
@@ -950,15 +969,86 @@ internal static class CohortCompletionAdoption
     internal static bool IsAdoptableExit(int exitCode) => exitCode == CoordinatorExitCodes.Halted;
 
     /// <summary>
+    /// Whether this record predates the pre-adoption drain witness entirely, as
+    /// opposed to positively recording that the witness was not obtained.
+    /// </summary>
+    /// <remarks>
+    /// The distinction decides whether a completion this build cannot re-derive
+    /// is a contradiction or an absence. 'timedOut' and 'abandoned' are a build
+    /// SAYING the tree was never confirmed stopped, and a completion published
+    /// over one of those is a record disagreeing with itself. 'none' is a build
+    /// that never had the field: nothing disagrees, the proof simply is not
+    /// there to re-run. Blocking on that would wedge the index forever, because
+    /// the journal is signed and no operator can add the missing witness.
+    /// </remarks>
+    internal static bool IsUnwitnessedByAge(CohortEntryRecord record)
+        => string.Equals(record.PreAdoptionOutcome, "none", StringComparison.Ordinal);
+
+    /// <summary>
     /// Whether this ended-but-not-complete entry proved completion, and the words
     /// for why it did or did not.
     /// </summary>
     internal static (bool Adopted, string Reason) Evaluate(CohortManifest manifest, CohortEntrySummary summary)
+        => Evaluate(manifest, summary, requireWitness: true);
+
+    /// <summary>
+    /// How a completion this build did not itself publish stands when the index
+    /// is rebuilt: re-proved, dropped because the proof was never recorded, or
+    /// blocked because the record and the artifacts disagree.
+    /// </summary>
+    /// <remarks>
+    /// Only the third is a stop. A journal from a build that never recorded the
+    /// pre-adoption witness cannot re-derive its completions and cannot be
+    /// repaired either, so treating that as a contradiction would end every
+    /// future run over that root. The completion is dropped instead - counted as
+    /// not complete, published, and left to the walk's own stop policy - which
+    /// is the loss the witness was always going to cost such journals.
+    /// </remarks>
+    internal static (CompletionStanding Standing, string Reason) Classify(CohortManifest manifest, CohortEntrySummary summary)
+    {
+        var (adopted, reason) = Evaluate(manifest, summary);
+        if (adopted)
+        {
+            return (CompletionStanding.Adopted, reason);
+        }
+        if (!IsUnwitnessedByAge(summary.Record))
+        {
+            return (CompletionStanding.Blocked, reason);
+        }
+        // Everything EXCEPT the witness has to still reproduce. A record that is
+        // both unwitnessed and contradicted by its artifacts is the tamper case,
+        // and it blocks on the contradiction rather than being excused by its age.
+        var (otherwiseAdoptable, otherReason) = Evaluate(manifest, summary, requireWitness: false);
+        return otherwiseAdoptable
+            ? (CompletionStanding.DroppedUnwitnessed, reason)
+            : (CompletionStanding.Blocked, otherReason);
+    }
+
+    private static (bool Adopted, string Reason) Evaluate(CohortManifest manifest, CohortEntrySummary summary, bool requireWitness)
     {
         var record = summary.Record;
         if (!record.HasEnded || record.EndedRefused)
         {
             return (false, "the entry has no ending this runner committed");
+        }
+        // The recorded PRE-ADOPTION outcome must positively witness that the
+        // supervised run drained to EOF and its process tree was confirmed
+        // stopped. Adoption overwrites Outcome with 'complete', so Outcome alone
+        // cannot tell an adoption that rested on a confirmed-stopped tree from one
+        // that never had that witness - a record from a build that did not persist
+        // the pre-adoption ending carries only the word 'complete', and reading
+        // that as proof would re-adopt an entry whose descendant may still be
+        // spending. 'timedOut' and 'abandoned' are the runner's durable record
+        // that the witness was NOT obtained, and 'none' is a record that never
+        // captured one; none of them is adopted over an otherwise-adoptable audit,
+        // and the not-adopted outcome the runner already committed stands as the
+        // durable ending. Reading the persisted witness rather than the exit code
+        // closes both the live path and a later rebuild: an exited-but-not-drained
+        // entry can carry an adoptable exit code, and only this field records that
+        // its tree was never confirmed stopped.
+        if (!CohortEntryOutcomes.IsDrainWitnessed(record.PreAdoptionOutcome) && requireWitness)
+        {
+            return (false, $"the entry's pre-adoption ending is recorded '{record.PreAdoptionOutcome}', an ending reached without confirming its output drained and its process tree stopped, so it is not adopted as complete");
         }
         if (record.ExitCode == CoordinatorExitCodes.Ok)
         {
@@ -1061,11 +1151,459 @@ internal static class CohortCompletionAdoption
 
         return (true, $"its authenticated audit reports '{target}' reached and at rest for '{summary.PreparationTerminalReason}' with every transition's evidence published and no provider write");
     }
+
+    /// <summary>
+    /// Proves an entry whose tree was never confirmed stopped is not adopted as
+    /// complete over an otherwise-adoptable audit. Returns 0 when every check
+    /// holds.
+    /// </summary>
+    /// <remarks>
+    /// The one variable across the first four checks is the pre-adoption ending.
+    /// Everything else - the adoptable exit code, the target at rest for a chosen
+    /// reason, every required transition digest, the on-disk state record the audit
+    /// was written over, and no provider write - is held fixed and adoptable. So a
+    /// 'runNotComplete' pre-adoption ending (a typed coordinator terminal reached
+    /// after the run drained to EOF) IS adopted. A generic 'preparationFaulted'
+    /// ending is NOT: its exit does not contractually account the coordinator's own
+    /// children. 'abandoned' and 'timedOut' are likewise refused. The fifth check
+    /// holds the audit adoptable too but
+    /// carries an Outcome already overwritten to 'complete' with no persisted
+    /// pre-adoption ending ('none'), as a build that did not record the witness
+    /// would have left it; it must not be adopted on the word 'complete' alone.
+    /// While the gate read Outcome rather than the pre-adoption ending, the unsafe
+    /// endings were adopted and the fifth record was re-adopted.
+    /// </remarks>
+    internal static int SelfTest(string root, TextWriter log)
+    {
+        Directory.CreateDirectory(root);
+        var failures = 0;
+        var checks = 0;
+
+        // Every check this selftest declares. A pass that skipped one and still
+        // said nothing failed would be a green that covered less than it claims,
+        // so the count is asserted against this before the summary is printed.
+        const int declaredChecks = 24;
+
+        void Check(bool ok, string message)
+        {
+            checks++;
+            log.WriteLine((ok ? "  PASS  " : "  FAIL  ") + message);
+            if (!ok)
+            {
+                failures++;
+            }
+        }
+
+        log.WriteLine("Completion adoption");
+
+        var outputRoot = Path.Combine(root, "entry-root");
+        Directory.CreateDirectory(Path.Combine(outputRoot, "coordinator"));
+        var stateBytes = StrictJson.StrictUtf8.GetBytes("{\"state\":\"snapshotVerified\"}");
+        var statePath = Path.Combine(outputRoot, "coordinator", "state.json");
+        File.WriteAllBytes(statePath, stateBytes);
+        var stateSha = CanonicalJson.Sha256Hex(stateBytes);
+        var digest = new string('a', 64);
+        const string target = "snapshotVerified";
+
+        var entry = new CohortEntry
+        {
+            Ordinal = 1,
+            EntryId = "entry-adoption",
+            RequestPath = Path.Combine(root, "request.json"),
+            RequestSha256 = digest,
+            OutputRoot = outputRoot,
+            Organization = "org",
+            Project = "project",
+            Repository = "repo",
+            PullRequestId = 1,
+            IterationId = 1,
+            SourceCommit = new string('0', 40),
+            CommonCommit = new string('0', 40),
+            TargetCommit = new string('0', 40),
+            TargetRefName = "refs/heads/main",
+            ConfigSha256 = digest,
+            PromptSha256 = digest,
+            SchemaSha256 = digest,
+            RuleBundleSourceKind = "inline",
+            RuleBundlePath = Path.Combine(root, "rules"),
+            RuleBundleSha256 = digest,
+            EstimatedModelStarts = 0,
+            ModelStartBoundPath = Path.Combine(root, "bound.json"),
+            ModelStartBoundSha256 = digest,
+            EstimatedVerifierAssignments = 0,
+            EstimatedWallClockSeconds = 1
+        };
+
+        var execution = new CohortExecution
+        {
+            Concurrency = 1,
+            StopPolicy = CohortManifest.StopPolicyContinue,
+            AuthorizationKind = CohortExecution.PreviewOnlyKind,
+            CommandPath = "stub.ps1",
+            ArgumentPrefix = Array.Empty<string>(),
+            RefusedArguments = Array.Empty<string>(),
+            NamesShippingPreparation = false,
+            NamesStubAdapter = true,
+            IsShippingLaunchProfile = false,
+            Target = target,
+            EntryTimeoutSeconds = 60
+        };
+
+        var budgets = new CohortBudgets
+        {
+            MaximumPullRequests = 1,
+            MaximumModelStarts = 0,
+            MaximumVerifierAssignments = 0,
+            MaximumWallClockSeconds = 1,
+            ProviderWriteBudget = 0
+        };
+
+        var manifest = new CohortManifest
+        {
+            CohortId = "cohort-adoption",
+            CorrelationId = "correlation-adoption",
+            Kind = CohortManifest.KindValue,
+            ToolkitRoot = root,
+            ToolkitHead = new string('0', 40),
+            RequiredRef = "refs/heads/main",
+            Execution = execution,
+            Budgets = budgets,
+            JournalRoot = Path.Combine(root, "journal"),
+            IndexPath = Path.Combine(root, "index.json"),
+            Entries = new[] { entry },
+            ManifestSha256 = digest
+        };
+
+        CohortEntrySummary SummaryWith(string outcome)
+        {
+            var record = CohortEntryRecord.Fresh(entry) with
+            {
+                State = CohortEntryStates.Ended,
+                EndedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+                ExitCode = CoordinatorExitCodes.Halted,
+                Outcome = outcome,
+                // These records are built as the runner would commit them before
+                // any adoption, so the pre-adoption ending IS the outcome given.
+                PreAdoptionOutcome = outcome
+            };
+            return new CohortEntrySummary
+            {
+                Entry = entry,
+                Record = record,
+                PreparationFinalState = target,
+                PreparationTerminalReason = "deliberateHalt",
+                SnapshotEvidenceSha256 = digest,
+                RunSetEvidenceSha256 = digest,
+                ReconciliationEvidenceSha256 = digest,
+                DeliveryEvidenceSha256 = digest,
+                ReconciliationSha256 = digest,
+                ReconciliationReportSha256 = digest,
+                DeliveryDecisionSha256 = digest,
+                DeliverySummarySha256 = digest,
+                AuditSha256 = digest,
+                StateSha256 = stateSha,
+                ModelStartCount = 0,
+                ModelStartsGeneralist = 0,
+                ModelStartsSpecialist = 0,
+                ModelStartsVerifier = 0,
+                ModelStartUnmeasuredAllowance = 0,
+                SlotAttemptRecordCount = 0,
+                SlotLaunchCount = 0,
+                SupervisedSlotCount = 0,
+                VerifierAssignmentCount = 0,
+                VerifierAssignmentUnmeasuredAllowance = 0,
+                VerifierAssignmentsByModel = Array.Empty<VerifierModelAssignments>(),
+                VerifierProcessStartCount = 0,
+                ProviderWriteCount = 0,
+                WriteToolInvocationCount = 0,
+                WallClockSeconds = 0
+            };
+        }
+
+        // Control: with the tree confirmed stopped (a drain-witnessed outcome),
+        // the fixed audit IS adoptable. This proves the summary below is genuinely
+        // adoptable, so the two refusals that follow turn on the outcome alone.
+        var (witnessedAdopted, witnessedWhy) = Evaluate(manifest, SummaryWith(CohortEntryOutcomes.RunNotComplete));
+        Check(witnessedAdopted, $"a typed, drain-witnessed 'runNotComplete' with an adoptable audit is adopted ({witnessedWhy})");
+
+        // A preparation fault may have happened before its own child supervisor
+        // accounted for every descendant. Even an otherwise-adoptable audit cannot
+        // turn that uncertain custody into completion.
+        var (faultedAdopted, genericFaultWhy) = Evaluate(manifest, SummaryWith(CohortEntryOutcomes.PreparationFaulted));
+        Check(!faultedAdopted, $"a generic 'preparationFaulted' entry is not adopted as complete ({genericFaultWhy})");
+
+        // The defect: an entry recorded 'abandoned' - its own process exited but a
+        // descendant outlived it holding the pipes - carries the same adoptable
+        // exit code and the same adoptable audit. It must NOT be adopted, because
+        // the descendant may still be spending against the output root.
+        var (abandonedAdopted, abandonedWhy) = Evaluate(manifest, SummaryWith(CohortEntryOutcomes.Abandoned));
+        Check(!abandonedAdopted, $"an 'abandoned' entry is not adopted as complete ({abandonedWhy})");
+
+        // The same for a killed-on-timeout tree, whose stop was likewise never
+        // confirmed.
+        var (timedOutAdopted, timedOutWhy) = Evaluate(manifest, SummaryWith(CohortEntryOutcomes.TimedOut));
+        Check(!timedOutAdopted, $"a 'timedOut' entry is not adopted as complete ({timedOutWhy})");
+        Check(
+            string.Equals(
+                CohortRunner.ClassifyTimedOutPreparation(rootExited: true, outputClosed: true),
+                CohortEntryOutcomes.Abandoned,
+                StringComparison.Ordinal),
+            "root exit plus inherited-pipe EOF remains abandoned without OS-enforced descendant containment");
+
+        // A record a build that did not persist the pre-adoption ending could have
+        // committed: its outcome was overwritten to 'complete' when it was adopted,
+        // it still carries the adoptable exit code, and its pre-adoption ending is
+        // absent, which reads as 'none'. Reading the word 'complete' as proof of a
+        // drained, stopped tree is the exact gap this closes - the entry is not
+        // adopted again, because 'none' is not a drain witness. Against the earlier
+        // logic that read Outcome instead of the pre-adoption ending, 'complete'
+        // passed and this entry was re-adopted.
+        var legacyAdopted = CohortEntryRecord.Fresh(entry) with
+        {
+            State = CohortEntryStates.Ended,
+            EndedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+            ExitCode = CoordinatorExitCodes.Halted,
+            Outcome = CohortEntryOutcomes.Complete
+            // PreAdoptionOutcome stays at Fresh's 'none': the witness this build
+            // persists was never recorded by the one that wrote this entry.
+        };
+        var legacySummary = SummaryWith(CohortEntryOutcomes.Complete) with { Record = legacyAdopted };
+        var (legacyReadopted, legacyWhy) = Evaluate(manifest, legacySummary);
+        Check(!legacyReadopted, $"a 'complete' record with no persisted drain witness is not adopted as complete ({legacyWhy})");
+
+        // Compatibility, stated as a property of the bytes rather than as a hope:
+        // a journal signed by a build that never knew about the pre-adoption
+        // ending is re-signed at load from this build's composition. If the field
+        // were emitted unconditionally, every such journal would authenticate to a
+        // different signature and be refused as tampered - unrepairably, because
+        // the operator cannot re-sign it. Emitting it only when it holds a real
+        // witness makes its presence the version marker and leaves the older
+        // bytes byte-for-byte reproducible.
+        var legacyComposed = CanonicalJson.Canonical(legacyAdopted.Describe());
+        Check(!legacyComposed.Contains("preAdoptionOutcome", StringComparison.Ordinal),
+            "a record with no persisted drain witness composes exactly the bytes an older build signed");
+        var witnessedComposed = CanonicalJson.Canonical((CohortEntryRecord.Fresh(entry) with
+        {
+            State = CohortEntryStates.Ended,
+            Outcome = CohortEntryOutcomes.Complete,
+            PreAdoptionOutcome = CohortEntryOutcomes.RunNotComplete
+        }).Describe());
+        Check(witnessedComposed.Contains("\"preAdoptionOutcome\":\"runNotComplete\"", StringComparison.Ordinal),
+            "a record that does carry a drain witness commits it into the signed composition");
+
+        // How the index treats each of those, which is a different question from
+        // whether the completion is re-proved. Only a record that CONTRADICTS
+        // itself may stop a rebuild; a record that merely predates the witness is
+        // dropped, because its journal is signed and can never be repaired.
+        var witnessedSummary = SummaryWith(CohortEntryOutcomes.Complete) with
+        {
+            Record = CohortEntryRecord.Fresh(entry) with
+            {
+                State = CohortEntryStates.Ended,
+                EndedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+                ExitCode = CoordinatorExitCodes.Halted,
+                Outcome = CohortEntryOutcomes.Complete,
+                PreAdoptionOutcome = CohortEntryOutcomes.RunNotComplete
+            }
+        };
+        var (witnessedStanding, _) = CohortCompletionAdoption.Classify(manifest, witnessedSummary);
+        Check(witnessedStanding == CohortCompletionAdoption.CompletionStanding.Adopted,
+            $"a witnessed, re-provable completion is adopted ({witnessedStanding})");
+
+        var (legacyStanding, legacyStandingWhy) = CohortCompletionAdoption.Classify(manifest, legacySummary);
+        Check(legacyStanding == CohortCompletionAdoption.CompletionStanding.DroppedUnwitnessed,
+            $"a completion from a build that never took the witness is dropped, not blocked ({legacyStandingWhy})");
+
+        // Unwitnessed AND contradicted is still a stop: age excuses a missing
+        // witness, never artifacts that disagree with the record.
+        var contradicted = legacySummary with { PreparationTerminalReason = "unexpectedFault" };
+        var (contradictedStanding, contradictedWhy) = CohortCompletionAdoption.Classify(manifest, contradicted);
+        Check(contradictedStanding == CohortCompletionAdoption.CompletionStanding.Blocked,
+            $"an unwitnessed completion whose audit contradicts it still blocks ({contradictedWhy})");
+
+        var timedOutStanding = CohortCompletionAdoption.Classify(manifest, SummaryWith(CohortEntryOutcomes.TimedOut)).Standing;
+        Check(timedOutStanding == CohortCompletionAdoption.CompletionStanding.Blocked,
+            $"a completion recorded over a tree that was never confirmed stopped blocks ({timedOutStanding})");
+
+        // The other adoption path, and the one a pre-witness root reaches most
+        // often: a build that adopted at INDEX time never wrote 'complete' into
+        // the journal at all, so its completion lives entirely in the branch that
+        // reads a recorded fault beside artifacts saying the target was reached.
+        // Classifying only the first path would take the count away from these
+        // without naming them anywhere - the number moving quietly that the
+        // published list exists to prevent.
+        var legacyFaulted = legacySummary with
+        {
+            Record = legacySummary.Record with { Outcome = CohortEntryOutcomes.PreparationFaulted }
+        };
+        Check(!legacyFaulted.Record.EndedComplete,
+            "the legacy fault-shaped record is not one the journal itself called complete");
+        var (faultedStanding, faultedWhy) = CohortCompletionAdoption.Classify(manifest, legacyFaulted);
+        Check(faultedStanding == CohortCompletionAdoption.CompletionStanding.DroppedUnwitnessed,
+            $"a legacy fault whose artifacts prove the target is dropped, not silently uncounted ({faultedWhy})");
+
+        // Both paths again, this time through the published index rather than
+        // through the classifier, because the property that matters is that a
+        // REBUILD over a legacy root finishes and states its loss. Publishing is
+        // where a wedge would appear: CohortBlockedException is not caught by the
+        // runner's index writer, so a throw here ends every future run over the
+        // root, and the journal is signed so no operator can repair it.
+        var indexKey = Convert.FromHexString(new string('b', 64));
+        (string Failure, string IndexPath) PublishOnce(CohortEntrySummary summary)
+        {
+            try
+            {
+                Directory.CreateDirectory(manifest.JournalRoot);
+                var journal = CohortJournal.LoadOrFresh(manifest, indexKey, keyPreexisted: false);
+                CohortIndex.Publish(manifest, journal, indexKey, new[] { summary }, "completed", "none", "none");
+                return (string.Empty, manifest.IndexPath);
+            }
+            catch (Exception ex)
+            {
+                return (ex.GetType().Name + ": " + ex.Message, string.Empty);
+            }
+        }
+
+        bool NamesOnlyOrdinalOne(string indexPath, string field)
+        {
+            var published = StrictJson.ReadObjectFile(indexPath, "cohort index");
+            var named = StrictJson.RequireArray(published, field, "cohort index");
+            return named.Count == 1 && named[0].GetInt32() == entry.Ordinal;
+        }
+
+        var faultedPublish = PublishOnce(legacyFaulted);
+        Check(faultedPublish.Failure.Length == 0,
+            $"a rebuild over a legacy fault-shaped completion publishes rather than wedging ({faultedPublish.Failure})");
+        if (faultedPublish.Failure.Length == 0)
+        {
+            var publishedIndex = StrictJson.ReadObjectFile(faultedPublish.IndexPath, "cohort index");
+            Check(StrictJson.RequireInt(publishedIndex, "completedEntryCount", "cohort index", 0, int.MaxValue) == 0,
+                "a completion this build cannot re-prove is not counted complete");
+            Check(NamesOnlyOrdinalOne(faultedPublish.IndexPath, "unwitnessedCompleteEntryOrdinals"),
+                "the index names the ordinal it stopped counting");
+            Check(StrictJson.RequireArray(publishedIndex, "adoptedCompleteEntryOrdinals", "cohort index").Count == 0,
+                "the index does not also claim it adopted the ordinal it dropped");
+        }
+
+        var completePublish = PublishOnce(legacySummary);
+        Check(completePublish.Failure.Length == 0,
+            $"a rebuild over a legacy 'complete' record publishes rather than wedging ({completePublish.Failure})");
+        if (completePublish.Failure.Length == 0)
+        {
+            Check(NamesOnlyOrdinalOne(completePublish.IndexPath, "unwitnessedCompleteEntryOrdinals"),
+                "both adoption paths state the same loss the same way");
+        }
+
+        // The reader's half of the same compatibility rule, proved on bytes. The
+        // writer omits the field at 'none', so a file that STATES 'none' is a
+        // file that was edited - and a reader that accepted it would recompose
+        // bytes without the field, fail its own signature, and tell an operator
+        // their journal was tampered with instead of naming the field. Refusing
+        // the literal where it is read turns an unrepairable accusation into an
+        // answer. The signature is left stale on purpose: the refusal has to come
+        // from the field, so this only passes if the field is read first.
+        //
+        // Its own directory each time, because the case ends by leaving a journal
+        // it deliberately edited. A second pass over a reused root would load THAT
+        // and end the whole selftest partway through with no failing check
+        // printed - a suite that quietly stops being one.
+        var literalManifest = manifest with
+        {
+            JournalRoot = Path.Combine(root, "literal-none-" + Guid.NewGuid().ToString("N")),
+            IndexPath = Path.Combine(root, "literal-none-index-" + Guid.NewGuid().ToString("N"), "index.json")
+        };
+        var literalPrepared = string.Empty;
+        var literalText = string.Empty;
+        try
+        {
+            Directory.CreateDirectory(literalManifest.JournalRoot);
+            var literalJournal = CohortJournal.LoadOrFresh(literalManifest, indexKey, keyPreexisted: false);
+            literalJournal.Commit(
+                indexKey,
+                CohortEntryRecord.Fresh(entry) with
+                {
+                    State = CohortEntryStates.Ended,
+                    StartedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+                    EndedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+                    ExitCode = CoordinatorExitCodes.Halted,
+                    Outcome = CohortEntryOutcomes.Complete,
+                    PreAdoptionOutcome = CohortEntryOutcomes.RunNotComplete,
+                    AuditSha256 = digest,
+                    SummarySha256 = digest
+                },
+                "ended",
+                "none");
+            literalText = File.ReadAllText(literalManifest.JournalPath);
+        }
+        catch (Exception ex)
+        {
+            // Reported as a failing check rather than thrown. An escape here
+            // would end the selftest with neither a FAIL line nor a count.
+            literalPrepared = ex.GetType().Name + ": " + ex.Message;
+        }
+        Check(literalPrepared.Length == 0,
+            $"the literal-'none' case can write the journal it goes on to edit ({literalPrepared})");
+        if (literalPrepared.Length == 0)
+        {
+            // Guarded on the preparation above. The journal path lives INSIDE the
+            // root the try block created, so writing it after a failed preparation
+            // throws a second, unhandled exception and the selftest ends with no
+            // count at all - the failure mode the try block exists to prevent.
+            Check(literalText.Contains("\"preAdoptionOutcome\"", StringComparison.Ordinal),
+                "a witnessed record really does reach the journal file carrying the field");
+            File.WriteAllText(
+                literalManifest.JournalPath,
+                literalText
+                    .Replace(
+                        "\"preAdoptionOutcome\": \"" + CohortEntryOutcomes.RunNotComplete + "\"",
+                        "\"preAdoptionOutcome\": \"none\"",
+                        StringComparison.Ordinal)
+                    .Replace(
+                        "\"preAdoptionOutcome\":\"" + CohortEntryOutcomes.RunNotComplete + "\"",
+                        "\"preAdoptionOutcome\":\"none\"",
+                        StringComparison.Ordinal));
+            Check(File.ReadAllText(literalManifest.JournalPath).Contains("\"none\"", StringComparison.Ordinal)
+                    && !File.ReadAllText(literalManifest.JournalPath).Contains(CohortEntryOutcomes.RunNotComplete, StringComparison.Ordinal),
+                "the edited journal really does state the literal this reader must refuse");
+            var literalRefusal = string.Empty;
+            try
+            {
+                _ = CohortJournal.LoadOrFresh(literalManifest, indexKey, keyPreexisted: true);
+            }
+            catch (ContractException ex)
+            {
+                literalRefusal = ex.Message;
+            }
+            Check(literalRefusal.Contains("pre-adoption", StringComparison.OrdinalIgnoreCase),
+                $"a journal stating the literal 'none' is refused at the field, not as a tampered file ({literalRefusal})");
+        }
+
+        if (failures == 0 && checks != declaredChecks)
+        {
+            log.WriteLine($"  FAIL  the selftest ran {checks} checks, not the {declaredChecks} it declares");
+            failures++;
+        }
+
+        if (failures == 0)
+        {
+            log.WriteLine();
+            log.WriteLine($"All {checks} completion adoption checks passed.");
+        }
+        return failures == 0 ? 0 : 1;
+    }
 }
 
 internal static class CohortIndex
 {
-    internal const string ContractVersionValue = "devpilot.shadow-cohort.index.v3";
+    /// <remarks>
+    /// v4 is v3 plus 'unwitnessedCompleteEntryOrdinals'. The list was added
+    /// without a bump, so a v3 index cannot be told apart from one written
+    /// before the list existed - and something reading two indexes has to know
+    /// whether a missing list means "none" or "this build did not say". v4 is
+    /// the version at which the absence of that list is a fact rather than an
+    /// era.
+    /// </remarks>
+    internal const string ContractVersionValue = "devpilot.shadow-cohort.index.v4";
     internal const string KindValue = "shadow-cohort-index";
 
     /// <summary>The reviewed plan's own word for the posture, unchanged by scaling it across a set.</summary>
@@ -1154,6 +1692,7 @@ internal static class CohortIndex
         var completed = 0;
         var pending = 0;
         var adoptedOrdinals = new ListNode();
+        var unwitnessedOrdinals = new ListNode();
         foreach (var summary in summaries)
         {
             entries.Add(summary.Describe());
@@ -1173,8 +1712,8 @@ internal static class CohortIndex
                 // subject.
                 if (summary.Record.HasEnded && summary.Record.ExitCode != CoordinatorExitCodes.Ok)
                 {
-                    var (adopted, reason) = CohortCompletionAdoption.Evaluate(manifest, summary);
-                    if (!adopted)
+                    var (standing, reason) = CohortCompletionAdoption.Classify(manifest, summary);
+                    if (standing == CohortCompletionAdoption.CompletionStanding.Blocked)
                     {
                         throw new CohortBlockedException(
                             $"Entry {summary.Entry.Ordinal.ToString(CultureInfo.InvariantCulture)} is recorded complete after exiting " +
@@ -1182,11 +1721,28 @@ internal static class CohortIndex
                             $"adopted on: {reason}. An index that published a completion it could not re-derive would be a record standing on " +
                             "artifacts that no longer say what it says.");
                     }
-                    adoptedOrdinals.Add(Node.Number(summary.Entry.Ordinal));
+                    if (standing == CohortCompletionAdoption.CompletionStanding.DroppedUnwitnessed)
+                    {
+                        // Not counted, not blocked, and not silent. The journal is
+                        // signed, so the witness it never took cannot be added;
+                        // ending every future run over this root would be a worse
+                        // answer than publishing it as the not-complete entry it
+                        // can prove. The ordinal is published so the loss is a
+                        // stated one rather than a number that quietly moved.
+                        unwitnessedOrdinals.Add(Node.Number(summary.Entry.Ordinal));
+                    }
+                    else
+                    {
+                        adoptedOrdinals.Add(Node.Number(summary.Entry.Ordinal));
+                        completed++;
+                    }
                 }
-                completed++;
+                else
+                {
+                    completed++;
+                }
             }
-            else if (CohortCompletionAdoption.Evaluate(manifest, summary).Adopted)
+            else
             {
                 // A root written by an earlier build, whose journal recorded the
                 // exit code and called it a fault. The artifacts say otherwise and
@@ -1195,8 +1751,28 @@ internal static class CohortIndex
                 // it is digest-bound to the journal, and an index that rewrote it
                 // would be an index that could no longer be checked against the
                 // record it was derived from.
-                completed++;
-                adoptedOrdinals.Add(Node.Number(summary.Entry.Ordinal));
+                //
+                // Classified rather than merely evaluated, and classified the same
+                // way the branch above classifies: a pre-witness journal reaches
+                // completion through THIS path far more often than through the
+                // other one, because a build that adopted at index time never wrote
+                // 'complete' into the journal at all. Deciding it with the
+                // witness-requiring answer alone would drop such an entry out of
+                // all three published numbers without saying so - the exact count
+                // that quietly moved the other branch names its losses to avoid.
+                // Nothing here throws: this record does not claim to be complete,
+                // so failing to adopt it is an absence of proof rather than a
+                // record contradicting itself.
+                var (standing, _) = CohortCompletionAdoption.Classify(manifest, summary);
+                if (standing == CohortCompletionAdoption.CompletionStanding.Adopted)
+                {
+                    completed++;
+                    adoptedOrdinals.Add(Node.Number(summary.Entry.Ordinal));
+                }
+                else if (standing == CohortCompletionAdoption.CompletionStanding.DroppedUnwitnessed)
+                {
+                    unwitnessedOrdinals.Add(Node.Number(summary.Entry.Ordinal));
+                }
             }
             if (!summary.Record.HasEnded)
             {
@@ -1219,6 +1795,16 @@ internal static class CohortIndex
             .Set("declaredEntryCount", manifest.Entries.Count)
             .Set("completedEntryCount", completed)
             .Set("adoptedCompleteEntryOrdinals", adoptedOrdinals)
+            // Entries a previous build published as complete whose proof this
+            // build cannot re-run, because the journal predates the witness that
+            // proof rests on. Both adoption paths feed this list - the entry the
+            // journal called complete and the entry the journal called a fault
+            // whose artifacts said otherwise - so a legacy root loses the same
+            // way whichever shape it was written in. They are not counted as
+            // complete and they do not stop the index; naming them keeps the
+            // difference between the two counts readable instead of leaving a
+            // number that quietly moved.
+            .Set("unwitnessedCompleteEntryOrdinals", unwitnessedOrdinals)
             .Set("pendingEntryCount", pending)
             .Set("budgets", manifest.Budgets.Describe())
             .Set("consumed", new MapNode()

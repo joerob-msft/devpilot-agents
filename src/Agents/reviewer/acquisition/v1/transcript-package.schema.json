@@ -215,7 +215,7 @@
       }
     },
     "terminalStatus": {
-      "enum": ["captured", "captureFailedRetriesExhausted", "captureFailedTerminal", "timeout", "crash"]
+      "enum": ["captured", "captureFailedRetriesExhausted", "captureFailedTerminal", "timeout", "crash", "childProcessNotStoppedTerminal"]
     },
     "createdUtc": { "type": "string", "format": "date-time" }
   },

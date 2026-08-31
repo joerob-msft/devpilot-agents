@@ -305,7 +305,13 @@ internal static class CohortRegistryClassifications
         && !string.Equals(classification, DiagnosticMode, StringComparison.Ordinal)
         && (realModelStarts > 0
             || string.Equals(classification, UnsafeBudgetContract, StringComparison.Ordinal)
-            || string.Equals(classification, EvidenceUnreadable, StringComparison.Ordinal));
+            || string.Equals(classification, EvidenceUnreadable, StringComparison.Ordinal)
+            // A started preparation that did not reach the target may have faulted
+            // before its own supervisor established full child custody. It still
+            // observed the subject, and holding that subject after the runner's
+            // live reservation closes prevents a second cohort from spending it
+            // while an unconfirmed descendant may remain.
+            || string.Equals(classification, TargetNotReached, StringComparison.Ordinal));
 
     private static readonly string[] All =
     [

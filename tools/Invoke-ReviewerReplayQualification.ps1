@@ -476,7 +476,7 @@ $declarations = @($verifiedDeclaration.Path)
 # N-1 has an immutable, successful terminal result; a later slot never follows a
 # failed or timed-out one, and reconciliation waits for the whole set.
 Assert-ReviewerQualificationSlotPredecessorComplete -SlotName $target.Name -RunDirectory $plan.RunDirectory `
-    -ExpectedSetId ([string]$declaration.setId) -ExpectedPlanDigest $planDigest
+    -RunSetKeyPath $runSetKeyPath -ExpectedSetId ([string]$declaration.setId) -ExpectedPlanDigest $planDigest
 
 # An attempted slot is immutable. Any state at all - even an empty directory
 # somebody created by hand - means this slot's identity is already spoken for.
@@ -569,7 +569,11 @@ $terminal = [pscustomobject][ordered]@{
     lastProgressUtc        = [string]$run.LastProgressUtc
     slotTimeoutSeconds     = [int]$plan.SlotTimeoutSeconds
     progressTimeoutSeconds = [int]$plan.ProgressTimeoutSeconds
+    runExecutionId         = $(if ($env:DEVPILOT_REVIEWER_RUN_EXECUTION_ID -match '^[0-9a-f]{32}\z') {
+            [string]$env:DEVPILOT_REVIEWER_RUN_EXECUTION_ID
+        } else { [Guid]::NewGuid().ToString('N') })
 }
+$terminal = Protect-ReviewerQualificationSlotTerminal -Terminal $terminal -RunSetKeyPath $runSetKeyPath
 $terminalBytes = $utf8.GetBytes((ConvertTo-Json -InputObject $terminal -Depth 5))
 $terminalStream = [IO.File]::Open($target.TerminalPath, [IO.FileMode]::CreateNew,
     [IO.FileAccess]::Write, [IO.FileShare]::None)

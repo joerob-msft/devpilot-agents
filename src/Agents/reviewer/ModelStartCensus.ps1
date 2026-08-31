@@ -62,6 +62,21 @@
 
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot 'ModelStartCensusManifest.ps1')
+
+# How a census treats evidence it cannot authenticate. 'require' - the default,
+# and the only value a budget should ever run under - reports an unauthenticated
+# run INCOMPLETE, so the caller stops rather than budgeting against numbers
+# nobody can vouch for. 'report' publishes the same verdict without letting it
+# decide completeness, and exists so that a survey of historical runs sealed
+# before authentication existed can say how many of them are unverifiable
+# instead of failing to load at all.
+#
+# Neither mode ever lowers a count. Authentication decides whether a number may
+# be RELIED ON, never what the number is; an unverified run is blocked, not
+# cheap.
+$script:ReviewerCensusAuthenticationModes = @('require', 'report')
+
 # The three roles a reviewer run can start a model in. Fixed here so that a
 # breakdown always carries all three keys: a role that did not run must report a
 # zero it measured, never a key a reader has to guess the absence of.
@@ -125,6 +140,12 @@ function Test-ReviewerModelStartArgvSwitch {
     return $false
 }
 
+# How much cycle log this census will read. See the refusal in
+# Get-ReviewerModelStartLogRecord: 64 MB is orders of magnitude above what a real
+# run writes, so it bounds a hostile or runaway log without ever being reachable
+# by an honest one.
+$script:ReviewerModelStartLogMaxBytes = 64MB
+
 function Get-ReviewerModelStartLogRecord {
     <#
     .SYNOPSIS
@@ -139,6 +160,20 @@ function Get-ReviewerModelStartLogRecord {
     if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
         throw ("The reviewer cycle log '$LogPath' does not exist, so the model starts this run made cannot be counted. " +
             'An absent log is not a zero.')
+    }
+    # A CEILING, NOT A BUDGET. The whole log is held in memory and parsed line by
+    # line, and this function is now called more than once per audit, so a log
+    # large enough to exhaust the auditing process would stop the census - and a
+    # census that never finishes is a cohort that never accounts for its spend.
+    # The bound is set far above what a real run produces (a few thousand records
+    # of a few hundred bytes) so that no honest run can reach it, and crossing it
+    # is a REFUSAL rather than a truncation: reading part of a log and counting
+    # what is in it is exactly the undercount this unit exists to prevent.
+    $length = [long]([IO.FileInfo]::new($LogPath)).Length
+    if ($length -gt $script:ReviewerModelStartLogMaxBytes) {
+        throw ("The reviewer cycle log '$LogPath' is $length bytes, beyond the " +
+            "$($script:ReviewerModelStartLogMaxBytes)-byte bound this census reads. A log that cannot be read in " +
+            'full is refused rather than counted in part.')
     }
     $text = ''
     try {
@@ -251,15 +286,40 @@ function Get-ReviewerVerifierLaunchNonce {
             evidencePresent = $false
             launchCount = 0
             previewCount = 0
+            previewSnapshot = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         }
     }
     $previews = @(Get-ChildItem -LiteralPath $directory -Filter '*.json' -File -ErrorAction SilentlyContinue |
             Sort-Object -Property Name | ForEach-Object { [string]$_.FullName })
     $nonces = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    # WHAT IS COUNTED MUST BE WHAT IS AUTHENTICATED, here for the same reason it
+    # is in the assignment census: each preview is read into bytes exactly once,
+    # and the caller hands this snapshot to the authenticity check so it verifies
+    # these bytes rather than whatever is on disk by the time it runs. Reading
+    # twice would let a writer present a thinner preview to the counting read and
+    # restore the attested bytes before the hashing read.
+    $previewSnapshot = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     foreach ($path in @($previews)) {
+        [byte[]]$previewBytes = $null
+        try { $previewBytes = [IO.File]::ReadAllBytes($path) }
+        catch {
+            throw ("The sealed verification preview '$path' could not be read: $($_.Exception.Message) " +
+                'The verifier launches of a run whose preview cannot be read are not counted as none.')
+        }
+        [string]$previewText = ''
+        try { $previewText = ([Text.UTF8Encoding]::new($false, $true)).GetString($previewBytes) }
+        catch {
+            throw ("The sealed verification preview '$path' is not the UTF-8 its run wrote: $($_.Exception.Message) " +
+                'The verifier launches of a run whose preview cannot be read are not counted as none.')
+        }
+        $previewSnapshot[[string](Split-Path -Leaf $path)] = [pscustomobject][ordered]@{
+            sha256 = [string]([Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData($previewBytes))).ToLowerInvariant()
+            text = $previewText
+        }
         $envelope = $null
         try {
-            $envelope = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json -Depth 64
+            $envelope = $previewText | ConvertFrom-Json -Depth 64
         }
         catch {
             throw ("The sealed verification preview '$path' could not be read: $($_.Exception.Message) " +
@@ -294,6 +354,7 @@ function Get-ReviewerVerifierLaunchNonce {
         evidencePresent = $true
         launchCount = [int]$nonces.Count
         previewCount = [int]@($previews).Count
+        previewSnapshot = $previewSnapshot
     }
 }
 
@@ -346,10 +407,34 @@ function Get-ReviewerVerifierAssignmentCensus {
         The sealed argument vector, which says whether the run was authorized to
         verify at all. A run never authorized is complete with zero; a run
         authorized that left no preview is incomplete.
+
+    .PARAMETER MasterKey
+        The run's artifact signing key. Without it the previews read here are
+        believed for their shape alone, which is what this census no longer does.
+
+    .PARAMETER AuthenticationMode
+        'require' (default) reports an unauthenticated run incomplete. 'report'
+        publishes the verdict without letting it decide completeness.
+
+    .PARAMETER ExpectedRunExecutionId
+        The execution this census was asked to audit, supplied from OUTSIDE the
+        run root. A manifest sealed by any other execution - an earlier, cheaper
+        run in the same re-used directory, for instance - is refused.
+
+    .PARAMETER CorroborateExecutionFromRecords
+        The explicit alternative for a caller that cannot know the execution it
+        is auditing: the manifest is corroborated against the execution stamped
+        on the accounting records under this run root. Weaker, and stated in the
+        call rather than reached by omitting a parameter. One of the two is
+        required; there is no silent third behaviour.
     #>
     param(
         [Parameter(Mandatory)][string]$RunRoot,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv,
+        [byte[]]$MasterKey,
+        [AllowEmptyString()][string]$ExpectedRunExecutionId = '',
+        [switch]$CorroborateExecutionFromRecords,
+        [ValidateSet('require', 'report')][string]$AuthenticationMode = 'require'
     )
     if (-not (Test-Path -LiteralPath $RunRoot -PathType Container)) {
         throw ("The run root '$RunRoot' does not exist, so the verifier assignments made under it cannot be counted. " +
@@ -368,14 +453,43 @@ function Get-ReviewerVerifierAssignmentCensus {
     $idModel = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     $previewCount = 0
     $evidenceLostPreviewCount = 0
+    # The bytes of every preview this census actually counted, by name. Handed to
+    # the authenticity check so it verifies these bytes rather than whatever is on
+    # disk by the time it runs.
+    $previewSnapshot = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     if ($evidencePresent) {
         $previews = @(Get-ChildItem -LiteralPath $directory -Filter '*.json' -File -ErrorAction SilentlyContinue |
                 Sort-Object -Property Name | ForEach-Object { [string]$_.FullName })
         $previewCount = [int]@($previews).Count
+        # WHAT IS COUNTED MUST BE WHAT IS AUTHENTICATED. Each preview is read
+        # into bytes exactly once here, and both the parse below and the digest
+        # the authenticity check later compares against the sealed manifest come
+        # from that single buffer. Reading twice - once to count, once to hash -
+        # would let a writer present a preview with fewer assignments to the
+        # counting read and restore the genuine attested bytes before the
+        # hashing read, producing a signed, self-consistent UNDERCOUNT. That is
+        # the one direction this census must never be pushed in.
         foreach ($path in @($previews)) {
+            [byte[]]$previewBytes = $null
+            try { $previewBytes = [IO.File]::ReadAllBytes($path) }
+            catch {
+                throw ("The sealed verification preview '$path' could not be read: $($_.Exception.Message) " +
+                    'The verifier assignments of a run whose preview cannot be read are not counted as none.')
+            }
+            [string]$previewText = ''
+            try { $previewText = ([Text.UTF8Encoding]::new($false, $true)).GetString($previewBytes) }
+            catch {
+                throw ("The sealed verification preview '$path' is not the UTF-8 its run wrote: $($_.Exception.Message) " +
+                    'The verifier assignments of a run whose preview cannot be read are not counted as none.')
+            }
+            $previewSnapshot[[string](Split-Path -Leaf $path)] = [pscustomobject][ordered]@{
+                sha256 = [string]([Convert]::ToHexString(
+                        [Security.Cryptography.SHA256]::HashData($previewBytes))).ToLowerInvariant()
+                text = $previewText
+            }
             $envelope = $null
             try {
-                $envelope = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json -Depth 64
+                $envelope = $previewText | ConvertFrom-Json -Depth 64
             }
             catch {
                 throw ("The sealed verification preview '$path' could not be read: $($_.Exception.Message) " +
@@ -539,6 +653,38 @@ function Get-ReviewerVerifierAssignmentCensus {
                 assignmentCount = [int]$byModel[$model]
             })
     }
+    # Same rule as the start census: authenticity can block, never discount. The
+    # assignment identities counted above stay exactly as counted; what an
+    # unauthenticated run loses is the right to be called a complete measurement.
+    #
+    # The accounting records are read here even though this census counts
+    # previews, because they carry the execution stamp the manifest is
+    # corroborated against. Without them a caller relying on the record witness
+    # would have no witness at all.
+    [object[]]$executionWitnessRecords = @()
+    if ($CorroborateExecutionFromRecords) {
+        # Best effort on purpose. An unreadable or absent log is not an error
+        # here - this census counts previews, not records - it simply leaves the
+        # witness empty, and an empty witness is already an objection below. The
+        # run is reported unproven rather than the whole census being refused
+        # over a unit it does not measure.
+        try {
+            $executionWitnessRecords = @(Get-ReviewerModelStartLogRecord -LogPath (
+                    Join-Path (Join-Path $RunRoot 'logs') 'reviewer.log.jsonl'))
+        }
+        catch { $executionWitnessRecords = @() }
+    }
+    $authenticity = Test-ReviewerModelStartCensusAuthenticity -RunRoot $RunRoot -MasterKey $MasterKey `
+        -Records $executionWitnessRecords -ExpectedRunExecutionId $ExpectedRunExecutionId `
+        -CorroborateExecutionFromRecords:$CorroborateExecutionFromRecords `
+        -PreviewSnapshot $previewSnapshot
+    if ($AuthenticationMode -ceq 'require' -and -not $authenticity.authenticated) {
+        $complete = $false
+        $authenticationDetail = (@($authenticity.objections) -join ' ')
+        $incompleteReason = (("The verification previews under this run root are not authenticated " +
+                "($([string]$authenticity.basis)), so the assignments read from them are unproven. ") + $authenticationDetail).Trim() +
+        $(if ($incompleteReason.Length -gt 0) { " $incompleteReason" } else { '' })
+    }
     return [pscustomobject][ordered]@{
         censusVersion = 1
         runRoot = [string]([IO.Path]::GetFullPath($RunRoot))
@@ -553,6 +699,10 @@ function Get-ReviewerVerifierAssignmentCensus {
         verificationAuthorized = [bool]$verificationEnabled
         verificationPreviewCount = [int]$previewCount
         verificationEvidenceLostPreviewCount = [int]$evidenceLostPreviewCount
+        authenticated = [bool]$authenticity.authenticated
+        authenticationBasis = [string]$authenticity.basis
+        authenticationMode = [string]$AuthenticationMode
+        authenticationObjections = ([string[]]@($authenticity.objections))
         basis = 'sealedVerificationPreviewAssignments'
     }
 }
@@ -603,15 +753,40 @@ function Get-ReviewerModelStartCensus {
         either 'that role was never enabled' or 'evidence this census needs is
         missing'.
 
+    .PARAMETER MasterKey
+        The run's artifact signing key. The census manifest is signed under a key
+        derived from it, so without this nothing in the run root can be
+        authenticated and the census says so rather than trusting file shapes.
+
+    .PARAMETER AuthenticationMode
+        'require' (default) reports an unauthenticated run incomplete. 'report'
+        publishes the same verdict without letting it decide completeness.
+
+    .PARAMETER ExpectedRunExecutionId
+        The execution this census was asked to audit, supplied from OUTSIDE the
+        run root. A manifest sealed by any other execution is refused, which is
+        what stops an earlier run's cheaper attestation being left in a re-used
+        directory and re-presented as this run's.
+
+    .PARAMETER CorroborateExecutionFromRecords
+        The explicit alternative for a caller that cannot know the execution it
+        is auditing: the manifest is corroborated against the execution stamped
+        on the accounting records it is counting. One of the two is required.
+
     .OUTPUTS
         An object carrying the total, the per-role breakdown, and an explicit
         completeness flag. 'complete' false means a role that was enabled left no
-        evidence to count; the caller must treat the census as unproven rather
+        evidence to count, or that the evidence present is not the evidence the
+        run attested to; the caller must treat the census as unproven rather
         than as the zero it would otherwise read as.
     #>
     param(
         [Parameter(Mandatory)][string]$RunRoot,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv,
+        [byte[]]$MasterKey,
+        [AllowEmptyString()][string]$ExpectedRunExecutionId = '',
+        [switch]$CorroborateExecutionFromRecords,
+        [ValidateSet('require', 'report')][string]$AuthenticationMode = 'require'
     )
     if (-not (Test-Path -LiteralPath $RunRoot -PathType Container)) {
         throw ("The run root '$RunRoot' does not exist, so the model starts made under it cannot be counted. " +
@@ -653,9 +828,12 @@ function Get-ReviewerModelStartCensus {
         [int]$verifierIntended)
 
     # A run that was never authorized to verify is complete without verification
-    # evidence; a run that WAS authorized and left none is not. The distinction is
-    # the whole value of the flag: without it, an unfinished verification phase and
-    # a phase that launched nothing report the same zero.
+    # evidence; a run that WAS authorized and left no preview DIRECTORY at all is
+    # not. What this flag records is the directory, not its contents: an existing
+    # but empty directory passes here and is caught downstream, where the
+    # assignment census refuses a preview set that accounts for no assignment. The
+    # distinction is the whole value of the flag: without it, an unfinished
+    # verification phase and a phase that launched nothing report the same zero.
     $complete = $true
     $incompleteReason = ''
     if ($verificationEnabled -and -not $verifier.evidencePresent) {
@@ -669,6 +847,22 @@ function Get-ReviewerModelStartCensus {
     # ENDED cleanly, which is the caller's to know - so this reports the fact and
     # the caller decides. Flagging it incomplete here would turn every legitimate
     # pre-launch refusal into a stop for the whole cohort that entry was part of.
+
+    # Authenticity is decided LAST and folded into completeness, never into the
+    # counts. An unauthenticated run keeps every start this census could see -
+    # blocking must never be able to make a run look cheaper than its own
+    # evidence says it was - and is reported as unproven so the caller stops.
+    $authenticity = Test-ReviewerModelStartCensusAuthenticity -RunRoot $RunRoot -MasterKey $MasterKey `
+        -Records $records -CompareRecordInventory -ExpectedRunExecutionId $ExpectedRunExecutionId `
+        -CorroborateExecutionFromRecords:$CorroborateExecutionFromRecords `
+        -PreviewSnapshot $verifier.previewSnapshot
+    if ($AuthenticationMode -ceq 'require' -and -not $authenticity.authenticated) {
+        $complete = $false
+        $authenticationDetail = (@($authenticity.objections) -join ' ')
+        $incompleteReason = (("The accounting artifacts under this run root are not authenticated " +
+                "($([string]$authenticity.basis)), so the starts counted from them are unproven. ") + $authenticationDetail).Trim() +
+        $(if ($incompleteReason.Length -gt 0) { " $incompleteReason" } else { '' })
+    }
 
     $total = [int]$breakdown.generalist + [int]$breakdown.specialist + [int]$breakdown.verifier
     return [pscustomobject][ordered]@{
@@ -688,6 +882,12 @@ function Get-ReviewerModelStartCensus {
         # unmeasured gap needs to know that, and cannot read it from the count.
         verificationSealed = [bool]([int]$verifier.previewCount -gt 0)
         logRecordCount = [int]@($records).Count
+        authenticated = [bool]$authenticity.authenticated
+        authenticationBasis = [string]$authenticity.basis
+        authenticationMode = [string]$AuthenticationMode
+        authenticationObjections = ([string[]]@($authenticity.objections))
+        authenticatedPreviewCount = [int]$authenticity.previewsVerified
+        authenticatedInputCount = [int]$authenticity.inputsVerified
         basis = 'publishedAttemptRecords'
     }
 }
