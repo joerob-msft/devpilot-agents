@@ -10666,6 +10666,18 @@ function Invoke-ReviewerConventionSpecialistPass {
     $run = $null
     $preview = $null
     $markerSource = ""
+    # The production contract. Replay and acquisition LAUNCH A MODEL - the
+    # sealed corpus freezes the inputs, not the contract - so they must render
+    # the same prompt and parse with the same schema as an ordinary cycle.
+    # Pinning them to v2 would mean the capability could never be demonstrated
+    # on the very corpus it is supposed to be proven against, and would bind a
+    # v2 schema to the v3 prompt this run actually sent.
+    #
+    # Version 2 survives as the DEFAULT on the contract functions, so anything
+    # reading a transcript sealed before this change still reads it by the rules
+    # it was written against.
+    $specialistContractVersion = [int]$script:ReviewerConventionSpecialistContractVersion
+    $specialistMarkerPrefix = [string]$script:ReviewerConventionSpecialistMarkerPrefixV3
     $toolAudit = @{
         grantedPermissions = @($script:ReviewerConventionSpecialistAllowToolCeiling)
         availableTools = @()
@@ -10729,6 +10741,7 @@ function Invoke-ReviewerConventionSpecialistPass {
                 }
             }
             $marker = $null
+            $markerDroppedElements = @()
             $nonce = ""
             $contextBytes = 0
             $run = $null
@@ -10792,7 +10805,8 @@ function Invoke-ReviewerConventionSpecialistPass {
                     -ConstructIdRanges (Get-ReviewerHashValue -Container $Bound -Key 'ConstructIdRanges' -Default $null) `
                     -RightHandRangesByPath (Get-ReviewerHashValue -Container $Bound -Key 'ChangedFileRangesByPath' -Default @{}) `
                     -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText `
-                    -ReplayNotice $(if ($script:ReviewerReplayActive) { $script:ReviewerReplayModelNotice } else { "" })
+                    -ReplayNotice $(if ($script:ReviewerReplayActive) { $script:ReviewerReplayModelNotice } else { "" }) `
+                    -ContractVersion $specialistContractVersion
                 $contextBytes = [int]$specialistInput.Bytes
                 if ([bool]$specialistInput.PinnedSourceDropped) {
                     Write-Warning ("PR $PrId's pinned source did not fit the convention specialist's input bound; " +
@@ -10816,7 +10830,8 @@ function Invoke-ReviewerConventionSpecialistPass {
                 # a too-small window or cap. The same window is handed to the
                 # typed extractor below.
                 $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
-                    -ExpectedProject $ExpectedProject -ExpectedNonce $nonce
+                    -ExpectedProject $ExpectedProject -ExpectedNonce $nonce `
+                    -ContractVersion $specialistContractVersion
                 try {
                     $specialistScanWindow = Assert-ReviewerModelResultContractFits -Surface "convention specialist" `
                         -Schema $specialistSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars) `
@@ -10950,8 +10965,10 @@ function Invoke-ReviewerConventionSpecialistPass {
                 # validated is used, so launch bound and capture bound are one.
                 $markerOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
                     -StdOutText $markerSource -Schema $specialistSchema `
-                    -ScanWindowChars $specialistScanWindow
+                    -ScanWindowChars $specialistScanWindow `
+                    -ContractVersion $specialistContractVersion
                 $specialistMarkerStatus = [string]$markerOutcome.Status
+                $markerDroppedElements = @($markerOutcome.DroppedElements)
                 $marker = if ($specialistMarkerStatus -ceq 'success') { $markerOutcome.Value } else { $null }
                 $markerReason = [string]$markerOutcome.Reason
                 $markerDetail = [string]$markerOutcome.Field
@@ -10999,7 +11016,9 @@ function Invoke-ReviewerConventionSpecialistPass {
                 -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
                 -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
                 -ConstructsIncomplete ([bool](Get-ReviewerHashValue -Container $Bound -Key 'ConstructsIncomplete' -Default $false)) `
-                -RightHandRangesByPath (Get-ReviewerHashValue -Container $Bound -Key 'ChangedFileRangesByPath' -Default @{})
+                -RightHandRangesByPath (Get-ReviewerHashValue -Container $Bound -Key 'ChangedFileRangesByPath' -Default @{}) `
+                -ContractVersion $specialistContractVersion `
+                -DroppedElements $markerDroppedElements
             $candidates = @($validated.Candidates)
             $withheld = @($validated.Withheld)
             $residualRisks = @($validated.ResidualRisks)
@@ -11053,7 +11072,7 @@ function Invoke-ReviewerConventionSpecialistPass {
                     "model       : $EffectiveConventionSpecialistModel"
                     "exitCode    : $($run.ExitCode)"
                     "timedOut    : $($run.TimedOut)"
-                    "markerPrefix: $script:ReviewerConventionSpecialistMarkerPrefix"
+                    "markerPrefix: $specialistMarkerPrefix"
                     "--------------- PARSED ANSWER ---------------"
                     (Get-ReviewerConventionSpecialistDiagnosticText -Value $markerSource)
                     "--------------- STDOUT ---------------"
@@ -17629,7 +17648,8 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         $discoveryAnswer = if ($discoveryCliOutcome -and $discoveryCliOutcome.Answer) { [string]$discoveryCliOutcome.Answer } else { $discoveryMarkerText }
         $discoveryAnswer = $discoveryAnswer.Trim()
         $expectedDiscoveryPrefix = if ($discoverySourceRole -ceq 'specialist') {
-            [string]$script:ReviewerConventionSpecialistMarkerPrefix
+            Get-ReviewerConventionSpecialistMarkerPrefixForVersion -ContractVersion (
+                Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryAnswer)
         }
         else { [string]$ResultMarkerPrefix }
         $discoveryPrefixIndex = $discoveryAnswer.IndexOf($expectedDiscoveryPrefix, [System.StringComparison]::Ordinal)
@@ -17641,11 +17661,14 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         try { $discoveryMarker = $discoveryAnswer | ConvertFrom-Json -Depth 64 }
         catch { throw "The sealed discovery result marker is not valid JSON; the verifier cannot rebuild its discovery pass." }
         if ($discoverySourceRole -ceq 'specialist') {
+            $sealedContractVersion = Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryMarkerText
             $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
-                -ExpectedProject ([string]$planTarget.project) -ExpectedNonce ([string]$discoveryCore.nonce)
+                -ExpectedProject ([string]$planTarget.project) -ExpectedNonce ([string]$discoveryCore.nonce) `
+                -ContractVersion $sealedContractVersion
             $specialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
                 -StdOutText $discoveryMarkerText -Schema $specialistSchema `
-                -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+                -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars) `
+                -ContractVersion $sealedContractVersion
             if ([string]$specialistOutcome.Status -cne 'success') {
                 throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
             }
@@ -17992,8 +18015,10 @@ function Invoke-ReviewerBlindedAcquisitionRun {
     switch ($AcquireTranscriptRole) {
         'specialist' {
             $promptText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ConventionSpecialistPromptPath).Path, $script:ReviewerUtf8)
-            $roleMarkerSchema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $terminalNonce
-            $roleMarkerPrefix = [string]$script:ReviewerConventionSpecialistMarkerPrefix
+            $roleMarkerSchema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $terminalNonce `
+                -ContractVersion ([int]$script:ReviewerConventionSpecialistContractVersion)
+            $roleMarkerPrefix = Get-ReviewerConventionSpecialistMarkerPrefixForVersion `
+                -ContractVersion ([int]$script:ReviewerConventionSpecialistContractVersion)
         }
         'verifier' {
             $promptText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CrossVerificationPromptPath).Path, $script:ReviewerUtf8)
@@ -18063,7 +18088,8 @@ function Invoke-ReviewerBlindedAcquisitionRun {
     if ($AcquireTranscriptRole -ceq 'specialist' -and $terminalStatus -ceq 'captured') {
         $terminalSpecialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
             -StdOutText $terminalMarkerText -Schema $roleMarkerSchema `
-            -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+            -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars) `
+            -ContractVersion ([int]$script:ReviewerConventionSpecialistContractVersion)
         if ([string]$terminalSpecialistOutcome.Status -cne 'success') {
             throw "The captured specialist marker could not be revalidated for its sealed source projection."
         }
@@ -18702,7 +18728,8 @@ function Invoke-ReviewerRoleInputCaptureRun {
         $discoveryAnswer = if ($discoveryCliOutcome -and $discoveryCliOutcome.Answer) { [string]$discoveryCliOutcome.Answer } else { $discoveryMarkerText }
         $discoveryAnswer = $discoveryAnswer.Trim()
         $expectedDiscoveryPrefix = if ($discoverySourceRole -ceq 'specialist') {
-            [string]$script:ReviewerConventionSpecialistMarkerPrefix
+            Get-ReviewerConventionSpecialistMarkerPrefixForVersion -ContractVersion (
+                Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryAnswer)
         }
         else { [string]$ResultMarkerPrefix }
         if ([string]$candidate.resultMarkerPrefix -cne $expectedDiscoveryPrefix) {
@@ -18716,11 +18743,14 @@ function Invoke-ReviewerRoleInputCaptureRun {
         try { $discoveryMarker = $discoveryAnswer | ConvertFrom-Json -Depth 64 }
         catch { throw "The discovery result marker is not valid JSON; the verifier cannot rebuild its discovery pass." }
         if ($discoverySourceRole -ceq 'specialist') {
+            $sealedContractVersion = Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryMarkerText
             $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
-                -ExpectedProject ([string]$binding.project) -ExpectedNonce ([string]$discoveryCore.nonce)
+                -ExpectedProject ([string]$binding.project) -ExpectedNonce ([string]$discoveryCore.nonce) `
+                -ContractVersion $sealedContractVersion
             $specialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
                 -StdOutText $discoveryMarkerText -Schema $specialistSchema `
-                -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+                -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars) `
+                -ContractVersion $sealedContractVersion
             if ([string]$specialistOutcome.Status -cne 'success') {
                 throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
             }
@@ -18891,10 +18921,12 @@ function Invoke-ReviewerRoleInputCaptureRun {
     switch ($CaptureRoleInputRole) {
         'specialist' {
             $rolePromptPath = (Resolve-Path -LiteralPath $ConventionSpecialistPromptPath).Path
-            $roleMarkerPrefix = [string]$script:ReviewerConventionSpecialistMarkerPrefix
+            $roleMarkerPrefix = Get-ReviewerConventionSpecialistMarkerPrefixForVersion `
+                -ContractVersion ([int]$script:ReviewerConventionSpecialistContractVersion)
             if ($captureNonce) {
                 $roleMarkerSchema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject $ExpectedProject `
-                    -ExpectedNonce $captureNonce
+                    -ExpectedNonce $captureNonce `
+                    -ContractVersion ([int]$script:ReviewerConventionSpecialistContractVersion)
             }
         }
         'verifier' {

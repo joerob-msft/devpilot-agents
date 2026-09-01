@@ -1061,14 +1061,19 @@ if ($Role -ceq 'verifier') {
         ConvertFrom-Json -Depth 64
     $sourceSpecialistCandidates = @()
     if ($sourceRole -ceq 'specialist') {
-        if ($packagePrefix -cne [string]$script:ReviewerConventionSpecialistMarkerPrefix) {
+        $specialistContractVersion = Get-ReviewerConventionSpecialistContractVersionFromText -Text $packageMarkerText
+        $expectedSpecialistPrefix = Get-ReviewerConventionSpecialistMarkerPrefixForVersion `
+            -ContractVersion $specialistContractVersion
+        if ($packagePrefix -cne $expectedSpecialistPrefix) {
             throw 'The specialist source does not use the exact production convention result-marker prefix.'
         }
         $sourceSchema = Get-ReviewerConventionSpecialistMarkerSchema `
-            -ExpectedProject ([string]$snapshot.Binding.Project) -ExpectedNonce ([string]$sourceCore.nonce)
-        $sourceOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $packageMarkerText `
-            -MarkerPrefix $packagePrefix -Schema $sourceSchema `
-            -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+            -ExpectedProject ([string]$snapshot.Binding.Project) -ExpectedNonce ([string]$sourceCore.nonce) `
+            -ContractVersion $specialistContractVersion
+        $sourceOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+            -StdOutText $packageMarkerText -Schema $sourceSchema `
+            -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars) `
+            -ContractVersion $specialistContractVersion
         if ([string]$sourceOutcome.Status -cne 'success') {
             throw "The specialist source marker failed the exact production schema: $([string]$sourceOutcome.Status)."
         }

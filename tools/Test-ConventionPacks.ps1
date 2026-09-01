@@ -107,7 +107,7 @@ $rawProfilePolicy = $profile.repoConventions.conventionPacks
 $profilePolicy = ConvertTo-ReviewerConventionPackPolicy -RawPolicy $rawProfilePolicy `
     -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $rawProfilePolicy.authoritativeSources)
 Assert-ConventionTest ($profile.previewOnly -eq $true) "The BPM fixture is not explicitly preview-only."
-Assert-ConventionTest (@($profilePolicy.Packs).Count -eq 8) "The BPM fixture did not parse to exactly eight packs."
+Assert-ConventionTest (@($profilePolicy.Packs).Count -eq 9) "The BPM fixture did not parse to exactly nine packs."
 
 foreach ($replay in @($profile.replays)) {
     $entries = ConvertTo-ReviewerConventionChangeSet -Response (ConvertTo-TestChangeResponse -Paths @($replay.changedPaths))
@@ -116,8 +116,12 @@ foreach ($replay in @($profile.replays)) {
     $expected = @($replay.expectedPacks)
     Assert-ConventionTest (($actual -join "|") -ceq ($expected -join "|")) `
         "Replay '$($replay.name)' selected '$($actual -join ", ")'; expected '$($expected -join ", ")'."
-    Assert-ConventionTest ($actual.Count -ge 1 -and $actual.Count -le 3) `
-        "Replay '$($replay.name)' selected $($actual.Count) packs; the fixture should demonstrate the typical 1-3."
+    # bpm-test-ownership deliberately overlaps tests-and-cloudtest on a
+    # '*.Tests.cs' path: one file can legitimately owe answers to a general
+    # testing pack and to the ownership rule at once. Four is therefore the
+    # realistic ceiling this fixture demonstrates, not three.
+    Assert-ConventionTest ($actual.Count -ge 1 -and $actual.Count -le 4) `
+        "Replay '$($replay.name)' selected $($actual.Count) packs; the fixture should demonstrate the typical 1-4."
 }
 
 $pathCases = @(

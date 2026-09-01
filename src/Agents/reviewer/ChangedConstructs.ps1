@@ -515,6 +515,81 @@ function Get-ReviewerChangedInvocations {
     return @{ Constructs = @($found.ToArray()); Truncated = $truncated }
 }
 
+function Get-ReviewerConstructAttributeGroup {
+    <#
+        The attribute names inside ONE bracket group, and the index of the ']'
+        that closes it, or $null when the group never closes.
+
+        C# lets one bracket group carry several attributes -
+        `[TestMethod, Owner("alias")]` - and matching only the name that follows
+        '[' reads that as `TestMethod` alone. A rule asking whether `Owner` is
+        present would then be told it is absent, on a declaration that carries
+        it: not a missed finding but an invented one, which is the more
+        expensive direction to be wrong in.
+
+        So the group is split at commas that are genuinely between attributes:
+        bracket depth one, and outside any parenthesis or brace. That keeps
+        `[DataRow(true, false)]` a single attribute whose argument list happens
+        to contain a comma. Callers pass MASKED text, so a comma inside a string
+        or comment has already become a space and cannot be seen here.
+
+        A segment whose shape cannot be established yields NO name and sets
+        `Uncertain`. Nothing is ever invented: the declaration is then reported
+        `unknown` rather than silently missing an attribute it may well have.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][int]$Start
+    )
+    if ($Start -lt 0 -or $Start -ge $Text.Length -or $Text[$Start] -ne '[') { return $null }
+    $names = [System.Collections.Generic.List[string]]::new()
+    $uncertain = $false
+    $bracketDepth = 1
+    $parenDepth = 0
+    $braceDepth = 0
+    $segmentStart = $Start + 1
+    $end = -1
+    # FUNCTION-LOCAL state the closure mutates by member and never reassigns, so
+    # the scan is reentrant and leaves no module-global residue.
+    $state = @{ Unreadable = $false }
+    $addSegment = {
+        param([int]$From, [int]$To)
+        $segment = $Text.Substring($From, $To - $From).Trim()
+        if (-not $segment) { return }
+        # An attribute target ('assembly:', 'return:') names where the attribute
+        # attaches, not the attribute. A single ':' only - '::' is a global
+        # qualifier and belongs to the name.
+        if ($segment -match '^[A-Za-z_][A-Za-z0-9_]*\s*:(?!:)\s*(.*)$') { $segment = $Matches[1].Trim() }
+        $segment = $segment -replace '^global\s*::\s*', ''
+        if ($segment -match '^([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)') {
+            [void]$names.Add(($Matches[1] -replace '\s+', ''))
+        }
+        else { $state.Unreadable = $true }
+    }
+    for ($index = $Start + 1; $index -lt $Text.Length; $index++) {
+        $character = $Text[$index]
+        if ($character -eq '(') { $parenDepth++; continue }
+        if ($character -eq ')') { if ($parenDepth -gt 0) { $parenDepth-- } else { $uncertain = $true }; continue }
+        if ($character -eq '{') { $braceDepth++; continue }
+        if ($character -eq '}') { if ($braceDepth -gt 0) { $braceDepth-- } else { $uncertain = $true }; continue }
+        if ($parenDepth -gt 0 -or $braceDepth -gt 0) { continue }
+        if ($character -eq '[') { $bracketDepth++; continue }
+        if ($character -eq ']') {
+            $bracketDepth--
+            if ($bracketDepth -eq 0) { $end = $index; break }
+            continue
+        }
+        if ($character -eq ',' -and $bracketDepth -eq 1) {
+            & $addSegment $segmentStart $index
+            $segmentStart = $index + 1
+        }
+    }
+    if ($end -lt 0) { return $null }
+    & $addSegment $segmentStart $end
+    if ($state.Unreadable -or $parenDepth -ne 0 -or $braceDepth -ne 0) { $uncertain = $true }
+    return @{ Names = [string[]]@($names.ToArray()); End = $end; Uncertain = $uncertain }
+}
+
 function Get-ReviewerConstructDeclarationAt {
     <#
         The declaration shape at one line, or $null. Split out so the changed
@@ -540,13 +615,13 @@ function Get-ReviewerConstructDeclarationAt {
     # declaration. Skipping those lines undercounts exactly the attribute a
     # rule is asking about.
     $inlineAttributes = [System.Collections.Generic.List[string]]::new()
+    $shapeUncertain = $false
     while ($masked.StartsWith('[')) {
-        $close = $masked.IndexOf(']')
-        if ($close -lt 0) { return $null }
-        foreach ($match in [regex]::Matches($masked.Substring(0, $close + 1), '\[\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)')) {
-            [void]$inlineAttributes.Add(($match.Groups[1].Value -replace '\s+', ''))
-        }
-        $masked = $masked.Substring($close + 1).Trim()
+        $group = Get-ReviewerConstructAttributeGroup -Text $masked -Start 0
+        if ($null -eq $group) { return $null }
+        if ([bool]$group.Uncertain) { $shapeUncertain = $true }
+        foreach ($attributeName in @($group.Names)) { [void]$inlineAttributes.Add($attributeName) }
+        $masked = $masked.Substring([int]$group.End + 1).Trim()
         if (-not $masked) { return $null }
     }
     if ($masked -notmatch '^[A-Za-z_][A-Za-z0-9_<>,\[\]\.\s]*\s([A-Za-z_][A-Za-z0-9_]*)\s*(\(|\{|=>|$)') { return $null }
@@ -569,18 +644,36 @@ function Get-ReviewerConstructDeclarationAt {
         $line = ([string]$MaskedLines[$above]).Trim()
         if (-not $line) { break }
         if (-not $line.StartsWith('[')) { break }
-        # The full dotted name, not its first segment: reporting
-        # `System.Diagnostics.CodeAnalysis.SuppressMessage` as "System" tells a
-        # reader nothing and could collide with an unrelated attribute.
-        foreach ($match in [regex]::Matches($line, '\[\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)')) {
+        # One line can hold several groups - `[TestMethod] [Owner("alias")]` -
+        # and each group can hold several attributes.
+        $cursor = 0
+        $lineNames = [System.Collections.Generic.List[string]]::new()
+        while ($cursor -lt $line.Length) {
+            while ($cursor -lt $line.Length -and $line[$cursor] -ne '[') { $cursor++ }
+            if ($cursor -ge $line.Length) { break }
+            $group = Get-ReviewerConstructAttributeGroup -Text $line -Start $cursor
+            if ($null -eq $group) { $shapeUncertain = $true; break }
+            if ([bool]$group.Uncertain) { $shapeUncertain = $true }
+            foreach ($attributeName in @($group.Names)) { [void]$lineNames.Add($attributeName) }
+            $cursor = [int]$group.End + 1
+        }
+        foreach ($attributeName in $lineNames) {
+            # The full dotted name, not its first segment: reporting
+            # `System.Diagnostics.CodeAnalysis.SuppressMessage` as "System" tells
+            # a reader nothing and could collide with an unrelated attribute.
             if ($attributes.Count -ge $script:ReviewerConstructMaxAttributes) { $truncated = $true; break }
-            [void]$attributes.Add(($match.Groups[1].Value -replace '\s+', ''))
+            [void]$attributes.Add($attributeName)
         }
         if ($truncated) { break }
     }
     $sorted = [string[]]@($attributes.ToArray())
     [Array]::Sort($sorted, [StringComparer]::Ordinal)
-    return @{ Name = $name; Attributes = @($sorted); Truncated = $truncated }
+    # `Truncated` means the attribute list is not a complete, established fact -
+    # whether because the cap cut it short or because a group's shape could not
+    # be read. Both must reach the caller the same way: a declaration whose
+    # attributes are only partly known is reported `unknown`, never as one that
+    # is missing whatever was not read.
+    return @{ Name = $name; Attributes = @($sorted); Truncated = ($truncated -or $shapeUncertain) }
 }
 
 function Get-ReviewerChangedDeclarations {

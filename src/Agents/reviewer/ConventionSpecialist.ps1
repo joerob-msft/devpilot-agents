@@ -18,6 +18,38 @@ if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -Err
 }
 
 $script:ReviewerConventionSpecialistMarkerPrefix = "CONVENTION_REVIEW_RESULT_V2:"
+# Version 3 gets its OWN prefix rather than a version field inside a shared one.
+# A reader that has to parse a payload before it can tell which contract the
+# payload is written against has already trusted it; the prefix decides first,
+# so a v2 transcript sealed months ago is still read by the v2 rules and can
+# never be silently re-interpreted under v3.
+$script:ReviewerConventionSpecialistMarkerPrefixV3 = "CONVENTION_REVIEW_RESULT_V3:"
+$script:ReviewerConventionSpecialistContractVersion = 3
+
+function Get-ReviewerConventionSpecialistContractVersionFromText {
+    <#
+        Which contract a SEALED marker was written against, decided by the
+        prefix it actually carries.
+
+        An artifact sealed months ago must be read by the rules it was written
+        against, not by whatever this build happens to produce today. Guessing
+        the current version would make an old, valid transcript look malformed;
+        guessing the old one would make a new transcript unreadable. The prefix
+        is the only thing that knows, so it decides.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    if ($Text.IndexOf($script:ReviewerConventionSpecialistMarkerPrefixV3,
+            [System.StringComparison]::Ordinal) -ge 0) {
+        return 3
+    }
+    return 2
+}
+
+function Get-ReviewerConventionSpecialistMarkerPrefixForVersion {
+    param([ValidateSet(2, 3)][int]$ContractVersion = 2)
+    if ($ContractVersion -ge 3) { return [string]$script:ReviewerConventionSpecialistMarkerPrefixV3 }
+    return [string]$script:ReviewerConventionSpecialistMarkerPrefix
+}
 $script:ReviewerConventionSpecialistArtifactKind = "convention-specialist-preview"
 $script:ReviewerConventionSpecialistArtifactVersion = 2
 $script:ReviewerConventionSpecialistMaxCandidates = 8
@@ -695,12 +727,39 @@ function Read-ReviewerConventionPlanFile {
 }
 
 function Get-ReviewerConventionSpecialistMarkerSchema {
+    <#
+        The result contract, by version.
+
+        Version 2 is FROZEN. Sealed transcripts and previews on disk were
+        produced against it, and a replay that cannot read them is a replay that
+        cannot check anything. Nothing in it may change shape.
+
+        Version 3 removes the eight fields the wrapper already holds and the
+        model merely retyped - the pack name, the five rule-source provenance
+        fields, and the anchor's file path and line - and asks for `ruleRef`
+        instead, which is the same `rs<n>` addressing the coverage rows already
+        use. Every one of those fields was an independent way for a correct
+        finding to be refused over a transcription slip: `ruleSourceSha256`
+        alone is sixty-four hex characters copied by hand. The wrapper derives
+        them all from what it transported, so they cannot disagree with it.
+
+        Version 3 also lets `factIds` cite a declaration-census fact (`rdf1:`)
+        as well as a review fact (`rf1:`). An adoption rule - "this attribute
+        belongs on these declarations" - turns on the census, and version 2 gave
+        the model no legal way to name the evidence its own conclusion rested
+        on.
+    #>
     param(
         [Parameter(Mandatory)][string]$ExpectedProject,
         [Parameter(Mandatory)][string]$ExpectedNonce,
-        [int]$MaxCandidateItems = $script:ReviewerConventionSpecialistMaxCandidates
+        [int]$MaxCandidateItems = $script:ReviewerConventionSpecialistMaxCandidates,
+        [ValidateSet(2, 3)][int]$ContractVersion = 2
     )
     $ascii = '^[\x20-\x7E]*$'
+    $wrapperOwnedKeys = @(
+        "filePath", "line", "packName", "ruleSourceId", "ruleSourceRepositoryId",
+        "ruleSourcePath", "ruleSourceCommit", "ruleSourceSha256"
+    )
     $candidateKeys = @(
         "candidateId", "category", "severity", "anchorKind", "filePath", "line",
         "primaryTarget", "manifestations",
@@ -711,6 +770,14 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
         "factIds", "confidence", "residualRiskSummary", "semanticCandidateVersion",
         "changedCodeFix", "existingDebtFollowUp"
     )
+    if ($ContractVersion -ge 3) {
+        $candidateKeys = @(@($candidateKeys | Where-Object { $wrapperOwnedKeys -notcontains $_ }) + "ruleRef")
+    }
+    $factIdPattern = if ($ContractVersion -ge 3) {
+        # Either namespace, in any order, still bounded at eight.
+        '^(|r(d)?f1:[0-9a-f]{64}(,r(d)?f1:[0-9a-f]{64}){0,7})$'
+    }
+    else { '^(|rf1:[0-9a-f]{64}(,rf1:[0-9a-f]{64}){0,7})$' }
     return @{
         Keys = @(
             "schemaVersion", "prId", "repositoryId", "project", "reviewedSourceCommit",
@@ -719,7 +786,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
             "candidates", "ruleCoverage", "withheld", "residualRisks", "nonce"
         )
         Fields = @{
-            schemaVersion = @{ Type = "int"; Min = 2; Max = 2 }
+            schemaVersion = @{ Type = "int"; Min = $ContractVersion; Max = $ContractVersion }
             prId = @{ Type = "int"; Min = 1; Max = [int]::MaxValue }
             repositoryId = @{ Type = "guid" }
             project = @{ Type = "exact"; Expected = $ExpectedProject }
@@ -733,6 +800,13 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
             promptSha256 = @{ Type = "hex"; Length = 64 }
             candidates = @{
                 Type = "objectArray"; MaxItems = $MaxCandidateItems
+                # Version 3 only: one unreadable semantic field withholds ITS OWN
+                # candidate instead of the whole marker. Under version 2 a single
+                # bad sub-field discarded every candidate and every rule row
+                # beside it, and "nothing came back" is indistinguishable from
+                # "there was nothing to find" - which is the one thing this layer
+                # must never say by accident.
+                ElementFailurePolicy = $(if ($ContractVersion -ge 3) { "drop" } else { "fail" })
                 Item = @{
                     Keys = $candidateKeys
                     Fields = @{
@@ -742,6 +816,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         anchorKind = @{ Type = "enum"; Values = @("changedFile", "prMetadata") }
                         filePath = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Pattern = '^/?[\x20-\x21\x23-\x29\x2B-\x39\x3B\x3D\x40-\x5B\x5D-\x7B\x7D-\x7E]*$' }
                         line = @{ Type = "int"; Min = 0; Max = 1000000 }
+                        ruleRef = @{ Type = "string"; MaxLength = 5; Pattern = '^rs[0-9]{1,3}$' }
                         primaryTarget = @{
                             Type = "string"; MaxLength = 24
                             Pattern = '^(prMetadata|cf[0-9]{1,3}:[1-9][0-9]{0,6})$'
@@ -767,7 +842,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         siblingNotRequiredReason = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Pattern = $ascii; NormalizeTypography = $true }
                         factIds = @{
                             Type = "string"; MaxLength = 600; AllowEmpty = $true
-                            Pattern = '^(|rf1:[0-9a-f]{64}(,rf1:[0-9a-f]{64}){0,7})$'
+                            Pattern = $factIdPattern
                         }
                         confidence = @{ Type = "enum"; Values = @("low", "medium", "high") }
                         residualRiskSummary = @{ Type = "string"; MaxLength = 800; AllowEmpty = $true; Pattern = $ascii; NormalizeTypography = $true }
@@ -971,8 +1046,13 @@ function ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
         [Parameter(Mandatory)][hashtable]$Schema,
-        [int]$ScanWindowChars = 327680
+        [int]$ScanWindowChars = 327680,
+        [ValidateSet(2, 3)][int]$ContractVersion = 2
     )
+    $markerPrefix = if ($ContractVersion -ge 3) {
+        $script:ReviewerConventionSpecialistMarkerPrefixV3
+    }
+    else { $script:ReviewerConventionSpecialistMarkerPrefix }
     $normalizer = {
         param($MarkerCandidate)
         $normalizedFields = [System.Collections.Generic.List[object]]::new()
@@ -1001,7 +1081,7 @@ function ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome {
         return @{ Value = $MarkerCandidate; NormalizedFields = @($normalizedFields) }
     }
     return ConvertFrom-AgentResultMarkerOutcome -StdOutText $StdOutText `
-        -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix -Schema $Schema `
+        -MarkerPrefix $markerPrefix -Schema $Schema `
         -ScanWindowChars $ScanWindowChars -CandidateNormalizer $normalizer
 }
 
@@ -1860,7 +1940,13 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         [AllowEmptyCollection()][object[]]$Constructs = @(),
         [AllowEmptyCollection()][object[]]$ConstructFiles = @(),
         [bool]$ConstructsIncomplete = $false,
-        [hashtable]$RightHandRangesByPath = @{}
+        [hashtable]$RightHandRangesByPath = @{},
+        [ValidateSet(2, 3)][int]$ContractVersion = 2,
+        # Candidates the marker extractor withheld because a semantic field of
+        # theirs could not be read. They arrive here so they leave a mark: a
+        # shortened candidate list that says nothing about what is missing from
+        # it reads exactly like a clean review.
+        [AllowEmptyCollection()][object[]]$DroppedElements = @()
     )
     if (@($ResolvedSources).Count -eq 0) {
         throw "Convention specialist candidate validation requires at least one resolved convention source."
@@ -1901,9 +1987,35 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     }
     $canonicalRanges = ConvertTo-ReviewerConventionSpecialistRangesByPath `
         -RightHandRangesByPath $RightHandRangesByPath
+    # Contract v3: the model addresses a rule by the same short `rs<n>` the
+    # coverage rows use, and the wrapper fills in the provenance itself from the
+    # source it actually transported. Under v2 the model retyped a pack name, a
+    # repository GUID, a path, a 40-hex commit and a 64-hex digest, and every one
+    # of them was a way for a correct finding to be refused over a transcription
+    # slip - or, worse, to be accepted while disagreeing with what was really
+    # delivered.
+    $ruleRefMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    if ($ContractVersion -ge 3) {
+        foreach ($row in @((Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $ResolvedSources).Requested)) {
+            $ruleRefMap[[string]$row.ruleRef] = $row.source
+        }
+    }
     $seenIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $accepted = [System.Collections.Generic.List[object]]::new()
     $withheld = [System.Collections.Generic.List[object]]::new()
+    foreach ($drop in @($DroppedElements)) {
+        $field = [string](Get-ReviewerConventionSpecialistValue $drop "Field" "")
+        $reason = [string](Get-ReviewerConventionSpecialistValue $drop "Reason" "")
+        [void]$withheld.Add([pscustomobject][ordered]@{
+                # There is no candidate id to name: the element that carried it
+                # is exactly what could not be read.
+                candidateId = ""
+                reason = "schemaInvalidCandidate"
+                detail = Get-ReviewerConventionSpecialistShortened `
+                    -Text ("A result element was withheld because '$field' failed its schema rule ($reason). " +
+                        "It was not assessed and must not be read as an absence of findings.") -MaxLength 800
+            })
+    }
     $changedFileIndex = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries `
         -RightHandRangesByPath $RightHandRangesByPath
     foreach ($item in @($Marker.withheld)) {
@@ -1919,6 +2031,28 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     foreach ($candidate in @($Marker.candidates)) {
         $candidateId = [string]$candidate.candidateId
         if (-not $seenIds.Add($candidateId)) { throw "Specialist output duplicated candidate id '$candidateId'." }
+        if ($ContractVersion -ge 3) {
+            $ruleRef = [string](Get-ReviewerConventionSpecialistValue $candidate "ruleRef" "")
+            if (-not $ruleRefMap.ContainsKey($ruleRef)) {
+                # A reference to a rule nobody transported is withheld, not
+                # guessed at. Withheld rather than thrown because one candidate
+                # naming a rule that is not there says nothing about the others.
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; reason = "invalidEvidence"
+                        detail = "Candidate cited rule reference '$ruleRef', which the wrapper did not transport."
+                    })
+                continue
+            }
+            $refSource = $ruleRefMap[$ruleRef]
+            foreach ($pair in @(
+                    @("packName", "PackName"), @("ruleSourceId", "SourceId"),
+                    @("ruleSourceRepositoryId", "RepositoryId"), @("ruleSourcePath", "Path"),
+                    @("ruleSourceCommit", "CommitSha"), @("ruleSourceSha256", "Sha256")
+                )) {
+                $candidate[[string]$pair[0]] = [string](
+                    Get-ReviewerConventionSpecialistValue $refSource ([string]$pair[1]) "")
+            }
+        }
         $anchorKind = [string](Get-ReviewerConventionSpecialistValue $candidate "anchorKind" "")
         $primaryTarget = [string](Get-ReviewerConventionSpecialistValue $candidate "primaryTarget" "")
         $manifestationText = [string](Get-ReviewerConventionSpecialistValue $candidate "manifestations" "")
@@ -1930,6 +2064,10 @@ function Resolve-ReviewerConventionSpecialistCandidates {
                     })
                 continue
             }
+            if ($ContractVersion -ge 3) {
+                $candidate["filePath"] = ""
+                $candidate["line"] = 0
+            }
         }
         else {
             $primary = Resolve-ReviewerConventionSpecialistTargets -Text $primaryTarget `
@@ -1940,14 +2078,29 @@ function Resolve-ReviewerConventionSpecialistCandidates {
                 -Text (@($primaryTarget, $manifestationText | Where-Object { $_ }) -join ",") `
                 -Constructs $Constructs -ChangedFileAnchors $changedFileIndex -ChangedLinesOnly
             $targetErrors = @($primary.Errors) + @($additional.Errors) + @($full.Errors)
-            $candidatePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
-                [string](Get-ReviewerConventionSpecialistValue $candidate "filePath" ""))
-            $candidateLine = Get-ReviewerConventionSpecialistValue $candidate "line" $null
-            if (@($primary.Targets).Count -ne 1 -or
-                [string]((@($primary.Targets)[0]).path) -cne $candidatePath -or
-                -not (Test-ReviewerConventionSpecialistInteger $candidateLine) -or
-                [int64]((@($primary.Targets)[0]).line) -ne [int64]$candidateLine) {
-                $targetErrors += "primaryTarget does not exactly match the posted filePath and line"
+            if ($ContractVersion -ge 3) {
+                # The anchor IS the target. There is only one statement of it, so
+                # there is nothing to cross-check and no way for two statements to
+                # disagree; the wrapper reads the path and line back off the
+                # target it just resolved.
+                if (@($primary.Targets).Count -ne 1) {
+                    $targetErrors += "primaryTarget did not resolve to exactly one changed-line anchor"
+                }
+                else {
+                    $candidate["filePath"] = [string]((@($primary.Targets)[0]).path)
+                    $candidate["line"] = [int]((@($primary.Targets)[0]).line)
+                }
+            }
+            else {
+                $candidatePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                    [string](Get-ReviewerConventionSpecialistValue $candidate "filePath" ""))
+                $candidateLine = Get-ReviewerConventionSpecialistValue $candidate "line" $null
+                if (@($primary.Targets).Count -ne 1 -or
+                    [string]((@($primary.Targets)[0]).path) -cne $candidatePath -or
+                    -not (Test-ReviewerConventionSpecialistInteger $candidateLine) -or
+                    [int64]((@($primary.Targets)[0]).line) -ne [int64]$candidateLine) {
+                    $targetErrors += "primaryTarget does not exactly match the posted filePath and line"
+                }
             }
             if (@($full.Targets).Count -gt 0) {
                 $deterministicPrimary = @($full.Targets)[0]
@@ -2025,6 +2178,30 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         $facts = [System.Collections.Generic.List[object]]::new()
         $invalidEvidence = [System.Collections.Generic.List[string]]::new()
         foreach ($factId in $factIds) {
+            # Contract v3 lets an adoption rule cite the declaration census its
+            # conclusion actually rests on. Under v2 the only legal citation was
+            # a review fact (`rf1:`), so "this attribute is on none of the
+            # fifteen declarations in this file" - the whole basis of the
+            # finding - had nowhere to be named, and a model that named it
+            # anyway had its entire marker refused.
+            if ($ContractVersion -ge 3 -and $factId -cmatch '^rdf1:[0-9a-f]{64}$') {
+                $census = @($ConstructFiles | Where-Object {
+                        [string](Get-ReviewerConventionSpecialistValue $_ "evidenceFactId" "") -ceq $factId
+                    })
+                if ($census.Count -ne 1) {
+                    [void]$invalidEvidence.Add("unknown declaration census '$factId'")
+                    continue
+                }
+                # A partial count is not evidence. It cannot say an attribute is
+                # absent; it can only say it was not seen in what was read.
+                if (-not [bool](Get-ReviewerConventionSpecialistValue $census[0] "attributeCountsComplete" $false) -or
+                    -not [bool](Get-ReviewerConventionSpecialistValue $census[0] "wholeFileComplete" $false)) {
+                    [void]$invalidEvidence.Add("declaration census '$factId' is incomplete")
+                    continue
+                }
+                [void]$facts.Add($census[0])
+                continue
+            }
             if (-not $factMap.ContainsKey($factId)) {
                 [void]$invalidEvidence.Add("unknown deterministic fact '$factId'")
                 continue
@@ -2272,6 +2449,7 @@ function New-ReviewerConventionSpecialistInput {
         # saying so here the pass fails closed for a reason that is not a
         # finding about the change.
         [AllowEmptyString()][string]$ReplayNotice = "",
+        [ValidateSet(2, 3)][int]$ContractVersion = 2,
         [int]$MaxInputBytes = $script:ReviewerConventionSpecialistMaxInputBytes
     )
     if (@($ResolvedSources).Count -eq 0) {
@@ -2377,7 +2555,7 @@ function New-ReviewerConventionSpecialistInput {
         # analysis is asking for exactly that. This is a formatting aid and
         # nothing else: it contains no finding, no rule, and no judgement.
         markerScaffold = [pscustomobject][ordered]@{
-            schemaVersion = 2
+            schemaVersion = $ContractVersion
             prId = $PrId
             repositoryId = $RepositoryId
             project = $Project

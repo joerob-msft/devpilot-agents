@@ -1,18 +1,31 @@
 {
   "previewOnly": true,
-  "description": "AzureUX-BPM convention-pack profile used only by offline routing and replay tests. It is not loaded by any deployed reviewer config.",
+  "description": "AzureUX-BPM convention-pack profile used only by offline routing and replay tests. It is not loaded by any deployed reviewer config. The bpm-test-ownership pack carries the one real, pinned authoritative source; every other source below keeps a placeholder repository GUID and path. All sources share one organization because cross-organization source transport is not supported.",
   "repoConventions": {
     "conventionPacks": {
       "schemaVersion": 1,
       "requireAllSourcesReferenced": true,
       "authoritativeSources": {
         "transportVersion": 1,
-        "maxTotalBytes": 8192,
+        "maxTotalBytes": 12288,
         "sources": [
           {
+            "note": "REAL, pinned read-only 2026-09-01. AzureUX-BPM-EngHub master faa7625402523966b177d2b1a25042338b3571fc; the whole file is 15059 bytes, sha256 5ce4be40f16ce555483467f73c088062b94f3ef882562908e6111131f30d0b94. expectedSha256/expectedByteLength bind the DELIVERED SECTION, which is cut before the pin is asserted. Rule text is resolved and hashed at runtime and is never copied into this repository; if EngHub edits the section, the pack fails closed rather than reviewing against a rule nobody validated.",
+            "name": "enghub-automated-tests-ownership",
+            "organization": "msazure",
+            "project": "One",
+            "repositoryId": "c327c2f0-f3b6-4d2f-ba8f-ad7bf7977fde",
+            "path": "/documentation/EngineeringProcesses/Conventions/AutomatedTests.md",
+            "branch": "master",
+            "section": "## Claim ownership",
+            "maxBytes": 2048,
+            "expectedSha256": "bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f",
+            "expectedByteLength": 569
+          },
+          {
             "name": "core-guidance",
-            "organization": "contoso",
-            "project": "AzureUX",
+            "organization": "msazure",
+            "project": "One",
             "repositoryId": "11111111-2222-3333-4444-555555555555",
             "path": "/reviewer/conventions/csharp-core.md",
             "branch": "main",
@@ -20,8 +33,8 @@
           },
           {
             "name": "delivery-guidance",
-            "organization": "contoso",
-            "project": "AzureUX",
+            "organization": "msazure",
+            "project": "One",
             "repositoryId": "11111111-2222-3333-4444-555555555555",
             "path": "/reviewer/conventions/delivery.md",
             "branch": "main",
@@ -29,8 +42,8 @@
           },
           {
             "name": "security-guidance",
-            "organization": "contoso",
-            "project": "AzureUX",
+            "organization": "msazure",
+            "project": "One",
             "repositoryId": "11111111-2222-3333-4444-555555555555",
             "path": "/reviewer/conventions/security-telemetry.md",
             "branch": "main",
@@ -38,8 +51,8 @@
           },
           {
             "name": "provider-guidance",
-            "organization": "contoso",
-            "project": "AzureUX",
+            "organization": "msazure",
+            "project": "One",
             "repositoryId": "11111111-2222-3333-4444-555555555555",
             "path": "/reviewer/conventions/service-providers.md",
             "branch": "main",
@@ -48,6 +61,21 @@
         ]
       },
       "packs": [
+        {
+          "note": "bpm-test-ownership@1. The only activated capability: the EngHub 'Claim ownership' rule requires the owner attribute on test CLASSES and METHODS. Globs deliberately match test-shaped C# only; generated files receive no global exception and are excluded simply by not matching '*Tests.cs'.",
+          "name": "bpm-test-ownership",
+          "priority": 50,
+          "changedPathGlobs": [
+            "**/*Tests.cs",
+            "**/*Test.cs",
+            "src/**/Tests/**/*.cs"
+          ],
+          "authoritativeSourceRefs": [
+            "enghub-automated-tests-ownership"
+          ],
+          "repositorySources": [],
+          "maxBytes": 4096
+        },
         {
           "name": "csharp-core",
           "priority": 100,
@@ -208,12 +236,48 @@
   },
   "replays": [
     {
+      "note": "The live PR16991680 change set. Both test files must select bpm-test-ownership.",
+      "name": "owner-rule-test-change",
+      "changedPaths": [
+        "/src/flow/Tests/Tests.Flow.Data/AutomationConnectionUtilityTests.cs",
+        "/src/flow/Tests/Tests.Flow.Web/AutomationApiOperationApiEngineTests.cs"
+      ],
+      "expectedPacks": [
+        "bpm-test-ownership",
+        "csharp-core"
+      ]
+    },
+    {
+      "note": "Generated test-shaped code receives no global exception; it is excluded by not matching the ownership globs.",
+      "name": "owner-rule-generated-excluded",
+      "changedPaths": [
+        "/src/Backend/Generated/ConnectorTests.g.cs",
+        "/src/Backend/Generated/ConnectorTests.generated.cs"
+      ],
+      "expectedPacks": [
+        "csharp-core",
+        "generated-code-and-packages"
+      ]
+    },
+    {
+      "note": "A non-test C# change must not select the ownership pack.",
+      "name": "owner-rule-non-test-excluded",
+      "changedPaths": [
+        "/src/Backend/ServiceProviders/StorageProvider.cs"
+      ],
+      "expectedPacks": [
+        "csharp-core",
+        "service-providers-and-connector-gateway"
+      ]
+    },
+    {
       "name": "service-provider-change",
       "changedPaths": [
         "/src/Backend/ServiceProviders/StorageProvider.cs",
         "\\tests\\Backend\\StorageProvider.Tests.cs"
       ],
       "expectedPacks": [
+        "bpm-test-ownership",
         "csharp-core",
         "tests-and-cloudtest",
         "service-providers-and-connector-gateway"

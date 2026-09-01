@@ -1,0 +1,200 @@
+{
+  "note": "Validation corpus for the bpm-test-ownership@1 capability. Truth here is HUMAN/MANUAL and is used to validate the specialist; it is never a production detector. Aliases are synthetic. This file lives under tools/ because it carries the real rule's semantics, and tools/ is one of the two locations the employer-specifics gate excludes.",
+  "corpusVersion": 1,
+  "capability": "bpm-test-ownership@1",
+  "rule": {
+    "sourceKind": "external engineering-guidance repository",
+    "section": "## Claim ownership",
+    "semantics": "The owner attribute is required on test CLASSES and on test METHODS. Combined attribute lists and DataTestMethod/DataRow forms are in scope.",
+    "scope": [
+      "declaration"
+    ],
+    "notes": "The rule governs declarations only. Invocations, comments and assignments are out of its reach and must be accounted for as notInReach, never as compliant."
+  },
+  "expectationVocabulary": {
+    "violation": "The declaration is in the rule's reach and lacks the owner attribute.",
+    "compliant": "The declaration is in the rule's reach and carries the owner attribute.",
+    "notInReach": "The construct is not a test declaration the rule governs.",
+    "notRouted": "The file does not select the ownership pack at all, so no verdict is produced for it.",
+    "unknown": "Required declaration context could not be established. Never a finding, never compliant."
+  },
+  "cases": [
+    {
+      "id": "pr16991680-new-test-methods",
+      "kind": "positive",
+      "origin": "live",
+      "description": "Nine new [TestMethod] declarations added with no owner attribute. This is the live change set the capability must reproduce.",
+      "anchors": [
+        { "path": "/src/flow/Tests/Tests.Flow.Data/AutomationConnectionUtilityTests.cs", "line": 69, "construct": "dc2" },
+        { "path": "/src/flow/Tests/Tests.Flow.Data/AutomationConnectionUtilityTests.cs", "line": 81, "construct": "dc3" },
+        { "path": "/src/flow/Tests/Tests.Flow.Data/AutomationConnectionUtilityTests.cs", "line": 115, "construct": "dc4" },
+        { "path": "/src/flow/Tests/Tests.Flow.Data/AutomationConnectionUtilityTests.cs", "line": 126, "construct": "dc5" },
+        { "path": "/src/flow/Tests/Tests.Flow.Data/AutomationConnectionUtilityTests.cs", "line": 137, "construct": "dc6" },
+        { "path": "/src/flow/Tests/Tests.Flow.Data/AutomationConnectionUtilityTests.cs", "line": 148, "construct": "dc7" },
+        { "path": "/src/flow/Tests/Tests.Flow.Data/AutomationConnectionUtilityTests.cs", "line": 159, "construct": "dc8" },
+        { "path": "/src/flow/Tests/Tests.Flow.Data/AutomationConnectionUtilityTests.cs", "line": 174, "construct": "dc9" },
+        { "path": "/src/flow/Tests/Tests.Flow.Web/AutomationApiOperationApiEngineTests.cs", "line": 398, "construct": "dc10" }
+      ],
+      "expect": "violation",
+      "expectedCount": 9,
+      "truth": "manual"
+    },
+    {
+      "id": "method-owner-separate-brackets",
+      "kind": "negative",
+      "description": "Owner attribute present in its own bracket group.",
+      "source": [
+        "[TestMethod]",
+        "[Owner(\"synthetic-alias\")]",
+        "public void GivenSomethingItDoesSomething()"
+      ],
+      "declarationLine": 3,
+      "expectedAttributes": [ "Owner", "TestMethod" ],
+      "expect": "compliant",
+      "truth": "manual"
+    },
+    {
+      "id": "method-owner-combined-list",
+      "kind": "negative",
+      "description": "Owner attribute inside a combined bracket group. Before the lexer fix this read as TestMethod alone, so a compliant declaration was reported as a violation - an invented finding, not a missed one.",
+      "source": [
+        "[TestMethod, Owner(\"synthetic-alias\")]",
+        "public void GivenSomethingItDoesSomething()"
+      ],
+      "declarationLine": 2,
+      "expectedAttributes": [ "Owner", "TestMethod" ],
+      "expect": "compliant",
+      "truth": "manual",
+      "regressionFor": "attribute-list-splitting"
+    },
+    {
+      "id": "class-and-method-both-owned",
+      "kind": "negative",
+      "description": "The rule covers classes as well as methods; both carry the attribute here.",
+      "source": [
+        "[TestClass]",
+        "[Owner(\"synthetic-alias\")]",
+        "public class WidgetTests"
+      ],
+      "declarationLine": 3,
+      "expectedAttributes": [ "Owner", "TestClass" ],
+      "expect": "compliant",
+      "truth": "manual"
+    },
+    {
+      "id": "class-missing-owner",
+      "kind": "positive",
+      "description": "A test class with no owner attribute. Confirms class scope, which the target repository's weaker methods-only phrasing would have missed.",
+      "source": [
+        "[TestClass]",
+        "public class WidgetTests"
+      ],
+      "declarationLine": 2,
+      "expectedAttributes": [ "TestClass" ],
+      "expect": "violation",
+      "truth": "manual"
+    },
+    {
+      "id": "datatestmethod-datarow-owned",
+      "kind": "negative",
+      "description": "DataTestMethod with a DataRow whose argument list contains a comma. The comma is an argument separator, not an attribute separator.",
+      "source": [
+        "[DataTestMethod]",
+        "[DataRow(true, false)]",
+        "[Owner(\"synthetic-alias\")]",
+        "public void GivenFlagsItBehaves(bool a, bool b)"
+      ],
+      "declarationLine": 4,
+      "expectedAttributes": [ "DataRow", "DataTestMethod", "Owner" ],
+      "expect": "compliant",
+      "truth": "manual",
+      "regressionFor": "comma-inside-parentheses"
+    },
+    {
+      "id": "datatestmethod-datarow-missing-owner",
+      "kind": "positive",
+      "description": "The same DataRow form with no owner attribute.",
+      "source": [
+        "[DataTestMethod]",
+        "[DataRow(true, false)]",
+        "public void GivenFlagsItBehaves(bool a, bool b)"
+      ],
+      "declarationLine": 3,
+      "expectedAttributes": [ "DataRow", "DataTestMethod" ],
+      "expect": "violation",
+      "truth": "manual"
+    },
+    {
+      "id": "attribute-array-argument",
+      "kind": "negative",
+      "description": "An array initialiser inside an attribute argument also contains commas.",
+      "source": [
+        "[DataRow(new[] { 1, 2 })]",
+        "[Owner(\"synthetic-alias\")]",
+        "public void GivenValuesItBehaves(int[] values)"
+      ],
+      "declarationLine": 3,
+      "expectedAttributes": [ "DataRow", "Owner" ],
+      "expect": "compliant",
+      "truth": "manual",
+      "regressionFor": "comma-inside-braces"
+    },
+    {
+      "id": "two-groups-one-line",
+      "kind": "negative",
+      "description": "Several bracket groups on a single line.",
+      "source": [
+        "[TestMethod] [Owner(\"synthetic-alias\")]",
+        "public void GivenSomethingItDoesSomething()"
+      ],
+      "declarationLine": 2,
+      "expectedAttributes": [ "Owner", "TestMethod" ],
+      "expect": "compliant",
+      "truth": "manual"
+    },
+    {
+      "id": "generated-test-shaped-file",
+      "kind": "excluded",
+      "description": "Generated code receives no global exception; it is excluded because it does not match the ownership globs.",
+      "paths": [
+        "/src/Backend/Generated/ConnectorTests.g.cs",
+        "/src/Backend/Generated/ConnectorTests.generated.cs"
+      ],
+      "expect": "notRouted",
+      "expectedPacks": [ "csharp-core", "generated-code-and-packages" ],
+      "truth": "manual"
+    },
+    {
+      "id": "non-test-changed-cs",
+      "kind": "excluded",
+      "description": "A production C# change is not a test declaration and is outside the rule's reach.",
+      "paths": [ "/src/Backend/ServiceProviders/StorageProvider.cs" ],
+      "expect": "notRouted",
+      "expectedPacks": [ "csharp-core", "service-providers-and-connector-gateway" ],
+      "truth": "manual"
+    },
+    {
+      "id": "truncated-attribute-list",
+      "kind": "unresolved",
+      "description": "More attributes than the per-declaration cap. The list is not a complete fact, so the owner attribute cannot be said to be absent.",
+      "attributeCount": 14,
+      "cap": 12,
+      "expect": "unknown",
+      "truth": "manual"
+    },
+    {
+      "id": "undelivered-context",
+      "kind": "unresolved",
+      "description": "The attribute lines above the declaration were never delivered by the transport. Absence in unread source is not absence.",
+      "expect": "unknown",
+      "truth": "manual"
+    },
+    {
+      "id": "unreadable-attribute-shape",
+      "kind": "unresolved",
+      "description": "A bracket group whose shape cannot be established yields no attribute name and marks the declaration uncertain, rather than reporting the owner attribute missing.",
+      "expect": "unknown",
+      "truth": "manual"
+    }
+  ]
+}

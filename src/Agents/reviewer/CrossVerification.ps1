@@ -1030,10 +1030,44 @@ function ConvertTo-ReviewerIndependentDiscoveryCandidates {
 
     $markerCandidates = @(Get-ReviewerVerificationValue $Marker "candidates" @())
     $artifactSha256 = Get-ReviewerVerificationObjectSha256 -Value $Marker
+    # Contract v3 candidates do not carry the anchor or the rule provenance: the
+    # wrapper derives both from what it transported, so the model states them
+    # once, not twice. This check exists to stop a resolved projection
+    # introducing a CANDIDATE the model never emitted, so for v3 the wrapper's
+    # own deterministic fields are copied onto the raw candidate - matched by
+    # candidate id - before the pair is hashed. A resolved candidate whose id is
+    # absent from the raw marker still has no pair to match and still throws,
+    # which is the property this guard is here for.
+    $markerContractVersion = [int](Get-ReviewerVerificationValue $Marker "schemaVersion" 2)
+    $wrapperOwnedFields = @("filePath", "line", "packName", "ruleSourceId", "ruleSourceRepositoryId",
+        "ruleSourcePath", "ruleSourceCommit", "ruleSourceSha256")
+    $resolvedById = @{}
+    if ($markerContractVersion -ge 3) {
+        foreach ($resolved in @($SpecialistCandidates)) {
+            $resolvedId = [string](Get-ReviewerVerificationValue $resolved "candidateId" "")
+            if ($resolvedId -and -not $resolvedById.ContainsKey($resolvedId)) {
+                $resolvedById[$resolvedId] = $resolved
+            }
+        }
+    }
     $normalizedMarkerCandidates = @($markerCandidates | ForEach-Object {
             $normalized = (ConvertTo-ReviewerVerificationCanonicalJson -Value $_) |
                 ConvertFrom-Json -Depth 32
-            $normalized.filePath = ConvertTo-ReviewerVerificationPath -Path ([string]$normalized.filePath)
+            if ($markerContractVersion -ge 3) {
+                $rawId = [string](Get-ReviewerVerificationValue $normalized "candidateId" "")
+                if ($rawId -and $resolvedById.ContainsKey($rawId)) {
+                    $source = $resolvedById[$rawId]
+                    foreach ($field in $wrapperOwnedFields) {
+                        $derivedValue = Get-ReviewerVerificationValue $source $field $null
+                        if ($null -eq $derivedValue) { continue }
+                        if ($normalized.PSObject.Properties[$field]) { $normalized.$field = $derivedValue }
+                        else { Add-Member -InputObject $normalized -NotePropertyName $field -NotePropertyValue $derivedValue }
+                    }
+                }
+            }
+            if ($normalized.PSObject.Properties['filePath']) {
+                $normalized.filePath = ConvertTo-ReviewerVerificationPath -Path ([string]$normalized.filePath)
+            }
             $normalized
         })
     $markerDerived = @(ConvertTo-ReviewerVerificationCandidates `
@@ -1118,6 +1152,17 @@ function Get-ReviewerAuthenticatedSpecialistCandidates {
     # materialization digest), so the trusted source build's successful parse is the
     # authority for that field. The caller must separately pin digests.scriptSha256
     # to the exact trusted source build.
+    # The legacy shape predates sourceProjection, so by construction it can only
+    # be a contract v2 marker: v2 is the contract those builds emitted. A v3
+    # marker has no anchor and no rule provenance of its own - the wrapper
+    # derives both - so a v3 package WITHOUT the projection has lost the only
+    # record of them. Reconstructing a candidate from what is left would be
+    # inventing provenance, and a package that arrives in that state is either
+    # from a build that cannot exist or one that has been stripped. Refuse it.
+    if ([int](Get-ReviewerVerificationValue $Marker "schemaVersion" 2) -ge 3) {
+        throw ("A contract v3 specialist package carries no supervisor-resolved source projection. " +
+            "Its candidates' anchors and rule provenance are wrapper-derived and cannot be recovered from the marker alone.")
+    }
     if (-not (Test-ReviewerConventionSpecialistBinding -Marker $Marker `
             -PrId ([int]$snapshot.prId) -RepositoryId ([string]$snapshot.repositoryId) `
             -SourceCommit ([string]$snapshot.sourceCommit) -TargetCommit ([string]$snapshot.targetCommit) `
