@@ -217,7 +217,15 @@ not a candidate. Do not invent a resolution.
     emit an array or `null`. `authoritativeRule` requires that empty string; its remediation evidence is the pinned
     provenance, section, and exact quote. Candidate-level `factIds` may cite
     wrapper-supplied review facts (`rf1:...`) or declaration-census facts
-    (`rdf1:...`) to support impact or declaration evidence. `deterministicFact`
+    (`rdf1:...`) to support impact or declaration evidence. A `rdf1:` census may
+    be cited ONLY when that record's `attributeCountsComplete` and
+    `wholeFileComplete` are both true. A partial count cannot show an attribute
+    is absent - it can only show it was not seen in what was read - so the
+    wrapper withholds any candidate citing an incomplete one, and the finding is
+    lost along with it. If a candidate spans several files, cite only the
+    complete censuses; a violation anchored on a changed declaration's OWN
+    attributes stands on those attributes and needs no census at all, so citing
+    none is better than citing one that is incomplete. `deterministicFact`
     may cite only wrapper-supplied `rf1:` facts whose state and value are
     canonical booleans or strings. Never infer an identifier, resource key, test,
     file, debt scope, identity, alias, owner, or assignee.

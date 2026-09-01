@@ -70,7 +70,7 @@ foreach ($case in @($corpus.cases)) {
     # A shape the wrapper could not establish must never be reported as a
     # complete attribute list, because "complete and without Owner" is a
     # finding and "incomplete" is not.
-    Assert-Owner (-not [bool]$declaration.Truncated) `
+    Assert-Owner (-not ([bool]$declaration.Truncated -or [bool]$declaration.ShapeUncertain)) `
         "Corpus case '$($case.id)': a fully readable declaration was marked incomplete."
 
     $carriesOwner = (@($declaration.Attributes) -ccontains 'Owner')
@@ -99,7 +99,7 @@ $unreadable = @((Get-ReviewerConstructMaskedLines -Lines ([string[]]@(
                 '[TestMethod, 9invalid]',
                 'public void GivenSomethingItDoesSomething()'))).Lines)
 $unreadableDeclaration = Get-ReviewerConstructDeclarationAt -MaskedLines $unreadable -Index 1
-Assert-Owner ($null -ne $unreadableDeclaration -and [bool]$unreadableDeclaration.Truncated) `
+Assert-Owner ($null -ne $unreadableDeclaration -and ([bool]$unreadableDeclaration.Truncated -or [bool]$unreadableDeclaration.ShapeUncertain)) `
     "An unreadable attribute segment did not mark the declaration incomplete."
 
 # A group that never closes is not a declaration the wrapper will speak about.
@@ -322,7 +322,7 @@ foreach ($shape in @(
     if ($null -ne $shapeDeclaration) {
         Assert-Owner (@($shapeDeclaration.Attributes).Count -eq 0) `
             "Shape '$($shape.Name)': invented attribute(s) [$(@($shapeDeclaration.Attributes) -join ',')]."
-        Assert-Owner ([bool]$shapeDeclaration.Truncated) `
+        Assert-Owner (([bool]$shapeDeclaration.Truncated -or [bool]$shapeDeclaration.ShapeUncertain)) `
             "Shape '$($shape.Name)': an unreadable attribute shape was reported as a complete, established fact."
     }
 }
@@ -337,7 +337,7 @@ $commentSplit = @((Get-ReviewerConstructMaskedLines -Lines ([string[]]@(
                 '[TestMethod]',
                 'public void A()'))).Lines)
 $commentDeclaration = Get-ReviewerConstructDeclarationAt -MaskedLines $commentSplit -Index 3
-Assert-Owner ($null -ne $commentDeclaration -and [bool]$commentDeclaration.Truncated) `
+Assert-Owner ($null -ne $commentDeclaration -and ([bool]$commentDeclaration.Truncated -or [bool]$commentDeclaration.ShapeUncertain)) `
     "An attribute list interrupted by a comment was reported as complete, losing the attributes above it."
 
 # An unread line directly above a declaration is ignorance, not absence.
@@ -348,8 +348,103 @@ $sparse = @((Get-ReviewerConstructMaskedLines -Lines ([string[]]@(
 $deliveredOnly = [System.Collections.Generic.HashSet[int]]::new()
 [void]$deliveredOnly.Add(3)
 $sparseDeclaration = Get-ReviewerConstructDeclarationAt -MaskedLines $sparse -Index 2 -Delivered $deliveredOnly
-Assert-Owner ($null -ne $sparseDeclaration -and [bool]$sparseDeclaration.Truncated) `
+Assert-Owner ($null -ne $sparseDeclaration -and ([bool]$sparseDeclaration.Truncated -or [bool]$sparseDeclaration.ShapeUncertain)) `
     "A declaration whose attribute lines were never delivered was reported as carrying no attributes."
+
+# The trial-1 regression. An unread line above ONE declaration used to be
+# laundered into the file-wide attribute flag, which marked EVERY declaration in
+# the file unknown. In the live trial that turned all nine changed test methods
+# into unknowns, the specialist correctly refused to call an unknown a
+# violation, and the capability reported nothing at all. Doubt about one
+# declaration's own shape must stay with that declaration.
+$mixedLines = [string[]]@(
+    '[TestMethod]',
+    'public void OwnedElsewhere()',
+    '{',
+    '}',
+    '[TestMethod]',
+    'public void AlsoChanged()')
+$mixedMasked = @((Get-ReviewerConstructMaskedLines -Lines $mixedLines).Lines)
+# Build the index the way production does - through the delivered set - or the
+# records carry no uncertainty at all and the test cannot discriminate.
+$mixedDelivered = @(2, 3, 4, 5, 6)
+$mixedIndex = Get-ReviewerConstructDeclarationIndex -MaskedLines $mixedMasked -DeliveredLines $mixedDelivered
+# Only the SECOND declaration changed, so the first is an unchanged neighbour -
+# which is the path that feeds the file-wide flag this correction is about.
+$mixedResult = Get-ReviewerChangedDeclarations -Path '/src/Tests/WidgetTests.cs' `
+    -ChangedLines @(6) -MaskedLines $mixedMasked -DeclarationIndex $mixedIndex `
+    -DeliveredLines $mixedDelivered
+$mixedSecond = @(@($mixedResult.Constructs) | Where-Object { [int]$_.line -eq 6 })
+Assert-Owner ($mixedSecond.Count -eq 1) "The fully delivered declaration was not enumerated."
+if ($mixedSecond.Count -eq 1) {
+    Assert-Owner ([string]$mixedSecond[0].status -ceq 'known') `
+        ("A declaration whose own attribute line WAS delivered was marked '$($mixedSecond[0].status)' " +
+        "because a different declaration in the same file sat next to an unread line.")
+    Assert-Owner (@($mixedSecond[0].attributes) -ccontains 'TestMethod') `
+        "The fully delivered declaration lost its own attribute."
+}
+# The neighbour itself must still be uncertain - the fix keeps doubt local, it
+# does not delete it.
+$mixedNeighbour = @($mixedIndex | Where-Object { $null -ne $_ -and [string]$_.Name -ceq 'OwnedElsewhere' })
+Assert-Owner ($mixedNeighbour.Count -eq 1 -and
+    (Get-ReviewerConstructShapeUncertain -Declaration $mixedNeighbour[0])) `
+    "The declaration sitting next to an unread line lost its own uncertainty."
+
+# An unread line directly above a declaration can never be discharged by
+# looking further up: that line is the one whose content decides the list.
+$unreadAbove = @((Get-ReviewerConstructMaskedLines -Lines ([string[]]@(
+                '}',
+                '[Owner("alias")]',
+                'public void GivenSomethingItDoesSomething()'))).Lines)
+$unreadDelivered = [System.Collections.Generic.HashSet[int]]::new()
+[void]$unreadDelivered.Add(1)
+[void]$unreadDelivered.Add(3)
+$unreadDeclaration = Get-ReviewerConstructDeclarationAt -MaskedLines $unreadAbove -Index 2 -Delivered $unreadDelivered
+Assert-Owner ($null -ne $unreadDeclaration -and
+    (Get-ReviewerConstructShapeUncertain -Declaration $unreadDeclaration)) `
+    "An unread line directly above a declaration was discharged by a delivered line above IT, claiming absence of an attribute nobody read."
+
+# A long masked comment run between attributes must not fall outside the peek.
+$longComment = @((Get-ReviewerConstructMaskedLines -Lines ([string[]]@(
+                '[Owner("alias")]',
+                '// one',
+                '// two',
+                '// three',
+                '// four',
+                '[TestMethod]',
+                'public void GivenSomethingItDoesSomething()'))).Lines)
+$longCommentDeclaration = Get-ReviewerConstructDeclarationAt -MaskedLines $longComment -Index 6
+Assert-Owner ($null -ne $longCommentDeclaration -and
+    (Get-ReviewerConstructShapeUncertain -Declaration $longCommentDeclaration)) `
+    "A four-line comment between attribute lines fell outside the peek, dropping the attributes above it and reporting the list complete."
+
+# A wrapped group's continuation line above a gap is proof the block did not end.
+$wrappedAbove = @((Get-ReviewerConstructMaskedLines -Lines ([string[]]@(
+                '[TestMethod,',
+                'Owner("alias")]',
+                '',
+                '[TestCategory("Unit")]',
+                'public void GivenSomethingItDoesSomething()'))).Lines)
+$wrappedAboveDeclaration = Get-ReviewerConstructDeclarationAt -MaskedLines $wrappedAbove -Index 4
+Assert-Owner ($null -ne $wrappedAboveDeclaration -and
+    (Get-ReviewerConstructShapeUncertain -Declaration $wrappedAboveDeclaration)) `
+    "A wrapped-group continuation above the gap was read as an ordinary statement, discharging the doubt it proves."
+
+# An under-counted census must never publish as complete.
+$censusLines = [string[]]@(
+    '[TestMethod]',
+    '[Owner("alias")]',
+    'public void A()',
+    '{',
+    '}',
+    '[TestMethod,',
+    'Owner("alias")]',
+    'public void B()')
+$censusMasked = @((Get-ReviewerConstructMaskedLines -Lines $censusLines).Lines)
+$censusIndex = Get-ReviewerConstructDeclarationIndex -MaskedLines $censusMasked
+$censusFrequency = Get-ReviewerConstructAttributeFrequency -DeclarationIndex $censusIndex
+Assert-Owner ([bool]$censusFrequency.Truncated) `
+    "A file containing a declaration whose attribute list could not be established published a COMPLETE census, so an under-count becomes a citable 'this file never used it' fact."
 
 if ($script:OwnerFailures.Count -gt 0) {
     foreach ($failure in $script:OwnerFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }

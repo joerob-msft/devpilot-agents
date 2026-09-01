@@ -650,22 +650,26 @@ function Get-ReviewerConstructDeclarationAt {
         # declaration, and the whole point of these attributes is that they are
         # facts. Stop at the first line that is not a delivered attribute line.
         if ($null -ne $Delivered -and $Delivered.Count -gt 0 -and -not $Delivered.Contains($above + 1)) {
-            # We did not read this line. "No attribute here" and "we never
-            # looked" are different answers, and only one of them may become a
-            # finding, so an unread line directly above a declaration makes its
-            # attribute list unknown rather than empty.
+            # An unread line is the ONE line whose content decides whether the
+            # list continues, and no amount of looking above it can say what was
+            # in it. Finding a closing brace two lines up is not evidence that
+            # the unread line was not `[Owner("alias")]`. This stop is never
+            # discharged.
             $shapeUncertain = $true
             break
         }
         $line = ([string]$MaskedLines[$above]).Trim()
         if (-not $line) {
             # Comment CONTENT is masked to spaces before this scan runs, so a
-            # comment sitting between two attribute lines arrives here looking
-            # exactly like a blank line. Stopping mid-list would drop every
-            # attribute above it and still call the result complete. A blank
-            # line below no attributes at all is the ordinary terminator and
-            # stays silent.
-            if ($attributes.Count -gt 0) { $shapeUncertain = $true }
+            # comment between two attribute lines arrives here looking exactly
+            # like a blank line. Stopping mid-list would drop every attribute
+            # above it and still call the result complete. A blank line above a
+            # block that has already ended is the ordinary terminator - which is
+            # the common case, and treating it as doubt marked every declaration
+            # in a file unknown and silenced the capability entirely.
+            if ((Test-ReviewerConstructAttributeAbove -MaskedLines $MaskedLines -Index $above -Delivered $Delivered) -cne 'other') {
+                $shapeUncertain = $true
+            }
             break
         }
         if (-not $line.StartsWith('[')) {
@@ -711,12 +715,90 @@ function Get-ReviewerConstructDeclarationAt {
     }
     $sorted = [string[]]@($attributes.ToArray())
     [Array]::Sort($sorted, [StringComparer]::Ordinal)
-    # `Truncated` means the attribute list is not a complete, established fact -
-    # whether because the cap cut it short or because a group's shape could not
-    # be read. Both must reach the caller the same way: a declaration whose
-    # attributes are only partly known is reported `unknown`, never as one that
-    # is missing whatever was not read.
-    return @{ Name = $name; Attributes = @($sorted); Truncated = ($truncated -or $shapeUncertain) }
+    # Two different kinds of doubt, deliberately reported apart.
+    #
+    # `Truncated` means a CAP cut the list short. That makes the file-wide
+    # attribute-name set incomplete, so "absent nowhere else" stops being a
+    # complete statement for every declaration in the file.
+    #
+    # `ShapeUncertain` means THIS declaration's own attribute list could not be
+    # established - an unreadable group, a wrapped group, an unread line above
+    # it. That says nothing about any other declaration, and laundering it into
+    # the file-wide flag marks every declaration in the file unknown because one
+    # of them sat next to a gap. A live trial did exactly that: all nine changed
+    # test methods came back unknown, so the specialist correctly refused to
+    # call any of them a violation and the capability reported nothing at all.
+    return @{
+        Name = $name
+        Attributes = @($sorted)
+        Truncated = $truncated
+        ShapeUncertain = $shapeUncertain
+    }
+}
+
+function Test-ReviewerConstructAttributeAbove {
+    <#
+        Whether an attribute line sits above the interrupting line at $Index,
+        within a short bounded peek.
+
+        This decides DOUBT, never content. A blank line above a complete
+        attribute block is the ordinary end of that block; a blank line with
+        more attribute lines above it means the block was interrupted and what
+        was collected is not the whole list. Comment CONTENT is masked to
+        spaces before this scan, so an interrupting comment arrives looking
+        exactly like a blank line - which is precisely the case that has to be
+        told apart from the ordinary one.
+
+        Nothing found here is ever collected as an attribute: reaching across a
+        gap for a NAME would attach an attribute from far away to a declaration
+        that does not carry it. The peek only answers "was there more".
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines,
+        [Parameter(Mandatory)][int]$Index,
+        $Delivered = $null
+    )
+    $limit = 0
+    $skippedGap = $false
+    for ($peek = $Index - 1; $peek -ge $limit; $peek--) {
+        if ($null -ne $Delivered -and $Delivered.Count -gt 0 -and -not $Delivered.Contains($peek + 1)) {
+            # An unread line inside the gap. Nothing above it can speak for it.
+            return 'blind'
+        }
+        $text = ([string]$MaskedLines[$peek]).Trim()
+        if (-not $text) { $skippedGap = $true; continue }
+        if ($text.StartsWith('[')) { return 'attribute' }
+        # A wrapped group's continuation line starts with the attribute NAME,
+        # not with '[', and closes more brackets than it opens. It is proof the
+        # block did not end, so reading it as an ordinary statement would
+        # discharge exactly the doubt this peek exists to raise.
+        $opens = @($text.ToCharArray() | Where-Object { $_ -eq '[' }).Count
+        $closes = @($text.ToCharArray() | Where-Object { $_ -eq ']' }).Count
+        if ($closes -gt $opens) { return 'attribute' }
+        return 'other'
+    }
+    # Ran off the top of the file. If a gap was crossed to get here we never
+    # established what was in it.
+    if ($skippedGap) { return 'blind' }
+    return 'other'
+}
+
+function Get-ReviewerConstructShapeUncertain {
+    <#
+        Whether ONE declaration's own attribute list could not be established.
+        Read through a helper because the field is newer than some of the
+        records that reach here, and a missing key must read as "no doubt
+        recorded" rather than throwing under StrictMode.
+    #>
+    param([AllowNull()]$Declaration)
+    if ($null -eq $Declaration) { return $false }
+    if ($Declaration -is [hashtable]) {
+        if (-not $Declaration.ContainsKey('ShapeUncertain')) { return $false }
+        return [bool]$Declaration['ShapeUncertain']
+    }
+    $property = $Declaration.PSObject.Properties['ShapeUncertain']
+    if ($null -eq $property) { return $false }
+    return [bool]$property.Value
 }
 
 function Get-ReviewerChangedDeclarations {
@@ -801,6 +883,14 @@ function Get-ReviewerChangedDeclarations {
                     $neighbour = $DeclarationIndex[$scan]
                     if ($null -ne $neighbour) {
                         $siblingCount++
+                        # Only a CAP makes a neighbour's list incomplete in a way
+                        # that matters here. A neighbour whose own shape could
+                        # not be read simply contributes no attributes: sibling
+                        # evidence is corroborating context, so that shrinks the
+                        # context and fails toward silence. Propagating it would
+                        # mark the SUBJECT unknown because a neighbour sat next
+                        # to a gap - the whole-file poisoning this correction
+                        # exists to remove, re-entering by another door.
                         if ([bool]$neighbour.Truncated) { $siblingTruncated = $true }
                         foreach ($attribute in @($neighbour.Attributes)) {
                             if ($siblingAttributes.Count -ge $script:ReviewerConstructMaxAttributes) { $siblingTruncated = $true; break }
@@ -831,7 +921,9 @@ function Get-ReviewerChangedDeclarations {
                 # file-wide attribute set hit its cap: "absent nowhere else"
                 # would then mean "the wrapper stopped counting", which a rule
                 # reasoning from it must not be told silently.
-                status = $(if ([bool]$declaration.Truncated -or $attributesTruncated -or $siblingTruncated) { "unknown" } else { "known" })
+                status = $(if ([bool]$declaration.Truncated -or
+                        (Get-ReviewerConstructShapeUncertain -Declaration $declaration) -or
+                        $attributesTruncated -or $siblingTruncated) { "unknown" } else { "known" })
             })
     }
     return @{ Constructs = @($found.ToArray()); Truncated = $truncated }
@@ -864,7 +956,14 @@ function Get-ReviewerConstructAttributeFrequency {
         # wrong in the direction that matters: it reports an attribute as
         # appearing on fewer declarations than it does, which reads as "this
         # file has never used it" - a precedent fact, inverted.
-        if ([bool]$declaration.Truncated) { $frequencyTruncated = $true }
+        # A declaration whose attribute list could not be ESTABLISHED counts
+        # here exactly like one a cap cut short. Either way the tally under-
+        # counts, and an under-count reads as "this file has never used that
+        # attribute" - a precedent fact, inverted. The census is what `rdf1:`
+        # evidence is built from and what `attributeCountsComplete` publishes,
+        # so it is the one place local doubt must NOT stay local.
+        if ([bool]$declaration.Truncated -or
+            (Get-ReviewerConstructShapeUncertain -Declaration $declaration)) { $frequencyTruncated = $true }
         $declarationCount++
         $attributesOnDeclaration = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($attribute in @($declaration.Attributes)) {
