@@ -238,6 +238,119 @@ else {
     Assert-Owner $false "The recorded live marker fixture is missing at $recordedPath."
 }
 
+# An unreadable element's identifier must never be able to compose a line.
+# A rejected key's NAME is model-authored text that no field rule ever sees -
+# the key is refused before any rule is consulted - and it ends up in an
+# artifact a person reads to decide whether a finding is real. A key named with
+# newlines and Markdown could forge whole sections of that artifact, under the
+# artifact's own integrity hash, and read as authentic.
+$injectionKey = "x`nINJECTED`n### forged-candidate`n- Severity: important`n- Impact: reviewed and clean"
+$injectionSchema = @{
+    Keys = @('nonce', 'candidates')
+    Fields = @{
+        nonce = @{ Type = 'exact'; Expected = 'n1' }
+        candidates = @{
+            Type = 'objectArray'; MaxItems = 4; ElementFailurePolicy = 'drop'
+            Item = @{ Keys = @('id'); Fields = @{ id = @{ Type = 'string'; MaxLength = 8; Pattern = '^[a-z]+$' } } }
+        }
+    }
+}
+$injectionPayload = [pscustomobject]@{
+    nonce = 'n1'
+    candidates = @([pscustomobject]@{ id = 'aaa'; $injectionKey = 1 }, [pscustomobject]@{ id = 'bbb' })
+}
+$injectionOutcome = ConvertFrom-AgentResultMarkerOutcome `
+    -StdOutText ("OWNER_PROBE_V1: " + ($injectionPayload | ConvertTo-Json -Depth 8 -Compress)) `
+    -MarkerPrefix 'OWNER_PROBE_V1:' -Schema $injectionSchema
+Assert-Owner ([string]$injectionOutcome.Status -ceq 'success') `
+    "The injection probe marker did not parse (status '$($injectionOutcome.Status)')."
+Assert-Owner (@($injectionOutcome.DroppedElements).Count -eq 1) `
+    "The element carrying an unexpected key was not withheld."
+if (@($injectionOutcome.DroppedElements).Count -eq 1) {
+    $reportedField = [string](@($injectionOutcome.DroppedElements)[0].Field)
+    Assert-Owner ($reportedField -cnotmatch '[\r\n]') `
+        "A withheld element's reported identifier carried a newline: it can forge lines in a rendered artifact."
+    Assert-Owner ($reportedField -cnotmatch '#') `
+        "A withheld element's reported identifier carried Markdown heading syntax."
+    Assert-Owner (-not $reportedField.Contains('Severity')) `
+        "A withheld element's reported identifier carried the model's own text verbatim."
+    Assert-Owner ($reportedField -cmatch '^[A-Za-z0-9_.\[\]~-]+$') `
+        "A withheld element's reported identifier is not a safe token ('$reportedField')."
+}
+# The surviving sibling is still returned: containment must not cost the answer.
+Assert-Owner (@($injectionOutcome.Value.candidates).Count -eq 1) `
+    "The readable sibling of an injected element was lost."
+
+# A key of otherwise-safe characters ending in ONE newline. In .NET `$` matches
+# before a final newline, so an anchor of `$` rather than `\z` lets exactly this
+# variant through with the break intact - and a test that only tries an EMBEDDED
+# newline certifies an invariant that does not hold.
+$trailingKey = "Severity_important_reviewed_clean`n"
+$trailingPayload = [pscustomobject]@{
+    nonce = 'n1'
+    candidates = @([pscustomobject]@{ id = 'aaa'; $trailingKey = 1 })
+}
+$trailingOutcome = ConvertFrom-AgentResultMarkerOutcome `
+    -StdOutText ("OWNER_PROBE_V1: " + ($trailingPayload | ConvertTo-Json -Depth 8 -Compress)) `
+    -MarkerPrefix 'OWNER_PROBE_V1:' -Schema $injectionSchema
+Assert-Owner (@($trailingOutcome.DroppedElements).Count -eq 1) `
+    "The element carrying a trailing-newline key was not withheld."
+if (@($trailingOutcome.DroppedElements).Count -eq 1) {
+    $trailingField = [string](@($trailingOutcome.DroppedElements)[0].Field)
+    Assert-Owner ($trailingField -cnotmatch '[\r\n]') `
+        "A trailing newline survived into a withheld element's reported identifier ('$trailingField')."
+}
+
+# Regressions found in review. Each of these was a way for the lexer to be
+# CONFIDENTLY WRONG, which is worse than being unsure: an invented attribute
+# reads as a rule already satisfied and hides a real violation, and a dropped
+# group reports compliant code as a violation. Both must be `unknown`.
+foreach ($shape in @(
+        @{ Name = 'generic attribute'; Lines = @('[Owner<A,B>]', 'public void A()') },
+        @{ Name = 'generic attribute naming Owner'; Lines = @('[GenericAttr<int, Owner>]', 'public void A()') },
+        @{ Name = 'group wrapped across lines'; Lines = @('[TestMethod,', 'Owner("alias")]', 'public void A()') },
+        @{ Name = 'trailing junk after an attribute'; Lines = @('[Owner("alias") junk]', 'public void A()') },
+        # A wrapped group whose closing line contains '[' inside an argument.
+        # "Contains no bracket" declined to flag exactly these, and they are the
+        # common real shape: an array, a typeof, an indexer.
+        @{ Name = 'wrapped group closing on an array argument'; Lines = @('[Owner("alias"),', 'DataRow(new object[] { 1, 2 })]', 'public void A()') },
+        @{ Name = 'wrapped group closing on a typeof argument'; Lines = @('[Owner("alias"),', 'DataRow(typeof(int[]))]', 'public void A()') }
+    )) {
+    $shapeMasked = @((Get-ReviewerConstructMaskedLines -Lines ([string[]]@($shape.Lines))).Lines)
+    $shapeDeclaration = Get-ReviewerConstructDeclarationAt -MaskedLines $shapeMasked -Index ($shape.Lines.Count - 1)
+    Assert-Owner ($null -ne $shapeDeclaration) "Shape '$($shape.Name)': the declaration was not recognized."
+    if ($null -ne $shapeDeclaration) {
+        Assert-Owner (@($shapeDeclaration.Attributes).Count -eq 0) `
+            "Shape '$($shape.Name)': invented attribute(s) [$(@($shapeDeclaration.Attributes) -join ',')]."
+        Assert-Owner ([bool]$shapeDeclaration.Truncated) `
+            "Shape '$($shape.Name)': an unreadable attribute shape was reported as a complete, established fact."
+    }
+}
+
+# A comment between two attribute lines is masked to spaces before the scan, so
+# it is indistinguishable from a blank line. Stopping there drops every
+# attribute above it; calling the remainder complete turns owned code into a
+# violation.
+$commentSplit = @((Get-ReviewerConstructMaskedLines -Lines ([string[]]@(
+                '[Owner("alias")]',
+                '// Tracked by work item 12345.',
+                '[TestMethod]',
+                'public void A()'))).Lines)
+$commentDeclaration = Get-ReviewerConstructDeclarationAt -MaskedLines $commentSplit -Index 3
+Assert-Owner ($null -ne $commentDeclaration -and [bool]$commentDeclaration.Truncated) `
+    "An attribute list interrupted by a comment was reported as complete, losing the attributes above it."
+
+# An unread line directly above a declaration is ignorance, not absence.
+$sparse = @((Get-ReviewerConstructMaskedLines -Lines ([string[]]@(
+                '[Owner("alias")]',
+                '[TestMethod]',
+                'public void A()'))).Lines)
+$deliveredOnly = [System.Collections.Generic.HashSet[int]]::new()
+[void]$deliveredOnly.Add(3)
+$sparseDeclaration = Get-ReviewerConstructDeclarationAt -MaskedLines $sparse -Index 2 -Delivered $deliveredOnly
+Assert-Owner ($null -ne $sparseDeclaration -and [bool]$sparseDeclaration.Truncated) `
+    "A declaration whose attribute lines were never delivered was reported as carrying no attributes."
+
 if ($script:OwnerFailures.Count -gt 0) {
     foreach ($failure in $script:OwnerFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }
     throw "bpm-test-ownership: $($script:OwnerFailures.Count) of $script:OwnerChecks check(s) failed."

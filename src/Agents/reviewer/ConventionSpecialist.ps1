@@ -2006,14 +2006,28 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     foreach ($drop in @($DroppedElements)) {
         $field = [string](Get-ReviewerConventionSpecialistValue $drop "Field" "")
         $reason = [string](Get-ReviewerConventionSpecialistValue $drop "Reason" "")
+        # The identifier comes from the extractor, which reports a rejected
+        # key by a safe name rather than the model's own. Re-assert that here
+        # anyway: this detail is rendered into an artifact a person reads, and
+        # it is the one withheld entry the wrapper composes rather than
+        # validates, so it does not get to be the exception to the rule that
+        # nothing reaches a rendered artifact unchecked.
+        # `\z`, not `$`: in .NET `$` also matches before a final newline, so an
+        # otherwise-safe identifier ending in one line break would pass.
+        if ($field -cnotmatch '^[A-Za-z0-9_.\[\]~-]{0,120}\z') { $field = "unreportableField" }
+        if ($reason -cnotmatch '^[A-Za-z0-9]{0,40}\z') { $reason = "unreportableReason" }
+        $detail = [string](Get-ReviewerConventionSpecialistShortened `
+                -Text ("A result element was withheld because '$field' failed its schema rule ($reason). " +
+                    "It was not assessed and must not be read as an absence of findings.") -MaxLength 800)
+        if (Test-ReviewerConventionSpecialistVoteText -Text $detail) {
+            throw "A withheld result element's diagnostic carried a vote recommendation."
+        }
         [void]$withheld.Add([pscustomobject][ordered]@{
                 # There is no candidate id to name: the element that carried it
                 # is exactly what could not be read.
                 candidateId = ""
                 reason = "schemaInvalidCandidate"
-                detail = Get-ReviewerConventionSpecialistShortened `
-                    -Text ("A result element was withheld because '$field' failed its schema rule ($reason). " +
-                        "It was not assessed and must not be read as an absence of findings.") -MaxLength 800
+                detail = $detail
             })
     }
     $changedFileIndex = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries `
@@ -2176,6 +2190,18 @@ function Resolve-ReviewerConventionSpecialistCandidates {
             throw "Specialist candidate '$candidateId' duplicated a deterministic fact id."
         }
         $facts = [System.Collections.Generic.List[object]]::new()
+        # Census facts are kept apart from review facts because they are a
+        # different KIND of evidence. A review fact carries a canonical
+        # true/false state; a complete declaration census carries counts, and
+        # its determinism was already established above by requiring the counts
+        # and the whole file to be complete. Mixing them meant the state check
+        # below - written for review facts - read a census record that has no
+        # `state` at all, and threw. That threw out of candidate resolution
+        # entirely, degrading the pass to zero candidates and discarding every
+        # other finding and rule row in it: exactly the all-or-nothing failure
+        # this contract exists to remove, reintroduced through its own new
+        # feature and with a wider blast radius than the case it fixed.
+        $censusFacts = [System.Collections.Generic.List[object]]::new()
         $invalidEvidence = [System.Collections.Generic.List[string]]::new()
         foreach ($factId in $factIds) {
             # Contract v3 lets an adoption rule cite the declaration census its
@@ -2199,7 +2225,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
                     [void]$invalidEvidence.Add("declaration census '$factId' is incomplete")
                     continue
                 }
-                [void]$facts.Add($census[0])
+                [void]$censusFacts.Add($census[0])
                 continue
             }
             if (-not $factMap.ContainsKey($factId)) {
@@ -2225,25 +2251,24 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         if ([string]$candidate.severity -ceq "important") {
             $candidateSiblingStatus = [string](Get-ReviewerConventionSpecialistValue `
                 $candidate "siblingStatus" "")
+            # A complete census is deterministic evidence in its own right: it
+            # is the count that says an attribute is on none of the declarations
+            # in a file, which is precisely the argument that justifies
+            # escalating past `suggestion` for an adoption rule.
+            $evidenceCount = $facts.Count + $censusFacts.Count
             if ([string]$candidate.impactCategory -ceq "none") {
                 throw "Specialist candidate '$candidateId' escalated severity without a protected impact category."
             }
-            if ($facts.Count -eq 0 -and $candidateSiblingStatus -cne "checked") {
+            if ($evidenceCount -eq 0 -and $candidateSiblingStatus -cne "checked") {
                 throw "Specialist candidate '$candidateId' used important severity without a deterministic fact or checked sibling evidence (status '$candidateSiblingStatus')."
             }
-            if ($facts.Count -eq 0 -and ([string]$candidate.siblingEvidence).Trim().Length -lt 16) {
+            if ($evidenceCount -eq 0 -and ([string]$candidate.siblingEvidence).Trim().Length -lt 16) {
                 throw "Specialist candidate '$candidateId' used important severity without meaningful checked sibling evidence."
             }
-            if (@($facts | Where-Object {
-                        @("true", "false") -cnotcontains
-                        [string](Get-ReviewerConventionSpecialistValue $_ "state" "")
-                    }).Count -gt 0) {
-                $invalidStates = @($facts | ForEach-Object {
-                        "$([string](Get-ReviewerConventionSpecialistValue $_ 'id' ''))=" +
-                        [string](Get-ReviewerConventionSpecialistValue $_ "state" "")
-                    }) -join ","
-                throw "Specialist candidate '$candidateId' used a non-deterministic fact to support important severity ($invalidStates)."
-            }
+            # Every id left in $facts already passed the per-fact deterministic
+            # state check above, which withholds rather than throws. There is
+            # deliberately no second state guard here: an unreachable one reads
+            # like a live defence and would rot untested.
         }
         elseif ([string]$candidate.impactCategory -cne "none") {
             throw "Specialist candidate '$candidateId' classified protected impact but did not use important severity."

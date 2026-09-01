@@ -196,5 +196,14 @@
       "expect": "unknown",
       "truth": "manual"
     }
+  ],
+  "knownLimitations": [
+    {
+      "id": "blank-line-between-attributes-and-declaration",
+      "description": "C# permits a blank line between an attribute list and the declaration it applies to. The upward scan stops at the first blank line, so in `[TestMethod]` / blank / `public void A()` the attribute is not collected. Because nothing had been collected when the scan stopped, this is NOT flagged uncertain.",
+      "failureDirection": "miss, not false positive",
+      "rationale": "The declaration is simply not recognized as carrying test attributes, so an ownership rule does not reach it and emits nothing. Flagging every blank line above a declaration would make almost every declaration in the repository unknown, which would destroy the accounting for no gain. A blank line mid-attribute-list IS flagged, because there the scan provably truncated a list it had already started reading.",
+      "status": "accepted for this increment"
+    }
   ]
 }

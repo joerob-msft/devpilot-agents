@@ -17648,8 +17648,8 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         $discoveryAnswer = if ($discoveryCliOutcome -and $discoveryCliOutcome.Answer) { [string]$discoveryCliOutcome.Answer } else { $discoveryMarkerText }
         $discoveryAnswer = $discoveryAnswer.Trim()
         $expectedDiscoveryPrefix = if ($discoverySourceRole -ceq 'specialist') {
-            Get-ReviewerConventionSpecialistMarkerPrefixForVersion -ContractVersion (
-                Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryAnswer)
+            [string](Get-ReviewerConventionSpecialistMarkerPrefixForVersion -ContractVersion (
+                    Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryAnswer))
         }
         else { [string]$ResultMarkerPrefix }
         $discoveryPrefixIndex = $discoveryAnswer.IndexOf($expectedDiscoveryPrefix, [System.StringComparison]::Ordinal)

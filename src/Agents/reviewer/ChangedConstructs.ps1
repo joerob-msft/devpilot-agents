@@ -561,7 +561,16 @@ function Get-ReviewerConstructAttributeGroup {
         # qualifier and belongs to the name.
         if ($segment -match '^[A-Za-z_][A-Za-z0-9_]*\s*:(?!:)\s*(.*)$') { $segment = $Matches[1].Trim() }
         $segment = $segment -replace '^global\s*::\s*', ''
-        if ($segment -match '^([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)') {
+        # An attribute is a (possibly dotted) name, optionally followed by an
+        # argument list - and NOTHING else. Matching only a leading identifier
+        # would quietly accept `Owner<A` from a generic attribute split at a
+        # comma the angle brackets should have protected, report `Owner` as
+        # present, and add the fragment `B>` as a second attribute that does not
+        # exist. An invented attribute reads as a rule already satisfied, so it
+        # suppresses a real violation and corrupts the per-file census that
+        # `rdf1:` evidence is built from. A shape this lexer cannot read whole
+        # is unreadable, not a name.
+        if ($segment -match '^([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*(\(.*\))?$') {
             [void]$names.Add(($Matches[1] -replace '\s+', ''))
         }
         else { $state.Unreadable = $true }
@@ -640,10 +649,44 @@ function Get-ReviewerConstructDeclarationAt {
         # would attach an attribute fifty undelivered lines away to this
         # declaration, and the whole point of these attributes is that they are
         # facts. Stop at the first line that is not a delivered attribute line.
-        if ($null -ne $Delivered -and $Delivered.Count -gt 0 -and -not $Delivered.Contains($above + 1)) { break }
+        if ($null -ne $Delivered -and $Delivered.Count -gt 0 -and -not $Delivered.Contains($above + 1)) {
+            # We did not read this line. "No attribute here" and "we never
+            # looked" are different answers, and only one of them may become a
+            # finding, so an unread line directly above a declaration makes its
+            # attribute list unknown rather than empty.
+            $shapeUncertain = $true
+            break
+        }
         $line = ([string]$MaskedLines[$above]).Trim()
-        if (-not $line) { break }
-        if (-not $line.StartsWith('[')) { break }
+        if (-not $line) {
+            # Comment CONTENT is masked to spaces before this scan runs, so a
+            # comment sitting between two attribute lines arrives here looking
+            # exactly like a blank line. Stopping mid-list would drop every
+            # attribute above it and still call the result complete. A blank
+            # line below no attributes at all is the ordinary terminator and
+            # stays silent.
+            if ($attributes.Count -gt 0) { $shapeUncertain = $true }
+            break
+        }
+        if (-not $line.StartsWith('[')) {
+            # A bracket group can wrap: `[TestMethod,` on one line and
+            # ` Owner("alias")]` on the next. The continuation begins with the
+            # attribute name, not with '[', so stopping here silently drops the
+            # WHOLE group and reports the declaration as carrying no attributes
+            # at all - with no uncertainty signal. Under an adoption rule that
+            # is a compliant declaration reported as a violation.
+            #
+            # Count, do not merely look: attribute arguments routinely contain
+            # '[' - `DataRow(new object[] { 1, 2 })]`, `DataRow(typeof(int[]))]`
+            # - so "contains no '['" would decline to flag exactly the
+            # continuation lines that matter most. A line closing a group opened
+            # above has more ']' than '[', while a balanced line such as
+            # `private int[] _x;` is an ordinary stop.
+            $opens = @($line.ToCharArray() | Where-Object { $_ -eq '[' }).Count
+            $closes = @($line.ToCharArray() | Where-Object { $_ -eq ']' }).Count
+            if ($closes -gt $opens) { $shapeUncertain = $true }
+            break
+        }
         # One line can hold several groups - `[TestMethod] [Owner("alias")]` -
         # and each group can hold several attributes.
         $cursor = 0

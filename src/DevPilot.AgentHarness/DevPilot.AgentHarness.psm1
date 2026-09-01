@@ -859,9 +859,29 @@ function ConvertTo-AgentMarkerFieldValue {
                     continue
                 }
                 $elementKeys = @($element.PSObject.Properties | ForEach-Object { $_.Name })
-                foreach ($name in $elementKeys) {
+                for ($keyIndex = 0; $keyIndex -lt $elementKeys.Count; $keyIndex++) {
+                    $name = [string]$elementKeys[$keyIndex]
                     if ($itemKeys -notcontains $name) {
-                        $elementFailure = @{ Ok = $false; Value = $null; Field = "$itemPath.$name"; Reason = 'unexpectedKey' }
+                        # A rejected key's NAME is model-authored text that no
+                        # field rule ever sees: the key is refused before any
+                        # rule is consulted, so it is never length-bounded,
+                        # typography-normalized or control-character checked.
+                        # It then travels into a human-facing report, so a key
+                        # named with newlines and Markdown could forge whole
+                        # sections of an artifact a person reads to decide
+                        # whether a finding is real.
+                        #
+                        # A key that already looks like a key is echoed, because
+                        # naming it is what makes the diagnostic useful. Anything
+                        # else is reported by position only: a caller learns
+                        # WHICH key was refused without the payload getting a
+                        # free ride into the report.
+                        # `$` is not end-of-input in .NET: it also matches before
+                        # a final newline, so a key of otherwise safe characters
+                        # ending in one `\n` would be echoed with the break
+                        # intact. `\z` is the only anchor that means "the end".
+                        $safeName = if ($name -cmatch '^[A-Za-z0-9_.\-]{1,64}\z') { $name } else { "key$keyIndex" }
+                        $elementFailure = @{ Ok = $false; Value = $null; Field = "$itemPath.$safeName"; Reason = 'unexpectedKey' }
                         break
                     }
                 }
