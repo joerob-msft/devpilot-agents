@@ -446,6 +446,94 @@ $censusFrequency = Get-ReviewerConstructAttributeFrequency -DeclarationIndex $ce
 Assert-Owner ([bool]$censusFrequency.Truncated) `
     "A file containing a declaration whose attribute list could not be established published a COMPLETE census, so an under-count becomes a citable 'this file never used it' fact."
 
+# siblingNotRequiredReason is the reason sibling evidence was NOT required.
+# Under `checked` there is no such reason and the wrapper insists the field be
+# empty, so requiring the model to emit an empty string for it is asking it to
+# restate a decision it already made. Three real-model trials lost an otherwise
+# correct nine-declaration finding to exactly that omission.
+$siblingSchemaV3 = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject 'One' -ExpectedNonce ('a' * 36) -ContractVersion 3
+$siblingSchemaV2 = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject 'One' -ExpectedNonce ('a' * 36) -ContractVersion 2
+Assert-Owner (@($siblingSchemaV3.Fields.candidates.Item.Keys) -ccontains 'siblingNotRequiredReason') `
+    "Contract v3 dropped siblingNotRequiredReason from the key set instead of defaulting it."
+
+if (Test-Path -LiteralPath $recordedPath) {
+    $siblingBase = Get-Content -LiteralPath $recordedPath -Raw | ConvertFrom-Json
+    $siblingProject = [string]$siblingBase.project
+    $siblingNonce = [string]$siblingBase.nonce
+    $wrapperOwnedSibling = @('filePath', 'line', 'packName', 'ruleSourceId', 'ruleSourceRepositoryId',
+        'ruleSourcePath', 'ruleSourceCommit', 'ruleSourceSha256')
+
+    function New-OwnerSiblingMarker {
+        param([string]$Status, [switch]$OmitReason)
+        $object = Get-Content -LiteralPath $recordedPath -Raw | ConvertFrom-Json
+        $object.schemaVersion = 3
+        $shaped = [ordered]@{}
+        foreach ($property in (@($object.candidates)[0]).PSObject.Properties) {
+            if ($wrapperOwnedSibling -contains $property.Name) { continue }
+            $shaped[$property.Name] = $property.Value
+        }
+        $shaped['ruleRef'] = 'rs0'
+        $shaped['siblingStatus'] = $Status
+        if ($Status -ceq 'notRequired') { $shaped['siblingEvidence'] = '' }
+        if ($OmitReason) { [void]$shaped.Remove('siblingNotRequiredReason') }
+        else { $shaped['siblingNotRequiredReason'] = $(if ($Status -ceq 'notRequired') { 'no comparable sibling exists' } else { '' }) }
+        $object.candidates = @([pscustomobject]$shaped)
+        return ($object | ConvertTo-Json -Depth 24 -Compress)
+    }
+
+    $schemaFor = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject $siblingProject -ExpectedNonce $siblingNonce -ContractVersion 3
+    # checked + omitted => accepted, and the default is recorded, not silent.
+    $checkedOmitted = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+        -StdOutText ("CONVENTION_REVIEW_RESULT_V3: " + (New-OwnerSiblingMarker -Status 'checked' -OmitReason)) `
+        -Schema $schemaFor -ContractVersion 3
+    Assert-Owner ([string]$checkedOmitted.Status -ceq 'success') `
+        "A checked-sibling candidate that omitted siblingNotRequiredReason was still refused (status '$($checkedOmitted.Status)', field '$($checkedOmitted.Field)')."
+    if ([string]$checkedOmitted.Status -ceq 'success') {
+        Assert-Owner (@($checkedOmitted.Value.candidates).Count -eq 1) "The defaulted candidate was not kept."
+        Assert-Owner ([string]@($checkedOmitted.Value.candidates)[0].siblingNotRequiredReason -ceq '') `
+            "The wrapper default did not produce an empty reason."
+        Assert-Owner (@(@($checkedOmitted.NormalizedFields) | Where-Object {
+                    [string]$_.Field -like '*siblingNotRequiredReason' }).Count -eq 1) `
+            "The wrapper defaulted a model-owned field without recording it."
+    }
+    # checked + present-and-empty => still accepted (no behaviour change).
+    $checkedPresent = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+        -StdOutText ("CONVENTION_REVIEW_RESULT_V3: " + (New-OwnerSiblingMarker -Status 'checked')) `
+        -Schema $schemaFor -ContractVersion 3
+    Assert-Owner ([string]$checkedPresent.Status -ceq 'success') `
+        "A checked-sibling candidate that DID emit an empty reason was refused."
+
+    # notRequired + omitted => still refused. The reason is real content the
+    # wrapper cannot invent, so its absence stays a refusal.
+    $notRequiredOmitted = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+        -StdOutText ("CONVENTION_REVIEW_RESULT_V3: " + (New-OwnerSiblingMarker -Status 'notRequired' -OmitReason)) `
+        -Schema $schemaFor -ContractVersion 3
+    $notRequiredDropped = (@($notRequiredOmitted.DroppedElements) | Where-Object {
+            [string]$_.Field -like '*siblingNotRequiredReason' }).Count -ge 1
+    Assert-Owner (([string]$notRequiredOmitted.Status -cne 'success') -or $notRequiredDropped) `
+        "A notRequired-sibling candidate with NO reason was silently accepted; the wrapper invented content it cannot know."
+    if ([string]$notRequiredOmitted.Status -ceq 'success') {
+        Assert-Owner (@($notRequiredOmitted.Value.candidates).Count -eq 0) `
+            "A notRequired-sibling candidate missing its reason survived into the candidate list."
+    }
+
+    # v2 is frozen: it must still require the key outright.
+    $v2Schema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject $siblingProject -ExpectedNonce $siblingNonce -ContractVersion 2
+    $v2Object = Get-Content -LiteralPath $recordedPath -Raw | ConvertFrom-Json
+    $v2Shaped = [ordered]@{}
+    foreach ($property in (@($v2Object.candidates)[0]).PSObject.Properties) {
+        if ($property.Name -ceq 'siblingNotRequiredReason') { continue }
+        $v2Shaped[$property.Name] = $property.Value
+    }
+    $v2Shaped['siblingStatus'] = 'checked'
+    $v2Object.candidates = @([pscustomobject]$v2Shaped)
+    $v2Outcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+        -StdOutText ("CONVENTION_REVIEW_RESULT_V2: " + ($v2Object | ConvertTo-Json -Depth 24 -Compress)) `
+        -Schema $v2Schema -ContractVersion 2
+    Assert-Owner ([string]$v2Outcome.Status -cne 'success') `
+        "Contract v2 accepted a candidate missing siblingNotRequiredReason; v2 is frozen and must not gain the default."
+}
+
 if ($script:OwnerFailures.Count -gt 0) {
     foreach ($failure in $script:OwnerFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }
     throw "bpm-test-ownership: $($script:OwnerFailures.Count) of $script:OwnerChecks check(s) failed."

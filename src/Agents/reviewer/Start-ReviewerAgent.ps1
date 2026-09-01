@@ -10973,10 +10973,24 @@ function Invoke-ReviewerConventionSpecialistPass {
                 $markerReason = [string]$markerOutcome.Reason
                 $markerDetail = [string]$markerOutcome.Field
                 if (@($markerOutcome.NormalizedFields).Count -gt 0) {
-                    $normalization = @($markerOutcome.NormalizedFields)[0]
-                    $markerDetail = [string]$normalization.Field
-                    $markerReason = ("Compatibility-normalized an exact empty JSON array to the schema's empty string at " +
-                        "'$markerDetail'. Original typed reason: $([string]$normalization.OriginalTypedReason)")
+                    # Every substitution is named, and named by what it ACTUALLY
+                    # was. This record is the sealed artifact an auditor reads to
+                    # see what the wrapper altered in a model-owned field, so a
+                    # hard-coded description of one normalization kind mislabels
+                    # every other kind - and rendering only the first entry hides
+                    # the rest behind whichever happened to be added first.
+                    $normalizations = @($markerOutcome.NormalizedFields)
+                    $markerDetail = [string]$normalizations[0].Field
+                    $described = @($normalizations | ForEach-Object {
+                            $from = [string]$_.From
+                            $what = switch ($from) {
+                                'emptyJsonArray' { "an exact empty JSON array to the schema's empty string" }
+                                'absentUnderCheckedSiblingStatus' { "an absent reason to the empty string the checked sibling status requires" }
+                                default { "'$from' to '$([string]$_.To)'" }
+                            }
+                            "$what at '$([string]$_.Field)' (original typed reason: $([string]$_.OriginalTypedReason))"
+                        })
+                    $markerReason = "Compatibility-normalized $($normalizations.Count) field(s): " + ($described -join '; ')
                 }
                 & $emitSpecialistAcct $specialistAttempt $nonce $specialistMarkerStatus $specialistModelRan $specialistUsage `
                     $markerReason $markerDetail

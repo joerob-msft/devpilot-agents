@@ -278,8 +278,7 @@ Each candidate has exactly:
 `diffEvidence`, `impactCategory`
 (`none|buildOrTestExecution|deployment|security|customerBehavior|compatibility`),
 `impact`, `expectedFixOrValidation`, `siblingStatus` (`checked|notRequired`),
-`siblingEvidence`, `siblingNotRequiredReason`, `factIds` (comma-separated
-`rf1:` and/or `rdf1:` ids, or empty), `confidence` (`low|medium|high`),
+`siblingEvidence`, `siblingNotRequiredReason`, `factIds` (comma-separated`rf1:` and/or `rdf1:` ids, or empty), `confidence` (`low|medium|high`),
 `residualRiskSummary`,
 `semanticCandidateVersion` (exactly `2`), `changedCodeFix` (an exact object with
 `action` (`add|modify|remove|rename|replace|validate`), `targets`
@@ -300,6 +299,12 @@ Do not emit `filePath`, `line`, `packName`, `ruleSourceId`,
 `ruleSourceSha256` on candidates. The wrapper owns provenance and derives the
 anchor from `primaryTarget`, so restating any of those fields is a contract
 error.
+
+`siblingNotRequiredReason` is the reason sibling evidence was NOT required.
+When `siblingStatus` is `checked` there is no such reason and the field must be
+empty, so you may simply omit it - the wrapper supplies the empty value and
+records that it did. When `siblingStatus` is `notRequired` the reason is real
+content only you can give, and omitting it withholds the candidate.
 
 Each withheld item has exactly `candidateId`, `reason`, and `detail`. `reason`
 must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,

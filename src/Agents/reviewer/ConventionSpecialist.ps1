@@ -1062,6 +1062,33 @@ function ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome {
             for ($index = 0; $index -lt $candidates.Count; $index++) {
                 $candidateItem = $candidates[$index]
                 if ($candidateItem -isnot [System.Management.Automation.PSCustomObject]) { continue }
+                if ($ContractVersion -ge 3) {
+                    # `siblingNotRequiredReason` is the reason sibling evidence
+                    # was NOT required. When `siblingStatus` is `checked` there
+                    # is no such reason - the wrapper's own validation below
+                    # insists the field be empty in that case - so requiring the
+                    # model to emit an empty string for it is asking it to state
+                    # something it has already stated. Three real-model trials
+                    # lost an otherwise correct nine-declaration finding to
+                    # exactly that omission.
+                    #
+                    # Defaulted only for `checked`. For `notRequired` the reason
+                    # is real content the wrapper cannot know, so an omission
+                    # there stays a refusal rather than becoming a silent blank.
+                    $statusProperty = $candidateItem.PSObject.Properties['siblingStatus']
+                    if ($statusProperty -and [string]$statusProperty.Value -ceq 'checked' -and
+                        -not $candidateItem.PSObject.Properties['siblingNotRequiredReason']) {
+                        $reasonField = "candidates[$index].siblingNotRequiredReason"
+                        Add-Member -InputObject $candidateItem -NotePropertyName 'siblingNotRequiredReason' `
+                            -NotePropertyValue '' -Force
+                        [void]$normalizedFields.Add([ordered]@{
+                                Field = $reasonField
+                                From = 'absentUnderCheckedSiblingStatus'
+                                To = 'emptyString'
+                                OriginalTypedReason = "The marker omitted the required key '$reasonField'."
+                            })
+                    }
+                }
                 $fixProperty = $candidateItem.PSObject.Properties['changedCodeFix']
                 if (-not $fixProperty -or
                     $fixProperty.Value -isnot [System.Management.Automation.PSCustomObject]) { continue }
