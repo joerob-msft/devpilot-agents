@@ -342,6 +342,15 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ConventionPacks.ps1
 
+      # The first activated convention capability. These checks decide whether
+      # a compliant declaration can be reported as a violation (a combined
+      # attribute list read as a missing attribute), and whether a correct
+      # finding survives the trip back through the result contract - the live
+      # replay lost one to a single unreadable evidence field.
+      - name: test-ownership capability checks
+        shell: pwsh
+        run: ./tools/Test-ConventionOwnerCapability.ps1
+
       # Layer 8: the sealed changed-file source transport. The model has no
       # working file-read tool on this host, so the wrapper reads the pinned
       # bytes itself; these checks pin the slicing, the hash binding, the

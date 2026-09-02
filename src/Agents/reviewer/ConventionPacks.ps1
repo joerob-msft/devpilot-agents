@@ -494,12 +494,20 @@ function ConvertTo-ReviewerConventionPackPolicy {
         $item = $items[$index]
         $where = "config.repoConventions.conventionPacks.packs[$index]"
         Assert-ReviewerConventionExactKeys -Object $item `
-            -Allowed @("note", "name", "priority", "changedPathGlobs", "authoritativeSourceRefs", "repositorySources", "maxBytes") `
+            -Allowed @("note", "name", "priority", "changedPathGlobs", "authoritativeSourceRefs", "repositorySources", "maxBytes", "declarationEvidence") `
             -Required @("name", "priority", "changedPathGlobs", "authoritativeSourceRefs", "repositorySources", "maxBytes") `
             -Where $where
         $name = [string](Get-ReviewerConventionValue -Object $item -Name "name")
         if ($name -notmatch '^[a-z][a-z0-9-]{0,63}$') { throw "$where.name must be an exact lowercase pack name." }
         if (-not $names.Add($name)) { throw "$where.name '$name' duplicates an earlier pack." }
+        $declarationEvidence = ""
+        if ($item.PSObject.Properties["declarationEvidence"]) {
+            $rawDeclarationEvidence = Get-ReviewerConventionValue -Object $item -Name "declarationEvidence"
+            if ($rawDeclarationEvidence -isnot [string] -or [string]$rawDeclarationEvidence -cne "local") {
+                throw "$where.declarationEvidence must be exactly 'local' when set."
+            }
+            $declarationEvidence = "local"
+        }
         $priority = Get-ReviewerConventionStrictInt -Object $item -Name "priority" -Where $where -Min 0 -Max 10000
         $globs = @(Get-ReviewerConventionStringArray -Object $item -Name "changedPathGlobs" -Where $where `
                 -MinCount 1 -MaxCount $script:ReviewerConventionMaxGlobsPerPack)
@@ -588,16 +596,18 @@ function ConvertTo-ReviewerConventionPackPolicy {
             priority = $priority
             sources  = $minimalSources.ToArray()
         }
+        if ($declarationEvidence) { $minimalDescriptor["declarationEvidence"] = $declarationEvidence }
         $minimumProvenanceBytes = $script:ReviewerConventionUtf8.GetByteCount(($minimalDescriptor | ConvertTo-Json -Depth 8 -Compress))
         if ($declaredContentBytes + $minimumProvenanceBytes -gt $maxBytes) {
             throw "$where.maxBytes cannot fit the declared source maxima plus required provenance ($declaredContentBytes + $minimumProvenanceBytes bytes)."
         }
         $definition = (@($globs) -join "`n") + "`0" + (@($sourceRefs) -join "`n") + "`0" +
-            (@($localSources | ForEach-Object { "$($_.Path):$($_.MaxBytes)" }) -join "`n") + "`0$maxBytes"
+            (@($localSources | ForEach-Object { "$($_.Path):$($_.MaxBytes)" }) -join "`n") + "`0$maxBytes`0$declarationEvidence"
         if (-not $definitions.Add($definition)) { throw "$where ambiguously duplicates an earlier pack definition." }
         [void]$packs.Add(@{
                 Name                    = $name
                 Priority                = $priority
+                DeclarationEvidence     = $declarationEvidence
                 ChangedPathGlobs        = @($globs)
                 AuthoritativeSourceRefs = @($sourceRefs)
                 RepositorySources       = $localSources.ToArray()
@@ -782,6 +792,9 @@ function New-ReviewerConventionContextPlan {
             priority = [int]$pack.Priority
             sources  = $resolved.ToArray()
         }
+        if ([string]$pack.DeclarationEvidence) {
+            $contextDescriptor["declarationEvidence"] = [string]$pack.DeclarationEvidence
+        }
         $contextDescriptorJson = $contextDescriptor | ConvertTo-Json -Depth 10 -Compress
         $provenanceBytes = $script:ReviewerConventionUtf8.GetByteCount($contextDescriptorJson)
         $routingEvidenceJson = ([ordered]@{ matchedPaths = $matchedPaths } | ConvertTo-Json -Depth 10 -Compress)
@@ -795,7 +808,7 @@ function New-ReviewerConventionContextPlan {
         if ($totalBytes -gt [int]$Policy.MaxTotalBytes) {
             throw "Selected convention packs require $totalBytes bytes, above the code-defined $($Policy.MaxTotalBytes)-byte total cap; no source was truncated."
         }
-        [void]$selectedPlans.Add([pscustomobject][ordered]@{
+        $selectedPlan = [ordered]@{
                 name            = $pack.Name
                 priority        = [int]$pack.Priority
                 matchedPaths    = $matchedPaths
@@ -807,7 +820,11 @@ function New-ReviewerConventionContextPlan {
                 maxBytes        = [int]$pack.MaxBytes
                 status          = "selected"
                 reason          = ""
-            })
+            }
+        if ([string]$pack.DeclarationEvidence) {
+            $selectedPlan["declarationEvidence"] = [string]$pack.DeclarationEvidence
+        }
+        [void]$selectedPlans.Add([pscustomobject]$selectedPlan)
     }
     $evidenceDegraded = ($degradedPacks.Count -gt 0)
     return [pscustomobject][ordered]@{

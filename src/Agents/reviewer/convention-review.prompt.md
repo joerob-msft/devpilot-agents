@@ -52,10 +52,10 @@ not a candidate. Do not invent a resolution.
    established, or unchanged siblings demonstrate the proposed API usage is
    accepted. Record the source/fact/precedent evidence; do not rely on memorized
    repository lore. For adoption-dependent annotations or metadata, including
-   ownership metadata, `notRequired` is never valid: use `checked` with concrete
-   unchanged-sibling evidence, or emit `missingSiblingEvidence` as a withheld
-   diagnostic. Inability to read siblings is not a reason that a sibling check
-   is unnecessary.
+   ownership metadata, `notRequired` is never valid unless the required row says
+   `siblingEvidenceRequired: false`: use `checked` with concrete unchanged-sibling
+   evidence, or emit `missingSiblingEvidence` as a withheld diagnostic. Inability
+   to read siblings is not a reason that a sibling check is unnecessary.
 5. Report only convention findings. Pure style is `suggestion`. `important` is
    permitted only when a documented convention protects build/test execution,
    deployment, security, customer behavior, or compatibility, and the candidate
@@ -73,17 +73,16 @@ not a candidate. Do not invent a resolution.
    fix or validation. It must record sibling evidence or an explicit reason that
    a sibling check is not required.
 7. Use `changedFile` only for a current changed file and a positive right-side
-   line. Copy its repository-relative path from `changedFiles`; either `src/a.cs`
-   or `/src/a.cs` is accepted. The exact normalized path and line must appear in
-   one `ruleCoverageRequest.changedFileAnchors[].rightHandRanges` entry. Set
-   `primaryTarget` to its exact `cf<n>:<line>` target. Put every additional
-   changed-line occurrence of the same semantic issue in `manifestations`, also
-   as exact `cf<n>:<line>` targets, including occurrences in other changed files.
-   The primary is the ordinal-first normalized path, then lowest line, then
-   target id across the full occurrence set; it is always the posted comment
-   location. Never relocate an invalid anchor or invent a construct. Use
-   `prMetadata` only for deterministic metadata/template facts, with empty file
-   path and line zero.
+   line. The exact normalized path and line must appear in one
+   `ruleCoverageRequest.changedFileAnchors[].rightHandRanges` entry. You may
+   leave `primaryTarget` as an empty string; then list every violating occurrence
+   in `manifestations` as exact `cf<n>:<line>` targets, and the wrapper derives
+   the posted anchor from those targets. If you do set `primaryTarget`, it must
+   be the ordinal-first normalized path, then lowest line, then target id across
+   the full occurrence set; put only additional occurrences in `manifestations`.
+   Never relocate an invalid anchor or invent a construct. Use `prMetadata`
+   only for deterministic metadata/template facts, with `primaryTarget`
+   exactly `prMetadata`.
 8. Never emit `critical`, a vote, a vote recommendation, or generalist findings.
 9. A comment that states an invariant is evidence of intent, never evidence of
    enforcement. Do not author a candidate that contradicts a remark, summary, or
@@ -95,6 +94,10 @@ not a candidate. Do not invent a resolution.
     compliant, and says nothing about the four calls beside it that break it.
     `ruleCoverageRequest.requiredRows` names the exact rows you must return -
     one per entry, no more, no fewer, addressed by `ruleRef` (`rs0`, `rs1`, ...).
+    Each row also tells you whether sibling evidence is required. When
+    `siblingEvidenceRequired` is `false`, `locallyAdjudicableConstructs` is the
+    range-compressed set of changed declarations whose own attribute lists the
+    wrapper established.
     `ruleCoverageRequest.changedConstructs` is the wrapper's own enumeration of
     what this change set touched, in four kinds:
     - `invocation` (id `mi*`) - a call that spans more than one line, with
@@ -137,6 +140,15 @@ not a candidate. Do not invent a resolution.
       applicable anchors ruled out this way in `codeEvidence`.
     - `unknownConstructs` - you could not decide: source you were not given,
       practice you could not establish, rule text that does not settle it.
+
+    When required declaration context is unavailable - a truncated attribute
+    list, undelivered lines, an unlexable file, or construct caps hit - the
+    answer is `unknown`. It is never `compliant`, and it is never a finding.
+    Exception: when the required row says `siblingEvidenceRequired: false`, a
+    changed declaration listed in `locallyAdjudicableConstructs` is adjudicable
+    from its OWN attributes. An incomplete whole-file census does not block that
+    local declaration evidence. `missingSiblingEvidence` applies only where
+    sibling/adoption evidence is the sole basis.
 
     The four lists must be disjoint and together must equal every sealed
     construct id - exactly, no more and no less. Anchors whose kinds are outside
@@ -211,10 +223,20 @@ not a candidate. Do not invent a resolution.
     value without guessing it. `changedCodeFix.evidenceFactIds` is ALWAYS a
     comma-separated JSON string: use exactly `""` when there are none, and never
     emit an array or `null`. `authoritativeRule` requires that empty string; its remediation evidence is the pinned
-    provenance, section, and exact quote. Candidate-level `factIds` may still
-    support impact. `deterministicFact` may cite only wrapper-supplied `rf1:` facts whose
-    state and value are canonical booleans or strings. Never infer an identifier,
-    resource key, test, file, debt scope, identity, alias, owner, or assignee.
+    provenance, section, and exact quote. Candidate-level `factIds` may cite
+    wrapper-supplied review facts (`rf1:...`) or declaration-census facts
+    (`rdf1:...`) to support impact or declaration evidence. A `rdf1:` census may
+    be cited ONLY when that record's `attributeCountsComplete` and
+    `wholeFileComplete` are both true. A partial count cannot show an attribute
+    is absent - it can only show it was not seen in what was read - so the
+    wrapper withholds any candidate citing an incomplete one, and the finding is
+    lost along with it. If a candidate spans several files, cite only the
+    complete censuses; a violation anchored on a changed declaration's OWN
+    attributes stands on those attributes and needs no census at all, so citing
+    none is better than citing one that is incomplete. `deterministicFact`
+    may cite only wrapper-supplied `rf1:` facts whose state and value are
+    canonical booleans or strings. Never infer an identifier, resource key, test,
+    file, debt scope, identity, alias, owner, or assignee.
 
     `existingDebtFollowUp` is separate and non-atomic. Use explicit `status:
     none` unless one complete `constructFileSummaries` record deterministically
@@ -235,7 +257,7 @@ not a candidate. Do not invent a resolution.
 
 ## Result marker
 
-Emit the `CONVENTION_REVIEW_RESULT_V2:` marker **exactly once**, as the very
+Emit the `CONVENTION_REVIEW_RESULT_V3:` marker **exactly once**, as the very
 last thing you write, and never again. Do not preview it, do not summarise it
 afterwards, and do not repeat it in a closing recap. If a second copy appears
 and so much as one word of prose differs between them, the wrapper cannot tell
@@ -245,9 +267,9 @@ them. This has happened; it costs the whole pass.
 It must be a **single line**: the literal prefix, one space, then the whole JSON
 object compacted onto that one line. Do not pretty-print it and do not wrap it
 in a code fence. Copy every binding, hash, and nonce from wrapper runtime data
-exactly. Use only the exact keys and types below. All authored strings must be
-printable ASCII with no controls or newlines. Candidate IDs must be unique
-lowercase slugs.
+exactly. The top-level `"schemaVersion"` is `3`. Use only the exact keys and
+types below. All authored strings must be printable ASCII with no controls or
+newlines. Candidate IDs must be unique lowercase slugs.
 
 Your visible working is not the deliverable and nobody reads it. Do the
 per-construct accounting, then put the result in the marker; do not narrate
@@ -257,16 +279,16 @@ commentary is rejected before the marker in it is ever read.
 Each candidate has exactly:
 
 `candidateId`, `category` (`convention`), `severity` (`suggestion|important`),
-`anchorKind` (`changedFile|prMetadata`), `filePath`, `line`, `primaryTarget`,
-`manifestations` (comma-separated additional exact `cf<n>:<line>` targets, or
-empty), `packName`,
-`ruleSourceId`, `ruleSourceRepositoryId`, `ruleSourcePath`,
-`ruleSourceCommit`, `ruleSourceSha256`, `ruleSection`, `ruleQuote`,
+`anchorKind` (`changedFile|prMetadata`), `primaryTarget` (exact `cf<n>:<line>`,
+`prMetadata`, or empty for wrapper derivation), `manifestations`
+(comma-separated exact `cf<n>:<line>` occurrence targets, or empty), `ruleRef`
+(`rs0`, `rs1`, ... naming the requested rule the candidate is about),
+`ruleSection`, `ruleQuote`,
 `diffEvidence`, `impactCategory`
 (`none|buildOrTestExecution|deployment|security|customerBehavior|compatibility`),
 `impact`, `expectedFixOrValidation`, `siblingStatus` (`checked|notRequired`),
-`siblingEvidence`, `siblingNotRequiredReason`, `factIds` (comma-separated,
-or empty), `confidence` (`low|medium|high`), `residualRiskSummary`,
+`siblingEvidence`, `siblingNotRequiredReason`, `factIds` (comma-separated`rf1:` and/or `rdf1:` ids, or empty), `confidence` (`low|medium|high`),
+`residualRiskSummary`,
 `semanticCandidateVersion` (exactly `2`), `changedCodeFix` (an exact object with
 `action` (`add|modify|remove|rename|replace|validate`), `targets`
 (comma-separated canonical sealed targets: exact `cf<n>:<line>` or truthful
@@ -280,6 +302,23 @@ comma-separated string, none=`""`, never an array or `null`)), and
 coordinates, not prose. For `prMetadata`, use exactly `prMetadata` as the
 changed-code target. Explicit `none` uses empty strings and zero counts in every
 other debt field.
+
+Do not emit `filePath`, `line`, `packName`, `ruleSourceId`,
+`ruleSourceRepositoryId`, `ruleSourcePath`, `ruleSourceCommit`, or
+`ruleSourceSha256` on candidates. The wrapper owns provenance and derives the
+anchor from `primaryTarget`, so restating any of those fields is a contract
+error.
+
+`siblingNotRequiredReason` is the reason sibling evidence was NOT required.
+When `siblingStatus` is `checked` there is no such reason and the field must be
+empty, so you may simply omit it - the wrapper supplies the empty value and
+records that it did. When `siblingStatus` is `notRequired` the reason is real
+content only you can give, and omitting it withholds the candidate.
+When a candidate's required row says `siblingEvidenceRequired: false`, the
+wrapper owns the sibling status and evidence from local declaration data and
+ignores the values in your candidate. Do not make a sibling-status decision for
+that row; satisfy the marker shape, but base the candidate only on the changed
+declaration's OWN known attributes.
 
 Each withheld item has exactly `candidateId`, `reason`, and `detail`. `reason`
 must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,

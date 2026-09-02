@@ -124,17 +124,20 @@ catch { throw "The sealed discovery result marker is not valid JSON; cannot extr
 # as convention-origin candidates; the specialist itself is never a verifier.
 $specialistCandidates = @()
 if ($sourceRole -ceq 'specialist') {
+    $specialistContractVersion = Get-ReviewerConventionSpecialistContractVersionFromText -Text $markerText
     $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
-        -ExpectedProject ([string]$core.snapshotIdentity.project) -ExpectedNonce ([string]$core.nonce)
+        -ExpectedProject ([string]$core.snapshotIdentity.project) -ExpectedNonce ([string]$core.nonce) `
+        -ContractVersion $specialistContractVersion
     # Route the specialist capture through the specialist-specific wrapper the
     # production reviewer uses, not the generic reader. The wrapper supplies the
     # -CandidateNormalizer that rewrites an empty changedCodeFix.evidenceFactIds
     # JSON array to the schema's no-evidence empty string; parsing with the bare
-    # ConvertFrom-AgentResultMarkerOutcome bypasses it and rejects a specialist
-    # marker every production call site accepts.
+    # ConvertFrom-AgentResultMarkerOutcome bypasses it and loses a specialist
+    # candidate every production call site accepts.
     $specialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
         -StdOutText $markerText -Schema $specialistSchema `
-        -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+        -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars) `
+        -ContractVersion $specialistContractVersion
     if ([string]$specialistOutcome.Status -cne 'success') {
         throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
     }

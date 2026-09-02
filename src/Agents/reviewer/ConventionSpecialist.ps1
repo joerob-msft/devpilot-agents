@@ -18,6 +18,38 @@ if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -Err
 }
 
 $script:ReviewerConventionSpecialistMarkerPrefix = "CONVENTION_REVIEW_RESULT_V2:"
+# Version 3 gets its OWN prefix rather than a version field inside a shared one.
+# A reader that has to parse a payload before it can tell which contract the
+# payload is written against has already trusted it; the prefix decides first,
+# so a v2 transcript sealed months ago is still read by the v2 rules and can
+# never be silently re-interpreted under v3.
+$script:ReviewerConventionSpecialistMarkerPrefixV3 = "CONVENTION_REVIEW_RESULT_V3:"
+$script:ReviewerConventionSpecialistContractVersion = 3
+
+function Get-ReviewerConventionSpecialistContractVersionFromText {
+    <#
+        Which contract a SEALED marker was written against, decided by the
+        prefix it actually carries.
+
+        An artifact sealed months ago must be read by the rules it was written
+        against, not by whatever this build happens to produce today. Guessing
+        the current version would make an old, valid transcript look malformed;
+        guessing the old one would make a new transcript unreadable. The prefix
+        is the only thing that knows, so it decides.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    if ($Text.IndexOf($script:ReviewerConventionSpecialistMarkerPrefixV3,
+            [System.StringComparison]::Ordinal) -ge 0) {
+        return 3
+    }
+    return 2
+}
+
+function Get-ReviewerConventionSpecialistMarkerPrefixForVersion {
+    param([ValidateSet(2, 3)][int]$ContractVersion = 2)
+    if ($ContractVersion -ge 3) { return [string]$script:ReviewerConventionSpecialistMarkerPrefixV3 }
+    return [string]$script:ReviewerConventionSpecialistMarkerPrefix
+}
 $script:ReviewerConventionSpecialistArtifactKind = "convention-specialist-preview"
 $script:ReviewerConventionSpecialistArtifactVersion = 2
 $script:ReviewerConventionSpecialistMaxCandidates = 8
@@ -220,6 +252,61 @@ function Resolve-ReviewerConventionSpecialistTargets {
         Errors = [string[]]$errors.ToArray()
         Targets = @($ordered)
         Canonical = (@($ordered | ForEach-Object { [string]$_.target }) -join ",")
+    }
+}
+
+function Get-ReviewerConventionSpecialistLocalDeclarationEvidence {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Targets,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Constructs
+    )
+    $known = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    $incomplete = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $unanchored = [System.Collections.Generic.List[string]]::new()
+    $declarations = @($Constructs | Where-Object {
+            [string](Get-ReviewerConventionSpecialistValue $_ "kind" "") -ceq "declaration"
+        })
+    foreach ($target in @($Targets)) {
+        $targetName = [string](Get-ReviewerConventionSpecialistValue $target "target" "")
+        $targetPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+            [string](Get-ReviewerConventionSpecialistValue $target "path" ""))
+        $targetLine = [int64](Get-ReviewerConventionSpecialistValue $target "line" 0)
+        $matches = @($declarations | Where-Object {
+                $path = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                    [string](Get-ReviewerConventionSpecialistValue $_ "path" ""))
+                $start = [int64](Get-ReviewerConventionSpecialistValue $_ "line" 0)
+                $end = [int64](Get-ReviewerConventionSpecialistValue $_ "endLine" $start)
+                if ($end -lt $start) { $end = $start }
+                $path -and [string]::Equals($path, $targetPath, [StringComparison]::Ordinal) -and
+                    $targetLine -ge $start -and $targetLine -le $end
+            })
+        if ($matches.Count -eq 0) {
+            if ($targetName) { [void]$unanchored.Add($targetName) }
+            continue
+        }
+        foreach ($declaration in $matches) {
+            $id = [string](Get-ReviewerConventionSpecialistValue $declaration "constructId" "")
+            if (-not $id) { continue }
+            if ([string](Get-ReviewerConventionSpecialistValue $declaration "status" "known") -ceq "known") {
+                if (-not $known.Contains($id)) { $known.Add($id, $declaration) }
+            }
+            else { [void]$incomplete.Add($id) }
+        }
+    }
+    $knownIds = [string[]]@($known.Keys)
+    $incompleteIds = [string[]]@($incomplete)
+    [Array]::Sort($incompleteIds, [StringComparer]::Ordinal)
+    $ok = ($knownIds.Count -gt 0 -and $incompleteIds.Count -eq 0 -and $unanchored.Count -eq 0)
+    $knownRange = ConvertTo-ReviewerConventionSpecialistConstructIdRanges -Ids $knownIds
+    $evidence = "Wrapper local declaration evidence: $($knownIds.Count) anchored declaration(s)"
+    if ($knownRange) { $evidence += " ($knownRange)" }
+    $evidence += " have status known and established own attribute lists."
+    return @{
+        Ok = $ok
+        Evidence = (Get-ReviewerConventionSpecialistShortened -Text $evidence -MaxLength 800)
+        KnownIds = $knownIds
+        IncompleteIds = $incompleteIds
+        UnanchoredTargets = [string[]]$unanchored.ToArray()
     }
 }
 
@@ -493,6 +580,38 @@ function Expand-ReviewerConventionSpecialistConstructIds {
     return New-ReviewerConventionSpecialistConstructIdResult -Ok $true -Ids $ids -Duplicated $duplicated
 }
 
+function ConvertTo-ReviewerConventionSpecialistConstructIdRanges {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Ids)
+    if (Get-Command -Name Get-ReviewerConstructIdRanges -ErrorAction SilentlyContinue) {
+        return Get-ReviewerConstructIdRanges -Ids $Ids
+    }
+    $items = @($Ids)
+    if ($items.Count -eq 0) { return "" }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $runStart = $items[0]
+    $previous = $items[0]
+    for ($i = 1; $i -le $items.Count; $i++) {
+        $current = if ($i -lt $items.Count) { [string]$items[$i] } else { "" }
+        $contiguous = $false
+        if ($current) {
+            $previousMatch = [regex]::Match($previous, '^([a-z]{2})([0-9]+)$')
+            $currentMatch = [regex]::Match($current, '^([a-z]{2})([0-9]+)$')
+            if ($previousMatch.Success -and $currentMatch.Success -and
+                $previousMatch.Groups[1].Value -ceq $currentMatch.Groups[1].Value -and
+                ([int]$currentMatch.Groups[2].Value - [int]$previousMatch.Groups[2].Value) -eq 1) {
+                $contiguous = $true
+            }
+        }
+        if (-not $contiguous) {
+            if ($runStart -ceq $previous) { [void]$parts.Add($runStart) }
+            else { [void]$parts.Add("$runStart-$previous") }
+            $runStart = $current
+        }
+        $previous = $current
+    }
+    return ($parts -join ",")
+}
+
 function Get-ReviewerConventionSpecialistShortened {
     <#
         Cuts a string to a length without splitting a surrogate pair.
@@ -695,12 +814,39 @@ function Read-ReviewerConventionPlanFile {
 }
 
 function Get-ReviewerConventionSpecialistMarkerSchema {
+    <#
+        The result contract, by version.
+
+        Version 2 is FROZEN. Sealed transcripts and previews on disk were
+        produced against it, and a replay that cannot read them is a replay that
+        cannot check anything. Nothing in it may change shape.
+
+        Version 3 removes the eight fields the wrapper already holds and the
+        model merely retyped - the pack name, the five rule-source provenance
+        fields, and the anchor's file path and line - and asks for `ruleRef`
+        instead, which is the same `rs<n>` addressing the coverage rows already
+        use. Every one of those fields was an independent way for a correct
+        finding to be refused over a transcription slip: `ruleSourceSha256`
+        alone is sixty-four hex characters copied by hand. The wrapper derives
+        them all from what it transported, so they cannot disagree with it.
+
+        Version 3 also lets `factIds` cite a declaration-census fact (`rdf1:`)
+        as well as a review fact (`rf1:`). An adoption rule - "this attribute
+        belongs on these declarations" - turns on the census, and version 2 gave
+        the model no legal way to name the evidence its own conclusion rested
+        on.
+    #>
     param(
         [Parameter(Mandatory)][string]$ExpectedProject,
         [Parameter(Mandatory)][string]$ExpectedNonce,
-        [int]$MaxCandidateItems = $script:ReviewerConventionSpecialistMaxCandidates
+        [int]$MaxCandidateItems = $script:ReviewerConventionSpecialistMaxCandidates,
+        [ValidateSet(2, 3)][int]$ContractVersion = 2
     )
     $ascii = '^[\x20-\x7E]*$'
+    $wrapperOwnedKeys = @(
+        "filePath", "line", "packName", "ruleSourceId", "ruleSourceRepositoryId",
+        "ruleSourcePath", "ruleSourceCommit", "ruleSourceSha256"
+    )
     $candidateKeys = @(
         "candidateId", "category", "severity", "anchorKind", "filePath", "line",
         "primaryTarget", "manifestations",
@@ -711,6 +857,14 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
         "factIds", "confidence", "residualRiskSummary", "semanticCandidateVersion",
         "changedCodeFix", "existingDebtFollowUp"
     )
+    if ($ContractVersion -ge 3) {
+        $candidateKeys = @(@($candidateKeys | Where-Object { $wrapperOwnedKeys -notcontains $_ }) + "ruleRef")
+    }
+    $factIdPattern = if ($ContractVersion -ge 3) {
+        # Either namespace, in any order, still bounded at eight.
+        '^(|r(d)?f1:[0-9a-f]{64}(,r(d)?f1:[0-9a-f]{64}){0,7})$'
+    }
+    else { '^(|rf1:[0-9a-f]{64}(,rf1:[0-9a-f]{64}){0,7})$' }
     return @{
         Keys = @(
             "schemaVersion", "prId", "repositoryId", "project", "reviewedSourceCommit",
@@ -719,7 +873,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
             "candidates", "ruleCoverage", "withheld", "residualRisks", "nonce"
         )
         Fields = @{
-            schemaVersion = @{ Type = "int"; Min = 2; Max = 2 }
+            schemaVersion = @{ Type = "int"; Min = $ContractVersion; Max = $ContractVersion }
             prId = @{ Type = "int"; Min = 1; Max = [int]::MaxValue }
             repositoryId = @{ Type = "guid" }
             project = @{ Type = "exact"; Expected = $ExpectedProject }
@@ -733,6 +887,13 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
             promptSha256 = @{ Type = "hex"; Length = 64 }
             candidates = @{
                 Type = "objectArray"; MaxItems = $MaxCandidateItems
+                # Version 3 only: one unreadable semantic field withholds ITS OWN
+                # candidate instead of the whole marker. Under version 2 a single
+                # bad sub-field discarded every candidate and every rule row
+                # beside it, and "nothing came back" is indistinguishable from
+                # "there was nothing to find" - which is the one thing this layer
+                # must never say by accident.
+                ElementFailurePolicy = $(if ($ContractVersion -ge 3) { "drop" } else { "fail" })
                 Item = @{
                     Keys = $candidateKeys
                     Fields = @{
@@ -742,10 +903,19 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         anchorKind = @{ Type = "enum"; Values = @("changedFile", "prMetadata") }
                         filePath = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Pattern = '^/?[\x20-\x21\x23-\x29\x2B-\x39\x3B\x3D\x40-\x5B\x5D-\x7B\x7D-\x7E]*$' }
                         line = @{ Type = "int"; Min = 0; Max = 1000000 }
-                        primaryTarget = @{
-                            Type = "string"; MaxLength = 24
-                            Pattern = '^(prMetadata|cf[0-9]{1,3}:[1-9][0-9]{0,6})$'
-                        }
+                        ruleRef = @{ Type = "string"; MaxLength = 5; Pattern = '^rs[0-9]{1,3}$' }
+                        primaryTarget = $(if ($ContractVersion -ge 3) {
+                                @{
+                                    Type = "string"; MaxLength = 24; AllowEmpty = $true
+                                    Pattern = '^$|^(prMetadata|cf[0-9]{1,3}:[1-9][0-9]{0,6})$'
+                                }
+                            }
+                            else {
+                                @{
+                                    Type = "string"; MaxLength = 24
+                                    Pattern = '^(prMetadata|cf[0-9]{1,3}:[1-9][0-9]{0,6})$'
+                                }
+                            })
                         manifestations = @{
                             Type = "string"; MaxLength = 400; AllowEmpty = $true
                             Pattern = $script:ReviewerConventionSpecialistChangedLineListPattern
@@ -767,7 +937,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         siblingNotRequiredReason = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Pattern = $ascii; NormalizeTypography = $true }
                         factIds = @{
                             Type = "string"; MaxLength = 600; AllowEmpty = $true
-                            Pattern = '^(|rf1:[0-9a-f]{64}(,rf1:[0-9a-f]{64}){0,7})$'
+                            Pattern = $factIdPattern
                         }
                         confidence = @{ Type = "enum"; Values = @("low", "medium", "high") }
                         residualRiskSummary = @{ Type = "string"; MaxLength = 800; AllowEmpty = $true; Pattern = $ascii; NormalizeTypography = $true }
@@ -971,8 +1141,13 @@ function ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
         [Parameter(Mandatory)][hashtable]$Schema,
-        [int]$ScanWindowChars = 327680
+        [int]$ScanWindowChars = 327680,
+        [ValidateSet(2, 3)][int]$ContractVersion = 2
     )
+    $markerPrefix = if ($ContractVersion -ge 3) {
+        $script:ReviewerConventionSpecialistMarkerPrefixV3
+    }
+    else { $script:ReviewerConventionSpecialistMarkerPrefix }
     $normalizer = {
         param($MarkerCandidate)
         $normalizedFields = [System.Collections.Generic.List[object]]::new()
@@ -982,6 +1157,33 @@ function ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome {
             for ($index = 0; $index -lt $candidates.Count; $index++) {
                 $candidateItem = $candidates[$index]
                 if ($candidateItem -isnot [System.Management.Automation.PSCustomObject]) { continue }
+                if ($ContractVersion -ge 3) {
+                    # `siblingNotRequiredReason` is the reason sibling evidence
+                    # was NOT required. When `siblingStatus` is `checked` there
+                    # is no such reason - the wrapper's own validation below
+                    # insists the field be empty in that case - so requiring the
+                    # model to emit an empty string for it is asking it to state
+                    # something it has already stated. Three real-model trials
+                    # lost an otherwise correct nine-declaration finding to
+                    # exactly that omission.
+                    #
+                    # Defaulted only for `checked`. For `notRequired` the reason
+                    # is real content the wrapper cannot know, so an omission
+                    # there stays a refusal rather than becoming a silent blank.
+                    $statusProperty = $candidateItem.PSObject.Properties['siblingStatus']
+                    if ($statusProperty -and [string]$statusProperty.Value -ceq 'checked' -and
+                        -not $candidateItem.PSObject.Properties['siblingNotRequiredReason']) {
+                        $reasonField = "candidates[$index].siblingNotRequiredReason"
+                        Add-Member -InputObject $candidateItem -NotePropertyName 'siblingNotRequiredReason' `
+                            -NotePropertyValue '' -Force
+                        [void]$normalizedFields.Add([ordered]@{
+                                Field = $reasonField
+                                From = 'absentUnderCheckedSiblingStatus'
+                                To = 'emptyString'
+                                OriginalTypedReason = "The marker omitted the required key '$reasonField'."
+                            })
+                    }
+                }
                 $fixProperty = $candidateItem.PSObject.Properties['changedCodeFix']
                 if (-not $fixProperty -or
                     $fixProperty.Value -isnot [System.Management.Automation.PSCustomObject]) { continue }
@@ -1001,7 +1203,7 @@ function ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome {
         return @{ Value = $MarkerCandidate; NormalizedFields = @($normalizedFields) }
     }
     return ConvertFrom-AgentResultMarkerOutcome -StdOutText $StdOutText `
-        -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix -Schema $Schema `
+        -MarkerPrefix $markerPrefix -Schema $Schema `
         -ScanWindowChars $ScanWindowChars -CandidateNormalizer $normalizer
 }
 
@@ -1226,6 +1428,8 @@ function Get-ReviewerConventionSpecialistRuleRequest {
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
+        [AllowEmptyCollection()][object[]]$Constructs = @(),
+        [ValidateSet(2, 3)][int]$ContractVersion = 2,
         [int]$MaxRows = $script:ReviewerConventionSpecialistMaxRuleCoverage
     )
     # Ordinal, not Sort-Object. This order does not merely number the rows: it
@@ -1255,18 +1459,37 @@ function Get-ReviewerConventionSpecialistRuleRequest {
     }
     $requested = [System.Collections.Generic.List[object]]::new()
     $unrequested = [System.Collections.Generic.List[string]]::new()
+    $knownDeclarationIds = [string[]]@($Constructs | Where-Object {
+            [string](Get-ReviewerConventionSpecialistValue $_ "kind" "") -ceq "declaration" -and
+            [string](Get-ReviewerConventionSpecialistValue $_ "status" "known") -ceq "known"
+        } | ForEach-Object { [string](Get-ReviewerConventionSpecialistValue $_ "constructId" "") } |
+        Where-Object { $_ })
+    $knownDeclarationRanges = ConvertTo-ReviewerConventionSpecialistConstructIdRanges -Ids $knownDeclarationIds
     for ($i = 0; $i -lt $ordered.Count; $i++) {
         $key = "{0}/{1}" -f `
             [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "PackName" ""),
         [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "SourceId" "")
         if ($i -ge $MaxRows) { [void]$unrequested.Add($key); continue }
-        [void]$requested.Add([pscustomobject][ordered]@{
+        $packDeclarationEvidence = [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "PackDeclarationEvidence" "")
+        if (-not $packDeclarationEvidence) {
+            $packDeclarationEvidence = [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "declarationEvidence" "")
+        }
+        if (-not $packDeclarationEvidence) {
+            $packDeclarationEvidence = [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "DeclarationEvidence" "")
+        }
+        $siblingEvidenceRequired = -not ($ContractVersion -ge 3 -and $packDeclarationEvidence -ceq "local")
+        $row = [ordered]@{
                 ruleRef = "rs$i"
                 packName = [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "PackName" "")
                 ruleSourceId = [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "SourceId" "")
                 ruleSourceSha256 = [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "Sha256" "")
                 source = $ordered[$i]
-            })
+            }
+        if ($ContractVersion -ge 3) {
+            $row.Add("siblingEvidenceRequired", [bool]$siblingEvidenceRequired)
+            $row.Add("locallyAdjudicableConstructs", $(if ($siblingEvidenceRequired) { "" } else { $knownDeclarationRanges }))
+        }
+        [void]$requested.Add([pscustomobject]$row)
     }
     return @{ Requested = $requested.ToArray(); Unrequested = @($unrequested.ToArray()) }
 }
@@ -1860,7 +2083,13 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         [AllowEmptyCollection()][object[]]$Constructs = @(),
         [AllowEmptyCollection()][object[]]$ConstructFiles = @(),
         [bool]$ConstructsIncomplete = $false,
-        [hashtable]$RightHandRangesByPath = @{}
+        [hashtable]$RightHandRangesByPath = @{},
+        [ValidateSet(2, 3)][int]$ContractVersion = 2,
+        # Candidates the marker extractor withheld because a semantic field of
+        # theirs could not be read. They arrive here so they leave a mark: a
+        # shortened candidate list that says nothing about what is missing from
+        # it reads exactly like a clean review.
+        [AllowEmptyCollection()][object[]]$DroppedElements = @()
     )
     if (@($ResolvedSources).Count -eq 0) {
         throw "Convention specialist candidate validation requires at least one resolved convention source."
@@ -1901,9 +2130,50 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     }
     $canonicalRanges = ConvertTo-ReviewerConventionSpecialistRangesByPath `
         -RightHandRangesByPath $RightHandRangesByPath
+    # Contract v3: the model addresses a rule by the same short `rs<n>` the
+    # coverage rows use, and the wrapper fills in the provenance itself from the
+    # source it actually transported. Under v2 the model retyped a pack name, a
+    # repository GUID, a path, a 40-hex commit and a 64-hex digest, and every one
+    # of them was a way for a correct finding to be refused over a transcription
+    # slip - or, worse, to be accepted while disagreeing with what was really
+    # delivered.
+    $ruleRefMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    if ($ContractVersion -ge 3) {
+        foreach ($row in @((Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $ResolvedSources `
+                    -Constructs $Constructs -ContractVersion $ContractVersion).Requested)) {
+            $ruleRefMap[[string]$row.ruleRef] = $row
+        }
+    }
     $seenIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $accepted = [System.Collections.Generic.List[object]]::new()
     $withheld = [System.Collections.Generic.List[object]]::new()
+    foreach ($drop in @($DroppedElements)) {
+        $field = [string](Get-ReviewerConventionSpecialistValue $drop "Field" "")
+        $reason = [string](Get-ReviewerConventionSpecialistValue $drop "Reason" "")
+        # The identifier comes from the extractor, which reports a rejected
+        # key by a safe name rather than the model's own. Re-assert that here
+        # anyway: this detail is rendered into an artifact a person reads, and
+        # it is the one withheld entry the wrapper composes rather than
+        # validates, so it does not get to be the exception to the rule that
+        # nothing reaches a rendered artifact unchecked.
+        # `\z`, not `$`: in .NET `$` also matches before a final newline, so an
+        # otherwise-safe identifier ending in one line break would pass.
+        if ($field -cnotmatch '^[A-Za-z0-9_.\[\]~-]{0,120}\z') { $field = "unreportableField" }
+        if ($reason -cnotmatch '^[A-Za-z0-9]{0,40}\z') { $reason = "unreportableReason" }
+        $detail = [string](Get-ReviewerConventionSpecialistShortened `
+                -Text ("A result element was withheld because '$field' failed its schema rule ($reason). " +
+                    "It was not assessed and must not be read as an absence of findings.") -MaxLength 800)
+        if (Test-ReviewerConventionSpecialistVoteText -Text $detail) {
+            throw "A withheld result element's diagnostic carried a vote recommendation."
+        }
+        [void]$withheld.Add([pscustomobject][ordered]@{
+                # There is no candidate id to name: the element that carried it
+                # is exactly what could not be read.
+                candidateId = ""
+                reason = "schemaInvalidCandidate"
+                detail = $detail
+            })
+    }
     $changedFileIndex = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries `
         -RightHandRangesByPath $RightHandRangesByPath
     foreach ($item in @($Marker.withheld)) {
@@ -1919,9 +2189,34 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     foreach ($candidate in @($Marker.candidates)) {
         $candidateId = [string]$candidate.candidateId
         if (-not $seenIds.Add($candidateId)) { throw "Specialist output duplicated candidate id '$candidateId'." }
+        $candidateRuleRow = $null
+        if ($ContractVersion -ge 3) {
+            $ruleRef = [string](Get-ReviewerConventionSpecialistValue $candidate "ruleRef" "")
+            if (-not $ruleRefMap.ContainsKey($ruleRef)) {
+                # A reference to a rule nobody transported is withheld, not
+                # guessed at. Withheld rather than thrown because one candidate
+                # naming a rule that is not there says nothing about the others.
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; reason = "invalidEvidence"
+                        detail = "Candidate cited rule reference '$ruleRef', which the wrapper did not transport."
+                    })
+                continue
+            }
+            $candidateRuleRow = $ruleRefMap[$ruleRef]
+            $refSource = $candidateRuleRow.source
+            foreach ($pair in @(
+                    @("packName", "PackName"), @("ruleSourceId", "SourceId"),
+                    @("ruleSourceRepositoryId", "RepositoryId"), @("ruleSourcePath", "Path"),
+                    @("ruleSourceCommit", "CommitSha"), @("ruleSourceSha256", "Sha256")
+                )) {
+                $candidate[[string]$pair[0]] = [string](
+                    Get-ReviewerConventionSpecialistValue $refSource ([string]$pair[1]) "")
+            }
+        }
         $anchorKind = [string](Get-ReviewerConventionSpecialistValue $candidate "anchorKind" "")
         $primaryTarget = [string](Get-ReviewerConventionSpecialistValue $candidate "primaryTarget" "")
         $manifestationText = [string](Get-ReviewerConventionSpecialistValue $candidate "manifestations" "")
+        $resolvedCandidateTargets = @()
         if ($anchorKind -ceq "prMetadata") {
             if ($primaryTarget -cne "prMetadata" -or $manifestationText) {
                 [void]$withheld.Add([pscustomobject][ordered]@{
@@ -1929,6 +2224,10 @@ function Resolve-ReviewerConventionSpecialistCandidates {
                         detail = "Metadata candidates require primaryTarget prMetadata and no changed-line manifestations."
                     })
                 continue
+            }
+            if ($ContractVersion -ge 3) {
+                $candidate["filePath"] = ""
+                $candidate["line"] = 0
             }
         }
         else {
@@ -1940,16 +2239,46 @@ function Resolve-ReviewerConventionSpecialistCandidates {
                 -Text (@($primaryTarget, $manifestationText | Where-Object { $_ }) -join ",") `
                 -Constructs $Constructs -ChangedFileAnchors $changedFileIndex -ChangedLinesOnly
             $targetErrors = @($primary.Errors) + @($additional.Errors) + @($full.Errors)
-            $candidatePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
-                [string](Get-ReviewerConventionSpecialistValue $candidate "filePath" ""))
-            $candidateLine = Get-ReviewerConventionSpecialistValue $candidate "line" $null
-            if (@($primary.Targets).Count -ne 1 -or
-                [string]((@($primary.Targets)[0]).path) -cne $candidatePath -or
-                -not (Test-ReviewerConventionSpecialistInteger $candidateLine) -or
-                [int64]((@($primary.Targets)[0]).line) -ne [int64]$candidateLine) {
-                $targetErrors += "primaryTarget does not exactly match the posted filePath and line"
+            $derivedPrimaryTarget = ""
+            $derivedManifestations = ""
+            if ($ContractVersion -ge 3) {
+                # The anchor IS the target. There is only one statement of it, so
+                # there is nothing to cross-check and no way for two statements to
+                # disagree; the wrapper reads the path and line back off the
+                # target it just resolved.
+                if ([string]::IsNullOrWhiteSpace($primaryTarget)) {
+                    if (@($full.Targets).Count -eq 0) {
+                        $targetErrors += "target union did not resolve any changed-line anchors"
+                    }
+                    elseif ($targetErrors.Count -eq 0) {
+                        $deterministicPrimary = @($full.Targets)[0]
+                        $derivedPrimaryTarget = [string]$deterministicPrimary.target
+                        $derivedManifestations = (@(@($full.Targets) | Select-Object -Skip 1 |
+                                ForEach-Object { [string]$_.target }) -join ",")
+                        $candidate["filePath"] = [string]$deterministicPrimary.path
+                        $candidate["line"] = [int]$deterministicPrimary.line
+                    }
+                }
+                elseif (@($primary.Targets).Count -ne 1) {
+                    $targetErrors += "primaryTarget did not resolve to exactly one changed-line anchor"
+                }
+                else {
+                    $candidate["filePath"] = [string]((@($primary.Targets)[0]).path)
+                    $candidate["line"] = [int]((@($primary.Targets)[0]).line)
+                }
             }
-            if (@($full.Targets).Count -gt 0) {
+            else {
+                $candidatePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                    [string](Get-ReviewerConventionSpecialistValue $candidate "filePath" ""))
+                $candidateLine = Get-ReviewerConventionSpecialistValue $candidate "line" $null
+                if (@($primary.Targets).Count -ne 1 -or
+                    [string]((@($primary.Targets)[0]).path) -cne $candidatePath -or
+                    -not (Test-ReviewerConventionSpecialistInteger $candidateLine) -or
+                    [int64]((@($primary.Targets)[0]).line) -ne [int64]$candidateLine) {
+                    $targetErrors += "primaryTarget does not exactly match the posted filePath and line"
+                }
+            }
+            if ($primaryTarget -and @($full.Targets).Count -gt 0) {
                 $deterministicPrimary = @($full.Targets)[0]
                 if ([string]$deterministicPrimary.target -cne $primaryTarget.ToLowerInvariant()) {
                     $targetErrors += "primaryTarget is not the deterministic ordinal path/line selection"
@@ -1964,8 +2293,15 @@ function Resolve-ReviewerConventionSpecialistCandidates {
                     })
                 continue
             }
-            $candidate.primaryTarget = [string]$primary.Canonical
-            $candidate.manifestations = [string]$additional.Canonical
+            if ($ContractVersion -ge 3 -and [string]::IsNullOrWhiteSpace($primaryTarget)) {
+                $candidate.primaryTarget = $derivedPrimaryTarget
+                $candidate.manifestations = $derivedManifestations
+            }
+            else {
+                $candidate.primaryTarget = [string]$primary.Canonical
+                $candidate.manifestations = [string]$additional.Canonical
+            }
+            $resolvedCandidateTargets = @($full.Targets)
         }
         $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
                 -Candidate $candidate -Constructs $Constructs -ConstructFiles $ConstructFiles `
@@ -2023,8 +2359,44 @@ function Resolve-ReviewerConventionSpecialistCandidates {
             throw "Specialist candidate '$candidateId' duplicated a deterministic fact id."
         }
         $facts = [System.Collections.Generic.List[object]]::new()
+        # Census facts are kept apart from review facts because they are a
+        # different KIND of evidence. A review fact carries a canonical
+        # true/false state; a complete declaration census carries counts, and
+        # its determinism was already established above by requiring the counts
+        # and the whole file to be complete. Mixing them meant the state check
+        # below - written for review facts - read a census record that has no
+        # `state` at all, and threw. That threw out of candidate resolution
+        # entirely, degrading the pass to zero candidates and discarding every
+        # other finding and rule row in it: exactly the all-or-nothing failure
+        # this contract exists to remove, reintroduced through its own new
+        # feature and with a wider blast radius than the case it fixed.
+        $censusFacts = [System.Collections.Generic.List[object]]::new()
         $invalidEvidence = [System.Collections.Generic.List[string]]::new()
         foreach ($factId in $factIds) {
+            # Contract v3 lets an adoption rule cite the declaration census its
+            # conclusion actually rests on. Under v2 the only legal citation was
+            # a review fact (`rf1:`), so "this attribute is on none of the
+            # fifteen declarations in this file" - the whole basis of the
+            # finding - had nowhere to be named, and a model that named it
+            # anyway had its entire marker refused.
+            if ($ContractVersion -ge 3 -and $factId -cmatch '^rdf1:[0-9a-f]{64}$') {
+                $census = @($ConstructFiles | Where-Object {
+                        [string](Get-ReviewerConventionSpecialistValue $_ "evidenceFactId" "") -ceq $factId
+                    })
+                if ($census.Count -ne 1) {
+                    [void]$invalidEvidence.Add("unknown declaration census '$factId'")
+                    continue
+                }
+                # A partial count is not evidence. It cannot say an attribute is
+                # absent; it can only say it was not seen in what was read.
+                if (-not [bool](Get-ReviewerConventionSpecialistValue $census[0] "attributeCountsComplete" $false) -or
+                    -not [bool](Get-ReviewerConventionSpecialistValue $census[0] "wholeFileComplete" $false)) {
+                    [void]$invalidEvidence.Add("declaration census '$factId' is incomplete")
+                    continue
+                }
+                [void]$censusFacts.Add($census[0])
+                continue
+            }
             if (-not $factMap.ContainsKey($factId)) {
                 [void]$invalidEvidence.Add("unknown deterministic fact '$factId'")
                 continue
@@ -2045,28 +2417,58 @@ function Resolve-ReviewerConventionSpecialistCandidates {
                 })
             continue
         }
+        if ($ContractVersion -ge 3 -and $null -ne $candidateRuleRow -and
+            -not [bool](Get-ReviewerConventionSpecialistValue $candidateRuleRow "siblingEvidenceRequired" $true)) {
+            if ($anchorKind -cne "changedFile") {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; reason = "invalidEvidence"
+                        detail = "Local declaration evidence is available only for changed declaration anchors."
+                    })
+                continue
+            }
+            $localEvidence = Get-ReviewerConventionSpecialistLocalDeclarationEvidence `
+                -Targets $resolvedCandidateTargets -Constructs $Constructs
+            if (-not [bool]$localEvidence.Ok) {
+                $detail = "Candidate local declaration evidence is incomplete."
+                if (@($localEvidence.IncompleteIds).Count -gt 0) {
+                    $detail += " Unknown declaration(s): " + ((@($localEvidence.IncompleteIds) |
+                            Select-Object -First 8) -join ",") + "."
+                }
+                if (@($localEvidence.UnanchoredTargets).Count -gt 0) {
+                    $detail += " Unanchored target(s): " + ((@($localEvidence.UnanchoredTargets) |
+                            Select-Object -First 8) -join ",") + "."
+                }
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; reason = "invalidEvidence"
+                        detail = Get-ReviewerConventionSpecialistShortened -Text $detail -MaxLength 800
+                    })
+                continue
+            }
+            $candidate["siblingStatus"] = "checked"
+            $candidate["siblingEvidence"] = [string]$localEvidence.Evidence
+            $candidate["siblingNotRequiredReason"] = ""
+        }
         if ([string]$candidate.severity -ceq "important") {
             $candidateSiblingStatus = [string](Get-ReviewerConventionSpecialistValue `
                 $candidate "siblingStatus" "")
+            # A complete census is deterministic evidence in its own right: it
+            # is the count that says an attribute is on none of the declarations
+            # in a file, which is precisely the argument that justifies
+            # escalating past `suggestion` for an adoption rule.
+            $evidenceCount = $facts.Count + $censusFacts.Count
             if ([string]$candidate.impactCategory -ceq "none") {
                 throw "Specialist candidate '$candidateId' escalated severity without a protected impact category."
             }
-            if ($facts.Count -eq 0 -and $candidateSiblingStatus -cne "checked") {
+            if ($evidenceCount -eq 0 -and $candidateSiblingStatus -cne "checked") {
                 throw "Specialist candidate '$candidateId' used important severity without a deterministic fact or checked sibling evidence (status '$candidateSiblingStatus')."
             }
-            if ($facts.Count -eq 0 -and ([string]$candidate.siblingEvidence).Trim().Length -lt 16) {
+            if ($evidenceCount -eq 0 -and ([string]$candidate.siblingEvidence).Trim().Length -lt 16) {
                 throw "Specialist candidate '$candidateId' used important severity without meaningful checked sibling evidence."
             }
-            if (@($facts | Where-Object {
-                        @("true", "false") -cnotcontains
-                        [string](Get-ReviewerConventionSpecialistValue $_ "state" "")
-                    }).Count -gt 0) {
-                $invalidStates = @($facts | ForEach-Object {
-                        "$([string](Get-ReviewerConventionSpecialistValue $_ 'id' ''))=" +
-                        [string](Get-ReviewerConventionSpecialistValue $_ "state" "")
-                    }) -join ","
-                throw "Specialist candidate '$candidateId' used a non-deterministic fact to support important severity ($invalidStates)."
-            }
+            # Every id left in $facts already passed the per-fact deterministic
+            # state check above, which withholds rather than throws. There is
+            # deliberately no second state guard here: an unreachable one reads
+            # like a live defence and would rot untested.
         }
         elseif ([string]$candidate.impactCategory -cne "none") {
             throw "Specialist candidate '$candidateId' classified protected impact but did not use important severity."
@@ -2272,6 +2674,7 @@ function New-ReviewerConventionSpecialistInput {
         # saying so here the pass fails closed for a reason that is not a
         # finding about the change.
         [AllowEmptyString()][string]$ReplayNotice = "",
+        [ValidateSet(2, 3)][int]$ContractVersion = 2,
         [int]$MaxInputBytes = $script:ReviewerConventionSpecialistMaxInputBytes
     )
     if (@($ResolvedSources).Count -eq 0) {
@@ -2297,7 +2700,8 @@ function New-ReviewerConventionSpecialistInput {
                 text = [string](Get-ReviewerConventionSpecialistValue $_ "Text" "")
             }
         })
-    $ruleRequest = Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $ResolvedSources
+    $ruleRequest = Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $ResolvedSources `
+        -Constructs $Constructs -ContractVersion $ContractVersion
     # The anchor list is bounded too. It is only a naming convenience for the
     # rows - every path in it is already in `changedFiles` - and letting it grow
     # with a thousand-file change set would push the envelope past its bound and
@@ -2343,12 +2747,17 @@ function New-ReviewerConventionSpecialistInput {
         # a row may cite.
         ruleCoverageRequest = [pscustomobject][ordered]@{
             requiredRows = @($ruleRequest.Requested | ForEach-Object {
-                    [pscustomobject][ordered]@{
+                    $row = [ordered]@{
                         ruleRef = [string]$_.ruleRef
                         packName = [string]$_.packName
                         ruleSourceId = [string]$_.ruleSourceId
                         ruleSourceSha256 = [string]$_.ruleSourceSha256
                     }
+                    if ($ContractVersion -ge 3) {
+                        $row["siblingEvidenceRequired"] = [bool]$_.siblingEvidenceRequired
+                        $row["locallyAdjudicableConstructs"] = [string]$_.locallyAdjudicableConstructs
+                    }
+                    [pscustomobject]$row
                 })
             unrequestedSources = @($ruleRequest.Unrequested)
             changedFileAnchors = @($anchorIndex)
@@ -2377,7 +2786,7 @@ function New-ReviewerConventionSpecialistInput {
         # analysis is asking for exactly that. This is a formatting aid and
         # nothing else: it contains no finding, no rule, and no judgement.
         markerScaffold = [pscustomobject][ordered]@{
-            schemaVersion = 2
+            schemaVersion = $ContractVersion
             prId = $PrId
             repositoryId = $RepositoryId
             project = $Project

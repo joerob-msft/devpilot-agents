@@ -107,7 +107,16 @@ $rawProfilePolicy = $profile.repoConventions.conventionPacks
 $profilePolicy = ConvertTo-ReviewerConventionPackPolicy -RawPolicy $rawProfilePolicy `
     -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $rawProfilePolicy.authoritativeSources)
 Assert-ConventionTest ($profile.previewOnly -eq $true) "The BPM fixture is not explicitly preview-only."
-Assert-ConventionTest (@($profilePolicy.Packs).Count -eq 8) "The BPM fixture did not parse to exactly eight packs."
+Assert-ConventionTest (@($profilePolicy.Packs).Count -eq 9) "The BPM fixture did not parse to exactly nine packs."
+$ownershipProfilePack = @($profilePolicy.Packs | Where-Object { [string]$_.Name -ceq "bpm-test-ownership" })
+Assert-ConventionTest ($ownershipProfilePack.Count -eq 1 -and
+    [string]$ownershipProfilePack[0].DeclarationEvidence -ceq "local") `
+    "The BPM ownership pack did not carry local declaration evidence metadata."
+$defaultProfilePacks = @($profilePolicy.Packs | Where-Object {
+        [string]$_.Name -cne "bpm-test-ownership" -and [string]$_.DeclarationEvidence
+    })
+Assert-ConventionTest ($defaultProfilePacks.Count -eq 0) `
+    "Declaration evidence metadata leaked onto non-ownership fixture packs."
 
 foreach ($replay in @($profile.replays)) {
     $entries = ConvertTo-ReviewerConventionChangeSet -Response (ConvertTo-TestChangeResponse -Paths @($replay.changedPaths))
@@ -116,8 +125,12 @@ foreach ($replay in @($profile.replays)) {
     $expected = @($replay.expectedPacks)
     Assert-ConventionTest (($actual -join "|") -ceq ($expected -join "|")) `
         "Replay '$($replay.name)' selected '$($actual -join ", ")'; expected '$($expected -join ", ")'."
-    Assert-ConventionTest ($actual.Count -ge 1 -and $actual.Count -le 3) `
-        "Replay '$($replay.name)' selected $($actual.Count) packs; the fixture should demonstrate the typical 1-3."
+    # bpm-test-ownership deliberately overlaps tests-and-cloudtest on a
+    # '*.Tests.cs' path: one file can legitimately owe answers to a general
+    # testing pack and to the ownership rule at once. Four is therefore the
+    # realistic ceiling this fixture demonstrates, not three.
+    Assert-ConventionTest ($actual.Count -ge 1 -and $actual.Count -le 4) `
+        "Replay '$($replay.name)' selected $($actual.Count) packs; the fixture should demonstrate the typical 1-4."
 }
 
 $pathCases = @(
@@ -298,6 +311,26 @@ Assert-ConventionTest (($generatedNames -join "|") -ceq "csharp-core|generated-c
 $raw = New-TestRawPolicy
 $policy = ConvertTo-ReviewerConventionPackPolicy -RawPolicy $raw `
     -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $raw.authoritativeSources)
+Assert-ConventionTest ([string]$policy.Packs[0].DeclarationEvidence -ceq "") `
+    "Packs without declarationEvidence did not retain default sibling-evidence behavior."
+$localEvidenceRaw = Copy-ConventionObject $raw
+Add-Member -InputObject $localEvidenceRaw.packs[0] -NotePropertyName "declarationEvidence" -NotePropertyValue "local"
+$localEvidencePolicy = ConvertTo-ReviewerConventionPackPolicy -RawPolicy $localEvidenceRaw `
+    -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $localEvidenceRaw.authoritativeSources)
+Assert-ConventionTest ([string]$localEvidencePolicy.Packs[0].DeclarationEvidence -ceq "local") `
+    "A pack with declarationEvidence=local did not parse."
+$negativeDeclarationEvidence = Copy-ConventionObject $raw
+Add-Member -InputObject $negativeDeclarationEvidence.packs[0] -NotePropertyName "declarationEvidence" -NotePropertyValue "global"
+Assert-ConventionThrows {
+    ConvertTo-ReviewerConventionPackPolicy -RawPolicy $negativeDeclarationEvidence `
+        -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $negativeDeclarationEvidence.authoritativeSources)
+} "An unsupported declarationEvidence value was accepted."
+$nonStringDeclarationEvidence = Copy-ConventionObject $raw
+Add-Member -InputObject $nonStringDeclarationEvidence.packs[0] -NotePropertyName "declarationEvidence" -NotePropertyValue $true
+Assert-ConventionThrows {
+    ConvertTo-ReviewerConventionPackPolicy -RawPolicy $nonStringDeclarationEvidence `
+        -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $nonStringDeclarationEvidence.authoritativeSources)
+} "A non-string declarationEvidence value was accepted."
 $requiredPackBytes = [int]$policy.Packs[0].RequiredMaxBytes
 $boundaryRaw = Copy-ConventionObject $raw
 $boundaryRaw.packs[0].maxBytes = $requiredPackBytes

@@ -1073,7 +1073,8 @@ $expectedInputParameters = @(
     "FactPlanSha256", "ConfigSha256", "ScriptSha256", "PromptSha256",
     "ConventionPlan", "FactPlan", "ResolvedSources", "ChangeEntries",
     "Constructs", "ConstructFiles", "ConstructIdRanges", "RightHandRangesByPath",
-    "ThreadDigestText", "PinnedSourceText", "ReplayNotice", "MaxInputBytes"
+    "ThreadDigestText", "PinnedSourceText", "ReplayNotice", "ContractVersion",
+    "MaxInputBytes"
 )
 Assert-Specialist (($actualInputParameters -join "|") -ceq ($expectedInputParameters -join "|")) `
     "Specialist input builder parameter allow-list changed."

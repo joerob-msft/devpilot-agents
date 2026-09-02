@@ -515,6 +515,90 @@ function Get-ReviewerChangedInvocations {
     return @{ Constructs = @($found.ToArray()); Truncated = $truncated }
 }
 
+function Get-ReviewerConstructAttributeGroup {
+    <#
+        The attribute names inside ONE bracket group, and the index of the ']'
+        that closes it, or $null when the group never closes.
+
+        C# lets one bracket group carry several attributes -
+        `[TestMethod, Owner("alias")]` - and matching only the name that follows
+        '[' reads that as `TestMethod` alone. A rule asking whether `Owner` is
+        present would then be told it is absent, on a declaration that carries
+        it: not a missed finding but an invented one, which is the more
+        expensive direction to be wrong in.
+
+        So the group is split at commas that are genuinely between attributes:
+        bracket depth one, and outside any parenthesis or brace. That keeps
+        `[DataRow(true, false)]` a single attribute whose argument list happens
+        to contain a comma. Callers pass MASKED text, so a comma inside a string
+        or comment has already become a space and cannot be seen here.
+
+        A segment whose shape cannot be established yields NO name and sets
+        `Uncertain`. Nothing is ever invented: the declaration is then reported
+        `unknown` rather than silently missing an attribute it may well have.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][int]$Start
+    )
+    if ($Start -lt 0 -or $Start -ge $Text.Length -or $Text[$Start] -ne '[') { return $null }
+    $names = [System.Collections.Generic.List[string]]::new()
+    $uncertain = $false
+    $bracketDepth = 1
+    $parenDepth = 0
+    $braceDepth = 0
+    $segmentStart = $Start + 1
+    $end = -1
+    # FUNCTION-LOCAL state the closure mutates by member and never reassigns, so
+    # the scan is reentrant and leaves no module-global residue.
+    $state = @{ Unreadable = $false }
+    $addSegment = {
+        param([int]$From, [int]$To)
+        $segment = $Text.Substring($From, $To - $From).Trim()
+        if (-not $segment) { return }
+        # An attribute target ('assembly:', 'return:') names where the attribute
+        # attaches, not the attribute. A single ':' only - '::' is a global
+        # qualifier and belongs to the name.
+        if ($segment -match '^[A-Za-z_][A-Za-z0-9_]*\s*:(?!:)\s*(.*)$') { $segment = $Matches[1].Trim() }
+        $segment = $segment -replace '^global\s*::\s*', ''
+        # An attribute is a (possibly dotted) name, optionally followed by an
+        # argument list - and NOTHING else. Matching only a leading identifier
+        # would quietly accept `Owner<A` from a generic attribute split at a
+        # comma the angle brackets should have protected, report `Owner` as
+        # present, and add the fragment `B>` as a second attribute that does not
+        # exist. An invented attribute reads as a rule already satisfied, so it
+        # suppresses a real violation and corrupts the per-file census that
+        # `rdf1:` evidence is built from. A shape this lexer cannot read whole
+        # is unreadable, not a name.
+        if ($segment -match '^([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*(\(.*\))?$') {
+            [void]$names.Add(($Matches[1] -replace '\s+', ''))
+        }
+        else { $state.Unreadable = $true }
+    }
+    for ($index = $Start + 1; $index -lt $Text.Length; $index++) {
+        $character = $Text[$index]
+        if ($character -eq '(') { $parenDepth++; continue }
+        if ($character -eq ')') { if ($parenDepth -gt 0) { $parenDepth-- } else { $uncertain = $true }; continue }
+        if ($character -eq '{') { $braceDepth++; continue }
+        if ($character -eq '}') { if ($braceDepth -gt 0) { $braceDepth-- } else { $uncertain = $true }; continue }
+        if ($parenDepth -gt 0 -or $braceDepth -gt 0) { continue }
+        if ($character -eq '[') { $bracketDepth++; continue }
+        if ($character -eq ']') {
+            $bracketDepth--
+            if ($bracketDepth -eq 0) { $end = $index; break }
+            continue
+        }
+        if ($character -eq ',' -and $bracketDepth -eq 1) {
+            & $addSegment $segmentStart $index
+            $segmentStart = $index + 1
+        }
+    }
+    if ($end -lt 0) { return $null }
+    & $addSegment $segmentStart $end
+    if ($state.Unreadable -or $parenDepth -ne 0 -or $braceDepth -ne 0) { $uncertain = $true }
+    return @{ Names = [string[]]@($names.ToArray()); End = $end; Uncertain = $uncertain }
+}
+
 function Get-ReviewerConstructDeclarationAt {
     <#
         The declaration shape at one line, or $null. Split out so the changed
@@ -540,13 +624,13 @@ function Get-ReviewerConstructDeclarationAt {
     # declaration. Skipping those lines undercounts exactly the attribute a
     # rule is asking about.
     $inlineAttributes = [System.Collections.Generic.List[string]]::new()
+    $shapeUncertain = $false
     while ($masked.StartsWith('[')) {
-        $close = $masked.IndexOf(']')
-        if ($close -lt 0) { return $null }
-        foreach ($match in [regex]::Matches($masked.Substring(0, $close + 1), '\[\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)')) {
-            [void]$inlineAttributes.Add(($match.Groups[1].Value -replace '\s+', ''))
-        }
-        $masked = $masked.Substring($close + 1).Trim()
+        $group = Get-ReviewerConstructAttributeGroup -Text $masked -Start 0
+        if ($null -eq $group) { return $null }
+        if ([bool]$group.Uncertain) { $shapeUncertain = $true }
+        foreach ($attributeName in @($group.Names)) { [void]$inlineAttributes.Add($attributeName) }
+        $masked = $masked.Substring([int]$group.End + 1).Trim()
         if (-not $masked) { return $null }
     }
     if ($masked -notmatch '^[A-Za-z_][A-Za-z0-9_<>,\[\]\.\s]*\s([A-Za-z_][A-Za-z0-9_]*)\s*(\(|\{|=>|$)') { return $null }
@@ -565,22 +649,156 @@ function Get-ReviewerConstructDeclarationAt {
         # would attach an attribute fifty undelivered lines away to this
         # declaration, and the whole point of these attributes is that they are
         # facts. Stop at the first line that is not a delivered attribute line.
-        if ($null -ne $Delivered -and $Delivered.Count -gt 0 -and -not $Delivered.Contains($above + 1)) { break }
+        if ($null -ne $Delivered -and $Delivered.Count -gt 0 -and -not $Delivered.Contains($above + 1)) {
+            # An unread line is the ONE line whose content decides whether the
+            # list continues, and no amount of looking above it can say what was
+            # in it. Finding a closing brace two lines up is not evidence that
+            # the unread line was not `[Owner("alias")]`. This stop is never
+            # discharged.
+            $shapeUncertain = $true
+            break
+        }
         $line = ([string]$MaskedLines[$above]).Trim()
-        if (-not $line) { break }
-        if (-not $line.StartsWith('[')) { break }
-        # The full dotted name, not its first segment: reporting
-        # `System.Diagnostics.CodeAnalysis.SuppressMessage` as "System" tells a
-        # reader nothing and could collide with an unrelated attribute.
-        foreach ($match in [regex]::Matches($line, '\[\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)')) {
+        if (-not $line) {
+            # Comment CONTENT is masked to spaces before this scan runs, so a
+            # comment between two attribute lines arrives here looking exactly
+            # like a blank line. Stopping mid-list would drop every attribute
+            # above it and still call the result complete. A blank line above a
+            # block that has already ended is the ordinary terminator - which is
+            # the common case, and treating it as doubt marked every declaration
+            # in a file unknown and silenced the capability entirely.
+            if ((Test-ReviewerConstructAttributeAbove -MaskedLines $MaskedLines -Index $above -Delivered $Delivered) -cne 'other') {
+                $shapeUncertain = $true
+            }
+            break
+        }
+        if (-not $line.StartsWith('[')) {
+            # A bracket group can wrap: `[TestMethod,` on one line and
+            # ` Owner("alias")]` on the next. The continuation begins with the
+            # attribute name, not with '[', so stopping here silently drops the
+            # WHOLE group and reports the declaration as carrying no attributes
+            # at all - with no uncertainty signal. Under an adoption rule that
+            # is a compliant declaration reported as a violation.
+            #
+            # Count, do not merely look: attribute arguments routinely contain
+            # '[' - `DataRow(new object[] { 1, 2 })]`, `DataRow(typeof(int[]))]`
+            # - so "contains no '['" would decline to flag exactly the
+            # continuation lines that matter most. A line closing a group opened
+            # above has more ']' than '[', while a balanced line such as
+            # `private int[] _x;` is an ordinary stop.
+            $opens = @($line.ToCharArray() | Where-Object { $_ -eq '[' }).Count
+            $closes = @($line.ToCharArray() | Where-Object { $_ -eq ']' }).Count
+            if ($closes -gt $opens) { $shapeUncertain = $true }
+            break
+        }
+        # One line can hold several groups - `[TestMethod] [Owner("alias")]` -
+        # and each group can hold several attributes.
+        $cursor = 0
+        $lineNames = [System.Collections.Generic.List[string]]::new()
+        while ($cursor -lt $line.Length) {
+            while ($cursor -lt $line.Length -and $line[$cursor] -ne '[') { $cursor++ }
+            if ($cursor -ge $line.Length) { break }
+            $group = Get-ReviewerConstructAttributeGroup -Text $line -Start $cursor
+            if ($null -eq $group) { $shapeUncertain = $true; break }
+            if ([bool]$group.Uncertain) { $shapeUncertain = $true }
+            foreach ($attributeName in @($group.Names)) { [void]$lineNames.Add($attributeName) }
+            $cursor = [int]$group.End + 1
+        }
+        foreach ($attributeName in $lineNames) {
+            # The full dotted name, not its first segment: reporting
+            # `System.Diagnostics.CodeAnalysis.SuppressMessage` as "System" tells
+            # a reader nothing and could collide with an unrelated attribute.
             if ($attributes.Count -ge $script:ReviewerConstructMaxAttributes) { $truncated = $true; break }
-            [void]$attributes.Add(($match.Groups[1].Value -replace '\s+', ''))
+            [void]$attributes.Add($attributeName)
         }
         if ($truncated) { break }
     }
     $sorted = [string[]]@($attributes.ToArray())
     [Array]::Sort($sorted, [StringComparer]::Ordinal)
-    return @{ Name = $name; Attributes = @($sorted); Truncated = $truncated }
+    # Two different kinds of doubt, deliberately reported apart.
+    #
+    # `Truncated` means a CAP cut the list short. That makes the file-wide
+    # attribute-name set incomplete, so "absent nowhere else" stops being a
+    # complete statement for every declaration in the file.
+    #
+    # `ShapeUncertain` means THIS declaration's own attribute list could not be
+    # established - an unreadable group, a wrapped group, an unread line above
+    # it. That says nothing about any other declaration, and laundering it into
+    # the file-wide flag marks every declaration in the file unknown because one
+    # of them sat next to a gap. A live trial did exactly that: all nine changed
+    # test methods came back unknown, so the specialist correctly refused to
+    # call any of them a violation and the capability reported nothing at all.
+    return @{
+        Name = $name
+        Attributes = @($sorted)
+        Truncated = $truncated
+        ShapeUncertain = $shapeUncertain
+    }
+}
+
+function Test-ReviewerConstructAttributeAbove {
+    <#
+        Whether an attribute line sits above the interrupting line at $Index,
+        within a short bounded peek.
+
+        This decides DOUBT, never content. A blank line above a complete
+        attribute block is the ordinary end of that block; a blank line with
+        more attribute lines above it means the block was interrupted and what
+        was collected is not the whole list. Comment CONTENT is masked to
+        spaces before this scan, so an interrupting comment arrives looking
+        exactly like a blank line - which is precisely the case that has to be
+        told apart from the ordinary one.
+
+        Nothing found here is ever collected as an attribute: reaching across a
+        gap for a NAME would attach an attribute from far away to a declaration
+        that does not carry it. The peek only answers "was there more".
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines,
+        [Parameter(Mandatory)][int]$Index,
+        $Delivered = $null
+    )
+    $limit = 0
+    $skippedGap = $false
+    for ($peek = $Index - 1; $peek -ge $limit; $peek--) {
+        if ($null -ne $Delivered -and $Delivered.Count -gt 0 -and -not $Delivered.Contains($peek + 1)) {
+            # An unread line inside the gap. Nothing above it can speak for it.
+            return 'blind'
+        }
+        $text = ([string]$MaskedLines[$peek]).Trim()
+        if (-not $text) { $skippedGap = $true; continue }
+        if ($text.StartsWith('[')) { return 'attribute' }
+        # A wrapped group's continuation line starts with the attribute NAME,
+        # not with '[', and closes more brackets than it opens. It is proof the
+        # block did not end, so reading it as an ordinary statement would
+        # discharge exactly the doubt this peek exists to raise.
+        $opens = @($text.ToCharArray() | Where-Object { $_ -eq '[' }).Count
+        $closes = @($text.ToCharArray() | Where-Object { $_ -eq ']' }).Count
+        if ($closes -gt $opens) { return 'attribute' }
+        return 'other'
+    }
+    # Ran off the top of the file. If a gap was crossed to get here we never
+    # established what was in it.
+    if ($skippedGap) { return 'blind' }
+    return 'other'
+}
+
+function Get-ReviewerConstructShapeUncertain {
+    <#
+        Whether ONE declaration's own attribute list could not be established.
+        Read through a helper because the field is newer than some of the
+        records that reach here, and a missing key must read as "no doubt
+        recorded" rather than throwing under StrictMode.
+    #>
+    param([AllowNull()]$Declaration)
+    if ($null -eq $Declaration) { return $false }
+    if ($Declaration -is [hashtable]) {
+        if (-not $Declaration.ContainsKey('ShapeUncertain')) { return $false }
+        return [bool]$Declaration['ShapeUncertain']
+    }
+    $property = $Declaration.PSObject.Properties['ShapeUncertain']
+    if ($null -eq $property) { return $false }
+    return [bool]$property.Value
 }
 
 function Get-ReviewerChangedDeclarations {
@@ -665,6 +883,14 @@ function Get-ReviewerChangedDeclarations {
                     $neighbour = $DeclarationIndex[$scan]
                     if ($null -ne $neighbour) {
                         $siblingCount++
+                        # Only a CAP makes a neighbour's list incomplete in a way
+                        # that matters here. A neighbour whose own shape could
+                        # not be read simply contributes no attributes: sibling
+                        # evidence is corroborating context, so that shrinks the
+                        # context and fails toward silence. Propagating it would
+                        # mark the SUBJECT unknown because a neighbour sat next
+                        # to a gap - the whole-file poisoning this correction
+                        # exists to remove, re-entering by another door.
                         if ([bool]$neighbour.Truncated) { $siblingTruncated = $true }
                         foreach ($attribute in @($neighbour.Attributes)) {
                             if ($siblingAttributes.Count -ge $script:ReviewerConstructMaxAttributes) { $siblingTruncated = $true; break }
@@ -695,7 +921,9 @@ function Get-ReviewerChangedDeclarations {
                 # file-wide attribute set hit its cap: "absent nowhere else"
                 # would then mean "the wrapper stopped counting", which a rule
                 # reasoning from it must not be told silently.
-                status = $(if ([bool]$declaration.Truncated -or $attributesTruncated -or $siblingTruncated) { "unknown" } else { "known" })
+                status = $(if ([bool]$declaration.Truncated -or
+                        (Get-ReviewerConstructShapeUncertain -Declaration $declaration) -or
+                        $attributesTruncated -or $siblingTruncated) { "unknown" } else { "known" })
             })
     }
     return @{ Constructs = @($found.ToArray()); Truncated = $truncated }
@@ -728,7 +956,14 @@ function Get-ReviewerConstructAttributeFrequency {
         # wrong in the direction that matters: it reports an attribute as
         # appearing on fewer declarations than it does, which reads as "this
         # file has never used it" - a precedent fact, inverted.
-        if ([bool]$declaration.Truncated) { $frequencyTruncated = $true }
+        # A declaration whose attribute list could not be ESTABLISHED counts
+        # here exactly like one a cap cut short. Either way the tally under-
+        # counts, and an under-count reads as "this file has never used that
+        # attribute" - a precedent fact, inverted. The census is what `rdf1:`
+        # evidence is built from and what `attributeCountsComplete` publishes,
+        # so it is the one place local doubt must NOT stay local.
+        if ([bool]$declaration.Truncated -or
+            (Get-ReviewerConstructShapeUncertain -Declaration $declaration)) { $frequencyTruncated = $true }
         $declarationCount++
         $attributesOnDeclaration = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($attribute in @($declaration.Attributes)) {

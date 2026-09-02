@@ -1855,7 +1855,7 @@ function Test-Specialist {
     }
     Check "specialist $Name zero real-model starts" ([int]$m.telemetry.realModelStarts -eq 0 -and [int]$m.telemetry.modelSubprocessStarts -ge 1) ("real=$([int]$m.telemetry.realModelStarts) sub=$([int]$m.telemetry.modelSubprocessStarts)")
     Check "specialist $Name zeroWriteVerified" ([bool]$m.telemetry.zeroWriteVerified) ''
-    Check "specialist $Name marker prefix is the convention marker" ([string]$m.resultMarkerPrefix -like 'CONVENTION_REVIEW_RESULT_V2:*') ("got=$([string]$m.resultMarkerPrefix)")
+    Check "specialist $Name marker prefix is the convention marker" ([string]$m.resultMarkerPrefix -like 'CONVENTION_REVIEW_RESULT_V3:*') ("got=$([string]$m.resultMarkerPrefix)")
     if ($DistinctNonces) {
         $ns = @(@($m.attempts) | ForEach-Object { [string]$_.nonce })
         Check "specialist $Name retry uses a fresh distinct nonce" ($ns.Count -ge 2 -and $ns[0] -cne $ns[1]) ("$($ns -join ',')")
@@ -1863,7 +1863,7 @@ function Test-Specialist {
     }
 }
 $specialistFindingTemplate = [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     prId = '{{binding.prId}}'
     repositoryId = '{{binding.repositoryId}}'
     project = '{{binding.project}}'
@@ -1877,13 +1877,8 @@ $specialistFindingTemplate = [ordered]@{
     promptSha256 = '{{binding.promptSha256}}'
     candidates = @([ordered]@{
             candidateId = 'immutable-state-reassignment'; category = 'convention'
-            severity = 'suggestion'; anchorKind = 'changedFile'; filePath = '/src/Widget.cs'; line = 15
-            primaryTarget = 'cf0:15'; manifestations = ''; packName = 'widget-core'
-            ruleSourceId = 'widget-rules'
-            ruleSourceRepositoryId = '11111111-2222-3333-4444-555555555555'
-            ruleSourcePath = '/docs/conventions.md'
-            ruleSourceCommit = 'f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9'
-            ruleSourceSha256 = '4b63e99eb07cf85e89dfdff08eca824ecfc305dcf2ba6ca4b71a691c978b8e12'
+            severity = 'suggestion'; anchorKind = 'changedFile'; ruleRef = 'rs0'
+            primaryTarget = 'cf0:15'; manifestations = ''
             ruleSection = 'Immutable state'; ruleQuote = 'never reassigning it'
             diffEvidence = 'The changed Rename method reassigns widgetId after construction.'
             impactCategory = 'none'
@@ -1915,11 +1910,14 @@ $specialistFindingTemplate = [ordered]@{
         })
     withheld = @(); residualRisks = @(); nonce = '{{binding.nonce}}'
 }
+$specialistSchemaInvalidTemplate = $specialistFindingTemplate | ConvertTo-Json -Depth 64 | ConvertFrom-Json -Depth 64
+$specialistSchemaInvalidTemplate.prId = 0
 Test-Specialist -Name 'success' -Behavior 'success' -RoleExtra @{ markerTemplate = $specialistFindingTemplate } `
     -ExpectAttempts 1 -ExpectStatus 'captured'
 Test-Specialist -Name 'missingMarker' -Behavior 'missingMarker' -ExpectAttempts 3 -ExpectStatus 'captureFailedRetriesExhausted' -DistinctNonces
 Test-Specialist -Name 'truncatedMarker' -Behavior 'truncatedMarker' -ExpectAttempts 3 -ExpectStatus 'captureFailedRetriesExhausted' -DistinctNonces
-Test-Specialist -Name 'schemaInvalidMarker' -Behavior 'schemaInvalidMarker' -ExpectAttempts 3 -ExpectStatus 'captureFailedRetriesExhausted' -DistinctNonces
+Test-Specialist -Name 'schemaInvalidMarker' -Behavior 'success' -RoleExtra @{ markerTemplate = $specialistSchemaInvalidTemplate } `
+    -ExpectAttempts 3 -ExpectStatus 'captureFailedRetriesExhausted' -DistinctNonces
 Test-Specialist -Name 'wrongBinding' -Behavior 'wrongBinding' -ExpectAttempts 1 -LooseTerminal
 
 # Blocker 3: the specialist attempt ledger preserves the EXACT production parser
@@ -1931,7 +1929,7 @@ Assert-ExactAttempt -Attempt (@($spMiss.attempts)[0]) -Label 'specialist missing
 $spTrunc = Read-Json (Join-Path (New-OutDir 'sp_truncatedMarker') 'package\transcript-package.json')
 Assert-ExactAttempt -Attempt (@($spTrunc.attempts)[0]) -Label 'specialist truncatedMarker' -ExpectStatus 'truncated' -ExpectRetryable $true
 $spSchema = Read-Json (Join-Path (New-OutDir 'sp_schemaInvalidMarker') 'package\transcript-package.json')
-Assert-ExactAttempt -Attempt (@($spSchema.attempts)[0]) -Label 'specialist schemaInvalidMarker' -ExpectStatus 'schemaInvalid' -ExpectRetryable $true -ExpectDetailNonEmpty
+Assert-ExactAttempt -Attempt (@($spSchema.attempts)[0]) -Label 'specialist schemaInvalidMarker' -ExpectStatus 'schemaInvalid' -ExpectRetryable $true -ExpectDetail 'prId'
 $spWrong = Read-Json (Join-Path (New-OutDir 'sp_wrongBinding') 'package\transcript-package.json')
 Assert-ExactAttempt -Attempt (@($spWrong.attempts)[-1]) -Label 'specialist wrongBinding' -ExpectStatus 'wrongBinding' -ExpectRetryable $false -ExpectDetail 'nonce'
 
@@ -1958,8 +1956,13 @@ $legacySpecialistCandidate = Join-Path $runRoot 'specialist-legacy-discovery-can
     -SealKeyPath $sealKey -ExpectedSourceScriptSha256 $currentReviewerSha `
     -OutputFile $legacySpecialistCandidate *> (Join-Path $logDir 'specialist-legacy-extract.log')
 $legacySpecialistExtractExit = $LASTEXITCODE
-Check 'authenticated pre-sourceProjection specialist package derives a convention candidate' (
-    $legacySpecialistExtractExit -eq 0 -and (Test-Path -LiteralPath $legacySpecialistCandidate)) `
+# The pre-sourceProjection shape belongs to builds that emitted contract v2. A
+# v3 marker states neither its anchor nor its rule provenance - the wrapper
+# derives both - so stripping the projection from a v3 package destroys the only
+# record of them. Deriving a candidate anyway would be inventing provenance, so
+# the extraction must refuse rather than produce one.
+Check 'a contract v3 specialist package stripped of its source projection is refused' (
+    $legacySpecialistExtractExit -ne 0 -and -not (Test-Path -LiteralPath $legacySpecialistCandidate)) `
     "exit=$legacySpecialistExtractExit"
 if (Test-Path -LiteralPath $specialistCandidate) {
     $sc = Read-Json $specialistCandidate
@@ -1975,8 +1978,14 @@ if (Test-Path -LiteralPath $specialistCandidate) {
     foreach ($target in @(
             @{ Tag = 'opus'; Model = 'claude-opus-5'; RoleName = 'reciprocal-opus-verifier';
                 Package = $specialistPackage; Candidate = $specialistCandidate },
+            # Both reciprocal verifier models still consume a specialist candidate.
+            # This one used to be fed the pre-sourceProjection package; under
+            # contract v3 that package is refused at extraction, so there is no
+            # candidate to hand it. The coverage that matters here is the second
+            # verifier MODEL, not the stripped package shape, which now has its
+            # own refusal check above.
             @{ Tag = 'gpt'; Model = 'gpt-5.6-sol'; RoleName = 'reciprocal-gpt-verifier';
-                Package = $legacySpecialistPackage; Candidate = $legacySpecialistCandidate })) {
+                Package = $specialistPackage; Candidate = $specialistCandidate })) {
         $out = New-OutDir "specialist_verifier_$($target.Tag)"
         $manifest = New-VariantManifest -Tag "specialistVerifier$($target.Tag)" `
             -Behavior 'success' -RoleName $target.RoleName

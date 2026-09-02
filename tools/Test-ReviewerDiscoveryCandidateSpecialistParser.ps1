@@ -15,7 +15,7 @@
     -CandidateNormalizer rewrites that exact empty array to '' before the typed
     schema runs. The discovery-candidate extraction tool parsed the same
     specialist capture with the GENERIC ConvertFrom-AgentResultMarkerOutcome,
-    which has no such normalizer, so it rejected a marker production accepts.
+    which has no such normalizer, so it lost a candidate production accepts.
 
     This check pins the difference on one fully schema-valid marker whose only
     compatibility shape is the empty evidenceFactIds array, and pins the tool to
@@ -63,16 +63,9 @@ $candidate = [pscustomobject][ordered]@{
     category = "convention"
     severity = "important"
     anchorKind = "changedFile"
-    filePath = "/src/a.cs"
-    line = 12
+    ruleRef = "rs0"
     primaryTarget = "cf0:12"
     manifestations = ""
-    packName = "csharp-core"
-    ruleSourceId = "shared-rules"
-    ruleSourceRepositoryId = $sourceRepositoryId
-    ruleSourcePath = "/docs/rules.md"
-    ruleSourceCommit = "c" * 40
-    ruleSourceSha256 = "d" * 64
     ruleSection = "Build validation"
     ruleQuote = "validation manifests are required"
     diffEvidence = "The changed build registration omits the required manifest."
@@ -113,7 +106,7 @@ $coverageRow = [pscustomobject][ordered]@{
     notes = ""
 }
 $markerObject = [pscustomobject][ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     prId = 42
     repositoryId = $repositoryId
     project = $project
@@ -132,9 +125,9 @@ $markerObject = [pscustomobject][ordered]@{
     nonce = $nonce
 }
 
-$schema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject $project -ExpectedNonce $nonce
+$schema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject $project -ExpectedNonce $nonce -ContractVersion 3
 $scan = Get-ReviewerConventionSpecialistScanWindowChars
-$prefix = $script:ReviewerConventionSpecialistMarkerPrefix
+$prefix = Get-ReviewerConventionSpecialistMarkerPrefixForVersion -ContractVersion 3
 
 # Baseline: the fully valid marker (string evidenceFactIds) parses through BOTH
 # readers. This proves the marker itself is not the reason the empty-array case
@@ -143,7 +136,7 @@ $stringText = $prefix + " " + ($markerObject | ConvertTo-Json -Depth 32 -Compres
 $stringGeneric = ConvertFrom-AgentResultMarkerOutcome -StdOutText $stringText `
     -MarkerPrefix $prefix -Schema $schema -ScanWindowChars $scan
 $stringSpecialist = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
-    -StdOutText $stringText -Schema $schema -ScanWindowChars $scan
+    -StdOutText $stringText -Schema $schema -ScanWindowChars $scan -ContractVersion 3
 Assert-Parser (([string]$stringGeneric.Status -ceq 'success') -and
     ([string]$stringSpecialist.Status -ceq 'success')) `
     "A fully valid specialist marker with a string evidenceFactIds did not parse through both readers; the fixture is not a clean baseline."
@@ -156,17 +149,21 @@ $emptyArrayText = $prefix + " " + ($emptyArrayMarker | ConvertTo-Json -Depth 32 
 
 # Falsifying reproduction of the tool's pre-fix path: the GENERIC reader the
 # tool used has no candidate normalizer, so the empty array fails the typed
-# string rule and the whole marker is rejected.
+# string rule. Under v3 that withholds the candidate, which is still unusable
+# for discovery extraction even though the marker envelope itself survives.
 $genericOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $emptyArrayText `
     -MarkerPrefix $prefix -Schema $schema -ScanWindowChars $scan
-Assert-Parser ([string]$genericOutcome.Status -cne 'success') `
-    "The generic result-marker reader accepted the empty-array evidenceFactIds; the tool's pre-fix bypass would not have been observable."
+Assert-Parser ([string]$genericOutcome.Status -ceq 'success' -and
+    @($genericOutcome.Value.candidates).Count -eq 0 -and
+    @($genericOutcome.DroppedElements).Count -eq 1) `
+    "The generic result-marker reader did not withhold the empty-array evidenceFactIds candidate; the tool's pre-fix bypass would not have been observable."
 
 # Production/post-fix path: the specialist wrapper normalizes the empty array to
 # '' and accepts the marker.
 $specialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
-    -StdOutText $emptyArrayText -Schema $schema -ScanWindowChars $scan
+    -StdOutText $emptyArrayText -Schema $schema -ScanWindowChars $scan -ContractVersion 3
 Assert-Parser ([string]$specialistOutcome.Status -ceq 'success' -and
+    @($specialistOutcome.Value.candidates).Count -eq 1 -and
     [string]$specialistOutcome.Value.candidates[0].changedCodeFix.evidenceFactIds -ceq '') `
     "The specialist wrapper did not accept and normalize the empty-array evidenceFactIds production accepts."
 

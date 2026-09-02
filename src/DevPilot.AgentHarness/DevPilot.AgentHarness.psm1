@@ -831,37 +831,101 @@ function ConvertTo-AgentMarkerFieldValue {
             # Require both entries so a malformed schema fails closed.
             if ($itemSchema -isnot [hashtable] -or -not $itemSchema.ContainsKey('Keys') -or -not $itemSchema.ContainsKey('Fields')) { return $bad }
             $itemKeys = @($itemSchema.Keys)
+            # Opt-in only. Under 'drop' an element that fails its own field
+            # rules is withheld and reported, instead of failing the whole
+            # marker. Callers that do not set it keep the fail-closed default
+            # exactly as before.
+            #
+            # This exists because "the marker was rejected" and "the review
+            # found nothing" arrive at the caller looking identical. One
+            # unreadable evidence field in one finding used to discard every
+            # other finding in the same marker and every rule-coverage row
+            # beside them - so a defect in one capability silently suppressed
+            # the ones that worked. Structural failures below (not an array,
+            # too many items, a malformed item schema) still fail closed: those
+            # say the payload is not the shape we asked for at all, which is not
+            # something a single element can be dropped to fix.
+            $dropBadElements = ($Spec.ContainsKey('ElementFailurePolicy') -and
+                [string]$Spec.ElementFailurePolicy -ceq 'drop')
             $out = New-Object System.Collections.Generic.List[hashtable]
+            $dropped = New-Object System.Collections.Generic.List[hashtable]
             for ($itemIndex = 0; $itemIndex -lt $items.Count; $itemIndex++) {
                 $element = $items[$itemIndex]
                 $itemPath = if ($Path) { "$Path[$itemIndex]" } else { "[$itemIndex]" }
-                if ($element -isnot [System.Management.Automation.PSCustomObject]) { return $bad }
+                $elementFailure = $null
+                if ($element -isnot [System.Management.Automation.PSCustomObject]) {
+                    if (-not $dropBadElements) { return $bad }
+                    [void]$dropped.Add(@{ Index = $itemIndex; Field = $itemPath; Reason = 'notAnObject' })
+                    continue
+                }
                 $elementKeys = @($element.PSObject.Properties | ForEach-Object { $_.Name })
-                foreach ($name in $elementKeys) {
+                for ($keyIndex = 0; $keyIndex -lt $elementKeys.Count; $keyIndex++) {
+                    $name = [string]$elementKeys[$keyIndex]
                     if ($itemKeys -notcontains $name) {
-                        return @{ Ok = $false; Value = $null; Field = "$itemPath.$name" }
+                        # A rejected key's NAME is model-authored text that no
+                        # field rule ever sees: the key is refused before any
+                        # rule is consulted, so it is never length-bounded,
+                        # typography-normalized or control-character checked.
+                        # It then travels into a human-facing report, so a key
+                        # named with newlines and Markdown could forge whole
+                        # sections of an artifact a person reads to decide
+                        # whether a finding is real.
+                        #
+                        # A key that already looks like a key is echoed, because
+                        # naming it is what makes the diagnostic useful. Anything
+                        # else is reported by position only: a caller learns
+                        # WHICH key was refused without the payload getting a
+                        # free ride into the report.
+                        # `$` is not end-of-input in .NET: it also matches before
+                        # a final newline, so a key of otherwise safe characters
+                        # ending in one `\n` would be echoed with the break
+                        # intact. `\z` is the only anchor that means "the end".
+                        $safeName = if ($name -cmatch '^[A-Za-z0-9_.\-]{1,64}\z') { $name } else { "key$keyIndex" }
+                        $elementFailure = @{ Ok = $false; Value = $null; Field = "$itemPath.$safeName"; Reason = 'unexpectedKey' }
+                        break
                     }
                 }
-                foreach ($name in $itemKeys) {
-                    if (-not $element.PSObject.Properties[$name]) {
-                        return @{ Ok = $false; Value = $null; Field = "$itemPath.$name" }
+                if ($null -eq $elementFailure) {
+                    foreach ($name in $itemKeys) {
+                        if (-not $element.PSObject.Properties[$name]) {
+                            $elementFailure = @{ Ok = $false; Value = $null; Field = "$itemPath.$name"; Reason = 'missingKey' }
+                            break
+                        }
                     }
                 }
                 $record = @{}
-                foreach ($name in $itemKeys) {
-                    $fieldSpec = $itemSchema.Fields[$name]
-                    if ($null -eq $fieldSpec) {
-                        return @{ Ok = $false; Value = $null; Field = "$itemPath.$name" }
+                if ($null -eq $elementFailure) {
+                    foreach ($name in $itemKeys) {
+                        $fieldSpec = $itemSchema.Fields[$name]
+                        if ($null -eq $fieldSpec) {
+                            $elementFailure = @{ Ok = $false; Value = $null; Field = "$itemPath.$name"; Reason = 'noFieldRule' }
+                            break
+                        }
+                        $converted = ConvertTo-AgentMarkerFieldValue -Spec $fieldSpec `
+                            -Value $element.PSObject.Properties[$name].Value -Depth ($Depth + 1) `
+                            -Path "$itemPath.$name"
+                        if (-not $converted.Ok) {
+                            $field = if ([string]$converted.Field) { [string]$converted.Field } else { "$itemPath.$name" }
+                            $elementFailure = @{ Ok = $false; Value = $null; Field = $field; Reason = 'fieldRule' }
+                            break
+                        }
+                        $record[$name] = $converted.Value
                     }
-                    $converted = ConvertTo-AgentMarkerFieldValue -Spec $fieldSpec `
-                        -Value $element.PSObject.Properties[$name].Value -Depth ($Depth + 1) `
-                        -Path "$itemPath.$name"
-                    if (-not $converted.Ok) { return $converted }
-                    $record[$name] = $converted.Value
+                }
+                if ($null -ne $elementFailure) {
+                    if (-not $dropBadElements) {
+                        return @{ Ok = $false; Value = $null; Field = [string]$elementFailure.Field }
+                    }
+                    [void]$dropped.Add(@{
+                            Index = $itemIndex
+                            Field = [string]$elementFailure.Field
+                            Reason = [string]$elementFailure.Reason
+                        })
+                    continue
                 }
                 [void]$out.Add($record)
             }
-            return @{ Ok = $true; Value = $out.ToArray() }
+            return @{ Ok = $true; Value = $out.ToArray(); DroppedElements = @($dropped.ToArray()) }
         }
         "object" {
             if ($Value -isnot [System.Management.Automation.PSCustomObject]) { return $bad }
@@ -1037,7 +1101,7 @@ function Get-AgentResultMarkerOutcome {
         [scriptblock]$CandidateNormalizer
     )
     $mk = {
-        param([string]$Status, $Value, $Field, [string]$Reason, [object[]]$NormalizedFields = @())
+        param([string]$Status, $Value, $Field, [string]$Reason, [object[]]$NormalizedFields = @(), [object[]]$DroppedElements = @())
         return @{
             Status           = $Status
             Value            = $Value
@@ -1045,6 +1109,10 @@ function Get-AgentResultMarkerOutcome {
             Retryable        = (Test-AgentMarkerStatusRetryable -Status $Status)
             Reason           = $Reason
             NormalizedFields = @($NormalizedFields)
+            # Elements an opted-in array field withheld rather than failing the
+            # whole marker over. Always reported: a caller that cannot see them
+            # would read a shortened list as a complete one.
+            DroppedElements  = @($DroppedElements)
         }
     }
     try {
@@ -1244,6 +1312,7 @@ function Get-AgentResultMarkerOutcome {
         }
 
         $out = @{}
+        $allDropped = [System.Collections.Generic.List[object]]::new()
         foreach ($name in $allowedKeys) {
             $spec = $Schema.Fields[$name]
             if ($null -eq $spec) {
@@ -1258,9 +1327,12 @@ function Get-AgentResultMarkerOutcome {
                 $field = if ([string]$converted.Field) { [string]$converted.Field } else { $name }
                 return (& $mk $status $null $field "The marker field '$field' failed its typed schema rule." @($allNormalizations))
             }
+            if ($converted -is [hashtable] -and $converted.ContainsKey('DroppedElements')) {
+                foreach ($drop in @($converted.DroppedElements)) { [void]$allDropped.Add($drop) }
+            }
             $out[$name] = $converted.Value
         }
-        return (& $mk $script:AgentMarkerStatus.Success $out $null "" @($allNormalizations))
+        return (& $mk $script:AgentMarkerStatus.Success $out $null "" @($allNormalizations) @($allDropped.ToArray()))
     }
     catch {
         return (& $mk $script:AgentMarkerStatus.MalformedMarker $null $null "The marker could not be parsed: $($_.Exception.Message)")

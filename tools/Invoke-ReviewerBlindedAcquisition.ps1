@@ -1610,21 +1610,26 @@ if ($Role -eq 'verifier') {
     catch { throw "The sealed discovery marker body is not valid JSON; provenance cannot be established." }
     $specialistCandidates = @()
     if ($discoverySourceRole -ceq 'specialist') {
-        if ($discoveryPrefix -cne [string]$script:ReviewerConventionSpecialistMarkerPrefix) {
+        $specialistContractVersion = Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryMarkerText
+        $expectedSpecialistPrefix = Get-ReviewerConventionSpecialistMarkerPrefixForVersion `
+            -ContractVersion $specialistContractVersion
+        if ($discoveryPrefix -cne $expectedSpecialistPrefix) {
             throw "The sealed specialist package does not use the exact production convention result-marker prefix."
         }
         $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
-            -ExpectedProject ([string]$planTarget.project) -ExpectedNonce ([string]$discoveryCore.nonce)
+            -ExpectedProject ([string]$planTarget.project) -ExpectedNonce ([string]$discoveryCore.nonce) `
+            -ContractVersion $specialistContractVersion
         # The SPECIALIST parser, not the generic one. The generic reader has no
         # normalizer, so a schema-valid specialist marker whose
         # changedCodeFix.evidenceFactIds is an empty array - which the specialist
-        # contract explicitly supports - is rejected here while production
+        # contract explicitly supports - loses its candidate here while production
         # accepts it. That divergence would refuse authentic sealed packages,
         # and, being a refusal, would look like a provenance failure rather than
         # a parser mismatch.
         $specialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
             -StdOutText $discoveryMarkerText `
-            -Schema $specialistSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+            -Schema $specialistSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars) `
+            -ContractVersion $specialistContractVersion
         if ([string]$specialistOutcome.Status -cne 'success') {
             throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
         }

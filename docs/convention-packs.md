@@ -166,11 +166,28 @@ summary, vote, pass-completion accounting, or promotion path.
 The specialist receives only the dedicated prompt, the sealed fact and
 convention plans, exact convention text re-resolved at each recorded commit and
 SHA-256, the pinned changed-file records, sanitized thread metadata, and two
-read-only tools: pull-request and repository-file reads. Its nonce-bound
-`CONVENTION_REVIEW_RESULT_V2` marker permits `suggestion` and `important`
-convention candidates only. Wrapper validation rechecks source quotes, pack
-membership, fact IDs, severity rules, sibling evidence, and current changed-file
-anchors. Invalid anchors are withheld rather than relocated.
+read-only tools: pull-request and repository-file reads.
+
+Two nonce-bound result contracts are supported. Contract v2 is frozen and
+retained as a read-only compatibility contract for sealed transcripts and
+previews already on disk; it keeps the historical shape in which a candidate
+retyped its anchor and source provenance. Contract v3 is the live specialist
+contract. Its candidates no longer restate file path, line, pack name, or
+rule-source provenance: the wrapper derives the anchor from `primaryTarget` and
+derives provenance from `ruleRef` (`rs0`, `rs1`, ...), the requested rule row the
+candidate is about. Candidate `factIds` may cite either review facts (`rf1:`) or
+declaration-census facts (`rdf1:`). Both contracts permit `suggestion` and
+`important` convention candidates only. Wrapper validation rechecks source
+quotes, pack membership, fact IDs, severity rules, sibling evidence, and current
+changed-file anchors. Invalid anchors are withheld rather than relocated.
+
+Contract v3 also opts the candidate array into per-element degradation. One
+unreadable candidate is reported through `DroppedElements` and becomes a
+`withheld` entry with reason `schemaInvalidCandidate`; it does not discard the
+whole marker or the other candidates. Binding fields stay marker-atomic, and
+structural failures such as a non-array, excessive item count, malformed element
+schema, or wrong top-level binding still fail closed. Dropped elements are always
+reported so a shortened candidate list is never read as a clean review.
 
 Each candidate carries two exact remediation parts. `changedCodeFix` is the
 required stop-the-bleed action on sealed changed constructs. It identifies the
@@ -242,6 +259,15 @@ any attribute means:
 `constructFileSummaries` additionally counts how often each attribute appears
 across each whole file, so "the surrounding code already does this" is a number
 rather than an impression.
+
+The `bpm-test-ownership` capability is generic convention evidence, not a
+hardcoded parser rule. When a transported rule requires an owner attribute on
+test classes and test methods, the specialist applies that text to changed
+declarations. Combined attribute lists and `DataTestMethod`/`DataRow` forms are
+in scope because the wrapper reports declaration attributes as syntax facts. If
+the required declaration context is unavailable - for example a truncated
+attribute list, undelivered lines, an unlexable file, or construct caps hit - the
+row is `unknown`, not `compliant`, and no finding is emitted.
 
 The enumeration decides *shape*, never *meaning*. It cannot declare a violation:
 only the transported rule text, read by the model, decides whether a construct
