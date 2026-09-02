@@ -1417,21 +1417,30 @@ function ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome {
                 for ($rowIndex = 0; $rowIndex -lt $rows.Count; $rowIndex++) {
                     $row = $rows[$rowIndex]
                     if ($row -isnot [System.Management.Automation.PSCustomObject]) { continue }
-                    if (-not $row.PSObject.Properties['notes']) {
+                    # Absent, `null`, or any other non-array shape are the SAME
+                    # repair. A `notes` value that is not an array fails the
+                    # field rule, and because a bad field fails its whole
+                    # element, that would drop the entire row - every construct
+                    # verdict in it - over a sentence list. `"notes": null` is
+                    # what a model most often writes for "no notes", so the one
+                    # surface this contract promised could never cost a finding
+                    # would have been the easiest way to lose one.
+                    $notesProperty = $row.PSObject.Properties['notes']
+                    if (-not $notesProperty -or $notesProperty.Value -isnot [System.Object[]]) {
                         $field = "assessments[$rowIndex].notes"
+                        $from = $(if (-not $notesProperty) { 'absent' } else { 'notAnArray' })
                         Add-Member -InputObject $row -NotePropertyName 'notes' `
                             -NotePropertyValue @() -Force
                         [void]$normalizedFields.Add([ordered]@{
                                 Field = $field
-                                From = 'absent'
+                                From = $from
                                 To = 'emptyArray'
-                                OriginalTypedReason = ("The marker omitted the non-eligibility-critical key " +
-                                    "'$field'; the row's verdicts are unaffected.")
+                                OriginalTypedReason = ("The non-eligibility-critical key '$field' was " +
+                                    "unreadable ($from); the row's verdicts are unaffected.")
                             })
                         continue
                     }
-                    if ($row.PSObject.Properties['notes'].Value -isnot [System.Object[]]) { continue }
-                    $notes = [System.Object[]]$row.PSObject.Properties['notes'].Value
+                    $notes = [System.Object[]]$notesProperty.Value
                     for ($noteIndex = 0; $noteIndex -lt $notes.Count; $noteIndex++) {
                         $note = $notes[$noteIndex]
                         if ($note -isnot [System.Management.Automation.PSCustomObject]) { continue }

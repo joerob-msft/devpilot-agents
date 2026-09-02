@@ -1217,6 +1217,49 @@ Assert-Owner (($ownerBadNoteAnchors -join ',') -ceq ($ownerExpectedAnchors -join
 Assert-Owner ([bool]$ownerBadNotes.RuleCoverage.Complete) `
     "Unusable prose broke the rule accounting."
 
+# The `notes` VALUE itself, not just one note, must be unable to cost a row.
+# `"notes": null` is what a model most often writes for "no notes", and a
+# non-array there fails the field rule - which fails the whole assessment
+# element and would silently take every construct verdict in the row with it.
+# Absent, null, a string and an object are all the same repair.
+$ownerNotesSchema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject 'One' `
+    -ExpectedNonce ('n' * 32) -ContractVersion 4
+# Built by explicit adds rather than an array expression: one of these shapes IS
+# a null, and wrapping a null in @() is exactly the phantom-element hazard the
+# repository's own analyzer refuses.
+$ownerNotesShapes = [System.Collections.Generic.List[object]]::new()
+[void]$ownerNotesShapes.Add(@{ Label = 'null'; Value = $null })
+[void]$ownerNotesShapes.Add(@{ Label = 'a string'; Value = 'none' })
+[void]$ownerNotesShapes.Add(@{ Label = 'an object'; Value = ([pscustomobject]@{ constructRef = 'dc2' }) })
+foreach ($shape in $ownerNotesShapes) {
+    $notesRow = [ordered]@{
+        ruleRef = 'rs0'
+        constructs = @(@{ constructRef = 'dc2'; verdict = 'violation' })
+        notes = $shape.Value
+    }
+    $notesMarker = [ordered]@{
+        schemaVersion = 4; prId = 16991680
+        repositoryId = '11111111-2222-3333-4444-555555555555'; project = 'One'
+        reviewedSourceCommit = ('a' * 40); targetCommit = ('b' * 40); changeSetDigest = ('c' * 64)
+        conventionPlanSha256 = ('d' * 64); factPlanSha256 = ('e' * 64); configSha256 = ('f' * 64)
+        scriptSha256 = ('0' * 64); promptSha256 = ('1' * 64)
+        assessments = @($notesRow); withheld = @(); residualRisks = @(); nonce = ('n' * 32)
+    }
+    $notesText = 'CONVENTION_REVIEW_RESULT_V4: ' + ($notesMarker | ConvertTo-Json -Depth 16 -Compress)
+    $notesOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome -StdOutText $notesText `
+        -Schema $ownerNotesSchema -ContractVersion 4
+    Assert-Owner ([string]$notesOutcome.Status -ceq 'success') `
+        "A marker whose notes value was $($shape.Label) was refused outright."
+    if ([string]$notesOutcome.Status -ceq 'success') {
+        Assert-Owner (@($notesOutcome.Value.assessments).Count -eq 1) `
+            "A notes value of $($shape.Label) dropped its whole rule row, taking the row's construct verdicts with it."
+        if (@($notesOutcome.Value.assessments).Count -eq 1) {
+            Assert-Owner (@(@($notesOutcome.Value.assessments)[0].constructs).Count -eq 1) `
+                "A notes value of $($shape.Label) cost the row its construct verdict."
+        }
+    }
+}
+
 if ($script:OwnerFailures.Count -gt 0) {
     foreach ($failure in $script:OwnerFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }
     throw "bpm-test-ownership: $($script:OwnerFailures.Count) of $script:OwnerChecks check(s) failed."
