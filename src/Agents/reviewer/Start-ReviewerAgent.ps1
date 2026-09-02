@@ -10979,18 +10979,17 @@ function Invoke-ReviewerConventionSpecialistPass {
                     # hard-coded description of one normalization kind mislabels
                     # every other kind - and rendering only the first entry hides
                     # the rest behind whichever happened to be added first.
-                    $normalizations = @($markerOutcome.NormalizedFields)
-                    $markerDetail = [string]$normalizations[0].Field
-                    $described = @($normalizations | ForEach-Object {
-                            $from = [string]$_.From
-                            $what = switch ($from) {
-                                'emptyJsonArray' { "an exact empty JSON array to the schema's empty string" }
-                                'absentUnderCheckedSiblingStatus' { "an absent reason to the empty string the checked sibling status requires" }
-                                default { "'$from' to '$([string]$_.To)'" }
-                            }
-                            "$what at '$([string]$_.Field)' (original typed reason: $([string]$_.OriginalTypedReason))"
-                        })
-                    $markerReason = "Compatibility-normalized $($normalizations.Count) field(s): " + ($described -join '; ')
+                    #
+                    # The rendering itself lives in a tested function. It used to
+                    # be inline here and read `$_` inside a `switch`, where
+                    # PowerShell rebinds `$_` to the switch's own input; the read
+                    # therefore reached a plain string and threw under StrictMode
+                    # for any kind that fell to the default arm. A live
+                    # qualification trial lost a complete, correct pass to it.
+                    $summary = Format-ReviewerConventionSpecialistNormalizations `
+                        -Normalizations @($markerOutcome.NormalizedFields)
+                    $markerDetail = [string]$summary.Detail
+                    $markerReason = [string]$summary.Reason
                 }
                 & $emitSpecialistAcct $specialistAttempt $nonce $specialistMarkerStatus $specialistModelRan $specialistUsage `
                     $markerReason $markerDetail

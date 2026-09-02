@@ -1313,6 +1313,198 @@ Assert-Owner ([string]$ownerRiskRead.Status -ceq 'success' -and
     [string]@($ownerRiskRead.Value.residualRisks)[0].text -ceq 'Two files were only partially delivered.') `
     "A bare-string residual risk was not read as the caveat text it plainly is."
 
+# ---------------------------------------------------------------------------
+# The normalization describer.
+#
+# A describer is commentary. It may never be the reason a finding is lost - and
+# it once was: the reviewer rendered this ledger inline and read `$_` inside a
+# `switch`, where PowerShell has rebound `$_` to the switch's own input. The
+# read reached a plain string and threw under StrictMode for any kind that fell
+# to the default arm. The two named arms never touched `$_`, so the fault sat
+# unreachable until v4 emitted a kind neither of them named. The first live
+# trial that needed one lost a complete, correct pass: 30 construct verdicts
+# including all nine violations, discarded while describing a footnote.
+#
+# These checks are exhaustive over the kinds actually emitted, and they assert
+# the property that matters: the describer CANNOT throw, whatever it is handed.
+# ---------------------------------------------------------------------------
+$ownerNormalizationKinds = @(
+    @{ From = 'emptyJsonArray'; To = 'emptyString'; Field = 'candidates[0].changedCodeFix.evidenceFactIds' },
+    @{ From = 'absentUnderCheckedSiblingStatus'; To = 'emptyString'; Field = 'candidates[0].siblingNotRequiredReason' },
+    @{ From = 'bareString'; To = 'textObject'; Field = 'residualRisks[0]' },
+    @{ From = 'absent'; To = 'emptyArray'; Field = 'assessments[0].notes' },
+    @{ From = 'notAnArray'; To = 'emptyArray'; Field = 'residualRisks' },
+    @{ From = 'absent'; To = 'emptyString'; Field = 'assessments[0].notes[0].rationale' }
+)
+foreach ($kind in $ownerNormalizationKinds) {
+    $record = [ordered]@{
+        Field = [string]$kind.Field; From = [string]$kind.From; To = [string]$kind.To
+        OriginalTypedReason = 'the typed reason'
+    }
+    $summary = $null
+    $threw = ''
+    try { $summary = Format-ReviewerConventionSpecialistNormalizations -Normalizations @($record) }
+    catch { $threw = $_.Exception.Message }
+    Assert-Owner (-not $threw) "Describing normalization kind '$($kind.From)' threw: $threw"
+    if (-not $threw) {
+        Assert-Owner ([string]$summary.Detail -ceq [string]$kind.Field) `
+            "Describing '$($kind.From)' did not lead with its field."
+        Assert-Owner (([string]$summary.Reason).Contains([string]$kind.Field)) `
+            "Describing '$($kind.From)' did not name the field it altered."
+        Assert-Owner (([string]$summary.Reason).Contains('the typed reason')) `
+            "Describing '$($kind.From)' dropped the original typed reason."
+        # Named by what it ACTUALLY was: a kind must never be rendered with
+        # another kind's words.
+        foreach ($other in $ownerNormalizationKinds) {
+            if ([string]$other.From -ceq [string]$kind.From) { continue }
+            if ([string]$other.To -ceq [string]$kind.To) { continue }
+            Assert-Owner (-not ([string]$summary.Reason).Contains("'$([string]$other.To)'")) `
+                "Describing '$($kind.From)' borrowed the words of '$($other.From)'."
+        }
+    }
+}
+
+# Co-occurrence: every record is rendered, not just the first, and the count is
+# the real count. Rendering only the first hides the rest behind whichever
+# happened to be added first.
+$ownerAllRecords = @($ownerNormalizationKinds | ForEach-Object {
+        [ordered]@{ Field = [string]$_.Field; From = [string]$_.From; To = [string]$_.To; OriginalTypedReason = 'r' }
+    })
+$ownerCoSummary = $null
+$ownerCoThrew = ''
+try { $ownerCoSummary = Format-ReviewerConventionSpecialistNormalizations -Normalizations $ownerAllRecords }
+catch { $ownerCoThrew = $_.Exception.Message }
+Assert-Owner (-not $ownerCoThrew) "Describing $($ownerAllRecords.Count) co-occurring normalizations threw: $ownerCoThrew"
+if (-not $ownerCoThrew) {
+    Assert-Owner ([int]$ownerCoSummary.NormalizedCount -eq $ownerAllRecords.Count) `
+        "The describer counted $([int]$ownerCoSummary.NormalizedCount) of $($ownerAllRecords.Count) co-occurring normalizations."
+    foreach ($kind in $ownerNormalizationKinds) {
+        Assert-Owner (([string]$ownerCoSummary.Reason).Contains([string]$kind.Field)) `
+            "Co-occurring description hid the normalization at '$($kind.Field)'."
+    }
+}
+
+# It must not throw for a record it has never seen: an unknown kind, a record
+# missing keys, an empty record, or an empty ledger. A describer that can throw
+# on an unexpected shape is the defect, not the shape.
+$ownerHostileRecords = [System.Collections.Generic.List[object]]::new()
+[void]$ownerHostileRecords.Add([ordered]@{ Field = 'x'; From = 'aKindNobodyHasWrittenYet'; To = 'y'; OriginalTypedReason = 'r' })
+[void]$ownerHostileRecords.Add([ordered]@{ Field = 'x' })
+[void]$ownerHostileRecords.Add([ordered]@{ From = 'bareString' })
+[void]$ownerHostileRecords.Add([ordered]@{})
+[void]$ownerHostileRecords.Add(([pscustomobject]@{ Field = 'x'; From = 'absent' }))
+foreach ($hostile in $ownerHostileRecords) {
+    $threw = ''
+    try { [void](Format-ReviewerConventionSpecialistNormalizations -Normalizations @($hostile)) }
+    catch { $threw = $_.Exception.Message }
+    Assert-Owner (-not $threw) "The describer threw on a record shape it does not recognise: $threw"
+}
+$threw = ''
+try {
+    $emptySummary = Format-ReviewerConventionSpecialistNormalizations -Normalizations @()
+    Assert-Owner ([int]$emptySummary.NormalizedCount -eq 0 -and [string]$emptySummary.Reason -ceq '') `
+        'An empty normalization ledger did not describe as nothing.'
+}
+catch { $threw = $_.Exception.Message }
+Assert-Owner (-not $threw) "The describer threw on an empty ledger: $threw"
+
+# The property the live miss violated: describing cannot change what was found.
+# Resolve the same matrix twice - once from a marker that needs no normalization
+# and once from one that needs several - and require identical coverage.
+$ownerNoNormalize = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs (New-OwnerV4Matrix -Violating $ownerNine) -Notes @())
+$ownerNeedsNormalize = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs (New-OwnerV4Matrix -Violating $ownerNine))
+Assert-Owner (((Get-OwnerUnionAnchors -Candidates @($ownerNoNormalize.Candidates)) -join ',') -ceq
+    ((Get-OwnerUnionAnchors -Candidates @($ownerNeedsNormalize.Candidates)) -join ',')) `
+    'Normalizing a field changed which constructs were found.'
+Assert-Owner ([bool]$ownerNoNormalize.RuleCoverage.Complete -eq [bool]$ownerNeedsNormalize.RuleCoverage.Complete) `
+    'Normalizing a field changed the rule accounting.'
+Assert-Owner (@($ownerNoNormalize.Candidates).Count -eq @($ownerNeedsNormalize.Candidates).Count) `
+    'Normalizing a field changed how many candidates were published.'
+
+# And the shape hazard itself, repo-wide: no switch arm may read a member off a
+# `$_` the switch has rebound. `catch` and nested script blocks bind their own
+# `$_` and are not hazardous; only a read whose nearest binder is the switch is.
+$ownerSwitchHazards = [System.Collections.Generic.List[string]]::new()
+foreach ($sourceFile in @(Get-ChildItem -Path (Join-Path $RepoRoot 'src\Agents\reviewer') -Recurse -File -Include *.ps1)) {
+    $sourceTokens = $null
+    $sourceErrors = $null
+    $sourceAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $sourceFile.FullName, [ref]$sourceTokens, [ref]$sourceErrors)
+    if (@($sourceErrors).Count -gt 0) { continue }
+    foreach ($switchAst in $sourceAst.FindAll({
+                param($node) $node -is [System.Management.Automation.Language.SwitchStatementAst]
+            }, $true)) {
+        $armBodies = [System.Collections.Generic.List[object]]::new()
+        foreach ($clause in @($switchAst.Clauses)) { [void]$armBodies.Add($clause.Item2) }
+        if ($null -ne $switchAst.Default) { [void]$armBodies.Add($switchAst.Default) }
+        foreach ($armBody in $armBodies) {
+            if ($null -eq $armBody) { continue }
+            foreach ($memberRead in $armBody.FindAll({
+                        param($node)
+                        $node -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                        $node.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                        ([string]$node.Expression.VariablePath.UserPath) -in @('_', 'PSItem')
+                    }, $true)) {
+                $binder = $memberRead.Parent
+                $ownedBySwitch = $true
+                while ($null -ne $binder -and $binder -ne $switchAst) {
+                    if ($binder -is [System.Management.Automation.Language.CatchClauseAst]) {
+                        $ownedBySwitch = $false
+                        break
+                    }
+                    # A script block only rebinds `$_` when something BINDS it to
+                    # a pipeline - `ForEach-Object`, `Where-Object`, `.ForEach{}`,
+                    # `.Where{}`. A block merely invoked in the arm (`& { $_.X }`)
+                    # still sees the switch's `$_` and would throw, so excluding
+                    # every script block would blind this guard to exactly that.
+                    if ($binder -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+                        $binderParent = $binder.Parent
+                        $rebinds = $false
+                        if ($binderParent -is [System.Management.Automation.Language.CommandAst]) {
+                            $commandName = [string]$binderParent.GetCommandName()
+                            $rebinds = ($commandName -iin @('ForEach-Object', 'Where-Object', 'foreach', 'where', '%', '?'))
+                        }
+                        elseif ($binderParent -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) {
+                            $rebinds = ([string]$binderParent.Member.Value -iin @('ForEach', 'Where'))
+                        }
+                        if ($rebinds) {
+                            $ownedBySwitch = $false
+                            break
+                        }
+                    }
+                    $binder = $binder.Parent
+                }
+                if (-not $ownedBySwitch) { continue }
+                [void]$ownerSwitchHazards.Add(
+                    "$($sourceFile.Name):$($memberRead.Extent.StartLineNumber) reads $($memberRead.Extent.Text)")
+            }
+        }
+    }
+}
+Assert-Owner ($ownerSwitchHazards.Count -eq 0) `
+    ("A switch arm reads a member off a `$_ the switch rebound, which throws under StrictMode: " +
+    (@($ownerSwitchHazards | Select-Object -First 4) -join '; '))
+
+# `unknown` is the answer this contract asks a model to give when it genuinely
+# cannot decide, so being honest must not cost the pass its accounting. The
+# coverage reconciler derives a row's status from its anchors and counts a
+# headline that contradicts them as a DEGRADED row, zeroing `Complete`. The
+# wrapper therefore has to derive the row status by exactly the reconciler's own
+# rule - any unknown anchor makes the row unknown - or it disagrees with itself.
+# Two of the eight preserved live answers used `unknown` verdicts and lost their
+# accounting to precisely that disagreement.
+$ownerMixed = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs (New-OwnerV4Matrix -Violating $ownerNine `
+            -Override @{ dc0 = 'unknown'; dc11 = 'unknown' }))
+Assert-Owner ([bool]$ownerMixed.RuleCoverage.Complete) `
+    'A row mixing violations with honest unknown verdicts lost its rule accounting.'
+Assert-Owner ([int]$ownerMixed.RuleCoverage.DegradedRowCount -eq 0) `
+    "A row mixing violations with unknown verdicts was degraded ($([int]$ownerMixed.RuleCoverage.DegradedRowCount) row(s))."
+Assert-Owner ([string]@($ownerMixed.RuleCoverage.Rows)[0].status -ceq 'unknown') `
+    "A row carrying unknown anchors did not derive status 'unknown' (got '$([string]@($ownerMixed.RuleCoverage.Rows)[0].status)')."
+$ownerMixedAnchors = Get-OwnerUnionAnchors -Candidates @($ownerMixed.Candidates)
+Assert-Owner (($ownerMixedAnchors -join ',') -ceq ($ownerExpectedAnchors -join ',')) `
+    'Honest unknown verdicts cost the pass its violating-construct coverage.'
+
 if ($script:OwnerFailures.Count -gt 0) {
     foreach ($failure in $script:OwnerFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }
     throw "bpm-test-ownership: $($script:OwnerFailures.Count) of $script:OwnerChecks check(s) failed."

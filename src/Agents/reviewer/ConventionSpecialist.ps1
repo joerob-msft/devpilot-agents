@@ -2596,6 +2596,59 @@ function Get-ReviewerConventionSpecialistSafeProse {
     return $value
 }
 
+function Format-ReviewerConventionSpecialistNormalizations {
+    <#
+        The human sentence that records what the wrapper altered in a
+        model-owned field, and the field name that leads it.
+
+        Extracted from the reviewer's inline pipeline because an inline block is
+        not testable, and an untestable describer is exactly how this layer came
+        to hold a defect that could destroy a correct pass. The original read
+        `$_.To` inside a `switch`, where PowerShell has rebound `$_` to the
+        switch's own input - so the read reached a plain string and threw under
+        StrictMode. The two named arms never touched `$_`, so the fault sat
+        unreachable until a contract emitted a normalization kind that fell to
+        `default`. The first one that did cost a live qualification trial its
+        entire pass, and the answer it destroyed was correct.
+
+        So this function has two properties, and both are asserted by tests:
+        it names every kind by what it ACTUALLY was, and it CANNOT throw. Every
+        field is read through the tolerant accessor, so a record missing any key
+        - or carrying a kind nobody has written yet - still describes. A
+        description is commentary; it may never be the reason a finding is lost.
+    #>
+    param([AllowEmptyCollection()][object[]]$Normalizations = @())
+    $records = @($Normalizations)
+    if ($records.Count -eq 0) {     return @{ Detail = ""; Reason = ""; NormalizedCount = 0 } }
+    $described = [System.Collections.Generic.List[string]]::new()
+    foreach ($normalization in $records) {
+        $from = [string](Get-ReviewerConventionSpecialistValue $normalization "From" "")
+        $to = [string](Get-ReviewerConventionSpecialistValue $normalization "To" "")
+        $field = [string](Get-ReviewerConventionSpecialistValue $normalization "Field" "")
+        $typed = [string](Get-ReviewerConventionSpecialistValue $normalization "OriginalTypedReason" "")
+        # Named by what it was. A hard-coded description of one kind mislabels
+        # every other kind, which is worse than saying nothing.
+        $what = switch ($from) {
+            'emptyJsonArray' { "an exact empty JSON array to the schema's empty string" }
+            'absentUnderCheckedSiblingStatus' { "an absent reason to the empty string the checked sibling status requires" }
+            'bareString' { "a bare string to the object with a text key the schema requires" }
+            'absent' { "an absent key to '$to'" }
+            'notAnArray' { "a value that was not an array to '$to'" }
+            default { "'$from' to '$to'" }
+        }
+        [void]$described.Add("$what at '$field' (original typed reason: $typed)")
+    }
+    return @{
+        Detail = [string](Get-ReviewerConventionSpecialistValue $records[0] "Field" "")
+        Reason = "Compatibility-normalized $($records.Count) field(s): " + ($described -join '; ')
+        # Deliberately NOT named `Count`. On a hashtable that name collides with
+        # the dictionary's own entry count, so a caller reading `.Count` gets one
+        # or the other depending on how the adapter resolves it - and a test that
+        # passes for the wrong reason is worse than no test.
+        NormalizedCount = $records.Count
+    }
+}
+
 function Convert-ReviewerConventionSpecialistV4Marker {
     <#
         A validated version 4 marker, rewritten into the version 3 shape the rest
@@ -2919,9 +2972,19 @@ function Convert-ReviewerConventionSpecialistV4Marker {
                 ruleRef = $ruleRef
                 ruleSourceSha256 = $sourceSha
                 ruleQuote = (Get-ReviewerConventionSpecialistShortened -Text $quote -MaxLength 200)
+                # Derived by EXACTLY the rule the coverage reconciler applies:
+                # any unknown anchor makes the row unknown, then any violation
+                # makes it a violation, then an unweighed row is notApplicable,
+                # else compliant. Authoring anything else here would be the
+                # wrapper disagreeing with itself - and the reconciler counts a
+                # headline that contradicts its own anchors as a degraded row and
+                # zeroes `Complete`. A model that answers `unknown` for a
+                # construct it genuinely could not decide - which this contract
+                # explicitly asks it to do - must not cost the pass its
+                # accounting for having been honest.
                 status = $(if ($defects.Count -gt 0) { "unknown" }
-                    elseif (@($violatingIds).Count -gt 0) { "violation" }
                     elseif ($unknownIds.Count -gt 0) { "unknown" }
+                    elseif (@($violatingIds).Count -gt 0) { "violation" }
                     elseif (@($compliantIds).Count -gt 0) { "compliant" }
                     else { "notApplicable" })
                 scope = $(if ($scopeKinds.Count -gt 0) { (@($scopeKinds.ToArray()) -join ",") } else { "none" })
