@@ -508,8 +508,9 @@ if (Test-Path -LiteralPath $recordedPath) {
     $notRequiredOmitted = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
         -StdOutText ("CONVENTION_REVIEW_RESULT_V3: " + (New-OwnerSiblingMarker -Status 'notRequired' -OmitReason)) `
         -Schema $schemaFor -ContractVersion 3
-    $notRequiredDropped = (@($notRequiredOmitted.DroppedElements) | Where-Object {
-            [string]$_.Field -like '*siblingNotRequiredReason' }).Count -ge 1
+    $notRequiredDrops = @(@($notRequiredOmitted.DroppedElements) | Where-Object {
+            [string]$_.Field -like '*siblingNotRequiredReason' })
+    $notRequiredDropped = ($notRequiredDrops.Count -ge 1)
     Assert-Owner (([string]$notRequiredOmitted.Status -cne 'success') -or $notRequiredDropped) `
         "A notRequired-sibling candidate with NO reason was silently accepted; the wrapper invented content it cannot know."
     if ([string]$notRequiredOmitted.Status -ceq 'success') {
