@@ -1260,6 +1260,59 @@ foreach ($shape in $ownerNotesShapes) {
     }
 }
 
+# A caveat must not be able to discard a verdict either. In the final v4
+# qualification series two of five model starts were spent on markers refused
+# WHOLE because the model wrote residualRisks as bare strings instead of
+# `{text}` objects - nine correct verdicts thrown away over the shape of a
+# footnote. Bare strings are now read as the text they obviously are, and
+# anything still unreadable drops only itself.
+$ownerRiskShapes = [System.Collections.Generic.List[object]]::new()
+[void]$ownerRiskShapes.Add(@{ Label = 'bare strings (the observed live failure)'; Value = @('Some files were only partially delivered.') })
+[void]$ownerRiskShapes.Add(@{ Label = 'null'; Value = $null })
+[void]$ownerRiskShapes.Add(@{ Label = 'a bare string, not an array'; Value = 'partially delivered' })
+[void]$ownerRiskShapes.Add(@{ Label = 'an object missing text'; Value = @([pscustomobject]@{ note = 'wrong key' }) })
+foreach ($shape in $ownerRiskShapes) {
+    $riskMarker = [ordered]@{
+        schemaVersion = 4; prId = 16991680
+        repositoryId = '11111111-2222-3333-4444-555555555555'; project = 'One'
+        reviewedSourceCommit = ('a' * 40); targetCommit = ('b' * 40); changeSetDigest = ('c' * 64)
+        conventionPlanSha256 = ('d' * 64); factPlanSha256 = ('e' * 64); configSha256 = ('f' * 64)
+        scriptSha256 = ('0' * 64); promptSha256 = ('1' * 64)
+        assessments = @([ordered]@{
+                ruleRef = 'rs0'
+                constructs = @(@{ constructRef = 'dc2'; verdict = 'violation' })
+                notes = @()
+            })
+        withheld = @(); residualRisks = $shape.Value; nonce = ('n' * 32)
+    }
+    $riskText = 'CONVENTION_REVIEW_RESULT_V4: ' + ($riskMarker | ConvertTo-Json -Depth 16 -Compress)
+    $riskOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome -StdOutText $riskText `
+        -Schema $ownerNotesSchema -ContractVersion 4
+    Assert-Owner ([string]$riskOutcome.Status -ceq 'success') `
+        "A marker whose residualRisks were $($shape.Label) was refused whole (status '$([string]$riskOutcome.Status)', field '$([string]$riskOutcome.Field)')."
+    if ([string]$riskOutcome.Status -ceq 'success') {
+        Assert-Owner (@($riskOutcome.Value.assessments).Count -eq 1 -and
+            @(@($riskOutcome.Value.assessments)[0].constructs).Count -eq 1) `
+            "residualRisks of shape '$($shape.Label)' cost the marker its construct verdict."
+    }
+}
+# The bare-string form must be READ, not merely survived - the caveat is real
+# content and dropping it would lose a stated limitation.
+$ownerRiskRead = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome -ContractVersion 4 `
+    -Schema $ownerNotesSchema -StdOutText ('CONVENTION_REVIEW_RESULT_V4: ' + ([ordered]@{
+                schemaVersion = 4; prId = 16991680
+                repositoryId = '11111111-2222-3333-4444-555555555555'; project = 'One'
+                reviewedSourceCommit = ('a' * 40); targetCommit = ('b' * 40); changeSetDigest = ('c' * 64)
+                conventionPlanSha256 = ('d' * 64); factPlanSha256 = ('e' * 64); configSha256 = ('f' * 64)
+                scriptSha256 = ('0' * 64); promptSha256 = ('1' * 64)
+                assessments = @(); withheld = @()
+                residualRisks = @('Two files were only partially delivered.')
+                nonce = ('n' * 32)
+            } | ConvertTo-Json -Depth 16 -Compress))
+Assert-Owner ([string]$ownerRiskRead.Status -ceq 'success' -and
+    [string]@($ownerRiskRead.Value.residualRisks)[0].text -ceq 'Two files were only partially delivered.') `
+    "A bare-string residual risk was not read as the caveat text it plainly is."
+
 if ($script:OwnerFailures.Count -gt 0) {
     foreach ($failure in $script:OwnerFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }
     throw "bpm-test-ownership: $($script:OwnerFailures.Count) of $script:OwnerChecks check(s) failed."

@@ -1074,6 +1074,12 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                 }
                 withheld = @{
                     Type = "objectArray"; MaxItems = 24
+                    # `drop`, for the same reason the notes array is. A withheld
+                    # entry is the model reporting its OWN limitation; it is not
+                    # a finding, and it must not be able to discard nine correct
+                    # verdicts by being malformed. The drop is itself reported,
+                    # so a lost self-report is visible rather than silent.
+                    ElementFailurePolicy = "drop"
                     Item = @{
                         Keys = @("candidateId", "reason", "detail")
                         Fields = @{
@@ -1083,11 +1089,20 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         }
                     }
                 }
+                # A residual risk is a caveat, not a verdict. Under versions 2
+                # and 3 a malformed one failed the WHOLE marker - and in the
+                # final v4 qualification series that is exactly what happened
+                # twice, costing two of five model starts, because the model
+                # wrote the risks as bare strings instead of `{text}` objects.
+                # Nine correct verdicts were discarded over the shape of a
+                # footnote. The normalizer now coerces a bare string, and
+                # anything still unreadable drops itself.
                 residualRisks = @{
-                    Type = "objectArray"; MaxItems = 8
+                    Type = "objectArray"; MaxItems = 12
+                    ElementFailurePolicy = "drop"
                     Item = @{
                         Keys = @("text")
-                        Fields = @{ text = @{ Type = "string"; MaxLength = 400; Pattern = $ascii; NormalizeTypography = $true } }
+                        Fields = @{ text = @{ Type = "string"; MaxLength = 800; Pattern = $ascii; NormalizeTypography = $true } }
                     }
                 }
                 nonce = @{ Type = "exact"; Expected = $ExpectedNonce }
@@ -1412,6 +1427,39 @@ function ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome {
             # exactly. Prose is the last one left, and this is why it cannot join
             # them.
             $assessmentsProperty = $MarkerCandidate.PSObject.Properties['assessments']
+            # A residual risk is a caveat the model writes in prose. Two of the
+            # five starts in the final qualification series were spent on markers
+            # refused whole because these arrived as bare strings rather than
+            # `{text}` objects - nine correct verdicts discarded over the shape
+            # of a footnote. The obvious intent is recoverable, so recover it.
+            $risksProperty = $MarkerCandidate.PSObject.Properties['residualRisks']
+            if (-not $risksProperty -or $risksProperty.Value -isnot [System.Object[]]) {
+                $from = $(if (-not $risksProperty) { 'absent' } else { 'notAnArray' })
+                Add-Member -InputObject $MarkerCandidate -NotePropertyName 'residualRisks' `
+                    -NotePropertyValue @() -Force
+                [void]$normalizedFields.Add([ordered]@{
+                        Field = 'residualRisks'
+                        From = $from
+                        To = 'emptyArray'
+                        OriginalTypedReason = ("The non-eligibility-critical key 'residualRisks' was " +
+                            "unreadable ($from); no verdict is affected.")
+                    })
+            }
+            else {
+                $risks = [System.Object[]]$risksProperty.Value
+                for ($riskIndex = 0; $riskIndex -lt $risks.Count; $riskIndex++) {
+                    if ($risks[$riskIndex] -isnot [string]) { continue }
+                    $field = "residualRisks[$riskIndex]"
+                    $risks[$riskIndex] = [pscustomobject]@{ text = [string]$risks[$riskIndex] }
+                    [void]$normalizedFields.Add([ordered]@{
+                            Field = $field
+                            From = 'bareString'
+                            To = 'textObject'
+                            OriginalTypedReason = ("The marker wrote '$field' as a bare string rather than " +
+                                "an object with a 'text' key; it was read as that text.")
+                        })
+                }
+            }
             if ($assessmentsProperty -and $assessmentsProperty.Value -is [System.Object[]]) {
                 $rows = [System.Object[]]$assessmentsProperty.Value
                 for ($rowIndex = 0; $rowIndex -lt $rows.Count; $rowIndex++) {
