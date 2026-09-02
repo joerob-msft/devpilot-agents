@@ -52,10 +52,10 @@ not a candidate. Do not invent a resolution.
    established, or unchanged siblings demonstrate the proposed API usage is
    accepted. Record the source/fact/precedent evidence; do not rely on memorized
    repository lore. For adoption-dependent annotations or metadata, including
-   ownership metadata, `notRequired` is never valid: use `checked` with concrete
-   unchanged-sibling evidence, or emit `missingSiblingEvidence` as a withheld
-   diagnostic. Inability to read siblings is not a reason that a sibling check
-   is unnecessary.
+   ownership metadata, `notRequired` is never valid unless the required row says
+   `siblingEvidenceRequired: false`: use `checked` with concrete unchanged-sibling
+   evidence, or emit `missingSiblingEvidence` as a withheld diagnostic. Inability
+   to read siblings is not a reason that a sibling check is unnecessary.
 5. Report only convention findings. Pure style is `suggestion`. `important` is
    permitted only when a documented convention protects build/test execution,
    deployment, security, customer behavior, or compatibility, and the candidate
@@ -74,13 +74,12 @@ not a candidate. Do not invent a resolution.
    a sibling check is not required.
 7. Use `changedFile` only for a current changed file and a positive right-side
    line. The exact normalized path and line must appear in one
-   `ruleCoverageRequest.changedFileAnchors[].rightHandRanges` entry. Set
-   `primaryTarget` to its exact `cf<n>:<line>` target; the wrapper derives the
-   posted file path and line from that target. Put every additional changed-line
-   occurrence of the same semantic issue in `manifestations`, also as exact
-   `cf<n>:<line>` targets, including occurrences in other changed files. The
-   primary is the ordinal-first normalized path, then lowest line, then target
-   id across the full occurrence set; it is always the posted comment location.
+   `ruleCoverageRequest.changedFileAnchors[].rightHandRanges` entry. You may
+   leave `primaryTarget` as an empty string; then list every violating occurrence
+   in `manifestations` as exact `cf<n>:<line>` targets, and the wrapper derives
+   the posted anchor from those targets. If you do set `primaryTarget`, it must
+   be the ordinal-first normalized path, then lowest line, then target id across
+   the full occurrence set; put only additional occurrences in `manifestations`.
    Never relocate an invalid anchor or invent a construct. Use `prMetadata`
    only for deterministic metadata/template facts, with `primaryTarget`
    exactly `prMetadata`.
@@ -95,6 +94,10 @@ not a candidate. Do not invent a resolution.
     compliant, and says nothing about the four calls beside it that break it.
     `ruleCoverageRequest.requiredRows` names the exact rows you must return -
     one per entry, no more, no fewer, addressed by `ruleRef` (`rs0`, `rs1`, ...).
+    Each row also tells you whether sibling evidence is required. When
+    `siblingEvidenceRequired` is `false`, `locallyAdjudicableConstructs` is the
+    range-compressed set of changed declarations whose own attribute lists the
+    wrapper established.
     `ruleCoverageRequest.changedConstructs` is the wrapper's own enumeration of
     what this change set touched, in four kinds:
     - `invocation` (id `mi*`) - a call that spans more than one line, with
@@ -141,6 +144,11 @@ not a candidate. Do not invent a resolution.
     When required declaration context is unavailable - a truncated attribute
     list, undelivered lines, an unlexable file, or construct caps hit - the
     answer is `unknown`. It is never `compliant`, and it is never a finding.
+    Exception: when the required row says `siblingEvidenceRequired: false`, a
+    changed declaration listed in `locallyAdjudicableConstructs` is adjudicable
+    from its OWN attributes. An incomplete whole-file census does not block that
+    local declaration evidence. `missingSiblingEvidence` applies only where
+    sibling/adoption evidence is the sole basis.
 
     The four lists must be disjoint and together must equal every sealed
     construct id - exactly, no more and no less. Anchors whose kinds are outside
@@ -271,8 +279,9 @@ commentary is rejected before the marker in it is ever read.
 Each candidate has exactly:
 
 `candidateId`, `category` (`convention`), `severity` (`suggestion|important`),
-`anchorKind` (`changedFile|prMetadata`), `primaryTarget`, `manifestations`
-(comma-separated additional exact `cf<n>:<line>` targets, or empty), `ruleRef`
+`anchorKind` (`changedFile|prMetadata`), `primaryTarget` (exact `cf<n>:<line>`,
+`prMetadata`, or empty for wrapper derivation), `manifestations`
+(comma-separated exact `cf<n>:<line>` occurrence targets, or empty), `ruleRef`
 (`rs0`, `rs1`, ... naming the requested rule the candidate is about),
 `ruleSection`, `ruleQuote`,
 `diffEvidence`, `impactCategory`
@@ -305,6 +314,11 @@ When `siblingStatus` is `checked` there is no such reason and the field must be
 empty, so you may simply omit it - the wrapper supplies the empty value and
 records that it did. When `siblingStatus` is `notRequired` the reason is real
 content only you can give, and omitting it withholds the candidate.
+When a candidate's required row says `siblingEvidenceRequired: false`, the
+wrapper owns the sibling status and evidence from local declaration data and
+ignores the values in your candidate. Do not make a sibling-status decision for
+that row; satisfy the marker shape, but base the candidate only on the changed
+declaration's OWN known attributes.
 
 Each withheld item has exactly `candidateId`, `reason`, and `detail`. `reason`
 must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,

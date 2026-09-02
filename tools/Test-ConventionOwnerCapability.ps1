@@ -25,6 +25,7 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
 . (Join-Path $RepoRoot 'src\Agents\reviewer\ChangedConstructs.ps1')
+. (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
 . (Join-Path $RepoRoot 'src\Agents\reviewer\ConventionSpecialist.ps1')
 
 $script:OwnerChecks = 0
@@ -534,6 +535,320 @@ if (Test-Path -LiteralPath $recordedPath) {
     Assert-Owner ([string]$v2Outcome.Status -cne 'success') `
         "Contract v2 accepted a candidate missing siblingNotRequiredReason; v2 is frozen and must not gain the default."
 }
+
+# ---------------------------------------------------------------------------
+# v3 local declaration evidence and wrapper-derived primary targets.
+# ---------------------------------------------------------------------------
+$localRepoId = '11111111-2222-3333-4444-555555555555'
+$localSourceRepoId = '22222222-3333-4444-5555-666666666666'
+$localSourceSha = 'd' * 64
+$localRuleQuote = 'owner attribute on test methods'
+$localSourceText = "Claim ownership: $localRuleQuote must be present."
+$localSource = [pscustomobject][ordered]@{
+    PackName = 'bpm-test-ownership'
+    PackDeclarationEvidence = 'local'
+    SourceId = 'enghub-automated-tests-ownership'
+    TrustTier = 'pinned-external'
+    Organization = 'contoso'
+    Project = 'Guidance'
+    RepositoryId = $localSourceRepoId
+    Path = '/reviewer/conventions/automated-tests.md'
+    CommitSha = 'c' * 40
+    Sha256 = $localSourceSha
+    MimeType = 'text/markdown'
+    ByteLength = $localSourceText.Length
+    Text = $localSourceText
+}
+$localSources = @($localSource)
+$localPlan = [pscustomobject][ordered]@{
+    selectedPacks = @([pscustomobject][ordered]@{ name = 'bpm-test-ownership'; declarationEvidence = 'local' })
+}
+$localFactPlan = [pscustomobject][ordered]@{ facts = @() }
+$localHashes = [ordered]@{
+    conventionPlanSha256 = '1' * 64
+    factPlanSha256 = '2' * 64
+    configSha256 = '3' * 64
+    scriptSha256 = '4' * 64
+    promptSha256 = '5' * 64
+}
+
+function New-OwnerLocalCandidate {
+    param(
+        [string]$CandidateId = 'owner-local',
+        [string]$PrimaryTarget = 'cf0:10',
+        [string]$Manifestations = '',
+        [string]$RuleRef = 'rs0',
+        [string]$FixTargets = 'dc0'
+    )
+    return [pscustomobject][ordered]@{
+        candidateId = $CandidateId
+        category = 'convention'
+        severity = 'important'
+        anchorKind = 'changedFile'
+        primaryTarget = $PrimaryTarget
+        manifestations = $Manifestations
+        ruleRef = $RuleRef
+        ruleSection = 'Claim ownership'
+        ruleQuote = $script:localRuleQuote
+        diffEvidence = 'A changed test declaration has TestMethod but no Owner attribute.'
+        impactCategory = 'buildOrTestExecution'
+        impact = 'Ownership metadata drives test accountability.'
+        expectedFixOrValidation = 'Add the Owner attribute to the changed test declaration.'
+        siblingStatus = 'notRequired'
+        siblingEvidence = ''
+        siblingNotRequiredReason = 'placeholder ignored for local declaration evidence'
+        factIds = ''
+        confidence = 'high'
+        residualRiskSummary = ''
+        semanticCandidateVersion = 2
+        changedCodeFix = [pscustomobject][ordered]@{
+            action = 'add'
+            targets = $FixTargets
+            conventionKey = 'Owner'
+            valueSource = 'authoritativeRule'
+            evidenceFactIds = ''
+        }
+        existingDebtFollowUp = [pscustomobject][ordered]@{
+            status = 'none'
+            evidenceFactId = ''
+            selectorKey = ''
+            scopeKind = ''
+            scopePath = ''
+            comparableCount = 0
+            compliantCount = 0
+            action = ''
+        }
+    }
+}
+
+function New-OwnerLocalCoverageRow {
+    param(
+        [string]$Status = 'violation',
+        [string]$Violating = 'dc0',
+        [string]$Unknown = '',
+        [string]$NotInReach = '',
+        [string]$CandidateId = 'owner-local'
+    )
+    return [pscustomobject][ordered]@{
+        ruleRef = 'rs0'
+        ruleSourceSha256 = $script:localSourceSha
+        ruleQuote = $script:localRuleQuote
+        status = $Status
+        scope = 'declaration'
+        violatingConstructs = $Violating
+        compliantConstructs = ''
+        notInReachConstructs = $NotInReach
+        unknownConstructs = $Unknown
+        violatingChangedFileTargets = ''
+        codeEvidence = 'The changed TestMethod declaration lacks Owner.'
+        siblingStatus = 'unavailable'
+        siblingEvidence = ''
+        candidateId = $CandidateId
+        notes = ''
+    }
+}
+
+function New-OwnerLocalMarker {
+    param(
+        [object[]]$Candidates,
+        [object[]]$Rows,
+        [string]$Nonce = 'owner-local-nonce'
+    )
+    return [pscustomobject][ordered]@{
+        schemaVersion = 3
+        prId = 16991680
+        repositoryId = $script:localRepoId
+        project = 'One'
+        reviewedSourceCommit = '6' * 40
+        targetCommit = '7' * 40
+        changeSetDigest = '8' * 64
+        conventionPlanSha256 = $script:localHashes.conventionPlanSha256
+        factPlanSha256 = $script:localHashes.factPlanSha256
+        configSha256 = $script:localHashes.configSha256
+        scriptSha256 = $script:localHashes.scriptSha256
+        promptSha256 = $script:localHashes.promptSha256
+        candidates = @($Candidates)
+        ruleCoverage = @($Rows)
+        withheld = @()
+        residualRisks = @()
+        nonce = $Nonce
+    }
+}
+
+function ConvertTo-OwnerLocalParsedMarker {
+    param([Parameter(Mandatory)]$Marker, [string]$Nonce = 'owner-local-nonce')
+    $schema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject 'One' `
+        -ExpectedNonce $Nonce -ContractVersion 3
+    return ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+        -StdOutText ("CONVENTION_REVIEW_RESULT_V3: " + ($Marker | ConvertTo-Json -Depth 24 -Compress)) `
+        -Schema $schema -ContractVersion 3
+}
+
+function Resolve-OwnerLocalMarker {
+    param(
+        [Parameter(Mandatory)]$Marker,
+        [Parameter(Mandatory)][object[]]$Constructs,
+        [Parameter(Mandatory)][object[]]$ChangeEntries,
+        [Parameter(Mandatory)][hashtable]$Ranges,
+        [object[]]$ConstructFiles = @(),
+        [object[]]$DroppedElements = @()
+    )
+    $outcome = ConvertTo-OwnerLocalParsedMarker -Marker $Marker
+    Assert-Owner ([string]$outcome.Status -ceq 'success') `
+        "The local-evidence v3 marker did not parse (status '$($outcome.Status)', field '$($outcome.Field)')."
+    if ([string]$outcome.Status -cne 'success') { return $null }
+    return Resolve-ReviewerConventionSpecialistCandidates -Marker $outcome.Value `
+        -ConventionPlan $script:localPlan -FactPlan $script:localFactPlan `
+        -ResolvedSources $script:localSources -ChangeEntries $ChangeEntries `
+        -Constructs $Constructs -ConstructFiles $ConstructFiles `
+        -RightHandRangesByPath $Ranges -ContractVersion 3 `
+        -DroppedElements $DroppedElements
+}
+
+$knownLocalDeclaration = [pscustomobject][ordered]@{
+    constructId = 'dc0'
+    kind = 'declaration'
+    path = 'src/Tests/OwnerTests.cs'
+    line = 10
+    endLine = 10
+    name = 'MissingOwner'
+    attributes = @('TestMethod')
+    siblingAttributes = @()
+    absentHere = @('Owner')
+    status = 'known'
+}
+$unknownLocalDeclaration = [pscustomobject][ordered]@{
+    constructId = 'dc1'
+    kind = 'declaration'
+    path = 'src/Tests/OwnerTests.cs'
+    line = 20
+    endLine = 20
+    name = 'UnknownOwner'
+    attributes = @()
+    siblingAttributes = @()
+    absentHere = @()
+    status = 'unknown'
+}
+$localRowRequest = Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $localSources `
+    -Constructs @($knownLocalDeclaration, $unknownLocalDeclaration) -ContractVersion 3
+$localRequiredRow = @($localRowRequest.Requested)[0]
+Assert-Owner ([bool]$localRequiredRow.siblingEvidenceRequired -eq $false) `
+    "The local declaration pack did not mark sibling evidence wrapper-owned."
+Assert-Owner ([string]$localRequiredRow.locallyAdjudicableConstructs -ceq 'dc0') `
+    "The local declaration row did not expose only known declarations (got '$($localRequiredRow.locallyAdjudicableConstructs)')."
+
+$knownChanges = @([pscustomobject][ordered]@{
+        Path = 'src/Tests/OwnerTests.cs'
+        Role = 'current'
+        ChangeTypes = @('edit')
+    })
+$knownRanges = @{ '/src/Tests/OwnerTests.cs' = @([pscustomobject]@{ startLine = 10; endLine = 10 }) }
+$incompleteCensus = [pscustomObject][ordered]@{
+    evidenceFactId = 'rdf1:' + ('9' * 64)
+    path = 'src/Tests/OwnerTests.cs'
+    declarationCount = 2
+    attributeFrequency = @()
+    generatedCode = $false
+    wholeFileComplete = $false
+    wholeFileLineCount = 200
+    wholeFileSha256 = 'a' * 64
+    attributeCountsComplete = $false
+}
+$knownMarker = New-OwnerLocalMarker -Candidates @((New-OwnerLocalCandidate)) `
+    -Rows @((New-OwnerLocalCoverageRow))
+$knownResult = Resolve-OwnerLocalMarker -Marker $knownMarker -Constructs @($knownLocalDeclaration) `
+    -ChangeEntries $knownChanges -Ranges $knownRanges -ConstructFiles @($incompleteCensus)
+Assert-Owner ($null -ne $knownResult -and @($knownResult.Candidates).Count -eq 1) `
+    "A known changed declaration was not adjudicable when its file census was incomplete."
+if ($null -ne $knownResult -and @($knownResult.Candidates).Count -eq 1) {
+    $kept = @($knownResult.Candidates)[0]
+    Assert-Owner ([string]$kept.siblingStatus -ceq 'checked' -and
+        [string]$kept.siblingNotRequiredReason -ceq '' -and
+        [string]$kept.siblingEvidence -like 'Wrapper local declaration evidence:*status known*') `
+        "The wrapper did not replace model sibling fields with local declaration evidence."
+}
+
+$unknownRanges = @{ '/src/Tests/OwnerTests.cs' = @([pscustomobject]@{ startLine = 20; endLine = 20 }) }
+$unknownMarker = New-OwnerLocalMarker -Candidates @((New-OwnerLocalCandidate `
+            -CandidateId 'owner-unknown' -PrimaryTarget 'cf0:20' -FixTargets 'cf0:20')) `
+    -Rows @((New-OwnerLocalCoverageRow -Status 'unknown' -Violating '' -Unknown 'dc1' -CandidateId ''))
+$unknownResult = Resolve-OwnerLocalMarker -Marker $unknownMarker -Constructs @($unknownLocalDeclaration) `
+    -ChangeEntries $knownChanges -Ranges $unknownRanges
+Assert-Owner ($null -ne $unknownResult -and @($unknownResult.Candidates).Count -eq 0 -and
+    @($unknownResult.Withheld | Where-Object {
+        [string]$_.candidateId -ceq 'owner-unknown' -and [string]$_.reason -ceq 'invalidEvidence'
+    }).Count -eq 1) `
+    "An unknown declaration became adjudicable from local declaration evidence."
+
+$derivedConstructs = @(
+    [pscustomobject][ordered]@{
+        constructId = 'dc0'; kind = 'declaration'; path = 'src/BTests.cs'; line = 10; endLine = 10
+        name = 'B'; attributes = @('TestMethod'); siblingAttributes = @(); absentHere = @('Owner'); status = 'known'
+    },
+    [pscustomobject][ordered]@{
+        constructId = 'dc1'; kind = 'declaration'; path = 'src/ATests.cs'; line = 20; endLine = 20
+        name = 'A'; attributes = @('TestMethod'); siblingAttributes = @(); absentHere = @('Owner'); status = 'known'
+    }
+)
+$derivedChanges = @(
+    [pscustomobject][ordered]@{ Path = 'src/BTests.cs'; Role = 'current'; ChangeTypes = @('edit') },
+    [pscustomobject][ordered]@{ Path = 'src/ATests.cs'; Role = 'current'; ChangeTypes = @('edit') }
+)
+$derivedRanges = @{
+    '/src/BTests.cs' = @([pscustomobject]@{ startLine = 10; endLine = 10 })
+    '/src/ATests.cs' = @([pscustomobject]@{ startLine = 20; endLine = 20 })
+}
+$derivedMarker = New-OwnerLocalMarker -Candidates @((New-OwnerLocalCandidate `
+            -CandidateId 'owner-derived' -PrimaryTarget '' -Manifestations 'cf1:10,cf0:20' `
+            -FixTargets 'dc0,dc1')) `
+    -Rows @((New-OwnerLocalCoverageRow -Violating 'dc0-dc1' -CandidateId 'owner-derived'))
+$derivedResult = Resolve-OwnerLocalMarker -Marker $derivedMarker -Constructs $derivedConstructs `
+    -ChangeEntries $derivedChanges -Ranges $derivedRanges
+Assert-Owner ($null -ne $derivedResult -and @($derivedResult.Candidates).Count -eq 1) `
+    "A candidate with omitted primaryTarget was not accepted for deterministic derivation."
+if ($null -ne $derivedResult -and @($derivedResult.Candidates).Count -eq 1) {
+    $derivedCandidate = @($derivedResult.Candidates)[0]
+    Assert-Owner ([string]$derivedCandidate.primaryTarget -ceq 'cf0:20' -and
+        [string]$derivedCandidate.manifestations -ceq 'cf1:10') `
+        "Omitted primaryTarget was not derived as ordinal-first with the rest as manifestations."
+}
+
+$unknownRefMarker = New-OwnerLocalMarker -Candidates @((New-OwnerLocalCandidate `
+            -CandidateId 'owner-unresolved-target' -PrimaryTarget '' -Manifestations 'cf99:10' `
+            -FixTargets 'cf0:10')) `
+    -Rows @((New-OwnerLocalCoverageRow -CandidateId 'owner-unresolved-target'))
+$unknownRefResult = Resolve-OwnerLocalMarker -Marker $unknownRefMarker -Constructs @($knownLocalDeclaration) `
+    -ChangeEntries $knownChanges -Ranges $knownRanges
+Assert-Owner ($null -ne $unknownRefResult -and @($unknownRefResult.Candidates).Count -eq 0 -and
+    @($unknownRefResult.Withheld | Where-Object {
+        [string]$_.candidateId -ceq 'owner-unresolved-target' -and [string]$_.reason -ceq 'invalidTarget'
+    }).Count -eq 1) `
+    "An omitted primaryTarget with unresolved refs was guessed instead of withheld."
+
+$unboundMarker = New-OwnerLocalMarker -Candidates @((New-OwnerLocalCandidate `
+            -CandidateId 'owner-unbound-rule' -RuleRef 'rs9')) `
+    -Rows @((New-OwnerLocalCoverageRow -CandidateId 'owner-unbound-rule'))
+$unboundResult = Resolve-OwnerLocalMarker -Marker $unboundMarker -Constructs @($knownLocalDeclaration) `
+    -ChangeEntries $knownChanges -Ranges $knownRanges
+Assert-Owner ($null -ne $unboundResult -and @($unboundResult.Candidates).Count -eq 0 -and
+    @($unboundResult.Withheld | Where-Object {
+        [string]$_.candidateId -ceq 'owner-unbound-rule' -and [string]$_.reason -ceq 'invalidEvidence'
+    }).Count -eq 1) `
+    "A candidate became eligible from an unbound rule reference."
+
+$droppedMarker = New-OwnerLocalMarker -Candidates @() `
+    -Rows @((New-OwnerLocalCoverageRow -CandidateId 'owner-dropped'))
+$droppedResult = Resolve-OwnerLocalMarker -Marker $droppedMarker -Constructs @($knownLocalDeclaration) `
+    -ChangeEntries $knownChanges -Ranges $knownRanges `
+    -DroppedElements @([pscustomobject]@{ Field = 'candidates[0].candidateId'; Reason = 'Pattern' })
+Assert-Owner ($null -ne $droppedResult -and @($droppedResult.Candidates).Count -eq 0 -and
+    @($droppedResult.Withheld | Where-Object { [string]$_.reason -ceq 'schemaInvalidCandidate' }).Count -eq 1) `
+    "A candidate became eligible from evidence that the marker reader had dropped."
+
+Assert-Owner ('' -notmatch $siblingSchemaV2.Fields.candidates.Item.Fields.primaryTarget.Pattern) `
+    "Contract v2 accepted an empty primaryTarget; v2 is frozen."
+Assert-Owner ('' -match $siblingSchemaV3.Fields.candidates.Item.Fields.primaryTarget.Pattern) `
+    "Contract v3 does not allow wrapper-derived empty primaryTarget."
 
 if ($script:OwnerFailures.Count -gt 0) {
     foreach ($failure in $script:OwnerFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }

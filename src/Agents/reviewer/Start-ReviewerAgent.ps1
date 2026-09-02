@@ -10033,6 +10033,7 @@ function Get-ReviewerConventionSpecialistResolvedSources {
     $resolved = [System.Collections.Generic.List[object]]::new()
     foreach ($pack in @(Get-ReviewerConventionSpecialistValue $ConventionPlan "selectedPacks" @())) {
         $packName = [string](Get-ReviewerConventionSpecialistValue $pack "name" "")
+        $packDeclarationEvidence = [string](Get-ReviewerConventionSpecialistValue $pack "declarationEvidence" "")
         foreach ($source in @(Get-ReviewerConventionSpecialistValue $pack "sources" @())) {
             $path = [string](Get-ReviewerConventionSpecialistValue $source "path" "")
             $project = [string](Get-ReviewerConventionSpecialistValue $source "project" "")
@@ -10080,6 +10081,7 @@ function Get-ReviewerConventionSpecialistResolvedSources {
             }
             [void]$resolved.Add([pscustomobject][ordered]@{
                     PackName = $packName
+                    PackDeclarationEvidence = $packDeclarationEvidence
                     SourceId = [string](Get-ReviewerConventionSpecialistValue $source "sourceId" "")
                     TrustTier = [string](Get-ReviewerConventionSpecialistValue $source "trustTier" "")
                     Organization = [string](Get-ReviewerConventionSpecialistValue $source "organization" "")

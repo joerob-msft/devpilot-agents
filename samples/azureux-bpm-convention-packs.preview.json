@@ -74,6 +74,7 @@
             "enghub-automated-tests-ownership"
           ],
           "repositorySources": [],
+          "declarationEvidence": "local",
           "maxBytes": 4096
         },
         {
