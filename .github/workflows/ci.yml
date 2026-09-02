@@ -351,6 +351,20 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ConventionOwnerCapability.ps1
 
+      # The preview that composes the existing tools into one Owner run over one
+      # pull request. These checks validate the three documents it authors
+      # against the SAME published schemas the production tools read, so a drift
+      # in either fails here rather than several minutes into a live capture.
+      # They also pin the two properties that make the layer safe to leave
+      # running: a changed head, rule, model or toolkit produces a different
+      # subject rather than overwriting one, and a marker that never parsed is
+      # reported incomplete rather than as a clean review. The nine-declaration
+      # case is read out of the recorded corpus, not copied from it. No network,
+      # no model, no provider.
+      - name: owner convention preview
+        shell: pwsh
+        run: ./tools/Test-OwnerPreviewCycle.ps1
+
       # Layer 8: the sealed changed-file source transport. The model has no
       # working file-read tool on this host, so the wrapper reads the pinned
       # bytes itself; these checks pin the slicing, the hash binding, the
