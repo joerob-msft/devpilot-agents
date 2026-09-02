@@ -243,6 +243,95 @@ enumeration of every **changed construct** in the change set. Each row states:
 practice that could not be established and ambiguous rule text are all honest
 `unknown`s, and each says which in its note.
 
+### Contract v4: the per-construct verdict matrix
+
+The accounting above is what the model produces under contract **v3**. Contract
+**v4** keeps every guarantee and moves the arithmetic behind it to the wrapper.
+
+Ten measured qualification runs of v3 found all nine violating declarations in a
+real pull request every time, with zero false positives - and lost the finding
+anyway. Not to bad judgement: to a `primaryTarget` written as a construct id
+rather than a line anchor, to six different spellings of one `conventionKey`
+across ten runs, to a `notInReachConstructs` list that named the three in-scope
+declarations correctly and omitted the twenty-five out-of-kind ids it was the
+set-complement of, and to a row `status` the wrapper already derived and
+overrode. Every one of those is transport or arithmetic the wrapper holds.
+
+So v4 asks for the one thing the wrapper does not hold - a verdict on each
+construct - and derives the rest:
+
+```
+assessments[]                one row per requested rule
+  ruleRef                    rs0, rs1, ... - the rule this row answers
+  constructs[]               EXACTLY one entry per id in the row's inScopeConstructs
+    constructRef             an opaque dc/mi/cm/as id the wrapper minted
+    verdict                  violation | compliant | unknown
+  notes[]                    up to eight short explanations, violations only
+    constructRef, rationale, suggestion
+```
+
+That is the whole model surface: two required leaves per construct. There is no
+`candidates` array and no `ruleCoverage` array in a v4 marker - the wrapper
+builds both.
+
+**In scope is decided by pack routing.** Each requested row carries
+`inScopeConstructs`: the exact, range-compressed id set that rule reaches,
+computed from the `changedPathGlobs` the pack already matched. The model never
+computes a set. Constructs in files the pack did not route to are ruled out of
+reach by the wrapper. A pack with no routing evidence is reported as
+**unresolved**, never as an empty scope - "this rule reaches nothing here" is a
+claim, and "the wrapper cannot tell" is not the same claim.
+
+**Omission is never compliance.** A row must carry exactly one verdict per
+in-scope id. A missing, duplicated or unrequested `constructRef` makes the whole
+row incomplete: its verdicts are discarded, every construct it reaches is
+recorded `unknown`, and it publishes no finding. This is the anti-silence
+mechanism from v3, moved off the model's set arithmetic and onto the wrapper's.
+
+**Grouping is a wrapper decision.** Violating constructs are grouped by
+`(rule, file)` in ordinal order and each group becomes one candidate. A model
+that answers per file and one that answers in a single block are therefore the
+same input and produce identical output - so a correct split can no longer be
+scored as a miss. Coverage is the **union** of every accepted candidate's
+anchors, never a property of one chosen candidate.
+
+**Prose cannot cost a verdict.** `notes` are bounded separately, capped at eight
+per row, and drop individually. An unreadable, over-long or duplicated note
+discards only itself.
+
+The wrapper derives, and the model never states: the candidate id, the primary
+anchor and its file and line, every manifestation, the pack and all five
+rule-source provenance fields, the rule section and quote, the evidence fact ids,
+the sibling status and evidence, the severity and impact category, the structured
+fix metadata, the four-way construct partition, the row status, and the rule
+accounting. The candidate the wrapper emits keeps the v3 shape exactly, so
+cross-verification, reconciliation and delivery are unchanged by v4.
+
+Two limitations, stated rather than implied:
+
+- **No kind-level scoping.** In scope is derived from file routing only, so
+  within a routed file every construct kind is in scope and `compliant` means
+  "does not violate this rule" rather than "in reach and complying". Recovering
+  the kind distinction needs one additional per-pack key (a rule `scopeKinds`),
+  which this contract deliberately does not add.
+- **No cross-construct claims.** A rule whose claim is about a *relationship
+  between* constructs can only be expressed as independent per-construct
+  verdicts that wrapper grouping collects; the model cannot state the relation.
+
+### The version ladder
+
+| Contract | Prefix | Status |
+|---|---|---|
+| v2 | `CONVENTION_REVIEW_RESULT_V2:` | **Frozen.** Sealed transcripts and previews on disk were produced against it. Nothing in it may change shape. |
+| v3 | `CONVENTION_REVIEW_RESULT_V3:` | **Readable.** No live caller, but sealed v3 artifacts still verify, against the v3 prompt whose digest they recorded. |
+| v4 | `CONVENTION_REVIEW_RESULT_V4:` | **Live.** |
+
+Each version has its own prefix and its own prompt file, so a reader decides
+which contract it is reading before it parses anything, and a `promptSha256` that
+sealed an older artifact never moves. A response carrying **two** known prefixes
+is ambiguous about which contract it was written against and is refused outright
+rather than resolved to one of them.
+
 ### Changed constructs
 
 The wrapper enumerates four kinds of changed construct, lexically and without

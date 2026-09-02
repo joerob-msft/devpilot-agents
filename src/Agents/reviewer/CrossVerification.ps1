@@ -1039,6 +1039,54 @@ function ConvertTo-ReviewerIndependentDiscoveryCandidates {
     # absent from the raw marker still has no pair to match and still throws,
     # which is the property this guard is here for.
     $markerContractVersion = [int](Get-ReviewerVerificationValue $Marker "schemaVersion" 2)
+    # Contract v4 carries no candidates at all: the model returns a per-construct
+    # verdict matrix and the WRAPPER groups the violations into candidates. So
+    # there is no raw candidate to pair a resolved one against, and the pairing
+    # check below cannot run.
+    #
+    # What this guard is for still can. A projection must not introduce a finding
+    # the model never made, so every resolved candidate has to trace back to an
+    # actual `violation` verdict: its rule must be one the marker assessed, that
+    # rule must carry at least one violation, and the projection may not contain
+    # more candidates for a rule than that rule has violating constructs, because
+    # grouping only ever merges violations - it never creates them.
+    #
+    # Honest limitation, stated rather than papered over: without the sealed
+    # construct table this cannot re-derive the exact anchors, so it proves a
+    # projected candidate is BACKED by violations of its rule, not that its
+    # grouping is the one the wrapper would have chosen. The wrapper's own
+    # candidate resolution already enforced that; this is the independent check
+    # that survives into the sealed package.
+    if ($markerContractVersion -ge 4) {
+        $violationsByRule = @{}
+        foreach ($assessment in @(Get-ReviewerVerificationValue $Marker "assessments" @())) {
+            $ruleRef = ([string](Get-ReviewerVerificationValue $assessment "ruleRef" "")).ToLowerInvariant()
+            if (-not $ruleRef) { continue }
+            $count = 0
+            foreach ($entry in @(Get-ReviewerVerificationValue $assessment "constructs" @())) {
+                if ([string](Get-ReviewerVerificationValue $entry "verdict" "") -ceq "violation") { $count++ }
+            }
+            if (-not $violationsByRule.ContainsKey($ruleRef)) { $violationsByRule[$ruleRef] = 0 }
+            $violationsByRule[$ruleRef] += $count
+        }
+        $projectedByRule = @{}
+        foreach ($resolved in @($SpecialistCandidates)) {
+            $ruleRef = ([string](Get-ReviewerVerificationValue $resolved "ruleRef" "")).ToLowerInvariant()
+            if (-not $ruleRef -or -not $violationsByRule.ContainsKey($ruleRef) -or
+                [int]$violationsByRule[$ruleRef] -lt 1) {
+                throw "The sealed specialist projection contains a candidate for a rule its result marker did not find violated."
+            }
+            if (-not $projectedByRule.ContainsKey($ruleRef)) { $projectedByRule[$ruleRef] = 0 }
+            $projectedByRule[$ruleRef]++
+            if ([int]$projectedByRule[$ruleRef] -gt [int]$violationsByRule[$ruleRef]) {
+                throw "The sealed specialist projection contains more candidates for a rule than its result marker reported violations."
+            }
+        }
+        return @(ConvertTo-ReviewerVerificationCandidates `
+                -ConventionCandidates @($SpecialistCandidates) `
+                -ConventionModel $SourceModel `
+                -ConventionArtifactSha256 $artifactSha256)
+    }
     $wrapperOwnedFields = @("filePath", "line", "packName", "ruleSourceId", "ruleSourceRepositoryId",
         "ruleSourcePath", "ruleSourceCommit", "ruleSourceSha256")
     $resolvedById = @{}

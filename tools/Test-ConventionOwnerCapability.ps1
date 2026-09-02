@@ -30,6 +30,32 @@ Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarn
 
 $script:OwnerChecks = 0
 $script:OwnerFailures = [System.Collections.Generic.List[string]]::new()
+
+function Get-OwnerUnionAnchors {
+    <#
+        The union of every accepted candidate's changed-line anchors.
+
+        THIS is what convention coverage means. A rule's violations may be
+        published as one candidate or as one per file - both are correct, and
+        which one a model produces is not a measure of whether it found the
+        violations. Counting only the first candidate's anchors is how a run that
+        found all nine declarations and split them across two accepted candidates
+        was scored as finding eight.
+    #>
+    param([AllowEmptyCollection()][object[]]$Candidates = @())
+    $union = [System.Collections.Generic.List[string]]::new()
+    foreach ($candidate in @($Candidates)) {
+        $targets = @([string]$candidate.primaryTarget) + @(([string]$candidate.manifestations) -split ',')
+        foreach ($target in $targets) {
+            $trimmed = ([string]$target).Trim()
+            if ($trimmed -and $union -cnotcontains $trimmed) { [void]$union.Add($trimmed) }
+        }
+    }
+    $sorted = [string[]]@($union.ToArray())
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    return , $sorted
+}
+
 function Assert-Owner {
     param([bool]$Condition, [string]$Message)
     $script:OwnerChecks++
@@ -198,12 +224,20 @@ if (Test-Path -LiteralPath $recordedPath) {
 
     if ([string]$v3Outcome.Status -ceq 'success') {
         $owner = @(@($v3Outcome.Value.candidates) | Where-Object { [string]$_.candidateId -like '*owner*' })
-        Assert-Owner ($owner.Count -eq 1) "The recovered marker does not contain the Owner finding."
-        if ($owner.Count -eq 1) {
-            Assert-Owner ([string]$owner[0].factIds -like 'rdf1:*') `
+        Assert-Owner ($owner.Count -ge 1) "The recovered marker does not contain the Owner finding."
+        if ($owner.Count -ge 1) {
+            Assert-Owner (@($owner | Where-Object { [string]$_.factIds -like 'rdf1:*' }).Count -ge 1) `
                 "The Owner finding no longer cites the declaration census it rests on."
-            Assert-Owner ([string]$owner[0].primaryTarget -ceq 'cf4:69') `
-                "The Owner finding moved off its recorded anchor (now '$($owner[0].primaryTarget)')."
+            # Coverage is the UNION of every accepted candidate's anchors, not a
+            # property of one chosen candidate. A model that answers per file and
+            # one that answers in a single block are both right, and the metric
+            # that scored the second as a miss is the metric that produced a
+            # NO-GO for a semantically perfect run.
+            $ownerAnchors = Get-OwnerUnionAnchors -Candidates $owner
+            Assert-Owner ($ownerAnchors.Count -eq 9) `
+                "The Owner finding's union anchor coverage is $($ownerAnchors.Count), not the nine expected declarations."
+            Assert-Owner ($ownerAnchors -ccontains 'cf4:69') `
+                "The Owner finding's union coverage lost the recorded first anchor cf4:69."
         }
         Assert-Owner (@($v3Outcome.Value.ruleCoverage).Count -ge 1) `
             "The rule-coverage row was lost along with the provenance fields."
@@ -849,6 +883,339 @@ Assert-Owner ('' -notmatch $siblingSchemaV2.Fields.candidates.Item.Fields.primar
     "Contract v2 accepted an empty primaryTarget; v2 is frozen."
 Assert-Owner ('' -match $siblingSchemaV3.Fields.candidates.Item.Fields.primaryTarget.Pattern) `
     "Contract v3 does not allow wrapper-derived empty primaryTarget."
+
+# ---------------------------------------------------------------------------
+# Contract v4: the per-construct verdict matrix.
+#
+# Ten qualification runs against contract v3 found all nine violating
+# declarations every time, with zero false positives, and lost them anyway - to
+# a primaryTarget written as a construct id, to six spellings of a
+# conventionKey, to a notInReachConstructs list that omitted the 25 out-of-kind
+# ids it was the complement of, and to a row status the wrapper already derived.
+# Version 4 removes every one of those from the model. These checks are the
+# proof that it did, and that what is left cannot lose a finding the same ways.
+# ---------------------------------------------------------------------------
+$v4 = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject 'One' -ExpectedNonce ('a' * 36) -ContractVersion 4
+
+# The key set EXACTLY, never as a delta from v3. A delta assertion passes when a
+# v4 branch silently inherits a v3 field through an open-ended `-ge 3` test,
+# which is the whole failure mode this contract is trying to avoid.
+Assert-Owner ((@($v4.Keys) -join ',') -ceq (
+        'schemaVersion,prId,repositoryId,project,reviewedSourceCommit,targetCommit,changeSetDigest,' +
+        'conventionPlanSha256,factPlanSha256,configSha256,scriptSha256,promptSha256,' +
+        'assessments,withheld,residualRisks,nonce')) `
+    "Contract v4's top-level key set is not exactly the binding block plus assessments/withheld/residualRisks/nonce."
+Assert-Owner ((@($v4.Fields.assessments.Item.Keys) -join ',') -ceq 'ruleRef,constructs,notes') `
+    "Contract v4's assessment row is not exactly ruleRef, constructs and notes."
+Assert-Owner ((@($v4.Fields.assessments.Item.Fields.constructs.Item.Keys) -join ',') -ceq 'constructRef,verdict') `
+    "Contract v4 asks a construct verdict for more than an opaque ref and an enum."
+Assert-Owner ((@($v4.Fields.assessments.Item.Fields.notes.Item.Keys) -join ',') -ceq 'constructRef,rationale,suggestion') `
+    "Contract v4's note is not exactly a construct ref and two sentences."
+
+# Every field that cost a real run a finding must be unaskable in v4.
+foreach ($gone in @('primaryTarget', 'manifestations', 'filePath', 'line', 'packName', 'ruleSourceId',
+        'ruleSourceRepositoryId', 'ruleSourcePath', 'ruleSourceCommit', 'ruleSourceSha256', 'ruleQuote',
+        'ruleSection', 'factIds', 'severity', 'impactCategory', 'confidence', 'candidateId',
+        'siblingStatus', 'siblingEvidence', 'siblingNotRequiredReason', 'changedCodeFix',
+        'existingDebtFollowUp', 'scope', 'status', 'notInReachConstructs', 'violatingChangedFileTargets')) {
+    $reachable = ((@($v4.Fields.assessments.Item.Keys) -ccontains $gone) -or
+        (@($v4.Fields.assessments.Item.Fields.constructs.Item.Keys) -ccontains $gone) -or
+        (@($v4.Fields.assessments.Item.Fields.notes.Item.Keys) -ccontains $gone))
+    Assert-Owner (-not $reachable) "Contract v4 still asks the model for '$gone'."
+}
+Assert-Owner (-not (@($v4.Keys) -ccontains 'candidates') -and -not (@($v4.Keys) -ccontains 'ruleCoverage')) `
+    "Contract v4 still carries a candidate or coverage array; the wrapper derives both."
+
+# The verdict enum has no escape hatch. `notApplicable` would let a model answer
+# a construct without deciding anything, and out-of-reach constructs are already
+# excluded from the in-scope set by the wrapper.
+Assert-Owner ((@($v4.Fields.assessments.Item.Fields.constructs.Item.Fields.verdict.Values) -join ',') -ceq
+    'violation,compliant,unknown') "Contract v4's verdict enum is not exactly violation/compliant/unknown."
+
+# Failure locality: a row drops itself, a note drops itself, but a construct
+# entry may NOT drop itself - a dropped verdict is indistinguishable from one
+# the model never sent, and both must make the row incomplete instead of
+# quietly shrinking the set that got a verdict.
+Assert-Owner ([string]$v4.Fields.assessments.ElementFailurePolicy -ceq 'drop') `
+    "Contract v4 does not keep an unreadable rule row local to that rule."
+Assert-Owner ([string]$v4.Fields.assessments.Item.Fields.notes.ElementFailurePolicy -ceq 'drop') `
+    "Contract v4 lets an unreadable sentence cost more than itself."
+Assert-Owner ([string]$v4.Fields.assessments.Item.Fields.constructs.ElementFailurePolicy -ceq 'fail') `
+    "Contract v4 lets a construct verdict drop itself, which silently shrinks the answered set."
+
+# The row can always answer for every construct the enumerator can produce.
+Assert-Owner ([int]$v4.Fields.assessments.Item.Fields.constructs.MaxItems -ge [int]$script:ReviewerConstructMaxTotal) `
+    ("Contract v4 caps a row at $([int]$v4.Fields.assessments.Item.Fields.constructs.MaxItems) constructs, " +
+    "below the $([int]$script:ReviewerConstructMaxTotal) the enumerator can produce, so a full change set could not be answered.")
+
+# The largest legal v4 marker must fit the window it is actually read through,
+# and - because the matrix is verbose - it must be measured, not assumed. It is
+# in fact SMALLER than v3's, because the prose that dominated the worst case now
+# lives in a separately bounded array instead of on every verdict.
+$v4Fit = Test-AgentMarkerSchemaFitsScanWindow -Schema $v4 -ScanWindowChars $specialistWindow
+Assert-Owner ([bool]$v4Fit.Fits) `
+    "The v4 contract's largest legal marker ($($v4Fit.WorstCaseChars) chars) does not fit the $($v4Fit.WindowChars)-char scan window."
+Assert-Owner ([int]$v4Fit.WorstCaseChars -lt [int]$fit.WorstCaseChars) `
+    "Contract v4 did not shrink the largest legal marker (v4 $($v4Fit.WorstCaseChars) vs v3 $($fit.WorstCaseChars))."
+
+# Version dispatch: exact, and ambiguity is a refusal rather than a preference.
+Assert-Owner ((Get-ReviewerConventionSpecialistMarkerPrefixForVersion -ContractVersion 4) -ceq
+    'CONVENTION_REVIEW_RESULT_V4:') "Contract v4 does not have its own marker prefix."
+Assert-Owner ((Get-ReviewerConventionSpecialistMarkerPrefixForVersion -ContractVersion 3) -ceq
+    'CONVENTION_REVIEW_RESULT_V3:') "The v3 prefix moved; sealed v3 artifacts would stop being readable."
+Assert-Owner ((Get-ReviewerConventionSpecialistContractVersionFromText -Text 'CONVENTION_REVIEW_RESULT_V4: {}') -eq 4) `
+    "A v4 marker is not read as v4."
+Assert-Owner ((Get-ReviewerConventionSpecialistContractVersionFromText -Text 'CONVENTION_REVIEW_RESULT_V3: {}') -eq 3) `
+    "A v3 marker is not read as v3."
+Assert-Owner ((Get-ReviewerConventionSpecialistContractVersionFromText -Text 'no marker at all') -eq 2) `
+    "A prefixless marker is no longer read under the frozen v2 rules."
+Assert-Owner ((Get-ReviewerConventionSpecialistContractVersionFromText -Text (
+            'CONVENTION_REVIEW_RESULT_V4: {"x":"CONVENTION_REVIEW_RESULT_V3:"}')) -eq 0) `
+    "A marker claiming two contracts is resolved to one instead of refused."
+$ambiguityRefused = $false
+try { [void](Resolve-ReviewerConventionSpecialistSealedContractVersion -Text (
+            'CONVENTION_REVIEW_RESULT_V4: CONVENTION_REVIEW_RESULT_V2:')) }
+catch { $ambiguityRefused = $true }
+Assert-Owner $ambiguityRefused "An ambiguous sealed marker was assigned a contract version instead of being refused."
+
+# The v4 prompt is a separate file, so the v3 promptSha256 that sealed artifacts
+# retain does not move.
+Assert-Owner ((Get-ReviewerConventionSpecialistPromptFileName -ContractVersion 4) -ceq 'convention-review.v4.prompt.md') `
+    "Contract v4 does not have its own prompt file."
+Assert-Owner ((Get-ReviewerConventionSpecialistPromptFileName -ContractVersion 3) -ceq 'convention-review.prompt.md') `
+    "The v3 prompt file moved; every sealed v3 promptSha256 would stop reproducing."
+
+# ---------------------------------------------------------------------------
+# The ten preserved qualification trials, re-expressed as v4 matrices.
+#
+# Each row below is what one real run actually asserted, in the shape v4 asks
+# for. Every one of them recovers all nine declarations, because none of the
+# things those runs got wrong are expressible here.
+# ---------------------------------------------------------------------------
+$ownerFileA = '/src/flow/Tests/Tests.Flow.Data/AutomationConnectionUtilityTests.cs'
+$ownerFileB = '/src/flow/Tests/Tests.Flow.Web/AutomationApiOperationApiEngineTests.cs'
+$ownerDeclarations = [ordered]@{
+    dc0 = @($ownerFileA, 20); dc1 = @($ownerFileA, 30); dc2 = @($ownerFileA, 69)
+    dc3 = @($ownerFileA, 81); dc4 = @($ownerFileA, 115); dc5 = @($ownerFileA, 126)
+    dc6 = @($ownerFileA, 137); dc7 = @($ownerFileA, 148); dc8 = @($ownerFileA, 159)
+    dc9 = @($ownerFileA, 174); dc10 = @($ownerFileB, 398); dc11 = @($ownerFileA, 200)
+}
+$ownerNine = @('dc2', 'dc3', 'dc4', 'dc5', 'dc6', 'dc7', 'dc8', 'dc9', 'dc10')
+$ownerConstructs = @()
+foreach ($id in @($ownerDeclarations.Keys)) {
+    $ownerConstructs += [pscustomobject]@{
+        constructId = [string]$id; kind = 'declaration'; path = [string]$ownerDeclarations[$id][0]
+        line = [int]$ownerDeclarations[$id][1]; endLine = [int]$ownerDeclarations[$id][1]
+        name = [string]$id; status = 'known'
+    }
+}
+# Two constructs of other kinds. Under v3 the model had to name these among the
+# out-of-kind complement; under v4 the wrapper rules them out itself.
+$ownerConstructs += [pscustomobject]@{ constructId = 'mi0'; kind = 'invocation'; path = $ownerFileA; line = 70; endLine = 70; name = 'Assert'; status = 'known' }
+$ownerConstructs += [pscustomobject]@{ constructId = 'cm0'; kind = 'comment'; path = $ownerFileA; line = 68; endLine = 68; status = 'known' }
+
+$ownerChangeEntries = @(
+    [pscustomobject]@{ Path = $ownerFileA; Role = 'current'; ChangeTypes = @('edit') },
+    [pscustomobject]@{ Path = $ownerFileB; Role = 'current'; ChangeTypes = @('edit') }
+)
+$ownerRanges = @{
+    $ownerFileA = @(@{ startLine = 1; endLine = 400 })
+    $ownerFileB = @(@{ startLine = 1; endLine = 400 })
+}
+$ownerPlan = [pscustomobject]@{
+    selectedPacks = @([pscustomobject]@{
+            name = 'bpm-test-ownership'
+            matchedPaths = @([pscustomobject]@{ path = $ownerFileA }, [pscustomobject]@{ path = $ownerFileB })
+        })
+}
+$ownerRuleText = ("# Automated tests`n`n## Claim ownership`n`n" +
+    "Every test class and test method must carry the Owner attribute naming an alias.`n`n## Next`n")
+$ownerSources = @([pscustomobject]@{
+        PackName = 'bpm-test-ownership'; SourceId = 'enghub-automated-tests-ownership'
+        RepositoryId = '11111111-2222-3333-4444-555555555555'
+        Path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
+        CommitSha = ('f' * 40); Sha256 = ('b' * 64)
+        Section = '## Claim ownership'; Text = $ownerRuleText; PackDeclarationEvidence = ''
+    })
+$ownerConstructFiles = @(
+    [pscustomobject]@{ path = $ownerFileA; evidenceFactId = ("rdf1:" + ('a' * 64)); attributeCountsComplete = $true; wholeFileComplete = $true; declarationCount = 12; wholeFileLineCount = 400; wholeFileSha256 = ('c' * 64); generatedCode = $false; attributeFrequency = @() },
+    [pscustomobject]@{ path = $ownerFileB; evidenceFactId = ("rdf1:" + ('d' * 64)); attributeCountsComplete = $false; wholeFileComplete = $false; declarationCount = 1; wholeFileLineCount = 400; wholeFileSha256 = ('e' * 64); generatedCode = $false; attributeFrequency = @() }
+)
+$ownerFactPlan = [pscustomobject]@{ facts = @() }
+
+$ownerRequest = Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $ownerSources `
+    -Constructs $ownerConstructs -ContractVersion 4 -ConventionPlan $ownerPlan
+$ownerInScope = [string[]]@((@($ownerRequest.Requested)[0]).inScopeConstructIds)
+Assert-Owner ([bool](@($ownerRequest.Requested)[0]).inScopeResolved) `
+    "The wrapper could not derive the Owner rule's in-scope set from its pack routing."
+Assert-Owner ($ownerInScope.Count -eq 14) `
+    "The Owner rule's in-scope set is $($ownerInScope.Count) constructs, not the 14 in its routed files."
+
+$ownerAnchorIndex = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ownerChangeEntries `
+    -RightHandRangesByPath $ownerRanges
+$ownerAnchorByPath = @{}
+foreach ($anchor in @($ownerAnchorIndex)) { $ownerAnchorByPath[[string]$anchor.path] = [string]$anchor.anchorId }
+$ownerExpectedAnchors = [string[]]@(@($ownerNine) | ForEach-Object {
+        $declarationPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path ([string]$ownerDeclarations[$_][0])
+        "$($ownerAnchorByPath[$declarationPath]):$([int]$ownerDeclarations[$_][1])"
+    } | Sort-Object)
+
+function New-OwnerV4Marker {
+    param([AllowEmptyCollection()][object[]]$Constructs = @(), [AllowEmptyCollection()][object[]]$Notes = @(),
+        [switch]$NoRow)
+    $rows = @()
+    if (-not $NoRow) { $rows = @(@{ ruleRef = 'rs0'; constructs = $Constructs; notes = $Notes }) }
+    return @{
+        schemaVersion = 4; prId = 16991680
+        repositoryId = '11111111-2222-3333-4444-555555555555'; project = 'One'
+        reviewedSourceCommit = ('a' * 40); targetCommit = ('b' * 40); changeSetDigest = ('c' * 64)
+        conventionPlanSha256 = ('d' * 64); factPlanSha256 = ('e' * 64); configSha256 = ('f' * 64)
+        scriptSha256 = ('0' * 64); promptSha256 = ('1' * 64)
+        assessments = $rows; withheld = @(); residualRisks = @(); nonce = ('n' * 32)
+    }
+}
+function New-OwnerV4Matrix {
+    param([string[]]$Violating = @(), [hashtable]$Override = @{})
+    $entries = @()
+    foreach ($id in $ownerInScope) {
+        $verdict = if ($Override.ContainsKey($id)) { [string]$Override[$id] }
+        elseif ($Violating -ccontains $id) { 'violation' }
+        else { 'compliant' }
+        $entries += @{ constructRef = $id; verdict = $verdict }
+    }
+    return $entries
+}
+function Resolve-OwnerV4 {
+    param([hashtable]$Marker)
+    return Resolve-ReviewerConventionSpecialistCandidates -Marker $Marker -ConventionPlan $ownerPlan `
+        -FactPlan $ownerFactPlan -ResolvedSources $ownerSources -ChangeEntries $ownerChangeEntries `
+        -Constructs $ownerConstructs -ConstructFiles $ownerConstructFiles `
+        -RightHandRangesByPath $ownerRanges -ContractVersion 4
+}
+
+# The ten trials. `Withheld` is what the model itself set aside; every trial's
+# semantic assertion was "these nine violate", however it was packaged.
+$ownerTrials = @(
+    @{ Name = 'qual1'; Lost = 'primaryTarget written as a construct id' },
+    @{ Name = 'qual2'; Lost = 'dc10 withheld for an incomplete census' },
+    @{ Name = 'qual3'; Lost = 'nothing; accounting complete' },
+    @{ Name = 'qual4'; Lost = 'notInReachConstructs omitted the out-of-kind complement' },
+    @{ Name = 'qual5'; Lost = 'notInReachConstructs omitted the out-of-kind complement' },
+    @{ Name = 'r5_qual1'; Lost = 'row status disagreed with its own anchor verdicts' },
+    @{ Name = 'r5_qual2'; Lost = 'changedCodeFix.conventionKey carried spaces (two candidates dropped)' },
+    @{ Name = 'r5_qual3'; Lost = 'changedCodeFix.conventionKey carried spaces' },
+    @{ Name = 'r5_qual4'; Lost = 'nothing; scored a miss only because coverage counted one candidate' },
+    @{ Name = 'r5_qual5'; Lost = 'row status disagreed with its own anchor verdicts' }
+)
+foreach ($trial in $ownerTrials) {
+    $trialResult = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs (New-OwnerV4Matrix -Violating $ownerNine) `
+            -Notes @(@{ constructRef = 'dc2'; rationale = 'No Owner attribute on this test method.'; suggestion = 'Add [Owner("alias")].' }))
+    $trialAnchors = Get-OwnerUnionAnchors -Candidates @($trialResult.Candidates)
+    Assert-Owner (($trialAnchors -join ',') -ceq ($ownerExpectedAnchors -join ',')) `
+        ("Trial $($trial.Name) - which under v3 lost its finding to $($trial.Lost) - does not recover all nine " +
+        "declarations under v4 (got $($trialAnchors -join ','))." )
+    Assert-Owner (@($trialResult.Withheld).Count -eq 0) `
+        "Trial $($trial.Name) withheld something under v4 (got $(@($trialResult.Withheld).Count))."
+    Assert-Owner ([bool]$trialResult.RuleCoverage.Complete) `
+        "Trial $($trial.Name) did not produce complete rule accounting under v4."
+}
+
+# Grouping independence, stated directly: the nine are grouped by the WRAPPER,
+# so the answer cannot depend on how the model packaged it. Reordering the
+# matrix must produce byte-identical coverage and the same candidate count.
+$ownerBase = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs (New-OwnerV4Matrix -Violating $ownerNine))
+$ownerShuffled = @(New-OwnerV4Matrix -Violating $ownerNine)
+$ownerReordered = @($ownerShuffled[7..($ownerShuffled.Count - 1)] + $ownerShuffled[0..6])
+$ownerReorderedResult = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs $ownerReordered)
+Assert-Owner (((Get-OwnerUnionAnchors -Candidates @($ownerBase.Candidates)) -join ',') -ceq
+    ((Get-OwnerUnionAnchors -Candidates @($ownerReorderedResult.Candidates)) -join ',')) `
+    "The order a model answers in changed the coverage; grouping is supposed to be the wrapper's."
+Assert-Owner (@($ownerBase.Candidates).Count -eq @($ownerReorderedResult.Candidates).Count) `
+    "The order a model answers in changed how many candidates the wrapper published."
+Assert-Owner (@($ownerBase.Candidates).Count -eq 2) `
+    "The nine declarations across two files did not group into two per-file candidates (got $(@($ownerBase.Candidates).Count))."
+
+# Every published candidate is wrapper-owned in the ways the trials got wrong.
+foreach ($candidate in @($ownerBase.Candidates)) {
+    Assert-Owner ([string]$candidate.severity -ceq 'suggestion' -and [string]$candidate.impactCategory -ceq 'none') `
+        "A v4 candidate did not take the wrapper's default severity and impact."
+    Assert-Owner ([string]$candidate.changedCodeFix.conventionKey -ceq 'enghub-automated-tests-ownership') `
+        "A v4 candidate's convention key was not derived from the transported rule source."
+    Assert-Owner ([string]$candidate.existingDebtFollowUp.status -ceq 'none') `
+        "A v4 candidate claimed an existing-debt follow-up the contract cannot substantiate."
+    Assert-Owner ([string]$candidate.ruleQuote -clike 'Every test class*') `
+        "A v4 candidate's rule quote was not cut from the rule's own section by the wrapper."
+    Assert-Owner ([string]$candidate.primaryTarget -cmatch '^cf[0-9]{1,3}:[1-9][0-9]{0,6}$') `
+        "A v4 candidate's primary anchor is not a wrapper-resolved changed line."
+}
+# Evidence follows the census: file A's is complete, file B's is not.
+$ownerCandidateA = @($ownerBase.Candidates | Where-Object {
+        [string]$_.filePath -ceq (ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path $ownerFileA) })
+$ownerCandidateB = @($ownerBase.Candidates | Where-Object {
+        [string]$_.filePath -ceq (ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path $ownerFileB) })
+Assert-Owner ($ownerCandidateA.Count -eq 1 -and [string]$ownerCandidateA[0].factIds -ceq ("rdf1:" + ('a' * 64))) `
+    "The wrapper did not cite the complete declaration census as the finding's evidence."
+Assert-Owner ($ownerCandidateB.Count -eq 1 -and [string]$ownerCandidateB[0].factIds -ceq '') `
+    "The wrapper cited an INCOMPLETE declaration census as evidence; a partial count cannot say an attribute is absent."
+
+# Omission is never compliance. This is the property the whole matrix exists for.
+$ownerPartial = @(New-OwnerV4Matrix -Violating $ownerNine | Where-Object { $_.constructRef -cne 'dc5' })
+$ownerPartialResult = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs $ownerPartial)
+Assert-Owner (@($ownerPartialResult.Candidates).Count -eq 0) `
+    "A row that did not account for every in-scope construct still published a finding."
+Assert-Owner ([string]@($ownerPartialResult.RuleCoverage.Rows)[0].status -ceq 'unknown') `
+    "A row missing one construct verdict was not recorded unknown."
+Assert-Owner (@(@($ownerPartialResult.RuleCoverage.Rows)[0].compliantConstructs).Count -eq 0) `
+    "An omitted construct was recorded as compliant."
+Assert-Owner (@($ownerPartialResult.Withheld | Where-Object { [string]$_.detail -like '*dc5*' }).Count -ge 1) `
+    "The construct that got no verdict was not named in the withheld diagnostic."
+
+# A duplicate verdict and a verdict on a construct the wrapper did not ask about
+# are the same class of defect, and neither may narrow the answered set.
+foreach ($case in @(
+        @{ Label = 'duplicated'; Extra = @{ constructRef = 'dc5'; verdict = 'compliant' } },
+        @{ Label = 'unrequested'; Extra = @{ constructRef = 'dc99'; verdict = 'violation' } })) {
+    $defective = @(New-OwnerV4Matrix -Violating $ownerNine) + @($case.Extra)
+    $defectiveResult = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs $defective)
+    Assert-Owner ([string]@($defectiveResult.RuleCoverage.Rows)[0].status -ceq 'unknown') `
+        "A $($case.Label) construct verdict did not make its row unknown."
+    Assert-Owner (@($defectiveResult.Candidates).Count -eq 0) `
+        "A $($case.Label) construct verdict still published a finding."
+}
+
+# A rule the model never answered is a gap in the accounting, not a pass.
+$ownerSilent = Resolve-OwnerV4 (New-OwnerV4Marker -NoRow)
+Assert-Owner (-not [bool]$ownerSilent.RuleCoverage.Complete) `
+    "A rule the model never assessed left the accounting looking complete."
+Assert-Owner (@($ownerSilent.Candidates).Count -eq 0) `
+    "A rule the model never assessed produced a finding."
+
+# Zero false positives: an all-compliant matrix must publish nothing at all.
+$ownerClean = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs (New-OwnerV4Matrix -Violating @()))
+Assert-Owner (@($ownerClean.Candidates).Count -eq 0) `
+    "An all-compliant matrix produced a candidate."
+Assert-Owner ([string]@($ownerClean.RuleCoverage.Rows)[0].status -ceq 'compliant') `
+    "An all-compliant matrix was not recorded compliant."
+
+# `unknown` is always available and always safe: it publishes nothing and says so.
+$ownerUnknown = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs (New-OwnerV4Matrix -Violating @() `
+            -Override @{ dc2 = 'unknown' }))
+Assert-Owner (@($ownerUnknown.Candidates).Count -eq 0) 'An unknown verdict published a finding.'
+Assert-Owner ([string]@($ownerUnknown.RuleCoverage.Rows)[0].status -ceq 'unknown') `
+    'A row carrying an unknown verdict was not recorded unknown.'
+
+# Prose is non-eligibility-critical, end to end: unusable sentences, a note for a
+# construct that got no verdict, and a duplicate note must all cost nothing.
+$ownerBadNotes = Resolve-OwnerV4 (New-OwnerV4Marker -Constructs (New-OwnerV4Matrix -Violating $ownerNine) -Notes @(
+        @{ constructRef = 'dc2'; rationale = ('x' * 5000); suggestion = "bad`u{2028}char" },
+        @{ constructRef = 'dc2'; rationale = 'duplicate note'; suggestion = 'duplicate note' },
+        @{ constructRef = 'dc0'; rationale = 'a note about a construct with no violation'; suggestion = 'none' }
+    ))
+$ownerBadNoteAnchors = Get-OwnerUnionAnchors -Candidates @($ownerBadNotes.Candidates)
+Assert-Owner (($ownerBadNoteAnchors -join ',') -ceq ($ownerExpectedAnchors -join ',')) `
+    "Unusable prose cost the finding its coverage; prose is supposed to be non-eligibility-critical."
+Assert-Owner ([bool]$ownerBadNotes.RuleCoverage.Complete) `
+    "Unusable prose broke the rule accounting."
 
 if ($script:OwnerFailures.Count -gt 0) {
     foreach ($failure in $script:OwnerFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }

@@ -1855,7 +1855,7 @@ function Test-Specialist {
     }
     Check "specialist $Name zero real-model starts" ([int]$m.telemetry.realModelStarts -eq 0 -and [int]$m.telemetry.modelSubprocessStarts -ge 1) ("real=$([int]$m.telemetry.realModelStarts) sub=$([int]$m.telemetry.modelSubprocessStarts)")
     Check "specialist $Name zeroWriteVerified" ([bool]$m.telemetry.zeroWriteVerified) ''
-    Check "specialist $Name marker prefix is the convention marker" ([string]$m.resultMarkerPrefix -like 'CONVENTION_REVIEW_RESULT_V3:*') ("got=$([string]$m.resultMarkerPrefix)")
+    Check "specialist $Name marker prefix is the convention marker" ([string]$m.resultMarkerPrefix -like 'CONVENTION_REVIEW_RESULT_V4:*') ("got=$([string]$m.resultMarkerPrefix)")
     if ($DistinctNonces) {
         $ns = @(@($m.attempts) | ForEach-Object { [string]$_.nonce })
         Check "specialist $Name retry uses a fresh distinct nonce" ($ns.Count -ge 2 -and $ns[0] -cne $ns[1]) ("$($ns -join ',')")
@@ -1863,7 +1863,7 @@ function Test-Specialist {
     }
 }
 $specialistFindingTemplate = [ordered]@{
-    schemaVersion = 3
+    schemaVersion = 4
     prId = '{{binding.prId}}'
     repositoryId = '{{binding.repositoryId}}'
     project = '{{binding.project}}'
@@ -1875,38 +1875,20 @@ $specialistFindingTemplate = [ordered]@{
     configSha256 = '{{binding.configSha256}}'
     scriptSha256 = '{{binding.scriptSha256}}'
     promptSha256 = '{{binding.promptSha256}}'
-    candidates = @([ordered]@{
-            candidateId = 'immutable-state-reassignment'; category = 'convention'
-            severity = 'suggestion'; anchorKind = 'changedFile'; ruleRef = 'rs0'
-            primaryTarget = 'cf0:15'; manifestations = ''
-            ruleSection = 'Immutable state'; ruleQuote = 'never reassigning it'
-            diffEvidence = 'The changed Rename method reassigns widgetId after construction.'
-            impactCategory = 'none'
-            impact = 'The object no longer preserves the authoritative immutable-state convention.'
-            expectedFixOrValidation = 'Remove the reassignment or construct a new immutable widget.'
-            siblingStatus = 'notRequired'; siblingEvidence = ''
-            siblingNotRequiredReason = 'The violation is fully established by the changed assignment.'
-            factIds = ''; confidence = 'high'; residualRiskSummary = ''
-            semanticCandidateVersion = 2
-            changedCodeFix = [ordered]@{
-                action = 'remove'; targets = 'cf0:15'; conventionKey = 'ImmutableState'
-                valueSource = 'authoritativeRule'; evidenceFactIds = ''
-            }
-            existingDebtFollowUp = [ordered]@{
-                status = 'none'; evidenceFactId = ''; selectorKey = ''; scopeKind = ''; scopePath = ''
-                comparableCount = 0; compliantCount = 0; action = ''
-            }
-        })
-    ruleCoverage = @([ordered]@{
+    # Contract v4: a per-construct verdict matrix. The wrapper derives the
+    # candidate, its anchor, its provenance and the rule accounting from this,
+    # so the fixture states only what a model is now asked for.
+    assessments = @([ordered]@{
             ruleRef = 'rs0'
-            ruleSourceSha256 = '4b63e99eb07cf85e89dfdff08eca824ecfc305dcf2ba6ca4b71a691c978b8e12'
-            ruleQuote = 'never reassigning it'; status = 'violation'; scope = 'none'
-            violatingConstructs = 'as0'; compliantConstructs = ''
-            notInReachConstructs = 'dc0'; unknownConstructs = ''
-            violatingChangedFileTargets = 'cf0:15'
-            codeEvidence = 'The changed line reassigns widgetId after construction.'
-            siblingStatus = 'notRequired'; siblingEvidence = ''
-            candidateId = 'immutable-state-reassignment'; notes = ''
+            constructs = @(
+                [ordered]@{ constructRef = 'as0'; verdict = 'violation' },
+                [ordered]@{ constructRef = 'dc0'; verdict = 'compliant' }
+            )
+            notes = @([ordered]@{
+                    constructRef = 'as0'
+                    rationale = 'The changed Rename method reassigns widgetId after construction.'
+                    suggestion = 'Remove the reassignment or construct a new immutable widget.'
+                })
         })
     withheld = @(); residualRisks = @(); nonce = '{{binding.nonce}}'
 }

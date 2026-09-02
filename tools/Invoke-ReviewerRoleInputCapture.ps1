@@ -1029,7 +1029,12 @@ if ($Role -ceq 'verifier') {
         }
     }
     $sourcePromptPath = if ($sourceRole -ceq 'specialist') {
-        Join-Path (Split-Path $ReviewerScript -Parent) 'convention-review.prompt.md'
+        # The SEALED contract version, not this build's: the captured package's
+        # `promptSha256` only reproduces against the prompt it was reviewed with.
+        Get-ReviewerConventionSpecialistPromptPath `
+            -AgentDirectory (Split-Path $ReviewerScript -Parent) `
+            -ContractVersion (Resolve-ReviewerConventionSpecialistSealedContractVersion `
+                -Text ([string]$discoveryPackage.MarkerText))
     }
     else { [string]$configLoad.PromptFilePath }
     $expectedDiscoveryScriptSha256 = if ($PSBoundParameters.ContainsKey('DiscoverySourceScriptSha256')) {
@@ -1061,7 +1066,7 @@ if ($Role -ceq 'verifier') {
         ConvertFrom-Json -Depth 64
     $sourceSpecialistCandidates = @()
     if ($sourceRole -ceq 'specialist') {
-        $specialistContractVersion = Get-ReviewerConventionSpecialistContractVersionFromText -Text $packageMarkerText
+        $specialistContractVersion = Resolve-ReviewerConventionSpecialistSealedContractVersion -Text $packageMarkerText
         $expectedSpecialistPrefix = Get-ReviewerConventionSpecialistMarkerPrefixForVersion `
             -ContractVersion $specialistContractVersion
         if ($packagePrefix -cne $expectedSpecialistPrefix) {

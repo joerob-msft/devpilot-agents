@@ -55,9 +55,9 @@
     "specialist": {
       "model": "claude-sonnet-5",
       "behavior": "success",
-      "markerPrefix": "CONVENTION_REVIEW_RESULT_V3:",
+      "markerPrefix": "CONVENTION_REVIEW_RESULT_V4:",
       "markerTemplate": {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "prId": "{{binding.prId}}",
         "repositoryId": "{{binding.repositoryId}}",
         "project": "{{binding.project}}",
@@ -69,64 +69,20 @@
         "configSha256": "{{binding.configSha256}}",
         "scriptSha256": "{{binding.scriptSha256}}",
         "promptSha256": "{{binding.promptSha256}}",
-        "candidates": [
-          {
-            "candidateId": "immutable-state-reassignment",
-            "category": "convention",
-            "severity": "suggestion",
-            "anchorKind": "changedFile",
-            "ruleRef": "rs0",
-            "primaryTarget": "cf0:15",
-            "manifestations": "",
-            "ruleSection": "Immutable state",
-            "ruleQuote": "never reassigning it",
-            "diffEvidence": "The changed Rename method reassigns widgetId after construction.",
-            "impactCategory": "none",
-            "impact": "The object no longer preserves the authoritative immutable-state convention.",
-            "expectedFixOrValidation": "Remove the reassignment or construct a new immutable widget.",
-            "siblingStatus": "notRequired",
-            "siblingEvidence": "",
-            "siblingNotRequiredReason": "The violation is fully established by the changed assignment.",
-            "factIds": "rf1:5765ca9a7be5fc1f2a2a42838b33e1f95cfdf8b1cadc16c732dd0d4bd1221396",
-            "confidence": "high",
-            "residualRiskSummary": "",
-            "semanticCandidateVersion": 2,
-            "changedCodeFix": {
-              "action": "remove",
-              "targets": "cf0:15",
-              "conventionKey": "ImmutableState",
-              "valueSource": "authoritativeRule",
-              "evidenceFactIds": ""
-            },
-            "existingDebtFollowUp": {
-              "status": "none",
-              "evidenceFactId": "",
-              "selectorKey": "",
-              "scopeKind": "",
-              "scopePath": "",
-              "comparableCount": 0,
-              "compliantCount": 0,
-              "action": ""
-            }
-          }
-        ],
-        "ruleCoverage": [
+        "assessments": [
           {
             "ruleRef": "rs0",
-            "ruleSourceSha256": "{{runtime.ruleCoverageRequest.requiredRows.0.ruleSourceSha256}}",
-            "ruleQuote": "never reassigning it",
-            "status": "violation",
-            "scope": "none",
-            "violatingConstructs": "as0",
-            "compliantConstructs": "",
-            "notInReachConstructs": "dc0",
-            "unknownConstructs": "",
-            "violatingChangedFileTargets": "cf0:15",
-            "codeEvidence": "The changed line reassigns widgetId after construction.",
-            "siblingStatus": "notRequired",
-            "siblingEvidence": "",
-            "candidateId": "immutable-state-reassignment",
-            "notes": ""
+            "constructs": [
+              { "constructRef": "as0", "verdict": "violation" },
+              { "constructRef": "dc0", "verdict": "compliant" }
+            ],
+            "notes": [
+              {
+                "constructRef": "as0",
+                "rationale": "The changed Rename method reassigns widgetId after construction.",
+                "suggestion": "Remove the reassignment or construct a new immutable widget."
+              }
+            ]
           }
         ],
         "withheld": [],
