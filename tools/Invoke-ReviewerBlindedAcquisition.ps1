@@ -1559,7 +1559,13 @@ if ($Role -eq 'verifier') {
         }
     }
     $sourcePromptPath = if ($discoverySourceRole -ceq 'specialist') {
-        Join-Path (Split-Path $reviewerScriptFull -Parent) 'convention-review.prompt.md'
+        # The SEALED contract version, not this build's. A package sealed under
+        # an older contract was reviewed with that contract's prompt, and its
+        # `promptSha256` binding only reproduces against that file.
+        Get-ReviewerConventionSpecialistPromptPath `
+            -AgentDirectory (Split-Path $reviewerScriptFull -Parent) `
+            -ContractVersion (Resolve-ReviewerConventionSpecialistSealedContractVersion `
+                -Text ([string]$discoveryPackage.MarkerText))
     }
     else {
         [string](Get-AgentConfig -Path $configFull -AgentDir (Split-Path $reviewerScriptFull -Parent) `
@@ -1610,7 +1616,7 @@ if ($Role -eq 'verifier') {
     catch { throw "The sealed discovery marker body is not valid JSON; provenance cannot be established." }
     $specialistCandidates = @()
     if ($discoverySourceRole -ceq 'specialist') {
-        $specialistContractVersion = Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryMarkerText
+        $specialistContractVersion = Resolve-ReviewerConventionSpecialistSealedContractVersion -Text $discoveryMarkerText
         $expectedSpecialistPrefix = Get-ReviewerConventionSpecialistMarkerPrefixForVersion `
             -ContractVersion $specialistContractVersion
         if ($discoveryPrefix -cne $expectedSpecialistPrefix) {

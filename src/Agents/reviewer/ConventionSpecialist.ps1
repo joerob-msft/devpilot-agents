@@ -24,7 +24,24 @@ $script:ReviewerConventionSpecialistMarkerPrefix = "CONVENTION_REVIEW_RESULT_V2:
 # so a v2 transcript sealed months ago is still read by the v2 rules and can
 # never be silently re-interpreted under v3.
 $script:ReviewerConventionSpecialistMarkerPrefixV3 = "CONVENTION_REVIEW_RESULT_V3:"
-$script:ReviewerConventionSpecialistContractVersion = 3
+# Version 4 reduces the model to a per-construct verdict matrix. It gets its own
+# prefix for the same reason version 3 did: the reader must know which contract
+# it is reading before it parses anything.
+$script:ReviewerConventionSpecialistMarkerPrefixV4 = "CONVENTION_REVIEW_RESULT_V4:"
+$script:ReviewerConventionSpecialistContractVersion = 4
+
+# One table, so a version can never be known to one lookup and unknown to
+# another. Ordered highest-first: the ambiguity check below walks it directly.
+#
+# The keys are STRINGS. An ordered dictionary indexed with an integer treats it
+# as a POSITION, not a key, so `$map[3]` would silently return the third entry
+# rather than version 3 - and version 2 would appear to work by pure coincidence
+# of its position in the table.
+$script:ReviewerConventionSpecialistMarkerPrefixesByVersion = [ordered]@{
+    '4' = $script:ReviewerConventionSpecialistMarkerPrefixV4
+    '3' = $script:ReviewerConventionSpecialistMarkerPrefixV3
+    '2' = $script:ReviewerConventionSpecialistMarkerPrefix
+}
 
 function Get-ReviewerConventionSpecialistContractVersionFromText {
     <#
@@ -36,19 +53,91 @@ function Get-ReviewerConventionSpecialistContractVersionFromText {
         the current version would make an old, valid transcript look malformed;
         guessing the old one would make a new transcript unreadable. The prefix
         is the only thing that knows, so it decides.
+
+        AMBIGUITY IS A REFUSAL, NOT A PREFERENCE. The scan is a substring search
+        over the whole response, so a marker whose prose quotes another
+        contract's prefix carries two of them. Picking the higher one would let
+        a payload written against one contract be read under another's rules -
+        the precise failure the per-version prefix exists to prevent. Two
+        distinct known prefixes therefore yield 0, which every caller must treat
+        as unreadable rather than as a version.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
-    if ($Text.IndexOf($script:ReviewerConventionSpecialistMarkerPrefixV3,
-            [System.StringComparison]::Ordinal) -ge 0) {
-        return 3
+    $found = [System.Collections.Generic.List[int]]::new()
+    foreach ($entry in $script:ReviewerConventionSpecialistMarkerPrefixesByVersion.GetEnumerator()) {
+        if ($Text.IndexOf([string]$entry.Value, [System.StringComparison]::Ordinal) -ge 0) {
+            [void]$found.Add([int]$entry.Key)
+        }
     }
+    # A v2 prefix is a proper substring of nothing else here - the version digit
+    # differs - so each hit is independent and two hits really are two claims.
+    if ($found.Count -gt 1) { return 0 }
+    if ($found.Count -eq 1) { return $found[0] }
+    # No prefix at all still reads as the frozen v2 contract, which is what every
+    # pre-versioning sealed artifact on disk was written against.
     return 2
 }
 
 function Get-ReviewerConventionSpecialistMarkerPrefixForVersion {
-    param([ValidateSet(2, 3)][int]$ContractVersion = 2)
-    if ($ContractVersion -ge 3) { return [string]$script:ReviewerConventionSpecialistMarkerPrefixV3 }
-    return [string]$script:ReviewerConventionSpecialistMarkerPrefix
+    <#
+        Exact per-version lookup, never `-ge`. An open-ended comparison quietly
+        hands a newer contract the previous contract's prefix, which is a
+        mismatch that no later validation can see: the payload would be scanned
+        for, and sealed under, a marker it was not written against.
+    #>
+    param([ValidateSet(2, 3, 4)][int]$ContractVersion = 2)
+    $key = [string]$ContractVersion
+    if (-not $script:ReviewerConventionSpecialistMarkerPrefixesByVersion.Contains($key)) {
+        throw "Convention specialist contract version '$ContractVersion' has no marker prefix."
+    }
+    return [string]$script:ReviewerConventionSpecialistMarkerPrefixesByVersion[$key]
+}
+
+function Get-ReviewerConventionSpecialistPromptFileName {
+    <#
+        Which prompt file a contract version is reviewed with.
+
+        Version 4 gets its OWN file rather than an edit of the version 3 prompt.
+        `promptSha256` is a binding, so editing the live prompt moves a digest
+        that sealed transcripts, corpus seals and the exact-path oracle all
+        retain - every one of them would need rebaselining to say the same thing
+        it already said. A new file leaves the version 3 digest exactly where it
+        is, which is what lets an artifact sealed under version 3 still verify.
+    #>
+    param([ValidateSet(2, 3, 4)][int]$ContractVersion = 2)
+    if ($ContractVersion -eq 4) { return "convention-review.v4.prompt.md" }
+    return "convention-review.prompt.md"
+}
+
+function Get-ReviewerConventionSpecialistPromptPath {
+    param(
+        [Parameter(Mandatory)][string]$AgentDirectory,
+        [ValidateSet(2, 3, 4)][int]$ContractVersion = 2
+    )
+    $path = Join-Path $AgentDirectory (Get-ReviewerConventionSpecialistPromptFileName -ContractVersion $ContractVersion)
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Convention-specialist prompt '$path' does not exist."
+    }
+    return $path
+}
+
+function Resolve-ReviewerConventionSpecialistSealedContractVersion {
+    <#
+        The contract version of a sealed marker, for callers that must have one.
+
+        `Get-...ContractVersionFromText` answers 0 when the text claims two
+        contracts at once. That is deliberately not a version, and it must not be
+        handed to a `ValidateSet` parameter, where it would surface as a generic
+        argument-validation error that says nothing about what was actually
+        wrong with the artifact. This turns it into the diagnostic a reader needs.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $version = Get-ReviewerConventionSpecialistContractVersionFromText -Text $Text
+    if ($version -le 0) {
+        throw ("The sealed specialist marker carries more than one convention result-marker " +
+            "prefix, so the contract it was written against is ambiguous and it cannot be read.")
+    }
+    return [int]$version
 }
 $script:ReviewerConventionSpecialistArtifactKind = "convention-specialist-preview"
 $script:ReviewerConventionSpecialistArtifactVersion = 2
@@ -61,6 +150,24 @@ $script:ReviewerConventionSpecialistMaxCandidates = 8
 $script:ReviewerConventionSpecialistMaxRuleCoverage = 10
 $script:ReviewerConventionSpecialistMaxCoverageAnchors = 200
 $script:ReviewerConventionSpecialistMaxInputBytes = 327680
+
+# --- Version 4 bounds -------------------------------------------------------
+#
+# A v4 row answers for EVERY in-scope construct, so the row length is set by the
+# construct enumerator's own cap rather than by anything the model chooses.
+# `ReviewerConstructMaxTotal` is 120, so a row can always cover the largest set
+# the wrapper is capable of enumerating; a row can never be asked for more.
+$script:ReviewerConventionSpecialistMaxConstructAssessments = 120
+# Rationale and suggestion are explanatory, never eligibility-critical, so the
+# tail of a very large violation set loses its prose rather than its verdicts.
+# Eight is the old candidate cap: the number of distinct findings this pass was
+# ever able to render prose for anyway.
+$script:ReviewerConventionSpecialistMaxProseAssessments = 8
+$script:ReviewerConventionSpecialistMaxRationaleLength = 200
+$script:ReviewerConventionSpecialistMaxSuggestionLength = 240
+$script:ReviewerConventionSpecialistConstructRefPattern = '^(mi|dc|cm|as)[0-9]{1,3}$'
+$script:ReviewerConventionSpecialistVerdicts = @("violation", "compliant", "unknown")
+
 $script:ReviewerConventionSpecialistUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 
 function ConvertTo-ReviewerConventionSpecialistCanonicalPath {
@@ -835,14 +942,173 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
         belongs on these declarations" - turns on the census, and version 2 gave
         the model no legal way to name the evidence its own conclusion rested
         on.
+
+        Version 4 stops trimming the model's transport surface and removes it.
+        Ten qualification runs found all nine violating declarations every time,
+        with zero false positives, and lost them anyway: to a `primaryTarget`
+        written as a construct id, to six different spellings of a
+        `conventionKey`, to a `notInReachConstructs` list that omitted the 25
+        out-of-kind ids it was a set-complement of, and to a row `status` the
+        wrapper already derived and overrode. Every one of those is arithmetic or
+        provenance the wrapper holds. So version 4 asks for the one thing it does
+        not hold - a verdict on each construct - and derives the rest.
+
+        A row is `ruleRef` plus one entry per in-scope construct, each carrying
+        an opaque `constructRef` and a `verdict`. Rationale and suggestion are
+        optional, violation-only, and NON-ELIGIBILITY-CRITICAL: they are dropped
+        on failure and the verdict survives, so prose can no longer cost a
+        finding. `candidates` and `ruleCoverage` are gone as separate arrays -
+        the wrapper groups violations into candidates itself, which is why a
+        model that splits its answer per file and one that does not now produce
+        identical output.
     #>
     param(
         [Parameter(Mandatory)][string]$ExpectedProject,
         [Parameter(Mandatory)][string]$ExpectedNonce,
         [int]$MaxCandidateItems = $script:ReviewerConventionSpecialistMaxCandidates,
-        [ValidateSet(2, 3)][int]$ContractVersion = 2
+        [ValidateSet(2, 3, 4)][int]$ContractVersion = 2
     )
     $ascii = '^[\x20-\x7E]*$'
+    # Version 4 is a DIFFERENT shape, not a narrower version 3, so it returns its
+    # own schema rather than threading `-ge 3` branches through the one below.
+    # Sharing the builder would mean every existing branch silently applied to a
+    # contract that no longer has the fields those branches are about.
+    if ($ContractVersion -eq 4) {
+        return @{
+            Keys = @(
+                "schemaVersion", "prId", "repositoryId", "project", "reviewedSourceCommit",
+                "targetCommit", "changeSetDigest", "conventionPlanSha256", "factPlanSha256",
+                "configSha256", "scriptSha256", "promptSha256",
+                "assessments", "withheld", "residualRisks", "nonce"
+            )
+            Fields = @{
+                schemaVersion = @{ Type = "int"; Min = 4; Max = 4 }
+                prId = @{ Type = "int"; Min = 1; Max = [int]::MaxValue }
+                repositoryId = @{ Type = "guid" }
+                project = @{ Type = "exact"; Expected = $ExpectedProject }
+                reviewedSourceCommit = @{ Type = "hex"; Length = 40 }
+                targetCommit = @{ Type = "hex"; Length = 40 }
+                changeSetDigest = @{ Type = "hex"; Length = 64 }
+                conventionPlanSha256 = @{ Type = "hex"; Length = 64 }
+                factPlanSha256 = @{ Type = "hex"; Length = 64 }
+                configSha256 = @{ Type = "hex"; Length = 64 }
+                scriptSha256 = @{ Type = "hex"; Length = 64 }
+                promptSha256 = @{ Type = "hex"; Length = 64 }
+                # One row per REQUESTED rule. A row that cannot be read drops
+                # ITSELF; the rules beside it are untouched, because one
+                # unreadable row says nothing about the others.
+                assessments = @{
+                    Type = "objectArray"
+                    MaxItems = $script:ReviewerConventionSpecialistMaxRuleCoverage
+                    ElementFailurePolicy = "drop"
+                    Item = @{
+                        Keys = @("ruleRef", "constructs", "notes")
+                        Fields = @{
+                            ruleRef = @{ Type = "string"; MaxLength = 5; Pattern = '^rs[0-9]{1,3}$' }
+                            # Exactly one entry per in-scope construct. The
+                            # wrapper checks that against the set it enumerated
+                            # and delivered, so an omission cannot pass as
+                            # "nothing to say about it" - it makes the ROW
+                            # incomplete. This is the whole anti-silence
+                            # mechanism, moved off the model's arithmetic and
+                            # onto the wrapper's.
+                            constructs = @{
+                                Type = "objectArray"
+                                MaxItems = $script:ReviewerConventionSpecialistMaxConstructAssessments
+                                # NOT "drop". A dropped construct entry is
+                                # indistinguishable from one the model never
+                                # sent, and both must make the row incomplete
+                                # rather than quietly shrink the set that gets a
+                                # verdict. The row-level policy above already
+                                # keeps that local to one rule.
+                                ElementFailurePolicy = "fail"
+                                Item = @{
+                                    Keys = @("constructRef", "verdict")
+                                    Fields = @{
+                                        constructRef = @{
+                                            Type = "string"; MaxLength = 5
+                                            Pattern = $script:ReviewerConventionSpecialistConstructRefPattern
+                                        }
+                                        verdict = @{
+                                            Type = "enum"
+                                            Values = $script:ReviewerConventionSpecialistVerdicts
+                                        }
+                                    }
+                                }
+                            }
+                            # Prose lives HERE, not on the verdict, for two
+                            # reasons. It is bounded independently, so the
+                            # largest legal row is a hundred and twenty short
+                            # verdicts plus a few sentences rather than a
+                            # hundred and twenty paragraphs - which is what
+                            # keeps the worst legal marker inside the launch
+                            # contract's scan window. And it is `drop`, so an
+                            # unreadable sentence discards ITSELF: prose can
+                            # never cost a verdict, a finding, or a row.
+                            notes = @{
+                                Type = "objectArray"
+                                MaxItems = $script:ReviewerConventionSpecialistMaxProseAssessments
+                                ElementFailurePolicy = "drop"
+                                Item = @{
+                                    Keys = @("constructRef", "rationale", "suggestion")
+                                    Fields = @{
+                                        constructRef = @{
+                                            Type = "string"; MaxLength = 5
+                                            Pattern = $script:ReviewerConventionSpecialistConstructRefPattern
+                                        }
+                                        rationale = @{
+                                            Type = "string"; AllowEmpty = $true
+                                            MaxLength = $script:ReviewerConventionSpecialistMaxRationaleLength
+                                            Pattern = $ascii; NormalizeTypography = $true
+                                        }
+                                        suggestion = @{
+                                            Type = "string"; AllowEmpty = $true
+                                            MaxLength = $script:ReviewerConventionSpecialistMaxSuggestionLength
+                                            Pattern = $ascii; NormalizeTypography = $true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                withheld = @{
+                    Type = "objectArray"; MaxItems = 24
+                    # `drop`, for the same reason the notes array is. A withheld
+                    # entry is the model reporting its OWN limitation; it is not
+                    # a finding, and it must not be able to discard nine correct
+                    # verdicts by being malformed. The drop is itself reported,
+                    # so a lost self-report is visible rather than silent.
+                    ElementFailurePolicy = "drop"
+                    Item = @{
+                        Keys = @("candidateId", "reason", "detail")
+                        Fields = @{
+                            candidateId = @{ Type = "string"; MaxLength = 64; AllowEmpty = $true; Pattern = '^(|[a-z][a-z0-9-]{0,63})$' }
+                            reason = @{ Type = "enum"; Values = $script:ReviewerConventionSpecialistWithheldReasons }
+                            detail = @{ Type = "string"; MaxLength = 800; Pattern = $ascii }
+                        }
+                    }
+                }
+                # A residual risk is a caveat, not a verdict. Under versions 2
+                # and 3 a malformed one failed the WHOLE marker - and in the
+                # final v4 qualification series that is exactly what happened
+                # twice, costing two of five model starts, because the model
+                # wrote the risks as bare strings instead of `{text}` objects.
+                # Nine correct verdicts were discarded over the shape of a
+                # footnote. The normalizer now coerces a bare string, and
+                # anything still unreadable drops itself.
+                residualRisks = @{
+                    Type = "objectArray"; MaxItems = 12
+                    ElementFailurePolicy = "drop"
+                    Item = @{
+                        Keys = @("text")
+                        Fields = @{ text = @{ Type = "string"; MaxLength = 800; Pattern = $ascii; NormalizeTypography = $true } }
+                    }
+                }
+                nonce = @{ Type = "exact"; Expected = $ExpectedNonce }
+            }
+        }
+    }
     $wrapperOwnedKeys = @(
         "filePath", "line", "packName", "ruleSourceId", "ruleSourceRepositoryId",
         "ruleSourcePath", "ruleSourceCommit", "ruleSourceSha256"
@@ -1142,22 +1408,115 @@ function ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome {
         [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
         [Parameter(Mandatory)][hashtable]$Schema,
         [int]$ScanWindowChars = 327680,
-        [ValidateSet(2, 3)][int]$ContractVersion = 2
+        [ValidateSet(2, 3, 4)][int]$ContractVersion = 2
     )
-    $markerPrefix = if ($ContractVersion -ge 3) {
-        $script:ReviewerConventionSpecialistMarkerPrefixV3
-    }
-    else { $script:ReviewerConventionSpecialistMarkerPrefix }
+    $markerPrefix = Get-ReviewerConventionSpecialistMarkerPrefixForVersion -ContractVersion $ContractVersion
     $normalizer = {
         param($MarkerCandidate)
         $normalizedFields = [System.Collections.Generic.List[object]]::new()
+        if ($ContractVersion -eq 4) {
+            # Prose is explanatory. It is the one thing in this contract that a
+            # reader would merely find less useful if it were missing, and the
+            # only thing whose absence costs nothing - so it must never be able
+            # to cost a VERDICT. The schema already isolates it in its own
+            # `drop` array; this adds the two repairs a schema cannot express:
+            # supplying the array when it is absent entirely, and supplying the
+            # two sentence fields when a note carries only one of them.
+            #
+            # Ten trials lost correct findings to fields the model had to author
+            # exactly. Prose is the last one left, and this is why it cannot join
+            # them.
+            $assessmentsProperty = $MarkerCandidate.PSObject.Properties['assessments']
+            # A residual risk is a caveat the model writes in prose. Two of the
+            # five starts in the final qualification series were spent on markers
+            # refused whole because these arrived as bare strings rather than
+            # `{text}` objects - nine correct verdicts discarded over the shape
+            # of a footnote. The obvious intent is recoverable, so recover it.
+            $risksProperty = $MarkerCandidate.PSObject.Properties['residualRisks']
+            if (-not $risksProperty -or $risksProperty.Value -isnot [System.Object[]]) {
+                $from = $(if (-not $risksProperty) { 'absent' } else { 'notAnArray' })
+                Add-Member -InputObject $MarkerCandidate -NotePropertyName 'residualRisks' `
+                    -NotePropertyValue @() -Force
+                [void]$normalizedFields.Add([ordered]@{
+                        Field = 'residualRisks'
+                        From = $from
+                        To = 'emptyArray'
+                        OriginalTypedReason = ("The non-eligibility-critical key 'residualRisks' was " +
+                            "unreadable ($from); no verdict is affected.")
+                    })
+            }
+            else {
+                $risks = [System.Object[]]$risksProperty.Value
+                for ($riskIndex = 0; $riskIndex -lt $risks.Count; $riskIndex++) {
+                    if ($risks[$riskIndex] -isnot [string]) { continue }
+                    $field = "residualRisks[$riskIndex]"
+                    $risks[$riskIndex] = [pscustomobject]@{ text = [string]$risks[$riskIndex] }
+                    [void]$normalizedFields.Add([ordered]@{
+                            Field = $field
+                            From = 'bareString'
+                            To = 'textObject'
+                            OriginalTypedReason = ("The marker wrote '$field' as a bare string rather than " +
+                                "an object with a 'text' key; it was read as that text.")
+                        })
+                }
+            }
+            if ($assessmentsProperty -and $assessmentsProperty.Value -is [System.Object[]]) {
+                $rows = [System.Object[]]$assessmentsProperty.Value
+                for ($rowIndex = 0; $rowIndex -lt $rows.Count; $rowIndex++) {
+                    $row = $rows[$rowIndex]
+                    if ($row -isnot [System.Management.Automation.PSCustomObject]) { continue }
+                    # Absent, `null`, or any other non-array shape are the SAME
+                    # repair. A `notes` value that is not an array fails the
+                    # field rule, and because a bad field fails its whole
+                    # element, that would drop the entire row - every construct
+                    # verdict in it - over a sentence list. `"notes": null` is
+                    # what a model most often writes for "no notes", so the one
+                    # surface this contract promised could never cost a finding
+                    # would have been the easiest way to lose one.
+                    $notesProperty = $row.PSObject.Properties['notes']
+                    if (-not $notesProperty -or $notesProperty.Value -isnot [System.Object[]]) {
+                        $field = "assessments[$rowIndex].notes"
+                        $from = $(if (-not $notesProperty) { 'absent' } else { 'notAnArray' })
+                        Add-Member -InputObject $row -NotePropertyName 'notes' `
+                            -NotePropertyValue @() -Force
+                        [void]$normalizedFields.Add([ordered]@{
+                                Field = $field
+                                From = $from
+                                To = 'emptyArray'
+                                OriginalTypedReason = ("The non-eligibility-critical key '$field' was " +
+                                    "unreadable ($from); the row's verdicts are unaffected.")
+                            })
+                        continue
+                    }
+                    $notes = [System.Object[]]$notesProperty.Value
+                    for ($noteIndex = 0; $noteIndex -lt $notes.Count; $noteIndex++) {
+                        $note = $notes[$noteIndex]
+                        if ($note -isnot [System.Management.Automation.PSCustomObject]) { continue }
+                        foreach ($name in @('rationale', 'suggestion')) {
+                            if ($note.PSObject.Properties[$name]) { continue }
+                            $field = "assessments[$rowIndex].notes[$noteIndex].$name"
+                            Add-Member -InputObject $note -NotePropertyName $name `
+                                -NotePropertyValue '' -Force
+                            [void]$normalizedFields.Add([ordered]@{
+                                    Field = $field
+                                    From = 'absent'
+                                    To = 'emptyString'
+                                    OriginalTypedReason = ("The marker omitted the non-eligibility-critical " +
+                                        "key '$field'; the construct's verdict is unaffected.")
+                                })
+                        }
+                    }
+                }
+            }
+            return @{ Value = $MarkerCandidate; NormalizedFields = @($normalizedFields) }
+        }
         $candidatesProperty = $MarkerCandidate.PSObject.Properties['candidates']
         if ($candidatesProperty -and $candidatesProperty.Value -is [System.Object[]]) {
             $candidates = [System.Object[]]$candidatesProperty.Value
             for ($index = 0; $index -lt $candidates.Count; $index++) {
                 $candidateItem = $candidates[$index]
                 if ($candidateItem -isnot [System.Management.Automation.PSCustomObject]) { continue }
-                if ($ContractVersion -ge 3) {
+                if ($ContractVersion -eq 3) {
                     # `siblingNotRequiredReason` is the reason sibling evidence
                     # was NOT required. When `siblingStatus` is `checked` there
                     # is no such reason - the wrapper's own validation below
@@ -1413,6 +1772,44 @@ function Get-ReviewerConventionSpecialistChangedFileIndex {
     return , $index.ToArray()
 }
 
+function Get-ReviewerConventionSpecialistRoutedPathsByPack {
+    <#
+        Which changed files each selected pack was actually routed to, from the
+        signed convention plan's own routing evidence.
+
+        This is the whole basis of the version 4 in-scope set, and it costs no
+        new pack metadata: `matchedPaths` is already the record of which globs
+        matched which changed path, written when the pack was selected.
+
+        A selected pack with NO routing evidence is reported as UNRESOLVED, not
+        as an empty set. Empty would mean "this rule reaches nothing here", which
+        is a substantive claim; absent means the wrapper cannot say. Treating the
+        second as the first would silently excuse every rule in a plan that lost
+        its routing, which is precisely the silent narrowing this contract exists
+        to prevent.
+    #>
+    param([Parameter(Mandatory)]$ConventionPlan)
+    $byPack = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($pack in @(Get-ReviewerConventionSpecialistValue $ConventionPlan "selectedPacks" @())) {
+        $name = [string](Get-ReviewerConventionSpecialistValue $pack "name" "")
+        if (-not $name -or $byPack.ContainsKey($name)) { continue }
+        $matched = @(Get-ReviewerConventionSpecialistValue $pack "matchedPaths" @())
+        $paths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $resolved = $true
+        if (@($matched).Count -eq 0) { $resolved = $false }
+        foreach ($match in @($matched)) {
+            $path = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                [string](Get-ReviewerConventionSpecialistValue $match "path" ""))
+            # An unreadable routing entry is not a smaller route; it is a route
+            # the wrapper cannot vouch for.
+            if (-not $path) { $resolved = $false; continue }
+            [void]$paths.Add($path)
+        }
+        $byPack[$name] = @{ Paths = $paths; Resolved = $resolved }
+    }
+    return $byPack
+}
+
 function Get-ReviewerConventionSpecialistRuleRequest {
     <#
         The exact accounting the wrapper will reconcile against: one requested
@@ -1425,11 +1822,20 @@ function Get-ReviewerConventionSpecialistRuleRequest {
         fail validation. When the transported set is larger than the cap the
         remainder is reported as unaccounted BY CONSTRUCTION rather than
         quietly sampled.
+
+        Under version 4 each row also carries the EXACT construct id set the
+        model owes a verdict for. The model never computes that set: five of ten
+        qualification runs lost their accounting to a set-complement the wrapper
+        could have done itself, so it now does.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
         [AllowEmptyCollection()][object[]]$Constructs = @(),
-        [ValidateSet(2, 3)][int]$ContractVersion = 2,
+        [ValidateSet(2, 3, 4)][int]$ContractVersion = 2,
+        # Version 4 only. The signed plan's routing evidence decides which
+        # changed files each rule reaches, and therefore which constructs its row
+        # owes a verdict for.
+        $ConventionPlan = $null,
         [int]$MaxRows = $script:ReviewerConventionSpecialistMaxRuleCoverage
     )
     # Ordinal, not Sort-Object. This order does not merely number the rows: it
@@ -1465,6 +1871,22 @@ function Get-ReviewerConventionSpecialistRuleRequest {
         } | ForEach-Object { [string](Get-ReviewerConventionSpecialistValue $_ "constructId" "") } |
         Where-Object { $_ })
     $knownDeclarationRanges = ConvertTo-ReviewerConventionSpecialistConstructIdRanges -Ids $knownDeclarationIds
+    # Version 4: the id set each rule owes a verdict for, keyed by pack. Built
+    # once, because every row of the same pack shares it. Materialized into a
+    # local dictionary rather than bound straight to the helper's return, so the
+    # lookups below index something this scope owns.
+    $routedByPack = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    if ($ContractVersion -eq 4 -and $null -ne $ConventionPlan) {
+        foreach ($routed in (Get-ReviewerConventionSpecialistRoutedPathsByPack `
+                    -ConventionPlan $ConventionPlan).GetEnumerator()) {
+            $routedByPack[[string]$routed.Key] = $routed.Value
+        }
+    }
+    # Enumeration order is the construct id order the wrapper assigned, so the
+    # in-scope list a model receives is stable between runs on the same input.
+    $orderedConstructs = @($Constructs | Where-Object {
+            [string](Get-ReviewerConventionSpecialistValue $_ "constructId" "")
+        })
     for ($i = 0; $i -lt $ordered.Count; $i++) {
         $key = "{0}/{1}" -f `
             [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "PackName" ""),
@@ -1488,6 +1910,35 @@ function Get-ReviewerConventionSpecialistRuleRequest {
         if ($ContractVersion -ge 3) {
             $row.Add("siblingEvidenceRequired", [bool]$siblingEvidenceRequired)
             $row.Add("locallyAdjudicableConstructs", $(if ($siblingEvidenceRequired) { "" } else { $knownDeclarationRanges }))
+        }
+        if ($ContractVersion -eq 4) {
+            $packName = [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "PackName" "")
+            $routed = $null
+            if ($routedByPack.ContainsKey($packName)) { $routed = $routedByPack[$packName] }
+            $inScopeIds = [System.Collections.Generic.List[string]]::new()
+            # No routing evidence is UNRESOLVED, never an empty scope. An empty
+            # scope says the rule reaches nothing in this change set; unresolved
+            # says the wrapper cannot tell. Only the first is an answer.
+            $inScopeResolved = ($null -ne $routed -and [bool]$routed.Resolved)
+            if ($inScopeResolved) {
+                foreach ($construct in $orderedConstructs) {
+                    $constructPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                        [string](Get-ReviewerConventionSpecialistValue $construct "path" ""))
+                    if (-not $constructPath -or -not $routed.Paths.Contains($constructPath)) { continue }
+                    [void]$inScopeIds.Add([string](Get-ReviewerConventionSpecialistValue $construct "constructId" ""))
+                }
+            }
+            # A rule whose routed set is larger than one row can carry cannot be
+            # answered completely, and a partial answer is exactly the silent
+            # narrowing this contract refuses. Say so instead of sampling.
+            if ($inScopeIds.Count -gt $script:ReviewerConventionSpecialistMaxConstructAssessments) {
+                $inScopeResolved = $false
+                $inScopeIds.Clear()
+            }
+            $row.Add("inScopeResolved", [bool]$inScopeResolved)
+            $row.Add("inScopeConstructIds", [string[]]@($inScopeIds.ToArray()))
+            $row.Add("inScopeConstructs", (ConvertTo-ReviewerConventionSpecialistConstructIdRanges `
+                        -Ids ([string[]]@($inScopeIds.ToArray()))))
         }
         [void]$requested.Add([pscustomobject]$row)
     }
@@ -2073,6 +2524,495 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
     }
 }
 
+function Get-ReviewerConventionSpecialistAuthoritativeRuleQuote {
+    <#
+        The first quotable line of a rule's own section.
+
+        Deliberately the same walk the verifier does for its wrapper-derived
+        convention binding. Version 4 stopped asking the model to copy a quote
+        out of a document the wrapper transported, so the wrapper has to cut one
+        itself, and the two must agree: a candidate quoted one way here and
+        another way there would look like two different rules to a reader
+        comparing the specialist's artifact with the verifier's.
+
+        Returns empty when no line qualifies. Empty is a refusal to emit a
+        candidate, never a candidate without provenance.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Section,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SourceText
+    )
+    $normalized = $SourceText.Replace("`r`n", "`n").Replace("`r", "`n")
+    if (-not $Section -or $normalized.IndexOf($Section, [StringComparison]::Ordinal) -lt 0) {
+        # A whole-file source has no heading to cut at, so take the first line
+        # that can stand as a quote. It is still the transported text.
+        if ($Section) { return "" }
+        foreach ($sourceLine in @($normalized -split "`n")) {
+            $line = $sourceLine.Trim()
+            if ($line -match '^(#{1,6})\s+') { continue }
+            if (-not $line) { continue }
+            if ($line.Length -gt 600) { $line = $line.Substring(0, 600).TrimEnd() }
+            if ($line.Length -ge 8 -and $line -notmatch '[^\x20-\x7E]') { return $line }
+        }
+        return ""
+    }
+    $sectionSeen = $false
+    $sectionLevel = 0
+    foreach ($sourceLine in @($normalized -split "`n")) {
+        $line = $sourceLine.Trim()
+        if (-not $sectionSeen) {
+            if ($line -ceq $Section.Trim()) {
+                $sectionSeen = $true
+                if ($line -match '^(#{1,6})\s+') { $sectionLevel = $Matches[1].Length }
+            }
+            continue
+        }
+        if ($line -match '^(#{1,6})\s+') {
+            if ($sectionLevel -eq 0 -or $Matches[1].Length -le $sectionLevel) { break }
+            continue
+        }
+        if (-not $line) { continue }
+        if ($line.Length -gt 600) { $line = $line.Substring(0, 600).TrimEnd() }
+        if ($line.Length -ge 8 -and $line -notmatch '[^\x20-\x7E]') { return $line }
+    }
+    return ""
+}
+
+function Get-ReviewerConventionSpecialistSafeProse {
+    <#
+        Model prose on its way into a rendered artifact.
+
+        Prose is the only model-authored text left in version 4, and it is
+        explicitly non-eligibility-critical, so it may never be the reason a
+        finding is lost. The marker normalizer already bounded and de-typographed
+        it; what is left is the one thing a length rule cannot catch - text that
+        recommends a VOTE, which this layer is forbidden to carry. That is
+        answered by dropping the sentence, not the finding.
+    #>
+    param([AllowEmptyString()][string]$Text = "", [Parameter(Mandatory)][string]$Fallback)
+    $value = [string]$Text
+    if ([string]::IsNullOrWhiteSpace($value)) { return $Fallback }
+    if (Test-ReviewerConventionSpecialistVoteText -Text $value) { return $Fallback }
+    return $value
+}
+
+function Format-ReviewerConventionSpecialistNormalizations {
+    <#
+        The human sentence that records what the wrapper altered in a
+        model-owned field, and the field name that leads it.
+
+        Extracted from the reviewer's inline pipeline because an inline block is
+        not testable, and an untestable describer is exactly how this layer came
+        to hold a defect that could destroy a correct pass. The original read
+        `$_.To` inside a `switch`, where PowerShell has rebound `$_` to the
+        switch's own input - so the read reached a plain string and threw under
+        StrictMode. The two named arms never touched `$_`, so the fault sat
+        unreachable until a contract emitted a normalization kind that fell to
+        `default`. The first one that did cost a live qualification trial its
+        entire pass, and the answer it destroyed was correct.
+
+        So this function has two properties, and both are asserted by tests:
+        it names every kind by what it ACTUALLY was, and it CANNOT throw. Every
+        field is read through the tolerant accessor, so a record missing any key
+        - or carrying a kind nobody has written yet - still describes. A
+        description is commentary; it may never be the reason a finding is lost.
+    #>
+    param([AllowEmptyCollection()][object[]]$Normalizations = @())
+    $records = @($Normalizations)
+    if ($records.Count -eq 0) {     return @{ Detail = ""; Reason = ""; NormalizedCount = 0 } }
+    $described = [System.Collections.Generic.List[string]]::new()
+    foreach ($normalization in $records) {
+        $from = [string](Get-ReviewerConventionSpecialistValue $normalization "From" "")
+        $to = [string](Get-ReviewerConventionSpecialistValue $normalization "To" "")
+        $field = [string](Get-ReviewerConventionSpecialistValue $normalization "Field" "")
+        $typed = [string](Get-ReviewerConventionSpecialistValue $normalization "OriginalTypedReason" "")
+        # Named by what it was. A hard-coded description of one kind mislabels
+        # every other kind, which is worse than saying nothing.
+        $what = switch ($from) {
+            'emptyJsonArray' { "an exact empty JSON array to the schema's empty string" }
+            'absentUnderCheckedSiblingStatus' { "an absent reason to the empty string the checked sibling status requires" }
+            'bareString' { "a bare string to the object with a text key the schema requires" }
+            'absent' { "an absent key to '$to'" }
+            'notAnArray' { "a value that was not an array to '$to'" }
+            default { "'$from' to '$to'" }
+        }
+        [void]$described.Add("$what at '$field' (original typed reason: $typed)")
+    }
+    return @{
+        Detail = [string](Get-ReviewerConventionSpecialistValue $records[0] "Field" "")
+        Reason = "Compatibility-normalized $($records.Count) field(s): " + ($described -join '; ')
+        # Deliberately NOT named `Count`. On a hashtable that name collides with
+        # the dictionary's own entry count, so a caller reading `.Count` gets one
+        # or the other depending on how the adapter resolves it - and a test that
+        # passes for the wrong reason is worse than no test.
+        NormalizedCount = $records.Count
+    }
+}
+
+function Convert-ReviewerConventionSpecialistV4Marker {
+    <#
+        A validated version 4 marker, rewritten into the version 3 shape the rest
+        of this pipeline already understands.
+
+        The point is not translation for its own sake. Every field the model no
+        longer sends still has to exist downstream: the verification and
+        run-reconciliation schemas REQUIRE `changedCodeFix` and
+        `existingDebtFollowUp` on a candidate, and the preview, the gate and the
+        reconciler all read the version 3 candidate shape. Deriving that shape
+        here means version 4 changes what the MODEL is asked for without changing
+        anything the wrapper hands on - so cross-verification, reconciliation and
+        delivery are untouched by this contract.
+
+        It also means the wrapper's own derivations are checked by exactly the
+        code that used to check the model's. Nothing here is trusted because the
+        wrapper wrote it; it goes through the same candidate validation, the same
+        target resolution and the same accounting reconciliation. A derivation
+        bug is caught rather than believed.
+
+        Completeness is decided HERE, against the id set the wrapper itself sent.
+        A row must carry exactly one verdict per in-scope construct. A missing,
+        duplicated or unbound id makes the ROW incomplete and unknown - it never
+        shrinks the set that gets a verdict, because "the model said nothing
+        about this construct" and "the model said this construct is fine" must
+        never arrive at a reader looking the same.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Marker,
+        [Parameter(Mandatory)]$ConventionPlan,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
+        [AllowEmptyCollection()][object[]]$Constructs = @(),
+        [AllowEmptyCollection()][object[]]$ConstructFiles = @(),
+        [hashtable]$RightHandRangesByPath = @{}
+    )
+    $withheld = [System.Collections.Generic.List[object]]::new()
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    $coverageRows = [System.Collections.Generic.List[object]]::new()
+
+    $request = Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $ResolvedSources `
+        -Constructs $Constructs -ContractVersion 4 -ConventionPlan $ConventionPlan
+    $requestedByRef = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($row in @($request.Requested)) { $requestedByRef[[string]$row.ruleRef] = $row }
+
+    $changedFileIndex = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries `
+        -RightHandRangesByPath $RightHandRangesByPath
+    $anchorIdByPath = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    foreach ($anchor in @($changedFileIndex)) {
+        $anchorPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+            [string](Get-ReviewerConventionSpecialistValue $anchor "path" ""))
+        $anchorId = [string](Get-ReviewerConventionSpecialistValue $anchor "anchorId" "")
+        if ($anchorPath -and $anchorId -and -not $anchorIdByPath.ContainsKey($anchorPath)) {
+            $anchorIdByPath.Add($anchorPath, $anchorId)
+        }
+    }
+    $constructById = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($construct in @($Constructs)) {
+        $id = [string](Get-ReviewerConventionSpecialistValue $construct "constructId" "")
+        if ($id -and -not $constructById.ContainsKey($id)) { $constructById.Add($id, $construct) }
+    }
+    $censusByPath = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($file in @($ConstructFiles)) {
+        $filePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+            [string](Get-ReviewerConventionSpecialistValue $file "path" ""))
+        if ($filePath -and -not $censusByPath.ContainsKey($filePath)) { $censusByPath.Add($filePath, $file) }
+    }
+
+    $assessmentsByRef = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($assessment in @($Marker.assessments)) {
+        # Lowercased for the same reason the coverage reconciler does it: the
+        # marker pattern is case-insensitive, so `RS0` validates and then misses
+        # the ordinal lookup, costing a whole rule its accounting.
+        $ruleRef = ([string](Get-ReviewerConventionSpecialistValue $assessment "ruleRef" "")).ToLowerInvariant()
+        if (-not $requestedByRef.ContainsKey($ruleRef)) {
+            [void]$withheld.Add([pscustomobject][ordered]@{
+                    candidateId = ""
+                    reason = "invalidEvidence"
+                    detail = "An assessment cited rule reference '$ruleRef', which the wrapper did not transport."
+                })
+            continue
+        }
+        if ($assessmentsByRef.ContainsKey($ruleRef)) {
+            [void]$withheld.Add([pscustomobject][ordered]@{
+                    candidateId = ""
+                    reason = "invalidEvidence"
+                    detail = "Rule reference '$ruleRef' was assessed more than once; the duplicate was not read."
+                })
+            continue
+        }
+        $assessmentsByRef[$ruleRef] = $assessment
+    }
+
+    foreach ($requestedRow in @($request.Requested)) {
+        $ruleRef = [string]$requestedRow.ruleRef
+        $source = $requestedRow.source
+        $sourceSha = [string](Get-ReviewerConventionSpecialistValue $source "Sha256" "")
+        $section = [string](Get-ReviewerConventionSpecialistValue $source "Section" "")
+        $sourceText = [string](Get-ReviewerConventionSpecialistValue $source "Text" "")
+        $quote = Get-ReviewerConventionSpecialistAuthoritativeRuleQuote -Section $section -SourceText $sourceText
+        $inScopeIds = [string[]]@(Get-ReviewerConventionSpecialistValue $requestedRow "inScopeConstructIds" @())
+        $inScopeResolved = [bool](Get-ReviewerConventionSpecialistValue $requestedRow "inScopeResolved" $false)
+        $scopeKinds = [System.Collections.Generic.List[string]]::new()
+        foreach ($kind in $script:ReviewerConventionSpecialistConstructKinds) {
+            foreach ($id in $inScopeIds) {
+                if (-not $constructById.ContainsKey($id)) { continue }
+                if ([string](Get-ReviewerConventionSpecialistValue $constructById[$id] "kind" "") -cne $kind) { continue }
+                [void]$scopeKinds.Add($kind)
+                break
+            }
+        }
+
+        $assessment = $null
+        if ($assessmentsByRef.ContainsKey($ruleRef)) { $assessment = $assessmentsByRef[$ruleRef] }
+        # A rule the model never answered is left OUT of the accounting entirely,
+        # so the reconciler reports it as the gap it is. Writing an empty row
+        # here would be the wrapper answering on the model's behalf.
+        if ($null -eq $assessment) { continue }
+
+        $verdicts = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+        $proseById = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+        $defects = [System.Collections.Generic.List[string]]::new()
+        if (-not $inScopeResolved) {
+            [void]$defects.Add("the wrapper could not establish which constructs this rule reaches")
+        }
+        # Prose is read first and separately, and its defects are NOT row
+        # defects. A note for a construct that got no verdict, or a second note
+        # for the same one, is simply not used; nothing about the accounting
+        # changes, because a sentence is not an assertion about coverage.
+        foreach ($note in @(Get-ReviewerConventionSpecialistValue $assessment "notes" @())) {
+            $noteRef = [string](Get-ReviewerConventionSpecialistValue $note "constructRef" "")
+            if (-not $noteRef -or $proseById.ContainsKey($noteRef)) { continue }
+            $proseById[$noteRef] = $note
+        }
+        foreach ($entry in @(Get-ReviewerConventionSpecialistValue $assessment "constructs" @())) {
+            $constructRef = [string](Get-ReviewerConventionSpecialistValue $entry "constructRef" "")
+            $verdict = [string](Get-ReviewerConventionSpecialistValue $entry "verdict" "")
+            if ($inScopeIds -cnotcontains $constructRef) {
+                [void]$defects.Add("verdict for '$constructRef', which is not in this rule's in-scope set")
+                continue
+            }
+            if ($verdicts.ContainsKey($constructRef)) {
+                [void]$defects.Add("more than one verdict for '$constructRef'")
+                continue
+            }
+            $verdicts[$constructRef] = $verdict
+        }
+        $missing = @($inScopeIds | Where-Object { -not $verdicts.ContainsKey($_) })
+        if ($missing.Count -gt 0) {
+            [void]$defects.Add("no verdict for " + (@($missing | Select-Object -First 12) -join ",") +
+                $(if ($missing.Count -gt 12) { " and $($missing.Count - 12) more" } else { "" }))
+        }
+
+        $violatingIds = [string[]]@($inScopeIds | Where-Object {
+                $verdicts.ContainsKey($_) -and $verdicts[$_] -ceq "violation"
+            })
+        $compliantIds = [string[]]@($inScopeIds | Where-Object {
+                $verdicts.ContainsKey($_) -and $verdicts[$_] -ceq "compliant"
+            })
+        $unknownIds = [System.Collections.Generic.List[string]]::new()
+        foreach ($id in $inScopeIds) {
+            if ($verdicts.ContainsKey($id) -and $verdicts[$id] -ceq "unknown") { [void]$unknownIds.Add($id) }
+        }
+        # An incomplete row asserts nothing. Every in-scope construct becomes
+        # UNKNOWN and no candidate is emitted from it: a row that could not
+        # account for itself must not also be a source of findings.
+        if ($defects.Count -gt 0) {
+            $violatingIds = [string[]]@()
+            $compliantIds = [string[]]@()
+            $unknownIds.Clear()
+            foreach ($id in $inScopeIds) { [void]$unknownIds.Add($id) }
+            [void]$withheld.Add([pscustomobject][ordered]@{
+                    candidateId = ""
+                    reason = "invalidEvidence"
+                    detail = Get-ReviewerConventionSpecialistShortened -Text (
+                        "Rule '$ruleRef' did not account for its in-scope constructs (" +
+                        (@($defects | Select-Object -First 4) -join "; ") +
+                        "); every construct it reaches was recorded as unknown and it produced no finding.") -MaxLength 800
+                })
+        }
+
+        # Not in reach is the wrapper's arithmetic, not the model's. Five of ten
+        # qualification runs lost their accounting to exactly this complement.
+        $judged = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($id in @($violatingIds) + @($compliantIds) + @($unknownIds.ToArray())) { [void]$judged.Add($id) }
+        $notInReachIds = [string[]]@(@($constructById.Keys) | Where-Object { -not $judged.Contains($_) })
+
+        $rowCandidateIds = [System.Collections.Generic.List[string]]::new()
+        # Grouping is a WRAPPER decision: violations are grouped by file, in the
+        # anchor order the wrapper assigned. A model that answers per file and
+        # one that answers in a single block now produce byte-identical output,
+        # so a correct split can no longer be scored as a miss.
+        $violatingByPath = [ordered]@{}
+        foreach ($id in $violatingIds) {
+            if (-not $constructById.ContainsKey($id)) { continue }
+            $path = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                [string](Get-ReviewerConventionSpecialistValue $constructById[$id] "path" ""))
+            if (-not $path) { continue }
+            if (-not $violatingByPath.Contains($path)) {
+                $violatingByPath[$path] = [System.Collections.Generic.List[string]]::new()
+            }
+            [void]$violatingByPath[$path].Add($id)
+        }
+        $groupPaths = [string[]]@($violatingByPath.Keys)
+        [Array]::Sort($groupPaths, [StringComparer]::Ordinal)
+        $groupIndex = 0
+        foreach ($groupPath in $groupPaths) {
+            $groupIds = [string[]]@($violatingByPath[$groupPath].ToArray())
+            $anchorId = $(if ($anchorIdByPath.ContainsKey($groupPath)) { $anchorIdByPath[$groupPath] } else { "" })
+            $targets = [System.Collections.Generic.List[string]]::new()
+            foreach ($id in $groupIds) {
+                $line = [int](Get-ReviewerConventionSpecialistValue $constructById[$id] "line" 0)
+                if (-not $anchorId -or $line -lt 1) { continue }
+                [void]$targets.Add("$($anchorId):$line")
+            }
+            $candidateId = "c$($ruleRef)f$groupIndex"
+            $groupIndex++
+            if ($targets.Count -ne $groupIds.Count -or -not $quote) {
+                $reason = $(if (-not $quote) {
+                        "the wrapper could not cut a quotable line from the transported rule source"
+                    }
+                    else { "one or more violating constructs do not sit on a delivered changed line" })
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId
+                        reason = "invalidTarget"
+                        detail = Get-ReviewerConventionSpecialistShortened -Text (
+                            "A violation group in '$groupPath' was not published because $reason.") -MaxLength 800
+                    })
+                continue
+            }
+            # The prose of the group's first violating construct speaks for the
+            # group. Deterministic, so the same matrix always renders the same
+            # candidate.
+            $leadEntry = $(if ($proseById.ContainsKey($groupIds[0])) { $proseById[$groupIds[0]] } else { $null })
+            $rationale = Get-ReviewerConventionSpecialistSafeProse -Text (
+                [string](Get-ReviewerConventionSpecialistValue $leadEntry "rationale" "")) -Fallback (
+                "The transported rule governs this construct and it does not satisfy it.")
+            $suggestion = Get-ReviewerConventionSpecialistSafeProse -Text (
+                [string](Get-ReviewerConventionSpecialistValue $leadEntry "suggestion" "")) -Fallback (
+                "Bring the named constructs into line with the quoted rule, or record why the rule does not apply.")
+            $factIds = ""
+            if ($censusByPath.ContainsKey($groupPath)) {
+                $census = $censusByPath[$groupPath]
+                # A partial census is not evidence: it cannot say an attribute is
+                # absent, only that it was not seen in what was read.
+                if ([bool](Get-ReviewerConventionSpecialistValue $census "attributeCountsComplete" $false) -and
+                    [bool](Get-ReviewerConventionSpecialistValue $census "wholeFileComplete" $false)) {
+                    $factIds = [string](Get-ReviewerConventionSpecialistValue $census "evidenceFactId" "")
+                }
+            }
+            $conventionKey = [string](Get-ReviewerConventionSpecialistValue $source "SourceId" "")
+            if ($conventionKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:\-]{0,127}$') {
+                $conventionKey = [string](Get-ReviewerConventionSpecialistValue $source "PackName" "")
+            }
+            if ($conventionKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:\-]{0,127}$') {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId
+                        reason = "unverifiedSource"
+                        detail = "A violation group was not published because its rule has no usable convention key."
+                    })
+                continue
+            }
+            $targetText = (@($targets.ToArray()) -join ",")
+            [void]$rowCandidateIds.Add($candidateId)
+            [void]$candidates.Add(@{
+                    candidateId = $candidateId
+                    category = "convention"
+                    # Version 4 never escalates. Escalation needs a policy the
+                    # pack does not yet express, and inventing one here would be
+                    # the wrapper asserting an impact nobody stated.
+                    severity = "suggestion"
+                    anchorKind = "changedFile"
+                    filePath = ""
+                    line = 0
+                    # Left empty on purpose: the version 3 resolver derives the
+                    # primary anchor, the file and the line from the target union
+                    # below. Deriving it a second time here would be a second
+                    # statement of the same thing, and two statements can differ.
+                    primaryTarget = ""
+                    manifestations = $targetText
+                    ruleRef = $ruleRef
+                    ruleSection = $section
+                    ruleQuote = $quote
+                    diffEvidence = "Wrapper-resolved changed-line anchors for this rule: $targetText."
+                    impactCategory = "none"
+                    impact = $rationale
+                    expectedFixOrValidation = $suggestion
+                    siblingStatus = "notRequired"
+                    siblingEvidence = ""
+                    siblingNotRequiredReason = "The wrapper adjudicated this rule from the constructs it enumerated and delivered."
+                    factIds = $factIds
+                    confidence = "medium"
+                    residualRiskSummary = ""
+                    semanticCandidateVersion = 2
+                    changedCodeFix = @{
+                        action = "replace"
+                        targets = $targetText
+                        conventionKey = $conventionKey
+                        valueSource = "authoritativeRule"
+                        evidenceFactIds = ""
+                    }
+                    # Version 4 makes no debt claim. The counts behind one are a
+                    # pack policy this contract does not carry, and a follow-up
+                    # nobody can substantiate is worse than none.
+                    existingDebtFollowUp = @{
+                        status = "none"
+                        evidenceFactId = ""
+                        selectorKey = ""
+                        scopeKind = ""
+                        scopePath = ""
+                        comparableCount = 0
+                        compliantCount = 0
+                        action = ""
+                    }
+                })
+        }
+
+        $reachEvidence = ("The wrapper routed this rule to " + @($groupPaths).Count.ToString() +
+            " changed file(s) by its pack's path globs; every construct outside that routing is out of reach.")
+        [void]$coverageRows.Add([pscustomobject][ordered]@{
+                ruleRef = $ruleRef
+                ruleSourceSha256 = $sourceSha
+                ruleQuote = (Get-ReviewerConventionSpecialistShortened -Text $quote -MaxLength 200)
+                # Derived by EXACTLY the rule the coverage reconciler applies:
+                # any unknown anchor makes the row unknown, then any violation
+                # makes it a violation, then an unweighed row is notApplicable,
+                # else compliant. Authoring anything else here would be the
+                # wrapper disagreeing with itself - and the reconciler counts a
+                # headline that contradicts its own anchors as a degraded row and
+                # zeroes `Complete`. A model that answers `unknown` for a
+                # construct it genuinely could not decide - which this contract
+                # explicitly asks it to do - must not cost the pass its
+                # accounting for having been honest.
+                status = $(if ($defects.Count -gt 0) { "unknown" }
+                    elseif ($unknownIds.Count -gt 0) { "unknown" }
+                    elseif (@($violatingIds).Count -gt 0) { "violation" }
+                    elseif (@($compliantIds).Count -gt 0) { "compliant" }
+                    else { "notApplicable" })
+                scope = $(if ($scopeKinds.Count -gt 0) { (@($scopeKinds.ToArray()) -join ",") } else { "none" })
+                violatingConstructs = (ConvertTo-ReviewerConventionSpecialistConstructIdRanges -Ids $violatingIds)
+                compliantConstructs = (ConvertTo-ReviewerConventionSpecialistConstructIdRanges -Ids $compliantIds)
+                notInReachConstructs = (ConvertTo-ReviewerConventionSpecialistConstructIdRanges -Ids $notInReachIds)
+                unknownConstructs = (ConvertTo-ReviewerConventionSpecialistConstructIdRanges -Ids ([string[]]@($unknownIds.ToArray())))
+                violatingChangedFileTargets = ""
+                codeEvidence = $reachEvidence
+                siblingStatus = "notRequired"
+                siblingEvidence = ""
+                candidateId = $(if ($rowCandidateIds.Count -gt 0) { $rowCandidateIds[0] } else { "" })
+                notes = ""
+            })
+    }
+
+    $converted = @{}
+    foreach ($key in @($Marker.Keys)) {
+        if (@("assessments") -ccontains [string]$key) { continue }
+        $converted[$key] = $Marker[$key]
+    }
+    $converted["schemaVersion"] = 3
+    $converted["candidates"] = @($candidates.ToArray())
+    $converted["ruleCoverage"] = @($coverageRows.ToArray())
+    $converted["withheld"] = @(@($Marker.withheld) + @($withheld.ToArray()))
+    return @{ Marker = $converted; ChangedFileIndex = $changedFileIndex }
+}
+
 function Resolve-ReviewerConventionSpecialistCandidates {
     param(
         [Parameter(Mandatory)][hashtable]$Marker,
@@ -2084,7 +3024,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         [AllowEmptyCollection()][object[]]$ConstructFiles = @(),
         [bool]$ConstructsIncomplete = $false,
         [hashtable]$RightHandRangesByPath = @{},
-        [ValidateSet(2, 3)][int]$ContractVersion = 2,
+        [ValidateSet(2, 3, 4)][int]$ContractVersion = 2,
         # Candidates the marker extractor withheld because a semantic field of
         # theirs could not be read. They arrive here so they leave a mark: a
         # shortened candidate list that says nothing about what is missing from
@@ -2096,6 +3036,22 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     }
     if (@($ChangeEntries).Count -eq 0) {
         throw "Convention specialist candidate validation requires at least one pinned change entry."
+    }
+    # Version 4 arrives as a per-construct verdict matrix. Convert it to the
+    # version 3 candidate/coverage shape FIRST, then resolve it with exactly the
+    # code that resolves a version 3 marker. The wrapper's own derivations are
+    # then validated by the same checks that used to validate the model's, so a
+    # derivation bug is caught here rather than published.
+    if ($ContractVersion -eq 4) {
+        $convertedV4 = Convert-ReviewerConventionSpecialistV4Marker -Marker $Marker `
+            -ConventionPlan $ConventionPlan -ResolvedSources $ResolvedSources `
+            -ChangeEntries $ChangeEntries -Constructs $Constructs `
+            -ConstructFiles $ConstructFiles -RightHandRangesByPath $RightHandRangesByPath
+        return Resolve-ReviewerConventionSpecialistCandidates -Marker $convertedV4.Marker `
+            -ConventionPlan $ConventionPlan -FactPlan $FactPlan -ResolvedSources $ResolvedSources `
+            -ChangeEntries $ChangeEntries -Constructs $Constructs -ConstructFiles $ConstructFiles `
+            -ConstructsIncomplete $ConstructsIncomplete -RightHandRangesByPath $RightHandRangesByPath `
+            -ContractVersion 3 -DroppedElements $DroppedElements
     }
     $sourceMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     foreach ($source in @($ResolvedSources)) {
@@ -2674,7 +3630,7 @@ function New-ReviewerConventionSpecialistInput {
         # saying so here the pass fails closed for a reason that is not a
         # finding about the change.
         [AllowEmptyString()][string]$ReplayNotice = "",
-        [ValidateSet(2, 3)][int]$ContractVersion = 2,
+        [ValidateSet(2, 3, 4)][int]$ContractVersion = 2,
         [int]$MaxInputBytes = $script:ReviewerConventionSpecialistMaxInputBytes
     )
     if (@($ResolvedSources).Count -eq 0) {
@@ -2701,7 +3657,7 @@ function New-ReviewerConventionSpecialistInput {
             }
         })
     $ruleRequest = Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $ResolvedSources `
-        -Constructs $Constructs -ContractVersion $ContractVersion
+        -Constructs $Constructs -ContractVersion $ContractVersion -ConventionPlan $ConventionPlan
     # The anchor list is bounded too. It is only a naming convenience for the
     # rows - every path in it is already in `changedFiles` - and letting it grow
     # with a thousand-file change set would push the envelope past its bound and
@@ -2757,6 +3713,16 @@ function New-ReviewerConventionSpecialistInput {
                         $row["siblingEvidenceRequired"] = [bool]$_.siblingEvidenceRequired
                         $row["locallyAdjudicableConstructs"] = [string]$_.locallyAdjudicableConstructs
                     }
+                    if ($ContractVersion -eq 4) {
+                        # The EXACT id set this row owes a verdict for, already
+                        # range-compressed. The model never derives it, because
+                        # deriving it is what five of ten qualification runs got
+                        # wrong; and `inScopeResolved` false means the wrapper
+                        # could not establish the set at all, which is not the
+                        # same as a rule that reaches nothing.
+                        $row["inScopeResolved"] = [bool]$_.inScopeResolved
+                        $row["inScopeConstructs"] = [string]$_.inScopeConstructs
+                    }
                     [pscustomobject]$row
                 })
             unrequestedSources = @($ruleRequest.Unrequested)
@@ -2785,25 +3751,31 @@ function New-ReviewerConventionSpecialistInput {
         # six hashes, a nonce and seven binding fields at the end of a long
         # analysis is asking for exactly that. This is a formatting aid and
         # nothing else: it contains no finding, no rule, and no judgement.
-        markerScaffold = [pscustomobject][ordered]@{
-            schemaVersion = $ContractVersion
-            prId = $PrId
-            repositoryId = $RepositoryId
-            project = $Project
-            reviewedSourceCommit = $SourceCommit
-            targetCommit = $TargetCommit
-            changeSetDigest = $ChangeSetDigest
-            conventionPlanSha256 = $ConventionPlanSha256
-            factPlanSha256 = $FactPlanSha256
-            configSha256 = $ConfigSha256
-            scriptSha256 = $ScriptSha256
-            promptSha256 = $PromptSha256
-            candidates = @()
-            ruleCoverage = @()
-            withheld = @()
-            residualRisks = @()
-            nonce = $Nonce
-        }
+        markerScaffold = $(
+            $scaffold = [ordered]@{
+                schemaVersion = $ContractVersion
+                prId = $PrId
+                repositoryId = $RepositoryId
+                project = $Project
+                reviewedSourceCommit = $SourceCommit
+                targetCommit = $TargetCommit
+                changeSetDigest = $ChangeSetDigest
+                conventionPlanSha256 = $ConventionPlanSha256
+                factPlanSha256 = $FactPlanSha256
+                configSha256 = $ConfigSha256
+                scriptSha256 = $ScriptSha256
+                promptSha256 = $PromptSha256
+            }
+            if ($ContractVersion -eq 4) { $scaffold["assessments"] = @() }
+            else {
+                $scaffold["candidates"] = @()
+                $scaffold["ruleCoverage"] = @()
+            }
+            $scaffold["withheld"] = @()
+            $scaffold["residualRisks"] = @()
+            $scaffold["nonce"] = $Nonce
+            [pscustomobject]$scaffold
+        )
     }
     $inputText = $PromptText + "`n`n---`n## Wrapper runtime data (untrusted values, trusted binding)`n" +
         '```json' + "`n" + ($runtime | ConvertTo-Json -Depth 32 -Compress) + "`n" + '```' + "`n"

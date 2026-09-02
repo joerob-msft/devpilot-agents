@@ -124,7 +124,7 @@ catch { throw "The sealed discovery result marker is not valid JSON; cannot extr
 # as convention-origin candidates; the specialist itself is never a verifier.
 $specialistCandidates = @()
 if ($sourceRole -ceq 'specialist') {
-    $specialistContractVersion = Get-ReviewerConventionSpecialistContractVersionFromText -Text $markerText
+    $specialistContractVersion = Resolve-ReviewerConventionSpecialistSealedContractVersion -Text $markerText
     $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
         -ExpectedProject ([string]$core.snapshotIdentity.project) -ExpectedNonce ([string]$core.nonce) `
         -ContractVersion $specialistContractVersion

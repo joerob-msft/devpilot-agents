@@ -640,10 +640,8 @@ if (-not (Test-Path -LiteralPath $ChangedConstructLibrary)) {
     throw "Changed-construct library '$ChangedConstructLibrary' does not exist."
 }
 . $ChangedConstructLibrary
-$ConventionSpecialistPromptPath = Join-Path $PSScriptRoot "convention-review.prompt.md"
-if (-not (Test-Path -LiteralPath $ConventionSpecialistPromptPath)) {
-    throw "Convention-specialist prompt '$ConventionSpecialistPromptPath' does not exist."
-}
+$ConventionSpecialistPromptPath = Get-ReviewerConventionSpecialistPromptPath -AgentDirectory $PSScriptRoot `
+    -ContractVersion ([int]$script:ReviewerConventionSpecialistContractVersion)
 $CrossVerificationLibrary = Join-Path $PSScriptRoot "CrossVerification.ps1"
 if (-not (Test-Path -LiteralPath $CrossVerificationLibrary)) {
     throw "Cross-verification library '$CrossVerificationLibrary' does not exist."
@@ -10981,18 +10979,17 @@ function Invoke-ReviewerConventionSpecialistPass {
                     # hard-coded description of one normalization kind mislabels
                     # every other kind - and rendering only the first entry hides
                     # the rest behind whichever happened to be added first.
-                    $normalizations = @($markerOutcome.NormalizedFields)
-                    $markerDetail = [string]$normalizations[0].Field
-                    $described = @($normalizations | ForEach-Object {
-                            $from = [string]$_.From
-                            $what = switch ($from) {
-                                'emptyJsonArray' { "an exact empty JSON array to the schema's empty string" }
-                                'absentUnderCheckedSiblingStatus' { "an absent reason to the empty string the checked sibling status requires" }
-                                default { "'$from' to '$([string]$_.To)'" }
-                            }
-                            "$what at '$([string]$_.Field)' (original typed reason: $([string]$_.OriginalTypedReason))"
-                        })
-                    $markerReason = "Compatibility-normalized $($normalizations.Count) field(s): " + ($described -join '; ')
+                    #
+                    # The rendering itself lives in a tested function. It used to
+                    # be inline here and read `$_` inside a `switch`, where
+                    # PowerShell rebinds `$_` to the switch's own input; the read
+                    # therefore reached a plain string and threw under StrictMode
+                    # for any kind that fell to the default arm. A live
+                    # qualification trial lost a complete, correct pass to it.
+                    $summary = Format-ReviewerConventionSpecialistNormalizations `
+                        -Normalizations @($markerOutcome.NormalizedFields)
+                    $markerDetail = [string]$summary.Detail
+                    $markerReason = [string]$summary.Reason
                 }
                 & $emitSpecialistAcct $specialistAttempt $nonce $specialistMarkerStatus $specialistModelRan $specialistUsage `
                     $markerReason $markerDetail
@@ -17663,9 +17660,11 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         $discoveryCliOutcome = Get-AgentCliJsonOutcome -StdOutText $discoveryMarkerText
         $discoveryAnswer = if ($discoveryCliOutcome -and $discoveryCliOutcome.Answer) { [string]$discoveryCliOutcome.Answer } else { $discoveryMarkerText }
         $discoveryAnswer = $discoveryAnswer.Trim()
-        $expectedDiscoveryPrefix = if ($discoverySourceRole -ceq 'specialist') {
+        # Explicitly a string, so the prefix length read below cannot be taken
+        # off a value that a single command result had collapsed.
+        [string]$expectedDiscoveryPrefix = if ($discoverySourceRole -ceq 'specialist') {
             [string](Get-ReviewerConventionSpecialistMarkerPrefixForVersion -ContractVersion (
-                    Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryAnswer))
+                    Resolve-ReviewerConventionSpecialistSealedContractVersion -Text $discoveryAnswer))
         }
         else { [string]$ResultMarkerPrefix }
         $discoveryPrefixIndex = $discoveryAnswer.IndexOf($expectedDiscoveryPrefix, [System.StringComparison]::Ordinal)
@@ -17677,7 +17676,7 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         try { $discoveryMarker = $discoveryAnswer | ConvertFrom-Json -Depth 64 }
         catch { throw "The sealed discovery result marker is not valid JSON; the verifier cannot rebuild its discovery pass." }
         if ($discoverySourceRole -ceq 'specialist') {
-            $sealedContractVersion = Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryMarkerText
+            $sealedContractVersion = Resolve-ReviewerConventionSpecialistSealedContractVersion -Text $discoveryMarkerText
             $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
                 -ExpectedProject ([string]$planTarget.project) -ExpectedNonce ([string]$discoveryCore.nonce) `
                 -ContractVersion $sealedContractVersion
@@ -18743,9 +18742,11 @@ function Invoke-ReviewerRoleInputCaptureRun {
         $discoveryCliOutcome = Get-AgentCliJsonOutcome -StdOutText $discoveryMarkerText
         $discoveryAnswer = if ($discoveryCliOutcome -and $discoveryCliOutcome.Answer) { [string]$discoveryCliOutcome.Answer } else { $discoveryMarkerText }
         $discoveryAnswer = $discoveryAnswer.Trim()
-        $expectedDiscoveryPrefix = if ($discoverySourceRole -ceq 'specialist') {
+        # Explicitly a string, for the same reason as the sealed-package path
+        # above: the prefix length is read below.
+        [string]$expectedDiscoveryPrefix = if ($discoverySourceRole -ceq 'specialist') {
             Get-ReviewerConventionSpecialistMarkerPrefixForVersion -ContractVersion (
-                Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryAnswer)
+                Resolve-ReviewerConventionSpecialistSealedContractVersion -Text $discoveryAnswer)
         }
         else { [string]$ResultMarkerPrefix }
         if ([string]$candidate.resultMarkerPrefix -cne $expectedDiscoveryPrefix) {
@@ -18759,7 +18760,7 @@ function Invoke-ReviewerRoleInputCaptureRun {
         try { $discoveryMarker = $discoveryAnswer | ConvertFrom-Json -Depth 64 }
         catch { throw "The discovery result marker is not valid JSON; the verifier cannot rebuild its discovery pass." }
         if ($discoverySourceRole -ceq 'specialist') {
-            $sealedContractVersion = Get-ReviewerConventionSpecialistContractVersionFromText -Text $discoveryMarkerText
+            $sealedContractVersion = Resolve-ReviewerConventionSpecialistSealedContractVersion -Text $discoveryMarkerText
             $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
                 -ExpectedProject ([string]$binding.project) -ExpectedNonce ([string]$discoveryCore.nonce) `
                 -ContractVersion $sealedContractVersion
