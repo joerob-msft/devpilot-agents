@@ -477,7 +477,8 @@ Describe 'dispatch protocol primitives' {
             [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
         $deadPid = 2147483647
         & pwsh -NoLogo -NoProfile -NonInteractive -File $guardianPath `
-            -RuntimeRoot $runtimeRoot -BrokerProcessId $deadPid -Token $token -DeadlineSeconds 2
+            -RuntimeRoot $runtimeRoot -BrokerProcessId $deadPid -BrokerStartTimeUtcTicks 1 `
+            -Token $token -DeadlineSeconds 2
         $LASTEXITCODE | Should -Be 0
         Get-ChildItem -LiteralPath $runtimeRoot -Force | Should -BeNullOrEmpty
     }
@@ -499,7 +500,9 @@ Describe 'dispatch protocol primitives' {
         $guardianErr = Join-Path $runtimeRoot 'guardian.stderr'
         $guardian = New-AgentRedirectedProcess -FilePath (Resolve-AgentPwshPath) `
             -ArgumentList @('-NoProfile', '-File', $guardianPath, '-RuntimeRoot', $runtimeRoot,
-                '-BrokerProcessId', [string]$broker.Id, '-Token', $token, '-DeadlineSeconds', '5') `
+                '-BrokerProcessId', [string]$broker.Id, '-BrokerStartTimeUtcTicks',
+                [string]$broker.StartTime.ToUniversalTime().Ticks, '-Token', $token,
+                '-DeadlineSeconds', '5') `
             -StandardOutputPath $guardianOut -StandardErrorPath $guardianErr
         try {
             $ready = Join-Path $runtimeRoot "guardian-$token.ready"
@@ -524,8 +527,14 @@ Describe 'dispatch protocol primitives' {
             $guardian.Process.HasExited | Should -BeFalse
             $broker.Kill()
             $broker.WaitForExit(5000) | Should -BeTrue
+            # This test runner owns the child, unlike the production broker.
+            # Observe and reap it so the guardian does not see a zombie leader.
+            $childDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while (-not $child.Process.HasExited -and [DateTime]::UtcNow -lt $childDeadline) {
+                Start-Sleep -Milliseconds 25
+            }
+            $child.Process.HasExited | Should -BeTrue
             $guardian.Process.WaitForExit(10000) | Should -BeTrue
-            $child.Process.WaitForExit(10000) | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.json") | Should -BeFalse
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.ready") | Should -BeFalse
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.registered") | Should -BeFalse
@@ -571,6 +580,7 @@ Describe 'dispatch protocol primitives' {
             $result = Invoke-TimedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList @(
                 '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $guardianPath,
                 '-RuntimeRoot', $runtimeRoot, '-BrokerProcessId', '2147483647',
+                '-BrokerStartTimeUtcTicks', '1',
                 '-Token', $token, '-DeadlineSeconds', '2') -CaptureStdOut -CaptureStdErr -TimeoutSeconds 2
             $result.TimedOut | Should -BeTrue
             $leader.Process.HasExited | Should -BeFalse

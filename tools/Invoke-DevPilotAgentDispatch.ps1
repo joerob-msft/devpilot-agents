@@ -339,7 +339,10 @@ function Publish-ProtectedPrompt {
             $guardian = New-AgentRedirectedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList @(
                 '-NoLogo', '-NoProfile', '-NonInteractive', '-File',
                 (Join-Path $PSScriptRoot 'Invoke-DevPilotPromptGuardian.ps1'),
-                '-RuntimeRoot', $runtimeRoot, '-BrokerProcessId', [string]$PID, '-Token', $token
+                '-RuntimeRoot', $runtimeRoot, '-BrokerProcessId', [string]$PID,
+                '-BrokerStartTimeUtcTicks',
+                [string]([Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks),
+                '-Token', $token
             ) -StandardOutputPath "$guardianDiagnostics.stdout" -StandardErrorPath "$guardianDiagnostics.stderr"
             $readyPath = Join-Path $runtimeRoot "guardian-$token.ready"
             $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)

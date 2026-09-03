@@ -150,8 +150,18 @@ $child = New-AgentPersistentRedirectedProcess -FilePath (Resolve-AgentPwshPath) 
             $containment = New-AgentProcessContainment -Process $child.Process
             try {
                 $containment.ProcessGroupId | Should -Be $child.Process.Id
-                Stop-AgentProcessContainment -Containment $containment -Process $child.Process
-                $child.Process.WaitForExit(10000) | Should -BeTrue
+                Stop-AgentProcessContainment -Containment $containment -Process $child.Process |
+                    Should -BeTrue
+                # Assert real OS-level process-group death via the same
+                # kill(-pgid, 0) observer the containment helpers use, not a
+                # raw .Process.WaitForExit(): .NET's redirected-stream
+                # WaitForExit is documented to hang past its timeout when a
+                # process was terminated by an external signal rather than
+                # Process.Kill() (dotnet/runtime #26165, #29232), which is
+                # exactly this scenario. Every sibling Unix containment test
+                # verifies termination this way instead.
+                Test-AgentProcessContainmentExited -Containment $containment -Process $child.Process |
+                    Should -BeTrue
             }
 
             finally {

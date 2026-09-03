@@ -3,6 +3,7 @@
 param(
     [Parameter(Mandatory)][string]$RuntimeRoot,
     [Parameter(Mandatory)][int]$BrokerProcessId,
+    [Parameter(Mandatory)][long]$BrokerStartTimeUtcTicks,
     [Parameter(Mandatory)][string]$Token,
     [ValidateRange(1, 300)][int]$DeadlineSeconds = 60
 )
@@ -75,13 +76,30 @@ function Test-GuardianGroupAlive {
 }
 function Test-GuardianLeaderLive {
     param([int]$ProcessGroupId, [long]$LeaderStartTimeUtcTicks)
-    $leader = Get-Process -Id $ProcessGroupId -ErrorAction SilentlyContinue
-    return ($null -ne $leader -and $LeaderStartTimeUtcTicks -gt 0 -and
-        $leader.StartTime.ToUniversalTime().Ticks -eq $LeaderStartTimeUtcTicks)
+    if ($LeaderStartTimeUtcTicks -le 0) { return $false }
+    try {
+        $leader = Get-Process -Id $ProcessGroupId -ErrorAction Stop
+        return $leader.StartTime.ToUniversalTime().Ticks -eq $LeaderStartTimeUtcTicks
+    }
+    catch {
+        return $false
+    }
+}
+function Test-GuardianBrokerLive {
+    param([int]$ProcessId, [long]$StartTimeUtcTicks)
+    if ($StartTimeUtcTicks -le 0) { return $false }
+    try {
+        $broker = Get-Process -Id $ProcessId -ErrorAction Stop
+        return $broker.StartTime.ToUniversalTime().Ticks -eq $StartTimeUtcTicks
+    }
+    catch {
+        return $false
+    }
 }
 $terminationRequested = $false
 while ($true) {
-    $brokerAlive = $null -ne (Get-Process -Id $BrokerProcessId -ErrorAction SilentlyContinue)
+    $brokerAlive = Test-GuardianBrokerLive -ProcessId $BrokerProcessId `
+        -StartTimeUtcTicks $BrokerStartTimeUtcTicks
     if (Test-Path -LiteralPath $registration -PathType Leaf) {
         try {
             $record = Get-Content -LiteralPath $registration -Raw -Encoding UTF8 |

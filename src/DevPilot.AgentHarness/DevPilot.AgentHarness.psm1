@@ -2179,25 +2179,60 @@ function New-AgentPersistentRedirectedProcess {
     $savedEnvironment = @{}
     $removedNames = @($EnvironmentVariablesToRemove) + @(Get-AgentSessionIsolationEnvVars) |
         Sort-Object -Unique
-    try {
-        foreach ($name in $removedNames) {
-            $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-            [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    if ($IsWindows) {
+        # On Windows, Start-Process -RedirectStandardOutput/-RedirectStandardError
+        # is implemented via CreateProcess with real file handles wired directly
+        # into the child's STARTUPINFO, so the redirection is native OS-level
+        # plumbing that survives this launching process's own exit.
+        try {
+            foreach ($name in $removedNames) {
+                $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+                [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+            }
+            $parameters = @{
+                FilePath = $absolute
+                ArgumentList = $ArgumentList
+                RedirectStandardOutput = $stdoutPath
+                RedirectStandardError = $stderrPath
+                PassThru = $true
+            }
+            if ($WorkingDirectory) { $parameters.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory) }
+            $process = Start-Process @parameters
         }
-        $parameters = @{
-            FilePath = $absolute
-            ArgumentList = $ArgumentList
-            RedirectStandardOutput = $stdoutPath
-            RedirectStandardError = $stderrPath
-            PassThru = $true
+        finally {
+            foreach ($name in $removedNames) {
+                [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
+            }
         }
-        if ($WorkingDirectory) { $parameters.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory) }
-        $process = Start-Process @parameters
     }
-    finally {
-        foreach ($name in $removedNames) {
-            [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
+    else {
+        # On Unix, PowerShell's Start-Process redirection is implemented with
+        # Process.BeginOutputReadLine()/BeginErrorReadLine() - async managed
+        # callbacks that copy pipe data into the target file from *this*
+        # launching process. Once this process exits, those callbacks stop
+        # running even though the spawned child keeps writing, so output
+        # produced after the launcher exits is silently lost. Get real,
+        # launcher-independent redirection the same way a shell does: have
+        # /bin/sh dup2 the target files onto fds 1/2 and then exec() the real
+        # program in place, so the child's own OS-level file descriptors -
+        # not a pipe read by this process - point at the output files.
+        $shell = '/bin/sh'
+        if (-not (Test-Path -LiteralPath $shell -PathType Leaf)) {
+            throw "Required trusted Unix shell '$shell' was not found."
         }
+        $psi = [Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $shell
+        Set-TimedProcessArguments -Psi $psi -ArgumentList (@(
+                '-c', 'out=$1; err=$2; shift 2; exec "$@" > "$out" 2> "$err"',
+                'sh', $stdoutPath, $stderrPath, $absolute
+            ) + @($ArgumentList))
+        if ($WorkingDirectory) { $psi.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory) }
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        foreach ($name in $removedNames) { [void]$psi.Environment.Remove($name) }
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $psi
+        if (-not $process.Start()) { throw "Failed to start '$absolute'." }
     }
     return @{
         Process = $process
