@@ -16,7 +16,7 @@
       "tree": "348f445b83a7f0841aa11dfdd6632030e2c447ac"
     }
   ],
-  "mappingDigest": "fd1404b7de01097cbb4fc40f46b1e93d282d3d517c77a0e137b13ca0c292b706",
+  "mappingDigest": "2af5c1d70551ea30dbf47c33d6fa20b41d0ac19c6e9e88d46b724f6f8d8ddf5b",
   "mappings": [
     {
       "anchor": "reviewer-result-retries",
@@ -72,15 +72,15 @@
           "path": "docs/escape-ledger.v2.json"
         },
         {
-          "blob": "3c8291a775bdff51ba864d4a9ea531a0492d70c2",
+          "blob": "e98305d6519a68f554414a4d9620a9edf5262030",
           "path": "tools/Test-EscapeLedger.ps1"
         }
       ],
-      "deltaIdentity": "bbfa57392533490248375de231093a78817dc742c5efcfd860bc76559ee2a3ae",
+      "deltaIdentity": "f1b812abd8c88c5336d7b11eeade588738a64878622a0ff691ac96a12812273e",
       "equivalenceBasis": "segmentConsolidation",
-      "note": "The commit the escape ledger coverage window was evaluated at. Its replacement is the tip of the consolidated segment, so the window end is measured against the branch that actually carries the work rather than against a history this branch does not have.",
-      "replacementCommit": "3149955f1268012b2af159c0dbe7ae6582f07aa3",
-      "replacementTree": "951ea73dca9d605983d78bcce6fb7d819bf482ed",
+      "note": "The commit the frozen escape-ledger coverage window was evaluated at. The replacement boundary was re-verified at exact reviewed base fee124dd0296e7a138cd41b8715564f79f25e13f before the scheduled Owner queue layer: that branch carries the frozen ledger and verifier evidence named below, so the staleness clock measures new work above the reviewed base rather than repeatedly charging the already-consolidated lineage.",
+      "replacementCommit": "fee124dd0296e7a138cd41b8715564f79f25e13f",
+      "replacementTree": "ac17b8f93ffdba0e7b8289e125171af545788939",
       "sourceCommit": "5a8f10610bf142b7d4cd0a59bd770407994fb290",
       "sourceSubject": "Inline the validator calls so a neutered assertion drops the count",
       "sourceTree": "996a27f0155cc5be20bb3098f4969169749b04da"
@@ -88,8 +88,8 @@
   ],
   "mappingVersion": 1,
   "replacementLineage": {
-    "headCommit": "3149955f1268012b2af159c0dbe7ae6582f07aa3",
-    "headTree": "951ea73dca9d605983d78bcce6fb7d819bf482ed",
+    "headCommit": "fee124dd0296e7a138cd41b8715564f79f25e13f",
+    "headTree": "ac17b8f93ffdba0e7b8289e125171af545788939",
     "name": "consolidated-cohort-protocol"
   },
   "schemaVersion": 1,

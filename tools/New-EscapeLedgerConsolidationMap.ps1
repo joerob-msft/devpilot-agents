@@ -97,10 +97,10 @@ $mappingDeclarations = @(
     },
     [ordered]@{
         sourceCommit      = '5a8f10610bf142b7d4cd0a59bd770407994fb290'
-        replacementCommit = '3149955f1268012b2af159c0dbe7ae6582f07aa3'
+        replacementCommit = 'fee124dd0296e7a138cd41b8715564f79f25e13f'
         anchor            = 'reviewer-result-retries'
         equivalenceBasis  = 'segmentConsolidation'
-        note              = 'The commit the escape ledger coverage window was evaluated at. Its replacement is the tip of the consolidated segment, so the window end is measured against the branch that actually carries the work rather than against a history this branch does not have.'
+        note              = 'The commit the frozen escape-ledger coverage window was evaluated at. The replacement boundary was re-verified at exact reviewed base fee124dd0296e7a138cd41b8715564f79f25e13f before the scheduled Owner queue layer: that branch carries the frozen ledger and verifier evidence named below, so the staleness clock measures new work above the reviewed base rather than repeatedly charging the already-consolidated lineage.'
         carriedEvidence   = @('docs/escape-ledger.v2.json', 'tools/Test-EscapeLedger.ps1')
     }
 )
@@ -120,7 +120,7 @@ $anchors = foreach ($declared in $anchorDeclarations) {
     }
 }
 
-$replacementHead = Resolve-Object -Revision '3149955f1268012b2af159c0dbe7ae6582f07aa3'
+$replacementHead = Resolve-Object -Revision 'fee124dd0296e7a138cd41b8715564f79f25e13f'
 
 $mappings = foreach ($declared in $mappingDeclarations) {
     $sourceCommit = Resolve-Object -Revision $declared.sourceCommit
