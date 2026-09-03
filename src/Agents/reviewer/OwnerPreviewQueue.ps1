@@ -681,7 +681,8 @@ function Invoke-OwnerPreviewQueueTick {
                 'src/Agents/reviewer/schemas/reviewer.owner-preview-status.v1.json') -Raw
         $statusValid = $false
         try {
-            $statusValid = Test-Json -Json (ConvertTo-AgentReplayCanonicalJson -Value $status) `
+            $statusJson = $status | ConvertTo-Json -Depth 64 -Compress
+            $statusValid = Test-Json -Json $statusJson `
                 -Schema $statusSchema -ErrorAction Stop
         }
         catch { $statusValid = $false }
