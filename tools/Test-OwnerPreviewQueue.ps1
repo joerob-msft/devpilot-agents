@@ -42,8 +42,15 @@ try {
     [IO.File]::WriteAllBytes($agency, [byte[]](1))
     $reviewerConfig = (Resolve-Path (Join-Path $RepoRoot 'samples/azureux-bpm-convention-packs.preview.json')).Path
     $toolkit = (Resolve-Path $RepoRoot).Path
-    $toolkitHead = ([string](& git -C $toolkit rev-parse HEAD)).Trim()
-    $toolkitRef = ([string](& git -C $toolkit symbolic-ref -q HEAD)).Trim()
+    $headOutput = @(& git -C $toolkit rev-parse HEAD)
+    $toolkitHead = ([string[]]$headOutput -join [Environment]::NewLine).Trim()
+    $refOutput = @(& git -C $toolkit symbolic-ref -q HEAD)
+    $toolkitRef = ([string[]]$refOutput -join [Environment]::NewLine).Trim()
+    $detachedCheckout = [string]::IsNullOrWhiteSpace($toolkitRef)
+    if ($detachedCheckout) { $toolkitRef = 'refs/heads/detached-ci-fixture' }
+    Assert-QueueTest ($toolkitHead -match '^[0-9a-f]{40}$' -and
+        -not [string]::IsNullOrWhiteSpace($toolkitRef)) `
+        'Git identity fixture did not normalize detached symbolic-ref output to a non-null value.'
 
     function New-TestEntry {
         param([int]$PullRequestId, [string]$Head = ('a' * 40), [string]$Mode = 'fixed')
@@ -320,8 +327,9 @@ try {
 
     Test-QueueRefusal { Resolve-OwnerPreviewQueueStateRoot -StateRoot $RepoRoot -InstanceName 'test' } 'inside git' `
         'A repository state root was accepted.'
-    Test-QueueRefusal { Assert-OwnerPreviewQueueStableToolkit -Config $config } 'worktree|ordinary checkout' `
-        'The linked Copilot worktree was accepted as a scheduler toolkit.'
+    $stableRefPattern = if ($detachedCheckout) { 'detached' } else { 'worktree|ordinary checkout' }
+    Test-QueueRefusal { Assert-OwnerPreviewQueueStableToolkit -Config $config } $stableRefPattern `
+        'An unsafe linked or detached scheduler toolkit was accepted.'
     Test-QueueRefusal { Assert-OwnerPreviewQueueSafePath -Path 'C:\bad"path' -Where 'test' } 'control character or quote' `
         'A quoted task path was accepted.'
 

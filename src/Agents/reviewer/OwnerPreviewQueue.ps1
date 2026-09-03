@@ -126,12 +126,19 @@ function Assert-OwnerPreviewQueueStableToolkit {
     }
     Push-Location -LiteralPath $root
     try {
-        $head = ([string](& git rev-parse HEAD 2>&1)).Trim().ToLowerInvariant()
-        if ($LASTEXITCODE -ne 0 -or $head -cne ([string]$Config.expectedToolkitHead).ToLowerInvariant()) {
+        $headOutput = @(& git rev-parse HEAD 2>&1)
+        $headExit = $LASTEXITCODE
+        $head = ([string[]]$headOutput -join [Environment]::NewLine).Trim().ToLowerInvariant()
+        if ($headExit -ne 0 -or $head -cne ([string]$Config.expectedToolkitHead).ToLowerInvariant()) {
             throw "Toolkit head '$head' does not equal expected head $($Config.expectedToolkitHead)."
         }
-        $ref = ([string](& git symbolic-ref -q HEAD 2>&1)).Trim()
-        if ($LASTEXITCODE -ne 0 -or $ref -cne [string]$Config.expectedToolkitRef) {
+        $refOutput = @(& git symbolic-ref -q HEAD 2>&1)
+        $refExit = $LASTEXITCODE
+        $ref = ([string[]]$refOutput -join [Environment]::NewLine).Trim()
+        if ($refExit -ne 0 -or [string]::IsNullOrWhiteSpace($ref)) {
+            throw "Toolkit '$root' is detached; scheduler deployment requires a named stable ref."
+        }
+        if ($ref -cne [string]$Config.expectedToolkitRef) {
             throw "Toolkit ref '$ref' does not equal expected ref $($Config.expectedToolkitRef)."
         }
     }
