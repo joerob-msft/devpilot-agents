@@ -565,6 +565,10 @@ Describe 'dispatch protocol primitives' {
             $childProcStat = if ($IsLinux -and (Test-Path -LiteralPath "/proc/$($child.Process.Id)/stat")) {
                 Get-Content -LiteralPath "/proc/$($child.Process.Id)/stat" -Raw
             } else { '<absent>' }
+            $guardianTracePath = Join-Path $runtimeRoot "guardian-$token.trace"
+            $guardianTrace = if (Test-Path -LiteralPath $guardianTracePath) {
+                Get-Content -LiteralPath $guardianTracePath -Raw
+            } else { '<absent>' }
             $childExited | Should -BeTrue -Because (
                 "the guardian must terminate the accepted child group after the broker dies" +
                 $(if ($childKillDiagnostics) {
@@ -573,7 +577,7 @@ Describe 'dispatch protocol primitives' {
                     }) +
                 "; guardian exited: $($guardian.Process.HasExited); " +
                 "broker probe: $($null -ne $brokerProbe); broker stat: $brokerProcStat; " +
-                "child stat: $childProcStat")
+                "child stat: $childProcStat; guardian trace: $guardianTrace")
             $guardian.Process.WaitForExit(10000) | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.json") | Should -BeFalse
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.ready") | Should -BeFalse
