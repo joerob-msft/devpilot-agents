@@ -4270,6 +4270,7 @@ Export-ModuleMember -Function @(
     "New-AgentRedirectedProcess",
     "New-AgentPersistentRedirectedProcess",
     "Complete-AgentRedirectedProcess",
+    "Get-AgentProcessStartIdentity",
     "New-AgentProcessContainment",
     "Stop-AgentProcessContainment",
     "Test-AgentProcessContainmentExited",
