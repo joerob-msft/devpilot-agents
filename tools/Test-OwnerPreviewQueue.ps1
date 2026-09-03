@@ -312,6 +312,12 @@ try {
     }
     finally { Exit-AgentLock -Stream $lock }
 
+    $layerKeyRoot = Initialize-OwnerPreviewQueueLayerKeys -StateRoot (Join-Path $testRoot 'layer-keys')
+    $entryKey = (Get-Content -LiteralPath (Join-Path $layerKeyRoot 'owner-preview-entry.key') -Raw).Trim()
+    $runSetKey = (Get-Content -LiteralPath (Join-Path $layerKeyRoot 'owner-preview-run-set.key') -Raw).Trim()
+    Assert-QueueTest ($entryKey -match '^raw:[A-Za-z0-9+/]{43}=$' -and
+        $runSetKey -match '^[A-Za-z0-9+/]{43}=$') 'Layer 1 keys were not created in their required formats.'
+
     Test-QueueRefusal { Resolve-OwnerPreviewQueueStateRoot -StateRoot $RepoRoot -InstanceName 'test' } 'inside git' `
         'A repository state root was accepted.'
     Test-QueueRefusal { Assert-OwnerPreviewQueueStableToolkit -Config $config } 'worktree|ordinary checkout' `

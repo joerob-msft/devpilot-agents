@@ -181,6 +181,28 @@ function Get-OwnerPreviewQueueKey {
     return , $key
 }
 
+function Initialize-OwnerPreviewQueueLayerKeys {
+    param([Parameter(Mandatory)][string]$StateRoot)
+    $root = Join-Path (Join-Path $StateRoot 'keys') 'layer1'
+    [void](New-Item -ItemType Directory -Force -Path $root)
+    foreach ($definition in @(
+            @{ Name = 'owner-preview-entry.key'; Prefix = 'raw:' },
+            @{ Name = 'owner-preview-run-set.key'; Prefix = '' })) {
+        $path = Join-Path $root $definition.Name
+        if (Test-Path -LiteralPath $path -PathType Leaf) { continue }
+        $bytes = [byte[]]::new(32)
+        [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+        $text = [string]$definition.Prefix + [Convert]::ToBase64String($bytes)
+        $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $encoded = [Text.UTF8Encoding]::new($false).GetBytes($text)
+            $stream.Write($encoded, 0, $encoded.Length)
+        }
+        finally { $stream.Dispose() }
+    }
+    return $root
+}
+
 function Protect-OwnerPreviewQueuePayload {
     param([Parameter(Mandatory)]$Payload, [Parameter(Mandatory)][byte[]]$Key)
     # Sign the exact JSON-compatible shape Set-JsonState will persist, not live
@@ -386,6 +408,8 @@ function Invoke-OwnerPreviewQueueCycleDriver {
     $readyPath = Join-Path $CycleRoot 'prelaunch-ready.json'
     $permitPath = Join-Path $CycleRoot 'prelaunch-permit.json'
     $subjectRoot = Join-Path $CycleRoot 'evidence'
+    $stateRoot = Split-Path (Split-Path (Split-Path $CycleRoot -Parent) -Parent) -Parent
+    $layerKeyRoot = Initialize-OwnerPreviewQueueLayerKeys -StateRoot $stateRoot
     [void](New-Item -ItemType Directory -Force -Path $CycleRoot)
     $tool = Join-Path ([string]$Config.toolkitRoot) 'tools/Invoke-OwnerPreviewCycle.ps1'
     $arguments = @(
@@ -399,6 +423,7 @@ function Invoke-OwnerPreviewQueueCycleDriver {
         '-ToolkitRoot', [string]$Config.toolkitRoot, '-ToolkitRequiredRef', [string]$Config.expectedToolkitRef,
         '-ExpectedReviewerBaseCommit', [string]$Entry.expectedReviewerBaseCommit,
         '-CaptureMode', 'live', '-AgencyPath', [string]$Entry.agencyPath,
+        '-SealKeyRoot', $layerKeyRoot,
         '-PrelaunchReadyPath', $readyPath, '-PrelaunchPermitPath', $permitPath,
         '-PrelaunchNonce', $nonce, '-PrelaunchTimeoutSeconds', '120'
     )
