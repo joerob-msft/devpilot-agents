@@ -442,21 +442,28 @@ Describe 'dispatch protocol primitives' {
                         schemaVersion = 1; requestId = $describeId; operation = 'describe'
                         role = 'reviewer'; pullRequestId = 1; repositoryKey = 'v1:github:1'
                     }))
+            $describeResponseTask = $process.StandardOutput.ReadLineAsync()
+            $describeResponseTask.Wait(10000) | Should -BeTrue `
+                -Because 'the broker must process a request while stdin remains open'
+            $describeResponse = $describeResponseTask.Result | ConvertFrom-Json -AsHashtable
+            $describeResponse.requestId | Should -BeExactly $describeId
+            $describeResponse.operation | Should -BeExactly 'rejected'
+            $describeResponse.code | Should -BeExactly 'role-not-allowed'
+
             $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{
                         schemaVersion = 1; requestId = $shutdownId; operation = 'shutdown'
                     }))
+            $shutdownResponseTask = $process.StandardOutput.ReadLineAsync()
+            $shutdownResponseTask.Wait(10000) | Should -BeTrue `
+                -Because 'the broker must process the next request while stdin remains open'
+            $shutdownResponse = $shutdownResponseTask.Result | ConvertFrom-Json -AsHashtable
+            $shutdownResponse.requestId | Should -BeExactly $shutdownId
+            $shutdownResponse.operation | Should -BeExactly 'shutdown-complete'
+
             $process.StandardInput.Close()
             $process.WaitForExit(15000) | Should -BeTrue
-            $responses = @($process.StandardOutput.ReadToEnd() -split "`r?`n" |
-                Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json -AsHashtable })
             $stderr = $process.StandardError.ReadToEnd()
             $process.ExitCode | Should -Be 0 -Because $stderr
-            $responses.Count | Should -Be 2
-            $responses[0].requestId | Should -BeExactly $describeId
-            $responses[0].operation | Should -BeExactly 'rejected'
-            $responses[0].code | Should -BeExactly 'role-not-allowed'
-            $responses[1].requestId | Should -BeExactly $shutdownId
-            $responses[1].operation | Should -BeExactly 'shutdown-complete'
             Test-Path (Join-Path $stateRoot 'manual-dispatch') | Should -BeFalse
         }
         finally {

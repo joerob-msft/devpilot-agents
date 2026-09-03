@@ -728,7 +728,6 @@ try {
         if (-not $readTask.Wait(100)) { continue }
         $line = $readTask.Result
         if ($null -eq $line) { break }
-        $readTask = [Console]::In.ReadLineAsync()
         $requestId = ''
         $request = $null
         try {
@@ -760,6 +759,9 @@ try {
                 Remove-DraftResidue $failedDraft
                 $drafts.Remove($failedDraftId)
             }
+        }
+        if ($accepting) {
+            $readTask = [Console]::In.ReadLineAsync()
         }
     }
 }
