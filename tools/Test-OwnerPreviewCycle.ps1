@@ -150,7 +150,7 @@ try {
     [void](New-Item -ItemType Directory -Force -Path $snapshotDir)
     $binding = [ordered]@{
         organization = 'contoso'; project = 'Widgets'
-        repositoryId = '11111111-2222-3333-4444-555555555555'; repositoryName = 'Widgets'
+        repositoryId = '11111111-2222-3333-4444-555555555555'
         pullRequestId = 4242; iterationId = 1
         sourceCommit = ('a' * 40); commonCommit = ('b' * 40); targetCommit = ('c' * 40)
         changeSetSha256 = ('e' * 64)
@@ -162,8 +162,11 @@ try {
         classification = [ordered]@{ sealKind = 'offlineCorpusSeal'; nonPromotable = $true }
     }
     [void](Write-OwnerPreviewJsonFile -Path (Join-Path $snapshotDir 'manifest.json') -Value $manifestValue)
-    $snapshot = Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot -SnapshotName $snapshotName
-    Assert-OwnerPreview -Condition ([int]$snapshot.PullRequestId -eq 4242 -and [int]$snapshot.IterationId -eq 1) `
+    $snapshot = Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot -SnapshotName $snapshotName `
+        -RepositoryName 'Widgets'
+    Assert-OwnerPreview -Condition (
+        [int]$snapshot.PullRequestId -eq 4242 -and [int]$snapshot.IterationId -eq 1 -and
+        [string]$snapshot.RepositoryName -ceq 'Widgets') `
         -Message "The sealed snapshot reader did not surface the bound pull request identity."
 
     $promotableDir = Join-Path $replayRoot 'promotable-snapshot'
@@ -176,7 +179,10 @@ try {
     }
     [void](Write-OwnerPreviewJsonFile -Path (Join-Path $promotableDir 'manifest.json') -Value $promotableValue)
     $promotableRefused = $false
-    try { [void](Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot -SnapshotName 'promotable-snapshot') }
+    try {
+        [void](Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot `
+                -SnapshotName 'promotable-snapshot' -RepositoryName 'Widgets')
+    }
     catch { $promotableRefused = $true }
     Assert-OwnerPreview -Condition $promotableRefused `
         -Message "A promotable snapshot was accepted; this layer consumes only permanently non-promotable evidence."
@@ -196,7 +202,10 @@ try {
     }
     [void](Write-OwnerPreviewJsonFile -Path (Join-Path $partialDir 'manifest.json') -Value $partialValue)
     $partialRefused = $false
-    try { [void](Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot -SnapshotName 'partial-snapshot') }
+    try {
+        [void](Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot `
+                -SnapshotName 'partial-snapshot' -RepositoryName 'Widgets')
+    }
     catch { $partialRefused = $true }
     Assert-OwnerPreview -Condition $partialRefused `
         -Message "A snapshot missing an iteration or merge base was accepted; the seed would assert identity the seal cannot back."

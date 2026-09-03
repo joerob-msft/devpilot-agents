@@ -436,7 +436,8 @@ function Read-OwnerPreviewSealedSnapshot {
     #>
     param(
         [Parameter(Mandatory)][string]$ReplayRoot,
-        [Parameter(Mandatory)][string]$SnapshotName
+        [Parameter(Mandatory)][string]$SnapshotName,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryName
     )
     $snapshotPath = Join-Path $ReplayRoot $SnapshotName
     $manifestPath = Join-Path $snapshotPath 'manifest.json'
@@ -459,7 +460,7 @@ function Read-OwnerPreviewSealedSnapshot {
     }
 
     $binding = $manifest.binding
-    $required = @('organization', 'project', 'repositoryId', 'repositoryName', 'pullRequestId',
+    $required = @('organization', 'project', 'repositoryId', 'pullRequestId',
         'iterationId', 'sourceCommit', 'commonCommit', 'targetCommit')
     foreach ($field in $required) {
         $property = $binding.PSObject.Properties[$field]
@@ -478,7 +479,11 @@ function Read-OwnerPreviewSealedSnapshot {
         Organization   = [string]$binding.organization
         Project        = [string]$binding.project
         RepositoryId   = [string]$binding.repositoryId
-        RepositoryName = [string]$binding.repositoryName
+        # The production replay manifest intentionally keys repositories by GUID.
+        # The name was independently validated by the sealer against the corpus
+        # index and is carried from that validated recipe/subject, not invented
+        # from a manifest field the replay contract does not publish.
+        RepositoryName = $RepositoryName
         PullRequestId  = [int]$binding.pullRequestId
         IterationId    = [int]$binding.iterationId
         SourceCommit   = [string]$binding.sourceCommit

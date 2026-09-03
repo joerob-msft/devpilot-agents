@@ -342,7 +342,8 @@ function New-OwnerPreviewPrepared {
     # Read the sealed identity back off disk rather than parsing it out of the
     # sealer's console prose: the manifest is the artifact, the prose is a
     # courtesy.
-    $snapshot = Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot -SnapshotName ([string]$recipe.snapshotId)
+    $snapshot = Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot `
+        -SnapshotName ([string]$recipe.snapshotId) -RepositoryName ([string]$recipe.binding.repositoryName)
     $sealDigest = Get-OwnerPreviewFileSha256 -Path (Join-Path $snapshot.SnapshotPath 'offline-corpus-seal.json')
     $seed = New-OwnerPreviewLegacyProjection -Snapshot $snapshot -PackRoot $packRoot `
         -CorpusIndexSha256 ([string]$builder.corpusIndexSha256) -SealDigest $sealDigest
@@ -565,7 +566,8 @@ function Invoke-OwnerPreviewSpecialist {
     $configSha = [string]$Subject['configSha256']
     $model = [string]$Subject['model']
 
-    $snapshot = Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot -SnapshotName $snapshotId
+    $snapshot = Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot -SnapshotName $snapshotId `
+        -RepositoryName ([string]$Subject['subject']['repositoryName'])
     $seed = [pscustomobject]@{
         FixtureId          = $snapshotId
         ManifestSha256     = $manifestSha
