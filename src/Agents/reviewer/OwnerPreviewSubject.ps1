@@ -182,6 +182,29 @@ $script:OwnerPreviewWriteSwitches = @(
     'PromotePreview', 'PromoteVerifiedPreview'
 )
 
+function Test-OwnerPreviewWriteSwitchName {
+    <#
+        Whether a name could bind one of the reviewer's write switches.
+
+        Compared case-INSENSITIVELY and by PREFIX, because that is how
+        PowerShell's binder works: `-enablesummarycom` binds
+        `-EnableSummaryComment` perfectly well. An exact, case-sensitive match
+        would refuse only the spelling a careful author used and wave through
+        every abbreviation of it, which is the wrong way round - the careless
+        spelling is the one worth catching.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Name)
+    $candidate = ([string]$Name).Trim()
+    if ($candidate -eq '') { return $false }
+    # `-Switch:$true` binds too, so anything before a colon is the name.
+    $colon = $candidate.IndexOf(':')
+    if ($colon -ge 0) { $candidate = $candidate.Substring(0, $colon) }
+    foreach ($switchName in $script:OwnerPreviewWriteSwitches) {
+        if ($switchName.StartsWith($candidate, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
 function Assert-OwnerPreviewNoWriteSurface {
     <#
         This tool must not be ABLE to ask for a write.
@@ -208,7 +231,7 @@ function Assert-OwnerPreviewNoWriteSurface {
     if ($null -ne $parameterBlock) {
         foreach ($parameter in @($parameterBlock.Parameters)) {
             $name = [string]$parameter.Name.VariablePath.UserPath
-            if ($script:OwnerPreviewWriteSwitches -ccontains $name) { [void]$declared.Add($name) }
+            if (Test-OwnerPreviewWriteSwitchName -Name $name) { [void]$declared.Add($name) }
         }
     }
     if ($declared.Count -gt 0) {
@@ -231,9 +254,11 @@ function Assert-OwnerPreviewNoWriteArgument {
         [Parameter(Mandatory)][string]$Stage
     )
     foreach ($argument in @($ToolArguments)) {
-        $trimmed = ([string]$argument).TrimStart('-')
-        if ($script:OwnerPreviewWriteSwitches -ccontains $trimmed) {
-            throw "The $Stage step was about to pass write switch '-$trimmed'. The Owner preview writes nothing."
+        $candidate = [string]$argument
+        if (-not $candidate.StartsWith('-')) { continue }
+        $trimmed = $candidate.TrimStart('-')
+        if (Test-OwnerPreviewWriteSwitchName -Name $trimmed) {
+            throw "The $Stage step was about to pass write switch '$candidate'. The Owner preview writes nothing."
         }
     }
     return $true

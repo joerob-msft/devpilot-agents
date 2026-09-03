@@ -224,6 +224,14 @@ function New-OwnerPreviewStatus {
         $status['counts'] = [ordered]@{ checked = 0; violations = 0; compliant = 0; unknown = 0 }
     }
     else {
+        # The schema caps these arrays, and the v4 contract admits far more
+        # constructs than the cap. Truncating and SAYING SO keeps the document
+        # inside its own contract without quietly losing findings: the counts
+        # above are always the full census, and the listed entries record when
+        # they are only part of it.
+        $maximumListed = 512
+        $violationEntries = @($Counts.ViolationEntries)
+        $unknownEntries = @($Counts.UnknownEntries)
         $status['counts'] = [ordered]@{
             checked       = [int]$Counts.Checked
             violations    = [int]$Counts.Violations
@@ -233,8 +241,16 @@ function New-OwnerPreviewStatus {
             withheld      = [int]$Counts.Withheld
             residualRisks = @($Counts.ResidualRisks).Count
         }
-        $status['violations'] = @($Counts.ViolationEntries)
-        $status['unknowns'] = @($Counts.UnknownEntries)
+        if ($violationEntries.Count -gt $maximumListed) {
+            $status['violationsTruncated'] = $violationEntries.Count - $maximumListed
+            $violationEntries = @($violationEntries[0..($maximumListed - 1)])
+        }
+        if ($unknownEntries.Count -gt $maximumListed) {
+            $status['unknownsTruncated'] = $unknownEntries.Count - $maximumListed
+            $unknownEntries = @($unknownEntries[0..($maximumListed - 1)])
+        }
+        $status['violations'] = $violationEntries
+        $status['unknowns'] = $unknownEntries
         $status['residualRisks'] = @($Counts.ResidualRisks)
     }
 
@@ -263,21 +279,42 @@ function New-OwnerPreviewStatus {
     return $status
 }
 
-function Get-OwnerPreviewMarkerNonce {
+function Assert-OwnerPreviewMarkerBinding {
     <#
-        The nonce the marker itself carries.
+        The marker must be about THIS subject.
 
-        The schema binds a marker to the nonce the wrapper issued. Acquisition
-        issued it and sealed the transcript around it, so it is read back from
-        the marker rather than re-invented here; a mismatch is then the schema's
-        refusal to make, not this function's.
+        Without this the only thing tying a result to a pull request is that it
+        arrived during the run, and the specialist reads attacker-controlled
+        changed-file bytes. A marker naming another pull request, another
+        repository or another commit is not a result to record under this
+        subject's identity - it is evidence that something produced a document
+        this run did not ask for.
+
+        Returns the first field that disagrees, or an empty string when the
+        marker is bound to the subject.
     #>
-    param([Parameter(Mandatory)][string]$MarkerText)
-    $match = [regex]::Match($MarkerText, '"nonce"\s*:\s*"([A-Za-z0-9._-]{8,128})"')
-    if (-not $match.Success) {
-        throw "The result marker carries no readable nonce; it cannot be bound to the run that asked for it."
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Marker,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$SubjectIdentity
+    )
+    $comparisons = @(
+        @{ Field = 'prId'; Marker = [string](Get-OwnerPreviewMarkerValue -Container $Marker -Key 'prId' -Default '')
+            Expected = [string][int]$SubjectIdentity.pullRequestId },
+        @{ Field = 'repositoryId'; Marker = [string](Get-OwnerPreviewMarkerValue -Container $Marker -Key 'repositoryId' -Default '')
+            Expected = [string]$SubjectIdentity.repositoryId },
+        @{ Field = 'reviewedSourceCommit'; Marker = [string](Get-OwnerPreviewMarkerValue -Container $Marker -Key 'reviewedSourceCommit' -Default '')
+            Expected = [string]$SubjectIdentity.sourceCommit },
+        @{ Field = 'targetCommit'; Marker = [string](Get-OwnerPreviewMarkerValue -Container $Marker -Key 'targetCommit' -Default '')
+            Expected = [string]$SubjectIdentity.targetCommit }
+    )
+    foreach ($comparison in $comparisons) {
+        $observed = [string]$comparison.Marker
+        $expected = [string]$comparison.Expected
+        if (-not [string]::Equals($observed, $expected, [StringComparison]::OrdinalIgnoreCase)) {
+            return ("the marker declares $([string]$comparison.Field) '$observed' and this subject is '$expected'")
+        }
     }
-    return $match.Groups[1].Value
+    return ''
 }
 
 function New-OwnerPreviewOutcome {
@@ -296,7 +333,8 @@ function New-OwnerPreviewOutcome {
     #>
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Subject,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$MarkerText
+        [Parameter(Mandatory)][AllowEmptyString()][string]$MarkerText,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ExpectedNonce
     )
     $subjectIdentity = $Subject.subject
     $ruleSection = @($Subject.rule.sections)[0]
@@ -329,23 +367,30 @@ function New-OwnerPreviewOutcome {
     $headKey = [string]$Subject.headKey
     $model = [string]$Subject.model
 
-    if ($MarkerText -eq '') {
+    if ($MarkerText -eq '' -or $ExpectedNonce -eq '') {
+        $absentReason = if ($MarkerText -eq '') {
+            'The pass produced no authenticated version 4 result marker.'
+        }
+        else {
+            'The sealed acquisition package carried no nonce, so no marker could be bound to this run.'
+        }
         return (New-OwnerPreviewStatus -Subject $subjectBlock -Rule $ruleBlock -Snapshot $snapshotBlock `
                 -TerminalStatus 'incomplete' -MarkerStatus 'absent' -SubjectKey $subjectKey `
                 -HeadKey $headKey -SpecialistModel $model -ModelStarts 1 `
-                -Diagnostic 'The pass produced no version 4 result marker.')
+                -Diagnostic $absentReason)
     }
 
     $schema = $null
     $outcome = $null
     $readFailure = ''
     try {
-        # A marker this layer cannot even read is an INCOMPLETE pass, not an
-        # error for the operator to interpret. Anything thrown between here and
-        # a parsed result means the same thing: no verdicts were established.
+        # The expected nonce is supplied by the caller from the run's own SEALED
+        # capture core. It is never scraped out of the marker being validated:
+        # comparing a document's nonce to itself always succeeds, which would
+        # leave nothing at all rejecting a replayed or invented marker.
         $schema = Get-ReviewerConventionSpecialistMarkerSchema `
             -ExpectedProject ([string]$subjectIdentity.project) `
-            -ExpectedNonce (Get-OwnerPreviewMarkerNonce -MarkerText $MarkerText) -ContractVersion 4
+            -ExpectedNonce $ExpectedNonce -ContractVersion 4
         $outcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome -StdOutText $MarkerText `
             -Schema $schema -ContractVersion 4
     }
@@ -360,6 +405,15 @@ function New-OwnerPreviewOutcome {
 
     $outcomeStatus = [string]$outcome.Status
     if ($outcomeStatus -ceq 'success') {
+        # Bound before it is counted. A marker that parsed is not yet a marker
+        # about this pull request.
+        $mismatch = Assert-OwnerPreviewMarkerBinding -Marker $outcome.Value -SubjectIdentity $subjectIdentity
+        if ($mismatch -ne '') {
+            return (New-OwnerPreviewStatus -Subject $subjectBlock -Rule $ruleBlock -Snapshot $snapshotBlock `
+                    -TerminalStatus 'blocked' -MarkerStatus 'wrongBinding' -SubjectKey $subjectKey `
+                    -HeadKey $headKey -SpecialistModel $model -ModelStarts 1 `
+                    -Diagnostic ("The result was refused: $mismatch."))
+        }
         $counts = Get-OwnerPreviewCapabilityCounts -Marker $outcome.Value
         return (New-OwnerPreviewStatus -Subject $subjectBlock -Rule $ruleBlock -Snapshot $snapshotBlock `
                 -TerminalStatus 'completed' -MarkerStatus $outcomeStatus -Counts $counts `

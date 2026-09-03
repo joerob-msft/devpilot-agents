@@ -111,6 +111,12 @@
         }
       }
     },
+    "violationsTruncated": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "How many violations exist beyond the listed ones. Present only when the list was capped, so a reader can tell a complete list from a partial one. The counts block is always the full census."
+    },
+    "unknownsTruncated": { "type": "integer", "minimum": 1 },
     "residualRisks": {
       "type": "array",
       "maxItems": 64,

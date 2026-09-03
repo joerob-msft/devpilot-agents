@@ -87,6 +87,10 @@ param(
     [ValidatePattern('^$|^[0-9a-f]{64}$')][string]$HeadKey = '',
     [ValidatePattern('^$|^[0-9a-fA-F]{40}$')][string]$ExpectedReviewerBaseCommit = '',
     [string]$ExpectedRef = '',
+    [string]$ToolkitRequiredRef = '',
+    [string]$SourceRefName = '',
+    [string]$DiscoveryGeneralistModel = '',
+    [string]$SealKeyRoot = '',
     [string]$SecondGeneralistModel = 'gpt-5.6-sol',
 
     [switch]$UseOfflineStubAdapter,
@@ -106,6 +110,7 @@ Set-StrictMode -Version Latest
 Import-Module (Join-Path $RepoRoot 'src/DevPilot.AgentHarness/DevPilot.AgentHarness.psd1') -Force
 . (Join-Path $RepoRoot 'src/Agents/reviewer/CorpusSeal.ps1')
 . (Join-Path $RepoRoot 'src/Agents/reviewer/ConventionSpecialist.ps1')
+. (Join-Path $RepoRoot 'src/Agents/reviewer/AcquisitionPackage.ps1')
 . (Join-Path $RepoRoot 'src/Agents/reviewer/OwnerPreviewSubject.ps1')
 . (Join-Path $RepoRoot 'src/Agents/reviewer/OwnerPreviewReport.ps1')
 
@@ -261,12 +266,16 @@ function New-OwnerPreviewPrepared {
     foreach ($directory in @($staging, $replayRoot, $packRoot)) {
         [void](New-Item -ItemType Directory -Force -Path $directory)
     }
-    $sealKeyPath = Join-Path $staging 'entry-seal.key'
-    $runSetKeyPath = Join-Path $staging 'run-set.key'
+    $prepared = $null
+
+    try {
+
+    $sealKeyPath = Get-OwnerPreviewSealKeyPath -Name 'entry'
+    $runSetKeyPath = Get-OwnerPreviewSealKeyPath -Name 'run-set'
 
     $entryId = "owner-$PullRequestId"
     $request = New-OwnerPreviewEvidenceRequest -CorrelationId $correlationId -ToolkitRoot $toolkit `
-        -ToolkitHead $toolkitHead -RequiredRef (Get-OwnerPreviewRequiredRef) `
+        -ToolkitHead $toolkitHead -RequiredRef (Get-OwnerPreviewToolkitRequiredRef -Root $toolkit) `
         -Organization $Organization -Project $Project -RepositoryId $RepositoryId `
         -RepositoryName $RepositoryName -PullRequestId $PullRequestId -TargetRefName $TargetRefName `
         -ConfigPath ([IO.Path]::GetFullPath($ConfigFile)) `
@@ -319,12 +328,21 @@ function New-OwnerPreviewPrepared {
     $subjectsRoot = Join-Path $Root 'subjects'
     [void](New-Item -ItemType Directory -Force -Path $subjectsRoot)
     $destination = Join-Path $subjectsRoot $headKey
+    $completed = Join-Path $destination 'subject.json'
     if (Test-Path -LiteralPath $destination) {
-        # The same head, rule set, model and toolkit was already prepared. Its
-        # evidence is not rebuilt: a second preparation would produce a second
-        # answer to a question already on disk.
-        Remove-Item -LiteralPath $staging -Recurse -Force
-        return (Read-OwnerPreviewSubject -Root $Root -HeadKey $headKey)
+        if (Test-Path -LiteralPath $completed -PathType Leaf) {
+            # The same head, rule set, model and toolkit was already prepared. Its
+            # evidence is not rebuilt: a second preparation would produce a second
+            # answer to a question already on disk.
+            $prepared = Read-OwnerPreviewSubject -Root $Root -HeadKey $headKey
+            return $prepared
+        }
+        # A directory with no subject.json is a preparation that was interrupted
+        # between the move and the record. Reusing it would return "prepared" for
+        # a package nothing finished, and rebuilding over it silently would
+        # discard whatever is there - so it is refused and named instead.
+        throw ("The subject directory '$destination' exists but records no subject.json, so an earlier " +
+            "preparation did not finish. Inspect it and remove it deliberately before preparing this head again.")
     }
     Move-Item -LiteralPath $staging -Destination $destination
 
@@ -338,6 +356,7 @@ function New-OwnerPreviewPrepared {
         preparedUtc    = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
         captureMode    = $CaptureMode
         toolkitHead    = $toolkitHead
+        sourceRefName  = $(if ($SourceRefName -ne '') { $SourceRefName } elseif ($ExpectedRef -ne '') { $ExpectedRef } else { $TargetRefName })
         configSha256   = $configSha
         model          = $Model
         entryId        = $entryId
@@ -374,13 +393,81 @@ function New-OwnerPreviewPrepared {
         spend          = [ordered]@{ modelStarts = 0; providerWrites = 0 }
     }
     [void](Write-OwnerPreviewJsonFile -Path (Join-Path $destination 'subject.json') -Value $subject)
-    return $subject
+
+    $prepared = $subject
+
+    }
+
+    finally {
+
+        # Captured pull request bytes must never be left behind by a refusal.
+
+        if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
+
+    }
+
+    return $prepared
 }
 
-function Get-OwnerPreviewRequiredRef {
-    <# The toolkit ref the capture is required to be on. #>
-    if ($ExpectedRef -ne '') { return $ExpectedRef }
-    return 'refs/heads/main'
+function Get-OwnerPreviewToolkitRequiredRef {
+    <#
+        The ref the TOOLKIT checkout is required to be on.
+
+        Deliberately not the same value as the pull request's ref, and kept in a
+        separate function because they were once the same one. The builder pins
+        the toolkit head and refuses when the required ref does not resolve to
+        it, so borrowing the subject's ref here refuses every run that is not on
+        main - and borrowing this one for the subject would assert that a pull
+        request lives on the branch the toolkit happens to be checked out at.
+
+        Defaults to the branch this checkout is actually on, because the honest
+        answer to "which ref is this toolkit" is one git can be asked.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+    if ($ToolkitRequiredRef -ne '') { return $ToolkitRequiredRef }
+    Push-Location -LiteralPath $Root
+    try {
+        $symbolic = (& git symbolic-ref -q HEAD 2>&1)
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$symbolic)) {
+            throw ("The toolkit at '$Root' is not on a named branch, so its required ref cannot be derived. " +
+                "State it with -ToolkitRequiredRef.")
+        }
+        return ([string]$symbolic).Trim()
+    }
+    finally { Pop-Location }
+}
+
+function Get-OwnerPreviewSealKeyPath {
+    <#
+        Where an HMAC seal key lives: outside the evidence it authenticates.
+
+        A key stored beside the package it seals proves nothing - whoever can
+        edit the package can mint a matching seal. The production default for
+        these tools is a private per-user key, and this mirrors it rather than
+        writing one into a directory that is published, copied or archived as
+        evidence.
+    #>
+    param([Parameter(Mandatory)][ValidatePattern('^[a-z][a-z0-9-]{0,31}$')][string]$Name)
+    if ($SealKeyRoot -ne '') { $base = [IO.Path]::GetFullPath($SealKeyRoot) }
+    else { $base = Join-Path (Join-Path $HOME '.devpilot') 'owner-preview' }
+    if (-not (Test-Path -LiteralPath $base -PathType Container)) {
+        [void](New-Item -ItemType Directory -Force -Path $base)
+    }
+    return (Join-Path $base "owner-preview-$Name.key")
+}
+
+function Get-OwnerPreviewDiscoveryGeneralistModel {
+    <#
+        The configured generalist first-pass model name.
+
+        Specialist acquisition refuses to start without it, and capture pairs it
+        with the second generalist model to check the configured pair. It names
+        a model; it does not start one - a specialist role runs the specialist
+        and nothing else.
+    #>
+    if ($DiscoveryGeneralistModel -ne '') { return $DiscoveryGeneralistModel }
+    $pair = Get-AgentGeneralistModelPair
+    return [string]$pair.First
 }
 
 function Get-OwnerPreviewPowerShellPath {
@@ -433,6 +520,8 @@ function Invoke-OwnerPreviewSpecialist {
     )
     [void](Assert-OwnerPreviewNoWriteSurface -ScriptPath $PSCommandPath)
 
+    $discoveryGeneralistModel = Get-OwnerPreviewDiscoveryGeneralistModel
+
     $headKey = [string]$Subject['headKey']
     $runRoot = Join-Path (Join-Path $Root 'runs') $headKey
     if (Test-Path -LiteralPath $runRoot) { Remove-Item -LiteralPath $runRoot -Recurse -Force }
@@ -462,19 +551,29 @@ function Invoke-OwnerPreviewSpecialist {
     [void](Write-OwnerPreviewJsonFile -Path $captureRequestPath -Value $captureRequest)
 
     $captureRoot = Join-Path $runRoot 'capture'
-    $sealKeyPath = Join-Path $runRoot 'capture-seal.key'
+    # The seal key authenticates this package, so it must not live inside it. A
+    # key sitting next to the evidence it seals means anyone who can edit the
+    # evidence can re-seal it, which is the same as not sealing it.
+    $sealKeyPath = Get-OwnerPreviewSealKeyPath -Name 'capture'
     $captureArguments = @(
         '-Role', 'specialist', '-Model', $model,
         '-CaptureRequestFile', $captureRequestPath, '-ConfigFile', $configPath,
         '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', $snapshotId,
         '-ReplayManifestDigest', ([string]$Subject['snapshot']['manifestDigest']),
         '-PullRequestId', ([string][int]$Subject['subject']['pullRequestId']),
-        '-ExpectedHeadCommit', ([string]$Subject['subject']['sourceCommit']),
-        '-ExpectedRef', (Get-OwnerPreviewRequiredRef),
+        # The TOOLKIT's head and ref, not the pull request's. Both child tools
+        # resolve these against the checkout named by -RepoRoot, so stating the
+        # reviewed pull request's commit here would assert that the toolkit is
+        # checked out at somebody else's branch and refuse every run. The pull
+        # request's own identity travels in -PullRequestId and in the sealed
+        # snapshot binding, which those tools cross-check separately.
+        '-ExpectedHeadCommit', ([string]$Subject['toolkitHead']),
+        '-ExpectedRef', (Get-OwnerPreviewToolkitRequiredRef -Root $RepoRoot),
         '-OutputRoot', $captureRoot, '-RepoRoot', $RepoRoot, '-SealKeyPath', $sealKeyPath,
         '-LegacyProjectionFile', ([string]$paths['legacyProjection']),
         '-SecondGeneralistModel', $SecondGeneralistModel,
-        '-ConventionSpecialistModel', $model
+        '-ConventionSpecialistModel', $model,
+        '-DiscoveryGeneralistModel', $discoveryGeneralistModel
     )
     [void](Invoke-OwnerPreviewTool -Tool 'tools/Invoke-ReviewerRoleInputCapture.ps1' `
             -ToolArguments $captureArguments -Stage 'specialist input capture')
@@ -513,12 +612,13 @@ function Invoke-OwnerPreviewSpecialist {
         '-ReplayManifestDigest', ([string]$materialize.replayManifestDigest),
         '-ExpectedReviewerBaseCommit', $ExpectedReviewerBaseCommit,
         '-PullRequestId', ([string][int]$Subject['subject']['pullRequestId']),
-        '-ExpectedHeadCommit', ([string]$Subject['subject']['sourceCommit']),
-        '-ExpectedRef', (Get-OwnerPreviewRequiredRef),
+        '-ExpectedHeadCommit', ([string]$Subject['toolkitHead']),
+        '-ExpectedRef', (Get-OwnerPreviewToolkitRequiredRef -Root $RepoRoot),
         '-OutputRoot', $acquisitionRoot, '-RepoRoot', $RepoRoot,
-        '-SealKeyPath', (Join-Path $runRoot 'acquisition-seal.key'),
+        '-SealKeyPath', (Get-OwnerPreviewSealKeyPath -Name 'acquisition'),
         '-SecondGeneralistModel', $SecondGeneralistModel,
         '-ConventionSpecialistModel', $model,
+        '-DiscoveryGeneralistModel', $discoveryGeneralistModel,
         '-PerCallTimeoutSeconds', ([string]$PerCallTimeoutSeconds),
         '-ActivityTimeoutSeconds', ([string]$ActivityTimeoutSeconds),
         '-TotalTimeoutSeconds', ([string]$TotalTimeoutSeconds)
@@ -533,22 +633,48 @@ function Invoke-OwnerPreviewSpecialist {
     return $acquisitionRoot
 }
 
-function Read-OwnerPreviewMarkerText {
+function Read-OwnerPreviewSealedResult {
     <#
-        The specialist's raw output, out of the sealed transcript package.
+        The run's result, read only out of the HMAC-sealed acquisition package.
 
-        The transcript is the artifact acquisition sealed; the marker is a line
-        inside it. Reading the file rather than the tool's console output keeps
-        the result bound to what was sealed.
+        Deliberately not a search of the acquisition tree. That tree also holds
+        each attempt's RAW model stdout, the supervisor and reviewer console
+        logs, and - for a specialist run - the sealed discovery marker that was
+        handed IN as an input, which carries the same marker prefix. Picking the
+        first file that happens to contain the prefix would let a retried
+        attempt, a console echo, or an input document stand in for the terminal
+        answer, and the model's stdout is derived from attacker-controlled pull
+        request bytes.
+
+        So the package's seal is verified first and the marker and nonce are
+        taken from the bytes that seal covers. A package that is absent or does
+        not verify yields nothing, which the caller reports as an incomplete
+        pass rather than a clean one.
     #>
-    param([Parameter(Mandatory)][string]$AcquisitionRoot)
-    $candidates = @(Get-ChildItem -LiteralPath $AcquisitionRoot -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like '*stdout*' -or $_.Name -like '*result-marker*' -or $_.Name -like '*final*' })
-    foreach ($candidate in $candidates) {
-        $text = Get-Content -LiteralPath $candidate.FullName -Raw -Encoding UTF8
-        if ($null -ne $text -and $text.Contains('CONVENTION_REVIEW_RESULT_V4:')) { return $text }
+    param(
+        [Parameter(Mandatory)][string]$AcquisitionRoot,
+        [Parameter(Mandatory)][string]$SealKeyPath
+    )
+    $packageRoot = Join-Path $AcquisitionRoot 'package'
+    $empty = [pscustomobject]@{ MarkerText = ''; Nonce = ''; Diagnostic = '' }
+    if (-not (Test-Path -LiteralPath $packageRoot -PathType Container)) {
+        $empty.Diagnostic = "The acquisition published no sealed package at '$packageRoot'."
+        return $empty
     }
-    return ''
+    $schemaPath = Join-Path $RepoRoot 'src/Agents/reviewer/acquisition/v1/transcript-package.schema.json'
+    try {
+        $verified = Assert-ReviewerAcquisitionTranscriptPackage -PackageRoot $packageRoot `
+            -SealKeyPath $SealKeyPath -SchemaPath $schemaPath
+    }
+    catch {
+        $empty.Diagnostic = "The sealed acquisition package did not verify: $([string]$_.Exception.Message)"
+        return $empty
+    }
+    return [pscustomobject]@{
+        MarkerText = [string]$verified.MarkerText
+        Nonce      = [string]$verified.Core.nonce
+        Diagnostic = ''
+    }
 }
 
 function Save-OwnerPreviewOutcome {
@@ -561,9 +687,10 @@ function Save-OwnerPreviewOutcome {
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Subject,
         [Parameter(Mandatory)][AllowEmptyString()][string]$MarkerText,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ExpectedNonce,
         [Parameter(Mandatory)][string]$RunRoot
     )
-    $status = New-OwnerPreviewOutcome -Subject $Subject -MarkerText $MarkerText
+    $status = New-OwnerPreviewOutcome -Subject $Subject -MarkerText $MarkerText -ExpectedNonce $ExpectedNonce
     [void](Write-OwnerPreviewJsonFile -Path (Join-Path $RunRoot 'owner-preview-status.json') -Value $status)
     $report = Format-OwnerPreviewReport -Status $status
     $encoding = [System.Text.UTF8Encoding]::new($false)
@@ -628,11 +755,17 @@ try {
             $activeKey = if ($null -ne $prepared) { [string]$prepared.headKey } else {
                 [string](Assert-OwnerPreviewParameter -Value $HeadKey -Name 'HeadKey' -ForAction 'run')
             }
+            # Checked here rather than discovered by a child binder: acquisition
+            # declares it mandatory, and finding that out after capture and
+            # materialization have already run and written a package wastes two
+            # stages to report a missing argument.
+            [void](Assert-OwnerPreviewParameter -Value $ExpectedReviewerBaseCommit `
+                    -Name 'ExpectedReviewerBaseCommit' -ForAction $Action)
             $subject = Read-OwnerPreviewSubject -Root $root -HeadKey $activeKey
             $acquisitionRoot = Invoke-OwnerPreviewSpecialist -Subject $subject -Root $root
-            $markerText = Read-OwnerPreviewMarkerText -AcquisitionRoot $acquisitionRoot
             $runRoot = Join-Path (Join-Path $root 'runs') $activeKey
-            $status = Save-OwnerPreviewOutcome -Subject $subject -MarkerText $markerText -RunRoot $runRoot
+            $sealed = Read-OwnerPreviewSealedResult -AcquisitionRoot $acquisitionRoot -SealKeyPath (Join-Path $runRoot 'acquisition-seal.key')
+            $status = Save-OwnerPreviewOutcome -Subject $subject -MarkerText $sealed.MarkerText -ExpectedNonce $sealed.Nonce -RunRoot $runRoot
             if ([string]$status.terminal.status -cne 'completed') { $exitCode = 2 }
             Write-Output (ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{
                         action = $Action

@@ -350,8 +350,8 @@ try {
         configSha256 = ('7' * 64); toolkitHead = ('f' * 40)
         subject = [ordered]@{
             organization = 'contoso'; project = 'One'; repositoryId = '11111111-2222-3333-4444-555555555555'
-            repositoryName = 'Widgets'; pullRequestId = 4242; iterationId = 1
-            sourceCommit = ('a' * 40); targetCommit = ('c' * 40)
+            repositoryName = 'Widgets'; pullRequestId = 16991680; iterationId = 1
+            sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
         }
         rule = [ordered]@{ sections = @($ruleSections) }
         snapshot = [ordered]@{
@@ -360,7 +360,7 @@ try {
         }
     }
 
-    $absentStatus = New-OwnerPreviewOutcome -Subject $subjectDocument -MarkerText ''
+    $absentStatus = New-OwnerPreviewOutcome -Subject $subjectDocument -MarkerText '' -ExpectedNonce $nonce
     Assert-OwnerPreview -Condition ([string]$absentStatus.terminal.status -ceq 'incomplete') `
         -Message "A pass with no marker was not reported incomplete."
     Assert-OwnerPreview -Condition ([int]$absentStatus.counts.checked -eq 0) `
@@ -372,17 +372,61 @@ try {
         -Message "A failed pass did not say plainly that it recorded no verdicts."
 
     $truncatedText = 'CONVENTION_REVIEW_RESULT_V4: {"schemaVersion":4,"prId":4242,"nonce":"' + $nonce + '"'
-    $truncatedStatus = New-OwnerPreviewOutcome -Subject $subjectDocument -MarkerText $truncatedText
+    $truncatedStatus = New-OwnerPreviewOutcome -Subject $subjectDocument -MarkerText $truncatedText -ExpectedNonce $nonce
     Assert-OwnerPreview -Condition ([string]$truncatedStatus.terminal.status -ceq 'incomplete') `
         -Message "A truncated marker was not reported incomplete."
     Assert-OwnerPreview -Condition ([int]$truncatedStatus.counts.violations -eq 0) `
         -Message "A truncated marker produced violation counts."
 
-    $goodStatus = New-OwnerPreviewOutcome -Subject $subjectDocument -MarkerText $ownerMarkerText
+    $goodStatus = New-OwnerPreviewOutcome -Subject $subjectDocument -MarkerText $ownerMarkerText -ExpectedNonce $nonce
     Assert-OwnerPreview -Condition ([string]$goodStatus.terminal.status -ceq 'completed') `
         -Message "The nine-declaration marker did not produce a completed pass."
     Assert-OwnerPreview -Condition ([int]$goodStatus.counts.violations -eq 9) `
         -Message "The completed status did not carry the nine recorded violations."
+
+    # -----------------------------------------------------------------------
+    # Replay and forgery. A marker is only this run's answer if the run's own
+    # sealed nonce accepts it AND it names this subject.
+    # -----------------------------------------------------------------------
+    $foreignNonceStatus = New-OwnerPreviewOutcome -Subject $subjectDocument `
+        -MarkerText $ownerMarkerText -ExpectedNonce ('q' * 32)
+    Assert-OwnerPreview -Condition ([string]$foreignNonceStatus.terminal.status -cne 'completed') `
+        -Message "A marker carrying a different nonce than the run issued was accepted as this run's result."
+
+    $noNonceStatus = New-OwnerPreviewOutcome -Subject $subjectDocument `
+        -MarkerText $ownerMarkerText -ExpectedNonce ''
+    Assert-OwnerPreview -Condition ([string]$noNonceStatus.terminal.status -ceq 'incomplete') `
+        -Message "A run whose sealed package carried no nonce still reported a completed pass."
+
+    $forgedMarker = [ordered]@{
+        schemaVersion = 4; prId = 999999
+        repositoryId = '99999999-9999-9999-9999-999999999999'; project = 'One'
+        reviewedSourceCommit = ('9' * 40); targetCommit = ('9' * 40); changeSetDigest = ('c' * 64)
+        conventionPlanSha256 = ('d' * 64); factPlanSha256 = ('e' * 64); configSha256 = ('f' * 64)
+        scriptSha256 = ('0' * 64); promptSha256 = ('1' * 64)
+        assessments = @([ordered]@{
+                ruleRef = 'rs0'
+                constructs = @([ordered]@{ constructRef = 'dc2'; verdict = 'compliant' })
+                notes = @()
+            })
+        withheld = @(); residualRisks = @(); nonce = $nonce
+    }
+    $forgedText = 'CONVENTION_REVIEW_RESULT_V4: ' + ($forgedMarker | ConvertTo-Json -Depth 16 -Compress)
+    $forgedStatus = New-OwnerPreviewOutcome -Subject $subjectDocument -MarkerText $forgedText -ExpectedNonce $nonce
+    Assert-OwnerPreview -Condition ([string]$forgedStatus.terminal.status -ceq 'blocked') `
+        -Message "A marker naming another pull request was recorded under this subject's identity."
+    Assert-OwnerPreview -Condition ([int]$forgedStatus.counts.compliant -eq 0) `
+        -Message "A refused marker still contributed compliant declarations."
+
+    $mismatchDetail = Assert-OwnerPreviewMarkerBinding -Marker $forgedMarker -SubjectIdentity $subjectDocument['subject']
+    Assert-OwnerPreview -Condition ($mismatchDetail -ne '') `
+        -Message "The marker binding check accepted a marker bound to a different pull request."
+    $boundDetail = Assert-OwnerPreviewMarkerBinding -Marker ([ordered]@{
+            prId = 16991680; repositoryId = '11111111-2222-3333-4444-555555555555'
+            reviewedSourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+        }) -SubjectIdentity $subjectDocument['subject']
+    Assert-OwnerPreview -Condition ($boundDetail -eq '') `
+        -Message "The marker binding check refused a marker that does name this subject."
 
     $statusSchema = Get-Content -LiteralPath (Join-Path $schemaDir 'reviewer.owner-preview-status.v1.json') -Raw
     foreach ($candidate in @(
@@ -418,6 +462,24 @@ try {
     catch { $writeArgumentRefused = $true }
     Assert-OwnerPreview -Condition $writeArgumentRefused `
         -Message "A write switch in a child argument vector was not refused."
+
+    # PowerShell binds parameter names case-insensitively and by unambiguous
+    # prefix, so these all reach the same child switch as the exact spelling.
+    foreach ($spelling in @('-enableapprovalvote', '-EnableApprovalVot', '-EnableApp', '-EnableApprovalVote:$true')) {
+        $variantRefused = $false
+        try { [void](Assert-OwnerPreviewNoWriteArgument -ToolArguments @('-Role', 'specialist', $spelling) -Stage 'test') }
+        catch { $variantRefused = $true }
+        Assert-OwnerPreview -Condition $variantRefused `
+            -Message "The write-switch guard let '$spelling' through; PowerShell binds it to a write switch."
+    }
+    $ordinaryArgumentAccepted = $false
+    try {
+        $ordinaryArgumentAccepted = [bool](Assert-OwnerPreviewNoWriteArgument `
+                -ToolArguments @('-Role', 'specialist', '-Model', 'claude-opus-5', '-ExpectedRef', 'refs/heads/main') -Stage 'test')
+    }
+    catch { $ordinaryArgumentAccepted = $false }
+    Assert-OwnerPreview -Condition $ordinaryArgumentAccepted `
+        -Message "The write-switch guard refused an ordinary argument vector."
 
     $singlePackConfig = Join-Path $testRoot 'single-pack.config.json'
     [void](Write-OwnerPreviewJsonFile -Path $singlePackConfig -Value ([ordered]@{
