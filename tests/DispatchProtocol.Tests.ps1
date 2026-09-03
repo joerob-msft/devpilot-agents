@@ -253,6 +253,9 @@ Describe 'dispatch protocol primitives' {
         $signalFunction | Should -Match 'StartTime\.ToUniversalTime\(\)\.Ticks'
         $signalFunction | Should -Match '\$Signal -ne 0'
         $source | Should -Match 'Test-GuardianLeaderLive'
+        $source | Should -Match 'Test-GuardianProcessZombie'
+        $source | Should -Match '"/proc/\$ProcessId/stat"'
+        $source | Should -Match "\`$stat\[\`$nameEnd \+ 2\] -eq 'Z'"
         $source | Should -Match 'Invoke-GuardianGroupSignal[\s\S]+-Signal 15'
         $source | Should -Match 'Invoke-GuardianGroupSignal[\s\S]+-Signal 9'
     }

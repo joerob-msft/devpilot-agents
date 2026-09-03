@@ -74,12 +74,26 @@ function Test-GuardianGroupAlive {
     return ((Invoke-GuardianGroupSignal -ProcessGroupId $ProcessGroupId `
                 -LeaderStartTimeUtcTicks $LeaderStartTimeUtcTicks -Signal 0) -eq 'alive')
 }
+function Test-GuardianProcessZombie {
+    param([int]$ProcessId)
+    if (-not $IsLinux -or $ProcessId -le 0) { return $false }
+    try {
+        $stat = [IO.File]::ReadAllText("/proc/$ProcessId/stat")
+        $nameEnd = $stat.LastIndexOf(')')
+        return $nameEnd -ge 0 -and $stat.Length -gt ($nameEnd + 2) -and
+            $stat[$nameEnd + 2] -eq 'Z'
+    }
+    catch {
+        return $false
+    }
+}
 function Test-GuardianLeaderLive {
     param([int]$ProcessGroupId, [long]$LeaderStartTimeUtcTicks)
     if ($LeaderStartTimeUtcTicks -le 0) { return $false }
     try {
         $leader = Get-Process -Id $ProcessGroupId -ErrorAction Stop
-        return $leader.StartTime.ToUniversalTime().Ticks -eq $LeaderStartTimeUtcTicks
+        return -not (Test-GuardianProcessZombie -ProcessId $ProcessGroupId) -and
+            $leader.StartTime.ToUniversalTime().Ticks -eq $LeaderStartTimeUtcTicks
     }
     catch {
         return $false
@@ -90,7 +104,8 @@ function Test-GuardianBrokerLive {
     if ($StartTimeUtcTicks -le 0) { return $false }
     try {
         $broker = Get-Process -Id $ProcessId -ErrorAction Stop
-        return $broker.StartTime.ToUniversalTime().Ticks -eq $StartTimeUtcTicks
+        return -not (Test-GuardianProcessZombie -ProcessId $ProcessId) -and
+            $broker.StartTime.ToUniversalTime().Ticks -eq $StartTimeUtcTicks
     }
     catch {
         return $false
