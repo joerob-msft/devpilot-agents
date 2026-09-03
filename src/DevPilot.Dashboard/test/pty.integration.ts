@@ -65,6 +65,10 @@ function event(
 }
 
 function fixtureLines(): string {
+  const scrollEvents = Array.from({ length: 32 }, (_, index) =>
+    event("reviewer", "pty-reviewer", index + 4, "phase.changed", {
+      phase: `scroll marker ${String(index + 1).padStart(2, "0")}`,
+    }));
   return [
     event("reviewer", "pty-reviewer", 1, "agent.started", { repository: "operations-dashboard" }),
     event("reviewer", "pty-reviewer", 2, "candidate.selected", {
@@ -78,11 +82,12 @@ function fixtureLines(): string {
       reason: "Deterministic fixture warning",
       outstanding: ["summary"],
     }),
-    event("reviewer", "pty-reviewer", 4, "work.completed", {
+    ...scrollEvents,
+    event("reviewer", "pty-reviewer", 36, "work.completed", {
       result: "reviewed",
       summary: "Renderer and protocol verification complete",
     }),
-    event("reviewer", "pty-reviewer", 5, "agent.stopped", {}),
+    event("reviewer", "pty-reviewer", 37, "agent.stopped", {}),
     event("review-handler", "pty-handler", 1, "agent.started", { repository: "operations-dashboard" }),
     event("review-handler", "pty-handler", 2, "candidate.selected", {
       title: "ConPTY live flow",
@@ -215,6 +220,12 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     await writeAndWait("i", "Inspector closed");
     await writeAndWait("i", "Inspector opened and focused");
     await writeAndWait("e", "RAW EVENTS - ALL");
+    const scrollStart = visibleOutput().length;
+    terminal.write("\x1b[A".repeat(12));
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    terminal.resize(terminalColumns, terminalRows - 1);
+    terminal.resize(terminalColumns, terminalRows);
+    await waitForVisible("scroll marker 01", scrollStart);
     await writeAndWait("\x1b[C", "RAW EVENTS - WARNINGS");
     await writeAndWait("\x1b", "Events overlay closed");
 

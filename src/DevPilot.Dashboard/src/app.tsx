@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid";
+import type { ScrollBoxRenderable } from "@opentui/core";
 import { decideLayout, type LayoutDecision } from "./layout.js";
 import {
   age,
@@ -645,6 +646,7 @@ export function App(props: AppProps) {
   const [manualStatus, setManualStatus] = createSignal("");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let localBrokerShutdown: Promise<void> | undefined;
+  let eventScrollbox: ScrollBoxRenderable | undefined;
 
   function shutdownBroker(): Promise<void> {
     if (props.shutdownBroker) return props.shutdownBroker();
@@ -1096,6 +1098,10 @@ export function App(props: AppProps) {
       if (key.name === "escape") {
         setOverlay("none");
         notify("Events overlay closed");
+      } else if (key.name === "up" || key.name === "k") {
+        eventScrollbox?.scrollBy({ x: 0, y: -3 });
+      } else if (key.name === "down" || key.name === "j") {
+        eventScrollbox?.scrollBy({ x: 0, y: 3 });
       } else if (key.name === "left" || key.name === "right" || key.name === "e") {
         setEventWarningsOnly((value) => !value);
         notify(eventWarningsOnly() ? "Showing warning and error events" : "Showing all events");
@@ -1279,7 +1285,13 @@ export function App(props: AppProps) {
       </Show>
       <Show when={overlay() === "events"}>
         <OverlayPanel title={`RAW EVENTS - ${eventWarningsOnly() ? "WARNINGS" : "ALL"} (left/right filter)`} width={88} height={28}>
-          <scrollbox flexGrow={1} scrollY stickyScroll stickyStart="bottom">
+          <scrollbox
+            ref={(value) => { eventScrollbox = value; }}
+            flexGrow={1}
+            scrollY
+            stickyScroll
+            stickyStart="bottom"
+          >
             <For each={overlayEvents()} fallback={<text height={1} fg={COLORS.muted}>No matching events.</text>}>
               {(event) => (
                 <text height={1} fg={event.level === "error" ? COLORS.error : event.level === "warning" ? COLORS.warning : COLORS.text}>
@@ -1312,7 +1324,7 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.text}>f / Shift+f        Cycle Live, Current session, History view</text>
           <text height={1} fg={COLORS.text}>x / Shift+x        Hide selected / restore hidden PR history rows</text>
           <text height={1} fg={COLORS.text}>i                  Open/close inspector</text>
-          <text height={1} fg={COLORS.text}>e                  Raw events; arrows change filter</text>
+          <text height={1} fg={COLORS.text}>e                  Raw events; Up/Down scroll; Left/Right filter</text>
           <text height={1} fg={COLORS.text}>w                  Next attention item</text>
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
