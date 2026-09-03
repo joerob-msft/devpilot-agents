@@ -632,9 +632,13 @@ function New-OwnerPreviewCaptureRequest {
         resources     = @(
             [ordered]@{
                 mediaRole  = 'replay-manifest'
-                sealedPath = "sealed-resources/$([string]$LegacyProjection.SealedResourceName)"
-                sha256     = [string]$LegacyProjection.ManifestSha256
-                byteLength = [long]$LegacyProjection.ByteLength
+                # Capture resolves this path inside the sealed replay snapshot.
+                # The legacy projection separately resolves its hashed copy under
+                # pack/sealed-resources; conflating the two roots made production
+                # capture look for a pack-only file inside the snapshot.
+                sealedPath = 'manifest.json'
+                sha256     = $ManifestFileSha256
+                byteLength = [long](Get-Item -LiteralPath $Snapshot.ManifestPath).Length
             }
         )
     }

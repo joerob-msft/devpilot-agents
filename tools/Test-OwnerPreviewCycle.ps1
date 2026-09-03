@@ -248,6 +248,10 @@ try {
         -Message "The authored capture request does not satisfy role-input-capture-request.schema.json."
     Assert-OwnerPreview -Condition ([string]$captureRequest.role -ceq 'specialist') `
         -Message "The capture request must ask for the specialist role and nothing else."
+    Assert-OwnerPreview -Condition (
+        [string]@($captureRequest.resources)[0].sealedPath -ceq 'manifest.json' -and
+        [string]@($captureRequest.resources)[0].sha256 -ceq [string]$seed.ManifestSha256) `
+        -Message "The capture request does not bind the manifest where it exists inside the replay snapshot."
 
     # -----------------------------------------------------------------------
     # Subject identity. A different question must get a different key.
