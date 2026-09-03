@@ -91,6 +91,12 @@ param(
     [string]$SourceRefName = '',
     [string]$DiscoveryGeneralistModel = '',
     [string]$SealKeyRoot = '',
+
+    [ValidateRange(1, 4096)][int]$MaxChangedFiles = 256,
+    [ValidateRange(1, 33554432)][int]$MaxFileBytes = 4194304,
+    [ValidateRange(0, 4096)][int]$MaxSiblingFiles = 16,
+    [ValidateRange(0, 4096)][int]$MaxThreads = 64,
+    [ValidateRange(1, 100)][int]$MinChangedPathCoveragePercent = 80,
     [string]$SecondGeneralistModel = 'gpt-5.6-sol',
 
     [switch]$UseOfflineStubAdapter,
@@ -286,7 +292,9 @@ function New-OwnerPreviewPrepared {
         -CaptureMode $CaptureMode -AgencyPath $AgencyPath -ReplayRoot $SourceReplayRoot `
         -ReplaySnapshotName $SourceReplaySnapshotName -ReplayManifestDigest $SourceReplayManifestDigest `
         -OutputRoot $entryRoot -EntryId $entryId -SealKeyPath $sealKeyPath `
-        -ChildTimeoutSeconds $ChildTimeoutSeconds -RequestTimeoutSeconds $PerCallTimeoutSeconds
+        -ChildTimeoutSeconds $ChildTimeoutSeconds -RequestTimeoutSeconds $PerCallTimeoutSeconds `
+        -MaxChangedFiles $MaxChangedFiles -MaxFileBytes $MaxFileBytes -MaxSiblingFiles $MaxSiblingFiles `
+        -MaxThreads $MaxThreads -MinChangedPathCoveragePercent $MinChangedPathCoveragePercent
 
     $requestPath = Join-Path $staging 'cohort-entry-request.json'
     [void](Write-OwnerPreviewJsonFile -Path $requestPath -Value $request)
