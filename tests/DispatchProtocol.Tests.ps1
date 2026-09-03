@@ -558,12 +558,22 @@ Describe 'dispatch protocol primitives' {
             }
             $childExited = $child.Process.HasExited
             $childKillDiagnostics = if (-not $childExited) { Complete-AgentRedirectedProcess $guardian } else { $null }
+            $brokerProbe = Get-Process -Id $broker.Id -ErrorAction SilentlyContinue
+            $brokerProcStat = if ($IsLinux -and (Test-Path -LiteralPath "/proc/$($broker.Id)/stat")) {
+                Get-Content -LiteralPath "/proc/$($broker.Id)/stat" -Raw
+            } else { '<absent>' }
+            $childProcStat = if ($IsLinux -and (Test-Path -LiteralPath "/proc/$($child.Process.Id)/stat")) {
+                Get-Content -LiteralPath "/proc/$($child.Process.Id)/stat" -Raw
+            } else { '<absent>' }
             $childExited | Should -BeTrue -Because (
                 "the guardian must terminate the accepted child group after the broker dies" +
                 $(if ($childKillDiagnostics) {
                         "; guardian stdout: $($childKillDiagnostics.SafeOutputTail); " +
                         "guardian stderr: $($childKillDiagnostics.SafeErrorTail)"
-                    }))
+                    }) +
+                "; guardian exited: $($guardian.Process.HasExited); " +
+                "broker probe: $($null -ne $brokerProbe); broker stat: $brokerProcStat; " +
+                "child stat: $childProcStat")
             $guardian.Process.WaitForExit(10000) | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.json") | Should -BeFalse
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.ready") | Should -BeFalse
