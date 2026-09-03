@@ -90,6 +90,7 @@ $script:ReviewerCohortEntryErrorCatalog = [ordered]@{
     CE111 = 'A declared path escapes its own root or is not a plain relative path.'
     CE112 = 'The rule bundle declaration does not match its declared digest.'
     CE113 = 'The request caps threads above the page the reviewer''s own thread read asks for.'
+    CE114 = 'A rule section names an organization or project that is not the subject''s.'
     CE200 = 'The toolkit head does not match the repository the request names.'
     CE201 = 'The required ref does not resolve to the pinned toolkit head.'
     CE202 = 'The authoritative repository identity is not the reduced wrapper-contract shape.'
@@ -803,14 +804,9 @@ function Read-ReviewerCohortEntryRequest {
         'schemaVersion', 'kind', 'correlationId', 'toolkit', 'subject',
         'reviewer', 'ruleBundle', 'capture', 'coverage', 'output') -Optional @('executionPlan')
 
-    # Two versions are loadable, and they differ by exactly one section. A v1
-    # request can never grow slots - not by adding the section, not by any
-    # argument - so every request written before this slice keeps producing the
-    # identical preparation-only entry it produced then. A v2 request WITHOUT the
-    # section produces that same entry too; the version is the operator's
-    # statement of what they are authorizing, and the section is what they
-    # authorized.
-    $schemaVersion = Get-ReviewerCohortEntryInt -Object $root -Name 'schemaVersion' -Where 'request' -Minimum 1 -Maximum 2
+    # V1/v2 retain their historical no-binding behavior. Only v3 requires the
+    # explicit rule source, branch, section, and optional capture provenance.
+    $schemaVersion = Get-ReviewerCohortEntryInt -Object $root -Name 'schemaVersion' -Where 'request' -Minimum 1 -Maximum 3
     $executionPlanProperty = $root.PSObject.Properties['executionPlan']
     $hasExecutionPlan = $null -ne $executionPlanProperty
     # An explicit null is a present property with no plan in it. Left to the
@@ -871,26 +867,85 @@ function Read-ReviewerCohortEntryRequest {
     if ($sections.Count -lt 1 -or $sections.Count -gt 64) {
         New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail "The request ruleBundle declares $($sections.Count) section(s)."
     }
+    # The rule-source binding is the ONE thing v3 adds, and it is added here
+    # rather than at the read because a default chosen at the read is invisible
+    # to the operator who wrote the request and to the digest that covers it.
+    #
+    # Below v3 there is no binding to read, so the subject repository is used -
+    # which is exactly what those versions have always done, restated rather
+    # than left implicit. It is recorded on the section either way, so the read
+    # site has one shape to issue and no version to remember.
     $sectionList = [System.Collections.Generic.List[object]]::new()
     $seenSections = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $sectionRequiredKeys = if ($schemaVersion -ge 3) {
+        @('organization', 'project', 'repositoryId', 'branch', 'path', 'commit', 'section', 'sha256', 'byteLength')
+    }
+    else { @('path', 'commit', 'sha256', 'byteLength') }
     foreach ($section in $sections) {
-        Assert-ReviewerCohortEntryExactKeys -Object $section -Where 'request ruleBundle section' -Required @('path', 'commit', 'sha256', 'byteLength')
+        Assert-ReviewerCohortEntryExactKeys -Object $section -Where 'request ruleBundle section' -Required $sectionRequiredKeys
         $sectionPath = Get-ReviewerCohortEntryString -Object $section -Name 'path' -Where 'request ruleBundle section'
         Assert-ReviewerCohortEntryRepositoryRelativePath -Path $sectionPath -Where 'request ruleBundle section'
-        if (-not $seenSections.Add($sectionPath)) {
+        $sectionRepositoryId = $repositoryId
+        $sectionBranch = ''
+        $sectionHeading = ''
+        if ($schemaVersion -ge 3) {
+            $sectionOrganization = Get-ReviewerCohortEntryString -Object $section -Name 'organization' `
+                -Where 'request ruleBundle section' -Pattern '^[^/\s]+$' -MaxLength 128
+            $sectionProject = Get-ReviewerCohortEntryString -Object $section -Name 'project' `
+                -Where 'request ruleBundle section' -Pattern '^[^/\s]+$' -MaxLength 128
+            # A rule read is a read-only fetch inside the account the subject
+            # lives in. A section naming another organization or project would
+            # make this build reach somewhere the operator authorized a pull
+            # request in, but not a fetch from - so it is refused rather than
+            # attempted. The REPOSITORY is deliberately not constrained this
+            # way: differing from the subject is the entire purpose of the field.
+            if ($sectionOrganization -cne $organization) {
+                New-ReviewerCohortEntryRefusal -Code 'CE114' `
+                    -Detail ("The rule section '$sectionPath' names organization '$sectionOrganization' and the subject " +
+                        "is in '$organization'; a rule is read from the subject's own account.")
+            }
+            if ($sectionProject -cne $project) {
+                New-ReviewerCohortEntryRefusal -Code 'CE114' `
+                    -Detail ("The rule section '$sectionPath' names project '$sectionProject' and the subject " +
+                        "is in '$project'; a rule is read from the subject's own project.")
+            }
+            $sectionRepositoryId = Get-ReviewerCohortEntryString -Object $section -Name 'repositoryId' `
+                -Where 'request ruleBundle section' `
+                -Pattern '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' -MaxLength 36
+            $sectionBranch = Get-ReviewerCohortEntryString -Object $section -Name 'branch' `
+                -Where 'request ruleBundle section' -Pattern '^[A-Za-z0-9._/-]+$' -MaxLength 506
+            $sectionHeading = Get-ReviewerCohortEntryString -Object $section -Name 'section' `
+                -Where 'request ruleBundle section' `
+                -Pattern '^#{1,6} [^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$' -MaxLength 242
+        }
+        # Below v3 this remains the historical repository/path key. At v3 the
+        # heading is part of the identity: two rules from one guidance document
+        # are distinct sections, while the same section declared twice is not.
+        $sectionIdentity = if ($schemaVersion -ge 3) {
+            "$sectionRepositoryId`n$sectionPath`n$sectionHeading"
+        }
+        else { "$sectionRepositoryId`n$sectionPath" }
+        if (-not $seenSections.Add($sectionIdentity)) {
             New-ReviewerCohortEntryRefusal -Code 'CE110' -Detail "The rule bundle declares '$sectionPath' twice."
         }
         [void]$sectionList.Add([pscustomobject][ordered]@{
+                Organization = $organization
+                Project = $project
+                RepositoryId = $sectionRepositoryId
+                Branch = $sectionBranch
                 Path = $sectionPath
                 Commit = (Get-ReviewerCohortEntryString -Object $section -Name 'commit' -Where 'request ruleBundle section' -Pattern '^[0-9a-f]{40}$' -MaxLength 40)
+                Section = $sectionHeading
                 Sha256 = (Get-ReviewerCohortEntryString -Object $section -Name 'sha256' -Where 'request ruleBundle section' -Pattern '^[0-9a-f]{64}$' -MaxLength 64)
                 ByteLength = (Get-ReviewerCohortEntryInt -Object $section -Name 'byteLength' -Where 'request ruleBundle section' -Minimum 1 -Maximum 1048576)
             })
     }
 
     $capture = $root.capture
+    $captureOptionalKeys = @('replayRoot', 'replaySnapshotName', 'replayManifestDigest', 'agencyPath', 'requestTimeoutSeconds')
+    if ($schemaVersion -ge 3) { $captureOptionalKeys += @('models', 'reviewerScriptSha256', 'promptSha256') }
     Assert-ReviewerCohortEntryExactKeys -Object $capture -Where 'request capture' -Required @('mode') `
-        -Optional @('replayRoot', 'replaySnapshotName', 'replayManifestDigest', 'agencyPath', 'requestTimeoutSeconds')
+        -Optional $captureOptionalKeys
     $captureMode = Get-ReviewerCohortEntryString -Object $capture -Name 'mode' -Where 'request capture' -MaxLength 16
     if ($captureMode -cne 'replay' -and $captureMode -cne 'live') {
         New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail "The request capture declares mode '$captureMode'."
@@ -918,6 +973,42 @@ function Read-ReviewerCohortEntryRequest {
     $requestTimeoutSeconds = 0
     if ($capture.PSObject.Properties['requestTimeoutSeconds']) {
         $requestTimeoutSeconds = Get-ReviewerCohortEntryInt -Object $capture -Name 'requestTimeoutSeconds' -Where 'request capture' -Minimum 1 -Maximum 600
+    }
+    $captureModels = [string[]]@()
+    $captureReviewerScriptSha256 = ''
+    $capturePromptSha256 = ''
+    if ($schemaVersion -ge 3 -and $capture.PSObject.Properties['models']) {
+        foreach ($bindingName in @('reviewerScriptSha256', 'promptSha256')) {
+            if (-not $capture.PSObject.Properties[$bindingName]) {
+                New-ReviewerCohortEntryRefusal -Code 'CE104' `
+                    -Detail "The request capture binds models but omits '$bindingName'."
+            }
+        }
+        $rawCaptureModels = $capture.models
+        if ($rawCaptureModels -isnot [array] -or @($rawCaptureModels).Count -lt 1 -or @($rawCaptureModels).Count -gt 16) {
+            New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail 'The request capture models must be an array of 1..16 model identifiers.'
+        }
+        $supportedModels = [string[]]@((Get-ReviewerCohortEntryModelRegistry).Supported)
+        $seenCaptureModels = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $captureModelList = [System.Collections.Generic.List[string]]::new()
+        foreach ($rawModel in @($rawCaptureModels)) {
+            if ($rawModel -isnot [string] -or [string]$rawModel -cnotmatch '^[a-z0-9][a-z0-9.-]{0,63}$' -or
+                $supportedModels -cnotcontains [string]$rawModel -or -not $seenCaptureModels.Add([string]$rawModel)) {
+                New-ReviewerCohortEntryRefusal -Code 'CE106' `
+                    -Detail "The request capture model '$rawModel' is malformed, unsupported, or duplicated."
+            }
+            [void]$captureModelList.Add([string]$rawModel)
+        }
+        $captureModels = [string[]]$captureModelList.ToArray()
+        $captureReviewerScriptSha256 = Get-ReviewerCohortEntryString -Object $capture `
+            -Name 'reviewerScriptSha256' -Where 'request capture' -Pattern '^[0-9a-f]{64}$' -MaxLength 64
+        $capturePromptSha256 = Get-ReviewerCohortEntryString -Object $capture `
+            -Name 'promptSha256' -Where 'request capture' -Pattern '^[0-9a-f]{64}$' -MaxLength 64
+    }
+    elseif ($schemaVersion -ge 3 -and
+        ($capture.PSObject.Properties['reviewerScriptSha256'] -or $capture.PSObject.Properties['promptSha256'])) {
+        New-ReviewerCohortEntryRefusal -Code 'CE106' `
+            -Detail 'The request capture cannot bind reviewer or prompt bytes without binding models.'
     }
 
     $coverage = $root.coverage
@@ -1009,6 +1100,9 @@ function Read-ReviewerCohortEntryRequest {
         ReplayManifestDigest = $replayManifestDigest
         AgencyPath = $agencyPath
         RequestTimeoutSeconds = $requestTimeoutSeconds
+        CaptureModels = $captureModels
+        CaptureReviewerScriptSha256 = $captureReviewerScriptSha256
+        CapturePromptSha256 = $capturePromptSha256
         MaxChangedFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxChangedFiles' -Where 'request coverage' -Minimum 1 -Maximum (Get-ReviewerChangeListTop))
         MaxFileBytes = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxFileBytes' -Where 'request coverage' -Minimum 1 -Maximum 5242880)
         MaxSiblingFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxSiblingFiles' -Where 'request coverage' -Minimum 0 -Maximum 256)
@@ -1188,10 +1282,24 @@ function Get-ReviewerCohortEntryFileRead {
     .SYNOPSIS
         One planned repo_file read, in the exact argument vector and embedded-
         resource envelope the reviewer's own source read uses.
+
+    .DESCRIPTION
+        -RepositoryId is MANDATORY and has no default, deliberately. It used to
+        be taken from the request's subject, which is right for a changed file
+        and for its baseline and wrong for a rule: rule text routinely lives in
+        an engineering-guidance repository that is not the repository the pull
+        request is in, so every rule read was issued against the subject
+        repository, answered with a provider error, and reported as a generic
+        envelope refusal (CE302) that named neither the repository nor the
+        reason. A default here cannot be seen at the call site, which is
+        precisely where the mistake was invisible; requiring the caller to name
+        the repository makes the two kinds of read look different in the source,
+        because they ARE different.
     #>
     param(
         [Parameter(Mandatory)]$Request,
         [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$RepositoryId,
         [Parameter(Mandatory)][string]$ProviderPath,
         [Parameter(Mandatory)][string]$Commit,
         [Parameter(Mandatory)][string]$Role,
@@ -1199,11 +1307,15 @@ function Get-ReviewerCohortEntryFileRead {
         [string]$MimeType = 'text/plain'
     )
     Assert-ReviewerCohortEntryRepositoryRelativePath -Path $ProviderPath -Where "planned $Role read"
+    if ($RepositoryId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        New-ReviewerCohortEntryRefusal -Code 'CE106' `
+            -Detail "The planned $Role read '$Id' names repository '$RepositoryId', which is not a repository GUID."
+    }
     return (New-ReviewerCohortEntryRead -Id $Id -Tool 'repo_file' -Role $Role `
             -Arguments ([ordered]@{
                 action = 'get_content'
                 project = $Request.Project
-                repositoryId = $Request.RepositoryId
+                repositoryId = $RepositoryId
                 path = $ProviderPath
                 versionType = 'Commit'
                 version = $Commit

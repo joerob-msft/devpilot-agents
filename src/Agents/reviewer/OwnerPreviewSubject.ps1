@@ -267,14 +267,10 @@ function Assert-OwnerPreviewNoWriteArgument {
 function New-OwnerPreviewEvidenceRequest {
     <#
         The typed cohort-entry evidence request, to
-        reviewer.cohort-entry-evidence-request.v1.json.
+        reviewer.cohort-entry-evidence-request.v3.json.
 
-        No executionPlan is emitted, and that is the load-bearing detail. The v2
-        request grows a plan carrying exactly two generalist slots; without one,
-        the builder emits the v1 preparation-only request with no slots section
-        at all. No slots means no generalist, which means this preview costs one
-        specialist model start rather than three model runs whose verdict it
-        would then have to discard.
+        V3 carries the cross-repository rule source and section pin. No
+        executionPlan is emitted, so preparation declares no generalist slot.
 
         `reviewer.plannedRunCount` and `runSetKeyPath` are still required by the
         schema and are stated honestly as the inert declarations they are: no run
@@ -299,6 +295,9 @@ function New-OwnerPreviewEvidenceRequest {
         [Parameter(Mandatory)][string]$RuleDeclarationPath,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$RuleDeclarationSha256,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$RuleSections,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$CaptureModels,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$CaptureReviewerScriptSha256,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$CapturePromptSha256,
         [Parameter(Mandatory)][ValidateSet('live', 'replay')][string]$CaptureMode,
         [Parameter(Mandatory)][string]$OutputRoot,
         [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$')][string]$EntryId,
@@ -337,19 +336,37 @@ function New-OwnerPreviewEvidenceRequest {
         $capture['replayManifestDigest'] = $ReplayManifestDigest
     }
     $capture['requestTimeoutSeconds'] = $RequestTimeoutSeconds
+    $capture['models'] = [string[]]@($CaptureModels)
+    $capture['reviewerScriptSha256'] = $CaptureReviewerScriptSha256
+    $capture['promptSha256'] = $CapturePromptSha256
 
     $sections = [System.Collections.Generic.List[object]]::new()
     foreach ($section in @($RuleSections)) {
+        # Every field is carried. The v3 request contract requires the rule's own
+        # repository triple and the heading its pin describes, and this is the
+        # last layer that still has them: a projection that dropped them here
+        # produced a request the builder could only resolve by defaulting to the
+        # subject repository, which is the defect v3 exists to remove.
+        foreach ($field in @('organization', 'project', 'repositoryId', 'branch', 'path', 'commit', 'section', 'sha256', 'byteLength')) {
+            if ($null -eq $section.PSObject.Properties[$field] -or $null -eq $section.PSObject.Properties[$field].Value) {
+                throw "A rule section is missing '$field'; a v3 evidence request binds every section to its own repository and heading."
+            }
+        }
         [void]$sections.Add([ordered]@{
-                path       = [string]$section.path
-                commit     = [string]$section.commit
-                sha256     = [string]$section.sha256
-                byteLength = [int]$section.byteLength
+                organization = [string]$section.organization
+                project      = [string]$section.project
+                repositoryId = [string]$section.repositoryId
+                branch       = [string]$section.branch
+                path         = [string]$section.path
+                commit       = [string]$section.commit
+                section      = [string]$section.section
+                sha256       = [string]$section.sha256
+                byteLength   = [int]$section.byteLength
             })
     }
 
     return [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 3
         kind          = 'reviewer-cohort-entry-evidence-request'
         correlationId = $CorrelationId
         toolkit       = [ordered]@{
@@ -412,7 +429,8 @@ function Read-OwnerPreviewSealedSnapshot {
     #>
     param(
         [Parameter(Mandatory)][string]$ReplayRoot,
-        [Parameter(Mandatory)][string]$SnapshotName
+        [Parameter(Mandatory)][string]$SnapshotName,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryName
     )
     $snapshotPath = Join-Path $ReplayRoot $SnapshotName
     $manifestPath = Join-Path $snapshotPath 'manifest.json'
@@ -435,7 +453,7 @@ function Read-OwnerPreviewSealedSnapshot {
     }
 
     $binding = $manifest.binding
-    $required = @('organization', 'project', 'repositoryId', 'repositoryName', 'pullRequestId',
+    $required = @('organization', 'project', 'repositoryId', 'pullRequestId',
         'iterationId', 'sourceCommit', 'commonCommit', 'targetCommit')
     foreach ($field in $required) {
         $property = $binding.PSObject.Properties[$field]
@@ -454,7 +472,11 @@ function Read-OwnerPreviewSealedSnapshot {
         Organization   = [string]$binding.organization
         Project        = [string]$binding.project
         RepositoryId   = [string]$binding.repositoryId
-        RepositoryName = [string]$binding.repositoryName
+        # The production replay manifest intentionally keys repositories by GUID.
+        # The name was independently validated by the sealer against the corpus
+        # index and is carried from that validated recipe/subject, not invented
+        # from a manifest field the replay contract does not publish.
+        RepositoryName = $RepositoryName
         PullRequestId  = [int]$binding.pullRequestId
         IterationId    = [int]$binding.iterationId
         SourceCommit   = [string]$binding.sourceCommit
@@ -601,9 +623,13 @@ function New-OwnerPreviewCaptureRequest {
         resources     = @(
             [ordered]@{
                 mediaRole  = 'replay-manifest'
-                sealedPath = "sealed-resources/$([string]$LegacyProjection.SealedResourceName)"
-                sha256     = [string]$LegacyProjection.ManifestSha256
-                byteLength = [long]$LegacyProjection.ByteLength
+                # Capture resolves this path inside the sealed replay snapshot.
+                # The legacy projection separately resolves its hashed copy under
+                # pack/sealed-resources; conflating the two roots made production
+                # capture look for a pack-only file inside the snapshot.
+                sealedPath = 'manifest.json'
+                sha256     = $ManifestFileSha256
+                byteLength = [long]([IO.FileInfo]::new([string]$Snapshot.ManifestPath).Length)
             }
         )
     }
@@ -646,13 +672,26 @@ function Get-OwnerPreviewHeadKey {
         [Parameter(Mandatory)][string]$ToolkitHead
     )
     $sections = [System.Collections.Generic.List[object]]::new()
-    $ordered = @($RuleSections) | Sort-Object -Property @{ Expression = { [string]$_.path } },
+    $ordered = @($RuleSections) | Sort-Object -Property `
+    @{ Expression = { [string]$_.repositoryId } },
+    @{ Expression = { [string]$_.branch } },
+    @{ Expression = { [string]$_.path } },
+    @{ Expression = { [string]$_.section } },
+    @{ Expression = { [string]$_.commit } },
     @{ Expression = { [string]$_.sha256 } }
     foreach ($section in $ordered) {
+        # repositoryId and section are bound here for the same reason path and
+        # commit are: a rule read from a different repository, or a pin taken
+        # over a different heading of the same document, is a different rule and
+        # therefore a different preview. Leaving them out would let two
+        # materially different previews collide on one key.
         [void]$sections.Add([ordered]@{
-                path   = [string]$section.path
-                commit = ([string]$section.commit).ToLowerInvariant()
-                sha256 = ([string]$section.sha256).ToLowerInvariant()
+                repositoryId = ([string]$section.repositoryId).ToLowerInvariant()
+                branch       = [string]$section.branch
+                path         = [string]$section.path
+                commit       = ([string]$section.commit).ToLowerInvariant()
+                section      = [string]$section.section
+                sha256       = ([string]$section.sha256).ToLowerInvariant()
             })
     }
     $material = [ordered]@{

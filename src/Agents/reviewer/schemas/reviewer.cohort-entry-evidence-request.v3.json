@@ -1,0 +1,386 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:cohort-entry-evidence-request:v3",
+  "title": "Cohort entry evidence request, version 3",
+  "description": "Version 3 of the versioned operator input that authorizes ONE no-model build of one typed cohort entry's evidence. It extends v2 in two non-launching ways: every rule section must state the repository and branch its text actually lives in and the exact ATX heading its pin describes, and capture.models may bind the sealed snapshot to downstream role-input identities without creating a slot or authorizing execution. WHY A VERSION RATHER THAN A FIELD: through v2 a rule section carried only path/commit/sha256/byteLength, so the builder had nothing to issue the rule read against except the SUBJECT repository - and a rule that lives in a different repository than the pull request was read from the wrong repository, which the provider answers with an error and the reader reports as a generic envelope refusal. Making the binding REQUIRED is what removes the silent default; making it a new VERSION is what keeps every v1 and v2 request loadable and replayable exactly as it was, byte for byte, rather than retroactively invalidating requests written before the binding existed. A v3 section additionally states 'section', the ATX heading whose bytes the sha256/byteLength pin describes, because those pins were always the pins of a CUT SECTION while the read returns the WHOLE FILE; the builder stores the whole file it actually received and compares the pin against the cut. It carries NO expected findings, no oracle, no severity, no verdict and no answer key of any kind - every field below is checked against that rule by a recursive key AND path scan, so an answer cannot arrive as data or as a file name. Everything the builder publishes is DERIVED from reviewed read-only provider contracts; nothing here states a result. A request is private evidence about a real pull request and is never committed; only this schema is.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "correlationId",
+    "toolkit",
+    "subject",
+    "reviewer",
+    "ruleBundle",
+    "capture",
+    "coverage",
+    "output"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 3 },
+    "kind": { "type": "string", "const": "reviewer-cohort-entry-evidence-request" },
+    "correlationId": {
+      "type": "string",
+      "description": "The handle this build is journalled and reported under. Opaque: it must not encode a subject, because it travels into logs the subject may not.",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$"
+    },
+    "toolkit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositoryRoot", "head", "requiredRef"],
+      "properties": {
+        "repositoryRoot": { "$ref": "#/definitions/rootedPath" },
+        "head": {
+          "$ref": "#/definitions/commit",
+          "description": "The exact reviewed build this entry is prepared against. Re-resolved from the repository's own object store and refused on any disagreement, so an entry can never be prepared against a build nobody named."
+        },
+        "requiredRef": { "$ref": "#/definitions/fullRef" }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "description": "The one pull request this entry is about. The repository is named TWICE, by GUID and by name, because the reviewer's own read seam uses different ones in different arguments: repo_repository is asked by name-or-id, repo_pull_request/get_changes is asked with the repository NAME in its repositoryId argument, and repo_file is asked with the repository GUID in the same-named argument. A request that carried one identifier would have to guess which, and every historical assembly defect in this area was that guess.",
+      "additionalProperties": false,
+      "required": [
+        "organization",
+        "project",
+        "repositoryId",
+        "repositoryName",
+        "pullRequestId",
+        "targetRefName"
+      ],
+      "properties": {
+        "organization": { "$ref": "#/definitions/identityToken" },
+        "project": { "$ref": "#/definitions/identityToken" },
+        "repositoryId": {
+          "$ref": "#/definitions/guid",
+          "description": "The repository GUID, compared case-sensitively against the reduced authoritative identity's own 'id'."
+        },
+        "repositoryName": { "$ref": "#/definitions/identityToken" },
+        "pullRequestId": { "type": "integer", "minimum": 1 },
+        "targetRefName": {
+          "$ref": "#/definitions/fullRef",
+          "description": "Fully qualified on purpose. The reviewer configuration's validated target is fully qualified, and a short name would compare unequal to the branch it names."
+        }
+      }
+    },
+    "reviewer": {
+      "type": "object",
+      "description": "What the typed preparation this entry feeds needs in order to qualify. Launch authority still appears only in executionPlan; capture.models, when present, is provenance for a later role-input capture and creates no slot.",
+      "additionalProperties": false,
+      "required": [
+        "configPath",
+        "repositoryPath",
+        "operatorAlias",
+        "powerShellPath",
+        "childTimeoutSeconds",
+        "plannedRunCount",
+        "runSetKeyPath"
+      ],
+      "properties": {
+        "configPath": { "$ref": "#/definitions/rootedPath" },
+        "repositoryPath": { "$ref": "#/definitions/rootedPath" },
+        "operatorAlias": {
+          "type": "string",
+          "description": "Opaque. Recorded so the account names someone; never checked against a directory, because that is not a claim this build is in a position to make.",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$"
+        },
+        "powerShellPath": { "$ref": "#/definitions/rootedPath" },
+        "childTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 14400 },
+        "plannedRunCount": { "type": "integer", "minimum": 2, "maximum": 16 },
+        "runSetKeyPath": { "$ref": "#/definitions/rootedPath" }
+      }
+    },
+    "ruleBundle": {
+      "type": "object",
+      "description": "The pinned rule sections this entry is declared against, each bound to the exact repository, commit, heading, digest and byte length it was pinned at. The builder reads every section through the same read-only provider contract it reads a changed file through, stores the whole file the provider returned, and refuses a section whose CUT bytes disagree with the pin. A rule bundle is a DECLARATION of what will be read, never a statement of what those rules conclude.",
+      "additionalProperties": false,
+      "required": ["sourceKind", "declarationPath", "declarationSha256", "sections"],
+      "properties": {
+        "sourceKind": {
+          "type": "string",
+          "enum": ["pinnedRepositorySections"],
+          "description": "One value in this build. The kind exists so a future source has to be added deliberately rather than inferred from a shape."
+        },
+        "declarationPath": { "$ref": "#/definitions/rootedPath" },
+        "declarationSha256": { "$ref": "#/definitions/sha256" },
+        "sections": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "description": "One pinned rule section. The repository triple is MANDATORY and explicit: rule text routinely lives in an engineering-guidance repository that is not the repository the pull request is in, and a section that omitted it was previously read from the subject repository by default. There is no default here.",
+            "additionalProperties": false,
+            "required": ["organization", "project", "repositoryId", "branch", "path", "commit", "section", "sha256", "byteLength"],
+            "properties": {
+              "organization": {
+                "$ref": "#/definitions/identityToken",
+                "description": "Must equal the subject's organization. A rule read is a read-only fetch inside the same account the subject lives in; crossing accounts is refused rather than attempted."
+              },
+              "project": {
+                "$ref": "#/definitions/identityToken",
+                "description": "Must equal the subject's project, for the same reason as organization."
+              },
+              "repositoryId": {
+                "$ref": "#/definitions/guid",
+                "description": "The GUID of the repository the rule text lives in. MAY differ from the subject's repository - that is the whole point of the field - but must be a well-formed GUID, and the read is issued against exactly this value."
+              },
+              "branch": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 506,
+                "pattern": "^[A-Za-z0-9._/-]+$",
+                "description": "The short branch production convention loading resolves before reading the pinned commit. The captured branch response must resolve to 'commit'."
+              },
+              "path": { "$ref": "#/definitions/repositoryPath" },
+              "commit": { "$ref": "#/definitions/commit" },
+              "section": {
+                "type": "string",
+                "description": "The exact ATX heading whose bytes 'sha256' and 'byteLength' describe. The builder cuts this heading out of the whole file with the reviewer's own section extractor and compares the pin against the cut, so a pin recorded for a section is never checked against a whole document. A heading that is absent, or that appears more than once, is refused.",
+                "minLength": 3,
+                "maxLength": 242,
+                "pattern": "^#{1,6} [^\\s\\u0000-\\u001f\\u007f](?:[^\\u0000-\\u001f\\u007f]*[^\\s\\u0000-\\u001f\\u007f])?$"
+              },
+              "sha256": { "$ref": "#/definitions/sha256" },
+              "byteLength": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+            }
+          }
+        }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "description": "Where the read-only provider contract answers from. A replay capture never falls through to a live read; a live capture opens the agency-wrapped session the reviewer opens and issues exactly the plan below, in order, and nothing else. Optional 'models' binds the sealed snapshot to downstream role-input capture identities; it authorizes no execution and creates no slot.",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["replay", "live"] },
+        "replayRoot": { "$ref": "#/definitions/rootedPath" },
+        "replaySnapshotName": { "$ref": "#/definitions/identityToken" },
+        "replayManifestDigest": { "$ref": "#/definitions/sha256" },
+        "agencyPath": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "requestTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600 },
+        "models": {
+          "type": "array",
+          "description": "Supported model identities the sealed snapshot may later be captured for. This is provenance only: execution remains impossible without an executionPlan and launch authorization.",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/modelId" }
+        },
+        "reviewerScriptSha256": { "$ref": "#/definitions/sha256" },
+        "promptSha256": { "$ref": "#/definitions/sha256" }
+      },
+      "dependentRequired": {
+        "models": ["reviewerScriptSha256", "promptSha256"],
+        "reviewerScriptSha256": ["models"],
+        "promptSha256": ["models"]
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "replay" } }, "required": ["mode"] },
+          "then": { "required": ["replayRoot", "replaySnapshotName", "replayManifestDigest"] }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "live" } }, "required": ["mode"] },
+          "then": { "required": ["agencyPath"] }
+        }
+      ]
+    },
+    "coverage": {
+      "type": "object",
+      "description": "The caps and the floor. Caps bound what one entry may pull into a private corpus; the floor is what makes an entry's evidence usable rather than merely present, and a build that cannot reach it refuses instead of publishing a thin corpus nobody would notice was thin.",
+      "additionalProperties": false,
+      "required": [
+        "maxChangedFiles",
+        "maxFileBytes",
+        "maxSiblingFiles",
+        "maxThreads",
+        "minChangedPathCoveragePercent"
+      ],
+      "properties": {
+        "maxChangedFiles": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "maxFileBytes": { "type": "integer", "minimum": 1, "maximum": 5242880 },
+        "maxSiblingFiles": { "type": "integer", "minimum": 0, "maximum": 256 },
+        "maxThreads": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "minChangedPathCoveragePercent": { "type": "integer", "minimum": 1, "maximum": 100 }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "Where the immutable entry package is published. The root must be OUTSIDE the toolkit repository: a corpus inside it is private evidence one commit away from being published, and the corpus sealer refuses one for the same reason.",
+      "additionalProperties": false,
+      "required": ["root", "entryId", "ordinal", "sealKeyPath"],
+      "properties": {
+        "root": { "$ref": "#/definitions/rootedPath" },
+        "entryId": {
+          "type": "string",
+          "description": "The opaque handle the cohort journals and reports this entry under.",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$"
+        },
+        "ordinal": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "sealKeyPath": { "$ref": "#/definitions/rootedPath" }
+      }
+    },
+    "executionPlan": {
+      "type": "object",
+      "description": "OPTIONAL, and the only difference between v1 and v2. When present, the builder emits the COMPLETE typed coordinator request from creation: 'slots', 'reconciliation' and 'delivery' are written INSIDE the region the request digest covers, so nothing can be appended after the entry is hashed - a request that grew a slot afterwards would be a different request and its digest would no longer be the digest the manifest entry pins. When absent, the builder emits exactly the v1 preparation-only request, with no slots section at all. This section is CLOSED in the strongest sense available: every capability that could write is fixed by 'const' to its off value, so a write-enabled plan is not merely rejected - it cannot be spelled in this contract.",
+      "additionalProperties": false,
+      "required": [
+        "shadowSlotsEnabled",
+        "reviewerScript",
+        "models",
+        "timeouts",
+        "slots",
+        "reconciliation",
+        "delivery"
+      ],
+      "properties": {
+        "shadowSlotsEnabled": {
+          "type": "boolean",
+          "const": true,
+          "description": "Declared rather than implied. A plan present but disabled would be an entry that carries a full run declaration nothing may run, which is a state no operator ever wants and every reader would have to handle."
+        },
+        "reviewerScript": {
+          "type": "object",
+          "description": "The reviewed PowerShell entry point both slots launch. Named ONCE and shared by both declarations, because two slots running different scripts are not a cross-check of the same reviewer - and pinned by digest, because a path alone names whatever is at that path when the slot finally starts.",
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": { "$ref": "#/definitions/rootedPath" },
+            "sha256": { "$ref": "#/definitions/sha256" }
+          }
+        },
+        "models": {
+          "type": "object",
+          "description": "The models the declared run will use, stated so the entry can be checked against the supported-model registry BEFORE any slot exists rather than discovered at slot startup, which is where the historical 'wrapper named a retired Opus version' failure landed. The generalist pair is DERIVED from the registry and merely restated here for the record; a restatement that disagrees with the derivation is refused rather than obeyed.",
+          "additionalProperties": false,
+          "required": [
+            "generalistPairSource",
+            "generalistPair",
+            "conventionSpecialistModel",
+            "conventionVerifierModel"
+          ],
+          "properties": {
+            "generalistPairSource": {
+              "type": "string",
+              "const": "derivedFromSupportedModelRegistry",
+              "description": "One value. The pair is never chosen here; naming the source keeps that visible in the request itself."
+            },
+            "generalistPair": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "description": "The ordered Opus-family and GPT-family pair, compared case-sensitively and in order against Get-AgentGeneralistModelPair.",
+              "items": { "$ref": "#/definitions/modelId" }
+            },
+            "conventionSpecialistModel": { "$ref": "#/definitions/modelId" },
+            "conventionVerifierModel": { "$ref": "#/definitions/modelId" }
+          }
+        },
+        "timeouts": {
+          "type": "object",
+          "description": "The supervision envelope. Only supervisionGraceSeconds reaches the coordinator request - the other three are read by the coordinator from the SEALED QUALIFICATION PLAN, not from the request - so they are declared here to be recorded in, and signed into, the entry's own bound, where an operator can check that the plan they sealed and the entry they built agree.",
+          "additionalProperties": false,
+          "required": [
+            "perCallTimeoutSeconds",
+            "slotTimeoutSeconds",
+            "progressTimeoutSeconds",
+            "supervisionGraceSeconds"
+          ],
+          "properties": {
+            "perCallTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 14400 },
+            "slotTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 14400 },
+            "progressTimeoutSeconds": { "type": "integer", "minimum": 0, "maximum": 14400 },
+            "supervisionGraceSeconds": { "type": "integer", "minimum": 30, "maximum": 3600 }
+          }
+        },
+        "slots": {
+          "type": "array",
+          "description": "EXACTLY two, named slot1 then slot2 in that order. Two is the contract, not a default: an independent cross-check is two passes, the coordinator's own reader requires exactly two declarations, and the qualification's plannedRunCount must equal this count.",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "stateDirName", "terminalName", "launchAuthorizationTokenPath", "modelPlan"],
+            "properties": {
+              "name": { "type": "string", "enum": ["slot1", "slot2"] },
+              "stateDirName": { "$ref": "#/definitions/pathComponent" },
+              "terminalName": { "$ref": "#/definitions/pathComponent" },
+              "launchAuthorizationTokenPath": {
+                "$ref": "#/definitions/rootedPath",
+                "description": "Where the OPERATOR's launch authorization lives. The builder never mints one, never reads one and never requires one to exist: it records the path the declaration will be checked against. An entry that could mint its own launch token would be an entry that could launch itself."
+              },
+              "modelPlan": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["bindSealedArguments", "opaqueArguments"],
+                "properties": {
+                  "bindSealedArguments": { "type": "boolean" },
+                  "opaqueArguments": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "reconciliation": {
+          "type": "object",
+          "description": "The comparison of the two runs, declared from creation on the same terms as the slots. Its output is named by a single path COMPONENT rather than a path, so a reconciliation directory cannot be pointed anywhere outside the preparation root the entry declares.",
+          "additionalProperties": false,
+          "required": ["reconciliationEnabled", "outputDirName", "launchAuthorizationTokenPath"],
+          "properties": {
+            "reconciliationEnabled": { "type": "boolean", "const": true },
+            "outputDirName": { "$ref": "#/definitions/pathComponent" },
+            "launchAuthorizationTokenPath": { "$ref": "#/definitions/rootedPath" }
+          }
+        },
+        "delivery": {
+          "type": "object",
+          "description": "Preview only, and unable to be anything else. authorizationKind, the three capability switches and the provider write budget are all 'const': there is no value of this object that authorizes a comment, a vote, a gate or a single provider write, so a reviewer that tried to deliver one would be refused by the coordinator's own reader on a request it could not have been given.",
+          "additionalProperties": false,
+          "required": [
+            "deliveryEnabled",
+            "authorizationKind",
+            "outputDirName",
+            "launchAuthorizationTokenPath",
+            "commentsEnabled",
+            "votesEnabled",
+            "gatesEnabled",
+            "providerWriteBudget"
+          ],
+          "properties": {
+            "deliveryEnabled": { "type": "boolean", "const": true },
+            "authorizationKind": { "type": "string", "const": "PreviewOnly" },
+            "outputDirName": { "$ref": "#/definitions/pathComponent" },
+            "launchAuthorizationTokenPath": { "$ref": "#/definitions/rootedPath" },
+            "commentsEnabled": { "type": "boolean", "const": false },
+            "votesEnabled": { "type": "boolean", "const": false },
+            "gatesEnabled": { "type": "boolean", "const": false },
+            "providerWriteBudget": { "type": "integer", "const": 0 }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "modelId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9.-]*$" },
+    "pathComponent": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$" },
+    "guid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "identityToken": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^/\\s]+$" },
+    "fullRef": { "type": "string", "minLength": 6, "maxLength": 512, "pattern": "^refs/[A-Za-z0-9._/-]+$" },
+    "repositoryPath": { "type": "string", "minLength": 2, "maxLength": 1024, "pattern": "^/[^\\\\]*$" },
+    "rootedPath": { "type": "string", "minLength": 2, "maxLength": 1024 }
+  }
+}

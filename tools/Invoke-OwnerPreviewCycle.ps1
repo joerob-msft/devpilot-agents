@@ -230,21 +230,42 @@ function Get-OwnerPreviewRuleSections {
         if ($null -eq $source) {
             throw "The pack references authoritative source '$reference', which the configuration does not declare."
         }
-        foreach ($field in @('path', 'expectedSha256', 'expectedByteLength')) {
+        # organization/project/repositoryId are REQUIRED here, not optional
+        # extras. The rule text lives wherever the configuration says it lives -
+        # for this pack, an engineering-guidance repository that is NOT the
+        # repository the pull request is in - and dropping the binding at this
+        # layer is what made every rule read reach the subject repository and
+        # fail. 'section' joins them for the same reason: expectedSha256 and
+        # expectedByteLength are the pins of the CUT section, so the heading
+        # they describe has to travel with them.
+        foreach ($field in @('organization', 'project', 'repositoryId', 'branch', 'path', 'section', 'expectedSha256', 'expectedByteLength')) {
             $property = $source.PSObject.Properties[$field]
             if ($null -eq $property -or $null -eq $property.Value) {
-                throw "The authoritative source '$reference' declares no '$field'; an unpinned rule cannot be bound to a commit."
+                throw "The authoritative source '$reference' declares no '$field'; an unpinned or unbound rule cannot be read."
             }
         }
-        $sectionEntry = [ordered]@{
-            path       = [string]$source.path
-            commit     = $RuleCommit.ToLowerInvariant()
-            sha256     = ([string]$source.expectedSha256).ToLowerInvariant()
-            byteLength = [int]$source.expectedByteLength
+        if ([string]::IsNullOrWhiteSpace([string]$source.section) -or
+            [string]$source.section -notmatch '^#{1,6} [^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$') {
+            throw "The authoritative source '$reference' does not name a non-empty exact ATX section; Owner preview v3 does not infer a whole-file pin."
         }
-        $sectionProperty = $source.PSObject.Properties['section']
-        if ($null -ne $sectionProperty) { $sectionEntry['section'] = [string]$sectionProperty.Value }
-        [void]$sections.Add([pscustomobject]$sectionEntry)
+        [void]$sections.Add([pscustomobject][ordered]@{
+                organization = [string]$source.organization
+                project      = [string]$source.project
+                repositoryId = [string]$source.repositoryId
+                branch       = [string]$source.branch
+                path         = [string]$source.path
+                commit       = $RuleCommit.ToLowerInvariant()
+                section      = [string]$source.section
+                sha256       = ([string]$source.expectedSha256).ToLowerInvariant()
+                byteLength   = [int]$source.expectedByteLength
+            })
+    }
+    $ruleRepositories = [string[]]@($sections |
+            ForEach-Object { ([string]$_.repositoryId).ToLowerInvariant() } |
+            Sort-Object -CaseSensitive -Unique)
+    if ($ruleRepositories.Count -gt 1) {
+        throw ("The ownership pack spans $($ruleRepositories.Count) rule repositories, but -RuleCommit names one commit. " +
+            'Owner preview currently requires every referenced rule section to live in the same repository.')
     }
     return , $sections.ToArray()
 }
@@ -263,6 +284,15 @@ function New-OwnerPreviewPrepared {
     $toolkitHead = Get-OwnerPreviewToolkitHead -Root $toolkit
     $sections = Get-OwnerPreviewRuleSections -ConfigFile $ConfigFile -RuleCommit $RuleCommit
     $configSha = Get-OwnerPreviewFileSha256 -Path $ConfigFile
+    $captureModels = [string[]]@(@($Model, (Get-OwnerPreviewDiscoveryGeneralistModel), $SecondGeneralistModel) |
+            Sort-Object -CaseSensitive -Unique)
+    $captureReviewerScriptSha256 = Get-OwnerPreviewFileSha256 `
+        -Path (Join-Path $RepoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1')
+    $capturePromptPath = if ($PromptFile -ne '') {
+        [IO.Path]::GetFullPath($PromptFile)
+    }
+    else { Join-Path $RepoRoot 'src/Agents/reviewer/review-cycle.prompt.md' }
+    $capturePromptSha256 = Get-OwnerPreviewFileSha256 -Path $capturePromptPath
 
     $correlationId = 'ownerprev-' + ([guid]::NewGuid().ToString('N').Substring(0, 16))
     $staging = Join-Path (Join-Path $Root '.staging') $correlationId
@@ -288,7 +318,8 @@ function New-OwnerPreviewPrepared {
         -RepositoryPath ([IO.Path]::GetFullPath($(if ($RepositoryPath -ne '') { $RepositoryPath } else { $toolkit }))) `
         -OperatorAlias $OperatorAlias -PowerShellPath (Get-OwnerPreviewPowerShellPath) `
         -RunSetKeyPath $runSetKeyPath -RuleDeclarationPath ([IO.Path]::GetFullPath($ConfigFile)) `
-        -RuleDeclarationSha256 $configSha -RuleSections $sections `
+        -RuleDeclarationSha256 $configSha -RuleSections $sections -CaptureModels $captureModels `
+        -CaptureReviewerScriptSha256 $captureReviewerScriptSha256 -CapturePromptSha256 $capturePromptSha256 `
         -CaptureMode $CaptureMode -AgencyPath $AgencyPath -ReplayRoot $SourceReplayRoot `
         -ReplaySnapshotName $SourceReplaySnapshotName -ReplayManifestDigest $SourceReplayManifestDigest `
         -OutputRoot $entryRoot -EntryId $entryId -SealKeyPath $sealKeyPath `
@@ -322,7 +353,8 @@ function New-OwnerPreviewPrepared {
     # Read the sealed identity back off disk rather than parsing it out of the
     # sealer's console prose: the manifest is the artifact, the prose is a
     # courtesy.
-    $snapshot = Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot -SnapshotName ([string]$recipe.snapshotId)
+    $snapshot = Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot `
+        -SnapshotName ([string]$recipe.snapshotId) -RepositoryName ([string]$recipe.binding.repositoryName)
     $sealDigest = Get-OwnerPreviewFileSha256 -Path (Join-Path $snapshot.SnapshotPath 'offline-corpus-seal.json')
     $seed = New-OwnerPreviewLegacyProjection -Snapshot $snapshot -PackRoot $packRoot `
         -CorpusIndexSha256 ([string]$builder.corpusIndexSha256) -SealDigest $sealDigest
@@ -545,7 +577,8 @@ function Invoke-OwnerPreviewSpecialist {
     $configSha = [string]$Subject['configSha256']
     $model = [string]$Subject['model']
 
-    $snapshot = Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot -SnapshotName $snapshotId
+    $snapshot = Read-OwnerPreviewSealedSnapshot -ReplayRoot $replayRoot -SnapshotName $snapshotId `
+        -RepositoryName ([string]$Subject['subject']['repositoryName'])
     $seed = [pscustomobject]@{
         FixtureId          = $snapshotId
         ManifestSha256     = $manifestSha
@@ -606,7 +639,8 @@ function Invoke-OwnerPreviewSpecialist {
         '-ExpectedPromptSha256', (Get-OwnerPreviewFileSha256 -Path $promptPath),
         '-SecondGeneralistModel', $SecondGeneralistModel,
         '-ConventionSpecialistModel', $model,
-        '-OutputRoot', $materialized, '-RepoRoot', $RepoRoot) -Stage 'benchmark pack materialization'
+        '-OutputRoot', $materialized, '-RepoRoot', $RepoRoot,
+        '-PreserveSourceClassification') -Stage 'benchmark pack materialization'
     $materialize = Get-OwnerPreviewJsonLine -Text $materializeText
 
     $acquisitionRoot = Join-Path $runRoot 'acquisition'
@@ -772,7 +806,8 @@ try {
             $subject = Read-OwnerPreviewSubject -Root $root -HeadKey $activeKey
             $acquisitionRoot = Invoke-OwnerPreviewSpecialist -Subject $subject -Root $root
             $runRoot = Join-Path (Join-Path $root 'runs') $activeKey
-            $sealed = Read-OwnerPreviewSealedResult -AcquisitionRoot $acquisitionRoot -SealKeyPath (Join-Path $runRoot 'acquisition-seal.key')
+            $sealed = Read-OwnerPreviewSealedResult -AcquisitionRoot $acquisitionRoot `
+                -SealKeyPath (Get-OwnerPreviewSealKeyPath -Name 'acquisition')
             $status = Save-OwnerPreviewOutcome -Subject $subject -MarkerText $sealed.MarkerText -ExpectedNonce $sealed.Nonce -RunRoot $runRoot
             if ([string]$status.terminal.status -cne 'completed') { $exitCode = 2 }
             Write-Output (ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{

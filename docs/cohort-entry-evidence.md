@@ -29,8 +29,9 @@ is a request. What they get back is a sealed directory or a catalogued refusal.
 
 ## The operator request
 
-`src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.v1.json`,
-`schemaVersion: 1`, `kind: reviewer-cohort-entry-evidence-request`. Strict throughout —
+`src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.v1.json` through
+`reviewer.cohort-entry-evidence-request.v3.json`, with the matching `schemaVersion`
+and `kind: reviewer-cohort-entry-evidence-request`. Strict throughout —
 `additionalProperties: false` on every object, so a misspelled field is a refusal rather
 than a silently ignored intention.
 
@@ -40,7 +41,7 @@ than a silently ignored intention.
 | `toolkit` | Repository root, the exact head commit, and the ref that head must be on. |
 | `subject` | Organization, project, repository **id** and **name**, pull request id, and the target ref the entry is claimed against. |
 | `reviewer` | Config path, repository path, operator alias, PowerShell path, child timeout, planned run count, run-set key. |
-| `ruleBundle` | Where the pinned rules come from, the declaration digest, and each section's path, commit and digest. |
+| `ruleBundle` | Where the pinned rules come from, the declaration digest, and each section's source binding, path, commit, heading and digest. |
 | `capture` | `replay` or `live`, the replay root, snapshot name and manifest digest, the agency path, and the request timeout. |
 | `coverage` | Maximum changed files, file bytes, sibling files and threads, and the minimum changed-path coverage percent. |
 | `output` | Where the package is published, its entry id, its cohort ordinal, and the seal key. |
@@ -73,6 +74,29 @@ appending a slot to the published request and showing the digest no longer match
 | `supervision` | Per-call, slot, activity and grace timeouts. Per-call may not outlive the slot supervising it (`CE710`). |
 | `reconciliation` | Enabled, with a required run count that equals the declared slot count. |
 | `delivery` | `PreviewOnly`, comments/votes/gates all `false`, `providerWriteBudget` exactly `0` — every one of them a schema `const`. |
+
+### v3: explicit rule source and section
+
+`reviewer.cohort-entry-evidence-request.v3.json`, `schemaVersion: 3`, keeps the
+v2 execution-plan shape and makes rule sources explicit. Every v3 section
+must name `organization`, `project`, the rule repository GUID, the short branch
+production convention loading resolves, and the exact ATX heading whose digest
+and byte length are pinned. Organization and project must match the subject; the
+repository may differ. The captured branch response must resolve to the pinned
+commit.
+
+The provider still returns and the corpus still seals the whole file, byte for
+byte. The pin is checked separately against the shared
+`Get-ReviewerMarkdownSection` cut. Missing or repeated headings and digest or
+length drift refuse as `CE310`. v1/v2 keep their historical subject-repository,
+whole-file behavior and do not accept the new fields.
+
+An optional `capture.models` array, paired with explicit reviewer-script and
+prompt-file digests, binds the exact downstream role-input identity into the
+sealed replay snapshot. It is provenance only: without `executionPlan` the entry
+still emits no slots, consumes no launch authorization, and derives a zero
+model-start bound. The coordinator's separate prompt-asset-set digest is
+unchanged.
 
 **The launch authorization is derived, never supplied.** A request may not name
 `launchAuthorizationTokenPath` anywhere — not on a slot, not on the reconciliation, not on
@@ -193,7 +217,10 @@ the first read and checked after the last. Nothing interprets a raw REST respons
 | changes | `repo_pull_request` | **not shaped here** — the live cycle's own request, from the one shared constructor: `action=get_changes`, `project`, `repositoryId` = repository **name**, `pullRequestId`, `top` = **1000** |
 | changes with content | `repo_pull_request` | the same, plus `includeDiffs=true`, `includeLineContent=true` — a **distinct** request key |
 | threads | `repo_pull_request_thread` | **not shaped here** — the live cycle's own request, from the one shared constructor: `action=list`, `project`, `repositoryId` = repository **name**, `pullRequestId`, `top` = **200** |
-| changed file, sibling, rule section | `repo_file` | `action=get_content`, `project`, `repositoryId` = repository **id**, `path`, `versionType=Commit`, `version` = 40-hex commit |
+| changed file, sibling | `repo_file` | `action=get_content`, `project`, `repositoryId` = subject repository **id**, `path`, `versionType=Commit`, `version` = 40-hex commit |
+| rule repository | `repo_repository` | `action=get`, section `project`, `repositoryNameOrId` = authoritative rule repository **id** |
+| rule branch | `repo_branch` | `action=get`, section `project`, `repositoryId` = authoritative rule repository **id**, `branchName` = section branch |
+| rule file | `repo_file` | the same file shape, with `repositoryId` = the v3 section's authoritative rule repository **id**; one whole-file read is shared by multiple sections of the same repository/path/commit |
 
 None of the three provider-list reads is shaped by this builder, and the reason is the same
 for all of them. A replay answers the arguments it recorded and never falls through to a live
@@ -439,7 +466,7 @@ process exit code, because an exit code is one byte and the catalogue is not.
 
 | Range | Exit | Refuses |
 | --- | --- | --- |
-| `CE1xx` | 2 | The request: schema, version, missing or extra field, unreadable file, BOM, path shape, toolkit head or ref drift, a `maxThreads` above the page the reviewer's own thread read asks for (`CE113`). |
+| `CE1xx` | 2 | The request: schema, version, missing or extra field, unreadable file, BOM, path shape, toolkit head or ref drift, a `maxThreads` above the page the reviewer's own thread read asks for (`CE113`), or a v3 rule source crossing the subject's organization/project boundary (`CE114`). |
 | `CE2xx` | 3 | The subject: pull request drift, draft, inactive; repository or project id **shape** mismatch; branch mismatch; the raw provider shape where the reduced contract shape is required (`CE203`); a change set that arrived as a singleton object (`CE210`); a toolkit working tree carrying tracked modifications (`CE213`). |
 | `CE3xx` | 4 | The capture: a planned read never performed (`CE300`), a read performed but never planned or performed more times than planned (`CE301`), a MIME outside the allow-list (`CE302`), a resource URI that did not match exactly (`CE304`), a payload count outside its bound (`CE305`), a byte-order mark (`CE306`), a replay that has no record of a planned read and will not reach the provider for it (`CE307`), a write or a write authorization in a replay (`CE308`), an undeclared duplicate request key or a re-read that asks a different question (`CE309`), a rule section drifted from its pin (`CE310`). |
 | `CE4xx` | 5 | The census and coverage: ordering, duplicates, path traversal, reparse points, the changed-file cap (`CE402`), the thread cap (`CE406`), a thread list that reaches the reviewer's own page and so cannot be proven complete (`CE408`), a change set that reaches the reviewer's own page or states a continuation (`CE409`), the byte cap, a right-hand path whose content was not stored or a content coverage under the declared floor (`CE403`), a span that runs past the end of the file it describes (`CE404`), an empty census (`CE407`), target ref or config mismatch. |
@@ -450,7 +477,7 @@ process exit code, because an exit code is one byte and the catalogue is not.
 
 ## Tests
 
-`tools/Test-ShadowCohortEntryEvidence.ps1` — 316 checks offline, 361 with `-IncludePreflight`;
+`tools/Test-ShadowCohortEntryEvidence.ps1` — more than 400 checks offline and with `-IncludePreflight`;
 no model, no network, everything in a temporary sandbox. The `-IncludePreflight` set ends with
 one case that drives a build to `runSetReady` against a real run set declaration and then walks
 the published entry through the shipping cohort runner, which is the only place the *published*
@@ -482,6 +509,10 @@ launch authorization and the *derived* one are shown to be the same file by cons
 - **v1 stays v1.** A v1 request and a v2 request without a plan are both asserted to emit no
   `slots` section and to derive a bound of zero real model starts while still estimating the
   runs they plan, so the compatibility claim is checked rather than assumed.
+- **v3 separates capture from the pin.** A cross-repository fixture preserves a Unicode,
+  CRLF whole file in the sealed corpus while checking two ATX sections against their own
+  normalized UTF-8 pins. Missing, malformed, cross-organization/project, duplicate,
+  ambiguous, tampered and wrong-request-key variants assert their exact refusal codes.
 - **The bound is derived, and the derivation is reached.** The published bound's kind,
   request digest, toolkit head, per-role split and per-slot totals are all asserted against
   the *formula* — recomputed from the same four attempt factors the fixture runner declares
@@ -521,7 +552,7 @@ launch authorization and the *derived* one are shown to be the same file by cons
   happy path runs the shipping `tools/Save-CorpusReplaySeal.ps1 -ValidateOnly` over the
   builder-produced entry and requires exit 0 and no replay root written; the preflight then
   drives the real coordinator through `snapshotValidateOnly`, `snapshotSealed` and
-  `snapshotVerified` for both the v1 and the v2 shape. Eight sabotage cases take that same
+  `snapshotVerified` for the versioned request shapes. Eight sabotage cases take that same
   entry, change exactly one thing, re-mint the corpus index so integrity is not what refuses,
   and require the sealer's own refusal: a recipe carrying an extra field, a recipe binding no
   start identity, a start identity naming `lastMergeSourceCommit` instead of `sourceCommit`,

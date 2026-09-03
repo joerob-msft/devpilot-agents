@@ -181,18 +181,45 @@ function Assert-ReviewerCohortEntryRuleSection {
         defend on its own. A section that drifted by one byte from its pin is a
         different rule set, and a cohort that ran half its entries against one
         rule set and half against another is not a cohort.
+
+        V3 checks the shared extractor's section cut while leaving the captured
+        whole-file bytes and digest intact. Earlier versions retain their
+        historical whole-file comparison.
     #>
     param(
         [Parameter(Mandatory)]$Section,
         [Parameter(Mandatory)]$Captured
     )
-    if ([string]$Captured.Sha256 -cne [string]$Section.Sha256) {
-        New-ReviewerCohortEntryRefusal -Code 'CE310' `
-            -Detail "'$($Section.Path)' at $($Section.Commit) hashes to $([string]$Captured.Sha256) and the pin declares $([string]$Section.Sha256)."
+    $observedSha = [string]$Captured.Sha256
+    $observedBytes = [int]$Captured.ByteLength
+    $what = "'$($Section.Path)' at $($Section.Commit)"
+    $heading = [string]$Section.Section
+    if ($heading) {
+        $cut = $null
+        try { $cut = Get-ReviewerMarkdownSection -Text ([string]$Captured.Text) -Heading $heading }
+        catch {
+            # Ambiguity. The extractor refuses rather than guessing, and so does
+            # this: two headings spelled the same way mean the pin does not
+            # identify one section.
+            New-ReviewerCohortEntryRefusal -Code 'CE310' `
+                -Detail "$what does not identify one section: $($_.Exception.Message)"
+        }
+        if (-not $cut.Found) {
+            New-ReviewerCohortEntryRefusal -Code 'CE310' `
+                -Detail "$what no longer contains the pinned section '$heading'."
+        }
+        $cutText = [string]$cut.Text
+        $observedSha = Get-ReviewerSourceSha256 -Text $cutText
+        $observedBytes = $script:ReviewerCohortEntryUtf8.GetByteCount($cutText)
+        $what = "$what section '$heading'"
     }
-    if ([int]$Captured.ByteLength -ne [int]$Section.ByteLength) {
+    if ($observedSha -cne [string]$Section.Sha256) {
         New-ReviewerCohortEntryRefusal -Code 'CE310' `
-            -Detail "'$($Section.Path)' is $([int]$Captured.ByteLength) bytes and the pin declares $([int]$Section.ByteLength)."
+            -Detail "$what hashes to $observedSha and the pin declares $([string]$Section.Sha256)."
+    }
+    if ($observedBytes -ne [int]$Section.ByteLength) {
+        New-ReviewerCohortEntryRefusal -Code 'CE310' `
+            -Detail "$what is $observedBytes bytes and the pin declares $([int]$Section.ByteLength)."
     }
 }
 
@@ -357,6 +384,7 @@ function New-ReviewerCohortEntryEvidence {
     $census = [object[]]@()
     $spanEvidence = [ordered]@{}
     $ruleReads = [System.Collections.Generic.List[object]]::new()
+    $ruleSourceBindings = [System.Collections.Generic.List[object]]::new()
     try {
         $byId = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         foreach ($read in $identityReads) {
@@ -409,6 +437,7 @@ function New-ReviewerCohortEntryEvidence {
             if (-not [bool]$record.HasRightHand) { continue }
             $suffix = ([int]$record.Ordinal).ToString('000', [Globalization.CultureInfo]::InvariantCulture)
             [void]$extension.Add((Get-ReviewerCohortEntryFileRead -Request $request -Id "changed-$suffix" `
+                        -RepositoryId $request.RepositoryId `
                         -ProviderPath ([string]$record.Path) -Commit $identity.SourceCommit -Role 'changedFile' `
                         -PayloadFile "payloads/file-$suffix.txt"))
         }
@@ -422,17 +451,85 @@ function New-ReviewerCohortEntryEvidence {
         foreach ($record in $siblings) {
             $suffix = ([int]$record.Ordinal).ToString('000', [Globalization.CultureInfo]::InvariantCulture)
             [void]$extension.Add((Get-ReviewerCohortEntryFileRead -Request $request -Id "baseline-$suffix" `
+                        -RepositoryId $request.RepositoryId `
                         -ProviderPath ([string]$record.Path) -Commit $identity.CommonCommit -Role 'sibling' `
                         -PayloadFile "payloads/baseline-$suffix.txt"))
         }
         $ruleOrdinal = 0
+        $ruleReadBySource = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+        $ruleRepositoryReadBySource = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+        $ruleBranchReadBySource = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
         foreach ($section in $request.RuleSections) {
+            if ($request.SchemaVersion -ge 3) {
+                $repositoryKey = "$([string]$section.Project)`n$([string]$section.RepositoryId)"
+                $repositoryReadId = ''
+                if ([string]$section.RepositoryId -ceq [string]$request.RepositoryId) {
+                    $repositoryReadId = 'repository-identity'
+                }
+                elseif ($ruleRepositoryReadBySource.ContainsKey($repositoryKey)) {
+                    $repositoryReadId = [string]$ruleRepositoryReadBySource[$repositoryKey]
+                }
+                else {
+                    $repositoryReadId = "rule-repository-$((($ruleRepositoryReadBySource.Count + 1).ToString('000', [Globalization.CultureInfo]::InvariantCulture)))"
+                    [void]$extension.Add((New-ReviewerCohortEntryRead -Id $repositoryReadId `
+                                -Tool 'repo_repository' -Role 'identity' -Arguments ([ordered]@{
+                                    action = 'get'
+                                    project = [string]$section.Project
+                                    repositoryNameOrId = [string]$section.RepositoryId
+                                }) -Envelope 'mcpTextContent' -PayloadFile "payloads/$repositoryReadId.json"))
+                    $ruleRepositoryReadBySource.Add($repositoryKey, $repositoryReadId)
+                }
+
+                $branchKey = "$repositoryKey`n$([string]$section.Branch)"
+                $branchReadId = ''
+                if ([string]$section.RepositoryId -ceq [string]$request.RepositoryId -and
+                    "refs/heads/$([string]$section.Branch)" -ceq [string]$request.TargetRefName) {
+                    $branchReadId = 'target-branch'
+                }
+                elseif ($ruleBranchReadBySource.ContainsKey($branchKey)) {
+                    $branchReadId = [string]$ruleBranchReadBySource[$branchKey]
+                }
+                else {
+                    $branchReadId = "rule-branch-$((($ruleBranchReadBySource.Count + 1).ToString('000', [Globalization.CultureInfo]::InvariantCulture)))"
+                    [void]$extension.Add((New-ReviewerCohortEntryRead -Id $branchReadId `
+                                -Tool 'repo_branch' -Role 'identity' -Arguments ([ordered]@{
+                                    action = 'get'
+                                    project = [string]$section.Project
+                                    repositoryId = [string]$section.RepositoryId
+                                    branchName = [string]$section.Branch
+                                }) -Envelope 'mcpTextContent' -PayloadFile "payloads/$branchReadId.json"))
+                    $ruleBranchReadBySource.Add($branchKey, $branchReadId)
+                }
+                [void]$ruleSourceBindings.Add([pscustomobject]@{
+                        Section = $section
+                        RepositoryReadId = $repositoryReadId
+                        BranchReadId = $branchReadId
+                    })
+            }
+
+            # One provider read returns the whole file. Multiple v3 sections in
+            # that file reuse the captured record, then validate their own cuts;
+            # issuing the identical repo_file request twice would make one replay
+            # key name two resources and the closed-plan check would refuse it.
+            $sourceKey = "$([string]$section.RepositoryId)`n$([string]$section.Path)`n$([string]$section.Commit)"
+            if ($ruleReadBySource.ContainsKey($sourceKey)) {
+                [void]$ruleReads.Add([pscustomobject]@{
+                        Section = $section
+                        ReadId = [string]$ruleReadBySource[$sourceKey]
+                    })
+                continue
+            }
             $ruleOrdinal++
             $suffix = $ruleOrdinal.ToString('000', [Globalization.CultureInfo]::InvariantCulture)
+            # The rule's OWN repository, not the subject's. Below v3 the request
+            # reader resolves this to the subject repository, which is what
+            # those versions always read; at v3 the operator states it.
             $ruleRead = Get-ReviewerCohortEntryFileRead -Request $request -Id "rule-$suffix" `
+                -RepositoryId ([string]$section.RepositoryId) `
                 -ProviderPath ([string]$section.Path) -Commit ([string]$section.Commit) -Role 'rule' `
                 -PayloadFile "payloads/rule-$suffix.txt"
             [void]$extension.Add($ruleRead)
+            $ruleReadBySource.Add($sourceKey, [string]$ruleRead.Id)
             [void]$ruleReads.Add([pscustomobject]@{ Section = $section; ReadId = [string]$ruleRead.Id })
         }
         foreach ($read in $extension) { [void]$plan.Add($read) }
@@ -442,6 +539,21 @@ function New-ReviewerCohortEntryEvidence {
             $record = Invoke-ReviewerCohortEntryRead -Session $session -Read $read -MaxBytes $request.MaxFileBytes
             [void]$captured.Add($record)
             $byId[[string]$read.Id] = $record
+        }
+
+        foreach ($sourceBinding in $ruleSourceBindings) {
+            $section = $sourceBinding.Section
+            Assert-ReviewerCohortEntryRepositoryIdentity `
+                -Repository $byId[[string]$sourceBinding.RepositoryReadId].Parsed `
+                -ExpectedProject ([string]$section.Project) -ExpectedRepositoryId ([string]$section.RepositoryId)
+            $resolvedRuleCommit = Get-ReviewerCohortEntryBranchCommit `
+                -BranchResult $byId[[string]$sourceBinding.BranchReadId].Parsed `
+                -ExpectedRefName "refs/heads/$([string]$section.Branch)"
+            if ($resolvedRuleCommit -cne [string]$section.Commit) {
+                New-ReviewerCohortEntryRefusal -Code 'CE205' `
+                    -Detail ("Rule branch '$([string]$section.Branch)' resolves to $resolvedRuleCommit and the " +
+                        "section pins $([string]$section.Commit).")
+            }
         }
 
         foreach ($pin in $ruleReads) {
@@ -588,7 +700,13 @@ function New-ReviewerCohortEntryEvidence {
     $siblingCorpusPaths = [string[]]@(@($siblings) | ForEach-Object {
             [string]$corpusPathByReadId["baseline-$(([int]$_.Ordinal).ToString('000', [Globalization.CultureInfo]::InvariantCulture))"]
         })
-    $ruleCorpusPaths = [string[]]@(@($ruleReads) | ForEach-Object { [string]$corpusPathByReadId[[string]$_.ReadId] })
+    $ruleCorpusPathList = [System.Collections.Generic.List[string]]::new()
+    $seenRuleCorpusPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($ruleRead in $ruleReads) {
+        $ruleCorpusPath = [string]$corpusPathByReadId[[string]$ruleRead.ReadId]
+        if ($seenRuleCorpusPaths.Add($ruleCorpusPath)) { [void]$ruleCorpusPathList.Add($ruleCorpusPath) }
+    }
+    $ruleCorpusPaths = [string[]]$ruleCorpusPathList.ToArray()
 
     $corpus = New-ReviewerCohortEntryCorpus -Root $corpusRoot -Files $corpusFiles -Request $request `
         -Identity $identity -IterationId $iteration.IterationId
@@ -674,7 +792,27 @@ function New-ReviewerCohortEntryEvidence {
             declarationPath = $request.RuleBundleDeclarationPath
             declarationSha256 = $declarationSha
             sections = [object[]]@($request.RuleSections | ForEach-Object {
-                    [ordered]@{ path = [string]$_.Path; commit = [string]$_.Commit; sha256 = [string]$_.Sha256; byteLength = [int]$_.ByteLength }
+                    if ($request.SchemaVersion -ge 3) {
+                        [ordered]@{
+                            organization = [string]$_.Organization
+                            project = [string]$_.Project
+                            repositoryId = [string]$_.RepositoryId
+                            branch = [string]$_.Branch
+                            path = [string]$_.Path
+                            commit = [string]$_.Commit
+                            section = [string]$_.Section
+                            sha256 = [string]$_.Sha256
+                            byteLength = [int]$_.ByteLength
+                        }
+                    }
+                    else {
+                        [ordered]@{
+                            path = [string]$_.Path
+                            commit = [string]$_.Commit
+                            sha256 = [string]$_.Sha256
+                            byteLength = [int]$_.ByteLength
+                        }
+                    }
                 })
         }
         capture = [ordered]@{
@@ -709,6 +847,9 @@ function New-ReviewerCohortEntryEvidence {
     $reviewerScriptSha = if ($null -ne $request.ExecutionPlan) {
         [string]$request.ExecutionPlan.ReviewerScriptSha256
     }
+    elseif (@($request.CaptureModels).Count -gt 0) {
+        [string]$request.CaptureReviewerScriptSha256
+    }
     else {
         # A preparation-only entry declares no reviewer script, so the script that
         # produced this evidence is the one bound: something real, digested where
@@ -724,6 +865,15 @@ function New-ReviewerCohortEntryEvidence {
                 [string]$request.ExecutionPlan.ConventionSpecialistModel +
                 [string]$request.ExecutionPlan.ConventionVerifierModel) | Sort-Object -CaseSensitive -Unique)
     }
+    elseif (@($request.CaptureModels).Count -gt 0) {
+        # A capture binding is provenance, not launch authority. Preparation-only
+        # entries still emit no slots and derive a zero model-start bound.
+        $recipeModels = [string[]]@($request.CaptureModels)
+    }
+    $recipePromptSha = if (@($request.CaptureModels).Count -gt 0) {
+        [string]$request.CapturePromptSha256
+    }
+    else { $promptAssetSha }
     $recipe = New-ReviewerCohortEntryOfflineSealRecipe -Request $request -Identity $identity `
         -IterationId $iteration.IterationId -Files $corpusFiles -Corpus $corpus `
         -Resources ([object[]]$resources.ToArray()) -SpanEvidence $spanEvidence `
@@ -734,7 +884,7 @@ function New-ReviewerCohortEntryEvidence {
         -PolicyCorpusPath $policyCorpusPath -SiblingCorpusPaths $siblingCorpusPaths `
         -RuleCorpusPaths $ruleCorpusPaths `
         -ThreadCorpusPaths ([string[]]@([string]$corpusPathByReadId['threads'])) `
-        -ConfigSha256 $configBinding.Sha256 -ScriptSha256 $reviewerScriptSha -PromptSha256 $promptAssetSha `
+        -ConfigSha256 $configBinding.Sha256 -ScriptSha256 $reviewerScriptSha -PromptSha256 $recipePromptSha `
         -SchemaSha256 $stageSchemaSha -Models $recipeModels `
         -CapturedUtc ([DateTime]::UtcNow.ToString('yyyyMMdd\THHmmss\Z', [Globalization.CultureInfo]::InvariantCulture))
     $recipePath = Join-Path $evidenceRoot 'corpus-seal-recipe.json'
