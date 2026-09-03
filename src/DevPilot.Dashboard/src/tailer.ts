@@ -159,7 +159,6 @@ export class EventTailer {
     if (this.timer) return;
     void this.poll();
     this.timer = setInterval(() => void this.poll(), this.options.pollMilliseconds ?? 300);
-    this.timer.unref();
   }
 
   async stop(): Promise<void> {

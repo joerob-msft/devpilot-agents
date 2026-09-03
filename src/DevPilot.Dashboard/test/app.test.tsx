@@ -10,7 +10,15 @@ import { parseAgentEvent } from "../src/domain.js";
 import { OperationsReducer } from "../src/reducer.js";
 import { EventTailer } from "../src/tailer.js";
 import { PullRequestHistoryProjection } from "../src/history.js";
+import { createDashboardLifecycle } from "../src/lifecycle.js";
 import type { CapabilitySummary, DispatchAccepted, DispatchBroker, DispatchTerminal } from "../src/dispatch.js";
+
+const DOCUMENTED_COMMAND_COVERAGE = [
+  "Left", "Right", "Up", "Down", "j", "k", "Enter", "Esc", "b",
+  "Tab", "Shift+Tab", "f", "Shift+f", "x", "Shift+x", "/",
+  "number then Enter", "m", "prompt Tab", "prompt Enter",
+  "Ctrl+d then d then y", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
+] as const;
 
 function createFixture(prUrl = "https://github.com/joerob-msft/devpilot-agents/pull/94"): {
   reducer: OperationsReducer;
@@ -111,6 +119,54 @@ function createFixture(prUrl = "https://github.com/joerob-msft/devpilot-agents/p
   return { reducer, tailer };
 }
 
+function historyEvent(
+  repositoryId: string,
+  pullRequestId: number,
+  sequence: number,
+  options: {
+    role?: "reviewer" | "review-handler";
+    repositoryName?: string;
+    title?: string;
+    author?: string;
+    timestamp?: string;
+  } = {},
+) {
+  const repositoryName = options.repositoryName ?? "repo";
+  return parseAgentEvent({
+    schemaVersion: 3,
+    agent: options.role ?? "reviewer",
+    instanceId: `${options.role ?? "reviewer"}-${repositoryId}`,
+    processId: sequence,
+    timestamp: options.timestamp ?? `2026-09-03T00:00:${String(sequence).padStart(2, "0")}Z`,
+    sequence,
+    eventType: "work.completed",
+    level: "info",
+    cycleNumber: 1,
+    pullRequestId,
+    sourceCommit: String(sequence).repeat(40).slice(0, 40),
+    repositoryIdentity: {
+      schemaVersion: 1,
+      provider: "GitHub",
+      repositoryId,
+      organization: "contoso",
+      project: "",
+      repositoryName,
+      slug: `contoso/${repositoryName}`,
+      key: `v1:github:${repositoryId}`,
+      verifiedAtUtc: "2026-09-03T00:00:00Z",
+      verified: true,
+      dispatchEligible: true,
+    },
+    dispatch: null,
+    data: {
+      title: options.title ?? `PR ${pullRequestId}`,
+      author: options.author ?? "Ada",
+      result: options.role === "review-handler" ? "handled" : "reviewed",
+    },
+    message: "",
+  });
+}
+
 async function renderAt(
   context: Parameters<typeof test>[1] extends (context: infer T) => unknown ? T : never,
   setupList: TestRendererSetup[],
@@ -151,6 +207,15 @@ test("help legend spells out view meaning and local-only forget behavior", () =>
     "Live = active work; Current session = Live plus newest retained per group.",
     "History = stopped/completed retained runs; Stale = heartbeat overdue.",
     "Forget never deletes agent state or event logs; unavailable actions report status.",
+  ]);
+});
+
+test("documented command coverage matrix enumerates every dashboard command", () => {
+  assert.deepEqual(DOCUMENTED_COMMAND_COVERAGE, [
+    "Left", "Right", "Up", "Down", "j", "k", "Enter", "Esc", "b",
+    "Tab", "Shift+Tab", "f", "Shift+f", "x", "Shift+x", "/",
+    "number then Enter", "m", "prompt Tab", "prompt Enter",
+    "Ctrl+d then d then y", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
   ]);
 });
 
@@ -271,6 +336,26 @@ test("native keyboard controls provide contextual effects and feedback in every 
   try {
     const wide = await renderAt(context, setups, 140, 32, (url) => opened.push(url));
     if (!wide) return;
+    wide.mockInput.pressArrow("left");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /STATUS: Instance rail is the leftmost pane/);
+    wide.mockInput.pressArrow("right");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /FOCUS DETAIL/);
+    wide.mockInput.pressArrow("left");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /FOCUS RAIL/);
+    for (const key of ["down", "up"] as const) {
+      wide.mockInput.pressArrow(key);
+      await wide.flush();
+      assert.match(wide.captureCharFrame(), new RegExp(`STATUS: ${key === "up" ? "Previous" : "Next"} instance selected`));
+    }
+    wide.mockInput.pressKey("j");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /STATUS: Next instance selected/);
+    wide.mockInput.pressKey("k");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /STATUS: Previous instance selected/);
     wide.mockInput.pressEnter();
     await wide.renderOnce();
     assert.match(wide.captureCharFrame(), /FOCUS DETAIL/);
@@ -283,6 +368,30 @@ test("native keyboard controls provide contextual effects and feedback in every 
     wide.mockInput.pressEscape();
     await wide.flush();
     assert.match(wide.captureCharFrame(), /FOCUS DETAIL/);
+    wide.mockInput.pressKey("b");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /FOCUS RAIL/);
+    wide.mockInput.pressTab();
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /CURRENT SESSION \| REVIEWER/);
+    wide.mockInput.pressTab({ shift: true });
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /CURRENT SESSION \| ALL/);
+    wide.mockInput.pressKey("w");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /STATUS: Attention item selected: blocked/);
+    wide.mockInput.pressKey("e");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /STATUS: Raw events overlay opened/);
+    wide.mockInput.pressArrow("right");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /STATUS: Showing warning and error events/);
+    wide.mockInput.pressKey("e");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /STATUS: Showing all events/);
+    wide.mockInput.pressEscape();
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /STATUS: Events overlay closed/);
     wide.mockInput.pressKey("o");
     await wide.flush();
     assert.deepEqual(opened, ["https://github.com/joerob-msft/devpilot-agents/pull/94"]);
@@ -310,6 +419,9 @@ test("native keyboard controls provide contextual effects and feedback in every 
     wide.mockInput.pressKey("f", { shift: true });
     await wide.flush();
     assert.match(wide.captureCharFrame(), /HISTORY \| ALL \| WIDE \| FOCUS RAIL/);
+    wide.mockInput.pressKey("m");
+    await wide.flush();
+    assert.match(wide.captureCharFrame(), /STATUS: Observe-only launch: trusted manual broker is unavailable/);
 
     const standard = await renderAt(context, setups, 100, 30);
     assert.ok(standard);
@@ -323,8 +435,9 @@ test("native keyboard controls provide contextual effects and feedback in every 
     standard.mockInput.pressKey("?");
     await standard.flush();
     assert.match(standard.captureCharFrame(), /STATUS: Help opened/);
-    standard.mockInput.pressEscape();
+    standard.mockInput.pressKey("?");
     await standard.flush();
+    assert.match(standard.captureCharFrame(), /STATUS: Help closed/);
     standard.mockInput.pressKey("x", { shift: true });
     await standard.flush();
     assert.match(standard.captureCharFrame(), /STATUS: 1 historical row\(s\) forgotten for this dashboard process/);
@@ -361,6 +474,47 @@ test("native keyboard controls provide contextual effects and feedback in every 
     assert.match(missingUrl.captureCharFrame(), /STATUS: PR URL is missing or unsupported/);
   } finally {
     for (const setup of setups.reverse()) setup.renderer.destroy();
+  }
+});
+
+test("empty renderer reports unavailable navigation, attention, URL, and manual actions", async (context) => {
+  const reducer = new OperationsReducer();
+  const tailer = new EventTailer({
+    stateDirectories: [],
+    eventLogPaths: [],
+    onEvent: () => {},
+    onDiagnostic: (diagnostic) => reducer.addSourceDiagnostic(diagnostic),
+  });
+  reducer.addSourceDiagnostic({
+    source: "Q:\\malformed.jsonl",
+    kind: "malformed",
+    message: "malformed diagnostic is bounded and visible",
+    timestampMs: Date.now(),
+  });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={reducer} tailer={tailer} />, {
+      width: 100, height: 30, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    assert.match(setup.captureCharFrame(), /SOURCE WARNING: malformed diagnostic is bounded and visible/);
+    for (const key of ["down", "w", "o", "m"] as const) {
+      setup.mockInput.pressKey(key);
+      await setup.flush();
+    }
+    assert.match(setup.captureCharFrame(), /STATUS: Observe-only launch: trusted manual broker is unavailable/);
+    setup.mockInput.pressArrow("right");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /STATUS: No instance is available for detail/);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await tailer.stop();
   }
 });
 
@@ -457,6 +611,7 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
   }));
   let describeCount = 0;
   let dispatchCount = 0;
+  let cancelCount = 0;
   let describedTarget = "";
   let dispatchedTarget = "";
   let resolveDescribe!: (value: CapabilitySummary) => void;
@@ -506,7 +661,16 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
       dispatchedTarget = `${describedSummary.repositoryIdentity.key}:${describedSummary.prSnapshot.pullRequestId}`;
       return accepted;
     },
-    cancel: async () => ({ schemaVersion: 1, requestId: "x", operation: "cancelled", dispatchId: accepted.dispatchId } as DispatchTerminal),
+    cancel: async () => {
+      cancelCount++;
+      return {
+        schemaVersion: 1,
+        requestId: "x",
+        operation: "cancelled",
+        dispatchId: accepted.dispatchId,
+        result: "cancelled-cooperative",
+      } as DispatchTerminal;
+    },
     shutdown: async () => {},
     subscribeTerminal: () => () => {},
   };
@@ -521,6 +685,28 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
     setup.mockInput.pressTab();
     await setup.flush();
     assert.match(setup.captureCharFrame(), /HISTORY \| REVIEWER/);
+    setup.mockInput.pressKey("/");
+    await setup.mockInput.typeText("ManualX");
+    setup.mockInput.pressBackspace();
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /PR history filter: Manual/);
+    setup.mockInput.pressKey("/");
+    for (let index = 0; index < 6; index++) setup.mockInput.pressBackspace();
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /PR history filter cleared/);
+    setup.mockInput.pressKey("/");
+    await setup.mockInput.typeText("cancelled");
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /STATUS: History input cancelled/);
+    setup.mockInput.pressKey("9");
+    setup.mockInput.pressKey("9");
+    setup.mockInput.pressKey("9");
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /jump is missing/);
     setup.mockInput.pressKey("3");
     setup.mockInput.pressKey("0");
     setup.mockInput.pressKey("6");
@@ -533,19 +719,59 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
     setup.mockInput.pressEnter();
     await setup.flush();
     assert.match(setup.captureCharFrame(), /Jumped to repo PR #104/);
+    setup.mockInput.pressKey("x");
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /repo PR #104/);
+    setup.mockInput.pressKey("1");
+    setup.mockInput.pressKey("0");
+    setup.mockInput.pressKey("4");
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Jumped to repo PR #104/);
+    assert.match(setup.captureCharFrame(), /repo PR #104/);
+    history.apply(historyEvent("9007199254740997", 104, 1, {
+      repositoryName: "duplicate",
+      title: "Duplicate number",
+      timestamp: "2026-09-05T00:00:00Z",
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    setup.mockInput.pressKey("1");
+    setup.mockInput.pressKey("0");
+    setup.mockInput.pressKey("4");
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /ambiguous across repositories/);
+    setup.mockInput.pressKey("/");
+    await setup.mockInput.typeText("Manual PR");
+    setup.mockInput.pressEnter();
+    setup.mockInput.pressKey("1");
+    setup.mockInput.pressKey("0");
+    setup.mockInput.pressKey("4");
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Jumped to repo PR #104/);
     setup.mockInput.pressKey("m");
     await setup.flush();
     assert.match(setup.captureCharFrame(), /MANUAL DISPATCH/);
     assert.match(setup.captureCharFrame(), /contoso\/repo \/ PR #104/);
     assert.match(setup.captureCharFrame(), /Manual PR \| Ada/);
     assert.match(setup.captureCharFrame(), /512 Unicode scalars/);
+    setup.mockInput.pressTab();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Role: HANDLER/);
+    setup.mockInput.pressTab({ shift: true });
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Role: REVIEWER/);
     setup.mockInput.pressKey("q");
     setup.mockInput.pressKey("q", { ctrl: true });
     await setup.mockInput.typeText(" fix");
-    await setup.flush();
-    assert.match(setup.captureCharFrame(), /q fix/);
     setup.mockInput.pressEnter();
+    await setup.mockInput.typeText("next");
     await setup.flush();
+    assert.match(setup.captureCharFrame(), /q fix \/ next/);
+    setup.mockInput.pressBackspace();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /q fix \/ nex/);
     assert.equal(describeCount, 0);
     assert.equal(dispatchCount, 0);
     setup.mockInput.pressKey("d", { ctrl: true });
@@ -585,6 +811,13 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
     assert.equal(dispatchCount, 1);
     assert.equal(dispatchedTarget, "v1:github:9007199254740993:104");
     assert.match(setup.captureCharFrame(), /Accepted dispatch/);
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    assert.equal(cancelCount, 1);
+    assert.match(setup.captureCharFrame(), /Cancellation completed: cancelled-cooperative/);
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /MANUAL DISPATCH/);
   } catch (error) {
     if (error instanceof Error && error.message.includes("native FFI is not available")) {
       context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
@@ -593,6 +826,101 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
     throw error;
   } finally {
     setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("q shuts down the tailer and trusted broker before destroying the renderer", async (context) => {
+  const fixture = createFixture();
+  let shutdownCount = 0;
+  let setup: TestRendererSetup | undefined;
+  const broker: DispatchBroker = {
+    describe: async () => { throw new Error("not called"); },
+    dispatch: async () => { throw new Error("not called"); },
+    cancel: async () => { throw new Error("not called"); },
+    shutdown: async () => { shutdownCount++; },
+    subscribeTerminal: () => () => {},
+  };
+  const lifecycle = createDashboardLifecycle(fixture.tailer, broker);
+  try {
+    setup = await testRender(() => <App
+      reducer={fixture.reducer}
+      tailer={fixture.tailer}
+      broker={broker}
+      shutdownBroker={lifecycle.shutdownBroker}
+    />, {
+      width: 100,
+      height: 30,
+      kittyKeyboard: true,
+      onDestroy: lifecycle.onRendererDestroy,
+    });
+    await setup.renderOnce();
+    setup.mockInput.pressKey("q");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(shutdownCount, 1);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    if (shutdownCount === 0) setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("renderer destruction handles rejected trusted broker shutdown once", async (context) => {
+  const fixture = createFixture();
+  let shutdownCount = 0;
+  let setup: TestRendererSetup | undefined;
+  const reportedFailures: unknown[] = [];
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown): void => {
+    unhandledRejections.push(reason);
+  };
+  const broker: DispatchBroker = {
+    describe: async () => { throw new Error("not called"); },
+    dispatch: async () => { throw new Error("not called"); },
+    cancel: async () => { throw new Error("not called"); },
+    shutdown: async () => {
+      shutdownCount++;
+      throw new Error("shutdown timed out");
+    },
+    subscribeTerminal: () => () => {},
+  };
+  const lifecycle = createDashboardLifecycle(fixture.tailer, broker, (error) => {
+    reportedFailures.push(error);
+  });
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    setup = await testRender(() => <App
+      reducer={fixture.reducer}
+      tailer={fixture.tailer}
+      broker={broker}
+      shutdownBroker={lifecycle.shutdownBroker}
+    />, {
+      width: 100,
+      height: 30,
+      kittyKeyboard: true,
+      onDestroy: lifecycle.onRendererDestroy,
+    });
+    await setup.renderOnce();
+    setup.renderer.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(shutdownCount, 1);
+    assert.equal(reportedFailures.length, 1);
+    assert.match(String(reportedFailures[0]), /shutdown timed out/);
+    assert.deepEqual(unhandledRejections, []);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+    if (!setup?.renderer.isDestroyed) setup?.renderer.destroy();
     await fixture.tailer.stop();
   }
 });

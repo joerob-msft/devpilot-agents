@@ -88,6 +88,7 @@ test("history filtering, hiding, restoring, and deterministic eviction are local
   const key = history.list()[0]!.key;
   assert.equal(history.hide(key), true);
   assert.equal(history.list().some((item) => item.key === key), false);
+  assert.equal(history.matches(3)[0]?.key, key);
   assert.equal(history.jump(3)?.key, key);
   assert.equal(history.restore(key), false);
   assert.equal(history.hideAll(), 2);

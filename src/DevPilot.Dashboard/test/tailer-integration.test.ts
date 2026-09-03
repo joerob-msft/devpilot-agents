@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { appendFile, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { spawn, type ChildProcess } from "node:child_process";
+import { access, appendFile, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentEvent, SourceDiagnostic } from "../src/domain.js";
 import { EventTailer } from "../src/tailer.js";
@@ -22,6 +23,20 @@ function eventLine(sequence: number): string {
     data: {},
     message: "",
   });
+}
+
+async function waitForFile(path: string, child: ChildProcess, timeoutMilliseconds = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (Date.now() < deadline) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      if (child.exitCode !== null) throw new Error(`tailer child exited before creating ${path}`);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+  }
+  throw new Error(`timed out waiting for ${path}`);
 }
 
 test("tailer discovers files after startup and holds partial content", async () => {
@@ -48,6 +63,27 @@ test("tailer discovers files after startup and holds partial content", async () 
     assert.equal(diagnostics.length, 0);
   } finally {
     await tailer.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("started tailer keeps its process alive to poll a growing event stream", async () => {
+  const root = join(process.cwd(), `.dashboard-test-${process.pid}-${Date.now()}`);
+  const path = join(root, "instance.jsonl");
+  const readyPath = join(root, "ready");
+  const observedPath = join(root, "observed");
+  let child: ChildProcess | undefined;
+  try {
+    await mkdir(root, { recursive: true });
+    await writeFile(path, `${eventLine(1)}\n`, "utf8");
+    child = spawn(process.execPath, [join(process.cwd(), "dist", "test", "tailer-process-fixture.js"), root, path], {
+      stdio: "ignore",
+    });
+    await waitForFile(readyPath, child);
+    await appendFile(path, `${eventLine(2)}\n`, "utf8");
+    await waitForFile(observedPath, child);
+  } finally {
+    if (child?.exitCode === null) child.kill();
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -3,6 +3,7 @@ import { render } from "@opentui/solid";
 import { App } from "./app.js";
 import { DispatchClient, type BrokerLaunchDescriptor } from "./dispatch.js";
 import { PullRequestHistoryProjection } from "./history.js";
+import { createDashboardLifecycle } from "./lifecycle.js";
 import { OperationsReducer } from "./reducer.js";
 import { EventTailer } from "./tailer.js";
 
@@ -80,25 +81,30 @@ async function main(): Promise<void> {
         },
       })
     : undefined;
+  const lifecycle = createDashboardLifecycle(tailer, broker);
   const renderer = await createCliRenderer({
     screenMode: "alternate-screen",
     clearOnShutdown: true,
     exitOnCtrlC: true,
     consoleMode: "disabled",
     backgroundColor: "#08090a",
-    onDestroy: () => {
-      void tailer.stop();
-      void broker?.shutdown();
-    },
+    onDestroy: lifecycle.onRendererDestroy,
   });
 
   try {
     tailer.start();
-    await render(() => <App reducer={reducer} history={history} tailer={tailer} broker={broker} brokerFailure={() => brokerFailure} />, renderer);
+    await render(() => <App
+      reducer={reducer}
+      history={history}
+      tailer={tailer}
+      broker={broker}
+      brokerFailure={() => brokerFailure}
+      shutdownBroker={lifecycle.shutdownBroker}
+    />, renderer);
     refresh = () => renderer.requestRender();
   } catch (error) {
     await tailer.stop();
-    await broker?.shutdown();
+    await lifecycle.shutdownBroker();
     if (!renderer.isDestroyed) renderer.destroy();
     throw error;
   }

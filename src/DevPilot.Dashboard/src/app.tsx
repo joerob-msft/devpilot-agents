@@ -58,6 +58,7 @@ export interface AppProps {
   openUrl?: (url: string) => void | Promise<void>;
   broker?: DispatchBroker | undefined;
   brokerFailure?: () => string;
+  shutdownBroker?: () => Promise<void>;
 }
 
 type ManualMode = "closed" | "prompt" | "describing" | "confirm" | "confirm-final" | "dispatching" | "active" | "terminal";
@@ -646,6 +647,13 @@ export function App(props: AppProps) {
   const [acceptedDispatch, setAcceptedDispatch] = createSignal<DispatchAccepted | null>(null);
   const [manualStatus, setManualStatus] = createSignal("");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
+  let localBrokerShutdown: Promise<void> | undefined;
+
+  function shutdownBroker(): Promise<void> {
+    if (props.shutdownBroker) return props.shutdownBroker();
+    localBrokerShutdown ??= props.broker?.shutdown() ?? Promise.resolve();
+    return localBrokerShutdown;
+  }
 
   const refreshTimer = setInterval(() => {
     setNow(Date.now());
@@ -654,7 +662,7 @@ export function App(props: AppProps) {
   onCleanup(() => {
     clearInterval(refreshTimer);
     if (feedbackTimer) clearTimeout(feedbackTimer);
-    void props.broker?.shutdown();
+    void shutdownBroker();
   });
 
   function notify(message: string): void {
@@ -798,7 +806,7 @@ export function App(props: AppProps) {
   async function quit(): Promise<void> {
     setFeedback("Shutting down broker-owned manual work...");
     try {
-      await props.broker?.shutdown();
+      await shutdownBroker();
     } catch (error) {
       setFeedback(`Broker shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -927,14 +935,18 @@ export function App(props: AppProps) {
       notify(historyInput() ? `PR history filter: ${historyInput()}` : "PR history filter cleared");
     } else if (historyInputMode() === "jump") {
       const pullRequestId = Number(historyInput());
-      const renderedEntries = historyEntries();
-      const matches = renderedEntries
-        .map((entry, index) => ({ entry, index }))
-        .filter(({ entry }) => entry.pullRequestId === pullRequestId);
+      const selectedRole = role();
+      const matches = props.history.matches(pullRequestId, historyFilter())
+        .filter((entry) => selectedRole === "all" || Boolean(entry.outcomes[selectedRole]));
       if (matches.length !== 1) {
         notify("PR jump is missing, excluded by the active role, or ambiguous across repositories");
       } else {
-        const { entry, index } = matches[0]!;
+        const entry = matches[0]!;
+        props.history.restore(entry.key);
+        setRevision((value) => value + 1);
+        const index = props.history.list(historyFilter())
+          .filter((item) => selectedRole === "all" || Boolean(item.outcomes[selectedRole]))
+          .findIndex((item) => item.key === entry.key);
         setSelected(index);
         notify(`Jumped to ${entry.repositoryIdentity.repositoryName} PR #${entry.pullRequestId}`);
       }

@@ -69,7 +69,7 @@ polled until they appear.
 | `Esc` / `b` | Dismiss overlay or move back toward the instance rail |
 | `Tab` / `Shift+Tab` | Cycle all, reviewer, and review-handler roles |
 | `f` / `Shift+f` | Cycle Live, Current session, and History views |
-| `x` / `Shift+x` | Hide the selected/all retained PR history rows for this dashboard process |
+| `x` / `Shift+x` | Hide the selected retained PR history row / restore all hidden PR history rows for this dashboard process |
 | `/` | Filter PR history by number, title, author, repository, or outcome |
 | Number then `Enter` | Jump to and restore a unique retained PR number |
 | `m` | Open manual dispatch for the selected retained PR when trusted policy is available |

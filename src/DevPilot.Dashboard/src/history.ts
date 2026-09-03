@@ -133,18 +133,17 @@ export class PullRequestHistoryProjection {
     return [...this.entries.values()]
       .filter((entry) => !this.hiddenKeys.has(entry.key))
       .filter((entry) => !repositoryKey || entry.repositoryIdentity.key === repositoryKey)
-      .filter((entry) => {
-        if (!needle) return true;
-        const outcomes = Object.values(entry.outcomes).map((item) => item?.result ?? "").join(" ");
-        return [
-          String(entry.pullRequestId),
-          entry.title,
-          entry.author,
-          entry.repositoryIdentity.repositoryName,
-          entry.repositoryIdentity.slug,
-          outcomes,
-        ].some((value) => value.toLowerCase().includes(needle));
-      })
+      .filter((entry) => this.matchesFilter(entry, needle))
+      .sort((left, right) =>
+        right.lastSeenTimestampMs - left.lastSeenTimestampMs || compareOrdinal(left.key, right.key));
+  }
+
+  matches(pullRequestId: number, filter = ""): PullRequestHistoryEntry[] {
+    if (!Number.isSafeInteger(pullRequestId) || pullRequestId <= 0) return [];
+    const needle = filter.trim().toLowerCase();
+    return [...this.entries.values()]
+      .filter((entry) => entry.pullRequestId === pullRequestId)
+      .filter((entry) => this.matchesFilter(entry, needle))
       .sort((left, right) =>
         right.lastSeenTimestampMs - left.lastSeenTimestampMs || compareOrdinal(left.key, right.key));
   }
@@ -188,6 +187,19 @@ export class PullRequestHistoryProjection {
 
   diagnostic(): string {
     return this.evictionDiagnostic;
+  }
+
+  private matchesFilter(entry: PullRequestHistoryEntry, needle: string): boolean {
+    if (!needle) return true;
+    const outcomes = Object.values(entry.outcomes).map((item) => item?.result ?? "").join(" ");
+    return [
+      String(entry.pullRequestId),
+      entry.title,
+      entry.author,
+      entry.repositoryIdentity.repositoryName,
+      entry.repositoryIdentity.slug,
+      outcomes,
+    ].some((value) => value.toLowerCase().includes(needle));
   }
 
   private evict(): void {
