@@ -197,6 +197,11 @@ expected 40-hex source head. `refresh-before-first-run` binds the live head
 captured on its first run; it is not a standing "run every new head" discovery
 mode. To process a later head, update the declaration.
 
+For offline proof only, an entry may name the committed
+`offlineModelAdapterManifest`; that digest is part of the charge key and Layer 1
+then enables its existing non-promotable offline adapter seam. The scheduled
+production declaration omits this field.
+
 The queue's `headKey` binds subject and source identity, target identity, exact
 rule repository/path/branch/commit/section/hash/length, supported-model
 registry, selected model, reviewer config, prompt and reviewer-script hashes,

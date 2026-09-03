@@ -47,6 +47,7 @@
         "configPath": { "$ref": "#/$defs/path" },
         "promptPath": { "$ref": "#/$defs/path" },
         "repositoryPath": { "$ref": "#/$defs/path" },
+        "offlineModelAdapterManifest": { "$ref": "#/$defs/path" },
         "authoritativeRuleCommit": { "$ref": "#/$defs/commit" },
         "model": { "$ref": "#/$defs/name" },
         "expectedReviewerBaseCommit": { "$ref": "#/$defs/commit" },

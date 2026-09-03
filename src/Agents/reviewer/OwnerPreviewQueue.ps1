@@ -91,9 +91,12 @@ function Read-OwnerPreviewQueueConfig {
         foreach ($name in @('configPath', 'agencyPath')) {
             $entry[$name] = Assert-OwnerPreviewQueueSafePath -Path ([string]$entry[$name]) -Where "Entry $name"
         }
-        foreach ($name in @('promptPath', 'repositoryPath')) {
+        foreach ($name in @('promptPath', 'repositoryPath', 'offlineModelAdapterManifest')) {
             if ($entry.Contains($name)) {
                 $entry[$name] = Assert-OwnerPreviewQueueSafePath -Path ([string]$entry[$name]) -Where "Entry $name"
+                if (-not (Test-Path -LiteralPath $entry[$name] -PathType Leaf) -and $name -cne 'repositoryPath') {
+                    throw "Entry $name '$($entry[$name])' does not exist."
+                }
             }
         }
         if (-not (Test-Path -LiteralPath $entry.configPath -PathType Leaf)) {
@@ -331,6 +334,10 @@ function Get-OwnerPreviewQueueIntent {
         configSha256 = Get-OwnerPreviewFileSha256 -Path ([string]$Entry.configPath)
         promptSha256 = Get-OwnerPreviewFileSha256 -Path $prompt
         scriptSha256 = Get-OwnerPreviewFileSha256 -Path $scriptPath
+        offlineAdapterSha256 = $(if ($Entry.Contains('offlineModelAdapterManifest')) {
+                Get-OwnerPreviewFileSha256 -Path ([string]$Entry.offlineModelAdapterManifest)
+            }
+            else { '' })
         toolkitHead = ([string]$Config.expectedToolkitHead).ToLowerInvariant()
     }
     return [pscustomobject]@{
@@ -360,6 +367,7 @@ function Get-OwnerPreviewQueueHeadKey {
         configSha256 = [string]$Intent.Material.configSha256
         promptSha256 = [string]$Intent.Material.promptSha256
         scriptSha256 = [string]$Intent.Material.scriptSha256
+        offlineAdapterSha256 = [string]$Intent.Material.offlineAdapterSha256
         replayManifestDigest = [string]$Subject.snapshot.manifestDigest
         toolkitHead = [string]$Intent.Material.toolkitHead
     }
@@ -398,6 +406,12 @@ function Invoke-OwnerPreviewQueueCycleDriver {
     if ($Entry.Contains('sourceRefName')) { $arguments += @('-SourceRefName', [string]$Entry.sourceRefName) }
     if ($Entry.Contains('repositoryPath')) { $arguments += @('-RepositoryPath', [string]$Entry.repositoryPath) }
     if ($Entry.Contains('promptPath')) { $arguments += @('-PromptFile', [string]$Entry.promptPath) }
+    if ($Entry.Contains('offlineModelAdapterManifest')) {
+        $arguments += @(
+            '-UseOfflineStubAdapter',
+            '-OfflineModelAdapterManifest', [string]$Entry.offlineModelAdapterManifest
+        )
+    }
 
     $start = [DateTime]::UtcNow
     $deadline = $start.AddSeconds($script:OwnerPreviewQueueMaximumSeconds)
