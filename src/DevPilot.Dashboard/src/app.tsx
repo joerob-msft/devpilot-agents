@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
-import { Portal, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid";
+import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import { decideLayout, type LayoutDecision } from "./layout.js";
 import {
   age,
@@ -590,27 +590,24 @@ function Inspector(props: { instance: InstanceState | undefined; focused?: boole
 }
 
 function OverlayPanel(props: { title: string; children: unknown; width?: number; height?: number }) {
-  const renderer = useRenderer();
   return (
-    <Portal mount={renderer.root}>
-      <box
-        position="absolute"
-        top="15%"
-        left="15%"
-        width={props.width ?? 70}
-        height={props.height ?? 18}
-        zIndex={100}
-        border
-        borderStyle="double"
-        borderColor={COLORS.accent}
-        backgroundColor={COLORS.panel}
-        title={` ${props.title} `}
-        padding={1}
-        flexDirection="column"
-      >
-        {props.children}
-      </box>
-    </Portal>
+    <box
+      position="absolute"
+      top="15%"
+      left="15%"
+      width={props.width ?? 70}
+      height={props.height ?? 18}
+      zIndex={100}
+      border
+      borderStyle="double"
+      borderColor={COLORS.accent}
+      backgroundColor={COLORS.panel}
+      title={` ${props.title} `}
+      padding={1}
+      flexDirection="column"
+    >
+      {props.children}
+    </box>
   );
 }
 

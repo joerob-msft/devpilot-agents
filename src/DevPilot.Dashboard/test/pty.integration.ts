@@ -197,7 +197,8 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     await waitForVisible("OBSERVE ONLY");
     await waitForVisible("ConPTY live flow");
 
-    await writeAndWait("?", "Help opened");
+    await writeAndWait("?", "HELP - OBSERVE MODE");
+    await waitForVisible("Left / Right");
     await writeAndWait("\x1b", "Help closed");
 
     await writeAndWait("f", "View filter changed to History");
@@ -213,11 +214,11 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
 
     await writeAndWait("i", "Inspector closed");
     await writeAndWait("i", "Inspector opened and focused");
-    await writeAndWait("e", "Raw events overlay opened");
-    await writeAndWait("\x1b[C", "Showing warning and error events");
+    await writeAndWait("e", "RAW EVENTS - ALL");
+    await writeAndWait("\x1b[C", "RAW EVENTS - WARNINGS");
     await writeAndWait("\x1b", "Events overlay closed");
 
-    await writeAndWait("\x10", "Command palette opened");
+    await writeAndWait("\x10", "CONTEXT COMMANDS - VIEW ONLY");
     await writeAndWait("\x1b", "Command palette closed");
 
     await writeAndWait("/missing\r", "PR HISTORY 0");
