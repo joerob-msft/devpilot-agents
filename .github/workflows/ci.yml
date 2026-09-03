@@ -106,6 +106,10 @@ jobs:
         shell: pwsh
         run: npm run test:renderer
 
+      - name: Run ConPTY live integration test
+        shell: pwsh
+        run: npm run test:pty
+
   selfcheck:
     name: Agent self-checks (-DryRun)
     runs-on: windows-latest

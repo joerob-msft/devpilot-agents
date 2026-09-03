@@ -10,7 +10,8 @@
     "build": "tsc --noEmit -p tsconfig.json && node build.mjs",
     "start": "bun --conditions=browser dist/src/index.js",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "test:renderer": "bun --conditions=browser test dist/test/app.test.js"
+    "test:renderer": "bun --conditions=browser test dist/test/app.test.js",
+    "test:pty": "node --test dist/test/pty.integration.js"
   },
   "dependencies": {
     "@opentui/core": "0.5.4",
@@ -27,6 +28,7 @@
     "@types/node": "24.3.0",
     "babel-preset-solid": "1.9.12",
     "bun": "1.3.14",
+    "node-pty": "1.1.0",
     "typescript": "5.9.2"
   }
 }

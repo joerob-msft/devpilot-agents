@@ -32,7 +32,14 @@ npm install
 npm run build
 npm test
 npm run test:renderer
+npm run test:pty
 ```
+
+`test:pty` is a Windows-only live integration test. It starts the built
+dashboard with the locked Bun runtime in a real ConPTY, drives terminal input
+and resize events, and requires a clean quit. Observe-only process behavior is
+covered there; trusted dispatch and mandatory Reviewer vote denial remain
+covered by the native renderer and broker protocol tests.
 
 The repository launcher intentionally does not install dependencies:
 
