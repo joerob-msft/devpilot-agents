@@ -813,6 +813,11 @@ function New-ReviewerCohortEntryEvidence {
                 [string]$request.ExecutionPlan.ConventionSpecialistModel +
                 [string]$request.ExecutionPlan.ConventionVerifierModel) | Sort-Object -CaseSensitive -Unique)
     }
+    elseif (@($request.CaptureModels).Count -gt 0) {
+        # A capture binding is provenance, not launch authority. Preparation-only
+        # entries still emit no slots and derive a zero model-start bound.
+        $recipeModels = [string[]]@($request.CaptureModels)
+    }
     $recipe = New-ReviewerCohortEntryOfflineSealRecipe -Request $request -Identity $identity `
         -IterationId $iteration.IterationId -Files $corpusFiles -Corpus $corpus `
         -Resources ([object[]]$resources.ToArray()) -SpanEvidence $spanEvidence `

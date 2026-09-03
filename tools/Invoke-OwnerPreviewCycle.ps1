@@ -283,6 +283,8 @@ function New-OwnerPreviewPrepared {
     $toolkitHead = Get-OwnerPreviewToolkitHead -Root $toolkit
     $sections = Get-OwnerPreviewRuleSections -ConfigFile $ConfigFile -RuleCommit $RuleCommit
     $configSha = Get-OwnerPreviewFileSha256 -Path $ConfigFile
+    $captureModels = [string[]]@(@($Model, (Get-OwnerPreviewDiscoveryGeneralistModel)) |
+            Sort-Object -CaseSensitive -Unique)
 
     $correlationId = 'ownerprev-' + ([guid]::NewGuid().ToString('N').Substring(0, 16))
     $staging = Join-Path (Join-Path $Root '.staging') $correlationId
@@ -308,7 +310,7 @@ function New-OwnerPreviewPrepared {
         -RepositoryPath ([IO.Path]::GetFullPath($(if ($RepositoryPath -ne '') { $RepositoryPath } else { $toolkit }))) `
         -OperatorAlias $OperatorAlias -PowerShellPath (Get-OwnerPreviewPowerShellPath) `
         -RunSetKeyPath $runSetKeyPath -RuleDeclarationPath ([IO.Path]::GetFullPath($ConfigFile)) `
-        -RuleDeclarationSha256 $configSha -RuleSections $sections `
+        -RuleDeclarationSha256 $configSha -RuleSections $sections -CaptureModels $captureModels `
         -CaptureMode $CaptureMode -AgencyPath $AgencyPath -ReplayRoot $SourceReplayRoot `
         -ReplaySnapshotName $SourceReplaySnapshotName -ReplayManifestDigest $SourceReplayManifestDigest `
         -OutputRoot $entryRoot -EntryId $entryId -SealKeyPath $sealKeyPath `

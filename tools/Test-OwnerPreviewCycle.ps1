@@ -85,7 +85,8 @@ try {
         -ConfigPath 'C:\state\reviewer.config.json' -RepositoryPath 'C:\repo' -OperatorAlias 'owner-preview' `
         -PowerShellPath 'C:\pwsh\pwsh.exe' -RunSetKeyPath 'C:\state\run-set.key' `
         -RuleDeclarationPath 'C:\state\reviewer.config.json' -RuleDeclarationSha256 ('c' * 64) `
-        -RuleSections $ruleSections -CaptureMode 'live' -AgencyPath 'copilot' `
+        -RuleSections $ruleSections -CaptureModels @('claude-sonnet-5', 'claude-opus-5') `
+        -CaptureMode 'live' -AgencyPath 'copilot' `
         -OutputRoot 'C:\state\entry' -EntryId 'owner-4242' -SealKeyPath 'C:\state\seal.key'
     $evidenceJson = ConvertTo-AgentReplayCanonicalJson -Value $evidenceRequest
     $evidenceSchema = Get-Content -LiteralPath (Join-Path $schemaDir 'reviewer.cohort-entry-evidence-request.v3.json') -Raw
@@ -101,6 +102,10 @@ try {
         -Message "The authored rule section does not carry its own repository; the read would fall back to the subject's."
     Assert-OwnerPreview -Condition ([string]@($evidenceRequest.ruleBundle.sections)[0].section -ceq '## Claim ownership') `
         -Message "The authored rule section does not carry the heading its pin describes."
+    Assert-OwnerPreview -Condition (
+        @($evidenceRequest.capture.models) -ccontains 'claude-sonnet-5' -and
+        @($evidenceRequest.capture.models) -ccontains 'claude-opus-5') `
+        -Message "The authored request does not bind the specialist and discovery model identities for downstream capture."
 
     # The load-bearing absence. An execution plan would carry exactly two
     # generalist slots, and this preview is specialist-only.
@@ -119,7 +124,7 @@ try {
         -ConfigPath 'C:\state\reviewer.config.json' -RepositoryPath 'C:\repo' -OperatorAlias 'owner-preview' `
         -PowerShellPath 'C:\pwsh\pwsh.exe' -RunSetKeyPath 'C:\state\run-set.key' `
         -RuleDeclarationPath 'C:\state\reviewer.config.json' -RuleDeclarationSha256 ('c' * 64) `
-        -RuleSections $ruleSections -CaptureMode 'replay' `
+        -RuleSections $ruleSections -CaptureModels @('claude-sonnet-5', 'claude-opus-5') -CaptureMode 'replay' `
         -ReplayRoot 'C:\state\replay' -ReplaySnapshotName 'synthetic-convention-pr' `
         -ReplayManifestDigest ('d' * 64) -OutputRoot 'C:\state\entry' -EntryId 'owner-4242' `
         -SealKeyPath 'C:\state\seal.key'
@@ -134,7 +139,8 @@ try {
             -RepositoryName 'Widgets' -PullRequestId 4242 -TargetRefName 'refs/heads/main' `
             -ConfigPath 'C:\c.json' -RepositoryPath 'C:\repo' -OperatorAlias 'owner-preview' `
             -PowerShellPath 'C:\pwsh\pwsh.exe' -RunSetKeyPath 'C:\k' -RuleDeclarationPath 'C:\c.json' `
-            -RuleDeclarationSha256 ('c' * 64) -RuleSections $ruleSections -CaptureMode 'live' `
+            -RuleDeclarationSha256 ('c' * 64) -RuleSections $ruleSections `
+            -CaptureModels @('claude-sonnet-5', 'claude-opus-5') -CaptureMode 'live' `
             -OutputRoot 'C:\state\entry' -EntryId 'owner-4242' -SealKeyPath 'C:\state\seal.key'
     }
     catch { $liveWithoutAgency = $null }

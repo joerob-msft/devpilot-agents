@@ -953,8 +953,10 @@ function Read-ReviewerCohortEntryRequest {
     }
 
     $capture = $root.capture
+    $captureOptionalKeys = @('replayRoot', 'replaySnapshotName', 'replayManifestDigest', 'agencyPath', 'requestTimeoutSeconds')
+    if ($schemaVersion -ge 3) { $captureOptionalKeys += 'models' }
     Assert-ReviewerCohortEntryExactKeys -Object $capture -Where 'request capture' -Required @('mode') `
-        -Optional @('replayRoot', 'replaySnapshotName', 'replayManifestDigest', 'agencyPath', 'requestTimeoutSeconds')
+        -Optional $captureOptionalKeys
     $captureMode = Get-ReviewerCohortEntryString -Object $capture -Name 'mode' -Where 'request capture' -MaxLength 16
     if ($captureMode -cne 'replay' -and $captureMode -cne 'live') {
         New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail "The request capture declares mode '$captureMode'."
@@ -982,6 +984,25 @@ function Read-ReviewerCohortEntryRequest {
     $requestTimeoutSeconds = 0
     if ($capture.PSObject.Properties['requestTimeoutSeconds']) {
         $requestTimeoutSeconds = Get-ReviewerCohortEntryInt -Object $capture -Name 'requestTimeoutSeconds' -Where 'request capture' -Minimum 1 -Maximum 600
+    }
+    $captureModels = [string[]]@()
+    if ($schemaVersion -ge 3 -and $capture.PSObject.Properties['models']) {
+        $rawCaptureModels = $capture.models
+        if ($rawCaptureModels -isnot [array] -or @($rawCaptureModels).Count -lt 1 -or @($rawCaptureModels).Count -gt 16) {
+            New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail 'The request capture models must be an array of 1..16 model identifiers.'
+        }
+        $supportedModels = [string[]]@((Get-ReviewerCohortEntryModelRegistry).Supported)
+        $seenCaptureModels = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $captureModelList = [System.Collections.Generic.List[string]]::new()
+        foreach ($rawModel in @($rawCaptureModels)) {
+            if ($rawModel -isnot [string] -or [string]$rawModel -cnotmatch '^[a-z0-9][a-z0-9.-]{0,63}$' -or
+                $supportedModels -cnotcontains [string]$rawModel -or -not $seenCaptureModels.Add([string]$rawModel)) {
+                New-ReviewerCohortEntryRefusal -Code 'CE106' `
+                    -Detail "The request capture model '$rawModel' is malformed, unsupported, or duplicated."
+            }
+            [void]$captureModelList.Add([string]$rawModel)
+        }
+        $captureModels = [string[]]$captureModelList.ToArray()
     }
 
     $coverage = $root.coverage
@@ -1073,6 +1094,7 @@ function Read-ReviewerCohortEntryRequest {
         ReplayManifestDigest = $replayManifestDigest
         AgencyPath = $agencyPath
         RequestTimeoutSeconds = $requestTimeoutSeconds
+        CaptureModels = $captureModels
         MaxChangedFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxChangedFiles' -Where 'request coverage' -Minimum 1 -Maximum (Get-ReviewerChangeListTop))
         MaxFileBytes = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxFileBytes' -Where 'request coverage' -Minimum 1 -Maximum 5242880)
         MaxSiblingFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxSiblingFiles' -Where 'request coverage' -Minimum 0 -Maximum 256)

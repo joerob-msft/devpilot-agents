@@ -309,6 +309,7 @@ function New-OwnerPreviewEvidenceRequest {
         [Parameter(Mandatory)][string]$RuleDeclarationPath,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$RuleDeclarationSha256,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$RuleSections,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$CaptureModels,
         [Parameter(Mandatory)][ValidateSet('live', 'replay')][string]$CaptureMode,
         [Parameter(Mandatory)][string]$OutputRoot,
         [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$')][string]$EntryId,
@@ -347,6 +348,7 @@ function New-OwnerPreviewEvidenceRequest {
         $capture['replayManifestDigest'] = $ReplayManifestDigest
     }
     $capture['requestTimeoutSeconds'] = $RequestTimeoutSeconds
+    $capture['models'] = [string[]]@($CaptureModels)
 
     $sections = [System.Collections.Generic.List[object]]::new()
     foreach ($section in @($RuleSections)) {

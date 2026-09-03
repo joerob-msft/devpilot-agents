@@ -78,7 +78,7 @@ appending a slot to the published request and showing the digest no longer match
 ### v3: explicit rule source and section
 
 `reviewer.cohort-entry-evidence-request.v3.json`, `schemaVersion: 3`, keeps the
-v2 execution-plan shape and changes only `ruleBundle.sections`. Every v3 section
+v2 execution-plan shape and makes rule sources explicit. Every v3 section
 must name `organization`, `project`, the rule repository GUID, and the exact ATX
 heading whose digest and byte length are pinned. Organization and project must
 match the subject; the repository may differ.
@@ -88,6 +88,11 @@ byte. The pin is checked separately against the shared
 `Get-ReviewerMarkdownSection` cut. Missing or repeated headings and digest or
 length drift refuse as `CE310`. v1/v2 keep their historical subject-repository,
 whole-file behavior and do not accept the new fields.
+
+An optional `capture.models` array binds supported model identities into the
+sealed replay snapshot for later role-input capture. It is provenance only:
+without `executionPlan` the entry still emits no slots, consumes no launch
+authorization, and derives a zero model-start bound.
 
 **The launch authorization is derived, never supplied.** A request may not name
 `launchAuthorizationTokenPath` anywhere — not on a slot, not on the reconciliation, not on

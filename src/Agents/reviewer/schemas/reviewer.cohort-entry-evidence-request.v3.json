@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:devpilot:reviewer:cohort-entry-evidence-request:v3",
   "title": "Cohort entry evidence request, version 3",
-  "description": "Version 3 of the versioned operator input that authorizes ONE no-model build of one typed cohort entry's evidence. It is v2 with ONE change, confined to 'ruleBundle.sections': every section must now state the repository its rule text actually lives in, and the exact ATX heading its pin describes. WHY A VERSION RATHER THAN A FIELD: through v2 a rule section carried only path/commit/sha256/byteLength, so the builder had nothing to issue the rule read against except the SUBJECT repository - and a rule that lives in a different repository than the pull request was read from the wrong repository, which the provider answers with an error and the reader reports as a generic envelope refusal. Making the binding REQUIRED is what removes the silent default; making it a new VERSION is what keeps every v1 and v2 request loadable and replayable exactly as it was, byte for byte, rather than retroactively invalidating requests written before the binding existed. A v3 section additionally states 'section', the ATX heading whose bytes the sha256/byteLength pin describes, because those pins were always the pins of a CUT SECTION while the read returns the WHOLE FILE; the builder stores the whole file it actually received and compares the pin against the cut. It carries NO expected findings, no oracle, no severity, no verdict and no answer key of any kind - every field below is checked against that rule by a recursive key AND path scan, so an answer cannot arrive as data or as a file name. Everything the builder publishes is DERIVED from reviewed read-only provider contracts; nothing here states a result. A request is private evidence about a real pull request and is never committed; only this schema is.",
+  "description": "Version 3 of the versioned operator input that authorizes ONE no-model build of one typed cohort entry's evidence. It extends v2 in two non-launching ways: every rule section must state the repository its text actually lives in and the exact ATX heading its pin describes, and capture.models may bind the sealed snapshot to downstream role-input identities without creating a slot or authorizing execution. WHY A VERSION RATHER THAN A FIELD: through v2 a rule section carried only path/commit/sha256/byteLength, so the builder had nothing to issue the rule read against except the SUBJECT repository - and a rule that lives in a different repository than the pull request was read from the wrong repository, which the provider answers with an error and the reader reports as a generic envelope refusal. Making the binding REQUIRED is what removes the silent default; making it a new VERSION is what keeps every v1 and v2 request loadable and replayable exactly as it was, byte for byte, rather than retroactively invalidating requests written before the binding existed. A v3 section additionally states 'section', the ATX heading whose bytes the sha256/byteLength pin describes, because those pins were always the pins of a CUT SECTION while the read returns the WHOLE FILE; the builder stores the whole file it actually received and compares the pin against the cut. It carries NO expected findings, no oracle, no severity, no verdict and no answer key of any kind - every field below is checked against that rule by a recursive key AND path scan, so an answer cannot arrive as data or as a file name. Everything the builder publishes is DERIVED from reviewed read-only provider contracts; nothing here states a result. A request is private evidence about a real pull request and is never committed; only this schema is.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -67,7 +67,7 @@
     },
     "reviewer": {
       "type": "object",
-      "description": "What the typed preparation this entry feeds needs in order to qualify. Paths only: no model name appears anywhere in this request, because the entry this build produces authorizes no launch.",
+      "description": "What the typed preparation this entry feeds needs in order to qualify. Launch authority still appears only in executionPlan; capture.models, when present, is provenance for a later role-input capture and creates no slot.",
       "additionalProperties": false,
       "required": [
         "configPath",
@@ -145,7 +145,7 @@
     },
     "capture": {
       "type": "object",
-      "description": "Where the read-only provider contract answers from. A replay capture never falls through to a live read; a live capture opens the agency-wrapped session the reviewer opens and issues exactly the plan below, in order, and nothing else.",
+      "description": "Where the read-only provider contract answers from. A replay capture never falls through to a live read; a live capture opens the agency-wrapped session the reviewer opens and issues exactly the plan below, in order, and nothing else. Optional 'models' binds the sealed snapshot to downstream role-input capture identities; it authorizes no execution and creates no slot.",
       "additionalProperties": false,
       "required": ["mode"],
       "properties": {
@@ -154,7 +154,15 @@
         "replaySnapshotName": { "$ref": "#/definitions/identityToken" },
         "replayManifestDigest": { "$ref": "#/definitions/sha256" },
         "agencyPath": { "type": "string", "minLength": 1, "maxLength": 512 },
-        "requestTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600 }
+        "requestTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600 },
+        "models": {
+          "type": "array",
+          "description": "Supported model identities the sealed snapshot may later be captured for. This is provenance only: execution remains impossible without an executionPlan and launch authorization.",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/modelId" }
+        }
       },
       "allOf": [
         {

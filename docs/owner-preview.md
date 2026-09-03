@@ -35,6 +35,10 @@ So the absence is load-bearing, and the test suite asserts it. If an
 `executionPlan` ever appears in the authored request, this preview silently
 becomes three model runs whose verdict it would then have to discard.
 
+The v3 request does bind the specialist and discovery model identities in
+`capture.models`. That list is snapshot provenance required by production role
+capture; it creates no slot and grants no launch authority.
+
 ## Why the capability is pinned in configuration
 
 Blinded acquisition takes a **role**, not a pack. `-Role specialist` runs the
