@@ -269,22 +269,8 @@ function New-OwnerPreviewEvidenceRequest {
         The typed cohort-entry evidence request, to
         reviewer.cohort-entry-evidence-request.v3.json.
 
-        v3 is authored rather than v1 because v3 is the first version in which a
-        rule section states the repository its text lives in. This capability's
-        rule lives in an engineering-guidance repository that is NOT the
-        repository the reviewed pull request is in, and under v1/v2 the builder
-        had nothing to issue that read against except the subject repository -
-        so the read was refused by the provider and reported as a generic
-        envelope failure. v3 also carries the ATX heading the pin describes, so
-        the pinned digest of a cut section is compared against that cut rather
-        than against the whole document.
-
-        No executionPlan is emitted, and that is the load-bearing detail. A
-        request MAY grow a plan carrying exactly two generalist slots; without
-        one, the builder emits a preparation-only entry with no slots section at
-        all. No slots means no generalist, which means this preview costs one
-        specialist model start rather than three model runs whose verdict it
-        would then have to discard.
+        V3 carries the cross-repository rule source and section pin. No
+        executionPlan is emitted, so preparation declares no generalist slot.
 
         `reviewer.plannedRunCount` and `runSetKeyPath` are still required by the
         schema and are stated honestly as the inert declarations they are: no run

@@ -804,23 +804,8 @@ function Read-ReviewerCohortEntryRequest {
         'schemaVersion', 'kind', 'correlationId', 'toolkit', 'subject',
         'reviewer', 'ruleBundle', 'capture', 'coverage', 'output') -Optional @('executionPlan')
 
-    # Three versions are loadable. v1 and v2 differ by exactly one section: a v1
-    # request can never grow slots - not by adding the section, not by any
-    # argument - so every request written before that slice keeps producing the
-    # identical preparation-only entry it produced then. A v2 request WITHOUT the
-    # section produces that same entry too; the version is the operator's
-    # statement of what they are authorizing, and the section is what they
-    # authorized.
-    #
-    # v3 differs from v2 by exactly one thing, inside ruleBundle.sections: the
-    # repository a rule's text lives in, and the ATX heading its pin describes,
-    # are both REQUIRED and explicit. Through v2 neither existed, so the rule
-    # read had nothing to be issued against except the subject repository and
-    # the pin of a cut section was compared against a whole file. Both of those
-    # are silent defaults, and the way to remove a silent default without
-    # invalidating every request written under it is a new version: v1 and v2
-    # keep parsing and replaying byte-for-byte as they did, and only a v3
-    # request is held to the explicit binding.
+    # V1/v2 retain their historical no-binding behavior. Only v3 requires the
+    # explicit rule source, branch, section, and optional capture provenance.
     $schemaVersion = Get-ReviewerCohortEntryInt -Object $root -Name 'schemaVersion' -Where 'request' -Minimum 1 -Maximum 3
     $executionPlanProperty = $root.PSObject.Properties['executionPlan']
     $hasExecutionPlan = $null -ne $executionPlanProperty

@@ -182,26 +182,9 @@ function Assert-ReviewerCohortEntryRuleSection {
         different rule set, and a cohort that ran half its entries against one
         rule set and half against another is not a cohort.
 
-        WHAT IS COMPARED IS THE CUT, NOT THE FILE. A v3 section names the exact
-        ATX heading its pin describes, and a convention pack pins the DELIVERED
-        SECTION - a few hundred bytes - while repo_file answers with the WHOLE
-        engineering-guidance document, routinely tens of kilobytes. Comparing
-        the pin against the file therefore failed every real pinned section on
-        both digest and length, and the two numbers in the refusal looked like
-        rule drift rather than like the wrong thing being measured.
-
-        The cut is taken with the reviewer's own extractor, so the bytes checked
-        here are the bytes the reviewer would deliver, and a heading that is
-        absent or that appears more than once is a refusal rather than a
-        plausible-looking wrong rule.
-
-        The CAPTURED record is left alone. The corpus keeps the whole file the
-        provider actually returned, with its own digest and its own request key,
-        so provenance still describes a real response and a replay still answers
-        the read that was issued. Only the comparison is section-scoped.
-
-        Below v3 a section carries no heading, so the whole-file comparison this
-        function has always made is what still happens.
+        V3 checks the shared extractor's section cut while leaving the captured
+        whole-file bytes and digest intact. Earlier versions retain their
+        historical whole-file comparison.
     #>
     param(
         [Parameter(Mandatory)]$Section,

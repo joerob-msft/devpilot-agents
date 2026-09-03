@@ -182,65 +182,31 @@ through the production v4 parser.
 
 ## What live validation established
 
-One read-only `prepare` was run against real Azure DevOps under an interactive
-user identity, with zero model starts and zero provider writes. It is worth
-recording what that proved and what it did not.
+The read-only proof used active PR `16705856` at source commit
+`80f5ebbd12df72830e0ceee5e9ec84a4c9564946`. `prepare` reported zero model
+starts and zero provider writes and published snapshot
+`pr16705856-i1-offlinecorpusseal`, manifest digest
+`c5f6de464cd5b53a881e829845b877d6dc75477b5aecbdd83d47eada194c5ec9`.
+Its classification is `offlineCorpusSeal`, `nonPromotable: true`.
 
-**The rule pin is live-accurate.** The `## Claim ownership` section of
-`/documentation/EngineeringProcesses/Conventions/AutomatedTests.md` in
-AzureUX-BPM-EngHub was fetched read-only at the commit the pack pins
-(`faa7625402523966b177d2b1a25042338b3571fc`) and cut with the production section
-extractor: **569 bytes, sha256 `bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f`**
-— byte-for-byte the pin. The whole file is 15059 bytes, as the pack records.
+The authoritative EngHub `master` branch resolved to
+`8cb115690a241634f89cf937ec12c79746651861`. The provider returned the whole
+`AutomatedTests.md` file unchanged into the sealed corpus: 20,261 bytes, SHA-256
+`d6698af51dc66142deb5dd8169fd02b4f809f5578f026d8c2911f34ae7eca144`.
+The shared extractor separately cut `## Claim ownership`; it remains exactly
+569 bytes with SHA-256
+`bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f`.
 
-**The live read path executes.** The builder opened the agency-wrapped session
-and worked through pull request identity, repository, target branch, the change
-census, changed files and their baselines.
+`run` then completed the production capture → preserved-lineage materialization
+→ blinded acquisition → V4 parse → status chain using only the committed
+`owner-preview-v4-unknown` offline adapter. Role capture recorded zero boundary
+hits, model/Agency/provider processes, live reads, writes, leases, plans and
+tokens. Acquisition reported zero premium requests and zero provider writes; its
+one accounted model attempt was the deterministic offline adapter, not a real
+specialist start. The authenticated V4 marker completed with 32 `unknown`
+constructs, zero violations, and zero compliant claims.
 
-**Fail-closed behaviour was observed against real conditions**, not simulated
-ones. Each of these refusals was produced by a live run:
-
-| Refusal | Condition |
-|---|---|
-| `CE201` | the required ref did not resolve to the pinned toolkit head |
-| `CE213` | the toolkit working tree carried a tracked modification |
-| `CE305` | a change payload exceeded the declared byte cap |
-| `CE208` | the pull request was not active |
-| `CE302` | a file read did not answer in the declared resource envelope |
-| `CE211` | the configuration's target ref disagreed with the declared one |
-| `CE307` | a replay capture would have needed a live fallback |
-
-**Two things stopped a package being published, and neither is in this layer.**
-
-1. **PR16991680 is `Completed`.** The recorded nine-finding case is a merged
-   pull request, so it can never be prepared live again - the builder refuses a
-   non-active subject (`CE208`), correctly. Live preparation was therefore also
-   attempted against active pull requests in the same repository.
-2. **Live `repo_file` reads refuse the builder's envelope check (`CE302`).**
-   Against active pull requests the capture reached the changed-file and
-   baseline reads and refused there. The committed synthetic snapshot is not a
-   substitute: it was recorded for the convention-pack replay tests and its
-   `pr-get` payload carries no `lastMergeCommit`, which the evidence builder
-   requires (`CE210`).
-
-So the wrapper's own half is exercised - it authors documents the builder
-accepts through every request and identity check, and it surfaces refusals
-intact - while an end-to-end published package from a live pull request remains
-unproven in this environment. That is a limitation of the production capture
-seam and the available fixture, and it is stated here rather than left for
-somebody to discover.
-
-## Honest notes
-
-1. **There is no sealed PR16991680 snapshot in this repository.** The nine-finding
-   truth is recorded as corpus *anchors* (`pr16991680-new-test-methods`,
-   `origin: live`, `expectedCount: 9`, constructs `dc2`-`dc10`). The test reads
-   those anchors out of the corpus rather than copying them, so it cannot drift
-   from the truth it claims to reproduce — but it is reproducing a recorded
-   verdict set, not replaying sealed provider bytes.
-2. **`run` has never completed end to end.** It is wired and its refusals are
-   checked, but no model has been started by this layer, so the capture →
-   materialize → acquire → parse sequence is unproven beyond its contracts.
-3. The v4 contract caps explanatory notes at eight, so nine violations cannot all
-   be annotated. The test asserts the nine verdicts survive that — a capped note
-   list must never cost a finding.
+The proof artifacts live outside the repository under
+`C:\Users\daviburg\.copilot\private\owner-preview-live-proof-20260903T052324Z`.
+The recorded head key is
+`42ca5a9ed65a3989b623f3a78760588c7631d9335d540fd3009bc656eb0079f4`.
