@@ -310,6 +310,8 @@ function New-OwnerPreviewEvidenceRequest {
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$RuleDeclarationSha256,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$RuleSections,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$CaptureModels,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$CaptureReviewerScriptSha256,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$CapturePromptSha256,
         [Parameter(Mandatory)][ValidateSet('live', 'replay')][string]$CaptureMode,
         [Parameter(Mandatory)][string]$OutputRoot,
         [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$')][string]$EntryId,
@@ -349,6 +351,8 @@ function New-OwnerPreviewEvidenceRequest {
     }
     $capture['requestTimeoutSeconds'] = $RequestTimeoutSeconds
     $capture['models'] = [string[]]@($CaptureModels)
+    $capture['reviewerScriptSha256'] = $CaptureReviewerScriptSha256
+    $capture['promptSha256'] = $CapturePromptSha256
 
     $sections = [System.Collections.Generic.List[object]]::new()
     foreach ($section in @($RuleSections)) {

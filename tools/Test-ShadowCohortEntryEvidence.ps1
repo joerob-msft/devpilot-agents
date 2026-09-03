@@ -373,6 +373,8 @@ function Set-CohortEntryV3RuleState {
     $State.RuleRepositoryId = '99999999-8888-7777-6666-555555555555'
     $State.RuleBranch = 'main'
     $State.CaptureModels = @('claude-opus-5', 'claude-sonnet-5')
+    $State.CaptureReviewerScriptSha256 = '8' * 64
+    $State.CapturePromptSha256 = '9' * 64
     $State.RuleSection = "## Claim ownership - caf$eAcute"
     $State.RuleText = (
         "# Engineering guidance`r`n`r`n" +
@@ -542,6 +544,8 @@ function New-CohortEntryFixture {
         # exercising the v1 preparation-only request byte for byte.
         SchemaVersion = 1
         CaptureModels = @()
+        CaptureReviewerScriptSha256 = ''
+        CapturePromptSha256 = ''
         WithExecutionPlan = $false
         ConfigDeclaresModels = $true
         ConfigVerificationEnabled = $true
@@ -1060,6 +1064,8 @@ function New-CohortEntryFixture {
     elseif ($null -ne $executionPlan) { [void]$requestBody.Add('executionPlan', $executionPlan) }
     if ([int]$state.SchemaVersion -ge 3 -and @($state.CaptureModels).Count -gt 0) {
         $requestBody.capture['models'] = [string[]]@($state.CaptureModels)
+        $requestBody.capture['reviewerScriptSha256'] = [string]$state.CaptureReviewerScriptSha256
+        $requestBody.capture['promptSha256'] = [string]$state.CapturePromptSha256
     }
         if ($state.MutateRequest) { & $state.MutateRequest $requestBody $state }
         Write-CohortEntryJsonFile -Path $requestPath -WithBom:$state.RequestWithBom -Value $requestBody
@@ -3173,7 +3179,9 @@ try {
         -Condition (
             @($v3Recipe.bindings.models).Count -eq 2 -and
             @($v3Recipe.bindings.models) -ccontains 'claude-opus-5' -and
-            @($v3Recipe.bindings.models) -ccontains 'claude-sonnet-5')
+            @($v3Recipe.bindings.models) -ccontains 'claude-sonnet-5' -and
+            [string]$v3Recipe.bindings.scriptSha256 -ceq ('8' * 64) -and
+            [string]$v3Recipe.bindings.promptSha256 -ceq ('9' * 64))
     Assert-CohortEntry -Name 'the v3 identity witness records each rule repository and heading' `
         -Condition (
             @($v3Witness.ruleBundle.sections).Count -eq 2 -and

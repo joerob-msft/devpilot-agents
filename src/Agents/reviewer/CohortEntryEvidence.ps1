@@ -958,7 +958,7 @@ function Read-ReviewerCohortEntryRequest {
 
     $capture = $root.capture
     $captureOptionalKeys = @('replayRoot', 'replaySnapshotName', 'replayManifestDigest', 'agencyPath', 'requestTimeoutSeconds')
-    if ($schemaVersion -ge 3) { $captureOptionalKeys += 'models' }
+    if ($schemaVersion -ge 3) { $captureOptionalKeys += @('models', 'reviewerScriptSha256', 'promptSha256') }
     Assert-ReviewerCohortEntryExactKeys -Object $capture -Where 'request capture' -Required @('mode') `
         -Optional $captureOptionalKeys
     $captureMode = Get-ReviewerCohortEntryString -Object $capture -Name 'mode' -Where 'request capture' -MaxLength 16
@@ -990,7 +990,15 @@ function Read-ReviewerCohortEntryRequest {
         $requestTimeoutSeconds = Get-ReviewerCohortEntryInt -Object $capture -Name 'requestTimeoutSeconds' -Where 'request capture' -Minimum 1 -Maximum 600
     }
     $captureModels = [string[]]@()
+    $captureReviewerScriptSha256 = ''
+    $capturePromptSha256 = ''
     if ($schemaVersion -ge 3 -and $capture.PSObject.Properties['models']) {
+        foreach ($bindingName in @('reviewerScriptSha256', 'promptSha256')) {
+            if (-not $capture.PSObject.Properties[$bindingName]) {
+                New-ReviewerCohortEntryRefusal -Code 'CE104' `
+                    -Detail "The request capture binds models but omits '$bindingName'."
+            }
+        }
         $rawCaptureModels = $capture.models
         if ($rawCaptureModels -isnot [array] -or @($rawCaptureModels).Count -lt 1 -or @($rawCaptureModels).Count -gt 16) {
             New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail 'The request capture models must be an array of 1..16 model identifiers.'
@@ -1007,6 +1015,15 @@ function Read-ReviewerCohortEntryRequest {
             [void]$captureModelList.Add([string]$rawModel)
         }
         $captureModels = [string[]]$captureModelList.ToArray()
+        $captureReviewerScriptSha256 = Get-ReviewerCohortEntryString -Object $capture `
+            -Name 'reviewerScriptSha256' -Where 'request capture' -Pattern '^[0-9a-f]{64}$' -MaxLength 64
+        $capturePromptSha256 = Get-ReviewerCohortEntryString -Object $capture `
+            -Name 'promptSha256' -Where 'request capture' -Pattern '^[0-9a-f]{64}$' -MaxLength 64
+    }
+    elseif ($schemaVersion -ge 3 -and
+        ($capture.PSObject.Properties['reviewerScriptSha256'] -or $capture.PSObject.Properties['promptSha256'])) {
+        New-ReviewerCohortEntryRefusal -Code 'CE106' `
+            -Detail 'The request capture cannot bind reviewer or prompt bytes without binding models.'
     }
 
     $coverage = $root.coverage
@@ -1099,6 +1116,8 @@ function Read-ReviewerCohortEntryRequest {
         AgencyPath = $agencyPath
         RequestTimeoutSeconds = $requestTimeoutSeconds
         CaptureModels = $captureModels
+        CaptureReviewerScriptSha256 = $captureReviewerScriptSha256
+        CapturePromptSha256 = $capturePromptSha256
         MaxChangedFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxChangedFiles' -Where 'request coverage' -Minimum 1 -Maximum (Get-ReviewerChangeListTop))
         MaxFileBytes = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxFileBytes' -Where 'request coverage' -Minimum 1 -Maximum 5242880)
         MaxSiblingFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxSiblingFiles' -Where 'request coverage' -Minimum 0 -Maximum 256)

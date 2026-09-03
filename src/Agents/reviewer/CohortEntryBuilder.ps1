@@ -864,6 +864,9 @@ function New-ReviewerCohortEntryEvidence {
     $reviewerScriptSha = if ($null -ne $request.ExecutionPlan) {
         [string]$request.ExecutionPlan.ReviewerScriptSha256
     }
+    elseif (@($request.CaptureModels).Count -gt 0) {
+        [string]$request.CaptureReviewerScriptSha256
+    }
     else {
         # A preparation-only entry declares no reviewer script, so the script that
         # produced this evidence is the one bound: something real, digested where
@@ -884,6 +887,10 @@ function New-ReviewerCohortEntryEvidence {
         # entries still emit no slots and derive a zero model-start bound.
         $recipeModels = [string[]]@($request.CaptureModels)
     }
+    $recipePromptSha = if (@($request.CaptureModels).Count -gt 0) {
+        [string]$request.CapturePromptSha256
+    }
+    else { $promptAssetSha }
     $recipe = New-ReviewerCohortEntryOfflineSealRecipe -Request $request -Identity $identity `
         -IterationId $iteration.IterationId -Files $corpusFiles -Corpus $corpus `
         -Resources ([object[]]$resources.ToArray()) -SpanEvidence $spanEvidence `
@@ -894,7 +901,7 @@ function New-ReviewerCohortEntryEvidence {
         -PolicyCorpusPath $policyCorpusPath -SiblingCorpusPaths $siblingCorpusPaths `
         -RuleCorpusPaths $ruleCorpusPaths `
         -ThreadCorpusPaths ([string[]]@([string]$corpusPathByReadId['threads'])) `
-        -ConfigSha256 $configBinding.Sha256 -ScriptSha256 $reviewerScriptSha -PromptSha256 $promptAssetSha `
+        -ConfigSha256 $configBinding.Sha256 -ScriptSha256 $reviewerScriptSha -PromptSha256 $recipePromptSha `
         -SchemaSha256 $stageSchemaSha -Models $recipeModels `
         -CapturedUtc ([DateTime]::UtcNow.ToString('yyyyMMdd\THHmmss\Z', [Globalization.CultureInfo]::InvariantCulture))
     $recipePath = Join-Path $evidenceRoot 'corpus-seal-recipe.json'

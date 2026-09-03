@@ -169,7 +169,14 @@
           "maxItems": 16,
           "uniqueItems": true,
           "items": { "$ref": "#/definitions/modelId" }
-        }
+        },
+        "reviewerScriptSha256": { "$ref": "#/definitions/sha256" },
+        "promptSha256": { "$ref": "#/definitions/sha256" }
+      },
+      "dependentRequired": {
+        "models": ["reviewerScriptSha256", "promptSha256"],
+        "reviewerScriptSha256": ["models"],
+        "promptSha256": ["models"]
       },
       "allOf": [
         {

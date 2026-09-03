@@ -87,6 +87,7 @@ try {
         -PowerShellPath 'C:\pwsh\pwsh.exe' -RunSetKeyPath 'C:\state\run-set.key' `
         -RuleDeclarationPath 'C:\state\reviewer.config.json' -RuleDeclarationSha256 ('c' * 64) `
         -RuleSections $ruleSections -CaptureModels @('claude-sonnet-5', 'claude-opus-5', 'gpt-5.6-sol') `
+        -CaptureReviewerScriptSha256 ('8' * 64) -CapturePromptSha256 ('9' * 64) `
         -CaptureMode 'live' -AgencyPath 'copilot' `
         -OutputRoot 'C:\state\entry' -EntryId 'owner-4242' -SealKeyPath 'C:\state\seal.key'
     $evidenceJson = ConvertTo-AgentReplayCanonicalJson -Value $evidenceRequest
@@ -106,7 +107,9 @@ try {
     Assert-OwnerPreview -Condition (
         @($evidenceRequest.capture.models) -ccontains 'claude-sonnet-5' -and
         @($evidenceRequest.capture.models) -ccontains 'claude-opus-5' -and
-        @($evidenceRequest.capture.models) -ccontains 'gpt-5.6-sol') `
+        @($evidenceRequest.capture.models) -ccontains 'gpt-5.6-sol' -and
+        [string]$evidenceRequest.capture.reviewerScriptSha256 -ceq ('8' * 64) -and
+        [string]$evidenceRequest.capture.promptSha256 -ceq ('9' * 64)) `
         -Message "The authored request does not bind the specialist and discovery model identities for downstream capture."
 
     # The load-bearing absence. An execution plan would carry exactly two
@@ -127,6 +130,7 @@ try {
         -PowerShellPath 'C:\pwsh\pwsh.exe' -RunSetKeyPath 'C:\state\run-set.key' `
         -RuleDeclarationPath 'C:\state\reviewer.config.json' -RuleDeclarationSha256 ('c' * 64) `
         -RuleSections $ruleSections -CaptureModels @('claude-sonnet-5', 'claude-opus-5', 'gpt-5.6-sol') -CaptureMode 'replay' `
+        -CaptureReviewerScriptSha256 ('8' * 64) -CapturePromptSha256 ('9' * 64) `
         -ReplayRoot 'C:\state\replay' -ReplaySnapshotName 'synthetic-convention-pr' `
         -ReplayManifestDigest ('d' * 64) -OutputRoot 'C:\state\entry' -EntryId 'owner-4242' `
         -SealKeyPath 'C:\state\seal.key'
@@ -143,6 +147,7 @@ try {
             -PowerShellPath 'C:\pwsh\pwsh.exe' -RunSetKeyPath 'C:\k' -RuleDeclarationPath 'C:\c.json' `
             -RuleDeclarationSha256 ('c' * 64) -RuleSections $ruleSections `
             -CaptureModels @('claude-sonnet-5', 'claude-opus-5', 'gpt-5.6-sol') -CaptureMode 'live' `
+            -CaptureReviewerScriptSha256 ('8' * 64) -CapturePromptSha256 ('9' * 64) `
             -OutputRoot 'C:\state\entry' -EntryId 'owner-4242' -SealKeyPath 'C:\state\seal.key'
     }
     catch { $liveWithoutAgency = $null }

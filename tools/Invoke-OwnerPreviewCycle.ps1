@@ -286,6 +286,13 @@ function New-OwnerPreviewPrepared {
     $configSha = Get-OwnerPreviewFileSha256 -Path $ConfigFile
     $captureModels = [string[]]@(@($Model, (Get-OwnerPreviewDiscoveryGeneralistModel), $SecondGeneralistModel) |
             Sort-Object -CaseSensitive -Unique)
+    $captureReviewerScriptSha256 = Get-OwnerPreviewFileSha256 `
+        -Path (Join-Path $RepoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1')
+    $capturePromptPath = if ($PromptFile -ne '') {
+        [IO.Path]::GetFullPath($PromptFile)
+    }
+    else { Join-Path $RepoRoot 'src/Agents/reviewer/review-cycle.prompt.md' }
+    $capturePromptSha256 = Get-OwnerPreviewFileSha256 -Path $capturePromptPath
 
     $correlationId = 'ownerprev-' + ([guid]::NewGuid().ToString('N').Substring(0, 16))
     $staging = Join-Path (Join-Path $Root '.staging') $correlationId
@@ -312,6 +319,7 @@ function New-OwnerPreviewPrepared {
         -OperatorAlias $OperatorAlias -PowerShellPath (Get-OwnerPreviewPowerShellPath) `
         -RunSetKeyPath $runSetKeyPath -RuleDeclarationPath ([IO.Path]::GetFullPath($ConfigFile)) `
         -RuleDeclarationSha256 $configSha -RuleSections $sections -CaptureModels $captureModels `
+        -CaptureReviewerScriptSha256 $captureReviewerScriptSha256 -CapturePromptSha256 $capturePromptSha256 `
         -CaptureMode $CaptureMode -AgencyPath $AgencyPath -ReplayRoot $SourceReplayRoot `
         -ReplaySnapshotName $SourceReplaySnapshotName -ReplayManifestDigest $SourceReplayManifestDigest `
         -OutputRoot $entryRoot -EntryId $entryId -SealKeyPath $sealKeyPath `
