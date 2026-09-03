@@ -670,7 +670,11 @@ function Get-OwnerPreviewHeadKey {
         [Parameter(Mandatory)][string]$ToolkitHead
     )
     $sections = [System.Collections.Generic.List[object]]::new()
-    $ordered = @($RuleSections) | Sort-Object -Property @{ Expression = { [string]$_.path } },
+    $ordered = @($RuleSections) | Sort-Object -Property `
+    @{ Expression = { [string]$_.repositoryId } },
+    @{ Expression = { [string]$_.path } },
+    @{ Expression = { [string]$_.section } },
+    @{ Expression = { [string]$_.commit } },
     @{ Expression = { [string]$_.sha256 } }
     foreach ($section in $ordered) {
         # repositoryId and section are bound here for the same reason path and

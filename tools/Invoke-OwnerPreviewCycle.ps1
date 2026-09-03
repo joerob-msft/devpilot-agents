@@ -244,6 +244,10 @@ function Get-OwnerPreviewRuleSections {
                 throw "The authoritative source '$reference' declares no '$field'; an unpinned or unbound rule cannot be read."
             }
         }
+        if ([string]::IsNullOrWhiteSpace([string]$source.section) -or
+            [string]$source.section -notmatch '^#{1,6} [^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$') {
+            throw "The authoritative source '$reference' does not name a non-empty exact ATX section; Owner preview v3 does not infer a whole-file pin."
+        }
         [void]$sections.Add([pscustomobject][ordered]@{
                 organization = [string]$source.organization
                 project      = [string]$source.project
@@ -254,6 +258,13 @@ function Get-OwnerPreviewRuleSections {
                 sha256       = ([string]$source.expectedSha256).ToLowerInvariant()
                 byteLength   = [int]$source.expectedByteLength
             })
+    }
+    $ruleRepositories = [string[]]@($sections |
+            ForEach-Object { ([string]$_.repositoryId).ToLowerInvariant() } |
+            Sort-Object -CaseSensitive -Unique)
+    if ($ruleRepositories.Count -gt 1) {
+        throw ("The ownership pack spans $($ruleRepositories.Count) rule repositories, but -RuleCommit names one commit. " +
+            'Owner preview currently requires every referenced rule section to live in the same repository.')
     }
     return , $sections.ToArray()
 }

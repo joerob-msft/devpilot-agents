@@ -472,7 +472,20 @@ function New-ReviewerCohortEntryEvidence {
                         -PayloadFile "payloads/baseline-$suffix.txt"))
         }
         $ruleOrdinal = 0
+        $ruleReadBySource = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
         foreach ($section in $request.RuleSections) {
+            # One provider read returns the whole file. Multiple v3 sections in
+            # that file reuse the captured record, then validate their own cuts;
+            # issuing the identical repo_file request twice would make one replay
+            # key name two resources and the closed-plan check would refuse it.
+            $sourceKey = "$([string]$section.RepositoryId)`n$([string]$section.Path)`n$([string]$section.Commit)"
+            if ($ruleReadBySource.ContainsKey($sourceKey)) {
+                [void]$ruleReads.Add([pscustomobject]@{
+                        Section = $section
+                        ReadId = [string]$ruleReadBySource[$sourceKey]
+                    })
+                continue
+            }
             $ruleOrdinal++
             $suffix = $ruleOrdinal.ToString('000', [Globalization.CultureInfo]::InvariantCulture)
             # The rule's OWN repository, not the subject's. Below v3 the request
@@ -483,6 +496,7 @@ function New-ReviewerCohortEntryEvidence {
                 -ProviderPath ([string]$section.Path) -Commit ([string]$section.Commit) -Role 'rule' `
                 -PayloadFile "payloads/rule-$suffix.txt"
             [void]$extension.Add($ruleRead)
+            $ruleReadBySource.Add($sourceKey, [string]$ruleRead.Id)
             [void]$ruleReads.Add([pscustomobject]@{ Section = $section; ReadId = [string]$ruleRead.Id })
         }
         foreach ($read in $extension) { [void]$plan.Add($read) }
@@ -638,7 +652,13 @@ function New-ReviewerCohortEntryEvidence {
     $siblingCorpusPaths = [string[]]@(@($siblings) | ForEach-Object {
             [string]$corpusPathByReadId["baseline-$(([int]$_.Ordinal).ToString('000', [Globalization.CultureInfo]::InvariantCulture))"]
         })
-    $ruleCorpusPaths = [string[]]@(@($ruleReads) | ForEach-Object { [string]$corpusPathByReadId[[string]$_.ReadId] })
+    $ruleCorpusPathList = [System.Collections.Generic.List[string]]::new()
+    $seenRuleCorpusPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($ruleRead in $ruleReads) {
+        $ruleCorpusPath = [string]$corpusPathByReadId[[string]$ruleRead.ReadId]
+        if ($seenRuleCorpusPaths.Add($ruleCorpusPath)) { [void]$ruleCorpusPathList.Add($ruleCorpusPath) }
+    }
+    $ruleCorpusPaths = [string[]]$ruleCorpusPathList.ToArray()
 
     $corpus = New-ReviewerCohortEntryCorpus -Root $corpusRoot -Files $corpusFiles -Request $request `
         -Identity $identity -IterationId $iteration.IterationId
@@ -724,7 +744,26 @@ function New-ReviewerCohortEntryEvidence {
             declarationPath = $request.RuleBundleDeclarationPath
             declarationSha256 = $declarationSha
             sections = [object[]]@($request.RuleSections | ForEach-Object {
-                    [ordered]@{ path = [string]$_.Path; commit = [string]$_.Commit; sha256 = [string]$_.Sha256; byteLength = [int]$_.ByteLength }
+                    if ($request.SchemaVersion -ge 3) {
+                        [ordered]@{
+                            organization = [string]$_.Organization
+                            project = [string]$_.Project
+                            repositoryId = [string]$_.RepositoryId
+                            path = [string]$_.Path
+                            commit = [string]$_.Commit
+                            section = [string]$_.Section
+                            sha256 = [string]$_.Sha256
+                            byteLength = [int]$_.ByteLength
+                        }
+                    }
+                    else {
+                        [ordered]@{
+                            path = [string]$_.Path
+                            commit = [string]$_.Commit
+                            sha256 = [string]$_.Sha256
+                            byteLength = [int]$_.ByteLength
+                        }
+                    }
                 })
         }
         capture = [ordered]@{

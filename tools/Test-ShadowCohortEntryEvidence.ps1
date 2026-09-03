@@ -2715,6 +2715,14 @@ Invoke-CohortEntryCase -Name 'a v3 rule section with a non-GUID repository bindi
     }
 }
 
+Invoke-CohortEntryCase -Name 'a v3 rule section with a whitespace-only ATX heading' -ExpectedCode 'CE106' -Mutate {
+    param($state)
+    Set-CohortEntryV3RuleState -State $state
+    $state.MutateRequest = {
+        param($request) $request.ruleBundle.sections[0].section = '##   '
+    }
+}
+
 Invoke-CohortEntryCase -Name 'a v3 rule section crossing organizations' -ExpectedCode 'CE114' -Mutate {
     param($state)
     Set-CohortEntryV3RuleState -State $state
@@ -3029,7 +3037,25 @@ finally { Remove-CohortEntrySandbox -Path $v2BareSandbox }
 $v3Sandbox = New-CohortEntrySandbox -Name 'v3-cross-repo'
 try {
     $v3Fixture = New-CohortEntryFixture -Sandbox $v3Sandbox -Mutate {
-        param($s) Set-CohortEntryV3RuleState -State $s
+        param($s)
+        Set-CohortEntryV3RuleState -State $s
+        $s.MutateRequest = {
+            param($request, $state)
+            $heading = '## Unrelated rule'
+            $cut = Get-ReviewerMarkdownSection -Text ([string]$state.RuleText) -Heading $heading
+            $bytes = $script:Utf8.GetBytes([string]$cut.Text)
+            $second = [ordered]@{
+                organization = [string]$state.RuleOrganization
+                project = [string]$state.RuleProject
+                repositoryId = [string]$state.RuleRepositoryId
+                path = '/docs/rules/review.md'
+                commit = [string]$state.RuleCommit
+                section = $heading
+                sha256 = (Get-CohortEntryBytesSha256 -Bytes $bytes)
+                byteLength = $bytes.Length
+            }
+            $request.ruleBundle.sections = @($request.ruleBundle.sections[0], $second)
+        }
     }
     $v3Parsed = Read-ReviewerCohortEntryRequest -Path $v3Fixture.RequestPath
     $v3Result = New-ReviewerCohortEntryEvidence -RequestPath $v3Fixture.RequestPath -PreparationOnly
@@ -3043,6 +3069,8 @@ try {
             [string]$_.arguments.version -ceq [string]$v3Fixture.State.RuleCommit
         })[0]
     $v3RuleReference = @($v3Recipe.evidence.rules)[0]
+    $v3Witness = [IO.File]::ReadAllText((Join-Path $v3Result.Root 'entry/identity-witness.json')) |
+        ConvertFrom-Json -Depth 64
     $v3RuleCorpusPath = Join-Path (Join-Path $v3Result.Root 'corpus') `
         (([string]$v3RuleReference.corpusPath) -replace '/', [IO.Path]::DirectorySeparatorChar)
     $v3WholeBytes = [IO.File]::ReadAllBytes($v3RuleCorpusPath)
@@ -3071,9 +3099,18 @@ try {
         -Condition ($v3Result.SchemaVersion -eq 3)
     Assert-CohortEntry -Name 'a v3 rule section retains its explicit repository and heading' `
         -Condition (
+            @($v3Parsed.RuleSections).Count -eq 2 -and
             [string]@($v3Parsed.RuleSections)[0].RepositoryId -ceq [string]$v3Fixture.State.RuleRepositoryId -and
             [string]@($v3Parsed.RuleSections)[0].RepositoryId -cne [string]$v3Parsed.RepositoryId -and
             [string]@($v3Parsed.RuleSections)[0].Section -ceq [string]$v3Fixture.State.RuleSection)
+    Assert-CohortEntry -Name 'two v3 sections in one file share one whole-file provider read' `
+        -Condition (
+            @($v3Recipe.resources | Where-Object {
+                    [string]$_.tool -ceq 'repo_file' -and
+                    [string]$_.arguments.path -ceq '/docs/rules/review.md' -and
+                    [string]$_.arguments.version -ceq [string]$v3Fixture.State.RuleCommit
+                }).Count -eq 1 -and
+            @($v3Recipe.evidence.rules).Count -eq 1)
     Assert-CohortEntry -Name 'the v3 rule read is issued against the authoritative repository' `
         -Condition ([string]$v3RuleResource.arguments.repositoryId -ceq [string]$v3Fixture.State.RuleRepositoryId)
     Assert-CohortEntry -Name 'the v3 corpus answers the authoritative rule request key, not the subject key' `
@@ -3092,6 +3129,13 @@ try {
         -Condition (
             [string]$v3RuleReference.sha256 -ceq (Get-CohortEntryBytesSha256 -Bytes $v3ExpectedWholeBytes) -and
             [int]$v3RuleReference.byteLength -eq $v3ExpectedWholeBytes.Length)
+    Assert-CohortEntry -Name 'the v3 identity witness records each rule repository and heading' `
+        -Condition (
+            @($v3Witness.ruleBundle.sections).Count -eq 2 -and
+            @($v3Witness.ruleBundle.sections | Where-Object {
+                    [string]$_.repositoryId -ceq [string]$v3Fixture.State.RuleRepositoryId -and
+                    [string]$_.section
+                }).Count -eq 2)
 }
 finally { Remove-CohortEntrySandbox -Path $v3Sandbox }
 

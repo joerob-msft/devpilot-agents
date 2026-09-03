@@ -134,7 +134,7 @@
                 "description": "The exact ATX heading whose bytes 'sha256' and 'byteLength' describe. The builder cuts this heading out of the whole file with the reviewer's own section extractor and compares the pin against the cut, so a pin recorded for a section is never checked against a whole document. A heading that is absent, or that appears more than once, is refused.",
                 "minLength": 3,
                 "maxLength": 242,
-                "pattern": "^#{1,6} [^\\u0000-\\u001f\\u007f]{1,240}$"
+                "pattern": "^#{1,6} [^\\s\\u0000-\\u001f\\u007f](?:[^\\u0000-\\u001f\\u007f]*[^\\s\\u0000-\\u001f\\u007f])?$"
               },
               "sha256": { "$ref": "#/definitions/sha256" },
               "byteLength": { "type": "integer", "minimum": 1, "maximum": 1048576 }

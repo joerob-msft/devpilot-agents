@@ -294,6 +294,30 @@ try {
         Assert-OwnerPreview -Condition ((Get-OwnerPreviewHeadKey @rebound) -cne $headKey) `
             -Message "A changed $($rebinding.Name) produced the same head key; two different rules would share one answer."
     }
+    $tiedSections = @(
+        [pscustomobject][ordered]@{
+            repositoryId = '12121212-3434-5656-7878-909090909090'
+            path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
+            commit = ('b' * 40)
+            section = '## Claim ownership A'
+            sha256 = ('5' * 64)
+        },
+        [pscustomobject][ordered]@{
+            repositoryId = '99999999-8888-7777-6666-555555555555'
+            path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
+            commit = ('b' * 40)
+            section = '## Claim ownership B'
+            sha256 = ('5' * 64)
+        })
+    $orderedRuleArgs = @{}
+    foreach ($pair in $baseArguments.GetEnumerator()) { $orderedRuleArgs[$pair.Key] = $pair.Value }
+    $orderedRuleArgs['RuleSections'] = $tiedSections
+    $reversedRuleArgs = @{}
+    foreach ($pair in $baseArguments.GetEnumerator()) { $reversedRuleArgs[$pair.Key] = $pair.Value }
+    $reversedRuleArgs['RuleSections'] = [object[]]@($tiedSections[1], $tiedSections[0])
+    Assert-OwnerPreview -Condition (
+        (Get-OwnerPreviewHeadKey @orderedRuleArgs) -ceq (Get-OwnerPreviewHeadKey @reversedRuleArgs)) `
+        -Message "The head key depends on input order when rule paths and hashes tie."
 
     # -----------------------------------------------------------------------
     # The nine-declaration case, taken from the recorded corpus itself.

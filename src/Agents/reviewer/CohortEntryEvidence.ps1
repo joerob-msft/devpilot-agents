@@ -927,12 +927,17 @@ function Read-ReviewerCohortEntryRequest {
                 -Where 'request ruleBundle section' `
                 -Pattern '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' -MaxLength 36
             $sectionHeading = Get-ReviewerCohortEntryString -Object $section -Name 'section' `
-                -Where 'request ruleBundle section' -Pattern '^#{1,6} [^\x00-\x1f\x7f]{1,240}$' -MaxLength 242
+                -Where 'request ruleBundle section' `
+                -Pattern '^#{1,6} [^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$' -MaxLength 242
         }
-        # Keyed by repository AND path. Below v3 every section resolves to the
-        # subject repository, so this is the same duplicate test those versions
-        # always applied; at v3 one path in two repositories is two rules.
-        if (-not $seenSections.Add("$sectionRepositoryId`n$sectionPath")) {
+        # Below v3 this remains the historical repository/path key. At v3 the
+        # heading is part of the identity: two rules from one guidance document
+        # are distinct sections, while the same section declared twice is not.
+        $sectionIdentity = if ($schemaVersion -ge 3) {
+            "$sectionRepositoryId`n$sectionPath`n$sectionHeading"
+        }
+        else { "$sectionRepositoryId`n$sectionPath" }
+        if (-not $seenSections.Add($sectionIdentity)) {
             New-ReviewerCohortEntryRefusal -Code 'CE110' -Detail "The rule bundle declares '$sectionPath' twice."
         }
         [void]$sectionList.Add([pscustomobject][ordered]@{
