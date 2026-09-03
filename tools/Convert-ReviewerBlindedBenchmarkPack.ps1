@@ -314,21 +314,33 @@ function Test-Bundle {
         $replayRoot = Join-Path $Root 'replay'
         $snapshot = New-AgentReplaySnapshot -ReplayRoot $replayRoot -SnapshotName ([string]$manifest.output.snapshotName) `
             -ExpectedManifestDigest ([string]$manifest.output.replayManifestDigest)
-        if (-not [bool]$snapshot.Classification.NonPromotable -or
-            [string]$snapshot.Classification.SealKind -cne 'benchmarkPackMaterialization') {
-            [void]$problems.Add('materialized replay is not classified benchmarkPackMaterialization/non-promotable')
+        if (-not [bool]$snapshot.Classification.NonPromotable) {
+            [void]$problems.Add('materialized replay is not classified non-promotable')
         }
-        $sidecar = $snapshot.Classification.Sidecar
-        if (-not $sidecar.PSObject.Properties['conventionSpecialistEnabled'] -or
-            -not $sidecar.PSObject.Properties['conventionSpecialistModel'] -or
-            -not (Test-SpecialistBindingShape `
-                -Enabled $sidecar.conventionSpecialistEnabled `
-                -Model $sidecar.conventionSpecialistModel) -or
-            $sidecar.conventionSpecialistEnabled -cne
-                $manifest.output.conventionSpecialistEnabled -or
-            $sidecar.conventionSpecialistModel -cne
-                $manifest.output.conventionSpecialistModel) {
-            [void]$problems.Add('materialization sidecar convention specialist binding mismatch')
+        if ([string]$snapshot.Classification.SealKind -ceq 'benchmarkPackMaterialization') {
+            $sidecar = $snapshot.Classification.Sidecar
+            if (-not $sidecar.PSObject.Properties['conventionSpecialistEnabled'] -or
+                -not $sidecar.PSObject.Properties['conventionSpecialistModel'] -or
+                -not (Test-SpecialistBindingShape `
+                    -Enabled $sidecar.conventionSpecialistEnabled `
+                    -Model $sidecar.conventionSpecialistModel) -or
+                $sidecar.conventionSpecialistEnabled -cne
+                    $manifest.output.conventionSpecialistEnabled -or
+                $sidecar.conventionSpecialistModel -cne
+                    $manifest.output.conventionSpecialistModel) {
+                [void]$problems.Add('materialization sidecar convention specialist binding mismatch')
+            }
+        }
+        else {
+            $requiredModels = @([string]$manifest.output.secondGeneralistModel)
+            if ([bool]$manifest.output.conventionSpecialistEnabled) {
+                $requiredModels += [string]$manifest.output.conventionSpecialistModel
+            }
+            foreach ($requiredModel in $requiredModels) {
+                if (@($snapshot.Bindings.Models) -cnotcontains $requiredModel) {
+                    [void]$problems.Add("preserved replay does not bind required model '$requiredModel'")
+                }
+            }
         }
     }
     catch { [void]$problems.Add($_.Exception.Message) }
