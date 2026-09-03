@@ -85,12 +85,17 @@ param(
     [ValidatePattern('^$|^[0-9a-fA-F]{64}$')][string]$SourceReplayManifestDigest = '',
 
     [ValidatePattern('^$|^[0-9a-f]{64}$')][string]$HeadKey = '',
+    [ValidatePattern('^$|^[0-9a-fA-F]{40}$')][string]$ExpectedSourceCommit = '',
     [ValidatePattern('^$|^[0-9a-fA-F]{40}$')][string]$ExpectedReviewerBaseCommit = '',
     [string]$ExpectedRef = '',
     [string]$ToolkitRequiredRef = '',
     [string]$SourceRefName = '',
     [string]$DiscoveryGeneralistModel = '',
     [string]$SealKeyRoot = '',
+    [string]$PrelaunchReadyPath = '',
+    [string]$PrelaunchPermitPath = '',
+    [ValidatePattern('^$|^[0-9a-f]{32}$')][string]$PrelaunchNonce = '',
+    [ValidateRange(5, 300)][int]$PrelaunchTimeoutSeconds = 60,
 
     [ValidateRange(1, 4096)][int]$MaxChangedFiles = 256,
     [ValidateRange(1, 33554432)][int]$MaxFileBytes = 4194304,
@@ -183,6 +188,47 @@ function Get-OwnerPreviewJsonLine {
     throw "No machine-readable summary line was found in tool output: $Text"
 }
 
+function Invoke-OwnerPreviewPrelaunchHandshake {
+    <# Lets an external supervisor journal this exact prepared head before launch. #>
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Prepared)
+
+    $values = @($PrelaunchReadyPath, $PrelaunchPermitPath, $PrelaunchNonce)
+    $supplied = @($values | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+    if ($supplied -eq 0) { return }
+    if ($supplied -ne 3) {
+        throw '-PrelaunchReadyPath, -PrelaunchPermitPath, and -PrelaunchNonce must be supplied together.'
+    }
+    foreach ($path in @($PrelaunchReadyPath, $PrelaunchPermitPath)) {
+        if (-not [IO.Path]::IsPathRooted($path)) { throw "Prelaunch path '$path' is not absolute." }
+        if (Test-Path -LiteralPath $path) { throw "Prelaunch path '$path' already exists." }
+    }
+
+    [void](Write-OwnerPreviewJsonFile -Path $PrelaunchReadyPath -Value ([ordered]@{
+                schemaVersion = 1
+                kind = 'reviewer-owner-preview-prelaunch-ready'
+                nonce = $PrelaunchNonce
+                headKey = [string]$Prepared.headKey
+                sourceCommit = [string]$Prepared.subject.sourceCommit
+                replayManifestDigest = [string]$Prepared.snapshot.manifestDigest
+            }))
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($PrelaunchTimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $PrelaunchPermitPath -PathType Leaf) {
+            $permit = Get-Content -LiteralPath $PrelaunchPermitPath -Raw -Encoding UTF8 |
+                ConvertFrom-Json -Depth 8
+            if ([string]$permit.kind -cne 'reviewer-owner-preview-prelaunch-permit' -or
+                [string]$permit.nonce -cne $PrelaunchNonce -or
+                [string]$permit.headKey -cne [string]$Prepared.headKey) {
+                throw 'The prelaunch permit does not bind this nonce and prepared head.'
+            }
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "No bound prelaunch permit arrived within $PrelaunchTimeoutSeconds second(s); no model was started."
+}
+
 function Get-OwnerPreviewToolkitHead {
     <# The toolkit commit this preview ran from. #>
     param([Parameter(Mandatory)][string]$Root)
@@ -193,81 +239,6 @@ function Get-OwnerPreviewToolkitHead {
         return ([string]$head).Trim().ToLowerInvariant()
     }
     finally { Pop-Location }
-}
-
-function Get-OwnerPreviewRuleSections {
-    <#
-        The ownership rule's pinned sections, taken from the configuration the
-        run will actually use.
-
-        Read from the configuration rather than accepted on the command line so
-        the bytes the preview claims to have measured against are the bytes the
-        specialist was routed to. Only the commit is supplied by the operator,
-        because a pack pins its rule by branch and a section has to name a commit.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$ConfigFile,
-        [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$RuleCommit
-    )
-    $config = Get-Content -LiteralPath $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
-    $conventions = $config.repoConventions
-    $packs = $conventions.conventionPacks
-    $sourcesProperty = $packs.PSObject.Properties['authoritativeSources']
-    if ($null -eq $sourcesProperty -or $null -eq $sourcesProperty.Value) {
-        throw "The configuration declares no conventionPacks.authoritativeSources; the ownership rule has no pinned bytes."
-    }
-    $sourceList = @($sourcesProperty.Value.sources)
-    $pack = @($packs.packs) | Where-Object { [string]$_.name -ceq 'bpm-test-ownership' } | Select-Object -First 1
-    if ($null -eq $pack) { throw "The configuration declares no 'bpm-test-ownership' pack." }
-    $refs = @($pack.authoritativeSourceRefs)
-    if ($refs.Count -lt 1) {
-        throw "The 'bpm-test-ownership' pack references no authoritative source; there would be no rule to measure against."
-    }
-
-    $sections = [System.Collections.Generic.List[object]]::new()
-    foreach ($reference in $refs) {
-        $source = @($sourceList) | Where-Object { [string]$_.name -ceq [string]$reference } | Select-Object -First 1
-        if ($null -eq $source) {
-            throw "The pack references authoritative source '$reference', which the configuration does not declare."
-        }
-        # organization/project/repositoryId are REQUIRED here, not optional
-        # extras. The rule text lives wherever the configuration says it lives -
-        # for this pack, an engineering-guidance repository that is NOT the
-        # repository the pull request is in - and dropping the binding at this
-        # layer is what made every rule read reach the subject repository and
-        # fail. 'section' joins them for the same reason: expectedSha256 and
-        # expectedByteLength are the pins of the CUT section, so the heading
-        # they describe has to travel with them.
-        foreach ($field in @('organization', 'project', 'repositoryId', 'branch', 'path', 'section', 'expectedSha256', 'expectedByteLength')) {
-            $property = $source.PSObject.Properties[$field]
-            if ($null -eq $property -or $null -eq $property.Value) {
-                throw "The authoritative source '$reference' declares no '$field'; an unpinned or unbound rule cannot be read."
-            }
-        }
-        if ([string]::IsNullOrWhiteSpace([string]$source.section) -or
-            [string]$source.section -notmatch '^#{1,6} [^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$') {
-            throw "The authoritative source '$reference' does not name a non-empty exact ATX section; Owner preview v3 does not infer a whole-file pin."
-        }
-        [void]$sections.Add([pscustomobject][ordered]@{
-                organization = [string]$source.organization
-                project      = [string]$source.project
-                repositoryId = [string]$source.repositoryId
-                branch       = [string]$source.branch
-                path         = [string]$source.path
-                commit       = $RuleCommit.ToLowerInvariant()
-                section      = [string]$source.section
-                sha256       = ([string]$source.expectedSha256).ToLowerInvariant()
-                byteLength   = [int]$source.expectedByteLength
-            })
-    }
-    $ruleRepositories = [string[]]@($sections |
-            ForEach-Object { ([string]$_.repositoryId).ToLowerInvariant() } |
-            Sort-Object -CaseSensitive -Unique)
-    if ($ruleRepositories.Count -gt 1) {
-        throw ("The ownership pack spans $($ruleRepositories.Count) rule repositories, but -RuleCommit names one commit. " +
-            'Owner preview currently requires every referenced rule section to live in the same repository.')
-    }
-    return , $sections.ToArray()
 }
 
 function New-OwnerPreviewPrepared {
@@ -516,36 +487,6 @@ function Get-OwnerPreviewPowerShellPath {
     return [string]$process.Path
 }
 
-function Read-OwnerPreviewSubject {
-    <#
-        A prepared subject, with its key re-derived from what is on disk.
-
-        The key is recomputed rather than trusted: a subject whose recorded head
-        key does not match its own contents is a package something has edited,
-        and a preview built on it would be filed under the wrong question.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$HeadKey
-    )
-    $path = Join-Path (Join-Path (Join-Path $Root 'subjects') $HeadKey) 'subject.json'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "No prepared subject '$HeadKey' under '$Root'. Run -Action prepare first."
-    }
-    $subject = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64 -AsHashtable
-    $recomputed = Get-OwnerPreviewHeadKey -SubjectKey ([string]$subject.subjectKey) `
-        -SourceCommit ([string]$subject.subject.sourceCommit) `
-        -RuleSections @($subject.rule.sections) `
-        -ReplayManifestDigest ([string]$subject.snapshot.manifestDigest) `
-        -Model ([string]$subject.model) -ConfigSha256 ([string]$subject.configSha256) `
-        -ToolkitHead ([string]$subject.toolkitHead)
-    if ($recomputed -cne [string]$subject.headKey) {
-        throw ("The subject at '$path' records head key $([string]$subject.headKey) but its own contents " +
-            "compute $recomputed. Evidence that disagrees with its own identity is refused rather than used.")
-    }
-    return $subject
-}
-
 function Invoke-OwnerPreviewSpecialist {
     <#
         The one model start, through the tools that already own model supervision.
@@ -698,7 +639,10 @@ function Read-OwnerPreviewSealedResult {
         [Parameter(Mandatory)][string]$SealKeyPath
     )
     $packageRoot = Join-Path $AcquisitionRoot 'package'
-    $empty = [pscustomobject]@{ MarkerText = ''; Nonce = ''; Diagnostic = '' }
+    $empty = [pscustomobject]@{
+        MarkerText = ''; Nonce = ''; Diagnostic = ''
+        AttemptCount = 0; ModelStarts = 0; DurationMs = 0
+    }
     if (-not (Test-Path -LiteralPath $packageRoot -PathType Container)) {
         $empty.Diagnostic = "The acquisition published no sealed package at '$packageRoot'."
         return $empty
@@ -716,6 +660,9 @@ function Read-OwnerPreviewSealedResult {
         MarkerText = [string]$verified.MarkerText
         Nonce      = [string]$verified.Core.nonce
         Diagnostic = ''
+        AttemptCount = @($verified.Core.attempts).Count
+        ModelStarts = @($verified.Core.attempts | Where-Object { [bool]$_.modelRan }).Count
+        DurationMs = [int]$verified.Core.timings.totalDurationMs
     }
 }
 
@@ -730,9 +677,13 @@ function Save-OwnerPreviewOutcome {
         [Parameter(Mandatory)][System.Collections.IDictionary]$Subject,
         [Parameter(Mandatory)][AllowEmptyString()][string]$MarkerText,
         [Parameter(Mandatory)][AllowEmptyString()][string]$ExpectedNonce,
-        [Parameter(Mandatory)][string]$RunRoot
+        [Parameter(Mandatory)][string]$RunRoot,
+        [ValidateRange(0, 8)][int]$AttemptCount = 0,
+        [ValidateRange(0, 8)][int]$ModelStarts = 0,
+        [ValidateRange(0, [int]::MaxValue)][int]$DurationMs = 0
     )
-    $status = New-OwnerPreviewOutcome -Subject $Subject -MarkerText $MarkerText -ExpectedNonce $ExpectedNonce
+    $status = New-OwnerPreviewOutcome -Subject $Subject -MarkerText $MarkerText -ExpectedNonce $ExpectedNonce `
+        -AttemptCount $AttemptCount -ModelStarts $ModelStarts -DurationMs $DurationMs
     [void](Write-OwnerPreviewJsonFile -Path (Join-Path $RunRoot 'owner-preview-status.json') -Value $status)
     $report = Format-OwnerPreviewReport -Status $status
     $encoding = [System.Text.UTF8Encoding]::new($false)
@@ -779,6 +730,11 @@ try {
                 }
                 if ($PullRequestId -lt 1) { throw "-PullRequestId is required for -Action $Action." }
                 $prepared = New-OwnerPreviewPrepared -Root $root
+                if ($ExpectedSourceCommit -ne '' -and
+                    [string]$prepared.subject.sourceCommit -cne $ExpectedSourceCommit.ToLowerInvariant()) {
+                    throw ("The active pull request source head is $([string]$prepared.subject.sourceCommit), " +
+                        "not expected commit $($ExpectedSourceCommit.ToLowerInvariant()); no model was started.")
+                }
             }
             if ($Action -ceq 'prepare') {
                 Write-Output (ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{
@@ -804,11 +760,14 @@ try {
             [void](Assert-OwnerPreviewParameter -Value $ExpectedReviewerBaseCommit `
                     -Name 'ExpectedReviewerBaseCommit' -ForAction $Action)
             $subject = Read-OwnerPreviewSubject -Root $root -HeadKey $activeKey
+            [void](Invoke-OwnerPreviewPrelaunchHandshake -Prepared $subject)
             $acquisitionRoot = Invoke-OwnerPreviewSpecialist -Subject $subject -Root $root
             $runRoot = Join-Path (Join-Path $root 'runs') $activeKey
             $sealed = Read-OwnerPreviewSealedResult -AcquisitionRoot $acquisitionRoot `
                 -SealKeyPath (Get-OwnerPreviewSealKeyPath -Name 'acquisition')
-            $status = Save-OwnerPreviewOutcome -Subject $subject -MarkerText $sealed.MarkerText -ExpectedNonce $sealed.Nonce -RunRoot $runRoot
+            $status = Save-OwnerPreviewOutcome -Subject $subject -MarkerText $sealed.MarkerText `
+                -ExpectedNonce $sealed.Nonce -RunRoot $runRoot -AttemptCount $sealed.AttemptCount `
+                -ModelStarts $sealed.ModelStarts -DurationMs $sealed.DurationMs
             if ([string]$status.terminal.status -cne 'completed') { $exitCode = 2 }
             Write-Output (ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{
                         action = $Action

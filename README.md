@@ -442,6 +442,13 @@ either - and carries no vote, no severity and no pass/fail, because a layer that
 checked one convention cannot say a pull request is fine. See
 [docs/owner-preview.md](docs/owner-preview.md).
 
+`tools/Invoke-OwnerPreviewQueue.ps1` adds a declared, maximum-ten-entry hourly
+Windows Task Scheduler queue around that `prepare-run` seam. It processes one
+head per tick, creates no app sessions or worktrees, persists a signed external
+ledger, never retries without an audited `requeue`, and refuses linked or
+ephemeral toolkit worktrees. See the
+[queue deployment guide](docs/owner-preview.md#hourly-declared-queue).
+
 #### Sealed source transport (layer 8)
 
 **The model is given no working file-read tool. It is given the file's bytes.**

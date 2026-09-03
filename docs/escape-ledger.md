@@ -474,3 +474,10 @@ a plausible-looking number derived from a history that no longer exists. The bou
 actually used, and whether it was reached directly or through the map, are both published in
 the check's report as `coverageWindowBoundary` and `coverageWindowBoundaryVia`, so a reader
 never has to guess which path a passing run took.
+
+The replacement boundary was re-verified at exact reviewed base
+`fee124dd0296e7a138cd41b8715564f79f25e13f` before adding the scheduled Owner queue. This
+does not edit the frozen source citation, widen the 40-commit limit, change an incident, or
+reclassify the budget. It advances only the verified replacement-side point from which
+post-consolidation drift is counted, after confirming that the descendant still carries the
+ledger and verifier evidence bound by the map.

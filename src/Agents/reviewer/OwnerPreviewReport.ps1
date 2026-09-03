@@ -205,7 +205,8 @@ function New-OwnerPreviewStatus {
         [AllowEmptyString()][string]$Diagnostic = '',
         [AllowEmptyString()][string]$Field = '',
         [AllowEmptyString()][string]$SpecialistModel = '',
-        [ValidateRange(0, 3)][int]$ModelStarts = 0,
+        [ValidateRange(0, 8)][int]$AttemptCount = 0,
+        [ValidateRange(0, 8)][int]$ModelStarts = 0,
         [ValidateRange(0, [int]::MaxValue)][int]$DurationMs = 0
     )
 
@@ -221,7 +222,10 @@ function New-OwnerPreviewStatus {
     $status['snapshot'] = $Snapshot
 
     if ($null -eq $Counts) {
-        $status['counts'] = [ordered]@{ checked = 0; violations = 0; compliant = 0; unknown = 0 }
+        $status['counts'] = [ordered]@{
+            checked = 0; violations = 0; compliant = 0; unknown = 0
+            notInReach = 0; notRouted = 0
+        }
     }
     else {
         # The schema caps these arrays, and the v4 contract admits far more
@@ -237,6 +241,8 @@ function New-OwnerPreviewStatus {
             violations    = [int]$Counts.Violations
             compliant     = [int]$Counts.Compliant
             unknown       = [int]$Counts.Unknown
+            notInReach    = [int](Get-OwnerPreviewMarkerValue -Container $Counts -Key 'NotInReach' -Default 0)
+            notRouted     = [int](Get-OwnerPreviewMarkerValue -Container $Counts -Key 'NotRouted' -Default 0)
             rows          = [int]$Counts.Rows
             withheld      = [int]$Counts.Withheld
             residualRisks = @($Counts.ResidualRisks).Count
@@ -267,6 +273,7 @@ function New-OwnerPreviewStatus {
     # this build ships no code path that could raise them. A number derived from
     # a counter would invite the reader to believe the counter.
     $spend = [ordered]@{
+        attempts             = $AttemptCount
         modelStarts           = $ModelStarts
         providerWriteCount    = 0
         writeToolInvocations  = 0
@@ -334,7 +341,10 @@ function New-OwnerPreviewOutcome {
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Subject,
         [Parameter(Mandatory)][AllowEmptyString()][string]$MarkerText,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$ExpectedNonce
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ExpectedNonce,
+        [ValidateRange(0, 8)][int]$AttemptCount = 1,
+        [ValidateRange(0, 8)][int]$ModelStarts = 1,
+        [ValidateRange(0, [int]::MaxValue)][int]$DurationMs = 0
     )
     $subjectIdentity = $Subject.subject
     $ruleSection = @($Subject.rule.sections)[0]
@@ -376,7 +386,8 @@ function New-OwnerPreviewOutcome {
         }
         return (New-OwnerPreviewStatus -Subject $subjectBlock -Rule $ruleBlock -Snapshot $snapshotBlock `
                 -TerminalStatus 'incomplete' -MarkerStatus 'absent' -SubjectKey $subjectKey `
-                -HeadKey $headKey -SpecialistModel $model -ModelStarts 1 `
+                -HeadKey $headKey -SpecialistModel $model -AttemptCount $AttemptCount -ModelStarts $ModelStarts `
+                -DurationMs $DurationMs `
                 -Diagnostic $absentReason)
     }
 
@@ -400,7 +411,8 @@ function New-OwnerPreviewOutcome {
     if ($readFailure -ne '') {
         return (New-OwnerPreviewStatus -Subject $subjectBlock -Rule $ruleBlock -Snapshot $snapshotBlock `
                 -TerminalStatus 'incomplete' -MarkerStatus 'unreadable' -SubjectKey $subjectKey `
-                -HeadKey $headKey -SpecialistModel $model -ModelStarts 1 -Diagnostic $readFailure)
+                -HeadKey $headKey -SpecialistModel $model -AttemptCount $AttemptCount -ModelStarts $ModelStarts `
+                -DurationMs $DurationMs -Diagnostic $readFailure)
     }
 
     $outcomeStatus = [string]$outcome.Status
@@ -411,18 +423,21 @@ function New-OwnerPreviewOutcome {
         if ($mismatch -ne '') {
             return (New-OwnerPreviewStatus -Subject $subjectBlock -Rule $ruleBlock -Snapshot $snapshotBlock `
                     -TerminalStatus 'blocked' -MarkerStatus 'wrongBinding' -SubjectKey $subjectKey `
-                    -HeadKey $headKey -SpecialistModel $model -ModelStarts 1 `
+                    -HeadKey $headKey -SpecialistModel $model -AttemptCount $AttemptCount -ModelStarts $ModelStarts `
+                    -DurationMs $DurationMs `
                     -Diagnostic ("The result was refused: $mismatch."))
         }
         $counts = Get-OwnerPreviewCapabilityCounts -Marker $outcome.Value
         return (New-OwnerPreviewStatus -Subject $subjectBlock -Rule $ruleBlock -Snapshot $snapshotBlock `
                 -TerminalStatus 'completed' -MarkerStatus $outcomeStatus -Counts $counts `
-                -SubjectKey $subjectKey -HeadKey $headKey -SpecialistModel $model -ModelStarts 1)
+                -SubjectKey $subjectKey -HeadKey $headKey -SpecialistModel $model `
+                -AttemptCount $AttemptCount -ModelStarts $ModelStarts -DurationMs $DurationMs)
     }
     $field = [string](Get-OwnerPreviewMarkerValue -Container $outcome -Key 'Field' -Default '')
     return (New-OwnerPreviewStatus -Subject $subjectBlock -Rule $ruleBlock -Snapshot $snapshotBlock `
             -TerminalStatus 'incomplete' -MarkerStatus $outcomeStatus -SubjectKey $subjectKey `
-            -HeadKey $headKey -SpecialistModel $model -ModelStarts 1 -Field $field `
+            -HeadKey $headKey -SpecialistModel $model -AttemptCount $AttemptCount -ModelStarts $ModelStarts `
+            -DurationMs $DurationMs -Field $field `
             -Diagnostic 'The result marker did not satisfy the version 4 contract.')
 }
 
@@ -512,8 +527,8 @@ function Format-OwnerPreviewReport {
     [void]$lines.Add(("- Sealed input: {0} (manifest digest {1})" -f `
                 $snapshot['snapshotId'], $snapshot['manifestDigest']))
     [void]$lines.Add(("- Classification: {0}, non-promotable" -f $snapshot['sealKind']))
-    [void]$lines.Add(("- Model starts: {0}; provider writes: {1}; write tool invocations: {2}" -f `
-                $Status['spend']['modelStarts'], $Status['spend']['providerWriteCount'],
+    [void]$lines.Add(("- Attempts: {0}; model starts: {1}; provider writes: {2}; write tool invocations: {3}" -f `
+                $Status['spend']['attempts'], $Status['spend']['modelStarts'], $Status['spend']['providerWriteCount'],
             $Status['spend']['writeToolInvocations']))
     [void]$lines.Add("")
     [void]$lines.Add("This preview reports one convention. It is not a review of the pull request, and it carries no vote.")

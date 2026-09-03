@@ -61,6 +61,62 @@ function Get-OwnerPreviewCanonicalSha256 {
     return (Get-OwnerPreviewTextSha256 -Text $canonical)
 }
 
+function Get-OwnerPreviewRuleSections {
+    <# Reads the exact authoritative ownership sections from the run config. #>
+    param(
+        [Parameter(Mandatory)][string]$ConfigFile,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$RuleCommit
+    )
+    $config = Get-Content -LiteralPath $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
+    $conventions = $config.repoConventions
+    $packs = $conventions.conventionPacks
+    $sourcesProperty = $packs.PSObject.Properties['authoritativeSources']
+    if ($null -eq $sourcesProperty -or $null -eq $sourcesProperty.Value) {
+        throw 'The configuration declares no conventionPacks.authoritativeSources.'
+    }
+    $sourceList = @($sourcesProperty.Value.sources)
+    $pack = @($packs.packs) | Where-Object { [string]$_.name -ceq 'bpm-test-ownership' } | Select-Object -First 1
+    if ($null -eq $pack) { throw "The configuration declares no 'bpm-test-ownership' pack." }
+    $refs = @($pack.authoritativeSourceRefs)
+    if ($refs.Count -lt 1) { throw "The 'bpm-test-ownership' pack references no authoritative source." }
+
+    $sections = [Collections.Generic.List[object]]::new()
+    foreach ($reference in $refs) {
+        $source = @($sourceList) | Where-Object { [string]$_.name -ceq [string]$reference } | Select-Object -First 1
+        if ($null -eq $source) { throw "The pack references undeclared authoritative source '$reference'." }
+        foreach ($field in @(
+                'organization', 'project', 'repositoryId', 'branch', 'path', 'section',
+                'expectedSha256', 'expectedByteLength')) {
+            $property = $source.PSObject.Properties[$field]
+            if ($null -eq $property -or $null -eq $property.Value) {
+                throw "The authoritative source '$reference' declares no '$field'."
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$source.section) -or
+            [string]$source.section -notmatch '^#{1,6} [^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$') {
+            throw "The authoritative source '$reference' does not name an exact ATX section."
+        }
+        [void]$sections.Add([pscustomobject][ordered]@{
+                organization = [string]$source.organization
+                project = [string]$source.project
+                repositoryId = [string]$source.repositoryId
+                branch = [string]$source.branch
+                path = [string]$source.path
+                commit = $RuleCommit.ToLowerInvariant()
+                section = [string]$source.section
+                sha256 = ([string]$source.expectedSha256).ToLowerInvariant()
+                byteLength = [int]$source.expectedByteLength
+            })
+    }
+    $repositories = [string[]]@($sections |
+            ForEach-Object { ([string]$_.repositoryId).ToLowerInvariant() } |
+            Sort-Object -CaseSensitive -Unique)
+    if ($repositories.Count -gt 1) {
+        throw 'The ownership pack spans multiple rule repositories, but RuleCommit names one commit.'
+    }
+    return , $sections.ToArray()
+}
+
 function Write-OwnerPreviewJsonFile {
     <#
         One JSON document on disk, canonical and UTF-8 without a byte-order mark.
@@ -705,4 +761,28 @@ function Get-OwnerPreviewHeadKey {
         toolkitHead          = $ToolkitHead.ToLowerInvariant()
     }
     return (Get-OwnerPreviewCanonicalSha256 -Value $material)
+}
+
+function Read-OwnerPreviewSubject {
+    <# Reads a prepared subject only after recomputing its Layer 1 head key. #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$HeadKey
+    )
+    $path = Join-Path (Join-Path (Join-Path $Root 'subjects') $HeadKey) 'subject.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "No prepared subject '$HeadKey' under '$Root'. Run -Action prepare first."
+    }
+    $subject = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64 -AsHashtable
+    $recomputed = Get-OwnerPreviewHeadKey -SubjectKey ([string]$subject.subjectKey) `
+        -SourceCommit ([string]$subject.subject.sourceCommit) `
+        -RuleSections @($subject.rule.sections) `
+        -ReplayManifestDigest ([string]$subject.snapshot.manifestDigest) `
+        -Model ([string]$subject.model) -ConfigSha256 ([string]$subject.configSha256) `
+        -ToolkitHead ([string]$subject.toolkitHead)
+    if ($recomputed -cne [string]$subject.headKey) {
+        throw ("The subject at '$path' records head key $([string]$subject.headKey) but its own contents " +
+            "compute $recomputed. Evidence that disagrees with its own identity is refused rather than used.")
+    }
+    return $subject
 }

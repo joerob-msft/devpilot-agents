@@ -180,6 +180,83 @@ proves a marker naming another pull request or carrying a nonce this run did not
 issue is refused rather than counted, and drives the nine-declaration case
 through the production v4 parser.
 
+## Hourly declared queue
+
+`tools/Invoke-OwnerPreviewQueue.ps1` is the Layer 2 Windows Task Scheduler
+harness. It does not discover pull requests and does not paginate or reorder
+anything: its validated local JSON configuration declares at most ten pull
+requests, and each tick considers them in that exact order. A tick processes at
+most one unprocessed head by invoking this Layer 1 tool with `-Action
+prepare-run`.
+
+Each entry names the live organization, project, repository ID/name, pull
+request ID, target ref, reviewer config, authoritative rule commit, model,
+reviewer base commit, agency executable, and exactly
+`bpm-test-ownership@1`. `sourceHeadMode: fixed` additionally requires the
+expected 40-hex source head. `refresh-before-first-run` binds the live head
+captured on its first run; it is not a standing "run every new head" discovery
+mode. To process a later head, update the declaration.
+
+For offline proof only, an entry may name the committed
+`offlineModelAdapterManifest`; that digest is part of the charge key and Layer 1
+then enables its existing non-promotable offline adapter seam. The scheduled
+production declaration omits this field.
+
+The queue's `headKey` binds subject and source identity, target identity, exact
+rule repository/path/branch/commit/section/hash/length, supported-model
+registry, selected model, reviewer config, prompt and reviewer-script hashes,
+replay manifest digest, and toolkit head. Its HMAC-authenticated atomic ledger
+and immutable per-head journal/index/artifact records live under the required
+external state root. A key must exist before any record; missing-key or
+key/record mismatch is a refusal. States are `pending` -> `running` ->
+`completed|incomplete|blocked`. A dead `running` record becomes
+`incomplete/interruptedUnknown` on the next tick and never retries
+automatically. The only retry path is:
+
+```powershell
+./tools/Invoke-OwnerPreviewQueue.ps1 -Action requeue `
+  -ConfigFile C:\stable\owner-queue.json -StateRoot C:\private\owner-state `
+  -HeadKey <64-lowercase-hex> -Reason "operator inspected evidence"
+```
+
+The requeue reason is appended to the signed audit history. One cycle reserves
+at most the production specialist's three starts, allows zero provider writes,
+zero write-tool invocations and zero generalist starts, and has a 50-minute wall
+limit. Any contrary telemetry blocks the record. The index reports only this
+capability: declarations checked, Owner violations, unknown,
+`notInReach`/`notRouted`, rule provenance, terminal/schema status, attempts,
+starts, latency, and write counts. It has no global pass, approval, verifier,
+reconciliation, or vote.
+
+### Scheduler deployment
+
+The scheduler must point at a **stable ordinary checkout** whose `.git` is a
+directory and whose named ref resolves to the exact configured toolkit head.
+Linked worktrees and paths under `copilot-worktrees` are refused. Consequently,
+install from a promoted stable checkout, not from a Copilot session worktree.
+The task creates **zero Copilot/app sessions and zero worktrees per tick**; it
+starts `pwsh` directly.
+
+```powershell
+# Shows the exact principal/action/trigger/settings without registering a task.
+./tools/Invoke-OwnerPreviewQueue.ps1 -Action install-dry-run `
+  -ConfigFile C:\stable\owner-queue.json -StateRoot C:\private\owner-state
+
+# Idempotent registration under the current interactive user.
+./tools/Invoke-OwnerPreviewQueue.ps1 -Action install `
+  -ConfigFile C:\stable\owner-queue.json -StateRoot C:\private\owner-state
+```
+
+The task is named `DevPilotOwnerPreview-<instanceName>`, uses interactive logon,
+limited run level, no stored password or elevation, an hourly trigger,
+`IgnoreNew`, and a 55-minute execution limit. `task-status`, `disable`, and
+`uninstall` manage only that task. Uninstall preserves the ledger and all
+evidence. App Automation is not a scheduler for this layer.
+
+`tools/Test-OwnerPreviewQueue.ps1` drives the queue offline with a fake
+prepare-run boundary and the committed result shapes. It registers no task,
+contacts no provider, and starts no model.
+
 ## What live validation established
 
 The read-only proof used active PR `16705856` at source commit
