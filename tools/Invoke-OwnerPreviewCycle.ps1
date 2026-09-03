@@ -806,7 +806,8 @@ try {
             $subject = Read-OwnerPreviewSubject -Root $root -HeadKey $activeKey
             $acquisitionRoot = Invoke-OwnerPreviewSpecialist -Subject $subject -Root $root
             $runRoot = Join-Path (Join-Path $root 'runs') $activeKey
-            $sealed = Read-OwnerPreviewSealedResult -AcquisitionRoot $acquisitionRoot -SealKeyPath (Join-Path $runRoot 'acquisition-seal.key')
+            $sealed = Read-OwnerPreviewSealedResult -AcquisitionRoot $acquisitionRoot `
+                -SealKeyPath (Get-OwnerPreviewSealKeyPath -Name 'acquisition')
             $status = Save-OwnerPreviewOutcome -Subject $subject -MarkerText $sealed.MarkerText -ExpectedNonce $sealed.Nonce -RunRoot $runRoot
             if ([string]$status.terminal.status -cne 'completed') { $exitCode = 2 }
             Write-Output (ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{

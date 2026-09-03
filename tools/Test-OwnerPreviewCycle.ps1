@@ -537,10 +537,15 @@ try {
     # The write surface, and the configuration that scopes the run.
     # -----------------------------------------------------------------------
     $cliPath = Join-Path $RepoRoot 'tools/Invoke-OwnerPreviewCycle.ps1'
+    $cliText = [IO.File]::ReadAllText($cliPath)
     $surfaceClean = $false
     try { $surfaceClean = [bool](Assert-OwnerPreviewNoWriteSurface -ScriptPath $cliPath) } catch { $surfaceClean = $false }
     Assert-OwnerPreview -Condition $surfaceClean `
         -Message "The Owner preview declares a write-capable parameter."
+    Assert-OwnerPreview -Condition (
+        $cliText -cmatch "Read-OwnerPreviewSealedResult[\s\S]{0,200}Get-OwnerPreviewSealKeyPath\s+-Name\s+'acquisition'" -and
+        $cliText -cnotmatch "Read-OwnerPreviewSealedResult[^\r\n]+acquisition-seal\.key") `
+        -Message "The Owner preview does not verify acquisition with the external key that sealed it."
 
     $reviewerScript = Join-Path $RepoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1'
     $detectsWriteSurface = $false
