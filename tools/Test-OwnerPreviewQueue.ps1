@@ -27,6 +27,10 @@ function Test-QueueRefusal {
     $refused = $false
     try { & $Action }
     catch { $refused = [string]$_.Exception.Message -match $Pattern }
+    # Expected native-command refusals (for example detached `git symbolic-ref`)
+    # are fully adjudicated above. Do not leak their exit code into the workflow
+    # shell after this script itself has passed every assertion.
+    $global:LASTEXITCODE = 0
     Assert-QueueTest $refused $Message
 }
 
@@ -327,9 +331,21 @@ try {
 
     Test-QueueRefusal { Resolve-OwnerPreviewQueueStateRoot -StateRoot $RepoRoot -InstanceName 'test' } 'inside git' `
         'A repository state root was accepted.'
-    $stableRefPattern = if ($detachedCheckout) { 'detached' } else { 'worktree|ordinary checkout' }
-    Test-QueueRefusal { Assert-OwnerPreviewQueueStableToolkit -Config $config } $stableRefPattern `
-        'An unsafe linked or detached scheduler toolkit was accepted.'
+    $gitMarker = Get-Item -LiteralPath (Join-Path $toolkit '.git') -Force
+    if ($detachedCheckout) {
+        Test-QueueRefusal { Assert-OwnerPreviewQueueStableToolkit -Config $config } 'detached' `
+            'A detached scheduler toolkit was accepted.'
+        Assert-QueueTest ($LASTEXITCODE -eq 0) `
+            'The expected detached-ref refusal leaked native exit 1 after its assertion passed.'
+    }
+    elseif (-not $gitMarker.PSIsContainer) {
+        Test-QueueRefusal { Assert-OwnerPreviewQueueStableToolkit -Config $config } 'worktree|ordinary checkout' `
+            'A linked scheduler worktree was accepted.'
+    }
+    else {
+        Assert-QueueTest ([bool](Assert-OwnerPreviewQueueStableToolkit -Config $config)) `
+            'A named stable ordinary checkout was refused.'
+    }
     Test-QueueRefusal { Assert-OwnerPreviewQueueSafePath -Path 'C:\bad"path' -Where 'test' } 'control character or quote' `
         'A quoted task path was accepted.'
 
