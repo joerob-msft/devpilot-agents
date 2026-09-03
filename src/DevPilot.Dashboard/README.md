@@ -1,8 +1,20 @@
 # DevPilot Operations Dashboard
 
-A read-only terminal operations console for observing DevPilot reviewer and
-review-handler instances. It consumes the per-instance JSONL event streams and
-never invokes, stops, retries, promotes, or otherwise controls an agent.
+Direct and attach-only launches remain visibly observe-only. A trusted
+`Watch-DevPilot*.ps1` launcher may opt in a long-lived broker descriptor and
+one or both manual roles. The renderer can confirm only wrapper-derived
+capabilities and can never grant them. Manual Reviewer approval votes remain
+hard-disabled.
+
+A terminal operations console for observing DevPilot reviewer and
+review-handler instances and, only under a trusted launcher, manually
+dispatching a retained PR through the restricted broker contract.
+
+The History view is an independent retained PR projection keyed by
+provider-verified repository identity plus PR number. It merges Reviewer and
+Review Handler outcomes without merging same-numbered PRs from different
+repositories. Legacy schema-v2 streams remain visible in instance views but do
+not enter canonical PR history.
 
 ## Prerequisites
 
@@ -20,7 +32,14 @@ npm install
 npm run build
 npm test
 npm run test:renderer
+npm run test:pty
 ```
+
+`test:pty` is a Windows-only live integration test. It starts the built
+dashboard with the locked Bun runtime in a real ConPTY, drives terminal input
+and resize events, and requires a clean quit. Observe-only process behavior is
+covered there; trusted dispatch and mandatory Reviewer vote denial remain
+covered by the native renderer and broker protocol tests.
 
 The repository launcher intentionally does not install dependencies:
 
@@ -57,7 +76,14 @@ polled until they appear.
 | `Esc` / `b` | Dismiss overlay or move back toward the instance rail |
 | `Tab` / `Shift+Tab` | Cycle all, reviewer, and review-handler roles |
 | `f` / `Shift+f` | Cycle Live, Current session, and History views |
-| `x` / `Shift+x` | Forget the selected/all historical rows for this dashboard process |
+| `x` / `Shift+x` | Hide the selected retained PR history row / restore all hidden PR history rows for this dashboard process |
+| `/` | Filter PR history by number, title, author, repository, or outcome |
+| Number then `Enter` | Jump to and restore a unique retained PR number |
+| `m` | Open manual dispatch for the selected retained PR when trusted policy is available |
+| `Tab` in prompt | Select the manual Reviewer or Review Handler role |
+| `Enter` in prompt | Insert a newline (never confirms execution) |
+| `Ctrl+d`, then `d`, then `y` | Describe, review the first gate, and explicitly confirm the exact broker snapshot |
+| `c` | Cancel only the active broker-owned manual child |
 | `i` | Open or close the inspector |
 | `e` | Bounded raw-events overlay; Left/Right changes filter |
 | `w` | Next failed, blocked, or diagnostic-bearing instance |
@@ -84,19 +110,36 @@ normal state roots, the namespace is the directory immediately above
 it is the containing directory.
 History rows include their completion timestamp and reported outcome.
 
-Forget is deliberately bounded to 500 hidden keys and affects only in-memory
-dashboard view state. It never removes an instance from the reducer, changes an
-agent process, edits agent state, or deletes/truncates event logs. A forgotten
-row remains hidden until this dashboard process exits (unless that instance
-becomes active again).
+Hide and restore affect only in-memory dashboard view state. They never change an agent
+process, edits agent state, or deletes/truncates event logs. Numeric jump in the
+history projection restores a hidden unique PR; same-numbered PRs across
+repositories require repository selection.
+
+The optional operator context is LF-normalized, rejects terminal control
+characters, and is capped at 512 Unicode scalar values (including non-BMP
+characters). It is sent only as bounded protocol data and is never placed in
+argv, environment, logs, events, or diagnostics. Confirmation separately shows
+the source commit, capability-policy digest, PR-state fingerprint, enabled
+capabilities, mandatory disabled high-impact actions, and dynamic constraints.
+`source-changed`, `policy-changed`, `pr-state-changed`, `delivery-pending`,
+`already-running`, broker/child failures, and cooperative/forced cancellation
+are rendered with distinct safe detail.
 
 ## Architecture
 
-- `domain.ts` validates and bounds the additive event envelope, including PR
-  title, author, URL, and source/target branch context.
+- `domain.ts` validates and bounds both legacy instance-observation events and
+  schema-v3 provider-verified repository identity.
+- `history.ts` independently retains up to 5,000 canonical repository/PR keys,
+  deterministic role outcomes, filtering, hide/restore, jump, and eviction.
 - `tailer.ts` discovers streams and maintains one rotation-safe byte cursor per
-  file. Complete malformed lines become bounded diagnostics; partial lines stay
+  file. Accepted event paths are registered immediately while preserving the
+  flat `logs\events\<role>` layout and `.jsonl.1` through `.jsonl.5` rotation.
+  Complete malformed lines become bounded diagnostics; partial lines stay
   buffered until a newline arrives.
+- `dispatch.ts` starts only the absolute trusted PowerShell executable and
+  fixed broker argv with `shell: false`, enforces 65,536-byte JSONL frames,
+  correlates requests, and owns bounded cancel/shutdown behavior. It never
+  derives capability policy.
 - `reducer.ts` deduplicates by instance sequence, surfaces gaps, derives
   lifecycle and attention state, preserves bounded review completion details,
   retains at most 500 non-heartbeat timeline events per instance, and owns the

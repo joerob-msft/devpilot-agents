@@ -64,6 +64,39 @@ $ado = New-AgentProviderContext -Provider 'AzureDevOps' -Organization 'o' -Proje
 Assert-True ($ado.Provider -eq 'AzureDevOps') "a complete AzureDevOps context is accepted"
 
 # ---------------------------------------------------------------------------
+Start-Check "repository identity is provider verified and exact"
+$adoId = 'D4D2E08B-47C1-4BAE-A9AE-56C8D5410F61'
+$adoVerified = New-AgentProviderContext -Provider 'AzureDevOps' -Organization 'contoso' -Project 'widgets' `
+    -RepositoryName 'service' -RepositoryId $adoId -McpInvoker {
+        param($Name, $Arguments, $RawText)
+        if ($Name -ne 'repo_repository' -or $Arguments.action -ne 'get') { throw 'unexpected provider operation' }
+        return @{ id = 'd4d2e08b-47c1-4bae-a9ae-56c8d5410f61'; name = 'Service'; projectReference = @{ name = 'Widgets' } }
+    }
+$adoIdentity = Resolve-AgentProviderRepositoryIdentity $adoVerified
+Assert-True ($adoIdentity.repositoryId -ceq $adoId.ToLowerInvariant()) "ADO GUID is normalized after provider verification"
+Assert-True ($adoIdentity.key -ceq "v1:azuredevops:$($adoId.ToLowerInvariant())") "ADO canonical key uses the immutable GUID"
+Assert-True ($adoIdentity.dispatchEligible -eq $true) "verified ADO identity is dispatch eligible"
+Assert-Throws {
+    Resolve-AgentProviderRepositoryIdentity (New-AgentProviderContext -Provider 'AzureDevOps' -Organization 'contoso' `
+        -Project 'widgets' -RepositoryName 'service' -RepositoryId $adoId -McpInvoker {
+            @{ id = '11111111-1111-1111-1111-111111111111'; name = 'service'; project = @{ name = 'widgets' } }
+        })
+} "a forged or mismatched config GUID is rejected"
+
+$largeGitHubId = '900719925474099312345'
+$githubVerified = New-AgentProviderContext -Provider 'GitHub' -Organization 'Contoso' -RepositoryName 'Widget-Service' `
+    -GitHubApiInvoker { param($Path, $Timeout) '{"id":900719925474099312345,"name":"Widget-Service","full_name":"contoso/widget-service"}' }
+$githubIdentity = Resolve-AgentProviderRepositoryIdentity $githubVerified
+Assert-True ($githubIdentity.repositoryId -ceq $largeGitHubId) "GitHub ID above 53 bits remains an exact decimal string"
+Assert-True ($githubIdentity.key -ceq "v1:github:$largeGitHubId") "GitHub canonical key preserves the opaque ID"
+Assert-Throws {
+    Resolve-AgentProviderRepositoryIdentity (New-AgentProviderContext -Provider 'GitHub' -Organization 'contoso' `
+        -RepositoryName 'widget-service' -GitHubApiInvoker { '{"id":42,"name":"other","full_name":"contoso/other"}' })
+} "GitHub provider/config address mismatch is rejected"
+$offline = New-AgentUnverifiedRepositoryIdentity -Provider GitHub -Organization contoso -RepositoryName widget-service
+Assert-True (-not $offline.verified -and -not $offline.dispatchEligible -and -not $offline.repositoryId) "offline identity is explicitly unverified and non-dispatchable"
+
+# ---------------------------------------------------------------------------
 Start-Check "status normalization distinguishes merged from abandoned"
 Assert-True ((ConvertTo-AgentProviderPullRequestStatus -Provider 'GitHub' -State 'open') -eq 'Active') "open maps to Active"
 Assert-True ((ConvertTo-AgentProviderPullRequestStatus -Provider 'GitHub' -State 'closed' -IsMerged $true) -eq 'Completed') "closed+merged maps to Completed"

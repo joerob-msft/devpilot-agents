@@ -317,6 +317,17 @@ export class OperationsReducer {
         state.retryable = state.blocked.retryable;
         state.outstanding = state.blocked.outstanding;
         break;
+      case "work.concurrent":
+        state.blocked = {
+          reason: getString(data, "reason") || "concurrent work owns this repository and role",
+          outstanding: [],
+          retryable: true,
+          nextRetry: "next cycle",
+          timestampMs: event.timestampMs,
+        };
+        state.retryable = true;
+        state.modelActivity = "Waiting for concurrent work";
+        break;
       case "review.completed":
       case "work.completed": {
         this.reducePullRequestContext(state, data);

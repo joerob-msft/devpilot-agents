@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parseAgentEvent } from "../src/domain.js";
 import { eventNarrative, eventSummary } from "../src/format.js";
+import { appendPromptScalar, dispatchResultDetail, promptScalarCount } from "../src/app.js";
 
 function namedEvent(eventType: string, data: Record<string, unknown> = {}, message = "") {
   return parseAgentEvent({
@@ -18,6 +19,24 @@ function namedEvent(eventType: string, data: Record<string, unknown> = {}, messa
     sourceCommit: "",
     data,
     message,
+  });
+
+  test("manual prompt counts Unicode scalars and bounds input at 512", () => {
+    const atLimit = "😀".repeat(512);
+    assert.equal(promptScalarCount(atLimit), 512);
+    assert.equal(appendPromptScalar(atLimit, "x"), atLimit);
+    assert.equal(appendPromptScalar("line one", "\n"), "line one\n");
+    assert.equal(appendPromptScalar("safe", "\u001b"), "safe");
+    assert.equal(appendPromptScalar("safe", "\ud800"), "safe");
+    assert.equal(appendPromptScalar("safe", "😀"), "safe😀");
+  });
+
+  test("manual rejection details stay distinct and safe", () => {
+    assert.match(dispatchResultDetail("source-changed"), /Source changed/);
+    assert.match(dispatchResultDetail("policy-changed"), /capability policy changed/);
+    assert.match(dispatchResultDetail("delivery-pending"), /delivery is pending/);
+    assert.match(dispatchResultDetail("already-running", "state-contended"), /role state is busy/);
+    assert.doesNotMatch(dispatchResultDetail("launch-failed", "bad\u001bdetail"), /\u001b/);
   });
 }
 

@@ -12,7 +12,7 @@
 RootModule = 'DevPilot.AgentHarness.psm1'
 
 # Version number of this module.
-ModuleVersion = '0.1.0'
+ModuleVersion = '0.4.0'
 
 # Supported PSEditions
 # CompatiblePSEditions = @()
@@ -78,8 +78,9 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Get-AgentRequiredProperty', 'Get-AgentDefaultModelSentinel', 
                'Assert-AgentSupportedModel', 'Test-ParserValidity', 
                'Get-OnceFinalExitCode', 'Test-StrictJsonInt', 'New-AgentNonce', 
+               'New-AgentPipeName',
                'Test-AgentValidatedParamRebind', 
-               'Test-AgentInteractiveOutput', 'New-AgentOutputContext', 'Set-AgentOutputLegacySuppression',
+               'Test-AgentInteractiveOutput', 'New-AgentOutputContext', 'Set-AgentOutputRepositoryIdentity', 'Set-AgentOutputLegacySuppression',
                'Get-AgentNormalizedSkipReason', 'Format-AgentCount',
                'Format-AgentSkipSummary', 'Publish-AgentEvent', 'Close-AgentOutputContext',
                'Test-AgentProtectedBranch', 'Get-AgentConfigProperty', 
@@ -87,14 +88,26 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Get-AgentConfigObject', 'Get-AgentConfigStringArray', 
                'Get-AgentConfig', 'Test-AgentAllowToolCeiling', 
                'Get-AgentCopilotArgs', 'Enter-AgentLock', 'Exit-AgentLock', 
+               'Get-AgentSha256', 'Get-AgentDefaultDurableStateRoot', 'Get-AgentDefaultLeaseRoot', 'Get-AgentDefaultWatchStateRoot',
+               'Test-AgentPathWithin', 'Resolve-AgentTrustedRoot', 'Assert-AgentTrustedFile', 'Remove-AgentContainedDirectory', 'Get-AgentRepositoryIdentityKey', 'Get-AgentExecutionKey',
+               'Enter-AgentWorkLease', 'Get-AgentDurableStateContext', 'Enter-AgentDurableStateLock',
+               'Invoke-AgentWithWorkAuthority', 'Enter-AgentManualDispatchStartup', 'Get-AgentManualOperatorContext',                'Test-AgentManualCancellationRequested', 'Get-AgentCancellationOutcome',
+               'Exit-AgentManualDispatchAuthority',
+               'Repair-AgentDurableState', 'Read-AgentDurableState', 'Write-AgentDurableState',
+               'Get-AgentDurableRecords', 'Get-AgentDurableRecordsSnapshot', 'Set-AgentDurableRecords', 'Initialize-AgentDurableState',
+               'Test-AgentAnalysisRequired', 'Test-AgentReviewerDeliveryPending', 'Confirm-AgentLegacyRecordsForMigration',
                'Get-JsonState', 'Set-JsonState', 'Write-AgentMetadata', 
                'ConvertFrom-AgentResultMarker', 'Find-CopilotSessionForBranch', 
                'Set-TimedProcessArguments', 'Stop-ProcessTree', 
+               'Resolve-AgentPwshPath', 'ConvertTo-AgentCanonicalJson', 'Get-AgentCanonicalDigest',
+               'Test-AgentOperatorPrompt', 'New-AgentRedirectedProcess', 'New-AgentPersistentRedirectedProcess', 'Complete-AgentRedirectedProcess',
+               'Get-AgentProcessStartIdentity', 'New-AgentProcessContainment', 'Stop-AgentProcessContainment', 'Test-AgentProcessContainmentExited', 'Close-AgentProcessContainment',
                'Get-TaskTextBeforeDeadline', 'Invoke-TimedProcess', 
                'Open-AgentMcpSession', 'Close-AgentMcpSession', 
                'Send-AgentMcpRequest', 'Send-AgentMcpNotification', 
                'Invoke-AgentMcpTool',
     'Get-AgentSupportedProvider', 'Test-AgentProviderSupported', 'New-AgentProviderContext', 'Assert-AgentProviderContext',
+    'New-AgentUnverifiedRepositoryIdentity', 'Resolve-AgentProviderRepositoryIdentity',
     'Invoke-AgentGitHubApi', 'Invoke-AgentGitHubGraphQl', 'ConvertTo-AgentProviderPullRequestStatus', 'ConvertTo-AgentProviderVote',
     'ConvertTo-AgentProviderSnapshot', 'ConvertTo-AgentProviderThreadStatus', 'Get-AgentProviderPullRequestSnapshot',
     'Get-AgentProviderActivePullRequestIds', 'Get-AgentProviderCommitDateUtc', 'Get-AgentProviderPullRequestThreads',

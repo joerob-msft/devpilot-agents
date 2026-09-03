@@ -22,6 +22,14 @@ param(
     [string]$StateDir,
 
     [Parameter(ParameterSetName = 'Launch')]
+    [ValidateNotNullOrEmpty()]
+    [string]$DurableStateRoot,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [ValidateNotNullOrEmpty()]
+    [string]$LeaseRoot,
+
+    [Parameter(ParameterSetName = 'Launch')]
     [ValidateRange(0, 2147483647)]
     [int]$PullRequestId = 0,
 
@@ -33,6 +41,12 @@ param(
 
     [Parameter(ParameterSetName = 'Launch')]
     [switch]$EnableTeamsNotifications,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableManualDispatch,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableManualWrites,
 
     [Parameter(ParameterSetName = 'Launch')]
     [ValidateRange(30, 86400)]
@@ -53,15 +67,23 @@ param(
     [switch]$IncludeOwnPullRequests
 )
 
+if ($PSBoundParameters.ContainsKey('PullRequestId') -and $PullRequestId -le 0) {
+    throw 'PullRequestId must be greater than zero when explicitly provided.'
+}
+
 $parameters = @{}
 if ($AttachOnly) { $parameters.AttachOnly = $true }
 else { $parameters.Agent = 'Reviewer' }
 if ($StateDir) { $parameters.StateDir = $StateDir }
+if ($DurableStateRoot) { $parameters.DurableStateRoot = $DurableStateRoot }
+if ($LeaseRoot) { $parameters.LeaseRoot = $LeaseRoot }
 if ($ConfigFile) { $parameters.ReviewerConfigFile = $ConfigFile }
-if ($PullRequestId -gt 0) { $parameters.ReviewerPullRequestId = $PullRequestId }
+if ($PSBoundParameters.ContainsKey('PullRequestId')) { $parameters.ReviewerPullRequestId = $PullRequestId }
 if ($Continuous) { $parameters.Continuous = $true }
 if ($Operational) { $parameters.Operational = $true }
 if ($EnableTeamsNotifications) { $parameters.EnableReviewerTeamsNotifications = $true }
+if ($EnableManualDispatch) { $parameters.EnableManualReviewer = $true }
+if ($EnableManualWrites) { $parameters.EnableManualReviewerWrites = $true }
 if ($PSBoundParameters.ContainsKey('IntervalSeconds')) { $parameters.IntervalSeconds = $IntervalSeconds }
 if ($OperatorAlias) { $parameters.OperatorAlias = $OperatorAlias }
 if ($AgentName) { $parameters.ReviewerAgentName = $AgentName }

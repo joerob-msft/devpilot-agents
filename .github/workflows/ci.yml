@@ -7,6 +7,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   hygiene:
     name: Generic-toolkit invariant
@@ -66,7 +69,7 @@ jobs:
 
       - name: Install Pester
         shell: pwsh
-        run: Install-Module Pester -MinimumVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+        run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
 
       - name: Run targeted tests
         shell: pwsh
@@ -103,6 +106,10 @@ jobs:
         shell: pwsh
         run: npm run test:renderer
 
+      - name: Run ConPTY live integration test
+        shell: pwsh
+        run: npm run test:pty
+
   selfcheck:
     name: Agent self-checks (-DryRun)
     runs-on: windows-latest
@@ -127,3 +134,60 @@ jobs:
       - name: provider self-checks
         shell: pwsh
         run: ./tools/Test-Provider.ps1
+
+  platform-safety:
+    name: Platform safety (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+
+      - name: Run platform-sensitive suites
+        shell: pwsh
+        run: |
+          $result = Invoke-Pester -Path @(
+            './tests/DispatchProtocol.Tests.ps1',
+            './tests/DurableState.Tests.ps1',
+            './tests/DurableStateMigration.Tests.ps1',
+            './tests/Invoke-TimedProcess.Tests.ps1',
+            './tests/ManualRedispatch.Tests.ps1',
+            './tests/ReviewHandler.Resume.Tests.ps1',
+            './tests/ReviewerOutput.Tests.ps1'
+          ) -Output Detailed -PassThru
+          if ($result.FailedCount -gt 0) {
+            throw "Platform Pester failures: $($result.FailedCount)"
+          }
+
+  dashboard-dispatch:
+    name: Dashboard dispatch groundwork (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: src/DevPilot.Dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: src/DevPilot.Dashboard/package-lock.json
+
+      - name: Restore and test dashboard
+        shell: pwsh
+        run: |
+          npm ci
+          npm test
+          $bun = './node_modules/bun/bin/bun.exe'
+          & $bun --conditions=browser test ./dist/test/dispatch.test.js

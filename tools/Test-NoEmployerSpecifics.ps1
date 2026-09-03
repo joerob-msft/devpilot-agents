@@ -14,6 +14,7 @@
     Exempt by design:
       samples/  - sample configs exist precisely to show filled-in real values
       tools/    - this checker necessarily contains the patterns it looks for
+      node_modules/ - installed third-party dependencies are not toolkit code
       .git/
 
 .EXAMPLE
@@ -22,7 +23,7 @@
 [CmdletBinding()]
 param(
     [string]$RepoRoot = (Split-Path $PSScriptRoot -Parent),
-    [string[]]$ExcludePaths = @('samples', 'tools', '.git')
+    [string[]]$ExcludePaths = @('samples', 'tools', 'node_modules', '.git')
 )
 
 $ErrorActionPreference = 'Stop'

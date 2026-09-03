@@ -1,5 +1,10 @@
 BeforeAll {
-    $handlerPath = "$PSScriptRoot\..\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1"
+    # [Parser]::ParseFile is a raw .NET API, not a PowerShell provider cmdlet,
+    # so it never normalizes a literal backslash-joined string the way
+    # Resolve-Path/Get-Content do; on Unix it would look for a single file
+    # literally named "..\src\Agents\...\Start-ReviewHandlerAgent.ps1" and
+    # fail to find it. Resolve to an OS-native absolute path first.
+    $handlerPath = (Resolve-Path "$PSScriptRoot\..\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1").Path
     $tokens = $null
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile(
