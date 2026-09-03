@@ -267,12 +267,22 @@ function Assert-OwnerPreviewNoWriteArgument {
 function New-OwnerPreviewEvidenceRequest {
     <#
         The typed cohort-entry evidence request, to
-        reviewer.cohort-entry-evidence-request.v1.json.
+        reviewer.cohort-entry-evidence-request.v3.json.
 
-        No executionPlan is emitted, and that is the load-bearing detail. The v2
-        request grows a plan carrying exactly two generalist slots; without one,
-        the builder emits the v1 preparation-only request with no slots section
-        at all. No slots means no generalist, which means this preview costs one
+        v3 is authored rather than v1 because v3 is the first version in which a
+        rule section states the repository its text lives in. This capability's
+        rule lives in an engineering-guidance repository that is NOT the
+        repository the reviewed pull request is in, and under v1/v2 the builder
+        had nothing to issue that read against except the subject repository -
+        so the read was refused by the provider and reported as a generic
+        envelope failure. v3 also carries the ATX heading the pin describes, so
+        the pinned digest of a cut section is compared against that cut rather
+        than against the whole document.
+
+        No executionPlan is emitted, and that is the load-bearing detail. A
+        request MAY grow a plan carrying exactly two generalist slots; without
+        one, the builder emits a preparation-only entry with no slots section at
+        all. No slots means no generalist, which means this preview costs one
         specialist model start rather than three model runs whose verdict it
         would then have to discard.
 
@@ -340,16 +350,30 @@ function New-OwnerPreviewEvidenceRequest {
 
     $sections = [System.Collections.Generic.List[object]]::new()
     foreach ($section in @($RuleSections)) {
+        # Every field is carried. The v3 request contract requires the rule's own
+        # repository triple and the heading its pin describes, and this is the
+        # last layer that still has them: a projection that dropped them here
+        # produced a request the builder could only resolve by defaulting to the
+        # subject repository, which is the defect v3 exists to remove.
+        foreach ($field in @('organization', 'project', 'repositoryId', 'path', 'commit', 'section', 'sha256', 'byteLength')) {
+            if ($null -eq $section.PSObject.Properties[$field] -or $null -eq $section.PSObject.Properties[$field].Value) {
+                throw "A rule section is missing '$field'; a v3 evidence request binds every section to its own repository and heading."
+            }
+        }
         [void]$sections.Add([ordered]@{
-                path       = [string]$section.path
-                commit     = [string]$section.commit
-                sha256     = [string]$section.sha256
-                byteLength = [int]$section.byteLength
+                organization = [string]$section.organization
+                project      = [string]$section.project
+                repositoryId = [string]$section.repositoryId
+                path         = [string]$section.path
+                commit       = [string]$section.commit
+                section      = [string]$section.section
+                sha256       = [string]$section.sha256
+                byteLength   = [int]$section.byteLength
             })
     }
 
     return [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 3
         kind          = 'reviewer-cohort-entry-evidence-request'
         correlationId = $CorrelationId
         toolkit       = [ordered]@{
@@ -649,10 +673,17 @@ function Get-OwnerPreviewHeadKey {
     $ordered = @($RuleSections) | Sort-Object -Property @{ Expression = { [string]$_.path } },
     @{ Expression = { [string]$_.sha256 } }
     foreach ($section in $ordered) {
+        # repositoryId and section are bound here for the same reason path and
+        # commit are: a rule read from a different repository, or a pin taken
+        # over a different heading of the same document, is a different rule and
+        # therefore a different preview. Leaving them out would let two
+        # materially different previews collide on one key.
         [void]$sections.Add([ordered]@{
-                path   = [string]$section.path
-                commit = ([string]$section.commit).ToLowerInvariant()
-                sha256 = ([string]$section.sha256).ToLowerInvariant()
+                repositoryId = ([string]$section.repositoryId).ToLowerInvariant()
+                path         = [string]$section.path
+                commit       = ([string]$section.commit).ToLowerInvariant()
+                section      = [string]$section.section
+                sha256       = ([string]$section.sha256).ToLowerInvariant()
             })
     }
     $material = [ordered]@{

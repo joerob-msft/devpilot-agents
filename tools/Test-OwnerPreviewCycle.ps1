@@ -58,13 +58,21 @@ $testRoot = New-OwnerPreviewTestRoot
 try {
     $schemaDir = Join-Path $RepoRoot 'src/Agents/reviewer/schemas'
     $acquisitionDir = Join-Path $RepoRoot 'src/Agents/reviewer/acquisition/v1'
+    # The rule lives in a DIFFERENT repository from the subject on purpose: that
+    # is the case v3 exists for, and a fixture that used the subject's own
+    # repository would pass just as well against the defaulting behaviour v3
+    # replaced.
+    $ruleRepositoryId = '99999999-8888-7777-6666-555555555555'
     $ruleSections = @(
         [pscustomobject][ordered]@{
-            path       = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
-            commit     = ('b' * 40)
-            sha256     = 'bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f'
-            byteLength = 569
-            section    = '## Claim ownership'
+            organization = 'contoso'
+            project      = 'Widgets'
+            repositoryId = $ruleRepositoryId
+            path         = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
+            commit       = ('b' * 40)
+            section      = '## Claim ownership'
+            sha256       = 'bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f'
+            byteLength   = 569
         })
 
     # -----------------------------------------------------------------------
@@ -80,11 +88,19 @@ try {
         -RuleSections $ruleSections -CaptureMode 'live' -AgencyPath 'copilot' `
         -OutputRoot 'C:\state\entry' -EntryId 'owner-4242' -SealKeyPath 'C:\state\seal.key'
     $evidenceJson = ConvertTo-AgentReplayCanonicalJson -Value $evidenceRequest
-    $evidenceSchema = Get-Content -LiteralPath (Join-Path $schemaDir 'reviewer.cohort-entry-evidence-request.v1.json') -Raw
+    $evidenceSchema = Get-Content -LiteralPath (Join-Path $schemaDir 'reviewer.cohort-entry-evidence-request.v3.json') -Raw
     $evidenceValid = $false
     try { $evidenceValid = Test-Json -Json $evidenceJson -Schema $evidenceSchema } catch { $evidenceValid = $false }
     Assert-OwnerPreview -Condition $evidenceValid `
-        -Message "The authored evidence request does not satisfy reviewer.cohort-entry-evidence-request.v1.json."
+        -Message "The authored evidence request does not satisfy reviewer.cohort-entry-evidence-request.v3.json."
+    Assert-OwnerPreview -Condition ([int]$evidenceRequest.schemaVersion -eq 3) `
+        -Message "The Owner preview must author a v3 request; below v3 a rule section carries no repository to be read from."
+    Assert-OwnerPreview -Condition (
+        [string]@($evidenceRequest.ruleBundle.sections)[0].repositoryId -ceq $ruleRepositoryId -and
+        [string]@($evidenceRequest.ruleBundle.sections)[0].repositoryId -cne [string]$evidenceRequest.subject.repositoryId) `
+        -Message "The authored rule section does not carry its own repository; the read would fall back to the subject's."
+    Assert-OwnerPreview -Condition ([string]@($evidenceRequest.ruleBundle.sections)[0].section -ceq '## Claim ownership') `
+        -Message "The authored rule section does not carry the heading its pin describes."
 
     # The load-bearing absence. An execution plan would carry exactly two
     # generalist slots, and this preview is specialist-only.
@@ -249,11 +265,35 @@ try {
     $reRuled = @{}
     foreach ($pair in $baseArguments.GetEnumerator()) { $reRuled[$pair.Key] = $pair.Value }
     $reRuled['RuleSections'] = @([pscustomobject][ordered]@{
+            organization = 'contoso'; project = 'Widgets'; repositoryId = $ruleRepositoryId
             path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
-            commit = ('9' * 40); sha256 = ('5' * 64); byteLength = 569
+            commit = ('9' * 40); section = '## Claim ownership'; sha256 = ('5' * 64); byteLength = 569
         })
     Assert-OwnerPreview -Condition ((Get-OwnerPreviewHeadKey @reRuled) -cne $headKey) `
         -Message "A re-pinned rule produced the same head key; verdicts measured against different bytes are different evidence."
+
+    # A rule read from another repository, or a pin taken over another heading of
+    # the same document, is a different rule and therefore a different preview.
+    # Without these the head key would collide across materially different runs.
+    $ruleRebindings = @(
+        @{ Name = 'rule repository'; Property = 'repositoryId'; Value = '12121212-3434-5656-7878-909090909090' },
+        @{ Name = 'rule heading'; Property = 'section'; Value = '## Claim ownership of tests' }
+    )
+    foreach ($rebinding in $ruleRebindings) {
+        $rebound = @{}
+        foreach ($pair in $baseArguments.GetEnumerator()) { $rebound[$pair.Key] = $pair.Value }
+        $section = [ordered]@{
+            organization = 'contoso'; project = 'Widgets'; repositoryId = $ruleRepositoryId
+            path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
+            commit = ('b' * 40); section = '## Claim ownership'
+            sha256 = 'bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f'
+            byteLength = 569
+        }
+        $section[[string]$rebinding.Property] = [string]$rebinding.Value
+        $rebound['RuleSections'] = @([pscustomobject]$section)
+        Assert-OwnerPreview -Condition ((Get-OwnerPreviewHeadKey @rebound) -cne $headKey) `
+            -Message "A changed $($rebinding.Name) produced the same head key; two different rules would share one answer."
+    }
 
     # -----------------------------------------------------------------------
     # The nine-declaration case, taken from the recorded corpus itself.

@@ -23,8 +23,9 @@
 
 .PARAMETER RequestPath
     The versioned operator request, validated against
-    src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.v1.json, or
-    ...-request.v2.json when it carries an executionPlan.
+    src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.v1.json,
+    ...-request.v2.json when it carries an executionPlan, or ...-request.v3.json
+    when each rule section carries an explicit source binding and ATX heading.
 
 .PARAMETER Preflight
     Additionally drive the typed coordinator over the published request, proving

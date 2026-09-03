@@ -364,6 +364,25 @@ function Remove-CohortEntryCreatedRef {
     $script:CohortEntryCreatedRefs = @($remaining)
 }
 
+function Set-CohortEntryV3RuleState {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$State)
+
+    $eAcute = [char]0x00E9
+    $lambda = [char]0x03BB
+    $State.SchemaVersion = 3
+    $State.RuleRepositoryId = '99999999-8888-7777-6666-555555555555'
+    $State.RuleSection = "## Claim ownership - caf$eAcute"
+    $State.RuleText = (
+        "# Engineering guidance`r`n`r`n" +
+        "Whole-file preface with $lambda.`r`n`r`n" +
+        "$($State.RuleSection)`r`n`r`n" +
+        "Owner Ren$eAcute reviews this rule.`r`n`r`n" +
+        "### Examples`r`n`r`n" +
+        "Preserve CRLF and UTF-8 bytes in the corpus.`r`n`r`n" +
+        "## Unrelated rule`r`n`r`n" +
+        "This text is outside the pinned section.`r`n")
+}
+
 function New-CohortEntryFixture {
     <#
     .SYNOPSIS
@@ -477,6 +496,11 @@ function New-CohortEntryFixture {
         }
         BaselineTexts = [ordered]@{ '/src/a.ps1' = "function A { 'left hand' }`n" }
         RuleText = "# Review rules`n`nOne pinned section.`n"
+        RuleOrganization = $organization
+        RuleProject = $project
+        RuleRepositoryId = $repositoryId
+        RuleSection = '## Review rules'
+        RuleReadRepositoryOverride = ''
         RealToolkitRoot = $RealToolkitRoot
         RuleServedText = ''
         RuleResourceUri = ''
@@ -523,6 +547,7 @@ function New-CohortEntryFixture {
         ConfigSpecialistModel = ''
         ConfigVerifierModel = ''
         MutateExecutionPlan = $null
+        MutateRequest = $null
         ExecutionPlanIsNull = $false
         PlannedRunCount = 2
         # The four attempt factors the fixture runner declares, and from which
@@ -720,7 +745,13 @@ function New-CohortEntryFixture {
     Write-CohortEntryJsonFile -Path $configPath -Value $configValue
 
     $rulePath = '/docs/rules/review.md'
-    $ruleBytes = $script:Utf8.GetBytes($state.RuleText)
+    $pinnedRuleText = [string]$state.RuleText
+    if ([int]$state.SchemaVersion -ge 3) {
+        $cut = Get-ReviewerMarkdownSection -Text ([string]$state.RuleText) -Heading ([string]$state.RuleSection)
+        if (-not $cut.Found) { throw "The v3 fixture rule text does not contain '$($state.RuleSection)'." }
+        $pinnedRuleText = [string]$cut.Text
+    }
+    $ruleBytes = $script:Utf8.GetBytes($pinnedRuleText)
     $declarationPath = Join-Path $Sandbox 'rule-bundle.json'
     Write-CohortEntryJsonFile -Path $declarationPath -Value ([ordered]@{
             sourceKind = 'pinnedRepositorySections'
@@ -807,9 +838,14 @@ function New-CohortEntryFixture {
     }
     $ruleUri = if ($state.RuleResourceUri) { [string]$state.RuleResourceUri } else { (& $uriFor $rulePath) }
     $ruleServed = if ($state.RuleServedText) { [string]$state.RuleServedText } else { [string]$state.RuleText }
+    $ruleReadRepositoryId = if ($state.RuleReadRepositoryOverride) {
+        [string]$state.RuleReadRepositoryOverride
+    }
+    elseif ([int]$state.SchemaVersion -ge 3) { [string]$state.RuleRepositoryId }
+    else { [string]$state.RepositoryId }
     [void]$reads.Add(@{
             Tool = 'repo_file'
-            Arguments = [ordered]@{ action = 'get_content'; project = $state.Project; repositoryId = $state.RepositoryId; path = $rulePath; versionType = 'Commit'; version = $state.RuleCommit }
+            Arguments = [ordered]@{ action = 'get_content'; project = $state.Project; repositoryId = $ruleReadRepositoryId; path = $rulePath; versionType = 'Commit'; version = $state.RuleCommit }
             Bytes = (New-CohortEntryResourceEnvelope -Text $ruleServed -Uri $ruleUri -MimeType 'text/plain')
         })
 
@@ -918,6 +954,24 @@ function New-CohortEntryFixture {
         }
         if ($state.MutateExecutionPlan) { & $state.MutateExecutionPlan $executionPlan $state }
     }
+    $ruleRequestSection = [ordered]@{
+        path = $rulePath
+        commit = $state.RuleCommit
+        sha256 = (Get-CohortEntryBytesSha256 -Bytes $ruleBytes)
+        byteLength = $ruleBytes.Length
+    }
+    if ([int]$state.SchemaVersion -ge 3) {
+        $ruleRequestSection = [ordered]@{
+            organization = [string]$state.RuleOrganization
+            project = [string]$state.RuleProject
+            repositoryId = [string]$state.RuleRepositoryId
+            path = $rulePath
+            commit = $state.RuleCommit
+            section = [string]$state.RuleSection
+            sha256 = (Get-CohortEntryBytesSha256 -Bytes $ruleBytes)
+            byteLength = $ruleBytes.Length
+        }
+    }
     $requestBody = [ordered]@{
             schemaVersion = $state.SchemaVersion
             kind = 'reviewer-cohort-entry-evidence-request'
@@ -944,12 +998,7 @@ function New-CohortEntryFixture {
                 sourceKind = 'pinnedRepositorySections'
                 declarationPath = $declarationPath
                 declarationSha256 = $declarationSha
-                sections = @([ordered]@{
-                        path = $rulePath
-                        commit = $state.RuleCommit
-                        sha256 = (Get-CohortEntryBytesSha256 -Bytes $ruleBytes)
-                        byteLength = $ruleBytes.Length
-                    })
+                sections = @($ruleRequestSection)
             }
             capture = [ordered]@{
                 mode = 'replay'
@@ -973,7 +1022,8 @@ function New-CohortEntryFixture {
         }
     if ($state.ExecutionPlanIsNull) { [void]$requestBody.Add('executionPlan', $null) }
     elseif ($null -ne $executionPlan) { [void]$requestBody.Add('executionPlan', $executionPlan) }
-    Write-CohortEntryJsonFile -Path $requestPath -WithBom:$state.RequestWithBom -Value $requestBody
+        if ($state.MutateRequest) { & $state.MutateRequest $requestBody $state }
+        Write-CohortEntryJsonFile -Path $requestPath -WithBom:$state.RequestWithBom -Value $requestBody
 
     return [pscustomobject][ordered]@{
         Sandbox = $Sandbox
@@ -1576,13 +1626,32 @@ Assert-CohortEntry -Name "the shared change page size is written down exactly on
 # reader cannot call into. So it is compared here instead: a schema that admits
 # a cap the reader refuses turns a fixable request into an unexplained failure
 # one layer down.
-foreach ($schemaVersionName in @('v1', 'v2')) {
+foreach ($schemaVersionName in @('v1', 'v2', 'v3')) {
     $capSchema = Get-Content -LiteralPath (Join-Path $repoRoot `
             "src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.$schemaVersionName.json") -Raw |
         ConvertFrom-Json -Depth 32
     Assert-CohortEntry -Name "the $schemaVersionName request schema caps maxChangedFiles at the reviewer's own page" `
         -Condition ([int]$capSchema.properties.coverage.properties.maxChangedFiles.maximum -eq (Get-ReviewerChangeListTop))
 }
+$v2RequestSchema = Get-Content -LiteralPath (Join-Path $repoRoot `
+        'src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.v2.json') -Raw |
+    ConvertFrom-Json -Depth 64
+$v3RequestSchema = Get-Content -LiteralPath (Join-Path $repoRoot `
+        'src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.v3.json') -Raw |
+    ConvertFrom-Json -Depth 64
+$v2RuleSchema = $v2RequestSchema.properties.ruleBundle.properties.sections.items
+$v3RuleSchema = $v3RequestSchema.properties.ruleBundle.properties.sections.items
+Assert-CohortEntry -Name 'the v2 rule-section schema remains the original four-field contract' `
+    -Condition (
+        ((@($v2RuleSchema.required) | Sort-Object -CaseSensitive) -join ',') -ceq
+        ((@('byteLength', 'commit', 'path', 'sha256') | Sort-Object -CaseSensitive) -join ',') -and
+        -not $v2RuleSchema.properties.PSObject.Properties['repositoryId'] -and
+        -not $v2RuleSchema.properties.PSObject.Properties['section'])
+Assert-CohortEntry -Name 'the v3 rule-section schema requires its explicit source binding and heading' `
+    -Condition (
+        ((@($v3RuleSchema.required) | Sort-Object -CaseSensitive) -join ',') -ceq
+        ((@('organization', 'project', 'repositoryId', 'path', 'commit', 'section', 'sha256', 'byteLength') |
+                Sort-Object -CaseSensitive) -join ','))
 # and the two change ceilings are two failures with opposite answers, exactly as
 # the thread pair is: CE402 says the operator authorized fewer files than this
 # subject has, CE409 says nobody can tell how many it has.
@@ -2622,6 +2691,70 @@ Invoke-CohortEntryCase -Name 'a rule section that drifted from its pin' -Expecte
     param($state) $state.RuleServedText = $state.RuleText + "an unpinned extra line`n"
 }
 
+Invoke-CohortEntryCase -Name 'a v3 rule binding whose repository response is recorded under another request key' `
+    -ExpectedCode 'CE307' -Mutate {
+    param($state)
+    Set-CohortEntryV3RuleState -State $state
+    $state.RuleReadRepositoryOverride = $state.RuleRepositoryId
+    $state.RuleRepositoryId = $state.RepositoryId
+}
+
+Invoke-CohortEntryCase -Name 'a v3 rule section missing its repository binding' -ExpectedCode 'CE104' -Mutate {
+    param($state)
+    Set-CohortEntryV3RuleState -State $state
+    $state.MutateRequest = {
+        param($request) $request.ruleBundle.sections[0].Remove('repositoryId')
+    }
+}
+
+Invoke-CohortEntryCase -Name 'a v3 rule section with a non-GUID repository binding' -ExpectedCode 'CE106' -Mutate {
+    param($state)
+    Set-CohortEntryV3RuleState -State $state
+    $state.MutateRequest = {
+        param($request) $request.ruleBundle.sections[0].repositoryId = 'engineering-guidance'
+    }
+}
+
+Invoke-CohortEntryCase -Name 'a v3 rule section crossing organizations' -ExpectedCode 'CE114' -Mutate {
+    param($state)
+    Set-CohortEntryV3RuleState -State $state
+    $state.MutateRequest = {
+        param($request) $request.ruleBundle.sections[0].organization = 'another-account'
+    }
+}
+
+Invoke-CohortEntryCase -Name 'a v3 rule section crossing projects' -ExpectedCode 'CE114' -Mutate {
+    param($state)
+    Set-CohortEntryV3RuleState -State $state
+    $state.MutateRequest = {
+        param($request) $request.ruleBundle.sections[0].project = 'another-project'
+    }
+}
+
+Invoke-CohortEntryCase -Name 'a duplicate v3 rule-section binding' -ExpectedCode 'CE110' -Mutate {
+    param($state)
+    Set-CohortEntryV3RuleState -State $state
+    $state.MutateRequest = {
+        param($request)
+        $section = $request.ruleBundle.sections[0]
+        $request.ruleBundle.sections = @($section, $section)
+    }
+}
+
+Invoke-CohortEntryCase -Name 'an ambiguous v3 ATX rule heading' -ExpectedCode 'CE310' -Mutate {
+    param($state)
+    Set-CohortEntryV3RuleState -State $state
+    $state.RuleServedText = (
+        $state.RuleText + "`r`n" + $state.RuleSection + "`r`n`r`n" +
+        "A second section with the same exact heading.`r`n")
+}
+
+Invoke-CohortEntryCase -Name 'a tampered Unicode v3 rule section' -ExpectedCode 'CE310' -Mutate {
+    param($state)
+    Set-CohortEntryV3RuleState -State $state
+    $state.RuleServedText = $state.RuleText.Replace(([string][char]0x00E9), 'e')
+}
+
 Invoke-CohortEntryCase -Name 'a configuration validating another target branch' -ExpectedCode 'CE211' -Mutate {
     param($state) $state.ConfigTargetRefName = 'refs/heads/release/8.0'
 }
@@ -2872,14 +3005,95 @@ finally { Remove-CohortEntrySandbox -Path $v1Sandbox }
 # -- v2 without a plan is v1 -------------------------------------------------
 $v2BareSandbox = New-CohortEntrySandbox -Name 'v2-bare'
 try {
-    $v2BareFixture = New-CohortEntryFixture -Sandbox $v2BareSandbox -Mutate { param($s) $s.SchemaVersion = 2 }
+    $v2BareFixture = New-CohortEntryFixture -Sandbox $v2BareSandbox -Mutate {
+        param($s)
+        $s.SchemaVersion = 2
+        # v2 has no rule-source binding. Even if fixture state knows another
+        # repository, neither the request nor its replay read may reinterpret it.
+        $s.RuleRepositoryId = '99999999-8888-7777-6666-555555555555'
+    }
+    $v2BareParsed = Read-ReviewerCohortEntryRequest -Path $v2BareFixture.RequestPath
     $v2BareResult = New-ReviewerCohortEntryEvidence -RequestPath $v2BareFixture.RequestPath -PreparationOnly
     $v2BareRequest = [IO.File]::ReadAllText((Join-Path $v2BareResult.Root 'entry/coordinator-request.json')) | ConvertFrom-Json -Depth 32
     Assert-CohortEntry -Name 'a v2 request without a plan emits no slots section' `
         -Condition (-not $v2BareRequest.PSObject.Properties['slots'])
     Assert-CohortEntry -Name 'a v2 request without a plan reports schema version 2' -Condition ($v2BareResult.SchemaVersion -eq 2)
+    Assert-CohortEntry -Name 'a v2 rule read keeps its historical subject-repository binding' `
+        -Condition (
+            [string]@($v2BareParsed.RuleSections)[0].RepositoryId -ceq [string]$v2BareParsed.RepositoryId -and
+            [string]@($v2BareParsed.RuleSections)[0].Section -ceq '')
 }
 finally { Remove-CohortEntrySandbox -Path $v2BareSandbox }
+
+# -- v3 binds a cross-repository section while sealing the whole file -----------
+$v3Sandbox = New-CohortEntrySandbox -Name 'v3-cross-repo'
+try {
+    $v3Fixture = New-CohortEntryFixture -Sandbox $v3Sandbox -Mutate {
+        param($s) Set-CohortEntryV3RuleState -State $s
+    }
+    $v3Parsed = Read-ReviewerCohortEntryRequest -Path $v3Fixture.RequestPath
+    $v3Result = New-ReviewerCohortEntryEvidence -RequestPath $v3Fixture.RequestPath -PreparationOnly
+    $v3Recipe = [IO.File]::ReadAllText((Join-Path $v3Result.Root 'entry/corpus-seal-recipe.json')) |
+        ConvertFrom-Json -Depth 64
+    $v3RequestBody = [IO.File]::ReadAllText($v3Fixture.RequestPath) | ConvertFrom-Json -Depth 64
+    $v3RuleRequest = @($v3RequestBody.ruleBundle.sections)[0]
+    $v3RuleResource = @($v3Recipe.resources | Where-Object {
+            [string]$_.tool -ceq 'repo_file' -and
+            [string]$_.arguments.path -ceq '/docs/rules/review.md' -and
+            [string]$_.arguments.version -ceq [string]$v3Fixture.State.RuleCommit
+        })[0]
+    $v3RuleReference = @($v3Recipe.evidence.rules)[0]
+    $v3RuleCorpusPath = Join-Path (Join-Path $v3Result.Root 'corpus') `
+        (([string]$v3RuleReference.corpusPath) -replace '/', [IO.Path]::DirectorySeparatorChar)
+    $v3WholeBytes = [IO.File]::ReadAllBytes($v3RuleCorpusPath)
+    $v3ExpectedWholeBytes = $script:Utf8.GetBytes([string]$v3Fixture.State.RuleText)
+    $v3Cut = Get-ReviewerMarkdownSection -Text ([string]$v3Fixture.State.RuleText) `
+        -Heading ([string]$v3Fixture.State.RuleSection)
+    $v3CutBytes = $script:Utf8.GetBytes([string]$v3Cut.Text)
+    $v3ExpectedArguments = [ordered]@{
+        action = 'get_content'
+        project = $v3Fixture.State.Project
+        repositoryId = $v3Fixture.State.RuleRepositoryId
+        path = '/docs/rules/review.md'
+        versionType = 'Commit'
+        version = $v3Fixture.State.RuleCommit
+    }
+    $v3SubjectArguments = [ordered]@{}
+    foreach ($pair in $v3ExpectedArguments.GetEnumerator()) { $v3SubjectArguments[$pair.Key] = $pair.Value }
+    $v3SubjectArguments.repositoryId = $v3Fixture.State.RepositoryId
+    $v3ExpectedKey = (Get-AgentReplayRequestKey -Name 'repo_file' -Arguments $v3ExpectedArguments).Key
+    $v3SubjectKey = (Get-AgentReplayRequestKey -Name 'repo_file' -Arguments $v3SubjectArguments).Key
+    $v3RecipeKeys = [string[]]@($v3Recipe.resources | ForEach-Object {
+            (Get-AgentReplayRequestKey -Name ([string]$_.tool) -Arguments $_.arguments).Key
+        })
+
+    Assert-CohortEntry -Name 'a v3 cross-repository rule fixture builds successfully' `
+        -Condition ($v3Result.SchemaVersion -eq 3)
+    Assert-CohortEntry -Name 'a v3 rule section retains its explicit repository and heading' `
+        -Condition (
+            [string]@($v3Parsed.RuleSections)[0].RepositoryId -ceq [string]$v3Fixture.State.RuleRepositoryId -and
+            [string]@($v3Parsed.RuleSections)[0].RepositoryId -cne [string]$v3Parsed.RepositoryId -and
+            [string]@($v3Parsed.RuleSections)[0].Section -ceq [string]$v3Fixture.State.RuleSection)
+    Assert-CohortEntry -Name 'the v3 rule read is issued against the authoritative repository' `
+        -Condition ([string]$v3RuleResource.arguments.repositoryId -ceq [string]$v3Fixture.State.RuleRepositoryId)
+    Assert-CohortEntry -Name 'the v3 corpus answers the authoritative rule request key, not the subject key' `
+        -Condition ($v3RecipeKeys -ccontains $v3ExpectedKey -and $v3RecipeKeys -cnotcontains $v3SubjectKey)
+    Assert-CohortEntry -Name 'the v3 corpus preserves the exact whole-file UTF-8 and CRLF bytes' `
+        -Condition (
+            [Convert]::ToHexString($v3WholeBytes) -ceq [Convert]::ToHexString($v3ExpectedWholeBytes) -and
+            [string]$v3Fixture.State.RuleText -cmatch "`r`n" -and
+            $v3WholeBytes.Length -gt $v3CutBytes.Length)
+    Assert-CohortEntry -Name 'the v3 section pin is the shared extractor cut with UTF-8 byte accounting' `
+        -Condition (
+            [string]$v3RuleRequest.sha256 -ceq (Get-CohortEntryBytesSha256 -Bytes $v3CutBytes) -and
+            [int]$v3RuleRequest.byteLength -eq $v3CutBytes.Length -and
+            $v3CutBytes.Length -gt ([string]$v3Cut.Text).Length)
+    Assert-CohortEntry -Name 'the v3 sealed rule reference binds the whole provider file, not the cut' `
+        -Condition (
+            [string]$v3RuleReference.sha256 -ceq (Get-CohortEntryBytesSha256 -Bytes $v3ExpectedWholeBytes) -and
+            [int]$v3RuleReference.byteLength -eq $v3ExpectedWholeBytes.Length)
+}
+finally { Remove-CohortEntrySandbox -Path $v3Sandbox }
 
 # -- v2 with a plan: the whole declaration, in the hashed region -------------
 $v2Sandbox = New-CohortEntrySandbox -Name 'v2-plan'

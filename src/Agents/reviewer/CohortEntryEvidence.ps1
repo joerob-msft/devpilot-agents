@@ -90,6 +90,7 @@ $script:ReviewerCohortEntryErrorCatalog = [ordered]@{
     CE111 = 'A declared path escapes its own root or is not a plain relative path.'
     CE112 = 'The rule bundle declaration does not match its declared digest.'
     CE113 = 'The request caps threads above the page the reviewer''s own thread read asks for.'
+    CE114 = 'A rule section names an organization or project that is not the subject''s.'
     CE200 = 'The toolkit head does not match the repository the request names.'
     CE201 = 'The required ref does not resolve to the pinned toolkit head.'
     CE202 = 'The authoritative repository identity is not the reduced wrapper-contract shape.'
@@ -803,14 +804,24 @@ function Read-ReviewerCohortEntryRequest {
         'schemaVersion', 'kind', 'correlationId', 'toolkit', 'subject',
         'reviewer', 'ruleBundle', 'capture', 'coverage', 'output') -Optional @('executionPlan')
 
-    # Two versions are loadable, and they differ by exactly one section. A v1
+    # Three versions are loadable. v1 and v2 differ by exactly one section: a v1
     # request can never grow slots - not by adding the section, not by any
-    # argument - so every request written before this slice keeps producing the
+    # argument - so every request written before that slice keeps producing the
     # identical preparation-only entry it produced then. A v2 request WITHOUT the
     # section produces that same entry too; the version is the operator's
     # statement of what they are authorizing, and the section is what they
     # authorized.
-    $schemaVersion = Get-ReviewerCohortEntryInt -Object $root -Name 'schemaVersion' -Where 'request' -Minimum 1 -Maximum 2
+    #
+    # v3 differs from v2 by exactly one thing, inside ruleBundle.sections: the
+    # repository a rule's text lives in, and the ATX heading its pin describes,
+    # are both REQUIRED and explicit. Through v2 neither existed, so the rule
+    # read had nothing to be issued against except the subject repository and
+    # the pin of a cut section was compared against a whole file. Both of those
+    # are silent defaults, and the way to remove a silent default without
+    # invalidating every request written under it is a new version: v1 and v2
+    # keep parsing and replaying byte-for-byte as they did, and only a v3
+    # request is held to the explicit binding.
+    $schemaVersion = Get-ReviewerCohortEntryInt -Object $root -Name 'schemaVersion' -Where 'request' -Minimum 1 -Maximum 3
     $executionPlanProperty = $root.PSObject.Properties['executionPlan']
     $hasExecutionPlan = $null -ne $executionPlanProperty
     # An explicit null is a present property with no plan in it. Left to the
@@ -871,18 +882,66 @@ function Read-ReviewerCohortEntryRequest {
     if ($sections.Count -lt 1 -or $sections.Count -gt 64) {
         New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail "The request ruleBundle declares $($sections.Count) section(s)."
     }
+    # The rule-source binding is the ONE thing v3 adds, and it is added here
+    # rather than at the read because a default chosen at the read is invisible
+    # to the operator who wrote the request and to the digest that covers it.
+    #
+    # Below v3 there is no binding to read, so the subject repository is used -
+    # which is exactly what those versions have always done, restated rather
+    # than left implicit. It is recorded on the section either way, so the read
+    # site has one shape to issue and no version to remember.
     $sectionList = [System.Collections.Generic.List[object]]::new()
     $seenSections = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $sectionRequiredKeys = if ($schemaVersion -ge 3) {
+        @('organization', 'project', 'repositoryId', 'path', 'commit', 'section', 'sha256', 'byteLength')
+    }
+    else { @('path', 'commit', 'sha256', 'byteLength') }
     foreach ($section in $sections) {
-        Assert-ReviewerCohortEntryExactKeys -Object $section -Where 'request ruleBundle section' -Required @('path', 'commit', 'sha256', 'byteLength')
+        Assert-ReviewerCohortEntryExactKeys -Object $section -Where 'request ruleBundle section' -Required $sectionRequiredKeys
         $sectionPath = Get-ReviewerCohortEntryString -Object $section -Name 'path' -Where 'request ruleBundle section'
         Assert-ReviewerCohortEntryRepositoryRelativePath -Path $sectionPath -Where 'request ruleBundle section'
-        if (-not $seenSections.Add($sectionPath)) {
+        $sectionRepositoryId = $repositoryId
+        $sectionHeading = ''
+        if ($schemaVersion -ge 3) {
+            $sectionOrganization = Get-ReviewerCohortEntryString -Object $section -Name 'organization' `
+                -Where 'request ruleBundle section' -Pattern '^[^/\s]+$' -MaxLength 128
+            $sectionProject = Get-ReviewerCohortEntryString -Object $section -Name 'project' `
+                -Where 'request ruleBundle section' -Pattern '^[^/\s]+$' -MaxLength 128
+            # A rule read is a read-only fetch inside the account the subject
+            # lives in. A section naming another organization or project would
+            # make this build reach somewhere the operator authorized a pull
+            # request in, but not a fetch from - so it is refused rather than
+            # attempted. The REPOSITORY is deliberately not constrained this
+            # way: differing from the subject is the entire purpose of the field.
+            if ($sectionOrganization -cne $organization) {
+                New-ReviewerCohortEntryRefusal -Code 'CE114' `
+                    -Detail ("The rule section '$sectionPath' names organization '$sectionOrganization' and the subject " +
+                        "is in '$organization'; a rule is read from the subject's own account.")
+            }
+            if ($sectionProject -cne $project) {
+                New-ReviewerCohortEntryRefusal -Code 'CE114' `
+                    -Detail ("The rule section '$sectionPath' names project '$sectionProject' and the subject " +
+                        "is in '$project'; a rule is read from the subject's own project.")
+            }
+            $sectionRepositoryId = Get-ReviewerCohortEntryString -Object $section -Name 'repositoryId' `
+                -Where 'request ruleBundle section' `
+                -Pattern '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' -MaxLength 36
+            $sectionHeading = Get-ReviewerCohortEntryString -Object $section -Name 'section' `
+                -Where 'request ruleBundle section' -Pattern '^#{1,6} [^\x00-\x1f\x7f]{1,240}$' -MaxLength 242
+        }
+        # Keyed by repository AND path. Below v3 every section resolves to the
+        # subject repository, so this is the same duplicate test those versions
+        # always applied; at v3 one path in two repositories is two rules.
+        if (-not $seenSections.Add("$sectionRepositoryId`n$sectionPath")) {
             New-ReviewerCohortEntryRefusal -Code 'CE110' -Detail "The rule bundle declares '$sectionPath' twice."
         }
         [void]$sectionList.Add([pscustomobject][ordered]@{
+                Organization = $organization
+                Project = $project
+                RepositoryId = $sectionRepositoryId
                 Path = $sectionPath
                 Commit = (Get-ReviewerCohortEntryString -Object $section -Name 'commit' -Where 'request ruleBundle section' -Pattern '^[0-9a-f]{40}$' -MaxLength 40)
+                Section = $sectionHeading
                 Sha256 = (Get-ReviewerCohortEntryString -Object $section -Name 'sha256' -Where 'request ruleBundle section' -Pattern '^[0-9a-f]{64}$' -MaxLength 64)
                 ByteLength = (Get-ReviewerCohortEntryInt -Object $section -Name 'byteLength' -Where 'request ruleBundle section' -Minimum 1 -Maximum 1048576)
             })
@@ -1188,10 +1247,24 @@ function Get-ReviewerCohortEntryFileRead {
     .SYNOPSIS
         One planned repo_file read, in the exact argument vector and embedded-
         resource envelope the reviewer's own source read uses.
+
+    .DESCRIPTION
+        -RepositoryId is MANDATORY and has no default, deliberately. It used to
+        be taken from the request's subject, which is right for a changed file
+        and for its baseline and wrong for a rule: rule text routinely lives in
+        an engineering-guidance repository that is not the repository the pull
+        request is in, so every rule read was issued against the subject
+        repository, answered with a provider error, and reported as a generic
+        envelope refusal (CE302) that named neither the repository nor the
+        reason. A default here cannot be seen at the call site, which is
+        precisely where the mistake was invisible; requiring the caller to name
+        the repository makes the two kinds of read look different in the source,
+        because they ARE different.
     #>
     param(
         [Parameter(Mandatory)]$Request,
         [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$RepositoryId,
         [Parameter(Mandatory)][string]$ProviderPath,
         [Parameter(Mandatory)][string]$Commit,
         [Parameter(Mandatory)][string]$Role,
@@ -1199,11 +1272,15 @@ function Get-ReviewerCohortEntryFileRead {
         [string]$MimeType = 'text/plain'
     )
     Assert-ReviewerCohortEntryRepositoryRelativePath -Path $ProviderPath -Where "planned $Role read"
+    if ($RepositoryId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        New-ReviewerCohortEntryRefusal -Code 'CE106' `
+            -Detail "The planned $Role read '$Id' names repository '$RepositoryId', which is not a repository GUID."
+    }
     return (New-ReviewerCohortEntryRead -Id $Id -Tool 'repo_file' -Role $Role `
             -Arguments ([ordered]@{
                 action = 'get_content'
                 project = $Request.Project
-                repositoryId = $Request.RepositoryId
+                repositoryId = $RepositoryId
                 path = $ProviderPath
                 versionType = 'Commit'
                 version = $Commit

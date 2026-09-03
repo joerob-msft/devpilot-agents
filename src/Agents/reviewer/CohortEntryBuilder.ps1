@@ -181,18 +181,62 @@ function Assert-ReviewerCohortEntryRuleSection {
         defend on its own. A section that drifted by one byte from its pin is a
         different rule set, and a cohort that ran half its entries against one
         rule set and half against another is not a cohort.
+
+        WHAT IS COMPARED IS THE CUT, NOT THE FILE. A v3 section names the exact
+        ATX heading its pin describes, and a convention pack pins the DELIVERED
+        SECTION - a few hundred bytes - while repo_file answers with the WHOLE
+        engineering-guidance document, routinely tens of kilobytes. Comparing
+        the pin against the file therefore failed every real pinned section on
+        both digest and length, and the two numbers in the refusal looked like
+        rule drift rather than like the wrong thing being measured.
+
+        The cut is taken with the reviewer's own extractor, so the bytes checked
+        here are the bytes the reviewer would deliver, and a heading that is
+        absent or that appears more than once is a refusal rather than a
+        plausible-looking wrong rule.
+
+        The CAPTURED record is left alone. The corpus keeps the whole file the
+        provider actually returned, with its own digest and its own request key,
+        so provenance still describes a real response and a replay still answers
+        the read that was issued. Only the comparison is section-scoped.
+
+        Below v3 a section carries no heading, so the whole-file comparison this
+        function has always made is what still happens.
     #>
     param(
         [Parameter(Mandatory)]$Section,
         [Parameter(Mandatory)]$Captured
     )
-    if ([string]$Captured.Sha256 -cne [string]$Section.Sha256) {
-        New-ReviewerCohortEntryRefusal -Code 'CE310' `
-            -Detail "'$($Section.Path)' at $($Section.Commit) hashes to $([string]$Captured.Sha256) and the pin declares $([string]$Section.Sha256)."
+    $observedSha = [string]$Captured.Sha256
+    $observedBytes = [int]$Captured.ByteLength
+    $what = "'$($Section.Path)' at $($Section.Commit)"
+    $heading = [string]$Section.Section
+    if ($heading) {
+        $cut = $null
+        try { $cut = Get-ReviewerMarkdownSection -Text ([string]$Captured.Text) -Heading $heading }
+        catch {
+            # Ambiguity. The extractor refuses rather than guessing, and so does
+            # this: two headings spelled the same way mean the pin does not
+            # identify one section.
+            New-ReviewerCohortEntryRefusal -Code 'CE310' `
+                -Detail "$what does not identify one section: $($_.Exception.Message)"
+        }
+        if (-not $cut.Found) {
+            New-ReviewerCohortEntryRefusal -Code 'CE310' `
+                -Detail "$what no longer contains the pinned section '$heading'."
+        }
+        $cutText = [string]$cut.Text
+        $observedSha = Get-ReviewerSourceSha256 -Text $cutText
+        $observedBytes = $script:ReviewerCohortEntryUtf8.GetByteCount($cutText)
+        $what = "$what section '$heading'"
     }
-    if ([int]$Captured.ByteLength -ne [int]$Section.ByteLength) {
+    if ($observedSha -cne [string]$Section.Sha256) {
         New-ReviewerCohortEntryRefusal -Code 'CE310' `
-            -Detail "'$($Section.Path)' is $([int]$Captured.ByteLength) bytes and the pin declares $([int]$Section.ByteLength)."
+            -Detail "$what hashes to $observedSha and the pin declares $([string]$Section.Sha256)."
+    }
+    if ($observedBytes -ne [int]$Section.ByteLength) {
+        New-ReviewerCohortEntryRefusal -Code 'CE310' `
+            -Detail "$what is $observedBytes bytes and the pin declares $([int]$Section.ByteLength)."
     }
 }
 
@@ -409,6 +453,7 @@ function New-ReviewerCohortEntryEvidence {
             if (-not [bool]$record.HasRightHand) { continue }
             $suffix = ([int]$record.Ordinal).ToString('000', [Globalization.CultureInfo]::InvariantCulture)
             [void]$extension.Add((Get-ReviewerCohortEntryFileRead -Request $request -Id "changed-$suffix" `
+                        -RepositoryId $request.RepositoryId `
                         -ProviderPath ([string]$record.Path) -Commit $identity.SourceCommit -Role 'changedFile' `
                         -PayloadFile "payloads/file-$suffix.txt"))
         }
@@ -422,6 +467,7 @@ function New-ReviewerCohortEntryEvidence {
         foreach ($record in $siblings) {
             $suffix = ([int]$record.Ordinal).ToString('000', [Globalization.CultureInfo]::InvariantCulture)
             [void]$extension.Add((Get-ReviewerCohortEntryFileRead -Request $request -Id "baseline-$suffix" `
+                        -RepositoryId $request.RepositoryId `
                         -ProviderPath ([string]$record.Path) -Commit $identity.CommonCommit -Role 'sibling' `
                         -PayloadFile "payloads/baseline-$suffix.txt"))
         }
@@ -429,7 +475,11 @@ function New-ReviewerCohortEntryEvidence {
         foreach ($section in $request.RuleSections) {
             $ruleOrdinal++
             $suffix = $ruleOrdinal.ToString('000', [Globalization.CultureInfo]::InvariantCulture)
+            # The rule's OWN repository, not the subject's. Below v3 the request
+            # reader resolves this to the subject repository, which is what
+            # those versions always read; at v3 the operator states it.
             $ruleRead = Get-ReviewerCohortEntryFileRead -Request $request -Id "rule-$suffix" `
+                -RepositoryId ([string]$section.RepositoryId) `
                 -ProviderPath ([string]$section.Path) -Commit ([string]$section.Commit) -Role 'rule' `
                 -PayloadFile "payloads/rule-$suffix.txt"
             [void]$extension.Add($ruleRead)

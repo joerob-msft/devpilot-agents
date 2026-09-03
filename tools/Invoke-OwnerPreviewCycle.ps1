@@ -230,21 +230,30 @@ function Get-OwnerPreviewRuleSections {
         if ($null -eq $source) {
             throw "The pack references authoritative source '$reference', which the configuration does not declare."
         }
-        foreach ($field in @('path', 'expectedSha256', 'expectedByteLength')) {
+        # organization/project/repositoryId are REQUIRED here, not optional
+        # extras. The rule text lives wherever the configuration says it lives -
+        # for this pack, an engineering-guidance repository that is NOT the
+        # repository the pull request is in - and dropping the binding at this
+        # layer is what made every rule read reach the subject repository and
+        # fail. 'section' joins them for the same reason: expectedSha256 and
+        # expectedByteLength are the pins of the CUT section, so the heading
+        # they describe has to travel with them.
+        foreach ($field in @('organization', 'project', 'repositoryId', 'path', 'section', 'expectedSha256', 'expectedByteLength')) {
             $property = $source.PSObject.Properties[$field]
             if ($null -eq $property -or $null -eq $property.Value) {
-                throw "The authoritative source '$reference' declares no '$field'; an unpinned rule cannot be bound to a commit."
+                throw "The authoritative source '$reference' declares no '$field'; an unpinned or unbound rule cannot be read."
             }
         }
-        $sectionEntry = [ordered]@{
-            path       = [string]$source.path
-            commit     = $RuleCommit.ToLowerInvariant()
-            sha256     = ([string]$source.expectedSha256).ToLowerInvariant()
-            byteLength = [int]$source.expectedByteLength
-        }
-        $sectionProperty = $source.PSObject.Properties['section']
-        if ($null -ne $sectionProperty) { $sectionEntry['section'] = [string]$sectionProperty.Value }
-        [void]$sections.Add([pscustomobject]$sectionEntry)
+        [void]$sections.Add([pscustomobject][ordered]@{
+                organization = [string]$source.organization
+                project      = [string]$source.project
+                repositoryId = [string]$source.repositoryId
+                path         = [string]$source.path
+                commit       = $RuleCommit.ToLowerInvariant()
+                section      = [string]$source.section
+                sha256       = ([string]$source.expectedSha256).ToLowerInvariant()
+                byteLength   = [int]$source.expectedByteLength
+            })
     }
     return , $sections.ToArray()
 }
