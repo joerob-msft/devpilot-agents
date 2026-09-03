@@ -502,14 +502,27 @@ Describe 'dispatch protocol primitives' {
             -ArgumentList @('-NoProfile', '-File', $guardianPath, '-RuntimeRoot', $runtimeRoot,
                 '-BrokerProcessId', [string]$broker.Id, '-BrokerStartTimeUtcTicks',
                 [string]$broker.StartTime.ToUniversalTime().Ticks, '-Token', $token,
-                '-DeadlineSeconds', '5') `
+                '-DeadlineSeconds', '30') `
             -StandardOutputPath $guardianOut -StandardErrorPath $guardianErr
         try {
             $ready = Join-Path $runtimeRoot "guardian-$token.ready"
-            $deadline = [DateTime]::UtcNow.AddSeconds(5)
-            while (-not (Test-Path -LiteralPath $ready) -and [DateTime]::UtcNow -lt $deadline) {
+            # Two independent handshake steps (ready, then registered) must each get
+            # their own deadline: reusing a single deadline across both waits (as this
+            # test previously did) starves the second wait whenever the first wait
+            # consumes most of the budget under CI scheduling delay - e.g. guardian's
+            # one-time Add-Type compile of the libc P/Invoke shim can itself take a
+            # meaningful slice of a tight budget on constrained Ubuntu runners. This
+            # mirrors the two-deadline pattern in Publish-ProtectedPrompt.
+            $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while (-not (Test-Path -LiteralPath $ready) -and -not $guardian.Process.HasExited -and
+                [DateTime]::UtcNow -lt $readyDeadline) {
                 Start-Sleep -Milliseconds 25
             }
+            $guardianReady = Test-Path -LiteralPath $ready
+            $readyDiagnostics = if (-not $guardianReady) { Complete-AgentRedirectedProcess $guardian } else { $null }
+            $guardianReady | Should -BeTrue -Because (
+                "the guardian must signal ready before the registration handshake begins" +
+                $(if ($readyDiagnostics) { "; guardian stderr: $($readyDiagnostics.SafeErrorTail)" }))
             $prompt = Join-Path $runtimeRoot 'operator-context.txt'
             Set-Content -LiteralPath $prompt -Value 'secret' -Encoding utf8NoBOM
             @{
@@ -519,9 +532,16 @@ Describe 'dispatch protocol primitives' {
             } | ConvertTo-Json -Compress | Set-Content `
                 -LiteralPath (Join-Path $runtimeRoot "guardian-$token.json") -Encoding utf8NoBOM
             $registered = Join-Path $runtimeRoot "guardian-$token.registered"
-            while (-not (Test-Path -LiteralPath $registered) -and [DateTime]::UtcNow -lt $deadline) {
+            $registeredDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while (-not (Test-Path -LiteralPath $registered) -and -not $guardian.Process.HasExited -and
+                [DateTime]::UtcNow -lt $registeredDeadline) {
                 Start-Sleep -Milliseconds 25
             }
+            $guardianRegistered = Test-Path -LiteralPath $registered
+            $registeredDiagnostics = if (-not $guardianRegistered) { Complete-AgentRedirectedProcess $guardian } else { $null }
+            $guardianRegistered | Should -BeTrue -Because (
+                "the guardian must complete the registration handshake before the prompt is deleted" +
+                $(if ($registeredDiagnostics) { "; guardian stderr: $($registeredDiagnostics.SafeErrorTail)" }))
             Remove-Item -LiteralPath $prompt -Force
             Start-Sleep -Milliseconds 250
             $guardian.Process.HasExited | Should -BeFalse
@@ -533,7 +553,11 @@ Describe 'dispatch protocol primitives' {
             while (-not $child.Process.HasExited -and [DateTime]::UtcNow -lt $childDeadline) {
                 Start-Sleep -Milliseconds 25
             }
-            $child.Process.HasExited | Should -BeTrue
+            $childExited = $child.Process.HasExited
+            $childKillDiagnostics = if (-not $childExited) { Complete-AgentRedirectedProcess $guardian } else { $null }
+            $childExited | Should -BeTrue -Because (
+                "the guardian must terminate the accepted child group after the broker dies" +
+                $(if ($childKillDiagnostics) { "; guardian stderr: $($childKillDiagnostics.SafeErrorTail)" }))
             $guardian.Process.WaitForExit(10000) | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.json") | Should -BeFalse
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.ready") | Should -BeFalse
