@@ -185,9 +185,5 @@ jobs:
         run: |
           npm ci
           npm test
-          $bun = if ($IsWindows) {
-            './node_modules/bun/bin/bun.exe'
-          } else {
-            './node_modules/bun/bin/bun'
-          }
+          $bun = './node_modules/bun/bin/bun.exe'
           & $bun --conditions=browser test ./dist/test/dispatch.test.js
