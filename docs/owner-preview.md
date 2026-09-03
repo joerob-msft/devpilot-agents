@@ -171,9 +171,61 @@ schema-valid marker.
 `tools/Test-OwnerPreviewCycle.ps1` (in CI) runs offline with no network, no model
 and no provider. It validates the authored documents against the **same published
 schema files** the production tools read, pins the subject-identity properties,
-and drives the nine-declaration case through the production v4 parser.
+proves a marker naming another pull request or carrying a nonce this run did not
+issue is refused rather than counted, and drives the nine-declaration case
+through the production v4 parser.
 
-Two honest notes:
+## What live validation established
+
+One read-only `prepare` was run against real Azure DevOps under an interactive
+user identity, with zero model starts and zero provider writes. It is worth
+recording what that proved and what it did not.
+
+**The rule pin is live-accurate.** The `## Claim ownership` section of
+`/documentation/EngineeringProcesses/Conventions/AutomatedTests.md` in
+AzureUX-BPM-EngHub was fetched read-only at the commit the pack pins
+(`faa7625402523966b177d2b1a25042338b3571fc`) and cut with the production section
+extractor: **569 bytes, sha256 `bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f`**
+— byte-for-byte the pin. The whole file is 15059 bytes, as the pack records.
+
+**The live read path executes.** The builder opened the agency-wrapped session
+and worked through pull request identity, repository, target branch, the change
+census, changed files and their baselines.
+
+**Fail-closed behaviour was observed against real conditions**, not simulated
+ones. Each of these refusals was produced by a live run:
+
+| Refusal | Condition |
+|---|---|
+| `CE201` | the required ref did not resolve to the pinned toolkit head |
+| `CE213` | the toolkit working tree carried a tracked modification |
+| `CE305` | a change payload exceeded the declared byte cap |
+| `CE208` | the pull request was not active |
+| `CE302` | a file read did not answer in the declared resource envelope |
+| `CE211` | the configuration's target ref disagreed with the declared one |
+| `CE307` | a replay capture would have needed a live fallback |
+
+**Two things stopped a package being published, and neither is in this layer.**
+
+1. **PR16991680 is `Completed`.** The recorded nine-finding case is a merged
+   pull request, so it can never be prepared live again - the builder refuses a
+   non-active subject (`CE208`), correctly. Live preparation was therefore also
+   attempted against active pull requests in the same repository.
+2. **Live `repo_file` reads refuse the builder's envelope check (`CE302`).**
+   Against active pull requests the capture reached the changed-file and
+   baseline reads and refused there. The committed synthetic snapshot is not a
+   substitute: it was recorded for the convention-pack replay tests and its
+   `pr-get` payload carries no `lastMergeCommit`, which the evidence builder
+   requires (`CE210`).
+
+So the wrapper's own half is exercised - it authors documents the builder
+accepts through every request and identity check, and it surfaces refusals
+intact - while an end-to-end published package from a live pull request remains
+unproven in this environment. That is a limitation of the production capture
+seam and the available fixture, and it is stated here rather than left for
+somebody to discover.
+
+## Honest notes
 
 1. **There is no sealed PR16991680 snapshot in this repository.** The nine-finding
    truth is recorded as corpus *anchors* (`pr16991680-new-test-methods`,
@@ -181,11 +233,9 @@ Two honest notes:
    those anchors out of the corpus rather than copying them, so it cannot drift
    from the truth it claims to reproduce — but it is reproducing a recorded
    verdict set, not replaying sealed provider bytes.
-2. **The live `prepare` path is proven structurally, not executed against a live
-   host in CI.** `capture.mode` selects `live` or `replay`; the tests exercise the
-   wiring and the documents. One optional read-only live preflight can be run by
-   an operator outside CI. Zero models and zero writes either way.
-
-A third detail worth knowing: the v4 contract caps explanatory notes at eight, so
-nine violations cannot all be annotated. The test asserts the nine verdicts
-survive that — a capped note list must never cost a finding.
+2. **`run` has never completed end to end.** It is wired and its refusals are
+   checked, but no model has been started by this layer, so the capture →
+   materialize → acquire → parse sequence is unproven beyond its contracts.
+3. The v4 contract caps explanatory notes at eight, so nine violations cannot all
+   be annotated. The test asserts the nine verdicts survive that — a capped note
+   list must never cost a finding.
