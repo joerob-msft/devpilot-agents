@@ -70,7 +70,7 @@ $adoVerified = New-AgentProviderContext -Provider 'AzureDevOps' -Organization 'c
     -RepositoryName 'service' -RepositoryId $adoId -McpInvoker {
         param($Name, $Arguments, $RawText)
         if ($Name -ne 'repo_repository' -or $Arguments.action -ne 'get') { throw 'unexpected provider operation' }
-        return @{ id = 'd4d2e08b-47c1-4bae-a9ae-56c8d5410f61'; name = 'Service'; project = @{ name = 'Widgets' } }
+        return @{ id = 'd4d2e08b-47c1-4bae-a9ae-56c8d5410f61'; name = 'Service'; projectReference = @{ name = 'Widgets' } }
     }
 $adoIdentity = Resolve-AgentProviderRepositoryIdentity $adoVerified
 Assert-True ($adoIdentity.repositoryId -ceq $adoId.ToLowerInvariant()) "ADO GUID is normalized after provider verification"

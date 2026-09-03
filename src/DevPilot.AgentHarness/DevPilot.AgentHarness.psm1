@@ -3551,6 +3551,9 @@ function Resolve-AgentProviderRepositoryIdentity {
             }
             $repositoryName = [string](Get-AgentProviderValue -InputObject $response -Name 'name')
             $providerProject = Get-AgentProviderValue -InputObject $response -Name 'project'
+            if (-not $providerProject) {
+                $providerProject = Get-AgentProviderValue -InputObject $response -Name 'projectReference'
+            }
             $providerProjectName = [string](Get-AgentProviderValue -InputObject $providerProject -Name 'name')
             if (-not $repositoryName -or -not $providerProjectName) {
                 throw "[identity-unresolved] Azure DevOps returned incomplete repository metadata."
