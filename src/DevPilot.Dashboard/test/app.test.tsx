@@ -857,9 +857,13 @@ test("q shuts down the tailer and trusted broker before destroying the renderer"
       onDestroy: lifecycle.onRendererDestroy,
     });
     await setup.renderOnce();
+    setup.mockInput.pressKey("?");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /HELP - TRUSTED MANUAL MODE/);
     setup.mockInput.pressKey("q");
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(shutdownCount, 1);
+    assert.equal(setup.renderer.isDestroyed, true);
   } catch (error) {
     if (error instanceof Error && error.message.includes("native FFI is not available")) {
       context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");

@@ -1071,6 +1071,10 @@ export function App(props: AppProps) {
       }
       return;
     }
+    if (key.name === "q") {
+      void quit();
+      return;
+    }
     if (key.ctrl && key.name === "p") {
       setOverlay("palette");
       setPaletteIndex(0);
@@ -1106,9 +1110,7 @@ export function App(props: AppProps) {
       return;
     }
 
-    if (key.name === "q") {
-      void quit();
-    } else if (key.name === "up" || key.name === "k") move(-1);
+    if (key.name === "up" || key.name === "k") move(-1);
     else if (key.name === "down" || key.name === "j") move(1);
     else if (key.name === "return") {
       if (activeFocus() === "rail") focusDetail();
