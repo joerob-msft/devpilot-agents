@@ -684,7 +684,8 @@ try {
         $sidecarRelative = Assert-SafeRelativePath ([string]$sourceManifest.classification.sidecarFile) `
             'Source replay classification sidecar'
         $copyPaths[$sidecarRelative] = $sidecarRelative
-        $sidecarItem = Get-Item -LiteralPath (Join-Path $snapshotFull $sidecarRelative) -ErrorAction Stop
+        $sidecarItems = @(Get-Item -LiteralPath (Join-Path $snapshotFull $sidecarRelative) -ErrorAction Stop)
+        $sidecarItem = $sidecarItems[0]
         $replayExpectations[$sidecarRelative] = [pscustomobject]@{
             Sha256 = [string]$sourceManifest.classification.sidecarSha256
             ByteLength = [long]$sidecarItem.Length

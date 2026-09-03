@@ -629,7 +629,7 @@ function New-OwnerPreviewCaptureRequest {
                 # capture look for a pack-only file inside the snapshot.
                 sealedPath = 'manifest.json'
                 sha256     = $ManifestFileSha256
-                byteLength = [long](Get-Item -LiteralPath $Snapshot.ManifestPath).Length
+                byteLength = [long]([IO.FileInfo]::new([string]$Snapshot.ManifestPath).Length)
             }
         )
     }
