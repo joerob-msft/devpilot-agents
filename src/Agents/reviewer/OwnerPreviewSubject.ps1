@@ -357,7 +357,7 @@ function New-OwnerPreviewEvidenceRequest {
         # last layer that still has them: a projection that dropped them here
         # produced a request the builder could only resolve by defaulting to the
         # subject repository, which is the defect v3 exists to remove.
-        foreach ($field in @('organization', 'project', 'repositoryId', 'path', 'commit', 'section', 'sha256', 'byteLength')) {
+        foreach ($field in @('organization', 'project', 'repositoryId', 'branch', 'path', 'commit', 'section', 'sha256', 'byteLength')) {
             if ($null -eq $section.PSObject.Properties[$field] -or $null -eq $section.PSObject.Properties[$field].Value) {
                 throw "A rule section is missing '$field'; a v3 evidence request binds every section to its own repository and heading."
             }
@@ -366,6 +366,7 @@ function New-OwnerPreviewEvidenceRequest {
                 organization = [string]$section.organization
                 project      = [string]$section.project
                 repositoryId = [string]$section.repositoryId
+                branch       = [string]$section.branch
                 path         = [string]$section.path
                 commit       = [string]$section.commit
                 section      = [string]$section.section
@@ -683,6 +684,7 @@ function Get-OwnerPreviewHeadKey {
     $sections = [System.Collections.Generic.List[object]]::new()
     $ordered = @($RuleSections) | Sort-Object -Property `
     @{ Expression = { [string]$_.repositoryId } },
+    @{ Expression = { [string]$_.branch } },
     @{ Expression = { [string]$_.path } },
     @{ Expression = { [string]$_.section } },
     @{ Expression = { [string]$_.commit } },
@@ -695,6 +697,7 @@ function Get-OwnerPreviewHeadKey {
         # materially different previews collide on one key.
         [void]$sections.Add([ordered]@{
                 repositoryId = ([string]$section.repositoryId).ToLowerInvariant()
+                branch       = [string]$section.branch
                 path         = [string]$section.path
                 commit       = ([string]$section.commit).ToLowerInvariant()
                 section      = [string]$section.section

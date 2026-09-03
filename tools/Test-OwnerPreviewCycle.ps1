@@ -68,6 +68,7 @@ try {
             organization = 'contoso'
             project      = 'Widgets'
             repositoryId = $ruleRepositoryId
+            branch       = 'main'
             path         = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
             commit       = ('b' * 40)
             section      = '## Claim ownership'
@@ -284,7 +285,7 @@ try {
     $reRuled = @{}
     foreach ($pair in $baseArguments.GetEnumerator()) { $reRuled[$pair.Key] = $pair.Value }
     $reRuled['RuleSections'] = @([pscustomobject][ordered]@{
-            organization = 'contoso'; project = 'Widgets'; repositoryId = $ruleRepositoryId
+            organization = 'contoso'; project = 'Widgets'; repositoryId = $ruleRepositoryId; branch = 'main'
             path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
             commit = ('9' * 40); section = '## Claim ownership'; sha256 = ('5' * 64); byteLength = 569
         })
@@ -302,7 +303,7 @@ try {
         $rebound = @{}
         foreach ($pair in $baseArguments.GetEnumerator()) { $rebound[$pair.Key] = $pair.Value }
         $section = [ordered]@{
-            organization = 'contoso'; project = 'Widgets'; repositoryId = $ruleRepositoryId
+            organization = 'contoso'; project = 'Widgets'; repositoryId = $ruleRepositoryId; branch = 'main'
             path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
             commit = ('b' * 40); section = '## Claim ownership'
             sha256 = 'bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f'
@@ -316,6 +317,7 @@ try {
     $tiedSections = @(
         [pscustomobject][ordered]@{
             repositoryId = '12121212-3434-5656-7878-909090909090'
+            branch = 'main'
             path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
             commit = ('b' * 40)
             section = '## Claim ownership A'
@@ -323,6 +325,7 @@ try {
         },
         [pscustomobject][ordered]@{
             repositoryId = '99999999-8888-7777-6666-555555555555'
+            branch = 'main'
             path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
             commit = ('b' * 40)
             section = '## Claim ownership B'

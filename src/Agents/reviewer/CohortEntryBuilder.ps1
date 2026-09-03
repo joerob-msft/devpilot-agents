@@ -401,6 +401,7 @@ function New-ReviewerCohortEntryEvidence {
     $census = [object[]]@()
     $spanEvidence = [ordered]@{}
     $ruleReads = [System.Collections.Generic.List[object]]::new()
+    $ruleSourceBindings = [System.Collections.Generic.List[object]]::new()
     try {
         $byId = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         foreach ($read in $identityReads) {
@@ -473,7 +474,56 @@ function New-ReviewerCohortEntryEvidence {
         }
         $ruleOrdinal = 0
         $ruleReadBySource = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+        $ruleRepositoryReadBySource = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+        $ruleBranchReadBySource = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
         foreach ($section in $request.RuleSections) {
+            if ($request.SchemaVersion -ge 3) {
+                $repositoryKey = "$([string]$section.Project)`n$([string]$section.RepositoryId)"
+                $repositoryReadId = ''
+                if ([string]$section.RepositoryId -ceq [string]$request.RepositoryId) {
+                    $repositoryReadId = 'repository-identity'
+                }
+                elseif ($ruleRepositoryReadBySource.ContainsKey($repositoryKey)) {
+                    $repositoryReadId = [string]$ruleRepositoryReadBySource[$repositoryKey]
+                }
+                else {
+                    $repositoryReadId = "rule-repository-$((($ruleRepositoryReadBySource.Count + 1).ToString('000', [Globalization.CultureInfo]::InvariantCulture)))"
+                    [void]$extension.Add((New-ReviewerCohortEntryRead -Id $repositoryReadId `
+                                -Tool 'repo_repository' -Role 'identity' -Arguments ([ordered]@{
+                                    action = 'get'
+                                    project = [string]$section.Project
+                                    repositoryNameOrId = [string]$section.RepositoryId
+                                }) -Envelope 'mcpTextContent' -PayloadFile "payloads/$repositoryReadId.json"))
+                    $ruleRepositoryReadBySource.Add($repositoryKey, $repositoryReadId)
+                }
+
+                $branchKey = "$repositoryKey`n$([string]$section.Branch)"
+                $branchReadId = ''
+                if ([string]$section.RepositoryId -ceq [string]$request.RepositoryId -and
+                    "refs/heads/$([string]$section.Branch)" -ceq [string]$request.TargetRefName) {
+                    $branchReadId = 'target-branch'
+                }
+                elseif ($ruleBranchReadBySource.ContainsKey($branchKey)) {
+                    $branchReadId = [string]$ruleBranchReadBySource[$branchKey]
+                }
+                else {
+                    $branchReadId = "rule-branch-$((($ruleBranchReadBySource.Count + 1).ToString('000', [Globalization.CultureInfo]::InvariantCulture)))"
+                    [void]$extension.Add((New-ReviewerCohortEntryRead -Id $branchReadId `
+                                -Tool 'repo_branch' -Role 'identity' -Arguments ([ordered]@{
+                                    action = 'get'
+                                    project = [string]$section.Project
+                                    repositoryId = [string]$section.RepositoryId
+                                    branchName = [string]$section.Branch
+                                }) -Envelope 'mcpTextContent' -PayloadFile "payloads/$branchReadId.json"))
+                    $ruleBranchReadBySource.Add($branchKey, $branchReadId)
+                }
+                [void]$ruleSourceBindings.Add([pscustomobject]@{
+                        Section = $section
+                        RepositoryReadId = $repositoryReadId
+                        BranchReadId = $branchReadId
+                    })
+            }
+
             # One provider read returns the whole file. Multiple v3 sections in
             # that file reuse the captured record, then validate their own cuts;
             # issuing the identical repo_file request twice would make one replay
@@ -506,6 +556,21 @@ function New-ReviewerCohortEntryEvidence {
             $record = Invoke-ReviewerCohortEntryRead -Session $session -Read $read -MaxBytes $request.MaxFileBytes
             [void]$captured.Add($record)
             $byId[[string]$read.Id] = $record
+        }
+
+        foreach ($sourceBinding in $ruleSourceBindings) {
+            $section = $sourceBinding.Section
+            Assert-ReviewerCohortEntryRepositoryIdentity `
+                -Repository $byId[[string]$sourceBinding.RepositoryReadId].Parsed `
+                -ExpectedProject ([string]$section.Project) -ExpectedRepositoryId ([string]$section.RepositoryId)
+            $resolvedRuleCommit = Get-ReviewerCohortEntryBranchCommit `
+                -BranchResult $byId[[string]$sourceBinding.BranchReadId].Parsed `
+                -ExpectedRefName "refs/heads/$([string]$section.Branch)"
+            if ($resolvedRuleCommit -cne [string]$section.Commit) {
+                New-ReviewerCohortEntryRefusal -Code 'CE205' `
+                    -Detail ("Rule branch '$([string]$section.Branch)' resolves to $resolvedRuleCommit and the " +
+                        "section pins $([string]$section.Commit).")
+            }
         }
 
         foreach ($pin in $ruleReads) {
@@ -749,6 +814,7 @@ function New-ReviewerCohortEntryEvidence {
                             organization = [string]$_.Organization
                             project = [string]$_.Project
                             repositoryId = [string]$_.RepositoryId
+                            branch = [string]$_.Branch
                             path = [string]$_.Path
                             commit = [string]$_.Commit
                             section = [string]$_.Section

@@ -893,7 +893,7 @@ function Read-ReviewerCohortEntryRequest {
     $sectionList = [System.Collections.Generic.List[object]]::new()
     $seenSections = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $sectionRequiredKeys = if ($schemaVersion -ge 3) {
-        @('organization', 'project', 'repositoryId', 'path', 'commit', 'section', 'sha256', 'byteLength')
+        @('organization', 'project', 'repositoryId', 'branch', 'path', 'commit', 'section', 'sha256', 'byteLength')
     }
     else { @('path', 'commit', 'sha256', 'byteLength') }
     foreach ($section in $sections) {
@@ -901,6 +901,7 @@ function Read-ReviewerCohortEntryRequest {
         $sectionPath = Get-ReviewerCohortEntryString -Object $section -Name 'path' -Where 'request ruleBundle section'
         Assert-ReviewerCohortEntryRepositoryRelativePath -Path $sectionPath -Where 'request ruleBundle section'
         $sectionRepositoryId = $repositoryId
+        $sectionBranch = ''
         $sectionHeading = ''
         if ($schemaVersion -ge 3) {
             $sectionOrganization = Get-ReviewerCohortEntryString -Object $section -Name 'organization' `
@@ -926,6 +927,8 @@ function Read-ReviewerCohortEntryRequest {
             $sectionRepositoryId = Get-ReviewerCohortEntryString -Object $section -Name 'repositoryId' `
                 -Where 'request ruleBundle section' `
                 -Pattern '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' -MaxLength 36
+            $sectionBranch = Get-ReviewerCohortEntryString -Object $section -Name 'branch' `
+                -Where 'request ruleBundle section' -Pattern '^[A-Za-z0-9._/-]+$' -MaxLength 506
             $sectionHeading = Get-ReviewerCohortEntryString -Object $section -Name 'section' `
                 -Where 'request ruleBundle section' `
                 -Pattern '^#{1,6} [^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$' -MaxLength 242
@@ -944,6 +947,7 @@ function Read-ReviewerCohortEntryRequest {
                 Organization = $organization
                 Project = $project
                 RepositoryId = $sectionRepositoryId
+                Branch = $sectionBranch
                 Path = $sectionPath
                 Commit = (Get-ReviewerCohortEntryString -Object $section -Name 'commit' -Where 'request ruleBundle section' -Pattern '^[0-9a-f]{40}$' -MaxLength 40)
                 Section = $sectionHeading

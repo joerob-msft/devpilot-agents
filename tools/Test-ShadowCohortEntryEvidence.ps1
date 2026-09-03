@@ -371,6 +371,7 @@ function Set-CohortEntryV3RuleState {
     $lambda = [char]0x03BB
     $State.SchemaVersion = 3
     $State.RuleRepositoryId = '99999999-8888-7777-6666-555555555555'
+    $State.RuleBranch = 'main'
     $State.CaptureModels = @('claude-opus-5', 'claude-sonnet-5')
     $State.RuleSection = "## Claim ownership - caf$eAcute"
     $State.RuleText = (
@@ -500,6 +501,7 @@ function New-CohortEntryFixture {
         RuleOrganization = $organization
         RuleProject = $project
         RuleRepositoryId = $repositoryId
+        RuleBranch = 'main'
         RuleSection = '## Review rules'
         RuleReadRepositoryOverride = ''
         RealToolkitRoot = $RealToolkitRoot
@@ -840,6 +842,37 @@ function New-CohortEntryFixture {
     }
     $ruleUri = if ($state.RuleResourceUri) { [string]$state.RuleResourceUri } else { (& $uriFor $rulePath) }
     $ruleServed = if ($state.RuleServedText) { [string]$state.RuleServedText } else { [string]$state.RuleText }
+    if ([int]$state.SchemaVersion -ge 3) {
+        [void]$reads.Add(@{
+                Tool = 'repo_repository'
+                Arguments = [ordered]@{
+                    action = 'get'
+                    project = $state.RuleProject
+                    repositoryNameOrId = $state.RuleRepositoryId
+                }
+                Bytes = (New-CohortEntryTextEnvelope -Value ([ordered]@{
+                            id = $state.RuleRepositoryId
+                            name = 'rule-source'
+                            projectReference = [ordered]@{
+                                id = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+                                name = $state.RuleProject
+                            }
+                        }))
+            })
+        [void]$reads.Add(@{
+                Tool = 'repo_branch'
+                Arguments = [ordered]@{
+                    action = 'get'
+                    project = $state.RuleProject
+                    repositoryId = $state.RuleRepositoryId
+                    branchName = $state.RuleBranch
+                }
+                Bytes = (New-CohortEntryTextEnvelope -Value ([ordered]@{
+                            name = "refs/heads/$($state.RuleBranch)"
+                            objectId = $state.RuleCommit
+                        }))
+            })
+    }
     $ruleReadRepositoryId = if ($state.RuleReadRepositoryOverride) {
         [string]$state.RuleReadRepositoryOverride
     }
@@ -967,6 +1000,7 @@ function New-CohortEntryFixture {
             organization = [string]$state.RuleOrganization
             project = [string]$state.RuleProject
             repositoryId = [string]$state.RuleRepositoryId
+            branch = [string]$state.RuleBranch
             path = $rulePath
             commit = $state.RuleCommit
             section = [string]$state.RuleSection
@@ -1655,7 +1689,7 @@ Assert-CohortEntry -Name 'the v2 rule-section schema remains the original four-f
 Assert-CohortEntry -Name 'the v3 rule-section schema requires its explicit source binding and heading' `
     -Condition (
         ((@($v3RuleSchema.required) | Sort-Object -CaseSensitive) -join ',') -ceq
-        ((@('organization', 'project', 'repositoryId', 'path', 'commit', 'section', 'sha256', 'byteLength') |
+        ((@('organization', 'project', 'repositoryId', 'branch', 'path', 'commit', 'section', 'sha256', 'byteLength') |
                 Sort-Object -CaseSensitive) -join ','))
 # and the two change ceilings are two failures with opposite answers, exactly as
 # the thread pair is: CE402 says the operator authorized fewer files than this
@@ -2700,8 +2734,7 @@ Invoke-CohortEntryCase -Name 'a v3 rule binding whose repository response is rec
     -ExpectedCode 'CE307' -Mutate {
     param($state)
     Set-CohortEntryV3RuleState -State $state
-    $state.RuleReadRepositoryOverride = $state.RuleRepositoryId
-    $state.RuleRepositoryId = $state.RepositoryId
+    $state.RuleReadRepositoryOverride = $state.RepositoryId
 }
 
 Invoke-CohortEntryCase -Name 'a v3 rule section missing its repository binding' -ExpectedCode 'CE104' -Mutate {
@@ -3053,6 +3086,7 @@ try {
                 organization = [string]$state.RuleOrganization
                 project = [string]$state.RuleProject
                 repositoryId = [string]$state.RuleRepositoryId
+                branch = [string]$state.RuleBranch
                 path = '/docs/rules/review.md'
                 commit = [string]$state.RuleCommit
                 section = $heading
@@ -3107,6 +3141,7 @@ try {
             @($v3Parsed.RuleSections).Count -eq 2 -and
             [string]@($v3Parsed.RuleSections)[0].RepositoryId -ceq [string]$v3Fixture.State.RuleRepositoryId -and
             [string]@($v3Parsed.RuleSections)[0].RepositoryId -cne [string]$v3Parsed.RepositoryId -and
+            [string]@($v3Parsed.RuleSections)[0].Branch -ceq [string]$v3Fixture.State.RuleBranch -and
             [string]@($v3Parsed.RuleSections)[0].Section -ceq [string]$v3Fixture.State.RuleSection)
     Assert-CohortEntry -Name 'two v3 sections in one file share one whole-file provider read' `
         -Condition (
@@ -3144,6 +3179,7 @@ try {
             @($v3Witness.ruleBundle.sections).Count -eq 2 -and
             @($v3Witness.ruleBundle.sections | Where-Object {
                     [string]$_.repositoryId -ceq [string]$v3Fixture.State.RuleRepositoryId -and
+                    [string]$_.branch -ceq [string]$v3Fixture.State.RuleBranch -and
                     [string]$_.section
                 }).Count -eq 2)
 }

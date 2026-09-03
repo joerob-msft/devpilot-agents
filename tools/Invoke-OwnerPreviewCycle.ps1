@@ -238,7 +238,7 @@ function Get-OwnerPreviewRuleSections {
         # fail. 'section' joins them for the same reason: expectedSha256 and
         # expectedByteLength are the pins of the CUT section, so the heading
         # they describe has to travel with them.
-        foreach ($field in @('organization', 'project', 'repositoryId', 'path', 'section', 'expectedSha256', 'expectedByteLength')) {
+        foreach ($field in @('organization', 'project', 'repositoryId', 'branch', 'path', 'section', 'expectedSha256', 'expectedByteLength')) {
             $property = $source.PSObject.Properties[$field]
             if ($null -eq $property -or $null -eq $property.Value) {
                 throw "The authoritative source '$reference' declares no '$field'; an unpinned or unbound rule cannot be read."
@@ -252,6 +252,7 @@ function Get-OwnerPreviewRuleSections {
                 organization = [string]$source.organization
                 project      = [string]$source.project
                 repositoryId = [string]$source.repositoryId
+                branch       = [string]$source.branch
                 path         = [string]$source.path
                 commit       = $RuleCommit.ToLowerInvariant()
                 section      = [string]$source.section

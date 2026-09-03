@@ -79,9 +79,11 @@ appending a slot to the published request and showing the digest no longer match
 
 `reviewer.cohort-entry-evidence-request.v3.json`, `schemaVersion: 3`, keeps the
 v2 execution-plan shape and makes rule sources explicit. Every v3 section
-must name `organization`, `project`, the rule repository GUID, and the exact ATX
-heading whose digest and byte length are pinned. Organization and project must
-match the subject; the repository may differ.
+must name `organization`, `project`, the rule repository GUID, the short branch
+production convention loading resolves, and the exact ATX heading whose digest
+and byte length are pinned. Organization and project must match the subject; the
+repository may differ. The captured branch response must resolve to the pinned
+commit.
 
 The provider still returns and the corpus still seals the whole file, byte for
 byte. The pin is checked separately against the shared
@@ -214,7 +216,9 @@ the first read and checked after the last. Nothing interprets a raw REST respons
 | changes with content | `repo_pull_request` | the same, plus `includeDiffs=true`, `includeLineContent=true` — a **distinct** request key |
 | threads | `repo_pull_request_thread` | **not shaped here** — the live cycle's own request, from the one shared constructor: `action=list`, `project`, `repositoryId` = repository **name**, `pullRequestId`, `top` = **200** |
 | changed file, sibling | `repo_file` | `action=get_content`, `project`, `repositoryId` = subject repository **id**, `path`, `versionType=Commit`, `version` = 40-hex commit |
-| rule file | `repo_file` | the same shape, with `repositoryId` = the v3 section's authoritative rule repository **id**; one whole-file read is shared by multiple sections of the same repository/path/commit |
+| rule repository | `repo_repository` | `action=get`, section `project`, `repositoryNameOrId` = authoritative rule repository **id** |
+| rule branch | `repo_branch` | `action=get`, section `project`, `repositoryId` = authoritative rule repository **id**, `branchName` = section branch |
+| rule file | `repo_file` | the same file shape, with `repositoryId` = the v3 section's authoritative rule repository **id**; one whole-file read is shared by multiple sections of the same repository/path/commit |
 
 None of the three provider-list reads is shaped by this builder, and the reason is the same
 for all of them. A replay answers the arguments it recorded and never falls through to a live
