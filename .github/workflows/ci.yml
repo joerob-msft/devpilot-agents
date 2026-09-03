@@ -365,6 +365,13 @@ jobs:
         shell: pwsh
         run: ./tools/Test-OwnerPreviewCycle.ps1
 
+      # Layer 2: a declared queue and Windows Task Scheduler wrapper around the
+      # proven prepare-run seam. Entirely offline: fake cycle driver, no provider,
+      # no model, no task registration, and no app session/worktree creation.
+      - name: owner convention preview queue
+        shell: pwsh
+        run: ./tools/Test-OwnerPreviewQueue.ps1
+
       # Layer 8: the sealed changed-file source transport. The model has no
       # working file-read tool on this host, so the wrapper reads the pinned
       # bytes itself; these checks pin the slicing, the hash binding, the
