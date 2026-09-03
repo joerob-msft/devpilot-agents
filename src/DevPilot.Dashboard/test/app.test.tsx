@@ -2,10 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { testRender } from "@opentui/solid";
 import type { TestRendererSetup } from "@opentui/core/testing";
-import { App, BRAND_PLANE, HELP_LEGEND, completionResultColor, safeHttpUrl } from "../src/app.js";
+import {
+  App, BRAND_PLANE, HELP_LEGEND, appendPromptScalar, completionResultColor,
+  printableKeySequence, safeHttpUrl, selectableCount,
+} from "../src/app.js";
 import { parseAgentEvent } from "../src/domain.js";
 import { OperationsReducer } from "../src/reducer.js";
 import { EventTailer } from "../src/tailer.js";
+import { PullRequestHistoryProjection } from "../src/history.js";
+import type { CapabilitySummary, DispatchAccepted, DispatchBroker, DispatchTerminal } from "../src/dispatch.js";
 
 function createFixture(prUrl = "https://github.com/joerob-msft/devpilot-agents/pull/94"): {
   reducer: OperationsReducer;
@@ -198,6 +203,22 @@ test("partial and failure result phrases retain semantic colors", () => {
   assert.equal(completionResultColor("delivered"), "#61d6a7");
 });
 
+test("printable input maps OpenTUI space safely and rejects control sequences", () => {
+  assert.equal(printableKeySequence({ name: "space", sequence: " " }), " ");
+  assert.equal(printableKeySequence({ name: "q", sequence: "q" }), "q");
+  assert.equal(printableKeySequence({ name: "q", sequence: "\u0011", ctrl: true }), null);
+  assert.equal(printableKeySequence({ name: "escape", sequence: "\u001b" }), null);
+  assert.equal(printableKeySequence({ name: "up", sequence: "\u001b[A" }), null);
+  assert.equal(appendPromptScalar("review", printableKeySequence({ name: "space" })!), "review ");
+});
+
+test("selection counts history rows in history view and live instances elsewhere", () => {
+  assert.equal(selectableCount("history", true, 12, 1), 12);
+  assert.equal(selectableCount("history", true, 12, 0), 12);
+  assert.equal(selectableCount("live", true, 12, 1), 1);
+  assert.equal(selectableCount("live", true, 12, 0), 0);
+});
+
 test("renderer geometry and narrative remain readable at 140, 100, and 70 columns", async (context) => {
   const setups: TestRendererSetup[] = [];
   try {
@@ -340,5 +361,238 @@ test("native keyboard controls provide contextual effects and feedback in every 
     assert.match(missingUrl.captureCharFrame(), /STATUS: PR URL is missing or unsupported/);
   } finally {
     for (const setup of setups.reverse()) setup.renderer.destroy();
+  }
+});
+
+test("trusted manual flow requires describe plus two explicit confirmations", async (context) => {
+  const fixture = createFixture();
+  const history = new PullRequestHistoryProjection();
+  history.apply(parseAgentEvent({
+    schemaVersion: 3,
+    agent: "reviewer",
+    instanceId: "manual-history",
+    processId: 1,
+    timestamp: "2026-09-03T00:00:00Z",
+    sequence: 1,
+    eventType: "work.completed",
+    level: "info",
+    cycleNumber: 1,
+    pullRequestId: 104,
+    sourceCommit: "a".repeat(40),
+    repositoryIdentity: {
+      schemaVersion: 1,
+      provider: "GitHub",
+      repositoryId: "9007199254740993",
+      organization: "contoso",
+      project: "",
+      repositoryName: "repo",
+      slug: "contoso/repo",
+      key: "v1:github:9007199254740993",
+      verifiedAtUtc: "2026-09-03T00:00:00Z",
+      verified: true,
+      dispatchEligible: true,
+    },
+    dispatch: null,
+    data: { title: "Manual PR", author: "Ada", result: "reviewed" },
+    message: "",
+  }));
+  const reorderedIdentity = {
+    schemaVersion: 1 as const,
+    provider: "GitHub" as const,
+    repositoryId: "9007199254740994",
+    organization: "contoso",
+    project: "",
+    repositoryName: "other-repo",
+    slug: "contoso/other-repo",
+    key: "v1:github:9007199254740994",
+    verifiedAtUtc: "2026-09-02T00:00:00Z",
+    verified: true,
+    dispatchEligible: true,
+  };
+  history.apply(parseAgentEvent({
+    schemaVersion: 3,
+    agent: "reviewer",
+    instanceId: "other-history",
+    processId: 2,
+    timestamp: "2026-09-02T00:00:00Z",
+    sequence: 1,
+    eventType: "work.completed",
+    level: "info",
+    cycleNumber: 1,
+    pullRequestId: 205,
+    sourceCommit: "d".repeat(40),
+    repositoryIdentity: reorderedIdentity,
+    dispatch: null,
+    data: { title: "Other PR", author: "Grace", result: "reviewed" },
+    message: "",
+  }));
+  history.apply(parseAgentEvent({
+    schemaVersion: 3,
+    agent: "review-handler",
+    instanceId: "handler-only-history",
+    processId: 3,
+    timestamp: "2026-09-04T00:00:00Z",
+    sequence: 1,
+    eventType: "work.completed",
+    level: "info",
+    cycleNumber: 1,
+    pullRequestId: 306,
+    sourceCommit: "e".repeat(40),
+    repositoryIdentity: {
+      schemaVersion: 1,
+      provider: "GitHub",
+      repositoryId: "9007199254740996",
+      organization: "contoso",
+      project: "",
+      repositoryName: "handler-repo",
+      slug: "contoso/handler-repo",
+      key: "v1:github:9007199254740996",
+      verifiedAtUtc: "2026-09-04T00:00:00Z",
+      verified: true,
+      dispatchEligible: true,
+    },
+    dispatch: null,
+    data: { title: "Handler-only PR", author: "Linus", result: "handled" },
+    message: "",
+  }));
+  let describeCount = 0;
+  let dispatchCount = 0;
+  let describedTarget = "";
+  let dispatchedTarget = "";
+  let resolveDescribe!: (value: CapabilitySummary) => void;
+  const described = new Promise<CapabilitySummary>((resolve) => { resolveDescribe = resolve; });
+  const summary: CapabilitySummary = {
+    schemaVersion: 1,
+    requestId: "11111111-1111-4111-8111-111111111111",
+    operation: "capability-summary",
+    role: "reviewer",
+    dispatchDraftId: "22222222-2222-4222-8222-222222222222",
+    repositoryIdentity: {
+      ...history.jump(104)!.repositoryIdentity,
+      repositoryName: "broker-repo",
+      slug: "contoso/broker-repo",
+    },
+    prSnapshot: {
+      schemaVersion: 1, pullRequestId: 104, sourceCommit: "a".repeat(40),
+      sourceRef: "feature", targetRef: "main", active: true, draft: false, author: "Ada", title: "Manual PR",
+    },
+    capabilityPolicyDigest: "b".repeat(64),
+    prStateFingerprint: "c".repeat(64),
+    capabilities: ["EnableSummaryComment"],
+    mandatoryDenies: ["EnableApprovalVote"],
+    dynamicConstraints: [],
+  };
+  const accepted: DispatchAccepted = {
+    schemaVersion: 1,
+    requestId: "33333333-3333-4333-8333-333333333333",
+    operation: "accepted",
+    dispatchId: "44444444-4444-4444-8444-444444444444",
+    repositoryIdentity: summary.repositoryIdentity,
+    pullRequestId: 104,
+    role: "reviewer",
+    capabilityPolicyDigest: summary.capabilityPolicyDigest,
+    prStateFingerprint: summary.prStateFingerprint,
+    childProcessId: 42,
+    eventLogPath: "Q:\\events\\reviewer.jsonl",
+  };
+  const broker: DispatchBroker = {
+    describe: async (repositoryKey, pullRequestId) => {
+      describeCount++;
+      describedTarget = `${repositoryKey}:${pullRequestId}`;
+      return described;
+    },
+    dispatch: async (describedSummary) => {
+      dispatchCount++;
+      dispatchedTarget = `${describedSummary.repositoryIdentity.key}:${describedSummary.prSnapshot.pullRequestId}`;
+      return accepted;
+    },
+    cancel: async () => ({ schemaVersion: 1, requestId: "x", operation: "cancelled", dispatchId: accepted.dispatchId } as DispatchTerminal),
+    shutdown: async () => {},
+    subscribeTerminal: () => () => {},
+  };
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 100, height: 30, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    setup.mockInput.pressKey("f");
+    await setup.flush();
+    setup.mockInput.pressTab();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /HISTORY \| REVIEWER/);
+    setup.mockInput.pressKey("3");
+    setup.mockInput.pressKey("0");
+    setup.mockInput.pressKey("6");
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /excluded by the active role/);
+    setup.mockInput.pressKey("1");
+    setup.mockInput.pressKey("0");
+    setup.mockInput.pressKey("4");
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Jumped to repo PR #104/);
+    setup.mockInput.pressKey("m");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /MANUAL DISPATCH/);
+    assert.match(setup.captureCharFrame(), /contoso\/repo \/ PR #104/);
+    assert.match(setup.captureCharFrame(), /Manual PR \| Ada/);
+    assert.match(setup.captureCharFrame(), /512 Unicode scalars/);
+    setup.mockInput.pressKey("q");
+    setup.mockInput.pressKey("q", { ctrl: true });
+    await setup.mockInput.typeText(" fix");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /q fix/);
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.equal(describeCount, 0);
+    assert.equal(dispatchCount, 0);
+    setup.mockInput.pressKey("d", { ctrl: true });
+    await setup.renderOnce();
+    assert.equal(describeCount, 1);
+    assert.equal(describedTarget, "v1:github:9007199254740993:104");
+    history.apply(parseAgentEvent({
+      schemaVersion: 3,
+      agent: "reviewer",
+      instanceId: "other-history",
+      processId: 2,
+      timestamp: "2026-09-04T00:00:00Z",
+      sequence: 2,
+      eventType: "agent.heartbeat",
+      level: "info",
+      cycleNumber: 1,
+      pullRequestId: 205,
+      sourceCommit: "d".repeat(40),
+      repositoryIdentity: reorderedIdentity,
+      dispatch: null,
+      data: { title: "Other PR", author: "Grace" },
+      message: "",
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await setup.renderOnce();
+    assert.match(setup.captureCharFrame(), /contoso\/repo \/ PR #104/);
+    assert.doesNotMatch(setup.captureCharFrame(), /other-repo \/ PR #205/);
+    resolveDescribe(summary);
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /contoso\/broker-repo \/ PR #104/);
+    assert.match(setup.captureCharFrame(), /Disabled high-impact: EnableApprovalVote/);
+    setup.mockInput.pressKey("d");
+    await setup.flush();
+    assert.equal(dispatchCount, 0);
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.equal(dispatchCount, 1);
+    assert.equal(dispatchedTarget, "v1:github:9007199254740993:104");
+    assert.match(setup.captureCharFrame(), /Accepted dispatch/);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
   }
 });

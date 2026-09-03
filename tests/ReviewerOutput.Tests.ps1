@@ -1,11 +1,27 @@
 BeforeAll {
     Import-Module "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1" -Force
 
+    function New-TestRepositoryIdentity {
+        return [ordered]@{
+            schemaVersion = 1
+            provider = 'GitHub'
+            repositoryId = '9007199254740993'
+            organization = 'contoso'
+            project = ''
+            repositoryName = 'widget-service'
+            slug = 'contoso/widget-service'
+            key = 'v1:github:9007199254740993'
+            verifiedAtUtc = '2026-09-03T00:00:00.0000000Z'
+            verified = $true
+            dispatchEligible = $true
+        }
+    }
+
     function New-TestReviewerContext {
         param([string]$Mode = 'Compact', [bool]$Redirected = $false, [bool]$Ansi = $false)
         $script:reviewerLines = [System.Collections.Generic.List[string]]::new()
         New-AgentOutputContext -Agent reviewer -OutputMode $Mode -IsOutputRedirected $Redirected `
-            -SupportsAnsi $Ansi -WindowWidth 120 -WriteLine {
+            -SupportsAnsi $Ansi -WindowWidth 120 -RepositoryIdentity (New-TestRepositoryIdentity) -WriteLine {
                 param($line)
                 [void]$script:reviewerLines.Add([string]$line)
             } -WriteRaw {
@@ -47,9 +63,12 @@ Describe 'Reviewer output modes' {
             $event = $line | ConvertFrom-Json
             $event.PSObject.Properties.Name | Should -Be @(
                 'schemaVersion', 'agent', 'instanceId', 'processId', 'timestamp', 'sequence', 'eventType',
-                'level', 'cycleNumber', 'pullRequestId', 'sourceCommit', 'data', 'message'
+                'level', 'cycleNumber', 'pullRequestId', 'sourceCommit', 'repositoryIdentity', 'dispatch', 'data', 'message'
             )
-            $event.schemaVersion | Should -Be 2
+            $event.schemaVersion | Should -Be 3
+            $event.repositoryIdentity.repositoryId | Should -Be '9007199254740993'
+            $event.repositoryIdentity.dispatchEligible | Should -BeTrue
+            $event.dispatch | Should -BeNullOrEmpty
             $event.agent | Should -Be 'reviewer'
             $event.instanceId | Should -Not -BeNullOrEmpty
             $event.processId | Should -BeGreaterThan 0
@@ -197,6 +216,7 @@ Describe 'Reviewer output modes' {
         $directory = Join-Path $TestDrive 'instance-events\reviewer'
         $context = New-AgentOutputContext -Agent reviewer -OutputMode Compact `
             -PerInstanceLogDirectory $directory -HeartbeatIntervalMilliseconds 1000 `
+            -RepositoryIdentity (New-TestRepositoryIdentity) `
             -WriteLine { param($line) }
         try {
             Publish-AgentEvent $context agent.started -Data @{ repository = 'sample' } | Out-Null
@@ -211,6 +231,9 @@ Describe 'Reviewer output modes' {
         @($events.eventType) | Should -Be @('agent.started', 'agent.heartbeat', 'agent.stopped')
         @($events.sequence) | Should -Be @(1, 2, 3)
         @($events.instanceId | Select-Object -Unique) | Should -Be @($context.InstanceId)
+        @($events.schemaVersion | Select-Object -Unique) | Should -Be @(3)
+        @($events.repositoryIdentity.repositoryId | Select-Object -Unique) | Should -Be @('9007199254740993')
+        @($events.repositoryIdentity.dispatchEligible | Select-Object -Unique) | Should -Be @($true)
     }
 
     It 'serializes foreground events and heartbeats in sequence order' {
@@ -257,6 +280,49 @@ Describe 'Reviewer output modes' {
         @(Get-ChildItem -LiteralPath $directory -File -Filter '*.jsonl').Count | Should -Be 20
         Test-Path -LiteralPath (Join-Path $directory '01.jsonl') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $directory '02.jsonl') | Should -BeFalse
+    }
+}
+
+Describe 'Sealed reviewer artifact persistence' {
+    BeforeAll {
+        $reviewerPath = Resolve-Path "$PSScriptRoot\..\src\Agents\reviewer\Start-ReviewerAgent.ps1"
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            $reviewerPath, [ref]$tokens, [ref]$errors)
+        $errors | Should -BeNullOrEmpty
+        $writerAst = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Write-ReviewerAtomicFile'
+            }, $true)
+        $writerAst | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($writerAst.Extent.Text))
+    }
+
+    It 'installs complete owner-only content and leaves no temporary file' {
+        $directory = Join-Path $TestDrive 'atomic-success'
+        New-Item -ItemType Directory -Path $directory | Out-Null
+        $path = Join-Path $directory 'review.md'
+        Write-ReviewerAtomicFile -Path $path -Text "complete`nreview"
+
+        [IO.File]::ReadAllText($path) | Should -BeExactly "complete`nreview"
+        @(Get-ChildItem -LiteralPath $directory -Force).Count | Should -Be 1
+        if (-not $IsWindows) {
+            [IO.File]::GetUnixFileMode($path) | Should -Be (
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+    }
+
+    It 'preserves the installed artifact and cleans a complete temp after atomic install failure' {
+        $directory = Join-Path $TestDrive 'atomic-failure'
+        New-Item -ItemType Directory -Path $directory | Out-Null
+        $path = Join-Path $directory 'review.json'
+        [IO.File]::WriteAllText($path, 'sealed-original')
+
+        { Write-ReviewerAtomicFile -Path $path -Text 'torn-replacement' } | Should -Throw
+        [IO.File]::ReadAllText($path) | Should -BeExactly 'sealed-original'
+        @(Get-ChildItem -LiteralPath $directory -Force).Count | Should -Be 1
     }
 }
 
@@ -333,9 +399,10 @@ Describe 'Shared reviewer and review-handler event contract' {
             $parameterNames | Should -Contain $parameterName
         }
         $source = Get-Content -LiteralPath $path -Raw
-        $source | Should -Match "OutputMode = 'Json'"
-        $source | Should -Match 'Once = \$true'
-        $source | Should -Match 'IntervalSeconds = \$IntervalSeconds'
+        $source | Should -Match "'-OutputMode', 'Json'"
+        $source | Should -Match "\$childArguments \+= '-Once'"
+        $source | Should -Match ([regex]::Escape(
+                '$childArguments += @(''-IntervalSeconds'', [string]$IntervalSeconds)'))
         $source | Should -Match "\[ValidateSet\('Reviewer', 'ReviewHandler', 'Both'\)\]"
         $source | Should -Match '\$Continuous\s+-and\s+\(\$ReviewerPullRequestId\s+-gt\s+0\s+-or\s+\$ReviewHandlerPullRequestId\s+-gt\s+0\)'
         $reviewerCapabilities = [regex]::Match(
@@ -378,16 +445,18 @@ Describe 'Shared reviewer and review-handler event contract' {
         )) {
             $handlerCodeUpdateCapabilities | Should -Not -Match ("'{0}'" -f $capability)
         }
-        $source | Should -Match "'EnableTeamsNotifications = \`$true'"
-        $source | Should -Match '\$parameterLines\.Add\("\$capability = `\$true"\)'
+        $source | Should -Match "\$childArguments \+= '-EnableTeamsNotifications'"
+        $source | Should -Match '\$childArguments \+= "-\$capability"'
         $source | Should -Match 'if \(\$Operational\)'
         $source | Should -Match 'review-handler code updates require -Operational'
         $source | Should -Match 'EnableReviewerTeamsNotifications requires -Agent Reviewer or -Agent Both'
         $source | Should -Match 'EnableReviewHandlerTeamsNotifications requires -Agent ReviewHandler or -Agent Both'
         $source | Should -Match 'EnableReviewHandlerCodeUpdates requires -Agent ReviewHandler or -Agent Both'
         $source | Should -Not -Match '(?i)\bYolo\s*='
-        $source.IndexOf('& $dashboardLauncher -StateDir $StateDir -ValidateOnly') |
-            Should -BeLessThan $source.IndexOf('$process = Start-Process')
+        $source.IndexOf('@dashboardParameters -ValidateOnly') |
+            Should -BeLessThan $source.IndexOf('$owned = if')
+        $source | Should -Match 'New-AgentPersistentRedirectedProcess'
+        $source | Should -Not -Match 'Start-Process|EncodedCommand'
         $source | Should -Match '\$dashboardCompletedNormally\s*=\s*\$false'
         $source | Should -Match '\$Process\.Kill\(\$true\)'
         $source | Should -Match 'if \(-not \$dashboardCompletedNormally -or \$Continuous -or \$Operational\)'

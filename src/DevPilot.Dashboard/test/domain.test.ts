@@ -68,3 +68,35 @@ test("schema parser removes terminal control characters from rendered strings", 
   assert.equal(getString(event.data, "title"), "safe [2Jtitle");
   assert.deepEqual(getStringArray(event.data, "outstanding"), ["one two"]);
 });
+
+test("schema v3 requires verified canonical identity and preserves opaque GitHub IDs", () => {
+  const repositoryId = "900719925474099312345";
+  const event = parseAgentEvent({
+    ...validEvent(),
+    schemaVersion: 3,
+    repositoryIdentity: {
+      schemaVersion: 1,
+      provider: "GitHub",
+      repositoryId,
+      organization: "contoso",
+      project: "",
+      repositoryName: "widget-service",
+      slug: "contoso/widget-service",
+      key: `v1:github:${repositoryId}`,
+      verifiedAtUtc: "2026-09-03T00:00:00Z",
+      verified: true,
+      dispatchEligible: true,
+    },
+    dispatch: null,
+  });
+  assert.equal(event.repositoryIdentity?.repositoryId, repositoryId);
+  assert.equal(event.repositoryIdentity?.key, `v1:github:${repositoryId}`);
+  assert.equal(event.dispatch, null);
+
+  assert.throws(() => parseAgentEvent({ ...validEvent(), schemaVersion: 3 }), /repositoryIdentity/);
+  assert.throws(() => parseAgentEvent({
+    ...validEvent(),
+    schemaVersion: 3,
+    repositoryIdentity: { ...event.repositoryIdentity, key: "v1:github:rounded" },
+  }), /key/);
+});

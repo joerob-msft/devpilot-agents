@@ -1,5 +1,15 @@
 # DevPilot Agents
 
+> Manual dispatch is available only when a trusted `Watch-DevPilot*.ps1`
+> launcher explicitly supplies a broker descriptor. Direct and attach-only
+> dashboard launches remain visibly observe-only.
+> Only PowerShell launchers create the hidden broker descriptor. Manual policy
+> is independent of watched roles, and Reviewer approval votes are always
+> denied. Dispatch freezes a one-use configuration snapshot, binds separate
+> policy and PR-state digests, and does not authorize model work until the child
+> owns the canonical lease and durable lock, deletes the protected prompt,
+> reports `ready`, and receives `proceed`.
+
 A portable harness for **autonomous, wrapper-governed coding agents** driven by
 GitHub Copilot CLI.
 
@@ -239,12 +249,12 @@ events are diagnostic only and cannot change agent selection or delivery.
 
 ### Live operations dashboard
 
-`tools\Start-DevPilotDashboard.ps1` is a read-only, OpenCode-inspired terminal
-UI over reviewer and review-handler event streams. The observer itself cannot
-start, stop, retry, promote, or otherwise control an agent. The
-`Watch-DevPilot*.ps1` launchers provide the separate convenience layer that
-starts child agents and points the observer at their shared state root. The
-launcher remains preview-only unless `-Operational` is passed.
+`tools\Start-DevPilotDashboard.ps1` is an OpenCode-inspired terminal UI over
+reviewer and review-handler event streams. Direct and attach-only launches are
+observe-only. A trusted `Watch-DevPilot*.ps1` launcher can separately opt in
+manual Reviewer or Review Handler dispatch. The TUI can only display and
+confirm the wrapper-derived capabilities; it cannot grant policy. Manual
+Reviewer approval votes are always disabled.
 
 The dashboard requires Node.js 24 or newer, PowerShell 7 for the watch
 launchers, and an interactive terminal at least 60 columns wide. Restore and
@@ -280,6 +290,13 @@ consumer repository whose conventional agent configs should be used:
 
 # Both agents, continuous 15-minute cadence:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
+
+# Enable manual Reviewer describe/dispatch with Reviewer writes still disabled:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -EnableManualReviewer
+
+# Enable explicitly trusted manual Reviewer comments/replies/summary:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -EnableManualReviewer `
+    -EnableManualReviewerWrites
 
 # One agent, or one specific PR:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Reviewer -Continuous
@@ -353,9 +370,20 @@ read explicit captures with `-EventLogPath`. The default **Current session**
 view shows every live instance plus the newest retained outcome per
 agent/session group. **Live** keeps active running, waiting, failed, blocked,
 and stale processes visible. **History** shows stopped or completed retained
-runs with timestamps and outcomes. `x` and `Shift+x` forget selected or all
-history rows only from the current dashboard process; they never change agent
-state or event logs.
+runs with timestamps and outcomes. `x` hides a selected PR history row and `Shift+x` restores hidden rows only in
+the current dashboard process; neither changes agent state or event logs.
+From a retained PR row, `m` opens manual dispatch when the trusted launcher
+enabled it. The optional multiline prompt is capped at 512 Unicode scalars.
+`Ctrl+d` performs a fresh provider-backed describe, then `d` and `y` are two
+separate confirmations of the displayed source commit, capability-policy
+digest, PR-state fingerprint, enabled capabilities, and disabled high-impact
+actions. `c` cancels only the broker-owned manual child. `q` awaits broker
+shutdown and never targets continuous watcher PIDs.
+
+Describe and dispatch failures remain distinct in the UI, including
+`source-changed`, `policy-changed`, `pr-state-changed`, `delivery-pending`,
+`already-running` with lease/state contention detail, broker launch failure,
+child failure, and cooperative versus forced cancellation.
 
 The layout adapts from three panes on a wide terminal to a single
 overview/detail route below 80 columns:
@@ -515,7 +543,33 @@ Non-negotiable, and enforced in code rather than prose:
   not read is rejected rather than ignored. The failure this prevents is an
   operator who believes something is enabled while it delivers nothing —
   which is worse than the feature being absent, because absence is visible.
-- **`-DryRun` self-checks are mandatory** and run offline.
+- **`-DryRun` self-checks are mandatory** and run offline. Offline DryRun
+  validates repository address syntax but reports an unverified,
+  non-dispatchable repository identity and does not create agent state.
+- **Repository identity is provider verified.** Azure DevOps repository GUIDs
+  must match provider metadata; GitHub repository IDs are retained as opaque
+  decimal strings without JavaScript-number conversion, including IDs above
+  53 bits. Event schema v3 carries this identity on every event and heartbeat.
+- **Canonical work leases and durable state are shared across launchers.**
+  The child acquires a lease keyed by verified repository identity, PR, and
+  role, followed by a repository/role durable-state lock. Acquisition is
+  bounded; contention reports `lease-contended` or `state-contended` and the
+  continuous watcher proceeds to its next candidate/pass.
+- **Runtime and durable state are separate.** `-StateDir` contains only
+  per-instance runtime data. Reviewed/handled records use state schema v2 under
+  `%LOCALAPPDATA%\DevPilot\state\v2` on Windows or the XDG user-state directory
+  on Unix. Tests and controlled deployments can pass absolute, non-overlapping
+  `-DurableStateRoot` and `-LeaseRoot` paths outside the repository.
+- **Legacy state migration is explicit.** Before a live role first uses state
+  v2, run `tools\Initialize-DevPilotDurableState.ps1` for one declared legacy
+  role directory. The tool verifies repository identity and each PR/commit
+  against the provider, refuses missing sealed delivery manifests or existing
+  conflicting state, and records an idempotent migration receipt.
+- **Forced analysis does not weaken writes.** The internal `-ForceAnalysis`
+  path bypasses only the already-reviewed/already-handled analysis check.
+  Existing records and fingerprints remain intact. A pending Reviewer delivery
+  returns `delivery-pending` before model analysis and must be resolved through
+  the existing sealed-delivery promotion flow.
 
 ---
 
@@ -530,14 +584,16 @@ See [`docs/adding-an-agent.md`](docs/adding-an-agent.md).
 
 ## Known limitations
 
-- **Azure DevOps only, today.** A provider abstraction for GitHub is designed
-  but not implemented. Thread resolution, auto-merge, and validation-run lookup
-  differ enough between hosts to need real adapters.
+- **Agent execution is Azure DevOps only, today.** Canonical repository identity
+  resolution supports Azure DevOps and GitHub, but GitHub agent execution still
+  lacks complete thread, write, and validation adapters.
 - **The local-validation tool ceiling is code-defined.** .NET and MSBuild repos
   work out of the box; adding another build ecosystem (npm, cargo, gradle)
   requires a toolkit change and a security review — deliberately, since the
   ceiling is a security boundary.
-- **Telemetry is local JSONL.** Central aggregation and a dashboard are planned.
+- **Telemetry is local JSONL.** Event schema v3 is the canonical history input;
+  legacy v2 streams remain visible by instance but are not projected into
+  repository/PR history and are never dispatch authority.
 - **An unattended `reviewer` posting run is not injection-proof.** The model
   cannot write anything itself, but the wrapper publishes text the model wrote.
   Schema validation bounds that text; it cannot establish that a finding is

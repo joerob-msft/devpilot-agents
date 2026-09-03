@@ -161,6 +161,8 @@ namespace DevPilot
         private readonly string agent;
         private readonly string instanceId;
         private readonly int processId;
+        private object repositoryIdentity;
+        private readonly object dispatch;
         private readonly TextWriter jsonOutput;
         private readonly Timer heartbeatTimer;
         private readonly int heartbeatIntervalMilliseconds;
@@ -180,15 +182,35 @@ namespace DevPilot
             string instanceId,
             int processId,
             int heartbeatIntervalMilliseconds,
-            TextWriter jsonOutput)
+            TextWriter jsonOutput,
+            string repositoryIdentityJson,
+            string dispatchJson)
         {
             this.path = path;
             this.agent = agent;
             this.instanceId = instanceId;
             this.processId = processId;
             this.jsonOutput = jsonOutput;
+            repositoryIdentity = ParseJson(repositoryIdentityJson);
+            dispatch = string.IsNullOrWhiteSpace(dispatchJson) ? null : ParseJson(dispatchJson);
             this.heartbeatIntervalMilliseconds = Math.Max(1000, heartbeatIntervalMilliseconds);
             heartbeatTimer = new Timer(WriteHeartbeat, null, Timeout.Infinite, Timeout.Infinite);
+        }
+
+        private static object ParseJson(string json)
+        {
+            using (var document = JsonDocument.Parse(string.IsNullOrEmpty(json) ? "{}" : json))
+            {
+                return document.RootElement.Clone();
+            }
+        }
+
+        public void SetRepositoryIdentity(string repositoryIdentityJson)
+        {
+            lock (gate)
+            {
+                repositoryIdentity = ParseJson(repositoryIdentityJson);
+            }
         }
 
         public AgentEventWriteResult WriteEvent(
@@ -225,7 +247,7 @@ namespace DevPilot
                 catch { }
                 var agentEvent = new Dictionary<string, object>
                 {
-                    ["schemaVersion"] = 2,
+                    ["schemaVersion"] = 3,
                     ["agent"] = agent,
                     ["instanceId"] = instanceId,
                     ["processId"] = processId,
@@ -236,6 +258,8 @@ namespace DevPilot
                     ["cycleNumber"] = cycleNumber,
                     ["pullRequestId"] = pullRequestId,
                     ["sourceCommit"] = this.sourceCommit,
+                    ["repositoryIdentity"] = repositoryIdentity,
+                    ["dispatch"] = dispatch,
                     ["data"] = data,
                     ["message"] = message ?? ""
                 };
@@ -264,7 +288,7 @@ namespace DevPilot
                     if (disposed || !heartbeatStarted) return;
                     var heartbeat = new Dictionary<string, object>
                     {
-                        ["schemaVersion"] = 2,
+                        ["schemaVersion"] = 3,
                         ["agent"] = agent,
                         ["instanceId"] = instanceId,
                         ["processId"] = processId,
@@ -275,6 +299,8 @@ namespace DevPilot
                         ["cycleNumber"] = cycleNumber,
                         ["pullRequestId"] = pullRequestId,
                         ["sourceCommit"] = sourceCommit,
+                        ["repositoryIdentity"] = repositoryIdentity,
+                        ["dispatch"] = dispatch,
                         ["data"] = new Dictionary<string, object>(),
                         ["message"] = ""
                     };
@@ -359,6 +385,7 @@ $script:AgentOutputEventTypes = @(
     'phase.changed',
     'delivery.retrying',
     'delivery.blocked',
+    'work.concurrent',
     'work.completed',
     'cycle.completed',
     'cycle.failed',
@@ -381,7 +408,14 @@ function New-AgentOutputContext {
         [string]$OutputMode = 'Auto',
         [string]$LogPath,
         [string]$PerInstanceLogDirectory,
+        [string]$LogFilePrefix = '',
         [int]$HeartbeatIntervalMilliseconds = 5000,
+        [System.Collections.IDictionary]$RepositoryIdentity = ([ordered]@{
+            schemaVersion = 1; provider = 'AzureDevOps'; repositoryId = ''
+            organization = ''; project = ''; repositoryName = ''; slug = ''; key = ''
+            verifiedAtUtc = ''; verified = $false; dispatchEligible = $false
+        }),
+        [AllowNull()][System.Collections.IDictionary]$Dispatch = $null,
         [bool]$IsOutputRedirected = [Console]::IsOutputRedirected,
         [bool]$SupportsAnsi = ($null -ne $PSStyle -and $PSStyle.OutputRendering -ne 'PlainText'),
         [int]$WindowWidth = $(try { [Console]::WindowWidth } catch { 0 }),
@@ -414,7 +448,7 @@ function New-AgentOutputContext {
     }
     $instanceId = [Guid]::NewGuid().ToString('D')
     $instanceLogPath = if ($PerInstanceLogDirectory) {
-        Join-Path $PerInstanceLogDirectory "$instanceId.jsonl"
+        Join-Path $PerInstanceLogDirectory "$LogFilePrefix$instanceId.jsonl"
     } else {
         $LogPath
     }
@@ -437,13 +471,17 @@ function New-AgentOutputContext {
     $eventStream = if ($PerInstanceLogDirectory -and $script:AgentEventStreamAvailable) {
         try {
             $jsonOutput = if ($resolved -eq 'Json') { [Console]::Out } else { $null }
+            $identityJson = ConvertTo-Json -InputObject $RepositoryIdentity -Depth 5 -Compress
+            $dispatchJson = if ($null -eq $Dispatch) { $null } else { ConvertTo-Json -InputObject $Dispatch -Depth 5 -Compress }
             New-Object DevPilot.AgentEventStream(
                 $instanceLogPath,
                 $Agent,
                 $instanceId,
                 $PID,
                 [Math]::Max(1000, $HeartbeatIntervalMilliseconds),
-                $jsonOutput)
+                $jsonOutput,
+                $identityJson,
+                $dispatchJson)
         }
         catch { $null }
     }
@@ -456,6 +494,8 @@ function New-AgentOutputContext {
         Mode = $resolved
         LogPath = $instanceLogPath
         EventStream = $eventStream
+        RepositoryIdentity = $RepositoryIdentity
+        Dispatch = $Dispatch
         WriteLine = $WriteLine
         WriteRaw = $WriteRaw
         StatusActive = $false
@@ -463,6 +503,18 @@ function New-AgentOutputContext {
         LastWorkCompletedCycle = -1
         LogMaxBytes = 10MB
         LogRetentionCount = 5
+    }
+}
+
+function Set-AgentOutputRepositoryIdentity {
+    param(
+        [Parameter(Mandatory)][hashtable]$Context,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$RepositoryIdentity
+    )
+    $Context.RepositoryIdentity = $RepositoryIdentity
+    if ($Context.EventStream) {
+        $identityJson = ConvertTo-Json -InputObject $RepositoryIdentity -Depth 5 -Compress
+        $Context.EventStream.SetRepositoryIdentity($identityJson)
     }
 }
 
@@ -711,7 +763,7 @@ function Publish-AgentEvent {
             $timestamp = [DateTime]::UtcNow.ToString('o')
         }
         $event = [ordered]@{
-            schemaVersion = 2
+            schemaVersion = 3
             agent = [string]$Context.Agent
             instanceId = [string]$Context.InstanceId
             processId = [int]$Context.ProcessId
@@ -722,6 +774,8 @@ function Publish-AgentEvent {
             cycleNumber = $Cycle
             pullRequestId = $PrId
             sourceCommit = $SourceCommit
+            repositoryIdentity = $Context.RepositoryIdentity
+            dispatch = $Context.Dispatch
             data = $safeData
             message = $safeMessage
         }
@@ -778,6 +832,7 @@ function Close-AgentOutputContext {
 Export-ModuleMember -Function @(
     'Test-AgentInteractiveOutput',
     'New-AgentOutputContext',
+    'Set-AgentOutputRepositoryIdentity',
     'Set-AgentOutputLegacySuppression',
     'Get-AgentNormalizedSkipReason',
     'Format-AgentCount',

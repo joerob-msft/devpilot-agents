@@ -8,15 +8,23 @@ param(
     [string[]]$EventLogPath = @(),
 
     [Parameter(DontShow)]
+    [string]$BrokerDescriptorPath,
+
+    [Parameter(DontShow)]
     [switch]$ValidateOnly
 )
 
 $ErrorActionPreference = 'Stop'
-$dashboardRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\src\DevPilot.Dashboard'))
+$dashboardRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path $PSScriptRoot '..') (Join-Path 'src' 'DevPilot.Dashboard')))
+$toolkitRoot = Split-Path $PSScriptRoot -Parent
+Import-Module (Join-Path (Join-Path (Join-Path $toolkitRoot 'src') 'DevPilot.AgentHarness') 'DevPilot.AgentHarness.psd1') -Force
 $packagePath = Join-Path $dashboardRoot 'package.json'
 $lockPath = Join-Path $dashboardRoot 'package-lock.json'
-$entryPath = Join-Path $dashboardRoot 'dist\src\index.js'
-$bunPath = Join-Path $dashboardRoot 'node_modules\bun\bin\bun.exe'
+$entryPath = Join-Path (Join-Path (Join-Path $dashboardRoot 'dist') 'src') 'index.js'
+$bunExecutable = if ($IsWindows) { 'bun.exe' } else { 'bun' }
+$nodeModulesPath = Join-Path $dashboardRoot 'node_modules'
+$bunPath = Join-Path (Join-Path (Join-Path $nodeModulesPath 'bun') 'bin') $bunExecutable
+$brokerScriptPath = Join-Path $PSScriptRoot 'Invoke-DevPilotAgentDispatch.ps1'
 
 function Stop-DashboardLaunch {
     param([Parameter(Mandatory)][string]$Message, [string[]]$Instructions = @())
@@ -71,13 +79,15 @@ if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf) -or
 }
 
 $requiredDependencies = @(
-    '@opentui\core\package.json',
-    '@opentui\solid\package.json',
-    'solid-js\package.json',
-    'bun\package.json'
+    @('@opentui', 'core', 'package.json'),
+    @('@opentui', 'solid', 'package.json'),
+    @('solid-js', 'package.json'),
+    @('bun', 'package.json')
 )
 $missingDependencies = @($requiredDependencies | Where-Object {
-        -not (Test-Path -LiteralPath (Join-Path (Join-Path $dashboardRoot 'node_modules') $_) -PathType Leaf)
+        $candidate = $nodeModulesPath
+        foreach ($segment in $_) { $candidate = Join-Path $candidate $segment }
+        -not (Test-Path -LiteralPath $candidate -PathType Leaf)
     })
 if ($missingDependencies.Count -gt 0) {
     Stop-DashboardLaunch 'Dashboard dependencies are not installed.' @(
@@ -89,8 +99,10 @@ if ($missingDependencies.Count -gt 0) {
 
 $manifest = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
 foreach ($dependencyName in @('@opentui/core', '@opentui/solid', 'solid-js', 'bun')) {
-    $relativeManifest = ($dependencyName -replace '/', '\') + '\package.json'
-    $installedManifestPath = Join-Path (Join-Path $dashboardRoot 'node_modules') $relativeManifest
+    $installedManifestPath = $nodeModulesPath
+    foreach ($segment in @($dependencyName -split '/') + @('package.json')) {
+        $installedManifestPath = Join-Path $installedManifestPath $segment
+    }
     $installedManifest = Get-Content -LiteralPath $installedManifestPath -Raw | ConvertFrom-Json
     $expectedVersion = if ($manifest.dependencies.PSObject.Properties[$dependencyName]) {
         [string]$manifest.dependencies.$dependencyName
@@ -151,6 +163,30 @@ if ($newestSource -gt $buildTime) {
     )
 }
 
+$descriptor = $null
+if ($BrokerDescriptorPath) {
+    $descriptor = (Resolve-Path -LiteralPath $BrokerDescriptorPath -ErrorAction Stop).Path
+    if (-not (Test-Path -LiteralPath $descriptor -PathType Leaf)) {
+        Stop-DashboardLaunch 'The trusted broker descriptor is unavailable.'
+    }
+    if (-not (Test-Path -LiteralPath $brokerScriptPath -PathType Leaf)) {
+        Stop-DashboardLaunch 'The trusted broker executable is unavailable.'
+    }
+    try {
+        $descriptorData = Get-Content -LiteralPath $descriptor -Raw -Encoding UTF8 |
+            ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
+        $descriptorStateRoot = Resolve-AgentTrustedRoot -Path ([IO.Path]::GetFullPath([string]$descriptorData.stateRoot)) `
+            -Kind watch-state -RepositoryRoot ([IO.Path]::GetFullPath($toolkitRoot))
+        [void](Assert-AgentTrustedFile -Path $descriptor -AllowedRoot $descriptorStateRoot `
+            -ExpectedPath (Join-Path $descriptorStateRoot 'broker.descriptor.v1.json') -Private)
+        [void](Assert-AgentTrustedFile -Path ([IO.Path]::GetFullPath($brokerScriptPath)) `
+            -AllowedRoot $toolkitRoot -ExpectedPath (Join-Path (Join-Path $toolkitRoot 'tools') 'Invoke-DevPilotAgentDispatch.ps1'))
+    }
+    catch {
+        Stop-DashboardLaunch "The broker authority descriptor is not trusted: $($_.Exception.Message)"
+    }
+}
+
 if ($ValidateOnly) { return }
 
 $arguments = New-Object System.Collections.Generic.List[string]
@@ -163,6 +199,15 @@ foreach ($path in $StateDir) {
 foreach ($path in $EventLogPath) {
     [void]$arguments.Add('--event-log')
     [void]$arguments.Add([IO.Path]::GetFullPath($path))
+}
+if ($descriptor) {
+    $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    [void]$arguments.Add('--broker-executable')
+    [void]$arguments.Add([IO.Path]::GetFullPath($pwsh))
+    [void]$arguments.Add('--broker-script')
+    [void]$arguments.Add([IO.Path]::GetFullPath($brokerScriptPath))
+    [void]$arguments.Add('--broker-descriptor')
+    [void]$arguments.Add([IO.Path]::GetFullPath($descriptor))
 }
 
 Push-Location $dashboardRoot

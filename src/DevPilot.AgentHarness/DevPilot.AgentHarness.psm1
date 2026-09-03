@@ -58,6 +58,7 @@ $script:AgentHarnessSupportedModels = @(
     "mai-code-1-flash-picker"
 )
 $script:AgentHarnessDefaultModelSentinel = "copilot-cli-default"
+$script:AgentManualAuthorities = @{}
 
 function Get-AgentSupportedModels {
     return , @($script:AgentHarnessSupportedModels)
@@ -515,6 +516,1007 @@ function Exit-AgentLock {
 }
 
 # ---------------------------------------------------------------------------
+# Canonical work leases and shared durable state v2
+# ---------------------------------------------------------------------------
+
+function Get-AgentSha256 {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    try {
+        return [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    }
+    finally {
+        [Array]::Clear($bytes, 0, $bytes.Length)
+    }
+}
+
+function Get-AgentDefaultDurableStateRoot {
+    if ($IsWindows) {
+        if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is required to resolve the durable-state root on Windows.' }
+        return (Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA 'DevPilot') 'state') 'v2')
+    }
+    $base = if ($env:XDG_STATE_HOME) { $env:XDG_STATE_HOME } else { Join-Path (Join-Path $HOME '.local') 'state' }
+    return (Join-Path (Join-Path (Join-Path $base 'devpilot') 'state') 'v2')
+}
+
+function Get-AgentDefaultLeaseRoot {
+    if ($IsWindows) {
+        if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is required to resolve the lease root on Windows.' }
+        return (Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA 'DevPilot') 'leases') 'v1')
+    }
+    $base = if ($env:XDG_STATE_HOME) { $env:XDG_STATE_HOME } else { Join-Path (Join-Path $HOME '.local') 'state' }
+    return (Join-Path (Join-Path (Join-Path $base 'devpilot') 'leases') 'v1')
+}
+
+function Get-AgentDefaultWatchStateRoot {
+    if ($IsWindows) {
+        if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is required to resolve the watch-state root on Windows.' }
+        return (Join-Path (Join-Path $env:LOCALAPPDATA 'DevPilot') 'watch')
+    }
+    $base = if ($env:XDG_STATE_HOME) { $env:XDG_STATE_HOME } else { Join-Path (Join-Path $HOME '.local') 'state' }
+    return (Join-Path (Join-Path $base 'devpilot') 'watch')
+}
+
+function Test-AgentPathWithin {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root)
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    return $fullPath.Equals($fullRoot, $comparison) -or
+        $fullPath.StartsWith($fullRoot + [IO.Path]::DirectorySeparatorChar, $comparison)
+}
+
+function Assert-AgentPathHasNoLinks {
+    param([Parameter(Mandatory)][string]$Path)
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($current) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($item) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $null -ne $item.LinkType) {
+                throw "Trusted root '$Path' traverses link or reparse point '$current'."
+            }
+        }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) { break }
+        $current = $parent
+    }
+}
+
+function Assert-AgentUnixOwner {
+    param([Parameter(Mandatory)][string]$Path)
+    $idPath = '/usr/bin/id'
+    $statPath = '/usr/bin/stat'
+    if (-not (Test-Path -LiteralPath $idPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $statPath -PathType Leaf)) {
+        throw 'Trusted Unix ownership cannot be validated because id or stat is unavailable.'
+    }
+    $current = ([string](& $idPath -u)).Trim()
+    if ($LASTEXITCODE -ne 0 -or $current -notmatch '^\d+$') {
+        throw 'Trusted Unix ownership cannot be validated for the current process.'
+    }
+    $owner = if ($IsMacOS) {
+        ([string](& $statPath -f '%u' $Path)).Trim()
+    }
+    else {
+        ([string](& $statPath -c '%u' -- $Path)).Trim()
+    }
+    if ($LASTEXITCODE -ne 0 -or $owner -notmatch '^\d+$' -or $owner -cne $current) {
+        throw "Trusted path '$Path' is not owned by the current user."
+    }
+}
+
+function Assert-AgentWindowsAcl {
+    param([Parameter(Mandatory)][string]$Path, [switch]$Private)
+    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $systemSid = [Security.Principal.SecurityIdentifier]::new(
+        [Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    $administratorsSid = [Security.Principal.SecurityIdentifier]::new(
+        [Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $ownerSid = ([Security.Principal.NTAccount]$acl.Owner).Translate(
+        [Security.Principal.SecurityIdentifier])
+    if ($ownerSid -ne $currentSid) { throw "Trusted path '$Path' is not owned by the current user." }
+    $writeRights = [Security.AccessControl.FileSystemRights]::Write -bor
+        [Security.AccessControl.FileSystemRights]::Modify -bor
+        [Security.AccessControl.FileSystemRights]::FullControl -bor
+        [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            $rule.IdentityReference -eq $currentSid -or $rule.IdentityReference -eq $systemSid -or
+            $rule.IdentityReference -eq $administratorsSid) {
+            continue
+        }
+        if ($Private -or (($rule.FileSystemRights -band $writeRights) -ne 0)) {
+            throw "Trusted path '$Path' grants unsafe access to another principal."
+        }
+    }
+}
+
+function Assert-AgentTrustedFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$AllowedRoot,
+        [string]$ExpectedPath,
+        [switch]$Private
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathFullyQualified($Path)) {
+        throw 'Trusted file path must be a non-empty absolute path.'
+    }
+    $resolved = [IO.Path]::GetFullPath($Path)
+    if ($ExpectedPath) {
+        $expected = [IO.Path]::GetFullPath($ExpectedPath)
+        $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        if (-not $resolved.Equals($expected, $comparison)) {
+            throw "Trusted file '$resolved' is not the expected file '$expected'."
+        }
+    }
+    if ($AllowedRoot -and -not (Test-AgentPathWithin -Path $resolved -Root $AllowedRoot)) {
+        throw "Trusted file '$resolved' is outside the allowed root."
+    }
+    Assert-AgentPathHasNoLinks -Path $resolved
+    $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
+    if ($item.PSIsContainer) { throw "Trusted file '$resolved' is not a file." }
+    if ($IsWindows) {
+        Assert-AgentWindowsAcl -Path $resolved -Private:$Private
+    }
+    else {
+        Assert-AgentUnixOwner -Path $resolved
+        $mode = [IO.File]::GetUnixFileMode($resolved)
+        $unsafe = [IO.UnixFileMode]::GroupWrite -bor [IO.UnixFileMode]::OtherWrite
+        if ($Private) {
+            $unsafe = $unsafe -bor [IO.UnixFileMode]::GroupRead -bor [IO.UnixFileMode]::GroupExecute -bor
+                [IO.UnixFileMode]::OtherRead -bor [IO.UnixFileMode]::OtherExecute
+        }
+        if (($mode -band $unsafe) -ne 0) {
+            throw "Trusted file '$resolved' has unsafe Unix permissions."
+        }
+    }
+    return $resolved
+}
+
+function Remove-AgentContainedDirectory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$AllowedRoot,
+        [Parameter(Mandatory)][string]$LeafPattern
+    )
+    $resolved = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetFullPath($AllowedRoot)
+    if (-not (Test-AgentPathWithin -Path $resolved -Root $root) -or
+        $resolved -eq $root -or (Split-Path $resolved -Leaf) -cnotmatch $LeafPattern) {
+        throw "Refusing to remove '$resolved' outside the allowed contained directory."
+    }
+    if (-not (Test-Path -LiteralPath $resolved)) { return }
+    Assert-AgentPathHasNoLinks -Path $resolved
+    $items = @(Get-ChildItem -LiteralPath $resolved -Force -Recurse -ErrorAction Stop)
+    if (-not $IsWindows) {
+        Assert-AgentUnixOwner -Path $resolved
+        foreach ($item in $items) {
+            Assert-AgentPathHasNoLinks -Path $item.FullName
+            Assert-AgentUnixOwner -Path $item.FullName
+        }
+        foreach ($directory in @($items | Where-Object { $_.PSIsContainer }) + @(Get-Item -LiteralPath $resolved -Force)) {
+            $mode = [IO.File]::GetUnixFileMode($directory.FullName)
+            [IO.File]::SetUnixFileMode($directory.FullName,
+                $mode -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
+        }
+    }
+    foreach ($item in @($items | Where-Object { -not $_.PSIsContainer })) {
+        if (-not (Test-AgentPathWithin -Path $item.FullName -Root $resolved)) {
+            throw 'Refusing to remove an item outside the allowed contained directory.'
+        }
+        Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+    }
+    foreach ($item in @($items | Where-Object { $_.PSIsContainer } |
+            Sort-Object { $_.FullName.Length } -Descending)) {
+        if (-not (Test-AgentPathWithin -Path $item.FullName -Root $resolved)) {
+            throw 'Refusing to remove an item outside the allowed contained directory.'
+        }
+        Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+    }
+    Remove-Item -LiteralPath $resolved -Force -ErrorAction Stop
+}
+
+function Resolve-AgentTrustedRoot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('durable-state', 'lease', 'watch-state')][string]$Kind,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [string[]]$DisallowedRoots = @(),
+        [switch]$Create
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathFullyQualified($Path)) {
+        throw "$Kind root must be a non-empty absolute path."
+    }
+    $resolved = [IO.Path]::GetFullPath($Path)
+    if (Test-AgentPathWithin -Path $resolved -Root $RepositoryRoot) {
+        throw "$Kind root '$resolved' must be outside the repository."
+    }
+    foreach ($other in @($DisallowedRoots)) {
+        if (-not $other) { continue }
+        if ((Test-AgentPathWithin -Path $resolved -Root $other) -or (Test-AgentPathWithin -Path $other -Root $resolved)) {
+            throw "$kind root '$resolved' must not contain or be contained by '$other'."
+        }
+    }
+    Assert-AgentPathHasNoLinks -Path $resolved
+    $created = -not (Test-Path -LiteralPath $resolved)
+    if ($created) {
+        if (-not $Create) { throw "$kind root '$resolved' does not exist." }
+        New-Item -ItemType Directory -Path $resolved -Force -ErrorAction Stop | Out-Null
+    }
+    $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer) { throw "$kind root '$resolved' is not a directory." }
+    Assert-AgentPathHasNoLinks -Path $resolved
+
+    if ($IsWindows) {
+        $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        if ($created) {
+            $acl = [Security.AccessControl.DirectorySecurity]::new()
+            $acl.SetOwner($currentSid)
+            $acl.SetAccessRuleProtection($true, $false)
+            $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+                [Security.AccessControl.InheritanceFlags]::ObjectInherit
+            $propagation = [Security.AccessControl.PropagationFlags]::None
+            $allow = [Security.AccessControl.AccessControlType]::Allow
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                    $currentSid, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, $propagation, $allow))
+            $systemSid = [Security.Principal.SecurityIdentifier]::new(
+                [Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                    $systemSid, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, $propagation, $allow))
+            Set-Acl -LiteralPath $resolved -AclObject $acl -ErrorAction Stop
+        }
+        Assert-AgentWindowsAcl -Path $resolved -Private
+    }
+    else {
+        Assert-AgentUnixOwner -Path $resolved
+        $mode = [IO.File]::GetUnixFileMode($resolved)
+        $unsafe = [IO.UnixFileMode]::GroupRead -bor [IO.UnixFileMode]::GroupWrite -bor
+            [IO.UnixFileMode]::GroupExecute -bor [IO.UnixFileMode]::OtherRead -bor
+            [IO.UnixFileMode]::OtherWrite -bor [IO.UnixFileMode]::OtherExecute
+        if (($mode -band $unsafe) -ne 0) {
+            if (-not $created) { throw "$kind root '$resolved' grants group or other access." }
+            [IO.File]::SetUnixFileMode($resolved,
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
+        }
+    }
+    return $resolved
+}
+
+function Get-AgentRepositoryIdentityKey {
+    param([Parameter(Mandatory)]$RepositoryIdentity)
+    $key = [string](Get-AgentProviderValue -InputObject $RepositoryIdentity -Name 'key')
+    $verified = [bool](Get-AgentProviderValue -InputObject $RepositoryIdentity -Name 'verified')
+    if (-not $verified -or $key -notmatch '^v1:(azuredevops|github):[^:]+$') {
+        throw 'A provider-verified RepositoryIdentityV1 is required.'
+    }
+    return $key
+}
+
+function Get-AgentExecutionKey {
+    param(
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role
+    )
+    $repoKey = Get-AgentRepositoryIdentityKey -RepositoryIdentity $RepositoryIdentity
+    return "$repoKey`:pr:$PullRequestId`:role:$Role"
+}
+
+function Enter-AgentExclusiveFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('lease-contended', 'state-contended')][string]$ContentionReason,
+        [ValidateRange(0, 30000)][int]$TimeoutMilliseconds = 2000,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None,
+        [hashtable]$Metadata = @{}
+    )
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $CancellationToken.ThrowIfCancellationRequested()
+        try {
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            $stream.SetLength(0)
+            $payload = [ordered]@{ pid = $PID; acquiredAtUtc = [DateTime]::UtcNow.ToString('o') }
+            foreach ($key in @($Metadata.Keys | Sort-Object)) { $payload[$key] = $Metadata[$key] }
+            $bytes = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Compress -Depth 4))
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+            return @{ Acquired = $true; Reason = ''; Stream = $stream; Path = $Path }
+        }
+        catch [IO.IOException] {
+            if ($deadline.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+                return @{ Acquired = $false; Reason = $ContentionReason; Stream = $null; Path = $Path }
+            }
+            $remaining = $TimeoutMilliseconds - [int]$deadline.ElapsedMilliseconds
+            $delay = [Math]::Min($remaining, [Random]::Shared.Next(50, 201))
+            if ($delay -gt 0) {
+                if ($CancellationToken.WaitHandle.WaitOne($delay)) { $CancellationToken.ThrowIfCancellationRequested() }
+            }
+        }
+    } while ($true)
+}
+
+function Enter-AgentWorkLease {
+    param(
+        [Parameter(Mandatory)][string]$LeaseRoot,
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [ValidateRange(0, 30000)][int]$TimeoutMilliseconds = 2000,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
+    )
+    $executionKey = Get-AgentExecutionKey -RepositoryIdentity $RepositoryIdentity -PullRequestId $PullRequestId -Role $Role
+    $keyHash = Get-AgentSha256 -Text $executionKey
+    if ($script:AgentManualAuthorities.ContainsKey($executionKey)) {
+        return @{
+            Acquired = $true; Reason = ''; Stream = $null
+            Path = $script:AgentManualAuthorities[$executionKey].Lease.Path
+            KeyHash = $keyHash; Preacquired = $true
+        }
+    }
+    $result = Enter-AgentExclusiveFile -Path (Join-Path $LeaseRoot "$keyHash.lease") `
+        -ContentionReason lease-contended -TimeoutMilliseconds $TimeoutMilliseconds `
+        -CancellationToken $CancellationToken -Metadata @{ keyHash = $keyHash; role = $Role }
+    $result['KeyHash'] = $keyHash
+    return $result
+}
+
+function Get-AgentDurableStateContext {
+    param(
+        [Parameter(Mandatory)][string]$DurableStateRoot,
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [switch]$Create
+    )
+    $repositoryKey = Get-AgentRepositoryIdentityKey -RepositoryIdentity $RepositoryIdentity
+    $repositoryKeyHash = Get-AgentSha256 -Text $repositoryKey
+    $roleRoot = Join-Path (Join-Path $DurableStateRoot $repositoryKeyHash) $Role
+    if ($Create -and -not (Test-Path -LiteralPath $roleRoot)) {
+        New-Item -ItemType Directory -Path $roleRoot -Force -ErrorAction Stop | Out-Null
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($roleRoot,
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
+        }
+    }
+    return @{
+        RoleRoot = $roleRoot
+        StatePath = Join-Path $roleRoot 'state.v2.json'
+        JournalPath = Join-Path $roleRoot 'state.v2.journal.json'
+        LockPath = Join-Path $roleRoot 'state.v2.lock'
+        InitializedPath = Join-Path $roleRoot 'initialized.v2'
+        RepositoryKey = $repositoryKey
+        RepositoryKeyHash = $repositoryKeyHash
+        Role = $Role
+        RepositoryIdentity = $RepositoryIdentity
+    }
+}
+
+function Enter-AgentDurableStateLock {
+    param(
+        [Parameter(Mandatory)][hashtable]$Context,
+        [ValidateRange(0, 30000)][int]$TimeoutMilliseconds = 2000,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
+    )
+    if (-not (Test-Path -LiteralPath $Context.RoleRoot)) {
+        throw "Durable role root '$($Context.RoleRoot)' does not exist."
+    }
+    $preacquired = @($script:AgentManualAuthorities.Values | Where-Object {
+            $_.StateLock.Path -ceq $Context.LockPath
+        } | Select-Object -First 1)
+    if ($preacquired.Count -gt 0) {
+        return @{ Acquired = $true; Reason = ''; Stream = $null; Path = $Context.LockPath; Preacquired = $true }
+    }
+    return Enter-AgentExclusiveFile -Path $Context.LockPath -ContentionReason state-contended `
+        -TimeoutMilliseconds $TimeoutMilliseconds -CancellationToken $CancellationToken `
+        -Metadata @{ repositoryKeyHash = $Context.RepositoryKeyHash; role = $Context.Role }
+}
+
+function Invoke-AgentWithWorkAuthority {
+    param(
+        [Parameter(Mandatory)][string]$LeaseRoot,
+        [Parameter(Mandatory)][hashtable]$DurableContext,
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [ValidateRange(0, 30000)][int]$TimeoutMilliseconds = 2000,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
+    )
+    $executionKey = Get-AgentExecutionKey -RepositoryIdentity $RepositoryIdentity -PullRequestId $PullRequestId -Role $Role
+    if ($script:AgentManualAuthorities.ContainsKey($executionKey)) {
+        $authority = $script:AgentManualAuthorities[$executionKey]
+        Repair-AgentDurableState -Context $DurableContext
+        $value = & $Action
+        return @{ Acquired = $true; Reason = ''; KeyHash = $authority.KeyHash; Value = $value }
+    }
+    $lease = Enter-AgentWorkLease -LeaseRoot $LeaseRoot -RepositoryIdentity $RepositoryIdentity `
+        -PullRequestId $PullRequestId -Role $Role -TimeoutMilliseconds $TimeoutMilliseconds `
+        -CancellationToken $CancellationToken
+    if (-not $lease.Acquired) {
+        return @{ Acquired = $false; Reason = $lease.Reason; KeyHash = $lease.KeyHash; Value = $null }
+    }
+
+    try {
+        $stateLock = Enter-AgentDurableStateLock -Context $DurableContext `
+            -TimeoutMilliseconds $TimeoutMilliseconds -CancellationToken $CancellationToken
+        if (-not $stateLock.Acquired) {
+            return @{ Acquired = $false; Reason = $stateLock.Reason; KeyHash = $lease.KeyHash; Value = $null }
+        }
+        try {
+            Repair-AgentDurableState -Context $DurableContext
+            $value = & $Action
+            return @{ Acquired = $true; Reason = ''; KeyHash = $lease.KeyHash; Value = $value }
+        }
+        finally {
+            Exit-AgentLock -Stream $stateLock.Stream
+        }
+    }
+    finally {
+        Exit-AgentLock -Stream $lease.Stream
+    }
+}
+
+function Enter-AgentManualDispatchStartup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ManifestPath,
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][hashtable]$DurableContext,
+        [Parameter(Mandatory)][string]$LeaseRoot,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][string]$EventLogPath,
+        [Parameter(Mandatory)][hashtable]$BoundCapabilities
+    )
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
+    $policyIdentity = if ($manifest.policy -is [Collections.IDictionary] -and
+        $manifest.policy.Contains('repositoryIdentity')) {
+        $manifest.policy['repositoryIdentity']
+    } else { $null }
+    if ($policyIdentity -is [Collections.IDictionary] -and
+        $policyIdentity.Contains('verifiedAtUtc') -and
+        $policyIdentity['verifiedAtUtc'] -is [DateTime]) {
+        $policyIdentity['verifiedAtUtc'] =
+            $policyIdentity['verifiedAtUtc'].ToUniversalTime().ToString('o')
+    }
+    $requiredDeny = if ($Role -eq 'reviewer') { 'EnableApprovalVote' } else { 'EnableAutoComplete' }
+    $allowedCapabilities = if ($Role -eq 'reviewer') {
+        @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment')
+    }
+    else {
+        @('EnableThreadReplies', 'EnableBuddyRequeue', 'EnableCodeChanges', 'EnablePush',
+            'LocalValidation', 'ResumeCodingSession')
+    }
+    $capabilities = @($manifest.policy.capabilities)
+    $mandatoryDenies = @($manifest.policy.mandatoryDenies)
+    $boundNames = @($BoundCapabilities.Keys)
+    $actualCapabilities = @($boundNames | Where-Object { [bool]$BoundCapabilities[$_] } | Sort-Object -Unique)
+    if ([int]$manifest.schemaVersion -ne 1 -or [string]$manifest.role -cne $Role -or
+        [string]$manifest.policy.role -cne $Role -or
+        [string]$manifest.dispatchId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
+        $mandatoryDenies -cnotcontains $requiredDeny -or
+        @($capabilities | Where-Object { $mandatoryDenies -ccontains $_ }).Count -gt 0 -or
+        @($capabilities | Where-Object { $allowedCapabilities -cnotcontains $_ }).Count -gt 0 -or
+        @($boundNames | Where-Object { ($_ -cnotin $allowedCapabilities) -and ($_ -cnotin $mandatoryDenies) }).Count -gt 0 -or
+        @($mandatoryDenies | Where-Object {
+                -not $BoundCapabilities.ContainsKey($_) -or [bool]$BoundCapabilities[$_]
+            }).Count -gt 0 -or
+        (ConvertTo-AgentCanonicalJson @($actualCapabilities)) -cne
+            (ConvertTo-AgentCanonicalJson @($capabilities | Sort-Object -Unique))) {
+        throw '[launch-failed] Manual dispatch manifest policy is malformed or inconsistent.'
+    }
+    $policy = Get-AgentCanonicalDigest -InputObject $manifest.policy
+    if ($policy -cne [string]$manifest.capabilityPolicyDigest) {
+        throw '[policy-changed] Manual dispatch policy digest does not match its snapshot.'
+    }
+    $expectedRepositoryKey = Get-AgentRepositoryIdentityKey -RepositoryIdentity $RepositoryIdentity
+    if ([string]$manifest.repositoryKey -cne $expectedRepositoryKey) {
+        throw '[repository-mismatch] Manual dispatch identity changed.'
+    }
+    $prId = [int]$manifest.pullRequestId
+    $lease = $null
+    $stateLock = $null
+    try {
+        $lease = Enter-AgentWorkLease -LeaseRoot $LeaseRoot -RepositoryIdentity $RepositoryIdentity `
+            -PullRequestId $prId -Role $Role -TimeoutMilliseconds 2000
+        if (-not $lease.Acquired) { throw "[already-running] $($lease.Reason)" }
+        $stateLock = Enter-AgentDurableStateLock -Context $DurableContext -TimeoutMilliseconds 2000
+        if (-not $stateLock.Acquired) { throw "[already-running] $($stateLock.Reason)" }
+        Repair-AgentDurableState -Context $DurableContext
+        if ($Role -eq 'reviewer') {
+            $records = Get-AgentDurableRecords -Context $DurableContext
+            if (Test-AgentReviewerDeliveryPending -Records $records -PullRequestId $prId `
+                    -SourceCommit ([string]$manifest.prStateFingerprintSourceCommit)) {
+                throw '[delivery-pending] Reviewer delivery is already pending for this source commit.'
+            }
+        }
+
+        $runtimeRoot = [IO.Path]::GetFullPath([string]$manifest.runtimeRoot)
+        $promptPath = [IO.Path]::GetFullPath([string]$manifest.operatorPromptPath)
+        if (-not (Test-AgentPathWithin -Path $promptPath -Root $runtimeRoot) -or
+            ((Get-Item -LiteralPath $promptPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw '[prompt-invalid] Operator prompt path is not protected.'
+        }
+        $promptStream = [IO.FileStream]::new($promptPath, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try {
+            if ($promptStream.Length -gt 4096) { throw '[prompt-invalid] Operator prompt byte limit exceeded.' }
+            $promptBytes = [byte[]]::new([int]$promptStream.Length)
+            [void]$promptStream.Read($promptBytes, 0, $promptBytes.Length)
+        }
+        finally { $promptStream.Dispose() }
+        $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+        $prompt = Test-AgentOperatorPrompt -Prompt ($strictUtf8.GetString($promptBytes))
+        Remove-Item -LiteralPath $promptPath -Force -ErrorAction Stop
+        if (-not $IsWindows -and (Test-Path -LiteralPath $promptPath)) {
+            throw '[prompt-invalid] Operator prompt cleanup failed.'
+        }
+
+        $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', [string]$manifest.startupPipe,
+            [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
+        try {
+            $pipe.Connect(10000)
+            $writer = [IO.StreamWriter]::new($pipe, [Text.UTF8Encoding]::new($false), 1024, $true)
+            $reader = [IO.StreamReader]::new($pipe, [Text.UTF8Encoding]::new($false, $true), $false, 1024, $true)
+            $writer.AutoFlush = $true
+            $ready = [ordered]@{
+                schemaVersion = 1; operation = 'ready'; dispatchId = [string]$manifest.dispatchId
+                processId = $PID; leaseKeyHash = $lease.KeyHash; eventLogPath = [IO.Path]::GetFullPath($EventLogPath)
+                boundCapabilities = $actualCapabilities
+                enforcedDenies = @($mandatoryDenies | Sort-Object -Unique)
+            }
+            $writer.WriteLine((ConvertTo-AgentCanonicalJson $ready))
+            $reply = $reader.ReadLine() | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+            if ([string]$reply.operation -cne 'proceed' -or [string]$reply.dispatchId -cne [string]$manifest.dispatchId) {
+                throw '[launch-failed] Broker did not authorize startup.'
+            }
+        }
+        finally { if ($pipe) { $pipe.Dispose() } }
+
+        $executionKey = Get-AgentExecutionKey -RepositoryIdentity $RepositoryIdentity -PullRequestId $prId -Role $Role
+        $runtimeRoot = [IO.Path]::GetFullPath([string]$manifest.runtimeRoot)
+        $cancelPath = [IO.Path]::GetFullPath([string]$manifest.cancellationRequestPath)
+        $cancelAckPath = [IO.Path]::GetFullPath([string]$manifest.cancellationAcknowledgementPath)
+        $cancelNonce = [string]$manifest.cancellationNonce
+        if ($cancelNonce -notmatch '^[0-9a-f]{36}$' -or
+            -not (Test-AgentPathWithin -Path $cancelPath -Root $runtimeRoot) -or
+            -not (Test-AgentPathWithin -Path $cancelAckPath -Root $runtimeRoot) -or
+            (Split-Path $cancelPath -Leaf) -cne 'cancel.requested.json' -or
+            (Split-Path $cancelAckPath -Leaf) -cne 'cancel.acknowledged.json') {
+            throw '[launch-failed] Manual dispatch cancellation binding is malformed.'
+        }
+        $script:AgentManualAuthorities[$executionKey] = @{
+            Lease = $lease; StateLock = $stateLock; KeyHash = $lease.KeyHash
+            OperatorContext = $prompt.Text
+            DispatchId = [string]$manifest.dispatchId
+            CancellationNonce = $cancelNonce
+            CancellationRequestPath = $cancelPath
+            CancellationAcknowledgementPath = $cancelAckPath
+        }
+        return $prompt.Text
+    }
+    catch {
+        try {
+            $message = $_.Exception.Message
+            $code = if ($message -match '^\[([a-z-]+)\]') { $Matches[1] } else { 'launch-failed' }
+            $detail = if ($code -eq 'already-running' -and
+                $message -match '^\[already-running\]\s+(lease-contended|state-contended)$') {
+                $Matches[1]
+            }
+            else { '' }
+            $failurePipe = [IO.Pipes.NamedPipeClientStream]::new('.', [string]$manifest.startupPipe,
+                [IO.Pipes.PipeDirection]::Out, [IO.Pipes.PipeOptions]::Asynchronous)
+            try {
+                $failurePipe.Connect(1000)
+                $failureWriter = [IO.StreamWriter]::new($failurePipe, [Text.UTF8Encoding]::new($false))
+                $failureWriter.WriteLine((ConvertTo-AgentCanonicalJson @{
+                            schemaVersion = 1; operation = 'rejected'
+                            dispatchId = [string]$manifest.dispatchId; code = $code; detail = $detail
+                        }))
+                $failureWriter.Flush()
+            }
+            finally { $failurePipe.Dispose() }
+        }
+        catch {
+            # The broker also observes an early child exit; notification is best effort.
+        }
+        if ($stateLock -and $stateLock.Acquired) { Exit-AgentLock $stateLock.Stream }
+        if ($lease -and $lease.Acquired) { Exit-AgentLock $lease.Stream }
+        throw
+    }
+}
+
+function Get-AgentManualOperatorContext {
+    param(
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role
+    )
+    $key = Get-AgentExecutionKey -RepositoryIdentity $RepositoryIdentity -PullRequestId $PullRequestId -Role $Role
+    if (-not $script:AgentManualAuthorities.ContainsKey($key)) { return '' }
+    return [string]$script:AgentManualAuthorities[$key].OperatorContext
+}
+
+function Test-AgentManualCancellationRequested {
+    param(
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role
+    )
+    $key = Get-AgentExecutionKey -RepositoryIdentity $RepositoryIdentity -PullRequestId $PullRequestId -Role $Role
+    if (-not $script:AgentManualAuthorities.ContainsKey($key)) { return $false }
+    $authority = $script:AgentManualAuthorities[$key]
+    $requestPath = [string]$authority.CancellationRequestPath
+    if (-not (Test-Path -LiteralPath $requestPath -PathType Leaf)) { return $false }
+    [void](Assert-AgentTrustedFile -Path $requestPath -AllowedRoot (Split-Path $requestPath -Parent) -Private)
+    $request = Get-Content -LiteralPath $requestPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 10 -ErrorAction Stop
+    if ([int]$request.schemaVersion -ne 1 -or [string]$request.operation -cne 'cancel' -or
+        [string]$request.dispatchId -cne [string]$authority.DispatchId -or
+        [string]$request.nonce -cne [string]$authority.CancellationNonce) {
+        throw '[cancel-invalid] Manual cancellation request failed its manifest binding.'
+    }
+    $ack = [ordered]@{
+        schemaVersion = 1; operation = 'cancel-acknowledged'
+        dispatchId = [string]$authority.DispatchId
+        nonce = [string]$authority.CancellationNonce
+        processId = $PID
+    }
+    $ackPath = [string]$authority.CancellationAcknowledgementPath
+    $temp = "$ackPath.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+    [IO.File]::WriteAllText($temp, (ConvertTo-AgentCanonicalJson $ack), [Text.UTF8Encoding]::new($false))
+    if (-not $IsWindows) {
+        [IO.File]::SetUnixFileMode($temp,
+            [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+    }
+    [IO.File]::Move($temp, $ackPath, $true)
+    return $true
+}
+
+function Get-AgentCancellationOutcome {
+    param(
+        [Parameter(Mandatory)][bool]$AcknowledgementPresent,
+        [Parameter(Mandatory)][bool]$AuthenticatedAcknowledgement,
+        [Parameter(Mandatory)][bool]$TreeExitedDuringGrace,
+        [Parameter(Mandatory)][bool]$ForcedContainmentSucceeded
+    )
+    if ($TreeExitedDuringGrace -and $AuthenticatedAcknowledgement) {
+        return @{ Operation = 'cancelled'; Result = 'cancelled-cooperative'; HandleReleaseObserved = $true }
+    }
+    if ($TreeExitedDuringGrace -and -not $AcknowledgementPresent) {
+        return @{ Operation = 'completed'; Result = 'completed'; HandleReleaseObserved = $true }
+    }
+    if ($ForcedContainmentSucceeded) {
+        return @{ Operation = 'cancelled'; Result = 'cancelled-forced'; HandleReleaseObserved = $true }
+    }
+    return @{ Operation = 'rejected'; Result = 'termination-failed'; HandleReleaseObserved = $false }
+}
+
+function Exit-AgentManualDispatchAuthority {
+    foreach ($key in @($script:AgentManualAuthorities.Keys)) {
+        $authority = $script:AgentManualAuthorities[$key]
+        Exit-AgentLock -Stream $authority.StateLock.Stream
+        Exit-AgentLock -Stream $authority.Lease.Stream
+        $script:AgentManualAuthorities.Remove($key)
+    }
+}
+
+function Write-AgentFileThrough {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes)
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+        [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+    try {
+        $stream.Write($Bytes, 0, $Bytes.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Install-AgentFileAtomic {
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination)
+    if (Test-Path -LiteralPath $Destination) {
+        $replaceBackup = "$Destination.replace-$PID-$([Guid]::NewGuid().ToString('N'))"
+        try { [IO.File]::Replace($Source, $Destination, $replaceBackup, $true) }
+        finally { Remove-Item -LiteralPath $replaceBackup -Force -ErrorAction SilentlyContinue }
+    }
+    else {
+        [IO.File]::Move($Source, $Destination)
+    }
+}
+
+function Read-AgentDurableState {
+    param([Parameter(Mandatory)][hashtable]$Context)
+    $initialized = Test-Path -LiteralPath $Context.InitializedPath -PathType Leaf
+    $bytes = $null
+    $lastIoError = $null
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        try {
+            $stream = [IO.FileStream]::new($Context.StatePath, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            try {
+                if ($stream.Length -gt 20MB) { throw "Durable state '$($Context.StatePath)' exceeds the size limit." }
+                $bytes = [byte[]]::new([int]$stream.Length)
+                $offset = 0
+                while ($offset -lt $bytes.Length) {
+                    $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+                    if ($read -eq 0) { throw [IO.IOException]::new('Durable state changed during the snapshot read.') }
+                    $offset += $read
+                }
+            }
+            finally { $stream.Dispose() }
+            break
+        }
+        catch [IO.IOException] {
+            $lastIoError = $_.Exception
+            if (-not $initialized -and $attempt -eq 0) {
+                return @{
+                    schemaVersion = 2; generation = 0; repositoryKey = $Context.RepositoryKey
+                    role = $Context.Role; records = @{}; migrationReceipts = @{}
+                }
+            }
+            if ($attempt -eq 9) { throw }
+            Start-Sleep -Milliseconds 25
+        }
+        catch [UnauthorizedAccessException] {
+            $lastIoError = $_.Exception
+            if ($attempt -eq 9) { throw }
+            Start-Sleep -Milliseconds 25
+        }
+    }
+    if ($null -eq $bytes) { throw $lastIoError }
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $state = $strictUtf8.GetString($bytes) |
+        ConvertFrom-Json -AsHashtable -Depth 100 -ErrorAction Stop
+    if ($state -isnot [hashtable] -or [int]$state.schemaVersion -ne 2 -or
+        [string]$state.repositoryKey -cne $Context.RepositoryKey -or [string]$state.role -cne $Context.Role -or
+        $state.records -isnot [hashtable] -or [long]$state.generation -lt 0) {
+        throw "Durable state '$($Context.StatePath)' is malformed or bound to another repository/role."
+    }
+    if ($state.migrationReceipts -isnot [hashtable]) { $state.migrationReceipts = @{} }
+    return $state
+}
+
+function Repair-AgentDurableState {
+    param([Parameter(Mandatory)][hashtable]$Context)
+    if (-not (Test-Path -LiteralPath $Context.JournalPath)) {
+        foreach ($orphan in @(Get-ChildItem -LiteralPath $Context.RoleRoot -Filter 'state.v2.tmp-*' -File -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $orphan.FullName -Force -ErrorAction Stop
+        }
+        return
+    }
+    $journal = $null
+    try {
+        $journal = Get-Content -LiteralPath $Context.JournalPath -Raw -Encoding UTF8 |
+            ConvertFrom-Json -AsHashtable -Depth 20 -ErrorAction Stop
+    }
+    catch {
+        Remove-Item -LiteralPath $Context.JournalPath -Force -ErrorAction Stop
+        return
+    }
+    $installed = $false
+    if (Test-Path -LiteralPath $Context.StatePath) {
+        $bytes = [IO.File]::ReadAllBytes($Context.StatePath)
+        $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        $installed = ($bytes.Length -eq [long]$journal.payloadLength -and
+            $hash -ceq [string]$journal.payloadSha256)
+        if ($installed) {
+            try {
+                $candidate = [Text.Encoding]::UTF8.GetString($bytes) |
+                    ConvertFrom-Json -AsHashtable -Depth 100 -ErrorAction Stop
+                $installed = ([long]$candidate.generation -eq [long]$journal.intendedGeneration)
+            }
+            catch { $installed = $false }
+        }
+    }
+    if (-not $installed) {
+        $backupPath = Join-Path $Context.RoleRoot ([string]$journal.backupName)
+        if ([string]$journal.backupName -and (Test-Path -LiteralPath $backupPath)) {
+            $backupBytes = [IO.File]::ReadAllBytes($backupPath)
+            $backupHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($backupBytes)).ToLowerInvariant()
+            if ($backupBytes.Length -ne [long]$journal.backupLength -or
+                $backupHash -cne [string]$journal.backupSha256) {
+                throw "Durable-state journal backup failed integrity validation."
+            }
+            $restoreTemp = Join-Path $Context.RoleRoot "state.v2.tmp-restore-$PID-$([Guid]::NewGuid().ToString('N'))"
+            Write-AgentFileThrough -Path $restoreTemp -Bytes $backupBytes
+            Install-AgentFileAtomic -Source $restoreTemp -Destination $Context.StatePath
+        }
+        elseif ([long]$journal.previousGeneration -eq 0) {
+            Remove-Item -LiteralPath $Context.StatePath -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            throw 'Durable-state journal cannot restore its previous committed generation.'
+        }
+    }
+    foreach ($name in @([string]$journal.tempName, [string]$journal.backupName)) {
+        if ($name -and [IO.Path]::GetFileName($name) -ceq $name) {
+            Remove-Item -LiteralPath (Join-Path $Context.RoleRoot $name) -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Remove-Item -LiteralPath $Context.JournalPath -Force -ErrorAction Stop
+}
+
+function Write-AgentDurableState {
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][hashtable]$State)
+    $current = Read-AgentDurableState -Context $Context
+    $next = [ordered]@{
+        schemaVersion = 2
+        generation = ([long]$current.generation + 1)
+        repositoryKey = $Context.RepositoryKey
+        repositoryIdentity = $Context.RepositoryIdentity
+        role = $Context.Role
+        records = $State.records
+        migrationReceipts = $State.migrationReceipts
+        updatedAtUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    $payload = [Text.UTF8Encoding]::new($false).GetBytes(($next | ConvertTo-Json -Compress -Depth 100))
+    $payloadHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payload)).ToLowerInvariant()
+    $token = "$PID-$([Guid]::NewGuid().ToString('N'))"
+    $tempName = "state.v2.tmp-$token"
+    $tempPath = Join-Path $Context.RoleRoot $tempName
+    $backupName = ''
+    $backupLength = 0
+    $backupHash = ''
+    try {
+        Write-AgentFileThrough -Path $tempPath -Bytes $payload
+        if (Test-Path -LiteralPath $Context.StatePath) {
+            $backupName = "state.v2.backup-$token"
+            $backupPath = Join-Path $Context.RoleRoot $backupName
+            $backupBytes = [IO.File]::ReadAllBytes($Context.StatePath)
+            Write-AgentFileThrough -Path $backupPath -Bytes $backupBytes
+            $backupLength = $backupBytes.Length
+            $backupHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($backupBytes)).ToLowerInvariant()
+        }
+        $journal = [ordered]@{
+            schemaVersion = 1; previousGeneration = [long]$current.generation
+            intendedGeneration = [long]$next.generation; payloadLength = $payload.Length
+            payloadSha256 = $payloadHash; tempName = $tempName; backupName = $backupName
+            backupLength = $backupLength; backupSha256 = $backupHash; phase = 'prepared'
+        }
+        $journalBytes = [Text.UTF8Encoding]::new($false).GetBytes(($journal | ConvertTo-Json -Compress))
+        $journalTemp = "$($Context.JournalPath).tmp-$token"
+        Write-AgentFileThrough -Path $journalTemp -Bytes $journalBytes
+        Install-AgentFileAtomic -Source $journalTemp -Destination $Context.JournalPath
+        Install-AgentFileAtomic -Source $tempPath -Destination $Context.StatePath
+        Remove-Item -LiteralPath $Context.JournalPath -Force -ErrorAction Stop
+        if ($backupName) { Remove-Item -LiteralPath (Join-Path $Context.RoleRoot $backupName) -Force -ErrorAction Stop }
+        return $next
+    }
+    finally {
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-AgentDurableRecords {
+    param([Parameter(Mandatory)][hashtable]$Context)
+    Repair-AgentDurableState -Context $Context
+    return (Read-AgentDurableState -Context $Context).records
+}
+
+function Get-AgentDurableRecordsSnapshot {
+    <#
+        Lock-free, non-authoritative scheduling view. Atomic state replacement
+        makes the committed file safe to read without taking the role lock.
+        Callers must still re-read under work authority before acting.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Context)
+    return (Read-AgentDurableState -Context $Context).records
+}
+
+function Set-AgentDurableRecords {
+    param(
+        [Parameter(Mandatory)][hashtable]$Context,
+        [Parameter(Mandatory)][hashtable]$Records,
+        [hashtable]$MigrationReceipts
+    )
+    $current = Read-AgentDurableState -Context $Context
+    if ($null -eq $MigrationReceipts) { $MigrationReceipts = $current.migrationReceipts }
+    return Write-AgentDurableState -Context $Context -State @{
+        records = $Records; migrationReceipts = $MigrationReceipts
+    }
+}
+
+function Initialize-AgentDurableState {
+    param(
+        [Parameter(Mandatory)][hashtable]$Context,
+        [Parameter(Mandatory)][hashtable]$Records,
+        [Parameter(Mandatory)][string]$ReceiptKey,
+        [Parameter(Mandatory)][string]$ReceiptSha256
+    )
+    Repair-AgentDurableState -Context $Context
+    $current = Read-AgentDurableState -Context $Context
+    $writeMarker = {
+        param([long]$Generation)
+        if (Test-Path -LiteralPath $Context.InitializedPath) { return }
+        $markerBytes = [Text.UTF8Encoding]::new($false).GetBytes("generation=$Generation`n")
+        $markerTemp = "$($Context.InitializedPath).tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+        Write-AgentFileThrough -Path $markerTemp -Bytes $markerBytes
+        Install-AgentFileAtomic -Source $markerTemp -Destination $Context.InitializedPath
+    }
+    if ($current.migrationReceipts.ContainsKey($ReceiptKey)) {
+        if ([string]$current.migrationReceipts[$ReceiptKey].sha256 -cne $ReceiptSha256) {
+            throw 'A different migration receipt already exists for this legacy state source.'
+        }
+        & $writeMarker ([long]$current.generation)
+        return $current
+    }
+    if ($current.generation -gt 0) {
+        throw 'Durable state is already initialized; migration will not merge or overwrite it.'
+    }
+    $receipts = $current.migrationReceipts
+    $receipts[$ReceiptKey] = @{
+        sha256 = $ReceiptSha256; importedAtUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    $written = Set-AgentDurableRecords -Context $Context -Records $Records -MigrationReceipts $receipts
+    $verified = Read-AgentDurableState -Context $Context
+    if ((Get-AgentCanonicalDigest $verified.records) -cne (Get-AgentCanonicalDigest $Records) -or
+        -not $verified.migrationReceipts.ContainsKey($ReceiptKey)) {
+        throw 'Durable state did not verify after migration write; initialization marker was withheld.'
+    }
+    & $writeMarker ([long]$written.generation)
+    return $written
+}
+
+function Test-AgentAnalysisRequired {
+    param([bool]$AlreadyProcessed, [bool]$ForceAnalysis)
+    return ($ForceAnalysis -or -not $AlreadyProcessed)
+}
+
+function Test-AgentReviewerDeliveryPending {
+    param(
+        [hashtable]$Records,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$SourceCommit
+    )
+    if ($null -eq $Records -or -not $Records.ContainsKey([string]$PullRequestId)) { return $false }
+    $record = $Records[[string]$PullRequestId]
+    return (([string](Get-AgentProviderValue $record sourceCommit)) -ieq $SourceCommit -and
+        [bool](Get-AgentProviderValue $record deliveryPending))
+}
+
+function Confirm-AgentLegacyRecordsForMigration {
+    param(
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][hashtable]$Records,
+        [Parameter(Mandatory)][scriptblock]$PullRequestReader
+    )
+    $confirmed = @{}
+    foreach ($key in @($Records.Keys)) {
+        $prId = 0
+        if (-not [int]::TryParse([string]$key, [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$prId) -or $prId -le 0) {
+            throw "Legacy state contains invalid pull request key '$key'."
+        }
+        $record = $Records[$key]
+        $commit = [string](Get-AgentProviderValue $record sourceCommit)
+        if ($commit -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "Legacy state for PR $prId has no valid source-commit binding."
+        }
+        $snapshot = & $PullRequestReader $prId
+        $liveCommit = [string](Get-AgentProviderValue $snapshot sourceCommit)
+        if ($liveCommit -ine $commit) {
+            throw "Legacy state for PR $prId does not match the provider's current source commit."
+        }
+        if ($Role -eq 'reviewer' -and [bool](Get-AgentProviderValue $record deliveryPending)) {
+            $artifactPath = [string](Get-AgentProviderValue $record artifactPath)
+            if (-not $artifactPath -or -not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+                throw "Legacy reviewer state for PR $prId has a pending delivery but its sealed manifest is missing."
+            }
+        }
+        $confirmed[[string]$prId] = $record
+    }
+    return $confirmed
+}
+
+# ---------------------------------------------------------------------------
 # Wrapper-owned JSON state (never repo-relative, never written by Copilot)
 # ---------------------------------------------------------------------------
 
@@ -920,6 +1922,497 @@ function Set-TimedProcessArguments {
     foreach ($argument in @($ArgumentList)) { $Psi.ArgumentList.Add($argument) }
 }
 
+function Resolve-AgentPwshPath {
+    $command = Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $path = [IO.Path]::GetFullPath($command.Source)
+    if (-not [IO.Path]::IsPathFullyQualified($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw 'pwsh did not resolve to an absolute executable path.'
+    }
+    return $path
+}
+
+function ConvertTo-AgentCanonicalJson {
+    param([AllowNull()]$InputObject)
+
+    function ConvertValue {
+        param([AllowNull()]$Value)
+        if ($null -eq $Value) { return 'null' }
+        if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
+        if ($Value -is [string] -or $Value -is [char]) {
+            return ConvertTo-Json -InputObject ([string]$Value) -Compress
+        }
+        if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or
+            $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or
+            $Value -is [int64]) {
+            return [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+        }
+        if ($Value -is [uint64] -and $Value -le [uint64][long]::MaxValue) {
+            return [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+        }
+        if ($Value -is [System.Collections.IDictionary] -or $Value -is [Management.Automation.PSCustomObject]) {
+            $keys = if ($Value -is [System.Collections.IDictionary]) {
+                @($Value.Keys | ForEach-Object { [string]$_ })
+            }
+            else {
+                @($Value.PSObject.Properties.Name)
+            }
+            $entries = foreach ($key in @($keys | Sort-Object -CaseSensitive)) {
+                $item = if ($Value -is [System.Collections.IDictionary]) { $Value[$key] } else { $Value.PSObject.Properties[$key].Value }
+                '{0}:{1}' -f (ConvertTo-Json -InputObject $key -Compress), (ConvertValue $item)
+            }
+            return '{' + ($entries -join ',') + '}'
+        }
+        if ($Value -is [System.Collections.IEnumerable]) {
+            return '[' + (@($Value | ForEach-Object { ConvertValue $_ }) -join ',') + ']'
+        }
+        throw "Canonical JSON v1 does not support values of type '$($Value.GetType().FullName)'."
+    }
+
+    return ConvertValue $InputObject
+}
+
+function Get-AgentCanonicalDigest {
+    param([Parameter(Mandatory)]$InputObject)
+    return Get-AgentSha256 -Text (ConvertTo-AgentCanonicalJson -InputObject $InputObject)
+}
+
+function Test-AgentOperatorPrompt {
+    param([AllowNull()][string]$Prompt)
+    $normalized = if ($null -eq $Prompt) { '' } else { $Prompt.Replace("`r`n", "`n").Replace("`r", "`n") }
+    $count = 0
+    for ($index = 0; $index -lt $normalized.Length; $index++) {
+        $character = $normalized[$index]
+        if ([char]::IsHighSurrogate($character)) {
+            if ($index + 1 -ge $normalized.Length -or -not [char]::IsLowSurrogate($normalized[$index + 1])) {
+                throw '[prompt-invalid] Operator prompt contains an unpaired surrogate.'
+            }
+            $value = [char]::ConvertToUtf32($character, $normalized[++$index])
+        }
+        elseif ([char]::IsLowSurrogate($character)) {
+            throw '[prompt-invalid] Operator prompt contains an unpaired surrogate.'
+        }
+        else {
+            $value = [int]$character
+        }
+        if (($value -lt 0x20 -and $value -notin @(0x09, 0x0A)) -or
+            ($value -ge 0x7F -and $value -le 0x9F)) {
+            throw '[prompt-invalid] Operator prompt contains a prohibited control character.'
+        }
+        $count++
+        if ($count -gt 512) { throw '[prompt-invalid] Operator prompt exceeds 512 Unicode scalar values.' }
+    }
+    return [ordered]@{
+        Text = $normalized
+        ScalarCount = $count
+        Sha256 = Get-AgentSha256 -Text $normalized
+        Preview = if ($count -eq 0) { '' } else { '[operator context redacted]' }
+    }
+}
+
+function New-AgentRedirectedProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [Parameter(Mandatory)][string]$StandardOutputPath,
+        [Parameter(Mandatory)][string]$StandardErrorPath,
+        [string]$WorkingDirectory,
+        [string[]]$EnvironmentVariablesToRemove = @()
+    )
+    $absolute = [IO.Path]::GetFullPath($FilePath)
+    if (-not [IO.Path]::IsPathFullyQualified($absolute) -or -not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
+        throw "Child executable must be an existing absolute file: '$FilePath'."
+    }
+    foreach ($path in @($StandardOutputPath, $StandardErrorPath)) {
+        $parent = Split-Path -Parent ([IO.Path]::GetFullPath($path))
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+        }
+    }
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    if ($IsWindows) {
+        $psi.FileName = $absolute
+        Set-TimedProcessArguments -Psi $psi -ArgumentList $ArgumentList
+    }
+    else {
+        $setsid = Get-Command setsid -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($setsid) {
+            $psi.FileName = [IO.Path]::GetFullPath($setsid.Source)
+            Set-TimedProcessArguments -Psi $psi -ArgumentList (@($absolute) + @($ArgumentList))
+        }
+        else {
+            $perl = Get-Command perl -CommandType Application -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if (-not $perl) {
+                throw 'Unix process containment requires a trusted setsid executable or Perl POSIX shim.'
+            }
+            $psi.FileName = [IO.Path]::GetFullPath($perl.Source)
+            Set-TimedProcessArguments -Psi $psi -ArgumentList (@(
+                '-MPOSIX', '-e', 'POSIX::setsid() >= 0 or die "setsid failed: $!"; exec @ARGV or die "exec failed: $!";',
+                '--', $absolute
+            ) + @($ArgumentList))
+        }
+    }
+    if ($WorkingDirectory) { $psi.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory) }
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $psi.StandardOutputEncoding = $utf8
+    $psi.StandardErrorEncoding = $utf8
+    $psi.StandardInputEncoding = $utf8
+    foreach ($name in @($EnvironmentVariablesToRemove) + @(Get-AgentSessionIsolationEnvVars)) {
+        [void]$psi.Environment.Remove($name)
+    }
+    if (-not ('DevPilot.Process.BoundedDrain' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+namespace DevPilot.Process {
+  public static class BoundedDrain {
+    public static async Task<string> ReadTailAsync(TextReader reader, int maximumCharacters) {
+      var tail = new StringBuilder();
+      var buffer = new char[8192];
+      int count;
+      while ((count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
+        tail.Append(buffer, 0, count);
+        if (tail.Length > maximumCharacters) {
+          tail.Remove(0, tail.Length - maximumCharacters);
+        }
+      }
+      return tail.ToString();
+    }
+  }
+}
+'@
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    if (-not $process.Start()) { throw "Failed to start '$absolute'." }
+    $process.StandardInput.Close()
+    $stdoutTask = [DevPilot.Process.BoundedDrain]::ReadTailAsync($process.StandardOutput, 10MB)
+    $stderrTask = [DevPilot.Process.BoundedDrain]::ReadTailAsync($process.StandardError, 10MB)
+    return @{
+        Process = $process
+        StdOutTask = $stdoutTask
+        StdErrTask = $stderrTask
+        StdOutPath = [IO.Path]::GetFullPath($StandardOutputPath)
+        StdErrPath = [IO.Path]::GetFullPath($StandardErrorPath)
+        StartedAtUtc = [DateTime]::UtcNow
+    }
+}
+
+function New-AgentPersistentRedirectedProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [Parameter(Mandatory)][string]$StandardOutputPath,
+        [Parameter(Mandatory)][string]$StandardErrorPath,
+        [string]$WorkingDirectory,
+        [string[]]$EnvironmentVariablesToRemove = @()
+    )
+    $absolute = [IO.Path]::GetFullPath($FilePath)
+    if (-not [IO.Path]::IsPathFullyQualified($absolute) -or -not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
+        throw "Child executable must be an existing absolute file: '$FilePath'."
+    }
+    $stdoutPath = [IO.Path]::GetFullPath($StandardOutputPath)
+    $stderrPath = [IO.Path]::GetFullPath($StandardErrorPath)
+    foreach ($path in @($stdoutPath, $stderrPath)) {
+        $parent = Split-Path -Parent $path
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+        }
+    }
+    $savedEnvironment = @{}
+    $removedNames = @($EnvironmentVariablesToRemove) + @(Get-AgentSessionIsolationEnvVars) |
+        Sort-Object -Unique
+    try {
+        foreach ($name in $removedNames) {
+            $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+            [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+        }
+        $parameters = @{
+            FilePath = $absolute
+            ArgumentList = $ArgumentList
+            RedirectStandardOutput = $stdoutPath
+            RedirectStandardError = $stderrPath
+            PassThru = $true
+        }
+        if ($WorkingDirectory) { $parameters.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory) }
+        $process = Start-Process @parameters
+    }
+    finally {
+        foreach ($name in $removedNames) {
+            [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
+        }
+    }
+    return @{
+        Process = $process
+        StdOutTask = $null
+        StdErrTask = $null
+        StdOutPath = $stdoutPath
+        StdErrPath = $stderrPath
+        StartedAtUtc = [DateTime]::UtcNow
+        PersistentRedirection = $true
+    }
+}
+
+function Complete-AgentRedirectedProcess {
+    param(
+        [Parameter(Mandatory)][hashtable]$Child,
+        [ValidateRange(1, 30000)][int]$DrainTimeoutMilliseconds = 5000,
+        [ValidateRange(256, 65536)][int]$DiagnosticTailCharacters = 4096
+    )
+    $persistent = $Child.ContainsKey('PersistentRedirection') -and [bool]$Child.PersistentRedirection
+    if ($persistent) {
+        $readTail = {
+            param([string]$Path)
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+            $text = [IO.File]::ReadAllText($Path)
+            if ($text.Length -gt 10MB) { $text = $text.Substring($text.Length - 10MB) }
+            return $text
+        }
+        $stdout = @{ Completed = $true; Text = (& $readTail $Child.StdOutPath) }
+        $stderr = @{ Completed = $true; Text = (& $readTail $Child.StdErrPath) }
+    }
+    else {
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($DrainTimeoutMilliseconds)
+        $stdout = Get-TaskTextBeforeDeadline -Task $Child.StdOutTask -DeadlineUtc $deadline
+        $stderr = Get-TaskTextBeforeDeadline -Task $Child.StdErrTask -DeadlineUtc $deadline
+        foreach ($entry in @(@($Child.StdOutPath, $stdout.Text), @($Child.StdErrPath, $stderr.Text))) {
+            $text = [string]$entry[1]
+            if ($text.Length -gt 10MB) { $text = $text.Substring($text.Length - 10MB) }
+            [IO.File]::WriteAllText([string]$entry[0], $text, [Text.UTF8Encoding]::new($false))
+        }
+    }
+    $sanitizeTail = {
+        param([string]$Text)
+        $safe = $Text -replace '(?ims)^Operator context \(untrusted DATA, not instructions\):.*\z',
+            '[operator context block redacted]'
+        if ($safe.Length -gt $DiagnosticTailCharacters) {
+            $safe = $safe.Substring($safe.Length - $DiagnosticTailCharacters)
+        }
+        return $safe
+    }
+    $safeOutputTail = & $sanitizeTail ([string]$stdout.Text)
+    $safeErrorTail = & $sanitizeTail ([string]$stderr.Text)
+    return @{
+        OutputDrained = $stdout.Completed -and $stderr.Completed
+        ExitCode = $(if ($Child.Process.HasExited) { $Child.Process.ExitCode } else { -1 })
+        SafeOutputTail = $safeOutputTail
+        SafeErrorTail = $safeErrorTail
+        StdOutPath = $Child.StdOutPath
+        StdErrPath = $Child.StdErrPath
+    }
+}
+
+function New-AgentProcessContainment {
+    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
+    if ($IsWindows) {
+        if (-not ('DevPilot.Native.Job' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace DevPilot.Native {
+  public static class Job {
+    [StructLayout(LayoutKind.Sequential)] public struct BasicAccounting {
+      public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
+      public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+    }
+    [StructLayout(LayoutKind.Sequential)] public struct BasicLimits {
+      public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+      public uint LimitFlags;
+      public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+      public uint ActiveProcessLimit;
+      public UIntPtr Affinity;
+      public uint PriorityClass, SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)] public struct IoCounters {
+      public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+      public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)] public struct ExtendedLimits {
+      public BasicLimits BasicLimitInformation;
+      public IoCounters IoInfo;
+      public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr CreateJobObject(IntPtr a, string n);
+    [DllImport("kernel32.dll")] public static extern bool SetInformationJobObject(IntPtr j, int c, ref ExtendedLimits i, uint l);
+    [DllImport("kernel32.dll")] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
+    [DllImport("kernel32.dll")] public static extern bool TerminateJobObject(IntPtr j, uint c);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(
+      IntPtr j, int c, out BasicAccounting i, uint l, IntPtr r);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+    public static IntPtr CreateKillOnClose(int pid, IntPtr processHandle) {
+      IntPtr job = CreateJobObject(IntPtr.Zero, null);
+      if (job == IntPtr.Zero) throw new Win32Exception();
+      var limits = new ExtendedLimits();
+      limits.BasicLimitInformation.LimitFlags = 0x00002000;
+      if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<ExtendedLimits>()) ||
+          !AssignProcessToJobObject(job, processHandle)) {
+        int error = Marshal.GetLastWin32Error(); CloseHandle(job); throw new Win32Exception(error);
+      }
+      return job;
+    }
+    public static bool IsEmpty(IntPtr job) {
+      BasicAccounting accounting;
+      if (!QueryInformationJobObject(job, 1, out accounting, (uint)Marshal.SizeOf<BasicAccounting>(), IntPtr.Zero))
+        throw new Win32Exception(Marshal.GetLastWin32Error());
+      return accounting.ActiveProcesses == 0;
+    }
+  }
+}
+'@
+        }
+        return @{ Platform = 'Windows'; Handle = [DevPilot.Native.Job]::CreateKillOnClose($Process.Id, $Process.Handle); ProcessGroupId = 0 }
+    }
+    if (-not ('DevPilot.Native.UnixProcessGroup' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace DevPilot.Native {
+  public static class UnixProcessGroup {
+    [DllImport("libc", SetLastError=true)] public static extern int kill(int pid, int signal);
+    public static int LastError() { return Marshal.GetLastWin32Error(); }
+  }
+}
+'@
+    }
+    if ($Process.Id -le 1) {
+        throw 'Unix containment requires a child-owned process group leader PID greater than 1.'
+    }
+    return @{
+        Platform = 'Unix'; Handle = $null; ProcessGroupId = $Process.Id
+        LeaderStartTimeUtcTicks = $Process.StartTime.ToUniversalTime().Ticks
+        ContainmentToken = [Guid]::NewGuid().ToString('N')
+    }
+}
+
+function Invoke-AgentUnixProcessGroupSignal {
+    param(
+        [Parameter(Mandatory)][hashtable]$Containment,
+        [Parameter(Mandatory)][ValidateSet(0, 9, 15)][int]$Signal,
+        [Diagnostics.Process]$Process
+    )
+    if ($Signal -eq 0) {
+        $processGroupId = [int]$Containment.ProcessGroupId
+        if ($processGroupId -le 1) {
+            throw 'Unix containment process group must be greater than 1.'
+        }
+        $result = [DevPilot.Native.UnixProcessGroup]::kill(-$processGroupId, 0)
+        if ($result -eq 0) { return 'alive' }
+        $errorNumber = [DevPilot.Native.UnixProcessGroup]::LastError()
+        if ($errorNumber -eq 3) { return 'absent' }
+        if ($errorNumber -eq 1) { return 'unknown' }
+        throw "Unix process-group observation failed with errno $errorNumber."
+    }
+    if (-not $Process) {
+        throw 'Unix containment leader identity is unavailable; refusing to signal a process group.'
+    }
+    $processGroupId = [int]$Containment.ProcessGroupId
+    if ($processGroupId -le 1 -or $processGroupId -ne $Process.Id) {
+        throw 'Unix containment process group is not the verified child leader; refusing to signal.'
+    }
+    $Process.Refresh()
+    if ($Process.HasExited) {
+        throw 'Unix containment leader has exited; refusing to signal an unverifiable process group.'
+    }
+    if ($Process.StartTime.ToUniversalTime().Ticks -ne [long]$Containment.LeaderStartTimeUtcTicks) {
+        throw 'Unix containment leader identity changed; refusing to signal a stale process group.'
+    }
+    $result = [DevPilot.Native.UnixProcessGroup]::kill(-$processGroupId, $Signal)
+    if ($result -eq 0) { return 'alive' }
+    $errorNumber = [DevPilot.Native.UnixProcessGroup]::LastError()
+    if ($errorNumber -eq 3) { return 'absent' }
+    if ($errorNumber -eq 1) {
+        throw "Unix process group $($Containment.ProcessGroupId) exists but signaling was denied (EPERM)."
+    }
+    throw "Unix process-group signal $Signal failed with errno $errorNumber."
+}
+
+function Stop-AgentProcessContainment {
+    param([Parameter(Mandatory)][hashtable]$Containment, [Diagnostics.Process]$Process)
+    if ($Containment.Platform -eq 'Windows') {
+        [void][DevPilot.Native.Job]::TerminateJobObject($Containment.Handle, 1)
+    }
+    else {
+        try {
+            if (-not $Process -or [int]$Containment.ProcessGroupId -le 1 -or
+                [int]$Containment.ProcessGroupId -ne $Process.Id) {
+                return $false
+            }
+            $Process.Refresh()
+            if (-not $Process.HasExited) {
+                if ($Process.StartTime.ToUniversalTime().Ticks -ne [long]$Containment.LeaderStartTimeUtcTicks) {
+                    return $false
+                }
+                [void](Invoke-AgentUnixProcessGroupSignal -Containment $Containment -Signal 15 -Process $Process)
+            }
+        }
+        catch { return $false }
+    }
+    $graceDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    while ([DateTime]::UtcNow -lt $graceDeadline) {
+        if (Test-AgentProcessContainmentExited -Containment $Containment -Process $Process) { return $true }
+        Start-Sleep -Milliseconds 25
+    }
+    if ($Containment.Platform -eq 'Unix') {
+        try {
+            if (Test-AgentProcessContainmentExited -Containment $Containment -Process $Process) { return $true }
+            $Process.Refresh()
+            if (-not $Process.HasExited -and
+                $Process.StartTime.ToUniversalTime().Ticks -eq [long]$Containment.LeaderStartTimeUtcTicks) {
+                [void](Invoke-AgentUnixProcessGroupSignal -Containment $Containment -Signal 9 -Process $Process)
+            }
+        }
+        catch { return $false }
+    }
+    else {
+        [void][DevPilot.Native.Job]::TerminateJobObject($Containment.Handle, 1)
+    }
+    $killDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    while ([DateTime]::UtcNow -lt $killDeadline) {
+        if (Test-AgentProcessContainmentExited -Containment $Containment -Process $Process) { return $true }
+        Start-Sleep -Milliseconds 25
+    }
+    return $false
+}
+
+function Test-AgentProcessContainmentExited {
+    param([Parameter(Mandatory)][hashtable]$Containment, [Diagnostics.Process]$Process)
+    if ($Process) { $Process.Refresh() }
+    if ($Containment.Platform -eq 'Windows') {
+        return [DevPilot.Native.Job]::IsEmpty($Containment.Handle)
+    }
+    try {
+        if (-not $Process) { return $false }
+        if ([int]$Containment.ProcessGroupId -le 1 -or
+            [int]$Containment.ProcessGroupId -ne $Process.Id) {
+            return $false
+        }
+        if (-not $Process.HasExited -and
+            $Process.StartTime.ToUniversalTime().Ticks -ne [long]$Containment.LeaderStartTimeUtcTicks) {
+            return $false
+        }
+        return (Invoke-AgentUnixProcessGroupSignal -Containment $Containment -Signal 0 -Process $Process) -eq 'absent'
+    }
+    catch { return $false }
+}
+
+function Close-AgentProcessContainment {
+    param([AllowNull()][hashtable]$Containment)
+    if ($Containment -and $Containment.Platform -eq 'Windows' -and $Containment.Handle -ne [IntPtr]::Zero) {
+        [void][DevPilot.Native.Job]::CloseHandle($Containment.Handle)
+        $Containment.Handle = [IntPtr]::Zero
+    }
+}
+
 function Stop-ProcessTree {
     param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
     try { $Process.Kill($true); return } catch {}
@@ -983,13 +2476,14 @@ function Invoke-TimedProcess {
         [switch]$CaptureStdErr,
         [string]$WorkingDirectory,
         [string[]]$EnvironmentVariablesToRemove = @(),
+        [scriptblock]$CancellationProbe,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath
     Set-TimedProcessArguments -Psi $psi -ArgumentList $ArgumentList
     if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
-    $psi.RedirectStandardInput = [bool]$StandardInputContent
+    $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = [bool]$CaptureStdOut
     $psi.RedirectStandardError = [bool]$CaptureStdErr
     $psi.UseShellExecute = $false
@@ -1029,15 +2523,24 @@ function Invoke-TimedProcess {
                 }
             }
         }
-
-        $exited = $false
-        if (-not $timedOut) {
-            $remainingMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-            $exited = $proc.WaitForExit($remainingMs)
-            $timedOut = -not $exited
+        else {
+            $proc.StandardInput.Close()
         }
 
-        if ($timedOut) {
+        $exited = $false
+        $cancelled = $false
+        if (-not $timedOut) {
+            while ([DateTime]::UtcNow -lt $deadline) {
+                if ($proc.WaitForExit(100)) { $exited = $true; break }
+                if ($CancellationProbe -and (& $CancellationProbe)) {
+                    $cancelled = $true
+                    break
+                }
+            }
+            $timedOut = -not $exited -and -not $cancelled
+        }
+
+        if ($timedOut -or $cancelled) {
             Stop-ProcessTree -Process $proc
             $proc.WaitForExit(5000) | Out-Null
         }
@@ -1054,6 +2557,7 @@ function Invoke-TimedProcess {
         return @{
             ExitCode  = $exitCode
             TimedOut  = $timedOut
+            Cancelled = $cancelled
             StdOut    = $stdoutResult.Text
             StdErr    = $stderrResult.Text
             ProcessId = $proc.Id
@@ -1811,6 +3315,7 @@ function New-AgentProviderContext {
         [Parameter(Mandatory)][string]$RepositoryName,
         [string]$RepositoryId = '',
         [scriptblock]$McpInvoker,
+        [scriptblock]$GitHubApiInvoker,
         [int]$TimeoutSeconds = 60
     )
 
@@ -1846,6 +3351,7 @@ function New-AgentProviderContext {
         RepositoryName = $RepositoryName
         RepositoryId   = $RepositoryId
         McpInvoker     = $McpInvoker
+        GitHubApiInvoker = $GitHubApiInvoker
         TimeoutSeconds = $TimeoutSeconds
         Slug           = if ($Provider -eq 'GitHub') { "$Organization/$RepositoryName" } else { "$Organization/$Project/$RepositoryName" }
     }
@@ -1858,6 +3364,152 @@ function Assert-AgentProviderContext {
     }
     if ($RequiredProvider -and $Context.Provider -cne $RequiredProvider) {
         throw "This operation requires the $RequiredProvider provider, but the context is $($Context.Provider)."
+    }
+}
+
+function New-AgentUnverifiedRepositoryIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('AzureDevOps', 'GitHub')][string]$Provider,
+        [Parameter(Mandatory)][string]$Organization,
+        [string]$Project = '',
+        [Parameter(Mandatory)][string]$RepositoryName
+    )
+    return [ordered]@{
+        schemaVersion = 1
+        provider = $Provider
+        repositoryId = ''
+        organization = $Organization
+        project = $Project
+        repositoryName = $RepositoryName
+        slug = if ($Provider -eq 'GitHub') { "$Organization/$RepositoryName" } else { "$Organization/$Project/$RepositoryName" }
+        key = ''
+        verifiedAtUtc = ''
+        verified = $false
+        dispatchEligible = $false
+    }
+}
+
+function Get-AgentProviderValue {
+    param([AllowNull()]$InputObject, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($key in $InputObject.Keys) {
+            if ([string]$key -ieq $Name) { return $InputObject[$key] }
+        }
+        return $null
+    }
+    $property = $InputObject.PSObject.Properties | Where-Object Name -IEq $Name | Select-Object -First 1
+    return $(if ($property) { $property.Value } else { $null })
+}
+
+function Resolve-AgentProviderRepositoryIdentity {
+    <#
+    .SYNOPSIS
+        Resolves the immutable repository ID from the configured provider.
+
+    .DESCRIPTION
+        Configuration supplies an address, never identity authority. Azure
+        DevOps repository GUIDs are checked against the provider response.
+        GitHub numeric IDs are read as raw JSON tokens so values above the
+        JavaScript safe-integer limit remain exact opaque decimal strings.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Context)
+
+    Assert-AgentProviderContext -Context $Context
+    $repositoryId = ''
+    $organization = [string]$Context.Organization
+    $project = [string]$Context.Project
+    $repositoryName = ''
+
+    switch ($Context.Provider) {
+        'AzureDevOps' {
+            $configuredGuid = [Guid]::Empty
+            if (-not [Guid]::TryParseExact(([string]$Context.RepositoryId), 'D', [ref]$configuredGuid)) {
+                throw "[identity-unresolved] Azure DevOps config repository.id must be a GUID in D format."
+            }
+            $response = & $Context.McpInvoker 'repo_repository' @{
+                action = 'get'
+                orgName = $organization
+                project = $project
+                repositoryNameOrId = [string]$Context.RepositoryName
+            } $false
+            $providerGuid = [Guid]::Empty
+            $rawId = [string](Get-AgentProviderValue -InputObject $response -Name 'id')
+            if (-not [Guid]::TryParseExact($rawId, 'D', [ref]$providerGuid)) {
+                throw "[identity-unresolved] Azure DevOps returned a missing or malformed repository ID."
+            }
+            if ($configuredGuid -ne $providerGuid) {
+                throw "[repository-mismatch] Azure DevOps returned a repository ID that does not match config."
+            }
+            $repositoryName = [string](Get-AgentProviderValue -InputObject $response -Name 'name')
+            $providerProject = Get-AgentProviderValue -InputObject $response -Name 'project'
+            $providerProjectName = [string](Get-AgentProviderValue -InputObject $providerProject -Name 'name')
+            if (-not $repositoryName -or -not $providerProjectName) {
+                throw "[identity-unresolved] Azure DevOps returned incomplete repository metadata."
+            }
+            if ($repositoryName -ine [string]$Context.RepositoryName -or $providerProjectName -ine $project) {
+                throw "[repository-mismatch] Azure DevOps repository address does not match config."
+            }
+            $repositoryId = $providerGuid.ToString('D').ToLowerInvariant()
+            $project = $providerProjectName
+        }
+        'GitHub' {
+            $raw = if ($Context.GitHubApiInvoker) {
+                & $Context.GitHubApiInvoker "repos/$($Context.Slug)" ([Math]::Min(10, [int]$Context.TimeoutSeconds))
+            }
+            else {
+                Invoke-AgentGitHubApi -Path "repos/$($Context.Slug)" -TimeoutSeconds ([Math]::Min(10, [int]$Context.TimeoutSeconds)) -RawText
+            }
+            try {
+                $document = [System.Text.Json.JsonDocument]::Parse($raw)
+                try {
+                    $root = $document.RootElement
+                    $idElement = [System.Text.Json.JsonElement]::new()
+                    $fullNameElement = [System.Text.Json.JsonElement]::new()
+                    $nameElement = [System.Text.Json.JsonElement]::new()
+                    if (-not $root.TryGetProperty('id', [ref]$idElement) -or
+                        $idElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Number) {
+                        throw "missing id"
+                    }
+                    $repositoryId = $idElement.GetRawText()
+                    if ($repositoryId -notmatch '^[1-9][0-9]*$') { throw "invalid id" }
+                    if (-not $root.TryGetProperty('full_name', [ref]$fullNameElement) -or
+                        $fullNameElement.ValueKind -ne [System.Text.Json.JsonValueKind]::String) {
+                        throw "missing full_name"
+                    }
+                    if ([string]$fullNameElement.GetString() -ine [string]$Context.Slug) {
+                        throw "[repository-mismatch] GitHub repository address does not match config."
+                    }
+                    if (-not $root.TryGetProperty('name', [ref]$nameElement) -or
+                        $nameElement.ValueKind -ne [System.Text.Json.JsonValueKind]::String) {
+                        throw "missing name"
+                    }
+                    $repositoryName = [string]$nameElement.GetString()
+                    if (-not $repositoryName) { throw "missing name" }
+                }
+                finally { $document.Dispose() }
+            }
+            catch {
+                if ($_.Exception.Message.StartsWith('[repository-mismatch]')) { throw }
+                throw "[identity-unresolved] GitHub returned malformed repository identity metadata."
+            }
+        }
+    }
+
+    return [ordered]@{
+        schemaVersion = 1
+        provider = [string]$Context.Provider
+        repositoryId = $repositoryId
+        organization = $organization
+        project = $project
+        repositoryName = $repositoryName
+        slug = if ($Context.Provider -eq 'GitHub') { "$organization/$repositoryName" } else { "$organization/$project/$repositoryName" }
+        key = "v1:$(([string]$Context.Provider).ToLowerInvariant()):$repositoryId"
+        verifiedAtUtc = [DateTime]::UtcNow.ToString('o')
+        verified = $true
+        dispatchEligible = $true
     }
 }
 
@@ -1884,7 +3536,8 @@ function Invoke-AgentGitHubApi {
         [Parameter(Mandatory)][string]$Path,
         [ValidateSet('GET', 'POST', 'PATCH')][string]$Method = 'GET',
         [hashtable]$Body,
-        [int]$TimeoutSeconds = 60
+        [int]$TimeoutSeconds = 60,
+        [switch]$RawText
     )
 
     $gh = Get-Command gh -ErrorAction SilentlyContinue
@@ -1910,6 +3563,7 @@ function Invoke-AgentGitHubApi {
         throw "GitHub API call '$Method $Path' failed: $detail"
     }
     if ([string]::IsNullOrWhiteSpace($result.StdOut)) { return $null }
+    if ($RawText) { return [string]$result.StdOut }
     try { return ($result.StdOut | ConvertFrom-Json -ErrorAction Stop) }
     catch { throw "GitHub API call '$Method $Path' returned malformed JSON." }
 }
@@ -2163,8 +3817,34 @@ function Get-AgentProviderPullRequestSnapshot {
             return ConvertTo-AgentProviderSnapshot -PullRequest $pr -Reviews $reviews `
                 -ExpectedOwner $Context.Organization -ExpectedRepository $Context.RepositoryName
         }
+        'AzureDevOps' {
+            $pr = & $Context.McpInvoker 'repo_pull_request' @{
+                action = 'get'
+                orgName = $Context.Organization
+                project = $Context.Project
+                repositoryId = $Context.RepositoryName
+                pullRequestId = $PullRequestId
+            } $false
+            $commit = [string](Get-AgentProviderValue $pr sourceCommitId)
+            if (-not $commit) {
+                $mergeSource = Get-AgentProviderValue $pr lastMergeSourceCommit
+                $commit = [string](Get-AgentProviderValue $mergeSource commitId)
+            }
+            if ($commit -notmatch '^[0-9a-fA-F]{40}$') {
+                throw "Azure DevOps pull request $PullRequestId has no valid source commit."
+            }
+            return @{
+                prId = $PullRequestId
+                sourceCommit = $commit.ToLowerInvariant()
+                status = [string](Get-AgentProviderValue $pr status)
+                isDraft = [bool](Get-AgentProviderValue $pr isDraft)
+                targetRefName = [string](Get-AgentProviderValue $pr targetRefName)
+                sourceRefName = [string](Get-AgentProviderValue $pr sourceRefName)
+                title = [string](Get-AgentProviderValue $pr title)
+            }
+        }
         default {
-            throw "Get-AgentProviderPullRequestSnapshot is not implemented for '$($Context.Provider)' in this layer; the Azure DevOps path uses its existing MCP invoker."
+            throw "Get-AgentProviderPullRequestSnapshot is not implemented for '$($Context.Provider)'."
         }
     }
 }
@@ -2441,12 +4121,52 @@ Export-ModuleMember -Function @(
     "Get-AgentCopilotArgs",
     "Enter-AgentLock",
     "Exit-AgentLock",
+    "Get-AgentSha256",
+    "Get-AgentDefaultDurableStateRoot",
+    "Get-AgentDefaultLeaseRoot",
+    "Get-AgentDefaultWatchStateRoot",
+    "Test-AgentPathWithin",
+    "Resolve-AgentTrustedRoot",
+    "Assert-AgentTrustedFile",
+    "Remove-AgentContainedDirectory",
+    "Get-AgentRepositoryIdentityKey",
+    "Get-AgentExecutionKey",
+    "Enter-AgentWorkLease",
+    "Get-AgentDurableStateContext",
+    "Enter-AgentDurableStateLock",
+    "Invoke-AgentWithWorkAuthority",
+    "Enter-AgentManualDispatchStartup",
+    "Get-AgentManualOperatorContext",
+    "Test-AgentManualCancellationRequested",
+    "Get-AgentCancellationOutcome",
+    "Exit-AgentManualDispatchAuthority",
+    "Repair-AgentDurableState",
+    "Read-AgentDurableState",
+    "Write-AgentDurableState",
+    "Get-AgentDurableRecords",
+    "Get-AgentDurableRecordsSnapshot",
+    "Set-AgentDurableRecords",
+    "Initialize-AgentDurableState",
+    "Test-AgentAnalysisRequired",
+    "Test-AgentReviewerDeliveryPending",
+    "Confirm-AgentLegacyRecordsForMigration",
     "Get-JsonState",
     "Set-JsonState",
     "Write-AgentMetadata",
     "ConvertFrom-AgentResultMarker",
     "Find-CopilotSessionForBranch",
     "Set-TimedProcessArguments",
+    "Resolve-AgentPwshPath",
+    "ConvertTo-AgentCanonicalJson",
+    "Get-AgentCanonicalDigest",
+    "Test-AgentOperatorPrompt",
+    "New-AgentRedirectedProcess",
+    "New-AgentPersistentRedirectedProcess",
+    "Complete-AgentRedirectedProcess",
+    "New-AgentProcessContainment",
+    "Stop-AgentProcessContainment",
+    "Test-AgentProcessContainmentExited",
+    "Close-AgentProcessContainment",
     "Stop-ProcessTree",
     "Get-TaskTextBeforeDeadline",
     "Invoke-TimedProcess",
@@ -2459,6 +4179,8 @@ Export-ModuleMember -Function @(
     "Test-AgentProviderSupported",
     "New-AgentProviderContext",
     "Assert-AgentProviderContext",
+    "New-AgentUnverifiedRepositoryIdentity",
+    "Resolve-AgentProviderRepositoryIdentity",
     "Invoke-AgentGitHubApi",
     "Invoke-AgentGitHubGraphQl",
     "ConvertTo-AgentProviderPullRequestStatus",
@@ -2472,4 +4194,3 @@ Export-ModuleMember -Function @(
     "Get-AgentProviderValidationRun",
     "Set-AgentProviderPullRequestVote"
 )
-

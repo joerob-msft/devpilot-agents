@@ -37,8 +37,17 @@ test("compact layout switches between overview and detail", () => {
     showInspector: false,
     inspectorOverlay: false,
   });
+
   const detail = decideLayout(40, true, true);
   assert.equal(detail.showRail, false);
   assert.equal(detail.showDetail, true);
   assert.equal(detail.showInspector, true);
+});
+
+test("manual dispatch can dedicate the content region at every supported width", () => {
+  assert.equal(decideLayout(140, true, false, false).showRail, false);
+  assert.equal(decideLayout(100, true, false, false).showRail, false);
+  const compact = decideLayout(70, true, false, false);
+  assert.equal(compact.showRail, false);
+  assert.equal(compact.showDetail, true);
 });

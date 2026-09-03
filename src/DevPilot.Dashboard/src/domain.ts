@@ -2,6 +2,27 @@ export const AGENTS = ["reviewer", "review-handler"] as const;
 export type AgentRole = (typeof AGENTS)[number];
 export type EventLevel = "debug" | "info" | "warning" | "error";
 
+export interface RepositoryIdentityV1 {
+  schemaVersion: 1;
+  provider: "AzureDevOps" | "GitHub";
+  repositoryId: string;
+  organization: string;
+  project: string;
+  repositoryName: string;
+  slug: string;
+  key: string;
+  verifiedAtUtc: string;
+  verified: boolean;
+  dispatchEligible: boolean;
+}
+
+export interface AgentDispatchV1 {
+  schemaVersion: 1;
+  dispatchId: string;
+  ownership: "tui";
+  forceAnalysis: true;
+}
+
 export interface AgentEvent {
   schemaVersion: number;
   agent: AgentRole;
@@ -15,6 +36,8 @@ export interface AgentEvent {
   cycleNumber: number;
   pullRequestId: number;
   sourceCommit: string;
+  repositoryIdentity: RepositoryIdentityV1 | null;
+  dispatch: AgentDispatchV1 | null;
   data: Record<string, unknown>;
   message: string;
 }
@@ -161,6 +184,66 @@ function boundedUnknown(value: unknown, depth: number): unknown {
   return String(value).slice(0, MAX_TEXT);
 }
 
+function parseRepositoryIdentity(value: unknown, required: boolean): RepositoryIdentityV1 | null {
+  if (value === null || value === undefined) {
+    if (required) throw new Error("repositoryIdentity is required for schema v3");
+    return null;
+  }
+  const raw = asRecord(value);
+  const provider = raw.provider;
+  if (provider !== "AzureDevOps" && provider !== "GitHub") throw new Error("repositoryIdentity.provider is invalid");
+  const repositoryId = boundedString(raw.repositoryId);
+  const organization = boundedString(raw.organization);
+  const project = boundedString(raw.project);
+  const repositoryName = boundedString(raw.repositoryName);
+  const slug = boundedString(raw.slug);
+  const key = boundedString(raw.key);
+  const verified = raw.verified === true;
+  const dispatchEligible = raw.dispatchEligible === true;
+  const verifiedAtUtc = boundedString(raw.verifiedAtUtc);
+  if (!organization || !repositoryName || !slug) throw new Error("repositoryIdentity display scope is incomplete");
+  if (verified) {
+    if (!repositoryId || !key || !verifiedAtUtc || !Number.isFinite(Date.parse(verifiedAtUtc))) {
+      throw new Error("verified repositoryIdentity is incomplete");
+    }
+    const expectedKey = `v1:${provider.toLowerCase()}:${repositoryId}`;
+    if (key !== expectedKey) throw new Error("repositoryIdentity.key does not match provider and repositoryId");
+    if (provider === "AzureDevOps" && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(repositoryId)) {
+      throw new Error("AzureDevOps repositoryIdentity.repositoryId must be a normalized GUID");
+    }
+    if (provider === "GitHub" && !/^[1-9][0-9]*$/.test(repositoryId)) {
+      throw new Error("GitHub repositoryIdentity.repositoryId must be an opaque decimal string");
+    }
+  } else if (repositoryId || key || verifiedAtUtc || dispatchEligible) {
+    throw new Error("unverified repositoryIdentity cannot be dispatch eligible or carry canonical identity");
+  }
+  if (dispatchEligible !== verified) throw new Error("dispatch eligibility requires provider verification");
+  return {
+    schemaVersion: 1,
+    provider,
+    repositoryId,
+    organization,
+    project,
+    repositoryName,
+    slug,
+    key,
+    verifiedAtUtc,
+    verified,
+    dispatchEligible,
+  };
+}
+
+function parseDispatch(value: unknown): AgentDispatchV1 | null {
+  if (value === null || value === undefined) return null;
+  const raw = asRecord(value);
+  const dispatchId = boundedString(raw.dispatchId);
+  if (raw.schemaVersion !== 1 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(dispatchId) ||
+      raw.ownership !== "tui" || raw.forceAnalysis !== true) {
+    throw new Error("dispatch metadata is invalid");
+  }
+  return { schemaVersion: 1, dispatchId: dispatchId.toLowerCase(), ownership: "tui", forceAnalysis: true };
+}
+
 export function parseAgentEvent(value: unknown): AgentEvent {
   const raw = asRecord(value);
   const agent = raw.agent;
@@ -180,8 +263,9 @@ export function parseAgentEvent(value: unknown): AgentEvent {
   const normalizedLevel: EventLevel =
     level === "debug" || level === "warning" || level === "error" ? level : "info";
 
+  const schemaVersion = Math.max(1, finiteInteger(raw.schemaVersion, 1));
   return {
-    schemaVersion: Math.max(1, finiteInteger(raw.schemaVersion, 1)),
+    schemaVersion,
     agent,
     instanceId,
     processId: Math.max(0, finiteInteger(raw.processId)),
@@ -193,6 +277,8 @@ export function parseAgentEvent(value: unknown): AgentEvent {
     cycleNumber: Math.max(0, finiteInteger(raw.cycleNumber)),
     pullRequestId: Math.max(0, finiteInteger(raw.pullRequestId)),
     sourceCommit: boundedString(raw.sourceCommit),
+    repositoryIdentity: parseRepositoryIdentity(raw.repositoryIdentity, schemaVersion >= 3),
+    dispatch: parseDispatch(raw.dispatch),
     data: boundedData(raw.data),
     message: boundedString(raw.message),
   };

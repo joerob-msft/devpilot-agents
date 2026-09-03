@@ -15,7 +15,15 @@ import {
 } from "./format.js";
 import { liveElapsedMilliseconds, OperationsReducer, totalElapsedMilliseconds } from "./reducer.js";
 import type { AgentRole, BlockedWarning, Completion, InstanceState, ViewFilter } from "./domain.js";
+import { PullRequestHistoryProjection, type PullRequestHistoryEntry } from "./history.js";
 import type { EventTailer } from "./tailer.js";
+import {
+  BrokerRejectionError,
+  type CapabilitySummary,
+  type DispatchAccepted,
+  type DispatchBroker,
+  type DispatchTerminal,
+} from "./dispatch.js";
 
 export const BRAND_PLANE = ["       __|__       ", "--o--o--(_)--o--o--"] as const;
 export const HELP_LEGEND = [
@@ -45,8 +53,179 @@ type PaneFocus = "rail" | "detail" | "timeline" | "inspector";
 
 export interface AppProps {
   reducer: OperationsReducer;
+  history?: PullRequestHistoryProjection;
   tailer: EventTailer;
   openUrl?: (url: string) => void | Promise<void>;
+  broker?: DispatchBroker | undefined;
+  brokerFailure?: () => string;
+}
+
+type ManualMode = "closed" | "prompt" | "describing" | "confirm" | "confirm-final" | "dispatching" | "active" | "terminal";
+
+export function normalizeOperatorPrompt(value: string): string {
+  return value.replace(/\r\n?/g, "\n");
+}
+
+export function promptScalarCount(value: string): number {
+  return Array.from(normalizeOperatorPrompt(value)).length;
+}
+
+export function appendPromptScalar(current: string, scalar: string): string {
+  const scalarValues = Array.from(scalar);
+  if (scalarValues.length !== 1 || scalarValues[0]!.codePointAt(0)! >= 0xd800 &&
+      scalarValues[0]!.codePointAt(0)! <= 0xdfff) return current;
+  const next = `${normalizeOperatorPrompt(current)}${scalar}`;
+  if (promptScalarCount(next) > 512) return current;
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(scalar)) return current;
+  return next;
+}
+
+export function printableKeySequence(key: {
+  name: string;
+  sequence?: string;
+  ctrl?: boolean;
+  meta?: boolean;
+}): string | null {
+  if (key.ctrl || key.meta) return null;
+  const candidate = key.name === "space" ? " " : key.sequence || key.name;
+  if (Array.from(candidate).length !== 1) return null;
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(candidate)) return null;
+  return candidate;
+}
+
+export function selectableCount(
+  selectedView: ViewFilter,
+  hasHistory: boolean,
+  historyLength: number,
+  instanceLength: number,
+): number {
+  return selectedView === "history" && hasHistory ? historyLength : instanceLength;
+}
+
+export function dispatchResultDetail(code: string, detail = ""): string {
+  const safe = line(detail.replace(/[\u0000-\u001f\u007f-\u009f]/g, " "), 160);
+  const labels: Record<string, string> = {
+    "source-changed": "Source changed after confirmation; describe the PR again.",
+    "policy-changed": "Manual capability policy changed; describe the PR again.",
+    "pr-state-changed": "Bound PR state changed; describe the PR again.",
+    "delivery-pending": "Reviewer delivery is pending; resolve or promote it before redispatch.",
+    "already-running": safe.includes("state-contended")
+      ? "Already running: repository role state is busy."
+      : "Already running: this PR and role hold the work lease.",
+    "launch-failed": "Broker could not safely launch the child.",
+    "role-not-allowed": "This manual role is not enabled by the trusted launcher.",
+  };
+  return `${labels[code] ?? `Dispatch rejected: ${code}`}${safe ? ` ${safe}` : ""}`;
+}
+
+function ManualDispatchPanel(props: {
+  mode: ManualMode;
+  entry: PullRequestHistoryEntry;
+  role: AgentRole;
+  prompt: string;
+  summary: CapabilitySummary | null;
+  accepted: DispatchAccepted | null;
+  status: string;
+}) {
+  const promptPreview = () => line(props.prompt.replace(/\n/g, " / ") || "(none)", 90);
+  const identity = () => props.summary?.repositoryIdentity ?? props.entry.repositoryIdentity;
+  const pullRequestId = () => props.summary?.prSnapshot.pullRequestId ?? props.entry.pullRequestId;
+  const title = () => props.summary?.prSnapshot.title ?? props.entry.title;
+  const author = () => props.summary?.prSnapshot.author ?? props.entry.author;
+  return (
+    <Panel title="MANUAL DISPATCH" flexGrow={1} borderColor={COLORS.warning}>
+      <box flexDirection="column" flexGrow={1}>
+        <text height={1} fg={COLORS.accent}>{identity().slug} / PR #{pullRequestId()}</text>
+        <text height={1} fg={COLORS.text}>{line(title() || "(untitled)", 100)} | {line(author() || "unknown author", 60)}</text>
+        <text height={1} fg={COLORS.text}>Role: {roleLabel(props.role)} | force fresh analysis</text>
+        <Show when={props.mode === "prompt"}>
+          <text height={1} fg={COLORS.warning}>Operator context is untrusted data; 512 Unicode scalars maximum.</text>
+          <text height={1} fg={COLORS.text}>{promptPreview()}</text>
+          <text height={1} fg={COLORS.muted}>{promptScalarCount(props.prompt)}/512 | Enter newline | Ctrl+D describe | Esc close</text>
+        </Show>
+        <Show when={props.mode === "describing" || props.mode === "dispatching"}>
+          <text height={1} fg={COLORS.warning}>{props.mode === "describing" ? "Fetching fresh provider and wrapper policy..." : "Starting contained broker-owned child..."}</text>
+        </Show>
+        <Show when={props.summary}>
+          {(summary: () => CapabilitySummary) => (
+            <>
+              <text height={1} fg={COLORS.text}>Source: {shortCommit(summary().prSnapshot.sourceCommit)} | {summary().prSnapshot.sourceRef} -&gt; {summary().prSnapshot.targetRef}</text>
+              <text height={1} fg={COLORS.ok}>Policy digest: {shortCommit(summary().capabilityPolicyDigest)} confirmed</text>
+              <text height={1} fg={COLORS.ok}>PR-state fingerprint: {shortCommit(summary().prStateFingerprint)} confirmed</text>
+              <text height={1} fg={COLORS.text}>Enabled: {line(summary().capabilities.join(", ") || "none", 100)}</text>
+              <text height={1} fg={COLORS.warning}>Disabled high-impact: {line(summary().mandatoryDenies.join(", ") || "none reported", 100)}</text>
+              <For each={summary().dynamicConstraints}>
+                {(constraint) => <text height={1} fg={COLORS.warning}>Constraint: {line(constraint, 100)}</text>}
+              </For>
+              <Show when={props.mode === "confirm"}>
+                <text height={1} fg={COLORS.warning}>First confirmation: press d to review the final execution gate; Esc cancels.</text>
+              </Show>
+              <Show when={props.mode === "confirm-final"}>
+                <text height={1} fg={COLORS.error}>FINAL CONFIRMATION: press y to dispatch this exact snapshot; Esc cancels.</text>
+              </Show>
+            </>
+          )}
+        </Show>
+        <Show when={props.accepted}>
+          {(accepted: () => DispatchAccepted) => (
+            <>
+              <text height={1} fg={COLORS.ok}>Accepted dispatch {shortId(accepted().dispatchId)} | child PID {accepted().childProcessId}</text>
+              <text height={1} fg={COLORS.text}>Correlated v3 events: {line(accepted().eventLogPath, 100)}</text>
+              <text height={1} fg={COLORS.warning}>Press c to cancel only this broker-owned manual child.</text>
+            </>
+          )}
+        </Show>
+        <Show when={props.status}>
+          <text height={1} fg={props.mode === "terminal" ? COLORS.warning : COLORS.muted}>{line(props.status, 160)}</text>
+        </Show>
+      </box>
+    </Panel>
+  );
+}
+
+function History(props: {
+  entries: PullRequestHistoryEntry[];
+  selected: number;
+  compact: boolean;
+}) {
+  const selected = () => props.entries[Math.min(props.selected, Math.max(0, props.entries.length - 1))];
+  return (
+    <>
+      <Panel title={`PR HISTORY ${props.entries.length}`} width={props.compact ? "100%" : 38} borderColor={COLORS.interactive}>
+        <Show when={props.entries.length} fallback={<Empty />}>
+          <scrollbox flexGrow={1} scrollY>
+            <For each={props.entries}>
+              {(entry, index) => (
+                <box height={4} paddingX={1} backgroundColor={index() === props.selected ? COLORS.panelAlt : COLORS.panel}>
+                  <text height={1} fg={index() === props.selected ? COLORS.accent : COLORS.text}>
+                    {index() === props.selected ? "> " : "  "}{entry.repositoryIdentity.repositoryName} PR #{entry.pullRequestId}
+                  </text>
+                  <text height={1} fg={COLORS.text}>{line(entry.title || "title not reported", 32)}</text>
+                  <text height={1} fg={COLORS.muted}>{line(entry.author || "author unknown", 32)}</text>
+                </box>
+              )}
+            </For>
+          </scrollbox>
+        </Show>
+      </Panel>
+      <Show when={!props.compact}>
+        <Panel title="RETAINED OUTCOMES" flexGrow={1}>
+          <Show when={selected()} fallback={<Empty />}>
+            {(entry: () => PullRequestHistoryEntry) => (
+              <box flexDirection="column">
+                <text height={1} fg={COLORS.accent}>{entry().repositoryIdentity.slug} / PR #{entry().pullRequestId}</text>
+                <text height={1} fg={COLORS.text}>{line(entry().title || "title not reported", 100)}</text>
+                <text height={1} fg={COLORS.muted}>{entry().author || "author unknown"} | {entry().sourceBranch || "?"} -&gt; {entry().targetBranch || "?"}</text>
+                <text height={1} fg={COLORS.text}>Reviewer: {entry().outcomes.reviewer?.result ?? "no terminal outcome"}</text>
+                <text height={1} fg={COLORS.text}>Handler: {entry().outcomes["review-handler"]?.result ?? "no terminal outcome"}</text>
+                <text height={1} fg={COLORS.muted}>Canonical key: {line(entry().key, 100)}</text>
+              </box>
+            )}
+          </Show>
+        </Panel>
+      </Show>
+    </>
+  );
 }
 
 interface PaletteCommand {
@@ -455,7 +634,17 @@ export function App(props: AppProps) {
   const [view, setView] = createSignal<ViewFilter>("current");
   const [eventWarningsOnly, setEventWarningsOnly] = createSignal(false);
   const [paletteIndex, setPaletteIndex] = createSignal(0);
+  const [historyFilter, setHistoryFilter] = createSignal("");
+  const [historyInputMode, setHistoryInputMode] = createSignal<"none" | "filter" | "jump">("none");
+  const [historyInput, setHistoryInput] = createSignal("");
   const [feedback, setFeedback] = createSignal("Observer is read-only");
+  const [manualMode, setManualMode] = createSignal<ManualMode>("closed");
+  const [manualEntry, setManualEntry] = createSignal<PullRequestHistoryEntry | null>(null);
+  const [manualRole, setManualRole] = createSignal<AgentRole>("reviewer");
+  const [operatorPrompt, setOperatorPrompt] = createSignal("");
+  const [capabilitySummary, setCapabilitySummary] = createSignal<CapabilitySummary | null>(null);
+  const [acceptedDispatch, setAcceptedDispatch] = createSignal<DispatchAccepted | null>(null);
+  const [manualStatus, setManualStatus] = createSignal("");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
 
   const refreshTimer = setInterval(() => {
@@ -465,6 +654,7 @@ export function App(props: AppProps) {
   onCleanup(() => {
     clearInterval(refreshTimer);
     if (feedbackTimer) clearTimeout(feedbackTimer);
+    void props.broker?.shutdown();
   });
 
   function notify(message: string): void {
@@ -478,14 +668,143 @@ export function App(props: AppProps) {
     const selectedRole = role();
     return props.reducer.list(now(), selectedRole === "all" ? undefined : selectedRole, view());
   });
+  const historyEntries = createMemo(() => {
+    revision();
+    const entries = props.history?.list(historyFilter()) ?? [];
+    const selectedRole = role();
+    return selectedRole === "all" ? entries : entries.filter((entry) => Boolean(entry.outcomes[selectedRole]));
+  });
+  const historyCurrent = createMemo(() =>
+    historyEntries()[Math.min(selected(), Math.max(0, historyEntries().length - 1))]);
   const current = createMemo(() => instances()[Math.min(selected(), Math.max(0, instances().length - 1))]);
   const layout = createMemo(() => decideLayout(dimensions().width, detailOpen(), inspectorOpen()));
   const activeFocus = createMemo(() => visibleFocus(layout(), focus()));
   createEffect(() => {
-    if (selected() >= instances().length) setSelected(Math.max(0, instances().length - 1));
+    const count = selectableCount(view(), Boolean(props.history), historyEntries().length, instances().length);
+    if (selected() >= count) setSelected(Math.max(0, count - 1));
     const corrected = activeFocus();
     if (corrected !== focus()) setFocus(corrected);
   });
+  const unsubscribeTerminal = props.broker?.subscribeTerminal((terminal: DispatchTerminal) => {
+    if (terminal.dispatchId !== acceptedDispatch()?.dispatchId) return;
+    const detail = terminal.operation === "cancelled"
+      ? terminal.result === "cancelled-forced"
+        ? "Cancellation forced after cooperative shutdown did not complete; process-tree exit observed."
+        : `Cancelled ${terminal.result ?? "cooperatively"}.`
+      : terminal.exitCode === 0
+        ? "Manual child completed successfully."
+        : `Manual child failed with exit code ${terminal.exitCode ?? "unknown"}.`;
+    setManualStatus(detail);
+    setManualMode("terminal");
+    setRevision((value) => value + 1);
+  });
+  onCleanup(() => unsubscribeTerminal?.());
+
+  function closeManual(): void {
+    if (manualMode() === "active" || manualMode() === "dispatching") {
+      notify("Cancel the active manual dispatch before closing");
+      return;
+    }
+    setManualMode("closed");
+    setManualEntry(null);
+    setCapabilitySummary(null);
+    setAcceptedDispatch(null);
+    setOperatorPrompt("");
+    setManualStatus("");
+  }
+
+  function openManual(): void {
+    if (!props.broker) {
+      notify("Observe-only launch: trusted manual broker is unavailable");
+      return;
+    }
+    const selectedEntry = historyCurrent();
+    if (view() !== "history" || !selectedEntry) {
+      notify("Select a retained PR history row before manual dispatch");
+      return;
+    }
+    setManualEntry({
+      ...selectedEntry,
+      repositoryIdentity: { ...selectedEntry.repositoryIdentity },
+      outcomes: { ...selectedEntry.outcomes },
+    });
+    setManualMode("prompt");
+    setCapabilitySummary(null);
+    setAcceptedDispatch(null);
+    setOperatorPrompt("");
+    setManualStatus("");
+    notify("Manual dispatch prompt opened");
+  }
+
+  async function describeManual(): Promise<void> {
+    const entry = manualEntry();
+    if (!props.broker || !entry || manualMode() !== "prompt") return;
+    setManualMode("describing");
+    setManualStatus("");
+    try {
+      const summary = await props.broker.describe(entry.repositoryIdentity.key, entry.pullRequestId, manualRole());
+      setCapabilitySummary(summary);
+      setManualMode("confirm");
+      setManualStatus("Fresh provider snapshot and wrapper-derived capabilities loaded.");
+    } catch (error) {
+      const message = error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`;
+      setManualStatus(message);
+      setManualMode("terminal");
+    }
+  }
+
+  async function dispatchManual(): Promise<void> {
+    const summary = capabilitySummary();
+    if (!props.broker || !summary || manualMode() !== "confirm-final") return;
+    setManualMode("dispatching");
+    setManualStatus("");
+    try {
+      const accepted = await props.broker.dispatch(summary, operatorPrompt());
+      setAcceptedDispatch(accepted);
+      props.tailer.registerEventLogPath(accepted.eventLogPath);
+      setManualMode("active");
+      setManualStatus("Dispatch accepted; waiting for correlated v3 child events.");
+    } catch (error) {
+      const message = error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`;
+      setManualStatus(message);
+      setManualMode("terminal");
+    }
+  }
+
+  async function cancelManual(): Promise<void> {
+    const accepted = acceptedDispatch();
+    if (!props.broker || !accepted || manualMode() !== "active") return;
+    setManualStatus("Requesting cooperative cancellation; forced cleanup follows only after the broker timeout.");
+    try {
+      const terminal = await props.broker.cancel(accepted.dispatchId);
+      setManualStatus(
+        terminal.result === "cancelled-forced"
+          ? "Cancellation was forced; the broker observed complete contained-process-tree exit."
+          : `Cancellation completed: ${terminal.result ?? "cooperative"}.`,
+      );
+      setManualMode("terminal");
+    } catch (error) {
+      setManualStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setManualMode("terminal");
+    }
+  }
+
+  async function quit(): Promise<void> {
+    setFeedback("Shutting down broker-owned manual work...");
+    try {
+      await props.broker?.shutdown();
+    } catch (error) {
+      setFeedback(`Broker shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    await props.tailer.stop();
+    renderer.destroy();
+  }
 
   function focusRail(): void {
     if (layout().mode === "compact") setDetailOpen(false);
@@ -508,11 +827,12 @@ export function App(props: AppProps) {
       notify("Select the instance rail first (Esc or Left)");
       return;
     }
-    if (!instances().length) {
+    const count = selectableCount(view(), Boolean(props.history), historyEntries().length, instances().length);
+    if (!count) {
       notify("No instances are available");
       return;
     }
-    setSelected((value) => (value + delta + instances().length) % instances().length);
+    setSelected((value) => (value + delta + count) % count);
     notify(delta < 0 ? "Previous instance selected" : "Next instance selected");
   }
 
@@ -563,6 +883,16 @@ export function App(props: AppProps) {
   }
 
   function forgetCurrentHistory(): void {
+    if (view() === "history" && props.history) {
+      const entry = historyEntries()[selected()];
+      if (!entry || !props.history.hide(entry.key)) {
+        notify("No PR history row is selected");
+        return;
+      }
+      setRevision((value) => value + 1);
+      notify("PR history row hidden for this dashboard process");
+      return;
+    }
     const instance = current();
     if (!instance || !props.reducer.forgetHistorical(instance.key)) {
       notify(instance ? "Selected instance is not historical" : "No historical instance is selected");
@@ -573,6 +903,13 @@ export function App(props: AppProps) {
   }
 
   function forgetAllHistory(): void {
+    if (view() === "history" && props.history) {
+      const restored = props.history.restoreAll();
+      setRevision((value) => value + 1);
+      notify(restored ? `${restored} PR history row(s) restored for this dashboard process` : "No hidden PR history rows are available");
+      return;
+    }
+
     const forgotten = props.reducer.forgetAllHistorical();
     if (!forgotten) {
       notify("No visible historical rows are available to forget");
@@ -580,6 +917,30 @@ export function App(props: AppProps) {
     }
     setRevision((value) => value + 1);
     notify(`${forgotten} historical row(s) forgotten for this dashboard process`);
+  }
+
+  function commitHistoryInput(): void {
+    if (!props.history) return;
+    if (historyInputMode() === "filter") {
+      setHistoryFilter(historyInput());
+      setSelected(0);
+      notify(historyInput() ? `PR history filter: ${historyInput()}` : "PR history filter cleared");
+    } else if (historyInputMode() === "jump") {
+      const pullRequestId = Number(historyInput());
+      const renderedEntries = historyEntries();
+      const matches = renderedEntries
+        .map((entry, index) => ({ entry, index }))
+        .filter(({ entry }) => entry.pullRequestId === pullRequestId);
+      if (matches.length !== 1) {
+        notify("PR jump is missing, excluded by the active role, or ambiguous across repositories");
+      } else {
+        const { entry, index } = matches[0]!;
+        setSelected(index);
+        notify(`Jumped to ${entry.repositoryIdentity.repositoryName} PR #${entry.pullRequestId}`);
+      }
+    }
+    setHistoryInputMode("none");
+    setHistoryInput("");
   }
 
   const warningAvailable = createMemo(() =>
@@ -653,6 +1014,54 @@ export function App(props: AppProps) {
   }
 
   useKeyboard((key) => {
+    if (manualMode() !== "closed") {
+      if (manualMode() === "prompt") {
+        if (key.name === "escape") closeManual();
+        else if (key.ctrl && key.name === "d") void describeManual();
+        else if (key.name === "tab") {
+          setManualRole((value) => value === "reviewer" ? "review-handler" : "reviewer");
+          setCapabilitySummary(null);
+        } else if (key.name === "backspace") {
+          setOperatorPrompt((value) => Array.from(value).slice(0, -1).join(""));
+        } else if (key.name === "return") {
+          setOperatorPrompt((value) => appendPromptScalar(value, "\n"));
+        } else {
+          const printable = printableKeySequence(key);
+          if (printable !== null) {
+            setOperatorPrompt((value) => appendPromptScalar(value, printable));
+          }
+        }
+      } else if (manualMode() === "confirm") {
+        if (key.name === "escape") closeManual();
+        else if (key.name === "d") setManualMode("confirm-final");
+      } else if (manualMode() === "confirm-final") {
+        if (key.name === "escape") closeManual();
+        else if (key.name === "y") void dispatchManual();
+      } else if (manualMode() === "active" && key.name === "c") {
+        void cancelManual();
+      } else if (manualMode() === "terminal" && (key.name === "escape" || key.name === "return")) {
+        closeManual();
+      }
+      return;
+    }
+    if (view() === "history" && props.history && historyInputMode() !== "none") {
+      if (key.name === "escape") {
+        setHistoryInputMode("none");
+        setHistoryInput("");
+        notify("History input cancelled");
+      } else if (key.name === "backspace") {
+        setHistoryInput((value) => value.slice(0, -1));
+      } else if (key.name === "return") {
+        commitHistoryInput();
+      } else {
+        const printable = printableKeySequence(key);
+        if (printable !== null &&
+            (historyInputMode() === "filter" || /^[0-9]$/.test(printable))) {
+          setHistoryInput((value) => `${value}${printable}`.slice(0, 80));
+        }
+      }
+      return;
+    }
     if (key.ctrl && key.name === "p") {
       setOverlay("palette");
       setPaletteIndex(0);
@@ -689,7 +1098,7 @@ export function App(props: AppProps) {
     }
 
     if (key.name === "q") {
-      void props.tailer.stop().finally(() => renderer.destroy());
+      void quit();
     } else if (key.name === "up" || key.name === "k") move(-1);
     else if (key.name === "down" || key.name === "j") move(1);
     else if (key.name === "return") {
@@ -732,6 +1141,17 @@ export function App(props: AppProps) {
       notify("Raw events overlay opened");
     } else if (key.name === "w") void nextWarning();
     else if (key.name === "o") void openCurrentUrl();
+    else if (view() === "history" && props.history && key.name === "/") {
+      setHistoryInputMode("filter");
+      setHistoryInput(historyFilter());
+      notify("Enter a case-insensitive PR history filter");
+    }
+    else if (view() === "history" && props.history && /^[0-9]$/.test(key.name)) {
+      setHistoryInputMode("jump");
+      setHistoryInput(key.name);
+      notify("Enter a PR number, then press Enter to jump");
+    }
+    else if (key.name === "m") openManual();
     else if (key.name === "f") cycleView(key.shift ? -1 : 1);
     else if (key.name === "x") {
       if (key.shift) forgetAllHistory();
@@ -763,6 +1183,11 @@ export function App(props: AppProps) {
     const live = instances().filter((item) => streamLabel(item) === "Live").length;
     const history = instances().filter((item) => streamLabel(item) === "History").length;
     const stale = instances().filter((item) => streamLabel(item) === "Stale").length;
+    if (view() === "history" && props.history) {
+      const input = historyInputMode() === "none" ? "" : ` | ${historyInputMode()}: ${historyInput()}`;
+      const summary = `PR history ${historyEntries().length}${historyFilter() ? ` | filter: ${historyFilter()}` : ""}${input}`;
+      return { summary, hint: "↑/↓ select | / filter | number jump | Tab role | x hide | X restore | m manual | f view | ? | q" };
+    }
     const summary = dimensions().width < 80
       ? `${viewLabel(view())} ${instances().length} | L ${live} H ${history} S ${stale}`
       : `${viewLabel(view())} ${instances().length} | Live ${live} History ${history} Stale ${stale}`;
@@ -784,23 +1209,47 @@ export function App(props: AppProps) {
     <box width="100%" height="100%" flexDirection="column" backgroundColor={COLORS.bg}>
       <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
         <text height={1} fg={COLORS.brand}>DEVPILOT OPERATIONS</text>
-        <text height={1} fg={COLORS.muted}>OBSERVE ONLY | {headerContext()}</text>
+        <text height={1} fg={props.broker ? COLORS.warning : COLORS.muted}>
+          {props.broker ? "TRUSTED MANUAL ENABLED" : "OBSERVE ONLY"} | {headerContext()}
+        </text>
       </box>
       <box flexGrow={1} flexDirection="row" gap={1} padding={1} overflow="hidden">
-        <Show when={layout().showRail}>
-          <Rail instances={instances()} selected={selected()} now={now()} compact={layout().mode === "compact"} focused={activeFocus() === "rail"} />
-        </Show>
-        <Show when={layout().showDetail}>
-          <Detail instance={current()} now={now()} focus={activeFocus()} />
-        </Show>
-        <Show when={layout().showInspector && !layout().inspectorOverlay}>
-          <Inspector instance={current()} focused={activeFocus() === "inspector"} />
+        <Show when={manualMode() !== "closed" && manualEntry()} fallback={
+          <Show when={view() === "history" && props.history} fallback={
+          <>
+            <Show when={layout().showRail}>
+              <Rail instances={instances()} selected={selected()} now={now()} compact={layout().mode === "compact"} focused={activeFocus() === "rail"} />
+            </Show>
+            <Show when={layout().showDetail}>
+              <Detail instance={current()} now={now()} focus={activeFocus()} />
+            </Show>
+            <Show when={layout().showInspector && !layout().inspectorOverlay}>
+              <Inspector instance={current()} focused={activeFocus() === "inspector"} />
+            </Show>
+          </>
+        }>
+          <History entries={historyEntries()} selected={selected()} compact={layout().mode === "compact"} />
+          </Show>
+        }>
+          {(entry: () => PullRequestHistoryEntry) => (
+            <ManualDispatchPanel
+              mode={manualMode()}
+              entry={entry()}
+              role={manualRole()}
+              prompt={operatorPrompt()}
+              summary={capabilitySummary()}
+              accepted={acceptedDispatch()}
+              status={manualStatus() || props.brokerFailure?.() || ""}
+            />
+          )}
         </Show>
       </box>
-      <Show when={diagnostics().length > 0}>
+      <Show when={diagnostics().length > 0 || props.brokerFailure?.()}>
         <box height={1} paddingX={1} backgroundColor="#282117">
           <text height={1} fg={COLORS.warning}>
-            SOURCE WARNING: {line(diagnostics().at(-1)?.message ?? "event source error", Math.max(20, dimensions().width - 20))}
+            {props.brokerFailure?.()
+              ? `BROKER FAILURE: ${line(props.brokerFailure?.() ?? "", Math.max(20, dimensions().width - 20))}`
+              : `SOURCE WARNING: ${line(diagnostics().at(-1)?.message ?? "event source error", Math.max(20, dimensions().width - 20))}`}
           </text>
         </box>
       </Show>
@@ -843,19 +1292,20 @@ export function App(props: AppProps) {
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "help"}>
-        <OverlayPanel title="HELP - OBSERVE MODE" width={78} height={24}>
+        <OverlayPanel title={props.broker ? "HELP - TRUSTED MANUAL MODE" : "HELP - OBSERVE MODE"} width={78} height={25}>
           <text height={1} fg={COLORS.text}>Left / Right      Focus visible pane</text>
           <text height={1} fg={COLORS.text}>Up/Down or j/k    Select instance when rail is focused</text>
           <text height={1} fg={COLORS.text}>Enter              Drill rail → narrative → timeline</text>
           <text height={1} fg={COLORS.text}>Esc / b            Back timeline/inspector → detail → rail</text>
           <text height={1} fg={COLORS.text}>Tab / Shift+Tab    Cycle role filter</text>
           <text height={1} fg={COLORS.text}>f / Shift+f        Cycle Live, Current session, History view</text>
-          <text height={1} fg={COLORS.text}>x / Shift+x        Forget selected/all history in this view only</text>
+          <text height={1} fg={COLORS.text}>x / Shift+x        Hide selected / restore hidden PR history rows</text>
           <text height={1} fg={COLORS.text}>i                  Open/close inspector</text>
           <text height={1} fg={COLORS.text}>e                  Raw events; arrows change filter</text>
           <text height={1} fg={COLORS.text}>w                  Next attention item</text>
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
+          <text height={1} fg={COLORS.text}>m                  Manual dispatch for selected retained PR (trusted launch only)</text>
           <text height={1} fg={COLORS.text}>?                  Help</text>
           <text height={1} fg={COLORS.text}>q                  Quit</text>
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[0]}</text>

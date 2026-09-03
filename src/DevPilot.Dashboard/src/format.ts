@@ -59,6 +59,7 @@ const EVENT_NARRATIVE: Record<string, string> = {
   "work.completed": "Delivery completed",
   "delivery.retrying": "Delivery will retry",
   "delivery.blocked": "Delivery is blocked",
+  "work.concurrent": "Concurrent work owns this role",
   "agent.waiting": "Waiting for next scan",
   "cycle.completed": "Scan cycle completed",
   "cycle.failed": "Scan cycle failed",

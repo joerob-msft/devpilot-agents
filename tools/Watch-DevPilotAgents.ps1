@@ -39,6 +39,14 @@ param(
 
     [Parameter(ParameterSetName = 'Launch')]
     [ValidateNotNullOrEmpty()]
+    [string]$DurableStateRoot,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [ValidateNotNullOrEmpty()]
+    [string]$LeaseRoot,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [ValidateNotNullOrEmpty()]
     [string]$ReviewerConfigFile,
 
     [Parameter(ParameterSetName = 'Launch')]
@@ -67,6 +75,18 @@ param(
 
     [Parameter(ParameterSetName = 'Launch')]
     [switch]$EnableReviewHandlerCodeUpdates,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableManualReviewer,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableManualReviewHandler,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableManualReviewerWrites,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableManualReviewHandlerCodeUpdates,
 
     [Parameter(ParameterSetName = 'Launch')]
     [ValidateRange(30, 86400)]
@@ -98,6 +118,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $toolkitRoot = Split-Path $PSScriptRoot -Parent
+$harnessManifest = Join-Path $toolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1'
+Import-Module $harnessManifest -Force
 $dashboardLauncher = Join-Path $PSScriptRoot 'Start-DevPilotDashboard.ps1'
 $reviewerScript = Join-Path $toolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
 $reviewHandlerScript = Join-Path $toolkitRoot 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1'
@@ -116,11 +138,6 @@ $reviewHandlerCodeUpdateCapabilities = @(
     'LocalValidation',
     'ResumeCodingSession'
 )
-
-function ConvertTo-PowerShellLiteral {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
-    return "'" + ($Value -replace "'", "''") + "'"
-}
 
 function Close-OwnedAgentProcess {
     param(
@@ -144,23 +161,28 @@ function Close-OwnedAgentProcess {
 
 if (-not $StateDir) {
     $watchId = '{0}-{1}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')), ([Guid]::NewGuid().ToString('N').Substring(0, 8))
-    $StateDir = Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'devpilot-agent-watch') $watchId
+    $StateDir = Join-Path (Get-AgentDefaultWatchStateRoot) $watchId
 }
 $StateDir = [IO.Path]::GetFullPath($StateDir)
-New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
-
-$global:LASTEXITCODE = 0
-& $dashboardLauncher -StateDir $StateDir -ValidateOnly
-if ($LASTEXITCODE -ne 0) {
-    throw "Dashboard preflight failed with code $LASTEXITCODE; no agent was started."
-}
+$StateDir = Resolve-AgentTrustedRoot -Path $StateDir -Kind watch-state `
+    -RepositoryRoot ([IO.Path]::GetFullPath($toolkitRoot)) -Create
 
 if ($AttachOnly) {
     $global:LASTEXITCODE = 0
+    & $dashboardLauncher -StateDir $StateDir -ValidateOnly
+    if ($LASTEXITCODE -ne 0) { throw "Dashboard preflight failed with code $LASTEXITCODE." }
     & $dashboardLauncher -StateDir $StateDir
     if ($LASTEXITCODE -ne 0) { throw "Dashboard exited with code $LASTEXITCODE." }
     return
 }
+
+if (-not $DurableStateRoot) { $DurableStateRoot = Get-AgentDefaultDurableStateRoot }
+if (-not $LeaseRoot) { $LeaseRoot = Get-AgentDefaultLeaseRoot }
+$repositoryRoot = [IO.Path]::GetFullPath($toolkitRoot)
+$DurableStateRoot = Resolve-AgentTrustedRoot -Path ([IO.Path]::GetFullPath($DurableStateRoot)) `
+    -Kind durable-state -RepositoryRoot $repositoryRoot -DisallowedRoots @($StateDir) -Create
+$LeaseRoot = Resolve-AgentTrustedRoot -Path ([IO.Path]::GetFullPath($LeaseRoot)) `
+    -Kind lease -RepositoryRoot $repositoryRoot -DisallowedRoots @($StateDir, $DurableStateRoot) -Create
 
 if ($Continuous -and ($ReviewerPullRequestId -gt 0 -or $ReviewHandlerPullRequestId -gt 0)) {
     throw 'A pull request ID cannot be combined with -Continuous because that would repeatedly process one pull request.'
@@ -175,6 +197,18 @@ if (-not $Operational -and (
 
 $launchReviewer = $Agent -in @('Reviewer', 'Both')
 $launchReviewHandler = $Agent -in @('ReviewHandler', 'Both')
+if ($PSBoundParameters.ContainsKey('ReviewerPullRequestId') -and $ReviewerPullRequestId -le 0) {
+    throw 'ReviewerPullRequestId must be greater than zero when explicitly provided.'
+}
+if ($PSBoundParameters.ContainsKey('ReviewHandlerPullRequestId') -and $ReviewHandlerPullRequestId -le 0) {
+    throw 'ReviewHandlerPullRequestId must be greater than zero when explicitly provided.'
+}
+if ($PSBoundParameters.ContainsKey('ReviewerPullRequestId') -and -not $launchReviewer) {
+    throw '-ReviewerPullRequestId requires -Agent Reviewer or -Agent Both.'
+}
+if ($PSBoundParameters.ContainsKey('ReviewHandlerPullRequestId') -and -not $launchReviewHandler) {
+    throw '-ReviewHandlerPullRequestId requires -Agent ReviewHandler or -Agent Both.'
+}
 if ($EnableReviewerTeamsNotifications -and -not $launchReviewer) {
     throw '-EnableReviewerTeamsNotifications requires -Agent Reviewer or -Agent Both.'
 }
@@ -184,7 +218,11 @@ if ($EnableReviewHandlerTeamsNotifications -and -not $launchReviewHandler) {
 if ($EnableReviewHandlerCodeUpdates -and -not $launchReviewHandler) {
     throw '-EnableReviewHandlerCodeUpdates requires -Agent ReviewHandler or -Agent Both.'
 }
-$defaultConfigRoot = Join-Path (Get-Location) '.github\copilot\agents'
+$defaultConfigRoot = [IO.Path]::GetFullPath((Join-Path (Get-Location) '.github\copilot\agents'))
+$reviewerScript = Assert-AgentTrustedFile -Path ([IO.Path]::GetFullPath($reviewerScript)) `
+    -AllowedRoot $repositoryRoot -ExpectedPath (Join-Path $repositoryRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1')
+$reviewHandlerScript = Assert-AgentTrustedFile -Path ([IO.Path]::GetFullPath($reviewHandlerScript)) `
+    -AllowedRoot $repositoryRoot -ExpectedPath (Join-Path $repositoryRoot 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1')
 if ($launchReviewer) {
     $ReviewerConfigFile = [IO.Path]::GetFullPath($(if ($ReviewerConfigFile) {
         $ReviewerConfigFile
@@ -194,9 +232,8 @@ if ($launchReviewer) {
     if (-not (Test-Path -LiteralPath $ReviewerConfigFile -PathType Leaf)) {
         throw "Reviewer config was not found: $ReviewerConfigFile"
     }
-    if (-not (Test-Path -LiteralPath $reviewerScript -PathType Leaf)) {
-        throw "Reviewer script was not found: $reviewerScript"
-    }
+    $ReviewerConfigFile = Assert-AgentTrustedFile -Path $ReviewerConfigFile `
+        -AllowedRoot $(if ($PSBoundParameters.ContainsKey('ReviewerConfigFile')) { '' } else { $defaultConfigRoot })
 }
 if ($launchReviewHandler) {
     $ReviewHandlerConfigFile = [IO.Path]::GetFullPath($(if ($ReviewHandlerConfigFile) {
@@ -207,9 +244,8 @@ if ($launchReviewHandler) {
     if (-not (Test-Path -LiteralPath $ReviewHandlerConfigFile -PathType Leaf)) {
         throw "Review-handler config was not found: $ReviewHandlerConfigFile"
     }
-    if (-not (Test-Path -LiteralPath $reviewHandlerScript -PathType Leaf)) {
-        throw "Review-handler script was not found: $reviewHandlerScript"
-    }
+    $ReviewHandlerConfigFile = Assert-AgentTrustedFile -Path $ReviewHandlerConfigFile `
+        -AllowedRoot $(if ($PSBoundParameters.ContainsKey('ReviewHandlerConfigFile')) { '' } else { $defaultConfigRoot })
 }
 
 if (-not $OperatorAlias) {
@@ -226,6 +262,77 @@ if (-not $OperatorAlias) {
         throw 'Could not detect a safe operator alias. Configure git user.email or pass -OperatorAlias.'
     }
     $OperatorAlias = $candidate
+}
+
+$manualRoles = [ordered]@{}
+if ($EnableManualReviewer) {
+    $manualReviewerConfig = [IO.Path]::GetFullPath($(if ($ReviewerConfigFile) {
+        $ReviewerConfigFile
+    } else {
+        Join-Path $defaultConfigRoot 'reviewer.config.json'
+    }))
+    if (-not (Test-Path -LiteralPath $manualReviewerConfig -PathType Leaf)) {
+        throw "Manual Reviewer config was not found: $manualReviewerConfig"
+    }
+    $manualReviewerConfig = Assert-AgentTrustedFile -Path $manualReviewerConfig `
+        -AllowedRoot $(if ($PSBoundParameters.ContainsKey('ReviewerConfigFile')) { '' } else { $defaultConfigRoot })
+    $manualRoles.reviewer = [ordered]@{
+        enabled = $true; configFile = $manualReviewerConfig
+        configRoot = (Split-Path $manualReviewerConfig -Parent); scriptPath = $reviewerScript
+        capabilities = @($(if ($EnableManualReviewerWrites) {
+                    'EnableFindingComments'; 'EnableThreadReplies'; 'EnableSummaryComment'
+                }))
+        mandatoryDenies = @('EnableApprovalVote')
+    }
+}
+if ($EnableManualReviewHandler) {
+    $manualHandlerConfig = [IO.Path]::GetFullPath($(if ($ReviewHandlerConfigFile) {
+        $ReviewHandlerConfigFile
+    } else {
+        Join-Path $defaultConfigRoot 'review-handler.config.json'
+    }))
+    if (-not (Test-Path -LiteralPath $manualHandlerConfig -PathType Leaf)) {
+        throw "Manual ReviewHandler config was not found: $manualHandlerConfig"
+    }
+    $manualHandlerConfig = Assert-AgentTrustedFile -Path $manualHandlerConfig `
+        -AllowedRoot $(if ($PSBoundParameters.ContainsKey('ReviewHandlerConfigFile')) { '' } else { $defaultConfigRoot })
+    $handlerCapabilities = @('EnableThreadReplies', 'EnableBuddyRequeue')
+    if ($EnableManualReviewHandlerCodeUpdates) {
+        $handlerCapabilities += @('EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession')
+    }
+    $manualRoles.'review-handler' = [ordered]@{
+        enabled = $true; configFile = $manualHandlerConfig
+        configRoot = (Split-Path $manualHandlerConfig -Parent); scriptPath = $reviewHandlerScript
+        capabilities = $handlerCapabilities; mandatoryDenies = @('EnableAutoComplete')
+    }
+}
+$brokerDescriptorPath = ''
+if ($manualRoles.Count -gt 0) {
+    $brokerDescriptorPath = Join-Path $StateDir 'broker.descriptor.v1.json'
+    $brokerDescriptor = [ordered]@{
+        schemaVersion = 1; ownerProcessId = $PID; stateRoot = $StateDir
+        durableStateRoot = $DurableStateRoot; leaseRoot = $LeaseRoot
+        operatorAlias = $OperatorAlias; roles = $manualRoles
+    }
+    if (Test-Path -LiteralPath $brokerDescriptorPath) {
+        [void](Assert-AgentTrustedFile -Path $brokerDescriptorPath -AllowedRoot $StateDir -Private)
+    }
+    [IO.File]::WriteAllText($brokerDescriptorPath,
+        (ConvertTo-AgentCanonicalJson $brokerDescriptor), [Text.UTF8Encoding]::new($false))
+    if (-not $IsWindows) {
+        [IO.File]::SetUnixFileMode($brokerDescriptorPath,
+            [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+    }
+    $brokerDescriptorPath = Assert-AgentTrustedFile -Path $brokerDescriptorPath -AllowedRoot $StateDir -Private
+}
+$global:LASTEXITCODE = 0
+$dashboardParameters = @{ StateDir = $StateDir }
+if ($brokerDescriptorPath) {
+    $dashboardParameters.BrokerDescriptorPath = $brokerDescriptorPath
+}
+& $dashboardLauncher @dashboardParameters -ValidateOnly
+if ($LASTEXITCODE -ne 0) {
+    throw "Dashboard preflight failed with code $LASTEXITCODE; no agent was started."
 }
 
 $sessionSuffix = [Guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -258,67 +365,68 @@ if ($launchReviewHandler) {
     })
 }
 
-$pwsh = Get-Command pwsh -ErrorAction Stop
+$pwsh = Resolve-AgentPwshPath
 $children = New-Object System.Collections.Generic.List[object]
 try {
     foreach ($spec in $specs) {
         New-Item -ItemType Directory -Force -Path $spec.StateDir | Out-Null
-        $parameterLines = New-Object System.Collections.Generic.List[string]
-        [void]$parameterLines.Add("ConfigFile = $(ConvertTo-PowerShellLiteral $spec.ConfigFile)")
-        [void]$parameterLines.Add("StateDir = $(ConvertTo-PowerShellLiteral $spec.StateDir)")
-        [void]$parameterLines.Add("AgentName = $(ConvertTo-PowerShellLiteral $spec.AgentName)")
-        [void]$parameterLines.Add("OperatorAlias = $(ConvertTo-PowerShellLiteral $OperatorAlias)")
-        [void]$parameterLines.Add("OutputMode = 'Json'")
+        $childArguments = @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $spec.Script,
+            '-ConfigFile', $spec.ConfigFile, '-StateDir', $spec.StateDir,
+            '-DurableStateRoot', $DurableStateRoot, '-LeaseRoot', $LeaseRoot,
+            '-AgentName', $spec.AgentName, '-OperatorAlias', $OperatorAlias,
+            '-OutputMode', 'Json'
+        )
+        # Typed equivalent of the prior child parameter: OutputMode = 'Json'
         if ($Continuous) {
-            [void]$parameterLines.Add("IntervalSeconds = $IntervalSeconds")
+            $childArguments += @('-IntervalSeconds', [string]$IntervalSeconds)
         }
         else {
-            [void]$parameterLines.Add('Once = $true')
+            $childArguments += '-Once'
+            # Typed equivalent of the prior child parameter: Once = $true
         }
-        if ($spec.PullRequestId -gt 0) { [void]$parameterLines.Add("PullRequestId = $($spec.PullRequestId)") }
-        if ($spec.Model) { [void]$parameterLines.Add("Model = $(ConvertTo-PowerShellLiteral $spec.Model)") }
-        if ($spec.IncludeOwn) { [void]$parameterLines.Add('IncludeOwnPullRequests = $true') }
+        if ($spec.PullRequestId -gt 0) { $childArguments += @('-PullRequestId', [string]$spec.PullRequestId) }
+        if ($spec.Model) { $childArguments += @('-Model', $spec.Model) }
+        if ($spec.IncludeOwn) { $childArguments += '-IncludeOwnPullRequests' }
         if ($Operational) {
             if ($spec.Role -eq 'reviewer') {
                 foreach ($capability in $reviewerOperationalCapabilities) {
-                    [void]$parameterLines.Add("$capability = `$true")
+                    $childArguments += "-$capability"
                 }
                 if ($EnableReviewerTeamsNotifications) {
-                    [void]$parameterLines.Add('EnableTeamsNotifications = $true')
+                    $childArguments += '-EnableTeamsNotifications'
                 }
             }
             else {
                 foreach ($capability in $reviewHandlerOperationalCapabilities) {
-                    [void]$parameterLines.Add("$capability = `$true")
+                    $childArguments += "-$capability"
                 }
                 if ($EnableReviewHandlerCodeUpdates) {
                     foreach ($capability in $reviewHandlerCodeUpdateCapabilities) {
-                        [void]$parameterLines.Add("$capability = `$true")
+                        $childArguments += "-$capability"
                     }
                 }
                 if ($EnableReviewHandlerTeamsNotifications) {
-                    [void]$parameterLines.Add('EnableTeamsNotifications = $true')
+                    $childArguments += '-EnableTeamsNotifications'
                 }
             }
         }
 
-        $childCommand = @"
-`$ErrorActionPreference = 'Stop'
-`$parameters = @{
-    $($parameterLines -join "`n    ")
-}
-& $(ConvertTo-PowerShellLiteral $spec.Script) @parameters
-exit `$LASTEXITCODE
-"@
-        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childCommand))
         $stdoutPath = Join-Path $StateDir "$($spec.Role).stdout.jsonl"
         $stderrPath = Join-Path $StateDir "$($spec.Role).stderr.log"
-        $process = Start-Process -FilePath $pwsh.Source -ArgumentList @(
-            '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand
-        ) -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+        $owned = if (-not $Continuous -and -not $Operational) {
+            New-AgentPersistentRedirectedProcess -FilePath $pwsh -ArgumentList $childArguments `
+                -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath -WorkingDirectory $toolkitRoot
+        }
+        else {
+            New-AgentRedirectedProcess -FilePath $pwsh -ArgumentList $childArguments `
+                -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath -WorkingDirectory $toolkitRoot
+        }
+        $process = $owned.Process
         [void]$children.Add([pscustomobject]@{
             Role = $spec.Role
             Process = $process
+            Owned = $owned
             StdErrPath = $stderrPath
         })
         Write-Host "Watching $($spec.Role) PID $($process.Id)." -ForegroundColor Cyan
@@ -327,6 +435,7 @@ exit `$LASTEXITCODE
 catch {
     foreach ($child in $children) {
         Close-OwnedAgentProcess -Process $child.Process -Role $child.Role
+        [void](Complete-AgentRedirectedProcess -Child $child.Owned)
     }
     throw
 }
@@ -357,6 +466,7 @@ foreach ($child in $children) {
 if ($startupFailure) {
     foreach ($child in $children) {
         Close-OwnedAgentProcess -Process $child.Process -Role $child.Role
+        [void](Complete-AgentRedirectedProcess -Child $child.Owned)
     }
     Write-Error "$($startupFailure.Role) exited during startup with code $($startupFailure.Process.ExitCode). Diagnostics: $($startupFailure.StdErrPath)"
     exit $startupFailure.Process.ExitCode
@@ -366,7 +476,7 @@ $dashboardCompletedNormally = $false
 $agentsStoppedByDashboard = $false
 try {
     $global:LASTEXITCODE = 0
-    & $dashboardLauncher -StateDir $StateDir
+    & $dashboardLauncher @dashboardParameters
     if ($LASTEXITCODE -ne 0) { throw "Dashboard exited with code $LASTEXITCODE." }
     $dashboardCompletedNormally = $true
 }
@@ -374,6 +484,7 @@ finally {
     if (-not $dashboardCompletedNormally -or $Continuous -or $Operational) {
         foreach ($child in $children) {
             Close-OwnedAgentProcess -Process $child.Process -Role $child.Role
+            [void](Complete-AgentRedirectedProcess -Child $child.Owned)
         }
         $agentsStoppedByDashboard = $true
     }
@@ -390,6 +501,12 @@ finally {
 }
 
 if ($agentsStoppedByDashboard -and $dashboardCompletedNormally) { exit 0 }
+foreach ($child in $children) {
+    $child.Process.Refresh()
+    if ($child.Process.HasExited) {
+        [void](Complete-AgentRedirectedProcess -Child $child.Owned)
+    }
+}
 $failedChild = @($children | Where-Object {
     $_.Process.Refresh()
     $_.Process.HasExited -and $_.Process.ExitCode -ne 0

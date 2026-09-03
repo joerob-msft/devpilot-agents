@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LineCursor } from "../src/tailer.js";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { discoverEventLogs, EventTailer, LineCursor } from "../src/tailer.js";
 
 test("partial final lines are held until newline", () => {
   const cursor = new LineCursor();
@@ -40,4 +42,30 @@ test("complete UTF-8 characters split across chunks are decoded safely", () => {
   const split = 5;
   assert.deepEqual(cursor.push(encoded.subarray(0, split)), []);
   assert.equal(cursor.push(encoded.subarray(split))[0], Buffer.from(encoded.subarray(0, -1)).toString("utf8"));
+});
+
+test("accepted event paths can be registered dynamically without duplicates", () => {
+  const tailer = new EventTailer({
+    stateDirectories: [],
+    eventLogPaths: [],
+    onEvent: () => {},
+    onDiagnostic: () => {},
+  });
+  const path = join(process.cwd(), "logs", "events", "reviewer", "dispatch.jsonl");
+  assert.equal(tailer.registerEventLogPath(path), true);
+  assert.equal(tailer.registerEventLogPath(path), false);
+});
+
+test("more than 500 dispatch-like directories cannot hide canonical flat event logs", () => {
+  const root = join(process.cwd(), `.tailer-discovery-${process.pid}-${Date.now()}`);
+  try {
+    for (let index = 0; index < 501; index++) mkdirSync(join(root, `dispatch-${String(index).padStart(3, "0")}`), { recursive: true });
+    const eventDirectory = join(root, "logs", "events", "reviewer");
+    mkdirSync(eventDirectory, { recursive: true });
+    const eventPath = join(eventDirectory, "instance.jsonl");
+    writeFileSync(eventPath, "");
+    assert.ok(discoverEventLogs([root], []).includes(eventPath));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

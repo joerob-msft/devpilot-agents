@@ -22,6 +22,14 @@ param(
     [string]$StateDir,
 
     [Parameter(ParameterSetName = 'Launch')]
+    [ValidateNotNullOrEmpty()]
+    [string]$DurableStateRoot,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [ValidateNotNullOrEmpty()]
+    [string]$LeaseRoot,
+
+    [Parameter(ParameterSetName = 'Launch')]
     [ValidateRange(0, 2147483647)]
     [int]$PullRequestId = 0,
 
@@ -36,6 +44,12 @@ param(
 
     [Parameter(ParameterSetName = 'Launch')]
     [switch]$EnableCodeUpdates,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableManualDispatch,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableManualCodeUpdates,
 
     [Parameter(ParameterSetName = 'Launch')]
     [ValidateRange(30, 86400)]
@@ -53,16 +67,24 @@ param(
     [string]$Model
 )
 
+if ($PSBoundParameters.ContainsKey('PullRequestId') -and $PullRequestId -le 0) {
+    throw 'PullRequestId must be greater than zero when explicitly provided.'
+}
+
 $parameters = @{}
 if ($AttachOnly) { $parameters.AttachOnly = $true }
 else { $parameters.Agent = 'ReviewHandler' }
 if ($StateDir) { $parameters.StateDir = $StateDir }
+if ($DurableStateRoot) { $parameters.DurableStateRoot = $DurableStateRoot }
+if ($LeaseRoot) { $parameters.LeaseRoot = $LeaseRoot }
 if ($ConfigFile) { $parameters.ReviewHandlerConfigFile = $ConfigFile }
-if ($PullRequestId -gt 0) { $parameters.ReviewHandlerPullRequestId = $PullRequestId }
+if ($PSBoundParameters.ContainsKey('PullRequestId')) { $parameters.ReviewHandlerPullRequestId = $PullRequestId }
 if ($Continuous) { $parameters.Continuous = $true }
 if ($Operational) { $parameters.Operational = $true }
 if ($EnableTeamsNotifications) { $parameters.EnableReviewHandlerTeamsNotifications = $true }
 if ($EnableCodeUpdates) { $parameters.EnableReviewHandlerCodeUpdates = $true }
+if ($EnableManualDispatch) { $parameters.EnableManualReviewHandler = $true }
+if ($EnableManualCodeUpdates) { $parameters.EnableManualReviewHandlerCodeUpdates = $true }
 if ($PSBoundParameters.ContainsKey('IntervalSeconds')) { $parameters.IntervalSeconds = $IntervalSeconds }
 if ($OperatorAlias) { $parameters.OperatorAlias = $OperatorAlias }
 if ($AgentName) { $parameters.ReviewHandlerAgentName = $AgentName }

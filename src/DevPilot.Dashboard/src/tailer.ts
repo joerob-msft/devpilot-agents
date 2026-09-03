@@ -104,6 +104,7 @@ export function discoverEventLogs(stateDirectories: string[], explicitPaths: str
       const normalized = current.path.replaceAll("\\", "/").toLowerCase();
       const isEventDirectory =
         normalized.endsWith("/logs/events/reviewer") || normalized.endsWith("/logs/events/review-handler");
+      const directories: Array<{ path: string; depth: number; priority: number }> = [];
       for (const entry of entries) {
         const path = join(current.path, entry.name);
         if (entry.isFile() && isEventDirectory && /\.jsonl(?:\.\d+)?$/i.test(entry.name)) {
@@ -113,9 +114,16 @@ export function discoverEventLogs(stateDirectories: string[], explicitPaths: str
             // The next discovery pass will retry files racing creation or rotation.
           }
         } else if (entry.isDirectory() && current.depth < 6) {
-          queue.push({ path, depth: current.depth + 1 });
+          const name = entry.name.toLowerCase();
+          if (name === "manual-dispatch" || name === "runtime") continue;
+          const priority = name === "logs" || name === "events" || name === "reviewer" || name === "review-handler" ? 0 : 1;
+          directories.push({ path, depth: current.depth + 1, priority });
         }
       }
+      directories.sort((left, right) => left.priority - right.priority || left.path.localeCompare(right.path));
+      const priorityDirectories = directories.filter((item) => item.priority === 0);
+      queue.unshift(...priorityDirectories.reverse());
+      queue.push(...directories.filter((item) => item.priority !== 0));
     }
   }
   return [...found].sort((left, right) => {
@@ -138,6 +146,14 @@ export class EventTailer {
   private polling = false;
 
   constructor(private readonly options: TailerOptions) {}
+
+  registerEventLogPath(path: string): boolean {
+    const normalized = resolve(path);
+    if (this.options.eventLogPaths.some((item) => resolve(item) === normalized)) return false;
+    this.options.eventLogPaths.push(normalized);
+    void this.poll();
+    return true;
+  }
 
   start(): void {
     if (this.timer) return;

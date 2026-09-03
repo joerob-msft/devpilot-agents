@@ -366,6 +366,15 @@ test("heartbeats update liveness without flooding the visible timeline", () => {
   assert.equal(reducer.get("reviewer:quiet", BASE_TIME + 2_100)?.lastSequence, 20);
 });
 
+test("work.concurrent is instance-observable without becoming PR history", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(event("concurrent", 1, "work.concurrent", { data: { reason: "lease-contended" } }));
+  const state = reducer.list()[0]!;
+  assert.equal(state.blocked?.reason, "lease-contended");
+  assert.equal(state.retryable, true);
+  assert.equal(state.modelActivity, "Waiting for concurrent work");
+});
+
 test("source diagnostics remain visible before any valid instance event", () => {
   const reducer = new OperationsReducer();
   const diagnostic = {
