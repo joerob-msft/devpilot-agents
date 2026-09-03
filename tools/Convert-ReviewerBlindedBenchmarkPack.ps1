@@ -35,6 +35,8 @@ param(
     [string]$ConventionSpecialistModel,
     [Parameter(ParameterSetName = 'Materialize')]
     [string]$ReviewerScriptFile,
+    [Parameter(ParameterSetName = 'Materialize')]
+    [switch]$PreserveSourceClassification,
     [Parameter(Mandatory)][string]$OutputRoot,
     [Parameter(ParameterSetName = 'Verify', Mandatory)][switch]$VerifyOnly,
     [Parameter(ParameterSetName = 'Verify', Mandatory)]
@@ -457,8 +459,11 @@ if ([long]$sourceManifestAfterLoad.Length -ne [long]$sourceManifestBytes.Length 
     (Get-BytesSha256 $sourceManifestAfterLoad) -cne $sourceManifestFileSha) {
     throw 'Independent replay manifest changed during production-loader validation.'
 }
-if ([bool]$sourceSnapshot.Classification.NonPromotable) {
+if ([bool]$sourceSnapshot.Classification.NonPromotable -and -not $PreserveSourceClassification) {
     throw "The source replay is already classified '$([string]$sourceSnapshot.Classification.SealKind)'; materialization will not replace existing non-promotable lineage."
+}
+if ($PreserveSourceClassification -and -not [bool]$sourceSnapshot.Classification.NonPromotable) {
+    throw '-PreserveSourceClassification requires an already non-promotable source replay.'
 }
 $generalistPair = Get-AgentGeneralistModelPair
 [void](Assert-AgentSupportedModel -ModelId $SecondGeneralistModel `
@@ -571,6 +576,13 @@ if ($conventionSpecialistEnabled) {
     [void](Assert-AgentSupportedModel -ModelId $effectiveConventionSpecialistModel `
             -Where 'benchmark materialization convention specialist model')
 }
+if ($PreserveSourceClassification) {
+    foreach ($requiredModel in @($SecondGeneralistModel, $effectiveConventionSpecialistModel)) {
+        if ($requiredModel -and @($sourceSnapshot.Bindings.Models) -cnotcontains $requiredModel) {
+            throw "Preserved source replay does not bind required model '$requiredModel'; its classification cannot be rewritten to add it."
+        }
+    }
+}
 $resolvedPromptFull = [IO.Path]::GetFullPath([string]$configLoad.PromptFilePath)
 if ($resolvedPromptFull -cne [IO.Path]::GetFullPath($promptFull)) {
     throw "Config promptFile resolves to '$resolvedPromptFull', not the independently supplied prompt '$promptFull'."
@@ -656,6 +668,16 @@ try {
             ByteLength = [long]$sourceManifest.sourceTransport.artifactByteLength
         }
     }
+    if ($PreserveSourceClassification) {
+        $sidecarRelative = Assert-SafeRelativePath ([string]$sourceManifest.classification.sidecarFile) `
+            'Source replay classification sidecar'
+        $copyPaths[$sidecarRelative] = $sidecarRelative
+        $sidecarItem = Get-Item -LiteralPath (Join-Path $snapshotFull $sidecarRelative) -ErrorAction Stop
+        $replayExpectations[$sidecarRelative] = [pscustomobject]@{
+            Sha256 = [string]$sourceManifest.classification.sidecarSha256
+            ByteLength = [long]$sidecarItem.Length
+        }
+    }
     foreach ($relative in $copyPaths.Values) {
         $source = Resolve-SafeFile -Path (Join-Path $snapshotFull ($relative -replace '/', [IO.Path]::DirectorySeparatorChar)) `
             -Within $snapshotFull -Surface 'Replay file'
@@ -670,50 +692,56 @@ try {
         [IO.File]::WriteAllBytes($destination, $bytes)
     }
 
-    $sidecar = [ordered]@{
-        schemaVersion = 1
-        kind = 'reviewer-benchmark-pack-materialization'
-        sealKind = 'benchmarkPackMaterialization'
-        snapshotId = $snapshotName
-        nonPromotable = $true
-        sourceManifestFileSha256 = $sourceManifestFileSha
-        sourceManifestDigest = [string]$sourceSnapshot.ManifestDigest
-        legacyProjectionSha256 = $legacySha
-        roleProvenanceSha256 = $provenanceSha
-        fixtureId = [string]$legacy.fixtureId
-        role = $Role
-        projectionSha256 = Get-FileSha256 $projectionPath
-        configSha256 = $configSha
-        promptSha256 = $promptSha
-        reviewerScriptSha256 = $scriptSha
-        secondGeneralistModel = $SecondGeneralistModel
-        conventionSpecialistEnabled = [bool]$conventionSpecialistEnabled
-        conventionSpecialistModel = $effectiveConventionSpecialistModel
+    if ($PreserveSourceClassification) {
+        $materializedDigest = [string]$sourceSnapshot.ManifestDigest
+        [IO.File]::WriteAllBytes((Join-Path $stagedSnapshot 'manifest.json'), $sourceManifestBytes)
     }
-    $sidecarName = 'benchmark-pack-materialization.json'
-    $sidecarPath = Join-Path $stagedSnapshot $sidecarName
-    [IO.File]::WriteAllText($sidecarPath, (Get-CanonicalJson $sidecar), $Utf8)
-    $sourceManifest.Remove('manifestDigest')
-    $sourceManifest.bindings.models = @(
-        @($sourceManifest.bindings.models) + $SecondGeneralistModel +
-            @($effectiveConventionSpecialistModel) |
-            Select-Object -Unique)
-    if ([int]$sourceManifest.schemaVersion -eq 1) {
-        # Version 3 is the classified counterpart of the v1 shape: it adds only
-        # the digest-bound non-promotable classification. Version 2 remains the
-        # source-transport shape and is never fabricated when source transport
-        # was not independently supplied.
-        $sourceManifest.schemaVersion = 3
+    else {
+        $sidecar = [ordered]@{
+            schemaVersion = 1
+            kind = 'reviewer-benchmark-pack-materialization'
+            sealKind = 'benchmarkPackMaterialization'
+            snapshotId = $snapshotName
+            nonPromotable = $true
+            sourceManifestFileSha256 = $sourceManifestFileSha
+            sourceManifestDigest = [string]$sourceSnapshot.ManifestDigest
+            legacyProjectionSha256 = $legacySha
+            roleProvenanceSha256 = $provenanceSha
+            fixtureId = [string]$legacy.fixtureId
+            role = $Role
+            projectionSha256 = Get-FileSha256 $projectionPath
+            configSha256 = $configSha
+            promptSha256 = $promptSha
+            reviewerScriptSha256 = $scriptSha
+            secondGeneralistModel = $SecondGeneralistModel
+            conventionSpecialistEnabled = [bool]$conventionSpecialistEnabled
+            conventionSpecialistModel = $effectiveConventionSpecialistModel
+        }
+        $sidecarName = 'benchmark-pack-materialization.json'
+        $sidecarPath = Join-Path $stagedSnapshot $sidecarName
+        [IO.File]::WriteAllText($sidecarPath, (Get-CanonicalJson $sidecar), $Utf8)
+        $sourceManifest.Remove('manifestDigest')
+        $sourceManifest.bindings.models = @(
+            @($sourceManifest.bindings.models) + $SecondGeneralistModel +
+                @($effectiveConventionSpecialistModel) |
+                Select-Object -Unique)
+        if ([int]$sourceManifest.schemaVersion -eq 1) {
+            # Version 3 is the classified counterpart of the v1 shape: it adds only
+            # the digest-bound non-promotable classification. Version 2 remains the
+            # source-transport shape and is never fabricated when source transport
+            # was not independently supplied.
+            $sourceManifest.schemaVersion = 3
+        }
+        $sourceManifest['classification'] = [ordered]@{
+            sealKind = 'benchmarkPackMaterialization'
+            nonPromotable = $true
+            sidecarFile = $sidecarName
+            sidecarSha256 = Get-FileSha256 $sidecarPath
+        }
+        $materializedDigest = Get-TextSha256 (Get-CanonicalJson $sourceManifest)
+        $sourceManifest['manifestDigest'] = $materializedDigest
+        [IO.File]::WriteAllText((Join-Path $stagedSnapshot 'manifest.json'), (Get-CanonicalJson $sourceManifest), $Utf8)
     }
-    $sourceManifest['classification'] = [ordered]@{
-        sealKind = 'benchmarkPackMaterialization'
-        nonPromotable = $true
-        sidecarFile = $sidecarName
-        sidecarSha256 = Get-FileSha256 $sidecarPath
-    }
-    $materializedDigest = Get-TextSha256 (Get-CanonicalJson $sourceManifest)
-    $sourceManifest['manifestDigest'] = $materializedDigest
-    [IO.File]::WriteAllText((Join-Path $stagedSnapshot 'manifest.json'), (Get-CanonicalJson $sourceManifest), $Utf8)
 
     $configDestination = Join-Path $staging 'config\reviewer.config.json'
     New-Item -ItemType Directory -Force -Path (Split-Path $configDestination -Parent) | Out-Null
@@ -724,8 +752,12 @@ try {
 
     $loaded = New-AgentReplaySnapshot -ReplayRoot $stagedReplayRoot -SnapshotName $snapshotName `
         -ExpectedManifestDigest $materializedDigest
+    $expectedSealKind = if ($PreserveSourceClassification) {
+        [string]$sourceSnapshot.Classification.SealKind
+    }
+    else { 'benchmarkPackMaterialization' }
     if (-not [bool]$loaded.Classification.NonPromotable -or
-        [string]$loaded.Classification.SealKind -cne 'benchmarkPackMaterialization') {
+        [string]$loaded.Classification.SealKind -cne $expectedSealKind) {
         throw 'Production replay loader did not accept the materialized non-promotable classification.'
     }
 

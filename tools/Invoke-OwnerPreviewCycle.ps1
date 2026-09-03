@@ -284,7 +284,7 @@ function New-OwnerPreviewPrepared {
     $toolkitHead = Get-OwnerPreviewToolkitHead -Root $toolkit
     $sections = Get-OwnerPreviewRuleSections -ConfigFile $ConfigFile -RuleCommit $RuleCommit
     $configSha = Get-OwnerPreviewFileSha256 -Path $ConfigFile
-    $captureModels = [string[]]@(@($Model, (Get-OwnerPreviewDiscoveryGeneralistModel)) |
+    $captureModels = [string[]]@(@($Model, (Get-OwnerPreviewDiscoveryGeneralistModel), $SecondGeneralistModel) |
             Sort-Object -CaseSensitive -Unique)
 
     $correlationId = 'ownerprev-' + ([guid]::NewGuid().ToString('N').Substring(0, 16))
@@ -631,7 +631,8 @@ function Invoke-OwnerPreviewSpecialist {
         '-ExpectedPromptSha256', (Get-OwnerPreviewFileSha256 -Path $promptPath),
         '-SecondGeneralistModel', $SecondGeneralistModel,
         '-ConventionSpecialistModel', $model,
-        '-OutputRoot', $materialized, '-RepoRoot', $RepoRoot) -Stage 'benchmark pack materialization'
+        '-OutputRoot', $materialized, '-RepoRoot', $RepoRoot,
+        '-PreserveSourceClassification') -Stage 'benchmark pack materialization'
     $materialize = Get-OwnerPreviewJsonLine -Text $materializeText
 
     $acquisitionRoot = Join-Path $runRoot 'acquisition'
