@@ -250,7 +250,8 @@ Describe 'dispatch protocol primitives' {
         $signalFunction | Should -Match 'Get-Process -Id \$ProcessGroupId'
         $signalFunction | Should -Match '\$ProcessGroupId -le 1'
         $signalFunction | Should -Match '\$leader\.Id -ne \$ProcessGroupId'
-        $signalFunction | Should -Match 'StartTime\.ToUniversalTime\(\)\.Ticks'
+        $signalFunction | Should -Match 'Get-GuardianProcessStartIdentity'
+        $signalFunction | Should -Match '\$LeaderStartIdentity'
         $signalFunction | Should -Match '\$Signal -ne 0'
         $source | Should -Match 'Test-GuardianLeaderLive'
         $source | Should -Match 'Test-GuardianProcessZombie'
@@ -480,7 +481,7 @@ Describe 'dispatch protocol primitives' {
             [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
         $deadPid = 2147483647
         & pwsh -NoLogo -NoProfile -NonInteractive -File $guardianPath `
-            -RuntimeRoot $runtimeRoot -BrokerProcessId $deadPid -BrokerStartTimeUtcTicks 1 `
+            -RuntimeRoot $runtimeRoot -BrokerProcessId $deadPid -BrokerStartIdentity 'utc:1' `
             -Token $token -DeadlineSeconds 2
         $LASTEXITCODE | Should -Be 0
         Get-ChildItem -LiteralPath $runtimeRoot -Force | Should -BeNullOrEmpty
@@ -503,8 +504,8 @@ Describe 'dispatch protocol primitives' {
         $guardianErr = Join-Path $runtimeRoot 'guardian.stderr'
         $guardian = New-AgentRedirectedProcess -FilePath (Resolve-AgentPwshPath) `
             -ArgumentList @('-NoProfile', '-File', $guardianPath, '-RuntimeRoot', $runtimeRoot,
-                '-BrokerProcessId', [string]$broker.Id, '-BrokerStartTimeUtcTicks',
-                [string]$broker.StartTime.ToUniversalTime().Ticks, '-Token', $token,
+                '-BrokerProcessId', [string]$broker.Id, '-BrokerStartIdentity',
+                (Get-AgentProcessStartIdentity -Process $broker), '-Token', $token,
                 '-DeadlineSeconds', '30', '-Verbose') `
             -StandardOutputPath $guardianOut -StandardErrorPath $guardianErr
         try {
@@ -530,7 +531,7 @@ Describe 'dispatch protocol primitives' {
             Set-Content -LiteralPath $prompt -Value 'secret' -Encoding utf8NoBOM
             @{
                 token = $token; childProcessId = $child.Process.Id
-                childLeaderStartTimeUtcTicks = $child.Process.StartTime.ToUniversalTime().Ticks
+                childLeaderStartIdentity = Get-AgentProcessStartIdentity -Process $child.Process
                 paths = @('operator-context.txt')
             } | ConvertTo-Json -Compress | Set-Content `
                 -LiteralPath (Join-Path $runtimeRoot "guardian-$token.json") -Encoding utf8NoBOM
@@ -614,7 +615,7 @@ Describe 'dispatch protocol primitives' {
         @{
             token = $token
             childProcessId = $leader.Process.Id
-            childLeaderStartTimeUtcTicks = 1
+            childLeaderStartIdentity = 'utc:1'
             paths = @('operator-context.txt')
         } | ConvertTo-Json -Compress | Set-Content `
             -LiteralPath (Join-Path $runtimeRoot "guardian-$token.json") -Encoding utf8NoBOM
@@ -624,7 +625,7 @@ Describe 'dispatch protocol primitives' {
             $result = Invoke-TimedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList @(
                 '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $guardianPath,
                 '-RuntimeRoot', $runtimeRoot, '-BrokerProcessId', '2147483647',
-                '-BrokerStartTimeUtcTicks', '1',
+                '-BrokerStartIdentity', 'utc:1',
                 '-Token', $token, '-DeadlineSeconds', '2') -CaptureStdOut -CaptureStdErr -TimeoutSeconds 2
             $result.TimedOut | Should -BeTrue
             $leader.Process.HasExited | Should -BeFalse

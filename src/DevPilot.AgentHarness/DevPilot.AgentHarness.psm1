@@ -2294,6 +2294,21 @@ function Complete-AgentRedirectedProcess {
     }
 }
 
+function Get-AgentProcessStartIdentity {
+    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
+    if ($IsLinux) {
+        $stat = [IO.File]::ReadAllText("/proc/$($Process.Id)/stat")
+        $nameEnd = $stat.LastIndexOf(')')
+        if ($nameEnd -lt 0) { throw "Process $($Process.Id) has malformed procfs identity." }
+        $fields = @($stat.Substring($nameEnd + 1).Trim() -split '\s+')
+        if ($fields.Count -le 19 -or $fields[19] -notmatch '^\d+$') {
+            throw "Process $($Process.Id) has malformed procfs start identity."
+        }
+        return "linux:$($fields[19])"
+    }
+    return "utc:$($Process.StartTime.ToUniversalTime().Ticks)"
+}
+
 function New-AgentProcessContainment {
     param([Parameter(Mandatory)][Diagnostics.Process]$Process)
     if ($IsWindows) {
@@ -2372,7 +2387,7 @@ namespace DevPilot.Native {
     }
     return @{
         Platform = 'Unix'; Handle = $null; ProcessGroupId = $Process.Id
-        LeaderStartTimeUtcTicks = $Process.StartTime.ToUniversalTime().Ticks
+        LeaderStartIdentity = Get-AgentProcessStartIdentity -Process $Process
         ContainmentToken = [Guid]::NewGuid().ToString('N')
     }
 }
@@ -2406,7 +2421,7 @@ function Invoke-AgentUnixProcessGroupSignal {
     if ($Process.HasExited) {
         throw 'Unix containment leader has exited; refusing to signal an unverifiable process group.'
     }
-    if ($Process.StartTime.ToUniversalTime().Ticks -ne [long]$Containment.LeaderStartTimeUtcTicks) {
+    if ((Get-AgentProcessStartIdentity -Process $Process) -cne [string]$Containment.LeaderStartIdentity) {
         throw 'Unix containment leader identity changed; refusing to signal a stale process group.'
     }
     $result = [DevPilot.Native.UnixProcessGroup]::kill(-$processGroupId, $Signal)
@@ -2432,7 +2447,7 @@ function Stop-AgentProcessContainment {
             }
             $Process.Refresh()
             if (-not $Process.HasExited) {
-                if ($Process.StartTime.ToUniversalTime().Ticks -ne [long]$Containment.LeaderStartTimeUtcTicks) {
+                if ((Get-AgentProcessStartIdentity -Process $Process) -cne [string]$Containment.LeaderStartIdentity) {
                     return $false
                 }
                 [void](Invoke-AgentUnixProcessGroupSignal -Containment $Containment -Signal 15 -Process $Process)
@@ -2450,7 +2465,7 @@ function Stop-AgentProcessContainment {
             if (Test-AgentProcessContainmentExited -Containment $Containment -Process $Process) { return $true }
             $Process.Refresh()
             if (-not $Process.HasExited -and
-                $Process.StartTime.ToUniversalTime().Ticks -eq [long]$Containment.LeaderStartTimeUtcTicks) {
+                (Get-AgentProcessStartIdentity -Process $Process) -ceq [string]$Containment.LeaderStartIdentity) {
                 [void](Invoke-AgentUnixProcessGroupSignal -Containment $Containment -Signal 9 -Process $Process)
             }
         }
@@ -2480,7 +2495,7 @@ function Test-AgentProcessContainmentExited {
             return $false
         }
         if (-not $Process.HasExited -and
-            $Process.StartTime.ToUniversalTime().Ticks -ne [long]$Containment.LeaderStartTimeUtcTicks) {
+            (Get-AgentProcessStartIdentity -Process $Process) -cne [string]$Containment.LeaderStartIdentity) {
             return $false
         }
         return (Invoke-AgentUnixProcessGroupSignal -Containment $Containment -Signal 0 -Process $Process) -eq 'absent'

@@ -101,7 +101,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Set-TimedProcessArguments', 'Stop-ProcessTree', 
                'Resolve-AgentPwshPath', 'ConvertTo-AgentCanonicalJson', 'Get-AgentCanonicalDigest',
                'Test-AgentOperatorPrompt', 'New-AgentRedirectedProcess', 'New-AgentPersistentRedirectedProcess', 'Complete-AgentRedirectedProcess',
-               'New-AgentProcessContainment', 'Stop-AgentProcessContainment', 'Test-AgentProcessContainmentExited', 'Close-AgentProcessContainment',
+               'Get-AgentProcessStartIdentity', 'New-AgentProcessContainment', 'Stop-AgentProcessContainment', 'Test-AgentProcessContainmentExited', 'Close-AgentProcessContainment',
                'Get-TaskTextBeforeDeadline', 'Invoke-TimedProcess', 
                'Open-AgentMcpSession', 'Close-AgentMcpSession', 
                'Send-AgentMcpRequest', 'Send-AgentMcpNotification', 

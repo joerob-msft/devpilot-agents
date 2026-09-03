@@ -3,7 +3,7 @@
 param(
     [Parameter(Mandatory)][string]$RuntimeRoot,
     [Parameter(Mandatory)][int]$BrokerProcessId,
-    [Parameter(Mandatory)][long]$BrokerStartTimeUtcTicks,
+    [Parameter(Mandatory)][string]$BrokerStartIdentity,
     [Parameter(Mandatory)][string]$Token,
     [ValidateRange(1, 300)][int]$DeadlineSeconds = 60
 )
@@ -57,7 +57,7 @@ namespace DevPilot.PromptGuardian {
 function Invoke-GuardianGroupSignal {
     param(
         [int]$ProcessGroupId,
-        [long]$LeaderStartTimeUtcTicks,
+        [string]$LeaderStartIdentity,
         [ValidateSet(0, 9, 15)][int]$Signal
     )
     if ($ProcessGroupId -le 1) {
@@ -69,8 +69,7 @@ function Invoke-GuardianGroupSignal {
         if ($leader.Id -ne $ProcessGroupId) {
             throw 'Guardian process group is not the verified child leader; refusing to signal.'
         }
-        if ($LeaderStartTimeUtcTicks -le 0 -or
-            $leader.StartTime.ToUniversalTime().Ticks -ne $LeaderStartTimeUtcTicks) {
+        if ((Get-GuardianProcessStartIdentity -Process $leader) -cne $LeaderStartIdentity) {
             throw 'Guardian child leader identity changed; refusing to signal a stale process group.'
         }
     }
@@ -83,9 +82,9 @@ function Invoke-GuardianGroupSignal {
     throw "Guardian process-group signal $Signal failed with errno $errorNumber."
 }
 function Test-GuardianGroupAlive {
-    param([int]$ProcessGroupId, [long]$LeaderStartTimeUtcTicks)
+    param([int]$ProcessGroupId, [string]$LeaderStartIdentity)
     return ((Invoke-GuardianGroupSignal -ProcessGroupId $ProcessGroupId `
-                -LeaderStartTimeUtcTicks $LeaderStartTimeUtcTicks -Signal 0) -eq 'alive')
+                -LeaderStartIdentity $LeaderStartIdentity -Signal 0) -eq 'alive')
 }
 function Test-GuardianProcessZombie {
     param([int]$ProcessId)
@@ -100,25 +99,39 @@ function Test-GuardianProcessZombie {
         return $false
     }
 }
+function Get-GuardianProcessStartIdentity {
+    param([Diagnostics.Process]$Process)
+    if ($IsLinux) {
+        $stat = [IO.File]::ReadAllText("/proc/$($Process.Id)/stat")
+        $nameEnd = $stat.LastIndexOf(')')
+        if ($nameEnd -lt 0) { throw 'Malformed procfs process identity.' }
+        $fields = @($stat.Substring($nameEnd + 1).Trim() -split '\s+')
+        if ($fields.Count -le 19 -or $fields[19] -notmatch '^\d+$') {
+            throw 'Malformed procfs process start identity.'
+        }
+        return "linux:$($fields[19])"
+    }
+    return "utc:$($Process.StartTime.ToUniversalTime().Ticks)"
+}
 function Test-GuardianLeaderLive {
-    param([int]$ProcessGroupId, [long]$LeaderStartTimeUtcTicks)
-    if ($LeaderStartTimeUtcTicks -le 0) { return $false }
+    param([int]$ProcessGroupId, [string]$LeaderStartIdentity)
+    if ([string]::IsNullOrWhiteSpace($LeaderStartIdentity)) { return $false }
     try {
         $leader = Get-Process -Id $ProcessGroupId -ErrorAction Stop
         return -not (Test-GuardianProcessZombie -ProcessId $ProcessGroupId) -and
-            $leader.StartTime.ToUniversalTime().Ticks -eq $LeaderStartTimeUtcTicks
+            (Get-GuardianProcessStartIdentity -Process $leader) -ceq $LeaderStartIdentity
     }
     catch {
         return $false
     }
 }
 function Test-GuardianBrokerLive {
-    param([int]$ProcessId, [long]$StartTimeUtcTicks)
-    if ($StartTimeUtcTicks -le 0) { return $false }
+    param([int]$ProcessId, [string]$StartIdentity)
+    if ([string]::IsNullOrWhiteSpace($StartIdentity)) { return $false }
     try {
         $broker = Get-Process -Id $ProcessId -ErrorAction Stop
         return -not (Test-GuardianProcessZombie -ProcessId $ProcessId) -and
-            $broker.StartTime.ToUniversalTime().Ticks -eq $StartTimeUtcTicks
+            (Get-GuardianProcessStartIdentity -Process $broker) -ceq $StartIdentity
     }
     catch {
         return $false
@@ -127,7 +140,7 @@ function Test-GuardianBrokerLive {
 $terminationRequested = $false
 while ($true) {
     $brokerAlive = Test-GuardianBrokerLive -ProcessId $BrokerProcessId `
-        -StartTimeUtcTicks $BrokerStartTimeUtcTicks
+        -StartIdentity $BrokerStartIdentity
     if (Test-Path -LiteralPath $registration -PathType Leaf) {
         try {
             $record = Get-Content -LiteralPath $registration -Raw -Encoding UTF8 |
@@ -158,9 +171,9 @@ while ($true) {
     $childProcessId = if ($record -and $record.ContainsKey('childProcessId')) {
         [int]$record['childProcessId']
     } else { 0 }
-    $childLeaderStartTimeUtcTicks = if ($record -and $record.ContainsKey('childLeaderStartTimeUtcTicks')) {
-        [long]$record['childLeaderStartTimeUtcTicks']
-    } else { 0 }
+    $childLeaderStartIdentity = if ($record -and $record.ContainsKey('childLeaderStartIdentity')) {
+        [string]$record['childLeaderStartIdentity']
+    } else { '' }
     if (Test-Path -LiteralPath $terminalPath -PathType Leaf) {
         $terminal = Get-Content -LiteralPath $terminalPath -Raw -Encoding UTF8 |
             ConvertFrom-Json -AsHashtable -ErrorAction Stop
@@ -169,7 +182,7 @@ while ($true) {
             throw 'Guardian terminal handoff authentication failed.'
         }
         if ($childProcessId -le 0 -or -not (Test-GuardianGroupAlive -ProcessGroupId $childProcessId `
-                    -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks)) {
+                    -LeaderStartIdentity $childLeaderStartIdentity)) {
             foreach ($path in $tracked) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
             Remove-Item -LiteralPath $registration, $readyPath, $registeredPath, $terminalPath -Force -ErrorAction SilentlyContinue
             if ($tracePath) { Remove-Item -LiteralPath $tracePath -Force -ErrorAction SilentlyContinue }
@@ -182,31 +195,31 @@ while ($true) {
         }
         if (-not $terminationRequested -and $childProcessId -gt 0 -and
             (Test-GuardianLeaderLive -ProcessGroupId $childProcessId `
-                    -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks)) {
+                    -LeaderStartIdentity $childLeaderStartIdentity)) {
             $terminationRequested = $true
             $termResult = Invoke-GuardianGroupSignal -ProcessGroupId $childProcessId `
-                -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks -Signal 15
+                -LeaderStartIdentity $childLeaderStartIdentity -Signal 15
             Write-GuardianTrace "Guardian sent TERM to process group $childProcessId ($termResult)."
             Start-Sleep -Milliseconds 500
             if (Test-GuardianLeaderLive -ProcessGroupId $childProcessId `
-                    -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks) {
+                    -LeaderStartIdentity $childLeaderStartIdentity) {
                 $killResult = Invoke-GuardianGroupSignal -ProcessGroupId $childProcessId `
-                    -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks -Signal 9
+                    -LeaderStartIdentity $childLeaderStartIdentity -Signal 9
                 Write-GuardianTrace "Guardian sent KILL to process group $childProcessId ($killResult)."
             }
         }
         elseif (-not $terminationRequested -and $childProcessId -gt 0) {
             $currentLeader = Get-Process -Id $childProcessId -ErrorAction SilentlyContinue
             $currentTicks = if ($currentLeader) {
-                try { $currentLeader.StartTime.ToUniversalTime().Ticks } catch { 0 }
-            } else { 0 }
+                try { Get-GuardianProcessStartIdentity -Process $currentLeader } catch { '<unavailable>' }
+            } else { '<absent>' }
             Write-GuardianTrace (
                 "Guardian refused unverified leader $childProcessId " +
-                "(recorded=$childLeaderStartTimeUtcTicks,current=$currentTicks).")
+                "(recorded=$childLeaderStartIdentity,current=$currentTicks).")
             $terminationRequested = $true
         }
         if ($childProcessId -le 0 -or -not (Test-GuardianGroupAlive -ProcessGroupId $childProcessId `
-                    -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks)) {
+                    -LeaderStartIdentity $childLeaderStartIdentity)) {
             foreach ($path in $tracked) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
             Remove-Item -LiteralPath $registration, $readyPath, $registeredPath, $terminalPath `
                 -Force -ErrorAction SilentlyContinue

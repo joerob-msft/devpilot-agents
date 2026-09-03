@@ -340,8 +340,8 @@ function Publish-ProtectedPrompt {
                 '-NoLogo', '-NoProfile', '-NonInteractive', '-File',
                 (Join-Path $PSScriptRoot 'Invoke-DevPilotPromptGuardian.ps1'),
                 '-RuntimeRoot', $runtimeRoot, '-BrokerProcessId', [string]$PID,
-                '-BrokerStartTimeUtcTicks',
-                [string]([Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks),
+                '-BrokerStartIdentity',
+                (Get-AgentProcessStartIdentity -Process ([Diagnostics.Process]::GetCurrentProcess())),
                 '-Token', $token
             ) -StandardOutputPath "$guardianDiagnostics.stdout" -StandardErrorPath "$guardianDiagnostics.stderr"
             $readyPath = Join-Path $runtimeRoot "guardian-$token.ready"
@@ -510,7 +510,7 @@ function Invoke-Dispatch {
             $guardianRecord = Get-Content -LiteralPath $registration -Raw -Encoding UTF8 |
                 ConvertFrom-Json -AsHashtable -ErrorAction Stop
             $guardianRecord['childProcessId'] = $child.Process.Id
-            $guardianRecord['childLeaderStartTimeUtcTicks'] = $containment.LeaderStartTimeUtcTicks
+            $guardianRecord['childLeaderStartIdentity'] = $containment.LeaderStartIdentity
             $registrationTemp = "$registration.new"
             [IO.File]::WriteAllText($registrationTemp, (ConvertTo-AgentCanonicalJson $guardianRecord), [Text.UTF8Encoding]::new($false))
             [IO.File]::SetUnixFileMode($registrationTemp, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
