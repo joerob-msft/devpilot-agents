@@ -233,10 +233,17 @@ $child = New-AgentPersistentRedirectedProcess -FilePath (Resolve-AgentPwshPath) 
             $stdout = Join-Path $TestDrive 'forced.stdout.log'
             $stderr = Join-Path $TestDrive 'forced.stderr.log'
             $child = New-AgentRedirectedProcess -FilePath '/bin/sh' `
-                -ArgumentList @('-c', 'trap "" TERM; sleep 30 & wait') `
+                -ArgumentList @('-c', 'trap "" TERM; echo ready; sleep 30 & wait') `
                 -StandardOutputPath $stdout -StandardErrorPath $stderr
             $containment = New-AgentProcessContainment -Process $child.Process
             try {
+                $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                while ((-not (Test-Path -LiteralPath $stdout) -or
+                        (Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue) -notmatch 'ready') -and
+                    [DateTime]::UtcNow -lt $readyDeadline) {
+                    Start-Sleep -Milliseconds 25
+                }
+                (Get-Content -LiteralPath $stdout -Raw) | Should -Match 'ready'
                 Stop-AgentProcessContainment -Containment $containment -Process $child.Process |
                     Should -BeTrue
                 Test-AgentProcessContainmentExited -Containment $containment -Process $child.Process |

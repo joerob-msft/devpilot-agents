@@ -26,6 +26,7 @@ $registeredPath = Join-Path $root "guardian-$Token.registered"
 $terminalPath = Join-Path $root "guardian-$Token.terminal.json"
 [IO.File]::WriteAllText($readyPath, "ready`n", [Text.UTF8Encoding]::new($false))
 [IO.File]::SetUnixFileMode($readyPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+Write-Verbose "Guardian ready for broker $BrokerProcessId."
 $deadline = [DateTime]::UtcNow.AddSeconds($DeadlineSeconds)
 $tracked = @()
 $record = $null
@@ -135,6 +136,7 @@ while ($true) {
         if ($tracked.Count -gt 0 -and -not (Test-Path -LiteralPath $registeredPath)) {
             [IO.File]::WriteAllText($registeredPath, "registered`n", [Text.UTF8Encoding]::new($false))
             [IO.File]::SetUnixFileMode($registeredPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+            Write-Verbose "Guardian registered child process group $($record['childProcessId'])."
         }
         $registered = $tracked.Count -gt 0
     }
@@ -162,17 +164,20 @@ while ($true) {
         }
     }
     if (-not $brokerAlive) {
+        Write-Verbose "Guardian observed broker $BrokerProcessId exit."
         if (-not $terminationRequested -and $childProcessId -gt 0 -and
             (Test-GuardianLeaderLive -ProcessGroupId $childProcessId `
                     -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks)) {
             $terminationRequested = $true
-            [void](Invoke-GuardianGroupSignal -ProcessGroupId $childProcessId `
-                    -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks -Signal 15)
+            $termResult = Invoke-GuardianGroupSignal -ProcessGroupId $childProcessId `
+                -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks -Signal 15
+            Write-Verbose "Guardian sent TERM to process group $childProcessId ($termResult)."
             Start-Sleep -Milliseconds 500
             if (Test-GuardianLeaderLive -ProcessGroupId $childProcessId `
                     -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks) {
-                [void](Invoke-GuardianGroupSignal -ProcessGroupId $childProcessId `
-                        -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks -Signal 9)
+                $killResult = Invoke-GuardianGroupSignal -ProcessGroupId $childProcessId `
+                    -LeaderStartTimeUtcTicks $childLeaderStartTimeUtcTicks -Signal 9
+                Write-Verbose "Guardian sent KILL to process group $childProcessId ($killResult)."
             }
         }
         if ($childProcessId -le 0 -or -not (Test-GuardianGroupAlive -ProcessGroupId $childProcessId `

@@ -505,7 +505,7 @@ Describe 'dispatch protocol primitives' {
             -ArgumentList @('-NoProfile', '-File', $guardianPath, '-RuntimeRoot', $runtimeRoot,
                 '-BrokerProcessId', [string]$broker.Id, '-BrokerStartTimeUtcTicks',
                 [string]$broker.StartTime.ToUniversalTime().Ticks, '-Token', $token,
-                '-DeadlineSeconds', '30') `
+                '-DeadlineSeconds', '30', '-Verbose') `
             -StandardOutputPath $guardianOut -StandardErrorPath $guardianErr
         try {
             $ready = Join-Path $runtimeRoot "guardian-$token.ready"
@@ -560,7 +560,10 @@ Describe 'dispatch protocol primitives' {
             $childKillDiagnostics = if (-not $childExited) { Complete-AgentRedirectedProcess $guardian } else { $null }
             $childExited | Should -BeTrue -Because (
                 "the guardian must terminate the accepted child group after the broker dies" +
-                $(if ($childKillDiagnostics) { "; guardian stderr: $($childKillDiagnostics.SafeErrorTail)" }))
+                $(if ($childKillDiagnostics) {
+                        "; guardian stdout: $($childKillDiagnostics.SafeOutputTail); " +
+                        "guardian stderr: $($childKillDiagnostics.SafeErrorTail)"
+                    }))
             $guardian.Process.WaitForExit(10000) | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.json") | Should -BeFalse
             Test-Path -LiteralPath (Join-Path $runtimeRoot "guardian-$token.ready") | Should -BeFalse
