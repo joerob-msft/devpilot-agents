@@ -131,6 +131,17 @@ Describe 'legacy durable-state migration validation' {
         $key = [byte[]](1..32)
         ('raw:' + [Convert]::ToBase64String($key)) |
             Set-Content -LiteralPath (Join-Path $legacy 'artifact-signing.key') -Encoding ascii
+        if (-not $IsWindows) {
+            # A real legacy signing key would already carry owner-only
+            # permissions (every writer of security-sensitive artifacts in
+            # this codebase sets them); Read-LegacyReviewerSigningKey
+            # correctly fails closed via Assert-AgentTrustedFile -Private
+            # when that is not the case, so the fixture must model a
+            # realistic, securely-permissioned legacy key rather than rely on
+            # the ambient umask.
+            [IO.File]::SetUnixFileMode((Join-Path $legacy 'artifact-signing.key'),
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
 
         $first = & $migrationTool -Role reviewer -LegacyStateDir $legacy `
             -RepositoryRoot (Resolve-Path "$PSScriptRoot\..").Path -Organization contoso `

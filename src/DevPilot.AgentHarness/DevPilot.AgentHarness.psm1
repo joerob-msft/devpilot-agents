@@ -201,6 +201,24 @@ function New-AgentNonce {
     return ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
 }
 
+function New-AgentPipeName {
+    <#
+        Short, cryptographically random named-pipe name (10 random bytes ->
+        20 lowercase hex chars, plus a 3-character 'dp-' prefix). Unix domain
+        sockets cap the full path at 104 characters, and .NET's named pipe
+        implementation on Unix builds that path as
+        "<TMPDIR>/CoreFxPipe_<name>" - macOS's per-boot TMPDIR
+        (/var/folders/xx/<~30 random chars>/T/) alone can consume half that
+        budget, so the name itself must stay short. 80 bits of randomness is
+        still ample to keep the name unpredictable and uniquely correlate a
+        single dispatch/test instance.
+    #>
+    $bytes = New-Object byte[] 10
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return "dp-$(([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant())"
+}
+
 function Test-AgentProtectedBranch {
     <#
         True if $Branch matches a protected pattern (exact, case-insensitive,
@@ -566,13 +584,34 @@ function Test-AgentPathWithin {
         $fullPath.StartsWith($fullRoot + [IO.Path]::DirectorySeparatorChar, $comparison)
 }
 
+function Test-AgentOsCanonicalAlias {
+    <#
+        True only for the top-level directories macOS's Signed
+        System Volume exposes as symlinks into /private for historical BSD
+        compatibility that can contain trusted state (/var -> private/var and
+        /tmp -> private/tmp). These are baked into the read-only system
+        volume - an ordinary process cannot replant them - so recognizing
+        exactly this fixed set does not weaken the reparse-point defense used
+        against every other (attacker-plantable) symlink.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [AllowNull()][string]$LinkTarget)
+    if (-not $IsMacOS -or -not $LinkTarget) { return $false }
+    $expectedTarget = switch -CaseSensitive ($Path) {
+        '/var' { 'private/var' }
+        '/tmp' { 'private/tmp' }
+        default { $null }
+    }
+    return $expectedTarget -and $expectedTarget -ceq $LinkTarget
+}
+
 function Assert-AgentPathHasNoLinks {
     param([Parameter(Mandatory)][string]$Path)
     $current = [IO.Path]::GetFullPath($Path)
     while ($current) {
         $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
         if ($item) {
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $null -ne $item.LinkType) {
+            $isLink = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $null -ne $item.LinkType
+            if ($isLink -and -not (Test-AgentOsCanonicalAlias -Path $current -LinkTarget $item.LinkTarget)) {
                 throw "Trusted root '$Path' traverses link or reparse point '$current'."
             }
         }
@@ -607,7 +646,8 @@ function Assert-AgentUnixOwner {
 
 function Assert-AgentWindowsAcl {
     param([Parameter(Mandatory)][string]$Path, [switch]$Private)
-    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $currentSid = $identity.User
     $systemSid = [Security.Principal.SecurityIdentifier]::new(
         [Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
     $administratorsSid = [Security.Principal.SecurityIdentifier]::new(
@@ -615,7 +655,15 @@ function Assert-AgentWindowsAcl {
     $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
     $ownerSid = ([Security.Principal.NTAccount]$acl.Owner).Translate(
         [Security.Principal.SecurityIdentifier])
-    if ($ownerSid -ne $currentSid) { throw "Trusted path '$Path' is not owned by the current user." }
+    # Windows gives a file created by an elevated administrator's process the
+    # Administrators group as its owner rather than the user's own SID. Accept
+    # that only for a genuinely elevated caller; another elevated administrator
+    # is already inside the same local-admin security boundary.
+    $ownedByAdministratorsOnBehalfOfCurrentUser = $ownerSid -eq $administratorsSid -and
+        [Security.Principal.WindowsPrincipal]::new($identity).IsInRole($administratorsSid)
+    if ($ownerSid -ne $currentSid -and -not $ownedByAdministratorsOnBehalfOfCurrentUser) {
+        throw "Trusted path '$Path' is not owned by the current user."
+    }
     $writeRights = [Security.AccessControl.FileSystemRights]::Write -bor
         [Security.AccessControl.FileSystemRights]::Modify -bor
         [Security.AccessControl.FileSystemRights]::FullControl -bor
@@ -2448,6 +2496,14 @@ function Test-IsClosedChildStdinException {
             $nativeError = $current.HResult -band 0xFFFF
             if ($nativeError -in @(109, 232)) { return $true }
         }
+        # On Unix, a child that exits before the redirected stdin write
+        # completes surfaces as a SocketException ("Broken pipe", errno
+        # EPIPE) wrapped in the IOException above and then in the
+        # AggregateException from Task.Wait - there is no other reason a
+        # SocketException would appear while writing to the child's own
+        # stdin pipe, so it is the Unix equivalent of the Windows
+        # ERROR_BROKEN_PIPE/ERROR_NO_DATA HResults checked above.
+        if ($current -is [System.Net.Sockets.SocketException]) { return $true }
         if ($current -is [System.AggregateException]) {
             foreach ($inner in $current.InnerExceptions) {
                 if ($inner) { $pending.Enqueue($inner) }
@@ -4108,6 +4164,7 @@ Export-ModuleMember -Function @(
     "Get-OnceFinalExitCode",
     "Test-StrictJsonInt",
     "New-AgentNonce",
+    "New-AgentPipeName",
     "Test-AgentValidatedParamRebind",
     "Test-AgentProtectedBranch",
     "Get-AgentConfigProperty",

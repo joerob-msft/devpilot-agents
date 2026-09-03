@@ -463,7 +463,7 @@ function Invoke-Dispatch {
 
     $dispatchId = [Guid]::NewGuid().ToString('D')
     $promptPath = Publish-ProtectedPrompt $draft ([string]$Request.operatorPrompt)
-    $pipeName = "devpilot-dispatch-$([Guid]::NewGuid().ToString('N'))"
+    $pipeName = New-AgentPipeName
     $pipe = [IO.Pipes.NamedPipeServerStream]::new($pipeName, [IO.Pipes.PipeDirection]::InOut, 1,
         [IO.Pipes.PipeTransmissionMode]::Byte,
         [IO.Pipes.PipeOptions]::Asynchronous -bor [IO.Pipes.PipeOptions]::CurrentUserOnly)

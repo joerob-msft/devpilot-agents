@@ -414,7 +414,12 @@ Describe 'dispatch protocol primitives' {
             -ExpectedPath $descriptorPath -Private)
 
         $startInfo = [Diagnostics.ProcessStartInfo]::new()
-        $startInfo.FileName = (Get-Command pwsh -CommandType Application).Source
+        # Resolve-AgentPwshPath already guards against Get-Command returning
+        # multiple Application matches (common on Linux/macOS runners, where
+        # pwsh is reachable via several PATH entries such as
+        # /opt/microsoft/powershell/7/pwsh, /usr/bin/pwsh, and /bin/pwsh) -
+        # reuse it instead of re-deriving the path inline.
+        $startInfo.FileName = Resolve-AgentPwshPath
         foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File',
                 $brokerPath, '-DescriptorPath', $descriptorPath)) {
             [void]$startInfo.ArgumentList.Add($argument)
@@ -541,20 +546,38 @@ Describe 'dispatch protocol primitives' {
         [IO.File]::SetUnixFileMode($runtimeRoot,
             [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
         $token = 'c' * 32
+        # The recorded "leader" must be a real process that owns its own Unix
+        # process group (via New-AgentRedirectedProcess's setsid wrapper), not
+        # this test-runner's own $PID: the runner process is frequently *not*
+        # its own process group leader (e.g. under a CI job shell), so a
+        # liveness probe against -$PID would report the group absent and the
+        # guardian would exit almost immediately instead of exercising the
+        # stale-identity refusal path for the full deadline.
+        $stdout = Join-Path $runtimeRoot 'stale-leader.stdout.log'
+        $stderr = Join-Path $runtimeRoot 'stale-leader.stderr.log'
+        $leader = New-AgentRedirectedProcess -FilePath (Resolve-AgentPwshPath) `
+            -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') `
+            -StandardOutputPath $stdout -StandardErrorPath $stderr
         @{
             token = $token
-            childProcessId = $PID
+            childProcessId = $leader.Process.Id
             childLeaderStartTimeUtcTicks = 1
             paths = @('operator-context.txt')
         } | ConvertTo-Json -Compress | Set-Content `
             -LiteralPath (Join-Path $runtimeRoot "guardian-$token.json") -Encoding utf8NoBOM
         [IO.File]::SetUnixFileMode((Join-Path $runtimeRoot "guardian-$token.json"),
             [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
-        $result = Invoke-TimedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList @(
-            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $guardianPath,
-            '-RuntimeRoot', $runtimeRoot, '-BrokerProcessId', '2147483647',
-            '-Token', $token, '-DeadlineSeconds', '2') -CaptureStdOut -CaptureStdErr -TimeoutSeconds 2
-        $result.TimedOut | Should -BeTrue
-        (Get-Process -Id $PID -ErrorAction SilentlyContinue) | Should -Not -BeNullOrEmpty
+        try {
+            $result = Invoke-TimedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList @(
+                '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $guardianPath,
+                '-RuntimeRoot', $runtimeRoot, '-BrokerProcessId', '2147483647',
+                '-Token', $token, '-DeadlineSeconds', '2') -CaptureStdOut -CaptureStdErr -TimeoutSeconds 2
+            $result.TimedOut | Should -BeTrue
+            $leader.Process.HasExited | Should -BeFalse
+        }
+        finally {
+            if (-not $leader.Process.HasExited) { Stop-ProcessTree $leader.Process }
+            [void](Complete-AgentRedirectedProcess $leader)
+        }
     }
 }

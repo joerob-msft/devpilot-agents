@@ -136,6 +136,17 @@ Describe 'trusted durable and lease roots' {
                 schemaVersion = 1; operation = 'cancel'; dispatchId = $dispatchId
                 nonce = ('f' * 36)
             } | ConvertTo-Json -Compress | Set-Content -LiteralPath $requestPath -Encoding utf8NoBOM
+            if (-not $IsWindows) {
+                # Mirror the production cancellation-request writer
+                # (Stop-BrokerChild in Invoke-DevPilotAgentDispatch.ps1), which
+                # always chmods the request file owner-only before the broker
+                # ever reads it. Leaving the default umask permissions here
+                # would make Assert-AgentTrustedFile's -Private check reject
+                # the file for unsafe permissions before the nonce mismatch is
+                # ever evaluated, masking the manifest-binding assertion below.
+                [IO.File]::SetUnixFileMode($requestPath,
+                    [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+            }
             { Test-AgentManualCancellationRequested -RepositoryIdentity $identity `
                     -PullRequestId 104 -Role reviewer } | Should -Throw '*manifest binding*'
             Test-Path -LiteralPath $ackPath | Should -BeFalse
@@ -143,6 +154,10 @@ Describe 'trusted durable and lease roots' {
             @{
                 schemaVersion = 1; operation = 'cancel'; dispatchId = $dispatchId; nonce = $nonce
             } | ConvertTo-Json -Compress | Set-Content -LiteralPath $requestPath -Encoding utf8NoBOM
+            if (-not $IsWindows) {
+                [IO.File]::SetUnixFileMode($requestPath,
+                    [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+            }
             Test-AgentManualCancellationRequested -RepositoryIdentity $identity `
                 -PullRequestId 104 -Role reviewer | Should -BeTrue
             $ack = Get-Content -LiteralPath $ackPath -Raw | ConvertFrom-Json -AsHashtable
@@ -189,7 +204,7 @@ Describe 'trusted durable and lease roots' {
             mandatoryDenies = @('EnableApprovalVote')
             configSnapshotSha256 = ('a' * 64)
         }
-        $pipeName = "devpilot-test-$([Guid]::NewGuid().ToString('N'))"
+        $pipeName = New-AgentPipeName
         $runtimeRoot = Join-Path $suiteRoot 'manual-runtime'
         New-Item -ItemType Directory -Path $runtimeRoot | Out-Null
         $manifestPath = Join-Path $runtimeRoot 'dispatch-manifest.json'

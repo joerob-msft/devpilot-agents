@@ -1,8 +1,27 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { DispatchClient, DISPATCH_PROTOCOL_MAX_BYTES } from "../src/dispatch.js";
+
+// PowerShell (pwsh) ships on every GitHub-hosted runner image (Windows, Linux,
+// macOS), so the fixture below can exercise the real broker process on every
+// platform instead of only on Windows. Resolving it via the platform lookup
+// tool keeps the fixture honest (an absolute, trusted path) without hardcoding
+// a location that only exists on one OS.
+function resolvePwshPath(): string {
+  const lookupTool = process.platform === "win32" ? "where.exe" : "which";
+  const output = execFileSync(lookupTool, ["pwsh"], { encoding: "utf8" });
+  const resolved = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  if (!resolved) {
+    throw new Error("pwsh executable not found on PATH");
+  }
+  return resolved;
+}
 
 test("protocol framing limit includes the newline", () => {
   const frame = `${JSON.stringify({ schemaVersion: 1, operation: "shutdown" })}\n`;
@@ -16,16 +35,12 @@ test("client rejects non-absolute executable and broker paths", () => {
   );
 });
 
-test("production client correlates describe, dispatch, cancel, and shutdown under pwsh", async (context) => {
-  if (process.platform !== "win32") {
-    context.skip("local fixture uses the Windows pwsh path; CI exercises its platform pwsh");
-    return;
-  }
+test("production client correlates describe, dispatch, cancel, and shutdown under pwsh", async () => {
   const root = join(process.cwd(), `.dashboard-dispatch-${process.pid}-${Date.now()}`);
   await mkdir(root, { recursive: false });
   const script = join(root, "fake-broker.ps1");
   const descriptor = join(root, "descriptor.json");
-  const pwsh = join(process.env.ProgramFiles ?? "C:\\Program Files", "PowerShell", "7", "pwsh.exe");
+  const pwsh = resolvePwshPath();
   await writeFile(descriptor, "{}", "utf8");
   await writeFile(script, String.raw`
 param([string]$DescriptorPath)
