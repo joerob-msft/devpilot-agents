@@ -426,6 +426,22 @@ rather than as a whole file. Without it a 60 KB rule document either exceeds its
 per-source cap, which fails the pack and means the rule silently never reaches
 the reviewer, or consumes an entire pack budget on its own.
 
+##### Previewing one capability over one pull request
+
+`tools/Invoke-OwnerPreviewCycle.ps1` runs the `bpm-test-ownership@1` specialist
+over a single pull request and writes a capability-scoped preview: `prepare`
+reads the PR through the typed cohort-entry evidence builder and seals a
+permanently non-promotable snapshot with no model and no write, and `run` starts
+the one specialist model through blinded acquisition. There is no generalist -
+the authored request carries no `executionPlan`, and that section is where a
+cohort entry declares its two generalist slots.
+
+The report speaks only in the capability's own vocabulary - `checked N
+declarations; X violations; Y unknown`, where `unknown` is never folded into
+either - and carries no vote, no severity and no pass/fail, because a layer that
+checked one convention cannot say a pull request is fine. See
+[docs/owner-preview.md](docs/owner-preview.md).
+
 #### Sealed source transport (layer 8)
 
 **The model is given no working file-read tool. It is given the file's bytes.**

@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer.owner-preview-status.v1",
+  "title": "Owner convention preview status",
+  "description": "The capability-scoped result of one preview-only specialist pass over one pull request head. This document reports what ONE capability checked. It carries no global verdict, no severity roll-up and no pass/fail field, because a layer that checked one convention is not in a position to say a pull request is fine.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "capability",
+    "subject",
+    "rule",
+    "snapshot",
+    "counts",
+    "terminal",
+    "spend",
+    "createdUtc"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "reviewer-owner-preview-status" },
+    "capability": {
+      "const": "bpm-test-ownership@1",
+      "description": "The one capability this build previews. A const rather than a free string: a status that could name any capability would be a status a reader has to check before trusting the counts."
+    },
+    "subjectKey": { "$ref": "#/$defs/hash" },
+    "headKey": { "$ref": "#/$defs/hash" },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["organization", "project", "repositoryId", "pullRequestId", "sourceCommit"],
+      "properties": {
+        "organization": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "project": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "repositoryId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "repositoryName": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "pullRequestId": { "type": "integer", "minimum": 1 },
+        "iterationId": { "type": "integer", "minimum": 1 },
+        "sourceCommit": { "$ref": "#/$defs/commit" },
+        "targetCommit": { "$ref": "#/$defs/commit" },
+        "targetRefName": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "description": "Exactly which bytes the verdicts were measured against. A finding whose rule provenance is not stated is a finding nobody can check.",
+      "additionalProperties": false,
+      "required": ["path", "commit", "sha256", "byteLength"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "commit": { "$ref": "#/$defs/commit" },
+        "sha256": { "$ref": "#/$defs/hash" },
+        "byteLength": { "type": "integer", "minimum": 1 },
+        "section": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "description": "The sealed, permanently non-promotable input the pass read. Both classification fields are const: this layer previews, and a promotable input would be one a later step could mistake for something publishable.",
+      "additionalProperties": false,
+      "required": ["snapshotId", "manifestDigest", "sealKind", "nonPromotable"],
+      "properties": {
+        "snapshotId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "manifestDigest": { "$ref": "#/$defs/hash" },
+        "sealKind": { "const": "offlineCorpusSeal" },
+        "nonPromotable": { "const": true }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "description": "The capability's own vocabulary. 'checked' is violations plus compliant: a declaration the rule reached and reported on. 'unknown' is never folded into either, because 'the context could not be established' and 'this declaration is fine' must never reach a reader looking the same.",
+      "additionalProperties": false,
+      "required": ["checked", "violations", "compliant", "unknown"],
+      "properties": {
+        "checked": { "type": "integer", "minimum": 0 },
+        "violations": { "type": "integer", "minimum": 0 },
+        "compliant": { "type": "integer", "minimum": 0 },
+        "unknown": { "type": "integer", "minimum": 0 },
+        "rows": { "type": "integer", "minimum": 0 },
+        "withheld": { "type": "integer", "minimum": 0 },
+        "residualRisks": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "violations": {
+      "type": "array",
+      "description": "One entry per construct verdicted 'violation', so a reader can act without opening the transcript.",
+      "maxItems": 512,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ruleRef", "constructRef"],
+        "properties": {
+          "ruleRef": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "constructRef": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "rationale": { "type": "string", "maxLength": 4096 },
+          "suggestion": { "type": "string", "maxLength": 4096 }
+        }
+      }
+    },
+    "unknowns": {
+      "type": "array",
+      "maxItems": 512,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ruleRef", "constructRef"],
+        "properties": {
+          "ruleRef": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "constructRef": { "type": "string", "minLength": 1, "maxLength": 64 }
+        }
+      }
+    },
+    "violationsTruncated": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "How many violations exist beyond the listed ones. Present only when the list was capped, so a reader can tell a complete list from a partial one. The counts block is always the full census."
+    },
+    "unknownsTruncated": { "type": "integer", "minimum": 1 },
+    "residualRisks": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+    },
+    "terminal": {
+      "type": "object",
+      "description": "How the pass ended, stated separately from what it found. A refused or truncated marker is never reported as a clean review.",
+      "additionalProperties": false,
+      "required": ["status", "markerStatus"],
+      "properties": {
+        "status": {
+          "enum": ["completed", "incomplete", "blocked"],
+          "description": "completed: a schema-valid marker was read. incomplete: the pass ended without one. blocked: the pass was refused before or after the model on evidence grounds."
+        },
+        "markerStatus": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "diagnostic": { "type": "string", "maxLength": 8192 },
+        "field": { "type": "string", "maxLength": 512 },
+        "contractVersion": { "const": 4 }
+      }
+    },
+    "spend": {
+      "type": "object",
+      "description": "What the pass cost and what it was structurally incapable of doing. The write counters are const zero: this build has no code path that could raise them, so a status carrying anything else would be describing a different build.",
+      "additionalProperties": false,
+      "required": ["modelStarts", "providerWriteCount", "writeToolInvocations", "generalistModelStarts"],
+      "properties": {
+        "modelStarts": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "providerWriteCount": { "const": 0 },
+        "writeToolInvocations": { "const": 0 },
+        "generalistModelStarts": { "const": 0 },
+        "specialistModel": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "durationMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "createdUtc": { "type": "string", "minLength": 20, "maxLength": 32 }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+  }
+}
