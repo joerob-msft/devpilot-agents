@@ -570,6 +570,256 @@ Describe 'broker and child-startup wiring' {
     }
 }
 
+Describe 'PR4 security hardening: kill-switch grant invalidation and broker-origin attestation' {
+  BeforeAll {
+    function New-GrantedManifestContext {
+        <#
+            Builds a minimal but fully self-consistent manual-dispatch manifest + sealed
+            grant-selection artifact for a single delegable capability, matching every field
+            Enter-AgentManualDispatchStartup independently re-derives/cross-checks (schema, digest,
+            ceiling self-consistency, WorktreeId, grant identity). PolicyPathHash/PolicyContentSha256
+            are deliberately arbitrary: the delegation-policy-allows check they gate is never reached
+            in the kill-switch tests below, which throw earlier under the kill-switch check.
+            -NoGrant builds the ordinary (unwidened) equivalent instead -- no sealed artifact, no
+            grantCapability -- for tests that must reach code AFTER the grant-only delegation-policy
+            re-check (the checked-in delegation.policy.v1.json's real on-disk ACL is environment-
+            dependent on a shared/mapped-drive checkout, exactly like Get-AgentDelegationPolicy's own
+            tests document; ordinary manual dispatch never reads that file at all, so it is
+            unaffected regardless of host).
+        #>
+        param([ValidateRange(1, [int]::MaxValue)][int]$PullRequestId = 7, [string]$WorktreeIdOverride, [switch]$NoGrant)
+        $roots = New-TestRoots
+        $durableRoot = Resolve-AgentTrustedRoot -Path (Join-Path $roots.Suite 'durable') -Kind durable-state `
+            -RepositoryRoot $roots.RepoRoot -Create
+        $leaseRoot = Resolve-AgentTrustedRoot -Path (Join-Path $roots.Suite 'leases') -Kind lease `
+            -RepositoryRoot $roots.RepoRoot -DisallowedRoots $durableRoot -Create
+        $context = Get-AgentDurableStateContext -DurableStateRoot $durableRoot -RepositoryIdentity $identity -Role reviewer -Create
+        # NOTE: assigned via explicit if/else statements (never an inline `if {...} else {@()}`
+        # expression as a hashtable value) -- PowerShell collapses an empty-array *expression
+        # result* to $null, which would otherwise silently turn "no mandatory denies" into a
+        # one-element array containing $null once round-tripped through JSON.
+        if ($NoGrant) {
+            $capabilitiesValue = @('EnableFindingComments'); $mandatoryDeniesValue = @('EnableApprovalVote')
+            $ceilingCapabilitiesValue = @('EnableFindingComments')
+        }
+        else {
+            $capabilitiesValue = @('EnableApprovalVote'); $mandatoryDeniesValue = @()
+            $ceilingCapabilitiesValue = @()
+        }
+        $policy = [ordered]@{
+            schemaVersion = 1; repositoryIdentity = @{ key = $identity.key; verified = $true }; role = 'reviewer'
+            capabilities = $capabilitiesValue
+            mandatoryDenies = $mandatoryDeniesValue
+            ceilingCapabilities = $ceilingCapabilitiesValue
+            ceilingMandatoryDenies = @('EnableApprovalVote')
+            configSnapshotSha256 = ('a' * 64)
+        }
+        $runtimeRoot = Join-Path $roots.Suite 'manual-runtime'
+        New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+        $promptPath = Join-Path $runtimeRoot 'operator-context.txt'
+        [IO.File]::WriteAllText($promptPath, 'do the review', [Text.UTF8Encoding]::new($false))
+        $dispatchId = [Guid]::NewGuid().ToString('D')
+        $draftId = [Guid]::NewGuid().ToString('D')
+        $worktreeId = if ($WorktreeIdOverride) { $WorktreeIdOverride } else { Get-AgentWorktreeIdentity -RepositoryRoot $roots.RepoRoot }
+        if (-not $NoGrant) {
+            [void](New-AgentWideningGrantArtifact -RuntimeRoot $runtimeRoot -DraftId $draftId -DispatchId $dispatchId `
+                    -Capability 'EnableApprovalVote' -Role reviewer -RepositoryKey $identity.key -WorktreeId $worktreeId `
+                    -PullRequestId $PullRequestId -SourceCommit $commit -PolicyPathHash ('c' * 64) -PolicyContentSha256 ('d' * 64) `
+                    -GrantNonce (New-AgentNonce) -ExpiresAtUtc (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow.AddMinutes(10))))
+        }
+        $manifestPath = Join-Path $runtimeRoot 'dispatch-manifest.json'
+        $boundCapabilities = if ($NoGrant) {
+            @{ EnableFindingComments = $true; EnableApprovalVote = $false }
+        } else {
+            @{ EnableApprovalVote = $true }
+        }
+        @{
+            schemaVersion = 1; dispatchId = $dispatchId; role = 'reviewer'
+            repositoryKey = $identity.key; pullRequestId = $PullRequestId
+            capabilityPolicyDigest = Get-AgentCanonicalDigest $policy
+            policy = $policy; runtimeRoot = $runtimeRoot; dispatchDraftId = $draftId
+            grantCapability = $(if ($NoGrant) { $null } else { 'EnableApprovalVote' })
+            operatorPromptPath = $promptPath; startupPipe = (New-AgentPipeName)
+            prStateFingerprintSourceCommit = $commit
+        } | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
+        return @{
+            Roots = $roots; Context = $context; LeaseRoot = $leaseRoot; RuntimeRoot = $runtimeRoot
+            ManifestPath = $manifestPath; PullRequestId = $PullRequestId; BoundCapabilities = $boundCapabilities
+        }
+    }
+  }
+
+    It 'CRITICAL-1: a kill switch enabled after mint invalidates the grant and clears the sealed artifact at child startup' {
+        $ctx = New-GrantedManifestContext
+        $lock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $ctx.Roots.RepoRoot
+        $lock.Acquired | Should -BeTrue
+        try { [void](Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $ctx.Roots.RepoRoot) }
+        finally { Exit-AgentLock $lock.Stream }
+
+        { Enter-AgentManualDispatchStartup -ManifestPath $ctx.ManifestPath -RepositoryIdentity $identity `
+                -RepositoryRoot $ctx.Roots.RepoRoot -DurableContext $ctx.Context -LeaseRoot $ctx.LeaseRoot `
+                -Role reviewer -EventLogPath (Join-Path $ctx.RuntimeRoot 'events.jsonl') `
+                -BoundCapabilities @{ EnableApprovalVote = $true }
+        } | Should -Throw '*grant-invalidated*kill switch*'
+
+        # The sealed artifact must be gone -- an invalidated grant can never be re-read by a retry.
+        Get-AgentWideningGrantArtifact -RuntimeRoot $ctx.RuntimeRoot | Should -BeNullOrEmpty
+        # The capability-override lock must not have been left held.
+        $followUp = Enter-AgentCapabilityOverrideLock -RepositoryRoot $ctx.Roots.RepoRoot -TimeoutMilliseconds 500
+        $followUp.Acquired | Should -BeTrue
+        Exit-AgentLock $followUp.Stream
+    }
+
+    It 'mints and dispatches successfully with the kill switch inactive (control case for CRITICAL-1)' {
+        $ctx = New-GrantedManifestContext -NoGrant
+        # No pipe server is listening, so this reaches (and fails at) the pipe-connect stage --
+        # proving the kill-switch/grant/attestation checks above it all passed, unlike the
+        # kill-switch-active case which never gets this far.
+        { Enter-AgentManualDispatchStartup -ManifestPath $ctx.ManifestPath -RepositoryIdentity $identity `
+                -RepositoryRoot $ctx.Roots.RepoRoot -DurableContext $ctx.Context -LeaseRoot $ctx.LeaseRoot `
+                -Role reviewer -EventLogPath (Join-Path $ctx.RuntimeRoot 'events.jsonl') `
+                -BoundCapabilities $ctx.BoundCapabilities
+        } | Should -Throw '*broker-attestation-missing*'
+    }
+
+    It 'issue #105 PR4 requirement 5: rejects a sealed grant minted for a different worktree' {
+        $ctx = New-GrantedManifestContext -WorktreeIdOverride ('f' * 64)
+        { Enter-AgentManualDispatchStartup -ManifestPath $ctx.ManifestPath -RepositoryIdentity $identity `
+                -RepositoryRoot $ctx.Roots.RepoRoot -DurableContext $ctx.Context -LeaseRoot $ctx.LeaseRoot `
+                -Role reviewer -EventLogPath (Join-Path $ctx.RuntimeRoot 'events.jsonl') `
+                -BoundCapabilities @{ EnableApprovalVote = $true }
+        } | Should -Throw '*grant-invalidated*does not match this dispatch*'
+    }
+
+    It 'CRITICAL-2: rejects a caller-authored manifest/artifact with no broker attestation handle, before any pipe is ever contacted' {
+        # Adversarial path: everything a direct/headless caller can trivially fabricate (a
+        # well-formed manifest naming a real startupPipe name) is present and internally
+        # consistent -- the ONLY thing missing is the broker-origin attestation handle a genuine
+        # broker spawn would have provided. Deliberately no fake pipe server is started here: since
+        # NOTHING is listening on $manifest.startupPipe, ANY attempt to actually use it (the real
+        # handshake, or even the catch block's best-effort failure notification) would fail fast
+        # with a connection-refused-style error rather than hang or succeed -- the strongest
+        # possible proof that rejection happens strictly before any pipe is ever contacted.
+        $ctx = New-GrantedManifestContext -NoGrant
+        $originalHandle = $env:DEVPILOT_BROKER_ATTESTATION_HANDLE
+        $env:DEVPILOT_BROKER_ATTESTATION_HANDLE = $null
+        try {
+            { Enter-AgentManualDispatchStartup -ManifestPath $ctx.ManifestPath -RepositoryIdentity $identity `
+                    -RepositoryRoot $ctx.Roots.RepoRoot -DurableContext $ctx.Context -LeaseRoot $ctx.LeaseRoot `
+                    -Role reviewer -EventLogPath (Join-Path $ctx.RuntimeRoot 'events.jsonl') `
+                    -BoundCapabilities $ctx.BoundCapabilities
+            } | Should -Throw '*broker-attestation-missing*'
+        }
+        finally {
+            $env:DEVPILOT_BROKER_ATTESTATION_HANDLE = $originalHandle
+        }
+    }
+
+    It 'CRITICAL-2: rejects a malformed/bogus broker attestation handle rather than treating it as absent' {
+        $ctx = New-GrantedManifestContext -NoGrant
+        $originalHandle = $env:DEVPILOT_BROKER_ATTESTATION_HANDLE
+        $env:DEVPILOT_BROKER_ATTESTATION_HANDLE = '999999999'
+        try {
+            { Enter-AgentManualDispatchStartup -ManifestPath $ctx.ManifestPath -RepositoryIdentity $identity `
+                    -RepositoryRoot $ctx.Roots.RepoRoot -DurableContext $ctx.Context -LeaseRoot $ctx.LeaseRoot `
+                    -Role reviewer -EventLogPath (Join-Path $ctx.RuntimeRoot 'events.jsonl') `
+                    -BoundCapabilities $ctx.BoundCapabilities
+            } | Should -Throw '*broker-attestation-invalid*'
+        }
+        finally { $env:DEVPILOT_BROKER_ATTESTATION_HANDLE = $originalHandle }
+    }
+
+    It 'CRITICAL-2 (valid broker path): a real anonymous-pipe secret is read correctly and yields a verifiable, tamper-sensitive proof' {
+        # Exercises the actual OS pipe I/O and the real Receive-AgentBrokerAttestationSecret /
+        # Get-AgentAttestationProof primitives the broker and child both call in production --
+        # sequential (broker writes fully before the child ever reads), so no concurrency/hang risk,
+        # while still proving the mechanism end-to-end: a real secret, delivered only through a real
+        # anonymous-pipe handle, verifiably ties the child's proof to the broker's own copy.
+        $secret = New-AgentBrokerAttestationSecret
+        $pipe = [IO.Pipes.AnonymousPipeServerStream]::new([IO.Pipes.PipeDirection]::Out, [IO.HandleInheritability]::None)
+        $originalHandle = $env:DEVPILOT_BROKER_ATTESTATION_HANDLE
+        try {
+            $env:DEVPILOT_BROKER_ATTESTATION_HANDLE = $pipe.GetClientHandleAsString()
+            $pipe.Write($secret, 0, $secret.Length)
+            $pipe.Flush()
+            $received = Receive-AgentBrokerAttestationSecret -TimeoutMilliseconds 5000
+            [Convert]::ToHexString($received) | Should -BeExactly ([Convert]::ToHexString($secret))
+            # Cleared immediately once read, regardless of outcome -- never left for a further
+            # child process this agent spawns to inherit.
+            $env:DEVPILOT_BROKER_ATTESTATION_HANDLE | Should -BeNullOrEmpty
+            $digest = Get-AgentAttestationDigest -DispatchId ([Guid]::NewGuid().ToString('D')) -Role reviewer `
+                -RepositoryKey $identity.key -WorktreeId ('a' * 64) -PullRequestId 7 -SourceCommit $commit `
+                -CapabilityPolicyDigest ('b' * 64) -GrantCapability $null -GrantNonce $null -GrantExpiresAtUtc $null
+            $nonce = New-AgentNonce
+            $childProof = Get-AgentAttestationProof -SecretBytes $received -Nonce $nonce -Digest $digest
+            $brokerProof = Get-AgentAttestationProof -SecretBytes $secret -Nonce $nonce -Digest $digest
+            $childProof | Should -BeExactly $brokerProof
+            $tamperedDigestProof = Get-AgentAttestationProof -SecretBytes $secret -Nonce $nonce -Digest (($digest.Substring(1)) + '0')
+            $tamperedDigestProof | Should -Not -Be $brokerProof
+            $wrongSecret = New-AgentBrokerAttestationSecret
+            (Get-AgentAttestationProof -SecretBytes $wrongSecret -Nonce $nonce -Digest $digest) | Should -Not -Be $brokerProof
+        }
+        finally {
+            $pipe.Dispose()
+            $env:DEVPILOT_BROKER_ATTESTATION_HANDLE = $originalHandle
+        }
+    }
+
+    It 'Receive-AgentBrokerAttestationSecret times out cleanly (never hangs) when no data is ever written' {
+        $pipe = [IO.Pipes.AnonymousPipeServerStream]::new([IO.Pipes.PipeDirection]::Out, [IO.HandleInheritability]::None)
+        $originalHandle = $env:DEVPILOT_BROKER_ATTESTATION_HANDLE
+        try {
+            $env:DEVPILOT_BROKER_ATTESTATION_HANDLE = $pipe.GetClientHandleAsString()
+            { Receive-AgentBrokerAttestationSecret -TimeoutMilliseconds 300 } | Should -Throw '*broker-attestation-invalid*'
+        }
+        finally {
+            $pipe.Dispose()
+            $env:DEVPILOT_BROKER_ATTESTATION_HANDLE = $originalHandle
+        }
+    }
+}
+
+Describe 'PR4 security hardening: fail-closed delegation policy load (requirements 3 and 9)' {
+    It 'Get-AgentDelegationPolicyOrNull returns $null (never throws) when the policy cannot be loaded' {
+        $missingRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $missingRoot -Force | Out-Null
+        { Get-AgentDelegationPolicyOrNull -ToolkitRoot $missingRoot } | Should -Not -Throw
+        Get-AgentDelegationPolicyOrNull -ToolkitRoot $missingRoot | Should -BeNullOrEmpty
+    }
+
+    It 'Get-AgentDelegationPolicyOrThrow fails closed with a distinct, actionable code' {
+        $missingRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $missingRoot -Force | Out-Null
+        { Get-AgentDelegationPolicyOrThrow -ToolkitRoot $missingRoot } | Should -Throw '*delegation-policy-unavailable*'
+    }
+
+    It 'describe/profile stay baseline functional (delegableAvailable empty) while widening rejects distinctly' {
+        $brokerSource = Get-Content -LiteralPath $brokerPath -Raw
+        $profileBody = [regex]::Match($brokerSource, '(?s)function Get-BrokerCapabilityProfile \{.*?\n\}').Value
+        $profileBody | Should -Match 'Get-AgentDelegationPolicyOrNull'
+        $profileBody | Should -Not -Match 'Get-AgentDelegationPolicyOrThrow'
+        foreach ($fn in @('Invoke-DescribeWidening', 'Invoke-ConfirmWideningPreview', 'Invoke-ConfirmWideningMint')) {
+            $body = [regex]::Match($brokerSource, "(?s)function $fn \{.*?\n\}").Value
+            $body | Should -Match 'Get-AgentDelegationPolicyOrThrow'
+        }
+    }
+}
+
+Describe 'PR4 security hardening: minted re-describe and cancel generation (requirements 4 and 12)' {
+    BeforeAll { $script:brokerSource = Get-Content -LiteralPath $brokerPath -Raw }
+
+    It 'requirement 4: describe-widening rejects re-describing a draft with an already-minted grant' {
+        $describeBody = [regex]::Match($script:brokerSource, '(?s)function Invoke-DescribeWidening \{.*?\n\}').Value
+        $describeBody | Should -Match "Stage -ceq 'minted'"
+        $describeBody | Should -Match 'widening-invalid'
+    }
+
+    It 'requirement 12: cancel-widening requires an exact, present, safe-integer generation' {
+        $cancelBody = [regex]::Match($script:brokerSource, '(?s)function Invoke-CancelWidening \{.*?\n\}').Value
+        $cancelBody | Should -Match 'ConvertTo-AgentSafeIntegralNumber'
+        $cancelBody | Should -Not -Match '\[int64\]\$Request\.generation -ne'
+    }
+}
 Describe 'PR3 capability-override writer and kill switch' {
     It 'exports the PR3 writer and kill-switch primitives at module scope' {
         foreach ($name in @(

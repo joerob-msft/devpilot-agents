@@ -1646,12 +1646,13 @@ function Get-AgentDelegationPolicy {
 
         Schema is exact and fixed: exactly the two known roles, each with exactly its own single
         delegable capability (Get-AgentHarnessCapabilityDescriptor's delegableDefaultOff), each an
-        object with exactly {allowedRepositoryKeys:[string], allowAnyVerified:bool} and no other
-        fields -- any additional/missing/malformed field, or any duplicate/case-collision key
+        object with exactly {allowedRepositoryKeys:[string]} and no other fields -- any
+        additional/missing/malformed field, or any duplicate/case-collision key
         (Assert-AgentCapabilityJsonRawShape, over the raw JSON before any hashtable folding hides
-        one), fails the WHOLE load closed. An empty allowedRepositoryKeys with allowAnyVerified:false
-        (the shipped default) means delegation is categorically unavailable: no caller of
-        Test-AgentDelegationAllows can ever get true back against it. Governance (who may edit this
+        one), fails the WHOLE load closed. There is deliberately no wildcard/"allow any" escape
+        hatch in this schema (issue #105 PR4 requirement 8): an empty allowedRepositoryKeys (the
+        shipped default) means delegation is categorically unavailable, and the only way to grant
+        anything is to name the exact repository key(s) explicitly. Governance (who may edit this
         file, and its CODEOWNERS group) is deliberately out of this function's scope.
     #>
     [CmdletBinding()]
@@ -1700,13 +1701,9 @@ function Get-AgentDelegationPolicy {
         $entry = $roleRecord[$expectedCapability]
         if ($entry -isnot [Collections.IDictionary]) { throw "[delegation-policy-invalid] roles.$role.$expectedCapability must be a JSON object." }
         $entryKeys = @($entry.Keys)
-        if ($entryKeys.Count -ne 2 -or
-            @($entryKeys | Where-Object { $_ -ceq 'allowedRepositoryKeys' }).Count -ne 1 -or
-            @($entryKeys | Where-Object { $_ -ceq 'allowAnyVerified' }).Count -ne 1) {
-            throw "[delegation-policy-invalid] roles.$role.$expectedCapability must contain exactly allowedRepositoryKeys and allowAnyVerified."
-        }
-        if ($entry.allowAnyVerified -isnot [bool]) {
-            throw "[delegation-policy-invalid] roles.$role.$expectedCapability.allowAnyVerified must be a boolean."
+        if ($entryKeys.Count -ne 1 -or
+            @($entryKeys | Where-Object { $_ -ceq 'allowedRepositoryKeys' }).Count -ne 1) {
+            throw "[delegation-policy-invalid] roles.$role.$expectedCapability must contain exactly allowedRepositoryKeys."
         }
         $rawKeys = $entry.allowedRepositoryKeys
         if ($rawKeys -is [string] -or $rawKeys -isnot [Collections.IEnumerable]) {
@@ -1725,7 +1722,7 @@ function Get-AgentDelegationPolicy {
             [void]$keys.Add($keyText)
         }
         $delegations[$role] = [ordered]@{
-            Capability = $expectedCapability; AllowedRepositoryKeys = @($keys.ToArray()); AllowAnyVerified = [bool]$entry.allowAnyVerified
+            Capability = $expectedCapability; AllowedRepositoryKeys = @($keys.ToArray())
         }
     }
     return [ordered]@{
@@ -1739,11 +1736,12 @@ function Get-AgentDelegationPolicy {
 function Test-AgentDelegationAllows {
     <#
         Pure decision function (issue #105 PR4): does the checked-in delegation policy permit
-        granting Capability to Role for RepositoryKey? An empty allowedRepositoryKeys with
-        allowAnyVerified:false (the shipped safe default) always returns false -- delegation is
-        categorically unavailable until a CODEOWNERS-approved policy change populates one or the
-        other. Capability must be exactly the role's own single delegable capability; any other
-        name is never allowed, never looked up.
+        granting Capability to Role for RepositoryKey? An empty allowedRepositoryKeys (the shipped
+        safe default) always returns false -- delegation is categorically unavailable until a
+        CODEOWNERS-approved policy change explicitly names a repository key. There is no
+        allow-any/wildcard escape hatch (issue #105 PR4 requirement 8): the only way this can ever
+        return true is an exact, explicit RepositoryKey match. Capability must be exactly the
+        role's own single delegable capability; any other name is never allowed, never looked up.
     #>
     [CmdletBinding()]
     param(
@@ -1755,8 +1753,42 @@ function Test-AgentDelegationAllows {
     if (-not $Policy.Delegations.Contains($Role)) { return $false }
     $entry = $Policy.Delegations[$Role]
     if ([string]$entry.Capability -cne $Capability) { return $false }
-    if ([bool]$entry.AllowAnyVerified) { return $true }
     return (@($entry.AllowedRepositoryKeys) -ccontains $RepositoryKey)
+}
+
+function Get-AgentDelegationPolicyOrNull {
+    <#
+        Fail-closed wrapper for read-only, best-effort callers (issue #105 PR4 requirements 3/9):
+        Get-BrokerCapabilityProfile (describe/profile) must keep reporting an ordinary capability
+        ceiling even when the checked-in delegation policy cannot be loaded at all -- a real
+        checkout with an unexpected ACL, a missing file, or a corrupt/malformed policy. Returns
+        $null instead of throwing; every caller of this wrapper treats $null exactly like "no
+        delegation configured" (delegableAvailable stays @()), never as an error that should abort
+        the whole RPC. This never masks the underlying failure from an operator who actually needs
+        to delegate/widen -- Get-AgentDelegationPolicyOrThrow is the fail-closed path for those
+        callers (describe-widening/confirm-widening-*/cancel-widening/dispatch's grant recheck).
+    #>
+    param([Parameter(Mandatory)][string]$ToolkitRoot)
+    try { return Get-AgentDelegationPolicy -ToolkitRoot $ToolkitRoot }
+    catch { return $null }
+}
+
+function Get-AgentDelegationPolicyOrThrow {
+    <#
+        Fail-closed wrapper for the widening/delegation-consuming callers (issue #105 PR4
+        requirements 3/9): describe-widening, confirm-widening-preview, confirm-widening-mint,
+        cancel-widening, and dispatch's own grant revalidation all NEED a real policy read to make
+        a correct decision, so unlike Get-AgentDelegationPolicyOrNull they must never silently
+        proceed without one. Normalizes any underlying failure (missing/malformed file, a real
+        checkout's unexpected ACL, a transient I/O error) to one distinct, actionable code --
+        [delegation-policy-unavailable] -- so operators/tests can tell "delegation is unavailable
+        right now" apart from every other dispatch/widening failure, while ordinary (non-delegated)
+        profile/describe/manual dispatch on the same broker keeps working via the OrNull wrapper
+        above.
+    #>
+    param([Parameter(Mandatory)][string]$ToolkitRoot)
+    try { return Get-AgentDelegationPolicy -ToolkitRoot $ToolkitRoot }
+    catch { throw "[delegation-policy-unavailable] The checked-in delegation policy could not be loaded: $($_.Exception.Message)" }
 }
 
 function Get-AgentWideningGrantArtifactPath {
@@ -1904,6 +1936,158 @@ function New-AgentWideningChallenge {
 function Test-AgentWideningChallengeShape {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Challenge)
     return [bool]($Challenge -cmatch '^[0-9a-f]{48}$')
+}
+
+function New-AgentBrokerAttestationSecret {
+    <#
+        Ephemeral, broker-only, in-memory-only secret (issue #105 PR4 CRITICAL-2 hardening): 32
+        cryptographically random bytes, minted fresh per dispatch attempt and NEVER written to
+        disk, a manifest, a sealed artifact, or any wire message. Delivered to the child ONLY
+        through an inherited anonymous-pipe handle (see Invoke-Dispatch), which only a process the
+        broker itself directly spawned can ever receive -- a forged manifest plus a same-named
+        fake pipe can never obtain it. Used as an HMAC key (Get-AgentAttestationProof) so the
+        child can prove possession without ever needing to verify anything itself; the broker is
+        the only party that ever compares a proof, against its own copy of this exact secret.
+    #>
+    $bytes = [byte[]]::new(32)
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return $bytes
+}
+
+function Get-AgentAttestationDigest {
+    <#
+        Canonical digest of the exact broker-origin attestation fields (issue #105 PR4 CRITICAL-2
+        hardening / requirement 6): both the child (Enter-AgentManualDispatchStartup, from its own
+        independently re-verified live state) and the broker (Invoke-Dispatch, from its own
+        in-memory draft/grant record) call this with THEIR OWN independently-sourced values --
+        never a value copied from the other side's message. A mismatch (a tampered manifest, a
+        stale or replayed grant, or the wrong worktree) changes the digest and is caught by the
+        broker's own recomputation before it ever authorizes 'proceed'. Including
+        grantNonce/grantExpiresAtUtc here gives grantNonce a real, live-bound exact-match check
+        (requirement 6) instead of being carried in the sealed artifact but never actually verified
+        against anything.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$DispatchId,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][string]$RepositoryKey,
+        [Parameter(Mandatory)][string]$WorktreeId,
+        [Parameter(Mandatory)][int]$PullRequestId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$CapabilityPolicyDigest,
+        [AllowNull()][string]$GrantCapability,
+        [AllowNull()][string]$GrantNonce,
+        [AllowNull()]$GrantExpiresAtUtc
+    )
+    $fields = [ordered]@{
+        schemaVersion = 1; dispatchId = $DispatchId; role = $Role; repositoryKey = $RepositoryKey
+        worktreeId = $WorktreeId; pullRequestId = $PullRequestId; sourceCommit = $SourceCommit
+        capabilityPolicyDigest = $CapabilityPolicyDigest
+        grantCapability = $(if ($GrantCapability) { $GrantCapability } else { $null })
+        grantNonce = $(if ($GrantCapability) { $GrantNonce } else { $null })
+        grantExpiresAtUtc = $(if ($GrantCapability) { [int64]$GrantExpiresAtUtc } else { $null })
+    }
+    return Get-AgentCanonicalDigest -InputObject $fields
+}
+
+function Get-AgentAttestationProof {
+    <#
+        HMAC-SHA256(secret, "nonce:digest") as lowercase hex (issue #105 PR4 CRITICAL-2 hardening)
+        -- a standard, well-known keyed-MAC construction, not bespoke cryptography. The child
+        computes this once (it can never verify a broker-authored proof back, since it never holds
+        the broker's copy of the secret) and sends {nonce, digest, proof} to the broker; only the
+        broker -- the sole other holder of SecretBytes -- ever recomputes and compares it. A forger
+        who can fabricate a matching manifest/artifact/named-pipe reply still cannot produce a
+        valid proof without SecretBytes, which is never written to disk, a manifest, an artifact,
+        or any file the forger could read.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$SecretBytes,
+        [Parameter(Mandatory)][string]$Nonce,
+        [Parameter(Mandatory)][string]$Digest
+    )
+    $hmac = [Security.Cryptography.HMACSHA256]::new($SecretBytes)
+    try {
+        $message = [Text.Encoding]::UTF8.GetBytes("$($Nonce):$($Digest)")
+        return [Convert]::ToHexString($hmac.ComputeHash($message)).ToLowerInvariant()
+    }
+    finally { $hmac.Dispose() }
+}
+
+function Receive-AgentBrokerAttestationSecret {
+    <#
+        Child-side (issue #105 PR4 CRITICAL-2 hardening): the ONLY way a manual-dispatch child can
+        obtain the broker's ephemeral attestation secret is an anonymous-pipe handle the broker
+        itself created and handed down as an OS-inherited handle at the moment it directly spawned
+        this exact process -- never a CLI argument, never a file, never anything a direct/headless
+        caller could fabricate by crafting text. The environment variable carries only the pipe's
+        transient handle reference (meaningless outside a process that actually inherited it), is
+        cleared from THIS process's own environment the instant it is read (so no further child
+        process this agent spawns ever sees or re-inherits it), and is never logged. Throws
+        distinct, fail-closed codes: [broker-attestation-missing] when the environment variable
+        itself is absent (the ordinary direct/headless-invocation case -- no inherited handle was
+        ever set up because there is no real broker parent), or [broker-attestation-invalid] when a
+        handle IS present but cannot be opened or the secret cannot be read within the deadline (a
+        malformed/bogus handle value, or a peer that closed without writing) -- never
+        reinterpreted as "no attestation required".
+    #>
+    [CmdletBinding()]
+    param([ValidateRange(100, 30000)][int]$TimeoutMilliseconds = 5000)
+    $handle = $env:DEVPILOT_BROKER_ATTESTATION_HANDLE
+    if ([string]::IsNullOrEmpty($handle)) {
+        throw '[broker-attestation-missing] This process was not launched with a broker attestation handle; manual dispatch requires launch by the trusted broker.'
+    }
+    # Cleared immediately, before it is even used, so a crash/exception mid-read still leaves no
+    # trace of the handle in this process's environment for any further child process to inherit.
+    [Environment]::SetEnvironmentVariable('DEVPILOT_BROKER_ATTESTATION_HANDLE', $null)
+    $client = $null
+    try {
+        $client = [IO.Pipes.AnonymousPipeClientStream]::new([IO.Pipes.PipeDirection]::In, $handle)
+        $buffer = [byte[]]::new(32)
+        $totalRead = 0
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+        while ($totalRead -lt $buffer.Length) {
+            $remainingMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            $readTask = $client.ReadAsync($buffer, $totalRead, $buffer.Length - $totalRead)
+            if (-not $readTask.Wait($remainingMs)) {
+                throw '[broker-attestation-invalid] Timed out reading the broker attestation secret.'
+            }
+            $count = $readTask.GetAwaiter().GetResult()
+            if ($count -le 0) {
+                throw '[broker-attestation-invalid] Broker attestation pipe closed before the secret was fully delivered.'
+            }
+            $totalRead += $count
+        }
+        return $buffer
+    }
+    catch {
+        if ($_.Exception.Message -match '^\[broker-attestation-invalid\]') { throw }
+        throw "[broker-attestation-invalid] Broker attestation handle could not be read: $($_.Exception.Message)"
+    }
+    finally { if ($client) { $client.Dispose() } }
+}
+
+function Assert-AgentManualDispatchEarlyContext {
+    <#
+        Early, side-effect-free guard (issue #105 PR4 CRITICAL-2 hardening): called by each agent
+        script immediately after its own parameter validation, BEFORE any provider/network setup.
+        A manual-dispatch manifest path alone -- even one naming a real, existing, well-formed file
+        -- is never sufficient evidence of genuine broker issuance; only the broker's own direct
+        process-creation call can hand this process an inherited anonymous-pipe attestation handle.
+        This rejects the cheapest, most common accidental/headless case (a manifest with no
+        accompanying broker attestation, or a manifest that does not even exist) before the caller
+        spends any provider/network cost; the full cryptographic challenge-response happens later,
+        in Enter-AgentManualDispatchStartup, immediately before the ready/proceed handshake.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$ManifestPath)
+    if (-not $ManifestPath) { return }
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw '[broker-attestation-missing] Manual dispatch manifest does not exist.'
+    }
+    if ([string]::IsNullOrEmpty($env:DEVPILOT_BROKER_ATTESTATION_HANDLE)) {
+        throw '[broker-attestation-missing] This process was not launched with a broker attestation handle; manual dispatch requires launch by the trusted broker.'
+    }
 }
 
 function Test-AgentAutoCompleteGrantWouldBeNoOp {
@@ -2536,11 +2720,16 @@ function Enter-AgentManualDispatchStartup {
         # but is still caught fail-closed by the live equality check below.
         $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $RepositoryRoot -TimeoutMilliseconds 2000
         if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+        # Independently derived from RepositoryRoot (issue #105 PR4 requirement 5) -- never taken
+        # from the manifest/artifact, which a caller could otherwise point at a different worktree
+        # of the same repository to replay a grant minted against that other worktree's override
+        # state.
+        $childWorktreeId = Get-AgentWorktreeIdentity -RepositoryRoot $RepositoryRoot
         if ($grantCapability) {
             # issue #105 PR4: independent child-side re-verification of the sealed grant-selection
             # artifact this dispatch was minted with. The artifact is a SELECTION, never an authority
             # (ANT-2): every field is cross-checked against this process's own live state and against
-            # a fresh Get-AgentDelegationPolicy read, all while already holding the same lock every
+            # a fresh delegation-policy read, all while already holding the same lock every
             # settings writer respects, so nothing can narrow/expire/invalidate the grant between
             # this check and `ready` being sent below.
             $toolkitRootForPolicy = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -2550,6 +2739,7 @@ function Enter-AgentManualDispatchStartup {
                 $liveGrant.DraftId -cne [string]$manifest['dispatchDraftId'] -or
                 $liveGrant.DispatchId -cne [string]$manifest.dispatchId -or
                 $liveGrant.RepositoryKey -cne $expectedRepositoryKey -or
+                $liveGrant.WorktreeId -cne $childWorktreeId -or
                 $liveGrant.PullRequestId -ne $prId -or
                 $liveGrant.SourceCommit -cne [string]$manifest.prStateFingerprintSourceCommit) {
                 throw '[grant-invalidated] Sealed grant-selection artifact does not match this dispatch.'
@@ -2557,7 +2747,17 @@ function Enter-AgentManualDispatchStartup {
             if ([DateTimeOffset]::FromUnixTimeSeconds($liveGrant.ExpiresAtUtc).UtcDateTime -le [DateTime]::UtcNow) {
                 throw '[grant-invalidated] Widening grant has expired.'
             }
-            $liveDelegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRootForPolicy
+            # issue #105 PR4 CRITICAL-1: the kill switch is an operator emergency lever over the
+            # WHOLE capability-override/delegation surface -- recheck it here, live, under the same
+            # lock, so a kill switch flipped on any time after mint (including after the sealed
+            # artifact was already written) invalidates an in-flight grant rather than letting the
+            # child still honor it. Clears the sealed artifact so an abandoned/invalidated grant can
+            # never be re-read by a later attempt.
+            if ((Get-AgentCapabilityOverrideKillSwitchState -RepositoryRoot $RepositoryRoot).Active) {
+                Remove-AgentWideningGrantArtifact -RuntimeRoot ([string]$manifest.runtimeRoot)
+                throw '[grant-invalidated] Capability-override kill switch is active; the widening grant has been invalidated.'
+            }
+            $liveDelegationPolicy = Get-AgentDelegationPolicyOrThrow -ToolkitRoot $toolkitRootForPolicy
             if ($liveDelegationPolicy.PathHash -cne $liveGrant.PolicyPathHash -or
                 $liveDelegationPolicy.ContentSha256 -cne $liveGrant.PolicyContentSha256) {
                 throw '[grant-invalidated] Delegation policy changed since the grant was minted.'
@@ -2602,6 +2802,32 @@ function Enter-AgentManualDispatchStartup {
             throw '[policy-changed] Live capability settings no longer match the dispatch manifest.'
         }
 
+        # issue #105 PR4 CRITICAL-2 hardening: everything checked above (schema, digests, ceiling
+        # self-consistency, live capability-settings freshness, grant re-verification) can ALSO be
+        # satisfied by a caller-authored manifest/artifact plus a same-named fake named pipe --
+        # none of it proves the process on the other end of $manifest.startupPipe is really the
+        # broker. Assert-AgentManualDispatchEarlyContext already rejected the common accidental/
+        # headless case (no attestation handle at all) before any of the work above; this is the
+        # deep check: the broker's ephemeral secret can only ever reach this exact process through
+        # an OS-inherited anonymous-pipe handle handed down at the moment the broker directly spawned
+        # it, never through a CLI argument, a file, or anything a forger could fabricate merely by
+        # crafting text. WorktreeId is independently re-derived (requirement 5); grantNonce is bound
+        # into the digest so it is finally live-compared against the broker's own in-memory grant
+        # rather than merely carried, unverified, in the sealed artifact (requirement 6).
+        $attestationSecret = Receive-AgentBrokerAttestationSecret
+        try {
+            $attestationDigest = Get-AgentAttestationDigest -DispatchId ([string]$manifest.dispatchId) -Role $Role `
+                -RepositoryKey $expectedRepositoryKey -WorktreeId $childWorktreeId -PullRequestId $prId `
+                -SourceCommit ([string]$manifest.prStateFingerprintSourceCommit) `
+                -CapabilityPolicyDigest ([string]$manifest.capabilityPolicyDigest) `
+                -GrantCapability $grantCapability `
+                -GrantNonce $(if ($grantCapability) { $liveGrant.GrantNonce } else { $null }) `
+                -GrantExpiresAtUtc $(if ($grantCapability) { $liveGrant.ExpiresAtUtc } else { $null })
+            $attestationNonce = New-AgentNonce
+            $attestationProof = Get-AgentAttestationProof -SecretBytes $attestationSecret -Nonce $attestationNonce -Digest $attestationDigest
+        }
+        finally { [Array]::Clear($attestationSecret, 0, $attestationSecret.Length) }
+
         $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', [string]$manifest.startupPipe,
             [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
         try {
@@ -2614,6 +2840,7 @@ function Enter-AgentManualDispatchStartup {
                 processId = $PID; leaseKeyHash = $lease.KeyHash; eventLogPath = [IO.Path]::GetFullPath($EventLogPath)
                 boundCapabilities = $actualCapabilities
                 enforcedDenies = @($mandatoryDenies | Sort-Object -Unique)
+                attestationNonce = $attestationNonce; attestationDigest = $attestationDigest; attestationProof = $attestationProof
             }
             $writer.WriteLine((ConvertTo-AgentCanonicalJson $ready))
             $reply = $reader.ReadLine() | ConvertFrom-Json -AsHashtable -ErrorAction Stop
@@ -3569,7 +3796,13 @@ function New-AgentRedirectedProcess {
         [Parameter(Mandatory)][string]$StandardOutputPath,
         [Parameter(Mandatory)][string]$StandardErrorPath,
         [string]$WorkingDirectory,
-        [string[]]$EnvironmentVariablesToRemove = @()
+        [string[]]$EnvironmentVariablesToRemove = @(),
+        # issue #105 PR4 CRITICAL-2 hardening: broker-only extra environment variables applied
+        # AFTER the isolation removals below and BEFORE Start(), for exactly one purpose today --
+        # handing this specific child an inherited anonymous-pipe attestation handle it cannot
+        # obtain any other way. Never used for anything a caller could equivalently pass on the
+        # command line.
+        [hashtable]$AdditionalEnvironmentVariables = @{}
     )
     $absolute = [IO.Path]::GetFullPath($FilePath)
     if (-not [IO.Path]::IsPathFullyQualified($absolute) -or -not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
@@ -3618,6 +3851,9 @@ function New-AgentRedirectedProcess {
     $psi.StandardInputEncoding = $utf8
     foreach ($name in @($EnvironmentVariablesToRemove) + @(Get-AgentSessionIsolationEnvVars)) {
         [void]$psi.Environment.Remove($name)
+    }
+    foreach ($name in @($AdditionalEnvironmentVariables.Keys)) {
+        $psi.Environment[$name] = [string]$AdditionalEnvironmentVariables[$name]
     }
     if (-not ('DevPilot.Process.BoundedDrain' -as [type])) {
         Add-Type -TypeDefinition @'
@@ -5766,6 +6002,8 @@ Export-ModuleMember -Function @(
     "Get-AgentDelegationPolicyPath",
     "Get-AgentDelegationPolicy",
     "Test-AgentDelegationAllows",
+    "Get-AgentDelegationPolicyOrNull",
+    "Get-AgentDelegationPolicyOrThrow",
     "Get-AgentWideningGrantArtifactPath",
     "New-AgentWideningGrantArtifact",
     "Get-AgentWideningGrantArtifact",
@@ -5774,6 +6012,11 @@ Export-ModuleMember -Function @(
     "Test-AgentWideningChallengeShape",
     "Test-AgentAutoCompleteGrantWouldBeNoOp",
     "Resolve-AgentWideningEffectiveDiff",
+    "New-AgentBrokerAttestationSecret",
+    "Get-AgentAttestationDigest",
+    "Get-AgentAttestationProof",
+    "Receive-AgentBrokerAttestationSecret",
+    "Assert-AgentManualDispatchEarlyContext",
      "Get-AgentDefaultCapabilityOverrideKillSwitchRoot",
      "Test-AgentCapabilityOverrideKillSwitch",
      "Enable-AgentCapabilityOverrideKillSwitch",

@@ -187,9 +187,27 @@ function Remove-DraftResidue {
 
 function Remove-ExpiredDrafts {
     $now = [DateTime]::UtcNow
+    # issue #105 PR4 requirement 7: a CONSUMED draft that never made it into (or already left)
+    # $children means Invoke-Dispatch failed/threw somewhere after marking it Consumed -- before,
+    # during, or after child launch. Invoke-Dispatch's own catch block best-effort-cleans the most
+    # common failure point immediately; this is the unconditional backstop (runs every loop tick,
+    # ~every 100ms) that guarantees no consumed draft, and no sealed grant artifact under its
+    # runtime root, is EVER left behind indefinitely regardless of which failure path produced it.
+    $activeDraftIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $children.Values) { [void]$activeDraftIds.Add([string]$entry.DraftId) }
     foreach ($id in @($drafts.Keys)) {
         $draft = $drafts[$id]
-        if ($draft.Consumed -or ($now - $draft.CreatedAt).TotalSeconds -le $DraftLifetimeSeconds) {
+        if ($draft.Consumed) {
+            if (-not $activeDraftIds.Contains($id)) {
+                if ($draft.Widening -and $draft.Widening.Stage -ceq 'minted') {
+                    Remove-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot
+                }
+                Remove-DraftResidue $draft
+                $drafts.Remove($id)
+            }
+            continue
+        }
+        if (($now - $draft.CreatedAt).TotalSeconds -le $DraftLifetimeSeconds) {
             continue
         }
         Remove-DraftResidue $draft
@@ -375,13 +393,17 @@ function Get-BrokerCapabilityProfile {
         $absoluteDenies = @($harnessRole.absoluteDenies | Sort-Object -Unique)
         $allowedManualCapabilities = @($harnessRole.allowedManualCapabilities | Sort-Object -Unique)
         # issue #105 PR4: delegableAvailable reflects the checked-in delegation policy for THIS
-        # role/repository -- never "any" unless the policy literally sets allowAnyVerified:true. The
-        # shipped policy ships with an empty allowlist and allowAnyVerified:false for every role, so
-        # this is always @() until a CODEOWNERS-approved policy change populates one or the other
-        # (governance deferred; see delegation.policy.v1.json).
-        $delegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+        # role/repository -- never a wildcard, since the schema has no allow-any escape hatch. The
+        # shipped policy ships with an empty allowlist for every role, so this is always @() until a
+        # CODEOWNERS-approved policy change explicitly names a repository key (see
+        # delegation.policy.v1.json). issue #105 PR4 requirement 3/9: an unavailable/unloadable
+        # policy (missing file, real-checkout ACL failure, corrupt content) fails CLOSED for
+        # delegation only -- delegableAvailable stays @() -- while this profile/describe RPC itself
+        # keeps working normally; only the widening endpoints reject distinctly for that condition.
+        $delegationPolicy = Get-AgentDelegationPolicyOrNull -ToolkitRoot $toolkitRoot
         $delegableAvailable = @()
-        if (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $role -Capability $harnessRole.delegableDefaultOff -RepositoryKey $identity.key) {
+        if ($delegationPolicy -and
+            (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $role -Capability $harnessRole.delegableDefaultOff -RepositoryKey $identity.key)) {
             $delegableAvailable = @($harnessRole.delegableDefaultOff)
         }
         # PR2: narrow the operational-default ceiling by any persisted, outside-repository
@@ -851,12 +873,18 @@ function Invoke-DescribeWidening {
     $resolved = Resolve-DraftWideningDraft $Request
     $draftId = $resolved.DraftId; $draft = $resolved.Draft
     Assert-AgentWideningRequestBinding -Request $Request -Draft $draft
+    # issue #105 PR4 requirement 4: once a grant is minted, describe-widening must never silently
+    # clobber it with a fresh (unminted) widening-preview stage -- that would discard a live grant
+    # an operator might still intend to dispatch. Require an explicit cancel-widening first.
+    if ($draft.Widening -and $draft.Widening.Stage -ceq 'minted') {
+        throw '[widening-invalid] A widening grant is already minted for this draft; dispatch it or cancel-widening before describing a different widening.'
+    }
     $capability = [string]$Request.capability
     $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $draft.Role
     if ($capability -cnotmatch '^[A-Za-z][A-Za-z0-9]*$' -or $capability -cne $harnessRole.delegableDefaultOff) {
         throw "[widening-invalid] capability is not the recognized delegable capability for role '$($draft.Role)'."
     }
-    $delegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+    $delegationPolicy = Get-AgentDelegationPolicyOrThrow -ToolkitRoot $toolkitRoot
     if (-not (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $draft.Role -Capability $capability -RepositoryKey $draft.RepositoryIdentity.key)) {
         throw '[delegation-not-allowed] The checked-in delegation policy does not permit this capability for this repository.'
     }
@@ -894,7 +922,7 @@ function Invoke-ConfirmWideningPreview {
         throw '[widening-invalid] Challenge does not match the pending widening preview.'
     }
     Add-AgentConsumedWideningChallenge -Widening $w -Challenge $challenge
-    $delegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+    $delegationPolicy = Get-AgentDelegationPolicyOrThrow -ToolkitRoot $toolkitRoot
     if ($delegationPolicy.PathHash -cne $w.DelegationPolicyPathHash -or $delegationPolicy.ContentSha256 -cne $w.DelegationPolicyContentSha256 -or
         -not (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $draft.Role -Capability $capability -RepositoryKey $draft.RepositoryIdentity.key)) {
         $draft.Widening = $null; $draft.WideningGeneration++
@@ -929,7 +957,7 @@ function Invoke-ConfirmWideningMint {
         throw '[widening-invalid] Challenge does not match the pending widening confirmation.'
     }
     Add-AgentConsumedWideningChallenge -Widening $w -Challenge $challenge
-    $delegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+    $delegationPolicy = Get-AgentDelegationPolicyOrThrow -ToolkitRoot $toolkitRoot
     if ($delegationPolicy.PathHash -cne $w.DelegationPolicyPathHash -or $delegationPolicy.ContentSha256 -cne $w.DelegationPolicyContentSha256 -or
         -not (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $draft.Role -Capability $capability -RepositoryKey $draft.RepositoryIdentity.key)) {
         $draft.Widening = $null; $draft.WideningGeneration++
@@ -969,13 +997,26 @@ function Invoke-CancelWidening {
     $resolved = Resolve-DraftWideningDraft $Request
     $draftId = $resolved.DraftId; $draft = $resolved.Draft
     Assert-AgentWideningRequestBinding -Request $Request -Draft $draft
-    if ([int64]$Request.generation -ne [int64]$draft.WideningGeneration) {
+    # issue #105 PR4 requirement 12: generation must be an exact, present, safe integer -- never
+    # defaulted. A request that omits it (Get-OptionalMember returns $null, and PowerShell's own
+    # [int64] cast on $null silently coerces to 0) must never be treated as if it explicitly named
+    # generation 0; that would let an omitted-generation request slip through whenever a draft's
+    # WideningGeneration happens to still be 0.
+    $requestedGeneration = ConvertTo-AgentSafeIntegralNumber (Get-OptionalMember $Request 'generation')
+    if ($null -eq $requestedGeneration) {
+        throw '[invalid-request] generation must be an exact, present, safe integer.'
+    }
+    if ($requestedGeneration -ne [int64]$draft.WideningGeneration) {
         throw '[widening-stale] Widening state has moved on; re-open the widening panel and try again.'
     }
     $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $draft.Role
-    $delegationPolicyForCancel = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+    # Cancel must stay usable even when the delegation policy cannot be loaded (issue #105 PR4
+    # requirement 3/9) -- an operator must always be able to cancel a stuck/unwanted widening
+    # attempt; only the delegableAvailable hint in the response degrades to empty.
+    $delegationPolicyForCancel = Get-AgentDelegationPolicyOrNull -ToolkitRoot $toolkitRoot
     $delegableAvailable = @()
-    if (Test-AgentDelegationAllows -Policy $delegationPolicyForCancel -Role $draft.Role -Capability $harnessRole.delegableDefaultOff -RepositoryKey $draft.RepositoryIdentity.key) {
+    if ($delegationPolicyForCancel -and
+        (Test-AgentDelegationAllows -Policy $delegationPolicyForCancel -Role $draft.Role -Capability $harnessRole.delegableDefaultOff -RepositoryKey $draft.RepositoryIdentity.key)) {
         $delegableAvailable = @($harnessRole.delegableDefaultOff)
     }
     $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $draft.RoleDescriptor.repositoryRoot -TimeoutMilliseconds 2000
@@ -1151,11 +1192,36 @@ function Invoke-Dispatch {
     $grantCapability = if ($draft.Widening -and $draft.Widening.Stage -ceq 'minted') { $draft.Widening.Capability } else { $null }
     if ($grantCapability) {
         if ([DateTime]::UtcNow -ge $draft.Widening.GrantExpiresAtUtc) { throw '[grant-invalidated] Widening grant has expired.' }
-        $liveDelegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+        # issue #105 PR4 CRITICAL-1: recheck the kill switch at dispatch preflight too (not only at
+        # child startup) -- an operator who flips it on any time after mint, even before the child
+        # is ever launched, must have the grant invalidated and dispatch rejected, not silently
+        # honored just because the mint-time check already passed.
+        $killSwitchLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $draft.RoleDescriptor.repositoryRoot -TimeoutMilliseconds 2000
+        if (-not $killSwitchLock.Acquired) { throw "[already-running] $($killSwitchLock.Reason)" }
+        try {
+            $dispatchKillSwitchState = Get-AgentCapabilityOverrideKillSwitchState -RepositoryRoot $draft.RoleDescriptor.repositoryRoot
+        }
+        finally { Exit-AgentLock $killSwitchLock.Stream }
+        if ($dispatchKillSwitchState.Active) {
+            $draft.Widening = $null; $draft.WideningGeneration++
+            throw '[grant-invalidated] Capability-override kill switch is active; the widening grant has been invalidated.'
+        }
+        $liveDelegationPolicy = Get-AgentDelegationPolicyOrThrow -ToolkitRoot $toolkitRoot
         if ($liveDelegationPolicy.PathHash -cne $draft.Widening.DelegationPolicyPathHash -or
             $liveDelegationPolicy.ContentSha256 -cne $draft.Widening.DelegationPolicyContentSha256 -or
             -not (Test-AgentDelegationAllows -Policy $liveDelegationPolicy -Role $draft.Role -Capability $grantCapability -RepositoryKey $identity.key)) {
             throw '[grant-invalidated] Delegation policy changed since the grant was minted.'
+        }
+        # issue #105 PR4 requirement 10: reassert the SAME two dispatch-blocking conditions
+        # mint-time already checked, live, right before launch -- narrowing/override state can
+        # change in the window between mint and dispatch. Shares Get-DraftWideningCandidate's
+        # single fresh, lock-held resolution so current/widened can never disagree with what
+        # describe-widening/confirm-widening-mint themselves would compute right now.
+        $dispatchCandidate = Get-DraftWideningCandidate -Draft $draft -Capability $grantCapability
+        $dispatchDiff = Resolve-AgentWideningEffectiveDiff -Current $dispatchCandidate.Current -Widened $dispatchCandidate.Widened -Role $draft.Role -GrantCapability $grantCapability
+        if (-not $dispatchDiff.pairedCapabilityActive) {
+            $draft.Widening = $null; $draft.WideningGeneration++
+            throw "[grant-invalidated] $($dispatchDiff.pairedCapability) is no longer active; the widening grant has been invalidated."
         }
         if ($draft.Role -eq 'review-handler' -and $grantCapability -ceq 'EnableAutoComplete') {
             $handlerDurableContext = Get-AgentDurableStateContext -DurableStateRoot $durableRoot -RepositoryIdentity $identity -Role review-handler
@@ -1177,6 +1243,20 @@ function Invoke-Dispatch {
     $manifestPath = Join-Path $draft.Snapshot.RuntimeRoot 'dispatch-manifest.json'
     $cancellationNonce = New-AgentNonce
     $draft['CancellationNonce'] = $cancellationNonce
+    # issue #105 PR4 CRITICAL-2 hardening: mint the ephemeral, broker-only attestation secret and
+    # anonymous-pipe channel for THIS dispatch attempt. Computed from the broker's own in-memory
+    # draft/grant state, never from anything the manifest will later echo back -- the child
+    # independently re-derives the identical fields from its own live state
+    # (Enter-AgentManualDispatchStartup) and the two digests must match exactly.
+    $attestationSecret = New-AgentBrokerAttestationSecret
+    $attestationPipe = [IO.Pipes.AnonymousPipeServerStream]::new([IO.Pipes.PipeDirection]::Out, [IO.HandleInheritability]::Inheritable)
+    $attestationWorktreeId = Get-AgentWorktreeIdentity -RepositoryRoot $draft.RoleDescriptor.repositoryRoot
+    $brokerAttestationDigest = Get-AgentAttestationDigest -DispatchId $dispatchId -Role $draft.Role `
+        -RepositoryKey $identity.key -WorktreeId $attestationWorktreeId -PullRequestId $draft.PullRequestId `
+        -SourceCommit $draft.PrSnapshot.sourceCommit -CapabilityPolicyDigest $draft.PolicyDigest `
+        -GrantCapability $grantCapability `
+        -GrantNonce $(if ($grantCapability) { $draft.Widening.GrantNonce } else { $null }) `
+        -GrantExpiresAtUtc $(if ($grantCapability) { ConvertTo-AgentCanonicalEpochSeconds $draft.Widening.GrantExpiresAtUtc } else { $null })
     if ($grantCapability) {
         # issue #105 PR4: seal the grant SELECTION into the child's own runtime root -- a
         # selection, never an authority (ANT-2); the child independently re-derives and re-verifies
@@ -1223,7 +1303,16 @@ function Invoke-Dispatch {
     $diagnostics = Join-Path $draft.Snapshot.Root 'diagnostics'
     $child = New-AgentRedirectedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList $args `
         -StandardOutputPath (Join-Path $diagnostics 'stdout.log') -StandardErrorPath (Join-Path $diagnostics 'stderr.log') `
-        -WorkingDirectory $toolkitRoot
+        -WorkingDirectory $toolkitRoot `
+        -AdditionalEnvironmentVariables @{ DEVPILOT_BROKER_ATTESTATION_HANDLE = $attestationPipe.GetClientHandleAsString() }
+    # The broker's own copy of the CLIENT-side handle must be released immediately once it has been
+    # duplicated into the child at process-creation time -- and only a process the OS itself handed
+    # this exact inherited handle to can ever open it; a forged manifest plus a same-named fake pipe
+    # can never obtain it. The secret is written once, right away, so the child can read it as soon
+    # as it reaches Receive-AgentBrokerAttestationSecret.
+    $attestationPipe.DisposeLocalCopyOfClientHandle()
+    $attestationPipe.Write($attestationSecret, 0, $attestationSecret.Length)
+    $attestationPipe.Flush()
     $containment = $null
     $completionResult = $null
     try {
@@ -1295,6 +1384,20 @@ function Invoke-Dispatch {
                 (ConvertTo-AgentCanonicalJson @($draft.Policy.mandatoryDenies | Sort-Object -Unique))) {
             throw '[launch-failed] Child capability attestation does not match the dispatch policy.'
         }
+        # issue #105 PR4 CRITICAL-2 hardening: the broker-origin attestation is the one check that
+        # a caller-authored manifest/artifact plus a same-named fake pipe cannot satisfy. The child
+        # can only have produced a valid attestationProof if it actually read SecretBytes -- which
+        # never left this broker process except through the anonymous-pipe handle inherited by the
+        # exact child this broker itself spawned above. attestationDigest is recomputed here from
+        # the broker's OWN in-memory draft/grant state (never trusted from the child's message) and
+        # must match exactly before the proof is even considered.
+        $readyAttestationNonce = [string](Get-OptionalMember $ready 'attestationNonce')
+        $readyAttestationDigest = [string](Get-OptionalMember $ready 'attestationDigest')
+        $readyAttestationProof = [string](Get-OptionalMember $ready 'attestationProof')
+        $expectedAttestationProof = Get-AgentAttestationProof -SecretBytes $attestationSecret -Nonce $readyAttestationNonce -Digest $brokerAttestationDigest
+        if ($readyAttestationDigest -cne $brokerAttestationDigest -or $readyAttestationProof -cne $expectedAttestationProof) {
+            throw '[broker-attestation-failed] Child broker-origin attestation could not be verified.'
+        }
         $eventPath = [IO.Path]::GetFullPath([string]$ready.eventLogPath)
         if (-not (Test-AgentPathWithin -Path $eventPath -Root $eventDir) -or
             [IO.Path]::GetExtension($eventPath) -cne '.jsonl') {
@@ -1315,6 +1418,8 @@ function Invoke-Dispatch {
             # remaining lifetime of the running child.
             Remove-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot
         }
+        $attestationPipe.Dispose()
+        [Array]::Clear($attestationSecret, 0, $attestationSecret.Length)
         $children[$dispatchId] = @{
             Child = $child; RequestId = [string]$Request.requestId; Pipe = $pipe
             Draft = $draft; DraftId = $draftId; Containment = $containment
@@ -1332,6 +1437,14 @@ function Invoke-Dispatch {
         if (-not $completionResult) { [void](Complete-AgentRedirectedProcess $child) }
         Close-AgentProcessContainment $containment
         $pipe.Dispose()
+        $attestationPipe.Dispose()
+        [Array]::Clear($attestationSecret, 0, $attestationSecret.Length)
+        # issue #105 PR4 requirement 7: a grant artifact already sealed for THIS dispatch attempt
+        # must never survive a failed/abandoned handshake -- Remove-ExpiredDrafts provides an
+        # unconditional backstop, but cleaning it up immediately here (write/start/ready/proceed all
+        # failed the same way) avoids leaving a sealed selection on disk for even one extra poll
+        # interval.
+        if ($grantCapability) { Remove-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot }
         Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
         throw
     }

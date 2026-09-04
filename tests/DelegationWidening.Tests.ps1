@@ -39,8 +39,8 @@ BeforeAll {
         return [ordered]@{
             schemaVersion = 1
             roles         = [ordered]@{
-                reviewer         = [ordered]@{ EnableApprovalVote = [ordered]@{ allowedRepositoryKeys = @(); allowAnyVerified = $false } }
-                'review-handler' = [ordered]@{ EnableAutoComplete = [ordered]@{ allowedRepositoryKeys = @(); allowAnyVerified = $false } }
+                reviewer         = [ordered]@{ EnableApprovalVote = [ordered]@{ allowedRepositoryKeys = @() } }
+                'review-handler' = [ordered]@{ EnableAutoComplete = [ordered]@{ allowedRepositoryKeys = @() } }
             }
         }
     }
@@ -67,9 +67,8 @@ Describe 'delegation policy trust and schema hardening (issue #105 PR4)' {
         $policy = Get-AgentDelegationPolicy -ToolkitRoot $root
         $policy.Delegations.reviewer.Capability | Should -BeExactly 'EnableApprovalVote'
         $policy.Delegations.reviewer.AllowedRepositoryKeys | Should -BeNullOrEmpty
-        $policy.Delegations.reviewer.AllowAnyVerified | Should -BeFalse
         $policy.Delegations.'review-handler'.Capability | Should -BeExactly 'EnableAutoComplete'
-        $policy.Delegations.'review-handler'.AllowAnyVerified | Should -BeFalse
+        $policy.Delegations.'review-handler'.AllowedRepositoryKeys | Should -BeNullOrEmpty
         foreach ($role in @('reviewer', 'review-handler')) {
             $capability = $policy.Delegations[$role].Capability
             Test-AgentDelegationAllows -Policy $policy -Role $role -Capability $capability -RepositoryKey 'v1:github:any/repo' | Should -BeFalse
@@ -81,7 +80,7 @@ Describe 'delegation policy trust and schema hardening (issue #105 PR4)' {
     It 'content hash is sensitive to any byte change (tamper detection)' {
         $recordA = New-DefaultPolicyRecord
         $recordB = New-DefaultPolicyRecord
-        $recordB.roles.reviewer.EnableApprovalVote.allowAnyVerified = $true
+        $recordB.roles.reviewer.EnableApprovalVote.allowedRepositoryKeys = @('v1:github:contoso/widgets')
         # Same toolkit root/path both times -- isolates the assertion to CONTENT sensitivity
         # (PathHash must stay identical since the path did not change; ContentSha256 must not).
         $root = New-TestToolkitRoot -PolicyContent ($recordA | ConvertTo-Json -Depth 10)
@@ -94,12 +93,13 @@ Describe 'delegation policy trust and schema hardening (issue #105 PR4)' {
         $policyA.ContentSha256 | Should -Be $policyA.Fingerprint.Sha256
     }
 
-    It 'grants only what an allowAnyVerified:true or a specific allowedRepositoryKeys entry names' {
+    It 'has no wildcard/allow-any escape hatch -- grants only an explicit allowedRepositoryKeys entry (issue #105 PR4 requirement 8)' {
         $record = New-DefaultPolicyRecord
-        $record.roles.reviewer.EnableApprovalVote.allowAnyVerified = $true
+        $record.roles.reviewer.EnableApprovalVote.allowedRepositoryKeys = @('v1:github:contoso/widgets')
         $root = New-TestToolkitRoot -PolicyContent ($record | ConvertTo-Json -Depth 10)
         $policy = Get-AgentDelegationPolicy -ToolkitRoot $root
-        Test-AgentDelegationAllows -Policy $policy -Role reviewer -Capability EnableApprovalVote -RepositoryKey 'v1:github:anything/at-all' | Should -BeTrue
+        Test-AgentDelegationAllows -Policy $policy -Role reviewer -Capability EnableApprovalVote -RepositoryKey 'v1:github:contoso/widgets' | Should -BeTrue
+        Test-AgentDelegationAllows -Policy $policy -Role reviewer -Capability EnableApprovalVote -RepositoryKey 'v1:github:anything/at-all' | Should -BeFalse
         Test-AgentDelegationAllows -Policy $policy -Role 'review-handler' -Capability EnableAutoComplete -RepositoryKey 'v1:github:anything/at-all' | Should -BeFalse
         $scoped = New-DefaultPolicyRecord
         $scoped.roles.'review-handler'.EnableAutoComplete.allowedRepositoryKeys = @('v1:github:contoso/widgets')
@@ -291,9 +291,11 @@ Describe 'broker widening protocol wiring (source-regex, matches existing Dispat
     }
 
     It 'delegation eligibility is checked-in-policy driven, never a broker-local allowlist' {
-        $script:brokerSource | Should -Match 'Get-AgentDelegationPolicy -ToolkitRoot \$toolkitRoot'
+        $script:brokerSource | Should -Match 'Get-AgentDelegationPolicyOr(Null|Throw) -ToolkitRoot \$toolkitRoot'
         $script:brokerSource | Should -Match 'Test-AgentDelegationAllows'
         $script:brokerSource | Should -Not -Match "allowAnyVerified\s*=\s*\`$true"
+        # issue #105 PR4 requirement 8: no wildcard/allow-any escape hatch anywhere in the schema.
+        $script:brokerSource | Should -Not -Match 'allowAnyVerified'
     }
 
     It 'bounds the per-draft consumed-challenge ring at 8 and the global requestId set' {

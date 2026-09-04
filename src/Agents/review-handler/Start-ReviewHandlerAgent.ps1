@@ -218,6 +218,13 @@ if (-not $importedHarness) {
 }
 $HarnessPath = $importedHarness.Path
 
+# issue #105 PR4 CRITICAL-2 hardening: as early as possible (immediately once the harness module
+# is available, before any config/provider/network setup below) reject the ordinary accidental/
+# headless case -- a manual-dispatch manifest path that does not exist, or one with no
+# accompanying broker attestation handle. The deep cryptographic verification happens later, in
+# Enter-AgentManualDispatchStartup, immediately before the ready/proceed handshake.
+Assert-AgentManualDispatchEarlyContext -ManifestPath $ManualDispatchManifest
+
 $ResultMarkerPrefix = "REVIEW_HANDLER_RESULT_V1:"
 $script:HandlerRejectedResumeSessionIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 

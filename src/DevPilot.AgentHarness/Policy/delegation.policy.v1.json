@@ -3,14 +3,12 @@
   "roles": {
     "reviewer": {
       "EnableApprovalVote": {
-        "allowedRepositoryKeys": [],
-        "allowAnyVerified": false
+        "allowedRepositoryKeys": []
       }
     },
     "review-handler": {
       "EnableAutoComplete": {
-        "allowedRepositoryKeys": [],
-        "allowAnyVerified": false
+        "allowedRepositoryKeys": []
       }
     }
   }
