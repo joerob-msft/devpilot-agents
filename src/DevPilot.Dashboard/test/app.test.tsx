@@ -552,6 +552,77 @@ test("settings overlay reports an explicit unavailable state without a trusted b
   }
 });
 
+test("settings overlay renders every known capability provenance value", async (context) => {
+  const fixture = createFixture();
+  const history = new PullRequestHistoryProjection();
+  history.apply(historyEvent("9007199254740993", 104, 1, { title: "Provenance PR", author: "Ada" }));
+  function profileWith(provenance: CapabilityProfile["provenance"]): CapabilityProfile {
+    return {
+      schemaVersion: 1,
+      requestId: "provenance-request",
+      operation: "capability-profile",
+      role: "reviewer",
+      repositoryIdentity: { ...history.jump(104)!.repositoryIdentity },
+      prSnapshot: {
+        schemaVersion: 1, pullRequestId: 104, sourceCommit: "a".repeat(40),
+        sourceRef: "feature", targetRef: "main", active: true, draft: false, author: "Ada", title: "Provenance PR",
+      },
+      capabilities: Object.keys(provenance),
+      mandatoryDenies: [],
+      dynamicConstraints: [],
+      absoluteDenies: [],
+      allowedManualCapabilities: Object.keys(provenance),
+      delegableAvailable: [],
+      provenance,
+    };
+  }
+  let profileCallCount = 0;
+  const broker: DispatchBroker = {
+    describe: async () => { throw new Error("not called"); },
+    profile: async () => {
+      profileCallCount++;
+      // The SETTINGS overlay's Provenance line is a fixed-width, non-wrapping single row, so all
+      // five KNOWN_PROVENANCE values (issue #105 PR2 review) can't be proven visible at once
+      // without risking clipping. Two short, comfortably-fitting batches still exercise every
+      // value through the real renderer instead of only the parser.
+      return profileCallCount === 1
+        ? profileWith({ a: "operational-default", b: "machine", c: "user" })
+        : profileWith({ d: "repo-worktree", e: "pr" });
+    },
+    dispatch: async () => { throw new Error("not called"); },
+    cancel: async () => { throw new Error("not called"); },
+    shutdown: async () => {},
+    subscribeTerminal: () => () => {},
+  };
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 100, height: 30, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE \(READ-ONLY\)/);
+    assert.match(setup.captureCharFrame(), /a=operational-default/);
+    assert.match(setup.captureCharFrame(), /b=machine/);
+    assert.match(setup.captureCharFrame(), /c=user/);
+
+    setup.mockInput.pressKey("r");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /d=repo-worktree/);
+    assert.match(setup.captureCharFrame(), /e=pr/);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
 test("settings role toggle refetches without ever pairing a role label with another role's profile body", async (context) => {
   const fixture = createFixture();
   const history = new PullRequestHistoryProjection();

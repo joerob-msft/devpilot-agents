@@ -4,6 +4,13 @@ BeforeAll {
     $script:harnessPath = (Resolve-Path "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psm1").Path
     $script:identity = @{ key = 'v1:github:contoso/widgets'; verified = $true }
     $script:commit = 'a' * 40
+    # New-TestRoots below repoints $env:LOCALAPPDATA (and, on non-Windows runners, could repoint
+    # $env:XDG_STATE_HOME) at a per-test TestDrive path so every capability-override root resolves
+    # underneath it. Environment variables are process-wide and outlive TestDrive, which Pester
+    # deletes after this file's run -- without saving/restoring the originals here, a later test
+    # FILE in the same Pester process would inherit a dangling reference to a deleted directory.
+    $script:originalLocalAppData = $env:LOCALAPPDATA
+    $script:originalXdgStateHome = $env:XDG_STATE_HOME
 
     function New-TestRoots {
         $suite = Join-Path $TestDrive ([Guid]::NewGuid().ToString('N'))
@@ -20,6 +27,13 @@ BeforeAll {
         New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
         [IO.File]::WriteAllText($Path, (ConvertTo-AgentCanonicalJson $Record), [Text.UTF8Encoding]::new($false))
     }
+}
+
+AfterAll {
+    # Restores the pre-suite values exactly (including removing the variable entirely via $null
+    # when it was unset beforehand) so no later test file ever observes a deleted TestDrive path.
+    $env:LOCALAPPDATA = $script:originalLocalAppData
+    $env:XDG_STATE_HOME = $script:originalXdgStateHome
 }
 
 Describe 'capability-override root hardening' {
@@ -151,6 +165,72 @@ Describe 'capability-override settings schema' {
             Should -Throw '*collides case-insensitively*'
     }
 
+    It 'never interpolates a raw token/secret-shaped or otherwise untrusted name into exception text' {
+        # ghp_-shaped: fails the alnum-only capability-name SHAPE check (contains underscores)
+        # before ever reaching the dedicated secret-shaped heuristic -- exercises the "malformed
+        # name" branch's redaction.
+        $tokenShaped = 'ghp_' + ('A1b2C3d4' * 5)
+        $bytes = [Text.Encoding]::UTF8.GetBytes(('{"schemaVersion":1,"settings":{"' + $tokenShaped + '":"off"}}'))
+        try {
+            ConvertFrom-AgentTrustedCapabilityJson -Bytes $bytes -SourceScope machine -AllowedCapabilities @()
+            throw 'expected ConvertFrom-AgentTrustedCapabilityJson to throw'
+        }
+        catch {
+            $_.Exception.Message | Should -Match '\[capability-settings-invalid\]'
+            $_.Exception.Message | Should -Match 'sha256:[0-9a-f]{12}@\d+'
+            $_.Exception.Message | Should -Not -Match ([regex]::Escape($tokenShaped))
+        }
+
+        # Pure hex-shaped: passes the alnum-only shape check, so this exercises the dedicated
+        # secret-shaped branch instead.
+        $hexShaped = ('a1b2c3' * 6)
+        $hexBytes = [Text.Encoding]::UTF8.GetBytes(('{"schemaVersion":1,"settings":{"' + $hexShaped + '":"off"}}'))
+        try {
+            ConvertFrom-AgentTrustedCapabilityJson -Bytes $hexBytes -SourceScope machine -AllowedCapabilities @($hexShaped)
+            throw 'expected ConvertFrom-AgentTrustedCapabilityJson to throw'
+        }
+        catch {
+            $_.Exception.Message | Should -Match 'looks secret-shaped'
+            $_.Exception.Message | Should -Not -Match ([regex]::Escape($hexShaped))
+        }
+
+        # A well-formed but unrecognized name still never echoes the raw name either.
+        $unrecognized = 'MadeUpCapabilityXyz'
+        $unrecognizedBytes = [Text.Encoding]::UTF8.GetBytes(('{"schemaVersion":1,"settings":{"' + $unrecognized + '":"off"}}'))
+        try {
+            ConvertFrom-AgentTrustedCapabilityJson -Bytes $unrecognizedBytes -SourceScope machine -AllowedCapabilities @()
+            throw 'expected ConvertFrom-AgentTrustedCapabilityJson to throw'
+        }
+        catch {
+            $_.Exception.Message | Should -Match 'not a recognized manually-selectable capability'
+            $_.Exception.Message | Should -Not -Match ([regex]::Escape($unrecognized))
+        }
+
+        # An unknown top-level field carrying a token-shaped name must be redacted too.
+        $unknownFieldBytes = [Text.Encoding]::UTF8.GetBytes(('{"schemaVersion":1,"settings":{},"' + $tokenShaped + '":"x"}'))
+        try {
+            ConvertFrom-AgentTrustedCapabilityJson -Bytes $unknownFieldBytes -SourceScope machine -AllowedCapabilities @()
+            throw 'expected ConvertFrom-AgentTrustedCapabilityJson to throw'
+        }
+        catch {
+            $_.Exception.Message | Should -Match 'Unknown top-level field'
+            $_.Exception.Message | Should -Not -Match ([regex]::Escape($tokenShaped))
+        }
+
+        # Duplicate/case-collision property-name errors (raised before hashtable conversion, on the
+        # raw JSON) must also never echo a token-shaped raw name.
+        $dupTokenBytes = [Text.Encoding]::UTF8.GetBytes(
+            '{"schemaVersion":1,"settings":{"' + $tokenShaped + '":"off","' + $tokenShaped.ToUpperInvariant() + '":"off"}}')
+        try {
+            ConvertFrom-AgentTrustedCapabilityJson -Bytes $dupTokenBytes -SourceScope machine -AllowedCapabilities @()
+            throw 'expected ConvertFrom-AgentTrustedCapabilityJson to throw'
+        }
+        catch {
+            $_.Exception.Message | Should -Match 'collides case-insensitively'
+            $_.Exception.Message | Should -Not -Match ([regex]::Escape($tokenShaped))
+        }
+    }
+
     It 'enforces byte, depth, element, and string bounds and fails closed' {
         $big = [Text.Encoding]::UTF8.GetBytes('{"schemaVersion":1,"settings":{},"pad":"' + ('x' * 70000) + '"}')
         { ConvertFrom-AgentTrustedCapabilityJson -Bytes $big -SourceScope machine -AllowedCapabilities @() } |
@@ -274,6 +354,42 @@ Describe 'capability-override effective resolution' {
         { Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
                 -PullRequestId 7 -CurrentSourceCommit $commit } | Should -Throw '*identity binding does not match*'
     }
+
+    It 'fails closed when an existing directory masks a settings file rather than silently resolving as absent' {
+        $roots = New-TestRoots
+        $overrideRoot = Get-AgentDefaultCapabilityOverrideRoot
+        New-Item -ItemType Directory -Path (Join-Path $overrideRoot 'machine.settings.v1.json') -Force | Out-Null
+        # Must fail closed (throw), never silently resolve as if the machine scope were unconfigured
+        # -- that would be an operator-invisible WIDENING of the effective ceiling.
+        { Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+                -PullRequestId 7 -CurrentSourceCommit $commit } | Should -Throw '*is not a file*'
+    }
+
+    It 'Read-AgentStableFile enforces MaxBytes before allocating a buffer, and distinguishes missing from present' {
+        $roots = New-TestRoots
+        $bigPath = Join-Path $roots.Suite 'oversized.json'
+        [IO.File]::WriteAllBytes($bigPath, [byte[]]::new(70000))
+        { Read-AgentStableFile -Path $bigPath -MaxBytes 65536 } | Should -Throw '*stable-read-too-large*'
+
+        $smallPath = Join-Path $roots.Suite 'small.json'
+        [IO.File]::WriteAllText($smallPath, 'hello', [Text.UTF8Encoding]::new($false))
+        $result = Read-AgentStableFile -Path $smallPath -MaxBytes 65536
+        $result.Exists | Should -BeTrue
+        $result.Size | Should -Be 5
+        $result.Bytes.Length | Should -Be 5
+
+        $missingPath = Join-Path $roots.Suite 'missing.json'
+        $missingResult = Read-AgentStableFile -Path $missingPath
+        $missingResult.Exists | Should -BeFalse
+        $missingResult.Bytes.Length | Should -Be 0
+    }
+
+    It 'Read-AgentStableFile fails closed rather than treating an existing directory as absent' {
+        $roots = New-TestRoots
+        $dirPath = Join-Path $roots.Suite 'not-a-file'
+        New-Item -ItemType Directory -Path $dirPath -Force | Out-Null
+        { Read-AgentStableFile -Path $dirPath } | Should -Throw '*stable-read-invalid*'
+    }
 }
 
 Describe 'capability-override advisory lock' {
@@ -373,5 +489,83 @@ Describe 'broker and child-startup wiring' {
         $followUp = Enter-AgentCapabilityOverrideLock -RepositoryRoot $roots.RepoRoot -TimeoutMilliseconds 200
         $followUp.Acquired | Should -BeTrue
         Exit-AgentLock $followUp.Stream
+    }
+
+    It 'holds the capability-override lock around the broker profile/describe resolution, with one bounded retry' {
+        $source = Get-Content -LiteralPath $brokerPath -Raw
+        $helperBody = [regex]::Match($source, '(?s)function Get-BrokerCapabilityProfile \{.*?\r?\n\}').Value
+        $lockIndex = $helperBody.IndexOf('Enter-AgentCapabilityOverrideLock')
+        $resolveIndex = $helperBody.IndexOf('Resolve-AgentEffectiveCapabilitySettings')
+        $releaseIndex = $helperBody.IndexOf('Exit-AgentLock $capabilityLock.Stream')
+        $lockIndex | Should -BeGreaterThan -1
+        $resolveIndex | Should -BeGreaterThan $lockIndex
+        $releaseIndex | Should -BeGreaterThan $resolveIndex
+        # Retries exactly once (a 2-iteration bounded loop) and only for the distinct, explicitly
+        # retryable stable-read-unstable signal -- a vanished-file race is never reinterpreted as
+        # corrupt/invalid content, and a failed retry must still fail this whole call closed rather
+        # than silently falling back to an un-narrowed (wider) ceiling.
+        $helperBody | Should -Match '\$resolveAttempt -le 2'
+        $helperBody | Should -Match '\[stable-read-unstable\]'
+    }
+
+    It 'accepts a manifest whose capabilities were already narrowed relative to the pre-narrowing ceiling' {
+        # Regression: the ceiling self-consistency check used to require every post-narrow
+        # mandatoryDeny to already be part of the PRE-narrow ceilingMandatoryDenies. That is wrong
+        # whenever a capability legitimately moved from ceilingCapabilities into mandatoryDenies via
+        # narrowing (exactly what Resolve-AgentCapabilityPolicyPartition does) -- it made the whole
+        # feature unusable, rejecting every already-narrowed manifest as "malformed" before the live
+        # re-verification (and its lock/retry semantics) was ever reached.
+        $roots = New-TestRoots
+        $durableRoot = Resolve-AgentTrustedRoot -Path (Join-Path $roots.Suite 'durable') -Kind durable-state `
+            -RepositoryRoot $roots.RepoRoot -Create
+        $leaseRoot = Resolve-AgentTrustedRoot -Path (Join-Path $roots.Suite 'leases') -Kind lease `
+            -RepositoryRoot $roots.RepoRoot -DisallowedRoots $durableRoot -Create
+        $context = Get-AgentDurableStateContext -DurableStateRoot $durableRoot -RepositoryIdentity $identity -Role reviewer -Create
+        $policy = [ordered]@{
+            schemaVersion = 1
+            repositoryIdentity = @{ key = $identity.key; verified = $true }
+            role = 'reviewer'
+            capabilities = @('EnableFindingComments', 'EnableSummaryComment')
+            mandatoryDenies = @('EnableApprovalVote', 'EnableThreadReplies')
+            ceilingCapabilities = @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment')
+            ceilingMandatoryDenies = @('EnableApprovalVote')
+            configSnapshotSha256 = ('a' * 64)
+        }
+        $runtimeRoot = Join-Path $roots.Suite 'manual-runtime-narrowed'
+        New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+        $manifestPath = Join-Path $runtimeRoot 'dispatch-manifest.json'
+        @{
+            schemaVersion = 1
+            dispatchId = [Guid]::NewGuid().ToString('D')
+            role = 'reviewer'
+            repositoryKey = $identity.key
+            pullRequestId = 9
+            capabilityPolicyDigest = Get-AgentCanonicalDigest $policy
+            policy = $policy
+            startupPipe = (New-AgentPipeName)
+            runtimeRoot = $runtimeRoot
+            prStateFingerprintSourceCommit = $commit
+        } | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
+
+        # Pre-acquire the work lease so a manifest that survives the ceiling self-consistency check
+        # (this test's actual target) fails fast and deterministically at the NEXT stage -- lease
+        # acquisition, which happens before any prompt/pipe I/O -- rather than needing a real prompt
+        # file and a live named-pipe handshake just to prove the ceiling check itself passed.
+        $held = Enter-AgentWorkLease -LeaseRoot $leaseRoot -RepositoryIdentity $identity `
+            -PullRequestId 9 -Role reviewer -TimeoutMilliseconds 0
+        $held.Acquired | Should -BeTrue
+        try {
+            { Enter-AgentManualDispatchStartup -ManifestPath $manifestPath -RepositoryIdentity $identity `
+                    -RepositoryRoot $roots.RepoRoot -DurableContext $context -LeaseRoot $leaseRoot `
+                    -Role reviewer -EventLogPath (Join-Path $runtimeRoot 'events.jsonl') `
+                    -BoundCapabilities @{
+                        EnableFindingComments = $true; EnableSummaryComment = $true
+                        EnableThreadReplies = $false; EnableApprovalVote = $false
+                    }
+            } | Should -Throw '*lease-contended*'
+        }
+        finally {
+            Exit-AgentLock $held.Stream
+        }
     }
 }

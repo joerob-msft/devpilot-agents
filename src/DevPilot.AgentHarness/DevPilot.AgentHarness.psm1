@@ -1058,6 +1058,16 @@ function Invoke-AgentWithWorkAuthority {
 # checked-in delegation policy and ephemeral widening are PR4. Everything
 # below is read/resolve-only and can only ever narrow an already-open
 # capability to a mandatory deny, never grant one.
+#
+# Root convention: this follows the exact same per-user %LOCALAPPDATA% (Windows) /
+# ${XDG_STATE_HOME:-$HOME/.local/state} (POSIX) convention this module already uses for the
+# durable-state/lease/watch-state roots -- a per-machine, per-LOCAL-USER install location, not a
+# roaming or shared one. The logical 'machine' scope name below means "this machine, for this
+# local user's DevPilot installation" -- i.e. the broadest baseline this one user's agents see on
+# this one box -- and is deliberately NOT an administrator-owned, multi-user machine-wide policy
+# store: it is written and read entirely with the invoking user's own privileges, same as every
+# other root this module resolves. This matches the approved architecture; do not rehome it under
+# ProgramData (Windows) or /etc (POSIX) or otherwise widen it to a multi-user/elevated location.
 # ---------------------------------------------------------------------------
 
 function Get-AgentDefaultCapabilityOverrideRoot {
@@ -1116,14 +1126,63 @@ function Read-AgentStableFile {
         fails closed rather than ever returning a possibly-torn read. The returned Bytes are the
         exact bytes the fingerprint was computed from -- callers that need to parse content
         (ConvertFrom-AgentTrustedCapabilityJson) never perform a second, separate read.
+
+        MaxBytes is enforced BEFORE any read buffer is allocated: the file is opened once and its
+        length is inspected from that open FileStream first, and an oversized file is rejected
+        immediately -- this function never performs the ReadAllBytes-equivalent of allocating a
+        buffer sized from an unchecked length. The bounded buffer is then filled from that SAME
+        single FileStream (never a second, separate open); a short read (fewer bytes delivered than
+        the checked length -- truncation mid-read) or the stream's length disagreeing with what was
+        checked immediately before the read (growth mid-read) both fail this attempt as unstable and
+        retry, exactly like the pre-existing before/after metadata race check below. A path that
+        exists but is not a regular file (a directory, or any other non-file object) is never
+        silently treated as "absent" -- Test-Path's plain existence check is evaluated first, and
+        only THEN is its type checked; an existing non-file object always fails closed instead of
+        being masked as a missing/un-narrowed override.
     #>
-    param([Parameter(Mandatory)][string]$Path, [ValidateRange(1, 5)][int]$MaxAttempts = 3)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateRange(1, 5)][int]$MaxAttempts = 3,
+        [ValidateRange(1, 1048576)][int]$MaxBytes = 65536
+    )
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        $before = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-        if (-not $before) {
+        if (-not (Test-Path -LiteralPath $Path)) {
             return [ordered]@{ Path = $Path; Exists = $false; Size = 0; MTime = 0; Sha256 = $null; Bytes = [byte[]]@() }
         }
-        $bytes = [IO.File]::ReadAllBytes($Path)
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            throw '[stable-read-invalid] An existing non-file object occupies the path.'
+        }
+        $before = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if (-not $before) {
+            # Test-Path just confirmed a leaf existed at this path; a failure here means it raced a
+            # concurrent delete between the two calls. Retry like any other stat instability rather
+            # than falling back to "does not exist".
+            continue
+        }
+        $bytes = $null
+        $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try {
+            $length = $stream.Length
+            if ($length -gt $MaxBytes) {
+                throw "[stable-read-too-large] File exceeds the maximum allowed size of $MaxBytes bytes."
+            }
+            $buffer = [byte[]]::new([int]$length)
+            $offset = 0
+            $truncated = $false
+            while ($offset -lt $buffer.Length) {
+                $read = $stream.Read($buffer, $offset, $buffer.Length - $offset)
+                if ($read -le 0) { $truncated = $true; break }
+                $offset += $read
+            }
+            if (-not $truncated -and $stream.Length -eq $length) { $bytes = $buffer }
+        }
+        finally { $stream.Dispose() }
+        if (-not $bytes) {
+            # Truncated mid-read or grew past the length we bounded the buffer to -- a concurrent
+            # writer raced this read. Retry.
+            continue
+        }
         $after = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
         if ($after -and $before.Length -eq $after.Length -and $before.LastWriteTimeUtc -eq $after.LastWriteTimeUtc -and
             $bytes.Length -eq $before.Length) {
@@ -1160,6 +1219,25 @@ function Test-AgentSecretShapedText {
     return $false
 }
 
+function Get-AgentRedactedFieldReference {
+    <#
+        Renders an untrusted JSON property/capability name as a bounded, non-reversible reference
+        safe to interpolate into an exception message: a short SHA-256 prefix of the raw value plus
+        its 1-based ordinal position among the sibling keys/entries being validated. Every capability-
+        override parsing error that would otherwise echo a raw, potentially secret-shaped or
+        otherwise sensitive property name (duplicate/case-collision keys, malformed/unrecognized
+        capability names, unknown top-level fields) must use this instead of the raw text --
+        Test-AgentSecretShapedText exists specifically to catch credential-looking values, and
+        putting the very value it flagged into the message that reports it would defeat the purpose
+        of flagging it. An engineer holding the original candidate value can still confirm a match by
+        hashing it the same way; the raw value itself never appears in logs, IcM, or protocol
+        responses.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)][int]$Position)
+    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Text))).ToLowerInvariant()
+    return "sha256:$($hash.Substring(0, 12))@$Position"
+}
+
 function Assert-AgentCapabilityJsonRawShape {
     <#
         Recursively walks the RAW JSON via System.Text.Json.JsonDocument -- BEFORE any
@@ -1192,15 +1270,19 @@ function Assert-AgentCapabilityJsonRawShape {
                 ([Text.Json.JsonValueKind]::Object) {
                     $seenExact = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
                     $seenFold = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    $propertyIndex = 0
                     foreach ($property in $node.EnumerateObject()) {
+                        $propertyIndex++
                         if ($property.Name.Length -gt $MaxStringLength) {
                             throw '[capability-settings-invalid] JSON property name exceeds the maximum length.'
                         }
                         if (-not $seenExact.Add($property.Name)) {
-                            throw "[capability-settings-invalid] Duplicate property '$($property.Name)' in capability settings JSON."
+                            $ref = Get-AgentRedactedFieldReference -Text $property.Name -Position $propertyIndex
+                            throw "[capability-settings-invalid] Duplicate property ($ref) in capability settings JSON."
                         }
                         if (-not $seenFold.Add($property.Name)) {
-                            throw "[capability-settings-invalid] Property '$($property.Name)' collides case-insensitively with a sibling."
+                            $ref = Get-AgentRedactedFieldReference -Text $property.Name -Position $propertyIndex
+                            throw "[capability-settings-invalid] Property ($ref) collides case-insensitively with a sibling."
                         }
                         $stack.Push(@{ Node = $property.Value; Depth = ($depth + 1) })
                     }
@@ -1265,8 +1347,13 @@ function ConvertFrom-AgentTrustedCapabilityJson {
     $knownFields = [Collections.Generic.HashSet[string]]::new(
         [string[]]($baseRequired + @('repositoryKey', 'worktreeId', 'pullRequestId', 'sourceCommit', 'expiresAtUtc')),
         [StringComparer]::Ordinal)
+    $topLevelIndex = 0
     foreach ($name in @($record.Keys)) {
-        if (-not $knownFields.Contains($name)) { throw "[capability-settings-invalid] ($SourceScope) Unknown top-level field '$name'." }
+        $topLevelIndex++
+        if (-not $knownFields.Contains($name)) {
+            $ref = Get-AgentRedactedFieldReference -Text $name -Position $topLevelIndex
+            throw "[capability-settings-invalid] ($SourceScope) Unknown top-level field ($ref)."
+        }
     }
     # ConvertFrom-Json -AsHashtable returns JSON integers as [int64] (not [int]) on this PowerShell
     # version, so every integer field below accepts both CLR widths and compares by value.
@@ -1278,15 +1365,17 @@ function ConvertFrom-AgentTrustedCapabilityJson {
     }
     $allowedSet = [Collections.Generic.HashSet[string]]::new([string[]]$AllowedCapabilities, [StringComparer]::Ordinal)
     $settings = [ordered]@{}
+    $settingIndex = 0
     foreach ($name in @($record.settings.Keys)) {
+        $settingIndex++
         if ($name.Length -eq 0 -or $name.Length -gt 256 -or $name -cnotmatch '^[A-Za-z][A-Za-z0-9]*$') {
-            throw "[capability-settings-invalid] ($SourceScope) Malformed capability name '$name'."
+            throw "[capability-settings-invalid] ($SourceScope) Malformed capability name ($(Get-AgentRedactedFieldReference -Text $name -Position $settingIndex))."
         }
         if (Test-AgentSecretShapedText -Text $name) {
-            throw "[capability-settings-invalid] ($SourceScope) Capability name '$name' looks secret-shaped."
+            throw "[capability-settings-invalid] ($SourceScope) Capability name ($(Get-AgentRedactedFieldReference -Text $name -Position $settingIndex)) looks secret-shaped."
         }
         if (-not $allowedSet.Contains($name)) {
-            throw "[capability-settings-invalid] ($SourceScope) Capability '$name' is not a recognized manually-selectable capability."
+            throw "[capability-settings-invalid] ($SourceScope) Capability ($(Get-AgentRedactedFieldReference -Text $name -Position $settingIndex)) is not a recognized manually-selectable capability."
         }
         $value = $record.settings[$name]
         if ($value -isnot [string] -or $value -cnotin @('inherit', 'off')) {
@@ -1397,12 +1486,27 @@ function Resolve-AgentEffectiveCapabilitySettings {
         if (-not (Test-AgentPathWithin -Path $path -Root $root)) {
             throw "[capability-settings-invalid] ($scope) Resolved settings path escaped the capability-override root."
         }
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $path)) {
             [void]$fingerprints.Add([ordered]@{ Path = $path; Exists = $false; Size = 0; MTime = 0; Sha256 = $null })
             continue
         }
-        $path = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -Private
-        $stable = Read-AgentStableFile -Path $path
+        # An existing path that is NOT a regular file (a directory, or any other non-file object)
+        # must never be silently treated the same as "absent" -- that would mask an intended
+        # narrowing record as if the store were empty, which is a silent WIDENING of the effective
+        # ceiling. Assert-AgentTrustedFile itself rejects a non-file (PSIsContainer) below, so this
+        # is deliberately only a plain existence check, not -PathType Leaf.
+        try {
+            $path = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -Private
+            $stable = Read-AgentStableFile -Path $path -MaxBytes 65536
+        }
+        catch [Management.Automation.ItemNotFoundException] {
+            # Existed an instant ago (the Test-Path above) but vanished before validation/read could
+            # complete -- a race, not a genuine absence and not malformed/corrupt content. Surface
+            # the same distinct, explicitly-retryable signal Read-AgentStableFile itself raises for
+            # in-flight instability, so callers (Get-BrokerCapabilityProfile) can retry once under
+            # the capability-override lock instead of failing this closed as "invalid".
+            throw "[stable-read-unstable] ($scope) File vanished while being validated/read."
+        }
         [void]$fingerprints.Add([ordered]@{ Path = $stable.Path; Exists = $stable.Exists; Size = $stable.Size; MTime = $stable.MTime; Sha256 = $stable.Sha256 })
         $record = ConvertFrom-AgentTrustedCapabilityJson -Bytes $stable.Bytes -SourceScope $scope -AllowedCapabilities $allowedCapabilities
         if ($candidates[$scope].RequireBinding -and
@@ -1531,17 +1635,31 @@ function Enter-AgentManualDispatchStartup {
     if ($policy -cne [string]$manifest.capabilityPolicyDigest) {
         throw '[policy-changed] Manual dispatch policy digest does not match its snapshot.'
     }
-    # Independently re-derive the pre-narrowing ceiling the broker described this policy from
-    # (§4.2/§5 mechanics), and re-validate it against the same checked-in ceiling rules as the
-    # already-narrowed capabilities/mandatoryDenies above -- the child trusts nothing from the wire
-    # it cannot re-derive or re-check itself (ANT-2).
+    # The pre-narrowing ceiling is NOT independently re-derived here -- unlike allowedCapabilities/
+    # requiredDeny (read fresh from this same module's own Get-AgentHarnessCapabilityDescriptor),
+    # the broker's per-repo role descriptor (its configured capabilities/mandatoryDenies before any
+    # override narrowing) lives only in the broker's own config file; this child process has no
+    # independent copy of it to compare against. ceilingCapabilities/ceilingMandatoryDenies are
+    # therefore wire-supplied, exactly like capabilities/mandatoryDenies above -- but they are not
+    # trusted blindly: every entry is constrained to lie within the shared maximum descriptor
+    # (allowedCapabilities/requiredDeny, re-derived independently just above), the already-narrowed
+    # capabilities/mandatoryDenies must be exactly reachable from this ceiling by narrowing alone
+    # (never wider, and any deny not already on the ceiling must have come from a ceiling
+    # capability), and the whole policy object -- ceiling included -- is bound to
+    # manifest.capabilityPolicyDigest and re-verified live under the capability-override lock below.
+    # The manifest file itself is written by the broker into a path this child only ever reads
+    # through Assert-AgentTrustedFile-style protections and the dedicated startupPipe handshake, so
+    # a party that could forge ceilingCapabilities would already have to be inside that trust
+    # boundary.
     $ceilingCapabilities = @($manifest.policy.ceilingCapabilities)
     $ceilingMandatoryDenies = @($manifest.policy.ceilingMandatoryDenies)
     if ($ceilingMandatoryDenies -cnotcontains $requiredDeny -or
         @($ceilingCapabilities | Where-Object { $ceilingMandatoryDenies -ccontains $_ }).Count -gt 0 -or
         @($ceilingCapabilities | Where-Object { $allowedCapabilities -cnotcontains $_ }).Count -gt 0 -or
         @($capabilities | Where-Object { $ceilingCapabilities -cnotcontains $_ }).Count -gt 0 -or
-        @($mandatoryDenies | Where-Object { $ceilingMandatoryDenies -cnotcontains $_ }).Count -gt 0) {
+        @($mandatoryDenies | Where-Object {
+                $ceilingMandatoryDenies -cnotcontains $_ -and $ceilingCapabilities -cnotcontains $_
+            }).Count -gt 0) {
         throw '[launch-failed] Manual dispatch manifest ceiling policy is malformed or inconsistent.'
     }
     $expectedRepositoryKey = Get-AgentRepositoryIdentityKey -RepositoryIdentity $RepositoryIdentity

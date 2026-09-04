@@ -23,7 +23,12 @@ export interface PullRequestSnapshotV1 {
   title: string;
 }
 
-export const KNOWN_PROVENANCE = ["operational-default"] as const;
+// operational-default is the un-narrowed, checked-in ceiling; the other four match the
+// outside-repository capability-override store's scopes (broad-to-narrow: machine, user,
+// repo-worktree, pr -- see Resolve-AgentEffectiveCapabilitySettings). Every value the broker can
+// legitimately put on the wire must be listed here, or a real, correctly-narrowed profile/summary
+// response is rejected outright by provenanceField below.
+export const KNOWN_PROVENANCE = ["operational-default", "machine", "user", "repo-worktree", "pr"] as const;
 export type CapabilityProvenance = (typeof KNOWN_PROVENANCE)[number];
 
 export interface CapabilitySummary {

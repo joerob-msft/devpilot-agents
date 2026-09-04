@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { DispatchClient, DISPATCH_PROTOCOL_MAX_BYTES } from "../src/dispatch.js";
+import { DispatchClient, DISPATCH_PROTOCOL_MAX_BYTES, type CapabilityProfile } from "../src/dispatch.js";
 
 // PowerShell (pwsh) ships on every GitHub-hosted runner image (Windows, Linux,
 // macOS), so the fixture below can exercise the real broker process on every
@@ -232,6 +232,76 @@ if ($r.operation -eq 'describe') {
 `);
     assert.equal(oversizedArray.rejected, true);
     assert.equal(oversizedArray.failures.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("client accepts every known capability provenance value and rejects an unrecognized one", async () => {
+  const root = join(process.cwd(), `.dashboard-dispatch-provenance-${process.pid}-${Date.now()}`);
+  await mkdir(root, { recursive: false });
+  const descriptor = join(root, "descriptor.json");
+  const pwsh = resolvePwshPath();
+  await writeFile(descriptor, "{}", "utf8");
+  const validIdentity = "@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';" +
+    "project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';" +
+    "verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true}";
+  const validPrSnapshot = "@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';" +
+    "targetRef='main';active=$true;draft=$false;author='ada';title='test'}";
+
+  async function profileWithProvenance(
+    provenancePs1: string,
+  ): Promise<{ failures: string[]; profile: CapabilityProfile | undefined }> {
+    const script = join(root, `fake-broker-${Date.now()}-${Math.random()}.ps1`);
+    await writeFile(script, String.raw`
+param([string]$DescriptorPath)
+$line = [Console]::In.ReadLine()
+$r = $line | ConvertFrom-Json
+if ($r.operation -eq 'profile') {
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-profile';role='reviewer';repositoryIdentity=${validIdentity};prSnapshot=${validPrSnapshot};capabilities=@();mandatoryDenies=@();dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=` +
+      provenancePs1 + String.raw`} | ConvertTo-Json -Compress -Depth 10
+}
+# Exit immediately after the single response, matching the other single-shot fixtures in this file.
+`, "utf8");
+    const failures: string[] = [];
+    const client = new DispatchClient(
+      { executablePath: pwsh, scriptPath: script, descriptorPath: descriptor },
+      { onBrokerFailure: (failure) => failures.push(failure) },
+    );
+    let profile: CapabilityProfile | undefined;
+    try {
+      profile = await client.profile("v1:github:9007199254740993", 104, "reviewer");
+    } catch {
+      // left undefined; caller asserts on failures/profile as appropriate
+    } finally {
+      await client.shutdown().catch(() => {});
+    }
+    return { failures, profile };
+  }
+
+  try {
+    // Every known provenance value (the operational-default ceiling plus all four
+    // outside-repository capability-override store scopes) must parse through unchanged.
+    const allKnown = await profileWithProvenance(
+      "@{ceilingCap='operational-default';machineCap='machine';userCap='user';" +
+      "worktreeCap='repo-worktree';prCap='pr'}",
+    );
+    // The single-shot fixture exits right after writing its one response (matching the other
+    // fixtures in this file), which the client reports as one unrequested-exit broker failure --
+    // orthogonal to whether the in-flight profile() call itself resolved successfully.
+    assert.equal(allKnown.failures.length, 1);
+    assert.ok(allKnown.profile, "expected a parsed capability-profile");
+    assert.equal(allKnown.profile?.provenance.ceilingCap, "operational-default");
+    assert.equal(allKnown.profile?.provenance.machineCap, "machine");
+    assert.equal(allKnown.profile?.provenance.userCap, "user");
+    assert.equal(allKnown.profile?.provenance.worktreeCap, "repo-worktree");
+    assert.equal(allKnown.profile?.provenance.prCap, "pr");
+
+    // An unrecognized provenance value must still be rejected outright rather than silently
+    // accepted -- the runtime validator is the trust boundary for this union, not just its type.
+    const unknown = await profileWithProvenance("@{someCap='admin-override'}");
+    assert.equal(unknown.profile, undefined);
+    assert.equal(unknown.failures.length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

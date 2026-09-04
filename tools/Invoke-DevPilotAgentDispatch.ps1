@@ -311,10 +311,35 @@ function Get-BrokerCapabilityProfile {
         # oversized/unsafe-path override record) fails this whole describe/profile call closed
         # rather than silently falling back to the un-narrowed ceiling -- that fallback would be a
         # silent widening from the operator's own last-known-good intent.
+        #
+        # Holds the same capability-override lock every future writer (PR3) will take before its
+        # atomic replace, so a cooperating writer's delete/rename can never interleave with this
+        # read. A file that still vanishes out from under us while the lock is held (Resolve-
+        # AgentEffectiveCapabilitySettings surfaces this as the distinct [stable-read-unstable]
+        # signal, never as ordinary "invalid"/corrupt content) is retried exactly once under the
+        # SAME lock acquisition; if it still cannot be read, that same distinct, explicitly-
+        # retryable failure is what this call fails closed with -- it is never reinterpreted as
+        # "no override" (that would silently widen the effective ceiling) or as malformed content.
         $ceilingCapabilities = $capabilities
         $ceilingMandatoryDenies = $mandatoryDenies
-        $override = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity `
-            -RepositoryRoot $provider.RepositoryRoot -PullRequestId $prId -CurrentSourceCommit $pr.sourceCommit
+        $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $provider.RepositoryRoot -TimeoutMilliseconds 2000
+        if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+        try {
+            $override = $null
+            for ($resolveAttempt = 1; $resolveAttempt -le 2; $resolveAttempt++) {
+                try {
+                    $override = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity `
+                        -RepositoryRoot $provider.RepositoryRoot -PullRequestId $prId -CurrentSourceCommit $pr.sourceCommit
+                    break
+                }
+                catch {
+                    if ($resolveAttempt -ge 2 -or $_.Exception.Message -notmatch '^\[stable-read-unstable\]') { throw }
+                }
+            }
+        }
+        finally {
+            Exit-AgentLock $capabilityLock.Stream
+        }
         $partition = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $roleDescriptor -PersistedNarrowing $override.Settings
         $capabilities = $partition.capabilities
         $mandatoryDenies = $partition.mandatoryDenies
