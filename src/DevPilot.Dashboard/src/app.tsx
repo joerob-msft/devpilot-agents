@@ -672,7 +672,11 @@ export function App(props: AppProps) {
   const [narrowingCapabilityIndex, setNarrowingCapabilityIndex] = createSignal(0);
   const [narrowingPreview, setNarrowingPreview] = createSignal<CapabilityNarrowingPreview | null>(null);
   const [narrowingStatus, setNarrowingStatus] = createSignal("");
-  const [killSwitchConfirming, setKillSwitchConfirming] = createSignal(false);
+  // PR3 completion (issue #105): two-stage confirm, mirroring narrowingMode's own
+  // confirm/confirm-final and ManualDispatchPanel's confirm/confirm-final -- "none" is the
+  // ordinary read-only Settings view, "confirm" is the first (full-disclosure) warning, and
+  // "confirm-final" is the terse final gate that actually arms the 'y' toggle.
+  const [killSwitchStage, setKillSwitchStage] = createSignal<"none" | "confirm" | "confirm-final">("none");
   let narrowingGeneration = 0;
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let localBrokerShutdown: Promise<void> | undefined;
@@ -948,7 +952,7 @@ export function App(props: AppProps) {
     setNarrowingMode(null);
     setNarrowingPreview(null);
     setNarrowingStatus("");
-    setKillSwitchConfirming(false);
+    setKillSwitchStage("none");
     notify("Effective profile settings closed");
   }
 
@@ -1088,12 +1092,16 @@ export function App(props: AppProps) {
       await props.broker.applyNarrowing(preview, entry.repositoryIdentity.key, entry.pullRequestId);
       if (requestId !== narrowingGeneration) return;
       setNarrowingStatus(`Applied: ${preview.capability} ${preview.action === "off" ? "turned off" : "reset to inherit"} at ${preview.scope} scope.`);
-      setNarrowingMode("result");
       setNarrowingPreview(null);
       // Refresh via the existing side-effect-free profile() RPC (never the mutating response
       // itself) -- reuses refreshSettingsProfile's own generation guard, so a stale response can
-      // never render either.
-      void refreshSettingsProfile(settingsRole(), { silent: true });
+      // never render either. Awaited BEFORE flipping to "result" (issue #105 PR3 completion) so
+      // the result screen's Enabled/Denied recap can never render a moment of stale, pre-apply
+      // data before catching up: the refreshed profile is already in hand the instant "result"
+      // first renders.
+      await refreshSettingsProfile(settingsRole(), { silent: true });
+      if (requestId !== narrowingGeneration) return;
+      setNarrowingMode("result");
     } catch (error) {
       if (requestId !== narrowingGeneration) return;
       if (isKillSwitchActiveRejection(error)) {
@@ -1125,7 +1133,7 @@ export function App(props: AppProps) {
   async function toggleKillSwitch(): Promise<void> {
     const entry = historyCurrent();
     if (!props.broker || !entry) return;
-    setKillSwitchConfirming(false);
+    setKillSwitchStage("none");
     const nextEnabled = !(settingsDisplayProfile()?.killSwitchActive ?? false);
     setSettingsStatus(nextEnabled
       ? "Enabling emergency lever: ignore local narrowing overrides..."
@@ -1501,8 +1509,17 @@ export function App(props: AppProps) {
         return;
       }
       if (editing === "previewing" || editing === "applying") return;
-      if (killSwitchConfirming()) {
-        if (key.name === "escape") setKillSwitchConfirming(false);
+      // Two-stage kill-switch confirm (issue #105 PR3 completion), mirroring narrowing's own
+      // confirm/confirm-final: "confirm" is the first, full-disclosure warning (c advances to the
+      // final gate); "confirm-final" is the terse final gate that actually arms 'y'. Esc cancels
+      // back to the ordinary Settings view at either stage.
+      if (killSwitchStage() === "confirm") {
+        if (key.name === "escape") setKillSwitchStage("none");
+        else if (key.name === "c") setKillSwitchStage("confirm-final");
+        return;
+      }
+      if (killSwitchStage() === "confirm-final") {
+        if (key.name === "escape") setKillSwitchStage("none");
         else if (key.name === "y") void toggleKillSwitch();
         return;
       }
@@ -1530,7 +1547,7 @@ export function App(props: AppProps) {
           if (loaded && !loaded.editingAvailable) {
             setSettingsStatus("Unavailable: broker does not support capability narrowing (upgrade required).");
           } else {
-            setKillSwitchConfirming(true);
+            setKillSwitchStage("confirm");
           }
         }
       }
@@ -1779,12 +1796,60 @@ export function App(props: AppProps) {
             <Show when={settingsStatus()}>
               <text height={1} fg={COLORS.warning}>{line(settingsStatus(), 170)}</text>
             </Show>
-            <Show when={killSwitchConfirming()}>
-              <text height={1} fg={COLORS.error}>
-                {line(settingsDisplayProfile()?.killSwitchActive
-                  ? "Disable 'Ignore local narrowing overrides'? Persisted narrowing applies again next launch. y confirm | Esc cancel"
-                  : "Enable 'Ignore local narrowing overrides'? All persisted narrowing is ignored next launch (not a security lockdown). y confirm | Esc cancel", 170)}
-              </text>
+            {/* Two-stage kill-switch confirm (issue #105 PR3 completion). "confirm" (first
+                warning) carries the full disclosure required for the ENABLE direction: this is a
+                machine+user-wide lever across every repo/worktree/PR for this user, it ignores
+                persisted narrowing and restores compiled operational defaults for NEXT launches
+                only, an already-running agent is immutable/unaffected, and it grants no delegated
+                approval-vote/auto-complete. The DISABLE direction's blast radius is much smaller
+                (persisted narrowing simply applies again), so its first-stage wording stays terse,
+                matching the narrowing editor's own confirm/confirm-final asymmetry (full detail on
+                the first stage, a short recap+action on the final one). */}
+            <Show when={killSwitchStage() === "confirm"}>
+              <Show
+                when={!(settingsDisplayProfile()?.killSwitchActive ?? false)}
+                fallback={
+                  <>
+                    <text height={1} fg={COLORS.error}>
+                      {line("Disable 'Ignore local narrowing overrides'? Persisted narrowing becomes active again for next launches.", 170)}
+                    </text>
+                    <text height={1} fg={COLORS.error}>
+                      {line("Press c to review the final confirmation; Esc cancels.", 170)}
+                    </text>
+                  </>
+                }
+              >
+                <text height={1} fg={COLORS.error}>
+                  {line("WARNING: machine+user-wide emergency lever -- affects ALL repos/worktrees/PRs for this user on this machine, not just this PR.", 170)}
+                </text>
+                <text height={1} fg={COLORS.error}>
+                  {line("Ignores all locally persisted narrowing; restores compiled operational defaults for NEXT launches only.", 170)}
+                </text>
+                <text height={1} fg={COLORS.error}>
+                  {line("Any already-running agent is immutable and unaffected; grants no delegated approval-vote or auto-complete.", 170)}
+                </text>
+                <text height={1} fg={COLORS.warning}>
+                  {line("Press c to review the final confirmation; Esc cancels.", 170)}
+                </text>
+              </Show>
+            </Show>
+            <Show when={killSwitchStage() === "confirm-final"}>
+              <Show
+                when={!(settingsDisplayProfile()?.killSwitchActive ?? false)}
+                fallback={
+                  <>
+                    <text height={1} fg={COLORS.error}>
+                      {line("FINAL CONFIRMATION: disable 'Ignore local narrowing overrides'? Persisted narrowing becomes active again.", 170)}
+                    </text>
+                    <text height={1} fg={COLORS.error}>{line("Press y to disable; Esc cancels.", 170)}</text>
+                  </>
+                }
+              >
+                <text height={1} fg={COLORS.error}>
+                  {line("FINAL CONFIRMATION: enable the kill switch machine+user-wide across ALL repos/worktrees/PRs?", 170)}
+                </text>
+                <text height={1} fg={COLORS.error}>{line("Press y to enable; Esc cancels.", 170)}</text>
+              </Show>
             </Show>
             <Show when={narrowingMode() && narrowingMode() !== "result" && narrowingStatus()}>
               <text height={1} fg={COLORS.warning}>{line(narrowingStatus(), 170)}</text>
@@ -1860,6 +1925,19 @@ export function App(props: AppProps) {
             </Show>
             <Show when={narrowingMode() === "result"}>
               <text height={1} fg={COLORS.ok}>{line(narrowingStatus(), 170)} (Esc/Enter back)</text>
+              {/* issue #105 PR3 completion: the result screen must show the REFRESHED effective
+                  profile, not just the "Applied: ..." status line -- applyNarrowing() now awaits
+                  refreshSettingsProfile() before ever entering "result", so
+                  settingsDisplayProfile() is already the post-apply truth the first time this
+                  renders (never a stale pre-apply snapshot). */}
+              <Show when={settingsDisplayProfile()}>
+                {(profile: () => CapabilityProfile) => (
+                  <>
+                    <text height={1} fg={COLORS.ok}>Enabled: {line(profile().capabilities.join(", ") || "none", 110)}</text>
+                    <text height={1} fg={COLORS.warning}>Denied (mandatory): {line(profile().mandatoryDenies.join(", ") || "none", 110)}</text>
+                  </>
+                )}
+              </Show>
             </Show>
           </box>
         </OverlayPanel>

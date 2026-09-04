@@ -3,7 +3,10 @@ import { execFileSync } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { DispatchClient, DISPATCH_PROTOCOL_MAX_BYTES, type CapabilityProfile, type CapabilitySummary } from "../src/dispatch.js";
+import {
+  DispatchClient, DISPATCH_PROTOCOL_MAX_BYTES,
+  type CapabilityProfile, type CapabilitySummary, type KillSwitchApplied,
+} from "../src/dispatch.js";
 
 // PowerShell (pwsh) ships on every GitHub-hosted runner image (Windows, Linux,
 // macOS), so the fixture below can exercise the real broker process on every
@@ -341,6 +344,103 @@ if ($r.operation -eq 'profile') {
     const unknown = await profileWithProvenance("@{someCap='admin-override'}");
     assert.equal(unknown.profile, undefined);
     assert.equal(unknown.failures.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("client normalizes killSwitchExpiresAtUtc from an integer epoch or a canonical ISO string on both profile and kill-switch-applied responses", async () => {
+  const root = join(process.cwd(), `.dashboard-dispatch-kill-switch-expiry-${process.pid}-${Date.now()}`);
+  await mkdir(root, { recursive: false });
+  const descriptor = join(root, "descriptor.json");
+  const pwsh = resolvePwshPath();
+  await writeFile(descriptor, "{}", "utf8");
+  const validIdentity = "@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';" +
+    "project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';" +
+    "verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true}";
+  const validPrSnapshot = "@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';" +
+    "targetRef='main';active=$true;draft=$false;author='ada';title='test'}";
+
+  async function profileWithExpiry(killSwitchExpiresAtUtcPs1: string): Promise<{ failures: string[]; profile: CapabilityProfile | undefined }> {
+    const script = join(root, `fake-broker-${Date.now()}-${Math.random()}.ps1`);
+    await writeFile(script, String.raw`
+param([string]$DescriptorPath)
+$line = [Console]::In.ReadLine()
+$r = $line | ConvertFrom-Json
+if ($r.operation -eq 'profile') {
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-profile';role='reviewer';repositoryIdentity=${validIdentity};prSnapshot=${validPrSnapshot};capabilities=@();mandatoryDenies=@();dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();killSwitchActive=$true;killSwitchExpiresAtUtc=` + killSwitchExpiresAtUtcPs1 + String.raw`;provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+}
+# Exit immediately after the single response, matching the other single-shot fixtures in this file.
+`, "utf8");
+    const failures: string[] = [];
+    const client = new DispatchClient(
+      { executablePath: pwsh, scriptPath: script, descriptorPath: descriptor },
+      { onBrokerFailure: (failure) => failures.push(failure) },
+    );
+    let profile: CapabilityProfile | undefined;
+    try {
+      profile = await client.profile("v1:github:9007199254740993", 104, "reviewer");
+    } catch {
+      // left undefined; caller asserts on failures/profile as appropriate
+    } finally {
+      await client.shutdown().catch(() => {});
+    }
+    return { failures, profile };
+  }
+
+  async function setKillSwitchWithExpiry(killSwitchExpiresAtUtcPs1: string): Promise<{ failures: string[]; applied: KillSwitchApplied | undefined }> {
+    const script = join(root, `fake-broker-${Date.now()}-${Math.random()}.ps1`);
+    await writeFile(script, String.raw`
+param([string]$DescriptorPath)
+$line = [Console]::In.ReadLine()
+$r = $line | ConvertFrom-Json
+if ($r.operation -eq 'set-kill-switch') {
+    @{schemaVersion=1;requestId=$r.requestId;operation='kill-switch-applied';role='reviewer';enabled=$true;killSwitchExpiresAtUtc=` + killSwitchExpiresAtUtcPs1 + String.raw`} | ConvertTo-Json -Compress -Depth 10
+}
+# Exit immediately after the single response, matching the other single-shot fixtures in this file.
+`, "utf8");
+    const failures: string[] = [];
+    const client = new DispatchClient(
+      { executablePath: pwsh, scriptPath: script, descriptorPath: descriptor },
+      { onBrokerFailure: (failure) => failures.push(failure) },
+    );
+    let applied: KillSwitchApplied | undefined;
+    try {
+      applied = await client.setKillSwitch("v1:github:9007199254740993", "reviewer", true);
+    } catch {
+      // left undefined
+    } finally {
+      await client.shutdown().catch(() => {});
+    }
+    return { failures, applied };
+  }
+
+  try {
+    // A plain non-negative integer epoch-seconds count -- the harness's own on-wire shape, via
+    // ConvertTo-AgentCanonicalEpochSeconds -- normalizes to the equivalent canonical ISO string.
+    const epoch = await profileWithExpiry("1756918800");
+    assert.equal(epoch.profile?.killSwitchExpiresAtUtc, new Date(1756918800 * 1000).toISOString());
+
+    // A canonical ISO-8601 UTC string continues to round-trip completely unchanged.
+    const iso = await profileWithExpiry("'2026-09-03T17:00:00Z'");
+    assert.equal(iso.profile?.killSwitchExpiresAtUtc, "2026-09-03T17:00:00Z");
+
+    // A negative number or a non-integer must still be rejected outright -- the runtime validator
+    // is the trust boundary for this union, not just its type.
+    const negative = await profileWithExpiry("-1");
+    assert.equal(negative.profile, undefined);
+    assert.equal(negative.failures.length, 1);
+
+    const fractional = await profileWithExpiry("1756918800.5");
+    assert.equal(fractional.profile, undefined);
+    assert.equal(fractional.failures.length, 1);
+
+    // kill-switch-applied echoes the identical epoch-or-ISO contract.
+    const appliedEpoch = await setKillSwitchWithExpiry("1756918800");
+    assert.equal(appliedEpoch.applied?.killSwitchExpiresAtUtc, new Date(1756918800 * 1000).toISOString());
+
+    const appliedNull = await setKillSwitchWithExpiry("$null");
+    assert.equal(appliedNull.applied?.killSwitchExpiresAtUtc, null);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

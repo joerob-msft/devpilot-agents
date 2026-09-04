@@ -698,6 +698,8 @@ Describe 'PR3 capability-override writer and kill switch' {
             -PullRequestId 1 -CurrentSourceCommit $commit
         $duringKillSwitch.Settings.Count | Should -Be 0
         $duringKillSwitch.KillSwitchActive | Should -BeTrue
+        $duringKillSwitch.KillSwitchExpiresAtUtc | Should -BeOfType [long]
+        $duringKillSwitch.KillSwitchExpiresAtUtc | Should -BeGreaterThan (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))
 
         Disable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot
         Disable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot  # idempotent, no throw
@@ -706,6 +708,35 @@ Describe 'PR3 capability-override writer and kill switch' {
             -PullRequestId 1 -CurrentSourceCommit $commit
         $afterDisable.Settings[$allowed[0]] | Should -BeExactly 'off'
         $afterDisable.KillSwitchActive | Should -BeFalse
+        $afterDisable.KillSwitchExpiresAtUtc | Should -BeNullOrEmpty
+    }
+
+    It 'emits the kill switch TTL expiry on the shared accessor and cleans up an expired sentinel on next observation' {
+        # Protocol-facing coverage (issue #105 PR3 completion) for the emitted-expiry/expired-
+        # cleanup gap: Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc is what
+        # Invoke-SetKillSwitch's response actually calls, so this exercises the exact same shared
+        # sentinel state Resolve-AgentEffectiveCapabilitySettings's KillSwitchExpiresAtUtc uses.
+        $roots = New-TestRoots
+        $nowEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
+        Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot | Should -BeNullOrEmpty
+
+        Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot -TtlSeconds 60
+        $expiresAtUtc = Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot
+        $expiresAtUtc | Should -BeGreaterThan $nowEpoch
+        $expiresAtUtc | Should -BeLessOrEqual ($nowEpoch + 60)
+
+        # Force expiry without sleeping 60+ seconds: rewrite the sentinel directly to a past epoch,
+        # exactly like Write-OverrideFile does for other scope files in this suite.
+        $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+        $disallowed = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot), (Get-AgentDefaultCapabilityOverrideRoot))
+        $killSwitchRoot = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $roots.RepoRoot -DisallowedRoots $disallowed
+        $sentinelPath = Join-Path $killSwitchRoot 'sentinel.json'
+        Test-Path -LiteralPath $sentinelPath -PathType Leaf | Should -BeTrue
+        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = ($nowEpoch - 120); expiresAtUtc = ($nowEpoch - 1) }
+
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+        Test-Path -LiteralPath $sentinelPath -PathType Leaf | Should -BeFalse
+        Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot | Should -BeNullOrEmpty
     }
 
     It 'the kill-switch sentinel root stays disjoint from the versioned v1 override store and every sibling root' {

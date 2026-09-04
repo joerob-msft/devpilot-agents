@@ -99,6 +99,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Resolve-AgentCapabilityPolicyPartition', 'Enter-AgentCapabilityOverrideLock',
                'Get-AgentDefaultCapabilityOverrideKillSwitchRoot', 'Test-AgentCapabilityOverrideKillSwitch',
                'Enable-AgentCapabilityOverrideKillSwitch', 'Disable-AgentCapabilityOverrideKillSwitch',
+               'Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc',
                'Set-AgentCapabilityOverrideSetting',
                'Repair-AgentDurableState', 'Read-AgentDurableState', 'Write-AgentDurableState',
                'Get-AgentDurableRecords', 'Get-AgentDurableRecordsSnapshot', 'Set-AgentDurableRecords', 'Initialize-AgentDurableState',

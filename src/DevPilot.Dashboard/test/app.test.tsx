@@ -415,6 +415,7 @@ function createSettingsBrokerFixture(): {
         operation: "kill-switch-applied",
         role,
         enabled,
+        killSwitchExpiresAtUtc: state.killSwitchExpiresAtUtc,
       };
       return applied;
     },
@@ -1110,10 +1111,11 @@ test("settings editor previews off and inherit changes without applying until th
   }
 });
 
-test("settings kill switch prompts can be cancelled or confirmed without leaving residue", async (context) => {
+test("settings kill switch two-stage confirm can be cancelled at either stage, enabled, disabled, and displays its expiry", async (context) => {
   const fixture = createFixture();
   const history = createSettingsHistory();
-  const { broker, calls } = createSettingsBrokerFixture();
+  const { broker, calls, setKillSwitchTtlMinutes } = createSettingsBrokerFixture();
+  setKillSwitchTtlMinutes(45);
   let setup: TestRendererSetup | undefined;
   try {
     setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
@@ -1125,15 +1127,38 @@ test("settings kill switch prompts can be cancelled or confirmed without leaving
 
     setup.mockInput.pressKey("s");
     await setup.flush();
+
+    // First-stage cancel: pressing k shows the full-disclosure warning (machine+user-wide blast
+    // radius, ignores local narrowing, NEXT-launches-only, running agents immutable, no delegated
+    // approval-vote/auto-complete) and Esc backs all the way out with no RPC call at all.
     setup.mockInput.pressKey("k");
     await setup.flush();
-    assert.match(setup.captureCharFrame(), /Enable 'Ignore local narrowing overrides'\? All persisted narrowing is ignored next launch \(not a security lockdown\)\. y confirm \| Esc cancel/);
+    assert.match(setup.captureCharFrame(), /WARNING: machine\+user-wide emergency lever -- affects ALL repos\/worktrees\/PRs for this user on this machine, not just this PR\./);
+    assert.match(setup.captureCharFrame(), /Ignores all locally persisted narrowing; restores compiled operational defaults for NEXT launches only\./);
+    assert.match(setup.captureCharFrame(), /Any already-running agent is immutable and unaffected; grants no delegated approval-vote or auto-complete\./);
+    assert.match(setup.captureCharFrame(), /Press c to review the final confirmation; Esc cancels\./);
     setup.mockInput.pressEscape();
     await setup.flush();
-    assert.doesNotMatch(setup.captureCharFrame(), /Enable 'Ignore local narrowing overrides'\?/);
+    assert.doesNotMatch(setup.captureCharFrame(), /WARNING: machine\+user-wide emergency lever/);
     assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 0);
 
+    // Final-stage cancel: advance past the warning with c, then Esc at the terse final gate still
+    // backs out with no RPC call.
     setup.mockInput.pressKey("k");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /FINAL CONFIRMATION: enable the kill switch machine\+user-wide across ALL repos\/worktrees\/PRs\?/);
+    assert.match(setup.captureCharFrame(), /Press y to enable; Esc cancels\./);
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /FINAL CONFIRMATION: enable the kill switch/);
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 0);
+
+    // Enable: k (warning) -> c (final gate) -> y (confirm) actually toggles it on.
+    setup.mockInput.pressKey("k");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
     await setup.flush();
     setup.mockInput.pressKey("y");
     await setup.flush();
@@ -1142,13 +1167,26 @@ test("settings kill switch prompts can be cancelled or confirmed without leaving
     assert.match(setup.captureCharFrame(), /Provenance: .*kill-switch/);
     assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 1);
 
+    // Expiry displayed: the broker's reported TTL renders as a minutes-remaining countdown plus
+    // the raw timestamp it echoed (not pinning an exact minute count, since Settings' own display
+    // is computed from a live clock signal relative to whenever this assertion happens to run).
+    assert.match(setup.captureCharFrame(), /ON \(emergency lever, not a security lockdown\) \(expires in \d+m, \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+
+    // Disable: k (terse warning, smaller blast radius) -> c (final gate) -> y (confirm) turns it
+    // back off.
     setup.mockInput.pressKey("k");
     await setup.flush();
-    assert.match(setup.captureCharFrame(), /Disable 'Ignore local narrowing overrides'\? Persisted narrowing applies again next launch\. y confirm \| Esc cancel/);
-    setup.mockInput.pressEscape();
+    assert.match(setup.captureCharFrame(), /Disable 'Ignore local narrowing overrides'\? Persisted narrowing becomes active again for next launches\./);
+    assert.match(setup.captureCharFrame(), /Press c to review the final confirmation; Esc cancels\./);
+    setup.mockInput.pressKey("c");
     await setup.flush();
-    assert.doesNotMatch(setup.captureCharFrame(), /Disable 'Ignore local narrowing overrides'\?/);
-    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 1);
+    assert.match(setup.captureCharFrame(), /FINAL CONFIRMATION: disable 'Ignore local narrowing overrides'\? Persisted narrowing becomes active again\./);
+    assert.match(setup.captureCharFrame(), /Press y to disable; Esc cancels\./);
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Ignore local narrowing overrides is now OFF: persisted narrowing applies again\./);
+    assert.match(setup.captureCharFrame(), /Ignore local narrowing overrides: off/);
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 2);
   } catch (error) {
     if (error instanceof Error && error.message.includes("native FFI is not available")) {
       context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");

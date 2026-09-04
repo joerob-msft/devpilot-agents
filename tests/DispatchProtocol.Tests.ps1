@@ -568,6 +568,28 @@ Describe 'dispatch protocol primitives' {
         $describeBody | Should -Match 'role = \$role'
     }
 
+    It 'emits killSwitchExpiresAtUtc on describe, profile, and set-kill-switch responses' {
+        # Protocol-shape coverage (issue #105 PR3 completion): describe/profile must surface the
+        # same Override.KillSwitchExpiresAtUtc Resolve-AgentEffectiveCapabilitySettings now returns
+        # alongside KillSwitchActive, and set-kill-switch (which has no PR-scoped Override object to
+        # read from) must read it back via the dedicated
+        # Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc accessor under the same lock it already
+        # holds for Enable-/Disable-AgentCapabilityOverrideKillSwitch.
+        $source = Get-Content -LiteralPath $brokerPath -Raw
+
+        $profileBody = [regex]::Match($source, '(?s)function Invoke-Profile \{.*?\n\}').Value
+        $profileBody | Should -Match 'killSwitchExpiresAtUtc\s*=\s*\$profile\.Override\.KillSwitchExpiresAtUtc'
+
+        $describeBody = [regex]::Match($source, '(?s)function Invoke-Describe \{.*?\n\}').Value
+        $describeBody | Should -Match 'killSwitchExpiresAtUtc\s*=\s*\$profile\.Override\.KillSwitchExpiresAtUtc'
+
+        $setKillSwitchBody = [regex]::Match($source, '(?s)function Invoke-SetKillSwitch \{.*?\n\}').Value
+        $setKillSwitchBody | Should -Not -BeNullOrEmpty
+        $setKillSwitchBody | Should -Match 'Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc'
+        $setKillSwitchBody | Should -Match "operation = 'kill-switch-applied'"
+        $setKillSwitchBody | Should -Match 'killSwitchExpiresAtUtc\s*=\s*\$killSwitchExpiresAtUtc'
+    }
+
     It 'keeps the read-only profile operation side-effect-free across repeated calls' {
         $repositoryRoot = (Resolve-Path "$PSScriptRoot\..").Path
         $suiteRoot = Join-Path $TestDrive 'broker-profile-integration'

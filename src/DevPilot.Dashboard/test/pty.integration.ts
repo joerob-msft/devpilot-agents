@@ -428,6 +428,7 @@ $prSnapshot = @{
 $enabled = @('EnableSummaryComment', 'EnableThreadReplies')
 $mandatory = @('EnableFindingComments', 'EnableApprovalVote')
 $killSwitchActive = $false
+$killSwitchExpiresAtUtc = $null
 function Append-Log([object]$request) {
   [System.IO.File]::AppendAllText($requestLogPath, (($request | ConvertTo-Json -Compress -Depth 10) + [Environment]::NewLine))
 }
@@ -471,6 +472,22 @@ function Profile-Response([object]$request) {
     delegableAvailable = @()
     provenance = $effect.provenance
     killSwitchActive = $killSwitchActive
+    killSwitchExpiresAtUtc = $killSwitchExpiresAtUtc
+  } | ConvertTo-Json -Compress -Depth 10
+}
+function Set-KillSwitch-Response([object]$request) {
+  # Mirrors Invoke-SetKillSwitch's real wire shape (issue #105 PR3 completion): flips the
+  # fixture's own shared $killSwitchActive/$killSwitchExpiresAtUtc state so the very next
+  # profile response reflects it too, exactly like the real broker's persisted sentinel would.
+  $script:killSwitchActive = [bool]$request.enabled
+  $script:killSwitchExpiresAtUtc = if ($script:killSwitchActive) { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600 } else { $null }
+  return @{
+    schemaVersion = 1
+    requestId = $request.requestId
+    operation = 'kill-switch-applied'
+    role = $request.role
+    enabled = $script:killSwitchActive
+    killSwitchExpiresAtUtc = $script:killSwitchExpiresAtUtc
   } | ConvertTo-Json -Compress -Depth 10
 }
 function Preview-Response([object]$request) {
@@ -511,6 +528,7 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
   switch ($request.operation) {
     'profile' { Write-Output (Profile-Response $request) }
     'preview-narrowing' { Write-Output (Preview-Response $request) }
+    'set-kill-switch' { Write-Output (Set-KillSwitch-Response $request) }
     'shutdown' {
       # break only exits the switch in PowerShell, not this enclosing while loop -- the
       # $accepting flag (mirroring the production broker's own shutdown handling in
@@ -585,6 +603,29 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
     await waitForVisible("First confirmation: press c to review the final apply gate; Esc cancels.");
     await writeAndWait("\x1b", "SETTINGS - EDIT PERSISTED NARROWING");
     await writeAndWait("\x1b", "SETTINGS - EFFECTIVE CAPABILITY PROFILE");
+
+    // Kill switch first-stage cancel: k shows the full-disclosure warning; Esc backs out with no
+    // set-kill-switch RPC.
+    await writeAndWait("k", "WARNING: machine+user-wide emergency lever");
+    await writeAndWait("\x1b", "SETTINGS - EFFECTIVE CAPABILITY PROFILE");
+
+    // Kill switch final-stage cancel: k -> c reaches the terse final gate; Esc still backs out
+    // with no RPC.
+    await writeAndWait("k", "WARNING: machine+user-wide emergency lever");
+    await writeAndWait("c", "FINAL CONFIRMATION: enable the kill switch machine+user-wide");
+    await writeAndWait("\x1b", "SETTINGS - EFFECTIVE CAPABILITY PROFILE");
+
+    // Enable: k -> c -> y actually toggles it on, and Settings displays the TTL expiry.
+    await writeAndWait("k", "WARNING: machine+user-wide emergency lever");
+    await writeAndWait("c", "FINAL CONFIRMATION: enable the kill switch machine+user-wide");
+    await writeAndWait("y", "Ignore local narrowing overrides is now ON: persisted narrowing is ignored until the next launch.");
+    await waitForVisible("ON (emergency lever, not a security lockdown) (expires in");
+
+    // Disable: k -> c -> y turns it back off.
+    await writeAndWait("k", "Disable 'Ignore local narrowing overrides'? Persisted narrowing becomes active again for next launches.");
+    await writeAndWait("c", "FINAL CONFIRMATION: disable 'Ignore local narrowing overrides'? Persisted narrowing becomes active again.");
+    await writeAndWait("y", "Ignore local narrowing overrides is now OFF: persisted narrowing applies again.");
+
     await writeAndWait("\x1b", "Effective profile settings closed");
     terminal.write("q");
     const result = await waitForExit("dashboard hung after quitting settings editor");
@@ -595,13 +636,18 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
       .then((content) =>
         content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>));
     const parsedRequests = await requests;
-    assert.deepEqual(parsedRequests.map((request) => request.operation), ["profile", "preview-narrowing", "shutdown"]);
+    assert.deepEqual(parsedRequests.map((request) => request.operation), [
+      "profile", "preview-narrowing", "set-kill-switch", "profile", "set-kill-switch", "profile", "shutdown",
+    ]);
     assert.equal(parsedRequests[0]?.repositoryKey, "v1:github:10400000000000001");
     assert.equal(parsedRequests[1]?.scope, "repo-worktree");
     assert.equal(parsedRequests[1]?.capability, "EnableThreadReplies");
     assert.equal(parsedRequests[1]?.action, "off");
     assert.ok(!parsedRequests.some((request) => request.operation === "apply-narrowing"));
-    assert.ok(!parsedRequests.some((request) => request.operation === "set-kill-switch"));
+    const killSwitchRequests = parsedRequests.filter((request) => request.operation === "set-kill-switch");
+    assert.equal(killSwitchRequests.length, 2);
+    assert.equal(killSwitchRequests[0]?.enabled, true);
+    assert.equal(killSwitchRequests[1]?.enabled, false);
   } finally {
     try {
       if (terminal && !exited) {

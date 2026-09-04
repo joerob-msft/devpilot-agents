@@ -163,6 +163,12 @@ export interface KillSwitchApplied {
   // setKillSwitch() can reject a response describing a different role than what was requested.
   role: AgentRole;
   enabled: boolean;
+  // PR3 completion (issue #105): the same short-TTL expiry CapabilityProfile/CapabilitySummary
+  // already report, echoed here too so the UI can display it immediately after toggling without
+  // waiting for the caller's own follow-up profile() refresh. Always present (never optional) --
+  // unlike the profile/summary fields above, setKillSwitch is a PR3-only operation with no
+  // legacy broker to be lenient about; null only when the switch is now OFF.
+  killSwitchExpiresAtUtc: string | null;
 }
 
 export interface DispatchAccepted {
@@ -385,15 +391,27 @@ function booleanField(record: Record<string, unknown>, name: string): boolean {
   return value;
 }
 
-// PR3's killSwitchExpiresAtUtc: bounded like boundedPrText, but null is a legitimate value (the
-// kill switch is inactive) rather than a parse failure.
-function nullableBoundedText(record: Record<string, unknown>, name: string): string | null {
+// PR3's killSwitchExpiresAtUtc: null is a legitimate value (the kill switch is inactive) rather
+// than a parse failure. The harness itself stores/emits this as a plain integer epoch-seconds
+// count (see ConvertTo-AgentCanonicalEpochSeconds), but every existing fixture in this codebase's
+// own test suite already emits a canonical ISO-8601 UTC string instead -- both are legal wire
+// shapes for a PR3-or-newer broker, so this validates and normalizes either one to a single
+// canonical ISO-8601 string. That keeps every downstream consumer (Date.parse in app.tsx's
+// killSwitchExpiryLabel, and this field's own CapabilityProfile/CapabilitySummary/KillSwitchApplied
+// type) dealing with exactly one shape regardless of which the broker actually sent. A string
+// input is returned completely unchanged (never reformatted) so an already-canonical value still
+// round-trips byte-for-byte.
+function nullableExpiryText(record: Record<string, unknown>, name: string): string | null {
   const value = record[name];
   if (value === null) return null;
-  if (typeof value !== "string" || value.length > MAX_PR_SNAPSHOT_TEXT_LENGTH) {
-    throw new Error(`broker response ${name} is invalid`);
+  if (typeof value === "string") {
+    if (value.length > MAX_PR_SNAPSHOT_TEXT_LENGTH) throw new Error(`broker response ${name} is invalid`);
+    return value;
   }
-  return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return new Date(value * 1000).toISOString();
+  }
+  throw new Error(`broker response ${name} is invalid`);
 }
 
 // Legacy-broker compatibility (issue #105 PR3 review): a schemaVersion-1 broker that predates the
@@ -414,8 +432,8 @@ function optionalBooleanField(record: Record<string, unknown>, name: string, fal
   return record[name] === undefined ? fallback : booleanField(record, name);
 }
 
-function optionalNullableBoundedText(record: Record<string, unknown>, name: string): string | null {
-  return record[name] === undefined ? null : nullableBoundedText(record, name);
+function optionalNullableExpiryText(record: Record<string, unknown>, name: string): string | null {
+  return record[name] === undefined ? null : nullableExpiryText(record, name);
 }
 
 // Constructs the PR1 additive profile fields from validated values only -- never spread/cast
@@ -449,7 +467,7 @@ function parseCapabilityProfileFields(record: Record<string, unknown>): Pick<
     delegableAvailable,
     provenance: optionalProvenanceField(record, "provenance"),
     killSwitchActive: optionalBooleanField(record, "killSwitchActive", false),
-    killSwitchExpiresAtUtc: optionalNullableBoundedText(record, "killSwitchExpiresAtUtc"),
+    killSwitchExpiresAtUtc: optionalNullableExpiryText(record, "killSwitchExpiresAtUtc"),
     editingAvailable,
   };
 }
@@ -580,6 +598,7 @@ function parseResponse(line: string): BrokerResponse {
       operation,
       role: roleField(record, "role"),
       enabled: booleanField(record, "enabled"),
+      killSwitchExpiresAtUtc: nullableExpiryText(record, "killSwitchExpiresAtUtc"),
     } satisfies KillSwitchApplied;
   }
   return { ...record, requestId, operation } as BrokerResponse;

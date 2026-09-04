@@ -437,6 +437,7 @@ function Invoke-Describe {
             absoluteDenies = $profile.AbsoluteDenies; allowedManualCapabilities = $profile.AllowedManualCapabilities
             delegableAvailable = $profile.DelegableAvailable; provenance = $profile.Provenance
             killSwitchActive = [bool]$profile.Override.KillSwitchActive
+            killSwitchExpiresAtUtc = $profile.Override.KillSwitchExpiresAtUtc
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
@@ -460,6 +461,7 @@ function Invoke-Profile {
             absoluteDenies = $profile.AbsoluteDenies; allowedManualCapabilities = $profile.AllowedManualCapabilities
             delegableAvailable = $profile.DelegableAvailable; provenance = $profile.Provenance
             killSwitchActive = [bool]$profile.Override.KillSwitchActive
+            killSwitchExpiresAtUtc = $profile.Override.KillSwitchExpiresAtUtc
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
@@ -694,16 +696,22 @@ function Invoke-SetKillSwitch {
         if ([string]$Request.repositoryKey -cne [string]$identity.key) { throw '[repository-mismatch] Repository key does not match the provider.' }
         $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $provider.RepositoryRoot -TimeoutMilliseconds 2000
         if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+        $killSwitchExpiresAtUtc = $null
         try {
             if ($enabledValue) { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $provider.RepositoryRoot }
             else { Disable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $provider.RepositoryRoot }
+            # Read back the fresh sentinel state under the SAME lock acquisition (issue #105 PR3
+            # completion) -- never a second, separately-locked read -- so this can never observe a
+            # different answer than the Enable/Disable call it just made, even if another process
+            # were racing for the lock immediately after release.
+            $killSwitchExpiresAtUtc = Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $provider.RepositoryRoot
         }
         finally {
             Exit-AgentLock $capabilityLock.Stream
         }
         Write-DispatchProtocolMessage @{
             schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'kill-switch-applied'
-            role = $role; enabled = [bool]$enabledValue
+            role = $role; enabled = [bool]$enabledValue; killSwitchExpiresAtUtc = $killSwitchExpiresAtUtc
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }

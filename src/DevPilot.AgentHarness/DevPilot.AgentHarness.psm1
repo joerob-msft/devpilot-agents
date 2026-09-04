@@ -1465,12 +1465,19 @@ function Resolve-AgentEffectiveCapabilitySettings {
         # extra input. $null (every existing PR1/PR2 caller) reproduces today's behavior exactly.
         [AllowNull()][hashtable]$HypotheticalOverride
     )
-    if (Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $RepositoryRoot) {
+    $killSwitchState = Get-AgentCapabilityOverrideKillSwitchState -RepositoryRoot $RepositoryRoot
+    if ($killSwitchState.Active) {
         # Emergency operational lever (PR3): ignores every persisted override record and returns
         # ceiling-only output, tagged distinctly (KillSwitchActive) so callers can render
         # provenance as 'kill-switch' rather than silently indistinguishable from an empty store.
         # Checked first, via a cheap Test-Path-backed check, before any scope-file parsing.
-        return @{ Settings = [ordered]@{}; Provenance = [ordered]@{}; FileFingerprints = @(); KillSwitchActive = $true }
+        # KillSwitchExpiresAtUtc (PR3 completion) is the sentinel's own raw epoch-seconds TTL,
+        # surfaced so Get-BrokerCapabilityProfile/Invoke-Profile/Invoke-Describe can put it on the
+        # wire alongside KillSwitchActive.
+        return @{
+            Settings = [ordered]@{}; Provenance = [ordered]@{}; FileFingerprints = @()
+            KillSwitchActive = $true; KillSwitchExpiresAtUtc = $killSwitchState.ExpiresAtUtc
+        }
     }
     $root = Get-AgentCapabilityOverrideRoot -RepositoryRoot $RepositoryRoot
     $allowedCapabilities = [Collections.Generic.List[string]]::new()
@@ -1557,7 +1564,10 @@ function Resolve-AgentEffectiveCapabilitySettings {
             }
         }
     }
-    return @{ Settings = $settings; Provenance = $provenance; FileFingerprints = @($fingerprints.ToArray()); KillSwitchActive = $false }
+    return @{
+        Settings = $settings; Provenance = $provenance; FileFingerprints = @($fingerprints.ToArray())
+        KillSwitchActive = $false; KillSwitchExpiresAtUtc = $null
+    }
 }
 
 function Resolve-AgentCapabilityPolicyPartition {
@@ -1649,7 +1659,7 @@ function Get-AgentCapabilityOverrideKillSwitchDisallowedRoots {
             (Get-AgentDefaultCapabilityOverrideRoot)))
 }
 
-function Test-AgentCapabilityOverrideKillSwitch {
+function Get-AgentCapabilityOverrideKillSwitchState {
     <#
         Emergency operational lever (PR3): existence of the sentinel file alone is authoritative --
         content is never consulted for its EXISTENCE, but the sentinel now also carries a short
@@ -1657,31 +1667,68 @@ function Test-AgentCapabilityOverrideKillSwitch {
         TtlSeconds), so a forgotten "ignore local narrowing overrides" toggle can never silently
         persist forever (issue #105 PR3 review). An expired sentinel is cleaned up (deleted) the
         first time anything observes it past expiry, rather than left for a separate janitor to
-        find -- safe because this function's only caller (Resolve-AgentEffectiveCapabilitySettings)
+        find -- safe because every caller of this helper (Test-AgentCapabilityOverrideKillSwitch,
+        Resolve-AgentEffectiveCapabilitySettings, Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc)
         is only ever invoked while the caller already holds Enter-AgentCapabilityOverrideLock,
         exactly like every writer in this module. Checked via a cheap Test-Path against the
         (possibly still nonexistent) kill-switch root FIRST, so a machine that has never toggled
         the kill switch never pays the cost of, or triggers, ACL/symlink hardening on every
         describe/profile call.
+
+        Shared, single-source-of-truth sentinel reader (issue #105 PR3 completion) behind the
+        boolean Test-AgentCapabilityOverrideKillSwitch gate, Resolve-AgentEffectiveCapabilitySettings's
+        KillSwitchExpiresAtUtc wire field, and Invoke-SetKillSwitch's response (via
+        Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc) -- exactly one place parses/expires the
+        sentinel, so none of those three callers can ever disagree about whether the lever is
+        active or when it expires. Returns @{ Active = [bool]; ExpiresAtUtc = [Nullable[long]] };
+        ExpiresAtUtc is the raw epoch-seconds sentinel value (only meaningful while Active is
+        $true), never reformatted here -- callers decide their own wire/return representation.
     #>
     param([Parameter(Mandatory)][string]$RepositoryRoot)
     $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
-    if (-not (Test-Path -LiteralPath $default -PathType Container)) { return $false }
+    if (-not (Test-Path -LiteralPath $default -PathType Container)) { return @{ Active = $false; ExpiresAtUtc = $null } }
     $root = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
         -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots)
     $path = Join-Path $root 'sentinel.json'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @{ Active = $false; ExpiresAtUtc = $null } }
     $trustedPath = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -ExpectedPath $path -Private
     $stable = Read-AgentStableFile -Path $trustedPath -MaxBytes 65536
-    if (-not $stable.Exists) { return $false }
+    if (-not $stable.Exists) { return @{ Active = $false; ExpiresAtUtc = $null } }
     $sentinel = [Text.Encoding]::UTF8.GetString($stable.Bytes) | ConvertFrom-Json -AsHashtable -Depth 5
-    if ($sentinel.Contains('expiresAtUtc') -and
-        [double]$sentinel['expiresAtUtc'] -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
+    if (-not $sentinel.Contains('expiresAtUtc')) { return @{ Active = $true; ExpiresAtUtc = $null } }
+    $expiresAtUtc = [long][double]$sentinel['expiresAtUtc']
+    if ($expiresAtUtc -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
         Assert-AgentPathHasNoLinks -Path $path
         Remove-Item -LiteralPath $path -Force -ErrorAction Stop
-        return $false
+        return @{ Active = $false; ExpiresAtUtc = $null }
     }
-    return $true
+    return @{ Active = $true; ExpiresAtUtc = $expiresAtUtc }
+}
+
+function Test-AgentCapabilityOverrideKillSwitch {
+    <#
+        Boolean gate wrapping Get-AgentCapabilityOverrideKillSwitchState -- see that function for
+        the sentinel/TTL/cleanup semantics this preserves unchanged.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    return (Get-AgentCapabilityOverrideKillSwitchState -RepositoryRoot $RepositoryRoot).Active
+}
+
+function Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc {
+    <#
+        Broker-facing accessor for Invoke-SetKillSwitch's response (issue #105 PR3 completion): the
+        one kill-switch caller that is NOT already threaded through
+        Resolve-AgentEffectiveCapabilitySettings's Override object, because that resolver is
+        PR-scoped (requires a PullRequestId/CurrentSourceCommit binding) and set-kill-switch is
+        deliberately not bound to any one pull request. Returns the same raw epoch-seconds value
+        (or $null when inactive) Resolve-AgentEffectiveCapabilitySettings itself would report via
+        KillSwitchExpiresAtUtc for the identical shared sentinel state, so a caller can never
+        observe a different answer than the profile/describe path would for the same instant.
+        Caller must hold Enter-AgentCapabilityOverrideLock, exactly like every other kill-switch
+        primitive in this module.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    return (Get-AgentCapabilityOverrideKillSwitchState -RepositoryRoot $RepositoryRoot).ExpiresAtUtc
 }
 
 function Enable-AgentCapabilityOverrideKillSwitch {
@@ -5174,6 +5221,7 @@ Export-ModuleMember -Function @(
      "Test-AgentCapabilityOverrideKillSwitch",
      "Enable-AgentCapabilityOverrideKillSwitch",
      "Disable-AgentCapabilityOverrideKillSwitch",
+     "Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc",
      "Set-AgentCapabilityOverrideSetting",
     "Repair-AgentDurableState",
     "Read-AgentDurableState",
