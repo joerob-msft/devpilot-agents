@@ -1659,15 +1659,87 @@ function Get-AgentCapabilityOverrideKillSwitchDisallowedRoots {
             (Get-AgentDefaultCapabilityOverrideRoot)))
 }
 
+function Read-AgentCapabilityOverrideKillSwitchSentinel {
+    <#
+        Single-source-of-truth sentinel parser/validator shared by
+        Get-AgentCapabilityOverrideKillSwitchState (read path) and
+        Enable-AgentCapabilityOverrideKillSwitch (write path) -- issue #105 PR3 completion. Neither
+        caller re-implements its own parsing, so the two can never disagree about what makes a
+        sentinel valid.
+
+        Returns @{ Status = 'absent' | 'active' | 'expired' | 'malformed'; ExpiresAtUtc = [Nullable[long]] }:
+          - 'absent': no sentinel file exists.
+          - 'active': a well-formed, non-expired sentinel; ExpiresAtUtc is its raw epoch-seconds value.
+          - 'expired': a well-formed but expired sentinel -- ALREADY DELETED by this call (the same
+            cleanup-on-observation behavior this function has always had), so no caller ever sees a
+            stale file after this returns.
+          - 'malformed': the file exists but fails validation (unparseable JSON, a non-object body,
+            a field outside the exact allowed set, a missing/wrong schemaVersion, or a missing/
+            non-numeric enabledAtUtc/expiresAtUtc). Never deleted here -- a malformed sentinel is
+            left in place for an operator to inspect rather than silently discarded, and its very
+            existence is what makes Enable-AgentCapabilityOverrideKillSwitch fail closed with an
+            explicit error instead of guessing at a migration. A missing expiresAtUtc is
+            deliberately 'malformed', never 'active' with a null expiry -- a kill switch can never
+            be indefinitely active by omission (issue #105 PR3 review).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Path
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @{ Status = 'absent'; ExpiresAtUtc = $null } }
+    $trustedPath = Assert-AgentTrustedFile -Path $Path -AllowedRoot $Root -ExpectedPath $Path -Private
+    $stable = Read-AgentStableFile -Path $trustedPath -MaxBytes 65536
+    if (-not $stable.Exists) { return @{ Status = 'absent'; ExpiresAtUtc = $null } }
+    try {
+        $sentinel = [Text.Encoding]::UTF8.GetString($stable.Bytes) | ConvertFrom-Json -AsHashtable -Depth 5
+    }
+    catch { return @{ Status = 'malformed'; ExpiresAtUtc = $null } }
+    if ($sentinel -isnot [Collections.IDictionary]) { return @{ Status = 'malformed'; ExpiresAtUtc = $null } }
+    $allowedFields = [string[]]@('schemaVersion', 'enabledAtUtc', 'expiresAtUtc')
+    foreach ($key in @($sentinel.Keys)) {
+        if ($allowedFields -cnotcontains $key) { return @{ Status = 'malformed'; ExpiresAtUtc = $null } }
+    }
+    if (-not $sentinel.Contains('schemaVersion') -or -not $sentinel.Contains('enabledAtUtc') -or
+        -not $sentinel.Contains('expiresAtUtc')) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    $schemaVersionRaw = $sentinel['schemaVersion']
+    if (($schemaVersionRaw -isnot [double] -and $schemaVersionRaw -isnot [long] -and $schemaVersionRaw -isnot [int]) -or
+        [long][double]$schemaVersionRaw -ne 1) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    $enabledAtUtcRaw = $sentinel['enabledAtUtc']
+    $expiresAtUtcRaw = $sentinel['expiresAtUtc']
+    if ($enabledAtUtcRaw -isnot [double] -and $enabledAtUtcRaw -isnot [long] -and $enabledAtUtcRaw -isnot [int]) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    if ($expiresAtUtcRaw -isnot [double] -and $expiresAtUtcRaw -isnot [long] -and $expiresAtUtcRaw -isnot [int]) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    $expiresAtUtc = [long][double]$expiresAtUtcRaw
+    if ($expiresAtUtc -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
+        Assert-AgentPathHasNoLinks -Path $Path
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return @{ Status = 'expired'; ExpiresAtUtc = $null }
+    }
+    return @{ Status = 'active'; ExpiresAtUtc = $expiresAtUtc }
+}
+
 function Get-AgentCapabilityOverrideKillSwitchState {
     <#
-        Emergency operational lever (PR3): existence of the sentinel file alone is authoritative --
-        content is never consulted for its EXISTENCE, but the sentinel now also carries a short
-        enforced TTL (default one hour -- see Enable-AgentCapabilityOverrideKillSwitch's
-        TtlSeconds), so a forgotten "ignore local narrowing overrides" toggle can never silently
-        persist forever (issue #105 PR3 review). An expired sentinel is cleaned up (deleted) the
-        first time anything observes it past expiry, rather than left for a separate janitor to
-        find -- safe because every caller of this helper (Test-AgentCapabilityOverrideKillSwitch,
+        Emergency operational lever (PR3): existence of a VALID sentinel file is authoritative for
+        Active -- content is parsed/validated (never merely tested for existence) via the shared
+        Read-AgentCapabilityOverrideKillSwitchSentinel, which also enforces the sentinel's TTL
+        (default one hour -- see Enable-AgentCapabilityOverrideKillSwitch's TtlSeconds), so a
+        forgotten "ignore local narrowing overrides" toggle can never silently persist forever
+        (issue #105 PR3 review). A missing/invalid schemaVersion, a disallowed field, or a missing
+        TTL makes the sentinel 'malformed', which this treats as fail-closed INACTIVE -- never as
+        indefinitely active (issue #105 PR3 completion). This never throws on a malformed sentinel
+        (unlike Enable-AgentCapabilityOverrideKillSwitch's explicit rejection of the same
+        condition): describe/profile/capability resolution must keep working even with a corrupt
+        local sentinel. An expired (but well-formed) sentinel is cleaned up (deleted) the first
+        time anything observes it past expiry, rather than left for a separate janitor to find --
+        safe because every caller of this helper (Test-AgentCapabilityOverrideKillSwitch,
         Resolve-AgentEffectiveCapabilitySettings, Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc)
         is only ever invoked while the caller already holds Enter-AgentCapabilityOverrideLock,
         exactly like every writer in this module. Checked via a cheap Test-Path against the
@@ -1689,20 +1761,9 @@ function Get-AgentCapabilityOverrideKillSwitchState {
     if (-not (Test-Path -LiteralPath $default -PathType Container)) { return @{ Active = $false; ExpiresAtUtc = $null } }
     $root = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
         -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots)
-    $path = Join-Path $root 'sentinel.json'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @{ Active = $false; ExpiresAtUtc = $null } }
-    $trustedPath = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -ExpectedPath $path -Private
-    $stable = Read-AgentStableFile -Path $trustedPath -MaxBytes 65536
-    if (-not $stable.Exists) { return @{ Active = $false; ExpiresAtUtc = $null } }
-    $sentinel = [Text.Encoding]::UTF8.GetString($stable.Bytes) | ConvertFrom-Json -AsHashtable -Depth 5
-    if (-not $sentinel.Contains('expiresAtUtc')) { return @{ Active = $true; ExpiresAtUtc = $null } }
-    $expiresAtUtc = [long][double]$sentinel['expiresAtUtc']
-    if ($expiresAtUtc -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
-        Assert-AgentPathHasNoLinks -Path $path
-        Remove-Item -LiteralPath $path -Force -ErrorAction Stop
-        return @{ Active = $false; ExpiresAtUtc = $null }
-    }
-    return @{ Active = $true; ExpiresAtUtc = $expiresAtUtc }
+    $sentinel = Read-AgentCapabilityOverrideKillSwitchSentinel -Root $root -Path (Join-Path $root 'sentinel.json')
+    if ($sentinel.Status -eq 'active') { return @{ Active = $true; ExpiresAtUtc = $sentinel.ExpiresAtUtc } }
+    return @{ Active = $false; ExpiresAtUtc = $null }
 }
 
 function Test-AgentCapabilityOverrideKillSwitch {
@@ -1733,15 +1794,35 @@ function Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc {
 
 function Enable-AgentCapabilityOverrideKillSwitch {
     <#
-        Idempotent: enabling an already-enabled kill switch is a no-op, never a second write.
-        (An already-running TTL window is therefore never silently restarted/extended by a
-        redundant enable call either.)
+        Idempotent: enabling an already-active kill switch is a no-op, never a second write, and
+        never restarts/extends the already-running TTL window -- it returns that active sentinel's
+        OWN actual expiry (issue #105 PR3 completion), not a newly-computed one, so a caller can
+        never be told a fresher expiry than what is really persisted.
+
+        Reads and validates the existing sentinel under the caller-held
+        Enter-AgentCapabilityOverrideLock via the same shared
+        Read-AgentCapabilityOverrideKillSwitchSentinel Get-AgentCapabilityOverrideKillSwitchState
+        uses, before ever deciding whether to write (issue #105 PR3 completion):
+          - 'active'    -> idempotent no-op; returns the sentinel's real Active/ExpiresAtUtc.
+          - 'expired'   -> the shared reader has ALREADY removed the stale file; a fresh sentinel is
+                           written atomically, exactly as if none had existed.
+          - 'absent'    -> a fresh sentinel is written atomically.
+          - 'malformed' -> fails closed with an explicit error instead of guessing at a migration or
+                           silently overwriting -- there is no documented schema-migration rule for
+                           this sentinel (schemaVersion has only ever been 1), so an operator must
+                           resolve it (typically by deleting the bad file) rather than have this
+                           silently replace or silently honor it. A missing TTL is one of the
+                           conditions this rejects; it is never treated as "active forever".
+
         Atomic owner-private create via the same temp-write-then-replace idiom every other writer
         in this store uses (Write-AgentFileThrough + Install-AgentFileAtomic) -- no partial file is
         ever observable at the final path. Caller must hold Enter-AgentCapabilityOverrideLock.
         TtlSeconds (issue #105 PR3 review): the emergency lever is short-lived by design -- default
         one hour -- so it can never be silently left on indefinitely; see
-        Test-AgentCapabilityOverrideKillSwitch for the corresponding enforcement/cleanup.
+        Get-AgentCapabilityOverrideKillSwitchState for the corresponding enforcement/cleanup.
+
+        Returns @{ Active = $true; ExpiresAtUtc = [long] } on success (idempotent or freshly
+        written); throws [kill-switch-invalid] on a malformed pre-existing sentinel.
     #>
     param(
         [Parameter(Mandatory)][string]$RepositoryRoot,
@@ -1751,12 +1832,17 @@ function Enable-AgentCapabilityOverrideKillSwitch {
     $root = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
         -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots) -Create
     $path = Join-Path $root 'sentinel.json'
-    if (Test-Path -LiteralPath $path -PathType Leaf) { return }
+    $existing = Read-AgentCapabilityOverrideKillSwitchSentinel -Root $root -Path $path
+    if ($existing.Status -eq 'active') { return @{ Active = $true; ExpiresAtUtc = $existing.ExpiresAtUtc } }
+    if ($existing.Status -eq 'malformed') {
+        throw "[kill-switch-invalid] Existing kill-switch sentinel at '$path' failed validation (unexpected schema, disallowed field, or missing/invalid TTL); refusing to enable. Remove the file to recover."
+    }
     $enabledAtUtc = [DateTime]::UtcNow
+    $expiresAtUtcValue = ConvertTo-AgentCanonicalEpochSeconds $enabledAtUtc.AddSeconds($TtlSeconds)
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-AgentCanonicalJson ([ordered]@{
                     schemaVersion = 1
                     enabledAtUtc = (ConvertTo-AgentCanonicalEpochSeconds $enabledAtUtc)
-                    expiresAtUtc = (ConvertTo-AgentCanonicalEpochSeconds $enabledAtUtc.AddSeconds($TtlSeconds))
+                    expiresAtUtc = $expiresAtUtcValue
                 })))
     $tempPath = Join-Path $root "sentinel.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
     try {
@@ -1769,6 +1855,7 @@ function Enable-AgentCapabilityOverrideKillSwitch {
     finally {
         Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
     }
+    return @{ Active = $true; ExpiresAtUtc = $expiresAtUtcValue }
 }
 
 function Disable-AgentCapabilityOverrideKillSwitch {

@@ -739,6 +739,76 @@ Describe 'PR3 capability-override writer and kill switch' {
         Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot | Should -BeNullOrEmpty
     }
 
+    It 'enabling after the sentinel has expired removes it and writes a fresh sentinel instead of treating "a file exists" as still active' {
+        # issue #105 PR3 completion (blocker 1): Enable-AgentCapabilityOverrideKillSwitch must
+        # itself read/validate the existing sentinel rather than short-circuit on Test-Path --
+        # otherwise an expired-but-still-present file (before anything else has observed/cleaned it
+        # up) makes a redundant enable call silently return without ever refreshing the TTL.
+        $roots = New-TestRoots
+        $nowEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
+        Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot -TtlSeconds 60
+        $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+        $disallowed = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot), (Get-AgentDefaultCapabilityOverrideRoot))
+        $killSwitchRoot = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $roots.RepoRoot -DisallowedRoots $disallowed
+        $sentinelPath = Join-Path $killSwitchRoot 'sentinel.json'
+        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = ($nowEpoch - 120); expiresAtUtc = ($nowEpoch - 1) }
+
+        # The stale, expired file is still present on disk at this point -- nothing has observed it
+        # yet -- so this is exactly the "Test-Path sees a file" trap the fix must not fall into.
+        Test-Path -LiteralPath $sentinelPath -PathType Leaf | Should -BeTrue
+
+        $result = Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot -TtlSeconds 3600
+        $result.Active | Should -BeTrue
+        $result.ExpiresAtUtc | Should -BeGreaterThan $nowEpoch
+        $result.ExpiresAtUtc | Should -BeLessOrEqual ($nowEpoch + 3600)
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeTrue
+        Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot | Should -Be $result.ExpiresAtUtc
+    }
+
+    It 'enabling an already-active kill switch is idempotent and returns the real, unmodified expiry' {
+        $roots = New-TestRoots
+        $first = Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot -TtlSeconds 3600
+        Start-Sleep -Milliseconds 50
+        $second = Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot -TtlSeconds 3600
+        $second.Active | Should -BeTrue
+        $second.ExpiresAtUtc | Should -Be $first.ExpiresAtUtc
+    }
+
+    It 'a sentinel missing its TTL is never treated as indefinitely active, and Enable fails closed rather than silently replacing it' {
+        # issue #105 PR3 completion / review: "missing TTL cannot mean indefinitely active".
+        $roots = New-TestRoots
+        $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+        $disallowed = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot), (Get-AgentDefaultCapabilityOverrideRoot))
+        $killSwitchRoot = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $roots.RepoRoot -DisallowedRoots $disallowed -Create
+        $sentinelPath = Join-Path $killSwitchRoot 'sentinel.json'
+        $nowEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
+        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = $nowEpoch }
+
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+        Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot | Should -BeNullOrEmpty
+        { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
+        # The malformed file must still be there afterward -- Enable- never silently deletes or
+        # replaces it; only an operator (or a documented migration) resolves it.
+        Test-Path -LiteralPath $sentinelPath -PathType Leaf | Should -BeTrue
+    }
+
+    It 'a sentinel with a disallowed extra field or a wrong schemaVersion is rejected the same way as a missing TTL' {
+        $roots = New-TestRoots
+        $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+        $disallowed = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot), (Get-AgentDefaultCapabilityOverrideRoot))
+        $killSwitchRoot = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $roots.RepoRoot -DisallowedRoots $disallowed -Create
+        $sentinelPath = Join-Path $killSwitchRoot 'sentinel.json'
+        $nowEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
+
+        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 2; enabledAtUtc = $nowEpoch; expiresAtUtc = ($nowEpoch + 3600) }
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+        { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
+
+        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = $nowEpoch; expiresAtUtc = ($nowEpoch + 3600); extra = 'bogus' }
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+        { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
+    }
+
     It 'the kill-switch sentinel root stays disjoint from the versioned v1 override store and every sibling root' {
         $roots = New-TestRoots
         Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot

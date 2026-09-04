@@ -391,6 +391,19 @@ function booleanField(record: Record<string, unknown>, name: string): boolean {
   return value;
 }
 
+// A canonical epoch-or-ISO killSwitchExpiresAtUtc is always short; bounding it far tighter than
+// the generic MAX_PR_SNAPSHOT_TEXT_LENGTH is itself part of rejecting "arbitrary text" (issue #105
+// PR3 completion) -- 40 characters comfortably fits every legal ISO-8601 UTC rendering (including
+// fractional seconds) with room to spare.
+const MAX_KILL_SWITCH_EXPIRY_TEXT_LENGTH = 40;
+// Upper bound for an epoch-seconds killSwitchExpiresAtUtc, far tighter than
+// Number.isSafeInteger's astronomically large +-2^53 span: the sentinel's own TTL is capped at 24h
+// (see Enable-AgentCapabilityOverrideKillSwitch's ValidateRange), so a legitimate expiry is always
+// within about a day of "now". Year 2200 leaves enormous headroom for clock skew while still
+// rejecting a clearly-bogus value a malformed/hostile broker response could otherwise smuggle
+// through as merely "a safe integer".
+const MAX_KILL_SWITCH_EPOCH_SECONDS = 7_258_118_400; // 2200-01-01T00:00:00Z
+
 // PR3's killSwitchExpiresAtUtc: null is a legitimate value (the kill switch is inactive) rather
 // than a parse failure. The harness itself stores/emits this as a plain integer epoch-seconds
 // count (see ConvertTo-AgentCanonicalEpochSeconds), but every existing fixture in this codebase's
@@ -399,16 +412,24 @@ function booleanField(record: Record<string, unknown>, name: string): boolean {
 // canonical ISO-8601 string. That keeps every downstream consumer (Date.parse in app.tsx's
 // killSwitchExpiryLabel, and this field's own CapabilityProfile/CapabilitySummary/KillSwitchApplied
 // type) dealing with exactly one shape regardless of which the broker actually sent. A string
-// input is returned completely unchanged (never reformatted) so an already-canonical value still
-// round-trips byte-for-byte.
+// input must pass three independent gates -- a tight length bound, no control/non-printable
+// characters, and a value Date.parse actually accepts as a timestamp -- rejecting control
+// characters or arbitrary non-timestamp text outright rather than only softening on length. Once
+// validated it is returned completely unchanged (never reformatted) so an already-canonical value
+// still round-trips byte-for-byte; a numeric epoch has no pre-existing textual form to preserve,
+// so it is normalized to one instead.
 function nullableExpiryText(record: Record<string, unknown>, name: string): string | null {
   const value = record[name];
   if (value === null) return null;
   if (typeof value === "string") {
-    if (value.length > MAX_PR_SNAPSHOT_TEXT_LENGTH) throw new Error(`broker response ${name} is invalid`);
+    if (value.length === 0 || value.length > MAX_KILL_SWITCH_EXPIRY_TEXT_LENGTH) {
+      throw new Error(`broker response ${name} is invalid`);
+    }
+    if (/[\x00-\x1f\x7f]/.test(value)) throw new Error(`broker response ${name} is invalid`);
+    if (Number.isNaN(Date.parse(value))) throw new Error(`broker response ${name} is invalid`);
     return value;
   }
-  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= MAX_KILL_SWITCH_EPOCH_SECONDS) {
     return new Date(value * 1000).toISOString();
   }
   throw new Error(`broker response ${name} is invalid`);

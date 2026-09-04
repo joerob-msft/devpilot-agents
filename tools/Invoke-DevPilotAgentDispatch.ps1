@@ -102,11 +102,22 @@ function Write-Rejection {
 }
 
 function Get-RoleDescriptor {
+    # Exact-case role validation (issue #105 PR3 completion): this is the ONE shared lookup behind
+    # describe/profile/preview-narrowing (via Get-BrokerCapabilityProfile) and, redundantly but
+    # harmlessly, apply-narrowing/set-kill-switch's own independent -cnotin pre-checks -- so fixing
+    # it here makes all five request-facing operations reject 'Reviewer'/'REVIEWER' consistently.
+    # Plain PowerShell '-notin' and Hashtable key lookup (ContainsKey/the indexer) are BOTH
+    # case-insensitive by default, so 'Reviewer' would otherwise silently resolve to the same role
+    # as 'reviewer'. '-cnotin' rejects any non-exact-case role before $descriptor.roles is ever
+    # consulted, and filtering .Keys with '-ceq' (rather than trusting ContainsKey/the indexer,
+    # both case-insensitive on this Hashtable) is what actually retrieves the entry -- so no future
+    # change to either check alone could reintroduce the casing bypass.
     param([string]$Role)
-    if ($Role -notin @('reviewer', 'review-handler') -or -not $descriptor.roles.ContainsKey($Role)) {
+    $roleKeys = @($descriptor.roles.Keys | Where-Object { $_ -ceq $Role })
+    if ($Role -cnotin @('reviewer', 'review-handler') -or $roleKeys.Count -ne 1) {
         throw '[role-not-allowed] The requested manual role is not configured.'
     }
-    $roleDescriptor = $descriptor.roles[$Role]
+    $roleDescriptor = $descriptor.roles[$roleKeys[0]]
     if (-not [bool]$roleDescriptor.enabled) { throw '[role-not-allowed] The requested manual role is disabled.' }
     $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $Role
     $allowedCapabilities = $harnessRole.allowedManualCapabilities
@@ -696,22 +707,28 @@ function Invoke-SetKillSwitch {
         if ([string]$Request.repositoryKey -cne [string]$identity.key) { throw '[repository-mismatch] Repository key does not match the provider.' }
         $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $provider.RepositoryRoot -TimeoutMilliseconds 2000
         if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
-        $killSwitchExpiresAtUtc = $null
+        $state = $null
         try {
-            if ($enabledValue) { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $provider.RepositoryRoot }
+            if ($enabledValue) { [void](Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $provider.RepositoryRoot) }
             else { Disable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $provider.RepositoryRoot }
-            # Read back the fresh sentinel state under the SAME lock acquisition (issue #105 PR3
-            # completion) -- never a second, separately-locked read -- so this can never observe a
-            # different answer than the Enable/Disable call it just made, even if another process
-            # were racing for the lock immediately after release.
-            $killSwitchExpiresAtUtc = Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $provider.RepositoryRoot
+            # Read back the ACTUAL sentinel state under the SAME lock acquisition (issue #105 PR3
+            # completion) -- never a second, separately-locked read, and never the request's own
+            # `enabled` value -- so the response can never acknowledge a transition that did not
+            # really happen, even if another process were racing for the lock immediately after
+            # release. Enable-/Disable- either succeed (leaving the state consistent with the
+            # requested transition) or throw (e.g. a malformed pre-existing sentinel), so this read
+            # is the one place that turns "the write call didn't throw" into a verified fact.
+            $state = Get-AgentCapabilityOverrideKillSwitchState -RepositoryRoot $provider.RepositoryRoot
         }
         finally {
             Exit-AgentLock $capabilityLock.Stream
         }
+        if ($state.Active -ne $enabledValue) {
+            throw "[kill-switch-transition-failed] Requested enabled=$enabledValue but the kill switch is actually $([bool]$state.Active)."
+        }
         Write-DispatchProtocolMessage @{
             schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'kill-switch-applied'
-            role = $role; enabled = [bool]$enabledValue; killSwitchExpiresAtUtc = $killSwitchExpiresAtUtc
+            role = $role; enabled = [bool]$state.Active; killSwitchExpiresAtUtc = $state.ExpiresAtUtc
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }

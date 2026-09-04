@@ -678,6 +678,11 @@ export function App(props: AppProps) {
   // "confirm-final" is the terse final gate that actually arms the 'y' toggle.
   const [killSwitchStage, setKillSwitchStage] = createSignal<"none" | "confirm" | "confirm-final">("none");
   let narrowingGeneration = 0;
+  // Kill-switch generation token (issue #105 PR3 completion), mirroring narrowingGeneration/
+  // settingsGeneration exactly: bumped by closeSettings and by a role switch (Tab), so a
+  // setKillSwitch() response that resolves after Settings was closed or re-roled can never
+  // mutate settingsStatus or trigger a refresh for a view the operator is no longer looking at.
+  let killSwitchGeneration = 0;
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let localBrokerShutdown: Promise<void> | undefined;
   // Settings refresh/toggle race guard: every refreshSettingsProfile() call is stamped with a
@@ -698,6 +703,12 @@ export function App(props: AppProps) {
   // success/error paths, and force-cleared by closeSettings so a queued intent can never fire late
   // into a closed/different view.
   let pendingNarrowingEditorGeneration: number | undefined;
+  // Kill-switch open queueing (issue #105 PR3 completion), mirroring
+  // pendingNarrowingEditorGeneration/tryOpenNarrowingEditor exactly: set to the settingsGeneration
+  // token of the in-flight profile load 'k' is waiting on, or undefined when no open is queued.
+  // Consumed (and cleared) by refreshSettingsProfile's success/error paths, and force-cleared by
+  // closeSettings so a queued intent can never fire late into a closed/different view.
+  let pendingKillSwitchGeneration: number | undefined;
   // Renders only when the resolved profile's own role still matches the currently displayed role
   // label, independent of the request-token guard above -- a second, cheap line of defense so a
   // mislabeled profile can never reach the screen even if the guard above is ever weakened (e.g. a
@@ -917,6 +928,13 @@ export function App(props: AppProps) {
         pendingNarrowingEditorGeneration = undefined;
         tryOpenNarrowingEditor(profile);
       }
+      // Kill-switch open queueing (issue #105 PR3 completion): mirrors the narrowing-editor queue
+      // immediately above -- 'k' pressed before a current, matching profile had ever loaded defers
+      // here instead of racing ahead on an unknown editingAvailable/killSwitchActive state.
+      if (pendingKillSwitchGeneration === requestId) {
+        pendingKillSwitchGeneration = undefined;
+        tryOpenKillSwitchConfirm(profile);
+      }
     } catch (error) {
       if (requestId !== settingsGeneration) return;
       setSettingsProfile(null);
@@ -924,6 +942,7 @@ export function App(props: AppProps) {
         ? `Unavailable: ${dispatchResultDetail(error.code, error.detail)}`
         : `Unavailable: broker failure resolving effective profile (${error instanceof Error ? error.message : String(error)}).`);
       if (pendingNarrowingEditorGeneration === requestId) pendingNarrowingEditorGeneration = undefined;
+      if (pendingKillSwitchGeneration === requestId) pendingKillSwitchGeneration = undefined;
     } finally {
       if (requestId === settingsGeneration) settingsRefreshPending = false;
     }
@@ -946,12 +965,16 @@ export function App(props: AppProps) {
     settingsRefreshPending = false;
     // A queued palette-triggered editor open must never fire late into a closed/different view.
     pendingNarrowingEditorGeneration = undefined;
+    pendingKillSwitchGeneration = undefined;
     setSettingsProfile(null);
     setSettingsStatus("");
     narrowingGeneration += 1;
     setNarrowingMode(null);
     setNarrowingPreview(null);
     setNarrowingStatus("");
+    // Invalidates any in-flight toggleKillSwitch() the same way narrowingGeneration invalidates an
+    // in-flight narrowing mutation -- see toggleKillSwitch's own requestId guard.
+    killSwitchGeneration += 1;
     setKillSwitchStage("none");
     notify("Effective profile settings closed");
   }
@@ -990,6 +1013,24 @@ export function App(props: AppProps) {
     setNarrowingStatus("");
     setNarrowingMode("browsing");
     notify("Narrowing editor opened");
+    return true;
+  }
+
+  // Shared gate for actually beginning the kill-switch confirm flow, given an already-resolved,
+  // current-role-matching profile (issue #105 PR3 completion) -- mirrors tryOpenNarrowingEditor
+  // exactly: used both when a profile is already loaded (immediate open) and when a queued 'k'
+  // press (see pendingKillSwitchGeneration) resolves. Never invoked with a stale/superseded/absent
+  // profile -- callers only reach this once their own generation guard has already confirmed the
+  // profile is current, so editingAvailable is always a real, known value here, never defaulted.
+  function tryOpenKillSwitchConfirm(profile: CapabilityProfile): boolean {
+    if (!profile.editingAvailable) {
+      // Legacy broker (issue #105 PR3 review): the kill switch was introduced in the same release
+      // as narrowing, so a broker too old to report editingAvailable=true cannot support it either
+      // -- stays read-only/upgrade-required, exactly like the narrowing editor.
+      setSettingsStatus("Unavailable: broker does not support capability narrowing (upgrade required).");
+      return false;
+    }
+    setKillSwitchStage("confirm");
     return true;
   }
 
@@ -1127,27 +1168,45 @@ export function App(props: AppProps) {
     const expiresAtMs = Date.parse(profile.killSwitchExpiresAtUtc);
     if (Number.isNaN(expiresAtMs)) return "";
     const remainingMinutes = Math.max(0, Math.ceil((expiresAtMs - now()) / 60_000));
-    return ` (expires in ${remainingMinutes}m, ${profile.killSwitchExpiresAtUtc})`;
+    // Bounded like every other broker-supplied string rendered in this overlay (issue #105 PR3
+    // completion) -- dispatch.ts's parser already validates/bounds this value at the wire
+    // boundary, but rendering it through line() too means no single field's parser is ever the
+    // only thing standing between a malformed value and unbounded terminal output.
+    return ` (expires in ${remainingMinutes}m, ${line(profile.killSwitchExpiresAtUtc, 40)})`;
   }
 
   async function toggleKillSwitch(): Promise<void> {
     const entry = historyCurrent();
-    if (!props.broker || !entry) return;
+    const profile = settingsDisplayProfile();
+    // Never default an unknown current state to "off" (issue #105 PR3 completion): the prior
+    // `?? false` fallback meant a momentarily-null/stale profile always computed nextEnabled as
+    // "turn ON", even if the switch were actually already active. tryOpenKillSwitchConfirm never
+    // enters "confirm" without a current, loaded profile, and nothing between then and 'y' can
+    // invalidate it without also resetting killSwitchStage to "none" (see setSettingsRole/
+    // closeSettings) -- so a null profile here means that invariant broke; abort rather than guess.
+    if (!props.broker || !entry || !profile) {
+      setKillSwitchStage("none");
+      return;
+    }
     setKillSwitchStage("none");
-    const nextEnabled = !(settingsDisplayProfile()?.killSwitchActive ?? false);
+    const nextEnabled = !profile.killSwitchActive;
+    const role = settingsRole();
+    const requestId = (killSwitchGeneration += 1);
     setSettingsStatus(nextEnabled
       ? "Enabling emergency lever: ignore local narrowing overrides..."
       : "Disabling emergency lever: ignore local narrowing overrides...");
     try {
-      await props.broker.setKillSwitch(entry.repositoryIdentity.key, settingsRole(), nextEnabled);
+      await props.broker.setKillSwitch(entry.repositoryIdentity.key, role, nextEnabled);
+      if (requestId !== killSwitchGeneration) return; // superseded: Settings closed/re-roled meanwhile
       setSettingsStatus(nextEnabled
         ? "Ignore local narrowing overrides is now ON: persisted narrowing is ignored until the next launch."
         : "Ignore local narrowing overrides is now OFF: persisted narrowing applies again.");
       // Silent (issue #105 PR3 review): mirrors previewNarrowing()/applyNarrowingEdit()'s own
       // internal refresh -- a non-silent refresh would immediately overwrite the confirmation
       // message just set above with "Resolving effective profile..." before it was ever visible.
-      void refreshSettingsProfile(settingsRole(), { silent: true });
+      void refreshSettingsProfile(role, { silent: true });
     } catch (error) {
+      if (requestId !== killSwitchGeneration) return;
       setSettingsStatus(error instanceof BrokerRejectionError
         ? dispatchResultDetail(error.code, error.detail)
         : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
@@ -1533,6 +1592,11 @@ export function App(props: AppProps) {
         if (settingsRefreshPending) return;
         const nextRole: AgentRole = settingsRole() === "reviewer" ? "review-handler" : "reviewer";
         setSettingsRole(nextRole);
+        // A role switch mid-flight invalidates any toggleKillSwitch() awaiting a response for the
+        // OLD role (issue #105 PR3 completion): killSwitchStage is already reset to "none" by the
+        // time 'y' is pressed (see toggleKillSwitch), so Tab can otherwise land here while that
+        // await is still outstanding -- see toggleKillSwitch's own requestId guard.
+        killSwitchGeneration += 1;
         void refreshSettingsProfile(nextRole);
       } else if (key.name === "r") {
         if (settingsRefreshPending) return;
@@ -1540,14 +1604,26 @@ export function App(props: AppProps) {
       } else if (key.name === "e") {
         openNarrowingEditor();
       } else if (key.name === "k") {
+        // Never begin the kill-switch flow on an unknown state (issue #105 PR3 completion): the
+        // previous version fell through to setKillSwitchStage("confirm") whenever `loaded` was
+        // null (no profile yet, or a request outstanding) -- i.e. it defaulted an UNKNOWN
+        // editingAvailable/killSwitchActive to "proceed" rather than never assuming false OR true
+        // for an unresolved value. This mirrors openNarrowingEditor's own gating exactly: open
+        // immediately against an already-loaded, current profile; otherwise queue the intent
+        // against refreshSettingsProfile's generation token (fires once that load resolves) rather
+        // than racing ahead of it or silently dropping the keypress.
         if (!props.broker) {
           setSettingsStatus("Observe-only: trusted manual broker is unavailable");
         } else {
           const loaded = settingsDisplayProfile();
-          if (loaded && !loaded.editingAvailable) {
-            setSettingsStatus("Unavailable: broker does not support capability narrowing (upgrade required).");
+          if (loaded) {
+            tryOpenKillSwitchConfirm(loaded);
+          } else if (!historyCurrent()) {
+            setSettingsStatus("Unavailable: select a retained PR history row to resolve a next-launch profile.");
           } else {
-            setKillSwitchStage("confirm");
+            if (!settingsRefreshPending) void refreshSettingsProfile(settingsRole());
+            pendingKillSwitchGeneration = settingsGeneration;
+            setSettingsStatus("Kill switch will open once the effective profile finishes loading.");
           }
         }
       }
@@ -1866,18 +1942,36 @@ export function App(props: AppProps) {
                 <>
                   <text height={1} fg={COLORS.accent}>{profile().repositoryIdentity.slug} / PR #{profile().prSnapshot.pullRequestId}</text>
                   <text height={1} fg={profile().killSwitchActive ? COLORS.error : COLORS.muted}>
-                    Ignore local narrowing overrides: {profile().killSwitchActive
-                      ? `ON (emergency lever, not a security lockdown)${killSwitchExpiryLabel(profile())}`
-                      : "off"}
+                    Ignore local narrowing overrides: {!profile().editingAvailable
+                      ? "unavailable (upgrade required)"
+                      : profile().killSwitchActive
+                        ? `ON (emergency lever, not a security lockdown)${killSwitchExpiryLabel(profile())}`
+                        : "off"}
                   </text>
-                  <text height={1} fg={COLORS.ok}>Allowed manual ceiling: {line(profile().allowedManualCapabilities.join(", ") || "none", 110)}</text>
                   <text height={1} fg={COLORS.ok}>Enabled for this launch: {line(profile().capabilities.join(", ") || "none", 110)}</text>
                   <text height={1} fg={COLORS.warning}>Denied (mandatory): {line(profile().mandatoryDenies.join(", ") || "none", 110)}</text>
-                  <text height={1} fg={COLORS.error}>Absolute denies (never grantable, locked): {line(profile().absoluteDenies.join(", ") || "none", 110)}</text>
-                  <text height={1} fg={COLORS.muted}>Delegable available (widening, locked here): {line(profile().delegableAvailable.join(", ") || "none in this release", 110)}</text>
-                  <text height={1} fg={COLORS.muted}>
-                    Provenance: {line(Object.entries(profile().provenance).map(([name, source]) => `${name}=${source}`).join(", ") || "none", 170)}
-                  </text>
+                  {/* Legacy-broker fallback (issue #105 PR3 completion): allowedManualCapabilities/
+                      absoluteDenies/delegableAvailable/provenance are all optional-defaulted to
+                      empty on a pre-narrowing broker (dispatch.ts's parseCapabilityProfileFields),
+                      the same signal editingAvailable itself is computed from. Rendering those
+                      defaults as "none"/"none in this release" would fabricate a locked-down,
+                      fully-resolved profile the broker never actually reported -- so a legacy
+                      broker gets one explicit "unavailable" line instead of four fabricated ones. */}
+                  <Show
+                    when={profile().editingAvailable}
+                    fallback={
+                      <text height={1} fg={COLORS.warning}>
+                        Allowed manual ceiling / absolute denies / delegable available / provenance: unavailable (broker predates capability narrowing; upgrade required).
+                      </text>
+                    }
+                  >
+                    <text height={1} fg={COLORS.ok}>Allowed manual ceiling: {line(profile().allowedManualCapabilities.join(", ") || "none", 110)}</text>
+                    <text height={1} fg={COLORS.error}>Absolute denies (never grantable, locked): {line(profile().absoluteDenies.join(", ") || "none", 110)}</text>
+                    <text height={1} fg={COLORS.muted}>Delegable available (widening, locked here): {line(profile().delegableAvailable.join(", ") || "none in this release", 110)}</text>
+                    <text height={1} fg={COLORS.muted}>
+                      Provenance: {line(Object.entries(profile().provenance).map(([name, source]) => `${name}=${source}`).join(", ") || "none", 170)}
+                    </text>
+                  </Show>
                 </>
               )}
             </Show>

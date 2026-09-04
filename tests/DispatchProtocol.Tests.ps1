@@ -568,13 +568,16 @@ Describe 'dispatch protocol primitives' {
         $describeBody | Should -Match 'role = \$role'
     }
 
-    It 'emits killSwitchExpiresAtUtc on describe, profile, and set-kill-switch responses' {
+    It 'emits killSwitchExpiresAtUtc on describe, profile, and set-kill-switch responses, and set-kill-switch verifies the actual read-back state' {
         # Protocol-shape coverage (issue #105 PR3 completion): describe/profile must surface the
         # same Override.KillSwitchExpiresAtUtc Resolve-AgentEffectiveCapabilitySettings now returns
         # alongside KillSwitchActive, and set-kill-switch (which has no PR-scoped Override object to
-        # read from) must read it back via the dedicated
-        # Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc accessor under the same lock it already
-        # holds for Enable-/Disable-AgentCapabilityOverrideKillSwitch.
+        # read from) must read back the actual sentinel state via
+        # Get-AgentCapabilityOverrideKillSwitchState under the same lock it already holds for
+        # Enable-/Disable-AgentCapabilityOverrideKillSwitch -- and emit ITS Active/ExpiresAtUtc,
+        # never the request's own `enabled` value, after verifying the requested transition
+        # actually happened (issue #105 PR3 completion: never acknowledge enabled=true when
+        # inactive).
         $source = Get-Content -LiteralPath $brokerPath -Raw
 
         $profileBody = [regex]::Match($source, '(?s)function Invoke-Profile \{.*?\n\}').Value
@@ -585,9 +588,13 @@ Describe 'dispatch protocol primitives' {
 
         $setKillSwitchBody = [regex]::Match($source, '(?s)function Invoke-SetKillSwitch \{.*?\n\}').Value
         $setKillSwitchBody | Should -Not -BeNullOrEmpty
-        $setKillSwitchBody | Should -Match 'Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc'
+        $setKillSwitchBody | Should -Match 'Get-AgentCapabilityOverrideKillSwitchState'
         $setKillSwitchBody | Should -Match "operation = 'kill-switch-applied'"
-        $setKillSwitchBody | Should -Match 'killSwitchExpiresAtUtc\s*=\s*\$killSwitchExpiresAtUtc'
+        $setKillSwitchBody | Should -Match 'killSwitchExpiresAtUtc\s*=\s*\$state\.ExpiresAtUtc'
+        # Verified read-back, never the raw request value (issue #105 PR3 completion).
+        $setKillSwitchBody | Should -Match 'enabled\s*=\s*\[bool\]\$state\.Active'
+        $setKillSwitchBody | Should -Not -Match 'enabled\s*=\s*\[bool\]\$enabledValue'
+        $setKillSwitchBody | Should -Match '\$state\.Active -ne \$enabledValue'
     }
 
     It 'keeps the read-only profile operation side-effect-free across repeated calls' {
@@ -671,6 +678,126 @@ Describe 'dispatch protocol primitives' {
             if (-not $process.HasExited) { $process.Kill($true); [void]$process.WaitForExit(5000) }
             $process.Dispose()
         }
+    }
+
+    It 'rejects case-variant roles (Reviewer, REVIEWER) consistently across describe, profile, preview-narrowing, and set-kill-switch' {
+        # issue #105 PR3 completion (blocker 3): Get-RoleDescriptor is the single shared lookup
+        # behind describe/profile/preview-narrowing (via Get-BrokerCapabilityProfile) -- plain
+        # PowerShell '-notin'/Hashtable key lookup are both case-insensitive by default, so this
+        # proves the fix holds at the real wire boundary for every operation reachable at the
+        # protocol level without first minting a genuine previewToken (apply-narrowing's own
+        # independent '-cnotin' role guard, which runs before Get-RoleDescriptor and requires a
+        # real preview-narrowing round trip first, is instead asserted by source inspection in the
+        # next test). set-kill-switch keeps its own pre-existing '-cnotin' guard (added as a
+        # stopgap before this fix existed) and so still rejects with 'narrowing-invalid' rather
+        # than 'role-not-allowed' -- both are correct rejections; the point proven here is that
+        # none of the five operations ever resolves 'Reviewer'/'REVIEWER' to the real 'reviewer'
+        # role.
+        $repositoryRoot = (Resolve-Path "$PSScriptRoot\..").Path
+        $suiteRoot = Join-Path $TestDrive 'broker-role-casing-integration'
+        $stateRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'watch') `
+            -Kind watch-state -RepositoryRoot $repositoryRoot -Create
+        $durableRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'durable') `
+            -Kind durable-state -RepositoryRoot $repositoryRoot -DisallowedRoots @($stateRoot) -Create
+        $leaseRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'leases') `
+            -Kind lease -RepositoryRoot $repositoryRoot -DisallowedRoots @($stateRoot, $durableRoot) -Create
+        $descriptorPath = Join-Path $stateRoot 'broker.descriptor.v1.json'
+        @{
+            schemaVersion = 1
+            ownerProcessId = $PID
+            stateRoot = $stateRoot
+            durableStateRoot = $durableRoot
+            leaseRoot = $leaseRoot
+            operatorAlias = 'integration-test'
+            roles = @{}
+        } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $descriptorPath -Encoding utf8NoBOM
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($descriptorPath,
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        [void](Assert-AgentTrustedFile -Path $descriptorPath -AllowedRoot $stateRoot `
+            -ExpectedPath $descriptorPath -Private)
+
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = Resolve-AgentPwshPath
+        foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File',
+                $brokerPath, '-DescriptorPath', $descriptorPath)) {
+            [void]$startInfo.ArgumentList.Add($argument)
+        }
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+        try {
+            $expectedCode = [ordered]@{
+                'describe' = 'role-not-allowed'
+                'profile' = 'role-not-allowed'
+                'preview-narrowing' = 'role-not-allowed'
+                'set-kill-switch' = 'narrowing-invalid'
+            }
+            foreach ($caseVariant in @('Reviewer', 'REVIEWER')) {
+                foreach ($operation in @('describe', 'profile', 'preview-narrowing', 'set-kill-switch')) {
+                    $requestId = [Guid]::NewGuid().ToString('D')
+                    $body = [ordered]@{
+                        schemaVersion = 1; requestId = $requestId; operation = $operation
+                        role = $caseVariant; repositoryKey = 'v1:github:1'
+                    }
+                    if ($operation -ne 'set-kill-switch') { $body['pullRequestId'] = 1 }
+                    if ($operation -eq 'preview-narrowing') {
+                        $body['scope'] = 'user'; $body['capability'] = 'EnableSummaryComment'; $body['action'] = 'off'
+                    }
+                    if ($operation -eq 'set-kill-switch') { $body['enabled'] = $true }
+                    $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson $body))
+                    $task = $process.StandardOutput.ReadLineAsync()
+                    $task.Wait(10000) | Should -BeTrue -Because "the broker must process $operation/$caseVariant while stdin remains open"
+                    $response = $task.Result | ConvertFrom-Json -AsHashtable
+                    $response.requestId | Should -BeExactly $requestId
+                    $response.operation | Should -BeExactly 'rejected'
+                    $response.code | Should -BeExactly $expectedCode[$operation] -Because "$operation must reject role '$caseVariant'"
+                }
+            }
+            Test-Path (Join-Path $stateRoot 'manual-dispatch') | Should -BeFalse
+
+            $shutdownId = [Guid]::NewGuid().ToString('D')
+            $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{
+                        schemaVersion = 1; requestId = $shutdownId; operation = 'shutdown'
+                    }))
+            $shutdownResponseTask = $process.StandardOutput.ReadLineAsync()
+            $shutdownResponseTask.Wait(10000) | Should -BeTrue `
+                -Because 'the broker must process the next request while stdin remains open'
+            $shutdownResponse = $shutdownResponseTask.Result | ConvertFrom-Json -AsHashtable
+            $shutdownResponse.requestId | Should -BeExactly $shutdownId
+            $shutdownResponse.operation | Should -BeExactly 'shutdown-complete'
+
+            $process.StandardInput.Close()
+            $process.WaitForExit(15000) | Should -BeTrue
+            $stderr = $process.StandardError.ReadToEnd()
+            $process.ExitCode | Should -Be 0 -Because $stderr
+        }
+        finally {
+            if (-not $process.HasExited) { $process.Kill($true); [void]$process.WaitForExit(5000) }
+            $process.Dispose()
+        }
+    }
+
+    It 'Get-RoleDescriptor performs an exact-case role check and case-sensitive retrieval; apply-narrowing and set-kill-switch each keep their own independent case-sensitive role guard' {
+        $source = Get-Content -LiteralPath $brokerPath -Raw
+        $roleDescriptorBody = [regex]::Match($source, '(?s)function Get-RoleDescriptor \{.*?\n\}').Value
+        $roleDescriptorBody | Should -Not -BeNullOrEmpty
+        $roleDescriptorBody | Should -Match '\$Role -cnotin @\(''reviewer'', ''review-handler''\)'
+        $roleDescriptorBody | Should -Not -Match '\$Role -notin '
+        $roleDescriptorBody | Should -Match '-ceq \$Role'
+
+        $applyBody = [regex]::Match($source, '(?s)function Invoke-ApplyNarrowing \{.*?\n\}').Value
+        $applyBody | Should -Not -BeNullOrEmpty
+        $applyBody | Should -Match '\$role -cnotin @\(''reviewer'', ''review-handler''\)'
+
+        $setKillSwitchBody = [regex]::Match($source, '(?s)function Invoke-SetKillSwitch \{.*?\n\}').Value
+        $setKillSwitchBody | Should -Not -BeNullOrEmpty
+        $setKillSwitchBody | Should -Match '\$role -cnotin @\(''reviewer'', ''review-handler''\)'
     }
 
     It 'cleans guardian files before child registration on Unix' -Skip:$IsWindows {
