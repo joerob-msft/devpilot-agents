@@ -97,8 +97,73 @@ Describe 'dispatch protocol primitives' {
     It 'keeps manual policy independent and makes Reviewer vote impossible' {
         $source = Get-Content -LiteralPath $watchPath -Raw
         $source | Should -Match 'EnableManualReviewer'
-        $source | Should -Match "mandatoryDenies = @\('EnableApprovalVote'\)"
+        $source | Should -Match 'mandatoryDenies = @\(\$reviewerCapabilityDescriptor\.delegableDefaultOff\)'
         $source | Should -Not -Match "manualRoles\.reviewer.+EnableApprovalVote"
+        $source | Should -Not -Match "'EnableApprovalVote'"
+        (Get-AgentHarnessCapabilityDescriptor -Role reviewer).delegableDefaultOff | Should -BeExactly 'EnableApprovalVote'
+    }
+
+    It 'exports a single-source, grant-free capability descriptor with exact golden values' {
+        Get-Command Get-AgentHarnessCapabilityDescriptor -Module DevPilot.AgentHarness |
+            Should -Not -BeNullOrEmpty
+        $reviewer = Get-AgentHarnessCapabilityDescriptor -Role reviewer
+        $reviewer.operationalTiers.base | Should -BeExactly @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment')
+        $reviewer.operationalTiers.Contains('codeUpdate') | Should -BeFalse
+        $reviewer.delegableDefaultOff | Should -BeExactly 'EnableApprovalVote'
+        (@($reviewer.allowedManualCapabilities | Sort-Object)) |
+            Should -BeExactly (@('EnableFindingComments', 'EnableSummaryComment', 'EnableThreadReplies') | Sort-Object)
+        $reviewer.absoluteDenies | Should -BeExactly @()
+
+        $handler = Get-AgentHarnessCapabilityDescriptor -Role review-handler
+        $handler.operationalTiers.base | Should -BeExactly @('EnableThreadReplies', 'EnableBuddyRequeue')
+        $handler.operationalTiers.codeUpdate | Should -BeExactly @('EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession')
+        $handler.delegableDefaultOff | Should -BeExactly 'EnableAutoComplete'
+        (@($handler.allowedManualCapabilities | Sort-Object)) |
+            Should -BeExactly (@('EnableThreadReplies', 'EnableBuddyRequeue', 'EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession') | Sort-Object)
+        $handler.absoluteDenies | Should -BeExactly @()
+
+        # Disjointness: the default-off delegable capability is never part of either role's
+        # always-on manual ceiling, and absoluteDenies (empty in PR1) never overlaps it either.
+        $reviewer.allowedManualCapabilities | Should -Not -Contain $reviewer.delegableDefaultOff
+        $handler.allowedManualCapabilities | Should -Not -Contain $handler.delegableDefaultOff
+        @($reviewer.absoluteDenies | Where-Object { $reviewer.allowedManualCapabilities -contains $_ }) | Should -BeNullOrEmpty
+        @($handler.absoluteDenies | Where-Object { $handler.allowedManualCapabilities -contains $_ }) | Should -BeNullOrEmpty
+    }
+
+    It 'returns a fresh, independently-mutable projection on every call' {
+        $first = Get-AgentHarnessCapabilityDescriptor -Role review-handler
+        $first.operationalTiers.base += 'Injected'
+        $first.allowedManualCapabilities += 'Injected'
+        $second = Get-AgentHarnessCapabilityDescriptor -Role review-handler
+        $second.operationalTiers.base | Should -Not -Contain 'Injected'
+        $second.allowedManualCapabilities | Should -Not -Contain 'Injected'
+        $second.operationalTiers.base | Should -BeExactly @('EnableThreadReplies', 'EnableBuddyRequeue')
+    }
+
+    It 'keeps capability literals declared in exactly one place (the harness descriptor)' {
+        $literals = @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment', 'EnableApprovalVote',
+            'EnableBuddyRequeue', 'EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession', 'EnableAutoComplete')
+        $watchSource = Get-Content -LiteralPath $watchPath -Raw
+        foreach ($literal in $literals) {
+            $watchSource | Should -Not -Match "'$literal'"
+        }
+        $brokerSource = Get-Content -LiteralPath $brokerPath -Raw
+        $roleDescriptorBody = [regex]::Match($brokerSource, '(?s)function Get-RoleDescriptor \{.*?\n\}').Value
+        $roleDescriptorBody | Should -Not -BeNullOrEmpty
+        foreach ($literal in $literals) {
+            $roleDescriptorBody | Should -Not -Match "'$literal'"
+        }
+        $harnessSource = Get-Content -LiteralPath "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psm1" -Raw
+        $startupBody = [regex]::Match($harnessSource, '(?s)function Enter-AgentManualDispatchStartup \{.*?\r?\n\}').Value
+        $startupBody | Should -Not -BeNullOrEmpty
+        foreach ($literal in $literals) {
+            $startupBody | Should -Not -Match "'$literal'"
+        }
+        $descriptorBody = [regex]::Match($harnessSource, '(?s)function Get-AgentHarnessCapabilityDescriptor \{.*?\r?\n\}').Value
+        $descriptorBody | Should -Not -BeNullOrEmpty
+        foreach ($literal in $literals) {
+            $descriptorBody | Should -Match "'$literal'"
+        }
     }
 
     It 'launches only immutable digest-bound capabilities and rejects deny overlap' {

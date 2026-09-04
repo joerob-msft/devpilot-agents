@@ -68,6 +68,46 @@ function Get-AgentDefaultModelSentinel {
     return $script:AgentHarnessDefaultModelSentinel
 }
 
+# ---------------------------------------------------------------------------
+# Single source of truth for per-role manual capability ceilings (NOT config-
+# supplied - this is the one place these literal capability names may be
+# declared). Watch-DevPilotAgents.ps1, the broker's Get-RoleDescriptor, and
+# Enter-AgentManualDispatchStartup all read this instead of keeping their own
+# copy, so the three call sites can never independently drift. Pure and
+# grant-free: no per-draft, per-grant, or persisted-override concept lives
+# here (that is PR2+ scope). Every array is a fresh literal built on each
+# call, so callers can freely mutate their own copy of the result without
+# affecting any other caller or a later call.
+# ---------------------------------------------------------------------------
+function Get-AgentHarnessCapabilityDescriptor {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role
+    )
+    $operationalTiers = if ($Role -eq 'reviewer') {
+        [ordered]@{
+            base = @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment')
+        }
+    }
+    else {
+        [ordered]@{
+            base       = @('EnableThreadReplies', 'EnableBuddyRequeue')
+            codeUpdate = @('EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession')
+        }
+    }
+    $delegableDefaultOff = if ($Role -eq 'reviewer') { 'EnableApprovalVote' } else { 'EnableAutoComplete' }
+    $allowedManualCapabilities = @($operationalTiers.Values | ForEach-Object { $_ } | Sort-Object -Unique)
+    return [ordered]@{
+        schemaVersion             = 1
+        role                      = $Role
+        operationalTiers          = $operationalTiers
+        delegableDefaultOff       = $delegableDefaultOff
+        allowedManualCapabilities = $allowedManualCapabilities
+        # Pinned empty in PR1: no absolute-deny source exists yet (PR2+ kill switch/policy scope).
+        absoluteDenies            = @()
+    }
+}
+
 function Assert-AgentSupportedModel {
     param(
         [Parameter(Mandatory)][string]$ModelId,
@@ -1033,14 +1073,12 @@ function Enter-AgentManualDispatchStartup {
         $policyIdentity['verifiedAtUtc'] =
             $policyIdentity['verifiedAtUtc'].ToUniversalTime().ToString('o')
     }
-    $requiredDeny = if ($Role -eq 'reviewer') { 'EnableApprovalVote' } else { 'EnableAutoComplete' }
-    $allowedCapabilities = if ($Role -eq 'reviewer') {
-        @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment')
-    }
-    else {
-        @('EnableThreadReplies', 'EnableBuddyRequeue', 'EnableCodeChanges', 'EnablePush',
-            'LocalValidation', 'ResumeCodingSession')
-    }
+    # Same module, no cross-module import needed: the child re-derives its own ceiling from the
+    # identical checked-in descriptor the broker's Get-RoleDescriptor also reads (single source of
+    # truth), rather than trusting anything the broker sent over the wire (ANT-2).
+    $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $Role
+    $requiredDeny = $harnessRole.delegableDefaultOff
+    $allowedCapabilities = $harnessRole.allowedManualCapabilities
     $capabilities = @($manifest.policy.capabilities)
     $mandatoryDenies = @($manifest.policy.mandatoryDenies)
     $boundNames = @($BoundCapabilities.Keys)
@@ -4200,6 +4238,7 @@ Export-ModuleMember -Function @(
     "Resolve-AgentRepositoryRoot",
     "Get-AgentSupportedModels",
     "Get-AgentSessionIsolationEnvVars",
+    "Get-AgentHarnessCapabilityDescriptor",
     "Get-AgentWorkIqTargetUrl",
     "Get-AgentMissingMcpServers",
     "Get-AgentLaunchFailureReason",

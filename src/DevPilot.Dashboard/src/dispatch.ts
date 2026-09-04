@@ -23,6 +23,9 @@ export interface PullRequestSnapshotV1 {
   title: string;
 }
 
+export const KNOWN_PROVENANCE = ["operational-default"] as const;
+export type CapabilityProvenance = (typeof KNOWN_PROVENANCE)[number];
+
 export interface CapabilitySummary {
   schemaVersion: 1;
   requestId: string;
@@ -36,6 +39,12 @@ export interface CapabilitySummary {
   capabilities: string[];
   mandatoryDenies: string[];
   dynamicConstraints: string[];
+  // Additive PR1 profile fields -- see Get-AgentHarnessCapabilityDescriptor. delegableAvailable is
+  // always empty in this release: no delegation/widening policy exists yet (PR2+ scope).
+  absoluteDenies: string[];
+  allowedManualCapabilities: string[];
+  delegableAvailable: string[];
+  provenance: Record<string, CapabilityProvenance>;
 }
 
 export interface DispatchAccepted {
@@ -121,6 +130,49 @@ function stringField(record: Record<string, unknown>, name: string): string {
   return value;
 }
 
+function stringArrayField(record: Record<string, unknown>, name: string): string[] {
+  const value = record[name];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  return value as string[];
+}
+
+function provenanceField(record: Record<string, unknown>, name: string): Record<string, CapabilityProvenance> {
+  const value = record[name];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  const result: Record<string, CapabilityProvenance> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry !== "string" || !(KNOWN_PROVENANCE as readonly string[]).includes(entry)) {
+      throw new Error(`broker response ${name}.${key} is invalid`);
+    }
+    result[key] = entry as CapabilityProvenance;
+  }
+  return result;
+}
+
+// Constructs the PR1 additive profile fields from validated values only -- never spread/cast
+// straight from the untrusted parsed record, unlike the rest of parseResponse's envelope fields.
+function parseCapabilityProfileFields(record: Record<string, unknown>): Pick<
+  CapabilitySummary,
+  "absoluteDenies" | "allowedManualCapabilities" | "delegableAvailable" | "provenance"
+> {
+  const delegableAvailable = stringArrayField(record, "delegableAvailable");
+  if (delegableAvailable.length > 0) {
+    // No delegation/widening policy exists yet in this release (PR2+ scope) -- a non-empty value
+    // here would mean the broker is claiming a capability policy that cannot exist in PR1.
+    throw new Error("broker response delegableAvailable must be empty");
+  }
+  return {
+    absoluteDenies: stringArrayField(record, "absoluteDenies"),
+    allowedManualCapabilities: stringArrayField(record, "allowedManualCapabilities"),
+    delegableAvailable,
+    provenance: provenanceField(record, "provenance"),
+  };
+}
+
 function parseResponse(line: string): BrokerResponse {
   const record = asRecord(JSON.parse(line));
   if (record.schemaVersion !== 1) throw new Error("unsupported broker protocol version");
@@ -128,6 +180,9 @@ function parseResponse(line: string): BrokerResponse {
   const operation = stringField(record, "operation");
   if (!["capability-summary", "accepted", "rejected", "completed", "cancelled", "shutdown-complete"].includes(operation)) {
     throw new Error("unknown broker response operation");
+  }
+  if (operation === "capability-summary") {
+    return { ...record, requestId, operation, ...parseCapabilityProfileFields(record) } as BrokerResponse;
   }
   return { ...record, requestId, operation } as BrokerResponse;
 }

@@ -18,6 +18,7 @@ const DOCUMENTED_COMMAND_COVERAGE = [
   "Tab", "Shift+Tab", "f", "Shift+f", "x", "Shift+x", "/",
   "number then Enter", "m", "prompt Tab", "prompt Enter",
   "Ctrl+d then d then y", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
+  "s", "settings Tab", "settings r",
 ] as const;
 
 function createFixture(prUrl = "https://github.com/joerob-msft/devpilot-agents/pull/94"): {
@@ -216,6 +217,7 @@ test("documented command coverage matrix enumerates every dashboard command", ()
     "Tab", "Shift+Tab", "f", "Shift+f", "x", "Shift+x", "/",
     "number then Enter", "m", "prompt Tab", "prompt Enter",
     "Ctrl+d then d then y", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
+    "s", "settings Tab", "settings r",
   ]);
 });
 

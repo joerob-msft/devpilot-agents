@@ -48,7 +48,7 @@ const COLORS = {
   ok: "#61d6a7",
 };
 
-type Overlay = "none" | "events" | "palette" | "help";
+type Overlay = "none" | "events" | "palette" | "help" | "settings";
 type RoleFilter = "all" | AgentRole;
 type PaneFocus = "rail" | "detail" | "timeline" | "inspector";
 
@@ -644,6 +644,9 @@ export function App(props: AppProps) {
   const [capabilitySummary, setCapabilitySummary] = createSignal<CapabilitySummary | null>(null);
   const [acceptedDispatch, setAcceptedDispatch] = createSignal<DispatchAccepted | null>(null);
   const [manualStatus, setManualStatus] = createSignal("");
+  const [settingsRole, setSettingsRole] = createSignal<AgentRole>("reviewer");
+  const [settingsProfile, setSettingsProfile] = createSignal<CapabilitySummary | null>(null);
+  const [settingsStatus, setSettingsStatus] = createSignal("");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let localBrokerShutdown: Promise<void> | undefined;
   let eventScrollbox: ScrollBoxRenderable | undefined;
@@ -800,6 +803,51 @@ export function App(props: AppProps) {
         : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
       setManualMode("terminal");
     }
+  }
+
+  // Read-only effective-profile settings: reuses the same trusted describe() RPC the manual
+  // dispatch prompt uses, since that is the only broker call that returns a resolved profile
+  // (PR1 adds no new RPC). This never mutates anything -- it only resolves what the NEXT manual
+  // dispatch/process launch would receive; a running agent's own profile is immutable and is not
+  // reflected here.
+  async function refreshSettingsProfile(): Promise<void> {
+    const entry = historyCurrent();
+    if (!props.broker) {
+      setSettingsProfile(null);
+      setSettingsStatus("Unavailable: trusted manual broker is not connected (observe-only mode).");
+      return;
+    }
+    if (!entry) {
+      setSettingsProfile(null);
+      setSettingsStatus("Unavailable: select a retained PR history row to resolve a next-launch profile.");
+      return;
+    }
+    setSettingsStatus("Resolving effective profile for the next manual dispatch...");
+    try {
+      const profile = await props.broker.describe(entry.repositoryIdentity.key, entry.pullRequestId, settingsRole());
+      setSettingsProfile(profile);
+      setSettingsStatus("");
+    } catch (error) {
+      setSettingsProfile(null);
+      setSettingsStatus(error instanceof BrokerRejectionError
+        ? `Unavailable: ${dispatchResultDetail(error.code, error.detail)}`
+        : `Unavailable: broker failure resolving effective profile (${error instanceof Error ? error.message : String(error)}).`);
+    }
+  }
+
+  function openSettings(): void {
+    setOverlay("settings");
+    setSettingsProfile(null);
+    setSettingsStatus("");
+    void refreshSettingsProfile();
+    notify("Effective profile settings opened");
+  }
+
+  function closeSettings(): void {
+    setOverlay("none");
+    setSettingsProfile(null);
+    setSettingsStatus("");
+    notify("Effective profile settings closed");
   }
 
   async function quit(): Promise<void> {
@@ -1011,6 +1059,12 @@ export function App(props: AppProps) {
       unavailable: "",
       run: () => setOverlay("help"),
     },
+    {
+      label: "Show effective capability profile (next launch)",
+      enabled: true,
+      unavailable: "",
+      run: openSettings,
+    },
   ]);
 
   function executePalette(): void {
@@ -1115,6 +1169,17 @@ export function App(props: AppProps) {
       }
       return;
     }
+    if (overlay() === "settings") {
+      if (key.name === "escape" || key.name === "s") {
+        closeSettings();
+      } else if (key.name === "tab") {
+        setSettingsRole((value) => (value === "reviewer" ? "review-handler" : "reviewer"));
+        void refreshSettingsProfile();
+      } else if (key.name === "r") {
+        void refreshSettingsProfile();
+      }
+      return;
+    }
 
     if (key.name === "up" || key.name === "k") move(-1);
     else if (key.name === "down" || key.name === "j") move(1);
@@ -1169,6 +1234,7 @@ export function App(props: AppProps) {
       notify("Enter a PR number, then press Enter to jump");
     }
     else if (key.name === "m") openManual();
+    else if (key.name === "s") openSettings();
     else if (key.name === "f") cycleView(key.shift ? -1 : 1);
     else if (key.name === "x") {
       if (key.shift) forgetAllHistory();
@@ -1329,11 +1395,40 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
           <text height={1} fg={COLORS.text}>m                  Manual dispatch for selected retained PR (trusted launch only)</text>
+          <text height={1} fg={COLORS.text}>s                  Effective capability profile for the next manual launch (read-only)</text>
           <text height={1} fg={COLORS.text}>?                  Help</text>
           <text height={1} fg={COLORS.text}>q                  Quit</text>
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[0]}</text>
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[1]}</text>
           <text height={1} fg={COLORS.warning}>{HELP_LEGEND[2]}</text>
+        </OverlayPanel>
+      </Show>
+      <Show when={overlay() === "settings"}>
+        <OverlayPanel title="SETTINGS - EFFECTIVE CAPABILITY PROFILE (READ-ONLY)" width={82} height={23}>
+          <box flexDirection="column" flexGrow={1}>
+            <text height={1} fg={COLORS.warning}>
+              Applies only to the next manual dispatch/process launch. A running agent's own profile is immutable and is not shown here.
+            </text>
+            <text height={1} fg={COLORS.text}>Role: {roleLabel(settingsRole())} | Tab switch role | r refresh | Esc/s close</text>
+            <Show when={settingsStatus()}>
+              <text height={1} fg={COLORS.warning}>{line(settingsStatus(), 170)}</text>
+            </Show>
+            <Show when={settingsProfile()}>
+              {(profile: () => CapabilitySummary) => (
+                <>
+                  <text height={1} fg={COLORS.accent}>{profile().repositoryIdentity.slug} / PR #{profile().prSnapshot.pullRequestId}</text>
+                  <text height={1} fg={COLORS.ok}>Allowed manual ceiling: {line(profile().allowedManualCapabilities.join(", ") || "none", 110)}</text>
+                  <text height={1} fg={COLORS.ok}>Enabled for this launch: {line(profile().capabilities.join(", ") || "none", 110)}</text>
+                  <text height={1} fg={COLORS.warning}>Denied (mandatory): {line(profile().mandatoryDenies.join(", ") || "none", 110)}</text>
+                  <text height={1} fg={COLORS.error}>Absolute denies (never grantable): {line(profile().absoluteDenies.join(", ") || "none", 110)}</text>
+                  <text height={1} fg={COLORS.muted}>Delegable available (widening): {line(profile().delegableAvailable.join(", ") || "none in this release", 110)}</text>
+                  <text height={1} fg={COLORS.muted}>
+                    Provenance: {line(Object.entries(profile().provenance).map(([name, source]) => `${name}=${source}`).join(", ") || "none", 170)}
+                  </text>
+                </>
+              )}
+            </Show>
+          </box>
         </OverlayPanel>
       </Show>
     </box>

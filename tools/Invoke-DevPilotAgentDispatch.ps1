@@ -102,14 +102,9 @@ function Get-RoleDescriptor {
     }
     $roleDescriptor = $descriptor.roles[$Role]
     if (-not [bool]$roleDescriptor.enabled) { throw '[role-not-allowed] The requested manual role is disabled.' }
-    $allowedCapabilities = if ($Role -eq 'reviewer') {
-        @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment')
-    }
-    else {
-        @('EnableThreadReplies', 'EnableBuddyRequeue', 'EnableCodeChanges', 'EnablePush',
-            'LocalValidation', 'ResumeCodingSession')
-    }
-    $requiredDeny = if ($Role -eq 'reviewer') { 'EnableApprovalVote' } else { 'EnableAutoComplete' }
+    $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $Role
+    $allowedCapabilities = $harnessRole.allowedManualCapabilities
+    $requiredDeny = $harnessRole.delegableDefaultOff
     $capabilities = @($roleDescriptor.capabilities)
     $mandatoryDenies = @($roleDescriptor.mandatoryDenies)
     if ($mandatoryDenies -cnotcontains $requiredDeny -or
@@ -294,6 +289,17 @@ function Invoke-Describe {
         $draftId = [Guid]::NewGuid().ToString('D')
         $capabilities = @($roleDescriptor.capabilities | Sort-Object -Unique)
         $mandatoryDenies = @($roleDescriptor.mandatoryDenies | Sort-Object -Unique)
+        $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $role
+        # Additive, read-only profile fields (PR1): delegableAvailable is always empty here because no
+        # delegation/widening policy exists yet (PR2+ scope) -- everything is decided by the checked-in
+        # operational-default ceiling, so every named capability's provenance is 'operational-default'.
+        $absoluteDenies = @($harnessRole.absoluteDenies | Sort-Object -Unique)
+        $allowedManualCapabilities = @($harnessRole.allowedManualCapabilities | Sort-Object -Unique)
+        $delegableAvailable = @()
+        $provenance = [ordered]@{}
+        foreach ($name in @($allowedManualCapabilities + $mandatoryDenies + $absoluteDenies | Sort-Object -Unique)) {
+            $provenance[$name] = 'operational-default'
+        }
         $snapshot = New-ConfigSnapshot $roleDescriptor $provider $draftId
         $policy = [ordered]@{
             schemaVersion = 1; repositoryIdentity = $identity; role = $role
@@ -318,6 +324,8 @@ function Invoke-Describe {
             dispatchDraftId = $draftId; repositoryIdentity = $identity; prSnapshot = $pr
             capabilityPolicyDigest = $policyDigest; prStateFingerprint = $prFingerprint
             capabilities = $capabilities; mandatoryDenies = $mandatoryDenies; dynamicConstraints = $constraints
+            absoluteDenies = $absoluteDenies; allowedManualCapabilities = $allowedManualCapabilities
+            delegableAvailable = $delegableAvailable; provenance = $provenance
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
