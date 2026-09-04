@@ -130,9 +130,21 @@ function stringField(record: Record<string, unknown>, name: string): string {
   return value;
 }
 
+// Bounds mirror stringField's own per-item cap. The whole line is already bounded by
+// DISPATCH_PROTOCOL_MAX_BYTES framing, but validating array shape explicitly here keeps this
+// fail-closed independent of that outer framing check, and holds every capability-name array --
+// legacy (capabilities/mandatoryDenies/dynamicConstraints) and PR1-additive alike -- to the same
+// bounded-string-array contract before any UI code runs .join()/<For> over it.
+const MAX_CAPABILITY_ARRAY_ITEMS = 256;
+const MAX_CAPABILITY_ITEM_LENGTH = 4_096;
+
 function stringArrayField(record: Record<string, unknown>, name: string): string[] {
   const value = record[name];
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+  if (
+    !Array.isArray(value) ||
+    value.length > MAX_CAPABILITY_ARRAY_ITEMS ||
+    value.some((item) => typeof item !== "string" || item.length > MAX_CAPABILITY_ITEM_LENGTH)
+  ) {
     throw new Error(`broker response ${name} is invalid`);
   }
   return value as string[];
@@ -182,7 +194,19 @@ function parseResponse(line: string): BrokerResponse {
     throw new Error("unknown broker response operation");
   }
   if (operation === "capability-summary") {
-    return { ...record, requestId, operation, ...parseCapabilityProfileFields(record) } as BrokerResponse;
+    return {
+      ...record,
+      requestId,
+      operation,
+      // Legacy fields predate PR1's stricter parsing and were previously spread straight from the
+      // untrusted record; validate them the same bounded-string-array way as the PR1-additive
+      // fields so a malformed broker response fails closed here instead of throwing later out of
+      // an unguarded UI .join()/<For>.
+      capabilities: stringArrayField(record, "capabilities"),
+      mandatoryDenies: stringArrayField(record, "mandatoryDenies"),
+      dynamicConstraints: stringArrayField(record, "dynamicConstraints"),
+      ...parseCapabilityProfileFields(record),
+    } as BrokerResponse;
   }
   return { ...record, requestId, operation } as BrokerResponse;
 }

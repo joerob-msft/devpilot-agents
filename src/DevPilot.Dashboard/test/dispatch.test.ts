@@ -157,3 +157,68 @@ if ($r.operation -eq 'describe') {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("client rejects a capability-summary whose legacy capability arrays are malformed", async () => {
+  const root = join(process.cwd(), `.dashboard-dispatch-legacy-malformed-${process.pid}-${Date.now()}`);
+  await mkdir(root, { recursive: false });
+  const descriptor = join(root, "descriptor.json");
+  const pwsh = resolvePwshPath();
+  await writeFile(descriptor, "{}", "utf8");
+
+  async function describeWith(fakeBrokerBody: string): Promise<{ failures: string[]; rejected: boolean }> {
+    const script = join(root, `fake-broker-${Date.now()}-${Math.random()}.ps1`);
+    await writeFile(script, String.raw`
+param([string]$DescriptorPath)
+$line = [Console]::In.ReadLine()
+$r = $line | ConvertFrom-Json
+if ($r.operation -eq 'describe') {
+` + fakeBrokerBody + String.raw`
+}
+# Exit immediately after the single malformed response -- the client is expected to fail closed
+# on it and never send a shutdown request, so this script must not block on further stdin input.
+`, "utf8");
+    const failures: string[] = [];
+    const client = new DispatchClient(
+      { executablePath: pwsh, scriptPath: script, descriptorPath: descriptor },
+      { onBrokerFailure: (failure) => failures.push(failure) },
+    );
+    let rejected = false;
+    try {
+      await client.describe("v1:github:9007199254740993", 104, "reviewer");
+    } catch {
+      rejected = true;
+    } finally {
+      await client.shutdown().catch(() => {});
+    }
+    return { failures, rejected };
+  }
+
+  try {
+    // Legacy `capabilities` is a bare string rather than an array -- the same shape a hand-edited
+    // or buggy broker response could plausibly send, and exactly what UI code's .join() assumes
+    // will never happen.
+    const nonArrayCapabilities = await describeWith(String.raw`
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities='EnableSummaryComment';mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+`);
+    assert.equal(nonArrayCapabilities.rejected, true);
+    assert.equal(nonArrayCapabilities.failures.length, 1);
+
+    // Legacy `mandatoryDenies` is an array, but one item is not a string.
+    const nonStringItem = await describeWith(String.raw`
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@(7);dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+`);
+    assert.equal(nonStringItem.rejected, true);
+    assert.equal(nonStringItem.failures.length, 1);
+
+    // Legacy `dynamicConstraints` is a well-typed string array but exceeds the bounded-array
+    // item-count limit the parser now enforces uniformly across every capability-name array.
+    const oversizedArray = await describeWith(String.raw`
+    $items = 1..300 | ForEach-Object { "c$_" }
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@();dynamicConstraints=$items;absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+`);
+    assert.equal(oversizedArray.rejected, true);
+    assert.equal(oversizedArray.failures.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
