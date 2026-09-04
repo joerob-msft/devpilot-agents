@@ -890,12 +890,19 @@ export function App(props: AppProps) {
     if (!props.broker) {
       settingsGeneration += 1;
       setSettingsProfile(null);
+      // issue #105 PR3 closure: a stale confirm/confirm-final left open against a profile that
+      // just disappeared would show a WARNING/FINAL CONFIRMATION for a transition this process no
+      // longer has any actual profile to compute -- close it the same instant the profile clears
+      // rather than leaving it visibly stuck until the next keypress (or a 'y' press) discovers
+      // the loss on its own.
+      setKillSwitchStage("none");
       setSettingsStatus("Unavailable: trusted manual broker is not connected (observe-only mode).");
       return;
     }
     if (!entry) {
       settingsGeneration += 1;
       setSettingsProfile(null);
+      setKillSwitchStage("none");
       setSettingsStatus("Unavailable: select a retained PR history row to resolve a next-launch profile.");
       return;
     }
@@ -938,6 +945,10 @@ export function App(props: AppProps) {
     } catch (error) {
       if (requestId !== settingsGeneration) return;
       setSettingsProfile(null);
+      // Same rationale as the broker-loss/no-entry branches above: a failed refresh means there
+      // is no current profile to confirm a kill-switch transition against, so any open confirm/
+      // confirm-final must close rather than linger on stale data.
+      setKillSwitchStage("none");
       setSettingsStatus(error instanceof BrokerRejectionError
         ? `Unavailable: ${dispatchResultDetail(error.code, error.detail)}`
         : `Unavailable: broker failure resolving effective profile (${error instanceof Error ? error.message : String(error)}).`);
@@ -1186,6 +1197,10 @@ export function App(props: AppProps) {
     // closeSettings) -- so a null profile here means that invariant broke; abort rather than guess.
     if (!props.broker || !entry || !profile) {
       setKillSwitchStage("none");
+      // issue #105 PR3 closure: silently vanishing the confirm dialog here left the operator
+      // guessing whether anything happened at all -- state plainly that the toggle was abandoned
+      // and why, the same way every other abort/failure path in this overlay already does.
+      setSettingsStatus("Kill switch toggle aborted: effective profile is no longer available.");
       return;
     }
     setKillSwitchStage("none");
@@ -1595,7 +1610,11 @@ export function App(props: AppProps) {
         // A role switch mid-flight invalidates any toggleKillSwitch() awaiting a response for the
         // OLD role (issue #105 PR3 completion): killSwitchStage is already reset to "none" by the
         // time 'y' is pressed (see toggleKillSwitch), so Tab can otherwise land here while that
-        // await is still outstanding -- see toggleKillSwitch's own requestId guard.
+        // await is still outstanding -- see toggleKillSwitch's own requestId guard. Reset
+        // explicitly here too (issue #105 PR3 closure) rather than relying solely on that
+        // invariant: the kill switch is machine+user-wide, never role-scoped, so a confirm opened
+        // for one role's profile must never carry over and be actioned against another role's.
+        setKillSwitchStage("none");
         killSwitchGeneration += 1;
         void refreshSettingsProfile(nextRole);
       } else if (key.name === "r") {
@@ -1614,6 +1633,18 @@ export function App(props: AppProps) {
         // than racing ahead of it or silently dropping the keypress.
         if (!props.broker) {
           setSettingsStatus("Observe-only: trusted manual broker is unavailable");
+        } else if (settingsRefreshPending) {
+          // issue #105 PR3 closure: a refresh already in flight means the currently loaded
+          // profile (settingsDisplayProfile(), even one that still role-matches) can be stale
+          // relative to it -- e.g. toggleKillSwitch's own silent refresh just kicked off after
+          // applying a transition, so the last-rendered profile still reflects the PRE-transition
+          // state. Never open (or decide a direction) against that stale snapshot; queue against
+          // the ACTIVE generation exactly like the no-profile-yet branch below, so the confirm
+          // dialog only ever opens once the fresh, matching profile actually lands (see
+          // refreshSettingsProfile's pendingKillSwitchGeneration consumption) -- never repeating a
+          // just-applied transition instead of its correct reverse.
+          pendingKillSwitchGeneration = settingsGeneration;
+          setSettingsStatus("Kill switch will open once the effective profile finishes loading.");
         } else {
           const loaded = settingsDisplayProfile();
           if (loaded) {
@@ -1621,7 +1652,7 @@ export function App(props: AppProps) {
           } else if (!historyCurrent()) {
             setSettingsStatus("Unavailable: select a retained PR history row to resolve a next-launch profile.");
           } else {
-            if (!settingsRefreshPending) void refreshSettingsProfile(settingsRole());
+            void refreshSettingsProfile(settingsRole());
             pendingKillSwitchGeneration = settingsGeneration;
             setSettingsStatus("Kill switch will open once the effective profile finishes loading.");
           }

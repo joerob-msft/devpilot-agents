@@ -717,13 +717,21 @@ Describe 'PR3 capability-override writer and kill switch' {
         # Invoke-SetKillSwitch's response actually calls, so this exercises the exact same shared
         # sentinel state Resolve-AgentEffectiveCapabilitySettings's KillSwitchExpiresAtUtc uses.
         $roots = New-TestRoots
-        $nowEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
         Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot | Should -BeNullOrEmpty
 
+        # Bounds captured immediately around this call (issue #105 PR3 closure), rather than a
+        # $nowEpoch snapshot taken before it: a slow first-ever ACL/symlink-hardening pass on a
+        # fresh kill-switch root (see Get-AgentCapabilityOverrideKillSwitchState's own doc comment)
+        # could otherwise push the wall clock across a second boundary between an earlier snapshot
+        # and this call's own internal [DateTime]::UtcNow, intermittently failing a zero-slack
+        # upper bound. A bounded 5s slack absorbs that scheduling jitter while still tightly
+        # proving the roughly-60s TTL this call actually requests, not some arbitrarily larger one.
+        $beforeEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
         Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot -TtlSeconds 60
+        $afterEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
         $expiresAtUtc = Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot
-        $expiresAtUtc | Should -BeGreaterThan $nowEpoch
-        $expiresAtUtc | Should -BeLessOrEqual ($nowEpoch + 60)
+        $expiresAtUtc | Should -BeGreaterThan $beforeEpoch
+        $expiresAtUtc | Should -BeLessOrEqual ($afterEpoch + 60 + 5)
 
         # Force expiry without sleeping 60+ seconds: rewrite the sentinel directly to a past epoch,
         # exactly like Write-OverrideFile does for other scope files in this suite.
@@ -732,7 +740,7 @@ Describe 'PR3 capability-override writer and kill switch' {
         $killSwitchRoot = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $roots.RepoRoot -DisallowedRoots $disallowed
         $sentinelPath = Join-Path $killSwitchRoot 'sentinel.json'
         Test-Path -LiteralPath $sentinelPath -PathType Leaf | Should -BeTrue
-        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = ($nowEpoch - 120); expiresAtUtc = ($nowEpoch - 1) }
+        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = ($afterEpoch - 120); expiresAtUtc = ($afterEpoch - 1) }
 
         Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
         Test-Path -LiteralPath $sentinelPath -PathType Leaf | Should -BeFalse
@@ -757,10 +765,16 @@ Describe 'PR3 capability-override writer and kill switch' {
         # yet -- so this is exactly the "Test-Path sees a file" trap the fix must not fall into.
         Test-Path -LiteralPath $sentinelPath -PathType Leaf | Should -BeTrue
 
+        # Bounds captured immediately around this call (issue #105 PR3 closure), not the
+        # $nowEpoch snapshot from the top of the test: several file-I/O-heavy calls run between
+        # that snapshot and here, and a bounded 5s slack absorbs any residual scheduling jitter
+        # while still tightly proving the roughly-1h (3600s) TTL this call actually requests.
+        $beforeEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
         $result = Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot -TtlSeconds 3600
+        $afterEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
         $result.Active | Should -BeTrue
-        $result.ExpiresAtUtc | Should -BeGreaterThan $nowEpoch
-        $result.ExpiresAtUtc | Should -BeLessOrEqual ($nowEpoch + 3600)
+        $result.ExpiresAtUtc | Should -BeGreaterThan $beforeEpoch
+        $result.ExpiresAtUtc | Should -BeLessOrEqual ($afterEpoch + 3600 + 5)
         Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeTrue
         Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot | Should -Be $result.ExpiresAtUtc
     }
@@ -805,6 +819,107 @@ Describe 'PR3 capability-override writer and kill switch' {
         { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
 
         Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = $nowEpoch; expiresAtUtc = ($nowEpoch + 3600); extra = 'bogus' }
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+        { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
+    }
+
+    It 'a sentinel with a fractional schemaVersion is malformed, never silently rounded to a valid version' {
+        # issue #105 PR3 closure: PowerShell's own [long] cast banker's-rounds a fractional double
+        # (1.1 -> 1), which would otherwise let a corrupted or foreign-schema sentinel masquerade
+        # as schemaVersion 1. ConvertTo-AgentCanonicalJson (Write-OverrideFile's own serializer)
+        # does not support [double] values at all, so this fixture is written as raw JSON text
+        # instead, exactly like the raw-bytes fixtures elsewhere in this file (e.g. the oversized/
+        # 'hello' Read-AgentStableFile cases above).
+        $roots = New-TestRoots
+        $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+        $disallowed = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot), (Get-AgentDefaultCapabilityOverrideRoot))
+        $killSwitchRoot = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $roots.RepoRoot -DisallowedRoots $disallowed -Create
+        $sentinelPath = Join-Path $killSwitchRoot 'sentinel.json'
+        $nowEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
+
+        [IO.File]::WriteAllText($sentinelPath, "{`"schemaVersion`":1.1,`"enabledAtUtc`":$nowEpoch,`"expiresAtUtc`":$($nowEpoch + 3600)}", [Text.UTF8Encoding]::new($false))
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+        Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot | Should -BeNullOrEmpty
+        { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
+
+        # Contrast case: a double that merely HAS a decimal point but is numerically whole (1.0)
+        # is still exactly integral -- only a genuine fractional value is rejected.
+        [IO.File]::WriteAllText($sentinelPath, "{`"schemaVersion`":1.0,`"enabledAtUtc`":$nowEpoch,`"expiresAtUtc`":$($nowEpoch + 3600)}", [Text.UTF8Encoding]::new($false))
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeTrue
+    }
+
+    It 'a sentinel with a huge, NaN-like (infinite), or otherwise out-of-safe-range numeric value is malformed rather than throwing' {
+        # issue #105 PR3 closure: PowerShell's own [long] cast THROWS an unhandled RuntimeException
+        # on a huge/infinite double instead of failing closed -- ConvertFrom-Json itself turns an
+        # oversized exponent like 1e400 into [double]::PositiveInfinity rather than erroring, so
+        # this is a real value a corrupted or hostile sentinel can present on the wire.
+        $roots = New-TestRoots
+        $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+        $disallowed = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot), (Get-AgentDefaultCapabilityOverrideRoot))
+        $killSwitchRoot = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $roots.RepoRoot -DisallowedRoots $disallowed -Create
+        $sentinelPath = Join-Path $killSwitchRoot 'sentinel.json'
+        $nowEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
+
+        foreach ($expiresAtUtcLiteral in @('1e20', '1e400', '-1e20')) {
+            [IO.File]::WriteAllText($sentinelPath, "{`"schemaVersion`":1,`"enabledAtUtc`":$nowEpoch,`"expiresAtUtc`":$expiresAtUtcLiteral}", [Text.UTF8Encoding]::new($false))
+            { Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Not -Throw
+            Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+            { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
+        }
+
+        # Same guard applies to schemaVersion, not just the timestamp fields.
+        [IO.File]::WriteAllText($sentinelPath, "{`"schemaVersion`":1e400,`"enabledAtUtc`":$nowEpoch,`"expiresAtUtc`":$($nowEpoch + 3600)}", [Text.UTF8Encoding]::new($false))
+        { Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Not -Throw
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+    }
+
+    It 'a sentinel with expiresAtUtc before enabledAtUtc is malformed' {
+        $roots = New-TestRoots
+        $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+        $disallowed = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot), (Get-AgentDefaultCapabilityOverrideRoot))
+        $killSwitchRoot = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $roots.RepoRoot -DisallowedRoots $disallowed -Create
+        $sentinelPath = Join-Path $killSwitchRoot 'sentinel.json'
+        $nowEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
+        # enabledAtUtc is 1000s ahead of a FUTURE expiresAtUtc so this can never be misclassified as
+        # merely 'expired' (which independently also resolves to Active=$false and would mask the
+        # real ordering bug this test targets).
+        $future = $nowEpoch + 5000
+        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = $future; expiresAtUtc = ($future - 100) }
+
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+        Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc -RepositoryRoot $roots.RepoRoot | Should -BeNullOrEmpty
+        { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
+    }
+
+    It 'a sentinel whose TTL delta is too short (<60s) or too long (>86400s), or whose expiresAtUtc is past the year-2200 ceiling, is malformed' {
+        $roots = New-TestRoots
+        $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+        $disallowed = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot), (Get-AgentDefaultCapabilityOverrideRoot))
+        $killSwitchRoot = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $roots.RepoRoot -DisallowedRoots $disallowed -Create
+        $sentinelPath = Join-Path $killSwitchRoot 'sentinel.json'
+        $nowEpoch = ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow)
+        $future = $nowEpoch + 5000
+
+        # Too short: a 10s TTL is well under Enable-AgentCapabilityOverrideKillSwitch's own 60s
+        # floor -- both enabledAtUtc/expiresAtUtc are placed in the future so this can never be
+        # misclassified as merely 'expired'.
+        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = $future; expiresAtUtc = ($future + 10) }
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+        { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
+
+        # Too long: a TTL delta beyond the 86400s ceiling, even though expiresAtUtc alone is still
+        # a plausible-looking near-term timestamp (isolates the delta check from the epoch ceiling
+        # check below).
+        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = $nowEpoch; expiresAtUtc = ($nowEpoch + 90000) }
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+        { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
+
+        # Far future: expiresAtUtc itself lands past the shared year-2200 wire ceiling (dashboard's
+        # MAX_KILL_SWITCH_EPOCH_SECONDS), with enabledAtUtc chosen so the TTL delta (3600s) stays
+        # comfortably inside [60, 86400] -- isolates the epoch-ceiling check from the delta check
+        # above.
+        $ceiling = 7258118400
+        Write-OverrideFile -Path $sentinelPath -Record @{ schemaVersion = 1; enabledAtUtc = ($ceiling - 3500); expiresAtUtc = ($ceiling + 100) }
         Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
         { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
     }

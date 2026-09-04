@@ -1199,6 +1199,97 @@ test("settings kill switch two-stage confirm can be cancelled at either stage, e
   }
 });
 
+test("settings kill switch during a post-toggle refresh queues against the active generation instead of a stale profile, and still reverses correctly", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker: baseBroker, calls } = createSettingsBrokerFixture();
+  // issue #105 PR3 closure: toggleKillSwitch() fires its own post-toggle profile() refresh
+  // without awaiting it (`void refreshSettingsProfile(...)`), so that refresh (call #2 below) can
+  // still be outstanding when the operator presses 'k' again. Holding exactly that second call
+  // pending lets this test race a second 'k' press against it deterministically.
+  let profileCallCount = 0;
+  let releaseSecondProfile: (() => void) | undefined;
+  const broker: DispatchBroker = {
+    ...baseBroker,
+    profile: async (repositoryKey, pullRequestId, role) => {
+      profileCallCount++;
+      if (profileCallCount === 2) {
+        await new Promise<void>((resolve) => { releaseSecondProfile = resolve; });
+      }
+      return baseBroker.profile(repositoryKey, pullRequestId, role);
+    },
+  };
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140,
+      height: 32,
+      kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+    assert.equal(profileCallCount, 1);
+
+    // Enable the kill switch normally; its own profile() call (#1) already resolved above.
+    setup.mockInput.pressKey("k");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Ignore local narrowing overrides is now ON/);
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 1);
+    // toggleKillSwitch's own silent refresh (profile call #2) is now in flight and deliberately
+    // held pending by the broker override above.
+    assert.equal(profileCallCount, 2);
+
+    // Press k again WHILE that refresh is still outstanding. The currently loaded profile is
+    // still the STALE pre-toggle snapshot (killSwitchActive: false) -- this must queue against
+    // the active refresh rather than act on it immediately.
+    setup.mockInput.pressKey("k");
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /WARNING: machine\+user-wide emergency lever/);
+    assert.doesNotMatch(setup.captureCharFrame(), /Disable 'Ignore local narrowing overrides'\?/);
+    assert.match(setup.captureCharFrame(), /Kill switch will open once the effective profile finishes loading\./);
+
+    // Extra c/y presses while still queued (killSwitchStage is still "none", nothing has opened
+    // yet) must never be silently misinterpreted as advancing or firing a confirm -- no dropped
+    // key ever turns into an unintended RPC.
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 1);
+
+    // Release the deferred refresh: the queued 'k' now fires against the FRESH, post-toggle
+    // profile (killSwitchActive: true), so the dialog must open showing the DISABLE direction,
+    // never repeating the stale ENABLE direction.
+    releaseSecondProfile?.();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Disable 'Ignore local narrowing overrides'\? Persisted narrowing becomes active again for next launches\./);
+
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /FINAL CONFIRMATION: disable 'Ignore local narrowing overrides'\?/);
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Ignore local narrowing overrides is now OFF: persisted narrowing applies again\./);
+    // Exactly one additional (correct, reverse) set-kill-switch call -- never a repeated ENABLE.
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 2);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
 test("settings editor is unavailable without a trusted broker", async (context) => {
   const fixture = createFixture();
   const history = createSettingsHistory();

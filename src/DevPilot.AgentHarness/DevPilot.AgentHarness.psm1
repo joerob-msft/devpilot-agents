@@ -1659,6 +1659,39 @@ function Get-AgentCapabilityOverrideKillSwitchDisallowedRoots {
             (Get-AgentDefaultCapabilityOverrideRoot)))
 }
 
+# Same epoch-seconds ceiling the dashboard enforces for this identical wire value (issue #105 PR3
+# closure -- see dispatch.ts's MAX_KILL_SWITCH_EPOCH_SECONDS): the sentinel's own TTL is capped at
+# 24h (Enable-AgentCapabilityOverrideKillSwitch's -TtlSeconds ValidateRange), so a legitimate
+# enabledAtUtc/expiresAtUtc is always within about a day of "now". Year 2200 leaves enormous
+# headroom for clock skew while still rejecting a clearly-bogus timestamp a tampered or
+# foreign-schema sentinel could otherwise smuggle through. Kept as one shared value so the harness
+# and dashboard can never disagree about what "a plausible expiry" means for the same field.
+$script:AgentCapabilityOverrideKillSwitchMaxEpochSeconds = 7258118400 # 2200-01-01T00:00:00Z
+
+function ConvertTo-AgentSafeIntegralNumber {
+    <#
+        Strict numeric gate shared by every field Read-AgentCapabilityOverrideKillSwitchSentinel
+        validates before ever casting to [long] (issue #105 PR3 closure). PowerShell's own [long]
+        cast operator silently BANKER'S-ROUNDS a fractional double (1.1 -> 1, 2.5 -> 2) instead of
+        rejecting it, and THROWS an unhandled RuntimeException on a huge/NaN/infinite double (1e20,
+        1e400, NaN) instead of failing closed -- both are real JSON-parser outputs
+        (ConvertFrom-Json turns an oversized exponent like 1e400 into [double]::PositiveInfinity
+        rather than erroring). This collapses both failure modes into a single "not a valid
+        sentinel integer" signal: returns $null for anything that is not exactly an int/long/double
+        holding a finite, integral value inside the +-2^53 "safe integer" span (the same boundary
+        Number.isSafeInteger enforces on the dashboard side of this exact wire value) -- never a
+        silently-rounded or silently-overflowed approximation. Callers must check for $null
+        explicitly (never falsy-check the return) since 0 is a valid result.
+    #>
+    param([Parameter(Mandatory)][AllowNull()]$Value)
+    if ($Value -isnot [double] -and $Value -isnot [long] -and $Value -isnot [int]) { return $null }
+    $asDouble = [double]$Value
+    if ([double]::IsNaN($asDouble) -or [double]::IsInfinity($asDouble)) { return $null }
+    if ($asDouble -ne [Math]::Truncate($asDouble)) { return $null }
+    if ($asDouble -lt -9007199254740991.0 -or $asDouble -gt 9007199254740991.0) { return $null }
+    return [long]$asDouble
+}
+
 function Read-AgentCapabilityOverrideKillSwitchSentinel {
     <#
         Single-source-of-truth sentinel parser/validator shared by
@@ -1675,12 +1708,17 @@ function Read-AgentCapabilityOverrideKillSwitchSentinel {
             stale file after this returns.
           - 'malformed': the file exists but fails validation (unparseable JSON, a non-object body,
             a field outside the exact allowed set, a missing/wrong schemaVersion, or a missing/
-            non-numeric enabledAtUtc/expiresAtUtc). Never deleted here -- a malformed sentinel is
+            non-numeric enabledAtUtc/expiresAtUtc, a fractional/NaN/infinite/out-of-safe-range
+            numeric value (schemaVersion must be EXACTLY integral 1 -- 1.1 or 1.0000001 is
+            malformed, not silently rounded), an expiresAtUtc before enabledAtUtc, an
+            enabledAtUtc/expiresAtUtc TTL delta outside [60, 86400] seconds, or either timestamp
+            beyond the shared year-2200 wire ceiling). Never deleted here -- a malformed sentinel is
             left in place for an operator to inspect rather than silently discarded, and its very
             existence is what makes Enable-AgentCapabilityOverrideKillSwitch fail closed with an
             explicit error instead of guessing at a migration. A missing expiresAtUtc is
             deliberately 'malformed', never 'active' with a null expiry -- a kill switch can never
-            be indefinitely active by omission (issue #105 PR3 review).
+            be indefinitely active by omission (issue #105 PR3 review). None of these checks ever
+            throw on bad input (issue #105 PR3 closure) -- see ConvertTo-AgentSafeIntegralNumber.
     #>
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -1703,20 +1741,30 @@ function Read-AgentCapabilityOverrideKillSwitchSentinel {
         -not $sentinel.Contains('expiresAtUtc')) {
         return @{ Status = 'malformed'; ExpiresAtUtc = $null }
     }
-    $schemaVersionRaw = $sentinel['schemaVersion']
-    if (($schemaVersionRaw -isnot [double] -and $schemaVersionRaw -isnot [long] -and $schemaVersionRaw -isnot [int]) -or
-        [long][double]$schemaVersionRaw -ne 1) {
+    $schemaVersion = ConvertTo-AgentSafeIntegralNumber $sentinel['schemaVersion']
+    if ($null -eq $schemaVersion -or $schemaVersion -ne 1) {
         return @{ Status = 'malformed'; ExpiresAtUtc = $null }
     }
-    $enabledAtUtcRaw = $sentinel['enabledAtUtc']
-    $expiresAtUtcRaw = $sentinel['expiresAtUtc']
-    if ($enabledAtUtcRaw -isnot [double] -and $enabledAtUtcRaw -isnot [long] -and $enabledAtUtcRaw -isnot [int]) {
+    $enabledAtUtc = ConvertTo-AgentSafeIntegralNumber $sentinel['enabledAtUtc']
+    $expiresAtUtc = ConvertTo-AgentSafeIntegralNumber $sentinel['expiresAtUtc']
+    if ($null -eq $enabledAtUtc -or $null -eq $expiresAtUtc) {
         return @{ Status = 'malformed'; ExpiresAtUtc = $null }
     }
-    if ($expiresAtUtcRaw -isnot [double] -and $expiresAtUtcRaw -isnot [long] -and $expiresAtUtcRaw -isnot [int]) {
+    if ($enabledAtUtc -lt 0 -or $enabledAtUtc -gt $script:AgentCapabilityOverrideKillSwitchMaxEpochSeconds -or
+        $expiresAtUtc -lt 0 -or $expiresAtUtc -gt $script:AgentCapabilityOverrideKillSwitchMaxEpochSeconds) {
         return @{ Status = 'malformed'; ExpiresAtUtc = $null }
     }
-    $expiresAtUtc = [long][double]$expiresAtUtcRaw
+    # enabledAtUtc can never be after expiresAtUtc, and the gap between them must land inside the
+    # exact TTL window Enable-AgentCapabilityOverrideKillSwitch's own -TtlSeconds
+    # ValidateRange(60, 86400) allows -- a tampered or foreign-schema sentinel could otherwise claim
+    # an implausible negative, one-second, or one-year lifetime this process itself never writes.
+    if ($expiresAtUtc -lt $enabledAtUtc) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    $ttlSeconds = $expiresAtUtc - $enabledAtUtc
+    if ($ttlSeconds -lt 60 -or $ttlSeconds -gt 86400) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
     if ($expiresAtUtc -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
         Assert-AgentPathHasNoLinks -Path $Path
         Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
@@ -1835,7 +1883,7 @@ function Enable-AgentCapabilityOverrideKillSwitch {
     $existing = Read-AgentCapabilityOverrideKillSwitchSentinel -Root $root -Path $path
     if ($existing.Status -eq 'active') { return @{ Active = $true; ExpiresAtUtc = $existing.ExpiresAtUtc } }
     if ($existing.Status -eq 'malformed') {
-        throw "[kill-switch-invalid] Existing kill-switch sentinel at '$path' failed validation (unexpected schema, disallowed field, or missing/invalid TTL); refusing to enable. Remove the file to recover."
+        throw "[kill-switch-invalid] Existing kill-switch sentinel at '$path' failed validation (unexpected schema, disallowed field, non-integral/out-of-range timestamp, bad enabledAtUtc/expiresAtUtc ordering, or missing/invalid TTL); refusing to enable. Remove the file to recover."
     }
     $enabledAtUtc = [DateTime]::UtcNow
     $expiresAtUtcValue = ConvertTo-AgentCanonicalEpochSeconds $enabledAtUtc.AddSeconds($TtlSeconds)
