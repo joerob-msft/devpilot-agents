@@ -1457,8 +1457,21 @@ function Resolve-AgentEffectiveCapabilitySettings {
         [Parameter(Mandatory)]$RepositoryIdentity,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
-        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$CurrentSourceCommit
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$CurrentSourceCommit,
+        # PR3-only: previews a single hypothetical scope-file edit (never persisted) by overlaying
+        # it onto that ONE scope's parsed record before the normal broad-to-narrow fold runs --
+        # every other scope, and the fold logic itself, is completely unchanged. This guarantees a
+        # preview can never drift from the real resolver: it IS the real resolver, called with one
+        # extra input. $null (every existing PR1/PR2 caller) reproduces today's behavior exactly.
+        [AllowNull()][hashtable]$HypotheticalOverride
     )
+    if (Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $RepositoryRoot) {
+        # Emergency operational lever (PR3): ignores every persisted override record and returns
+        # ceiling-only output, tagged distinctly (KillSwitchActive) so callers can render
+        # provenance as 'kill-switch' rather than silently indistinguishable from an empty store.
+        # Checked first, via a cheap Test-Path-backed check, before any scope-file parsing.
+        return @{ Settings = [ordered]@{}; Provenance = [ordered]@{}; FileFingerprints = @(); KillSwitchActive = $true }
+    }
     $root = Get-AgentCapabilityOverrideRoot -RepositoryRoot $RepositoryRoot
     $allowedCapabilities = [Collections.Generic.List[string]]::new()
     foreach ($knownRole in @('reviewer', 'review-handler')) {
@@ -1488,41 +1501,53 @@ function Resolve-AgentEffectiveCapabilitySettings {
         }
         if (-not (Test-Path -LiteralPath $path)) {
             [void]$fingerprints.Add([ordered]@{ Path = $path; Exists = $false; Size = 0; MTime = 0; Sha256 = $null })
-            continue
+            # No file on disk for this scope. Ordinarily a no-op continue -- but when the caller is
+            # previewing a hypothetical edit AT this exact scope, an absent file behaves exactly
+            # like PR2's existing "empty store" contract: an empty settings record to overlay onto,
+            # not a reason to skip the scope entirely.
+            if (-not ($HypotheticalOverride -and [string]$HypotheticalOverride.Scope -ceq $scope)) { continue }
+            $record = [ordered]@{ Settings = [ordered]@{} }
         }
-        # An existing path that is NOT a regular file (a directory, or any other non-file object)
-        # must never be silently treated the same as "absent" -- that would mask an intended
-        # narrowing record as if the store were empty, which is a silent WIDENING of the effective
-        # ceiling. Assert-AgentTrustedFile itself rejects a non-file (PSIsContainer) below, so this
-        # is deliberately only a plain existence check, not -PathType Leaf.
-        try {
-            $path = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -Private
-            $stable = Read-AgentStableFile -Path $path -MaxBytes 65536
-        }
-        catch [Management.Automation.ItemNotFoundException] {
-            # Existed an instant ago (the Test-Path above) but vanished before validation/read could
-            # complete -- a race, not a genuine absence and not malformed/corrupt content. Surface
-            # the same distinct, explicitly-retryable signal Read-AgentStableFile itself raises for
-            # in-flight instability, so callers (Get-BrokerCapabilityProfile) can retry once under
-            # the capability-override lock instead of failing this closed as "invalid".
-            throw "[stable-read-unstable] ($scope) File vanished while being validated/read."
-        }
-        [void]$fingerprints.Add([ordered]@{ Path = $stable.Path; Exists = $stable.Exists; Size = $stable.Size; MTime = $stable.MTime; Sha256 = $stable.Sha256 })
-        $record = ConvertFrom-AgentTrustedCapabilityJson -Bytes $stable.Bytes -SourceScope $scope -AllowedCapabilities $allowedCapabilities
-        if ($candidates[$scope].RequireBinding -and
-            ([string]$record.RepositoryKey -cne $repositoryKey -or [string]$record.WorktreeId -cne $worktreeId)) {
-            throw "[capability-settings-invalid] ($scope) Record identity binding does not match the current repository/worktree."
-        }
-        if ($scope -eq 'pr') {
-            if ([int]$record.PullRequestId -ne $PullRequestId) {
-                throw '[capability-settings-invalid] (pr) Record pullRequestId does not match the current pull request.'
+        else {
+            # An existing path that is NOT a regular file (a directory, or any other non-file object)
+            # must never be silently treated the same as "absent" -- that would mask an intended
+            # narrowing record as if the store were empty, which is a silent WIDENING of the effective
+            # ceiling. Assert-AgentTrustedFile itself rejects a non-file (PSIsContainer) below, so this
+            # is deliberately only a plain existence check, not -PathType Leaf.
+            try {
+                $path = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -Private
+                $stable = Read-AgentStableFile -Path $path -MaxBytes 65536
             }
-            if ([string]$record.SourceCommit -cne $CurrentSourceCommit) {
-                throw '[capability-settings-stale] Persisted PR-scope override no longer matches the current source commit.'
+            catch [Management.Automation.ItemNotFoundException] {
+                # Existed an instant ago (the Test-Path above) but vanished before validation/read could
+                # complete -- a race, not a genuine absence and not malformed/corrupt content. Surface
+                # the same distinct, explicitly-retryable signal Read-AgentStableFile itself raises for
+                # in-flight instability, so callers (Get-BrokerCapabilityProfile) can retry once under
+                # the capability-override lock instead of failing this closed as "invalid".
+                throw "[stable-read-unstable] ($scope) File vanished while being validated/read."
             }
-            if ([long]$record.ExpiresAtUtc -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
-                throw '[capability-settings-expired] Persisted PR-scope override has expired.'
+            [void]$fingerprints.Add([ordered]@{ Path = $stable.Path; Exists = $stable.Exists; Size = $stable.Size; MTime = $stable.MTime; Sha256 = $stable.Sha256 })
+            $record = ConvertFrom-AgentTrustedCapabilityJson -Bytes $stable.Bytes -SourceScope $scope -AllowedCapabilities $allowedCapabilities
+            if ($candidates[$scope].RequireBinding -and
+                ([string]$record.RepositoryKey -cne $repositoryKey -or [string]$record.WorktreeId -cne $worktreeId)) {
+                throw "[capability-settings-invalid] ($scope) Record identity binding does not match the current repository/worktree."
             }
+            if ($scope -eq 'pr') {
+                if ([int]$record.PullRequestId -ne $PullRequestId) {
+                    throw '[capability-settings-invalid] (pr) Record pullRequestId does not match the current pull request.'
+                }
+                if ([string]$record.SourceCommit -cne $CurrentSourceCommit) {
+                    throw '[capability-settings-stale] Persisted PR-scope override no longer matches the current source commit.'
+                }
+                if ([long]$record.ExpiresAtUtc -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
+                    throw '[capability-settings-expired] Persisted PR-scope override has expired.'
+                }
+            }
+        }
+        if ($HypotheticalOverride -and [string]$HypotheticalOverride.Scope -ceq $scope) {
+            $previewCapability = [string]$HypotheticalOverride.Capability
+            if ([string]$HypotheticalOverride.Action -ceq 'off') { $record.Settings[$previewCapability] = 'off' }
+            else { $record.Settings.Remove($previewCapability) }
         }
         foreach ($name in @($record.Settings.Keys)) {
             if ([string]$record.Settings[$name] -cne 'off') { continue }
@@ -1532,7 +1557,7 @@ function Resolve-AgentEffectiveCapabilitySettings {
             }
         }
     }
-    return @{ Settings = $settings; Provenance = $provenance; FileFingerprints = @($fingerprints.ToArray()) }
+    return @{ Settings = $settings; Provenance = $provenance; FileFingerprints = @($fingerprints.ToArray()); KillSwitchActive = $false }
 }
 
 function Resolve-AgentCapabilityPolicyPartition {
@@ -1581,6 +1606,218 @@ function Enter-AgentCapabilityOverrideLock {
     return Enter-AgentExclusiveFile -Path (Join-Path $root 'capability-overrides.lock') `
         -ContentionReason capability-override-contended -TimeoutMilliseconds $TimeoutMilliseconds `
         -CancellationToken $CancellationToken -Metadata @{}
+}
+
+# ---------------------------------------------------------------------------
+# TUI edit/diff/reset UX + emergency kill switch (PR3): the first, and only, supported writer for
+# the outside-repository capability-override store PR2 introduced. Every mutation goes through
+# Set-AgentCapabilityOverrideSetting (atomic temp-write-then-replace, one scope file at a time) or
+# Enable-/Disable-AgentCapabilityOverrideKillSwitch (a separate owner-private sentinel, deliberately
+# outside the versioned v1 store so a future schema bump never orphans it). Callers are required
+# to hold Enter-AgentCapabilityOverrideLock for the same RepositoryRoot before calling any of these,
+# exactly like Write-AgentDurableState is always called under Enter-AgentDurableStateLock, so every
+# supported writer and every reader that must observe a consistent snapshot
+# (Resolve-AgentEffectiveCapabilitySettings via Get-BrokerCapabilityProfile,
+# Enter-AgentManualDispatchStartup) serializes through the identical single lock.
+# ---------------------------------------------------------------------------
+
+function Get-AgentDefaultCapabilityOverrideKillSwitchRoot {
+    <#
+        A dedicated root, sibling to (never nested under) the versioned 'capability-overrides\v1'
+        store -- deliberately its own independently-created-and-hardened directory rather than the
+        literal filesystem parent of the v1 root. That parent can already exist as a side effect of
+        Get-AgentCapabilityOverrideRoot's New-Item -Force creating 'v1' underneath it, in which case
+        Resolve-AgentTrustedRoot would see it as pre-existing and skip its own one-time
+        ACL-hardening branch, silently leaving it on whatever permissions it happened to inherit. A
+        brand-new path nothing else ever creates has no such history: the first
+        Enable-AgentCapabilityOverrideKillSwitch call is guaranteed to be the call that creates it,
+        so Resolve-AgentTrustedRoot's hardening branch always actually runs. This still satisfies
+        "outside the v1 child scope": a future schema version bump to the override store itself
+        never touches this path.
+    #>
+    if ($IsWindows) {
+        if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is required to resolve the capability-override kill-switch root on Windows.' }
+        return (Join-Path (Join-Path $env:LOCALAPPDATA 'DevPilot') 'capability-overrides.disabled')
+    }
+    $base = if ($env:XDG_STATE_HOME) { $env:XDG_STATE_HOME } else { Join-Path (Join-Path $HOME '.local') 'state' }
+    return (Join-Path (Join-Path $base 'devpilot') 'capability-overrides.disabled')
+}
+
+function Get-AgentCapabilityOverrideKillSwitchDisallowedRoots {
+    [Collections.Generic.List[string]]::new([string[]]@(
+            (Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot),
+            (Get-AgentDefaultCapabilityOverrideRoot)))
+}
+
+function Test-AgentCapabilityOverrideKillSwitch {
+    <#
+        Emergency operational lever (PR3): existence of the sentinel file alone is authoritative --
+        content is never consulted. Checked via a cheap Test-Path against the (possibly still
+        nonexistent) kill-switch root FIRST, so a machine that has never toggled the kill switch
+        never pays the cost of, or triggers, ACL/symlink hardening on every describe/profile call.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+    if (-not (Test-Path -LiteralPath $default -PathType Container)) { return $false }
+    $root = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
+        -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots)
+    $path = Join-Path $root 'sentinel.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    [void](Assert-AgentTrustedFile -Path $path -AllowedRoot $root -ExpectedPath $path -Private)
+    return $true
+}
+
+function Enable-AgentCapabilityOverrideKillSwitch {
+    <#
+        Idempotent: enabling an already-enabled kill switch is a no-op, never a second write.
+        Atomic owner-private create via the same temp-write-then-replace idiom every other writer
+        in this store uses (Write-AgentFileThrough + Install-AgentFileAtomic) -- no partial file is
+        ever observable at the final path. Caller must hold Enter-AgentCapabilityOverrideLock.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+    $root = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
+        -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots) -Create
+    $path = Join-Path $root 'sentinel.json'
+    if (Test-Path -LiteralPath $path -PathType Leaf) { return }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-AgentCanonicalJson ([ordered]@{
+                    schemaVersion = 1
+                    enabledAtUtc = (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))
+                })))
+    $tempPath = Join-Path $root "sentinel.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        Write-AgentFileThrough -Path $tempPath -Bytes $bytes
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($tempPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        Install-AgentFileAtomic -Source $tempPath -Destination $path
+    }
+    finally {
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Disable-AgentCapabilityOverrideKillSwitch {
+    <#
+        Idempotent: disabling an already-disabled (or never-enabled) kill switch is a no-op.
+        Caller must hold Enter-AgentCapabilityOverrideLock.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+    if (-not (Test-Path -LiteralPath $default -PathType Container)) { return }
+    $root = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
+        -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots)
+    $path = Join-Path $root 'sentinel.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
+    Assert-AgentPathHasNoLinks -Path $path
+    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+}
+
+function Set-AgentCapabilityOverrideSetting {
+    <#
+        THE atomic writer PR3 introduces: the only supported way any code narrows or resets a
+        persisted capability-override entry. Caller must already hold
+        Enter-AgentCapabilityOverrideLock for the same RepositoryRoot -- this function does not take
+        the lock itself, mirroring every other write-adjacent primitive in this module (e.g.
+        Write-AgentDurableState, always called from inside a caller-held lock).
+
+        'off' upserts the single named capability as 'off' in the selected scope's settings file.
+        'inherit' removes that single entry -- 'inherit' is never itself persisted as a settings
+        value (PR2's schema never accepted it as one). If removing (or never having added) any
+        entries leaves the scope's settings object empty, the file itself is deleted instead of
+        being written back as a near-empty residue record, atomically and safely, so a
+        never-edited scope and a fully-reset scope are indistinguishable on disk -- exactly like
+        PR2's existing "absent file means inherit" contract.
+
+        Every write is round-trip validated (re-parsed through the identical trusted reader a
+        future caller will use) before ever touching disk, and lands via the same
+        temp-file-in-the-same-directory + flush + atomic replace/rename idiom as every other write
+        in this module -- no partial file is ever observable at the final path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$CurrentSourceCommit,
+        [Parameter(Mandatory)][ValidateSet('machine', 'user', 'repo-worktree', 'pr')][string]$Scope,
+        [Parameter(Mandatory)][ValidatePattern('^[A-Za-z][A-Za-z0-9]*$')][string]$Capability,
+        [Parameter(Mandatory)][ValidateSet('off', 'inherit')][string]$Action,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$AllowedCapabilities,
+        [ValidateRange(60, 31536000)][int]$PrScopeTtlSeconds = 2592000
+    )
+    if ($AllowedCapabilities -cnotcontains $Capability) {
+        throw "[narrowing-invalid] Capability '$Capability' is not a recognized manually-selectable capability."
+    }
+    $root = Get-AgentCapabilityOverrideRoot -RepositoryRoot $RepositoryRoot
+    $repositoryKey = Get-AgentRepositoryIdentityKey -RepositoryIdentity $RepositoryIdentity
+    $worktreeId = Get-AgentWorktreeIdentity -RepositoryRoot $RepositoryRoot
+    $repoRoot = Join-Path (Join-Path $root 'repo') (Get-AgentSha256 -Text $repositoryKey)
+    $path = switch ($Scope) {
+        'machine' { Join-Path $root 'machine.settings.v1.json' }
+        'user' { Join-Path $root 'user.settings.v1.json' }
+        'repo-worktree' { Join-Path $repoRoot "$worktreeId.settings.v1.json" }
+        'pr' { Join-Path (Join-Path $repoRoot 'pr') "$PullRequestId-$($CurrentSourceCommit.Substring(0, 12)).settings.v1.json" }
+    }
+    $path = [IO.Path]::GetFullPath($path)
+    if (-not (Test-AgentPathWithin -Path $path -Root $root)) {
+        throw '[narrowing-invalid] Resolved settings path escaped the capability-override root.'
+    }
+    $parent = Split-Path $path -Parent
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($parent, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
+        }
+    }
+    $existingSettings = [ordered]@{}
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        $trustedPath = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -Private
+        $stable = Read-AgentStableFile -Path $trustedPath -MaxBytes 65536
+        if ($stable.Exists) {
+            $existingRecord = ConvertFrom-AgentTrustedCapabilityJson -Bytes $stable.Bytes -SourceScope $Scope -AllowedCapabilities $AllowedCapabilities
+            foreach ($key in @($existingRecord.Settings.Keys)) { $existingSettings[$key] = $existingRecord.Settings[$key] }
+        }
+    }
+    if ($Action -ceq 'off') { $existingSettings[$Capability] = 'off' } else { $existingSettings.Remove($Capability) }
+
+    if ($existingSettings.Count -eq 0) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Assert-AgentPathHasNoLinks -Path $path
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+        return
+    }
+    $record = [ordered]@{ schemaVersion = 1; settings = $existingSettings }
+    if ($Scope -eq 'repo-worktree' -or $Scope -eq 'pr') {
+        $record.repositoryKey = $repositoryKey
+        $record.worktreeId = $worktreeId
+    }
+    if ($Scope -eq 'pr') {
+        $record.pullRequestId = $PullRequestId
+        $record.sourceCommit = $CurrentSourceCommit
+        $record.expiresAtUtc = (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow.AddSeconds($PrScopeTtlSeconds)))
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($record | ConvertTo-Json -Compress -Depth 8))
+    # Round-trip validated before ever touching disk: the bytes about to be written must themselves
+    # parse back through the exact same trusted parser a future reader will use, with the identical
+    # settings -- catches a schema/serialization mismatch here, synchronously, rather than
+    # persisting a file this store's own reader could later reject or misinterpret.
+    $roundTrip = ConvertFrom-AgentTrustedCapabilityJson -Bytes $bytes -SourceScope $Scope -AllowedCapabilities $AllowedCapabilities
+    if ((ConvertTo-AgentCanonicalJson $roundTrip.Settings) -cne (ConvertTo-AgentCanonicalJson $existingSettings)) {
+        throw '[narrowing-invalid] Serialized settings failed round-trip validation.'
+    }
+    $tempPath = Join-Path $parent ("{0}.tmp-{1}-{2}" -f (Split-Path $path -Leaf), $PID, ([Guid]::NewGuid().ToString('N')))
+    try {
+        Write-AgentFileThrough -Path $tempPath -Bytes $bytes
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($tempPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        Install-AgentFileAtomic -Source $tempPath -Destination $path
+    }
+    finally {
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Enter-AgentManualDispatchStartup {
@@ -4896,6 +5133,11 @@ Export-ModuleMember -Function @(
     "Resolve-AgentEffectiveCapabilitySettings",
     "Resolve-AgentCapabilityPolicyPartition",
     "Enter-AgentCapabilityOverrideLock",
+     "Get-AgentDefaultCapabilityOverrideKillSwitchRoot",
+     "Test-AgentCapabilityOverrideKillSwitch",
+     "Enable-AgentCapabilityOverrideKillSwitch",
+     "Disable-AgentCapabilityOverrideKillSwitch",
+     "Set-AgentCapabilityOverrideSetting",
     "Repair-AgentDurableState",
     "Read-AgentDurableState",
     "Write-AgentDurableState",

@@ -48,9 +48,9 @@ $cancelCount = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
   $r = $line | ConvertFrom-Json
   if ($r.operation -eq 'describe') {
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@('EnableSummaryComment');mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@('EnableFindingComments','EnableSummaryComment','EnableThreadReplies');delegableAvailable=@();provenance=@{EnableFindingComments='operational-default';EnableSummaryComment='operational-default';EnableThreadReplies='operational-default';EnableApprovalVote='operational-default'}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@('EnableSummaryComment');mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@('EnableFindingComments','EnableSummaryComment','EnableThreadReplies');delegableAvailable=@();killSwitchActive=$false;provenance=@{EnableFindingComments='operational-default';EnableSummaryComment='operational-default';EnableThreadReplies='operational-default';EnableApprovalVote='operational-default'}} | ConvertTo-Json -Compress -Depth 10
   } elseif ($r.operation -eq 'profile') {
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-profile';role='reviewer';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilities=@('EnableSummaryComment');mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@('EnableFindingComments','EnableSummaryComment','EnableThreadReplies');delegableAvailable=@();provenance=@{EnableFindingComments='operational-default';EnableSummaryComment='operational-default';EnableThreadReplies='operational-default';EnableApprovalVote='operational-default'}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-profile';role='reviewer';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilities=@('EnableSummaryComment');mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@('EnableFindingComments','EnableSummaryComment','EnableThreadReplies');delegableAvailable=@();killSwitchActive=$false;provenance=@{EnableFindingComments='operational-default';EnableSummaryComment='operational-default';EnableThreadReplies='operational-default';EnableApprovalVote='operational-default'}} | ConvertTo-Json -Compress -Depth 10
   } elseif ($r.operation -eq 'dispatch') {
     @{schemaVersion=1;requestId=$r.requestId;operation='accepted';dispatchId='22222222-2222-4222-8222-222222222222';repositoryIdentity=@{};pullRequestId=104;role='reviewer';capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);childProcessId=42;eventLogPath=(Join-Path $PSScriptRoot 'event.jsonl')} | ConvertTo-Json -Compress -Depth 10
   } elseif ($r.operation -eq 'cancel') {
@@ -163,7 +163,7 @@ if ($r.operation -eq 'describe') {
     // Every PR1 field present and well-typed, but delegableAvailable is non-empty -- no delegation
     // policy can exist yet in this release, so the client must treat this as malformed too.
     const nonEmptyDelegable = await describeWith(String.raw`
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@('EnableApprovalVote');provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@('EnableApprovalVote');killSwitchActive=$false;provenance=@{}} | ConvertTo-Json -Compress -Depth 10
 `);
     assert.equal(nonEmptyDelegable.rejected, true);
     assert.equal(nonEmptyDelegable.failures.length, 1);
@@ -212,14 +212,14 @@ if ($r.operation -eq 'describe') {
     // or buggy broker response could plausibly send, and exactly what UI code's .join() assumes
     // will never happen.
     const nonArrayCapabilities = await describeWith(String.raw`
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities='EnableSummaryComment';mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities='EnableSummaryComment';mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();killSwitchActive=$false;provenance=@{}} | ConvertTo-Json -Compress -Depth 10
 `);
     assert.equal(nonArrayCapabilities.rejected, true);
     assert.equal(nonArrayCapabilities.failures.length, 1);
 
     // Legacy `mandatoryDenies` is an array, but one item is not a string.
     const nonStringItem = await describeWith(String.raw`
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@(7);dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@(7);dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();killSwitchActive=$false;provenance=@{}} | ConvertTo-Json -Compress -Depth 10
 `);
     assert.equal(nonStringItem.rejected, true);
     assert.equal(nonStringItem.failures.length, 1);
@@ -228,7 +228,7 @@ if ($r.operation -eq 'describe') {
     // item-count limit the parser now enforces uniformly across every capability-name array.
     const oversizedArray = await describeWith(String.raw`
     $items = 1..300 | ForEach-Object { "c$_" }
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@();dynamicConstraints=$items;absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@();dynamicConstraints=$items;absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();killSwitchActive=$false;provenance=@{}} | ConvertTo-Json -Compress -Depth 10
 `);
     assert.equal(oversizedArray.rejected, true);
     assert.equal(oversizedArray.failures.length, 1);
@@ -258,7 +258,7 @@ param([string]$DescriptorPath)
 $line = [Console]::In.ReadLine()
 $r = $line | ConvertFrom-Json
 if ($r.operation -eq 'profile') {
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-profile';role='reviewer';repositoryIdentity=${validIdentity};prSnapshot=${validPrSnapshot};capabilities=@();mandatoryDenies=@();dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=` +
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-profile';role='reviewer';repositoryIdentity=${validIdentity};prSnapshot=${validPrSnapshot};capabilities=@();mandatoryDenies=@();dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();killSwitchActive=$false;provenance=` +
       provenancePs1 + String.raw`} | ConvertTo-Json -Compress -Depth 10
 }
 # Exit immediately after the single response, matching the other single-shot fixtures in this file.
@@ -280,11 +280,12 @@ if ($r.operation -eq 'profile') {
   }
 
   try {
-    // Every known provenance value (the operational-default ceiling plus all four
-    // outside-repository capability-override store scopes) must parse through unchanged.
+    // Every known provenance value (the operational-default ceiling, all four outside-repository
+    // capability-override store scopes, and the PR3 kill-switch emergency lever) must parse
+    // through unchanged.
     const allKnown = await profileWithProvenance(
       "@{ceilingCap='operational-default';machineCap='machine';userCap='user';" +
-      "worktreeCap='repo-worktree';prCap='pr'}",
+      "worktreeCap='repo-worktree';prCap='pr';killSwitchCap='kill-switch'}",
     );
     // The single-shot fixture exits right after writing its one response (matching the other
     // fixtures in this file), which the client reports as one unrequested-exit broker failure --
@@ -296,6 +297,7 @@ if ($r.operation -eq 'profile') {
     assert.equal(allKnown.profile?.provenance.userCap, "user");
     assert.equal(allKnown.profile?.provenance.worktreeCap, "repo-worktree");
     assert.equal(allKnown.profile?.provenance.prCap, "pr");
+    assert.equal(allKnown.profile?.provenance.killSwitchCap, "kill-switch");
 
     // An unrecognized provenance value must still be rejected outright rather than silently
     // accepted -- the runtime validator is the trust boundary for this union, not just its type.
@@ -335,7 +337,7 @@ $r = $line | ConvertFrom-Json
 if ($r.operation -eq '` + operation + String.raw`') {
     @{schemaVersion=1;requestId=$r.requestId;operation='` + responseOperation + `';` + roleAssignment + draftFields +
       `repositoryIdentity=${validIdentity};prSnapshot=${validPrSnapshot};capabilities=@();mandatoryDenies=@();` +
-      `dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} |` +
+      `dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();killSwitchActive=$false;provenance=@{}} |` +
       String.raw` ConvertTo-Json -Compress -Depth 10
 }
 # Exit immediately after the single response (matching the other malformed-field fixtures in this

@@ -23,13 +23,26 @@ export interface PullRequestSnapshotV1 {
   title: string;
 }
 
-// operational-default is the un-narrowed, checked-in ceiling; the other four match the
-// outside-repository capability-override store's scopes (broad-to-narrow: machine, user,
-// repo-worktree, pr -- see Resolve-AgentEffectiveCapabilitySettings). Every value the broker can
-// legitimately put on the wire must be listed here, or a real, correctly-narrowed profile/summary
-// response is rejected outright by provenanceField below.
-export const KNOWN_PROVENANCE = ["operational-default", "machine", "user", "repo-worktree", "pr"] as const;
+// operational-default is the un-narrowed, checked-in ceiling; machine/user/repo-worktree/pr match
+// the outside-repository capability-override store's scopes (broad-to-narrow -- see
+// Resolve-AgentEffectiveCapabilitySettings); kill-switch (PR3) marks every capability when the
+// emergency override-disable sentinel is active, superseding whatever the store would otherwise
+// report. Every value the broker can legitimately put on the wire must be listed here, or a real,
+// correctly-narrowed profile/summary response is rejected outright by provenanceField below.
+export const KNOWN_PROVENANCE = ["operational-default", "machine", "user", "repo-worktree", "pr", "kill-switch"] as const;
 export type CapabilityProvenance = (typeof KNOWN_PROVENANCE)[number];
+
+// PR3: the four persisted-narrowing scopes an operator can directly edit -- the same broad-to-narrow
+// set KNOWN_PROVENANCE's machine/user/repo-worktree/pr values name, but as a closed request-side enum
+// (never 'operational-default'/'kill-switch', which are provenance OUTCOMES, not editable targets).
+export const NARROWING_SCOPES = ["machine", "user", "repo-worktree", "pr"] as const;
+export type NarrowingScope = (typeof NARROWING_SCOPES)[number];
+
+// Fixed action enum: 'off' narrows; 'inherit' resets that one capability back to whatever a
+// broader scope (or the operational default) already provides. There is no 'on' -- this store is
+// narrow-only by construction, never a path to widen a capability (see issue #105 charter).
+export const NARROWING_ACTIONS = ["off", "inherit"] as const;
+export type NarrowingAction = (typeof NARROWING_ACTIONS)[number];
 
 export interface CapabilitySummary {
   schemaVersion: 1;
@@ -50,6 +63,10 @@ export interface CapabilitySummary {
   allowedManualCapabilities: string[];
   delegableAvailable: string[];
   provenance: Record<string, CapabilityProvenance>;
+  // PR3: true when the emergency kill switch is currently masking every persisted override for
+  // this machine+user. capabilities/mandatoryDenies/provenance above already reflect that (ceiling
+  // defaults, provenance 'kill-switch') -- this flag lets the UI additionally explain WHY.
+  killSwitchActive: boolean;
 }
 
 // Read-only effective-capability-profile inspection (PR1 issue #105): the Settings TUI's dedicated,
@@ -72,6 +89,57 @@ export interface CapabilityProfile {
   allowedManualCapabilities: string[];
   delegableAvailable: string[];
   provenance: Record<string, CapabilityProvenance>;
+  killSwitchActive: boolean;
+}
+
+// PR3: the {capabilities, mandatoryDenies, provenance} triple describing one resolved effective
+// profile -- shared shape for both the CURRENT (pre-change) and PROPOSED (post-hypothetical-change)
+// halves of a narrowing preview, so a diff is always comparing two values of the identical type.
+export interface CapabilityNarrowingEffect {
+  capabilities: string[];
+  mandatoryDenies: string[];
+  provenance: Record<string, CapabilityProvenance>;
+}
+
+// Non-mutating preview/diff (PR3): never writes anything, never allocates a dispatch draft/config
+// snapshot. previewToken + storeFingerprint bind this exact hypothetical mutation to the broker's
+// in-memory record of it; applyNarrowing must echo both back unchanged, and the broker re-verifies
+// repository/worktree/PR/source-commit/store-fingerprint identity before ever writing.
+export interface CapabilityNarrowingPreview {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "narrowing-preview";
+  state: "previewed";
+  role: AgentRole;
+  repositoryIdentity: RepositoryIdentityV1;
+  prSnapshot: PullRequestSnapshotV1;
+  scope: NarrowingScope;
+  capability: string;
+  action: NarrowingAction;
+  previewToken: string;
+  storeFingerprint: string;
+  expiresAtUtc: string;
+  killSwitchActive: boolean;
+  changed: boolean;
+  current: CapabilityNarrowingEffect;
+  proposed: CapabilityNarrowingEffect;
+}
+
+export interface CapabilityNarrowingApplied {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "narrowing-applied";
+  state: "applied";
+  scope: NarrowingScope;
+  capability: string;
+  action: NarrowingAction;
+}
+
+export interface KillSwitchApplied {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "kill-switch-applied";
+  enabled: boolean;
 }
 
 export interface DispatchAccepted {
@@ -109,6 +177,9 @@ export interface DispatchTerminal {
 type BrokerResponse =
   | CapabilitySummary
   | CapabilityProfile
+  | CapabilityNarrowingPreview
+  | CapabilityNarrowingApplied
+  | KillSwitchApplied
   | DispatchAccepted
   | DispatchRejected
   | DispatchTerminal
@@ -138,6 +209,21 @@ export interface DispatchClientOptions {
 export interface DispatchBroker {
   describe(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilitySummary>;
   profile(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilityProfile>;
+  // PR3 narrow-only edit protocol. previewNarrowing never mutates anything; applyNarrowing takes
+  // the full CapabilityNarrowingPreview it was just given (mirroring dispatch(summary, ...) taking
+  // the full CapabilitySummary) so the client never has to separately track the binding fields the
+  // broker will re-verify. Callers must refresh via profile() after either succeeds -- neither
+  // returns a full effective profile itself.
+  previewNarrowing(
+    repositoryKey: string,
+    pullRequestId: number,
+    role: AgentRole,
+    scope: NarrowingScope,
+    capability: string,
+    action: NarrowingAction,
+  ): Promise<CapabilityNarrowingPreview>;
+  applyNarrowing(preview: CapabilityNarrowingPreview, repositoryKey: string, pullRequestId: number): Promise<CapabilityNarrowingApplied>;
+  setKillSwitch(repositoryKey: string, role: AgentRole, enabled: boolean): Promise<KillSwitchApplied>;
   dispatch(summary: CapabilitySummary, operatorPrompt: string): Promise<DispatchAccepted>;
   cancel(dispatchId: string): Promise<DispatchTerminal>;
   shutdown(timeoutMilliseconds?: number): Promise<void>;
@@ -270,11 +356,17 @@ function provenanceField(record: Record<string, unknown>, name: string): Record<
   return result;
 }
 
+function booleanField(record: Record<string, unknown>, name: string): boolean {
+  const value = record[name];
+  if (typeof value !== "boolean") throw new Error(`broker response ${name} is invalid`);
+  return value;
+}
+
 // Constructs the PR1 additive profile fields from validated values only -- never spread/cast
 // straight from the untrusted parsed record, unlike the rest of parseResponse's envelope fields.
 function parseCapabilityProfileFields(record: Record<string, unknown>): Pick<
   CapabilitySummary,
-  "absoluteDenies" | "allowedManualCapabilities" | "delegableAvailable" | "provenance"
+  "absoluteDenies" | "allowedManualCapabilities" | "delegableAvailable" | "provenance" | "killSwitchActive"
 > {
   const delegableAvailable = stringArrayField(record, "delegableAvailable");
   if (delegableAvailable.length > 0) {
@@ -287,6 +379,46 @@ function parseCapabilityProfileFields(record: Record<string, unknown>): Pick<
     allowedManualCapabilities: stringArrayField(record, "allowedManualCapabilities"),
     delegableAvailable,
     provenance: provenanceField(record, "provenance"),
+    killSwitchActive: booleanField(record, "killSwitchActive"),
+  };
+}
+
+const CAPABILITY_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9]*$/;
+
+function capabilityNameField(record: Record<string, unknown>, name: string): string {
+  const value = record[name];
+  if (typeof value !== "string" || value.length > MAX_CAPABILITY_ITEM_LENGTH || !CAPABILITY_NAME_PATTERN.test(value)) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  return value;
+}
+
+function narrowingScopeField(record: Record<string, unknown>, name: string): NarrowingScope {
+  const value = record[name];
+  if (typeof value !== "string" || !(NARROWING_SCOPES as readonly string[]).includes(value)) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  return value as NarrowingScope;
+}
+
+function narrowingActionField(record: Record<string, unknown>, name: string): NarrowingAction {
+  const value = record[name];
+  if (typeof value !== "string" || !(NARROWING_ACTIONS as readonly string[]).includes(value)) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  return value as NarrowingAction;
+}
+
+function narrowingEffectField(record: Record<string, unknown>, name: string): CapabilityNarrowingEffect {
+  const value = record[name];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  const raw = value as Record<string, unknown>;
+  return {
+    capabilities: stringArrayField(raw, "capabilities"),
+    mandatoryDenies: stringArrayField(raw, "mandatoryDenies"),
+    provenance: provenanceField(raw, "provenance"),
   };
 }
 
@@ -295,7 +427,20 @@ function parseResponse(line: string): BrokerResponse {
   if (record.schemaVersion !== 1) throw new Error("unsupported broker protocol version");
   const requestId = stringField(record, "requestId");
   const operation = stringField(record, "operation");
-  if (!["capability-summary", "capability-profile", "accepted", "rejected", "completed", "cancelled", "shutdown-complete"].includes(operation)) {
+  if (
+    ![
+      "capability-summary",
+      "capability-profile",
+      "narrowing-preview",
+      "narrowing-applied",
+      "kill-switch-applied",
+      "accepted",
+      "rejected",
+      "completed",
+      "cancelled",
+      "shutdown-complete",
+    ].includes(operation)
+  ) {
     throw new Error("unknown broker response operation");
   }
   if (operation === "capability-summary" || operation === "capability-profile") {
@@ -318,6 +463,50 @@ function parseResponse(line: string): BrokerResponse {
       return { ...record, requestId, operation, ...shared } as CapabilitySummary;
     }
     return { ...record, requestId, operation, ...shared } as CapabilityProfile;
+  }
+  if (operation === "narrowing-preview") {
+    const stateValue = stringField(record, "state");
+    if (stateValue !== "previewed") throw new Error("broker response state is invalid");
+    return {
+      schemaVersion: 1,
+      requestId,
+      operation,
+      state: "previewed",
+      role: roleField(record, "role"),
+      repositoryIdentity: repositoryIdentityField(record, "repositoryIdentity"),
+      prSnapshot: prSnapshotField(record, "prSnapshot"),
+      scope: narrowingScopeField(record, "scope"),
+      capability: capabilityNameField(record, "capability"),
+      action: narrowingActionField(record, "action"),
+      previewToken: stringField(record, "previewToken"),
+      storeFingerprint: stringField(record, "storeFingerprint"),
+      expiresAtUtc: boundedPrText(record, "expiresAtUtc"),
+      killSwitchActive: booleanField(record, "killSwitchActive"),
+      changed: booleanField(record, "changed"),
+      current: narrowingEffectField(record, "current"),
+      proposed: narrowingEffectField(record, "proposed"),
+    } satisfies CapabilityNarrowingPreview;
+  }
+  if (operation === "narrowing-applied") {
+    const stateValue = stringField(record, "state");
+    if (stateValue !== "applied") throw new Error("broker response state is invalid");
+    return {
+      schemaVersion: 1,
+      requestId,
+      operation,
+      state: "applied",
+      scope: narrowingScopeField(record, "scope"),
+      capability: capabilityNameField(record, "capability"),
+      action: narrowingActionField(record, "action"),
+    } satisfies CapabilityNarrowingApplied;
+  }
+  if (operation === "kill-switch-applied") {
+    return {
+      schemaVersion: 1,
+      requestId,
+      operation,
+      enabled: booleanField(record, "enabled"),
+    } satisfies KillSwitchApplied;
   }
   return { ...record, requestId, operation } as BrokerResponse;
 }
@@ -410,6 +599,56 @@ export class DispatchClient implements DispatchBroker {
       }
       return response;
     });
+  }
+
+  previewNarrowing(
+    repositoryKey: string,
+    pullRequestId: number,
+    role: AgentRole,
+    scope: NarrowingScope,
+    capability: string,
+    action: NarrowingAction,
+  ): Promise<CapabilityNarrowingPreview> {
+    return this.request<CapabilityNarrowingPreview>({
+      schemaVersion: 1,
+      operation: "preview-narrowing",
+      repositoryKey,
+      pullRequestId,
+      role,
+      scope,
+      capability,
+      action,
+    }, "narrowing-preview").then((response) => {
+      if (response.role !== role || response.scope !== scope || response.capability !== capability || response.action !== action) {
+        throw new Error("broker narrowing-preview does not match the requested mutation");
+      }
+      return response;
+    });
+  }
+
+  applyNarrowing(preview: CapabilityNarrowingPreview, repositoryKey: string, pullRequestId: number): Promise<CapabilityNarrowingApplied> {
+    return this.request({
+      schemaVersion: 1,
+      operation: "apply-narrowing",
+      repositoryKey,
+      pullRequestId,
+      role: preview.role,
+      scope: preview.scope,
+      capability: preview.capability,
+      action: preview.action,
+      previewToken: preview.previewToken,
+      storeFingerprint: preview.storeFingerprint,
+    }, "narrowing-applied");
+  }
+
+  setKillSwitch(repositoryKey: string, role: AgentRole, enabled: boolean): Promise<KillSwitchApplied> {
+    return this.request({
+      schemaVersion: 1,
+      operation: "set-kill-switch",
+      repositoryKey,
+      role,
+      enabled,
+    }, "kill-switch-applied");
   }
 
   dispatch(summary: CapabilitySummary, operatorPrompt: string): Promise<DispatchAccepted> {

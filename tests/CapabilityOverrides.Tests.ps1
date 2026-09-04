@@ -569,3 +569,173 @@ Describe 'broker and child-startup wiring' {
         }
     }
 }
+
+Describe 'PR3 capability-override writer and kill switch' {
+    It 'exports the PR3 writer and kill-switch primitives at module scope' {
+        foreach ($name in @(
+                'Set-AgentCapabilityOverrideSetting', 'Test-AgentCapabilityOverrideKillSwitch',
+                'Enable-AgentCapabilityOverrideKillSwitch', 'Disable-AgentCapabilityOverrideKillSwitch')) {
+            Get-Command $name -Module DevPilot.AgentHarness | Should -Not -BeNullOrEmpty
+        }
+    }
+
+    It 'writes off, then reset removes the file entirely with no residue and no leftover temp files' {
+        $roots = New-TestRoots
+        $allowed = (Get-AgentHarnessCapabilityDescriptor -Role reviewer).allowedManualCapabilities
+        $capability = $allowed[0]
+        $lock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $roots.RepoRoot
+        $lock.Acquired | Should -BeTrue
+        try {
+            Set-AgentCapabilityOverrideSetting -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+                -PullRequestId 1 -CurrentSourceCommit $commit -Scope user -Capability $capability -Action off `
+                -AllowedCapabilities $allowed
+        }
+        finally { Exit-AgentLock $lock.Stream }
+        $userFile = Join-Path (Get-AgentDefaultCapabilityOverrideRoot) 'user.settings.v1.json'
+        Test-Path -LiteralPath $userFile | Should -BeTrue
+        $eff = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+            -PullRequestId 1 -CurrentSourceCommit $commit
+        $eff.Settings[$capability] | Should -BeExactly 'off'
+        $eff.Provenance[$capability] | Should -BeExactly 'user'
+
+        $lock2 = Enter-AgentCapabilityOverrideLock -RepositoryRoot $roots.RepoRoot
+        try {
+            Set-AgentCapabilityOverrideSetting -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+                -PullRequestId 1 -CurrentSourceCommit $commit -Scope user -Capability $capability -Action inherit `
+                -AllowedCapabilities $allowed
+        }
+        finally { Exit-AgentLock $lock2.Stream }
+        Test-Path -LiteralPath $userFile | Should -BeFalse
+        $leftover = Get-ChildItem -Path (Get-AgentDefaultCapabilityOverrideRoot) -Recurse -Filter '*.tmp-*' -ErrorAction SilentlyContinue
+        $leftover | Should -BeNullOrEmpty
+        $effAfter = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+            -PullRequestId 1 -CurrentSourceCommit $commit
+        $effAfter.Settings.Contains($capability) | Should -BeFalse
+    }
+
+    It 'rejects a capability outside the allowed set, including delegableDefaultOff and unknown/case-variant names' {
+        $roots = New-TestRoots
+        $allowed = (Get-AgentHarnessCapabilityDescriptor -Role reviewer).allowedManualCapabilities
+        $lock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $roots.RepoRoot
+        try {
+            { Set-AgentCapabilityOverrideSetting -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+                    -PullRequestId 1 -CurrentSourceCommit $commit -Scope user -Capability 'EnableApprovalVote' -Action off `
+                    -AllowedCapabilities $allowed
+            } | Should -Throw '*narrowing-invalid*'
+            { Set-AgentCapabilityOverrideSetting -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+                    -PullRequestId 1 -CurrentSourceCommit $commit -Scope user -Capability 'NotARealCapability' -Action off `
+                    -AllowedCapabilities $allowed
+            } | Should -Throw '*narrowing-invalid*'
+            { Set-AgentCapabilityOverrideSetting -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+                    -PullRequestId 1 -CurrentSourceCommit $commit -Scope user -Capability ($allowed[0].ToUpperInvariant()) -Action off `
+                    -AllowedCapabilities $allowed
+            } | Should -Throw '*narrowing-invalid*'
+        }
+        finally { Exit-AgentLock $lock.Stream }
+    }
+
+    It 'writes a PR-scope record with the correct required binding fields and an expiry in the future' {
+        $roots = New-TestRoots
+        $allowed = (Get-AgentHarnessCapabilityDescriptor -Role reviewer).allowedManualCapabilities
+        $lock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $roots.RepoRoot
+        try {
+            Set-AgentCapabilityOverrideSetting -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+                -PullRequestId 42 -CurrentSourceCommit $commit -Scope pr -Capability $allowed[0] -Action off `
+                -AllowedCapabilities $allowed
+        }
+        finally { Exit-AgentLock $lock.Stream }
+        $eff = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+            -PullRequestId 42 -CurrentSourceCommit $commit
+        $eff.Settings[$allowed[0]] | Should -BeExactly 'off'
+        $eff.Provenance[$allowed[0]] | Should -BeExactly 'pr'
+        # A different PR number must never see this record (deterministic per-PR filename + full-SHA binding).
+        $effOtherPr = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+            -PullRequestId 43 -CurrentSourceCommit $commit
+        $effOtherPr.Settings.Contains($allowed[0]) | Should -BeFalse
+    }
+
+    It 'hypothetical-override preview never drifts from what the writer would actually persist' {
+        # Same invariant the shared Resolve-AgentCapabilityPolicyPartition primitive already
+        # protects: the preview path and the real resolver are the SAME function, so this proves it
+        # end-to-end rather than by inspection -- preview a narrowing, apply it for real, and assert
+        # the two resolutions agree exactly.
+        $roots = New-TestRoots
+        $allowed = (Get-AgentHarnessCapabilityDescriptor -Role reviewer).allowedManualCapabilities
+        $capability = $allowed[1]
+        $hypothetical = @{ Scope = 'repo-worktree'; Capability = $capability; Action = 'off' }
+        $preview = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+            -PullRequestId 1 -CurrentSourceCommit $commit -HypotheticalOverride $hypothetical
+        $lock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $roots.RepoRoot
+        try {
+            Set-AgentCapabilityOverrideSetting -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+                -PullRequestId 1 -CurrentSourceCommit $commit -Scope repo-worktree -Capability $capability -Action off `
+                -AllowedCapabilities $allowed
+        }
+        finally { Exit-AgentLock $lock.Stream }
+        $applied = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+            -PullRequestId 1 -CurrentSourceCommit $commit
+        (ConvertTo-AgentCanonicalJson $preview.Settings) | Should -BeExactly (ConvertTo-AgentCanonicalJson $applied.Settings)
+        (ConvertTo-AgentCanonicalJson $preview.Provenance) | Should -BeExactly (ConvertTo-AgentCanonicalJson $applied.Provenance)
+    }
+
+    It 'kill switch is off by default, masks all persisted narrowing while on, and is idempotent' {
+        $roots = New-TestRoots
+        $allowed = (Get-AgentHarnessCapabilityDescriptor -Role reviewer).allowedManualCapabilities
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+
+        $lock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $roots.RepoRoot
+        try {
+            Set-AgentCapabilityOverrideSetting -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+                -PullRequestId 1 -CurrentSourceCommit $commit -Scope machine -Capability $allowed[0] -Action off `
+                -AllowedCapabilities $allowed
+        }
+        finally { Exit-AgentLock $lock.Stream }
+
+        Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot
+        Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot  # idempotent, no throw
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeTrue
+        $duringKillSwitch = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+            -PullRequestId 1 -CurrentSourceCommit $commit
+        $duringKillSwitch.Settings.Count | Should -Be 0
+        $duringKillSwitch.KillSwitchActive | Should -BeTrue
+
+        Disable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot
+        Disable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot  # idempotent, no throw
+        Test-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot | Should -BeFalse
+        $afterDisable = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $roots.RepoRoot `
+            -PullRequestId 1 -CurrentSourceCommit $commit
+        $afterDisable.Settings[$allowed[0]] | Should -BeExactly 'off'
+        $afterDisable.KillSwitchActive | Should -BeFalse
+    }
+
+    It 'the kill-switch sentinel root stays disjoint from the versioned v1 override store and every sibling root' {
+        $roots = New-TestRoots
+        Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot
+        $killSwitchRoot = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+        $v1Root = Get-AgentDefaultCapabilityOverrideRoot
+        Test-AgentPathWithin -Path $killSwitchRoot -Root $v1Root | Should -BeFalse
+        Test-AgentPathWithin -Path $v1Root -Root $killSwitchRoot | Should -BeFalse
+        foreach ($sibling in @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot))) {
+            Test-AgentPathWithin -Path $killSwitchRoot -Root $sibling | Should -BeFalse
+            Test-AgentPathWithin -Path $sibling -Root $killSwitchRoot | Should -BeFalse
+        }
+        Disable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot
+    }
+
+    It 'two concurrent writers cannot both hold the capability-override lock at once' {
+        $roots = New-TestRoots
+        $first = Enter-AgentCapabilityOverrideLock -RepositoryRoot $roots.RepoRoot -TimeoutMilliseconds 200
+        $first.Acquired | Should -BeTrue
+        try {
+            $second = Enter-AgentCapabilityOverrideLock -RepositoryRoot $roots.RepoRoot -TimeoutMilliseconds 200
+            $second.Acquired | Should -BeFalse
+            $second.Reason | Should -BeExactly 'capability-override-contended'
+        }
+        finally {
+            Exit-AgentLock $first.Stream
+        }
+        $followUp = Enter-AgentCapabilityOverrideLock -RepositoryRoot $roots.RepoRoot -TimeoutMilliseconds 200
+        $followUp.Acquired | Should -BeTrue
+        Exit-AgentLock $followUp.Stream
+    }
+}

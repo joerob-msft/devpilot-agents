@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory)][string]$DescriptorPath,
     [ValidateRange(1024, 65536)][int]$MaximumLineBytes = 65536,
-    [ValidateRange(1, 3600)][int]$DraftLifetimeSeconds = 600
+    [ValidateRange(1, 3600)][int]$DraftLifetimeSeconds = 600,
+    [ValidateRange(5, 300)][int]$NarrowingPreviewTtlSeconds = 120
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,6 +59,11 @@ $writerGate = [object]::new()
 $drafts = @{}
 $children = @{}
 $requestIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+# PR3: in-memory-only preview bindings for the narrow-only settings editor (preview-narrowing /
+# apply-narrowing). Never persisted, never a reusable proof -- a token is consumed (removed) the
+# instant apply-narrowing succeeds, and any expired or otherwise-consumed token fails closed,
+# requiring a fresh preview. Broker-local, exactly like $drafts.
+$narrowingPreviews = @{}
 $accepting = $true
 
 function Get-OptionalMember {
@@ -154,6 +160,13 @@ function Remove-ExpiredDrafts {
         }
         Remove-DraftResidue $draft
         $drafts.Remove($id)
+    }
+}
+
+function Remove-ExpiredNarrowingPreviews {
+    $now = [DateTime]::UtcNow
+    foreach ($token in @($narrowingPreviews.Keys)) {
+        if ($now -ge $narrowingPreviews[$token].ExpiresAtUtc) { $narrowingPreviews.Remove($token) }
     }
 }
 
@@ -262,6 +275,36 @@ function New-ConfigSnapshot {
     }
 }
 
+function Get-BrokerNarrowingEffect {
+    # Shared provenance/partition builder reused by Get-BrokerCapabilityProfile (the live effective
+    # profile) and Invoke-PreviewNarrowing (a hypothetical hop over the same live data) -- exactly
+    # ONE place decides how a resolved override turns into {capabilities, mandatoryDenies,
+    # provenance}, so a preview's "proposed" effect can never drift from what describe/profile/apply
+    # would themselves compute for the identical override.
+    param(
+        [Parameter(Mandatory)][hashtable]$RoleDescriptor,
+        [Parameter(Mandatory)][string[]]$AllowedManualCapabilities,
+        [Parameter(Mandatory)][string[]]$AbsoluteDenies,
+        [Parameter(Mandatory)][hashtable]$Override
+    )
+    $mandatoryDeniesBase = @($RoleDescriptor.mandatoryDenies | Sort-Object -Unique)
+    $provenance = [ordered]@{}
+    foreach ($name in @($AllowedManualCapabilities + $mandatoryDeniesBase + $AbsoluteDenies | Sort-Object -Unique)) {
+        $provenance[$name] = 'operational-default'
+    }
+    $partition = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $RoleDescriptor -PersistedNarrowing $Override.Settings
+    if ([bool]$Override.KillSwitchActive) {
+        # Emergency lever (PR3): every capability's provenance reads 'kill-switch', not
+        # 'operational-default' -- the operator can see overrides exist but are being ignored,
+        # distinct from a genuinely empty store.
+        foreach ($name in @($provenance.Keys | Sort-Object)) { $provenance[$name] = 'kill-switch' }
+    }
+    else {
+        foreach ($name in @($Override.Provenance.Keys)) { $provenance[$name] = $Override.Provenance[$name] }
+    }
+    return @{ capabilities = $partition.capabilities; mandatoryDenies = $partition.mandatoryDenies; provenance = $provenance }
+}
+
 function Get-BrokerCapabilityProfile {
     # Shared, side-effect-free profile builder for describe (capability-summary) and the read-only
     # profile operation (capability-profile): role/PR validation, provider reads, dynamic
@@ -301,10 +344,6 @@ function Get-BrokerCapabilityProfile {
         $absoluteDenies = @($harnessRole.absoluteDenies | Sort-Object -Unique)
         $allowedManualCapabilities = @($harnessRole.allowedManualCapabilities | Sort-Object -Unique)
         $delegableAvailable = @()
-        $provenance = [ordered]@{}
-        foreach ($name in @($allowedManualCapabilities + $mandatoryDenies + $absoluteDenies | Sort-Object -Unique)) {
-            $provenance[$name] = 'operational-default'
-        }
         # PR2: narrow the operational-default ceiling by any persisted, outside-repository
         # capability override. Overrides can only ever remove an active capability, never add one
         # (Resolve-AgentCapabilityPolicyPartition). A resolution failure (corrupt/stale/expired/
@@ -312,8 +351,9 @@ function Get-BrokerCapabilityProfile {
         # rather than silently falling back to the un-narrowed ceiling -- that fallback would be a
         # silent widening from the operator's own last-known-good intent.
         #
-        # Holds the same capability-override lock every future writer (PR3) will take before its
-        # atomic replace, so a cooperating writer's delete/rename can never interleave with this
+        # Holds the same capability-override lock every PR3 writer (Set-AgentCapabilityOverrideSetting,
+        # Enable-/Disable-AgentCapabilityOverrideKillSwitch) takes before its atomic replace, so a
+        # cooperating writer's delete/rename can never interleave with this
         # read. A file that still vanishes out from under us while the lock is held (Resolve-
         # AgentEffectiveCapabilitySettings surfaces this as the distinct [stable-read-unstable]
         # signal, never as ordinary "invalid"/corrupt content) is retried exactly once under the
@@ -340,10 +380,11 @@ function Get-BrokerCapabilityProfile {
         finally {
             Exit-AgentLock $capabilityLock.Stream
         }
-        $partition = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $roleDescriptor -PersistedNarrowing $override.Settings
-        $capabilities = $partition.capabilities
-        $mandatoryDenies = $partition.mandatoryDenies
-        foreach ($name in @($override.Provenance.Keys)) { $provenance[$name] = $override.Provenance[$name] }
+        $effect = Get-BrokerNarrowingEffect -RoleDescriptor $roleDescriptor -AllowedManualCapabilities $allowedManualCapabilities `
+            -AbsoluteDenies $absoluteDenies -Override $override
+        $capabilities = $effect.capabilities
+        $mandatoryDenies = $effect.mandatoryDenies
+        $provenance = $effect.provenance
     }
     catch {
         if ($provider.Session) { Close-AgentMcpSession $provider.Session }
@@ -356,6 +397,7 @@ function Get-BrokerCapabilityProfile {
         CeilingCapabilities = $ceilingCapabilities; CeilingMandatoryDenies = $ceilingMandatoryDenies
         AbsoluteDenies = $absoluteDenies; AllowedManualCapabilities = $allowedManualCapabilities
         DelegableAvailable = $delegableAvailable; Provenance = $provenance
+        Override = $override
     }
 }
 
@@ -394,6 +436,7 @@ function Invoke-Describe {
             capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies; dynamicConstraints = $profile.Constraints
             absoluteDenies = $profile.AbsoluteDenies; allowedManualCapabilities = $profile.AllowedManualCapabilities
             delegableAvailable = $profile.DelegableAvailable; provenance = $profile.Provenance
+            killSwitchActive = [bool]$profile.Override.KillSwitchActive
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
@@ -416,6 +459,186 @@ function Invoke-Profile {
             capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies; dynamicConstraints = $profile.Constraints
             absoluteDenies = $profile.AbsoluteDenies; allowedManualCapabilities = $profile.AllowedManualCapabilities
             delegableAvailable = $profile.DelegableAvailable; provenance = $profile.Provenance
+            killSwitchActive = [bool]$profile.Override.KillSwitchActive
+        }
+    }
+    finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
+}
+
+function Invoke-PreviewNarrowing {
+    # PR3: non-mutating preview/diff for a single hypothetical scope-file edit. Never writes
+    # anything, never creates a dispatch draft/snapshot. Returns the CURRENT effective profile (as
+    # Get-BrokerCapabilityProfile/Get-BrokerNarrowingEffect already compute it), the PROPOSED
+    # effective profile if the requested {scope, capability, action} were applied (computed by the
+    # identical resolver + shared effect builder, just fed one extra hypothetical input -- so it can
+    # never drift from what apply-narrowing would actually produce), and a short-lived, single-use
+    # previewToken binding this exact mutation to the exact repository/worktree/PR/source-commit/
+    # role/store-fingerprint apply-narrowing must re-verify before it is allowed to write.
+    param([hashtable]$Request)
+    $scope = [string]$Request.scope
+    if ($scope -cnotin @('machine', 'user', 'repo-worktree', 'pr')) { throw '[narrowing-invalid] scope is not a recognized value.' }
+    $action = [string]$Request.action
+    if ($action -cnotin @('off', 'inherit')) { throw '[narrowing-invalid] action is not a recognized value.' }
+    $capability = [string]$Request.capability
+    if ($capability -cnotmatch '^[A-Za-z][A-Za-z0-9]*$') { throw '[narrowing-invalid] capability is not a recognized value.' }
+    $profile = Get-BrokerCapabilityProfile $Request
+    $provider = $profile.Provider
+    try {
+        if ($capability -cnotin @($profile.AllowedManualCapabilities)) {
+            throw "[narrowing-invalid] capability is not a recognized manually-selectable capability for role '$($profile.Role)'."
+        }
+        $worktreeId = Get-AgentWorktreeIdentity -RepositoryRoot $provider.RepositoryRoot
+        $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $provider.RepositoryRoot -TimeoutMilliseconds 2000
+        if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+        try {
+            $hypothetical = @{ Scope = $scope; Capability = $capability; Action = $action }
+            $proposedOverride = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $profile.Identity `
+                -RepositoryRoot $provider.RepositoryRoot -PullRequestId $profile.PullRequestId `
+                -CurrentSourceCommit $profile.Pr.sourceCommit -HypotheticalOverride $hypothetical
+        }
+        finally {
+            Exit-AgentLock $capabilityLock.Stream
+        }
+        $proposedEffect = Get-BrokerNarrowingEffect -RoleDescriptor $profile.RoleDescriptor `
+            -AllowedManualCapabilities $profile.AllowedManualCapabilities -AbsoluteDenies $profile.AbsoluteDenies `
+            -Override $proposedOverride
+        $storeFingerprint = Get-AgentCanonicalDigest -InputObject $profile.Override.FileFingerprints
+        $token = [Guid]::NewGuid().ToString('D')
+        $expiresAtUtc = [DateTime]::UtcNow.AddSeconds($NarrowingPreviewTtlSeconds)
+        $narrowingPreviews[$token] = @{
+            ExpiresAtUtc = $expiresAtUtc; RepositoryKey = $profile.Identity.key; WorktreeId = $worktreeId
+            PullRequestId = $profile.PullRequestId; SourceCommit = $profile.Pr.sourceCommit
+            Role = $profile.Role; Scope = $scope; Capability = $capability; Action = $action
+            StoreFingerprint = $storeFingerprint
+        }
+        $currentJson = ConvertTo-AgentCanonicalJson ([ordered]@{
+                capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies; provenance = $profile.Provenance
+            })
+        $proposedJson = ConvertTo-AgentCanonicalJson ([ordered]@{
+                capabilities = $proposedEffect.capabilities; mandatoryDenies = $proposedEffect.mandatoryDenies
+                provenance = $proposedEffect.provenance
+            })
+        Write-DispatchProtocolMessage @{
+            schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'narrowing-preview'
+            state = 'previewed'; role = $profile.Role; repositoryIdentity = $profile.Identity; prSnapshot = $profile.Pr
+            scope = $scope; capability = $capability; action = $action
+            previewToken = $token; storeFingerprint = $storeFingerprint; expiresAtUtc = $expiresAtUtc.ToString('o')
+            killSwitchActive = [bool]$profile.Override.KillSwitchActive; changed = ($currentJson -cne $proposedJson)
+            current = @{ capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies; provenance = $profile.Provenance }
+            proposed = @{
+                capabilities = $proposedEffect.capabilities; mandatoryDenies = $proposedEffect.mandatoryDenies
+                provenance = $proposedEffect.provenance
+            }
+        }
+    }
+    finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
+}
+
+function Invoke-ApplyNarrowing {
+    # PR3: the only mutating operation the dashboard can drive. Requires an exact, still-valid
+    # previewToken -- role/scope/capability/action/storeFingerprint must match the bound preview
+    # exactly, the token must not have expired, and the live store fingerprint re-derived HERE,
+    # under the same exclusive lock the write itself uses, must still match what was bound at
+    # preview time. Any mismatch fails closed with a code that requires a fresh preview; the token
+    # is consumed (removed) the instant a write succeeds, so it can never be replayed.
+    param([hashtable]$Request)
+    $token = [string]$Request.previewToken
+    if ($token -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or -not $narrowingPreviews.ContainsKey($token)) {
+        throw '[narrowing-stale] Preview token is unknown, already consumed, or malformed; re-preview and try again.'
+    }
+    $bound = $narrowingPreviews[$token]
+    if ([DateTime]::UtcNow -ge $bound.ExpiresAtUtc) {
+        $narrowingPreviews.Remove($token)
+        throw '[narrowing-expired] Preview has expired; re-preview and try again.'
+    }
+    $role = [string]$Request.role
+    $scope = [string]$Request.scope
+    $capability = [string]$Request.capability
+    $action = [string]$Request.action
+    $storeFingerprint = [string]$Request.storeFingerprint
+    if ($role -cnotin @('reviewer', 'review-handler') -or $scope -cnotin @('machine', 'user', 'repo-worktree', 'pr') -or
+        $action -cnotin @('off', 'inherit') -or $capability -cnotmatch '^[A-Za-z][A-Za-z0-9]*$') {
+        throw '[narrowing-invalid] role, scope, capability, or action is not a recognized value.'
+    }
+    if ($role -cne $bound.Role -or $scope -cne $bound.Scope -or $capability -cne $bound.Capability -or
+        $action -cne $bound.Action -or $storeFingerprint -cne $bound.StoreFingerprint) {
+        throw '[narrowing-stale] Apply request does not match the previewed mutation; re-preview and try again.'
+    }
+    $roleDescriptor = Get-RoleDescriptor $role
+    $provider = Open-BrokerProvider $roleDescriptor
+    try {
+        $roleDescriptor['repositoryRoot'] = $provider.RepositoryRoot
+        $identity = Resolve-AgentProviderRepositoryIdentity -Context $provider.Context
+        if ([string]$Request.repositoryKey -cne [string]$identity.key -or $identity.key -cne $bound.RepositoryKey) {
+            throw '[repository-mismatch] Repository identity changed since the preview.'
+        }
+        $worktreeId = Get-AgentWorktreeIdentity -RepositoryRoot $provider.RepositoryRoot
+        if ($worktreeId -cne $bound.WorktreeId) { throw '[narrowing-stale] Worktree changed since the preview; re-preview and try again.' }
+        $prId = [int]$Request.pullRequestId
+        if ($prId -ne $bound.PullRequestId) { throw '[narrowing-stale] Pull request changed since the preview; re-preview and try again.' }
+        $pr = ConvertTo-BrokerPrSnapshot -PullRequest (Get-BrokerPullRequest $provider $prId) -PullRequestId $prId
+        if ($pr.sourceCommit -cne $bound.SourceCommit) { throw '[narrowing-stale] Source commit changed since the preview; re-preview and try again.' }
+        $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $role
+        if ($capability -cnotin @($harnessRole.allowedManualCapabilities)) {
+            throw "[narrowing-invalid] capability is not a recognized manually-selectable capability for role '$role'."
+        }
+        $allAllowedCapabilities = [Collections.Generic.List[string]]::new()
+        foreach ($knownRole in @('reviewer', 'review-handler')) {
+            foreach ($name in @((Get-AgentHarnessCapabilityDescriptor -Role $knownRole).allowedManualCapabilities)) {
+                if (-not $allAllowedCapabilities.Contains($name)) { [void]$allAllowedCapabilities.Add($name) }
+            }
+        }
+        $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $provider.RepositoryRoot -TimeoutMilliseconds 2000
+        if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+        try {
+            $liveOverride = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $provider.RepositoryRoot `
+                -PullRequestId $prId -CurrentSourceCommit $pr.sourceCommit
+            $liveFingerprint = Get-AgentCanonicalDigest -InputObject $liveOverride.FileFingerprints
+            if ($liveFingerprint -cne $storeFingerprint) {
+                throw '[narrowing-stale] The capability-override store changed since the preview; re-preview and try again.'
+            }
+            Set-AgentCapabilityOverrideSetting -RepositoryIdentity $identity -RepositoryRoot $provider.RepositoryRoot `
+                -PullRequestId $prId -CurrentSourceCommit $pr.sourceCommit -Scope $scope -Capability $capability `
+                -Action $action -AllowedCapabilities @($allAllowedCapabilities.ToArray())
+        }
+        finally {
+            Exit-AgentLock $capabilityLock.Stream
+        }
+        $narrowingPreviews.Remove($token)
+        Write-DispatchProtocolMessage @{
+            schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'narrowing-applied'
+            state = 'applied'; scope = $scope; capability = $capability; action = $action
+        }
+    }
+    finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
+}
+
+function Invoke-SetKillSwitch {
+    # PR3 emergency operational lever. Requires only role + repositoryKey (no PR/draft binding --
+    # the kill switch is a machine-wide baseline, not scoped to any one pull request). Toggling
+    # takes effect for the NEXT profile()/describe()/dispatch() resolution only; it can never affect
+    # an already-running child, which never re-reads persisted settings after its own startup.
+    param([hashtable]$Request)
+    $enabledValue = Get-OptionalMember $Request 'enabled'
+    if ($enabledValue -isnot [bool]) { throw '[narrowing-invalid] enabled must be a boolean.' }
+    $role = [string]$Request.role
+    $roleDescriptor = Get-RoleDescriptor $role
+    $provider = Open-BrokerProvider $roleDescriptor
+    try {
+        $roleDescriptor['repositoryRoot'] = $provider.RepositoryRoot
+        $identity = Resolve-AgentProviderRepositoryIdentity -Context $provider.Context
+        if ([string]$Request.repositoryKey -cne [string]$identity.key) { throw '[repository-mismatch] Repository key does not match the provider.' }
+        $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $provider.RepositoryRoot -TimeoutMilliseconds 2000
+        if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+        try {
+            if ($enabledValue) { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $provider.RepositoryRoot }
+            else { Disable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $provider.RepositoryRoot }
+        }
+        finally {
+            Exit-AgentLock $capabilityLock.Stream
+        }
+        Write-DispatchProtocolMessage @{
+            schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'kill-switch-applied'; enabled = [bool]$enabledValue
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
@@ -822,6 +1045,7 @@ try {
     while ($accepting) {
         Complete-ExitedChildren
         Remove-ExpiredDrafts
+        Remove-ExpiredNarrowingPreviews
         if ($null -eq (Get-Process -Id ([int]$descriptor.ownerProcessId) -ErrorAction SilentlyContinue)) { break }
         if (-not $readTask.Wait(100)) { continue }
         $line = $readTask.Result
@@ -838,6 +1062,9 @@ try {
             switch ([string]$request.operation) {
                 'describe' { Invoke-Describe $request }
                 'profile' { Invoke-Profile $request }
+                'preview-narrowing' { Invoke-PreviewNarrowing $request }
+                'apply-narrowing' { Invoke-ApplyNarrowing $request }
+                'set-kill-switch' { Invoke-SetKillSwitch $request }
                 'dispatch' { Invoke-Dispatch $request }
                 'cancel' { Stop-BrokerChild ([string]$request.dispatchId) $requestId }
                 'shutdown' {

@@ -20,11 +20,15 @@ import { PullRequestHistoryProjection, type PullRequestHistoryEntry } from "./hi
 import type { EventTailer } from "./tailer.js";
 import {
   BrokerRejectionError,
+  type CapabilityNarrowingPreview,
   type CapabilityProfile,
   type CapabilitySummary,
   type DispatchAccepted,
   type DispatchBroker,
   type DispatchTerminal,
+  type NarrowingAction,
+  type NarrowingScope,
+  NARROWING_SCOPES,
 } from "./dispatch.js";
 
 export const BRAND_PLANE = ["       __|__       ", "--o--o--(_)--o--o--"] as const;
@@ -117,6 +121,9 @@ export function dispatchResultDetail(code: string, detail = ""): string {
       : "Already running: this PR and role hold the work lease.",
     "launch-failed": "Broker could not safely launch the child.",
     "role-not-allowed": "This manual role is not enabled by the trusted launcher.",
+    "narrowing-invalid": "The requested narrowing scope, capability, or action is not valid.",
+    "narrowing-stale": "The store changed since preview; re-preview before applying.",
+    "narrowing-expired": "The preview expired; re-preview before applying.",
   };
   return `${labels[code] ?? `Dispatch rejected: ${code}`}${safe ? ` ${safe}` : ""}`;
 }
@@ -648,6 +655,17 @@ export function App(props: AppProps) {
   const [settingsRole, setSettingsRole] = createSignal<AgentRole>("reviewer");
   const [settingsProfile, setSettingsProfile] = createSignal<CapabilityProfile | null>(null);
   const [settingsStatus, setSettingsStatus] = createSignal("");
+  // PR3 narrow-only edit UX. narrowingMode is null while the read-only Settings view (PR1/PR2) is
+  // showing; entering the editor stages a scope+capability selection, o/i request a preview for
+  // 'off'/'inherit', and the two-stage confirm mirrors ManualDispatchPanel's confirm/confirm-final.
+  const [narrowingMode, setNarrowingMode] =
+    createSignal<"browsing" | "previewing" | "confirm" | "confirm-final" | "applying" | "result" | null>(null);
+  const [narrowingScopeIndex, setNarrowingScopeIndex] = createSignal(0);
+  const [narrowingCapabilityIndex, setNarrowingCapabilityIndex] = createSignal(0);
+  const [narrowingPreview, setNarrowingPreview] = createSignal<CapabilityNarrowingPreview | null>(null);
+  const [narrowingStatus, setNarrowingStatus] = createSignal("");
+  const [killSwitchConfirming, setKillSwitchConfirming] = createSignal(false);
+  let narrowingGeneration = 0;
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let localBrokerShutdown: Promise<void> | undefined;
   // Settings refresh/toggle race guard: every refreshSettingsProfile() call is stamped with a
@@ -888,7 +906,126 @@ export function App(props: AppProps) {
     settingsRefreshPending = false;
     setSettingsProfile(null);
     setSettingsStatus("");
+    narrowingGeneration += 1;
+    setNarrowingMode(null);
+    setNarrowingPreview(null);
+    setNarrowingStatus("");
+    setKillSwitchConfirming(false);
     notify("Effective profile settings closed");
+  }
+
+  // PR3 narrow-only edit UX. Every mutation is broker-owned: the dashboard never touches the
+  // capability-override store directly, only requests preview/apply/kill-switch RPCs and re-reads
+  // the resulting truth back through the existing side-effect-free profile() RPC.
+  function narrowingCapabilities(): string[] {
+    return settingsDisplayProfile()?.allowedManualCapabilities ?? [];
+  }
+
+  function openNarrowingEditor(): void {
+    if (!props.broker) {
+      notify("Observe-only: trusted manual broker is unavailable");
+      return;
+    }
+    if (overlay() !== "settings") openSettings();
+    if (narrowingCapabilities().length === 0) {
+      notify("No manually-selectable capabilities are available to narrow for this role");
+      return;
+    }
+    setNarrowingScopeIndex(0);
+    setNarrowingCapabilityIndex(0);
+    setNarrowingPreview(null);
+    setNarrowingStatus("");
+    setNarrowingMode("browsing");
+    notify("Narrowing editor opened");
+  }
+
+  function cancelNarrowingEdit(): void {
+    narrowingGeneration += 1;
+    setNarrowingMode("browsing");
+    setNarrowingPreview(null);
+    setNarrowingStatus("");
+  }
+
+  function closeNarrowingEditor(): void {
+    narrowingGeneration += 1;
+    setNarrowingMode(null);
+    setNarrowingPreview(null);
+    setNarrowingStatus("");
+  }
+
+  async function previewNarrowing(action: NarrowingAction): Promise<void> {
+    const entry = historyCurrent();
+    if (!props.broker || !entry || narrowingMode() !== "browsing") return;
+    const capabilities = narrowingCapabilities();
+    const capability = capabilities[narrowingCapabilityIndex()];
+    const scope = NARROWING_SCOPES[narrowingScopeIndex()];
+    if (!capability || !scope) return;
+    setNarrowingMode("previewing");
+    setNarrowingStatus("Resolving preview...");
+    const requestId = (narrowingGeneration += 1);
+    try {
+      const preview = await props.broker.previewNarrowing(
+        entry.repositoryIdentity.key, entry.pullRequestId, settingsRole(), scope, capability, action,
+      );
+      if (requestId !== narrowingGeneration) return; // superseded: editor cancelled/closed meanwhile
+      setNarrowingPreview(preview);
+      setNarrowingMode("confirm");
+      setNarrowingStatus("");
+    } catch (error) {
+      if (requestId !== narrowingGeneration) return;
+      setNarrowingStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setNarrowingMode("browsing");
+    }
+  }
+
+  async function applyNarrowing(): Promise<void> {
+    const entry = historyCurrent();
+    const preview = narrowingPreview();
+    if (!props.broker || !entry || !preview || narrowingMode() !== "confirm-final") return;
+    setNarrowingMode("applying");
+    setNarrowingStatus("");
+    const requestId = (narrowingGeneration += 1);
+    try {
+      await props.broker.applyNarrowing(preview, entry.repositoryIdentity.key, entry.pullRequestId);
+      if (requestId !== narrowingGeneration) return;
+      setNarrowingStatus(`Applied: ${preview.capability} ${preview.action === "off" ? "turned off" : "reset to inherit"} at ${preview.scope} scope.`);
+      setNarrowingMode("result");
+      setNarrowingPreview(null);
+      // Refresh via the existing side-effect-free profile() RPC (never the mutating response
+      // itself) -- reuses refreshSettingsProfile's own generation guard, so a stale response can
+      // never render either.
+      void refreshSettingsProfile(settingsRole());
+    } catch (error) {
+      if (requestId !== narrowingGeneration) return;
+      setNarrowingStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setNarrowingMode("browsing");
+      setNarrowingPreview(null);
+    }
+  }
+
+  async function toggleKillSwitch(): Promise<void> {
+    const entry = historyCurrent();
+    if (!props.broker || !entry) return;
+    setKillSwitchConfirming(false);
+    const nextEnabled = !(settingsDisplayProfile()?.killSwitchActive ?? false);
+    setSettingsStatus(nextEnabled
+      ? "Enabling emergency lever: ignore local narrowing overrides..."
+      : "Disabling emergency lever: ignore local narrowing overrides...");
+    try {
+      await props.broker.setKillSwitch(entry.repositoryIdentity.key, settingsRole(), nextEnabled);
+      setSettingsStatus(nextEnabled
+        ? "Ignore local narrowing overrides is now ON: persisted narrowing is ignored until the next launch."
+        : "Ignore local narrowing overrides is now OFF: persisted narrowing applies again.");
+      void refreshSettingsProfile(settingsRole());
+    } catch (error) {
+      setSettingsStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async function quit(): Promise<void> {
@@ -1106,6 +1243,12 @@ export function App(props: AppProps) {
       unavailable: "",
       run: openSettings,
     },
+    {
+      label: "Edit persisted capability narrowing (next launch)",
+      enabled: Boolean(props.broker),
+      unavailable: "Observe-only: trusted manual broker is unavailable",
+      run: openNarrowingEditor,
+    },
   ]);
 
   function executePalette(): void {
@@ -1211,6 +1354,40 @@ export function App(props: AppProps) {
       return;
     }
     if (overlay() === "settings") {
+      const editing = narrowingMode();
+      if (editing === "browsing") {
+        const capabilityCount = narrowingCapabilities().length;
+        if (key.name === "escape") closeNarrowingEditor();
+        else if (key.name === "left") setNarrowingScopeIndex((v) => (v + NARROWING_SCOPES.length - 1) % NARROWING_SCOPES.length);
+        else if (key.name === "right") setNarrowingScopeIndex((v) => (v + 1) % NARROWING_SCOPES.length);
+        else if ((key.name === "up" || key.name === "k") && capabilityCount > 0) {
+          setNarrowingCapabilityIndex((v) => (v + capabilityCount - 1) % capabilityCount);
+        } else if ((key.name === "down" || key.name === "j") && capabilityCount > 0) {
+          setNarrowingCapabilityIndex((v) => (v + 1) % capabilityCount);
+        } else if (key.name === "o") void previewNarrowing("off");
+        else if (key.name === "i") void previewNarrowing("inherit");
+        return;
+      }
+      if (editing === "confirm") {
+        if (key.name === "escape") cancelNarrowingEdit();
+        else if (key.name === "c") setNarrowingMode("confirm-final");
+        return;
+      }
+      if (editing === "confirm-final") {
+        if (key.name === "escape") cancelNarrowingEdit();
+        else if (key.name === "y") void applyNarrowing();
+        return;
+      }
+      if (editing === "result") {
+        if (key.name === "escape" || key.name === "return") { setNarrowingMode("browsing"); setNarrowingStatus(""); }
+        return;
+      }
+      if (editing === "previewing" || editing === "applying") return;
+      if (killSwitchConfirming()) {
+        if (key.name === "escape") setKillSwitchConfirming(false);
+        else if (key.name === "y") void toggleKillSwitch();
+        return;
+      }
       if (key.name === "escape" || key.name === "s") {
         closeSettings();
       } else if (key.name === "tab") {
@@ -1225,6 +1402,11 @@ export function App(props: AppProps) {
       } else if (key.name === "r") {
         if (settingsRefreshPending) return;
         void refreshSettingsProfile(settingsRole());
+      } else if (key.name === "e") {
+        openNarrowingEditor();
+      } else if (key.name === "k") {
+        if (!props.broker) notify("Observe-only: trusted manual broker is unavailable");
+        else setKillSwitchConfirming(true);
       }
       return;
     }
@@ -1443,7 +1625,8 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
           <text height={1} fg={COLORS.text}>m                  Manual dispatch for selected retained PR (trusted launch only)</text>
-          <text height={1} fg={COLORS.text}>s                  Effective capability profile for the next manual launch (read-only)</text>
+          <text height={1} fg={COLORS.text}>s                  Effective capability profile for the next manual launch</text>
+          <text height={1} fg={COLORS.text}>  (in Settings) e   Edit persisted narrowing | k toggle kill switch</text>
           <text height={1} fg={COLORS.text}>?                  Help</text>
           <text height={1} fg={COLORS.text}>q                  Quit</text>
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[0]}</text>
@@ -1452,28 +1635,94 @@ export function App(props: AppProps) {
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "settings"}>
-        <OverlayPanel title="SETTINGS - EFFECTIVE CAPABILITY PROFILE (READ-ONLY)" width={82} height={23}>
+        <OverlayPanel
+          title={narrowingMode() ? "SETTINGS - EDIT PERSISTED NARROWING" : "SETTINGS - EFFECTIVE CAPABILITY PROFILE"}
+          width={88}
+          height={27}
+        >
           <box flexDirection="column" flexGrow={1}>
             <text height={1} fg={COLORS.warning}>Applies only to the next manual dispatch/process launch.</text>
             <text height={1} fg={COLORS.warning}>A running agent's own profile is immutable and is not shown here.</text>
-            <text height={1} fg={COLORS.text}>Role: {roleLabel(settingsRole())} | Tab switch role | r refresh | Esc/s close</text>
+            <Show when={!narrowingMode()}>
+              <text height={1} fg={COLORS.text}>
+                Role: {roleLabel(settingsRole())} | Tab role | r refresh | e edit narrowing | k kill switch | Esc/s close
+              </text>
+            </Show>
             <Show when={settingsStatus()}>
               <text height={1} fg={COLORS.warning}>{line(settingsStatus(), 170)}</text>
             </Show>
-            <Show when={settingsDisplayProfile()}>
+            <Show when={killSwitchConfirming()}>
+              <text height={1} fg={COLORS.error}>
+                {line(settingsDisplayProfile()?.killSwitchActive
+                  ? "Disable 'Ignore local narrowing overrides'? Persisted narrowing applies again next launch. y confirm | Esc cancel"
+                  : "Enable 'Ignore local narrowing overrides'? All persisted narrowing is ignored next launch (not a security lockdown). y confirm | Esc cancel", 170)}
+              </text>
+            </Show>
+            <Show when={narrowingMode() && narrowingMode() !== "result" && narrowingStatus()}>
+              <text height={1} fg={COLORS.warning}>{line(narrowingStatus(), 170)}</text>
+            </Show>
+            <Show when={settingsDisplayProfile() && !narrowingMode()}>
               {(profile: () => CapabilityProfile) => (
                 <>
                   <text height={1} fg={COLORS.accent}>{profile().repositoryIdentity.slug} / PR #{profile().prSnapshot.pullRequestId}</text>
+                  <text height={1} fg={profile().killSwitchActive ? COLORS.error : COLORS.muted}>
+                    Ignore local narrowing overrides: {profile().killSwitchActive ? "ON (emergency lever, not a security lockdown)" : "off"}
+                  </text>
                   <text height={1} fg={COLORS.ok}>Allowed manual ceiling: {line(profile().allowedManualCapabilities.join(", ") || "none", 110)}</text>
                   <text height={1} fg={COLORS.ok}>Enabled for this launch: {line(profile().capabilities.join(", ") || "none", 110)}</text>
                   <text height={1} fg={COLORS.warning}>Denied (mandatory): {line(profile().mandatoryDenies.join(", ") || "none", 110)}</text>
-                  <text height={1} fg={COLORS.error}>Absolute denies (never grantable): {line(profile().absoluteDenies.join(", ") || "none", 110)}</text>
-                  <text height={1} fg={COLORS.muted}>Delegable available (widening): {line(profile().delegableAvailable.join(", ") || "none in this release", 110)}</text>
+                  <text height={1} fg={COLORS.error}>Absolute denies (never grantable, locked): {line(profile().absoluteDenies.join(", ") || "none", 110)}</text>
+                  <text height={1} fg={COLORS.muted}>Delegable available (widening, locked here): {line(profile().delegableAvailable.join(", ") || "none in this release", 110)}</text>
                   <text height={1} fg={COLORS.muted}>
                     Provenance: {line(Object.entries(profile().provenance).map(([name, source]) => `${name}=${source}`).join(", ") || "none", 170)}
                   </text>
                 </>
               )}
+            </Show>
+            <Show when={narrowingMode() === "browsing"}>
+              <box flexDirection="column">
+                <text height={1} fg={COLORS.text}>
+                  Scope: {NARROWING_SCOPES.map((scopeName, index) => index === narrowingScopeIndex() ? `[${scopeName}]` : scopeName).join("  ")}
+                  {" "}(Left/Right change)
+                </text>
+                <text height={1} fg={COLORS.muted}>Up/Down select capability | o narrow (off) | i reset (inherit) | Esc cancel</text>
+                <For each={narrowingCapabilities()}>
+                  {(name, index) => (
+                    <text height={1} fg={index() === narrowingCapabilityIndex() ? COLORS.accent : COLORS.text}>
+                      {index() === narrowingCapabilityIndex() ? "> " : "  "}{name}
+                    </text>
+                  )}
+                </For>
+              </box>
+            </Show>
+            <Show when={narrowingMode() === "previewing" || narrowingMode() === "applying"}>
+              <text height={1} fg={COLORS.warning}>{narrowingMode() === "previewing" ? "Resolving preview..." : "Applying..."}</text>
+            </Show>
+            <Show when={narrowingPreview()}>
+              {(preview: () => CapabilityNarrowingPreview) => (
+                <box flexDirection="column">
+                  <text height={1} fg={COLORS.accent}>
+                    {preview().scope} / {preview().capability} -&gt; {preview().action === "off" ? "off" : "inherit"}
+                    {preview().killSwitchActive ? " (kill switch ON: no effect until disabled)" : ""}
+                  </text>
+                  <text height={1} fg={preview().changed ? COLORS.warning : COLORS.muted}>
+                    {preview().changed ? "This changes the effective profile:" : "No effective change (another scope already decides this)."}
+                  </text>
+                  <text height={1} fg={COLORS.text}>Current enabled: {line(preview().current.capabilities.join(", ") || "none", 100)}</text>
+                  <text height={1} fg={COLORS.text}>Proposed enabled: {line(preview().proposed.capabilities.join(", ") || "none", 100)}</text>
+                  <text height={1} fg={COLORS.warning}>Current denied: {line(preview().current.mandatoryDenies.join(", ") || "none", 100)}</text>
+                  <text height={1} fg={COLORS.warning}>Proposed denied: {line(preview().proposed.mandatoryDenies.join(", ") || "none", 100)}</text>
+                  <Show when={narrowingMode() === "confirm"}>
+                    <text height={1} fg={COLORS.warning}>First confirmation: press c to review the final apply gate; Esc cancels.</text>
+                  </Show>
+                  <Show when={narrowingMode() === "confirm-final"}>
+                    <text height={1} fg={COLORS.error}>FINAL CONFIRMATION: press y to apply this exact preview; Esc cancels.</text>
+                  </Show>
+                </box>
+              )}
+            </Show>
+            <Show when={narrowingMode() === "result"}>
+              <text height={1} fg={COLORS.ok}>{line(narrowingStatus(), 170)} (Esc/Enter back)</text>
             </Show>
           </box>
         </OverlayPanel>
