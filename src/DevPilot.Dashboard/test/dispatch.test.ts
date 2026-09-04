@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { DispatchClient, DISPATCH_PROTOCOL_MAX_BYTES, type CapabilityProfile } from "../src/dispatch.js";
+import { DispatchClient, DISPATCH_PROTOCOL_MAX_BYTES, type CapabilityProfile, type CapabilitySummary } from "../src/dispatch.js";
 
 // PowerShell (pwsh) ships on every GitHub-hosted runner image (Windows, Linux,
 // macOS), so the fixture below can exercise the real broker process on every
@@ -117,14 +117,14 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   }
 });
 
-test("client rejects a capability-summary missing PR1 profile fields or claiming a non-empty delegableAvailable", async () => {
+test("client accepts a legacy capability-summary missing PR1/2/3-additive fields via safe defaults, but still fails closed on malformed or non-empty values", async () => {
   const root = join(process.cwd(), `.dashboard-dispatch-malformed-${process.pid}-${Date.now()}`);
   await mkdir(root, { recursive: false });
   const descriptor = join(root, "descriptor.json");
   const pwsh = resolvePwshPath();
   await writeFile(descriptor, "{}", "utf8");
 
-  async function describeWith(fakeBrokerBody: string): Promise<{ failures: string[]; rejected: boolean }> {
+  async function describeWith(fakeBrokerBody: string): Promise<{ failures: string[]; rejected: boolean; summary: CapabilitySummary | undefined }> {
     const script = join(root, `fake-broker-${Date.now()}-${Math.random()}.ps1`);
     await writeFile(script, String.raw`
 param([string]$DescriptorPath)
@@ -142,23 +142,44 @@ if ($r.operation -eq 'describe') {
       { onBrokerFailure: (failure) => failures.push(failure) },
     );
     let rejected = false;
+    let summary: CapabilitySummary | undefined;
     try {
-      await client.describe("v1:github:9007199254740993", 104, "reviewer");
+      summary = await client.describe("v1:github:9007199254740993", 104, "reviewer");
     } catch {
       rejected = true;
     } finally {
       await client.shutdown().catch(() => {});
     }
-    return { failures, rejected };
+    return { failures, rejected, summary };
   }
 
   try {
-    // Missing every PR1 additive field entirely (pre-#105 shape).
-    const missingFields = await describeWith(String.raw`
+    // (4a) A legacy schemaVersion-1 broker that predates PR1/2/3 entirely omits every additive
+    // field from the wire -- schemaVersion never bumps for these additions, so this shape is still
+    // legal. It must parse successfully with the documented safe defaults, and editingAvailable
+    // must be false (this broker cannot support narrowing/kill-switch editing at all).
+    const legacy = await describeWith(String.raw`
     @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@()} | ConvertTo-Json -Compress -Depth 10
 `);
-    assert.equal(missingFields.rejected, true);
-    assert.equal(missingFields.failures.length, 1);
+    assert.equal(legacy.rejected, false);
+    assert.ok(legacy.summary, "expected a parsed legacy capability-summary");
+    assert.deepEqual(legacy.summary?.absoluteDenies, []);
+    assert.deepEqual(legacy.summary?.allowedManualCapabilities, []);
+    assert.deepEqual(legacy.summary?.delegableAvailable, []);
+    assert.deepEqual(Object.entries(legacy.summary?.provenance ?? { unexpected: true }), []);
+    assert.equal(legacy.summary?.killSwitchActive, false);
+    assert.equal(legacy.summary?.killSwitchExpiresAtUtc, null);
+    assert.equal(legacy.summary?.editingAvailable, false);
+
+    // (4b) A full modern record (every additive field present, including the new
+    // killSwitchExpiresAtUtc) parses with editingAvailable=true.
+    const modern = await describeWith(String.raw`
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@('EnableSummaryComment');delegableAvailable=@();killSwitchActive=$true;killSwitchExpiresAtUtc='2026-09-03T17:00:00Z';provenance=@{EnableSummaryComment='kill-switch'}} | ConvertTo-Json -Compress -Depth 10
+`);
+    assert.equal(modern.rejected, false);
+    assert.equal(modern.summary?.editingAvailable, true);
+    assert.equal(modern.summary?.killSwitchActive, true);
+    assert.equal(modern.summary?.killSwitchExpiresAtUtc, "2026-09-03T17:00:00Z");
 
     // Every PR1 field present and well-typed, but delegableAvailable is non-empty -- no delegation
     // policy can exist yet in this release, so the client must treat this as malformed too.
@@ -167,6 +188,15 @@ if ($r.operation -eq 'describe') {
 `);
     assert.equal(nonEmptyDelegable.rejected, true);
     assert.equal(nonEmptyDelegable.failures.length, 1);
+
+    // (4c) A malformed (wrong-type) additive field must still throw even though it's one of the
+    // fields that is otherwise allowed to be absent -- the safe-defaulting above only covers
+    // genuine absence, never corruption.
+    const malformedAdditive = await describeWith(String.raw`
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();allowedManualCapabilities='not-an-array'} | ConvertTo-Json -Compress -Depth 10
+`);
+    assert.equal(malformedAdditive.rejected, true);
+    assert.equal(malformedAdditive.failures.length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -251,6 +281,7 @@ test("client accepts every known capability provenance value and rejects an unre
 
   async function profileWithProvenance(
     provenancePs1: string,
+    killSwitchExpiresAtUtcPs1 = "$null",
   ): Promise<{ failures: string[]; profile: CapabilityProfile | undefined }> {
     const script = join(root, `fake-broker-${Date.now()}-${Math.random()}.ps1`);
     await writeFile(script, String.raw`
@@ -258,7 +289,7 @@ param([string]$DescriptorPath)
 $line = [Console]::In.ReadLine()
 $r = $line | ConvertFrom-Json
 if ($r.operation -eq 'profile') {
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-profile';role='reviewer';repositoryIdentity=${validIdentity};prSnapshot=${validPrSnapshot};capabilities=@();mandatoryDenies=@();dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();killSwitchActive=$false;provenance=` +
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-profile';role='reviewer';repositoryIdentity=${validIdentity};prSnapshot=${validPrSnapshot};capabilities=@();mandatoryDenies=@();dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();killSwitchActive=$false;killSwitchExpiresAtUtc=` + killSwitchExpiresAtUtcPs1 + String.raw`;provenance=` +
       provenancePs1 + String.raw`} | ConvertTo-Json -Compress -Depth 10
 }
 # Exit immediately after the single response, matching the other single-shot fixtures in this file.
@@ -298,6 +329,12 @@ if ($r.operation -eq 'profile') {
     assert.equal(allKnown.profile?.provenance.worktreeCap, "repo-worktree");
     assert.equal(allKnown.profile?.provenance.prCap, "pr");
     assert.equal(allKnown.profile?.provenance.killSwitchCap, "kill-switch");
+    assert.equal(allKnown.profile?.killSwitchExpiresAtUtc, null);
+
+    // killSwitchExpiresAtUtc must likewise round-trip a real ISO-8601 UTC string unchanged (the
+    // kill switch's short TTL, PR3 review item).
+    const withExpiry = await profileWithProvenance("@{soloCap='machine'}", "'2026-09-03T17:00:00Z'");
+    assert.equal(withExpiry.profile?.killSwitchExpiresAtUtc, "2026-09-03T17:00:00Z");
 
     // An unrecognized provenance value must still be rejected outright rather than silently
     // accepted -- the runtime validator is the trust boundary for this union, not just its type.

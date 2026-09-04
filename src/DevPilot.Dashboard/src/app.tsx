@@ -124,6 +124,7 @@ export function dispatchResultDetail(code: string, detail = ""): string {
     "narrowing-invalid": "The requested narrowing scope, capability, or action is not valid.",
     "narrowing-stale": "The store changed since preview; re-preview before applying.",
     "narrowing-expired": "The preview expired; re-preview before applying.",
+    "narrowing-kill-switch-active": "Editing is unavailable while the kill switch is active.",
   };
   return `${labels[code] ?? `Dispatch rejected: ${code}`}${safe ? ` ${safe}` : ""}`;
 }
@@ -598,12 +599,19 @@ function Inspector(props: { instance: InstanceState | undefined; focused?: boole
   );
 }
 
-function OverlayPanel(props: { title: string; children: unknown; width?: number; height?: number }) {
+function OverlayPanel(props: {
+  title: string;
+  children: unknown;
+  width?: number;
+  height?: number;
+  left?: number | "auto" | `${number}%`;
+  padding?: number;
+}) {
   return (
     <box
       position="absolute"
       top="15%"
-      left="15%"
+      left={props.left ?? "15%"}
       width={props.width ?? 70}
       height={props.height ?? 18}
       zIndex={100}
@@ -612,7 +620,7 @@ function OverlayPanel(props: { title: string; children: unknown; width?: number;
       borderColor={COLORS.accent}
       backgroundColor={COLORS.panel}
       title={` ${props.title} `}
-      padding={1}
+      padding={props.padding ?? 1}
       flexDirection="column"
     >
       {props.children}
@@ -680,6 +688,12 @@ export function App(props: AppProps) {
   // response must still never be applied, which is what these guards continue to protect against.
   let settingsGeneration = 0;
   let settingsRefreshPending = false;
+  // PR3 palette first-use queueing (see openNarrowingEditor/tryOpenNarrowingEditor): set to the
+  // settingsGeneration token of the in-flight profile load the editor-open intent is waiting on,
+  // or undefined when no open is queued. Consumed (and cleared) by refreshSettingsProfile's
+  // success/error paths, and force-cleared by closeSettings so a queued intent can never fire late
+  // into a closed/different view.
+  let pendingNarrowingEditorGeneration: number | undefined;
   // Renders only when the resolved profile's own role still matches the currently displayed role
   // label, independent of the request-token guard above -- a second, cheap line of defense so a
   // mislabeled profile can never reach the screen even if the guard above is ever weakened (e.g. a
@@ -855,7 +869,7 @@ export function App(props: AppProps) {
   // token plus its own broker-authored role -- see the settingsGeneration/settingsDisplayProfile
   // comment above -- so an overlapping or superseded profile() response can never render under the
   // wrong label.
-  async function refreshSettingsProfile(targetRole: AgentRole): Promise<void> {
+  async function refreshSettingsProfile(targetRole: AgentRole, options: { silent?: boolean } = {}): Promise<void> {
     if (settingsRefreshPending) return;
     const entry = historyCurrent();
     if (!props.broker) {
@@ -872,18 +886,40 @@ export function App(props: AppProps) {
     }
     const requestId = (settingsGeneration += 1);
     settingsRefreshPending = true;
-    setSettingsStatus("Resolving effective profile for the next manual dispatch...");
+    if (!options.silent) setSettingsStatus("Resolving effective profile for the next manual dispatch...");
     try {
       const profile = await props.broker.profile(entry.repositoryIdentity.key, entry.pullRequestId, targetRole);
       if (requestId !== settingsGeneration) return; // superseded: Settings closed/reopened meanwhile
       setSettingsProfile(profile);
-      setSettingsStatus("");
+      // Legacy-broker compatibility (issue #105 PR3 review): editingAvailable is false only when
+      // this broker predates narrowing/kill-switch support entirely (see dispatch.ts's
+      // parseCapabilityProfileFields) -- surface that as a persistent, always-visible status line
+      // the same way the broker-not-connected/no-history-row messages above already are, rather
+      // than silently no-oping the first time 'e'/'k' is pressed. Skipped for a `silent` refresh
+      // (the internal re-read applyNarrowing()/toggleKillSwitch() trigger after their own mutation
+      // succeeds) so it can never stomp the confirmation message those callers just set via this
+      // same settingsStatus signal.
+      if (!options.silent) {
+        setSettingsStatus(profile.editingAvailable
+          ? ""
+          : "Unavailable: broker does not support capability narrowing (upgrade required).");
+      }
+      // PR3 palette first-use queueing: if openNarrowingEditor() was invoked before this profile
+      // load resolved (e.g. the command palette's "Edit persisted capability narrowing" entry
+      // picked before Settings had ever fetched a profile), fire the deferred open now that a
+      // profile for the exact same generation has just landed. Reuses this function's own
+      // generation guard rather than inventing a second one.
+      if (pendingNarrowingEditorGeneration === requestId) {
+        pendingNarrowingEditorGeneration = undefined;
+        tryOpenNarrowingEditor(profile);
+      }
     } catch (error) {
       if (requestId !== settingsGeneration) return;
       setSettingsProfile(null);
       setSettingsStatus(error instanceof BrokerRejectionError
         ? `Unavailable: ${dispatchResultDetail(error.code, error.detail)}`
         : `Unavailable: broker failure resolving effective profile (${error instanceof Error ? error.message : String(error)}).`);
+      if (pendingNarrowingEditorGeneration === requestId) pendingNarrowingEditorGeneration = undefined;
     } finally {
       if (requestId === settingsGeneration) settingsRefreshPending = false;
     }
@@ -904,6 +940,8 @@ export function App(props: AppProps) {
     // blocked by a request the UI no longer cares about.
     settingsGeneration += 1;
     settingsRefreshPending = false;
+    // A queued palette-triggered editor open must never fire late into a closed/different view.
+    pendingNarrowingEditorGeneration = undefined;
     setSettingsProfile(null);
     setSettingsStatus("");
     narrowingGeneration += 1;
@@ -921,15 +959,26 @@ export function App(props: AppProps) {
     return settingsDisplayProfile()?.allowedManualCapabilities ?? [];
   }
 
-  function openNarrowingEditor(): void {
-    if (!props.broker) {
-      notify("Observe-only: trusted manual broker is unavailable");
-      return;
+  // Shared gate for actually entering the editor, given an already-resolved profile: used both
+  // when a profile is already loaded (immediate open) and when a queued palette-triggered open
+  // (see pendingNarrowingEditorGeneration below) resolves. Never invoked with a stale/superseded
+  // profile -- callers only reach this once their own generation guard has already confirmed the
+  // profile is current.
+  function tryOpenNarrowingEditor(profile: CapabilityProfile): boolean {
+    if (profile.killSwitchActive) {
+      // Fail-closed UI (issue #105 PR3 review): the broker itself now rejects preview/apply while
+      // the kill switch is active (BrokerRejectionError code narrowing-kill-switch-active), so the
+      // editor must never even open in that state -- there is no exact preview it could ever apply.
+      notify("Editing is unavailable while the kill switch is active.");
+      return false;
     }
-    if (overlay() !== "settings") openSettings();
-    if (narrowingCapabilities().length === 0) {
+    if (!profile.editingAvailable) {
+      notify("Editing unavailable: broker does not support capability narrowing (upgrade required).");
+      return false;
+    }
+    if (profile.allowedManualCapabilities.length === 0) {
       notify("No manually-selectable capabilities are available to narrow for this role");
-      return;
+      return false;
     }
     setNarrowingScopeIndex(0);
     setNarrowingCapabilityIndex(0);
@@ -937,6 +986,40 @@ export function App(props: AppProps) {
     setNarrowingStatus("");
     setNarrowingMode("browsing");
     notify("Narrowing editor opened");
+    return true;
+  }
+
+  function openNarrowingEditor(): void {
+    if (!props.broker) {
+      // Rendered the same way as refreshSettingsProfile's own broker-not-connected message
+      // (a persistent line inside the Settings overlay) rather than the transient global STATUS
+      // toast: the Settings overlay itself covers most of the screen including that global bar,
+      // so a notify()-only message here would be clipped by the very panel it's meant to explain.
+      if (overlay() !== "settings") setOverlay("settings");
+      setSettingsProfile(null);
+      setSettingsStatus("Observe-only: trusted manual broker is unavailable");
+      return;
+    }
+    const loaded = settingsDisplayProfile();
+    if (loaded) {
+      tryOpenNarrowingEditor(loaded);
+      return;
+    }
+    if (!historyCurrent()) {
+      if (overlay() !== "settings") setOverlay("settings");
+      setSettingsStatus("Unavailable: select a retained PR history row to resolve a next-launch profile.");
+      return;
+    }
+    // First use / role-switch race (issue #105 PR3 review): no profile has resolved for the
+    // current role yet (e.g. the command palette's edit entry was picked before Settings had ever
+    // been opened). Queue the open against refreshSettingsProfile's own generation token instead
+    // of dropping it, double-fetching, or opening a stale/empty editor -- it fires automatically
+    // once that in-flight (or freshly-triggered) load resolves; see the pendingNarrowingEditorGeneration
+    // consumers in refreshSettingsProfile and the clear in closeSettings.
+    if (overlay() !== "settings") openSettings();
+    else if (!settingsRefreshPending) void refreshSettingsProfile(settingsRole());
+    pendingNarrowingEditorGeneration = settingsGeneration;
+    notify("Narrowing editor will open once the effective profile finishes loading");
   }
 
   function cancelNarrowingEdit(): void {
@@ -951,6 +1034,14 @@ export function App(props: AppProps) {
     setNarrowingMode(null);
     setNarrowingPreview(null);
     setNarrowingStatus("");
+  }
+
+  // Fail-closed UI (issue #105 PR3 review): the broker rejects preview/apply-narrowing with this
+  // distinct code when the kill switch became active concurrently (e.g. another operator enabled
+  // it while this preview was already in flight). The editor can never apply anything in that
+  // state, so callers exit back to the read-only profile view instead of leaving the user stuck.
+  function isKillSwitchActiveRejection(error: unknown): error is BrokerRejectionError {
+    return error instanceof BrokerRejectionError && error.code === "narrowing-kill-switch-active";
   }
 
   async function previewNarrowing(action: NarrowingAction): Promise<void> {
@@ -973,6 +1064,12 @@ export function App(props: AppProps) {
       setNarrowingStatus("");
     } catch (error) {
       if (requestId !== narrowingGeneration) return;
+      if (isKillSwitchActiveRejection(error)) {
+        closeNarrowingEditor();
+        setSettingsStatus(dispatchResultDetail(error.code, error.detail));
+        void refreshSettingsProfile(settingsRole(), { silent: true });
+        return;
+      }
       setNarrowingStatus(error instanceof BrokerRejectionError
         ? dispatchResultDetail(error.code, error.detail)
         : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
@@ -996,15 +1093,33 @@ export function App(props: AppProps) {
       // Refresh via the existing side-effect-free profile() RPC (never the mutating response
       // itself) -- reuses refreshSettingsProfile's own generation guard, so a stale response can
       // never render either.
-      void refreshSettingsProfile(settingsRole());
+      void refreshSettingsProfile(settingsRole(), { silent: true });
     } catch (error) {
       if (requestId !== narrowingGeneration) return;
+      if (isKillSwitchActiveRejection(error)) {
+        closeNarrowingEditor();
+        setSettingsStatus(dispatchResultDetail(error.code, error.detail));
+        void refreshSettingsProfile(settingsRole(), { silent: true });
+        return;
+      }
       setNarrowingStatus(error instanceof BrokerRejectionError
         ? dispatchResultDetail(error.code, error.detail)
         : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
       setNarrowingMode("browsing");
       setNarrowingPreview(null);
     }
+  }
+
+  // PR3 kill-switch TTL display: the emergency lever is broker-enforced short-lived (recommended
+  // 1 hour), so Settings shows the operator how much of that window is left rather than leaving
+  // "ON" looking permanent. now() is the existing 1s-refreshed clock signal, so this counts down
+  // live while Settings stays open.
+  function killSwitchExpiryLabel(profile: CapabilityProfile): string {
+    if (!profile.killSwitchActive || !profile.killSwitchExpiresAtUtc) return "";
+    const expiresAtMs = Date.parse(profile.killSwitchExpiresAtUtc);
+    if (Number.isNaN(expiresAtMs)) return "";
+    const remainingMinutes = Math.max(0, Math.ceil((expiresAtMs - now()) / 60_000));
+    return ` (expires in ${remainingMinutes}m, ${profile.killSwitchExpiresAtUtc})`;
   }
 
   async function toggleKillSwitch(): Promise<void> {
@@ -1020,7 +1135,10 @@ export function App(props: AppProps) {
       setSettingsStatus(nextEnabled
         ? "Ignore local narrowing overrides is now ON: persisted narrowing is ignored until the next launch."
         : "Ignore local narrowing overrides is now OFF: persisted narrowing applies again.");
-      void refreshSettingsProfile(settingsRole());
+      // Silent (issue #105 PR3 review): mirrors previewNarrowing()/applyNarrowingEdit()'s own
+      // internal refresh -- a non-silent refresh would immediately overwrite the confirmation
+      // message just set above with "Resolving effective profile..." before it was ever visible.
+      void refreshSettingsProfile(settingsRole(), { silent: true });
     } catch (error) {
       setSettingsStatus(error instanceof BrokerRejectionError
         ? dispatchResultDetail(error.code, error.detail)
@@ -1405,8 +1523,16 @@ export function App(props: AppProps) {
       } else if (key.name === "e") {
         openNarrowingEditor();
       } else if (key.name === "k") {
-        if (!props.broker) notify("Observe-only: trusted manual broker is unavailable");
-        else setKillSwitchConfirming(true);
+        if (!props.broker) {
+          setSettingsStatus("Observe-only: trusted manual broker is unavailable");
+        } else {
+          const loaded = settingsDisplayProfile();
+          if (loaded && !loaded.editingAvailable) {
+            setSettingsStatus("Unavailable: broker does not support capability narrowing (upgrade required).");
+          } else {
+            setKillSwitchConfirming(true);
+          }
+        }
       }
       return;
     }
@@ -1637,7 +1763,9 @@ export function App(props: AppProps) {
       <Show when={overlay() === "settings"}>
         <OverlayPanel
           title={narrowingMode() ? "SETTINGS - EDIT PERSISTED NARROWING" : "SETTINGS - EFFECTIVE CAPABILITY PROFILE"}
-          width={88}
+          left="0%"
+          padding={0}
+          width={142}
           height={27}
         >
           <box flexDirection="column" flexGrow={1}>
@@ -1661,12 +1789,21 @@ export function App(props: AppProps) {
             <Show when={narrowingMode() && narrowingMode() !== "result" && narrowingStatus()}>
               <text height={1} fg={COLORS.warning}>{line(narrowingStatus(), 170)}</text>
             </Show>
-            <Show when={settingsDisplayProfile() && !narrowingMode()}>
+            {/* Operand order matters here: Show's render-prop accessor receives the resolved
+                `when` VALUE, and `&&` returns its right-hand operand when the left is truthy. With
+                the guard first and the profile second, a truthy result is always the profile
+                object itself -- never the boolean from `!narrowingMode()` -- so the accessor below
+                can never observe a boxed boolean where a CapabilityProfile is expected (the prior
+                `profile && !narrowingMode()` ordering crashed with "undefined is not an object"
+                inside profile().repositoryIdentity.slug once narrowingMode() was falsy). */}
+            <Show when={!narrowingMode() && settingsDisplayProfile()}>
               {(profile: () => CapabilityProfile) => (
                 <>
                   <text height={1} fg={COLORS.accent}>{profile().repositoryIdentity.slug} / PR #{profile().prSnapshot.pullRequestId}</text>
                   <text height={1} fg={profile().killSwitchActive ? COLORS.error : COLORS.muted}>
-                    Ignore local narrowing overrides: {profile().killSwitchActive ? "ON (emergency lever, not a security lockdown)" : "off"}
+                    Ignore local narrowing overrides: {profile().killSwitchActive
+                      ? `ON (emergency lever, not a security lockdown)${killSwitchExpiryLabel(profile())}`
+                      : "off"}
                   </text>
                   <text height={1} fg={COLORS.ok}>Allowed manual ceiling: {line(profile().allowedManualCapabilities.join(", ") || "none", 110)}</text>
                   <text height={1} fg={COLORS.ok}>Enabled for this launch: {line(profile().capabilities.join(", ") || "none", 110)}</text>

@@ -467,13 +467,14 @@ function Invoke-Profile {
 
 function Invoke-PreviewNarrowing {
     # PR3: non-mutating preview/diff for a single hypothetical scope-file edit. Never writes
-    # anything, never creates a dispatch draft/snapshot. Returns the CURRENT effective profile (as
-    # Get-BrokerCapabilityProfile/Get-BrokerNarrowingEffect already compute it), the PROPOSED
-    # effective profile if the requested {scope, capability, action} were applied (computed by the
-    # identical resolver + shared effect builder, just fed one extra hypothetical input -- so it can
-    # never drift from what apply-narrowing would actually produce), and a short-lived, single-use
-    # previewToken binding this exact mutation to the exact repository/worktree/PR/source-commit/
-    # role/store-fingerprint apply-narrowing must re-verify before it is allowed to write.
+    # anything, never creates a dispatch draft/snapshot. Returns the CURRENT effective profile and
+    # the PROPOSED effective profile if the requested {scope, capability, action} were applied,
+    # resolved back-to-back under ONE capability-override lock acquisition (issue #105 PR3 review:
+    # current/proposed/storeFingerprint must all come from the identical locked snapshot, never
+    # from two separate lock acquisitions a concurrent writer could interleave between), and a
+    # short-lived, single-use previewToken binding this exact mutation to the exact repository/
+    # worktree/PR-fingerprint/role/store-fingerprint apply-narrowing must re-verify before it is
+    # allowed to write.
     param([hashtable]$Request)
     $scope = [string]$Request.scope
     if ($scope -cnotin @('machine', 'user', 'repo-worktree', 'pr')) { throw '[narrowing-invalid] scope is not a recognized value.' }
@@ -488,31 +489,66 @@ function Invoke-PreviewNarrowing {
             throw "[narrowing-invalid] capability is not a recognized manually-selectable capability for role '$($profile.Role)'."
         }
         $worktreeId = Get-AgentWorktreeIdentity -RepositoryRoot $provider.RepositoryRoot
+        $hypothetical = @{ Scope = $scope; Capability = $capability; Action = $action }
         $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $provider.RepositoryRoot -TimeoutMilliseconds 2000
         if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
         try {
-            $hypothetical = @{ Scope = $scope; Capability = $capability; Action = $action }
-            $proposedOverride = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $profile.Identity `
-                -RepositoryRoot $provider.RepositoryRoot -PullRequestId $profile.PullRequestId `
-                -CurrentSourceCommit $profile.Pr.sourceCommit -HypotheticalOverride $hypothetical
+            for ($resolveAttempt = 1; $resolveAttempt -le 2; $resolveAttempt++) {
+                try {
+                    # Single locked snapshot: current and proposed are resolved back-to-back inside
+                    # the SAME lock acquisition, so neither can ever observe a different underlying
+                    # file state than the other -- and storeFingerprint below is derived from this
+                    # identical currentOverride read, never from a separate, earlier acquisition.
+                    $currentOverride = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $profile.Identity `
+                        -RepositoryRoot $provider.RepositoryRoot -PullRequestId $profile.PullRequestId -CurrentSourceCommit $profile.Pr.sourceCommit
+                    $proposedOverride = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $profile.Identity `
+                        -RepositoryRoot $provider.RepositoryRoot -PullRequestId $profile.PullRequestId `
+                        -CurrentSourceCommit $profile.Pr.sourceCommit -HypotheticalOverride $hypothetical
+                    break
+                }
+                catch {
+                    if ($resolveAttempt -ge 2 -or $_.Exception.Message -notmatch '^\[stable-read-unstable\]') { throw }
+                }
+            }
         }
         finally {
             Exit-AgentLock $capabilityLock.Stream
         }
+        if ([bool]$currentOverride.KillSwitchActive) {
+            # Fail-closed (issue #105 PR3 review): the kill switch makes every persisted override
+            # inert, so a preview computed while it is active would show a "proposed" effect that
+            # could never actually take hold -- and, worse, a subsequent apply would still be free
+            # to WRITE a hidden override that only takes effect once the kill switch is later
+            # disabled. Reject outright; the UI never even opens the editor in this state (see
+            # tryOpenNarrowingEditor), so reaching here means the kill switch was toggled on
+            # concurrently after the editor was already open.
+            throw '[narrowing-kill-switch-active] Editing is unavailable while the kill switch is active.'
+        }
+        $currentEffect = Get-BrokerNarrowingEffect -RoleDescriptor $profile.RoleDescriptor `
+            -AllowedManualCapabilities $profile.AllowedManualCapabilities -AbsoluteDenies $profile.AbsoluteDenies `
+            -Override $currentOverride
         $proposedEffect = Get-BrokerNarrowingEffect -RoleDescriptor $profile.RoleDescriptor `
             -AllowedManualCapabilities $profile.AllowedManualCapabilities -AbsoluteDenies $profile.AbsoluteDenies `
             -Override $proposedOverride
-        $storeFingerprint = Get-AgentCanonicalDigest -InputObject $profile.Override.FileFingerprints
+        $storeFingerprint = Get-AgentCanonicalDigest -InputObject $currentOverride.FileFingerprints
+        # Full PR-state binding (issue #105 PR3 review): a digest of every PR field apply-narrowing
+        # re-derives and re-checks at the mutation boundary, not just sourceCommit -- see
+        # Invoke-ApplyNarrowing's prFingerprint recheck.
+        $prFingerprint = Get-AgentCanonicalDigest ([ordered]@{
+                schemaVersion = 1; repositoryKey = $profile.Identity.key; pullRequestId = $profile.PullRequestId
+                sourceCommit = $profile.Pr.sourceCommit; sourceRef = $profile.Pr.sourceRef; targetRef = $profile.Pr.targetRef
+                active = $profile.Pr.active; draft = $profile.Pr.draft; author = $profile.Pr.author
+            })
         $token = [Guid]::NewGuid().ToString('D')
         $expiresAtUtc = [DateTime]::UtcNow.AddSeconds($NarrowingPreviewTtlSeconds)
         $narrowingPreviews[$token] = @{
             ExpiresAtUtc = $expiresAtUtc; RepositoryKey = $profile.Identity.key; WorktreeId = $worktreeId
-            PullRequestId = $profile.PullRequestId; SourceCommit = $profile.Pr.sourceCommit
+            PullRequestId = $profile.PullRequestId; PrFingerprint = $prFingerprint
             Role = $profile.Role; Scope = $scope; Capability = $capability; Action = $action
             StoreFingerprint = $storeFingerprint
         }
         $currentJson = ConvertTo-AgentCanonicalJson ([ordered]@{
-                capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies; provenance = $profile.Provenance
+                capabilities = $currentEffect.capabilities; mandatoryDenies = $currentEffect.mandatoryDenies; provenance = $currentEffect.provenance
             })
         $proposedJson = ConvertTo-AgentCanonicalJson ([ordered]@{
                 capabilities = $proposedEffect.capabilities; mandatoryDenies = $proposedEffect.mandatoryDenies
@@ -523,8 +559,8 @@ function Invoke-PreviewNarrowing {
             state = 'previewed'; role = $profile.Role; repositoryIdentity = $profile.Identity; prSnapshot = $profile.Pr
             scope = $scope; capability = $capability; action = $action
             previewToken = $token; storeFingerprint = $storeFingerprint; expiresAtUtc = $expiresAtUtc.ToString('o')
-            killSwitchActive = [bool]$profile.Override.KillSwitchActive; changed = ($currentJson -cne $proposedJson)
-            current = @{ capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies; provenance = $profile.Provenance }
+            killSwitchActive = [bool]$currentOverride.KillSwitchActive; changed = ($currentJson -cne $proposedJson)
+            current = @{ capabilities = $currentEffect.capabilities; mandatoryDenies = $currentEffect.mandatoryDenies; provenance = $currentEffect.provenance }
             proposed = @{
                 capabilities = $proposedEffect.capabilities; mandatoryDenies = $proposedEffect.mandatoryDenies
                 provenance = $proposedEffect.provenance
@@ -577,7 +613,20 @@ function Invoke-ApplyNarrowing {
         $prId = [int]$Request.pullRequestId
         if ($prId -ne $bound.PullRequestId) { throw '[narrowing-stale] Pull request changed since the preview; re-preview and try again.' }
         $pr = ConvertTo-BrokerPrSnapshot -PullRequest (Get-BrokerPullRequest $provider $prId) -PullRequestId $prId
-        if ($pr.sourceCommit -cne $bound.SourceCommit) { throw '[narrowing-stale] Source commit changed since the preview; re-preview and try again.' }
+        # Full PR-state revalidation at the mutation boundary (issue #105 PR3 review): re-checking
+        # active/non-draft here, not just at preview time, is required -- Get-BrokerCapabilityProfile's
+        # own [pr-state-changed] guard only ever ran against the PREVIEW-time read. A PR that was
+        # merged, closed, or converted to draft between preview and apply must still be rejected here.
+        if (-not $pr.active -or $pr.draft) { throw '[pr-state-changed] Pull request is not active and ready.' }
+        # Compares the FULL PR fingerprint (sourceCommit, sourceRef, targetRef, active, draft,
+        # author), not just sourceCommit, against the identical digest Invoke-PreviewNarrowing bound
+        # -- a retarget or author change with an unchanged sourceCommit must still be caught.
+        $prFingerprint = Get-AgentCanonicalDigest ([ordered]@{
+                schemaVersion = 1; repositoryKey = $identity.key; pullRequestId = $prId
+                sourceCommit = $pr.sourceCommit; sourceRef = $pr.sourceRef; targetRef = $pr.targetRef
+                active = $pr.active; draft = $pr.draft; author = $pr.author
+            })
+        if ($prFingerprint -cne $bound.PrFingerprint) { throw '[narrowing-stale] Pull request changed since the preview; re-preview and try again.' }
         $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $role
         if ($capability -cnotin @($harnessRole.allowedManualCapabilities)) {
             throw "[narrowing-invalid] capability is not a recognized manually-selectable capability for role '$role'."
@@ -593,6 +642,14 @@ function Invoke-ApplyNarrowing {
         try {
             $liveOverride = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity -RepositoryRoot $provider.RepositoryRoot `
                 -PullRequestId $prId -CurrentSourceCommit $pr.sourceCommit
+            if ([bool]$liveOverride.KillSwitchActive) {
+                # Fail-closed (issue #105 PR3 review): mirrors Invoke-PreviewNarrowing's own check.
+                # In practice a kill switch flipped on since the preview already changes
+                # FileFingerprints (see below) and would be caught as [narrowing-stale] anyway, but
+                # this gives the dashboard the precise, actionable rejection code instead of a
+                # generic staleness message.
+                throw '[narrowing-kill-switch-active] Editing is unavailable while the kill switch is active.'
+            }
             $liveFingerprint = Get-AgentCanonicalDigest -InputObject $liveOverride.FileFingerprints
             if ($liveFingerprint -cne $storeFingerprint) {
                 throw '[narrowing-stale] The capability-override store changed since the preview; re-preview and try again.'
@@ -607,7 +664,8 @@ function Invoke-ApplyNarrowing {
         $narrowingPreviews.Remove($token)
         Write-DispatchProtocolMessage @{
             schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'narrowing-applied'
-            state = 'applied'; scope = $scope; capability = $capability; action = $action
+            state = 'applied'; role = $role; scope = $scope; capability = $capability; action = $action
+            previewToken = $token
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
@@ -622,6 +680,12 @@ function Invoke-SetKillSwitch {
     $enabledValue = Get-OptionalMember $Request 'enabled'
     if ($enabledValue -isnot [bool]) { throw '[narrowing-invalid] enabled must be a boolean.' }
     $role = [string]$Request.role
+    # Exact-case role validation (issue #105 PR3 review): Get-RoleDescriptor's own lookup goes
+    # through a case-insensitive PowerShell -in check and hashtable key lookup, unlike every other
+    # per-request field in this protocol. Invoke-ApplyNarrowing has its own independent, explicit
+    # -cnotin check as a second layer; this endpoint had none, so it is validated here explicitly,
+    # before ever calling Get-RoleDescriptor.
+    if ($role -cnotin @('reviewer', 'review-handler')) { throw '[narrowing-invalid] role is not a recognized value.' }
     $roleDescriptor = Get-RoleDescriptor $role
     $provider = Open-BrokerProvider $roleDescriptor
     try {
@@ -638,7 +702,8 @@ function Invoke-SetKillSwitch {
             Exit-AgentLock $capabilityLock.Stream
         }
         Write-DispatchProtocolMessage @{
-            schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'kill-switch-applied'; enabled = [bool]$enabledValue
+            schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'kill-switch-applied'
+            role = $role; enabled = [bool]$enabledValue
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }

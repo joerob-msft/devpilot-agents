@@ -1652,9 +1652,17 @@ function Get-AgentCapabilityOverrideKillSwitchDisallowedRoots {
 function Test-AgentCapabilityOverrideKillSwitch {
     <#
         Emergency operational lever (PR3): existence of the sentinel file alone is authoritative --
-        content is never consulted. Checked via a cheap Test-Path against the (possibly still
-        nonexistent) kill-switch root FIRST, so a machine that has never toggled the kill switch
-        never pays the cost of, or triggers, ACL/symlink hardening on every describe/profile call.
+        content is never consulted for its EXISTENCE, but the sentinel now also carries a short
+        enforced TTL (default one hour -- see Enable-AgentCapabilityOverrideKillSwitch's
+        TtlSeconds), so a forgotten "ignore local narrowing overrides" toggle can never silently
+        persist forever (issue #105 PR3 review). An expired sentinel is cleaned up (deleted) the
+        first time anything observes it past expiry, rather than left for a separate janitor to
+        find -- safe because this function's only caller (Resolve-AgentEffectiveCapabilitySettings)
+        is only ever invoked while the caller already holds Enter-AgentCapabilityOverrideLock,
+        exactly like every writer in this module. Checked via a cheap Test-Path against the
+        (possibly still nonexistent) kill-switch root FIRST, so a machine that has never toggled
+        the kill switch never pays the cost of, or triggers, ACL/symlink hardening on every
+        describe/profile call.
     #>
     param([Parameter(Mandatory)][string]$RepositoryRoot)
     $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
@@ -1663,26 +1671,45 @@ function Test-AgentCapabilityOverrideKillSwitch {
         -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots)
     $path = Join-Path $root 'sentinel.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
-    [void](Assert-AgentTrustedFile -Path $path -AllowedRoot $root -ExpectedPath $path -Private)
+    $trustedPath = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -ExpectedPath $path -Private
+    $stable = Read-AgentStableFile -Path $trustedPath -MaxBytes 65536
+    if (-not $stable.Exists) { return $false }
+    $sentinel = [Text.Encoding]::UTF8.GetString($stable.Bytes) | ConvertFrom-Json -AsHashtable -Depth 5
+    if ($sentinel.Contains('expiresAtUtc') -and
+        [double]$sentinel['expiresAtUtc'] -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
+        Assert-AgentPathHasNoLinks -Path $path
+        Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        return $false
+    }
     return $true
 }
 
 function Enable-AgentCapabilityOverrideKillSwitch {
     <#
         Idempotent: enabling an already-enabled kill switch is a no-op, never a second write.
+        (An already-running TTL window is therefore never silently restarted/extended by a
+        redundant enable call either.)
         Atomic owner-private create via the same temp-write-then-replace idiom every other writer
         in this store uses (Write-AgentFileThrough + Install-AgentFileAtomic) -- no partial file is
         ever observable at the final path. Caller must hold Enter-AgentCapabilityOverrideLock.
+        TtlSeconds (issue #105 PR3 review): the emergency lever is short-lived by design -- default
+        one hour -- so it can never be silently left on indefinitely; see
+        Test-AgentCapabilityOverrideKillSwitch for the corresponding enforcement/cleanup.
     #>
-    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [ValidateRange(60, 86400)][int]$TtlSeconds = 3600
+    )
     $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
     $root = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
         -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots) -Create
     $path = Join-Path $root 'sentinel.json'
     if (Test-Path -LiteralPath $path -PathType Leaf) { return }
+    $enabledAtUtc = [DateTime]::UtcNow
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-AgentCanonicalJson ([ordered]@{
                     schemaVersion = 1
-                    enabledAtUtc = (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))
+                    enabledAtUtc = (ConvertTo-AgentCanonicalEpochSeconds $enabledAtUtc)
+                    expiresAtUtc = (ConvertTo-AgentCanonicalEpochSeconds $enabledAtUtc.AddSeconds($TtlSeconds))
                 })))
     $tempPath = Join-Path $root "sentinel.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
     try {
@@ -1764,12 +1791,22 @@ function Set-AgentCapabilityOverrideSetting {
         throw '[narrowing-invalid] Resolved settings path escaped the capability-override root.'
     }
     $parent = Split-Path $path -Parent
+    # First-write dynamic parent creation (issue #105 PR3 review): repo-worktree/pr scopes create
+    # nested directories ('repo\<hash>' and 'repo\<hash>\pr') lazily, on the first override ever
+    # written for that repository/worktree/PR -- unlike the store root itself (hardened once by
+    # Resolve-AgentTrustedRoot), nothing validated these deeper, dynamically-created path segments
+    # before now. Checked for a planted link/junction/reparse point both BEFORE creating (catches
+    # an ancestor an attacker already planted) and AFTER (catches one swapped in during the TOCTOU
+    # window the New-Item call itself opens), mirroring Resolve-AgentTrustedRoot's own
+    # check-create-recheck idiom exactly.
+    Assert-AgentPathHasNoLinks -Path $parent
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
         New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
         if (-not $IsWindows) {
             [IO.File]::SetUnixFileMode($parent, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
         }
     }
+    Assert-AgentPathHasNoLinks -Path $parent
     $existingSettings = [ordered]@{}
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         $trustedPath = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -Private

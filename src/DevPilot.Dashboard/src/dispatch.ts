@@ -67,6 +67,18 @@ export interface CapabilitySummary {
   // this machine+user. capabilities/mandatoryDenies/provenance above already reflect that (ceiling
   // defaults, provenance 'kill-switch') -- this flag lets the UI additionally explain WHY.
   killSwitchActive: boolean;
+  // PR3: ISO-8601 UTC timestamp for when the kill switch's short TTL (broker-enforced, recommended
+  // 1 hour) expires, or null when the kill switch is inactive. Always present on the wire from a
+  // PR3-or-newer broker (never silently optional here) -- see editingAvailable below for how a
+  // pre-PR3 broker missing this entirely is instead detected and handled.
+  killSwitchExpiresAtUtc: string | null;
+  // Derived, not broker-authored: true only when allowedManualCapabilities, provenance, and
+  // killSwitchActive were ALL actually present on the wire (i.e. this broker is new enough to
+  // support narrowing/kill-switch editing at all). A capability marker for the UI to decide
+  // whether to offer the editor -- never a trust signal about the (possibly-defaulted) field
+  // values themselves, and never used to imply a broker-old response is a "trusted editable
+  // profile".
+  editingAvailable: boolean;
 }
 
 // Read-only effective-capability-profile inspection (PR1 issue #105): the Settings TUI's dedicated,
@@ -90,6 +102,8 @@ export interface CapabilityProfile {
   delegableAvailable: string[];
   provenance: Record<string, CapabilityProvenance>;
   killSwitchActive: boolean;
+  killSwitchExpiresAtUtc: string | null;
+  editingAvailable: boolean;
 }
 
 // PR3: the {capabilities, mandatoryDenies, provenance} triple describing one resolved effective
@@ -130,15 +144,24 @@ export interface CapabilityNarrowingApplied {
   requestId: string;
   operation: "narrowing-applied";
   state: "applied";
+  // PR3 echo-validation (mirrors CapabilityNarrowingPreview's own role/previewToken): the broker
+  // must echo back the exact role and previewToken it was given so applyNarrowing() can verify the
+  // response describes the same mutation that was requested, rather than trusting operation name
+  // matching alone.
+  role: AgentRole;
   scope: NarrowingScope;
   capability: string;
   action: NarrowingAction;
+  previewToken: string;
 }
 
 export interface KillSwitchApplied {
   schemaVersion: 1;
   requestId: string;
   operation: "kill-switch-applied";
+  // Broker-authored role (mirrors CapabilitySummary/CapabilityProfile's roleField) so
+  // setKillSwitch() can reject a response describing a different role than what was requested.
+  role: AgentRole;
   enabled: boolean;
 }
 
@@ -362,24 +385,72 @@ function booleanField(record: Record<string, unknown>, name: string): boolean {
   return value;
 }
 
+// PR3's killSwitchExpiresAtUtc: bounded like boundedPrText, but null is a legitimate value (the
+// kill switch is inactive) rather than a parse failure.
+function nullableBoundedText(record: Record<string, unknown>, name: string): string | null {
+  const value = record[name];
+  if (value === null) return null;
+  if (typeof value !== "string" || value.length > MAX_PR_SNAPSHOT_TEXT_LENGTH) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  return value;
+}
+
+// Legacy-broker compatibility (issue #105 PR3 review): a schemaVersion-1 broker that predates the
+// PR1/PR2/PR3-additive profile fields simply omits them from capability-summary/capability-profile
+// responses -- schemaVersion here never bumps across those additions, so an old broker is legally
+// still on the wire. These optionalXField helpers default a field ONLY when it is genuinely absent
+// (`record[name] === undefined`); a field that IS present but malformed still throws via the
+// underlying required-field parser, so this only softens absence, never corruption.
+function optionalStringArrayField(record: Record<string, unknown>, name: string, fallback: string[]): string[] {
+  return record[name] === undefined ? fallback : stringArrayField(record, name);
+}
+
+function optionalProvenanceField(record: Record<string, unknown>, name: string): Record<string, CapabilityProvenance> {
+  return record[name] === undefined ? Object.create(null) : provenanceField(record, name);
+}
+
+function optionalBooleanField(record: Record<string, unknown>, name: string, fallback: boolean): boolean {
+  return record[name] === undefined ? fallback : booleanField(record, name);
+}
+
+function optionalNullableBoundedText(record: Record<string, unknown>, name: string): string | null {
+  return record[name] === undefined ? null : nullableBoundedText(record, name);
+}
+
 // Constructs the PR1 additive profile fields from validated values only -- never spread/cast
 // straight from the untrusted parsed record, unlike the rest of parseResponse's envelope fields.
 function parseCapabilityProfileFields(record: Record<string, unknown>): Pick<
   CapabilitySummary,
-  "absoluteDenies" | "allowedManualCapabilities" | "delegableAvailable" | "provenance" | "killSwitchActive"
+  | "absoluteDenies"
+  | "allowedManualCapabilities"
+  | "delegableAvailable"
+  | "provenance"
+  | "killSwitchActive"
+  | "killSwitchExpiresAtUtc"
+  | "editingAvailable"
 > {
-  const delegableAvailable = stringArrayField(record, "delegableAvailable");
+  // editingAvailable is a capability marker, not a trust decision about content: it reflects
+  // whether the broker is new enough to have SENT these fields at all, computed from raw presence
+  // BEFORE any fallback is applied -- never from the (possibly-defaulted) values below.
+  const editingAvailable =
+    record.allowedManualCapabilities !== undefined &&
+    record.provenance !== undefined &&
+    record.killSwitchActive !== undefined;
+  const delegableAvailable = optionalStringArrayField(record, "delegableAvailable", []);
   if (delegableAvailable.length > 0) {
     // No delegation/widening policy exists yet in this release (PR2+ scope) -- a non-empty value
     // here would mean the broker is claiming a capability policy that cannot exist in PR1.
     throw new Error("broker response delegableAvailable must be empty");
   }
   return {
-    absoluteDenies: stringArrayField(record, "absoluteDenies"),
-    allowedManualCapabilities: stringArrayField(record, "allowedManualCapabilities"),
+    absoluteDenies: optionalStringArrayField(record, "absoluteDenies", []),
+    allowedManualCapabilities: optionalStringArrayField(record, "allowedManualCapabilities", []),
     delegableAvailable,
-    provenance: provenanceField(record, "provenance"),
-    killSwitchActive: booleanField(record, "killSwitchActive"),
+    provenance: optionalProvenanceField(record, "provenance"),
+    killSwitchActive: optionalBooleanField(record, "killSwitchActive", false),
+    killSwitchExpiresAtUtc: optionalNullableBoundedText(record, "killSwitchExpiresAtUtc"),
+    editingAvailable,
   };
 }
 
@@ -495,9 +566,11 @@ function parseResponse(line: string): BrokerResponse {
       requestId,
       operation,
       state: "applied",
+      role: roleField(record, "role"),
       scope: narrowingScopeField(record, "scope"),
       capability: capabilityNameField(record, "capability"),
       action: narrowingActionField(record, "action"),
+      previewToken: stringField(record, "previewToken"),
     } satisfies CapabilityNarrowingApplied;
   }
   if (operation === "kill-switch-applied") {
@@ -505,6 +578,7 @@ function parseResponse(line: string): BrokerResponse {
       schemaVersion: 1,
       requestId,
       operation,
+      role: roleField(record, "role"),
       enabled: booleanField(record, "enabled"),
     } satisfies KillSwitchApplied;
   }
@@ -627,7 +701,7 @@ export class DispatchClient implements DispatchBroker {
   }
 
   applyNarrowing(preview: CapabilityNarrowingPreview, repositoryKey: string, pullRequestId: number): Promise<CapabilityNarrowingApplied> {
-    return this.request({
+    return this.request<CapabilityNarrowingApplied>({
       schemaVersion: 1,
       operation: "apply-narrowing",
       repositoryKey,
@@ -638,17 +712,36 @@ export class DispatchClient implements DispatchBroker {
       action: preview.action,
       previewToken: preview.previewToken,
       storeFingerprint: preview.storeFingerprint,
-    }, "narrowing-applied");
+    }, "narrowing-applied").then((response) => {
+      // Mirrors previewNarrowing()'s own echo-validation: the broker must echo back the exact
+      // binding it was just given, so a response describing a different mutation is rejected
+      // client-side rather than trusted.
+      if (
+        response.role !== preview.role ||
+        response.scope !== preview.scope ||
+        response.capability !== preview.capability ||
+        response.action !== preview.action ||
+        response.previewToken !== preview.previewToken
+      ) {
+        throw new Error("broker narrowing-applied does not match the requested mutation");
+      }
+      return response;
+    });
   }
 
   setKillSwitch(repositoryKey: string, role: AgentRole, enabled: boolean): Promise<KillSwitchApplied> {
-    return this.request({
+    return this.request<KillSwitchApplied>({
       schemaVersion: 1,
       operation: "set-kill-switch",
       repositoryKey,
       role,
       enabled,
-    }, "kill-switch-applied");
+    }, "kill-switch-applied").then((response) => {
+      if (response.role !== role || response.enabled !== enabled) {
+        throw new Error("broker kill-switch-applied does not match the requested mutation");
+      }
+      return response;
+    });
   }
 
   dispatch(summary: CapabilitySummary, operatorPrompt: string): Promise<DispatchAccepted> {
