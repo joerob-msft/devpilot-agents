@@ -59,12 +59,35 @@ $writerGate = [object]::new()
 $drafts = @{}
 $children = @{}
 $requestIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$requestIdOrder = [Collections.Generic.Queue[string]]::new()
+# issue #105 PR4 (requirement 4): global requestId anti-replay tracking is bounded, not unbounded --
+# a long-lived broker process must not grow $requestIds forever. Oldest ids are evicted once the
+# tracked count exceeds this cap; replay protection only needs to hold for a request's realistic
+# in-flight lifetime, not for the lifetime of the broker process.
+[int]$MaxTrackedRequestIds = 8192
+# issue #105 PR4: short TTL for each interactive widening confirmation step (describe-widening's
+# challenge1, confirm-widening-preview's challenge2); a minted grant's own expiry is instead bound
+# to the draft's own DraftLifetimeSeconds (a grant never outlives the draft it was minted for).
+[int]$WideningChallengeTtlSeconds = 60
 # PR3: in-memory-only preview bindings for the narrow-only settings editor (preview-narrowing /
 # apply-narrowing). Never persisted, never a reusable proof -- a token is consumed (removed) the
 # instant apply-narrowing succeeds, and any expired or otherwise-consumed token fails closed,
 # requiring a fresh preview. Broker-local, exactly like $drafts.
 $narrowingPreviews = @{}
 $accepting = $true
+
+function Register-BrokerRequestId {
+    <#
+        Bounded anti-replay set (issue #105 PR4 requirement 4): returns $false (caller must reject)
+        if Id was already registered; otherwise registers it and evicts the oldest tracked id once
+        the bound is exceeded, keeping memory bounded across a long-lived broker process.
+    #>
+    param([Parameter(Mandatory)][string]$Id)
+    if (-not $requestIds.Add($Id)) { return $false }
+    $requestIdOrder.Enqueue($Id)
+    while ($requestIdOrder.Count -gt $MaxTrackedRequestIds) { [void]$requestIds.Remove($requestIdOrder.Dequeue()) }
+    return $true
+}
 
 function Get-OptionalMember {
     param([AllowNull()]$InputObject, [Parameter(Mandatory)][string]$Name)
@@ -349,12 +372,18 @@ function Get-BrokerCapabilityProfile {
         $capabilities = @($roleDescriptor.capabilities | Sort-Object -Unique)
         $mandatoryDenies = @($roleDescriptor.mandatoryDenies | Sort-Object -Unique)
         $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $role
-        # Additive, read-only profile fields (PR1): delegableAvailable is always empty here because no
-        # delegation/widening policy exists yet (PR2+ scope) -- everything is decided by the checked-in
-        # operational-default ceiling, so every named capability's provenance is 'operational-default'.
         $absoluteDenies = @($harnessRole.absoluteDenies | Sort-Object -Unique)
         $allowedManualCapabilities = @($harnessRole.allowedManualCapabilities | Sort-Object -Unique)
+        # issue #105 PR4: delegableAvailable reflects the checked-in delegation policy for THIS
+        # role/repository -- never "any" unless the policy literally sets allowAnyVerified:true. The
+        # shipped policy ships with an empty allowlist and allowAnyVerified:false for every role, so
+        # this is always @() until a CODEOWNERS-approved policy change populates one or the other
+        # (governance deferred; see delegation.policy.v1.json).
+        $delegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
         $delegableAvailable = @()
+        if (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $role -Capability $harnessRole.delegableDefaultOff -RepositoryKey $identity.key) {
+            $delegableAvailable = @($harnessRole.delegableDefaultOff)
+        }
         # PR2: narrow the operational-default ceiling by any persisted, outside-repository
         # capability override. Overrides can only ever remove an active capability, never add one
         # (Resolve-AgentCapabilityPolicyPartition). A resolution failure (corrupt/stale/expired/
@@ -439,6 +468,11 @@ function Invoke-Describe {
             PolicyDigest = $policyDigest; PrFingerprint = $prFingerprint
             Snapshot = $snapshot; RoleDescriptor = $roleDescriptor
             PromptGuard = $null; Guardian = $null; GuardianToken = $null
+            # issue #105 PR4: no widening requested yet. Widening is set only by describe-widening
+            # and cleared back to $null by cancel-widening/Invoke-TerminalDraftFailure-style resets;
+            # WideningGeneration increments on every widening state transition so cancel-widening can
+            # detect and reject a stale request bound to an already-superseded widening attempt.
+            Widening = $null; WideningGeneration = 0
         }
         Write-DispatchProtocolMessage @{
             schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'capability-summary'
@@ -734,6 +768,242 @@ function Invoke-SetKillSwitch {
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
 }
 
+# ---------------------------------------------------------------------------
+# issue #105 PR4: interactive-only, draft-bound capability widening protocol. Delegation
+# eligibility is decided ENTIRELY by the checked-in delegation.policy.v1.json (shipped empty --
+# safe default, no grant possible until a CODEOWNERS-approved policy change populates it) and the
+# role's own single delegableDefaultOff capability; nothing here ever widens beyond that one name.
+# No provider/network round trip: identity/PR are already provider-verified and bound on the draft
+# from describe() time, so these four operations only ever touch the local delegation-policy file
+# and the local capability-override store (both already bounded, small, synchronous reads
+# elsewhere in this broker) -- keeping the interactive confirmation loop responsive.
+# ---------------------------------------------------------------------------
+
+function Get-DraftWideningCandidate {
+    <#
+        Resolves the draft's CURRENT (no grant) and WIDENED (Capability granted) capability
+        partitions from a single fresh, lock-held read of the capability-override store -- current
+        and widened can never observe different underlying file state than each other, exactly like
+        Invoke-PreviewNarrowing's own current/proposed pairing.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Draft, [Parameter(Mandatory)][string]$Capability)
+    $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $Draft.RoleDescriptor.repositoryRoot -TimeoutMilliseconds 2000
+    if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+    try {
+        $override = $null
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            try {
+                $override = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $Draft.RepositoryIdentity `
+                    -RepositoryRoot $Draft.RoleDescriptor.repositoryRoot -PullRequestId $Draft.PullRequestId `
+                    -CurrentSourceCommit $Draft.PrSnapshot.sourceCommit
+                break
+            }
+            catch {
+                if ($attempt -ge 2 -or $_.Exception.Message -notmatch '^\[stable-read-unstable\]') { throw }
+            }
+        }
+    }
+    finally { Exit-AgentLock $capabilityLock.Stream }
+    if ([bool]$override.KillSwitchActive) {
+        throw '[narrowing-kill-switch-active] Widening is unavailable while the kill switch is active.'
+    }
+    $current = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $Draft.RoleDescriptor -PersistedNarrowing $override.Settings
+    $widened = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $Draft.RoleDescriptor -PersistedNarrowing $override.Settings -GrantCapability $Capability
+    return @{ Override = $override; Current = $current; Widened = $widened }
+}
+
+function Assert-AgentWideningRequestBinding {
+    param([Parameter(Mandatory)][hashtable]$Request, [Parameter(Mandatory)][hashtable]$Draft)
+    if ($Draft.Consumed) { throw '[invalid-request] dispatchDraftId has already been consumed.' }
+    if (([DateTime]::UtcNow - $Draft.CreatedAt).TotalSeconds -gt $DraftLifetimeSeconds) { throw '[invalid-request] dispatchDraftId has expired.' }
+    if ([string]$Request.role -cne $Draft.Role -or [int]$Request.pullRequestId -ne $Draft.PullRequestId -or
+        [string]$Request.repositoryKey -cne $Draft.RepositoryIdentity.key) {
+        throw '[invalid-request] Widening request binding does not match its draft.'
+    }
+}
+
+function Resolve-DraftWideningDraft {
+    param([hashtable]$Request)
+    $draftId = [string](Get-OptionalMember $Request 'dispatchDraftId')
+    $parsed = [Guid]::Empty
+    if (-not [Guid]::TryParseExact($draftId, 'D', [ref]$parsed) -or -not $drafts.ContainsKey($draftId)) {
+        throw '[invalid-request] dispatchDraftId is unknown or malformed.'
+    }
+    return @{ DraftId = $draftId; Draft = $drafts[$draftId] }
+}
+
+function Add-AgentConsumedWideningChallenge {
+    <#
+        Per-draft bounded consumed-challenge ring, max 8 (issue #105 PR4 requirement 4): rejects an
+        exact replay of any challenge this draft's widening flow has ever issued and consumed, not
+        merely one matching the CURRENT stage name -- a restarted flow (a fresh describe-widening
+        call) issues a new challenge at the same stage name, and an old, already-consumed challenge
+        for an earlier attempt must still never be replayable.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Widening, [Parameter(Mandatory)][string]$Challenge)
+    if ($Widening.ConsumedChallenges.Contains($Challenge)) { throw '[widening-replay] Challenge has already been consumed.' }
+    $Widening.ConsumedChallenges.Add($Challenge)
+    while ($Widening.ConsumedChallenges.Count -gt 8) { $Widening.ConsumedChallenges.RemoveAt(0) }
+}
+
+function Invoke-DescribeWidening {
+    param([hashtable]$Request)
+    $resolved = Resolve-DraftWideningDraft $Request
+    $draftId = $resolved.DraftId; $draft = $resolved.Draft
+    Assert-AgentWideningRequestBinding -Request $Request -Draft $draft
+    $capability = [string]$Request.capability
+    $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $draft.Role
+    if ($capability -cnotmatch '^[A-Za-z][A-Za-z0-9]*$' -or $capability -cne $harnessRole.delegableDefaultOff) {
+        throw "[widening-invalid] capability is not the recognized delegable capability for role '$($draft.Role)'."
+    }
+    $delegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+    if (-not (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $draft.Role -Capability $capability -RepositoryKey $draft.RepositoryIdentity.key)) {
+        throw '[delegation-not-allowed] The checked-in delegation policy does not permit this capability for this repository.'
+    }
+    $candidate = Get-DraftWideningCandidate -Draft $draft -Capability $capability
+    $diff = Resolve-AgentWideningEffectiveDiff -Current $candidate.Current -Widened $candidate.Widened -Role $draft.Role -GrantCapability $capability
+    $challenge = New-AgentWideningChallenge
+    $expiresAtUtc = [DateTime]::UtcNow.AddSeconds($WideningChallengeTtlSeconds)
+    $draft.Widening = @{
+        Capability = $capability; Stage = 'widening-preview'; Challenge = $challenge; ExpiresAtUtc = $expiresAtUtc
+        ConsumedChallenges = [Collections.Generic.List[string]]::new()
+        DelegationPolicyPathHash = $delegationPolicy.PathHash; DelegationPolicyContentSha256 = $delegationPolicy.ContentSha256
+        GrantNonce = $null; MintedAtUtc = $null; GrantExpiresAtUtc = $null
+    }
+    $draft.WideningGeneration++
+    Write-DispatchProtocolMessage @{
+        schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'widening-preview'
+        state = 'previewed'; dispatchDraftId = $draftId; capability = $capability; challenge = $challenge
+        effectiveDiff = $diff; expiresAtUtc = $expiresAtUtc.ToString('o'); generation = $draft.WideningGeneration
+    }
+}
+
+function Invoke-ConfirmWideningPreview {
+    param([hashtable]$Request)
+    $resolved = Resolve-DraftWideningDraft $Request
+    $draftId = $resolved.DraftId; $draft = $resolved.Draft
+    Assert-AgentWideningRequestBinding -Request $Request -Draft $draft
+    $capability = [string]$Request.capability
+    $challenge = [string]$Request.challenge
+    $w = $draft.Widening
+    if (-not $w -or $w.Stage -cne 'widening-preview' -or $w.Capability -cne $capability) {
+        throw '[widening-invalid] No widening preview is pending for this capability.'
+    }
+    if ([DateTime]::UtcNow -ge $w.ExpiresAtUtc) { throw '[widening-expired] Widening preview challenge has expired.' }
+    if (-not (Test-AgentWideningChallengeShape -Challenge $challenge) -or $challenge -cne $w.Challenge) {
+        throw '[widening-invalid] Challenge does not match the pending widening preview.'
+    }
+    Add-AgentConsumedWideningChallenge -Widening $w -Challenge $challenge
+    $delegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+    if ($delegationPolicy.PathHash -cne $w.DelegationPolicyPathHash -or $delegationPolicy.ContentSha256 -cne $w.DelegationPolicyContentSha256 -or
+        -not (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $draft.Role -Capability $capability -RepositoryKey $draft.RepositoryIdentity.key)) {
+        $draft.Widening = $null; $draft.WideningGeneration++
+        throw '[delegation-not-allowed] The checked-in delegation policy changed and no longer permits this capability.'
+    }
+    $candidate = Get-DraftWideningCandidate -Draft $draft -Capability $capability
+    $diff = Resolve-AgentWideningEffectiveDiff -Current $candidate.Current -Widened $candidate.Widened -Role $draft.Role -GrantCapability $capability
+    $newChallenge = New-AgentWideningChallenge
+    $expiresAtUtc = [DateTime]::UtcNow.AddSeconds($WideningChallengeTtlSeconds)
+    $w.Stage = 'widening-summary'; $w.Challenge = $newChallenge; $w.ExpiresAtUtc = $expiresAtUtc
+    $draft.WideningGeneration++
+    Write-DispatchProtocolMessage @{
+        schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'widening-summary'
+        state = 'awaiting-final-confirmation'; dispatchDraftId = $draftId; capability = $capability; challenge = $newChallenge
+        effectiveDiff = $diff; expiresAtUtc = $expiresAtUtc.ToString('o'); generation = $draft.WideningGeneration
+    }
+}
+
+function Invoke-ConfirmWideningMint {
+    param([hashtable]$Request)
+    $resolved = Resolve-DraftWideningDraft $Request
+    $draftId = $resolved.DraftId; $draft = $resolved.Draft
+    Assert-AgentWideningRequestBinding -Request $Request -Draft $draft
+    $capability = [string]$Request.capability
+    $challenge = [string]$Request.challenge
+    $w = $draft.Widening
+    if (-not $w -or $w.Stage -cne 'widening-summary' -or $w.Capability -cne $capability) {
+        throw '[widening-invalid] No widening confirmation is pending for this capability.'
+    }
+    if ([DateTime]::UtcNow -ge $w.ExpiresAtUtc) { throw '[widening-expired] Widening confirmation challenge has expired.' }
+    if (-not (Test-AgentWideningChallengeShape -Challenge $challenge) -or $challenge -cne $w.Challenge) {
+        throw '[widening-invalid] Challenge does not match the pending widening confirmation.'
+    }
+    Add-AgentConsumedWideningChallenge -Widening $w -Challenge $challenge
+    $delegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+    if ($delegationPolicy.PathHash -cne $w.DelegationPolicyPathHash -or $delegationPolicy.ContentSha256 -cne $w.DelegationPolicyContentSha256 -or
+        -not (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $draft.Role -Capability $capability -RepositoryKey $draft.RepositoryIdentity.key)) {
+        $draft.Widening = $null; $draft.WideningGeneration++
+        throw '[delegation-not-allowed] The checked-in delegation policy changed and no longer permits this capability.'
+    }
+    $candidate = Get-DraftWideningCandidate -Draft $draft -Capability $capability
+    $diff = Resolve-AgentWideningEffectiveDiff -Current $candidate.Current -Widened $candidate.Widened -Role $draft.Role -GrantCapability $capability
+    if (-not $diff.pairedCapabilityActive) {
+        throw "[widening-invalid] $($diff.pairedCapability) must already be active before $capability can be granted."
+    }
+    $grantNonce = New-AgentNonce
+    $grantExpiresAtUtc = $draft.CreatedAt.AddSeconds($DraftLifetimeSeconds)
+    $w.Stage = 'minted'; $w.GrantNonce = $grantNonce; $w.MintedAtUtc = [DateTime]::UtcNow; $w.GrantExpiresAtUtc = $grantExpiresAtUtc
+    $w.DelegationPolicyPathHash = $delegationPolicy.PathHash; $w.DelegationPolicyContentSha256 = $delegationPolicy.ContentSha256
+    # Update the draft's own bound policy/digest to the WIDENED partition -- exactly the same
+    # ordered-field shape Invoke-Describe used, so dispatch()'s existing capabilityPolicyDigest
+    # binding check keeps working unmodified against this new, wider value.
+    $draft.Policy = [ordered]@{
+        schemaVersion = 1; repositoryIdentity = $draft.RepositoryIdentity; role = $draft.Role
+        capabilities = $candidate.Widened.capabilities; mandatoryDenies = $candidate.Widened.mandatoryDenies
+        ceilingCapabilities = $draft.Policy.ceilingCapabilities; ceilingMandatoryDenies = $draft.Policy.ceilingMandatoryDenies
+        configSnapshotSha256 = $draft.Policy.configSnapshotSha256
+    }
+    $draft.PolicyDigest = Get-AgentCanonicalDigest $draft.Policy
+    $draft.WideningGeneration++
+    Write-DispatchProtocolMessage @{
+        schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'widening-minted'
+        state = 'minted'; dispatchDraftId = $draftId; capability = $capability
+        capabilities = $draft.Policy.capabilities; mandatoryDenies = $draft.Policy.mandatoryDenies
+        capabilityPolicyDigest = $draft.PolicyDigest; effectiveDiff = $diff
+        grantExpiresAtUtc = (ConvertTo-AgentCanonicalEpochSeconds $grantExpiresAtUtc); generation = $draft.WideningGeneration
+    }
+}
+
+function Invoke-CancelWidening {
+    param([hashtable]$Request)
+    $resolved = Resolve-DraftWideningDraft $Request
+    $draftId = $resolved.DraftId; $draft = $resolved.Draft
+    Assert-AgentWideningRequestBinding -Request $Request -Draft $draft
+    if ([int64]$Request.generation -ne [int64]$draft.WideningGeneration) {
+        throw '[widening-stale] Widening state has moved on; re-open the widening panel and try again.'
+    }
+    $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $draft.Role
+    $delegationPolicyForCancel = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+    $delegableAvailable = @()
+    if (Test-AgentDelegationAllows -Policy $delegationPolicyForCancel -Role $draft.Role -Capability $harnessRole.delegableDefaultOff -RepositoryKey $draft.RepositoryIdentity.key) {
+        $delegableAvailable = @($harnessRole.delegableDefaultOff)
+    }
+    $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $draft.RoleDescriptor.repositoryRoot -TimeoutMilliseconds 2000
+    if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+    try {
+        $override = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $draft.RepositoryIdentity `
+            -RepositoryRoot $draft.RoleDescriptor.repositoryRoot -PullRequestId $draft.PullRequestId -CurrentSourceCommit $draft.PrSnapshot.sourceCommit
+    }
+    finally { Exit-AgentLock $capabilityLock.Stream }
+    $unwidened = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $draft.RoleDescriptor -PersistedNarrowing $override.Settings
+    $draft.Widening = $null
+    $draft.Policy = [ordered]@{
+        schemaVersion = 1; repositoryIdentity = $draft.RepositoryIdentity; role = $draft.Role
+        capabilities = $unwidened.capabilities; mandatoryDenies = $unwidened.mandatoryDenies
+        ceilingCapabilities = $draft.Policy.ceilingCapabilities; ceilingMandatoryDenies = $draft.Policy.ceilingMandatoryDenies
+        configSnapshotSha256 = $draft.Policy.configSnapshotSha256
+    }
+    $draft.PolicyDigest = Get-AgentCanonicalDigest $draft.Policy
+    $draft.WideningGeneration++
+    Write-DispatchProtocolMessage @{
+        schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'widening-cancelled'
+        state = 'cancelled'; dispatchDraftId = $draftId
+        capabilities = $draft.Policy.capabilities; mandatoryDenies = $draft.Policy.mandatoryDenies
+        capabilityPolicyDigest = $draft.PolicyDigest; delegableAvailable = $delegableAvailable
+        generation = $draft.WideningGeneration
+    }
+}
+
 function Publish-ProtectedPrompt {
     param([hashtable]$Draft, [string]$Text)
     $validated = Test-AgentOperatorPrompt -Prompt $Text
@@ -875,6 +1145,27 @@ function Invoke-Dispatch {
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
 
+    # issue #105 PR4: dispatch-time revalidation of a minted widening grant. The mint step (§
+    # Invoke-ConfirmWideningMint) is in-memory only -- this is the FIRST point a grant can be acted
+    # on, so it is re-verified in full, fresh, right before the sealed artifact/child are created.
+    $grantCapability = if ($draft.Widening -and $draft.Widening.Stage -ceq 'minted') { $draft.Widening.Capability } else { $null }
+    if ($grantCapability) {
+        if ([DateTime]::UtcNow -ge $draft.Widening.GrantExpiresAtUtc) { throw '[grant-invalidated] Widening grant has expired.' }
+        $liveDelegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRoot
+        if ($liveDelegationPolicy.PathHash -cne $draft.Widening.DelegationPolicyPathHash -or
+            $liveDelegationPolicy.ContentSha256 -cne $draft.Widening.DelegationPolicyContentSha256 -or
+            -not (Test-AgentDelegationAllows -Policy $liveDelegationPolicy -Role $draft.Role -Capability $grantCapability -RepositoryKey $identity.key)) {
+            throw '[grant-invalidated] Delegation policy changed since the grant was minted.'
+        }
+        if ($draft.Role -eq 'review-handler' -and $grantCapability -ceq 'EnableAutoComplete') {
+            $handlerDurableContext = Get-AgentDurableStateContext -DurableStateRoot $durableRoot -RepositoryIdentity $identity -Role review-handler
+            $handledStateSnapshot = Get-AgentDurableRecordsSnapshot -Context $handlerDurableContext
+            if (Test-AgentAutoCompleteGrantWouldBeNoOp -HandledState $handledStateSnapshot -PullRequestId $draft.PullRequestId) {
+                throw '[grant-noop] Forced redispatch already has prior delivery state; the auto-complete grant would be a no-op.'
+            }
+        }
+    }
+
     $dispatchId = [Guid]::NewGuid().ToString('D')
     $promptPath = Publish-ProtectedPrompt $draft ([string]$Request.operatorPrompt)
     $pipeName = New-AgentPipeName
@@ -886,11 +1177,24 @@ function Invoke-Dispatch {
     $manifestPath = Join-Path $draft.Snapshot.RuntimeRoot 'dispatch-manifest.json'
     $cancellationNonce = New-AgentNonce
     $draft['CancellationNonce'] = $cancellationNonce
+    if ($grantCapability) {
+        # issue #105 PR4: seal the grant SELECTION into the child's own runtime root -- a
+        # selection, never an authority (ANT-2); the child independently re-derives and re-verifies
+        # every field below from its own live state before ever acting on it (§ Enter-
+        # AgentManualDispatchStartup).
+        [void](New-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot -DraftId $draftId -DispatchId $dispatchId `
+                -Capability $grantCapability -Role $draft.Role -RepositoryKey $identity.key `
+                -WorktreeId (Get-AgentWorktreeIdentity -RepositoryRoot $draft.RoleDescriptor.repositoryRoot) `
+                -PullRequestId $draft.PullRequestId -SourceCommit $draft.PrSnapshot.sourceCommit `
+                -PolicyPathHash $draft.Widening.DelegationPolicyPathHash -PolicyContentSha256 $draft.Widening.DelegationPolicyContentSha256 `
+                -GrantNonce $draft.Widening.GrantNonce -ExpiresAtUtc (ConvertTo-AgentCanonicalEpochSeconds $draft.Widening.GrantExpiresAtUtc))
+    }
     $manifest = [ordered]@{
         schemaVersion = 1; dispatchId = $dispatchId; role = $draft.Role
         repositoryKey = $identity.key; pullRequestId = $draft.PullRequestId
         capabilityPolicyDigest = $draft.PolicyDigest; prStateFingerprint = $draft.PrFingerprint
         policy = $draft.Policy; runtimeRoot = $draft.Snapshot.RuntimeRoot
+        dispatchDraftId = $draftId; grantCapability = $grantCapability
         operatorPromptPath = $promptPath; startupPipe = $pipeName; eventLogDirectory = $eventDir
         prStateFingerprintSourceCommit = $draft.PrSnapshot.sourceCommit
         cancellationNonce = $cancellationNonce
@@ -898,13 +1202,21 @@ function Invoke-Dispatch {
         cancellationAcknowledgementPath = (Join-Path $draft.Snapshot.RuntimeRoot 'cancel.acknowledged.json')
     }
     [IO.File]::WriteAllText($manifestPath, (ConvertTo-AgentCanonicalJson $manifest), [Text.UTF8Encoding]::new($false))
+    # issue #105 PR4 requirement 6: -ForceAnalysis is omitted ONLY for a reviewer's valid
+    # vote-grant dispatch -- forcing an already-reviewed PR's analysis while a vote is granted risks
+    # a duplicate/stale-analysis vote. Every other combination (unwidened reviewer, any
+    # review-handler dispatch including an auto-complete grant) keeps -ForceAnalysis exactly as
+    # before, so Start-ReviewHandlerAgent.ps1's own $forcedRedispatchReadOnly safety valve is
+    # unaffected -- see the grant-noop preflight above, which is what actually protects that path.
+    $includeForceAnalysis = -not ($draft.Role -eq 'reviewer' -and $grantCapability -ceq 'EnableApprovalVote')
     $args = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', [string]$expectedRoleScripts[$draft.Role],
         '-ConfigFile', $draft.Snapshot.SnapshotPath, '-RepoPath', [string]$draft.RoleDescriptor.repositoryRoot,
         '-StateDir', (Join-Path $draft.Snapshot.RuntimeRoot 'agent'),
         '-EventLogDirectory', $eventDir,
         '-DurableStateRoot', $durableRoot, '-LeaseRoot', $leaseRoot, '-OperatorAlias', [string]$descriptor.operatorAlias,
-        '-PullRequestId', [string]$draft.PullRequestId, '-Once', '-ForceAnalysis',
-        '-OutputMode', 'Json', '-ManualDispatchManifest', $manifestPath)
+        '-PullRequestId', [string]$draft.PullRequestId, '-Once')
+    if ($includeForceAnalysis) { $args += '-ForceAnalysis' }
+    $args += @('-OutputMode', 'Json', '-ManualDispatchManifest', $manifestPath)
     foreach ($capability in @($draft.Policy.capabilities)) {
         $args += "-$capability"
     }
@@ -963,7 +1275,7 @@ function Invoke-Dispatch {
                 throw '[launch-failed] Child rejection identity mismatch.'
             }
             $startupCode = [string](Get-OptionalMember $ready 'code')
-            if ($startupCode -notin @('already-running', 'delivery-pending')) {
+            if ($startupCode -notin @('already-running', 'delivery-pending', 'grant-invalidated', 'grant-noop')) {
                 $startupCode = 'launch-failed'
             }
             $startupDetail = [string](Get-OptionalMember $ready 'detail')
@@ -996,6 +1308,13 @@ function Invoke-Dispatch {
         $writer.WriteLine((ConvertTo-AgentCanonicalJson ([ordered]@{
                     schemaVersion = 1; operation = 'proceed'; dispatchId = $dispatchId
                 })))
+        if ($grantCapability) {
+            # issue #105 PR4: the handshake concluded successfully -- the sealed grant-selection
+            # artifact has done its job (the child already independently re-verified it under its
+            # own capability-override lock before sending ready) and must not linger for the
+            # remaining lifetime of the running child.
+            Remove-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot
+        }
         $children[$dispatchId] = @{
             Child = $child; RequestId = [string]$Request.requestId; Pipe = $pipe
             Draft = $draft; DraftId = $draftId; Containment = $containment
@@ -1148,13 +1467,17 @@ try {
             if ([int]$request.schemaVersion -ne 1) { throw '[invalid-request] Unsupported protocol version.' }
             $requestId = [string]$request.requestId
             if ($requestId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
-                -not $requestIds.Add($requestId)) { throw '[invalid-request] requestId is malformed or duplicated.' }
+                -not (Register-BrokerRequestId -Id $requestId)) { throw '[invalid-request] requestId is malformed or duplicated.' }
             switch ([string]$request.operation) {
                 'describe' { Invoke-Describe $request }
                 'profile' { Invoke-Profile $request }
                 'preview-narrowing' { Invoke-PreviewNarrowing $request }
                 'apply-narrowing' { Invoke-ApplyNarrowing $request }
                 'set-kill-switch' { Invoke-SetKillSwitch $request }
+                'describe-widening' { Invoke-DescribeWidening $request }
+                'confirm-widening-preview' { Invoke-ConfirmWideningPreview $request }
+                'confirm-widening-mint' { Invoke-ConfirmWideningMint $request }
+                'cancel-widening' { Invoke-CancelWidening $request }
                 'dispatch' { Invoke-Dispatch $request }
                 'cancel' { Stop-BrokerChild ([string]$request.dispatchId) $requestId }
                 'shutdown' {

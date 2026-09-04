@@ -169,6 +169,14 @@ param(
 if ($PSBoundParameters.ContainsKey('PullRequestId') -and $PullRequestId -le 0) {
     throw 'PullRequestId must be greater than zero when explicitly specified.'
 }
+# issue #105 PR4 requirement 7: -EnableAutoComplete is delegable ONLY through a broker-minted,
+# sealed widening grant -- Enter-AgentManualDispatchStartup independently re-verifies that grant
+# under the capability-override lock before ever honoring it. A direct/headless invocation (no
+# -ManualDispatchManifest) has no grant to verify against and must never be able to request the
+# auto-complete capability at all; a generic local profile is never sufficient.
+if ($EnableAutoComplete -and -not $ManualDispatchManifest) {
+    throw '-EnableAutoComplete requires a sealed manual dispatch grant (-ManualDispatchManifest); it cannot be requested directly.'
+}
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -932,7 +940,7 @@ if ($ManualDispatchManifest) {
     }
     $dispatchLogPrefix = "$dispatchId-"
     $dispatchMetadata = [ordered]@{
-        schemaVersion = 1; dispatchId = $dispatchId; ownership = 'tui'; forceAnalysis = $true
+        schemaVersion = 1; dispatchId = $dispatchId; ownership = 'tui'; forceAnalysis = [bool]$ForceAnalysis
     }
 }
 $script:HandlerOutputContext = New-AgentOutputContext -Agent review-handler -OutputMode $OutputMode `

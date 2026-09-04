@@ -20,7 +20,7 @@ export interface AgentDispatchV1 {
   schemaVersion: 1;
   dispatchId: string;
   ownership: "tui";
-  forceAnalysis: true;
+  forceAnalysis: boolean;
 }
 
 export interface AgentEvent {
@@ -238,10 +238,10 @@ function parseDispatch(value: unknown): AgentDispatchV1 | null {
   const raw = asRecord(value);
   const dispatchId = boundedString(raw.dispatchId);
   if (raw.schemaVersion !== 1 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(dispatchId) ||
-      raw.ownership !== "tui" || raw.forceAnalysis !== true) {
+      raw.ownership !== "tui" || typeof raw.forceAnalysis !== "boolean") {
     throw new Error("dispatch metadata is invalid");
   }
-  return { schemaVersion: 1, dispatchId: dispatchId.toLowerCase(), ownership: "tui", forceAnalysis: true };
+  return { schemaVersion: 1, dispatchId: dispatchId.toLowerCase(), ownership: "tui", forceAnalysis: raw.forceAnalysis };
 }
 
 export function parseAgentEvent(value: unknown): AgentEvent {

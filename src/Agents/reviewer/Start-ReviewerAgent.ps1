@@ -273,6 +273,14 @@ if ($ForceAnalysis -and $PullRequestId -le 0) {
 if ($ForceAnalysis -and $EnableApprovalVote) {
     throw 'Manual forced Reviewer analysis cannot enable approval voting.'
 }
+# issue #105 PR4 requirement 7: -EnableApprovalVote is delegable ONLY through a broker-minted,
+# sealed widening grant -- Enter-AgentManualDispatchStartup independently re-verifies that grant
+# under the capability-override lock before ever honoring it. A direct/headless invocation (no
+# -ManualDispatchManifest) has no grant to verify against and must never be able to request the
+# vote capability at all; a generic local profile is never sufficient.
+if ($EnableApprovalVote -and -not $ManualDispatchManifest) {
+    throw '-EnableApprovalVote requires a sealed manual dispatch grant (-ManualDispatchManifest); it cannot be requested directly.'
+}
 
 
 # One top-level try/catch so ANY uncaught error surfaces as a nonzero exit,
@@ -2198,7 +2206,7 @@ if ($ManualDispatchManifest) {
     }
     $dispatchLogPrefix = "$dispatchId-"
     $dispatchMetadata = [ordered]@{
-        schemaVersion = 1; dispatchId = $dispatchId; ownership = 'tui'; forceAnalysis = $true
+        schemaVersion = 1; dispatchId = $dispatchId; ownership = 'tui'; forceAnalysis = [bool]$ForceAnalysis
     }
 }
 $script:ReviewerOutputContext = New-AgentOutputContext -Agent reviewer -OutputMode $OutputMode `

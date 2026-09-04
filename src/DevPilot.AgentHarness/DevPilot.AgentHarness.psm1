@@ -1247,12 +1247,19 @@ function Assert-AgentCapabilityJsonRawShape {
         pathological file cannot exhaust memory/CPU before schema validation even begins. Iterative
         (explicit stack), not recursive, so a pathological depth fails via the bound check rather
         than risking a real stack overflow.
+
+        ErrorCode (issue #105 PR4) lets a non-capability-override caller (Get-AgentDelegationPolicy)
+        get an error code that actually names ITS artifact rather than a hardcoded
+        "capability-settings-invalid" that would misdescribe a raw-shape violation in
+        delegation.policy.v1.json. Defaults to the original literal so every existing call site's
+        error text/tests are unaffected.
     #>
     param(
         [Parameter(Mandatory)][byte[]]$Bytes,
         [ValidateRange(1, 64)][int]$MaxDepth = 6,
         [ValidateRange(1, 4096)][int]$MaxElements = 512,
-        [ValidateRange(1, 65536)][int]$MaxStringLength = 4096
+        [ValidateRange(1, 65536)][int]$MaxStringLength = 4096,
+        [string]$ErrorCode = 'capability-settings-invalid'
     )
     $document = [Text.Json.JsonDocument]::Parse([ReadOnlyMemory[byte]]$Bytes)
     try {
@@ -1263,9 +1270,9 @@ function Assert-AgentCapabilityJsonRawShape {
             $frame = $stack.Pop()
             $node = $frame.Node
             $depth = $frame.Depth
-            if ($depth -gt $MaxDepth) { throw '[capability-settings-invalid] JSON exceeds the maximum nesting depth.' }
+            if ($depth -gt $MaxDepth) { throw "[$ErrorCode] JSON exceeds the maximum nesting depth." }
             $elementCount++
-            if ($elementCount -gt $MaxElements) { throw '[capability-settings-invalid] JSON exceeds the maximum element count.' }
+            if ($elementCount -gt $MaxElements) { throw "[$ErrorCode] JSON exceeds the maximum element count." }
             switch ($node.ValueKind) {
                 ([Text.Json.JsonValueKind]::Object) {
                     $seenExact = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -1274,15 +1281,15 @@ function Assert-AgentCapabilityJsonRawShape {
                     foreach ($property in $node.EnumerateObject()) {
                         $propertyIndex++
                         if ($property.Name.Length -gt $MaxStringLength) {
-                            throw '[capability-settings-invalid] JSON property name exceeds the maximum length.'
+                            throw "[$ErrorCode] JSON property name exceeds the maximum length."
                         }
                         if (-not $seenExact.Add($property.Name)) {
                             $ref = Get-AgentRedactedFieldReference -Text $property.Name -Position $propertyIndex
-                            throw "[capability-settings-invalid] Duplicate property ($ref) in capability settings JSON."
+                            throw "[$ErrorCode] Duplicate property ($ref) in JSON."
                         }
                         if (-not $seenFold.Add($property.Name)) {
                             $ref = Get-AgentRedactedFieldReference -Text $property.Name -Position $propertyIndex
-                            throw "[capability-settings-invalid] Property ($ref) collides case-insensitively with a sibling."
+                            throw "[$ErrorCode] Property ($ref) collides case-insensitively with a sibling."
                         }
                         $stack.Push(@{ Node = $property.Value; Depth = ($depth + 1) })
                     }
@@ -1292,7 +1299,7 @@ function Assert-AgentCapabilityJsonRawShape {
                 }
                 ([Text.Json.JsonValueKind]::String) {
                     if ($node.GetString().Length -gt $MaxStringLength) {
-                        throw '[capability-settings-invalid] JSON string value exceeds the maximum length.'
+                        throw "[$ErrorCode] JSON string value exceeds the maximum length."
                     }
                 }
                 default {}
@@ -1585,7 +1592,17 @@ function Resolve-AgentCapabilityPolicyPartition {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][hashtable]$RoleDescriptor,
-        [Parameter(Mandatory)][hashtable]$PersistedNarrowing
+        [Parameter(Mandatory)][hashtable]$PersistedNarrowing,
+        # issue #105 PR4: the ONE ephemeral, draft-bound widening a valid grant may apply. Pure
+        # set-math only -- this function never decides whether a grant IS valid (that is
+        # Get-AgentDelegationPolicy/Test-AgentDelegationAllows plus the broker/child's own grant
+        # freshness checks); it only encodes the single mechanical invariant a valid grant is
+        # allowed to exploit: move EXACTLY the one capability named here from mandatoryDenies to
+        # capabilities. Fails closed (throws) rather than silently no-op-ing if the caller passes a
+        # capability that is not currently an active mandatory deny on THIS ceiling, or that is
+        # already an active capability -- both would mean the caller is trying to widen something
+        # this primitive was never told is eligible, which must never happen for a correct caller.
+        [AllowNull()][string]$GrantCapability
     )
     $capabilities = [Collections.Generic.List[string]]::new([string[]]@($RoleDescriptor.capabilities | Sort-Object -Unique))
     $mandatoryDenies = [Collections.Generic.List[string]]::new([string[]]@($RoleDescriptor.mandatoryDenies | Sort-Object -Unique))
@@ -1595,7 +1612,342 @@ function Resolve-AgentCapabilityPolicyPartition {
             if (-not $mandatoryDenies.Contains($name)) { [void]$mandatoryDenies.Add($name) }
         }
     }
+    if ($GrantCapability) {
+        if ($capabilities.Contains($GrantCapability) -or -not $mandatoryDenies.Contains($GrantCapability)) {
+            throw '[grant-invalid] GrantCapability is not eligible to be widened from the current capability ceiling.'
+        }
+        [void]$mandatoryDenies.Remove($GrantCapability)
+        [void]$capabilities.Add($GrantCapability)
+    }
     return @{ capabilities = @($capabilities | Sort-Object -Unique); mandatoryDenies = @($mandatoryDenies | Sort-Object -Unique) }
+}
+
+function Get-AgentDelegationPolicyPath {
+    <#
+        Fixed, toolkit-relative, checked-in path for the delegation policy -- never forwarded
+        through config, CLI argument, or environment variable, unlike every root this module
+        otherwise resolves. $PSScriptRoot here is always this module's own directory
+        (src\DevPilot.AgentHarness), so the resolved path is stable regardless of the caller's
+        working directory or how the toolkit was checked out.
+    #>
+    param([Parameter(Mandatory)][string]$ToolkitRoot)
+    return [IO.Path]::GetFullPath((Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\Policy\delegation.policy.v1.json'))
+}
+
+function Get-AgentDelegationPolicy {
+    <#
+        Loads and hardens the checked-in delegation policy (issue #105 PR4): a NORMAL checked-in
+        file (no -Private -- it ships in source control with the toolkit's ordinary checkout ACL,
+        unlike the owner-private capability-override store or the sealed grant-selection artifact),
+        pinned to its exact expected path and validated via the same trusted-root/no-links
+        containment this module already uses elsewhere. Read via Read-AgentStableFile -- one read,
+        stat-before/after stability -- and ContentSha256 is defined as that same read's fingerprint,
+        never a second, separately-computed hash over a separately-read buffer.
+
+        Schema is exact and fixed: exactly the two known roles, each with exactly its own single
+        delegable capability (Get-AgentHarnessCapabilityDescriptor's delegableDefaultOff), each an
+        object with exactly {allowedRepositoryKeys:[string], allowAnyVerified:bool} and no other
+        fields -- any additional/missing/malformed field, or any duplicate/case-collision key
+        (Assert-AgentCapabilityJsonRawShape, over the raw JSON before any hashtable folding hides
+        one), fails the WHOLE load closed. An empty allowedRepositoryKeys with allowAnyVerified:false
+        (the shipped default) means delegation is categorically unavailable: no caller of
+        Test-AgentDelegationAllows can ever get true back against it. Governance (who may edit this
+        file, and its CODEOWNERS group) is deliberately out of this function's scope.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ToolkitRoot)
+    $expectedPath = Get-AgentDelegationPolicyPath -ToolkitRoot $ToolkitRoot
+    $policyRoot = Split-Path $expectedPath -Parent
+    if (-not (Test-Path -LiteralPath $policyRoot -PathType Container)) {
+        throw "[delegation-policy-invalid] Delegation policy directory does not exist: $policyRoot"
+    }
+    $path = Assert-AgentTrustedFile -Path $expectedPath -AllowedRoot $policyRoot -ExpectedPath $expectedPath
+    $stable = Read-AgentStableFile -Path $path -MaxBytes 16384
+    if (-not $stable.Exists) { throw '[delegation-policy-invalid] Checked-in delegation policy is missing.' }
+    Assert-AgentCapabilityJsonRawShape -Bytes $stable.Bytes -MaxDepth 5 -MaxElements 128 -MaxStringLength 256 -ErrorCode 'delegation-policy-invalid'
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $record = $strictUtf8.GetString($stable.Bytes) | ConvertFrom-Json -AsHashtable -Depth 6 -ErrorAction Stop
+    if ($record -isnot [Collections.IDictionary]) { throw '[delegation-policy-invalid] Record is not a JSON object.' }
+    $topLevelKeys = @($record.Keys)
+    if ($topLevelKeys.Count -ne 2 -or
+        @($topLevelKeys | Where-Object { $_ -ceq 'schemaVersion' }).Count -ne 1 -or
+        @($topLevelKeys | Where-Object { $_ -ceq 'roles' }).Count -ne 1) {
+        throw '[delegation-policy-invalid] Record must contain exactly schemaVersion and roles.'
+    }
+    if (($record.schemaVersion -isnot [int] -and $record.schemaVersion -isnot [long]) -or [int64]$record.schemaVersion -ne 1) {
+        throw '[delegation-policy-invalid] Unsupported schemaVersion.'
+    }
+    if ($record.roles -isnot [Collections.IDictionary]) { throw "[delegation-policy-invalid] 'roles' must be a JSON object." }
+    $expectedCapabilityByRole = [ordered]@{
+        reviewer         = (Get-AgentHarnessCapabilityDescriptor -Role reviewer).delegableDefaultOff
+        'review-handler' = (Get-AgentHarnessCapabilityDescriptor -Role 'review-handler').delegableDefaultOff
+    }
+    $roleKeys = @($record.roles.Keys)
+    if ($roleKeys.Count -ne 2 -or
+        @($roleKeys | Where-Object { $_ -ceq 'reviewer' }).Count -ne 1 -or
+        @($roleKeys | Where-Object { $_ -ceq 'review-handler' }).Count -ne 1) {
+        throw '[delegation-policy-invalid] roles must contain exactly reviewer and review-handler.'
+    }
+    $delegations = [ordered]@{}
+    foreach ($role in @('reviewer', 'review-handler')) {
+        $roleRecord = @($record.roles.Keys | Where-Object { $_ -ceq $role } | ForEach-Object { $record.roles[$_] })[0]
+        if ($roleRecord -isnot [Collections.IDictionary]) { throw "[delegation-policy-invalid] roles.$role must be a JSON object." }
+        $expectedCapability = $expectedCapabilityByRole[$role]
+        $capabilityKeys = @($roleRecord.Keys)
+        if ($capabilityKeys.Count -ne 1 -or @($capabilityKeys | Where-Object { $_ -ceq $expectedCapability }).Count -ne 1) {
+            throw "[delegation-policy-invalid] roles.$role must contain exactly '$expectedCapability'."
+        }
+        $entry = $roleRecord[$expectedCapability]
+        if ($entry -isnot [Collections.IDictionary]) { throw "[delegation-policy-invalid] roles.$role.$expectedCapability must be a JSON object." }
+        $entryKeys = @($entry.Keys)
+        if ($entryKeys.Count -ne 2 -or
+            @($entryKeys | Where-Object { $_ -ceq 'allowedRepositoryKeys' }).Count -ne 1 -or
+            @($entryKeys | Where-Object { $_ -ceq 'allowAnyVerified' }).Count -ne 1) {
+            throw "[delegation-policy-invalid] roles.$role.$expectedCapability must contain exactly allowedRepositoryKeys and allowAnyVerified."
+        }
+        if ($entry.allowAnyVerified -isnot [bool]) {
+            throw "[delegation-policy-invalid] roles.$role.$expectedCapability.allowAnyVerified must be a boolean."
+        }
+        $rawKeys = $entry.allowedRepositoryKeys
+        if ($rawKeys -is [string] -or $rawKeys -isnot [Collections.IEnumerable]) {
+            throw "[delegation-policy-invalid] roles.$role.$expectedCapability.allowedRepositoryKeys must be an array."
+        }
+        $keys = [Collections.Generic.List[string]]::new()
+        $seenKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($key in $rawKeys) {
+            $keyText = [string]$key
+            if ($keyText -notmatch '^v1:(azuredevops|github):[^:]+$') {
+                throw "[delegation-policy-invalid] roles.$role.$expectedCapability.allowedRepositoryKeys contains a malformed key."
+            }
+            if (-not $seenKeys.Add($keyText)) {
+                throw "[delegation-policy-invalid] roles.$role.$expectedCapability.allowedRepositoryKeys contains a duplicate key."
+            }
+            [void]$keys.Add($keyText)
+        }
+        $delegations[$role] = [ordered]@{
+            Capability = $expectedCapability; AllowedRepositoryKeys = @($keys.ToArray()); AllowAnyVerified = [bool]$entry.allowAnyVerified
+        }
+    }
+    return [ordered]@{
+        SchemaVersion = 1; Path = $path; PathHash = (Get-AgentSha256 -Text $path.ToLowerInvariant())
+        ContentSha256 = $stable.Sha256
+        Fingerprint   = [ordered]@{ Path = $stable.Path; Exists = $stable.Exists; Size = $stable.Size; MTime = $stable.MTime; Sha256 = $stable.Sha256 }
+        Delegations   = $delegations
+    }
+}
+
+function Test-AgentDelegationAllows {
+    <#
+        Pure decision function (issue #105 PR4): does the checked-in delegation policy permit
+        granting Capability to Role for RepositoryKey? An empty allowedRepositoryKeys with
+        allowAnyVerified:false (the shipped safe default) always returns false -- delegation is
+        categorically unavailable until a CODEOWNERS-approved policy change populates one or the
+        other. Capability must be exactly the role's own single delegable capability; any other
+        name is never allowed, never looked up.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Policy,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][string]$Capability,
+        [Parameter(Mandatory)][string]$RepositoryKey
+    )
+    if (-not $Policy.Delegations.Contains($Role)) { return $false }
+    $entry = $Policy.Delegations[$Role]
+    if ([string]$entry.Capability -cne $Capability) { return $false }
+    if ([bool]$entry.AllowAnyVerified) { return $true }
+    return (@($entry.AllowedRepositoryKeys) -ccontains $RepositoryKey)
+}
+
+function Get-AgentWideningGrantArtifactPath {
+    param([Parameter(Mandatory)][string]$RuntimeRoot)
+    return Join-Path ([IO.Path]::GetFullPath($RuntimeRoot)) 'grant-selection.sealed.v1.json'
+}
+
+function New-AgentWideningGrantArtifact {
+    <#
+        Broker-side (issue #105 PR4): atomically writes the sealed, owner-private grant-selection
+        artifact into the draft's own per-dispatch runtime root at dispatch() time, immediately
+        before the child is launched. This is a SELECTION the child independently re-verifies, never
+        an authority the child can trust blindly (ANT-2): every field the child cross-checks (policy
+        path/content hash, repository/worktree/PR/full source SHA, grant nonce/expiry) is also
+        independently re-derived by the child from its own live state and from its own fresh
+        Get-AgentDelegationPolicy read, never taken solely from this artifact. Written via a
+        create-new temp file (never overwrites an existing name) plus a rename into place, exactly
+        one per dispatch attempt -- a draft only ever reaches this call once, since a real
+        dispatchId/artifact is allocated only after the broker's own dispatch-time revalidation
+        already passed.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RuntimeRoot,
+        [Parameter(Mandatory)][string]$DraftId,
+        [Parameter(Mandatory)][string]$DispatchId,
+        [Parameter(Mandatory)][string]$Capability,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][string]$RepositoryKey,
+        [Parameter(Mandatory)][string]$WorktreeId,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$PolicyPathHash,
+        [Parameter(Mandatory)][string]$PolicyContentSha256,
+        [Parameter(Mandatory)][string]$GrantNonce,
+        [Parameter(Mandatory)][long]$ExpiresAtUtc
+    )
+    $path = Get-AgentWideningGrantArtifactPath -RuntimeRoot $RuntimeRoot
+    $record = [ordered]@{
+        schemaVersion = 1; draftId = $DraftId; dispatchId = $DispatchId; capability = $Capability; role = $Role
+        repositoryKey = $RepositoryKey; worktreeId = $WorktreeId; pullRequestId = $PullRequestId; sourceCommit = $SourceCommit
+        policyPathHash = $PolicyPathHash; policyContentSha256 = $PolicyContentSha256
+        grantNonce = $GrantNonce; expiresAtUtc = $ExpiresAtUtc
+        mintedAtUtc = (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-AgentCanonicalJson $record))
+    $tempPath = "$path.tmp-$([Guid]::NewGuid().ToString('N'))"
+    $stream = [IO.FileStream]::new($tempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        if (-not $IsWindows) { [IO.File]::SetUnixFileMode($tempPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite) }
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+    [IO.File]::Move($tempPath, $path)
+    return $path
+}
+
+function Get-AgentWideningGrantArtifact {
+    <#
+        Child-side (issue #105 PR4): reads and validates the sealed grant-selection artifact as a
+        SELECTION, not an authority (ANT-2) -- every field returned here is independently
+        cross-checked by the caller (Enter-AgentManualDispatchStartup) against its own live-derived
+        state and against Get-AgentDelegationPolicy's own fresh read, never trusted alone. Returns
+        $null if the file is absent (the ordinary, unwidened dispatch path) -- absence is not an
+        error. Read via Assert-AgentTrustedFile -Private (owner-only ACL/no-links) then
+        Read-AgentStableFile (one read); a present-but-invalid/malformed artifact fails closed
+        (throws) -- it is never reinterpreted as "no grant".
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RuntimeRoot)
+    $runtimeRoot = [IO.Path]::GetFullPath($RuntimeRoot)
+    $path = Get-AgentWideningGrantArtifactPath -RuntimeRoot $runtimeRoot
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $trusted = Assert-AgentTrustedFile -Path $path -AllowedRoot $runtimeRoot -ExpectedPath $path -Private
+    $stable = Read-AgentStableFile -Path $trusted -MaxBytes 8192
+    if (-not $stable.Exists) { return $null }
+    Assert-AgentCapabilityJsonRawShape -Bytes $stable.Bytes -MaxDepth 3 -MaxElements 64 -MaxStringLength 512 -ErrorCode 'grant-invalidated'
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $record = $strictUtf8.GetString($stable.Bytes) | ConvertFrom-Json -AsHashtable -Depth 4 -ErrorAction Stop
+    if ($record -isnot [Collections.IDictionary]) { throw '[grant-invalidated] Sealed grant artifact is not a JSON object.' }
+    $requiredFields = @('schemaVersion', 'draftId', 'dispatchId', 'capability', 'role', 'repositoryKey', 'worktreeId',
+        'pullRequestId', 'sourceCommit', 'policyPathHash', 'policyContentSha256', 'grantNonce', 'expiresAtUtc', 'mintedAtUtc')
+    $actualFields = @($record.Keys)
+    if ($actualFields.Count -ne $requiredFields.Count) {
+        throw '[grant-invalidated] Sealed grant artifact does not contain exactly the expected fields.'
+    }
+    foreach ($name in $requiredFields) {
+        if (@($actualFields | Where-Object { $_ -ceq $name }).Count -ne 1) {
+            throw "[grant-invalidated] Sealed grant artifact is missing required field '$name'."
+        }
+    }
+    if (([int64]$record.schemaVersion) -ne 1 -or
+        [string]$record.draftId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
+        [string]$record.dispatchId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
+        [string]$record.capability -cnotmatch '^[A-Za-z][A-Za-z0-9]*$' -or
+        [string]$record.role -cnotin @('reviewer', 'review-handler') -or
+        [string]$record.repositoryKey -notmatch '^v1:(azuredevops|github):[^:]+$' -or
+        [string]$record.worktreeId -cnotmatch '^[0-9a-f]{64}$' -or
+        ($record.pullRequestId -isnot [int] -and $record.pullRequestId -isnot [long]) -or [int64]$record.pullRequestId -le 0 -or
+        [string]$record.sourceCommit -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$record.policyPathHash -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$record.policyContentSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$record.grantNonce -notmatch '^[0-9a-f]{36}$' -or
+        ($record.expiresAtUtc -isnot [int] -and $record.expiresAtUtc -isnot [long]) -or
+        ($record.mintedAtUtc -isnot [int] -and $record.mintedAtUtc -isnot [long])) {
+        throw '[grant-invalidated] Sealed grant artifact is malformed.'
+    }
+    return [ordered]@{
+        DraftId = [string]$record.draftId; DispatchId = [string]$record.dispatchId; Capability = [string]$record.capability
+        Role = [string]$record.role; RepositoryKey = [string]$record.repositoryKey; WorktreeId = [string]$record.worktreeId
+        PullRequestId = [int]$record.pullRequestId; SourceCommit = [string]$record.sourceCommit
+        PolicyPathHash = [string]$record.policyPathHash; PolicyContentSha256 = [string]$record.policyContentSha256
+        GrantNonce = [string]$record.grantNonce; ExpiresAtUtc = [long]$record.expiresAtUtc; MintedAtUtc = [long]$record.mintedAtUtc
+    }
+}
+
+function Remove-AgentWideningGrantArtifact {
+    <#
+        Broker-side (issue #105 PR4): deletes the sealed grant-selection artifact once its
+        handshake has concluded (proceed sent) or the dispatch attempt failed/was abandoned before
+        that point -- an artifact must never outlive the single dispatch attempt it was minted for.
+        Absence is not an error: a dispatch attempt that never reached the point of writing one, or
+        whose artifact was already removed, is a normal no-op.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RuntimeRoot)
+    $path = Get-AgentWideningGrantArtifactPath -RuntimeRoot $RuntimeRoot
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+}
+
+function New-AgentWideningChallenge {
+    <#
+        Cryptographically random, single-use challenge token for one step of the interactive
+        widening confirmation protocol (issue #105 PR4). 24 random bytes (192 bits) as lowercase hex
+        -- ample unpredictability for a short-TTL, draft/capability/stage-bound token that is never a
+        long-lived secret.
+    #>
+    $bytes = [byte[]]::new(24)
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+}
+
+function Test-AgentWideningChallengeShape {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Challenge)
+    return [bool]($Challenge -cmatch '^[0-9a-f]{48}$')
+}
+
+function Test-AgentAutoCompleteGrantWouldBeNoOp {
+    <#
+        Issue #105 PR4 / requirement 6: a review-handler EnableAutoComplete grant must never be
+        allowed to reach dispatch when the SAME forced-redispatch-read-only condition
+        Start-ReviewHandlerAgent.ps1 itself already applies ($ForceAnalysis -and durable handled-
+        state already has a record for this PR) would make the grant a silent no-op -- the child
+        always runs manual dispatch with -ForceAnalysis (unaffected by this change; only reviewer
+        vote-grant dispatch omits it, see the broker), so `$forcedRedispatchReadOnly` would suppress
+        EnableAutoComplete (and every other write capability) on the child regardless of what the
+        broker granted. This mirrors, rather than duplicates, that exact condition so the two can
+        never independently drift: HandledState.ContainsKey(PullRequestId), nothing more.
+    #>
+    param([Parameter(Mandatory)][hashtable]$HandledState, [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId)
+    return $HandledState.ContainsKey([string]$PullRequestId)
+}
+
+function Resolve-AgentWideningEffectiveDiff {
+    <#
+        Shared, pure blast-radius renderer for the widening protocol's describe/confirm-preview
+        steps (issue #105 PR4): given the current (unwidened) partition and the candidate (widened)
+        partition, returns the exact set of capabilities the grant would add (always exactly the one
+        GrantCapability, restated here rather than trusted from the caller) plus, for the reviewer
+        role's EnableApprovalVote specifically, the paired capability (EnableFindingComments) the
+        widened dispatch requires to already be active -- Start-ReviewerAgent.ps1 itself refuses to
+        start with EnableApprovalVote set and EnableFindingComments not (issue #105 PR4 requirement
+        6), so a widening whose paired capability is not currently active can mint a grant that can
+        never actually be dispatched; callers surface PairedCapabilityActive so the operator sees
+        this BEFORE minting, not as a dispatch-time surprise.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Current,
+        [Parameter(Mandatory)][hashtable]$Widened,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][string]$GrantCapability
+    )
+    $pairedCapability = if ($Role -eq 'reviewer' -and $GrantCapability -ceq 'EnableApprovalVote') { 'EnableFindingComments' } else { $null }
+    return [ordered]@{
+        addedCapabilities = @($Widened.capabilities | Where-Object { $Current.capabilities -cnotcontains $_ } | Sort-Object -Unique)
+        removedDenies     = @($Current.mandatoryDenies | Where-Object { $Widened.mandatoryDenies -cnotcontains $_ } | Sort-Object -Unique)
+        pairedCapability  = $pairedCapability
+        pairedCapabilityActive = if ($pairedCapability) { [bool]($Widened.capabilities -ccontains $pairedCapability) } else { $true }
+    }
 }
 
 function Enter-AgentCapabilityOverrideLock {
@@ -2073,13 +2425,27 @@ function Enter-AgentManualDispatchStartup {
     $mandatoryDenies = @($manifest.policy.mandatoryDenies)
     $boundNames = @($BoundCapabilities.Keys)
     $actualCapabilities = @($boundNames | Where-Object { [bool]$BoundCapabilities[$_] } | Sort-Object -Unique)
+    # issue #105 PR4: a manifest MAY carry a single ephemeral, draft-bound widening grant. Ordinarily
+    # the role's own single delegable capability (requiredDeny) must always sit in mandatoryDenies,
+    # never capabilities -- a grant is the ONE exception, and only for that exact capability. The
+    # grant itself is re-verified in full (sealed artifact, delegation policy, expiry, no-op guard)
+    # under the capability-override lock below, before ready is ever sent; this check only pins the
+    # shape the manifest must already have for that later verification to make sense.
+    $grantCapability = if ($manifest.Contains('grantCapability') -and $manifest['grantCapability']) { [string]$manifest['grantCapability'] } else { $null }
+    $requiredDenyConsistent = if ($grantCapability) {
+        $grantCapability -ceq $requiredDeny -and $mandatoryDenies -cnotcontains $requiredDeny -and $capabilities -ccontains $requiredDeny
+    }
+    else {
+        $mandatoryDenies -ccontains $requiredDeny
+    }
     if ([int]$manifest.schemaVersion -ne 1 -or [string]$manifest.role -cne $Role -or
         [string]$manifest.policy.role -cne $Role -or
         [string]$manifest.dispatchId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
-        $mandatoryDenies -cnotcontains $requiredDeny -or
+        ($grantCapability -and [string]$manifest['dispatchDraftId'] -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') -or
+        -not $requiredDenyConsistent -or
         @($capabilities | Where-Object { $mandatoryDenies -ccontains $_ }).Count -gt 0 -or
-        @($capabilities | Where-Object { $allowedCapabilities -cnotcontains $_ }).Count -gt 0 -or
-        @($boundNames | Where-Object { ($_ -cnotin $allowedCapabilities) -and ($_ -cnotin $mandatoryDenies) }).Count -gt 0 -or
+        @($capabilities | Where-Object { $allowedCapabilities -cnotcontains $_ -and $_ -cne $grantCapability }).Count -gt 0 -or
+        @($boundNames | Where-Object { ($_ -cnotin $allowedCapabilities) -and ($_ -cnotin $mandatoryDenies) -and ($_ -cne $grantCapability) }).Count -gt 0 -or
         @($mandatoryDenies | Where-Object {
                 -not $BoundCapabilities.ContainsKey($_) -or [bool]$BoundCapabilities[$_]
             }).Count -gt 0 -or
@@ -2112,7 +2478,8 @@ function Enter-AgentManualDispatchStartup {
     if ($ceilingMandatoryDenies -cnotcontains $requiredDeny -or
         @($ceilingCapabilities | Where-Object { $ceilingMandatoryDenies -ccontains $_ }).Count -gt 0 -or
         @($ceilingCapabilities | Where-Object { $allowedCapabilities -cnotcontains $_ }).Count -gt 0 -or
-        @($capabilities | Where-Object { $ceilingCapabilities -cnotcontains $_ }).Count -gt 0 -or
+        @($capabilities | Where-Object { $ceilingCapabilities -cnotcontains $_ -and $_ -cne $grantCapability }).Count -gt 0 -or
+        ($grantCapability -and $ceilingMandatoryDenies -cnotcontains $grantCapability) -or
         @($mandatoryDenies | Where-Object {
                 $ceilingMandatoryDenies -cnotcontains $_ -and $ceilingCapabilities -cnotcontains $_
             }).Count -gt 0) {
@@ -2169,12 +2536,56 @@ function Enter-AgentManualDispatchStartup {
         # but is still caught fail-closed by the live equality check below.
         $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $RepositoryRoot -TimeoutMilliseconds 2000
         if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+        if ($grantCapability) {
+            # issue #105 PR4: independent child-side re-verification of the sealed grant-selection
+            # artifact this dispatch was minted with. The artifact is a SELECTION, never an authority
+            # (ANT-2): every field is cross-checked against this process's own live state and against
+            # a fresh Get-AgentDelegationPolicy read, all while already holding the same lock every
+            # settings writer respects, so nothing can narrow/expire/invalidate the grant between
+            # this check and `ready` being sent below.
+            $toolkitRootForPolicy = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+            $liveGrant = Get-AgentWideningGrantArtifact -RuntimeRoot ([string]$manifest.runtimeRoot)
+            if (-not $liveGrant) { throw '[grant-invalidated] Sealed grant-selection artifact is missing.' }
+            if ($liveGrant.Capability -cne $grantCapability -or $liveGrant.Role -cne $Role -or
+                $liveGrant.DraftId -cne [string]$manifest['dispatchDraftId'] -or
+                $liveGrant.DispatchId -cne [string]$manifest.dispatchId -or
+                $liveGrant.RepositoryKey -cne $expectedRepositoryKey -or
+                $liveGrant.PullRequestId -ne $prId -or
+                $liveGrant.SourceCommit -cne [string]$manifest.prStateFingerprintSourceCommit) {
+                throw '[grant-invalidated] Sealed grant-selection artifact does not match this dispatch.'
+            }
+            if ([DateTimeOffset]::FromUnixTimeSeconds($liveGrant.ExpiresAtUtc).UtcDateTime -le [DateTime]::UtcNow) {
+                throw '[grant-invalidated] Widening grant has expired.'
+            }
+            $liveDelegationPolicy = Get-AgentDelegationPolicy -ToolkitRoot $toolkitRootForPolicy
+            if ($liveDelegationPolicy.PathHash -cne $liveGrant.PolicyPathHash -or
+                $liveDelegationPolicy.ContentSha256 -cne $liveGrant.PolicyContentSha256) {
+                throw '[grant-invalidated] Delegation policy changed since the grant was minted.'
+            }
+            if (-not (Test-AgentDelegationAllows -Policy $liveDelegationPolicy -Role $Role -Capability $grantCapability -RepositoryKey $expectedRepositoryKey)) {
+                throw '[grant-invalidated] Delegation policy no longer allows this capability.'
+            }
+            # No new capability literal here (ANT-8/OAI-V3-3): $requiredDenyConsistent above already
+            # forces $grantCapability -ceq $requiredDeny whenever $grantCapability is truthy, and
+            # $requiredDeny is this role's own single delegable capability from the shared harness
+            # descriptor -- so scoping by $Role alone is exactly as precise as naming the literal.
+            if ($Role -eq 'review-handler' -and $grantCapability) {
+                # requirement 6: never let a forced redispatch on a PR the handler already delivered
+                # to reach the child with an auto-complete grant that Start-ReviewHandlerAgent.ps1's
+                # own $forcedRedispatchReadOnly would immediately suppress anyway -- reject up front
+                # with a distinct, actionable code instead of a silent read-only no-op.
+                $handledState = Get-AgentDurableRecords -Context $DurableContext
+                if (Test-AgentAutoCompleteGrantWouldBeNoOp -HandledState $handledState -PullRequestId $prId) {
+                    throw '[grant-noop] Forced redispatch already has prior delivery state; the auto-complete grant would be a no-op.'
+                }
+            }
+        }
         $liveOverride = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $RepositoryIdentity `
             -RepositoryRoot $RepositoryRoot -PullRequestId $prId `
             -CurrentSourceCommit ([string]$manifest.prStateFingerprintSourceCommit)
         $livePartition = Resolve-AgentCapabilityPolicyPartition `
             -RoleDescriptor ([hashtable]@{ capabilities = $ceilingCapabilities; mandatoryDenies = $ceilingMandatoryDenies }) `
-            -PersistedNarrowing $liveOverride.Settings
+            -PersistedNarrowing $liveOverride.Settings -GrantCapability $grantCapability
         $livePolicy = [ordered]@{
             schemaVersion = 1; repositoryIdentity = $manifest.policy.repositoryIdentity; role = $Role
             capabilities = $livePartition.capabilities; mandatoryDenies = $livePartition.mandatoryDenies
@@ -5352,6 +5763,17 @@ Export-ModuleMember -Function @(
     "Resolve-AgentEffectiveCapabilitySettings",
     "Resolve-AgentCapabilityPolicyPartition",
     "Enter-AgentCapabilityOverrideLock",
+    "Get-AgentDelegationPolicyPath",
+    "Get-AgentDelegationPolicy",
+    "Test-AgentDelegationAllows",
+    "Get-AgentWideningGrantArtifactPath",
+    "New-AgentWideningGrantArtifact",
+    "Get-AgentWideningGrantArtifact",
+    "Remove-AgentWideningGrantArtifact",
+    "New-AgentWideningChallenge",
+    "Test-AgentWideningChallengeShape",
+    "Test-AgentAutoCompleteGrantWouldBeNoOp",
+    "Resolve-AgentWideningEffectiveDiff",
      "Get-AgentDefaultCapabilityOverrideKillSwitchRoot",
      "Test-AgentCapabilityOverrideKillSwitch",
      "Enable-AgentCapabilityOverrideKillSwitch",
