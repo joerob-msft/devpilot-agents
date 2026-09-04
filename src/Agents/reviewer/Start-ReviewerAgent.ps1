@@ -6552,7 +6552,8 @@ try {
         }
         if ($ManualDispatchManifest) {
             [void](Enter-AgentManualDispatchStartup -ManifestPath $ManualDispatchManifest `
-                -RepositoryIdentity $repositoryIdentity -DurableContext $script:ReviewerDurableContext `
+                -RepositoryIdentity $repositoryIdentity -RepositoryRoot ([IO.Path]::GetFullPath($RepoPath)) `
+                -DurableContext $script:ReviewerDurableContext `
                 -LeaseRoot $LeaseRoot -Role reviewer -EventLogPath $script:ReviewerOutputContext.LogPath `
                 -BoundCapabilities @{
                     EnableFindingComments = [bool]$EnableFindingComments

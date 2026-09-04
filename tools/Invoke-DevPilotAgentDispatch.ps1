@@ -305,6 +305,20 @@ function Get-BrokerCapabilityProfile {
         foreach ($name in @($allowedManualCapabilities + $mandatoryDenies + $absoluteDenies | Sort-Object -Unique)) {
             $provenance[$name] = 'operational-default'
         }
+        # PR2: narrow the operational-default ceiling by any persisted, outside-repository
+        # capability override. Overrides can only ever remove an active capability, never add one
+        # (Resolve-AgentCapabilityPolicyPartition). A resolution failure (corrupt/stale/expired/
+        # oversized/unsafe-path override record) fails this whole describe/profile call closed
+        # rather than silently falling back to the un-narrowed ceiling -- that fallback would be a
+        # silent widening from the operator's own last-known-good intent.
+        $ceilingCapabilities = $capabilities
+        $ceilingMandatoryDenies = $mandatoryDenies
+        $override = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $identity `
+            -RepositoryRoot $provider.RepositoryRoot -PullRequestId $prId -CurrentSourceCommit $pr.sourceCommit
+        $partition = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $roleDescriptor -PersistedNarrowing $override.Settings
+        $capabilities = $partition.capabilities
+        $mandatoryDenies = $partition.mandatoryDenies
+        foreach ($name in @($override.Provenance.Keys)) { $provenance[$name] = $override.Provenance[$name] }
     }
     catch {
         if ($provider.Session) { Close-AgentMcpSession $provider.Session }
@@ -314,6 +328,7 @@ function Get-BrokerCapabilityProfile {
         Role = $role; RoleDescriptor = $roleDescriptor; Provider = $provider; PullRequestId = $prId
         Identity = $identity; Pr = $pr; Constraints = $constraints
         Capabilities = $capabilities; MandatoryDenies = $mandatoryDenies
+        CeilingCapabilities = $ceilingCapabilities; CeilingMandatoryDenies = $ceilingMandatoryDenies
         AbsoluteDenies = $absoluteDenies; AllowedManualCapabilities = $allowedManualCapabilities
         DelegableAvailable = $delegableAvailable; Provenance = $provenance
     }
@@ -331,6 +346,7 @@ function Invoke-Describe {
         $policy = [ordered]@{
             schemaVersion = 1; repositoryIdentity = $profile.Identity; role = $role
             capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies
+            ceilingCapabilities = $profile.CeilingCapabilities; ceilingMandatoryDenies = $profile.CeilingMandatoryDenies
             configSnapshotSha256 = $snapshot.SnapshotSha256
         }
         $policyDigest = Get-AgentCanonicalDigest $policy

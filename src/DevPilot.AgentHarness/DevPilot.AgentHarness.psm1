@@ -813,7 +813,7 @@ function Resolve-AgentTrustedRoot {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][ValidateSet('durable-state', 'lease', 'watch-state')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('durable-state', 'lease', 'watch-state', 'capability-overrides')][string]$Kind,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [string[]]$DisallowedRoots = @(),
         [switch]$Create
@@ -899,7 +899,7 @@ function Get-AgentExecutionKey {
 function Enter-AgentExclusiveFile {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][ValidateSet('lease-contended', 'state-contended')][string]$ContentionReason,
+        [Parameter(Mandatory)][ValidateSet('lease-contended', 'state-contended', 'capability-override-contended')][string]$ContentionReason,
         [ValidateRange(0, 30000)][int]$TimeoutMilliseconds = 2000,
         [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None,
         [hashtable]$Metadata = @{}
@@ -1050,11 +1050,441 @@ function Invoke-AgentWithWorkAuthority {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Outside-repository capability-override store (PR2): hardened root, stable
+# reads, narrow-only schema validation, effective-settings resolution, and
+# the advisory lock shared with child-startup re-verification. No writer
+# exists yet anywhere in this change -- TUI edit/reset/kill switch is PR3,
+# checked-in delegation policy and ephemeral widening are PR4. Everything
+# below is read/resolve-only and can only ever narrow an already-open
+# capability to a mandatory deny, never grant one.
+# ---------------------------------------------------------------------------
+
+function Get-AgentDefaultCapabilityOverrideRoot {
+    if ($IsWindows) {
+        if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is required to resolve the capability-override root on Windows.' }
+        return (Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA 'DevPilot') 'capability-overrides') 'v1')
+    }
+    $base = if ($env:XDG_STATE_HOME) { $env:XDG_STATE_HOME } else { Join-Path (Join-Path $HOME '.local') 'state' }
+    return (Join-Path (Join-Path (Join-Path $base 'devpilot') 'capability-overrides') 'v1')
+}
+
+function Get-AgentCapabilityOverrideRoot {
+    <#
+        Resolves and hardens the capability-override root. Deliberately takes no root/path
+        parameter from any caller -- unlike durable-state/lease/watch-state, this root is never
+        forwarded through a broker descriptor or CLI argument; every consumer computes it the same
+        way, from the same environment convention, so nothing external can redirect where overrides
+        are read from. Disjoint by construction from every other default root this module resolves.
+        Re-validated (ACL/symlink/ownership) on every call rather than cached, matching this
+        function's own "resolve internally, never trust a forwarded value" contract; call frequency
+        here is human-interaction-scale (profile/describe/dispatch/startup), not a hot loop.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    $default = Get-AgentDefaultCapabilityOverrideRoot
+    $siblings = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot))
+    return Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
+        -DisallowedRoots $siblings -Create
+}
+
+function ConvertTo-AgentCanonicalEpochSeconds {
+    param([Parameter(Mandatory)][DateTime]$Value)
+    $utc = if ($Value.Kind -eq [DateTimeKind]::Utc) { $Value } else { $Value.ToUniversalTime() }
+    return [long][Math]::Floor(($utc - [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds)
+}
+
+function Get-AgentWorktreeIdentity {
+    <#
+        Stable identity for one repository worktree: the SHA-256 of its canonical, case-normalized
+        (Windows only) absolute path. Two worktrees of the identical repository checked out at
+        different filesystem paths (e.g. two `git worktree add` checkouts) always resolve to
+        different ids; the same worktree path always resolves to the same id.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    if ([string]::IsNullOrWhiteSpace($RepositoryRoot) -or -not [IO.Path]::IsPathFullyQualified($RepositoryRoot)) {
+        throw 'RepositoryRoot must be a non-empty absolute path.'
+    }
+    $full = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $normalized = if ($IsWindows) { $full.ToLowerInvariant() } else { $full }
+    return Get-AgentSha256 -Text $normalized
+}
+
+function Read-AgentStableFile {
+    <#
+        Stat-before/read-once/stat-after stable read: retries while a concurrent writer appears to
+        be racing this read (size/mtime disagree before vs. after, or existence itself flips), and
+        fails closed rather than ever returning a possibly-torn read. The returned Bytes are the
+        exact bytes the fingerprint was computed from -- callers that need to parse content
+        (ConvertFrom-AgentTrustedCapabilityJson) never perform a second, separate read.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [ValidateRange(1, 5)][int]$MaxAttempts = 3)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $before = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if (-not $before) {
+            return [ordered]@{ Path = $Path; Exists = $false; Size = 0; MTime = 0; Sha256 = $null; Bytes = [byte[]]@() }
+        }
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        $after = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($after -and $before.Length -eq $after.Length -and $before.LastWriteTimeUtc -eq $after.LastWriteTimeUtc -and
+            $bytes.Length -eq $before.Length) {
+            return [ordered]@{
+                Path = $Path; Exists = $true; Size = $bytes.Length
+                MTime = (ConvertTo-AgentCanonicalEpochSeconds $after.LastWriteTimeUtc)
+                Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+                Bytes = $bytes
+            }
+        }
+        # Stat-before and stat-after (or existence itself) disagree -- a concurrent writer raced
+        # this read. Retry.
+    }
+    throw '[stable-read-unstable] File changed while being read.'
+}
+
+function Test-AgentSecretShapedText {
+    <#
+        Conservative, intentionally narrow "does this look like a credential rather than a
+        capability name" heuristic. Defense in depth only, layered on top of this store's own
+        structural rules (fixed capability-name shape, enum-only settings values, fixed hex identity
+        formats), in case a future change loosens any of those. False negatives are expected and
+        acceptable here precisely because the structural checks alongside it are the primary
+        defense.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    if ($Text.Length -ge 32 -and $Text -cmatch '^[0-9a-fA-F]{32,}$') { return $true }
+    if ($Text.Length -ge 24 -and $Text -cmatch '^[A-Za-z0-9+/]{24,}={0,2}$') { return $true }
+    if ($Text -cmatch '^(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}$') { return $true }
+    if ($Text -cmatch '^(?:sk|pk|rk)_[A-Za-z0-9]{16,}$') { return $true }
+    if ($Text -cmatch '^AKIA[A-Z0-9]{16}$') { return $true }
+    if ($Text -cmatch '^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$') { return $true }
+    if ($Text -cmatch '-----BEGIN [A-Z ]*PRIVATE KEY-----') { return $true }
+    return $false
+}
+
+function Assert-AgentCapabilityJsonRawShape {
+    <#
+        Recursively walks the RAW JSON via System.Text.Json.JsonDocument -- BEFORE any
+        ConvertFrom-Json/hashtable conversion -- to catch duplicate and case-collision object keys
+        that ConvertFrom-Json's own last-value-wins folding would otherwise silently hide. Also
+        enforces hard bounds on nesting depth, total element count, and string length so a
+        pathological file cannot exhaust memory/CPU before schema validation even begins. Iterative
+        (explicit stack), not recursive, so a pathological depth fails via the bound check rather
+        than risking a real stack overflow.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [ValidateRange(1, 64)][int]$MaxDepth = 6,
+        [ValidateRange(1, 4096)][int]$MaxElements = 512,
+        [ValidateRange(1, 65536)][int]$MaxStringLength = 4096
+    )
+    $document = [Text.Json.JsonDocument]::Parse([ReadOnlyMemory[byte]]$Bytes)
+    try {
+        $elementCount = 0
+        $stack = [Collections.Generic.Stack[object]]::new()
+        $stack.Push(@{ Node = $document.RootElement; Depth = 0 })
+        while ($stack.Count -gt 0) {
+            $frame = $stack.Pop()
+            $node = $frame.Node
+            $depth = $frame.Depth
+            if ($depth -gt $MaxDepth) { throw '[capability-settings-invalid] JSON exceeds the maximum nesting depth.' }
+            $elementCount++
+            if ($elementCount -gt $MaxElements) { throw '[capability-settings-invalid] JSON exceeds the maximum element count.' }
+            switch ($node.ValueKind) {
+                ([Text.Json.JsonValueKind]::Object) {
+                    $seenExact = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                    $seenFold = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    foreach ($property in $node.EnumerateObject()) {
+                        if ($property.Name.Length -gt $MaxStringLength) {
+                            throw '[capability-settings-invalid] JSON property name exceeds the maximum length.'
+                        }
+                        if (-not $seenExact.Add($property.Name)) {
+                            throw "[capability-settings-invalid] Duplicate property '$($property.Name)' in capability settings JSON."
+                        }
+                        if (-not $seenFold.Add($property.Name)) {
+                            throw "[capability-settings-invalid] Property '$($property.Name)' collides case-insensitively with a sibling."
+                        }
+                        $stack.Push(@{ Node = $property.Value; Depth = ($depth + 1) })
+                    }
+                }
+                ([Text.Json.JsonValueKind]::Array) {
+                    foreach ($item in $node.EnumerateArray()) { $stack.Push(@{ Node = $item; Depth = ($depth + 1) }) }
+                }
+                ([Text.Json.JsonValueKind]::String) {
+                    if ($node.GetString().Length -gt $MaxStringLength) {
+                        throw '[capability-settings-invalid] JSON string value exceeds the maximum length.'
+                    }
+                }
+                default {}
+            }
+        }
+    }
+    finally { $document.Dispose() }
+}
+
+function ConvertFrom-AgentTrustedCapabilityJson {
+    <#
+        Parses and validates one capability-override settings record from already-read bytes
+        (Read-AgentStableFile) -- performs no file I/O of its own, so the single stable read is
+        authoritative for both fingerprint and content. Any schema, shape, or binding violation
+        rejects the ENTIRE record, not just the offending field, and fails closed.
+
+        AllowedCapabilities must be the union of every known role's allowedManualCapabilities, not
+        only the resolving caller's role: the physical file layout has no role segment (one file
+        serves every role for a given scope), so a key relevant only to another role must still
+        validate here. A role's delegableDefaultOff/absoluteDenies names are deliberately excluded
+        from that union by the caller, so they always fail as unrecognized -- persisted settings may
+        only narrow a capability that is already part of some role's open ceiling, never name one
+        that was never open to begin with.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes,
+        [Parameter(Mandatory)][ValidateSet('machine', 'user', 'repo-worktree', 'pr')][string]$SourceScope,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$AllowedCapabilities
+    )
+    if ($Bytes.Length -eq 0) { throw "[capability-settings-invalid] ($SourceScope) Empty capability settings content." }
+    if ($Bytes.Length -gt 65536) { throw "[capability-settings-invalid] ($SourceScope) Capability settings content exceeds the byte limit." }
+    Assert-AgentCapabilityJsonRawShape -Bytes $Bytes
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $record = $strictUtf8.GetString($Bytes) | ConvertFrom-Json -AsHashtable -Depth 8 -ErrorAction Stop
+    if ($record -isnot [Collections.IDictionary]) { throw "[capability-settings-invalid] ($SourceScope) Record is not a JSON object." }
+
+    $scopedFields = @{
+        machine         = @{ Required = @(); Forbidden = @('repositoryKey', 'worktreeId', 'pullRequestId', 'sourceCommit', 'expiresAtUtc') }
+        user            = @{ Required = @(); Forbidden = @('repositoryKey', 'worktreeId', 'pullRequestId', 'sourceCommit', 'expiresAtUtc') }
+        'repo-worktree' = @{ Required = @('repositoryKey', 'worktreeId'); Forbidden = @('pullRequestId', 'sourceCommit', 'expiresAtUtc') }
+        pr              = @{ Required = @('repositoryKey', 'worktreeId', 'pullRequestId', 'sourceCommit', 'expiresAtUtc'); Forbidden = @() }
+    }
+    $rules = $scopedFields[$SourceScope]
+    $baseRequired = @('schemaVersion', 'settings')
+    foreach ($name in ($baseRequired + $rules.Required)) {
+        if (-not $record.Contains($name)) { throw "[capability-settings-invalid] ($SourceScope) Missing required field '$name'." }
+    }
+    foreach ($name in $rules.Forbidden) {
+        if ($record.Contains($name)) { throw "[capability-settings-invalid] ($SourceScope) Field '$name' is forbidden for this scope." }
+    }
+    $knownFields = [Collections.Generic.HashSet[string]]::new(
+        [string[]]($baseRequired + @('repositoryKey', 'worktreeId', 'pullRequestId', 'sourceCommit', 'expiresAtUtc')),
+        [StringComparer]::Ordinal)
+    foreach ($name in @($record.Keys)) {
+        if (-not $knownFields.Contains($name)) { throw "[capability-settings-invalid] ($SourceScope) Unknown top-level field '$name'." }
+    }
+    # ConvertFrom-Json -AsHashtable returns JSON integers as [int64] (not [int]) on this PowerShell
+    # version, so every integer field below accepts both CLR widths and compares by value.
+    if (($record.schemaVersion -isnot [int] -and $record.schemaVersion -isnot [long]) -or [int64]$record.schemaVersion -ne 1) {
+        throw "[capability-settings-invalid] ($SourceScope) Unsupported schemaVersion."
+    }
+    if ($record.settings -isnot [Collections.IDictionary]) {
+        throw "[capability-settings-invalid] ($SourceScope) 'settings' must be a JSON object."
+    }
+    $allowedSet = [Collections.Generic.HashSet[string]]::new([string[]]$AllowedCapabilities, [StringComparer]::Ordinal)
+    $settings = [ordered]@{}
+    foreach ($name in @($record.settings.Keys)) {
+        if ($name.Length -eq 0 -or $name.Length -gt 256 -or $name -cnotmatch '^[A-Za-z][A-Za-z0-9]*$') {
+            throw "[capability-settings-invalid] ($SourceScope) Malformed capability name '$name'."
+        }
+        if (Test-AgentSecretShapedText -Text $name) {
+            throw "[capability-settings-invalid] ($SourceScope) Capability name '$name' looks secret-shaped."
+        }
+        if (-not $allowedSet.Contains($name)) {
+            throw "[capability-settings-invalid] ($SourceScope) Capability '$name' is not a recognized manually-selectable capability."
+        }
+        $value = $record.settings[$name]
+        if ($value -isnot [string] -or $value -cnotin @('inherit', 'off')) {
+            throw "[capability-settings-invalid] ($SourceScope) Capability '$name' has an unsupported value; only 'inherit'/'off' may be persisted."
+        }
+        $settings[$name] = $value
+    }
+
+    $result = [ordered]@{ SchemaVersion = 1; SourceScope = $SourceScope; Settings = $settings }
+    if ($record.Contains('repositoryKey')) {
+        $key = [string]$record.repositoryKey
+        if ($key -notmatch '^v1:(azuredevops|github):[^:]+$') { throw "[capability-settings-invalid] ($SourceScope) repositoryKey is malformed." }
+        $result.RepositoryKey = $key
+    }
+    if ($record.Contains('worktreeId')) {
+        $worktreeId = [string]$record.worktreeId
+        if ($worktreeId -cnotmatch '^[0-9a-f]{64}$') { throw "[capability-settings-invalid] ($SourceScope) worktreeId is malformed." }
+        $result.WorktreeId = $worktreeId
+    }
+    if ($record.Contains('pullRequestId')) {
+        if (($record.pullRequestId -isnot [int] -and $record.pullRequestId -isnot [long]) -or [int64]$record.pullRequestId -le 0) {
+            throw "[capability-settings-invalid] ($SourceScope) pullRequestId is malformed."
+        }
+        $result.PullRequestId = [int]$record.pullRequestId
+    }
+    if ($record.Contains('sourceCommit')) {
+        $sourceCommit = [string]$record.sourceCommit
+        if ($sourceCommit -cnotmatch '^[0-9a-f]{40}$') { throw "[capability-settings-invalid] ($SourceScope) sourceCommit must be a full 40-hex SHA." }
+        $result.SourceCommit = $sourceCommit
+    }
+    if ($record.Contains('expiresAtUtc')) {
+        if ($record.expiresAtUtc -isnot [int] -and $record.expiresAtUtc -isnot [long]) {
+            throw "[capability-settings-invalid] ($SourceScope) expiresAtUtc must be an integer epoch-seconds value."
+        }
+        $result.ExpiresAtUtc = [long]$record.expiresAtUtc
+    }
+    return $result
+}
+
+function Resolve-AgentEffectiveCapabilitySettings {
+    <#
+        Resolves the effective, outside-repository capability-override narrowing for one
+        repository worktree + pull request, across all four logical scopes (machine, user,
+        repo-worktree, pr) under the single hardened capability-overrides root. Persisted settings
+        can only ever narrow an already-open capability to 'off' -- never grant one -- so scopes are
+        applied broad-to-narrow and are purely additive/monotonic: once any scope turns a capability
+        off, no narrower scope can turn it back on, and provenance records the broadest (first) scope
+        that did so.
+
+        A single physical settings file is shared by every role that operates in that scope (the
+        layout has no role segment), so capability-name validation uses the union of every known
+        role's allowedManualCapabilities; callers that need a role-specific ceiling apply
+        Resolve-AgentCapabilityPolicyPartition afterward with their own role's descriptor.
+
+        PR-scope lookup is fully deterministic from PullRequestId + the current source commit's
+        first 12 hex characters -- no directory enumeration. The short SHA only selects which
+        candidate FILE to open; the full sourceCommit recorded inside that file's content is what is
+        actually checked for staleness, so a short-SHA collision can never silently authorize a
+        narrowing that belongs to a different commit.
+
+        Synchronous by design: every file this function reads is small (<=64KB) and local, bounded
+        by the same byte/depth/element/string limits Assert-AgentCapabilityJsonRawShape already
+        enforces -- the same order of local I/O this broker already performs synchronously elsewhere
+        (config/descriptor/durable-state reads). This broker has no RunspacePool/bounded-worker
+        infrastructure today (PR2 does not introduce one), so adding asynchronous plumbing solely for
+        this resolver would be new, untested async infrastructure rather than reuse of an existing,
+        bounded one; keeping this call synchronous preserves today's protocol responsiveness without
+        that risk.
+
+        Any schema, integrity, staleness, expiry, or path-safety failure on a file that DOES exist
+        fails the WHOLE resolution closed (throws) rather than silently discarding just that scope --
+        silently ignoring a corrupt/stale/expired narrowing record would make the effective policy
+        MORE permissive than the operator's last-known-good intent, which is the one direction this
+        feature must never move in unattended. A scope file that is simply absent is not an error:
+        an entirely empty store resolves to empty Settings/Provenance, identical to PR1's behavior.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$CurrentSourceCommit
+    )
+    $root = Get-AgentCapabilityOverrideRoot -RepositoryRoot $RepositoryRoot
+    $allowedCapabilities = [Collections.Generic.List[string]]::new()
+    foreach ($knownRole in @('reviewer', 'review-handler')) {
+        foreach ($name in @((Get-AgentHarnessCapabilityDescriptor -Role $knownRole).allowedManualCapabilities)) {
+            if (-not $allowedCapabilities.Contains($name)) { [void]$allowedCapabilities.Add($name) }
+        }
+    }
+    $repositoryKey = Get-AgentRepositoryIdentityKey -RepositoryIdentity $RepositoryIdentity
+    $worktreeId = Get-AgentWorktreeIdentity -RepositoryRoot $RepositoryRoot
+    $repoRoot = Join-Path (Join-Path $root 'repo') (Get-AgentSha256 -Text $repositoryKey)
+    $candidates = [ordered]@{
+        machine         = @{ Path = (Join-Path $root 'machine.settings.v1.json'); RequireBinding = $false }
+        user            = @{ Path = (Join-Path $root 'user.settings.v1.json'); RequireBinding = $false }
+        'repo-worktree' = @{ Path = (Join-Path $repoRoot "$worktreeId.settings.v1.json"); RequireBinding = $true }
+        pr              = @{
+            Path = (Join-Path (Join-Path $repoRoot 'pr') "$PullRequestId-$($CurrentSourceCommit.Substring(0, 12)).settings.v1.json")
+            RequireBinding = $true
+        }
+    }
+    $settings = [ordered]@{}
+    $provenance = [ordered]@{}
+    $fingerprints = [Collections.Generic.List[hashtable]]::new()
+    foreach ($scope in @('machine', 'user', 'repo-worktree', 'pr')) {
+        $path = [IO.Path]::GetFullPath($candidates[$scope].Path)
+        if (-not (Test-AgentPathWithin -Path $path -Root $root)) {
+            throw "[capability-settings-invalid] ($scope) Resolved settings path escaped the capability-override root."
+        }
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            [void]$fingerprints.Add([ordered]@{ Path = $path; Exists = $false; Size = 0; MTime = 0; Sha256 = $null })
+            continue
+        }
+        $path = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -Private
+        $stable = Read-AgentStableFile -Path $path
+        [void]$fingerprints.Add([ordered]@{ Path = $stable.Path; Exists = $stable.Exists; Size = $stable.Size; MTime = $stable.MTime; Sha256 = $stable.Sha256 })
+        $record = ConvertFrom-AgentTrustedCapabilityJson -Bytes $stable.Bytes -SourceScope $scope -AllowedCapabilities $allowedCapabilities
+        if ($candidates[$scope].RequireBinding -and
+            ([string]$record.RepositoryKey -cne $repositoryKey -or [string]$record.WorktreeId -cne $worktreeId)) {
+            throw "[capability-settings-invalid] ($scope) Record identity binding does not match the current repository/worktree."
+        }
+        if ($scope -eq 'pr') {
+            if ([int]$record.PullRequestId -ne $PullRequestId) {
+                throw '[capability-settings-invalid] (pr) Record pullRequestId does not match the current pull request.'
+            }
+            if ([string]$record.SourceCommit -cne $CurrentSourceCommit) {
+                throw '[capability-settings-stale] Persisted PR-scope override no longer matches the current source commit.'
+            }
+            if ([long]$record.ExpiresAtUtc -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
+                throw '[capability-settings-expired] Persisted PR-scope override has expired.'
+            }
+        }
+        foreach ($name in @($record.Settings.Keys)) {
+            if ([string]$record.Settings[$name] -cne 'off') { continue }
+            if (-not $settings.Contains($name)) {
+                $settings[$name] = 'off'
+                $provenance[$name] = $scope
+            }
+        }
+    }
+    return @{ Settings = $settings; Provenance = $provenance; FileFingerprints = @($fingerprints.ToArray()) }
+}
+
+function Resolve-AgentCapabilityPolicyPartition {
+    <#
+        Pure set-math shared by every caller that needs to apply a persisted narrowing to a role's
+        capability ceiling (the broker's describe/profile builder and, at child startup, the
+        independent re-verification in Enter-AgentManualDispatchStartup): turn every capability the
+        operator persisted as 'off' from an active capability into a mandatory deny. Persisted
+        settings can only ever narrow this ceiling, never widen it -- a name that is not already an
+        active capability is a no-op here, and 'inherit' entries are already absent from
+        PersistedNarrowing by construction (Resolve-AgentEffectiveCapabilitySettings only ever
+        returns 'off' entries). Delegation/widening (checked-in delegation policy, ephemeral grants)
+        is out of scope for this change and intentionally not modeled here.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$RoleDescriptor,
+        [Parameter(Mandatory)][hashtable]$PersistedNarrowing
+    )
+    $capabilities = [Collections.Generic.List[string]]::new([string[]]@($RoleDescriptor.capabilities | Sort-Object -Unique))
+    $mandatoryDenies = [Collections.Generic.List[string]]::new([string[]]@($RoleDescriptor.mandatoryDenies | Sort-Object -Unique))
+    foreach ($name in @($PersistedNarrowing.Keys | Where-Object { [string]$PersistedNarrowing[$_] -ceq 'off' })) {
+        if ($capabilities.Contains($name)) {
+            [void]$capabilities.Remove($name)
+            if (-not $mandatoryDenies.Contains($name)) { [void]$mandatoryDenies.Add($name) }
+        }
+    }
+    return @{ capabilities = @($capabilities | Sort-Object -Unique); mandatoryDenies = @($mandatoryDenies | Sort-Object -Unique) }
+}
+
+function Enter-AgentCapabilityOverrideLock {
+    <#
+        Same exclusive, FileShare.None-backed advisory file lock idiom as Enter-AgentWorkLease/
+        Enter-AgentDurableStateLock, against one lock file at the root of the capability-override
+        store. No writer takes this lock yet in this change (TUI edit/reset/kill switch is PR3);
+        Enter-AgentManualDispatchStartup is its first caller, holding it across live re-verification
+        through the ready/proceed handshake so no future cooperating writer can narrow settings out
+        from under an in-flight startup decision.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [ValidateRange(0, 30000)][int]$TimeoutMilliseconds = 2000,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
+    )
+    $root = Get-AgentCapabilityOverrideRoot -RepositoryRoot $RepositoryRoot
+    return Enter-AgentExclusiveFile -Path (Join-Path $root 'capability-overrides.lock') `
+        -ContentionReason capability-override-contended -TimeoutMilliseconds $TimeoutMilliseconds `
+        -CancellationToken $CancellationToken -Metadata @{}
+}
+
 function Enter-AgentManualDispatchStartup {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$ManifestPath,
         [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][hashtable]$DurableContext,
         [Parameter(Mandatory)][string]$LeaseRoot,
         [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
@@ -1101,6 +1531,19 @@ function Enter-AgentManualDispatchStartup {
     if ($policy -cne [string]$manifest.capabilityPolicyDigest) {
         throw '[policy-changed] Manual dispatch policy digest does not match its snapshot.'
     }
+    # Independently re-derive the pre-narrowing ceiling the broker described this policy from
+    # (§4.2/§5 mechanics), and re-validate it against the same checked-in ceiling rules as the
+    # already-narrowed capabilities/mandatoryDenies above -- the child trusts nothing from the wire
+    # it cannot re-derive or re-check itself (ANT-2).
+    $ceilingCapabilities = @($manifest.policy.ceilingCapabilities)
+    $ceilingMandatoryDenies = @($manifest.policy.ceilingMandatoryDenies)
+    if ($ceilingMandatoryDenies -cnotcontains $requiredDeny -or
+        @($ceilingCapabilities | Where-Object { $ceilingMandatoryDenies -ccontains $_ }).Count -gt 0 -or
+        @($ceilingCapabilities | Where-Object { $allowedCapabilities -cnotcontains $_ }).Count -gt 0 -or
+        @($capabilities | Where-Object { $ceilingCapabilities -cnotcontains $_ }).Count -gt 0 -or
+        @($mandatoryDenies | Where-Object { $ceilingMandatoryDenies -cnotcontains $_ }).Count -gt 0) {
+        throw '[launch-failed] Manual dispatch manifest ceiling policy is malformed or inconsistent.'
+    }
     $expectedRepositoryKey = Get-AgentRepositoryIdentityKey -RepositoryIdentity $RepositoryIdentity
     if ([string]$manifest.repositoryKey -cne $expectedRepositoryKey) {
         throw '[repository-mismatch] Manual dispatch identity changed.'
@@ -1108,6 +1551,7 @@ function Enter-AgentManualDispatchStartup {
     $prId = [int]$manifest.pullRequestId
     $lease = $null
     $stateLock = $null
+    $capabilityLock = $null
     try {
         $lease = Enter-AgentWorkLease -LeaseRoot $LeaseRoot -RepositoryIdentity $RepositoryIdentity `
             -PullRequestId $prId -Role $Role -TimeoutMilliseconds 2000
@@ -1144,6 +1588,35 @@ function Enter-AgentManualDispatchStartup {
             throw '[prompt-invalid] Operator prompt cleanup failed.'
         }
 
+        # Decisive enforcement boundary (§5): hold the same lock every capability-override writer
+        # will take (PR3+) across the entire remaining ready/proceed exchange, so no cooperating
+        # writer can narrow settings out from under a startup decision already in flight. A
+        # non-cooperative write that bypasses this lock is outside the trust boundary (ANT-1/ANT-2)
+        # but is still caught fail-closed by the live equality check below.
+        $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $RepositoryRoot -TimeoutMilliseconds 2000
+        if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+        $liveOverride = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $RepositoryIdentity `
+            -RepositoryRoot $RepositoryRoot -PullRequestId $prId `
+            -CurrentSourceCommit ([string]$manifest.prStateFingerprintSourceCommit)
+        $livePartition = Resolve-AgentCapabilityPolicyPartition `
+            -RoleDescriptor ([hashtable]@{ capabilities = $ceilingCapabilities; mandatoryDenies = $ceilingMandatoryDenies }) `
+            -PersistedNarrowing $liveOverride.Settings
+        $livePolicy = [ordered]@{
+            schemaVersion = 1; repositoryIdentity = $manifest.policy.repositoryIdentity; role = $Role
+            capabilities = $livePartition.capabilities; mandatoryDenies = $livePartition.mandatoryDenies
+            ceilingCapabilities = @($ceilingCapabilities | Sort-Object -Unique)
+            ceilingMandatoryDenies = @($ceilingMandatoryDenies | Sort-Object -Unique)
+            configSnapshotSha256 = [string]$manifest.policy.configSnapshotSha256
+        }
+        $liveDigest = Get-AgentCanonicalDigest -InputObject $livePolicy
+        if ($liveDigest -cne [string]$manifest.capabilityPolicyDigest -or
+            (ConvertTo-AgentCanonicalJson @($livePartition.capabilities    | Sort-Object -Unique)) -cne
+                (ConvertTo-AgentCanonicalJson @($capabilities    | Sort-Object -Unique)) -or
+            (ConvertTo-AgentCanonicalJson @($livePartition.mandatoryDenies | Sort-Object -Unique)) -cne
+                (ConvertTo-AgentCanonicalJson @($mandatoryDenies | Sort-Object -Unique))) {
+            throw '[policy-changed] Live capability settings no longer match the dispatch manifest.'
+        }
+
         $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', [string]$manifest.startupPipe,
             [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
         try {
@@ -1163,7 +1636,14 @@ function Enter-AgentManualDispatchStartup {
                 throw '[launch-failed] Broker did not authorize startup.'
             }
         }
-        finally { if ($pipe) { $pipe.Dispose() } }
+        finally {
+            if ($pipe) { $pipe.Dispose() }
+            # Released the instant the ready/proceed exchange concludes -- success or throw -- never
+            # held for the remainder of the function (cancellation-binding validation,
+            # $script:AgentManualAuthorities bookkeeping), since only this window needs to be
+            # race-free against a cooperating settings writer.
+            if ($capabilityLock -and $capabilityLock.Acquired) { Exit-AgentLock $capabilityLock.Stream; $capabilityLock.Acquired = $false }
+        }
 
         $executionKey = Get-AgentExecutionKey -RepositoryIdentity $RepositoryIdentity -PullRequestId $prId -Role $Role
         $runtimeRoot = [IO.Path]::GetFullPath([string]$manifest.runtimeRoot)
@@ -1192,7 +1672,7 @@ function Enter-AgentManualDispatchStartup {
             $message = $_.Exception.Message
             $code = if ($message -match '^\[([a-z-]+)\]') { $Matches[1] } else { 'launch-failed' }
             $detail = if ($code -eq 'already-running' -and
-                $message -match '^\[already-running\]\s+(lease-contended|state-contended)$') {
+                $message -match '^\[already-running\]\s+(lease-contended|state-contended|capability-override-contended)$') {
                 $Matches[1]
             }
             else { '' }
@@ -1212,6 +1692,7 @@ function Enter-AgentManualDispatchStartup {
         catch {
             # The broker also observes an early child exit; notification is best effort.
         }
+        if ($capabilityLock -and $capabilityLock.Acquired) { Exit-AgentLock $capabilityLock.Stream }
         if ($stateLock -and $stateLock.Acquired) { Exit-AgentLock $stateLock.Stream }
         if ($lease -and $lease.Acquired) { Exit-AgentLock $lease.Stream }
         throw
@@ -4289,6 +4770,14 @@ Export-ModuleMember -Function @(
     "Test-AgentManualCancellationRequested",
     "Get-AgentCancellationOutcome",
     "Exit-AgentManualDispatchAuthority",
+    "Get-AgentDefaultCapabilityOverrideRoot",
+    "ConvertTo-AgentCanonicalEpochSeconds",
+    "Get-AgentWorktreeIdentity",
+    "Read-AgentStableFile",
+    "ConvertFrom-AgentTrustedCapabilityJson",
+    "Resolve-AgentEffectiveCapabilitySettings",
+    "Resolve-AgentCapabilityPolicyPartition",
+    "Enter-AgentCapabilityOverrideLock",
     "Repair-AgentDurableState",
     "Read-AgentDurableState",
     "Write-AgentDurableState",

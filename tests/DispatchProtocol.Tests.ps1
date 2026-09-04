@@ -181,13 +181,15 @@ Describe 'dispatch protocol primitives' {
                 role = 'reviewer'
                 capabilities = @('EnableApprovalVote')
                 mandatoryDenies = @('EnableApprovalVote')
+                ceilingCapabilities = @('EnableApprovalVote')
+                ceilingMandatoryDenies = @('EnableApprovalVote')
             }
             capabilityPolicyDigest = 'invalid'
         } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifest -Encoding utf8NoBOM
         {
             Enter-AgentManualDispatchStartup -ManifestPath $manifest -RepositoryIdentity @{
                 key = 'v1:github:1'; verified = $true
-            } -DurableContext @{} -LeaseRoot $TestDrive -Role reviewer `
+            } -RepositoryRoot $TestDrive -DurableContext @{} -LeaseRoot $TestDrive -Role reviewer `
                 -EventLogPath (Join-Path $TestDrive 'event.jsonl') `
                 -BoundCapabilities @{ EnableApprovalVote = $false }
         } | Should -Throw '*policy is malformed or inconsistent*'
@@ -200,6 +202,8 @@ Describe 'dispatch protocol primitives' {
             role = 'reviewer'
             capabilities = @('EnableFindingComments')
             mandatoryDenies = @('EnableApprovalVote')
+            ceilingCapabilities = @('EnableFindingComments')
+            ceilingMandatoryDenies = @('EnableApprovalVote')
             configSnapshotSha256 = ('a' * 64)
         }
         $manifest = Join-Path $TestDrive 'capability-mismatch-manifest.json'
@@ -213,7 +217,7 @@ Describe 'dispatch protocol primitives' {
         {
             Enter-AgentManualDispatchStartup -ManifestPath $manifest -RepositoryIdentity @{
                 key = 'v1:github:1'; verified = $true
-            } -DurableContext @{} -LeaseRoot $TestDrive -Role reviewer `
+            } -RepositoryRoot $TestDrive -DurableContext @{} -LeaseRoot $TestDrive -Role reviewer `
                 -EventLogPath (Join-Path $TestDrive 'event.jsonl') `
                 -BoundCapabilities @{
                     EnableFindingComments = $false
@@ -223,7 +227,7 @@ Describe 'dispatch protocol primitives' {
         {
             Enter-AgentManualDispatchStartup -ManifestPath $manifest -RepositoryIdentity @{
                 key = 'v1:github:1'; verified = $true
-            } -DurableContext @{} -LeaseRoot $TestDrive -Role reviewer `
+            } -RepositoryRoot $TestDrive -DurableContext @{} -LeaseRoot $TestDrive -Role reviewer `
                 -EventLogPath (Join-Path $TestDrive 'event.jsonl') `
                 -BoundCapabilities @{
                     EnableFindingComments = $true

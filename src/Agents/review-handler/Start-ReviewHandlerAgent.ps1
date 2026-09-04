@@ -2637,7 +2637,8 @@ try {
         }
         if ($ManualDispatchManifest) {
             [void](Enter-AgentManualDispatchStartup -ManifestPath $ManualDispatchManifest `
-                -RepositoryIdentity $repositoryIdentity -DurableContext $script:HandlerDurableContext `
+                -RepositoryIdentity $repositoryIdentity -RepositoryRoot ([IO.Path]::GetFullPath($RepoPath)) `
+                -DurableContext $script:HandlerDurableContext `
                 -LeaseRoot $LeaseRoot -Role review-handler -EventLogPath $script:HandlerOutputContext.LogPath `
                 -BoundCapabilities @{
                     EnableThreadReplies = [bool]$EnableThreadReplies
