@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
-import type { AgentRole, RepositoryIdentityV1 } from "./domain.js";
+import { AGENTS, parseRepositoryIdentity, type AgentRole, type RepositoryIdentityV1 } from "./domain.js";
 
 export const DISPATCH_PROTOCOL_MAX_BYTES = 65_536;
 
@@ -47,6 +47,28 @@ export interface CapabilitySummary {
   provenance: Record<string, CapabilityProvenance>;
 }
 
+// Read-only effective-capability-profile inspection (PR1 issue #105): the Settings TUI's dedicated,
+// side-effect-free counterpart to CapabilitySummary. The broker's `profile` operation never
+// allocates a dispatchDraftId/config snapshot/$drafts entry, so this type intentionally has no
+// dispatchDraftId/capabilityPolicyDigest/prStateFingerprint -- none is meaningful without a config
+// snapshot to bind it to, and a distinct type is safer here than fake/optional draft identifiers
+// that could be mistaken for something dispatch() can actually consume.
+export interface CapabilityProfile {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "capability-profile";
+  role: AgentRole;
+  repositoryIdentity: RepositoryIdentityV1;
+  prSnapshot: PullRequestSnapshotV1;
+  capabilities: string[];
+  mandatoryDenies: string[];
+  dynamicConstraints: string[];
+  absoluteDenies: string[];
+  allowedManualCapabilities: string[];
+  delegableAvailable: string[];
+  provenance: Record<string, CapabilityProvenance>;
+}
+
 export interface DispatchAccepted {
   schemaVersion: 1;
   requestId: string;
@@ -81,6 +103,7 @@ export interface DispatchTerminal {
 
 type BrokerResponse =
   | CapabilitySummary
+  | CapabilityProfile
   | DispatchAccepted
   | DispatchRejected
   | DispatchTerminal
@@ -109,6 +132,7 @@ export interface DispatchClientOptions {
 
 export interface DispatchBroker {
   describe(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilitySummary>;
+  profile(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilityProfile>;
   dispatch(summary: CapabilitySummary, operatorPrompt: string): Promise<DispatchAccepted>;
   cancel(dispatchId: string): Promise<DispatchTerminal>;
   shutdown(timeoutMilliseconds?: number): Promise<void>;
@@ -128,6 +152,66 @@ function stringField(record: Record<string, unknown>, name: string): string {
     throw new Error(`broker response ${name} is invalid`);
   }
   return value;
+}
+
+// Broker-authored role (issue #105): the broker is the sole source of truth for which role a
+// capability-summary/capability-profile response describes. Runtime-validated against the same
+// known-role list the rest of the dashboard uses -- never client-stamped/overwritten, and a
+// mismatch (missing, wrong type, or not a known role) fails closed here rather than trusting the
+// wire value silently.
+function roleField(record: Record<string, unknown>, name: string): AgentRole {
+  const value = record[name];
+  if (typeof value !== "string" || !(AGENTS as readonly string[]).includes(value)) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  return value as AgentRole;
+}
+
+// repositoryIdentity/prSnapshot were previously spread straight from the untrusted record with no
+// validation at all. repositoryIdentityField reuses domain.ts's canonical, already-bounded
+// verified-identity parser (the same one AgentEvent.repositoryIdentity goes through) instead of
+// duplicating that validation here.
+function repositoryIdentityField(record: Record<string, unknown>, name: string): RepositoryIdentityV1 {
+  const identity = parseRepositoryIdentity(record[name], true);
+  if (!identity) throw new Error(`broker response ${name} is invalid`);
+  return identity;
+}
+
+const MAX_PR_SNAPSHOT_TEXT_LENGTH = 4_096;
+
+function boundedPrText(record: Record<string, unknown>, name: string): string {
+  const value = record[name];
+  if (typeof value !== "string" || value.length > MAX_PR_SNAPSHOT_TEXT_LENGTH) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  return value;
+}
+
+function prSnapshotField(record: Record<string, unknown>, name: string): PullRequestSnapshotV1 {
+  const value = record[name];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  const raw = value as Record<string, unknown>;
+  if (raw.schemaVersion !== 1) throw new Error(`broker response ${name}.schemaVersion is invalid`);
+  const pullRequestId = raw.pullRequestId;
+  if (typeof pullRequestId !== "number" || !Number.isSafeInteger(pullRequestId) || pullRequestId <= 0) {
+    throw new Error(`broker response ${name}.pullRequestId is invalid`);
+  }
+  if (typeof raw.active !== "boolean" || typeof raw.draft !== "boolean") {
+    throw new Error(`broker response ${name} active/draft flags are invalid`);
+  }
+  return {
+    schemaVersion: 1,
+    pullRequestId,
+    sourceCommit: boundedPrText(raw, "sourceCommit"),
+    sourceRef: boundedPrText(raw, "sourceRef"),
+    targetRef: boundedPrText(raw, "targetRef"),
+    active: raw.active,
+    draft: raw.draft,
+    author: boundedPrText(raw, "author"),
+    title: boundedPrText(raw, "title"),
+  };
 }
 
 // Bounds mirror stringField's own per-item cap. The whole line is already bounded by
@@ -150,13 +234,29 @@ function stringArrayField(record: Record<string, unknown>, name: string): string
   return value as string[];
 }
 
+const MAX_PROVENANCE_ENTRIES = 256;
+const MAX_PROVENANCE_KEY_LENGTH = 128;
+// Rejected outright rather than merely bounded: these keys shadow/attack object internals if ever
+// forwarded into a prototype-carrying object or a lodash-style deep-set elsewhere in the pipeline.
+const DANGEROUS_PROVENANCE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 function provenanceField(record: Record<string, unknown>, name: string): Record<string, CapabilityProvenance> {
   const value = record[name];
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`broker response ${name} is invalid`);
   }
-  const result: Record<string, CapabilityProvenance> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > MAX_PROVENANCE_ENTRIES) {
+    throw new Error(`broker response ${name} has too many entries`);
+  }
+  // Object.create(null) has no prototype to hijack, so even a "__proto__" key that somehow slipped
+  // past the explicit rejection below would land as a harmless own property instead of reaching
+  // Object.prototype.
+  const result: Record<string, CapabilityProvenance> = Object.create(null);
+  for (const [key, entry] of entries) {
+    if (DANGEROUS_PROVENANCE_KEYS.has(key) || key.length > MAX_PROVENANCE_KEY_LENGTH) {
+      throw new Error(`broker response ${name} key is invalid`);
+    }
     if (typeof entry !== "string" || !(KNOWN_PROVENANCE as readonly string[]).includes(entry)) {
       throw new Error(`broker response ${name}.${key} is invalid`);
     }
@@ -190,14 +290,16 @@ function parseResponse(line: string): BrokerResponse {
   if (record.schemaVersion !== 1) throw new Error("unsupported broker protocol version");
   const requestId = stringField(record, "requestId");
   const operation = stringField(record, "operation");
-  if (!["capability-summary", "accepted", "rejected", "completed", "cancelled", "shutdown-complete"].includes(operation)) {
+  if (!["capability-summary", "capability-profile", "accepted", "rejected", "completed", "cancelled", "shutdown-complete"].includes(operation)) {
     throw new Error("unknown broker response operation");
   }
-  if (operation === "capability-summary") {
-    return {
-      ...record,
-      requestId,
-      operation,
+  if (operation === "capability-summary" || operation === "capability-profile") {
+    const shared = {
+      // Broker-authored role (issue #105) plus repositoryIdentity/prSnapshot, both of which used to
+      // be spread straight from the untrusted record with no validation at all.
+      role: roleField(record, "role"),
+      repositoryIdentity: repositoryIdentityField(record, "repositoryIdentity"),
+      prSnapshot: prSnapshotField(record, "prSnapshot"),
       // Legacy fields predate PR1's stricter parsing and were previously spread straight from the
       // untrusted record; validate them the same bounded-string-array way as the PR1-additive
       // fields so a malformed broker response fails closed here instead of throwing later out of
@@ -206,7 +308,11 @@ function parseResponse(line: string): BrokerResponse {
       mandatoryDenies: stringArrayField(record, "mandatoryDenies"),
       dynamicConstraints: stringArrayField(record, "dynamicConstraints"),
       ...parseCapabilityProfileFields(record),
-    } as BrokerResponse;
+    };
+    if (operation === "capability-summary") {
+      return { ...record, requestId, operation, ...shared } as CapabilitySummary;
+    }
+    return { ...record, requestId, operation, ...shared } as CapabilityProfile;
   }
   return { ...record, requestId, operation } as BrokerResponse;
 }
@@ -270,13 +376,35 @@ export class DispatchClient implements DispatchBroker {
   }
 
   describe(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilitySummary> {
-    return this.request<Omit<CapabilitySummary, "role">>({
+    return this.request<CapabilitySummary>({
       schemaVersion: 1,
       operation: "describe",
       repositoryKey,
       pullRequestId,
       role,
-    }, "capability-summary").then((response) => ({ ...response, role }));
+    }, "capability-summary").then((response) => {
+      // The broker's role is authoritative (issue #105) and is never client-stamped/overwritten;
+      // a response for a different role than what was requested is rejected rather than trusted.
+      if (response.role !== role) {
+        throw new Error("broker capability-summary role does not match the requested role");
+      }
+      return response;
+    });
+  }
+
+  profile(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilityProfile> {
+    return this.request<CapabilityProfile>({
+      schemaVersion: 1,
+      operation: "profile",
+      repositoryKey,
+      pullRequestId,
+      role,
+    }, "capability-profile").then((response) => {
+      if (response.role !== role) {
+        throw new Error("broker capability-profile role does not match the requested role");
+      }
+      return response;
+    });
   }
 
   dispatch(summary: CapabilitySummary, operatorPrompt: string): Promise<DispatchAccepted> {

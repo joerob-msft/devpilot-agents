@@ -184,7 +184,7 @@ function boundedUnknown(value: unknown, depth: number): unknown {
   return String(value).slice(0, MAX_TEXT);
 }
 
-function parseRepositoryIdentity(value: unknown, required: boolean): RepositoryIdentityV1 | null {
+export function parseRepositoryIdentity(value: unknown, required: boolean): RepositoryIdentityV1 | null {
   if (value === null || value === undefined) {
     if (required) throw new Error("repositoryIdentity is required for schema v3");
     return null;

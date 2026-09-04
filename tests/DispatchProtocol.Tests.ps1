@@ -537,6 +537,116 @@ Describe 'dispatch protocol primitives' {
         }
     }
 
+    It 'shares a side-effect-free capability profile helper between describe and profile' {
+        $source = Get-Content -LiteralPath $brokerPath -Raw
+        $source | Should -Match "'profile' \{ Invoke-Profile \`$request \}"
+
+        $helperBody = [regex]::Match($source, '(?s)function Get-BrokerCapabilityProfile \{.*?\n\}').Value
+        $helperBody | Should -Not -BeNullOrEmpty
+        $helperBody | Should -Not -Match 'New-ConfigSnapshot'
+        $helperBody | Should -Not -Match '\$drafts\['
+
+        $profileBody = [regex]::Match($source, '(?s)function Invoke-Profile \{.*?\n\}').Value
+        $profileBody | Should -Not -BeNullOrEmpty
+        $profileBody | Should -Match 'Get-BrokerCapabilityProfile'
+        $profileBody | Should -Not -Match 'New-ConfigSnapshot'
+        $profileBody | Should -Not -Match '\$drafts\['
+        $profileBody | Should -Not -Match 'dispatchDraftId\s*='
+        $profileBody | Should -Match "operation = 'capability-profile'"
+        $profileBody | Should -Match 'role = \$profile\.Role'
+
+        $describeBody = [regex]::Match($source, '(?s)function Invoke-Describe \{.*?\n\}').Value
+        $describeBody | Should -Not -BeNullOrEmpty
+        $describeBody | Should -Match 'Get-BrokerCapabilityProfile'
+        $describeBody | Should -Match 'New-ConfigSnapshot'
+        $describeBody | Should -Match '\$drafts\['
+        $describeBody | Should -Match "operation = 'capability-summary'"
+        $describeBody | Should -Match 'role = \$role'
+    }
+
+    It 'keeps the read-only profile operation side-effect-free across repeated calls' {
+        $repositoryRoot = (Resolve-Path "$PSScriptRoot\..").Path
+        $suiteRoot = Join-Path $TestDrive 'broker-profile-integration'
+        $stateRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'watch') `
+            -Kind watch-state -RepositoryRoot $repositoryRoot -Create
+        $durableRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'durable') `
+            -Kind durable-state -RepositoryRoot $repositoryRoot -DisallowedRoots @($stateRoot) -Create
+        $leaseRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'leases') `
+            -Kind lease -RepositoryRoot $repositoryRoot -DisallowedRoots @($stateRoot, $durableRoot) -Create
+        $descriptorPath = Join-Path $stateRoot 'broker.descriptor.v1.json'
+        @{
+            schemaVersion = 1
+            ownerProcessId = $PID
+            stateRoot = $stateRoot
+            durableStateRoot = $durableRoot
+            leaseRoot = $leaseRoot
+            operatorAlias = 'integration-test'
+            roles = @{}
+        } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $descriptorPath -Encoding utf8NoBOM
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($descriptorPath,
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        [void](Assert-AgentTrustedFile -Path $descriptorPath -AllowedRoot $stateRoot `
+            -ExpectedPath $descriptorPath -Private)
+
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = Resolve-AgentPwshPath
+        foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File',
+                $brokerPath, '-DescriptorPath', $descriptorPath)) {
+            [void]$startInfo.ArgumentList.Add($argument)
+        }
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+        try {
+            # Repeated profile requests (simulating a Settings refresh and close/reopen) must never
+            # create the manual-dispatch draft directory -- each is rejected the same way describe()
+            # would be for this unconfigured role, proving the read-only path never reaches
+            # New-ConfigSnapshot regardless of how many times it is called.
+            for ($i = 0; $i -lt 3; $i++) {
+                $profileId = [Guid]::NewGuid().ToString('D')
+                $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{
+                            schemaVersion = 1; requestId = $profileId; operation = 'profile'
+                            role = 'reviewer'; pullRequestId = 1; repositoryKey = 'v1:github:1'
+                        }))
+                $profileResponseTask = $process.StandardOutput.ReadLineAsync()
+                $profileResponseTask.Wait(10000) | Should -BeTrue `
+                    -Because 'the broker must process each repeated profile request while stdin remains open'
+                $profileResponse = $profileResponseTask.Result | ConvertFrom-Json -AsHashtable
+                $profileResponse.requestId | Should -BeExactly $profileId
+                $profileResponse.operation | Should -BeExactly 'rejected'
+                $profileResponse.code | Should -BeExactly 'role-not-allowed'
+                Test-Path (Join-Path $stateRoot 'manual-dispatch') | Should -BeFalse
+            }
+
+            $shutdownId = [Guid]::NewGuid().ToString('D')
+            $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{
+                        schemaVersion = 1; requestId = $shutdownId; operation = 'shutdown'
+                    }))
+            $shutdownResponseTask = $process.StandardOutput.ReadLineAsync()
+            $shutdownResponseTask.Wait(10000) | Should -BeTrue `
+                -Because 'the broker must process the next request while stdin remains open'
+            $shutdownResponse = $shutdownResponseTask.Result | ConvertFrom-Json -AsHashtable
+            $shutdownResponse.requestId | Should -BeExactly $shutdownId
+            $shutdownResponse.operation | Should -BeExactly 'shutdown-complete'
+
+            $process.StandardInput.Close()
+            $process.WaitForExit(15000) | Should -BeTrue
+            $stderr = $process.StandardError.ReadToEnd()
+            $process.ExitCode | Should -Be 0 -Because $stderr
+            Test-Path (Join-Path $stateRoot 'manual-dispatch') | Should -BeFalse
+        }
+        finally {
+            if (-not $process.HasExited) { $process.Kill($true); [void]$process.WaitForExit(5000) }
+            $process.Dispose()
+        }
+    }
+
     It 'cleans guardian files before child registration on Unix' -Skip:$IsWindows {
         $runtimeRoot = Join-Path $TestDrive 'guardian-runtime'
         New-Item -ItemType Directory -Path $runtimeRoot | Out-Null

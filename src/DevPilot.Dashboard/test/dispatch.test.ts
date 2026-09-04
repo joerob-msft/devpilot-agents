@@ -48,7 +48,9 @@ $cancelCount = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
   $r = $line | ConvertFrom-Json
   if ($r.operation -eq 'describe') {
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@('EnableSummaryComment');mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@('EnableFindingComments','EnableSummaryComment','EnableThreadReplies');delegableAvailable=@();provenance=@{EnableFindingComments='operational-default';EnableSummaryComment='operational-default';EnableThreadReplies='operational-default';EnableApprovalVote='operational-default'}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@('EnableSummaryComment');mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@('EnableFindingComments','EnableSummaryComment','EnableThreadReplies');delegableAvailable=@();provenance=@{EnableFindingComments='operational-default';EnableSummaryComment='operational-default';EnableThreadReplies='operational-default';EnableApprovalVote='operational-default'}} | ConvertTo-Json -Compress -Depth 10
+  } elseif ($r.operation -eq 'profile') {
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-profile';role='reviewer';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilities=@('EnableSummaryComment');mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@('EnableFindingComments','EnableSummaryComment','EnableThreadReplies');delegableAvailable=@();provenance=@{EnableFindingComments='operational-default';EnableSummaryComment='operational-default';EnableThreadReplies='operational-default';EnableApprovalVote='operational-default'}} | ConvertTo-Json -Compress -Depth 10
   } elseif ($r.operation -eq 'dispatch') {
     @{schemaVersion=1;requestId=$r.requestId;operation='accepted';dispatchId='22222222-2222-4222-8222-222222222222';repositoryIdentity=@{};pullRequestId=104;role='reviewer';capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);childProcessId=42;eventLogPath=(Join-Path $PSScriptRoot 'event.jsonl')} | ConvertTo-Json -Compress -Depth 10
   } elseif ($r.operation -eq 'cancel') {
@@ -87,6 +89,18 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     );
     assert.equal(summary.provenance.EnableApprovalVote, "operational-default");
     assert.equal(summary.provenance.EnableSummaryComment, "operational-default");
+
+    // Positive broker-authored role test (issue #105): profile() is the Settings TUI's dedicated,
+    // side-effect-free counterpart to describe(). Its response must carry the broker's own role
+    // (never client-stamped) and must never carry dispatch/draft-only fields.
+    const profile = await client.profile("v1:github:9007199254740993", 104, "reviewer");
+    assert.equal(profile.operation, "capability-profile");
+    assert.equal(profile.role, "reviewer");
+    assert.deepEqual(profile.capabilities, ["EnableSummaryComment"]);
+    assert.ok(!("dispatchDraftId" in profile), "profile responses must never carry a dispatchDraftId");
+    assert.ok(!("capabilityPolicyDigest" in profile), "profile responses must never carry a capabilityPolicyDigest");
+    assert.ok(!("prStateFingerprint" in profile), "profile responses must never carry a prStateFingerprint");
+
     const accepted = await client.dispatch(summary, "prompt remains protocol data only");
     assert.equal(accepted.dispatchId, "22222222-2222-4222-8222-222222222222");
     assert.equal(paths.length, 1);
@@ -141,7 +155,7 @@ if ($r.operation -eq 'describe') {
   try {
     // Missing every PR1 additive field entirely (pre-#105 shape).
     const missingFields = await describeWith(String.raw`
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@()} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@()} | ConvertTo-Json -Compress -Depth 10
 `);
     assert.equal(missingFields.rejected, true);
     assert.equal(missingFields.failures.length, 1);
@@ -149,7 +163,7 @@ if ($r.operation -eq 'describe') {
     // Every PR1 field present and well-typed, but delegableAvailable is non-empty -- no delegation
     // policy can exist yet in this release, so the client must treat this as malformed too.
     const nonEmptyDelegable = await describeWith(String.raw`
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@('EnableApprovalVote');provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@('EnableApprovalVote');provenance=@{}} | ConvertTo-Json -Compress -Depth 10
 `);
     assert.equal(nonEmptyDelegable.rejected, true);
     assert.equal(nonEmptyDelegable.failures.length, 1);
@@ -198,14 +212,14 @@ if ($r.operation -eq 'describe') {
     // or buggy broker response could plausibly send, and exactly what UI code's .join() assumes
     // will never happen.
     const nonArrayCapabilities = await describeWith(String.raw`
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities='EnableSummaryComment';mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities='EnableSummaryComment';mandatoryDenies=@('EnableApprovalVote');dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
 `);
     assert.equal(nonArrayCapabilities.rejected, true);
     assert.equal(nonArrayCapabilities.failures.length, 1);
 
     // Legacy `mandatoryDenies` is an array, but one item is not a string.
     const nonStringItem = await describeWith(String.raw`
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@(7);dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@(7);dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
 `);
     assert.equal(nonStringItem.rejected, true);
     assert.equal(nonStringItem.failures.length, 1);
@@ -214,10 +228,102 @@ if ($r.operation -eq 'describe') {
     // item-count limit the parser now enforces uniformly across every capability-name array.
     const oversizedArray = await describeWith(String.raw`
     $items = 1..300 | ForEach-Object { "c$_" }
-    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@();dynamicConstraints=$items;absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
+    @{schemaVersion=1;requestId=$r.requestId;operation='capability-summary';role='reviewer';dispatchDraftId='11111111-1111-4111-8111-111111111111';repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true};prSnapshot=@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='test'};capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);capabilities=@();mandatoryDenies=@();dynamicConstraints=$items;absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} | ConvertTo-Json -Compress -Depth 10
 `);
     assert.equal(oversizedArray.rejected, true);
     assert.equal(oversizedArray.failures.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("client rejects a capability-summary or capability-profile with a missing or mismatched on-wire role", async () => {
+  const root = join(process.cwd(), `.dashboard-dispatch-role-malformed-${process.pid}-${Date.now()}`);
+  await mkdir(root, { recursive: false });
+  const descriptor = join(root, "descriptor.json");
+  const pwsh = resolvePwshPath();
+  await writeFile(descriptor, "{}", "utf8");
+  const validIdentity = "@{schemaVersion=1;provider='GitHub';repositoryId='9007199254740993';organization='contoso';" +
+    "project='';repositoryName='repo';slug='contoso/repo';key='v1:github:9007199254740993';" +
+    "verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true}";
+  const validPrSnapshot = "@{schemaVersion=1;pullRequestId=104;sourceCommit=('a'*40);sourceRef='feature';" +
+    "targetRef='main';active=$true;draft=$false;author='ada';title='test'}";
+
+  async function requestWith(
+    operation: "describe" | "profile",
+    responseOperation: "capability-summary" | "capability-profile",
+    roleAssignment: string,
+  ): Promise<{ failures: string[]; rejected: boolean }> {
+    const draftFields = responseOperation === "capability-summary"
+      ? "dispatchDraftId='11111111-1111-4111-8111-111111111111';capabilityPolicyDigest=('b'*64);prStateFingerprint=('c'*64);"
+      : "";
+    const script = join(root, `fake-broker-${Date.now()}-${Math.random()}.ps1`);
+    await writeFile(script, String.raw`
+param([string]$DescriptorPath)
+$line = [Console]::In.ReadLine()
+$r = $line | ConvertFrom-Json
+if ($r.operation -eq '` + operation + String.raw`') {
+    @{schemaVersion=1;requestId=$r.requestId;operation='` + responseOperation + `';` + roleAssignment + draftFields +
+      `repositoryIdentity=${validIdentity};prSnapshot=${validPrSnapshot};capabilities=@();mandatoryDenies=@();` +
+      `dynamicConstraints=@();absoluteDenies=@();allowedManualCapabilities=@();delegableAvailable=@();provenance=@{}} |` +
+      String.raw` ConvertTo-Json -Compress -Depth 10
+}
+# Exit immediately after the single response (matching the other malformed-field fixtures in this
+# file) -- a looping script that only exits on an explicit shutdown would instead orphan the child
+# process forever whenever the client's own shutdown() short-circuits (e.g. once already closed by
+# a connection-level broker failure), since nothing would ever be left to send it one.
+`, "utf8");
+    const failures: string[] = [];
+    const client = new DispatchClient(
+      { executablePath: pwsh, scriptPath: script, descriptorPath: descriptor },
+      { onBrokerFailure: (failure) => failures.push(failure) },
+    );
+    let rejected = false;
+    try {
+      if (operation === "describe") {
+        await client.describe("v1:github:9007199254740993", 104, "reviewer");
+      } else {
+        await client.profile("v1:github:9007199254740993", 104, "reviewer");
+      }
+    } catch {
+      rejected = true;
+    } finally {
+      await client.shutdown().catch(() => {});
+    }
+    return { failures, rejected };
+  }
+
+  try {
+    // Missing role entirely (pre-#105 shape) on both operations.
+    const summaryMissingRole = await requestWith("describe", "capability-summary", "");
+    assert.equal(summaryMissingRole.rejected, true);
+    const profileMissingRole = await requestWith("profile", "capability-profile", "");
+    assert.equal(profileMissingRole.rejected, true);
+
+    // A well-typed but unknown role value fails the runtime reviewer|review-handler check.
+    const unknownRole = await requestWith("describe", "capability-summary", "role='auditor';");
+    assert.equal(unknownRole.rejected, true);
+
+    // A valid, known role that simply does not match what was requested must still be rejected --
+    // the client never trusts an on-wire role pairing the request didn't itself produce, and this
+    // is the only place that guarantee is enforced now that the broker's role is authoritative.
+    const mismatchedSummaryRole = await requestWith("describe", "capability-summary", "role='review-handler';");
+    assert.equal(mismatchedSummaryRole.rejected, true);
+    const mismatchedProfileRole = await requestWith("profile", "capability-profile", "role='review-handler';");
+    assert.equal(mismatchedProfileRole.rejected, true);
+
+    // Missing/unknown role fails runtime parsing itself (roleField), which routes through the
+    // client's connection-level broker-failure reporting exactly like the other malformed-field
+    // tests in this file.
+    for (const result of [summaryMissingRole, profileMissingRole, unknownRole]) {
+      assert.equal(result.failures.length, 1);
+    }
+    // A valid-but-mismatched role parses successfully (it IS a known role): describe()/profile()'s
+    // own request/response pairing check rejects that single call regardless of whether the fake
+    // broker's natural process exit also happens to race a connection-level broker-failure report,
+    // so only `rejected` (not `failures.length`) is a meaningful, deterministic assertion here.
+    assert.equal(mismatchedSummaryRole.rejected, true);
+    assert.equal(mismatchedProfileRole.rejected, true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

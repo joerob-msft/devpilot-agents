@@ -262,7 +262,13 @@ function New-ConfigSnapshot {
     }
 }
 
-function Invoke-Describe {
+function Get-BrokerCapabilityProfile {
+    # Shared, side-effect-free profile builder for describe (capability-summary) and the read-only
+    # profile operation (capability-profile): role/PR validation, provider reads, dynamic
+    # constraints, and the capability ceiling. Never allocates a dispatchDraftId, config snapshot,
+    # RuntimeRoot, or $drafts entry -- callers decide independently whether to allocate one
+    # (Invoke-Describe only). On failure, closes the provider session itself before rethrowing;
+    # on success, the caller owns closing Provider.Session once it is done with it.
     param([hashtable]$Request)
     Remove-ExpiredDrafts
     $role = [string]$Request.role
@@ -286,7 +292,6 @@ function Invoke-Describe {
                 $constraints += 'delivery-pending'
             }
         }
-        $draftId = [Guid]::NewGuid().ToString('D')
         $capabilities = @($roleDescriptor.capabilities | Sort-Object -Unique)
         $mandatoryDenies = @($roleDescriptor.mandatoryDenies | Sort-Object -Unique)
         $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $role
@@ -300,32 +305,76 @@ function Invoke-Describe {
         foreach ($name in @($allowedManualCapabilities + $mandatoryDenies + $absoluteDenies | Sort-Object -Unique)) {
             $provenance[$name] = 'operational-default'
         }
+    }
+    catch {
+        if ($provider.Session) { Close-AgentMcpSession $provider.Session }
+        throw
+    }
+    return @{
+        Role = $role; RoleDescriptor = $roleDescriptor; Provider = $provider; PullRequestId = $prId
+        Identity = $identity; Pr = $pr; Constraints = $constraints
+        Capabilities = $capabilities; MandatoryDenies = $mandatoryDenies
+        AbsoluteDenies = $absoluteDenies; AllowedManualCapabilities = $allowedManualCapabilities
+        DelegableAvailable = $delegableAvailable; Provenance = $provenance
+    }
+}
+
+function Invoke-Describe {
+    param([hashtable]$Request)
+    $profile = Get-BrokerCapabilityProfile $Request
+    $role = $profile.Role
+    $roleDescriptor = $profile.RoleDescriptor
+    $provider = $profile.Provider
+    try {
+        $draftId = [Guid]::NewGuid().ToString('D')
         $snapshot = New-ConfigSnapshot $roleDescriptor $provider $draftId
         $policy = [ordered]@{
-            schemaVersion = 1; repositoryIdentity = $identity; role = $role
-            capabilities = $capabilities; mandatoryDenies = $mandatoryDenies
+            schemaVersion = 1; repositoryIdentity = $profile.Identity; role = $role
+            capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies
             configSnapshotSha256 = $snapshot.SnapshotSha256
         }
         $policyDigest = Get-AgentCanonicalDigest $policy
         $prFingerprint = Get-AgentCanonicalDigest ([ordered]@{
-                schemaVersion = 1; repositoryKey = $identity.key; pullRequestId = $prId
-                sourceCommit = $pr.sourceCommit; sourceRef = $pr.sourceRef; targetRef = $pr.targetRef
-                active = $pr.active; draft = $pr.draft; author = $pr.author
+                schemaVersion = 1; repositoryKey = $profile.Identity.key; pullRequestId = $profile.PullRequestId
+                sourceCommit = $profile.Pr.sourceCommit; sourceRef = $profile.Pr.sourceRef; targetRef = $profile.Pr.targetRef
+                active = $profile.Pr.active; draft = $profile.Pr.draft; author = $profile.Pr.author
             })
         $drafts[$draftId] = @{
-            CreatedAt = [DateTime]::UtcNow; Consumed = $false; Role = $role; PullRequestId = $prId
-            RepositoryIdentity = $identity; PrSnapshot = $pr; Policy = $policy
+            CreatedAt = [DateTime]::UtcNow; Consumed = $false; Role = $role; PullRequestId = $profile.PullRequestId
+            RepositoryIdentity = $profile.Identity; PrSnapshot = $profile.Pr; Policy = $policy
             PolicyDigest = $policyDigest; PrFingerprint = $prFingerprint
             Snapshot = $snapshot; RoleDescriptor = $roleDescriptor
             PromptGuard = $null; Guardian = $null; GuardianToken = $null
         }
         Write-DispatchProtocolMessage @{
             schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'capability-summary'
-            dispatchDraftId = $draftId; repositoryIdentity = $identity; prSnapshot = $pr
+            dispatchDraftId = $draftId; role = $role; repositoryIdentity = $profile.Identity; prSnapshot = $profile.Pr
             capabilityPolicyDigest = $policyDigest; prStateFingerprint = $prFingerprint
-            capabilities = $capabilities; mandatoryDenies = $mandatoryDenies; dynamicConstraints = $constraints
-            absoluteDenies = $absoluteDenies; allowedManualCapabilities = $allowedManualCapabilities
-            delegableAvailable = $delegableAvailable; provenance = $provenance
+            capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies; dynamicConstraints = $profile.Constraints
+            absoluteDenies = $profile.AbsoluteDenies; allowedManualCapabilities = $profile.AllowedManualCapabilities
+            delegableAvailable = $profile.DelegableAvailable; provenance = $profile.Provenance
+        }
+    }
+    finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
+}
+
+function Invoke-Profile {
+    # Read-only effective-capability-profile inspection (PR1): the Settings TUI's dedicated broker
+    # RPC. Shares Get-BrokerCapabilityProfile with Invoke-Describe for the common role/repository/PR
+    # reads and capability ceiling, but never allocates a dispatchDraftId, config snapshot,
+    # RuntimeRoot, or $drafts entry -- repeated or overlapping calls (refresh, close/reopen) leave
+    # no broker-side residue. Omits dispatchDraftId/capabilityPolicyDigest/prStateFingerprint
+    # entirely: none is meaningful without a config snapshot to bind it to.
+    param([hashtable]$Request)
+    $profile = Get-BrokerCapabilityProfile $Request
+    $provider = $profile.Provider
+    try {
+        Write-DispatchProtocolMessage @{
+            schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'capability-profile'
+            role = $profile.Role; repositoryIdentity = $profile.Identity; prSnapshot = $profile.Pr
+            capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies; dynamicConstraints = $profile.Constraints
+            absoluteDenies = $profile.AbsoluteDenies; allowedManualCapabilities = $profile.AllowedManualCapabilities
+            delegableAvailable = $profile.DelegableAvailable; provenance = $profile.Provenance
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
@@ -747,6 +796,7 @@ try {
                 -not $requestIds.Add($requestId)) { throw '[invalid-request] requestId is malformed or duplicated.' }
             switch ([string]$request.operation) {
                 'describe' { Invoke-Describe $request }
+                'profile' { Invoke-Profile $request }
                 'dispatch' { Invoke-Dispatch $request }
                 'cancel' { Stop-BrokerChild ([string]$request.dispatchId) $requestId }
                 'shutdown' {

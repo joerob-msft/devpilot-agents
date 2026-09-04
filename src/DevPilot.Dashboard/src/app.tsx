@@ -20,6 +20,7 @@ import { PullRequestHistoryProjection, type PullRequestHistoryEntry } from "./hi
 import type { EventTailer } from "./tailer.js";
 import {
   BrokerRejectionError,
+  type CapabilityProfile,
   type CapabilitySummary,
   type DispatchAccepted,
   type DispatchBroker,
@@ -645,22 +646,26 @@ export function App(props: AppProps) {
   const [acceptedDispatch, setAcceptedDispatch] = createSignal<DispatchAccepted | null>(null);
   const [manualStatus, setManualStatus] = createSignal("");
   const [settingsRole, setSettingsRole] = createSignal<AgentRole>("reviewer");
-  const [settingsProfile, setSettingsProfile] = createSignal<CapabilitySummary | null>(null);
+  const [settingsProfile, setSettingsProfile] = createSignal<CapabilityProfile | null>(null);
   const [settingsStatus, setSettingsStatus] = createSignal("");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let localBrokerShutdown: Promise<void> | undefined;
   // Settings refresh/toggle race guard: every refreshSettingsProfile() call is stamped with a
   // generation token. A response is only applied if its token still matches the latest one, so a
-  // slow response from a superseded request (e.g. an earlier role) can never land after a newer
-  // one. settingsRefreshPending is a one-in-flight gate -- Tab/r are ignored while a describe is
-  // outstanding so autorepeat cannot pile up broker-side drafts. Closing Settings advances the
-  // generation and clears the gate so a stale in-flight response is discarded and the next open is
-  // never blocked by a request the UI no longer cares about.
+  // slow response from a superseded request (e.g. an earlier role, or a request outstanding when
+  // Settings was closed and reopened) can never land after a newer one. settingsRefreshPending is a
+  // one-in-flight gate so Tab/r are ignored while a profile request is outstanding. Both guards are
+  // defense-in-depth for UI correctness now, not resource bounding: the broker's `profile` RPC
+  // (unlike describe(), used only by manual dispatch) is side-effect-free -- it never allocates a
+  // dispatchDraftId, config snapshot, or $drafts entry -- so overlapping profile reads from repeated
+  // refreshes or close/reopen are safe and accumulate no broker-side residue; a stale/superseded
+  // response must still never be applied, which is what these guards continue to protect against.
   let settingsGeneration = 0;
   let settingsRefreshPending = false;
   // Renders only when the resolved profile's own role still matches the currently displayed role
   // label, independent of the request-token guard above -- a second, cheap line of defense so a
-  // mislabeled profile can never reach the screen even if the guard above is ever weakened.
+  // mislabeled profile can never reach the screen even if the guard above is ever weakened (e.g. a
+  // response from a request outstanding when Settings was closed and reopened under a new role).
   const settingsDisplayProfile = createMemo(() => {
     const profile = settingsProfile();
     return profile && profile.role === settingsRole() ? profile : null;
@@ -821,21 +826,17 @@ export function App(props: AppProps) {
     }
   }
 
-  // Read-only effective-profile settings: reuses the same trusted describe() RPC the manual
-  // dispatch prompt uses, since that is the only broker call that returns a resolved profile
-  // (PR1 adds no new RPC). Settings never issues a dispatch/mutating request itself, but describe()
-  // is NOT side-effect free on the broker: it allocates a broker-side draft (a config snapshot
-  // written under the broker's state root) that is only released when consumed by a real dispatch
-  // or when it expires (broker-side DraftLifetimeSeconds). The protocol has no operation to
-  // explicitly cancel an unconsumed draft, so this gates itself to one in-flight request (see
-  // settingsRefreshPending) and ignores Tab/r while a request is outstanding, bounding how many
-  // Settings-only drafts autorepeat can create; the rest is left to broker-side expiry. A running
-  // agent's own profile is immutable and is never reflected here.
+  // Read-only effective-profile settings: uses the broker's dedicated `profile` RPC (issue #105),
+  // not the manual dispatch prompt's describe(). Unlike describe(), profile() is side-effect-free
+  // on the broker -- it never allocates a dispatchDraftId, config snapshot, or $drafts entry -- so
+  // repeated refreshes and close/reopen concurrency can never accumulate broker-side draft residue.
+  // A running agent's own profile is immutable and is never reflected here.
   //
   // targetRole is always the caller's freshly-computed role rather than a read of the
   // settingsRole() signal, and every response is stamped with (and checked against) a generation
-  // token plus its own echoed role -- see the settingsGeneration/settingsDisplayProfile comment
-  // above -- so an overlapping or superseded describe() can never render under the wrong label.
+  // token plus its own broker-authored role -- see the settingsGeneration/settingsDisplayProfile
+  // comment above -- so an overlapping or superseded profile() response can never render under the
+  // wrong label.
   async function refreshSettingsProfile(targetRole: AgentRole): Promise<void> {
     if (settingsRefreshPending) return;
     const entry = historyCurrent();
@@ -855,14 +856,8 @@ export function App(props: AppProps) {
     settingsRefreshPending = true;
     setSettingsStatus("Resolving effective profile for the next manual dispatch...");
     try {
-      const profile = await props.broker.describe(entry.repositoryIdentity.key, entry.pullRequestId, targetRole);
+      const profile = await props.broker.profile(entry.repositoryIdentity.key, entry.pullRequestId, targetRole);
       if (requestId !== settingsGeneration) return; // superseded: Settings closed/reopened meanwhile
-      if (profile.role !== targetRole) {
-        // Self-verifying: never trust a role label pairing the request didn't itself produce.
-        setSettingsProfile(null);
-        setSettingsStatus("Unavailable: broker returned a profile for an unexpected role.");
-        return;
-      }
       setSettingsProfile(profile);
       setSettingsStatus("");
     } catch (error) {
@@ -1466,7 +1461,7 @@ export function App(props: AppProps) {
               <text height={1} fg={COLORS.warning}>{line(settingsStatus(), 170)}</text>
             </Show>
             <Show when={settingsDisplayProfile()}>
-              {(profile: () => CapabilitySummary) => (
+              {(profile: () => CapabilityProfile) => (
                 <>
                   <text height={1} fg={COLORS.accent}>{profile().repositoryIdentity.slug} / PR #{profile().prSnapshot.pullRequestId}</text>
                   <text height={1} fg={COLORS.ok}>Allowed manual ceiling: {line(profile().allowedManualCapabilities.join(", ") || "none", 110)}</text>
