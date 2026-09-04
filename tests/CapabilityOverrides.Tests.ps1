@@ -891,7 +891,7 @@ Describe 'PR3 capability-override writer and kill switch' {
         { Enable-AgentCapabilityOverrideKillSwitch -RepositoryRoot $roots.RepoRoot } | Should -Throw '*kill-switch-invalid*'
     }
 
-    It 'a sentinel whose TTL delta is too short (<60s) or too long (>86400s), or whose expiresAtUtc is past the year-2200 ceiling, is malformed' {
+    It 'a sentinel whose TTL delta is under 60 seconds or over 86400 seconds, or whose expiresAtUtc is past the year-2200 ceiling, is malformed' {
         $roots = New-TestRoots
         $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
         $disallowed = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot), (Get-AgentDefaultCapabilityOverrideRoot))
