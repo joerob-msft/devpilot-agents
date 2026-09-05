@@ -105,6 +105,262 @@ function fixtureLines(): string {
   ].join("\n") + "\n";
 }
 
+function reviewerWideningBrokerScript(): string {
+  return resolve("test\\fixtures\\reviewer-widening-broker.ps1");
+}
+/*
+param([string]$DescriptorPath)
+$descriptor = Get-Content -Raw -Path $DescriptorPath | ConvertFrom-Json
+$requestLogPath = $descriptor.requestLogPath
+$dispatchEventLogPath = $descriptor.dispatchEventLogPath
+if ($dispatchEventLogPath) {
+  New-Item -ItemType File -Force -Path $dispatchEventLogPath | Out-Null
+}
+$repositoryIdentity = @{
+  schemaVersion = 1
+  provider = 'GitHub'
+  repositoryId = '10400000000000001'
+  organization = 'devpilot'
+  project = ''
+  repositoryName = 'operations-dashboard'
+  slug = 'devpilot/operations-dashboard'
+  key = 'v1:github:10400000000000001'
+  verifiedAtUtc = '2026-09-03T15:00:00Z'
+  verified = $true
+  dispatchEligible = $true
+}
+$prSnapshot = @{
+  schemaVersion = 1
+  pullRequestId = 104
+  sourceCommit = ('a' * 40)
+  sourceRef = 'joerob/issue-105-pr2'
+  targetRef = 'main'
+  active = $true
+  draft = $false
+  author = 'Ada'
+  title = 'ConPTY widening flow'
+}
+$baseCapabilities = @('EnableSummaryComment', 'EnableThreadReplies', 'EnableFindingComments')
+$baseMandatoryDenies = @('EnableApprovalVote')
+$delegableAvailable = @('EnableApprovalVote')
+$absoluteDenies = @('EnableAutoComplete')
+$allowedManualCapabilities = @('EnableSummaryComment', 'EnableThreadReplies', 'EnableFindingComments')
+$baselineDigest = ('1' * 64)
+$widenedDigest = ('2' * 64)
+$prStateFingerprint = ('3' * 64)
+$dispatchDraftId = '11111111-1111-1111-1111-111111111111'
+$dispatchId = '22222222-2222-2222-2222-222222222222'
+$previewChallenge = ('a' * 48)
+$summaryChallenge = ('b' * 48)
+$previewExpiresAtUtc = [DateTime]::UtcNow.AddMinutes(10).ToString('o')
+$summaryExpiresAtUtc = [DateTime]::UtcNow.AddMinutes(11).ToString('o')
+$grantExpiresAtUtc = [DateTimeOffset]::UtcNow.AddHours(8).ToUnixTimeSeconds()
+$previewDiff = @{
+  addedCapabilities = @('EnableApprovalVote')
+  removedDenies = @('EnableApprovalVote')
+  pairedCapability = 'EnableFindingComments'
+  pairedCapabilityActive = $true
+}
+$wideningStage = $null
+$wideningGeneration = 0
+$dispatchActive = $false
+function Append-Log([object]$request) {
+  [System.IO.File]::AppendAllText($requestLogPath, (($request | ConvertTo-Json -Compress -Depth 10) + [Environment]::NewLine))
+}
+function Provenance([bool]$widened) {
+  if ($widened) {
+    return [ordered]@{
+      EnableFindingComments = 'repo-worktree'
+      EnableSummaryComment = 'machine'
+      EnableThreadReplies = 'user'
+      EnableApprovalVote = 'repo-worktree'
+    }
+  }
+  return [ordered]@{
+    EnableFindingComments = 'repo-worktree'
+    EnableSummaryComment = 'machine'
+    EnableThreadReplies = 'user'
+    EnableApprovalVote = 'operational-default'
+  }
+}
+function Current-Effect([bool]$widened) {
+  return @{
+    capabilities = if ($widened) { @('EnableSummaryComment', 'EnableThreadReplies', 'EnableFindingComments', 'EnableApprovalVote') } else { @($baseCapabilities) }
+    mandatoryDenies = if ($widened) { @() } else { @($baseMandatoryDenies) }
+    provenance = Provenance $widened
+  }
+}
+function Describe-Response([object]$request) {
+  $effect = Current-Effect $false
+  return @{
+    schemaVersion = 1
+    requestId = $request.requestId
+    operation = 'capability-summary'
+    role = $request.role
+    dispatchDraftId = $dispatchDraftId
+    repositoryIdentity = $repositoryIdentity
+    prSnapshot = $prSnapshot
+    capabilityPolicyDigest = $baselineDigest
+    prStateFingerprint = $prStateFingerprint
+    capabilities = $effect.capabilities
+    mandatoryDenies = $effect.mandatoryDenies
+    dynamicConstraints = @()
+    absoluteDenies = @($absoluteDenies)
+    allowedManualCapabilities = @($allowedManualCapabilities)
+    delegableAvailable = @($delegableAvailable)
+    provenance = $effect.provenance
+    killSwitchActive = $false
+    killSwitchExpiresAtUtc = $null
+  } | ConvertTo-Json -Compress -Depth 10
+}
+function Describe-Widening([object]$request) {
+  if ($request.capability -ne 'EnableApprovalVote') { throw 'unexpected widening capability' }
+  if ($script:wideningStage -eq 'minted') { throw 'widening already minted' }
+  $script:wideningStage = 'previewed'
+  $script:wideningGeneration = 1
+  return @{
+    schemaVersion = 1
+    requestId = $request.requestId
+    operation = 'widening-preview'
+    state = 'previewed'
+    dispatchDraftId = $dispatchDraftId
+    capability = $request.capability
+    challenge = $previewChallenge
+    effectiveDiff = $previewDiff
+    expiresAtUtc = $previewExpiresAtUtc
+    generation = $script:wideningGeneration
+  } | ConvertTo-Json -Compress -Depth 10
+}
+function Confirm-Widening-Preview([object]$request) {
+  if ($script:wideningStage -ne 'previewed' -or $request.capability -ne 'EnableApprovalVote' -or $request.challenge -ne $previewChallenge) {
+    throw 'unexpected widening preview confirmation'
+  }
+  $script:wideningStage = 'summary'
+  $script:wideningGeneration++
+  return @{
+    schemaVersion = 1
+    requestId = $request.requestId
+    operation = 'widening-summary'
+    state = 'awaiting-final-confirmation'
+    dispatchDraftId = $dispatchDraftId
+    capability = $request.capability
+    challenge = $summaryChallenge
+    effectiveDiff = $previewDiff
+    expiresAtUtc = $summaryExpiresAtUtc
+    generation = $script:wideningGeneration
+  } | ConvertTo-Json -Compress -Depth 10
+}
+function Confirm-Widening-Mint([object]$request) {
+  if ($script:wideningStage -ne 'summary' -or $request.capability -ne 'EnableApprovalVote' -or $request.challenge -ne $summaryChallenge) {
+    throw 'unexpected widening mint confirmation'
+  }
+  $script:wideningStage = 'minted'
+  $script:wideningGeneration++
+  $effect = Current-Effect $true
+  return @{
+    schemaVersion = 1
+    requestId = $request.requestId
+    operation = 'widening-minted'
+    state = 'minted'
+    dispatchDraftId = $dispatchDraftId
+    capability = $request.capability
+    capabilities = $effect.capabilities
+    mandatoryDenies = $effect.mandatoryDenies
+    capabilityPolicyDigest = $widenedDigest
+    effectiveDiff = $previewDiff
+    grantExpiresAtUtc = $grantExpiresAtUtc
+    generation = $script:wideningGeneration
+  } | ConvertTo-Json -Compress -Depth 10
+}
+function Cancel-Widening([object]$request) {
+  if ($script:wideningStage -notin @('previewed', 'summary', 'minted')) {
+    throw 'unexpected widening cancellation'
+  }
+  if ($request.generation -ne $script:wideningGeneration) {
+    throw 'unexpected widening generation'
+  }
+  $script:wideningStage = $null
+  $script:wideningGeneration++
+  $effect = Current-Effect $false
+  return @{
+    schemaVersion = 1
+    requestId = $request.requestId
+    operation = 'widening-cancelled'
+    state = 'cancelled'
+    dispatchDraftId = $dispatchDraftId
+    capabilities = $effect.capabilities
+    mandatoryDenies = $effect.mandatoryDenies
+    capabilityPolicyDigest = $baselineDigest
+    delegableAvailable = @($delegableAvailable)
+    generation = $script:wideningGeneration
+  } | ConvertTo-Json -Compress -Depth 10
+}
+function Dispatch-Response([object]$request) {
+  if ($script:wideningStage -ne 'minted') { throw 'widening grant not minted' }
+  if ($request.dispatchDraftId -ne $dispatchDraftId -or $request.capabilityPolicyDigest -ne $widenedDigest -or $request.prStateFingerprint -ne $prStateFingerprint) {
+    throw 'dispatch bindings do not match the widened draft'
+  }
+  $script:dispatchActive = $true
+  return @{
+    schemaVersion = 1
+    requestId = $request.requestId
+    operation = 'accepted'
+    dispatchId = $dispatchId
+    repositoryIdentity = $repositoryIdentity
+    pullRequestId = 104
+    role = $request.role
+    capabilityPolicyDigest = $widenedDigest
+    prStateFingerprint = $prStateFingerprint
+    childProcessId = 4242
+    eventLogPath = $dispatchEventLogPath
+  } | ConvertTo-Json -Compress -Depth 10
+}
+function Cancel-Dispatch([object]$request) {
+  if (-not $script:dispatchActive) { throw 'dispatch is not active' }
+  $script:dispatchActive = $false
+  return @{
+    schemaVersion = 1
+    requestId = $request.requestId
+    operation = 'cancelled'
+    dispatchId = $request.dispatchId
+    result = 'cooperatively'
+    handleReleaseObserved = $true
+  } | ConvertTo-Json -Compress -Depth 10
+}
+$accepting = $true
+while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
+  $request = $line | ConvertFrom-Json
+  Append-Log $request
+  switch ($request.operation) {
+    'describe' { Write-Output (Describe-Response $request) }
+    'describe-widening' { Write-Output (Describe-Widening $request) }
+    'confirm-widening-preview' { Write-Output (Confirm-Widening-Preview $request) }
+    'confirm-widening-mint' { Write-Output (Confirm-Widening-Mint $request) }
+    'cancel-widening' { Write-Output (Cancel-Widening $request) }
+    'dispatch' { Write-Output (Dispatch-Response $request) }
+    'cancel' { Write-Output (Cancel-Dispatch $request) }
+    'shutdown' {
+      $accepting = $false
+      Write-Output (@{
+        schemaVersion = 1
+        requestId = $request.requestId
+        operation = 'shutdown-complete'
+      } | ConvertTo-Json -Compress -Depth 10)
+    }
+    default { throw "unexpected operation $($request.operation)" }
+  }
+}
+*/
+
+async function readRequestOperations(path: string): Promise<string[]> {
+  const content = await readFile(path, "utf8");
+  return content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => (JSON.parse(line) as Record<string, unknown>).operation as string);
+}
+
 function environment(): Record<string, string> {
   return Object.fromEntries(
     Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
@@ -648,6 +904,355 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
     assert.equal(killSwitchRequests.length, 2);
     assert.equal(killSwitchRequests[0]?.enabled, true);
     assert.equal(killSwitchRequests[1]?.enabled, false);
+  } finally {
+    try {
+      if (terminal && !exited) {
+        terminal.kill();
+        await waitForExit("dashboard did not terminate after cleanup kill");
+      }
+      if (terminal) {
+        assert.ok(exited, "node-pty must report child termination before cleanup completes");
+        disposeConptyOutputWorker(terminal);
+      }
+      assert.doesNotMatch(
+        visibleOutput(),
+        /AttachConsole failed|conpty_console_list_agent/i,
+        failureContext("node-pty helper failure was written to the terminal").message,
+      );
+    } finally {
+      dataSubscription?.dispose();
+      exitSubscription?.dispose();
+      await rm(stateRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("built dashboard exercises reviewer widening through real ConPTY and cancels dispatch cleanly", {
+  skip: process.platform === "win32" ? false : "ConPTY integration is Windows-only",
+  timeout: 120_000,
+}, async () => {
+  const dashboardRoot = resolve(".");
+  const stateRoot = await mkdtemp(join(tmpdir(), "devpilot-dashboard-widening-pty-"));
+  assert.ok(isAbsolute(stateRoot));
+  assert.notEqual(resolve(stateRoot), dashboardRoot);
+
+  const eventDirectory = join(stateRoot, "logs", "events", "reviewer");
+  const eventPath = join(eventDirectory, "fixture.jsonl");
+  const requestLogPath = join(stateRoot, "broker-requests.jsonl");
+  const dispatchEventLogPath = join(stateRoot, "broker-child-events.jsonl");
+  const brokerScriptPath = join(stateRoot, "fake-broker.ps1");
+  const brokerDescriptorPath = join(stateRoot, "broker-descriptor.json");
+  const bunPath = resolve(dashboardRoot, "node_modules", "bun", "bin", "bun.exe");
+  const entryPath = resolve(dashboardRoot, "dist", "src", "index.js");
+  const powerShellPath = resolvePowerShellPath();
+  let terminal: IPty | undefined;
+  let dataSubscription: IDisposable | undefined;
+  let exitSubscription: IDisposable | undefined;
+  let terminalColumns = 130;
+  let terminalRows = 36;
+  let capture = "";
+  let exited: { exitCode: number; signal?: number } | undefined;
+  let resolveExit: ((exit: { exitCode: number; signal?: number }) => void) | undefined;
+  const exitPromise = new Promise<{ exitCode: number; signal?: number }>((resolvePromise) => {
+    resolveExit = resolvePromise;
+  });
+
+  function visibleOutput(): string {
+    return stripVTControlCharacters(capture);
+  }
+
+  function failureContext(message: string): Error {
+    return new Error(`${message}\n--- captured terminal output ---\n${visibleOutput().slice(-8_000)}`);
+  }
+
+  async function waitForVisible(expected: string, start = 0): Promise<void> {
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline) {
+      if (visibleOutput().slice(start).includes(expected)) return;
+      if (exited) throw failureContext(`dashboard exited before rendering ${JSON.stringify(expected)}`);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+    throw failureContext(`timed out waiting for ${JSON.stringify(expected)}`);
+  }
+
+  async function writeAndWait(bytes: string, expected: string): Promise<void> {
+    assert.ok(terminal, "terminal must be running");
+    const start = visibleOutput().length;
+    terminal.write(bytes);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
+    terminal.resize(terminalColumns, terminalRows - 1);
+    terminal.resize(terminalColumns, terminalRows);
+    await waitForVisible(expected, start);
+  }
+
+  async function waitForExit(message: string): Promise<{ exitCode: number; signal?: number }> {
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        exitPromise,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(failureContext(message)), 15_000);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  try {
+    await access(bunPath);
+    await access(entryPath);
+    await access(powerShellPath);
+    await mkdir(eventDirectory, { recursive: true });
+    await writeFile(eventPath, fixtureLines(), "utf8");
+    await writeFile(dispatchEventLogPath, "", "utf8");
+    await writeFile(
+      brokerDescriptorPath,
+      JSON.stringify({ requestLogPath, dispatchEventLogPath }, null, 2),
+      "utf8",
+    );
+    await writeFile(brokerScriptPath, await readFile(reviewerWideningBrokerScript(), "utf8"), "utf8");
+
+    terminal = spawn(bunPath, [
+      "--conditions=browser",
+      entryPath,
+      "--state-dir", stateRoot,
+      "--broker-executable", powerShellPath,
+      "--broker-script", brokerScriptPath,
+      "--broker-descriptor", brokerDescriptorPath,
+    ], {
+      name: "xterm-256color",
+      cols: 130,
+      rows: 36,
+      cwd: dashboardRoot,
+      env: environment(),
+    });
+    dataSubscription = terminal.onData((data) => {
+      capture = (capture + data).slice(-1_000_000);
+    });
+    exitSubscription = terminal.onExit((eventExit) => {
+      exited = eventExit;
+      resolveExit?.(eventExit);
+    });
+
+    await waitForVisible("DEVPILOT OPERATIONS");
+    await waitForVisible("TRUSTED MANUAL ENABLED");
+    await writeAndWait("f", "View filter changed to History");
+    await waitForVisible("operations-dashboard PR #104");
+    await writeAndWait("m", "Ctrl+D describe");
+    await writeAndWait("\x04", "Press w to request EnableApprovalVote widening (draft-bound, single-use).");
+    await writeAndWait("w", "Widening preview: EnableApprovalVote");
+    await waitForVisible("Paired requirement: EnableFindingComments must already be active (confirmed active).");
+    await waitForVisible("Would add: EnableApprovalVote");
+    await waitForVisible("Would remove from denies: EnableApprovalVote");
+    await writeAndWait("c", "Final widening blast radius: EnableApprovalVote");
+    await waitForVisible("Single-use grant; expires");
+    await waitForVisible("FINAL WIDENING CONFIRMATION: press y to mint this grant; Esc cancels.");
+    await writeAndWait("y", "Widening grant minted and active for this draft; continue with d then y to dispatch, or Esc to close and relinquish it.");
+
+    const preDispatchOperations = await readRequestOperations(requestLogPath);
+    assert.deepEqual(preDispatchOperations, [
+      "describe",
+      "describe-widening",
+      "confirm-widening-preview",
+      "confirm-widening-mint",
+    ]);
+    const preDispatchRequests = (await readFile(requestLogPath, "utf8"))
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(preDispatchRequests[0]?.repositoryKey, "v1:github:10400000000000001");
+    assert.equal(preDispatchRequests[1]?.capability, "EnableApprovalVote");
+    assert.equal(preDispatchRequests[2]?.challenge, "a".repeat(48));
+    assert.equal(preDispatchRequests[3]?.challenge, "b".repeat(48));
+
+    await writeAndWait("d", "FINAL CONFIRMATION: press y to dispatch this exact snapshot; Esc cancels.");
+    await writeAndWait("y", "Accepted dispatch");
+    await waitForVisible("Dispatch accepted; waiting for correlated v3 child events.");
+    await waitForVisible("Correlated v3 events:");
+    await writeAndWait("c", "Cancellation completed: cooperatively.");
+    await writeAndWait("\r", "PR HISTORY");
+
+    terminal.write("q");
+    const result = await waitForExit("dashboard hung after quitting widened flow");
+    assert.equal(result.exitCode, 0, failureContext("dashboard did not exit cleanly").message);
+    assert.equal(result.signal ?? 0, 0, failureContext("dashboard exited due to a signal").message);
+
+    const parsedRequests = await readRequestOperations(requestLogPath);
+    assert.deepEqual(parsedRequests, [
+      "describe",
+      "describe-widening",
+      "confirm-widening-preview",
+      "confirm-widening-mint",
+      "dispatch",
+      "cancel",
+      "shutdown",
+    ]);
+  } finally {
+    try {
+      if (terminal && !exited) {
+        terminal.kill();
+        await waitForExit("dashboard did not terminate after cleanup kill");
+      }
+      if (terminal) {
+        assert.ok(exited, "node-pty must report child termination before cleanup completes");
+        disposeConptyOutputWorker(terminal);
+      }
+      assert.doesNotMatch(
+        visibleOutput(),
+        /AttachConsole failed|conpty_console_list_agent/i,
+        failureContext("node-pty helper failure was written to the terminal").message,
+      );
+    } finally {
+      dataSubscription?.dispose();
+      exitSubscription?.dispose();
+      await rm(stateRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("built dashboard cancels reviewer widening with Esc and leaves no broker residue", {
+  skip: process.platform === "win32" ? false : "ConPTY integration is Windows-only",
+  timeout: 90_000,
+}, async () => {
+  const dashboardRoot = resolve(".");
+  const stateRoot = await mkdtemp(join(tmpdir(), "devpilot-dashboard-widening-cancel-"));
+  assert.ok(isAbsolute(stateRoot));
+  assert.notEqual(resolve(stateRoot), dashboardRoot);
+
+  const eventDirectory = join(stateRoot, "logs", "events", "reviewer");
+  const eventPath = join(eventDirectory, "fixture.jsonl");
+  const requestLogPath = join(stateRoot, "broker-requests.jsonl");
+  const dispatchEventLogPath = join(stateRoot, "broker-child-events.jsonl");
+  const brokerScriptPath = join(stateRoot, "fake-broker.ps1");
+  const brokerDescriptorPath = join(stateRoot, "broker-descriptor.json");
+  const bunPath = resolve(dashboardRoot, "node_modules", "bun", "bin", "bun.exe");
+  const entryPath = resolve(dashboardRoot, "dist", "src", "index.js");
+  const powerShellPath = resolvePowerShellPath();
+  let terminal: IPty | undefined;
+  let dataSubscription: IDisposable | undefined;
+  let exitSubscription: IDisposable | undefined;
+  let terminalColumns = 130;
+  let terminalRows = 36;
+  let capture = "";
+  let exited: { exitCode: number; signal?: number } | undefined;
+  let resolveExit: ((exit: { exitCode: number; signal?: number }) => void) | undefined;
+  const exitPromise = new Promise<{ exitCode: number; signal?: number }>((resolvePromise) => {
+    resolveExit = resolvePromise;
+  });
+
+  function visibleOutput(): string {
+    return stripVTControlCharacters(capture);
+  }
+
+  function failureContext(message: string): Error {
+    return new Error(`${message}\n--- captured terminal output ---\n${visibleOutput().slice(-8_000)}`);
+  }
+
+  async function waitForVisible(expected: string, start = 0): Promise<void> {
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline) {
+      if (visibleOutput().slice(start).includes(expected)) return;
+      if (exited) throw failureContext(`dashboard exited before rendering ${JSON.stringify(expected)}`);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+    throw failureContext(`timed out waiting for ${JSON.stringify(expected)}`);
+  }
+
+  async function writeAndWait(bytes: string, expected: string): Promise<void> {
+    assert.ok(terminal, "terminal must be running");
+    const start = visibleOutput().length;
+    terminal.write(bytes);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
+    terminal.resize(terminalColumns, terminalRows - 1);
+    terminal.resize(terminalColumns, terminalRows);
+    await waitForVisible(expected, start);
+  }
+
+  async function waitForExit(message: string): Promise<{ exitCode: number; signal?: number }> {
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        exitPromise,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(failureContext(message)), 15_000);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  try {
+    await access(bunPath);
+    await access(entryPath);
+    await access(powerShellPath);
+    await mkdir(eventDirectory, { recursive: true });
+    await writeFile(eventPath, fixtureLines(), "utf8");
+    await writeFile(dispatchEventLogPath, "", "utf8");
+    await writeFile(
+      brokerDescriptorPath,
+      JSON.stringify({ requestLogPath, dispatchEventLogPath }, null, 2),
+      "utf8",
+    );
+    await writeFile(brokerScriptPath, await readFile(reviewerWideningBrokerScript(), "utf8"), "utf8");
+
+    terminal = spawn(bunPath, [
+      "--conditions=browser",
+      entryPath,
+      "--state-dir", stateRoot,
+      "--broker-executable", powerShellPath,
+      "--broker-script", brokerScriptPath,
+      "--broker-descriptor", brokerDescriptorPath,
+    ], {
+      name: "xterm-256color",
+      cols: 130,
+      rows: 36,
+      cwd: dashboardRoot,
+      env: environment(),
+    });
+    dataSubscription = terminal.onData((data) => {
+      capture = (capture + data).slice(-1_000_000);
+    });
+    exitSubscription = terminal.onExit((eventExit) => {
+      exited = eventExit;
+      resolveExit?.(eventExit);
+    });
+
+    await waitForVisible("DEVPILOT OPERATIONS");
+    await waitForVisible("TRUSTED MANUAL ENABLED");
+    await writeAndWait("f", "View filter changed to History");
+    await waitForVisible("operations-dashboard PR #104");
+    await writeAndWait("m", "Ctrl+D describe");
+    await writeAndWait("\x04", "Press w to request EnableApprovalVote widening (draft-bound, single-use).");
+    await writeAndWait("w", "Widening preview: EnableApprovalVote");
+    await waitForVisible("Paired requirement: EnableFindingComments must already be active (confirmed active).");
+    await writeAndWait("c", "Final widening blast radius: EnableApprovalVote");
+    await waitForVisible("FINAL WIDENING CONFIRMATION: press y to mint this grant; Esc cancels.");
+    await writeAndWait("\x1b", "Widening cancelled; capability profile refreshed to the unwidened baseline.");
+    await waitForVisible("Press w to request EnableApprovalVote widening (draft-bound, single-use).");
+    await writeAndWait("\x1b", "PR HISTORY");
+
+    terminal.write("q");
+    const result = await waitForExit("dashboard hung after quitting Esc cancellation flow");
+    assert.equal(result.exitCode, 0, failureContext("dashboard did not exit cleanly").message);
+    assert.equal(result.signal ?? 0, 0, failureContext("dashboard exited due to a signal").message);
+
+    const parsedRequests = await readRequestOperations(requestLogPath);
+    assert.deepEqual(parsedRequests, [
+      "describe",
+      "describe-widening",
+      "confirm-widening-preview",
+      "cancel-widening",
+      "shutdown",
+    ]);
+    const cancelRequests = (await readFile(requestLogPath, "utf8"))
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(cancelRequests[3]?.generation, 2);
   } finally {
     try {
       if (terminal && !exited) {
