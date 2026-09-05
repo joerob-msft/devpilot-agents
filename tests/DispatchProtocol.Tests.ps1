@@ -389,15 +389,16 @@ Describe 'dispatch protocol primitives' {
             '-Agent', 'ReviewHandler', '-ReviewerPullRequestId', '0') `
             -CaptureStdOut -CaptureStdErr -TimeoutSeconds 20
         $invalid.ExitCode | Should -Not -Be 0
-        ($invalid.StdErr -join ' ') | Should -Match 'ReviewerPullRequestId\s+must be greater than zero'
+        (($invalid.StdErr -join [Environment]::NewLine) -replace '\s+', ' ') |
+            Should -Match 'ReviewerPullRequestId must be greater than zero'
 
         $mismatched = Invoke-TimedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList @(
             '-NoProfile', '-NonInteractive', '-File', $watchPath,
             '-Agent', 'ReviewHandler', '-ReviewerPullRequestId', '104') `
             -CaptureStdOut -CaptureStdErr -TimeoutSeconds 20
         $mismatched.ExitCode | Should -Not -Be 0
-        ($mismatched.StdErr -join ' ') |
-            Should -Match 'ReviewerPullRequestId\s+requires\s+-Agent Reviewer or -Agent Both'
+        (($mismatched.StdErr -join [Environment]::NewLine) -replace '\s+', ' ') |
+            Should -Match 'ReviewerPullRequestId requires -Agent Reviewer or -Agent Both'
     }
 
     It 'creates broker authority only when a manual role is enabled' {
