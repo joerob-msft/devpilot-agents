@@ -97,8 +97,73 @@ Describe 'dispatch protocol primitives' {
     It 'keeps manual policy independent and makes Reviewer vote impossible' {
         $source = Get-Content -LiteralPath $watchPath -Raw
         $source | Should -Match 'EnableManualReviewer'
-        $source | Should -Match "mandatoryDenies = @\('EnableApprovalVote'\)"
+        $source | Should -Match 'mandatoryDenies = @\(\$reviewerCapabilityDescriptor\.delegableDefaultOff\)'
         $source | Should -Not -Match "manualRoles\.reviewer.+EnableApprovalVote"
+        $source | Should -Not -Match "'EnableApprovalVote'"
+        (Get-AgentHarnessCapabilityDescriptor -Role reviewer).delegableDefaultOff | Should -BeExactly 'EnableApprovalVote'
+    }
+
+    It 'exports a single-source, grant-free capability descriptor with exact golden values' {
+        Get-Command Get-AgentHarnessCapabilityDescriptor -Module DevPilot.AgentHarness |
+            Should -Not -BeNullOrEmpty
+        $reviewer = Get-AgentHarnessCapabilityDescriptor -Role reviewer
+        $reviewer.operationalTiers.base | Should -BeExactly @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment')
+        $reviewer.operationalTiers.Contains('codeUpdate') | Should -BeFalse
+        $reviewer.delegableDefaultOff | Should -BeExactly 'EnableApprovalVote'
+        (@($reviewer.allowedManualCapabilities | Sort-Object)) |
+            Should -BeExactly (@('EnableFindingComments', 'EnableSummaryComment', 'EnableThreadReplies') | Sort-Object)
+        $reviewer.absoluteDenies | Should -BeExactly @()
+
+        $handler = Get-AgentHarnessCapabilityDescriptor -Role review-handler
+        $handler.operationalTiers.base | Should -BeExactly @('EnableThreadReplies', 'EnableBuddyRequeue')
+        $handler.operationalTiers.codeUpdate | Should -BeExactly @('EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession')
+        $handler.delegableDefaultOff | Should -BeExactly 'EnableAutoComplete'
+        (@($handler.allowedManualCapabilities | Sort-Object)) |
+            Should -BeExactly (@('EnableThreadReplies', 'EnableBuddyRequeue', 'EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession') | Sort-Object)
+        $handler.absoluteDenies | Should -BeExactly @()
+
+        # Disjointness: the default-off delegable capability is never part of either role's
+        # always-on manual ceiling, and absoluteDenies (empty in PR1) never overlaps it either.
+        $reviewer.allowedManualCapabilities | Should -Not -Contain $reviewer.delegableDefaultOff
+        $handler.allowedManualCapabilities | Should -Not -Contain $handler.delegableDefaultOff
+        @($reviewer.absoluteDenies | Where-Object { $reviewer.allowedManualCapabilities -contains $_ }) | Should -BeNullOrEmpty
+        @($handler.absoluteDenies | Where-Object { $handler.allowedManualCapabilities -contains $_ }) | Should -BeNullOrEmpty
+    }
+
+    It 'returns a fresh, independently-mutable projection on every call' {
+        $first = Get-AgentHarnessCapabilityDescriptor -Role review-handler
+        $first.operationalTiers.base += 'Injected'
+        $first.allowedManualCapabilities += 'Injected'
+        $second = Get-AgentHarnessCapabilityDescriptor -Role review-handler
+        $second.operationalTiers.base | Should -Not -Contain 'Injected'
+        $second.allowedManualCapabilities | Should -Not -Contain 'Injected'
+        $second.operationalTiers.base | Should -BeExactly @('EnableThreadReplies', 'EnableBuddyRequeue')
+    }
+
+    It 'keeps capability literals declared in exactly one place (the harness descriptor)' {
+        $literals = @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment', 'EnableApprovalVote',
+            'EnableBuddyRequeue', 'EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession', 'EnableAutoComplete')
+        $watchSource = Get-Content -LiteralPath $watchPath -Raw
+        foreach ($literal in $literals) {
+            $watchSource | Should -Not -Match "'$literal'"
+        }
+        $brokerSource = Get-Content -LiteralPath $brokerPath -Raw
+        $roleDescriptorBody = [regex]::Match($brokerSource, '(?s)function Get-RoleDescriptor \{.*?\n\}').Value
+        $roleDescriptorBody | Should -Not -BeNullOrEmpty
+        foreach ($literal in $literals) {
+            $roleDescriptorBody | Should -Not -Match "'$literal'"
+        }
+        $harnessSource = Get-Content -LiteralPath "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psm1" -Raw
+        $startupBody = [regex]::Match($harnessSource, '(?s)function Enter-AgentManualDispatchStartup \{.*?\r?\n\}').Value
+        $startupBody | Should -Not -BeNullOrEmpty
+        foreach ($literal in $literals) {
+            $startupBody | Should -Not -Match "'$literal'"
+        }
+        $descriptorBody = [regex]::Match($harnessSource, '(?s)function Get-AgentHarnessCapabilityDescriptor \{.*?\r?\n\}').Value
+        $descriptorBody | Should -Not -BeNullOrEmpty
+        foreach ($literal in $literals) {
+            $descriptorBody | Should -Match "'$literal'"
+        }
     }
 
     It 'launches only immutable digest-bound capabilities and rejects deny overlap' {
@@ -450,6 +515,116 @@ Describe 'dispatch protocol primitives' {
             $describeResponse.operation | Should -BeExactly 'rejected'
             $describeResponse.code | Should -BeExactly 'role-not-allowed'
 
+            $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{
+                        schemaVersion = 1; requestId = $shutdownId; operation = 'shutdown'
+                    }))
+            $shutdownResponseTask = $process.StandardOutput.ReadLineAsync()
+            $shutdownResponseTask.Wait(10000) | Should -BeTrue `
+                -Because 'the broker must process the next request while stdin remains open'
+            $shutdownResponse = $shutdownResponseTask.Result | ConvertFrom-Json -AsHashtable
+            $shutdownResponse.requestId | Should -BeExactly $shutdownId
+            $shutdownResponse.operation | Should -BeExactly 'shutdown-complete'
+
+            $process.StandardInput.Close()
+            $process.WaitForExit(15000) | Should -BeTrue
+            $stderr = $process.StandardError.ReadToEnd()
+            $process.ExitCode | Should -Be 0 -Because $stderr
+            Test-Path (Join-Path $stateRoot 'manual-dispatch') | Should -BeFalse
+        }
+        finally {
+            if (-not $process.HasExited) { $process.Kill($true); [void]$process.WaitForExit(5000) }
+            $process.Dispose()
+        }
+    }
+
+    It 'shares a side-effect-free capability profile helper between describe and profile' {
+        $source = Get-Content -LiteralPath $brokerPath -Raw
+        $source | Should -Match "'profile' \{ Invoke-Profile \`$request \}"
+
+        $helperBody = [regex]::Match($source, '(?s)function Get-BrokerCapabilityProfile \{.*?\n\}').Value
+        $helperBody | Should -Not -BeNullOrEmpty
+        $helperBody | Should -Not -Match 'New-ConfigSnapshot'
+        $helperBody | Should -Not -Match '\$drafts\['
+
+        $profileBody = [regex]::Match($source, '(?s)function Invoke-Profile \{.*?\n\}').Value
+        $profileBody | Should -Not -BeNullOrEmpty
+        $profileBody | Should -Match 'Get-BrokerCapabilityProfile'
+        $profileBody | Should -Not -Match 'New-ConfigSnapshot'
+        $profileBody | Should -Not -Match '\$drafts\['
+        $profileBody | Should -Not -Match 'dispatchDraftId\s*='
+        $profileBody | Should -Match "operation = 'capability-profile'"
+        $profileBody | Should -Match 'role = \$profile\.Role'
+
+        $describeBody = [regex]::Match($source, '(?s)function Invoke-Describe \{.*?\n\}').Value
+        $describeBody | Should -Not -BeNullOrEmpty
+        $describeBody | Should -Match 'Get-BrokerCapabilityProfile'
+        $describeBody | Should -Match 'New-ConfigSnapshot'
+        $describeBody | Should -Match '\$drafts\['
+        $describeBody | Should -Match "operation = 'capability-summary'"
+        $describeBody | Should -Match 'role = \$role'
+    }
+
+    It 'keeps the read-only profile operation side-effect-free across repeated calls' {
+        $repositoryRoot = (Resolve-Path "$PSScriptRoot\..").Path
+        $suiteRoot = Join-Path $TestDrive 'broker-profile-integration'
+        $stateRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'watch') `
+            -Kind watch-state -RepositoryRoot $repositoryRoot -Create
+        $durableRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'durable') `
+            -Kind durable-state -RepositoryRoot $repositoryRoot -DisallowedRoots @($stateRoot) -Create
+        $leaseRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'leases') `
+            -Kind lease -RepositoryRoot $repositoryRoot -DisallowedRoots @($stateRoot, $durableRoot) -Create
+        $descriptorPath = Join-Path $stateRoot 'broker.descriptor.v1.json'
+        @{
+            schemaVersion = 1
+            ownerProcessId = $PID
+            stateRoot = $stateRoot
+            durableStateRoot = $durableRoot
+            leaseRoot = $leaseRoot
+            operatorAlias = 'integration-test'
+            roles = @{}
+        } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $descriptorPath -Encoding utf8NoBOM
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($descriptorPath,
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        [void](Assert-AgentTrustedFile -Path $descriptorPath -AllowedRoot $stateRoot `
+            -ExpectedPath $descriptorPath -Private)
+
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = Resolve-AgentPwshPath
+        foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File',
+                $brokerPath, '-DescriptorPath', $descriptorPath)) {
+            [void]$startInfo.ArgumentList.Add($argument)
+        }
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+        try {
+            # Repeated profile requests (simulating a Settings refresh and close/reopen) must never
+            # create the manual-dispatch draft directory -- each is rejected the same way describe()
+            # would be for this unconfigured role, proving the read-only path never reaches
+            # New-ConfigSnapshot regardless of how many times it is called.
+            for ($i = 0; $i -lt 3; $i++) {
+                $profileId = [Guid]::NewGuid().ToString('D')
+                $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{
+                            schemaVersion = 1; requestId = $profileId; operation = 'profile'
+                            role = 'reviewer'; pullRequestId = 1; repositoryKey = 'v1:github:1'
+                        }))
+                $profileResponseTask = $process.StandardOutput.ReadLineAsync()
+                $profileResponseTask.Wait(10000) | Should -BeTrue `
+                    -Because 'the broker must process each repeated profile request while stdin remains open'
+                $profileResponse = $profileResponseTask.Result | ConvertFrom-Json -AsHashtable
+                $profileResponse.requestId | Should -BeExactly $profileId
+                $profileResponse.operation | Should -BeExactly 'rejected'
+                $profileResponse.code | Should -BeExactly 'role-not-allowed'
+                Test-Path (Join-Path $stateRoot 'manual-dispatch') | Should -BeFalse
+            }
+
+            $shutdownId = [Guid]::NewGuid().ToString('D')
             $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{
                         schemaVersion = 1; requestId = $shutdownId; operation = 'shutdown'
                     }))

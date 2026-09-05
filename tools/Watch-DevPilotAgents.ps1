@@ -123,21 +123,14 @@ Import-Module $harnessManifest -Force
 $dashboardLauncher = Join-Path $PSScriptRoot 'Start-DevPilotDashboard.ps1'
 $reviewerScript = Join-Path $toolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
 $reviewHandlerScript = Join-Path $toolkitRoot 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1'
-$reviewerOperationalCapabilities = @(
-    'EnableFindingComments',
-    'EnableThreadReplies',
-    'EnableSummaryComment'
-)
-$reviewHandlerOperationalCapabilities = @(
-    'EnableThreadReplies',
-    'EnableBuddyRequeue'
-)
-$reviewHandlerCodeUpdateCapabilities = @(
-    'EnableCodeChanges',
-    'EnablePush',
-    'LocalValidation',
-    'ResumeCodingSession'
-)
+# Sourced from the harness's single-source-of-truth descriptor rather than declared here, so this
+# script can never independently drift from the broker/child ceilings (see
+# Get-AgentHarnessCapabilityDescriptor).
+$reviewerCapabilityDescriptor = Get-AgentHarnessCapabilityDescriptor -Role reviewer
+$reviewHandlerCapabilityDescriptor = Get-AgentHarnessCapabilityDescriptor -Role review-handler
+$reviewerOperationalCapabilities = @($reviewerCapabilityDescriptor.operationalTiers.base)
+$reviewHandlerOperationalCapabilities = @($reviewHandlerCapabilityDescriptor.operationalTiers.base)
+$reviewHandlerCodeUpdateCapabilities = @($reviewHandlerCapabilityDescriptor.operationalTiers.codeUpdate)
 
 function Close-OwnedAgentProcess {
     param(
@@ -279,10 +272,8 @@ if ($EnableManualReviewer) {
     $manualRoles.reviewer = [ordered]@{
         enabled = $true; configFile = $manualReviewerConfig
         configRoot = (Split-Path $manualReviewerConfig -Parent); scriptPath = $reviewerScript
-        capabilities = @($(if ($EnableManualReviewerWrites) {
-                    'EnableFindingComments'; 'EnableThreadReplies'; 'EnableSummaryComment'
-                }))
-        mandatoryDenies = @('EnableApprovalVote')
+        capabilities = @($(if ($EnableManualReviewerWrites) { $reviewerCapabilityDescriptor.operationalTiers.base }))
+        mandatoryDenies = @($reviewerCapabilityDescriptor.delegableDefaultOff)
     }
 }
 if ($EnableManualReviewHandler) {
@@ -296,14 +287,14 @@ if ($EnableManualReviewHandler) {
     }
     $manualHandlerConfig = Assert-AgentTrustedFile -Path $manualHandlerConfig `
         -AllowedRoot $(if ($PSBoundParameters.ContainsKey('ReviewHandlerConfigFile')) { '' } else { $defaultConfigRoot })
-    $handlerCapabilities = @('EnableThreadReplies', 'EnableBuddyRequeue')
+    $handlerCapabilities = @($reviewHandlerCapabilityDescriptor.operationalTiers.base)
     if ($EnableManualReviewHandlerCodeUpdates) {
-        $handlerCapabilities += @('EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession')
+        $handlerCapabilities += @($reviewHandlerCapabilityDescriptor.operationalTiers.codeUpdate)
     }
     $manualRoles.'review-handler' = [ordered]@{
         enabled = $true; configFile = $manualHandlerConfig
         configRoot = (Split-Path $manualHandlerConfig -Parent); scriptPath = $reviewHandlerScript
-        capabilities = $handlerCapabilities; mandatoryDenies = @('EnableAutoComplete')
+        capabilities = $handlerCapabilities; mandatoryDenies = @($reviewHandlerCapabilityDescriptor.delegableDefaultOff)
     }
 }
 $brokerDescriptorPath = ''

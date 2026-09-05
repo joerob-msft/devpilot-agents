@@ -20,6 +20,7 @@ import { PullRequestHistoryProjection, type PullRequestHistoryEntry } from "./hi
 import type { EventTailer } from "./tailer.js";
 import {
   BrokerRejectionError,
+  type CapabilityProfile,
   type CapabilitySummary,
   type DispatchAccepted,
   type DispatchBroker,
@@ -48,7 +49,7 @@ const COLORS = {
   ok: "#61d6a7",
 };
 
-type Overlay = "none" | "events" | "palette" | "help";
+type Overlay = "none" | "events" | "palette" | "help" | "settings";
 type RoleFilter = "all" | AgentRole;
 type PaneFocus = "rail" | "detail" | "timeline" | "inspector";
 
@@ -644,8 +645,31 @@ export function App(props: AppProps) {
   const [capabilitySummary, setCapabilitySummary] = createSignal<CapabilitySummary | null>(null);
   const [acceptedDispatch, setAcceptedDispatch] = createSignal<DispatchAccepted | null>(null);
   const [manualStatus, setManualStatus] = createSignal("");
+  const [settingsRole, setSettingsRole] = createSignal<AgentRole>("reviewer");
+  const [settingsProfile, setSettingsProfile] = createSignal<CapabilityProfile | null>(null);
+  const [settingsStatus, setSettingsStatus] = createSignal("");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let localBrokerShutdown: Promise<void> | undefined;
+  // Settings refresh/toggle race guard: every refreshSettingsProfile() call is stamped with a
+  // generation token. A response is only applied if its token still matches the latest one, so a
+  // slow response from a superseded request (e.g. an earlier role, or a request outstanding when
+  // Settings was closed and reopened) can never land after a newer one. settingsRefreshPending is a
+  // one-in-flight gate so Tab/r are ignored while a profile request is outstanding. Both guards are
+  // defense-in-depth for UI correctness now, not resource bounding: the broker's `profile` RPC
+  // (unlike describe(), used only by manual dispatch) is side-effect-free -- it never allocates a
+  // dispatchDraftId, config snapshot, or $drafts entry -- so overlapping profile reads from repeated
+  // refreshes or close/reopen are safe and accumulate no broker-side residue; a stale/superseded
+  // response must still never be applied, which is what these guards continue to protect against.
+  let settingsGeneration = 0;
+  let settingsRefreshPending = false;
+  // Renders only when the resolved profile's own role still matches the currently displayed role
+  // label, independent of the request-token guard above -- a second, cheap line of defense so a
+  // mislabeled profile can never reach the screen even if the guard above is ever weakened (e.g. a
+  // response from a request outstanding when Settings was closed and reopened under a new role).
+  const settingsDisplayProfile = createMemo(() => {
+    const profile = settingsProfile();
+    return profile && profile.role === settingsRole() ? profile : null;
+  });
   let eventScrollbox: ScrollBoxRenderable | undefined;
 
   function shutdownBroker(): Promise<void> {
@@ -800,6 +824,71 @@ export function App(props: AppProps) {
         : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
       setManualMode("terminal");
     }
+  }
+
+  // Read-only effective-profile settings: uses the broker's dedicated `profile` RPC (issue #105),
+  // not the manual dispatch prompt's describe(). Unlike describe(), profile() is side-effect-free
+  // on the broker -- it never allocates a dispatchDraftId, config snapshot, or $drafts entry -- so
+  // repeated refreshes and close/reopen concurrency can never accumulate broker-side draft residue.
+  // A running agent's own profile is immutable and is never reflected here.
+  //
+  // targetRole is always the caller's freshly-computed role rather than a read of the
+  // settingsRole() signal, and every response is stamped with (and checked against) a generation
+  // token plus its own broker-authored role -- see the settingsGeneration/settingsDisplayProfile
+  // comment above -- so an overlapping or superseded profile() response can never render under the
+  // wrong label.
+  async function refreshSettingsProfile(targetRole: AgentRole): Promise<void> {
+    if (settingsRefreshPending) return;
+    const entry = historyCurrent();
+    if (!props.broker) {
+      settingsGeneration += 1;
+      setSettingsProfile(null);
+      setSettingsStatus("Unavailable: trusted manual broker is not connected (observe-only mode).");
+      return;
+    }
+    if (!entry) {
+      settingsGeneration += 1;
+      setSettingsProfile(null);
+      setSettingsStatus("Unavailable: select a retained PR history row to resolve a next-launch profile.");
+      return;
+    }
+    const requestId = (settingsGeneration += 1);
+    settingsRefreshPending = true;
+    setSettingsStatus("Resolving effective profile for the next manual dispatch...");
+    try {
+      const profile = await props.broker.profile(entry.repositoryIdentity.key, entry.pullRequestId, targetRole);
+      if (requestId !== settingsGeneration) return; // superseded: Settings closed/reopened meanwhile
+      setSettingsProfile(profile);
+      setSettingsStatus("");
+    } catch (error) {
+      if (requestId !== settingsGeneration) return;
+      setSettingsProfile(null);
+      setSettingsStatus(error instanceof BrokerRejectionError
+        ? `Unavailable: ${dispatchResultDetail(error.code, error.detail)}`
+        : `Unavailable: broker failure resolving effective profile (${error instanceof Error ? error.message : String(error)}).`);
+    } finally {
+      if (requestId === settingsGeneration) settingsRefreshPending = false;
+    }
+  }
+
+  function openSettings(): void {
+    setOverlay("settings");
+    setSettingsProfile(null);
+    setSettingsStatus("");
+    void refreshSettingsProfile(settingsRole());
+    notify("Effective profile settings opened");
+  }
+
+  function closeSettings(): void {
+    setOverlay("none");
+    // Advance the generation and release the gate so a still-outstanding describe() from this
+    // session is discarded on arrival instead of being applied, and the next open is never
+    // blocked by a request the UI no longer cares about.
+    settingsGeneration += 1;
+    settingsRefreshPending = false;
+    setSettingsProfile(null);
+    setSettingsStatus("");
+    notify("Effective profile settings closed");
   }
 
   async function quit(): Promise<void> {
@@ -1011,6 +1100,12 @@ export function App(props: AppProps) {
       unavailable: "",
       run: () => setOverlay("help"),
     },
+    {
+      label: "Show effective capability profile (next launch)",
+      enabled: true,
+      unavailable: "",
+      run: openSettings,
+    },
   ]);
 
   function executePalette(): void {
@@ -1115,6 +1210,24 @@ export function App(props: AppProps) {
       }
       return;
     }
+    if (overlay() === "settings") {
+      if (key.name === "escape" || key.name === "s") {
+        closeSettings();
+      } else if (key.name === "tab") {
+        // Ignore role toggles while a describe() is outstanding (see settingsRefreshPending):
+        // otherwise the label could advance to a role whose refetch never fires. The NEW role is
+        // computed here and threaded straight into refreshSettingsProfile as an explicit argument
+        // rather than re-read from the settingsRole() signal inside it.
+        if (settingsRefreshPending) return;
+        const nextRole: AgentRole = settingsRole() === "reviewer" ? "review-handler" : "reviewer";
+        setSettingsRole(nextRole);
+        void refreshSettingsProfile(nextRole);
+      } else if (key.name === "r") {
+        if (settingsRefreshPending) return;
+        void refreshSettingsProfile(settingsRole());
+      }
+      return;
+    }
 
     if (key.name === "up" || key.name === "k") move(-1);
     else if (key.name === "down" || key.name === "j") move(1);
@@ -1169,6 +1282,7 @@ export function App(props: AppProps) {
       notify("Enter a PR number, then press Enter to jump");
     }
     else if (key.name === "m") openManual();
+    else if (key.name === "s") openSettings();
     else if (key.name === "f") cycleView(key.shift ? -1 : 1);
     else if (key.name === "x") {
       if (key.shift) forgetAllHistory();
@@ -1329,11 +1443,39 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
           <text height={1} fg={COLORS.text}>m                  Manual dispatch for selected retained PR (trusted launch only)</text>
+          <text height={1} fg={COLORS.text}>s                  Effective capability profile for the next manual launch (read-only)</text>
           <text height={1} fg={COLORS.text}>?                  Help</text>
           <text height={1} fg={COLORS.text}>q                  Quit</text>
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[0]}</text>
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[1]}</text>
           <text height={1} fg={COLORS.warning}>{HELP_LEGEND[2]}</text>
+        </OverlayPanel>
+      </Show>
+      <Show when={overlay() === "settings"}>
+        <OverlayPanel title="SETTINGS - EFFECTIVE CAPABILITY PROFILE (READ-ONLY)" width={82} height={23}>
+          <box flexDirection="column" flexGrow={1}>
+            <text height={1} fg={COLORS.warning}>Applies only to the next manual dispatch/process launch.</text>
+            <text height={1} fg={COLORS.warning}>A running agent's own profile is immutable and is not shown here.</text>
+            <text height={1} fg={COLORS.text}>Role: {roleLabel(settingsRole())} | Tab switch role | r refresh | Esc/s close</text>
+            <Show when={settingsStatus()}>
+              <text height={1} fg={COLORS.warning}>{line(settingsStatus(), 170)}</text>
+            </Show>
+            <Show when={settingsDisplayProfile()}>
+              {(profile: () => CapabilityProfile) => (
+                <>
+                  <text height={1} fg={COLORS.accent}>{profile().repositoryIdentity.slug} / PR #{profile().prSnapshot.pullRequestId}</text>
+                  <text height={1} fg={COLORS.ok}>Allowed manual ceiling: {line(profile().allowedManualCapabilities.join(", ") || "none", 110)}</text>
+                  <text height={1} fg={COLORS.ok}>Enabled for this launch: {line(profile().capabilities.join(", ") || "none", 110)}</text>
+                  <text height={1} fg={COLORS.warning}>Denied (mandatory): {line(profile().mandatoryDenies.join(", ") || "none", 110)}</text>
+                  <text height={1} fg={COLORS.error}>Absolute denies (never grantable): {line(profile().absoluteDenies.join(", ") || "none", 110)}</text>
+                  <text height={1} fg={COLORS.muted}>Delegable available (widening): {line(profile().delegableAvailable.join(", ") || "none in this release", 110)}</text>
+                  <text height={1} fg={COLORS.muted}>
+                    Provenance: {line(Object.entries(profile().provenance).map(([name, source]) => `${name}=${source}`).join(", ") || "none", 170)}
+                  </text>
+                </>
+              )}
+            </Show>
+          </box>
         </OverlayPanel>
       </Show>
     </box>

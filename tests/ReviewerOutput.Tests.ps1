@@ -405,46 +405,30 @@ Describe 'Shared reviewer and review-handler event contract' {
                 '$childArguments += @(''-IntervalSeconds'', [string]$IntervalSeconds)'))
         $source | Should -Match "\[ValidateSet\('Reviewer', 'ReviewHandler', 'Both'\)\]"
         $source | Should -Match '\$Continuous\s+-and\s+\(\$ReviewerPullRequestId\s+-gt\s+0\s+-or\s+\$ReviewHandlerPullRequestId\s+-gt\s+0\)'
-        $reviewerCapabilities = [regex]::Match(
-            $source, '(?s)\$reviewerOperationalCapabilities\s*=\s*@\((.*?)\)').Groups[1].Value
-        $handlerCapabilities = [regex]::Match(
-            $source, '(?s)\$reviewHandlerOperationalCapabilities\s*=\s*@\((.*?)\)').Groups[1].Value
-        $handlerCodeUpdateCapabilities = [regex]::Match(
-            $source, '(?s)\$reviewHandlerCodeUpdateCapabilities\s*=\s*@\((.*?)\)').Groups[1].Value
+        # issue #105 PR1: the watcher no longer declares any capability literal itself -- it sources
+        # every operational array from the harness's single-source-of-truth descriptor.
+        $source | Should -Match '\$reviewerCapabilityDescriptor\s*=\s*Get-AgentHarnessCapabilityDescriptor\s+-Role\s+reviewer'
+        $source | Should -Match '\$reviewHandlerCapabilityDescriptor\s*=\s*Get-AgentHarnessCapabilityDescriptor\s+-Role\s+review-handler'
+        $source | Should -Match '\$reviewerOperationalCapabilities\s*=\s*@\(\$reviewerCapabilityDescriptor\.operationalTiers\.base\)'
+        $source | Should -Match '\$reviewHandlerOperationalCapabilities\s*=\s*@\(\$reviewHandlerCapabilityDescriptor\.operationalTiers\.base\)'
+        $source | Should -Match '\$reviewHandlerCodeUpdateCapabilities\s*=\s*@\(\$reviewHandlerCapabilityDescriptor\.operationalTiers\.codeUpdate\)'
         foreach ($capability in @(
-            'EnableFindingComments', 'EnableThreadReplies',
-            'EnableSummaryComment'
-        )) {
-            $reviewerCapabilities | Should -Match ("'{0}'" -f $capability)
+                'EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment', 'EnableApprovalVote',
+                'EnableBuddyRequeue', 'EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession', 'EnableAutoComplete'
+            )) {
+            $source | Should -Not -Match ("'{0}'" -f $capability)
         }
-        foreach ($capability in @(
-            'EnableThreadReplies', 'EnableBuddyRequeue'
-        )) {
-            $handlerCapabilities | Should -Match ("'{0}'" -f $capability)
-        }
-        foreach ($capability in @(
-            'EnableApprovalVote', 'EnableCodeChanges', 'EnablePush',
-            'EnableBuddyRequeue', 'EnableAutoComplete', 'LocalValidation'
-        )) {
-            $reviewerCapabilities | Should -Not -Match ("'{0}'" -f $capability)
-        }
-        foreach ($capability in @(
-            'EnableFindingComments', 'EnableSummaryComment', 'EnableApprovalVote',
-            'EnableCodeChanges', 'EnablePush', 'EnableAutoComplete', 'LocalValidation'
-        )) {
-            $handlerCapabilities | Should -Not -Match ("'{0}'" -f $capability)
-        }
-        foreach ($capability in @(
-            'EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession'
-        )) {
-            $handlerCodeUpdateCapabilities | Should -Match ("'{0}'" -f $capability)
-        }
-        foreach ($capability in @(
-            'EnableThreadReplies', 'EnableBuddyRequeue', 'EnableTeamsNotifications',
-            'EnableAutoComplete', 'RequireCodingSession', 'EnableApprovalVote'
-        )) {
-            $handlerCodeUpdateCapabilities | Should -Not -Match ("'{0}'" -f $capability)
-        }
+        # Golden-value equivalence: what the descriptor actually returns is what the watcher's argv
+        # loops below (foreach $capability in $reviewer/handler/handlerCodeUpdate...Capabilities) use.
+        $reviewerDescriptor = Get-AgentHarnessCapabilityDescriptor -Role reviewer
+        $reviewHandlerDescriptor = Get-AgentHarnessCapabilityDescriptor -Role review-handler
+        $reviewerDescriptor.operationalTiers.base |
+            Should -BeExactly @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment')
+        $reviewHandlerDescriptor.operationalTiers.base | Should -BeExactly @('EnableThreadReplies', 'EnableBuddyRequeue')
+        $reviewHandlerDescriptor.operationalTiers.codeUpdate |
+            Should -BeExactly @('EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession')
+        $reviewerDescriptor.delegableDefaultOff | Should -BeExactly 'EnableApprovalVote'
+        $reviewHandlerDescriptor.delegableDefaultOff | Should -BeExactly 'EnableAutoComplete'
         $source | Should -Match "\$childArguments \+= '-EnableTeamsNotifications'"
         $source | Should -Match '\$childArguments \+= "-\$capability"'
         $source | Should -Match 'if \(\$Operational\)'

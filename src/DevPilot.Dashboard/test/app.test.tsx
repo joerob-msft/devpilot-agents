@@ -6,18 +6,19 @@ import {
   App, BRAND_PLANE, HELP_LEGEND, appendPromptScalar, completionResultColor,
   printableKeySequence, safeHttpUrl, selectableCount,
 } from "../src/app.js";
-import { parseAgentEvent } from "../src/domain.js";
+import { parseAgentEvent, type AgentRole } from "../src/domain.js";
 import { OperationsReducer } from "../src/reducer.js";
 import { EventTailer } from "../src/tailer.js";
 import { PullRequestHistoryProjection } from "../src/history.js";
 import { createDashboardLifecycle } from "../src/lifecycle.js";
-import type { CapabilitySummary, DispatchAccepted, DispatchBroker, DispatchTerminal } from "../src/dispatch.js";
+import type { CapabilityProfile, CapabilitySummary, DispatchAccepted, DispatchBroker, DispatchTerminal } from "../src/dispatch.js";
 
 const DOCUMENTED_COMMAND_COVERAGE = [
   "Left", "Right", "Up", "Down", "j", "k", "Enter", "Esc", "b",
   "Tab", "Shift+Tab", "f", "Shift+f", "x", "Shift+x", "/",
   "number then Enter", "m", "prompt Tab", "prompt Enter",
   "Ctrl+d then d then y", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
+  "s", "settings Tab", "settings r",
 ] as const;
 
 function createFixture(prUrl = "https://github.com/joerob-msft/devpilot-agents/pull/94"): {
@@ -216,6 +217,7 @@ test("documented command coverage matrix enumerates every dashboard command", ()
     "Tab", "Shift+Tab", "f", "Shift+f", "x", "Shift+x", "/",
     "number then Enter", "m", "prompt Tab", "prompt Enter",
     "Ctrl+d then d then y", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
+    "s", "settings Tab", "settings r",
   ]);
 });
 
@@ -520,6 +522,139 @@ test("empty renderer reports unavailable navigation, attention, URL, and manual 
   }
 });
 
+test("settings overlay reports an explicit unavailable state without a trusted broker", async (context) => {
+  const fixture = createFixture();
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} tailer={fixture.tailer} />, {
+      width: 100, height: 30, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE \(READ-ONLY\)/);
+    assert.match(setup.captureCharFrame(), /Applies only to the next manual dispatch/);
+    assert.match(setup.captureCharFrame(), /A running agent's own profile is immutable and is not shown here\./);
+    assert.match(setup.captureCharFrame(), /Unavailable: trusted manual broker is not connected \(observe-only mode\)\./);
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE/);
+    assert.match(setup.captureCharFrame(), /STATUS: Effective profile settings closed/);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("settings role toggle refetches without ever pairing a role label with another role's profile body", async (context) => {
+  const fixture = createFixture();
+  const history = new PullRequestHistoryProjection();
+  history.apply(historyEvent("9007199254740993", 104, 1, { title: "Settings PR", author: "Ada" }));
+  const profileCalls: AgentRole[] = [];
+  let resolveReviewer!: (value: CapabilityProfile) => void;
+  let resolveHandler!: (value: CapabilityProfile) => void;
+  const reviewerPending = new Promise<CapabilityProfile>((resolve) => { resolveReviewer = resolve; });
+  const handlerPending = new Promise<CapabilityProfile>((resolve) => { resolveHandler = resolve; });
+  function profileFor(role: AgentRole, tag: string): CapabilityProfile {
+    return {
+      schemaVersion: 1,
+      requestId: `${tag}-request`,
+      operation: "capability-profile",
+      role,
+      repositoryIdentity: { ...history.jump(104)!.repositoryIdentity },
+      prSnapshot: {
+        schemaVersion: 1, pullRequestId: 104, sourceCommit: "a".repeat(40),
+        sourceRef: "feature", targetRef: "main", active: true, draft: false, author: "Ada", title: "Settings PR",
+      },
+      capabilities: [`${tag}-only-capability`],
+      mandatoryDenies: [],
+      dynamicConstraints: [],
+      absoluteDenies: [],
+      allowedManualCapabilities: [`${tag}-only-capability`],
+      delegableAvailable: [],
+      provenance: { [`${tag}-only-capability`]: "operational-default" },
+    };
+  }
+  const reviewerProfile = profileFor("reviewer", "reviewer");
+  const handlerProfile = profileFor("review-handler", "handler");
+  const broker: DispatchBroker = {
+    describe: async () => { throw new Error("not called"); },
+    profile: async (_repositoryKey, _pullRequestId, role) => {
+      profileCalls.push(role);
+      return role === "reviewer" ? reviewerPending : handlerPending;
+    },
+    dispatch: async () => { throw new Error("not called"); },
+    cancel: async () => { throw new Error("not called"); },
+    shutdown: async () => {},
+    subscribeTerminal: () => () => {},
+  };
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 100, height: 30, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE \(READ-ONLY\)/);
+    assert.match(setup.captureCharFrame(), /Role: REVIEWER/);
+    assert.deepEqual(profileCalls, ["reviewer"]);
+    assert.match(setup.captureCharFrame(), /Resolving effective profile for the next manual dispatch/);
+
+    // Gate: Tab and r are ignored while the reviewer profile() request is still outstanding. This
+    // is defense-in-depth against UI churn and out-of-order responses -- profile() is side-effect-
+    // free on the broker, so unlike the old describe()-based flow this no longer needs to bound
+    // broker-side draft allocation, but the role label must still never be able to outrun its own
+    // refetch.
+    setup.mockInput.pressTab();
+    await setup.flush();
+    assert.deepEqual(profileCalls, ["reviewer"]);
+    assert.match(setup.captureCharFrame(), /Role: REVIEWER/);
+    setup.mockInput.pressKey("r");
+    await setup.flush();
+    assert.deepEqual(profileCalls, ["reviewer"]);
+
+    resolveReviewer(reviewerProfile);
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Role: REVIEWER/);
+    assert.match(setup.captureCharFrame(), /reviewer-only-capability/);
+
+    // Toggling role now fires a fresh profile() request for review-handler. Until it resolves, the
+    // stale reviewer profile must never render under the new HANDLER label.
+    setup.mockInput.pressTab();
+    await setup.flush();
+    assert.deepEqual(profileCalls, ["reviewer", "review-handler"]);
+    assert.match(setup.captureCharFrame(), /Role: HANDLER/);
+    assert.doesNotMatch(setup.captureCharFrame(), /reviewer-only-capability/);
+    assert.match(setup.captureCharFrame(), /Resolving effective profile for the next manual dispatch/);
+
+    resolveHandler(handlerProfile);
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Role: HANDLER/);
+    assert.match(setup.captureCharFrame(), /handler-only-capability/);
+    assert.doesNotMatch(setup.captureCharFrame(), /reviewer-only-capability/);
+
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE/);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
 test("trusted manual flow requires describe plus two explicit confirmations", async (context) => {
   const fixture = createFixture();
   const history = new PullRequestHistoryProjection();
@@ -658,6 +793,7 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
       describedTarget = `${repositoryKey}:${pullRequestId}`;
       return described;
     },
+    profile: async () => { throw new Error("not called"); },
     dispatch: async (describedSummary) => {
       dispatchCount++;
       dispatchedTarget = `${describedSummary.repositoryIdentity.key}:${describedSummary.prSnapshot.pullRequestId}`;
@@ -838,6 +974,7 @@ test("q shuts down the tailer and trusted broker before destroying the renderer"
   let setup: TestRendererSetup | undefined;
   const broker: DispatchBroker = {
     describe: async () => { throw new Error("not called"); },
+    profile: async () => { throw new Error("not called"); },
     dispatch: async () => { throw new Error("not called"); },
     cancel: async () => { throw new Error("not called"); },
     shutdown: async () => { shutdownCount++; },
@@ -887,6 +1024,7 @@ test("renderer destruction handles rejected trusted broker shutdown once", async
   };
   const broker: DispatchBroker = {
     describe: async () => { throw new Error("not called"); },
+    profile: async () => { throw new Error("not called"); },
     dispatch: async () => { throw new Error("not called"); },
     cancel: async () => { throw new Error("not called"); },
     shutdown: async () => {

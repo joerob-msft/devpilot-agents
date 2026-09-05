@@ -255,6 +255,10 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     terminal.resize(terminalColumns, terminalRows);
     await waitForVisible("HISTORY | REVIEWER | WIDE | FOCUS RAIL", resizeStart);
 
+    await writeAndWait("s", "SETTINGS - EFFECTIVE CAPABILITY PROFILE (READ-ONLY)");
+    await waitForVisible("Unavailable: trusted manual broker is not connected (observe-only mode).");
+    await writeAndWait("\x1b", "Effective profile settings closed");
+
     terminal.write("q");
     const result = await waitForExit("dashboard hung after quit input");
     assert.equal(result.exitCode, 0, failureContext("dashboard did not exit cleanly").message);
