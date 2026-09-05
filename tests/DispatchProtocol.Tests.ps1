@@ -1098,7 +1098,10 @@ $child.Process.WaitForExit(15000) | Out-Null
             Mock Get-AgentImmediateParentProcessId { 999999 }
             Mock Get-Process { [Diagnostics.Process]::GetCurrentProcess() } -ParameterFilter { $Id -eq 999999 }
             Mock Get-AgentProcessStartIdentity { 'utc:123456789' }
-            Mock Get-AgentProcessCommandLine { "pwsh -NoLogo -File `"$BrokerPath`" -DescriptorPath somewhere.json" }
+            Mock Get-AgentProcessArgv { @{
+                ExecutablePath = 'pwsh'
+                Arguments = @('-NoLogo', '-File', $BrokerPath, '-DescriptorPath', $DescriptorPath)
+            } }
             $manifest = @{
                 role = 'reviewer'; brokerProcessId = 999999; brokerProcessStartIdentity = 'utc:123456789'
                 brokerDescriptorPath = $DescriptorPath; brokerDescriptorDigest = $DescriptorDigest
@@ -1140,23 +1143,153 @@ $child.Process.WaitForExit(15000) | Out-Null
             Mock Get-AgentImmediateParentProcessId { 111111 }
             Mock Get-Process { [Diagnostics.Process]::GetCurrentProcess() } -ParameterFilter { $Id -eq 111111 }
             Mock Get-AgentProcessStartIdentity { 'utc:123456789' }
-            Mock Get-AgentProcessCommandLine { "pwsh -File `"$BrokerPath`"" }
+            Mock Get-AgentProcessArgv { @{ ExecutablePath = 'pwsh'; Arguments = @('-File', $BrokerPath, '-DescriptorPath', $DescriptorPath) } }
             { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } |
                 Should -Throw '*not directly spawned by the broker process*'
 
             Mock Get-AgentImmediateParentProcessId { 999999 }
             Mock Get-Process { [Diagnostics.Process]::GetCurrentProcess() } -ParameterFilter { $Id -eq 999999 }
             Mock Get-AgentProcessStartIdentity { 'utc:DIFFERENT' }
-            Mock Get-AgentProcessCommandLine { "pwsh -File `"$BrokerPath`"" }
+            Mock Get-AgentProcessArgv { @{ ExecutablePath = 'pwsh'; Arguments = @('-File', $BrokerPath, '-DescriptorPath', $DescriptorPath) } }
             { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } |
                 Should -Throw '*possible PID reuse*'
 
             Mock Get-AgentProcessStartIdentity { 'utc:123456789' }
-            Mock Get-AgentProcessCommandLine { 'pwsh -NoProfile -Command "Start-Sleep -Seconds 30"' }
+            Mock Get-AgentProcessArgv { @{ ExecutablePath = 'pwsh'; Arguments = @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') } }
             { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } |
                 Should -Throw '*not running the pinned broker script*'
         }
     }
+
+     It 'Assert-AgentBrokerProcessAnchor rejects a substring-spoofed command line, a duplicate -File, a wrong -File target with the trusted path only as later inert data, and a manifest descriptor path that does not match the verified parent argv' {
+         # issue #105 PR5 parent-anchor-spoof fix: the prior implementation used
+         # $liveParentCommandLine.IndexOf($expectedBrokerScript) -- a plain substring search. Every
+         # case below has the trusted broker script's full path present as literal TEXT in the
+         # command line, but never as the thing actually executed by -File in its real argument
+         # position; a substring search alone would have wrongly accepted every one of them. Only
+         # Get-AgentProcessArgv + Assert-AgentBrokerCommandLineShape's exact positional/allowlist
+         # validation tells them apart from a genuine invocation.
+         $repositoryRoot = (Resolve-Path "$PSScriptRoot\..").Path
+         $suiteRoot = Join-Path $TestDrive 'anchor-argv-spoof'
+         $stateRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'watch') -Kind watch-state `
+             -RepositoryRoot $repositoryRoot -Create
+         $descriptorPath = Join-Path $stateRoot 'broker.descriptor.v1.json'
+         @{ schemaVersion = 1; ownerProcessId = $PID; roles = @{ reviewer = @{ scriptPath = $reviewerPath } } } |
+             ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $descriptorPath -Encoding utf8NoBOM
+         if (-not $IsWindows) {
+             [IO.File]::SetUnixFileMode($descriptorPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+         }
+         $liveDescriptor = Get-Content -LiteralPath $descriptorPath -Raw -Encoding UTF8 |
+             ConvertFrom-Json -AsHashtable -Depth 30
+         $descriptorDigest = Get-AgentCanonicalDigest -InputObject $liveDescriptor
+         $brokerScriptSha256 = [Convert]::ToHexString(
+             [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($brokerPath))).ToLowerInvariant()
+         $decoyScriptPath = Join-Path $suiteRoot 'decoy.ps1'
+         Set-Content -LiteralPath $decoyScriptPath -Value '# decoy, never actually the broker'
+         InModuleScope DevPilot.AgentHarness -Parameters @{
+             DescriptorPath = $descriptorPath; DescriptorDigest = $descriptorDigest
+             BrokerScriptSha256 = $brokerScriptSha256; BrokerPath = $brokerPath; DecoyScriptPath = $decoyScriptPath
+             SuiteRoot = $suiteRoot
+         } {
+             param($DescriptorPath, $DescriptorDigest, $BrokerScriptSha256, $BrokerPath, $DecoyScriptPath, $SuiteRoot)
+             $baseManifest = {
+                 @{
+                     role = 'reviewer'; brokerProcessId = 999999; brokerProcessStartIdentity = 'utc:123456789'
+                     brokerDescriptorPath = $DescriptorPath; brokerDescriptorDigest = $DescriptorDigest
+                     brokerScriptSha256 = $BrokerScriptSha256
+                 }
+             }
+             Mock Get-AgentImmediateParentProcessId { 999999 }
+             Mock Get-Process { [Diagnostics.Process]::GetCurrentProcess() } -ParameterFilter { $Id -eq 999999 }
+             Mock Get-AgentProcessStartIdentity { 'utc:123456789' }
+
+             # (1) launcher uses `-Command` (real code execution) and appends the trusted broker
+             # path as a second, inert, never-executed argument -- a plain substring search over
+             # the raw command line would find the trusted path and wrongly accept this.
+             Mock Get-AgentProcessArgv { @{
+                 ExecutablePath = 'pwsh'
+                 Arguments = @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30', $BrokerPath)
+             } }
+             { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } |
+                 Should -Throw '*not running the pinned broker script*'
+
+             # (2) a wrong -File target (a decoy script), with the real trusted broker path only
+             # ever appearing later as inert -DescriptorPath data.
+             Mock Get-AgentProcessArgv { @{
+                 ExecutablePath = 'pwsh'
+                 Arguments = @('-NoLogo', '-File', $DecoyScriptPath, '-DescriptorPath', $BrokerPath)
+             } }
+             { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } |
+                 Should -Throw '*not running the pinned broker script*'
+
+             # (3) duplicate -File: the trusted script named once for real, then a second -File
+             # reasserting it (or anything else) -- exactly one -File is ever accepted.
+             Mock Get-AgentProcessArgv { @{
+                 ExecutablePath = 'pwsh'
+                 Arguments = @('-File', $BrokerPath, '-File', $BrokerPath, '-DescriptorPath', $DescriptorPath)
+             } }
+             { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } |
+                 Should -Throw '*not running the pinned broker script*'
+
+             # (4) a genuinely, structurally valid broker invocation -- but the manifest's claimed
+             # brokerDescriptorPath does not match what that verified parent's own command line
+             # actually says its -DescriptorPath is. The manifest is no longer an independent
+             # authority on the descriptor path: this must be rejected even though every other
+             # claim (PID, start identity, script hash, digest) is otherwise consistent.
+             $forgedDescriptorPath = Join-Path $SuiteRoot 'attacker-owned-descriptor.json'
+             Mock Get-AgentProcessArgv { @{
+                 ExecutablePath = 'pwsh'
+                 Arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $BrokerPath, '-DescriptorPath', $forgedDescriptorPath)
+             } }
+             { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } |
+                 Should -Throw '*descriptor path does not match the verified broker process command line*'
+
+             # Valid actual broker invocation shape passes structurally (reaches descriptor
+             # resolution/digest comparison, which succeeds since $DescriptorPath is real).
+             Mock Get-AgentProcessArgv { @{
+                 ExecutablePath = 'pwsh'
+                 Arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $BrokerPath, '-DescriptorPath', $DescriptorPath)
+             } }
+             { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } | Should -Not -Throw
+         }
+     }
+
+     It 'ConvertFrom-AgentWindowsCommandLineArgv tokenizes quoted paths with spaces, escaped quotes, and backslash runs exactly like CommandLineToArgvW' {
+         InModuleScope DevPilot.AgentHarness {
+             (ConvertFrom-AgentWindowsCommandLineArgv -CommandLine 'pwsh -NoLogo -File "C:\Program Files\script.ps1" -DescriptorPath "C:\a b\d.json"') |
+                 Should -Be @('pwsh', '-NoLogo', '-File', 'C:\Program Files\script.ps1', '-DescriptorPath', 'C:\a b\d.json')
+             # odd backslash count before a quote: the quote is escaped (literal) and does not toggle quoting
+             (ConvertFrom-AgentWindowsCommandLineArgv -CommandLine 'prog a\\\"b c') | Should -Be @('prog', 'a\"b', 'c')
+             # even backslash count before a quote: backslashes halve, quote toggles/delimits normally
+             (ConvertFrom-AgentWindowsCommandLineArgv -CommandLine 'prog a\\\\"b c" d') | Should -Be @('prog', 'a\\b c', 'd')
+             # doubled quote inside an already-quoted run collapses to one literal quote
+             (ConvertFrom-AgentWindowsCommandLineArgv -CommandLine 'prog "a""b" c') | Should -Be @('prog', 'a"b', 'c')
+             (ConvertFrom-AgentWindowsCommandLineArgv -CommandLine '') | Should -BeNullOrEmpty
+         }
+     }
+
+     It 'Get-AgentProcessArgv identifies a real spawned process''s executable path and argument vector, matching the exact shape a real broker invocation uses' {
+         $suiteRoot = Join-Path $TestDrive 'argv-integration'
+         New-Item -ItemType Directory -Path $suiteRoot -Force | Out-Null
+         $descriptorStandIn = Join-Path $suiteRoot 'descriptor.json'
+         $pwshPath = Resolve-AgentPwshPath
+         $stdOut = Join-Path $suiteRoot 'child.stdout.log'
+         $stdErr = Join-Path $suiteRoot 'child.stderr.log'
+         $child = New-AgentRedirectedProcess -FilePath $pwshPath -ArgumentList @(
+             '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $brokerPath, '-DescriptorPath', $descriptorStandIn
+         ) -StandardOutputPath $stdOut -StandardErrorPath $stdErr
+         try {
+             Start-Sleep -Milliseconds 500
+             $invocation = Get-AgentProcessArgv -ProcessId $child.Process.Id
+             $invocation.ExecutablePath | Should -Match ([regex]::Escape('pwsh'))
+             $resolvedDescriptor = Assert-AgentBrokerCommandLineShape -ExecutablePath $invocation.ExecutablePath `
+                 -Arguments $invocation.Arguments -ExpectedBrokerScript $brokerPath
+             $resolvedDescriptor | Should -Be ([IO.Path]::GetFullPath($descriptorStandIn))
+         }
+         finally {
+             if (-not $child.Process.HasExited) { Stop-ProcessTree $child.Process; [void]$child.Process.WaitForExit(5000) }
+         }
+     }
 
     It 'Start-ReviewerAgent.ps1 rejects a same-user forger who truthfully reports their own real PID, start time, descriptor, and broker script hash' {
         # The strongest adversarial case: every claim in the manifest below is

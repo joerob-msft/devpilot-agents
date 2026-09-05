@@ -2175,6 +2175,191 @@ function Get-AgentProcessCommandLine {
     return [string](& ps -o command= -p $ProcessId 2>$null)
 }
 
+function ConvertFrom-AgentWindowsCommandLineArgv {
+    <#
+        Pure, OS-independent tokenizer implementing the exact CommandLineToArgvW quoting
+        algorithm (issue #105 PR5 parent-anchor-spoof fix). Deliberately NOT Add-Type/P-Invoke --
+        a plain string-walk that any host can unit-test from static fixtures. Rules (identical to
+        the documented Windows CRT/CommandLineToArgvW convention):
+          - arguments are delimited by unquoted whitespace;
+          - a double quote toggles "inside quotes" (whitespace inside quotes is literal);
+          - two consecutive double quotes while already inside a quoted run collapse to one
+            literal double quote and stay inside the quoted run;
+          - a run of N backslashes immediately followed by a double quote emits floor(N/2)
+            literal backslashes; if N is odd the quote itself is escaped (emitted literally and
+            does not toggle quoting), otherwise the quote toggles quoting as usual;
+          - a run of backslashes NOT followed by a double quote is emitted literally.
+        This is the ONLY safe way to recover an unambiguous argument vector from a Windows
+        CommandLine string without re-invoking the OS parser; a naive whitespace split (or a
+        substring/Contains search, the exact bug this function replaces) can be defeated by an
+        attacker who places the trusted path as inert, never-executed data anywhere in the line.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$CommandLine)
+    $tokens = [Collections.Generic.List[string]]::new()
+    $length = $CommandLine.Length
+    $i = 0
+    while ($true) {
+        while ($i -lt $length -and ($CommandLine[$i] -eq ' ' -or $CommandLine[$i] -eq "`t")) { $i++ }
+        if ($i -ge $length) { break }
+        $token = [Text.StringBuilder]::new()
+        $inQuotes = $false
+        while ($i -lt $length -and ($inQuotes -or ($CommandLine[$i] -ne ' ' -and $CommandLine[$i] -ne "`t"))) {
+            if ($CommandLine[$i] -eq '\') {
+                $backslashRunStart = $i
+                while ($i -lt $length -and $CommandLine[$i] -eq '\') { $i++ }
+                $backslashCount = $i - $backslashRunStart
+                if ($i -lt $length -and $CommandLine[$i] -eq '"') {
+                    [void]$token.Append([char]'\', [int][Math]::Floor($backslashCount / 2))
+                    if (($backslashCount % 2) -eq 1) {
+                        [void]$token.Append('"')
+                        $i++
+                    }
+                    else {
+                        if ($inQuotes -and $i + 1 -lt $length -and $CommandLine[$i + 1] -eq '"') {
+                            [void]$token.Append('"')
+                            $i += 2
+                        }
+                        else {
+                            $inQuotes = -not $inQuotes
+                            $i++
+                        }
+                    }
+                }
+                else {
+                    [void]$token.Append([char]'\', $backslashCount)
+                }
+            }
+            elseif ($CommandLine[$i] -eq '"') {
+                if ($inQuotes -and $i + 1 -lt $length -and $CommandLine[$i + 1] -eq '"') {
+                    [void]$token.Append('"')
+                    $i += 2
+                }
+                else {
+                    $inQuotes = -not $inQuotes
+                    $i++
+                }
+            }
+            else {
+                [void]$token.Append($CommandLine[$i])
+                $i++
+            }
+        }
+        [void]$tokens.Add($token.ToString())
+    }
+    return , @($tokens.ToArray())
+}
+
+function Get-AgentProcessArgv {
+    <#
+        Cross-platform "independently observed executable image path + argument vector" probe
+        (issue #105 PR5 parent-anchor-spoof fix). Returns @{ ExecutablePath; Arguments } where
+        Arguments excludes argv[0] (the executable token itself, which is never authoritative --
+        Win32_Process.ExecutablePath / the /proc/<pid>/exe symlink target are the OS's own record
+        of the loaded image, independent of anything the command line merely claims about itself).
+        Never a joined/rejoined string: Assert-AgentBrokerCommandLineShape requires an exact,
+        unambiguous array so a caller cannot defeat positional validation by embedding the
+        trusted script path as inert data alongside a real code-execution option.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$ProcessId)
+    if ($IsWindows) {
+        $info = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" `
+            -Property ExecutablePath, CommandLine -ErrorAction Stop
+        if (-not $info) { throw "Process $ProcessId was not found." }
+        if ([string]::IsNullOrEmpty($info.CommandLine)) {
+            throw "Process $ProcessId has no command line to validate."
+        }
+        # NOTE: ConvertFrom-AgentWindowsCommandLineArgv already returns its array via the
+        # comma-wrap idiom (`return , @(...)`) specifically so PowerShell never unrolls it onto
+        # the pipeline -- wrapping this call in an additional @(...) here would instead capture a
+        # single-element array whose one element is the real token array, silently corrupting
+        # every positional index downstream.
+        $tokens = ConvertFrom-AgentWindowsCommandLineArgv -CommandLine $info.CommandLine
+        $arguments = if ($tokens.Count -gt 1) { @($tokens[1..($tokens.Count - 1)]) } else { @() }
+        return @{ ExecutablePath = [string]$info.ExecutablePath; Arguments = $arguments }
+    }
+    if ($IsLinux) {
+        $exeItem = Get-Item -LiteralPath "/proc/$ProcessId/exe" -Force -ErrorAction Stop
+        $exePath = if ($exeItem.Target) { @($exeItem.Target)[0] } else { $exeItem.FullName }
+        $bytes = [IO.File]::ReadAllBytes("/proc/$ProcessId/cmdline")
+        $tokens = @(([Text.Encoding]::UTF8.GetString($bytes)) -split "`0")
+        # procfs cmdline is NUL-delimited with exactly one trailing NUL terminator -- strip only
+        # that single trailing empty artifact, never any legitimate internal empty argument (a
+        # naive "drop every empty entry" filter would silently corrupt positional validation).
+        if ($tokens.Count -gt 0 -and $tokens[$tokens.Count - 1] -eq '') {
+            $tokens = if ($tokens.Count -gt 1) { @($tokens[0..($tokens.Count - 2)]) } else { @() }
+        }
+        $arguments = if ($tokens.Count -gt 1) { @($tokens[1..($tokens.Count - 1)]) } else { @() }
+        return @{ ExecutablePath = [string]$exePath; Arguments = $arguments }
+    }
+    # macOS fallback: no /proc, so there is no OS-native argv boundary source. `ps -o command=`
+    # only ever returns a single space-joined display string; a naive split can silently
+    # misparse an argument containing embedded whitespace as two arguments. Rather than pretend
+    # that split is trustworthy, hand the raw split straight to the strict, exact-shape
+    # positional validator below -- any embedded-whitespace corruption changes the token count or
+    # position and that validator already fails closed on anything but the one exact expected
+    # shape, so this never silently accepts a misparsed line.
+    $comm = ([string](& ps -o comm= -p $ProcessId 2>$null)).Trim()
+    $full = ([string](& ps -o command= -p $ProcessId 2>$null)).Trim()
+    if (-not $comm -or -not $full) {
+        throw "Could not determine the command line for process $ProcessId via ps."
+    }
+    $tokens = @($full -split '\s+' | Where-Object { $_ -ne '' })
+    $arguments = if ($tokens.Count -gt 1) { @($tokens[1..($tokens.Count - 1)]) } else { @() }
+    return @{ ExecutablePath = $comm; Arguments = $arguments }
+}
+
+function Assert-AgentBrokerCommandLineShape {
+    <#
+        Pure, unit-testable structural validator (issue #105 PR5 parent-anchor-spoof fix): the
+        prior check used $liveParentCommandLine.IndexOf($expectedBrokerScript) -- a substring
+        search a forger defeats trivially by launching e.g.
+        `pwsh -NoProfile -Command <payload> "<trusted broker script path>"` and passing the
+        trusted path as a second, never-executed, inert argument. This instead requires the
+        EXACT, fixed shape the dashboard's own broker launcher uses (see
+        DispatchClient.constructor in src/DevPilot.Dashboard/src/dispatch.ts): a bare pwsh/
+        powershell host; only -NoLogo/-NoProfile/-NonInteractive allowed before -File, each at
+        most once; exactly one -File immediately followed by the one canonical trusted broker
+        script path; exactly one -DescriptorPath immediately followed by its value; and nothing
+        else anywhere. Any deviation -- a duplicate -File, -File appearing only as a later data
+        token, -Command/-EncodedCommand/any other option, or trailing extra tokens -- is a single
+        generic failure so a forger's inert extra argument and a genuine code-execution option
+        are rejected identically (no oracle for "how close" a forged command line got).
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ExecutablePath,
+        [Parameter(Mandatory)][AllowNull()][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$ExpectedBrokerScript
+    )
+    $failure = '[broker-attestation-invalid] The claimed broker parent process is not running the pinned broker script.'
+    $hostName = if ($ExecutablePath) { [IO.Path]::GetFileNameWithoutExtension($ExecutablePath) } else { '' }
+    if ([string]::IsNullOrEmpty($hostName) -or $hostName.ToLowerInvariant() -notin @('pwsh', 'powershell')) {
+        throw $failure
+    }
+    $argv = @($Arguments)
+    $allowedPreFlags = @('-NoLogo', '-NoProfile', '-NonInteractive')
+    $seenPreFlags = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $i = 0
+    while ($i -lt $argv.Count -and $argv[$i] -cin $allowedPreFlags) {
+        if (-not $seenPreFlags.Add($argv[$i])) { throw $failure }
+        $i++
+    }
+    if ($i -ge $argv.Count -or $argv[$i] -cne '-File') { throw $failure }
+    $i++
+    if ($i -ge $argv.Count) { throw $failure }
+    $pathComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $suppliedScript = [IO.Path]::GetFullPath($argv[$i])
+    if (-not $suppliedScript.Equals($ExpectedBrokerScript, $pathComparison)) { throw $failure }
+    $i++
+    if ($i -ge $argv.Count -or $argv[$i] -cne '-DescriptorPath') { throw $failure }
+    $i++
+    if ($i -ge $argv.Count) { throw $failure }
+    $descriptorPathArgument = $argv[$i]
+    $i++
+    if ($i -ne $argv.Count) { throw $failure }
+    return [IO.Path]::GetFullPath($descriptorPathArgument)
+}
+
 function Assert-AgentBrokerProcessAnchor {
     <#
         issue #105 PR5 (broker-issuer anchor): the anonymous-pipe/HMAC attestation
@@ -2189,10 +2374,22 @@ function Assert-AgentBrokerProcessAnchor {
           trusted from the manifest;
         - that live parent's own start-time identity (Get-AgentProcessStartIdentity), guarding
           against PID reuse;
-        - that live parent's own command line (Get-AgentProcessCommandLine), which must actually
-          name the one fixed, trusted broker script path this function derives independently from
-          its own module location -- an ordinary shell/launcher was never started that way, so a
-          caller who merely knows and reports their own true PID/start-time still fails here;
+        - that live parent's own independently-observed executable image path and argument
+          vector (Get-AgentProcessArgv), structurally validated by Assert-AgentBrokerCommandLineShape
+          against the EXACT shape the real broker launcher uses -- a bare pwsh/powershell host
+          invoked with exactly one -File naming the one fixed, trusted broker script path this
+          function derives independently from its own module location, and exactly one
+          -DescriptorPath. This is a structured positional check, never a substring/Contains
+          search: an ordinary shell/launcher was never started that way, so a caller who merely
+          knows and reports their own true PID/start-time -- or who appends the trusted script
+          path as a second, inert, never-executed argument alongside a real -Command/
+          -EncodedCommand payload -- still fails here;
+        - the broker's own -DescriptorPath argument, extracted from that same independently
+          observed, structurally-validated argument vector -- NEVER the manifest's
+          brokerDescriptorPath claim, which is only ever accepted once it is shown to equal this
+          OS-observed value; a forger who never actually invokes the real broker script this way
+          can supply any manifest text they like but can never make Assert-AgentBrokerCommandLineShape
+          hand back a descriptor path they merely wish were true;
         - the pinned, owner-private broker descriptor, read from its own trusted, exact-bound
           location (Resolve-AgentTrustedRoot/Assert-AgentTrustedFile -- the same helpers the
           broker itself uses on its own descriptor at startup), never trusted from the manifest's
@@ -2266,18 +2463,31 @@ function Assert-AgentBrokerProcessAnchor {
     # ordinary caller's own shell truthfully IS its own parent. Require that parent to actually be
     # running the pinned broker script; a caller who merely reports the truth about their own
     # shell still fails here.
-    $liveParentCommandLine = Get-AgentProcessCommandLine -ProcessId $liveParentPid
-    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
-    if ([string]::IsNullOrEmpty($liveParentCommandLine) -or
-        $liveParentCommandLine.IndexOf($expectedBrokerScript, $comparison) -lt 0) {
-        throw '[broker-attestation-invalid] The claimed broker parent process is not running the pinned broker script.'
-    }
+    # issue #105 PR5 parent-anchor-spoof fix: a substring/Contains search here was defeated by
+    # launching e.g. `pwsh -NoProfile -Command <payload> "<trusted script path>"` -- the trusted
+    # path is real text in the command line, but only ever as inert, never-executed data. Require
+    # instead the exact positional shape a real broker invocation has, and extract the broker's
+    # own -DescriptorPath argument from that same OS-observed, structurally-validated vector --
+    # never from the manifest alone.
+    $liveParentInvocation = Get-AgentProcessArgv -ProcessId $liveParentPid
+    $liveDescriptorPathFromArgv = Assert-AgentBrokerCommandLineShape -ExecutablePath $liveParentInvocation.ExecutablePath `
+        -Arguments $liveParentInvocation.Arguments -ExpectedBrokerScript $expectedBrokerScript
 
     # Independently read the pinned, owner-private broker descriptor from its own trusted,
     # exact-bound location -- the manifest's claimed path is only ever accepted if it resolves to
     # that exact trusted location; the descriptor's own CONTENT is never trusted from the
     # manifest, only its digest is compared against what the manifest claims.
-    $descriptorFullPath = [IO.Path]::GetFullPath($claimedDescriptorPath)
+    # issue #105 PR5 parent-anchor-spoof fix: the manifest's brokerDescriptorPath is no longer an
+    # independent authority on its own -- it is only ever accepted once proven to equal the
+    # verified parent's own -DescriptorPath argument above (OS truth), then resolved against the
+    # trusted watch-state root exactly as before. A manifest claiming any other path is rejected
+    # here, before that path is ever touched.
+    $claimedDescriptorFullPath = [IO.Path]::GetFullPath($claimedDescriptorPath)
+    $descriptorPathComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    if (-not $claimedDescriptorFullPath.Equals($liveDescriptorPathFromArgv, $descriptorPathComparison)) {
+        throw '[broker-attestation-invalid] Dispatch manifest broker descriptor path does not match the verified broker process command line.'
+    }
+    $descriptorFullPath = $liveDescriptorPathFromArgv
     $descriptorParent = Split-Path $descriptorFullPath -Parent
     $trustedDescriptorRoot = Resolve-AgentTrustedRoot -Path $descriptorParent -Kind watch-state -RepositoryRoot $toolkitRoot
     $descriptorFullPath = Assert-AgentTrustedFile -Path $descriptorFullPath -AllowedRoot $trustedDescriptorRoot `
@@ -6242,6 +6452,9 @@ Export-ModuleMember -Function @(
     "ConvertFrom-AgentProcStatPpid",
     "Get-AgentImmediateParentProcessId",
     "Get-AgentProcessCommandLine",
+    "ConvertFrom-AgentWindowsCommandLineArgv",
+    "Get-AgentProcessArgv",
+    "Assert-AgentBrokerCommandLineShape",
     "Assert-AgentBrokerProcessAnchor",
      "Get-AgentDefaultCapabilityOverrideKillSwitchRoot",
      "Test-AgentCapabilityOverrideKillSwitch",
