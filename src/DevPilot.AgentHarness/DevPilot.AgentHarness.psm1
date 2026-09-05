@@ -2516,6 +2516,146 @@ function Assert-AgentBrokerProcessAnchor {
     }
 }
 
+function Assert-AgentDashboardCommandLineShape {
+    <#
+        Pure, unit-testable structural validator (issue #105 final headless-broker bypass fix):
+        the mirror-image direction of Assert-AgentBrokerCommandLineShape. That function stops a
+        forged CHILD from claiming a fake broker parent; this one stops an ordinary headless
+        caller from running the genuine broker script directly and driving the interactive
+        widening challenge stages itself -- an operator confirmation is an anti-MISTAKE safeguard,
+        never human authentication, but it must be structurally unavailable unless this broker
+        process's own immediate OS parent is the one, fixed, trusted Dashboard launch shape:
+        Start-DevPilotDashboard.ps1's locked Bun runtime running dist/src/index.js
+        (src/DevPilot.Dashboard/src/index.tsx's parseArguments), which then spawns the broker via
+        DispatchClient's own fixed pwsh -File/-DescriptorPath shape (dispatch.ts).
+
+        Exactly like Assert-AgentBrokerCommandLineShape, this is never a substring/Contains
+        search over the parent's command line: it requires the EXACT positions Start-
+        DevPilotDashboard.ps1 itself always emits -- a bare locked Bun executable; the fixed
+        literal token '--conditions=browser'; the one canonical dist/src/index.js entry point;
+        zero or more well-formed --state-dir/--event-log pairs (their VALUES carry no trust
+        weight -- only their shape is checked); then exactly the --broker-executable/
+        --broker-script/--broker-descriptor triple, in that fixed order, whose three values must
+        equal THIS broker process's own live executable path, its own running script path, and
+        its own -DescriptorPath argument -- never anything the parent merely claims. Any
+        deviation (a decoy entry script, an inert extra argument, a -e/eval option, a duplicate or
+        reordered flag, or trailing extra tokens) is a single generic failure, so a forger's
+        near-miss and an ordinary unrelated launcher are rejected identically.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ExecutablePath,
+        [Parameter(Mandatory)][AllowNull()][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$ExpectedBunExecutable,
+        [Parameter(Mandatory)][string]$ExpectedEntryScript,
+        [Parameter(Mandatory)][string]$ExpectedBrokerExecutable,
+        [Parameter(Mandatory)][string]$ExpectedBrokerScript,
+        [Parameter(Mandatory)][string]$ExpectedDescriptorPath
+    )
+    $failure = '[widening-interactive-required] The immediate parent process is not the trusted interactive Dashboard.'
+    $pathComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    function Test-AgentDashboardPathEquals([string]$Supplied, [string]$Expected) {
+        if ([string]::IsNullOrEmpty($Supplied)) { return $false }
+        return ([IO.Path]::GetFullPath($Supplied)).Equals($Expected, $pathComparison)
+    }
+    if (-not (Test-AgentDashboardPathEquals $ExecutablePath $ExpectedBunExecutable)) { throw $failure }
+    $argv = @($Arguments)
+    $i = 0
+    if ($i -ge $argv.Count -or $argv[$i] -cne '--conditions=browser') { throw $failure }
+    $i++
+    if ($i -ge $argv.Count -or -not (Test-AgentDashboardPathEquals $argv[$i] $ExpectedEntryScript)) { throw $failure }
+    $i++
+    while ($i -lt $argv.Count -and $argv[$i] -cin @('--state-dir', '--event-log')) {
+        $i += 2
+        if ($i -gt $argv.Count) { throw $failure }
+    }
+    $expectedTriple = [ordered]@{
+        '--broker-executable' = $ExpectedBrokerExecutable
+        '--broker-script' = $ExpectedBrokerScript
+        '--broker-descriptor' = $ExpectedDescriptorPath
+    }
+    foreach ($flag in $expectedTriple.Keys) {
+        if ($i -ge $argv.Count -or $argv[$i] -cne $flag) { throw $failure }
+        $i++
+        if ($i -ge $argv.Count -or -not (Test-AgentDashboardPathEquals $argv[$i] $expectedTriple[$flag])) { throw $failure }
+        $i++
+    }
+    if ($i -ne $argv.Count) { throw $failure }
+}
+
+function Test-AgentDashboardLaunchProvenance {
+    <#
+        issue #105 final headless-broker bypass fix: an ordinary headless caller can run the
+        genuine broker script directly (`pwsh -File Invoke-DevPilotAgentDispatch.ps1
+        -DescriptorPath ...`) and drive both interactive-widening challenge stages entirely
+        itself -- describe-widening/confirm-widening-preview/confirm-widening-mint never
+        required anything beyond knowing the JSONL protocol shape. Those confirmations are
+        anti-MISTAKE safeguards (catching a wrong role/capability/typo), never human
+        authentication, but making them reachable AT ALL must be structurally unavailable unless
+        this broker process was itself spawned by the trusted interactive Dashboard.
+
+        Called ONCE at broker startup (the result never changes for the life of this broker
+        process -- there is no later re-launch to re-anchor against). Returns $false, and NEVER
+        throws, whenever launch provenance cannot be established for ANY reason: a missing/exited
+        parent, a permission failure reading its live process record, or a structural command-line
+        mismatch are all indistinguishable "provenance cannot be established" outcomes, and all
+        fail closed identically -- the caller gets no oracle for which check actually failed.
+
+        This determination gates ONLY the interactive-widening RPCs (describe-widening/
+        confirm-widening-preview/confirm-widening-mint/cancel-widening) and dispatch of an
+        already-minted grant. Baseline describe/profile/manual (unwidened) dispatch are
+        completely unaffected, so every existing noninteractive protocol test keeps passing
+        exactly as before.
+
+        ANTI-MISTAKE BOUNDARY (do not oversell this): this proves the immediate OS parent really
+        is the one, fixed, trusted Dashboard launch shape -- it is NOT proof of human presence at
+        a keyboard. Automating input into a genuinely-launched interactive Dashboard process is
+        entirely outside this check's scope; it defends only against an ordinary headless/
+        script/CLI caller who never went through the Dashboard at all, exactly like
+        Assert-AgentBrokerProcessAnchor's own documented boundary for the mirror-image direction.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ToolkitRoot,
+        [Parameter(Mandatory)][string]$BrokerScriptPath,
+        [Parameter(Mandatory)][string]$DescriptorPath
+    )
+    try {
+        $dashboardRoot = Join-Path (Join-Path $ToolkitRoot 'src') 'DevPilot.Dashboard'
+        $bunExecutableName = if ($IsWindows) { 'bun.exe' } else { 'bun' }
+        $expectedBunExecutable = [IO.Path]::GetFullPath(
+            (Join-Path $dashboardRoot (Join-Path 'node_modules' (Join-Path 'bun' (Join-Path 'bin' $bunExecutableName)))))
+        $expectedEntryScript = [IO.Path]::GetFullPath((Join-Path $dashboardRoot (Join-Path 'dist' (Join-Path 'src' 'index.js'))))
+        $expectedBrokerScript = [IO.Path]::GetFullPath($BrokerScriptPath)
+        $expectedDescriptorPath = [IO.Path]::GetFullPath($DescriptorPath)
+        # This process's own live executable image path, from the same OS-native probe used for
+        # the parent below -- never $PSCommandPath (that names the SCRIPT, not the host binary)
+        # and never a guessed/derived path, so this always agrees with whatever the real running
+        # pwsh host actually is, including on hosts where multiple pwsh installs exist on PATH.
+        $ownInvocation = Get-AgentProcessArgv -ProcessId $PID
+        $expectedBrokerExecutable = [IO.Path]::GetFullPath($ownInvocation.ExecutablePath)
+
+        # Independently obtain THIS process's real immediate OS parent -- never trusted from an
+        # environment variable or anything the parent could otherwise merely claim about itself.
+        $liveParentPid = Get-AgentImmediateParentProcessId -ProcessId $PID
+        $liveParentProcess = Get-Process -Id $liveParentPid -ErrorAction Stop
+        # Bind the parent's own start-time identity purely to guard the narrow window between
+        # reading its PID and opening its process handle above -- the same PID-reuse discipline
+        # Assert-AgentBrokerProcessAnchor applies for the mirror-image (child->broker) anchor.
+        # There is no separate manifest claim to compare it against here; requiring it to be
+        # obtainable at all is itself part of establishing a genuinely live, well-formed process.
+        [void](Get-AgentProcessStartIdentity -Process $liveParentProcess)
+        $liveParentInvocation = Get-AgentProcessArgv -ProcessId $liveParentPid
+        Assert-AgentDashboardCommandLineShape -ExecutablePath $liveParentInvocation.ExecutablePath `
+            -Arguments $liveParentInvocation.Arguments -ExpectedBunExecutable $expectedBunExecutable `
+            -ExpectedEntryScript $expectedEntryScript -ExpectedBrokerExecutable $expectedBrokerExecutable `
+            -ExpectedBrokerScript $expectedBrokerScript -ExpectedDescriptorPath $expectedDescriptorPath
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-AgentHashtableMemberOrNull {
     param([Parameter(Mandatory)][hashtable]$Table, [Parameter(Mandatory)][string]$Name)
     if ($Table.Contains($Name) -and $null -ne $Table[$Name]) { return $Table[$Name] }
@@ -6456,6 +6596,8 @@ Export-ModuleMember -Function @(
     "Get-AgentProcessArgv",
     "Assert-AgentBrokerCommandLineShape",
     "Assert-AgentBrokerProcessAnchor",
+    "Assert-AgentDashboardCommandLineShape",
+    "Test-AgentDashboardLaunchProvenance",
      "Get-AgentDefaultCapabilityOverrideKillSwitchRoot",
      "Test-AgentCapabilityOverrideKillSwitch",
      "Enable-AgentCapabilityOverrideKillSwitch",

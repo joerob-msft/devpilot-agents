@@ -374,3 +374,257 @@ Describe 'headless/direct dispatch guards (issue #105 PR4 requirement 7)' {
         $stderr | Should -Match 'requires a sealed manual dispatch grant'
     }
 }
+
+Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboard (issue #105 final)' {
+    BeforeAll {
+        $script:dashboardRepositoryRoot = (Resolve-Path "$PSScriptRoot\..").Path
+        $script:dashboardRootPath = Join-Path $script:dashboardRepositoryRoot 'src\DevPilot.Dashboard'
+        $script:dashboardBunExecutableName = if ($IsWindows) { 'bun.exe' } else { 'bun' }
+        $script:expectedDashboardBunExecutable = [IO.Path]::GetFullPath(
+            (Join-Path $script:dashboardRootPath "node_modules\bun\bin\$script:dashboardBunExecutableName"))
+        $script:expectedDashboardEntryScript = [IO.Path]::GetFullPath((Join-Path $script:dashboardRootPath 'dist\src\index.js'))
+    }
+
+    It 'exports the new dashboard-anchor primitives at module scope and keeps them in the manifest' {
+        foreach ($name in @('Assert-AgentDashboardCommandLineShape', 'Test-AgentDashboardLaunchProvenance')) {
+            Get-Command $name -Module DevPilot.AgentHarness | Should -Not -BeNullOrEmpty
+        }
+        $manifestPath = (Resolve-Path "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1").Path
+        $manifestContent = Get-Content -LiteralPath $manifestPath -Raw
+        foreach ($name in @('Assert-AgentDashboardCommandLineShape', 'Test-AgentDashboardLaunchProvenance')) {
+            $manifestContent | Should -Match ([regex]::Escape("'$name'"))
+        }
+    }
+
+    It 'Assert-AgentDashboardCommandLineShape accepts only the exact canonical Start-DevPilotDashboard.ps1 invocation shape' {
+        $brokerExe = 'C:\fake\pwsh.exe'
+        $descriptorPath = 'C:\fake\watch\broker.descriptor.v1.json'
+        {
+            Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                -Arguments @(
+                    '--conditions=browser', $script:expectedDashboardEntryScript,
+                    '--state-dir', 'C:\fake\state1', '--event-log', 'C:\fake\events.jsonl',
+                    '--broker-executable', $brokerExe, '--broker-script', $script:brokerPath,
+                    '--broker-descriptor', $descriptorPath) `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath `
+                -ExpectedDescriptorPath $descriptorPath
+        } | Should -Not -Throw
+
+        # Zero state-dir/event-log pairs is also a legal shape (Start-DevPilotDashboard.ps1 only
+        # emits them when configured).
+        {
+            Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                -Arguments @(
+                    '--conditions=browser', $script:expectedDashboardEntryScript,
+                    '--broker-executable', $brokerExe, '--broker-script', $script:brokerPath,
+                    '--broker-descriptor', $descriptorPath) `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath `
+                -ExpectedDescriptorPath $descriptorPath
+        } | Should -Not -Throw
+    }
+
+    It 'Assert-AgentDashboardCommandLineShape rejects a decoy Bun executable, a decoy entry script used as inert data, a wrong --conditions value, a forged broker triple, and trailing extra tokens' {
+        $brokerExe = 'C:\fake\pwsh.exe'
+        $descriptorPath = 'C:\fake\watch\broker.descriptor.v1.json'
+        $trustedTriple = @('--broker-executable', $brokerExe, '--broker-script', $script:brokerPath, '--broker-descriptor', $descriptorPath)
+
+        # (1) A decoy/unlocked Bun binary elsewhere on PATH.
+        {
+            Assert-AgentDashboardCommandLineShape -ExecutablePath 'C:\other\bun.exe' `
+                -Arguments (@('--conditions=browser', $script:expectedDashboardEntryScript) + $trustedTriple) `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
+        } | Should -Throw '*widening-interactive-required*'
+
+        # (2) issue #105 PR5-style spoof attempt: the trusted entry script appears in the command
+        # line only as inert trailing data, after a real code-execution option/decoy entry runs first.
+        {
+            Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                -Arguments (@('--conditions=browser', 'C:\decoy\index.js') + $trustedTriple + @($script:expectedDashboardEntryScript)) `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
+        } | Should -Throw '*widening-interactive-required*'
+
+        # (3) Wrong --conditions value, even though the entry script and broker triple are otherwise exact.
+        {
+            Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                -Arguments (@('--conditions=node', $script:expectedDashboardEntryScript) + $trustedTriple) `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
+        } | Should -Throw '*widening-interactive-required*'
+
+        # (4) Forged --broker-script value (an attacker-controlled script masquerading as the broker).
+        {
+            Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                -Arguments @('--conditions=browser', $script:expectedDashboardEntryScript,
+                    '--broker-executable', $brokerExe, '--broker-script', 'C:\attacker\decoy-broker.ps1', '--broker-descriptor', $descriptorPath) `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
+        } | Should -Throw '*widening-interactive-required*'
+
+        # (5) A trailing extra token after an otherwise-exact broker triple.
+        {
+            Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                -Arguments (@('--conditions=browser', $script:expectedDashboardEntryScript) + $trustedTriple + @('--extra')) `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
+        } | Should -Throw '*widening-interactive-required*'
+
+        # (6) Reordered triple (broker-descriptor before broker-script) is not the fixed shape.
+        {
+            Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                -Arguments @('--conditions=browser', $script:expectedDashboardEntryScript,
+                    '--broker-executable', $brokerExe, '--broker-descriptor', $descriptorPath, '--broker-script', $script:brokerPath) `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
+        } | Should -Throw '*widening-interactive-required*'
+    }
+
+    It 'Test-AgentDashboardLaunchProvenance returns $true only when every OS-observed fact matches the canonical Dashboard shape, and $false (never throws) for any mismatch or missing parent' {
+        InModuleScope DevPilot.AgentHarness -Parameters @{
+            RepositoryRoot = $script:dashboardRepositoryRoot; BrokerPath = $script:brokerPath
+            ExpectedBunExecutable = $script:expectedDashboardBunExecutable; ExpectedEntryScript = $script:expectedDashboardEntryScript
+        } {
+            param($RepositoryRoot, $BrokerPath, $ExpectedBunExecutable, $ExpectedEntryScript)
+            $descriptorPath = 'C:\fake\watch\broker.descriptor.v1.json'
+            $ownExecutable = 'C:\fake\pwsh.exe'
+            Mock Get-AgentProcessArgv { @{ ExecutablePath = $ownExecutable; Arguments = @() } } -ParameterFilter { $ProcessId -eq $PID }
+            Mock Get-AgentImmediateParentProcessId { 999999 }
+            Mock Get-Process { [Diagnostics.Process]::GetCurrentProcess() } -ParameterFilter { $Id -eq 999999 }
+            Mock Get-AgentProcessStartIdentity { 'utc:123456789' }
+
+            # Accept: the parent is exactly the locked Bun runtime running the canonical entry
+            # script, wired to this broker's own executable/script and the requested descriptor.
+            Mock Get-AgentProcessArgv {
+                @{
+                    ExecutablePath = $ExpectedBunExecutable
+                    Arguments = @('--conditions=browser', $ExpectedEntryScript, '--broker-executable', $ownExecutable,
+                        '--broker-script', $BrokerPath, '--broker-descriptor', $descriptorPath)
+                }
+            } -ParameterFilter { $ProcessId -eq 999999 }
+            Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
+                Should -BeTrue
+
+            # Reject: an ordinary headless caller's own shell is truthfully its own parent, but it
+            # is never the locked Bun host.
+            Mock Get-AgentProcessArgv { @{ ExecutablePath = 'C:\Windows\System32\cmd.exe'; Arguments = @() } } -ParameterFilter { $ProcessId -eq 999999 }
+            Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
+                Should -BeFalse
+
+            # Reject: the broker triple's --broker-descriptor value does not match the descriptor
+            # this broker process was actually started with (a decoy Dashboard pointed elsewhere).
+            Mock Get-AgentProcessArgv {
+                @{
+                    ExecutablePath = $ExpectedBunExecutable
+                    Arguments = @('--conditions=browser', $ExpectedEntryScript, '--broker-executable', $ownExecutable,
+                        '--broker-script', $BrokerPath, '--broker-descriptor', 'C:\fake\watch\other.descriptor.json')
+                }
+            } -ParameterFilter { $ProcessId -eq 999999 }
+            Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
+                Should -BeFalse
+
+            # Reject, never throw: the parent process has already exited / is inaccessible.
+            Mock Get-Process { throw 'process not found' } -ParameterFilter { $Id -eq 999999 }
+            { Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath } |
+                Should -Not -Throw
+            Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
+                Should -BeFalse
+        }
+    }
+
+    It 'gates every interactive-widening operation and dispatch of a minted grant behind $interactiveWideningAvailable, computed once at startup, without touching baseline describe/profile/manual dispatch' {
+        $brokerSource = Get-Content -LiteralPath $script:brokerPath -Raw
+        $brokerSource | Should -Match '\$interactiveWideningAvailable = Test-AgentDashboardLaunchProvenance'
+        foreach ($fn in @('Invoke-DescribeWidening', 'Invoke-ConfirmWideningPreview', 'Invoke-ConfirmWideningMint', 'Invoke-CancelWidening')) {
+            $body = [regex]::Match($brokerSource, "(?s)function $fn \{.*?\n\}").Value
+            $body | Should -Not -BeNullOrEmpty
+            $body | Should -Match 'Assert-AgentInteractiveWideningAvailable'
+        }
+        foreach ($fn in @('Invoke-Describe', 'Invoke-Profile')) {
+            $body = [regex]::Match($brokerSource, "(?s)function $fn \{.*?\n\}").Value
+            $body | Should -Not -BeNullOrEmpty
+            $body | Should -Not -Match 'Assert-AgentInteractiveWideningAvailable'
+        }
+        $dispatchBody = [regex]::Match($brokerSource, '(?s)function Invoke-Dispatch \{.*?\n\}').Value
+        $dispatchBody | Should -Not -BeNullOrEmpty
+        $dispatchBody | Should -Match 'widening-interactive-required'
+    }
+
+    It 'a broker launched directly by pwsh (no trusted Dashboard ancestor) rejects every interactive-widening operation with [widening-interactive-required], while baseline describe/shutdown keep working' {
+        $repositoryRoot = $script:dashboardRepositoryRoot
+        $suiteRoot = Join-Path $TestDrive 'dashboard-anchor-direct-launch'
+        $stateRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'watch') `
+            -Kind watch-state -RepositoryRoot $repositoryRoot -Create
+        $durableRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'durable') `
+            -Kind durable-state -RepositoryRoot $repositoryRoot -DisallowedRoots @($stateRoot) -Create
+        $leaseRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'leases') `
+            -Kind lease -RepositoryRoot $repositoryRoot -DisallowedRoots @($stateRoot, $durableRoot) -Create
+        $descriptorPath = Join-Path $stateRoot 'broker.descriptor.v1.json'
+        @{
+            schemaVersion = 1; ownerProcessId = $PID; stateRoot = $stateRoot; durableStateRoot = $durableRoot
+            leaseRoot = $leaseRoot; operatorAlias = 'integration-test'; roles = @{}
+        } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $descriptorPath -Encoding utf8NoBOM
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($descriptorPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        [void](Assert-AgentTrustedFile -Path $descriptorPath -AllowedRoot $stateRoot -ExpectedPath $descriptorPath -Private)
+
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = Resolve-AgentPwshPath
+        foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:brokerPath, '-DescriptorPath', $descriptorPath)) {
+            [void]$startInfo.ArgumentList.Add($argument)
+        }
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+        try {
+            foreach ($op in @('describe-widening', 'confirm-widening-preview', 'confirm-widening-mint', 'cancel-widening')) {
+                $opId = [Guid]::NewGuid().ToString('D')
+                $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{
+                            schemaVersion = 1; requestId = $opId; operation = $op
+                        }))
+                $opTask = $process.StandardOutput.ReadLineAsync()
+                $opTask.Wait(10000) | Should -BeTrue -Because "the broker must process $op while stdin remains open"
+                $opResponse = $opTask.Result | ConvertFrom-Json -AsHashtable
+                $opResponse.requestId | Should -BeExactly $opId
+                $opResponse.operation | Should -BeExactly 'rejected'
+                $opResponse.code | Should -BeExactly 'widening-interactive-required'
+            }
+
+            # Baseline: describe (unwidened) is completely unaffected by this broker's launch
+            # provenance -- it rejects for the ordinary reason (no reviewer role configured),
+            # never for the interactive gate.
+            $describeId = [Guid]::NewGuid().ToString('D')
+            $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{
+                        schemaVersion = 1; requestId = $describeId; operation = 'describe'
+                        role = 'reviewer'; pullRequestId = 1; repositoryKey = 'v1:github:1'
+                    }))
+            $describeTask = $process.StandardOutput.ReadLineAsync()
+            $describeTask.Wait(10000) | Should -BeTrue
+            $describeResponse = $describeTask.Result | ConvertFrom-Json -AsHashtable
+            $describeResponse.operation | Should -BeExactly 'rejected'
+            $describeResponse.code | Should -BeExactly 'role-not-allowed'
+
+            $shutdownId = [Guid]::NewGuid().ToString('D')
+            $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{ schemaVersion = 1; requestId = $shutdownId; operation = 'shutdown' }))
+            $shutdownTask = $process.StandardOutput.ReadLineAsync()
+            $shutdownTask.Wait(10000) | Should -BeTrue
+            ($shutdownTask.Result | ConvertFrom-Json -AsHashtable).operation | Should -BeExactly 'shutdown-complete'
+
+            $process.StandardInput.Close()
+            $process.WaitForExit(15000) | Should -BeTrue
+            $stderr = $process.StandardError.ReadToEnd()
+            $process.ExitCode | Should -Be 0 -Because $stderr
+        }
+        finally {
+            if (-not $process.HasExited) { $process.Kill($true); [void]$process.WaitForExit(5000) }
+            $process.Dispose()
+        }
+    }
+}

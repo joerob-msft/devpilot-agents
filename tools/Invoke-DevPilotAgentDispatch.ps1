@@ -35,6 +35,16 @@ $descriptorDigest = Get-AgentCanonicalDigest -InputObject $descriptor
 $brokerProcessStartIdentity = Get-AgentProcessStartIdentity -Process (Get-Process -Id $PID)
 $brokerScriptSha256 = [Convert]::ToHexString(
     [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($PSCommandPath))).ToLowerInvariant()
+# issue #105 final headless-broker bypass fix: an ordinary headless caller can run this exact
+# script directly and drive both interactive-widening challenge stages entirely themselves --
+# those confirmations are anti-mistake safeguards, never human authentication, but must be
+# structurally unreachable unless this broker's own immediate OS parent really is the trusted
+# interactive Dashboard (Start-DevPilotDashboard.ps1's locked Bun runtime spawning this exact
+# script -- see Test-AgentDashboardLaunchProvenance for the full anchor). Computed exactly once,
+# here, before the request loop starts; never re-evaluated per-request. Baseline describe/
+# profile/manual (unwidened) dispatch are completely unaffected by this value.
+$interactiveWideningAvailable = Test-AgentDashboardLaunchProvenance -ToolkitRoot $toolkitRoot `
+    -BrokerScriptPath $PSCommandPath -DescriptorPath $descriptorFullPath
 $stateRoot = [IO.Path]::GetFullPath([string]$descriptor.stateRoot)
 $durableRoot = [IO.Path]::GetFullPath([string]$descriptor.durableStateRoot)
 $leaseRoot = [IO.Path]::GetFullPath([string]$descriptor.leaseRoot)
@@ -879,8 +889,24 @@ function Add-AgentConsumedWideningChallenge {
     while ($Widening.ConsumedChallenges.Count -gt 8) { $Widening.ConsumedChallenges.RemoveAt(0) }
 }
 
+function Assert-AgentInteractiveWideningAvailable {
+    <#
+        issue #105 final headless-broker bypass fix: gates every interactive-widening RPC
+        (describe-widening/confirm-widening-preview/confirm-widening-mint/cancel-widening) and,
+        separately, dispatch of an already-minted grant (see Invoke-Dispatch). $interactiveWideningAvailable
+        is computed exactly once, at broker startup, by Test-AgentDashboardLaunchProvenance -- it
+        never changes for the life of this broker process. Placed FIRST in every gated operation,
+        before any other request validation, so a direct-pwsh caller is rejected identically
+        regardless of whether the rest of their request would otherwise have been valid.
+    #>
+    if (-not $interactiveWideningAvailable) {
+        throw '[widening-interactive-required] Interactive widening requires a broker process launched by the trusted Dashboard.'
+    }
+}
+
 function Invoke-DescribeWidening {
     param([hashtable]$Request)
+    Assert-AgentInteractiveWideningAvailable
     $resolved = Resolve-DraftWideningDraft $Request
     $draftId = $resolved.DraftId; $draft = $resolved.Draft
     Assert-AgentWideningRequestBinding -Request $Request -Draft $draft
@@ -919,6 +945,7 @@ function Invoke-DescribeWidening {
 
 function Invoke-ConfirmWideningPreview {
     param([hashtable]$Request)
+    Assert-AgentInteractiveWideningAvailable
     $resolved = Resolve-DraftWideningDraft $Request
     $draftId = $resolved.DraftId; $draft = $resolved.Draft
     Assert-AgentWideningRequestBinding -Request $Request -Draft $draft
@@ -954,6 +981,7 @@ function Invoke-ConfirmWideningPreview {
 
 function Invoke-ConfirmWideningMint {
     param([hashtable]$Request)
+    Assert-AgentInteractiveWideningAvailable
     $resolved = Resolve-DraftWideningDraft $Request
     $draftId = $resolved.DraftId; $draft = $resolved.Draft
     Assert-AgentWideningRequestBinding -Request $Request -Draft $draft
@@ -1005,6 +1033,7 @@ function Invoke-ConfirmWideningMint {
 
 function Invoke-CancelWidening {
     param([hashtable]$Request)
+    Assert-AgentInteractiveWideningAvailable
     $resolved = Resolve-DraftWideningDraft $Request
     $draftId = $resolved.DraftId; $draft = $resolved.Draft
     Assert-AgentWideningRequestBinding -Request $Request -Draft $draft
@@ -1202,6 +1231,16 @@ function Invoke-Dispatch {
     # on, so it is re-verified in full, fresh, right before the sealed artifact/child are created.
     $grantCapability = if ($draft.Widening -and $draft.Widening.Stage -ceq 'minted') { $draft.Widening.Capability } else { $null }
     if ($grantCapability) {
+        # issue #105 final headless-broker bypass fix: $interactiveWideningAvailable is invariant
+        # for the life of this broker process, so a minted grant can only ever exist here if it
+        # was already true throughout describe-widening/confirm-widening-preview/-mint above --
+        # this is defense-in-depth, never reachable through the normal request sequence, but
+        # dispatch of an already-minted grant must still independently require it rather than
+        # trust that the earlier gates were never bypassed by a future code change.
+        if (-not $interactiveWideningAvailable) {
+            $draft.Widening = $null; $draft.WideningGeneration++
+            throw '[widening-interactive-required] Interactive widening requires a broker process launched by the trusted Dashboard.'
+        }
         if ([DateTime]::UtcNow -ge $draft.Widening.GrantExpiresAtUtc) { throw '[grant-invalidated] Widening grant has expired.' }
         # issue #105 PR4 CRITICAL-1: recheck the kill switch at dispatch preflight too (not only at
         # child startup) -- an operator who flips it on any time after mint, even before the child

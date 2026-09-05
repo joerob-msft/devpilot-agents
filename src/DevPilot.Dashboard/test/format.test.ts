@@ -37,6 +37,9 @@ function namedEvent(eventType: string, data: Record<string, unknown> = {}, messa
     assert.match(dispatchResultDetail("delivery-pending"), /delivery is pending/);
     assert.match(dispatchResultDetail("already-running", "state-contended"), /role state is busy/);
     assert.doesNotMatch(dispatchResultDetail("launch-failed", "bad\u001bdetail"), /\u001b/);
+    // issue #105 final headless-broker bypass fix: distinct message, never the generic
+    // "Dispatch rejected: <code>" fallback, and never suggests retrying from the client.
+    assert.match(dispatchResultDetail("widening-interactive-required"), /not launched by the trusted Dashboard/);
   });
 }
 

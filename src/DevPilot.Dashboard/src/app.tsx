@@ -133,6 +133,11 @@ export function dispatchResultDetail(code: string, detail = ""): string {
     "widening-expired": "The widening confirmation expired; request widening again.",
     "widening-replay": "That widening confirmation was already used; request widening again.",
     "widening-stale": "Widening state has moved on; re-open the widening panel and try again.",
+    // issue #105 final headless-broker bypass fix: distinct from every other widening rejection
+    // -- this broker process was not itself launched by the trusted interactive Dashboard, so
+    // interactive widening is structurally unavailable here. No retry can fix this from the
+    // client; only relaunching through the trusted Dashboard entry point can.
+    "widening-interactive-required": "Interactive widening is unavailable: this broker was not launched by the trusted Dashboard.",
     "delegation-not-allowed": "The checked-in delegation policy does not permit this capability for this repository.",
     "delegation-policy-unavailable": "The checked-in delegation policy could not be loaded; widening is unavailable right now.",
     "grant-invalidated": "The capability widening grant is no longer valid; dispatch without it or request widening again.",

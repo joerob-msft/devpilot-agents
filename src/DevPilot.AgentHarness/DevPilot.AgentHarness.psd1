@@ -111,6 +111,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'ConvertFrom-AgentProcStatPpid', 'Get-AgentImmediateParentProcessId', 'Get-AgentProcessCommandLine',
                'ConvertFrom-AgentWindowsCommandLineArgv', 'Get-AgentProcessArgv', 'Assert-AgentBrokerCommandLineShape',
                'Assert-AgentBrokerProcessAnchor',
+               'Assert-AgentDashboardCommandLineShape', 'Test-AgentDashboardLaunchProvenance',
                'Repair-AgentDurableState', 'Read-AgentDurableState', 'Write-AgentDurableState',
                'Get-AgentDurableRecords', 'Get-AgentDurableRecordsSnapshot', 'Set-AgentDurableRecords', 'Initialize-AgentDurableState',
                'Test-AgentAnalysisRequired', 'Test-AgentReviewerDeliveryPending', 'Confirm-AgentLegacyRecordsForMigration',
