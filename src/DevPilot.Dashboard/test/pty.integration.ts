@@ -806,6 +806,7 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
     terminal = spawn(bunPath, [
       "--conditions=browser",
       entryPath,
+      "--launch-mode", "operational",
       "--state-dir", stateRoot,
       "--broker-executable", powerShellPath,
       "--broker-script", brokerScriptPath,
@@ -826,6 +827,7 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
     });
 
     await waitForVisible("DEVPILOT OPERATIONS");
+    await waitForVisible("OPERATIONAL");
     await waitForVisible("TRUSTED MANUAL ENABLED");
     await writeAndWait("f", "View filter changed to History");
     await waitForVisible("operations-dashboard PR #104");

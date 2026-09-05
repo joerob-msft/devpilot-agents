@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { decideLayout, type LayoutDecision } from "./layout.js";
@@ -60,11 +60,13 @@ const COLORS = {
 type Overlay = "none" | "events" | "palette" | "help" | "settings";
 type RoleFilter = "all" | AgentRole;
 type PaneFocus = "rail" | "detail" | "timeline" | "inspector";
+export type LaunchMode = "observe" | "preview" | "operational";
 
 export interface AppProps {
   reducer: OperationsReducer;
   history?: PullRequestHistoryProjection;
   tailer: EventTailer;
+  launchMode?: LaunchMode;
   openUrl?: (url: string) => void | Promise<void>;
   broker?: DispatchBroker | undefined;
   brokerFailure?: () => string;
@@ -158,6 +160,7 @@ function ManualDispatchPanel(props: {
   wideningPreview: WideningPreview | WideningSummary | null;
   wideningStatus: string;
   mintedWideningGeneration: number | null;
+  wideningLocked: boolean;
 }) {
   const promptPreview = () => line(props.prompt.replace(/\n/g, " / ") || "(none)", 90);
   const identity = () => props.summary?.repositoryIdentity ?? props.entry.repositoryIdentity;
@@ -206,13 +209,16 @@ function ManualDispatchPanel(props: {
                   <Show when={props.mintedWideningGeneration !== null}>
                     <text height={1} fg={COLORS.ok}>Widening grant minted and active for this draft; continue with d then y to dispatch, or Esc to close and relinquish it.</text>
                   </Show>
-                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 0}>
+                  <Show when={props.mintedWideningGeneration === null && props.wideningLocked}>
+                    <text height={1} fg={COLORS.error}>Widening locked by PreviewOnly.</text>
+                  </Show>
+                  <Show when={props.mintedWideningGeneration === null && !props.wideningLocked && summary().delegableAvailable.length === 0}>
                     <text height={1} fg={COLORS.muted}>No delegated capabilities available for this role.</text>
                   </Show>
-                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 1 && summary().killSwitchActive}>
+                  <Show when={props.mintedWideningGeneration === null && !props.wideningLocked && summary().delegableAvailable.length === 1 && summary().killSwitchActive}>
                     <text height={1} fg={COLORS.error}>Widening unavailable while the kill switch is active.</text>
                   </Show>
-                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 1 && !summary().killSwitchActive}>
+                  <Show when={props.mintedWideningGeneration === null && !props.wideningLocked && summary().delegableAvailable.length === 1 && !summary().killSwitchActive}>
                     <text height={1} fg={COLORS.muted}>Press w to request {summary().delegableAvailable[0]} widening (draft-bound, single-use).</text>
                   </Show>
                   <text height={1} fg={COLORS.warning}>First confirmation: press d to review the final execution gate; Esc cancels.</text>
@@ -300,17 +306,17 @@ function History(props: {
       <Panel title={`PR HISTORY ${props.entries.length}`} width={props.compact ? "100%" : 38} borderColor={COLORS.interactive}>
         <Show when={props.entries.length} fallback={<Empty />}>
           <scrollbox flexGrow={1} scrollY>
-            <For each={props.entries}>
+            <Index each={props.entries}>
               {(entry, index) => (
-                <box height={4} paddingX={1} backgroundColor={index() === props.selected ? COLORS.panelAlt : COLORS.panel}>
-                  <text height={1} fg={index() === props.selected ? COLORS.accent : COLORS.text}>
-                    {index() === props.selected ? "> " : "  "}{entry.repositoryIdentity.repositoryName} PR #{entry.pullRequestId}
+                <box height={4} paddingX={1} backgroundColor={index === props.selected ? COLORS.panelAlt : COLORS.panel}>
+                  <text height={1} fg={index === props.selected ? COLORS.accent : COLORS.text}>
+                    {index === props.selected ? "> " : "  "}{entry().repositoryIdentity.repositoryName} PR #{entry().pullRequestId}
                   </text>
-                  <text height={1} fg={COLORS.text}>{line(entry.title || "title not reported", 32)}</text>
-                  <text height={1} fg={COLORS.muted}>{line(entry.author || "author unknown", 32)}</text>
+                  <text height={1} fg={COLORS.text}>{line(entry().title || "title not reported", 32)}</text>
+                  <text height={1} fg={COLORS.muted}>{line(entry().author || "author unknown", 32)}</text>
                 </box>
               )}
-            </For>
+            </Index>
           </scrollbox>
         </Show>
       </Panel>
@@ -747,7 +753,12 @@ export function App(props: AppProps) {
   const [historyFilter, setHistoryFilter] = createSignal("");
   const [historyInputMode, setHistoryInputMode] = createSignal<"none" | "filter" | "jump">("none");
   const [historyInput, setHistoryInput] = createSignal("");
-  const [feedback, setFeedback] = createSignal("Observer is read-only");
+  const defaultFeedback = props.launchMode === "operational"
+    ? "OPERATIONAL: this launch authorizes pull-request mutations"
+    : props.launchMode === "preview"
+      ? "PREVIEW ONLY: live agents cannot mutate pull requests"
+      : "Observer is read-only";
+  const [feedback, setFeedback] = createSignal(defaultFeedback);
   const [manualMode, setManualMode] = createSignal<ManualMode>("closed");
   const [manualEntry, setManualEntry] = createSignal<PullRequestHistoryEntry | null>(null);
   const [manualRole, setManualRole] = createSignal<AgentRole>("reviewer");
@@ -855,7 +866,7 @@ export function App(props: AppProps) {
   function notify(message: string): void {
     setFeedback(line(message, 180));
     if (feedbackTimer) clearTimeout(feedbackTimer);
-    feedbackTimer = setTimeout(() => setFeedback("Observer is read-only"), 2_500);
+    feedbackTimer = setTimeout(() => setFeedback(defaultFeedback), 2_500);
   }
 
   const instances = createMemo(() => {
@@ -1013,7 +1024,8 @@ export function App(props: AppProps) {
   function canRequestWidening(): boolean {
     const summary = capabilitySummary();
     return manualMode() === "confirm" && wideningStage() === "closed" &&
-      Boolean(summary) && !summary!.killSwitchActive && summary!.delegableAvailable.length === 1;
+      props.launchMode !== "preview" && Boolean(summary) &&
+      !summary!.killSwitchActive && summary!.delegableAvailable.length === 1;
   }
 
   async function beginWidening(): Promise<void> {
@@ -2036,15 +2048,25 @@ export function App(props: AppProps) {
     const stale = instances().filter((item) => streamLabel(item) === "Stale").length;
     if (view() === "history" && props.history) {
       const input = historyInputMode() === "none" ? "" : ` | ${historyInputMode()}: ${historyInput()}`;
-      const summary = `PR history ${historyEntries().length}${historyFilter() ? ` | filter: ${historyFilter()}` : ""}${input}`;
-      return { summary, hint: "↑/↓ select | / filter | number jump | Tab role | x hide | X restore | m manual | f view | ? | q" };
+      const selectedPr = historyCurrent();
+      const selectedLabel = selectedPr
+        ? ` | selected ${selectedPr.repositoryIdentity.repositoryName} #${selectedPr.pullRequestId}`
+        : " | no PR selected";
+      const summary = `PR history ${historyEntries().length}${selectedLabel}${historyFilter() ? ` | filter: ${historyFilter()}` : ""}${input}`;
+      if (dimensions().width >= 120) {
+        return { summary, hint: "↑/↓ select | m launch | Tab role | / filter | number jump | x/X | f view | ? | q" };
+      }
+      if (dimensions().width >= 80) {
+        return { summary, hint: "↑/↓ select | m launch | Tab role | / filter | f view | ? | q" };
+      }
+      return { summary, hint: "↑/↓ | m launch | Tab role | f view | ? | q" };
     }
     const summary = dimensions().width < 80
       ? `${viewLabel(view())} ${instances().length} | L ${live} H ${history} S ${stale}`
       : `${viewLabel(view())} ${instances().length} | Live ${live} History ${history} Stale ${stale}`;
-    if (dimensions().width >= 120) return { summary, hint: "←/→ pane | ↑/↓ select | f view | Tab role | x/X forget | Enter/Esc | i/e/o/w | Ctrl+P | ? | q" };
-    if (dimensions().width >= 80) return { summary, hint: "f view | Tab role | x/X forget | Enter/Esc | i/e/o | ? | q" };
-    return { summary, hint: layout().showDetail ? "Esc | f view | x forget | i/e/o | ? | q" : "↑/↓ | Enter | f view | Tab | x/X | ? | q" };
+    if (dimensions().width >= 120) return { summary, hint: "f History | m launch selected PR | ←/→ pane | ↑/↓ | Tab role | i/e/o/w | Ctrl+P | ? | q" };
+    if (dimensions().width >= 80) return { summary, hint: "f History | m launch selected PR | Tab role | i/e/o | ? | q" };
+    return { summary, hint: "Enter | f History | m launch | ? | q" };
   });
   const headerContext = createMemo(() => {
     if (dimensions().width >= 120) {
@@ -2060,8 +2082,10 @@ export function App(props: AppProps) {
     <box width="100%" height="100%" flexDirection="column" backgroundColor={COLORS.bg}>
       <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
         <text height={1} fg={COLORS.brand}>DEVPILOT OPERATIONS</text>
-        <text height={1} fg={props.broker ? COLORS.warning : COLORS.muted}>
-          {props.broker ? "TRUSTED MANUAL ENABLED" : "OBSERVE ONLY"} | {headerContext()}
+        <text height={1} fg={props.launchMode === "operational" ? COLORS.error : props.broker ? COLORS.warning : COLORS.muted}>
+          {(props.launchMode ?? "observe") === "observe" && !props.broker
+            ? "OBSERVE ONLY"
+            : `${(props.launchMode ?? "observe").toUpperCase()} | ${props.broker ? "TRUSTED MANUAL ENABLED" : "NO MANUAL"}`} | {headerContext()}
         </text>
       </box>
       <box flexGrow={1} flexDirection="row" gap={1} padding={1} overflow="hidden">
@@ -2095,6 +2119,7 @@ export function App(props: AppProps) {
               wideningPreview={wideningPreview()}
               wideningStatus={wideningStatus()}
               mintedWideningGeneration={mintedWideningGeneration()}
+              wideningLocked={props.launchMode === "preview"}
             />
           )}
         </Show>
@@ -2167,7 +2192,11 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
           <text height={1} fg={COLORS.text}>m                  Manual dispatch for selected retained PR (trusted launch only)</text>
-          <text height={1} fg={COLORS.text}>  (dispatch confirm) w   Request capability widening, if delegable (draft-bound)</text>
+          <text height={1} fg={COLORS.text}>
+            {"  (dispatch confirm) w   "}{props.launchMode === "preview"
+              ? "Widening locked by PreviewOnly"
+              : "Request capability widening, if delegable (draft-bound)"}
+          </text>
           <text height={1} fg={COLORS.text}>  (widening) c / y   Confirm preview / mint the grant | Esc cancels widening</text>
           <text height={1} fg={COLORS.text}>s                  Effective capability profile for the next manual launch</text>
           <text height={1} fg={COLORS.text}>  (in Settings) e   Edit persisted narrowing | k toggle kill switch</text>
@@ -2189,6 +2218,9 @@ export function App(props: AppProps) {
           <box flexDirection="column" flexGrow={1}>
             <text height={1} fg={COLORS.warning}>Applies only to the next manual dispatch/process launch.</text>
             <text height={1} fg={COLORS.warning}>A running agent's own profile is immutable and is not shown here.</text>
+            <Show when={props.launchMode === "preview"}>
+              <text height={1} fg={COLORS.error}>PreviewOnly is a terminal ceiling: writes and capability widening are locked.</text>
+            </Show>
             <Show when={!narrowingMode()}>
               <text height={1} fg={COLORS.text}>
                 Role: {roleLabel(settingsRole())} | Tab role | r refresh | e edit narrowing | k kill switch | Esc/s close

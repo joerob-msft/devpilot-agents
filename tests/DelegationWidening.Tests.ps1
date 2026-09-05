@@ -403,6 +403,7 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
             Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
                 -Arguments @(
                     '--conditions=browser', $script:expectedDashboardEntryScript,
+                    '--launch-mode', 'operational',
                     '--state-dir', 'C:\fake\state1', '--event-log', 'C:\fake\events.jsonl',
                     '--broker-executable', $brokerExe, '--broker-script', $script:brokerPath,
                     '--broker-descriptor', $descriptorPath) `
@@ -416,7 +417,7 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
         {
             Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
                 -Arguments @(
-                    '--conditions=browser', $script:expectedDashboardEntryScript,
+                    '--conditions=browser', $script:expectedDashboardEntryScript, '--launch-mode', 'observe',
                     '--broker-executable', $brokerExe, '--broker-script', $script:brokerPath,
                     '--broker-descriptor', $descriptorPath) `
                 -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
@@ -425,15 +426,75 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
         } | Should -Not -Throw
     }
 
+    It 'Assert-AgentDashboardCommandLineShape accepts every launch mode the launcher can emit, in exactly one fixed-position pair (issue #114)' {
+        $brokerExe = 'C:\fake\pwsh.exe'
+        $descriptorPath = 'C:\fake\watch\broker.descriptor.v1.json'
+        $trustedTriple = @('--broker-executable', $brokerExe, '--broker-script', $script:brokerPath,
+            '--broker-descriptor', $descriptorPath)
+        function Test-DashboardShape {
+            param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments)
+            Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                -Arguments $Arguments `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
+        }
+        # -Golden emits operational, -Golden -PreviewOnly emits preview, -AttachOnly emits the
+        # launcher's own observe default; all three are the canonical shape.
+        foreach ($mode in @('observe', 'preview', 'operational')) {
+            { Test-DashboardShape -Arguments (@('--conditions=browser', $script:expectedDashboardEntryScript,
+                        '--launch-mode', $mode, '--state-dir', 'C:\fake\state1') + $trustedTriple) } |
+                Should -Not -Throw -Because $mode
+        }
+        foreach ($rejected in @(
+                # Missing entirely.
+                , @('--conditions=browser', $script:expectedDashboardEntryScript, '--state-dir', 'C:\fake\state1')
+                # Unknown / wrongly-cased mode value.
+                , @('--conditions=browser', $script:expectedDashboardEntryScript, '--launch-mode', 'Operational')
+                , @('--conditions=browser', $script:expectedDashboardEntryScript, '--launch-mode', 'yolo')
+                # Flag present with no value at all.
+                , @('--conditions=browser', $script:expectedDashboardEntryScript, '--launch-mode')
+                # Duplicated, both before and after the state-dir pairs.
+                , @('--conditions=browser', $script:expectedDashboardEntryScript, '--launch-mode', 'preview',
+                    '--launch-mode', 'operational')
+                , @('--conditions=browser', $script:expectedDashboardEntryScript, '--launch-mode', 'preview',
+                    '--state-dir', 'C:\fake\state1', '--launch-mode', 'operational')
+                # Present, but after the state-dir pairs instead of its fixed position.
+                , @('--conditions=browser', $script:expectedDashboardEntryScript, '--state-dir', 'C:\fake\state1',
+                    '--launch-mode', 'operational')
+            )) {
+            { Test-DashboardShape -Arguments (@($rejected) + $trustedTriple) } |
+                Should -Throw '*widening-interactive-required*' -Because (@($rejected) -join ' ')
+        }
+    }
+
+    It 'keeps the harness argv shape and the launcher that produces it in the same fixed order' {
+        # Read-only coupling check: Start-DevPilotDashboard.ps1 owns the argv, the harness validates
+        # it, and the two must not drift. The launch mode is emitted immediately after the entry
+        # script and before any --state-dir/--event-log pair.
+        $launcherSource = Get-Content -LiteralPath (
+            Resolve-Path "$PSScriptRoot\..\tools\Start-DevPilotDashboard.ps1").Path -Raw
+        $entryIndex = $launcherSource.IndexOf("[void]`$arguments.Add(`$entryPath)")
+        $launchModeFlagIndex = $launcherSource.IndexOf("[void]`$arguments.Add('--launch-mode')")
+        $launchModeValueIndex = $launcherSource.IndexOf("[void]`$arguments.Add(`$LaunchMode)")
+        $stateDirIndex = $launcherSource.IndexOf("[void]`$arguments.Add('--state-dir')")
+        $entryIndex | Should -BeGreaterThan -1
+        $launchModeFlagIndex | Should -BeGreaterThan $entryIndex
+        $launchModeValueIndex | Should -BeGreaterThan $launchModeFlagIndex
+        $stateDirIndex | Should -BeGreaterThan $launchModeValueIndex
+        ([regex]::Matches($launcherSource, [regex]::Escape("[void]`$arguments.Add('--launch-mode')"))).Count | Should -Be 1
+        $launcherSource | Should -Match "\[ValidateSet\('observe', 'preview', 'operational'\)\]"
+    }
+
     It 'Assert-AgentDashboardCommandLineShape rejects a decoy Bun executable, a decoy entry script used as inert data, a wrong --conditions value, a forged broker triple, and trailing extra tokens' {
         $brokerExe = 'C:\fake\pwsh.exe'
         $descriptorPath = 'C:\fake\watch\broker.descriptor.v1.json'
         $trustedTriple = @('--broker-executable', $brokerExe, '--broker-script', $script:brokerPath, '--broker-descriptor', $descriptorPath)
+        $canonicalPrefix = @('--conditions=browser', $script:expectedDashboardEntryScript, '--launch-mode', 'operational')
 
         # (1) A decoy/unlocked Bun binary elsewhere on PATH.
         {
             Assert-AgentDashboardCommandLineShape -ExecutablePath 'C:\other\bun.exe' `
-                -Arguments (@('--conditions=browser', $script:expectedDashboardEntryScript) + $trustedTriple) `
+                -Arguments (@($canonicalPrefix) + $trustedTriple) `
                 -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
                 -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
         } | Should -Throw '*widening-interactive-required*'
@@ -442,7 +503,8 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
         # line only as inert trailing data, after a real code-execution option/decoy entry runs first.
         {
             Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
-                -Arguments (@('--conditions=browser', 'C:\decoy\index.js') + $trustedTriple + @($script:expectedDashboardEntryScript)) `
+                -Arguments (@('--conditions=browser', 'C:\decoy\index.js', '--launch-mode', 'operational') +
+                    $trustedTriple + @($script:expectedDashboardEntryScript)) `
                 -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
                 -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
         } | Should -Throw '*widening-interactive-required*'
@@ -450,7 +512,7 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
         # (3) Wrong --conditions value, even though the entry script and broker triple are otherwise exact.
         {
             Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
-                -Arguments (@('--conditions=node', $script:expectedDashboardEntryScript) + $trustedTriple) `
+                -Arguments (@('--conditions=node', $script:expectedDashboardEntryScript, '--launch-mode', 'operational') + $trustedTriple) `
                 -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
                 -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
         } | Should -Throw '*widening-interactive-required*'
@@ -458,8 +520,8 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
         # (4) Forged --broker-script value (an attacker-controlled script masquerading as the broker).
         {
             Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
-                -Arguments @('--conditions=browser', $script:expectedDashboardEntryScript,
-                    '--broker-executable', $brokerExe, '--broker-script', 'C:\attacker\decoy-broker.ps1', '--broker-descriptor', $descriptorPath) `
+                -Arguments (@($canonicalPrefix) + @('--broker-executable', $brokerExe,
+                        '--broker-script', 'C:\attacker\decoy-broker.ps1', '--broker-descriptor', $descriptorPath)) `
                 -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
                 -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
         } | Should -Throw '*widening-interactive-required*'
@@ -467,7 +529,7 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
         # (5) A trailing extra token after an otherwise-exact broker triple.
         {
             Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
-                -Arguments (@('--conditions=browser', $script:expectedDashboardEntryScript) + $trustedTriple + @('--extra')) `
+                -Arguments (@($canonicalPrefix) + $trustedTriple + @('--extra')) `
                 -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
                 -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
         } | Should -Throw '*widening-interactive-required*'
@@ -475,8 +537,8 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
         # (6) Reordered triple (broker-descriptor before broker-script) is not the fixed shape.
         {
             Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
-                -Arguments @('--conditions=browser', $script:expectedDashboardEntryScript,
-                    '--broker-executable', $brokerExe, '--broker-descriptor', $descriptorPath, '--broker-script', $script:brokerPath) `
+                -Arguments (@($canonicalPrefix) + @('--broker-executable', $brokerExe,
+                        '--broker-descriptor', $descriptorPath, '--broker-script', $script:brokerPath)) `
                 -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
                 -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
         } | Should -Throw '*widening-interactive-required*'
@@ -500,12 +562,25 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
             Mock Get-AgentProcessArgv {
                 @{
                     ExecutablePath = $ExpectedBunExecutable
+                    Arguments = @('--conditions=browser', $ExpectedEntryScript, '--launch-mode', 'operational',
+                        '--broker-executable', $ownExecutable, '--broker-script', $BrokerPath,
+                        '--broker-descriptor', $descriptorPath)
+                }
+            } -ParameterFilter { $ProcessId -eq 999999 }
+            Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
+                Should -BeTrue
+
+            # Reject: a parent that is otherwise the exact canonical shape but omits the
+            # --launch-mode pair the trusted launcher always emits (issue #114).
+            Mock Get-AgentProcessArgv {
+                @{
+                    ExecutablePath = $ExpectedBunExecutable
                     Arguments = @('--conditions=browser', $ExpectedEntryScript, '--broker-executable', $ownExecutable,
                         '--broker-script', $BrokerPath, '--broker-descriptor', $descriptorPath)
                 }
             } -ParameterFilter { $ProcessId -eq 999999 }
             Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
-                Should -BeTrue
+                Should -BeFalse
 
             # Reject: an ordinary headless caller's own shell is truthfully its own parent, but it
             # is never the locked Bun host.
@@ -518,8 +593,9 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
             Mock Get-AgentProcessArgv {
                 @{
                     ExecutablePath = $ExpectedBunExecutable
-                    Arguments = @('--conditions=browser', $ExpectedEntryScript, '--broker-executable', $ownExecutable,
-                        '--broker-script', $BrokerPath, '--broker-descriptor', 'C:\fake\watch\other.descriptor.json')
+                    Arguments = @('--conditions=browser', $ExpectedEntryScript, '--launch-mode', 'preview',
+                        '--broker-executable', $ownExecutable, '--broker-script', $BrokerPath,
+                        '--broker-descriptor', 'C:\fake\watch\other.descriptor.json')
                 }
             } -ParameterFilter { $ProcessId -eq 999999 }
             Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |

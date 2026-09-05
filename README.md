@@ -251,10 +251,10 @@ events are diagnostic only and cannot change agent selection or delivery.
 
 `tools\Start-DevPilotDashboard.ps1` is an OpenCode-inspired terminal UI over
 reviewer and review-handler event streams. Direct and attach-only launches are
-observe-only. A trusted `Watch-DevPilot*.ps1` launcher can separately opt in
-manual Reviewer or Review Handler dispatch. The TUI can only display and
-confirm the wrapper-derived capabilities; it cannot grant policy. Manual
-Reviewer approval votes are always disabled.
+observe-only. A trusted `Watch-DevPilot*.ps1` launcher can enable automatic and
+manual Reviewer or Review Handler operations. The TUI can display, narrow, and
+explicitly confirm only the launcher-derived capability ceiling; it cannot
+exceed that ceiling.
 
 The dashboard requires Node.js 24 or newer, PowerShell 7 for the watch
 launchers, and an interactive terminal at least 60 columns wide. Restore and
@@ -273,34 +273,56 @@ The launchers deliberately never install dependencies. If public npm is
 blocked, configure npm to use your organization's approved registry mirror
 before running `npm ci`.
 
-For the simplest workflow, run the launcher while the current directory is the
-consumer repository whose conventional agent configs should be used:
+For the primary operational workflow, run the launcher while the current
+directory is the consumer repository whose conventional agent configs should
+be used:
 
 ```powershell
-# Both preview-only agents, one cycle each:
+# Both agents loop continuously. Reviewer posts review results; Review Handler
+# replies, applies and validates fixes, resumes work, and pushes updates.
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden
+
+# Same live workflow with a terminal no-write capability ceiling:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden -PreviewOnly
+```
+
+`-Golden` is intentionally explicit because it grants write authority. It
+enables Reviewer finding comments, thread replies, and summaries, plus Review
+Handler replies, buddy requeues, code changes, local validation, session
+resume, and push. It does **not** enable Teams notifications, Reviewer approval
+votes, or Review Handler auto-complete. Those remain behind their separate
+existing gates.
+
+`-PreviewOnly` is not an omission-based convention. It is a terminal,
+non-delegable ceiling that disables automatic and manual PR mutations,
+notification delivery, Settings widening, and delegated grants. Use `-DryRun`
+only for an agent's offline self-check; it is not the live PreviewOnly mode.
+
+The golden TUI shows **OPERATIONAL** or **PREVIEW** in its header. Press `f` to
+reach **History**, select a retained PR, press `m`, and use `Tab` to choose
+Reviewer or Review Handler. The current launch and up to 20 recent,
+independently trusted watch runs contribute to History. Every manual launch
+revalidates the PR's current state, author/ownership eligibility, and work
+lease before starting.
+
+Advanced and compatibility modes remain available:
+
+```powershell
+# Existing bare behavior remains one preview cycle:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both
 
-# Both operational agents. Notification delivery is independently opt-in:
+# One operational golden cycle:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden -Once
+
+# Operational Teams delivery remains independently opt-in:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Operational `
     -EnableReviewerTeamsNotifications
 
-# Let the review-handler resume the originating session, fix, validate, reply, and push:
+# Explicit single-role and fixed-PR modes:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Reviewer -Continuous
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent ReviewHandler -Operational `
     -EnableReviewHandlerCodeUpdates
-
-# Both agents, continuous 15-minute cadence:
-<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
-
-# Enable manual Reviewer describe/dispatch with Reviewer writes still disabled:
-<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -EnableManualReviewer
-
-# Enable explicitly trusted manual Reviewer comments/replies/summary:
-<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -EnableManualReviewer `
-    -EnableManualReviewerWrites
-
 # One agent, or one specific PR:
-<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Reviewer -Continuous
-<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent ReviewHandler -Continuous
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Reviewer `
     -ReviewerPullRequestId 12345
 ```
@@ -320,12 +342,14 @@ local validation remain disabled by default. Add
 originating Copilot coding session when available, make code changes, run local
 validation, and push to the PR source branch. A missing local session starts a
 fresh coding session; this option does not require local ownership. Reviewer
-votes and review-handler auto-complete remain disabled. Teams delivery is
+votes and review-handler auto-complete remain default-denied and require the
+existing explicit, policy-authorized manual widening flow. Teams delivery is
 separate and requires the
 appropriate `-EnableReviewerTeamsNotifications` or
 `-EnableReviewHandlerTeamsNotifications` switch. Unless `-StateDir` is
-supplied, the agents share a generated temporary session root, so one dashboard
-can group their live and retained instances.
+supplied, the agents share a generated session root. Golden mode also reads a
+bounded set of trusted prior watch roots so one dashboard can group current
+activity and cross-launch PR history.
 
 Compatibility wrappers provide the shorter single-agent names:
 

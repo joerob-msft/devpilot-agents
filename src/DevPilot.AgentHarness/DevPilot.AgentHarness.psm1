@@ -82,7 +82,13 @@ function Get-AgentDefaultModelSentinel {
 function Get-AgentHarnessCapabilityDescriptor {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        # issue #114: projects the SAME descriptor under the launcher's terminal preview-only
+        # ceiling. Nothing new is declared here -- the preview projection is derived purely from
+        # the role's own operational tiers and its single delegable capability, so a preview
+        # launch can never lock a name this descriptor does not already know about. Omitted (every
+        # pre-#114 caller) reproduces the previous behavior byte for byte.
+        [switch]$PreviewOnly
     )
     $operationalTiers = if ($Role -eq 'reviewer') {
         [ordered]@{
@@ -97,14 +103,70 @@ function Get-AgentHarnessCapabilityDescriptor {
     }
     $delegableDefaultOff = if ($Role -eq 'reviewer') { 'EnableApprovalVote' } else { 'EnableAutoComplete' }
     $allowedManualCapabilities = @($operationalTiers.Values | ForEach-Object { $_ } | Sort-Object -Unique)
+    # A preview launch is a terminal, non-delegable ceiling: every mutation-capable capability the
+    # role could otherwise be granted -- including the one capability delegation could ever widen --
+    # is locked for the whole life of that launch. Outside a preview launch this stays empty, which
+    # is exactly the pinned-empty value every pre-#114 caller already sees.
+    $absoluteDenies = if ($PreviewOnly) {
+        @(@($allowedManualCapabilities) + @($delegableDefaultOff) | Sort-Object -Unique)
+    }
+    else {
+        @()
+    }
     return [ordered]@{
         schemaVersion             = 1
         role                      = $Role
         operationalTiers          = $operationalTiers
         delegableDefaultOff       = $delegableDefaultOff
         allowedManualCapabilities = $allowedManualCapabilities
-        # Pinned empty in PR1: no absolute-deny source exists yet (PR2+ kill switch/policy scope).
-        absoluteDenies            = @()
+        # Empty unless the caller asked for the preview-only projection (issue #114). The broker
+        # never reads this value for enforcement: it validates and enforces the per-role
+        # absoluteDenies the trusted launcher recorded in its own broker descriptor, so a launch
+        # that was started operationally can never be silently reinterpreted as a preview launch
+        # (or the reverse) by a later harness default.
+        absoluteDenies            = $absoluteDenies
+    }
+}
+
+function Assert-AgentDashboardLaunchAuthority {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('observe', 'preview', 'operational')]
+        [string]$LaunchMode,
+
+        [Parameter()]
+        [AllowNull()]
+        [Collections.IDictionary]$BrokerDescriptor
+    )
+
+    if ($null -eq $BrokerDescriptor) { return }
+    if ($LaunchMode -eq 'observe') {
+        throw 'Observe mode cannot be combined with broker authority.'
+    }
+    if ($LaunchMode -eq 'operational') { return }
+    if (-not $BrokerDescriptor.Contains('roles') -or
+        $BrokerDescriptor.roles -isnot [Collections.IDictionary]) {
+        throw 'Preview broker authority must contain a roles object.'
+    }
+
+    foreach ($roleEntry in $BrokerDescriptor.roles.GetEnumerator()) {
+        $role = [string]$roleEntry.Key
+        if ($role -cnotin @('reviewer', 'review-handler') -or
+            $roleEntry.Value -isnot [Collections.IDictionary]) {
+            throw "Preview broker authority contains an invalid role '$role'."
+        }
+        $entry = $roleEntry.Value
+        $capabilities = @(if ($entry.Contains('capabilities')) { $entry.capabilities })
+        $absoluteDenies = @(if ($entry.Contains('absoluteDenies')) {
+                $entry.absoluteDenies | ForEach-Object { [string]$_ } | Sort-Object -Unique
+            })
+        $expectedDenies = @((Get-AgentHarnessCapabilityDescriptor -Role $role -PreviewOnly).absoluteDenies)
+        $denyDifference = @(Compare-Object -ReferenceObject $expectedDenies `
+                -DifferenceObject $absoluteDenies -CaseSensitive)
+        if ($capabilities.Count -gt 0 -or $denyDifference.Count -gt 0) {
+            throw "Preview mode requires role '$role' to have no capabilities and the complete terminal absolute-deny ceiling."
+        }
     }
 }
 
@@ -816,7 +878,8 @@ function Resolve-AgentTrustedRoot {
         [Parameter(Mandatory)][ValidateSet('durable-state', 'lease', 'watch-state', 'capability-overrides')][string]$Kind,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [string[]]$DisallowedRoots = @(),
-        [switch]$Create
+        [switch]$Create,
+        [ref]$CreatedByCaller
     )
     if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathFullyQualified($Path)) {
         throw "$Kind root must be a non-empty absolute path."
@@ -832,18 +895,27 @@ function Resolve-AgentTrustedRoot {
         }
     }
     Assert-AgentPathHasNoLinks -Path $resolved
-    $created = -not (Test-Path -LiteralPath $resolved)
-    if ($created) {
+    $createdHere = $false
+    if (-not (Test-Path -LiteralPath $resolved)) {
         if (-not $Create) { throw "$kind root '$resolved' does not exist." }
-        New-Item -ItemType Directory -Path $resolved -Force -ErrorAction Stop | Out-Null
+        try {
+            New-Item -ItemType Directory -Path $resolved -ErrorAction Stop | Out-Null
+            $createdHere = $true
+        }
+        catch {
+            # Another process may have won the create race. Treat that root as pre-existing so
+            # this caller can validate and use it but can never claim it for rollback.
+            if (-not (Test-Path -LiteralPath $resolved -PathType Container)) { throw }
+        }
     }
+    if ($CreatedByCaller) { $CreatedByCaller.Value = $createdHere }
     $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
     if (-not $item.PSIsContainer) { throw "$kind root '$resolved' is not a directory." }
     Assert-AgentPathHasNoLinks -Path $resolved
 
     if ($IsWindows) {
         $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-        if ($created) {
+        if ($createdHere) {
             $acl = [Security.AccessControl.DirectorySecurity]::new()
             $acl.SetOwner($currentSid)
             $acl.SetAccessRuleProtection($true, $false)
@@ -868,7 +940,7 @@ function Resolve-AgentTrustedRoot {
             [IO.UnixFileMode]::GroupExecute -bor [IO.UnixFileMode]::OtherRead -bor
             [IO.UnixFileMode]::OtherWrite -bor [IO.UnixFileMode]::OtherExecute
         if (($mode -band $unsafe) -ne 0) {
-            if (-not $created) { throw "$kind root '$resolved' grants group or other access." }
+            if (-not $createdHere) { throw "$kind root '$resolved' grants group or other access." }
             [IO.File]::SetUnixFileMode($resolved,
                 [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
         }
@@ -1602,7 +1674,14 @@ function Resolve-AgentCapabilityPolicyPartition {
         # capability that is not currently an active mandatory deny on THIS ceiling, or that is
         # already an active capability -- both would mean the caller is trying to widen something
         # this primitive was never told is eligible, which must never happen for a correct caller.
-        [AllowNull()][string]$GrantCapability
+        [AllowNull()][string]$GrantCapability,
+        # issue #114: the launch-wide, terminal, non-delegable denies recorded by the trusted
+        # launcher in its broker descriptor (a preview-only launch names every mutation-capable
+        # capability here). Applied AFTER persisted narrowing and BEFORE any grant, and unlike a
+        # persisted narrowing it is not merely monotonic bookkeeping: a grant naming an absolutely
+        # denied capability fails closed rather than widening it back. Omitted (every pre-#114
+        # caller) reproduces the previous behavior exactly.
+        [AllowNull()][string[]]$AbsoluteDenies
     )
     $capabilities = [Collections.Generic.List[string]]::new([string[]]@($RoleDescriptor.capabilities | Sort-Object -Unique))
     $mandatoryDenies = [Collections.Generic.List[string]]::new([string[]]@($RoleDescriptor.mandatoryDenies | Sort-Object -Unique))
@@ -1612,7 +1691,15 @@ function Resolve-AgentCapabilityPolicyPartition {
             if (-not $mandatoryDenies.Contains($name)) { [void]$mandatoryDenies.Add($name) }
         }
     }
+    $absolute = [Collections.Generic.List[string]]::new([string[]]@(@($AbsoluteDenies) | Where-Object { $_ } | Sort-Object -Unique))
+    foreach ($name in @($absolute)) {
+        if ($capabilities.Contains($name)) { [void]$capabilities.Remove($name) }
+        if (-not $mandatoryDenies.Contains($name)) { [void]$mandatoryDenies.Add($name) }
+    }
     if ($GrantCapability) {
+        if ($absolute.Contains($GrantCapability)) {
+            throw '[grant-invalid] GrantCapability is absolutely denied for this launch and can never be widened.'
+        }
         if ($capabilities.Contains($GrantCapability) -or -not $mandatoryDenies.Contains($GrantCapability)) {
             throw '[grant-invalid] GrantCapability is not eligible to be widened from the current capability ceiling.'
         }
@@ -2533,14 +2620,21 @@ function Assert-AgentDashboardCommandLineShape {
         search over the parent's command line: it requires the EXACT positions Start-
         DevPilotDashboard.ps1 itself always emits -- a bare locked Bun executable; the fixed
         literal token '--conditions=browser'; the one canonical dist/src/index.js entry point;
-        zero or more well-formed --state-dir/--event-log pairs (their VALUES carry no trust
-        weight -- only their shape is checked); then exactly the --broker-executable/
+        exactly one '--launch-mode' pair whose value is one of the three launch modes the
+        launcher can emit (issue #114); zero or more well-formed --state-dir/--event-log pairs
+        (their VALUES carry no trust weight -- only their shape is checked); then exactly the --broker-executable/
         --broker-script/--broker-descriptor triple, in that fixed order, whose three values must
         equal THIS broker process's own live executable path, its own running script path, and
         its own -DescriptorPath argument -- never anything the parent merely claims. Any
         deviation (a decoy entry script, an inert extra argument, a -e/eval option, a duplicate or
         reordered flag, or trailing extra tokens) is a single generic failure, so a forger's
         near-miss and an ordinary unrelated launcher are rejected identically.
+
+        The launch mode's VALUE carries no trust weight either, exactly like a --state-dir value:
+        the capability ceiling of a launch is enforced from the trusted broker descriptor's own
+        per-role absoluteDenies, never from anything on the Dashboard command line. Only its
+        presence, position, cardinality, and membership in the fixed mode set are checked here --
+        which is what keeps this a structural, fail-closed argv shape rather than a policy input.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$ExecutablePath,
@@ -2563,6 +2657,14 @@ function Assert-AgentDashboardCommandLineShape {
     if ($i -ge $argv.Count -or $argv[$i] -cne '--conditions=browser') { throw $failure }
     $i++
     if ($i -ge $argv.Count -or -not (Test-AgentDashboardPathEquals $argv[$i] $ExpectedEntryScript)) { throw $failure }
+    $i++
+    # issue #114: exactly one --launch-mode pair, in this fixed position. Cardinality is
+    # structural rather than counted: the state-dir/event-log loop below accepts only its own two
+    # flags and every later position is an exact literal, so a second (or misplaced) --launch-mode
+    # can never be consumed anywhere else in this shape.
+    if ($i -ge $argv.Count -or $argv[$i] -cne '--launch-mode') { throw $failure }
+    $i++
+    if ($i -ge $argv.Count -or $argv[$i] -cnotin @('observe', 'preview', 'operational')) { throw $failure }
     $i++
     while ($i -lt $argv.Count -and $argv[$i] -cin @('--state-dir', '--event-log')) {
         $i += 2
@@ -6518,6 +6620,7 @@ Export-ModuleMember -Function @(
     "Get-AgentSupportedModels",
     "Get-AgentSessionIsolationEnvVars",
     "Get-AgentHarnessCapabilityDescriptor",
+    "Assert-AgentDashboardLaunchAuthority",
     "Get-AgentWorkIqTargetUrl",
     "Get-AgentMissingMcpServers",
     "Get-AgentLaunchFailureReason",

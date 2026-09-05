@@ -134,6 +134,7 @@ function createFixture(prUrl = "https://github.com/joerob-msft/devpilot-agents/p
     onEvent: () => {},
     onDiagnostic: () => {},
   });
+
   return { reducer, tailer };
 }
 
@@ -762,6 +763,59 @@ test("empty renderer reports unavailable navigation, attention, URL, and manual 
   } finally {
     setup?.renderer.destroy();
     await tailer.stop();
+  }
+});
+
+test("history refresh during filter input updates reordered rows without OpenTUI warnings", async (context) => {
+  const fixture = createFixture();
+  const history = new PullRequestHistoryProjection();
+  for (let index = 1; index <= 29; index++) {
+    history.apply(historyEvent(
+      `900719925474${String(index).padStart(4, "0")}`,
+      100 + index,
+      index,
+      {
+        title: `Retained pull request ${index}`,
+        timestamp: `2026-09-03T00:00:${String(index).padStart(2, "0")}Z`,
+      },
+    ));
+  }
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  let setup: TestRendererSetup | undefined;
+  console.warn = (...values: unknown[]) => {
+    warnings.push(values.map(String).join(" "));
+  };
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} />, {
+      width: 140,
+      height: 32,
+      kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    setup.mockInput.pressKey("f");
+    await setup.flush();
+    for (let index = 0; index < 28; index++) setup.mockInput.pressArrow("down");
+    await setup.flush();
+    setup.mockInput.pressKey("/");
+    history.apply(historyEvent("9007199254740001", 101, 30, {
+      title: "Matching retained pull request",
+      timestamp: "2026-09-03T00:01:00Z",
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Matching retained pull request/);
+    assert.deepEqual(warnings.filter((warning) => warning.includes("insertBefore")), []);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    console.warn = originalWarn;
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
   }
 });
 
@@ -2189,6 +2243,90 @@ test("manual dispatch widening: closing the panel with a minted-but-undispatched
     await setup.flush();
     assert.doesNotMatch(setup.captureCharFrame(), /MANUAL DISPATCH/);
     assert.ok(calls.includes("cancel-widening:3"), "closing with a minted grant must best-effort cancel it");
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("golden operational chrome keeps History and manual launch discoverable at supported widths", async (context) => {
+  for (const width of [60, 80, 120]) {
+    const fixture = createFixture();
+    const history = createSettingsHistory();
+    let setup: TestRendererSetup | undefined;
+    try {
+      setup = await testRender(() => (
+        <App
+          reducer={fixture.reducer}
+          history={history}
+          tailer={fixture.tailer}
+          launchMode="operational"
+        />
+      ), { width, height: 32, kittyKeyboard: true });
+      await setup.renderOnce();
+      const initial = setup.captureCharFrame();
+      assert.match(initial, /OPERATIONAL/);
+      assert.match(initial, /f History/);
+      assert.match(initial, /m launch/);
+
+      setup.mockInput.pressKey("f");
+      await setup.flush();
+      const historyFrame = setup.captureCharFrame();
+      assert.match(historyFrame, /PR history 1/);
+      assert.match(historyFrame, /selected repo #104/);
+      assert.match(historyFrame, /m launch/);
+      assert.match(historyFrame, /Tab role/);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("native FFI is not available")) {
+        context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+        return;
+      }
+      throw error;
+    } finally {
+      setup?.renderer.destroy();
+      await fixture.tailer.stop();
+    }
+  }
+});
+
+test("PreviewOnly chrome locks widening even when a broker reports a delegable capability", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls } = createWideningBrokerFixture({
+    role: "reviewer",
+    delegableAvailable: ["EnableApprovalVote"],
+  });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => (
+      <App
+        reducer={fixture.reducer}
+        history={history}
+        tailer={fixture.tailer}
+        broker={broker}
+        launchMode="preview"
+      />
+    ), { width: 140, height: 32, kittyKeyboard: true });
+    await setup.renderOnce();
+    assert.match(setup.captureCharFrame(), /PREVIEW/);
+
+    await openManualAndDescribe(setup);
+    assert.match(setup.captureCharFrame(), /Widening locked by PreviewOnly/);
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    assert.equal(calls.includes("describe-widening:EnableApprovalVote"), false);
+
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /PreviewOnly is a terminal ceiling/);
   } catch (error) {
     if (error instanceof Error && error.message.includes("native FFI is not available")) {
       context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
