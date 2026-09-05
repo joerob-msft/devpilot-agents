@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import {
@@ -36,6 +36,82 @@ test("client rejects non-absolute executable and broker paths", () => {
     () => new DispatchClient({ executablePath: "pwsh", scriptPath: "broker.ps1", descriptorPath: "descriptor.json" }),
     /absolute trusted path/,
   );
+});
+
+test("profile-current uses only PR ID and role; client validates numeric input and every resolved target echo", async () => {
+  const root = join(process.cwd(), `.dashboard-discovery-${process.pid}-${Date.now()}`);
+  await mkdir(root);
+  const scriptPath = join(root, "broker.ps1");
+  const descriptorPath = join(root, "descriptor.json");
+  const requestLog = join(root, "requests.jsonl");
+  await writeFile(scriptPath, String.raw`
+param([string]$DescriptorPath)
+$descriptor = Get-Content -LiteralPath $DescriptorPath -Raw | ConvertFrom-Json
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  $r = $line | ConvertFrom-Json
+  Add-Content -LiteralPath $descriptor.log -Value $line
+  if ($r.operation -eq 'shutdown') {
+    @{schemaVersion=1;requestId=$r.requestId;operation='shutdown-complete'} | ConvertTo-Json -Compress
+    break
+  }
+  $id = if ($r.role -eq 'reviewer') { '101' } else { '202' }
+  $response = @{
+    schemaVersion=1;requestId=$r.requestId;operation='capability-profile';role=$r.role
+    repositoryIdentity=@{schemaVersion=1;provider='GitHub';repositoryId=$id;organization='configured';project='';repositoryName='repo';slug='configured/repo';key="v1:github:$id";verifiedAtUtc='2026-09-03T00:00:00Z';verified=$true;dispatchEligible=$true}
+    prSnapshot=@{schemaVersion=1;pullRequestId=$r.pullRequestId;sourceCommit=('a'*40);sourceRef='feature';targetRef='main';active=$true;draft=$false;author='ada';title='unobserved'}
+    capabilities=@('EnableThreadReplies');mandatoryDenies=@();dynamicConstraints=@()
+    absoluteDenies=@();allowedManualCapabilities=@('EnableThreadReplies');delegableAvailable=@()
+    provenance=@{EnableThreadReplies='operational-default'};killSwitchActive=$false;killSwitchExpiresAtUtc=$null
+  }
+  if ($r.operation -eq 'describe') {
+    $response.operation = 'capability-summary'
+    $response.dispatchDraftId = '11111111-1111-4111-8111-111111111111'
+    $response.capabilityPolicyDigest = 'b'*64
+    $response.prStateFingerprint = 'c'*64
+  }
+  if ($descriptor.fault -eq 'pr') { $response.prSnapshot.pullRequestId++ }
+  if ($descriptor.fault -eq 'role') { $response.role = 'review-handler' }
+  if ($descriptor.fault -eq 'key') {
+    $response.repositoryIdentity.key = 'v1:github:999'
+    $response.repositoryIdentity.repositoryId = '999'
+  }
+  $response | ConvertTo-Json -Compress -Depth 10
+}
+`, "utf8");
+  try {
+    for (const fault of ["none", "pr", "role", "key"]) {
+      await writeFile(descriptorPath, JSON.stringify({ log: requestLog, fault }));
+      const client = new DispatchClient({ executablePath: resolvePwshPath(), scriptPath, descriptorPath });
+      try {
+        if (fault === "none") {
+          for (const invalid of [0, -1, 1.2, 2147483648, NaN, Infinity, "104", null, true]) {
+            await assert.rejects(client.profileCurrent(invalid as number, "reviewer"), /invalid PR ID/);
+            await assert.rejects(client.describe("v1:github:101", invalid as number, "reviewer"), /invalid PR ID/);
+          }
+          for (const role of ["reviewer", "review-handler"] as const) {
+            const profile = await client.profileCurrent(2147483647, role);
+            assert.equal(profile.repositoryIdentity.key, role === "reviewer" ? "v1:github:101" : "v1:github:202");
+            assert.equal(profile.prSnapshot.pullRequestId, 2147483647);
+            assert.equal(profile.role, role);
+            assert.equal("dispatchDraftId" in profile, false);
+            const summary = await client.describe(profile.repositoryIdentity.key, 2147483647, role);
+            assert.deepEqual(summary.capabilities, ["EnableThreadReplies"]);
+          }
+        } else {
+          if (fault !== "key") {
+            await assert.rejects(client.profileCurrent(104, "reviewer"), /does not match/);
+          }
+          await assert.rejects(client.describe("v1:github:101", 104, "reviewer"), /does not match/);
+          await assert.rejects(client.profile("v1:github:101", 104, "reviewer"), /does not match/);
+        }
+      } finally { await client.shutdown(); }
+    }
+    const requests = (await readFile(requestLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    for (const request of requests.filter((request) => request.operation === "profile-current")) {
+      assert.deepEqual(Object.keys(request).sort(), ["operation", "pullRequestId", "requestId", "role", "schemaVersion"]);
+    }
+    assert.equal(requests.some((request) => request.operation === "dispatch"), false);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("production client correlates describe, dispatch, cancel, and shutdown under pwsh", async () => {

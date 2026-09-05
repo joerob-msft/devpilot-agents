@@ -4481,7 +4481,8 @@ function New-AgentRedirectedProcess {
         # handing this specific child an inherited anonymous-pipe attestation handle it cannot
         # obtain any other way. Never used for anything a caller could equivalently pass on the
         # command line.
-        [hashtable]$AdditionalEnvironmentVariables = @{}
+        [hashtable]$AdditionalEnvironmentVariables = @{},
+        [switch]$LiveStandardOutput
     )
     $absolute = [IO.Path]::GetFullPath($FilePath)
     if (-not [IO.Path]::IsPathFullyQualified($absolute) -or -not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
@@ -4557,13 +4558,142 @@ namespace DevPilot.Process {
 }
 '@
     }
+    # Add-Type survives Import-Module -Force. Live capture must also work when a prior
+    # launcher already registered the original two-argument BoundedDrain in this shell.
+    if ($LiveStandardOutput -and -not ('DevPilot.Process.LiveStdoutDrainV1' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+namespace DevPilot.Process {
+  public sealed class LiveStdoutCaptureV1 : IDisposable {
+    private readonly string path;
+    private readonly int maximumBytes;
+    private readonly StringBuilder line = new StringBuilder();
+    private FileStream stream;
+    public LiveStdoutCaptureV1(string path, int maximumBytes) {
+      if (maximumBytes < 1024) throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+      this.path = path;
+      this.maximumBytes = maximumBytes;
+      if (File.Exists(path + ".1") || Directory.Exists(path + ".1"))
+        throw new IOException("Live capture rotation already exists.");
+      stream = OpenNew();
+    }
+    private FileStream OpenNew() {
+      var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read | FileShare.Delete);
+      try {
+        if (!OperatingSystem.IsWindows())
+          File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        return file;
+      } catch {
+        file.Dispose();
+        throw;
+      }
+    }
+    public void Append(char[] buffer, int count) {
+      for (int i = 0; i < count; i++) {
+        if (line.Length >= Math.Min(256 * 1024, maximumBytes / 4))
+          throw new InvalidDataException("Live stdout frame exceeds the capture bound.");
+        line.Append(buffer[i]);
+        if (buffer[i] == '\n') WriteFrame();
+      }
+    }
+    private void WriteFrame() {
+      var bytes = Encoding.UTF8.GetBytes(line.ToString());
+      // Readers see complete frames; rotation renames rather than truncating an open file.
+      if (stream.Length + bytes.Length > maximumBytes) {
+        stream.Dispose();
+        File.Move(path, path + ".1", true);
+        stream = OpenNew();
+      }
+      stream.Write(bytes, 0, bytes.Length);
+      stream.Flush();
+      line.Clear();
+    }
+    public void Finish() {
+      if (line.Length > 0) WriteFrame(); // Preserve an actual unterminated suffix, without inventing a newline.
+    }
+    public void Dispose() { stream.Dispose(); }
+  }
+  public static class LiveStdoutDrainV1 {
+    public static async Task<string> ReadTailAsync(TextReader reader, int maximumCharacters, LiveStdoutCaptureV1 capture) {
+      var tail = new StringBuilder();
+      var buffer = new char[8192];
+      Exception captureFailure = null;
+      try {
+        int count;
+        while ((count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
+          tail.Append(buffer, 0, count);
+          if (tail.Length > maximumCharacters) tail.Remove(0, tail.Length - maximumCharacters);
+          if (capture != null && captureFailure == null) {
+            try { capture.Append(buffer, count); }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException || error is InvalidDataException) {
+              captureFailure = error;
+              // Do not echo child content, and continue draining so an I/O failure cannot block the child.
+              Console.Error.WriteLine("DevPilot live stdout capture failed (" + error.GetType().Name + ").");
+            }
+          }
+        }
+        if (capture != null && captureFailure == null) {
+          try { capture.Finish(); }
+          catch (Exception error) when (error is IOException || error is UnauthorizedAccessException) {
+            captureFailure = error;
+            Console.Error.WriteLine("DevPilot live stdout capture failed (" + error.GetType().Name + ").");
+          }
+        }
+      } finally {
+        if (capture != null) {
+          try { capture.Dispose(); }
+          catch (Exception error) when (error is IOException || error is UnauthorizedAccessException) {
+            captureFailure = error;
+            Console.Error.WriteLine("DevPilot live stdout capture failed (" + error.GetType().Name + ").");
+          }
+        }
+      }
+      if (captureFailure != null) throw new IOException("Live stdout capture failed.", captureFailure);
+      return tail.ToString();
+    }
+  }
+}
+'@
+    }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $psi
-    if (-not $process.Start()) { throw "Failed to start '$absolute'." }
+    $capture = $null
+    if ($LiveStandardOutput) {
+        $capturePath = [IO.Path]::GetFullPath($StandardOutputPath)
+        $captureParent = Split-Path -Parent $capturePath
+        Assert-AgentPathHasNoLinks -Path $capturePath
+        if ($IsWindows) { Assert-AgentWindowsAcl -Path $captureParent -Private }
+        else {
+            Assert-AgentUnixOwner -Path $captureParent
+            if (([IO.File]::GetUnixFileMode($captureParent) -band
+                ([IO.UnixFileMode]::GroupRead -bor [IO.UnixFileMode]::GroupWrite -bor [IO.UnixFileMode]::GroupExecute -bor
+                 [IO.UnixFileMode]::OtherRead -bor [IO.UnixFileMode]::OtherWrite -bor [IO.UnixFileMode]::OtherExecute)) -ne 0) {
+                throw 'Live stdout capture requires an owner-private parent directory.'
+            }
+        }
+        $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        $errorPath = [IO.Path]::GetFullPath($StandardErrorPath)
+        if ($errorPath.Equals($capturePath, $comparison) -or $errorPath.Equals($capturePath + '.1', $comparison)) {
+            throw 'Live stdout capture and stderr paths must be distinct.'
+        }
+        $capture = [DevPilot.Process.LiveStdoutCaptureV1]::new($capturePath, 10MB)
+    }
+    try {
+        if (-not $process.Start()) { throw "Failed to start '$absolute'." }
+    }
+    catch {
+        if ($capture) { $capture.Dispose() }
+        throw
+    }
     $process.StandardInput.Close()
-    $stdoutTask = [DevPilot.Process.BoundedDrain]::ReadTailAsync($process.StandardOutput, 10MB)
+    $stdoutTask = if ($LiveStandardOutput) {
+        [DevPilot.Process.LiveStdoutDrainV1]::ReadTailAsync($process.StandardOutput, 10MB, $capture)
+    } else { [DevPilot.Process.BoundedDrain]::ReadTailAsync($process.StandardOutput, 10MB) }
     $stderrTask = [DevPilot.Process.BoundedDrain]::ReadTailAsync($process.StandardError, 10MB)
-    return @{
+    $child = @{
         Process = $process
         StdOutTask = $stdoutTask
         StdErrTask = $stderrTask
@@ -4571,6 +4701,8 @@ namespace DevPilot.Process {
         StdErrPath = [IO.Path]::GetFullPath($StandardErrorPath)
         StartedAtUtc = [DateTime]::UtcNow
     }
+    if ($LiveStandardOutput) { $child.LiveStandardOutput = $true }
+    return $child
 }
 
 function New-AgentPersistentRedirectedProcess {
@@ -4671,6 +4803,8 @@ function Complete-AgentRedirectedProcess {
         [ValidateRange(256, 65536)][int]$DiagnosticTailCharacters = 4096
     )
     $persistent = $Child.ContainsKey('PersistentRedirection') -and [bool]$Child.PersistentRedirection
+    $liveStandardOutput = $Child.ContainsKey('LiveStandardOutput') -and [bool]$Child.LiveStandardOutput
+    $captureFailed = $false
     if ($persistent) {
         $readTail = {
             param([string]$Path)
@@ -4687,9 +4821,15 @@ function Complete-AgentRedirectedProcess {
         $stdout = Get-TaskTextBeforeDeadline -Task $Child.StdOutTask -DeadlineUtc $deadline
         $stderr = Get-TaskTextBeforeDeadline -Task $Child.StdErrTask -DeadlineUtc $deadline
         foreach ($entry in @(@($Child.StdOutPath, $stdout.Text), @($Child.StdErrPath, $stderr.Text))) {
+            if ($liveStandardOutput -and $entry[0] -eq $Child.StdOutPath) { continue }
             $text = [string]$entry[1]
             if ($text.Length -gt 10MB) { $text = $text.Substring($text.Length - 10MB) }
             [IO.File]::WriteAllText([string]$entry[0], $text, [Text.UTF8Encoding]::new($false))
+        }
+        if ($liveStandardOutput -and $Child.StdOutTask.IsFaulted) {
+            $captureFailed = $true
+            # Report failure without aborting the caller's existing cleanup of other children.
+            Write-Error '[live-stdout-capture-failed] Live stdout capture failed; see launcher stderr. The capture was not overwritten.' -ErrorAction Continue
         }
     }
     $sanitizeTail = {
@@ -4704,7 +4844,7 @@ function Complete-AgentRedirectedProcess {
     $safeOutputTail = & $sanitizeTail ([string]$stdout.Text)
     $safeErrorTail = & $sanitizeTail ([string]$stderr.Text)
     return @{
-        OutputDrained = $stdout.Completed -and $stderr.Completed
+        OutputDrained = $stdout.Completed -and $stderr.Completed -and -not $captureFailed
         ExitCode = $(if ($Child.Process.HasExited) { $Child.Process.ExitCode } else { -1 })
         SafeOutputTail = $safeOutputTail
         SafeErrorTail = $safeErrorTail

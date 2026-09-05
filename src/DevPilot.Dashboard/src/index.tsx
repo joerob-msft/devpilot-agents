@@ -82,10 +82,19 @@ async function main(): Promise<void> {
       reducer.addSourceDiagnostic(diagnostic);
       refresh();
     },
+    async onPoll() {
+      if (await reducer.observeProcesses()) refresh();
+    },
   });
   const broker = args.broker
     ? new DispatchClient(args.broker, {
         onAcceptedEventPath: (path) => tailer.registerEventLogPath(path),
+        onLocalStreams: (streams) => {
+          for (const stream of streams) {
+            reducer.registerLocalStream(stream);
+            tailer.registerEventLogPath(stream.eventLogPath);
+          }
+        },
         onTerminal: () => refresh(),
         onBrokerFailure: (message) => {
           brokerFailure = message;

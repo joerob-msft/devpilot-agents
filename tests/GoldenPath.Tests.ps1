@@ -75,7 +75,8 @@ exit 0
 '@
 
     function New-GoldenContext {
-        $root = New-HardenedDirectory (Join-Path $TestDrive ([Guid]::NewGuid().ToString('N')))
+        param([string]$Prefix = '')
+        $root = New-HardenedDirectory (Join-Path $TestDrive ($Prefix + [Guid]::NewGuid().ToString('N')))
         New-Item -ItemType Directory -Path (Join-Path $root 'tools') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $root 'src\Agents\reviewer') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $root 'src\Agents\review-handler') -Force | Out-Null
@@ -344,10 +345,101 @@ Describe 'golden launch policy (issue #114)' {
                 @($script:handlerDescriptor.operationalTiers.codeUpdate) | Sort-Object))
         $descriptor.roles.'review-handler'.mandatoryDenies | Should -BeExactly @($script:handlerDescriptor.delegableDefaultOff)
         $descriptor.roles.'review-handler'.absoluteDenies | Should -BeExactly @()
+        $descriptor.ContainsKey('localObservation') | Should -BeFalse
+        $launchedDescriptor = $records[2].descriptor | ConvertFrom-Json -AsHashtable
+        $launchedDescriptor.localObservation.ownerStartIdentity | Should -Match '^(utc|linux):\d+$'
+        @($launchedDescriptor.localObservation.streams).Count | Should -Be 2
+        foreach ($stream in $launchedDescriptor.localObservation.streams) {
+            $stream.processId | Should -BeGreaterThan 0
+            $stream.eventLogPath | Should -BeExactly (Join-Path $launchedDescriptor.stateRoot "$($stream.role).stdout.jsonl")
+            $result.StdOut | Should -Match "Watching $($stream.role) PID $($stream.processId)\."
+        }
 
         $result.StdOut | Should -Match 'Mode\s+: OPERATIONAL'
         $result.StdOut | Should -Match 'Operator\s+: golden-test'
         $result.StdOut | Should -Match 'Preview alternative'
+    }
+
+    It 'captures real Golden stdout through the real broker and tailer (buffered baseline=<BufferedBaseline>)' -Tag 'LiveCapture' -ForEach @(
+        @{ BufferedBaseline = $true }, @{ BufferedBaseline = $false }
+    ) {
+        $dashboardSource = Join-Path $script:repoRoot 'src\DevPilot.Dashboard'
+        $bunName = if ($IsWindows) { 'bun.exe' } else { 'bun' }
+        $bunSource = Join-Path $dashboardSource "node_modules\bun\bin\$bunName"
+        $probeSource = Join-Path $dashboardSource 'dist\test\fixtures\live-capture-dashboard.js'
+        if (-not (Test-Path $bunSource) -or -not (Test-Path $probeSource)) {
+            Set-ItResult -Skipped -Because 'Build the installed dashboard before running its Golden integration.'
+            return
+        }
+        $context = New-GoldenContext -Prefix 'live golden spaced path '
+        if ($BufferedBaseline) {
+            $watchCopy = Join-Path $context.Root 'tools\Watch-DevPilotAgents.ps1'
+            $source = [IO.File]::ReadAllText($watchCopy)
+            [IO.File]::WriteAllText($watchCopy, $source.Replace(' -LiveStandardOutput', ''), [Text.UTF8Encoding]::new($false))
+        }
+        $dashboard = Join-Path $context.Root 'src\DevPilot.Dashboard'
+        New-Item -ItemType Directory -Path "$dashboard\node_modules\bun\bin", "$dashboard\dist\src", "$dashboard\dist\test\fixtures" -Force | Out-Null
+        Copy-Item $bunSource "$dashboard\node_modules\bun\bin\$bunName"
+        Copy-Item "$dashboardSource\dist\src\*.js" "$dashboard\dist\src"
+        Copy-Item $probeSource "$dashboard\dist\test\fixtures\live-capture-dashboard.js"
+        # The genuine fixed dashboard command line remains intact. Only the rendering
+        # entry delegates to the assertion probe; the broker/ancestry checks are not mocked.
+        [IO.File]::WriteAllText("$dashboard\dist\src\index.js",
+            'import "../test/fixtures/live-capture-dashboard.js";', [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $context.Root 'tools\Start-DevPilotDashboard.ps1'), @'
+param([string[]]$StateDir, [string[]]$EventLogPath, [string]$BrokerDescriptorPath, [string]$LaunchMode, [switch]$ValidateOnly)
+if ($ValidateOnly) { return }
+$dashboard = Join-Path (Split-Path $PSScriptRoot -Parent) 'src\DevPilot.Dashboard'
+$bun = Join-Path $dashboard $(if ($IsWindows) { 'node_modules\bun\bin\bun.exe' } else { 'node_modules\bun\bin\bun' })
+& $bun --conditions=browser (Join-Path $dashboard 'dist\src\index.js') --launch-mode $LaunchMode --state-dir $StateDir[0] `
+    --broker-executable (Resolve-AgentPwshPath) --broker-script (Join-Path $PSScriptRoot 'Invoke-DevPilotAgentDispatch.ps1') `
+    --broker-descriptor $BrokerDescriptorPath
+if ($LASTEXITCODE -ne 0) { throw "Live capture dashboard probe failed: $LASTEXITCODE" }
+'@, [Text.UTF8Encoding]::new($false))
+        $liveChild = @'
+$role = if ($PSCommandPath -match 'ReviewHandler') { 'review-handler' } else { 'reviewer' }
+[IO.File]::WriteAllText((Join-Path $env:DEVPILOT_TEST_ARGV_DIR "$role.argv.json"), (ConvertTo-Json @($args)))
+$event = @{ schemaVersion = 2; agent = $role; instanceId = "real-$role"; processId = $PID; sequence = 1;
+    timestamp = [DateTime]::UtcNow.ToString('o'); eventType = 'agent.started'; data = @{ repository = 'test' } }
+[Console]::Out.WriteLine(($event | ConvertTo-Json -Compress))
+[Console]::Out.Flush()
+$deadline = [DateTime]::UtcNow.AddSeconds(45)
+while (-not (Test-Path (Join-Path $env:DEVPILOT_TEST_ARGV_DIR 'release'))) {
+    if ([DateTime]::UtcNow -gt $deadline) { exit 81 }
+    Start-Sleep -Milliseconds 25
+}
+$event.sequence = 2
+$event.eventType = 'phase.changed'
+$event.data = @{ phase = 'last frame before interrupted exit' }
+$line = $event | ConvertTo-Json -Compress
+[Console]::Out.Write($line.Substring(0, 40))
+[Console]::Out.Flush()
+Start-Sleep -Milliseconds 75
+[Console]::Out.WriteLine($line.Substring(40))
+[Console]::Out.Flush()
+exit 0
+'@
+        foreach ($path in @('src\Agents\reviewer\Start-ReviewerAgent.ps1', 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1')) {
+            [IO.File]::WriteAllText((Join-Path $context.Root $path), $liveChild, [Text.UTF8Encoding]::new($false))
+        }
+        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden') + (Get-BaseLaunchArgument -Context $context))
+        if ($BufferedBaseline) {
+            # The same end-to-end assertion must fail with the old buffered helper branch.
+            $result.ExitCode | Should -Be 1
+            $result.StdErr | Should -Match 'ENOENT'
+            $result.StdErr | Should -Match 'reviewer.stdout.jsonl'
+            return
+        }
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        $proof = Get-Content (Join-Path $context.ArgvDir 'live-proof.json') -Raw | ConvertFrom-Json
+        $proof.exited | Should -Be 2
+        foreach ($capture in $proof.captures) {
+            (Get-FileHash $capture.path -Algorithm SHA256).Hash.ToLowerInvariant() | Should -BeExactly $capture.hash
+            @(Get-Content $capture.path).Count | Should -Be 2
+            [void](Assert-AgentTrustedFile -Path $capture.path -Private)
+        }
+        (Get-AgentArgv -Context $context -Role reviewer) | Should -Contain $context.ReviewerConfig
+        (Get-AgentArgv -Context $context -Role review-handler) | Should -Contain $context.ReviewHandlerConfig
     }
 
     It 'applies PreviewOnly as a terminal ceiling over every golden default' {

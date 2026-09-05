@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import test from "node:test";
@@ -510,7 +510,7 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     await writeAndWait("\x1b[C", "RAW EVENTS - WARNINGS");
     await writeAndWait("\x1b", "Events overlay closed");
 
-    await writeAndWait("\x10", "CONTEXT COMMANDS - VIEW ONLY");
+    await writeAndWait("\x10", "DASHBOARD COMMANDS");
     await writeAndWait("\x1b", "Command palette closed");
 
     await writeAndWait("/missing\r", "PR HISTORY 0");
@@ -614,9 +614,16 @@ test("built dashboard exercises the PR3 settings editor through real ConPTY and 
 
   async function waitForVisible(expected: string, start = 0): Promise<void> {
     const deadline = Date.now() + 8_000;
+    let repaintAt = Date.now() + 400;
     while (Date.now() < deadline) {
       if (visibleOutput().slice(start).includes(expected)) return;
       if (exited) throw failureContext(`dashboard exited before rendering ${JSON.stringify(expected)}`);
+      if (Date.now() >= repaintAt) {
+        terminal!.resize(terminalColumns + 1, terminalRows);
+        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+        terminal!.resize(terminalColumns, terminalRows);
+        repaintAt = Date.now() + 600;
+      }
       await new Promise((resolveWait) => setTimeout(resolveWait, 20));
     }
     throw failureContext(`timed out waiting for ${JSON.stringify(expected)}`);
@@ -969,9 +976,16 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
 
   async function waitForVisible(expected: string, start = 0): Promise<void> {
     const deadline = Date.now() + 8_000;
+    let repaintAt = Date.now() + 400;
     while (Date.now() < deadline) {
       if (visibleOutput().slice(start).includes(expected)) return;
       if (exited) throw failureContext(`dashboard exited before rendering ${JSON.stringify(expected)}`);
+      if (Date.now() >= repaintAt) {
+        terminal!.resize(terminalColumns + 1, terminalRows);
+        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+        terminal!.resize(terminalColumns, terminalRows);
+        repaintAt = Date.now() + 600;
+      }
       await new Promise((resolveWait) => setTimeout(resolveWait, 20));
     }
     throw failureContext(`timed out waiting for ${JSON.stringify(expected)}`);
@@ -1006,7 +1020,7 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
     await access(entryPath);
     await access(powerShellPath);
     await mkdir(eventDirectory, { recursive: true });
-    await writeFile(eventPath, fixtureLines(), "utf8");
+    await writeFile(eventPath, "", "utf8");
     await writeFile(dispatchEventLogPath, "", "utf8");
     await writeFile(
       brokerDescriptorPath,
@@ -1039,21 +1053,23 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
 
     await waitForVisible("DEVPILOT OPERATIONS");
     await waitForVisible("TRUSTED MANUAL ENABLED");
-    await writeAndWait("f", "View filter changed to History");
-    await waitForVisible("operations-dashboard PR #104");
-    await writeAndWait("m", "Ctrl+D describe");
-    await writeAndWait("\x04", "Press w to request EnableApprovalVote widening (draft-bound, single-use).");
+    await writeAndWait("m", "START AGENT BY PR ID");
+    await writeAndWait("\x1b", "Start Agent by PR ID");
+    await writeAndWait("m", "PR ID: (blank)");
+    await writeAndWait("1.2\r", "PR ID must be in 1..2147483647.");
+    await writeAndWait("\x15104\r", "Press w to request EnableApprovalVote widening (draft-bound, single-use).");
     await writeAndWait("w", "Widening preview: EnableApprovalVote");
     await waitForVisible("Paired requirement: EnableFindingComments must already be active (confirmed active).");
     await waitForVisible("Would add: EnableApprovalVote");
     await waitForVisible("Would remove from denies: EnableApprovalVote");
-    await writeAndWait("c", "Final widening blast radius: EnableApprovalVote");
+    await writeAndWait("c", "widening blast radius: EnableApprovalVote");
     await waitForVisible("Single-use grant; expires");
     await waitForVisible("FINAL WIDENING CONFIRMATION: press y to mint this grant; Esc cancels.");
-    await writeAndWait("y", "Widening grant minted and active for this draft; continue with d then y to dispatch, or Esc to close and relinquish it.");
+    await writeAndWait("y", "Widening grant minted and active for this draft.");
 
     const preDispatchOperations = await readRequestOperations(requestLogPath);
     assert.deepEqual(preDispatchOperations, [
+      "profile-current",
       "describe",
       "describe-widening",
       "confirm-widening-preview",
@@ -1064,17 +1080,18 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
       .map((line) => line.trim())
       .filter(Boolean)
       .map((line) => JSON.parse(line) as Record<string, unknown>);
-    assert.equal(preDispatchRequests[0]?.repositoryKey, "v1:github:10400000000000001");
-    assert.equal(preDispatchRequests[1]?.capability, "EnableApprovalVote");
-    assert.equal(preDispatchRequests[2]?.challenge, "a".repeat(48));
-    assert.equal(preDispatchRequests[3]?.challenge, "b".repeat(48));
+    assert.equal(preDispatchRequests[0]?.repositoryKey, undefined);
+    assert.equal(preDispatchRequests[0]?.pullRequestId, 104);
+    assert.equal(preDispatchRequests[1]?.repositoryKey, "v1:github:10400000000000001");
+    assert.equal(preDispatchRequests[2]?.capability, "EnableApprovalVote");
+    assert.equal(preDispatchRequests[3]?.challenge, "a".repeat(48));
+    assert.equal(preDispatchRequests[4]?.challenge, "b".repeat(48));
 
-    await writeAndWait("d", "FINAL CONFIRMATION: press y to dispatch this exact snapshot; Esc cancels.");
-    await writeAndWait("y", "Accepted dispatch");
-    await waitForVisible("Dispatch accepted; waiting for correlated v3 child events.");
-    await waitForVisible("Correlated v3 events:");
-    await writeAndWait("c", "Cancellation completed: cooperatively.");
-    await writeAndWait("\r", "PR HISTORY");
+    await writeAndWait("\r", "STARTED / RUNNING");
+    await waitForVisible("Waiting for first progress");
+    await waitForVisible("Child PID 4242");
+    await writeAndWait("c", "CANCELLED");
+    await writeAndWait("\r", "INSTANCES");
 
     terminal.write("q");
     const result = await waitForExit("dashboard hung after quitting widened flow");
@@ -1083,6 +1100,7 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
 
     const parsedRequests = await readRequestOperations(requestLogPath);
     assert.deepEqual(parsedRequests, [
+      "profile-current",
       "describe",
       "describe-widening",
       "confirm-widening-preview",
@@ -1191,7 +1209,7 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
     await access(entryPath);
     await access(powerShellPath);
     await mkdir(eventDirectory, { recursive: true });
-    await writeFile(eventPath, fixtureLines(), "utf8");
+    await writeFile(eventPath, "", "utf8");
     await writeFile(dispatchEventLogPath, "", "utf8");
     await writeFile(
       brokerDescriptorPath,
@@ -1224,17 +1242,15 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
 
     await waitForVisible("DEVPILOT OPERATIONS");
     await waitForVisible("TRUSTED MANUAL ENABLED");
-    await writeAndWait("f", "View filter changed to History");
-    await waitForVisible("operations-dashboard PR #104");
-    await writeAndWait("m", "Ctrl+D describe");
-    await writeAndWait("\x04", "Press w to request EnableApprovalVote widening (draft-bound, single-use).");
+    await writeAndWait("m", "START AGENT BY PR ID");
+    await writeAndWait("104\r", "Press w to request EnableApprovalVote widening (draft-bound, single-use).");
     await writeAndWait("w", "Widening preview: EnableApprovalVote");
     await waitForVisible("Paired requirement: EnableFindingComments must already be active (confirmed active).");
-    await writeAndWait("c", "Final widening blast radius: EnableApprovalVote");
+    await writeAndWait("c", "widening blast radius: EnableApprovalVote");
     await waitForVisible("FINAL WIDENING CONFIRMATION: press y to mint this grant; Esc cancels.");
     await writeAndWait("\x1b", "Widening cancelled; capability profile refreshed to the unwidened baseline.");
     await waitForVisible("Press w to request EnableApprovalVote widening (draft-bound, single-use).");
-    await writeAndWait("\x1b", "PR HISTORY");
+    await writeAndWait("\x1b", "INSTANCES");
 
     terminal.write("q");
     const result = await waitForExit("dashboard hung after quitting Esc cancellation flow");
@@ -1243,6 +1259,7 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
 
     const parsedRequests = await readRequestOperations(requestLogPath);
     assert.deepEqual(parsedRequests, [
+      "profile-current",
       "describe",
       "describe-widening",
       "confirm-widening-preview",
@@ -1254,7 +1271,7 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
       .map((line) => line.trim())
       .filter(Boolean)
       .map((line) => JSON.parse(line) as Record<string, unknown>);
-    assert.equal(cancelRequests[3]?.generation, 2);
+    assert.equal(cancelRequests[4]?.generation, 2);
   } finally {
     try {
       if (terminal && !exited) {
@@ -1274,6 +1291,128 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
       dataSubscription?.dispose();
       exitSubscription?.dispose();
       await rm(stateRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("real ConPTY Enter flow shows starting, late progress, completion and cancellation across both roles and widths", {
+  skip: process.platform === "win32" ? false : "ConPTY integration is Windows-only",
+  timeout: 120_000,
+}, async () => {
+  for (const width of [70, 100, 140]) {
+    const role = width === 100 ? "review-handler" : "reviewer";
+    const previewOnly = width === 140;
+    const root = await mkdtemp(join(tmpdir(), "devpilot-dashboard-enter-"));
+    const requestLogPath = join(root, "requests.jsonl");
+    const eventLogPath = join(root, "late.jsonl");
+    const descriptorPath = join(root, "descriptor.json");
+    let terminal: IPty | undefined;
+    let output = "";
+    let exited: PtyExit | undefined;
+    let dataSubscription: IDisposable | undefined;
+    let exitSubscription: IDisposable | undefined;
+    const visible = () => stripVTControlCharacters(output);
+    async function waitFor(expected: string, start = 0): Promise<void> {
+      const until = Date.now() + 8_000;
+      let repaintAt = Date.now() + 400;
+      while (!visible().slice(start).includes(expected)) {
+        if (exited || Date.now() > until) throw new Error(`Expected ${expected} at ${width} columns\n${visible().slice(-5_000)}`);
+        // ConPTY emits changed cells, not full text (CANCELLING -> CANCELLED can be only "ED").
+        // A real width change requests a complete current frame for text assertions.
+        if (Date.now() >= repaintAt) {
+          terminal!.resize(width + 1, 36);
+          await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+          terminal!.resize(width, 36);
+          repaintAt = Date.now() + 600;
+        }
+        await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      }
+    }
+    async function send(bytes: string, expected: string): Promise<void> {
+      const start = visible().length;
+      terminal!.write(bytes);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 90));
+      terminal!.resize(width, 35);
+      terminal!.resize(width, 36);
+      await waitFor(expected, start);
+    }
+    try {
+      await writeFile(descriptorPath, JSON.stringify({
+        requestLogPath, dispatchEventLogPath: eventLogPath, simpleFlow: true, role,
+        previewOnly, complete: role === "review-handler",
+      }));
+      terminal = spawn(resolve("node_modules", "bun", "bin", "bun.exe"), [
+        "--conditions=browser", resolve("dist", "src", "index.js"),
+        "--state-dir", root, "--launch-mode", previewOnly ? "preview" : "operational",
+        "--broker-executable", resolvePowerShellPath(), "--broker-script", reviewerWideningBrokerScript(),
+        "--broker-descriptor", descriptorPath,
+      ], { name: "xterm-256color", cols: width, rows: 36, cwd: resolve("."), env: environment() });
+      dataSubscription = terminal.onData((data) => { output = (output + data).slice(-MAX_CAPTURE_CHARS); });
+      exitSubscription = terminal.onExit((exit) => { exited = exit; });
+      await waitFor("DEVPILOT OPERATIONS");
+      await send("m", "PR ID: (blank)");
+      if (role === "review-handler") await send("\t", "Agent: Review Handler");
+      await send("104\r\r", "NOT STARTED / READY TO START");
+      assert.deepEqual(await readRequestOperations(requestLogPath), ["profile-current", "describe"]);
+      if (width === 70) {
+        await send("p", "Optional instructions");
+        terminal.write("first\x1b[13;2u\x1b[200~second\r\nq d y c\x1b[201~");
+        await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+        await send("\r\r", "NOT STARTED / READY TO START");
+        assert.deepEqual(await readRequestOperations(requestLogPath), ["profile-current", "describe"]);
+      }
+      if (previewOnly) await waitFor("No PR comments or code pushes");
+      else await waitFor(role === "reviewer" ? "finding comments" : "code pushes");
+      await send("\x1b[13;1:2u", "Enter: START");
+      assert.deepEqual(await readRequestOperations(requestLogPath), ["profile-current", "describe"]);
+      await send("\r\r", "STARTING...");
+      await waitFor("STARTED / RUNNING");
+      await waitFor("Waiting for first progress");
+      await waitFor("Child PID 4242");
+      terminal.write("\r\r");
+      assert.equal((await readRequestOperations(requestLogPath)).filter((operation) => operation === "dispatch").length, 1);
+      assert.doesNotMatch(visible(), /SOURCE WARNING/);
+      const dispatchId = "22222222-2222-4222-8222-222222222222";
+      const manualEvent = (sequence: number, type: string, data: Record<string, unknown>, manual = true): string => {
+        const value = JSON.parse(event(role, manual ? "manual-enter" : "automatic-same-pr", sequence, type, data));
+        return JSON.stringify({
+          ...value, processId: manual ? 4242 : 5555, timestamp: new Date().toISOString(),
+          dispatch: manual ? { schemaVersion: 1, dispatchId, ownership: "tui", forceAnalysis: true } : null,
+        }) + "\n";
+      };
+      await writeFile(eventLogPath, manualEvent(1, "work.completed", { result: "failed" }, false));
+      await appendFile(eventLogPath, manualEvent(1, "agent.started", {}));
+      await appendFile(eventLogPath, manualEvent(2, "phase.changed", { phase: "Inspecting manual changes" }));
+      await waitFor("Phase: Inspecting manual changes");
+      if (role === "review-handler") {
+        await appendFile(eventLogPath, manualEvent(3, "work.completed", { result: "handled", summary: "Manual handler finished" }));
+        await waitFor("FINISHED");
+        await waitFor("Manual handler finished");
+      } else {
+        await send("cc\r", "CANCELLING...");
+        await waitFor("CANCELLED");
+      }
+      await send("\r", "INSTANCES");
+      terminal.write("q");
+      const until = Date.now() + 15_000;
+      while (!exited && Date.now() < until) await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      assert.equal(exited?.exitCode, 0, "fixture dashboard must quit cleanly");
+      const requests = (await readFile(requestLogPath, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+      const dispatched = requests.filter((request) => request.operation === "dispatch");
+      assert.equal(dispatched.length, 1);
+      assert.equal(dispatched[0].role, role);
+      assert.equal(dispatched[0].operatorPrompt, width === 70 ? "first\nsecond\nq d y c" : "");
+      assert.equal(requests.some((request) => /widening/.test(request.operation)), false);
+    } finally {
+      if (terminal && !exited) {
+        terminal.kill();
+        const until = Date.now() + EXIT_TIMEOUT_MS;
+        while (!exited && Date.now() < until) await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      }
+      if (terminal) disposeConptyOutputWorker(terminal);
+      dataSubscription?.dispose();
+      exitSubscription?.dispose();
+      await rm(root, { recursive: true, force: true });
     }
   }
 });

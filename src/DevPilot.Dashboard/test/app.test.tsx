@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { join } from "node:path";
+import test, { type TestContext } from "node:test";
 import { testRender } from "@opentui/solid";
 import type { TestRendererSetup } from "@opentui/core/testing";
 import {
   App, BRAND_PLANE, HELP_LEGEND, appendPromptScalar, completionResultColor,
-  printableKeySequence, safeHttpUrl, selectableCount,
+  printableKeySequence, safeHttpUrl, selectableCount, parseManualPullRequestId,
 } from "../src/app.js";
 import { parseAgentEvent, type AgentRole } from "../src/domain.js";
 import { OperationsReducer } from "../src/reducer.js";
@@ -33,8 +34,8 @@ import { BrokerRejectionError } from "../src/dispatch.js";
 const DOCUMENTED_COMMAND_COVERAGE = [
   "Left", "Right", "Up", "Down", "j", "k", "Enter", "Esc", "b",
   "Tab", "Shift+Tab", "f", "Shift+f", "x", "Shift+x", "/",
-  "number then Enter", "m", "prompt Tab", "prompt Enter",
-  "Ctrl+d then d then y", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
+  "number then Enter", "m", "target Tab", "target Enter", "preview p", "prompt Enter",
+  "Enter preview then Enter start", "Shift+Enter newline", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
   "s", "settings Tab", "settings r",
 ] as const;
 
@@ -341,6 +342,7 @@ function createSettingsBrokerFixture(): {
 
   const broker: DispatchBroker = {
     describe: async () => { throw new Error("not called"); },
+    profileCurrent: async () => { throw new Error("not called"); },
     profile: async (_repositoryKey, pullRequestId, role) => {
       if (pullRequestId !== prSnapshot.pullRequestId) throw new Error("unexpected pullRequestId");
       return profile(role);
@@ -450,7 +452,7 @@ test("brand plane rows share one centered monospace geometry", () => {
 test("help legend spells out view meaning and local-only forget behavior", () => {
   assert.deepEqual(HELP_LEGEND, [
     "Live = active work; Current session = Live plus newest retained per group.",
-    "History = stopped/completed retained runs; Stale = heartbeat overdue.",
+    "History includes observed exits; Stale alone never proves process exit.",
     "Forget never deletes agent state or event logs; unavailable actions report status.",
   ]);
 });
@@ -459,8 +461,8 @@ test("documented command coverage matrix enumerates every dashboard command", ()
   assert.deepEqual(DOCUMENTED_COMMAND_COVERAGE, [
     "Left", "Right", "Up", "Down", "j", "k", "Enter", "Esc", "b",
     "Tab", "Shift+Tab", "f", "Shift+f", "x", "Shift+x", "/",
-    "number then Enter", "m", "prompt Tab", "prompt Enter",
-    "Ctrl+d then d then y", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
+    "number then Enter", "m", "target Tab", "target Enter", "preview p", "prompt Enter",
+    "Enter preview then Enter start", "Shift+Enter newline", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
     "s", "settings Tab", "settings r",
   ]);
 });
@@ -644,7 +646,7 @@ test("native keyboard controls provide contextual effects and feedback in every 
     assert.match(wide.captureCharFrame(), /STATUS: Opened validated PR URL/);
     wide.mockInput.pressKey("p", { ctrl: true });
     await wide.flush();
-    assert.match(wide.captureCharFrame(), /CONTEXT COMMANDS - VIEW ONLY/);
+    assert.match(wide.captureCharFrame(), /DASHBOARD COMMANDS/);
     wide.mockInput.pressArrow("down");
     wide.mockInput.pressEnter();
     await wide.flush();
@@ -900,6 +902,7 @@ test("settings overlay renders every known capability provenance value", async (
   let profileCallCount = 0;
   const broker: DispatchBroker = {
     describe: async () => { throw new Error("not called"); },
+    profileCurrent: async () => { throw new Error("not called"); },
     profile: async () => {
       profileCallCount++;
       // The SETTINGS overlay's Provenance line is a fixed-width, non-wrapping single row, so all
@@ -1001,6 +1004,7 @@ test("settings role toggle refetches without ever pairing a role label with anot
   const handlerProfile = profileFor("review-handler", "handler");
   const broker: DispatchBroker = {
     describe: async () => { throw new Error("not called"); },
+    profileCurrent: async () => { throw new Error("not called"); },
     profile: async (_repositoryKey, _pullRequestId, role) => {
       profileCalls.push(role);
       return role === "reviewer" ? reviewerPending : handlerPending;
@@ -1424,7 +1428,7 @@ test("q closes the settings editor globally and shuts down the broker", async (c
   }
 });
 
-test("trusted manual flow requires describe plus two explicit confirmations", async (context) => {
+test("trusted manual flow binds a fresh preview and explicit start independently of History", async (context) => {
   const fixture = createFixture();
   const history = new PullRequestHistoryProjection();
   history.apply(parseAgentEvent({
@@ -1564,6 +1568,7 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
     eventLogPath: "Q:\\events\\reviewer.jsonl",
   };
   const broker: DispatchBroker = {
+    profileCurrent: async () => ({ ...summary, operation: "capability-profile" }),
     describe: async (repositoryKey, pullRequestId) => {
       describeCount++;
       describedTarget = `${repositoryKey}:${pullRequestId}`;
@@ -1666,30 +1671,24 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
     assert.match(setup.captureCharFrame(), /Jumped to repo PR #104/);
     setup.mockInput.pressKey("m");
     await setup.flush();
-    assert.match(setup.captureCharFrame(), /MANUAL DISPATCH/);
-    assert.match(setup.captureCharFrame(), /contoso\/repo \/ PR #104/);
-    assert.match(setup.captureCharFrame(), /Manual PR \| Ada/);
-    assert.match(setup.captureCharFrame(), /512 Unicode scalars/);
+    assert.match(setup.captureCharFrame(), /START AGENT BY PR ID/);
+    assert.match(setup.captureCharFrame(), /PR ID: \(blank\)/);
     setup.mockInput.pressTab();
     await setup.flush();
     assert.match(setup.captureCharFrame(), /Role: HANDLER/);
     setup.mockInput.pressTab({ shift: true });
     await setup.flush();
     assert.match(setup.captureCharFrame(), /Role: REVIEWER/);
-    setup.mockInput.pressKey("q");
-    setup.mockInput.pressKey("q", { ctrl: true });
-    await setup.mockInput.typeText(" fix");
+    await setup.mockInput.typeText("104");
     setup.mockInput.pressEnter();
-    await setup.mockInput.typeText("next");
     await setup.flush();
-    assert.match(setup.captureCharFrame(), /q fix \/ next/);
-    setup.mockInput.pressBackspace();
+    assert.match(setup.captureCharFrame(), /contoso\/broker-repo \/ PR #104/);
+    assert.match(setup.captureCharFrame(), /Manual PR \| Ada/);
+    assert.match(setup.captureCharFrame(), /Preparing preview/);
+    setup.mockInput.pressTab();
     await setup.flush();
-    assert.match(setup.captureCharFrame(), /q fix \/ nex/);
-    assert.equal(describeCount, 0);
+    assert.match(setup.captureCharFrame(), /Role: REVIEWER/);
     assert.equal(dispatchCount, 0);
-    setup.mockInput.pressKey("d", { ctrl: true });
-    await setup.renderOnce();
     assert.equal(describeCount, 1);
     assert.equal(describedTarget, "v1:github:9007199254740993:104");
     history.apply(parseAgentEvent({
@@ -1711,12 +1710,29 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
     }));
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     await setup.renderOnce();
-    assert.match(setup.captureCharFrame(), /contoso\/repo \/ PR #104/);
+    assert.match(setup.captureCharFrame(), /contoso\/broker-repo \/ PR #104/);
     assert.doesNotMatch(setup.captureCharFrame(), /other-repo \/ PR #205/);
     resolveDescribe(summary);
     await setup.flush();
     assert.match(setup.captureCharFrame(), /contoso\/broker-repo \/ PR #104/);
-    assert.match(setup.captureCharFrame(), /Disabled high-impact: EnableApprovalVote/);
+    assert.match(setup.captureCharFrame(), /Not allowed: approval vote/);
+    setup.mockInput.pressKey("p");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Optional instructions/);
+    setup.mockInput.pressKey("q");
+    setup.mockInput.pressKey("q", { ctrl: true });
+    await setup.mockInput.typeText(" fix");
+    setup.mockInput.pressEnter({ shift: true });
+    await setup.mockInput.typeText("next");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /q fix \/ next/);
+    setup.mockInput.pressBackspace();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /q fix \/ nex/);
+    setup.mockInput.pressKey("d", { ctrl: true });
+    await setup.flush();
+    assert.equal(describeCount, 1, "optional instructions do not allocate another draft");
+    assert.equal(dispatchCount, 0);
     setup.mockInput.pressKey("d");
     await setup.flush();
     assert.equal(dispatchCount, 0);
@@ -1724,14 +1740,14 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
     await setup.flush();
     assert.equal(dispatchCount, 1);
     assert.equal(dispatchedTarget, "v1:github:9007199254740993:104");
-    assert.match(setup.captureCharFrame(), /Accepted dispatch/);
+    assert.match(setup.captureCharFrame(), /STARTED \/ RUNNING/);
     setup.mockInput.pressKey("c");
     await setup.flush();
     assert.equal(cancelCount, 1);
-    assert.match(setup.captureCharFrame(), /Cancellation completed: cancelled-cooperative/);
+    assert.match(setup.captureCharFrame(), /CANCELLED/);
     setup.mockInput.pressEscape();
     await setup.flush();
-    assert.doesNotMatch(setup.captureCharFrame(), /MANUAL DISPATCH/);
+    assert.doesNotMatch(setup.captureCharFrame(), /START AGENT BY PR ID/);
   } catch (error) {
     if (error instanceof Error && error.message.includes("native FFI is not available")) {
       context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
@@ -1750,6 +1766,7 @@ test("q shuts down the tailer and trusted broker before destroying the renderer"
   let setup: TestRendererSetup | undefined;
   const broker: DispatchBroker = {
     describe: async () => { throw new Error("not called"); },
+    profileCurrent: async () => { throw new Error("not called"); },
     profile: async () => { throw new Error("not called"); },
     dispatch: async () => { throw new Error("not called"); },
     cancel: async () => { throw new Error("not called"); },
@@ -1800,6 +1817,7 @@ test("renderer destruction handles rejected trusted broker shutdown once", async
   };
   const broker: DispatchBroker = {
     describe: async () => { throw new Error("not called"); },
+    profileCurrent: async () => { throw new Error("not called"); },
     profile: async () => { throw new Error("not called"); },
     dispatch: async () => { throw new Error("not called"); },
     cancel: async () => { throw new Error("not called"); },
@@ -1926,6 +1944,7 @@ function createWideningBrokerFixture(options: {
     eventLogPath: "Q:\\events\\widening.jsonl",
   };
   const broker: DispatchBroker = {
+    profileCurrent: async () => ({ ...summary, operation: "capability-profile" }),
     describe: async () => { calls.push("describe"); return summary; },
     profile: async () => { throw new Error("not called"); },
     previewNarrowing: async () => { throw new Error("not called"); },
@@ -2013,16 +2032,16 @@ function createWideningBrokerFixture(options: {
 }
 
 async function openManualAndDescribe(setup: TestRendererSetup, role: AgentRole = "reviewer"): Promise<void> {
-  setup.mockInput.pressKey("f");
-  await setup.flush();
   setup.mockInput.pressKey("m");
   await setup.flush();
   if (role === "review-handler") {
     setup.mockInput.pressTab();
     await setup.flush();
   }
-  setup.mockInput.pressKey("d", { ctrl: true });
+  await setup.mockInput.typeText("104");
+  setup.mockInput.pressEnter();
   await setup.flush();
+  assert.match(setup.captureCharFrame(), /NOT STARTED \/ READY TO START/);
 }
 
 test("manual dispatch widening: reviewer mints EnableApprovalVote via two explicit confirms, shows the paired EnableFindingComments requirement, never auto-dispatches, and the existing d/y gate dispatches the minted digest", async (context) => {
@@ -2046,6 +2065,10 @@ test("manual dispatch widening: reviewer mints EnableApprovalVote via two explic
     assert.match(setup.captureCharFrame(), /Paired requirement: EnableFindingComments must already be active \(confirmed active\)/);
     assert.match(setup.captureCharFrame(), /unexplained verdict/);
     assert.match(setup.captureCharFrame(), /First widening confirmation: press c/);
+    setup.mockInput.pressEnter();
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.equal(calls.at(-1), "describe-widening:EnableApprovalVote");
 
     setup.mockInput.pressKey("c");
     await setup.flush();
@@ -2054,6 +2077,9 @@ test("manual dispatch widening: reviewer mints EnableApprovalVote via two explic
     assert.match(setup.captureCharFrame(), /Single-use grant; expires/);
     assert.match(setup.captureCharFrame(), /Unavailable to headless\/direct\/watcher dispatch/);
     assert.match(setup.captureCharFrame(), /FINAL WIDENING CONFIRMATION: press y/);
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.equal(calls.at(-1), "confirm-widening-preview");
 
     setup.mockInput.pressKey("y");
     await setup.flush();
@@ -2061,7 +2087,7 @@ test("manual dispatch widening: reviewer mints EnableApprovalVote via two explic
     assert.equal(calls.includes("dispatch"), false, "minting must never auto-dispatch");
     assert.match(setup.captureCharFrame(), /Widening grant minted and active for this draft/);
     assert.match(setup.captureCharFrame(), /vote-grant dispatch: skips forced fresh analysis/);
-    assert.match(setup.captureCharFrame(), /Enabled: EnableApprovalVote/);
+    assert.match(setup.captureCharFrame(), /Allowed: approval vote/);
 
     // Existing, unmodified dispatch confirmation gate -- 'd' then 'y' -- is what finally dispatches.
     setup.mockInput.pressKey("d");
@@ -2241,7 +2267,7 @@ test("manual dispatch widening: closing the panel with a minted-but-undispatched
 
     setup.mockInput.pressEscape();
     await setup.flush();
-    assert.doesNotMatch(setup.captureCharFrame(), /MANUAL DISPATCH/);
+    assert.doesNotMatch(setup.captureCharFrame(), /START AGENT BY PR ID/);
     assert.ok(calls.includes("cancel-widening:3"), "closing with a minted grant must best-effort cancel it");
   } catch (error) {
     if (error instanceof Error && error.message.includes("native FFI is not available")) {
@@ -2256,7 +2282,7 @@ test("manual dispatch widening: closing the panel with a minted-but-undispatched
 });
 
 test("golden operational chrome keeps History and manual launch discoverable at supported widths", async (context) => {
-  for (const width of [60, 80, 120]) {
+  for (const width of [70, 100, 140]) {
     const fixture = createFixture();
     const history = createSettingsHistory();
     let setup: TestRendererSetup | undefined;
@@ -2272,16 +2298,14 @@ test("golden operational chrome keeps History and manual launch discoverable at 
       await setup.renderOnce();
       const initial = setup.captureCharFrame();
       assert.match(initial, /OPERATIONAL/);
-      assert.match(initial, /f History/);
-      assert.match(initial, /m launch/);
+      assert.match(initial, /m Start Agent by PR ID/);
 
       setup.mockInput.pressKey("f");
       await setup.flush();
       const historyFrame = setup.captureCharFrame();
       assert.match(historyFrame, /PR history 1/);
       assert.match(historyFrame, /selected repo #104/);
-      assert.match(historyFrame, /m launch/);
-      assert.match(historyFrame, /Tab role/);
+      assert.match(historyFrame, /m Start Agent by PR ID/);
     } catch (error) {
       if (error instanceof Error && error.message.includes("native FFI is not available")) {
         context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
@@ -2294,6 +2318,476 @@ test("golden operational chrome keeps History and manual launch discoverable at 
     }
   }
 });
+
+  async function startFixture() {
+    const seed = createWideningBrokerFixture();
+    const base = await seed.broker.describe("", 104, "reviewer");
+    const calls: { operation: string; prId?: number; role?: AgentRole; key?: string; summary?: CapabilitySummary }[] = [];
+    const summaryFor = (prId: number, role: AgentRole): CapabilitySummary => {
+      const id = role === "reviewer" ? "101" : "202";
+      const capabilities = role === "reviewer"
+        ? ["EnableFindingComments", "EnableThreadReplies", "EnableSummaryComment"]
+        : ["EnableCodeChanges", "EnablePush", "EnableThreadReplies", "LocalValidation"];
+      return {
+        ...base, role,
+        repositoryIdentity: { ...base.repositoryIdentity, repositoryId: id, key: `v1:github:${id}`, slug: `configured/${role}` },
+        prSnapshot: { ...base.prSnapshot, pullRequestId: prId, title: `Unobserved PR ${prId}` },
+        capabilities, allowedManualCapabilities: capabilities, delegableAvailable: [],
+        mandatoryDenies: [role === "reviewer" ? "EnableApprovalVote" : "EnableAutoComplete"],
+      };
+    };
+    const broker: DispatchBroker = {
+      ...seed.broker,
+      profileCurrent: async (prId, role) => {
+        calls.push({ operation: "profile-current", prId, role });
+        const { dispatchDraftId: _draft, capabilityPolicyDigest: _policy, prStateFingerprint: _pr, ...profile } = summaryFor(prId, role);
+        return { ...profile, operation: "capability-profile" };
+      },
+      describe: async (key, prId, role) => {
+        calls.push({ operation: "describe", key, prId, role });
+        return summaryFor(prId, role);
+      },
+      dispatch: async (summary) => {
+        calls.push({ operation: "dispatch", summary });
+        return {
+          schemaVersion: 1, requestId: "accepted", operation: "accepted", dispatchId: "44444444-4444-4444-8444-444444444444",
+          repositoryIdentity: summary.repositoryIdentity, role: summary.role,
+          pullRequestId: summary.prSnapshot.pullRequestId, capabilityPolicyDigest: summary.capabilityPolicyDigest,
+          prStateFingerprint: summary.prStateFingerprint, childProcessId: 42,
+          eventLogPath: join(process.cwd(), "unobserved-test-events.jsonl"),
+        };
+      },
+      shutdown: async () => { calls.push({ operation: "shutdown" }); },
+    };
+    return { broker, calls, summaryFor };
+  }
+
+  async function withStartRenderer(
+    context: TestContext,
+    broker: DispatchBroker,
+    run: (setup: TestRendererSetup, history: PullRequestHistoryProjection, reducer: OperationsReducer) => Promise<void>,
+    width = 140,
+    launchMode: "operational" | "preview" = "operational",
+    brokerFailure?: () => string,
+  ): Promise<void> {
+    const fixture = createFixture();
+    const history = new PullRequestHistoryProjection();
+    const reducer = new OperationsReducer();
+    let setup: TestRendererSetup | undefined;
+    try {
+      setup = await testRender(() => (
+        <App reducer={reducer} history={width === 100 ? undefined : history} tailer={fixture.tailer} broker={broker} launchMode={launchMode} brokerFailure={brokerFailure} />
+      ), { width, height: 36, kittyKeyboard: true });
+      await setup.renderOnce();
+      await run(setup, history, reducer);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("native FFI is not available")) {
+        context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+        return;
+      }
+      throw error;
+    } finally {
+      setup?.renderer.destroy();
+      await fixture.tailer.stop();
+    }
+  }
+
+  test("Start Agent by PR ID: both configured repositories work without history from every view, command and width", { timeout: 30_000 }, async (context) => {
+    for (const width of [70, 100, 140]) {
+      for (const view of ["current", "live", "history"]) {
+        for (const role of ["reviewer", "review-handler"] as const) {
+          for (const command of ["m", "palette"]) {
+            const { broker, calls } = await startFixture();
+            await withStartRenderer(context, broker, async (setup, history) => {
+              if (view !== "current") setup.mockInput.pressKey("f", { shift: view === "live" });
+              await setup.flush();
+              assert.match(setup.captureCharFrame(), /m Start Agent by PR ID/);
+              if (command === "m") setup.mockInput.pressKey("m");
+              else {
+                setup.mockInput.pressKey("p", { ctrl: true });
+                for (let i = 0; i < 10; i++) setup.mockInput.pressArrow("down");
+                setup.mockInput.pressEnter();
+              }
+              await setup.flush();
+              assert.match(setup.captureCharFrame(), /START AGENT BY PR ID/);
+              assert.match(setup.captureCharFrame(), /PR ID: \(blank\)/);
+              assert.match(setup.captureCharFrame(), /Agent: Reviewer/);
+              assert.match(setup.captureCharFrame(), /Uses the selected agent's configured repository/);
+              if (role === "review-handler") setup.mockInput.pressTab();
+              await setup.mockInput.typeText("912");
+              setup.mockInput.pressEnter();
+              await setup.flush();
+              assert.match(setup.captureCharFrame(), new RegExp(`configured/${role} / PR #912`));
+              assert.match(setup.captureCharFrame(), /Unobserved PR 912/);
+              setup.mockInput.pressTab(); // Resolution freezes the chosen role.
+              await setup.flush();
+              assert.match(setup.captureCharFrame(), /NOT STARTED \/ READY TO START/);
+              assert.doesNotMatch(setup.captureCharFrame(), /Optional instructions \(/);
+              assert.deepEqual(calls.map((call) => call.operation), ["profile-current", "describe"]);
+              assert.deepEqual(calls[1], {
+                operation: "describe", role, prId: 912, key: role === "reviewer" ? "v1:github:101" : "v1:github:202",
+              });
+              setup.mockInput.pressEnter();
+              setup.mockInput.pressEnter();
+              await setup.flush();
+              assert.equal(calls.filter((call) => call.operation === "dispatch").length, 1);
+              assert.ok(calls[2]?.summary?.capabilities.includes(role === "reviewer" ? "EnableFindingComments" : "EnablePush"));
+              assert.equal(history.list().length, 0, "no synthetic history is inserted");
+            }, width);
+            if (context.signal.aborted) return;
+          }
+        }
+      }
+    }
+  });
+
+  test("Start Agent input validates whole typed and pasted strings, rejects truncation, and permits deliberate correction", async (context) => {
+    for (const value of ["", "0", "-1", "1.2", "1e2", "2147483648", "１２", "1 2", "1\n2", "1\u001b2"]) {
+      assert.equal(parseManualPullRequestId(value), null);
+    }
+    assert.equal(parseManualPullRequestId("2147483647"), 2147483647);
+    const { broker, calls } = await startFixture();
+    await withStartRenderer(context, broker, async (setup) => {
+      setup.mockInput.pressKey("m");
+      await setup.flush();
+      for (const value of ["", "0", "-1", "1.2", "1e2", "2147483648", "１２", "1 2"]) {
+        setup.mockInput.pressKey("u", { ctrl: true });
+        await setup.mockInput.typeText(value);
+        setup.mockInput.pressEnter();
+        await setup.flush();
+        assert.match(setup.captureCharFrame(), /PR ID must be in 1..2147483647/);
+        assert.equal(calls.length, 0, `must not reinterpret ${value}`);
+      }
+      for (const value of ["1.2", "-1", "2147483648", "9".repeat(100), "104\n", "1\u001b2"]) {
+        setup.mockInput.pressKey("u", { ctrl: true });
+        await setup.mockInput.pasteBracketedText(value);
+        setup.mockInput.pressEnter();
+        await setup.flush();
+        assert.equal(calls.length, 0, `must not reinterpret paste ${JSON.stringify(value)}`);
+      }
+      setup.mockInput.pressKey("u", { ctrl: true });
+      await setup.mockInput.typeText("104");
+      await setup.mockInput.pasteBracketedText("0".repeat(100));
+      setup.mockInput.pressBackspace();
+      setup.mockInput.pressEnter();
+      await setup.flush();
+      assert.equal(calls.length, 0, "overflow never leaves a submittable retained prefix");
+      assert.match(setup.captureCharFrame(), /Input rejected. Ctrl\+U to clear/);
+      setup.mockInput.pressKey("u", { ctrl: true });
+      await setup.mockInput.typeText("2147483648");
+      setup.mockInput.pressBackspace();
+      setup.mockInput.pressKey("7");
+      setup.mockInput.pressArrow("left");
+      setup.mockInput.pressKey("q", { ctrl: true });
+      setup.mockInput.pressEnter();
+      await setup.flush();
+      assert.equal(calls[0]?.prId, 2147483647);
+      setup.mockInput.pressKey("p");
+      await setup.flush();
+      await setup.mockInput.pasteBracketedText("🚀".repeat(512));
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), /512\/512/);
+      await setup.mockInput.pasteBracketedText("x");
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), /Context paste rejected/);
+    });
+  });
+
+  test("Start Agent pending reads cancel, deduplicate and ignore stale success AND failure after reopening", async (context) => {
+    for (const stage of ["resolving", "describing"]) {
+      for (const outcome of ["success", "failure"]) {
+        const { broker, calls, summaryFor } = await startFixture();
+        let settle!: (value: CapabilitySummary) => void;
+        let fail!: (reason: Error) => void;
+        const pending = new Promise<CapabilitySummary>((resolve, reject) => { settle = resolve; fail = reject; });
+        let readCount = 0;
+        if (stage === "resolving") {
+          const original = broker.profileCurrent;
+          broker.profileCurrent = async (prId, role) => {
+            readCount++;
+            if (readCount === 1) return { ...await pending, operation: "capability-profile" };
+            return original(prId, role);
+          };
+        } else {
+          const original = broker.describe;
+          broker.describe = async (...args) => { readCount++; return readCount === 1 ? pending : original(...args); };
+        }
+        await withStartRenderer(context, broker, async (setup) => {
+          setup.mockInput.pressKey("m");
+          await setup.mockInput.typeText("104");
+          setup.mockInput.pressEnter();
+          setup.mockInput.pressEnter();
+          await setup.flush();
+          if (stage === "describing") {
+            setup.mockInput.pressKey("d", { ctrl: true });
+            setup.mockInput.pressKey("d", { ctrl: true });
+            await setup.flush();
+          }
+          assert.equal(readCount, 1);
+          setup.mockInput.pressTab();
+          setup.mockInput.pressEscape();
+          await setup.flush();
+          assert.doesNotMatch(setup.captureCharFrame(), /START AGENT BY PR ID/);
+          setup.mockInput.pressKey("m");
+          setup.mockInput.pressTab();
+          await setup.mockInput.typeText("205");
+          setup.mockInput.pressEnter();
+          await setup.flush();
+          assert.match(setup.captureCharFrame(), /configured\/review-handler \/ PR #205/);
+          if (outcome === "success") settle(summaryFor(104, "reviewer"));
+          else fail(new Error("stale failure must not surface"));
+          await setup.flush();
+          assert.match(setup.captureCharFrame(), /configured\/review-handler \/ PR #205/);
+          assert.match(setup.captureCharFrame(), /NOT STARTED \/ READY TO START/);
+          assert.doesNotMatch(setup.captureCharFrame(), /stale failure|First confirmation/);
+          assert.equal(calls.some((call) => call.operation === "dispatch"), false);
+          setup.mockInput.pressEscape();
+          setup.mockInput.pressKey("m");
+          await setup.flush();
+          assert.match(setup.captureCharFrame(), /Agent: Reviewer/);
+          assert.match(setup.captureCharFrame(), /PR ID: \(blank\)/);
+        });
+      }
+    }
+  });
+
+  test("Start Agent fails closed for discovery and fresh-describe mismatches, disabled roles and provider failures", async (context) => {
+    for (const fault of ["resolve-pr", "resolve-role", "describe-pr", "describe-role", "describe-key", "disabled", "provider"]) {
+      const { broker, calls } = await startFixture();
+      const discover = broker.profileCurrent;
+      const describe = broker.describe;
+      broker.profileCurrent = async (prId, role) => {
+        if (fault === "disabled") throw new BrokerRejectionError("role-not-allowed", "");
+        if (fault === "provider") throw new Error("private/path/provider-secret");
+        const profile = await discover(prId, role);
+        if (fault === "resolve-pr") profile.prSnapshot.pullRequestId++;
+        if (fault === "resolve-role") profile.role = "review-handler";
+        return profile;
+      };
+      broker.describe = async (key, prId, role) => {
+        const summary = await describe(key, prId, role);
+        if (fault === "describe-pr") summary.prSnapshot.pullRequestId++;
+        if (fault === "describe-role") summary.role = "review-handler";
+        if (fault === "describe-key") summary.repositoryIdentity.key = "v1:github:999";
+        return summary;
+      };
+      await withStartRenderer(context, broker, async (setup) => {
+        setup.mockInput.pressKey("m");
+        await setup.mockInput.typeText("104");
+        setup.mockInput.pressEnter();
+        await setup.flush();
+        if (fault.startsWith("describe")) {
+          setup.mockInput.pressKey("d", { ctrl: true });
+          await setup.flush();
+        }
+        assert.match(setup.captureCharFrame(), /Could not verify|not enabled by the trusted launcher/);
+        assert.doesNotMatch(setup.captureCharFrame(), /private\/path|First confirmation/);
+        setup.mockInput.pressKey("d");
+        setup.mockInput.pressKey("y");
+        await setup.flush();
+        assert.equal(calls.some((call) => call.operation === "dispatch"), false);
+      });
+    }
+  });
+
+test("Start Agent pending reads cannot revive UI after quit or renderer cleanup", async (context) => {
+  for (const stage of ["resolving", "describing"]) {
+    for (const exit of ["quit", "destroy"]) {
+      for (const outcome of ["success", "failure"]) {
+        const { broker, calls, summaryFor } = await startFixture();
+        let complete!: (summary: CapabilitySummary) => void;
+        let fail!: (reason: Error) => void;
+        const pending = new Promise<CapabilitySummary>((resolve, reject) => { complete = resolve; fail = reject; });
+        if (stage === "resolving") broker.profileCurrent = async () => ({ ...await pending, operation: "capability-profile" });
+        else broker.describe = async () => pending;
+        await withStartRenderer(context, broker, async (setup) => {
+          setup.mockInput.pressKey("m");
+          await setup.mockInput.typeText("104");
+          setup.mockInput.pressEnter();
+          await setup.flush();
+          if (stage === "describing") {
+            setup.mockInput.pressKey("d", { ctrl: true });
+            await setup.flush();
+          }
+          if (exit === "quit") setup.mockInput.pressKey("q");
+          else setup.renderer.destroy();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          assert.equal(setup.renderer.isDestroyed, true);
+          if (outcome === "success") complete(summaryFor(104, "reviewer"));
+          else fail(new Error("abandoned request"));
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          assert.equal(calls.filter((call) => call.operation === "shutdown").length, 1);
+          assert.equal(calls.some((call) => call.operation === "dispatch"), false);
+        });
+      }
+    }
+  }
+});
+
+  test("Enter previews then starts exactly once; both roles show visible progress and cancellation at 70/100/140 columns", { timeout: 20_000 }, async (context) => {
+    for (const width of [70, 100, 140]) {
+      const role: AgentRole = width === 100 ? "review-handler" : "reviewer";
+      const { broker, calls, summaryFor } = await startFixture();
+      let accept!: (value: DispatchAccepted) => void;
+      let cancel!: (value: DispatchTerminal) => void;
+      let terminalListener: ((value: DispatchTerminal) => void) | undefined;
+      let dispatchedPrompt = "";
+      let cancelCount = 0;
+      const dispatch = broker.dispatch;
+      broker.dispatch = async (summary, prompt) => {
+        dispatchedPrompt = prompt;
+        const accepted = await dispatch(summary, prompt);
+        await new Promise<void>((resolve) => { accept = (value) => { assert.deepEqual(value, accepted); resolve(); }; });
+        return accepted;
+      };
+      broker.cancel = async () => {
+        cancelCount++;
+        return new Promise<DispatchTerminal>((resolve) => { cancel = resolve; });
+      };
+      broker.subscribeTerminal = (listener) => {
+        terminalListener = listener;
+        return () => { terminalListener = undefined; };
+      };
+      await withStartRenderer(context, broker, async (setup, _history, reducer) => {
+        setup.mockInput.pressKey("f"); // History/filter selection must not hide manual progress.
+        setup.mockInput.pressTab();
+        setup.mockInput.pressKey("m");
+        if (role === "review-handler") setup.mockInput.pressTab();
+        await setup.mockInput.typeText("104");
+        setup.mockInput.pressEnter();
+        setup.mockInput.pressEnter(); // Buffered Enter cannot start the asynchronously loaded preview.
+        await setup.flush();
+        assert.match(setup.captureCharFrame(), /NOT STARTED \/ READY TO START/);
+        assert.equal(calls.some((call) => call.operation === "dispatch"), false);
+        setup.mockInput.pressKey("p");
+        await setup.flush();
+        assert.match(setup.captureCharFrame(), /Optional instructions/);
+        assert.match(setup.captureCharFrame(), /Enter: return to preview/);
+        await setup.mockInput.typeText("q d y w");
+        setup.mockInput.pressEnter({ shift: true });
+        await setup.mockInput.pasteBracketedText("line two\r\nc y\nm");
+        assert.equal(calls.filter((call) => call.operation === "describe").length, 1);
+        setup.mockInput.pressEnter();
+        setup.mockInput.pressEnter(); // Same input batch may reveal, but must never accept, preview.
+        await setup.flush();
+        assert.match(setup.captureCharFrame(), /NOT STARTED \/ READY TO START/);
+        assert.match(setup.captureCharFrame(), /Enter: START \| Esc: cancel/);
+        assert.equal(calls.some((call) => call.operation === "dispatch"), false);
+        setup.mockInput.pressKey("\x1b[13;1:2u"); // Kitty's actual held-key repeat sequence.
+        await setup.flush();
+        assert.equal(calls.some((call) => call.operation === "dispatch"), false);
+        setup.mockInput.pressEnter();
+        setup.mockInput.pressEnter();
+        await setup.flush();
+        assert.match(setup.captureCharFrame(), /STARTING/);
+        assert.equal(calls.filter((call) => call.operation === "dispatch").length, 1);
+        assert.equal(dispatchedPrompt, "q d y w\nline two\nc y\nm");
+        const summary = summaryFor(104, role);
+        const accepted: DispatchAccepted = {
+          schemaVersion: 1, requestId: "accepted", operation: "accepted", dispatchId: "44444444-4444-4444-8444-444444444444",
+          repositoryIdentity: summary.repositoryIdentity, role, pullRequestId: 104,
+          capabilityPolicyDigest: summary.capabilityPolicyDigest, prStateFingerprint: summary.prStateFingerprint,
+          childProcessId: 42, eventLogPath: join(process.cwd(), "unobserved-test-events.jsonl"),
+        };
+        accept(accepted);
+        await setup.flush();
+        assert.match(setup.captureCharFrame(), /STARTED \/ RUNNING/);
+        assert.match(setup.captureCharFrame(), /Child PID 42 \| elapsed/);
+        assert.match(setup.captureCharFrame(), /Waiting for first progress/);
+        assert.match(setup.captureCharFrame(), /c: cancel this run/);
+        setup.mockInput.pressEnter();
+        setup.mockInput.pressEnter();
+        assert.equal(calls.filter((call) => call.operation === "dispatch").length, 1);
+        const event = (sequence: number, type: string, data: Record<string, unknown>, overrides = {}) => parseAgentEvent({
+          schemaVersion: 3, agent: role, instanceId: "manual-test", processId: 42, timestamp: new Date().toISOString(),
+          sequence, eventType: type, pullRequestId: 104, repositoryIdentity: summary.repositoryIdentity,
+          dispatch: { schemaVersion: 1, dispatchId: accepted.dispatchId, ownership: "tui", forceAnalysis: true },
+          data, ...overrides,
+        });
+        reducer.apply(event(1, "work.completed", { result: "failed" }, { instanceId: "automatic", dispatch: null }));
+        terminalListener?.({ schemaVersion: 1, requestId: "other", operation: "completed", dispatchId: "other", exitCode: 1 });
+        await new Promise((resolve) => setTimeout(resolve, 1_050));
+        await setup.renderOnce();
+        assert.match(setup.captureCharFrame(), /Waiting for first progress/);
+        reducer.apply(event(1, "agent.started", {}));
+        reducer.apply(event(2, "phase.changed", { phase: "manual review in progress" }));
+        await new Promise((resolve) => setTimeout(resolve, 1_050));
+        await setup.renderOnce();
+        assert.match(setup.captureCharFrame(), /Phase: manual review in progress/);
+        setup.mockInput.pressKey("c");
+        setup.mockInput.pressKey("c");
+        setup.mockInput.pressEnter();
+        await setup.flush();
+        assert.equal(cancelCount, 1);
+        assert.match(setup.captureCharFrame(), /CANCELLING/);
+        cancel({ schemaVersion: 1, requestId: "cancel", operation: "cancelled", dispatchId: accepted.dispatchId, result: "cancelled-cooperative" });
+        await setup.flush();
+        assert.match(setup.captureCharFrame(), /CANCELLED/);
+        assert.match(setup.captureCharFrame(), /Enter or Esc: close/);
+        setup.mockInput.pressEnter();
+        await setup.flush();
+        assert.doesNotMatch(setup.captureCharFrame(), /START AGENT BY PR ID/);
+      }, width);
+    }
+  });
+
+  test("fast terminal before accepted continuation is retained; exit zero cannot overwrite failed/blocked work", async (context) => {
+    for (const outcome of ["unreported", "failed", "blocked"]) {
+      const { broker, summaryFor } = await startFixture();
+      let listener: ((value: DispatchTerminal) => void) | undefined;
+      broker.subscribeTerminal = (value) => { listener = value; return () => { listener = undefined; }; };
+      const dispatch = broker.dispatch;
+      broker.dispatch = async (summary, prompt) => {
+        const accepted = await dispatch(summary, prompt);
+        listener?.({ schemaVersion: 1, requestId: "fast", operation: "completed", dispatchId: accepted.dispatchId, exitCode: 0 });
+        return accepted;
+      };
+      await withStartRenderer(context, broker, async (setup, _history, reducer) => {
+        await openManualAndDescribe(setup);
+        setup.mockInput.pressEnter();
+        await setup.flush();
+        assert.match(setup.captureCharFrame(), /FINISHED/);
+        assert.match(setup.captureCharFrame(), /outcome was not reported/);
+        if (outcome !== "unreported") {
+          const summary = summaryFor(104, "reviewer");
+          reducer.apply(parseAgentEvent({
+            schemaVersion: 3, agent: "reviewer", instanceId: "fast", processId: 42, timestamp: new Date().toISOString(),
+            sequence: 1, eventType: "work.completed", pullRequestId: 104, repositoryIdentity: summary.repositoryIdentity,
+            dispatch: { schemaVersion: 1, dispatchId: "44444444-4444-4444-8444-444444444444", ownership: "tui", forceAnalysis: true },
+            data: { result: outcome, reason: "Delivery unavailable", summary: "Manual completion summary" },
+          }));
+          await new Promise((resolve) => setTimeout(resolve, 1_050));
+          await setup.renderOnce();
+          assert.match(setup.captureCharFrame(), new RegExp(outcome.toUpperCase()));
+          assert.match(setup.captureCharFrame(), /Manual completion summary/);
+        }
+      });
+    }
+  });
+
+  test("broker loss and cancellation failure report uncertainty without claiming child exit", async (context) => {
+    const { broker } = await startFixture();
+    let failure = "";
+    broker.cancel = async () => { throw new Error("transport lost"); };
+    await withStartRenderer(context, broker, async (setup) => {
+      await openManualAndDescribe(setup);
+      setup.mockInput.pressEnter();
+      await setup.flush();
+      failure = "Broker closed";
+      await new Promise((resolve) => setTimeout(resolve, 1_050));
+      await setup.renderOnce();
+      assert.match(setup.captureCharFrame(), /STATUS UNKNOWN/);
+      setup.mockInput.pressKey("c");
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), /STATUS UNKNOWN/);
+      assert.match(setup.captureCharFrame(), /child exit is not confirmed/);
+      setup.mockInput.pressEnter();
+      setup.mockInput.pressEscape();
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), /START AGENT BY PR ID/);
+      assert.doesNotMatch(setup.captureCharFrame(), /FINISHED|CANCELLED/);
+    }, 100, "operational", () => failure);
+  });
 
 test("PreviewOnly chrome locks widening even when a broker reports a delegable capability", async (context) => {
   const fixture = createFixture();
@@ -2315,18 +2809,22 @@ test("PreviewOnly chrome locks widening even when a broker reports a delegable c
     ), { width: 140, height: 32, kittyKeyboard: true });
     await setup.renderOnce();
     assert.match(setup.captureCharFrame(), /PREVIEW/);
-
-    await openManualAndDescribe(setup);
-    assert.match(setup.captureCharFrame(), /Widening locked by PreviewOnly/);
-    setup.mockInput.pressKey("w");
-    await setup.flush();
-    assert.equal(calls.includes("describe-widening:EnableApprovalVote"), false);
-
-    setup.mockInput.pressEscape();
-    await setup.flush();
     setup.mockInput.pressKey("s");
     await setup.flush();
     assert.match(setup.captureCharFrame(), /PreviewOnly is a terminal ceiling/);
+    setup.mockInput.pressEscape();
+    await setup.flush();
+
+    await openManualAndDescribe(setup);
+    assert.match(setup.captureCharFrame(), /Widening locked by PreviewOnly/);
+    assert.match(setup.captureCharFrame(), /No PR comments or code pushes/);
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    assert.equal(calls.includes("describe-widening:EnableApprovalVote"), false);
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.equal(calls.filter((call) => call === "dispatch").length, 1);
+    assert.match(setup.captureCharFrame(), /STARTED \/ RUNNING/);
   } catch (error) {
     if (error instanceof Error && error.message.includes("native FFI is not available")) {
       context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
@@ -2337,4 +2835,244 @@ test("PreviewOnly chrome locks widening even when a broker reports a delegable c
     setup?.renderer.destroy();
     await fixture.tailer.stop();
   }
+});
+
+for (const failure of [
+  { name: "transport", error: new Error("lost acceptance response") },
+  { name: "termination", error: new BrokerRejectionError("termination-failed", "Child exit is not confirmed.") },
+]) {
+  test(`unconfirmed start ${failure.name} failure stays uncertain and cannot be redispatched`, async (context) => {
+    const { broker, calls } = await startFixture();
+    const dispatch = broker.dispatch;
+    broker.dispatch = async (summary, prompt) => {
+      await dispatch(summary, prompt);
+      throw failure.error;
+    };
+    await withStartRenderer(context, broker, async (setup) => {
+      await openManualAndDescribe(setup);
+      setup.mockInput.pressEnter();
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), /START STATUS UNKNOWN/);
+      assert.doesNotMatch(setup.captureCharFrame(), /NOT STARTED|REQUEST FAILED/);
+      setup.mockInput.pressEnter();
+      setup.mockInput.pressEscape();
+      setup.mockInput.pressKey("m");
+      await setup.flush();
+      assert.equal(calls.filter((call) => call.operation === "dispatch").length, 1);
+      assert.match(setup.captureCharFrame(), /START STATUS UNKNOWN/);
+      assert.match(setup.captureCharFrame(), /q: quit and stop/);
+    });
+  });
+}
+
+test("confirmed startup rejection remains dismissible and preserves the actual error", async (context) => {
+  const { broker } = await startFixture();
+  broker.dispatch = async () => {
+    throw new BrokerRejectionError("launch-failed", "Child exited before readiness.");
+  };
+  await withStartRenderer(context, broker, async (setup) => {
+    await openManualAndDescribe(setup);
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /NOT STARTED \/ REQUEST FAILED/);
+    assert.match(setup.captureCharFrame(), /Child exited before readiness/);
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /START AGENT BY PR ID/);
+  });
+});
+
+test("widening RPCs exclusively own input; Enter cannot advance or mint during any in-flight challenge", async (context) => {
+  const { broker, calls } = createWideningBrokerFixture();
+  let release!: () => void;
+  const pause = () => new Promise<void>((resolve) => { release = resolve; });
+  const describe = broker.describeWidening!;
+  const confirm = broker.confirmWideningPreview!;
+  const mint = broker.confirmWideningMint!;
+  broker.describeWidening = async (...args) => { await pause(); return describe(...args); };
+  broker.confirmWideningPreview = async (...args) => { await pause(); return confirm(...args); };
+  broker.confirmWideningMint = async (...args) => { await pause(); return mint(...args); };
+  await withStartRenderer(context, broker, async (setup) => {
+    await openManualAndDescribe(setup);
+    for (const [key, label] of [
+      ["w", "Requesting capability widening"],
+      ["c", "Confirming widening preview"],
+      ["y", "Minting capability widening"],
+    ]) {
+      setup.mockInput.pressKey(key!);
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), new RegExp(label!));
+      const before = calls.length;
+      for (const input of ["\r", "y", "d", "c", "w", "\x1b"]) setup.mockInput.pressKey(input);
+      await setup.flush();
+      assert.equal(calls.length, before);
+      assert.equal(calls.includes("dispatch"), false);
+      release();
+      await setup.flush();
+    }
+    assert.equal(calls.filter((call) => call === "confirm-widening-mint").length, 1);
+    assert.equal(calls.includes("dispatch"), false);
+    assert.match(setup.captureCharFrame(), /Enter: START/);
+  });
+});
+
+test("ID Enter loads the keyed preview, but no Enter can dispatch before its first rendered frame", async (context) => {
+  const { broker, calls, summaryFor } = await startFixture();
+  let release!: (value: CapabilitySummary) => void;
+  broker.describe = async () => new Promise<CapabilitySummary>((resolve) => { release = resolve; });
+  await withStartRenderer(context, broker, async (setup) => {
+    setup.mockInput.pressKey("m");
+    await setup.mockInput.typeText("104");
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Preparing preview/);
+    const frame = setup.renderer.frameId;
+    release(summaryFor(104, "reviewer"));
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    assert.equal(setup.renderer.frameId, frame);
+    setup.mockInput.pressEnter();
+    assert.equal(calls.some((call) => call.operation === "dispatch"), false);
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /NOT STARTED \/ READY TO START/);
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    assert.equal(calls.filter((call) => call.operation === "dispatch").length, 1);
+  });
+});
+
+test("confirmed exits leave Current and Live, but canonical and legacy diagnostics remain accessible in History", async (context) => {
+  for (const width of [70, 100, 140]) {
+    const { broker, summaryFor } = await startFixture();
+    await withStartRenderer(context, broker, async (setup, history, reducer) => {
+      const summary = summaryFor(104, "reviewer");
+      const timestamp = new Date(Date.now() - 60_000).toISOString();
+      const source = join(process.cwd(), "retained-run.jsonl");
+      reducer.registerLocalStream({ eventLogPath: source, processId: 42, role: "reviewer" });
+      const started = parseAgentEvent({
+        schemaVersion: 3, agent: "reviewer", instanceId: "exited-canonical", processId: 42,
+        timestamp, sequence: 1, eventType: "agent.started", pullRequestId: 104,
+        repositoryIdentity: summary.repositoryIdentity, data: { repository: "repo", title: "Retained context" },
+      });
+      reducer.apply(started, source);
+      history.apply(started);
+      reducer.apply(parseAgentEvent({
+        ...started, sequence: 2, eventType: "candidate.selected", data: { title: "Retained context", author: "Ada" },
+      }), source);
+      reducer.apply(parseAgentEvent({
+        ...started, schemaVersion: 2, repositoryIdentity: null, instanceId: "exited-legacy", pullRequestId: 0,
+      }), source);
+      reducer.apply(parseAgentEvent({ ...started, instanceId: "alive-warning", processId: 43 }), source);
+      await reducer.observeProcesses(async (pid) => pid === 42 ? "absent" : "present");
+      await new Promise((resolve) => setTimeout(resolve, 1_050));
+      setup.mockInput.pressKey("f", { shift: true });
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), /INSTANCES 1/);
+      assert.match(setup.captureCharFrame(), /Stale \/ stale/);
+      assert.doesNotMatch(setup.captureCharFrame(), /exited-c|exited-l/);
+      setup.mockInput.pressKey("f");
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), /INSTANCES 1/);
+      setup.mockInput.pressKey("f");
+      await setup.flush();
+      if (width !== 100) {
+        assert.match(setup.captureCharFrame(), /EXITED 2/);
+        setup.mockInput.pressArrow("down"); // First exit, after the real PR projection row.
+      } else assert.match(setup.captureCharFrame(), /INSTANCES 2/);
+      setup.mockInput.pressEnter();
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), /Process exit observed/);
+      assert.match(setup.captureCharFrame(), /Interrupted \/ outcome unknown/);
+      assert.match(setup.captureCharFrame(), /retained-run.jsonl/);
+      assert.match(setup.captureCharFrame(), /Retained context/);
+      setup.mockInput.pressKey("e");
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), /candidate.selected/);
+      setup.mockInput.pressEscape();
+      setup.mockInput.pressEscape();
+      await setup.flush();
+      setup.mockInput.pressArrow("down");
+      setup.mockInput.pressEnter();
+      await setup.flush();
+      assert.match(setup.captureCharFrame(), /Process exit observed/);
+      assert.match(setup.captureCharFrame(), /none selected/);
+      assert.equal(history.list().length, 1, "legacy archive rows never synthesize canonical History");
+    }, width);
+  }
+});
+
+test("archiving never detaches the active accepted manual panel or fabricates a successful outcome", async (context) => {
+  const { broker, summaryFor } = await startFixture();
+  await withStartRenderer(context, broker, async (setup, _history, reducer) => {
+    await openManualAndDescribe(setup);
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    const summary = summaryFor(104, "reviewer");
+    const timestamp = new Date(Date.now() - 60_000).toISOString();
+    reducer.apply(parseAgentEvent({
+      schemaVersion: 3, agent: "reviewer", instanceId: "manual-exited", processId: 42,
+      timestamp, sequence: 1, eventType: "agent.started", pullRequestId: 104,
+      repositoryIdentity: summary.repositoryIdentity,
+      dispatch: { schemaVersion: 1, dispatchId: "44444444-4444-4444-8444-444444444444", ownership: "tui", forceAnalysis: true },
+      data: {},
+    }), join(process.cwd(), "unobserved-test-events.jsonl"));
+    await reducer.observeProcesses(async () => "absent");
+    assert.equal(reducer.list(Date.now(), undefined, "current").length, 0);
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    await setup.renderOnce();
+    assert.match(setup.captureCharFrame(), /START AGENT BY PR ID/);
+    assert.match(setup.captureCharFrame(), /EXITED \/ OUTCOME UNKNOWN/);
+    assert.match(setup.captureCharFrame(), /Child PID 42/);
+    assert.doesNotMatch(setup.captureCharFrame(), /FINISHED|READY TO START/);
+  });
+});
+
+test("an unknown-origin live row repaints as a stale warning and never probes its locally absent PID", async (context) => {
+  const { broker } = await startFixture();
+  await withStartRenderer(context, broker, async (setup, _history, reducer) => {
+    reducer.apply(parseAgentEvent({
+      schemaVersion: 2, agent: "reviewer", instanceId: "live-stale", processId: 42,
+      timestamp: new Date().toISOString(), sequence: 1, eventType: "agent.started",
+      data: { repository: "repo" },
+    }));
+    setup.mockInput.pressKey("f", { shift: true });
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Live \/ running/);
+    const state = reducer.get("reviewer:live-stale")!;
+    state.lastHeartbeatMs -= 60_000;
+    state.lastEventMs -= 60_000;
+    let probes = 0;
+    await reducer.observeProcesses(async () => { probes++; return "absent"; });
+    assert.equal(probes, 0);
+    assert.equal(state.processOrigin, "unknown");
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    await setup.renderOnce();
+    assert.match(setup.captureCharFrame(), /Stale \/ stale/);
+    assert.match(setup.captureCharFrame(), /INSTANCES 1/);
+    assert.doesNotMatch(setup.captureCharFrame(), /Process exit observed/);
+  });
+});
+
+test("state contention tells either requested role to wait and retry, retains the typed reason, and never queues work", async (context) => {
+    for (const role of ["reviewer", "review-handler"] as const) {
+      const { broker } = await startFixture();
+      let attempts = 0;
+      broker.dispatch = async () => {
+        attempts++;
+        throw new BrokerRejectionError("already-running", "state-contended: repository state is busy");
+      };
+      await withStartRenderer(context, broker, async (setup) => {
+        await openManualAndDescribe(setup, role);
+        setup.mockInput.pressEnter();
+        await setup.flush();
+        assert.match(setup.captureCharFrame(), new RegExp(`Another ${role === "reviewer" ? "Reviewer" : "Review Handler"} is using`));
+        assert.match(setup.captureCharFrame(), /finish, then retry/);
+        assert.match(setup.captureCharFrame(), /state-contended/);
+        assert.match(setup.captureCharFrame(), /NOT STARTED \/ REQUEST FAILED/);
+        assert.equal(attempts, 1);
+        setup.mockInput.pressEnter();
+        await setup.flush();
+        assert.doesNotMatch(setup.captureCharFrame(), /START AGENT BY PR ID/);
+        assert.equal(attempts, 1);
+      }, 70);
+    }
 });

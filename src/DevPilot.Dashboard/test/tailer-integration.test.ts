@@ -3,8 +3,10 @@ import test from "node:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { access, appendFile, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import type { AgentEvent, SourceDiagnostic } from "../src/domain.js";
-import { EventTailer } from "../src/tailer.js";
+import { EventTailer, INITIAL_EVENT_LOG_WAIT_MS } from "../src/tailer.js";
 import { OperationsReducer } from "../src/reducer.js";
 
 function eventLine(sequence: number): string {
@@ -223,3 +225,67 @@ test("tailer rechecks rotations when the active file rotates immediately before 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+  test("accepted path waits for first creation, ingests late and rotated events, but diagnoses disappearance", async () => {
+    const root = join(process.cwd(), `.dashboard-test-late-${process.pid}-${Date.now()}`);
+    const path = join(root, "late.jsonl");
+    const events: AgentEvent[] = [];
+    const diagnostics: SourceDiagnostic[] = [];
+    const tailer = new EventTailer({
+      stateDirectories: [], eventLogPaths: [],
+      onEvent: (event) => events.push(event), onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    try {
+      tailer.registerEventLogPath(path);
+      await tailer.stop();
+      for (let attempt = 0; attempt < 25; attempt++) await tailer.poll();
+      assert.equal(diagnostics.length, 0, "initial ENOENT must not exhaust the diagnostic budget");
+      await mkdir(root, { recursive: true });
+      await writeFile(`${path}.1`, `${eventLine(1)}\n`);
+      await writeFile(path, `${eventLine(2)}\n`);
+      await tailer.poll();
+      assert.deepEqual(events.map((event) => event.sequence), [1, 2]);
+      await rm(path);
+      await tailer.poll();
+      assert.equal(diagnostics.at(-1)?.kind, "io");
+      assert.match(diagnostics.at(-1)?.message ?? "", /cannot read event log/);
+    } finally {
+      await tailer.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("only initial ENOENT gets grace: explicit missing paths and permissions fail visibly; prolonged absence warns once", async (context) => {
+    const path = join(process.cwd(), `.dashboard-test-absent-${process.pid}-${Date.now()}.jsonl`);
+    const diagnostics: SourceDiagnostic[] = [];
+    const options = { stateDirectories: [], eventLogPaths: [path], onEvent: () => {}, onDiagnostic: (d: SourceDiagnostic) => diagnostics.push(d) };
+    const explicit = new EventTailer(options);
+    await explicit.poll();
+    assert.match(diagnostics.at(-1)?.message ?? "", /cannot read event log/);
+    diagnostics.length = 0;
+    const tailer = new EventTailer({ ...options, eventLogPaths: [] });
+    try {
+      tailer.registerEventLogPath(path);
+      await tailer.stop();
+      const originalNow = Date.now();
+      const clock = context.mock.method(Date, "now", () => originalNow + INITIAL_EVENT_LOG_WAIT_MS + 1);
+      await tailer.poll();
+      await tailer.poll();
+      assert.equal(diagnostics.length, 1);
+      assert.match(diagnostics[0]?.message ?? "", /progress is unknown/);
+      clock.mock.restore();
+      const statMock = context.mock.method(fsPromises, "stat", async () => {
+        throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      });
+      syncBuiltinESMExports();
+      try {
+        await tailer.poll();
+      } finally {
+        statMock.mock.restore();
+        syncBuiltinESMExports();
+      }
+      assert.match(diagnostics.at(-1)?.message ?? "", /permission denied/);
+    } finally {
+      await tailer.stop();
+    }
+  });

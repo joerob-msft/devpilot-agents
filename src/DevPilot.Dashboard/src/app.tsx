@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
-import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid";
+import { useKeyboard, usePaste, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { decideLayout, type LayoutDecision } from "./layout.js";
 import {
@@ -16,10 +16,14 @@ import {
 } from "./format.js";
 import { liveElapsedMilliseconds, OperationsReducer, totalElapsedMilliseconds } from "./reducer.js";
 import type { AgentRole, BlockedWarning, Completion, InstanceState, ViewFilter } from "./domain.js";
+import { boundedText } from "./domain.js";
 import { PullRequestHistoryProjection, type PullRequestHistoryEntry } from "./history.js";
 import type { EventTailer } from "./tailer.js";
+import { manualProgress, type ManualProgress } from "./manual-progress.js";
 import {
   BrokerRejectionError,
+  assertManualTarget,
+  isPullRequestId,
   type CapabilityNarrowingPreview,
   type CapabilityProfile,
   type CapabilitySummary,
@@ -28,6 +32,7 @@ import {
   type DispatchTerminal,
   type NarrowingAction,
   type NarrowingScope,
+  type ResolvedManualTarget,
   NARROWING_SCOPES,
   type WideningCancelled,
   type WideningMinted,
@@ -38,7 +43,7 @@ import {
 export const BRAND_PLANE = ["       __|__       ", "--o--o--(_)--o--o--"] as const;
 export const HELP_LEGEND = [
   "Live = active work; Current session = Live plus newest retained per group.",
-  "History = stopped/completed retained runs; Stale = heartbeat overdue.",
+  "History includes observed exits; Stale alone never proves process exit.",
   "Forget never deletes agent state or event logs; unavailable actions report status.",
 ] as const;
 
@@ -73,7 +78,16 @@ export interface AppProps {
   shutdownBroker?: () => Promise<void>;
 }
 
-type ManualMode = "closed" | "prompt" | "describing" | "confirm" | "confirm-final" | "dispatching" | "active" | "terminal";
+type ManualMode = "closed" | "target" | "resolving" | "prompt" | "describing" | "confirm" | "confirm-final" | "dispatching" | "active" | "cancelling" | "terminal";
+
+const MAX_PR_INPUT = 64;
+const PR_INPUT_HELP = "Enter ASCII digits: PR ID must be in 1..2147483647.";
+
+export function parseManualPullRequestId(value: string): number | null {
+  if (value.length > MAX_PR_INPUT || !/^[0-9]+$/.test(value)) return null;
+  const number = Number(value);
+  return isPullRequestId(number) ? number : null;
+}
 
 export function normalizeOperatorPrompt(value: string): string {
   return value.replace(/\r\n?/g, "\n");
@@ -115,7 +129,7 @@ export function selectableCount(
   return selectedView === "history" && hasHistory ? historyLength : instanceLength;
 }
 
-export function dispatchResultDetail(code: string, detail = ""): string {
+export function dispatchResultDetail(code: string, detail = "", role?: AgentRole): string {
   const safe = line(detail.replace(/[\u0000-\u001f\u007f-\u009f]/g, " "), 160);
   const labels: Record<string, string> = {
     "source-changed": "Source changed after confirmation; describe the PR again.",
@@ -123,7 +137,7 @@ export function dispatchResultDetail(code: string, detail = ""): string {
     "pr-state-changed": "Bound PR state changed; describe the PR again.",
     "delivery-pending": "Reviewer delivery is pending; resolve or promote it before redispatch.",
     "already-running": safe.includes("state-contended")
-      ? "Already running: repository role state is busy."
+      ? `Another ${role === "reviewer" ? "Reviewer" : role === "review-handler" ? "Review Handler" : "agent"} is using this repository's state; wait for it to finish, then retry.`
       : "Already running: this PR and role hold the work lease.",
     "launch-failed": "Broker could not safely launch the child.",
     "role-not-allowed": "This manual role is not enabled by the trusted launcher.",
@@ -150,12 +164,15 @@ export function dispatchResultDetail(code: string, detail = ""): string {
 
 function ManualDispatchPanel(props: {
   mode: ManualMode;
-  entry: PullRequestHistoryEntry;
+  target: ResolvedManualTarget | null;
+  targetInput: string;
   role: AgentRole;
   prompt: string;
   summary: CapabilitySummary | null;
   accepted: DispatchAccepted | null;
   status: string;
+  progress: ManualProgress | null;
+  startUncertain: boolean;
   wideningStage: "closed" | "describing" | "preview" | "confirming" | "summary" | "minting" | "cancelling";
   wideningPreview: WideningPreview | WideningSummary | null;
   wideningStatus: string;
@@ -163,15 +180,52 @@ function ManualDispatchPanel(props: {
   wideningLocked: boolean;
 }) {
   const promptPreview = () => line(props.prompt.replace(/\n/g, " / ") || "(none)", 90);
-  const identity = () => props.summary?.repositoryIdentity ?? props.entry.repositoryIdentity;
-  const pullRequestId = () => props.summary?.prSnapshot.pullRequestId ?? props.entry.pullRequestId;
-  const title = () => props.summary?.prSnapshot.title ?? props.entry.title;
-  const author = () => props.summary?.prSnapshot.author ?? props.entry.author;
+  const capabilityLabel = (name: string) => ({
+    EnableFindingComments: "finding comments",
+    EnableSummaryComment: "summary comments",
+    EnableThreadReplies: "thread replies",
+    EnableCodeChanges: "code changes",
+    EnablePush: "code pushes",
+    EnableApprovalVote: "approval vote",
+    EnableAutoComplete: "auto-complete",
+    LocalValidation: "local validation",
+  }[name] ?? name);
   return (
-    <Panel title="MANUAL DISPATCH" flexGrow={1} borderColor={COLORS.warning}>
+    <Panel title="START AGENT BY PR ID" flexGrow={1} borderColor={COLORS.warning}>
       <box flexDirection="column" flexGrow={1}>
-        <text height={1} fg={COLORS.accent}>{identity().slug} / PR #{pullRequestId()}</text>
-        <text height={1} fg={COLORS.text}>{line(title() || "(untitled)", 100)} | {line(author() || "unknown author", 60)}</text>
+        <Show when={props.mode === "confirm" || props.mode === "confirm-final"}>
+          <text height={1} fg={COLORS.warning}>NOT STARTED / READY TO START</text>
+        </Show>
+        <Show when={props.mode === "dispatching"}>
+          <text height={1} fg={COLORS.warning}>{props.startUncertain ? "START STATUS UNKNOWN" : "STARTING... waiting for broker confirmation"}</text>
+        </Show>
+        <Show when={props.progress}>
+          {(progress: () => ManualProgress) => (
+            <text height={1} fg={progress().attention ? COLORS.warning : COLORS.ok}>{progress().headline}</text>
+          )}
+        </Show>
+        <Show when={props.mode === "terminal" && !props.accepted}>
+          <text height={1} fg={COLORS.error}>NOT STARTED / REQUEST FAILED</text>
+        </Show>
+        <Show when={props.mode === "target" || props.mode === "resolving"}>
+        <text height={1} fg={COLORS.muted}>Uses the selected agent's configured repository.</text>
+        </Show>
+        <Show when={props.mode === "target" || props.mode === "resolving"}>
+          <text height={1} fg={COLORS.accent}>PR ID: {props.targetInput || "(blank)"}</text>
+          <text height={1} fg={COLORS.text}>Agent: {props.role === "reviewer" ? "Reviewer" : "Review Handler"}</text>
+          <text height={1} fg={COLORS.muted}>Tab agent | Enter preview | Ctrl+U clear | Esc cancel</text>
+          <Show when={props.mode === "resolving"}>
+            <text height={1} fg={COLORS.warning}>Resolving configured repository and PR... | Esc cancel</text>
+          </Show>
+        </Show>
+        <Show when={props.target}>
+          {(target: () => ResolvedManualTarget) => (
+            <>
+              <text height={1} fg={COLORS.accent}>{target().repositoryIdentity.slug} / PR #{target().prSnapshot.pullRequestId}</text>
+              <text height={1} fg={COLORS.text}>{line(target().prSnapshot.title || "(untitled)", 100)} | {line(target().prSnapshot.author || "unknown author", 60)}</text>
+            </>
+          )}
+        </Show>
         <text height={1} fg={COLORS.text}>
           Role: {roleLabel(props.role)} |{" "}
           {
@@ -186,28 +240,34 @@ function ManualDispatchPanel(props: {
           }
         </text>
         <Show when={props.mode === "prompt"}>
-          <text height={1} fg={COLORS.warning}>Operator context is untrusted data; 512 Unicode scalars maximum.</text>
+          <text height={1} fg={COLORS.text}>Optional instructions ({promptScalarCount(props.prompt)}/512 characters)</text>
           <text height={1} fg={COLORS.text}>{promptPreview()}</text>
-          <text height={1} fg={COLORS.muted}>{promptScalarCount(props.prompt)}/512 | Enter newline | Ctrl+D describe | Esc close</text>
+          <text height={1} fg={COLORS.accent}>Enter: return to preview | Shift+Enter: newline | Esc: cancel</text>
         </Show>
-        <Show when={props.mode === "describing" || props.mode === "dispatching"}>
-          <text height={1} fg={COLORS.warning}>{props.mode === "describing" ? "Fetching fresh provider and wrapper policy..." : "Starting contained broker-owned child..."}</text>
+        <Show when={props.mode === "describing"}>
+          <text height={1} fg={COLORS.warning}>Preparing preview... | Esc: cancel</text>
         </Show>
-        <Show when={props.summary}>
+        <Show when={!props.accepted && props.mode !== "prompt" && props.summary}>
           {(summary: () => CapabilitySummary) => (
             <>
-              <text height={1} fg={COLORS.text}>Source: {shortCommit(summary().prSnapshot.sourceCommit)} | {summary().prSnapshot.sourceRef} -&gt; {summary().prSnapshot.targetRef}</text>
-              <text height={1} fg={COLORS.ok}>Policy digest: {shortCommit(summary().capabilityPolicyDigest)} confirmed</text>
-              <text height={1} fg={COLORS.ok}>PR-state fingerprint: {shortCommit(summary().prStateFingerprint)} confirmed</text>
-              <text height={1} fg={COLORS.text}>Enabled: {line(summary().capabilities.join(", ") || "none", 100)}</text>
-              <text height={1} fg={COLORS.warning}>Disabled high-impact: {line(summary().mandatoryDenies.join(", ") || "none reported", 100)}</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>Source: {shortCommit(summary().prSnapshot.sourceCommit)} | {summary().prSnapshot.sourceRef} -&gt; {summary().prSnapshot.targetRef}</text>
+              <Show when={summary().capabilities.length === 0}>
+                <text height={1} fg={COLORS.ok}>No PR comments or code pushes</text>
+              </Show>
+              <Show when={summary().capabilities.length > 0}>
+                <text flexShrink={0} wrapMode="word" fg={COLORS.text}>Allowed: {summary().capabilities.map(capabilityLabel).join(", ")}</text>
+              </Show>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.muted}>Not allowed: {summary().mandatoryDenies.map(capabilityLabel).join(", ") || "none reported"}</text>
               <For each={summary().dynamicConstraints}>
                 {(constraint) => <text height={1} fg={COLORS.warning}>Constraint: {line(constraint, 100)}</text>}
               </For>
+              <Show when={props.prompt}>
+                <text height={1} fg={COLORS.muted}>Instructions: {promptPreview()}</text>
+              </Show>
               <Show when={props.mode === "confirm"}>
                 <Show when={props.wideningStage === "closed"}>
                   <Show when={props.mintedWideningGeneration !== null}>
-                    <text height={1} fg={COLORS.ok}>Widening grant minted and active for this draft; continue with d then y to dispatch, or Esc to close and relinquish it.</text>
+                    <text height={1} fg={COLORS.ok}>Widening grant minted and active for this draft.</text>
                   </Show>
                   <Show when={props.mintedWideningGeneration === null && props.wideningLocked}>
                     <text height={1} fg={COLORS.error}>Widening locked by PreviewOnly.</text>
@@ -221,7 +281,7 @@ function ManualDispatchPanel(props: {
                   <Show when={props.mintedWideningGeneration === null && !props.wideningLocked && summary().delegableAvailable.length === 1 && !summary().killSwitchActive}>
                     <text height={1} fg={COLORS.muted}>Press w to request {summary().delegableAvailable[0]} widening (draft-bound, single-use).</text>
                   </Show>
-                  <text height={1} fg={COLORS.warning}>First confirmation: press d to review the final execution gate; Esc cancels.</text>
+                  <text height={1} fg={COLORS.accent}>Enter: START | p: optional instructions | Esc: cancel</text>
                 </Show>
                 <Show when={props.wideningStage === "describing"}>
                   <text height={1} fg={COLORS.warning}>Requesting capability widening description...</text>
@@ -273,7 +333,7 @@ function ManualDispatchPanel(props: {
                 </Show>
               </Show>
               <Show when={props.mode === "confirm-final"}>
-                <text height={1} fg={COLORS.error}>FINAL CONFIRMATION: press y to dispatch this exact snapshot; Esc cancels.</text>
+                <text height={1} fg={COLORS.accent}>Enter: START | y: start | Esc: cancel</text>
               </Show>
             </>
           )}
@@ -281,14 +341,25 @@ function ManualDispatchPanel(props: {
         <Show when={props.accepted}>
           {(accepted: () => DispatchAccepted) => (
             <>
-              <text height={1} fg={COLORS.ok}>Accepted dispatch {shortId(accepted().dispatchId)} | child PID {accepted().childProcessId}</text>
-              <text height={1} fg={COLORS.text}>Correlated v3 events: {line(accepted().eventLogPath, 100)}</text>
-              <text height={1} fg={COLORS.warning}>Press c to cancel only this broker-owned manual child.</text>
+              <text height={1} fg={COLORS.text}>Child PID {accepted().childProcessId} | elapsed {props.progress?.elapsed ?? "0s"}</text>
+              <text height={2} fg={COLORS.text}>{props.progress?.detail}</text>
+              <Show when={props.progress?.latest}>
+                <text height={3} fg={COLORS.muted}>{props.progress?.latest}</text>
+              </Show>
+              <Show when={props.mode === "active"}>
+                <text height={1} fg={COLORS.accent}>c: cancel this run | q: quit and stop</text>
+              </Show>
+              <Show when={props.mode === "cancelling"}>
+                <text height={1} fg={COLORS.warning}>Cancellation pending | q: quit and stop</text>
+              </Show>
             </>
           )}
         </Show>
         <Show when={props.status}>
-          <text height={1} fg={props.mode === "terminal" ? COLORS.warning : COLORS.muted}>{line(props.status, 160)}</text>
+          <text height={props.mode === "terminal" ? 3 : 2} fg={props.mode === "terminal" ? COLORS.warning : COLORS.muted}>{line(props.status, 160)}</text>
+        </Show>
+        <Show when={props.mode === "terminal"}>
+          <text height={1} fg={COLORS.accent}>Enter or Esc: close | q: quit</text>
         </Show>
       </box>
     </Panel>
@@ -297,14 +368,20 @@ function ManualDispatchPanel(props: {
 
 function History(props: {
   entries: PullRequestHistoryEntry[];
+  exited: InstanceState[];
   selected: number;
   compact: boolean;
+  detailOpen: boolean;
+  now: number;
+  focus: PaneFocus;
 }) {
-  const selected = () => props.entries[Math.min(props.selected, Math.max(0, props.entries.length - 1))];
+  const selected = () => props.entries[props.selected];
+  const selectedExit = () => props.exited[props.selected - props.entries.length];
   return (
     <>
-      <Panel title={`PR HISTORY ${props.entries.length}`} width={props.compact ? "100%" : 38} borderColor={COLORS.interactive}>
-        <Show when={props.entries.length} fallback={<Empty />}>
+      <Show when={!props.compact || !props.detailOpen || !selectedExit()}>
+      <Panel title={`PR HISTORY ${props.entries.length}${props.exited.length ? ` | EXITED ${props.exited.length}` : ""}`} width={props.compact ? "100%" : 38} borderColor={COLORS.interactive}>
+        <Show when={props.entries.length + props.exited.length} fallback={<Empty />}>
           <scrollbox flexGrow={1} scrollY>
             <Index each={props.entries}>
               {(entry, index) => (
@@ -317,10 +394,28 @@ function History(props: {
                 </box>
               )}
             </Index>
+            <Show when={props.exited.length}>
+              <text height={1} fg={COLORS.warning}>EXITED INSTANCES / retained logs</text>
+              <Index each={props.exited}>
+                {(instance, index) => (
+                  <box height={4} paddingX={1} backgroundColor={index + props.entries.length === props.selected ? COLORS.panelAlt : COLORS.panel}>
+                    <text height={1} fg={COLORS.warning}>
+                      {index + props.entries.length === props.selected ? "> " : "  "}{roleLabel(instance().agent)} {shortId(instance().instanceId)}
+                    </text>
+                    <text height={1} fg={COLORS.text}>{line(instance().repository || "repository unknown", 20)} | PR #{instance().pullRequestId || "?"}</text>
+                    <text height={1} fg={COLORS.muted}>{line(instance().completion?.result || "Exited / outcome unknown", 32)}</text>
+                  </box>
+                )}
+              </Index>
+            </Show>
           </scrollbox>
         </Show>
       </Panel>
-      <Show when={!props.compact}>
+      </Show>
+      <Show when={selectedExit() && (!props.compact || props.detailOpen)}>
+        <Detail instance={selectedExit()} now={props.now} focus={props.focus} />
+      </Show>
+      <Show when={!props.compact && !selectedExit()}>
         <Panel title="RETAINED OUTCOMES" flexGrow={1}>
           <Show when={selected()} fallback={<Empty />}>
             {(entry: () => PullRequestHistoryEntry) => (
@@ -436,13 +531,13 @@ function Empty() {
 }
 
 function streamLabel(instance: InstanceState): string {
-  if (instance.lifecycle === "stopped" || instance.status === "completed") return "History";
+  if (isHistoricalInstance(instance)) return "History";
   if (instance.status === "stale") return "Stale";
   return "Live";
 }
 
 function isHistoricalInstance(instance: InstanceState | undefined): boolean {
-  return Boolean(instance && (instance.lifecycle === "stopped" || instance.status === "completed"));
+  return Boolean(instance && (instance.exitObservedMs !== null || instance.lifecycle === "stopped" || instance.status === "completed"));
 }
 
 function viewLabel(view: ViewFilter): string {
@@ -604,6 +699,12 @@ function Detail(props: {
       <Show when={props.instance} fallback={<Empty />}>
         {(instance: () => InstanceState) => (
           <box flexDirection="column" flexGrow={1}>
+            <Show when={instance().exitObservedMs !== null}>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.warning}>
+                Process exit observed. {instance().completion ? "Reported work outcome retained below." : "Interrupted / outcome unknown; no completion was reported."}
+              </text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.muted}>Log: {boundedText(instance().sources[0] || "source not reported", 240)}</text>
+            </Show>
             <WarningBlock instance={instance()} />
             <box flexDirection="row" gap={2} height={3}>
               <FieldColumn
@@ -680,6 +781,9 @@ function Inspector(props: { instance: InstanceState | undefined; focused?: boole
               {instance().lifecycle.toUpperCase()} / {instance().status.toUpperCase()}
             </text>
             <text height={1} fg={COLORS.text}>PID {instance().processId} | schema v{instance().schemaVersion}</text>
+            <text height={2} fg={COLORS.muted}>{instance().processOrigin === "local"
+              ? "Origin: local launch confirmed"
+              : "Origin unknown: local PID absence cannot confirm exit"}</text>
             <text height={1} fg={COLORS.text}>Sequence {instance().lastSequence} | gaps {instance().gapCount}</text>
             <text height={1} fg={COLORS.text}>Duplicates ignored {instance().duplicateCount}</text>
             <text height={1} fg={COLORS.muted}>Last raw event</text>
@@ -760,12 +864,24 @@ export function App(props: AppProps) {
       : "Observer is read-only";
   const [feedback, setFeedback] = createSignal(defaultFeedback);
   const [manualMode, setManualMode] = createSignal<ManualMode>("closed");
-  const [manualEntry, setManualEntry] = createSignal<PullRequestHistoryEntry | null>(null);
+  const [manualTarget, setManualTarget] = createSignal<ResolvedManualTarget | null>(null);
+  const [manualInput, setManualInput] = createSignal("");
+  const [manualInputRejected, setManualInputRejected] = createSignal(false);
+  let manualGeneration = 0;
   const [manualRole, setManualRole] = createSignal<AgentRole>("reviewer");
   const [operatorPrompt, setOperatorPrompt] = createSignal("");
   const [capabilitySummary, setCapabilitySummary] = createSignal<CapabilitySummary | null>(null);
   const [acceptedDispatch, setAcceptedDispatch] = createSignal<DispatchAccepted | null>(null);
   const [manualStatus, setManualStatus] = createSignal("");
+  const [manualTerminal, setManualTerminal] = createSignal<DispatchTerminal | null>(null);
+  const [manualStartedMs, setManualStartedMs] = createSignal(0);
+  const [manualTerminalMs, setManualTerminalMs] = createSignal<number | null>(null);
+  const [manualMonitorError, setManualMonitorError] = createSignal("");
+  let previewFrame = -1;
+  let previewRendered = false;
+  // stdout can contain accepted + completed in one chunk, before dispatch()'s await resumes.
+  // Retain only the bounded in-flight window and apply only the subsequently accepted ID.
+  const earlyTerminals = new Map<string, DispatchTerminal>();
   // PR4 interactive widening sub-flow (issue #105), nested entirely inside manualMode()==="confirm"
   // -- Settings' own read-only CapabilityProfile has no dispatchDraftId to bind against, so
   // widening is only ever reachable from the trusted manual describe() flow. "preview"/"summary"
@@ -777,6 +893,19 @@ export function App(props: AppProps) {
     createSignal<"closed" | "describing" | "preview" | "confirming" | "summary" | "minting" | "cancelling">("closed");
   const [wideningPreview, setWideningPreview] = createSignal<WideningPreview | WideningSummary | null>(null);
   const [wideningStatus, setWideningStatus] = createSignal("");
+  createEffect(() => {
+    capabilitySummary();
+    manualMode();
+    wideningStage();
+    previewFrame = renderer.frameId;
+    previewRendered = false;
+  });
+  const onManualFrame = () => {
+    if ((manualMode() === "confirm" || manualMode() === "confirm-final") &&
+        wideningStage() === "closed" && renderer.frameId > previewFrame) previewRendered = true;
+  };
+  renderer.on("frame", onManualFrame);
+  onCleanup(() => renderer.off("frame", onManualFrame));
   // Set the instant confirm-widening-mint succeeds; cleared on dispatch, on an explicit cancel, or
   // on closing/reopening manual dispatch. Tracks a minted-but-not-yet-dispatched grant so
   // close/quit/shutdown can still best-effort relinquish it even though wideningStage() itself has
@@ -857,6 +986,7 @@ export function App(props: AppProps) {
     setRevision((value) => value + 1);
   }, 1000);
   onCleanup(() => {
+    manualGeneration += 1;
     clearInterval(refreshTimer);
     if (feedbackTimer) clearTimeout(feedbackTimer);
     bestEffortCancelWidening();
@@ -872,7 +1002,10 @@ export function App(props: AppProps) {
   const instances = createMemo(() => {
     revision();
     const selectedRole = role();
-    return props.reducer.list(now(), selectedRole === "all" ? undefined : selectedRole, view());
+    // Reducer states mutate in place; publish snapshots so heartbeat/exit changes repaint
+    // even when the selected key and list order did not change.
+    return props.reducer.list(now(), selectedRole === "all" ? undefined : selectedRole, view())
+      .map((state) => ({ ...state }));
   });
   const historyEntries = createMemo(() => {
     revision();
@@ -880,42 +1013,81 @@ export function App(props: AppProps) {
     const selectedRole = role();
     return selectedRole === "all" ? entries : entries.filter((entry) => Boolean(entry.outcomes[selectedRole]));
   });
-  const historyCurrent = createMemo(() =>
-    historyEntries()[Math.min(selected(), Math.max(0, historyEntries().length - 1))]);
-  const current = createMemo(() => instances()[Math.min(selected(), Math.max(0, instances().length - 1))]);
+  const exitedHistory = createMemo(() => {
+    const needle = historyFilter().trim().toLowerCase();
+    return instances().filter((state) => state.exitObservedMs !== null &&
+      (!needle || [state.repository, state.pullRequestTitle, state.pullRequestAuthor, String(state.pullRequestId),
+        state.instanceId, state.completion?.result || "exited outcome unknown"].some((text) => text.toLowerCase().includes(needle))));
+  });
+  const historyCurrent = createMemo(() => historyEntries()[selected()]);
+  const current = createMemo(() => {
+    if (view() !== "history" || !props.history) {
+      return instances()[Math.min(selected(), Math.max(0, instances().length - 1))];
+    }
+    const entry = historyCurrent();
+    if (!entry) return exitedHistory()[selected() - historyEntries().length];
+    const selectedRole = role();
+    const state = props.reducer.list(now(), selectedRole === "all" ? undefined : selectedRole)
+      .find((state) => state.timeline.some((event) => event.repositoryIdentity?.key === entry.repositoryIdentity.key &&
+        event.pullRequestId === entry.pullRequestId));
+    return state ? { ...state } : undefined;
+  });
   const layout = createMemo(() => decideLayout(dimensions().width, detailOpen(), inspectorOpen()));
   const activeFocus = createMemo(() => visibleFocus(layout(), focus()));
   createEffect(() => {
-    const count = selectableCount(view(), Boolean(props.history), historyEntries().length, instances().length);
+    const count = selectableCount(view(), Boolean(props.history), historyEntries().length + exitedHistory().length, instances().length);
     if (selected() >= count) setSelected(Math.max(0, count - 1));
     const corrected = activeFocus();
     if (corrected !== focus()) setFocus(corrected);
   });
-  const unsubscribeTerminal = props.broker?.subscribeTerminal((terminal: DispatchTerminal) => {
+  function receiveManualTerminal(terminal: DispatchTerminal): void {
     if (terminal.dispatchId !== acceptedDispatch()?.dispatchId) return;
-    const detail = terminal.operation === "cancelled"
-      ? terminal.result === "cancelled-forced"
-        ? "Cancellation forced after cooperative shutdown did not complete; process-tree exit observed."
-        : `Cancelled ${terminal.result ?? "cooperatively"}.`
-      : terminal.exitCode === 0
-        ? "Manual child completed successfully."
-        : `Manual child failed with exit code ${terminal.exitCode ?? "unknown"}.`;
-    setManualStatus(detail);
+    setManualTerminal(terminal);
+    setManualTerminalMs(Date.now());
+    setManualMonitorError("");
+    setManualStatus("");
     setManualMode("terminal");
     setRevision((value) => value + 1);
+  }
+  const unsubscribeTerminal = props.broker?.subscribeTerminal((terminal: DispatchTerminal) => {
+    if (manualMode() === "dispatching" && !acceptedDispatch()) {
+      if (earlyTerminals.size < 20) earlyTerminals.set(terminal.dispatchId, terminal);
+    } else receiveManualTerminal(terminal);
   });
   onCleanup(() => unsubscribeTerminal?.());
 
+  const dispatchProgress = createMemo(() => {
+    revision();
+    const accepted = acceptedDispatch();
+    if (!accepted) return null;
+    return manualProgress(
+      props.reducer.getDispatch(accepted.dispatchId, accepted.repositoryIdentity.key,
+        accepted.role, accepted.pullRequestId, accepted.childProcessId, now()),
+      manualTerminal(), manualStartedMs(), manualTerminalMs(), now(),
+      manualMode() === "cancelling", manualMonitorError() || props.brokerFailure?.() || "",
+    );
+  });
+
+  function resetManualProgress(): void {
+    earlyTerminals.clear();
+    setManualTerminal(null);
+    setManualTerminalMs(null);
+    setManualMonitorError("");
+    setManualStartedMs(0);
+  }
+
   function closeManual(): void {
-    if (manualMode() === "active" || manualMode() === "dispatching") {
+    if (manualMode() === "active" || manualMode() === "dispatching" || manualMode() === "cancelling") {
       notify("Cancel the active manual dispatch before closing");
       return;
     }
     bestEffortCancelWidening();
+    manualGeneration += 1;
     setManualMode("closed");
-    setManualEntry(null);
+    setManualTarget(null);
     setCapabilitySummary(null);
     setAcceptedDispatch(null);
+    resetManualProgress();
     setOperatorPrompt("");
     setManualStatus("");
     wideningRequestToken += 1;
@@ -930,19 +1102,17 @@ export function App(props: AppProps) {
       notify("Observe-only launch: trusted manual broker is unavailable");
       return;
     }
-    const selectedEntry = historyCurrent();
-    if (view() !== "history" || !selectedEntry) {
-      notify("Select a retained PR history row before manual dispatch");
-      return;
-    }
-    setManualEntry({
-      ...selectedEntry,
-      repositoryIdentity: { ...selectedEntry.repositoryIdentity },
-      outcomes: { ...selectedEntry.outcomes },
-    });
-    setManualMode("prompt");
+    manualGeneration += 1;
+    setOverlay("none");
+    setInspectorOpen(false);
+    setManualTarget(null);
+    setManualInput("");
+    setManualInputRejected(false);
+    setManualRole("reviewer");
+    setManualMode("target");
     setCapabilitySummary(null);
     setAcceptedDispatch(null);
+    resetManualProgress();
     setOperatorPrompt("");
     setManualStatus("");
     wideningRequestToken += 1;
@@ -950,23 +1120,71 @@ export function App(props: AppProps) {
     setWideningPreview(null);
     setWideningStatus("");
     setMintedWideningGeneration(null);
-    notify("Manual dispatch prompt opened");
+    notify("Start Agent by PR ID opened");
+  }
+
+  function appendManualInput(value: string): void {
+    if (manualInputRejected()) return;
+    if (manualInput().length + value.length > MAX_PR_INPUT ||
+        /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
+      // Never turn a rejected/truncated paste into a different, valid PR ID.
+      setManualInputRejected(true);
+      setManualStatus("Input rejected (too long or controls). Ctrl+U to clear.");
+      return;
+    }
+    setManualInput((current) => current + value);
+    setManualStatus(parseManualPullRequestId(manualInput()) === null ? PR_INPUT_HELP : "");
+  }
+
+  async function resolveManual(): Promise<void> {
+    if (!props.broker || manualMode() !== "target") return;
+    const prId = parseManualPullRequestId(manualInput());
+    if (manualInputRejected() || prId === null) {
+      setManualStatus(manualInputRejected() ? "Input rejected. Ctrl+U to clear." : PR_INPUT_HELP);
+      return;
+    }
+    const role = manualRole();
+    const generation = manualGeneration;
+    setManualMode("resolving");
+    setManualStatus("");
+    try {
+      const profile = await props.broker.profileCurrent(prId, role);
+      if (generation !== manualGeneration) return;
+      assertManualTarget(profile, prId, role);
+      setManualTarget({
+        role: profile.role,
+        repositoryIdentity: { ...profile.repositoryIdentity },
+        prSnapshot: { ...profile.prSnapshot },
+      });
+      await describeManual();
+    } catch (error) {
+      if (generation !== manualGeneration) return;
+      setManualStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail, role)
+        : "Could not verify the requested target. Cancel and retry.");
+      setManualMode("target");
+    }
   }
 
   async function describeManual(): Promise<void> {
-    const entry = manualEntry();
-    if (!props.broker || !entry || manualMode() !== "prompt") return;
+    const target = manualTarget();
+    if (!props.broker || !target || manualMode() !== "resolving") return;
+    const generation = manualGeneration;
     setManualMode("describing");
     setManualStatus("");
     try {
-      const summary = await props.broker.describe(entry.repositoryIdentity.key, entry.pullRequestId, manualRole());
+      const summary = await props.broker.describe(target.repositoryIdentity.key, target.prSnapshot.pullRequestId, target.role);
+      if (generation !== manualGeneration) return;
+      assertManualTarget(summary, target.prSnapshot.pullRequestId, target.role, target.repositoryIdentity.key);
       setCapabilitySummary(summary);
+      previewFrame = renderer.frameId;
       setManualMode("confirm");
-      setManualStatus("Fresh provider snapshot and wrapper-derived capabilities loaded.");
+      setManualStatus("");
     } catch (error) {
+      if (generation !== manualGeneration) return;
       const message = error instanceof BrokerRejectionError
-        ? dispatchResultDetail(error.code, error.detail)
-        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`;
+        ? dispatchResultDetail(error.code, error.detail, target.role)
+        : "Could not verify the fresh target and capabilities. Cancel and retry.";
       setManualStatus(message);
       setManualMode("terminal");
     }
@@ -974,45 +1192,69 @@ export function App(props: AppProps) {
 
   async function dispatchManual(): Promise<void> {
     const summary = capabilitySummary();
-    if (!props.broker || !summary || manualMode() !== "confirm-final") return;
+    if (!props.broker || !summary || (manualMode() !== "confirm" && manualMode() !== "confirm-final") ||
+        wideningStage() !== "closed" || !previewRendered) return;
+    const generation = manualGeneration;
+    earlyTerminals.clear();
     setManualMode("dispatching");
+    setManualStartedMs(Date.now());
     setManualStatus("");
     try {
       const accepted = await props.broker.dispatch(summary, operatorPrompt());
+      if (generation !== manualGeneration) return;
       setAcceptedDispatch(accepted);
+      if (accepted.role === summary.role && accepted.repositoryIdentity.key === summary.repositoryIdentity.key &&
+          accepted.pullRequestId === summary.prSnapshot.pullRequestId &&
+          accepted.capabilityPolicyDigest === summary.capabilityPolicyDigest &&
+          accepted.prStateFingerprint === summary.prStateFingerprint) {
+        props.reducer.registerLocalStream({
+          eventLogPath: accepted.eventLogPath, processId: accepted.childProcessId, role: accepted.role,
+          dispatch: { dispatchId: accepted.dispatchId, repositoryKey: accepted.repositoryIdentity.key, pullRequestId: accepted.pullRequestId },
+        });
+      }
       props.tailer.registerEventLogPath(accepted.eventLogPath);
       setManualMode("active");
-      setManualStatus("Dispatch accepted; waiting for correlated v3 child events.");
+      const earlyTerminal = earlyTerminals.get(accepted.dispatchId);
+      earlyTerminals.clear();
+      if (earlyTerminal) receiveManualTerminal(earlyTerminal);
       // Any minted widening grant is now consumed by the broker's own dispatch-time preflight
       // (Invoke-Dispatch sets Consumed=true unconditionally) -- a later best-effort cancel-widening
       // for this generation would only fail harmlessly, so stop tracking it.
       setMintedWideningGeneration(null);
     } catch (error) {
-      const message = error instanceof BrokerRejectionError
-        ? dispatchResultDetail(error.code, error.detail)
-        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`;
-      setManualStatus(message);
-      setManualMode("terminal");
+      if (generation !== manualGeneration) return;
+      earlyTerminals.clear();
+      if (error instanceof BrokerRejectionError && error.code !== "termination-failed") {
+        setManualStatus(dispatchResultDetail(error.code, error.detail, summary.role));
+        setManualMode("terminal");
+      } else {
+        // Neither a lost acceptance response nor failed cleanup proves that no child remains.
+        setManualMonitorError("Start could not be confirmed.");
+        setManualStatus(error instanceof BrokerRejectionError
+          ? "Startup failed; child exit is unconfirmed. Press q to stop broker-owned work and quit."
+          : "Start status unknown. Press q to stop broker-owned work and quit.");
+      }
     }
   }
 
   async function cancelManual(): Promise<void> {
     const accepted = acceptedDispatch();
     if (!props.broker || !accepted || manualMode() !== "active") return;
-    setManualStatus("Requesting cooperative cancellation; forced cleanup follows only after the broker timeout.");
+    const generation = manualGeneration;
+    setManualMode("cancelling");
+    setManualMonitorError("");
+    setManualStatus("");
     try {
       const terminal = await props.broker.cancel(accepted.dispatchId);
-      setManualStatus(
-        terminal.result === "cancelled-forced"
-          ? "Cancellation was forced; the broker observed complete contained-process-tree exit."
-          : `Cancellation completed: ${terminal.result ?? "cooperative"}.`,
-      );
-      setManualMode("terminal");
+      if (generation !== manualGeneration) return;
+      if (terminal.dispatchId !== accepted.dispatchId) throw new Error("Cancellation response did not match this run.");
+      receiveManualTerminal(terminal);
     } catch (error) {
-      setManualStatus(error instanceof BrokerRejectionError
+      if (generation !== manualGeneration || manualTerminal()) return;
+      setManualMonitorError(error instanceof BrokerRejectionError
         ? dispatchResultDetail(error.code, error.detail)
-        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
-      setManualMode("terminal");
+        : "Could not confirm cancellation. Retry c or quit to stop.");
+      setManualMode("active");
     }
   }
 
@@ -1100,7 +1342,7 @@ export function App(props: AppProps) {
       setWideningPreview(null);
       setWideningStatus(
         `Widening minted: ${minted.capability} granted until ${minted.grantExpiresAtUtc}. ` +
-        "Continue with d then y to dispatch, or Esc to close and relinquish it.",
+        "Enter to start, or Esc to close and relinquish it.",
       );
     } catch (error) {
       if (requestId !== wideningRequestToken) return;
@@ -1516,6 +1758,7 @@ export function App(props: AppProps) {
   }
 
   async function quit(): Promise<void> {
+    manualGeneration += 1;
     setFeedback("Shutting down broker-owned manual work...");
     bestEffortCancelWidening();
     try {
@@ -1548,7 +1791,7 @@ export function App(props: AppProps) {
       notify("Select the instance rail first (Esc or Left)");
       return;
     }
-    const count = selectableCount(view(), Boolean(props.history), historyEntries().length, instances().length);
+    const count = selectableCount(view(), Boolean(props.history), historyEntries().length + exitedHistory().length, instances().length);
     if (!count) {
       notify("No instances are available");
       return;
@@ -1606,13 +1849,12 @@ export function App(props: AppProps) {
   function forgetCurrentHistory(): void {
     if (view() === "history" && props.history) {
       const entry = historyEntries()[selected()];
-      if (!entry || !props.history.hide(entry.key)) {
-        notify("No PR history row is selected");
+      if (entry) {
+        props.history.hide(entry.key);
+        setRevision((value) => value + 1);
+        notify("PR history row hidden for this dashboard process");
         return;
       }
-      setRevision((value) => value + 1);
-      notify("PR history row hidden for this dashboard process");
-      return;
     }
     const instance = current();
     if (!instance || !props.reducer.forgetHistorical(instance.key)) {
@@ -1625,7 +1867,7 @@ export function App(props: AppProps) {
 
   function forgetAllHistory(): void {
     if (view() === "history" && props.history) {
-      const restored = props.history.restoreAll();
+      const restored = props.history.restoreAll() + props.reducer.restoreAllHistorical();
       setRevision((value) => value + 1);
       notify(restored ? `${restored} PR history row(s) restored for this dashboard process` : "No hidden PR history rows are available");
       return;
@@ -1737,6 +1979,12 @@ export function App(props: AppProps) {
       unavailable: "Observe-only: trusted manual broker is unavailable",
       run: openNarrowingEditor,
     },
+    {
+      label: "Start Agent by PR ID",
+      enabled: Boolean(props.broker),
+      unavailable: "Observe-only: trusted manual broker is unavailable",
+      run: openManual,
+    },
   ]);
 
   function executePalette(): void {
@@ -1750,18 +1998,51 @@ export function App(props: AppProps) {
     command.run();
   }
 
+  usePaste((event) => {
+    if (manualMode() !== "target" && manualMode() !== "prompt") return;
+    event.preventDefault();
+    const value = new TextDecoder().decode(event.bytes);
+    if (manualMode() === "target") appendManualInput(value);
+    else {
+      const next = normalizeOperatorPrompt(operatorPrompt() + value);
+      if (promptScalarCount(next) > 512 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(next)) {
+        setManualStatus("Context paste rejected: maximum 512 Unicode scalars, no control characters.");
+      } else setOperatorPrompt(next);
+    }
+  });
+
   useKeyboard((key) => {
     if (manualMode() !== "closed") {
-      if (manualMode() === "prompt") {
+      // Kitty distinguishes held-key repeats. A freshly drawn preview is also required below,
+      // so buffered raw Enter presses cannot start on the transition that reveals the preview.
+      if (key.eventType === "release" || key.eventType === "repeat" || key.repeated) return;
+      if (key.name === "q" && manualMode() !== "target" && manualMode() !== "prompt") {
+        void quit();
+        return;
+      }
+      if (manualMode() === "target") {
         if (key.name === "escape") closeManual();
-        else if (key.ctrl && key.name === "d") void describeManual();
-        else if (key.name === "tab") {
-          setManualRole((value) => value === "reviewer" ? "review-handler" : "reviewer");
-          setCapabilitySummary(null);
-        } else if (key.name === "backspace") {
+        else if (key.ctrl && key.name === "u") {
+          setManualInput("");
+          setManualInputRejected(false);
+          setManualStatus("");
+        } else if (key.name === "return") void resolveManual();
+        else if (key.name === "tab") setManualRole((value) => value === "reviewer" ? "review-handler" : "reviewer");
+        else if (key.name === "backspace" && !manualInputRejected()) {
+          setManualInput((value) => Array.from(value).slice(0, -1).join(""));
+          setManualStatus(parseManualPullRequestId(manualInput()) === null ? PR_INPUT_HELP : "");
+        } else {
+          const printable = printableKeySequence(key);
+          if (printable !== null) appendManualInput(printable);
+        }
+      } else if (manualMode() === "prompt") {
+        if (key.name === "escape") closeManual();
+        else if (key.ctrl && key.name === "d") setManualMode("confirm");
+        else if (key.name === "backspace") {
           setOperatorPrompt((value) => Array.from(value).slice(0, -1).join(""));
         } else if (key.name === "return") {
-          setOperatorPrompt((value) => appendPromptScalar(value, "\n"));
+          if (key.shift) setOperatorPrompt((value) => appendPromptScalar(value, "\n"));
+          else if (!key.ctrl && !key.meta) setManualMode("confirm");
         } else {
           const printable = printableKeySequence(key);
           if (printable !== null) {
@@ -1781,15 +2062,19 @@ export function App(props: AppProps) {
         } else if (wStage === "describing" || wStage === "confirming" || wStage === "minting" || wStage === "cancelling") {
           // A widening RPC is in flight; ignore keys until it settles rather than let d/Esc race it.
         } else if (key.name === "escape") closeManual();
+        else if (key.name === "return" && !key.ctrl && !key.meta && !key.shift) void dispatchManual();
+        else if (key.name === "p") { setManualStatus(""); setManualMode("prompt"); }
         else if (key.name === "d") setManualMode("confirm-final");
         else if (key.name === "w" && canRequestWidening()) void beginWidening();
       } else if (manualMode() === "confirm-final") {
         if (key.name === "escape") closeManual();
-        else if (key.name === "y") void dispatchManual();
+        else if (key.name === "y" || (key.name === "return" && !key.ctrl && !key.meta && !key.shift)) void dispatchManual();
       } else if (manualMode() === "active" && key.name === "c") {
         void cancelManual();
       } else if (manualMode() === "terminal" && (key.name === "escape" || key.name === "return")) {
         closeManual();
+      } else if (manualMode() === "resolving" || manualMode() === "describing") {
+        if (key.name === "escape") closeManual();
       }
       return;
     }
@@ -2043,6 +2328,21 @@ export function App(props: AppProps) {
     return props.reducer.globalDiagnostics();
   });
   const footer = createMemo(() => {
+    if (manualMode() !== "closed") {
+      const mode = manualMode();
+      const widening = wideningStage();
+      const hint = widening !== "closed"
+        ? widening === "preview" ? "c: review widening | Esc: cancel" :
+          widening === "summary" ? "y: mint widening | Esc: cancel" : "Widening pending | q: quit"
+        : mode === "target" ? "Tab: agent | Enter: preview | Esc: cancel" :
+          mode === "prompt" ? "Enter: preview | Shift+Enter: newline | Esc: cancel" :
+          mode === "confirm" || mode === "confirm-final" ? "Enter: START | Esc: cancel" :
+          mode === "active" ? "c: cancel this run | q: quit and stop" :
+          mode === "terminal" ? "Enter or Esc: close | q: quit" :
+          mode === "dispatching" || mode === "cancelling" ? "Please wait | q: quit and stop" :
+          "Please wait | Esc: cancel";
+      return { summary: "", hint };
+    }
     const live = instances().filter((item) => streamLabel(item) === "Live").length;
     const history = instances().filter((item) => streamLabel(item) === "History").length;
     const stale = instances().filter((item) => streamLabel(item) === "Stale").length;
@@ -2054,19 +2354,19 @@ export function App(props: AppProps) {
         : " | no PR selected";
       const summary = `PR history ${historyEntries().length}${selectedLabel}${historyFilter() ? ` | filter: ${historyFilter()}` : ""}${input}`;
       if (dimensions().width >= 120) {
-        return { summary, hint: "↑/↓ select | m launch | Tab role | / filter | number jump | x/X | f view | ? | q" };
+        return { summary, hint: "m Start Agent by PR ID | ↑/↓ | Tab role | / filter | number jump | x/X | f | ? | q" };
       }
       if (dimensions().width >= 80) {
-        return { summary, hint: "↑/↓ select | m launch | Tab role | / filter | f view | ? | q" };
+        return { summary, hint: "m Start Agent by PR ID | ↑/↓ | / filter | f | ? | q" };
       }
-      return { summary, hint: "↑/↓ | m launch | Tab role | f view | ? | q" };
+      return { summary, hint: "m Start Agent by PR ID | Enter | f | ? | q" };
     }
     const summary = dimensions().width < 80
       ? `${viewLabel(view())} ${instances().length} | L ${live} H ${history} S ${stale}`
       : `${viewLabel(view())} ${instances().length} | Live ${live} History ${history} Stale ${stale}`;
-    if (dimensions().width >= 120) return { summary, hint: "f History | m launch selected PR | ←/→ pane | ↑/↓ | Tab role | i/e/o/w | Ctrl+P | ? | q" };
-    if (dimensions().width >= 80) return { summary, hint: "f History | m launch selected PR | Tab role | i/e/o | ? | q" };
-    return { summary, hint: "Enter | f History | m launch | ? | q" };
+    if (dimensions().width >= 120) return { summary, hint: "m Start Agent by PR ID | f view | ←/→ pane | ↑/↓ | Tab role | i/e/o/w | Ctrl+P | ? | q" };
+    if (dimensions().width >= 80) return { summary, hint: "m Start Agent by PR ID | f view | Tab role | i/e/o | ? | q" };
+    return { summary, hint: "m Start Agent by PR ID | Enter | f | ? | q" };
   });
   const headerContext = createMemo(() => {
     if (dimensions().width >= 120) {
@@ -2089,7 +2389,7 @@ export function App(props: AppProps) {
         </text>
       </box>
       <box flexGrow={1} flexDirection="row" gap={1} padding={1} overflow="hidden">
-        <Show when={manualMode() !== "closed" && manualEntry()} fallback={
+        <Show when={manualMode() !== "closed"} fallback={
           <Show when={view() === "history" && props.history} fallback={
           <>
             <Show when={layout().showRail}>
@@ -2103,25 +2403,26 @@ export function App(props: AppProps) {
             </Show>
           </>
         }>
-          <History entries={historyEntries()} selected={selected()} compact={layout().mode === "compact"} />
+          <History entries={historyEntries()} exited={exitedHistory()} selected={selected()} compact={layout().mode === "compact"} detailOpen={detailOpen()} now={now()} focus={activeFocus()} />
           </Show>
         }>
-          {(entry: () => PullRequestHistoryEntry) => (
             <ManualDispatchPanel
               mode={manualMode()}
-              entry={entry()}
+              target={manualTarget()}
+              targetInput={manualInput()}
               role={manualRole()}
               prompt={operatorPrompt()}
               summary={capabilitySummary()}
               accepted={acceptedDispatch()}
               status={manualStatus() || props.brokerFailure?.() || ""}
+              progress={dispatchProgress()}
+              startUncertain={Boolean(manualMonitorError())}
               wideningStage={wideningStage()}
               wideningPreview={wideningPreview()}
               wideningStatus={wideningStatus()}
               mintedWideningGeneration={mintedWideningGeneration()}
               wideningLocked={props.launchMode === "preview"}
             />
-          )}
         </Show>
       </box>
       <Show when={diagnostics().length > 0 || props.brokerFailure?.()}>
@@ -2134,14 +2435,17 @@ export function App(props: AppProps) {
         </box>
       </Show>
       <box height={1} paddingX={1} backgroundColor={COLORS.brand}>
-        <text height={1} fg={COLORS.text}>STATUS: {line(feedback(), Math.max(10, dimensions().width - 10))}</text>
+        <text height={1} fg={COLORS.text}>STATUS: {line(manualMode() === "closed" ? feedback() :
+          dispatchProgress()?.headline ?? (manualMode() === "dispatching" ? manualMonitorError() ? "START STATUS UNKNOWN" : "STARTING..." :
+            manualMode() === "confirm" || manualMode() === "confirm-final" ? "NOT STARTED / READY TO START" :
+              manualStatus() || "Not started"), Math.max(10, dimensions().width - 10))}</text>
       </box>
       <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
         <text height={1} fg={COLORS.text}>{footer().summary}</text>
         <text height={1} fg={COLORS.muted}>{footer().hint}</text>
       </box>
 
-      <Show when={layout().showInspector && layout().inspectorOverlay}>
+      <Show when={manualMode() === "closed" && layout().showInspector && layout().inspectorOverlay}>
         <OverlayPanel title="INSPECTOR" width={58} height={25}>
           <Inspector instance={current()} focused />
         </OverlayPanel>
@@ -2166,7 +2470,7 @@ export function App(props: AppProps) {
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "palette"}>
-        <OverlayPanel title="CONTEXT COMMANDS - VIEW ONLY" width={64} height={19}>
+        <OverlayPanel title="DASHBOARD COMMANDS" width={64} height={19}>
           <For each={palette()}>
             {(command, index) => (
               <text height={1} fg={!command.enabled ? COLORS.muted : index() === paletteIndex() ? COLORS.accent : COLORS.text}>
@@ -2191,7 +2495,9 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.text}>w                  Next attention item</text>
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
-          <text height={1} fg={COLORS.text}>m                  Manual dispatch for selected retained PR (trusted launch only)</text>
+          <text height={1} fg={COLORS.text}>m                  Start Agent by PR ID (no History required)</text>
+          <text height={1} fg={COLORS.text}>  ID + Enter: load preview | Enter after preview: START</text>
+          <text height={1} fg={COLORS.text}>  p: optional instructions in preview | c: cancel running child</text>
           <text height={1} fg={COLORS.text}>
             {"  (dispatch confirm) w   "}{props.launchMode === "preview"
               ? "Widening locked by PreviewOnly"

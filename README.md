@@ -298,9 +298,16 @@ non-delegable ceiling that disables automatic and manual PR mutations,
 notification delivery, Settings widening, and delegated grants. Use `-DryRun`
 only for an agent's offline self-check; it is not the live PreviewOnly mode.
 
-The golden TUI shows **OPERATIONAL** or **PREVIEW** in its header. Press `f` to
-reach **History**, select a retained PR, press `m`, and use `Tab` to choose
-Reviewer or Review Handler. The current launch and up to 20 recent,
+The golden TUI shows **OPERATIONAL** or **PREVIEW** in its header. Press `m`
+from Current, Live, or History to **Start Agent by PR ID**, or select that
+command in `Ctrl+P`. Enter a PR ID and use `Tab` to choose Reviewer (default)
+or Review Handler, then `Enter` to resolve it in that agent's configured
+repository and load the preview. No retained PR or History filter is required.
+Press `Enter` again after the preview is displayed to start:
+**m → ID → Enter (preview) → Enter (start)**. Optional instructions are behind
+`p` in the preview, not a mandatory step. The panel shows **NOT STARTED** before confirmation, **STARTING** while
+launching, and **STARTED / RUNNING** with the child PID and progress afterward.
+The current launch and up to 20 recent,
 independently trusted watch runs contribute to History. Every manual launch
 revalidates the PR's current state, author/ownership eligibility, and work
 lease before starting.
@@ -393,15 +400,44 @@ streams, including state layouts with agent-name subdirectories. It can also
 read explicit captures with `-EventLogPath`. The default **Current session**
 view shows every live instance plus the newest retained outcome per
 agent/session group. **Live** keeps active running, waiting, failed, blocked,
-and stale processes visible. **History** shows stopped or completed retained
-runs with timestamps and outcomes. `x` hides a selected PR history row and `Shift+x` restores hidden rows only in
+and stale processes visible. Current trusted Watch children and accepted manual
+children have explicit local-process provenance. When their overdue PID is
+confirmed absent by a signal-free existence check, they leave Current and Live
+automatically. Arbitrary, copied, remote/container, attached, and older streams
+without that provenance remain stale warnings; local paths or matching PIDs do
+not establish origin. Heartbeat gaps, access errors, and present (possibly reused)
+PIDs never prove exit.
+Golden's private stdout captures stream live through the existing typed process
+helper, with 10 MiB active plus one 10 MiB rotation. Final draining never rewrites
+a live capture. Capture failures are visible and do not interrupt child cleanup.
+**History** retains PR outcomes plus exited-instance diagnostics, including
+legacy streams and runs without a completion event; those say **outcome unknown**,
+not success. Logs and agent state are never removed. `x` hides a selected PR history row and `Shift+x` restores hidden rows only in
 the current dashboard process; neither changes agent state or event logs.
-From a retained PR row, `m` opens manual dispatch when the trusted launcher
-enabled it. The optional multiline prompt is capped at 512 Unicode scalars.
-`Ctrl+d` performs a fresh provider-backed describe, then `d` and `y` are two
-separate confirmations of the displayed source commit, capability-policy
-digest, PR-state fingerprint, enabled capabilities, and disabled high-impact
-actions. `c` cancels only the broker-owned manual child. `q` awaits broker
+From any main view, `m` opens the same blank **Start Agent by PR ID** form
+when the trusted launcher enabled it. The full ID must contain only ASCII
+digits and be in `1..2147483647`; invalid or oversized input never becomes a
+different PR ID. `Ctrl+U` clears the field. The broker resolves only the chosen
+role's trusted configured repository, which may differ between agents.
+The first `Enter` resolves the target and automatically fetches a fresh,
+key-bound preview. Verify the displayed repository, PR title, and role.
+The target and role are locked for that attempt; cancel and reopen to change them.
+Press `p` in the preview to edit optional instructions (512 Unicode scalars);
+`Shift+Enter` inserts a newline and `Enter` returns to preview without starting.
+The provider-backed preview shows the repository, PR, role, source commit,
+allowed actions, and denied actions. A separate `Enter` **after the preview is
+displayed** starts the exact bound snapshot, with the displayed operational capabilities
+(including authorized comments and pushes), or with terminal no-write denies
+under PreviewOnly. `Esc` also cancels pending resolution or describe reads;
+late responses cannot revive a cancelled attempt.
+The manual panel stays on that exact dispatch, independent of view filters or
+automatic agents watching the same PR. It shows elapsed time and latest progress,
+explicitly says when no events have arrived, and distinguishes finished, failed,
+blocked, cancelled, and unknown monitoring status. Exit code zero without a work
+outcome is reported as a child exit, not a successful review. `c` cancels the run.
+Capability widening still requires its separate `c` / `y` challenge confirmations;
+neither Enter nor instruction text can mint a grant.
+`c` cancels only the broker-owned manual child. `q` awaits broker
 shutdown and never targets continuous watcher PIDs.
 
 Describe and dispatch failures remain distinct in the UI, including
@@ -419,6 +455,11 @@ overview/detail route below 80 columns:
 | `Enter` / `Esc` | Drill into or back out of detail and timeline views |
 | `Tab` / `Shift+Tab` | Cycle all, reviewer, and review-handler roles |
 | `f` / `Shift+f` | Cycle Live, Current session, and History |
+| `m` | Start Agent by PR ID, without selecting a History row |
+| `Tab`, then `Enter` in PR entry | Choose agent, then resolve the configured repository/PR and load preview |
+| `p` in preview | Edit optional instructions; Enter returns to preview without starting |
+| `Enter` in preview | Explicitly start after the preview has been displayed |
+| `Shift+Enter` in instructions | Insert a newline |
 | `x` / `Shift+x` | Forget selected/all history from dashboard view state |
 | `i` / `e` | Toggle the inspector or bounded raw-events overlay |
 | `w` | Select the next failed, blocked, or diagnostic-bearing instance |

@@ -890,16 +890,36 @@ try {
         }
         else {
             New-AgentRedirectedProcess -FilePath $pwsh -ArgumentList $childArguments `
-                -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath -WorkingDirectory $toolkitRoot
+                -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath -WorkingDirectory $toolkitRoot -LiveStandardOutput
         }
         $process = $owned.Process
         [void]$children.Add([pscustomobject]@{
             Role = $spec.Role
             Process = $process
             Owned = $owned
+            StdOutPath = $stdoutPath
             StdErrPath = $stderrPath
         })
         Write-Host "Watching $($spec.Role) PID $($process.Id)." -ForegroundColor Cyan
+    }
+    if ($brokerDescriptorPath) {
+        # Only this launch's owned stdout captures have known local origin. Prior/copy/attach
+        # roots are not provenance, even when their paths and PIDs happen to exist locally.
+        try {
+            $brokerDescriptor.localObservation = [ordered]@{
+                schemaVersion = 1
+                ownerStartIdentity = Get-AgentProcessStartIdentity -Process (Get-Process -Id $PID)
+                streams = @($children | ForEach-Object {
+                    [ordered]@{ role = $_.Role; processId = $_.Process.Id; eventLogPath = $_.StdOutPath }
+                })
+            }
+            [void](Assert-AgentTrustedFile -Path $brokerDescriptorPath -AllowedRoot $StateDir -Private)
+            [IO.File]::WriteAllText($brokerDescriptorPath,
+                (ConvertTo-AgentCanonicalJson $brokerDescriptor), [Text.UTF8Encoding]::new($false))
+        }
+        catch {
+            Write-Warning 'Local process origin is unavailable; overdue instances will remain visible as stale warnings.'
+        }
     }
 }
 catch {
@@ -970,7 +990,12 @@ finally {
     }
 }
 
-if ($agentsStoppedByDashboard -and $dashboardCompletedNormally) { exit 0 }
+if ($agentsStoppedByDashboard -and $dashboardCompletedNormally) {
+    if (@($children | Where-Object { $_.Owned.ContainsKey('LiveStandardOutput') -and $_.Owned.StdOutTask.IsFaulted }).Count -gt 0) {
+        throw '[live-stdout-capture-failed] A live stdout capture failed. All owned children have completed cleanup.'
+    }
+    exit 0
+}
 foreach ($child in $children) {
     $child.Process.Refresh()
     if ($child.Process.HasExited) {

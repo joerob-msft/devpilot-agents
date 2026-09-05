@@ -35,7 +35,7 @@ function namedEvent(eventType: string, data: Record<string, unknown> = {}, messa
     assert.match(dispatchResultDetail("source-changed"), /Source changed/);
     assert.match(dispatchResultDetail("policy-changed"), /capability policy changed/);
     assert.match(dispatchResultDetail("delivery-pending"), /delivery is pending/);
-    assert.match(dispatchResultDetail("already-running", "state-contended"), /role state is busy/);
+    assert.match(dispatchResultDetail("already-running", "state-contended"), /wait for it to finish, then retry/);
     assert.doesNotMatch(dispatchResultDetail("launch-failed", "bad\u001bdetail"), /\u001b/);
     // issue #105 final headless-broker bypass fix: distinct message, never the generic
     // "Dispatch rejected: <code>" fallback, and never suggests retrying from the client.
@@ -55,4 +55,15 @@ test("stable event names become concise narrative while raw summaries retain ide
   const completed = namedEvent("review.completed", { summary: "Three findings" });
   assert.equal(eventNarrative(completed), "Review completed - Three findings");
   assert.match(eventSummary(completed), /^review\.completed PR 94/);
+});
+
+test("repository-state contention names only the requested role, retains the reason, and distinguishes PR leases", () => {
+  const detail = "state-contended: repository state is busy";
+  for (const [role, label] of [["reviewer", "Reviewer"], ["review-handler", "Review Handler"]] as const) {
+    const message = dispatchResultDetail("already-running", detail, role);
+    assert.equal(message, `Another ${label} is using this repository's state; wait for it to finish, then retry. ${detail}`);
+    assert.doesNotMatch(message, /PR #|queue|cancel|stale/i);
+  }
+  assert.match(dispatchResultDetail("already-running", "lease-contended", "reviewer"), /this PR and role hold the work lease/);
+  assert.doesNotMatch(dispatchResultDetail("already-running", "state-contended\u001b", "reviewer"), /\u001b/);
 });

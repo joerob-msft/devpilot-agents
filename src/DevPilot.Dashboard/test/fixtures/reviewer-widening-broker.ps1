@@ -2,7 +2,8 @@ param([string]$DescriptorPath)
 $descriptor = Get-Content -Raw -Path $DescriptorPath | ConvertFrom-Json
 $requestLogPath = $descriptor.requestLogPath
 $dispatchEventLogPath = $descriptor.dispatchEventLogPath
-if ($dispatchEventLogPath) {
+$simpleFlow = $descriptor.simpleFlow -eq $true
+if ($dispatchEventLogPath -and -not $simpleFlow) {
   New-Item -ItemType File -Force -Path $dispatchEventLogPath | Out-Null
 }
 $repositoryIdentity = @{
@@ -34,11 +35,20 @@ $baseMandatoryDenies = @('EnableApprovalVote')
 $delegableAvailable = @('EnableApprovalVote')
 $absoluteDenies = @('EnableAutoComplete')
 $allowedManualCapabilities = @('EnableSummaryComment', 'EnableThreadReplies', 'EnableFindingComments')
+if ($simpleFlow) {
+  $delegableAvailable = @()
+  if ($descriptor.role -eq 'review-handler') {
+    $baseCapabilities = @('EnableCodeChanges', 'EnablePush', 'EnableThreadReplies', 'LocalValidation')
+    $baseMandatoryDenies = @('EnableAutoComplete')
+  }
+  if ($descriptor.previewOnly -eq $true) { $baseCapabilities = @() }
+  $allowedManualCapabilities = @($baseCapabilities)
+}
 $baselineDigest = ('1' * 64)
 $widenedDigest = ('2' * 64)
 $prStateFingerprint = ('3' * 64)
 $dispatchDraftId = '11111111-1111-1111-1111-111111111111'
-$dispatchId = '22222222-2222-2222-2222-222222222222'
+$dispatchId = '22222222-2222-4222-8222-222222222222'
 $previewChallenge = ('a' * 48)
 $summaryChallenge = ('b' * 48)
 $previewExpiresAtUtc = [DateTime]::UtcNow.AddMinutes(10).ToString('o')
@@ -73,6 +83,13 @@ function Provenance([bool]$widened) {
   }
 }
 function Current-Effect([bool]$widened) {
+  if ($simpleFlow) {
+    return @{
+      capabilities = [string[]]$baseCapabilities
+      mandatoryDenies = [string[]]$baseMandatoryDenies
+      provenance = @{}
+    }
+  }
   $capabilities = if ($widened) { @('EnableSummaryComment', 'EnableThreadReplies', 'EnableFindingComments', 'EnableApprovalVote') } else { @($baseCapabilities) }
   $mandatoryDenies = [System.Collections.Generic.List[string]]::new()
   if (-not $widened) { [void]$mandatoryDenies.Add('EnableApprovalVote') }
@@ -84,7 +101,7 @@ function Current-Effect([bool]$widened) {
 }
 function Describe-Response([object]$request) {
   $effect = Current-Effect $false
-  return @{
+  $response = @{
     schemaVersion = 1
     requestId = $request.requestId
     operation = 'capability-summary'
@@ -103,7 +120,12 @@ function Describe-Response([object]$request) {
     provenance = $effect.provenance
     killSwitchActive = $false
     killSwitchExpiresAtUtc = $null
-  } | ConvertTo-Json -Compress -Depth 10
+  }
+  if ($request.operation -eq 'profile-current') {
+    $response.operation = 'capability-profile'
+    foreach ($field in @('dispatchDraftId', 'capabilityPolicyDigest', 'prStateFingerprint')) { $response.Remove($field) }
+  }
+  return $response | ConvertTo-Json -Compress -Depth 10
 }
 function Describe-Widening([object]$request) {
   if ($request.capability -ne 'EnableApprovalVote') { throw 'unexpected widening capability' }
@@ -188,11 +210,13 @@ function Cancel-Widening([object]$request) {
   } | ConvertTo-Json -Compress -Depth 10
 }
 function Dispatch-Response([object]$request) {
-  if ($script:wideningStage -ne 'minted') { throw 'widening grant not minted' }
-  if ($request.dispatchDraftId -ne $dispatchDraftId -or $request.capabilityPolicyDigest -ne $widenedDigest -or $request.prStateFingerprint -ne $prStateFingerprint) {
+  if (-not $simpleFlow -and $script:wideningStage -ne 'minted') { throw 'widening grant not minted' }
+  $expectedDigest = if ($simpleFlow) { $baselineDigest } else { $widenedDigest }
+  if ($request.dispatchDraftId -ne $dispatchDraftId -or $request.capabilityPolicyDigest -ne $expectedDigest -or $request.prStateFingerprint -ne $prStateFingerprint) {
     throw 'dispatch bindings do not match the widened draft'
   }
   $script:dispatchActive = $true
+  if ($simpleFlow) { Start-Sleep -Milliseconds 700 }
   return @{
     schemaVersion = 1
     requestId = $request.requestId
@@ -201,7 +225,7 @@ function Dispatch-Response([object]$request) {
     repositoryIdentity = $repositoryIdentity
     pullRequestId = 104
     role = $request.role
-    capabilityPolicyDigest = $widenedDigest
+    capabilityPolicyDigest = $expectedDigest
     prStateFingerprint = $prStateFingerprint
     childProcessId = 4242
     eventLogPath = $dispatchEventLogPath
@@ -210,6 +234,7 @@ function Dispatch-Response([object]$request) {
 function Cancel-Dispatch([object]$request) {
   if (-not $script:dispatchActive) { throw 'dispatch is not active' }
   $script:dispatchActive = $false
+  if ($simpleFlow) { Start-Sleep -Milliseconds 400 }
   return @{
     schemaVersion = 1
     requestId = $request.requestId
@@ -224,12 +249,26 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
   $request = $line | ConvertFrom-Json
   Append-Log $request
   switch ($request.operation) {
+    'profile-current' { Write-Output (Describe-Response $request) }
     'describe' { Write-Output (Describe-Response $request) }
     'describe-widening' { Write-Output (Describe-Widening $request) }
     'confirm-widening-preview' { Write-Output (Confirm-Widening-Preview $request) }
     'confirm-widening-mint' { Write-Output (Confirm-Widening-Mint $request) }
     'cancel-widening' { Write-Output (Cancel-Widening $request) }
-    'dispatch' { Write-Output (Dispatch-Response $request) }
+    'dispatch' {
+      Write-Output (Dispatch-Response $request)
+      if ($simpleFlow -and $descriptor.complete -eq $true) {
+        Start-Sleep -Seconds 4
+        $script:dispatchActive = $false
+        Write-Output (@{
+          schemaVersion = 1
+          requestId = $request.requestId
+          operation = 'completed'
+          dispatchId = $dispatchId
+          exitCode = 0
+        } | ConvertTo-Json -Compress)
+      }
+    }
     'cancel' { Write-Output (Cancel-Dispatch $request) }
     'shutdown' {
       $accepting = $false

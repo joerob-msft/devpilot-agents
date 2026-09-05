@@ -428,17 +428,27 @@ function Get-BrokerCapabilityProfile {
     # RuntimeRoot, or $drafts entry -- callers decide independently whether to allocate one
     # (Invoke-Describe only). On failure, closes the provider session itself before rethrowing;
     # on success, the caller owns closing Provider.Session once it is done with it.
-    param([hashtable]$Request)
+    param([hashtable]$Request, [switch]$DiscoverCurrent)
     Remove-ExpiredDrafts
     $role = [string]$Request.role
-    $prId = [int]$Request.pullRequestId
-    if ($prId -le 0) { throw '[invalid-request] pullRequestId must be positive.' }
+    if ($Request.role -isnot [string]) { throw '[role-not-allowed] The requested manual role is invalid.' }
+    # Reuse the private harness parser in module scope; never round/coerce raw JSON into an ID.
+    $prNumber = & (Get-Module DevPilot.AgentHarness) {
+        param($Value)
+        ConvertTo-AgentSafeIntegralNumber $Value
+    } $Request['pullRequestId']
+    if ($null -eq $prNumber -or $prNumber -lt 1 -or $prNumber -gt [int]::MaxValue) {
+        throw '[invalid-request] pullRequestId must be an integer in 1..2147483647.'
+    }
+    $prId = [int]$prNumber
     $roleDescriptor = Get-RoleDescriptor $role
     $provider = Open-BrokerProvider $roleDescriptor
     try {
         $roleDescriptor['repositoryRoot'] = $provider.RepositoryRoot
         $identity = Resolve-AgentProviderRepositoryIdentity -Context $provider.Context
-        if ([string]$Request.repositoryKey -cne [string]$identity.key) { throw '[repository-mismatch] Repository key does not match the provider.' }
+        if (-not $DiscoverCurrent -and [string]$Request.repositoryKey -cne [string]$identity.key) {
+            throw '[repository-mismatch] Repository key does not match the provider.'
+        }
         $pr = ConvertTo-BrokerPrSnapshot -PullRequest (Get-BrokerPullRequest $provider $prId) -PullRequestId $prId
         if (-not $pr.active -or $pr.draft) { throw '[pr-state-changed] Pull request is not active and ready.' }
         $constraints = @()
@@ -584,8 +594,8 @@ function Invoke-Profile {
     # RuntimeRoot, or $drafts entry -- repeated or overlapping calls (refresh, close/reopen) leave
     # no broker-side residue. Omits dispatchDraftId/capabilityPolicyDigest/prStateFingerprint
     # entirely: none is meaningful without a config snapshot to bind it to.
-    param([hashtable]$Request)
-    $profile = Get-BrokerCapabilityProfile $Request
+    param([hashtable]$Request, [switch]$DiscoverCurrent)
+    $profile = Get-BrokerCapabilityProfile $Request -DiscoverCurrent:$DiscoverCurrent
     $provider = $profile.Provider
     try {
         Write-DispatchProtocolMessage @{
@@ -599,6 +609,18 @@ function Invoke-Profile {
         }
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
+}
+
+function Invoke-ProfileCurrent {
+    param([hashtable]$Request)
+    # Discovery grants no caller authority over repository/config/path selection. Only this
+    # read-only endpoint may omit the repository key; all later operations remain key-bound.
+    foreach ($field in $Request.Keys) {
+        if ($field -cnotin @('schemaVersion', 'requestId', 'operation', 'pullRequestId', 'role')) {
+            throw '[invalid-request] profile-current accepts only a PR ID and role.'
+        }
+    }
+    Invoke-Profile $Request -DiscoverCurrent
 }
 
 function Invoke-PreviewNarrowing {
@@ -1572,20 +1594,26 @@ function Invoke-Dispatch {
         }
     }
     catch {
-        if ($containment) { Stop-AgentProcessContainment $containment $child.Process }
-        else { Stop-ProcessTree $child.Process; [void]$child.Process.WaitForExit(5000) }
+        $startupError = $_
+        $terminated = if ($containment) { Stop-AgentProcessContainment $containment $child.Process }
+        else { Stop-ProcessTree $child.Process; $child.Process.WaitForExit(5000) }
+        $attestationPipe.Dispose()
+        [Array]::Clear($attestationSecret, 0, $attestationSecret.Length)
+        if ($grantCapability) { Remove-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot }
+        if ($draft['PromptGuard']) { $draft['PromptGuard'].Dispose(); $draft['PromptGuard'] = $null }
+        Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
+        if (-not $terminated) {
+            # Keep ownership and runtime files until the tree really exits; cleanup results
+            # must never become protocol output or authorize deleting a live child's state.
+            $children[$dispatchId] = @{
+                Child = $child; RequestId = [string]$Request.requestId; Pipe = $pipe
+                Draft = $draft; DraftId = $draftId; Containment = $containment; StartupFailed = $true
+            }
+            throw "[termination-failed] Startup cleanup could not confirm child exit. Original startup error: $($startupError.Exception.Message)"
+        }
         if (-not $completionResult) { [void](Complete-AgentRedirectedProcess $child) }
         Close-AgentProcessContainment $containment
         $pipe.Dispose()
-        $attestationPipe.Dispose()
-        [Array]::Clear($attestationSecret, 0, $attestationSecret.Length)
-        # issue #105 PR4 requirement 7: a grant artifact already sealed for THIS dispatch attempt
-        # must never survive a failed/abandoned handshake -- Remove-ExpiredDrafts provides an
-        # unconditional backstop, but cleaning it up immediately here (write/start/ready/proceed all
-        # failed the same way) avoids leaving a sealed selection on disk for even one extra poll
-        # interval.
-        if ($grantCapability) { Remove-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot }
-        Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
         throw
     }
 }
@@ -1595,15 +1623,17 @@ function Complete-ExitedChildren {
         $entry = $children[$id]
         $entry.Child.Process.Refresh()
         if (-not $entry.Child.Process.HasExited) { continue }
-        if (-not (Test-AgentProcessContainmentExited -Containment $entry.Containment -Process $entry.Child.Process)) {
+        if ($entry.Containment -and -not (Test-AgentProcessContainmentExited -Containment $entry.Containment -Process $entry.Child.Process)) {
             continue
         }
         $result = Complete-AgentRedirectedProcess $entry.Child
         $entry.Pipe.Dispose()
         Close-AgentProcessContainment $entry.Containment
-        Write-DispatchProtocolMessage @{
-            schemaVersion = 1; requestId = $entry.RequestId; operation = 'completed'
-            dispatchId = $id; exitCode = $result.ExitCode
+        if (-not $entry.ContainsKey('StartupFailed')) {
+            Write-DispatchProtocolMessage @{
+                schemaVersion = 1; requestId = $entry.RequestId; operation = 'completed'
+                dispatchId = $id; exitCode = $result.ExitCode
+            }
         }
         $children.Remove($id)
         Remove-DraftResidue $entry.Draft
@@ -1627,7 +1657,10 @@ function Stop-BrokerChild {
             [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
     }
     [void]$entry.Child.Process.WaitForExit(5000)
-    $treeExited = Test-AgentProcessContainmentExited -Containment $entry.Containment -Process $entry.Child.Process
+    $treeExited = if ($entry.Containment) {
+        Test-AgentProcessContainmentExited -Containment $entry.Containment -Process $entry.Child.Process
+    }
+    else { $entry.Child.Process.HasExited }
     $cooperative = $false
     $acknowledgementPresent = Test-Path -LiteralPath $cancelAckPath -PathType Leaf
     if ($treeExited -and $acknowledgementPresent) {
@@ -1674,7 +1707,10 @@ function Stop-BrokerChild {
     }
     $terminated = $false
     if ($graceOutcome.Result -ne 'cancelled-cooperative') {
-        $terminated = Stop-AgentProcessContainment $entry.Containment $entry.Child.Process
+        $terminated = if ($entry.Containment) {
+            Stop-AgentProcessContainment $entry.Containment $entry.Child.Process
+        }
+        else { Stop-ProcessTree $entry.Child.Process; $entry.Child.Process.WaitForExit(5000) }
         $treeExited = [bool]$terminated
     }
     $outcome = Get-AgentCancellationOutcome `
@@ -1683,6 +1719,7 @@ function Stop-BrokerChild {
         -TreeExitedDuringGrace ($graceOutcome.Result -eq 'cancelled-cooperative') `
         -ForcedContainmentSucceeded ($graceOutcome.Result -ne 'cancelled-cooperative' -and $terminated)
     if ($outcome.Result -eq 'termination-failed') {
+        if ($BrokerShutdown) { throw '[termination-failed] Contained process tree did not exit within the bounded termination period.' }
         Write-Rejection $RequestId 'termination-failed' 'Contained process tree did not exit within the bounded termination period.'
         return
     }
@@ -1702,8 +1739,60 @@ function Stop-BrokerChild {
     }
 }
 
+function Get-LocalWatchObservation {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Descriptor,
+        [Parameter(Mandatory)][string]$StateRoot,
+        [switch]$DashboardProvenance
+    )
+    if (-not $DashboardProvenance -or -not $Descriptor.Contains('localObservation')) { return $null }
+    try {
+        $observation = $Descriptor.localObservation
+        if ($observation -isnot [Collections.IDictionary] -or $observation.schemaVersion -ne 1 -or
+            $observation.ownerStartIdentity -isnot [string] -or
+            $observation.ownerStartIdentity -cnotmatch '^(utc|linux):[0-9]+$') { return $null }
+        # A copied descriptor, a live/reused PID, or a local-looking path is not origin proof.
+        # This must be the current Dashboard's actual launcher, with the captured start identity.
+        $dashboardPid = Get-AgentImmediateParentProcessId -ProcessId $PID
+        $launcherPid = Get-AgentImmediateParentProcessId -ProcessId $dashboardPid
+        if ($launcherPid -ne $Descriptor.ownerProcessId) { return $null }
+        $launcher = Get-Process -Id $launcherPid -ErrorAction Stop
+        if ((Get-AgentProcessStartIdentity -Process $launcher) -cne $observation.ownerStartIdentity) { return $null }
+        $streams = @($observation.streams)
+        if ($streams.Count -gt 2) { return $null }
+        $result = [Collections.Generic.List[object]]::new()
+        $roles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($stream in $streams) {
+            if ($stream -isnot [Collections.IDictionary] -or $stream.role -cnotin @('reviewer', 'review-handler') -or
+                ($stream.processId -isnot [int] -and $stream.processId -isnot [long]) -or
+                $stream.processId -le 0 -or $stream.processId -gt [int]::MaxValue -or
+                -not $roles.Add($stream.role) -or $stream.eventLogPath -isnot [string] -or
+                -not [IO.Path]::IsPathFullyQualified($stream.eventLogPath)) { return $null }
+            $expectedPath = Join-Path $StateRoot "$($stream.role).stdout.jsonl"
+            $path = Assert-AgentTrustedFile -Path ([IO.Path]::GetFullPath([string]$stream.eventLogPath)) `
+                -AllowedRoot $StateRoot -ExpectedPath $expectedPath -Private
+            [void]$result.Add(@{ role = $stream.role; processId = $stream.processId; eventLogPath = $path })
+        }
+        return @{
+            schemaVersion = 1; requestId = '00000000-0000-0000-0000-000000000000'
+            operation = 'local-observation'; streams = @($result.ToArray())
+        }
+    }
+    catch {
+        # Unavailable origin metadata never makes an arbitrary stream locally observable.
+        return $null
+    }
+}
+
+$localObservation = Get-LocalWatchObservation -Descriptor $descriptor -StateRoot $stateRoot `
+    -DashboardProvenance:$interactiveWideningAvailable
+if ($null -ne $localObservation) { Write-DispatchProtocolMessage $localObservation }
+
+$protocolReader = [IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8, $false, 1024, $true)
 try {
-    $readTask = [Console]::In.ReadLineAsync()
+    # Console.In's synchronized reader can execute ReadLineAsync synchronously, starving
+    # child completion/cleanup while the dashboard has no next request to send.
+    $readTask = $protocolReader.ReadLineAsync()
     while ($accepting) {
         Complete-ExitedChildren
         Remove-ExpiredDrafts
@@ -1724,6 +1813,7 @@ try {
             switch ([string]$request.operation) {
                 'describe' { Invoke-Describe $request }
                 'profile' { Invoke-Profile $request }
+                'profile-current' { Invoke-ProfileCurrent $request }
                 'preview-narrowing' { Invoke-PreviewNarrowing $request }
                 'apply-narrowing' { Invoke-ApplyNarrowing $request }
                 'set-kill-switch' { Invoke-SetKillSwitch $request }
@@ -1746,26 +1836,42 @@ try {
             $code = if ($message -match '^\[([a-z-]+)\]') { $Matches[1] } else { 'launch-failed' }
             Write-Rejection $requestId $code $message
             $failedDraftId = [string](Get-OptionalMember $request 'dispatchDraftId')
-            if ($failedDraftId -and $drafts.ContainsKey($failedDraftId)) {
+            $draftStillOwned = @($children.Values | Where-Object { $_.DraftId -ceq $failedDraftId }).Count -gt 0
+            if ($failedDraftId -and $drafts.ContainsKey($failedDraftId) -and -not $draftStillOwned) {
                 $failedDraft = $drafts[$failedDraftId]
                 Remove-DraftResidue $failedDraft
                 $drafts.Remove($failedDraftId)
             }
         }
         if ($accepting) {
-            $readTask = [Console]::In.ReadLineAsync()
+            $readTask = $protocolReader.ReadLineAsync()
         }
     }
 }
 finally {
+    $protocolReader.Dispose()
+    $terminationFailed = $false
     foreach ($id in @($children.Keys)) {
         $entry = $children[$id]
-        Stop-AgentProcessContainment $entry.Containment $entry.Child.Process
+        $terminated = if ($entry.Containment) {
+            Stop-AgentProcessContainment $entry.Containment $entry.Child.Process
+        }
+        else { Stop-ProcessTree $entry.Child.Process; $entry.Child.Process.WaitForExit(5000) }
+        if (-not $terminated) {
+            $terminationFailed = $true
+            Close-AgentProcessContainment $entry.Containment
+            $entry.Pipe.Dispose()
+            continue
+        }
         [void](Complete-AgentRedirectedProcess $entry.Child)
         Close-AgentProcessContainment $entry.Containment
         $entry.Pipe.Dispose()
+        $children.Remove($id)
     }
-    foreach ($draft in @($drafts.Values)) {
-        Remove-DraftResidue $draft
+    foreach ($draftId in @($drafts.Keys)) {
+        if (@($children.Values | Where-Object { $_.DraftId -ceq $draftId }).Count -eq 0) {
+            Remove-DraftResidue $drafts[$draftId]
+        }
     }
+    if ($terminationFailed) { throw '[termination-failed] Broker shutdown could not confirm contained process exit; runtime state was retained.' }
 }

@@ -102,6 +102,16 @@ jobs:
         shell: pwsh
         run: npm test
 
+      - name: Verify real Windows manual startup and protocol cleanup
+        shell: pwsh
+        run: |
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+          Import-Module Pester -RequiredVersion 5.7.1 -Force
+          $result = Invoke-Pester -Path ..\..\tests\DispatchStartup.Tests.ps1 -Output Detailed -PassThru
+          if ($result.FailedCount -gt 0 -or $result.SkippedCount -gt 0) {
+            throw "Startup integration failures/skips: $($result.FailedCount)/$($result.SkippedCount)"
+          }
+
       - name: Run native renderer smoke test
         shell: pwsh
         run: npm run test:renderer

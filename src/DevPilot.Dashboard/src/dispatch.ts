@@ -2,8 +2,10 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { AGENTS, parseRepositoryIdentity, type AgentRole, type RepositoryIdentityV1 } from "./domain.js";
+import type { LocalProcessStream } from "./process-observer.js";
 
 export const DISPATCH_PROTOCOL_MAX_BYTES = 65_536;
+const LOCAL_OBSERVATION_ID = "00000000-0000-0000-0000-000000000000";
 
 export interface BrokerLaunchDescriptor {
   executablePath: string;
@@ -118,6 +120,27 @@ export interface CapabilityProfile {
   killSwitchActive: boolean;
   killSwitchExpiresAtUtc: string | null;
   editingAvailable: boolean;
+}
+
+export type ResolvedManualTarget = Pick<CapabilityProfile, "repositoryIdentity" | "prSnapshot" | "role">;
+
+export function isPullRequestId(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= 2_147_483_647;
+}
+
+export function assertManualTarget(
+  response: ResolvedManualTarget,
+  pullRequestId: number,
+  role: AgentRole,
+  repositoryKey?: string,
+): void {
+  if (response.role !== role) throw new Error("broker response role does not match the requested role");
+  if (response.prSnapshot.pullRequestId !== pullRequestId) {
+    throw new Error("broker response PR ID does not match the requested PR ID");
+  }
+  if (repositoryKey !== undefined && response.repositoryIdentity.key !== repositoryKey) {
+    throw new Error("broker response repository key does not match the requested repository key");
+  }
 }
 
 // PR3: the {capabilities, mandatoryDenies, provenance} triple describing one resolved effective
@@ -314,6 +337,7 @@ type BrokerResponse =
   | DispatchAccepted
   | DispatchRejected
   | DispatchTerminal
+  | { schemaVersion: 1; requestId: string; operation: "local-observation"; streams: LocalProcessStream[] }
   | { schemaVersion: 1; requestId: string; operation: "shutdown-complete" };
 
 interface PendingRequest {
@@ -335,11 +359,13 @@ export interface DispatchClientOptions {
   onTerminal?: (event: DispatchTerminal) => void;
   onBrokerFailure?: (message: string) => void;
   onAcceptedEventPath?: (path: string) => void;
+  onLocalStreams?: (streams: LocalProcessStream[]) => void;
 }
 
 export interface DispatchBroker {
   describe(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilitySummary>;
   profile(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilityProfile>;
+  profileCurrent(pullRequestId: number, role: AgentRole): Promise<CapabilityProfile>;
   // PR3 narrow-only edit protocol. previewNarrowing never mutates anything; applyNarrowing takes
   // the full CapabilityNarrowingPreview it was just given (mirroring dispatch(summary, ...) taking
   // the full CapabilitySummary) so the client never has to separately track the binding fields the
@@ -429,7 +455,7 @@ function prSnapshotField(record: Record<string, unknown>, name: string): PullReq
   const raw = value as Record<string, unknown>;
   if (raw.schemaVersion !== 1) throw new Error(`broker response ${name}.schemaVersion is invalid`);
   const pullRequestId = raw.pullRequestId;
-  if (typeof pullRequestId !== "number" || !Number.isSafeInteger(pullRequestId) || pullRequestId <= 0) {
+  if (!isPullRequestId(pullRequestId)) {
     throw new Error(`broker response ${name}.pullRequestId is invalid`);
   }
   if (typeof raw.active !== "boolean" || typeof raw.draft !== "boolean") {
@@ -792,9 +818,30 @@ function parseResponse(line: string): BrokerResponse {
       "completed",
       "cancelled",
       "shutdown-complete",
+      "local-observation",
     ].includes(operation)
   ) {
     throw new Error("unknown broker response operation");
+  }
+  if (operation === "local-observation") {
+    if (requestId !== LOCAL_OBSERVATION_ID || !Array.isArray(record.streams) || record.streams.length > 2) {
+      throw new Error("invalid local observation envelope");
+    }
+    const streams = record.streams.map((value): LocalProcessStream => {
+      const stream = asRecord(value);
+      const eventLogPath = stringField(stream, "eventLogPath");
+      const processId = stream.processId;
+      if (!isAbsolute(eventLogPath) || /[\u0000-\u001f\u007f]/.test(eventLogPath) ||
+          typeof processId !== "number" || !Number.isSafeInteger(processId) ||
+          processId <= 0 || processId > 2_147_483_647) throw new Error("invalid local observation stream");
+      return { eventLogPath, processId, role: roleField(stream, "role") };
+    });
+    if (new Set(streams.map((stream) => stream.role)).size !== streams.length ||
+        new Set(streams.map((stream) => process.platform === "win32"
+          ? stream.eventLogPath.toLowerCase() : stream.eventLogPath)).size !== streams.length) {
+      throw new Error("duplicate local observation stream");
+    }
+    return { schemaVersion: 1, requestId, operation, streams };
   }
   if (operation === "capability-summary" || operation === "capability-profile") {
     // Computed once so it can also be threaded into parseCapabilityProfileFields's role-aware
@@ -982,6 +1029,7 @@ export class DispatchClient implements DispatchBroker {
   }
 
   describe(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilitySummary> {
+    if (!isPullRequestId(pullRequestId)) return Promise.reject(new Error("invalid PR ID"));
     return this.request<CapabilitySummary>({
       schemaVersion: 1,
       operation: "describe",
@@ -989,16 +1037,13 @@ export class DispatchClient implements DispatchBroker {
       pullRequestId,
       role,
     }, "capability-summary").then((response) => {
-      // The broker's role is authoritative (issue #105) and is never client-stamped/overwritten;
-      // a response for a different role than what was requested is rejected rather than trusted.
-      if (response.role !== role) {
-        throw new Error("broker capability-summary role does not match the requested role");
-      }
+      assertManualTarget(response, pullRequestId, role, repositoryKey);
       return response;
     });
   }
 
   profile(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilityProfile> {
+    if (!isPullRequestId(pullRequestId)) return Promise.reject(new Error("invalid PR ID"));
     return this.request<CapabilityProfile>({
       schemaVersion: 1,
       operation: "profile",
@@ -1006,9 +1051,20 @@ export class DispatchClient implements DispatchBroker {
       pullRequestId,
       role,
     }, "capability-profile").then((response) => {
-      if (response.role !== role) {
-        throw new Error("broker capability-profile role does not match the requested role");
-      }
+      assertManualTarget(response, pullRequestId, role, repositoryKey);
+      return response;
+    });
+  }
+
+  profileCurrent(pullRequestId: number, role: AgentRole): Promise<CapabilityProfile> {
+    if (!isPullRequestId(pullRequestId)) return Promise.reject(new Error("invalid PR ID"));
+    return this.request<CapabilityProfile>({
+      schemaVersion: 1,
+      operation: "profile-current",
+      pullRequestId,
+      role,
+    }, "capability-profile").then((response) => {
+      assertManualTarget(response, pullRequestId, role);
       return response;
     });
   }
@@ -1290,6 +1346,10 @@ export class DispatchClient implements DispatchBroker {
       response = parseResponse(line);
     } catch {
       this.fail("broker emitted an invalid protocol frame");
+      return;
+    }
+    if (response.operation === "local-observation") {
+      this.options.onLocalStreams?.(response.streams);
       return;
     }
     const pending = this.pending.get(response.requestId);

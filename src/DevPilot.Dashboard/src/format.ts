@@ -28,6 +28,7 @@ export function statusColor(status: InstanceStatus): string {
     case "running":
       return "#61d6a7";
     case "stale":
+    case "exited":
       return "#d9a15f";
     case "waiting":
       return "#77bdfb";
