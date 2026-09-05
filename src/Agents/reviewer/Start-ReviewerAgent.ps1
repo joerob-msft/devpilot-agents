@@ -273,6 +273,14 @@ if ($ForceAnalysis -and $PullRequestId -le 0) {
 if ($ForceAnalysis -and $EnableApprovalVote) {
     throw 'Manual forced Reviewer analysis cannot enable approval voting.'
 }
+# issue #105 PR4 requirement 7: -EnableApprovalVote is delegable ONLY through a broker-minted,
+# sealed widening grant -- Enter-AgentManualDispatchStartup independently re-verifies that grant
+# under the capability-override lock before ever honoring it. A direct/headless invocation (no
+# -ManualDispatchManifest) has no grant to verify against and must never be able to request the
+# vote capability at all; a generic local profile is never sufficient.
+if ($EnableApprovalVote -and -not $ManualDispatchManifest) {
+    throw '-EnableApprovalVote requires a sealed manual dispatch grant (-ManualDispatchManifest); it cannot be requested directly.'
+}
 
 
 # One top-level try/catch so ANY uncaught error surfaces as a nonzero exit,
@@ -302,6 +310,13 @@ if (-not $importedHarness) {
         "or run this script from a checkout of the devpilot-agents repository.")
 }
 $HarnessPath = $importedHarness.Path
+
+# issue #105 PR4 CRITICAL-2 hardening: as early as possible (immediately once the harness module
+# is available, before any config/provider/network setup below) reject the ordinary accidental/
+# headless case -- a manual-dispatch manifest path that does not exist, or one with no
+# accompanying broker attestation handle. The deep cryptographic verification happens later, in
+# Enter-AgentManualDispatchStartup, immediately before the ready/proceed handshake.
+Assert-AgentManualDispatchEarlyContext -ManifestPath $ManualDispatchManifest
 
 $ResultMarkerPrefix = "REVIEWER_RESULT_V3:"
 $script:ReviewerLegacyResultMarkerPrefix = "REVIEWER_RESULT_V1:"
@@ -2198,7 +2213,7 @@ if ($ManualDispatchManifest) {
     }
     $dispatchLogPrefix = "$dispatchId-"
     $dispatchMetadata = [ordered]@{
-        schemaVersion = 1; dispatchId = $dispatchId; ownership = 'tui'; forceAnalysis = $true
+        schemaVersion = 1; dispatchId = $dispatchId; ownership = 'tui'; forceAnalysis = [bool]$ForceAnalysis
     }
 }
 $script:ReviewerOutputContext = New-AgentOutputContext -Agent reviewer -OutputMode $OutputMode `
@@ -6552,7 +6567,8 @@ try {
         }
         if ($ManualDispatchManifest) {
             [void](Enter-AgentManualDispatchStartup -ManifestPath $ManualDispatchManifest `
-                -RepositoryIdentity $repositoryIdentity -DurableContext $script:ReviewerDurableContext `
+                -RepositoryIdentity $repositoryIdentity -RepositoryRoot ([IO.Path]::GetFullPath($RepoPath)) `
+                -DurableContext $script:ReviewerDurableContext `
                 -LeaseRoot $LeaseRoot -Role reviewer -EventLogPath $script:ReviewerOutputContext.LogPath `
                 -BoundCapabilities @{
                     EnableFindingComments = [bool]$EnableFindingComments

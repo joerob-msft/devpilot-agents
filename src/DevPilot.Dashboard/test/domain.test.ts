@@ -100,3 +100,27 @@ test("schema v3 requires verified canonical identity and preserves opaque GitHub
     repositoryIdentity: { ...event.repositoryIdentity, key: "v1:github:rounded" },
   }), /key/);
 });
+
+test("issue #105 PR4: dispatch.forceAnalysis parses both true and false and rejects non-booleans", () => {
+  const dispatchId = "11111111-1111-4111-8111-111111111111";
+  const forced = parseAgentEvent({
+    ...validEvent(),
+    dispatch: { schemaVersion: 1, dispatchId, ownership: "tui", forceAnalysis: true },
+  });
+  assert.equal(forced.dispatch?.forceAnalysis, true);
+
+  const unforced = parseAgentEvent({
+    ...validEvent(),
+    dispatch: { schemaVersion: 1, dispatchId, ownership: "tui", forceAnalysis: false },
+  });
+  assert.equal(unforced.dispatch?.forceAnalysis, false);
+
+  assert.throws(() => parseAgentEvent({
+    ...validEvent(),
+    dispatch: { schemaVersion: 1, dispatchId, ownership: "tui", forceAnalysis: "true" },
+  }), /dispatch metadata/);
+  assert.throws(() => parseAgentEvent({
+    ...validEvent(),
+    dispatch: { schemaVersion: 1, dispatchId, ownership: "tui" },
+  }), /dispatch metadata/);
+});

@@ -813,7 +813,7 @@ function Resolve-AgentTrustedRoot {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][ValidateSet('durable-state', 'lease', 'watch-state')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('durable-state', 'lease', 'watch-state', 'capability-overrides')][string]$Kind,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [string[]]$DisallowedRoots = @(),
         [switch]$Create
@@ -899,7 +899,7 @@ function Get-AgentExecutionKey {
 function Enter-AgentExclusiveFile {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][ValidateSet('lease-contended', 'state-contended')][string]$ContentionReason,
+        [Parameter(Mandatory)][ValidateSet('lease-contended', 'state-contended', 'capability-override-contended')][string]$ContentionReason,
         [ValidateRange(0, 30000)][int]$TimeoutMilliseconds = 2000,
         [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None,
         [hashtable]$Metadata = @{}
@@ -1050,11 +1050,2109 @@ function Invoke-AgentWithWorkAuthority {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Outside-repository capability-override store (PR2): hardened root, stable
+# reads, narrow-only schema validation, effective-settings resolution, and
+# the advisory lock shared with child-startup re-verification. No writer
+# exists yet anywhere in this change -- TUI edit/reset/kill switch is PR3,
+# checked-in delegation policy and ephemeral widening are PR4. Everything
+# below is read/resolve-only and can only ever narrow an already-open
+# capability to a mandatory deny, never grant one.
+#
+# Root convention: this follows the exact same per-user %LOCALAPPDATA% (Windows) /
+# ${XDG_STATE_HOME:-$HOME/.local/state} (POSIX) convention this module already uses for the
+# durable-state/lease/watch-state roots -- a per-machine, per-LOCAL-USER install location, not a
+# roaming or shared one. The logical 'machine' scope name below means "this machine, for this
+# local user's DevPilot installation" -- i.e. the broadest baseline this one user's agents see on
+# this one box -- and is deliberately NOT an administrator-owned, multi-user machine-wide policy
+# store: it is written and read entirely with the invoking user's own privileges, same as every
+# other root this module resolves. This matches the approved architecture; do not rehome it under
+# ProgramData (Windows) or /etc (POSIX) or otherwise widen it to a multi-user/elevated location.
+# ---------------------------------------------------------------------------
+
+function Get-AgentDefaultCapabilityOverrideRoot {
+    if ($IsWindows) {
+        if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is required to resolve the capability-override root on Windows.' }
+        return (Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA 'DevPilot') 'capability-overrides') 'v1')
+    }
+    $base = if ($env:XDG_STATE_HOME) { $env:XDG_STATE_HOME } else { Join-Path (Join-Path $HOME '.local') 'state' }
+    return (Join-Path (Join-Path (Join-Path $base 'devpilot') 'capability-overrides') 'v1')
+}
+
+function Get-AgentCapabilityOverrideRoot {
+    <#
+        Resolves and hardens the capability-override root. Deliberately takes no root/path
+        parameter from any caller -- unlike durable-state/lease/watch-state, this root is never
+        forwarded through a broker descriptor or CLI argument; every consumer computes it the same
+        way, from the same environment convention, so nothing external can redirect where overrides
+        are read from. Disjoint by construction from every other default root this module resolves.
+        Re-validated (ACL/symlink/ownership) on every call rather than cached, matching this
+        function's own "resolve internally, never trust a forwarded value" contract; call frequency
+        here is human-interaction-scale (profile/describe/dispatch/startup), not a hot loop.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    $default = Get-AgentDefaultCapabilityOverrideRoot
+    $siblings = @((Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot))
+    return Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
+        -DisallowedRoots $siblings -Create
+}
+
+function ConvertTo-AgentCanonicalEpochSeconds {
+    param([Parameter(Mandatory)][DateTime]$Value)
+    $utc = if ($Value.Kind -eq [DateTimeKind]::Utc) { $Value } else { $Value.ToUniversalTime() }
+    return [long][Math]::Floor(($utc - [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds)
+}
+
+function Get-AgentWorktreeIdentity {
+    <#
+        Stable identity for one repository worktree: the SHA-256 of its canonical, case-normalized
+        (Windows only) absolute path. Two worktrees of the identical repository checked out at
+        different filesystem paths (e.g. two `git worktree add` checkouts) always resolve to
+        different ids; the same worktree path always resolves to the same id.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    if ([string]::IsNullOrWhiteSpace($RepositoryRoot) -or -not [IO.Path]::IsPathFullyQualified($RepositoryRoot)) {
+        throw 'RepositoryRoot must be a non-empty absolute path.'
+    }
+    $full = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $normalized = if ($IsWindows) { $full.ToLowerInvariant() } else { $full }
+    return Get-AgentSha256 -Text $normalized
+}
+
+function Read-AgentStableFile {
+    <#
+        Stat-before/read-once/stat-after stable read: retries while a concurrent writer appears to
+        be racing this read (size/mtime disagree before vs. after, or existence itself flips), and
+        fails closed rather than ever returning a possibly-torn read. The returned Bytes are the
+        exact bytes the fingerprint was computed from -- callers that need to parse content
+        (ConvertFrom-AgentTrustedCapabilityJson) never perform a second, separate read.
+
+        MaxBytes is enforced BEFORE any read buffer is allocated: the file is opened once and its
+        length is inspected from that open FileStream first, and an oversized file is rejected
+        immediately -- this function never performs the ReadAllBytes-equivalent of allocating a
+        buffer sized from an unchecked length. The bounded buffer is then filled from that SAME
+        single FileStream (never a second, separate open); a short read (fewer bytes delivered than
+        the checked length -- truncation mid-read) or the stream's length disagreeing with what was
+        checked immediately before the read (growth mid-read) both fail this attempt as unstable and
+        retry, exactly like the pre-existing before/after metadata race check below. A path that
+        exists but is not a regular file (a directory, or any other non-file object) is never
+        silently treated as "absent" -- Test-Path's plain existence check is evaluated first, and
+        only THEN is its type checked; an existing non-file object always fails closed instead of
+        being masked as a missing/un-narrowed override.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateRange(1, 5)][int]$MaxAttempts = 3,
+        [ValidateRange(1, 1048576)][int]$MaxBytes = 65536
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return [ordered]@{ Path = $Path; Exists = $false; Size = 0; MTime = 0; Sha256 = $null; Bytes = [byte[]]@() }
+        }
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            throw '[stable-read-invalid] An existing non-file object occupies the path.'
+        }
+        $before = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if (-not $before) {
+            # Test-Path just confirmed a leaf existed at this path; a failure here means it raced a
+            # concurrent delete between the two calls. Retry like any other stat instability rather
+            # than falling back to "does not exist".
+            continue
+        }
+        $bytes = $null
+        $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try {
+            $length = $stream.Length
+            if ($length -gt $MaxBytes) {
+                throw "[stable-read-too-large] File exceeds the maximum allowed size of $MaxBytes bytes."
+            }
+            $buffer = [byte[]]::new([int]$length)
+            $offset = 0
+            $truncated = $false
+            while ($offset -lt $buffer.Length) {
+                $read = $stream.Read($buffer, $offset, $buffer.Length - $offset)
+                if ($read -le 0) { $truncated = $true; break }
+                $offset += $read
+            }
+            if (-not $truncated -and $stream.Length -eq $length) { $bytes = $buffer }
+        }
+        finally { $stream.Dispose() }
+        if (-not $bytes) {
+            # Truncated mid-read or grew past the length we bounded the buffer to -- a concurrent
+            # writer raced this read. Retry.
+            continue
+        }
+        $after = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($after -and $before.Length -eq $after.Length -and $before.LastWriteTimeUtc -eq $after.LastWriteTimeUtc -and
+            $bytes.Length -eq $before.Length) {
+            return [ordered]@{
+                Path = $Path; Exists = $true; Size = $bytes.Length
+                MTime = (ConvertTo-AgentCanonicalEpochSeconds $after.LastWriteTimeUtc)
+                Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+                Bytes = $bytes
+            }
+        }
+        # Stat-before and stat-after (or existence itself) disagree -- a concurrent writer raced
+        # this read. Retry.
+    }
+    throw '[stable-read-unstable] File changed while being read.'
+}
+
+function Test-AgentSecretShapedText {
+    <#
+        Conservative, intentionally narrow "does this look like a credential rather than a
+        capability name" heuristic. Defense in depth only, layered on top of this store's own
+        structural rules (fixed capability-name shape, enum-only settings values, fixed hex identity
+        formats), in case a future change loosens any of those. False negatives are expected and
+        acceptable here precisely because the structural checks alongside it are the primary
+        defense.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    if ($Text.Length -ge 32 -and $Text -cmatch '^[0-9a-fA-F]{32,}$') { return $true }
+    if ($Text.Length -ge 24 -and $Text -cmatch '^[A-Za-z0-9+/]{24,}={0,2}$') { return $true }
+    if ($Text -cmatch '^(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}$') { return $true }
+    if ($Text -cmatch '^(?:sk|pk|rk)_[A-Za-z0-9]{16,}$') { return $true }
+    if ($Text -cmatch '^AKIA[A-Z0-9]{16}$') { return $true }
+    if ($Text -cmatch '^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$') { return $true }
+    if ($Text -cmatch '-----BEGIN [A-Z ]*PRIVATE KEY-----') { return $true }
+    return $false
+}
+
+function Get-AgentRedactedFieldReference {
+    <#
+        Renders an untrusted JSON property/capability name as a bounded, non-reversible reference
+        safe to interpolate into an exception message: a short SHA-256 prefix of the raw value plus
+        its 1-based ordinal position among the sibling keys/entries being validated. Every capability-
+        override parsing error that would otherwise echo a raw, potentially secret-shaped or
+        otherwise sensitive property name (duplicate/case-collision keys, malformed/unrecognized
+        capability names, unknown top-level fields) must use this instead of the raw text --
+        Test-AgentSecretShapedText exists specifically to catch credential-looking values, and
+        putting the very value it flagged into the message that reports it would defeat the purpose
+        of flagging it. An engineer holding the original candidate value can still confirm a match by
+        hashing it the same way; the raw value itself never appears in logs, IcM, or protocol
+        responses.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)][int]$Position)
+    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Text))).ToLowerInvariant()
+    return "sha256:$($hash.Substring(0, 12))@$Position"
+}
+
+function Assert-AgentCapabilityJsonRawShape {
+    <#
+        Recursively walks the RAW JSON via System.Text.Json.JsonDocument -- BEFORE any
+        ConvertFrom-Json/hashtable conversion -- to catch duplicate and case-collision object keys
+        that ConvertFrom-Json's own last-value-wins folding would otherwise silently hide. Also
+        enforces hard bounds on nesting depth, total element count, and string length so a
+        pathological file cannot exhaust memory/CPU before schema validation even begins. Iterative
+        (explicit stack), not recursive, so a pathological depth fails via the bound check rather
+        than risking a real stack overflow.
+
+        ErrorCode (issue #105 PR4) lets a non-capability-override caller (Get-AgentDelegationPolicy)
+        get an error code that actually names ITS artifact rather than a hardcoded
+        "capability-settings-invalid" that would misdescribe a raw-shape violation in
+        delegation.policy.v1.json. Defaults to the original literal so every existing call site's
+        error text/tests are unaffected.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [ValidateRange(1, 64)][int]$MaxDepth = 6,
+        [ValidateRange(1, 4096)][int]$MaxElements = 512,
+        [ValidateRange(1, 65536)][int]$MaxStringLength = 4096,
+        [string]$ErrorCode = 'capability-settings-invalid'
+    )
+    $document = [Text.Json.JsonDocument]::Parse([ReadOnlyMemory[byte]]$Bytes)
+    try {
+        $elementCount = 0
+        $stack = [Collections.Generic.Stack[object]]::new()
+        $stack.Push(@{ Node = $document.RootElement; Depth = 0 })
+        while ($stack.Count -gt 0) {
+            $frame = $stack.Pop()
+            $node = $frame.Node
+            $depth = $frame.Depth
+            if ($depth -gt $MaxDepth) { throw "[$ErrorCode] JSON exceeds the maximum nesting depth." }
+            $elementCount++
+            if ($elementCount -gt $MaxElements) { throw "[$ErrorCode] JSON exceeds the maximum element count." }
+            switch ($node.ValueKind) {
+                ([Text.Json.JsonValueKind]::Object) {
+                    $seenExact = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                    $seenFold = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    $propertyIndex = 0
+                    foreach ($property in $node.EnumerateObject()) {
+                        $propertyIndex++
+                        if ($property.Name.Length -gt $MaxStringLength) {
+                            throw "[$ErrorCode] JSON property name exceeds the maximum length."
+                        }
+                        if (-not $seenExact.Add($property.Name)) {
+                            $ref = Get-AgentRedactedFieldReference -Text $property.Name -Position $propertyIndex
+                            throw "[$ErrorCode] Duplicate property ($ref) in JSON."
+                        }
+                        if (-not $seenFold.Add($property.Name)) {
+                            $ref = Get-AgentRedactedFieldReference -Text $property.Name -Position $propertyIndex
+                            throw "[$ErrorCode] Property ($ref) collides case-insensitively with a sibling."
+                        }
+                        $stack.Push(@{ Node = $property.Value; Depth = ($depth + 1) })
+                    }
+                }
+                ([Text.Json.JsonValueKind]::Array) {
+                    foreach ($item in $node.EnumerateArray()) { $stack.Push(@{ Node = $item; Depth = ($depth + 1) }) }
+                }
+                ([Text.Json.JsonValueKind]::String) {
+                    if ($node.GetString().Length -gt $MaxStringLength) {
+                        throw "[$ErrorCode] JSON string value exceeds the maximum length."
+                    }
+                }
+                default {}
+            }
+        }
+    }
+    finally { $document.Dispose() }
+}
+
+function ConvertFrom-AgentTrustedCapabilityJson {
+    <#
+        Parses and validates one capability-override settings record from already-read bytes
+        (Read-AgentStableFile) -- performs no file I/O of its own, so the single stable read is
+        authoritative for both fingerprint and content. Any schema, shape, or binding violation
+        rejects the ENTIRE record, not just the offending field, and fails closed.
+
+        AllowedCapabilities must be the union of every known role's allowedManualCapabilities, not
+        only the resolving caller's role: the physical file layout has no role segment (one file
+        serves every role for a given scope), so a key relevant only to another role must still
+        validate here. A role's delegableDefaultOff/absoluteDenies names are deliberately excluded
+        from that union by the caller, so they always fail as unrecognized -- persisted settings may
+        only narrow a capability that is already part of some role's open ceiling, never name one
+        that was never open to begin with.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes,
+        [Parameter(Mandatory)][ValidateSet('machine', 'user', 'repo-worktree', 'pr')][string]$SourceScope,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$AllowedCapabilities
+    )
+    if ($Bytes.Length -eq 0) { throw "[capability-settings-invalid] ($SourceScope) Empty capability settings content." }
+    if ($Bytes.Length -gt 65536) { throw "[capability-settings-invalid] ($SourceScope) Capability settings content exceeds the byte limit." }
+    Assert-AgentCapabilityJsonRawShape -Bytes $Bytes
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $record = $strictUtf8.GetString($Bytes) | ConvertFrom-Json -AsHashtable -Depth 8 -ErrorAction Stop
+    if ($record -isnot [Collections.IDictionary]) { throw "[capability-settings-invalid] ($SourceScope) Record is not a JSON object." }
+
+    $scopedFields = @{
+        machine         = @{ Required = @(); Forbidden = @('repositoryKey', 'worktreeId', 'pullRequestId', 'sourceCommit', 'expiresAtUtc') }
+        user            = @{ Required = @(); Forbidden = @('repositoryKey', 'worktreeId', 'pullRequestId', 'sourceCommit', 'expiresAtUtc') }
+        'repo-worktree' = @{ Required = @('repositoryKey', 'worktreeId'); Forbidden = @('pullRequestId', 'sourceCommit', 'expiresAtUtc') }
+        pr              = @{ Required = @('repositoryKey', 'worktreeId', 'pullRequestId', 'sourceCommit', 'expiresAtUtc'); Forbidden = @() }
+    }
+    $rules = $scopedFields[$SourceScope]
+    $baseRequired = @('schemaVersion', 'settings')
+    foreach ($name in ($baseRequired + $rules.Required)) {
+        if (-not $record.Contains($name)) { throw "[capability-settings-invalid] ($SourceScope) Missing required field '$name'." }
+    }
+    foreach ($name in $rules.Forbidden) {
+        if ($record.Contains($name)) { throw "[capability-settings-invalid] ($SourceScope) Field '$name' is forbidden for this scope." }
+    }
+    $knownFields = [Collections.Generic.HashSet[string]]::new(
+        [string[]]($baseRequired + @('repositoryKey', 'worktreeId', 'pullRequestId', 'sourceCommit', 'expiresAtUtc')),
+        [StringComparer]::Ordinal)
+    $topLevelIndex = 0
+    foreach ($name in @($record.Keys)) {
+        $topLevelIndex++
+        if (-not $knownFields.Contains($name)) {
+            $ref = Get-AgentRedactedFieldReference -Text $name -Position $topLevelIndex
+            throw "[capability-settings-invalid] ($SourceScope) Unknown top-level field ($ref)."
+        }
+    }
+    # ConvertFrom-Json -AsHashtable returns JSON integers as [int64] (not [int]) on this PowerShell
+    # version, so every integer field below accepts both CLR widths and compares by value.
+    if (($record.schemaVersion -isnot [int] -and $record.schemaVersion -isnot [long]) -or [int64]$record.schemaVersion -ne 1) {
+        throw "[capability-settings-invalid] ($SourceScope) Unsupported schemaVersion."
+    }
+    if ($record.settings -isnot [Collections.IDictionary]) {
+        throw "[capability-settings-invalid] ($SourceScope) 'settings' must be a JSON object."
+    }
+    $allowedSet = [Collections.Generic.HashSet[string]]::new([string[]]$AllowedCapabilities, [StringComparer]::Ordinal)
+    $settings = [ordered]@{}
+    $settingIndex = 0
+    foreach ($name in @($record.settings.Keys)) {
+        $settingIndex++
+        if ($name.Length -eq 0 -or $name.Length -gt 256 -or $name -cnotmatch '^[A-Za-z][A-Za-z0-9]*$') {
+            throw "[capability-settings-invalid] ($SourceScope) Malformed capability name ($(Get-AgentRedactedFieldReference -Text $name -Position $settingIndex))."
+        }
+        if (Test-AgentSecretShapedText -Text $name) {
+            throw "[capability-settings-invalid] ($SourceScope) Capability name ($(Get-AgentRedactedFieldReference -Text $name -Position $settingIndex)) looks secret-shaped."
+        }
+        if (-not $allowedSet.Contains($name)) {
+            throw "[capability-settings-invalid] ($SourceScope) Capability ($(Get-AgentRedactedFieldReference -Text $name -Position $settingIndex)) is not a recognized manually-selectable capability."
+        }
+        $value = $record.settings[$name]
+        if ($value -isnot [string] -or $value -cnotin @('inherit', 'off')) {
+            throw "[capability-settings-invalid] ($SourceScope) Capability '$name' has an unsupported value; only 'inherit'/'off' may be persisted."
+        }
+        $settings[$name] = $value
+    }
+
+    $result = [ordered]@{ SchemaVersion = 1; SourceScope = $SourceScope; Settings = $settings }
+    if ($record.Contains('repositoryKey')) {
+        $key = [string]$record.repositoryKey
+        if ($key -notmatch '^v1:(azuredevops|github):[^:]+$') { throw "[capability-settings-invalid] ($SourceScope) repositoryKey is malformed." }
+        $result.RepositoryKey = $key
+    }
+    if ($record.Contains('worktreeId')) {
+        $worktreeId = [string]$record.worktreeId
+        if ($worktreeId -cnotmatch '^[0-9a-f]{64}$') { throw "[capability-settings-invalid] ($SourceScope) worktreeId is malformed." }
+        $result.WorktreeId = $worktreeId
+    }
+    if ($record.Contains('pullRequestId')) {
+        if (($record.pullRequestId -isnot [int] -and $record.pullRequestId -isnot [long]) -or [int64]$record.pullRequestId -le 0) {
+            throw "[capability-settings-invalid] ($SourceScope) pullRequestId is malformed."
+        }
+        $result.PullRequestId = [int]$record.pullRequestId
+    }
+    if ($record.Contains('sourceCommit')) {
+        $sourceCommit = [string]$record.sourceCommit
+        if ($sourceCommit -cnotmatch '^[0-9a-f]{40}$') { throw "[capability-settings-invalid] ($SourceScope) sourceCommit must be a full 40-hex SHA." }
+        $result.SourceCommit = $sourceCommit
+    }
+    if ($record.Contains('expiresAtUtc')) {
+        if ($record.expiresAtUtc -isnot [int] -and $record.expiresAtUtc -isnot [long]) {
+            throw "[capability-settings-invalid] ($SourceScope) expiresAtUtc must be an integer epoch-seconds value."
+        }
+        $result.ExpiresAtUtc = [long]$record.expiresAtUtc
+    }
+    return $result
+}
+
+function Resolve-AgentEffectiveCapabilitySettings {
+    <#
+        Resolves the effective, outside-repository capability-override narrowing for one
+        repository worktree + pull request, across all four logical scopes (machine, user,
+        repo-worktree, pr) under the single hardened capability-overrides root. Persisted settings
+        can only ever narrow an already-open capability to 'off' -- never grant one -- so scopes are
+        applied broad-to-narrow and are purely additive/monotonic: once any scope turns a capability
+        off, no narrower scope can turn it back on, and provenance records the broadest (first) scope
+        that did so.
+
+        A single physical settings file is shared by every role that operates in that scope (the
+        layout has no role segment), so capability-name validation uses the union of every known
+        role's allowedManualCapabilities; callers that need a role-specific ceiling apply
+        Resolve-AgentCapabilityPolicyPartition afterward with their own role's descriptor.
+
+        PR-scope lookup is fully deterministic from PullRequestId + the current source commit's
+        first 12 hex characters -- no directory enumeration. The short SHA only selects which
+        candidate FILE to open; the full sourceCommit recorded inside that file's content is what is
+        actually checked for staleness, so a short-SHA collision can never silently authorize a
+        narrowing that belongs to a different commit.
+
+        Synchronous by design: every file this function reads is small (<=64KB) and local, bounded
+        by the same byte/depth/element/string limits Assert-AgentCapabilityJsonRawShape already
+        enforces -- the same order of local I/O this broker already performs synchronously elsewhere
+        (config/descriptor/durable-state reads). This broker has no RunspacePool/bounded-worker
+        infrastructure today (PR2 does not introduce one), so adding asynchronous plumbing solely for
+        this resolver would be new, untested async infrastructure rather than reuse of an existing,
+        bounded one; keeping this call synchronous preserves today's protocol responsiveness without
+        that risk.
+
+        Any schema, integrity, staleness, expiry, or path-safety failure on a file that DOES exist
+        fails the WHOLE resolution closed (throws) rather than silently discarding just that scope --
+        silently ignoring a corrupt/stale/expired narrowing record would make the effective policy
+        MORE permissive than the operator's last-known-good intent, which is the one direction this
+        feature must never move in unattended. A scope file that is simply absent is not an error:
+        an entirely empty store resolves to empty Settings/Provenance, identical to PR1's behavior.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$CurrentSourceCommit,
+        # PR3-only: previews a single hypothetical scope-file edit (never persisted) by overlaying
+        # it onto that ONE scope's parsed record before the normal broad-to-narrow fold runs --
+        # every other scope, and the fold logic itself, is completely unchanged. This guarantees a
+        # preview can never drift from the real resolver: it IS the real resolver, called with one
+        # extra input. $null (every existing PR1/PR2 caller) reproduces today's behavior exactly.
+        [AllowNull()][hashtable]$HypotheticalOverride
+    )
+    $killSwitchState = Get-AgentCapabilityOverrideKillSwitchState -RepositoryRoot $RepositoryRoot
+    if ($killSwitchState.Active) {
+        # Emergency operational lever (PR3): ignores every persisted override record and returns
+        # ceiling-only output, tagged distinctly (KillSwitchActive) so callers can render
+        # provenance as 'kill-switch' rather than silently indistinguishable from an empty store.
+        # Checked first, via a cheap Test-Path-backed check, before any scope-file parsing.
+        # KillSwitchExpiresAtUtc (PR3 completion) is the sentinel's own raw epoch-seconds TTL,
+        # surfaced so Get-BrokerCapabilityProfile/Invoke-Profile/Invoke-Describe can put it on the
+        # wire alongside KillSwitchActive.
+        return @{
+            Settings = [ordered]@{}; Provenance = [ordered]@{}; FileFingerprints = @()
+            KillSwitchActive = $true; KillSwitchExpiresAtUtc = $killSwitchState.ExpiresAtUtc
+        }
+    }
+    $root = Get-AgentCapabilityOverrideRoot -RepositoryRoot $RepositoryRoot
+    $allowedCapabilities = [Collections.Generic.List[string]]::new()
+    foreach ($knownRole in @('reviewer', 'review-handler')) {
+        foreach ($name in @((Get-AgentHarnessCapabilityDescriptor -Role $knownRole).allowedManualCapabilities)) {
+            if (-not $allowedCapabilities.Contains($name)) { [void]$allowedCapabilities.Add($name) }
+        }
+    }
+    $repositoryKey = Get-AgentRepositoryIdentityKey -RepositoryIdentity $RepositoryIdentity
+    $worktreeId = Get-AgentWorktreeIdentity -RepositoryRoot $RepositoryRoot
+    $repoRoot = Join-Path (Join-Path $root 'repo') (Get-AgentSha256 -Text $repositoryKey)
+    $candidates = [ordered]@{
+        machine         = @{ Path = (Join-Path $root 'machine.settings.v1.json'); RequireBinding = $false }
+        user            = @{ Path = (Join-Path $root 'user.settings.v1.json'); RequireBinding = $false }
+        'repo-worktree' = @{ Path = (Join-Path $repoRoot "$worktreeId.settings.v1.json"); RequireBinding = $true }
+        pr              = @{
+            Path = (Join-Path (Join-Path $repoRoot 'pr') "$PullRequestId-$($CurrentSourceCommit.Substring(0, 12)).settings.v1.json")
+            RequireBinding = $true
+        }
+    }
+    $settings = [ordered]@{}
+    $provenance = [ordered]@{}
+    $fingerprints = [Collections.Generic.List[hashtable]]::new()
+    foreach ($scope in @('machine', 'user', 'repo-worktree', 'pr')) {
+        $path = [IO.Path]::GetFullPath($candidates[$scope].Path)
+        if (-not (Test-AgentPathWithin -Path $path -Root $root)) {
+            throw "[capability-settings-invalid] ($scope) Resolved settings path escaped the capability-override root."
+        }
+        if (-not (Test-Path -LiteralPath $path)) {
+            [void]$fingerprints.Add([ordered]@{ Path = $path; Exists = $false; Size = 0; MTime = 0; Sha256 = $null })
+            # No file on disk for this scope. Ordinarily a no-op continue -- but when the caller is
+            # previewing a hypothetical edit AT this exact scope, an absent file behaves exactly
+            # like PR2's existing "empty store" contract: an empty settings record to overlay onto,
+            # not a reason to skip the scope entirely.
+            if (-not ($HypotheticalOverride -and [string]$HypotheticalOverride.Scope -ceq $scope)) { continue }
+            $record = [ordered]@{ Settings = [ordered]@{} }
+        }
+        else {
+            # An existing path that is NOT a regular file (a directory, or any other non-file object)
+            # must never be silently treated the same as "absent" -- that would mask an intended
+            # narrowing record as if the store were empty, which is a silent WIDENING of the effective
+            # ceiling. Assert-AgentTrustedFile itself rejects a non-file (PSIsContainer) below, so this
+            # is deliberately only a plain existence check, not -PathType Leaf.
+            try {
+                $path = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -Private
+                $stable = Read-AgentStableFile -Path $path -MaxBytes 65536
+            }
+            catch [Management.Automation.ItemNotFoundException] {
+                # Existed an instant ago (the Test-Path above) but vanished before validation/read could
+                # complete -- a race, not a genuine absence and not malformed/corrupt content. Surface
+                # the same distinct, explicitly-retryable signal Read-AgentStableFile itself raises for
+                # in-flight instability, so callers (Get-BrokerCapabilityProfile) can retry once under
+                # the capability-override lock instead of failing this closed as "invalid".
+                throw "[stable-read-unstable] ($scope) File vanished while being validated/read."
+            }
+            [void]$fingerprints.Add([ordered]@{ Path = $stable.Path; Exists = $stable.Exists; Size = $stable.Size; MTime = $stable.MTime; Sha256 = $stable.Sha256 })
+            $record = ConvertFrom-AgentTrustedCapabilityJson -Bytes $stable.Bytes -SourceScope $scope -AllowedCapabilities $allowedCapabilities
+            if ($candidates[$scope].RequireBinding -and
+                ([string]$record.RepositoryKey -cne $repositoryKey -or [string]$record.WorktreeId -cne $worktreeId)) {
+                throw "[capability-settings-invalid] ($scope) Record identity binding does not match the current repository/worktree."
+            }
+            if ($scope -eq 'pr') {
+                if ([int]$record.PullRequestId -ne $PullRequestId) {
+                    throw '[capability-settings-invalid] (pr) Record pullRequestId does not match the current pull request.'
+                }
+                if ([string]$record.SourceCommit -cne $CurrentSourceCommit) {
+                    throw '[capability-settings-stale] Persisted PR-scope override no longer matches the current source commit.'
+                }
+                if ([long]$record.ExpiresAtUtc -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
+                    throw '[capability-settings-expired] Persisted PR-scope override has expired.'
+                }
+            }
+        }
+        if ($HypotheticalOverride -and [string]$HypotheticalOverride.Scope -ceq $scope) {
+            $previewCapability = [string]$HypotheticalOverride.Capability
+            if ([string]$HypotheticalOverride.Action -ceq 'off') { $record.Settings[$previewCapability] = 'off' }
+            else { $record.Settings.Remove($previewCapability) }
+        }
+        foreach ($name in @($record.Settings.Keys)) {
+            if ([string]$record.Settings[$name] -cne 'off') { continue }
+            if (-not $settings.Contains($name)) {
+                $settings[$name] = 'off'
+                $provenance[$name] = $scope
+            }
+        }
+    }
+    return @{
+        Settings = $settings; Provenance = $provenance; FileFingerprints = @($fingerprints.ToArray())
+        KillSwitchActive = $false; KillSwitchExpiresAtUtc = $null
+    }
+}
+
+function Resolve-AgentCapabilityPolicyPartition {
+    <#
+        Pure set-math shared by every caller that needs to apply a persisted narrowing to a role's
+        capability ceiling (the broker's describe/profile builder and, at child startup, the
+        independent re-verification in Enter-AgentManualDispatchStartup): turn every capability the
+        operator persisted as 'off' from an active capability into a mandatory deny. Persisted
+        settings can only ever narrow this ceiling, never widen it -- a name that is not already an
+        active capability is a no-op here, and 'inherit' entries are already absent from
+        PersistedNarrowing by construction (Resolve-AgentEffectiveCapabilitySettings only ever
+        returns 'off' entries). Delegation/widening (checked-in delegation policy, ephemeral grants)
+        is out of scope for this change and intentionally not modeled here.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$RoleDescriptor,
+        [Parameter(Mandatory)][hashtable]$PersistedNarrowing,
+        # issue #105 PR4: the ONE ephemeral, draft-bound widening a valid grant may apply. Pure
+        # set-math only -- this function never decides whether a grant IS valid (that is
+        # Get-AgentDelegationPolicy/Test-AgentDelegationAllows plus the broker/child's own grant
+        # freshness checks); it only encodes the single mechanical invariant a valid grant is
+        # allowed to exploit: move EXACTLY the one capability named here from mandatoryDenies to
+        # capabilities. Fails closed (throws) rather than silently no-op-ing if the caller passes a
+        # capability that is not currently an active mandatory deny on THIS ceiling, or that is
+        # already an active capability -- both would mean the caller is trying to widen something
+        # this primitive was never told is eligible, which must never happen for a correct caller.
+        [AllowNull()][string]$GrantCapability
+    )
+    $capabilities = [Collections.Generic.List[string]]::new([string[]]@($RoleDescriptor.capabilities | Sort-Object -Unique))
+    $mandatoryDenies = [Collections.Generic.List[string]]::new([string[]]@($RoleDescriptor.mandatoryDenies | Sort-Object -Unique))
+    foreach ($name in @($PersistedNarrowing.Keys | Where-Object { [string]$PersistedNarrowing[$_] -ceq 'off' })) {
+        if ($capabilities.Contains($name)) {
+            [void]$capabilities.Remove($name)
+            if (-not $mandatoryDenies.Contains($name)) { [void]$mandatoryDenies.Add($name) }
+        }
+    }
+    if ($GrantCapability) {
+        if ($capabilities.Contains($GrantCapability) -or -not $mandatoryDenies.Contains($GrantCapability)) {
+            throw '[grant-invalid] GrantCapability is not eligible to be widened from the current capability ceiling.'
+        }
+        [void]$mandatoryDenies.Remove($GrantCapability)
+        [void]$capabilities.Add($GrantCapability)
+    }
+    return @{ capabilities = @($capabilities | Sort-Object -Unique); mandatoryDenies = @($mandatoryDenies | Sort-Object -Unique) }
+}
+
+function Get-AgentDelegationPolicyPath {
+    <#
+        Fixed, toolkit-relative, checked-in path for the delegation policy -- never forwarded
+        through config, CLI argument, or environment variable, unlike every root this module
+        otherwise resolves. $PSScriptRoot here is always this module's own directory
+        (src\DevPilot.AgentHarness), so the resolved path is stable regardless of the caller's
+        working directory or how the toolkit was checked out.
+    #>
+    param([Parameter(Mandatory)][string]$ToolkitRoot)
+    return [IO.Path]::GetFullPath((Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\Policy\delegation.policy.v1.json'))
+}
+
+function Get-AgentDelegationPolicy {
+    <#
+        Loads and hardens the checked-in delegation policy (issue #105 PR4): a NORMAL checked-in
+        file (no -Private -- it ships in source control with the toolkit's ordinary checkout ACL,
+        unlike the owner-private capability-override store or the sealed grant-selection artifact),
+        pinned to its exact expected path and validated via the same trusted-root/no-links
+        containment this module already uses elsewhere. Read via Read-AgentStableFile -- one read,
+        stat-before/after stability -- and ContentSha256 is defined as that same read's fingerprint,
+        never a second, separately-computed hash over a separately-read buffer.
+
+        Schema is exact and fixed: exactly the two known roles, each with exactly its own single
+        delegable capability (Get-AgentHarnessCapabilityDescriptor's delegableDefaultOff), each an
+        object with exactly {allowedRepositoryKeys:[string]} and no other fields -- any
+        additional/missing/malformed field, or any duplicate/case-collision key
+        (Assert-AgentCapabilityJsonRawShape, over the raw JSON before any hashtable folding hides
+        one), fails the WHOLE load closed. There is deliberately no wildcard/"allow any" escape
+        hatch in this schema (issue #105 PR4 requirement 8): an empty allowedRepositoryKeys (the
+        shipped default) means delegation is categorically unavailable, and the only way to grant
+        anything is to name the exact repository key(s) explicitly. Governance (who may edit this
+        file, and its CODEOWNERS group) is deliberately out of this function's scope.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ToolkitRoot)
+    $expectedPath = Get-AgentDelegationPolicyPath -ToolkitRoot $ToolkitRoot
+    $policyRoot = Split-Path $expectedPath -Parent
+    if (-not (Test-Path -LiteralPath $policyRoot -PathType Container)) {
+        throw "[delegation-policy-invalid] Delegation policy directory does not exist: $policyRoot"
+    }
+    $path = Assert-AgentTrustedFile -Path $expectedPath -AllowedRoot $policyRoot -ExpectedPath $expectedPath
+    $stable = Read-AgentStableFile -Path $path -MaxBytes 16384
+    if (-not $stable.Exists) { throw '[delegation-policy-invalid] Checked-in delegation policy is missing.' }
+    Assert-AgentCapabilityJsonRawShape -Bytes $stable.Bytes -MaxDepth 5 -MaxElements 128 -MaxStringLength 256 -ErrorCode 'delegation-policy-invalid'
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $record = $strictUtf8.GetString($stable.Bytes) | ConvertFrom-Json -AsHashtable -Depth 6 -ErrorAction Stop
+    if ($record -isnot [Collections.IDictionary]) { throw '[delegation-policy-invalid] Record is not a JSON object.' }
+    $topLevelKeys = @($record.Keys)
+    if ($topLevelKeys.Count -ne 2 -or
+        @($topLevelKeys | Where-Object { $_ -ceq 'schemaVersion' }).Count -ne 1 -or
+        @($topLevelKeys | Where-Object { $_ -ceq 'roles' }).Count -ne 1) {
+        throw '[delegation-policy-invalid] Record must contain exactly schemaVersion and roles.'
+    }
+    if (($record.schemaVersion -isnot [int] -and $record.schemaVersion -isnot [long]) -or [int64]$record.schemaVersion -ne 1) {
+        throw '[delegation-policy-invalid] Unsupported schemaVersion.'
+    }
+    if ($record.roles -isnot [Collections.IDictionary]) { throw "[delegation-policy-invalid] 'roles' must be a JSON object." }
+    $expectedCapabilityByRole = [ordered]@{
+        reviewer         = (Get-AgentHarnessCapabilityDescriptor -Role reviewer).delegableDefaultOff
+        'review-handler' = (Get-AgentHarnessCapabilityDescriptor -Role 'review-handler').delegableDefaultOff
+    }
+    $roleKeys = @($record.roles.Keys)
+    if ($roleKeys.Count -ne 2 -or
+        @($roleKeys | Where-Object { $_ -ceq 'reviewer' }).Count -ne 1 -or
+        @($roleKeys | Where-Object { $_ -ceq 'review-handler' }).Count -ne 1) {
+        throw '[delegation-policy-invalid] roles must contain exactly reviewer and review-handler.'
+    }
+    $delegations = [ordered]@{}
+    foreach ($role in @('reviewer', 'review-handler')) {
+        $roleRecord = @($record.roles.Keys | Where-Object { $_ -ceq $role } | ForEach-Object { $record.roles[$_] })[0]
+        if ($roleRecord -isnot [Collections.IDictionary]) { throw "[delegation-policy-invalid] roles.$role must be a JSON object." }
+        $expectedCapability = $expectedCapabilityByRole[$role]
+        $capabilityKeys = @($roleRecord.Keys)
+        if ($capabilityKeys.Count -ne 1 -or @($capabilityKeys | Where-Object { $_ -ceq $expectedCapability }).Count -ne 1) {
+            throw "[delegation-policy-invalid] roles.$role must contain exactly '$expectedCapability'."
+        }
+        $entry = $roleRecord[$expectedCapability]
+        if ($entry -isnot [Collections.IDictionary]) { throw "[delegation-policy-invalid] roles.$role.$expectedCapability must be a JSON object." }
+        $entryKeys = @($entry.Keys)
+        if ($entryKeys.Count -ne 1 -or
+            @($entryKeys | Where-Object { $_ -ceq 'allowedRepositoryKeys' }).Count -ne 1) {
+            throw "[delegation-policy-invalid] roles.$role.$expectedCapability must contain exactly allowedRepositoryKeys."
+        }
+        $rawKeys = $entry.allowedRepositoryKeys
+        if ($rawKeys -is [string] -or $rawKeys -isnot [Collections.IEnumerable]) {
+            throw "[delegation-policy-invalid] roles.$role.$expectedCapability.allowedRepositoryKeys must be an array."
+        }
+        $keys = [Collections.Generic.List[string]]::new()
+        $seenKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($key in $rawKeys) {
+            $keyText = [string]$key
+            if ($keyText -notmatch '^v1:(azuredevops|github):[^:]+$') {
+                throw "[delegation-policy-invalid] roles.$role.$expectedCapability.allowedRepositoryKeys contains a malformed key."
+            }
+            if (-not $seenKeys.Add($keyText)) {
+                throw "[delegation-policy-invalid] roles.$role.$expectedCapability.allowedRepositoryKeys contains a duplicate key."
+            }
+            [void]$keys.Add($keyText)
+        }
+        $delegations[$role] = [ordered]@{
+            Capability = $expectedCapability; AllowedRepositoryKeys = @($keys.ToArray())
+        }
+    }
+    return [ordered]@{
+        SchemaVersion = 1; Path = $path; PathHash = (Get-AgentSha256 -Text $path.ToLowerInvariant())
+        ContentSha256 = $stable.Sha256
+        Fingerprint   = [ordered]@{ Path = $stable.Path; Exists = $stable.Exists; Size = $stable.Size; MTime = $stable.MTime; Sha256 = $stable.Sha256 }
+        Delegations   = $delegations
+    }
+}
+
+function Test-AgentDelegationAllows {
+    <#
+        Pure decision function (issue #105 PR4): does the checked-in delegation policy permit
+        granting Capability to Role for RepositoryKey? An empty allowedRepositoryKeys (the shipped
+        safe default) always returns false -- delegation is categorically unavailable until a
+        CODEOWNERS-approved policy change explicitly names a repository key. There is no
+        allow-any/wildcard escape hatch (issue #105 PR4 requirement 8): the only way this can ever
+        return true is an exact, explicit RepositoryKey match. Capability must be exactly the
+        role's own single delegable capability; any other name is never allowed, never looked up.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Policy,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][string]$Capability,
+        [Parameter(Mandatory)][string]$RepositoryKey
+    )
+    if (-not $Policy.Delegations.Contains($Role)) { return $false }
+    $entry = $Policy.Delegations[$Role]
+    if ([string]$entry.Capability -cne $Capability) { return $false }
+    return (@($entry.AllowedRepositoryKeys) -ccontains $RepositoryKey)
+}
+
+function Get-AgentDelegationPolicyOrNull {
+    <#
+        Fail-closed wrapper for read-only, best-effort callers (issue #105 PR4 requirements 3/9):
+        Get-BrokerCapabilityProfile (describe/profile) must keep reporting an ordinary capability
+        ceiling even when the checked-in delegation policy cannot be loaded at all -- a real
+        checkout with an unexpected ACL, a missing file, or a corrupt/malformed policy. Returns
+        $null instead of throwing; every caller of this wrapper treats $null exactly like "no
+        delegation configured" (delegableAvailable stays @()), never as an error that should abort
+        the whole RPC. This never masks the underlying failure from an operator who actually needs
+        to delegate/widen -- Get-AgentDelegationPolicyOrThrow is the fail-closed path for those
+        callers (describe-widening/confirm-widening-*/cancel-widening/dispatch's grant recheck).
+    #>
+    param([Parameter(Mandatory)][string]$ToolkitRoot)
+    try { return Get-AgentDelegationPolicy -ToolkitRoot $ToolkitRoot }
+    catch { return $null }
+}
+
+function Get-AgentDelegationPolicyOrThrow {
+    <#
+        Fail-closed wrapper for the widening/delegation-consuming callers (issue #105 PR4
+        requirements 3/9): describe-widening, confirm-widening-preview, confirm-widening-mint,
+        cancel-widening, and dispatch's own grant revalidation all NEED a real policy read to make
+        a correct decision, so unlike Get-AgentDelegationPolicyOrNull they must never silently
+        proceed without one. Normalizes any underlying failure (missing/malformed file, a real
+        checkout's unexpected ACL, a transient I/O error) to one distinct, actionable code --
+        [delegation-policy-unavailable] -- so operators/tests can tell "delegation is unavailable
+        right now" apart from every other dispatch/widening failure, while ordinary (non-delegated)
+        profile/describe/manual dispatch on the same broker keeps working via the OrNull wrapper
+        above.
+    #>
+    param([Parameter(Mandatory)][string]$ToolkitRoot)
+    try { return Get-AgentDelegationPolicy -ToolkitRoot $ToolkitRoot }
+    catch { throw "[delegation-policy-unavailable] The checked-in delegation policy could not be loaded: $($_.Exception.Message)" }
+}
+
+function Get-AgentWideningGrantArtifactPath {
+    param([Parameter(Mandatory)][string]$RuntimeRoot)
+    return Join-Path ([IO.Path]::GetFullPath($RuntimeRoot)) 'grant-selection.sealed.v1.json'
+}
+
+function New-AgentWideningGrantArtifact {
+    <#
+        Broker-side (issue #105 PR4): atomically writes the sealed, owner-private grant-selection
+        artifact into the draft's own per-dispatch runtime root at dispatch() time, immediately
+        before the child is launched. This is a SELECTION the child independently re-verifies, never
+        an authority the child can trust blindly (ANT-2): every field the child cross-checks (policy
+        path/content hash, repository/worktree/PR/full source SHA, grant nonce/expiry) is also
+        independently re-derived by the child from its own live state and from its own fresh
+        Get-AgentDelegationPolicy read, never taken solely from this artifact. Written via a
+        create-new temp file (never overwrites an existing name) plus a rename into place, exactly
+        one per dispatch attempt -- a draft only ever reaches this call once, since a real
+        dispatchId/artifact is allocated only after the broker's own dispatch-time revalidation
+        already passed.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RuntimeRoot,
+        [Parameter(Mandatory)][string]$DraftId,
+        [Parameter(Mandatory)][string]$DispatchId,
+        [Parameter(Mandatory)][string]$Capability,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][string]$RepositoryKey,
+        [Parameter(Mandatory)][string]$WorktreeId,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$PolicyPathHash,
+        [Parameter(Mandatory)][string]$PolicyContentSha256,
+        [Parameter(Mandatory)][string]$GrantNonce,
+        [Parameter(Mandatory)][long]$ExpiresAtUtc
+    )
+    $path = Get-AgentWideningGrantArtifactPath -RuntimeRoot $RuntimeRoot
+    $record = [ordered]@{
+        schemaVersion = 1; draftId = $DraftId; dispatchId = $DispatchId; capability = $Capability; role = $Role
+        repositoryKey = $RepositoryKey; worktreeId = $WorktreeId; pullRequestId = $PullRequestId; sourceCommit = $SourceCommit
+        policyPathHash = $PolicyPathHash; policyContentSha256 = $PolicyContentSha256
+        grantNonce = $GrantNonce; expiresAtUtc = $ExpiresAtUtc
+        mintedAtUtc = (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-AgentCanonicalJson $record))
+    $tempPath = "$path.tmp-$([Guid]::NewGuid().ToString('N'))"
+    $stream = [IO.FileStream]::new($tempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        if (-not $IsWindows) { [IO.File]::SetUnixFileMode($tempPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite) }
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+    [IO.File]::Move($tempPath, $path)
+    return $path
+}
+
+function Get-AgentWideningGrantArtifact {
+    <#
+        Child-side (issue #105 PR4): reads and validates the sealed grant-selection artifact as a
+        SELECTION, not an authority (ANT-2) -- every field returned here is independently
+        cross-checked by the caller (Enter-AgentManualDispatchStartup) against its own live-derived
+        state and against Get-AgentDelegationPolicy's own fresh read, never trusted alone. Returns
+        $null if the file is absent (the ordinary, unwidened dispatch path) -- absence is not an
+        error. Read via Assert-AgentTrustedFile -Private (owner-only ACL/no-links) then
+        Read-AgentStableFile (one read); a present-but-invalid/malformed artifact fails closed
+        (throws) -- it is never reinterpreted as "no grant".
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RuntimeRoot)
+    $runtimeRoot = [IO.Path]::GetFullPath($RuntimeRoot)
+    $path = Get-AgentWideningGrantArtifactPath -RuntimeRoot $runtimeRoot
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $trusted = Assert-AgentTrustedFile -Path $path -AllowedRoot $runtimeRoot -ExpectedPath $path -Private
+    $stable = Read-AgentStableFile -Path $trusted -MaxBytes 8192
+    if (-not $stable.Exists) { return $null }
+    Assert-AgentCapabilityJsonRawShape -Bytes $stable.Bytes -MaxDepth 3 -MaxElements 64 -MaxStringLength 512 -ErrorCode 'grant-invalidated'
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $record = $strictUtf8.GetString($stable.Bytes) | ConvertFrom-Json -AsHashtable -Depth 4 -ErrorAction Stop
+    if ($record -isnot [Collections.IDictionary]) { throw '[grant-invalidated] Sealed grant artifact is not a JSON object.' }
+    $requiredFields = @('schemaVersion', 'draftId', 'dispatchId', 'capability', 'role', 'repositoryKey', 'worktreeId',
+        'pullRequestId', 'sourceCommit', 'policyPathHash', 'policyContentSha256', 'grantNonce', 'expiresAtUtc', 'mintedAtUtc')
+    $actualFields = @($record.Keys)
+    if ($actualFields.Count -ne $requiredFields.Count) {
+        throw '[grant-invalidated] Sealed grant artifact does not contain exactly the expected fields.'
+    }
+    foreach ($name in $requiredFields) {
+        if (@($actualFields | Where-Object { $_ -ceq $name }).Count -ne 1) {
+            throw "[grant-invalidated] Sealed grant artifact is missing required field '$name'."
+        }
+    }
+    if (([int64]$record.schemaVersion) -ne 1 -or
+        [string]$record.draftId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
+        [string]$record.dispatchId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
+        [string]$record.capability -cnotmatch '^[A-Za-z][A-Za-z0-9]*$' -or
+        [string]$record.role -cnotin @('reviewer', 'review-handler') -or
+        [string]$record.repositoryKey -notmatch '^v1:(azuredevops|github):[^:]+$' -or
+        [string]$record.worktreeId -cnotmatch '^[0-9a-f]{64}$' -or
+        ($record.pullRequestId -isnot [int] -and $record.pullRequestId -isnot [long]) -or [int64]$record.pullRequestId -le 0 -or
+        [string]$record.sourceCommit -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$record.policyPathHash -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$record.policyContentSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$record.grantNonce -notmatch '^[0-9a-f]{36}$' -or
+        ($record.expiresAtUtc -isnot [int] -and $record.expiresAtUtc -isnot [long]) -or
+        ($record.mintedAtUtc -isnot [int] -and $record.mintedAtUtc -isnot [long])) {
+        throw '[grant-invalidated] Sealed grant artifact is malformed.'
+    }
+    return [ordered]@{
+        DraftId = [string]$record.draftId; DispatchId = [string]$record.dispatchId; Capability = [string]$record.capability
+        Role = [string]$record.role; RepositoryKey = [string]$record.repositoryKey; WorktreeId = [string]$record.worktreeId
+        PullRequestId = [int]$record.pullRequestId; SourceCommit = [string]$record.sourceCommit
+        PolicyPathHash = [string]$record.policyPathHash; PolicyContentSha256 = [string]$record.policyContentSha256
+        GrantNonce = [string]$record.grantNonce; ExpiresAtUtc = [long]$record.expiresAtUtc; MintedAtUtc = [long]$record.mintedAtUtc
+    }
+}
+
+function Remove-AgentWideningGrantArtifact {
+    <#
+        Broker-side (issue #105 PR4): deletes the sealed grant-selection artifact once its
+        handshake has concluded (proceed sent) or the dispatch attempt failed/was abandoned before
+        that point -- an artifact must never outlive the single dispatch attempt it was minted for.
+        Absence is not an error: a dispatch attempt that never reached the point of writing one, or
+        whose artifact was already removed, is a normal no-op.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RuntimeRoot)
+    $path = Get-AgentWideningGrantArtifactPath -RuntimeRoot $RuntimeRoot
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+}
+
+function New-AgentWideningChallenge {
+    <#
+        Cryptographically random, single-use challenge token for one step of the interactive
+        widening confirmation protocol (issue #105 PR4). 24 random bytes (192 bits) as lowercase hex
+        -- ample unpredictability for a short-TTL, draft/capability/stage-bound token that is never a
+        long-lived secret.
+    #>
+    $bytes = [byte[]]::new(24)
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+}
+
+function Test-AgentWideningChallengeShape {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Challenge)
+    return [bool]($Challenge -cmatch '^[0-9a-f]{48}$')
+}
+
+function New-AgentBrokerAttestationSecret {
+    <#
+        Ephemeral, broker-only, in-memory-only secret (issue #105 PR4 CRITICAL-2 hardening): 32
+        cryptographically random bytes, minted fresh per dispatch attempt and NEVER written to
+        disk, a manifest, a sealed artifact, or any wire message. Delivered to the child ONLY
+        through an inherited anonymous-pipe handle (see Invoke-Dispatch), which only a process the
+        broker itself directly spawned can ever receive -- a forged manifest plus a same-named
+        fake pipe can never obtain it. Used as an HMAC key (Get-AgentAttestationProof) so the
+        child can prove possession without ever needing to verify anything itself; the broker is
+        the only party that ever compares a proof, against its own copy of this exact secret.
+    #>
+    $bytes = [byte[]]::new(32)
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return $bytes
+}
+
+function Get-AgentAttestationDigest {
+    <#
+        Canonical digest of the exact broker-origin attestation fields (issue #105 PR4 CRITICAL-2
+        hardening / requirement 6): both the child (Enter-AgentManualDispatchStartup, from its own
+        independently re-verified live state) and the broker (Invoke-Dispatch, from its own
+        in-memory draft/grant record) call this with THEIR OWN independently-sourced values --
+        never a value copied from the other side's message. A mismatch (a tampered manifest, a
+        stale or replayed grant, or the wrong worktree) changes the digest and is caught by the
+        broker's own recomputation before it ever authorizes 'proceed'. Including
+        grantNonce/grantExpiresAtUtc here gives grantNonce a real, live-bound exact-match check
+        (requirement 6) instead of being carried in the sealed artifact but never actually verified
+        against anything.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$DispatchId,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][string]$RepositoryKey,
+        [Parameter(Mandatory)][string]$WorktreeId,
+        [Parameter(Mandatory)][int]$PullRequestId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$CapabilityPolicyDigest,
+        [AllowNull()][string]$GrantCapability,
+        [AllowNull()][string]$GrantNonce,
+        [AllowNull()]$GrantExpiresAtUtc
+    )
+    $fields = [ordered]@{
+        schemaVersion = 1; dispatchId = $DispatchId; role = $Role; repositoryKey = $RepositoryKey
+        worktreeId = $WorktreeId; pullRequestId = $PullRequestId; sourceCommit = $SourceCommit
+        capabilityPolicyDigest = $CapabilityPolicyDigest
+        grantCapability = $(if ($GrantCapability) { $GrantCapability } else { $null })
+        grantNonce = $(if ($GrantCapability) { $GrantNonce } else { $null })
+        grantExpiresAtUtc = $(if ($GrantCapability) { [int64]$GrantExpiresAtUtc } else { $null })
+    }
+    return Get-AgentCanonicalDigest -InputObject $fields
+}
+
+function Get-AgentAttestationProof {
+    <#
+        HMAC-SHA256(secret, "nonce:digest") as lowercase hex (issue #105 PR4 CRITICAL-2 hardening)
+        -- a standard, well-known keyed-MAC construction, not bespoke cryptography. The child
+        computes this once (it can never verify a broker-authored proof back, since it never holds
+        the broker's copy of the secret) and sends {nonce, digest, proof} to the broker; only the
+        broker -- the sole other holder of SecretBytes -- ever recomputes and compares it. A forger
+        who can fabricate a matching manifest/artifact/named-pipe reply still cannot produce a
+        valid proof without SecretBytes, which is never written to disk, a manifest, an artifact,
+        or any file the forger could read.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$SecretBytes,
+        [Parameter(Mandatory)][string]$Nonce,
+        [Parameter(Mandatory)][string]$Digest
+    )
+    $hmac = [Security.Cryptography.HMACSHA256]::new($SecretBytes)
+    try {
+        $message = [Text.Encoding]::UTF8.GetBytes("$($Nonce):$($Digest)")
+        return [Convert]::ToHexString($hmac.ComputeHash($message)).ToLowerInvariant()
+    }
+    finally { $hmac.Dispose() }
+}
+
+function Receive-AgentBrokerAttestationSecret {
+    <#
+        Child-side (issue #105 PR4 CRITICAL-2 hardening): the ONLY way a manual-dispatch child can
+        obtain the broker's ephemeral attestation secret is an anonymous-pipe handle the broker
+        itself created and handed down as an OS-inherited handle at the moment it directly spawned
+        this exact process -- never a CLI argument, never a file, never anything a direct/headless
+        caller could fabricate by crafting text. The environment variable carries only the pipe's
+        transient handle reference (meaningless outside a process that actually inherited it), is
+        cleared from THIS process's own environment the instant it is read (so no further child
+        process this agent spawns ever sees or re-inherits it), and is never logged. Throws
+        distinct, fail-closed codes: [broker-attestation-missing] when the environment variable
+        itself is absent (the ordinary direct/headless-invocation case -- no inherited handle was
+        ever set up because there is no real broker parent), or [broker-attestation-invalid] when a
+        handle IS present but cannot be opened or the secret cannot be read within the deadline (a
+        malformed/bogus handle value, or a peer that closed without writing) -- never
+        reinterpreted as "no attestation required".
+    #>
+    [CmdletBinding()]
+    param([ValidateRange(100, 30000)][int]$TimeoutMilliseconds = 5000)
+    $handle = $env:DEVPILOT_BROKER_ATTESTATION_HANDLE
+    if ([string]::IsNullOrEmpty($handle)) {
+        throw '[broker-attestation-missing] This process was not launched with a broker attestation handle; manual dispatch requires launch by the trusted broker.'
+    }
+    # Cleared immediately, before it is even used, so a crash/exception mid-read still leaves no
+    # trace of the handle in this process's environment for any further child process to inherit.
+    [Environment]::SetEnvironmentVariable('DEVPILOT_BROKER_ATTESTATION_HANDLE', $null)
+    $client = $null
+    try {
+        $client = [IO.Pipes.AnonymousPipeClientStream]::new([IO.Pipes.PipeDirection]::In, $handle)
+        $buffer = [byte[]]::new(32)
+        $totalRead = 0
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+        while ($totalRead -lt $buffer.Length) {
+            $remainingMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            $readTask = $client.ReadAsync($buffer, $totalRead, $buffer.Length - $totalRead)
+            if (-not $readTask.Wait($remainingMs)) {
+                throw '[broker-attestation-invalid] Timed out reading the broker attestation secret.'
+            }
+            $count = $readTask.GetAwaiter().GetResult()
+            if ($count -le 0) {
+                throw '[broker-attestation-invalid] Broker attestation pipe closed before the secret was fully delivered.'
+            }
+            $totalRead += $count
+        }
+        return $buffer
+    }
+    catch {
+        if ($_.Exception.Message -match '^\[broker-attestation-invalid\]') { throw }
+        throw "[broker-attestation-invalid] Broker attestation handle could not be read: $($_.Exception.Message)"
+    }
+    finally { if ($client) { $client.Dispose() } }
+}
+
+function Assert-AgentManualDispatchEarlyContext {
+    <#
+        Early, side-effect-free guard (issue #105 PR4 CRITICAL-2 hardening): called by each agent
+        script immediately after its own parameter validation, BEFORE any provider/network setup.
+        A manual-dispatch manifest path alone -- even one naming a real, existing, well-formed file
+        -- is never sufficient evidence of genuine broker issuance; only the broker's own direct
+        process-creation call can hand this process an inherited anonymous-pipe attestation handle.
+        This rejects the cheapest, most common accidental/headless case (a manifest with no
+        accompanying broker attestation, or a manifest that does not even exist) before the caller
+        spends any provider/network cost; the full cryptographic challenge-response happens later,
+        in Enter-AgentManualDispatchStartup, immediately before the ready/proceed handshake.
+
+        issue #105 PR5 (broker-issuer anchor): the checks above only reject the ABSENCE of an
+        attestation handle -- they say nothing about whether the handle actually came from a real
+        broker. A same-user caller can mint their own anonymous pipe, point
+        DEVPILOT_BROKER_ATTESTATION_HANDLE at it, and write any bytes they like; the deep HMAC
+        proof in Enter-AgentManualDispatchStartup would only catch that much later, after
+        provider/network setup already ran. Assert-AgentBrokerProcessAnchor closes that gap here,
+        before any of that cost is spent, by independently verifying this process's real OS parent
+        against the manifest's own broker-origin claims.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$ManifestPath)
+    if (-not $ManifestPath) { return }
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw '[broker-attestation-missing] Manual dispatch manifest does not exist.'
+    }
+    if ([string]::IsNullOrEmpty($env:DEVPILOT_BROKER_ATTESTATION_HANDLE)) {
+        throw '[broker-attestation-missing] This process was not launched with a broker attestation handle; manual dispatch requires launch by the trusted broker.'
+    }
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
+    Assert-AgentBrokerProcessAnchor -Manifest $manifest
+}
+
+function ConvertFrom-AgentProcStatPpid {
+    <#
+        Pure, OS-independent parser for a Linux /proc/<pid>/stat line's ppid field (issue #105
+        PR5 broker-issuer anchor). Factored out of Get-AgentImmediateParentProcessId so its exact
+        field-index parsing (identical convention to Get-AgentProcessStartIdentity's starttime
+        field) can be unit-tested from a static fixture string on any host, including a non-Linux
+        development/CI machine that can never read a real /proc file. Strict integer parsing --
+        any unexpected shape is a hard failure, never a silent default.
+    #>
+    param([Parameter(Mandatory)][string]$StatText)
+    $nameEnd = $StatText.LastIndexOf(')')
+    if ($nameEnd -lt 0) { throw 'Malformed procfs stat text: no comm field terminator.' }
+    $fields = @($StatText.Substring($nameEnd + 1).Trim() -split '\s+')
+    if ($fields.Count -le 1 -or $fields[1] -notmatch '^\d+$') {
+        throw 'Malformed procfs stat text: ppid field is not a plain integer.'
+    }
+    return [int]$fields[1]
+}
+
+function Get-AgentImmediateParentProcessId {
+    <#
+        Cross-platform "who is my real OS parent right now" probe (issue #105 PR5 broker-issuer
+        anchor). Used ONLY to bind a manual-dispatch child to the process the operating system
+        itself recorded as having created it -- never anything a manifest, environment variable,
+        or named pipe could claim. Strict integer parsing throughout; any unexpected shape is a
+        hard failure, never a silent zero/self default.
+    #>
+    [CmdletBinding()]
+    param([ValidateRange(1, [int]::MaxValue)][int]$ProcessId = $PID)
+    if ($IsWindows) {
+        $info = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" `
+            -Property ParentProcessId -ErrorAction Stop
+        if (-not $info -or [string]$info.ParentProcessId -notmatch '^\d+$') {
+            throw "Could not determine the parent process id for process $ProcessId."
+        }
+        return [int]$info.ParentProcessId
+    }
+    if ($IsLinux) {
+        return ConvertFrom-AgentProcStatPpid -StatText ([IO.File]::ReadAllText("/proc/$ProcessId/stat"))
+    }
+    # POSIX fallback (e.g. macOS) with no /proc: a single, strictly-parsed ps(1) column.
+    $psOutput = & ps -o ppid= -p $ProcessId 2>$null
+    $trimmed = if ($psOutput) { (@($psOutput)[0]).ToString().Trim() } else { '' }
+    if ($trimmed -notmatch '^\d+$') {
+        throw "Could not determine the parent process id for process $ProcessId via ps."
+    }
+    return [int]$trimmed
+}
+
+function Get-AgentProcessCommandLine {
+    <#
+        Cross-platform "what is this process actually running" probe (issue #105 PR5
+        broker-issuer anchor). Companion to Get-AgentImmediateParentProcessId: knowing a live
+        process's PID matches a manifest's claim is not enough on its own -- an ordinary caller's
+        own shell IS, truthfully, its own parent. This additionally requires that parent's command
+        line to actually name the one fixed, trusted broker script path; an ordinary shell/launcher
+        was never started that way.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$ProcessId)
+    if ($IsWindows) {
+        $info = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" `
+            -Property CommandLine -ErrorAction Stop
+        if (-not $info) { throw "Process $ProcessId was not found." }
+        return [string]$info.CommandLine
+    }
+    if ($IsLinux) {
+        $bytes = [IO.File]::ReadAllBytes("/proc/$ProcessId/cmdline")
+        return (([Text.Encoding]::UTF8.GetString($bytes)) -split "`0" | Where-Object { $_ -ne '' }) -join ' '
+    }
+    return [string](& ps -o command= -p $ProcessId 2>$null)
+}
+
+function ConvertFrom-AgentWindowsCommandLineArgv {
+    <#
+        Pure, OS-independent tokenizer implementing the exact CommandLineToArgvW quoting
+        algorithm (issue #105 PR5 parent-anchor-spoof fix). Deliberately NOT Add-Type/P-Invoke --
+        a plain string-walk that any host can unit-test from static fixtures. Rules (identical to
+        the documented Windows CRT/CommandLineToArgvW convention):
+          - arguments are delimited by unquoted whitespace;
+          - a double quote toggles "inside quotes" (whitespace inside quotes is literal);
+          - two consecutive double quotes while already inside a quoted run collapse to one
+            literal double quote and stay inside the quoted run;
+          - a run of N backslashes immediately followed by a double quote emits floor(N/2)
+            literal backslashes; if N is odd the quote itself is escaped (emitted literally and
+            does not toggle quoting), otherwise the quote toggles quoting as usual;
+          - a run of backslashes NOT followed by a double quote is emitted literally.
+        This is the ONLY safe way to recover an unambiguous argument vector from a Windows
+        CommandLine string without re-invoking the OS parser; a naive whitespace split (or a
+        substring/Contains search, the exact bug this function replaces) can be defeated by an
+        attacker who places the trusted path as inert, never-executed data anywhere in the line.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$CommandLine)
+    $tokens = [Collections.Generic.List[string]]::new()
+    $length = $CommandLine.Length
+    $i = 0
+    while ($true) {
+        while ($i -lt $length -and ($CommandLine[$i] -eq ' ' -or $CommandLine[$i] -eq "`t")) { $i++ }
+        if ($i -ge $length) { break }
+        $token = [Text.StringBuilder]::new()
+        $inQuotes = $false
+        while ($i -lt $length -and ($inQuotes -or ($CommandLine[$i] -ne ' ' -and $CommandLine[$i] -ne "`t"))) {
+            if ($CommandLine[$i] -eq '\') {
+                $backslashRunStart = $i
+                while ($i -lt $length -and $CommandLine[$i] -eq '\') { $i++ }
+                $backslashCount = $i - $backslashRunStart
+                if ($i -lt $length -and $CommandLine[$i] -eq '"') {
+                    [void]$token.Append([char]'\', [int][Math]::Floor($backslashCount / 2))
+                    if (($backslashCount % 2) -eq 1) {
+                        [void]$token.Append('"')
+                        $i++
+                    }
+                    else {
+                        if ($inQuotes -and $i + 1 -lt $length -and $CommandLine[$i + 1] -eq '"') {
+                            [void]$token.Append('"')
+                            $i += 2
+                        }
+                        else {
+                            $inQuotes = -not $inQuotes
+                            $i++
+                        }
+                    }
+                }
+                else {
+                    [void]$token.Append([char]'\', $backslashCount)
+                }
+            }
+            elseif ($CommandLine[$i] -eq '"') {
+                if ($inQuotes -and $i + 1 -lt $length -and $CommandLine[$i + 1] -eq '"') {
+                    [void]$token.Append('"')
+                    $i += 2
+                }
+                else {
+                    $inQuotes = -not $inQuotes
+                    $i++
+                }
+            }
+            else {
+                [void]$token.Append($CommandLine[$i])
+                $i++
+            }
+        }
+        [void]$tokens.Add($token.ToString())
+    }
+    return , @($tokens.ToArray())
+}
+
+function Get-AgentProcessArgv {
+    <#
+        Cross-platform "independently observed executable image path + argument vector" probe
+        (issue #105 PR5 parent-anchor-spoof fix). Returns @{ ExecutablePath; Arguments } where
+        Arguments excludes argv[0] (the executable token itself, which is never authoritative --
+        Win32_Process.ExecutablePath / the /proc/<pid>/exe symlink target are the OS's own record
+        of the loaded image, independent of anything the command line merely claims about itself).
+        Never a joined/rejoined string: Assert-AgentBrokerCommandLineShape requires an exact,
+        unambiguous array so a caller cannot defeat positional validation by embedding the
+        trusted script path as inert data alongside a real code-execution option.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$ProcessId)
+    if ($IsWindows) {
+        $info = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" `
+            -Property ExecutablePath, CommandLine -ErrorAction Stop
+        if (-not $info) { throw "Process $ProcessId was not found." }
+        if ([string]::IsNullOrEmpty($info.CommandLine)) {
+            throw "Process $ProcessId has no command line to validate."
+        }
+        # NOTE: ConvertFrom-AgentWindowsCommandLineArgv already returns its array via the
+        # comma-wrap idiom (`return , @(...)`) specifically so PowerShell never unrolls it onto
+        # the pipeline -- wrapping this call in an additional @(...) here would instead capture a
+        # single-element array whose one element is the real token array, silently corrupting
+        # every positional index downstream.
+        $tokens = ConvertFrom-AgentWindowsCommandLineArgv -CommandLine $info.CommandLine
+        $arguments = if ($tokens.Count -gt 1) { @($tokens[1..($tokens.Count - 1)]) } else { @() }
+        return @{ ExecutablePath = [string]$info.ExecutablePath; Arguments = $arguments }
+    }
+    if ($IsLinux) {
+        $exeItem = Get-Item -LiteralPath "/proc/$ProcessId/exe" -Force -ErrorAction Stop
+        $exePath = if ($exeItem.Target) { @($exeItem.Target)[0] } else { $exeItem.FullName }
+        $bytes = [IO.File]::ReadAllBytes("/proc/$ProcessId/cmdline")
+        $tokens = @(([Text.Encoding]::UTF8.GetString($bytes)) -split "`0")
+        # procfs cmdline is NUL-delimited with exactly one trailing NUL terminator -- strip only
+        # that single trailing empty artifact, never any legitimate internal empty argument (a
+        # naive "drop every empty entry" filter would silently corrupt positional validation).
+        if ($tokens.Count -gt 0 -and $tokens[$tokens.Count - 1] -eq '') {
+            $tokens = if ($tokens.Count -gt 1) { @($tokens[0..($tokens.Count - 2)]) } else { @() }
+        }
+        $arguments = if ($tokens.Count -gt 1) { @($tokens[1..($tokens.Count - 1)]) } else { @() }
+        return @{ ExecutablePath = [string]$exePath; Arguments = $arguments }
+    }
+    # macOS fallback: no /proc, so there is no OS-native argv boundary source. `ps -o command=`
+    # only ever returns a single space-joined display string; a naive split can silently
+    # misparse an argument containing embedded whitespace as two arguments. Rather than pretend
+    # that split is trustworthy, hand the raw split straight to the strict, exact-shape
+    # positional validator below -- any embedded-whitespace corruption changes the token count or
+    # position and that validator already fails closed on anything but the one exact expected
+    # shape, so this never silently accepts a misparsed line.
+    $comm = ([string](& ps -o comm= -p $ProcessId 2>$null)).Trim()
+    $full = ([string](& ps -o command= -p $ProcessId 2>$null)).Trim()
+    if (-not $comm -or -not $full) {
+        throw "Could not determine the command line for process $ProcessId via ps."
+    }
+    $tokens = @($full -split '\s+' | Where-Object { $_ -ne '' })
+    $arguments = if ($tokens.Count -gt 1) { @($tokens[1..($tokens.Count - 1)]) } else { @() }
+    return @{ ExecutablePath = $comm; Arguments = $arguments }
+}
+
+function Assert-AgentBrokerCommandLineShape {
+    <#
+        Pure, unit-testable structural validator (issue #105 PR5 parent-anchor-spoof fix): the
+        prior check used $liveParentCommandLine.IndexOf($expectedBrokerScript) -- a substring
+        search a forger defeats trivially by launching e.g.
+        `pwsh -NoProfile -Command <payload> "<trusted broker script path>"` and passing the
+        trusted path as a second, never-executed, inert argument. This instead requires the
+        EXACT, fixed shape the dashboard's own broker launcher uses (see
+        DispatchClient.constructor in src/DevPilot.Dashboard/src/dispatch.ts): a bare pwsh/
+        powershell host; only -NoLogo/-NoProfile/-NonInteractive allowed before -File, each at
+        most once; exactly one -File immediately followed by the one canonical trusted broker
+        script path; exactly one -DescriptorPath immediately followed by its value; and nothing
+        else anywhere. Any deviation -- a duplicate -File, -File appearing only as a later data
+        token, -Command/-EncodedCommand/any other option, or trailing extra tokens -- is a single
+        generic failure so a forger's inert extra argument and a genuine code-execution option
+        are rejected identically (no oracle for "how close" a forged command line got).
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ExecutablePath,
+        [Parameter(Mandatory)][AllowNull()][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$ExpectedBrokerScript
+    )
+    $failure = '[broker-attestation-invalid] The claimed broker parent process is not running the pinned broker script.'
+    $hostName = if ($ExecutablePath) { [IO.Path]::GetFileNameWithoutExtension($ExecutablePath) } else { '' }
+    if ([string]::IsNullOrEmpty($hostName) -or $hostName.ToLowerInvariant() -notin @('pwsh', 'powershell')) {
+        throw $failure
+    }
+    $argv = @($Arguments)
+    $allowedPreFlags = @('-NoLogo', '-NoProfile', '-NonInteractive')
+    $seenPreFlags = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $i = 0
+    while ($i -lt $argv.Count -and $argv[$i] -cin $allowedPreFlags) {
+        if (-not $seenPreFlags.Add($argv[$i])) { throw $failure }
+        $i++
+    }
+    if ($i -ge $argv.Count -or $argv[$i] -cne '-File') { throw $failure }
+    $i++
+    if ($i -ge $argv.Count) { throw $failure }
+    $pathComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $suppliedScript = [IO.Path]::GetFullPath($argv[$i])
+    if (-not $suppliedScript.Equals($ExpectedBrokerScript, $pathComparison)) { throw $failure }
+    $i++
+    if ($i -ge $argv.Count -or $argv[$i] -cne '-DescriptorPath') { throw $failure }
+    $i++
+    if ($i -ge $argv.Count) { throw $failure }
+    $descriptorPathArgument = $argv[$i]
+    $i++
+    if ($i -ne $argv.Count) { throw $failure }
+    return [IO.Path]::GetFullPath($descriptorPathArgument)
+}
+
+function Assert-AgentBrokerProcessAnchor {
+    <#
+        issue #105 PR5 (broker-issuer anchor): the anonymous-pipe/HMAC attestation
+        (New-AgentBrokerAttestationSecret / Receive-AgentBrokerAttestationSecret /
+        Get-AgentAttestationProof) proves the child can read a secret handed down through an
+        OS-inherited handle -- but a same-user caller can mint an anonymous pipe of their own,
+        set DEVPILOT_BROKER_ATTESTATION_HANDLE to it, and write any bytes they like into it
+        themselves; nothing in that handshake alone proves the handle came from a real broker.
+
+        This closes that gap independently of anything the manifest merely claims about itself:
+        - this process's REAL immediate OS parent (Get-AgentImmediateParentProcessId), never
+          trusted from the manifest;
+        - that live parent's own start-time identity (Get-AgentProcessStartIdentity), guarding
+          against PID reuse;
+        - that live parent's own independently-observed executable image path and argument
+          vector (Get-AgentProcessArgv), structurally validated by Assert-AgentBrokerCommandLineShape
+          against the EXACT shape the real broker launcher uses -- a bare pwsh/powershell host
+          invoked with exactly one -File naming the one fixed, trusted broker script path this
+          function derives independently from its own module location, and exactly one
+          -DescriptorPath. This is a structured positional check, never a substring/Contains
+          search: an ordinary shell/launcher was never started that way, so a caller who merely
+          knows and reports their own true PID/start-time -- or who appends the trusted script
+          path as a second, inert, never-executed argument alongside a real -Command/
+          -EncodedCommand payload -- still fails here;
+        - the broker's own -DescriptorPath argument, extracted from that same independently
+          observed, structurally-validated argument vector -- NEVER the manifest's
+          brokerDescriptorPath claim, which is only ever accepted once it is shown to equal this
+          OS-observed value; a forger who never actually invokes the real broker script this way
+          can supply any manifest text they like but can never make Assert-AgentBrokerCommandLineShape
+          hand back a descriptor path they merely wish were true;
+        - the pinned, owner-private broker descriptor, read from its own trusted, exact-bound
+          location (Resolve-AgentTrustedRoot/Assert-AgentTrustedFile -- the same helpers the
+          broker itself uses on its own descriptor at startup), never trusted from the manifest's
+          content, only from its path once that path is proven to resolve to the one trusted spot;
+        - the fixed, trusted broker script's own live content hash, recomputed here directly from
+          disk, never trusted from the manifest.
+
+        Every manifest-declared value is a SELECTION checked against one of the independently
+        derived facts above; none of them is ever an authority on its own (ANT-2).
+
+        ANTI-MISTAKE BOUNDARY (do not oversell this): this defeats the cheap, ordinary mistake of
+        a hand-crafted manifest/env-var/named-pipe with no real broker involved, because an
+        ordinary direct/headless caller's real parent process is their own shell/launcher, which
+        is never running the pinned broker script. It is NOT a defense against a deliberate,
+        privileged, same-user attacker who can inject into or masquerade as the broker process,
+        patch this module in memory, or otherwise forge the OS-level parent/PID/ACL primitives
+        this check itself relies on -- that class of attacker is explicitly out of scope.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Manifest)
+
+    $role = [string]$Manifest['role']
+    if ($role -cnotin @('reviewer', 'review-handler')) {
+        throw '[broker-attestation-invalid] Manual dispatch manifest role is malformed.'
+    }
+    $claimedBrokerPid = [int](Get-AgentHashtableMemberOrNull -Table $Manifest -Name 'brokerProcessId')
+    $claimedBrokerStartIdentity = [string](Get-AgentHashtableMemberOrNull -Table $Manifest -Name 'brokerProcessStartIdentity')
+    $claimedDescriptorPath = [string](Get-AgentHashtableMemberOrNull -Table $Manifest -Name 'brokerDescriptorPath')
+    $claimedDescriptorDigest = [string](Get-AgentHashtableMemberOrNull -Table $Manifest -Name 'brokerDescriptorDigest')
+    $claimedBrokerScriptSha256 = [string](Get-AgentHashtableMemberOrNull -Table $Manifest -Name 'brokerScriptSha256')
+    if ($claimedBrokerPid -le 0 -or [string]::IsNullOrEmpty($claimedBrokerStartIdentity) -or
+        [string]::IsNullOrEmpty($claimedDescriptorPath) -or $claimedDescriptorDigest -notmatch '^[0-9a-f]{64}$' -or
+        $claimedBrokerScriptSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw '[broker-attestation-invalid] Manual dispatch manifest is missing broker-origin identity fields.'
+    }
+
+    $toolkitRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+    $expectedBrokerScript = [IO.Path]::GetFullPath((Join-Path (Join-Path $toolkitRoot 'tools') 'Invoke-DevPilotAgentDispatch.ps1'))
+    # Deliberately NOT Assert-AgentTrustedFile here: that helper's Windows-ACL/Unix-owner tier
+    # exists to gate a runtime-created, owner-private SECRET (the descriptor, checked below) --
+    # it is the wrong tool for an ordinary checked-in repository file, which routinely has
+    # broader read (and on some shared/team checkouts, even write) permissions for other local
+    # principals without that meaning anything about content integrity. $expectedBrokerScript is
+    # already the ONE fixed path this function itself derives (never anything the manifest
+    # supplies), so only reject a symlink swap and then let the SHA-256 content hash below -- the
+    # actual integrity control here -- do the real work.
+    Assert-AgentPathHasNoLinks -Path $expectedBrokerScript
+    if (-not (Test-Path -LiteralPath $expectedBrokerScript -PathType Leaf)) {
+        throw '[broker-attestation-invalid] The pinned broker script does not exist.'
+    }
+    $liveBrokerScriptSha256 = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($expectedBrokerScript))).ToLowerInvariant()
+    if ($claimedBrokerScriptSha256 -cne $liveBrokerScriptSha256) {
+        throw '[broker-attestation-invalid] Broker script content hash does not match the pinned broker executable.'
+    }
+
+    # Independently obtain THIS process's real immediate OS parent -- never trusted from the
+    # manifest, an env var, or a named pipe. Only the operating system itself decides who created
+    # this process.
+    $liveParentPid = Get-AgentImmediateParentProcessId -ProcessId $PID
+    if ($liveParentPid -ne $claimedBrokerPid) {
+        throw '[broker-attestation-invalid] This process was not directly spawned by the broker process named in its own dispatch manifest.'
+    }
+    $liveParentProcess = $null
+    try { $liveParentProcess = Get-Process -Id $liveParentPid -ErrorAction Stop }
+    catch { throw '[broker-attestation-invalid] The claimed broker parent process is no longer running.' }
+    if ((Get-AgentProcessStartIdentity -Process $liveParentProcess) -cne $claimedBrokerStartIdentity) {
+        throw '[broker-attestation-invalid] The claimed broker parent process identity does not match its live start time (possible PID reuse).'
+    }
+    # The live parent being SOME process with a matching PID/start-time is not enough -- an
+    # ordinary caller's own shell truthfully IS its own parent. Require that parent to actually be
+    # running the pinned broker script; a caller who merely reports the truth about their own
+    # shell still fails here.
+    # issue #105 PR5 parent-anchor-spoof fix: a substring/Contains search here was defeated by
+    # launching e.g. `pwsh -NoProfile -Command <payload> "<trusted script path>"` -- the trusted
+    # path is real text in the command line, but only ever as inert, never-executed data. Require
+    # instead the exact positional shape a real broker invocation has, and extract the broker's
+    # own -DescriptorPath argument from that same OS-observed, structurally-validated vector --
+    # never from the manifest alone.
+    $liveParentInvocation = Get-AgentProcessArgv -ProcessId $liveParentPid
+    $liveDescriptorPathFromArgv = Assert-AgentBrokerCommandLineShape -ExecutablePath $liveParentInvocation.ExecutablePath `
+        -Arguments $liveParentInvocation.Arguments -ExpectedBrokerScript $expectedBrokerScript
+
+    # Independently read the pinned, owner-private broker descriptor from its own trusted,
+    # exact-bound location -- the manifest's claimed path is only ever accepted if it resolves to
+    # that exact trusted location; the descriptor's own CONTENT is never trusted from the
+    # manifest, only its digest is compared against what the manifest claims.
+    # issue #105 PR5 parent-anchor-spoof fix: the manifest's brokerDescriptorPath is no longer an
+    # independent authority on its own -- it is only ever accepted once proven to equal the
+    # verified parent's own -DescriptorPath argument above (OS truth), then resolved against the
+    # trusted watch-state root exactly as before. A manifest claiming any other path is rejected
+    # here, before that path is ever touched.
+    $claimedDescriptorFullPath = [IO.Path]::GetFullPath($claimedDescriptorPath)
+    $descriptorPathComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    if (-not $claimedDescriptorFullPath.Equals($liveDescriptorPathFromArgv, $descriptorPathComparison)) {
+        throw '[broker-attestation-invalid] Dispatch manifest broker descriptor path does not match the verified broker process command line.'
+    }
+    $descriptorFullPath = $liveDescriptorPathFromArgv
+    $descriptorParent = Split-Path $descriptorFullPath -Parent
+    $trustedDescriptorRoot = Resolve-AgentTrustedRoot -Path $descriptorParent -Kind watch-state -RepositoryRoot $toolkitRoot
+    $descriptorFullPath = Assert-AgentTrustedFile -Path $descriptorFullPath -AllowedRoot $trustedDescriptorRoot `
+        -ExpectedPath (Join-Path $trustedDescriptorRoot 'broker.descriptor.v1.json') -Private
+    $descriptor = Get-Content -LiteralPath $descriptorFullPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
+    if ([int]$descriptor['schemaVersion'] -ne 1 -or [int]$descriptor['ownerProcessId'] -le 0) {
+        throw '[broker-attestation-invalid] Trusted broker descriptor is malformed.'
+    }
+    if (-not ($descriptor['roles'] -is [Collections.IDictionary]) -or -not $descriptor['roles'].Contains($role)) {
+        throw "[broker-attestation-invalid] Trusted broker descriptor does not authorize role '$role'."
+    }
+    $expectedRoleScripts = @{
+        reviewer = Join-Path $toolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
+        'review-handler' = Join-Path $toolkitRoot 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1'
+    }
+    $roleScriptPath = [string]$descriptor['roles'][$role]['scriptPath']
+    [void](Assert-AgentTrustedFile -Path ([IO.Path]::GetFullPath($roleScriptPath)) `
+        -AllowedRoot $toolkitRoot -ExpectedPath $expectedRoleScripts[$role])
+    # Digested BEFORE any of the per-role mutation the broker itself applies to its own in-memory
+    # copy of this same descriptor -- the broker computes its manifest-bound digest the same way,
+    # from the freshly-parsed, unmutated hashtable, so the two always agree bit-for-bit.
+    $liveDescriptorDigest = Get-AgentCanonicalDigest -InputObject $descriptor
+    if ($liveDescriptorDigest -cne $claimedDescriptorDigest) {
+        throw '[broker-attestation-invalid] Dispatch manifest broker descriptor digest does not match the live trusted descriptor.'
+    }
+}
+
+function Assert-AgentDashboardCommandLineShape {
+    <#
+        Pure, unit-testable structural validator (issue #105 final headless-broker bypass fix):
+        the mirror-image direction of Assert-AgentBrokerCommandLineShape. That function stops a
+        forged CHILD from claiming a fake broker parent; this one stops an ordinary headless
+        caller from running the genuine broker script directly and driving the interactive
+        widening challenge stages itself -- an operator confirmation is an anti-MISTAKE safeguard,
+        never human authentication, but it must be structurally unavailable unless this broker
+        process's own immediate OS parent is the one, fixed, trusted Dashboard launch shape:
+        Start-DevPilotDashboard.ps1's locked Bun runtime running dist/src/index.js
+        (src/DevPilot.Dashboard/src/index.tsx's parseArguments), which then spawns the broker via
+        DispatchClient's own fixed pwsh -File/-DescriptorPath shape (dispatch.ts).
+
+        Exactly like Assert-AgentBrokerCommandLineShape, this is never a substring/Contains
+        search over the parent's command line: it requires the EXACT positions Start-
+        DevPilotDashboard.ps1 itself always emits -- a bare locked Bun executable; the fixed
+        literal token '--conditions=browser'; the one canonical dist/src/index.js entry point;
+        zero or more well-formed --state-dir/--event-log pairs (their VALUES carry no trust
+        weight -- only their shape is checked); then exactly the --broker-executable/
+        --broker-script/--broker-descriptor triple, in that fixed order, whose three values must
+        equal THIS broker process's own live executable path, its own running script path, and
+        its own -DescriptorPath argument -- never anything the parent merely claims. Any
+        deviation (a decoy entry script, an inert extra argument, a -e/eval option, a duplicate or
+        reordered flag, or trailing extra tokens) is a single generic failure, so a forger's
+        near-miss and an ordinary unrelated launcher are rejected identically.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ExecutablePath,
+        [Parameter(Mandatory)][AllowNull()][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$ExpectedBunExecutable,
+        [Parameter(Mandatory)][string]$ExpectedEntryScript,
+        [Parameter(Mandatory)][string]$ExpectedBrokerExecutable,
+        [Parameter(Mandatory)][string]$ExpectedBrokerScript,
+        [Parameter(Mandatory)][string]$ExpectedDescriptorPath
+    )
+    $failure = '[widening-interactive-required] The immediate parent process is not the trusted interactive Dashboard.'
+    $pathComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    function Test-AgentDashboardPathEquals([string]$Supplied, [string]$Expected) {
+        if ([string]::IsNullOrEmpty($Supplied)) { return $false }
+        return ([IO.Path]::GetFullPath($Supplied)).Equals($Expected, $pathComparison)
+    }
+    if (-not (Test-AgentDashboardPathEquals $ExecutablePath $ExpectedBunExecutable)) { throw $failure }
+    $argv = @($Arguments)
+    $i = 0
+    if ($i -ge $argv.Count -or $argv[$i] -cne '--conditions=browser') { throw $failure }
+    $i++
+    if ($i -ge $argv.Count -or -not (Test-AgentDashboardPathEquals $argv[$i] $ExpectedEntryScript)) { throw $failure }
+    $i++
+    while ($i -lt $argv.Count -and $argv[$i] -cin @('--state-dir', '--event-log')) {
+        $i += 2
+        if ($i -gt $argv.Count) { throw $failure }
+    }
+    $expectedTriple = [ordered]@{
+        '--broker-executable' = $ExpectedBrokerExecutable
+        '--broker-script' = $ExpectedBrokerScript
+        '--broker-descriptor' = $ExpectedDescriptorPath
+    }
+    foreach ($flag in $expectedTriple.Keys) {
+        if ($i -ge $argv.Count -or $argv[$i] -cne $flag) { throw $failure }
+        $i++
+        if ($i -ge $argv.Count -or -not (Test-AgentDashboardPathEquals $argv[$i] $expectedTriple[$flag])) { throw $failure }
+        $i++
+    }
+    if ($i -ne $argv.Count) { throw $failure }
+}
+
+function Test-AgentDashboardLaunchProvenance {
+    <#
+        issue #105 final headless-broker bypass fix: an ordinary headless caller can run the
+        genuine broker script directly (`pwsh -File Invoke-DevPilotAgentDispatch.ps1
+        -DescriptorPath ...`) and drive both interactive-widening challenge stages entirely
+        itself -- describe-widening/confirm-widening-preview/confirm-widening-mint never
+        required anything beyond knowing the JSONL protocol shape. Those confirmations are
+        anti-MISTAKE safeguards (catching a wrong role/capability/typo), never human
+        authentication, but making them reachable AT ALL must be structurally unavailable unless
+        this broker process was itself spawned by the trusted interactive Dashboard.
+
+        Called ONCE at broker startup (the result never changes for the life of this broker
+        process -- there is no later re-launch to re-anchor against). Returns $false, and NEVER
+        throws, whenever launch provenance cannot be established for ANY reason: a missing/exited
+        parent, a permission failure reading its live process record, or a structural command-line
+        mismatch are all indistinguishable "provenance cannot be established" outcomes, and all
+        fail closed identically -- the caller gets no oracle for which check actually failed.
+
+        This determination gates ONLY the interactive-widening RPCs (describe-widening/
+        confirm-widening-preview/confirm-widening-mint/cancel-widening) and dispatch of an
+        already-minted grant. Baseline describe/profile/manual (unwidened) dispatch are
+        completely unaffected, so every existing noninteractive protocol test keeps passing
+        exactly as before.
+
+        ANTI-MISTAKE BOUNDARY (do not oversell this): this proves the immediate OS parent really
+        is the one, fixed, trusted Dashboard launch shape -- it is NOT proof of human presence at
+        a keyboard. Automating input into a genuinely-launched interactive Dashboard process is
+        entirely outside this check's scope; it defends only against an ordinary headless/
+        script/CLI caller who never went through the Dashboard at all, exactly like
+        Assert-AgentBrokerProcessAnchor's own documented boundary for the mirror-image direction.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ToolkitRoot,
+        [Parameter(Mandatory)][string]$BrokerScriptPath,
+        [Parameter(Mandatory)][string]$DescriptorPath
+    )
+    try {
+        $dashboardRoot = Join-Path (Join-Path $ToolkitRoot 'src') 'DevPilot.Dashboard'
+        $bunExecutableName = if ($IsWindows) { 'bun.exe' } else { 'bun' }
+        $expectedBunExecutable = [IO.Path]::GetFullPath(
+            (Join-Path $dashboardRoot (Join-Path 'node_modules' (Join-Path 'bun' (Join-Path 'bin' $bunExecutableName)))))
+        $expectedEntryScript = [IO.Path]::GetFullPath((Join-Path $dashboardRoot (Join-Path 'dist' (Join-Path 'src' 'index.js'))))
+        $expectedBrokerScript = [IO.Path]::GetFullPath($BrokerScriptPath)
+        $expectedDescriptorPath = [IO.Path]::GetFullPath($DescriptorPath)
+        # This process's own live executable image path, from the same OS-native probe used for
+        # the parent below -- never $PSCommandPath (that names the SCRIPT, not the host binary)
+        # and never a guessed/derived path, so this always agrees with whatever the real running
+        # pwsh host actually is, including on hosts where multiple pwsh installs exist on PATH.
+        $ownInvocation = Get-AgentProcessArgv -ProcessId $PID
+        $expectedBrokerExecutable = [IO.Path]::GetFullPath($ownInvocation.ExecutablePath)
+
+        # Independently obtain THIS process's real immediate OS parent -- never trusted from an
+        # environment variable or anything the parent could otherwise merely claim about itself.
+        $liveParentPid = Get-AgentImmediateParentProcessId -ProcessId $PID
+        $liveParentProcess = Get-Process -Id $liveParentPid -ErrorAction Stop
+        # Bind the parent's own start-time identity purely to guard the narrow window between
+        # reading its PID and opening its process handle above -- the same PID-reuse discipline
+        # Assert-AgentBrokerProcessAnchor applies for the mirror-image (child->broker) anchor.
+        # There is no separate manifest claim to compare it against here; requiring it to be
+        # obtainable at all is itself part of establishing a genuinely live, well-formed process.
+        [void](Get-AgentProcessStartIdentity -Process $liveParentProcess)
+        $liveParentInvocation = Get-AgentProcessArgv -ProcessId $liveParentPid
+        Assert-AgentDashboardCommandLineShape -ExecutablePath $liveParentInvocation.ExecutablePath `
+            -Arguments $liveParentInvocation.Arguments -ExpectedBunExecutable $expectedBunExecutable `
+            -ExpectedEntryScript $expectedEntryScript -ExpectedBrokerExecutable $expectedBrokerExecutable `
+            -ExpectedBrokerScript $expectedBrokerScript -ExpectedDescriptorPath $expectedDescriptorPath
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-AgentHashtableMemberOrNull {
+    param([Parameter(Mandatory)][hashtable]$Table, [Parameter(Mandatory)][string]$Name)
+    if ($Table.Contains($Name) -and $null -ne $Table[$Name]) { return $Table[$Name] }
+    return $null
+}
+
+function Test-AgentAutoCompleteGrantWouldBeNoOp {
+    <#
+        Issue #105 PR4 / requirement 6: a review-handler EnableAutoComplete grant must never be
+        allowed to reach dispatch when the SAME forced-redispatch-read-only condition
+        Start-ReviewHandlerAgent.ps1 itself already applies ($ForceAnalysis -and durable handled-
+        state already has a record for this PR) would make the grant a silent no-op -- the child
+        always runs manual dispatch with -ForceAnalysis (unaffected by this change; only reviewer
+        vote-grant dispatch omits it, see the broker), so `$forcedRedispatchReadOnly` would suppress
+        EnableAutoComplete (and every other write capability) on the child regardless of what the
+        broker granted. This mirrors, rather than duplicates, that exact condition so the two can
+        never independently drift: HandledState.ContainsKey(PullRequestId), nothing more.
+    #>
+    param([Parameter(Mandatory)][hashtable]$HandledState, [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId)
+    return $HandledState.ContainsKey([string]$PullRequestId)
+}
+
+function Resolve-AgentWideningEffectiveDiff {
+    <#
+        Shared, pure blast-radius renderer for the widening protocol's describe/confirm-preview
+        steps (issue #105 PR4): given the current (unwidened) partition and the candidate (widened)
+        partition, returns the exact set of capabilities the grant would add (always exactly the one
+        GrantCapability, restated here rather than trusted from the caller) plus, for the reviewer
+        role's EnableApprovalVote specifically, the paired capability (EnableFindingComments) the
+        widened dispatch requires to already be active -- Start-ReviewerAgent.ps1 itself refuses to
+        start with EnableApprovalVote set and EnableFindingComments not (issue #105 PR4 requirement
+        6), so a widening whose paired capability is not currently active can mint a grant that can
+        never actually be dispatched; callers surface PairedCapabilityActive so the operator sees
+        this BEFORE minting, not as a dispatch-time surprise.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Current,
+        [Parameter(Mandatory)][hashtable]$Widened,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][string]$GrantCapability
+    )
+    $pairedCapability = if ($Role -eq 'reviewer' -and $GrantCapability -ceq 'EnableApprovalVote') { 'EnableFindingComments' } else { $null }
+    return [ordered]@{
+        addedCapabilities = @($Widened.capabilities | Where-Object { $Current.capabilities -cnotcontains $_ } | Sort-Object -Unique)
+        removedDenies     = @($Current.mandatoryDenies | Where-Object { $Widened.mandatoryDenies -cnotcontains $_ } | Sort-Object -Unique)
+        pairedCapability  = $pairedCapability
+        pairedCapabilityActive = if ($pairedCapability) { [bool]($Widened.capabilities -ccontains $pairedCapability) } else { $true }
+    }
+}
+
+function Enter-AgentCapabilityOverrideLock {
+    <#
+        Same exclusive, FileShare.None-backed advisory file lock idiom as Enter-AgentWorkLease/
+        Enter-AgentDurableStateLock, against one lock file at the root of the capability-override
+        store. No writer takes this lock yet in this change (TUI edit/reset/kill switch is PR3);
+        Enter-AgentManualDispatchStartup is its first caller, holding it across live re-verification
+        through the ready/proceed handshake so no future cooperating writer can narrow settings out
+        from under an in-flight startup decision.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [ValidateRange(0, 30000)][int]$TimeoutMilliseconds = 2000,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
+    )
+    $root = Get-AgentCapabilityOverrideRoot -RepositoryRoot $RepositoryRoot
+    return Enter-AgentExclusiveFile -Path (Join-Path $root 'capability-overrides.lock') `
+        -ContentionReason capability-override-contended -TimeoutMilliseconds $TimeoutMilliseconds `
+        -CancellationToken $CancellationToken -Metadata @{}
+}
+
+# ---------------------------------------------------------------------------
+# TUI edit/diff/reset UX + emergency kill switch (PR3): the first, and only, supported writer for
+# the outside-repository capability-override store PR2 introduced. Every mutation goes through
+# Set-AgentCapabilityOverrideSetting (atomic temp-write-then-replace, one scope file at a time) or
+# Enable-/Disable-AgentCapabilityOverrideKillSwitch (a separate owner-private sentinel, deliberately
+# outside the versioned v1 store so a future schema bump never orphans it). Callers are required
+# to hold Enter-AgentCapabilityOverrideLock for the same RepositoryRoot before calling any of these,
+# exactly like Write-AgentDurableState is always called under Enter-AgentDurableStateLock, so every
+# supported writer and every reader that must observe a consistent snapshot
+# (Resolve-AgentEffectiveCapabilitySettings via Get-BrokerCapabilityProfile,
+# Enter-AgentManualDispatchStartup) serializes through the identical single lock.
+# ---------------------------------------------------------------------------
+
+function Get-AgentDefaultCapabilityOverrideKillSwitchRoot {
+    <#
+        A dedicated root, sibling to (never nested under) the versioned 'capability-overrides\v1'
+        store -- deliberately its own independently-created-and-hardened directory rather than the
+        literal filesystem parent of the v1 root. That parent can already exist as a side effect of
+        Get-AgentCapabilityOverrideRoot's New-Item -Force creating 'v1' underneath it, in which case
+        Resolve-AgentTrustedRoot would see it as pre-existing and skip its own one-time
+        ACL-hardening branch, silently leaving it on whatever permissions it happened to inherit. A
+        brand-new path nothing else ever creates has no such history: the first
+        Enable-AgentCapabilityOverrideKillSwitch call is guaranteed to be the call that creates it,
+        so Resolve-AgentTrustedRoot's hardening branch always actually runs. This still satisfies
+        "outside the v1 child scope": a future schema version bump to the override store itself
+        never touches this path.
+    #>
+    if ($IsWindows) {
+        if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is required to resolve the capability-override kill-switch root on Windows.' }
+        return (Join-Path (Join-Path $env:LOCALAPPDATA 'DevPilot') 'capability-overrides.disabled')
+    }
+    $base = if ($env:XDG_STATE_HOME) { $env:XDG_STATE_HOME } else { Join-Path (Join-Path $HOME '.local') 'state' }
+    return (Join-Path (Join-Path $base 'devpilot') 'capability-overrides.disabled')
+}
+
+function Get-AgentCapabilityOverrideKillSwitchDisallowedRoots {
+    [Collections.Generic.List[string]]::new([string[]]@(
+            (Get-AgentDefaultDurableStateRoot), (Get-AgentDefaultLeaseRoot), (Get-AgentDefaultWatchStateRoot),
+            (Get-AgentDefaultCapabilityOverrideRoot)))
+}
+
+# Same epoch-seconds ceiling the dashboard enforces for this identical wire value (issue #105 PR3
+# closure -- see dispatch.ts's MAX_KILL_SWITCH_EPOCH_SECONDS): the sentinel's own TTL is capped at
+# 24h (Enable-AgentCapabilityOverrideKillSwitch's -TtlSeconds ValidateRange), so a legitimate
+# enabledAtUtc/expiresAtUtc is always within about a day of "now". Year 2200 leaves enormous
+# headroom for clock skew while still rejecting a clearly-bogus timestamp a tampered or
+# foreign-schema sentinel could otherwise smuggle through. Kept as one shared value so the harness
+# and dashboard can never disagree about what "a plausible expiry" means for the same field.
+$script:AgentCapabilityOverrideKillSwitchMaxEpochSeconds = 7258118400 # 2200-01-01T00:00:00Z
+
+function ConvertTo-AgentSafeIntegralNumber {
+    <#
+        Strict numeric gate shared by every field Read-AgentCapabilityOverrideKillSwitchSentinel
+        validates before ever casting to [long] (issue #105 PR3 closure). PowerShell's own [long]
+        cast operator silently BANKER'S-ROUNDS a fractional double (1.1 -> 1, 2.5 -> 2) instead of
+        rejecting it, and THROWS an unhandled RuntimeException on a huge/NaN/infinite double (1e20,
+        1e400, NaN) instead of failing closed -- both are real JSON-parser outputs
+        (ConvertFrom-Json turns an oversized exponent like 1e400 into [double]::PositiveInfinity
+        rather than erroring). This collapses both failure modes into a single "not a valid
+        sentinel integer" signal: returns $null for anything that is not exactly an int/long/double
+        holding a finite, integral value inside the +-2^53 "safe integer" span (the same boundary
+        Number.isSafeInteger enforces on the dashboard side of this exact wire value) -- never a
+        silently-rounded or silently-overflowed approximation. Callers must check for $null
+        explicitly (never falsy-check the return) since 0 is a valid result.
+    #>
+    param([Parameter(Mandatory)][AllowNull()]$Value)
+    if ($Value -isnot [double] -and $Value -isnot [long] -and $Value -isnot [int]) { return $null }
+    $asDouble = [double]$Value
+    if ([double]::IsNaN($asDouble) -or [double]::IsInfinity($asDouble)) { return $null }
+    if ($asDouble -ne [Math]::Truncate($asDouble)) { return $null }
+    if ($asDouble -lt -9007199254740991.0 -or $asDouble -gt 9007199254740991.0) { return $null }
+    return [long]$asDouble
+}
+
+function Read-AgentCapabilityOverrideKillSwitchSentinel {
+    <#
+        Single-source-of-truth sentinel parser/validator shared by
+        Get-AgentCapabilityOverrideKillSwitchState (read path) and
+        Enable-AgentCapabilityOverrideKillSwitch (write path) -- issue #105 PR3 completion. Neither
+        caller re-implements its own parsing, so the two can never disagree about what makes a
+        sentinel valid.
+
+        Returns @{ Status = 'absent' | 'active' | 'expired' | 'malformed'; ExpiresAtUtc = [Nullable[long]] }:
+          - 'absent': no sentinel file exists.
+          - 'active': a well-formed, non-expired sentinel; ExpiresAtUtc is its raw epoch-seconds value.
+          - 'expired': a well-formed but expired sentinel -- ALREADY DELETED by this call (the same
+            cleanup-on-observation behavior this function has always had), so no caller ever sees a
+            stale file after this returns.
+          - 'malformed': the file exists but fails validation (unparseable JSON, a non-object body,
+            a field outside the exact allowed set, a missing/wrong schemaVersion, or a missing/
+            non-numeric enabledAtUtc/expiresAtUtc, a fractional/NaN/infinite/out-of-safe-range
+            numeric value (schemaVersion must be EXACTLY integral 1 -- 1.1 or 1.0000001 is
+            malformed, not silently rounded), an expiresAtUtc before enabledAtUtc, an
+            enabledAtUtc/expiresAtUtc TTL delta outside [60, 86400] seconds, or either timestamp
+            beyond the shared year-2200 wire ceiling). Never deleted here -- a malformed sentinel is
+            left in place for an operator to inspect rather than silently discarded, and its very
+            existence is what makes Enable-AgentCapabilityOverrideKillSwitch fail closed with an
+            explicit error instead of guessing at a migration. A missing expiresAtUtc is
+            deliberately 'malformed', never 'active' with a null expiry -- a kill switch can never
+            be indefinitely active by omission (issue #105 PR3 review). None of these checks ever
+            throw on bad input (issue #105 PR3 closure) -- see ConvertTo-AgentSafeIntegralNumber.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Path
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @{ Status = 'absent'; ExpiresAtUtc = $null } }
+    $trustedPath = Assert-AgentTrustedFile -Path $Path -AllowedRoot $Root -ExpectedPath $Path -Private
+    $stable = Read-AgentStableFile -Path $trustedPath -MaxBytes 65536
+    if (-not $stable.Exists) { return @{ Status = 'absent'; ExpiresAtUtc = $null } }
+    try {
+        $sentinel = [Text.Encoding]::UTF8.GetString($stable.Bytes) | ConvertFrom-Json -AsHashtable -Depth 5
+    }
+    catch { return @{ Status = 'malformed'; ExpiresAtUtc = $null } }
+    if ($sentinel -isnot [Collections.IDictionary]) { return @{ Status = 'malformed'; ExpiresAtUtc = $null } }
+    $allowedFields = [string[]]@('schemaVersion', 'enabledAtUtc', 'expiresAtUtc')
+    foreach ($key in @($sentinel.Keys)) {
+        if ($allowedFields -cnotcontains $key) { return @{ Status = 'malformed'; ExpiresAtUtc = $null } }
+    }
+    if (-not $sentinel.Contains('schemaVersion') -or -not $sentinel.Contains('enabledAtUtc') -or
+        -not $sentinel.Contains('expiresAtUtc')) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    $schemaVersion = ConvertTo-AgentSafeIntegralNumber $sentinel['schemaVersion']
+    if ($null -eq $schemaVersion -or $schemaVersion -ne 1) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    $enabledAtUtc = ConvertTo-AgentSafeIntegralNumber $sentinel['enabledAtUtc']
+    $expiresAtUtc = ConvertTo-AgentSafeIntegralNumber $sentinel['expiresAtUtc']
+    if ($null -eq $enabledAtUtc -or $null -eq $expiresAtUtc) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    if ($enabledAtUtc -lt 0 -or $enabledAtUtc -gt $script:AgentCapabilityOverrideKillSwitchMaxEpochSeconds -or
+        $expiresAtUtc -lt 0 -or $expiresAtUtc -gt $script:AgentCapabilityOverrideKillSwitchMaxEpochSeconds) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    # enabledAtUtc can never be after expiresAtUtc, and the gap between them must land inside the
+    # exact TTL window Enable-AgentCapabilityOverrideKillSwitch's own -TtlSeconds
+    # ValidateRange(60, 86400) allows -- a tampered or foreign-schema sentinel could otherwise claim
+    # an implausible negative, one-second, or one-year lifetime this process itself never writes.
+    if ($expiresAtUtc -lt $enabledAtUtc) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    $ttlSeconds = $expiresAtUtc - $enabledAtUtc
+    if ($ttlSeconds -lt 60 -or $ttlSeconds -gt 86400) {
+        return @{ Status = 'malformed'; ExpiresAtUtc = $null }
+    }
+    if ($expiresAtUtc -le (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow))) {
+        Assert-AgentPathHasNoLinks -Path $Path
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return @{ Status = 'expired'; ExpiresAtUtc = $null }
+    }
+    return @{ Status = 'active'; ExpiresAtUtc = $expiresAtUtc }
+}
+
+function Get-AgentCapabilityOverrideKillSwitchState {
+    <#
+        Emergency operational lever (PR3): existence of a VALID sentinel file is authoritative for
+        Active -- content is parsed/validated (never merely tested for existence) via the shared
+        Read-AgentCapabilityOverrideKillSwitchSentinel, which also enforces the sentinel's TTL
+        (default one hour -- see Enable-AgentCapabilityOverrideKillSwitch's TtlSeconds), so a
+        forgotten "ignore local narrowing overrides" toggle can never silently persist forever
+        (issue #105 PR3 review). A missing/invalid schemaVersion, a disallowed field, or a missing
+        TTL makes the sentinel 'malformed', which this treats as fail-closed INACTIVE -- never as
+        indefinitely active (issue #105 PR3 completion). This never throws on a malformed sentinel
+        (unlike Enable-AgentCapabilityOverrideKillSwitch's explicit rejection of the same
+        condition): describe/profile/capability resolution must keep working even with a corrupt
+        local sentinel. An expired (but well-formed) sentinel is cleaned up (deleted) the first
+        time anything observes it past expiry, rather than left for a separate janitor to find --
+        safe because every caller of this helper (Test-AgentCapabilityOverrideKillSwitch,
+        Resolve-AgentEffectiveCapabilitySettings, Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc)
+        is only ever invoked while the caller already holds Enter-AgentCapabilityOverrideLock,
+        exactly like every writer in this module. Checked via a cheap Test-Path against the
+        (possibly still nonexistent) kill-switch root FIRST, so a machine that has never toggled
+        the kill switch never pays the cost of, or triggers, ACL/symlink hardening on every
+        describe/profile call.
+
+        Shared, single-source-of-truth sentinel reader (issue #105 PR3 completion) behind the
+        boolean Test-AgentCapabilityOverrideKillSwitch gate, Resolve-AgentEffectiveCapabilitySettings's
+        KillSwitchExpiresAtUtc wire field, and Invoke-SetKillSwitch's response (via
+        Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc) -- exactly one place parses/expires the
+        sentinel, so none of those three callers can ever disagree about whether the lever is
+        active or when it expires. Returns @{ Active = [bool]; ExpiresAtUtc = [Nullable[long]] };
+        ExpiresAtUtc is the raw epoch-seconds sentinel value (only meaningful while Active is
+        $true), never reformatted here -- callers decide their own wire/return representation.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+    if (-not (Test-Path -LiteralPath $default -PathType Container)) { return @{ Active = $false; ExpiresAtUtc = $null } }
+    $root = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
+        -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots)
+    $sentinel = Read-AgentCapabilityOverrideKillSwitchSentinel -Root $root -Path (Join-Path $root 'sentinel.json')
+    if ($sentinel.Status -eq 'active') { return @{ Active = $true; ExpiresAtUtc = $sentinel.ExpiresAtUtc } }
+    return @{ Active = $false; ExpiresAtUtc = $null }
+}
+
+function Test-AgentCapabilityOverrideKillSwitch {
+    <#
+        Boolean gate wrapping Get-AgentCapabilityOverrideKillSwitchState -- see that function for
+        the sentinel/TTL/cleanup semantics this preserves unchanged.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    return (Get-AgentCapabilityOverrideKillSwitchState -RepositoryRoot $RepositoryRoot).Active
+}
+
+function Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc {
+    <#
+        Broker-facing accessor for Invoke-SetKillSwitch's response (issue #105 PR3 completion): the
+        one kill-switch caller that is NOT already threaded through
+        Resolve-AgentEffectiveCapabilitySettings's Override object, because that resolver is
+        PR-scoped (requires a PullRequestId/CurrentSourceCommit binding) and set-kill-switch is
+        deliberately not bound to any one pull request. Returns the same raw epoch-seconds value
+        (or $null when inactive) Resolve-AgentEffectiveCapabilitySettings itself would report via
+        KillSwitchExpiresAtUtc for the identical shared sentinel state, so a caller can never
+        observe a different answer than the profile/describe path would for the same instant.
+        Caller must hold Enter-AgentCapabilityOverrideLock, exactly like every other kill-switch
+        primitive in this module.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    return (Get-AgentCapabilityOverrideKillSwitchState -RepositoryRoot $RepositoryRoot).ExpiresAtUtc
+}
+
+function Enable-AgentCapabilityOverrideKillSwitch {
+    <#
+        Idempotent: enabling an already-active kill switch is a no-op, never a second write, and
+        never restarts/extends the already-running TTL window -- it returns that active sentinel's
+        OWN actual expiry (issue #105 PR3 completion), not a newly-computed one, so a caller can
+        never be told a fresher expiry than what is really persisted.
+
+        Reads and validates the existing sentinel under the caller-held
+        Enter-AgentCapabilityOverrideLock via the same shared
+        Read-AgentCapabilityOverrideKillSwitchSentinel Get-AgentCapabilityOverrideKillSwitchState
+        uses, before ever deciding whether to write (issue #105 PR3 completion):
+          - 'active'    -> idempotent no-op; returns the sentinel's real Active/ExpiresAtUtc.
+          - 'expired'   -> the shared reader has ALREADY removed the stale file; a fresh sentinel is
+                           written atomically, exactly as if none had existed.
+          - 'absent'    -> a fresh sentinel is written atomically.
+          - 'malformed' -> fails closed with an explicit error instead of guessing at a migration or
+                           silently overwriting -- there is no documented schema-migration rule for
+                           this sentinel (schemaVersion has only ever been 1), so an operator must
+                           resolve it (typically by deleting the bad file) rather than have this
+                           silently replace or silently honor it. A missing TTL is one of the
+                           conditions this rejects; it is never treated as "active forever".
+
+        Atomic owner-private create via the same temp-write-then-replace idiom every other writer
+        in this store uses (Write-AgentFileThrough + Install-AgentFileAtomic) -- no partial file is
+        ever observable at the final path. Caller must hold Enter-AgentCapabilityOverrideLock.
+        TtlSeconds (issue #105 PR3 review): the emergency lever is short-lived by design -- default
+        one hour -- so it can never be silently left on indefinitely; see
+        Get-AgentCapabilityOverrideKillSwitchState for the corresponding enforcement/cleanup.
+
+        Returns @{ Active = $true; ExpiresAtUtc = [long] } on success (idempotent or freshly
+        written); throws [kill-switch-invalid] on a malformed pre-existing sentinel.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [ValidateRange(60, 86400)][int]$TtlSeconds = 3600
+    )
+    $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+    $root = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
+        -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots) -Create
+    $path = Join-Path $root 'sentinel.json'
+    $existing = Read-AgentCapabilityOverrideKillSwitchSentinel -Root $root -Path $path
+    if ($existing.Status -eq 'active') { return @{ Active = $true; ExpiresAtUtc = $existing.ExpiresAtUtc } }
+    if ($existing.Status -eq 'malformed') {
+        throw "[kill-switch-invalid] Existing kill-switch sentinel at '$path' failed validation (unexpected schema, disallowed field, non-integral/out-of-range timestamp, bad enabledAtUtc/expiresAtUtc ordering, or missing/invalid TTL); refusing to enable. Remove the file to recover."
+    }
+    $enabledAtUtc = [DateTime]::UtcNow
+    $expiresAtUtcValue = ConvertTo-AgentCanonicalEpochSeconds $enabledAtUtc.AddSeconds($TtlSeconds)
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-AgentCanonicalJson ([ordered]@{
+                    schemaVersion = 1
+                    enabledAtUtc = (ConvertTo-AgentCanonicalEpochSeconds $enabledAtUtc)
+                    expiresAtUtc = $expiresAtUtcValue
+                })))
+    $tempPath = Join-Path $root "sentinel.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        Write-AgentFileThrough -Path $tempPath -Bytes $bytes
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($tempPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        Install-AgentFileAtomic -Source $tempPath -Destination $path
+    }
+    finally {
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    }
+    return @{ Active = $true; ExpiresAtUtc = $expiresAtUtcValue }
+}
+
+function Disable-AgentCapabilityOverrideKillSwitch {
+    <#
+        Idempotent: disabling an already-disabled (or never-enabled) kill switch is a no-op.
+        Caller must hold Enter-AgentCapabilityOverrideLock.
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    $default = Get-AgentDefaultCapabilityOverrideKillSwitchRoot
+    if (-not (Test-Path -LiteralPath $default -PathType Container)) { return }
+    $root = Resolve-AgentTrustedRoot -Path $default -Kind capability-overrides -RepositoryRoot $RepositoryRoot `
+        -DisallowedRoots (Get-AgentCapabilityOverrideKillSwitchDisallowedRoots)
+    $path = Join-Path $root 'sentinel.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
+    Assert-AgentPathHasNoLinks -Path $path
+    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+}
+
+function Set-AgentCapabilityOverrideSetting {
+    <#
+        THE atomic writer PR3 introduces: the only supported way any code narrows or resets a
+        persisted capability-override entry. Caller must already hold
+        Enter-AgentCapabilityOverrideLock for the same RepositoryRoot -- this function does not take
+        the lock itself, mirroring every other write-adjacent primitive in this module (e.g.
+        Write-AgentDurableState, always called from inside a caller-held lock).
+
+        'off' upserts the single named capability as 'off' in the selected scope's settings file.
+        'inherit' removes that single entry -- 'inherit' is never itself persisted as a settings
+        value (PR2's schema never accepted it as one). If removing (or never having added) any
+        entries leaves the scope's settings object empty, the file itself is deleted instead of
+        being written back as a near-empty residue record, atomically and safely, so a
+        never-edited scope and a fully-reset scope are indistinguishable on disk -- exactly like
+        PR2's existing "absent file means inherit" contract.
+
+        Every write is round-trip validated (re-parsed through the identical trusted reader a
+        future caller will use) before ever touching disk, and lands via the same
+        temp-file-in-the-same-directory + flush + atomic replace/rename idiom as every other write
+        in this module -- no partial file is ever observable at the final path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$CurrentSourceCommit,
+        [Parameter(Mandatory)][ValidateSet('machine', 'user', 'repo-worktree', 'pr')][string]$Scope,
+        [Parameter(Mandatory)][ValidatePattern('^[A-Za-z][A-Za-z0-9]*$')][string]$Capability,
+        [Parameter(Mandatory)][ValidateSet('off', 'inherit')][string]$Action,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$AllowedCapabilities,
+        [ValidateRange(60, 31536000)][int]$PrScopeTtlSeconds = 2592000
+    )
+    if ($AllowedCapabilities -cnotcontains $Capability) {
+        throw "[narrowing-invalid] Capability '$Capability' is not a recognized manually-selectable capability."
+    }
+    $root = Get-AgentCapabilityOverrideRoot -RepositoryRoot $RepositoryRoot
+    $repositoryKey = Get-AgentRepositoryIdentityKey -RepositoryIdentity $RepositoryIdentity
+    $worktreeId = Get-AgentWorktreeIdentity -RepositoryRoot $RepositoryRoot
+    $repoRoot = Join-Path (Join-Path $root 'repo') (Get-AgentSha256 -Text $repositoryKey)
+    $path = switch ($Scope) {
+        'machine' { Join-Path $root 'machine.settings.v1.json' }
+        'user' { Join-Path $root 'user.settings.v1.json' }
+        'repo-worktree' { Join-Path $repoRoot "$worktreeId.settings.v1.json" }
+        'pr' { Join-Path (Join-Path $repoRoot 'pr') "$PullRequestId-$($CurrentSourceCommit.Substring(0, 12)).settings.v1.json" }
+    }
+    $path = [IO.Path]::GetFullPath($path)
+    if (-not (Test-AgentPathWithin -Path $path -Root $root)) {
+        throw '[narrowing-invalid] Resolved settings path escaped the capability-override root.'
+    }
+    $parent = Split-Path $path -Parent
+    # First-write dynamic parent creation (issue #105 PR3 review): repo-worktree/pr scopes create
+    # nested directories ('repo\<hash>' and 'repo\<hash>\pr') lazily, on the first override ever
+    # written for that repository/worktree/PR -- unlike the store root itself (hardened once by
+    # Resolve-AgentTrustedRoot), nothing validated these deeper, dynamically-created path segments
+    # before now. Checked for a planted link/junction/reparse point both BEFORE creating (catches
+    # an ancestor an attacker already planted) and AFTER (catches one swapped in during the TOCTOU
+    # window the New-Item call itself opens), mirroring Resolve-AgentTrustedRoot's own
+    # check-create-recheck idiom exactly.
+    Assert-AgentPathHasNoLinks -Path $parent
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($parent, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
+        }
+    }
+    Assert-AgentPathHasNoLinks -Path $parent
+    $existingSettings = [ordered]@{}
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        $trustedPath = Assert-AgentTrustedFile -Path $path -AllowedRoot $root -Private
+        $stable = Read-AgentStableFile -Path $trustedPath -MaxBytes 65536
+        if ($stable.Exists) {
+            $existingRecord = ConvertFrom-AgentTrustedCapabilityJson -Bytes $stable.Bytes -SourceScope $Scope -AllowedCapabilities $AllowedCapabilities
+            foreach ($key in @($existingRecord.Settings.Keys)) { $existingSettings[$key] = $existingRecord.Settings[$key] }
+        }
+    }
+    if ($Action -ceq 'off') { $existingSettings[$Capability] = 'off' } else { $existingSettings.Remove($Capability) }
+
+    if ($existingSettings.Count -eq 0) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Assert-AgentPathHasNoLinks -Path $path
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+        return
+    }
+    $record = [ordered]@{ schemaVersion = 1; settings = $existingSettings }
+    if ($Scope -eq 'repo-worktree' -or $Scope -eq 'pr') {
+        $record.repositoryKey = $repositoryKey
+        $record.worktreeId = $worktreeId
+    }
+    if ($Scope -eq 'pr') {
+        $record.pullRequestId = $PullRequestId
+        $record.sourceCommit = $CurrentSourceCommit
+        $record.expiresAtUtc = (ConvertTo-AgentCanonicalEpochSeconds ([DateTime]::UtcNow.AddSeconds($PrScopeTtlSeconds)))
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($record | ConvertTo-Json -Compress -Depth 8))
+    # Round-trip validated before ever touching disk: the bytes about to be written must themselves
+    # parse back through the exact same trusted parser a future reader will use, with the identical
+    # settings -- catches a schema/serialization mismatch here, synchronously, rather than
+    # persisting a file this store's own reader could later reject or misinterpret.
+    $roundTrip = ConvertFrom-AgentTrustedCapabilityJson -Bytes $bytes -SourceScope $Scope -AllowedCapabilities $AllowedCapabilities
+    if ((ConvertTo-AgentCanonicalJson $roundTrip.Settings) -cne (ConvertTo-AgentCanonicalJson $existingSettings)) {
+        throw '[narrowing-invalid] Serialized settings failed round-trip validation.'
+    }
+    $tempPath = Join-Path $parent ("{0}.tmp-{1}-{2}" -f (Split-Path $path -Leaf), $PID, ([Guid]::NewGuid().ToString('N')))
+    try {
+        Write-AgentFileThrough -Path $tempPath -Bytes $bytes
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($tempPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        Install-AgentFileAtomic -Source $tempPath -Destination $path
+    }
+    finally {
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Enter-AgentManualDispatchStartup {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$ManifestPath,
         [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][hashtable]$DurableContext,
         [Parameter(Mandatory)][string]$LeaseRoot,
         [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
@@ -1083,13 +3181,27 @@ function Enter-AgentManualDispatchStartup {
     $mandatoryDenies = @($manifest.policy.mandatoryDenies)
     $boundNames = @($BoundCapabilities.Keys)
     $actualCapabilities = @($boundNames | Where-Object { [bool]$BoundCapabilities[$_] } | Sort-Object -Unique)
+    # issue #105 PR4: a manifest MAY carry a single ephemeral, draft-bound widening grant. Ordinarily
+    # the role's own single delegable capability (requiredDeny) must always sit in mandatoryDenies,
+    # never capabilities -- a grant is the ONE exception, and only for that exact capability. The
+    # grant itself is re-verified in full (sealed artifact, delegation policy, expiry, no-op guard)
+    # under the capability-override lock below, before ready is ever sent; this check only pins the
+    # shape the manifest must already have for that later verification to make sense.
+    $grantCapability = if ($manifest.Contains('grantCapability') -and $manifest['grantCapability']) { [string]$manifest['grantCapability'] } else { $null }
+    $requiredDenyConsistent = if ($grantCapability) {
+        $grantCapability -ceq $requiredDeny -and $mandatoryDenies -cnotcontains $requiredDeny -and $capabilities -ccontains $requiredDeny
+    }
+    else {
+        $mandatoryDenies -ccontains $requiredDeny
+    }
     if ([int]$manifest.schemaVersion -ne 1 -or [string]$manifest.role -cne $Role -or
         [string]$manifest.policy.role -cne $Role -or
         [string]$manifest.dispatchId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
-        $mandatoryDenies -cnotcontains $requiredDeny -or
+        ($grantCapability -and [string]$manifest['dispatchDraftId'] -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') -or
+        -not $requiredDenyConsistent -or
         @($capabilities | Where-Object { $mandatoryDenies -ccontains $_ }).Count -gt 0 -or
-        @($capabilities | Where-Object { $allowedCapabilities -cnotcontains $_ }).Count -gt 0 -or
-        @($boundNames | Where-Object { ($_ -cnotin $allowedCapabilities) -and ($_ -cnotin $mandatoryDenies) }).Count -gt 0 -or
+        @($capabilities | Where-Object { $allowedCapabilities -cnotcontains $_ -and $_ -cne $grantCapability }).Count -gt 0 -or
+        @($boundNames | Where-Object { ($_ -cnotin $allowedCapabilities) -and ($_ -cnotin $mandatoryDenies) -and ($_ -cne $grantCapability) }).Count -gt 0 -or
         @($mandatoryDenies | Where-Object {
                 -not $BoundCapabilities.ContainsKey($_) -or [bool]$BoundCapabilities[$_]
             }).Count -gt 0 -or
@@ -1101,6 +3213,34 @@ function Enter-AgentManualDispatchStartup {
     if ($policy -cne [string]$manifest.capabilityPolicyDigest) {
         throw '[policy-changed] Manual dispatch policy digest does not match its snapshot.'
     }
+    # The pre-narrowing ceiling is NOT independently re-derived here -- unlike allowedCapabilities/
+    # requiredDeny (read fresh from this same module's own Get-AgentHarnessCapabilityDescriptor),
+    # the broker's per-repo role descriptor (its configured capabilities/mandatoryDenies before any
+    # override narrowing) lives only in the broker's own config file; this child process has no
+    # independent copy of it to compare against. ceilingCapabilities/ceilingMandatoryDenies are
+    # therefore wire-supplied, exactly like capabilities/mandatoryDenies above -- but they are not
+    # trusted blindly: every entry is constrained to lie within the shared maximum descriptor
+    # (allowedCapabilities/requiredDeny, re-derived independently just above), the already-narrowed
+    # capabilities/mandatoryDenies must be exactly reachable from this ceiling by narrowing alone
+    # (never wider, and any deny not already on the ceiling must have come from a ceiling
+    # capability), and the whole policy object -- ceiling included -- is bound to
+    # manifest.capabilityPolicyDigest and re-verified live under the capability-override lock below.
+    # The manifest file itself is written by the broker into a path this child only ever reads
+    # through Assert-AgentTrustedFile-style protections and the dedicated startupPipe handshake, so
+    # a party that could forge ceilingCapabilities would already have to be inside that trust
+    # boundary.
+    $ceilingCapabilities = @($manifest.policy.ceilingCapabilities)
+    $ceilingMandatoryDenies = @($manifest.policy.ceilingMandatoryDenies)
+    if ($ceilingMandatoryDenies -cnotcontains $requiredDeny -or
+        @($ceilingCapabilities | Where-Object { $ceilingMandatoryDenies -ccontains $_ }).Count -gt 0 -or
+        @($ceilingCapabilities | Where-Object { $allowedCapabilities -cnotcontains $_ }).Count -gt 0 -or
+        @($capabilities | Where-Object { $ceilingCapabilities -cnotcontains $_ -and $_ -cne $grantCapability }).Count -gt 0 -or
+        ($grantCapability -and $ceilingMandatoryDenies -cnotcontains $grantCapability) -or
+        @($mandatoryDenies | Where-Object {
+                $ceilingMandatoryDenies -cnotcontains $_ -and $ceilingCapabilities -cnotcontains $_
+            }).Count -gt 0) {
+        throw '[launch-failed] Manual dispatch manifest ceiling policy is malformed or inconsistent.'
+    }
     $expectedRepositoryKey = Get-AgentRepositoryIdentityKey -RepositoryIdentity $RepositoryIdentity
     if ([string]$manifest.repositoryKey -cne $expectedRepositoryKey) {
         throw '[repository-mismatch] Manual dispatch identity changed.'
@@ -1108,6 +3248,7 @@ function Enter-AgentManualDispatchStartup {
     $prId = [int]$manifest.pullRequestId
     $lease = $null
     $stateLock = $null
+    $capabilityLock = $null
     try {
         $lease = Enter-AgentWorkLease -LeaseRoot $LeaseRoot -RepositoryIdentity $RepositoryIdentity `
             -PullRequestId $prId -Role $Role -TimeoutMilliseconds 2000
@@ -1144,6 +3285,121 @@ function Enter-AgentManualDispatchStartup {
             throw '[prompt-invalid] Operator prompt cleanup failed.'
         }
 
+        # Decisive enforcement boundary (§5): hold the same lock every capability-override writer
+        # will take (PR3+) across the entire remaining ready/proceed exchange, so no cooperating
+        # writer can narrow settings out from under a startup decision already in flight. A
+        # non-cooperative write that bypasses this lock is outside the trust boundary (ANT-1/ANT-2)
+        # but is still caught fail-closed by the live equality check below.
+        $capabilityLock = Enter-AgentCapabilityOverrideLock -RepositoryRoot $RepositoryRoot -TimeoutMilliseconds 2000
+        if (-not $capabilityLock.Acquired) { throw "[already-running] $($capabilityLock.Reason)" }
+        # Independently derived from RepositoryRoot (issue #105 PR4 requirement 5) -- never taken
+        # from the manifest/artifact, which a caller could otherwise point at a different worktree
+        # of the same repository to replay a grant minted against that other worktree's override
+        # state.
+        $childWorktreeId = Get-AgentWorktreeIdentity -RepositoryRoot $RepositoryRoot
+        if ($grantCapability) {
+            # issue #105 PR4: independent child-side re-verification of the sealed grant-selection
+            # artifact this dispatch was minted with. The artifact is a SELECTION, never an authority
+            # (ANT-2): every field is cross-checked against this process's own live state and against
+            # a fresh delegation-policy read, all while already holding the same lock every
+            # settings writer respects, so nothing can narrow/expire/invalidate the grant between
+            # this check and `ready` being sent below.
+            $toolkitRootForPolicy = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+            $liveGrant = Get-AgentWideningGrantArtifact -RuntimeRoot ([string]$manifest.runtimeRoot)
+            if (-not $liveGrant) { throw '[grant-invalidated] Sealed grant-selection artifact is missing.' }
+            if ($liveGrant.Capability -cne $grantCapability -or $liveGrant.Role -cne $Role -or
+                $liveGrant.DraftId -cne [string]$manifest['dispatchDraftId'] -or
+                $liveGrant.DispatchId -cne [string]$manifest.dispatchId -or
+                $liveGrant.RepositoryKey -cne $expectedRepositoryKey -or
+                $liveGrant.WorktreeId -cne $childWorktreeId -or
+                $liveGrant.PullRequestId -ne $prId -or
+                $liveGrant.SourceCommit -cne [string]$manifest.prStateFingerprintSourceCommit) {
+                throw '[grant-invalidated] Sealed grant-selection artifact does not match this dispatch.'
+            }
+            if ([DateTimeOffset]::FromUnixTimeSeconds($liveGrant.ExpiresAtUtc).UtcDateTime -le [DateTime]::UtcNow) {
+                throw '[grant-invalidated] Widening grant has expired.'
+            }
+            # issue #105 PR4 CRITICAL-1: the kill switch is an operator emergency lever over the
+            # WHOLE capability-override/delegation surface -- recheck it here, live, under the same
+            # lock, so a kill switch flipped on any time after mint (including after the sealed
+            # artifact was already written) invalidates an in-flight grant rather than letting the
+            # child still honor it. Clears the sealed artifact so an abandoned/invalidated grant can
+            # never be re-read by a later attempt.
+            if ((Get-AgentCapabilityOverrideKillSwitchState -RepositoryRoot $RepositoryRoot).Active) {
+                Remove-AgentWideningGrantArtifact -RuntimeRoot ([string]$manifest.runtimeRoot)
+                throw '[grant-invalidated] Capability-override kill switch is active; the widening grant has been invalidated.'
+            }
+            $liveDelegationPolicy = Get-AgentDelegationPolicyOrThrow -ToolkitRoot $toolkitRootForPolicy
+            if ($liveDelegationPolicy.PathHash -cne $liveGrant.PolicyPathHash -or
+                $liveDelegationPolicy.ContentSha256 -cne $liveGrant.PolicyContentSha256) {
+                throw '[grant-invalidated] Delegation policy changed since the grant was minted.'
+            }
+            if (-not (Test-AgentDelegationAllows -Policy $liveDelegationPolicy -Role $Role -Capability $grantCapability -RepositoryKey $expectedRepositoryKey)) {
+                throw '[grant-invalidated] Delegation policy no longer allows this capability.'
+            }
+            # No new capability literal here (ANT-8/OAI-V3-3): $requiredDenyConsistent above already
+            # forces $grantCapability -ceq $requiredDeny whenever $grantCapability is truthy, and
+            # $requiredDeny is this role's own single delegable capability from the shared harness
+            # descriptor -- so scoping by $Role alone is exactly as precise as naming the literal.
+            if ($Role -eq 'review-handler' -and $grantCapability) {
+                # requirement 6: never let a forced redispatch on a PR the handler already delivered
+                # to reach the child with an auto-complete grant that Start-ReviewHandlerAgent.ps1's
+                # own $forcedRedispatchReadOnly would immediately suppress anyway -- reject up front
+                # with a distinct, actionable code instead of a silent read-only no-op.
+                $handledState = Get-AgentDurableRecords -Context $DurableContext
+                if (Test-AgentAutoCompleteGrantWouldBeNoOp -HandledState $handledState -PullRequestId $prId) {
+                    throw '[grant-noop] Forced redispatch already has prior delivery state; the auto-complete grant would be a no-op.'
+                }
+            }
+        }
+        $liveOverride = Resolve-AgentEffectiveCapabilitySettings -RepositoryIdentity $RepositoryIdentity `
+            -RepositoryRoot $RepositoryRoot -PullRequestId $prId `
+            -CurrentSourceCommit ([string]$manifest.prStateFingerprintSourceCommit)
+        $livePartition = Resolve-AgentCapabilityPolicyPartition `
+            -RoleDescriptor ([hashtable]@{ capabilities = $ceilingCapabilities; mandatoryDenies = $ceilingMandatoryDenies }) `
+            -PersistedNarrowing $liveOverride.Settings -GrantCapability $grantCapability
+        $livePolicy = [ordered]@{
+            schemaVersion = 1; repositoryIdentity = $manifest.policy.repositoryIdentity; role = $Role
+            capabilities = $livePartition.capabilities; mandatoryDenies = $livePartition.mandatoryDenies
+            ceilingCapabilities = @($ceilingCapabilities | Sort-Object -Unique)
+            ceilingMandatoryDenies = @($ceilingMandatoryDenies | Sort-Object -Unique)
+            configSnapshotSha256 = [string]$manifest.policy.configSnapshotSha256
+        }
+        $liveDigest = Get-AgentCanonicalDigest -InputObject $livePolicy
+        if ($liveDigest -cne [string]$manifest.capabilityPolicyDigest -or
+            (ConvertTo-AgentCanonicalJson @($livePartition.capabilities    | Sort-Object -Unique)) -cne
+                (ConvertTo-AgentCanonicalJson @($capabilities    | Sort-Object -Unique)) -or
+            (ConvertTo-AgentCanonicalJson @($livePartition.mandatoryDenies | Sort-Object -Unique)) -cne
+                (ConvertTo-AgentCanonicalJson @($mandatoryDenies | Sort-Object -Unique))) {
+            throw '[policy-changed] Live capability settings no longer match the dispatch manifest.'
+        }
+
+        # issue #105 PR4 CRITICAL-2 hardening: everything checked above (schema, digests, ceiling
+        # self-consistency, live capability-settings freshness, grant re-verification) can ALSO be
+        # satisfied by a caller-authored manifest/artifact plus a same-named fake named pipe --
+        # none of it proves the process on the other end of $manifest.startupPipe is really the
+        # broker. Assert-AgentManualDispatchEarlyContext already rejected the common accidental/
+        # headless case (no attestation handle at all) before any of the work above; this is the
+        # deep check: the broker's ephemeral secret can only ever reach this exact process through
+        # an OS-inherited anonymous-pipe handle handed down at the moment the broker directly spawned
+        # it, never through a CLI argument, a file, or anything a forger could fabricate merely by
+        # crafting text. WorktreeId is independently re-derived (requirement 5); grantNonce is bound
+        # into the digest so it is finally live-compared against the broker's own in-memory grant
+        # rather than merely carried, unverified, in the sealed artifact (requirement 6).
+        $attestationSecret = Receive-AgentBrokerAttestationSecret
+        try {
+            $attestationDigest = Get-AgentAttestationDigest -DispatchId ([string]$manifest.dispatchId) -Role $Role `
+                -RepositoryKey $expectedRepositoryKey -WorktreeId $childWorktreeId -PullRequestId $prId `
+                -SourceCommit ([string]$manifest.prStateFingerprintSourceCommit) `
+                -CapabilityPolicyDigest ([string]$manifest.capabilityPolicyDigest) `
+                -GrantCapability $grantCapability `
+                -GrantNonce $(if ($grantCapability) { $liveGrant.GrantNonce } else { $null }) `
+                -GrantExpiresAtUtc $(if ($grantCapability) { $liveGrant.ExpiresAtUtc } else { $null })
+            $attestationNonce = New-AgentNonce
+            $attestationProof = Get-AgentAttestationProof -SecretBytes $attestationSecret -Nonce $attestationNonce -Digest $attestationDigest
+        }
+        finally { [Array]::Clear($attestationSecret, 0, $attestationSecret.Length) }
+
         $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', [string]$manifest.startupPipe,
             [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
         try {
@@ -1156,6 +3412,7 @@ function Enter-AgentManualDispatchStartup {
                 processId = $PID; leaseKeyHash = $lease.KeyHash; eventLogPath = [IO.Path]::GetFullPath($EventLogPath)
                 boundCapabilities = $actualCapabilities
                 enforcedDenies = @($mandatoryDenies | Sort-Object -Unique)
+                attestationNonce = $attestationNonce; attestationDigest = $attestationDigest; attestationProof = $attestationProof
             }
             $writer.WriteLine((ConvertTo-AgentCanonicalJson $ready))
             $reply = $reader.ReadLine() | ConvertFrom-Json -AsHashtable -ErrorAction Stop
@@ -1163,7 +3420,14 @@ function Enter-AgentManualDispatchStartup {
                 throw '[launch-failed] Broker did not authorize startup.'
             }
         }
-        finally { if ($pipe) { $pipe.Dispose() } }
+        finally {
+            if ($pipe) { $pipe.Dispose() }
+            # Released the instant the ready/proceed exchange concludes -- success or throw -- never
+            # held for the remainder of the function (cancellation-binding validation,
+            # $script:AgentManualAuthorities bookkeeping), since only this window needs to be
+            # race-free against a cooperating settings writer.
+            if ($capabilityLock -and $capabilityLock.Acquired) { Exit-AgentLock $capabilityLock.Stream; $capabilityLock.Acquired = $false }
+        }
 
         $executionKey = Get-AgentExecutionKey -RepositoryIdentity $RepositoryIdentity -PullRequestId $prId -Role $Role
         $runtimeRoot = [IO.Path]::GetFullPath([string]$manifest.runtimeRoot)
@@ -1192,7 +3456,7 @@ function Enter-AgentManualDispatchStartup {
             $message = $_.Exception.Message
             $code = if ($message -match '^\[([a-z-]+)\]') { $Matches[1] } else { 'launch-failed' }
             $detail = if ($code -eq 'already-running' -and
-                $message -match '^\[already-running\]\s+(lease-contended|state-contended)$') {
+                $message -match '^\[already-running\]\s+(lease-contended|state-contended|capability-override-contended)$') {
                 $Matches[1]
             }
             else { '' }
@@ -1212,6 +3476,7 @@ function Enter-AgentManualDispatchStartup {
         catch {
             # The broker also observes an early child exit; notification is best effort.
         }
+        if ($capabilityLock -and $capabilityLock.Acquired) { Exit-AgentLock $capabilityLock.Stream }
         if ($stateLock -and $stateLock.Acquired) { Exit-AgentLock $stateLock.Stream }
         if ($lease -and $lease.Acquired) { Exit-AgentLock $lease.Stream }
         throw
@@ -2043,7 +4308,12 @@ function ConvertTo-AgentCanonicalJson {
                 @($Value.PSObject.Properties.Name)
             }
             $entries = foreach ($key in @($keys | Sort-Object -CaseSensitive)) {
-                $item = if ($Value -is [System.Collections.IDictionary]) { $Value[$key] } else { $Value.PSObject.Properties[$key].Value }
+                if ($Value -is [System.Collections.IDictionary]) {
+                    $item = $Value[$key]
+                }
+                else {
+                    $item = $Value.PSObject.Properties[$key].Value
+                }
                 '{0}:{1}' -f (ConvertTo-Json -InputObject $key -Compress), (ConvertValue $item)
             }
             return '{' + ($entries -join ',') + '}'
@@ -2103,7 +4373,13 @@ function New-AgentRedirectedProcess {
         [Parameter(Mandatory)][string]$StandardOutputPath,
         [Parameter(Mandatory)][string]$StandardErrorPath,
         [string]$WorkingDirectory,
-        [string[]]$EnvironmentVariablesToRemove = @()
+        [string[]]$EnvironmentVariablesToRemove = @(),
+        # issue #105 PR4 CRITICAL-2 hardening: broker-only extra environment variables applied
+        # AFTER the isolation removals below and BEFORE Start(), for exactly one purpose today --
+        # handing this specific child an inherited anonymous-pipe attestation handle it cannot
+        # obtain any other way. Never used for anything a caller could equivalently pass on the
+        # command line.
+        [hashtable]$AdditionalEnvironmentVariables = @{}
     )
     $absolute = [IO.Path]::GetFullPath($FilePath)
     if (-not [IO.Path]::IsPathFullyQualified($absolute) -or -not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
@@ -2152,6 +4428,9 @@ function New-AgentRedirectedProcess {
     $psi.StandardInputEncoding = $utf8
     foreach ($name in @($EnvironmentVariablesToRemove) + @(Get-AgentSessionIsolationEnvVars)) {
         [void]$psi.Environment.Remove($name)
+    }
+    foreach ($name in @($AdditionalEnvironmentVariables.Keys)) {
+        $psi.Environment[$name] = [string]$AdditionalEnvironmentVariables[$name]
     }
     if (-not ('DevPilot.Process.BoundedDrain' -as [type])) {
         Add-Type -TypeDefinition @'
@@ -4289,6 +6568,47 @@ Export-ModuleMember -Function @(
     "Test-AgentManualCancellationRequested",
     "Get-AgentCancellationOutcome",
     "Exit-AgentManualDispatchAuthority",
+    "Get-AgentDefaultCapabilityOverrideRoot",
+    "ConvertTo-AgentCanonicalEpochSeconds",
+    "Get-AgentWorktreeIdentity",
+    "Read-AgentStableFile",
+    "ConvertFrom-AgentTrustedCapabilityJson",
+    "Resolve-AgentEffectiveCapabilitySettings",
+    "Resolve-AgentCapabilityPolicyPartition",
+    "Enter-AgentCapabilityOverrideLock",
+    "Get-AgentDelegationPolicyPath",
+    "Get-AgentDelegationPolicy",
+    "Test-AgentDelegationAllows",
+    "Get-AgentDelegationPolicyOrNull",
+    "Get-AgentDelegationPolicyOrThrow",
+    "Get-AgentWideningGrantArtifactPath",
+    "New-AgentWideningGrantArtifact",
+    "Get-AgentWideningGrantArtifact",
+    "Remove-AgentWideningGrantArtifact",
+    "New-AgentWideningChallenge",
+    "Test-AgentWideningChallengeShape",
+    "Test-AgentAutoCompleteGrantWouldBeNoOp",
+    "Resolve-AgentWideningEffectiveDiff",
+    "New-AgentBrokerAttestationSecret",
+    "Get-AgentAttestationDigest",
+    "Get-AgentAttestationProof",
+    "Receive-AgentBrokerAttestationSecret",
+    "Assert-AgentManualDispatchEarlyContext",
+    "ConvertFrom-AgentProcStatPpid",
+    "Get-AgentImmediateParentProcessId",
+    "Get-AgentProcessCommandLine",
+    "ConvertFrom-AgentWindowsCommandLineArgv",
+    "Get-AgentProcessArgv",
+    "Assert-AgentBrokerCommandLineShape",
+    "Assert-AgentBrokerProcessAnchor",
+    "Assert-AgentDashboardCommandLineShape",
+    "Test-AgentDashboardLaunchProvenance",
+     "Get-AgentDefaultCapabilityOverrideKillSwitchRoot",
+     "Test-AgentCapabilityOverrideKillSwitch",
+     "Enable-AgentCapabilityOverrideKillSwitch",
+     "Disable-AgentCapabilityOverrideKillSwitch",
+     "Get-AgentCapabilityOverrideKillSwitchExpiresAtUtc",
+     "Set-AgentCapabilityOverrideSetting",
     "Repair-AgentDurableState",
     "Read-AgentDurableState",
     "Write-AgentDurableState",

@@ -412,6 +412,9 @@ Describe 'Shared reviewer and review-handler event contract' {
         $source | Should -Match '\$reviewerOperationalCapabilities\s*=\s*@\(\$reviewerCapabilityDescriptor\.operationalTiers\.base\)'
         $source | Should -Match '\$reviewHandlerOperationalCapabilities\s*=\s*@\(\$reviewHandlerCapabilityDescriptor\.operationalTiers\.base\)'
         $source | Should -Match '\$reviewHandlerCodeUpdateCapabilities\s*=\s*@\(\$reviewHandlerCapabilityDescriptor\.operationalTiers\.codeUpdate\)'
+        $source | Should -Match '\$reviewerCapabilities\s*=\s*@\(\)'
+        $source | Should -Match 'capabilities\s*=\s*\$reviewerCapabilities'
+        $source | Should -Not -Match 'capabilities\s*=\s*@\(\$\(if\s*\(\$EnableManualReviewerWrites\)'
         foreach ($capability in @(
                 'EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment', 'EnableApprovalVote',
                 'EnableBuddyRequeue', 'EnableCodeChanges', 'EnablePush', 'LocalValidation', 'ResumeCodingSession', 'EnableAutoComplete'

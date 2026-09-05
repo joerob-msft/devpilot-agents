@@ -269,10 +269,14 @@ if ($EnableManualReviewer) {
     }
     $manualReviewerConfig = Assert-AgentTrustedFile -Path $manualReviewerConfig `
         -AllowedRoot $(if ($PSBoundParameters.ContainsKey('ReviewerConfigFile')) { '' } else { $defaultConfigRoot })
+    $reviewerCapabilities = @()
+    if ($EnableManualReviewerWrites) {
+        $reviewerCapabilities += @($reviewerCapabilityDescriptor.operationalTiers.base)
+    }
     $manualRoles.reviewer = [ordered]@{
         enabled = $true; configFile = $manualReviewerConfig
         configRoot = (Split-Path $manualReviewerConfig -Parent); scriptPath = $reviewerScript
-        capabilities = @($(if ($EnableManualReviewerWrites) { $reviewerCapabilityDescriptor.operationalTiers.base }))
+        capabilities = $reviewerCapabilities
         mandatoryDenies = @($reviewerCapabilityDescriptor.delegableDefaultOff)
     }
 }

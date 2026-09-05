@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "roles": {
+    "reviewer": {
+      "EnableApprovalVote": {
+        "allowedRepositoryKeys": []
+      }
+    },
+    "review-handler": {
+      "EnableAutoComplete": {
+        "allowedRepositoryKeys": []
+      }
+    }
+  }
+}

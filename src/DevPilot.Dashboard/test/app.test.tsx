@@ -11,7 +11,24 @@ import { OperationsReducer } from "../src/reducer.js";
 import { EventTailer } from "../src/tailer.js";
 import { PullRequestHistoryProjection } from "../src/history.js";
 import { createDashboardLifecycle } from "../src/lifecycle.js";
-import type { CapabilityProfile, CapabilitySummary, DispatchAccepted, DispatchBroker, DispatchTerminal } from "../src/dispatch.js";
+import type {
+  CapabilityNarrowingApplied,
+  CapabilityNarrowingPreview,
+  CapabilityProfile,
+  CapabilityProvenance,
+  CapabilitySummary,
+  DispatchAccepted,
+  DispatchBroker,
+  DispatchTerminal,
+  KillSwitchApplied,
+  NarrowingAction,
+  NarrowingScope,
+  WideningCancelled,
+  WideningMinted,
+  WideningPreview,
+  WideningSummary,
+} from "../src/dispatch.js";
+import { BrokerRejectionError } from "../src/dispatch.js";
 
 const DOCUMENTED_COMMAND_COVERAGE = [
   "Left", "Right", "Up", "Down", "j", "k", "Enter", "Esc", "b",
@@ -194,6 +211,232 @@ async function renderAt(
     }
     throw error;
   }
+}
+
+function createSettingsHistory(): PullRequestHistoryProjection {
+  const history = new PullRequestHistoryProjection();
+  history.apply(historyEvent("9007199254740993", 104, 1, {
+    repositoryName: "repo",
+    title: "Settings PR",
+    author: "Ada",
+  }));
+  return history;
+}
+
+type NarrowingCall =
+  | { operation: "profile"; repositoryKey: string; pullRequestId: number; role: AgentRole }
+  | { operation: "preview-narrowing"; repositoryKey: string; pullRequestId: number; role: AgentRole; scope: NarrowingScope; capability: string; action: NarrowingAction }
+  | { operation: "apply-narrowing"; repositoryKey: string; pullRequestId: number; role: AgentRole; scope: NarrowingScope; capability: string; action: NarrowingAction; previewToken: string; storeFingerprint: string }
+  | { operation: "set-kill-switch"; repositoryKey: string; role: AgentRole; enabled: boolean }
+  | { operation: "shutdown" };
+
+function createSettingsBrokerFixture(): {
+  broker: DispatchBroker;
+  calls: NarrowingCall[];
+  // Test-only levers (point 6/10 coverage): forceKillSwitchRejection simulates the kill switch
+  // becoming active concurrently with an in-flight preview/apply (broker rejects with the
+  // distinct narrowing-kill-switch-active code); setKillSwitchTtlMinutes controls the TTL the next
+  // set-kill-switch response reports via killSwitchExpiresAtUtc.
+  forceKillSwitchRejection: (value: boolean) => void;
+  setKillSwitchTtlMinutes: (minutes: number) => void;
+} {
+  const calls: NarrowingCall[] = [];
+  const repositoryKey = "v1:github:9007199254740993";
+  const repositoryIdentity = {
+    schemaVersion: 1 as const,
+    provider: "GitHub" as const,
+    repositoryId: "9007199254740993",
+    organization: "contoso",
+    project: "",
+    repositoryName: "repo",
+    slug: "contoso/repo",
+    key: repositoryKey,
+    verifiedAtUtc: "2026-09-03T00:00:00Z",
+    verified: true,
+    dispatchEligible: true,
+  };
+  const prSnapshot = {
+    schemaVersion: 1 as const,
+    pullRequestId: 104,
+    sourceCommit: "a".repeat(40),
+    sourceRef: "feature",
+    targetRef: "main",
+    active: true,
+    draft: false,
+    author: "Ada",
+    title: "Settings PR",
+  };
+  const allowedManualCapabilities = ["EnableFindingComments", "EnableSummaryComment", "EnableThreadReplies"];
+  const absoluteDenies = ["EnableApprovalVote"];
+  const baseProvenance: Record<string, CapabilityProvenance> = {
+    EnableFindingComments: "repo-worktree",
+    EnableSummaryComment: "machine",
+    EnableThreadReplies: "user",
+    EnableApprovalVote: "operational-default",
+  };
+  const state = {
+    killSwitchActive: false,
+    killSwitchExpiresAtUtc: null as string | null,
+    enabled: new Set(["EnableSummaryComment", "EnableThreadReplies"]),
+    mandatoryDenies: new Set(["EnableFindingComments", "EnableApprovalVote"]),
+  };
+  let killSwitchTtlMinutes = 60;
+  let rejectWithKillSwitchActive = false;
+
+  function effect(): CapabilityNarrowingPreview["current"] {
+    const provenance: Record<string, CapabilityProvenance> = Object.create(null);
+    for (const capability of [...allowedManualCapabilities, ...absoluteDenies]) {
+      provenance[capability] = state.killSwitchActive ? "kill-switch" : baseProvenance[capability]!;
+    }
+    return {
+      capabilities: [...state.enabled],
+      mandatoryDenies: [...state.mandatoryDenies],
+      provenance,
+    };
+  }
+
+  function previewEffect(action: NarrowingAction, capability: string): CapabilityNarrowingPreview["proposed"] {
+    const enabled = new Set(state.enabled);
+    const mandatoryDenies = new Set(state.mandatoryDenies);
+    if (action === "off") {
+      enabled.delete(capability);
+      mandatoryDenies.add(capability);
+    } else {
+      enabled.add(capability);
+      mandatoryDenies.delete(capability);
+    }
+    const provenance: Record<string, CapabilityProvenance> = Object.create(null);
+    for (const entry of [...allowedManualCapabilities, ...absoluteDenies]) {
+      provenance[entry] = state.killSwitchActive ? "kill-switch" : baseProvenance[entry]!;
+    }
+    return {
+      capabilities: [...enabled],
+      mandatoryDenies: [...mandatoryDenies],
+      provenance,
+    };
+  }
+
+  function profile(role: AgentRole): CapabilityProfile {
+    calls.push({ operation: "profile", repositoryKey, pullRequestId: prSnapshot.pullRequestId, role });
+    return {
+      schemaVersion: 1,
+      requestId: `profile-${calls.length}`,
+      operation: "capability-profile",
+      role,
+      repositoryIdentity,
+      prSnapshot,
+      capabilities: [...state.enabled],
+      mandatoryDenies: [...state.mandatoryDenies],
+      dynamicConstraints: [],
+      absoluteDenies,
+      allowedManualCapabilities,
+      delegableAvailable: [],
+      provenance: effect().provenance,
+      killSwitchActive: state.killSwitchActive,
+      killSwitchExpiresAtUtc: state.killSwitchExpiresAtUtc,
+      editingAvailable: true,
+    };
+  }
+
+  const broker: DispatchBroker = {
+    describe: async () => { throw new Error("not called"); },
+    profile: async (_repositoryKey, pullRequestId, role) => {
+      if (pullRequestId !== prSnapshot.pullRequestId) throw new Error("unexpected pullRequestId");
+      return profile(role);
+    },
+    previewNarrowing: async (_repositoryKey, pullRequestId, role, scope, capability, action) => {
+      if (pullRequestId !== prSnapshot.pullRequestId) throw new Error("unexpected pullRequestId");
+      if (rejectWithKillSwitchActive) {
+        throw new BrokerRejectionError("narrowing-kill-switch-active", "kill switch is active");
+      }
+      calls.push({ operation: "preview-narrowing", repositoryKey, pullRequestId, role, scope, capability, action });
+      const current = effect();
+      return {
+        schemaVersion: 1,
+        requestId: `preview-${calls.length}`,
+        operation: "narrowing-preview",
+        state: "previewed",
+        role,
+        repositoryIdentity,
+        prSnapshot,
+        scope,
+        capability,
+        action,
+        previewToken: `preview-${scope}-${capability}-${action}`,
+        storeFingerprint: `store-${state.killSwitchActive ? "kill-switch" : "normal"}`,
+        expiresAtUtc: "2026-09-03T16:00:00Z",
+        killSwitchActive: state.killSwitchActive,
+        changed: JSON.stringify(current) !== JSON.stringify(previewEffect(action, capability)),
+        current,
+        proposed: previewEffect(action, capability),
+      };
+    },
+    applyNarrowing: async (preview, _repositoryKey, pullRequestId) => {
+      if (pullRequestId !== prSnapshot.pullRequestId) throw new Error("unexpected pullRequestId");
+      if (rejectWithKillSwitchActive) {
+        throw new BrokerRejectionError("narrowing-kill-switch-active", "kill switch is active");
+      }
+      calls.push({
+        operation: "apply-narrowing",
+        repositoryKey,
+        pullRequestId,
+        role: preview.role,
+        scope: preview.scope,
+        capability: preview.capability,
+        action: preview.action,
+        previewToken: preview.previewToken,
+        storeFingerprint: preview.storeFingerprint,
+      });
+      if (preview.action === "off") {
+        state.enabled.delete(preview.capability);
+        state.mandatoryDenies.add(preview.capability);
+      } else {
+        state.enabled.add(preview.capability);
+        state.mandatoryDenies.delete(preview.capability);
+      }
+      const applied: CapabilityNarrowingApplied = {
+        schemaVersion: 1,
+        requestId: `apply-${calls.length}`,
+        operation: "narrowing-applied",
+        state: "applied",
+        role: preview.role,
+        scope: preview.scope,
+        capability: preview.capability,
+        action: preview.action,
+        previewToken: preview.previewToken,
+      };
+      return applied;
+    },
+    setKillSwitch: async (_repositoryKey, role, enabled) => {
+      calls.push({ operation: "set-kill-switch", repositoryKey, role, enabled });
+      state.killSwitchActive = enabled;
+      state.killSwitchExpiresAtUtc = enabled
+        ? new Date(Date.now() + killSwitchTtlMinutes * 60_000).toISOString()
+        : null;
+      const applied: KillSwitchApplied = {
+        schemaVersion: 1,
+        requestId: `kill-switch-${calls.length}`,
+        operation: "kill-switch-applied",
+        role,
+        enabled,
+        killSwitchExpiresAtUtc: state.killSwitchExpiresAtUtc,
+      };
+      return applied;
+    },
+    dispatch: async () => { throw new Error("not called"); },
+    cancel: async () => { throw new Error("not called"); },
+    shutdown: async () => {
+      calls.push({ operation: "shutdown" });
+    },
+    subscribeTerminal: () => () => {},
+  };
+
+  return {
+    broker,
+    calls,
+    forceKillSwitchRejection: (value: boolean) => { rejectWithKillSwitchActive = value; },
+    setKillSwitchTtlMinutes: (minutes: number) => { killSwitchTtlMinutes = minutes; },
+  };
 }
 
 test("brand plane rows share one centered monospace geometry", () => {
@@ -498,7 +741,7 @@ test("empty renderer reports unavailable navigation, attention, URL, and manual 
   let setup: TestRendererSetup | undefined;
   try {
     setup = await testRender(() => <App reducer={reducer} tailer={tailer} />, {
-      width: 100, height: 30, kittyKeyboard: true,
+      width: 140, height: 32, kittyKeyboard: true,
     });
     await setup.renderOnce();
     assert.match(setup.captureCharFrame(), /SOURCE WARNING: malformed diagnostic is bounded and visible/);
@@ -527,12 +770,12 @@ test("settings overlay reports an explicit unavailable state without a trusted b
   let setup: TestRendererSetup | undefined;
   try {
     setup = await testRender(() => <App reducer={fixture.reducer} tailer={fixture.tailer} />, {
-      width: 100, height: 30, kittyKeyboard: true,
+      width: 140, height: 32, kittyKeyboard: true,
     });
     await setup.renderOnce();
     setup.mockInput.pressKey("s");
     await setup.flush();
-    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE \(READ-ONLY\)/);
+    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE/);
     assert.match(setup.captureCharFrame(), /Applies only to the next manual dispatch/);
     assert.match(setup.captureCharFrame(), /A running agent's own profile is immutable and is not shown here\./);
     assert.match(setup.captureCharFrame(), /Unavailable: trusted manual broker is not connected \(observe-only mode\)\./);
@@ -552,10 +795,129 @@ test("settings overlay reports an explicit unavailable state without a trusted b
   }
 });
 
+test("settings overlay renders every known capability provenance value", async (context) => {
+  const fixture = createFixture();
+  const history = new PullRequestHistoryProjection();
+  history.apply(historyEvent("9007199254740993", 104, 1, { title: "Provenance PR", author: "Ada" }));
+  const repositoryIdentity = {
+    schemaVersion: 1 as const,
+    provider: "GitHub" as const,
+    repositoryId: "9007199254740993",
+    organization: "contoso",
+    project: "",
+    repositoryName: "repo",
+    slug: "contoso/repo",
+    key: "v1:github:9007199254740993",
+    verifiedAtUtc: "2026-09-03T00:00:00Z",
+    verified: true,
+    dispatchEligible: true,
+  };
+  const prSnapshot = {
+    schemaVersion: 1 as const,
+    pullRequestId: 104,
+    sourceCommit: "a".repeat(40),
+    sourceRef: "feature",
+    targetRef: "main",
+    active: true,
+    draft: false,
+    author: "Ada",
+    title: "Provenance PR",
+  };
+  function profileWith(provenance: CapabilityProfile["provenance"]): CapabilityProfile {
+    return {
+      schemaVersion: 1,
+      requestId: "provenance-request",
+      operation: "capability-profile",
+      role: "reviewer",
+      repositoryIdentity,
+      prSnapshot,
+      capabilities: Object.keys(provenance),
+      mandatoryDenies: [],
+      dynamicConstraints: [],
+      absoluteDenies: [],
+      allowedManualCapabilities: Object.keys(provenance),
+      delegableAvailable: [],
+      provenance,
+      killSwitchActive: false,
+      killSwitchExpiresAtUtc: null,
+      editingAvailable: true,
+    };
+  }
+  let profileCallCount = 0;
+  const broker: DispatchBroker = {
+    describe: async () => { throw new Error("not called"); },
+    profile: async () => {
+      profileCallCount++;
+      // The SETTINGS overlay's Provenance line is a fixed-width, non-wrapping single row, so all
+      // five KNOWN_PROVENANCE values (issue #105 PR2 review) can't be proven visible at once
+      // without risking clipping. Two short, comfortably-fitting batches still exercise every
+      // value through the real renderer instead of only the parser.
+      return profileCallCount === 1
+        ? profileWith({ a: "operational-default", b: "machine", c: "user" })
+        : profileWith({ d: "repo-worktree", e: "pr" });
+    },
+    dispatch: async () => { throw new Error("not called"); },
+    cancel: async () => { throw new Error("not called"); },
+    shutdown: async () => {},
+    subscribeTerminal: () => () => {},
+  };
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE/);
+    assert.match(setup.captureCharFrame(), /a=operational-default/);
+    assert.match(setup.captureCharFrame(), /b=machine/);
+    assert.match(setup.captureCharFrame(), /c=user/);
+
+    setup.mockInput.pressKey("r");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /d=repo-worktree/);
+    assert.match(setup.captureCharFrame(), /e=pr/);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
 test("settings role toggle refetches without ever pairing a role label with another role's profile body", async (context) => {
   const fixture = createFixture();
   const history = new PullRequestHistoryProjection();
   history.apply(historyEvent("9007199254740993", 104, 1, { title: "Settings PR", author: "Ada" }));
+  const repositoryIdentity = {
+    schemaVersion: 1 as const,
+    provider: "GitHub" as const,
+    repositoryId: "9007199254740993",
+    organization: "contoso",
+    project: "",
+    repositoryName: "repo",
+    slug: "contoso/repo",
+    key: "v1:github:9007199254740993",
+    verifiedAtUtc: "2026-09-03T00:00:00Z",
+    verified: true,
+    dispatchEligible: true,
+  };
+  const prSnapshot = {
+    schemaVersion: 1 as const,
+    pullRequestId: 104,
+    sourceCommit: "a".repeat(40),
+    sourceRef: "feature",
+    targetRef: "main",
+    active: true,
+    draft: false,
+    author: "Ada",
+    title: "Settings PR",
+  };
   const profileCalls: AgentRole[] = [];
   let resolveReviewer!: (value: CapabilityProfile) => void;
   let resolveHandler!: (value: CapabilityProfile) => void;
@@ -567,11 +929,8 @@ test("settings role toggle refetches without ever pairing a role label with anot
       requestId: `${tag}-request`,
       operation: "capability-profile",
       role,
-      repositoryIdentity: { ...history.jump(104)!.repositoryIdentity },
-      prSnapshot: {
-        schemaVersion: 1, pullRequestId: 104, sourceCommit: "a".repeat(40),
-        sourceRef: "feature", targetRef: "main", active: true, draft: false, author: "Ada", title: "Settings PR",
-      },
+      repositoryIdentity,
+      prSnapshot,
       capabilities: [`${tag}-only-capability`],
       mandatoryDenies: [],
       dynamicConstraints: [],
@@ -579,6 +938,9 @@ test("settings role toggle refetches without ever pairing a role label with anot
       allowedManualCapabilities: [`${tag}-only-capability`],
       delegableAvailable: [],
       provenance: { [`${tag}-only-capability`]: "operational-default" },
+      killSwitchActive: false,
+      killSwitchExpiresAtUtc: null,
+      editingAvailable: true,
     };
   }
   const reviewerProfile = profileFor("reviewer", "reviewer");
@@ -597,12 +959,12 @@ test("settings role toggle refetches without ever pairing a role label with anot
   let setup: TestRendererSetup | undefined;
   try {
     setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
-      width: 100, height: 30, kittyKeyboard: true,
+      width: 140, height: 32, kittyKeyboard: true,
     });
     await setup.renderOnce();
     setup.mockInput.pressKey("s");
     await setup.flush();
-    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE \(READ-ONLY\)/);
+    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE/);
     assert.match(setup.captureCharFrame(), /Role: REVIEWER/);
     assert.deepEqual(profileCalls, ["reviewer"]);
     assert.match(setup.captureCharFrame(), /Resolving effective profile for the next manual dispatch/);
@@ -651,6 +1013,359 @@ test("settings role toggle refetches without ever pairing a role label with anot
     throw error;
   } finally {
     setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("settings editor previews off and inherit changes without applying until the final confirmation", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls } = createSettingsBrokerFixture();
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140,
+      height: 32,
+      kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE/);
+    assert.match(setup.captureCharFrame(), /Role: REVIEWER \| Tab role \| r refresh \| e edit narrowing \| k kill switch \| Esc\/s close/);
+    assert.deepEqual(calls.map((call) => call.operation), ["profile"]);
+
+    setup.mockInput.pressKey("e");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /SETTINGS - EDIT PERSISTED NARROWING/);
+    assert.match(setup.captureCharFrame(), /Scope: \[machine\]\s+user\s+repo-worktree\s+pr/);
+    assert.match(setup.captureCharFrame(), /> EnableFindingComments/);
+
+    setup.mockInput.pressArrow("right");
+    await setup.flush();
+    setup.mockInput.pressArrow("right");
+    await setup.flush();
+    setup.mockInput.pressArrow("down");
+    await setup.flush();
+    setup.mockInput.pressArrow("down");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Scope: machine\s+user\s+\[repo-worktree\]\s+pr/);
+    assert.match(setup.captureCharFrame(), /> EnableThreadReplies/);
+
+    setup.mockInput.pressKey("o");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /repo-worktree \/ EnableThreadReplies -> off/);
+    assert.match(setup.captureCharFrame(), /This changes the effective profile:/);
+    assert.match(setup.captureCharFrame(), /First confirmation: press c to review the final apply gate; Esc cancels\./);
+    assert.deepEqual(calls.map((call) => call.operation), ["profile", "preview-narrowing"]);
+
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /SETTINGS - EDIT PERSISTED NARROWING/);
+    assert.match(setup.captureCharFrame(), /> EnableThreadReplies/);
+    assert.equal(calls.filter((call) => call.operation === "apply-narrowing").length, 0);
+
+    setup.mockInput.pressArrow("up");
+    await setup.flush();
+    setup.mockInput.pressArrow("up");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /> EnableFindingComments/);
+
+    setup.mockInput.pressKey("i");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /repo-worktree \/ EnableFindingComments -> inherit/);
+    assert.match(setup.captureCharFrame(), /First confirmation: press c to review the final apply gate; Esc cancels\./);
+    assert.deepEqual(calls.map((call) => call.operation), ["profile", "preview-narrowing", "preview-narrowing"]);
+
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /FINAL CONFIRMATION: press y to apply this exact preview; Esc cancels\./);
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /SETTINGS - EDIT PERSISTED NARROWING/);
+    assert.equal(calls.filter((call) => call.operation === "apply-narrowing").length, 0);
+
+    setup.mockInput.pressKey("i");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Applied: EnableFindingComments reset to inherit at repo-worktree scope\./);
+    assert.match(setup.captureCharFrame(), /Enabled: EnableSummaryComment, EnableThreadReplies, EnableFindingComments/);
+    assert.match(setup.captureCharFrame(), /Denied \(mandatory\): EnableApprovalVote/);
+    assert.deepEqual(calls.map((call) => call.operation), [
+      "profile",
+      "preview-narrowing",
+      "preview-narrowing",
+      "preview-narrowing",
+      "apply-narrowing",
+      "profile",
+    ]);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("settings kill switch two-stage confirm can be cancelled at either stage, enabled, disabled, and displays its expiry", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls, setKillSwitchTtlMinutes } = createSettingsBrokerFixture();
+  setKillSwitchTtlMinutes(45);
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140,
+      height: 32,
+      kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+
+    // First-stage cancel: pressing k shows the full-disclosure warning (machine+user-wide blast
+    // radius, ignores local narrowing, NEXT-launches-only, running agents immutable, no delegated
+    // approval-vote/auto-complete) and Esc backs all the way out with no RPC call at all.
+    setup.mockInput.pressKey("k");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /WARNING: machine\+user-wide emergency lever -- affects ALL repos\/worktrees\/PRs for this user on this machine, not just this PR\./);
+    assert.match(setup.captureCharFrame(), /Ignores all locally persisted narrowing; restores compiled operational defaults for NEXT launches only\./);
+    assert.match(setup.captureCharFrame(), /Any already-running agent is immutable and unaffected; grants no delegated approval-vote or auto-complete\./);
+    assert.match(setup.captureCharFrame(), /Press c to review the final confirmation; Esc cancels\./);
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /WARNING: machine\+user-wide emergency lever/);
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 0);
+
+    // Final-stage cancel: advance past the warning with c, then Esc at the terse final gate still
+    // backs out with no RPC call.
+    setup.mockInput.pressKey("k");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /FINAL CONFIRMATION: enable the kill switch machine\+user-wide across ALL repos\/worktrees\/PRs\?/);
+    assert.match(setup.captureCharFrame(), /Press y to enable; Esc cancels\./);
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /FINAL CONFIRMATION: enable the kill switch/);
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 0);
+
+    // Enable: k (warning) -> c (final gate) -> y (confirm) actually toggles it on.
+    setup.mockInput.pressKey("k");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Ignore local narrowing overrides is now ON: persisted narrowing is ignored until the next launch\./);
+    assert.match(setup.captureCharFrame(), /Ignore local narrowing overrides: ON \(emergency lever, not a security lockdown\)/);
+    assert.match(setup.captureCharFrame(), /Provenance: .*kill-switch/);
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 1);
+
+    // Expiry displayed: the broker's reported TTL renders as a minutes-remaining countdown plus
+    // the raw timestamp it echoed (not pinning an exact minute count, since Settings' own display
+    // is computed from a live clock signal relative to whenever this assertion happens to run).
+    assert.match(setup.captureCharFrame(), /ON \(emergency lever, not a security lockdown\) \(expires in \d+m, \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+
+    // Disable: k (terse warning, smaller blast radius) -> c (final gate) -> y (confirm) turns it
+    // back off.
+    setup.mockInput.pressKey("k");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Disable 'Ignore local narrowing overrides'\? Persisted narrowing becomes active again for next launches\./);
+    assert.match(setup.captureCharFrame(), /Press c to review the final confirmation; Esc cancels\./);
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /FINAL CONFIRMATION: disable 'Ignore local narrowing overrides'\? Persisted narrowing becomes active again\./);
+    assert.match(setup.captureCharFrame(), /Press y to disable; Esc cancels\./);
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Ignore local narrowing overrides is now OFF: persisted narrowing applies again\./);
+    assert.match(setup.captureCharFrame(), /Ignore local narrowing overrides: off/);
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 2);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("settings kill switch during a post-toggle refresh queues against the active generation instead of a stale profile, and still reverses correctly", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker: baseBroker, calls } = createSettingsBrokerFixture();
+  // issue #105 PR3 closure: toggleKillSwitch() fires its own post-toggle profile() refresh
+  // without awaiting it (`void refreshSettingsProfile(...)`), so that refresh (call #2 below) can
+  // still be outstanding when the operator presses 'k' again. Holding exactly that second call
+  // pending lets this test race a second 'k' press against it deterministically.
+  let profileCallCount = 0;
+  let releaseSecondProfile: (() => void) | undefined;
+  const broker: DispatchBroker = {
+    ...baseBroker,
+    profile: async (repositoryKey, pullRequestId, role) => {
+      profileCallCount++;
+      if (profileCallCount === 2) {
+        await new Promise<void>((resolve) => { releaseSecondProfile = resolve; });
+      }
+      return baseBroker.profile(repositoryKey, pullRequestId, role);
+    },
+  };
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140,
+      height: 32,
+      kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+    assert.equal(profileCallCount, 1);
+
+    // Enable the kill switch normally; its own profile() call (#1) already resolved above.
+    setup.mockInput.pressKey("k");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Ignore local narrowing overrides is now ON/);
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 1);
+    // toggleKillSwitch's own silent refresh (profile call #2) is now in flight and deliberately
+    // held pending by the broker override above.
+    assert.equal(profileCallCount, 2);
+
+    // Press k again WHILE that refresh is still outstanding. The currently loaded profile is
+    // still the STALE pre-toggle snapshot (killSwitchActive: false) -- this must queue against
+    // the active refresh rather than act on it immediately.
+    setup.mockInput.pressKey("k");
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /WARNING: machine\+user-wide emergency lever/);
+    assert.doesNotMatch(setup.captureCharFrame(), /Disable 'Ignore local narrowing overrides'\?/);
+    assert.match(setup.captureCharFrame(), /Kill switch will open once the effective profile finishes loading\./);
+
+    // Extra c/y presses while still queued (killSwitchStage is still "none", nothing has opened
+    // yet) must never be silently misinterpreted as advancing or firing a confirm -- no dropped
+    // key ever turns into an unintended RPC.
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 1);
+
+    // Release the deferred refresh: the queued 'k' now fires against the FRESH, post-toggle
+    // profile (killSwitchActive: true), so the dialog must open showing the DISABLE direction,
+    // never repeating the stale ENABLE direction.
+    releaseSecondProfile?.();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Disable 'Ignore local narrowing overrides'\? Persisted narrowing becomes active again for next launches\./);
+
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /FINAL CONFIRMATION: disable 'Ignore local narrowing overrides'\?/);
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Ignore local narrowing overrides is now OFF: persisted narrowing applies again\./);
+    // Exactly one additional (correct, reverse) set-kill-switch call -- never a repeated ENABLE.
+    assert.equal(calls.filter((call) => call.operation === "set-kill-switch").length, 2);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("settings editor is unavailable without a trusted broker", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} />, {
+      width: 140,
+      height: 32,
+      kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE/);
+    assert.match(setup.captureCharFrame(), /Unavailable: trusted manual broker is not connected \(observe-only mode\)\./);
+
+    setup.mockInput.pressKey("e");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Observe-only: trusted manual broker is unavailable/);
+    assert.match(setup.captureCharFrame(), /SETTINGS - EFFECTIVE CAPABILITY PROFILE/);
+    assert.doesNotMatch(setup.captureCharFrame(), /SETTINGS - EDIT PERSISTED NARROWING/);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("q closes the settings editor globally and shuts down the broker", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker } = createSettingsBrokerFixture();
+  let shutdownCount = 0;
+  const wrappedBroker: DispatchBroker = {
+    ...broker,
+    shutdown: async () => {
+      shutdownCount++;
+      await broker.shutdown();
+    },
+  };
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={wrappedBroker} />, {
+      width: 140,
+      height: 32,
+      kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    setup.mockInput.pressKey("s");
+    await setup.flush();
+    setup.mockInput.pressKey("e");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /SETTINGS - EDIT PERSISTED NARROWING/);
+
+    setup.mockInput.pressKey("q");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(shutdownCount, 1);
+    assert.equal(setup.renderer.isDestroyed, true);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    if (shutdownCount === 0) setup?.renderer.destroy();
     await fixture.tailer.stop();
   }
 });
@@ -773,6 +1488,13 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
     capabilities: ["EnableSummaryComment"],
     mandatoryDenies: ["EnableApprovalVote"],
     dynamicConstraints: [],
+    absoluteDenies: [],
+    allowedManualCapabilities: [],
+    delegableAvailable: [],
+    provenance: {},
+    killSwitchActive: false,
+    killSwitchExpiresAtUtc: null,
+    editingAvailable: true,
   };
   const accepted: DispatchAccepted = {
     schemaVersion: 1,
@@ -815,7 +1537,7 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
   let setup: TestRendererSetup | undefined;
   try {
     setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
-      width: 100, height: 30, kittyKeyboard: true,
+      width: 140, height: 32, kittyKeyboard: true,
     });
     await setup.renderOnce();
     setup.mockInput.pressKey("f");
@@ -1065,6 +1787,416 @@ test("renderer destruction handles rejected trusted broker shutdown once", async
   } finally {
     process.off("unhandledRejection", onUnhandledRejection);
     if (!setup?.renderer.isDestroyed) setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+// PR4 interactive widening (issue #105): a dedicated fixture mirroring createSettingsBrokerFixture's
+// style but for the manual-dispatch draft + widening chain specifically. describe() always resolves
+// immediately (unlike the big manual-dispatch test's deferred-promise fixture above) since these
+// tests exercise the widening sub-flow, not describe()'s own pending/race behavior.
+function createWideningBrokerFixture(options: {
+  role?: AgentRole;
+  delegableAvailable?: string[];
+  killSwitchActive?: boolean;
+  pairedCapabilityActive?: boolean;
+  describeWideningRejection?: { code: string; detail?: string };
+} = {}): {
+  broker: DispatchBroker;
+  calls: string[];
+  dispatchedSummaries: CapabilitySummary[];
+} {
+  const role: AgentRole = options.role ?? "reviewer";
+  const capability = role === "reviewer" ? "EnableApprovalVote" : "EnableAutoComplete";
+  const pairedCapability = role === "reviewer" ? "EnableFindingComments" : null;
+  const pairedCapabilityActive = options.pairedCapabilityActive ?? true;
+  const calls: string[] = [];
+  const dispatchedSummaries: CapabilitySummary[] = [];
+  let generation = 0;
+  const repositoryIdentity = {
+    schemaVersion: 1 as const,
+    provider: "GitHub" as const,
+    repositoryId: "9007199254740993",
+    organization: "contoso",
+    project: "",
+    repositoryName: "repo",
+    slug: "contoso/repo",
+    key: "v1:github:9007199254740993",
+    verifiedAtUtc: "2026-09-03T00:00:00Z",
+    verified: true,
+    dispatchEligible: true,
+  };
+  const prSnapshot = {
+    schemaVersion: 1 as const,
+    pullRequestId: 104,
+    sourceCommit: "a".repeat(40),
+    sourceRef: "feature",
+    targetRef: "main",
+    active: true,
+    draft: false,
+    author: "Ada",
+    title: "Widening PR",
+  };
+  const summary: CapabilitySummary = {
+    schemaVersion: 1,
+    requestId: "r-describe",
+    operation: "capability-summary",
+    role,
+    dispatchDraftId: "22222222-2222-4222-8222-222222222222",
+    repositoryIdentity,
+    prSnapshot,
+    capabilityPolicyDigest: "b".repeat(64),
+    prStateFingerprint: "c".repeat(64),
+    capabilities: [],
+    mandatoryDenies: [capability],
+    dynamicConstraints: [],
+    absoluteDenies: [],
+    allowedManualCapabilities: [],
+    delegableAvailable: options.delegableAvailable ?? [capability],
+    provenance: {},
+    killSwitchActive: options.killSwitchActive ?? false,
+    killSwitchExpiresAtUtc: null,
+    editingAvailable: true,
+  };
+  const accepted: DispatchAccepted = {
+    schemaVersion: 1,
+    requestId: "r-accept",
+    operation: "accepted",
+    dispatchId: "44444444-4444-4444-8444-444444444444",
+    repositoryIdentity,
+    pullRequestId: 104,
+    role,
+    capabilityPolicyDigest: "d".repeat(64),
+    prStateFingerprint: summary.prStateFingerprint,
+    childProcessId: 42,
+    eventLogPath: "Q:\\events\\widening.jsonl",
+  };
+  const broker: DispatchBroker = {
+    describe: async () => { calls.push("describe"); return summary; },
+    profile: async () => { throw new Error("not called"); },
+    previewNarrowing: async () => { throw new Error("not called"); },
+    applyNarrowing: async () => { throw new Error("not called"); },
+    setKillSwitch: async () => { throw new Error("not called"); },
+    describeWidening: async (s, cap): Promise<WideningPreview> => {
+      calls.push(`describe-widening:${cap}`);
+      if (options.describeWideningRejection) {
+        throw new BrokerRejectionError(options.describeWideningRejection.code, options.describeWideningRejection.detail ?? "");
+      }
+      generation += 1;
+      return {
+        schemaVersion: 1,
+        requestId: `w-${generation}`,
+        operation: "widening-preview",
+        state: "previewed",
+        dispatchDraftId: s.dispatchDraftId,
+        capability: cap,
+        challenge: "a".repeat(48),
+        effectiveDiff: { addedCapabilities: [cap], removedDenies: [cap], pairedCapability, pairedCapabilityActive },
+        expiresAtUtc: "2026-09-03T18:00:00Z",
+        generation,
+      };
+    },
+    confirmWideningPreview: async (s, stage): Promise<WideningSummary> => {
+      calls.push("confirm-widening-preview");
+      generation += 1;
+      return {
+        schemaVersion: 1,
+        requestId: `w-${generation}`,
+        operation: "widening-summary",
+        state: "awaiting-final-confirmation",
+        dispatchDraftId: s.dispatchDraftId,
+        capability: stage.capability,
+        challenge: "b".repeat(48),
+        effectiveDiff: stage.effectiveDiff,
+        expiresAtUtc: "2026-09-03T18:01:00Z",
+        generation,
+      };
+    },
+    confirmWideningMint: async (s, stage): Promise<WideningMinted> => {
+      calls.push("confirm-widening-mint");
+      generation += 1;
+      return {
+        schemaVersion: 1,
+        requestId: `w-${generation}`,
+        operation: "widening-minted",
+        state: "minted",
+        dispatchDraftId: s.dispatchDraftId,
+        capability: stage.capability,
+        capabilities: [...summary.capabilities, stage.capability],
+        mandatoryDenies: summary.mandatoryDenies.filter((deny) => deny !== stage.capability),
+        capabilityPolicyDigest: "d".repeat(64),
+        effectiveDiff: stage.effectiveDiff,
+        grantExpiresAtUtc: "2026-09-03T18:10:00Z",
+        generation,
+      };
+    },
+    cancelWidening: async (s, requestedGeneration): Promise<WideningCancelled> => {
+      calls.push(`cancel-widening:${requestedGeneration}`);
+      generation += 1;
+      return {
+        schemaVersion: 1,
+        requestId: `w-${generation}`,
+        operation: "widening-cancelled",
+        state: "cancelled",
+        dispatchDraftId: s.dispatchDraftId,
+        capabilities: summary.capabilities,
+        mandatoryDenies: summary.mandatoryDenies,
+        capabilityPolicyDigest: summary.capabilityPolicyDigest,
+        delegableAvailable: summary.delegableAvailable,
+        generation,
+      };
+    },
+    dispatch: async (describedSummary) => {
+      calls.push("dispatch");
+      dispatchedSummaries.push(describedSummary);
+      return accepted;
+    },
+    cancel: async () => { throw new Error("not called"); },
+    shutdown: async () => { calls.push("shutdown"); },
+    subscribeTerminal: () => () => {},
+  };
+  return { broker, calls, dispatchedSummaries };
+}
+
+async function openManualAndDescribe(setup: TestRendererSetup, role: AgentRole = "reviewer"): Promise<void> {
+  setup.mockInput.pressKey("f");
+  await setup.flush();
+  setup.mockInput.pressKey("m");
+  await setup.flush();
+  if (role === "review-handler") {
+    setup.mockInput.pressTab();
+    await setup.flush();
+  }
+  setup.mockInput.pressKey("d", { ctrl: true });
+  await setup.flush();
+}
+
+test("manual dispatch widening: reviewer mints EnableApprovalVote via two explicit confirms, shows the paired EnableFindingComments requirement, never auto-dispatches, and the existing d/y gate dispatches the minted digest", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls, dispatchedSummaries } = createWideningBrokerFixture({ role: "reviewer" });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    await openManualAndDescribe(setup);
+    assert.match(setup.captureCharFrame(), /force fresh analysis/);
+    assert.match(setup.captureCharFrame(), /Press w to request EnableApprovalVote widening/);
+
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    assert.deepEqual(calls, ["describe", "describe-widening:EnableApprovalVote"]);
+    assert.match(setup.captureCharFrame(), /Widening preview: EnableApprovalVote/);
+    assert.match(setup.captureCharFrame(), /Paired requirement: EnableFindingComments must already be active \(confirmed active\)/);
+    assert.match(setup.captureCharFrame(), /unexplained verdict/);
+    assert.match(setup.captureCharFrame(), /First widening confirmation: press c/);
+
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    assert.equal(calls.at(-1), "confirm-widening-preview");
+    assert.match(setup.captureCharFrame(), /Final widening blast radius: EnableApprovalVote/);
+    assert.match(setup.captureCharFrame(), /Single-use grant; expires/);
+    assert.match(setup.captureCharFrame(), /Unavailable to headless\/direct\/watcher dispatch/);
+    assert.match(setup.captureCharFrame(), /FINAL WIDENING CONFIRMATION: press y/);
+
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.equal(calls.at(-1), "confirm-widening-mint");
+    assert.equal(calls.includes("dispatch"), false, "minting must never auto-dispatch");
+    assert.match(setup.captureCharFrame(), /Widening grant minted and active for this draft/);
+    assert.match(setup.captureCharFrame(), /vote-grant dispatch: skips forced fresh analysis/);
+    assert.match(setup.captureCharFrame(), /Enabled: EnableApprovalVote/);
+
+    // Existing, unmodified dispatch confirmation gate -- 'd' then 'y' -- is what finally dispatches.
+    setup.mockInput.pressKey("d");
+    await setup.flush();
+    assert.equal(calls.includes("dispatch"), false);
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.deepEqual(calls.slice(-1), ["dispatch"]);
+    assert.equal(dispatchedSummaries.length, 1);
+    assert.equal(dispatchedSummaries[0]?.capabilityPolicyDigest, "d".repeat(64));
+    assert.deepEqual(dispatchedSummaries[0]?.capabilities, ["EnableApprovalVote"]);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("manual dispatch widening: Esc during preview and during the final summary each cancel widening with the current generation and never dispatch", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls } = createWideningBrokerFixture({ role: "reviewer" });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    await openManualAndDescribe(setup);
+
+    // Cancel at the first widening stage (preview).
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.deepEqual(calls, ["describe", "describe-widening:EnableApprovalVote", "cancel-widening:1"]);
+    assert.match(setup.captureCharFrame(), /Widening cancelled/);
+    assert.match(setup.captureCharFrame(), /Press w to request EnableApprovalVote widening/);
+
+    // Cancel again, this time at the final summary stage, after a fresh describe-widening.
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.deepEqual(calls.slice(-3), ["describe-widening:EnableApprovalVote", "confirm-widening-preview", "cancel-widening:4"]);
+    assert.match(setup.captureCharFrame(), /Widening cancelled/);
+    assert.equal(calls.includes("confirm-widening-mint"), false);
+    assert.equal(calls.includes("dispatch"), false);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("manual dispatch widening: empty delegableAvailable and an active kill switch both block the widening entry point in the UI", async (context) => {
+  const fixture1 = createFixture();
+  const history1 = createSettingsHistory();
+  const { broker: emptyBroker, calls: emptyCalls } = createWideningBrokerFixture({ delegableAvailable: [] });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture1.reducer} history={history1} tailer={fixture1.tailer} broker={emptyBroker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    await openManualAndDescribe(setup);
+    assert.match(setup.captureCharFrame(), /No delegated capabilities available for this role/);
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    assert.equal(emptyCalls.includes("describe-widening:EnableApprovalVote"), false);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture1.tailer.stop();
+  }
+
+  const fixture2 = createFixture();
+  const history2 = createSettingsHistory();
+  const { broker: killSwitchBroker, calls: killSwitchCalls } = createWideningBrokerFixture({ killSwitchActive: true });
+  let setup2: TestRendererSetup | undefined;
+  try {
+    setup2 = await testRender(() => <App reducer={fixture2.reducer} history={history2} tailer={fixture2.tailer} broker={killSwitchBroker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup2.renderOnce();
+    await openManualAndDescribe(setup2);
+    assert.match(setup2.captureCharFrame(), /Widening unavailable while the kill switch is active/);
+    setup2.mockInput.pressKey("w");
+    await setup2.flush();
+    assert.equal(killSwitchCalls.includes("describe-widening:EnableApprovalVote"), false);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup2?.renderer.destroy();
+    await fixture2.tailer.stop();
+  }
+});
+
+test("manual dispatch widening: a rejected describe-widening is terminal (no auto-retry) and surfaces the broker's message; review-handler grants its own EnableAutoComplete capability", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls } = createWideningBrokerFixture({
+    role: "review-handler",
+    describeWideningRejection: { code: "widening-expired", detail: "" },
+  });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    await openManualAndDescribe(setup, "review-handler");
+    assert.match(setup.captureCharFrame(), /Role: HANDLER/);
+    assert.match(setup.captureCharFrame(), /Press w to request EnableAutoComplete widening/);
+
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    assert.deepEqual(calls, ["describe", "describe-widening:EnableAutoComplete"]);
+    assert.match(setup.captureCharFrame(), /widening confirmation expired; request widening again/);
+    // Terminal, not auto-retried: the hint to press w again is back, and no further
+    // describe-widening call has been made without an explicit fresh keypress.
+    assert.match(setup.captureCharFrame(), /Press w to request EnableAutoComplete widening/);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(calls, ["describe", "describe-widening:EnableAutoComplete"]);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("manual dispatch widening: closing the panel with a minted-but-undispatched grant best-effort cancels it", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls } = createWideningBrokerFixture({ role: "reviewer" });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    await openManualAndDescribe(setup);
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.equal(calls.includes("dispatch"), false);
+    assert.equal(calls.includes("cancel-widening:3"), false);
+
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /MANUAL DISPATCH/);
+    assert.ok(calls.includes("cancel-widening:3"), "closing with a minted grant must best-effort cancel it");
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
     await fixture.tailer.stop();
   }
 });

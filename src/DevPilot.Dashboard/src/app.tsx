@@ -20,11 +20,19 @@ import { PullRequestHistoryProjection, type PullRequestHistoryEntry } from "./hi
 import type { EventTailer } from "./tailer.js";
 import {
   BrokerRejectionError,
+  type CapabilityNarrowingPreview,
   type CapabilityProfile,
   type CapabilitySummary,
   type DispatchAccepted,
   type DispatchBroker,
   type DispatchTerminal,
+  type NarrowingAction,
+  type NarrowingScope,
+  NARROWING_SCOPES,
+  type WideningCancelled,
+  type WideningMinted,
+  type WideningPreview,
+  type WideningSummary,
 } from "./dispatch.js";
 
 export const BRAND_PLANE = ["       __|__       ", "--o--o--(_)--o--o--"] as const;
@@ -117,6 +125,23 @@ export function dispatchResultDetail(code: string, detail = ""): string {
       : "Already running: this PR and role hold the work lease.",
     "launch-failed": "Broker could not safely launch the child.",
     "role-not-allowed": "This manual role is not enabled by the trusted launcher.",
+    "narrowing-invalid": "The requested narrowing scope, capability, or action is not valid.",
+    "narrowing-stale": "The store changed since preview; re-preview before applying.",
+    "narrowing-expired": "The preview expired; re-preview before applying.",
+    "narrowing-kill-switch-active": "Editing is unavailable while the kill switch is active.",
+    "widening-invalid": "The requested capability widening is not valid for this draft or role.",
+    "widening-expired": "The widening confirmation expired; request widening again.",
+    "widening-replay": "That widening confirmation was already used; request widening again.",
+    "widening-stale": "Widening state has moved on; re-open the widening panel and try again.",
+    // issue #105 final headless-broker bypass fix: distinct from every other widening rejection
+    // -- this broker process was not itself launched by the trusted interactive Dashboard, so
+    // interactive widening is structurally unavailable here. No retry can fix this from the
+    // client; only relaunching through the trusted Dashboard entry point can.
+    "widening-interactive-required": "Interactive widening is unavailable: this broker was not launched by the trusted Dashboard.",
+    "delegation-not-allowed": "The checked-in delegation policy does not permit this capability for this repository.",
+    "delegation-policy-unavailable": "The checked-in delegation policy could not be loaded; widening is unavailable right now.",
+    "grant-invalidated": "The capability widening grant is no longer valid; dispatch without it or request widening again.",
+    "grant-noop": "This redispatch already has prior delivery state; the auto-complete grant would be a no-op.",
   };
   return `${labels[code] ?? `Dispatch rejected: ${code}`}${safe ? ` ${safe}` : ""}`;
 }
@@ -129,6 +154,10 @@ function ManualDispatchPanel(props: {
   summary: CapabilitySummary | null;
   accepted: DispatchAccepted | null;
   status: string;
+  wideningStage: "closed" | "describing" | "preview" | "confirming" | "summary" | "minting" | "cancelling";
+  wideningPreview: WideningPreview | WideningSummary | null;
+  wideningStatus: string;
+  mintedWideningGeneration: number | null;
 }) {
   const promptPreview = () => line(props.prompt.replace(/\n/g, " / ") || "(none)", 90);
   const identity = () => props.summary?.repositoryIdentity ?? props.entry.repositoryIdentity;
@@ -140,7 +169,19 @@ function ManualDispatchPanel(props: {
       <box flexDirection="column" flexGrow={1}>
         <text height={1} fg={COLORS.accent}>{identity().slug} / PR #{pullRequestId()}</text>
         <text height={1} fg={COLORS.text}>{line(title() || "(untitled)", 100)} | {line(author() || "unknown author", 60)}</text>
-        <text height={1} fg={COLORS.text}>Role: {roleLabel(props.role)} | force fresh analysis</text>
+        <text height={1} fg={COLORS.text}>
+          Role: {roleLabel(props.role)} |{" "}
+          {
+            // Mirrors Invoke-Dispatch's own $includeForceAnalysis exactly (issue #105 PR4
+            // requirement 6): -ForceAnalysis is omitted ONLY for a reviewer's minted
+            // EnableApprovalVote grant (the sole capability a reviewer can ever widen) --
+            // every other combination, including a review-handler's EnableAutoComplete grant,
+            // keeps forcing fresh analysis exactly as an unwidened dispatch would.
+            props.role === "reviewer" && props.mintedWideningGeneration !== null
+              ? "vote-grant dispatch: skips forced fresh analysis (already-reviewed PR)"
+              : "force fresh analysis"
+          }
+        </text>
         <Show when={props.mode === "prompt"}>
           <text height={1} fg={COLORS.warning}>Operator context is untrusted data; 512 Unicode scalars maximum.</text>
           <text height={1} fg={COLORS.text}>{promptPreview()}</text>
@@ -161,7 +202,69 @@ function ManualDispatchPanel(props: {
                 {(constraint) => <text height={1} fg={COLORS.warning}>Constraint: {line(constraint, 100)}</text>}
               </For>
               <Show when={props.mode === "confirm"}>
-                <text height={1} fg={COLORS.warning}>First confirmation: press d to review the final execution gate; Esc cancels.</text>
+                <Show when={props.wideningStage === "closed"}>
+                  <Show when={props.mintedWideningGeneration !== null}>
+                    <text height={1} fg={COLORS.ok}>Widening grant minted and active for this draft; continue with d then y to dispatch, or Esc to close and relinquish it.</text>
+                  </Show>
+                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 0}>
+                    <text height={1} fg={COLORS.muted}>No delegated capabilities available for this role.</text>
+                  </Show>
+                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 1 && summary().killSwitchActive}>
+                    <text height={1} fg={COLORS.error}>Widening unavailable while the kill switch is active.</text>
+                  </Show>
+                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 1 && !summary().killSwitchActive}>
+                    <text height={1} fg={COLORS.muted}>Press w to request {summary().delegableAvailable[0]} widening (draft-bound, single-use).</text>
+                  </Show>
+                  <text height={1} fg={COLORS.warning}>First confirmation: press d to review the final execution gate; Esc cancels.</text>
+                </Show>
+                <Show when={props.wideningStage === "describing"}>
+                  <text height={1} fg={COLORS.warning}>Requesting capability widening description...</text>
+                </Show>
+                <Show when={props.wideningStage === "cancelling"}>
+                  <text height={1} fg={COLORS.warning}>Cancelling capability widening...</text>
+                </Show>
+                <Show when={props.wideningPreview}>
+                  {(stageAccessor: () => WideningPreview | WideningSummary) => {
+                    const diff = () => stageAccessor().effectiveDiff;
+                    return (
+                      <>
+                        <text height={1} fg={COLORS.accent}>
+                          {props.wideningStage === "summary" || props.wideningStage === "minting" ? "Final widening blast radius" : "Widening preview"}: {stageAccessor().capability}
+                        </text>
+                        <text height={1} fg={COLORS.ok}>Would add: {line(diff().addedCapabilities.join(", ") || "none", 100)}</text>
+                        <text height={1} fg={COLORS.warning}>Would remove from denies: {line(diff().removedDenies.join(", ") || "none", 100)}</text>
+                        <Show when={diff().pairedCapability}>
+                          {(paired: () => string) => (
+                            <>
+                              <text height={1} fg={diff().pairedCapabilityActive ? COLORS.ok : COLORS.error}>
+                                Paired requirement: {paired()} must already be active{diff().pairedCapabilityActive ? " (confirmed active)" : " -- NOT active; minting refused"}.
+                              </text>
+                              <text height={1} fg={COLORS.muted}>Casting a vote without visible findings leaves the author an unexplained verdict.</text>
+                            </>
+                          )}
+                        </Show>
+                        <Show when={props.wideningStage === "preview"}>
+                          <text height={1} fg={COLORS.muted}>Expires {line(stageAccessor().expiresAtUtc, 40)}</text>
+                          <text height={1} fg={COLORS.warning}>First widening confirmation: press c to review the final blast radius; Esc cancels the widening request.</text>
+                        </Show>
+                        <Show when={props.wideningStage === "confirming"}>
+                          <text height={1} fg={COLORS.warning}>Confirming widening preview...</text>
+                        </Show>
+                        <Show when={props.wideningStage === "summary"}>
+                          <text height={1} fg={COLORS.warning}>Single-use grant; expires {line(stageAccessor().expiresAtUtc, 40)}.</text>
+                          <text height={1} fg={COLORS.warning}>Unavailable to headless/direct/watcher dispatch -- interactive draft-bound use only.</text>
+                          <text height={1} fg={COLORS.error}>FINAL WIDENING CONFIRMATION: press y to mint this grant; Esc cancels.</text>
+                        </Show>
+                        <Show when={props.wideningStage === "minting"}>
+                          <text height={1} fg={COLORS.warning}>Minting capability widening grant...</text>
+                        </Show>
+                      </>
+                    );
+                  }}
+                </Show>
+                <Show when={props.wideningStatus}>
+                  <text height={1} fg={COLORS.muted}>{line(props.wideningStatus, 160)}</text>
+                </Show>
               </Show>
               <Show when={props.mode === "confirm-final"}>
                 <text height={1} fg={COLORS.error}>FINAL CONFIRMATION: press y to dispatch this exact snapshot; Esc cancels.</text>
@@ -591,12 +694,19 @@ function Inspector(props: { instance: InstanceState | undefined; focused?: boole
   );
 }
 
-function OverlayPanel(props: { title: string; children: unknown; width?: number; height?: number }) {
+function OverlayPanel(props: {
+  title: string;
+  children: unknown;
+  width?: number;
+  height?: number;
+  left?: number | "auto" | `${number}%`;
+  padding?: number;
+}) {
   return (
     <box
       position="absolute"
       top="15%"
-      left="15%"
+      left={props.left ?? "15%"}
       width={props.width ?? 70}
       height={props.height ?? 18}
       zIndex={100}
@@ -605,7 +715,7 @@ function OverlayPanel(props: { title: string; children: unknown; width?: number;
       borderColor={COLORS.accent}
       backgroundColor={COLORS.panel}
       title={` ${props.title} `}
-      padding={1}
+      padding={props.padding ?? 1}
       flexDirection="column"
     >
       {props.children}
@@ -645,9 +755,50 @@ export function App(props: AppProps) {
   const [capabilitySummary, setCapabilitySummary] = createSignal<CapabilitySummary | null>(null);
   const [acceptedDispatch, setAcceptedDispatch] = createSignal<DispatchAccepted | null>(null);
   const [manualStatus, setManualStatus] = createSignal("");
+  // PR4 interactive widening sub-flow (issue #105), nested entirely inside manualMode()==="confirm"
+  // -- Settings' own read-only CapabilityProfile has no dispatchDraftId to bind against, so
+  // widening is only ever reachable from the trusted manual describe() flow. "preview"/"summary"
+  // hold the broker's two challenge-bearing responses; the "-ing" stages are in-flight RPCs during
+  // which widening keys are ignored (see the keyboard handler). wideningPreview holds whichever of
+  // WideningPreview/WideningSummary is currently active, since both share the same challenge/
+  // effectiveDiff/expiresAtUtc/generation shape.
+  const [wideningStage, setWideningStage] =
+    createSignal<"closed" | "describing" | "preview" | "confirming" | "summary" | "minting" | "cancelling">("closed");
+  const [wideningPreview, setWideningPreview] = createSignal<WideningPreview | WideningSummary | null>(null);
+  const [wideningStatus, setWideningStatus] = createSignal("");
+  // Set the instant confirm-widening-mint succeeds; cleared on dispatch, on an explicit cancel, or
+  // on closing/reopening manual dispatch. Tracks a minted-but-not-yet-dispatched grant so
+  // close/quit/shutdown can still best-effort relinquish it even though wideningStage() itself has
+  // already returned to "closed" (mint returns control to the ordinary confirm/confirm-final gate,
+  // per issue #105 PR4 -- widening never dispatches on its own).
+  const [mintedWideningGeneration, setMintedWideningGeneration] = createSignal<number | null>(null);
   const [settingsRole, setSettingsRole] = createSignal<AgentRole>("reviewer");
   const [settingsProfile, setSettingsProfile] = createSignal<CapabilityProfile | null>(null);
   const [settingsStatus, setSettingsStatus] = createSignal("");
+  // PR3 narrow-only edit UX. narrowingMode is null while the read-only Settings view (PR1/PR2) is
+  // showing; entering the editor stages a scope+capability selection, o/i request a preview for
+  // 'off'/'inherit', and the two-stage confirm mirrors ManualDispatchPanel's confirm/confirm-final.
+  const [narrowingMode, setNarrowingMode] =
+    createSignal<"browsing" | "previewing" | "confirm" | "confirm-final" | "applying" | "result" | null>(null);
+  const [narrowingScopeIndex, setNarrowingScopeIndex] = createSignal(0);
+  const [narrowingCapabilityIndex, setNarrowingCapabilityIndex] = createSignal(0);
+  const [narrowingPreview, setNarrowingPreview] = createSignal<CapabilityNarrowingPreview | null>(null);
+  const [narrowingStatus, setNarrowingStatus] = createSignal("");
+  // PR3 completion (issue #105): two-stage confirm, mirroring narrowingMode's own
+  // confirm/confirm-final and ManualDispatchPanel's confirm/confirm-final -- "none" is the
+  // ordinary read-only Settings view, "confirm" is the first (full-disclosure) warning, and
+  // "confirm-final" is the terse final gate that actually arms the 'y' toggle.
+  const [killSwitchStage, setKillSwitchStage] = createSignal<"none" | "confirm" | "confirm-final">("none");
+  let narrowingGeneration = 0;
+  // Local UI correlation token for the widening sub-flow, mirroring narrowingGeneration/
+  // killSwitchGeneration exactly: bumped by every widening step and by closeManual/openManual, so
+  // a response for a superseded step (panel closed/reopened meanwhile) can never be applied.
+  let wideningRequestToken = 0;
+  // Kill-switch generation token (issue #105 PR3 completion), mirroring narrowingGeneration/
+  // settingsGeneration exactly: bumped by closeSettings and by a role switch (Tab), so a
+  // setKillSwitch() response that resolves after Settings was closed or re-roled can never
+  // mutate settingsStatus or trigger a refresh for a view the operator is no longer looking at.
+  let killSwitchGeneration = 0;
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let localBrokerShutdown: Promise<void> | undefined;
   // Settings refresh/toggle race guard: every refreshSettingsProfile() call is stamped with a
@@ -662,6 +813,18 @@ export function App(props: AppProps) {
   // response must still never be applied, which is what these guards continue to protect against.
   let settingsGeneration = 0;
   let settingsRefreshPending = false;
+  // PR3 palette first-use queueing (see openNarrowingEditor/tryOpenNarrowingEditor): set to the
+  // settingsGeneration token of the in-flight profile load the editor-open intent is waiting on,
+  // or undefined when no open is queued. Consumed (and cleared) by refreshSettingsProfile's
+  // success/error paths, and force-cleared by closeSettings so a queued intent can never fire late
+  // into a closed/different view.
+  let pendingNarrowingEditorGeneration: number | undefined;
+  // Kill-switch open queueing (issue #105 PR3 completion), mirroring
+  // pendingNarrowingEditorGeneration/tryOpenNarrowingEditor exactly: set to the settingsGeneration
+  // token of the in-flight profile load 'k' is waiting on, or undefined when no open is queued.
+  // Consumed (and cleared) by refreshSettingsProfile's success/error paths, and force-cleared by
+  // closeSettings so a queued intent can never fire late into a closed/different view.
+  let pendingKillSwitchGeneration: number | undefined;
   // Renders only when the resolved profile's own role still matches the currently displayed role
   // label, independent of the request-token guard above -- a second, cheap line of defense so a
   // mislabeled profile can never reach the screen even if the guard above is ever weakened (e.g. a
@@ -685,6 +848,7 @@ export function App(props: AppProps) {
   onCleanup(() => {
     clearInterval(refreshTimer);
     if (feedbackTimer) clearTimeout(feedbackTimer);
+    bestEffortCancelWidening();
     void shutdownBroker();
   });
 
@@ -736,12 +900,18 @@ export function App(props: AppProps) {
       notify("Cancel the active manual dispatch before closing");
       return;
     }
+    bestEffortCancelWidening();
     setManualMode("closed");
     setManualEntry(null);
     setCapabilitySummary(null);
     setAcceptedDispatch(null);
     setOperatorPrompt("");
     setManualStatus("");
+    wideningRequestToken += 1;
+    setWideningStage("closed");
+    setWideningPreview(null);
+    setWideningStatus("");
+    setMintedWideningGeneration(null);
   }
 
   function openManual(): void {
@@ -764,6 +934,11 @@ export function App(props: AppProps) {
     setAcceptedDispatch(null);
     setOperatorPrompt("");
     setManualStatus("");
+    wideningRequestToken += 1;
+    setWideningStage("closed");
+    setWideningPreview(null);
+    setWideningStatus("");
+    setMintedWideningGeneration(null);
     notify("Manual dispatch prompt opened");
   }
 
@@ -797,6 +972,10 @@ export function App(props: AppProps) {
       props.tailer.registerEventLogPath(accepted.eventLogPath);
       setManualMode("active");
       setManualStatus("Dispatch accepted; waiting for correlated v3 child events.");
+      // Any minted widening grant is now consumed by the broker's own dispatch-time preflight
+      // (Invoke-Dispatch sets Consumed=true unconditionally) -- a later best-effort cancel-widening
+      // for this generation would only fail harmlessly, so stop tracking it.
+      setMintedWideningGeneration(null);
     } catch (error) {
       const message = error instanceof BrokerRejectionError
         ? dispatchResultDetail(error.code, error.detail)
@@ -826,6 +1005,149 @@ export function App(props: AppProps) {
     }
   }
 
+  // PR4 interactive widening (issue #105). Reachable only while manualMode() === "confirm" -- see
+  // the keyboard handler -- since a live CapabilitySummary/dispatchDraftId is required and Settings'
+  // CapabilityProfile has none. Only ever ONE capability can be delegable per role
+  // (DELEGABLE_CAPABILITY_BY_ROLE), so there is no picker: the sole entry in delegableAvailable is
+  // the one this whole sub-flow requests.
+  function canRequestWidening(): boolean {
+    const summary = capabilitySummary();
+    return manualMode() === "confirm" && wideningStage() === "closed" &&
+      Boolean(summary) && !summary!.killSwitchActive && summary!.delegableAvailable.length === 1;
+  }
+
+  async function beginWidening(): Promise<void> {
+    const summary = capabilitySummary();
+    if (!props.broker || !summary || !canRequestWidening()) return;
+    const capability = summary.delegableAvailable[0]!;
+    setWideningStage("describing");
+    setWideningStatus("");
+    const requestId = (wideningRequestToken += 1);
+    try {
+      const preview = await props.broker.describeWidening(summary, capability);
+      if (requestId !== wideningRequestToken) return; // superseded: manual panel closed/reset meanwhile
+      setWideningPreview(preview);
+      setWideningStage("preview");
+    } catch (error) {
+      if (requestId !== wideningRequestToken) return;
+      setWideningStatus(isKillSwitchActiveRejection(error)
+        ? "Widening is unavailable while the kill switch is active."
+        : error instanceof BrokerRejectionError
+          ? dispatchResultDetail(error.code, error.detail)
+          : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setWideningStage("closed");
+      setWideningPreview(null);
+    }
+  }
+
+  async function confirmWideningPreviewStep(): Promise<void> {
+    const summary = capabilitySummary();
+    const stage = wideningPreview();
+    if (!props.broker || !summary || !stage || wideningStage() !== "preview") return;
+    setWideningStage("confirming");
+    setWideningStatus("");
+    const requestId = (wideningRequestToken += 1);
+    try {
+      const nextStage = await props.broker.confirmWideningPreview(summary, stage as WideningPreview);
+      if (requestId !== wideningRequestToken) return;
+      setWideningPreview(nextStage);
+      setWideningStage("summary");
+    } catch (error) {
+      if (requestId !== wideningRequestToken) return;
+      setWideningStatus(isKillSwitchActiveRejection(error)
+        ? "Widening is unavailable while the kill switch is active."
+        : error instanceof BrokerRejectionError
+          ? dispatchResultDetail(error.code, error.detail)
+          : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setWideningStage("closed");
+      setWideningPreview(null);
+    }
+  }
+
+  async function confirmWideningMintStep(): Promise<void> {
+    const summary = capabilitySummary();
+    const stage = wideningPreview();
+    if (!props.broker || !summary || !stage || wideningStage() !== "summary") return;
+    setWideningStage("minting");
+    setWideningStatus("");
+    const requestId = (wideningRequestToken += 1);
+    try {
+      const minted = await props.broker.confirmWideningMint(summary, stage as WideningSummary);
+      if (requestId !== wideningRequestToken) return;
+      // Merge the minted, refreshed capabilities/mandatoryDenies/digest into the manual dispatch
+      // summary in place -- the existing, unmodified d/y confirm-final gate then dispatches this
+      // exact widened snapshot. Widening never dispatches on its own (issue #105 PR4).
+      setCapabilitySummary({
+        ...summary,
+        capabilities: minted.capabilities,
+        mandatoryDenies: minted.mandatoryDenies,
+        capabilityPolicyDigest: minted.capabilityPolicyDigest,
+      });
+      setMintedWideningGeneration(minted.generation);
+      setWideningStage("closed");
+      setWideningPreview(null);
+      setWideningStatus(
+        `Widening minted: ${minted.capability} granted until ${minted.grantExpiresAtUtc}. ` +
+        "Continue with d then y to dispatch, or Esc to close and relinquish it.",
+      );
+    } catch (error) {
+      if (requestId !== wideningRequestToken) return;
+      setWideningStatus(isKillSwitchActiveRejection(error)
+        ? "Widening is unavailable while the kill switch is active."
+        : error instanceof BrokerRejectionError
+          ? dispatchResultDetail(error.code, error.detail)
+          : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setWideningStage("closed");
+      setWideningPreview(null);
+    }
+  }
+
+  async function cancelWideningStep(): Promise<void> {
+    const summary = capabilitySummary();
+    const stage = wideningPreview();
+    const stageName = wideningStage();
+    if (!props.broker || !summary || !stage || (stageName !== "preview" && stageName !== "summary")) return;
+    setWideningStage("cancelling");
+    const requestId = (wideningRequestToken += 1);
+    try {
+      const cancelled = await props.broker.cancelWidening(summary, stage.generation);
+      if (requestId !== wideningRequestToken) return;
+      setCapabilitySummary({
+        ...summary,
+        capabilities: cancelled.capabilities,
+        mandatoryDenies: cancelled.mandatoryDenies,
+        capabilityPolicyDigest: cancelled.capabilityPolicyDigest,
+        delegableAvailable: cancelled.delegableAvailable,
+      });
+      setWideningStatus("Widening cancelled; capability profile refreshed to the unwidened baseline.");
+    } catch (error) {
+      if (requestId !== wideningRequestToken) return;
+      setWideningStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (requestId === wideningRequestToken) {
+        setMintedWideningGeneration(null);
+        setWideningStage("closed");
+        setWideningPreview(null);
+      }
+    }
+  }
+
+  // Best-effort only (issue #105 PR4): never awaited, never surfaced as a failure -- a widening
+  // attempt or an already-minted grant is draft-scoped and expires on its own (DraftLifetimeSeconds)
+  // even if this never lands, so close/quit/shutdown must never block on it.
+  function bestEffortCancelWidening(): void {
+    const summary = capabilitySummary();
+    const stageName = wideningStage();
+    const generation = mintedWideningGeneration() ??
+      (stageName === "preview" || stageName === "summary" ? wideningPreview()?.generation ?? null : null);
+    if (!props.broker || !summary || generation === null) return;
+    void props.broker.cancelWidening(summary, generation).catch(() => {
+      // Best-effort: see comment above.
+    });
+  }
+
   // Read-only effective-profile settings: uses the broker's dedicated `profile` RPC (issue #105),
   // not the manual dispatch prompt's describe(). Unlike describe(), profile() is side-effect-free
   // on the broker -- it never allocates a dispatchDraftId, config snapshot, or $drafts entry -- so
@@ -837,35 +1159,76 @@ export function App(props: AppProps) {
   // token plus its own broker-authored role -- see the settingsGeneration/settingsDisplayProfile
   // comment above -- so an overlapping or superseded profile() response can never render under the
   // wrong label.
-  async function refreshSettingsProfile(targetRole: AgentRole): Promise<void> {
+  async function refreshSettingsProfile(targetRole: AgentRole, options: { silent?: boolean } = {}): Promise<void> {
     if (settingsRefreshPending) return;
     const entry = historyCurrent();
     if (!props.broker) {
       settingsGeneration += 1;
       setSettingsProfile(null);
+      // issue #105 PR3 closure: a stale confirm/confirm-final left open against a profile that
+      // just disappeared would show a WARNING/FINAL CONFIRMATION for a transition this process no
+      // longer has any actual profile to compute -- close it the same instant the profile clears
+      // rather than leaving it visibly stuck until the next keypress (or a 'y' press) discovers
+      // the loss on its own.
+      setKillSwitchStage("none");
       setSettingsStatus("Unavailable: trusted manual broker is not connected (observe-only mode).");
       return;
     }
     if (!entry) {
       settingsGeneration += 1;
       setSettingsProfile(null);
+      setKillSwitchStage("none");
       setSettingsStatus("Unavailable: select a retained PR history row to resolve a next-launch profile.");
       return;
     }
     const requestId = (settingsGeneration += 1);
     settingsRefreshPending = true;
-    setSettingsStatus("Resolving effective profile for the next manual dispatch...");
+    if (!options.silent) setSettingsStatus("Resolving effective profile for the next manual dispatch...");
     try {
       const profile = await props.broker.profile(entry.repositoryIdentity.key, entry.pullRequestId, targetRole);
       if (requestId !== settingsGeneration) return; // superseded: Settings closed/reopened meanwhile
       setSettingsProfile(profile);
-      setSettingsStatus("");
+      // Legacy-broker compatibility (issue #105 PR3 review): editingAvailable is false only when
+      // this broker predates narrowing/kill-switch support entirely (see dispatch.ts's
+      // parseCapabilityProfileFields) -- surface that as a persistent, always-visible status line
+      // the same way the broker-not-connected/no-history-row messages above already are, rather
+      // than silently no-oping the first time 'e'/'k' is pressed. Skipped for a `silent` refresh
+      // (the internal re-read applyNarrowing()/toggleKillSwitch() trigger after their own mutation
+      // succeeds) so it can never stomp the confirmation message those callers just set via this
+      // same settingsStatus signal.
+      if (!options.silent) {
+        setSettingsStatus(profile.editingAvailable
+          ? ""
+          : "Unavailable: broker does not support capability narrowing (upgrade required).");
+      }
+      // PR3 palette first-use queueing: if openNarrowingEditor() was invoked before this profile
+      // load resolved (e.g. the command palette's "Edit persisted capability narrowing" entry
+      // picked before Settings had ever fetched a profile), fire the deferred open now that a
+      // profile for the exact same generation has just landed. Reuses this function's own
+      // generation guard rather than inventing a second one.
+      if (pendingNarrowingEditorGeneration === requestId) {
+        pendingNarrowingEditorGeneration = undefined;
+        tryOpenNarrowingEditor(profile);
+      }
+      // Kill-switch open queueing (issue #105 PR3 completion): mirrors the narrowing-editor queue
+      // immediately above -- 'k' pressed before a current, matching profile had ever loaded defers
+      // here instead of racing ahead on an unknown editingAvailable/killSwitchActive state.
+      if (pendingKillSwitchGeneration === requestId) {
+        pendingKillSwitchGeneration = undefined;
+        tryOpenKillSwitchConfirm(profile);
+      }
     } catch (error) {
       if (requestId !== settingsGeneration) return;
       setSettingsProfile(null);
+      // Same rationale as the broker-loss/no-entry branches above: a failed refresh means there
+      // is no current profile to confirm a kill-switch transition against, so any open confirm/
+      // confirm-final must close rather than linger on stale data.
+      setKillSwitchStage("none");
       setSettingsStatus(error instanceof BrokerRejectionError
         ? `Unavailable: ${dispatchResultDetail(error.code, error.detail)}`
         : `Unavailable: broker failure resolving effective profile (${error instanceof Error ? error.message : String(error)}).`);
+      if (pendingNarrowingEditorGeneration === requestId) pendingNarrowingEditorGeneration = undefined;
+      if (pendingKillSwitchGeneration === requestId) pendingKillSwitchGeneration = undefined;
     } finally {
       if (requestId === settingsGeneration) settingsRefreshPending = false;
     }
@@ -886,13 +1249,263 @@ export function App(props: AppProps) {
     // blocked by a request the UI no longer cares about.
     settingsGeneration += 1;
     settingsRefreshPending = false;
+    // A queued palette-triggered editor open must never fire late into a closed/different view.
+    pendingNarrowingEditorGeneration = undefined;
+    pendingKillSwitchGeneration = undefined;
     setSettingsProfile(null);
     setSettingsStatus("");
+    narrowingGeneration += 1;
+    setNarrowingMode(null);
+    setNarrowingPreview(null);
+    setNarrowingStatus("");
+    // Invalidates any in-flight toggleKillSwitch() the same way narrowingGeneration invalidates an
+    // in-flight narrowing mutation -- see toggleKillSwitch's own requestId guard.
+    killSwitchGeneration += 1;
+    setKillSwitchStage("none");
     notify("Effective profile settings closed");
+  }
+
+  // PR3 narrow-only edit UX. Every mutation is broker-owned: the dashboard never touches the
+  // capability-override store directly, only requests preview/apply/kill-switch RPCs and re-reads
+  // the resulting truth back through the existing side-effect-free profile() RPC.
+  function narrowingCapabilities(): string[] {
+    return settingsDisplayProfile()?.allowedManualCapabilities ?? [];
+  }
+
+  // Shared gate for actually entering the editor, given an already-resolved profile: used both
+  // when a profile is already loaded (immediate open) and when a queued palette-triggered open
+  // (see pendingNarrowingEditorGeneration below) resolves. Never invoked with a stale/superseded
+  // profile -- callers only reach this once their own generation guard has already confirmed the
+  // profile is current.
+  function tryOpenNarrowingEditor(profile: CapabilityProfile): boolean {
+    if (profile.killSwitchActive) {
+      // Fail-closed UI (issue #105 PR3 review): the broker itself now rejects preview/apply while
+      // the kill switch is active (BrokerRejectionError code narrowing-kill-switch-active), so the
+      // editor must never even open in that state -- there is no exact preview it could ever apply.
+      notify("Editing is unavailable while the kill switch is active.");
+      return false;
+    }
+    if (!profile.editingAvailable) {
+      notify("Editing unavailable: broker does not support capability narrowing (upgrade required).");
+      return false;
+    }
+    if (profile.allowedManualCapabilities.length === 0) {
+      notify("No manually-selectable capabilities are available to narrow for this role");
+      return false;
+    }
+    setNarrowingScopeIndex(0);
+    setNarrowingCapabilityIndex(0);
+    setNarrowingPreview(null);
+    setNarrowingStatus("");
+    setNarrowingMode("browsing");
+    notify("Narrowing editor opened");
+    return true;
+  }
+
+  // Shared gate for actually beginning the kill-switch confirm flow, given an already-resolved,
+  // current-role-matching profile (issue #105 PR3 completion) -- mirrors tryOpenNarrowingEditor
+  // exactly: used both when a profile is already loaded (immediate open) and when a queued 'k'
+  // press (see pendingKillSwitchGeneration) resolves. Never invoked with a stale/superseded/absent
+  // profile -- callers only reach this once their own generation guard has already confirmed the
+  // profile is current, so editingAvailable is always a real, known value here, never defaulted.
+  function tryOpenKillSwitchConfirm(profile: CapabilityProfile): boolean {
+    if (!profile.editingAvailable) {
+      // Legacy broker (issue #105 PR3 review): the kill switch was introduced in the same release
+      // as narrowing, so a broker too old to report editingAvailable=true cannot support it either
+      // -- stays read-only/upgrade-required, exactly like the narrowing editor.
+      setSettingsStatus("Unavailable: broker does not support capability narrowing (upgrade required).");
+      return false;
+    }
+    setKillSwitchStage("confirm");
+    return true;
+  }
+
+  function openNarrowingEditor(): void {
+    if (!props.broker) {
+      // Rendered the same way as refreshSettingsProfile's own broker-not-connected message
+      // (a persistent line inside the Settings overlay) rather than the transient global STATUS
+      // toast: the Settings overlay itself covers most of the screen including that global bar,
+      // so a notify()-only message here would be clipped by the very panel it's meant to explain.
+      if (overlay() !== "settings") setOverlay("settings");
+      setSettingsProfile(null);
+      setSettingsStatus("Observe-only: trusted manual broker is unavailable");
+      return;
+    }
+    const loaded = settingsDisplayProfile();
+    if (loaded) {
+      tryOpenNarrowingEditor(loaded);
+      return;
+    }
+    if (!historyCurrent()) {
+      if (overlay() !== "settings") setOverlay("settings");
+      setSettingsStatus("Unavailable: select a retained PR history row to resolve a next-launch profile.");
+      return;
+    }
+    // First use / role-switch race (issue #105 PR3 review): no profile has resolved for the
+    // current role yet (e.g. the command palette's edit entry was picked before Settings had ever
+    // been opened). Queue the open against refreshSettingsProfile's own generation token instead
+    // of dropping it, double-fetching, or opening a stale/empty editor -- it fires automatically
+    // once that in-flight (or freshly-triggered) load resolves; see the pendingNarrowingEditorGeneration
+    // consumers in refreshSettingsProfile and the clear in closeSettings.
+    if (overlay() !== "settings") openSettings();
+    else if (!settingsRefreshPending) void refreshSettingsProfile(settingsRole());
+    pendingNarrowingEditorGeneration = settingsGeneration;
+    notify("Narrowing editor will open once the effective profile finishes loading");
+  }
+
+  function cancelNarrowingEdit(): void {
+    narrowingGeneration += 1;
+    setNarrowingMode("browsing");
+    setNarrowingPreview(null);
+    setNarrowingStatus("");
+  }
+
+  function closeNarrowingEditor(): void {
+    narrowingGeneration += 1;
+    setNarrowingMode(null);
+    setNarrowingPreview(null);
+    setNarrowingStatus("");
+  }
+
+  // Fail-closed UI (issue #105 PR3 review): the broker rejects preview/apply-narrowing with this
+  // distinct code when the kill switch became active concurrently (e.g. another operator enabled
+  // it while this preview was already in flight). The editor can never apply anything in that
+  // state, so callers exit back to the read-only profile view instead of leaving the user stuck.
+  function isKillSwitchActiveRejection(error: unknown): error is BrokerRejectionError {
+    return error instanceof BrokerRejectionError && error.code === "narrowing-kill-switch-active";
+  }
+
+  async function previewNarrowing(action: NarrowingAction): Promise<void> {
+    const entry = historyCurrent();
+    if (!props.broker || !entry || narrowingMode() !== "browsing") return;
+    const capabilities = narrowingCapabilities();
+    const capability = capabilities[narrowingCapabilityIndex()];
+    const scope = NARROWING_SCOPES[narrowingScopeIndex()];
+    if (!capability || !scope) return;
+    setNarrowingMode("previewing");
+    setNarrowingStatus("Resolving preview...");
+    const requestId = (narrowingGeneration += 1);
+    try {
+      const preview = await props.broker.previewNarrowing(
+        entry.repositoryIdentity.key, entry.pullRequestId, settingsRole(), scope, capability, action,
+      );
+      if (requestId !== narrowingGeneration) return; // superseded: editor cancelled/closed meanwhile
+      setNarrowingPreview(preview);
+      setNarrowingMode("confirm");
+      setNarrowingStatus("");
+    } catch (error) {
+      if (requestId !== narrowingGeneration) return;
+      if (isKillSwitchActiveRejection(error)) {
+        closeNarrowingEditor();
+        setSettingsStatus(dispatchResultDetail(error.code, error.detail));
+        void refreshSettingsProfile(settingsRole(), { silent: true });
+        return;
+      }
+      setNarrowingStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setNarrowingMode("browsing");
+    }
+  }
+
+  async function applyNarrowing(): Promise<void> {
+    const entry = historyCurrent();
+    const preview = narrowingPreview();
+    if (!props.broker || !entry || !preview || narrowingMode() !== "confirm-final") return;
+    setNarrowingMode("applying");
+    setNarrowingStatus("");
+    const requestId = (narrowingGeneration += 1);
+    try {
+      await props.broker.applyNarrowing(preview, entry.repositoryIdentity.key, entry.pullRequestId);
+      if (requestId !== narrowingGeneration) return;
+      setNarrowingStatus(`Applied: ${preview.capability} ${preview.action === "off" ? "turned off" : "reset to inherit"} at ${preview.scope} scope.`);
+      setNarrowingPreview(null);
+      // Refresh via the existing side-effect-free profile() RPC (never the mutating response
+      // itself) -- reuses refreshSettingsProfile's own generation guard, so a stale response can
+      // never render either. Awaited BEFORE flipping to "result" (issue #105 PR3 completion) so
+      // the result screen's Enabled/Denied recap can never render a moment of stale, pre-apply
+      // data before catching up: the refreshed profile is already in hand the instant "result"
+      // first renders.
+      await refreshSettingsProfile(settingsRole(), { silent: true });
+      if (requestId !== narrowingGeneration) return;
+      setNarrowingMode("result");
+    } catch (error) {
+      if (requestId !== narrowingGeneration) return;
+      if (isKillSwitchActiveRejection(error)) {
+        closeNarrowingEditor();
+        setSettingsStatus(dispatchResultDetail(error.code, error.detail));
+        void refreshSettingsProfile(settingsRole(), { silent: true });
+        return;
+      }
+      setNarrowingStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setNarrowingMode("browsing");
+      setNarrowingPreview(null);
+    }
+  }
+
+  // PR3 kill-switch TTL display: the emergency lever is broker-enforced short-lived (recommended
+  // 1 hour), so Settings shows the operator how much of that window is left rather than leaving
+  // "ON" looking permanent. now() is the existing 1s-refreshed clock signal, so this counts down
+  // live while Settings stays open.
+  function killSwitchExpiryLabel(profile: CapabilityProfile): string {
+    if (!profile.killSwitchActive || !profile.killSwitchExpiresAtUtc) return "";
+    const expiresAtMs = Date.parse(profile.killSwitchExpiresAtUtc);
+    if (Number.isNaN(expiresAtMs)) return "";
+    const remainingMinutes = Math.max(0, Math.ceil((expiresAtMs - now()) / 60_000));
+    // Bounded like every other broker-supplied string rendered in this overlay (issue #105 PR3
+    // completion) -- dispatch.ts's parser already validates/bounds this value at the wire
+    // boundary, but rendering it through line() too means no single field's parser is ever the
+    // only thing standing between a malformed value and unbounded terminal output.
+    return ` (expires in ${remainingMinutes}m, ${line(profile.killSwitchExpiresAtUtc, 40)})`;
+  }
+
+  async function toggleKillSwitch(): Promise<void> {
+    const entry = historyCurrent();
+    const profile = settingsDisplayProfile();
+    // Never default an unknown current state to "off" (issue #105 PR3 completion): the prior
+    // `?? false` fallback meant a momentarily-null/stale profile always computed nextEnabled as
+    // "turn ON", even if the switch were actually already active. tryOpenKillSwitchConfirm never
+    // enters "confirm" without a current, loaded profile, and nothing between then and 'y' can
+    // invalidate it without also resetting killSwitchStage to "none" (see setSettingsRole/
+    // closeSettings) -- so a null profile here means that invariant broke; abort rather than guess.
+    if (!props.broker || !entry || !profile) {
+      setKillSwitchStage("none");
+      // issue #105 PR3 closure: silently vanishing the confirm dialog here left the operator
+      // guessing whether anything happened at all -- state plainly that the toggle was abandoned
+      // and why, the same way every other abort/failure path in this overlay already does.
+      setSettingsStatus("Kill switch toggle aborted: effective profile is no longer available.");
+      return;
+    }
+    setKillSwitchStage("none");
+    const nextEnabled = !profile.killSwitchActive;
+    const role = settingsRole();
+    const requestId = (killSwitchGeneration += 1);
+    setSettingsStatus(nextEnabled
+      ? "Enabling emergency lever: ignore local narrowing overrides..."
+      : "Disabling emergency lever: ignore local narrowing overrides...");
+    try {
+      await props.broker.setKillSwitch(entry.repositoryIdentity.key, role, nextEnabled);
+      if (requestId !== killSwitchGeneration) return; // superseded: Settings closed/re-roled meanwhile
+      setSettingsStatus(nextEnabled
+        ? "Ignore local narrowing overrides is now ON: persisted narrowing is ignored until the next launch."
+        : "Ignore local narrowing overrides is now OFF: persisted narrowing applies again.");
+      // Silent (issue #105 PR3 review): mirrors previewNarrowing()/applyNarrowingEdit()'s own
+      // internal refresh -- a non-silent refresh would immediately overwrite the confirmation
+      // message just set above with "Resolving effective profile..." before it was ever visible.
+      void refreshSettingsProfile(role, { silent: true });
+    } catch (error) {
+      if (requestId !== killSwitchGeneration) return;
+      setSettingsStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async function quit(): Promise<void> {
     setFeedback("Shutting down broker-owned manual work...");
+    bestEffortCancelWidening();
     try {
       await shutdownBroker();
     } catch (error) {
@@ -1106,6 +1719,12 @@ export function App(props: AppProps) {
       unavailable: "",
       run: openSettings,
     },
+    {
+      label: "Edit persisted capability narrowing (next launch)",
+      enabled: Boolean(props.broker),
+      unavailable: "Observe-only: trusted manual broker is unavailable",
+      run: openNarrowingEditor,
+    },
   ]);
 
   function executePalette(): void {
@@ -1138,8 +1757,20 @@ export function App(props: AppProps) {
           }
         }
       } else if (manualMode() === "confirm") {
-        if (key.name === "escape") closeManual();
+        // PR4 interactive widening (issue #105), nested inside "confirm": while a widening
+        // sub-stage is active it owns Esc/c/y exclusively; the ordinary d/Esc confirm gate below
+        // only ever sees keys once wideningStage() is back to "closed" (including right after a
+        // successful mint -- see confirmWideningMintStep, which never advances manualMode itself).
+        const wStage = wideningStage();
+        if (wStage === "preview" || wStage === "summary") {
+          if (key.name === "escape") void cancelWideningStep();
+          else if (wStage === "preview" && key.name === "c") void confirmWideningPreviewStep();
+          else if (wStage === "summary" && key.name === "y") void confirmWideningMintStep();
+        } else if (wStage === "describing" || wStage === "confirming" || wStage === "minting" || wStage === "cancelling") {
+          // A widening RPC is in flight; ignore keys until it settles rather than let d/Esc race it.
+        } else if (key.name === "escape") closeManual();
         else if (key.name === "d") setManualMode("confirm-final");
+        else if (key.name === "w" && canRequestWidening()) void beginWidening();
       } else if (manualMode() === "confirm-final") {
         if (key.name === "escape") closeManual();
         else if (key.name === "y") void dispatchManual();
@@ -1211,6 +1842,49 @@ export function App(props: AppProps) {
       return;
     }
     if (overlay() === "settings") {
+      const editing = narrowingMode();
+      if (editing === "browsing") {
+        const capabilityCount = narrowingCapabilities().length;
+        if (key.name === "escape") closeNarrowingEditor();
+        else if (key.name === "left") setNarrowingScopeIndex((v) => (v + NARROWING_SCOPES.length - 1) % NARROWING_SCOPES.length);
+        else if (key.name === "right") setNarrowingScopeIndex((v) => (v + 1) % NARROWING_SCOPES.length);
+        else if ((key.name === "up" || key.name === "k") && capabilityCount > 0) {
+          setNarrowingCapabilityIndex((v) => (v + capabilityCount - 1) % capabilityCount);
+        } else if ((key.name === "down" || key.name === "j") && capabilityCount > 0) {
+          setNarrowingCapabilityIndex((v) => (v + 1) % capabilityCount);
+        } else if (key.name === "o") void previewNarrowing("off");
+        else if (key.name === "i") void previewNarrowing("inherit");
+        return;
+      }
+      if (editing === "confirm") {
+        if (key.name === "escape") cancelNarrowingEdit();
+        else if (key.name === "c") setNarrowingMode("confirm-final");
+        return;
+      }
+      if (editing === "confirm-final") {
+        if (key.name === "escape") cancelNarrowingEdit();
+        else if (key.name === "y") void applyNarrowing();
+        return;
+      }
+      if (editing === "result") {
+        if (key.name === "escape" || key.name === "return") { setNarrowingMode("browsing"); setNarrowingStatus(""); }
+        return;
+      }
+      if (editing === "previewing" || editing === "applying") return;
+      // Two-stage kill-switch confirm (issue #105 PR3 completion), mirroring narrowing's own
+      // confirm/confirm-final: "confirm" is the first, full-disclosure warning (c advances to the
+      // final gate); "confirm-final" is the terse final gate that actually arms 'y'. Esc cancels
+      // back to the ordinary Settings view at either stage.
+      if (killSwitchStage() === "confirm") {
+        if (key.name === "escape") setKillSwitchStage("none");
+        else if (key.name === "c") setKillSwitchStage("confirm-final");
+        return;
+      }
+      if (killSwitchStage() === "confirm-final") {
+        if (key.name === "escape") setKillSwitchStage("none");
+        else if (key.name === "y") void toggleKillSwitch();
+        return;
+      }
       if (key.name === "escape" || key.name === "s") {
         closeSettings();
       } else if (key.name === "tab") {
@@ -1221,10 +1895,56 @@ export function App(props: AppProps) {
         if (settingsRefreshPending) return;
         const nextRole: AgentRole = settingsRole() === "reviewer" ? "review-handler" : "reviewer";
         setSettingsRole(nextRole);
+        // A role switch mid-flight invalidates any toggleKillSwitch() awaiting a response for the
+        // OLD role (issue #105 PR3 completion): killSwitchStage is already reset to "none" by the
+        // time 'y' is pressed (see toggleKillSwitch), so Tab can otherwise land here while that
+        // await is still outstanding -- see toggleKillSwitch's own requestId guard. Reset
+        // explicitly here too (issue #105 PR3 closure) rather than relying solely on that
+        // invariant: the kill switch is machine+user-wide, never role-scoped, so a confirm opened
+        // for one role's profile must never carry over and be actioned against another role's.
+        setKillSwitchStage("none");
+        killSwitchGeneration += 1;
         void refreshSettingsProfile(nextRole);
       } else if (key.name === "r") {
         if (settingsRefreshPending) return;
         void refreshSettingsProfile(settingsRole());
+      } else if (key.name === "e") {
+        openNarrowingEditor();
+      } else if (key.name === "k") {
+        // Never begin the kill-switch flow on an unknown state (issue #105 PR3 completion): the
+        // previous version fell through to setKillSwitchStage("confirm") whenever `loaded` was
+        // null (no profile yet, or a request outstanding) -- i.e. it defaulted an UNKNOWN
+        // editingAvailable/killSwitchActive to "proceed" rather than never assuming false OR true
+        // for an unresolved value. This mirrors openNarrowingEditor's own gating exactly: open
+        // immediately against an already-loaded, current profile; otherwise queue the intent
+        // against refreshSettingsProfile's generation token (fires once that load resolves) rather
+        // than racing ahead of it or silently dropping the keypress.
+        if (!props.broker) {
+          setSettingsStatus("Observe-only: trusted manual broker is unavailable");
+        } else if (settingsRefreshPending) {
+          // issue #105 PR3 closure: a refresh already in flight means the currently loaded
+          // profile (settingsDisplayProfile(), even one that still role-matches) can be stale
+          // relative to it -- e.g. toggleKillSwitch's own silent refresh just kicked off after
+          // applying a transition, so the last-rendered profile still reflects the PRE-transition
+          // state. Never open (or decide a direction) against that stale snapshot; queue against
+          // the ACTIVE generation exactly like the no-profile-yet branch below, so the confirm
+          // dialog only ever opens once the fresh, matching profile actually lands (see
+          // refreshSettingsProfile's pendingKillSwitchGeneration consumption) -- never repeating a
+          // just-applied transition instead of its correct reverse.
+          pendingKillSwitchGeneration = settingsGeneration;
+          setSettingsStatus("Kill switch will open once the effective profile finishes loading.");
+        } else {
+          const loaded = settingsDisplayProfile();
+          if (loaded) {
+            tryOpenKillSwitchConfirm(loaded);
+          } else if (!historyCurrent()) {
+            setSettingsStatus("Unavailable: select a retained PR history row to resolve a next-launch profile.");
+          } else {
+            void refreshSettingsProfile(settingsRole());
+            pendingKillSwitchGeneration = settingsGeneration;
+            setSettingsStatus("Kill switch will open once the effective profile finishes loading.");
+          }
+        }
       }
       return;
     }
@@ -1371,6 +2091,10 @@ export function App(props: AppProps) {
               summary={capabilitySummary()}
               accepted={acceptedDispatch()}
               status={manualStatus() || props.brokerFailure?.() || ""}
+              wideningStage={wideningStage()}
+              wideningPreview={wideningPreview()}
+              wideningStatus={wideningStatus()}
+              mintedWideningGeneration={mintedWideningGeneration()}
             />
           )}
         </Show>
@@ -1443,7 +2167,10 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
           <text height={1} fg={COLORS.text}>m                  Manual dispatch for selected retained PR (trusted launch only)</text>
-          <text height={1} fg={COLORS.text}>s                  Effective capability profile for the next manual launch (read-only)</text>
+          <text height={1} fg={COLORS.text}>  (dispatch confirm) w   Request capability widening, if delegable (draft-bound)</text>
+          <text height={1} fg={COLORS.text}>  (widening) c / y   Confirm preview / mint the grant | Esc cancels widening</text>
+          <text height={1} fg={COLORS.text}>s                  Effective capability profile for the next manual launch</text>
+          <text height={1} fg={COLORS.text}>  (in Settings) e   Edit persisted narrowing | k toggle kill switch</text>
           <text height={1} fg={COLORS.text}>?                  Help</text>
           <text height={1} fg={COLORS.text}>q                  Quit</text>
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[0]}</text>
@@ -1452,28 +2179,184 @@ export function App(props: AppProps) {
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "settings"}>
-        <OverlayPanel title="SETTINGS - EFFECTIVE CAPABILITY PROFILE (READ-ONLY)" width={82} height={23}>
+        <OverlayPanel
+          title={narrowingMode() ? "SETTINGS - EDIT PERSISTED NARROWING" : "SETTINGS - EFFECTIVE CAPABILITY PROFILE"}
+          left="0%"
+          padding={0}
+          width={142}
+          height={27}
+        >
           <box flexDirection="column" flexGrow={1}>
             <text height={1} fg={COLORS.warning}>Applies only to the next manual dispatch/process launch.</text>
             <text height={1} fg={COLORS.warning}>A running agent's own profile is immutable and is not shown here.</text>
-            <text height={1} fg={COLORS.text}>Role: {roleLabel(settingsRole())} | Tab switch role | r refresh | Esc/s close</text>
+            <Show when={!narrowingMode()}>
+              <text height={1} fg={COLORS.text}>
+                Role: {roleLabel(settingsRole())} | Tab role | r refresh | e edit narrowing | k kill switch | Esc/s close
+              </text>
+            </Show>
             <Show when={settingsStatus()}>
               <text height={1} fg={COLORS.warning}>{line(settingsStatus(), 170)}</text>
             </Show>
-            <Show when={settingsDisplayProfile()}>
+            {/* Two-stage kill-switch confirm (issue #105 PR3 completion). "confirm" (first
+                warning) carries the full disclosure required for the ENABLE direction: this is a
+                machine+user-wide lever across every repo/worktree/PR for this user, it ignores
+                persisted narrowing and restores compiled operational defaults for NEXT launches
+                only, an already-running agent is immutable/unaffected, and it grants no delegated
+                approval-vote/auto-complete. The DISABLE direction's blast radius is much smaller
+                (persisted narrowing simply applies again), so its first-stage wording stays terse,
+                matching the narrowing editor's own confirm/confirm-final asymmetry (full detail on
+                the first stage, a short recap+action on the final one). */}
+            <Show when={killSwitchStage() === "confirm"}>
+              <Show
+                when={!(settingsDisplayProfile()?.killSwitchActive ?? false)}
+                fallback={
+                  <>
+                    <text height={1} fg={COLORS.error}>
+                      {line("Disable 'Ignore local narrowing overrides'? Persisted narrowing becomes active again for next launches.", 170)}
+                    </text>
+                    <text height={1} fg={COLORS.error}>
+                      {line("Press c to review the final confirmation; Esc cancels.", 170)}
+                    </text>
+                  </>
+                }
+              >
+                <text height={1} fg={COLORS.error}>
+                  {line("WARNING: machine+user-wide emergency lever -- affects ALL repos/worktrees/PRs for this user on this machine, not just this PR.", 170)}
+                </text>
+                <text height={1} fg={COLORS.error}>
+                  {line("Ignores all locally persisted narrowing; restores compiled operational defaults for NEXT launches only.", 170)}
+                </text>
+                <text height={1} fg={COLORS.error}>
+                  {line("Any already-running agent is immutable and unaffected; grants no delegated approval-vote or auto-complete.", 170)}
+                </text>
+                <text height={1} fg={COLORS.warning}>
+                  {line("Press c to review the final confirmation; Esc cancels.", 170)}
+                </text>
+              </Show>
+            </Show>
+            <Show when={killSwitchStage() === "confirm-final"}>
+              <Show
+                when={!(settingsDisplayProfile()?.killSwitchActive ?? false)}
+                fallback={
+                  <>
+                    <text height={1} fg={COLORS.error}>
+                      {line("FINAL CONFIRMATION: disable 'Ignore local narrowing overrides'? Persisted narrowing becomes active again.", 170)}
+                    </text>
+                    <text height={1} fg={COLORS.error}>{line("Press y to disable; Esc cancels.", 170)}</text>
+                  </>
+                }
+              >
+                <text height={1} fg={COLORS.error}>
+                  {line("FINAL CONFIRMATION: enable the kill switch machine+user-wide across ALL repos/worktrees/PRs?", 170)}
+                </text>
+                <text height={1} fg={COLORS.error}>{line("Press y to enable; Esc cancels.", 170)}</text>
+              </Show>
+            </Show>
+            <Show when={narrowingMode() && narrowingMode() !== "result" && narrowingStatus()}>
+              <text height={1} fg={COLORS.warning}>{line(narrowingStatus(), 170)}</text>
+            </Show>
+            {/* Operand order matters here: Show's render-prop accessor receives the resolved
+                `when` VALUE, and `&&` returns its right-hand operand when the left is truthy. With
+                the guard first and the profile second, a truthy result is always the profile
+                object itself -- never the boolean from `!narrowingMode()` -- so the accessor below
+                can never observe a boxed boolean where a CapabilityProfile is expected (the prior
+                `profile && !narrowingMode()` ordering crashed with "undefined is not an object"
+                inside profile().repositoryIdentity.slug once narrowingMode() was falsy). */}
+            <Show when={!narrowingMode() && settingsDisplayProfile()}>
               {(profile: () => CapabilityProfile) => (
                 <>
                   <text height={1} fg={COLORS.accent}>{profile().repositoryIdentity.slug} / PR #{profile().prSnapshot.pullRequestId}</text>
-                  <text height={1} fg={COLORS.ok}>Allowed manual ceiling: {line(profile().allowedManualCapabilities.join(", ") || "none", 110)}</text>
+                  <text height={1} fg={profile().killSwitchActive ? COLORS.error : COLORS.muted}>
+                    Ignore local narrowing overrides: {!profile().editingAvailable
+                      ? "unavailable (upgrade required)"
+                      : profile().killSwitchActive
+                        ? `ON (emergency lever, not a security lockdown)${killSwitchExpiryLabel(profile())}`
+                        : "off"}
+                  </text>
                   <text height={1} fg={COLORS.ok}>Enabled for this launch: {line(profile().capabilities.join(", ") || "none", 110)}</text>
                   <text height={1} fg={COLORS.warning}>Denied (mandatory): {line(profile().mandatoryDenies.join(", ") || "none", 110)}</text>
-                  <text height={1} fg={COLORS.error}>Absolute denies (never grantable): {line(profile().absoluteDenies.join(", ") || "none", 110)}</text>
-                  <text height={1} fg={COLORS.muted}>Delegable available (widening): {line(profile().delegableAvailable.join(", ") || "none in this release", 110)}</text>
-                  <text height={1} fg={COLORS.muted}>
-                    Provenance: {line(Object.entries(profile().provenance).map(([name, source]) => `${name}=${source}`).join(", ") || "none", 170)}
-                  </text>
+                  {/* Legacy-broker fallback (issue #105 PR3 completion): allowedManualCapabilities/
+                      absoluteDenies/delegableAvailable/provenance are all optional-defaulted to
+                      empty on a pre-narrowing broker (dispatch.ts's parseCapabilityProfileFields),
+                      the same signal editingAvailable itself is computed from. Rendering those
+                      defaults as "none"/"none in this release" would fabricate a locked-down,
+                      fully-resolved profile the broker never actually reported -- so a legacy
+                      broker gets one explicit "unavailable" line instead of four fabricated ones. */}
+                  <Show
+                    when={profile().editingAvailable}
+                    fallback={
+                      <text height={1} fg={COLORS.warning}>
+                        Allowed manual ceiling / absolute denies / delegable available / provenance: unavailable (broker predates capability narrowing; upgrade required).
+                      </text>
+                    }
+                  >
+                    <text height={1} fg={COLORS.ok}>Allowed manual ceiling: {line(profile().allowedManualCapabilities.join(", ") || "none", 110)}</text>
+                    <text height={1} fg={COLORS.error}>Absolute denies (never grantable, locked): {line(profile().absoluteDenies.join(", ") || "none", 110)}</text>
+                    <text height={1} fg={COLORS.muted}>Delegable available (widening, locked here): {line(profile().delegableAvailable.join(", ") || "none in this release", 110)}</text>
+                    <text height={1} fg={COLORS.muted}>
+                      Provenance: {line(Object.entries(profile().provenance).map(([name, source]) => `${name}=${source}`).join(", ") || "none", 170)}
+                    </text>
+                  </Show>
                 </>
               )}
+            </Show>
+            <Show when={narrowingMode() === "browsing"}>
+              <box flexDirection="column">
+                <text height={1} fg={COLORS.text}>
+                  Scope: {NARROWING_SCOPES.map((scopeName, index) => index === narrowingScopeIndex() ? `[${scopeName}]` : scopeName).join("  ")}
+                  {" "}(Left/Right change)
+                </text>
+                <text height={1} fg={COLORS.muted}>Up/Down select capability | o narrow (off) | i reset (inherit) | Esc cancel</text>
+                <For each={narrowingCapabilities()}>
+                  {(name, index) => (
+                    <text height={1} fg={index() === narrowingCapabilityIndex() ? COLORS.accent : COLORS.text}>
+                      {index() === narrowingCapabilityIndex() ? "> " : "  "}{name}
+                    </text>
+                  )}
+                </For>
+              </box>
+            </Show>
+            <Show when={narrowingMode() === "previewing" || narrowingMode() === "applying"}>
+              <text height={1} fg={COLORS.warning}>{narrowingMode() === "previewing" ? "Resolving preview..." : "Applying..."}</text>
+            </Show>
+            <Show when={narrowingPreview()}>
+              {(preview: () => CapabilityNarrowingPreview) => (
+                <box flexDirection="column">
+                  <text height={1} fg={COLORS.accent}>
+                    {preview().scope} / {preview().capability} -&gt; {preview().action === "off" ? "off" : "inherit"}
+                    {preview().killSwitchActive ? " (kill switch ON: no effect until disabled)" : ""}
+                  </text>
+                  <text height={1} fg={preview().changed ? COLORS.warning : COLORS.muted}>
+                    {preview().changed ? "This changes the effective profile:" : "No effective change (another scope already decides this)."}
+                  </text>
+                  <text height={1} fg={COLORS.text}>Current enabled: {line(preview().current.capabilities.join(", ") || "none", 100)}</text>
+                  <text height={1} fg={COLORS.text}>Proposed enabled: {line(preview().proposed.capabilities.join(", ") || "none", 100)}</text>
+                  <text height={1} fg={COLORS.warning}>Current denied: {line(preview().current.mandatoryDenies.join(", ") || "none", 100)}</text>
+                  <text height={1} fg={COLORS.warning}>Proposed denied: {line(preview().proposed.mandatoryDenies.join(", ") || "none", 100)}</text>
+                  <Show when={narrowingMode() === "confirm"}>
+                    <text height={1} fg={COLORS.warning}>First confirmation: press c to review the final apply gate; Esc cancels.</text>
+                  </Show>
+                  <Show when={narrowingMode() === "confirm-final"}>
+                    <text height={1} fg={COLORS.error}>FINAL CONFIRMATION: press y to apply this exact preview; Esc cancels.</text>
+                  </Show>
+                </box>
+              )}
+            </Show>
+            <Show when={narrowingMode() === "result"}>
+              <text height={1} fg={COLORS.ok}>{line(narrowingStatus(), 170)} (Esc/Enter back)</text>
+              {/* issue #105 PR3 completion: the result screen must show the REFRESHED effective
+                  profile, not just the "Applied: ..." status line -- applyNarrowing() now awaits
+                  refreshSettingsProfile() before ever entering "result", so
+                  settingsDisplayProfile() is already the post-apply truth the first time this
+                  renders (never a stale pre-apply snapshot). */}
+              <Show when={settingsDisplayProfile()}>
+                {(profile: () => CapabilityProfile) => (
+                  <>
+                    <text height={1} fg={COLORS.ok}>Enabled: {line(profile().capabilities.join(", ") || "none", 110)}</text>
+                    <text height={1} fg={COLORS.warning}>Denied (mandatory): {line(profile().mandatoryDenies.join(", ") || "none", 110)}</text>
+                  </>
+                )}
+              </Show>
             </Show>
           </box>
         </OverlayPanel>

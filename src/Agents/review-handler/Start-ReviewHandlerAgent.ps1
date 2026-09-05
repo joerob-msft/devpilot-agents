@@ -169,6 +169,14 @@ param(
 if ($PSBoundParameters.ContainsKey('PullRequestId') -and $PullRequestId -le 0) {
     throw 'PullRequestId must be greater than zero when explicitly specified.'
 }
+# issue #105 PR4 requirement 7: -EnableAutoComplete is delegable ONLY through a broker-minted,
+# sealed widening grant -- Enter-AgentManualDispatchStartup independently re-verifies that grant
+# under the capability-override lock before ever honoring it. A direct/headless invocation (no
+# -ManualDispatchManifest) has no grant to verify against and must never be able to request the
+# auto-complete capability at all; a generic local profile is never sufficient.
+if ($EnableAutoComplete -and -not $ManualDispatchManifest) {
+    throw '-EnableAutoComplete requires a sealed manual dispatch grant (-ManualDispatchManifest); it cannot be requested directly.'
+}
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -209,6 +217,13 @@ if (-not $importedHarness) {
         "or run this script from a checkout of the devpilot-agents repository.")
 }
 $HarnessPath = $importedHarness.Path
+
+# issue #105 PR4 CRITICAL-2 hardening: as early as possible (immediately once the harness module
+# is available, before any config/provider/network setup below) reject the ordinary accidental/
+# headless case -- a manual-dispatch manifest path that does not exist, or one with no
+# accompanying broker attestation handle. The deep cryptographic verification happens later, in
+# Enter-AgentManualDispatchStartup, immediately before the ready/proceed handshake.
+Assert-AgentManualDispatchEarlyContext -ManifestPath $ManualDispatchManifest
 
 $ResultMarkerPrefix = "REVIEW_HANDLER_RESULT_V1:"
 $script:HandlerRejectedResumeSessionIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -932,7 +947,7 @@ if ($ManualDispatchManifest) {
     }
     $dispatchLogPrefix = "$dispatchId-"
     $dispatchMetadata = [ordered]@{
-        schemaVersion = 1; dispatchId = $dispatchId; ownership = 'tui'; forceAnalysis = $true
+        schemaVersion = 1; dispatchId = $dispatchId; ownership = 'tui'; forceAnalysis = [bool]$ForceAnalysis
     }
 }
 $script:HandlerOutputContext = New-AgentOutputContext -Agent review-handler -OutputMode $OutputMode `
@@ -2637,7 +2652,8 @@ try {
         }
         if ($ManualDispatchManifest) {
             [void](Enter-AgentManualDispatchStartup -ManifestPath $ManualDispatchManifest `
-                -RepositoryIdentity $repositoryIdentity -DurableContext $script:HandlerDurableContext `
+                -RepositoryIdentity $repositoryIdentity -RepositoryRoot ([IO.Path]::GetFullPath($RepoPath)) `
+                -DurableContext $script:HandlerDurableContext `
                 -LeaseRoot $LeaseRoot -Role review-handler -EventLogPath $script:HandlerOutputContext.LogPath `
                 -BoundCapabilities @{
                     EnableThreadReplies = [bool]$EnableThreadReplies

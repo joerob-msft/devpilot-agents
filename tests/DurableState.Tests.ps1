@@ -202,6 +202,8 @@ Describe 'trusted durable and lease roots' {
             role = 'reviewer'
             capabilities = @()
             mandatoryDenies = @('EnableApprovalVote')
+            ceilingCapabilities = @()
+            ceilingMandatoryDenies = @('EnableApprovalVote')
             configSnapshotSha256 = ('a' * 64)
         }
         $pipeName = New-AgentPipeName
@@ -230,7 +232,7 @@ Describe 'trusted durable and lease roots' {
             $connection = $pipe.WaitForConnectionAsync()
             {
                 Enter-AgentManualDispatchStartup -ManifestPath $manifestPath `
-                    -RepositoryIdentity $identity -DurableContext $context -LeaseRoot $leaseRoot `
+                    -RepositoryIdentity $identity -RepositoryRoot $suiteRoot -DurableContext $context -LeaseRoot $leaseRoot `
                     -Role reviewer -EventLogPath (Join-Path $runtimeRoot 'events.jsonl') `
                     -BoundCapabilities @{ EnableApprovalVote = $false }
             } | Should -Throw '*lease-contended*'
