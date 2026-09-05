@@ -874,7 +874,7 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
     // Enable: k -> c -> y actually toggles it on, and Settings displays the TTL expiry.
     await writeAndWait("k", "WARNING: machine+user-wide emergency lever");
     await writeAndWait("c", "FINAL CONFIRMATION: enable the kill switch machine+user-wide");
-    await writeAndWait("y", "Ignore local narrowing overrides is now ON: persisted narrowing is ignored until the next launch.");
+    await writeAndWait("y", "Ignore local narrowing overrides: ON (emergency lever, not a security lockdown)");
     await waitForVisible("ON (emergency lever, not a security lockdown) (expires in");
 
     // Disable: k -> c -> y turns it back off.

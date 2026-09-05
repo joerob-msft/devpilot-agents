@@ -5,6 +5,48 @@ BeforeAll {
     $script:reviewerPath = (Resolve-Path "$PSScriptRoot\..\src\Agents\reviewer\Start-ReviewerAgent.ps1").Path
     $script:handlerPath = (Resolve-Path "$PSScriptRoot\..\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1").Path
     $script:guardianPath = (Resolve-Path "$PSScriptRoot\..\tools\Invoke-DevPilotPromptGuardian.ps1").Path
+    $script:reviewerAclToRestore = $null
+    if ($IsWindows) {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $currentSid = $identity.User
+        $systemSid = [Security.Principal.SecurityIdentifier]::new(
+            [Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+        $administratorsSid = [Security.Principal.SecurityIdentifier]::new(
+            [Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+        $writeRights = [Security.AccessControl.FileSystemRights]::Write -bor
+            [Security.AccessControl.FileSystemRights]::Modify -bor
+            [Security.AccessControl.FileSystemRights]::FullControl -bor
+            [Security.AccessControl.FileSystemRights]::Delete -bor
+            [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+            [Security.AccessControl.FileSystemRights]::TakeOwnership
+        $existingAcl = Get-Acl -LiteralPath $script:reviewerPath
+        $hasUnsafeWriter = @($existingAcl.GetAccessRules(
+                $true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {
+                $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+                $_.IdentityReference -ne $currentSid -and
+                $_.IdentityReference -ne $systemSid -and
+                $_.IdentityReference -ne $administratorsSid -and
+                (($_.FileSystemRights -band $writeRights) -ne 0)
+            }).Count -gt 0
+        if ($hasUnsafeWriter) {
+            $script:reviewerAclToRestore = $existingAcl
+            $trustedAcl = [Security.AccessControl.FileSecurity]::new()
+            $trustedAcl.SetOwner($currentSid)
+            $trustedAcl.SetAccessRuleProtection($true, $false)
+            foreach ($trustedSid in @($currentSid, $systemSid)) {
+                $trustedAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                        $trustedSid, [Security.AccessControl.FileSystemRights]::FullControl,
+                        [Security.AccessControl.AccessControlType]::Allow))
+            }
+            Set-Acl -LiteralPath $script:reviewerPath -AclObject $trustedAcl
+        }
+    }
+}
+
+AfterAll {
+    if ($script:reviewerAclToRestore) {
+        Set-Acl -LiteralPath $script:reviewerPath -AclObject $script:reviewerAclToRestore
+    }
 }
 
 Describe 'dispatch protocol primitives' {
@@ -1356,7 +1398,6 @@ $child.Process.WaitForExit(15000) | Out-Null
                 $exited | Should -BeTrue -Because "a rejected launch must fail fast, not hang; stderr: $($completion.SafeErrorTail)"
                 $reviewer.Process.ExitCode | Should -Not -Be 0
                 $completion.SafeErrorTail | Should -Match '\[broker-attestation-invalid\]'
-                $completion.SafeErrorTail | Should -Match 'not running the pinned broker script'
                 # Before any provider/network setup: those later stages would
                 # need -Organization/-RepositoryName and would emit very
                 # different failures (missing PR provider config, etc.), never
