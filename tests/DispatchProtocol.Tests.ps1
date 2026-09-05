@@ -389,7 +389,7 @@ Describe 'dispatch protocol primitives' {
             '-Agent', 'ReviewHandler', '-ReviewerPullRequestId', '0') `
             -CaptureStdOut -CaptureStdErr -TimeoutSeconds 20
         $invalid.ExitCode | Should -Not -Be 0
-        (($invalid.StdErr -join [Environment]::NewLine) -replace '\s+', ' ') |
+        ((($invalid.StdErr -join [Environment]::NewLine) -replace '\s*\|\s*', ' ') -replace '\s+', ' ') |
             Should -Match 'ReviewerPullRequestId must be greater than zero'
 
         $mismatched = Invoke-TimedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList @(
@@ -397,7 +397,7 @@ Describe 'dispatch protocol primitives' {
             '-Agent', 'ReviewHandler', '-ReviewerPullRequestId', '104') `
             -CaptureStdOut -CaptureStdErr -TimeoutSeconds 20
         $mismatched.ExitCode | Should -Not -Be 0
-        (($mismatched.StdErr -join [Environment]::NewLine) -replace '\s+', ' ') |
+        ((($mismatched.StdErr -join [Environment]::NewLine) -replace '\s*\|\s*', ' ') -replace '\s+', ' ') |
             Should -Match 'ReviewerPullRequestId requires -Agent Reviewer or -Agent Both'
     }
 
