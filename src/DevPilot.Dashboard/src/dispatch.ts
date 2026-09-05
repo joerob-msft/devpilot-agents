@@ -44,6 +44,17 @@ export type NarrowingScope = (typeof NARROWING_SCOPES)[number];
 export const NARROWING_ACTIONS = ["off", "inherit"] as const;
 export type NarrowingAction = (typeof NARROWING_ACTIONS)[number];
 
+// PR4 interactive widening protocol (issue #105): the checked-in delegation policy grants at most
+// ONE capability per role (Get-AgentHarnessCapabilityDescriptor's delegableDefaultOff) -- there is
+// no wildcard/allow-any escape hatch on the broker (Test-AgentDelegationAllows), so the client
+// holds the identical closed mapping and rejects any other value outright, whether it is a
+// capability the operator requests to widen or one a broker response claims is delegable. See
+// assertDelegableCapability/assertDelegableAvailable below.
+export const DELEGABLE_CAPABILITY_BY_ROLE: Record<AgentRole, string> = {
+  reviewer: "EnableApprovalVote",
+  "review-handler": "EnableAutoComplete",
+};
+
 export interface CapabilitySummary {
   schemaVersion: 1;
   requestId: string;
@@ -58,7 +69,10 @@ export interface CapabilitySummary {
   mandatoryDenies: string[];
   dynamicConstraints: string[];
   // Additive PR1 profile fields -- see Get-AgentHarnessCapabilityDescriptor. delegableAvailable is
-  // always empty in this release: no delegation/widening policy exists yet (PR2+ scope).
+  // empty unless the checked-in delegation policy explicitly allows this role's one delegable
+  // capability for this repository (issue #105 PR4); the shipped policy ships with an empty
+  // allowlist for every role, so this is @() in production until a CODEOWNERS-approved policy
+  // change names a repository key. See DELEGABLE_CAPABILITY_BY_ROLE/assertDelegableAvailable.
   absoluteDenies: string[];
   allowedManualCapabilities: string[];
   delegableAvailable: string[];
@@ -171,6 +185,90 @@ export interface KillSwitchApplied {
   killSwitchExpiresAtUtc: string | null;
 }
 
+// Shared blast-radius shape for describe-widening/confirm-widening-preview's responses (issue
+// #105 PR4): mirrors Resolve-AgentWideningEffectiveDiff exactly. addedCapabilities/removedDenies
+// restate the single capability the grant would add/un-deny (never trusted as "whatever the
+// broker says changed" -- callers still bind against the specific capability they requested).
+// pairedCapability is non-null only for the reviewer role's EnableApprovalVote (its paired
+// capability is EnableFindingComments); pairedCapabilityActive is true whenever no pairing is
+// required, or false if the pairing capability is not currently active (in which case minting is
+// refused server-side).
+export interface WideningEffectiveDiff {
+  addedCapabilities: string[];
+  removedDenies: string[];
+  pairedCapability: string | null;
+  pairedCapabilityActive: boolean;
+}
+
+interface WideningChallengeStageFields {
+  dispatchDraftId: string;
+  capability: string;
+  challenge: string;
+  effectiveDiff: WideningEffectiveDiff;
+  expiresAtUtc: string;
+  generation: number;
+}
+
+// describe-widening's response (issue #105 PR4): the broker has staged an unminted widening
+// attempt in memory for this draft/capability and issued a single-use challenge1 -- confirming it
+// (confirmWideningPreview) is the operator's FIRST explicit confirmation. Never itself a grant.
+export interface WideningPreview extends WideningChallengeStageFields {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "widening-preview";
+  state: "previewed";
+}
+
+// confirm-widening-preview's response (issue #105 PR4): a fresh challenge2 plus the same
+// effectiveDiff restated as the full blast-radius summary -- confirming THIS (confirmWideningMint)
+// is the operator's FINAL, terminal-commitment confirmation; there is no third stage.
+export interface WideningSummary extends WideningChallengeStageFields {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "widening-summary";
+  state: "awaiting-final-confirmation";
+}
+
+// confirm-widening-mint's response (issue #105 PR4): the grant now exists in the broker's
+// in-memory draft state only (never yet dispatched). capabilities/mandatoryDenies/
+// capabilityPolicyDigest are the WIDENED policy -- callers must merge these into their
+// CapabilitySummary in place so a subsequent dispatch() binds against the exact widened digest
+// the broker now expects (see dispatch()'s own capabilityPolicyDigest binding check). Minting
+// never dispatches by itself -- the caller must still drive the existing confirm/confirm-final
+// dispatch gate.
+export interface WideningMinted {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "widening-minted";
+  state: "minted";
+  dispatchDraftId: string;
+  capability: string;
+  capabilities: string[];
+  mandatoryDenies: string[];
+  capabilityPolicyDigest: string;
+  effectiveDiff: WideningEffectiveDiff;
+  grantExpiresAtUtc: string;
+  generation: number;
+}
+
+// cancel-widening's response (issue #105 PR4): the broker has torn down whatever widening/grant
+// state existed for this draft (previewed, awaiting final confirmation, or already minted) and
+// rebuilt the UNWIDENED policy fresh from the persisted capability-override store. Callers must
+// merge these fields back into their CapabilitySummary exactly like WideningMinted's fields, so a
+// subsequent dispatch() (if ever attempted) binds against the correct, un-widened digest.
+export interface WideningCancelled {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "widening-cancelled";
+  state: "cancelled";
+  dispatchDraftId: string;
+  capabilities: string[];
+  mandatoryDenies: string[];
+  capabilityPolicyDigest: string;
+  delegableAvailable: string[];
+  generation: number;
+}
+
 export interface DispatchAccepted {
   schemaVersion: 1;
   requestId: string;
@@ -209,6 +307,10 @@ type BrokerResponse =
   | CapabilityNarrowingPreview
   | CapabilityNarrowingApplied
   | KillSwitchApplied
+  | WideningPreview
+  | WideningSummary
+  | WideningMinted
+  | WideningCancelled
   | DispatchAccepted
   | DispatchRejected
   | DispatchTerminal
@@ -253,6 +355,18 @@ export interface DispatchBroker {
   ): Promise<CapabilityNarrowingPreview>;
   applyNarrowing(preview: CapabilityNarrowingPreview, repositoryKey: string, pullRequestId: number): Promise<CapabilityNarrowingApplied>;
   setKillSwitch(repositoryKey: string, role: AgentRole, enabled: boolean): Promise<KillSwitchApplied>;
+  // PR4 interactive widening protocol (issue #105). Every method requires a live CapabilitySummary
+  // (i.e. an outstanding manual-dispatch draft from describe()) -- there is no widening entry
+  // point from the side-effect-free profile() RPC's CapabilityProfile, which has no
+  // dispatchDraftId to bind against. describeWidening/confirmWideningPreview/confirmWideningMint
+  // form one strictly-ordered, single-use, two-challenge confirmation chain per capability;
+  // cancelWidening tears down whatever stage that chain is currently at (including an
+  // already-minted grant) and requires the CURRENT draft generation the caller observed on the
+  // most recent widening response -- it is never defaulted.
+  describeWidening(summary: CapabilitySummary, capability: string): Promise<WideningPreview>;
+  confirmWideningPreview(summary: CapabilitySummary, stage: WideningPreview): Promise<WideningSummary>;
+  confirmWideningMint(summary: CapabilitySummary, stage: WideningSummary): Promise<WideningMinted>;
+  cancelWidening(summary: CapabilitySummary, generation: number): Promise<WideningCancelled>;
   dispatch(summary: CapabilitySummary, operatorPrompt: string): Promise<DispatchAccepted>;
   cancel(dispatchId: string): Promise<DispatchTerminal>;
   shutdown(timeoutMilliseconds?: number): Promise<void>;
@@ -457,9 +571,29 @@ function optionalNullableExpiryText(record: Record<string, unknown>, name: strin
   return record[name] === undefined ? null : nullableExpiryText(record, name);
 }
 
+// Shared by parseCapabilityProfileFields (role known in-band from the same response) and
+// cancelWidening (role known only from the caller's own CapabilitySummary, since widening-
+// cancelled carries no role field of its own): delegableAvailable is either empty or exactly the
+// one capability DELEGABLE_CAPABILITY_BY_ROLE names for this role. A cross-role value, an unknown
+// name, or more than one entry all fail closed rather than being trusted.
+function assertDelegableAvailable(role: AgentRole, delegableAvailable: string[], context: string): void {
+  const expected = DELEGABLE_CAPABILITY_BY_ROLE[role];
+  const valid = delegableAvailable.length === 0 || (delegableAvailable.length === 1 && delegableAvailable[0] === expected);
+  if (!valid) throw new Error(`${context} delegableAvailable is not valid for role ${role}`);
+}
+
+// Client-side mirror of the broker's own role/capability check (Invoke-DescribeWidening) --
+// rejected here, before a request is ever sent, rather than relying solely on the broker's own
+// rejection round-trip.
+function assertDelegableCapability(role: AgentRole, capability: string): void {
+  if (capability !== DELEGABLE_CAPABILITY_BY_ROLE[role]) {
+    throw new Error(`capability ${capability} is not delegable for role ${role}`);
+  }
+}
+
 // Constructs the PR1 additive profile fields from validated values only -- never spread/cast
 // straight from the untrusted parsed record, unlike the rest of parseResponse's envelope fields.
-function parseCapabilityProfileFields(record: Record<string, unknown>): Pick<
+function parseCapabilityProfileFields(record: Record<string, unknown>, role: AgentRole): Pick<
   CapabilitySummary,
   | "absoluteDenies"
   | "allowedManualCapabilities"
@@ -477,11 +611,10 @@ function parseCapabilityProfileFields(record: Record<string, unknown>): Pick<
     record.provenance !== undefined &&
     record.killSwitchActive !== undefined;
   const delegableAvailable = optionalStringArrayField(record, "delegableAvailable", []);
-  if (delegableAvailable.length > 0) {
-    // No delegation/widening policy exists yet in this release (PR2+ scope) -- a non-empty value
-    // here would mean the broker is claiming a capability policy that cannot exist in PR1.
-    throw new Error("broker response delegableAvailable must be empty");
-  }
+  // issue #105 PR4: delegableAvailable may now legitimately be non-empty, but only ever the exact
+  // one capability the checked-in delegation policy can ever name for this role -- never a
+  // cross-role value, an unknown name, or more than one entry (see DELEGABLE_CAPABILITY_BY_ROLE).
+  assertDelegableAvailable(role, delegableAvailable, "broker response");
   return {
     absoluteDenies: optionalStringArrayField(record, "absoluteDenies", []),
     allowedManualCapabilities: optionalStringArrayField(record, "allowedManualCapabilities", []),
@@ -532,6 +665,112 @@ function narrowingEffectField(record: Record<string, unknown>, name: string): Ca
   };
 }
 
+const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function guidField(record: Record<string, unknown>, name: string): string {
+  const value = record[name];
+  if (typeof value !== "string" || !GUID_RE.test(value)) throw new Error(`broker response ${name} is invalid`);
+  return value;
+}
+
+// Matches Test-AgentWideningChallengeShape exactly (24 random bytes as lowercase hex) -- a
+// single-use, short-TTL confirmation token, never a long-lived secret, but still validated to its
+// exact shape rather than treated as an arbitrary bounded string.
+const CHALLENGE_RE = /^[0-9a-f]{48}$/;
+
+function challengeField(record: Record<string, unknown>, name: string): string {
+  const value = record[name];
+  if (typeof value !== "string" || !CHALLENGE_RE.test(value)) throw new Error(`broker response ${name} is invalid`);
+  return value;
+}
+
+// Matches Get-AgentCanonicalDigest's output shape exactly (lowercase SHA-256 hex).
+const HEX64_RE = /^[0-9a-f]{64}$/;
+
+function hex64Field(record: Record<string, unknown>, name: string): string {
+  const value = record[name];
+  if (typeof value !== "string" || !HEX64_RE.test(value)) throw new Error(`broker response ${name} is invalid`);
+  return value;
+}
+
+// Draft-scoped monotonically-increasing counter (WideningGeneration) -- never negative and never
+// remotely close to this ceiling in practice; bounded generously rather than tightly so a
+// legitimate long-lived draft's counter is never rejected.
+const MAX_WIDENING_GENERATION = 1_000_000;
+
+function generationField(record: Record<string, unknown>, name: string): number {
+  const value = record[name];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > MAX_WIDENING_GENERATION) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  return value;
+}
+
+const MAX_WIDENING_DIFF_ITEMS = 32;
+
+function capabilityNameArrayField(record: Record<string, unknown>, name: string): string[] {
+  const values = stringArrayField(record, name);
+  if (values.length > MAX_WIDENING_DIFF_ITEMS || values.some((value) => !CAPABILITY_NAME_PATTERN.test(value))) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  return values;
+}
+
+function effectiveDiffField(record: Record<string, unknown>, name: string): WideningEffectiveDiff {
+  const value = record[name];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  const raw = value as Record<string, unknown>;
+  const pairedCapabilityRaw = raw.pairedCapability;
+  let pairedCapability: string | null;
+  if (pairedCapabilityRaw === null) {
+    pairedCapability = null;
+  } else if (typeof pairedCapabilityRaw === "string" && CAPABILITY_NAME_PATTERN.test(pairedCapabilityRaw)) {
+    pairedCapability = pairedCapabilityRaw;
+  } else {
+    throw new Error(`broker response ${name}.pairedCapability is invalid`);
+  }
+  return {
+    addedCapabilities: capabilityNameArrayField(raw, "addedCapabilities"),
+    removedDenies: capabilityNameArrayField(raw, "removedDenies"),
+    pairedCapability,
+    pairedCapabilityActive: booleanField(raw, "pairedCapabilityActive"),
+  };
+}
+
+const MAX_WIDENING_TIMESTAMP_LENGTH = 40;
+
+// expiresAtUtc is PowerShell's [DateTime]::ToString('o') round-trip format -- always a string on
+// the wire, unlike grantExpiresAtUtc below (which the harness emits as a plain epoch-seconds
+// integer). Bounded the same way nullableExpiryText already bounds its own string branch, but
+// required: this field is never null/absent on a widening-preview/-summary response.
+function requiredIsoTimestampField(record: Record<string, unknown>, name: string): string {
+  const value = record[name];
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_WIDENING_TIMESTAMP_LENGTH) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  if (/[\x00-\x1f\x7f]/.test(value)) throw new Error(`broker response ${name} is invalid`);
+  if (Number.isNaN(Date.parse(value))) throw new Error(`broker response ${name} is invalid`);
+  return value;
+}
+
+// grantExpiresAtUtc is ConvertTo-AgentCanonicalEpochSeconds's output -- always a plain epoch-
+// seconds integer on the wire (never a string), mirroring killSwitchExpiresAtUtc's own numeric
+// branch and bounded by the identical far-future ceiling (issue #105 PR3's
+// MAX_KILL_SWITCH_EPOCH_SECONDS) so a clearly-bogus value can never be smuggled through as merely
+// "a safe integer". Normalized to an ISO string so every consumer (Date.parse in app.tsx) deals
+// with one shape regardless of which numeric/string convention a given field happens to use.
+const MAX_GRANT_EPOCH_SECONDS = 7_258_118_400; // 2200-01-01T00:00:00Z
+
+function requiredEpochSecondsField(record: Record<string, unknown>, name: string): string {
+  const value = record[name];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > MAX_GRANT_EPOCH_SECONDS) {
+    throw new Error(`broker response ${name} is invalid`);
+  }
+  return new Date(value * 1000).toISOString();
+}
+
 function parseResponse(line: string): BrokerResponse {
   const record = asRecord(JSON.parse(line));
   if (record.schemaVersion !== 1) throw new Error("unsupported broker protocol version");
@@ -544,6 +783,10 @@ function parseResponse(line: string): BrokerResponse {
       "narrowing-preview",
       "narrowing-applied",
       "kill-switch-applied",
+      "widening-preview",
+      "widening-summary",
+      "widening-minted",
+      "widening-cancelled",
       "accepted",
       "rejected",
       "completed",
@@ -554,10 +797,14 @@ function parseResponse(line: string): BrokerResponse {
     throw new Error("unknown broker response operation");
   }
   if (operation === "capability-summary" || operation === "capability-profile") {
+    // Computed once so it can also be threaded into parseCapabilityProfileFields's role-aware
+    // delegableAvailable validation below, rather than parsed twice or read back off the
+    // not-yet-constructed `shared` object.
+    const role = roleField(record, "role");
     const shared = {
       // Broker-authored role (issue #105) plus repositoryIdentity/prSnapshot, both of which used to
       // be spread straight from the untrusted record with no validation at all.
-      role: roleField(record, "role"),
+      role,
       repositoryIdentity: repositoryIdentityField(record, "repositoryIdentity"),
       prSnapshot: prSnapshotField(record, "prSnapshot"),
       // Legacy fields predate PR1's stricter parsing and were previously spread straight from the
@@ -567,12 +814,63 @@ function parseResponse(line: string): BrokerResponse {
       capabilities: stringArrayField(record, "capabilities"),
       mandatoryDenies: stringArrayField(record, "mandatoryDenies"),
       dynamicConstraints: stringArrayField(record, "dynamicConstraints"),
-      ...parseCapabilityProfileFields(record),
+      ...parseCapabilityProfileFields(record, role),
     };
     if (operation === "capability-summary") {
       return { ...record, requestId, operation, ...shared } as CapabilitySummary;
     }
     return { ...record, requestId, operation, ...shared } as CapabilityProfile;
+  }
+  if (operation === "widening-preview" || operation === "widening-summary") {
+    const expectedState = operation === "widening-preview" ? "previewed" : "awaiting-final-confirmation";
+    const stateValue = stringField(record, "state");
+    if (stateValue !== expectedState) throw new Error("broker response state is invalid");
+    const shared = {
+      dispatchDraftId: guidField(record, "dispatchDraftId"),
+      capability: capabilityNameField(record, "capability"),
+      challenge: challengeField(record, "challenge"),
+      effectiveDiff: effectiveDiffField(record, "effectiveDiff"),
+      expiresAtUtc: requiredIsoTimestampField(record, "expiresAtUtc"),
+      generation: generationField(record, "generation"),
+    };
+    if (operation === "widening-preview") {
+      return { schemaVersion: 1, requestId, operation, state: "previewed", ...shared } satisfies WideningPreview;
+    }
+    return { schemaVersion: 1, requestId, operation, state: "awaiting-final-confirmation", ...shared } satisfies WideningSummary;
+  }
+  if (operation === "widening-minted") {
+    const stateValue = stringField(record, "state");
+    if (stateValue !== "minted") throw new Error("broker response state is invalid");
+    return {
+      schemaVersion: 1,
+      requestId,
+      operation,
+      state: "minted",
+      dispatchDraftId: guidField(record, "dispatchDraftId"),
+      capability: capabilityNameField(record, "capability"),
+      capabilities: stringArrayField(record, "capabilities"),
+      mandatoryDenies: stringArrayField(record, "mandatoryDenies"),
+      capabilityPolicyDigest: hex64Field(record, "capabilityPolicyDigest"),
+      effectiveDiff: effectiveDiffField(record, "effectiveDiff"),
+      grantExpiresAtUtc: requiredEpochSecondsField(record, "grantExpiresAtUtc"),
+      generation: generationField(record, "generation"),
+    } satisfies WideningMinted;
+  }
+  if (operation === "widening-cancelled") {
+    const stateValue = stringField(record, "state");
+    if (stateValue !== "cancelled") throw new Error("broker response state is invalid");
+    return {
+      schemaVersion: 1,
+      requestId,
+      operation,
+      state: "cancelled",
+      dispatchDraftId: guidField(record, "dispatchDraftId"),
+      capabilities: stringArrayField(record, "capabilities"),
+      mandatoryDenies: stringArrayField(record, "mandatoryDenies"),
+      capabilityPolicyDigest: hex64Field(record, "capabilityPolicyDigest"),
+      delegableAvailable: stringArrayField(record, "delegableAvailable"),
+      generation: generationField(record, "generation"),
+    } satisfies WideningCancelled;
   }
   if (operation === "narrowing-preview") {
     const stateValue = stringField(record, "state");
@@ -780,6 +1078,98 @@ export class DispatchClient implements DispatchBroker {
       if (response.role !== role || response.enabled !== enabled) {
         throw new Error("broker kill-switch-applied does not match the requested mutation");
       }
+      return response;
+    });
+  }
+
+  describeWidening(summary: CapabilitySummary, capability: string): Promise<WideningPreview> {
+    // Client-side gate (defense in depth): the broker independently enforces the identical
+    // role/capability check (Invoke-DescribeWidening) and rejects with [widening-invalid] --
+    // rejecting here first avoids a pointless round-trip for a request that can never succeed.
+    // Returned as a rejected promise (never a synchronous throw) so this method's calling
+    // contract stays uniformly promise-returning, exactly like the `this.closed` guard in
+    // request() below -- a synchronous throw here would break a caller doing
+    // `client.describeWidening(...).catch(...)` instead of try/await.
+    try {
+      assertDelegableCapability(summary.role, capability);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.request<WideningPreview>({
+      schemaVersion: 1,
+      operation: "describe-widening",
+      repositoryKey: summary.repositoryIdentity.key,
+      pullRequestId: summary.prSnapshot.pullRequestId,
+      role: summary.role,
+      dispatchDraftId: summary.dispatchDraftId,
+      capability,
+    }, "widening-preview").then((response) => {
+      if (response.dispatchDraftId !== summary.dispatchDraftId || response.capability !== capability) {
+        throw new Error("broker widening-preview does not match the requested draft/capability");
+      }
+      return response;
+    });
+  }
+
+  confirmWideningPreview(summary: CapabilitySummary, stage: WideningPreview): Promise<WideningSummary> {
+    return this.request<WideningSummary>({
+      schemaVersion: 1,
+      operation: "confirm-widening-preview",
+      repositoryKey: summary.repositoryIdentity.key,
+      pullRequestId: summary.prSnapshot.pullRequestId,
+      role: summary.role,
+      dispatchDraftId: summary.dispatchDraftId,
+      capability: stage.capability,
+      challenge: stage.challenge,
+    }, "widening-summary").then((response) => {
+      if (response.dispatchDraftId !== summary.dispatchDraftId || response.capability !== stage.capability) {
+        throw new Error("broker widening-summary does not match the requested draft/capability");
+      }
+      return response;
+    });
+  }
+
+  confirmWideningMint(summary: CapabilitySummary, stage: WideningSummary): Promise<WideningMinted> {
+    return this.request<WideningMinted>({
+      schemaVersion: 1,
+      operation: "confirm-widening-mint",
+      repositoryKey: summary.repositoryIdentity.key,
+      pullRequestId: summary.prSnapshot.pullRequestId,
+      role: summary.role,
+      dispatchDraftId: summary.dispatchDraftId,
+      capability: stage.capability,
+      challenge: stage.challenge,
+    }, "widening-minted").then((response) => {
+      if (response.dispatchDraftId !== summary.dispatchDraftId || response.capability !== stage.capability) {
+        throw new Error("broker widening-minted does not match the requested draft/capability");
+      }
+      return response;
+    });
+  }
+
+  cancelWidening(summary: CapabilitySummary, generation: number): Promise<WideningCancelled> {
+    // Never defaulted (issue #105 PR4 review): the caller must supply the exact generation from
+    // the most recent widening response it observed. An omitted/non-integer/negative value is
+    // rejected here, before the request is ever sent, mirroring the identical invariant the
+    // broker's own cancel-widening handler enforces server-side (ConvertTo-AgentSafeIntegralNumber).
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      // Same rationale as describeWidening's guard above: a rejected promise, never a synchronous
+      // throw, so this method's calling contract stays uniformly promise-returning.
+      return Promise.reject(new Error("cancelWidening requires an exact, non-negative generation"));
+    }
+    return this.request<WideningCancelled>({
+      schemaVersion: 1,
+      operation: "cancel-widening",
+      repositoryKey: summary.repositoryIdentity.key,
+      pullRequestId: summary.prSnapshot.pullRequestId,
+      role: summary.role,
+      dispatchDraftId: summary.dispatchDraftId,
+      generation,
+    }, "widening-cancelled").then((response) => {
+      if (response.dispatchDraftId !== summary.dispatchDraftId) {
+        throw new Error("broker widening-cancelled does not match the requested draft");
+      }
+      assertDelegableAvailable(summary.role, response.delegableAvailable, "broker widening-cancelled");
       return response;
     });
   }
