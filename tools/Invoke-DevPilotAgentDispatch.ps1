@@ -62,6 +62,50 @@ $expectedRoleScripts = @{
     reviewer = Join-Path $toolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
     'review-handler' = Join-Path $toolkitRoot 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1'
 }
+function Assert-RoleCapabilityPolicy {
+    <#
+        issue #114: the ONE place that decides whether a launcher-written role policy
+        {capabilities, mandatoryDenies, absoluteDenies} is internally consistent, shared by the
+        startup descriptor sweep below and by Get-RoleDescriptor's per-request revalidation.
+        absoluteDenies is the trusted launcher's terminal, non-delegable ceiling for the WHOLE
+        launch (a preview-only launch names every mutation-capable capability there). It is read
+        from the descriptor the launcher actually wrote -- never from a harness default -- so an
+        operational launch can never be reinterpreted as a preview launch, or the reverse, by a
+        later harness change. Returns the normalized, sorted absolute-deny set.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][hashtable]$RoleDescriptor
+    )
+    $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $Role
+    $lockable = @(@($harnessRole.allowedManualCapabilities) + @($harnessRole.delegableDefaultOff))
+    $capabilities = @($RoleDescriptor.capabilities)
+    $mandatoryDenies = @($RoleDescriptor.mandatoryDenies)
+    # A descriptor written before issue #114 simply has no absoluteDenies member; that is a valid,
+    # unlocked (operational) launch, not a malformed one.
+    $declared = @()
+    if ($RoleDescriptor.Contains('absoluteDenies') -and $null -ne $RoleDescriptor['absoluteDenies']) {
+        $declared = @($RoleDescriptor['absoluteDenies'])
+    }
+    foreach ($name in $declared) {
+        if ($name -isnot [string] -or [string]$name -cnotmatch '^[A-Za-z][A-Za-z0-9]*$') {
+            throw '[role-not-allowed] The configured absolute-deny policy is malformed.'
+        }
+    }
+    $absoluteDenies = @($declared | Sort-Object -Unique)
+    if ($absoluteDenies.Count -ne $declared.Count -or
+        @($absoluteDenies | Where-Object { $lockable -cnotcontains $_ }).Count -gt 0 -or
+        @($absoluteDenies | Where-Object { $capabilities -ccontains $_ }).Count -gt 0 -or
+        @($absoluteDenies | Where-Object { $mandatoryDenies -cnotcontains $_ }).Count -gt 0) {
+        throw '[role-not-allowed] The configured absolute-deny policy is inconsistent.'
+    }
+    if ($mandatoryDenies -cnotcontains $harnessRole.delegableDefaultOff -or
+        @($capabilities | Where-Object { $mandatoryDenies -ccontains $_ }).Count -gt 0 -or
+        @($capabilities | Where-Object { $harnessRole.allowedManualCapabilities -cnotcontains $_ }).Count -gt 0) {
+        throw '[role-not-allowed] The configured manual capability policy is inconsistent.'
+    }
+    return $absoluteDenies
+}
 foreach ($role in @($descriptor.roles.Keys)) {
     if ($role -notin @('reviewer', 'review-handler')) { throw "Broker descriptor contains unsupported role '$role'." }
     $roleDescriptor = $descriptor.roles[$role]
@@ -75,6 +119,10 @@ foreach ($role in @($descriptor.roles.Keys)) {
     $roleDescriptor.configRoot = $configRoot
     $roleDescriptor.configFile = Assert-AgentTrustedFile -Path $expectedConfigPath `
         -AllowedRoot $configRoot -ExpectedPath $expectedConfigPath
+    # Validated once here, at startup, before any request is served, and normalized in place so
+    # every later reader (Get-RoleDescriptor, Get-BrokerCapabilityProfile, the widening path)
+    # sees the same sorted, verified set rather than raw wire content.
+    $roleDescriptor['absoluteDenies'] = @(Assert-RoleCapabilityPolicy -Role $role -RoleDescriptor $roleDescriptor)
 }
 $writerGate = [object]::new()
 $drafts = @{}
@@ -163,16 +211,10 @@ function Get-RoleDescriptor {
     }
     $roleDescriptor = $descriptor.roles[$roleKeys[0]]
     if (-not [bool]$roleDescriptor.enabled) { throw '[role-not-allowed] The requested manual role is disabled.' }
-    $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $Role
-    $allowedCapabilities = $harnessRole.allowedManualCapabilities
-    $requiredDeny = $harnessRole.delegableDefaultOff
-    $capabilities = @($roleDescriptor.capabilities)
-    $mandatoryDenies = @($roleDescriptor.mandatoryDenies)
-    if ($mandatoryDenies -cnotcontains $requiredDeny -or
-        @($capabilities | Where-Object { $mandatoryDenies -ccontains $_ }).Count -gt 0 -or
-        @($capabilities | Where-Object { $allowedCapabilities -cnotcontains $_ }).Count -gt 0) {
-        throw '[role-not-allowed] The configured manual capability policy is inconsistent.'
-    }
+    # issue #114: revalidated per request (not merely at startup) and against the launcher's own
+    # recorded absolute-deny set, so a preview-only launch's terminal ceiling is re-asserted on
+    # every describe/profile/preview-narrowing/widening path rather than assumed from startup.
+    $roleDescriptor['absoluteDenies'] = @(Assert-RoleCapabilityPolicy -Role $Role -RoleDescriptor $roleDescriptor)
     return $roleDescriptor
 }
 
@@ -365,7 +407,8 @@ function Get-BrokerNarrowingEffect {
     foreach ($name in @($AllowedManualCapabilities + $mandatoryDeniesBase + $AbsoluteDenies | Sort-Object -Unique)) {
         $provenance[$name] = 'operational-default'
     }
-    $partition = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $RoleDescriptor -PersistedNarrowing $Override.Settings
+    $partition = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $RoleDescriptor `
+        -PersistedNarrowing $Override.Settings -AbsoluteDenies $AbsoluteDenies
     if ([bool]$Override.KillSwitchActive) {
         # Emergency lever (PR3): every capability's provenance reads 'kill-switch', not
         # 'operational-default' -- the operator can see overrides exist but are being ignored,
@@ -411,7 +454,10 @@ function Get-BrokerCapabilityProfile {
         $capabilities = @($roleDescriptor.capabilities | Sort-Object -Unique)
         $mandatoryDenies = @($roleDescriptor.mandatoryDenies | Sort-Object -Unique)
         $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $role
-        $absoluteDenies = @($harnessRole.absoluteDenies | Sort-Object -Unique)
+        # issue #114: the launch-wide terminal denies come from the trusted launcher's own broker
+        # descriptor (validated by Assert-RoleCapabilityPolicy), never from the harness default --
+        # the harness cannot know whether THIS launch was started operationally or preview-only.
+        $absoluteDenies = @($roleDescriptor.absoluteDenies | Sort-Object -Unique)
         $allowedManualCapabilities = @($harnessRole.allowedManualCapabilities | Sort-Object -Unique)
         # issue #105 PR4: delegableAvailable reflects the checked-in delegation policy for THIS
         # role/repository -- never a wildcard, since the schema has no allow-any escape hatch. The
@@ -423,7 +469,7 @@ function Get-BrokerCapabilityProfile {
         # keeps working normally; only the widening endpoints reject distinctly for that condition.
         $delegationPolicy = Get-AgentDelegationPolicyOrNull -ToolkitRoot $toolkitRoot
         $delegableAvailable = @()
-        if ($delegationPolicy -and
+        if ($delegationPolicy -and $absoluteDenies -cnotcontains $harnessRole.delegableDefaultOff -and
             (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $role -Capability $harnessRole.delegableDefaultOff -RepositoryKey $identity.key)) {
             $delegableAvailable = @($harnessRole.delegableDefaultOff)
         }
@@ -850,8 +896,14 @@ function Get-DraftWideningCandidate {
     if ([bool]$override.KillSwitchActive) {
         throw '[narrowing-kill-switch-active] Widening is unavailable while the kill switch is active.'
     }
-    $current = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $Draft.RoleDescriptor -PersistedNarrowing $override.Settings
-    $widened = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $Draft.RoleDescriptor -PersistedNarrowing $override.Settings -GrantCapability $Capability
+    # issue #114: the launch's terminal absolute denies are applied to BOTH partitions. A grant that
+    # names an absolutely denied capability fails closed inside the primitive itself, so a preview
+    # launch can never mint, preview, or dispatch a widened ceiling.
+    $absoluteDenies = @($Draft.RoleDescriptor.absoluteDenies)
+    $current = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $Draft.RoleDescriptor `
+        -PersistedNarrowing $override.Settings -AbsoluteDenies $absoluteDenies
+    $widened = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $Draft.RoleDescriptor `
+        -PersistedNarrowing $override.Settings -AbsoluteDenies $absoluteDenies -GrantCapability $Capability
     return @{ Override = $override; Current = $current; Widened = $widened }
 }
 
@@ -920,6 +972,12 @@ function Invoke-DescribeWidening {
     $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $draft.Role
     if ($capability -cnotmatch '^[A-Za-z][A-Za-z0-9]*$' -or $capability -cne $harnessRole.delegableDefaultOff) {
         throw "[widening-invalid] capability is not the recognized delegable capability for role '$($draft.Role)'."
+    }
+    # issue #114: rejected before the delegation policy is even consulted -- a preview-only launch's
+    # absolute denies are terminal and non-delegable, so no policy, grant, or confirmation sequence
+    # can reach past them.
+    if (@($draft.RoleDescriptor.absoluteDenies) -ccontains $capability) {
+        throw '[widening-invalid] capability is absolutely denied for this launch and can never be widened.'
     }
     $delegationPolicy = Get-AgentDelegationPolicyOrThrow -ToolkitRoot $toolkitRoot
     if (-not (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $draft.Role -Capability $capability -RepositoryKey $draft.RepositoryIdentity.key)) {
@@ -1055,7 +1113,7 @@ function Invoke-CancelWidening {
     # attempt; only the delegableAvailable hint in the response degrades to empty.
     $delegationPolicyForCancel = Get-AgentDelegationPolicyOrNull -ToolkitRoot $toolkitRoot
     $delegableAvailable = @()
-    if ($delegationPolicyForCancel -and
+    if ($delegationPolicyForCancel -and @($draft.RoleDescriptor.absoluteDenies) -cnotcontains $harnessRole.delegableDefaultOff -and
         (Test-AgentDelegationAllows -Policy $delegationPolicyForCancel -Role $draft.Role -Capability $harnessRole.delegableDefaultOff -RepositoryKey $draft.RepositoryIdentity.key)) {
         $delegableAvailable = @($harnessRole.delegableDefaultOff)
     }
@@ -1066,7 +1124,8 @@ function Invoke-CancelWidening {
             -RepositoryRoot $draft.RoleDescriptor.repositoryRoot -PullRequestId $draft.PullRequestId -CurrentSourceCommit $draft.PrSnapshot.sourceCommit
     }
     finally { Exit-AgentLock $capabilityLock.Stream }
-    $unwidened = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $draft.RoleDescriptor -PersistedNarrowing $override.Settings
+    $unwidened = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $draft.RoleDescriptor `
+        -PersistedNarrowing $override.Settings -AbsoluteDenies @($draft.RoleDescriptor.absoluteDenies)
     $draft.Widening = $null
     $draft.Policy = [ordered]@{
         schemaVersion = 1; repositoryIdentity = $draft.RepositoryIdentity; role = $draft.Role
@@ -1195,6 +1254,13 @@ function Invoke-Dispatch {
     $draft.Consumed = $true
     if (([DateTime]::UtcNow - $draft.CreatedAt).TotalSeconds -gt $DraftLifetimeSeconds) {
         throw '[invalid-request] dispatchDraftId has expired.'
+    }
+    # issue #114: terminal ceiling recheck at the one boundary that actually launches a child. The
+    # draft's bound policy is re-derived from the descriptor on every describe, so this can only
+    # fire if the policy was widened after the draft was bound -- it must never reach a child argv.
+    $dispatchAbsoluteDenies = @($draft.RoleDescriptor.absoluteDenies)
+    if (@($draft.Policy.capabilities | Where-Object { $dispatchAbsoluteDenies -ccontains $_ }).Count -gt 0) {
+        throw '[role-not-allowed] The requested dispatch includes a capability this launch absolutely denies.'
     }
     foreach ($binding in @(
             @('role', $draft.Role), @('pullRequestId', $draft.PullRequestId),

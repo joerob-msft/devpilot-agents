@@ -1,10 +1,9 @@
 # DevPilot Operations Dashboard
 
 Direct and attach-only launches remain visibly observe-only. A trusted
-`Watch-DevPilot*.ps1` launcher may opt in a long-lived broker descriptor and
-one or both manual roles. The renderer can confirm only wrapper-derived
-capabilities and can never grant them. Manual Reviewer approval votes remain
-hard-disabled.
+`Watch-DevPilot*.ps1` launcher may opt in automatic operations, a long-lived
+broker descriptor, and one or both manual roles. The renderer cannot exceed
+the launcher-derived capability ceiling.
 
 A terminal operations console for observing DevPilot reviewer and
 review-handler instances and, only under a trusted launcher, manually
@@ -15,6 +14,36 @@ provider-verified repository identity plus PR number. It merges Reviewer and
 Review Handler outcomes without merging same-numbered PRs from different
 repositories. Legacy schema-v2 streams remain visible in instance views but do
 not enter canonical PR history.
+
+## Golden path
+
+Run the toolkit watcher from a consumer repository containing the conventional
+Reviewer and Review Handler configs:
+
+```powershell
+& '<toolkit-root>\tools\Watch-DevPilotAgents.ps1' -Golden
+```
+
+This explicit authority-bearing mode starts both agents continuously.
+Reviewer may post findings, replies, and summaries. Review Handler may reply,
+requeue, apply fixes, run local validation, resume the originating coding
+session, and push updates. Teams notifications, approval votes, and
+auto-complete are not granted by Golden.
+
+For the same live experience with no PR mutations:
+
+```powershell
+& '<toolkit-root>\tools\Watch-DevPilotAgents.ps1' -Golden -PreviewOnly
+```
+
+PreviewOnly is a terminal ceiling: automatic and manual writes, notifications,
+Settings widening, and delegated grants are unavailable. The header always
+shows **OPERATIONAL**, **PREVIEW**, or **OBSERVE**. Press `f` to reach History,
+select a PR, press `m`, and use `Tab` to choose the manual role.
+
+Golden History includes the current launch and up to 20 recent watch runs that
+still satisfy the owner-private trusted-path contract. Unsafe prior roots are
+reported and excluded; durable and lease roots are never scanned.
 
 ## Prerequisites
 
@@ -53,7 +82,7 @@ The repository launcher intentionally does not install dependencies:
 For direct debugging:
 
 ```powershell
-npm start -- --state-dir C:\DevPilot\state --event-log C:\captures\events.jsonl
+npm start -- --launch-mode observe --state-dir C:\DevPilot\state --event-log C:\captures\events.jsonl
 ```
 
 Each state directory is recursively scanned (to a bounded depth) for:

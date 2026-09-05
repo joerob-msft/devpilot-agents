@@ -11,6 +11,10 @@ param(
     [string]$BrokerDescriptorPath,
 
     [Parameter(DontShow)]
+    [ValidateSet('observe', 'preview', 'operational')]
+    [string]$LaunchMode = 'observe',
+
+    [Parameter(DontShow)]
     [switch]$ValidateOnly
 )
 
@@ -35,7 +39,7 @@ function Stop-DashboardLaunch {
     exit 1
 }
 
-if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+if (-not $ValidateOnly -and ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected)) {
     Stop-DashboardLaunch 'DevPilot Operations requires an interactive terminal; input or output is redirected.'
 }
 
@@ -44,7 +48,7 @@ if ($StateDir.Count -eq 0 -and $EventLogPath.Count -eq 0) {
 }
 
 $width = try { [Console]::WindowWidth } catch { 0 }
-if ($width -lt 60) {
+if (-not $ValidateOnly -and $width -lt 60) {
     Stop-DashboardLaunch "DevPilot Operations requires a terminal width of at least 60 columns (current: $width)." @(
         'Resize the terminal and run the launcher again.'
     )
@@ -181,6 +185,7 @@ if ($BrokerDescriptorPath) {
             -ExpectedPath (Join-Path $descriptorStateRoot 'broker.descriptor.v1.json') -Private)
         [void](Assert-AgentTrustedFile -Path ([IO.Path]::GetFullPath($brokerScriptPath)) `
             -AllowedRoot $toolkitRoot -ExpectedPath (Join-Path (Join-Path $toolkitRoot 'tools') 'Invoke-DevPilotAgentDispatch.ps1'))
+        Assert-AgentDashboardLaunchAuthority -LaunchMode $LaunchMode -BrokerDescriptor $descriptorData
     }
     catch {
         Stop-DashboardLaunch "The broker authority descriptor is not trusted: $($_.Exception.Message)"
@@ -192,6 +197,8 @@ if ($ValidateOnly) { return }
 $arguments = New-Object System.Collections.Generic.List[string]
 [void]$arguments.Add('--conditions=browser')
 [void]$arguments.Add($entryPath)
+[void]$arguments.Add('--launch-mode')
+[void]$arguments.Add($LaunchMode)
 foreach ($path in $StateDir) {
     [void]$arguments.Add('--state-dir')
     [void]$arguments.Add([IO.Path]::GetFullPath($path))

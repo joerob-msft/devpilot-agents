@@ -1,6 +1,6 @@
 import { createCliRenderer } from "@opentui/core";
 import { render } from "@opentui/solid";
-import { App } from "./app.js";
+import { App, type LaunchMode } from "./app.js";
 import { DispatchClient, type BrokerLaunchDescriptor } from "./dispatch.js";
 import { PullRequestHistoryProjection } from "./history.js";
 import { createDashboardLifecycle } from "./lifecycle.js";
@@ -11,10 +11,16 @@ interface Arguments {
   stateDirectories: string[];
   eventLogPaths: string[];
   broker: BrokerLaunchDescriptor | null;
+  launchMode: LaunchMode;
 }
 
 export function parseArguments(argv: string[]): Arguments {
-  const result: Arguments = { stateDirectories: [], eventLogPaths: [], broker: null };
+  const result: Arguments = {
+    stateDirectories: [],
+    eventLogPaths: [],
+    broker: null,
+    launchMode: "observe",
+  };
   const broker: Partial<BrokerLaunchDescriptor> = {};
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
@@ -23,6 +29,12 @@ export function parseArguments(argv: string[]): Arguments {
       if (!value) throw new Error(`${argument} requires a path`);
       if (argument === "--state-dir") result.stateDirectories.push(value);
       else result.eventLogPaths.push(value);
+    } else if (argument === "--launch-mode") {
+      const value = argv[++index];
+      if (value !== "observe" && value !== "preview" && value !== "operational") {
+        throw new Error("--launch-mode requires observe, preview, or operational");
+      }
+      result.launchMode = value;
     } else if (argument === "--broker-executable" || argument === "--broker-script" || argument === "--broker-descriptor") {
       const value = argv[++index];
       if (!value) throw new Error(`${argument} requires a path`);
@@ -31,7 +43,7 @@ export function parseArguments(argv: string[]): Arguments {
       else broker.descriptorPath = value;
     } else if (argument === "--help" || argument === "-h") {
       process.stdout.write(
-        "Usage: npm start -- [--state-dir <path>]... [--event-log <path>]...\n" +
+        "Usage: npm start -- [--state-dir <path>]... [--event-log <path>]... [--launch-mode <observe|preview|operational>]\n" +
           "Observe DevPilot reviewer and review-handler JSONL event streams.\n",
       );
       process.exitCode = 0;
@@ -98,6 +110,7 @@ async function main(): Promise<void> {
       history={history}
       tailer={tailer}
       broker={broker}
+      launchMode={args.launchMode}
       brokerFailure={() => brokerFailure}
       shutdownBroker={lifecycle.shutdownBroker}
     />, renderer);
