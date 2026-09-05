@@ -29,6 +29,10 @@ import {
   type NarrowingAction,
   type NarrowingScope,
   NARROWING_SCOPES,
+  type WideningCancelled,
+  type WideningMinted,
+  type WideningPreview,
+  type WideningSummary,
 } from "./dispatch.js";
 
 export const BRAND_PLANE = ["       __|__       ", "--o--o--(_)--o--o--"] as const;
@@ -125,6 +129,14 @@ export function dispatchResultDetail(code: string, detail = ""): string {
     "narrowing-stale": "The store changed since preview; re-preview before applying.",
     "narrowing-expired": "The preview expired; re-preview before applying.",
     "narrowing-kill-switch-active": "Editing is unavailable while the kill switch is active.",
+    "widening-invalid": "The requested capability widening is not valid for this draft or role.",
+    "widening-expired": "The widening confirmation expired; request widening again.",
+    "widening-replay": "That widening confirmation was already used; request widening again.",
+    "widening-stale": "Widening state has moved on; re-open the widening panel and try again.",
+    "delegation-not-allowed": "The checked-in delegation policy does not permit this capability for this repository.",
+    "delegation-policy-unavailable": "The checked-in delegation policy could not be loaded; widening is unavailable right now.",
+    "grant-invalidated": "The capability widening grant is no longer valid; dispatch without it or request widening again.",
+    "grant-noop": "This redispatch already has prior delivery state; the auto-complete grant would be a no-op.",
   };
   return `${labels[code] ?? `Dispatch rejected: ${code}`}${safe ? ` ${safe}` : ""}`;
 }
@@ -137,6 +149,10 @@ function ManualDispatchPanel(props: {
   summary: CapabilitySummary | null;
   accepted: DispatchAccepted | null;
   status: string;
+  wideningStage: "closed" | "describing" | "preview" | "confirming" | "summary" | "minting" | "cancelling";
+  wideningPreview: WideningPreview | WideningSummary | null;
+  wideningStatus: string;
+  mintedWideningGeneration: number | null;
 }) {
   const promptPreview = () => line(props.prompt.replace(/\n/g, " / ") || "(none)", 90);
   const identity = () => props.summary?.repositoryIdentity ?? props.entry.repositoryIdentity;
@@ -148,7 +164,19 @@ function ManualDispatchPanel(props: {
       <box flexDirection="column" flexGrow={1}>
         <text height={1} fg={COLORS.accent}>{identity().slug} / PR #{pullRequestId()}</text>
         <text height={1} fg={COLORS.text}>{line(title() || "(untitled)", 100)} | {line(author() || "unknown author", 60)}</text>
-        <text height={1} fg={COLORS.text}>Role: {roleLabel(props.role)} | force fresh analysis</text>
+        <text height={1} fg={COLORS.text}>
+          Role: {roleLabel(props.role)} |{" "}
+          {
+            // Mirrors Invoke-Dispatch's own $includeForceAnalysis exactly (issue #105 PR4
+            // requirement 6): -ForceAnalysis is omitted ONLY for a reviewer's minted
+            // EnableApprovalVote grant (the sole capability a reviewer can ever widen) --
+            // every other combination, including a review-handler's EnableAutoComplete grant,
+            // keeps forcing fresh analysis exactly as an unwidened dispatch would.
+            props.role === "reviewer" && props.mintedWideningGeneration !== null
+              ? "vote-grant dispatch: skips forced fresh analysis (already-reviewed PR)"
+              : "force fresh analysis"
+          }
+        </text>
         <Show when={props.mode === "prompt"}>
           <text height={1} fg={COLORS.warning}>Operator context is untrusted data; 512 Unicode scalars maximum.</text>
           <text height={1} fg={COLORS.text}>{promptPreview()}</text>
@@ -169,7 +197,69 @@ function ManualDispatchPanel(props: {
                 {(constraint) => <text height={1} fg={COLORS.warning}>Constraint: {line(constraint, 100)}</text>}
               </For>
               <Show when={props.mode === "confirm"}>
-                <text height={1} fg={COLORS.warning}>First confirmation: press d to review the final execution gate; Esc cancels.</text>
+                <Show when={props.wideningStage === "closed"}>
+                  <Show when={props.mintedWideningGeneration !== null}>
+                    <text height={1} fg={COLORS.ok}>Widening grant minted and active for this draft; continue with d then y to dispatch, or Esc to close and relinquish it.</text>
+                  </Show>
+                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 0}>
+                    <text height={1} fg={COLORS.muted}>No delegated capabilities available for this role.</text>
+                  </Show>
+                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 1 && summary().killSwitchActive}>
+                    <text height={1} fg={COLORS.error}>Widening unavailable while the kill switch is active.</text>
+                  </Show>
+                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 1 && !summary().killSwitchActive}>
+                    <text height={1} fg={COLORS.muted}>Press w to request {summary().delegableAvailable[0]} widening (draft-bound, single-use).</text>
+                  </Show>
+                  <text height={1} fg={COLORS.warning}>First confirmation: press d to review the final execution gate; Esc cancels.</text>
+                </Show>
+                <Show when={props.wideningStage === "describing"}>
+                  <text height={1} fg={COLORS.warning}>Requesting capability widening description...</text>
+                </Show>
+                <Show when={props.wideningStage === "cancelling"}>
+                  <text height={1} fg={COLORS.warning}>Cancelling capability widening...</text>
+                </Show>
+                <Show when={props.wideningPreview}>
+                  {(stageAccessor: () => WideningPreview | WideningSummary) => {
+                    const diff = () => stageAccessor().effectiveDiff;
+                    return (
+                      <>
+                        <text height={1} fg={COLORS.accent}>
+                          {props.wideningStage === "summary" || props.wideningStage === "minting" ? "Final widening blast radius" : "Widening preview"}: {stageAccessor().capability}
+                        </text>
+                        <text height={1} fg={COLORS.ok}>Would add: {line(diff().addedCapabilities.join(", ") || "none", 100)}</text>
+                        <text height={1} fg={COLORS.warning}>Would remove from denies: {line(diff().removedDenies.join(", ") || "none", 100)}</text>
+                        <Show when={diff().pairedCapability}>
+                          {(paired: () => string) => (
+                            <>
+                              <text height={1} fg={diff().pairedCapabilityActive ? COLORS.ok : COLORS.error}>
+                                Paired requirement: {paired()} must already be active{diff().pairedCapabilityActive ? " (confirmed active)" : " -- NOT active; minting refused"}.
+                              </text>
+                              <text height={1} fg={COLORS.muted}>Casting a vote without visible findings leaves the author an unexplained verdict.</text>
+                            </>
+                          )}
+                        </Show>
+                        <Show when={props.wideningStage === "preview"}>
+                          <text height={1} fg={COLORS.muted}>Expires {line(stageAccessor().expiresAtUtc, 40)}</text>
+                          <text height={1} fg={COLORS.warning}>First widening confirmation: press c to review the final blast radius; Esc cancels the widening request.</text>
+                        </Show>
+                        <Show when={props.wideningStage === "confirming"}>
+                          <text height={1} fg={COLORS.warning}>Confirming widening preview...</text>
+                        </Show>
+                        <Show when={props.wideningStage === "summary"}>
+                          <text height={1} fg={COLORS.warning}>Single-use grant; expires {line(stageAccessor().expiresAtUtc, 40)}.</text>
+                          <text height={1} fg={COLORS.warning}>Unavailable to headless/direct/watcher dispatch -- interactive draft-bound use only.</text>
+                          <text height={1} fg={COLORS.error}>FINAL WIDENING CONFIRMATION: press y to mint this grant; Esc cancels.</text>
+                        </Show>
+                        <Show when={props.wideningStage === "minting"}>
+                          <text height={1} fg={COLORS.warning}>Minting capability widening grant...</text>
+                        </Show>
+                      </>
+                    );
+                  }}
+                </Show>
+                <Show when={props.wideningStatus}>
+                  <text height={1} fg={COLORS.muted}>{line(props.wideningStatus, 160)}</text>
+                </Show>
               </Show>
               <Show when={props.mode === "confirm-final"}>
                 <text height={1} fg={COLORS.error}>FINAL CONFIRMATION: press y to dispatch this exact snapshot; Esc cancels.</text>
@@ -660,6 +750,23 @@ export function App(props: AppProps) {
   const [capabilitySummary, setCapabilitySummary] = createSignal<CapabilitySummary | null>(null);
   const [acceptedDispatch, setAcceptedDispatch] = createSignal<DispatchAccepted | null>(null);
   const [manualStatus, setManualStatus] = createSignal("");
+  // PR4 interactive widening sub-flow (issue #105), nested entirely inside manualMode()==="confirm"
+  // -- Settings' own read-only CapabilityProfile has no dispatchDraftId to bind against, so
+  // widening is only ever reachable from the trusted manual describe() flow. "preview"/"summary"
+  // hold the broker's two challenge-bearing responses; the "-ing" stages are in-flight RPCs during
+  // which widening keys are ignored (see the keyboard handler). wideningPreview holds whichever of
+  // WideningPreview/WideningSummary is currently active, since both share the same challenge/
+  // effectiveDiff/expiresAtUtc/generation shape.
+  const [wideningStage, setWideningStage] =
+    createSignal<"closed" | "describing" | "preview" | "confirming" | "summary" | "minting" | "cancelling">("closed");
+  const [wideningPreview, setWideningPreview] = createSignal<WideningPreview | WideningSummary | null>(null);
+  const [wideningStatus, setWideningStatus] = createSignal("");
+  // Set the instant confirm-widening-mint succeeds; cleared on dispatch, on an explicit cancel, or
+  // on closing/reopening manual dispatch. Tracks a minted-but-not-yet-dispatched grant so
+  // close/quit/shutdown can still best-effort relinquish it even though wideningStage() itself has
+  // already returned to "closed" (mint returns control to the ordinary confirm/confirm-final gate,
+  // per issue #105 PR4 -- widening never dispatches on its own).
+  const [mintedWideningGeneration, setMintedWideningGeneration] = createSignal<number | null>(null);
   const [settingsRole, setSettingsRole] = createSignal<AgentRole>("reviewer");
   const [settingsProfile, setSettingsProfile] = createSignal<CapabilityProfile | null>(null);
   const [settingsStatus, setSettingsStatus] = createSignal("");
@@ -678,6 +785,10 @@ export function App(props: AppProps) {
   // "confirm-final" is the terse final gate that actually arms the 'y' toggle.
   const [killSwitchStage, setKillSwitchStage] = createSignal<"none" | "confirm" | "confirm-final">("none");
   let narrowingGeneration = 0;
+  // Local UI correlation token for the widening sub-flow, mirroring narrowingGeneration/
+  // killSwitchGeneration exactly: bumped by every widening step and by closeManual/openManual, so
+  // a response for a superseded step (panel closed/reopened meanwhile) can never be applied.
+  let wideningRequestToken = 0;
   // Kill-switch generation token (issue #105 PR3 completion), mirroring narrowingGeneration/
   // settingsGeneration exactly: bumped by closeSettings and by a role switch (Tab), so a
   // setKillSwitch() response that resolves after Settings was closed or re-roled can never
@@ -732,6 +843,7 @@ export function App(props: AppProps) {
   onCleanup(() => {
     clearInterval(refreshTimer);
     if (feedbackTimer) clearTimeout(feedbackTimer);
+    bestEffortCancelWidening();
     void shutdownBroker();
   });
 
@@ -783,12 +895,18 @@ export function App(props: AppProps) {
       notify("Cancel the active manual dispatch before closing");
       return;
     }
+    bestEffortCancelWidening();
     setManualMode("closed");
     setManualEntry(null);
     setCapabilitySummary(null);
     setAcceptedDispatch(null);
     setOperatorPrompt("");
     setManualStatus("");
+    wideningRequestToken += 1;
+    setWideningStage("closed");
+    setWideningPreview(null);
+    setWideningStatus("");
+    setMintedWideningGeneration(null);
   }
 
   function openManual(): void {
@@ -811,6 +929,11 @@ export function App(props: AppProps) {
     setAcceptedDispatch(null);
     setOperatorPrompt("");
     setManualStatus("");
+    wideningRequestToken += 1;
+    setWideningStage("closed");
+    setWideningPreview(null);
+    setWideningStatus("");
+    setMintedWideningGeneration(null);
     notify("Manual dispatch prompt opened");
   }
 
@@ -844,6 +967,10 @@ export function App(props: AppProps) {
       props.tailer.registerEventLogPath(accepted.eventLogPath);
       setManualMode("active");
       setManualStatus("Dispatch accepted; waiting for correlated v3 child events.");
+      // Any minted widening grant is now consumed by the broker's own dispatch-time preflight
+      // (Invoke-Dispatch sets Consumed=true unconditionally) -- a later best-effort cancel-widening
+      // for this generation would only fail harmlessly, so stop tracking it.
+      setMintedWideningGeneration(null);
     } catch (error) {
       const message = error instanceof BrokerRejectionError
         ? dispatchResultDetail(error.code, error.detail)
@@ -871,6 +998,149 @@ export function App(props: AppProps) {
         : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
       setManualMode("terminal");
     }
+  }
+
+  // PR4 interactive widening (issue #105). Reachable only while manualMode() === "confirm" -- see
+  // the keyboard handler -- since a live CapabilitySummary/dispatchDraftId is required and Settings'
+  // CapabilityProfile has none. Only ever ONE capability can be delegable per role
+  // (DELEGABLE_CAPABILITY_BY_ROLE), so there is no picker: the sole entry in delegableAvailable is
+  // the one this whole sub-flow requests.
+  function canRequestWidening(): boolean {
+    const summary = capabilitySummary();
+    return manualMode() === "confirm" && wideningStage() === "closed" &&
+      Boolean(summary) && !summary!.killSwitchActive && summary!.delegableAvailable.length === 1;
+  }
+
+  async function beginWidening(): Promise<void> {
+    const summary = capabilitySummary();
+    if (!props.broker || !summary || !canRequestWidening()) return;
+    const capability = summary.delegableAvailable[0]!;
+    setWideningStage("describing");
+    setWideningStatus("");
+    const requestId = (wideningRequestToken += 1);
+    try {
+      const preview = await props.broker.describeWidening(summary, capability);
+      if (requestId !== wideningRequestToken) return; // superseded: manual panel closed/reset meanwhile
+      setWideningPreview(preview);
+      setWideningStage("preview");
+    } catch (error) {
+      if (requestId !== wideningRequestToken) return;
+      setWideningStatus(isKillSwitchActiveRejection(error)
+        ? "Widening is unavailable while the kill switch is active."
+        : error instanceof BrokerRejectionError
+          ? dispatchResultDetail(error.code, error.detail)
+          : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setWideningStage("closed");
+      setWideningPreview(null);
+    }
+  }
+
+  async function confirmWideningPreviewStep(): Promise<void> {
+    const summary = capabilitySummary();
+    const stage = wideningPreview();
+    if (!props.broker || !summary || !stage || wideningStage() !== "preview") return;
+    setWideningStage("confirming");
+    setWideningStatus("");
+    const requestId = (wideningRequestToken += 1);
+    try {
+      const nextStage = await props.broker.confirmWideningPreview(summary, stage as WideningPreview);
+      if (requestId !== wideningRequestToken) return;
+      setWideningPreview(nextStage);
+      setWideningStage("summary");
+    } catch (error) {
+      if (requestId !== wideningRequestToken) return;
+      setWideningStatus(isKillSwitchActiveRejection(error)
+        ? "Widening is unavailable while the kill switch is active."
+        : error instanceof BrokerRejectionError
+          ? dispatchResultDetail(error.code, error.detail)
+          : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setWideningStage("closed");
+      setWideningPreview(null);
+    }
+  }
+
+  async function confirmWideningMintStep(): Promise<void> {
+    const summary = capabilitySummary();
+    const stage = wideningPreview();
+    if (!props.broker || !summary || !stage || wideningStage() !== "summary") return;
+    setWideningStage("minting");
+    setWideningStatus("");
+    const requestId = (wideningRequestToken += 1);
+    try {
+      const minted = await props.broker.confirmWideningMint(summary, stage as WideningSummary);
+      if (requestId !== wideningRequestToken) return;
+      // Merge the minted, refreshed capabilities/mandatoryDenies/digest into the manual dispatch
+      // summary in place -- the existing, unmodified d/y confirm-final gate then dispatches this
+      // exact widened snapshot. Widening never dispatches on its own (issue #105 PR4).
+      setCapabilitySummary({
+        ...summary,
+        capabilities: minted.capabilities,
+        mandatoryDenies: minted.mandatoryDenies,
+        capabilityPolicyDigest: minted.capabilityPolicyDigest,
+      });
+      setMintedWideningGeneration(minted.generation);
+      setWideningStage("closed");
+      setWideningPreview(null);
+      setWideningStatus(
+        `Widening minted: ${minted.capability} granted until ${minted.grantExpiresAtUtc}. ` +
+        "Continue with d then y to dispatch, or Esc to close and relinquish it.",
+      );
+    } catch (error) {
+      if (requestId !== wideningRequestToken) return;
+      setWideningStatus(isKillSwitchActiveRejection(error)
+        ? "Widening is unavailable while the kill switch is active."
+        : error instanceof BrokerRejectionError
+          ? dispatchResultDetail(error.code, error.detail)
+          : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+      setWideningStage("closed");
+      setWideningPreview(null);
+    }
+  }
+
+  async function cancelWideningStep(): Promise<void> {
+    const summary = capabilitySummary();
+    const stage = wideningPreview();
+    const stageName = wideningStage();
+    if (!props.broker || !summary || !stage || (stageName !== "preview" && stageName !== "summary")) return;
+    setWideningStage("cancelling");
+    const requestId = (wideningRequestToken += 1);
+    try {
+      const cancelled = await props.broker.cancelWidening(summary, stage.generation);
+      if (requestId !== wideningRequestToken) return;
+      setCapabilitySummary({
+        ...summary,
+        capabilities: cancelled.capabilities,
+        mandatoryDenies: cancelled.mandatoryDenies,
+        capabilityPolicyDigest: cancelled.capabilityPolicyDigest,
+        delegableAvailable: cancelled.delegableAvailable,
+      });
+      setWideningStatus("Widening cancelled; capability profile refreshed to the unwidened baseline.");
+    } catch (error) {
+      if (requestId !== wideningRequestToken) return;
+      setWideningStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail)
+        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (requestId === wideningRequestToken) {
+        setMintedWideningGeneration(null);
+        setWideningStage("closed");
+        setWideningPreview(null);
+      }
+    }
+  }
+
+  // Best-effort only (issue #105 PR4): never awaited, never surfaced as a failure -- a widening
+  // attempt or an already-minted grant is draft-scoped and expires on its own (DraftLifetimeSeconds)
+  // even if this never lands, so close/quit/shutdown must never block on it.
+  function bestEffortCancelWidening(): void {
+    const summary = capabilitySummary();
+    const stageName = wideningStage();
+    const generation = mintedWideningGeneration() ??
+      (stageName === "preview" || stageName === "summary" ? wideningPreview()?.generation ?? null : null);
+    if (!props.broker || !summary || generation === null) return;
+    void props.broker.cancelWidening(summary, generation).catch(() => {
+      // Best-effort: see comment above.
+    });
   }
 
   // Read-only effective-profile settings: uses the broker's dedicated `profile` RPC (issue #105),
@@ -1230,6 +1500,7 @@ export function App(props: AppProps) {
 
   async function quit(): Promise<void> {
     setFeedback("Shutting down broker-owned manual work...");
+    bestEffortCancelWidening();
     try {
       await shutdownBroker();
     } catch (error) {
@@ -1481,8 +1752,20 @@ export function App(props: AppProps) {
           }
         }
       } else if (manualMode() === "confirm") {
-        if (key.name === "escape") closeManual();
+        // PR4 interactive widening (issue #105), nested inside "confirm": while a widening
+        // sub-stage is active it owns Esc/c/y exclusively; the ordinary d/Esc confirm gate below
+        // only ever sees keys once wideningStage() is back to "closed" (including right after a
+        // successful mint -- see confirmWideningMintStep, which never advances manualMode itself).
+        const wStage = wideningStage();
+        if (wStage === "preview" || wStage === "summary") {
+          if (key.name === "escape") void cancelWideningStep();
+          else if (wStage === "preview" && key.name === "c") void confirmWideningPreviewStep();
+          else if (wStage === "summary" && key.name === "y") void confirmWideningMintStep();
+        } else if (wStage === "describing" || wStage === "confirming" || wStage === "minting" || wStage === "cancelling") {
+          // A widening RPC is in flight; ignore keys until it settles rather than let d/Esc race it.
+        } else if (key.name === "escape") closeManual();
         else if (key.name === "d") setManualMode("confirm-final");
+        else if (key.name === "w" && canRequestWidening()) void beginWidening();
       } else if (manualMode() === "confirm-final") {
         if (key.name === "escape") closeManual();
         else if (key.name === "y") void dispatchManual();
@@ -1803,6 +2086,10 @@ export function App(props: AppProps) {
               summary={capabilitySummary()}
               accepted={acceptedDispatch()}
               status={manualStatus() || props.brokerFailure?.() || ""}
+              wideningStage={wideningStage()}
+              wideningPreview={wideningPreview()}
+              wideningStatus={wideningStatus()}
+              mintedWideningGeneration={mintedWideningGeneration()}
             />
           )}
         </Show>
@@ -1875,6 +2162,8 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
           <text height={1} fg={COLORS.text}>m                  Manual dispatch for selected retained PR (trusted launch only)</text>
+          <text height={1} fg={COLORS.text}>  (dispatch confirm) w   Request capability widening, if delegable (draft-bound)</text>
+          <text height={1} fg={COLORS.text}>  (widening) c / y   Confirm preview / mint the grant | Esc cancels widening</text>
           <text height={1} fg={COLORS.text}>s                  Effective capability profile for the next manual launch</text>
           <text height={1} fg={COLORS.text}>  (in Settings) e   Edit persisted narrowing | k toggle kill switch</text>
           <text height={1} fg={COLORS.text}>?                  Help</text>

@@ -23,6 +23,10 @@ import type {
   KillSwitchApplied,
   NarrowingAction,
   NarrowingScope,
+  WideningCancelled,
+  WideningMinted,
+  WideningPreview,
+  WideningSummary,
 } from "../src/dispatch.js";
 import { BrokerRejectionError } from "../src/dispatch.js";
 
@@ -1484,6 +1488,13 @@ test("trusted manual flow requires describe plus two explicit confirmations", as
     capabilities: ["EnableSummaryComment"],
     mandatoryDenies: ["EnableApprovalVote"],
     dynamicConstraints: [],
+    absoluteDenies: [],
+    allowedManualCapabilities: [],
+    delegableAvailable: [],
+    provenance: {},
+    killSwitchActive: false,
+    killSwitchExpiresAtUtc: null,
+    editingAvailable: true,
   };
   const accepted: DispatchAccepted = {
     schemaVersion: 1,
@@ -1776,6 +1787,416 @@ test("renderer destruction handles rejected trusted broker shutdown once", async
   } finally {
     process.off("unhandledRejection", onUnhandledRejection);
     if (!setup?.renderer.isDestroyed) setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+// PR4 interactive widening (issue #105): a dedicated fixture mirroring createSettingsBrokerFixture's
+// style but for the manual-dispatch draft + widening chain specifically. describe() always resolves
+// immediately (unlike the big manual-dispatch test's deferred-promise fixture above) since these
+// tests exercise the widening sub-flow, not describe()'s own pending/race behavior.
+function createWideningBrokerFixture(options: {
+  role?: AgentRole;
+  delegableAvailable?: string[];
+  killSwitchActive?: boolean;
+  pairedCapabilityActive?: boolean;
+  describeWideningRejection?: { code: string; detail?: string };
+} = {}): {
+  broker: DispatchBroker;
+  calls: string[];
+  dispatchedSummaries: CapabilitySummary[];
+} {
+  const role: AgentRole = options.role ?? "reviewer";
+  const capability = role === "reviewer" ? "EnableApprovalVote" : "EnableAutoComplete";
+  const pairedCapability = role === "reviewer" ? "EnableFindingComments" : null;
+  const pairedCapabilityActive = options.pairedCapabilityActive ?? true;
+  const calls: string[] = [];
+  const dispatchedSummaries: CapabilitySummary[] = [];
+  let generation = 0;
+  const repositoryIdentity = {
+    schemaVersion: 1 as const,
+    provider: "GitHub" as const,
+    repositoryId: "9007199254740993",
+    organization: "contoso",
+    project: "",
+    repositoryName: "repo",
+    slug: "contoso/repo",
+    key: "v1:github:9007199254740993",
+    verifiedAtUtc: "2026-09-03T00:00:00Z",
+    verified: true,
+    dispatchEligible: true,
+  };
+  const prSnapshot = {
+    schemaVersion: 1 as const,
+    pullRequestId: 104,
+    sourceCommit: "a".repeat(40),
+    sourceRef: "feature",
+    targetRef: "main",
+    active: true,
+    draft: false,
+    author: "Ada",
+    title: "Widening PR",
+  };
+  const summary: CapabilitySummary = {
+    schemaVersion: 1,
+    requestId: "r-describe",
+    operation: "capability-summary",
+    role,
+    dispatchDraftId: "22222222-2222-4222-8222-222222222222",
+    repositoryIdentity,
+    prSnapshot,
+    capabilityPolicyDigest: "b".repeat(64),
+    prStateFingerprint: "c".repeat(64),
+    capabilities: [],
+    mandatoryDenies: [capability],
+    dynamicConstraints: [],
+    absoluteDenies: [],
+    allowedManualCapabilities: [],
+    delegableAvailable: options.delegableAvailable ?? [capability],
+    provenance: {},
+    killSwitchActive: options.killSwitchActive ?? false,
+    killSwitchExpiresAtUtc: null,
+    editingAvailable: true,
+  };
+  const accepted: DispatchAccepted = {
+    schemaVersion: 1,
+    requestId: "r-accept",
+    operation: "accepted",
+    dispatchId: "44444444-4444-4444-8444-444444444444",
+    repositoryIdentity,
+    pullRequestId: 104,
+    role,
+    capabilityPolicyDigest: "d".repeat(64),
+    prStateFingerprint: summary.prStateFingerprint,
+    childProcessId: 42,
+    eventLogPath: "Q:\\events\\widening.jsonl",
+  };
+  const broker: DispatchBroker = {
+    describe: async () => { calls.push("describe"); return summary; },
+    profile: async () => { throw new Error("not called"); },
+    previewNarrowing: async () => { throw new Error("not called"); },
+    applyNarrowing: async () => { throw new Error("not called"); },
+    setKillSwitch: async () => { throw new Error("not called"); },
+    describeWidening: async (s, cap): Promise<WideningPreview> => {
+      calls.push(`describe-widening:${cap}`);
+      if (options.describeWideningRejection) {
+        throw new BrokerRejectionError(options.describeWideningRejection.code, options.describeWideningRejection.detail ?? "");
+      }
+      generation += 1;
+      return {
+        schemaVersion: 1,
+        requestId: `w-${generation}`,
+        operation: "widening-preview",
+        state: "previewed",
+        dispatchDraftId: s.dispatchDraftId,
+        capability: cap,
+        challenge: "a".repeat(48),
+        effectiveDiff: { addedCapabilities: [cap], removedDenies: [cap], pairedCapability, pairedCapabilityActive },
+        expiresAtUtc: "2026-09-03T18:00:00Z",
+        generation,
+      };
+    },
+    confirmWideningPreview: async (s, stage): Promise<WideningSummary> => {
+      calls.push("confirm-widening-preview");
+      generation += 1;
+      return {
+        schemaVersion: 1,
+        requestId: `w-${generation}`,
+        operation: "widening-summary",
+        state: "awaiting-final-confirmation",
+        dispatchDraftId: s.dispatchDraftId,
+        capability: stage.capability,
+        challenge: "b".repeat(48),
+        effectiveDiff: stage.effectiveDiff,
+        expiresAtUtc: "2026-09-03T18:01:00Z",
+        generation,
+      };
+    },
+    confirmWideningMint: async (s, stage): Promise<WideningMinted> => {
+      calls.push("confirm-widening-mint");
+      generation += 1;
+      return {
+        schemaVersion: 1,
+        requestId: `w-${generation}`,
+        operation: "widening-minted",
+        state: "minted",
+        dispatchDraftId: s.dispatchDraftId,
+        capability: stage.capability,
+        capabilities: [...summary.capabilities, stage.capability],
+        mandatoryDenies: summary.mandatoryDenies.filter((deny) => deny !== stage.capability),
+        capabilityPolicyDigest: "d".repeat(64),
+        effectiveDiff: stage.effectiveDiff,
+        grantExpiresAtUtc: "2026-09-03T18:10:00Z",
+        generation,
+      };
+    },
+    cancelWidening: async (s, requestedGeneration): Promise<WideningCancelled> => {
+      calls.push(`cancel-widening:${requestedGeneration}`);
+      generation += 1;
+      return {
+        schemaVersion: 1,
+        requestId: `w-${generation}`,
+        operation: "widening-cancelled",
+        state: "cancelled",
+        dispatchDraftId: s.dispatchDraftId,
+        capabilities: summary.capabilities,
+        mandatoryDenies: summary.mandatoryDenies,
+        capabilityPolicyDigest: summary.capabilityPolicyDigest,
+        delegableAvailable: summary.delegableAvailable,
+        generation,
+      };
+    },
+    dispatch: async (describedSummary) => {
+      calls.push("dispatch");
+      dispatchedSummaries.push(describedSummary);
+      return accepted;
+    },
+    cancel: async () => { throw new Error("not called"); },
+    shutdown: async () => { calls.push("shutdown"); },
+    subscribeTerminal: () => () => {},
+  };
+  return { broker, calls, dispatchedSummaries };
+}
+
+async function openManualAndDescribe(setup: TestRendererSetup, role: AgentRole = "reviewer"): Promise<void> {
+  setup.mockInput.pressKey("f");
+  await setup.flush();
+  setup.mockInput.pressKey("m");
+  await setup.flush();
+  if (role === "review-handler") {
+    setup.mockInput.pressTab();
+    await setup.flush();
+  }
+  setup.mockInput.pressKey("d", { ctrl: true });
+  await setup.flush();
+}
+
+test("manual dispatch widening: reviewer mints EnableApprovalVote via two explicit confirms, shows the paired EnableFindingComments requirement, never auto-dispatches, and the existing d/y gate dispatches the minted digest", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls, dispatchedSummaries } = createWideningBrokerFixture({ role: "reviewer" });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    await openManualAndDescribe(setup);
+    assert.match(setup.captureCharFrame(), /force fresh analysis/);
+    assert.match(setup.captureCharFrame(), /Press w to request EnableApprovalVote widening/);
+
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    assert.deepEqual(calls, ["describe", "describe-widening:EnableApprovalVote"]);
+    assert.match(setup.captureCharFrame(), /Widening preview: EnableApprovalVote/);
+    assert.match(setup.captureCharFrame(), /Paired requirement: EnableFindingComments must already be active \(confirmed active\)/);
+    assert.match(setup.captureCharFrame(), /unexplained verdict/);
+    assert.match(setup.captureCharFrame(), /First widening confirmation: press c/);
+
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    assert.equal(calls.at(-1), "confirm-widening-preview");
+    assert.match(setup.captureCharFrame(), /Final widening blast radius: EnableApprovalVote/);
+    assert.match(setup.captureCharFrame(), /Single-use grant; expires/);
+    assert.match(setup.captureCharFrame(), /Unavailable to headless\/direct\/watcher dispatch/);
+    assert.match(setup.captureCharFrame(), /FINAL WIDENING CONFIRMATION: press y/);
+
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.equal(calls.at(-1), "confirm-widening-mint");
+    assert.equal(calls.includes("dispatch"), false, "minting must never auto-dispatch");
+    assert.match(setup.captureCharFrame(), /Widening grant minted and active for this draft/);
+    assert.match(setup.captureCharFrame(), /vote-grant dispatch: skips forced fresh analysis/);
+    assert.match(setup.captureCharFrame(), /Enabled: EnableApprovalVote/);
+
+    // Existing, unmodified dispatch confirmation gate -- 'd' then 'y' -- is what finally dispatches.
+    setup.mockInput.pressKey("d");
+    await setup.flush();
+    assert.equal(calls.includes("dispatch"), false);
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.deepEqual(calls.slice(-1), ["dispatch"]);
+    assert.equal(dispatchedSummaries.length, 1);
+    assert.equal(dispatchedSummaries[0]?.capabilityPolicyDigest, "d".repeat(64));
+    assert.deepEqual(dispatchedSummaries[0]?.capabilities, ["EnableApprovalVote"]);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("manual dispatch widening: Esc during preview and during the final summary each cancel widening with the current generation and never dispatch", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls } = createWideningBrokerFixture({ role: "reviewer" });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    await openManualAndDescribe(setup);
+
+    // Cancel at the first widening stage (preview).
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.deepEqual(calls, ["describe", "describe-widening:EnableApprovalVote", "cancel-widening:1"]);
+    assert.match(setup.captureCharFrame(), /Widening cancelled/);
+    assert.match(setup.captureCharFrame(), /Press w to request EnableApprovalVote widening/);
+
+    // Cancel again, this time at the final summary stage, after a fresh describe-widening.
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.deepEqual(calls.slice(-3), ["describe-widening:EnableApprovalVote", "confirm-widening-preview", "cancel-widening:4"]);
+    assert.match(setup.captureCharFrame(), /Widening cancelled/);
+    assert.equal(calls.includes("confirm-widening-mint"), false);
+    assert.equal(calls.includes("dispatch"), false);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("manual dispatch widening: empty delegableAvailable and an active kill switch both block the widening entry point in the UI", async (context) => {
+  const fixture1 = createFixture();
+  const history1 = createSettingsHistory();
+  const { broker: emptyBroker, calls: emptyCalls } = createWideningBrokerFixture({ delegableAvailable: [] });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture1.reducer} history={history1} tailer={fixture1.tailer} broker={emptyBroker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    await openManualAndDescribe(setup);
+    assert.match(setup.captureCharFrame(), /No delegated capabilities available for this role/);
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    assert.equal(emptyCalls.includes("describe-widening:EnableApprovalVote"), false);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture1.tailer.stop();
+  }
+
+  const fixture2 = createFixture();
+  const history2 = createSettingsHistory();
+  const { broker: killSwitchBroker, calls: killSwitchCalls } = createWideningBrokerFixture({ killSwitchActive: true });
+  let setup2: TestRendererSetup | undefined;
+  try {
+    setup2 = await testRender(() => <App reducer={fixture2.reducer} history={history2} tailer={fixture2.tailer} broker={killSwitchBroker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup2.renderOnce();
+    await openManualAndDescribe(setup2);
+    assert.match(setup2.captureCharFrame(), /Widening unavailable while the kill switch is active/);
+    setup2.mockInput.pressKey("w");
+    await setup2.flush();
+    assert.equal(killSwitchCalls.includes("describe-widening:EnableApprovalVote"), false);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup2?.renderer.destroy();
+    await fixture2.tailer.stop();
+  }
+});
+
+test("manual dispatch widening: a rejected describe-widening is terminal (no auto-retry) and surfaces the broker's message; review-handler grants its own EnableAutoComplete capability", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls } = createWideningBrokerFixture({
+    role: "review-handler",
+    describeWideningRejection: { code: "widening-expired", detail: "" },
+  });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    await openManualAndDescribe(setup, "review-handler");
+    assert.match(setup.captureCharFrame(), /Role: HANDLER/);
+    assert.match(setup.captureCharFrame(), /Press w to request EnableAutoComplete widening/);
+
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    assert.deepEqual(calls, ["describe", "describe-widening:EnableAutoComplete"]);
+    assert.match(setup.captureCharFrame(), /widening confirmation expired; request widening again/);
+    // Terminal, not auto-retried: the hint to press w again is back, and no further
+    // describe-widening call has been made without an explicit fresh keypress.
+    assert.match(setup.captureCharFrame(), /Press w to request EnableAutoComplete widening/);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(calls, ["describe", "describe-widening:EnableAutoComplete"]);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
+test("manual dispatch widening: closing the panel with a minted-but-undispatched grant best-effort cancels it", async (context) => {
+  const fixture = createFixture();
+  const history = createSettingsHistory();
+  const { broker, calls } = createWideningBrokerFixture({ role: "reviewer" });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} broker={broker} />, {
+      width: 140, height: 32, kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    await openManualAndDescribe(setup);
+    setup.mockInput.pressKey("w");
+    await setup.flush();
+    setup.mockInput.pressKey("c");
+    await setup.flush();
+    setup.mockInput.pressKey("y");
+    await setup.flush();
+    assert.equal(calls.includes("dispatch"), false);
+    assert.equal(calls.includes("cancel-widening:3"), false);
+
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /MANUAL DISPATCH/);
+    assert.ok(calls.includes("cancel-widening:3"), "closing with a minted grant must best-effort cancel it");
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
     await fixture.tailer.stop();
   }
 });
