@@ -11,6 +11,8 @@ Describe 'dispatch protocol primitives' {
     It 'emits deterministic canonical JSON and separate digests' {
         ConvertTo-AgentCanonicalJson ([ordered]@{ z = 2; a = @($true, $null, 'x') }) |
             Should -BeExactly '{"a":[true,null,"x"],"z":2}'
+        ConvertTo-AgentCanonicalJson ([ordered]@{ capabilities = [object[]]@() }) |
+            Should -BeExactly '{"capabilities":[]}'
         Get-AgentCanonicalDigest @{ role = 'reviewer'; source = 'a' } |
             Should -Not -Be (Get-AgentCanonicalDigest @{ role = 'reviewer'; source = 'b' })
     }
@@ -32,6 +34,7 @@ Describe 'dispatch protocol primitives' {
     It 'keeps one protocol writer and requires versioned draft binding' {
         $source = Get-Content -LiteralPath $brokerPath -Raw
         ([regex]::Matches($source, 'function Write-DispatchProtocolMessage')).Count | Should -Be 1
+        $source | Should -Match '\[AllowEmptyCollection\(\)\]\[string\[\]\]\$AbsoluteDenies'
         $source | Should -Match 'dispatchDraftId'
         $source | Should -Match 'DraftLifetimeSeconds'
         $source | Should -Match 'capabilityPolicyDigest'

@@ -357,7 +357,7 @@ function Get-BrokerNarrowingEffect {
     param(
         [Parameter(Mandatory)][hashtable]$RoleDescriptor,
         [Parameter(Mandatory)][string[]]$AllowedManualCapabilities,
-        [Parameter(Mandatory)][string[]]$AbsoluteDenies,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$AbsoluteDenies,
         [Parameter(Mandatory)][hashtable]$Override
     )
     $mandatoryDeniesBase = @($RoleDescriptor.mandatoryDenies | Sort-Object -Unique)

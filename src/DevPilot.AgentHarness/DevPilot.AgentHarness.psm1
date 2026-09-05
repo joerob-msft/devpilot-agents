@@ -4308,7 +4308,12 @@ function ConvertTo-AgentCanonicalJson {
                 @($Value.PSObject.Properties.Name)
             }
             $entries = foreach ($key in @($keys | Sort-Object -CaseSensitive)) {
-                $item = if ($Value -is [System.Collections.IDictionary]) { $Value[$key] } else { $Value.PSObject.Properties[$key].Value }
+                if ($Value -is [System.Collections.IDictionary]) {
+                    $item = $Value[$key]
+                }
+                else {
+                    $item = $Value.PSObject.Properties[$key].Value
+                }
                 '{0}:{1}' -f (ConvertTo-Json -InputObject $key -Compress), (ConvertValue $item)
             }
             return '{' + ($entries -join ',') + '}'
