@@ -2079,6 +2079,15 @@ function Assert-AgentManualDispatchEarlyContext {
         accompanying broker attestation, or a manifest that does not even exist) before the caller
         spends any provider/network cost; the full cryptographic challenge-response happens later,
         in Enter-AgentManualDispatchStartup, immediately before the ready/proceed handshake.
+
+        issue #105 PR5 (broker-issuer anchor): the checks above only reject the ABSENCE of an
+        attestation handle -- they say nothing about whether the handle actually came from a real
+        broker. A same-user caller can mint their own anonymous pipe, point
+        DEVPILOT_BROKER_ATTESTATION_HANDLE at it, and write any bytes they like; the deep HMAC
+        proof in Enter-AgentManualDispatchStartup would only catch that much later, after
+        provider/network setup already ran. Assert-AgentBrokerProcessAnchor closes that gap here,
+        before any of that cost is spent, by independently verifying this process's real OS parent
+        against the manifest's own broker-origin claims.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$ManifestPath)
     if (-not $ManifestPath) { return }
@@ -2088,6 +2097,219 @@ function Assert-AgentManualDispatchEarlyContext {
     if ([string]::IsNullOrEmpty($env:DEVPILOT_BROKER_ATTESTATION_HANDLE)) {
         throw '[broker-attestation-missing] This process was not launched with a broker attestation handle; manual dispatch requires launch by the trusted broker.'
     }
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
+    Assert-AgentBrokerProcessAnchor -Manifest $manifest
+}
+
+function ConvertFrom-AgentProcStatPpid {
+    <#
+        Pure, OS-independent parser for a Linux /proc/<pid>/stat line's ppid field (issue #105
+        PR5 broker-issuer anchor). Factored out of Get-AgentImmediateParentProcessId so its exact
+        field-index parsing (identical convention to Get-AgentProcessStartIdentity's starttime
+        field) can be unit-tested from a static fixture string on any host, including a non-Linux
+        development/CI machine that can never read a real /proc file. Strict integer parsing --
+        any unexpected shape is a hard failure, never a silent default.
+    #>
+    param([Parameter(Mandatory)][string]$StatText)
+    $nameEnd = $StatText.LastIndexOf(')')
+    if ($nameEnd -lt 0) { throw 'Malformed procfs stat text: no comm field terminator.' }
+    $fields = @($StatText.Substring($nameEnd + 1).Trim() -split '\s+')
+    if ($fields.Count -le 1 -or $fields[1] -notmatch '^\d+$') {
+        throw 'Malformed procfs stat text: ppid field is not a plain integer.'
+    }
+    return [int]$fields[1]
+}
+
+function Get-AgentImmediateParentProcessId {
+    <#
+        Cross-platform "who is my real OS parent right now" probe (issue #105 PR5 broker-issuer
+        anchor). Used ONLY to bind a manual-dispatch child to the process the operating system
+        itself recorded as having created it -- never anything a manifest, environment variable,
+        or named pipe could claim. Strict integer parsing throughout; any unexpected shape is a
+        hard failure, never a silent zero/self default.
+    #>
+    [CmdletBinding()]
+    param([ValidateRange(1, [int]::MaxValue)][int]$ProcessId = $PID)
+    if ($IsWindows) {
+        $info = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" `
+            -Property ParentProcessId -ErrorAction Stop
+        if (-not $info -or [string]$info.ParentProcessId -notmatch '^\d+$') {
+            throw "Could not determine the parent process id for process $ProcessId."
+        }
+        return [int]$info.ParentProcessId
+    }
+    if ($IsLinux) {
+        return ConvertFrom-AgentProcStatPpid -StatText ([IO.File]::ReadAllText("/proc/$ProcessId/stat"))
+    }
+    # POSIX fallback (e.g. macOS) with no /proc: a single, strictly-parsed ps(1) column.
+    $psOutput = & ps -o ppid= -p $ProcessId 2>$null
+    $trimmed = if ($psOutput) { (@($psOutput)[0]).ToString().Trim() } else { '' }
+    if ($trimmed -notmatch '^\d+$') {
+        throw "Could not determine the parent process id for process $ProcessId via ps."
+    }
+    return [int]$trimmed
+}
+
+function Get-AgentProcessCommandLine {
+    <#
+        Cross-platform "what is this process actually running" probe (issue #105 PR5
+        broker-issuer anchor). Companion to Get-AgentImmediateParentProcessId: knowing a live
+        process's PID matches a manifest's claim is not enough on its own -- an ordinary caller's
+        own shell IS, truthfully, its own parent. This additionally requires that parent's command
+        line to actually name the one fixed, trusted broker script path; an ordinary shell/launcher
+        was never started that way.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$ProcessId)
+    if ($IsWindows) {
+        $info = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" `
+            -Property CommandLine -ErrorAction Stop
+        if (-not $info) { throw "Process $ProcessId was not found." }
+        return [string]$info.CommandLine
+    }
+    if ($IsLinux) {
+        $bytes = [IO.File]::ReadAllBytes("/proc/$ProcessId/cmdline")
+        return (([Text.Encoding]::UTF8.GetString($bytes)) -split "`0" | Where-Object { $_ -ne '' }) -join ' '
+    }
+    return [string](& ps -o command= -p $ProcessId 2>$null)
+}
+
+function Assert-AgentBrokerProcessAnchor {
+    <#
+        issue #105 PR5 (broker-issuer anchor): the anonymous-pipe/HMAC attestation
+        (New-AgentBrokerAttestationSecret / Receive-AgentBrokerAttestationSecret /
+        Get-AgentAttestationProof) proves the child can read a secret handed down through an
+        OS-inherited handle -- but a same-user caller can mint an anonymous pipe of their own,
+        set DEVPILOT_BROKER_ATTESTATION_HANDLE to it, and write any bytes they like into it
+        themselves; nothing in that handshake alone proves the handle came from a real broker.
+
+        This closes that gap independently of anything the manifest merely claims about itself:
+        - this process's REAL immediate OS parent (Get-AgentImmediateParentProcessId), never
+          trusted from the manifest;
+        - that live parent's own start-time identity (Get-AgentProcessStartIdentity), guarding
+          against PID reuse;
+        - that live parent's own command line (Get-AgentProcessCommandLine), which must actually
+          name the one fixed, trusted broker script path this function derives independently from
+          its own module location -- an ordinary shell/launcher was never started that way, so a
+          caller who merely knows and reports their own true PID/start-time still fails here;
+        - the pinned, owner-private broker descriptor, read from its own trusted, exact-bound
+          location (Resolve-AgentTrustedRoot/Assert-AgentTrustedFile -- the same helpers the
+          broker itself uses on its own descriptor at startup), never trusted from the manifest's
+          content, only from its path once that path is proven to resolve to the one trusted spot;
+        - the fixed, trusted broker script's own live content hash, recomputed here directly from
+          disk, never trusted from the manifest.
+
+        Every manifest-declared value is a SELECTION checked against one of the independently
+        derived facts above; none of them is ever an authority on its own (ANT-2).
+
+        ANTI-MISTAKE BOUNDARY (do not oversell this): this defeats the cheap, ordinary mistake of
+        a hand-crafted manifest/env-var/named-pipe with no real broker involved, because an
+        ordinary direct/headless caller's real parent process is their own shell/launcher, which
+        is never running the pinned broker script. It is NOT a defense against a deliberate,
+        privileged, same-user attacker who can inject into or masquerade as the broker process,
+        patch this module in memory, or otherwise forge the OS-level parent/PID/ACL primitives
+        this check itself relies on -- that class of attacker is explicitly out of scope.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Manifest)
+
+    $role = [string]$Manifest['role']
+    if ($role -cnotin @('reviewer', 'review-handler')) {
+        throw '[broker-attestation-invalid] Manual dispatch manifest role is malformed.'
+    }
+    $claimedBrokerPid = [int](Get-AgentHashtableMemberOrNull -Table $Manifest -Name 'brokerProcessId')
+    $claimedBrokerStartIdentity = [string](Get-AgentHashtableMemberOrNull -Table $Manifest -Name 'brokerProcessStartIdentity')
+    $claimedDescriptorPath = [string](Get-AgentHashtableMemberOrNull -Table $Manifest -Name 'brokerDescriptorPath')
+    $claimedDescriptorDigest = [string](Get-AgentHashtableMemberOrNull -Table $Manifest -Name 'brokerDescriptorDigest')
+    $claimedBrokerScriptSha256 = [string](Get-AgentHashtableMemberOrNull -Table $Manifest -Name 'brokerScriptSha256')
+    if ($claimedBrokerPid -le 0 -or [string]::IsNullOrEmpty($claimedBrokerStartIdentity) -or
+        [string]::IsNullOrEmpty($claimedDescriptorPath) -or $claimedDescriptorDigest -notmatch '^[0-9a-f]{64}$' -or
+        $claimedBrokerScriptSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw '[broker-attestation-invalid] Manual dispatch manifest is missing broker-origin identity fields.'
+    }
+
+    $toolkitRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+    $expectedBrokerScript = [IO.Path]::GetFullPath((Join-Path (Join-Path $toolkitRoot 'tools') 'Invoke-DevPilotAgentDispatch.ps1'))
+    # Deliberately NOT Assert-AgentTrustedFile here: that helper's Windows-ACL/Unix-owner tier
+    # exists to gate a runtime-created, owner-private SECRET (the descriptor, checked below) --
+    # it is the wrong tool for an ordinary checked-in repository file, which routinely has
+    # broader read (and on some shared/team checkouts, even write) permissions for other local
+    # principals without that meaning anything about content integrity. $expectedBrokerScript is
+    # already the ONE fixed path this function itself derives (never anything the manifest
+    # supplies), so only reject a symlink swap and then let the SHA-256 content hash below -- the
+    # actual integrity control here -- do the real work.
+    Assert-AgentPathHasNoLinks -Path $expectedBrokerScript
+    if (-not (Test-Path -LiteralPath $expectedBrokerScript -PathType Leaf)) {
+        throw '[broker-attestation-invalid] The pinned broker script does not exist.'
+    }
+    $liveBrokerScriptSha256 = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($expectedBrokerScript))).ToLowerInvariant()
+    if ($claimedBrokerScriptSha256 -cne $liveBrokerScriptSha256) {
+        throw '[broker-attestation-invalid] Broker script content hash does not match the pinned broker executable.'
+    }
+
+    # Independently obtain THIS process's real immediate OS parent -- never trusted from the
+    # manifest, an env var, or a named pipe. Only the operating system itself decides who created
+    # this process.
+    $liveParentPid = Get-AgentImmediateParentProcessId -ProcessId $PID
+    if ($liveParentPid -ne $claimedBrokerPid) {
+        throw '[broker-attestation-invalid] This process was not directly spawned by the broker process named in its own dispatch manifest.'
+    }
+    $liveParentProcess = $null
+    try { $liveParentProcess = Get-Process -Id $liveParentPid -ErrorAction Stop }
+    catch { throw '[broker-attestation-invalid] The claimed broker parent process is no longer running.' }
+    if ((Get-AgentProcessStartIdentity -Process $liveParentProcess) -cne $claimedBrokerStartIdentity) {
+        throw '[broker-attestation-invalid] The claimed broker parent process identity does not match its live start time (possible PID reuse).'
+    }
+    # The live parent being SOME process with a matching PID/start-time is not enough -- an
+    # ordinary caller's own shell truthfully IS its own parent. Require that parent to actually be
+    # running the pinned broker script; a caller who merely reports the truth about their own
+    # shell still fails here.
+    $liveParentCommandLine = Get-AgentProcessCommandLine -ProcessId $liveParentPid
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    if ([string]::IsNullOrEmpty($liveParentCommandLine) -or
+        $liveParentCommandLine.IndexOf($expectedBrokerScript, $comparison) -lt 0) {
+        throw '[broker-attestation-invalid] The claimed broker parent process is not running the pinned broker script.'
+    }
+
+    # Independently read the pinned, owner-private broker descriptor from its own trusted,
+    # exact-bound location -- the manifest's claimed path is only ever accepted if it resolves to
+    # that exact trusted location; the descriptor's own CONTENT is never trusted from the
+    # manifest, only its digest is compared against what the manifest claims.
+    $descriptorFullPath = [IO.Path]::GetFullPath($claimedDescriptorPath)
+    $descriptorParent = Split-Path $descriptorFullPath -Parent
+    $trustedDescriptorRoot = Resolve-AgentTrustedRoot -Path $descriptorParent -Kind watch-state -RepositoryRoot $toolkitRoot
+    $descriptorFullPath = Assert-AgentTrustedFile -Path $descriptorFullPath -AllowedRoot $trustedDescriptorRoot `
+        -ExpectedPath (Join-Path $trustedDescriptorRoot 'broker.descriptor.v1.json') -Private
+    $descriptor = Get-Content -LiteralPath $descriptorFullPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
+    if ([int]$descriptor['schemaVersion'] -ne 1 -or [int]$descriptor['ownerProcessId'] -le 0) {
+        throw '[broker-attestation-invalid] Trusted broker descriptor is malformed.'
+    }
+    if (-not ($descriptor['roles'] -is [Collections.IDictionary]) -or -not $descriptor['roles'].Contains($role)) {
+        throw "[broker-attestation-invalid] Trusted broker descriptor does not authorize role '$role'."
+    }
+    $expectedRoleScripts = @{
+        reviewer = Join-Path $toolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
+        'review-handler' = Join-Path $toolkitRoot 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1'
+    }
+    $roleScriptPath = [string]$descriptor['roles'][$role]['scriptPath']
+    [void](Assert-AgentTrustedFile -Path ([IO.Path]::GetFullPath($roleScriptPath)) `
+        -AllowedRoot $toolkitRoot -ExpectedPath $expectedRoleScripts[$role])
+    # Digested BEFORE any of the per-role mutation the broker itself applies to its own in-memory
+    # copy of this same descriptor -- the broker computes its manifest-bound digest the same way,
+    # from the freshly-parsed, unmutated hashtable, so the two always agree bit-for-bit.
+    $liveDescriptorDigest = Get-AgentCanonicalDigest -InputObject $descriptor
+    if ($liveDescriptorDigest -cne $claimedDescriptorDigest) {
+        throw '[broker-attestation-invalid] Dispatch manifest broker descriptor digest does not match the live trusted descriptor.'
+    }
+}
+
+function Get-AgentHashtableMemberOrNull {
+    param([Parameter(Mandatory)][hashtable]$Table, [Parameter(Mandatory)][string]$Name)
+    if ($Table.Contains($Name) -and $null -ne $Table[$Name]) { return $Table[$Name] }
+    return $null
 }
 
 function Test-AgentAutoCompleteGrantWouldBeNoOp {
@@ -6017,6 +6239,10 @@ Export-ModuleMember -Function @(
     "Get-AgentAttestationProof",
     "Receive-AgentBrokerAttestationSecret",
     "Assert-AgentManualDispatchEarlyContext",
+    "ConvertFrom-AgentProcStatPpid",
+    "Get-AgentImmediateParentProcessId",
+    "Get-AgentProcessCommandLine",
+    "Assert-AgentBrokerProcessAnchor",
      "Get-AgentDefaultCapabilityOverrideKillSwitchRoot",
      "Test-AgentCapabilityOverrideKillSwitch",
      "Enable-AgentCapabilityOverrideKillSwitch",

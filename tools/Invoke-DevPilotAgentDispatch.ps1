@@ -24,6 +24,17 @@ $descriptor = Get-Content -LiteralPath $descriptorFullPath -Raw -Encoding UTF8 |
 if ([int]$descriptor.schemaVersion -ne 1 -or [int]$descriptor.ownerProcessId -le 0) {
     throw 'Broker descriptor is malformed.'
 }
+# issue #105 PR5 (broker-issuer anchor): captured from the freshly-parsed, unmutated descriptor
+# hashtable, BEFORE the per-role loop below rewrites roleDescriptor.scriptPath/configFile in
+# place -- Assert-AgentBrokerProcessAnchor (child side) parses the same on-disk file the same way
+# and must land on the identical digest. Also pins this broker's own live process identity and
+# the content hash of the exact script currently running, both independent of anything a request
+# supplies, so every per-dispatch manifest can carry a value the child can verify without ever
+# trusting the manifest itself.
+$descriptorDigest = Get-AgentCanonicalDigest -InputObject $descriptor
+$brokerProcessStartIdentity = Get-AgentProcessStartIdentity -Process (Get-Process -Id $PID)
+$brokerScriptSha256 = [Convert]::ToHexString(
+    [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($PSCommandPath))).ToLowerInvariant()
 $stateRoot = [IO.Path]::GetFullPath([string]$descriptor.stateRoot)
 $durableRoot = [IO.Path]::GetFullPath([string]$descriptor.durableStateRoot)
 $leaseRoot = [IO.Path]::GetFullPath([string]$descriptor.leaseRoot)
@@ -1280,6 +1291,13 @@ function Invoke-Dispatch {
         cancellationNonce = $cancellationNonce
         cancellationRequestPath = (Join-Path $draft.Snapshot.RuntimeRoot 'cancel.requested.json')
         cancellationAcknowledgementPath = (Join-Path $draft.Snapshot.RuntimeRoot 'cancel.acknowledged.json')
+        # issue #105 PR5 (broker-issuer anchor): every value below is derived from THIS broker's
+        # own live process/trusted descriptor -- computed once at script startup, never from
+        # $Request/$draft -- so Assert-AgentBrokerProcessAnchor (child side) can bind this exact
+        # dispatch to a real, verified broker ancestor instead of trusting the manifest alone.
+        brokerProcessId = $PID; brokerProcessStartIdentity = $brokerProcessStartIdentity
+        brokerDescriptorPath = $descriptorFullPath; brokerDescriptorDigest = $descriptorDigest
+        brokerScriptSha256 = $brokerScriptSha256
     }
     [IO.File]::WriteAllText($manifestPath, (ConvertTo-AgentCanonicalJson $manifest), [Text.UTF8Encoding]::new($false))
     # issue #105 PR4 requirement 6: -ForceAnalysis is omitted ONLY for a reviewer's valid
@@ -1301,18 +1319,35 @@ function Invoke-Dispatch {
         $args += "-$capability"
     }
     $diagnostics = Join-Path $draft.Snapshot.Root 'diagnostics'
-    $child = New-AgentRedirectedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList $args `
-        -StandardOutputPath (Join-Path $diagnostics 'stdout.log') -StandardErrorPath (Join-Path $diagnostics 'stderr.log') `
-        -WorkingDirectory $toolkitRoot `
-        -AdditionalEnvironmentVariables @{ DEVPILOT_BROKER_ATTESTATION_HANDLE = $attestationPipe.GetClientHandleAsString() }
-    # The broker's own copy of the CLIENT-side handle must be released immediately once it has been
-    # duplicated into the child at process-creation time -- and only a process the OS itself handed
-    # this exact inherited handle to can ever open it; a forged manifest plus a same-named fake pipe
-    # can never obtain it. The secret is written once, right away, so the child can read it as soon
-    # as it reaches Receive-AgentBrokerAttestationSecret.
-    $attestationPipe.DisposeLocalCopyOfClientHandle()
-    $attestationPipe.Write($attestationSecret, 0, $attestationSecret.Length)
-    $attestationPipe.Flush()
+    # issue #105 PR5 requirement 7: everything from child creation through the pipe write/flush is
+    # its own try/catch so a failure ANYWHERE in this sequence (e.g. the child executable fails to
+    # start, or the pipe write fails because the child never even reached the point of inheriting
+    # the handle) still disposes attestationPipe and clears attestationSecret -- previously a
+    # failure here left both leaked until process exit (known limitation, now closed): neither was
+    # covered by the try/finally that only starts below, once the child is already known to exist.
+    $child = $null
+    try {
+        $child = New-AgentRedirectedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList $args `
+            -StandardOutputPath (Join-Path $diagnostics 'stdout.log') -StandardErrorPath (Join-Path $diagnostics 'stderr.log') `
+            -WorkingDirectory $toolkitRoot `
+            -AdditionalEnvironmentVariables @{ DEVPILOT_BROKER_ATTESTATION_HANDLE = $attestationPipe.GetClientHandleAsString() }
+        # The broker's own copy of the CLIENT-side handle must be released immediately once it has
+        # been duplicated into the child at process-creation time -- and only a process the OS
+        # itself handed this exact inherited handle to can ever open it; a forged manifest plus a
+        # same-named fake pipe can never obtain it. The secret is written once, right away, so the
+        # child can read it as soon as it reaches Receive-AgentBrokerAttestationSecret.
+        $attestationPipe.DisposeLocalCopyOfClientHandle()
+        $attestationPipe.Write($attestationSecret, 0, $attestationSecret.Length)
+        $attestationPipe.Flush()
+    }
+    catch {
+        $attestationPipe.Dispose()
+        [Array]::Clear($attestationSecret, 0, $attestationSecret.Length)
+        if ($child) { Stop-ProcessTree $child.Process; [void]$child.Process.WaitForExit(5000); [void](Complete-AgentRedirectedProcess $child) }
+        if ($grantCapability) { Remove-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot }
+        Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
+        throw
+    }
     $containment = $null
     $completionResult = $null
     try {

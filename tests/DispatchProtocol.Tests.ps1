@@ -970,4 +970,279 @@ Describe 'dispatch protocol primitives' {
             [void](Complete-AgentRedirectedProcess $leader)
         }
     }
+
+    # ------------------------------------------------------------------
+    # issue #105 PR5 (broker-issuer anchor)
+    # ------------------------------------------------------------------
+    # The anonymous-pipe/HMAC attestation alone proves a child can read a secret
+    # handed down an OS-inherited handle -- it never proved the handle actually
+    # came from a real broker. These tests cover, in order: the pure procfs
+    # parser (static fixtures, any host), the two OS-ancestry probes across a
+    # REAL spawned process boundary (not mocked), Assert-AgentBrokerProcessAnchor's
+    # full decision logic (OS-truth probes mocked -- deliberately, and only
+    # those two, since faking "this process's real OS parent is running the one
+    # pinned broker script" for a genuine positive case would otherwise require
+    # actually running the production broker end-to-end through its full
+    # draft/policy/provider pipeline; everything else here -- trusted-root
+    # resolution, descriptor I/O, canonical digesting, script hashing, role-pin
+    # checks -- is completely real, unmocked), and finally a real adversarial
+    # process spawn proving the whole chain rejects a same-user forger who
+    # truthfully reports their own PID/start-time/descriptor/script hash.
+
+    It 'ConvertFrom-AgentProcStatPpid parses a well-formed procfs stat line, including a comm field containing spaces and parentheses' {
+        ConvertFrom-AgentProcStatPpid -StatText '4021 (my (weird) proc) S 4000 4021 4021 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0' |
+            Should -Be 4000
+    }
+
+    It 'ConvertFrom-AgentProcStatPpid throws on a stat line with no comm field terminator' {
+        { ConvertFrom-AgentProcStatPpid -StatText '4021 unterminated S 4000' } | Should -Throw '*comm field terminator*'
+    }
+
+    It 'ConvertFrom-AgentProcStatPpid throws when the ppid field is not a plain integer' {
+        { ConvertFrom-AgentProcStatPpid -StatText '4021 (proc) S notanumber 4021 4021' } |
+            Should -Throw '*ppid field is not a plain integer*'
+    }
+
+    It 'Get-AgentImmediateParentProcessId and Get-AgentProcessCommandLine identify a real spawned parent across a real OS process boundary' {
+        # At minimum: spawn a trusted "broker" harness process that itself spawns
+        # a child verifier, and prove the verifier's independently-derived live
+        # parent PID and command line actually point back at the harness -- the
+        # exact real-OS-fact primitive Assert-AgentBrokerProcessAnchor anchors on.
+        $suiteRoot = Join-Path $TestDrive 'ancestry-integration'
+        New-Item -ItemType Directory -Path $suiteRoot -Force | Out-Null
+        $modulePath = (Resolve-Path "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1").Path
+        $childScriptPath = Join-Path $suiteRoot 'child-verifier.ps1'
+        $harnessScriptPath = Join-Path $suiteRoot 'harness-broker-stand-in.ps1'
+        Set-Content -LiteralPath $childScriptPath -Encoding utf8NoBOM -Value @'
+param([Parameter(Mandatory)][string]$ModulePath, [Parameter(Mandatory)][string]$OutputPath)
+Import-Module $ModulePath -Force
+$parentPid = Get-AgentImmediateParentProcessId
+$parentCommandLine = Get-AgentProcessCommandLine -ProcessId $parentPid
+[IO.File]::WriteAllText($OutputPath, (ConvertTo-Json @{ ParentPid = $parentPid; ParentCommandLine = $parentCommandLine } -Compress))
+'@
+        Set-Content -LiteralPath $harnessScriptPath -Encoding utf8NoBOM -Value @'
+param(
+    [Parameter(Mandatory)][string]$ModulePath,
+    [Parameter(Mandatory)][string]$ChildScriptPath,
+    [Parameter(Mandatory)][string]$OutputPath,
+    [Parameter(Mandatory)][string]$ChildStdOutPath,
+    [Parameter(Mandatory)][string]$ChildStdErrPath,
+    [Parameter(Mandatory)][string]$PwshPath
+)
+Import-Module $ModulePath -Force
+$child = New-AgentRedirectedProcess -FilePath $PwshPath -ArgumentList @(
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $ChildScriptPath,
+    '-ModulePath', $ModulePath, '-OutputPath', $OutputPath
+) -StandardOutputPath $ChildStdOutPath -StandardErrorPath $ChildStdErrPath
+$child.Process.WaitForExit(15000) | Out-Null
+[void](Complete-AgentRedirectedProcess $child)
+'@
+        $resultPath = Join-Path $suiteRoot 'result.json'
+        $childStdOut = Join-Path $suiteRoot 'child.stdout.log'
+        $childStdErr = Join-Path $suiteRoot 'child.stderr.log'
+        $harnessStdOut = Join-Path $suiteRoot 'harness.stdout.log'
+        $harnessStdErr = Join-Path $suiteRoot 'harness.stderr.log'
+        $pwshPath = Resolve-AgentPwshPath
+        $harness = New-AgentRedirectedProcess -FilePath $pwshPath -ArgumentList @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $harnessScriptPath,
+            '-ModulePath', $modulePath, '-ChildScriptPath', $childScriptPath,
+            '-OutputPath', $resultPath, '-ChildStdOutPath', $childStdOut, '-ChildStdErrPath', $childStdErr,
+            '-PwshPath', $pwshPath
+        ) -StandardOutputPath $harnessStdOut -StandardErrorPath $harnessStdErr
+        try {
+            $exited = $harness.Process.WaitForExit(20000)
+            $harnessDiagnostics = if (-not $exited -or -not (Test-Path -LiteralPath $resultPath)) {
+                Complete-AgentRedirectedProcess $harness
+            } else { $null }
+            $exited | Should -BeTrue -Because (
+                "the harness must spawn and wait on its child verifier within budget" +
+                $(if ($harnessDiagnostics) { "; harness stderr: $($harnessDiagnostics.SafeErrorTail)" }))
+            (Test-Path -LiteralPath $resultPath) | Should -BeTrue -Because (
+                "the child verifier must have written its result" +
+                $(if ($harnessDiagnostics) { "; harness stderr: $($harnessDiagnostics.SafeErrorTail)" }))
+            $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+            $result.ParentPid | Should -Be $harness.Process.Id -Because (
+                "the child verifier's real OS parent must be the harness process that spawned it, " +
+                "exactly as a manual-dispatch child's parent must be the broker")
+            $result.ParentCommandLine | Should -Match ([regex]::Escape($harnessScriptPath)) -Because (
+                "the parent's live command line must actually name the script it is running, " +
+                "not merely share its PID")
+        }
+        finally {
+            if (-not $harness.Process.HasExited) { Stop-ProcessTree $harness.Process; [void]$harness.Process.WaitForExit(5000) }
+            [void](Complete-AgentRedirectedProcess $harness)
+        }
+    }
+
+    It 'Assert-AgentBrokerProcessAnchor accepts a manifest whose broker-origin claims all match independently-verified live state' {
+        $repositoryRoot = (Resolve-Path "$PSScriptRoot\..").Path
+        $suiteRoot = Join-Path $TestDrive 'anchor-happy-path'
+        $stateRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'watch') -Kind watch-state `
+            -RepositoryRoot $repositoryRoot -Create
+        $descriptorPath = Join-Path $stateRoot 'broker.descriptor.v1.json'
+        @{ schemaVersion = 1; ownerProcessId = $PID; roles = @{ reviewer = @{ scriptPath = $reviewerPath } } } |
+            ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $descriptorPath -Encoding utf8NoBOM
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($descriptorPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        $liveDescriptor = Get-Content -LiteralPath $descriptorPath -Raw -Encoding UTF8 |
+            ConvertFrom-Json -AsHashtable -Depth 30
+        $descriptorDigest = Get-AgentCanonicalDigest -InputObject $liveDescriptor
+        $brokerScriptSha256 = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($brokerPath))).ToLowerInvariant()
+        InModuleScope DevPilot.AgentHarness -Parameters @{
+            DescriptorPath = $descriptorPath; DescriptorDigest = $descriptorDigest
+            BrokerScriptSha256 = $brokerScriptSha256; BrokerPath = $brokerPath
+        } {
+            param($DescriptorPath, $DescriptorDigest, $BrokerScriptSha256, $BrokerPath)
+            Mock Get-AgentImmediateParentProcessId { 999999 }
+            Mock Get-Process { [Diagnostics.Process]::GetCurrentProcess() } -ParameterFilter { $Id -eq 999999 }
+            Mock Get-AgentProcessStartIdentity { 'utc:123456789' }
+            Mock Get-AgentProcessCommandLine { "pwsh -NoLogo -File `"$BrokerPath`" -DescriptorPath somewhere.json" }
+            $manifest = @{
+                role = 'reviewer'; brokerProcessId = 999999; brokerProcessStartIdentity = 'utc:123456789'
+                brokerDescriptorPath = $DescriptorPath; brokerDescriptorDigest = $DescriptorDigest
+                brokerScriptSha256 = $BrokerScriptSha256
+            }
+            { Assert-AgentBrokerProcessAnchor -Manifest $manifest } | Should -Not -Throw
+        }
+    }
+
+    It 'Assert-AgentBrokerProcessAnchor rejects a wrong parent pid, a stale (PID-reuse) start identity, and a parent not running the pinned broker script' {
+        $repositoryRoot = (Resolve-Path "$PSScriptRoot\..").Path
+        $suiteRoot = Join-Path $TestDrive 'anchor-negative'
+        $stateRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'watch') -Kind watch-state `
+            -RepositoryRoot $repositoryRoot -Create
+        $descriptorPath = Join-Path $stateRoot 'broker.descriptor.v1.json'
+        @{ schemaVersion = 1; ownerProcessId = $PID; roles = @{ reviewer = @{ scriptPath = $reviewerPath } } } |
+            ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $descriptorPath -Encoding utf8NoBOM
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($descriptorPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        $liveDescriptor = Get-Content -LiteralPath $descriptorPath -Raw -Encoding UTF8 |
+            ConvertFrom-Json -AsHashtable -Depth 30
+        $descriptorDigest = Get-AgentCanonicalDigest -InputObject $liveDescriptor
+        $brokerScriptSha256 = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($brokerPath))).ToLowerInvariant()
+        InModuleScope DevPilot.AgentHarness -Parameters @{
+            DescriptorPath = $descriptorPath; DescriptorDigest = $descriptorDigest
+            BrokerScriptSha256 = $brokerScriptSha256; BrokerPath = $brokerPath
+        } {
+            param($DescriptorPath, $DescriptorDigest, $BrokerScriptSha256, $BrokerPath)
+            $baseManifest = {
+                @{
+                    role = 'reviewer'; brokerProcessId = 999999; brokerProcessStartIdentity = 'utc:123456789'
+                    brokerDescriptorPath = $DescriptorPath; brokerDescriptorDigest = $DescriptorDigest
+                    brokerScriptSha256 = $BrokerScriptSha256
+                }
+            }
+
+            Mock Get-AgentImmediateParentProcessId { 111111 }
+            Mock Get-Process { [Diagnostics.Process]::GetCurrentProcess() } -ParameterFilter { $Id -eq 111111 }
+            Mock Get-AgentProcessStartIdentity { 'utc:123456789' }
+            Mock Get-AgentProcessCommandLine { "pwsh -File `"$BrokerPath`"" }
+            { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } |
+                Should -Throw '*not directly spawned by the broker process*'
+
+            Mock Get-AgentImmediateParentProcessId { 999999 }
+            Mock Get-Process { [Diagnostics.Process]::GetCurrentProcess() } -ParameterFilter { $Id -eq 999999 }
+            Mock Get-AgentProcessStartIdentity { 'utc:DIFFERENT' }
+            Mock Get-AgentProcessCommandLine { "pwsh -File `"$BrokerPath`"" }
+            { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } |
+                Should -Throw '*possible PID reuse*'
+
+            Mock Get-AgentProcessStartIdentity { 'utc:123456789' }
+            Mock Get-AgentProcessCommandLine { 'pwsh -NoProfile -Command "Start-Sleep -Seconds 30"' }
+            { Assert-AgentBrokerProcessAnchor -Manifest (& $baseManifest) } |
+                Should -Throw '*not running the pinned broker script*'
+        }
+    }
+
+    It 'Start-ReviewerAgent.ps1 rejects a same-user forger who truthfully reports their own real PID, start time, descriptor, and broker script hash' {
+        # The strongest adversarial case: every claim in the manifest below is
+        # TRUE about the test process itself (it really is the reviewer child's
+        # immediate OS parent; its own start identity really is what it claims;
+        # the descriptor and its digest, and the broker script hash, are all
+        # real, valid, unmodified values). The one thing that cannot be true is
+        # that this test process's own command line names the pinned broker
+        # script -- it is the Pester test runner, not the broker -- so this
+        # must still fail, proving the anchor defeats a forger who reports the
+        # honest truth about everything except which script actually launched
+        # them.
+        $repositoryRoot = (Resolve-Path "$PSScriptRoot\..").Path
+        $suiteRoot = Join-Path $TestDrive 'anchor-adversarial'
+        $stateRoot = Resolve-AgentTrustedRoot -Path (Join-Path $suiteRoot 'watch') -Kind watch-state `
+            -RepositoryRoot $repositoryRoot -Create
+        $descriptorPath = Join-Path $stateRoot 'broker.descriptor.v1.json'
+        @{ schemaVersion = 1; ownerProcessId = $PID; roles = @{ reviewer = @{ scriptPath = $reviewerPath } } } |
+            ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $descriptorPath -Encoding utf8NoBOM
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($descriptorPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        [void](Assert-AgentTrustedFile -Path $descriptorPath -AllowedRoot $stateRoot -ExpectedPath $descriptorPath -Private)
+        $liveDescriptor = Get-Content -LiteralPath $descriptorPath -Raw -Encoding UTF8 |
+            ConvertFrom-Json -AsHashtable -Depth 30
+        $trueDescriptorDigest = Get-AgentCanonicalDigest -InputObject $liveDescriptor
+        $trueBrokerScriptSha256 = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($brokerPath))).ToLowerInvariant()
+        $manifestPath = Join-Path $suiteRoot 'dispatch-manifest.json'
+        @{
+            role = 'reviewer'; brokerProcessId = $PID
+            brokerProcessStartIdentity = (Get-AgentProcessStartIdentity -Process ([Diagnostics.Process]::GetCurrentProcess()))
+            brokerDescriptorPath = $descriptorPath; brokerDescriptorDigest = $trueDescriptorDigest
+            brokerScriptSha256 = $trueBrokerScriptSha256
+        } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
+
+        # Fake, attacker-minted attestation channel: a real anonymous pipe (with
+        # arbitrary bytes) and a real but unrelated named startup pipe -- neither
+        # should even be reached before the anchor check throws.
+        $fakeAttestationPipe = [IO.Pipes.AnonymousPipeServerStream]::new(
+            [IO.Pipes.PipeDirection]::Out, [IO.HandleInheritability]::Inheritable)
+        $fakeNamedPipe = [IO.Pipes.NamedPipeServerStream]::new((New-AgentPipeName),
+            [IO.Pipes.PipeDirection]::InOut, 1, [IO.Pipes.PipeTransmissionMode]::Byte,
+            [IO.Pipes.PipeOptions]::Asynchronous -bor [IO.Pipes.PipeOptions]::CurrentUserOnly)
+        $stdOutPath = Join-Path $suiteRoot 'reviewer.stdout.log'
+        $stdErrPath = Join-Path $suiteRoot 'reviewer.stderr.log'
+        try {
+            $fakeAttestationPipe.Write([byte[]](1..16), 0, 16)
+            $fakeAttestationPipe.Flush()
+            $started = [DateTime]::UtcNow
+            $reviewer = New-AgentRedirectedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList @(
+                '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $reviewerPath,
+                '-ManualDispatchManifest', $manifestPath
+            ) -StandardOutputPath $stdOutPath -StandardErrorPath $stdErrPath `
+                -AdditionalEnvironmentVariables @{ DEVPILOT_BROKER_ATTESTATION_HANDLE = $fakeAttestationPipe.GetClientHandleAsString() }
+            $fakeAttestationPipe.DisposeLocalCopyOfClientHandle()
+            try {
+                $exited = $reviewer.Process.WaitForExit(15000)
+                $elapsed = ([DateTime]::UtcNow - $started).TotalSeconds
+                $completion = Complete-AgentRedirectedProcess $reviewer
+                $exited | Should -BeTrue -Because "a rejected launch must fail fast, not hang; stderr: $($completion.SafeErrorTail)"
+                $reviewer.Process.ExitCode | Should -Not -Be 0
+                $completion.SafeErrorTail | Should -Match '\[broker-attestation-invalid\]'
+                $completion.SafeErrorTail | Should -Match 'not running the pinned broker script'
+                # Before any provider/network setup: those later stages would
+                # need -Organization/-RepositoryName and would emit very
+                # different failures (missing PR provider config, etc.), never
+                # this message, and would not fail in well under the interval
+                # this early guard is designed to short-circuit before.
+                $elapsed | Should -BeLessThan 10
+            }
+            finally {
+                if (-not $reviewer.Process.HasExited) { Stop-ProcessTree $reviewer.Process; [void]$reviewer.Process.WaitForExit(5000) }
+            }
+        }
+        finally {
+            $fakeAttestationPipe.Dispose()
+            $fakeNamedPipe.Dispose()
+        }
+    }
+
+    It 'documents the broker-issuer anchor anti-mistake boundary: an ordinary caller, not a privileged same-user attacker' {
+        $source = Get-Content -LiteralPath (Resolve-Path "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psm1") -Raw
+        $anchorBody = [regex]::Match($source, '(?s)function Assert-AgentBrokerProcessAnchor \{.*?ANTI-MISTAKE BOUNDARY.*?#>').Value
+        $anchorBody | Should -Not -BeNullOrEmpty
+        $anchorBody | Should -Match 'NOT a defense against a deliberate'
+        $anchorBody | Should -Match 'out of scope'
+    }
 }
