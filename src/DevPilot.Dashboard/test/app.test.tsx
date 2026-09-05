@@ -766,6 +766,59 @@ test("empty renderer reports unavailable navigation, attention, URL, and manual 
   }
 });
 
+test("history refresh during filter input updates reordered rows without OpenTUI warnings", async (context) => {
+  const fixture = createFixture();
+  const history = new PullRequestHistoryProjection();
+  for (let index = 1; index <= 29; index++) {
+    history.apply(historyEvent(
+      `900719925474${String(index).padStart(4, "0")}`,
+      100 + index,
+      index,
+      {
+        title: `Retained pull request ${index}`,
+        timestamp: `2026-09-03T00:00:${String(index).padStart(2, "0")}Z`,
+      },
+    ));
+  }
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  let setup: TestRendererSetup | undefined;
+  console.warn = (...values: unknown[]) => {
+    warnings.push(values.map(String).join(" "));
+  };
+  try {
+    setup = await testRender(() => <App reducer={fixture.reducer} history={history} tailer={fixture.tailer} />, {
+      width: 140,
+      height: 32,
+      kittyKeyboard: true,
+    });
+    await setup.renderOnce();
+    setup.mockInput.pressKey("f");
+    await setup.flush();
+    for (let index = 0; index < 28; index++) setup.mockInput.pressArrow("down");
+    await setup.flush();
+    setup.mockInput.pressKey("/");
+    history.apply(historyEvent("9007199254740001", 101, 30, {
+      title: "Matching retained pull request",
+      timestamp: "2026-09-03T00:01:00Z",
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Matching retained pull request/);
+    assert.deepEqual(warnings.filter((warning) => warning.includes("insertBefore")), []);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    console.warn = originalWarn;
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
+});
+
 test("settings overlay reports an explicit unavailable state without a trusted broker", async (context) => {
   const fixture = createFixture();
   let setup: TestRendererSetup | undefined;

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { decideLayout, type LayoutDecision } from "./layout.js";
@@ -306,17 +306,17 @@ function History(props: {
       <Panel title={`PR HISTORY ${props.entries.length}`} width={props.compact ? "100%" : 38} borderColor={COLORS.interactive}>
         <Show when={props.entries.length} fallback={<Empty />}>
           <scrollbox flexGrow={1} scrollY>
-            <For each={props.entries}>
+            <Index each={props.entries}>
               {(entry, index) => (
-                <box height={4} paddingX={1} backgroundColor={index() === props.selected ? COLORS.panelAlt : COLORS.panel}>
-                  <text height={1} fg={index() === props.selected ? COLORS.accent : COLORS.text}>
-                    {index() === props.selected ? "> " : "  "}{entry.repositoryIdentity.repositoryName} PR #{entry.pullRequestId}
+                <box height={4} paddingX={1} backgroundColor={index === props.selected ? COLORS.panelAlt : COLORS.panel}>
+                  <text height={1} fg={index === props.selected ? COLORS.accent : COLORS.text}>
+                    {index === props.selected ? "> " : "  "}{entry().repositoryIdentity.repositoryName} PR #{entry().pullRequestId}
                   </text>
-                  <text height={1} fg={COLORS.text}>{line(entry.title || "title not reported", 32)}</text>
-                  <text height={1} fg={COLORS.muted}>{line(entry.author || "author unknown", 32)}</text>
+                  <text height={1} fg={COLORS.text}>{line(entry().title || "title not reported", 32)}</text>
+                  <text height={1} fg={COLORS.muted}>{line(entry().author || "author unknown", 32)}</text>
                 </box>
               )}
-            </For>
+            </Index>
           </scrollbox>
         </Show>
       </Panel>
