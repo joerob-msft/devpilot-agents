@@ -18166,6 +18166,14 @@ function Invoke-ReviewerBlindedAcquisitionRun {
                 promptSha256 = ([string]$ConventionSpecialistPromptSha256).ToLowerInvariant()
             }
             candidates = @((Get-ReviewerHashValue -Container $rolePassResult -Key 'Candidates' -Default @()))
+            ruleCoverage = $(if ($null -eq $rolePassResult.RuleCoverage) { $null } else {
+                    [ordered]@{
+                        complete = [bool]$rolePassResult.RuleCoverage.Complete
+                        constructsIncomplete = [bool]$rolePassResult.RuleCoverage.ConstructsIncomplete
+                        changedConstructs = @($rolePassResult.RuleCoverage.Constructs)
+                        rows = @($rolePassResult.RuleCoverage.Rows)
+                    }
+                })
         }
     }
     [IO.File]::WriteAllText((Join-Path $outputRoot 'capture-core.json'),

@@ -2503,6 +2503,9 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                     endLine = [int](Get-ReviewerConventionSpecialistValue $_ "endLine" 0)
                     name = [string](Get-ReviewerConventionSpecialistValue $_ "name" "")
                     argumentNaming = [string](Get-ReviewerConventionSpecialistValue $_ "argumentNaming" "")
+                    status = [string](Get-ReviewerConventionSpecialistValue $_ "status" "unknown")
+                    attributes = @((Get-ReviewerConventionSpecialistValue $_ "attributes" @()) |
+                        ForEach-Object { [string]$_ })
                 }
             })
         # A row that the wrapper had to degrade is not a check that happened.

@@ -449,6 +449,12 @@ ledger, never retries without an audited `requeue`, and refuses linked or
 ephemeral toolkit worktrees. See the
 [queue deployment guide](docs/owner-preview.md#hourly-declared-queue).
 
+`tools/Invoke-ApprovedOwnerComment.ps1` is a separate, interactive,
+human-approved command for at most five exact method-level Owner findings from
+one signed completed preview. It is dry-run by default; the hourly queue cannot
+invoke it. Test-class ownership remains advisory-only. See
+[the approval guide](docs/owner-preview.md#human-approved-method-comments).
+
 #### Sealed source transport (layer 8)
 
 **The model is given no working file-read tool. It is given the file's bytes.**
