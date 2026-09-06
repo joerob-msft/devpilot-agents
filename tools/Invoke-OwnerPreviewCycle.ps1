@@ -277,8 +277,8 @@ function New-OwnerPreviewPrepared {
 
     try {
 
-    $sealKeyPath = Get-OwnerPreviewSealKeyPath -Name 'entry'
-    $runSetKeyPath = Get-OwnerPreviewSealKeyPath -Name 'run-set'
+    $sealKeyPath = Get-OwnerPreviewSealKeyPath -Name 'entry' -SealKeyRoot $SealKeyRoot
+    $runSetKeyPath = Get-OwnerPreviewSealKeyPath -Name 'run-set' -SealKeyRoot $SealKeyRoot
 
     $entryId = "owner-$PullRequestId"
     $request = New-OwnerPreviewEvidenceRequest -CorrelationId $correlationId -ToolkitRoot $toolkit `
@@ -448,25 +448,6 @@ function Get-OwnerPreviewToolkitRequiredRef {
     finally { Pop-Location }
 }
 
-function Get-OwnerPreviewSealKeyPath {
-    <#
-        Where an HMAC seal key lives: outside the evidence it authenticates.
-
-        A key stored beside the package it seals proves nothing - whoever can
-        edit the package can mint a matching seal. The production default for
-        these tools is a private per-user key, and this mirrors it rather than
-        writing one into a directory that is published, copied or archived as
-        evidence.
-    #>
-    param([Parameter(Mandatory)][ValidatePattern('^[a-z][a-z0-9-]{0,31}$')][string]$Name)
-    if ($SealKeyRoot -ne '') { $base = [IO.Path]::GetFullPath($SealKeyRoot) }
-    else { $base = Join-Path (Join-Path $HOME '.devpilot') 'owner-preview' }
-    if (-not (Test-Path -LiteralPath $base -PathType Container)) {
-        [void](New-Item -ItemType Directory -Force -Path $base)
-    }
-    return (Join-Path $base "owner-preview-$Name.key")
-}
-
 function Get-OwnerPreviewDiscoveryGeneralistModel {
     <#
         The configured generalist first-pass model name.
@@ -536,7 +517,7 @@ function Invoke-OwnerPreviewSpecialist {
     # The seal key authenticates this package, so it must not live inside it. A
     # key sitting next to the evidence it seals means anyone who can edit the
     # evidence can re-seal it, which is the same as not sealing it.
-    $sealKeyPath = Get-OwnerPreviewSealKeyPath -Name 'capture'
+    $sealKeyPath = Get-OwnerPreviewSealKeyPath -Name 'capture' -SealKeyRoot $SealKeyRoot
     $captureArguments = @(
         '-Role', 'specialist', '-Model', $model,
         '-CaptureRequestFile', $captureRequestPath, '-ConfigFile', $configPath,
@@ -598,7 +579,7 @@ function Invoke-OwnerPreviewSpecialist {
         '-ExpectedHeadCommit', ([string]$Subject['toolkitHead']),
         '-ExpectedRef', (Get-OwnerPreviewToolkitRequiredRef -Root $RepoRoot),
         '-OutputRoot', $acquisitionRoot, '-RepoRoot', $RepoRoot,
-        '-SealKeyPath', (Get-OwnerPreviewSealKeyPath -Name 'acquisition'),
+        '-SealKeyPath', (Get-OwnerPreviewSealKeyPath -Name 'acquisition' -SealKeyRoot $SealKeyRoot),
         '-SecondGeneralistModel', $SecondGeneralistModel,
         '-ConventionSpecialistModel', $model,
         '-DiscoveryGeneralistModel', $discoveryGeneralistModel,
@@ -764,7 +745,7 @@ try {
             $acquisitionRoot = Invoke-OwnerPreviewSpecialist -Subject $subject -Root $root
             $runRoot = Join-Path (Join-Path $root 'runs') $activeKey
             $sealed = Read-OwnerPreviewSealedResult -AcquisitionRoot $acquisitionRoot `
-                -SealKeyPath (Get-OwnerPreviewSealKeyPath -Name 'acquisition')
+                -SealKeyPath (Get-OwnerPreviewSealKeyPath -Name 'acquisition' -SealKeyRoot $SealKeyRoot)
             $status = Save-OwnerPreviewOutcome -Subject $subject -MarkerText $sealed.MarkerText `
                 -ExpectedNonce $sealed.Nonce -RunRoot $runRoot -AttemptCount $sealed.AttemptCount `
                 -ModelStarts $sealed.ModelStarts -DurationMs $sealed.DurationMs

@@ -261,7 +261,8 @@ function Read-ApprovedOwnerEvidence {
             -Boundary (Split-Path -Parent ([string]$resolvedStatus.Path)))) {
         throw "The acquisition package for Layer 1 head '$layer1HeadKey' is missing or unsafe."
     }
-    $sealKey = Join-Path (Join-Path (Join-Path $root 'keys') 'layer1') 'acquisition-seal.key'
+    $layer1KeyRoot = Join-Path (Join-Path $root 'keys') 'layer1'
+    $sealKey = Get-OwnerPreviewSealKeyPath -Name 'acquisition' -SealKeyRoot $layer1KeyRoot
     $package = Assert-ReviewerAcquisitionTranscriptPackage -PackageRoot $packageRoot -SealKeyPath $sealKey `
         -SchemaPath (Join-Path $RepoRoot 'src/Agents/reviewer/acquisition/v1/transcript-package.schema.json') -RequireCaptured
     $projection = Get-ApprovedOwnerValue $package.Core 'sourceProjection'

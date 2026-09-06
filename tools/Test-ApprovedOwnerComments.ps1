@@ -79,11 +79,174 @@ function New-Evidence {
     }
 }
 
+function Write-TestApprovedOwnerAcquisitionPackage {
+    param(
+        [Parameter(Mandatory)][string]$PackageRoot,
+        [Parameter(Mandatory)][string]$SealKeyPath,
+        [Parameter(Mandatory)]$Subject
+    )
+    [void](New-Item -ItemType Directory -Force -Path $PackageRoot)
+    $keyRoot = Split-Path -Parent $SealKeyPath
+    [void](New-Item -ItemType Directory -Force -Path $keyRoot)
+    $key = [byte[]](33..64)
+    [IO.File]::WriteAllBytes($SealKeyPath, $key)
+
+    $nonce = '0123456789abcdef'
+    $usage = [ordered]@{
+        reported = $false
+        premiumRequests = $null
+        totalApiDurationMs = $null
+        sessionDurationMs = $null
+        totalNanoAiu = $null
+        totalPremiumRequests = $null
+        unavailable = $true
+    }
+    $attempt = [ordered]@{
+        attempt = 1
+        nonce = $nonce
+        nonceSha256 = '1' * 64
+        markerStatus = 'success'
+        retryable = $false
+        modelRan = $true
+        exitCode = 0
+        timedOut = $false
+        reason = ''
+        detail = ''
+        durationMs = 1
+        usage = $usage
+    }
+    $snapshotIdentity = [ordered]@{
+        snapshotName = [string]$Subject.snapshot.snapshotId
+        manifestDigest = [string]$Subject.snapshot.manifestDigest
+        prId = [int]$Subject.subject.pullRequestId
+        repositoryId = [string]$Subject.subject.repositoryId
+        project = [string]$Subject.subject.project
+        sourceCommit = [string]$Subject.subject.sourceCommit
+        targetCommit = [string]$Subject.subject.targetCommit
+        changeSetDigest = '2' * 64
+        nonPromotable = $true
+    }
+    $core = [ordered]@{
+        role = 'specialist'
+        requestedModel = [string]$Subject.model
+        reportedModel = [string]$Subject.model
+        secondGeneralistModel = 'gpt-5.6-sol'
+        conventionSpecialistEnabled = $true
+        conventionSpecialistModel = [string]$Subject.model
+        nonce = $nonce
+        resultMarkerPrefix = 'CONVENTION_REVIEW_RESULT_V4:'
+        terminalStatus = 'captured'
+        attempts = @($attempt)
+        timings = [ordered]@{
+            startedUtc = '2026-09-06T00:00:00Z'
+            endedUtc = '2026-09-06T00:00:00.001Z'
+            totalDurationMs = 1
+        }
+        snapshotIdentity = $snapshotIdentity
+        sourceProjection = [ordered]@{
+            sourceRole = 'specialist'
+            sourceModel = [string]$Subject.model
+            binding = [ordered]@{
+                prId = [int]$Subject.subject.pullRequestId
+                repositoryId = [string]$Subject.subject.repositoryId
+                project = [string]$Subject.subject.project
+                sourceCommit = [string]$Subject.subject.sourceCommit
+                targetCommit = [string]$Subject.subject.targetCommit
+            }
+            digests = [ordered]@{ configSha256 = [string]$Subject.configSha256 }
+            ruleCoverage = (New-Evidence).Coverage
+        }
+    }
+    $coreText = ConvertTo-ReviewerAcquisitionPackageCanonicalText -JsonText (
+        $core | ConvertTo-Json -Depth 64 -Compress)
+    $markerText = 'CONVENTION_REVIEW_RESULT_V4: {}'
+    $corePath = Join-Path $PackageRoot 'capture-core.json'
+    $markerPath = Join-Path $PackageRoot 'result-marker.txt'
+    [IO.File]::WriteAllText($corePath, $coreText, $script:ReviewerAcquisitionPackageUtf8)
+    [IO.File]::WriteAllText($markerPath, $markerText, $script:ReviewerAcquisitionPackageUtf8)
+
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        kind = 'reviewer-blinded-transcript-package'
+        planId = '0123456789abcdef'
+        role = [string]$core.role
+        reportedModel = [string]$core.reportedModel
+        requestedModel = [string]$core.requestedModel
+        secondGeneralistModel = [string]$core.secondGeneralistModel
+        conventionSpecialistEnabled = [bool]$core.conventionSpecialistEnabled
+        conventionSpecialistModel = [string]$core.conventionSpecialistModel
+        nonce = $nonce
+        nonceSha256 = '1' * 64
+        resultMarkerPrefix = [string]$core.resultMarkerPrefix
+        files = @(
+            [ordered]@{
+                name = 'capture-core.json'
+                sha256 = Get-ReviewerAcquisitionPackageFileSha256 -Path $corePath
+                bytes = [long]@(Get-Item -LiteralPath $corePath)[0].Length
+            },
+            [ordered]@{
+                name = 'result-marker.txt'
+                sha256 = Get-ReviewerAcquisitionPackageFileSha256 -Path $markerPath
+                bytes = [long]@(Get-Item -LiteralPath $markerPath)[0].Length
+            }
+        )
+        directories = @()
+        digests = [ordered]@{
+            fixtureProjectionSha256 = '3' * 64
+            requestSha256 = '4' * 64
+            inputSha256 = '5' * 64
+            promptSha256 = '6' * 64
+            schemaSha256 = '7' * 64
+            configSha256 = [string]$Subject.configSha256
+            scriptSha256 = '8' * 64
+            snapshotManifestDigest = [string]$Subject.snapshot.manifestDigest
+        }
+        snapshotIdentity = $snapshotIdentity
+        attempts = @($attempt)
+        usage = $usage
+        telemetry = [ordered]@{
+            mode = 'production-test-only'
+            fileExists = $true
+            sinkBytes = 1
+            sinkSha256 = '9' * 64
+            totalEvents = 1
+            modelSubprocessStarts = 1
+            realModelStarts = 0
+            providerLiveProcessStarts = 0
+            providerLiveWrites = 0
+            writeToolInvocations = 0
+            zeroWriteVerified = $true
+        }
+        timings = $core.timings
+        terminalStatus = [string]$core.terminalStatus
+        createdUtc = '2026-09-06T00:00:00Z'
+    }
+    $manifestText = ConvertTo-ReviewerAcquisitionPackageCanonicalText -JsonText (
+        $manifest | ConvertTo-Json -Depth 64 -Compress)
+    $manifestPath = Join-Path $PackageRoot 'transcript-package.json'
+    [IO.File]::WriteAllText($manifestPath, $manifestText, $script:ReviewerAcquisitionPackageUtf8)
+    $seal = [ordered]@{
+        kind = 'reviewer-blinded-transcript-package-seal'
+        manifestHmac = Get-ReviewerAcquisitionPackageHmac -Text $manifestText -Key $key
+        manifestSha256 = Get-ReviewerAcquisitionPackageTextSha256 -Text $manifestText
+        schemaVersion = 1
+        sealedUtc = '2026-09-06T00:00:00Z'
+    }
+    $sealText = ConvertTo-ReviewerAcquisitionPackageCanonicalText -JsonText (
+        $seal | ConvertTo-Json -Depth 8 -Compress)
+    $sealPath = Join-Path $PackageRoot 'transcript-package.seal'
+    [IO.File]::WriteAllText($sealPath, $sealText, $script:ReviewerAcquisitionPackageUtf8)
+    foreach ($path in @($corePath, $markerPath, $manifestPath, $sealPath)) {
+        [IO.File]::SetAttributes($path, [IO.FileAttributes]::ReadOnly)
+    }
+}
+
 function New-SignedEvidenceFixture {
     param(
         [string]$QueueHeadKey = '',
         [string]$ArtifactStatusSha256 = '',
-        [scriptblock]$MutateStatus
+        [scriptblock]$MutateStatus,
+        [switch]$CreateValidPackage
     )
     $state = Join-Path $script:TestRoot ("signed-" + [guid]::NewGuid().ToString('N'))
     [void](New-Item -ItemType Directory -Force -Path $state)
@@ -186,9 +349,16 @@ function New-SignedEvidenceFixture {
         artifact = $artifactPath
     }
     Save-OwnerPreviewQueueLedger $state $ledger $key
+    $acquisitionKeyPath = Get-OwnerPreviewSealKeyPath -Name 'acquisition' `
+        -SealKeyRoot (Join-Path (Join-Path $state 'keys') 'layer1')
+    if ($CreateValidPackage) {
+        Write-TestApprovedOwnerAcquisitionPackage -PackageRoot (Join-Path $runDir 'acquisition/package') `
+            -SealKeyPath $acquisitionKeyPath -Subject $subject
+    }
     return [pscustomobject]@{
         State = $state
         Key = $key
+        AcquisitionKeyPath = $acquisitionKeyPath
         SubjectRoot = $subjectRoot
         QueueHeadKey = $queueHeadKey
         Layer1HeadKey = $layer1HeadKey
@@ -391,6 +561,34 @@ try {
     $commandText = [IO.File]::ReadAllText((Join-Path $RepoRoot 'tools/Invoke-ApprovedOwnerComment.ps1'))
     Check 'operator command requires explicit approval and defaults dry-run' ($commandText -match '\[Parameter\(Mandatory\)\]\[switch\]\$Approve' -and
         $commandText -match '\[switch\]\$Publish' -and $commandText -notmatch 'ConfigFile')
+
+    $productionKey = New-SignedEvidenceFixture -QueueHeadKey ('9' * 64) -CreateValidPackage
+    $productionRead = Read-ApprovedOwnerEvidence $productionKey.State $productionKey.QueueHeadKey $RepoRoot
+    Check 'production acquisition key filename verifies distinct queue and Layer1 evidence' (
+        [IO.Path]::GetFileName($productionKey.AcquisitionKeyPath) -ceq 'owner-preview-acquisition.key' -and
+        $productionRead.Layer1HeadKey -ceq $productionKey.Layer1HeadKey -and
+        $productionRead.Layer1HeadKey -cne $productionKey.QueueHeadKey -and
+        [Convert]::ToBase64String([byte[]]$productionKey.Key) -cne
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($productionKey.AcquisitionKeyPath)))
+
+    $wrongProductionKey = New-SignedEvidenceFixture -QueueHeadKey ('8' * 64) -CreateValidPackage
+    [IO.File]::WriteAllBytes($wrongProductionKey.AcquisitionKeyPath, ([byte[]](65..96)))
+    Refuses 'wrong production acquisition key is refused' {
+        Read-ApprovedOwnerEvidence $wrongProductionKey.State $wrongProductionKey.QueueHeadKey $RepoRoot
+    } 'HMAC seal does not match'
+
+    $missingProductionKey = New-SignedEvidenceFixture -QueueHeadKey ('7' * 64) -CreateValidPackage
+    Remove-Item -LiteralPath $missingProductionKey.AcquisitionKeyPath -Force
+    Refuses 'missing production acquisition key is refused' {
+        Read-ApprovedOwnerEvidence $missingProductionKey.State $missingProductionKey.QueueHeadKey $RepoRoot
+    } 'owner-preview-acquisition\.key'
+
+    $alternateProductionKey = New-SignedEvidenceFixture -QueueHeadKey ('6' * 64) -CreateValidPackage
+    Move-Item -LiteralPath $alternateProductionKey.AcquisitionKeyPath `
+        -Destination (Join-Path (Split-Path -Parent $alternateProductionKey.AcquisitionKeyPath) 'acquisition-seal.key')
+    Refuses 'alternate acquisition key filename is not an ambiguous fallback' {
+        Read-ApprovedOwnerEvidence $alternateProductionKey.State $alternateProductionKey.QueueHeadKey $RepoRoot
+    } 'owner-preview-acquisition\.key'
 
     # Signed evidence checks use real queue HMACs and a narrow package-verifier
     # substitution; acquisition package HMAC coverage is already exercised by
