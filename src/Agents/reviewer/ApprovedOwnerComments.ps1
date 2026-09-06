@@ -102,6 +102,71 @@ function Format-ApprovedOwnerComment {
     ) -join "`n"
 }
 
+function Resolve-ApprovedOwnerLayer1Status {
+    param(
+        [Parameter(Mandatory)][string]$SubjectRoot,
+        [Parameter(Mandatory)][string]$StatusSha256
+    )
+    if ($StatusSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'The signed queue artifact has an invalid Owner preview status digest.'
+    }
+
+    $safeSubjectRoot = Assert-OwnerPreviewQueueSafePath -Path $SubjectRoot -Where 'Owner preview subject root'
+    $root = Resolve-ReviewerCorpusSealRealPath -Path $safeSubjectRoot -RejectReparsePoints
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        throw "The signed queue artifact subject root '$SubjectRoot' is not a directory."
+    }
+    $runs = Resolve-ReviewerCorpusSealRealPath -Path (Join-Path $root 'runs') -RejectReparsePoints
+    if (-not (Test-Path -LiteralPath $runs -PathType Container) -or
+        -not (Test-ReviewerCorpusSealPathWithin -Path $runs -Boundary $root)) {
+        throw "The Owner preview runs directory under '$SubjectRoot' is missing or unsafe."
+    }
+
+    $statusMatches = @()
+    foreach ($child in @(Get-ChildItem -LiteralPath $runs -Directory -Force -ErrorAction Stop)) {
+        if ($child.Name -cnotmatch '^[0-9a-f]{64}$') {
+            throw "The Owner preview runs directory contains unsafe child '$($child.Name)'."
+        }
+        $childPath = Resolve-ReviewerCorpusSealRealPath -Path $child.FullName -RejectReparsePoints
+        if (-not (Test-ReviewerCorpusSealPathWithin -Path $childPath -Boundary $runs) -or
+            -not [string]::Equals(
+                [IO.Path]::GetFullPath((Split-Path -Parent $childPath)).TrimEnd('\', '/'),
+                [IO.Path]::GetFullPath($runs).TrimEnd('\', '/'),
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "The Owner preview run '$($child.Name)' escapes its direct runs child path."
+        }
+
+        $statusPath = Join-Path $childPath 'owner-preview-status.json'
+        if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) { continue }
+        $resolvedStatusPath = Resolve-ReviewerCorpusSealRealPath -Path $statusPath -RejectReparsePoints
+        if (-not (Test-ReviewerCorpusSealPathWithin -Path $resolvedStatusPath -Boundary $childPath) -or
+            -not [string]::Equals(
+                [IO.Path]::GetFullPath((Split-Path -Parent $resolvedStatusPath)).TrimEnd('\', '/'),
+                [IO.Path]::GetFullPath($childPath).TrimEnd('\', '/'),
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "The Owner preview status under '$($child.Name)' escapes its run directory."
+        }
+        [byte[]]$statusBytes = [IO.File]::ReadAllBytes($resolvedStatusPath)
+        $digest = ([Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData($statusBytes))).ToLowerInvariant()
+        if ($digest -ceq $StatusSha256) {
+            $match = [pscustomobject]@{
+                    HeadKey = [string]$child.Name
+                    Path = $resolvedStatusPath
+                    Bytes = $statusBytes
+                }
+            $statusMatches += $match
+        }
+    }
+    if ($statusMatches.Count -eq 0) {
+        throw 'No direct Owner preview run has the status digest from the signed queue artifact.'
+    }
+    if ($statusMatches.Count -ne 1) {
+        throw 'Multiple direct Owner preview runs have the status digest from the signed queue artifact.'
+    }
+    return $statusMatches[0]
+}
+
 function Read-ApprovedOwnerEvidence {
     param(
         [Parameter(Mandatory)][string]$StateRoot,
@@ -130,57 +195,114 @@ function Read-ApprovedOwnerEvidence {
     }
 
     $subjectRoot = [string]$artifact.subjectRoot
-    $subject = Read-OwnerPreviewSubject -Root $subjectRoot -HeadKey $HeadKey
+    $resolvedStatus = Resolve-ApprovedOwnerLayer1Status -SubjectRoot $subjectRoot `
+        -StatusSha256 ([string]$artifact.statusSha256)
+    $layer1HeadKey = [string]$resolvedStatus.HeadKey
+    $subjectsRoot = Resolve-ReviewerCorpusSealRealPath -Path (Join-Path $subjectRoot 'subjects') -RejectReparsePoints
+    $subjectDirectory = Resolve-ReviewerCorpusSealRealPath -Path (
+        Join-Path $subjectsRoot $layer1HeadKey) -RejectReparsePoints
+    $subjectPath = Resolve-ReviewerCorpusSealRealPath -Path (
+        Join-Path $subjectDirectory 'subject.json') -RejectReparsePoints
+    if (-not (Test-Path -LiteralPath $subjectPath -PathType Leaf) -or
+        -not (Test-ReviewerCorpusSealPathWithin -Path $subjectDirectory -Boundary $subjectsRoot) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath((Split-Path -Parent $subjectDirectory)).TrimEnd('\', '/'),
+            [IO.Path]::GetFullPath($subjectsRoot).TrimEnd('\', '/'),
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath((Split-Path -Parent $subjectPath)).TrimEnd('\', '/'),
+            [IO.Path]::GetFullPath($subjectDirectory).TrimEnd('\', '/'),
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The prepared subject '$layer1HeadKey' is missing or escapes its direct subject path."
+    }
+    [byte[]]$subjectBytes = [IO.File]::ReadAllBytes($subjectPath)
+    $subject = Read-OwnerPreviewSubject -Root $subjectRoot -HeadKey $layer1HeadKey -SubjectBytes $subjectBytes
     if ([int]$subject.schemaVersion -ne 1 -or
         [string]$subject.kind -cne 'reviewer-owner-preview-subject' -or
         [string]$subject.capability -cne $script:ApprovedOwnerCapability -or
-        [string]$subject.headKey -cne $HeadKey) {
+        [string]$subject.headKey -cne $layer1HeadKey) {
         throw 'The prepared subject has the wrong capability or HeadKey.'
     }
-    $statusPath = Join-Path (Join-Path (Join-Path $subjectRoot 'runs') $HeadKey) 'owner-preview-status.json'
-    if ((Get-OwnerPreviewFileSha256 -Path $statusPath) -cne [string]$artifact.statusSha256) {
-        throw 'The Owner preview status digest does not match its signed queue artifact.'
-    }
-    $statusText = [IO.File]::ReadAllText($statusPath, [Text.UTF8Encoding]::new($false, $true))
+    $statusText = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$resolvedStatus.Bytes)
     if (-not (Test-Json -Json $statusText -SchemaFile (
-                Join-Path $RepoRoot 'src/Agents/reviewer/schemas/reviewer.owner-preview-status.v1.json'))) {
+                Join-Path $RepoRoot 'src/Agents/reviewer/schemas/reviewer.owner-preview-status.v1.json'
+            ) -ErrorAction SilentlyContinue)) {
         throw 'The Owner preview status failed its versioned schema.'
     }
     $status = $statusText | ConvertFrom-Json -Depth 64 -AsHashtable
     if ([int]$status.schemaVersion -ne 1 -or
         [string]$status.capability -cne $script:ApprovedOwnerCapability -or
-        [string]$status.headKey -cne $HeadKey -or
+        [string]$status.headKey -cne $layer1HeadKey -or
         [string]$status.terminal.status -cne 'completed' -or
         [int]$status.spend.providerWriteCount -ne 0 -or [int]$status.spend.writeToolInvocations -ne 0) {
         throw 'The Owner preview status is not a completed, capability-matched, zero-write result.'
     }
+    if ([string]$status.subjectKey -cne [string]$subject.subjectKey -or
+        [string]$status.subject.organization -cne [string]$subject.subject.organization -or
+        [string]$status.subject.project -cne [string]$subject.subject.project -or
+        [string]$status.subject.repositoryId -cne [string]$subject.subject.repositoryId -or
+        [string]$status.subject.repositoryName -cne [string]$subject.subject.repositoryName -or
+        [int]$status.subject.pullRequestId -ne [int]$subject.subject.pullRequestId -or
+        [int]$status.subject.iterationId -ne [int]$subject.subject.iterationId -or
+        [string]$status.subject.sourceCommit -cne [string]$subject.subject.sourceCommit -or
+        [string]$status.subject.targetCommit -cne [string]$subject.subject.targetCommit -or
+        [string]$status.snapshot.snapshotId -cne [string]$subject.snapshot.snapshotId -or
+        [string]$status.snapshot.manifestDigest -cne [string]$subject.snapshot.manifestDigest -or
+        [string]$status.snapshot.sealKind -cne [string]$subject.snapshot.sealKind -or
+        [bool]$status.snapshot.nonPromotable -ne [bool]$subject.snapshot.nonPromotable) {
+        throw 'The Owner preview status is bound to a different prepared subject.'
+    }
 
-    $packageRoot = Join-Path (Join-Path (Join-Path (Join-Path $subjectRoot 'runs') $HeadKey) 'acquisition') 'package'
+    $packageRoot = Resolve-ReviewerCorpusSealRealPath -Path (
+        Join-Path (Join-Path (Split-Path -Parent ([string]$resolvedStatus.Path)) 'acquisition') 'package'
+    ) -RejectReparsePoints
+    if (-not (Test-Path -LiteralPath $packageRoot -PathType Container) -or
+        -not (Test-ReviewerCorpusSealPathWithin -Path $packageRoot `
+            -Boundary (Split-Path -Parent ([string]$resolvedStatus.Path)))) {
+        throw "The acquisition package for Layer 1 head '$layer1HeadKey' is missing or unsafe."
+    }
     $sealKey = Join-Path (Join-Path (Join-Path $root 'keys') 'layer1') 'acquisition-seal.key'
     $package = Assert-ReviewerAcquisitionTranscriptPackage -PackageRoot $packageRoot -SealKeyPath $sealKey `
         -SchemaPath (Join-Path $RepoRoot 'src/Agents/reviewer/acquisition/v1/transcript-package.schema.json') -RequireCaptured
     $projection = Get-ApprovedOwnerValue $package.Core 'sourceProjection'
     $coverage = Get-ApprovedOwnerValue $projection 'ruleCoverage'
+    $binding = Get-ApprovedOwnerValue $projection 'binding'
+    $digests = Get-ApprovedOwnerValue $projection 'digests'
     if ([string](Get-ApprovedOwnerValue $projection 'sourceRole' '') -cne 'specialist' -or
         $null -eq $coverage -or -not [bool](Get-ApprovedOwnerValue $coverage 'complete' $false) -or
         [bool](Get-ApprovedOwnerValue $coverage 'constructsIncomplete' $true)) {
         throw 'The signed acquisition package has incomplete or foreign specialist rule coverage.'
     }
     if ([string]$package.Core.snapshotIdentity.sourceCommit -ine [string]$subject.subject.sourceCommit -or
+        [string]$package.Core.snapshotIdentity.targetCommit -ine [string]$subject.subject.targetCommit -or
         [int]$package.Core.snapshotIdentity.prId -ne [int]$subject.subject.pullRequestId -or
-        [string]$package.Core.snapshotIdentity.repositoryId -ine [string]$subject.subject.repositoryId) {
+        [string]$package.Core.snapshotIdentity.repositoryId -ine [string]$subject.subject.repositoryId -or
+        [string]$package.Core.snapshotIdentity.project -cne [string]$subject.subject.project -or
+        [string]$package.Core.snapshotIdentity.snapshotName -cne [string]$subject.snapshot.snapshotId -or
+        [string]$package.Core.snapshotIdentity.manifestDigest -cne [string]$subject.snapshot.manifestDigest -or
+        -not [bool]$package.Core.snapshotIdentity.nonPromotable -or
+        [string](Get-ApprovedOwnerValue $projection 'sourceModel' '') -cne [string]$subject.model -or
+        [int](Get-ApprovedOwnerValue $binding 'prId' 0) -ne [int]$subject.subject.pullRequestId -or
+        [string](Get-ApprovedOwnerValue $binding 'repositoryId' '') -ine [string]$subject.subject.repositoryId -or
+        [string](Get-ApprovedOwnerValue $binding 'project' '') -cne [string]$subject.subject.project -or
+        [string](Get-ApprovedOwnerValue $binding 'sourceCommit' '') -ine [string]$subject.subject.sourceCommit -or
+        [string](Get-ApprovedOwnerValue $binding 'targetCommit' '') -ine [string]$subject.subject.targetCommit -or
+        [string](Get-ApprovedOwnerValue $digests 'configSha256' '') -cne [string]$subject.configSha256) {
         throw 'The signed acquisition package is bound to a different pull request head.'
     }
     $rule = @($subject.rule.sections)
     if ($rule.Count -ne 1 -or
         [string]$status.rule.path -cne [string]$rule[0].path -or
+        [string]$status.rule.section -cne [string]$rule[0].section -or
         [string]$status.rule.commit -ine [string]$rule[0].commit -or
-        [string]$status.rule.sha256 -ine [string]$rule[0].sha256) {
+        [string]$status.rule.sha256 -ine [string]$rule[0].sha256 -or
+        [int]$status.rule.byteLength -ne [int]$rule[0].byteLength) {
         throw 'The status rule provenance does not match the prepared subject.'
     }
     return [pscustomobject]@{
         StateRoot = $root; Key = $key; Ledger = $ledger; Record = $record
-        Artifact = $artifact; Subject = $subject; Status = $status; Package = $package
+        Artifact = $artifact; Layer1HeadKey = $layer1HeadKey
+        Subject = $subject; Status = $status; Package = $package
         Coverage = $coverage
     }
 }

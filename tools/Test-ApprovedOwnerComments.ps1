@@ -79,6 +79,126 @@ function New-Evidence {
     }
 }
 
+function New-SignedEvidenceFixture {
+    param(
+        [string]$QueueHeadKey = '',
+        [string]$ArtifactStatusSha256 = '',
+        [scriptblock]$MutateStatus
+    )
+    $state = Join-Path $script:TestRoot ("signed-" + [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Force -Path $state)
+    $key = Get-OwnerPreviewQueueKey $state
+    $subjectRoot = Join-Path $state 'subjects-source'
+
+    $subject = (New-Evidence).Subject
+    $subject.subjectKey = Get-OwnerPreviewSubjectKey contoso Widgets '11111111-2222-3333-4444-555555555555' 117
+    $subject.configSha256 = 'e' * 64
+    $subject.toolkitHead = 'f' * 40
+    $subject.model = 'claude-sonnet-5'
+    $subject.snapshot = [ordered]@{
+        snapshotId = 'snapshot'
+        manifestDigest = '3' * 64
+        sealKind = 'offlineCorpusSeal'
+        nonPromotable = $true
+    }
+    $subject.headKey = Get-OwnerPreviewHeadKey $subject.subjectKey $subject.subject.sourceCommit @($subject.rule.sections) `
+        $subject.snapshot.manifestDigest $subject.model $subject.configSha256 $subject.toolkitHead
+    $layer1HeadKey = [string]$subject.headKey
+    $subject.schemaVersion = 1
+    $subject.kind = 'reviewer-owner-preview-subject'
+    $subjectDir = Join-Path (Join-Path $subjectRoot 'subjects') $layer1HeadKey
+    $runDir = Join-Path (Join-Path $subjectRoot 'runs') $layer1HeadKey
+    [void](New-Item -ItemType Directory -Force -Path $subjectDir)
+    [void](New-Item -ItemType Directory -Force -Path $runDir)
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path $runDir 'acquisition/package'))
+    [void](Write-OwnerPreviewJsonFile (Join-Path $subjectDir 'subject.json') $subject)
+
+    $status = [ordered]@{
+        schemaVersion = 1
+        kind = 'reviewer-owner-preview-status'
+        capability = 'bpm-test-ownership@1'
+        subjectKey = $subject.subjectKey
+        headKey = $layer1HeadKey
+        subject = [ordered]@{
+            organization = $subject.subject.organization
+            project = $subject.subject.project
+            repositoryId = $subject.subject.repositoryId
+            repositoryName = $subject.subject.repositoryName
+            pullRequestId = $subject.subject.pullRequestId
+            iterationId = $subject.subject.iterationId
+            sourceCommit = $subject.subject.sourceCommit
+            targetCommit = $subject.subject.targetCommit
+        }
+        rule = [ordered]@{
+            path = $subject.rule.sections[0].path
+            commit = $subject.rule.sections[0].commit
+            sha256 = $subject.rule.sections[0].sha256
+            byteLength = $subject.rule.sections[0].byteLength
+            section = $subject.rule.sections[0].section
+        }
+        snapshot = [ordered]@{
+            snapshotId = $subject.snapshot.snapshotId
+            manifestDigest = $subject.snapshot.manifestDigest
+            sealKind = $subject.snapshot.sealKind
+            nonPromotable = $subject.snapshot.nonPromotable
+        }
+        counts = [ordered]@{ checked = 1; violations = 1; compliant = 0; unknown = 0; notInReach = 0; notRouted = 0 }
+        violations = @([ordered]@{ ruleRef = 'rs0'; constructRef = 'dc0' })
+        terminal = [ordered]@{ status = 'completed'; markerStatus = 'success'; contractVersion = 4 }
+        spend = [ordered]@{
+            attempts = 1
+            modelStarts = 1
+            providerWriteCount = 0
+            writeToolInvocations = 0
+            generalistModelStarts = 0
+        }
+        createdUtc = '2026-09-06T00:00:00Z'
+    }
+    if ($null -ne $MutateStatus) { & $MutateStatus $status $layer1HeadKey }
+    $statusPath = Join-Path $runDir 'owner-preview-status.json'
+    [void](Write-OwnerPreviewJsonFile $statusPath $status)
+
+    $queueHeadKey = if ($QueueHeadKey) { $QueueHeadKey } else { $layer1HeadKey }
+    $statusSha256 = if ($ArtifactStatusSha256) {
+        $ArtifactStatusSha256
+    }
+    else {
+        Get-OwnerPreviewFileSha256 $statusPath
+    }
+    $artifactPath = Join-Path (Join-Path (Join-Path $state 'artifacts') $queueHeadKey) 'attempt-001.json'
+    $artifact = [ordered]@{
+        schemaVersion = 1
+        kind = 'reviewer-owner-preview-queue-artifact'
+        capability = 'bpm-test-ownership@1'
+        headKey = $queueHeadKey
+        attempt = 1
+        subjectRoot = $subjectRoot
+        statusSha256 = $statusSha256
+        createdUtc = '20260906T000000Z'
+    }
+    Write-OwnerPreviewQueueImmutableRecord $artifactPath $artifact $key
+    $ledger = New-OwnerPreviewQueueLedger
+    $ledger.records[$queueHeadKey] = [ordered]@{
+        state = 'completed'
+        terminal = [ordered]@{ status = 'completed' }
+        providerWriteCount = 0
+        writeToolInvocations = 0
+        artifact = $artifactPath
+    }
+    Save-OwnerPreviewQueueLedger $state $ledger $key
+    return [pscustomobject]@{
+        State = $state
+        Key = $key
+        SubjectRoot = $subjectRoot
+        QueueHeadKey = $queueHeadKey
+        Layer1HeadKey = $layer1HeadKey
+        RunDir = $runDir
+        Status = $status
+        StatusPath = $statusPath
+        ArtifactPath = $artifactPath
+    }
+}
+
 function New-FakeProvider {
     param([switch]$FailCreate, [switch]$Stale, [switch]$Foreign, [switch]$BadAnchor)
     $script:ProviderCalls = [Collections.Generic.List[string]]::new()
@@ -275,76 +395,123 @@ try {
     # Signed evidence checks use real queue HMACs and a narrow package-verifier
     # substitution; acquisition package HMAC coverage is already exercised by
     # Test-ReviewerBlindedAcquisition, while this verifies the new reader's joins.
-    $state = Join-Path $script:TestRoot 'signed'
-    [void](New-Item -ItemType Directory -Force -Path $state)
-    $key = Get-OwnerPreviewQueueKey $state
-    $head = '2' * 64
-    $subjectRoot = Join-Path $state 'subjects-source'
-    $subjectDir = Join-Path (Join-Path $subjectRoot 'subjects') $head
-    $runDir = Join-Path (Join-Path $subjectRoot 'runs') $head
-    [void](New-Item -ItemType Directory -Force -Path $subjectDir)
-    [void](New-Item -ItemType Directory -Force -Path $runDir)
-    $subject = (New-Evidence).Subject
-    $subject.headKey = $head
-    $subject.subjectKey = Get-OwnerPreviewSubjectKey contoso Widgets '11111111-2222-3333-4444-555555555555' 117
-    $subject.configSha256 = 'e' * 64; $subject.toolkitHead = 'f' * 40; $subject.model = 'claude-sonnet-5'
-    $subject.snapshot = [ordered]@{ manifestDigest = '3' * 64 }
-    $subject.headKey = Get-OwnerPreviewHeadKey $subject.subjectKey $subject.subject.sourceCommit @($subject.rule.sections) `
-        $subject.snapshot.manifestDigest $subject.model $subject.configSha256 $subject.toolkitHead
-    $head = $subject.headKey
-    $subjectDir = Join-Path (Join-Path $subjectRoot 'subjects') $head
-    $runDir = Join-Path (Join-Path $subjectRoot 'runs') $head
-    [void](New-Item -ItemType Directory -Force -Path $subjectDir)
-    [void](New-Item -ItemType Directory -Force -Path $runDir)
-    $subject.schemaVersion = 1; $subject.kind = 'reviewer-owner-preview-subject'
-    [void](Write-OwnerPreviewJsonFile (Join-Path $subjectDir 'subject.json') $subject)
-    $status = [ordered]@{
-        schemaVersion = 1; kind = 'reviewer-owner-preview-status'; capability = 'bpm-test-ownership@1'
-        subjectKey = $subject.subjectKey; headKey = $head; subject = $subject.subject
-        rule = [ordered]@{ path = $subject.rule.sections[0].path; commit = $subject.rule.sections[0].commit
-            sha256 = $subject.rule.sections[0].sha256; byteLength = 123; section = $subject.rule.sections[0].section }
-        snapshot = [ordered]@{ snapshotId = 'snapshot'; manifestDigest = '3' * 64; sealKind = 'offlineCorpusSeal'; nonPromotable = $true }
-        counts = [ordered]@{ checked = 1; violations = 1; compliant = 0; unknown = 0; notInReach = 0; notRouted = 0 }
-        violations = @([ordered]@{ ruleRef = 'rs0'; constructRef = 'dc0' })
-        terminal = [ordered]@{ status = 'completed'; markerStatus = 'success'; contractVersion = 4 }
-        spend = [ordered]@{ attempts = 1; modelStarts = 1; providerWriteCount = 0; writeToolInvocations = 0; generalistModelStarts = 0 }
-        createdUtc = '2026-09-06T00:00:00Z'
-    }
-    $statusPath = Join-Path $runDir 'owner-preview-status.json'
-    [void](Write-OwnerPreviewJsonFile $statusPath $status)
-    $artifactPath = Join-Path (Join-Path (Join-Path $state 'artifacts') $head) 'attempt-001.json'
-    $artifact = [ordered]@{ schemaVersion = 1; kind = 'reviewer-owner-preview-queue-artifact'; capability = 'bpm-test-ownership@1'
-        headKey = $head; attempt = 1; subjectRoot = $subjectRoot; statusSha256 = Get-OwnerPreviewFileSha256 $statusPath
-        createdUtc = '20260906T000000Z' }
-    Write-OwnerPreviewQueueImmutableRecord $artifactPath $artifact $key
-    $ledger = New-OwnerPreviewQueueLedger
-    $ledger.records[$head] = [ordered]@{ state = 'completed'; terminal = [ordered]@{ status = 'completed' }
-        providerWriteCount = 0; writeToolInvocations = 0; artifact = $artifactPath }
-    Save-OwnerPreviewQueueLedger $state $ledger $key
     $realPackageVerifier = ${function:Assert-ReviewerAcquisitionTranscriptPackage}
     function Assert-ReviewerAcquisitionTranscriptPackage {
         return [pscustomobject]@{ Core = [ordered]@{
-                sourceProjection = [ordered]@{ sourceRole = 'specialist'; ruleCoverage = (New-Evidence).Coverage }
-                snapshotIdentity = [ordered]@{ sourceCommit = 'a' * 40; prId = 117; repositoryId = '11111111-2222-3333-4444-555555555555' }
+                sourceProjection = [ordered]@{
+                    sourceRole = 'specialist'
+                    sourceModel = 'claude-sonnet-5'
+                    binding = [ordered]@{
+                        prId = 117
+                        repositoryId = '11111111-2222-3333-4444-555555555555'
+                        project = 'Widgets'
+                        sourceCommit = 'a' * 40
+                        targetCommit = 'b' * 40
+                    }
+                    digests = [ordered]@{ configSha256 = 'e' * 64 }
+                    ruleCoverage = (New-Evidence).Coverage
+                }
+                snapshotIdentity = [ordered]@{
+                    snapshotName = 'snapshot'
+                    manifestDigest = '3' * 64
+                    sourceCommit = 'a' * 40
+                    targetCommit = 'b' * 40
+                    prId = 117
+                    repositoryId = '11111111-2222-3333-4444-555555555555'
+                    project = 'Widgets'
+                    nonPromotable = $true
+                }
             } }
     }
-    $read = Read-ApprovedOwnerEvidence $state $head $RepoRoot
-    Check 'signed ledger artifact and status are accepted' ($read.Subject.headKey -ceq $head)
-    Add-Content -LiteralPath $statusPath -Value ' '
-    Refuses 'status digest tamper is refused' { Read-ApprovedOwnerEvidence $state $head $RepoRoot } 'digest'
-    [void](Write-OwnerPreviewJsonFile $statusPath $status)
-    $artifactEnvelope = Get-Content -LiteralPath $artifactPath -Raw | ConvertFrom-Json -AsHashtable
-    [IO.File]::SetAttributes($artifactPath, [IO.FileAttributes]::Normal)
+
+    $sameKey = New-SignedEvidenceFixture
+    $read = Read-ApprovedOwnerEvidence $sameKey.State $sameKey.QueueHeadKey $RepoRoot
+    Check 'old same-key signed evidence remains valid' (
+        $read.Artifact.headKey -ceq $sameKey.QueueHeadKey -and
+        $read.Layer1HeadKey -ceq $sameKey.Layer1HeadKey -and
+        $read.Subject.headKey -ceq $sameKey.Layer1HeadKey)
+
+    $distinct = New-SignedEvidenceFixture -QueueHeadKey ('9' * 64)
+    $decoyHead = '8' * 64
+    $decoyRun = Join-Path (Join-Path $distinct.SubjectRoot 'runs') $decoyHead
+    [void](New-Item -ItemType Directory -Force -Path $decoyRun)
+    [void](Write-OwnerPreviewJsonFile (Join-Path $decoyRun 'owner-preview-status.json') ([ordered]@{ decoy = $true }))
+    $read = Read-ApprovedOwnerEvidence $distinct.State $distinct.QueueHeadKey $RepoRoot
+    Check 'signed digest resolves a distinct Layer1 head from the queue head' (
+        $read.Artifact.headKey -ceq $distinct.QueueHeadKey -and
+        $read.Layer1HeadKey -ceq $distinct.Layer1HeadKey -and
+        $read.Layer1HeadKey -cne $distinct.QueueHeadKey)
+    Check 'status digest chooses the correct direct runs child' (
+        $read.Status.headKey -ceq $distinct.Layer1HeadKey)
+
+    $missing = New-SignedEvidenceFixture -QueueHeadKey ('7' * 64) -ArtifactStatusSha256 ('0' * 64)
+    Refuses 'zero matching status digests are refused' {
+        Read-ApprovedOwnerEvidence $missing.State $missing.QueueHeadKey $RepoRoot
+    } 'No direct.*status digest'
+
+    $multiple = New-SignedEvidenceFixture -QueueHeadKey ('6' * 64)
+    $duplicateRun = Join-Path (Join-Path $multiple.SubjectRoot 'runs') ('5' * 64)
+    [void](New-Item -ItemType Directory -Force -Path $duplicateRun)
+    Copy-Item -LiteralPath $multiple.StatusPath -Destination (Join-Path $duplicateRun 'owner-preview-status.json')
+    Refuses 'multiple matching status digests are refused' {
+        Read-ApprovedOwnerEvidence $multiple.State $multiple.QueueHeadKey $RepoRoot
+    } 'Multiple direct.*status digest'
+
+    $unsafe = New-SignedEvidenceFixture -QueueHeadKey ('4' * 64)
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $unsafe.SubjectRoot 'runs') 'not-a-head-key'))
+    Refuses 'unsafe direct runs child is refused' {
+        Read-ApprovedOwnerEvidence $unsafe.State $unsafe.QueueHeadKey $RepoRoot
+    } 'unsafe child'
+
+    $reparse = New-SignedEvidenceFixture -QueueHeadKey ('3' * 64)
+    $junctionTarget = Join-Path $script:TestRoot ("escaped-run-" + [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Force -Path $junctionTarget)
+    Copy-Item -LiteralPath $reparse.StatusPath -Destination (Join-Path $junctionTarget 'owner-preview-status.json')
+    $junctionPath = Join-Path (Join-Path $reparse.SubjectRoot 'runs') ('4' * 64)
+    [void](New-Item -ItemType Junction -Path $junctionPath -Target $junctionTarget)
+    Refuses 'reparse-point direct child cannot escape the runs root' {
+        Read-ApprovedOwnerEvidence $reparse.State $reparse.QueueHeadKey $RepoRoot
+    } 'reparse point'
+
+    $headMismatch = New-SignedEvidenceFixture -QueueHeadKey ('2' * 64) -MutateStatus {
+        param($statusValue, $layer1HeadKey)
+        [void]$layer1HeadKey
+        $statusValue.headKey = '1' * 64
+    }
+    Refuses 'status HeadKey must match its direct runs directory' {
+        Read-ApprovedOwnerEvidence $headMismatch.State $headMismatch.QueueHeadKey $RepoRoot
+    } 'capability-matched|HeadKey'
+
+    $malformed = New-SignedEvidenceFixture -QueueHeadKey ('1' * 64) -MutateStatus {
+        param($statusValue, $layer1HeadKey)
+        [void]$layer1HeadKey
+        [void]$statusValue.Remove('terminal')
+    }
+    Refuses 'matched status must satisfy its versioned schema' {
+        Read-ApprovedOwnerEvidence $malformed.State $malformed.QueueHeadKey $RepoRoot
+    } 'versioned schema'
+
+    Add-Content -LiteralPath $sameKey.StatusPath -Value ' '
+    Refuses 'status digest tamper is refused' {
+        Read-ApprovedOwnerEvidence $sameKey.State $sameKey.QueueHeadKey $RepoRoot
+    } 'digest'
+    [void](Write-OwnerPreviewJsonFile $sameKey.StatusPath $sameKey.Status)
+    $artifactEnvelope = Get-Content -LiteralPath $sameKey.ArtifactPath -Raw | ConvertFrom-Json -AsHashtable
+    [IO.File]::SetAttributes($sameKey.ArtifactPath, [IO.FileAttributes]::Normal)
     $artifactEnvelope.hmac = '0' * 64
-    [void](Write-OwnerPreviewJsonFile $artifactPath $artifactEnvelope)
-    Refuses 'artifact HMAC tamper is refused' { Read-ApprovedOwnerEvidence $state $head $RepoRoot } 'HMAC'
+    [void](Write-OwnerPreviewJsonFile $sameKey.ArtifactPath $artifactEnvelope)
+    Refuses 'artifact HMAC tamper is refused' {
+        Read-ApprovedOwnerEvidence $sameKey.State $sameKey.QueueHeadKey $RepoRoot
+    } 'HMAC'
     Set-Item -Path Function:Assert-ReviewerAcquisitionTranscriptPackage -Value $realPackageVerifier
 
-    $ledgerPath = Join-Path $state 'ledger.json'
+    $ledgerPath = Join-Path $sameKey.State 'ledger.json'
     $ledgerEnvelope = Get-Content -LiteralPath $ledgerPath -Raw | ConvertFrom-Json -AsHashtable
     $ledgerEnvelope.hmac = '0' * 64
     [void](Write-OwnerPreviewJsonFile $ledgerPath $ledgerEnvelope)
-    Refuses 'ledger HMAC tamper is refused' { Read-ApprovedOwnerEvidence $state $head $RepoRoot } 'HMAC'
+    Refuses 'ledger HMAC tamper is refused' {
+        Read-ApprovedOwnerEvidence $sameKey.State $sameKey.QueueHeadKey $RepoRoot
+    } 'HMAC'
 }
 finally {
     Remove-Item -LiteralPath $script:TestRoot -Recurse -Force -ErrorAction SilentlyContinue

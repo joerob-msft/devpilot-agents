@@ -767,13 +767,20 @@ function Read-OwnerPreviewSubject {
     <# Reads a prepared subject only after recomputing its Layer 1 head key. #>
     param(
         [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$HeadKey
+        [Parameter(Mandatory)][string]$HeadKey,
+        [AllowNull()][byte[]]$SubjectBytes
     )
     $path = Join-Path (Join-Path (Join-Path $Root 'subjects') $HeadKey) 'subject.json'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "No prepared subject '$HeadKey' under '$Root'. Run -Action prepare first."
+    if ($PSBoundParameters.ContainsKey('SubjectBytes')) {
+        $subjectText = [Text.UTF8Encoding]::new($false, $true).GetString($SubjectBytes)
     }
-    $subject = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64 -AsHashtable
+    else {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "No prepared subject '$HeadKey' under '$Root'. Run -Action prepare first."
+        }
+        $subjectText = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+    }
+    $subject = $subjectText | ConvertFrom-Json -Depth 64 -AsHashtable
     $recomputed = Get-OwnerPreviewHeadKey -SubjectKey ([string]$subject.subjectKey) `
         -SourceCommit ([string]$subject.subject.sourceCommit) `
         -RuleSections @($subject.rule.sections) `
