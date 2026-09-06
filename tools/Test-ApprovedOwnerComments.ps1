@@ -393,7 +393,20 @@ function New-FakeProvider {
             'GetBranch' { return [ordered]@{ objectId = $(if ($script:ProviderStale) { '9' * 40 } else { 'a' * 40 }) } }
             'GetChanges' {
                 $path = if ($script:ProviderBadAnchor) { '/tests/Other.cs' } else { '/TESTS/WIDGETTESTS.CS' }
-                return [ordered]@{ SpansByPath = [ordered]@{ $path = @([ordered]@{ startLine = 27; endLine = 27 }) } }
+                return [ordered]@{
+                    count = 1
+                    value = @([ordered]@{
+                            item = [ordered]@{ path = $path; isFolder = $false }
+                            changeType = [int]2
+                            diff = [ordered]@{
+                                lineDiffBlocks = @([ordered]@{
+                                        changeType = [int]3
+                                        modifiedLineNumberStart = [int]27
+                                        modifiedLinesCount = [int]1
+                                    })
+                            }
+                        })
+                }
             }
             'ListThreads' { return $script:ProviderThreads.ToArray() }
             'CreateThread' {
@@ -513,7 +526,46 @@ try {
 
     $provider = New-FakeProvider
     $caseDry = Invoke-ApprovedOwnerComment $evidence @('dc0') @($finding) $provider 'case check'
-    Check 'path case is canonical for live anchor' ($caseDry.results[0].outcome -ceq 'wouldCreate')
+    Check 'get_changes-like canonical span anchors without StrictMode property failure' (
+        $caseDry.results[0].outcome -ceq 'wouldCreate')
+
+    $boundarySpans = [ordered]@{
+        SpansByPath = [ordered]@{
+            '/tests/WidgetTests.cs' = @([ordered]@{ Start = 26; End = 28 })
+        }
+    }
+    Assert-ApprovedOwnerAnchors -Selections @(
+        [ordered]@{ path = '/tests/WidgetTests.cs'; line = 26 },
+        [ordered]@{ path = '/tests/WidgetTests.cs'; line = 28 }
+    ) -Changes $boundarySpans
+    Check 'canonical span includes both boundary lines' $true
+    foreach ($outsideLine in @(25, 29)) {
+        Refuses "line $outsideLine outside canonical span is refused" {
+            Assert-ApprovedOwnerAnchors -Selections @(
+                [ordered]@{ path = '/tests/WidgetTests.cs'; line = $outsideLine }
+            ) -Changes $boundarySpans
+        } 'not one live changed right-hand line'
+    }
+    $malformedSpans = @(
+        [ordered]@{ Name = 'missing Start'; Span = [ordered]@{ End = 28 } },
+        [ordered]@{ Name = 'missing End'; Span = [ordered]@{ Start = 26 } },
+        [ordered]@{ Name = 'zero Start'; Span = [ordered]@{ Start = 0; End = 28 } },
+        [ordered]@{ Name = 'negative End'; Span = [ordered]@{ Start = 1; End = -1 } },
+        [ordered]@{ Name = 'nonnumeric Start'; Span = [ordered]@{ Start = 'line 26'; End = 28 } },
+        [ordered]@{ Name = 'reversed range'; Span = [ordered]@{ Start = 28; End = 26 } },
+        [ordered]@{ Name = 'legacy aliases'; Span = [ordered]@{ startLine = 26; endLine = 28 } }
+    )
+    foreach ($malformedSpan in $malformedSpans) {
+        Refuses "$($malformedSpan.Name) canonical span is refused" {
+            Assert-ApprovedOwnerAnchors -Selections @(
+                [ordered]@{ path = '/tests/WidgetTests.cs'; line = 27 }
+            ) -Changes ([ordered]@{
+                    SpansByPath = [ordered]@{
+                        '/tests/WidgetTests.cs' = @($malformedSpan.Span)
+                    }
+                })
+        } 'malformed live changed-line span'
+    }
 
     $provider = New-FakeProvider
     $previewSelections = Resolve-ApprovedOwnerSelections $evidence @('dc0') @($finding)

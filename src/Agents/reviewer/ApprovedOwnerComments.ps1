@@ -414,7 +414,7 @@ function Assert-ApprovedOwnerAnchors {
     param([Parameter(Mandatory)][object[]]$Selections, [Parameter(Mandatory)]$Changes)
     [Collections.IDictionary]$spans = @{}
     if ($Changes -is [Collections.IDictionary] -and $Changes.Contains('SpansByPath')) {
-        $spans = $Changes.SpansByPath
+        $spans = $Changes['SpansByPath']
     }
     else { $spans = Get-ReviewerSourceChangedSpans -Response $Changes }
     foreach ($selection in $Selections) {
@@ -423,9 +423,25 @@ function Assert-ApprovedOwnerAnchors {
             })
         if ($entries.Count -ne 1) { throw "Anchor path '$($selection.path)' is absent or case-ambiguous in the live change set." }
         $line = [int]$selection.line
-        if (@($entries[0].Value | Where-Object {
-                    $line -ge [int]$_.startLine -and $line -le [int]$_.endLine
-                }).Count -ne 1) {
+        $matchingSpans = 0
+        foreach ($span in @($entries[0].Value)) {
+            $missing = [object]::new()
+            $rawStart = Get-ApprovedOwnerValue $span 'Start' $missing
+            $rawEnd = Get-ApprovedOwnerValue $span 'End' $missing
+            if ([object]::ReferenceEquals($rawStart, $missing) -or
+                [object]::ReferenceEquals($rawEnd, $missing) -or
+                ($rawStart -isnot [int] -and $rawStart -isnot [long]) -or
+                ($rawEnd -isnot [int] -and $rawEnd -isnot [long])) {
+                throw "Anchor path '$($selection.path)' contains a malformed live changed-line span."
+            }
+            $start = [long]$rawStart
+            $end = [long]$rawEnd
+            if ($start -le 0 -or $end -le 0 -or $end -lt $start) {
+                throw "Anchor path '$($selection.path)' contains a malformed live changed-line span."
+            }
+            if ($line -ge $start -and $line -le $end) { $matchingSpans++ }
+        }
+        if ($matchingSpans -ne 1) {
             throw "Anchor '$($selection.path):$line' is not one live changed right-hand line."
         }
     }
