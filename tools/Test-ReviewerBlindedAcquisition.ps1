@@ -269,9 +269,10 @@ $script:ProductionMarkerStatuses = @(
 
 function Assert-ExactAttempt {
     # Blocker 3: a sealed attempt record must preserve the EXACT production parser/
-    # run status, the human reason string and the offending-field detail verbatim -
-    # never a coarse ok/terminal/markerMissing remap and never the typed class
-    # echoed back as the reason.
+    # run status and the human reason's typed prefix - never a coarse
+    # ok/terminal/markerMissing remap and never the typed class echoed back as the
+    # reason. Short reason/detail values remain verbatim; over-bound values carry
+    # an explicit pointer to their full capture-core evidence.
     param(
         [Parameter(Mandatory)]$Attempt, [Parameter(Mandatory)][string]$Label,
         [string]$ExpectStatus = '', [object]$ExpectRetryable = $null,
@@ -1220,6 +1221,63 @@ function Test-Behavior {
     }
 }
 
+# The manifest projection is the only bounded copy. Short and exact-bound values
+# remain byte-for-byte identical; over-bound values explicitly account for what
+# was omitted and point at the immutable full evidence. Unicode cuts stay on text
+# element boundaries rather than splitting a surrogate pair or combining mark.
+Invoke-Expression (Get-LiveFunctionText -Path $tool -Name 'Get-AcquisitionBoundedEvidenceSummary')
+$boundedShort = 'success: short reason'
+$boundedExact = 'success: ' + ('x' * (512 - 'success: '.Length))
+$boundedLong = 'success: ' + ('x' * 600)
+$boundedUnicode = 'success: ' + ('x' * 409) +
+    (-join ([char]::ConvertFromUtf32(0x1F642) * 60))
+Check 'bounded evidence leaves short text unchanged' (
+    (Get-AcquisitionBoundedEvidenceSummary -Text $boundedShort -MaxLength 512 `
+            -FieldName 'reason' -EvidenceLocation 'capture-core.json#/attempts/0/reason') -ceq
+    $boundedShort)
+Check 'bounded evidence leaves exact-bound text unchanged' (
+    (Get-AcquisitionBoundedEvidenceSummary -Text $boundedExact -MaxLength 512 `
+            -FieldName 'reason' -EvidenceLocation 'capture-core.json#/attempts/0/reason') -ceq
+    $boundedExact)
+$boundedLongSummaryOutput = @(Get-AcquisitionBoundedEvidenceSummary -Text $boundedLong -MaxLength 512 `
+    -FieldName 'reason' -EvidenceLocation 'capture-core.json#/attempts/0/reason'
+)
+$boundedLongSummary = [string]$boundedLongSummaryOutput[0]
+Check 'bounded evidence reports over-bound truncation and full evidence location' (
+    $boundedLongSummary.Length -le 512 -and
+    $boundedLongSummary.StartsWith('success: ', [StringComparison]::Ordinal) -and
+    $boundedLongSummary -match
+    '\[reason truncated; \d+ characters omitted; full reason: capture-core\.json#/attempts/0/reason\]$') `
+    $boundedLongSummary
+$boundedUnicodeSummaryOutput = @(Get-AcquisitionBoundedEvidenceSummary -Text $boundedUnicode -MaxLength 512 `
+    -FieldName 'reason' -EvidenceLocation 'capture-core.json#/attempts/0/reason'
+)
+$boundedUnicodeSummary = [string]$boundedUnicodeSummaryOutput[0]
+$unicodeSummaryMatch = [regex]::Match(
+    $boundedUnicodeSummary,
+    '^(?<prefix>.*) \[reason truncated; (?<omitted>\d+) characters omitted; full reason: capture-core\.json#/attempts/0/reason\]$')
+$unicodePrefix = $unicodeSummaryMatch.Groups['prefix'].Value
+$unicodeUtf8 = [Text.UTF8Encoding]::new($false, $true)
+Check 'bounded evidence does not split Unicode text elements' (
+    $boundedUnicodeSummary.Length -le 512 -and
+    $unicodeSummaryMatch.Success -and
+    [int]$unicodeSummaryMatch.Groups['omitted'].Value -eq 60 -and
+    $unicodePrefix -ceq ('success: ' + ('x' * 409)) -and
+    $unicodeUtf8.GetString($unicodeUtf8.GetBytes($boundedUnicodeSummary)) -ceq
+        $boundedUnicodeSummary) `
+    $boundedUnicodeSummary
+$boundedDetailSummaryOutput = @(Get-AcquisitionBoundedEvidenceSummary -Text ('field: ' + ('y' * 600)) `
+    -MaxLength 512 -FieldName 'detail' `
+    -EvidenceLocation 'capture-core.json#/attempts/0/detail'
+)
+$boundedDetailSummary = [string]$boundedDetailSummaryOutput[0]
+Check 'bounded evidence handles detail independently' (
+    $boundedDetailSummary.Length -le 512 -and
+    $boundedDetailSummary.StartsWith('field: ', [StringComparison]::Ordinal) -and
+    $boundedDetailSummary -match
+    '\[detail truncated; \d+ characters omitted; full detail: capture-core\.json#/attempts/0/detail\]$') `
+    $boundedDetailSummary
+
 Test-Behavior -Name 'successOpus' -Behavior 'success' -Model 'claude-opus-5' -ExpectExit 0 -ExpectStatus 'captured' -ExpectAttempts 1 -ExpectReported 'claude-opus-5'
 Test-Behavior -Name 'successGpt' -Behavior 'success' -Model 'gpt-5.6-sol' -ExpectExit 0 -ExpectStatus 'captured' -ExpectAttempts 1 -ExpectReported 'gpt-5.6-sol'
 Test-Behavior -Name 'missingMarker' -Behavior 'missingMarker' -Model 'claude-opus-5' -ExpectExit 0 -ExpectStatus 'captureFailedRetriesExhausted' -ExpectAttempts 2 -ExpectReported 'claude-opus-5' -DistinctNonces
@@ -1896,16 +1954,25 @@ $specialistSchemaInvalidTemplate = $specialistFindingTemplate | ConvertTo-Json -
 $specialistSchemaInvalidTemplate.prId = 0
 Test-Specialist -Name 'success' -Behavior 'success' -RoleExtra @{ markerTemplate = $specialistFindingTemplate } `
     -ExpectAttempts 1 -ExpectStatus 'captured'
+$specialistLongReasonTemplate = $specialistFindingTemplate | ConvertTo-Json -Depth 64 |
+    ConvertFrom-Json -Depth 64
+$specialistLongReasonTemplate.residualRisks = @(
+    'First residual risk remains visible in the raw marker.',
+    'Second residual risk remains visible in the raw marker.',
+    'Third residual risk remains visible in the raw marker.'
+)
+Test-Specialist -Name 'longNormalizationReason' -Behavior 'success' `
+    -RoleExtra @{ markerTemplate = $specialistLongReasonTemplate } `
+    -ExpectAttempts 1 -ExpectStatus 'captured'
 Test-Specialist -Name 'missingMarker' -Behavior 'missingMarker' -ExpectAttempts 3 -ExpectStatus 'captureFailedRetriesExhausted' -DistinctNonces
 Test-Specialist -Name 'truncatedMarker' -Behavior 'truncatedMarker' -ExpectAttempts 3 -ExpectStatus 'captureFailedRetriesExhausted' -DistinctNonces
 Test-Specialist -Name 'schemaInvalidMarker' -Behavior 'success' -RoleExtra @{ markerTemplate = $specialistSchemaInvalidTemplate } `
     -ExpectAttempts 3 -ExpectStatus 'captureFailedRetriesExhausted' -DistinctNonces
 Test-Specialist -Name 'wrongBinding' -Behavior 'wrongBinding' -ExpectAttempts 1 -LooseTerminal
 
-# Blocker 3: the specialist attempt ledger preserves the EXACT production parser
-# status/reason/detail verbatim (never a coarse ok/terminal/markerMissing remap or
-# a rejectionClass-as-reason). Each retryable emission slip keeps its typed class
-# and retryability; the wrong-binding attempt is terminal and names its field.
+# Blocker 3: the specialist attempt ledger preserves the exact production parser
+# status and useful human prefix (never a coarse remap or rejectionClass-as-reason).
+# Short reason/detail values stay verbatim; long copies point to capture-core.
 $spMiss = Read-Json (Join-Path (New-OutDir 'sp_missingMarker') 'package\transcript-package.json')
 Assert-ExactAttempt -Attempt (@($spMiss.attempts)[0]) -Label 'specialist missingMarker' -ExpectStatus 'missingMarker' -ExpectRetryable $true
 $spTrunc = Read-Json (Join-Path (New-OutDir 'sp_truncatedMarker') 'package\transcript-package.json')
@@ -1914,6 +1981,64 @@ $spSchema = Read-Json (Join-Path (New-OutDir 'sp_schemaInvalidMarker') 'package\
 Assert-ExactAttempt -Attempt (@($spSchema.attempts)[0]) -Label 'specialist schemaInvalidMarker' -ExpectStatus 'schemaInvalid' -ExpectRetryable $true -ExpectDetail 'prId'
 $spWrong = Read-Json (Join-Path (New-OutDir 'sp_wrongBinding') 'package\transcript-package.json')
 Assert-ExactAttempt -Attempt (@($spWrong.attempts)[-1]) -Label 'specialist wrongBinding' -ExpectStatus 'wrongBinding' -ExpectRetryable $false -ExpectDetail 'nonce'
+
+$longReasonPackage = Join-Path (New-OutDir 'sp_longNormalizationReason') 'package'
+$longReasonManifestPath = Join-Path $longReasonPackage 'transcript-package.json'
+$longReasonCorePath = Join-Path $longReasonPackage 'capture-core.json'
+$longReasonMarkerPath = Join-Path $longReasonPackage 'result-marker.txt'
+$longReasonManifest = Read-Json $longReasonManifestPath
+$longReasonCore = Read-Json $longReasonCorePath
+$fullLongReason = [string]@($longReasonCore.attempts)[0].reason
+$boundedManifestReason = [string]@($longReasonManifest.attempts)[0].reason
+$expectedLongReason = 'Compatibility-normalized 3 field(s): ' + (@(
+        "a bare string to the object with a text key the schema requires at 'residualRisks[0]' (original typed reason: The marker wrote 'residualRisks[0]' as a bare string rather than an object with a 'text' key; it was read as that text.)",
+        "a bare string to the object with a text key the schema requires at 'residualRisks[1]' (original typed reason: The marker wrote 'residualRisks[1]' as a bare string rather than an object with a 'text' key; it was read as that text.)",
+        "a bare string to the object with a text key the schema requires at 'residualRisks[2]' (original typed reason: The marker wrote 'residualRisks[2]' as a bare string rather than an object with a 'text' key; it was read as that text.)"
+    ) -join '; ')
+Check 'long normalization capture-core preserves the exact 731-character reason' (
+    $fullLongReason.Length -eq 731 -and $fullLongReason -ceq $expectedLongReason) `
+    "length=$($fullLongReason.Length)"
+$oldProjection = $longReasonManifest | ConvertTo-Json -Depth 64 |
+    ConvertFrom-Json -AsHashtable -Depth 64
+$oldProjection.attempts[0].reason = $fullLongReason
+$packageSchema = Join-Path $RepoRoot `
+    'src\Agents\reviewer\acquisition\v1\transcript-package.schema.json'
+Check 'old unbounded manifest projection is schema-invalid' (
+    -not (($oldProjection | ConvertTo-Json -Depth 64) |
+        Test-Json -SchemaFile $packageSchema -ErrorAction SilentlyContinue))
+$summaryMatch = [regex]::Match(
+    $boundedManifestReason,
+    '^(?<prefix>.*) \[reason truncated; (?<omitted>\d+) characters omitted; full reason: capture-core\.json#/attempts/0/reason\]$')
+$prefixCharacters = if ($summaryMatch.Success) {
+    [Globalization.StringInfo]::ParseCombiningCharacters($summaryMatch.Groups['prefix'].Value).Count
+} else { -1 }
+$fullCharacters = [Globalization.StringInfo]::ParseCombiningCharacters($fullLongReason).Count
+Check 'bounded manifest reason is explicit, classified, and exactly accounts for omitted text' (
+    $boundedManifestReason.Length -le 512 -and
+    $boundedManifestReason.StartsWith(
+        'Compatibility-normalized 3 field(s): ', [StringComparison]::Ordinal) -and
+    $summaryMatch.Success -and
+    [int]$summaryMatch.Groups['omitted'].Value -eq ($fullCharacters - $prefixCharacters)) `
+    $boundedManifestReason
+Check 'long normalization detail remains independently unmodified' (
+    [string]@($longReasonManifest.attempts)[0].detail -ceq 'residualRisks[0]' -and
+    [string]@($longReasonCore.attempts)[0].detail -ceq 'residualRisks[0]')
+$markerBeforeVerify = (Get-FileHash -LiteralPath $longReasonMarkerPath -Algorithm SHA256).Hash
+$coreBeforeVerify = (Get-FileHash -LiteralPath $longReasonCorePath -Algorithm SHA256).Hash
+$longReasonVerify = Invoke-Tool -ToolArgs @(
+    '-VerifyOnly', '-OutputRoot', (New-OutDir 'sp_longNormalizationReason'),
+    '-SealKeyPath', $sealKey) -LogName 'verify-long-normalization-reason.log'
+Check 'bounded long-reason package seals and verifies' ($longReasonVerify.Exit -eq 0) `
+    "exit=$($longReasonVerify.Exit)"
+Check 'verification leaves full capture-core reason and raw marker byte-for-byte unchanged' (
+    (Get-FileHash -LiteralPath $longReasonCorePath -Algorithm SHA256).Hash -ceq $coreBeforeVerify -and
+    (Get-FileHash -LiteralPath $longReasonMarkerPath -Algorithm SHA256).Hash -ceq $markerBeforeVerify)
+$rawLongMarker = [IO.File]::ReadAllText(
+    $longReasonMarkerPath, [Text.UTF8Encoding]::new($false, $true))
+Check 'raw marker retains all three original residual-risk strings' (
+    $rawLongMarker.Contains('First residual risk remains visible in the raw marker.') -and
+    $rawLongMarker.Contains('Second residual risk remains visible in the raw marker.') -and
+    $rawLongMarker.Contains('Third residual risk remains visible in the raw marker.'))
 
 # J2 - an authenticated specialist package projects convention-origin candidates,
 # and either configured generalist can verify them. The specialist itself cannot.

@@ -351,6 +351,30 @@ function Assert-AcquisitionSchema {
     }
 }
 
+function Get-AcquisitionBoundedEvidenceSummary {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$MaxLength,
+        [Parameter(Mandatory)][ValidatePattern('^[a-z][A-Za-z0-9]*$')][string]$FieldName,
+        [Parameter(Mandatory)][string]$EvidenceLocation
+    )
+    if ($Text.Length -le $MaxLength) { return $Text }
+
+    # Cut only at Unicode text-element boundaries. Substring indexes are UTF-16
+    # code units, so an arbitrary length cut could split a surrogate pair or a
+    # combining sequence and make the manifest summary invalid or misleading.
+    $starts = [Globalization.StringInfo]::ParseCombiningCharacters($Text)
+    for ($kept = $starts.Count - 1; $kept -ge 0; $kept--) {
+        $omitted = $starts.Count - $kept
+        $notice = " [$FieldName truncated; $omitted characters omitted; full $FieldName`: $EvidenceLocation]"
+        $prefixLength = if ($kept -eq 0) { 0 } else { $starts[$kept] }
+        if (($prefixLength + $notice.Length) -le $MaxLength) {
+            return $Text.Substring(0, $prefixLength) + $notice
+        }
+    }
+    throw "The bounded $FieldName notice for '$EvidenceLocation' exceeds its $MaxLength-character manifest field."
+}
+
 function Get-AcquisitionGitLayout {
     param([Parameter(Mandatory)][string]$RepositoryRoot)
     $dotGit = Join-Path $RepositoryRoot '.git'
@@ -2300,6 +2324,7 @@ if ($exitCode -eq 0 -and $core) {
         createdUtc         = [string]$coreCreatedUtc
     }
     foreach ($p in $core.digests.PSObject.Properties) { $manifest.digests[$p.Name] = ([string]$p.Value).ToLowerInvariant() }
+    $attemptIndex = 0
     foreach ($a in @($core.attempts)) {
         $manifest.attempts += , [ordered]@{
             attempt      = [int]$a.attempt
@@ -2310,8 +2335,13 @@ if ($exitCode -eq 0 -and $core) {
             modelRan     = [bool]$a.modelRan
             exitCode     = [int]$a.exitCode
             timedOut     = [bool]$a.timedOut
-            reason       = [string]$a.reason
-            detail       = [string]$(if ($a.PSObject.Properties['detail']) { $a.detail } else { '' })
+            reason       = Get-AcquisitionBoundedEvidenceSummary -Text ([string]$a.reason) `
+                -MaxLength 512 -FieldName 'reason' `
+                -EvidenceLocation "capture-core.json#/attempts/$attemptIndex/reason"
+            detail       = Get-AcquisitionBoundedEvidenceSummary `
+                -Text ([string]$(if ($a.PSObject.Properties['detail']) { $a.detail } else { '' })) `
+                -MaxLength 512 -FieldName 'detail' `
+                -EvidenceLocation "capture-core.json#/attempts/$attemptIndex/detail"
             durationMs   = [int]$a.durationMs
             usage        = [ordered]@{
                 reported             = [bool]$a.usage.reported
@@ -2323,6 +2353,7 @@ if ($exitCode -eq 0 -and $core) {
                 unavailable          = [bool]$a.usage.unavailable
             }
         }
+        $attemptIndex++
     }
     $manifestPath = Write-SealedPackage -PackageDir $packageDir -Manifest $manifest
     $verifyProblems = @(Test-SealedPackage -PackageDir $packageDir)
