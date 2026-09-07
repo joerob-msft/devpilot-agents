@@ -1,0 +1,108 @@
+{
+  "schemaVersion": 1,
+  "provider": "AzureDevOps",
+  "platform": {
+    "os": "Windows",
+    "device": "OfflineFixture",
+    "minimumPowerShellVersion": "7.0"
+  },
+  "repository": {
+    "organization": "contoso",
+    "project": "Widgets",
+    "name": "11111111-2222-3333-4444-555555555555",
+    "id": "11111111-2222-3333-4444-555555555555"
+  },
+  "customAgent": { "name": "", "source": "" },
+  "promptFile": "review-cycle.prompt.md",
+  "stateNamespace": "ExactPathFixture",
+  "operator": { "defaultAlias": "" },
+  "timing": {
+    "maxSourceCommitAgeDays": 14,
+    "consecutiveFailureThreshold": 3
+  },
+  "review": {
+    "targetRefName": "refs/heads/main",
+    "conventionSpecialistModel": "",
+    "verification": {
+      "schemaVersion": 1,
+      "enabled": false,
+      "conventionVerifierModel": "",
+      "timeoutSeconds": 30
+    },
+    "sourceTransport": {
+      "azureDevOpsCliFallback": {
+        "enabled": false,
+        "tenantId": "12121212-3434-5656-7878-909090909090"
+      }
+    },
+    "maxFindings": 8,
+    "postSeverities": ["critical", "important"],
+    "skipTitlePatterns": ["WIP", "DO NOT MERGE", "DRAFT", "[skip review]"],
+    "deliveryGates": { "disabled": false }
+  },
+  "threadClassification": {
+    "botIdentitySubstrings": ["Fixture Bot"],
+    "systemIdentitySubstrings": ["Fixture System"]
+  },
+  "repoConventions": {
+    "conventionDocPaths": [],
+    "customRules": "",
+    "authoritativeSources": {
+      "transportVersion": 1,
+      "maxTotalBytes": 4096,
+      "sources": [
+        {
+          "organization": "contoso",
+          "project": "Widgets",
+          "repositoryId": "11111111-2222-3333-4444-555555555555",
+          "path": "/docs/conventions.md",
+          "branch": "main",
+          "maxBytes": 1024,
+          "expectedByteLength": 35,
+          "expectedSha256": "82ae4e259f55c0fb1ac8aa1239e210ad0c3b2a43ab006b394affe94a10e16f72"
+        }
+      ]
+    },
+    "conventionPacks": {
+      "schemaVersion": 1,
+      "requireAllSourcesReferenced": true,
+      "authoritativeSources": {
+        "transportVersion": 1,
+        "maxTotalBytes": 1024,
+        "sources": [
+          {
+            "name": "widget-rules",
+            "organization": "contoso",
+            "project": "Widgets",
+            "repositoryId": "11111111-2222-3333-4444-555555555555",
+            "path": "/docs/conventions.md",
+            "branch": "main",
+            "maxBytes": 1024
+          }
+        ]
+      },
+      "packs": [
+        {
+          "name": "widget-core",
+          "priority": 100,
+          "changedPathGlobs": ["src/**/*.cs"],
+          "authoritativeSourceRefs": ["widget-rules"],
+          "repositorySources": [],
+          "maxBytes": 2048
+        }
+      ]
+    }
+  },
+  "permissions": {
+    "allowTools": [
+      "read",
+      "ado(repo_pull_request)",
+      "ado(repo_pull_request_thread)",
+      "ado(repo_search_commits)",
+      "ado(repo_repository)",
+      "ado(repo_file)",
+      "ado(repo_branch)"
+    ],
+    "denyTools": []
+  }
+}

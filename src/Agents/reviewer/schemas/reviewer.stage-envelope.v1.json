@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer.stage-envelope.v1.json",
+  "title": "Reviewer stage contract envelope, version 1",
+  "description": "Every stage child process writes its result as one envelope object to a caller-specified file. The envelope is closed: unknown fields are a contract violation rather than forward compatibility. The payload shape is governed by the registered contract named in 'kind', not by this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "envelopeVersion",
+    "kind",
+    "contractVersion",
+    "form",
+    "depth",
+    "payload"
+  ],
+  "properties": {
+    "envelopeVersion": {
+      "description": "Version of the envelope itself, independent of the payload contract version.",
+      "type": "integer",
+      "const": 1
+    },
+    "kind": {
+      "description": "Dotted lowercase contract name. The reader states the kind it expects and a mismatch fails closed, so a stage cannot silently consume another stage's artifact.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(\\.[a-z0-9][a-z0-9-]*)+$"
+    },
+    "contractVersion": {
+      "description": "Version of the payload contract. A reader accepts it only if the contract lists it as supported and an explicit adapter is registered for every version below the current one.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "form": {
+      "description": "Serialized form the writer committed to. The reader re-checks the bytes against this declaration, so an indented artifact claiming to be compact fails closed.",
+      "type": "string",
+      "enum": [
+        "compact",
+        "indented"
+      ]
+    },
+    "depth": {
+      "description": "ConvertTo-Json depth the writer used. Recorded explicitly because a host default silently truncates nested structures into type-name strings.",
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 64
+    },
+    "payload": {
+      "description": "The stage result object. Always an object: a bare array or scalar at this position is a collapsed payload and is rejected.",
+      "type": "object"
+    }
+  }
+}

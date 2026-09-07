@@ -1,0 +1,123 @@
+{
+  "contractVersion": "devpilot.shadow-cohort.manifest.v3",
+  "kind": "shadow-cohort-run",
+  "cohortId": "pilot-two-active",
+  "correlationId": "pilot-two-active-0001",
+  "toolkit": {
+    "repositoryRoot": "D:/toolkit/devpilot-agents",
+    "head": "0000000000000000000000000000000000000000",
+    "requiredRef": "refs/heads/main"
+  },
+  "execution": {
+    "concurrency": 1,
+    "stopPolicy": "failFast",
+    "authorizationKind": "PreviewOnly",
+    "commandPath": "dotnet",
+    "argumentPrefix": ["D:/toolkit/devpilot-agents/tools/ShadowRunCoordinator/bin/Release/net10.0/ShadowRunCoordinator.dll"],
+    "target": "deliveryTerminalVerified",
+    "entryTimeoutSeconds": 2700
+  },
+  "budgets": {
+    "maxPullRequests": 2,
+    "maxModelStarts": 540,
+    "maxVerifierAssignments": 512,
+    "maxWallClockSeconds": 5400,
+    "providerWriteBudget": 0
+  },
+  "journal": {
+    "root": "D:/shadow/pilot-two-active/journal"
+  },
+  "audit": {
+    "indexPath": "D:/shadow/pilot-two-active/index/cohort-index.json"
+  },
+  "registry": {
+    "path": "D:/shadow/registry/gate5-cohort-registry.json",
+    "sha256": "none",
+    "targetSubjectKey": "6d36015b4d63f04d37b220299afaa98a327b8da41a0f479eb86c899df97889ce",
+    "mode": "count"
+  },
+  "entries": [
+    {
+      "ordinal": 1,
+      "entryId": "pilot-entry-one",
+      "request": {
+        "path": "D:/shadow/pilot-two-active/requests/entry-one.request.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "output": {
+        "root": "D:/shadow/pilot-two-active/runs/entry-one"
+      },
+      "subject": {
+        "organization": "contoso",
+        "project": "ExampleProject",
+        "repository": "ExampleRepository",
+        "pullRequestId": 1,
+        "iterationId": 1,
+        "sourceCommit": "0000000000000000000000000000000000000000",
+        "commonCommit": "0000000000000000000000000000000000000000",
+        "targetCommit": "0000000000000000000000000000000000000000",
+        "targetRefName": "refs/heads/main"
+      },
+      "digests": {
+        "configSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "promptSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "schemaSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "ruleBundle": {
+        "sourceKind": "reviewedRepositoryDeclaration",
+        "declarationPath": "D:/shadow/pilot-two-active/rules/entry-one.convention-packs.json",
+        "declarationSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "planEstimate": {
+        "modelStarts": 270,
+        "verifierAssignments": 256,
+        "wallClockSeconds": 2700,
+        "modelStartBound": {
+          "path": "D:/shadow/pilot-two-active/bounds/entry-one.model-start-bound.json",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    },
+    {
+      "ordinal": 2,
+      "entryId": "pilot-entry-two",
+      "request": {
+        "path": "D:/shadow/pilot-two-active/requests/entry-two.request.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "output": {
+        "root": "D:/shadow/pilot-two-active/runs/entry-two"
+      },
+      "subject": {
+        "organization": "contoso",
+        "project": "ExampleProject",
+        "repository": "ExampleRepository",
+        "pullRequestId": 2,
+        "iterationId": 1,
+        "sourceCommit": "0000000000000000000000000000000000000000",
+        "commonCommit": "0000000000000000000000000000000000000000",
+        "targetCommit": "0000000000000000000000000000000000000000",
+        "targetRefName": "refs/heads/main"
+      },
+      "digests": {
+        "configSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "promptSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "schemaSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "ruleBundle": {
+        "sourceKind": "reviewedRepositoryDeclaration",
+        "declarationPath": "D:/shadow/pilot-two-active/rules/entry-two.convention-packs.json",
+        "declarationSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "planEstimate": {
+        "modelStarts": 270,
+        "verifierAssignments": 256,
+        "wallClockSeconds": 2700,
+        "modelStartBound": {
+          "path": "D:/shadow/pilot-two-active/bounds/entry-two.model-start-bound.json",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    }
+  ]
+}

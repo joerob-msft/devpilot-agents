@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer.blinded-acquisition-readiness.v1",
+  "title": "Reviewer blinded acquisition readiness",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "ready", "role", "model", "secondGeneralistModel", "conventionSpecialistEnabled", "conventionSpecialistModel", "fixture", "replay", "config", "supervision", "repository", "candidate", "output", "checks", "sideEffects"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "reviewer-blinded-acquisition-readiness" },
+    "ready": { "const": true },
+    "role": { "enum": ["generalist", "specialist", "verifier"] },
+    "model": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "secondGeneralistModel": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "conventionSpecialistEnabled": { "type": "boolean" },
+    "conventionSpecialistModel": {
+      "oneOf": [
+        { "type": "string", "minLength": 1, "maxLength": 128 },
+        { "type": "null" }
+      ]
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "projectionPath", "projectionSha256"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "projectionPath": { "type": "string", "minLength": 1 },
+        "projectionSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "replay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "snapshotName", "manifestDigest", "resourceCount", "payloadBytes", "nonPromotable"],
+      "properties": {
+        "root": { "type": "string", "minLength": 1 },
+        "snapshotName": { "type": "string", "minLength": 1 },
+        "manifestDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "resourceCount": { "type": "integer", "minimum": 1 },
+        "payloadBytes": { "type": "integer", "minimum": 1 },
+        "nonPromotable": { "type": "boolean" }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "supervision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["perCallTimeoutSeconds", "activityTimeoutSeconds", "totalTimeoutSeconds", "teardownMarginSeconds", "maximumAttempts"],
+      "properties": {
+        "perCallTimeoutSeconds": { "type": "integer", "minimum": 5, "maximum": 3600 },
+        "activityTimeoutSeconds": { "type": "integer", "minimum": 10, "maximum": 7200 },
+        "totalTimeoutSeconds": { "type": "integer", "minimum": 10, "maximum": 7200 },
+        "teardownMarginSeconds": { "const": 30 },
+        "maximumAttempts": { "type": "integer", "minimum": 1, "maximum": 3 }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "head", "ref", "baseCommit"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "head": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "ref": { "type": "string", "pattern": "^refs/" },
+        "baseCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      }
+    },
+    "candidate": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256", "clusterHash", "discoveryPackageRoot"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "clusterHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "discoveryPackageRoot": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "leasePath", "collisionFree"],
+      "properties": {
+        "root": { "type": "string", "minLength": 1 },
+        "leasePath": { "type": "string", "minLength": 1 },
+        "collisionFree": { "const": true }
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exactHead", "exactRef", "exactRepoPath", "bundleBound", "projectionBound", "replayLoadable", "configBound", "modelSupported", "roleFit", "candidateFit", "planFit", "noWrite"],
+      "properties": {
+        "exactHead": { "const": true },
+        "exactRef": { "const": true },
+        "exactRepoPath": { "const": true },
+        "bundleBound": { "const": true },
+        "projectionBound": { "const": true },
+        "replayLoadable": { "const": true },
+        "configBound": { "const": true },
+        "modelSupported": { "const": true },
+        "roleFit": { "const": true },
+        "candidateFit": { "const": true },
+        "planFit": { "const": true },
+        "noWrite": { "const": true }
+      }
+    },
+    "sideEffects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planFilesCreated", "tokensMinted", "leasesCreated", "processesStarted", "modelsStarted", "providerWrites"],
+      "properties": {
+        "planFilesCreated": { "const": 0 },
+        "tokensMinted": { "const": 0 },
+        "leasesCreated": { "const": 0 },
+        "processesStarted": { "const": 0 },
+        "modelsStarted": { "const": 0 },
+        "providerWrites": { "const": 0 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "conventionSpecialistEnabled": { "const": true } } },
+      "then": { "properties": { "conventionSpecialistModel": { "type": "string", "minLength": 1 } } },
+      "else": { "properties": { "conventionSpecialistModel": { "type": "null" } } }
+    }
+  ]
+}

@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 1,
+  "kind": "agent-replay-snapshot",
+  "snapshotId": "synthetic-convention-pr",
+  "capturedUtc": "20260101T000000Z",
+  "provider": "ado",
+  "binding": {
+    "organization": "contoso",
+    "project": "Widgets",
+    "repositoryId": "11111111-2222-3333-4444-555555555555",
+    "pullRequestId": 4242,
+    "sourceCommit": "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0",
+    "targetCommit": "f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9",
+    "changeSetSha256": "0bb7ae300b9336e3145432279dc9d54a2d7300e4ea0c6878745d25e69bd9d7c9"
+  },
+  "bindings": {
+    "configSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "scriptSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "promptSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "models": [
+      "claude-opus-5"
+    ]
+  },
+  "resources": [
+    {
+      "tool": "repo_pull_request",
+      "arguments": {
+        "action": "get",
+        "project": "Widgets",
+        "repositoryId": "11111111-2222-3333-4444-555555555555",
+        "pullRequestId": 4242
+      },
+      "requestSha256": "3e9350700af2a1542bffb5a26b7473d90246b8592d199da3beac413a579a3c34",
+      "payloadFile": "payloads/pr-get.json",
+      "payloadSha256": "58c12fa2ebe9b83e5de8f5ea663c8dcf1bbd6d2196697d34f019780ca02bae33",
+      "payloadByteLength": 627
+    },
+    {
+      "tool": "repo_pull_request",
+      "arguments": {
+        "action": "list",
+        "project": "Widgets",
+        "repositoryId": "11111111-2222-3333-4444-555555555555",
+        "status": "Active",
+        "targetRefName": "refs/heads/main",
+        "top": 100
+      },
+      "requestSha256": "c1e2f4b8f6611f886f32a2912f5c1751c299a668f1812dfc716f1c6367eb3a96",
+      "payloadFile": "payloads/pr-list.json",
+      "payloadSha256": "58c12fa2ebe9b83e5de8f5ea663c8dcf1bbd6d2196697d34f019780ca02bae33",
+      "payloadByteLength": 627
+    },
+    {
+      "tool": "repo_pull_request",
+      "arguments": {
+        "action": "get_changes",
+        "project": "Widgets",
+        "repositoryId": "11111111-2222-3333-4444-555555555555",
+        "pullRequestId": 4242,
+        "includeDiffs": true,
+        "includeLineContent": true,
+        "top": 1000
+      },
+      "requestSha256": "d27fd1ac53f3ddd37ff9e865ec9a36ffb914c1d0b5b99ca4aa76e195d88ff357",
+      "payloadFile": "payloads/pr-changes.json",
+      "payloadSha256": "0bb7ae300b9336e3145432279dc9d54a2d7300e4ea0c6878745d25e69bd9d7c9",
+      "payloadByteLength": 693
+    },
+    {
+      "tool": "repo_pull_request",
+      "arguments": {
+        "action": "get_changes",
+        "project": "Widgets",
+        "repositoryId": "11111111-2222-3333-4444-555555555555",
+        "pullRequestId": 4242,
+        "top": 1000
+      },
+      "requestSha256": "e2ddfc82421505fe95bf2e9f448bff464368723d222733c57b089184fb7c95dd",
+      "payloadFile": "payloads/pr-changes.json",
+      "payloadSha256": "0bb7ae300b9336e3145432279dc9d54a2d7300e4ea0c6878745d25e69bd9d7c9",
+      "payloadByteLength": 693
+    },
+    {
+      "tool": "repo_pull_request_thread",
+      "arguments": {
+        "action": "list",
+        "project": "Widgets",
+        "repositoryId": "11111111-2222-3333-4444-555555555555",
+        "pullRequestId": 4242,
+        "top": 200
+      },
+      "requestSha256": "6d5187fb26a4a16d9266c8e9f8bbc4566a0b9b916b045f6dca82fc612111d1ea",
+      "payloadFile": "payloads/pr-threads.json",
+      "payloadSha256": "203303a16f8f8224150d0909a75187b2c832ac83ed83ba989bf5bf76720f0053",
+      "payloadByteLength": 402
+    },
+    {
+      "tool": "repo_branch",
+      "arguments": {
+        "action": "get",
+        "project": "Widgets",
+        "repositoryId": "11111111-2222-3333-4444-555555555555",
+        "branchName": "main"
+      },
+      "requestSha256": "0857ce27cba7145d8f015d80a7821bce42640b8ee023b768efb6b4e57c77081f",
+      "payloadFile": "payloads/branch-main.json",
+      "payloadSha256": "1cd13f48eee416155a8c8a5a217c76606b7ad7838fe1abfbd7be124994245bdb",
+      "payloadByteLength": 180
+    },
+    {
+      "tool": "repo_file",
+      "arguments": {
+        "action": "get_content",
+        "project": "Widgets",
+        "repositoryId": "11111111-2222-3333-4444-555555555555",
+        "path": "/src/Widget.cs",
+        "versionType": "Commit",
+        "version": "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0"
+      },
+      "requestSha256": "fe76bc5ef5a59ebeb645943a87f72afb5dfdf5673dccefcee710511afa9c69f0",
+      "payloadFile": "payloads/file-widget.json",
+      "payloadSha256": "066da5435dca9f0fb3e14624eb0b97febb9e8e35bfcd463624b7106001c2e614",
+      "payloadByteLength": 689
+    },
+    {
+      "tool": "repo_file",
+      "arguments": {
+        "action": "get_content",
+        "project": "Widgets",
+        "repositoryId": "11111111-2222-3333-4444-555555555555",
+        "path": "/docs/conventions.md",
+        "versionType": "Commit",
+        "version": "f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9"
+      },
+      "requestSha256": "b072d63d93902601a8deb51b624f30559776cf3e56312ea23bb1c231f010b950",
+      "payloadFile": "payloads/file-conventions.json",
+      "payloadSha256": "68c4f41ba0285c1dc46a07492813b7a3bee4ef4b0b3d78bab414887768e448c7",
+      "payloadByteLength": 439
+    },
+    {
+      "tool": "repo_repository",
+      "arguments": {
+        "action": "get",
+        "project": "Widgets",
+        "repositoryNameOrId": "11111111-2222-3333-4444-555555555555"
+      },
+      "requestSha256": "58e172c7591c8bc9c8054257f8f14e037067eb4ee76494f045b58c3b8143f621",
+      "payloadFile": "payloads/repo-identity.json",
+      "payloadSha256": "31da36c6365ee9607cbd36a3e5c0698befaa848fb9068b68e0e6648ffe68e2f3",
+      "payloadByteLength": 191
+    }
+  ],
+  "manifestDigest": "2b75bc21539276e22ee5b01e6c6b3f06442b59806a8c14528b831472cf14ed65"
+}

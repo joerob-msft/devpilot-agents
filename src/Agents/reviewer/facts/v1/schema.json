@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:facts:v1",
+  "title": "DevPilot deterministic review fact plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "planVersion",
+    "schemaVersion",
+    "extractorVersion",
+    "status",
+    "binding",
+    "hashes",
+    "domains",
+    "facts",
+    "factCount",
+    "canonicalBytes",
+    "planSha256"
+  ],
+  "properties": {
+    "planVersion": { "const": 1 },
+    "schemaVersion": { "const": 1 },
+    "extractorVersion": { "const": "review-facts-v1" },
+    "status": { "enum": ["complete", "partial", "failed"] },
+    "binding": { "$ref": "#/$defs/binding" },
+    "hashes": { "$ref": "#/$defs/hashes" },
+    "domains": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/domain" },
+      "minItems": 5,
+      "maxItems": 5
+    },
+    "facts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fact" }
+    },
+    "factCount": { "type": "integer", "minimum": 0 },
+    "canonicalBytes": { "type": "integer", "minimum": 0, "maximum": 262144 },
+    "planSha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "organization",
+        "project",
+        "repositoryId",
+        "pullRequestId",
+        "sourceCommit",
+        "targetCommit",
+        "changeSetDigest"
+      ],
+      "properties": {
+        "organization": { "type": "string", "minLength": 1 },
+        "project": { "type": "string", "minLength": 1 },
+        "repositoryId": { "type": "string", "minLength": 1 },
+        "pullRequestId": { "type": "integer", "minimum": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "targetCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "changeSetDigest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "configSha256",
+        "policySha256",
+        "scriptClosure"
+      ],
+      "properties": {
+        "configSha256": { "$ref": "#/$defs/sha256" },
+        "policySha256": { "$ref": "#/$defs/sha256" },
+        "scriptClosure": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      }
+    },
+    "domain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "status", "errorCode", "errorMessage", "factCount"],
+      "properties": {
+        "name": {
+          "enum": ["metadata", "cloudTest", "fanOut", "threads", "changes"]
+        },
+        "status": { "enum": ["complete", "notApplicable", "failed"] },
+        "errorCode": { "type": "string" },
+        "errorMessage": { "type": "string" },
+        "factCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceType",
+        "path",
+        "lineStart",
+        "lineEnd",
+        "field",
+        "sha256"
+      ],
+      "properties": {
+        "sourceType": { "type": "string", "minLength": 1 },
+        "path": { "type": "string" },
+        "lineStart": { "type": "integer", "minimum": 0 },
+        "lineEnd": { "type": "integer", "minimum": 0 },
+        "field": { "type": "string" },
+        "sha256": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256" },
+            { "const": "" }
+          ]
+        }
+      }
+    },
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "domain",
+        "kind",
+        "subject",
+        "state",
+        "unknownReason",
+        "value",
+        "evidence",
+        "provenance"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^rf1:[0-9a-f]{64}$" },
+        "domain": {
+          "enum": ["metadata", "cloudTest", "fanOut", "threads", "changes"]
+        },
+        "kind": { "type": "string", "minLength": 1 },
+        "subject": { "type": "string", "minLength": 1 },
+        "state": { "enum": ["true", "false", "unknown", "notApplicable"] },
+        "unknownReason": {
+          "enum": [
+            "",
+            "transportFailed",
+            "absent",
+            "unprovable",
+            "truncated",
+            "capExceeded",
+            "malformed",
+            "snapshotMoved"
+          ]
+        },
+        "value": {},
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidence" }
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["extractorVersion", "inputSha256", "trustTier"],
+          "properties": {
+            "extractorVersion": { "const": "review-facts-v1" },
+            "inputSha256": { "$ref": "#/$defs/sha256" },
+            "trustTier": {
+              "enum": [
+                "wrapper-observed",
+                "source-commit",
+                "target-policy",
+                "untrusted-author-controlled"
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

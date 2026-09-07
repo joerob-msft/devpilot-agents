@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-blinded-fixture-projection",
+  "fixtureId": "synthetic-generalist-acq",
+  "role": "generalist",
+  "binding": {
+    "prId": 4242,
+    "repositoryId": "11111111-2222-3333-4444-555555555555",
+    "project": "Widgets",
+    "sourceCommit": "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0",
+    "targetCommit": "f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9",
+    "changeSetDigest": "0bb7ae300b9336e3145432279dc9d54a2d7300e4ea0c6878745d25e69bd9d7c9"
+  },
+  "generalist": {
+    "sourceBranch": "refs/heads/feature/widget-rename",
+    "authorAlias": "synthetic-author",
+    "title": "Rename widget identifier",
+    "threadDigestText": "No prior review threads. The change renames a construction-stable identifier in /src/Widget.cs.",
+    "authoritativeSourcesText": "",
+    "pinnedSourceText": ""
+  }
+}

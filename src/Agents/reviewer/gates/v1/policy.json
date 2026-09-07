@@ -1,0 +1,32 @@
+{
+  "_note": "Shipped default is ALL-OFF by construction. This file ships INSIDE the reviewed repository's toolkit checkout, so it must never be able to enable unattended behavior on its own. Real enablement requires an out-of-repo policy file (-GatePolicyFile, or <StateDir>/gate-policy.json outside the reviewed repository) PLUS an explicit CLI switch PLUS a verified qualification artifact. See docs/delivery-gates.md.",
+  "schemaVersion": 1,
+  "policyVersion": 1,
+  "mode": "off",
+  "maxCommentsPerRun": 3,
+  "maxSuggestionsPerRun": 0,
+  "maxDecisionAgeSeconds": 1800,
+  "maxQualificationAgeDays": 30,
+  "minPrecisionLowerBound95": 0.95,
+  "minRecallLowerBound95": 0.6,
+  "minCommentSampleCount": 200,
+  "minApprovalSampleCount": 150,
+  "maxApprovalFalsePositives": 0,
+  "requirePriorRunEligibility": true,
+  "requireCanaryConfirmation": true,
+  "severities": {
+    "critical": { "unattendedComment": false, "humanPromotedComment": true },
+    "important": { "unattendedComment": false, "humanPromotedComment": true },
+    "suggestion": { "unattendedComment": false, "humanPromotedComment": false }
+  },
+  "packs": [
+    { "name": "(generalist)", "unattendedComment": false, "humanPromotedComment": true }
+  ],
+  "approval": {
+    "enabled": false,
+    "requireChecks": true,
+    "requiredCheckNames": [],
+    "requireDismissStaleReviews": true,
+    "allowOperatorAttestedDismissal": false
+  }
+}

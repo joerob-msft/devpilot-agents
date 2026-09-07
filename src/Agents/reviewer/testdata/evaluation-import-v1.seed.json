@@ -1,0 +1,275 @@
+{
+  "_note": "NON-QUALIFYING SEED FIXTURE. Every record is status 'seed': synthetic provenance, synthetic labels, synthetic pins. It exists to exercise the harness end to end offline, and it can never satisfy a rollout requirement no matter how good its numbers look - Test-ReviewerEvalRolloutQualification vetoes any corpus containing a seed record. Real corpus population requires genuinely sourced, provenance-bound pull requests imported through tools/Import-ReviewerEvalCorpus.ps1.",
+  "name": "reviewer-eval-seed",
+  "corpusVersion": 1,
+  "corpusPin": {
+    "repositoryId": "example-org/example-toolkit",
+    "commitSha": "1111111111111111111111111111111111111111"
+  },
+  "holdoutPercent": 20,
+  "partitionSalt": "seed-partition-salt-0001",
+  "adjudicationSalt": "seed-adjudication-salt-0001",
+  "frozenAtEpochSeconds": 1767225600,
+  "records": [
+    {
+      "status": "seed",
+      "stratum": "csharp",
+      "provenance": {
+        "provider": "GitHub",
+        "repositoryId": "example-org/example-service",
+        "prId": "101",
+        "sourceCommitSha": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "targetCommitSha": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+        "changeSetSha256": "c101c101c101c101c101c101c101c101c101c101c101c101c101c101c101c101",
+        "changedFilePathsSha256": "d101d101d101d101d101d101d101d101d101d101d101d101d101d101d101d101",
+        "sourceRef": "refs/heads/seed/csharp",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "csharp-null-deref", "issueClass": "nullReference", "severity": "critical", "convention": false, "correctness": true, "path": "src/Service/Handler.cs" },
+        { "issueId": "csharp-naming", "issueClass": "namingConvention", "severity": "suggestion", "convention": true, "correctness": false, "path": "src/Service/Handler.cs" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-a", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225601, "issueIds": ["csharp-naming", "csharp-null-deref"], "decision": "reject" },
+        { "labelerId": "seed-labeler-b", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225602, "issueIds": ["csharp-naming", "csharp-null-deref"], "decision": "reject" }
+      ],
+      "adjudication": null
+    },
+    {
+      "status": "seed",
+      "stratum": "tests",
+      "provenance": {
+        "provider": "GitHub",
+        "repositoryId": "example-org/example-service",
+        "prId": "102",
+        "sourceCommitSha": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+        "targetCommitSha": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "changeSetSha256": "c102c102c102c102c102c102c102c102c102c102c102c102c102c102c102c102",
+        "changedFilePathsSha256": "d102d102d102d102d102d102d102d102d102d102d102d102d102d102d102d102",
+        "sourceRef": "refs/heads/seed/tests",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "tests-missing-negative", "issueClass": "testCoverage", "severity": "important", "convention": false, "correctness": true, "path": "test/Service/HandlerTests.cs" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-a", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225603, "issueIds": ["tests-missing-negative"], "decision": "reject" },
+        { "labelerId": "seed-labeler-b", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225604, "issueIds": ["tests-missing-negative"], "decision": "reject" }
+      ],
+      "adjudication": null
+    },
+    {
+      "status": "seed",
+      "stratum": "deployment",
+      "provenance": {
+        "provider": "AzureDevOps",
+        "repositoryId": "example-org/example-deploy",
+        "prId": "103",
+        "sourceCommitSha": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+        "targetCommitSha": "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3",
+        "changeSetSha256": "c103c103c103c103c103c103c103c103c103c103c103c103c103c103c103c103",
+        "changedFilePathsSha256": "d103d103d103d103d103d103d103d103d103d103d103d103d103d103d103d103",
+        "sourceRef": "refs/heads/seed/deployment",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "deploy-rollback-gap", "issueClass": "deploymentSafety", "severity": "important", "convention": false, "correctness": true, "path": "deploy/pipeline.yml" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-a", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225605, "issueIds": ["deploy-rollback-gap"], "decision": "reject" },
+        { "labelerId": "seed-labeler-c", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225606, "issueIds": [], "decision": "approve" }
+      ],
+      "adjudication": {
+        "adjudicatorId": "seed-adjudicator-z",
+        "adjudicatorKind": "human",
+        "adjudicatedAtEpochSeconds": 1767225607,
+        "issueIds": ["deploy-rollback-gap"],
+        "decision": "reject"
+      }
+    },
+    {
+      "status": "seed",
+      "stratum": "settings",
+      "provenance": {
+        "provider": "GitHub",
+        "repositoryId": "example-org/example-service",
+        "prId": "104",
+        "sourceCommitSha": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+        "targetCommitSha": "b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4",
+        "changeSetSha256": "c104c104c104c104c104c104c104c104c104c104c104c104c104c104c104c104",
+        "changedFilePathsSha256": "d104d104d104d104d104d104d104d104d104d104d104d104d104d104d104d104",
+        "sourceRef": "refs/heads/seed/settings",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "settings-default-drift", "issueClass": "configurationDrift", "severity": "important", "convention": true, "correctness": false, "path": "config/appsettings.json" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-b", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225608, "issueIds": ["settings-default-drift"], "decision": "reject" },
+        { "labelerId": "seed-labeler-c", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225609, "issueIds": ["settings-default-drift"], "decision": "reject" }
+      ],
+      "adjudication": null
+    },
+    {
+      "status": "seed",
+      "stratum": "security",
+      "provenance": {
+        "provider": "GitHub",
+        "repositoryId": "example-org/example-service",
+        "prId": "105",
+        "sourceCommitSha": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "targetCommitSha": "b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5",
+        "changeSetSha256": "c105c105c105c105c105c105c105c105c105c105c105c105c105c105c105c105",
+        "changedFilePathsSha256": "d105d105d105d105d105d105d105d105d105d105d105d105d105d105d105d105",
+        "sourceRef": "refs/heads/seed/security",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "security-unvalidated-input", "issueClass": "inputValidation", "severity": "critical", "convention": false, "correctness": true, "path": "src/Service/Api.cs" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-a", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225610, "issueIds": ["security-unvalidated-input"], "decision": "reject" },
+        { "labelerId": "seed-labeler-b", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225611, "issueIds": ["security-unvalidated-input"], "decision": "reject" }
+      ],
+      "adjudication": null
+    },
+    {
+      "status": "seed",
+      "stratum": "generatedCode",
+      "provenance": {
+        "provider": "GitHub",
+        "repositoryId": "example-org/example-service",
+        "prId": "106",
+        "sourceCommitSha": "a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6",
+        "targetCommitSha": "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6",
+        "changeSetSha256": "c106c106c106c106c106c106c106c106c106c106c106c106c106c106c106c106",
+        "changedFilePathsSha256": "d106d106d106d106d106d106d106d106d106d106d106d106d106d106d106d106",
+        "sourceRef": "refs/heads/seed/generated",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "generated-hand-edit", "issueClass": "generatedCodeEdit", "severity": "important", "convention": true, "correctness": false, "path": "src/Service/Generated/Client.g.cs" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-a", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225612, "issueIds": ["generated-hand-edit"], "decision": "reject" },
+        { "labelerId": "seed-labeler-c", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225613, "issueIds": [], "decision": "approve" }
+      ],
+      "adjudication": null
+    },
+    {
+      "status": "seed",
+      "stratum": "resources",
+      "provenance": {
+        "provider": "GitHub",
+        "repositoryId": "example-org/example-service",
+        "prId": "107",
+        "sourceCommitSha": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+        "targetCommitSha": "b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7",
+        "changeSetSha256": "c107c107c107c107c107c107c107c107c107c107c107c107c107c107c107c107",
+        "changedFilePathsSha256": "d107d107d107d107d107d107d107d107d107d107d107d107d107d107d107d107",
+        "sourceRef": "refs/heads/seed/resources",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "resources-missing-string", "issueClass": "resourceFanOut", "severity": "important", "convention": true, "correctness": false, "path": "src/Service/Resources/Messages.resx" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-b", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225614, "issueIds": ["resources-missing-string"], "decision": "reject" },
+        { "labelerId": "seed-labeler-c", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225615, "issueIds": ["resources-missing-string"], "decision": "reject" }
+      ],
+      "adjudication": null
+    },
+    {
+      "status": "seed",
+      "stratum": "serviceProviders",
+      "provenance": {
+        "provider": "GitHub",
+        "repositoryId": "example-org/example-service",
+        "prId": "108",
+        "sourceCommitSha": "a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8",
+        "targetCommitSha": "b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8",
+        "changeSetSha256": "c108c108c108c108c108c108c108c108c108c108c108c108c108c108c108c108",
+        "changedFilePathsSha256": "d108d108d108d108d108d108d108d108d108d108d108d108d108d108d108d108",
+        "sourceRef": "refs/heads/seed/providers",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "provider-registration-gap", "issueClass": "serviceRegistration", "severity": "important", "convention": true, "correctness": true, "path": "src/Service/Providers/Registration.cs" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-a", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225616, "issueIds": ["provider-registration-gap"], "decision": "reject" },
+        { "labelerId": "seed-labeler-b", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225617, "issueIds": ["provider-registration-gap"], "decision": "reject" }
+      ],
+      "adjudication": null
+    },
+    {
+      "status": "seed",
+      "stratum": "docs",
+      "provenance": {
+        "provider": "GitHub",
+        "repositoryId": "example-org/example-service",
+        "prId": "109",
+        "sourceCommitSha": "a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9",
+        "targetCommitSha": "b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9",
+        "changeSetSha256": "c109c109c109c109c109c109c109c109c109c109c109c109c109c109c109c109",
+        "changedFilePathsSha256": "d109d109d109d109d109d109d109d109d109d109d109d109d109d109d109d109",
+        "sourceRef": "refs/heads/seed/docs",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "docs-stale-example", "issueClass": "documentationDrift", "severity": "suggestion", "convention": false, "correctness": false, "path": "docs/usage.md" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-a", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225618, "issueIds": ["docs-stale-example"], "decision": "approve" },
+        { "labelerId": "seed-labeler-b", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225619, "issueIds": ["docs-stale-example"], "decision": "approve" }
+      ],
+      "adjudication": null
+    },
+    {
+      "status": "seed",
+      "stratum": "csharp",
+      "provenance": {
+        "provider": "GitHub",
+        "repositoryId": "example-org/example-service",
+        "prId": "110",
+        "sourceCommitSha": "aaa0aaa0aaa0aaa0aaa0aaa0aaa0aaa0aaa0aaa0",
+        "targetCommitSha": "bbb0bbb0bbb0bbb0bbb0bbb0bbb0bbb0bbb0bbb0",
+        "changeSetSha256": "c110c110c110c110c110c110c110c110c110c110c110c110c110c110c110c110",
+        "changedFilePathsSha256": "d110d110d110d110d110d110d110d110d110d110d110d110d110d110d110d110",
+        "sourceRef": "refs/heads/seed/csharp-two",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "csharp-race", "issueClass": "concurrency", "severity": "critical", "convention": false, "correctness": true, "path": "src/Service/Cache.cs" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-a", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225620, "issueIds": ["csharp-race"], "decision": "reject" },
+        { "labelerId": "seed-labeler-b", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225621, "issueIds": ["csharp-race"], "decision": "reject" }
+      ],
+      "adjudication": null
+    },
+    {
+      "status": "seed",
+      "stratum": "tests",
+      "provenance": {
+        "provider": "GitHub",
+        "repositoryId": "example-org/example-service",
+        "prId": "111",
+        "sourceCommitSha": "aaa1aaa1aaa1aaa1aaa1aaa1aaa1aaa1aaa1aaa1",
+        "targetCommitSha": "bbb1bbb1bbb1bbb1bbb1bbb1bbb1bbb1bbb1bbb1",
+        "changeSetSha256": "c111c111c111c111c111c111c111c111c111c111c111c111c111c111c111c111",
+        "changedFilePathsSha256": "d111d111d111d111d111d111d111d111d111d111d111d111d111d111d111d111",
+        "sourceRef": "refs/heads/seed/tests-two",
+        "importedAtEpochSeconds": 1767225600
+      },
+      "inventory": [
+        { "issueId": "tests-flaky-wait", "issueClass": "testReliability", "severity": "important", "convention": false, "correctness": true, "path": "test/Service/CacheTests.cs" }
+      ],
+      "labels": [
+        { "labelerId": "seed-labeler-b", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225622, "issueIds": ["tests-flaky-wait"], "decision": "reject" },
+        { "labelerId": "seed-labeler-c", "labelerKind": "human", "blind": true, "labeledAtEpochSeconds": 1767225623, "issueIds": ["tests-flaky-wait"], "decision": "reject" }
+      ],
+      "adjudication": null
+    }
+  ]
+}

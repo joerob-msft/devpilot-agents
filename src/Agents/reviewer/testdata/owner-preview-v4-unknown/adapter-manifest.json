@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-offline-model-adapter",
+  "fixtureId": "owner-preview-v4-unknown",
+  "expectedBaseCommit": "ccbf14632064118f008539becec2fef77030cf54",
+  "adapterScript": "../../offline/Invoke-ReviewerModelAdapter.ps1",
+  "adapterScriptSha256": "dd700f09b82bca0c1503ff0adf66987d98efa4407cfb519d46dc29887ff4658b",
+  "classification": {
+    "offlineOnly": true,
+    "nonPromotable": true,
+    "writesPermitted": false,
+    "outputsPreAuthored": true,
+    "oracleDerivedAtRuntime": false
+  },
+  "roles": {
+    "specialist": {
+      "model": "claude-sonnet-5",
+      "behavior": "success",
+      "markerPrefix": "CONVENTION_REVIEW_RESULT_V4:",
+      "markerTemplate": {
+        "schemaVersion": 4,
+        "prId": "{{binding.prId}}",
+        "repositoryId": "{{binding.repositoryId}}",
+        "project": "{{binding.project}}",
+        "reviewedSourceCommit": "{{binding.reviewedSourceCommit}}",
+        "targetCommit": "{{binding.targetCommit}}",
+        "changeSetDigest": "{{binding.changeSetDigest}}",
+        "conventionPlanSha256": "{{binding.conventionPlanSha256}}",
+        "factPlanSha256": "{{binding.factPlanSha256}}",
+        "configSha256": "{{binding.configSha256}}",
+        "scriptSha256": "{{binding.scriptSha256}}",
+        "promptSha256": "{{binding.promptSha256}}",
+        "assessments": [
+          {
+            "ruleRef": "rs0",
+            "constructs": [
+              { "constructRef": "mi0", "verdict": "unknown" },
+              { "constructRef": "mi1", "verdict": "unknown" },
+              { "constructRef": "mi2", "verdict": "unknown" },
+              { "constructRef": "mi3", "verdict": "unknown" },
+              { "constructRef": "mi4", "verdict": "unknown" },
+              { "constructRef": "mi5", "verdict": "unknown" },
+              { "constructRef": "mi6", "verdict": "unknown" },
+              { "constructRef": "mi7", "verdict": "unknown" },
+              { "constructRef": "mi8", "verdict": "unknown" },
+              { "constructRef": "mi9", "verdict": "unknown" },
+              { "constructRef": "mi10", "verdict": "unknown" },
+              { "constructRef": "mi11", "verdict": "unknown" },
+              { "constructRef": "mi12", "verdict": "unknown" },
+              { "constructRef": "mi13", "verdict": "unknown" },
+              { "constructRef": "mi14", "verdict": "unknown" },
+              { "constructRef": "dc0", "verdict": "unknown" },
+              { "constructRef": "dc1", "verdict": "unknown" },
+              { "constructRef": "dc2", "verdict": "unknown" },
+              { "constructRef": "dc3", "verdict": "unknown" },
+              { "constructRef": "dc4", "verdict": "unknown" },
+              { "constructRef": "dc5", "verdict": "unknown" },
+              { "constructRef": "dc6", "verdict": "unknown" },
+              { "constructRef": "cm0", "verdict": "unknown" },
+              { "constructRef": "cm1", "verdict": "unknown" },
+              { "constructRef": "cm2", "verdict": "unknown" },
+              { "constructRef": "cm3", "verdict": "unknown" },
+              { "constructRef": "cm4", "verdict": "unknown" },
+              { "constructRef": "cm5", "verdict": "unknown" },
+              { "constructRef": "cm6", "verdict": "unknown" },
+              { "constructRef": "cm7", "verdict": "unknown" },
+              { "constructRef": "cm8", "verdict": "unknown" },
+              { "constructRef": "cm9", "verdict": "unknown" }
+            ],
+            "notes": []
+          }
+        ],
+        "withheld": [],
+        "residualRisks": [],
+        "nonce": "{{binding.nonce}}"
+      }
+    }
+  }
+}

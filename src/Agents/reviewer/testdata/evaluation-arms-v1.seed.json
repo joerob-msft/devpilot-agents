@@ -1,0 +1,95 @@
+{
+  "_note": "NON-QUALIFYING SEED FIXTURE for the three evaluation arms and their blind claim verdicts. Derived identifiers (exampleId, blindClaimKey, claimContentSha256, presentedSha256, presentationOrderSha256) are deliberately NOT stored here: they are functions of the frozen corpus hash and are recomputed by the harness, so a hand-edited fixture cannot smuggle in a key that does not match its own content. Claims are referenced by a stable claimRef so that two arms emitting the same claim share one verdict, exactly as the blind key would.",
+  "pricingTableVersion": "seed-2026-01",
+  "rates": [
+    { "model": "seed-generalist-one", "inputMicroUsdPerKiloToken": 3000, "outputMicroUsdPerKiloToken": 15000 },
+    { "model": "seed-generalist-two", "inputMicroUsdPerKiloToken": 2500, "outputMicroUsdPerKiloToken": 12000 },
+    { "model": "seed-specialist", "inputMicroUsdPerKiloToken": 1000, "outputMicroUsdPerKiloToken": 5000 },
+    { "model": "seed-verifier", "inputMicroUsdPerKiloToken": 2500, "outputMicroUsdPerKiloToken": 12000 }
+  ],
+  "models": {
+    "generalists": ["seed-generalist-one", "seed-generalist-two"],
+    "conventionSpecialist": "seed-specialist",
+    "conventionVerifier": "seed-verifier"
+  },
+  "claims": {
+    "c-csharp-null": { "issueClass": "nullReference", "severity": "critical", "path": "src/Service/Handler.cs", "pack": "(generalist)", "text": "Handler dereferences the request payload before the null guard runs." },
+    "c-csharp-noise": { "issueClass": "readability", "severity": "important", "path": "src/Service/Handler.cs", "pack": "(generalist)", "text": "Consider extracting this block into a helper for readability." },
+    "c-csharp-naming": { "issueClass": "namingConvention", "severity": "suggestion", "path": "src/Service/Handler.cs", "pack": "seed-conventions", "text": "Private field does not follow the repository naming convention." },
+    "c-tests-missing": { "issueClass": "testCoverage", "severity": "important", "path": "test/Service/HandlerTests.cs", "pack": "(generalist)", "text": "No negative-path test covers the new failure branch." },
+    "c-deploy-rollback": { "issueClass": "deploymentSafety", "severity": "important", "path": "deploy/pipeline.yml", "pack": "(generalist)", "text": "This stage has no rollback path if the migration step fails." },
+    "c-settings-drift": { "issueClass": "configurationDrift", "severity": "important", "path": "config/appsettings.json", "pack": "seed-conventions", "text": "Default value diverges from the documented settings convention." },
+    "c-security-input": { "issueClass": "inputValidation", "severity": "critical", "path": "src/Service/Api.cs", "pack": "(generalist)", "text": "Request field reaches the query builder without validation." },
+    "c-generated-edit": { "issueClass": "generatedCodeEdit", "severity": "important", "path": "src/Service/Generated/Client.g.cs", "pack": "seed-conventions", "text": "Generated file carries a hand edit that regeneration will discard." },
+    "c-resources-string": { "issueClass": "resourceFanOut", "severity": "important", "path": "src/Service/Resources/Messages.resx", "pack": "seed-conventions", "text": "New message key is missing from the companion resource files." },
+    "c-provider-reg": { "issueClass": "serviceRegistration", "severity": "important", "path": "src/Service/Providers/Registration.cs", "pack": "seed-conventions", "text": "Provider is constructed directly instead of being registered." },
+    "c-docs-stale": { "issueClass": "documentationDrift", "severity": "suggestion", "path": "docs/usage.md", "pack": "(generalist)", "text": "The usage example still shows the removed parameter." },
+    "c-csharp-race": { "issueClass": "concurrency", "severity": "critical", "path": "src/Service/Cache.cs", "pack": "(generalist)", "text": "Cache entry is published before its initialization completes." },
+    "c-tests-flaky": { "issueClass": "testReliability", "severity": "important", "path": "test/Service/CacheTests.cs", "pack": "(generalist)", "text": "Test waits on a fixed delay instead of the completion signal." }
+  },
+  "arms": [
+    {
+      "arm": "generalistOnly",
+      "results": [
+        { "prId": "101", "status": "complete", "vote": "none", "claimRefs": ["c-csharp-null", "c-csharp-noise"], "observation": { "latencyMs": 41000, "inputTokens": 18000, "outputTokens": 900, "costMicroUsd": 67500 } },
+        { "prId": "102", "status": "complete", "vote": "none", "claimRefs": ["c-tests-missing"], "observation": { "latencyMs": 33000, "inputTokens": 12000, "outputTokens": 600, "costMicroUsd": 45000 } },
+        { "prId": "103", "status": "complete", "vote": "approve", "claimRefs": [], "observation": { "latencyMs": 29000, "inputTokens": 9000, "outputTokens": 300, "costMicroUsd": 31500 } },
+        { "prId": "104", "status": "complete", "vote": "approve", "claimRefs": [], "observation": { "latencyMs": 27000, "inputTokens": 8000, "outputTokens": 250, "costMicroUsd": 27000 } },
+        { "prId": "105", "status": "complete", "vote": "none", "claimRefs": ["c-security-input"], "observation": { "latencyMs": 38000, "inputTokens": 15000, "outputTokens": 700, "costMicroUsd": 55500 } },
+        { "prId": "106", "status": "complete", "vote": "approve", "claimRefs": [], "observation": { "latencyMs": 24000, "inputTokens": 7000, "outputTokens": 200, "costMicroUsd": 24000 } },
+        { "prId": "107", "status": "complete", "vote": "approve", "claimRefs": [], "observation": { "latencyMs": 26000, "inputTokens": 7500, "outputTokens": 220, "costMicroUsd": 25500 } },
+        { "prId": "108", "status": "complete", "vote": "approve", "claimRefs": [], "observation": { "latencyMs": 25000, "inputTokens": 7200, "outputTokens": 210, "costMicroUsd": 24600 } },
+        { "prId": "109", "status": "complete", "vote": "approve", "claimRefs": ["c-docs-stale"], "observation": { "latencyMs": 21000, "inputTokens": 5000, "outputTokens": 180, "costMicroUsd": 17700 } },
+        { "prId": "110", "status": "complete", "vote": "none", "claimRefs": ["c-csharp-race"], "observation": { "latencyMs": 36000, "inputTokens": 13000, "outputTokens": 650, "costMicroUsd": 48750 } },
+        { "prId": "111", "status": "complete", "vote": "approve", "claimRefs": [], "observation": { "latencyMs": 23000, "inputTokens": 6500, "outputTokens": 190, "costMicroUsd": 22350 } }
+      ]
+    },
+    {
+      "arm": "multiPassDiscovery",
+      "results": [
+        { "prId": "101", "status": "complete", "vote": "none", "claimRefs": ["c-csharp-null", "c-csharp-noise", "c-csharp-naming"], "observation": { "latencyMs": 96000, "inputTokens": 41000, "outputTokens": 2100, "costMicroUsd": 154500 } },
+        { "prId": "102", "status": "complete", "vote": "none", "claimRefs": ["c-tests-missing", "c-tests-missing"], "observation": { "latencyMs": 74000, "inputTokens": 28000, "outputTokens": 1400, "costMicroUsd": 105000 } },
+        { "prId": "103", "status": "complete", "vote": "none", "claimRefs": ["c-deploy-rollback"], "observation": { "latencyMs": 68000, "inputTokens": 22000, "outputTokens": 1100, "costMicroUsd": 82500 } },
+        { "prId": "104", "status": "complete", "vote": "none", "claimRefs": ["c-settings-drift"], "observation": { "latencyMs": 61000, "inputTokens": 19000, "outputTokens": 950, "costMicroUsd": 71250 } },
+        { "prId": "105", "status": "complete", "vote": "none", "claimRefs": ["c-security-input"], "observation": { "latencyMs": 82000, "inputTokens": 33000, "outputTokens": 1600, "costMicroUsd": 123000 } },
+        { "prId": "106", "status": "complete", "vote": "none", "claimRefs": ["c-generated-edit"], "observation": { "latencyMs": 57000, "inputTokens": 17000, "outputTokens": 800, "costMicroUsd": 63000 } },
+        { "prId": "107", "status": "complete", "vote": "none", "claimRefs": ["c-resources-string"], "observation": { "latencyMs": 59000, "inputTokens": 17500, "outputTokens": 830, "costMicroUsd": 64950 } },
+        { "prId": "108", "status": "complete", "vote": "none", "claimRefs": ["c-provider-reg"], "observation": { "latencyMs": 58000, "inputTokens": 17200, "outputTokens": 810, "costMicroUsd": 64200 } },
+        { "prId": "109", "status": "complete", "vote": "approve", "claimRefs": ["c-docs-stale"], "observation": { "latencyMs": 44000, "inputTokens": 11000, "outputTokens": 500, "costMicroUsd": 39000 } },
+        { "prId": "110", "status": "complete", "vote": "none", "claimRefs": ["c-csharp-race"], "observation": { "latencyMs": 78000, "inputTokens": 29000, "outputTokens": 1450, "costMicroUsd": 108750 } },
+        { "prId": "111", "status": "complete", "vote": "none", "claimRefs": ["c-tests-flaky"], "observation": { "latencyMs": 64000, "inputTokens": 21000, "outputTokens": 1050, "costMicroUsd": 78750 } }
+      ]
+    },
+    {
+      "arm": "verified",
+      "results": [
+        { "prId": "101", "status": "complete", "vote": "none", "claimRefs": ["c-csharp-null", "c-csharp-naming"], "observation": { "latencyMs": 141000, "inputTokens": 62000, "outputTokens": 3000, "costMicroUsd": 231000 } },
+        { "prId": "102", "status": "complete", "vote": "none", "claimRefs": ["c-tests-missing"], "observation": { "latencyMs": 112000, "inputTokens": 44000, "outputTokens": 2200, "costMicroUsd": 165000 } },
+        { "prId": "103", "status": "complete", "vote": "none", "claimRefs": ["c-deploy-rollback"], "observation": { "latencyMs": 104000, "inputTokens": 36000, "outputTokens": 1800, "costMicroUsd": 135000 } },
+        { "prId": "104", "status": "complete", "vote": "none", "claimRefs": ["c-settings-drift"], "observation": { "latencyMs": 97000, "inputTokens": 31000, "outputTokens": 1500, "costMicroUsd": 115500 } },
+        { "prId": "105", "status": "complete", "vote": "none", "claimRefs": ["c-security-input"], "observation": { "latencyMs": 126000, "inputTokens": 52000, "outputTokens": 2600, "costMicroUsd": 195000 } },
+        { "prId": "106", "status": "complete", "vote": "none", "claimRefs": ["c-generated-edit"], "observation": { "latencyMs": 89000, "inputTokens": 27000, "outputTokens": 1300, "costMicroUsd": 100500 } },
+        { "prId": "107", "status": "complete", "vote": "none", "claimRefs": ["c-resources-string"], "observation": { "latencyMs": 91000, "inputTokens": 27500, "outputTokens": 1320, "costMicroUsd": 101700 } },
+        { "prId": "108", "status": "complete", "vote": "none", "claimRefs": ["c-provider-reg"], "observation": { "latencyMs": 90000, "inputTokens": 27200, "outputTokens": 1310, "costMicroUsd": 101100 } },
+        { "prId": "109", "status": "complete", "vote": "approve", "claimRefs": ["c-docs-stale"], "observation": { "latencyMs": 66000, "inputTokens": 18000, "outputTokens": 800, "costMicroUsd": 63000 } },
+        { "prId": "110", "status": "complete", "vote": "none", "claimRefs": ["c-csharp-race"], "observation": { "latencyMs": 118000, "inputTokens": 47000, "outputTokens": 2300, "costMicroUsd": 175500 } },
+        { "prId": "111", "status": "complete", "vote": "none", "claimRefs": ["c-tests-flaky"], "observation": { "latencyMs": 99000, "inputTokens": 34000, "outputTokens": 1700, "costMicroUsd": 127500 } }
+      ]
+    }
+  ],
+  "verdicts": [
+    { "claimRef": "c-csharp-null", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["csharp-null-deref"] }, { "labelerId": "seed-verdict-b", "verdict": "truePositive", "matchedIssueIds": ["csharp-null-deref"] } ], "adjudication": null },
+    { "claimRef": "c-csharp-noise", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "falsePositive", "matchedIssueIds": [] }, { "labelerId": "seed-verdict-b", "verdict": "falsePositive", "matchedIssueIds": [] } ], "adjudication": null },
+    { "claimRef": "c-csharp-naming", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["csharp-naming"] }, { "labelerId": "seed-verdict-b", "verdict": "truePositive", "matchedIssueIds": ["csharp-naming"] } ], "adjudication": null },
+    { "claimRef": "c-tests-missing", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["tests-missing-negative"] }, { "labelerId": "seed-verdict-b", "verdict": "truePositive", "matchedIssueIds": ["tests-missing-negative"] } ], "adjudication": null },
+    { "claimRef": "c-deploy-rollback", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["deploy-rollback-gap"] }, { "labelerId": "seed-verdict-b", "verdict": "truePositive", "matchedIssueIds": ["deploy-rollback-gap"] } ], "adjudication": null },
+    { "claimRef": "c-settings-drift", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["settings-default-drift"] }, { "labelerId": "seed-verdict-b", "verdict": "truePositive", "matchedIssueIds": ["settings-default-drift"] } ], "adjudication": null },
+    { "claimRef": "c-security-input", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["security-unvalidated-input"] }, { "labelerId": "seed-verdict-b", "verdict": "truePositive", "matchedIssueIds": ["security-unvalidated-input"] } ], "adjudication": null },
+    { "claimRef": "c-generated-edit", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "abstain", "matchedIssueIds": [] }, { "labelerId": "seed-verdict-b", "verdict": "abstain", "matchedIssueIds": [] } ], "adjudication": null },
+    { "claimRef": "c-resources-string", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["resources-missing-string"] }, { "labelerId": "seed-verdict-b", "verdict": "truePositive", "matchedIssueIds": ["resources-missing-string"] } ], "adjudication": null },
+    { "claimRef": "c-provider-reg", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["provider-registration-gap"] }, { "labelerId": "seed-verdict-b", "verdict": "falsePositive", "matchedIssueIds": [] } ], "adjudication": { "adjudicatorId": "seed-verdict-z", "verdict": "truePositive", "matchedIssueIds": ["provider-registration-gap"] } },
+    { "claimRef": "c-docs-stale", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["docs-stale-example"] }, { "labelerId": "seed-verdict-b", "verdict": "truePositive", "matchedIssueIds": ["docs-stale-example"] } ], "adjudication": null },
+    { "claimRef": "c-csharp-race", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["csharp-race"] }, { "labelerId": "seed-verdict-b", "verdict": "truePositive", "matchedIssueIds": ["csharp-race"] } ], "adjudication": null },
+    { "claimRef": "c-tests-flaky", "labels": [ { "labelerId": "seed-verdict-a", "verdict": "truePositive", "matchedIssueIds": ["tests-flaky-wait"] }, { "labelerId": "seed-verdict-b", "verdict": "truePositive", "matchedIssueIds": ["tests-flaky-wait"] } ], "adjudication": null }
+  ]
+}

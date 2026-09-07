@@ -1,0 +1,45 @@
+{
+  "_note": "Captured shape from GET /repos/{owner}/{repo}/commits/{sha}/check-runs, identities synthesized. The SHAPE is real; that is the point. Regenerate with tools/Test-GitHubProviderLive.ps1 against a real commit if GitHub changes its payload.",
+  "allGreen": {
+    "response": {
+      "total_count": 2,
+      "check_runs": [
+        { "name": "ci/build", "status": "completed", "conclusion": "success", "started_at": "2026-08-01T10:00:00Z" },
+        { "name": "ci/test", "status": "completed", "conclusion": "success", "started_at": "2026-08-01T10:05:00Z" }
+      ]
+    },
+    "expected": { "found": true, "state": "Succeeded", "isComplete": true, "isSuccess": true }
+  },
+  "oneFailed": {
+    "response": {
+      "total_count": 2,
+      "check_runs": [
+        { "name": "ci/build", "status": "completed", "conclusion": "success", "started_at": "2026-08-01T10:00:00Z" },
+        { "name": "ci/test", "status": "completed", "conclusion": "failure", "started_at": "2026-08-01T10:05:00Z" }
+      ]
+    },
+    "expected": { "found": true, "state": "Failed", "isComplete": true, "isSuccess": false }
+  },
+  "inProgress": {
+    "response": {
+      "total_count": 1,
+      "check_runs": [
+        { "name": "ci/build", "status": "in_progress", "conclusion": null, "started_at": "2026-08-01T10:00:00Z" }
+      ]
+    },
+    "expected": { "found": true, "state": "InProgress", "isComplete": false, "isSuccess": false }
+  },
+  "neutralIsNotSuccess": {
+    "response": {
+      "total_count": 1,
+      "check_runs": [
+        { "name": "ci/build", "status": "completed", "conclusion": "neutral", "started_at": "2026-08-01T10:00:00Z" }
+      ]
+    },
+    "expected": { "found": true, "state": "Failed", "isComplete": true, "isSuccess": false }
+  },
+  "none": {
+    "response": { "total_count": 0, "check_runs": [] },
+    "expected": { "found": false, "state": "None", "isComplete": false, "isSuccess": false }
+  }
+}

@@ -1,0 +1,102 @@
+[
+  {
+    "tool": "repo_pull_request",
+    "arguments": {
+      "action": "get",
+      "project": "Widgets",
+      "repositoryId": "11111111-2222-3333-4444-555555555555",
+      "pullRequestId": 4242
+    },
+    "payloadFile": "payloads/pr-get.json"
+  },
+  {
+    "tool": "repo_pull_request",
+    "arguments": {
+      "action": "list",
+      "project": "Widgets",
+      "repositoryId": "11111111-2222-3333-4444-555555555555",
+      "status": "Active",
+      "targetRefName": "refs/heads/main",
+      "top": 100
+    },
+    "payloadFile": "payloads/pr-list.json"
+  },
+  {
+    "tool": "repo_pull_request",
+    "arguments": {
+      "action": "get_changes",
+      "project": "Widgets",
+      "repositoryId": "11111111-2222-3333-4444-555555555555",
+      "pullRequestId": 4242,
+      "includeDiffs": true,
+      "includeLineContent": true,
+      "top": 1000
+    },
+    "payloadFile": "payloads/pr-changes.json"
+  },
+  {
+    "tool": "repo_pull_request",
+    "arguments": {
+      "action": "get_changes",
+      "project": "Widgets",
+      "repositoryId": "11111111-2222-3333-4444-555555555555",
+      "pullRequestId": 4242,
+      "top": 1000
+    },
+    "payloadFile": "payloads/pr-changes.json"
+  },
+  {
+    "tool": "repo_pull_request_thread",
+    "arguments": {
+      "action": "list",
+      "project": "Widgets",
+      "repositoryId": "11111111-2222-3333-4444-555555555555",
+      "pullRequestId": 4242,
+      "top": 200
+    },
+    "payloadFile": "payloads/pr-threads.json"
+  },
+  {
+    "tool": "repo_branch",
+    "arguments": {
+      "action": "get",
+      "project": "Widgets",
+      "repositoryId": "11111111-2222-3333-4444-555555555555",
+      "branchName": "main"
+    },
+    "payloadFile": "payloads/branch-main.json"
+  },
+  {
+    "tool": "repo_file",
+    "arguments": {
+      "action": "get_content",
+      "project": "Widgets",
+      "repositoryId": "11111111-2222-3333-4444-555555555555",
+      "path": "/src/Widget.cs",
+      "versionType": "Commit",
+      "version": "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0"
+    },
+    "payloadFile": "payloads/file-widget.json"
+  },
+  {
+    "tool": "repo_file",
+    "arguments": {
+      "action": "get_content",
+      "project": "Widgets",
+      "repositoryId": "11111111-2222-3333-4444-555555555555",
+      "path": "/docs/conventions.md",
+      "versionType": "Commit",
+      "version": "f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9"
+    },
+    "payloadFile": "payloads/file-conventions.json"
+  },
+  {
+    "tool": "repo_repository",
+    "arguments": {
+      "action": "get",
+      "project": "Widgets",
+      "repositoryNameOrId": "11111111-2222-3333-4444-555555555555"
+    },
+    "payloadFile": "payloads/repo-identity.json"
+  }
+]
