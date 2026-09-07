@@ -5203,11 +5203,9 @@ function Get-AgentProcessStartIdentity {
     return "utc:$($Process.StartTime.ToUniversalTime().Ticks)"
 }
 
-function New-AgentProcessContainment {
-    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
-    if ($IsWindows) {
-        if (-not ('DevPilot.Native.Job' -as [type])) {
-            Add-Type -TypeDefinition @'
+function Initialize-AgentWindowsProcessContainment {
+    if (-not $IsWindows -or ('DevPilot.Native.Job' -as [type])) { return }
+    Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
@@ -5234,13 +5232,13 @@ namespace DevPilot.Native {
       public IoCounters IoInfo;
       public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
     }
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr CreateJobObject(IntPtr a, string n);
-    [DllImport("kernel32.dll")] public static extern bool SetInformationJobObject(IntPtr j, int c, ref ExtendedLimits i, uint l);
-    [DllImport("kernel32.dll")] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
-    [DllImport("kernel32.dll")] public static extern bool TerminateJobObject(IntPtr j, uint c);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateJobObject(IntPtr a, string n);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j, int c, ref ExtendedLimits i, uint l);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j, uint c);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(
       IntPtr j, int c, out BasicAccounting i, uint l, IntPtr r);
-    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
     public static IntPtr CreateKillOnClose(int pid, IntPtr processHandle) {
       IntPtr job = CreateJobObject(IntPtr.Zero, null);
       if (job == IntPtr.Zero) throw new Win32Exception();
@@ -5261,7 +5259,12 @@ namespace DevPilot.Native {
   }
 }
 '@
-        }
+}
+
+function New-AgentProcessContainment {
+    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
+    if ($IsWindows) {
+        Initialize-AgentWindowsProcessContainment
         return @{ Platform = 'Windows'; Handle = [DevPilot.Native.Job]::CreateKillOnClose($Process.Id, $Process.Handle); ProcessGroupId = 0 }
     }
     if (-not ('DevPilot.Native.UnixProcessGroup' -as [type])) {
@@ -5501,8 +5504,26 @@ function Invoke-TimedProcess {
     $lastProgressUtc = $startedAtUtc
     $progressObserved = $false
     $proc = $null
+    $containment = $null
     try {
+        # Compile the Job-object shim before starting a fast child. Compiling it
+        # after Start() leaves enough time for the child to exit before assignment.
+        if ($IsWindows) { Initialize-AgentWindowsProcessContainment }
         $proc = [System.Diagnostics.Process]::Start($psi)
+        if ($IsWindows) {
+            # Process.Kill(true) cannot find a descendant after the direct child
+            # has already exited while leaving inherited output handles open.
+            # Assign the child to a kill-on-close job before it can launch normal
+            # work so output-drain cancellation still owns that detached tree.
+            try {
+                $containment = New-AgentProcessContainment -Process $proc
+            }
+            catch {
+                # Preserve the historical uncontained fallback for a child that
+                # exited before assignment or a host that refuses nested jobs.
+                Write-Verbose "Process containment was unavailable for child $($proc.Id): $($_.Exception.Message)"
+            }
+        }
         $telemetryArguments = @($ArgumentList)
         for ($argumentIndex = 0; $argumentIndex -lt $telemetryArguments.Count - 1; $argumentIndex++) {
             if ([string]$telemetryArguments[$argumentIndex] -ceq '-BindingBase64') {
@@ -5586,7 +5607,10 @@ function Invoke-TimedProcess {
 
         if ($timedOut -or $cancelled) {
             if ($timedOut -and -not $timeoutReason) { $timeoutReason = "standardInputDeadline" }
-            Stop-ProcessTree -Process $proc
+            if (-not $containment -or
+                -not (Stop-AgentProcessContainment -Containment $containment -Process $proc)) {
+                Stop-ProcessTree -Process $proc
+            }
             $proc.WaitForExit(5000) | Out-Null
         }
 
@@ -5595,6 +5619,10 @@ function Invoke-TimedProcess {
         if (-not $stdoutResult.Completed -or -not $stderrResult.Completed) {
             $timedOut = $true
             if (-not $timeoutReason) { $timeoutReason = "outputDrainDeadline" }
+            if (-not $containment -or
+                -not (Stop-AgentProcessContainment -Containment $containment -Process $proc)) {
+                Stop-ProcessTree -Process $proc
+            }
         }
 
         $exitCode = -1
@@ -5616,6 +5644,7 @@ function Invoke-TimedProcess {
         }
     }
     finally {
+        Close-AgentProcessContainment -Containment $containment
         if ($proc) { $proc.Dispose() }
     }
 }
