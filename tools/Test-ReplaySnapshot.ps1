@@ -1860,6 +1860,9 @@ try {
     $replaySafetyCallAt = $reviewerSource.IndexOf(
         'Assert-ReviewerReplayPreviewOnly -ReplayRequested $replayRequested',
         [StringComparison]::Ordinal)
+    $qualificationPrelaunchAt = $reviewerSource.IndexOf(
+        'if ($QualificationPrelaunch) {',
+        [StringComparison]::Ordinal)
     $manualApprovalAt = $reviewerSource.IndexOf(
         'if ($EnableApprovalVote -and -not $ManualDispatchManifest)',
         [StringComparison]::Ordinal)
@@ -1869,11 +1872,12 @@ try {
     $replayCompletenessAt = $reviewerSource.IndexOf(
         'Offline replay requires all of -ReplayRoot, -ReplaySnapshotName and -ReplayManifestDigest.',
         [StringComparison]::Ordinal)
-    Assert-Replay ($replaySafetyCallAt -ge 0 -and
+    Assert-Replay ($qualificationPrelaunchAt -ge 0 -and
+        $replaySafetyCallAt -gt $qualificationPrelaunchAt -and
         $manualApprovalAt -gt $replaySafetyCallAt -and
         $operationalRouteAt -gt $replaySafetyCallAt -and
         $replayCompletenessAt -gt $replaySafetyCallAt) `
-        'Replay preview-only validation must run before replay completeness, manual approval validation and operational write routing.'
+        'Qualification combination validation must precede replay preview-only validation, which must precede replay completeness, manual approval and operational routing.'
     Assert-Replay ($reviewerSource.IndexOf(
             "'-EnableApprovalVote requires a sealed manual dispatch grant (-ManualDispatchManifest); it cannot be requested directly.'",
             [StringComparison]::Ordinal) -gt $replaySafetyCallAt) `

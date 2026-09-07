@@ -409,7 +409,10 @@ exit 0
     foreach ($forbiddenCombination in @(
             , @("-DryRun"),
             @("-PromotePreview", (Join-Path $sandbox "preview.json")),
+            @("-PromoteVerifiedPreview", (Join-Path $sandbox "verified-preview.json")),
             @("-EnableApprovalVote"),
+            @("-EnableThreadReplies"),
+            @("-EnableTeamsNotifications"),
             @("-ShowState"),
             @("-CaptureSourceTransportOnly"))) {
         $combined = @($prelaunchArguments) + @($forbiddenCombination)

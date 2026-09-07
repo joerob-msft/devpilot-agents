@@ -537,6 +537,35 @@ function Assert-ReviewerReplayPreviewOnly {
     }
 }
 
+# Qualification prelaunch is a validation-only capability with its own stricter
+# combination contract. Resolve that intersection before the replay ceiling:
+# a prelaunch plus a write-like option is invalid AS A PRELAUNCH, while every
+# ordinary replay plus the same option is refused below as preview-only.
+if ($QualificationPrelaunch) {
+    $prelaunchRefusedSwitches = @(
+        @{ Name = "-DryRun"; Set = [bool]$DryRun },
+        @{ Name = "-ShowState"; Set = [bool]$ShowState },
+        @{ Name = "-ResetStarvedCandidates"; Set = [bool]$ResetStarvedCandidates },
+        @{ Name = "-CaptureSourceTransportOnly"; Set = [bool]$CaptureSourceTransportOnly },
+        @{ Name = "-CaptureSourceTransportArtifactPath"; Set = [bool]$CaptureSourceTransportArtifactPath },
+        @{ Name = "-EnableFindingComments"; Set = [bool]$EnableFindingComments },
+        @{ Name = "-EnableThreadReplies"; Set = [bool]$EnableThreadReplies },
+        @{ Name = "-EnableSummaryComment"; Set = [bool]$EnableSummaryComment },
+        @{ Name = "-EnableApprovalVote"; Set = [bool]$EnableApprovalVote },
+        @{ Name = "-EnableTeamsNotifications"; Set = [bool]$EnableTeamsNotifications },
+        @{ Name = "-EnableVerifiedCommentGate"; Set = [bool]$EnableVerifiedCommentGate },
+        @{ Name = "-EnableVerifiedSuggestionGate"; Set = [bool]$EnableVerifiedSuggestionGate },
+        @{ Name = "-EnableVerifiedApprovalGate"; Set = [bool]$EnableVerifiedApprovalGate },
+        @{ Name = "-PromotePreview"; Set = [bool]$PromotePreview },
+        @{ Name = "-PromoteVerifiedPreview"; Set = [bool]$PromoteVerifiedPreview }
+    )
+    $prelaunchRefused = @($prelaunchRefusedSwitches | Where-Object { $_.Set } | ForEach-Object { [string]$_.Name })
+    if ($prelaunchRefused.Count -gt 0) {
+        throw ("-QualificationPrelaunch validates an invocation and exits before any state exists; it cannot be " +
+            "combined with $($prelaunchRefused -join ', ').")
+    }
+}
+
 $replayRequested = [bool]($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest)
 Assert-ReviewerReplayPreviewOnly -ReplayRequested $replayRequested `
     -FindingComments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) `
@@ -3111,36 +3140,6 @@ if ($ValidateConfigurationOnly) {
     return
 }
 
-# ---------------------------------------------------------------------------
-# Qualification prelaunch. A strictly earlier exit on the normal path: every
-# validation below still runs, and the process stops immediately before the
-# first state directory is created. It is refused in combination with anything
-# that delivers, promotes, captures, mutates state, or diverts into the
-# self-check fixtures, because a prelaunch that could do any of those would be
-# a new capability rather than an earlier stop.
-# ---------------------------------------------------------------------------
-if ($QualificationPrelaunch) {
-    $prelaunchRefusedSwitches = @(
-        @{ Name = "-DryRun"; Set = [bool]$DryRun },
-        @{ Name = "-ShowState"; Set = [bool]$ShowState },
-        @{ Name = "-ResetStarvedCandidates"; Set = [bool]$ResetStarvedCandidates },
-        @{ Name = "-CaptureSourceTransportOnly"; Set = [bool]$CaptureSourceTransportOnly },
-        @{ Name = "-CaptureSourceTransportArtifactPath"; Set = [bool]$CaptureSourceTransportArtifactPath },
-        @{ Name = "-EnableFindingComments"; Set = [bool]$EnableFindingComments },
-        @{ Name = "-EnableSummaryComment"; Set = [bool]$EnableSummaryComment },
-        @{ Name = "-EnableApprovalVote"; Set = [bool]$EnableApprovalVote },
-        @{ Name = "-EnableVerifiedCommentGate"; Set = [bool]$EnableVerifiedCommentGate },
-        @{ Name = "-EnableVerifiedSuggestionGate"; Set = [bool]$EnableVerifiedSuggestionGate },
-        @{ Name = "-EnableVerifiedApprovalGate"; Set = [bool]$EnableVerifiedApprovalGate },
-        @{ Name = "-PromotePreview"; Set = [bool]$PromotePreview },
-        @{ Name = "-PromoteVerifiedPreview"; Set = [bool]$PromoteVerifiedPreview }
-    )
-    $prelaunchRefused = @($prelaunchRefusedSwitches | Where-Object { $_.Set } | ForEach-Object { [string]$_.Name })
-    if ($prelaunchRefused.Count -gt 0) {
-        throw ("-QualificationPrelaunch validates an invocation and exits before any state exists; it cannot be " +
-            "combined with $($prelaunchRefused -join ', ').")
-    }
-}
 # A vote with no visible reasoning is an unexplained verdict on someone else's
 # work. Refuse the combination at startup rather than discovering it per-PR.
 if ($EnableApprovalVote -and -not $EnableFindingComments) {
