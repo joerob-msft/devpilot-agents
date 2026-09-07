@@ -19772,7 +19772,8 @@ if (-not $script:ReviewerReplayActive) {
     try {
         $identitySession = Open-AgentMcpSession -AgencyPath $agencyPath -Server "ado" `
             -Organization $Organization -Toolsets @("repos") -TimeoutSeconds 10 `
-            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+            -ReplaySnapshot $script:ReviewerReplaySnapshot
         $identityInvoker = {
             param($Name, $Arguments, $RawText)
             Invoke-AgentMcpTool -Session $identitySession -Name $Name -Arguments $Arguments -RawText:$RawText
