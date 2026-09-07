@@ -11,8 +11,7 @@ import { observeProcess, type LocalProcessStream } from "../../src/process-obser
 
 const args = process.argv.slice(2);
 const value = (flag: string) => args[args.indexOf(flag) + 1]!;
-const descriptor = JSON.parse(await readFile(value("--broker-descriptor"), "utf8"));
-const owned = descriptor.localObservation.streams as LocalProcessStream[];
+let owned: LocalProcessStream[] = [];
 const release = join(process.env.DEVPILOT_TEST_ARGV_DIR!, "release");
 const reducer = new OperationsReducer();
 const diagnostics: string[] = [];
@@ -32,10 +31,6 @@ async function waitFor(check: () => Promise<boolean>, label: string): Promise<vo
   }
 }
 try {
-  for (const stream of owned) {
-    assert.equal(await observeProcess(stream.processId), "present");
-    assert.ok((await readFile(stream.eventLogPath)).length > 0, "actual stdout must be live before broker startup");
-  }
   broker = new DispatchClient({
     executablePath: value("--broker-executable"),
     scriptPath: value("--broker-script"),
@@ -52,8 +47,9 @@ try {
   });
   await waitFor(async () => {
     assert.equal(brokerError, "");
-    return Boolean(streams);
+    return streams?.length === 2;
   }, "real Golden broker did not publish live capture provenance");
+  owned = streams!;
   assert.equal(streams!.length, 2);
   await waitFor(async () => {
     await tailer.poll();

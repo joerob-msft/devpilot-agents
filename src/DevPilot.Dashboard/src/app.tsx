@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { useKeyboard, usePaste, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { decideLayout, type LayoutDecision } from "./layout.js";
@@ -14,16 +14,20 @@ import {
   shortId,
   statusColor,
 } from "./format.js";
-import { liveElapsedMilliseconds, OperationsReducer, totalElapsedMilliseconds } from "./reducer.js";
+import { isLiveInstance, liveElapsedMilliseconds, OperationsReducer, totalElapsedMilliseconds } from "./reducer.js";
+import type { DismissalStorage } from "./dismissals.js";
 import type { AgentRole, BlockedWarning, Completion, InstanceState, ViewFilter } from "./domain.js";
 import { boundedText } from "./domain.js";
 import { PullRequestHistoryProjection, type PullRequestHistoryEntry } from "./history.js";
 import type { EventTailer } from "./tailer.js";
 import { manualProgress, type ManualProgress } from "./manual-progress.js";
+import { SimpleView, SimpleManualPanel, simpleInstanceRow, simpleHistoryRow, selectionWindow, automationStatusText, scanNowResultText } from "./simple-view.js";
 import {
+  AUTOMATIC_FAILURE_CODES,
   BrokerRejectionError,
   assertManualTarget,
   isPullRequestId,
+  type AutomationStatus,
   type CapabilityNarrowingPreview,
   type CapabilityProfile,
   type CapabilitySummary,
@@ -33,6 +37,11 @@ import {
   type NarrowingAction,
   type NarrowingScope,
   type ResolvedManualTarget,
+  type RunPrepared,
+  type RunQueued,
+  type RunProgress,
+  type RunScheduleMode,
+  type ScheduledDispatchAccepted,
   NARROWING_SCOPES,
   type WideningCancelled,
   type WideningMinted,
@@ -42,10 +51,19 @@ import {
 
 export const BRAND_PLANE = ["       __|__       ", "--o--o--(_)--o--o--"] as const;
 export const HELP_LEGEND = [
-  "Live = active work; Current session = Live plus newest retained per group.",
+  "Live only = recent heartbeats, including waiting agents; l toggles Current.",
   "History includes observed exits; Stale alone never proves process exit.",
-  "Forget never deletes agent state or event logs; unavailable actions report status.",
+  "Delete remembers dismissal; new heartbeats restore it. Logs/state are untouched.",
 ] as const;
+const HARD_SCHEDULE_FAILURES = new Set<string>([
+  "termination-failed", "automatic-policy-changed", ...AUTOMATIC_FAILURE_CODES,
+]);
+const REPREVIEW_SCHEDULE_BLOCKS = new Set<string>([
+  "schedule-repreview-required", "schedule-expired", "schedule-stale", "schedule-interrupted",
+  "policy-changed", "source-changed", "pr-state-changed", "repository-mismatch",
+]);
+const AUTOMATION_POLL_MS = 5_000;
+const AUTOMATION_STATUS_RETRIES = 3;
 
 const COLORS = {
   bg: "#08090a",
@@ -76,9 +94,13 @@ export interface AppProps {
   broker?: DispatchBroker | undefined;
   brokerFailure?: () => string;
   shutdownBroker?: () => Promise<void>;
+  dismissalStorage?: DismissalStorage;
+  dismissalLoadError?: string;
 }
 
-type ManualMode = "closed" | "target" | "resolving" | "prompt" | "describing" | "confirm" | "confirm-final" | "dispatching" | "active" | "cancelling" | "terminal";
+export type ManualMode = "closed" | "target" | "resolving" | "prompt" | "describing" | "confirm" | "confirm-final" | "dispatching" | "active" | "cancelling" | "terminal"
+  | "busy-preparing" | "busy-choice" | "schedule-confirming" | "scheduled" | "schedule-cancelling" | "schedule-unknown"
+  | "schedule-waiting-release" | "schedule-ended" | "queue-cancelled";
 
 const MAX_PR_INPUT = 64;
 const PR_INPUT_HELP = "Enter ASCII digits: PR ID must be in 1..2147483647.";
@@ -532,7 +554,7 @@ function Empty() {
 
 function streamLabel(instance: InstanceState): string {
   if (isHistoricalInstance(instance)) return "History";
-  if (instance.status === "stale") return "Stale";
+  if (!isLiveInstance(instance)) return "Stale";
   return "Live";
 }
 
@@ -542,6 +564,7 @@ function isHistoricalInstance(instance: InstanceState | undefined): boolean {
 
 function viewLabel(view: ViewFilter): string {
   if (view === "current") return "Current session";
+  if (view === "live") return "Live only";
   return view[0]?.toUpperCase() + view.slice(1);
 }
 
@@ -560,21 +583,21 @@ function Rail(props: {
     >
       <Show when={props.instances.length} fallback={<Empty />}>
         <scrollbox flexGrow={1} scrollY>
-          <For each={props.instances}>
+          <Index each={props.instances}>
             {(instance, index) => {
-              const selected = () => index() === props.selected;
+              const selected = () => index === props.selected;
               const startsGroup = () => {
-                const previous = props.instances[index() - 1];
+                const previous = props.instances[index - 1];
                 return !previous ||
-                  previous.agent !== instance.agent ||
-                  previous.sessionNamespace !== instance.sessionNamespace;
+                  previous.agent !== instance().agent ||
+                  previous.sessionNamespace !== instance().sessionNamespace;
               };
-              const historical = () => isHistoricalInstance(instance);
+              const historical = () => isHistoricalInstance(instance());
               return (
                 <>
                   <Show when={startsGroup()}>
                     <text height={1} fg={COLORS.accent}>
-                      {roleLabel(instance.agent)} / {line(instance.sessionNamespace, 18)}
+                      {roleLabel(instance().agent)} / {line(instance().sessionNamespace, 18)}
                     </text>
                   </Show>
                   <box
@@ -582,27 +605,27 @@ function Rail(props: {
                     backgroundColor={selected() ? COLORS.panelAlt : COLORS.panel}
                     paddingX={1}
                     border={selected() ? ["left"] : false}
-                    borderColor={statusColor(instance.status)}
+                    borderColor={statusColor(instance().status)}
                     flexDirection="column"
                   >
-                    <text height={1} fg={statusColor(instance.status)}>
-                      {selected() ? "> " : "  "}{streamLabel(instance)} / {historical() ? instance.completion?.result || instance.status : instance.status}
+                    <text height={1} fg={statusColor(instance().status)}>
+                      {selected() ? "> " : "  "}{streamLabel(instance())} / {historical() ? instance().completion?.result || instance().status : instance().status}
                     </text>
                     <text height={1} fg={COLORS.text}>
-                      {shortId(instance.instanceId)} {historical() ? `| ${instance.completion?.result || instance.status}` : `| PID ${instance.processId}`}
+                      {shortId(instance().instanceId)} {historical() ? `| ${instance().completion?.result || instance().status}` : `| PID ${instance().processId}`}
                     </text>
-                    <text height={1} fg={COLORS.muted}>{line(instance.repository || "repository unknown", 26)}</text>
+                    <text height={1} fg={COLORS.muted}>{line(instance().repository || "repository unknown", 26)}</text>
                     <text height={1} fg={COLORS.text}>
-                      {instance.pullRequestId ? `PR #${instance.pullRequestId} ${line(instance.pullRequestTitle, 15)}` : `cycle ${instance.cycleNumber || "-"}`}
+                      {instance().pullRequestId ? `PR #${instance().pullRequestId} ${line(instance().pullRequestTitle, 15)}` : `cycle ${instance().cycleNumber || "-"}`}
                     </text>
                     <text height={1} fg={COLORS.muted}>
-                      {historical() ? "Ended " : "Event "}{new Date(instance.completion?.timestampMs ?? instance.lastEventMs).toISOString().slice(11, 19)}Z | {age(instance.completion?.timestampMs ?? instance.lastEventMs, props.now)}
+                      {historical() ? "Ended " : "Event "}{new Date(instance().completion?.timestampMs ?? instance().lastEventMs).toISOString().slice(11, 19)}Z | {age(instance().completion?.timestampMs ?? instance().lastEventMs, props.now)}
                     </text>
                   </box>
                 </>
               );
             }}
-          </For>
+          </Index>
         </scrollbox>
       </Show>
     </Panel>
@@ -811,21 +834,25 @@ function OverlayPanel(props: {
   height?: number;
   left?: number | "auto" | `${number}%`;
   padding?: number;
+  bounded?: boolean;
 }) {
+  const dimensions = useTerminalDimensions();
+  const width = () => props.bounded ? Math.min(props.width ?? 70, Math.max(1, dimensions().width - 2)) : props.width ?? 70;
+  const height = () => props.bounded ? Math.min(props.height ?? 18, Math.max(1, dimensions().height - 4)) : props.height ?? 18;
   return (
     <box
       position="absolute"
-      top="15%"
-      left={props.left ?? "15%"}
-      width={props.width ?? 70}
-      height={props.height ?? 18}
+      top={props.bounded ? Math.max(1, Math.floor((dimensions().height - height()) / 2)) : "15%"}
+      left={props.bounded ? Math.max(0, Math.floor((dimensions().width - width()) / 2)) : props.left ?? "15%"}
+      width={width()}
+      height={height()}
       zIndex={100}
       border
       borderStyle="double"
       borderColor={COLORS.accent}
       backgroundColor={COLORS.panel}
       title={` ${props.title} `}
-      padding={props.padding ?? 1}
+      padding={props.padding ?? (props.bounded && height() < 8 ? 0 : 1)}
       flexDirection="column"
     >
       {props.children}
@@ -845,13 +872,21 @@ export function App(props: AppProps) {
   const dimensions = useTerminalDimensions();
   const [now, setNow] = createSignal(Date.now());
   const [revision, setRevision] = createSignal(0);
+  const [uiMode, setUiMode] = createSignal<"simple" | "advanced">("simple");
+  const [simpleSelectedKey, setSimpleSelectedKey] = createSignal<string | null>(null);
+  const [simpleDetail, setSimpleDetail] = createSignal<{ key: string; reference: string } | null>(null);
+  let simpleDetailScroll: ScrollBoxRenderable | undefined;
+  let simpleManualScroll: ScrollBoxRenderable | undefined;
+  let helpScroll: ScrollBoxRenderable | undefined;
   const [selected, setSelected] = createSignal(0);
   const [detailOpen, setDetailOpen] = createSignal(false);
   const [inspectorOpen, setInspectorOpen] = createSignal(dimensions().width >= 120);
   const [focus, setFocus] = createSignal<PaneFocus>("rail");
   const [overlay, setOverlay] = createSignal<Overlay>("none");
   const [role, setRole] = createSignal<RoleFilter>("all");
-  const [view, setView] = createSignal<ViewFilter>("current");
+  const [view, setView] = createSignal<ViewFilter>("live");
+  const [dismissalPending, setDismissalPending] = createSignal(false);
+  const [dismissalError, setDismissalError] = createSignal(props.dismissalLoadError ?? "");
   const [eventWarningsOnly, setEventWarningsOnly] = createSignal(false);
   const [paletteIndex, setPaletteIndex] = createSignal(0);
   const [historyFilter, setHistoryFilter] = createSignal("");
@@ -863,7 +898,29 @@ export function App(props: AppProps) {
       ? "PREVIEW ONLY: live agents cannot mutate pull requests"
       : "Observer is read-only";
   const [feedback, setFeedback] = createSignal(defaultFeedback);
+  const getAutomationStatus = props.broker?.getAutomationStatus?.bind(props.broker);
+  const scanNow = props.broker?.scanNow?.bind(props.broker);
+  const [automationStatus, setAutomationStatus] = createSignal<AutomationStatus | null>(null);
+  const [automationQueryError, setAutomationQueryError] = createSignal("");
+  const [automationScanError, setAutomationScanError] = createSignal("");
+  const [automationHalted, setAutomationHalted] = createSignal(false);
+  const [scanPending, setScanPending] = createSignal(false);
+  let automationTimer: ReturnType<typeof setTimeout> | undefined;
+  let automationDisposed = false;
+  let automationReadPending = false;
+  let automationRefreshPending = false;
+  let automationReadGeneration = 0;
+  let automationScanGeneration = 0;
+  let automationFailures = 0;
+  const scanVisible = () => Boolean(getAutomationStatus && scanNow &&
+    automationStatus()?.available && automationStatus()?.scope === "current-launcher");
+  const automationError = () => automationQueryError() || automationScanError();
+  const scanUnavailable = () => props.brokerFailure?.() || automationHalted() || automationQueryError()
+    ? "Scan now unavailable: automatic control or monitoring is unavailable."
+    : scanPending() ? "Scan request already pending."
+      : !scanVisible() ? "Scan now unavailable: no current-launcher automatic control." : "";
   const [manualMode, setManualMode] = createSignal<ManualMode>("closed");
+  const scanMainVisible = () => scanVisible() && manualMode() === "closed" && overlay() === "none" && historyInputMode() === "none";
   const [manualTarget, setManualTarget] = createSignal<ResolvedManualTarget | null>(null);
   const [manualInput, setManualInput] = createSignal("");
   const [manualInputRejected, setManualInputRejected] = createSignal(false);
@@ -877,6 +934,35 @@ export function App(props: AppProps) {
   const [manualStartedMs, setManualStartedMs] = createSignal(0);
   const [manualTerminalMs, setManualTerminalMs] = createSignal<number | null>(null);
   const [manualMonitorError, setManualMonitorError] = createSignal("");
+  const [scheduleFlow, setScheduleFlow] = createSignal(false);
+  const [busyChoice, setBusyChoice] = createSignal<RunScheduleMode | "back">("replace");
+  const [runPrepared, setRunPrepared] = createSignal<RunPrepared | null>(null);
+  const [runQueued, setRunQueued] = createSignal<RunQueued | null>(null);
+  const [runProgress, setRunProgress] = createSignal<RunProgress | null>(null);
+  const [slotReleased, setSlotReleased] = createSignal(false);
+  const [automationNote, setAutomationNote] = createSignal("");
+  let scheduleBlockedCode = "";
+  let queueCancelRequested = false;
+  let queueCancelPending = false;
+  const [queueCancelAcknowledged, setQueueCancelAcknowledged] = createSignal(false);
+  let scheduleGeneration = 0;
+  let queuedManualGeneration = -1;
+  const [scheduleFatal, setScheduleFatal] = createSignal(false);
+  let scheduleBrokerFailed = false;
+  let scheduleConfirmationInFlight = false;
+  let focusBusyChoice = false;
+  let scheduleBufferOverflow = false;
+  const earlySchedule: (RunProgress | ScheduledDispatchAccepted)[] = [];
+  const scheduler = (() => {
+    const broker = props.broker;
+    if (!broker?.prepareRun || !broker.confirmRun || !broker.cancelQueued ||
+        !broker.subscribeSchedule || !broker.subscribeScheduledAccepted) return null;
+    return {
+      prepareRun: broker.prepareRun.bind(broker), confirmRun: broker.confirmRun.bind(broker),
+      cancelQueued: broker.cancelQueued.bind(broker), subscribeSchedule: broker.subscribeSchedule.bind(broker),
+      subscribeScheduledAccepted: broker.subscribeScheduledAccepted.bind(broker),
+    };
+  })();
   let previewFrame = -1;
   let previewRendered = false;
   // stdout can contain accepted + completed in one chunk, before dispatch()'s await resumes.
@@ -897,11 +983,21 @@ export function App(props: AppProps) {
     capabilitySummary();
     manualMode();
     wideningStage();
+    busyChoice();
+    runPrepared();
     previewFrame = renderer.frameId;
     previewRendered = false;
+    if (uiMode() === "simple" || scheduleFlow()) simpleManualScroll?.scrollTo(0);
   });
   const onManualFrame = () => {
-    if ((manualMode() === "confirm" || manualMode() === "confirm-final") &&
+    if (manualMode() === "busy-choice" && focusBusyChoice && renderer.frameId > previewFrame) {
+      focusBusyChoice = false;
+      simpleManualScroll?.scrollChildIntoView(`busy-choice-${busyChoice()}`);
+      previewFrame = renderer.frameId;
+      renderer.requestRender();
+      return;
+    }
+    if ((manualMode() === "confirm" || manualMode() === "confirm-final" || manualMode() === "busy-choice") &&
         wideningStage() === "closed" && renderer.frameId > previewFrame) previewRendered = true;
   };
   renderer.on("frame", onManualFrame);
@@ -976,6 +1072,7 @@ export function App(props: AppProps) {
   let eventScrollbox: ScrollBoxRenderable | undefined;
 
   function shutdownBroker(): Promise<void> {
+    stopAutomationPolling();
     if (props.shutdownBroker) return props.shutdownBroker();
     localBrokerShutdown ??= props.broker?.shutdown() ?? Promise.resolve();
     return localBrokerShutdown;
@@ -999,6 +1096,109 @@ export function App(props: AppProps) {
     feedbackTimer = setTimeout(() => setFeedback(defaultFeedback), 2_500);
   }
 
+  function stopAutomationPolling(): void {
+    setAutomationHalted(true);
+    automationReadGeneration++;
+    automationScanGeneration++;
+    automationRefreshPending = false;
+    if (automationTimer) clearTimeout(automationTimer);
+    automationTimer = undefined;
+  }
+
+  function automationFailure(error: unknown): string {
+    return error instanceof BrokerRejectionError ? `${error.code}: ${error.detail}` :
+      error instanceof Error ? error.message : String(error);
+  }
+
+  async function refreshAutomationStatus(supersede = false): Promise<void> {
+    if (!getAutomationStatus || automationDisposed || automationHalted() || props.brokerFailure?.()) return;
+    if (automationTimer) clearTimeout(automationTimer);
+    automationTimer = undefined;
+    if (scanPending()) {
+      automationRefreshPending = true;
+      return;
+    }
+    if (automationReadPending) {
+      if (supersede) {
+        automationReadGeneration++;
+        automationRefreshPending = true;
+      }
+      return;
+    }
+    automationRefreshPending = false;
+    automationReadPending = true;
+    const generation = ++automationReadGeneration;
+    try {
+      const status = await getAutomationStatus();
+      if (generation !== automationReadGeneration || automationDisposed || automationHalted() || props.brokerFailure?.()) return;
+      if (status.automationVersion !== 1 || status.available && status.scope !== "current-launcher") {
+        throw new Error("Automation status did not identify the current launcher.");
+      }
+      setAutomationStatus(status);
+      setAutomationQueryError("");
+      automationFailures = 0;
+      if (!status.available) setAutomationHalted(true);
+    } catch (error) {
+      if (generation === automationReadGeneration && !automationDisposed && !automationHalted() && !props.brokerFailure?.()) {
+        automationFailures++;
+        setAutomationQueryError(`Status unavailable: ${automationFailure(error)}${
+          automationFailures <= AUTOMATION_STATUS_RETRIES ? " (retrying)" : " (retry limit reached)"}`);
+        if (automationFailures > AUTOMATION_STATUS_RETRIES) setAutomationHalted(true);
+      }
+    } finally {
+      automationReadPending = false;
+      if (!automationDisposed && !automationHalted() && !props.brokerFailure?.() && !scanPending()) {
+        if (automationRefreshPending) {
+          automationRefreshPending = false;
+          void refreshAutomationStatus();
+        } else {
+          automationTimer = setTimeout(() => { void refreshAutomationStatus(); }, AUTOMATION_POLL_MS);
+        }
+      }
+    }
+  }
+
+  async function requestScanNow(): Promise<void> {
+    const unavailable = scanUnavailable();
+    if (unavailable || !scanNow) {
+      notify(unavailable || "Scan now unavailable.");
+      return;
+    }
+    const generation = ++automationScanGeneration;
+    // Invalidate pre-action results without releasing the read's single-flight slot.
+    automationReadGeneration++;
+    automationRefreshPending = true;
+    if (automationTimer) clearTimeout(automationTimer);
+    automationTimer = undefined;
+    setScanPending(true);
+    setAutomationScanError("");
+    try {
+      const result = await scanNow();
+      if (generation !== automationScanGeneration || automationDisposed || props.brokerFailure?.()) return;
+      notify(scanNowResultText(result));
+    } catch (error) {
+      if (generation === automationScanGeneration && !automationDisposed && !props.brokerFailure?.()) {
+        setAutomationScanError(`Scan now failed: ${automationFailure(error)}`);
+      }
+    } finally {
+      if (generation === automationScanGeneration && !automationDisposed) {
+        setScanPending(false);
+        // A poll started before this request must not overwrite its post-action status.
+        void refreshAutomationStatus(true);
+      }
+    }
+  }
+
+  onMount(() => { if (getAutomationStatus) void refreshAutomationStatus(); });
+  onCleanup(() => {
+    automationDisposed = true;
+    stopAutomationPolling();
+  });
+  createEffect(() => {
+    revision();
+    if ((props.brokerFailure?.() || scheduleFatal()) && !automationHalted()) stopAutomationPolling();
+  });
+
   const instances = createMemo(() => {
     revision();
     const selectedRole = role();
@@ -1019,6 +1219,55 @@ export function App(props: AppProps) {
       (!needle || [state.repository, state.pullRequestTitle, state.pullRequestAuthor, String(state.pullRequestId),
         state.instanceId, state.completion?.result || "exited outcome unknown"].some((text) => text.toLowerCase().includes(needle))));
   });
+  const simpleRows = createMemo(() => view() === "history" && props.history
+    ? [...historyEntries().map(simpleHistoryRow),
+      ...instances().filter((state) => state.exitObservedMs !== null || state.schemaVersion < 3).map(simpleInstanceRow)]
+    : instances().map(simpleInstanceRow));
+  createEffect(() => {
+    const rows = simpleRows();
+    if (!rows.some((row) => row.key === simpleSelectedKey())) setSimpleSelectedKey(rows[0]?.key ?? null);
+  });
+  function resetSimpleView(next: "live" | "history"): void {
+    setView(next);
+    setRole("all");
+    setHistoryFilter("");
+    setHistoryInputMode("none");
+    setHistoryInput("");
+    setSelected(0);
+    setSimpleSelectedKey(null);
+    setSimpleDetail(null);
+    setDetailOpen(false);
+    setFocus("rail");
+    setInspectorOpen(false);
+    setOverlay("none");
+    setFeedback(defaultFeedback);
+  }
+  function toggleUiMode(): void {
+    if (manualMode() !== "closed" || overlay() !== "none" || historyInputMode() !== "none") return;
+    const next = uiMode() === "simple" ? "advanced" : "simple";
+    resetSimpleView("live");
+    setUiMode(next);
+    setInspectorOpen(next === "advanced" && dimensions().width >= 120);
+  }
+  function toggleSimpleHistory(): void { resetSimpleView(view() === "history" ? "live" : "history"); }
+  function openSimpleDetail(): void {
+    const row = simpleRows().find((row) => row.key === simpleSelectedKey());
+    if (row) setSimpleDetail({ key: row.key, reference: row.reference });
+    else notify("No item is available for details");
+  }
+  function moveSimple(delta: number): void {
+    const rows = simpleRows();
+    if (!rows.length) { notify("No items are available"); return; }
+    const index = Math.max(0, rows.findIndex((row) => row.key === simpleSelectedKey()));
+    setSimpleSelectedKey(rows[Math.max(0, Math.min(rows.length - 1, index + delta))]!.key);
+  }
+  function scrollAmount(key: string): number {
+    if (key === "up" || key === "k") return -1;
+    if (key === "down" || key === "j") return 1;
+    if (key === "pageup") return -Math.max(1, dimensions().height - 8);
+    if (key === "pagedown") return Math.max(1, dimensions().height - 8);
+    return 0;
+  }
   const historyCurrent = createMemo(() => historyEntries()[selected()]);
   const current = createMemo(() => {
     if (view() !== "history" || !props.history) {
@@ -1044,28 +1293,42 @@ export function App(props: AppProps) {
     if (terminal.dispatchId !== acceptedDispatch()?.dispatchId) return;
     setManualTerminal(terminal);
     setManualTerminalMs(Date.now());
-    setManualMonitorError("");
-    setManualStatus("");
+    if (!scheduleFatal()) {
+      setManualMonitorError("");
+      setManualStatus(scheduleFlow() && runQueued() && !slotReleased()
+        ? "Manual outcome received; waiting for confirmed scheduling-slot release." : "");
+    }
     setManualMode("terminal");
     setRevision((value) => value + 1);
   }
   const unsubscribeTerminal = props.broker?.subscribeTerminal((terminal: DispatchTerminal) => {
-    if (manualMode() === "dispatching" && !acceptedDispatch()) {
+    if (!acceptedDispatch() && (manualMode() === "dispatching" || scheduleConfirmationInFlight || runQueued() && !slotReleased())) {
       if (earlyTerminals.size < 20) earlyTerminals.set(terminal.dispatchId, terminal);
     } else receiveManualTerminal(terminal);
   });
   onCleanup(() => unsubscribeTerminal?.());
+  const unsubscribeSchedule = scheduler?.subscribeSchedule(receiveSchedule);
+  const unsubscribeScheduledAccepted = scheduler?.subscribeScheduledAccepted(receiveSchedule);
+  onCleanup(() => {
+    unsubscribeSchedule?.();
+    unsubscribeScheduledAccepted?.();
+    resetScheduling();
+  });
 
   const dispatchProgress = createMemo(() => {
     revision();
     const accepted = acceptedDispatch();
     if (!accepted) return null;
-    return manualProgress(
+    const terminal = manualTerminal();
+    const progress = manualProgress(
       props.reducer.getDispatch(accepted.dispatchId, accepted.repositoryIdentity.key,
         accepted.role, accepted.pullRequestId, accepted.childProcessId, now()),
-      manualTerminal(), manualStartedMs(), manualTerminalMs(), now(),
-      manualMode() === "cancelling", manualMonitorError() || props.brokerFailure?.() || "",
+      terminal, manualStartedMs(), manualTerminalMs(), now(),
+      manualMode() === "cancelling", terminal ? "" : manualMonitorError() || props.brokerFailure?.() || "",
     );
+    return scheduleFatal() && !terminal && progress.headline === "STATUS UNKNOWN"
+      ? { ...progress, detail: "The run was accepted; scheduling state and child exit are unconfirmed." }
+      : progress;
   });
 
   function resetManualProgress(): void {
@@ -1074,10 +1337,20 @@ export function App(props: AppProps) {
     setManualTerminalMs(null);
     setManualMonitorError("");
     setManualStartedMs(0);
+    resetScheduling();
   }
 
   function closeManual(): void {
-    if (manualMode() === "active" || manualMode() === "dispatching" || manualMode() === "cancelling") {
+    if (scheduleFatal()) {
+      setManualStatus("Scheduling state is uncertain. Press q to shut down broker-owned work.");
+      return;
+    }
+    if (runQueued() && !slotReleased()) {
+      setManualStatus("The scheduling slot is not released. Wait for automatic resumption or press q to shut down.");
+      return;
+    }
+    if (manualMode() === "active" || manualMode() === "dispatching" || manualMode() === "cancelling" ||
+        ["schedule-confirming", "scheduled", "schedule-cancelling", "schedule-unknown"].includes(manualMode())) {
       notify("Cancel the active manual dispatch before closing");
       return;
     }
@@ -1177,6 +1450,7 @@ export function App(props: AppProps) {
       if (generation !== manualGeneration) return;
       assertManualTarget(summary, target.prSnapshot.pullRequestId, target.role, target.repositoryIdentity.key);
       setCapabilitySummary(summary);
+      setManualTarget({ role: summary.role, repositoryIdentity: { ...summary.repositoryIdentity }, prSnapshot: { ...summary.prSnapshot } });
       previewFrame = renderer.frameId;
       setManualMode("confirm");
       setManualStatus("");
@@ -1202,21 +1476,7 @@ export function App(props: AppProps) {
     try {
       const accepted = await props.broker.dispatch(summary, operatorPrompt());
       if (generation !== manualGeneration) return;
-      setAcceptedDispatch(accepted);
-      if (accepted.role === summary.role && accepted.repositoryIdentity.key === summary.repositoryIdentity.key &&
-          accepted.pullRequestId === summary.prSnapshot.pullRequestId &&
-          accepted.capabilityPolicyDigest === summary.capabilityPolicyDigest &&
-          accepted.prStateFingerprint === summary.prStateFingerprint) {
-        props.reducer.registerLocalStream({
-          eventLogPath: accepted.eventLogPath, processId: accepted.childProcessId, role: accepted.role,
-          dispatch: { dispatchId: accepted.dispatchId, repositoryKey: accepted.repositoryIdentity.key, pullRequestId: accepted.pullRequestId },
-        });
-      }
-      props.tailer.registerEventLogPath(accepted.eventLogPath);
-      setManualMode("active");
-      const earlyTerminal = earlyTerminals.get(accepted.dispatchId);
-      earlyTerminals.clear();
-      if (earlyTerminal) receiveManualTerminal(earlyTerminal);
+      acceptManual(accepted, summary);
       // Any minted widening grant is now consumed by the broker's own dispatch-time preflight
       // (Invoke-Dispatch sets Consumed=true unconditionally) -- a later best-effort cancel-widening
       // for this generation would only fail harmlessly, so stop tracking it.
@@ -1225,6 +1485,12 @@ export function App(props: AppProps) {
       if (generation !== manualGeneration) return;
       earlyTerminals.clear();
       if (error instanceof BrokerRejectionError && error.code !== "termination-failed") {
+        if ((error.code === "already-running" || error.code === "state-contended") && schedulingAvailable(summary)) {
+          setScheduleFlow(true);
+          setMintedWideningGeneration(null);
+          await prepareBusy("replace", dispatchResultDetail(error.code, error.detail, summary.role));
+          return;
+        }
         setManualStatus(dispatchResultDetail(error.code, error.detail, summary.role));
         setManualMode("terminal");
       } else {
@@ -1237,9 +1503,350 @@ export function App(props: AppProps) {
     }
   }
 
+  function schedulingAvailable(summary: CapabilitySummary): boolean {
+    return Boolean(scheduler && summary.scheduling?.version === 1 && summary.scheduling.scope === "current-launcher");
+  }
+
+  function resetScheduling(): void {
+    scheduleGeneration++;
+    queuedManualGeneration = -1;
+    setScheduleFatal(false);
+    scheduleBrokerFailed = false;
+    scheduleConfirmationInFlight = false;
+    focusBusyChoice = false;
+    scheduleBufferOverflow = false;
+    earlySchedule.length = 0;
+    setScheduleFlow(false);
+    setBusyChoice("replace");
+    setRunPrepared(null);
+    setRunQueued(null);
+    setRunProgress(null);
+    setAutomationNote("");
+    resetQueueLifecycle();
+  }
+
+  function resetQueueLifecycle(): void {
+    setSlotReleased(false);
+    scheduleBlockedCode = "";
+    queueCancelRequested = false;
+    queueCancelPending = false;
+    setQueueCancelAcknowledged(false);
+  }
+
+  function scheduleUnknown(message: string, fatal = true): void {
+    if (fatal) setScheduleFatal(true);
+    setManualMonitorError(message);
+    setManualStatus(`${message} No new run can be requested here. Press q to shut down broker-owned work.`);
+    setManualMode("schedule-unknown");
+  }
+
+  function inconsistentQueueCancellation(): void {
+    const message = "Broker state is inconsistent: cancellation was acknowledged for an accepted run. The accepted child is retained; cancellation and slot release are unknown.";
+    setAutomationNote(message);
+    scheduleUnknown(message);
+  }
+
+  function acceptManual(accepted: DispatchAccepted, summary: CapabilitySummary, scheduled = false): void {
+    const matches = accepted.role === summary.role && accepted.repositoryIdentity.key === summary.repositoryIdentity.key &&
+      accepted.pullRequestId === summary.prSnapshot.pullRequestId &&
+      accepted.capabilityPolicyDigest === summary.capabilityPolicyDigest && accepted.prStateFingerprint === summary.prStateFingerprint;
+    if (scheduled && !matches) {
+      scheduleBrokerFailed = false;
+      scheduleUnknown("Scheduled acceptance did not match the confirmed target and policy.");
+      return;
+    }
+    setAcceptedDispatch(accepted);
+    if (scheduled) {
+      setManualStartedMs(Date.now());
+      setRunPrepared(null);
+    }
+    setManualMonitorError("");
+    setManualStatus("");
+    if (matches) {
+      props.reducer.registerLocalStream({
+        eventLogPath: accepted.eventLogPath, processId: accepted.childProcessId, role: accepted.role,
+        dispatch: { dispatchId: accepted.dispatchId, repositoryKey: accepted.repositoryIdentity.key, pullRequestId: accepted.pullRequestId },
+      });
+    }
+    props.tailer.registerEventLogPath(accepted.eventLogPath);
+    setManualMode("active");
+    const terminal = earlyTerminals.get(accepted.dispatchId);
+    earlyTerminals.clear();
+    if (terminal) receiveManualTerminal(terminal);
+    setMintedWideningGeneration(null);
+  }
+
+  async function prepareBusy(mode: RunScheduleMode, reason = ""): Promise<void> {
+    const summary = capabilitySummary();
+    if (!scheduler || !summary || !schedulingAvailable(summary)) return;
+    const generation = manualGeneration;
+    const request = ++scheduleGeneration;
+    previewRendered = false;
+    setBusyChoice(mode);
+    setRunPrepared(null);
+    setManualMode("busy-preparing");
+    setManualStatus(`${reason ? `${reason} ` : ""}Checking current-launcher ownership. Preparation is inert; nothing is being stopped.`);
+    try {
+      const prepared = await scheduler.prepareRun(summary, mode, operatorPrompt());
+      if (generation !== manualGeneration || request !== scheduleGeneration) return;
+      if (prepared.scope !== "current-launcher" || prepared.schedulingVersion !== 1 ||
+          prepared.repositoryKey !== summary.repositoryIdentity.key || prepared.role !== summary.role ||
+          prepared.pullRequestId !== summary.prSnapshot.pullRequestId || prepared.mode !== mode ||
+          !isPullRequestId(prepared.conflict.pullRequestId) || !Number.isFinite(Date.parse(prepared.expiresAtUtc))) {
+        throw new Error("Preparation did not match the requested current-launcher target.");
+      }
+      setRunPrepared(prepared);
+      setManualStatus(reason);
+      focusBusyChoice = true;
+      setManualMode("busy-choice");
+    } catch (error) {
+      if (generation !== manualGeneration || request !== scheduleGeneration) return;
+      if (error instanceof BrokerRejectionError &&
+          ["schedule-repreview-required", "schedule-expired"].includes(error.code)) {
+        refreshScheduledPreview(dispatchResultDetail(error.code, error.detail, summary.role));
+        return;
+      }
+      setManualStatus(`No verified current-launcher proposal is available; nothing was stopped. ${
+        error instanceof BrokerRejectionError ? dispatchResultDetail(error.code, error.detail, summary.role) :
+          "Could not verify ownership. Cancel and retry."}`);
+      setManualMode("terminal");
+    }
+  }
+
+  function changeBusyChoice(direction: number): void {
+    previewRendered = false;
+    const choices = ["replace", "next", "back"] as const;
+    const next = choices[(choices.indexOf(busyChoice()) + direction + choices.length) % choices.length]!;
+    if (next === "back") {
+      scheduleGeneration++;
+      setRunPrepared(null);
+      setBusyChoice(next);
+      setManualStatus("Back abandons this inert proposal. No cancellation has been requested.");
+      focusBusyChoice = true;
+      setManualMode("busy-choice");
+    } else void prepareBusy(next);
+  }
+
+  function refreshScheduledPreview(reason: string): void {
+    if (runQueued() && !slotReleased()) {
+      setManualStatus("A fresh preview must wait for confirmed scheduling-slot release.");
+      return;
+    }
+    scheduleGeneration++;
+    manualGeneration++;
+    setRunQueued(null);
+    setRunPrepared(null);
+    setRunProgress(null);
+    resetQueueLifecycle();
+    earlySchedule.length = 0;
+    earlyTerminals.clear();
+    bestEffortCancelWidening();
+    setMintedWideningGeneration(null);
+    wideningRequestToken++;
+    setWideningStage("closed");
+    setWideningPreview(null);
+    setWideningStatus("");
+    setCapabilitySummary(null);
+    setManualMonitorError("");
+    setManualMode("resolving");
+    setAutomationNote(`Previous proposal ended: ${reason} Review the fresh preview and press Enter again.`);
+    void describeManual();
+  }
+
+  async function confirmBusy(): Promise<void> {
+    if (manualMode() !== "busy-choice" || !previewRendered) return;
+    if (busyChoice() === "back") { closeManual(); return; }
+    const prepared = runPrepared();
+    if (!scheduler || !prepared || prepared.mode !== busyChoice()) return;
+    if (Date.now() >= Date.parse(prepared.expiresAtUtc)) {
+      await prepareBusy(prepared.mode, "The proposal expired. Review the new binding, then press Enter again.");
+      return;
+    }
+    const generation = manualGeneration;
+    const request = ++scheduleGeneration;
+    earlySchedule.length = 0;
+    earlyTerminals.clear();
+    scheduleBufferOverflow = false;
+    resetQueueLifecycle();
+    setManualStatus("");
+    scheduleConfirmationInFlight = true;
+    setManualMode("schedule-confirming");
+    try {
+      const queued = await scheduler.confirmRun(prepared);
+      if (generation !== manualGeneration || request !== scheduleGeneration) return;
+      scheduleConfirmationInFlight = false;
+      if (queued.mode !== prepared.mode) { scheduleUnknown("Queue confirmation did not match the selected action."); return; }
+      // Broker failure must not discard ownership/outcome evidence buffered before confirmation.
+      setRunQueued(queued);
+      queuedManualGeneration = generation;
+      setRunProgress(null);
+      setManualMode(scheduleFatal() ? "schedule-unknown" : "scheduled");
+      if (scheduleBufferOverflow) { scheduleUnknown("Scheduling updates exceeded the confirmation buffer."); return; }
+      const buffered = earlySchedule.splice(0);
+      for (const event of buffered) receiveSchedule(event);
+    } catch (error) {
+      if (generation !== manualGeneration || request !== scheduleGeneration) return;
+      scheduleConfirmationInFlight = false;
+      earlySchedule.length = 0;
+      earlyTerminals.clear();
+      if (scheduleFatal()) { scheduleUnknown("Scheduling state became uncertain while confirmation was pending."); return; }
+      if (error instanceof BrokerRejectionError && error.code === "schedule-stale") {
+        await prepareBusy(prepared.mode, "Current work changed. Review the new proposal and press Enter again.");
+      } else if (error instanceof BrokerRejectionError &&
+          ["schedule-repreview-required", "schedule-expired"].includes(error.code)) {
+        refreshScheduledPreview(dispatchResultDetail(error.code, error.detail, prepared.role));
+      } else if (error instanceof BrokerRejectionError && !HARD_SCHEDULE_FAILURES.has(error.code)) {
+        setRunPrepared(null);
+        setManualStatus(dispatchResultDetail(error.code, error.detail, prepared.role));
+        setManualMode("terminal");
+      } else scheduleUnknown("Scheduling confirmation failed; cancellation or startup could not be confirmed.");
+    }
+  }
+
+  function receiveSchedule(event: RunProgress | ScheduledDispatchAccepted): void {
+    if (!scheduleFlow()) return;
+    // A response and its events may share one JSONL batch, before confirmRun's await resumes.
+    if (scheduleConfirmationInFlight) {
+      if (earlySchedule.length < 40) earlySchedule.push(event);
+      else scheduleBufferOverflow = true;
+      return;
+    }
+    const queued = runQueued();
+    if (!queued || queuedManualGeneration !== manualGeneration || event.queueId !== queued.queueId) return;
+    if (event.operation === "accepted") {
+      if (acceptedDispatch() || scheduleFatal() && !scheduleBrokerFailed || slotReleased() && !queueCancelAcknowledged()) return;
+      const summary = capabilitySummary();
+      const failure = scheduleFatal() ? manualMonitorError() : "";
+      if (summary) {
+        acceptManual(event, summary, true);
+        if (acceptedDispatch()?.dispatchId === event.dispatchId) {
+          if (queueCancelAcknowledged()) inconsistentQueueCancellation();
+          else if (failure) scheduleUnknown(failure);
+        }
+      }
+      return;
+    }
+    if (scheduleFatal() || slotReleased()) return;
+    if (event.state === "resumed") {
+      setSlotReleased(true);
+      setRunProgress(event);
+      setAutomationNote("Automatic work resumed.");
+      if (acceptedDispatch() && manualTerminal()) setManualStatus("");
+      finishReleasedQueue();
+      return;
+    }
+    if (event.state === "blocked") {
+      scheduleBlockedCode = boundedText(event.code, 160);
+      const hardBlocked = HARD_SCHEDULE_FAILURES.has(event.code) || !REPREVIEW_SCHEDULE_BLOCKS.has(event.code);
+      if (hardBlocked) setScheduleFatal(true);
+      setRunProgress(event);
+      setAutomationNote(`Scheduling blocked: ${scheduleBlockedCode}. ${hardBlocked
+        ? "Slot retained; automatic admission remains closed. Press q to shut down."
+        : "Waiting for explicit slot release; no new request will be started."}`);
+      simpleManualScroll?.scrollTo(0);
+      if (!acceptedDispatch()) {
+        if (hardBlocked) scheduleUnknown(`Scheduling blocked: ${scheduleBlockedCode}. Slot release is unconfirmed.`);
+        else setManualMode("schedule-waiting-release");
+      }
+      return;
+    }
+    if (acceptedDispatch() || scheduleBlockedCode || queueCancelAcknowledged()) return;
+    setRunProgress(event);
+  }
+
+  function finishReleasedQueue(): void {
+    if (!slotReleased() || scheduleFatal() || acceptedDispatch() || queueCancelPending) return;
+    setManualMonitorError("");
+    setRunPrepared(null);
+    if (queueCancelAcknowledged()) {
+      setManualStatus("Queued request cancelled; the broker confirmed slot release and restored automatic admission.");
+      setManualMode("queue-cancelled");
+    } else if (queueCancelRequested || !scheduleBlockedCode) {
+      setManualStatus("Scheduling slot released. No manual acceptance or outcome was reported; cancellation is not inferred.");
+      setManualMode("schedule-ended");
+    } else {
+      // A blocked code alone never releases the slot, including errors during automatic restart.
+      // Only a correlated resumed event permits a fresh, separately consented attempt.
+      refreshScheduledPreview(scheduleBlockedCode);
+    }
+  }
+
+  async function cancelQueuedRun(): Promise<void> {
+    const queued = runQueued();
+    if (!scheduler || !queued || acceptedDispatch() || scheduleFatal() ||
+        !["scheduled", "schedule-unknown"].includes(manualMode())) return;
+    const generation = manualGeneration;
+    const request = scheduleGeneration;
+    queueCancelRequested = true;
+    queueCancelPending = true;
+    setManualMode("schedule-cancelling");
+    try {
+      const cancelled = await scheduler.cancelQueued(queued.queueId);
+      if (generation !== manualGeneration || request !== scheduleGeneration || runQueued()?.queueId !== queued.queueId) return;
+      queueCancelPending = false;
+      if (scheduleFatal()) return;
+      if (cancelled.queueId !== queued.queueId) { scheduleUnknown("Cancellation did not match the queued request."); return; }
+      setQueueCancelAcknowledged(true);
+      if (acceptedDispatch()) {
+        inconsistentQueueCancellation();
+        return;
+      }
+      setRunPrepared(null);
+      setManualMonitorError("");
+      setManualStatus("Cancellation acknowledged. Waiting for current work / authority cleanup and confirmed automatic resumption.");
+      setManualMode("schedule-waiting-release");
+      finishReleasedQueue();
+    } catch (error) {
+      if (generation !== manualGeneration || request !== scheduleGeneration || runQueued()?.queueId !== queued.queueId) return;
+      queueCancelPending = false;
+      if (scheduleFatal()) return;
+      if (acceptedDispatch()) {
+        if (!manualTerminal()) setManualStatus("The run started before queued cancellation. Use c to cancel this exact manual run.");
+        return;
+      }
+      scheduleUnknown(error instanceof BrokerRejectionError
+        ? `Queued cancellation was not confirmed: ${dispatchResultDetail(error.code, error.detail)}`
+        : "Queued cancellation was not confirmed.", error instanceof BrokerRejectionError && HARD_SCHEDULE_FAILURES.has(error.code));
+      finishReleasedQueue();
+    }
+  }
+
+  const schedulingPresentation = createMemo(() => {
+    if (!scheduleFlow()) return undefined;
+    const mode = manualMode();
+    const prepared = runPrepared();
+    const role = prepared?.role === "review-handler" ? "Review Handler" : "Reviewer";
+    const states: Record<string, string> = {
+      queued: "QUEUED / NOT STARTED", quiescing: "STOPPING CURRENT WORK / NOT STARTED",
+      "waiting-authority": "WAITING FOR AUTHORITY", revalidating: "REVALIDATING / NOT STARTED",
+    };
+    return {
+      headline: mode === "busy-preparing" ? "NOT STARTED / CHECKING OWNED WORK" :
+        mode === "busy-choice" ? prepared ? `NOT STARTED | ${role} PR #${prepared.conflict.pullRequestId} is busy` : "NOT STARTED / BACK" :
+        mode === "schedule-confirming" ? "CONFIRMING REQUEST" :
+        mode === "schedule-cancelling" ? "CANCELLING QUEUED REQUEST" :
+        mode === "schedule-unknown" ? "STATUS UNKNOWN" :
+        mode === "schedule-waiting-release" ? queueCancelAcknowledged() ? "CANCELLATION ACKNOWLEDGED / CLEANUP PENDING" : "BLOCKED / WAITING FOR SLOT RELEASE" :
+        mode === "schedule-ended" ? "REQUEST ENDED / OUTCOME UNKNOWN" :
+        mode === "queue-cancelled" ? "CANCELLED / NOT STARTED" :
+        mode === "scheduled" ? states[runProgress()?.state ?? "queued"] ?? "QUEUED / NOT STARTED" : "",
+      choosing: mode === "busy-choice", choice: busyChoice(), prepared,
+      automationNote: automationNote(), attention: runProgress()?.state === "blocked" || scheduleFatal(),
+    };
+  });
+  createEffect(() => {
+    revision();
+    if (scheduleFlow() && !slotReleased() && !scheduleFatal() && props.brokerFailure?.() &&
+        (runQueued() || scheduleConfirmationInFlight)) {
+      scheduleBrokerFailed = true;
+      setAutomationNote("Broker failure: scheduling-slot release and automatic resumption are unconfirmed.");
+      scheduleUnknown("Lost broker contact while scheduling; cancellation or startup is unconfirmed.");
+    }
+  });
+
   async function cancelManual(): Promise<void> {
     const accepted = acceptedDispatch();
-    if (!props.broker || !accepted || manualMode() !== "active") return;
+    if (!props.broker || !accepted || manualMode() !== "active" || scheduleFatal()) return;
     const generation = manualGeneration;
     setManualMode("cancelling");
     setManualMonitorError("");
@@ -1265,7 +1872,7 @@ export function App(props: AppProps) {
   // the one this whole sub-flow requests.
   function canRequestWidening(): boolean {
     const summary = capabilitySummary();
-    return manualMode() === "confirm" && wideningStage() === "closed" &&
+    return !scheduleFlow() && uiMode() === "advanced" && manualMode() === "confirm" && wideningStage() === "closed" &&
       props.launchMode !== "preview" && Boolean(summary) &&
       !summary!.killSwitchActive && summary!.delegableAvailable.length === 1;
   }
@@ -1836,14 +2443,76 @@ export function App(props: AppProps) {
     }
   }
 
-  function cycleView(direction = 1): void {
-    const values: ViewFilter[] = ["live", "current", "history"];
-    const next = values[(values.indexOf(view()) + direction + values.length) % values.length] ?? "current";
+  function selectView(next: ViewFilter): void {
     setView(next);
     setSelected(0);
     setFocus("rail");
     if (layout().mode === "compact") setDetailOpen(false);
     notify(`View filter changed to ${viewLabel(next)}`);
+  }
+
+  function cycleView(direction = 1): void {
+    const values: ViewFilter[] = ["live", "current", "history"];
+    selectView(values[(values.indexOf(view()) + direction + values.length) % values.length] ?? "live");
+  }
+
+  async function dismissCurrentInstance(): Promise<void> {
+    if (dismissalPending()) {
+      notify("Please wait for the current dismissal operation");
+      return;
+    }
+    if (view() === "history" && props.history) {
+      notify("PR History is retained; use x to hide a PR row or l to return to instances");
+      return;
+    }
+    const instance = current();
+    const record = instance ? props.reducer.dismissalFor(instance.key) : null;
+    if (!record) {
+      notify(instance ? "Live agents cannot be dismissed; Delete never stops a process" : "No stale or finished instance is selected");
+      return;
+    }
+    if (!props.dismissalStorage) {
+      notify("Dashboard dismissal storage is unavailable");
+      return;
+    }
+    setDismissalPending(true);
+    try {
+      await props.dismissalStorage.save(record);
+      const dismissed = props.reducer.dismissInstance(record);
+      setRevision((value) => value + 1);
+      notify(dismissed ? "Instance dismissed across Watch restarts; logs and PR History retained" :
+        "Instance received new activity; kept visible");
+    } catch (error) {
+      setDismissalError(`Could not save dismissal: ${error instanceof Error ? error.message : String(error)}`);
+      notify("Dismissal could not be saved; instance kept visible");
+    } finally {
+      setDismissalPending(false);
+    }
+  }
+
+  async function restoreDismissedInstances(): Promise<void> {
+    if (dismissalPending()) {
+      notify("Please wait for the current dismissal operation");
+      return;
+    }
+    if (!props.dismissalStorage) {
+      notify("Dashboard dismissal storage is unavailable");
+      return;
+    }
+    setDismissalPending(true);
+    try {
+      const restored = await props.dismissalStorage.restoreAll();
+      props.reducer.restoreDismissedInstances();
+      setDismissalError("");
+      setRevision((value) => value + 1);
+      selectView("current");
+      notify(`${restored} dismissed instance(s) restored; logs were not changed`);
+    } catch (error) {
+      setDismissalError(`Could not restore dismissed instances: ${error instanceof Error ? error.message : String(error)}`);
+      notify("Could not restore dismissed instances");
+    } finally {
+      setDismissalPending(false);
+    }
   }
 
   function forgetCurrentHistory(): void {
@@ -1913,7 +2582,11 @@ export function App(props: AppProps) {
   const warningAvailable = createMemo(() =>
     instances().some((item) => item.status === "failed" || item.status === "blocked" || item.sourceDiagnostics.length > 0),
   );
-  const palette = createMemo<PaletteCommand[]>(() => [
+  const scanCommands = (): PaletteCommand[] => scanVisible() ? [{
+    label: "Scan now", enabled: !scanUnavailable(), unavailable: scanUnavailable(),
+    run: () => { void requestScanNow(); },
+  }] : [];
+  const advancedPalette = createMemo<PaletteCommand[]>(() => [
     {
       label: "Focus instance rail",
       enabled: activeFocus() !== "rail",
@@ -1985,7 +2658,37 @@ export function App(props: AppProps) {
       unavailable: "Observe-only: trusted manual broker is unavailable",
       run: openManual,
     },
+    {
+      label: view() === "live" ? "Show Current session (including stale)" : "Show Live only",
+      enabled: true,
+      unavailable: "",
+      run: () => selectView(view() === "live" ? "current" : "live"),
+    },
+    {
+      label: "Dismiss selected stale/finished instance (Delete)",
+      enabled: view() !== "history" && Boolean(current()) && !isLiveInstance(current()!, now()) && !dismissalPending(),
+      unavailable: "Select a stale or finished instance in Current session",
+      run: () => void dismissCurrentInstance(),
+    },
+    {
+      label: "Restore dismissed instances (Shift+Delete)",
+      enabled: Boolean(props.dismissalStorage) && !dismissalPending(),
+      unavailable: "Dashboard dismissal storage is unavailable or busy",
+      run: () => void restoreDismissedInstances(),
+    },
+    ...scanCommands(),
   ]);
+  const palette = createMemo<PaletteCommand[]>(() => uiMode() === "advanced" ? advancedPalette() : [
+    { label: "Start Agent by PR ID", enabled: Boolean(props.broker), unavailable: "Observe-only: trusted manual broker is unavailable", run: openManual },
+    { label: view() === "history" ? "Show Live" : "Show History", enabled: true, unavailable: "", run: toggleSimpleHistory },
+    { label: simpleDetail() ? "Back to list" : "Open selected details", enabled: Boolean(simpleDetail() || simpleRows().length),
+      unavailable: "No item is available", run: () => simpleDetail() ? setSimpleDetail(null) : openSimpleDetail() },
+    { label: "Show keyboard help", enabled: true, unavailable: "", run: () => setOverlay("help") },
+    { label: "Quit", enabled: true, unavailable: "", run: () => void quit() },
+    ...scanCommands(),
+  ]);
+  const paletteCapacity = () => Math.max(1, Math.min(22, dimensions().height - 4) - 5);
+  const paletteStart = () => selectionWindow(paletteIndex(), paletteCapacity());
 
   function executePalette(): void {
     const command = palette()[paletteIndex()];
@@ -2018,6 +2721,34 @@ export function App(props: AppProps) {
       if (key.eventType === "release" || key.eventType === "repeat" || key.repeated) return;
       if (key.name === "q" && manualMode() !== "target" && manualMode() !== "prompt") {
         void quit();
+        return;
+      }
+      if (manualMode() === "busy-choice" && ["tab", "up", "down"].includes(key.name)) {
+        changeBusyChoice(key.name === "up" || key.name === "tab" && key.shift ? -1 : 1);
+        return;
+      }
+      if ((uiMode() === "simple" || scheduleFlow()) && manualMode() !== "target" && wideningStage() === "closed" &&
+          ["up", "down", "pageup", "pagedown"].includes(key.name)) {
+        simpleManualScroll?.scrollBy({ x: 0, y: scrollAmount(key.name) });
+        return;
+      }
+      if (scheduleFatal()) return;
+      if (manualMode() === "busy-choice") {
+        if (key.name === "escape") closeManual();
+        else if (key.name === "return" && !key.ctrl && !key.meta && !key.shift) void confirmBusy();
+        return;
+      }
+      if (manualMode() === "busy-preparing") {
+        if (key.name === "escape") closeManual();
+        return;
+      }
+      if (manualMode() === "scheduled" || manualMode() === "schedule-unknown") {
+        if (key.name === "c" || key.name === "escape") void cancelQueuedRun();
+        return;
+      }
+      if (manualMode() === "schedule-confirming" || manualMode() === "schedule-cancelling" || manualMode() === "schedule-waiting-release") return;
+      if (manualMode() === "queue-cancelled" || manualMode() === "schedule-ended") {
+        if (key.name === "escape" || key.name === "return") closeManual();
         return;
       }
       if (manualMode() === "target") {
@@ -2065,7 +2796,11 @@ export function App(props: AppProps) {
         else if (key.name === "return" && !key.ctrl && !key.meta && !key.shift) void dispatchManual();
         else if (key.name === "p") { setManualStatus(""); setManualMode("prompt"); }
         else if (key.name === "d") setManualMode("confirm-final");
-        else if (key.name === "w" && canRequestWidening()) void beginWidening();
+        else if (key.name === "w") {
+          if (uiMode() === "simple") setManualStatus("Capability widening is in Advanced. Cancel this preview, then press a.");
+          else if (scheduleFlow()) setManualStatus("Scheduling uses the fresh baseline permissions. Cancel and reopen to request a new widening grant.");
+          else if (canRequestWidening()) void beginWidening();
+        }
       } else if (manualMode() === "confirm-final") {
         if (key.name === "escape") closeManual();
         else if (key.name === "y" || (key.name === "return" && !key.ctrl && !key.meta && !key.shift)) void dispatchManual();
@@ -2114,6 +2849,9 @@ export function App(props: AppProps) {
         setPaletteIndex((value) => (value + palette().length - 1) % palette().length);
       } else if (key.name === "down" || key.name === "j") {
         setPaletteIndex((value) => (value + 1) % palette().length);
+      } else if (key.name === "pageup" || key.name === "pagedown") {
+        setPaletteIndex((value) => Math.max(0, Math.min(palette().length - 1,
+          value + (key.name === "pageup" ? -paletteCapacity() : paletteCapacity()))));
       } else if (key.name === "return") executePalette();
       return;
     }
@@ -2135,7 +2873,7 @@ export function App(props: AppProps) {
       if (key.name === "escape" || key.name === "?") {
         setOverlay("none");
         notify("Help closed");
-      }
+      } else if (scrollAmount(key.name)) helpScroll?.scrollBy({ x: 0, y: scrollAmount(key.name) });
       return;
     }
     if (overlay() === "settings") {
@@ -2246,6 +2984,26 @@ export function App(props: AppProps) {
       return;
     }
 
+    if (key.name === "r" && !key.ctrl && !key.meta && !key.shift) {
+      if (key.eventType !== "release" && key.eventType !== "repeat" && !key.repeated) void requestScanNow();
+      return;
+    }
+    if (key.name === "a") { toggleUiMode(); return; }
+    if (uiMode() === "simple") {
+      if (key.name === "m") openManual();
+      else if (key.name === "h") toggleSimpleHistory();
+      else if (key.name === "?") setOverlay("help");
+      else if (key.name === "escape") setSimpleDetail(null);
+      else if (key.name === "return" && !simpleDetail()) openSimpleDetail();
+      else if (scrollAmount(key.name)) {
+        if (simpleDetail()) simpleDetailScroll?.scrollBy({ x: 0, y: scrollAmount(key.name) });
+        else moveSimple(key.name === "pageup" || key.name === "pagedown"
+          ? Math.sign(scrollAmount(key.name)) * Math.max(1, Math.floor((dimensions().height - 5) / 2))
+          : scrollAmount(key.name));
+      } else if (["s", "i", "e", "f", "w", "l", "delete", "x", "tab", "/", "left", "right", "o"].includes(key.name) ||
+                 /^[0-9]$/.test(key.name)) notify("Press a for Advanced");
+      return;
+    }
     if (key.name === "up" || key.name === "k") move(-1);
     else if (key.name === "down" || key.name === "j") move(1);
     else if (key.name === "return") {
@@ -2301,6 +3059,11 @@ export function App(props: AppProps) {
     else if (key.name === "m") openManual();
     else if (key.name === "s") openSettings();
     else if (key.name === "f") cycleView(key.shift ? -1 : 1);
+    else if (key.name === "l") selectView(view() === "live" ? "current" : "live");
+    else if (key.name === "delete") {
+      if (key.shift) void restoreDismissedInstances();
+      else void dismissCurrentInstance();
+    }
     else if (key.name === "x") {
       if (key.shift) forgetAllHistory();
       else forgetCurrentHistory();
@@ -2330,6 +3093,35 @@ export function App(props: AppProps) {
   const footer = createMemo(() => {
     if (manualMode() !== "closed") {
       const mode = manualMode();
+      if (scheduleFatal()) return {
+        summary: "Up/Down/PgUp/PgDn scroll", hint: "Scheduling slot blocked | q: quit and stop",
+      };
+      if (runQueued() && !slotReleased() && acceptedDispatch() && mode === "terminal") {
+        return { summary: "Up/Down/PgUp/PgDn scroll",
+          hint: "Waiting for automatic resumption | q: quit and stop" };
+      }
+      if (mode === "busy-choice") return {
+        summary: "Tab/Up/Down choose | PgUp/PgDn scroll",
+        hint: `Enter: ${busyChoice() === "replace" ? "Replace / run now" : busyChoice() === "next" ? "Run next" : "Back"} | Esc: Back | q: quit`,
+      };
+      if (mode === "busy-preparing") return { summary: "PgUp/PgDn scroll", hint: "Checking ownership only | Esc: Back | q: quit" };
+      if (mode === "scheduled") return { summary: "Up/Down/PgUp/PgDn scroll", hint: "c/Esc: cancel queued request | q: quit and stop" };
+      if (mode === "schedule-unknown") return { summary: "Up/Down/PgUp/PgDn scroll",
+        hint: "c/Esc: retry queued cancel | q: quit and stop" };
+      if (mode === "schedule-confirming" || mode === "schedule-cancelling") return {
+        summary: "Up/Down/PgUp/PgDn scroll", hint: "Please wait | q: quit and stop",
+      };
+      if (mode === "schedule-waiting-release") return { summary: "Up/Down/PgUp/PgDn scroll", hint: "Waiting for slot release | q: quit and stop" };
+      if (mode === "queue-cancelled" || mode === "schedule-ended") return { summary: "Up/Down/PgUp/PgDn scroll", hint: "Enter or Esc: close | q: quit" };
+      if (uiMode() === "simple" || scheduleFlow()) {
+        const hint = mode === "target" ? "Tab Agent | Enter Preview | Ctrl+U Clear | Esc Cancel" :
+          mode === "prompt" ? "Enter: return to preview | Shift+Enter: newline | Esc: cancel" :
+          mode === "confirm" || mode === "confirm-final" ? "Enter: START | p: instructions | Esc: cancel | q: quit" :
+          mode === "active" ? "c: cancel this run | q: quit and stop" :
+          mode === "terminal" ? "Enter or Esc: close | q: quit" :
+          mode === "dispatching" || mode === "cancelling" ? "Please wait | q: quit and stop" : "Esc: cancel | q: quit";
+        return { summary: mode === "target" || mode === "resolving" || mode === "describing" ? "" : "Up/Down/PgUp/PgDn scroll", hint };
+      }
       const widening = wideningStage();
       const hint = widening !== "closed"
         ? widening === "preview" ? "c: review widening | Esc: cancel" :
@@ -2343,6 +3135,17 @@ export function App(props: AppProps) {
           "Please wait | Esc: cancel";
       return { summary: "", hint };
     }
+    if (uiMode() === "simple") {
+      if (overlay() !== "none") return { summary: "", hint: overlay() === "palette"
+        ? "Up/Down select | Enter run | Esc close" : "Up/Down/PgUp/PgDn scroll | Esc close" };
+      return {
+        summary: simpleDetail() ? "Esc Back | Up/Down/PgUp/PgDn scroll" : simpleRows().length ? "Enter Details" : "",
+        hint: `m Start agent | ${scanVisible() ? "r Scan now | " : ""}h ${view() === "history" ? "Live" : "History"} | a Advanced | q Quit`,
+      };
+    }
+    const scanHint = (hint: string): string => scanMainVisible()
+      ? dimensions().width < 80 ? "m Start | r Scan now | l Live | Del | f | ? | q" : hint.replace(" | ", " | r Scan now | ")
+      : hint;
     const live = instances().filter((item) => streamLabel(item) === "Live").length;
     const history = instances().filter((item) => streamLabel(item) === "History").length;
     const stale = instances().filter((item) => streamLabel(item) === "Stale").length;
@@ -2354,19 +3157,19 @@ export function App(props: AppProps) {
         : " | no PR selected";
       const summary = `PR history ${historyEntries().length}${selectedLabel}${historyFilter() ? ` | filter: ${historyFilter()}` : ""}${input}`;
       if (dimensions().width >= 120) {
-        return { summary, hint: "m Start Agent by PR ID | ↑/↓ | Tab role | / filter | number jump | x/X | f | ? | q" };
+        return { summary, hint: scanHint("m Start Agent by PR ID | ↑/↓ | Tab role | / filter | number jump | x/X | f | ? | q") };
       }
       if (dimensions().width >= 80) {
-        return { summary, hint: "m Start Agent by PR ID | ↑/↓ | / filter | f | ? | q" };
+        return { summary, hint: scanHint("m Start Agent by PR ID | ↑/↓ | / filter | f | ? | q") };
       }
-      return { summary, hint: "m Start Agent by PR ID | Enter | f | ? | q" };
+      return { summary, hint: scanHint("m Start Agent by PR ID | Enter | f | ? | q") };
     }
     const summary = dimensions().width < 80
       ? `${viewLabel(view())} ${instances().length} | L ${live} H ${history} S ${stale}`
       : `${viewLabel(view())} ${instances().length} | Live ${live} History ${history} Stale ${stale}`;
-    if (dimensions().width >= 120) return { summary, hint: "m Start Agent by PR ID | f view | ←/→ pane | ↑/↓ | Tab role | i/e/o/w | Ctrl+P | ? | q" };
-    if (dimensions().width >= 80) return { summary, hint: "m Start Agent by PR ID | f view | Tab role | i/e/o | ? | q" };
-    return { summary, hint: "m Start Agent by PR ID | Enter | f | ? | q" };
+    if (dimensions().width >= 120) return { summary, hint: scanHint("m Start Agent by PR ID | l Live/Current | Del dismiss | f view | Ctrl+P | ? | q") };
+    if (dimensions().width >= 80) return { summary: `${viewLabel(view())} ${instances().length}`, hint: scanHint("m Start Agent by PR ID | l Live/Current | Del dismiss | f | ? | q") };
+    return { summary: `${viewLabel(view())} ${instances().length}`, hint: scanHint("m Start Agent by PR ID | l Live | Del | Enter | q") };
   });
   const headerContext = createMemo(() => {
     if (dimensions().width >= 120) {
@@ -2377,18 +3180,67 @@ export function App(props: AppProps) {
     }
     return `${view().toUpperCase()} | ${role().toUpperCase()} | FOCUS ${activeFocus().toUpperCase()}`;
   });
+  const showAutomationStatus = () => manualMode() === "closed" && overlay() === "none";
+  const advancedFooterHint = () => scanMainVisible() && footer().hint.length > dimensions().width - 2
+    ? "m Start | r Scan now | f Views | Ctrl+P | ? | q Quit" : footer().hint;
+  const advancedFooterSummary = () => {
+    if (!scanMainVisible()) return footer().summary;
+    const remaining = dimensions().width - advancedFooterHint().length - 3;
+    return remaining > 0 ? line(footer().summary, remaining) : "";
+  };
+  const automationLine = createMemo(() => {
+    revision();
+    if (props.brokerFailure?.() || automationQueryError() || automationHalted() && automationStatus()?.available) return "Auto: unavailable";
+    const status = automationStatus();
+    return status ? automationStatusText(status) : getAutomationStatus ? "Auto: checking..." : "Auto: unavailable";
+  });
+  const showFeedback = () => (uiMode() === "advanced" && !scheduleFlow() ||
+    (manualMode() === "closed" && overlay() === "none" && feedback() !== defaultFeedback)) &&
+    !(getAutomationStatus && showAutomationStatus() && dimensions().height <= 8 && feedback() === defaultFeedback);
+  const simpleHeight = () => Math.max(3, dimensions().height - 1 - (footer().summary ? 2 : 1) -
+    (showAutomationStatus() ? 1 : 0) - (showFeedback() ? 1 : 0) -
+    (diagnostics().length || props.brokerFailure?.() || dismissalError() || automationError() ? 1 : 0));
 
   return (
     <box width="100%" height="100%" flexDirection="column" backgroundColor={COLORS.bg}>
       <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
         <text height={1} fg={COLORS.brand}>DEVPILOT OPERATIONS</text>
         <text height={1} fg={props.launchMode === "operational" ? COLORS.error : props.broker ? COLORS.warning : COLORS.muted}>
+          <Show when={uiMode() === "simple"} fallback={
+          <>
           {(props.launchMode ?? "observe") === "observe" && !props.broker
             ? "OBSERVE ONLY"
             : `${(props.launchMode ?? "observe").toUpperCase()} | ${props.broker ? "TRUSTED MANUAL ENABLED" : "NO MANUAL"}`} | {headerContext()}
+          </>
+          }>
+            {props.launchMode === "operational" ? "OPERATIONAL" : props.launchMode === "preview" ? "PREVIEW ONLY" : "OBSERVE ONLY"}
+          </Show>
         </text>
       </box>
-      <box flexGrow={1} flexDirection="row" gap={1} padding={1} overflow="hidden">
+      <Show when={showAutomationStatus()}>
+        <box height={1} flexShrink={0} paddingX={1}>
+          <text height={1} fg={automationError() || props.brokerFailure?.() ? COLORS.warning : COLORS.muted}>
+            {line(automationLine(), Math.max(1, dimensions().width - 2))}
+          </text>
+        </box>
+      </Show>
+      <box flexGrow={1} minHeight={0} flexDirection="row" gap={1} padding={uiMode() === "simple" || scheduleFlow() ||
+        getAutomationStatus && showAutomationStatus() && dimensions().height <= 8 ? 0 : 1} overflow="hidden">
+        <Show when={uiMode() === "advanced" && !scheduleFlow()} fallback={
+          <Show when={manualMode() !== "closed"} fallback={
+            <SimpleView rows={simpleRows()} selectedKey={simpleSelectedKey()} detail={simpleDetail()}
+              history={view() === "history"} width={dimensions().width} height={simpleHeight()} colors={COLORS}
+              scrollRef={(value) => { simpleDetailScroll = value; }} />
+          }>
+            <SimpleManualPanel mode={manualMode()} role={manualRole()} targetInput={manualInput()} target={manualTarget()}
+              summary={capabilitySummary()} prompt={operatorPrompt()} accepted={Boolean(acceptedDispatch())}
+              status={manualStatus() || props.brokerFailure?.() || ""} progress={dispatchProgress()}
+              startUncertain={Boolean(manualMonitorError())} colors={COLORS}
+              advanced={uiMode() === "advanced"} processId={acceptedDispatch()?.childProcessId}
+              scheduling={schedulingPresentation()}
+              scrollRef={(value) => { simpleManualScroll = value; }} />
+          </Show>
+        }>
         <Show when={manualMode() !== "closed"} fallback={
           <Show when={view() === "history" && props.history} fallback={
           <>
@@ -2424,28 +3276,42 @@ export function App(props: AppProps) {
               wideningLocked={props.launchMode === "preview"}
             />
         </Show>
+        </Show>
       </box>
-      <Show when={diagnostics().length > 0 || props.brokerFailure?.()}>
+      <Show when={diagnostics().length > 0 || props.brokerFailure?.() || dismissalError() || automationError()}>
         <box height={1} paddingX={1} backgroundColor="#282117">
           <text height={1} fg={COLORS.warning}>
             {props.brokerFailure?.()
               ? `BROKER FAILURE: ${line(props.brokerFailure?.() ?? "", Math.max(20, dimensions().width - 20))}`
-              : `SOURCE WARNING: ${line(diagnostics().at(-1)?.message ?? "event source error", Math.max(20, dimensions().width - 20))}`}
+              : dismissalError()
+                ? `DISPLAY STATE: ${line(dismissalError(), Math.max(20, dimensions().width - 20))}`
+                : automationError()
+                  ? `AUTO POLLING: ${line(automationError(), Math.max(20, dimensions().width - 16))}`
+                  : `SOURCE WARNING: ${line(diagnostics().at(-1)?.message ?? "event source error", Math.max(20, dimensions().width - 20))}`}
           </text>
         </box>
       </Show>
-      <box height={1} paddingX={1} backgroundColor={COLORS.brand}>
+      <Show when={showFeedback()}>
+      <box height={1} flexShrink={0} paddingX={1} backgroundColor={COLORS.brand}>
         <text height={1} fg={COLORS.text}>STATUS: {line(manualMode() === "closed" ? feedback() :
           dispatchProgress()?.headline ?? (manualMode() === "dispatching" ? manualMonitorError() ? "START STATUS UNKNOWN" : "STARTING..." :
             manualMode() === "confirm" || manualMode() === "confirm-final" ? "NOT STARTED / READY TO START" :
               manualStatus() || "Not started"), Math.max(10, dimensions().width - 10))}</text>
       </box>
-      <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
-        <text height={1} fg={COLORS.text}>{footer().summary}</text>
-        <text height={1} fg={COLORS.muted}>{footer().hint}</text>
+      </Show>
+      <Show when={uiMode() === "simple" || scheduleFlow()} fallback={
+      <box height={1} flexShrink={0} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
+        <text height={1} fg={COLORS.text}>{advancedFooterSummary()}</text>
+        <text height={1} fg={COLORS.muted}>{advancedFooterHint()}</text>
       </box>
+      }>
+        <box height={footer().summary ? 2 : 1} flexShrink={0} paddingX={1} flexDirection="column" backgroundColor={COLORS.panelAlt}>
+          <Show when={footer().summary}><text height={1} fg={COLORS.muted}>{footer().summary}</text></Show>
+          <text height={1} fg={COLORS.accent}>{footer().hint}</text>
+        </box>
+      </Show>
 
-      <Show when={manualMode() === "closed" && layout().showInspector && layout().inspectorOverlay}>
+      <Show when={uiMode() === "advanced" && manualMode() === "closed" && layout().showInspector && layout().inspectorOverlay}>
         <OverlayPanel title="INSPECTOR" width={58} height={25}>
           <Inspector instance={current()} focused />
         </OverlayPanel>
@@ -2470,25 +3336,46 @@ export function App(props: AppProps) {
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "palette"}>
-        <OverlayPanel title="DASHBOARD COMMANDS" width={64} height={19}>
-          <For each={palette()}>
+        <OverlayPanel title="DASHBOARD COMMANDS" width={64} height={22} bounded>
+          <Index each={palette().slice(paletteStart(), paletteStart() + paletteCapacity())}>
             {(command, index) => (
-              <text height={1} fg={!command.enabled ? COLORS.muted : index() === paletteIndex() ? COLORS.accent : COLORS.text}>
-                {index() === paletteIndex() ? "> " : "  "}{command.label}{command.enabled ? "" : " [unavailable]"}
+              <text height={1} fg={!command().enabled ? COLORS.muted : index + paletteStart() === paletteIndex() ? COLORS.accent : COLORS.text}>
+                {index + paletteStart() === paletteIndex() ? "> " : "  "}{command().label}{command().enabled ? "" : " [unavailable]"}
               </text>
             )}
-          </For>
+          </Index>
           <text height={1} fg={COLORS.muted}>Up/Down select | Enter run | Esc dismiss</text>
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "help"}>
-        <OverlayPanel title={props.broker ? "HELP - TRUSTED MANUAL MODE" : "HELP - OBSERVE MODE"} width={78} height={25}>
+        <OverlayPanel title={uiMode() === "simple" ? "HELP - SIMPLE" : props.broker ? "HELP - TRUSTED MANUAL MODE" : "HELP - OBSERVE MODE"} width={78} height={29} bounded>
+          <scrollbox ref={(value) => { helpScroll = value; }} flexGrow={1} minHeight={0} scrollY>
+          <Show when={scanVisible()}>
+            <text flexShrink={0} wrapMode="word" fg={COLORS.text}>
+              r Scan now: wake idle automatic workers; busy/manual work is not interrupted.
+            </text>
+          </Show>
+          <Show when={uiMode() === "advanced"} fallback={
+            <>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>m Start agent: enter PR ID, Enter loads preview, Enter starts.</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>h History / Live</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>Up/Down select; Enter details; Esc back. PageUp/PageDown scroll.</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>p Optional instructions in preview; c cancels a running manual agent.</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>a Advanced (from the main view); a returns to Simple.</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>Ctrl+P Basic commands | q Quit</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.muted}>Live shows recent heartbeats. History retains reported outcomes; missing outcomes stay unknown.</text>
+            </>
+          }>
+          <text height={1} fg={COLORS.text}>a                  Return to Simple (Live, all roles)</text>
           <text height={1} fg={COLORS.text}>Left / Right      Focus visible pane</text>
           <text height={1} fg={COLORS.text}>Up/Down or j/k    Select instance when rail is focused</text>
           <text height={1} fg={COLORS.text}>Enter              Drill rail → narrative → timeline</text>
           <text height={1} fg={COLORS.text}>Esc / b            Back timeline/inspector → detail → rail</text>
           <text height={1} fg={COLORS.text}>Tab / Shift+Tab    Cycle role filter</text>
           <text height={1} fg={COLORS.text}>f / Shift+f        Cycle Live, Current session, History view</text>
+          <text height={1} fg={COLORS.text}>l                  Toggle Live only / Current (including stale)</text>
+          <text height={1} fg={COLORS.text}>Delete             Dismiss stale/finished instance across restarts</text>
+          <text height={1} fg={COLORS.text}>Shift+Delete       Restore dismissed instances</text>
           <text height={1} fg={COLORS.text}>x / Shift+x        Hide selected / restore hidden PR history rows</text>
           <text height={1} fg={COLORS.text}>i                  Open/close inspector</text>
           <text height={1} fg={COLORS.text}>e                  Raw events; Up/Down scroll; Left/Right filter</text>
@@ -2511,6 +3398,8 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[0]}</text>
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[1]}</text>
           <text height={1} fg={COLORS.warning}>{HELP_LEGEND[2]}</text>
+          </Show>
+          </scrollbox>
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "settings"}>

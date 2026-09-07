@@ -48,7 +48,9 @@ $baselineDigest = ('1' * 64)
 $widenedDigest = ('2' * 64)
 $prStateFingerprint = ('3' * 64)
 $dispatchDraftId = '11111111-1111-1111-1111-111111111111'
-$dispatchId = '22222222-2222-4222-8222-222222222222'
+$dispatchId = if ($descriptor.dispatchId) {
+  [Guid]::Parse([string]$descriptor.dispatchId).ToString()
+} else { [Guid]::NewGuid().ToString() }
 $previewChallenge = ('a' * 48)
 $summaryChallenge = ('b' * 48)
 $previewExpiresAtUtc = [DateTime]::UtcNow.AddMinutes(10).ToString('o')
@@ -63,8 +65,49 @@ $previewDiff = @{
 $wideningStage = $null
 $wideningGeneration = 0
 $dispatchActive = $false
+$scanRequests = 0
 function Append-Log([object]$request) {
   [System.IO.File]::AppendAllText($requestLogPath, (($request | ConvertTo-Json -Compress -Depth 10) + [Environment]::NewLine))
+}
+function Assert-AutomationRequest([object]$request) {
+  if ((($request.PSObject.Properties.Name | Sort-Object) -join ',') -ne 'operation,requestId,schemaVersion') {
+    throw 'Automation status and scan requests must not carry PIDs, roles or other arguments.'
+  }
+}
+function Automation-Status-Response([object]$request) {
+  Assert-AutomationRequest $request
+  $response = @{
+    schemaVersion=1;requestId=$request.requestId;operation='automation-status';automationVersion=1
+    available=$false;scope=$null;agents=@()
+  }
+  if ($descriptor.automationFlow -eq $true) {
+    $response.available = $true
+    $response.scope = 'current-launcher'
+    $response.agents = @(
+      @{role='reviewer';continuous=$true;intervalSeconds=900;state='waiting';canScanNow=$true},
+      @{role='review-handler';continuous=$true;intervalSeconds=900;state='scanning';canScanNow=$false}
+    )
+  }
+  return $response | ConvertTo-Json -Compress -Depth 10
+}
+function Scan-Now-Response([object]$request) {
+  Assert-AutomationRequest $request
+  if ($descriptor.automationFlow -ne $true) {
+    return @{schemaVersion=1;requestId=$request.requestId;operation='rejected'
+      code='automation-unavailable';detail='This fixture does not own an automatic launcher.'
+    } | ConvertTo-Json -Compress
+  }
+  $script:scanRequests++
+  Start-Sleep -Milliseconds 700
+  $reviewerOutcome = if ($descriptor.automationManualPriorityAfterFirst -eq $true -and $script:scanRequests -gt 1) {
+    'manual-priority'
+  } else { 'requested' }
+  return @{schemaVersion=1;requestId=$request.requestId;operation='scan-now-result'
+    automationVersion=1;scope='current-launcher';results=@(
+      @{role='reviewer';outcome=$reviewerOutcome},
+      @{role='review-handler';outcome='already-running'}
+    )
+  } | ConvertTo-Json -Compress -Depth 10
 }
 function Provenance([bool]$widened) {
   if ($widened) {
@@ -233,6 +276,7 @@ function Dispatch-Response([object]$request) {
 }
 function Cancel-Dispatch([object]$request) {
   if (-not $script:dispatchActive) { throw 'dispatch is not active' }
+  if ($request.dispatchId -ne $dispatchId) { throw 'dispatch cancellation ID does not match the active fixture dispatch' }
   $script:dispatchActive = $false
   if ($simpleFlow) { Start-Sleep -Milliseconds 400 }
   return @{
@@ -249,6 +293,8 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
   $request = $line | ConvertFrom-Json
   Append-Log $request
   switch ($request.operation) {
+    'get-automation-status' { Write-Output (Automation-Status-Response $request) }
+    'scan-now' { Write-Output (Scan-Now-Response $request) }
     'profile-current' { Write-Output (Describe-Response $request) }
     'describe' { Write-Output (Describe-Response $request) }
     'describe-widening' { Write-Output (Describe-Widening $request) }

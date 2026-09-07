@@ -1,7 +1,7 @@
 param(
     [string]$ConfigFile, [string]$RepoPath, [string]$StateDir, [string]$EventLogDirectory,
     [string]$DurableStateRoot, [string]$LeaseRoot, [string]$OperatorAlias,
-    [int]$PullRequestId, [switch]$Once, [switch]$ForceAnalysis, [string]$OutputMode,
+    [int]$PullRequestId, [switch]$Once, [switch]$ForceAnalysis, [switch]$IncludeOwnPullRequests, [string]$OutputMode,
     [string]$ManualDispatchManifest,
     [switch]$EnableFindingComments, [switch]$EnableThreadReplies, [switch]$EnableSummaryComment
 )
@@ -49,6 +49,7 @@ try {
     $manifest = Get-Content -LiteralPath $ManualDispatchManifest -Raw | ConvertFrom-Json -AsHashtable
     [IO.File]::WriteAllText($eventPath, (ConvertTo-AgentCanonicalJson @{
                 dispatchId = $manifest.dispatchId; processId = $PID; startupVerified = $true
+                includeOwnPullRequests = [bool]$IncludeOwnPullRequests
                 attestationHandleCleared = [string]::IsNullOrEmpty($env:DEVPILOT_BROKER_ATTESTATION_HANDLE)
             }), [Text.UTF8Encoding]::new($false))
     if ($config.startupTestMode -in @('wait', 'eof-termination-failed', 'shutdown-termination-failed')) { Start-Sleep -Seconds 90 }

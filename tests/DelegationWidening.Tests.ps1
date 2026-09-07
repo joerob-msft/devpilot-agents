@@ -323,11 +323,12 @@ Describe 'broker widening protocol wiring (source-regex, matches existing Dispat
     }
 
     It 'seals the grant artifact before launch and removes it only after proceed is sent, before accepted' {
-        $sealIdx = $script:brokerSource.IndexOf('New-AgentWideningGrantArtifact -RuntimeRoot')
-        $manifestWriteIdx = $script:brokerSource.IndexOf('[IO.File]::WriteAllText($manifestPath')
-        $proceedIdx = $script:brokerSource.IndexOf("operation = 'proceed'")
-        $removeIdx = $script:brokerSource.IndexOf('Remove-AgentWideningGrantArtifact -RuntimeRoot', $proceedIdx)
-        $acceptedIdx = $script:brokerSource.IndexOf("operation = 'accepted'")
+        $dispatch = [regex]::Match($script:brokerSource, '(?s)function Invoke-DispatchCore \{.*?\n\}').Value
+        $sealIdx = $dispatch.IndexOf('New-AgentWideningGrantArtifact -RuntimeRoot')
+        $manifestWriteIdx = $dispatch.IndexOf('[IO.File]::WriteAllText($manifestPath')
+        $proceedIdx = $dispatch.IndexOf("operation = 'proceed'")
+        $removeIdx = $dispatch.IndexOf('Remove-AgentWideningGrantArtifact -RuntimeRoot', $proceedIdx)
+        $acceptedIdx = $dispatch.IndexOf("operation = 'accepted'")
         $sealIdx | Should -BeGreaterThan -1
         $manifestWriteIdx | Should -BeGreaterThan $sealIdx
         $removeIdx | Should -BeGreaterThan $proceedIdx
@@ -623,7 +624,7 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
             $body | Should -Not -BeNullOrEmpty
             $body | Should -Not -Match 'Assert-AgentInteractiveWideningAvailable'
         }
-        $dispatchBody = [regex]::Match($brokerSource, '(?s)function Invoke-Dispatch \{.*?\n\}').Value
+        $dispatchBody = [regex]::Match($brokerSource, '(?s)function Invoke-DispatchCore \{.*?\n\}').Value
         $dispatchBody | Should -Not -BeNullOrEmpty
         $dispatchBody | Should -Match 'widening-interactive-required'
     }

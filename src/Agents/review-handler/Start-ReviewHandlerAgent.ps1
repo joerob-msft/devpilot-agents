@@ -89,6 +89,9 @@ param(
     [string]$ManualDispatchManifest,
 
     [Parameter(DontShow)]
+    [string]$LauncherWorkerManifest,
+
+    [Parameter(DontShow)]
     [string]$EventLogDirectory,
 
     [ValidateRange(30, 86400)]
@@ -224,6 +227,8 @@ $HarnessPath = $importedHarness.Path
 # accompanying broker attestation handle. The deep cryptographic verification happens later, in
 # Enter-AgentManualDispatchStartup, immediately before the ready/proceed handshake.
 Assert-AgentManualDispatchEarlyContext -ManifestPath $ManualDispatchManifest
+if ($ManualDispatchManifest -and $LauncherWorkerManifest) { throw 'Worker and manual authority cannot be combined.' }
+Initialize-AgentLauncherWorker -ManifestPath $LauncherWorkerManifest
 
 $ResultMarkerPrefix = "REVIEW_HANDLER_RESULT_V1:"
 $script:HandlerRejectedResumeSessionIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -2290,10 +2295,11 @@ function Invoke-HandlerCycle {
             phase = 'running the model'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
         } -Message "Launching Copilot (mode=$permissionMode, timeout=${CycleTimeoutSeconds}s, resume=$([bool]$resumeId))..."
 
-        $cancellationProbe = if ($ManualDispatchManifest) {
+        $cancellationProbe = if ($ManualDispatchManifest -or $LauncherWorkerManifest) {
             {
-                Test-AgentManualCancellationRequested -RepositoryIdentity $repositoryIdentity `
-                    -PullRequestId $prId -Role review-handler
+                (Test-AgentLauncherCancellationRequested) -or
+                    (Test-AgentManualCancellationRequested -RepositoryIdentity $repositoryIdentity `
+                        -PullRequestId $prId -Role review-handler)
             }.GetNewClosure()
         }
         else { $null }
@@ -2562,6 +2568,7 @@ function Invoke-HandlerCycle {
         return $result
     }
     catch {
+        if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
         Write-Warning "Cycle $CycleNumber failed: $($_.Exception.Message)"
         Write-HandlerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "error"; message = $_.Exception.Message }
         $result.ExitCode = 1
@@ -2670,6 +2677,7 @@ try {
         if ($identitySession) { Close-AgentMcpSession -Session $identitySession }
     }
 
+    Confirm-AgentLauncherWorkerStartup
     Write-Host "review-handler: operator=$OperatorAlias org=$Organization project=$ExpectedProject repo=$RepositoryName" -ForegroundColor Cyan
     if ($PullRequestId -gt 0) { Write-Host "Target: PR $PullRequestId only." -ForegroundColor Cyan }
     Write-Host "Capabilities: codeChanges=$([bool]$EnableCodeChanges) push=$([bool]$EnablePush) threadReplies=$([bool]$EnableThreadReplies) localValidation=$([bool]$LocalValidation) buddyRequeue=$([bool]$EnableBuddyRequeue) autoComplete=$([bool]$EnableAutoComplete) teams=$([bool]$EnableTeamsNotifications)" -ForegroundColor Cyan
@@ -2704,7 +2712,7 @@ try {
             kind = $(if ($lastCycleExitCode -eq 0) { 'scan' } else { 'retry' })
             delayMilliseconds = ([long]$delay * 1000); retryable = ($lastCycleExitCode -ne 0)
         } -Message "Waiting ${delay}s before the next $(if ($lastCycleExitCode -eq 0) { 'scan' } else { 'retry' })."
-        Start-Sleep -Seconds $delay
+        Wait-AgentLauncherInterval -Seconds $delay
     } while ($true)
 
     $final = Get-OnceFinalExitCode -IsOnce:$Once -IsDryRun:$false -LastCycleExitCode $lastCycleExitCode
@@ -2716,6 +2724,7 @@ finally {
 
 }
 catch {
+    if ($_.Exception.Message -match '^\[(cancelled|launcher-yielded)\]') { exit 0 }
     if ($script:HandlerOutputContext) {
         Send-HandlerEvent cycle.failed -Level error -Data @{ reason = $_.Exception.Message } -Message $_.Exception.Message
     }
@@ -2724,6 +2733,7 @@ catch {
 }
 finally {
     Exit-AgentManualDispatchAuthority
+    Close-AgentLauncherWorker
     if ($script:HandlerOutputContext) {
         Close-AgentOutputContext -Context $script:HandlerOutputContext
     }

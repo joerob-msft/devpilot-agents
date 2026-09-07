@@ -6,12 +6,14 @@ import { PullRequestHistoryProjection } from "./history.js";
 import { createDashboardLifecycle } from "./lifecycle.js";
 import { OperationsReducer } from "./reducer.js";
 import { EventTailer } from "./tailer.js";
+import { FileDismissalStorage } from "./dismissals.js";
 
 interface Arguments {
   stateDirectories: string[];
   eventLogPaths: string[];
   broker: BrokerLaunchDescriptor | null;
   launchMode: LaunchMode;
+  viewStateDirectory?: string;
 }
 
 export function parseArguments(argv: string[]): Arguments {
@@ -29,6 +31,10 @@ export function parseArguments(argv: string[]): Arguments {
       if (!value) throw new Error(`${argument} requires a path`);
       if (argument === "--state-dir") result.stateDirectories.push(value);
       else result.eventLogPaths.push(value);
+    } else if (argument === "--view-state-dir") {
+      const value = argv[++index];
+      if (!value) throw new Error("--view-state-dir requires a path");
+      result.viewStateDirectory = value;
     } else if (argument === "--launch-mode") {
       const value = argv[++index];
       if (value !== "observe" && value !== "preview" && value !== "operational") {
@@ -44,6 +50,7 @@ export function parseArguments(argv: string[]): Arguments {
     } else if (argument === "--help" || argument === "-h") {
       process.stdout.write(
         "Usage: npm start -- [--state-dir <path>]... [--event-log <path>]... [--launch-mode <observe|preview|operational>]\n" +
+          "  [--view-state-dir <path>] overrides local dashboard dismissal storage only.\n" +
           "Observe DevPilot reviewer and review-handler JSONL event streams.\n",
       );
       process.exitCode = 0;
@@ -66,7 +73,14 @@ export function parseArguments(argv: string[]): Arguments {
 async function main(): Promise<void> {
   const args = parseArguments(process.argv.slice(2));
   if (process.exitCode !== undefined) return;
-  const reducer = new OperationsReducer();
+  const dismissalStorage = new FileDismissalStorage(args.viewStateDirectory);
+  let dismissalError = "";
+  const reducer = await dismissalStorage.load()
+    .then((records) => new OperationsReducer(records))
+    .catch((error: unknown) => {
+      dismissalError = `Could not load dismissed instances: ${error instanceof Error ? error.message : String(error)}`;
+      return new OperationsReducer();
+    });
   const history = new PullRequestHistoryProjection();
   let brokerFailure = "";
   let refresh = (): void => {};
@@ -122,6 +136,8 @@ async function main(): Promise<void> {
       launchMode={args.launchMode}
       brokerFailure={() => brokerFailure}
       shutdownBroker={lifecycle.shutdownBroker}
+      dismissalStorage={dismissalStorage}
+      dismissalLoadError={dismissalError}
     />, renderer);
     refresh = () => renderer.requestRender();
   } catch (error) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { access, appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -6,10 +7,111 @@ import test from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { execFileSync } from "node:child_process";
 import { spawn, type IDisposable, type IPty } from "node-pty";
+import { TerminalScreen } from "./terminal-screen.js";
 
 const WAIT_TIMEOUT_MS = 8_000;
 const EXIT_TIMEOUT_MS = 5_000;
 const MAX_CAPTURE_CHARS = 1_000_000;
+const SIMPLE_MAIN_HINT = "m Start agent | h History | a Advanced | q Quit";
+
+test("real Delete dismisses stale instances across dashboard restarts and Live only stays the default", {
+  skip: process.platform === "win32" ? false : "ConPTY integration is Windows-only",
+  timeout: 60_000,
+}, async () => {
+  const root = await mkdtemp(resolve(".devpilot-dismissal-pty-"));
+  const log = join(root, "events.jsonl");
+  const contents = event("reviewer", "dismissal-pty", 1, "agent.started", { repository: "old-watch" }) + "\n";
+  let expectedContents = contents;
+  const dashboardRoot = resolve(".");
+  const bun = resolve("node_modules", "bun", "bin", "bun.exe");
+  try {
+    await writeFile(log, contents);
+    for (let launch = 0; launch < 2; launch++) {
+      const terminal = spawn(bun, ["--conditions=browser", resolve("dist", "src", "index.js"),
+        "--event-log", log, "--view-state-dir", join(root, "display")], {
+        name: "xterm-256color", cols: 130, rows: 36, cwd: dashboardRoot, env: environment(),
+      });
+      let revision = 0;
+      let raw = "";
+      let exited = false;
+      const screen = new TerminalScreen();
+      const output = terminal.onData((data) => {
+        raw = (raw + data).slice(-MAX_CAPTURE_CHARS);
+        screen.write(data);
+        revision++;
+      });
+      let resolveExit!: (event: PtyExit) => void;
+      const exit = new Promise<PtyExit>((resolve) => { resolveExit = resolve; });
+      const subscription = terminal.onExit((result) => { exited = true; resolveExit(result); });
+      const visible = () => screen.text();
+      async function wait(expected: string, start = 0): Promise<void> {
+        const deadline = Date.now() + WAIT_TIMEOUT_MS;
+        while (Date.now() < deadline && !exited) {
+          if (revision >= start && visible().includes(expected)) return;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.fail(`Missing ${expected}\n${visible()}\nRAW tail: ${JSON.stringify(raw.slice(-2000))}`);
+      }
+      async function send(bytes: string, expected: string): Promise<void> {
+        const start = revision + 1;
+        terminal.write(bytes);
+        await wait(expected, start);
+      }
+      async function finish(): Promise<PtyExit> {
+        let timeout: NodeJS.Timeout | undefined;
+        try {
+          return await Promise.race([exit, new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => reject(new Error("Dashboard did not exit")), EXIT_TIMEOUT_MS);
+          })]);
+        } finally { if (timeout) clearTimeout(timeout); }
+      }
+      try {
+        await wait(SIMPLE_MAIN_HINT);
+        await send("a", "FOCUS RAIL");
+        await wait("LIVE ONLY");
+        await wait("INSTANCES 0");
+        await send("F", "operations-dashboard PR #104"); // Wait for replay, not just the initially empty frame.
+        await wait("PR HISTORY 1");
+        await send("l", "Live only 0");
+        await send("l", "CURRENT SESSION");
+        await wait(`INSTANCES ${launch === 0 ? 1 : 0}`);
+        if (launch === 0) {
+          await send("\x1b[3~", "Instance dismissed across Watch restarts");
+          await wait("INSTANCES 0");
+          await send("f", "operations-dashboard PR #104");
+          await wait("PR HISTORY 1");
+        } else {
+          await send("\x1b[3;2~", "1 dismissed instance(s) restored");
+          await wait("INSTANCES 1");
+          assert.equal(await readFile(log, "utf8"), contents);
+          await send("\x1b[3~", "Instance dismissed across Watch restarts");
+          await wait("INSTANCES 0");
+          const heartbeat = JSON.parse(contents);
+          heartbeat.sequence = 2;
+          heartbeat.eventType = "agent.heartbeat";
+          heartbeat.timestamp = new Date().toISOString();
+          const heartbeatLine = JSON.stringify(heartbeat) + "\n";
+          await appendFile(log, heartbeatLine);
+          expectedContents += heartbeatLine;
+          await send("l", "Live only 1");
+          await send("\x1b[3~", "Live agents cannot be dismissed");
+          await wait("INSTANCES 1");
+        }
+        assert.equal(await readFile(log, "utf8"), expectedContents);
+        terminal.write("q");
+        const result = await finish();
+        assert.equal(result.exitCode, 0);
+        assert.equal(result.signal ?? 0, 0);
+        assert.equal(await readFile(log, "utf8"), expectedContents);
+      } finally {
+        if (!exited) { terminal.kill(); await finish(); }
+        disposeConptyOutputWorker(terminal);
+        output.dispose();
+        subscription.dispose();
+      }
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 interface PtyExit {
   exitCode: number;
@@ -105,9 +207,652 @@ function fixtureLines(): string {
   ].join("\n") + "\n";
 }
 
+test("real ConPTY defaults to Simple across widths, retains History and starts agents with two Enters", {
+  skip: process.platform === "win32" ? false : "ConPTY integration is Windows-only",
+  timeout: 120_000,
+}, async () => {
+  for (const width of [70, 100, 140]) {
+    const root = await mkdtemp(resolve(".devpilot-simple-pty-"));
+    const eventLogPath = join(root, "events.jsonl");
+    const dispatchEventLogPath = join(root, "manual-events.jsonl");
+    const requestLogPath = join(root, "requests.jsonl");
+    const descriptorPath = join(root, "descriptor.json");
+    const role = width === 100 ? "review-handler" : "reviewer";
+    const liveEvents = (["reviewer", "review-handler"] as const).flatMap((agent) =>
+      ["agent.started", "agent.heartbeat"].map((type, index) => {
+        const value = JSON.parse(event(agent, `simple-${agent}`, index + 1, type, { repository: "simple-live" }));
+        return JSON.stringify({ ...value, pullRequestId: 0, timestamp: new Date().toISOString() });
+      }));
+    const contents = fixtureLines() + liveEvents.join("\n") + "\n";
+    try {
+      await writeFile(eventLogPath, contents);
+      await writeFile(descriptorPath, JSON.stringify({
+        requestLogPath, dispatchEventLogPath, simpleFlow: true, role,
+      }));
+      for (let launch = 0; launch < 2; launch++) {
+        const screen = new TerminalScreen();
+        screen.resize(width, 36);
+        let revision = 0;
+        let raw = "";
+        let exited: PtyExit | undefined;
+        let resolveExit!: (result: PtyExit) => void;
+        const exit = new Promise<PtyExit>((resolve) => { resolveExit = resolve; });
+        const terminal = spawn(resolve("node_modules", "bun", "bin", "bun.exe"), [
+          "--conditions=browser", resolve("dist", "src", "index.js"),
+          "--state-dir", root, "--event-log", eventLogPath, "--view-state-dir", join(root, "display"),
+          "--launch-mode", "operational", "--broker-executable", resolvePowerShellPath(),
+          "--broker-script", reviewerWideningBrokerScript(), "--broker-descriptor", descriptorPath,
+        ], { name: "xterm-256color", cols: width, rows: 36, cwd: resolve("."), env: environment() });
+        const output = terminal.onData((data) => {
+          raw = (raw + data).slice(-MAX_CAPTURE_CHARS);
+          screen.write(data);
+          revision++;
+        });
+        const subscription = terminal.onExit((result) => { exited = result; resolveExit(result); });
+        const context = (message: string) => `${message} at ${width} columns, launch ${launch}\n${screen.text()}\nRAW tail: ${JSON.stringify(raw.slice(-2000))}`;
+        async function wait(expected: string | RegExp, start = 0): Promise<void> {
+          const deadline = Date.now() + WAIT_TIMEOUT_MS;
+          while (!exited && Date.now() < deadline) {
+            const text = screen.text();
+            if (revision >= start && (typeof expected === "string" ? text.includes(expected) : expected.test(text))) return;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          assert.fail(context(`Missing ${expected}`));
+        }
+        async function send(bytes: string, expected: string | RegExp): Promise<void> {
+          const start = revision + 1;
+          terminal.write(bytes);
+          await wait(expected, start);
+        }
+        async function finish(): Promise<PtyExit> {
+          let timeout: NodeJS.Timeout | undefined;
+          try {
+            return await Promise.race([exit, new Promise<never>((_, reject) => {
+              timeout = setTimeout(() => reject(new Error(context("Dashboard did not exit"))), 15_000);
+            })]);
+          } finally { if (timeout) clearTimeout(timeout); }
+        }
+        async function simpleMain(): Promise<void> {
+          await wait(SIMPLE_MAIN_HINT);
+          await wait("LIVE AGENTS");
+          await wait("Reviewer | No PR selected");
+          await wait("Review Handler | No PR selected");
+          assert.doesNotMatch(screen.text(), /\bINSPECTOR\b|\bFOCUS\b|\bPID\b|\bINSTANCES\b|\bRAW STREAM\b/,
+            context("Simple main must not expose Advanced chrome"));
+        }
+        try {
+          await wait("DEVPILOT OPERATIONS");
+          await wait("OPERATIONAL");
+          await simpleMain();
+          if (launch === 0) {
+            await send("h", "h Live | a Advanced | q Quit");
+            await wait("Both agents | PR #104");
+            await wait("ConPTY live flow");
+            await send("\r", "Esc Back");
+            await wait("DETAILS");
+            await wait("Author: Ada");
+            await wait("Reviewer: reviewed");
+            await wait("Review Handler: handled");
+            await send("\x1b", "Enter Details");
+            await wait("Both agents | PR #104");
+            assert.doesNotMatch(screen.text(), /\bDETAILS\b|\bAuthor: Ada\b/);
+
+            await send("a", "Live only 2");
+            await wait("INSTANCES 2");
+            await send("\t", "Role filter changed");
+            await wait("Live only 1");
+            await send("F", "View filter changed to History");
+            await wait("PR HISTORY 1");
+            await send("a", SIMPLE_MAIN_HINT);
+            await simpleMain(); // Both live roles must return after the Advanced History/role filters.
+
+            await send("m", "PR ID: (blank)");
+            if (role === "review-handler") await send("\t", "Agent: Review Handler");
+            await send("104\r", /^[ \u2502]*NOT STARTED \/ READY TO START[ \u2502]*$/m);
+            await wait("ConPTY widening flow");
+            await wait(role === "reviewer" ? "Finding comments" : "Code pushes");
+            assert.deepEqual(await readRequestOperations(requestLogPath), ["profile-current", "describe"],
+              "The first Enter must only resolve and preview; it must not dispatch");
+            await send("\r", /^[ \u2502]*STARTING[ \u2502]*$/m);
+            await wait(/^[ \u2502]*STARTED[ \u2502]*$/m);
+            await wait("Waiting for first progress");
+            assert.doesNotMatch(screen.text(), /\bChild PID\b|\bFOCUS\b|\bINSPECTOR\b/);
+            assert.equal((await readRequestOperations(requestLogPath)).filter((operation) => operation === "dispatch").length, 1,
+              "The second Enter must start exactly one agent");
+            await send("c", /^[ \u2502]*CANCELLING\.\.\.[ \u2502]*$/m);
+            await wait(/^[ \u2502]*CANCELLED[ \u2502]*$/m);
+            await send("\r", SIMPLE_MAIN_HINT);
+            await simpleMain();
+
+            // Quit in Advanced with non-default filters; the next process must still start in Simple.
+            await send("a", "Live only 2");
+            await send("\t", "Role filter changed");
+            await wait("Live only 1");
+            await send("F", "View filter changed to History");
+            await wait("PR HISTORY 1");
+          }
+          terminal.write("q");
+          const result = await finish();
+          assert.equal(result.exitCode, 0, context("Fixture dashboard must quit cleanly"));
+          assert.equal(result.signal ?? 0, 0);
+          assert.equal(await readFile(eventLogPath, "utf8"), contents);
+        } finally {
+          try {
+            if (!exited) { terminal.kill(); await finish(); }
+            assert.ok(exited, "Owned dashboard must terminate before cleanup");
+            assert.doesNotMatch(stripVTControlCharacters(raw), /AttachConsole failed|conpty_console_list_agent/i);
+          } finally {
+            disposeConptyOutputWorker(terminal);
+            output.dispose();
+            subscription.dispose();
+          }
+        }
+      }
+      assert.deepEqual(await readRequestOperations(requestLogPath),
+        ["profile-current", "describe", "dispatch", "cancel", "shutdown", "shutdown"]);
+      const requests = (await readFile(requestLogPath, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+      const dispatched = requests.filter((request) => request.operation === "dispatch");
+      assert.equal(dispatched[0]?.role, role);
+      assert.equal(dispatched[0]?.operatorPrompt, "");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test("real ConPTY Auto shows both 15-minute agents and Scan now is one honest main-view request", {
+  skip: process.platform === "win32" ? false : "ConPTY integration is Windows-only",
+  timeout: 120_000,
+}, async () => {
+  for (const { width, automationFlow } of [
+    { width: 70, automationFlow: true }, { width: 140, automationFlow: true }, { width: 70, automationFlow: false },
+  ]) {
+    const root = await mkdtemp(resolve(".devpilot-auto-scan-pty-"));
+    const requestLogPath = join(root, "requests.jsonl");
+    const eventLogPath = join(root, "events.jsonl");
+    const descriptorPath = join(root, "descriptor.json");
+    const screen = new TerminalScreen();
+    screen.resize(width, 36);
+    let revision = 0;
+    let raw = "";
+    let terminal: IPty | undefined;
+    let exited: PtyExit | undefined;
+    let output: IDisposable | undefined;
+    let subscription: IDisposable | undefined;
+    let resolveExit!: (result: PtyExit) => void;
+    const exit = new Promise<PtyExit>((resolve) => { resolveExit = resolve; });
+    const context = (message: string) => `${message} (${width} columns, automation ${automationFlow})\n${screen.text()}\nRAW tail: ${JSON.stringify(raw.slice(-2000))}`;
+    async function wait(expected: string | RegExp, start = 0): Promise<void> {
+      const deadline = Date.now() + WAIT_TIMEOUT_MS;
+      while (!exited && Date.now() < deadline) {
+        const text = screen.text();
+        if (revision >= start && (typeof expected === "string" ? text.includes(expected) : expected.test(text))) return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.fail(context(`Missing ${expected}`));
+    }
+    async function send(bytes: string, expected: string | RegExp): Promise<void> {
+      assert.ok(terminal, "The isolated dashboard must be running");
+      const start = revision + 1;
+      terminal.write(bytes);
+      await wait(expected, start);
+    }
+    async function finish(): Promise<PtyExit> {
+      let timeout: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([exit, new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(context("Dashboard did not exit"))), 15_000);
+        })]);
+      } finally { if (timeout) clearTimeout(timeout); }
+    }
+    async function assertScanCount(expected: number): Promise<void> {
+      const requests = await readBrokerRequests(requestLogPath);
+      const scans = requests.filter((request) => request.operation === "scan-now");
+      assert.equal(scans.length, expected, context("Unexpected Scan now request count"));
+      for (const request of scans) {
+        assert.deepEqual(request, { schemaVersion: 1, requestId: request.requestId, operation: "scan-now" });
+      }
+    }
+    try {
+      await writeFile(eventLogPath, "");
+      await writeFile(requestLogPath, "");
+      await writeFile(descriptorPath, JSON.stringify({
+        requestLogPath, dispatchEventLogPath: join(root, "manual-events.jsonl"),
+        simpleFlow: true, role: "reviewer", automationFlow, automationManualPriorityAfterFirst: true,
+      }));
+      terminal = spawn(resolve("node_modules", "bun", "bin", "bun.exe"), [
+        "--conditions=browser", resolve("dist", "src", "index.js"),
+        "--state-dir", root, "--event-log", eventLogPath, "--view-state-dir", join(root, "display"),
+        "--launch-mode", "operational", "--broker-executable", resolvePowerShellPath(),
+        "--broker-script", reviewerWideningBrokerScript(), "--broker-descriptor", descriptorPath,
+      ], { name: "xterm-256color", cols: width, rows: 36, cwd: resolve("."), env: environment() });
+      output = terminal.onData((data) => { raw = (raw + data).slice(-MAX_CAPTURE_CHARS); screen.write(data); revision++; });
+      subscription = terminal.onExit((result) => { exited = result; resolveExit(result); });
+      await wait("LIVE AGENTS");
+      const statusDeadline = Date.now() + WAIT_TIMEOUT_MS;
+      while (!(await readBrokerRequests(requestLogPath)).some((request) => request.operation === "get-automation-status")) {
+        assert.ok(!exited && Date.now() < statusDeadline, context("Mount must query automation status"));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await assertScanCount(0);
+      if (automationFlow) {
+        // Assert the compact status semantics without fixing its complete wording or separators.
+        await wait(/\bAuto\b/i);
+        await wait(/\bBoth\b/i);
+        await wait(/\b15m\b/i);
+        await wait("r Scan now");
+        if (width === 140) {
+          await send("a", "INSTANCES");
+          await wait("r Scan now");
+        }
+        terminal.write("r" + "\x1b[114;1:2u".repeat(8) + "r");
+        await wait("Reviewer wake requested");
+        await wait("Handler already working");
+        await assertScanCount(1);
+        assert.doesNotMatch(screen.text(), /STARTED \/ RUNNING|Child PID/,
+          "A scan wake request must not be presented as an accepted model/agent start");
+        terminal.write("\x1b[114;1:2u".repeat(3) + "\x1b[114;1:3u");
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await assertScanCount(1);
+        assert.deepEqual(await readRequestOperations(requestLogPath), ["scan-now"],
+          "r needs no d/y/Enter confirmation and must not dispatch, cancel or queue work");
+
+        if (width === 140) {
+          await send("F", "View filter changed to History");
+          await send("/r", "filter: r");
+          await assertScanCount(1);
+          terminal.write("\x1b");
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await send("a", "LIVE AGENTS");
+          await send("a", "INSTANCES");
+        }
+        await send("m", "PR ID: (blank)");
+        await send("104\r", "NOT STARTED / READY TO START");
+        await send("p", "Optional instructions");
+        await send("r", /^[ \u2502]*r[ \u2502]*$/m);
+        await assertScanCount(1);
+        assert.deepEqual(await readRequestOperations(requestLogPath), ["scan-now", "profile-current", "describe"],
+          "Manual prompt input r is text, not an automation command");
+        await send("\x1b", width === 140 ? "INSTANCES" : "LIVE AGENTS");
+        await wait("r Scan now");
+        await send("r", "Reviewer manual priority");
+        await wait("Handler already working");
+        await assertScanCount(2);
+        assert.deepEqual(await readRequestOperations(requestLogPath),
+          ["scan-now", "profile-current", "describe", "scan-now"],
+          "Manual priority and active work must not produce cancellation, dispatch or an extra queued scan");
+      } else {
+        await wait("Auto: unavailable");
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        assert.doesNotMatch(screen.text(), /r Scan now/);
+        terminal.write("r\x1b[114;1:2u");
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await assertScanCount(0);
+        assert.deepEqual(await readRequestOperations(requestLogPath), [],
+          "An unavailable legacy launcher must never receive a scan wake");
+      }
+      terminal.write("q");
+      const result = await finish();
+      assert.equal(result.exitCode, 0, context("Fixture dashboard must quit cleanly"));
+      assert.equal(result.signal ?? 0, 0);
+      await assertScanCount(automationFlow ? 2 : 0);
+      const polls = (await readBrokerRequests(requestLogPath)).filter((request) => request.operation === "get-automation-status");
+      assert.ok(polls.length >= 1);
+      for (const request of polls) {
+        assert.deepEqual(request, { schemaVersion: 1, requestId: request.requestId, operation: "get-automation-status" });
+      }
+      assert.deepEqual(await readRequestOperations(requestLogPath),
+        automationFlow ? ["scan-now", "profile-current", "describe", "scan-now", "shutdown"] : ["shutdown"]);
+      assert.equal(await readFile(eventLogPath, "utf8"), "");
+    } finally {
+      try {
+        if (terminal && !exited) { terminal.kill(); await finish(); }
+        if (terminal) assert.ok(exited, "Owned fixture dashboard must terminate before cleanup");
+        assert.doesNotMatch(raw, /AttachConsole failed|conpty_console_list_agent/i);
+      } finally {
+        if (terminal) disposeConptyOutputWorker(terminal);
+        output?.dispose();
+        subscription?.dispose();
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
 function reviewerWideningBrokerScript(): string {
   return resolve("test\\fixtures\\reviewer-widening-broker.ps1");
 }
+
+async function busyBrokerSource(): Promise<string> {
+  const source = await readFile(reviewerWideningBrokerScript(), "utf8");
+  const loop = "$accepting = $true";
+  assert.equal(source.split(loop).length, 2, "The shared fixture must have one protocol loop");
+  // Reuse its identities, capability responses and fake dispatch/cancel functions.
+  return source.slice(0, source.indexOf(loop)) + String.raw`
+$prepareCount = 0
+$prepared = $null
+$pendingQueue = $null
+$lastDispatch = $null
+$queueId = '77777777-7777-4777-8777-777777777777'
+function Emit([object]$response) {
+  [Console]::Out.WriteLine(($response | ConvertTo-Json -Compress -Depth 10))
+}
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  $request = $line | ConvertFrom-Json
+  Append-Log $request
+  switch ($request.operation) {
+    'get-automation-status' { Emit (Automation-Status-Response $request | ConvertFrom-Json) }
+    { $_ -in @('profile-current', 'describe') } {
+      $response = Describe-Response $request | ConvertFrom-Json
+      $response | Add-Member -NotePropertyName scheduling -NotePropertyValue @{version=1;scope='current-launcher'}
+      Emit $response
+    }
+    'dispatch' {
+      $lastDispatch = $request
+      Emit @{schemaVersion=1;requestId=$request.requestId;operation='rejected'
+        code=$descriptor.busyCode;detail='The current launcher is reviewing PR #114.'}
+    }
+    'prepare-run' {
+      if ($null -eq $lastDispatch) { throw 'Preparation must follow the explicit busy dispatch attempt.' }
+      if ($request.repositoryKey -ne $repositoryIdentity.key -or $request.pullRequestId -ne 104 -or
+          $request.role -ne 'reviewer' -or $request.mode -notin @('replace', 'next') -or
+          $request.capabilityPolicyDigest -ne $baselineDigest -or $request.prStateFingerprint -ne $prStateFingerprint) {
+        throw 'Preparation changed the verified target.'
+      }
+      $prepareCount++
+      $prepared = @{schemaVersion=1;requestId=$request.requestId;operation='run-prepared'
+        schedulingVersion=1;scope='current-launcher';confirmationToken=(('a'*47) + $prepareCount.ToString('x'))
+        expiresAtUtc=[DateTime]::UtcNow.AddMinutes(2).ToString('o');repositoryKey=$repositoryIdentity.key
+        pullRequestId=104;role='reviewer';mode=$request.mode
+        conflict=@{kind='automatic';pullRequestId=(113 + $prepareCount)
+          workId=('33333333-3333-4333-8333-{0:D12}' -f $prepareCount)
+          generation=('44444444-4444-4444-8444-{0:D12}' -f $prepareCount)}
+      }
+      Emit $prepared
+    }
+    'confirm-run' {
+      if ($null -eq $prepared -or $request.confirmationToken -ne $prepared.confirmationToken -or
+          $request.expectedWorkId -ne $prepared.conflict.workId -or
+          $request.expectedGeneration -ne $prepared.conflict.generation) {
+        throw 'Confirmation reused an obsolete work generation or choice.'
+      }
+      $pendingQueue = $queueId
+      $queued = @{schemaVersion=1;requestId=$request.requestId;operation='run-queued'
+        schedulingVersion=1;queueId=$queueId;mode=$prepared.mode}
+      $prepared = $null
+      if ($descriptor.busyFlow -eq 'queued') {
+        Emit $queued
+        Emit @{schemaVersion=1;requestId=$request.requestId;operation='run-progress'
+          schedulingVersion=1;queueId=$queueId;state='queued';code=''}
+      } else {
+        $messages = [System.Collections.Generic.List[string]]::new()
+        $messages.Add(($queued | ConvertTo-Json -Compress))
+        foreach ($state in @('queued', 'quiescing', 'waiting-authority', 'revalidating')) {
+          $messages.Add((@{schemaVersion=1;requestId=$request.requestId;operation='run-progress'
+            schedulingVersion=1;queueId=$queueId;state=$state;code=''
+          } | ConvertTo-Json -Compress))
+        }
+        $accepted = Dispatch-Response $lastDispatch | ConvertFrom-Json
+        $accepted.requestId = $request.requestId
+        $accepted | Add-Member -NotePropertyName queueId -NotePropertyValue $queueId
+        $messages.Add(($accepted | ConvertTo-Json -Compress -Depth 10))
+        $pendingQueue = $null
+        # One write stresses acceptance arriving before the confirm-run continuation.
+        [Console]::Out.WriteLine(($messages -join [Environment]::NewLine))
+      }
+    }
+    'cancel-queued' {
+      if ($null -eq $pendingQueue -or $request.queueId -ne $pendingQueue) { throw 'Only the pending queue may be cancelled.' }
+      $pendingQueue = $null
+      Emit @{schemaVersion=1;requestId=$request.requestId;operation='queue-cancelled';schedulingVersion=1;queueId=$request.queueId}
+      Emit @{schemaVersion=1;requestId=$request.requestId;operation='run-progress'
+        schedulingVersion=1;queueId=$request.queueId;state='resumed';code=''}
+    }
+    'cancel' {
+      Emit (Cancel-Dispatch $request | ConvertFrom-Json)
+      Emit @{schemaVersion=1;requestId=$request.requestId;operation='run-progress'
+        schedulingVersion=1;queueId=$queueId;state='resumed';code=''}
+    }
+    'shutdown' {
+      Emit @{schemaVersion=1;requestId=$request.requestId;operation='shutdown-complete'}
+      return
+    }
+    default { throw "Unexpected busy fixture operation $($request.operation)" }
+  }
+}
+`;
+}
+
+interface BusyPty {
+  readonly dispatchId: string;
+  wait(expected: string | RegExp, start?: number): Promise<void>;
+  send(bytes: string, expected: string | RegExp): Promise<void>;
+  write(bytes: string): void;
+  text(): string;
+  requests(): Promise<Record<string, unknown>[]>;
+}
+
+async function withBusyPty(
+  mode: "simple" | "advanced",
+  busyFlow: "queued" | "accepted",
+  action: (fixture: BusyPty) => Promise<void>,
+): Promise<void> {
+  const root = await mkdtemp(resolve(".devpilot-busy-pty-"));
+  const dispatchId = randomUUID();
+  const requestLogPath = join(root, "requests.jsonl");
+  const descriptorPath = join(root, "descriptor.json");
+  const scriptPath = join(root, "broker.ps1");
+  const eventLogPath = join(root, "events.jsonl");
+  const width = mode === "simple" ? 70 : 140;
+  const screen = new TerminalScreen();
+  screen.resize(width, 36);
+  let revision = 0;
+  let raw = "";
+  let terminal: IPty | undefined;
+  let exited: PtyExit | undefined;
+  let output: IDisposable | undefined;
+  let subscription: IDisposable | undefined;
+  let resolveExit!: (result: PtyExit) => void;
+  const exit = new Promise<PtyExit>((resolve) => { resolveExit = resolve; });
+  const context = (message: string) => `${message} (${mode}, ${busyFlow}, ${width} columns)\n${screen.text()}\nRAW tail: ${JSON.stringify(raw.slice(-2000))}`;
+  async function wait(expected: string | RegExp, start = 0): Promise<void> {
+    const deadline = Date.now() + WAIT_TIMEOUT_MS;
+    while (!exited && Date.now() < deadline) {
+      const text = screen.text();
+      if (revision >= start && (typeof expected === "string" ? text.includes(expected) : expected.test(text))) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.fail(context(`Missing ${expected}`));
+  }
+  function write(bytes: string): void {
+    assert.ok(terminal, "The isolated dashboard must be running");
+    terminal.write(bytes);
+  }
+  async function send(bytes: string, expected: string | RegExp): Promise<void> {
+    const start = revision + 1;
+    write(bytes);
+    await wait(expected, start);
+  }
+  async function finish(): Promise<PtyExit> {
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([exit, new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(context("Dashboard did not exit"))), 15_000);
+      })]);
+    } finally { if (timeout) clearTimeout(timeout); }
+  }
+  async function requests(): Promise<Record<string, unknown>[]> {
+    return readInteractionRequests(requestLogPath);
+  }
+  try {
+    await writeFile(eventLogPath, "");
+    await writeFile(requestLogPath, "");
+    await writeFile(scriptPath, await busyBrokerSource());
+    await writeFile(descriptorPath, JSON.stringify({
+      requestLogPath, dispatchId, dispatchEventLogPath: join(root, "manual-events.jsonl"), simpleFlow: true,
+      role: "reviewer", busyFlow, busyCode: busyFlow === "queued" ? "state-contended" : "already-running",
+    }));
+    terminal = spawn(resolve("node_modules", "bun", "bin", "bun.exe"), [
+      "--conditions=browser", resolve("dist", "src", "index.js"),
+      "--state-dir", root, "--event-log", eventLogPath, "--view-state-dir", join(root, "display"),
+      "--launch-mode", "operational", "--broker-executable", resolvePowerShellPath(),
+      "--broker-script", scriptPath, "--broker-descriptor", descriptorPath,
+    ], { name: "xterm-256color", cols: width, rows: 36, cwd: resolve("."), env: environment() });
+    output = terminal.onData((data) => { raw = (raw + data).slice(-MAX_CAPTURE_CHARS); screen.write(data); revision++; });
+    subscription = terminal.onExit((result) => { exited = result; resolveExit(result); });
+    await wait(SIMPLE_MAIN_HINT);
+    if (mode === "advanced") await send("a", "INSTANCES");
+    await action({ dispatchId, wait, send, write, text: () => screen.text(), requests });
+    write("q");
+    const result = await finish();
+    assert.equal(result.exitCode, 0, context("Fixture dashboard must quit cleanly"));
+    assert.equal(result.signal ?? 0, 0);
+    assert.equal((await requests()).at(-1)?.operation, "shutdown");
+    assert.equal(await readFile(eventLogPath, "utf8"), "");
+  } finally {
+    try {
+      if (terminal && !exited) { terminal.kill(); await finish(); }
+      if (terminal) assert.ok(exited, "Only the owned fixture dashboard may be cleaned up");
+      assert.doesNotMatch(raw, /AttachConsole failed|conpty_console_list_agent/i);
+    } finally {
+      if (terminal) disposeConptyOutputWorker(terminal);
+      output?.dispose();
+      subscription?.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+}
+
+async function assertBusyRequestsUnchanged(fixture: BusyPty, before?: Record<string, unknown>[]): Promise<void> {
+  const baseline = before ?? await fixture.requests();
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.deepEqual(await fixture.requests(), baseline, "Buffered/repeated input must not issue another broker request");
+}
+
+async function waitForBusyPreparations(fixture: BusyPty, modes: string[]): Promise<void> {
+  const deadline = Date.now() + WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const requests = await fixture.requests();
+    assert.equal(requests.filter((request) => request.operation === "confirm-run").length, 0,
+      "Changing choices must only prepare, never confirm");
+    const preparations = requests.filter((request) => request.operation === "prepare-run");
+    if (preparations.length >= modes.length) {
+      assert.deepEqual(preparations.map((request) => request.mode), modes);
+      const label = modes.at(-1) === "replace" ? "Replace / run now" : "Run next";
+      await fixture.wait(`NOT STARTED | Reviewer PR #${113 + modes.length} is busy`);
+      await fixture.wait(`> ${label}`);
+      await fixture.wait(`Enter: ${label} | Esc: Back | q: quit`);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(`Missing preparation modes ${modes.join(", ")}\n${fixture.text()}`);
+}
+
+async function enterBusyPrompt(fixture: BusyPty): Promise<void> {
+  await fixture.send("m", "PR ID: (blank)");
+  await fixture.send("104\r\r", "NOT STARTED / READY TO START");
+  assert.deepEqual((await fixture.requests()).map((request) => request.operation), ["profile-current", "describe"]);
+  await fixture.send("\r\r\x1b[13;1:2u", "> Replace / run now");
+  await fixture.wait("Run next");
+  await fixture.wait("Back");
+  await waitForBusyPreparations(fixture, ["replace"]);
+  assert.deepEqual((await fixture.requests()).map((request) => request.operation),
+    ["profile-current", "describe", "dispatch", "prepare-run"],
+    "A busy dispatch must automatically prepare the default Replace choice, without confirming it");
+  const beforeRepeat = await fixture.requests();
+  fixture.write("\x1b[13;1:2u");
+  await assertBusyRequestsUnchanged(fixture, beforeRepeat);
+}
+
+function assertConfirmedLatestBusyPreparation(requests: Record<string, unknown>[]): void {
+  const preparations = requests.filter((request) => request.operation === "prepare-run");
+  const confirmations = requests.filter((request) => request.operation === "confirm-run");
+  assert.equal(confirmations.length, 1, "One fresh Enter must confirm exactly once");
+  const generation = String(preparations.length).padStart(12, "0");
+  assert.deepEqual(confirmations[0], {
+    schemaVersion: 1, requestId: confirmations[0]?.requestId, operation: "confirm-run",
+    confirmationToken: "a".repeat(47) + preparations.length.toString(16),
+    expectedWorkId: `33333333-3333-4333-8333-${generation}`,
+    expectedGeneration: `44444444-4444-4444-8444-${generation}`,
+  }, "Confirmation must bind the latest choice and exact current work generation");
+  assert.equal(requests.filter((request) => request.operation === "dispatch").length, 1,
+    "Scheduling must not retry the consumed dispatch draft");
+  for (const preparation of preparations) {
+    assert.equal(preparation.repositoryKey, "v1:github:10400000000000001");
+    assert.equal(preparation.pullRequestId, 104);
+    assert.equal(preparation.role, "reviewer");
+    assert.equal(preparation.operatorPrompt, "");
+    assert.equal("dispatchDraftId" in preparation, false);
+  }
+}
+
+test("real ConPTY Simple busy Back is inert and Run next cancels only its pending queue at 70 columns", {
+  skip: process.platform === "win32" ? false : "ConPTY integration is Windows-only",
+  timeout: 90_000,
+}, async () => {
+  await withBusyPty("simple", "queued", async (fixture) => {
+    await enterBusyPrompt(fixture);
+    const before = await fixture.requests();
+    await fixture.send("\x1b", SIMPLE_MAIN_HINT);
+    await assertBusyRequestsUnchanged(fixture, before);
+    assert.deepEqual(await fixture.requests(), before, "Back must not confirm or cancel existing work");
+  });
+  await withBusyPty("simple", "queued", async (fixture) => {
+    await enterBusyPrompt(fixture);
+    fixture.write("\t");
+    await waitForBusyPreparations(fixture, ["replace", "next"]);
+    fixture.write("\x1b[A");
+    await waitForBusyPreparations(fixture, ["replace", "next", "replace"]);
+    fixture.write("\x1b[B");
+    await waitForBusyPreparations(fixture, ["replace", "next", "replace", "next"]);
+    await fixture.wait("Run next");
+    const beforeRepeat = await fixture.requests();
+    fixture.write("\x1b[13;1:2u");
+    await assertBusyRequestsUnchanged(fixture, beforeRepeat);
+    await fixture.send("\r", "QUEUED / NOT STARTED");
+    await fixture.wait("c/Esc: cancel queued request | q: quit and stop");
+    assertConfirmedLatestBusyPreparation(await fixture.requests());
+    assert.doesNotMatch(fixture.text(), /\bChild PID\b|\bFOCUS\b|\bINSPECTOR\b/);
+    await fixture.send("c", "CANCELLED / NOT STARTED");
+    await fixture.wait("Automatic work resumed.");
+    const requests = await fixture.requests();
+    assertConfirmedLatestBusyPreparation(requests);
+    assert.deepEqual(requests.filter((request) => request.operation === "cancel-queued").map((request) => request.queueId),
+      ["77777777-7777-4777-8777-777777777777"]);
+    assert.equal(requests.filter((request) => request.operation === "cancel").length, 0,
+      "Cancelling Run next must not stop the currently running automatic work");
+    assert.deepEqual(requests.map((request) => request.operation), [
+      "profile-current", "describe", "dispatch", "prepare-run", "prepare-run", "prepare-run", "prepare-run",
+      "confirm-run", "cancel-queued",
+    ]);
+  });
+});
+
+test("real ConPTY Simple and Advanced route same-write busy queue progress and acceptance to the running agent", {
+  skip: process.platform === "win32" ? false : "ConPTY integration is Windows-only",
+  timeout: 90_000,
+}, async () => {
+  for (const mode of ["simple", "advanced"] as const) {
+    await withBusyPty(mode, "accepted", async (fixture) => {
+      await enterBusyPrompt(fixture);
+      const running = /^[ \u2502]*STARTED[ \u2502]*$/m;
+      await fixture.send("\r", running);
+      await fixture.wait("Waiting for first progress");
+      assertConfirmedLatestBusyPreparation(await fixture.requests());
+      await assertBusyRequestsUnchanged(fixture);
+      await fixture.wait(running);
+      if (mode === "simple") assert.doesNotMatch(fixture.text(), /\bChild PID\b|\bFOCUS\b|\bINSPECTOR\b/);
+      await fixture.send("c", "CANCELLED");
+      await fixture.wait("Automatic work resumed.");
+      const requests = await fixture.requests();
+      assert.deepEqual(requests.map((request) => request.operation),
+        ["profile-current", "describe", "dispatch", "prepare-run", "confirm-run", "cancel"]);
+      assert.equal(requests.find((request) => request.operation === "cancel")?.dispatchId,
+        fixture.dispatchId);
+      await fixture.send("\r", mode === "simple" ? SIMPLE_MAIN_HINT : "INSTANCES");
+    });
+  }
+});
+
 /*
 param([string]$DescriptorPath)
 $descriptor = Get-Content -Raw -Path $DescriptorPath | ConvertFrom-Json
@@ -352,13 +1097,31 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
 }
 */
 
-async function readRequestOperations(path: string): Promise<string[]> {
+async function readBrokerRequests(path: string): Promise<Record<string, unknown>[]> {
   const content = await readFile(path, "utf8");
   return content
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
-    .map((line) => (JSON.parse(line) as Record<string, unknown>).operation as string);
+    .map((line): Record<string, unknown> => JSON.parse(line));
+}
+
+async function readInteractionRequests(path: string): Promise<Record<string, unknown>[]> {
+  // Only background status polls are excluded; scan-now and every other request stay observable.
+  return (await readBrokerRequests(path)).filter((request) => {
+    if (request.operation !== "get-automation-status") return true;
+    assert.deepEqual(Object.keys(request).sort(), ["operation", "requestId", "schemaVersion"]);
+    assert.equal(request.schemaVersion, 1);
+    assert.equal(typeof request.requestId, "string");
+    return false;
+  });
+}
+
+async function readRequestOperations(path: string): Promise<string[]> {
+  return (await readInteractionRequests(path)).map((request) => {
+    assert.ok(typeof request.operation === "string");
+    return request.operation;
+  });
 }
 
 function environment(): Record<string, string> {
@@ -391,7 +1154,7 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
   timeout: 60_000,
 }, async () => {
   const dashboardRoot = resolve(".");
-  const stateRoot = await mkdtemp(join(tmpdir(), "devpilot-dashboard-pty-"));
+  const stateRoot = await mkdtemp(resolve(".devpilot-dashboard-pty-"));
   assert.ok(isAbsolute(stateRoot));
   assert.notEqual(resolve(stateRoot), dashboardRoot);
 
@@ -404,7 +1167,9 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
   let exitSubscription: IDisposable | undefined;
   let terminalColumns = 130;
   let terminalRows = 36;
-  let capture = "";
+  let revision = 0;
+  let raw = "";
+  const screen = new TerminalScreen();
   let exited: PtyExit | undefined;
   let resolveExit: ((exit: PtyExit) => void) | undefined;
   const exitPromise = new Promise<PtyExit>((resolvePromise) => {
@@ -412,17 +1177,17 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
   });
 
   function visibleOutput(): string {
-    return stripVTControlCharacters(capture);
+    return screen.text();
   }
 
   function failureContext(message: string): Error {
-    return new Error(`${message}\n--- captured terminal output ---\n${visibleOutput().slice(-8_000)}`);
+    return new Error(`${message}\n--- current terminal screen ---\n${visibleOutput()}\nRAW tail: ${JSON.stringify(raw.slice(-2000))}`);
   }
 
   async function waitForVisible(expected: string, start = 0): Promise<void> {
     const deadline = Date.now() + WAIT_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      if (visibleOutput().slice(start).includes(expected)) return;
+      if (revision >= start && visibleOutput().includes(expected)) return;
       if (exited) throw failureContext(`dashboard exited before rendering ${JSON.stringify(expected)}`);
       await new Promise((resolveWait) => setTimeout(resolveWait, 20));
     }
@@ -431,11 +1196,8 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
 
   async function writeAndWait(bytes: string, expected: string): Promise<void> {
     assert.ok(terminal, "terminal must be running");
-    const start = visibleOutput().length;
+    const start = revision + 1;
     terminal.write(bytes);
-    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     await waitForVisible(expected, start);
   }
 
@@ -459,7 +1221,8 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     await mkdir(eventDirectory, { recursive: true });
     await writeFile(eventPath, fixtureLines(), "utf8");
 
-    terminal = spawn(bunPath, ["--conditions=browser", entryPath, "--state-dir", stateRoot], {
+    terminal = spawn(bunPath, ["--conditions=browser", entryPath, "--state-dir", stateRoot,
+      "--view-state-dir", join(stateRoot, "display")], {
       name: "xterm-256color",
       cols: 130,
       rows: 36,
@@ -467,15 +1230,21 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
       env: environment(),
     });
     dataSubscription = terminal.onData((data) => {
-      capture = (capture + data).slice(-MAX_CAPTURE_CHARS);
+      raw = (raw + data).slice(-MAX_CAPTURE_CHARS);
+      screen.write(data);
+      revision++;
     });
     exitSubscription = terminal.onExit((eventExit) => {
       exited = eventExit;
       resolveExit?.(eventExit);
     });
 
+    await waitForVisible(SIMPLE_MAIN_HINT);
+    await writeAndWait("a", "FOCUS RAIL");
     await waitForVisible("DEVPILOT OPERATIONS");
     await waitForVisible("OBSERVE ONLY");
+    await waitForVisible("LIVE ONLY");
+    await writeAndWait("l", "View filter changed to Current session");
     await waitForVisible("ConPTY live flow");
 
     await writeAndWait("?", "HELP - OBSERVE MODE");
@@ -483,14 +1252,8 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     await writeAndWait("\x1b", "Help closed");
 
     await writeAndWait("f", "View filter changed to History");
-    terminal.write("F");
-    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
-    terminal.write("f");
-    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
+    await writeAndWait("F", "View filter changed to Current session");
+    await writeAndWait("f", "View filter changed to History");
     await writeAndWait("\t", "HISTORY | REVIEWER");
     await writeAndWait("\t", "HISTORY | REVIEW-HANDLER");
     await writeAndWait("\t", "HISTORY | ALL");
@@ -501,11 +1264,8 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     await writeAndWait("i", "Inspector closed");
     await writeAndWait("i", "Inspector opened and focused");
     await writeAndWait("e", "RAW EVENTS - ALL");
-    const scrollStart = visibleOutput().length;
+    const scrollStart = revision + 1;
     terminal.write("\x1b[A".repeat(12));
-    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     await waitForVisible("scroll marker 01", scrollStart);
     await writeAndWait("\x1b[C", "RAW EVENTS - WARNINGS");
     await writeAndWait("\x1b", "Events overlay closed");
@@ -521,26 +1281,22 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
     terminal.write("104\r");
     await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     terminal.write("x");
     await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     terminal.write("X");
     await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
 
     assert.ok(terminal);
-    let resizeStart = visibleOutput().length;
+    let resizeStart = revision + 1;
     terminalColumns = 70;
     terminalRows = 24;
+    screen.resize(terminalColumns, terminalRows);
     terminal.resize(terminalColumns, terminalRows);
     await waitForVisible("HISTORY | REVIEWER | FOCUS RAIL", resizeStart);
-    resizeStart = visibleOutput().length;
+    resizeStart = revision + 1;
     terminalColumns = 130;
     terminalRows = 36;
+    screen.resize(terminalColumns, terminalRows);
     terminal.resize(terminalColumns, terminalRows);
     await waitForVisible("HISTORY | REVIEWER | WIDE | FOCUS RAIL", resizeStart);
 
@@ -563,7 +1319,7 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
         disposeConptyOutputWorker(terminal);
       }
       assert.doesNotMatch(
-        visibleOutput(),
+        stripVTControlCharacters(raw),
         /AttachConsole failed|conpty_console_list_agent/i,
         failureContext("node-pty helper failure was written to the terminal").message,
       );
@@ -595,9 +1351,9 @@ test("built dashboard exercises the PR3 settings editor through real ConPTY and 
   let terminal: IPty | undefined;
   let dataSubscription: IDisposable | undefined;
   let exitSubscription: IDisposable | undefined;
-  let terminalColumns = 130;
-  let terminalRows = 36;
-  let capture = "";
+  let revision = 0;
+  let raw = "";
+  const screen = new TerminalScreen();
   let exited: { exitCode: number; signal?: number } | undefined;
   let resolveExit: ((exit: { exitCode: number; signal?: number }) => void) | undefined;
   const exitPromise = new Promise<{ exitCode: number; signal?: number }>((resolvePromise) => {
@@ -605,25 +1361,18 @@ test("built dashboard exercises the PR3 settings editor through real ConPTY and 
   });
 
   function visibleOutput(): string {
-    return stripVTControlCharacters(capture);
+    return screen.text();
   }
 
   function failureContext(message: string): Error {
-    return new Error(`${message}\n--- captured terminal output ---\n${visibleOutput().slice(-8_000)}`);
+    return new Error(`${message}\n--- current terminal screen ---\n${visibleOutput()}\nRAW tail: ${JSON.stringify(raw.slice(-2000))}`);
   }
 
   async function waitForVisible(expected: string, start = 0): Promise<void> {
     const deadline = Date.now() + 8_000;
-    let repaintAt = Date.now() + 400;
     while (Date.now() < deadline) {
-      if (visibleOutput().slice(start).includes(expected)) return;
+      if (revision >= start && visibleOutput().includes(expected)) return;
       if (exited) throw failureContext(`dashboard exited before rendering ${JSON.stringify(expected)}`);
-      if (Date.now() >= repaintAt) {
-        terminal!.resize(terminalColumns + 1, terminalRows);
-        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-        terminal!.resize(terminalColumns, terminalRows);
-        repaintAt = Date.now() + 600;
-      }
       await new Promise((resolveWait) => setTimeout(resolveWait, 20));
     }
     throw failureContext(`timed out waiting for ${JSON.stringify(expected)}`);
@@ -631,11 +1380,8 @@ test("built dashboard exercises the PR3 settings editor through real ConPTY and 
 
   async function writeAndWait(bytes: string, expected: string): Promise<void> {
     assert.ok(terminal, "terminal must be running");
-    const start = visibleOutput().length;
+    const start = revision + 1;
     terminal.write(bytes);
-    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     await waitForVisible(expected, start);
   }
 
@@ -789,6 +1535,11 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
   $request = $line | ConvertFrom-Json
   Append-Log $request
   switch ($request.operation) {
+    'get-automation-status' {
+      Write-Output (@{schemaVersion=1;requestId=$request.requestId;operation='automation-status'
+        automationVersion=1;available=$false;scope=$null;agents=@()
+      } | ConvertTo-Json -Compress)
+    }
     'profile' { Write-Output (Profile-Response $request) }
     'preview-narrowing' { Write-Output (Preview-Response $request) }
     'set-kill-switch' { Write-Output (Set-KillSwitch-Response $request) }
@@ -826,38 +1577,32 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
       env: environment(),
     });
     dataSubscription = terminal.onData((data) => {
-      capture = (capture + data).slice(-1_000_000);
+      raw = (raw + data).slice(-MAX_CAPTURE_CHARS);
+      screen.write(data);
+      revision++;
     });
     exitSubscription = terminal.onExit((eventExit) => {
       exited = eventExit;
       resolveExit?.(eventExit);
     });
 
+    await waitForVisible(SIMPLE_MAIN_HINT);
+    await writeAndWait("a", "FOCUS RAIL");
     await waitForVisible("DEVPILOT OPERATIONS");
     await waitForVisible("OPERATIONAL");
     await waitForVisible("TRUSTED MANUAL ENABLED");
-    await writeAndWait("f", "View filter changed to History");
+    await writeAndWait("F", "View filter changed to History");
     await waitForVisible("operations-dashboard PR #104");
     terminal.write("F");
     await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     terminal.write("f");
     await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     terminal.write("104\r");
     await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     terminal.write("x");
     await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     terminal.write("X");
     await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     await writeAndWait("s", "SETTINGS - EFFECTIVE CAPABILITY PROFILE");
     await writeAndWait("e", "SETTINGS - EDIT PERSISTED NARROWING");
     await writeAndWait("\x1b[C", "Scope: machine  [user]  repo-worktree  pr");
@@ -897,10 +1642,7 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
     assert.equal(result.exitCode, 0, failureContext("dashboard did not exit cleanly").message);
     assert.equal(result.signal ?? 0, 0, failureContext("dashboard exited due to a signal").message);
 
-    const requests = readFile(requestLogPath, "utf8")
-      .then((content) =>
-        content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>));
-    const parsedRequests = await requests;
+    const parsedRequests = await readInteractionRequests(requestLogPath);
     assert.deepEqual(parsedRequests.map((request) => request.operation), [
       "profile", "preview-narrowing", "set-kill-switch", "profile", "set-kill-switch", "profile", "shutdown",
     ]);
@@ -924,7 +1666,7 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
         disposeConptyOutputWorker(terminal);
       }
       assert.doesNotMatch(
-        visibleOutput(),
+        stripVTControlCharacters(raw),
         /AttachConsole failed|conpty_console_list_agent/i,
         failureContext("node-pty helper failure was written to the terminal").message,
       );
@@ -957,9 +1699,9 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
   let terminal: IPty | undefined;
   let dataSubscription: IDisposable | undefined;
   let exitSubscription: IDisposable | undefined;
-  let terminalColumns = 130;
-  let terminalRows = 36;
-  let capture = "";
+  let revision = 0;
+  let raw = "";
+  const screen = new TerminalScreen();
   let exited: { exitCode: number; signal?: number } | undefined;
   let resolveExit: ((exit: { exitCode: number; signal?: number }) => void) | undefined;
   const exitPromise = new Promise<{ exitCode: number; signal?: number }>((resolvePromise) => {
@@ -967,25 +1709,18 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
   });
 
   function visibleOutput(): string {
-    return stripVTControlCharacters(capture);
+    return screen.text();
   }
 
   function failureContext(message: string): Error {
-    return new Error(`${message}\n--- captured terminal output ---\n${visibleOutput().slice(-8_000)}`);
+    return new Error(`${message}\n--- current terminal screen ---\n${visibleOutput()}\nRAW tail: ${JSON.stringify(raw.slice(-2000))}`);
   }
 
   async function waitForVisible(expected: string, start = 0): Promise<void> {
     const deadline = Date.now() + 8_000;
-    let repaintAt = Date.now() + 400;
     while (Date.now() < deadline) {
-      if (visibleOutput().slice(start).includes(expected)) return;
+      if (revision >= start && visibleOutput().includes(expected)) return;
       if (exited) throw failureContext(`dashboard exited before rendering ${JSON.stringify(expected)}`);
-      if (Date.now() >= repaintAt) {
-        terminal!.resize(terminalColumns + 1, terminalRows);
-        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-        terminal!.resize(terminalColumns, terminalRows);
-        repaintAt = Date.now() + 600;
-      }
       await new Promise((resolveWait) => setTimeout(resolveWait, 20));
     }
     throw failureContext(`timed out waiting for ${JSON.stringify(expected)}`);
@@ -993,11 +1728,8 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
 
   async function writeAndWait(bytes: string, expected: string): Promise<void> {
     assert.ok(terminal, "terminal must be running");
-    const start = visibleOutput().length;
+    const start = revision + 1;
     terminal.write(bytes);
-    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     await waitForVisible(expected, start);
   }
 
@@ -1044,13 +1776,17 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
       env: environment(),
     });
     dataSubscription = terminal.onData((data) => {
-      capture = (capture + data).slice(-1_000_000);
+      raw = (raw + data).slice(-MAX_CAPTURE_CHARS);
+      screen.write(data);
+      revision++;
     });
     exitSubscription = terminal.onExit((eventExit) => {
       exited = eventExit;
       resolveExit?.(eventExit);
     });
 
+    await waitForVisible(SIMPLE_MAIN_HINT);
+    await writeAndWait("a", "FOCUS RAIL");
     await waitForVisible("DEVPILOT OPERATIONS");
     await waitForVisible("TRUSTED MANUAL ENABLED");
     await writeAndWait("m", "START AGENT BY PR ID");
@@ -1075,11 +1811,7 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
       "confirm-widening-preview",
       "confirm-widening-mint",
     ]);
-    const preDispatchRequests = (await readFile(requestLogPath, "utf8"))
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const preDispatchRequests = await readInteractionRequests(requestLogPath);
     assert.equal(preDispatchRequests[0]?.repositoryKey, undefined);
     assert.equal(preDispatchRequests[0]?.pullRequestId, 104);
     assert.equal(preDispatchRequests[1]?.repositoryKey, "v1:github:10400000000000001");
@@ -1120,7 +1852,7 @@ test("built dashboard exercises reviewer widening through real ConPTY and cancel
         disposeConptyOutputWorker(terminal);
       }
       assert.doesNotMatch(
-        visibleOutput(),
+        stripVTControlCharacters(raw),
         /AttachConsole failed|conpty_console_list_agent/i,
         failureContext("node-pty helper failure was written to the terminal").message,
       );
@@ -1153,9 +1885,9 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
   let terminal: IPty | undefined;
   let dataSubscription: IDisposable | undefined;
   let exitSubscription: IDisposable | undefined;
-  let terminalColumns = 130;
-  let terminalRows = 36;
-  let capture = "";
+  let revision = 0;
+  let raw = "";
+  const screen = new TerminalScreen();
   let exited: { exitCode: number; signal?: number } | undefined;
   let resolveExit: ((exit: { exitCode: number; signal?: number }) => void) | undefined;
   const exitPromise = new Promise<{ exitCode: number; signal?: number }>((resolvePromise) => {
@@ -1163,17 +1895,17 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
   });
 
   function visibleOutput(): string {
-    return stripVTControlCharacters(capture);
+    return screen.text();
   }
 
   function failureContext(message: string): Error {
-    return new Error(`${message}\n--- captured terminal output ---\n${visibleOutput().slice(-8_000)}`);
+    return new Error(`${message}\n--- current terminal screen ---\n${visibleOutput()}\nRAW tail: ${JSON.stringify(raw.slice(-2000))}`);
   }
 
   async function waitForVisible(expected: string, start = 0): Promise<void> {
     const deadline = Date.now() + 8_000;
     while (Date.now() < deadline) {
-      if (visibleOutput().slice(start).includes(expected)) return;
+      if (revision >= start && visibleOutput().includes(expected)) return;
       if (exited) throw failureContext(`dashboard exited before rendering ${JSON.stringify(expected)}`);
       await new Promise((resolveWait) => setTimeout(resolveWait, 20));
     }
@@ -1182,11 +1914,8 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
 
   async function writeAndWait(bytes: string, expected: string): Promise<void> {
     assert.ok(terminal, "terminal must be running");
-    const start = visibleOutput().length;
+    const start = revision + 1;
     terminal.write(bytes);
-    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    terminal.resize(terminalColumns, terminalRows - 1);
-    terminal.resize(terminalColumns, terminalRows);
     await waitForVisible(expected, start);
   }
 
@@ -1233,13 +1962,17 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
       env: environment(),
     });
     dataSubscription = terminal.onData((data) => {
-      capture = (capture + data).slice(-1_000_000);
+      raw = (raw + data).slice(-MAX_CAPTURE_CHARS);
+      screen.write(data);
+      revision++;
     });
     exitSubscription = terminal.onExit((eventExit) => {
       exited = eventExit;
       resolveExit?.(eventExit);
     });
 
+    await waitForVisible(SIMPLE_MAIN_HINT);
+    await writeAndWait("a", "FOCUS RAIL");
     await waitForVisible("DEVPILOT OPERATIONS");
     await waitForVisible("TRUSTED MANUAL ENABLED");
     await writeAndWait("m", "START AGENT BY PR ID");
@@ -1266,11 +1999,7 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
       "cancel-widening",
       "shutdown",
     ]);
-    const cancelRequests = (await readFile(requestLogPath, "utf8"))
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const cancelRequests = await readInteractionRequests(requestLogPath);
     assert.equal(cancelRequests[4]?.generation, 2);
   } finally {
     try {
@@ -1283,7 +2012,7 @@ test("built dashboard cancels reviewer widening with Esc and leaves no broker re
         disposeConptyOutputWorker(terminal);
       }
       assert.doesNotMatch(
-        visibleOutput(),
+        stripVTControlCharacters(raw),
         /AttachConsole failed|conpty_console_list_agent/i,
         failureContext("node-pty helper failure was written to the terminal").message,
       );
@@ -1306,40 +2035,32 @@ test("real ConPTY Enter flow shows starting, late progress, completion and cance
     const requestLogPath = join(root, "requests.jsonl");
     const eventLogPath = join(root, "late.jsonl");
     const descriptorPath = join(root, "descriptor.json");
+    const dispatchId = randomUUID();
     let terminal: IPty | undefined;
-    let output = "";
+    let revision = 0;
+    let raw = "";
+    const screen = new TerminalScreen();
+    screen.resize(width, 36);
     let exited: PtyExit | undefined;
     let dataSubscription: IDisposable | undefined;
     let exitSubscription: IDisposable | undefined;
-    const visible = () => stripVTControlCharacters(output);
+    const visible = () => screen.text();
     async function waitFor(expected: string, start = 0): Promise<void> {
       const until = Date.now() + 8_000;
-      let repaintAt = Date.now() + 400;
-      while (!visible().slice(start).includes(expected)) {
-        if (exited || Date.now() > until) throw new Error(`Expected ${expected} at ${width} columns\n${visible().slice(-5_000)}`);
-        // ConPTY emits changed cells, not full text (CANCELLING -> CANCELLED can be only "ED").
-        // A real width change requests a complete current frame for text assertions.
-        if (Date.now() >= repaintAt) {
-          terminal!.resize(width + 1, 36);
-          await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-          terminal!.resize(width, 36);
-          repaintAt = Date.now() + 600;
-        }
+      while (revision < start || !visible().includes(expected)) {
+        if (exited || Date.now() > until) throw new Error(`Expected ${expected} at ${width} columns\n${visible()}\nRAW tail: ${JSON.stringify(raw.slice(-2000))}`);
         await new Promise((resolveWait) => setTimeout(resolveWait, 25));
       }
     }
     async function send(bytes: string, expected: string): Promise<void> {
-      const start = visible().length;
+      const start = revision + 1;
       terminal!.write(bytes);
-      await new Promise((resolveWait) => setTimeout(resolveWait, 90));
-      terminal!.resize(width, 35);
-      terminal!.resize(width, 36);
       await waitFor(expected, start);
     }
     try {
       await writeFile(descriptorPath, JSON.stringify({
         requestLogPath, dispatchEventLogPath: eventLogPath, simpleFlow: true, role,
-        previewOnly, complete: role === "review-handler",
+        dispatchId, previewOnly, complete: role === "review-handler",
       }));
       terminal = spawn(resolve("node_modules", "bun", "bin", "bun.exe"), [
         "--conditions=browser", resolve("dist", "src", "index.js"),
@@ -1347,8 +2068,14 @@ test("real ConPTY Enter flow shows starting, late progress, completion and cance
         "--broker-executable", resolvePowerShellPath(), "--broker-script", reviewerWideningBrokerScript(),
         "--broker-descriptor", descriptorPath,
       ], { name: "xterm-256color", cols: width, rows: 36, cwd: resolve("."), env: environment() });
-      dataSubscription = terminal.onData((data) => { output = (output + data).slice(-MAX_CAPTURE_CHARS); });
+      dataSubscription = terminal.onData((data) => {
+        raw = (raw + data).slice(-MAX_CAPTURE_CHARS);
+        screen.write(data);
+        revision++;
+      });
       exitSubscription = terminal.onExit((exit) => { exited = exit; });
+      await waitFor(SIMPLE_MAIN_HINT);
+      await send("a", "INSTANCES");
       await waitFor("DEVPILOT OPERATIONS");
       await send("m", "PR ID: (blank)");
       if (role === "review-handler") await send("\t", "Agent: Review Handler");
@@ -1363,7 +2090,10 @@ test("real ConPTY Enter flow shows starting, late progress, completion and cance
       }
       if (previewOnly) await waitFor("No PR comments or code pushes");
       else await waitFor(role === "reviewer" ? "finding comments" : "code pushes");
-      await send("\x1b[13;1:2u", "Enter: START");
+      // Ignored key repeats need not emit a frame; verify the unchanged screen and request log.
+      terminal.write("\x1b[13;1:2u");
+      await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+      await waitFor("Enter: START");
       assert.deepEqual(await readRequestOperations(requestLogPath), ["profile-current", "describe"]);
       await send("\r\r", "STARTING...");
       await waitFor("STARTED / RUNNING");
@@ -1372,7 +2102,6 @@ test("real ConPTY Enter flow shows starting, late progress, completion and cance
       terminal.write("\r\r");
       assert.equal((await readRequestOperations(requestLogPath)).filter((operation) => operation === "dispatch").length, 1);
       assert.doesNotMatch(visible(), /SOURCE WARNING/);
-      const dispatchId = "22222222-2222-4222-8222-222222222222";
       const manualEvent = (sequence: number, type: string, data: Record<string, unknown>, manual = true): string => {
         const value = JSON.parse(event(role, manual ? "manual-enter" : "automatic-same-pr", sequence, type, data));
         return JSON.stringify({

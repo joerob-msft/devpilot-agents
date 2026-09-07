@@ -166,7 +166,18 @@ exit 0
     function Get-AgentArgv {
         param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Role)
         $path = Join-Path $Context.ArgvDir "$Role.argv.json"
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $allRecords = Get-DashboardRecord $Context
+            $last = @($allRecords | Where-Object { -not $_.validateOnly -and $_.descriptor } | Select-Object -Last 1)
+            if ($last.Count -eq 1) {
+                $d = $last[0].descriptor | ConvertFrom-Json -AsHashtable
+                if ($d.ContainsKey('launcherControl')) {
+                    return , @($d.launcherControl.automaticWorkers | Where-Object { $_.role -ceq $Role } |
+                        ForEach-Object { $_.arguments })
+                }
+            }
+            return $null
+        }
         return , @(Get-Content -LiteralPath $path -Raw | ConvertFrom-Json)
     }
 
@@ -290,7 +301,7 @@ Describe 'preview-only capability projection (issue #114)' {
         $narrowingEffectBody = [regex]::Match($source, '(?s)function Get-BrokerNarrowingEffect \{.*?\n\}').Value
         $narrowingEffectBody | Should -Match '-AbsoluteDenies \$AbsoluteDenies'
 
-        $dispatchBody = [regex]::Match($source, '(?s)function Invoke-Dispatch \{.*?\n\}').Value
+        $dispatchBody = [regex]::Match($source, '(?s)function Invoke-DispatchCore \{.*?\n\}').Value
         $dispatchBody | Should -Match '\$dispatchAbsoluteDenies -ccontains \$_'
         $dispatchBody | Should -Match 'absolutely denies'
 
@@ -301,7 +312,7 @@ Describe 'preview-only capability projection (issue #114)' {
 }
 
 Describe 'golden launch policy (issue #114)' {
-    It 'launches both agents operationally, continuously, with manual writes and no vote or Teams' {
+    It 'delegates both automatic launch specifications with original capabilities and cycling policy' {
         $context = New-GoldenContext
         $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden') + (Get-BaseLaunchArgument -Context $context))
         $result.ExitCode | Should -Be 0 -Because $result.StdErr
@@ -324,6 +335,7 @@ Describe 'golden launch policy (issue #114)' {
             $argv | Should -Not -Contain '-EnableTeamsNotifications'
             $argv | Should -Not -Contain '-Once'
             $argv | Should -Contain '-IntervalSeconds'
+            $argv[[array]::IndexOf($argv, '-IntervalSeconds') + 1] | Should -BeExactly '900'
         }
 
         $records = Get-DashboardRecord -Context $context
@@ -347,13 +359,13 @@ Describe 'golden launch policy (issue #114)' {
         $descriptor.roles.'review-handler'.absoluteDenies | Should -BeExactly @()
         $descriptor.ContainsKey('localObservation') | Should -BeFalse
         $launchedDescriptor = $records[2].descriptor | ConvertFrom-Json -AsHashtable
-        $launchedDescriptor.localObservation.ownerStartIdentity | Should -Match '^(utc|linux):\d+$'
-        @($launchedDescriptor.localObservation.streams).Count | Should -Be 2
-        foreach ($stream in $launchedDescriptor.localObservation.streams) {
-            $stream.processId | Should -BeGreaterThan 0
-            $stream.eventLogPath | Should -BeExactly (Join-Path $launchedDescriptor.stateRoot "$($stream.role).stdout.jsonl")
-            $result.StdOut | Should -Match "Watching $($stream.role) PID $($stream.processId)\."
+        $launchedDescriptor.ContainsKey('localObservation') | Should -BeFalse
+        $launchedDescriptor.launcherControl.ownerStartIdentity | Should -Match '^(utc|linux):\d+$'
+        @($launchedDescriptor.launcherControl.automaticWorkers).Count | Should -Be 2
+        foreach ($worker in $launchedDescriptor.launcherControl.automaticWorkers) {
+            $worker.continuous | Should -BeTrue
         }
+        $result.StdOut | Should -Not -Match 'Watching .+ PID'
 
         $result.StdOut | Should -Match 'Mode\s+: OPERATIONAL'
         $result.StdOut | Should -Match 'Operator\s+: golden-test'
@@ -366,14 +378,14 @@ Describe 'golden launch policy (issue #114)' {
         $dashboardSource = Join-Path $script:repoRoot 'src\DevPilot.Dashboard'
         $bunName = if ($IsWindows) { 'bun.exe' } else { 'bun' }
         $bunSource = Join-Path $dashboardSource "node_modules\bun\bin\$bunName"
-        $probeSource = Join-Path $dashboardSource 'dist\test\fixtures\live-capture-dashboard.js'
+        $probeSource = Join-Path $dashboardSource 'test\fixtures\live-capture-dashboard.ts'
         if (-not (Test-Path $bunSource) -or -not (Test-Path $probeSource)) {
             Set-ItResult -Skipped -Because 'Build the installed dashboard before running its Golden integration.'
             return
         }
         $context = New-GoldenContext -Prefix 'live golden spaced path '
         if ($BufferedBaseline) {
-            $watchCopy = Join-Path $context.Root 'tools\Watch-DevPilotAgents.ps1'
+            $watchCopy = Join-Path $context.Root 'tools\Invoke-DevPilotAgentDispatch.ps1'
             $source = [IO.File]::ReadAllText($watchCopy)
             [IO.File]::WriteAllText($watchCopy, $source.Replace(' -LiveStandardOutput', ''), [Text.UTF8Encoding]::new($false))
         }
@@ -381,11 +393,11 @@ Describe 'golden launch policy (issue #114)' {
         New-Item -ItemType Directory -Path "$dashboard\node_modules\bun\bin", "$dashboard\dist\src", "$dashboard\dist\test\fixtures" -Force | Out-Null
         Copy-Item $bunSource "$dashboard\node_modules\bun\bin\$bunName"
         Copy-Item "$dashboardSource\dist\src\*.js" "$dashboard\dist\src"
-        Copy-Item $probeSource "$dashboard\dist\test\fixtures\live-capture-dashboard.js"
+        Copy-Item $probeSource "$dashboard\dist\test\fixtures\live-capture-dashboard.ts"
         # The genuine fixed dashboard command line remains intact. Only the rendering
         # entry delegates to the assertion probe; the broker/ancestry checks are not mocked.
         [IO.File]::WriteAllText("$dashboard\dist\src\index.js",
-            'import "../test/fixtures/live-capture-dashboard.js";', [Text.UTF8Encoding]::new($false))
+            'import "../test/fixtures/live-capture-dashboard.ts";', [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $context.Root 'tools\Start-DevPilotDashboard.ps1'), @'
 param([string[]]$StateDir, [string[]]$EventLogPath, [string]$BrokerDescriptorPath, [string]$LaunchMode, [switch]$ValidateOnly)
 if ($ValidateOnly) { return }
@@ -399,6 +411,12 @@ if ($LASTEXITCODE -ne 0) { throw "Live capture dashboard probe failed: $LASTEXIT
         $liveChild = @'
 $role = if ($PSCommandPath -match 'ReviewHandler') { 'review-handler' } else { 'reviewer' }
 [IO.File]::WriteAllText((Join-Path $env:DEVPILOT_TEST_ARGV_DIR "$role.argv.json"), (ConvertTo-Json @($args)))
+$manifestIndex = [array]::IndexOf($args, '-LauncherWorkerManifest')
+if ($manifestIndex -ge 0) {
+    Import-Module (Join-Path $PSScriptRoot '..\..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
+    Initialize-AgentLauncherWorker -ManifestPath $args[$manifestIndex + 1]
+    Confirm-AgentLauncherWorkerStartup
+}
 $event = @{ schemaVersion = 2; agent = $role; instanceId = "real-$role"; processId = $PID; sequence = 1;
     timestamp = [DateTime]::UtcNow.ToString('o'); eventType = 'agent.started'; data = @{ repository = 'test' } }
 [Console]::Out.WriteLine(($event | ConvertTo-Json -Compress))
@@ -422,12 +440,11 @@ exit 0
         foreach ($path in @('src\Agents\reviewer\Start-ReviewerAgent.ps1', 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1')) {
             [IO.File]::WriteAllText((Join-Path $context.Root $path), $liveChild, [Text.UTF8Encoding]::new($false))
         }
-        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden') + (Get-BaseLaunchArgument -Context $context))
+        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden', '-Once') + (Get-BaseLaunchArgument -Context $context))
         if ($BufferedBaseline) {
             # The same end-to-end assertion must fail with the old buffered helper branch.
             $result.ExitCode | Should -Be 1
-            $result.StdErr | Should -Match 'ENOENT'
-            $result.StdErr | Should -Match 'reviewer.stdout.jsonl'
+            $result.StdErr | Should -Match 'stdout never reached the production tailer while alive'
             return
         }
         $result.ExitCode | Should -Be 0 -Because $result.StdErr
@@ -462,6 +479,7 @@ exit 0
             $argv | Should -Not -Contain '-EnableTeamsNotifications'
             # PreviewOnly overrides golden's writes, never golden's continuity.
             $argv | Should -Contain '-IntervalSeconds'
+            $argv[[array]::IndexOf($argv, '-IntervalSeconds') + 1] | Should -BeExactly '900'
             $argv | Should -Not -Contain '-Once'
         }
 

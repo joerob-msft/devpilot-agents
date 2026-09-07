@@ -298,6 +298,23 @@ non-delegable ceiling that disables automatic and manual PR mutations,
 notification delivery, Settings widening, and delegated grants. Use `-DryRun`
 only for an agent's offline self-check; it is not the live PreviewOnly mode.
 
+Every launch starts in **Simple** mode: a boxed left agent sidebar with selected
+activity beside it on wider terminals, or a compact list on narrow terminals.
+Use `Enter` for details and **`m` Start agent, `h` History, `a` Advanced, `q` Quit**.
+Advanced keeps the full panes, filters, diagnostics, settings, and stale-instance
+controls; press `a` again to return to Simple. Changing the view never changes
+the launch's authority.
+
+Golden still starts **both agents automatically**, without a manual command,
+and waits **900 seconds (15 minutes)** between successful scans by default.
+Failures use the existing retry backoff. The compact automatic-polling status
+shows the configured cadence and whether agents are scanning, waiting, or
+paused for manual work. Press **`r` Scan now** in a main view to wake this
+launcher's idle pollers early. It does not interrupt running work, queue an
+extra scan behind a busy agent, or bypass manual-work priority. It also does
+not restart stopped agents or grant control to an observe-only dashboard.
+The configured interval and Operational/PreviewOnly permissions stay unchanged.
+
 The golden TUI shows **OPERATIONAL** or **PREVIEW** in its header. Press `m`
 from Current, Live, or History to **Start Agent by PR ID**, or select that
 command in `Ctrl+P`. Enter a PR ID and use `Tab` to choose Reviewer (default)
@@ -311,6 +328,20 @@ The current launch and up to 20 recent,
 independently trusted watch runs contribute to History. Every manual launch
 revalidates the PR's current state, author/ownership eligibility, and work
 lease before starting.
+Manual Reviewer launches allow your own PRs; automatic scans still exclude them
+by default. This does not grant approval-vote permission or bypass work leases.
+
+If the same launcher already has conflicting work, the manual panel offers
+**Replace and run now**, **Run next**, or **Back** in both view modes. Replace
+is selected initially but does nothing until you explicitly confirm it.
+It stops only that launcher's conflicting work and waits for confirmed process
+tree exit and lock release. Run next lets the current PR finish before the
+manual turn. Automatic scanning then resumes with its original settings.
+Already-posted comments and pushes are not undone. Queues belong to this Watch
+session; `c` cancels a pending request and quitting cancels the queue.
+Changed PR data or permissions require a fresh preview and confirmation.
+Work from another launcher, or work whose ownership cannot be established,
+cannot be replaced through this prompt.
 
 Advanced and compatibility modes remain available:
 
@@ -397,10 +428,12 @@ more state roots:
 
 The standalone observer searches below each root for both agents' per-instance
 streams, including state layouts with agent-name subdirectories. It can also
-read explicit captures with `-EventLogPath`. The default **Current session**
-view shows every live instance plus the newest retained outcome per
-agent/session group. **Live** keeps active running, waiting, failed, blocked,
-and stale processes visible. Current trusted Watch children and accepted manual
+read explicit captures with `-EventLogPath`. The default **Live** list shows
+instances with a heartbeat in the last 20 seconds, including waiting, failed,
+and blocked agents that are still heartbeating. Stale rows stay off this list.
+In Advanced, `l` toggles **Live** and the broader **Current session** view,
+which also includes retained outcomes and unconfirmed stale instances.
+Current trusted Watch children and accepted manual
 children have explicit local-process provenance. When their overdue PID is
 confirmed absent by a signal-free existence check, they leave Current and Live
 automatically. Arbitrary, copied, remote/container, attached, and older streams
@@ -412,8 +445,12 @@ helper, with 10 MiB active plus one 10 MiB rotation. Final draining never rewrit
 a live capture. Capture failures are visible and do not interrupt child cleanup.
 **History** retains PR outcomes plus exited-instance diagnostics, including
 legacy streams and runs without a completion event; those say **outcome unknown**,
-not success. Logs and agent state are never removed. `x` hides a selected PR history row and `Shift+x` restores hidden rows only in
-the current dashboard process; neither changes agent state or event logs.
+not success. In Advanced, `Delete` persistently dismisses a selected inactive
+instance across dashboard launches; `Shift+Delete` restores dismissed instances.
+A new heartbeat makes an instance visible again. Dismissal never stops a
+process or deletes logs, locks, or agent state. The separate `x` command hides
+a selected PR History row and `Shift+x` restores those rows only in the current
+dashboard process.
 From any main view, `m` opens the same blank **Start Agent by PR ID** form
 when the trusted launcher enabled it. The full ID must contain only ASCII
 digits and be in `1..2147483647`; invalid or oversized input never becomes a
@@ -437,16 +474,20 @@ blocked, cancelled, and unknown monitoring status. Exit code zero without a work
 outcome is reported as a child exit, not a successful review. `c` cancels the run.
 Capability widening still requires its separate `c` / `y` challenge confirmations;
 neither Enter nor instruction text can mint a grant.
-`c` cancels only the broker-owned manual child. `q` awaits broker
-shutdown and never targets continuous watcher PIDs.
+`c` cancels the pending manual request or the accepted manual child, not an
+unrelated observed agent. `q` awaits broker shutdown; Golden stops its own
+automatic and manual process trees, never another launcher's workers.
 
 Describe and dispatch failures remain distinct in the UI, including
 `source-changed`, `policy-changed`, `pr-state-changed`, `delivery-pending`,
 `already-running` with lease/state contention detail, broker launch failure,
 child failure, and cooperative versus forced cancellation.
 
-The layout adapts from three panes on a wide terminal to a single
-overview/detail route below 80 columns:
+Simple shows its boxed sidebar at 100 columns and wider when at least four
+content rows are available; otherwise it uses a single-pane list and detail
+drill-down. **Advanced** adapts from three
+panes on a wide terminal to a single overview/detail route below 80 columns
+and exposes these additional controls alongside the common commands:
 
 | Key | Action |
 |---|---|
@@ -455,6 +496,8 @@ overview/detail route below 80 columns:
 | `Enter` / `Esc` | Drill into or back out of detail and timeline views |
 | `Tab` / `Shift+Tab` | Cycle all, reviewer, and review-handler roles |
 | `f` / `Shift+f` | Cycle Live, Current session, and History |
+| `l` | Toggle Live-only and Current session |
+| `Delete` / `Shift+Delete` | Dismiss an inactive instance across launches / restore dismissed instances |
 | `m` | Start Agent by PR ID, without selecting a History row |
 | `Tab`, then `Enter` in PR entry | Choose agent, then resolve the configured repository/PR and load preview |
 | `p` in preview | Edit optional instructions; Enter returns to preview without starting |

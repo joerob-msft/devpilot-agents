@@ -62,7 +62,7 @@ test("trusted stream provenance is exact to PID, role, and accepted manual dispa
     reducer.registerLocalStream({ eventLogPath: SOURCE, processId: 42, role: "reviewer", dispatch });
     reducer.apply({ ...manual, ...overrides }, SOURCE);
     assert.equal(await reducer.observeProcesses(async () => "absent", NOW), false);
-    assert.equal(reducer.list(NOW, undefined, "live").length, 1);
+    assert.equal(reducer.list(NOW, undefined, "current").length, 1);
   }
   const reducer = new OperationsReducer();
   reducer.registerLocalStream({ eventLogPath: SOURCE, processId: 42, role: "reviewer", dispatch });
@@ -118,18 +118,19 @@ test("an instance's changed PID loses local provenance unless the producer vouch
   assert.equal(await reducer.observeProcesses(async () => "absent", NOW + 5_001), true);
 });
 
-test("staleness alone, present/reused PIDs and unknown/denied observations never hide a run", async () => {
+test("staleness, present/reused PIDs and unknown/denied observations never retire a run from Current", async () => {
   for (const presence of ["present", "unknown", "denied"] as const) {
     const reducer = new OperationsReducer();
     applyLocal(reducer, event("old"));
     applyLocal(reducer, event("different-instance-same-pid"));
-    assert.equal(reducer.list(NOW, undefined, "live").length, 2);
+    assert.equal(reducer.list(NOW, undefined, "current").length, 2);
     assert.equal(await reducer.observeProcesses(async () => {
       if (presence === "denied") throw Object.assign(new Error("access denied"), { code: "EPERM" });
       return presence;
     }, NOW), false);
     assert.equal(reducer.list(NOW, undefined, "current").length, 2);
-    assert.ok(reducer.list(NOW, undefined, "live").every((state) => state.status === "stale"));
+    assert.ok(reducer.list(NOW, undefined, "current").every((state) => state.status === "stale"));
+    assert.equal(reducer.list(NOW, undefined, "live").length, 0);
     assert.equal(reducer.list(NOW, undefined, "history").length, 0);
   }
 });
@@ -202,7 +203,8 @@ test("same PID across instances cannot transfer a current heartbeat or an old ab
   await pending;
   assert.equal(reducer.get("reviewer:old", NOW)?.status, "stale");
   assert.equal(reducer.get("reviewer:current", NOW)?.exitObservedMs, null);
-  assert.deepEqual(new Set(reducer.list(NOW, undefined, "live").map((state) => state.instanceId)), new Set(["old", "current"]));
+  assert.deepEqual(reducer.list(NOW, undefined, "live").map((state) => state.instanceId), ["current"]);
+  assert.equal(reducer.list(NOW, undefined, "current").length, 2);
 });
 
 test("recent events postpone probing even if a heartbeat is overdue; polls are bounded", async () => {

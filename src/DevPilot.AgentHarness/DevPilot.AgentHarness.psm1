@@ -59,6 +59,8 @@ $script:AgentHarnessSupportedModels = @(
 )
 $script:AgentHarnessDefaultModelSentinel = "copilot-cli-default"
 $script:AgentManualAuthorities = @{}
+$script:AgentLauncherWorker = $null
+$script:AgentEarlyBrokerSecret = $null
 
 function Get-AgentSupportedModels {
     return , @($script:AgentHarnessSupportedModels)
@@ -632,7 +634,15 @@ function Enter-AgentLock {
 
 function Exit-AgentLock {
     param([System.IO.FileStream]$Stream)
-    if ($Stream) { $Stream.Dispose() }
+    if ($Stream) {
+        $Stream.Dispose()
+        if ($script:AgentLauncherWorker -and
+            [object]::ReferenceEquals($Stream, $script:AgentLauncherWorker.Lease)) {
+            $script:AgentLauncherWorker.Lease = $null
+            $script:AgentLauncherWorker.State = $null
+            Invoke-AgentLauncherCheckpoint -Phase released
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1023,10 @@ function Enter-AgentWorkLease {
     )
     $executionKey = Get-AgentExecutionKey -RepositoryIdentity $RepositoryIdentity -PullRequestId $PullRequestId -Role $Role
     $keyHash = Get-AgentSha256 -Text $executionKey
+    if ($script:AgentLauncherWorker) {
+        Invoke-AgentLauncherCheckpoint -Phase admission -RepositoryKey (Get-AgentRepositoryIdentityKey $RepositoryIdentity) `
+            -PullRequestId $PullRequestId -Role $Role
+    }
     if ($script:AgentManualAuthorities.ContainsKey($executionKey)) {
         return @{
             Acquired = $true; Reason = ''; Stream = $null
@@ -1024,6 +1038,10 @@ function Enter-AgentWorkLease {
         -ContentionReason lease-contended -TimeoutMilliseconds $TimeoutMilliseconds `
         -CancellationToken $CancellationToken -Metadata @{ keyHash = $keyHash; role = $Role }
     $result['KeyHash'] = $keyHash
+    if ($script:AgentLauncherWorker) {
+        if ($result.Acquired) { $script:AgentLauncherWorker.Lease = $result.Stream }
+        else { Invoke-AgentLauncherCheckpoint -Phase released }
+    }
     return $result
 }
 
@@ -1066,15 +1084,148 @@ function Enter-AgentDurableStateLock {
     if (-not (Test-Path -LiteralPath $Context.RoleRoot)) {
         throw "Durable role root '$($Context.RoleRoot)' does not exist."
     }
+    if ($script:AgentLauncherWorker -and $script:AgentLauncherWorker.Lease -and
+        ($Context.RepositoryKey -cne $script:AgentLauncherWorker.RepositoryKey -or
+         $Context.Role -cne $script:AgentLauncherWorker.Manifest.role)) {
+        throw '[launcher-control-invalid] Durable authority does not match the admitted work lease.'
+    }
     $preacquired = @($script:AgentManualAuthorities.Values | Where-Object {
             $_.StateLock.Path -ceq $Context.LockPath
         } | Select-Object -First 1)
     if ($preacquired.Count -gt 0) {
         return @{ Acquired = $true; Reason = ''; Stream = $null; Path = $Context.LockPath; Preacquired = $true }
     }
-    return Enter-AgentExclusiveFile -Path $Context.LockPath -ContentionReason state-contended `
+    $result = Enter-AgentExclusiveFile -Path $Context.LockPath -ContentionReason state-contended `
         -TimeoutMilliseconds $TimeoutMilliseconds -CancellationToken $CancellationToken `
         -Metadata @{ repositoryKeyHash = $Context.RepositoryKeyHash; role = $Context.Role }
+    if ($script:AgentLauncherWorker -and $script:AgentLauncherWorker.Lease -and $result.Acquired) {
+        $script:AgentLauncherWorker.State = $result.Stream
+        try { Invoke-AgentLauncherCheckpoint -Phase acquired }
+        catch { $result.Stream.Dispose(); throw }
+    }
+    return $result
+}
+
+function Initialize-AgentLauncherWorker {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$ManifestPath)
+    if (-not $ManifestPath) { return }
+    Assert-AgentManualDispatchEarlyContext -ManifestPath $ManifestPath
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 15
+    if ($manifest.schemaVersion -ne 1 -or $manifest.kind -cne 'launcher-worker' -or
+        $manifest.workerId -cnotmatch '^[0-9a-f-]{36}$' -or $manifest.startupPipe -cnotmatch '^[A-Za-z0-9-]{1,128}$') {
+        throw '[launcher-control-invalid] Invalid worker manifest.'
+    }
+    [void](Assert-AgentTrustedFile -Path $ManifestPath -AllowedRoot $manifest.runtimeRoot -Private)
+    $secret = Receive-AgentBrokerAttestationSecret
+    $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', $manifest.startupPipe, [IO.Pipes.PipeDirection]::InOut,
+        [IO.Pipes.PipeOptions]::Asynchronous)
+    try {
+        $pipe.Connect(20000)
+        $script:AgentLauncherWorker = @{
+            Manifest = $manifest; Secret = $secret; Pipe = $pipe; Sequence = 0
+            Reader = [IO.StreamReader]::new($pipe, [Text.UTF8Encoding]::new($false, $true), $false, 1024, $true)
+            Writer = [IO.StreamWriter]::new($pipe, [Text.UTF8Encoding]::new($false), 1024, $true)
+            Lease = $null; State = $null; RepositoryKey = ''; PullRequestId = 0; WorkId = ''
+            WakeCurrentWait = $false
+        }
+        $script:AgentLauncherWorker.Writer.AutoFlush = $true
+        Invoke-AgentLauncherCheckpoint -Phase ready
+    }
+    catch {
+        $pipe.Dispose()
+        [Array]::Clear($secret, 0, $secret.Length)
+        $script:AgentLauncherWorker = $null
+        throw
+    }
+}
+
+function Invoke-AgentLauncherCheckpoint {
+    param(
+        [Parameter(Mandatory)][ValidateSet('ready', 'started', 'admission', 'acquired', 'released', 'idle', 'scanning')][string]$Phase,
+        [string]$RepositoryKey = '', [int]$PullRequestId = 0, [string]$Role = ''
+    )
+    $worker = $script:AgentLauncherWorker
+    if (-not $worker) { return }
+    if ($Phase -cin @('idle', 'scanning') -and ($worker.Lease -or $worker.State)) {
+        throw '[launcher-control-invalid] A work-authority holder cannot enter or leave an idle interval.'
+    }
+    if ($Phase -ceq 'admission') {
+        if ($Role -cne $worker.Manifest.role -or $worker.Lease) {
+            throw '[launcher-control-invalid] Worker authority transition is invalid.'
+        }
+        $worker.RepositoryKey = $RepositoryKey
+        $worker.PullRequestId = $PullRequestId
+        $worker.WorkId = [Guid]::NewGuid().ToString('D')
+    }
+    $worker.Sequence++
+    $record = [ordered]@{
+        workerId = $worker.Manifest.workerId; sequence = $worker.Sequence; phase = $Phase
+        repositoryKey = $worker.RepositoryKey; pullRequestId = $worker.PullRequestId; workId = $worker.WorkId
+    }
+    $digest = Get-AgentCanonicalDigest $record
+    $proof = Get-AgentAttestationProof -SecretBytes $worker.Secret -Nonce $worker.Manifest.nonce -Digest $digest
+    $worker.Writer.WriteLine((ConvertTo-AgentCanonicalJson @{ record = $record; proof = $proof }))
+    $read = $worker.Reader.ReadLineAsync()
+    if (-not $read.Wait(60000) -or $null -eq $read.Result -or $read.Result.Length -gt 4096) {
+        throw '[launcher-control-lost] Launcher did not acknowledge the worker checkpoint.'
+    }
+    $reply = $read.Result | ConvertFrom-Json -AsHashtable -Depth 10
+    $expected = Get-AgentAttestationProof -SecretBytes $worker.Secret -Nonce $worker.Manifest.nonce `
+        -Digest (Get-AgentCanonicalDigest $reply.record)
+    if ($reply.proof -cne $expected -or $reply.record.workerId -cne $worker.Manifest.workerId -or
+        $reply.record.sequence -ne $worker.Sequence -or $reply.record.action -cnotin @('proceed', 'yield', 'wake') -or
+        ($reply.record.action -ceq 'wake' -and $Phase -cne 'idle')) {
+        throw '[launcher-control-invalid] Launcher checkpoint acknowledgement is invalid.'
+    }
+    if ($reply.record.action -ceq 'yield') { throw '[launcher-yielded] Automatic worker yielded its turn.' }
+    if ($reply.record.action -ceq 'wake') { $worker.WakeCurrentWait = $true }
+}
+
+function Confirm-AgentLauncherWorkerStartup {
+    Invoke-AgentLauncherCheckpoint -Phase started
+}
+
+function Test-AgentLauncherCancellationRequested {
+    $worker = $script:AgentLauncherWorker
+    if (-not $worker) { return $false }
+    $path = Join-Path $worker.Manifest.runtimeRoot 'cancel.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    [void](Assert-AgentTrustedFile -Path $path -AllowedRoot $worker.Manifest.runtimeRoot -Private)
+    $file = Read-AgentStableFile -Path $path -MaxBytes 4096
+    $cancel = [Text.Encoding]::UTF8.GetString($file.Bytes) | ConvertFrom-Json -AsHashtable -Depth 10
+    $expected = Get-AgentAttestationProof -SecretBytes $worker.Secret -Nonce $worker.Manifest.nonce `
+        -Digest (Get-AgentCanonicalDigest $cancel.record)
+    if ($cancel.proof -cne $expected -or $cancel.record.workerId -cne $worker.Manifest.workerId -or
+        $cancel.record.workId -cne $worker.WorkId -or $cancel.record.operation -cne 'cancel') {
+        throw '[launcher-control-invalid] Worker cancellation is not bound to this turn.'
+    }
+    return $true
+}
+
+function Wait-AgentLauncherInterval {
+    param([Parameter(Mandatory)][ValidateRange(0, 86400)][int]$Seconds)
+    if (-not $script:AgentLauncherWorker) { Start-Sleep -Seconds $Seconds; return }
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    $script:AgentLauncherWorker.WakeCurrentWait = $false
+    try {
+        do {
+            Invoke-AgentLauncherCheckpoint -Phase idle
+            if ($script:AgentLauncherWorker.WakeCurrentWait) { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+        # Both natural expiry and wake close this interval before any scan metadata work.
+        # A late request can therefore never leak into the next interval.
+        Invoke-AgentLauncherCheckpoint -Phase scanning
+    }
+    finally { $script:AgentLauncherWorker.WakeCurrentWait = $false }
+}
+
+function Close-AgentLauncherWorker {
+    if ($script:AgentLauncherWorker) {
+        $script:AgentLauncherWorker.Pipe.Dispose()
+        [Array]::Clear($script:AgentLauncherWorker.Secret, 0, $script:AgentLauncherWorker.Secret.Length)
+        $script:AgentLauncherWorker = $null
+    }
 }
 
 function Invoke-AgentWithWorkAuthority {
@@ -2121,6 +2272,11 @@ function Receive-AgentBrokerAttestationSecret {
     #>
     [CmdletBinding()]
     param([ValidateRange(100, 30000)][int]$TimeoutMilliseconds = 5000)
+    if ($script:AgentEarlyBrokerSecret) {
+        $secret = $script:AgentEarlyBrokerSecret
+        $script:AgentEarlyBrokerSecret = $null
+        return $secret
+    }
     $handle = $env:DEVPILOT_BROKER_ATTESTATION_HANDLE
     if ([string]::IsNullOrEmpty($handle)) {
         throw '[broker-attestation-missing] This process was not launched with a broker attestation handle; manual dispatch requires launch by the trusted broker.'
@@ -2157,7 +2313,7 @@ function Receive-AgentBrokerAttestationSecret {
 
 function Assert-AgentManualDispatchEarlyContext {
     <#
-        Early, side-effect-free guard (issue #105 PR4 CRITICAL-2 hardening): called by each agent
+        Early, provider-free guard and containment barrier: called by each agent
         script immediately after its own parameter validation, BEFORE any provider/network setup.
         A manual-dispatch manifest path alone -- even one naming a real, existing, well-formed file
         -- is never sufficient evidence of genuine broker issuance; only the broker's own direct
@@ -2187,6 +2343,9 @@ function Assert-AgentManualDispatchEarlyContext {
     $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 |
         ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
     Assert-AgentBrokerProcessAnchor -Manifest $manifest
+    # The issuer writes these bytes only AFTER installing containment. Keep them in this
+    # process until the later policy/readiness attestation consumes them exactly once.
+    $script:AgentEarlyBrokerSecret = Receive-AgentBrokerAttestationSecret
 }
 
 function ConvertFrom-AgentProcStatPpid {
@@ -3652,6 +3811,10 @@ function Get-AgentCancellationOutcome {
 }
 
 function Exit-AgentManualDispatchAuthority {
+    if ($script:AgentEarlyBrokerSecret) {
+        [Array]::Clear($script:AgentEarlyBrokerSecret, 0, $script:AgentEarlyBrokerSecret.Length)
+        $script:AgentEarlyBrokerSecret = $null
+    }
     foreach ($key in @($script:AgentManualAuthorities.Keys)) {
         $authority = $script:AgentManualAuthorities[$key]
         Exit-AgentLock -Stream $authority.StateLock.Stream
@@ -6755,6 +6918,8 @@ function Set-AgentProviderPullRequestVote {
 # export list rather than add to it.
 
 Export-ModuleMember -Function @(
+    'Initialize-AgentLauncherWorker', 'Test-AgentLauncherCancellationRequested',
+    'Wait-AgentLauncherInterval', 'Close-AgentLauncherWorker', 'Confirm-AgentLauncherWorkerStartup',
     "Get-DevPilotAgentPath",
     "Resolve-AgentRepositoryRoot",
     "Get-AgentSupportedModels",

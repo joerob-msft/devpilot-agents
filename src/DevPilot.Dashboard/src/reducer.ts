@@ -1,4 +1,5 @@
 import { basename, dirname, isAbsolute, normalize, resolve } from "node:path";
+import type { InstanceDismissal } from "./dismissals.js";
 import { observeProcess, type LocalProcessStream, type ProcessObserver } from "./process-observer.js";
 import {
   boundedText,
@@ -153,6 +154,10 @@ function isHistorical(state: InstanceState): boolean {
   return state.exitObservedMs !== null || state.lifecycle === "stopped" || state.status === "completed";
 }
 
+export function isLiveInstance(state: InstanceState, now = Date.now()): boolean {
+  return !isHistorical(state) && now - state.lastHeartbeatMs <= STALE_AFTER_MS;
+}
+
 export function liveElapsedMilliseconds(state: InstanceState, now = Date.now()): number {
   if (!state.phaseTimestampMs) return state.phaseElapsedMilliseconds;
   if (state.status === "running" || state.status === "stale") {
@@ -179,6 +184,11 @@ export class OperationsReducer {
   private eventRevision = 0;
   private readonly localStreams = new Map<string, LocalProcessStream>();
   private readonly originEvidence = new Map<string, { event: AgentEvent; source: string }>();
+  private readonly dismissedInstances: Map<string, InstanceDismissal>;
+
+  constructor(dismissals: readonly InstanceDismissal[] = []) {
+    this.dismissedInstances = new Map(dismissals.map((record) => [record.key, { ...record }]));
+  }
 
   registerLocalStream(stream: LocalProcessStream): void {
     if (!isAbsolute(stream.eventLogPath) || /[\u0000-\u001f\u007f]/.test(stream.eventLogPath) ||
@@ -296,6 +306,11 @@ export class OperationsReducer {
 
     this.reduceEvent(state, event);
     state.status = calculateStatus(state, event.timestampMs);
+    const dismissal = this.dismissedInstances.get(key);
+    if (dismissal && event.sequence > dismissal.throughSequence &&
+        (event.eventType === "agent.heartbeat" || event.eventType === "agent.started")) {
+      this.dismissedInstances.delete(key);
+    }
     if (!isHistorical(state)) this.forgottenHistory.delete(key);
     this.states.set(key, state);
     return true;
@@ -543,9 +558,10 @@ export class OperationsReducer {
       }
     }
     const items = visible.filter((state) => {
-      if (view === "live") return !isHistorical(state);
+      if (view === "live") return isLiveInstance(state, now);
       if (view === "history") return isHistorical(state);
       if (view === "current") {
+        if (this.dismissedInstances.has(state.key) && !isLiveInstance(state, now)) return false;
         if (state.exitObservedMs !== null) return false;
         return !isHistorical(state) ||
           newestRetainedByNamespace.get(`${state.agent}\0${state.sessionNamespace}`) === state.key;
@@ -594,6 +610,24 @@ export class OperationsReducer {
     };
     for (const state of this.list(now, role, view)) result[state.status]++;
     return result;
+  }
+
+  dismissalFor(key: string, now = Date.now()): InstanceDismissal | null {
+    const state = this.get(key, now);
+    return state && !isLiveInstance(state, now) ? { key, throughSequence: state.lastSequence } : null;
+  }
+
+  dismissInstance(record: InstanceDismissal, now = Date.now()): boolean {
+    const state = this.get(record.key, now);
+    if (!state || state.lastSequence !== record.throughSequence || isLiveInstance(state, now)) return false;
+    this.dismissedInstances.set(record.key, { ...record });
+    return true;
+  }
+
+  restoreDismissedInstances(): number {
+    const restored = this.dismissedInstances.size;
+    this.dismissedInstances.clear();
+    return restored;
   }
 
   forgetHistorical(key: string): boolean {

@@ -429,7 +429,7 @@ test("continuous completion followed by waiting remains live until the agent sto
   assert.equal(reducer.forgetHistorical("reviewer:continuous"), true);
 });
 
-test("active failed, blocked, and stale instances are live rather than history", () => {
+test("Live only includes heartbeating failed and blocked agents, while stale instances stay in Current", () => {
   const reducer = new OperationsReducer();
   reducer.apply(event("failed-active", 1, "agent.started"));
   reducer.apply(event("failed-active", 2, "cycle.failed", { data: { reason: "transient failure" } }));
@@ -440,10 +440,14 @@ test("active failed, blocked, and stale instances are live rather than history",
   reducer.apply(event("stale-active", 1, "agent.started"));
 
   const now = BASE_TIME + STALE_AFTER_MS + 500;
+  for (const id of ["failed-active", "blocked-active"]) {
+    reducer.apply(event(id, 3, "agent.heartbeat", { timestamp: new Date(now).toISOString() }));
+  }
   assert.deepEqual(
     reducer.list(now, undefined, "live").map((item) => `${item.instanceId}:${item.status}`),
-    ["failed-active:failed", "blocked-active:blocked", "stale-active:stale"],
+    ["failed-active:failed", "blocked-active:blocked"],
   );
+  assert.equal(reducer.list(now, undefined, "current").length, 3);
   assert.equal(reducer.list(now, undefined, "history").length, 0);
   assert.equal(reducer.forgetHistorical("reviewer:failed-active"), false);
   assert.equal(reducer.forgetHistorical("reviewer:blocked-active"), false);

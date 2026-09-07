@@ -31,6 +31,7 @@ try {
     assert.equal(event.dispatchId, accepted.dispatchId);
     assert.equal(event.processId, accepted.childProcessId);
     assert.equal(event.startupVerified, true);
+    assert.equal(event.includeOwnPullRequests, true, "manual Reviewer must allow the operator's own PR");
     assert.equal(event.attestationHandleCleared, true);
   } else {
     await assert.rejects(client.dispatch(summary, "isolated startup context"), (error) => {

@@ -850,6 +850,7 @@ if ($launchReviewHandler) {
 
 $pwsh = Resolve-AgentPwshPath
 $children = New-Object System.Collections.Generic.List[object]
+$automaticSpecs = [Collections.Generic.List[object]]::new()
 try {
     foreach ($spec in $specs) {
         New-Item -ItemType Directory -Force -Path $spec.StateDir | Out-Null
@@ -882,6 +883,15 @@ try {
             $childArguments += '-EnableTeamsNotifications'
         }
 
+        if ($launch.Golden) {
+            # The trusted dashboard broker is the sole process/containment owner for Golden.
+            # These are immutable automatic settings, never supplied by a dashboard request.
+            [void]$automaticSpecs.Add([ordered]@{
+                role = $spec.Role; arguments = @($childArguments)
+                continuous = [bool]$launch.Continuous
+            })
+            continue
+        }
         $stdoutPath = Join-Path $StateDir "$($spec.Role).stdout.jsonl"
         $stderrPath = Join-Path $StateDir "$($spec.Role).stderr.log"
         $owned = if (-not $launch.Continuous -and -not $launch.Operational) {
@@ -902,7 +912,17 @@ try {
         })
         Write-Host "Watching $($spec.Role) PID $($process.Id)." -ForegroundColor Cyan
     }
-    if ($brokerDescriptorPath) {
+    if ($launch.Golden) {
+        $brokerDescriptor.launcherControl = [ordered]@{
+            schemaVersion = 1; sessionId = [Guid]::NewGuid().ToString('D')
+            ownerStartIdentity = Get-AgentProcessStartIdentity -Process (Get-Process -Id $PID)
+            automaticWorkers = @($automaticSpecs.ToArray())
+        }
+        [void](Assert-AgentTrustedFile -Path $brokerDescriptorPath -AllowedRoot $StateDir -Private)
+        [IO.File]::WriteAllText($brokerDescriptorPath,
+            (ConvertTo-AgentCanonicalJson $brokerDescriptor), [Text.UTF8Encoding]::new($false))
+    }
+    elseif ($brokerDescriptorPath) {
         # Only this launch's owned stdout captures have known local origin. Prior/copy/attach
         # roots are not provenance, even when their paths and PIDs happen to exist locally.
         try {

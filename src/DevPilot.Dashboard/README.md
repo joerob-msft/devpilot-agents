@@ -10,6 +10,19 @@ review-handler instances and, only under a trusted launcher, manually
 starting either agent by PR ID through the restricted broker contract,
 without requiring retained history.
 
+Every launch starts in **Simple**. At 100 columns and wider, a clearly boxed
+left sidebar lists agents, PRs, and statuses, with the selected item's latest
+activity beside it. The sidebar is bounded to 40-42 columns; it is not the
+Advanced inspector or filter layout. `Enter` opens pinned details in the main
+pane; `Esc` returns to selection. Narrow terminals use the compact list and
+full-width Enter/Esc drill-down instead. `h` switches Live/History and `a`
+opens **Advanced**.
+The main footer is `m Start agent | h History | a Advanced | q Quit`
+(`h Live` in History), plus `r Scan now` when current-launcher automatic control
+is available, with contextual detail/back controls. Authority and
+actionable failures remain visible; Simple does not turn an operational
+launch into preview-only mode.
+
 The History view is an independent retained PR projection keyed by
 provider-verified repository identity plus PR number. It merges Reviewer and
 Review Handler outcomes without merging same-numbered PRs from different
@@ -65,16 +78,21 @@ work. Operational launches retain their authorized comments/pushes; PreviewOnly
 remains terminal no-write with widening locked. `Esc` cancels pending resolution
 or describe; stale responses are ignored.
 
+Manual Reviewer launches include the operator's own PRs. Automatic scans still
+exclude them unless explicitly configured otherwise. Selecting your own PR does
+not grant approval-vote permission or bypass work leases.
+
 The panel clearly distinguishes **NOT STARTED / READY TO START**, **STARTING**,
-and **STARTED / RUNNING**. Acceptance shows the child PID and elapsed time even
+and **STARTED** (Advanced: **STARTED / RUNNING**). Acceptance shows elapsed time even
 before the first event, with an explicit waiting message (not a claim that the
 model is already working). Matching events show the current phase and latest
 progress. Completion, failure, blocking, cancellation and lost monitoring are
 distinct. Exit zero without a reported work outcome does not imply review success.
 Progress is tied to the exact accepted dispatch, repository, role and PID, not
-the selected row or an automatic watcher on the same PR.
+the selected row or an automatic watcher on the same PR. Raw PID and instance
+identifiers appear only in Advanced.
 
-Capability widening is separate: `w` opens the disclosure, `c` reviews the final
+Capability widening is separate and **Advanced-only**: `w` opens the disclosure, `c` reviews the final
 blast radius and `y` mints the grant. Enter never advances these challenges;
 minting never starts work. The ordinary post-preview Enter confirmation is still
 required afterward. No launcher or broker authority gate is changed.
@@ -82,6 +100,99 @@ required afterward. No launcher or broker authority gate is changed.
 Golden History includes the current launch and up to 20 recent watch runs that
 still satisfy the owner-private trusted-path contract. Unsafe prior roots are
 reported and excluded; durable and lease roots are never scanned.
+
+### Automatic polling and Scan now
+
+Golden still starts **both automatic agents immediately** and uses the existing
+900-second (15-minute) wait between **successful** scans. Failure backoff can
+differ. The dashboard does not change these settings, infer deadlines, or show
+a fabricated next-scan countdown.
+
+The compact `Auto:` line in Simple and Advanced reports the broker's negotiated
+roles, configured intervals (or once-only mode), and current worker states.
+Mixed states remain role-specific. Missing or unsupported control is labeled
+unavailable, not falsely reported as automatic polling being off. Event PIDs
+and the operational/preview label do not grant this control.
+
+Press **`r` / Scan now** in a main view, or select it in either command palette,
+to wake eligible idle automatic workers from this same launcher. No additional
+confirmation is needed: this does not change their existing authorization.
+It never interrupts a model, supersedes manual priority, queues an extra scan
+behind busy work, or restarts stopped/failed workers. The shortcut stays visible
+while workers are busy; results distinguish each role's **wake requested**,
+**already working**, **manual priority**, or **unavailable** outcome.
+A wake acknowledgment is not proof that a model started. PreviewOnly remains
+no-write, and no widening is performed.
+
+`r` remains ordinary data in manual inputs and history filters. In Settings it
+keeps its existing profile-refresh meaning; help and other overlays do not wake
+workers.
+
+Status is read on dashboard mount, then polled sequentially about every five
+seconds while available. Scan completion requests a fresh status read; older
+responses cannot overwrite it. A status-read error is visible and disables
+Scan now until a healthy read succeeds, with at most three five-second retries.
+Unsupported control, exhausted retries, shutdown, or fatal broker failure stops
+polling. Scan errors are reported without automatically retrying the wake.
+Polling never changes selection, inputs, or manual confirmation state.
+
+### When another run is busy
+
+In both Simple and Advanced, a scheduling-enabled current Watch launch can
+offer **Replace / run now**, **Run next**, and **Back** after a typed busy
+rejection. Replace is preselected, but preparing the proposal is read-only:
+no work is cancelled until a separate `Enter` confirms the displayed proposal.
+`Tab` or Up/Down changes the choice; changing the action obtains a fresh binding.
+PageUp/PageDown scrolls the full scope, permissions, and constraints, even in a
+short terminal. `Esc` or Back abandons an unconfirmed proposal safely.
+
+The proposal identifies the current owned role and PR. Replace requests
+cancellation of that exact current-launcher work before giving the manual PR a
+turn; Run next waits for the **current PR**, not the entire automatic scan cycle.
+Completed comments and pushes are not undone. Automatic work resumes after
+manual completion; queued intents end with the Watch session.
+
+Queued work is labeled **QUEUED**, **STOPPING CURRENT WORK**, **WAITING FOR
+AUTHORITY**, or **REVALIDATING**, never started merely because it was queued.
+`c` or `Esc` cancels only the queued intent. Its acknowledgment is shown as
+**CANCELLATION ACKNOWLEDGED / CLEANUP PENDING**, not completed cancellation:
+the panel stays open until a matching `resumed` update confirms scheduling-slot
+release and restored automatic admission.
+Cancellation or expiry of a queued request does not release an earlier manual
+run's reservation. The panel waits while that run finishes and while automatic
+startup is being confirmed; process creation alone is not a resumption signal.
+If manual acceptance wins that race, the panel tracks that exact child instead;
+`c` then cancels that manual run. Unconfirmed cancellation, lost confirmation,
+or termination uncertainty never permits dismissal into a second dispatch.
+`q` retains the normal broker-owned shutdown route.
+If the broker reports both successful queued cancellation and acceptance for
+the same request, the panel instead flags inconsistent state and retains the
+observed run. It does not label that child cancelled or allow another start;
+use `q` for shutdown.
+
+Every `blocked` update retains the slot, including errors during automatic
+restart. The panel waits for explicit slot release before loading a fresh
+preview for an abandoned or expired intent; another explicit Enter is required.
+A cancel rejection such as `not-queued` proves neither acceptance nor cancellation.
+Termination uncertainty, automatic-policy changes, and automatic startup/worker
+failures retain the blocked slot without an automatic retry or dismissal; use
+`q` for the normal shutdown route. A global automatic failure is also shown
+as a broker diagnostic when there is no queued request.
+A changed work generation during confirmation requires a fresh inert proposal and
+confirmation before replacing any successor. Previously consumed drafts and
+widening grants are not silently reused or renewed. Scheduling previews use
+fresh baseline permissions; cancel and reopen in Advanced to request a new
+draft-bound widening grant. PreviewOnly remains a terminal no-mutation ceiling.
+Automatic-resumption messages never replace the manual run's reported outcome.
+Manual completion alone does not release a scheduling slot: the finished/failed
+outcome remains visible while cleanup or automatic restart is pending or blocked.
+Broker failure also keeps an unreleased scheduling slot blocked, including
+after manual completion. Accepted runs and their terminal outcomes are retained
+even when their notifications arrive before the confirmation response is handled.
+
+These choices require the negotiated scheduling capability and the complete
+broker scheduling API. Legacy, non-scheduling, foreign, or unverified owners
+do not gain a Replace action; they retain an actionable busy/scope diagnostic.
 
 ## Prerequisites
 
@@ -135,18 +246,67 @@ polled until they appear.
 
 ## Navigation
 
+### Simple (default)
+
 | Key | Action |
 | --- | --- |
+| Up / Down / `j` / `k` | Select an agent or retained PR; selection scrolls into view |
+| `Enter` / `Esc` | Open details / return to the list |
+| `h` | Switch Live / History |
+| `m` | Start Agent by PR ID, with the same explicit preview and start confirmations |
+| `r` | Scan now: wake eligible current-launcher automatic workers, when available |
+| `a` | Switch to Advanced; from Advanced, return to Simple |
+| PageUp / PageDown, Up / Down | Scroll details, long previews, or help |
+| `Ctrl+P` / `?` | Basic command palette / short help |
+| `q` | Quit |
+
+The sidebar remains visible beside open details when there is enough room.
+Its brighter border marks list navigation; the main pane's border becomes
+brighter when details are open. Up/Down selects sidebar rows before Enter and
+scrolls details afterward, without adding pane-switching shortcuts. At 70
+columns, or with fewer than four content rows available, Simple falls back
+to a single pane. The automatic status, authority header, and basic controls
+remain the same in both layouts.
+
+Simple has no inspector, pane-focus controls, raw-event wall, role filter, or stale
+management controls. Advanced-only keys provide a short `Press a for Advanced`
+message. Switching mode returns to Live with all roles and clears open details
+and transient filters; it does not restore explicitly dismissed instances or
+hidden PR history. Mode changes are unavailable inside manual dialogs and
+confirmation challenges. `a` in optional instructions is ordinary text.
+
+Open details stay pinned to the exact agent instance or canonical repository/PR
+identity as lists reorder. If that item leaves the view or is evicted, details
+identify the original selection as unavailable rather than silently substituting
+another row. Canonical History details work even without a retained agent instance.
+
+Simple previews show the exact repository, PR, role, title, short commit,
+complete allowed actions, and dynamic constraints. Long text wraps and scrolls;
+the explicit `Enter: START` and `Esc: cancel` controls stay visible. Optional
+instructions remain behind `p`. Advanced retains the full deny and widening
+disclosures. Simple never invokes widening.
+
+### Advanced
+
+Press `a` from the main view for the detailed dashboard and all existing controls.
+
+| Key | Action |
+| --- | --- |
+| `a` | Return to Simple, Live, all roles |
 | Left / Right | Focus a visible pane |
 | Up / Down / `j` / `k` | Select instance while the rail is focused |
 | `Enter` | Drill from rail to narrative to current-run timeline |
 | `Esc` / `b` | Dismiss overlay or move back toward the instance rail |
 | `Tab` / `Shift+Tab` | Cycle all, reviewer, and review-handler roles |
 | `f` / `Shift+f` | Cycle Live, Current session, and History views |
+| `l` | Toggle Live only (the default) / Current session (including stale instances) |
+| `Delete` | Dismiss the selected stale or finished instance across Watch restarts; retain logs and PR History |
+| `Shift+Delete` | Restore dismissed instances and show Current session (also in `Ctrl+P`) |
 | `x` / `Shift+x` | Hide the selected retained PR history row / restore all hidden PR history rows for this dashboard process |
 | `/` | Filter PR history by number, title, author, repository, or outcome |
 | Number then `Enter` | Jump to and restore a unique retained PR number |
 | `m` | Start Agent by PR ID from any main view, when trusted policy is available |
+| `r` | Scan now from a main view; in Settings, refresh the effective profile instead |
 | `Tab` in PR entry | Choose Reviewer or Review Handler (before resolution only) |
 | `Enter` in PR entry | Validate ID, resolve the configured repository, and load a fresh keyed preview |
 | `Ctrl+U` in PR entry | Clear input, including an oversized/rejected paste |
@@ -164,19 +324,21 @@ polled until they appear.
 | `q` | Quit |
 
 Unavailable actions produce a brief status message instead of silently doing
-nothing. The focused pane is visible in both the header and pane border.
+nothing. In Advanced, the focused pane is visible in both the header and pane border.
 
-The default **Current session** view contains every live instance plus only the
-newest retained instance in each agent/session namespace group. This keeps old
-runs out of the default view without hiding the most relevant recent outcome.
-**Live** contains nonterminal derived statuses while lifecycle remains active,
-including active failed, blocked, waiting, or stale agents. A completion event
-followed by `agent.waiting` therefore remains Live. **History** contains
+The default **Live only** view shows nonterminal instances with a heartbeat
+within 20 seconds, including waiting, failed, or blocked agents that are still
+heartbeating. Stale instances are excluded, without claiming they have exited.
+In Advanced, press `l` to show **Current session**, which includes stale instances plus the
+newest retained instance in each agent/session namespace group; press `l`
+again to return to Live only. A completion event followed by `agent.waiting`
+remains Live while heartbeats are recent. **History** contains
 terminal retained runs whose lifecycle stopped or whose derived status is
 completed. Overdue instances whose local PID is positively observed absent
 are automatically removed from both Current and Live, including the newest
 such row in a group. They remain available under **EXITED INSTANCES** in
-History: select a row for its narrative/log path or press `e` for raw events.
+Advanced History: select a row for its narrative/log path or press `e` for raw events.
+Simple History shows these retained instances with human-readable outcomes and details.
 This also retains legacy/unverified streams and PR-less startup failures
 without inventing canonical PR records. A missing completion is labeled
 **Interrupted / outcome unknown**, never successful.
@@ -213,25 +375,40 @@ normal state roots, the namespace is the directory immediately above
 it is the containing directory.
 History rows include their completion timestamp and reported outcome.
 
-Hide and restore affect only in-memory dashboard view state. They never change an agent
-process, edits agent state, or deletes/truncates event logs. Numeric jump in the
-history projection restores a hidden unique PR; same-numbered PRs across
-repositories require repository selection.
+`Delete` dismisses a stale or finished instance from Current session. Dismissals
+survive Watch restarts in local display-preference files under
+`%LOCALAPPDATA%\DevPilot\dashboard\dismissed-instances` on Windows, or
+`$XDG_STATE_HOME/DevPilot/dashboard/dismissed-instances` (default
+`~/.local/state`) elsewhere. A later heartbeat or agent-start event restores
+the instance; replaying its old logs does not. `Shift+Delete` or **Restore
+dismissed instances** in `Ctrl+P` restores these rows. Live agents cannot be
+dismissed, and save failures leave the row visible with an error.
+`--view-state-dir <path>` overrides only this display-preference directory.
+Concurrent dashboards retain the newest dismissal watermark for each instance,
+so a lagging window cannot undo a newer dismissal when old logs are replayed.
+Storage is bounded to 5,000 dismissal records; reaching the limit reports an
+error rather than silently evicting dismissals. Restore clears these records.
+
+Dismissal never stops a process, changes locks or agent state, or deletes or
+truncates event logs. PR History remains intact. Its existing `x`/`Shift+x`
+hide/restore controls remain process-local; numeric jump restores a hidden
+unique PR, while same-numbered PRs across repositories require repository selection.
 
 The optional operator context is LF-normalized, rejects terminal control
 characters, and is capped at 512 Unicode scalar values (including non-BMP
 characters). It is sent only as bounded protocol data and is never placed in
-argv, environment, logs, events, or diagnostics. Confirmation shows
-the source commit, allowed actions, mandatory denied actions, and dynamic
-constraints. Policy digests and PR-state fingerprints remain bound and verified
+argv, environment, logs, events, or diagnostics. Both previews show
+the source commit, allowed actions, and dynamic constraints; Advanced additionally
+shows mandatory denied actions. Policy digests and PR-state fingerprints remain bound and verified
 by the protocol without dominating the operator view.
 `source-changed`, `policy-changed`, `pr-state-changed`, `delivery-pending`,
 `already-running`, broker/child failures, and cooperative/forced cancellation
 are rendered with distinct safe detail.
 For `already-running` / `state-contended`, another run of the selected role is
 using this repository's durable state, possibly for a different PR. Wait for it
-to finish, then retry. Removing a stale row does not release that lock; the
-dashboard neither queues the request nor cancels automatic work.
+to finish, then retry, or use the explicitly confirmed current-launcher busy
+choices when available. Removing a stale row does not release that lock.
+The dashboard never bypasses authority or stops a process based on its PID.
 
 ## Architecture
 
@@ -259,8 +436,13 @@ dashboard neither queues the request nor cancels automatic work.
   lifecycle and attention state, preserves bounded review completion details,
   retains at most 500 non-heartbeat timeline events per instance, and owns the
   bounded process-local history visibility state.
+- `dismissals.ts` persists per-instance display dismissals atomically, independently
+  of PR History, agent state, work leases, and launch authority.
 - `layout.ts` is a pure responsive decision function used by the SolidJS UI.
-- `app.tsx` renders focus-aware OpenTUI panes and overlays. At 120 columns it
+- `simple-view.tsx` supplies pure Simple presentation rows, identity-pinned list/details,
+  and the scrollable manual panel without changing reducer or broker authority.
+- `app.tsx` defaults to Simple and manages mode, selection, and confirmation input.
+  Advanced renders focus-aware OpenTUI panes and overlays. At 120 columns it
   shows three panes, at 80-119 it overlays the inspector, and below 80 it uses
   one pane. The primary hierarchy is current phase, elapsed/model activity,
   candidate story, completion summary, and the current-run narrative.

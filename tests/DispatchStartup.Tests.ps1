@@ -131,7 +131,7 @@ finally { [Array]::Clear($secret, 0, $secret.Length) }
                 } -PullRequestId 114 -Role reviewer -TimeoutMilliseconds 100
                 $lease.Acquired | Should -BeTrue
             }
-            $result = Invoke-TimedProcess -FilePath (Get-Command node -CommandType Application).Source `
+            $result = Invoke-TimedProcess -FilePath (Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source `
                 -ArgumentList @(
                     (Join-Path $PSScriptRoot 'fixtures\manual-startup-client.mjs'),
                     (Join-Path $repoRoot 'src\DevPilot.Dashboard\dist\src\dispatch.js'),
@@ -159,7 +159,7 @@ finally { [Array]::Clear($secret, 0, $secret.Length) }
         $savedAppData = $env:LOCALAPPDATA
         try {
             $env:LOCALAPPDATA = Join-Path $fixture.Root 'appdata'
-            $result = Invoke-TimedProcess -FilePath (Get-Command node -CommandType Application).Source `
+            $result = Invoke-TimedProcess -FilePath (Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source `
                 -ArgumentList @(
                     (Join-Path $PSScriptRoot 'fixtures\manual-startup-eof.mjs'),
                     (Resolve-AgentPwshPath), $fixture.Broker, $fixture.Descriptor, [string]$ExpectedExitCode, $Mode
