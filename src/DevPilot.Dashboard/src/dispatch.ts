@@ -2,13 +2,43 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { AGENTS, parseRepositoryIdentity, type AgentRole, type RepositoryIdentityV1 } from "./domain.js";
+import type { LocalProcessStream } from "./process-observer.js";
 
 export const DISPATCH_PROTOCOL_MAX_BYTES = 65_536;
+const LOCAL_OBSERVATION_ID = "00000000-0000-0000-0000-000000000000";
+export const AUTOMATIC_FAILURE_CODES = ["automatic-startup-failed", "automatic-worker-failed"] as const;
 
 export interface BrokerLaunchDescriptor {
   executablePath: string;
   scriptPath: string;
   descriptorPath: string;
+}
+
+export interface AutomationAgentStatus {
+  role: AgentRole;
+  continuous: boolean;
+  intervalSeconds: number | null;
+  state: "starting" | "scanning" | "waiting" | "paused" | "stopped" | "failed";
+  canScanNow: boolean;
+}
+
+export interface AutomationStatus {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "automation-status";
+  automationVersion: 1;
+  available: boolean;
+  scope: "current-launcher" | null;
+  agents: AutomationAgentStatus[];
+}
+
+export interface ScanNowResult {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "scan-now-result";
+  automationVersion: 1;
+  scope: "current-launcher";
+  results: Array<{ role: AgentRole; outcome: "requested" | "already-running" | "manual-priority" | "unavailable" }>;
 }
 
 export interface PullRequestSnapshotV1 {
@@ -56,6 +86,7 @@ export const DELEGABLE_CAPABILITY_BY_ROLE: Record<AgentRole, string> = {
 };
 
 export interface CapabilitySummary {
+  scheduling?: SchedulingCapability;
   schemaVersion: 1;
   requestId: string;
   operation: "capability-summary";
@@ -102,6 +133,7 @@ export interface CapabilitySummary {
 // snapshot to bind it to, and a distinct type is safer here than fake/optional draft identifiers
 // that could be mistaken for something dispatch() can actually consume.
 export interface CapabilityProfile {
+  scheduling?: SchedulingCapability;
   schemaVersion: 1;
   requestId: string;
   operation: "capability-profile";
@@ -118,6 +150,27 @@ export interface CapabilityProfile {
   killSwitchActive: boolean;
   killSwitchExpiresAtUtc: string | null;
   editingAvailable: boolean;
+}
+
+export type ResolvedManualTarget = Pick<CapabilityProfile, "repositoryIdentity" | "prSnapshot" | "role">;
+
+export function isPullRequestId(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= 2_147_483_647;
+}
+
+export function assertManualTarget(
+  response: ResolvedManualTarget,
+  pullRequestId: number,
+  role: AgentRole,
+  repositoryKey?: string,
+): void {
+  if (response.role !== role) throw new Error("broker response role does not match the requested role");
+  if (response.prSnapshot.pullRequestId !== pullRequestId) {
+    throw new Error("broker response PR ID does not match the requested PR ID");
+  }
+  if (repositoryKey !== undefined && response.repositoryIdentity.key !== repositoryKey) {
+    throw new Error("broker response repository key does not match the requested repository key");
+  }
 }
 
 // PR3: the {capabilities, mandatoryDenies, provenance} triple describing one resolved effective
@@ -281,7 +334,61 @@ export interface DispatchAccepted {
   prStateFingerprint: string;
   childProcessId: number;
   eventLogPath: string;
+  queueId?: string;
 }
+
+export interface SchedulingCapability {
+  version: 1;
+  scope: "current-launcher";
+}
+
+export type RunScheduleMode = "replace" | "next";
+
+export interface RunPrepared {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "run-prepared";
+  schedulingVersion: 1;
+  scope: "current-launcher";
+  confirmationToken: string;
+  expiresAtUtc: string;
+  repositoryKey: string;
+  role: AgentRole;
+  pullRequestId: number;
+  mode: RunScheduleMode;
+  conflict: { kind: "automatic" | "manual"; workId: string; generation: string; pullRequestId: number };
+}
+
+export interface RunQueued {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "run-queued";
+  schedulingVersion: 1;
+  queueId: string;
+  mode: RunScheduleMode;
+}
+
+export interface QueueCancelled {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "queue-cancelled";
+  schedulingVersion: 1;
+  queueId: string;
+}
+
+export const RUN_PROGRESS_STATES = [
+  "queued", "quiescing", "waiting-authority", "revalidating", "blocked", "resumed",
+] as const;
+export interface RunProgress {
+  schemaVersion: 1;
+  requestId: string;
+  operation: "run-progress";
+  schedulingVersion: 1;
+  queueId: string;
+  state: (typeof RUN_PROGRESS_STATES)[number];
+  code: string;
+}
+export type ScheduledDispatchAccepted = DispatchAccepted & { queueId: string };
 
 export interface DispatchRejected {
   schemaVersion: 1;
@@ -302,6 +409,12 @@ export interface DispatchTerminal {
 }
 
 type BrokerResponse =
+  | AutomationStatus
+  | ScanNowResult
+  | RunPrepared
+  | RunQueued
+  | QueueCancelled
+  | RunProgress
   | CapabilitySummary
   | CapabilityProfile
   | CapabilityNarrowingPreview
@@ -314,6 +427,7 @@ type BrokerResponse =
   | DispatchAccepted
   | DispatchRejected
   | DispatchTerminal
+  | { schemaVersion: 1; requestId: string; operation: "local-observation"; streams: LocalProcessStream[] }
   | { schemaVersion: 1; requestId: string; operation: "shutdown-complete" };
 
 interface PendingRequest {
@@ -332,14 +446,25 @@ export class BrokerRejectionError extends Error {
 }
 
 export interface DispatchClientOptions {
+  onSchedule?: (event: RunProgress) => void;
+  onScheduledAccepted?: (event: ScheduledDispatchAccepted) => void;
   onTerminal?: (event: DispatchTerminal) => void;
   onBrokerFailure?: (message: string) => void;
   onAcceptedEventPath?: (path: string) => void;
+  onLocalStreams?: (streams: LocalProcessStream[]) => void;
 }
 
 export interface DispatchBroker {
+  getAutomationStatus?(): Promise<AutomationStatus>;
+  scanNow?(): Promise<ScanNowResult>;
+  prepareRun?(summary: CapabilitySummary, mode: RunScheduleMode, operatorPrompt: string): Promise<RunPrepared>;
+  confirmRun?(prepared: RunPrepared): Promise<RunQueued>;
+  cancelQueued?(queueId: string): Promise<QueueCancelled>;
+  subscribeSchedule?(listener: (event: RunProgress) => void): () => void;
+  subscribeScheduledAccepted?(listener: (event: ScheduledDispatchAccepted) => void): () => void;
   describe(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilitySummary>;
   profile(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilityProfile>;
+  profileCurrent(pullRequestId: number, role: AgentRole): Promise<CapabilityProfile>;
   // PR3 narrow-only edit protocol. previewNarrowing never mutates anything; applyNarrowing takes
   // the full CapabilityNarrowingPreview it was just given (mirroring dispatch(summary, ...) taking
   // the full CapabilitySummary) so the client never has to separately track the binding fields the
@@ -429,7 +554,7 @@ function prSnapshotField(record: Record<string, unknown>, name: string): PullReq
   const raw = value as Record<string, unknown>;
   if (raw.schemaVersion !== 1) throw new Error(`broker response ${name}.schemaVersion is invalid`);
   const pullRequestId = raw.pullRequestId;
-  if (typeof pullRequestId !== "number" || !Number.isSafeInteger(pullRequestId) || pullRequestId <= 0) {
+  if (!isPullRequestId(pullRequestId)) {
     throw new Error(`broker response ${name}.pullRequestId is invalid`);
   }
   if (typeof raw.active !== "boolean" || typeof raw.draft !== "boolean") {
@@ -771,6 +896,74 @@ function requiredEpochSecondsField(record: Record<string, unknown>, name: string
   return new Date(value * 1000).toISOString();
 }
 
+function exactResponseFields(record: Record<string, unknown>, fields: readonly string[]): void {
+  const keys = Object.keys(record);
+  if (keys.length !== fields.length || keys.some((key) => !fields.includes(key))) {
+    throw new Error("broker automation response has missing or unknown fields");
+  }
+}
+
+function parseAutomationResponse(record: Record<string, unknown>): AutomationStatus | ScanNowResult {
+  const requestId = guidField(record, "requestId");
+  if (record.automationVersion !== 1) throw new Error("unsupported automation protocol version");
+  const envelope = { schemaVersion: 1 as const, requestId, automationVersion: 1 as const };
+  const seen = new Set<AgentRole>();
+  if (record.operation === "automation-status") {
+    exactResponseFields(record, ["schemaVersion", "requestId", "operation", "automationVersion", "available", "scope", "agents"]);
+    const available = booleanField(record, "available");
+    if (!Array.isArray(record.agents) || record.agents.length > 2 ||
+        (available ? record.scope !== "current-launcher" || record.agents.length === 0
+          : record.scope !== null || record.agents.length !== 0)) {
+      throw new Error("invalid automation availability or scope");
+    }
+    const agents = record.agents.map((value): AutomationAgentStatus => {
+      const agent = asRecord(value);
+      exactResponseFields(agent, ["role", "continuous", "intervalSeconds", "state", "canScanNow"]);
+      const role = roleField(agent, "role");
+      if (seen.has(role)) throw new Error("duplicate automation role");
+      seen.add(role);
+      const continuous = booleanField(agent, "continuous");
+      const interval = agent.intervalSeconds;
+      let intervalSeconds: number | null;
+      if (continuous) {
+        if (typeof interval !== "number" || !Number.isSafeInteger(interval) || interval < 30 || interval > 86_400) {
+          throw new Error("invalid automation interval");
+        }
+        intervalSeconds = interval;
+      } else {
+        if (interval !== null) throw new Error("invalid automation interval");
+        intervalSeconds = null;
+      }
+      const state = agent.state;
+      if (typeof state !== "string" || !["starting", "scanning", "waiting", "paused", "stopped", "failed"].includes(state)) {
+        throw new Error("invalid automation state");
+      }
+      const canScanNow = booleanField(agent, "canScanNow");
+      if (canScanNow && (!continuous || state !== "waiting")) throw new Error("invalid scan-now eligibility");
+      return { role, continuous, intervalSeconds,
+        state: state as AutomationAgentStatus["state"], canScanNow };
+    });
+    return { ...envelope, operation: "automation-status", available, scope: available ? "current-launcher" : null, agents };
+  }
+  exactResponseFields(record, ["schemaVersion", "requestId", "operation", "automationVersion", "scope", "results"]);
+  if (record.scope !== "current-launcher" || !Array.isArray(record.results) || record.results.length < 1 || record.results.length > 2) {
+    throw new Error("invalid scan-now scope or results");
+  }
+  const results = record.results.map((value): ScanNowResult["results"][number] => {
+    const result = asRecord(value);
+    exactResponseFields(result, ["role", "outcome"]);
+    const role = roleField(result, "role");
+    if (seen.has(role)) throw new Error("duplicate scan-now role");
+    seen.add(role);
+    const outcome = result.outcome;
+    if (outcome !== "requested" && outcome !== "already-running" && outcome !== "manual-priority" && outcome !== "unavailable") {
+      throw new Error("invalid scan-now outcome");
+    }
+    return { role, outcome };
+  });
+  return { ...envelope, operation: "scan-now-result", scope: "current-launcher", results };
+}
+
 function parseResponse(line: string): BrokerResponse {
   const record = asRecord(JSON.parse(line));
   if (record.schemaVersion !== 1) throw new Error("unsupported broker protocol version");
@@ -792,9 +985,71 @@ function parseResponse(line: string): BrokerResponse {
       "completed",
       "cancelled",
       "shutdown-complete",
+      "local-observation",
+      "run-prepared", "run-queued", "queue-cancelled", "run-progress",
+      "automation-status", "scan-now-result",
     ].includes(operation)
   ) {
     throw new Error("unknown broker response operation");
+  }
+  if (operation === "automation-status" || operation === "scan-now-result") return parseAutomationResponse(record);
+  if (operation === "run-prepared" || operation === "run-queued" ||
+      operation === "queue-cancelled" || operation === "run-progress") {
+    if (record.schedulingVersion !== 1) throw new Error("unsupported scheduling protocol version");
+    const envelope = { schemaVersion: 1 as const, requestId, schedulingVersion: 1 as const };
+    if (operation === "run-progress") {
+      const state = record.state;
+      if (typeof state !== "string" || !(RUN_PROGRESS_STATES as readonly string[]).includes(state) ||
+          typeof record.code !== "string" || !/^[a-z-]{0,80}$/.test(record.code)) {
+        throw new Error("invalid scheduling progress");
+      }
+      return { ...envelope, operation, queueId: guidField(record, "queueId"),
+        state: state as RunProgress["state"], code: record.code };
+    }
+    if (operation === "queue-cancelled") return { ...envelope, operation, queueId: guidField(record, "queueId") };
+    if (record.mode !== "replace" && record.mode !== "next") throw new Error("invalid scheduling mode");
+    if (operation === "run-queued") {
+      return { ...envelope, operation, queueId: guidField(record, "queueId"), mode: record.mode };
+    }
+    const conflict = asRecord(record.conflict);
+    if (record.scope !== "current-launcher" || !isPullRequestId(record.pullRequestId) ||
+        !isPullRequestId(conflict.pullRequestId) || (conflict.kind !== "automatic" && conflict.kind !== "manual")) {
+      throw new Error("invalid scheduling ownership scope");
+    }
+    return { ...envelope, operation, scope: "current-launcher", mode: record.mode,
+      confirmationToken: challengeField(record, "confirmationToken"),
+      expiresAtUtc: requiredIsoTimestampField(record, "expiresAtUtc"),
+      repositoryKey: stringField(record, "repositoryKey"), role: roleField(record, "role"),
+      pullRequestId: record.pullRequestId,
+      conflict: { kind: conflict.kind, workId: guidField(conflict, "workId"),
+        generation: guidField(conflict, "generation"), pullRequestId: conflict.pullRequestId } };
+  }
+  if (operation === "local-observation") {
+    if (requestId !== LOCAL_OBSERVATION_ID || !Array.isArray(record.streams) || record.streams.length > 2) {
+      throw new Error("invalid local observation envelope");
+    }
+    const streams = record.streams.map((value): LocalProcessStream => {
+      const stream = asRecord(value);
+      const eventLogPath = stringField(stream, "eventLogPath");
+      const processId = stream.processId;
+      if (!isAbsolute(eventLogPath) || /[\u0000-\u001f\u007f]/.test(eventLogPath) ||
+          typeof processId !== "number" || !Number.isSafeInteger(processId) ||
+          processId <= 0 || processId > 2_147_483_647) throw new Error("invalid local observation stream");
+      return { eventLogPath, processId, role: roleField(stream, "role") };
+    });
+    if (new Set(streams.map((stream) => stream.role)).size !== streams.length ||
+        new Set(streams.map((stream) => process.platform === "win32"
+          ? stream.eventLogPath.toLowerCase() : stream.eventLogPath)).size !== streams.length) {
+      throw new Error("duplicate local observation stream");
+    }
+    return { schemaVersion: 1, requestId, operation, streams };
+  }
+  if (operation === "rejected" && requestId === LOCAL_OBSERVATION_ID) {
+    const code = stringField(record, "code");
+    if (!(AUTOMATIC_FAILURE_CODES as readonly string[]).includes(code)) {
+      throw new Error("unknown unsolicited broker failure");
+    }
+    return { schemaVersion: 1, requestId, operation, code, detail: boundedPrText(record, "detail") };
   }
   if (operation === "capability-summary" || operation === "capability-profile") {
     // Computed once so it can also be threaded into parseCapabilityProfileFields's role-aware
@@ -816,10 +1071,21 @@ function parseResponse(line: string): BrokerResponse {
       dynamicConstraints: stringArrayField(record, "dynamicConstraints"),
       ...parseCapabilityProfileFields(record, role),
     };
-    if (operation === "capability-summary") {
-      return { ...record, requestId, operation, ...shared } as CapabilitySummary;
+    // Unknown versions do not advertise controls. Malformed known versions fail closed.
+    let scheduling: SchedulingCapability | undefined;
+    if (record.scheduling !== undefined) {
+      const capability = asRecord(record.scheduling);
+      if (capability.version === 1) {
+        if (capability.scope !== "current-launcher") throw new Error("invalid scheduling scope");
+        scheduling = { version: 1, scope: "current-launcher" };
+      }
     }
-    return { ...record, requestId, operation, ...shared } as CapabilityProfile;
+    const profileRecord = { ...record };
+    delete profileRecord.scheduling;
+    if (operation === "capability-summary") {
+      return { ...profileRecord, requestId, operation, ...shared, ...(scheduling ? { scheduling } : {}) } as CapabilitySummary;
+    }
+    return { ...profileRecord, requestId, operation, ...shared, ...(scheduling ? { scheduling } : {}) } as CapabilityProfile;
   }
   if (operation === "widening-preview" || operation === "widening-summary") {
     const expectedState = operation === "widening-preview" ? "previewed" : "awaiting-final-confirmation";
@@ -948,6 +1214,13 @@ export class DispatchClient implements DispatchBroker {
   private closed = false;
   private shutdownPromise: Promise<void> | undefined;
   private readonly terminalListeners = new Set<(event: DispatchTerminal) => void>();
+  private readonly scheduleListeners = new Set<(event: RunProgress) => void>();
+  private readonly scheduledAcceptedListeners = new Set<(event: ScheduledDispatchAccepted) => void>();
+  private readonly preparedTargets = new Map<string, { summary: CapabilitySummary; prepared: RunPrepared }>();
+  private readonly scheduledTargets = new Map<string, CapabilitySummary>();
+  private readonly scheduledDispatches = new Map<string, string>();
+  private automationRoles: AgentRole[] | null = null;
+  private automationStatusRequest: Promise<AutomationStatus> | undefined;
 
   constructor(
     descriptor: BrokerLaunchDescriptor,
@@ -981,7 +1254,36 @@ export class DispatchClient implements DispatchBroker {
     });
   }
 
+  getAutomationStatus(): Promise<AutomationStatus> {
+    // Coalesce overlapping read-only polls; the UI owns its five-second cadence.
+    if (this.automationStatusRequest) return this.automationStatusRequest;
+    this.automationStatusRequest = this.request<AutomationStatus>({
+      schemaVersion: 1, operation: "get-automation-status",
+    }, "automation-status", (response) => {
+      this.automationRoles = response.available ? response.agents.map((agent) => agent.role) : null;
+    }).catch((error: unknown) => {
+      this.automationRoles = null;
+      throw error;
+    }).finally(() => { this.automationStatusRequest = undefined; });
+    return this.automationStatusRequest;
+  }
+
+  scanNow(): Promise<ScanNowResult> {
+    const roles = this.automationRoles;
+    if (!roles?.length) {
+      return Promise.reject(new BrokerRejectionError("automation-unavailable", "This launcher has not advertised owned automation."));
+    }
+    return this.request<ScanNowResult>({ schemaVersion: 1, operation: "scan-now" },
+      "scan-now-result", (response) => {
+        if (response.results.length !== roles.length || response.results.some((result) => !roles.includes(result.role))) {
+          this.automationRoles = null;
+          throw new Error("scan-now response roles do not match verified automation");
+        }
+      });
+  }
+
   describe(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilitySummary> {
+    if (!isPullRequestId(pullRequestId)) return Promise.reject(new Error("invalid PR ID"));
     return this.request<CapabilitySummary>({
       schemaVersion: 1,
       operation: "describe",
@@ -989,16 +1291,13 @@ export class DispatchClient implements DispatchBroker {
       pullRequestId,
       role,
     }, "capability-summary").then((response) => {
-      // The broker's role is authoritative (issue #105) and is never client-stamped/overwritten;
-      // a response for a different role than what was requested is rejected rather than trusted.
-      if (response.role !== role) {
-        throw new Error("broker capability-summary role does not match the requested role");
-      }
+      assertManualTarget(response, pullRequestId, role, repositoryKey);
       return response;
     });
   }
 
   profile(repositoryKey: string, pullRequestId: number, role: AgentRole): Promise<CapabilityProfile> {
+    if (!isPullRequestId(pullRequestId)) return Promise.reject(new Error("invalid PR ID"));
     return this.request<CapabilityProfile>({
       schemaVersion: 1,
       operation: "profile",
@@ -1006,9 +1305,20 @@ export class DispatchClient implements DispatchBroker {
       pullRequestId,
       role,
     }, "capability-profile").then((response) => {
-      if (response.role !== role) {
-        throw new Error("broker capability-profile role does not match the requested role");
-      }
+      assertManualTarget(response, pullRequestId, role, repositoryKey);
+      return response;
+    });
+  }
+
+  profileCurrent(pullRequestId: number, role: AgentRole): Promise<CapabilityProfile> {
+    if (!isPullRequestId(pullRequestId)) return Promise.reject(new Error("invalid PR ID"));
+    return this.request<CapabilityProfile>({
+      schemaVersion: 1,
+      operation: "profile-current",
+      pullRequestId,
+      role,
+    }, "capability-profile").then((response) => {
+      assertManualTarget(response, pullRequestId, role);
       return response;
     });
   }
@@ -1188,6 +1498,63 @@ export class DispatchClient implements DispatchBroker {
     }, "accepted");
   }
 
+  prepareRun(summary: CapabilitySummary, mode: RunScheduleMode, operatorPrompt: string): Promise<RunPrepared> {
+    if (summary.scheduling?.version !== 1 || summary.scheduling.scope !== "current-launcher") {
+      return Promise.reject(new BrokerRejectionError("scheduling-unavailable", "This launcher does not advertise scheduling."));
+    }
+    if ((mode !== "replace" && mode !== "next") || typeof operatorPrompt !== "string" ||
+        [...operatorPrompt].length > 512) return Promise.reject(new Error("invalid run preparation"));
+    return this.request<RunPrepared>({
+      schemaVersion: 1, operation: "prepare-run", repositoryKey: summary.repositoryIdentity.key,
+      pullRequestId: summary.prSnapshot.pullRequestId, role: summary.role, mode, operatorPrompt,
+      capabilityPolicyDigest: summary.capabilityPolicyDigest, prStateFingerprint: summary.prStateFingerprint,
+    }, "run-prepared", (response) => {
+      if (response.repositoryKey !== summary.repositoryIdentity.key || response.role !== summary.role ||
+          response.pullRequestId !== summary.prSnapshot.pullRequestId || response.mode !== mode) {
+        throw new Error("broker run-prepared does not match the requested target");
+      }
+      // Only the current UI interaction is retained; the backend independently bounds preparations.
+      this.preparedTargets.clear();
+      this.preparedTargets.set(response.confirmationToken, {
+        summary: structuredClone(summary), prepared: structuredClone(response),
+      });
+    });
+  }
+
+  confirmRun(prepared: RunPrepared): Promise<RunQueued> {
+    const binding = this.preparedTargets.get(prepared.confirmationToken);
+    if (!binding || Date.now() >= Date.parse(binding.prepared.expiresAtUtc) ||
+        JSON.stringify(binding.prepared) !== JSON.stringify(prepared)) {
+      return Promise.reject(new BrokerRejectionError("schedule-stale", "Prepare and explicitly confirm again."));
+    }
+    const summary = binding.summary;
+    this.preparedTargets.delete(prepared.confirmationToken);
+    return this.request<RunQueued>({
+      schemaVersion: 1, operation: "confirm-run", confirmationToken: prepared.confirmationToken,
+      expectedWorkId: prepared.conflict.workId, expectedGeneration: prepared.conflict.generation,
+    }, "run-queued", (response) => {
+      if (response.mode !== prepared.mode) throw new Error("broker run-queued mode does not match confirmation");
+      this.scheduledTargets.set(response.queueId, summary);
+    });
+  }
+
+  cancelQueued(queueId: string): Promise<QueueCancelled> {
+    return this.request<QueueCancelled>({ schemaVersion: 1, operation: "cancel-queued", queueId },
+      "queue-cancelled", (response) => {
+        if (response.queueId !== queueId) throw new Error("broker cancelled a different queued intent");
+      });
+  }
+
+  subscribeSchedule(listener: (event: RunProgress) => void): () => void {
+    this.scheduleListeners.add(listener);
+    return () => { this.scheduleListeners.delete(listener); };
+  }
+
+  subscribeScheduledAccepted(listener: (event: ScheduledDispatchAccepted) => void): () => void {
+    this.scheduledAcceptedListeners.add(listener);
+    return () => { this.scheduledAcceptedListeners.delete(listener); };
+  }
+
   cancel(dispatchId: string): Promise<DispatchTerminal> {
     return this.request({
       schemaVersion: 1,
@@ -1230,6 +1597,7 @@ export class DispatchClient implements DispatchBroker {
   private request<T>(
     body: Record<string, unknown>,
     expected: string | string[],
+    accept?: (response: T) => void,
   ): Promise<T> {
     if (this.closed) return Promise.reject(new Error("broker is closed"));
     const requestId = randomUUID();
@@ -1242,7 +1610,8 @@ export class DispatchClient implements DispatchBroker {
           } else if (!(Array.isArray(expected) ? expected.includes(response.operation) : response.operation === expected)) {
             reject(new Error(`unexpected broker response ${response.operation}`));
           } else {
-            resolve(response as T);
+            try { accept?.(response as T); resolve(response as T); }
+            catch (error) { reject(error instanceof Error ? error : new Error("invalid broker response")); }
           }
         },
         reject,
@@ -1292,8 +1661,46 @@ export class DispatchClient implements DispatchBroker {
       this.fail("broker emitted an invalid protocol frame");
       return;
     }
+    if (response.operation === "local-observation") {
+      this.options.onLocalStreams?.(response.streams);
+      return;
+    }
+    if (response.operation === "rejected" && response.requestId === LOCAL_OBSERVATION_ID) {
+      this.fail(`${response.code}: ${response.detail}`);
+      return;
+    }
+    if (response.operation === "run-progress") {
+      this.options.onSchedule?.(response);
+      for (const listener of this.scheduleListeners) listener(response);
+      if (response.state === "resumed") this.scheduledTargets.delete(response.queueId);
+      return;
+    }
+    if (response.operation === "accepted" && response.queueId !== undefined) {
+      try {
+        const summary = this.scheduledTargets.get(response.queueId);
+        if (!summary || response.repositoryIdentity.key !== summary.repositoryIdentity.key ||
+            response.role !== summary.role || response.pullRequestId !== summary.prSnapshot.pullRequestId ||
+            response.capabilityPolicyDigest !== summary.capabilityPolicyDigest ||
+            response.prStateFingerprint !== summary.prStateFingerprint ||
+            !isAbsolute(response.eventLogPath) || !isPullRequestId(response.childProcessId)) {
+          throw new Error("scheduled acceptance did not match the confirmed target");
+        }
+        const event: ScheduledDispatchAccepted = { ...response, queueId: response.queueId };
+        this.scheduledDispatches.set(event.dispatchId, event.queueId);
+        this.options.onScheduledAccepted?.(event);
+        for (const listener of this.scheduledAcceptedListeners) listener(event);
+      } catch {
+        this.fail("broker emitted an invalid scheduled acceptance");
+        return;
+      }
+    }
     const pending = this.pending.get(response.requestId);
     if (response.operation === "completed" || response.operation === "cancelled") {
+      const queueId = this.scheduledDispatches.get(response.dispatchId);
+      if (queueId) {
+        this.scheduledTargets.delete(queueId);
+        this.scheduledDispatches.delete(response.dispatchId);
+      }
       this.options.onTerminal?.(response);
       for (const listener of this.terminalListeners) listener(response);
     }
@@ -1311,6 +1718,13 @@ export class DispatchClient implements DispatchBroker {
     this.closed = true;
     for (const pending of this.pending.values()) pending.reject(new Error(message));
     this.pending.clear();
+    this.preparedTargets.clear();
+    this.scheduledTargets.clear();
+    this.scheduledDispatches.clear();
+    this.automationRoles = null;
+    // EOF revokes pending intent and lets the broker prove owned-tree cleanup. Do not
+    // leave a protocol-failed broker accepting automatic work with a dead client.
+    this.child.stdin.end();
     this.options.onBrokerFailure?.(message);
   }
 }

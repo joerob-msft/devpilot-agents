@@ -59,6 +59,8 @@ $script:AgentHarnessSupportedModels = @(
 )
 $script:AgentHarnessDefaultModelSentinel = "copilot-cli-default"
 $script:AgentManualAuthorities = @{}
+$script:AgentLauncherWorker = $null
+$script:AgentEarlyBrokerSecret = $null
 
 function Get-AgentSupportedModels {
     return , @($script:AgentHarnessSupportedModels)
@@ -82,7 +84,13 @@ function Get-AgentDefaultModelSentinel {
 function Get-AgentHarnessCapabilityDescriptor {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        # issue #114: projects the SAME descriptor under the launcher's terminal preview-only
+        # ceiling. Nothing new is declared here -- the preview projection is derived purely from
+        # the role's own operational tiers and its single delegable capability, so a preview
+        # launch can never lock a name this descriptor does not already know about. Omitted (every
+        # pre-#114 caller) reproduces the previous behavior byte for byte.
+        [switch]$PreviewOnly
     )
     $operationalTiers = if ($Role -eq 'reviewer') {
         [ordered]@{
@@ -97,14 +105,70 @@ function Get-AgentHarnessCapabilityDescriptor {
     }
     $delegableDefaultOff = if ($Role -eq 'reviewer') { 'EnableApprovalVote' } else { 'EnableAutoComplete' }
     $allowedManualCapabilities = @($operationalTiers.Values | ForEach-Object { $_ } | Sort-Object -Unique)
+    # A preview launch is a terminal, non-delegable ceiling: every mutation-capable capability the
+    # role could otherwise be granted -- including the one capability delegation could ever widen --
+    # is locked for the whole life of that launch. Outside a preview launch this stays empty, which
+    # is exactly the pinned-empty value every pre-#114 caller already sees.
+    $absoluteDenies = if ($PreviewOnly) {
+        @(@($allowedManualCapabilities) + @($delegableDefaultOff) | Sort-Object -Unique)
+    }
+    else {
+        @()
+    }
     return [ordered]@{
         schemaVersion             = 1
         role                      = $Role
         operationalTiers          = $operationalTiers
         delegableDefaultOff       = $delegableDefaultOff
         allowedManualCapabilities = $allowedManualCapabilities
-        # Pinned empty in PR1: no absolute-deny source exists yet (PR2+ kill switch/policy scope).
-        absoluteDenies            = @()
+        # Empty unless the caller asked for the preview-only projection (issue #114). The broker
+        # never reads this value for enforcement: it validates and enforces the per-role
+        # absoluteDenies the trusted launcher recorded in its own broker descriptor, so a launch
+        # that was started operationally can never be silently reinterpreted as a preview launch
+        # (or the reverse) by a later harness default.
+        absoluteDenies            = $absoluteDenies
+    }
+}
+
+function Assert-AgentDashboardLaunchAuthority {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('observe', 'preview', 'operational')]
+        [string]$LaunchMode,
+
+        [Parameter()]
+        [AllowNull()]
+        [Collections.IDictionary]$BrokerDescriptor
+    )
+
+    if ($null -eq $BrokerDescriptor) { return }
+    if ($LaunchMode -eq 'observe') {
+        throw 'Observe mode cannot be combined with broker authority.'
+    }
+    if ($LaunchMode -eq 'operational') { return }
+    if (-not $BrokerDescriptor.Contains('roles') -or
+        $BrokerDescriptor.roles -isnot [Collections.IDictionary]) {
+        throw 'Preview broker authority must contain a roles object.'
+    }
+
+    foreach ($roleEntry in $BrokerDescriptor.roles.GetEnumerator()) {
+        $role = [string]$roleEntry.Key
+        if ($role -cnotin @('reviewer', 'review-handler') -or
+            $roleEntry.Value -isnot [Collections.IDictionary]) {
+            throw "Preview broker authority contains an invalid role '$role'."
+        }
+        $entry = $roleEntry.Value
+        $capabilities = @(if ($entry.Contains('capabilities')) { $entry.capabilities })
+        $absoluteDenies = @(if ($entry.Contains('absoluteDenies')) {
+                $entry.absoluteDenies | ForEach-Object { [string]$_ } | Sort-Object -Unique
+            })
+        $expectedDenies = @((Get-AgentHarnessCapabilityDescriptor -Role $role -PreviewOnly).absoluteDenies)
+        $denyDifference = @(Compare-Object -ReferenceObject $expectedDenies `
+                -DifferenceObject $absoluteDenies -CaseSensitive)
+        if ($capabilities.Count -gt 0 -or $denyDifference.Count -gt 0) {
+            throw "Preview mode requires role '$role' to have no capabilities and the complete terminal absolute-deny ceiling."
+        }
     }
 }
 
@@ -570,7 +634,15 @@ function Enter-AgentLock {
 
 function Exit-AgentLock {
     param([System.IO.FileStream]$Stream)
-    if ($Stream) { $Stream.Dispose() }
+    if ($Stream) {
+        $Stream.Dispose()
+        if ($script:AgentLauncherWorker -and
+            [object]::ReferenceEquals($Stream, $script:AgentLauncherWorker.Lease)) {
+            $script:AgentLauncherWorker.Lease = $null
+            $script:AgentLauncherWorker.State = $null
+            Invoke-AgentLauncherCheckpoint -Phase released
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -816,7 +888,8 @@ function Resolve-AgentTrustedRoot {
         [Parameter(Mandatory)][ValidateSet('durable-state', 'lease', 'watch-state', 'capability-overrides')][string]$Kind,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [string[]]$DisallowedRoots = @(),
-        [switch]$Create
+        [switch]$Create,
+        [ref]$CreatedByCaller
     )
     if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathFullyQualified($Path)) {
         throw "$Kind root must be a non-empty absolute path."
@@ -832,18 +905,27 @@ function Resolve-AgentTrustedRoot {
         }
     }
     Assert-AgentPathHasNoLinks -Path $resolved
-    $created = -not (Test-Path -LiteralPath $resolved)
-    if ($created) {
+    $createdHere = $false
+    if (-not (Test-Path -LiteralPath $resolved)) {
         if (-not $Create) { throw "$kind root '$resolved' does not exist." }
-        New-Item -ItemType Directory -Path $resolved -Force -ErrorAction Stop | Out-Null
+        try {
+            New-Item -ItemType Directory -Path $resolved -ErrorAction Stop | Out-Null
+            $createdHere = $true
+        }
+        catch {
+            # Another process may have won the create race. Treat that root as pre-existing so
+            # this caller can validate and use it but can never claim it for rollback.
+            if (-not (Test-Path -LiteralPath $resolved -PathType Container)) { throw }
+        }
     }
+    if ($CreatedByCaller) { $CreatedByCaller.Value = $createdHere }
     $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
     if (-not $item.PSIsContainer) { throw "$kind root '$resolved' is not a directory." }
     Assert-AgentPathHasNoLinks -Path $resolved
 
     if ($IsWindows) {
         $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-        if ($created) {
+        if ($createdHere) {
             $acl = [Security.AccessControl.DirectorySecurity]::new()
             $acl.SetOwner($currentSid)
             $acl.SetAccessRuleProtection($true, $false)
@@ -868,7 +950,7 @@ function Resolve-AgentTrustedRoot {
             [IO.UnixFileMode]::GroupExecute -bor [IO.UnixFileMode]::OtherRead -bor
             [IO.UnixFileMode]::OtherWrite -bor [IO.UnixFileMode]::OtherExecute
         if (($mode -band $unsafe) -ne 0) {
-            if (-not $created) { throw "$kind root '$resolved' grants group or other access." }
+            if (-not $createdHere) { throw "$kind root '$resolved' grants group or other access." }
             [IO.File]::SetUnixFileMode($resolved,
                 [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
         }
@@ -941,6 +1023,10 @@ function Enter-AgentWorkLease {
     )
     $executionKey = Get-AgentExecutionKey -RepositoryIdentity $RepositoryIdentity -PullRequestId $PullRequestId -Role $Role
     $keyHash = Get-AgentSha256 -Text $executionKey
+    if ($script:AgentLauncherWorker) {
+        Invoke-AgentLauncherCheckpoint -Phase admission -RepositoryKey (Get-AgentRepositoryIdentityKey $RepositoryIdentity) `
+            -PullRequestId $PullRequestId -Role $Role
+    }
     if ($script:AgentManualAuthorities.ContainsKey($executionKey)) {
         return @{
             Acquired = $true; Reason = ''; Stream = $null
@@ -952,6 +1038,10 @@ function Enter-AgentWorkLease {
         -ContentionReason lease-contended -TimeoutMilliseconds $TimeoutMilliseconds `
         -CancellationToken $CancellationToken -Metadata @{ keyHash = $keyHash; role = $Role }
     $result['KeyHash'] = $keyHash
+    if ($script:AgentLauncherWorker) {
+        if ($result.Acquired) { $script:AgentLauncherWorker.Lease = $result.Stream }
+        else { Invoke-AgentLauncherCheckpoint -Phase released }
+    }
     return $result
 }
 
@@ -994,15 +1084,148 @@ function Enter-AgentDurableStateLock {
     if (-not (Test-Path -LiteralPath $Context.RoleRoot)) {
         throw "Durable role root '$($Context.RoleRoot)' does not exist."
     }
+    if ($script:AgentLauncherWorker -and $script:AgentLauncherWorker.Lease -and
+        ($Context.RepositoryKey -cne $script:AgentLauncherWorker.RepositoryKey -or
+         $Context.Role -cne $script:AgentLauncherWorker.Manifest.role)) {
+        throw '[launcher-control-invalid] Durable authority does not match the admitted work lease.'
+    }
     $preacquired = @($script:AgentManualAuthorities.Values | Where-Object {
             $_.StateLock.Path -ceq $Context.LockPath
         } | Select-Object -First 1)
     if ($preacquired.Count -gt 0) {
         return @{ Acquired = $true; Reason = ''; Stream = $null; Path = $Context.LockPath; Preacquired = $true }
     }
-    return Enter-AgentExclusiveFile -Path $Context.LockPath -ContentionReason state-contended `
+    $result = Enter-AgentExclusiveFile -Path $Context.LockPath -ContentionReason state-contended `
         -TimeoutMilliseconds $TimeoutMilliseconds -CancellationToken $CancellationToken `
         -Metadata @{ repositoryKeyHash = $Context.RepositoryKeyHash; role = $Context.Role }
+    if ($script:AgentLauncherWorker -and $script:AgentLauncherWorker.Lease -and $result.Acquired) {
+        $script:AgentLauncherWorker.State = $result.Stream
+        try { Invoke-AgentLauncherCheckpoint -Phase acquired }
+        catch { $result.Stream.Dispose(); throw }
+    }
+    return $result
+}
+
+function Initialize-AgentLauncherWorker {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$ManifestPath)
+    if (-not $ManifestPath) { return }
+    Assert-AgentManualDispatchEarlyContext -ManifestPath $ManifestPath
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 15
+    if ($manifest.schemaVersion -ne 1 -or $manifest.kind -cne 'launcher-worker' -or
+        $manifest.workerId -cnotmatch '^[0-9a-f-]{36}$' -or $manifest.startupPipe -cnotmatch '^[A-Za-z0-9-]{1,128}$') {
+        throw '[launcher-control-invalid] Invalid worker manifest.'
+    }
+    [void](Assert-AgentTrustedFile -Path $ManifestPath -AllowedRoot $manifest.runtimeRoot -Private)
+    $secret = Receive-AgentBrokerAttestationSecret
+    $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', $manifest.startupPipe, [IO.Pipes.PipeDirection]::InOut,
+        [IO.Pipes.PipeOptions]::Asynchronous)
+    try {
+        $pipe.Connect(20000)
+        $script:AgentLauncherWorker = @{
+            Manifest = $manifest; Secret = $secret; Pipe = $pipe; Sequence = 0
+            Reader = [IO.StreamReader]::new($pipe, [Text.UTF8Encoding]::new($false, $true), $false, 1024, $true)
+            Writer = [IO.StreamWriter]::new($pipe, [Text.UTF8Encoding]::new($false), 1024, $true)
+            Lease = $null; State = $null; RepositoryKey = ''; PullRequestId = 0; WorkId = ''
+            WakeCurrentWait = $false
+        }
+        $script:AgentLauncherWorker.Writer.AutoFlush = $true
+        Invoke-AgentLauncherCheckpoint -Phase ready
+    }
+    catch {
+        $pipe.Dispose()
+        [Array]::Clear($secret, 0, $secret.Length)
+        $script:AgentLauncherWorker = $null
+        throw
+    }
+}
+
+function Invoke-AgentLauncherCheckpoint {
+    param(
+        [Parameter(Mandatory)][ValidateSet('ready', 'started', 'admission', 'acquired', 'released', 'idle', 'scanning')][string]$Phase,
+        [string]$RepositoryKey = '', [int]$PullRequestId = 0, [string]$Role = ''
+    )
+    $worker = $script:AgentLauncherWorker
+    if (-not $worker) { return }
+    if ($Phase -cin @('idle', 'scanning') -and ($worker.Lease -or $worker.State)) {
+        throw '[launcher-control-invalid] A work-authority holder cannot enter or leave an idle interval.'
+    }
+    if ($Phase -ceq 'admission') {
+        if ($Role -cne $worker.Manifest.role -or $worker.Lease) {
+            throw '[launcher-control-invalid] Worker authority transition is invalid.'
+        }
+        $worker.RepositoryKey = $RepositoryKey
+        $worker.PullRequestId = $PullRequestId
+        $worker.WorkId = [Guid]::NewGuid().ToString('D')
+    }
+    $worker.Sequence++
+    $record = [ordered]@{
+        workerId = $worker.Manifest.workerId; sequence = $worker.Sequence; phase = $Phase
+        repositoryKey = $worker.RepositoryKey; pullRequestId = $worker.PullRequestId; workId = $worker.WorkId
+    }
+    $digest = Get-AgentCanonicalDigest $record
+    $proof = Get-AgentAttestationProof -SecretBytes $worker.Secret -Nonce $worker.Manifest.nonce -Digest $digest
+    $worker.Writer.WriteLine((ConvertTo-AgentCanonicalJson @{ record = $record; proof = $proof }))
+    $read = $worker.Reader.ReadLineAsync()
+    if (-not $read.Wait(60000) -or $null -eq $read.Result -or $read.Result.Length -gt 4096) {
+        throw '[launcher-control-lost] Launcher did not acknowledge the worker checkpoint.'
+    }
+    $reply = $read.Result | ConvertFrom-Json -AsHashtable -Depth 10
+    $expected = Get-AgentAttestationProof -SecretBytes $worker.Secret -Nonce $worker.Manifest.nonce `
+        -Digest (Get-AgentCanonicalDigest $reply.record)
+    if ($reply.proof -cne $expected -or $reply.record.workerId -cne $worker.Manifest.workerId -or
+        $reply.record.sequence -ne $worker.Sequence -or $reply.record.action -cnotin @('proceed', 'yield', 'wake') -or
+        ($reply.record.action -ceq 'wake' -and $Phase -cne 'idle')) {
+        throw '[launcher-control-invalid] Launcher checkpoint acknowledgement is invalid.'
+    }
+    if ($reply.record.action -ceq 'yield') { throw '[launcher-yielded] Automatic worker yielded its turn.' }
+    if ($reply.record.action -ceq 'wake') { $worker.WakeCurrentWait = $true }
+}
+
+function Confirm-AgentLauncherWorkerStartup {
+    Invoke-AgentLauncherCheckpoint -Phase started
+}
+
+function Test-AgentLauncherCancellationRequested {
+    $worker = $script:AgentLauncherWorker
+    if (-not $worker) { return $false }
+    $path = Join-Path $worker.Manifest.runtimeRoot 'cancel.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    [void](Assert-AgentTrustedFile -Path $path -AllowedRoot $worker.Manifest.runtimeRoot -Private)
+    $file = Read-AgentStableFile -Path $path -MaxBytes 4096
+    $cancel = [Text.Encoding]::UTF8.GetString($file.Bytes) | ConvertFrom-Json -AsHashtable -Depth 10
+    $expected = Get-AgentAttestationProof -SecretBytes $worker.Secret -Nonce $worker.Manifest.nonce `
+        -Digest (Get-AgentCanonicalDigest $cancel.record)
+    if ($cancel.proof -cne $expected -or $cancel.record.workerId -cne $worker.Manifest.workerId -or
+        $cancel.record.workId -cne $worker.WorkId -or $cancel.record.operation -cne 'cancel') {
+        throw '[launcher-control-invalid] Worker cancellation is not bound to this turn.'
+    }
+    return $true
+}
+
+function Wait-AgentLauncherInterval {
+    param([Parameter(Mandatory)][ValidateRange(0, 86400)][int]$Seconds)
+    if (-not $script:AgentLauncherWorker) { Start-Sleep -Seconds $Seconds; return }
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    $script:AgentLauncherWorker.WakeCurrentWait = $false
+    try {
+        do {
+            Invoke-AgentLauncherCheckpoint -Phase idle
+            if ($script:AgentLauncherWorker.WakeCurrentWait) { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+        # Both natural expiry and wake close this interval before any scan metadata work.
+        # A late request can therefore never leak into the next interval.
+        Invoke-AgentLauncherCheckpoint -Phase scanning
+    }
+    finally { $script:AgentLauncherWorker.WakeCurrentWait = $false }
+}
+
+function Close-AgentLauncherWorker {
+    if ($script:AgentLauncherWorker) {
+        $script:AgentLauncherWorker.Pipe.Dispose()
+        [Array]::Clear($script:AgentLauncherWorker.Secret, 0, $script:AgentLauncherWorker.Secret.Length)
+        $script:AgentLauncherWorker = $null
+    }
 }
 
 function Invoke-AgentWithWorkAuthority {
@@ -1602,7 +1825,14 @@ function Resolve-AgentCapabilityPolicyPartition {
         # capability that is not currently an active mandatory deny on THIS ceiling, or that is
         # already an active capability -- both would mean the caller is trying to widen something
         # this primitive was never told is eligible, which must never happen for a correct caller.
-        [AllowNull()][string]$GrantCapability
+        [AllowNull()][string]$GrantCapability,
+        # issue #114: the launch-wide, terminal, non-delegable denies recorded by the trusted
+        # launcher in its broker descriptor (a preview-only launch names every mutation-capable
+        # capability here). Applied AFTER persisted narrowing and BEFORE any grant, and unlike a
+        # persisted narrowing it is not merely monotonic bookkeeping: a grant naming an absolutely
+        # denied capability fails closed rather than widening it back. Omitted (every pre-#114
+        # caller) reproduces the previous behavior exactly.
+        [AllowNull()][string[]]$AbsoluteDenies
     )
     $capabilities = [Collections.Generic.List[string]]::new([string[]]@($RoleDescriptor.capabilities | Sort-Object -Unique))
     $mandatoryDenies = [Collections.Generic.List[string]]::new([string[]]@($RoleDescriptor.mandatoryDenies | Sort-Object -Unique))
@@ -1612,7 +1842,15 @@ function Resolve-AgentCapabilityPolicyPartition {
             if (-not $mandatoryDenies.Contains($name)) { [void]$mandatoryDenies.Add($name) }
         }
     }
+    $absolute = [Collections.Generic.List[string]]::new([string[]]@(@($AbsoluteDenies) | Where-Object { $_ } | Sort-Object -Unique))
+    foreach ($name in @($absolute)) {
+        if ($capabilities.Contains($name)) { [void]$capabilities.Remove($name) }
+        if (-not $mandatoryDenies.Contains($name)) { [void]$mandatoryDenies.Add($name) }
+    }
     if ($GrantCapability) {
+        if ($absolute.Contains($GrantCapability)) {
+            throw '[grant-invalid] GrantCapability is absolutely denied for this launch and can never be widened.'
+        }
         if ($capabilities.Contains($GrantCapability) -or -not $mandatoryDenies.Contains($GrantCapability)) {
             throw '[grant-invalid] GrantCapability is not eligible to be widened from the current capability ceiling.'
         }
@@ -2034,6 +2272,11 @@ function Receive-AgentBrokerAttestationSecret {
     #>
     [CmdletBinding()]
     param([ValidateRange(100, 30000)][int]$TimeoutMilliseconds = 5000)
+    if ($script:AgentEarlyBrokerSecret) {
+        $secret = $script:AgentEarlyBrokerSecret
+        $script:AgentEarlyBrokerSecret = $null
+        return $secret
+    }
     $handle = $env:DEVPILOT_BROKER_ATTESTATION_HANDLE
     if ([string]::IsNullOrEmpty($handle)) {
         throw '[broker-attestation-missing] This process was not launched with a broker attestation handle; manual dispatch requires launch by the trusted broker.'
@@ -2070,7 +2313,7 @@ function Receive-AgentBrokerAttestationSecret {
 
 function Assert-AgentManualDispatchEarlyContext {
     <#
-        Early, side-effect-free guard (issue #105 PR4 CRITICAL-2 hardening): called by each agent
+        Early, provider-free guard and containment barrier: called by each agent
         script immediately after its own parameter validation, BEFORE any provider/network setup.
         A manual-dispatch manifest path alone -- even one naming a real, existing, well-formed file
         -- is never sufficient evidence of genuine broker issuance; only the broker's own direct
@@ -2100,6 +2343,9 @@ function Assert-AgentManualDispatchEarlyContext {
     $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 |
         ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
     Assert-AgentBrokerProcessAnchor -Manifest $manifest
+    # The issuer writes these bytes only AFTER installing containment. Keep them in this
+    # process until the later policy/readiness attestation consumes them exactly once.
+    $script:AgentEarlyBrokerSecret = Receive-AgentBrokerAttestationSecret
 }
 
 function ConvertFrom-AgentProcStatPpid {
@@ -2533,14 +2779,21 @@ function Assert-AgentDashboardCommandLineShape {
         search over the parent's command line: it requires the EXACT positions Start-
         DevPilotDashboard.ps1 itself always emits -- a bare locked Bun executable; the fixed
         literal token '--conditions=browser'; the one canonical dist/src/index.js entry point;
-        zero or more well-formed --state-dir/--event-log pairs (their VALUES carry no trust
-        weight -- only their shape is checked); then exactly the --broker-executable/
+        exactly one '--launch-mode' pair whose value is one of the three launch modes the
+        launcher can emit (issue #114); zero or more well-formed --state-dir/--event-log pairs
+        (their VALUES carry no trust weight -- only their shape is checked); then exactly the --broker-executable/
         --broker-script/--broker-descriptor triple, in that fixed order, whose three values must
         equal THIS broker process's own live executable path, its own running script path, and
         its own -DescriptorPath argument -- never anything the parent merely claims. Any
         deviation (a decoy entry script, an inert extra argument, a -e/eval option, a duplicate or
         reordered flag, or trailing extra tokens) is a single generic failure, so a forger's
         near-miss and an ordinary unrelated launcher are rejected identically.
+
+        The launch mode's VALUE carries no trust weight either, exactly like a --state-dir value:
+        the capability ceiling of a launch is enforced from the trusted broker descriptor's own
+        per-role absoluteDenies, never from anything on the Dashboard command line. Only its
+        presence, position, cardinality, and membership in the fixed mode set are checked here --
+        which is what keeps this a structural, fail-closed argv shape rather than a policy input.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$ExecutablePath,
@@ -2563,6 +2816,14 @@ function Assert-AgentDashboardCommandLineShape {
     if ($i -ge $argv.Count -or $argv[$i] -cne '--conditions=browser') { throw $failure }
     $i++
     if ($i -ge $argv.Count -or -not (Test-AgentDashboardPathEquals $argv[$i] $ExpectedEntryScript)) { throw $failure }
+    $i++
+    # issue #114: exactly one --launch-mode pair, in this fixed position. Cardinality is
+    # structural rather than counted: the state-dir/event-log loop below accepts only its own two
+    # flags and every later position is an exact literal, so a second (or misplaced) --launch-mode
+    # can never be consumed anywhere else in this shape.
+    if ($i -ge $argv.Count -or $argv[$i] -cne '--launch-mode') { throw $failure }
+    $i++
+    if ($i -ge $argv.Count -or $argv[$i] -cnotin @('observe', 'preview', 'operational')) { throw $failure }
     $i++
     while ($i -lt $argv.Count -and $argv[$i] -cin @('--state-dir', '--event-log')) {
         $i += 2
@@ -3550,6 +3811,10 @@ function Get-AgentCancellationOutcome {
 }
 
 function Exit-AgentManualDispatchAuthority {
+    if ($script:AgentEarlyBrokerSecret) {
+        [Array]::Clear($script:AgentEarlyBrokerSecret, 0, $script:AgentEarlyBrokerSecret.Length)
+        $script:AgentEarlyBrokerSecret = $null
+    }
     foreach ($key in @($script:AgentManualAuthorities.Keys)) {
         $authority = $script:AgentManualAuthorities[$key]
         Exit-AgentLock -Stream $authority.StateLock.Stream
@@ -4379,7 +4644,8 @@ function New-AgentRedirectedProcess {
         # handing this specific child an inherited anonymous-pipe attestation handle it cannot
         # obtain any other way. Never used for anything a caller could equivalently pass on the
         # command line.
-        [hashtable]$AdditionalEnvironmentVariables = @{}
+        [hashtable]$AdditionalEnvironmentVariables = @{},
+        [switch]$LiveStandardOutput
     )
     $absolute = [IO.Path]::GetFullPath($FilePath)
     if (-not [IO.Path]::IsPathFullyQualified($absolute) -or -not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
@@ -4455,13 +4721,142 @@ namespace DevPilot.Process {
 }
 '@
     }
+    # Add-Type survives Import-Module -Force. Live capture must also work when a prior
+    # launcher already registered the original two-argument BoundedDrain in this shell.
+    if ($LiveStandardOutput -and -not ('DevPilot.Process.LiveStdoutDrainV1' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+namespace DevPilot.Process {
+  public sealed class LiveStdoutCaptureV1 : IDisposable {
+    private readonly string path;
+    private readonly int maximumBytes;
+    private readonly StringBuilder line = new StringBuilder();
+    private FileStream stream;
+    public LiveStdoutCaptureV1(string path, int maximumBytes) {
+      if (maximumBytes < 1024) throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+      this.path = path;
+      this.maximumBytes = maximumBytes;
+      if (File.Exists(path + ".1") || Directory.Exists(path + ".1"))
+        throw new IOException("Live capture rotation already exists.");
+      stream = OpenNew();
+    }
+    private FileStream OpenNew() {
+      var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read | FileShare.Delete);
+      try {
+        if (!OperatingSystem.IsWindows())
+          File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        return file;
+      } catch {
+        file.Dispose();
+        throw;
+      }
+    }
+    public void Append(char[] buffer, int count) {
+      for (int i = 0; i < count; i++) {
+        if (line.Length >= Math.Min(256 * 1024, maximumBytes / 4))
+          throw new InvalidDataException("Live stdout frame exceeds the capture bound.");
+        line.Append(buffer[i]);
+        if (buffer[i] == '\n') WriteFrame();
+      }
+    }
+    private void WriteFrame() {
+      var bytes = Encoding.UTF8.GetBytes(line.ToString());
+      // Readers see complete frames; rotation renames rather than truncating an open file.
+      if (stream.Length + bytes.Length > maximumBytes) {
+        stream.Dispose();
+        File.Move(path, path + ".1", true);
+        stream = OpenNew();
+      }
+      stream.Write(bytes, 0, bytes.Length);
+      stream.Flush();
+      line.Clear();
+    }
+    public void Finish() {
+      if (line.Length > 0) WriteFrame(); // Preserve an actual unterminated suffix, without inventing a newline.
+    }
+    public void Dispose() { stream.Dispose(); }
+  }
+  public static class LiveStdoutDrainV1 {
+    public static async Task<string> ReadTailAsync(TextReader reader, int maximumCharacters, LiveStdoutCaptureV1 capture) {
+      var tail = new StringBuilder();
+      var buffer = new char[8192];
+      Exception captureFailure = null;
+      try {
+        int count;
+        while ((count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
+          tail.Append(buffer, 0, count);
+          if (tail.Length > maximumCharacters) tail.Remove(0, tail.Length - maximumCharacters);
+          if (capture != null && captureFailure == null) {
+            try { capture.Append(buffer, count); }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException || error is InvalidDataException) {
+              captureFailure = error;
+              // Do not echo child content, and continue draining so an I/O failure cannot block the child.
+              Console.Error.WriteLine("DevPilot live stdout capture failed (" + error.GetType().Name + ").");
+            }
+          }
+        }
+        if (capture != null && captureFailure == null) {
+          try { capture.Finish(); }
+          catch (Exception error) when (error is IOException || error is UnauthorizedAccessException) {
+            captureFailure = error;
+            Console.Error.WriteLine("DevPilot live stdout capture failed (" + error.GetType().Name + ").");
+          }
+        }
+      } finally {
+        if (capture != null) {
+          try { capture.Dispose(); }
+          catch (Exception error) when (error is IOException || error is UnauthorizedAccessException) {
+            captureFailure = error;
+            Console.Error.WriteLine("DevPilot live stdout capture failed (" + error.GetType().Name + ").");
+          }
+        }
+      }
+      if (captureFailure != null) throw new IOException("Live stdout capture failed.", captureFailure);
+      return tail.ToString();
+    }
+  }
+}
+'@
+    }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $psi
-    if (-not $process.Start()) { throw "Failed to start '$absolute'." }
+    $capture = $null
+    if ($LiveStandardOutput) {
+        $capturePath = [IO.Path]::GetFullPath($StandardOutputPath)
+        $captureParent = Split-Path -Parent $capturePath
+        Assert-AgentPathHasNoLinks -Path $capturePath
+        if ($IsWindows) { Assert-AgentWindowsAcl -Path $captureParent -Private }
+        else {
+            Assert-AgentUnixOwner -Path $captureParent
+            if (([IO.File]::GetUnixFileMode($captureParent) -band
+                ([IO.UnixFileMode]::GroupRead -bor [IO.UnixFileMode]::GroupWrite -bor [IO.UnixFileMode]::GroupExecute -bor
+                 [IO.UnixFileMode]::OtherRead -bor [IO.UnixFileMode]::OtherWrite -bor [IO.UnixFileMode]::OtherExecute)) -ne 0) {
+                throw 'Live stdout capture requires an owner-private parent directory.'
+            }
+        }
+        $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        $errorPath = [IO.Path]::GetFullPath($StandardErrorPath)
+        if ($errorPath.Equals($capturePath, $comparison) -or $errorPath.Equals($capturePath + '.1', $comparison)) {
+            throw 'Live stdout capture and stderr paths must be distinct.'
+        }
+        $capture = [DevPilot.Process.LiveStdoutCaptureV1]::new($capturePath, 10MB)
+    }
+    try {
+        if (-not $process.Start()) { throw "Failed to start '$absolute'." }
+    }
+    catch {
+        if ($capture) { $capture.Dispose() }
+        throw
+    }
     $process.StandardInput.Close()
-    $stdoutTask = [DevPilot.Process.BoundedDrain]::ReadTailAsync($process.StandardOutput, 10MB)
+    $stdoutTask = if ($LiveStandardOutput) {
+        [DevPilot.Process.LiveStdoutDrainV1]::ReadTailAsync($process.StandardOutput, 10MB, $capture)
+    } else { [DevPilot.Process.BoundedDrain]::ReadTailAsync($process.StandardOutput, 10MB) }
     $stderrTask = [DevPilot.Process.BoundedDrain]::ReadTailAsync($process.StandardError, 10MB)
-    return @{
+    $child = @{
         Process = $process
         StdOutTask = $stdoutTask
         StdErrTask = $stderrTask
@@ -4469,6 +4864,8 @@ namespace DevPilot.Process {
         StdErrPath = [IO.Path]::GetFullPath($StandardErrorPath)
         StartedAtUtc = [DateTime]::UtcNow
     }
+    if ($LiveStandardOutput) { $child.LiveStandardOutput = $true }
+    return $child
 }
 
 function New-AgentPersistentRedirectedProcess {
@@ -4569,6 +4966,8 @@ function Complete-AgentRedirectedProcess {
         [ValidateRange(256, 65536)][int]$DiagnosticTailCharacters = 4096
     )
     $persistent = $Child.ContainsKey('PersistentRedirection') -and [bool]$Child.PersistentRedirection
+    $liveStandardOutput = $Child.ContainsKey('LiveStandardOutput') -and [bool]$Child.LiveStandardOutput
+    $captureFailed = $false
     if ($persistent) {
         $readTail = {
             param([string]$Path)
@@ -4585,9 +4984,15 @@ function Complete-AgentRedirectedProcess {
         $stdout = Get-TaskTextBeforeDeadline -Task $Child.StdOutTask -DeadlineUtc $deadline
         $stderr = Get-TaskTextBeforeDeadline -Task $Child.StdErrTask -DeadlineUtc $deadline
         foreach ($entry in @(@($Child.StdOutPath, $stdout.Text), @($Child.StdErrPath, $stderr.Text))) {
+            if ($liveStandardOutput -and $entry[0] -eq $Child.StdOutPath) { continue }
             $text = [string]$entry[1]
             if ($text.Length -gt 10MB) { $text = $text.Substring($text.Length - 10MB) }
             [IO.File]::WriteAllText([string]$entry[0], $text, [Text.UTF8Encoding]::new($false))
+        }
+        if ($liveStandardOutput -and $Child.StdOutTask.IsFaulted) {
+            $captureFailed = $true
+            # Report failure without aborting the caller's existing cleanup of other children.
+            Write-Error '[live-stdout-capture-failed] Live stdout capture failed; see launcher stderr. The capture was not overwritten.' -ErrorAction Continue
         }
     }
     $sanitizeTail = {
@@ -4602,7 +5007,7 @@ function Complete-AgentRedirectedProcess {
     $safeOutputTail = & $sanitizeTail ([string]$stdout.Text)
     $safeErrorTail = & $sanitizeTail ([string]$stderr.Text)
     return @{
-        OutputDrained = $stdout.Completed -and $stderr.Completed
+        OutputDrained = $stdout.Completed -and $stderr.Completed -and -not $captureFailed
         ExitCode = $(if ($Child.Process.HasExited) { $Child.Process.ExitCode } else { -1 })
         SafeOutputTail = $safeOutputTail
         SafeErrorTail = $safeErrorTail
@@ -6513,11 +6918,14 @@ function Set-AgentProviderPullRequestVote {
 # export list rather than add to it.
 
 Export-ModuleMember -Function @(
+    'Initialize-AgentLauncherWorker', 'Test-AgentLauncherCancellationRequested',
+    'Wait-AgentLauncherInterval', 'Close-AgentLauncherWorker', 'Confirm-AgentLauncherWorkerStartup',
     "Get-DevPilotAgentPath",
     "Resolve-AgentRepositoryRoot",
     "Get-AgentSupportedModels",
     "Get-AgentSessionIsolationEnvVars",
     "Get-AgentHarnessCapabilityDescriptor",
+    "Assert-AgentDashboardLaunchAuthority",
     "Get-AgentWorkIqTargetUrl",
     "Get-AgentMissingMcpServers",
     "Get-AgentLaunchFailureReason",

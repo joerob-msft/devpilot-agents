@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
-import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid";
+import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { useKeyboard, usePaste, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { decideLayout, type LayoutDecision } from "./layout.js";
 import {
@@ -14,12 +14,20 @@ import {
   shortId,
   statusColor,
 } from "./format.js";
-import { liveElapsedMilliseconds, OperationsReducer, totalElapsedMilliseconds } from "./reducer.js";
+import { isLiveInstance, liveElapsedMilliseconds, OperationsReducer, totalElapsedMilliseconds } from "./reducer.js";
+import type { DismissalStorage } from "./dismissals.js";
 import type { AgentRole, BlockedWarning, Completion, InstanceState, ViewFilter } from "./domain.js";
+import { boundedText } from "./domain.js";
 import { PullRequestHistoryProjection, type PullRequestHistoryEntry } from "./history.js";
 import type { EventTailer } from "./tailer.js";
+import { manualProgress, type ManualProgress } from "./manual-progress.js";
+import { SimpleView, SimpleManualPanel, simpleInstanceRow, simpleHistoryRow, selectionWindow, automationStatusText, scanNowResultText } from "./simple-view.js";
 import {
+  AUTOMATIC_FAILURE_CODES,
   BrokerRejectionError,
+  assertManualTarget,
+  isPullRequestId,
+  type AutomationStatus,
   type CapabilityNarrowingPreview,
   type CapabilityProfile,
   type CapabilitySummary,
@@ -28,6 +36,12 @@ import {
   type DispatchTerminal,
   type NarrowingAction,
   type NarrowingScope,
+  type ResolvedManualTarget,
+  type RunPrepared,
+  type RunQueued,
+  type RunProgress,
+  type RunScheduleMode,
+  type ScheduledDispatchAccepted,
   NARROWING_SCOPES,
   type WideningCancelled,
   type WideningMinted,
@@ -37,10 +51,19 @@ import {
 
 export const BRAND_PLANE = ["       __|__       ", "--o--o--(_)--o--o--"] as const;
 export const HELP_LEGEND = [
-  "Live = active work; Current session = Live plus newest retained per group.",
-  "History = stopped/completed retained runs; Stale = heartbeat overdue.",
-  "Forget never deletes agent state or event logs; unavailable actions report status.",
+  "Live only = recent heartbeats, including waiting agents; l toggles Current.",
+  "History includes observed exits; Stale alone never proves process exit.",
+  "Delete remembers dismissal; new heartbeats restore it. Logs/state are untouched.",
 ] as const;
+const HARD_SCHEDULE_FAILURES = new Set<string>([
+  "termination-failed", "automatic-policy-changed", ...AUTOMATIC_FAILURE_CODES,
+]);
+const REPREVIEW_SCHEDULE_BLOCKS = new Set<string>([
+  "schedule-repreview-required", "schedule-expired", "schedule-stale", "schedule-interrupted",
+  "policy-changed", "source-changed", "pr-state-changed", "repository-mismatch",
+]);
+const AUTOMATION_POLL_MS = 5_000;
+const AUTOMATION_STATUS_RETRIES = 3;
 
 const COLORS = {
   bg: "#08090a",
@@ -60,18 +83,33 @@ const COLORS = {
 type Overlay = "none" | "events" | "palette" | "help" | "settings";
 type RoleFilter = "all" | AgentRole;
 type PaneFocus = "rail" | "detail" | "timeline" | "inspector";
+export type LaunchMode = "observe" | "preview" | "operational";
 
 export interface AppProps {
   reducer: OperationsReducer;
   history?: PullRequestHistoryProjection;
   tailer: EventTailer;
+  launchMode?: LaunchMode;
   openUrl?: (url: string) => void | Promise<void>;
   broker?: DispatchBroker | undefined;
   brokerFailure?: () => string;
   shutdownBroker?: () => Promise<void>;
+  dismissalStorage?: DismissalStorage;
+  dismissalLoadError?: string;
 }
 
-type ManualMode = "closed" | "prompt" | "describing" | "confirm" | "confirm-final" | "dispatching" | "active" | "terminal";
+export type ManualMode = "closed" | "target" | "resolving" | "prompt" | "describing" | "confirm" | "confirm-final" | "dispatching" | "active" | "cancelling" | "terminal"
+  | "busy-preparing" | "busy-choice" | "schedule-confirming" | "scheduled" | "schedule-cancelling" | "schedule-unknown"
+  | "schedule-waiting-release" | "schedule-ended" | "queue-cancelled";
+
+const MAX_PR_INPUT = 64;
+const PR_INPUT_HELP = "Enter ASCII digits: PR ID must be in 1..2147483647.";
+
+export function parseManualPullRequestId(value: string): number | null {
+  if (value.length > MAX_PR_INPUT || !/^[0-9]+$/.test(value)) return null;
+  const number = Number(value);
+  return isPullRequestId(number) ? number : null;
+}
 
 export function normalizeOperatorPrompt(value: string): string {
   return value.replace(/\r\n?/g, "\n");
@@ -113,7 +151,7 @@ export function selectableCount(
   return selectedView === "history" && hasHistory ? historyLength : instanceLength;
 }
 
-export function dispatchResultDetail(code: string, detail = ""): string {
+export function dispatchResultDetail(code: string, detail = "", role?: AgentRole): string {
   const safe = line(detail.replace(/[\u0000-\u001f\u007f-\u009f]/g, " "), 160);
   const labels: Record<string, string> = {
     "source-changed": "Source changed after confirmation; describe the PR again.",
@@ -121,7 +159,7 @@ export function dispatchResultDetail(code: string, detail = ""): string {
     "pr-state-changed": "Bound PR state changed; describe the PR again.",
     "delivery-pending": "Reviewer delivery is pending; resolve or promote it before redispatch.",
     "already-running": safe.includes("state-contended")
-      ? "Already running: repository role state is busy."
+      ? `Another ${role === "reviewer" ? "Reviewer" : role === "review-handler" ? "Review Handler" : "agent"} is using this repository's state; wait for it to finish, then retry.`
       : "Already running: this PR and role hold the work lease.",
     "launch-failed": "Broker could not safely launch the child.",
     "role-not-allowed": "This manual role is not enabled by the trusted launcher.",
@@ -148,27 +186,68 @@ export function dispatchResultDetail(code: string, detail = ""): string {
 
 function ManualDispatchPanel(props: {
   mode: ManualMode;
-  entry: PullRequestHistoryEntry;
+  target: ResolvedManualTarget | null;
+  targetInput: string;
   role: AgentRole;
   prompt: string;
   summary: CapabilitySummary | null;
   accepted: DispatchAccepted | null;
   status: string;
+  progress: ManualProgress | null;
+  startUncertain: boolean;
   wideningStage: "closed" | "describing" | "preview" | "confirming" | "summary" | "minting" | "cancelling";
   wideningPreview: WideningPreview | WideningSummary | null;
   wideningStatus: string;
   mintedWideningGeneration: number | null;
+  wideningLocked: boolean;
 }) {
   const promptPreview = () => line(props.prompt.replace(/\n/g, " / ") || "(none)", 90);
-  const identity = () => props.summary?.repositoryIdentity ?? props.entry.repositoryIdentity;
-  const pullRequestId = () => props.summary?.prSnapshot.pullRequestId ?? props.entry.pullRequestId;
-  const title = () => props.summary?.prSnapshot.title ?? props.entry.title;
-  const author = () => props.summary?.prSnapshot.author ?? props.entry.author;
+  const capabilityLabel = (name: string) => ({
+    EnableFindingComments: "finding comments",
+    EnableSummaryComment: "summary comments",
+    EnableThreadReplies: "thread replies",
+    EnableCodeChanges: "code changes",
+    EnablePush: "code pushes",
+    EnableApprovalVote: "approval vote",
+    EnableAutoComplete: "auto-complete",
+    LocalValidation: "local validation",
+  }[name] ?? name);
   return (
-    <Panel title="MANUAL DISPATCH" flexGrow={1} borderColor={COLORS.warning}>
+    <Panel title="START AGENT BY PR ID" flexGrow={1} borderColor={COLORS.warning}>
       <box flexDirection="column" flexGrow={1}>
-        <text height={1} fg={COLORS.accent}>{identity().slug} / PR #{pullRequestId()}</text>
-        <text height={1} fg={COLORS.text}>{line(title() || "(untitled)", 100)} | {line(author() || "unknown author", 60)}</text>
+        <Show when={props.mode === "confirm" || props.mode === "confirm-final"}>
+          <text height={1} fg={COLORS.warning}>NOT STARTED / READY TO START</text>
+        </Show>
+        <Show when={props.mode === "dispatching"}>
+          <text height={1} fg={COLORS.warning}>{props.startUncertain ? "START STATUS UNKNOWN" : "STARTING... waiting for broker confirmation"}</text>
+        </Show>
+        <Show when={props.progress}>
+          {(progress: () => ManualProgress) => (
+            <text height={1} fg={progress().attention ? COLORS.warning : COLORS.ok}>{progress().headline}</text>
+          )}
+        </Show>
+        <Show when={props.mode === "terminal" && !props.accepted}>
+          <text height={1} fg={COLORS.error}>NOT STARTED / REQUEST FAILED</text>
+        </Show>
+        <Show when={props.mode === "target" || props.mode === "resolving"}>
+        <text height={1} fg={COLORS.muted}>Uses the selected agent's configured repository.</text>
+        </Show>
+        <Show when={props.mode === "target" || props.mode === "resolving"}>
+          <text height={1} fg={COLORS.accent}>PR ID: {props.targetInput || "(blank)"}</text>
+          <text height={1} fg={COLORS.text}>Agent: {props.role === "reviewer" ? "Reviewer" : "Review Handler"}</text>
+          <text height={1} fg={COLORS.muted}>Tab agent | Enter preview | Ctrl+U clear | Esc cancel</text>
+          <Show when={props.mode === "resolving"}>
+            <text height={1} fg={COLORS.warning}>Resolving configured repository and PR... | Esc cancel</text>
+          </Show>
+        </Show>
+        <Show when={props.target}>
+          {(target: () => ResolvedManualTarget) => (
+            <>
+              <text height={1} fg={COLORS.accent}>{target().repositoryIdentity.slug} / PR #{target().prSnapshot.pullRequestId}</text>
+              <text height={1} fg={COLORS.text}>{line(target().prSnapshot.title || "(untitled)", 100)} | {line(target().prSnapshot.author || "unknown author", 60)}</text>
+            </>
+          )}
+        </Show>
         <text height={1} fg={COLORS.text}>
           Role: {roleLabel(props.role)} |{" "}
           {
@@ -183,39 +262,48 @@ function ManualDispatchPanel(props: {
           }
         </text>
         <Show when={props.mode === "prompt"}>
-          <text height={1} fg={COLORS.warning}>Operator context is untrusted data; 512 Unicode scalars maximum.</text>
+          <text height={1} fg={COLORS.text}>Optional instructions ({promptScalarCount(props.prompt)}/512 characters)</text>
           <text height={1} fg={COLORS.text}>{promptPreview()}</text>
-          <text height={1} fg={COLORS.muted}>{promptScalarCount(props.prompt)}/512 | Enter newline | Ctrl+D describe | Esc close</text>
+          <text height={1} fg={COLORS.accent}>Enter: return to preview | Shift+Enter: newline | Esc: cancel</text>
         </Show>
-        <Show when={props.mode === "describing" || props.mode === "dispatching"}>
-          <text height={1} fg={COLORS.warning}>{props.mode === "describing" ? "Fetching fresh provider and wrapper policy..." : "Starting contained broker-owned child..."}</text>
+        <Show when={props.mode === "describing"}>
+          <text height={1} fg={COLORS.warning}>Preparing preview... | Esc: cancel</text>
         </Show>
-        <Show when={props.summary}>
+        <Show when={!props.accepted && props.mode !== "prompt" && props.summary}>
           {(summary: () => CapabilitySummary) => (
             <>
-              <text height={1} fg={COLORS.text}>Source: {shortCommit(summary().prSnapshot.sourceCommit)} | {summary().prSnapshot.sourceRef} -&gt; {summary().prSnapshot.targetRef}</text>
-              <text height={1} fg={COLORS.ok}>Policy digest: {shortCommit(summary().capabilityPolicyDigest)} confirmed</text>
-              <text height={1} fg={COLORS.ok}>PR-state fingerprint: {shortCommit(summary().prStateFingerprint)} confirmed</text>
-              <text height={1} fg={COLORS.text}>Enabled: {line(summary().capabilities.join(", ") || "none", 100)}</text>
-              <text height={1} fg={COLORS.warning}>Disabled high-impact: {line(summary().mandatoryDenies.join(", ") || "none reported", 100)}</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>Source: {shortCommit(summary().prSnapshot.sourceCommit)} | {summary().prSnapshot.sourceRef} -&gt; {summary().prSnapshot.targetRef}</text>
+              <Show when={summary().capabilities.length === 0}>
+                <text height={1} fg={COLORS.ok}>No PR comments or code pushes</text>
+              </Show>
+              <Show when={summary().capabilities.length > 0}>
+                <text flexShrink={0} wrapMode="word" fg={COLORS.text}>Allowed: {summary().capabilities.map(capabilityLabel).join(", ")}</text>
+              </Show>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.muted}>Not allowed: {summary().mandatoryDenies.map(capabilityLabel).join(", ") || "none reported"}</text>
               <For each={summary().dynamicConstraints}>
                 {(constraint) => <text height={1} fg={COLORS.warning}>Constraint: {line(constraint, 100)}</text>}
               </For>
+              <Show when={props.prompt}>
+                <text height={1} fg={COLORS.muted}>Instructions: {promptPreview()}</text>
+              </Show>
               <Show when={props.mode === "confirm"}>
                 <Show when={props.wideningStage === "closed"}>
                   <Show when={props.mintedWideningGeneration !== null}>
-                    <text height={1} fg={COLORS.ok}>Widening grant minted and active for this draft; continue with d then y to dispatch, or Esc to close and relinquish it.</text>
+                    <text height={1} fg={COLORS.ok}>Widening grant minted and active for this draft.</text>
                   </Show>
-                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 0}>
+                  <Show when={props.mintedWideningGeneration === null && props.wideningLocked}>
+                    <text height={1} fg={COLORS.error}>Widening locked by PreviewOnly.</text>
+                  </Show>
+                  <Show when={props.mintedWideningGeneration === null && !props.wideningLocked && summary().delegableAvailable.length === 0}>
                     <text height={1} fg={COLORS.muted}>No delegated capabilities available for this role.</text>
                   </Show>
-                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 1 && summary().killSwitchActive}>
+                  <Show when={props.mintedWideningGeneration === null && !props.wideningLocked && summary().delegableAvailable.length === 1 && summary().killSwitchActive}>
                     <text height={1} fg={COLORS.error}>Widening unavailable while the kill switch is active.</text>
                   </Show>
-                  <Show when={props.mintedWideningGeneration === null && summary().delegableAvailable.length === 1 && !summary().killSwitchActive}>
+                  <Show when={props.mintedWideningGeneration === null && !props.wideningLocked && summary().delegableAvailable.length === 1 && !summary().killSwitchActive}>
                     <text height={1} fg={COLORS.muted}>Press w to request {summary().delegableAvailable[0]} widening (draft-bound, single-use).</text>
                   </Show>
-                  <text height={1} fg={COLORS.warning}>First confirmation: press d to review the final execution gate; Esc cancels.</text>
+                  <text height={1} fg={COLORS.accent}>Enter: START | p: optional instructions | Esc: cancel</text>
                 </Show>
                 <Show when={props.wideningStage === "describing"}>
                   <text height={1} fg={COLORS.warning}>Requesting capability widening description...</text>
@@ -267,7 +355,7 @@ function ManualDispatchPanel(props: {
                 </Show>
               </Show>
               <Show when={props.mode === "confirm-final"}>
-                <text height={1} fg={COLORS.error}>FINAL CONFIRMATION: press y to dispatch this exact snapshot; Esc cancels.</text>
+                <text height={1} fg={COLORS.accent}>Enter: START | y: start | Esc: cancel</text>
               </Show>
             </>
           )}
@@ -275,14 +363,25 @@ function ManualDispatchPanel(props: {
         <Show when={props.accepted}>
           {(accepted: () => DispatchAccepted) => (
             <>
-              <text height={1} fg={COLORS.ok}>Accepted dispatch {shortId(accepted().dispatchId)} | child PID {accepted().childProcessId}</text>
-              <text height={1} fg={COLORS.text}>Correlated v3 events: {line(accepted().eventLogPath, 100)}</text>
-              <text height={1} fg={COLORS.warning}>Press c to cancel only this broker-owned manual child.</text>
+              <text height={1} fg={COLORS.text}>Child PID {accepted().childProcessId} | elapsed {props.progress?.elapsed ?? "0s"}</text>
+              <text height={2} fg={COLORS.text}>{props.progress?.detail}</text>
+              <Show when={props.progress?.latest}>
+                <text height={3} fg={COLORS.muted}>{props.progress?.latest}</text>
+              </Show>
+              <Show when={props.mode === "active"}>
+                <text height={1} fg={COLORS.accent}>c: cancel this run | q: quit and stop</text>
+              </Show>
+              <Show when={props.mode === "cancelling"}>
+                <text height={1} fg={COLORS.warning}>Cancellation pending | q: quit and stop</text>
+              </Show>
             </>
           )}
         </Show>
         <Show when={props.status}>
-          <text height={1} fg={props.mode === "terminal" ? COLORS.warning : COLORS.muted}>{line(props.status, 160)}</text>
+          <text height={props.mode === "terminal" ? 3 : 2} fg={props.mode === "terminal" ? COLORS.warning : COLORS.muted}>{line(props.status, 160)}</text>
+        </Show>
+        <Show when={props.mode === "terminal"}>
+          <text height={1} fg={COLORS.accent}>Enter or Esc: close | q: quit</text>
         </Show>
       </box>
     </Panel>
@@ -291,30 +390,54 @@ function ManualDispatchPanel(props: {
 
 function History(props: {
   entries: PullRequestHistoryEntry[];
+  exited: InstanceState[];
   selected: number;
   compact: boolean;
+  detailOpen: boolean;
+  now: number;
+  focus: PaneFocus;
 }) {
-  const selected = () => props.entries[Math.min(props.selected, Math.max(0, props.entries.length - 1))];
+  const selected = () => props.entries[props.selected];
+  const selectedExit = () => props.exited[props.selected - props.entries.length];
   return (
     <>
-      <Panel title={`PR HISTORY ${props.entries.length}`} width={props.compact ? "100%" : 38} borderColor={COLORS.interactive}>
-        <Show when={props.entries.length} fallback={<Empty />}>
+      <Show when={!props.compact || !props.detailOpen || !selectedExit()}>
+      <Panel title={`PR HISTORY ${props.entries.length}${props.exited.length ? ` | EXITED ${props.exited.length}` : ""}`} width={props.compact ? "100%" : 38} borderColor={COLORS.interactive}>
+        <Show when={props.entries.length + props.exited.length} fallback={<Empty />}>
           <scrollbox flexGrow={1} scrollY>
-            <For each={props.entries}>
+            <Index each={props.entries}>
               {(entry, index) => (
-                <box height={4} paddingX={1} backgroundColor={index() === props.selected ? COLORS.panelAlt : COLORS.panel}>
-                  <text height={1} fg={index() === props.selected ? COLORS.accent : COLORS.text}>
-                    {index() === props.selected ? "> " : "  "}{entry.repositoryIdentity.repositoryName} PR #{entry.pullRequestId}
+                <box height={4} paddingX={1} backgroundColor={index === props.selected ? COLORS.panelAlt : COLORS.panel}>
+                  <text height={1} fg={index === props.selected ? COLORS.accent : COLORS.text}>
+                    {index === props.selected ? "> " : "  "}{entry().repositoryIdentity.repositoryName} PR #{entry().pullRequestId}
                   </text>
-                  <text height={1} fg={COLORS.text}>{line(entry.title || "title not reported", 32)}</text>
-                  <text height={1} fg={COLORS.muted}>{line(entry.author || "author unknown", 32)}</text>
+                  <text height={1} fg={COLORS.text}>{line(entry().title || "title not reported", 32)}</text>
+                  <text height={1} fg={COLORS.muted}>{line(entry().author || "author unknown", 32)}</text>
                 </box>
               )}
-            </For>
+            </Index>
+            <Show when={props.exited.length}>
+              <text height={1} fg={COLORS.warning}>EXITED INSTANCES / retained logs</text>
+              <Index each={props.exited}>
+                {(instance, index) => (
+                  <box height={4} paddingX={1} backgroundColor={index + props.entries.length === props.selected ? COLORS.panelAlt : COLORS.panel}>
+                    <text height={1} fg={COLORS.warning}>
+                      {index + props.entries.length === props.selected ? "> " : "  "}{roleLabel(instance().agent)} {shortId(instance().instanceId)}
+                    </text>
+                    <text height={1} fg={COLORS.text}>{line(instance().repository || "repository unknown", 20)} | PR #{instance().pullRequestId || "?"}</text>
+                    <text height={1} fg={COLORS.muted}>{line(instance().completion?.result || "Exited / outcome unknown", 32)}</text>
+                  </box>
+                )}
+              </Index>
+            </Show>
           </scrollbox>
         </Show>
       </Panel>
-      <Show when={!props.compact}>
+      </Show>
+      <Show when={selectedExit() && (!props.compact || props.detailOpen)}>
+        <Detail instance={selectedExit()} now={props.now} focus={props.focus} />
+      </Show>
+      <Show when={!props.compact && !selectedExit()}>
         <Panel title="RETAINED OUTCOMES" flexGrow={1}>
           <Show when={selected()} fallback={<Empty />}>
             {(entry: () => PullRequestHistoryEntry) => (
@@ -430,17 +553,18 @@ function Empty() {
 }
 
 function streamLabel(instance: InstanceState): string {
-  if (instance.lifecycle === "stopped" || instance.status === "completed") return "History";
-  if (instance.status === "stale") return "Stale";
+  if (isHistoricalInstance(instance)) return "History";
+  if (!isLiveInstance(instance)) return "Stale";
   return "Live";
 }
 
 function isHistoricalInstance(instance: InstanceState | undefined): boolean {
-  return Boolean(instance && (instance.lifecycle === "stopped" || instance.status === "completed"));
+  return Boolean(instance && (instance.exitObservedMs !== null || instance.lifecycle === "stopped" || instance.status === "completed"));
 }
 
 function viewLabel(view: ViewFilter): string {
   if (view === "current") return "Current session";
+  if (view === "live") return "Live only";
   return view[0]?.toUpperCase() + view.slice(1);
 }
 
@@ -459,21 +583,21 @@ function Rail(props: {
     >
       <Show when={props.instances.length} fallback={<Empty />}>
         <scrollbox flexGrow={1} scrollY>
-          <For each={props.instances}>
+          <Index each={props.instances}>
             {(instance, index) => {
-              const selected = () => index() === props.selected;
+              const selected = () => index === props.selected;
               const startsGroup = () => {
-                const previous = props.instances[index() - 1];
+                const previous = props.instances[index - 1];
                 return !previous ||
-                  previous.agent !== instance.agent ||
-                  previous.sessionNamespace !== instance.sessionNamespace;
+                  previous.agent !== instance().agent ||
+                  previous.sessionNamespace !== instance().sessionNamespace;
               };
-              const historical = () => isHistoricalInstance(instance);
+              const historical = () => isHistoricalInstance(instance());
               return (
                 <>
                   <Show when={startsGroup()}>
                     <text height={1} fg={COLORS.accent}>
-                      {roleLabel(instance.agent)} / {line(instance.sessionNamespace, 18)}
+                      {roleLabel(instance().agent)} / {line(instance().sessionNamespace, 18)}
                     </text>
                   </Show>
                   <box
@@ -481,27 +605,27 @@ function Rail(props: {
                     backgroundColor={selected() ? COLORS.panelAlt : COLORS.panel}
                     paddingX={1}
                     border={selected() ? ["left"] : false}
-                    borderColor={statusColor(instance.status)}
+                    borderColor={statusColor(instance().status)}
                     flexDirection="column"
                   >
-                    <text height={1} fg={statusColor(instance.status)}>
-                      {selected() ? "> " : "  "}{streamLabel(instance)} / {historical() ? instance.completion?.result || instance.status : instance.status}
+                    <text height={1} fg={statusColor(instance().status)}>
+                      {selected() ? "> " : "  "}{streamLabel(instance())} / {historical() ? instance().completion?.result || instance().status : instance().status}
                     </text>
                     <text height={1} fg={COLORS.text}>
-                      {shortId(instance.instanceId)} {historical() ? `| ${instance.completion?.result || instance.status}` : `| PID ${instance.processId}`}
+                      {shortId(instance().instanceId)} {historical() ? `| ${instance().completion?.result || instance().status}` : `| PID ${instance().processId}`}
                     </text>
-                    <text height={1} fg={COLORS.muted}>{line(instance.repository || "repository unknown", 26)}</text>
+                    <text height={1} fg={COLORS.muted}>{line(instance().repository || "repository unknown", 26)}</text>
                     <text height={1} fg={COLORS.text}>
-                      {instance.pullRequestId ? `PR #${instance.pullRequestId} ${line(instance.pullRequestTitle, 15)}` : `cycle ${instance.cycleNumber || "-"}`}
+                      {instance().pullRequestId ? `PR #${instance().pullRequestId} ${line(instance().pullRequestTitle, 15)}` : `cycle ${instance().cycleNumber || "-"}`}
                     </text>
                     <text height={1} fg={COLORS.muted}>
-                      {historical() ? "Ended " : "Event "}{new Date(instance.completion?.timestampMs ?? instance.lastEventMs).toISOString().slice(11, 19)}Z | {age(instance.completion?.timestampMs ?? instance.lastEventMs, props.now)}
+                      {historical() ? "Ended " : "Event "}{new Date(instance().completion?.timestampMs ?? instance().lastEventMs).toISOString().slice(11, 19)}Z | {age(instance().completion?.timestampMs ?? instance().lastEventMs, props.now)}
                     </text>
                   </box>
                 </>
               );
             }}
-          </For>
+          </Index>
         </scrollbox>
       </Show>
     </Panel>
@@ -598,6 +722,12 @@ function Detail(props: {
       <Show when={props.instance} fallback={<Empty />}>
         {(instance: () => InstanceState) => (
           <box flexDirection="column" flexGrow={1}>
+            <Show when={instance().exitObservedMs !== null}>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.warning}>
+                Process exit observed. {instance().completion ? "Reported work outcome retained below." : "Interrupted / outcome unknown; no completion was reported."}
+              </text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.muted}>Log: {boundedText(instance().sources[0] || "source not reported", 240)}</text>
+            </Show>
             <WarningBlock instance={instance()} />
             <box flexDirection="row" gap={2} height={3}>
               <FieldColumn
@@ -674,6 +804,9 @@ function Inspector(props: { instance: InstanceState | undefined; focused?: boole
               {instance().lifecycle.toUpperCase()} / {instance().status.toUpperCase()}
             </text>
             <text height={1} fg={COLORS.text}>PID {instance().processId} | schema v{instance().schemaVersion}</text>
+            <text height={2} fg={COLORS.muted}>{instance().processOrigin === "local"
+              ? "Origin: local launch confirmed"
+              : "Origin unknown: local PID absence cannot confirm exit"}</text>
             <text height={1} fg={COLORS.text}>Sequence {instance().lastSequence} | gaps {instance().gapCount}</text>
             <text height={1} fg={COLORS.text}>Duplicates ignored {instance().duplicateCount}</text>
             <text height={1} fg={COLORS.muted}>Last raw event</text>
@@ -701,21 +834,25 @@ function OverlayPanel(props: {
   height?: number;
   left?: number | "auto" | `${number}%`;
   padding?: number;
+  bounded?: boolean;
 }) {
+  const dimensions = useTerminalDimensions();
+  const width = () => props.bounded ? Math.min(props.width ?? 70, Math.max(1, dimensions().width - 2)) : props.width ?? 70;
+  const height = () => props.bounded ? Math.min(props.height ?? 18, Math.max(1, dimensions().height - 4)) : props.height ?? 18;
   return (
     <box
       position="absolute"
-      top="15%"
-      left={props.left ?? "15%"}
-      width={props.width ?? 70}
-      height={props.height ?? 18}
+      top={props.bounded ? Math.max(1, Math.floor((dimensions().height - height()) / 2)) : "15%"}
+      left={props.bounded ? Math.max(0, Math.floor((dimensions().width - width()) / 2)) : props.left ?? "15%"}
+      width={width()}
+      height={height()}
       zIndex={100}
       border
       borderStyle="double"
       borderColor={COLORS.accent}
       backgroundColor={COLORS.panel}
       title={` ${props.title} `}
-      padding={props.padding ?? 1}
+      padding={props.padding ?? (props.bounded && height() < 8 ? 0 : 1)}
       flexDirection="column"
     >
       {props.children}
@@ -735,26 +872,102 @@ export function App(props: AppProps) {
   const dimensions = useTerminalDimensions();
   const [now, setNow] = createSignal(Date.now());
   const [revision, setRevision] = createSignal(0);
+  const [uiMode, setUiMode] = createSignal<"simple" | "advanced">("simple");
+  const [simpleSelectedKey, setSimpleSelectedKey] = createSignal<string | null>(null);
+  const [simpleDetail, setSimpleDetail] = createSignal<{ key: string; reference: string } | null>(null);
+  let simpleDetailScroll: ScrollBoxRenderable | undefined;
+  let simpleManualScroll: ScrollBoxRenderable | undefined;
+  let helpScroll: ScrollBoxRenderable | undefined;
   const [selected, setSelected] = createSignal(0);
   const [detailOpen, setDetailOpen] = createSignal(false);
   const [inspectorOpen, setInspectorOpen] = createSignal(dimensions().width >= 120);
   const [focus, setFocus] = createSignal<PaneFocus>("rail");
   const [overlay, setOverlay] = createSignal<Overlay>("none");
   const [role, setRole] = createSignal<RoleFilter>("all");
-  const [view, setView] = createSignal<ViewFilter>("current");
+  const [view, setView] = createSignal<ViewFilter>("live");
+  const [dismissalPending, setDismissalPending] = createSignal(false);
+  const [dismissalError, setDismissalError] = createSignal(props.dismissalLoadError ?? "");
   const [eventWarningsOnly, setEventWarningsOnly] = createSignal(false);
   const [paletteIndex, setPaletteIndex] = createSignal(0);
   const [historyFilter, setHistoryFilter] = createSignal("");
   const [historyInputMode, setHistoryInputMode] = createSignal<"none" | "filter" | "jump">("none");
   const [historyInput, setHistoryInput] = createSignal("");
-  const [feedback, setFeedback] = createSignal("Observer is read-only");
+  const defaultFeedback = props.launchMode === "operational"
+    ? "OPERATIONAL: this launch authorizes pull-request mutations"
+    : props.launchMode === "preview"
+      ? "PREVIEW ONLY: live agents cannot mutate pull requests"
+      : "Observer is read-only";
+  const [feedback, setFeedback] = createSignal(defaultFeedback);
+  const getAutomationStatus = props.broker?.getAutomationStatus?.bind(props.broker);
+  const scanNow = props.broker?.scanNow?.bind(props.broker);
+  const [automationStatus, setAutomationStatus] = createSignal<AutomationStatus | null>(null);
+  const [automationQueryError, setAutomationQueryError] = createSignal("");
+  const [automationScanError, setAutomationScanError] = createSignal("");
+  const [automationHalted, setAutomationHalted] = createSignal(false);
+  const [scanPending, setScanPending] = createSignal(false);
+  let automationTimer: ReturnType<typeof setTimeout> | undefined;
+  let automationDisposed = false;
+  let automationReadPending = false;
+  let automationRefreshPending = false;
+  let automationReadGeneration = 0;
+  let automationScanGeneration = 0;
+  let automationFailures = 0;
+  const scanVisible = () => Boolean(getAutomationStatus && scanNow &&
+    automationStatus()?.available && automationStatus()?.scope === "current-launcher");
+  const automationError = () => automationQueryError() || automationScanError();
+  const scanUnavailable = () => props.brokerFailure?.() || automationHalted() || automationQueryError()
+    ? "Scan now unavailable: automatic control or monitoring is unavailable."
+    : scanPending() ? "Scan request already pending."
+      : !scanVisible() ? "Scan now unavailable: no current-launcher automatic control." : "";
   const [manualMode, setManualMode] = createSignal<ManualMode>("closed");
-  const [manualEntry, setManualEntry] = createSignal<PullRequestHistoryEntry | null>(null);
+  const scanMainVisible = () => scanVisible() && manualMode() === "closed" && overlay() === "none" && historyInputMode() === "none";
+  const [manualTarget, setManualTarget] = createSignal<ResolvedManualTarget | null>(null);
+  const [manualInput, setManualInput] = createSignal("");
+  const [manualInputRejected, setManualInputRejected] = createSignal(false);
+  let manualGeneration = 0;
   const [manualRole, setManualRole] = createSignal<AgentRole>("reviewer");
   const [operatorPrompt, setOperatorPrompt] = createSignal("");
   const [capabilitySummary, setCapabilitySummary] = createSignal<CapabilitySummary | null>(null);
   const [acceptedDispatch, setAcceptedDispatch] = createSignal<DispatchAccepted | null>(null);
   const [manualStatus, setManualStatus] = createSignal("");
+  const [manualTerminal, setManualTerminal] = createSignal<DispatchTerminal | null>(null);
+  const [manualStartedMs, setManualStartedMs] = createSignal(0);
+  const [manualTerminalMs, setManualTerminalMs] = createSignal<number | null>(null);
+  const [manualMonitorError, setManualMonitorError] = createSignal("");
+  const [scheduleFlow, setScheduleFlow] = createSignal(false);
+  const [busyChoice, setBusyChoice] = createSignal<RunScheduleMode | "back">("replace");
+  const [runPrepared, setRunPrepared] = createSignal<RunPrepared | null>(null);
+  const [runQueued, setRunQueued] = createSignal<RunQueued | null>(null);
+  const [runProgress, setRunProgress] = createSignal<RunProgress | null>(null);
+  const [slotReleased, setSlotReleased] = createSignal(false);
+  const [automationNote, setAutomationNote] = createSignal("");
+  let scheduleBlockedCode = "";
+  let queueCancelRequested = false;
+  let queueCancelPending = false;
+  const [queueCancelAcknowledged, setQueueCancelAcknowledged] = createSignal(false);
+  let scheduleGeneration = 0;
+  let queuedManualGeneration = -1;
+  const [scheduleFatal, setScheduleFatal] = createSignal(false);
+  let scheduleBrokerFailed = false;
+  let scheduleConfirmationInFlight = false;
+  let focusBusyChoice = false;
+  let scheduleBufferOverflow = false;
+  const earlySchedule: (RunProgress | ScheduledDispatchAccepted)[] = [];
+  const scheduler = (() => {
+    const broker = props.broker;
+    if (!broker?.prepareRun || !broker.confirmRun || !broker.cancelQueued ||
+        !broker.subscribeSchedule || !broker.subscribeScheduledAccepted) return null;
+    return {
+      prepareRun: broker.prepareRun.bind(broker), confirmRun: broker.confirmRun.bind(broker),
+      cancelQueued: broker.cancelQueued.bind(broker), subscribeSchedule: broker.subscribeSchedule.bind(broker),
+      subscribeScheduledAccepted: broker.subscribeScheduledAccepted.bind(broker),
+    };
+  })();
+  let previewFrame = -1;
+  let previewRendered = false;
+  // stdout can contain accepted + completed in one chunk, before dispatch()'s await resumes.
+  // Retain only the bounded in-flight window and apply only the subsequently accepted ID.
+  const earlyTerminals = new Map<string, DispatchTerminal>();
   // PR4 interactive widening sub-flow (issue #105), nested entirely inside manualMode()==="confirm"
   // -- Settings' own read-only CapabilityProfile has no dispatchDraftId to bind against, so
   // widening is only ever reachable from the trusted manual describe() flow. "preview"/"summary"
@@ -766,6 +979,29 @@ export function App(props: AppProps) {
     createSignal<"closed" | "describing" | "preview" | "confirming" | "summary" | "minting" | "cancelling">("closed");
   const [wideningPreview, setWideningPreview] = createSignal<WideningPreview | WideningSummary | null>(null);
   const [wideningStatus, setWideningStatus] = createSignal("");
+  createEffect(() => {
+    capabilitySummary();
+    manualMode();
+    wideningStage();
+    busyChoice();
+    runPrepared();
+    previewFrame = renderer.frameId;
+    previewRendered = false;
+    if (uiMode() === "simple" || scheduleFlow()) simpleManualScroll?.scrollTo(0);
+  });
+  const onManualFrame = () => {
+    if (manualMode() === "busy-choice" && focusBusyChoice && renderer.frameId > previewFrame) {
+      focusBusyChoice = false;
+      simpleManualScroll?.scrollChildIntoView(`busy-choice-${busyChoice()}`);
+      previewFrame = renderer.frameId;
+      renderer.requestRender();
+      return;
+    }
+    if ((manualMode() === "confirm" || manualMode() === "confirm-final" || manualMode() === "busy-choice") &&
+        wideningStage() === "closed" && renderer.frameId > previewFrame) previewRendered = true;
+  };
+  renderer.on("frame", onManualFrame);
+  onCleanup(() => renderer.off("frame", onManualFrame));
   // Set the instant confirm-widening-mint succeeds; cleared on dispatch, on an explicit cancel, or
   // on closing/reopening manual dispatch. Tracks a minted-but-not-yet-dispatched grant so
   // close/quit/shutdown can still best-effort relinquish it even though wideningStage() itself has
@@ -836,6 +1072,7 @@ export function App(props: AppProps) {
   let eventScrollbox: ScrollBoxRenderable | undefined;
 
   function shutdownBroker(): Promise<void> {
+    stopAutomationPolling();
     if (props.shutdownBroker) return props.shutdownBroker();
     localBrokerShutdown ??= props.broker?.shutdown() ?? Promise.resolve();
     return localBrokerShutdown;
@@ -846,6 +1083,7 @@ export function App(props: AppProps) {
     setRevision((value) => value + 1);
   }, 1000);
   onCleanup(() => {
+    manualGeneration += 1;
     clearInterval(refreshTimer);
     if (feedbackTimer) clearTimeout(feedbackTimer);
     bestEffortCancelWidening();
@@ -855,13 +1093,119 @@ export function App(props: AppProps) {
   function notify(message: string): void {
     setFeedback(line(message, 180));
     if (feedbackTimer) clearTimeout(feedbackTimer);
-    feedbackTimer = setTimeout(() => setFeedback("Observer is read-only"), 2_500);
+    feedbackTimer = setTimeout(() => setFeedback(defaultFeedback), 2_500);
   }
+
+  function stopAutomationPolling(): void {
+    setAutomationHalted(true);
+    automationReadGeneration++;
+    automationScanGeneration++;
+    automationRefreshPending = false;
+    if (automationTimer) clearTimeout(automationTimer);
+    automationTimer = undefined;
+  }
+
+  function automationFailure(error: unknown): string {
+    return error instanceof BrokerRejectionError ? `${error.code}: ${error.detail}` :
+      error instanceof Error ? error.message : String(error);
+  }
+
+  async function refreshAutomationStatus(supersede = false): Promise<void> {
+    if (!getAutomationStatus || automationDisposed || automationHalted() || props.brokerFailure?.()) return;
+    if (automationTimer) clearTimeout(automationTimer);
+    automationTimer = undefined;
+    if (scanPending()) {
+      automationRefreshPending = true;
+      return;
+    }
+    if (automationReadPending) {
+      if (supersede) {
+        automationReadGeneration++;
+        automationRefreshPending = true;
+      }
+      return;
+    }
+    automationRefreshPending = false;
+    automationReadPending = true;
+    const generation = ++automationReadGeneration;
+    try {
+      const status = await getAutomationStatus();
+      if (generation !== automationReadGeneration || automationDisposed || automationHalted() || props.brokerFailure?.()) return;
+      if (status.automationVersion !== 1 || status.available && status.scope !== "current-launcher") {
+        throw new Error("Automation status did not identify the current launcher.");
+      }
+      setAutomationStatus(status);
+      setAutomationQueryError("");
+      automationFailures = 0;
+      if (!status.available) setAutomationHalted(true);
+    } catch (error) {
+      if (generation === automationReadGeneration && !automationDisposed && !automationHalted() && !props.brokerFailure?.()) {
+        automationFailures++;
+        setAutomationQueryError(`Status unavailable: ${automationFailure(error)}${
+          automationFailures <= AUTOMATION_STATUS_RETRIES ? " (retrying)" : " (retry limit reached)"}`);
+        if (automationFailures > AUTOMATION_STATUS_RETRIES) setAutomationHalted(true);
+      }
+    } finally {
+      automationReadPending = false;
+      if (!automationDisposed && !automationHalted() && !props.brokerFailure?.() && !scanPending()) {
+        if (automationRefreshPending) {
+          automationRefreshPending = false;
+          void refreshAutomationStatus();
+        } else {
+          automationTimer = setTimeout(() => { void refreshAutomationStatus(); }, AUTOMATION_POLL_MS);
+        }
+      }
+    }
+  }
+
+  async function requestScanNow(): Promise<void> {
+    const unavailable = scanUnavailable();
+    if (unavailable || !scanNow) {
+      notify(unavailable || "Scan now unavailable.");
+      return;
+    }
+    const generation = ++automationScanGeneration;
+    // Invalidate pre-action results without releasing the read's single-flight slot.
+    automationReadGeneration++;
+    automationRefreshPending = true;
+    if (automationTimer) clearTimeout(automationTimer);
+    automationTimer = undefined;
+    setScanPending(true);
+    setAutomationScanError("");
+    try {
+      const result = await scanNow();
+      if (generation !== automationScanGeneration || automationDisposed || props.brokerFailure?.()) return;
+      notify(scanNowResultText(result));
+    } catch (error) {
+      if (generation === automationScanGeneration && !automationDisposed && !props.brokerFailure?.()) {
+        setAutomationScanError(`Scan now failed: ${automationFailure(error)}`);
+      }
+    } finally {
+      if (generation === automationScanGeneration && !automationDisposed) {
+        setScanPending(false);
+        // A poll started before this request must not overwrite its post-action status.
+        void refreshAutomationStatus(true);
+      }
+    }
+  }
+
+  onMount(() => { if (getAutomationStatus) void refreshAutomationStatus(); });
+  onCleanup(() => {
+    automationDisposed = true;
+    stopAutomationPolling();
+  });
+  createEffect(() => {
+    revision();
+    if ((props.brokerFailure?.() || scheduleFatal()) && !automationHalted()) stopAutomationPolling();
+  });
 
   const instances = createMemo(() => {
     revision();
     const selectedRole = role();
-    return props.reducer.list(now(), selectedRole === "all" ? undefined : selectedRole, view());
+    // Reducer states mutate in place; publish snapshots so heartbeat/exit changes repaint
+    // even when the selected key and list order did not change.
+    return props.reducer.list(now(), selectedRole === "all" ? undefined : selectedRole, view())
+      .map((state) => ({ ...state }));
   });
   const historyEntries = createMemo(() => {
     revision();
@@ -869,42 +1213,154 @@ export function App(props: AppProps) {
     const selectedRole = role();
     return selectedRole === "all" ? entries : entries.filter((entry) => Boolean(entry.outcomes[selectedRole]));
   });
-  const historyCurrent = createMemo(() =>
-    historyEntries()[Math.min(selected(), Math.max(0, historyEntries().length - 1))]);
-  const current = createMemo(() => instances()[Math.min(selected(), Math.max(0, instances().length - 1))]);
+  const exitedHistory = createMemo(() => {
+    const needle = historyFilter().trim().toLowerCase();
+    return instances().filter((state) => state.exitObservedMs !== null &&
+      (!needle || [state.repository, state.pullRequestTitle, state.pullRequestAuthor, String(state.pullRequestId),
+        state.instanceId, state.completion?.result || "exited outcome unknown"].some((text) => text.toLowerCase().includes(needle))));
+  });
+  const simpleRows = createMemo(() => view() === "history" && props.history
+    ? [...historyEntries().map(simpleHistoryRow),
+      ...instances().filter((state) => state.exitObservedMs !== null || state.schemaVersion < 3).map(simpleInstanceRow)]
+    : instances().map(simpleInstanceRow));
+  createEffect(() => {
+    const rows = simpleRows();
+    if (!rows.some((row) => row.key === simpleSelectedKey())) setSimpleSelectedKey(rows[0]?.key ?? null);
+  });
+  function resetSimpleView(next: "live" | "history"): void {
+    setView(next);
+    setRole("all");
+    setHistoryFilter("");
+    setHistoryInputMode("none");
+    setHistoryInput("");
+    setSelected(0);
+    setSimpleSelectedKey(null);
+    setSimpleDetail(null);
+    setDetailOpen(false);
+    setFocus("rail");
+    setInspectorOpen(false);
+    setOverlay("none");
+    setFeedback(defaultFeedback);
+  }
+  function toggleUiMode(): void {
+    if (manualMode() !== "closed" || overlay() !== "none" || historyInputMode() !== "none") return;
+    const next = uiMode() === "simple" ? "advanced" : "simple";
+    resetSimpleView("live");
+    setUiMode(next);
+    setInspectorOpen(next === "advanced" && dimensions().width >= 120);
+  }
+  function toggleSimpleHistory(): void { resetSimpleView(view() === "history" ? "live" : "history"); }
+  function openSimpleDetail(): void {
+    const row = simpleRows().find((row) => row.key === simpleSelectedKey());
+    if (row) setSimpleDetail({ key: row.key, reference: row.reference });
+    else notify("No item is available for details");
+  }
+  function moveSimple(delta: number): void {
+    const rows = simpleRows();
+    if (!rows.length) { notify("No items are available"); return; }
+    const index = Math.max(0, rows.findIndex((row) => row.key === simpleSelectedKey()));
+    setSimpleSelectedKey(rows[Math.max(0, Math.min(rows.length - 1, index + delta))]!.key);
+  }
+  function scrollAmount(key: string): number {
+    if (key === "up" || key === "k") return -1;
+    if (key === "down" || key === "j") return 1;
+    if (key === "pageup") return -Math.max(1, dimensions().height - 8);
+    if (key === "pagedown") return Math.max(1, dimensions().height - 8);
+    return 0;
+  }
+  const historyCurrent = createMemo(() => historyEntries()[selected()]);
+  const current = createMemo(() => {
+    if (view() !== "history" || !props.history) {
+      return instances()[Math.min(selected(), Math.max(0, instances().length - 1))];
+    }
+    const entry = historyCurrent();
+    if (!entry) return exitedHistory()[selected() - historyEntries().length];
+    const selectedRole = role();
+    const state = props.reducer.list(now(), selectedRole === "all" ? undefined : selectedRole)
+      .find((state) => state.timeline.some((event) => event.repositoryIdentity?.key === entry.repositoryIdentity.key &&
+        event.pullRequestId === entry.pullRequestId));
+    return state ? { ...state } : undefined;
+  });
   const layout = createMemo(() => decideLayout(dimensions().width, detailOpen(), inspectorOpen()));
   const activeFocus = createMemo(() => visibleFocus(layout(), focus()));
   createEffect(() => {
-    const count = selectableCount(view(), Boolean(props.history), historyEntries().length, instances().length);
+    const count = selectableCount(view(), Boolean(props.history), historyEntries().length + exitedHistory().length, instances().length);
     if (selected() >= count) setSelected(Math.max(0, count - 1));
     const corrected = activeFocus();
     if (corrected !== focus()) setFocus(corrected);
   });
-  const unsubscribeTerminal = props.broker?.subscribeTerminal((terminal: DispatchTerminal) => {
+  function receiveManualTerminal(terminal: DispatchTerminal): void {
     if (terminal.dispatchId !== acceptedDispatch()?.dispatchId) return;
-    const detail = terminal.operation === "cancelled"
-      ? terminal.result === "cancelled-forced"
-        ? "Cancellation forced after cooperative shutdown did not complete; process-tree exit observed."
-        : `Cancelled ${terminal.result ?? "cooperatively"}.`
-      : terminal.exitCode === 0
-        ? "Manual child completed successfully."
-        : `Manual child failed with exit code ${terminal.exitCode ?? "unknown"}.`;
-    setManualStatus(detail);
+    setManualTerminal(terminal);
+    setManualTerminalMs(Date.now());
+    if (!scheduleFatal()) {
+      setManualMonitorError("");
+      setManualStatus(scheduleFlow() && runQueued() && !slotReleased()
+        ? "Manual outcome received; waiting for confirmed scheduling-slot release." : "");
+    }
     setManualMode("terminal");
     setRevision((value) => value + 1);
+  }
+  const unsubscribeTerminal = props.broker?.subscribeTerminal((terminal: DispatchTerminal) => {
+    if (!acceptedDispatch() && (manualMode() === "dispatching" || scheduleConfirmationInFlight || runQueued() && !slotReleased())) {
+      if (earlyTerminals.size < 20) earlyTerminals.set(terminal.dispatchId, terminal);
+    } else receiveManualTerminal(terminal);
   });
   onCleanup(() => unsubscribeTerminal?.());
+  const unsubscribeSchedule = scheduler?.subscribeSchedule(receiveSchedule);
+  const unsubscribeScheduledAccepted = scheduler?.subscribeScheduledAccepted(receiveSchedule);
+  onCleanup(() => {
+    unsubscribeSchedule?.();
+    unsubscribeScheduledAccepted?.();
+    resetScheduling();
+  });
+
+  const dispatchProgress = createMemo(() => {
+    revision();
+    const accepted = acceptedDispatch();
+    if (!accepted) return null;
+    const terminal = manualTerminal();
+    const progress = manualProgress(
+      props.reducer.getDispatch(accepted.dispatchId, accepted.repositoryIdentity.key,
+        accepted.role, accepted.pullRequestId, accepted.childProcessId, now()),
+      terminal, manualStartedMs(), manualTerminalMs(), now(),
+      manualMode() === "cancelling", terminal ? "" : manualMonitorError() || props.brokerFailure?.() || "",
+    );
+    return scheduleFatal() && !terminal && progress.headline === "STATUS UNKNOWN"
+      ? { ...progress, detail: "The run was accepted; scheduling state and child exit are unconfirmed." }
+      : progress;
+  });
+
+  function resetManualProgress(): void {
+    earlyTerminals.clear();
+    setManualTerminal(null);
+    setManualTerminalMs(null);
+    setManualMonitorError("");
+    setManualStartedMs(0);
+    resetScheduling();
+  }
 
   function closeManual(): void {
-    if (manualMode() === "active" || manualMode() === "dispatching") {
+    if (scheduleFatal()) {
+      setManualStatus("Scheduling state is uncertain. Press q to shut down broker-owned work.");
+      return;
+    }
+    if (runQueued() && !slotReleased()) {
+      setManualStatus("The scheduling slot is not released. Wait for automatic resumption or press q to shut down.");
+      return;
+    }
+    if (manualMode() === "active" || manualMode() === "dispatching" || manualMode() === "cancelling" ||
+        ["schedule-confirming", "scheduled", "schedule-cancelling", "schedule-unknown"].includes(manualMode())) {
       notify("Cancel the active manual dispatch before closing");
       return;
     }
     bestEffortCancelWidening();
+    manualGeneration += 1;
     setManualMode("closed");
-    setManualEntry(null);
+    setManualTarget(null);
     setCapabilitySummary(null);
     setAcceptedDispatch(null);
+    resetManualProgress();
     setOperatorPrompt("");
     setManualStatus("");
     wideningRequestToken += 1;
@@ -919,19 +1375,17 @@ export function App(props: AppProps) {
       notify("Observe-only launch: trusted manual broker is unavailable");
       return;
     }
-    const selectedEntry = historyCurrent();
-    if (view() !== "history" || !selectedEntry) {
-      notify("Select a retained PR history row before manual dispatch");
-      return;
-    }
-    setManualEntry({
-      ...selectedEntry,
-      repositoryIdentity: { ...selectedEntry.repositoryIdentity },
-      outcomes: { ...selectedEntry.outcomes },
-    });
-    setManualMode("prompt");
+    manualGeneration += 1;
+    setOverlay("none");
+    setInspectorOpen(false);
+    setManualTarget(null);
+    setManualInput("");
+    setManualInputRejected(false);
+    setManualRole("reviewer");
+    setManualMode("target");
     setCapabilitySummary(null);
     setAcceptedDispatch(null);
+    resetManualProgress();
     setOperatorPrompt("");
     setManualStatus("");
     wideningRequestToken += 1;
@@ -939,23 +1393,72 @@ export function App(props: AppProps) {
     setWideningPreview(null);
     setWideningStatus("");
     setMintedWideningGeneration(null);
-    notify("Manual dispatch prompt opened");
+    notify("Start Agent by PR ID opened");
+  }
+
+  function appendManualInput(value: string): void {
+    if (manualInputRejected()) return;
+    if (manualInput().length + value.length > MAX_PR_INPUT ||
+        /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
+      // Never turn a rejected/truncated paste into a different, valid PR ID.
+      setManualInputRejected(true);
+      setManualStatus("Input rejected (too long or controls). Ctrl+U to clear.");
+      return;
+    }
+    setManualInput((current) => current + value);
+    setManualStatus(parseManualPullRequestId(manualInput()) === null ? PR_INPUT_HELP : "");
+  }
+
+  async function resolveManual(): Promise<void> {
+    if (!props.broker || manualMode() !== "target") return;
+    const prId = parseManualPullRequestId(manualInput());
+    if (manualInputRejected() || prId === null) {
+      setManualStatus(manualInputRejected() ? "Input rejected. Ctrl+U to clear." : PR_INPUT_HELP);
+      return;
+    }
+    const role = manualRole();
+    const generation = manualGeneration;
+    setManualMode("resolving");
+    setManualStatus("");
+    try {
+      const profile = await props.broker.profileCurrent(prId, role);
+      if (generation !== manualGeneration) return;
+      assertManualTarget(profile, prId, role);
+      setManualTarget({
+        role: profile.role,
+        repositoryIdentity: { ...profile.repositoryIdentity },
+        prSnapshot: { ...profile.prSnapshot },
+      });
+      await describeManual();
+    } catch (error) {
+      if (generation !== manualGeneration) return;
+      setManualStatus(error instanceof BrokerRejectionError
+        ? dispatchResultDetail(error.code, error.detail, role)
+        : "Could not verify the requested target. Cancel and retry.");
+      setManualMode("target");
+    }
   }
 
   async function describeManual(): Promise<void> {
-    const entry = manualEntry();
-    if (!props.broker || !entry || manualMode() !== "prompt") return;
+    const target = manualTarget();
+    if (!props.broker || !target || manualMode() !== "resolving") return;
+    const generation = manualGeneration;
     setManualMode("describing");
     setManualStatus("");
     try {
-      const summary = await props.broker.describe(entry.repositoryIdentity.key, entry.pullRequestId, manualRole());
+      const summary = await props.broker.describe(target.repositoryIdentity.key, target.prSnapshot.pullRequestId, target.role);
+      if (generation !== manualGeneration) return;
+      assertManualTarget(summary, target.prSnapshot.pullRequestId, target.role, target.repositoryIdentity.key);
       setCapabilitySummary(summary);
+      setManualTarget({ role: summary.role, repositoryIdentity: { ...summary.repositoryIdentity }, prSnapshot: { ...summary.prSnapshot } });
+      previewFrame = renderer.frameId;
       setManualMode("confirm");
-      setManualStatus("Fresh provider snapshot and wrapper-derived capabilities loaded.");
+      setManualStatus("");
     } catch (error) {
+      if (generation !== manualGeneration) return;
       const message = error instanceof BrokerRejectionError
-        ? dispatchResultDetail(error.code, error.detail)
-        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`;
+        ? dispatchResultDetail(error.code, error.detail, target.role)
+        : "Could not verify the fresh target and capabilities. Cancel and retry.";
       setManualStatus(message);
       setManualMode("terminal");
     }
@@ -963,45 +1466,402 @@ export function App(props: AppProps) {
 
   async function dispatchManual(): Promise<void> {
     const summary = capabilitySummary();
-    if (!props.broker || !summary || manualMode() !== "confirm-final") return;
+    if (!props.broker || !summary || (manualMode() !== "confirm" && manualMode() !== "confirm-final") ||
+        wideningStage() !== "closed" || !previewRendered) return;
+    const generation = manualGeneration;
+    earlyTerminals.clear();
     setManualMode("dispatching");
+    setManualStartedMs(Date.now());
     setManualStatus("");
     try {
       const accepted = await props.broker.dispatch(summary, operatorPrompt());
-      setAcceptedDispatch(accepted);
-      props.tailer.registerEventLogPath(accepted.eventLogPath);
-      setManualMode("active");
-      setManualStatus("Dispatch accepted; waiting for correlated v3 child events.");
+      if (generation !== manualGeneration) return;
+      acceptManual(accepted, summary);
       // Any minted widening grant is now consumed by the broker's own dispatch-time preflight
       // (Invoke-Dispatch sets Consumed=true unconditionally) -- a later best-effort cancel-widening
       // for this generation would only fail harmlessly, so stop tracking it.
       setMintedWideningGeneration(null);
     } catch (error) {
-      const message = error instanceof BrokerRejectionError
-        ? dispatchResultDetail(error.code, error.detail)
-        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`;
-      setManualStatus(message);
+      if (generation !== manualGeneration) return;
+      earlyTerminals.clear();
+      if (error instanceof BrokerRejectionError && error.code !== "termination-failed") {
+        if ((error.code === "already-running" || error.code === "state-contended") && schedulingAvailable(summary)) {
+          setScheduleFlow(true);
+          setMintedWideningGeneration(null);
+          await prepareBusy("replace", dispatchResultDetail(error.code, error.detail, summary.role));
+          return;
+        }
+        setManualStatus(dispatchResultDetail(error.code, error.detail, summary.role));
+        setManualMode("terminal");
+      } else {
+        // Neither a lost acceptance response nor failed cleanup proves that no child remains.
+        setManualMonitorError("Start could not be confirmed.");
+        setManualStatus(error instanceof BrokerRejectionError
+          ? "Startup failed; child exit is unconfirmed. Press q to stop broker-owned work and quit."
+          : "Start status unknown. Press q to stop broker-owned work and quit.");
+      }
+    }
+  }
+
+  function schedulingAvailable(summary: CapabilitySummary): boolean {
+    return Boolean(scheduler && summary.scheduling?.version === 1 && summary.scheduling.scope === "current-launcher");
+  }
+
+  function resetScheduling(): void {
+    scheduleGeneration++;
+    queuedManualGeneration = -1;
+    setScheduleFatal(false);
+    scheduleBrokerFailed = false;
+    scheduleConfirmationInFlight = false;
+    focusBusyChoice = false;
+    scheduleBufferOverflow = false;
+    earlySchedule.length = 0;
+    setScheduleFlow(false);
+    setBusyChoice("replace");
+    setRunPrepared(null);
+    setRunQueued(null);
+    setRunProgress(null);
+    setAutomationNote("");
+    resetQueueLifecycle();
+  }
+
+  function resetQueueLifecycle(): void {
+    setSlotReleased(false);
+    scheduleBlockedCode = "";
+    queueCancelRequested = false;
+    queueCancelPending = false;
+    setQueueCancelAcknowledged(false);
+  }
+
+  function scheduleUnknown(message: string, fatal = true): void {
+    if (fatal) setScheduleFatal(true);
+    setManualMonitorError(message);
+    setManualStatus(`${message} No new run can be requested here. Press q to shut down broker-owned work.`);
+    setManualMode("schedule-unknown");
+  }
+
+  function inconsistentQueueCancellation(): void {
+    const message = "Broker state is inconsistent: cancellation was acknowledged for an accepted run. The accepted child is retained; cancellation and slot release are unknown.";
+    setAutomationNote(message);
+    scheduleUnknown(message);
+  }
+
+  function acceptManual(accepted: DispatchAccepted, summary: CapabilitySummary, scheduled = false): void {
+    const matches = accepted.role === summary.role && accepted.repositoryIdentity.key === summary.repositoryIdentity.key &&
+      accepted.pullRequestId === summary.prSnapshot.pullRequestId &&
+      accepted.capabilityPolicyDigest === summary.capabilityPolicyDigest && accepted.prStateFingerprint === summary.prStateFingerprint;
+    if (scheduled && !matches) {
+      scheduleBrokerFailed = false;
+      scheduleUnknown("Scheduled acceptance did not match the confirmed target and policy.");
+      return;
+    }
+    setAcceptedDispatch(accepted);
+    if (scheduled) {
+      setManualStartedMs(Date.now());
+      setRunPrepared(null);
+    }
+    setManualMonitorError("");
+    setManualStatus("");
+    if (matches) {
+      props.reducer.registerLocalStream({
+        eventLogPath: accepted.eventLogPath, processId: accepted.childProcessId, role: accepted.role,
+        dispatch: { dispatchId: accepted.dispatchId, repositoryKey: accepted.repositoryIdentity.key, pullRequestId: accepted.pullRequestId },
+      });
+    }
+    props.tailer.registerEventLogPath(accepted.eventLogPath);
+    setManualMode("active");
+    const terminal = earlyTerminals.get(accepted.dispatchId);
+    earlyTerminals.clear();
+    if (terminal) receiveManualTerminal(terminal);
+    setMintedWideningGeneration(null);
+  }
+
+  async function prepareBusy(mode: RunScheduleMode, reason = ""): Promise<void> {
+    const summary = capabilitySummary();
+    if (!scheduler || !summary || !schedulingAvailable(summary)) return;
+    const generation = manualGeneration;
+    const request = ++scheduleGeneration;
+    previewRendered = false;
+    setBusyChoice(mode);
+    setRunPrepared(null);
+    setManualMode("busy-preparing");
+    setManualStatus(`${reason ? `${reason} ` : ""}Checking current-launcher ownership. Preparation is inert; nothing is being stopped.`);
+    try {
+      const prepared = await scheduler.prepareRun(summary, mode, operatorPrompt());
+      if (generation !== manualGeneration || request !== scheduleGeneration) return;
+      if (prepared.scope !== "current-launcher" || prepared.schedulingVersion !== 1 ||
+          prepared.repositoryKey !== summary.repositoryIdentity.key || prepared.role !== summary.role ||
+          prepared.pullRequestId !== summary.prSnapshot.pullRequestId || prepared.mode !== mode ||
+          !isPullRequestId(prepared.conflict.pullRequestId) || !Number.isFinite(Date.parse(prepared.expiresAtUtc))) {
+        throw new Error("Preparation did not match the requested current-launcher target.");
+      }
+      setRunPrepared(prepared);
+      setManualStatus(reason);
+      focusBusyChoice = true;
+      setManualMode("busy-choice");
+    } catch (error) {
+      if (generation !== manualGeneration || request !== scheduleGeneration) return;
+      if (error instanceof BrokerRejectionError &&
+          ["schedule-repreview-required", "schedule-expired"].includes(error.code)) {
+        refreshScheduledPreview(dispatchResultDetail(error.code, error.detail, summary.role));
+        return;
+      }
+      setManualStatus(`No verified current-launcher proposal is available; nothing was stopped. ${
+        error instanceof BrokerRejectionError ? dispatchResultDetail(error.code, error.detail, summary.role) :
+          "Could not verify ownership. Cancel and retry."}`);
       setManualMode("terminal");
     }
   }
 
+  function changeBusyChoice(direction: number): void {
+    previewRendered = false;
+    const choices = ["replace", "next", "back"] as const;
+    const next = choices[(choices.indexOf(busyChoice()) + direction + choices.length) % choices.length]!;
+    if (next === "back") {
+      scheduleGeneration++;
+      setRunPrepared(null);
+      setBusyChoice(next);
+      setManualStatus("Back abandons this inert proposal. No cancellation has been requested.");
+      focusBusyChoice = true;
+      setManualMode("busy-choice");
+    } else void prepareBusy(next);
+  }
+
+  function refreshScheduledPreview(reason: string): void {
+    if (runQueued() && !slotReleased()) {
+      setManualStatus("A fresh preview must wait for confirmed scheduling-slot release.");
+      return;
+    }
+    scheduleGeneration++;
+    manualGeneration++;
+    setRunQueued(null);
+    setRunPrepared(null);
+    setRunProgress(null);
+    resetQueueLifecycle();
+    earlySchedule.length = 0;
+    earlyTerminals.clear();
+    bestEffortCancelWidening();
+    setMintedWideningGeneration(null);
+    wideningRequestToken++;
+    setWideningStage("closed");
+    setWideningPreview(null);
+    setWideningStatus("");
+    setCapabilitySummary(null);
+    setManualMonitorError("");
+    setManualMode("resolving");
+    setAutomationNote(`Previous proposal ended: ${reason} Review the fresh preview and press Enter again.`);
+    void describeManual();
+  }
+
+  async function confirmBusy(): Promise<void> {
+    if (manualMode() !== "busy-choice" || !previewRendered) return;
+    if (busyChoice() === "back") { closeManual(); return; }
+    const prepared = runPrepared();
+    if (!scheduler || !prepared || prepared.mode !== busyChoice()) return;
+    if (Date.now() >= Date.parse(prepared.expiresAtUtc)) {
+      await prepareBusy(prepared.mode, "The proposal expired. Review the new binding, then press Enter again.");
+      return;
+    }
+    const generation = manualGeneration;
+    const request = ++scheduleGeneration;
+    earlySchedule.length = 0;
+    earlyTerminals.clear();
+    scheduleBufferOverflow = false;
+    resetQueueLifecycle();
+    setManualStatus("");
+    scheduleConfirmationInFlight = true;
+    setManualMode("schedule-confirming");
+    try {
+      const queued = await scheduler.confirmRun(prepared);
+      if (generation !== manualGeneration || request !== scheduleGeneration) return;
+      scheduleConfirmationInFlight = false;
+      if (queued.mode !== prepared.mode) { scheduleUnknown("Queue confirmation did not match the selected action."); return; }
+      // Broker failure must not discard ownership/outcome evidence buffered before confirmation.
+      setRunQueued(queued);
+      queuedManualGeneration = generation;
+      setRunProgress(null);
+      setManualMode(scheduleFatal() ? "schedule-unknown" : "scheduled");
+      if (scheduleBufferOverflow) { scheduleUnknown("Scheduling updates exceeded the confirmation buffer."); return; }
+      const buffered = earlySchedule.splice(0);
+      for (const event of buffered) receiveSchedule(event);
+    } catch (error) {
+      if (generation !== manualGeneration || request !== scheduleGeneration) return;
+      scheduleConfirmationInFlight = false;
+      earlySchedule.length = 0;
+      earlyTerminals.clear();
+      if (scheduleFatal()) { scheduleUnknown("Scheduling state became uncertain while confirmation was pending."); return; }
+      if (error instanceof BrokerRejectionError && error.code === "schedule-stale") {
+        await prepareBusy(prepared.mode, "Current work changed. Review the new proposal and press Enter again.");
+      } else if (error instanceof BrokerRejectionError &&
+          ["schedule-repreview-required", "schedule-expired"].includes(error.code)) {
+        refreshScheduledPreview(dispatchResultDetail(error.code, error.detail, prepared.role));
+      } else if (error instanceof BrokerRejectionError && !HARD_SCHEDULE_FAILURES.has(error.code)) {
+        setRunPrepared(null);
+        setManualStatus(dispatchResultDetail(error.code, error.detail, prepared.role));
+        setManualMode("terminal");
+      } else scheduleUnknown("Scheduling confirmation failed; cancellation or startup could not be confirmed.");
+    }
+  }
+
+  function receiveSchedule(event: RunProgress | ScheduledDispatchAccepted): void {
+    if (!scheduleFlow()) return;
+    // A response and its events may share one JSONL batch, before confirmRun's await resumes.
+    if (scheduleConfirmationInFlight) {
+      if (earlySchedule.length < 40) earlySchedule.push(event);
+      else scheduleBufferOverflow = true;
+      return;
+    }
+    const queued = runQueued();
+    if (!queued || queuedManualGeneration !== manualGeneration || event.queueId !== queued.queueId) return;
+    if (event.operation === "accepted") {
+      if (acceptedDispatch() || scheduleFatal() && !scheduleBrokerFailed || slotReleased() && !queueCancelAcknowledged()) return;
+      const summary = capabilitySummary();
+      const failure = scheduleFatal() ? manualMonitorError() : "";
+      if (summary) {
+        acceptManual(event, summary, true);
+        if (acceptedDispatch()?.dispatchId === event.dispatchId) {
+          if (queueCancelAcknowledged()) inconsistentQueueCancellation();
+          else if (failure) scheduleUnknown(failure);
+        }
+      }
+      return;
+    }
+    if (scheduleFatal() || slotReleased()) return;
+    if (event.state === "resumed") {
+      setSlotReleased(true);
+      setRunProgress(event);
+      setAutomationNote("Automatic work resumed.");
+      if (acceptedDispatch() && manualTerminal()) setManualStatus("");
+      finishReleasedQueue();
+      return;
+    }
+    if (event.state === "blocked") {
+      scheduleBlockedCode = boundedText(event.code, 160);
+      const hardBlocked = HARD_SCHEDULE_FAILURES.has(event.code) || !REPREVIEW_SCHEDULE_BLOCKS.has(event.code);
+      if (hardBlocked) setScheduleFatal(true);
+      setRunProgress(event);
+      setAutomationNote(`Scheduling blocked: ${scheduleBlockedCode}. ${hardBlocked
+        ? "Slot retained; automatic admission remains closed. Press q to shut down."
+        : "Waiting for explicit slot release; no new request will be started."}`);
+      simpleManualScroll?.scrollTo(0);
+      if (!acceptedDispatch()) {
+        if (hardBlocked) scheduleUnknown(`Scheduling blocked: ${scheduleBlockedCode}. Slot release is unconfirmed.`);
+        else setManualMode("schedule-waiting-release");
+      }
+      return;
+    }
+    if (acceptedDispatch() || scheduleBlockedCode || queueCancelAcknowledged()) return;
+    setRunProgress(event);
+  }
+
+  function finishReleasedQueue(): void {
+    if (!slotReleased() || scheduleFatal() || acceptedDispatch() || queueCancelPending) return;
+    setManualMonitorError("");
+    setRunPrepared(null);
+    if (queueCancelAcknowledged()) {
+      setManualStatus("Queued request cancelled; the broker confirmed slot release and restored automatic admission.");
+      setManualMode("queue-cancelled");
+    } else if (queueCancelRequested || !scheduleBlockedCode) {
+      setManualStatus("Scheduling slot released. No manual acceptance or outcome was reported; cancellation is not inferred.");
+      setManualMode("schedule-ended");
+    } else {
+      // A blocked code alone never releases the slot, including errors during automatic restart.
+      // Only a correlated resumed event permits a fresh, separately consented attempt.
+      refreshScheduledPreview(scheduleBlockedCode);
+    }
+  }
+
+  async function cancelQueuedRun(): Promise<void> {
+    const queued = runQueued();
+    if (!scheduler || !queued || acceptedDispatch() || scheduleFatal() ||
+        !["scheduled", "schedule-unknown"].includes(manualMode())) return;
+    const generation = manualGeneration;
+    const request = scheduleGeneration;
+    queueCancelRequested = true;
+    queueCancelPending = true;
+    setManualMode("schedule-cancelling");
+    try {
+      const cancelled = await scheduler.cancelQueued(queued.queueId);
+      if (generation !== manualGeneration || request !== scheduleGeneration || runQueued()?.queueId !== queued.queueId) return;
+      queueCancelPending = false;
+      if (scheduleFatal()) return;
+      if (cancelled.queueId !== queued.queueId) { scheduleUnknown("Cancellation did not match the queued request."); return; }
+      setQueueCancelAcknowledged(true);
+      if (acceptedDispatch()) {
+        inconsistentQueueCancellation();
+        return;
+      }
+      setRunPrepared(null);
+      setManualMonitorError("");
+      setManualStatus("Cancellation acknowledged. Waiting for current work / authority cleanup and confirmed automatic resumption.");
+      setManualMode("schedule-waiting-release");
+      finishReleasedQueue();
+    } catch (error) {
+      if (generation !== manualGeneration || request !== scheduleGeneration || runQueued()?.queueId !== queued.queueId) return;
+      queueCancelPending = false;
+      if (scheduleFatal()) return;
+      if (acceptedDispatch()) {
+        if (!manualTerminal()) setManualStatus("The run started before queued cancellation. Use c to cancel this exact manual run.");
+        return;
+      }
+      scheduleUnknown(error instanceof BrokerRejectionError
+        ? `Queued cancellation was not confirmed: ${dispatchResultDetail(error.code, error.detail)}`
+        : "Queued cancellation was not confirmed.", error instanceof BrokerRejectionError && HARD_SCHEDULE_FAILURES.has(error.code));
+      finishReleasedQueue();
+    }
+  }
+
+  const schedulingPresentation = createMemo(() => {
+    if (!scheduleFlow()) return undefined;
+    const mode = manualMode();
+    const prepared = runPrepared();
+    const role = prepared?.role === "review-handler" ? "Review Handler" : "Reviewer";
+    const states: Record<string, string> = {
+      queued: "QUEUED / NOT STARTED", quiescing: "STOPPING CURRENT WORK / NOT STARTED",
+      "waiting-authority": "WAITING FOR AUTHORITY", revalidating: "REVALIDATING / NOT STARTED",
+    };
+    return {
+      headline: mode === "busy-preparing" ? "NOT STARTED / CHECKING OWNED WORK" :
+        mode === "busy-choice" ? prepared ? `NOT STARTED | ${role} PR #${prepared.conflict.pullRequestId} is busy` : "NOT STARTED / BACK" :
+        mode === "schedule-confirming" ? "CONFIRMING REQUEST" :
+        mode === "schedule-cancelling" ? "CANCELLING QUEUED REQUEST" :
+        mode === "schedule-unknown" ? "STATUS UNKNOWN" :
+        mode === "schedule-waiting-release" ? queueCancelAcknowledged() ? "CANCELLATION ACKNOWLEDGED / CLEANUP PENDING" : "BLOCKED / WAITING FOR SLOT RELEASE" :
+        mode === "schedule-ended" ? "REQUEST ENDED / OUTCOME UNKNOWN" :
+        mode === "queue-cancelled" ? "CANCELLED / NOT STARTED" :
+        mode === "scheduled" ? states[runProgress()?.state ?? "queued"] ?? "QUEUED / NOT STARTED" : "",
+      choosing: mode === "busy-choice", choice: busyChoice(), prepared,
+      automationNote: automationNote(), attention: runProgress()?.state === "blocked" || scheduleFatal(),
+    };
+  });
+  createEffect(() => {
+    revision();
+    if (scheduleFlow() && !slotReleased() && !scheduleFatal() && props.brokerFailure?.() &&
+        (runQueued() || scheduleConfirmationInFlight)) {
+      scheduleBrokerFailed = true;
+      setAutomationNote("Broker failure: scheduling-slot release and automatic resumption are unconfirmed.");
+      scheduleUnknown("Lost broker contact while scheduling; cancellation or startup is unconfirmed.");
+    }
+  });
+
   async function cancelManual(): Promise<void> {
     const accepted = acceptedDispatch();
-    if (!props.broker || !accepted || manualMode() !== "active") return;
-    setManualStatus("Requesting cooperative cancellation; forced cleanup follows only after the broker timeout.");
+    if (!props.broker || !accepted || manualMode() !== "active" || scheduleFatal()) return;
+    const generation = manualGeneration;
+    setManualMode("cancelling");
+    setManualMonitorError("");
+    setManualStatus("");
     try {
       const terminal = await props.broker.cancel(accepted.dispatchId);
-      setManualStatus(
-        terminal.result === "cancelled-forced"
-          ? "Cancellation was forced; the broker observed complete contained-process-tree exit."
-          : `Cancellation completed: ${terminal.result ?? "cooperative"}.`,
-      );
-      setManualMode("terminal");
+      if (generation !== manualGeneration) return;
+      if (terminal.dispatchId !== accepted.dispatchId) throw new Error("Cancellation response did not match this run.");
+      receiveManualTerminal(terminal);
     } catch (error) {
-      setManualStatus(error instanceof BrokerRejectionError
+      if (generation !== manualGeneration || manualTerminal()) return;
+      setManualMonitorError(error instanceof BrokerRejectionError
         ? dispatchResultDetail(error.code, error.detail)
-        : `Broker failure: ${error instanceof Error ? error.message : String(error)}`);
-      setManualMode("terminal");
+        : "Could not confirm cancellation. Retry c or quit to stop.");
+      setManualMode("active");
     }
   }
 
@@ -1012,8 +1872,9 @@ export function App(props: AppProps) {
   // the one this whole sub-flow requests.
   function canRequestWidening(): boolean {
     const summary = capabilitySummary();
-    return manualMode() === "confirm" && wideningStage() === "closed" &&
-      Boolean(summary) && !summary!.killSwitchActive && summary!.delegableAvailable.length === 1;
+    return !scheduleFlow() && uiMode() === "advanced" && manualMode() === "confirm" && wideningStage() === "closed" &&
+      props.launchMode !== "preview" && Boolean(summary) &&
+      !summary!.killSwitchActive && summary!.delegableAvailable.length === 1;
   }
 
   async function beginWidening(): Promise<void> {
@@ -1088,7 +1949,7 @@ export function App(props: AppProps) {
       setWideningPreview(null);
       setWideningStatus(
         `Widening minted: ${minted.capability} granted until ${minted.grantExpiresAtUtc}. ` +
-        "Continue with d then y to dispatch, or Esc to close and relinquish it.",
+        "Enter to start, or Esc to close and relinquish it.",
       );
     } catch (error) {
       if (requestId !== wideningRequestToken) return;
@@ -1504,6 +2365,7 @@ export function App(props: AppProps) {
   }
 
   async function quit(): Promise<void> {
+    manualGeneration += 1;
     setFeedback("Shutting down broker-owned manual work...");
     bestEffortCancelWidening();
     try {
@@ -1536,7 +2398,7 @@ export function App(props: AppProps) {
       notify("Select the instance rail first (Esc or Left)");
       return;
     }
-    const count = selectableCount(view(), Boolean(props.history), historyEntries().length, instances().length);
+    const count = selectableCount(view(), Boolean(props.history), historyEntries().length + exitedHistory().length, instances().length);
     if (!count) {
       notify("No instances are available");
       return;
@@ -1581,9 +2443,7 @@ export function App(props: AppProps) {
     }
   }
 
-  function cycleView(direction = 1): void {
-    const values: ViewFilter[] = ["live", "current", "history"];
-    const next = values[(values.indexOf(view()) + direction + values.length) % values.length] ?? "current";
+  function selectView(next: ViewFilter): void {
     setView(next);
     setSelected(0);
     setFocus("rail");
@@ -1591,16 +2451,79 @@ export function App(props: AppProps) {
     notify(`View filter changed to ${viewLabel(next)}`);
   }
 
+  function cycleView(direction = 1): void {
+    const values: ViewFilter[] = ["live", "current", "history"];
+    selectView(values[(values.indexOf(view()) + direction + values.length) % values.length] ?? "live");
+  }
+
+  async function dismissCurrentInstance(): Promise<void> {
+    if (dismissalPending()) {
+      notify("Please wait for the current dismissal operation");
+      return;
+    }
+    if (view() === "history" && props.history) {
+      notify("PR History is retained; use x to hide a PR row or l to return to instances");
+      return;
+    }
+    const instance = current();
+    const record = instance ? props.reducer.dismissalFor(instance.key) : null;
+    if (!record) {
+      notify(instance ? "Live agents cannot be dismissed; Delete never stops a process" : "No stale or finished instance is selected");
+      return;
+    }
+    if (!props.dismissalStorage) {
+      notify("Dashboard dismissal storage is unavailable");
+      return;
+    }
+    setDismissalPending(true);
+    try {
+      await props.dismissalStorage.save(record);
+      const dismissed = props.reducer.dismissInstance(record);
+      setRevision((value) => value + 1);
+      notify(dismissed ? "Instance dismissed across Watch restarts; logs and PR History retained" :
+        "Instance received new activity; kept visible");
+    } catch (error) {
+      setDismissalError(`Could not save dismissal: ${error instanceof Error ? error.message : String(error)}`);
+      notify("Dismissal could not be saved; instance kept visible");
+    } finally {
+      setDismissalPending(false);
+    }
+  }
+
+  async function restoreDismissedInstances(): Promise<void> {
+    if (dismissalPending()) {
+      notify("Please wait for the current dismissal operation");
+      return;
+    }
+    if (!props.dismissalStorage) {
+      notify("Dashboard dismissal storage is unavailable");
+      return;
+    }
+    setDismissalPending(true);
+    try {
+      const restored = await props.dismissalStorage.restoreAll();
+      props.reducer.restoreDismissedInstances();
+      setDismissalError("");
+      setRevision((value) => value + 1);
+      selectView("current");
+      notify(`${restored} dismissed instance(s) restored; logs were not changed`);
+    } catch (error) {
+      setDismissalError(`Could not restore dismissed instances: ${error instanceof Error ? error.message : String(error)}`);
+      notify("Could not restore dismissed instances");
+    } finally {
+      setDismissalPending(false);
+    }
+  }
+
   function forgetCurrentHistory(): void {
     if (view() === "history" && props.history) {
       const entry = historyEntries()[selected()];
-      if (!entry || !props.history.hide(entry.key)) {
-        notify("No PR history row is selected");
+      if (entry) {
+        props.history.hide(entry.key);
+        setRevision((value) => value + 1);
+        notify("PR history row hidden for this dashboard process");
         return;
       }
-      setRevision((value) => value + 1);
-      notify("PR history row hidden for this dashboard process");
-      return;
     }
     const instance = current();
     if (!instance || !props.reducer.forgetHistorical(instance.key)) {
@@ -1613,7 +2536,7 @@ export function App(props: AppProps) {
 
   function forgetAllHistory(): void {
     if (view() === "history" && props.history) {
-      const restored = props.history.restoreAll();
+      const restored = props.history.restoreAll() + props.reducer.restoreAllHistorical();
       setRevision((value) => value + 1);
       notify(restored ? `${restored} PR history row(s) restored for this dashboard process` : "No hidden PR history rows are available");
       return;
@@ -1659,7 +2582,11 @@ export function App(props: AppProps) {
   const warningAvailable = createMemo(() =>
     instances().some((item) => item.status === "failed" || item.status === "blocked" || item.sourceDiagnostics.length > 0),
   );
-  const palette = createMemo<PaletteCommand[]>(() => [
+  const scanCommands = (): PaletteCommand[] => scanVisible() ? [{
+    label: "Scan now", enabled: !scanUnavailable(), unavailable: scanUnavailable(),
+    run: () => { void requestScanNow(); },
+  }] : [];
+  const advancedPalette = createMemo<PaletteCommand[]>(() => [
     {
       label: "Focus instance rail",
       enabled: activeFocus() !== "rail",
@@ -1725,7 +2652,43 @@ export function App(props: AppProps) {
       unavailable: "Observe-only: trusted manual broker is unavailable",
       run: openNarrowingEditor,
     },
+    {
+      label: "Start Agent by PR ID",
+      enabled: Boolean(props.broker),
+      unavailable: "Observe-only: trusted manual broker is unavailable",
+      run: openManual,
+    },
+    {
+      label: view() === "live" ? "Show Current session (including stale)" : "Show Live only",
+      enabled: true,
+      unavailable: "",
+      run: () => selectView(view() === "live" ? "current" : "live"),
+    },
+    {
+      label: "Dismiss selected stale/finished instance (Delete)",
+      enabled: view() !== "history" && Boolean(current()) && !isLiveInstance(current()!, now()) && !dismissalPending(),
+      unavailable: "Select a stale or finished instance in Current session",
+      run: () => void dismissCurrentInstance(),
+    },
+    {
+      label: "Restore dismissed instances (Shift+Delete)",
+      enabled: Boolean(props.dismissalStorage) && !dismissalPending(),
+      unavailable: "Dashboard dismissal storage is unavailable or busy",
+      run: () => void restoreDismissedInstances(),
+    },
+    ...scanCommands(),
   ]);
+  const palette = createMemo<PaletteCommand[]>(() => uiMode() === "advanced" ? advancedPalette() : [
+    { label: "Start Agent by PR ID", enabled: Boolean(props.broker), unavailable: "Observe-only: trusted manual broker is unavailable", run: openManual },
+    { label: view() === "history" ? "Show Live" : "Show History", enabled: true, unavailable: "", run: toggleSimpleHistory },
+    { label: simpleDetail() ? "Back to list" : "Open selected details", enabled: Boolean(simpleDetail() || simpleRows().length),
+      unavailable: "No item is available", run: () => simpleDetail() ? setSimpleDetail(null) : openSimpleDetail() },
+    { label: "Show keyboard help", enabled: true, unavailable: "", run: () => setOverlay("help") },
+    { label: "Quit", enabled: true, unavailable: "", run: () => void quit() },
+    ...scanCommands(),
+  ]);
+  const paletteCapacity = () => Math.max(1, Math.min(22, dimensions().height - 4) - 5);
+  const paletteStart = () => selectionWindow(paletteIndex(), paletteCapacity());
 
   function executePalette(): void {
     const command = palette()[paletteIndex()];
@@ -1738,18 +2701,79 @@ export function App(props: AppProps) {
     command.run();
   }
 
+  usePaste((event) => {
+    if (manualMode() !== "target" && manualMode() !== "prompt") return;
+    event.preventDefault();
+    const value = new TextDecoder().decode(event.bytes);
+    if (manualMode() === "target") appendManualInput(value);
+    else {
+      const next = normalizeOperatorPrompt(operatorPrompt() + value);
+      if (promptScalarCount(next) > 512 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(next)) {
+        setManualStatus("Context paste rejected: maximum 512 Unicode scalars, no control characters.");
+      } else setOperatorPrompt(next);
+    }
+  });
+
   useKeyboard((key) => {
     if (manualMode() !== "closed") {
-      if (manualMode() === "prompt") {
+      // Kitty distinguishes held-key repeats. A freshly drawn preview is also required below,
+      // so buffered raw Enter presses cannot start on the transition that reveals the preview.
+      if (key.eventType === "release" || key.eventType === "repeat" || key.repeated) return;
+      if (key.name === "q" && manualMode() !== "target" && manualMode() !== "prompt") {
+        void quit();
+        return;
+      }
+      if (manualMode() === "busy-choice" && ["tab", "up", "down"].includes(key.name)) {
+        changeBusyChoice(key.name === "up" || key.name === "tab" && key.shift ? -1 : 1);
+        return;
+      }
+      if ((uiMode() === "simple" || scheduleFlow()) && manualMode() !== "target" && wideningStage() === "closed" &&
+          ["up", "down", "pageup", "pagedown"].includes(key.name)) {
+        simpleManualScroll?.scrollBy({ x: 0, y: scrollAmount(key.name) });
+        return;
+      }
+      if (scheduleFatal()) return;
+      if (manualMode() === "busy-choice") {
         if (key.name === "escape") closeManual();
-        else if (key.ctrl && key.name === "d") void describeManual();
-        else if (key.name === "tab") {
-          setManualRole((value) => value === "reviewer" ? "review-handler" : "reviewer");
-          setCapabilitySummary(null);
-        } else if (key.name === "backspace") {
+        else if (key.name === "return" && !key.ctrl && !key.meta && !key.shift) void confirmBusy();
+        return;
+      }
+      if (manualMode() === "busy-preparing") {
+        if (key.name === "escape") closeManual();
+        return;
+      }
+      if (manualMode() === "scheduled" || manualMode() === "schedule-unknown") {
+        if (key.name === "c" || key.name === "escape") void cancelQueuedRun();
+        return;
+      }
+      if (manualMode() === "schedule-confirming" || manualMode() === "schedule-cancelling" || manualMode() === "schedule-waiting-release") return;
+      if (manualMode() === "queue-cancelled" || manualMode() === "schedule-ended") {
+        if (key.name === "escape" || key.name === "return") closeManual();
+        return;
+      }
+      if (manualMode() === "target") {
+        if (key.name === "escape") closeManual();
+        else if (key.ctrl && key.name === "u") {
+          setManualInput("");
+          setManualInputRejected(false);
+          setManualStatus("");
+        } else if (key.name === "return") void resolveManual();
+        else if (key.name === "tab") setManualRole((value) => value === "reviewer" ? "review-handler" : "reviewer");
+        else if (key.name === "backspace" && !manualInputRejected()) {
+          setManualInput((value) => Array.from(value).slice(0, -1).join(""));
+          setManualStatus(parseManualPullRequestId(manualInput()) === null ? PR_INPUT_HELP : "");
+        } else {
+          const printable = printableKeySequence(key);
+          if (printable !== null) appendManualInput(printable);
+        }
+      } else if (manualMode() === "prompt") {
+        if (key.name === "escape") closeManual();
+        else if (key.ctrl && key.name === "d") setManualMode("confirm");
+        else if (key.name === "backspace") {
           setOperatorPrompt((value) => Array.from(value).slice(0, -1).join(""));
         } else if (key.name === "return") {
-          setOperatorPrompt((value) => appendPromptScalar(value, "\n"));
+          if (key.shift) setOperatorPrompt((value) => appendPromptScalar(value, "\n"));
+          else if (!key.ctrl && !key.meta) setManualMode("confirm");
         } else {
           const printable = printableKeySequence(key);
           if (printable !== null) {
@@ -1769,15 +2793,23 @@ export function App(props: AppProps) {
         } else if (wStage === "describing" || wStage === "confirming" || wStage === "minting" || wStage === "cancelling") {
           // A widening RPC is in flight; ignore keys until it settles rather than let d/Esc race it.
         } else if (key.name === "escape") closeManual();
+        else if (key.name === "return" && !key.ctrl && !key.meta && !key.shift) void dispatchManual();
+        else if (key.name === "p") { setManualStatus(""); setManualMode("prompt"); }
         else if (key.name === "d") setManualMode("confirm-final");
-        else if (key.name === "w" && canRequestWidening()) void beginWidening();
+        else if (key.name === "w") {
+          if (uiMode() === "simple") setManualStatus("Capability widening is in Advanced. Cancel this preview, then press a.");
+          else if (scheduleFlow()) setManualStatus("Scheduling uses the fresh baseline permissions. Cancel and reopen to request a new widening grant.");
+          else if (canRequestWidening()) void beginWidening();
+        }
       } else if (manualMode() === "confirm-final") {
         if (key.name === "escape") closeManual();
-        else if (key.name === "y") void dispatchManual();
+        else if (key.name === "y" || (key.name === "return" && !key.ctrl && !key.meta && !key.shift)) void dispatchManual();
       } else if (manualMode() === "active" && key.name === "c") {
         void cancelManual();
       } else if (manualMode() === "terminal" && (key.name === "escape" || key.name === "return")) {
         closeManual();
+      } else if (manualMode() === "resolving" || manualMode() === "describing") {
+        if (key.name === "escape") closeManual();
       }
       return;
     }
@@ -1817,6 +2849,9 @@ export function App(props: AppProps) {
         setPaletteIndex((value) => (value + palette().length - 1) % palette().length);
       } else if (key.name === "down" || key.name === "j") {
         setPaletteIndex((value) => (value + 1) % palette().length);
+      } else if (key.name === "pageup" || key.name === "pagedown") {
+        setPaletteIndex((value) => Math.max(0, Math.min(palette().length - 1,
+          value + (key.name === "pageup" ? -paletteCapacity() : paletteCapacity()))));
       } else if (key.name === "return") executePalette();
       return;
     }
@@ -1838,7 +2873,7 @@ export function App(props: AppProps) {
       if (key.name === "escape" || key.name === "?") {
         setOverlay("none");
         notify("Help closed");
-      }
+      } else if (scrollAmount(key.name)) helpScroll?.scrollBy({ x: 0, y: scrollAmount(key.name) });
       return;
     }
     if (overlay() === "settings") {
@@ -1949,6 +2984,26 @@ export function App(props: AppProps) {
       return;
     }
 
+    if (key.name === "r" && !key.ctrl && !key.meta && !key.shift) {
+      if (key.eventType !== "release" && key.eventType !== "repeat" && !key.repeated) void requestScanNow();
+      return;
+    }
+    if (key.name === "a") { toggleUiMode(); return; }
+    if (uiMode() === "simple") {
+      if (key.name === "m") openManual();
+      else if (key.name === "h") toggleSimpleHistory();
+      else if (key.name === "?") setOverlay("help");
+      else if (key.name === "escape") setSimpleDetail(null);
+      else if (key.name === "return" && !simpleDetail()) openSimpleDetail();
+      else if (scrollAmount(key.name)) {
+        if (simpleDetail()) simpleDetailScroll?.scrollBy({ x: 0, y: scrollAmount(key.name) });
+        else moveSimple(key.name === "pageup" || key.name === "pagedown"
+          ? Math.sign(scrollAmount(key.name)) * Math.max(1, Math.floor((dimensions().height - 5) / 2))
+          : scrollAmount(key.name));
+      } else if (["s", "i", "e", "f", "w", "l", "delete", "x", "tab", "/", "left", "right", "o"].includes(key.name) ||
+                 /^[0-9]$/.test(key.name)) notify("Press a for Advanced");
+      return;
+    }
     if (key.name === "up" || key.name === "k") move(-1);
     else if (key.name === "down" || key.name === "j") move(1);
     else if (key.name === "return") {
@@ -2004,6 +3059,11 @@ export function App(props: AppProps) {
     else if (key.name === "m") openManual();
     else if (key.name === "s") openSettings();
     else if (key.name === "f") cycleView(key.shift ? -1 : 1);
+    else if (key.name === "l") selectView(view() === "live" ? "current" : "live");
+    else if (key.name === "delete") {
+      if (key.shift) void restoreDismissedInstances();
+      else void dismissCurrentInstance();
+    }
     else if (key.name === "x") {
       if (key.shift) forgetAllHistory();
       else forgetCurrentHistory();
@@ -2031,20 +3091,85 @@ export function App(props: AppProps) {
     return props.reducer.globalDiagnostics();
   });
   const footer = createMemo(() => {
+    if (manualMode() !== "closed") {
+      const mode = manualMode();
+      if (scheduleFatal()) return {
+        summary: "Up/Down/PgUp/PgDn scroll", hint: "Scheduling slot blocked | q: quit and stop",
+      };
+      if (runQueued() && !slotReleased() && acceptedDispatch() && mode === "terminal") {
+        return { summary: "Up/Down/PgUp/PgDn scroll",
+          hint: "Waiting for automatic resumption | q: quit and stop" };
+      }
+      if (mode === "busy-choice") return {
+        summary: "Tab/Up/Down choose | PgUp/PgDn scroll",
+        hint: `Enter: ${busyChoice() === "replace" ? "Replace / run now" : busyChoice() === "next" ? "Run next" : "Back"} | Esc: Back | q: quit`,
+      };
+      if (mode === "busy-preparing") return { summary: "PgUp/PgDn scroll", hint: "Checking ownership only | Esc: Back | q: quit" };
+      if (mode === "scheduled") return { summary: "Up/Down/PgUp/PgDn scroll", hint: "c/Esc: cancel queued request | q: quit and stop" };
+      if (mode === "schedule-unknown") return { summary: "Up/Down/PgUp/PgDn scroll",
+        hint: "c/Esc: retry queued cancel | q: quit and stop" };
+      if (mode === "schedule-confirming" || mode === "schedule-cancelling") return {
+        summary: "Up/Down/PgUp/PgDn scroll", hint: "Please wait | q: quit and stop",
+      };
+      if (mode === "schedule-waiting-release") return { summary: "Up/Down/PgUp/PgDn scroll", hint: "Waiting for slot release | q: quit and stop" };
+      if (mode === "queue-cancelled" || mode === "schedule-ended") return { summary: "Up/Down/PgUp/PgDn scroll", hint: "Enter or Esc: close | q: quit" };
+      if (uiMode() === "simple" || scheduleFlow()) {
+        const hint = mode === "target" ? "Tab Agent | Enter Preview | Ctrl+U Clear | Esc Cancel" :
+          mode === "prompt" ? "Enter: return to preview | Shift+Enter: newline | Esc: cancel" :
+          mode === "confirm" || mode === "confirm-final" ? "Enter: START | p: instructions | Esc: cancel | q: quit" :
+          mode === "active" ? "c: cancel this run | q: quit and stop" :
+          mode === "terminal" ? "Enter or Esc: close | q: quit" :
+          mode === "dispatching" || mode === "cancelling" ? "Please wait | q: quit and stop" : "Esc: cancel | q: quit";
+        return { summary: mode === "target" || mode === "resolving" || mode === "describing" ? "" : "Up/Down/PgUp/PgDn scroll", hint };
+      }
+      const widening = wideningStage();
+      const hint = widening !== "closed"
+        ? widening === "preview" ? "c: review widening | Esc: cancel" :
+          widening === "summary" ? "y: mint widening | Esc: cancel" : "Widening pending | q: quit"
+        : mode === "target" ? "Tab: agent | Enter: preview | Esc: cancel" :
+          mode === "prompt" ? "Enter: preview | Shift+Enter: newline | Esc: cancel" :
+          mode === "confirm" || mode === "confirm-final" ? "Enter: START | Esc: cancel" :
+          mode === "active" ? "c: cancel this run | q: quit and stop" :
+          mode === "terminal" ? "Enter or Esc: close | q: quit" :
+          mode === "dispatching" || mode === "cancelling" ? "Please wait | q: quit and stop" :
+          "Please wait | Esc: cancel";
+      return { summary: "", hint };
+    }
+    if (uiMode() === "simple") {
+      if (overlay() !== "none") return { summary: "", hint: overlay() === "palette"
+        ? "Up/Down select | Enter run | Esc close" : "Up/Down/PgUp/PgDn scroll | Esc close" };
+      return {
+        summary: simpleDetail() ? "Esc Back | Up/Down/PgUp/PgDn scroll" : simpleRows().length ? "Enter Details" : "",
+        hint: `m Start agent | ${scanVisible() ? "r Scan now | " : ""}h ${view() === "history" ? "Live" : "History"} | a Advanced | q Quit`,
+      };
+    }
+    const scanHint = (hint: string): string => scanMainVisible()
+      ? dimensions().width < 80 ? "m Start | r Scan now | l Live | Del | f | ? | q" : hint.replace(" | ", " | r Scan now | ")
+      : hint;
     const live = instances().filter((item) => streamLabel(item) === "Live").length;
     const history = instances().filter((item) => streamLabel(item) === "History").length;
     const stale = instances().filter((item) => streamLabel(item) === "Stale").length;
     if (view() === "history" && props.history) {
       const input = historyInputMode() === "none" ? "" : ` | ${historyInputMode()}: ${historyInput()}`;
-      const summary = `PR history ${historyEntries().length}${historyFilter() ? ` | filter: ${historyFilter()}` : ""}${input}`;
-      return { summary, hint: "↑/↓ select | / filter | number jump | Tab role | x hide | X restore | m manual | f view | ? | q" };
+      const selectedPr = historyCurrent();
+      const selectedLabel = selectedPr
+        ? ` | selected ${selectedPr.repositoryIdentity.repositoryName} #${selectedPr.pullRequestId}`
+        : " | no PR selected";
+      const summary = `PR history ${historyEntries().length}${selectedLabel}${historyFilter() ? ` | filter: ${historyFilter()}` : ""}${input}`;
+      if (dimensions().width >= 120) {
+        return { summary, hint: scanHint("m Start Agent by PR ID | ↑/↓ | Tab role | / filter | number jump | x/X | f | ? | q") };
+      }
+      if (dimensions().width >= 80) {
+        return { summary, hint: scanHint("m Start Agent by PR ID | ↑/↓ | / filter | f | ? | q") };
+      }
+      return { summary, hint: scanHint("m Start Agent by PR ID | Enter | f | ? | q") };
     }
     const summary = dimensions().width < 80
       ? `${viewLabel(view())} ${instances().length} | L ${live} H ${history} S ${stale}`
       : `${viewLabel(view())} ${instances().length} | Live ${live} History ${history} Stale ${stale}`;
-    if (dimensions().width >= 120) return { summary, hint: "←/→ pane | ↑/↓ select | f view | Tab role | x/X forget | Enter/Esc | i/e/o/w | Ctrl+P | ? | q" };
-    if (dimensions().width >= 80) return { summary, hint: "f view | Tab role | x/X forget | Enter/Esc | i/e/o | ? | q" };
-    return { summary, hint: layout().showDetail ? "Esc | f view | x forget | i/e/o | ? | q" : "↑/↓ | Enter | f view | Tab | x/X | ? | q" };
+    if (dimensions().width >= 120) return { summary, hint: scanHint("m Start Agent by PR ID | l Live/Current | Del dismiss | f view | Ctrl+P | ? | q") };
+    if (dimensions().width >= 80) return { summary: `${viewLabel(view())} ${instances().length}`, hint: scanHint("m Start Agent by PR ID | l Live/Current | Del dismiss | f | ? | q") };
+    return { summary: `${viewLabel(view())} ${instances().length}`, hint: scanHint("m Start Agent by PR ID | l Live | Del | Enter | q") };
   });
   const headerContext = createMemo(() => {
     if (dimensions().width >= 120) {
@@ -2055,17 +3180,68 @@ export function App(props: AppProps) {
     }
     return `${view().toUpperCase()} | ${role().toUpperCase()} | FOCUS ${activeFocus().toUpperCase()}`;
   });
+  const showAutomationStatus = () => manualMode() === "closed" && overlay() === "none";
+  const advancedFooterHint = () => scanMainVisible() && footer().hint.length > dimensions().width - 2
+    ? "m Start | r Scan now | f Views | Ctrl+P | ? | q Quit" : footer().hint;
+  const advancedFooterSummary = () => {
+    if (!scanMainVisible()) return footer().summary;
+    const remaining = dimensions().width - advancedFooterHint().length - 3;
+    return remaining > 0 ? line(footer().summary, remaining) : "";
+  };
+  const automationLine = createMemo(() => {
+    revision();
+    if (props.brokerFailure?.() || automationQueryError() || automationHalted() && automationStatus()?.available) return "Auto: unavailable";
+    const status = automationStatus();
+    return status ? automationStatusText(status) : getAutomationStatus ? "Auto: checking..." : "Auto: unavailable";
+  });
+  const showFeedback = () => (uiMode() === "advanced" && !scheduleFlow() ||
+    (manualMode() === "closed" && overlay() === "none" && feedback() !== defaultFeedback)) &&
+    !(getAutomationStatus && showAutomationStatus() && dimensions().height <= 8 && feedback() === defaultFeedback);
+  const simpleHeight = () => Math.max(3, dimensions().height - 1 - (footer().summary ? 2 : 1) -
+    (showAutomationStatus() ? 1 : 0) - (showFeedback() ? 1 : 0) -
+    (diagnostics().length || props.brokerFailure?.() || dismissalError() || automationError() ? 1 : 0));
 
   return (
     <box width="100%" height="100%" flexDirection="column" backgroundColor={COLORS.bg}>
       <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
         <text height={1} fg={COLORS.brand}>DEVPILOT OPERATIONS</text>
-        <text height={1} fg={props.broker ? COLORS.warning : COLORS.muted}>
-          {props.broker ? "TRUSTED MANUAL ENABLED" : "OBSERVE ONLY"} | {headerContext()}
+        <text height={1} fg={props.launchMode === "operational" ? COLORS.error : props.broker ? COLORS.warning : COLORS.muted}>
+          <Show when={uiMode() === "simple"} fallback={
+          <>
+          {(props.launchMode ?? "observe") === "observe" && !props.broker
+            ? "OBSERVE ONLY"
+            : `${(props.launchMode ?? "observe").toUpperCase()} | ${props.broker ? "TRUSTED MANUAL ENABLED" : "NO MANUAL"}`} | {headerContext()}
+          </>
+          }>
+            {props.launchMode === "operational" ? "OPERATIONAL" : props.launchMode === "preview" ? "PREVIEW ONLY" : "OBSERVE ONLY"}
+          </Show>
         </text>
       </box>
-      <box flexGrow={1} flexDirection="row" gap={1} padding={1} overflow="hidden">
-        <Show when={manualMode() !== "closed" && manualEntry()} fallback={
+      <Show when={showAutomationStatus()}>
+        <box height={1} flexShrink={0} paddingX={1}>
+          <text height={1} fg={automationError() || props.brokerFailure?.() ? COLORS.warning : COLORS.muted}>
+            {line(automationLine(), Math.max(1, dimensions().width - 2))}
+          </text>
+        </box>
+      </Show>
+      <box flexGrow={1} minHeight={0} flexDirection="row" gap={1} padding={uiMode() === "simple" || scheduleFlow() ||
+        getAutomationStatus && showAutomationStatus() && dimensions().height <= 8 ? 0 : 1} overflow="hidden">
+        <Show when={uiMode() === "advanced" && !scheduleFlow()} fallback={
+          <Show when={manualMode() !== "closed"} fallback={
+            <SimpleView rows={simpleRows()} selectedKey={simpleSelectedKey()} detail={simpleDetail()}
+              history={view() === "history"} width={dimensions().width} height={simpleHeight()} colors={COLORS}
+              scrollRef={(value) => { simpleDetailScroll = value; }} />
+          }>
+            <SimpleManualPanel mode={manualMode()} role={manualRole()} targetInput={manualInput()} target={manualTarget()}
+              summary={capabilitySummary()} prompt={operatorPrompt()} accepted={Boolean(acceptedDispatch())}
+              status={manualStatus() || props.brokerFailure?.() || ""} progress={dispatchProgress()}
+              startUncertain={Boolean(manualMonitorError())} colors={COLORS}
+              advanced={uiMode() === "advanced"} processId={acceptedDispatch()?.childProcessId}
+              scheduling={schedulingPresentation()}
+              scrollRef={(value) => { simpleManualScroll = value; }} />
+          </Show>
+        }>
+        <Show when={manualMode() !== "closed"} fallback={
           <Show when={view() === "history" && props.history} fallback={
           <>
             <Show when={layout().showRail}>
@@ -2079,44 +3255,63 @@ export function App(props: AppProps) {
             </Show>
           </>
         }>
-          <History entries={historyEntries()} selected={selected()} compact={layout().mode === "compact"} />
+          <History entries={historyEntries()} exited={exitedHistory()} selected={selected()} compact={layout().mode === "compact"} detailOpen={detailOpen()} now={now()} focus={activeFocus()} />
           </Show>
         }>
-          {(entry: () => PullRequestHistoryEntry) => (
             <ManualDispatchPanel
               mode={manualMode()}
-              entry={entry()}
+              target={manualTarget()}
+              targetInput={manualInput()}
               role={manualRole()}
               prompt={operatorPrompt()}
               summary={capabilitySummary()}
               accepted={acceptedDispatch()}
               status={manualStatus() || props.brokerFailure?.() || ""}
+              progress={dispatchProgress()}
+              startUncertain={Boolean(manualMonitorError())}
               wideningStage={wideningStage()}
               wideningPreview={wideningPreview()}
               wideningStatus={wideningStatus()}
               mintedWideningGeneration={mintedWideningGeneration()}
+              wideningLocked={props.launchMode === "preview"}
             />
-          )}
+        </Show>
         </Show>
       </box>
-      <Show when={diagnostics().length > 0 || props.brokerFailure?.()}>
+      <Show when={diagnostics().length > 0 || props.brokerFailure?.() || dismissalError() || automationError()}>
         <box height={1} paddingX={1} backgroundColor="#282117">
           <text height={1} fg={COLORS.warning}>
             {props.brokerFailure?.()
               ? `BROKER FAILURE: ${line(props.brokerFailure?.() ?? "", Math.max(20, dimensions().width - 20))}`
-              : `SOURCE WARNING: ${line(diagnostics().at(-1)?.message ?? "event source error", Math.max(20, dimensions().width - 20))}`}
+              : dismissalError()
+                ? `DISPLAY STATE: ${line(dismissalError(), Math.max(20, dimensions().width - 20))}`
+                : automationError()
+                  ? `AUTO POLLING: ${line(automationError(), Math.max(20, dimensions().width - 16))}`
+                  : `SOURCE WARNING: ${line(diagnostics().at(-1)?.message ?? "event source error", Math.max(20, dimensions().width - 20))}`}
           </text>
         </box>
       </Show>
-      <box height={1} paddingX={1} backgroundColor={COLORS.brand}>
-        <text height={1} fg={COLORS.text}>STATUS: {line(feedback(), Math.max(10, dimensions().width - 10))}</text>
+      <Show when={showFeedback()}>
+      <box height={1} flexShrink={0} paddingX={1} backgroundColor={COLORS.brand}>
+        <text height={1} fg={COLORS.text}>STATUS: {line(manualMode() === "closed" ? feedback() :
+          dispatchProgress()?.headline ?? (manualMode() === "dispatching" ? manualMonitorError() ? "START STATUS UNKNOWN" : "STARTING..." :
+            manualMode() === "confirm" || manualMode() === "confirm-final" ? "NOT STARTED / READY TO START" :
+              manualStatus() || "Not started"), Math.max(10, dimensions().width - 10))}</text>
       </box>
-      <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
-        <text height={1} fg={COLORS.text}>{footer().summary}</text>
-        <text height={1} fg={COLORS.muted}>{footer().hint}</text>
+      </Show>
+      <Show when={uiMode() === "simple" || scheduleFlow()} fallback={
+      <box height={1} flexShrink={0} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
+        <text height={1} fg={COLORS.text}>{advancedFooterSummary()}</text>
+        <text height={1} fg={COLORS.muted}>{advancedFooterHint()}</text>
       </box>
+      }>
+        <box height={footer().summary ? 2 : 1} flexShrink={0} paddingX={1} flexDirection="column" backgroundColor={COLORS.panelAlt}>
+          <Show when={footer().summary}><text height={1} fg={COLORS.muted}>{footer().summary}</text></Show>
+          <text height={1} fg={COLORS.accent}>{footer().hint}</text>
+        </box>
+      </Show>
 
-      <Show when={layout().showInspector && layout().inspectorOverlay}>
+      <Show when={uiMode() === "advanced" && manualMode() === "closed" && layout().showInspector && layout().inspectorOverlay}>
         <OverlayPanel title="INSPECTOR" width={58} height={25}>
           <Inspector instance={current()} focused />
         </OverlayPanel>
@@ -2141,33 +3336,60 @@ export function App(props: AppProps) {
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "palette"}>
-        <OverlayPanel title="CONTEXT COMMANDS - VIEW ONLY" width={64} height={19}>
-          <For each={palette()}>
+        <OverlayPanel title="DASHBOARD COMMANDS" width={64} height={22} bounded>
+          <Index each={palette().slice(paletteStart(), paletteStart() + paletteCapacity())}>
             {(command, index) => (
-              <text height={1} fg={!command.enabled ? COLORS.muted : index() === paletteIndex() ? COLORS.accent : COLORS.text}>
-                {index() === paletteIndex() ? "> " : "  "}{command.label}{command.enabled ? "" : " [unavailable]"}
+              <text height={1} fg={!command().enabled ? COLORS.muted : index + paletteStart() === paletteIndex() ? COLORS.accent : COLORS.text}>
+                {index + paletteStart() === paletteIndex() ? "> " : "  "}{command().label}{command().enabled ? "" : " [unavailable]"}
               </text>
             )}
-          </For>
+          </Index>
           <text height={1} fg={COLORS.muted}>Up/Down select | Enter run | Esc dismiss</text>
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "help"}>
-        <OverlayPanel title={props.broker ? "HELP - TRUSTED MANUAL MODE" : "HELP - OBSERVE MODE"} width={78} height={25}>
+        <OverlayPanel title={uiMode() === "simple" ? "HELP - SIMPLE" : props.broker ? "HELP - TRUSTED MANUAL MODE" : "HELP - OBSERVE MODE"} width={78} height={29} bounded>
+          <scrollbox ref={(value) => { helpScroll = value; }} flexGrow={1} minHeight={0} scrollY>
+          <Show when={scanVisible()}>
+            <text flexShrink={0} wrapMode="word" fg={COLORS.text}>
+              r Scan now: wake idle automatic workers; busy/manual work is not interrupted.
+            </text>
+          </Show>
+          <Show when={uiMode() === "advanced"} fallback={
+            <>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>m Start agent: enter PR ID, Enter loads preview, Enter starts.</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>h History / Live</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>Up/Down select; Enter details; Esc back. PageUp/PageDown scroll.</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>p Optional instructions in preview; c cancels a running manual agent.</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>a Advanced (from the main view); a returns to Simple.</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>Ctrl+P Basic commands | q Quit</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.muted}>Live shows recent heartbeats. History retains reported outcomes; missing outcomes stay unknown.</text>
+            </>
+          }>
+          <text height={1} fg={COLORS.text}>a                  Return to Simple (Live, all roles)</text>
           <text height={1} fg={COLORS.text}>Left / Right      Focus visible pane</text>
           <text height={1} fg={COLORS.text}>Up/Down or j/k    Select instance when rail is focused</text>
           <text height={1} fg={COLORS.text}>Enter              Drill rail → narrative → timeline</text>
           <text height={1} fg={COLORS.text}>Esc / b            Back timeline/inspector → detail → rail</text>
           <text height={1} fg={COLORS.text}>Tab / Shift+Tab    Cycle role filter</text>
           <text height={1} fg={COLORS.text}>f / Shift+f        Cycle Live, Current session, History view</text>
+          <text height={1} fg={COLORS.text}>l                  Toggle Live only / Current (including stale)</text>
+          <text height={1} fg={COLORS.text}>Delete             Dismiss stale/finished instance across restarts</text>
+          <text height={1} fg={COLORS.text}>Shift+Delete       Restore dismissed instances</text>
           <text height={1} fg={COLORS.text}>x / Shift+x        Hide selected / restore hidden PR history rows</text>
           <text height={1} fg={COLORS.text}>i                  Open/close inspector</text>
           <text height={1} fg={COLORS.text}>e                  Raw events; Up/Down scroll; Left/Right filter</text>
           <text height={1} fg={COLORS.text}>w                  Next attention item</text>
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
-          <text height={1} fg={COLORS.text}>m                  Manual dispatch for selected retained PR (trusted launch only)</text>
-          <text height={1} fg={COLORS.text}>  (dispatch confirm) w   Request capability widening, if delegable (draft-bound)</text>
+          <text height={1} fg={COLORS.text}>m                  Start Agent by PR ID (no History required)</text>
+          <text height={1} fg={COLORS.text}>  ID + Enter: load preview | Enter after preview: START</text>
+          <text height={1} fg={COLORS.text}>  p: optional instructions in preview | c: cancel running child</text>
+          <text height={1} fg={COLORS.text}>
+            {"  (dispatch confirm) w   "}{props.launchMode === "preview"
+              ? "Widening locked by PreviewOnly"
+              : "Request capability widening, if delegable (draft-bound)"}
+          </text>
           <text height={1} fg={COLORS.text}>  (widening) c / y   Confirm preview / mint the grant | Esc cancels widening</text>
           <text height={1} fg={COLORS.text}>s                  Effective capability profile for the next manual launch</text>
           <text height={1} fg={COLORS.text}>  (in Settings) e   Edit persisted narrowing | k toggle kill switch</text>
@@ -2176,6 +3398,8 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[0]}</text>
           <text height={1} fg={COLORS.muted}>{HELP_LEGEND[1]}</text>
           <text height={1} fg={COLORS.warning}>{HELP_LEGEND[2]}</text>
+          </Show>
+          </scrollbox>
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "settings"}>
@@ -2189,6 +3413,9 @@ export function App(props: AppProps) {
           <box flexDirection="column" flexGrow={1}>
             <text height={1} fg={COLORS.warning}>Applies only to the next manual dispatch/process launch.</text>
             <text height={1} fg={COLORS.warning}>A running agent's own profile is immutable and is not shown here.</text>
+            <Show when={props.launchMode === "preview"}>
+              <text height={1} fg={COLORS.error}>PreviewOnly is a terminal ceiling: writes and capability widening are locked.</text>
+            </Show>
             <Show when={!narrowingMode()}>
               <text height={1} fg={COLORS.text}>
                 Role: {roleLabel(settingsRole())} | Tab role | r refresh | e edit narrowing | k kill switch | Esc/s close

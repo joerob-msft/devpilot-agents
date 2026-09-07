@@ -251,10 +251,10 @@ events are diagnostic only and cannot change agent selection or delivery.
 
 `tools\Start-DevPilotDashboard.ps1` is an OpenCode-inspired terminal UI over
 reviewer and review-handler event streams. Direct and attach-only launches are
-observe-only. A trusted `Watch-DevPilot*.ps1` launcher can separately opt in
-manual Reviewer or Review Handler dispatch. The TUI can only display and
-confirm the wrapper-derived capabilities; it cannot grant policy. Manual
-Reviewer approval votes are always disabled.
+observe-only. A trusted `Watch-DevPilot*.ps1` launcher can enable automatic and
+manual Reviewer or Review Handler operations. The TUI can display, narrow, and
+explicitly confirm only the launcher-derived capability ceiling; it cannot
+exceed that ceiling.
 
 The dashboard requires Node.js 24 or newer, PowerShell 7 for the watch
 launchers, and an interactive terminal at least 60 columns wide. Restore and
@@ -273,34 +273,94 @@ The launchers deliberately never install dependencies. If public npm is
 blocked, configure npm to use your organization's approved registry mirror
 before running `npm ci`.
 
-For the simplest workflow, run the launcher while the current directory is the
-consumer repository whose conventional agent configs should be used:
+For the primary operational workflow, run the launcher while the current
+directory is the consumer repository whose conventional agent configs should
+be used:
 
 ```powershell
-# Both preview-only agents, one cycle each:
+# Both agents loop continuously. Reviewer posts review results; Review Handler
+# replies, applies and validates fixes, resumes work, and pushes updates.
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden
+
+# Same live workflow with a terminal no-write capability ceiling:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden -PreviewOnly
+```
+
+`-Golden` is intentionally explicit because it grants write authority. It
+enables Reviewer finding comments, thread replies, and summaries, plus Review
+Handler replies, buddy requeues, code changes, local validation, session
+resume, and push. It does **not** enable Teams notifications, Reviewer approval
+votes, or Review Handler auto-complete. Those remain behind their separate
+existing gates.
+
+`-PreviewOnly` is not an omission-based convention. It is a terminal,
+non-delegable ceiling that disables automatic and manual PR mutations,
+notification delivery, Settings widening, and delegated grants. Use `-DryRun`
+only for an agent's offline self-check; it is not the live PreviewOnly mode.
+
+Every launch starts in **Simple** mode: a boxed left agent sidebar with selected
+activity beside it on wider terminals, or a compact list on narrow terminals.
+Use `Enter` for details and **`m` Start agent, `h` History, `a` Advanced, `q` Quit**.
+Advanced keeps the full panes, filters, diagnostics, settings, and stale-instance
+controls; press `a` again to return to Simple. Changing the view never changes
+the launch's authority.
+
+Golden still starts **both agents automatically**, without a manual command,
+and waits **900 seconds (15 minutes)** between successful scans by default.
+Failures use the existing retry backoff. The compact automatic-polling status
+shows the configured cadence and whether agents are scanning, waiting, or
+paused for manual work. Press **`r` Scan now** in a main view to wake this
+launcher's idle pollers early. It does not interrupt running work, queue an
+extra scan behind a busy agent, or bypass manual-work priority. It also does
+not restart stopped agents or grant control to an observe-only dashboard.
+The configured interval and Operational/PreviewOnly permissions stay unchanged.
+
+The golden TUI shows **OPERATIONAL** or **PREVIEW** in its header. Press `m`
+from Current, Live, or History to **Start Agent by PR ID**, or select that
+command in `Ctrl+P`. Enter a PR ID and use `Tab` to choose Reviewer (default)
+or Review Handler, then `Enter` to resolve it in that agent's configured
+repository and load the preview. No retained PR or History filter is required.
+Press `Enter` again after the preview is displayed to start:
+**m → ID → Enter (preview) → Enter (start)**. Optional instructions are behind
+`p` in the preview, not a mandatory step. The panel shows **NOT STARTED** before confirmation, **STARTING** while
+launching, and **STARTED / RUNNING** with the child PID and progress afterward.
+The current launch and up to 20 recent,
+independently trusted watch runs contribute to History. Every manual launch
+revalidates the PR's current state, author/ownership eligibility, and work
+lease before starting.
+Manual Reviewer launches allow your own PRs; automatic scans still exclude them
+by default. This does not grant approval-vote permission or bypass work leases.
+
+If the same launcher already has conflicting work, the manual panel offers
+**Replace and run now**, **Run next**, or **Back** in both view modes. Replace
+is selected initially but does nothing until you explicitly confirm it.
+It stops only that launcher's conflicting work and waits for confirmed process
+tree exit and lock release. Run next lets the current PR finish before the
+manual turn. Automatic scanning then resumes with its original settings.
+Already-posted comments and pushes are not undone. Queues belong to this Watch
+session; `c` cancels a pending request and quitting cancels the queue.
+Changed PR data or permissions require a fresh preview and confirmation.
+Work from another launcher, or work whose ownership cannot be established,
+cannot be replaced through this prompt.
+
+Advanced and compatibility modes remain available:
+
+```powershell
+# Existing bare behavior remains one preview cycle:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both
 
-# Both operational agents. Notification delivery is independently opt-in:
+# One operational golden cycle:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden -Once
+
+# Operational Teams delivery remains independently opt-in:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Operational `
     -EnableReviewerTeamsNotifications
 
-# Let the review-handler resume the originating session, fix, validate, reply, and push:
+# Explicit single-role and fixed-PR modes:
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Reviewer -Continuous
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent ReviewHandler -Operational `
     -EnableReviewHandlerCodeUpdates
-
-# Both agents, continuous 15-minute cadence:
-<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
-
-# Enable manual Reviewer describe/dispatch with Reviewer writes still disabled:
-<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -EnableManualReviewer
-
-# Enable explicitly trusted manual Reviewer comments/replies/summary:
-<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Both -EnableManualReviewer `
-    -EnableManualReviewerWrites
-
 # One agent, or one specific PR:
-<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Reviewer -Continuous
-<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent ReviewHandler -Continuous
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Agent Reviewer `
     -ReviewerPullRequestId 12345
 ```
@@ -320,12 +380,14 @@ local validation remain disabled by default. Add
 originating Copilot coding session when available, make code changes, run local
 validation, and push to the PR source branch. A missing local session starts a
 fresh coding session; this option does not require local ownership. Reviewer
-votes and review-handler auto-complete remain disabled. Teams delivery is
+votes and review-handler auto-complete remain default-denied and require the
+existing explicit, policy-authorized manual widening flow. Teams delivery is
 separate and requires the
 appropriate `-EnableReviewerTeamsNotifications` or
 `-EnableReviewHandlerTeamsNotifications` switch. Unless `-StateDir` is
-supplied, the agents share a generated temporary session root, so one dashboard
-can group their live and retained instances.
+supplied, the agents share a generated session root. Golden mode also reads a
+bounded set of trusted prior watch roots so one dashboard can group current
+activity and cross-launch PR history.
 
 Compatibility wrappers provide the shorter single-agent names:
 
@@ -366,27 +428,66 @@ more state roots:
 
 The standalone observer searches below each root for both agents' per-instance
 streams, including state layouts with agent-name subdirectories. It can also
-read explicit captures with `-EventLogPath`. The default **Current session**
-view shows every live instance plus the newest retained outcome per
-agent/session group. **Live** keeps active running, waiting, failed, blocked,
-and stale processes visible. **History** shows stopped or completed retained
-runs with timestamps and outcomes. `x` hides a selected PR history row and `Shift+x` restores hidden rows only in
-the current dashboard process; neither changes agent state or event logs.
-From a retained PR row, `m` opens manual dispatch when the trusted launcher
-enabled it. The optional multiline prompt is capped at 512 Unicode scalars.
-`Ctrl+d` performs a fresh provider-backed describe, then `d` and `y` are two
-separate confirmations of the displayed source commit, capability-policy
-digest, PR-state fingerprint, enabled capabilities, and disabled high-impact
-actions. `c` cancels only the broker-owned manual child. `q` awaits broker
-shutdown and never targets continuous watcher PIDs.
+read explicit captures with `-EventLogPath`. The default **Live** list shows
+instances with a heartbeat in the last 20 seconds, including waiting, failed,
+and blocked agents that are still heartbeating. Stale rows stay off this list.
+In Advanced, `l` toggles **Live** and the broader **Current session** view,
+which also includes retained outcomes and unconfirmed stale instances.
+Current trusted Watch children and accepted manual
+children have explicit local-process provenance. When their overdue PID is
+confirmed absent by a signal-free existence check, they leave Current and Live
+automatically. Arbitrary, copied, remote/container, attached, and older streams
+without that provenance remain stale warnings; local paths or matching PIDs do
+not establish origin. Heartbeat gaps, access errors, and present (possibly reused)
+PIDs never prove exit.
+Golden's private stdout captures stream live through the existing typed process
+helper, with 10 MiB active plus one 10 MiB rotation. Final draining never rewrites
+a live capture. Capture failures are visible and do not interrupt child cleanup.
+**History** retains PR outcomes plus exited-instance diagnostics, including
+legacy streams and runs without a completion event; those say **outcome unknown**,
+not success. In Advanced, `Delete` persistently dismisses a selected inactive
+instance across dashboard launches; `Shift+Delete` restores dismissed instances.
+A new heartbeat makes an instance visible again. Dismissal never stops a
+process or deletes logs, locks, or agent state. The separate `x` command hides
+a selected PR History row and `Shift+x` restores those rows only in the current
+dashboard process.
+From any main view, `m` opens the same blank **Start Agent by PR ID** form
+when the trusted launcher enabled it. The full ID must contain only ASCII
+digits and be in `1..2147483647`; invalid or oversized input never becomes a
+different PR ID. `Ctrl+U` clears the field. The broker resolves only the chosen
+role's trusted configured repository, which may differ between agents.
+The first `Enter` resolves the target and automatically fetches a fresh,
+key-bound preview. Verify the displayed repository, PR title, and role.
+The target and role are locked for that attempt; cancel and reopen to change them.
+Press `p` in the preview to edit optional instructions (512 Unicode scalars);
+`Shift+Enter` inserts a newline and `Enter` returns to preview without starting.
+The provider-backed preview shows the repository, PR, role, source commit,
+allowed actions, and denied actions. A separate `Enter` **after the preview is
+displayed** starts the exact bound snapshot, with the displayed operational capabilities
+(including authorized comments and pushes), or with terminal no-write denies
+under PreviewOnly. `Esc` also cancels pending resolution or describe reads;
+late responses cannot revive a cancelled attempt.
+The manual panel stays on that exact dispatch, independent of view filters or
+automatic agents watching the same PR. It shows elapsed time and latest progress,
+explicitly says when no events have arrived, and distinguishes finished, failed,
+blocked, cancelled, and unknown monitoring status. Exit code zero without a work
+outcome is reported as a child exit, not a successful review. `c` cancels the run.
+Capability widening still requires its separate `c` / `y` challenge confirmations;
+neither Enter nor instruction text can mint a grant.
+`c` cancels the pending manual request or the accepted manual child, not an
+unrelated observed agent. `q` awaits broker shutdown; Golden stops its own
+automatic and manual process trees, never another launcher's workers.
 
 Describe and dispatch failures remain distinct in the UI, including
 `source-changed`, `policy-changed`, `pr-state-changed`, `delivery-pending`,
 `already-running` with lease/state contention detail, broker launch failure,
 child failure, and cooperative versus forced cancellation.
 
-The layout adapts from three panes on a wide terminal to a single
-overview/detail route below 80 columns:
+Simple shows its boxed sidebar at 100 columns and wider when at least four
+content rows are available; otherwise it uses a single-pane list and detail
+drill-down. **Advanced** adapts from three
+panes on a wide terminal to a single overview/detail route below 80 columns
+and exposes these additional controls alongside the common commands:
 
 | Key | Action |
 |---|---|
@@ -395,6 +496,13 @@ overview/detail route below 80 columns:
 | `Enter` / `Esc` | Drill into or back out of detail and timeline views |
 | `Tab` / `Shift+Tab` | Cycle all, reviewer, and review-handler roles |
 | `f` / `Shift+f` | Cycle Live, Current session, and History |
+| `l` | Toggle Live-only and Current session |
+| `Delete` / `Shift+Delete` | Dismiss an inactive instance across launches / restore dismissed instances |
+| `m` | Start Agent by PR ID, without selecting a History row |
+| `Tab`, then `Enter` in PR entry | Choose agent, then resolve the configured repository/PR and load preview |
+| `p` in preview | Edit optional instructions; Enter returns to preview without starting |
+| `Enter` in preview | Explicitly start after the preview has been displayed |
+| `Shift+Enter` in instructions | Insert a newline |
 | `x` / `Shift+x` | Forget selected/all history from dashboard view state |
 | `i` / `e` | Toggle the inspector or bounded raw-events overlay |
 | `w` | Select the next failed, blocked, or diagnostic-bearing instance |

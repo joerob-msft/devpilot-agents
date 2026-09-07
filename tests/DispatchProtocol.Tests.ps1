@@ -389,14 +389,18 @@ Describe 'dispatch protocol primitives' {
             '-Agent', 'ReviewHandler', '-ReviewerPullRequestId', '0') `
             -CaptureStdOut -CaptureStdErr -TimeoutSeconds 20
         $invalid.ExitCode | Should -Not -Be 0
-        $invalid.StdErr | Should -Match 'ReviewerPullRequestId must be greater than zero'
+        $invalidText = $invalid.StdErr -join [Environment]::NewLine
+        $invalidText | Should -Match 'ReviewerPullRequestId'
+        $invalidText | Should -Match 'must be greater than zero'
 
         $mismatched = Invoke-TimedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList @(
             '-NoProfile', '-NonInteractive', '-File', $watchPath,
             '-Agent', 'ReviewHandler', '-ReviewerPullRequestId', '104') `
             -CaptureStdOut -CaptureStdErr -TimeoutSeconds 20
         $mismatched.ExitCode | Should -Not -Be 0
-        $mismatched.StdErr | Should -Match 'ReviewerPullRequestId requires -Agent Reviewer or -Agent Both'
+        $mismatchedText = $mismatched.StdErr -join [Environment]::NewLine
+        $mismatchedText | Should -Match 'ReviewerPullRequestId'
+        $mismatchedText | Should -Match 'requires -Agent Reviewer or -Agent Both'
     }
 
     It 'creates broker authority only when a manual role is enabled' {
@@ -686,12 +690,14 @@ Describe 'dispatch protocol primitives' {
             # create the manual-dispatch draft directory -- each is rejected the same way describe()
             # would be for this unconfigured role, proving the read-only path never reaches
             # New-ConfigSnapshot regardless of how many times it is called.
-            for ($i = 0; $i -lt 3; $i++) {
+            foreach ($operation in @('profile', 'profile-current', 'profile-current')) {
                 $profileId = [Guid]::NewGuid().ToString('D')
-                $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson @{
-                            schemaVersion = 1; requestId = $profileId; operation = 'profile'
-                            role = 'reviewer'; pullRequestId = 1; repositoryKey = 'v1:github:1'
-                        }))
+                $body = @{
+                    schemaVersion = 1; requestId = $profileId; operation = $operation
+                    role = 'reviewer'; pullRequestId = 1
+                }
+                if ($operation -eq 'profile') { $body.repositoryKey = 'v1:github:1' }
+                $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson $body))
                 $profileResponseTask = $process.StandardOutput.ReadLineAsync()
                 $profileResponseTask.Wait(10000) | Should -BeTrue `
                     -Because 'the broker must process each repeated profile request while stdin remains open'
@@ -700,6 +706,35 @@ Describe 'dispatch protocol primitives' {
                 $profileResponse.operation | Should -BeExactly 'rejected'
                 $profileResponse.code | Should -BeExactly 'role-not-allowed'
                 Test-Path (Join-Path $stateRoot 'manual-dispatch') | Should -BeFalse
+            }
+
+            foreach ($operation in @('profile-current', 'profile', 'describe')) {
+                foreach ($rawId in @('null', 'true', '"104"', '-1', '0', '1.2', '2147483648', '1e400', '[]', '[104]', '[[104]]', '[2147483647]', '{}')) {
+                    $requestId = [Guid]::NewGuid().ToString('D')
+                    $process.StandardInput.WriteLine(
+                        '{"schemaVersion":1,"requestId":"' + $requestId + '","operation":"' + $operation +
+                        '","role":"reviewer","pullRequestId":' + $rawId + '}')
+                    $read = $process.StandardOutput.ReadLineAsync()
+                    $read.Wait(10000) | Should -BeTrue
+                    $response = $read.Result | ConvertFrom-Json -AsHashtable
+                    $response.requestId | Should -BeExactly $requestId
+                    $response.operation | Should -BeExactly 'rejected'
+                    $response.code | Should -BeExactly 'invalid-request' -Because "$operation must not coerce $rawId"
+                }
+            }
+
+            foreach ($field in @('repositoryKey', 'repository', 'configFile', 'configRoot', 'repositoryRoot', 'scriptPath', 'DiscoverCurrent')) {
+                $requestId = [Guid]::NewGuid().ToString('D')
+                $request = @{
+                    schemaVersion = 1; requestId = $requestId; operation = 'profile-current'
+                    role = 'reviewer'; pullRequestId = 104
+                }
+                $request[$field] = 'caller-override'
+                $process.StandardInput.WriteLine((ConvertTo-AgentCanonicalJson $request))
+                $read = $process.StandardOutput.ReadLineAsync()
+                $read.Wait(10000) | Should -BeTrue
+                $response = $read.Result | ConvertFrom-Json -AsHashtable
+                $response.code | Should -BeExactly 'invalid-request'
             }
 
             $shutdownId = [Guid]::NewGuid().ToString('D')
@@ -719,10 +754,167 @@ Describe 'dispatch protocol primitives' {
             $process.ExitCode | Should -Be 0 -Because $stderr
             Test-Path (Join-Path $stateRoot 'manual-dispatch') | Should -BeFalse
         }
+
         finally {
             if (-not $process.HasExited) { $process.Kill($true); [void]$process.WaitForExit(5000) }
             $process.Dispose()
         }
+    }
+
+    Describe 'configured-role PR discovery without retained history' {
+            BeforeAll {
+                $tokens = $null
+                $parseErrors = $null
+                $ast = [Management.Automation.Language.Parser]::ParseFile($brokerPath, [ref]$tokens, [ref]$parseErrors)
+                $parseErrors.Count | Should -Be 0
+                $names = @(
+                    'Get-OptionalMember', 'Assert-RoleCapabilityPolicy', 'Get-RoleDescriptor',
+                    'Remove-ExpiredDrafts', 'Open-BrokerProvider', 'Get-BrokerPullRequest', 'ConvertTo-BrokerPrSnapshot',
+                    'New-ConfigSnapshot', 'Get-BrokerNarrowingEffect', 'Get-BrokerCapabilityProfile',
+                    'Invoke-Profile', 'Invoke-ProfileCurrent', 'Invoke-Describe', 'Write-DispatchProtocolMessage'
+                )
+                $definitions = $ast.FindAll({
+                        param($node)
+                        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
+                    }, $false)
+                foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
+            }
+
+            BeforeEach {
+                $script:toolkitRoot = (Resolve-Path "$PSScriptRoot\..").Path
+                $script:stateRoot = Resolve-AgentTrustedRoot -Path (Join-Path $TestDrive ([Guid]::NewGuid().ToString('N'))) `
+                    -Kind watch-state -RepositoryRoot $toolkitRoot -Create
+                $script:durableRoot = Join-Path $stateRoot 'durable'
+                $script:drafts = @{}
+                $script:children = @{}
+                $script:descriptor = @{ roles = @{} }
+                foreach ($role in @('reviewer', 'review-handler')) {
+                    $configPath = Join-Path $stateRoot "$role.json"
+                    @{
+                        provider = 'GitHub'
+                        repository = @{ organization = 'configured'; name = $role }
+                    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configPath -Encoding utf8NoBOM
+                    $harness = Get-AgentHarnessCapabilityDescriptor -Role $role
+                    $descriptor.roles[$role] = @{
+                        enabled = $true; configRoot = $stateRoot; configFile = $configPath; repositoryRoot = $toolkitRoot
+                        capabilities = @($harness.allowedManualCapabilities)
+                        mandatoryDenies = @($harness.delegableDefaultOff); absoluteDenies = @()
+                    }
+                }
+                $script:responses = [Collections.Generic.List[object]]::new()
+                Mock Write-DispatchProtocolMessage {
+                    param($Message)
+                    $script:responses.Add(((ConvertTo-AgentCanonicalJson $Message) | ConvertFrom-Json -AsHashtable))
+                }
+                Mock New-AgentProviderContext {
+                    param($Provider, $Organization, $RepositoryName)
+                    @{ Provider = $Provider; Organization = $Organization; RepositoryName = $RepositoryName }
+                }
+                Mock Resolve-AgentProviderRepositoryIdentity {
+                    param($Context)
+                    $id = if ($Context.RepositoryName -eq 'reviewer') { '101' } else { '202' }
+                    @{
+                        schemaVersion = 1; provider = 'GitHub'; repositoryId = $id; key = "v1:github:$id"
+                        organization = 'configured'; project = ''; repositoryName = $Context.RepositoryName
+                        slug = "configured/$($Context.RepositoryName)"; verified = $true; dispatchEligible = $true
+                        verifiedAtUtc = '2026-09-05T00:00:00Z'
+                    }
+                }
+                Mock Get-AgentProviderPullRequestSnapshot {
+                    param($Context, $PullRequestId)
+                    @{
+                        sourceCommitId = ('a' * 40); sourceRefName = 'feature'; targetRefName = 'main'
+                        status = 'open'; isDraft = $false; authorAlias = 'Ada'; title = "Unobserved PR $PullRequestId"
+                    }
+                }
+                Mock Get-AgentDurableStateContext { @{ } }
+                Mock Get-AgentDurableRecordsSnapshot { @{ } }
+                Mock Test-AgentReviewerDeliveryPending { $false }
+                Mock Get-AgentDelegationPolicyOrNull { $null }
+                Mock Enter-AgentCapabilityOverrideLock { @{ Acquired = $true; Stream = $null } }
+                Mock Exit-AgentLock {}
+                Mock Resolve-AgentEffectiveCapabilitySettings {
+                    @{ Settings = @{}; Provenance = @{}; KillSwitchActive = $false; KillSwitchExpiresAtUtc = $null }
+                }
+                Mock New-ConfigSnapshot { throw 'Discovery must not allocate a snapshot' }
+            }
+
+            It 'resolves the same never-observed ID in each configured repository with the operational ceiling, without drafts' {
+                foreach ($role in @('reviewer', 'review-handler')) {
+                    1..2 | ForEach-Object {
+                        Invoke-ProfileCurrent @{
+                            schemaVersion = 1; requestId = [Guid]::NewGuid().ToString('D')
+                            operation = 'profile-current'; pullRequestId = 2147483647; role = $role
+                        }
+                        $response = $responses[$responses.Count - 1]
+                        $response.operation | Should -BeExactly 'capability-profile'
+                        $response.role | Should -BeExactly $role
+                        $response.prSnapshot.pullRequestId | Should -Be 2147483647
+                        $response.prSnapshot.title | Should -BeExactly 'Unobserved PR 2147483647'
+                        $response.repositoryIdentity.key | Should -BeExactly $(if ($role -eq 'reviewer') { 'v1:github:101' } else { 'v1:github:202' })
+                        $response.capabilities | Should -Contain $(if ($role -eq 'reviewer') { 'EnableFindingComments' } else { 'EnablePush' })
+                        $response.ContainsKey('dispatchDraftId') | Should -BeFalse
+                        $response.ContainsKey('capabilityPolicyDigest') | Should -BeFalse
+                        $drafts.Count | Should -Be 0
+                        Test-Path (Join-Path $stateRoot 'manual-dispatch') | Should -BeFalse
+                    }
+                }
+                Should -Invoke New-ConfigSnapshot -Times 0 -Exactly
+                Should -Invoke New-AgentProviderContext -Times 2 -Exactly -ParameterFilter { $RepositoryName -eq 'reviewer' }
+                Should -Invoke New-AgentProviderContext -Times 2 -Exactly -ParameterFilter { $RepositoryName -eq 'review-handler' }
+            }
+
+            It 'keeps keyed profile and describe guards after discovery and rejects all caller authority fields' {
+                $request = @{ schemaVersion = 1; requestId = 'test'; operation = 'profile-current'; role = 'reviewer'; pullRequestId = 104 }
+                Invoke-ProfileCurrent $request
+                $bound = $request.Clone()
+                $bound.repositoryKey = 'v1:github:202'
+                $bound.DiscoverCurrent = $true
+                { Invoke-Profile $bound } | Should -Throw '*repository-mismatch*'
+                { Invoke-Describe $bound } | Should -Throw '*repository-mismatch*'
+                $bound.repositoryKey = 'v1:github:101'
+                Invoke-Profile $bound
+                $responses.Count | Should -Be 2
+                foreach ($field in @('repositoryKey', 'repository', 'repositoryRoot', 'configFile', 'scriptPath', 'DiscoverCurrent', 'Role')) {
+                    $override = [hashtable]::new([StringComparer]::Ordinal)
+                    foreach ($key in $request.Keys) { $override[$key] = $request[$key] }
+                    $override[$field] = 'untrusted'
+                    { Invoke-ProfileCurrent $override } | Should -Throw '*invalid-request*'
+                }
+                Should -Invoke New-ConfigSnapshot -Times 0 -Exactly
+            }
+
+            It 'rejects invalid raw PR types before conversion or provider reads, and rejects exact-role violations' {
+                foreach ($raw in @('null', 'true', '"104"', '-1', '0', '1.2', '2147483648', '1e400', '[]', '[104]', '[[104]]', '[2147483647]', '{}')) {
+                    $request = ('{"role":"reviewer","pullRequestId":' + $raw + '}') | ConvertFrom-Json -AsHashtable
+                    { Get-BrokerCapabilityProfile $request -DiscoverCurrent } | Should -Throw '*invalid-request*'
+                }
+                foreach ($role in @('Reviewer', 'REVIEWER', 'other', @('reviewer'))) {
+                    { Invoke-ProfileCurrent @{ role = $role; pullRequestId = 104 } } | Should -Throw '*role-not-allowed*'
+                }
+                $descriptor.roles.reviewer.enabled = $false
+                { Invoke-ProfileCurrent @{ role = 'reviewer'; pullRequestId = 104 } } | Should -Throw '*role-not-allowed*'
+                Should -Invoke New-AgentProviderContext -Times 0 -Exactly
+                $responses.Count | Should -Be 0
+            }
+
+            It 'preserves PreviewOnly terminal denies and rejects unavailable or ineligible provider results' {
+                $role = $descriptor.roles['review-handler']
+                $harness = Get-AgentHarnessCapabilityDescriptor -Role review-handler
+                $role.capabilities = @()
+                $role.absoluteDenies = @($harness.allowedManualCapabilities) + @($harness.delegableDefaultOff)
+                $role.mandatoryDenies = $role.absoluteDenies
+                Invoke-ProfileCurrent @{ role = 'review-handler'; pullRequestId = 104 }
+                $responses[0].capabilities.Count | Should -Be 0
+                $responses[0].absoluteDenies | Should -Contain 'EnablePush'
+                $responses[0].delegableAvailable.Count | Should -Be 0
+                Mock Get-AgentProviderPullRequestSnapshot { @{ status = 'closed'; isDraft = $false; title = 'closed' } }
+                { Invoke-ProfileCurrent @{ role = 'review-handler'; pullRequestId = 104 } } | Should -Throw '*pr-state-changed*'
+                Mock Resolve-AgentProviderRepositoryIdentity { throw '[provider-unavailable] Could not resolve provider.' }
+                { Invoke-ProfileCurrent @{ role = 'review-handler'; pullRequestId = 104 } } | Should -Throw '*provider-unavailable*'
+                $responses.Count | Should -Be 1
+                Should -Invoke New-ConfigSnapshot -Times 0 -Exactly
+            }
     }
 
     It 'rejects case-variant roles (Reviewer, REVIEWER) consistently across describe, profile, preview-narrowing, and set-kill-switch' {

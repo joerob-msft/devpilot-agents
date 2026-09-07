@@ -1,4 +1,6 @@
-import { basename, dirname, normalize } from "node:path";
+import { basename, dirname, isAbsolute, normalize, resolve } from "node:path";
+import type { InstanceDismissal } from "./dismissals.js";
+import { observeProcess, type LocalProcessStream, type ProcessObserver } from "./process-observer.js";
 import {
   boundedText,
   eventKey,
@@ -28,6 +30,7 @@ const STATUS_ORDER: Record<InstanceStatus, number> = {
   stale: 2,
   waiting: 3,
   completed: 4,
+  exited: 5,
 };
 
 function statusOrder(state: InstanceState): number {
@@ -97,6 +100,8 @@ function newState(event: AgentEvent, source: string): InstanceState {
     completion: null,
     waiting: null,
     lifecycle: "starting",
+    exitObservedMs: null,
+    processOrigin: "unknown",
     currentRunStartedMs: event.timestampMs,
     modelActivity: "Not started",
     lastEventMs: event.timestampMs,
@@ -137,6 +142,7 @@ function addBounded<T>(items: T[], item: T, limit: number): T[] {
 
 function calculateStatus(state: InstanceState, now: number): InstanceStatus {
   if (state.completion?.result === "failed" || state.timeline.at(-1)?.eventType === "cycle.failed") return "failed";
+  if (state.exitObservedMs !== null) return state.completion ? "completed" : "exited";
   if (state.blocked) return "blocked";
   if (state.lifecycle !== "stopped" && now - state.lastHeartbeatMs > STALE_AFTER_MS) return "stale";
   if (state.waiting) return "waiting";
@@ -145,7 +151,11 @@ function calculateStatus(state: InstanceState, now: number): InstanceStatus {
 }
 
 function isHistorical(state: InstanceState): boolean {
-  return state.lifecycle === "stopped" || state.status === "completed";
+  return state.exitObservedMs !== null || state.lifecycle === "stopped" || state.status === "completed";
+}
+
+export function isLiveInstance(state: InstanceState, now = Date.now()): boolean {
+  return !isHistorical(state) && now - state.lastHeartbeatMs <= STALE_AFTER_MS;
 }
 
 export function liveElapsedMilliseconds(state: InstanceState, now = Date.now()): number {
@@ -158,20 +168,95 @@ export function liveElapsedMilliseconds(state: InstanceState, now = Date.now()):
 
 export function totalElapsedMilliseconds(state: InstanceState, now = Date.now()): number {
   if (state.completion?.elapsedMilliseconds) return state.completion.elapsedMilliseconds;
-  const end = state.lifecycle === "stopped" ? state.lastEventMs : now;
+  const end = state.exitObservedMs !== null || state.lifecycle === "stopped" ? state.lastEventMs : now;
   return Math.max(0, end - state.currentRunStartedMs);
 }
 
 export class OperationsReducer {
   private readonly states = new Map<string, InstanceState>();
+  private readonly dispatchBindings = new Map<string, AgentEvent>();
   private readonly sourceKeys = new Map<string, Set<string>>();
   private readonly pendingSourceDiagnostics = new Map<string, SourceDiagnostic[]>();
   private readonly diagnostics: SourceDiagnostic[] = [];
   private readonly forgottenHistory = new Set<string>();
+  private lastProcessCheckMs = -Infinity;
+  private observingProcesses = false;
+  private eventRevision = 0;
+  private readonly localStreams = new Map<string, LocalProcessStream>();
+  private readonly originEvidence = new Map<string, { event: AgentEvent; source: string }>();
+  private readonly dismissedInstances: Map<string, InstanceDismissal>;
+
+  constructor(dismissals: readonly InstanceDismissal[] = []) {
+    this.dismissedInstances = new Map(dismissals.map((record) => [record.key, { ...record }]));
+  }
+
+  registerLocalStream(stream: LocalProcessStream): void {
+    if (!isAbsolute(stream.eventLogPath) || /[\u0000-\u001f\u007f]/.test(stream.eventLogPath) ||
+        !Number.isSafeInteger(stream.processId) || stream.processId <= 0 || stream.processId > 2_147_483_647 ||
+        (stream.role !== "reviewer" && stream.role !== "review-handler")) return;
+    // This is called only with launch/control-channel provenance, never CLI event paths,
+    // file contents, host labels, or a PID existence result.
+    this.localStreams.set(this.streamPath(stream.eventLogPath), { ...stream });
+    // Acceptance can arrive after the first file read. Reconcile only an actual
+    // source/event pair, never a reconstructed event or another source's tuple.
+    for (const [key, { event, source }] of this.originEvidence) {
+      const state = this.states.get(key);
+      if (state?.processId === event.processId && this.hasLocalOrigin(event, source)) state.processOrigin = "local";
+    }
+  }
+
+  private streamPath(source: string): string {
+    const path = resolve(source).replace(/\.jsonl\.[1-5]$/i, ".jsonl");
+    return process.platform === "win32" ? path.toLowerCase() : path;
+  }
+
+  private hasLocalOrigin(event: AgentEvent, source: string): boolean {
+    if (!source) return false;
+    const stream = this.localStreams.get(this.streamPath(source));
+    if (!stream || stream.processId !== event.processId || stream.role !== event.agent) return false;
+    return stream.dispatch
+      ? event.dispatch?.dispatchId === stream.dispatch.dispatchId &&
+        event.repositoryIdentity?.verified === true &&
+        event.repositoryIdentity.key === stream.dispatch.repositoryKey &&
+        (event.pullRequestId === 0 || event.pullRequestId === stream.dispatch.pullRequestId)
+      : event.dispatch === null;
+  }
+
+  async observeProcesses(observe: ProcessObserver = observeProcess, now = Date.now()): Promise<boolean> {
+    if (this.observingProcesses || now - this.lastProcessCheckMs < 5_000) return false;
+    this.lastProcessCheckMs = now;
+    this.observingProcesses = true;
+    let changed = false;
+    try {
+      const candidates = [...this.states.values()]
+        .filter((state) => state.processOrigin === "local" && state.exitObservedMs === null && state.lifecycle !== "stopped" &&
+          now - Math.max(state.lastEventMs, state.lastHeartbeatMs) > STALE_AFTER_MS)
+        .map((state) => ({ key: state.key, processId: state.processId, sequence: state.lastSequence }));
+      for (const candidate of candidates) {
+        const revision = this.eventRevision;
+        let presence;
+        try { presence = await observe(candidate.processId); } catch { continue; }
+        const state = this.states.get(candidate.key);
+        // Absence is scoped to this snapshot, not a PID cache: new events or a changed PID
+        // invalidate the read. A present/reused/unobservable PID stays visible as stale.
+        if (presence !== "absent" || revision !== this.eventRevision || !state || state.processId !== candidate.processId ||
+            state.lastSequence !== candidate.sequence) continue;
+        state.exitObservedMs = now;
+        state.status = calculateStatus(state, now);
+        changed = true;
+      }
+    } finally {
+      this.observingProcesses = false;
+    }
+    return changed;
+  }
 
   apply(event: AgentEvent, source = ""): boolean {
     const key = eventKey(event);
     const state = this.states.get(key) ?? newState(event, source);
+    this.originEvidence.set(key, { event, source });
+    const localOrigin = this.hasLocalOrigin(event, source);
+    if (localOrigin && state.processId === event.processId) state.processOrigin = "local";
     if (event.sequence <= state.lastSequence) {
       state.duplicateCount++;
       this.states.set(key, state);
@@ -188,8 +273,14 @@ export class OperationsReducer {
       });
     }
     state.lastSequence = event.sequence;
+    this.eventRevision++;
+    state.exitObservedMs = null;
+    if (event.schemaVersion === 3 && event.dispatch && event.repositoryIdentity?.verified) {
+      this.dispatchBindings.set(key, event);
+    }
     state.lastEventMs = Math.max(state.lastEventMs, event.timestampMs);
     if (event.eventType === "agent.heartbeat") state.lastHeartbeatMs = event.timestampMs;
+    if (event.processId && event.processId !== state.processId) state.processOrigin = localOrigin ? "local" : "unknown";
     state.processId = event.processId || state.processId;
     state.schemaVersion = event.schemaVersion;
     state.cycleNumber = event.cycleNumber || state.cycleNumber;
@@ -215,6 +306,11 @@ export class OperationsReducer {
 
     this.reduceEvent(state, event);
     state.status = calculateStatus(state, event.timestampMs);
+    const dismissal = this.dismissedInstances.get(key);
+    if (dismissal && event.sequence > dismissal.throughSequence &&
+        (event.eventType === "agent.heartbeat" || event.eventType === "agent.started")) {
+      this.dismissedInstances.delete(key);
+    }
     if (!isHistorical(state)) this.forgottenHistory.delete(key);
     this.states.set(key, state);
     return true;
@@ -452,7 +548,7 @@ export class OperationsReducer {
     });
     const newestRetainedByNamespace = new Map<string, string>();
     for (const state of visible) {
-      if (!isHistorical(state)) continue;
+      if (!isHistorical(state) || state.exitObservedMs !== null) continue;
       const group = `${state.agent}\0${state.sessionNamespace}`;
       const newestKey = newestRetainedByNamespace.get(group);
       const newest = newestKey ? this.states.get(newestKey) : undefined;
@@ -462,9 +558,11 @@ export class OperationsReducer {
       }
     }
     const items = visible.filter((state) => {
-      if (view === "live") return !isHistorical(state);
+      if (view === "live") return isLiveInstance(state, now);
       if (view === "history") return isHistorical(state);
       if (view === "current") {
+        if (this.dismissedInstances.has(state.key) && !isLiveInstance(state, now)) return false;
+        if (state.exitObservedMs !== null) return false;
         return !isHistorical(state) ||
           newestRetainedByNamespace.get(`${state.agent}\0${state.sessionNamespace}`) === state.key;
       }
@@ -486,6 +584,20 @@ export class OperationsReducer {
     return state;
   }
 
+  getDispatch(
+    dispatchId: string, repositoryKey: string, role: AgentRole,
+    pullRequestId: number, processId: number, now = Date.now(),
+  ): InstanceState | undefined {
+    // Independent of selected row, view filters, and forgotten History. Early lifecycle events
+    // may have PR 0, but must still match the exact broker-owned dispatch, repository, role and PID.
+    for (const [key, event] of this.dispatchBindings) {
+      if (event.dispatch?.dispatchId === dispatchId && event.repositoryIdentity?.key === repositoryKey &&
+          event.agent === role && event.processId === processId &&
+          (event.pullRequestId === 0 || event.pullRequestId === pullRequestId)) return this.get(key, now);
+    }
+    return undefined;
+  }
+
   counts(now = Date.now(), role?: AgentRole, view?: ViewFilter): Record<InstanceStatus, number> {
     const result: Record<InstanceStatus, number> = {
       failed: 0,
@@ -494,9 +606,28 @@ export class OperationsReducer {
       stale: 0,
       waiting: 0,
       completed: 0,
+      exited: 0,
     };
     for (const state of this.list(now, role, view)) result[state.status]++;
     return result;
+  }
+
+  dismissalFor(key: string, now = Date.now()): InstanceDismissal | null {
+    const state = this.get(key, now);
+    return state && !isLiveInstance(state, now) ? { key, throughSequence: state.lastSequence } : null;
+  }
+
+  dismissInstance(record: InstanceDismissal, now = Date.now()): boolean {
+    const state = this.get(record.key, now);
+    if (!state || state.lastSequence !== record.throughSequence || isLiveInstance(state, now)) return false;
+    this.dismissedInstances.set(record.key, { ...record });
+    return true;
+  }
+
+  restoreDismissedInstances(): number {
+    const restored = this.dismissedInstances.size;
+    this.dismissedInstances.clear();
+    return restored;
   }
 
   forgetHistorical(key: string): boolean {
@@ -526,6 +657,12 @@ export class OperationsReducer {
       if (!this.forgottenHistory.has(state.key) && this.forgetHistorical(state.key)) forgotten++;
     }
     return forgotten;
+  }
+
+  restoreAllHistorical(): number {
+    const restored = this.forgottenHistory.size;
+    this.forgottenHistory.clear();
+    return restored;
   }
 
   globalDiagnostics(): SourceDiagnostic[] {

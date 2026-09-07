@@ -55,6 +55,7 @@ export type InstanceStatus =
   | "running"
   | "waiting"
   | "completed"
+  | "exited"
   | "stale";
 
 export type ViewFilter = "live" | "current" | "history";
@@ -126,6 +127,8 @@ export interface InstanceState {
   completion: Completion | null;
   waiting: { kind: string; delayMilliseconds: number; sinceMs: number } | null;
   lifecycle: "starting" | "active" | "stopped";
+  exitObservedMs: number | null;
+  processOrigin: "unknown" | "local";
   currentRunStartedMs: number;
   modelActivity: string;
   lastEventMs: number;

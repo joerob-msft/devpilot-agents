@@ -6,6 +6,7 @@ import { parseAgentEventLine, type AgentEvent, type SourceDiagnostic } from "./d
 const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_DIAGNOSTICS_PER_SOURCE = 20;
 const CONTINUITY_BYTES = 256;
+export const INITIAL_EVENT_LOG_WAIT_MS = 30_000;
 
 export interface TailerOptions {
   stateDirectories: string[];
@@ -13,6 +14,7 @@ export interface TailerOptions {
   pollMilliseconds?: number;
   onEvent: (event: AgentEvent, source: string) => void;
   onDiagnostic: (diagnostic: SourceDiagnostic) => void;
+  onPoll?: () => Promise<void>;
   beforeActiveRead?: (path: string) => Promise<void>;
 }
 
@@ -142,6 +144,7 @@ export function discoverEventLogs(stateDirectories: string[], explicitPaths: str
 export class EventTailer {
   private readonly cursors = new Map<string, LineCursor>();
   private readonly diagnosticCounts = new Map<string, number>();
+  private readonly awaitingCreation = new Map<string, { since: number; warned: boolean }>();
   private timer: NodeJS.Timeout | undefined;
   private polling = false;
 
@@ -151,6 +154,9 @@ export class EventTailer {
     const normalized = resolve(path);
     if (this.options.eventLogPaths.some((item) => resolve(item) === normalized)) return false;
     this.options.eventLogPaths.push(normalized);
+    // READY supplies the canonical path before the child necessarily writes its first event.
+    // Only dynamically accepted paths get this grace period; explicit CLI inputs still fail visibly.
+    this.awaitingCreation.set(normalized, { since: Date.now(), warned: false });
     void this.poll();
     return true;
   }
@@ -174,6 +180,7 @@ export class EventTailer {
       const paths = discoverEventLogs(this.options.stateDirectories, this.options.eventLogPaths);
       const bases = new Set(paths.map((path) => /^(.*\.jsonl)(?:\.\d+)?$/i.exec(path)?.[1] ?? path));
       for (const base of bases) await this.pollStream(base);
+      await this.options.onPoll?.();
     } finally {
       this.polling = false;
     }
@@ -219,11 +226,20 @@ export class EventTailer {
     try {
       snapshot = await stat(path);
     } catch (error) {
+      const pending = this.awaitingCreation.get(path);
+      if (pending && (error as NodeJS.ErrnoException).code === "ENOENT") {
+        if (!pending.warned && Date.now() - pending.since >= INITIAL_EVENT_LOG_WAIT_MS) {
+          pending.warned = true;
+          this.diagnostic(path, "io", "Manual child has not created its event log after 30s; progress is unknown. Still retrying.");
+        }
+        return "missing";
+      }
       if (this.options.eventLogPaths.map((item) => resolve(item)).includes(resolve(path))) {
         this.diagnostic(path, "io", `cannot read event log: ${error instanceof Error ? error.message : String(error)}`);
       }
       return expectedIdentity !== undefined && expectedIdentity !== null ? "changed" : "missing";
     }
+    this.awaitingCreation.delete(path);
     if (!snapshot.isFile()) return "missing";
     const cursor = this.cursors.get(path) ?? new LineCursor();
     if (expectedIdentity !== undefined && identityOf(snapshot) !== expectedIdentity) return "changed";

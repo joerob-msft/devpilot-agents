@@ -62,6 +62,50 @@ $expectedRoleScripts = @{
     reviewer = Join-Path $toolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
     'review-handler' = Join-Path $toolkitRoot 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1'
 }
+function Assert-RoleCapabilityPolicy {
+    <#
+        issue #114: the ONE place that decides whether a launcher-written role policy
+        {capabilities, mandatoryDenies, absoluteDenies} is internally consistent, shared by the
+        startup descriptor sweep below and by Get-RoleDescriptor's per-request revalidation.
+        absoluteDenies is the trusted launcher's terminal, non-delegable ceiling for the WHOLE
+        launch (a preview-only launch names every mutation-capable capability there). It is read
+        from the descriptor the launcher actually wrote -- never from a harness default -- so an
+        operational launch can never be reinterpreted as a preview launch, or the reverse, by a
+        later harness change. Returns the normalized, sorted absolute-deny set.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][hashtable]$RoleDescriptor
+    )
+    $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $Role
+    $lockable = @(@($harnessRole.allowedManualCapabilities) + @($harnessRole.delegableDefaultOff))
+    $capabilities = @($RoleDescriptor.capabilities)
+    $mandatoryDenies = @($RoleDescriptor.mandatoryDenies)
+    # A descriptor written before issue #114 simply has no absoluteDenies member; that is a valid,
+    # unlocked (operational) launch, not a malformed one.
+    $declared = @()
+    if ($RoleDescriptor.Contains('absoluteDenies') -and $null -ne $RoleDescriptor['absoluteDenies']) {
+        $declared = @($RoleDescriptor['absoluteDenies'])
+    }
+    foreach ($name in $declared) {
+        if ($name -isnot [string] -or [string]$name -cnotmatch '^[A-Za-z][A-Za-z0-9]*$') {
+            throw '[role-not-allowed] The configured absolute-deny policy is malformed.'
+        }
+    }
+    $absoluteDenies = @($declared | Sort-Object -Unique)
+    if ($absoluteDenies.Count -ne $declared.Count -or
+        @($absoluteDenies | Where-Object { $lockable -cnotcontains $_ }).Count -gt 0 -or
+        @($absoluteDenies | Where-Object { $capabilities -ccontains $_ }).Count -gt 0 -or
+        @($absoluteDenies | Where-Object { $mandatoryDenies -cnotcontains $_ }).Count -gt 0) {
+        throw '[role-not-allowed] The configured absolute-deny policy is inconsistent.'
+    }
+    if ($mandatoryDenies -cnotcontains $harnessRole.delegableDefaultOff -or
+        @($capabilities | Where-Object { $mandatoryDenies -ccontains $_ }).Count -gt 0 -or
+        @($capabilities | Where-Object { $harnessRole.allowedManualCapabilities -cnotcontains $_ }).Count -gt 0) {
+        throw '[role-not-allowed] The configured manual capability policy is inconsistent.'
+    }
+    return $absoluteDenies
+}
 foreach ($role in @($descriptor.roles.Keys)) {
     if ($role -notin @('reviewer', 'review-handler')) { throw "Broker descriptor contains unsupported role '$role'." }
     $roleDescriptor = $descriptor.roles[$role]
@@ -75,12 +119,24 @@ foreach ($role in @($descriptor.roles.Keys)) {
     $roleDescriptor.configRoot = $configRoot
     $roleDescriptor.configFile = Assert-AgentTrustedFile -Path $expectedConfigPath `
         -AllowedRoot $configRoot -ExpectedPath $expectedConfigPath
+    # Validated once here, at startup, before any request is served, and normalized in place so
+    # every later reader (Get-RoleDescriptor, Get-BrokerCapabilityProfile, the widening path)
+    # sees the same sorted, verified set rather than raw wire content.
+    $roleDescriptor['absoluteDenies'] = @(Assert-RoleCapabilityPolicy -Role $role -RoleDescriptor $roleDescriptor)
 }
 $writerGate = [object]::new()
 $drafts = @{}
 $children = @{}
+$automaticWorkers = @{}
+$runPreparations = @{}
+$manualTurns = @{}
+$launcherControl = $null
+$launcherClaim = $null
+$shutdownRequestId = $null
 $requestIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $requestIdOrder = [Collections.Generic.Queue[string]]::new()
+$pollRequestIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$pollRequestIdOrder = [Collections.Generic.Queue[string]]::new()
 # issue #105 PR4 (requirement 4): global requestId anti-replay tracking is bounded, not unbounded --
 # a long-lived broker process must not grow $requestIds forever. Oldest ids are evicted once the
 # tracked count exceeds this cap; replay protection only needs to hold for a request's realistic
@@ -103,7 +159,18 @@ function Register-BrokerRequestId {
         if Id was already registered; otherwise registers it and evicts the oldest tracked id once
         the bound is exceeded, keeping memory bounded across a long-lived broker process.
     #>
-    param([Parameter(Mandatory)][string]$Id)
+    param([Parameter(Mandatory)][string]$Id, [switch]$AutomationPoll)
+    if ($requestIds.Contains($Id) -or $pollRequestIds.Contains($Id)) { return $false }
+    # Background reads rotate their own bounded ring, never the replay history for
+    # manual dispatch, widening, settings, cancellation, or scan-now.
+    if ($AutomationPoll) {
+        [void]$pollRequestIds.Add($Id)
+        $pollRequestIdOrder.Enqueue($Id)
+        while ($pollRequestIdOrder.Count -gt $MaxTrackedRequestIds) {
+            [void]$pollRequestIds.Remove($pollRequestIdOrder.Dequeue())
+        }
+        return $true
+    }
     if (-not $requestIds.Add($Id)) { return $false }
     $requestIdOrder.Enqueue($Id)
     while ($requestIdOrder.Count -gt $MaxTrackedRequestIds) { [void]$requestIds.Remove($requestIdOrder.Dequeue()) }
@@ -163,16 +230,10 @@ function Get-RoleDescriptor {
     }
     $roleDescriptor = $descriptor.roles[$roleKeys[0]]
     if (-not [bool]$roleDescriptor.enabled) { throw '[role-not-allowed] The requested manual role is disabled.' }
-    $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $Role
-    $allowedCapabilities = $harnessRole.allowedManualCapabilities
-    $requiredDeny = $harnessRole.delegableDefaultOff
-    $capabilities = @($roleDescriptor.capabilities)
-    $mandatoryDenies = @($roleDescriptor.mandatoryDenies)
-    if ($mandatoryDenies -cnotcontains $requiredDeny -or
-        @($capabilities | Where-Object { $mandatoryDenies -ccontains $_ }).Count -gt 0 -or
-        @($capabilities | Where-Object { $allowedCapabilities -cnotcontains $_ }).Count -gt 0) {
-        throw '[role-not-allowed] The configured manual capability policy is inconsistent.'
-    }
+    # issue #114: revalidated per request (not merely at startup) and against the launcher's own
+    # recorded absolute-deny set, so a preview-only launch's terminal ceiling is re-asserted on
+    # every describe/profile/preview-narrowing/widening path rather than assumed from startup.
+    $roleDescriptor['absoluteDenies'] = @(Assert-RoleCapabilityPolicy -Role $Role -RoleDescriptor $roleDescriptor)
     return $roleDescriptor
 }
 
@@ -365,7 +426,8 @@ function Get-BrokerNarrowingEffect {
     foreach ($name in @($AllowedManualCapabilities + $mandatoryDeniesBase + $AbsoluteDenies | Sort-Object -Unique)) {
         $provenance[$name] = 'operational-default'
     }
-    $partition = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $RoleDescriptor -PersistedNarrowing $Override.Settings
+    $partition = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $RoleDescriptor `
+        -PersistedNarrowing $Override.Settings -AbsoluteDenies $AbsoluteDenies
     if ([bool]$Override.KillSwitchActive) {
         # Emergency lever (PR3): every capability's provenance reads 'kill-switch', not
         # 'operational-default' -- the operator can see overrides exist but are being ignored,
@@ -385,17 +447,27 @@ function Get-BrokerCapabilityProfile {
     # RuntimeRoot, or $drafts entry -- callers decide independently whether to allocate one
     # (Invoke-Describe only). On failure, closes the provider session itself before rethrowing;
     # on success, the caller owns closing Provider.Session once it is done with it.
-    param([hashtable]$Request)
+    param([hashtable]$Request, [switch]$DiscoverCurrent)
     Remove-ExpiredDrafts
     $role = [string]$Request.role
-    $prId = [int]$Request.pullRequestId
-    if ($prId -le 0) { throw '[invalid-request] pullRequestId must be positive.' }
+    if ($Request.role -isnot [string]) { throw '[role-not-allowed] The requested manual role is invalid.' }
+    # Reuse the private harness parser in module scope; never round/coerce raw JSON into an ID.
+    $prNumber = & (Get-Module DevPilot.AgentHarness) {
+        param($Value)
+        ConvertTo-AgentSafeIntegralNumber $Value
+    } $Request['pullRequestId']
+    if ($null -eq $prNumber -or $prNumber -lt 1 -or $prNumber -gt [int]::MaxValue) {
+        throw '[invalid-request] pullRequestId must be an integer in 1..2147483647.'
+    }
+    $prId = [int]$prNumber
     $roleDescriptor = Get-RoleDescriptor $role
     $provider = Open-BrokerProvider $roleDescriptor
     try {
         $roleDescriptor['repositoryRoot'] = $provider.RepositoryRoot
         $identity = Resolve-AgentProviderRepositoryIdentity -Context $provider.Context
-        if ([string]$Request.repositoryKey -cne [string]$identity.key) { throw '[repository-mismatch] Repository key does not match the provider.' }
+        if (-not $DiscoverCurrent -and [string]$Request.repositoryKey -cne [string]$identity.key) {
+            throw '[repository-mismatch] Repository key does not match the provider.'
+        }
         $pr = ConvertTo-BrokerPrSnapshot -PullRequest (Get-BrokerPullRequest $provider $prId) -PullRequestId $prId
         if (-not $pr.active -or $pr.draft) { throw '[pr-state-changed] Pull request is not active and ready.' }
         $constraints = @()
@@ -411,7 +483,10 @@ function Get-BrokerCapabilityProfile {
         $capabilities = @($roleDescriptor.capabilities | Sort-Object -Unique)
         $mandatoryDenies = @($roleDescriptor.mandatoryDenies | Sort-Object -Unique)
         $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $role
-        $absoluteDenies = @($harnessRole.absoluteDenies | Sort-Object -Unique)
+        # issue #114: the launch-wide terminal denies come from the trusted launcher's own broker
+        # descriptor (validated by Assert-RoleCapabilityPolicy), never from the harness default --
+        # the harness cannot know whether THIS launch was started operationally or preview-only.
+        $absoluteDenies = @($roleDescriptor.absoluteDenies | Sort-Object -Unique)
         $allowedManualCapabilities = @($harnessRole.allowedManualCapabilities | Sort-Object -Unique)
         # issue #105 PR4: delegableAvailable reflects the checked-in delegation policy for THIS
         # role/repository -- never a wildcard, since the schema has no allow-any escape hatch. The
@@ -423,7 +498,7 @@ function Get-BrokerCapabilityProfile {
         # keeps working normally; only the widening endpoints reject distinctly for that condition.
         $delegationPolicy = Get-AgentDelegationPolicyOrNull -ToolkitRoot $toolkitRoot
         $delegableAvailable = @()
-        if ($delegationPolicy -and
+        if ($delegationPolicy -and $absoluteDenies -cnotcontains $harnessRole.delegableDefaultOff -and
             (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $role -Capability $harnessRole.delegableDefaultOff -RepositoryKey $identity.key)) {
             $delegableAvailable = @($harnessRole.delegableDefaultOff)
         }
@@ -485,7 +560,7 @@ function Get-BrokerCapabilityProfile {
 }
 
 function Invoke-Describe {
-    param([hashtable]$Request)
+    param([hashtable]$Request, [switch]$PassThru)
     $profile = Get-BrokerCapabilityProfile $Request
     $role = $profile.Role
     $roleDescriptor = $profile.RoleDescriptor
@@ -493,8 +568,13 @@ function Invoke-Describe {
     try {
         $draftId = [Guid]::NewGuid().ToString('D')
         $snapshot = New-ConfigSnapshot $roleDescriptor $provider $draftId
+        # Verification time is observation metadata, not a policy change on every fresh read.
+        $policyIdentity = @{}
+        foreach ($name in $profile.Identity.Keys) {
+            if ($name -cne 'verifiedAtUtc') { $policyIdentity[$name] = $profile.Identity[$name] }
+        }
         $policy = [ordered]@{
-            schemaVersion = 1; repositoryIdentity = $profile.Identity; role = $role
+            schemaVersion = 1; repositoryIdentity = $policyIdentity; role = $role
             capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies
             ceilingCapabilities = $profile.CeilingCapabilities; ceilingMandatoryDenies = $profile.CeilingMandatoryDenies
             configSnapshotSha256 = $snapshot.SnapshotSha256
@@ -516,8 +596,12 @@ function Invoke-Describe {
             # WideningGeneration increments on every widening state transition so cancel-widening can
             # detect and reject a stale request bound to an already-superseded widening attempt.
             Widening = $null; WideningGeneration = 0
+            SchedulingBinding = Get-AgentCanonicalDigest @{
+                overrides = $profile.Override.FileFingerprints; absoluteDenies = $profile.AbsoluteDenies
+                constraints = $profile.Constraints; worktree = (Get-AgentWorktreeIdentity $provider.RepositoryRoot)
+            }
         }
-        Write-DispatchProtocolMessage @{
+        $summary = @{
             schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'capability-summary'
             dispatchDraftId = $draftId; role = $role; repositoryIdentity = $profile.Identity; prSnapshot = $profile.Pr
             capabilityPolicyDigest = $policyDigest; prStateFingerprint = $prFingerprint
@@ -527,6 +611,9 @@ function Invoke-Describe {
             killSwitchActive = [bool]$profile.Override.KillSwitchActive
             killSwitchExpiresAtUtc = $profile.Override.KillSwitchExpiresAtUtc
         }
+        if ($launcherControl) { $summary.scheduling = @{ version = 1; scope = 'current-launcher' } }
+        if ($PassThru) { return $summary }
+        Write-DispatchProtocolMessage $summary
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
 }
@@ -538,11 +625,11 @@ function Invoke-Profile {
     # RuntimeRoot, or $drafts entry -- repeated or overlapping calls (refresh, close/reopen) leave
     # no broker-side residue. Omits dispatchDraftId/capabilityPolicyDigest/prStateFingerprint
     # entirely: none is meaningful without a config snapshot to bind it to.
-    param([hashtable]$Request)
-    $profile = Get-BrokerCapabilityProfile $Request
+    param([hashtable]$Request, [switch]$DiscoverCurrent)
+    $profile = Get-BrokerCapabilityProfile $Request -DiscoverCurrent:$DiscoverCurrent
     $provider = $profile.Provider
     try {
-        Write-DispatchProtocolMessage @{
+        $response = @{
             schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'capability-profile'
             role = $profile.Role; repositoryIdentity = $profile.Identity; prSnapshot = $profile.Pr
             capabilities = $profile.Capabilities; mandatoryDenies = $profile.MandatoryDenies; dynamicConstraints = $profile.Constraints
@@ -551,8 +638,22 @@ function Invoke-Profile {
             killSwitchActive = [bool]$profile.Override.KillSwitchActive
             killSwitchExpiresAtUtc = $profile.Override.KillSwitchExpiresAtUtc
         }
+        if ($launcherControl) { $response.scheduling = @{ version = 1; scope = 'current-launcher' } }
+        Write-DispatchProtocolMessage $response
     }
     finally { if ($provider.Session) { Close-AgentMcpSession $provider.Session } }
+}
+
+function Invoke-ProfileCurrent {
+    param([hashtable]$Request)
+    # Discovery grants no caller authority over repository/config/path selection. Only this
+    # read-only endpoint may omit the repository key; all later operations remain key-bound.
+    foreach ($field in $Request.Keys) {
+        if ($field -cnotin @('schemaVersion', 'requestId', 'operation', 'pullRequestId', 'role')) {
+            throw '[invalid-request] profile-current accepts only a PR ID and role.'
+        }
+    }
+    Invoke-Profile $Request -DiscoverCurrent
 }
 
 function Invoke-PreviewNarrowing {
@@ -850,8 +951,14 @@ function Get-DraftWideningCandidate {
     if ([bool]$override.KillSwitchActive) {
         throw '[narrowing-kill-switch-active] Widening is unavailable while the kill switch is active.'
     }
-    $current = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $Draft.RoleDescriptor -PersistedNarrowing $override.Settings
-    $widened = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $Draft.RoleDescriptor -PersistedNarrowing $override.Settings -GrantCapability $Capability
+    # issue #114: the launch's terminal absolute denies are applied to BOTH partitions. A grant that
+    # names an absolutely denied capability fails closed inside the primitive itself, so a preview
+    # launch can never mint, preview, or dispatch a widened ceiling.
+    $absoluteDenies = @($Draft.RoleDescriptor.absoluteDenies)
+    $current = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $Draft.RoleDescriptor `
+        -PersistedNarrowing $override.Settings -AbsoluteDenies $absoluteDenies
+    $widened = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $Draft.RoleDescriptor `
+        -PersistedNarrowing $override.Settings -AbsoluteDenies $absoluteDenies -GrantCapability $Capability
     return @{ Override = $override; Current = $current; Widened = $widened }
 }
 
@@ -920,6 +1027,12 @@ function Invoke-DescribeWidening {
     $harnessRole = Get-AgentHarnessCapabilityDescriptor -Role $draft.Role
     if ($capability -cnotmatch '^[A-Za-z][A-Za-z0-9]*$' -or $capability -cne $harnessRole.delegableDefaultOff) {
         throw "[widening-invalid] capability is not the recognized delegable capability for role '$($draft.Role)'."
+    }
+    # issue #114: rejected before the delegation policy is even consulted -- a preview-only launch's
+    # absolute denies are terminal and non-delegable, so no policy, grant, or confirmation sequence
+    # can reach past them.
+    if (@($draft.RoleDescriptor.absoluteDenies) -ccontains $capability) {
+        throw '[widening-invalid] capability is absolutely denied for this launch and can never be widened.'
     }
     $delegationPolicy = Get-AgentDelegationPolicyOrThrow -ToolkitRoot $toolkitRoot
     if (-not (Test-AgentDelegationAllows -Policy $delegationPolicy -Role $draft.Role -Capability $capability -RepositoryKey $draft.RepositoryIdentity.key)) {
@@ -1015,7 +1128,7 @@ function Invoke-ConfirmWideningMint {
     # ordered-field shape Invoke-Describe used, so dispatch()'s existing capabilityPolicyDigest
     # binding check keeps working unmodified against this new, wider value.
     $draft.Policy = [ordered]@{
-        schemaVersion = 1; repositoryIdentity = $draft.RepositoryIdentity; role = $draft.Role
+        schemaVersion = 1; repositoryIdentity = $draft.Policy.repositoryIdentity; role = $draft.Role
         capabilities = $candidate.Widened.capabilities; mandatoryDenies = $candidate.Widened.mandatoryDenies
         ceilingCapabilities = $draft.Policy.ceilingCapabilities; ceilingMandatoryDenies = $draft.Policy.ceilingMandatoryDenies
         configSnapshotSha256 = $draft.Policy.configSnapshotSha256
@@ -1055,7 +1168,7 @@ function Invoke-CancelWidening {
     # attempt; only the delegableAvailable hint in the response degrades to empty.
     $delegationPolicyForCancel = Get-AgentDelegationPolicyOrNull -ToolkitRoot $toolkitRoot
     $delegableAvailable = @()
-    if ($delegationPolicyForCancel -and
+    if ($delegationPolicyForCancel -and @($draft.RoleDescriptor.absoluteDenies) -cnotcontains $harnessRole.delegableDefaultOff -and
         (Test-AgentDelegationAllows -Policy $delegationPolicyForCancel -Role $draft.Role -Capability $harnessRole.delegableDefaultOff -RepositoryKey $draft.RepositoryIdentity.key)) {
         $delegableAvailable = @($harnessRole.delegableDefaultOff)
     }
@@ -1066,10 +1179,11 @@ function Invoke-CancelWidening {
             -RepositoryRoot $draft.RoleDescriptor.repositoryRoot -PullRequestId $draft.PullRequestId -CurrentSourceCommit $draft.PrSnapshot.sourceCommit
     }
     finally { Exit-AgentLock $capabilityLock.Stream }
-    $unwidened = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $draft.RoleDescriptor -PersistedNarrowing $override.Settings
+    $unwidened = Resolve-AgentCapabilityPolicyPartition -RoleDescriptor $draft.RoleDescriptor `
+        -PersistedNarrowing $override.Settings -AbsoluteDenies @($draft.RoleDescriptor.absoluteDenies)
     $draft.Widening = $null
     $draft.Policy = [ordered]@{
-        schemaVersion = 1; repositoryIdentity = $draft.RepositoryIdentity; role = $draft.Role
+        schemaVersion = 1; repositoryIdentity = $draft.Policy.repositoryIdentity; role = $draft.Role
         capabilities = $unwidened.capabilities; mandatoryDenies = $unwidened.mandatoryDenies
         ceilingCapabilities = $draft.Policy.ceilingCapabilities; ceilingMandatoryDenies = $draft.Policy.ceilingMandatoryDenies
         configSnapshotSha256 = $draft.Policy.configSnapshotSha256
@@ -1183,8 +1297,794 @@ function Publish-ProtectedPrompt {
     finally { if ($bytes.Length) { [Array]::Clear($bytes, 0, $bytes.Length) } }
 }
 
-function Invoke-Dispatch {
+function Get-ManualTurnKey {
+    param([string]$RepositoryKey, [string]$Role)
+    return "$RepositoryKey|$Role"
+}
+
+function Initialize-BrokerLauncherControl {
+    if (-not $descriptor.ContainsKey('launcherControl')) { return }
+    $control = $descriptor.launcherControl
+    if (-not $interactiveWideningAvailable -or $control -isnot [Collections.IDictionary] -or
+        $control.schemaVersion -ne 1 -or $control.sessionId -cnotmatch '^[0-9a-f-]{36}$' -or
+        $control.ownerStartIdentity -cnotmatch '^(utc|linux):[0-9]+$') {
+        throw '[scheduling-unavailable] Automatic-worker ownership requires the trusted current dashboard launcher.'
+    }
+    $dashboardPid = Get-AgentImmediateParentProcessId -ProcessId $PID
+    $watchPid = Get-AgentImmediateParentProcessId -ProcessId $dashboardPid
+    if ($watchPid -ne $descriptor.ownerProcessId -or
+        (Get-AgentProcessStartIdentity -Process (Get-Process -Id $watchPid)) -cne $control.ownerStartIdentity) {
+        throw '[not-owner] Launcher identity no longer matches this session.'
+    }
+    $specs = @($control.automaticWorkers)
+    if ($specs.Count -lt 1 -or $specs.Count -gt 2) { throw '[launcher-control-invalid] Invalid automatic worker count.' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($spec in $specs) {
+        if ($spec -isnot [hashtable] -or $spec.role -cnotin @('reviewer', 'review-handler') -or
+            -not $seen.Add($spec.role) -or $spec.continuous -isnot [bool]) {
+            throw '[launcher-control-invalid] Invalid automatic worker specification.'
+        }
+        $argv = @($spec.arguments)
+        if ($argv.Count -lt 5 -or $argv.Count -gt 64 -or
+            @($argv | Where-Object { $_ -isnot [string] -or $_.Length -gt 4096 -or $_ -match '[\x00-\x1f\x7f]' }).Count -gt 0 -or
+            $argv[0] -cne '-NoLogo' -or $argv[1] -cne '-NoProfile' -or $argv[2] -cne '-NonInteractive' -or
+            $argv[3] -cne '-File' -or $argv[4] -cne $expectedRoleScripts[$spec.role]) {
+            throw '[launcher-control-invalid] Invalid automatic worker argument vector.'
+        }
+        $role = Get-RoleDescriptor $spec.role
+        $known = Get-AgentHarnessCapabilityDescriptor -Role $spec.role
+        $capabilities = @($known.operationalTiers.base)
+        if ($spec.role -ceq 'review-handler') { $capabilities += @($known.operationalTiers.codeUpdate) }
+        $values = @{}
+        for ($i = 5; $i -lt $argv.Count; $i++) {
+            $option = $argv[$i]
+            if ($values.ContainsKey($option)) { throw '[launcher-control-invalid] Repeated automatic option.' }
+            if ($option -cin @('-ConfigFile', '-StateDir', '-DurableStateRoot', '-LeaseRoot', '-AgentName',
+                    '-OperatorAlias', '-OutputMode', '-IntervalSeconds', '-PullRequestId', '-Model')) {
+                $i++
+                if ($i -ge $argv.Count) { throw '[launcher-control-invalid] Missing automatic option value.' }
+                $values[$option] = $argv[$i]
+            }
+            elseif ($option -cin @('-Once', '-IncludeOwnPullRequests', '-EnableTeamsNotifications') -or
+                ($option.StartsWith('-') -and $option.Substring(1) -cin $capabilities)) {
+                if ($option.Substring(1) -cin @($role.absoluteDenies) -or
+                    ($option -ceq '-EnableTeamsNotifications' -and @($role.absoluteDenies).Count -gt 0)) {
+                    throw '[launcher-control-invalid] Automatic option exceeds the launch ceiling.'
+                }
+                $values[$option] = $true
+            }
+            else { throw '[launcher-control-invalid] Unsupported automatic option.' }
+        }
+        foreach ($binding in @(
+            @('-ConfigFile', $role.configFile), @('-StateDir', (Join-Path $stateRoot $spec.role)),
+            @('-DurableStateRoot', $durableRoot), @('-LeaseRoot', $leaseRoot),
+            @('-OperatorAlias', $descriptor.operatorAlias), @('-OutputMode', 'Json'))) {
+            if ($values[$binding[0]] -cne $binding[1]) { throw '[launcher-control-invalid] Automatic launch binding changed.' }
+        }
+        if ($values['-AgentName'] -cnotmatch '^[A-Za-z0-9._-]+$' -or
+            ($spec.continuous -and ($values['-IntervalSeconds'] -notmatch '^\d+$' -or
+                [int]$values['-IntervalSeconds'] -lt 30 -or [int]$values['-IntervalSeconds'] -gt 86400 -or $values.ContainsKey('-Once'))) -or
+            (-not $spec.continuous -and (-not $values.ContainsKey('-Once') -or $values.ContainsKey('-IntervalSeconds')))) {
+            throw '[launcher-control-invalid] Automatic cycling policy is malformed.'
+        }
+        $spec['ConfigPath'] = $role.configFile
+        $spec['IntervalSeconds'] = if ($spec.continuous) { [int]$values['-IntervalSeconds'] } else { $null }
+        $spec['ConfigDigest'] = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($role.configFile))).ToLowerInvariant()
+    }
+    # A broker restart cannot replay this Watch session's launch authority or its old queue.
+    # The marker is never deleted, and the live handle excludes simultaneous brokers.
+    $script:launcherClaim = [IO.File]::Open((Join-Path $stateRoot "launcher-$($control.sessionId).claim"),
+        [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $script:launcherControl = $control
+    foreach ($spec in $specs) { Start-AutomaticWorker $spec }
+}
+
+function Start-AutomaticWorker {
+    param([hashtable]$Spec)
+    [void](Assert-AgentTrustedFile -Path $Spec.ConfigPath)
+    $configDigest = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($Spec.ConfigPath))).ToLowerInvariant()
+    if ($configDigest -cne $Spec.ConfigDigest) {
+        throw '[automatic-policy-changed] Automatic configuration changed; start a new launcher to approve its policy.'
+    }
+    $role = [string]$Spec.role
+    $workerId = [Guid]::NewGuid().ToString('D')
+    $captureName = if ($automaticWorkers.ContainsKey($role)) { "$role-$workerId" } else { $role }
+    $runtime = Join-Path (Join-Path $stateRoot 'automatic-control') $workerId
+    New-Item -ItemType Directory -Path $runtime -Force | Out-Null
+    if (-not $IsWindows) {
+        [IO.File]::SetUnixFileMode($runtime, [IO.UnixFileMode]::UserRead -bor
+            [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
+    }
+    $pipeName = New-AgentPipeName
+    $pipe = [IO.Pipes.NamedPipeServerStream]::new($pipeName, [IO.Pipes.PipeDirection]::InOut, 1,
+        [IO.Pipes.PipeTransmissionMode]::Byte,
+        [IO.Pipes.PipeOptions]::Asynchronous -bor [IO.Pipes.PipeOptions]::CurrentUserOnly)
+    $manifest = @{
+        schemaVersion = 1; kind = 'launcher-worker'; role = $role; workerId = $workerId
+        nonce = New-AgentNonce; startupPipe = $pipeName; runtimeRoot = $runtime
+        brokerProcessId = $PID; brokerProcessStartIdentity = $brokerProcessStartIdentity
+        brokerDescriptorPath = $descriptorFullPath; brokerDescriptorDigest = $descriptorDigest
+        brokerScriptSha256 = $brokerScriptSha256
+    }
+    $manifestPath = Join-Path $runtime 'worker.json'
+    [IO.File]::WriteAllText($manifestPath, (ConvertTo-AgentCanonicalJson $manifest), $utf8)
+    $secret = New-AgentBrokerAttestationSecret
+    $attestation = [IO.Pipes.AnonymousPipeServerStream]::new([IO.Pipes.PipeDirection]::Out,
+        [IO.HandleInheritability]::Inheritable)
+    $entry = @{
+        Spec = $Spec; Manifest = $manifest; Secret = $secret; Pipe = $pipe
+        Connect = $pipe.WaitForConnectionAsync(); Read = $null; Reader = $null; Writer = $null
+        Child = $null; Containment = $null; Phase = 'starting'; Sequence = 0
+        WorkId = ''; RepositoryKey = ''; PullRequestId = 0
+        Deadline = [DateTime]::UtcNow.AddSeconds(30); ExitConfirmed = $false
+        StartupDeadline = [DateTime]::UtcNow.AddSeconds(120); StartupAcknowledged = $false
+        ExitResult = $null; FailureCode = ''; ExpectedExit = $false; WakePending = $false
+    }
+    $automaticWorkers[$role] = $entry
+    try {
+        $entry.Child = New-AgentRedirectedProcess -FilePath (Resolve-AgentPwshPath) `
+            -ArgumentList (@($Spec.arguments) + @('-LauncherWorkerManifest', $manifestPath)) `
+            -StandardOutputPath (Join-Path $stateRoot "$captureName.stdout.jsonl") `
+            -StandardErrorPath (Join-Path $stateRoot "$captureName.stderr.log") -WorkingDirectory $toolkitRoot `
+            -LiveStandardOutput -AdditionalEnvironmentVariables @{
+                DEVPILOT_BROKER_ATTESTATION_HANDLE = $attestation.GetClientHandleAsString()
+            }
+        # The worker cannot leave its early barrier until containment exists.
+        $entry.Containment = New-AgentProcessContainment $entry.Child.Process
+        $attestation.DisposeLocalCopyOfClientHandle()
+        $attestation.Write($secret, 0, $secret.Length)
+        $attestation.Flush()
+        Write-DispatchProtocolMessage @{
+            schemaVersion = 1; requestId = '00000000-0000-0000-0000-000000000000'; operation = 'local-observation'
+            streams = @($automaticWorkers.Values | Where-Object { $_.Child -and -not $_.ExitConfirmed } | ForEach-Object {
+                @{ role = $_.Spec.role; processId = $_.Child.Process.Id; eventLogPath = $_.Child.StdOutPath }
+            })
+        }
+    }
+    finally { $attestation.Dispose() }
+}
+
+function Update-AutomaticWorkers {
+    foreach ($entry in @($automaticWorkers.Values)) {
+        if ($entry.Phase -cne 'idle' -or $entry.ExitConfirmed -or (Test-AutomaticManualPriority $entry)) {
+            $entry['WakePending'] = $false
+        }
+        if ($entry.ExitConfirmed -or -not $entry.Child) { continue }
+        $entry.Child.Process.Refresh()
+        if ($entry.Child.Process.HasExited) {
+            $entry['WakePending'] = $false
+            $entry['LeaderExitCode'] = $entry.Child.Process.ExitCode
+            $treeExited = Test-AgentProcessContainmentExited $entry.Containment $entry.Child.Process
+            if ($treeExited) {
+                $entry.ExitResult = Complete-AgentRedirectedProcess $entry.Child
+                $entry.ExitConfirmed = $true
+                $entry.Pipe.Dispose()
+                Close-AgentProcessContainment $entry.Containment
+                [Array]::Clear($entry.Secret, 0, $entry.Secret.Length)
+            }
+            $reason = "exited with code $($entry.LeaderExitCode)"
+            if (-not $treeExited) { $reason += '; contained-tree exit remains unconfirmed' }
+            if (-not $entry.StartupAcknowledged) {
+                Stop-BrokerForAutomaticFailure $entry automatic-startup-failed "$reason before acknowledging initialization"
+            }
+            if (-not $entry.ExpectedExit -and $entry.Phase -cne 'yielding' -and
+                ($entry.Spec.continuous -or $entry.LeaderExitCode -ne 0)) {
+                Stop-BrokerForAutomaticFailure $entry automatic-worker-failed "$reason unexpectedly"
+            }
+            if ($treeExited) { continue }
+        }
+        if (-not $entry.StartupAcknowledged -and [DateTime]::UtcNow -gt $entry.StartupDeadline) {
+            Stop-BrokerForAutomaticFailure $entry automatic-startup-failed 'did not acknowledge initialization before the deadline'
+        }
+        if (-not $entry.Connect.IsCompleted) {
+            if ([DateTime]::UtcNow -gt $entry.Deadline) {
+                Stop-BrokerForAutomaticFailure $entry automatic-startup-failed 'did not connect to its startup barrier'
+            }
+            continue
+        }
+        if (-not $entry.Reader) {
+            $entry.Connect.GetAwaiter().GetResult()
+            $entry.Reader = [IO.StreamReader]::new($entry.Pipe, $utf8, $false, 1024, $true)
+            $entry.Writer = [IO.StreamWriter]::new($entry.Pipe, $utf8, 1024, $true)
+            $entry.Writer.AutoFlush = $true
+            $entry.Read = $entry.Reader.ReadLineAsync()
+        }
+        if (-not $entry.Read.IsCompleted) { continue }
+        $line = $entry.Read.GetAwaiter().GetResult()
+        if ($null -eq $line) { continue } # Tree exit, not pipe closure, releases ownership.
+        if ($line.Length -gt 4096) { throw '[launcher-control-invalid] Worker checkpoint is too large.' }
+        $message = $line | ConvertFrom-Json -AsHashtable -Depth 10
+        $r = $message.record
+        $proof = Get-AgentAttestationProof -SecretBytes $entry.Secret -Nonce $entry.Manifest.nonce `
+            -Digest (Get-AgentCanonicalDigest $r)
+        if ($message.proof -cne $proof -or $r.workerId -cne $entry.Manifest.workerId -or
+            $r.sequence -ne ($entry.Sequence + 1) -or
+            $r.phase -cnotin @('ready', 'started', 'admission', 'acquired', 'released', 'idle', 'scanning')) {
+            throw '[launcher-control-invalid] Worker checkpoint authentication failed.'
+        }
+        $entry.Sequence++
+        $action = 'proceed'
+        if (($r.phase -ceq 'ready' -and $entry.Phase -cne 'starting') -or
+            ($r.phase -ceq 'started' -and $entry.Phase -cne 'ready') -or
+            ($r.phase -cin @('admission', 'acquired', 'released', 'idle', 'scanning') -and -not $entry.StartupAcknowledged)) {
+            throw '[launcher-control-invalid] Worker has not completed the startup protocol.'
+        }
+        if (($r.phase -ceq 'idle' -and $entry.Phase -cnotin @('started', 'scanning', 'released', 'idle')) -or
+            ($r.phase -ceq 'scanning' -and $entry.Phase -cnotin @('idle', 'waking'))) {
+            throw '[launcher-control-invalid] Worker idle interval transition is invalid.'
+        }
+        if ($r.phase -ceq 'admission') {
+            if ($entry.Phase -cnotin @('started', 'scanning', 'released') -or
+                $r.repositoryKey -isnot [string] -or $r.repositoryKey.Length -gt 512 -or
+                $r.repositoryKey -cnotmatch '^v1:(github|azuredevops):' -or
+                ($r.pullRequestId -isnot [int] -and $r.pullRequestId -isnot [long]) -or
+                $r.pullRequestId -lt 1 -or $r.pullRequestId -gt [int]::MaxValue -or
+                $r.workId -cnotmatch '^[0-9a-f-]{36}$') {
+                throw '[launcher-control-invalid] Worker admission transition is invalid.'
+            }
+            $entry.RepositoryKey = $r.repositoryKey
+            $entry.PullRequestId = $r.pullRequestId
+            $entry.WorkId = $r.workId
+        }
+        elseif ($r.phase -ceq 'acquired' -and ($entry.Phase -cne 'admission' -or $r.workId -cne $entry.WorkId)) {
+            throw '[launcher-control-invalid] Worker authority checkpoint is invalid.'
+        }
+        elseif ($r.phase -ceq 'released' -and $r.workId -cne $entry.WorkId) {
+            throw '[launcher-control-invalid] Worker release checkpoint is invalid.'
+        }
+        $entry.Phase = $r.phase
+        if ($r.phase -cne 'idle') { $entry['WakePending'] = $false }
+        $key = Get-ManualTurnKey $entry.RepositoryKey $entry.Spec.role
+        if (($manualTurns.ContainsKey($key) -and $r.phase -cin @('admission', 'acquired', 'released')) -or
+            ($r.phase -cin @('idle', 'scanning') -and (Test-AutomaticManualPriority $entry))) {
+            $action = 'yield'
+            $entry.Phase = 'yielding'
+            $entry['WakePending'] = $false
+        }
+        elseif ($r.phase -ceq 'idle' -and $entry.Spec.continuous -and $entry.WakePending) {
+            $action = 'wake'
+            $entry.WakePending = $false
+            $entry.Phase = 'waking'
+        }
+        $reply = @{ workerId = $entry.Manifest.workerId; sequence = $entry.Sequence; action = $action }
+        $entry.Writer.WriteLine((ConvertTo-AgentCanonicalJson @{
+            record = $reply
+            proof = Get-AgentAttestationProof -SecretBytes $entry.Secret -Nonce $entry.Manifest.nonce `
+                -Digest (Get-AgentCanonicalDigest $reply)
+        }))
+        if ($r.phase -ceq 'started') {
+            $entry.StartupAcknowledged = $true
+            foreach ($turnKey in @($manualTurns.Keys)) {
+                $turn = $manualTurns[$turnKey]
+                if ($turn.Phase -ceq 'resuming' -and $turn.ResumeWorkerId -ceq $entry.Manifest.workerId) {
+                    Complete-ManualTurn $turnKey $turn
+                }
+            }
+        }
+        $entry.Read = $entry.Reader.ReadLineAsync()
+    }
+}
+
+function Test-AutomaticManualPriority {
+    param([hashtable]$Worker)
+    # A worker that has not selected any PR yet has no repository checkpoint. The role's
+    # configured launcher reservation still wins; observation metadata is never authority.
+    return @($manualTurns.Values | Where-Object { $_.Summary.role -ceq $Worker.Spec.role }).Count -gt 0
+}
+
+function Get-AutomaticPollingState {
+    param([hashtable]$Worker)
+    if ($Worker.FailureCode -or $Worker.Phase -ceq 'failed') { return 'failed' }
+    if (Test-AutomaticManualPriority $Worker) { return 'paused' }
+    if ($Worker.ExitConfirmed -or ($Worker.Child -and $Worker.Child.Process.HasExited)) { return 'stopped' }
+    if ($Worker.ExpectedExit -or $Worker.Phase -ceq 'yielding') { return 'paused' }
+    if (-not $Worker.StartupAcknowledged) { return 'starting' }
+    if ($Worker.Phase -ceq 'idle') { return 'waiting' }
+    return 'scanning'
+}
+
+function Assert-AutomationRequest {
+    param([hashtable]$Request, [string]$Operation)
+    if ($Request.Count -ne 3 -or
+        @($Request.Keys | Where-Object { $_ -cnotin @('schemaVersion', 'requestId', 'operation') }).Count -gt 0 -or
+        ($Request.schemaVersion -isnot [int] -and $Request.schemaVersion -isnot [long]) -or
+        $Request.schemaVersion -ne 1 -or $Request.operation -isnot [string] -or $Request.operation -cne $Operation -or
+        $Request.requestId -isnot [string] -or
+        $Request.requestId -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+        throw '[invalid-request] Automation requests accept only the version, request ID and exact operation.'
+    }
+}
+
+function Invoke-GetAutomationStatus {
     param([hashtable]$Request)
+    Assert-AutomationRequest $Request 'get-automation-status'
+    $agents = @()
+    if ($launcherControl) {
+        foreach ($role in @('reviewer', 'review-handler')) {
+            if (-not $automaticWorkers.ContainsKey($role)) { continue }
+            $worker = $automaticWorkers[$role]
+            $state = Get-AutomaticPollingState $worker
+            $agents += @{
+                role = $role; continuous = [bool]$worker.Spec.continuous; intervalSeconds = $worker.Spec.IntervalSeconds
+                state = $state; canScanNow = ($state -ceq 'waiting' -and $worker.Spec.continuous -and -not $worker.WakePending)
+            }
+        }
+    }
+    Write-DispatchProtocolMessage @{
+        schemaVersion = 1; requestId = $Request.requestId; operation = 'automation-status'; automationVersion = 1
+        available = [bool]$launcherControl; scope = $(if ($launcherControl) { 'current-launcher' } else { $null })
+        agents = @($agents)
+    }
+}
+
+function Invoke-ScanNow {
+    param([hashtable]$Request)
+    Assert-AutomationRequest $Request 'scan-now'
+    if (-not $launcherControl) { throw '[automation-unavailable] This launcher does not own automatic workers.' }
+    $results = @()
+    foreach ($role in @('reviewer', 'review-handler')) {
+        if (-not $automaticWorkers.ContainsKey($role)) { continue }
+        $worker = $automaticWorkers[$role]
+        $state = Get-AutomaticPollingState $worker
+        $outcome = if (-not $worker.Spec.continuous -or $state -cin @('starting', 'stopped', 'failed')) {
+            'unavailable'
+        }
+        elseif ($state -ceq 'paused') { 'manual-priority' }
+        elseif ($state -ceq 'waiting' -and -not $worker.WakePending) {
+            $worker.WakePending = $true
+            'requested'
+        }
+        else { 'already-running' }
+        if ($outcome -cin @('unavailable', 'manual-priority')) { $worker.WakePending = $false }
+        $results += @{ role = $role; outcome = $outcome }
+    }
+    Write-DispatchProtocolMessage @{
+        schemaVersion = 1; requestId = $Request.requestId; operation = 'scan-now-result'; automationVersion = 1
+        scope = 'current-launcher'; results = @($results)
+    }
+}
+
+function Stop-BrokerForAutomaticFailure {
+    param([hashtable]$Worker, [ValidateSet('automatic-startup-failed', 'automatic-worker-failed')][string]$Code,
+        [string]$Reason)
+    $Worker.FailureCode = $Code
+    $Worker['WakePending'] = $false
+    $Worker.Phase = 'failed'
+    foreach ($turn in @($manualTurns.Values)) {
+        if ($turn.Summary.role -ceq $Worker.Spec.role) {
+            $turn.Phase = 'blocked'
+            foreach ($progress in @(Get-TurnProgressRecords $turn)) { Write-RunProgress $progress blocked $Code }
+        }
+    }
+    # Reserved, unsolicited rejection is fatal, not a request response. The typed client
+    # forwards this bounded role/exit-code explanation to its existing broker-failure hook.
+    $detail = "Automatic $($Worker.Spec.role) worker $Reason. This launcher is stopping; no automatic restart was attempted."
+    Write-Rejection '00000000-0000-0000-0000-000000000000' $Code $detail
+    throw "[$Code] $detail"
+}
+
+function Test-BrokerStartupInputPending {
+    # Bounded servicing of the new bare automation RPCs prevents a five-second status
+    # poll from cancelling/starving an already-consented manual startup. Other input,
+    # malformed frames and EOF remain pending for the existing interruption path.
+    for ($count = 0; $count -lt 4 -and $readTask.IsCompleted; $count++) {
+        $line = $readTask.GetAwaiter().GetResult()
+        if ($null -eq $line -or $utf8.GetByteCount($line) + 1 -gt $MaximumLineBytes) { return $true }
+        try {
+            $request = $line | ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
+            if ($request -isnot [hashtable] -or $request.operation -cnotin @('get-automation-status', 'scan-now')) { return $true }
+            Assert-AutomationRequest $request $request.operation
+        }
+        catch [Management.Automation.RuntimeException] { return $true }
+        if (-not (Register-BrokerRequestId -Id $request.requestId -AutomationPoll:($request.operation -ceq 'get-automation-status'))) {
+            return $true
+        }
+        if ($request.operation -ceq 'get-automation-status') { Invoke-GetAutomationStatus $request }
+        else { Invoke-ScanNow $request }
+        $script:readTask = $protocolReader.ReadLineAsync()
+    }
+    return $readTask.IsCompleted
+}
+
+function Get-OwnedRunConflict {
+    param([string]$RepositoryKey, [string]$Role)
+    $matches = @($children.GetEnumerator() | Where-Object {
+        -not $_.Value.ContainsKey('StartupFailed') -and $_.Value.Draft.Role -ceq $Role -and
+        $_.Value.Draft.RepositoryIdentity.key -ceq $RepositoryKey
+    })
+    if ($matches.Count -gt 0) {
+        if ($matches.Count -ne 1) { throw '[not-owner] Conflicting authority is ambiguous.' }
+        return @{ kind = 'manual'; workId = $matches[0].Key; generation = $matches[0].Key
+            pullRequestId = $matches[0].Value.Draft.PullRequestId }
+    }
+    if ($automaticWorkers.ContainsKey($Role)) {
+        $entry = $automaticWorkers[$Role]
+        if (-not $entry.ExitConfirmed -and $entry.Phase -ceq 'acquired' -and $entry.RepositoryKey -ceq $RepositoryKey) {
+            return @{ kind = 'automatic'; workId = $entry.WorkId; generation = $entry.Manifest.workerId
+                pullRequestId = $entry.PullRequestId }
+        }
+    }
+    return $null
+}
+
+function Assert-ScheduleRequest {
+    param([hashtable]$Request, [string[]]$Fields)
+    if (-not $launcherControl) { throw '[scheduling-unavailable] This launcher does not own schedulable workers.' }
+    if (($Request.schemaVersion -isnot [int] -and $Request.schemaVersion -isnot [long]) -or
+        $Request.schemaVersion -ne 1 -or $Request.operation -isnot [string] -or
+        $Request.operation -cnotin @('prepare-run', 'confirm-run', 'cancel-queued')) {
+        throw '[invalid-request] Unsupported scheduling envelope.'
+    }
+    foreach ($name in $Request.Keys) {
+        if ($name -cnotin (@('schemaVersion', 'requestId', 'operation') + $Fields)) {
+            throw '[invalid-request] Unexpected scheduling request field.'
+        }
+    }
+}
+
+function Remove-ScheduleDraft {
+    param([hashtable]$Summary)
+    if ($drafts.ContainsKey($Summary.dispatchDraftId)) {
+        Remove-DraftResidue $drafts[$Summary.dispatchDraftId]
+        $drafts.Remove($Summary.dispatchDraftId)
+    }
+}
+
+function Get-RevalidatedRunSummary {
+    param([hashtable]$Summary, [string]$Binding = '')
+    $fresh = Invoke-Describe @{
+        requestId = $Summary.requestId; role = $Summary.role
+        repositoryKey = $Summary.repositoryIdentity.key; pullRequestId = $Summary.prSnapshot.pullRequestId
+    } -PassThru
+    if ($fresh.capabilityPolicyDigest -cne $Summary.capabilityPolicyDigest -or
+        $fresh.prStateFingerprint -cne $Summary.prStateFingerprint -or
+        ($Binding -and $drafts[$fresh.dispatchDraftId].SchedulingBinding -cne $Binding)) {
+        Remove-ScheduleDraft $fresh
+        throw '[schedule-repreview-required] Target, source, configuration or permissions changed; preview again. Widening grants cannot be queued.'
+    }
+    return $fresh
+}
+
+function Invoke-PrepareRun {
+    param([hashtable]$Request)
+    Assert-ScheduleRequest $Request @('role', 'repositoryKey', 'pullRequestId', 'mode',
+        'capabilityPolicyDigest', 'prStateFingerprint', 'operatorPrompt')
+    if ($Request.mode -isnot [string] -or $Request.mode -cnotin @('replace', 'next') -or
+        $Request.repositoryKey -isnot [string] -or $Request.repositoryKey.Length -gt 512 -or
+        $Request.capabilityPolicyDigest -isnot [string] -or $Request.capabilityPolicyDigest -cnotmatch '^[0-9a-f]{64}$' -or
+        $Request.prStateFingerprint -isnot [string] -or $Request.prStateFingerprint -cnotmatch '^[0-9a-f]{64}$' -or
+        $Request.operatorPrompt -isnot [string]) { throw '[invalid-request] Invalid run preparation.' }
+    $prompt = Test-AgentOperatorPrompt -Prompt $Request.operatorPrompt
+    $summary = Invoke-Describe $Request -PassThru
+    try {
+        if ($summary.capabilityPolicyDigest -cne $Request.capabilityPolicyDigest -or
+            $summary.prStateFingerprint -cne $Request.prStateFingerprint) {
+            throw '[schedule-repreview-required] Preview again; target or permissions changed, or a widening grant cannot be queued.'
+        }
+        $key = Get-ManualTurnKey $summary.repositoryIdentity.key $summary.role
+        if ($manualTurns.ContainsKey($key) -and $manualTurns[$key].Phase -cne 'running') {
+            throw '[queue-full] This repository and role already has a pending manual turn.'
+        }
+        $conflict = Get-OwnedRunConflict $summary.repositoryIdentity.key $summary.role
+        if (-not $conflict) { throw '[not-owner] No currently acquired conflicting authority belongs to this launcher.' }
+        if ($runPreparations.Count -ge 16) { throw '[queue-full] Too many pending confirmations.' }
+        $token = New-AgentWideningChallenge
+        $expiry = [DateTime]::UtcNow.AddSeconds(60)
+        $runPreparations[$token] = @{
+            Summary = $summary; Binding = $drafts[$summary.dispatchDraftId].SchedulingBinding
+            Conflict = $conflict; Mode = $Request.mode; Prompt = $prompt.Text; Expires = $expiry
+        }
+        Write-DispatchProtocolMessage @{
+            schemaVersion = 1; requestId = $Request.requestId; operation = 'run-prepared'; schedulingVersion = 1
+            scope = 'current-launcher'; confirmationToken = $token; expiresAtUtc = $expiry.ToString('o')
+            role = $summary.role; repositoryKey = $summary.repositoryIdentity.key
+            pullRequestId = $summary.prSnapshot.pullRequestId; mode = $Request.mode; conflict = $conflict
+        }
+    }
+    catch { Remove-ScheduleDraft $summary; throw }
+}
+
+function Write-RunProgress {
+    param([hashtable]$Turn, [string]$State, [string]$Code = '')
+    if ($Turn.Progress -ceq $State -and $Turn.Code -ceq $Code) { return }
+    $Turn.Progress = $State; $Turn.Code = $Code
+    Write-DispatchProtocolMessage @{
+        schemaVersion = 1; requestId = $Turn.RequestId; operation = 'run-progress'; schedulingVersion = 1
+        queueId = $Turn.QueueId; state = $State; code = $Code
+    }
+}
+
+function Invoke-ConfirmRun {
+    param([hashtable]$Request)
+    Assert-ScheduleRequest $Request @('confirmationToken', 'expectedWorkId', 'expectedGeneration')
+    $token = $Request.confirmationToken
+    if ($token -isnot [string] -or $token -cnotmatch '^[0-9a-f]{48}$' -or -not $runPreparations.ContainsKey($token)) {
+        throw '[schedule-stale] Confirmation is unknown or consumed.'
+    }
+    $prepared = $runPreparations[$token]
+    $runPreparations.Remove($token)
+    try {
+        if ([DateTime]::UtcNow -ge $prepared.Expires) { throw '[schedule-expired] Confirmation expired.' }
+        $s = $prepared.Summary
+        $key = Get-ManualTurnKey $s.repositoryIdentity.key $s.role
+        if ($manualTurns.ContainsKey($key) -and $manualTurns[$key].Phase -cne 'running') {
+            throw '[queue-full] A manual turn is already reserved.'
+        }
+        $current = Get-OwnedRunConflict $s.repositoryIdentity.key $s.role
+        if (-not $current -or $Request.expectedWorkId -isnot [string] -or $Request.expectedGeneration -isnot [string] -or
+            $Request.expectedWorkId -cne $prepared.Conflict.workId -or
+            $Request.expectedGeneration -cne $prepared.Conflict.generation -or
+            (Get-AgentCanonicalDigest $current) -cne (Get-AgentCanonicalDigest $prepared.Conflict)) {
+            throw '[schedule-stale] Owned work changed; preview and confirm again.'
+        }
+        $predecessor = $null
+        if ($current.kind -ceq 'manual') {
+            if (-not $manualTurns.ContainsKey($key) -or $manualTurns[$key].DispatchId -cne $current.workId) {
+                throw '[schedule-stale] The predecessor manual reservation changed.'
+            }
+            $predecessor = $manualTurns[$key]
+            if (@(Get-OptionalMember $predecessor 'DeferredProgress').Count -ge 32) {
+                throw '[queue-full] Too many outcomes are awaiting automatic resumption.'
+            }
+        }
+        $fresh = Get-RevalidatedRunSummary $s $prepared.Binding
+        Remove-ScheduleDraft $s
+        $prepared.Summary = $fresh
+        $queueId = [Guid]::NewGuid().ToString('D')
+        $turn = @{
+            QueueId = $queueId; RequestId = $Request.requestId; Summary = $fresh; Binding = $prepared.Binding
+            Conflict = $current; Mode = $prepared.Mode; Prompt = $prepared.Prompt; Phase = 'pending'
+            Expires = [DateTime]::UtcNow.AddSeconds($DraftLifetimeSeconds); Cancelled = $false
+            Progress = ''; Code = ''; CancelSent = $false; CancelDeadline = $null; DispatchId = ''
+            Predecessor = $predecessor; DeferredProgress = @()
+        }
+        # Closing admission precedes cancellation/yield. Only this broker can acknowledge
+        # another automatic acquisition, so no unobserved successor can slip past this gate.
+        $manualTurns[$key] = $turn
+        Write-DispatchProtocolMessage @{
+            schemaVersion = 1; requestId = $Request.requestId; operation = 'run-queued'; schedulingVersion = 1
+            queueId = $queueId; mode = $turn.Mode
+        }
+        Write-RunProgress $turn queued
+    }
+    catch { Remove-ScheduleDraft $prepared.Summary; throw }
+}
+
+function Test-RunAuthorityAvailable {
+    param([hashtable]$Summary, [int]$ConflictPullRequestId = 0)
+    $execution = Get-AgentExecutionKey -RepositoryIdentity $Summary.repositoryIdentity `
+        -PullRequestId $Summary.prSnapshot.pullRequestId -Role $Summary.role
+    $context = Get-AgentDurableStateContext -DurableStateRoot $durableRoot `
+        -RepositoryIdentity $Summary.repositoryIdentity -Role $Summary.role -Create
+    $opened = [Collections.Generic.List[IO.FileStream]]::new()
+    try {
+        $paths = @((Join-Path $leaseRoot "$(Get-AgentSha256 $execution).lease"), $context.LockPath)
+        if ($ConflictPullRequestId -gt 0 -and $ConflictPullRequestId -ne $Summary.prSnapshot.pullRequestId) {
+            $prior = Get-AgentExecutionKey -RepositoryIdentity $Summary.repositoryIdentity `
+                -PullRequestId $ConflictPullRequestId -Role $Summary.role
+            $paths += Join-Path $leaseRoot "$(Get-AgentSha256 $prior).lease"
+        }
+        foreach ($path in $paths) {
+            $opened.Add([IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None))
+        }
+        return $true
+    }
+    catch [IO.IOException] { return $false }
+    finally { foreach ($stream in $opened) { $stream.Dispose() } }
+}
+
+function Complete-ManualTurn {
+    param([string]$Key, [hashtable]$Turn)
+    if ($Turn.Summary) { Remove-ScheduleDraft $Turn.Summary }
+    $predecessor = Get-OptionalMember $Turn 'Predecessor'
+    if ($predecessor) {
+        # Retiring B must not retire A's still-live reservation, including the window
+        # after A exits but before its authority release has been independently observed.
+        Add-DeferredTurnProgress -Destination $predecessor -Source $Turn
+        $Turn.Predecessor = $null
+        $manualTurns[$Key] = $predecessor
+        if ($Turn.QueueId) { Write-RunProgress $Turn waiting-authority predecessor-running }
+        return
+    }
+    if ($automaticWorkers.ContainsKey($Turn.Summary.role)) {
+        $worker = $automaticWorkers[$Turn.Summary.role]
+        if ($worker.FailureCode) {
+            $Turn.Phase = 'blocked'
+            foreach ($progress in @(Get-TurnProgressRecords $Turn)) { Write-RunProgress $progress blocked $worker.FailureCode }
+            return
+        }
+        if ($worker.ExitConfirmed -and $worker.Phase -ceq 'yielding') {
+            try {
+                Start-AutomaticWorker $worker.Spec
+                $worker = $automaticWorkers[$Turn.Summary.role]
+            }
+            catch {
+                $Turn.Phase = 'blocked'
+                $code = if ($_.Exception.Message -match '^\[([a-z-]+)\]') { $Matches[1] } else { 'launch-failed' }
+                if ($Turn.QueueId) { Write-RunProgress $Turn blocked $code }
+                else { Write-Rejection $Turn.RequestId $code 'Automatic resumption failed; admission remains closed.' }
+                return
+            }
+        }
+        if (-not $worker.StartupAcknowledged) {
+            $Turn.Phase = 'resuming'
+            $Turn['ResumeWorkerId'] = $worker.Manifest.workerId
+            foreach ($progress in @(Get-TurnProgressRecords $Turn)) { Write-RunProgress $progress waiting-authority automatic-starting }
+            return
+        }
+    }
+    $manualTurns.Remove($Key)
+    foreach ($progress in @(Get-TurnProgressRecords $Turn)) { Write-RunProgress $progress resumed }
+}
+
+function Get-TurnProgressRecords {
+    param([hashtable]$Turn)
+    if ($Turn.QueueId) {
+        @{ QueueId = $Turn.QueueId; RequestId = $Turn.RequestId; Progress = $Turn.Progress; Code = $Turn.Code }
+    }
+    foreach ($progress in @(Get-OptionalMember $Turn 'DeferredProgress')) {
+        if ($progress) { $progress }
+    }
+}
+
+function Add-DeferredTurnProgress {
+    param([hashtable]$Destination, [hashtable]$Source)
+    $records = @(@(Get-OptionalMember $Destination 'DeferredProgress') | Where-Object { $null -ne $_ })
+    $records += @(Get-TurnProgressRecords $Source)
+    $Destination['DeferredProgress'] = $records
+}
+
+function Invoke-CancelQueued {
+    param([hashtable]$Request)
+    Assert-ScheduleRequest $Request @('queueId')
+    if ($Request.queueId -isnot [string] -or $Request.queueId -cnotmatch '^[0-9a-f-]{36}$') {
+        throw '[invalid-request] Invalid queue ID.'
+    }
+    $entry = @($manualTurns.GetEnumerator() | Where-Object { $_.Value.QueueId -ceq $Request.queueId })
+    if ($entry.Count -ne 1 -or $entry[0].Value.Phase -cne 'pending') {
+        throw '[not-queued] This intent is not pending; cancel accepted work separately.'
+    }
+    $entry[0].Value.Cancelled = $true
+    Write-DispatchProtocolMessage @{
+        schemaVersion = 1; requestId = $Request.requestId; operation = 'queue-cancelled'; schedulingVersion = 1
+        queueId = $Request.queueId
+    }
+}
+
+function Update-ManualTurns {
+    foreach ($token in @($runPreparations.Keys)) {
+        if ([DateTime]::UtcNow -ge $runPreparations[$token].Expires) {
+            Remove-ScheduleDraft $runPreparations[$token].Summary
+            $runPreparations.Remove($token)
+        }
+    }
+    foreach ($key in @($manualTurns.Keys)) {
+        $turn = $manualTurns[$key]
+        if ($turn.Phase -cin @('blocked', 'resuming')) { continue }
+        if ($turn.Phase -ceq 'running') {
+            if (-not $children.ContainsKey($turn.DispatchId)) {
+                if (Test-RunAuthorityAvailable $turn.Summary) { Complete-ManualTurn $key $turn }
+                elseif ($turn.QueueId) { Write-RunProgress $turn waiting-authority authority-contended }
+            }
+            continue
+        }
+        try {
+            if ([DateTime]::UtcNow -ge $turn.Expires) {
+                $turn.Cancelled = $true
+                Write-RunProgress $turn blocked schedule-expired
+            }
+            if ($turn.Conflict.kind -ceq 'automatic') {
+                $worker = $automaticWorkers[$turn.Summary.role]
+                if ($worker.Manifest.workerId -cne $turn.Conflict.generation) { throw '[schedule-stale] Worker generation changed.' }
+                if (-not $worker.ExitConfirmed) {
+                    if ($turn.Cancelled -and -not $turn.CancelSent -and $worker.Phase -cne 'yielding') {
+                        Complete-ManualTurn $key $turn
+                        continue
+                    }
+                    if ($turn.Mode -ceq 'replace' -and -not $turn.CancelSent) {
+                        $record = @{ operation = 'cancel'; workerId = $worker.Manifest.workerId; workId = $turn.Conflict.workId }
+                        $cancel = @{ record = $record; proof = Get-AgentAttestationProof -SecretBytes $worker.Secret `
+                            -Nonce $worker.Manifest.nonce -Digest (Get-AgentCanonicalDigest $record) }
+                        $path = Join-Path $worker.Manifest.runtimeRoot 'cancel.json'
+                        [IO.File]::WriteAllText("$path.new", (ConvertTo-AgentCanonicalJson $cancel), $utf8)
+                        [IO.File]::Move("$path.new", $path, $true)
+                        $turn.CancelSent = $true; $turn.CancelDeadline = [DateTime]::UtcNow.AddSeconds(5)
+                        $worker.ExpectedExit = $true
+                        Write-RunProgress $turn quiescing
+                    }
+                    else { Write-RunProgress $turn waiting-authority }
+                    if ($turn.CancelSent -and [DateTime]::UtcNow -ge $turn.CancelDeadline) {
+                        if (-not (Stop-AgentProcessContainment $worker.Containment $worker.Child.Process)) {
+                            $turn.Phase = 'blocked'
+                            Write-RunProgress $turn blocked termination-failed
+                            continue
+                        }
+                        $worker.Phase = 'yielding'
+                    }
+                    continue
+                }
+            }
+            elseif ($children.ContainsKey($turn.Conflict.workId)) {
+                if ($turn.Cancelled) { Complete-ManualTurn $key $turn; continue }
+                if ($turn.Mode -ceq 'replace' -and -not $turn.CancelSent) {
+                    Write-RunProgress $turn quiescing
+                    $turn.CancelSent = $true
+                    Stop-BrokerChild $turn.Conflict.workId $turn.RequestId
+                    if ($children.ContainsKey($turn.Conflict.workId)) {
+                        $turn.Phase = 'blocked'
+                        Write-RunProgress $turn blocked termination-failed
+                    }
+                }
+                else { Write-RunProgress $turn waiting-authority }
+                continue
+            }
+            if ($turn.Cancelled) { Complete-ManualTurn $key $turn; continue }
+            if (-not (Test-RunAuthorityAvailable $turn.Summary -ConflictPullRequestId $turn.Conflict.pullRequestId)) {
+                Write-RunProgress $turn waiting-authority
+                continue
+            }
+            Write-RunProgress $turn revalidating
+            $fresh = Get-RevalidatedRunSummary $turn.Summary $turn.Binding
+            Remove-ScheduleDraft $turn.Summary
+            $turn.Summary = $fresh
+            # A cancel/EOF that arrived during bounded provider revalidation wins over
+            # admission. The main loop services the buffered input before another turn.
+            if (Test-BrokerStartupInputPending) { continue }
+            if ($turn.Predecessor) {
+                Add-DeferredTurnProgress -Destination $turn -Source $turn.Predecessor
+                $turn.Predecessor = $null
+            }
+            Invoke-Dispatch @{
+                schemaVersion = 1; requestId = $turn.RequestId; role = $fresh.role
+                repositoryKey = $fresh.repositoryIdentity.key; pullRequestId = $fresh.prSnapshot.pullRequestId
+                dispatchDraftId = $fresh.dispatchDraftId; capabilityPolicyDigest = $fresh.capabilityPolicyDigest
+                prStateFingerprint = $fresh.prStateFingerprint; operatorPrompt = $turn.Prompt
+            } -ScheduledTurn $turn
+        }
+        catch {
+            $code = if ($_.Exception.Message -match '^\[([a-z-]+)\]') { $Matches[1] } else { 'launch-failed' }
+            Write-RunProgress $turn blocked $code
+            if ($code -ceq 'termination-failed') { $turn.Phase = 'blocked' }
+            else { Complete-ManualTurn $key $turn }
+        }
+    }
+}
+
+function Invoke-Dispatch {
+    param([hashtable]$Request, [hashtable]$ScheduledTurn)
+    if (-not $launcherControl -or $ScheduledTurn) {
+        Invoke-DispatchCore $Request -Turn $ScheduledTurn
+        return
+    }
+    $draftId = [string](Get-OptionalMember $Request 'dispatchDraftId')
+    if (-not $drafts.ContainsKey($draftId)) { throw '[invalid-request] Unknown dispatch draft.' }
+    $draft = $drafts[$draftId]
+    $key = Get-ManualTurnKey $draft.RepositoryIdentity.key $draft.Role
+    if ($manualTurns.ContainsKey($key)) { throw '[already-running] A manual turn is already reserved.' }
+    if (Get-OwnedRunConflict $draft.RepositoryIdentity.key $draft.Role) {
+        # This refusal consumes the draft too; busy scheduling deliberately binds intent, not
+        # a retry of an already-used dispatch authorization.
+        $draft.Consumed = $true
+        throw '[already-running] state-contended'
+    }
+    $turn = @{
+        QueueId = ''; RequestId = $Request.requestId; Phase = 'running'; DispatchId = ''
+        Summary = @{ dispatchDraftId = $draftId; repositoryIdentity = $draft.RepositoryIdentity
+            role = $draft.Role; prSnapshot = $draft.PrSnapshot }
+    }
+    $manualTurns[$key] = $turn
+    try { Invoke-DispatchCore $Request -Turn $turn }
+    catch {
+        if (@($children.Values | Where-Object { $_.DraftId -ceq $draftId }).Count -gt 0) { $turn.Phase = 'blocked' }
+        else { Complete-ManualTurn $key $turn }
+        throw
+    }
+}
+
+function Invoke-DispatchCore {
+    param([hashtable]$Request, [hashtable]$Turn)
     $draftId = [string](Get-OptionalMember $Request 'dispatchDraftId')
     $parsed = [Guid]::Empty
     if (-not [Guid]::TryParseExact($draftId, 'D', [ref]$parsed) -or -not $drafts.ContainsKey($draftId)) {
@@ -1195,6 +2095,13 @@ function Invoke-Dispatch {
     $draft.Consumed = $true
     if (([DateTime]::UtcNow - $draft.CreatedAt).TotalSeconds -gt $DraftLifetimeSeconds) {
         throw '[invalid-request] dispatchDraftId has expired.'
+    }
+    # issue #114: terminal ceiling recheck at the one boundary that actually launches a child. The
+    # draft's bound policy is re-derived from the descriptor on every describe, so this can only
+    # fire if the policy was widened after the draft was bound -- it must never reach a child argv.
+    $dispatchAbsoluteDenies = @($draft.RoleDescriptor.absoluteDenies)
+    if (@($draft.Policy.capabilities | Where-Object { $dispatchAbsoluteDenies -ccontains $_ }).Count -gt 0) {
+        throw '[role-not-allowed] The requested dispatch includes a capability this launch absolutely denies.'
     }
     foreach ($binding in @(
             @('role', $draft.Role), @('pullRequestId', $draft.PullRequestId),
@@ -1354,6 +2261,8 @@ function Invoke-Dispatch {
         '-PullRequestId', [string]$draft.PullRequestId, '-Once')
     if ($includeForceAnalysis) { $args += '-ForceAnalysis' }
     $args += @('-OutputMode', 'Json', '-ManualDispatchManifest', $manifestPath)
+    # An explicitly selected manual PR may belong to the operator; automatic scans keep their default.
+    if ($draft.Role -eq 'reviewer') { $args += '-IncludeOwnPullRequests' }
     foreach ($capability in @($draft.Policy.capabilities)) {
         $args += "-$capability"
     }
@@ -1365,6 +2274,7 @@ function Invoke-Dispatch {
     # failure here left both leaked until process exit (known limitation, now closed): neither was
     # covered by the try/finally that only starts below, once the child is already known to exist.
     $child = $null
+    $containment = $null
     try {
         $child = New-AgentRedirectedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList $args `
             -StandardOutputPath (Join-Path $diagnostics 'stdout.log') -StandardErrorPath (Join-Path $diagnostics 'stderr.log') `
@@ -1373,24 +2283,37 @@ function Invoke-Dispatch {
         # The broker's own copy of the CLIENT-side handle must be released immediately once it has
         # been duplicated into the child at process-creation time -- and only a process the OS
         # itself handed this exact inherited handle to can ever open it; a forged manifest plus a
-        # same-named fake pipe can never obtain it. The secret is written once, right away, so the
-        # child can read it as soon as it reaches Receive-AgentBrokerAttestationSecret.
+        # same-named fake pipe can never obtain it. The early child guard waits for these
+        # bytes before provider setup, so install containment before releasing that barrier.
         $attestationPipe.DisposeLocalCopyOfClientHandle()
+        $containment = New-AgentProcessContainment -Process $child.Process
         $attestationPipe.Write($attestationSecret, 0, $attestationSecret.Length)
         $attestationPipe.Flush()
     }
     catch {
         $attestationPipe.Dispose()
         [Array]::Clear($attestationSecret, 0, $attestationSecret.Length)
-        if ($child) { Stop-ProcessTree $child.Process; [void]$child.Process.WaitForExit(5000); [void](Complete-AgentRedirectedProcess $child) }
         if ($grantCapability) { Remove-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot }
+        if ($draft['PromptGuard']) { $draft['PromptGuard'].Dispose(); $draft['PromptGuard'] = $null }
         Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
+        if ($child) {
+            $terminated = if ($containment) { Stop-AgentProcessContainment $containment $child.Process }
+            else { Stop-ProcessTree $child.Process; $child.Process.WaitForExit(5000) }
+            if (-not $terminated) {
+                $children[$dispatchId] = @{
+                    Child = $child; RequestId = [string]$Request.requestId; Pipe = $pipe
+                    Draft = $draft; DraftId = $draftId; Containment = $containment; StartupFailed = $true
+                }
+                throw '[termination-failed] Early startup cleanup could not confirm child exit.'
+            }
+            [void](Complete-AgentRedirectedProcess $child)
+        }
+        Close-AgentProcessContainment $containment
+        $pipe.Dispose()
         throw
     }
-    $containment = $null
     $completionResult = $null
     try {
-        $containment = New-AgentProcessContainment -Process $child.Process
         if (-not $IsWindows -and $draft.ContainsKey('GuardianToken') -and $draft['GuardianToken']) {
             $registration = Join-Path $draft.Snapshot.RuntimeRoot "guardian-$($draft['GuardianToken']).json"
             $guardianRecord = Get-Content -LiteralPath $registration -Raw -Encoding UTF8 |
@@ -1482,6 +2405,9 @@ function Invoke-Dispatch {
             $draft['PromptGuard'] = $null
         }
         if (Test-Path -LiteralPath $promptPath) { throw '[launch-failed] Child did not remove the operator prompt.' }
+        if ($Turn -and $Turn.QueueId -and (Test-BrokerStartupInputPending)) {
+            throw '[schedule-interrupted] Dashboard input interrupted queued startup; preview and confirm again.'
+        }
         $writer.WriteLine((ConvertTo-AgentCanonicalJson ([ordered]@{
                     schemaVersion = 1; operation = 'proceed'; dispatchId = $dispatchId
                 })))
@@ -1498,28 +2424,39 @@ function Invoke-Dispatch {
             Child = $child; RequestId = [string]$Request.requestId; Pipe = $pipe
             Draft = $draft; DraftId = $draftId; Containment = $containment
         }
-        Write-DispatchProtocolMessage @{
+        $accepted = @{
             schemaVersion = 1; requestId = [string]$Request.requestId; operation = 'accepted'
             dispatchId = $dispatchId; repositoryIdentity = $identity; pullRequestId = $draft.PullRequestId
             role = $draft.Role; capabilityPolicyDigest = $draft.PolicyDigest
             prStateFingerprint = $draft.PrFingerprint; childProcessId = $child.Process.Id; eventLogPath = $eventPath
         }
+        if ($Turn) {
+            $Turn.Phase = 'running'; $Turn.DispatchId = $dispatchId
+            if ($Turn.QueueId) { $accepted.queueId = $Turn.QueueId }
+        }
+        Write-DispatchProtocolMessage $accepted
     }
     catch {
-        if ($containment) { Stop-AgentProcessContainment $containment $child.Process }
-        else { Stop-ProcessTree $child.Process; [void]$child.Process.WaitForExit(5000) }
+        $startupError = $_
+        $terminated = if ($containment) { Stop-AgentProcessContainment $containment $child.Process }
+        else { Stop-ProcessTree $child.Process; $child.Process.WaitForExit(5000) }
+        $attestationPipe.Dispose()
+        [Array]::Clear($attestationSecret, 0, $attestationSecret.Length)
+        if ($grantCapability) { Remove-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot }
+        if ($draft['PromptGuard']) { $draft['PromptGuard'].Dispose(); $draft['PromptGuard'] = $null }
+        Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
+        if (-not $terminated) {
+            # Keep ownership and runtime files until the tree really exits; cleanup results
+            # must never become protocol output or authorize deleting a live child's state.
+            $children[$dispatchId] = @{
+                Child = $child; RequestId = [string]$Request.requestId; Pipe = $pipe
+                Draft = $draft; DraftId = $draftId; Containment = $containment; StartupFailed = $true
+            }
+            throw "[termination-failed] Startup cleanup could not confirm child exit. Original startup error: $($startupError.Exception.Message)"
+        }
         if (-not $completionResult) { [void](Complete-AgentRedirectedProcess $child) }
         Close-AgentProcessContainment $containment
         $pipe.Dispose()
-        $attestationPipe.Dispose()
-        [Array]::Clear($attestationSecret, 0, $attestationSecret.Length)
-        # issue #105 PR4 requirement 7: a grant artifact already sealed for THIS dispatch attempt
-        # must never survive a failed/abandoned handshake -- Remove-ExpiredDrafts provides an
-        # unconditional backstop, but cleaning it up immediately here (write/start/ready/proceed all
-        # failed the same way) avoids leaving a sealed selection on disk for even one extra poll
-        # interval.
-        if ($grantCapability) { Remove-AgentWideningGrantArtifact -RuntimeRoot $draft.Snapshot.RuntimeRoot }
-        Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
         throw
     }
 }
@@ -1529,15 +2466,17 @@ function Complete-ExitedChildren {
         $entry = $children[$id]
         $entry.Child.Process.Refresh()
         if (-not $entry.Child.Process.HasExited) { continue }
-        if (-not (Test-AgentProcessContainmentExited -Containment $entry.Containment -Process $entry.Child.Process)) {
+        if ($entry.Containment -and -not (Test-AgentProcessContainmentExited -Containment $entry.Containment -Process $entry.Child.Process)) {
             continue
         }
         $result = Complete-AgentRedirectedProcess $entry.Child
         $entry.Pipe.Dispose()
         Close-AgentProcessContainment $entry.Containment
-        Write-DispatchProtocolMessage @{
-            schemaVersion = 1; requestId = $entry.RequestId; operation = 'completed'
-            dispatchId = $id; exitCode = $result.ExitCode
+        if (-not $entry.ContainsKey('StartupFailed')) {
+            Write-DispatchProtocolMessage @{
+                schemaVersion = 1; requestId = $entry.RequestId; operation = 'completed'
+                dispatchId = $id; exitCode = $result.ExitCode
+            }
         }
         $children.Remove($id)
         Remove-DraftResidue $entry.Draft
@@ -1561,7 +2500,10 @@ function Stop-BrokerChild {
             [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
     }
     [void]$entry.Child.Process.WaitForExit(5000)
-    $treeExited = Test-AgentProcessContainmentExited -Containment $entry.Containment -Process $entry.Child.Process
+    $treeExited = if ($entry.Containment) {
+        Test-AgentProcessContainmentExited -Containment $entry.Containment -Process $entry.Child.Process
+    }
+    else { $entry.Child.Process.HasExited }
     $cooperative = $false
     $acknowledgementPresent = Test-Path -LiteralPath $cancelAckPath -PathType Leaf
     if ($treeExited -and $acknowledgementPresent) {
@@ -1593,6 +2535,9 @@ function Stop-BrokerChild {
         -TreeExitedDuringGrace $treeExited `
         -ForcedContainmentSucceeded $false
     if ($graceOutcome.Result -eq 'completed') {
+        $authorityAvailable = Test-RunAuthorityAvailable @{
+            repositoryIdentity = $entry.Draft.RepositoryIdentity; prSnapshot = $entry.Draft.PrSnapshot; role = $entry.Draft.Role
+        }
         $natural = Complete-AgentRedirectedProcess $entry.Child
         Close-AgentProcessContainment $entry.Containment
         $entry.Pipe.Dispose()
@@ -1602,13 +2547,16 @@ function Stop-BrokerChild {
         Write-DispatchProtocolMessage @{
             schemaVersion = 1; requestId = $RequestId; operation = 'completed'
             dispatchId = $DispatchId; exitCode = $natural.ExitCode
-            handleReleaseObserved = $true
+            handleReleaseObserved = $authorityAvailable
         }
         return
     }
     $terminated = $false
     if ($graceOutcome.Result -ne 'cancelled-cooperative') {
-        $terminated = Stop-AgentProcessContainment $entry.Containment $entry.Child.Process
+        $terminated = if ($entry.Containment) {
+            Stop-AgentProcessContainment $entry.Containment $entry.Child.Process
+        }
+        else { Stop-ProcessTree $entry.Child.Process; $entry.Child.Process.WaitForExit(5000) }
         $treeExited = [bool]$terminated
     }
     $outcome = Get-AgentCancellationOutcome `
@@ -1617,8 +2565,12 @@ function Stop-BrokerChild {
         -TreeExitedDuringGrace ($graceOutcome.Result -eq 'cancelled-cooperative') `
         -ForcedContainmentSucceeded ($graceOutcome.Result -ne 'cancelled-cooperative' -and $terminated)
     if ($outcome.Result -eq 'termination-failed') {
+        if ($BrokerShutdown) { throw '[termination-failed] Contained process tree did not exit within the bounded termination period.' }
         Write-Rejection $RequestId 'termination-failed' 'Contained process tree did not exit within the bounded termination period.'
         return
+    }
+    $authorityAvailable = Test-RunAuthorityAvailable @{
+        repositoryIdentity = $entry.Draft.RepositoryIdentity; prSnapshot = $entry.Draft.PrSnapshot; role = $entry.Draft.Role
     }
     [void](Complete-AgentRedirectedProcess $entry.Child)
     Close-AgentProcessContainment $entry.Containment
@@ -1632,18 +2584,75 @@ function Stop-BrokerChild {
         operation = $outcome.Operation
         dispatchId = $DispatchId
         result = $outcome.Result
-        handleReleaseObserved = $outcome.HandleReleaseObserved
+        handleReleaseObserved = $authorityAvailable
     }
 }
 
+function Get-LocalWatchObservation {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Descriptor,
+        [Parameter(Mandatory)][string]$StateRoot,
+        [switch]$DashboardProvenance
+    )
+    if (-not $DashboardProvenance -or -not $Descriptor.Contains('localObservation')) { return $null }
+    try {
+        $observation = $Descriptor.localObservation
+        if ($observation -isnot [Collections.IDictionary] -or $observation.schemaVersion -ne 1 -or
+            $observation.ownerStartIdentity -isnot [string] -or
+            $observation.ownerStartIdentity -cnotmatch '^(utc|linux):[0-9]+$') { return $null }
+        # A copied descriptor, a live/reused PID, or a local-looking path is not origin proof.
+        # This must be the current Dashboard's actual launcher, with the captured start identity.
+        $dashboardPid = Get-AgentImmediateParentProcessId -ProcessId $PID
+        $launcherPid = Get-AgentImmediateParentProcessId -ProcessId $dashboardPid
+        if ($launcherPid -ne $Descriptor.ownerProcessId) { return $null }
+        $launcher = Get-Process -Id $launcherPid -ErrorAction Stop
+        if ((Get-AgentProcessStartIdentity -Process $launcher) -cne $observation.ownerStartIdentity) { return $null }
+        $streams = @($observation.streams)
+        if ($streams.Count -gt 2) { return $null }
+        $result = [Collections.Generic.List[object]]::new()
+        $roles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($stream in $streams) {
+            if ($stream -isnot [Collections.IDictionary] -or $stream.role -cnotin @('reviewer', 'review-handler') -or
+                ($stream.processId -isnot [int] -and $stream.processId -isnot [long]) -or
+                $stream.processId -le 0 -or $stream.processId -gt [int]::MaxValue -or
+                -not $roles.Add($stream.role) -or $stream.eventLogPath -isnot [string] -or
+                -not [IO.Path]::IsPathFullyQualified($stream.eventLogPath)) { return $null }
+            $expectedPath = Join-Path $StateRoot "$($stream.role).stdout.jsonl"
+            $path = Assert-AgentTrustedFile -Path ([IO.Path]::GetFullPath([string]$stream.eventLogPath)) `
+                -AllowedRoot $StateRoot -ExpectedPath $expectedPath -Private
+            [void]$result.Add(@{ role = $stream.role; processId = $stream.processId; eventLogPath = $path })
+        }
+        return @{
+            schemaVersion = 1; requestId = '00000000-0000-0000-0000-000000000000'
+            operation = 'local-observation'; streams = @($result.ToArray())
+        }
+    }
+    catch {
+        # Unavailable origin metadata never makes an arbitrary stream locally observable.
+        return $null
+    }
+}
+
+$localObservation = Get-LocalWatchObservation -Descriptor $descriptor -StateRoot $stateRoot `
+    -DashboardProvenance:$interactiveWideningAvailable
+if ($null -ne $localObservation) { Write-DispatchProtocolMessage $localObservation }
+
+$protocolReader = [IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8, $false, 1024, $true)
 try {
-    $readTask = [Console]::In.ReadLineAsync()
+    Initialize-BrokerLauncherControl
+    # Console.In's synchronized reader can execute ReadLineAsync synchronously, starving
+    # child completion/cleanup while the dashboard has no next request to send.
+    $readTask = $protocolReader.ReadLineAsync()
     while ($accepting) {
+        Update-AutomaticWorkers
         Complete-ExitedChildren
         Remove-ExpiredDrafts
         Remove-ExpiredNarrowingPreviews
         if ($null -eq (Get-Process -Id ([int]$descriptor.ownerProcessId) -ErrorAction SilentlyContinue)) { break }
-        if (-not $readTask.Wait(100)) { continue }
+        if (-not $readTask.Wait(100)) {
+            Update-ManualTurns
+            continue
+        }
         $line = $readTask.Result
         if ($null -eq $line) { break }
         $requestId = ''
@@ -1654,10 +2663,13 @@ try {
             if ([int]$request.schemaVersion -ne 1) { throw '[invalid-request] Unsupported protocol version.' }
             $requestId = [string]$request.requestId
             if ($requestId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
-                -not (Register-BrokerRequestId -Id $requestId)) { throw '[invalid-request] requestId is malformed or duplicated.' }
+                -not (Register-BrokerRequestId -Id $requestId -AutomationPoll:($request.operation -ceq 'get-automation-status'))) {
+                throw '[invalid-request] requestId is malformed or duplicated.'
+            }
             switch ([string]$request.operation) {
                 'describe' { Invoke-Describe $request }
                 'profile' { Invoke-Profile $request }
+                'profile-current' { Invoke-ProfileCurrent $request }
                 'preview-narrowing' { Invoke-PreviewNarrowing $request }
                 'apply-narrowing' { Invoke-ApplyNarrowing $request }
                 'set-kill-switch' { Invoke-SetKillSwitch $request }
@@ -1666,11 +2678,16 @@ try {
                 'confirm-widening-mint' { Invoke-ConfirmWideningMint $request }
                 'cancel-widening' { Invoke-CancelWidening $request }
                 'dispatch' { Invoke-Dispatch $request }
+                'prepare-run' { Invoke-PrepareRun $request }
+                'confirm-run' { Invoke-ConfirmRun $request }
+                'cancel-queued' { Invoke-CancelQueued $request }
+                'get-automation-status' { Invoke-GetAutomationStatus $request }
+                'scan-now' { Invoke-ScanNow $request }
                 'cancel' { Stop-BrokerChild ([string]$request.dispatchId) $requestId }
                 'shutdown' {
                     $accepting = $false
+                    $shutdownRequestId = $requestId
                     foreach ($id in @($children.Keys)) { Stop-BrokerChild $id $requestId -BrokerShutdown }
-                    Write-DispatchProtocolMessage @{ schemaVersion = 1; requestId = $requestId; operation = 'shutdown-complete' }
                 }
                 default { throw '[invalid-request] Unknown operation.' }
             }
@@ -1680,26 +2697,64 @@ try {
             $code = if ($message -match '^\[([a-z-]+)\]') { $Matches[1] } else { 'launch-failed' }
             Write-Rejection $requestId $code $message
             $failedDraftId = [string](Get-OptionalMember $request 'dispatchDraftId')
-            if ($failedDraftId -and $drafts.ContainsKey($failedDraftId)) {
+            $draftStillOwned = @($children.Values | Where-Object { $_.DraftId -ceq $failedDraftId }).Count -gt 0
+            if ($failedDraftId -and $drafts.ContainsKey($failedDraftId) -and -not $draftStillOwned) {
                 $failedDraft = $drafts[$failedDraftId]
                 Remove-DraftResidue $failedDraft
                 $drafts.Remove($failedDraftId)
             }
         }
         if ($accepting) {
-            $readTask = [Console]::In.ReadLineAsync()
+            $readTask = $protocolReader.ReadLineAsync()
         }
     }
 }
 finally {
+    $protocolReader.Dispose()
+    $terminationFailed = $false
+    # A disconnect cancels all pending intent. Never resume automatic admission during cleanup.
+    foreach ($worker in @($automaticWorkers.Values)) {
+        if ($worker.ExitConfirmed) { continue }
+        if ($worker.Child) {
+            $stopped = if ($worker.Containment) {
+                Stop-AgentProcessContainment $worker.Containment $worker.Child.Process
+            }
+            else {
+                Stop-ProcessTree $worker.Child.Process
+                $worker.Child.Process.WaitForExit(5000)
+            }
+            if (-not $stopped) { $terminationFailed = $true }
+            else { [void](Complete-AgentRedirectedProcess $worker.Child) }
+        }
+        Close-AgentProcessContainment $worker.Containment
+        $worker.Pipe.Dispose()
+        [Array]::Clear($worker.Secret, 0, $worker.Secret.Length)
+    }
     foreach ($id in @($children.Keys)) {
         $entry = $children[$id]
-        Stop-AgentProcessContainment $entry.Containment $entry.Child.Process
+        $terminated = if ($entry.Containment) {
+            Stop-AgentProcessContainment $entry.Containment $entry.Child.Process
+        }
+        else { Stop-ProcessTree $entry.Child.Process; $entry.Child.Process.WaitForExit(5000) }
+        if (-not $terminated) {
+            $terminationFailed = $true
+            Close-AgentProcessContainment $entry.Containment
+            $entry.Pipe.Dispose()
+            continue
+        }
         [void](Complete-AgentRedirectedProcess $entry.Child)
         Close-AgentProcessContainment $entry.Containment
         $entry.Pipe.Dispose()
+        $children.Remove($id)
     }
-    foreach ($draft in @($drafts.Values)) {
-        Remove-DraftResidue $draft
+    foreach ($draftId in @($drafts.Keys)) {
+        if (@($children.Values | Where-Object { $_.DraftId -ceq $draftId }).Count -eq 0) {
+            Remove-DraftResidue $drafts[$draftId]
+        }
+    }
+    if ($launcherClaim) { $launcherClaim.Dispose() }
+    if ($terminationFailed) { throw '[termination-failed] Broker shutdown could not confirm contained process exit; runtime state was retained.' }
+    if ($shutdownRequestId) {
+        Write-DispatchProtocolMessage @{ schemaVersion = 1; requestId = $shutdownRequestId; operation = 'shutdown-complete' }
     }
 }

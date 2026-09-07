@@ -412,7 +412,13 @@ Describe 'Shared reviewer and review-handler event contract' {
         $source | Should -Match '\$reviewerOperationalCapabilities\s*=\s*@\(\$reviewerCapabilityDescriptor\.operationalTiers\.base\)'
         $source | Should -Match '\$reviewHandlerOperationalCapabilities\s*=\s*@\(\$reviewHandlerCapabilityDescriptor\.operationalTiers\.base\)'
         $source | Should -Match '\$reviewHandlerCodeUpdateCapabilities\s*=\s*@\(\$reviewHandlerCapabilityDescriptor\.operationalTiers\.codeUpdate\)'
-        $source | Should -Match '\$reviewerCapabilities\s*=\s*@\(\)'
+        # issue #114: the manual reviewer ceiling is no longer decided inline -- it comes from the
+        # one resolved launch policy, which has already applied Golden's defaults and any terminal
+        # preview-only lock, so the manual and automatic ceilings of a launch cannot diverge.
+        $source | Should -Match '\$reviewerCapabilities\s*=\s*@\(\$launch\.Reviewer\.ManualCapabilities\)'
+        $source | Should -Match '\$handlerCapabilities\s*=\s*@\(\$launch\.ReviewHandler\.ManualCapabilities\)'
+        $source | Should -Match 'absoluteDenies\s*=\s*@\(\$launch\.Reviewer\.AbsoluteDenies\)'
+        $source | Should -Match 'absoluteDenies\s*=\s*@\(\$launch\.ReviewHandler\.AbsoluteDenies\)'
         $source | Should -Match 'capabilities\s*=\s*\$reviewerCapabilities'
         $source | Should -Not -Match 'capabilities\s*=\s*@\(\$\(if\s*\(\$EnableManualReviewerWrites\)'
         foreach ($capability in @(
@@ -434,7 +440,9 @@ Describe 'Shared reviewer and review-handler event contract' {
         $reviewHandlerDescriptor.delegableDefaultOff | Should -BeExactly 'EnableAutoComplete'
         $source | Should -Match "\$childArguments \+= '-EnableTeamsNotifications'"
         $source | Should -Match '\$childArguments \+= "-\$capability"'
-        $source | Should -Match 'if \(\$Operational\)'
+        $source | Should -Match 'if \(\$launch\.LaunchMode -eq ''operational''\)'
+        $source | Should -Match '\$launch = Resolve-WatchLaunchPolicy'
+        $source | Should -Match 'LaunchMode = \$launch\.LaunchMode'
         $source | Should -Match 'review-handler code updates require -Operational'
         $source | Should -Match 'EnableReviewerTeamsNotifications requires -Agent Reviewer or -Agent Both'
         $source | Should -Match 'EnableReviewHandlerTeamsNotifications requires -Agent ReviewHandler or -Agent Both'
@@ -446,7 +454,7 @@ Describe 'Shared reviewer and review-handler event contract' {
         $source | Should -Not -Match 'Start-Process|EncodedCommand'
         $source | Should -Match '\$dashboardCompletedNormally\s*=\s*\$false'
         $source | Should -Match '\$Process\.Kill\(\$true\)'
-        $source | Should -Match 'if \(-not \$dashboardCompletedNormally -or \$Continuous -or \$Operational\)'
+        $source | Should -Match 'if \(-not \$dashboardCompletedNormally -or \$launch\.Continuous -or \$launch\.Operational\)'
 
         foreach ($wrapper in @(
             @{ File = 'Watch-DevPilotReviewer.ps1'; Agent = 'Reviewer'; Config = 'ReviewerConfigFile' }

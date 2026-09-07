@@ -6,6 +6,9 @@
 
 .DESCRIPTION
     Compatibility wrapper for Watch-DevPilotAgents.ps1 -Agent Reviewer.
+    Legacy behavior is pinned here rather than inherited: when neither -Continuous nor -Once is
+    passed, -Once is forwarded explicitly, so this wrapper stays a single preview cycle no matter
+    what the shared launcher's own default becomes.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Launch')]
 param(
@@ -35,6 +38,12 @@ param(
 
     [Parameter(ParameterSetName = 'Launch')]
     [switch]$Continuous,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$Once,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$PreviewOnly,
 
     [Parameter(ParameterSetName = 'Launch')]
     [switch]$Operational,
@@ -80,6 +89,8 @@ if ($LeaseRoot) { $parameters.LeaseRoot = $LeaseRoot }
 if ($ConfigFile) { $parameters.ReviewerConfigFile = $ConfigFile }
 if ($PSBoundParameters.ContainsKey('PullRequestId')) { $parameters.ReviewerPullRequestId = $PullRequestId }
 if ($Continuous) { $parameters.Continuous = $true }
+if (-not $AttachOnly -and ($Once -or -not $Continuous)) { $parameters.Once = $true }
+if ($PreviewOnly) { $parameters.PreviewOnly = $true }
 if ($Operational) { $parameters.Operational = $true }
 if ($EnableTeamsNotifications) { $parameters.EnableReviewerTeamsNotifications = $true }
 if ($EnableManualDispatch) { $parameters.EnableManualReviewer = $true }
