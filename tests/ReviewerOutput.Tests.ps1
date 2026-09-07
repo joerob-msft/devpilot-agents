@@ -32,6 +32,25 @@ BeforeAll {
 }
 
 Describe 'Reviewer output modes' {
+    It 'renders notification diagnostics separately from the work outcome' {
+        $context = New-TestReviewerContext
+        Publish-AgentEvent $context notification.delivery -Level warning -PrId 42 `
+            -Data @{ outcome = 'unknown'; code = 'delivery-unconfirmed' } `
+            -Message 'Teams delivery is unconfirmed; review work is unaffected.' | Out-Null
+        $script:reviewerLines | Should -Contain 'Teams delivery is unconfirmed; review work is unaffected.'
+    }
+
+    It 'writes notification audit events as JSON without changing their event type' {
+        $context = New-TestReviewerContext -Mode Json
+        Publish-AgentEvent $context notification.delivery -PrId 42 `
+            -Data @{ outcome = 'root-created'; code = 'created' } -Message 'Teams thread created.' | Out-Null
+        $script:reviewerLines.Count | Should -Be 1
+        $event = $script:reviewerLines[0] | ConvertFrom-Json
+        $event.eventType | Should -Be 'notification.delivery'
+        $event.data.outcome | Should -Be 'root-created'
+        $event.pullRequestId | Should -Be 42
+    }
+
     It 'aggregates hundreds of skips in compact mode' {
         $context = New-TestReviewerContext
         1..300 | ForEach-Object {

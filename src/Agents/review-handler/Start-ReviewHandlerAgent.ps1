@@ -796,6 +796,12 @@ if ($repoConvProp -and $repoConvProp.Value) {
 $teamsCfg = Get-AgentConfigObject -Object $Cfg -Name "teamsNotifications" -Where "config"
 $teamsChannelCfg = Get-AgentConfigObject -Object $teamsCfg -Name "channel" -Where "config.teamsNotifications"
 $TeamsChannelEnabled = Get-AgentConfigBool -Object $teamsChannelCfg -Name "enabled" -Where "config.teamsNotifications.channel"
+$TeamsThreadReuseEnabled = if ($teamsChannelCfg.PSObject.Properties['threadReuseEnabled']) {
+    if ($teamsChannelCfg.threadReuseEnabled -isnot [bool]) {
+        throw 'config.teamsNotifications.channel.threadReuseEnabled must be a JSON boolean.'
+    }
+    Get-AgentConfigBool -Object $teamsChannelCfg -Name "threadReuseEnabled" -Where "config.teamsNotifications.channel"
+} else { $true }
 $TeamsTeamId = Get-AgentConfigString -Object $teamsChannelCfg -Name "teamId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
 $TeamsChannelId = Get-AgentConfigString -Object $teamsChannelCfg -Name "channelId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
 $TeamsSupportedEvents = Get-AgentConfigStringArray -Object $teamsCfg -Name "supportedEvents" -Where "config.teamsNotifications"
@@ -1849,27 +1855,60 @@ function Send-HandlerTeamsNotification {
     $wantDirect = $TeamsDirectEnabled -and ($TeamsDirectEvents -ccontains $Event)
     if (-not $wantChannel -and -not $wantDirect) { return }
 
-    $dedupeKey = "$Event|$PrId|$SourceCommit"
-    $notifState = Get-JsonState -Path $notificationsStatePath
-    if ($notifState.ContainsKey($dedupeKey)) {
-        Write-Host "Teams '$Event' already delivered for this PR/commit; skipping." -ForegroundColor DarkGray
-        return
-    }
-
     $workIqSession = $null
-    $delivered = New-Object System.Collections.Generic.List[string]
     try {
+        $dedupeKey = "$Event|$PrId|$SourceCommit"
+        $notifState = Get-JsonState -Path $notificationsStatePath
+        $threadedChannel = $wantChannel -and $TeamsThreadReuseEnabled -and $PrId -gt 0 -and $repositoryIdentity.verified -eq $true
+        $previousDestinations = @()
+        if ($notifState.ContainsKey($dedupeKey) -and $threadedChannel) {
+            $previousDestinations = @(Get-HandlerHashValue -Container $notifState[$dedupeKey] -Key 'destinations' -Default @())
+        }
+        if ($notifState.ContainsKey($dedupeKey) -and -not $threadedChannel) {
+            Write-Host "Teams '$Event' already delivered for this PR/commit; skipping." -ForegroundColor DarkGray
+            return
+        }
+
+        $delivered = New-Object System.Collections.Generic.List[string]
         $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "workiq" -TimeoutSeconds 60
         # Destinations are independent: one failing must not suppress the other.
         if ($wantChannel) {
             try {
-                Send-AgentTeamsChannelMessage -Session $workIqSession -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
-                    -Title $Title -Body $Body -Links $Links | Out-Null
-                [void]$delivered.Add("channel")
+                $channelConfirmed = $true
+                if ($threadedChannel) {
+                    $result = Send-AgentTeamsThreadedChannelMessage -Session $workIqSession -DurableStateRoot $DurableStateRoot `
+                        -RepositoryIdentity $repositoryIdentity -Role review-handler -NotificationEvent $Event `
+                        -PullRequestId $PrId -SourceCommit $SourceCommit -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
+                        -Title $Title -Body $Body -Links $Links -OutputContext $script:HandlerOutputContext
+                    $channelConfirmed = $result.Delivered -or $result.Deduped
+                    if (-not $channelConfirmed) {
+                        Write-Warning "Teams '$Event' channel delivery is $($result.Outcome) ($($result.Code)); review work is unaffected."
+                    }
+                }
+                else {
+                    Send-AgentTeamsChannelMessage -Session $workIqSession -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
+                        -Title $Title -Body $Body -Links $Links | Out-Null
+                    if ($TeamsThreadReuseEnabled -and $script:HandlerOutputContext) {
+                        Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery -PrId $PrId `
+                            -SourceCommit $SourceCommit -Data @{ outcome = 'fallback-delivered'; code = 'thread-scope-unavailable' } `
+                            -Message "Teams notification sent independently; no verified PR thread scope." | Out-Null
+                    }
+                }
+                if ($channelConfirmed) { [void]$delivered.Add("channel") }
             }
-            catch { Write-Warning "Teams '$Event' channel delivery failed: $($_.Exception.Message)" }
+            catch {
+                if ($threadedChannel) {
+                    if ($script:HandlerOutputContext) {
+                        Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery -Level warning `
+                            -PrId $PrId -SourceCommit $SourceCommit -Data @{ outcome = 'unknown'; code = 'threaded-channel-error' } `
+                            -Message 'Teams threaded delivery is unconfirmed; review work is unaffected.' | Out-Null
+                    }
+                    Write-Warning "Teams '$Event' threaded channel delivery failed; review work is unaffected."
+                }
+                else { Write-Warning "Teams '$Event' channel delivery failed: $($_.Exception.Message)" }
+            }
         }
-        if ($wantDirect) {
+        if ($wantDirect -and $previousDestinations -cnotcontains 'direct') {
             try {
                 Send-AgentTeamsDirectMessage -Session $workIqSession -RecipientUpn $TeamsDirectRecipient `
                     -Title $Title -Body $Body -Links $Links | Out-Null
@@ -1878,16 +1917,33 @@ function Send-HandlerTeamsNotification {
             catch { Write-Warning "Teams '$Event' direct delivery failed: $($_.Exception.Message)" }
         }
         if ($delivered.Count -gt 0) {
-            $notifState[$dedupeKey] = @{ event = $Event; prId = $PrId; destinations = @($delivered.ToArray()); at = (Get-Date).ToUniversalTime().ToString("o") }
+            $confirmedDestinations = @(@($previousDestinations) + @($delivered.ToArray()) | Select-Object -Unique)
+            $notifState[$dedupeKey] = @{ event = $Event; prId = $PrId; destinations = $confirmedDestinations; at = (Get-Date).ToUniversalTime().ToString("o") }
             Set-JsonState -Path $notificationsStatePath -State $notifState
-            Write-Host "Teams '$Event' delivered to: $($delivered.ToArray() -join ', ')." -ForegroundColor Green
+            $deliveryLabel = if ($threadedChannel) { 'delivery confirmed for' } else { 'delivered to' }
+            Write-Host "Teams '$Event' $deliveryLabel`: $($delivered.ToArray() -join ', ')." -ForegroundColor Green
         }
     }
     catch {
+        if ($TeamsThreadReuseEnabled -and $script:HandlerOutputContext) {
+            Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery -Level warning `
+                -PrId $PrId -SourceCommit $SourceCommit -Data @{ outcome = 'wrapper-warning'; code = 'notification-wrapper-error' } `
+                -Message 'Teams notification setup or bookkeeping failed; earlier confirmed sends and review work are unchanged.' | Out-Null
+        }
         Write-Warning "Teams '$Event' notification failed (review work is unaffected): $($_.Exception.Message)"
     }
     finally {
-        if ($workIqSession) { Close-AgentMcpSession -Session $workIqSession }
+        if ($workIqSession) {
+            try { Close-AgentMcpSession -Session $workIqSession }
+            catch {
+                if ($TeamsThreadReuseEnabled -and $script:HandlerOutputContext) {
+                    Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery -Level warning `
+                        -PrId $PrId -SourceCommit $SourceCommit -Data @{ outcome = 'wrapper-warning'; code = 'session-cleanup-error' } `
+                        -Message 'Teams notification session cleanup failed; confirmed sends and review work are unchanged.' | Out-Null
+                }
+                Write-Warning "Teams notification session cleanup failed; review work is unaffected."
+            }
+        }
     }
 }
 

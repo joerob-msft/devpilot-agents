@@ -27,6 +27,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot 'AgentOutput.ps1')
+. (Join-Path $PSScriptRoot 'TeamsThreading.ps1')
 
 # ---------------------------------------------------------------------------
 # Code-defined Copilot CLI model allowlist (NOT config-supplied - a forked or
@@ -5886,7 +5887,19 @@ function Invoke-AgentWorkIqTool {
     }
     $statusCode = [int]$statusProperty.Value
     if ($statusCode -lt 200 -or $statusCode -gt 299) {
-        throw "WorkIQ tool '$Name' returned HTTP $statusCode for the requested entity."
+        $failure = [InvalidOperationException]::new("WorkIQ tool '$Name' returned HTTP $statusCode for the requested entity.")
+        $failure.Data['WorkIqStatusCode'] = $statusCode
+        # This is response metadata, not a request-header capability. WorkIQ
+        # may omit it; callers must not infer a retry delay from error prose.
+        $headersProperty = $entry.PSObject.Properties['headers']
+        if ($headersProperty -and $headersProperty.Value -is [System.Management.Automation.PSCustomObject]) {
+            $retryProperty = $headersProperty.Value.PSObject.Properties['Retry-After']
+            if ($retryProperty -and $retryProperty.Value -is [string] -and
+                $retryProperty.Value.Length -le 128 -and $retryProperty.Value -notmatch '[\r\n]') {
+                $failure.Data['WorkIqRetryAfter'] = $retryProperty.Value
+            }
+        }
+        throw $failure
     }
     $dataProperty = $entry.PSObject.Properties["data"]
     if (-not $dataProperty) { return $null }
@@ -6933,6 +6946,7 @@ Export-ModuleMember -Function @(
     "Get-AgentCliJsonOutcome",
     "Invoke-AgentWorkIqTool",
     "Send-AgentTeamsChannelMessage",
+    "Send-AgentTeamsThreadedChannelMessage",
     "Send-AgentTeamsDirectMessage",
     "Resolve-AgentTeamsUserChatId",
     "New-AgentTeamsMessageHtml",

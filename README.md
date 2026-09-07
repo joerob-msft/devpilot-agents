@@ -541,6 +541,39 @@ ADO's `createdBy` identity. The configured `recipientUpn` and
 `-TeamsRecipientUpn` are fallback values only when ADO does not expose a usable
 author UPN. Channel and direct delivery are deduplicated independently.
 
+**Shared Teams channel threads (default):** enabled channel notifications use
+one shared thread per PR. Both agents must use the same `teamId`, `channelId`,
+and protected `-DurableStateRoot`. The optional
+`teamsNotifications.channel.threadReuseEnabled` setting defaults to `true`;
+set it to `false` to send independent channel messages instead.
+Threading does not enable notifications by itself:
+the existing channel enablement, event subscriptions, and notification
+capability switch still apply. `PreviewOnly` remains a no-write ceiling.
+The first eligible notification creates the root; later Reviewer and Review
+Handler notifications for that verified repository and PR become replies.
+Direct chats and non-PR notifications remain independent messages. This
+feature only sends notifications; it never reads Teams replies or grants
+agent capabilities.
+
+Thread IDs and per-role/event/commit receipts live in a versioned shared
+subtree of the durable state root, outside per-Watch runtime state. Existing
+notification records are not backfilled. State is bound to the current
+destination, verified repository identity, and PR, and an exclusive file
+lock coordinates local processes before creating a root. Separate machines
+or different durable roots are **not** a shared dedupe coordinator.
+
+The `notification.delivery` audit event reports root creation, replies,
+dedupe, fallback, and failures without changing the PR work result. Disabled
+threading or unavailable verified PR scope retains independent delivery.
+An explicitly stale root can produce a recorded independent fallback.
+Invalid state, contention, or an ambiguous send must not create another root:
+an unconfirmed outcome stays unconfirmed rather than being blindly retried.
+Do not delete thread state or lock files to force a retry after a timeout;
+first inspect the destination for the possibly delivered message.
+Explicit Graph throttles are retried only when the transport exposes a valid
+`Retry-After`, up to three attempts within the notification deadline; a
+required delay is never shortened to fit that budget.
+
 Running the agent twice, once to preview and once to post, does **not** give
 you any of this: the second run is an independent model run with a fresh nonce
 and may reach different conclusions.

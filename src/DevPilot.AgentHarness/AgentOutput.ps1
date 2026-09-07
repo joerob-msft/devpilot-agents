@@ -385,6 +385,7 @@ $script:AgentOutputEventTypes = @(
     'phase.changed',
     'delivery.retrying',
     'delivery.blocked',
+    'notification.delivery',
     'work.concurrent',
     'work.completed',
     'cycle.completed',
@@ -701,6 +702,9 @@ function Write-ReviewerHumanEvent {
             }
         }
         'delivery.retrying' { Write-ReviewerOutputLine $Context ("Retrying unfinished delivery for PR {0} - {1}" -f $prId, $data.title) }
+        'notification.delivery' {
+            if ($message) { Write-ReviewerOutputLine $Context $message }
+        }
         'delivery.blocked' {
             Write-ReviewerOutputLine $Context "`nWARNING: DELIVERY BLOCKED - PR $prId$(if ($data.title) { " - $($data.title)" })"
             Write-ReviewerOutputLine $Context ([string]$data.reason)
