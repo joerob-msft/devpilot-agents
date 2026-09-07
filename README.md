@@ -621,6 +621,12 @@ Other properties worth knowing:
   justify the vote were not posted; and a plain `Approved` requires *zero*
   findings.
 
+`tools/Invoke-ApprovedOwnerComment.ps1` is a separate, interactive,
+human-approved command for at most five exact method-level Owner findings from
+one signed completed preview. It is dry-run by default; scheduled workflows cannot
+invoke it. Test-class ownership remains advisory-only. See
+[the approval guide](docs/owner-preview.md#human-approved-method-comments).
+
 Posted findings appear under **your** identity, since that is who the session is
 authenticated as. That is why every write is opt-in.
 

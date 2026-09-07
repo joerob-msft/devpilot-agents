@@ -257,6 +257,54 @@ evidence. App Automation is not a scheduler for this layer.
 prepare-run boundary and the committed result shapes. It registers no task,
 contacts no provider, and starts no model.
 
+## Human-approved method comments
+
+`tools/Invoke-ApprovedOwnerComment.ps1` is deliberately separate from the
+hourly queue. It accepts only a mandatory external `StateRoot`, one signed
+completed `HeadKey`, one to five exact `ConstructId`/`FindingId` pairs, the
+authenticated Azure DevOps commenter's `-OperatorAlias`, `-Approve`, and a
+nonempty audit reason. It defaults to dry-run; `-Publish` is the additional explicit write choice. No repository configuration can enable
+it, and the scheduler has no action or code path that invokes it.
+
+Only changed declarations carrying `TestMethod` or `DataTestMethod` and missing
+`Owner` are eligible. `TestClass`, helper, invocation, unknown, incomplete,
+withheld, stale, foreign, or unanchored selections are refused. Immediately
+before each write the command re-reads the active non-draft PR, repository,
+source and target commits/refs, source branch head, changed-line spans, and
+threads through the existing ADO provider seams.
+
+The comment body is fixed and contains only method/path/line, the missing
+`Owner`, a fixed suggestion, and the authoritative rule provenance. A hidden
+stable key deduplicates by capability/version/repository/PR/source/rule/path/
+line/symbol. Read-back markers are trusted only on a thread authored by that
+operator and anchored to the exact method path/line. Identical active content is
+a no-op; a collision is refused unless the operator also supplies `-ApproveUpdate`. The reviewed replacement is created and confirmed before
+conflicting active threads are closed, and bounded thread pages fail closed before dedupe or batch mutation.
+
+Intent and outcome records are HMAC-signed under
+`StateRoot\approved-comments`, outside git. On a later invocation, an intent
+without an outcome is reconciled by read-only thread search before any new
+write.
+
+```powershell
+# Preview only (zero writes):
+./tools/Invoke-ApprovedOwnerComment.ps1 `
+  -StateRoot C:\private\owner-state -HeadKey <64-hex> `
+  -OperatorAlias <your-alias> `
+  -ConstructId dc3 -FindingId 'bpm-test-ownership@1:rs0:dc3' `
+  -Approve -Reason 'Reviewed the signed preview and source.'
+
+# Publish exactly the selected method comment:
+./tools/Invoke-ApprovedOwnerComment.ps1 `
+  -StateRoot C:\private\owner-state -HeadKey <64-hex> `
+  -OperatorAlias <your-alias> `
+  -ConstructId dc3 -FindingId 'bpm-test-ownership@1:rs0:dc3' `
+  -Approve -Reason 'Reviewed the signed preview and source.' -Publish
+```
+
+`tools/Test-ApprovedOwnerComments.ps1` uses a fake provider only. It never
+contacts Azure DevOps and never posts a live comment.
+
 ## What live validation established
 
 The read-only proof used active PR `16705856` at source commit
