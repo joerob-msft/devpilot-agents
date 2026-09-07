@@ -87,6 +87,23 @@
       {
         "sha256": "f94a0f0dc39789f3671194b808d3e36b88af51008a35ff75b31f6e58deb9ba72",
         "reason": "CURRENT and authoritative. Disclose schema-v2 replay as exact reconstruction from the canonical sealed source-transport artifact, including its recorded live mode, while retaining an explicit snapshotLegacy warning only for schema-v1 compatibility snapshots."
+      },
+      {
+        "sha256": "4a8d93f0090a93c30ea0fa215386d522eb3959621f47bc20ab3a3e99346e4948",
+        "reason": "CURRENT and authoritative for PR119. Preserve the exact PR117 preview semantics at 80131f567a82997281bcdb754d0551795c59105d while integrating current-main's durable manual-dispatch behavior: commit 6c43b0b42c21d911ec2d257e0cffd5defad659d5 atomically writes both preview and sealed artifact, keeps a manual artifact under the durable pending-artifacts root, verifies containment, and removes both files so delivery stays blocked when atomic persistence fails. Current-main's complete operational preview remains byte-for-byte preserved in Start-ReviewerAgent.Operational.ps1.",
+        "provenance": {
+          "sourceCommit": "80131f567a82997281bcdb754d0551795c59105d",
+          "sourceSha256": "f94a0f0dc39789f3671194b808d3e36b88af51008a35ff75b31f6e58deb9ba72",
+          "currentMainCommit": "27d94e1eb43e527d365d6afcb572d9f88411f486",
+          "currentMainSha256": "25499928cad48aa050d5423179ed5f8bd95b8d36c69806d02c25d70181be2ba1",
+          "currentMainOperationalPath": "src/Agents/reviewer/Start-ReviewerAgent.Operational.ps1",
+          "currentMainBehaviorCommits": [
+            {
+              "commit": "6c43b0b42c21d911ec2d257e0cffd5defad659d5",
+              "behavior": "Atomic preview and artifact persistence plus durable, contained pending-artifact custody for manual dispatch."
+            }
+          ]
+        }
       }
     ],
     "Invoke-ReviewerDelivery": [
@@ -231,6 +248,31 @@
     {
       "sha256": "fff240feb44031fa30efcb3d5eef276ce76b45515bec9c9bd6867869a9b3f2f3",
       "reason": "CURRENT and authoritative. Bind the census signing key through an explicitly typed byte array so the boundary analyzer's array-preservation rule is satisfied at the point the key is handed to the census seal; the key value, its origin, and every gate, launch, retry, discovery, cross-verification and delivery decision in this function are unchanged, and the disabled generalist paths are untouched."
+    },
+    {
+      "sha256": "cdd34b39eb3cf60f07793c20feeb1e1558fd16436c15bea356427c5cdd1f0db6",
+      "reason": "CURRENT and authoritative for PR119. Preserve the exact PR117 multi-pass, acquisition, census, specialist, reciprocal-verification, gate, replay, and disabled-delivery flow at 80131f567a82997281bcdb754d0551795c59105d while integrating current-main delivery custody. Commit 1f3dade168198a32e408669e0c789acfe196e3df persists the sealed plan before the first write and keeps unresolved capabilities pending; commit 93c384636853514870015ba65459c188b6a55804 retains terminal-abort and artifact-aware pending-plan resolution; commit 6c43b0b42c21d911ec2d257e0cffd5defad659d5 mirrors records into durable state and removes completed manual-dispatch artifacts. Current-main's complete operational pull-request function remains byte-for-byte preserved in Start-ReviewerAgent.Operational.ps1.",
+      "provenance": {
+        "sourceCommit": "80131f567a82997281bcdb754d0551795c59105d",
+        "sourceSha256": "fff240feb44031fa30efcb3d5eef276ce76b45515bec9c9bd6867869a9b3f2f3",
+        "currentMainCommit": "27d94e1eb43e527d365d6afcb572d9f88411f486",
+        "currentMainSha256": "ace09f2112adfb6e7e44abdc5ada93d0c91218faa9c9b7d9107feeb22b6c7b85",
+        "currentMainOperationalPath": "src/Agents/reviewer/Start-ReviewerAgent.Operational.ps1",
+        "currentMainBehaviorCommits": [
+          {
+            "commit": "1f3dade168198a32e408669e0c789acfe196e3df",
+            "behavior": "Persist the sealed delivery plan before the first provider write and keep the plan open until every capability it owes resolves."
+          },
+          {
+            "commit": "93c384636853514870015ba65459c188b6a55804",
+            "behavior": "Resolve artifact-aware pending state without retaining terminally aborted delivery work."
+          },
+          {
+            "commit": "6c43b0b42c21d911ec2d257e0cffd5defad659d5",
+            "behavior": "Mirror reviewed records into durable state and clean completed manual-dispatch preview and artifact custody."
+          }
+        ]
+      }
     }
     ],
     "Write-ReviewerConventionSpecialistPreview": [

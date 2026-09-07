@@ -1476,6 +1476,65 @@ $multiDeltaFunctions = @($golden.authorizedFunctionDeltas.PSObject.Properties | 
 Assert-Specialist ($multiDeltaFunctions.Count -ge 1) `
     "At least one function keeps two or more authorized deltas, so the revert-refusal assertions actually run."
 
+# PR119 combines two independently valuable parents. Pin both parent shapes as
+# provenance, keep current-main's operational implementation exact in its
+# compatibility entry point, and mutation-test the acceptance rule with each
+# parent substituted for the integrated hash. Either one-sided revert must fail.
+$integrationFunctions = @('Write-ReviewerPreview', 'Invoke-ReviewerPullRequest')
+foreach ($functionName in $integrationFunctions) {
+    $history = @($golden.authorizedFunctionDeltas.PSObject.Properties[$functionName].Value)
+    $currentDelta = $history[$history.Count - 1]
+    $provenance = $currentDelta.provenance
+    Assert-Specialist ($null -ne $provenance -and
+        [string]$provenance.sourceCommit -ceq '80131f567a82997281bcdb754d0551795c59105d' -and
+        [string]$provenance.currentMainCommit -ceq '27d94e1eb43e527d365d6afcb572d9f88411f486') `
+        "The PR119 delta for '$functionName' must name the exact source and current-main commits."
+
+    $sourceParentHash = [string]$provenance.sourceSha256
+    $mainParentHash = [string]$provenance.currentMainSha256
+    $integratedHash = [string]$currentDelta.sha256
+    Assert-Specialist ($sourceParentHash -match '^[0-9a-f]{64}$' -and
+        $mainParentHash -match '^[0-9a-f]{64}$' -and
+        $sourceParentHash -cne $mainParentHash -and
+        $sourceParentHash -cne $integratedHash -and
+        $mainParentHash -cne $integratedHash) `
+        "The PR119 provenance for '$functionName' must distinguish both parent shapes from the integration."
+
+    $actualText = (Get-FunctionText -Text $wrapperText -Name $functionName).
+        Replace("`r`n", "`n").Replace("`r", "`n")
+    $actualHash = Get-ReviewerConventionSpecialistSha256 -Text $actualText
+    foreach ($parent in @(
+            @{ Name = 'PR117'; Hash = $sourceParentHash },
+            @{ Name = 'current-main'; Hash = $mainParentHash }
+        )) {
+        $mutatedGolden = Copy-SpecialistObject $golden
+        $mutatedHistory = @($mutatedGolden.authorizedFunctionDeltas.PSObject.Properties[$functionName].Value)
+        $mutatedHistory[$mutatedHistory.Count - 1].sha256 = [string]$parent.Hash
+        $mutatedAccepted = Get-ReviewerAuthorizedHashes -Golden $mutatedGolden -Name $functionName
+        Assert-Specialist (-not ($mutatedAccepted -ccontains $actualHash)) `
+            "Replacing '$functionName' with the $($parent.Name)-only authorized shape must reject the PR119 integration."
+    }
+
+    $operationalPath = Join-Path $repoRoot ([string]$provenance.currentMainOperationalPath)
+    Assert-Specialist (Test-Path -LiteralPath $operationalPath -PathType Leaf) `
+        "The exact current-main operational compatibility file for '$functionName' is missing."
+    if (Test-Path -LiteralPath $operationalPath -PathType Leaf) {
+        $operationalText = [IO.File]::ReadAllText($operationalPath)
+        $operationalFunction = (Get-FunctionText -Text $operationalText -Name $functionName).
+            Replace("`r`n", "`n").Replace("`r", "`n")
+        Assert-Specialist ((Get-ReviewerConventionSpecialistSha256 -Text $operationalFunction) -ceq $mainParentHash) `
+            "The operational compatibility implementation of '$functionName' drifted from current-main."
+    }
+
+    $behaviorCommits = @($provenance.currentMainBehaviorCommits)
+    Assert-Specialist ($behaviorCommits.Count -gt 0 -and
+        @($behaviorCommits | Where-Object {
+                [string]$_.commit -notmatch '^[0-9a-f]{40}$' -or
+                ([string]$_.behavior).Length -lt 24
+            }).Count -eq 0) `
+        "The PR119 provenance for '$functionName' must name each current-main behavior commit precisely."
+}
+
 $pullRequestFunction = Get-FunctionText -Text $wrapperText -Name "Invoke-ReviewerPullRequest"
 $deliveryAt = $pullRequestFunction.IndexOf("Invoke-ReviewerDelivery", [StringComparison]::Ordinal)
 $stateAt = $pullRequestFunction.LastIndexOf("Set-JsonState -Path `$reviewedStatePath", [StringComparison]::Ordinal)
