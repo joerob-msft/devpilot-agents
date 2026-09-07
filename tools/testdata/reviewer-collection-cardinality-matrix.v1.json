@@ -47,7 +47,7 @@
     "producerDirectRows": 6,
     "producerStageEquivalentRows": 230,
     "producerResidualRows": 12,
-    "producerTestOnlyReachRows": 12,
+    "producerTestOnlyReachRows": 0,
     "producerBoundariesInForce": 12,
     "knownEscapeShapeFields": 15,
     "escapeShapeProperties": 11,
@@ -2276,8 +2276,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2321,8 +2323,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2366,8 +2370,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2411,8 +2417,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2456,8 +2464,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2501,8 +2511,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2546,8 +2558,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2591,8 +2605,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2636,8 +2652,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2681,8 +2699,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2726,8 +2746,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,
@@ -2771,8 +2793,10 @@
       "producerFile": "src/Agents/reviewer/AcquisitionPackage.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "The capture producer authenticates a sealed on-disk transcript package, which only a live acquisition can mint; its contract is driven through the same registered boundary the producer calls, but the producing function itself is not executed here. It is executed elsewhere: tools/Invoke-ReviewerCaptureCellCensus.ps1 mints sealed generalist, specialist and verifier packages offline with no model and runs Assert-ReviewerAcquisitionTranscriptPackage over each, publishing a capture stage artifact per role and observing seven bound files, one directory and one attempt marker status - the one cell of the named variants a real package reaches. Why the rest are not reached is recorded as two different facts rather than one flattering one, per collection. Schema-forbidden: files and attempts both carry minItems 1, so zero bound files and zero attempt statuses cannot be minted, and attempts is capped at maxItems 8, so the corpus max cell of 32 statuses is unreachable. Producer-forbidden rather than schema-forbidden, and the distinction is kept because the schema declares no uniqueItems anywhere: duplicate bound names are refused by Assert-ReviewerAcquisitionTranscriptPackage and by the filesystem, for files and directories. Merely untested: directories carries no minItems, so a package with zero directories is schema-legal and this census never minted one; attempts carries no uniqueItems, so two attempts may share a terminal status; and files and directories carry no upper bound, so 32 of either is legal and simply not produced by any synthetic fixture. All of those cells are held by the registered boundary, driven directly here, and this row is not counted as producer-path covered.",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ApprovedOwnerComments.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": -1,
         "one": -1,

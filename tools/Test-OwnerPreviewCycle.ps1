@@ -543,7 +543,7 @@ try {
     Assert-OwnerPreview -Condition $surfaceClean `
         -Message "The Owner preview declares a write-capable parameter."
     Assert-OwnerPreview -Condition (
-        $cliText -cmatch "Read-OwnerPreviewSealedResult[\s\S]{0,200}Get-OwnerPreviewSealKeyPath\s+-Name\s+'acquisition'" -and
+        $cliText -cmatch 'Read-OwnerPreviewSealedResult[\s\S]{0,240}Get-OwnerPreviewSealKeyPath\s+-Name\s+''acquisition''\s+-SealKeyRoot\s+\$SealKeyRoot' -and
         $cliText -cnotmatch "Read-OwnerPreviewSealedResult[^\r\n]+acquisition-seal\.key") `
         -Message "The Owner preview does not verify acquisition with the external key that sealed it."
 

@@ -18461,6 +18461,8 @@ function Invoke-ReviewerBlindedAcquisitionRun {
             ConvertFrom-Json -AsHashtable -Depth 64
         $sourceFactPlan = [string]$projection.specialist.factPlanJson |
             ConvertFrom-Json -AsHashtable -Depth 64
+        $roleRuleCoverage = Get-ReviewerHashValue -Container $rolePassResult `
+            -Key 'RuleCoverage' -Default $null
         $captureCore['sourceProjection'] = [ordered]@{
             sourceRole = 'specialist'
             sourceModel = $model
@@ -18480,6 +18482,18 @@ function Invoke-ReviewerBlindedAcquisitionRun {
                 promptSha256 = ([string]$ConventionSpecialistPromptSha256).ToLowerInvariant()
             }
             candidates = @((Get-ReviewerHashValue -Container $rolePassResult -Key 'Candidates' -Default @()))
+            ruleCoverage = $(if ($null -eq $roleRuleCoverage) { $null } else {
+                    [ordered]@{
+                        complete = [bool](Get-ReviewerHashValue -Container $roleRuleCoverage `
+                                -Key 'Complete' -Default $false)
+                        constructsIncomplete = [bool](Get-ReviewerHashValue -Container $roleRuleCoverage `
+                                -Key 'ConstructsIncomplete' -Default $true)
+                        changedConstructs = @((Get-ReviewerHashValue -Container $roleRuleCoverage `
+                                    -Key 'Constructs' -Default @()))
+                        rows = @((Get-ReviewerHashValue -Container $roleRuleCoverage `
+                                    -Key 'Rows' -Default @()))
+                    }
+                })
         }
     }
     [IO.File]::WriteAllText((Join-Path $outputRoot 'capture-core.json'),

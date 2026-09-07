@@ -191,6 +191,29 @@ function Get-OwnerPreviewDefaultSubjectRoot {
     return (Join-Path (Join-Path (Join-Path $base 'DevPilot') 'OwnerPreview') $Name)
 }
 
+function Get-OwnerPreviewSealKeyPath {
+    <#
+        The canonical external HMAC key path for one Owner preview stage.
+
+        The caller supplies the approved key root when deployment policy owns
+        it. Otherwise the interactive cycle uses the private per-user default.
+        Keeping the filename here gives producers and later evidence readers one
+        exact key identity without fallback across ambiguous alternate names.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('acquisition', 'capture', 'entry', 'run-set')]
+        [string]$Name,
+        [string]$SealKeyRoot = ''
+    )
+    if ($SealKeyRoot -ne '') { $base = [IO.Path]::GetFullPath($SealKeyRoot) }
+    else { $base = Join-Path (Join-Path $HOME '.devpilot') 'owner-preview' }
+    if (-not (Test-Path -LiteralPath $base -PathType Container)) {
+        [void](New-Item -ItemType Directory -Force -Path $base)
+    }
+    return (Join-Path $base "owner-preview-$Name.key")
+}
+
 function Assert-OwnerPreviewCapabilityOnly {
     <#
         The configuration must select exactly this one capability.
@@ -767,13 +790,20 @@ function Read-OwnerPreviewSubject {
     <# Reads a prepared subject only after recomputing its Layer 1 head key. #>
     param(
         [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$HeadKey
+        [Parameter(Mandatory)][string]$HeadKey,
+        [AllowNull()][byte[]]$SubjectBytes
     )
     $path = Join-Path (Join-Path (Join-Path $Root 'subjects') $HeadKey) 'subject.json'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "No prepared subject '$HeadKey' under '$Root'. Run -Action prepare first."
+    if ($PSBoundParameters.ContainsKey('SubjectBytes')) {
+        $subjectText = [Text.UTF8Encoding]::new($false, $true).GetString($SubjectBytes)
     }
-    $subject = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64 -AsHashtable
+    else {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "No prepared subject '$HeadKey' under '$Root'. Run -Action prepare first."
+        }
+        $subjectText = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+    }
+    $subject = $subjectText | ConvertFrom-Json -Depth 64 -AsHashtable
     $recomputed = Get-OwnerPreviewHeadKey -SubjectKey ([string]$subject.subjectKey) `
         -SourceCommit ([string]$subject.subject.sourceCommit) `
         -RuleSections @($subject.rule.sections) `
