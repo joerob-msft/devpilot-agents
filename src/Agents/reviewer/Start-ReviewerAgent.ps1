@@ -500,6 +500,53 @@ param(
     [string]$OutputMode = 'Auto'
 )
 
+function Assert-ReviewerReplayPreviewOnly {
+    param(
+        [bool]$ReplayRequested,
+        [bool]$FindingComments,
+        [bool]$ThreadReplies,
+        [bool]$SummaryComment,
+        [bool]$ApprovalVote,
+        [bool]$TeamsNotifications,
+        [bool]$VerifiedCommentGate,
+        [bool]$VerifiedSuggestionGate,
+        [bool]$VerifiedApprovalGate,
+        [bool]$RawPromotion,
+        [bool]$VerifiedPromotion
+    )
+    if (-not $ReplayRequested) { return }
+
+    $refused = [Collections.Generic.List[string]]::new()
+    foreach ($option in @(
+            @{ Name = '-EnableFindingComments'; Set = $FindingComments },
+            @{ Name = '-EnableThreadReplies'; Set = $ThreadReplies },
+            @{ Name = '-EnableSummaryComment'; Set = $SummaryComment },
+            @{ Name = '-EnableApprovalVote'; Set = $ApprovalVote },
+            @{ Name = '-EnableTeamsNotifications'; Set = $TeamsNotifications },
+            @{ Name = '-EnableVerifiedCommentGate'; Set = $VerifiedCommentGate },
+            @{ Name = '-EnableVerifiedSuggestionGate'; Set = $VerifiedSuggestionGate },
+            @{ Name = '-EnableVerifiedApprovalGate'; Set = $VerifiedApprovalGate },
+            @{ Name = '-PromotePreview'; Set = $RawPromotion },
+            @{ Name = '-PromoteVerifiedPreview'; Set = $VerifiedPromotion }
+        )) {
+        if ([bool]$option.Set) { [void]$refused.Add([string]$option.Name) }
+    }
+    if ($refused.Count -gt 0) {
+        throw ("Offline snapshot replay is permanently preview-only and cannot deliver, promote or vote. " +
+            "Remove: $($refused -join ', ').")
+    }
+}
+
+$replayRequested = [bool]($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest)
+Assert-ReviewerReplayPreviewOnly -ReplayRequested $replayRequested `
+    -FindingComments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) `
+    -SummaryComment ([bool]$EnableSummaryComment) -ApprovalVote ([bool]$EnableApprovalVote) `
+    -TeamsNotifications ([bool]$EnableTeamsNotifications) `
+    -VerifiedCommentGate ([bool]$EnableVerifiedCommentGate) `
+    -VerifiedSuggestionGate ([bool]$EnableVerifiedSuggestionGate) `
+    -VerifiedApprovalGate ([bool]$EnableVerifiedApprovalGate) `
+    -RawPromotion ([bool]$PromotePreview) -VerifiedPromotion ([bool]$PromoteVerifiedPreview)
+
 if ($PSBoundParameters.ContainsKey('PullRequestId') -and $PullRequestId -le 0) {
     throw 'PullRequestId must be greater than zero when explicitly specified.'
 }
@@ -3190,24 +3237,6 @@ if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
     }
     if ($DryRun) {
         throw "-DryRun runs this agent's self-checks against its own fixtures and never opens a session; it cannot be combined with offline replay."
-    }
-    # Refused here, individually and by name, so an operator learns which switch
-    # is the problem. The authorization forced below is what makes it true even
-    # if this list is ever missed.
-    $replayRefusedSwitches = @(
-        @{ Name = "-EnableFindingComments"; Set = [bool]$EnableFindingComments },
-        @{ Name = "-EnableSummaryComment"; Set = [bool]$EnableSummaryComment },
-        @{ Name = "-EnableApprovalVote"; Set = [bool]$EnableApprovalVote },
-        @{ Name = "-EnableVerifiedCommentGate"; Set = [bool]$EnableVerifiedCommentGate },
-        @{ Name = "-EnableVerifiedSuggestionGate"; Set = [bool]$EnableVerifiedSuggestionGate },
-        @{ Name = "-EnableVerifiedApprovalGate"; Set = [bool]$EnableVerifiedApprovalGate },
-        @{ Name = "-PromotePreview"; Set = [bool]$PromotePreview },
-        @{ Name = "-PromoteVerifiedPreview"; Set = [bool]$PromoteVerifiedPreview }
-    )
-    $replayRefused = @($replayRefusedSwitches | Where-Object { $_.Set } | ForEach-Object { [string]$_.Name })
-    if ($replayRefused.Count -gt 0) {
-        throw ("Offline snapshot replay is permanently preview-only and cannot deliver, promote or vote. " +
-            "Remove: $($replayRefused -join ', ').")
     }
     $script:ReviewerReplaySnapshot = New-AgentReplaySnapshot -ReplayRoot $ReplayRoot `
         -SnapshotName $ReplaySnapshotName -ExpectedManifestDigest $ReplayManifestDigest

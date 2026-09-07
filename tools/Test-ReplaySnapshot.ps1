@@ -1809,6 +1809,76 @@ try {
     $reviewerTokens = $null
     $reviewerErrors = $null
     $reviewerAst = [Management.Automation.Language.Parser]::ParseInput($reviewerSource, [ref]$reviewerTokens, [ref]$reviewerErrors)
+    $replaySafetyNode = $reviewerAst.FindAll({
+            param($candidate)
+            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -ceq 'Assert-ReviewerReplayPreviewOnly'
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $replaySafetyNode) `
+        'The reviewer must define the early replay preview-only assertion.'
+    if ($replaySafetyNode) {
+        . ([scriptblock]::Create($replaySafetyNode.Extent.Text))
+        $replayWriteCases = @(
+            @{ Name = 'finding comments'; Parameter = 'FindingComments'; Option = '-EnableFindingComments' },
+            @{ Name = 'thread replies'; Parameter = 'ThreadReplies'; Option = '-EnableThreadReplies' },
+            @{ Name = 'summary comment'; Parameter = 'SummaryComment'; Option = '-EnableSummaryComment' },
+            @{ Name = 'approval vote'; Parameter = 'ApprovalVote'; Option = '-EnableApprovalVote' },
+            @{ Name = 'Teams notifications'; Parameter = 'TeamsNotifications'; Option = '-EnableTeamsNotifications' },
+            @{ Name = 'comment gate'; Parameter = 'VerifiedCommentGate'; Option = '-EnableVerifiedCommentGate' },
+            @{ Name = 'suggestion gate'; Parameter = 'VerifiedSuggestionGate'; Option = '-EnableVerifiedSuggestionGate' },
+            @{ Name = 'approval gate'; Parameter = 'VerifiedApprovalGate'; Option = '-EnableVerifiedApprovalGate' },
+            @{ Name = 'raw promotion'; Parameter = 'RawPromotion'; Option = '-PromotePreview' },
+            @{ Name = 'verified promotion'; Parameter = 'VerifiedPromotion'; Option = '-PromoteVerifiedPreview' }
+        )
+        foreach ($case in $replayWriteCases) {
+            $arguments = @{ ReplayRequested = $true }
+            $arguments[[string]$case.Parameter] = $true
+            Assert-ReplayThrows { Assert-ReviewerReplayPreviewOnly @arguments } `
+                "Replay did not reject $($case.Name) as preview-only before later validation." `
+                ('preview-only.*' + [regex]::Escape([string]$case.Option))
+        }
+
+        $combined = $null
+        try {
+            Assert-ReviewerReplayPreviewOnly -ReplayRequested $true `
+                -FindingComments $true -ApprovalVote $true -VerifiedSuggestionGate $true
+        }
+        catch { $combined = [string]$_.Exception.Message }
+        Assert-Replay ($combined -cmatch 'preview-only' -and
+            $combined -cmatch 'Remove: -EnableFindingComments, -EnableApprovalVote, -EnableVerifiedSuggestionGate\.') `
+            'Replay must report multiple refused write options in deterministic validation order.'
+
+        $nonReplayThrew = $false
+        try {
+            Assert-ReviewerReplayPreviewOnly -ReplayRequested $false -ApprovalVote $true
+        }
+        catch { $nonReplayThrew = $true }
+        Assert-Replay (-not $nonReplayThrew) `
+            'The replay-only assertion must not weaken manual-dispatch approval protection outside replay.'
+    }
+
+    $replaySafetyCallAt = $reviewerSource.IndexOf(
+        'Assert-ReviewerReplayPreviewOnly -ReplayRequested $replayRequested',
+        [StringComparison]::Ordinal)
+    $manualApprovalAt = $reviewerSource.IndexOf(
+        'if ($EnableApprovalVote -and -not $ManualDispatchManifest)',
+        [StringComparison]::Ordinal)
+    $operationalRouteAt = $reviewerSource.IndexOf(
+        'if ($EnableThreadReplies -or $EnableTeamsNotifications)',
+        [StringComparison]::Ordinal)
+    $replayCompletenessAt = $reviewerSource.IndexOf(
+        'Offline replay requires all of -ReplayRoot, -ReplaySnapshotName and -ReplayManifestDigest.',
+        [StringComparison]::Ordinal)
+    Assert-Replay ($replaySafetyCallAt -ge 0 -and
+        $manualApprovalAt -gt $replaySafetyCallAt -and
+        $operationalRouteAt -gt $replaySafetyCallAt -and
+        $replayCompletenessAt -gt $replaySafetyCallAt) `
+        'Replay preview-only validation must run before replay completeness, manual approval validation and operational write routing.'
+    Assert-Replay ($reviewerSource.IndexOf(
+            "'-EnableApprovalVote requires a sealed manual dispatch grant (-ManualDispatchManifest); it cannot be requested directly.'",
+            [StringComparison]::Ordinal) -gt $replaySafetyCallAt) `
+        'The non-replay manual-dispatch approval refusal must remain present after the replay precedence guard.'
+
     foreach ($fn in @("Get-ReviewerLaunchAllowTools", "Get-ReviewerEffectiveDenyTools")) {
         $node = $reviewerAst.FindAll({
                 param($candidate)

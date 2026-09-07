@@ -556,10 +556,14 @@ jobs:
           $blocked = @(
               @{ Name = 'finding comments'; Args = @('-EnableFindingComments'); Expect = 'preview-only' },
               @{ Name = 'summary comment'; Args = @('-EnableSummaryComment'); Expect = 'preview-only' },
-              @{ Name = 'approval vote'; Args = @('-EnableFindingComments', '-EnableApprovalVote'); Expect = 'preview-only' },
+              @{ Name = 'approval vote'; Args = @('-EnableApprovalVote'); Expect = 'preview-only' },
+              @{ Name = 'approval vote with invalid manual grant'; Args = @('-EnableApprovalVote', '-ManualDispatchManifest', 'not-needed.json'); Expect = 'preview-only' },
+              @{ Name = 'thread replies'; Args = @('-EnableThreadReplies'); Expect = 'preview-only' },
+              @{ Name = 'Teams notifications'; Args = @('-EnableTeamsNotifications'); Expect = 'preview-only' },
               @{ Name = 'raw promotion'; Args = @('-PromotePreview', 'not-needed.json'); Expect = 'preview-only' },
               @{ Name = 'verified promotion'; Args = @('-PromoteVerifiedPreview', 'not-needed.json'); Expect = 'preview-only' },
               @{ Name = 'comment gate'; Args = @('-EnableVerifiedCommentGate'); Expect = 'preview-only' },
+              @{ Name = 'suggestion gate'; Args = @('-EnableVerifiedSuggestionGate'); Expect = 'preview-only' },
               @{ Name = 'approval gate'; Args = @('-EnableVerifiedApprovalGate'); Expect = 'preview-only' },
               @{ Name = 'self-checks'; Args = @('-DryRun'); Expect = 'cannot be combined with offline replay' }
           )
@@ -573,6 +577,25 @@ jobs:
                   if ($LASTEXITCODE -eq 0 -or $normalizedOutput -notmatch [regex]::Escape($case.Expect)) {
                       throw "Replay with $($case.Name) did not fail closed at startup: $output"
                   }
+              }
+              $manualOnly = & pwsh -NoProfile -File $scriptPath `
+                  -ConfigFile './samples/reviewer-ado.config.json' `
+                  -Model $pair.First -OperatorAlias 'example-operator' -EnableApprovalVote 2>&1 | Out-String
+              $manualOnlyDiagnostic = ConvertTo-FlatDiagnostic -Text $manualOnly
+              if ($LASTEXITCODE -eq 0 -or
+                  $manualOnlyDiagnostic -notmatch [regex]::Escape('requires a sealed manual dispatch grant') -or
+                  $manualOnlyDiagnostic -match [regex]::Escape('preview-only')) {
+                  throw "Approval voting outside replay no longer reaches the manual-dispatch protection: $manualOnly"
+              }
+              $partialWrite = & pwsh -NoProfile -File $scriptPath `
+                  -ConfigFile './samples/reviewer-ado.config.json' `
+                  -Model $pair.First -OperatorAlias 'example-operator' `
+                  -ReplayManifestDigest $digest -EnableApprovalVote 2>&1 | Out-String
+              $partialWriteDiagnostic = ConvertTo-FlatDiagnostic -Text $partialWrite
+              if ($LASTEXITCODE -eq 0 -or
+                  $partialWriteDiagnostic -notmatch [regex]::Escape('preview-only') -or
+                  $partialWriteDiagnostic -match [regex]::Escape('requires all of')) {
+                  throw "A partial replay plus approval vote did not prioritize the preview-only ceiling: $partialWrite"
               }
               # An incomplete replay invocation is refused rather than guessed at.
               $partial = & pwsh -NoProfile -File $scriptPath -ConfigFile './samples/reviewer-ado.config.json' `
