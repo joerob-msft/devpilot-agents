@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:gate-qualification:v1",
+  "title": "DevPilot reviewer delivery-gate qualification v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "artifactVersion",
+    "schemaVersion",
+    "qualificationVersion",
+    "issuedAtUtc",
+    "expiresAtUtc",
+    "evaluationToolSha256",
+    "corpus",
+    "agentBinding",
+    "comment",
+    "approval"
+  ],
+  "properties": {
+    "kind": { "const": "reviewer-gate-qualification" },
+    "artifactVersion": { "const": 1 },
+    "schemaVersion": { "const": 1 },
+    "qualificationVersion": { "type": "integer", "minimum": 1 },
+    "issuedAtUtc": { "type": "string", "format": "date-time" },
+    "expiresAtUtc": { "type": "string", "format": "date-time" },
+    "evaluationToolSha256": { "$ref": "#/$defs/sha256" },
+    "corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "repositoryId", "commitSha", "itemCount", "sha256"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "repositoryId": { "type": "string", "minLength": 1 },
+        "commitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "itemCount": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "agentBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scriptSha256",
+        "gateLibrarySha256",
+        "verificationLibrarySha256",
+        "verificationPromptSha256",
+        "verificationPolicySha256",
+        "verificationSchemaSha256",
+        "generalistModels",
+        "conventionSpecialistModel",
+        "conventionVerifierModel"
+      ],
+      "properties": {
+        "scriptSha256": { "$ref": "#/$defs/sha256" },
+        "gateLibrarySha256": { "$ref": "#/$defs/sha256" },
+        "verificationLibrarySha256": { "$ref": "#/$defs/sha256" },
+        "verificationPromptSha256": { "$ref": "#/$defs/sha256" },
+        "verificationPolicySha256": { "$ref": "#/$defs/sha256" },
+        "verificationSchemaSha256": { "$ref": "#/$defs/sha256" },
+        "generalistModels": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "conventionSpecialistModel": { "type": "string", "minLength": 1 },
+        "conventionVerifierModel": { "type": "string", "minLength": 1 }
+      }
+    },
+    "comment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scopes"],
+      "properties": {
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "pack",
+              "severity",
+              "sampleCount",
+              "truePositives",
+              "falsePositives",
+              "precision",
+              "precisionLowerBound95",
+              "recall",
+              "recallLowerBound95",
+              "boundMethod"
+            ],
+            "properties": {
+              "pack": { "type": "string", "minLength": 1 },
+              "severity": { "enum": ["critical", "important", "suggestion"] },
+              "sampleCount": { "type": "integer", "minimum": 0 },
+              "truePositives": { "type": "integer", "minimum": 0 },
+              "falsePositives": { "type": "integer", "minimum": 0 },
+              "precision": { "type": "number", "minimum": 0, "maximum": 1 },
+              "precisionLowerBound95": { "type": "number", "minimum": 0, "maximum": 1 },
+              "recall": { "type": "number", "minimum": 0, "maximum": 1 },
+              "recallLowerBound95": { "type": "number", "minimum": 0, "maximum": 1 },
+              "boundMethod": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sampleCount",
+        "wouldApproveCount",
+        "falseApprovalCount",
+        "falseApprovalUpperBound95",
+        "boundMethod",
+        "recall",
+        "recallLowerBound95"
+      ],
+      "properties": {
+        "sampleCount": { "type": "integer", "minimum": 0 },
+        "wouldApproveCount": { "type": "integer", "minimum": 0 },
+        "falseApprovalCount": { "type": "integer", "minimum": 0 },
+        "falseApprovalUpperBound95": { "type": "number", "minimum": 0, "maximum": 1 },
+        "boundMethod": { "type": "string", "minLength": 1 },
+        "recall": { "type": "number", "minimum": 0, "maximum": 1 },
+        "recallLowerBound95": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

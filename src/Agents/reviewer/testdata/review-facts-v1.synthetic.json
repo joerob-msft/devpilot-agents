@@ -1,0 +1,35 @@
+{
+  "description": "Employer-neutral synthetic calibration cases derived from recurring reviewer failure modes; no private PR content is retained.",
+  "cases": [
+    {
+      "name": "test-project-name-is-not-gating-evidence",
+      "changedPath": "/tests/Flow.Data/CheckInTests.cs",
+      "claim": {
+        "assembly": "Flow.Data.Tests",
+        "category": "CheckInTests"
+      },
+      "manifestCorpusComplete": false,
+      "expectedState": "unknown"
+    },
+    {
+      "name": "owner-is-not-an-established-companion",
+      "changedPath": "/src/Example/Resources/Strings.resx",
+      "identifier": "Owner",
+      "configuredCompanions": [],
+      "expectedCompanionFactCount": 0
+    },
+    {
+      "name": "same-namespace-explicit-precedent",
+      "changedPath": "/config/RegionA/service.settings.json",
+      "identifier": "Feature.Enabled",
+      "precedent": {
+        "namespace": "config/RegionA",
+        "surfaces": [
+          "service.settings.json",
+          "service.defaults.json"
+        ]
+      },
+      "expectedMissingSurface": "service.defaults.json"
+    }
+  ]
+}

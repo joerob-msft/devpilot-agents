@@ -1,0 +1,49 @@
+{
+  "artifactHashBasis": "text-lf-v1",
+  "boundArtifacts": [
+    {
+      "path": "src/Agents/reviewer/acquisition/v1/acquisition-plan.schema.json",
+      "sha256": "618fae43d098d3bd700a8335d830d0857ced7414aacac0f9c75e900d2545a2e6"
+    },
+    {
+      "path": "src/Agents/reviewer/offline/Invoke-ReviewerModelAdapter.ps1",
+      "sha256": "a6bfb7fedca4b9f11bfb56bd0277391ce3fc94a3ff8eb8ef2bc2169faa948312"
+    },
+    {
+      "path": "src/Agents/reviewer/offline/v1/adapter-manifest.schema.json",
+      "sha256": "33a84c82eb286ecf7cfdf8b33463229262f389ce4f9ffac12198a3af2c5069fc"
+    },
+    {
+      "path": "src/Agents/reviewer/ReviewerBaseContract.ps1",
+      "sha256": "3b7e2d19c06170bfe45889212b278fe3b461c776c2828fd086720146f82e2ffb"
+    },
+    {
+      "path": "src/Agents/reviewer/testdata/exact-path/reviewer.config.json",
+      "sha256": "3b89e01e61437e663142b94fed0e6533a1f9c7a26b1121a584c62614531f3142"
+    }
+  ],
+  "contractDigest": "ce1ece383eea20913b898b501ecfef5c39fec1922eaeb290a13f87a9a4fb6ece",
+  "contractId": "reviewer-base-lineage/v1",
+  "description": "The base identities a sealed reviewer fixture may be bound to. A superseded identity is accepted only through an equal-tree active lineage. A main-parent squash may carry that lineage through the verifier-pinned exact PR117 source carrier plus the contract-bound reviewer artifacts. Regenerate with tools/New-ReviewerBaseContract.ps1.",
+  "kind": "reviewer-base-lineage-contract",
+  "lineageVersion": 2,
+  "lineages": [
+    {
+      "baseCommit": "ccbf14632064118f008539becec2fef77030cf54",
+      "baseTree": "6a0a443397f7117ce42f01dba3e872675890da6b",
+      "lineageVersion": 1,
+      "name": "pre-consolidation",
+      "status": "superseded",
+      "supersededByLineageVersion": 2
+    },
+    {
+      "baseCommit": "dd9f661711936d7c124fccc89dbc1bc7a6388ec5",
+      "baseTree": "6a0a443397f7117ce42f01dba3e872675890da6b",
+      "lineageVersion": 2,
+      "name": "consolidated-replacement",
+      "status": "active",
+      "supersededByLineageVersion": 0
+    }
+  ],
+  "schemaVersion": 1
+}

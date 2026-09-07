@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:evaluation-run:v1",
+  "title": "DevPilot reviewer evaluation run v1",
+  "description": "One arm's outputs over a frozen corpus. Carries no labels and no verdicts. The derivation subtree is deterministic and is what replay equality compares; the observations subtree records wall-clock facts (latency, tokens, cost) that a re-execution will never reproduce.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "artifactVersion", "schemaVersion", "runId", "arm", "derivation", "observations"],
+  "properties": {
+    "kind": { "const": "reviewer-evaluation-run" },
+    "artifactVersion": { "const": 1 },
+    "schemaVersion": { "const": 1 },
+    "runId": { "type": "string", "minLength": 1 },
+    "arm": { "enum": ["generalistOnly", "multiPassDiscovery", "verified"] },
+    "derivation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executedAtEpochSeconds", "corpus", "binding", "models", "results"],
+      "properties": {
+        "executedAtEpochSeconds": { "$ref": "#/$defs/epochSeconds" },
+        "corpus": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "corpusVersion", "corpusSha256", "exampleCount"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "corpusVersion": { "type": "integer", "minimum": 1 },
+            "corpusSha256": { "$ref": "#/$defs/sha256" },
+            "exampleCount": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "evaluationLibrarySha256",
+            "harnessToolSha256",
+            "importToolSha256",
+            "evaluationPolicySha256",
+            "corpusSchemaSha256",
+            "runSchemaSha256",
+            "adjudicationSchemaSha256",
+            "reportSchemaSha256",
+            "reviewerScriptSha256",
+            "gateLibrarySha256",
+            "verificationLibrarySha256",
+            "verificationPromptSha256",
+            "verificationPolicySha256",
+            "verificationSchemaSha256",
+            "configSha256"
+          ],
+          "properties": {
+            "evaluationLibrarySha256": { "$ref": "#/$defs/sha256" },
+            "harnessToolSha256": { "$ref": "#/$defs/sha256" },
+            "importToolSha256": { "$ref": "#/$defs/sha256" },
+            "evaluationPolicySha256": { "$ref": "#/$defs/sha256" },
+            "corpusSchemaSha256": { "$ref": "#/$defs/sha256" },
+            "runSchemaSha256": { "$ref": "#/$defs/sha256" },
+            "adjudicationSchemaSha256": { "$ref": "#/$defs/sha256" },
+            "reportSchemaSha256": { "$ref": "#/$defs/sha256" },
+            "reviewerScriptSha256": { "$ref": "#/$defs/sha256" },
+            "gateLibrarySha256": { "$ref": "#/$defs/sha256" },
+            "verificationLibrarySha256": { "$ref": "#/$defs/sha256" },
+            "verificationPromptSha256": { "$ref": "#/$defs/sha256" },
+            "verificationPolicySha256": { "$ref": "#/$defs/sha256" },
+            "verificationSchemaSha256": { "$ref": "#/$defs/sha256" },
+            "configSha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "models": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["generalists", "conventionSpecialist", "conventionVerifier"],
+          "properties": {
+            "generalists": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "conventionSpecialist": { "type": "string", "minLength": 1 },
+            "conventionVerifier": { "type": "string", "minLength": 1 }
+          }
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "exampleId",
+              "sourceCommitSha",
+              "targetCommitSha",
+              "changeSetSha256",
+              "commitResolution",
+              "status",
+              "vote",
+              "claims"
+            ],
+            "properties": {
+              "exampleId": { "$ref": "#/$defs/sha256" },
+              "sourceCommitSha": { "$ref": "#/$defs/commitSha" },
+              "targetCommitSha": { "$ref": "#/$defs/commitSha" },
+              "changeSetSha256": { "$ref": "#/$defs/sha256" },
+              "commitResolution": { "enum": ["resolved", "unresolved"] },
+              "status": { "enum": ["complete", "degraded", "unknown", "missing"] },
+              "vote": { "enum": ["approve", "none", "abstain"] },
+              "claims": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "claimId",
+                    "blindClaimKey",
+                    "claimContentSha256",
+                    "issueClass",
+                    "severity",
+                    "path",
+                    "pack",
+                    "clusterId",
+                    "text"
+                  ],
+                  "properties": {
+                    "claimId": { "type": "string", "minLength": 1 },
+                    "blindClaimKey": { "$ref": "#/$defs/sha256" },
+                    "claimContentSha256": { "$ref": "#/$defs/sha256" },
+                    "issueClass": { "type": "string", "minLength": 1 },
+                    "severity": { "enum": ["critical", "important", "suggestion"] },
+                    "path": { "type": "string" },
+                    "pack": { "type": "string", "minLength": 1 },
+                    "clusterId": { "type": "string" },
+                    "text": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pricingTableVersion", "rates", "perExample"],
+      "properties": {
+        "pricingTableVersion": { "type": "string", "minLength": 1 },
+        "rates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "inputMicroUsdPerKiloToken", "outputMicroUsdPerKiloToken"],
+            "properties": {
+              "model": { "type": "string", "minLength": 1 },
+              "inputMicroUsdPerKiloToken": { "type": "integer", "minimum": 0 },
+              "outputMicroUsdPerKiloToken": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "perExample": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["exampleId", "latencyMs", "inputTokens", "outputTokens", "costMicroUsd"],
+            "properties": {
+              "exampleId": { "$ref": "#/$defs/sha256" },
+              "latencyMs": { "type": "integer", "minimum": 0 },
+              "inputTokens": { "type": "integer", "minimum": 0 },
+              "outputTokens": { "type": "integer", "minimum": 0 },
+              "costMicroUsd": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "commitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "epochSeconds": { "type": "integer", "minimum": 0 }
+  }
+}

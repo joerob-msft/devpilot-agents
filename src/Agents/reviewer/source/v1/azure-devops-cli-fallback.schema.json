@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/devpilot-agents/reviewer/source/v1/azure-devops-cli-fallback.schema.json",
+  "title": "Reviewer Azure DevOps CLI source fallback config v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "enabled",
+    "tenantId"
+  ],
+  "properties": {
+    "note": {
+      "type": "string"
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "tenantId": {
+      "type": "string",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?$",
+      "description": "Exact Microsoft Entra tenant expected from az account show. Required and non-empty when enabled is true."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "enabled": {
+            "const": true
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tenantId": {
+            "minLength": 36
+          }
+        }
+      }
+    }
+  ]
+}

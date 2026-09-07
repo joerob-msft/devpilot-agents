@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/devpilot-agents/reviewer/source/v1/policy.schema.json",
+  "title": "Reviewer sealed source-transport policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "transportVersion",
+    "contextRadiusLines",
+    "maxFiles",
+    "maxFetchBytesPerFile",
+    "maxSliceBytesPerFile",
+    "maxTotalSliceBytes",
+    "maxSlicesPerFile",
+    "siblingContextSlices",
+    "siblingContextLines",
+    "maxTotalSiblingBytes",
+    "minDeliveredFiles",
+    "minDeliveredFilePercent",
+  "minDeliveredSpanPercent",
+  "allowedMimeTypes"
+  ],
+  "properties": {
+    "_note": { "type": "string" },
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "transportVersion": { "type": "integer", "const": 1 },
+    "contextRadiusLines": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 400,
+      "description": "Lines of unchanged context added on each side of a changed span before overlapping spans are merged."
+    },
+    "maxFiles": { "type": "integer", "minimum": 1, "maximum": 500 },
+    "maxFetchBytesPerFile": {
+      "type": "integer",
+      "minimum": 1024,
+      "maximum": 5242880,
+      "description": "Largest decoded file the wrapper will read. A larger file is accounted as fileTooLarge rather than partially read."
+    },
+    "maxSliceBytesPerFile": { "type": "integer", "minimum": 256, "maximum": 1048576 },
+    "maxTotalSliceBytes": { "type": "integer", "minimum": 1024, "maximum": 4194304 },
+    "maxSlicesPerFile": { "type": "integer", "minimum": 1, "maximum": 200 },
+    "siblingContextSlices": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 16,
+      "description": "Slices of UNCHANGED text delivered next to the change, per file. Zero disables sibling evidence, which makes adoption-dependent conventions unreportable by a specialist that requires unchanged-sibling proof."
+    },
+    "siblingContextLines": { "type": "integer", "minimum": 0, "maximum": 400 },
+    "maxTotalSiblingBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1048576,
+      "description": "Separate whole-pull-request budget for UNCHANGED sibling context. Kept apart from maxTotalSliceBytes on purpose: when the two shared one pool, the sibling evidence attached to an early file could consume the allowance a later file's changed hunks needed, so adding established-practice context silently lowered changed-source coverage elsewhere in the same pull request. NOTE: the loader additionally refuses any policy whose worst-case rendered size - maxTotalSliceBytes + maxTotalSiblingBytes + maxFiles * (maxSlicesPerFile + siblingContextSlices) * 700 - exceeds the 4194304-byte sealed-block render bound. JSON Schema cannot express that relation, so a policy can satisfy this file and still be refused at load."
+    },
+    "minDeliveredFiles": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 500,
+      "description": "Fail-closed floor: fewer FULLY delivered changed files than this fails the cycle instead of producing a review. A partially delivered file does not count."
+    },
+    "minDeliveredFilePercent": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "minDeliveredSpanPercent": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Fail-closed floor on delivered changed-line spans, so a change set where every file arrived only partially cannot pass on file counts alone."
+    },
+    "allowedMimeTypes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+    }
+  }
+}

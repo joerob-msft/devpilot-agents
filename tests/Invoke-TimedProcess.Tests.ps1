@@ -18,6 +18,26 @@ Describe 'Invoke-TimedProcess early stdin closure' {
             -TimeoutSeconds 10
     }
 
+    It 'does not race first-use Job initialization against a fast Windows child' -Skip:(-not $IsWindows) {
+        $modulePath = (Resolve-Path "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1").Path
+        $command = @'
+            Import-Module '__MODULE_PATH__' -Force
+            $VerbosePreference = 'Continue'
+            $records = @(Invoke-TimedProcess -FilePath $env:ComSpec -ArgumentList @('/c', 'exit 0') `
+                -CaptureStdOut -CaptureStdErr -TimeoutSeconds 10 4>&1)
+            if (@($records | Where-Object {
+                        [string]$_ -match 'Process containment was unavailable'
+                    }).Count -gt 0) { exit 18 }
+            $result = @($records | Where-Object { $_ -is [hashtable] })[-1]
+            if (-not $result) { exit 19 }
+            if ($result.TimedOut -or $result.ExitCode -ne 0) { exit 17 }
+'@.Replace('__MODULE_PATH__', $modulePath.Replace("'", "''"))
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+        $probe = & pwsh -NoProfile -EncodedCommand $encodedCommand
+        $LASTEXITCODE | Should -Be 0
+        $probe | Should -BeNullOrEmpty
+    }
+
     Describe 'typed redirected process helpers' {
         It 'resolves an absolute pwsh executable' {
             $path = Resolve-AgentPwshPath

@@ -1,0 +1,70 @@
+{
+  "contractVersion": "devpilot.seal-parity.v1",
+  "encoding": {
+    "name": "UTF-8",
+    "bom": false,
+    "trailingNewline": false,
+    "invalidUtf16": "reject"
+  },
+  "runtimeAssumption": "The spike targets the repository's installed .NET 10 SDK. Ordinal comparison, invariant numeric formatting, and date parsing are locked by cross-runtime PowerShell vectors and must be revalidated before production migration.",
+  "profiles": {
+    "json-text-v1": {
+      "productionSurfaces": [
+        "acquisition transcript-package.json",
+        "terminal-evidence.json",
+        "reviewer text canonicalization"
+      ],
+      "maximumDepth": 64,
+      "objectKeys": "ordinal ascending",
+      "arrays": "preserve order",
+      "numbers": "preserve JSON token text",
+      "strings": "PowerShell 7 ConvertTo-Json -Compress string escaping"
+    },
+    "replay-v1": {
+      "productionSurfaces": [
+        "replay manifestDigest",
+        "requestSha256",
+        "benchmark transformation manifestDigest"
+      ],
+      "maximumDepth": 24,
+      "objectKeys": "ordinal ascending",
+      "arrays": "preserve order",
+      "numbers": "signed 64-bit integers only; non-integral numeric CLR types rejected",
+      "strings": "production replay escaping; U+007F and U+0000..U+001F escaped with lowercase hex"
+    },
+    "convention-v1": {
+      "productionSurfaces": [
+        "convention-specialist previews",
+        "qualification run-set manifestJson"
+      ],
+      "maximumDepth": 32,
+      "objectKeys": "ordinal ascending",
+      "arrays": "preserve order",
+      "numbers": "PowerShell object numeric rendering with invariant culture",
+      "strings": "PowerShell 7 ConvertTo-Json -Compress string escaping"
+    },
+    "exact-text-v1": {
+      "productionSurfaces": [
+        "capture-manifest SHA/HMAC",
+        "acquisition and terminal canonical manifest SHA/HMAC",
+        "preview envelope manifestJson HMAC"
+      ],
+      "transformation": "Strict UTF-8 file decoding followed by hashing the decoded text as BOM-free UTF-8; this matches production ReadAllText behavior, including consuming an input BOM."
+    }
+  },
+  "operations": [
+    "canonicalize",
+    "sha256",
+    "hmac-sha256"
+  ],
+  "keyFormats": [
+    "hex",
+    "base64",
+    "utf8",
+    "raw-file",
+    "stored-raw",
+    "stored-file"
+  ],
+  "domainDerivation": "For each domains entry in order, replace key with HMAC-SHA256(key, UTF8(domain)); then sign the canonical bytes.",
+  "rootExclusion": "excludeRootProperties removes only matching root object members before canonicalization; this models self-excluding manifestDigest fields without changing production artifacts."
+}
