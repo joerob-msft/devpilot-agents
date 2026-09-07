@@ -67,6 +67,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: src/DevPilot.Dashboard/package-lock.json
+
+      - name: Restore locked dashboard dependencies for process fixtures
+        shell: pwsh
+        working-directory: src/DevPilot.Dashboard
+        run: npm ci
+
       - name: Install Pester
         shell: pwsh
         run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
