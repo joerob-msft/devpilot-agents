@@ -157,6 +157,7 @@ function Get-AgentTeamsFreshPullRequest {
     $project = Get-AgentProviderValue $repository project
     if ($null -eq $project) { $project = Get-AgentProviderValue $repository projectReference }
     $author = Get-AgentProviderValue $pr createdBy
+    $authorDescriptor = Get-AgentProviderValue $author descriptor
     $source = Get-AgentProviderValue $pr lastMergeSourceCommit
     $head = Get-AgentProviderValue $source commitId
     $uniqueName = Get-AgentProviderValue $author uniqueName
@@ -202,9 +203,19 @@ function Get-AgentTeamsFreshPullRequest {
         (ConvertTo-AgentTeamsGuid $segments[$offset + 3]) -cne $Authority.RepositoryId) {
         throw [IO.InvalidDataException]::new('Repository URL scope mismatches.')
     }
+    $ownerMentionId = Get-AgentProviderValue $authorDescriptor identifier
+    $ownerDisplayName = Get-AgentProviderValue $author displayName
+    $mentionObjectId = [Guid]::Empty
+    if ($ownerMentionId -isnot [string] -or -not [Guid]::TryParse($ownerMentionId, [ref]$mentionObjectId) -or
+        $ownerDisplayName -isnot [string] -or $ownerDisplayName.Length -lt 1 -or $ownerDisplayName.Length -gt 256 -or
+        $ownerDisplayName -match '[\p{C}]') {
+        $ownerMentionId = ''
+        $ownerDisplayName = ''
+    }
     return @{
         OwnerId = ConvertTo-AgentTeamsGuid (Get-AgentProviderValue $author id)
         OwnerUpn = $uniqueName.ToLowerInvariant(); Head = $head.ToLowerInvariant()
+        OwnerMentionId = $ownerMentionId; OwnerDisplayName = $ownerDisplayName
         Active = $status -ceq 'active'; Draft = Get-AgentProviderValue $pr isDraft
     }
 }
@@ -724,6 +735,7 @@ function Send-AgentTeamsSharedChannelMessage {
         [hashtable]$Session, [hashtable]$ReferenceContext, [string]$DurableStateRoot, $RepositoryIdentity,
         [string]$Role, [string]$NotificationEvent, [int]$PullRequestId, [AllowEmptyString()][string]$SourceCommit,
         [string]$TeamId, [string]$ChannelId, [string]$Title, [string]$Body, [string[]]$Links = @(),
+        [string]$MentionRecipientId = '', [string]$MentionRecipientDisplayName = '',
         [string]$PullRequestUrl = '', [Nullable[DateTime]]$DeadlineUtc, [hashtable]$OutputContext, [switch]$PreviewOnly
     )
     $Role = $Role.ToLowerInvariant()
@@ -781,7 +793,10 @@ function Send-AgentTeamsSharedChannelMessage {
         $result = Invoke-AgentTeamsLocalChannelMessage -Session $Session -DurableStateRoot $DurableStateRoot `
             -RepositoryIdentity $RepositoryIdentity -Role $Role -NotificationEvent $payload.notificationEvent `
             -PullRequestId $PullRequestId -SourceCommit $payload.sourceCommit -TeamId $TeamId -ChannelId $ChannelId `
-            -Title $payload.title -Body $payload.body -Links $payload.links -DeadlineUtc $deadline -OutputContext $OutputContext `
+            -Title $payload.title -Body $payload.body -Links $payload.links `
+            -MentionRecipientId $(if ($Role -ceq 'reviewer') { $pr.OwnerMentionId } else { '' }) `
+            -MentionRecipientDisplayName $(if ($Role -ceq 'reviewer') { $pr.OwnerDisplayName } else { '' }) `
+            -DeadlineUtc $deadline -OutputContext $OutputContext `
             -SharedAuthority @{ Mode = 'reply'; RootId = $reference.Reference.messageId }
         if ($result.Delivered) { Set-AgentTeamsOutboxDisposition $context $Role $key delivered $deadline }
         elseif ($result.Outcome -cin @('unknown', 'failed')) { Set-AgentTeamsOutboxDisposition $context $Role $key $result.Outcome $deadline }

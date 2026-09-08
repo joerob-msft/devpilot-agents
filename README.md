@@ -542,6 +542,10 @@ posted review is sent directly to the reviewed PR's author using the UPN in
 ADO's `createdBy` identity. The configured `recipientUpn` and
 `-TeamsRecipientUpn` are fallback values only when ADO does not expose a usable
 author UPN. Channel and direct delivery are deduplicated independently.
+Reviewer channel notifications also tag that PR owner using the Entra identity
+bound to the fresh ADO author record. If ADO does not expose a valid mention
+identity, the original unmentioned notification is still sent rather than
+losing the review signal.
 
 **Local Teams channel threads (default):** the optional
 `teamsNotifications.channel.threadReuseEnabled` setting defaults to `true`.
