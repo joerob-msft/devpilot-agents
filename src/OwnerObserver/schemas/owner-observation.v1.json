@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "owner-observation.v1",
+  "title": "Normalized Owner reviewer observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "implementation",
+    "capability",
+    "subject",
+    "rule",
+    "lifecycle",
+    "counts",
+    "findingsComplete",
+    "findings",
+    "execution",
+    "effects",
+    "sourceArtifacts",
+    "validationErrors"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "owner-observation" },
+    "implementation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "$ref": "#/$defs/text" },
+        "version": { "$ref": "#/$defs/text" }
+      }
+    },
+    "capability": { "$ref": "#/$defs/knownText" },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pullRequestId", "repositoryId", "headCommit", "targetCommit", "targetRef"],
+      "properties": {
+        "pullRequestId": { "$ref": "#/$defs/countOrUnknown" },
+        "repositoryId": { "$ref": "#/$defs/knownText" },
+        "headCommit": { "$ref": "#/$defs/knownText" },
+        "targetCommit": { "$ref": "#/$defs/knownText" },
+        "targetRef": { "$ref": "#/$defs/knownText" }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "path", "section", "commit", "sha256"],
+      "properties": {
+        "identity": { "$ref": "#/$defs/knownText" },
+        "path": { "$ref": "#/$defs/knownText" },
+        "section": { "$ref": "#/$defs/knownText" },
+        "commit": { "$ref": "#/$defs/knownText" },
+        "sha256": { "$ref": "#/$defs/knownText" }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "prepared", "completed", "incomplete", "pending"],
+      "properties": {
+        "status": { "enum": ["prepared", "pending", "completed", "incomplete", "blocked", "unknown"] },
+        "prepared": { "$ref": "#/$defs/boolOrUnknown" },
+        "completed": { "$ref": "#/$defs/boolOrUnknown" },
+        "incomplete": { "$ref": "#/$defs/boolOrUnknown" },
+        "pending": { "$ref": "#/$defs/boolOrUnknown" }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checked", "violations", "unknown", "uncovered"],
+      "properties": {
+        "checked": { "$ref": "#/$defs/countOrUnknown" },
+        "violations": { "$ref": "#/$defs/countOrUnknown" },
+        "unknown": { "$ref": "#/$defs/countOrUnknown" },
+        "uncovered": { "$ref": "#/$defs/countOrUnknown" }
+      }
+    },
+    "findingsComplete": { "$ref": "#/$defs/boolOrUnknown" },
+    "findings": {
+      "type": "array",
+      "maxItems": 512,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["identity", "disposition", "ruleRef", "constructRef", "anchor"],
+        "properties": {
+          "identity": { "$ref": "#/$defs/knownText" },
+          "disposition": { "enum": ["violation", "unknown"] },
+          "ruleRef": { "$ref": "#/$defs/knownText" },
+          "constructRef": { "$ref": "#/$defs/knownText" },
+          "anchor": {
+            "oneOf": [
+              { "const": "unknown" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["path", "line", "symbol"],
+                "properties": {
+                  "path": { "$ref": "#/$defs/text" },
+                  "line": { "type": "integer", "minimum": 1 },
+                  "symbol": { "$ref": "#/$defs/knownText" }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempts", "modelStarts", "latencyMs", "refusalReason", "incompleteReason"],
+      "properties": {
+        "attempts": { "$ref": "#/$defs/countOrUnknown" },
+        "modelStarts": { "$ref": "#/$defs/countOrUnknown" },
+        "latencyMs": { "$ref": "#/$defs/countOrUnknown" },
+        "refusalReason": { "$ref": "#/$defs/knownText" },
+        "incompleteReason": { "$ref": "#/$defs/knownText" }
+      }
+    },
+    "effects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["providerWrites", "writeToolInvocations", "dedupe", "operatorIntervention"],
+      "properties": {
+        "providerWrites": { "$ref": "#/$defs/countOrUnknown" },
+        "writeToolInvocations": { "$ref": "#/$defs/countOrUnknown" },
+        "operatorIntervention": { "$ref": "#/$defs/boolOrUnknown" },
+        "dedupe": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["created", "updated", "noOp", "wouldCreate", "wouldUpdate", "unknown"],
+          "properties": {
+            "created": { "$ref": "#/$defs/countOrUnknown" },
+            "updated": { "$ref": "#/$defs/countOrUnknown" },
+            "noOp": { "$ref": "#/$defs/countOrUnknown" },
+            "wouldCreate": { "$ref": "#/$defs/countOrUnknown" },
+            "wouldUpdate": { "$ref": "#/$defs/countOrUnknown" },
+            "unknown": { "$ref": "#/$defs/countOrUnknown" }
+          }
+        }
+      }
+    },
+    "sourceArtifacts": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "sha256", "signature"],
+        "properties": {
+          "kind": { "$ref": "#/$defs/text" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "signature": { "enum": ["verified", "not-applicable", "unknown"] }
+        }
+      }
+    },
+    "validationErrors": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+    }
+  },
+  "$defs": {
+    "text": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "knownText": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "countOrUnknown": {
+      "oneOf": [
+        { "const": "unknown" },
+        { "type": "integer", "minimum": 0 }
+      ]
+    },
+    "boolOrUnknown": {
+      "oneOf": [
+        { "const": "unknown" },
+        { "type": "boolean" }
+      ]
+    }
+  }
+}
