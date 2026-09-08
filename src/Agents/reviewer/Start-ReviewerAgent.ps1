@@ -5178,34 +5178,49 @@ function Get-ReviewerPullRequestLink {
 }
 
 function Invoke-ReviewerTeamsMaintenance {
-    param([Parameter(Mandatory)][hashtable]$AdoSession, [Parameter(Mandatory)][string]$AgencyPath)
+    param([Parameter(Mandatory)][string]$AgencyPath)
     if ($PreviewOnly -or -not $EnableTeamsNotifications -or -not $TeamsChannelEnabled -or
         -not $TeamsThreadReuseEnabled -or -not $TeamsPrReferenceEnabled -or @($TeamsChannelEvents).Count -eq 0) { return }
     if ($ManualDispatchManifest -and -not $script:ReviewerTeamsManualAuthorized) { return }
     if ($ManualDispatchManifest -and (Test-AgentManualCancellationRequested -RepositoryIdentity $repositoryIdentity -PullRequestId $PullRequestId -Role reviewer)) { return }
+    $adoSession = $null
     $workIqSession = $null
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds(60)
-        $referenceContext = New-AgentTeamsPrReferenceContext -AdoSession $AdoSession -RepositoryIdentity $repositoryIdentity -Role reviewer
+        $maintenanceSessionTimeoutSeconds = [Math]::Max(1, [Math]::Min(15, $McpTimeoutSeconds))
+        $adoSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
+            -Organization $Organization -Toolsets @('repos') -TimeoutSeconds $maintenanceSessionTimeoutSeconds `
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+        if ([DateTime]::UtcNow -ge $deadline) { throw 'Teams outbox deadline exhausted during ADO session startup.' }
+        $referenceContext = New-AgentTeamsPrReferenceContext -AdoSession $adoSession -RepositoryIdentity $repositoryIdentity -Role reviewer
         $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server workiq -TimeoutSeconds 15
+        if ([DateTime]::UtcNow -ge $deadline) { throw 'Teams outbox deadline exhausted during WorkIQ session startup.' }
         Invoke-AgentTeamsNotificationOutbox -Session $workIqSession -ReferenceContext $referenceContext `
             -DurableStateRoot $DurableStateRoot -RepositoryIdentity $repositoryIdentity -Role reviewer `
             -TeamId $TeamsTeamId -ChannelId $TeamsChannelId -AllowedEvents $TeamsChannelEvents `
             -PullRequestId $PullRequestId -DeadlineUtc $deadline -OutputContext $script:ReviewerOutputContext | Out-Null
+        if (-not $adoSession.Process) {
+            throw 'Teams outbox ADO session closed while draining queued notifications.'
+        }
     }
     catch {
         if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
+        $reason = $_.Exception.Message
         if ($script:ReviewerOutputContext) {
             Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -Level warning `
-                -Data @{ outcome = 'deferred'; code = 'outbox-cycle-error' } `
-                -Message 'Teams outbox flush deferred; review selection is unaffected.' | Out-Null
+                -Data @{ outcome = 'deferred'; code = 'outbox-cycle-error'; reason = $reason } `
+                -Message "Teams outbox flush deferred; review selection is unaffected: $reason" | Out-Null
         }
-        Write-Warning 'Teams outbox flush deferred; review selection is unaffected.'
+        Write-Warning "Teams outbox flush deferred; review selection is unaffected: $reason"
     }
     finally {
         if ($workIqSession) {
             try { Close-AgentMcpSession -Session $workIqSession }
             catch { Write-Warning 'Teams outbox session cleanup failed; review selection is unaffected.' }
+        }
+        if ($adoSession) {
+            try { Close-AgentMcpSession -Session $adoSession }
+            catch { Write-Warning 'Teams outbox ADO session cleanup failed; review selection is unaffected.' }
         }
     }
 }
@@ -6350,7 +6365,7 @@ function Invoke-ReviewerCycle {
             -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
 
         $script:ReviewerTeamsAdoSession = $session
-        Invoke-ReviewerTeamsMaintenance -AdoSession $session -AgencyPath $AgencyPath
+        Invoke-ReviewerTeamsMaintenance -AgencyPath $AgencyPath
 
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
         # This snapshot is scheduling input only. The selected PR is re-read
