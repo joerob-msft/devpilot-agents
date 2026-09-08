@@ -693,6 +693,20 @@ function Get-ReviewerAuthorUpn {
     return ""
 }
 
+function Get-ReviewerAuthorMentionIdentity {
+    param([Parameter(Mandatory)]$Pr)
+    $author = Get-ReviewerHashValue -Container $Pr -Key 'createdBy'
+    $descriptor = Get-ReviewerHashValue -Container $author -Key 'descriptor'
+    $id = [string](Get-ReviewerHashValue -Container $descriptor -Key 'identifier' -Default '')
+    $displayName = [string](Get-ReviewerHashValue -Container $author -Key 'displayName' -Default '')
+    $objectId = [Guid]::Empty
+    if (-not [Guid]::TryParse($id, [ref]$objectId) -or -not $displayName -or
+        $displayName.Length -gt 256 -or $displayName -match '[\p{C}]') {
+        return @{ Id = ''; DisplayName = '' }
+    }
+    return @{ Id = $objectId.ToString(); DisplayName = $displayName }
+}
+
 function Test-ReviewerTitleSkipped {
     <# Title-only, and deliberately so. Authors mark work-in-progress in the
        TITLE; matching the same words in a description or a diff would silence
@@ -4906,7 +4920,8 @@ function Invoke-ReviewerDelivery {
         PostedCount = 0; PostFailures = 0; ThreadRepliesPosted = 0; ThreadReplyFailures = 0
         SummaryPosted = $false; CastVote = ""; CommentsDelivered = $false
         ThreadRepliesDelivered = $false; SummaryDelivered = $false; VoteResolved = $false
-        Delivered = $false; Aborted = $false; TerminalAbort = $false; AuthorUpn = ""; Reason = ""
+        Delivered = $false; Aborted = $false; TerminalAbort = $false; AuthorUpn = ""
+        AuthorMentionId = ""; AuthorMentionDisplayName = ""; Reason = ""
     }
     if (-not (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote))) {
         $outcome.Delivered = $false
@@ -4935,6 +4950,9 @@ function Invoke-ReviewerDelivery {
         return $outcome
     }
     $outcome.AuthorUpn = Get-ReviewerAuthorUpn -Pr $freshness.Pr
+    $authorMention = Get-ReviewerAuthorMentionIdentity -Pr $freshness.Pr
+    $outcome.AuthorMentionId = $authorMention.Id
+    $outcome.AuthorMentionDisplayName = $authorMention.DisplayName
 
     # -- Findings --------------------------------------------------------------
     if ($EnableFindingComments -and @($Postable).Count -gt 0) {
@@ -5220,6 +5238,8 @@ function Send-ReviewerTeamsNotification {
         [int]$PrId = 0,
         [string]$SourceCommit = "",
         [string]$DirectRecipientUpn = "",
+        [string]$MentionRecipientId = "",
+        [string]$MentionRecipientDisplayName = "",
         [string[]]$Links = @()
     )
     if ($PreviewOnly -or -not $EnableTeamsNotifications) { return }
@@ -5230,11 +5250,12 @@ function Send-ReviewerTeamsNotification {
     $wantDirect = $TeamsDirectEnabled -and ($TeamsDirectEvents -ccontains $NotificationEvent)
     if (-not $wantChannel -and -not $wantDirect) { return }
 
-    $resolvedDirectRecipient = $DirectRecipientUpn.Trim()
-    if ($resolvedDirectRecipient -and $resolvedDirectRecipient -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
-        Write-Warning "Teams '$NotificationEvent' PR-author identity '$resolvedDirectRecipient' is not a usable UPN; trying the configured fallback."
-        $resolvedDirectRecipient = ""
+    $resolvedOwnerUpn = $DirectRecipientUpn.Trim()
+    if ($resolvedOwnerUpn -and $resolvedOwnerUpn -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        Write-Warning "Teams '$NotificationEvent' PR-author identity '$resolvedOwnerUpn' is not a usable UPN; trying the configured fallback."
+        $resolvedOwnerUpn = ""
     }
+    $resolvedDirectRecipient = $resolvedOwnerUpn
     if (-not $resolvedDirectRecipient) { $resolvedDirectRecipient = $TeamsDirectRecipientFallback }
     if ($wantDirect -and -not $resolvedDirectRecipient) {
         Write-Warning "Teams '$NotificationEvent' direct-author delivery skipped because ADO exposed no usable author UPN and no fallback recipient is configured."
@@ -5288,7 +5309,9 @@ function Send-ReviewerTeamsNotification {
                         -RepositoryIdentity $repositoryIdentity -Role reviewer -NotificationEvent $NotificationEvent `
                         -PullRequestId $PrId -SourceCommit $SourceCommit -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
                         -PullRequestUrl (Get-ReviewerPullRequestLink -PrId $PrId) `
-                        -Title $Title -Body $Body -Links $Links -OutputContext $script:ReviewerOutputContext @referenceParameters
+                        -Title $Title -Body $Body -Links $Links -MentionRecipientId $MentionRecipientId `
+                        -MentionRecipientDisplayName $MentionRecipientDisplayName `
+                        -OutputContext $script:ReviewerOutputContext @referenceParameters
                     $channelConfirmed = $result.Delivered -or $result.Deduped
                     if ([bool](Get-ReviewerHashValue -Container $result -Key Queued -Default $false)) {
                         Write-Host "Teams '$NotificationEvent' queued for its shared PR thread; not yet delivered." -ForegroundColor DarkGray
@@ -5299,7 +5322,8 @@ function Send-ReviewerTeamsNotification {
                 }
                 else {
                     Send-AgentTeamsChannelMessage -Session $workIqSession -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
-                        -Title $Title -Body $Body -Links $Links | Out-Null
+                        -Title $Title -Body $Body -Links $Links -MentionRecipientId $MentionRecipientId `
+                        -MentionRecipientDisplayName $MentionRecipientDisplayName | Out-Null
                     if ($TeamsThreadReuseEnabled -and $script:ReviewerOutputContext) {
                         Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -PrId $PrId `
                             -SourceCommit $SourceCommit -Data @{ outcome = 'fallback-delivered'; code = 'thread-scope-unavailable' } `
@@ -5593,6 +5617,7 @@ function Invoke-ReviewerPullRequest {
             -Title "Review failed on PR $prId" `
             -Body ("$reason" + $(if ($launchFailureReason) { " This is an environment fault on the agent host, not a problem with the pull request." } else { "" })) `
             -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) `
+            -MentionRecipientId ([string]$Bound.AuthorMentionId) -MentionRecipientDisplayName ([string]$Bound.AuthorDisplay) `
             -Links @(Get-ReviewerPullRequestLink -PrId $prId)
         Send-ReviewerEvent work.completed -Level error -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data ($prContext + @{
             result = 'failed'; elapsedMilliseconds = $reviewTimer.ElapsedMilliseconds
@@ -5805,7 +5830,8 @@ function Invoke-ReviewerPullRequest {
             -Body ("$($allFindings.Count) finding(s): $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion. " +
                 "$postedCount finding(s) posted, $threadRepliesPosted human-comment assessment(s) posted, $($withheld.Count) withheld by config. " +
                 "Vote: $(if ($castVote) { $castVote } else { 'none' }).") `
-            -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) -Links @($prLink)
+            -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) `
+            -MentionRecipientId ([string]$Bound.AuthorMentionId) -MentionRecipientDisplayName ([string]$Bound.AuthorDisplay) -Links @($prLink)
     }
     elseif ($allFindings.Count -gt 0 -or $threadReplies.Count -gt 0) {
         Send-ReviewerTeamsNotification -NotificationEvent 'previewReady' -AgencyPath $AgencyPath `
@@ -5813,7 +5839,8 @@ function Invoke-ReviewerPullRequest {
             -Body ("$($allFindings.Count) finding(s) and $($threadReplies.Count) human-comment assessment(s) were produced but nothing was posted: " +
                 "$($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion. " +
                 "Read the preview, then publish it with -PromotePreview. Preview: $previewPath") `
-            -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) -Links @($prLink)
+            -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) `
+            -MentionRecipientId ([string]$Bound.AuthorMentionId) -MentionRecipientDisplayName ([string]$Bound.AuthorDisplay) -Links @($prLink)
     }
 
     $deliveredParts = New-Object System.Collections.Generic.List[string]
@@ -6288,6 +6315,8 @@ function Invoke-ReviewerPromotion {
                 "$([int]$delivery.PostedCount) finding(s) posted, $([int]$delivery.ThreadRepliesPosted) human-comment assessment(s) posted. " +
                 "Vote: $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { 'none' }).") `
             -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$delivery.AuthorUpn) `
+            -MentionRecipientId ([string]$delivery.AuthorMentionId) `
+            -MentionRecipientDisplayName ([string]$delivery.AuthorMentionDisplayName) `
             -Links @(Get-ReviewerPullRequestLink -PrId $prId)
         Write-Host "Promoted the stored review of PR $prId." -ForegroundColor Green
         Send-ReviewerEvent work.completed -PrId $prId -SourceCommit $sourceCommit -Data @{
@@ -6411,11 +6440,14 @@ function Invoke-ReviewerCycle {
                 # is silent by construction: the loop keeps running, exits 0,
                 # and reviews nothing - indistinguishable from having no work,
                 # unless somebody happens to read the state file.
+                $starvedMention = Get-ReviewerAuthorMentionIdentity -Pr $pr
                 Send-ReviewerTeamsNotification -NotificationEvent 'candidateStarved' -AgencyPath $AgencyPath `
                     -Title "PR $prId is starved and will be skipped" `
                     -Body ("$attempts consecutive failures reached the threshold of $ConsecutiveFailureThreshold, so this pull request is no longer being attempted. " +
                         "The agent keeps running and will look otherwise healthy. Investigate, then clear it with -ResetStarvedCandidates.") `
                     -PrId $prId -DirectRecipientUpn (Get-ReviewerAuthorUpn -Pr $pr) `
+                    -MentionRecipientId ([string]$starvedMention.Id) `
+                    -MentionRecipientDisplayName ([string]$starvedMention.DisplayName) `
                     -Links @(Get-ReviewerPullRequestLink -PrId $prId)
                 continue
             }
@@ -6547,6 +6579,7 @@ function Invoke-ReviewerCycle {
             $authorAlias = Get-ReviewerAlias -UniqueName ([string](Get-ReviewerHashValue -Container $createdBy -Key 'uniqueName' -Default ''))
             $authorDisplay = [string](Get-ReviewerHashValue -Container $createdBy -Key 'displayName' -Default $authorAlias)
             if ([string]::IsNullOrWhiteSpace($authorDisplay)) { $authorDisplay = $authorAlias }
+            $authorMention = Get-ReviewerAuthorMentionIdentity -Pr $prRecord
             $sourceBranch = (([string](Get-ReviewerHashValue -Container $prRecord -Key 'sourceRefName' -Default '')) -replace '^refs/heads/', '')
             $targetBranch = (([string](Get-ReviewerHashValue -Container $prRecord -Key 'targetRefName' -Default '')) -replace '^refs/heads/', '')
             $prTitle = [string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId")
@@ -6560,6 +6593,7 @@ function Invoke-ReviewerCycle {
                     AuthorAlias          = $authorAlias
                     AuthorDisplay        = $authorDisplay
                     AuthorUpn            = (Get-ReviewerAuthorUpn -Pr $prRecord)
+                    AuthorMentionId      = $authorMention.Id
                     Url                  = $prUrl
                     ThreadCount          = @($threads).Count
                     ActionableThreadCount = @($digest.AssessmentTargets).Count

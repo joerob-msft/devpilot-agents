@@ -112,6 +112,48 @@ Describe 'WorkIQ structured rejection metadata' {
             $Params.name -eq 'create_entity' -and $Params.arguments.parentUrl -eq '/chats/legacy-id/messages'
         }
     }
+
+    It 'tags a resolved PR owner in an independent channel message' {
+        $script:posted = $null
+        Mock Send-AgentMcpRequest -ModuleName DevPilot.AgentHarness {
+            param($Params)
+            $script:posted = $Params.arguments
+            return [pscustomobject]@{ structuredContent = [pscustomobject]@{
+                statusCode = 201; data = [pscustomobject]@{ id = 'message-id' }
+            } }
+        }
+
+        $null = Send-AgentTeamsChannelMessage -Session $session -TeamId fixture -ChannelId channel `
+            -Title title -Body body -MentionRecipientId '22222222-2222-2222-2222-222222222222' `
+            -MentionRecipientDisplayName 'PR <Owner>'
+
+        $posted.jsonBody.body.content | Should -Match '<at id="0">PR &lt;Owner&gt;</at>'
+        $posted.jsonBody.mentions | Should -HaveCount 1
+        $posted.jsonBody.mentions[0].mentionText | Should -BeExactly 'PR <Owner>'
+        $posted.jsonBody.mentions[0].mentioned.user.id | Should -BeExactly '22222222-2222-2222-2222-222222222222'
+        $posted.jsonBody.mentions[0].mentioned.user.userIdentityType | Should -BeExactly 'aadUser'
+        Should -Invoke Send-AgentMcpRequest -ModuleName DevPilot.AgentHarness -Times 1 -Exactly -ParameterFilter {
+            $Params.name -eq 'create_entity'
+        }
+    }
+
+    It 'sends without a mention when the bound owner identity is invalid' {
+        $script:posted = $null
+        Mock Send-AgentMcpRequest -ModuleName DevPilot.AgentHarness {
+            param($Params)
+            $script:posted = $Params.arguments
+            return [pscustomobject]@{ structuredContent = [pscustomobject]@{
+                statusCode = 201; data = [pscustomobject]@{ id = 'message-id' }
+            } }
+        }
+
+        $null = Send-AgentTeamsChannelMessage -Session $session -TeamId fixture -ChannelId channel `
+            -Title title -Body body -MentionRecipientId 'not-a-guid' `
+            -MentionRecipientDisplayName 'Owner' -WarningVariable warnings
+
+        $posted.jsonBody.ContainsKey('mentions') | Should -BeFalse
+        $warnings | Should -Match 'bound owner identity is incomplete or invalid'
+    }
 }
 
 Describe 'durable channel threading' {

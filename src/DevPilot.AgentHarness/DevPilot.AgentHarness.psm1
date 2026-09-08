@@ -6067,6 +6067,35 @@ function New-AgentTeamsMessageHtml {
     return $html
 }
 
+function New-AgentTeamsChannelMessagePayload {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Body,
+        [string[]]$Links = @(),
+        [string]$MentionRecipientId = '',
+        [string]$MentionRecipientDisplayName = ''
+    )
+    $html = New-AgentTeamsMessageHtml -Title $Title -Body $Body -Links $Links
+    $payload = @{ body = @{ contentType = 'html'; content = $html } }
+    $id = $MentionRecipientId.Trim()
+    $displayName = $MentionRecipientDisplayName.Trim()
+    if (-not $id -and -not $displayName) { return $payload }
+    $objectId = [Guid]::Empty
+    if (-not [Guid]::TryParse($id, [ref]$objectId) -or -not $displayName -or
+        $displayName.Length -gt 256 -or $displayName -match '[\p{C}]') {
+        Write-Warning 'Teams PR-owner mention was skipped because the bound owner identity is incomplete or invalid.'
+        return $payload
+    }
+    $mentionText = [System.Net.WebUtility]::HtmlEncode($displayName)
+    $payload.body.content = "<at id=`"0`">$mentionText</at><br/>$html"
+    $payload.mentions = @(@{
+            id = 0
+            mentionText = $displayName
+            mentioned = @{ user = @{ id = $objectId.ToString(); displayName = $displayName; userIdentityType = 'aadUser' } }
+        })
+    return $payload
+}
+
 function Send-AgentTeamsChannelMessage {
     <#
         Posts one HTML message to a Teams channel through WorkIQ. Every dynamic
@@ -6080,12 +6109,15 @@ function Send-AgentTeamsChannelMessage {
         [Parameter(Mandatory)][string]$Title,
         [Parameter(Mandatory)][string]$Body,
         [string[]]$Links = @(),
+        [string]$MentionRecipientId = '',
+        [string]$MentionRecipientDisplayName = '',
         [Nullable[DateTime]]$DeadlineUtc
     )
-    $html = New-AgentTeamsMessageHtml -Title $Title -Body $Body -Links $Links
+    $payload = New-AgentTeamsChannelMessagePayload -Title $Title -Body $Body -Links $Links `
+        -MentionRecipientId $MentionRecipientId -MentionRecipientDisplayName $MentionRecipientDisplayName
     $arguments = @{
         parentUrl = "/teams/$TeamId/channels/$ChannelId/messages"
-        jsonBody  = @{ body = @{ contentType = "html"; content = $html } }
+        jsonBody  = $payload
     }
     return Invoke-AgentWorkIqTool -Session $Session -Name "create_entity" -Arguments $arguments -DeadlineUtc $DeadlineUtc
 }

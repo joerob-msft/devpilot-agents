@@ -264,6 +264,8 @@ function Invoke-AgentTeamsLocalChannelMessage {
         [Parameter(Mandatory)][ValidateLength(1, 4096)][string]$Title,
         [Parameter(Mandatory)][ValidateLength(1, 24576)][string]$Body,
         [string[]]$Links = @(),
+        [string]$MentionRecipientId = '',
+        [string]$MentionRecipientDisplayName = '',
         [Nullable[DateTime]]$DeadlineUtc,
         [AllowNull()][hashtable]$OutputContext,
         [AllowNull()][hashtable]$SharedAuthority
@@ -369,8 +371,11 @@ function Invoke-AgentTeamsLocalChannelMessage {
         }
         $resultOptions.Operation = $record.kind
         $messagesPath = "/teams/$([Uri]::EscapeDataString($TeamId))/channels/$([Uri]::EscapeDataString($ChannelId))/messages"
-        $html = New-AgentTeamsMessageHtml -Title $Title -Body $Body -Links $Links
-        if ($SharedAuthority -and $SharedAuthority.Mode -ceq 'bootstrap') { $html = $SharedAuthority.RootPrefix + $html }
+        $payload = New-AgentTeamsChannelMessagePayload -Title $Title -Body $Body -Links $Links `
+            -MentionRecipientId $MentionRecipientId -MentionRecipientDisplayName $MentionRecipientDisplayName
+        if ($SharedAuthority -and $SharedAuthority.Mode -ceq 'bootstrap') {
+            $payload.body.content = $SharedAuthority.RootPrefix + $payload.body.content
+        }
         while ($true) {
             if ($record.attempts -ge 3) { return New-AgentTeamsThreadResult deferred attempt-limit @resultOptions }
             if ($record.code -ceq 'throttled-metadata-unavailable') {
@@ -396,7 +401,7 @@ function Invoke-AgentTeamsLocalChannelMessage {
             try {
                 $response = Invoke-AgentWorkIqTool -Session $Session -Name create_entity -AllowedTools @('create_entity') `
                     -AllowedPathPrefixes @($path) -Arguments @{
-                        parentUrl = $path; jsonBody = @{ body = @{ contentType = 'html'; content = $html } }
+                        parentUrl = $path; jsonBody = $payload
                     } -DeadlineUtc $deadline
             }
             catch {
@@ -482,7 +487,8 @@ function Send-AgentTeamsThreadedChannelMessage {
         [Parameter(Mandatory)][string]$TeamId, [Parameter(Mandatory)][string]$ChannelId,
         [Parameter(Mandatory)][ValidateLength(1, 4096)][string]$Title,
         [Parameter(Mandatory)][ValidateLength(1, 24576)][string]$Body,
-        [string[]]$Links = @(), [string]$PullRequestUrl = '',
+        [string[]]$Links = @(), [string]$MentionRecipientId = '', [string]$MentionRecipientDisplayName = '',
+        [string]$PullRequestUrl = '',
         [Nullable[DateTime]]$DeadlineUtc, [AllowNull()][hashtable]$OutputContext,
         [AllowNull()][hashtable]$ReferenceContext, [switch]$PreviewOnly
     )

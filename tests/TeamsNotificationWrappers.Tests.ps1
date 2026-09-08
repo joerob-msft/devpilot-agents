@@ -28,6 +28,7 @@ Describe '<Role> Teams notification integration' -ForEach @(
         }, $true)
         $script:referenceFlagConfig = [scriptblock]::Create($referenceFlagAssignment.Extent.Text)
         $functionsToLoad = @($NotificationFunction, $HashFunction, $LinkFunction)
+        if ($Role -eq 'reviewer') { $functionsToLoad += 'Get-ReviewerAuthorMentionIdentity' }
         if ($Role -eq 'review-handler') { $functionsToLoad += 'Get-HandlerTeamsNotificationSourceCommit' }
         foreach ($name in $functionsToLoad) {
             $definition = $ast.Find({
@@ -46,13 +47,21 @@ Describe '<Role> Teams notification integration' -ForEach @(
         function Invoke-TestNotification {
             param(
                 [int]$PrId = 42, [AllowEmptyString()][string]$Commit = 'abc123', [string[]]$Links = @(),
-                [string]$SourceRefName = '', [string]$ExpectedSourceCommit = '', [string]$EventOverride = ''
+                [string]$SourceRefName = '', [string]$ExpectedSourceCommit = '', [string]$EventOverride = '',
+                [string]$OwnerUpn = 'owner@example.test',
+                [string]$OwnerMentionId = '22222222-2222-2222-2222-222222222222',
+                [string]$OwnerDisplayName = 'PR Owner'
             )
             $parameters = @{
                 AgencyPath = 'unused-agency'; Title = 'Synthetic notification'; Body = 'Synthetic body'
                 PrId = $PrId; SourceCommit = $Commit; Links = $Links
             }
             $parameters[$script:eventParameter] = if ($EventOverride) { $EventOverride } else { $script:notificationEvent }
+            if ($script:notificationRole -eq 'reviewer') {
+                $parameters.DirectRecipientUpn = $OwnerUpn
+                $parameters.MentionRecipientId = $OwnerMentionId
+                $parameters.MentionRecipientDisplayName = $OwnerDisplayName
+            }
             if ($SourceRefName) {
                 $parameters.SourceRefName = $SourceRefName
                 $parameters.ExpectedSourceCommit = $ExpectedSourceCommit
@@ -177,11 +186,25 @@ Describe '<Role> Teams notification integration' -ForEach @(
             $PullRequestId -eq 42 -and $SourceCommit -eq 'abc123' -and
             $PullRequestUrl -eq 'https://dev.azure.com/example-org/ExampleProject/_git/example-repository/pullrequest/42' -and
             $TeamId -eq 'synthetic-team' -and $ChannelId -eq 'synthetic-channel' -and
-            $DurableStateRoot -eq $script:DurableStateRoot -and $null -ne $OutputContext
+            $DurableStateRoot -eq $script:DurableStateRoot -and $null -ne $OutputContext -and
+            ($script:notificationRole -ne 'reviewer' -or
+                ($MentionRecipientId -eq '22222222-2222-2222-2222-222222222222' -and
+                    $MentionRecipientDisplayName -eq 'PR Owner'))
         }
         Should -Invoke Send-AgentTeamsChannelMessage -Times 0
         Should -Invoke Set-JsonState -Times 1
         Should -Invoke Close-AgentMcpSession -Times 1
+    }
+
+    It 'does not tag a configured direct-message fallback as the PR owner' {
+        if ($script:notificationRole -ne 'reviewer') {
+            Set-ItResult -Skipped -Because 'Only reviewer notifications tag PR owners.'
+            return
+        }
+        Invoke-TestNotification -OwnerUpn '' -OwnerMentionId '' -OwnerDisplayName ''
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -Exactly -ParameterFilter {
+            $MentionRecipientId -eq '' -and $MentionRecipientDisplayName -eq ''
+        }
     }
 
     It 'builds PR routing identity from trusted config rather than caller-supplied links' {
