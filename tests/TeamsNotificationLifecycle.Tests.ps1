@@ -191,7 +191,51 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         $result = & $script:cycleFunction -AgencyPath unused -CycleNumber 1
         $result.ExitCode | Should -Be 0 -Because $result.Summary
         Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter { $Data.outcome -eq 'deferred' }
-        Should -Invoke Close-AgentMcpSession -Times $(if ($Role -eq 'review-handler') { 3 } else { 2 })
+        Should -Invoke Close-AgentMcpSession -Times 3
+    }
+
+    It 'isolates reviewer outbox timeouts from the work session' -Skip:($Role -ne 'reviewer') {
+        $script:adoSessions = [Collections.Generic.List[hashtable]]::new()
+        Mock Open-AgentMcpSession {
+            param($Server, $TimeoutSeconds)
+            $session = @{
+                Server = $Server
+                Process = [pscustomobject]@{ Alive = $true }
+                SessionId = [Guid]::NewGuid().ToString('N')
+                TimeoutSeconds = $TimeoutSeconds
+            }
+            if ($Server -eq 'ado') { $script:adoSessions.Add($session) }
+            return $session
+        }
+        Mock Invoke-AgentTeamsNotificationOutbox {
+            param($ReferenceContext)
+            $ReferenceContext.Ado.Process = $null
+            @{ Outcome = 'deferred' }
+        }
+        Mock Invoke-AgentMcpTool {
+            param($Session, $Name)
+            if (-not $Session.Process) { throw 'Agent MCP session is closed.' }
+            if ($Name -eq 'repo_pull_request') { return $script:prs[0] }
+            throw "Unexpected MCP call $Name"
+        }
+        $script:McpTimeoutSeconds = 120
+        $script:PullRequestId = 42
+
+        $result = & $script:cycleFunction -AgencyPath unused -CycleNumber 1
+
+        $result.ExitCode | Should -Be 0 -Because $result.Summary
+        $script:adoSessions.Count | Should -Be 2
+        $script:adoSessions[0].TimeoutSeconds | Should -Be 120
+        $script:adoSessions[1].TimeoutSeconds | Should -Be 15
+        $script:adoSessions[0].Process | Should -Not -BeNullOrEmpty
+        $script:adoSessions[1].Process | Should -BeNullOrEmpty
+        Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter {
+            $Data.code -eq 'outbox-cycle-error' -and
+            $Data.reason -eq 'Teams outbox ADO session closed while draining queued notifications.'
+        }
+        Should -Invoke Invoke-AgentMcpTool -Times 1 -ParameterFilter {
+            $Name -eq 'repo_pull_request' -and $Session.SessionId -eq $script:adoSessions[0].SessionId
+        }
     }
 
     It 'isolates Teams maintenance timeouts from the handler work session' -Skip:($Role -ne 'review-handler') {
