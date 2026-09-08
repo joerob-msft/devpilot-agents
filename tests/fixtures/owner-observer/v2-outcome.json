@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "kind": "owner-observation",
+  "implementation": {
+    "id": "owner-v2-fixture",
+    "version": "0.1"
+  },
+  "capability": "test-ownership@1",
+  "subject": {
+    "pullRequestId": 42,
+    "repositoryId": "repo-1",
+    "headCommit": "1111111111111111111111111111111111111111",
+    "targetCommit": "2222222222222222222222222222222222222222",
+    "targetRef": "refs/heads/main"
+  },
+  "rule": {
+    "identity": "a4463c8f2b9b5354e1a3dfecd03cf8383be80ac27014db24dad910302b718029",
+    "path": "docs/testing.md",
+    "section": "Ownership",
+    "commit": "3333333333333333333333333333333333333333",
+    "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "lifecycle": {
+    "status": "completed",
+    "prepared": true,
+    "completed": true,
+    "incomplete": false,
+    "pending": false
+  },
+  "counts": {
+    "checked": 2,
+    "violations": 1,
+    "unknown": 0,
+    "uncovered": 1
+  },
+  "findingsComplete": true,
+  "findings": [
+    {
+      "identity": "test-ownership@1:rs0:dc1",
+      "disposition": "violation",
+      "ruleRef": "rs0",
+      "constructRef": "dc1",
+      "anchor": {
+        "path": "src/WidgetTests.cs",
+        "line": 12,
+        "symbol": "CreatesWidget"
+      }
+    },
+    {
+      "identity": "test-ownership@1:rs0:dc3",
+      "disposition": "violation",
+      "ruleRef": "rs0",
+      "constructRef": "dc3",
+      "anchor": "unknown"
+    }
+  ],
+  "execution": {
+    "attempts": 1,
+    "modelStarts": 1,
+    "latencyMs": 900,
+    "refusalReason": "unknown",
+    "incompleteReason": "unknown"
+  },
+  "effects": {
+    "providerWrites": 0,
+    "writeToolInvocations": 0,
+    "dedupe": {
+      "created": 0,
+      "updated": 0,
+      "noOp": 1,
+      "wouldCreate": 0,
+      "wouldUpdate": 0,
+      "unknown": 0
+    },
+    "operatorIntervention": true
+  },
+  "sourceArtifacts": [
+    {
+      "kind": "v2-fixture",
+      "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "signature": "not-applicable"
+    }
+  ],
+  "validationErrors": []
+}

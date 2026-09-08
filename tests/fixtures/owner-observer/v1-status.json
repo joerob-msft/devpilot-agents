@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-owner-preview-status",
+  "capability": "test-ownership@1",
+  "subjectKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "headKey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "subject": {
+    "organization": "example",
+    "project": "sample",
+    "repositoryId": "repo-1",
+    "repositoryName": "widgets",
+    "pullRequestId": 42,
+    "iterationId": 1,
+    "sourceCommit": "1111111111111111111111111111111111111111",
+    "targetCommit": "2222222222222222222222222222222222222222",
+    "targetRefName": "refs/heads/main"
+  },
+  "rule": {
+    "path": "docs/testing.md",
+    "section": "Ownership",
+    "commit": "3333333333333333333333333333333333333333",
+    "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    "byteLength": 128
+  },
+  "snapshot": {
+    "snapshotId": "sample-pr-42",
+    "manifestDigest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "sealKind": "offlineCorpusSeal",
+    "nonPromotable": true
+  },
+  "counts": {
+    "checked": 2,
+    "violations": 1,
+    "compliant": 1,
+    "unknown": 1,
+    "notInReach": 2,
+    "notRouted": 1
+  },
+  "violations": [
+    {
+      "ruleRef": "rs0",
+      "constructRef": "dc1",
+      "rationale": "The declaration has no owner metadata.",
+      "suggestion": "Add the configured owner metadata."
+    }
+  ],
+  "unknowns": [
+    {
+      "ruleRef": "rs0",
+      "constructRef": "dc2"
+    }
+  ],
+  "terminal": {
+    "status": "completed",
+    "markerStatus": "success",
+    "contractVersion": 4
+  },
+  "spend": {
+    "attempts": 1,
+    "modelStarts": 1,
+    "providerWriteCount": 0,
+    "writeToolInvocations": 0,
+    "generalistModelStarts": 0,
+    "specialistModel": "sample-model",
+    "durationMs": 1200
+  },
+  "createdUtc": "2026-09-01T00:00:00Z"
+}
