@@ -82,6 +82,8 @@
     },
     "channel": {
       "enabled": false,
+      "threadReuseEnabled": true,
+      "threadReuseNote": "Enabled channel notifications share one thread per verified repository and PR by default. Requires the existing notification switch; direct chats remain independent.",
       "teamId": "",
       "channelId": "",
       "events": [

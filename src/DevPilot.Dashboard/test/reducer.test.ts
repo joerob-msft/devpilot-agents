@@ -37,6 +37,30 @@ function event(
   });
 }
 
+test("Teams notification diagnostics preserve completed work for both agent roles", () => {
+  for (const agent of ["reviewer", "review-handler"] as const) {
+    const reducer = new OperationsReducer();
+    reducer.apply(event("notifications", 1, "agent.started", { agent }));
+    reducer.apply(event("notifications", 2, "work.completed", {
+      agent, pullRequestId: 42, data: { result: "reviewed", delivered: ["summary"], summary: "Work finished" },
+    }));
+    const key = `${agent}:notifications`;
+    const before = structuredClone(reducer.get(key, BASE_TIME + 500));
+    assert.ok(before?.completion);
+    for (const [index, outcome] of ["root-created", "reply-delivered", "unknown", "failed", "wrapper-warning"].entries()) {
+      reducer.apply(event("notifications", index + 3, "notification.delivery", {
+        agent, pullRequestId: 42, level: "warning", data: { outcome, code: "synthetic" },
+        message: "Teams notification diagnostic; review work is unchanged.",
+      }));
+      const after = reducer.get(key, BASE_TIME + 1_000);
+      assert.equal(after?.status, before.status);
+      assert.equal(after?.blocked, before.blocked);
+      assert.deepEqual(after?.completion, before.completion);
+      assert.equal(after?.timeline.at(-1)?.eventType, "notification.delivery");
+    }
+  }
+});
+
 test("reducer tracks scope, work state, completion, and live elapsed", () => {
   const reducer = new OperationsReducer();
   reducer.apply(

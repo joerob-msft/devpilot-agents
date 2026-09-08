@@ -247,13 +247,14 @@ Describe 'preview-only capability projection (issue #114)' {
 
     It 'reports trusted-root creation ownership without claiming an existing root' {
         $root = Join-Path $TestDrive ([Guid]::NewGuid().ToString('N'))
+        $repository = (New-Item -ItemType Directory -Path (Join-Path $TestDrive 'root-ownership-repository') -Force).FullName
         $created = $false
-        Resolve-AgentTrustedRoot -Path $root -Kind watch-state -RepositoryRoot $script:repoRoot `
+        Resolve-AgentTrustedRoot -Path $root -Kind watch-state -RepositoryRoot $repository `
             -Create -CreatedByCaller ([ref]$created) | Should -BeExactly ([IO.Path]::GetFullPath($root))
         $created | Should -BeTrue
 
         $created = $true
-        Resolve-AgentTrustedRoot -Path $root -Kind watch-state -RepositoryRoot $script:repoRoot `
+        Resolve-AgentTrustedRoot -Path $root -Kind watch-state -RepositoryRoot $repository `
             -Create -CreatedByCaller ([ref]$created) | Should -BeExactly ([IO.Path]::GetFullPath($root))
         $created | Should -BeFalse
     }
@@ -312,6 +313,20 @@ Describe 'preview-only capability projection (issue #114)' {
 }
 
 Describe 'golden launch policy (issue #114)' {
+    It 'keeps PR reference writes explicitly opt-in and seals authorized handler startup arguments' {
+        $context = New-GoldenContext
+        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden', '-Once',
+            '-EnableReviewHandlerTeamsNotifications', '-EnableReviewHandlerTeamsPrReferenceWrites') +
+            (Get-BaseLaunchArgument -Context $context))
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        $handler = Get-AgentArgv -Context $context -Role review-handler
+        $handler | Should -Contain '-EnableTeamsNotifications'
+        $handler | Should -Contain '-EnableTeamsPrReferenceWrites'
+        $handler | Should -Not -Contain '-EnableAutoComplete'
+        (Get-AgentArgv -Context $context -Role reviewer) | Should -Not -Contain '-EnableTeamsPrReferenceWrites'
+        $result.StdOut | Should -Match 'Teams PR coordination comments'
+    }
+
     It 'delegates both automatic launch specifications with original capabilities and cycling policy' {
         $context = New-GoldenContext
         $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden') + (Get-BaseLaunchArgument -Context $context))
@@ -333,6 +348,7 @@ Describe 'golden launch policy (issue #114)' {
         $handlerArgv | Should -Not -Contain "-$($script:handlerDescriptor.delegableDefaultOff)"
         foreach ($argv in @($reviewerArgv, $handlerArgv)) {
             $argv | Should -Not -Contain '-EnableTeamsNotifications'
+            $argv | Should -Not -Contain '-EnableTeamsPrReferenceWrites'
             $argv | Should -Not -Contain '-Once'
             $argv | Should -Contain '-IntervalSeconds'
             $argv[[array]::IndexOf($argv, '-IntervalSeconds') + 1] | Should -BeExactly '900'
@@ -598,6 +614,8 @@ exit 0
         @{ Case = @('-Continuous', '-ReviewHandlerPullRequestId', '104'); Expected = 'pull request ID cannot be combined with -Continuous' }
         @{ Case = @('-PreviewOnly', '-EnableManualReviewerWrites'); Expected = 'PreviewOnly cannot be combined with -EnableManualReviewerWrites' }
         @{ Case = @('-EnableReviewHandlerCodeUpdates'); Expected = 'review-handler code updates require -Operational' }
+        @{ Case = @('-Operational', '-EnableReviewHandlerTeamsPrReferenceWrites'); Expected = 'requires the review-handler and -EnableReviewHandlerTeamsNotifications' }
+        @{ Case = @('-Golden', '-PreviewOnly', '-EnableReviewHandlerTeamsNotifications', '-EnableReviewHandlerTeamsPrReferenceWrites'); Expected = 'Preview runs never enable side effects' }
         @{ Case = @('-Golden', '-Agent', 'Reviewer'); Expected = '-Golden always launches both agents' }
         @{ Case = @('-Golden', '-Agent', 'ReviewHandler'); Expected = '-Golden always launches both agents' }
         @{ Case = @('-Agent', 'ReviewHandler', '-ReviewerPullRequestId', '104'); Expected = 'ReviewerPullRequestId requires -Agent Reviewer or -Agent Both' }

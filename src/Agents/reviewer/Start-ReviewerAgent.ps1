@@ -198,6 +198,7 @@ param(
     # config alone never enables it: the operator must pass this switch AND the
     # config must name at least one enabled destination, or startup fails.
     [switch]$EnableTeamsNotifications,
+    [switch]$PreviewOnly,
 
     # Fallback direct-message recipient when ADO does not expose a usable UPN
     # for the PR author. Normal review notifications resolve the recipient from
@@ -268,6 +269,8 @@ $script:ReviewerUtf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $script:ReviewerUtf8
 $OutputEncoding = $script:ReviewerUtf8
 $script:ReviewerOutputContext = $null
+$script:ReviewerTeamsAdoSession = $null
+$script:ReviewerTeamsManualAuthorized = $false
 $script:ReviewerDurableContext = $null
 $script:ReviewerLeaseRoot = $null
 if ($ForceAnalysis -and $PullRequestId -le 0) {
@@ -1977,6 +1980,18 @@ $teamsCfg = Get-AgentConfigObject -Object $Cfg -Name "teamsNotifications" -Where
 $TeamsSupportedEvents = Get-AgentConfigStringArray -Object $teamsCfg -Name "supportedEvents" -Where "config.teamsNotifications"
 $teamsChannelCfg = Get-AgentConfigObject -Object $teamsCfg -Name "channel" -Where "config.teamsNotifications"
 $TeamsChannelEnabled = Get-AgentConfigBool -Object $teamsChannelCfg -Name "enabled" -Where "config.teamsNotifications.channel"
+$TeamsThreadReuseEnabled = if ($teamsChannelCfg.PSObject.Properties['threadReuseEnabled']) {
+    if ($teamsChannelCfg.threadReuseEnabled -isnot [bool]) {
+        throw 'config.teamsNotifications.channel.threadReuseEnabled must be a JSON boolean.'
+    }
+    Get-AgentConfigBool -Object $teamsChannelCfg -Name "threadReuseEnabled" -Where "config.teamsNotifications.channel"
+} else { $true }
+$TeamsPrReferenceEnabled = if ($teamsChannelCfg.PSObject.Properties['prReferenceEnabled']) {
+    if ($teamsChannelCfg.prReferenceEnabled -isnot [bool]) {
+        throw 'config.teamsNotifications.channel.prReferenceEnabled must be a JSON boolean.'
+    }
+    Get-AgentConfigBool -Object $teamsChannelCfg -Name "prReferenceEnabled" -Where "config.teamsNotifications.channel"
+} else { $false }
 $TeamsTeamId = Get-AgentConfigString -Object $teamsChannelCfg -Name "teamId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
 $TeamsChannelId = Get-AgentConfigString -Object $teamsChannelCfg -Name "channelId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
 $TeamsChannelEvents = Get-AgentConfigStringArray -Object $teamsChannelCfg -Name "events" -Where "config.teamsNotifications.channel"
@@ -2010,6 +2025,9 @@ foreach ($evt in (@($TeamsChannelEvents) + @($TeamsDirectEvents))) {
     }
 }
 
+if ($PreviewOnly -and ($EnableTeamsNotifications -or $EnableFindingComments -or $EnableThreadReplies -or $EnableSummaryComment -or $EnableApprovalVote)) {
+    throw '-PreviewOnly cannot be combined with write or notification switches.'
+}
 if ($EnableTeamsNotifications) {
     # Channel and direct message are INDEPENDENT destinations: either alone is
     # a valid configuration, so only validate the ones actually enabled.
@@ -2442,6 +2460,7 @@ function Get-ReviewerCommentClass {
         if ($n -and $idText.IndexOf([string]$n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return 'system' }
     }
     $body = [string](Get-ReviewerHashValue -Container $Comment -Key 'content' -Default '')
+    if (Test-AgentTeamsPrReferenceComment -CommentText $body) { return 'system' }
     if ($body.IndexOf($script:ReviewerSignatureFooter, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return 'agent' }
     foreach ($n in @($BotSubstrings)) {
         if ($n -and $idText.IndexOf([string]$n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return 'bot' }
@@ -4374,9 +4393,11 @@ function Invoke-DryRunSelfChecks {
         try { [void](Get-ReviewerArtifactSigningKey -KeyPath $shortKeyPath) } catch { $shortKeyRejected = $true }
         if (-not $shortKeyRejected) { $failures.Add('A signing key with the wrong length was accepted.') }
 
+        $migrationRepository = Join-Path $sealDir 'migration-repository'
+        New-Item -ItemType Directory -Path $migrationRepository | Out-Null
         $migrationRoot = Resolve-AgentTrustedRoot `
             -Path (Join-Path $sealDir 'private-key-migration') -Kind durable-state `
-            -RepositoryRoot $RepoPath -Create
+            -RepositoryRoot $migrationRepository -Create
         $migrationRoleRoot = Join-Path $migrationRoot 'reviewer'
         New-Item -ItemType Directory -Path $migrationRoleRoot | Out-Null
         if (-not $IsWindows) {
@@ -4563,7 +4584,27 @@ function Invoke-DryRunSelfChecks {
         if ($notifySlice -cnotmatch '\$wantChannel\s*=' -or $notifySlice -cnotmatch '\$wantDirect\s*=') {
             $teamsFailures += "channel and direct destinations are not evaluated independently."
         }
-        if (([regex]::Matches($notifySlice, 'catch \{ Write-Warning "Teams')).Count -lt 2) {
+        $notifyTokens = $null
+        $notifyErrors = $null
+        $notifyAst = [Management.Automation.Language.Parser]::ParseInput($notifySlice, [ref]$notifyTokens, [ref]$notifyErrors)
+        $destinationTries = @{}
+        foreach ($sendCommand in @('Send-AgentTeamsChannelMessage', 'Send-AgentTeamsThreadedChannelMessage', 'Send-AgentTeamsDirectMessage')) {
+            $calls = @($notifyAst.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq $sendCommand
+            }, $true))
+            if ($calls.Count -ne 1) { continue }
+            $ancestor = $calls[0].Parent
+            while ($ancestor -and $ancestor -isnot [Management.Automation.Language.TryStatementAst]) {
+                $ancestor = $ancestor.Parent
+            }
+            if ($ancestor -and $ancestor.CatchClauses.Count -gt 0) {
+                $destinationTries[$sendCommand] = $ancestor.Extent.StartOffset
+            }
+        }
+        if ($notifyErrors.Count -gt 0 -or $destinationTries.Count -ne 3 -or
+            $destinationTries['Send-AgentTeamsChannelMessage'] -eq $destinationTries['Send-AgentTeamsDirectMessage'] -or
+            $destinationTries['Send-AgentTeamsThreadedChannelMessage'] -eq $destinationTries['Send-AgentTeamsDirectMessage']) {
             $teamsFailures += "a failure in one destination is not isolated from the other."
         }
         # 3. The dedupe record must be written only after something was actually
@@ -5115,7 +5156,40 @@ function Get-ReviewerPullRequestLink {
     #>
     param([Parameter(Mandatory)][int]$PrId)
     if ($PrId -le 0) { return "" }
-    return "https://dev.azure.com/$Organization/$ExpectedProject/_git/$RepositoryName/pullrequest/$PrId"
+    return "https://dev.azure.com/$([Uri]::EscapeDataString($Organization))/$([Uri]::EscapeDataString($ExpectedProject))/_git/$([Uri]::EscapeDataString($RepositoryName))/pullrequest/$PrId"
+}
+
+function Invoke-ReviewerTeamsMaintenance {
+    param([Parameter(Mandatory)][hashtable]$AdoSession, [Parameter(Mandatory)][string]$AgencyPath)
+    if ($PreviewOnly -or -not $EnableTeamsNotifications -or -not $TeamsChannelEnabled -or
+        -not $TeamsThreadReuseEnabled -or -not $TeamsPrReferenceEnabled -or @($TeamsChannelEvents).Count -eq 0) { return }
+    if ($ManualDispatchManifest -and -not $script:ReviewerTeamsManualAuthorized) { return }
+    if ($ManualDispatchManifest -and (Test-AgentManualCancellationRequested -RepositoryIdentity $repositoryIdentity -PullRequestId $PullRequestId -Role reviewer)) { return }
+    $workIqSession = $null
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(60)
+        $referenceContext = New-AgentTeamsPrReferenceContext -AdoSession $AdoSession -RepositoryIdentity $repositoryIdentity -Role reviewer
+        $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server workiq -TimeoutSeconds 15
+        Invoke-AgentTeamsNotificationOutbox -Session $workIqSession -ReferenceContext $referenceContext `
+            -DurableStateRoot $DurableStateRoot -RepositoryIdentity $repositoryIdentity -Role reviewer `
+            -TeamId $TeamsTeamId -ChannelId $TeamsChannelId -AllowedEvents $TeamsChannelEvents `
+            -PullRequestId $PullRequestId -DeadlineUtc $deadline -OutputContext $script:ReviewerOutputContext | Out-Null
+    }
+    catch {
+        if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
+        if ($script:ReviewerOutputContext) {
+            Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -Level warning `
+                -Data @{ outcome = 'deferred'; code = 'outbox-cycle-error' } `
+                -Message 'Teams outbox flush deferred; review selection is unaffected.' | Out-Null
+        }
+        Write-Warning 'Teams outbox flush deferred; review selection is unaffected.'
+    }
+    finally {
+        if ($workIqSession) {
+            try { Close-AgentMcpSession -Session $workIqSession }
+            catch { Write-Warning 'Teams outbox session cleanup failed; review selection is unaffected.' }
+        }
+    }
 }
 
 function Send-ReviewerTeamsNotification {
@@ -5148,7 +5222,10 @@ function Send-ReviewerTeamsNotification {
         [string]$DirectRecipientUpn = "",
         [string[]]$Links = @()
     )
-    if (-not $EnableTeamsNotifications) { return }
+    if ($PreviewOnly -or -not $EnableTeamsNotifications) { return }
+    if ($ManualDispatchManifest -and -not $script:ReviewerTeamsManualAuthorized) { return }
+    if ($ManualDispatchManifest -and ($PrId -le 0 -or $PrId -ne $PullRequestId)) { return }
+    if ($ManualDispatchManifest -and (Test-AgentManualCancellationRequested -RepositoryIdentity $repositoryIdentity -PullRequestId $PrId -Role reviewer)) { return }
     $wantChannel = $TeamsChannelEnabled -and ($TeamsChannelEvents -ccontains $NotificationEvent)
     $wantDirect = $TeamsDirectEnabled -and ($TeamsDirectEvents -ccontains $NotificationEvent)
     if (-not $wantChannel -and -not $wantDirect) { return }
@@ -5163,42 +5240,91 @@ function Send-ReviewerTeamsNotification {
         Write-Warning "Teams '$NotificationEvent' direct-author delivery skipped because ADO exposed no usable author UPN and no fallback recipient is configured."
     }
 
-    $dedupeBase = "$NotificationEvent|$PrId|$SourceCommit"
-    $channelDedupeKey = "$dedupeBase|channel"
-    $directDedupeKey = "$dedupeBase|direct|$($resolvedDirectRecipient.ToLowerInvariant())"
-    $notifState = Get-JsonState -Path $notificationsStatePath
-    # A pre-v0.3.4 record used one key for every destination. Preserve only the
-    # destinations it says actually succeeded. Even a legacy direct success
-    # does not suppress the author DM: that destination used a fixed operator
-    # UPN and did not notify the PR author.
-    $legacyChannelDelivered = $false
-    if ($notifState.ContainsKey($dedupeBase)) {
-        $legacyRecord = $notifState[$dedupeBase]
-        $legacyDestinations = [string[]]@(Get-ReviewerHashValue -Container $legacyRecord -Key 'destinations' -Default @())
-        $legacyChannelDelivered = ($legacyDestinations -ccontains 'channel')
-    }
-    $sendChannel = $wantChannel -and -not $legacyChannelDelivered -and -not $notifState.ContainsKey($channelDedupeKey)
-    $sendDirect = $wantDirect -and [bool]$resolvedDirectRecipient -and -not $notifState.ContainsKey($directDedupeKey)
-    if (-not $sendChannel -and -not $sendDirect) {
-        Write-Host "Teams '$NotificationEvent' already delivered to every available destination for this PR/commit; skipping." -ForegroundColor DarkGray
-        return
-    }
-
     $workIqSession = $null
-    $delivered = New-Object System.Collections.Generic.List[string]
+    $referenceSession = $null
     try {
+        $dedupeBase = "$NotificationEvent|$PrId|$SourceCommit"
+        $channelDedupeKey = "$dedupeBase|channel"
+        $directDedupeKey = "$dedupeBase|direct|$($resolvedDirectRecipient.ToLowerInvariant())"
+        $notifState = Get-JsonState -Path $notificationsStatePath
+        # A pre-v0.3.4 record used one key for every destination. Preserve only the
+        # destinations it says actually succeeded. Even a legacy direct success
+        # does not suppress the author DM: that destination used a fixed operator
+        # UPN and did not notify the PR author.
+        $legacyChannelDelivered = $false
+        if ($notifState.ContainsKey($dedupeBase)) {
+            $legacyRecord = $notifState[$dedupeBase]
+            $legacyDestinations = [string[]]@(Get-ReviewerHashValue -Container $legacyRecord -Key 'destinations' -Default @())
+            $legacyChannelDelivered = ($legacyDestinations -ccontains 'channel')
+        }
+        $threadedChannel = $wantChannel -and $TeamsThreadReuseEnabled -and $PrId -gt 0 -and ($TeamsPrReferenceEnabled -or $repositoryIdentity.verified -eq $true)
+        # Only the destination-bound durable ledger can dedupe threaded delivery.
+        $sendChannel = $wantChannel -and ($threadedChannel -or (-not $legacyChannelDelivered -and -not $notifState.ContainsKey($channelDedupeKey)))
+        $sendDirect = $wantDirect -and [bool]$resolvedDirectRecipient -and -not $notifState.ContainsKey($directDedupeKey)
+        if (-not $sendChannel -and -not $sendDirect) {
+            Write-Host "Teams '$NotificationEvent' already delivered to every available destination for this PR/commit; skipping." -ForegroundColor DarkGray
+            return
+        }
+
+        $delivered = New-Object System.Collections.Generic.List[string]
         $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "workiq" -TimeoutSeconds 60
         if ($sendChannel) {
             try {
-                Send-AgentTeamsChannelMessage -Session $workIqSession -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
-                    -Title $Title -Body $Body -Links $Links | Out-Null
-                [void]$delivered.Add("channel")
-                $notifState[$channelDedupeKey] = @{
-                    event = $NotificationEvent; prId = $PrId; destination = "channel"
-                    at = (Get-Date).ToUniversalTime().ToString("o")
+                $channelConfirmed = $true
+                if ($threadedChannel) {
+                    $referenceParameters = @{}
+                    if ($TeamsPrReferenceEnabled) {
+                        $ado = $script:ReviewerTeamsAdoSession
+                        if (-not $ado) {
+                            $referenceSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
+                                -Organization $Organization -Toolsets @('repos') -TimeoutSeconds 30 `
+                                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+                            $ado = $referenceSession
+                        }
+                        $referenceParameters.ReferenceContext = New-AgentTeamsPrReferenceContext -AdoSession $ado `
+                            -RepositoryIdentity $repositoryIdentity -Role reviewer
+                    }
+                    $result = Send-AgentTeamsThreadedChannelMessage -Session $workIqSession -DurableStateRoot $DurableStateRoot `
+                        -RepositoryIdentity $repositoryIdentity -Role reviewer -NotificationEvent $NotificationEvent `
+                        -PullRequestId $PrId -SourceCommit $SourceCommit -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
+                        -PullRequestUrl (Get-ReviewerPullRequestLink -PrId $PrId) `
+                        -Title $Title -Body $Body -Links $Links -OutputContext $script:ReviewerOutputContext @referenceParameters
+                    $channelConfirmed = $result.Delivered -or $result.Deduped
+                    if ([bool](Get-ReviewerHashValue -Container $result -Key Queued -Default $false)) {
+                        Write-Host "Teams '$NotificationEvent' queued for its shared PR thread; not yet delivered." -ForegroundColor DarkGray
+                    }
+                    elseif (-not $channelConfirmed) {
+                        Write-Warning "Teams '$NotificationEvent' channel delivery is $($result.Outcome) ($($result.Code)); review work is unaffected."
+                    }
+                }
+                else {
+                    Send-AgentTeamsChannelMessage -Session $workIqSession -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
+                        -Title $Title -Body $Body -Links $Links | Out-Null
+                    if ($TeamsThreadReuseEnabled -and $script:ReviewerOutputContext) {
+                        Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -PrId $PrId `
+                            -SourceCommit $SourceCommit -Data @{ outcome = 'fallback-delivered'; code = 'thread-scope-unavailable' } `
+                            -Message "Teams notification sent independently; no verified PR thread scope." | Out-Null
+                    }
+                }
+                if ($channelConfirmed) {
+                    [void]$delivered.Add("channel")
+                    $notifState[$channelDedupeKey] = @{
+                        event = $NotificationEvent; prId = $PrId; destination = "channel"
+                        at = (Get-Date).ToUniversalTime().ToString("o")
+                    }
                 }
             }
-            catch { Write-Warning "Teams '$NotificationEvent' channel delivery failed: $($_.Exception.Message)" }
+            catch {
+                if ($threadedChannel) {
+                    if ($script:ReviewerOutputContext) {
+                        Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -Level warning `
+                            -PrId $PrId -SourceCommit $SourceCommit -Data @{ outcome = 'unknown'; code = 'threaded-channel-error' } `
+                            -Message 'Teams threaded delivery is unconfirmed; review work is unaffected.' | Out-Null
+                    }
+                    Write-Warning "Teams '$NotificationEvent' threaded channel delivery failed; review work is unaffected."
+                }
+                else { Write-Warning "Teams '$NotificationEvent' channel delivery failed: $($_.Exception.Message)" }
+            }
         }
         if ($sendDirect) {
             try {
@@ -5215,14 +5341,34 @@ function Send-ReviewerTeamsNotification {
         }
         if ($delivered.Count -gt 0) {
             Set-JsonState -Path $notificationsStatePath -State $notifState
-            Write-Host "Teams '$NotificationEvent' delivered to: $($delivered.ToArray() -join ', ')." -ForegroundColor Green
+            $deliveryLabel = if ($threadedChannel) { 'delivery confirmed for' } else { 'delivered to' }
+            Write-Host "Teams '$NotificationEvent' $deliveryLabel`: $($delivered.ToArray() -join ', ')." -ForegroundColor Green
         }
     }
     catch {
+        if ($TeamsThreadReuseEnabled -and $script:ReviewerOutputContext) {
+            Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -Level warning `
+                -PrId $PrId -SourceCommit $SourceCommit -Data @{ outcome = 'wrapper-warning'; code = 'notification-wrapper-error' } `
+                -Message 'Teams notification setup or bookkeeping failed; earlier confirmed sends and review work are unchanged.' | Out-Null
+        }
         Write-Warning "Teams '$NotificationEvent' notification failed (review work is unaffected): $($_.Exception.Message)"
     }
     finally {
-        if ($workIqSession) { Close-AgentMcpSession -Session $workIqSession }
+        if ($referenceSession) {
+            try { Close-AgentMcpSession -Session $referenceSession }
+            catch { Write-Warning 'Teams PR reference session cleanup failed; review work is unaffected.' }
+        }
+        if ($workIqSession) {
+            try { Close-AgentMcpSession -Session $workIqSession }
+            catch {
+                if ($TeamsThreadReuseEnabled -and $script:ReviewerOutputContext) {
+                    Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -Level warning `
+                        -PrId $PrId -SourceCommit $SourceCommit -Data @{ outcome = 'wrapper-warning'; code = 'session-cleanup-error' } `
+                        -Message 'Teams notification session cleanup failed; confirmed sends and review work are unchanged.' | Out-Null
+                }
+                Write-Warning "Teams notification session cleanup failed; review work is unaffected."
+            }
+        }
     }
 }
 
@@ -6174,6 +6320,9 @@ function Invoke-ReviewerCycle {
             -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
             -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
 
+        $script:ReviewerTeamsAdoSession = $session
+        Invoke-ReviewerTeamsMaintenance -AdoSession $session -AgencyPath $AgencyPath
+
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
         # This snapshot is scheduling input only. The selected PR is re-read
         # under the exact work lease and repository/role lock before acting.
@@ -6490,6 +6639,7 @@ function Invoke-ReviewerCycle {
         return $result
     }
     finally {
+        $script:ReviewerTeamsAdoSession = $null
         if ($session) { Close-AgentMcpSession -Session $session }
     }
 }
@@ -6577,12 +6727,19 @@ try {
                 -RepositoryIdentity $repositoryIdentity -RepositoryRoot ([IO.Path]::GetFullPath($RepoPath)) `
                 -DurableContext $script:ReviewerDurableContext `
                 -LeaseRoot $LeaseRoot -Role reviewer -EventLogPath $script:ReviewerOutputContext.LogPath `
+                -BoundWrapperPermissions @{
+                    EnableTeamsNotifications = [bool]$EnableTeamsNotifications
+                    EnableTeamsPrReferenceWrites = $false
+                    PreviewOnly = [bool]$PreviewOnly
+                } `
                 -BoundCapabilities @{
                     EnableFindingComments = [bool]$EnableFindingComments
                     EnableThreadReplies = [bool]$EnableThreadReplies
                     EnableSummaryComment = [bool]$EnableSummaryComment
                     EnableApprovalVote = [bool]$EnableApprovalVote
                 })
+            # Startup returns only after the broker's authenticated ready/proceed exchange.
+            $script:ReviewerTeamsManualAuthorized = $true
         }
     }
     finally {
@@ -6601,18 +6758,20 @@ try {
         Write-Host "Writes: findingComments=$([bool]$EnableFindingComments) threadReplies=$([bool]$EnableThreadReplies) summary=$([bool]$EnableSummaryComment) vote=$([bool]$EnableApprovalVote) - anything posted will appear under '$OperatorAlias'." -ForegroundColor Yellow
     }
     else {
-        Write-Host "Writes: NONE. This is a preview run: candidate findings and thread assessments are printed and saved to $previewDir, and nothing is posted." -ForegroundColor Green
+        Write-Host "PR writes: NONE. Candidate findings and thread assessments are saved to $previewDir. Teams notifications remain independently opt-in ($([bool]$EnableTeamsNotifications))." -ForegroundColor Green
     }
     $writeNames = New-Object System.Collections.Generic.List[string]
     if ($EnableFindingComments) { [void]$writeNames.Add('comments') }
     if ($EnableThreadReplies) { [void]$writeNames.Add('replies') }
     if ($EnableSummaryComment) { [void]$writeNames.Add('summary') }
+    if ($EnableTeamsNotifications) { [void]$writeNames.Add('Teams notifications') }
     if ($writeNames.Count -eq 0) { [void]$writeNames.Add('preview only') }
     Send-ReviewerEvent agent.started -Data @{
         organization = $Organization; project = $ExpectedProject; repository = $RepositoryName
         target = $TargetRefName; operator = $OperatorAlias; writes = ($writeNames -join ', ')
         vote = $(if ($EnableApprovalVote) { 'on' } else { 'off' }); outputMode = $script:ReviewerOutputContext.Mode
         diagnosticLog = $eventLogPath
+        teamsNotifications = [bool]$EnableTeamsNotifications; previewOnly = [bool]$PreviewOnly
     } -Message "reviewer: operator=$OperatorAlias org=$Organization project=$ExpectedProject repo=$RepositoryName target=$TargetRefName"
 
     if ($PromotePreview) {

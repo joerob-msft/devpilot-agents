@@ -27,6 +27,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot 'AgentOutput.ps1')
+. (Join-Path $PSScriptRoot 'TeamsThreading.ps1')
+. (Join-Path $PSScriptRoot 'TeamsPrReference.ps1')
 
 # ---------------------------------------------------------------------------
 # Code-defined Copilot CLI model allowlist (NOT config-supplied - a forked or
@@ -2655,7 +2657,7 @@ function Assert-AgentBrokerProcessAnchor {
         this check itself relies on -- that class of attacker is explicitly out of scope.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Manifest)
+    param([Parameter(Mandatory)][hashtable]$Manifest, [switch]$PassThru)
 
     $role = [string]$Manifest['role']
     if ($role -cnotin @('reviewer', 'review-handler')) {
@@ -2759,6 +2761,75 @@ function Assert-AgentBrokerProcessAnchor {
     $liveDescriptorDigest = Get-AgentCanonicalDigest -InputObject $descriptor
     if ($liveDescriptorDigest -cne $claimedDescriptorDigest) {
         throw '[broker-attestation-invalid] Dispatch manifest broker descriptor digest does not match the live trusted descriptor.'
+    }
+    if ($PassThru) { return $descriptor }
+}
+
+function Assert-AgentManualWrapperPermissions {
+    param(
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][hashtable]$BoundWrapperPermissions,
+        [Parameter(Mandatory)][hashtable]$Descriptor
+    )
+    foreach ($key in $BoundWrapperPermissions.Keys) {
+        if ($key -cnotin @('EnableTeamsNotifications', 'EnableTeamsPrReferenceWrites', 'PreviewOnly') -or
+            $BoundWrapperPermissions[$key] -isnot [bool]) {
+            throw '[launch-failed] Wrapper notification permissions are malformed.'
+        }
+    }
+    $notifications = [bool]$BoundWrapperPermissions['EnableTeamsNotifications']
+    $writes = [bool]$BoundWrapperPermissions['EnableTeamsPrReferenceWrites']
+    $preview = [bool]$BoundWrapperPermissions['PreviewOnly']
+    $roleDescriptor = $Descriptor.roles[$Role]
+    $denies = @(Get-AgentProviderValue $roleDescriptor absoluteDenies | Where-Object { $_ })
+    if (($preview -or $denies.Count -gt 0) -and ($notifications -or $writes)) {
+        throw '[launch-failed] Preview forbids wrapper notification permissions.'
+    }
+    if ($writes -and ($Role -cne 'review-handler' -or -not $notifications)) {
+        throw '[launch-failed] PR-reference writes require handler notification authority.'
+    }
+    if ($preview) {
+        $required = @((Get-AgentHarnessCapabilityDescriptor -Role $Role -PreviewOnly).absoluteDenies)
+        if (@($required | Where-Object { $denies -cnotcontains $_ }).Count -gt 0) {
+            throw '[launch-failed] Preview is not backed by the complete launcher ceiling.'
+        }
+    }
+    if (-not $notifications -and -not $writes) { return }
+
+    # The descriptor is returned by the live broker-process anchor, never by a
+    # manifest field or manual request. Parse argv so a value resembling a switch is not authority.
+    $control = Get-AgentProviderValue $Descriptor launcherControl
+    $sources = @(Get-AgentProviderValue $control automaticWorkers | Where-Object {
+        $_ -is [Collections.IDictionary] -and (Get-AgentProviderValue $_ role) -ceq $Role
+    })
+    if ($sources.Count -ne 1) { throw '[launch-failed] No unique owned notification permission source exists.' }
+    $argv = @($sources[0].arguments)
+    if ($argv.Count -lt 5 -or $argv.Count -gt 64 -or
+        @($argv | Where-Object { $_ -isnot [string] }).Count -gt 0 -or
+        $argv[0] -cne '-NoLogo' -or $argv[1] -cne '-NoProfile' -or $argv[2] -cne '-NonInteractive' -or
+        $argv[3] -cne '-File' -or $argv[4] -cne $roleDescriptor.scriptPath) {
+        throw '[launch-failed] The owned wrapper argument source is malformed.'
+    }
+    $options = @{}
+    $known = Get-AgentHarnessCapabilityDescriptor -Role $Role
+    for ($i = 5; $i -lt $argv.Count; $i++) {
+        $option = $argv[$i]
+        if ($options.ContainsKey($option)) { throw '[launch-failed] Repeated owned wrapper option.' }
+        if ($option -cin @('-ConfigFile', '-StateDir', '-DurableStateRoot', '-LeaseRoot', '-AgentName',
+            '-OperatorAlias', '-OutputMode', '-IntervalSeconds', '-PullRequestId', '-Model')) {
+            if (++$i -ge $argv.Count) { throw '[launch-failed] Missing owned wrapper option value.' }
+            $options[$option] = $argv[$i]
+        }
+        elseif ($option -cin @('-Once', '-IncludeOwnPullRequests', '-EnableTeamsNotifications', '-EnableTeamsPrReferenceWrites', '-PreviewOnly') -or
+            ($option.StartsWith('-') -and $option.Substring(1) -cin @($known.allowedManualCapabilities))) {
+            $options[$option] = $true
+        }
+        else { throw '[launch-failed] Unknown owned wrapper option.' }
+    }
+    if ($options.ContainsKey('-PreviewOnly') -or
+        ($notifications -and $options['-EnableTeamsNotifications'] -isnot [bool]) -or
+        ($writes -and $options['-EnableTeamsPrReferenceWrites'] -isnot [bool])) {
+        throw '[launch-failed] Manual wrapper permissions exceed the owned launcher source.'
     }
 }
 
@@ -3418,10 +3489,15 @@ function Enter-AgentManualDispatchStartup {
         [Parameter(Mandatory)][string]$LeaseRoot,
         [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
         [Parameter(Mandatory)][string]$EventLogPath,
-        [Parameter(Mandatory)][hashtable]$BoundCapabilities
+        [Parameter(Mandatory)][hashtable]$BoundCapabilities,
+        [hashtable]$BoundWrapperPermissions = @{}
     )
     $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 |
         ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
+    if ($BoundWrapperPermissions.Count -gt 0) {
+        $trustedDescriptor = Assert-AgentBrokerProcessAnchor -Manifest $manifest -PassThru
+        Assert-AgentManualWrapperPermissions -Role $Role -BoundWrapperPermissions $BoundWrapperPermissions -Descriptor $trustedDescriptor
+    }
     $policyIdentity = if ($manifest.policy -is [Collections.IDictionary] -and
         $manifest.policy.Contains('repositoryIdentity')) {
         $manifest.policy['repositoryIdentity']
@@ -5817,9 +5893,9 @@ function Invoke-AgentWorkIqTool {
         array and puts the payload in structuredContent, in one of two shapes -
         `fetch` returns a per-entity results[] array, `create_entity` returns a
         single {data, statusCode} envelope. Both are normalized to one entry
-        here. A non-2xx status is a failure even though the MCP call itself
-        succeeded, and the server's own error text is surfaced: discarding it
-        makes a wrong-argument-shape bug indistinguishable from an auth failure.
+        here. A non-2xx status or an isError flag is a failure. Validated HTTP
+        metadata remains available even when content is empty; provider error
+        prose is never included in the exception surface.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Session,
@@ -5849,17 +5925,10 @@ function Invoke-AgentWorkIqTool {
     $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{ name = $Name; arguments = $Arguments } -DeadlineUtc $DeadlineUtc
     if ($toolResult -isnot [System.Management.Automation.PSCustomObject]) { throw "WorkIQ tool '$Name' returned an unexpected result shape." }
 
-    if ($toolResult.PSObject.Properties["isError"] -and $toolResult.isError -eq $true) {
-        $detail = ""
-        $errorContent = $toolResult.PSObject.Properties["content"]
-        if ($errorContent) {
-            $errorText = @(@($errorContent.Value) | Where-Object { $_.PSObject.Properties["text"] })[0]
-            if ($errorText) {
-                $detail = [string]$errorText.text
-                if ($detail.Length -gt 300) { $detail = $detail.Substring(0, 300) + "..." }
-            }
-        }
-        throw "WorkIQ tool '$Name' reported failure.$(if ($detail) { " Server said: $detail" })"
+    $providerError = $false
+    if ($toolResult.PSObject.Properties['isError']) {
+        if ($toolResult.isError -isnot [bool]) { throw "WorkIQ tool '$Name' returned an invalid error flag." }
+        $providerError = $toolResult.isError
     }
 
     $structuredProperty = $toolResult.PSObject.Properties["structuredContent"]
@@ -5885,8 +5954,20 @@ function Invoke-AgentWorkIqTool {
         throw "WorkIQ tool '$Name' returned no valid statusCode."
     }
     $statusCode = [int]$statusProperty.Value
-    if ($statusCode -lt 200 -or $statusCode -gt 299) {
-        throw "WorkIQ tool '$Name' returned HTTP $statusCode for the requested entity."
+    if ($providerError -or $statusCode -lt 200 -or $statusCode -gt 299) {
+        $failure = [InvalidOperationException]::new("WorkIQ tool '$Name' returned HTTP $statusCode for the requested entity.")
+        $failure.Data['WorkIqStatusCode'] = $statusCode
+        # This is response metadata, not a request-header capability. WorkIQ
+        # may omit it; callers must not infer a retry delay from error prose.
+        $headersProperty = $entry.PSObject.Properties['headers']
+        if ($headersProperty -and $headersProperty.Value -is [System.Management.Automation.PSCustomObject]) {
+            $retryProperty = $headersProperty.Value.PSObject.Properties['Retry-After']
+            if ($retryProperty -and $retryProperty.Value -is [string] -and
+                $retryProperty.Value.Length -le 128 -and $retryProperty.Value -notmatch '[\r\n]') {
+                $failure.Data['WorkIqRetryAfter'] = $retryProperty.Value
+            }
+        }
+        throw $failure
     }
     $dataProperty = $entry.PSObject.Properties["data"]
     if (-not $dataProperty) { return $null }
@@ -6933,6 +7014,11 @@ Export-ModuleMember -Function @(
     "Get-AgentCliJsonOutcome",
     "Invoke-AgentWorkIqTool",
     "Send-AgentTeamsChannelMessage",
+    "Send-AgentTeamsThreadedChannelMessage",
+    "New-AgentTeamsPrReferenceContext",
+    "Initialize-AgentTeamsPrThread",
+    "Invoke-AgentTeamsNotificationOutbox",
+    "Test-AgentTeamsPrReferenceComment",
     "Send-AgentTeamsDirectMessage",
     "Resolve-AgentTeamsUserChatId",
     "New-AgentTeamsMessageHtml",

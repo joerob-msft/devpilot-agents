@@ -289,9 +289,9 @@ be used:
 `-Golden` is intentionally explicit because it grants write authority. It
 enables Reviewer finding comments, thread replies, and summaries, plus Review
 Handler replies, buddy requeues, code changes, local validation, session
-resume, and push. It does **not** enable Teams notifications, Reviewer approval
-votes, or Review Handler auto-complete. Those remain behind their separate
-existing gates.
+resume, and push. It does **not** enable Teams notifications, shared PR-reference
+writes, Reviewer approval votes, or Review Handler auto-complete. Those remain
+behind their separate gates.
 
 `-PreviewOnly` is not an omission-based convention. It is a terminal,
 non-delegable ceiling that disables automatic and manual PR mutations,
@@ -384,7 +384,9 @@ votes and review-handler auto-complete remain default-denied and require the
 existing explicit, policy-authorized manual widening flow. Teams delivery is
 separate and requires the
 appropriate `-EnableReviewerTeamsNotifications` or
-`-EnableReviewHandlerTeamsNotifications` switch. Unless `-StateDir` is
+`-EnableReviewHandlerTeamsNotifications` switch. Shared thread registration also
+requires `-EnableReviewHandlerTeamsPrReferenceWrites` and the configured
+PR-reference mode described below. Unless `-StateDir` is
 supplied, the agents share a generated session root. Golden mode also reads a
 bounded set of trusted prior watch roots so one dashboard can group current
 activity and cross-launch PR history.
@@ -540,6 +542,80 @@ posted review is sent directly to the reviewed PR's author using the UPN in
 ADO's `createdBy` identity. The configured `recipientUpn` and
 `-TeamsRecipientUpn` are fallback values only when ADO does not expose a usable
 author UPN. Channel and direct delivery are deduplicated independently.
+
+**Local Teams channel threads (default):** the optional
+`teamsNotifications.channel.threadReuseEnabled` setting defaults to `true`.
+The first eligible notification creates a root; later notifications reuse the
+protected local receipt for that repository, PR, and destination. Both roles on
+one installation share it through `-DurableStateRoot`. Explicit `false` sends
+independent channel messages instead.
+
+**Shared PR references (Azure DevOps, opt-in):** set
+`teamsNotifications.channel.prReferenceEnabled=true` in both role configs, with
+threading enabled and identical `teamId`/`channelId`. This additional setting
+defaults to `false`; enabling it switches routing from local-only roots to the
+PR author's shared reference. Different operators keep **separate protected
+state directories**, not a shared writable filesystem.
+
+The author's Review Handler creates or registers the root and publishes its
+reference in one **closed PR coordination thread**: a pending claim followed
+by the ready Teams link. It does this before requiring actionable feedback.
+Registration needs the additional wrapper-owned write permission:
+
+```powershell
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden `
+    -EnableReviewerTeamsNotifications -EnableReviewHandlerTeamsNotifications `
+    -EnableReviewHandlerTeamsPrReferenceWrites
+```
+
+Direct Review Handler invocations use `-EnableTeamsPrReferenceWrites` alongside
+`-EnableTeamsNotifications`. This permission does not grant new model tools.
+The wrapper checks the authenticated identity against the current PR author;
+an operator alias or a comment's display name is not ownership evidence.
+Other operators read the author-published, scope-bound reference and fetch the
+**known Teams root directly**. No channel-history scan, continuation token, or
+body-content filter is required. Coordination comments are routing metadata,
+not review feedback, model instructions, or inbound Teams steering.
+
+Both modes still require channel enablement, event subscriptions, and the
+notification capability switch. `PreviewOnly` cannot register, publish, drain,
+or enqueue messages for a later operational run. Direct chats remain independent.
+
+Thread IDs and per-role/event/commit receipts live in a versioned local
+subtree of the durable state root, outside per-Watch runtime state. Existing
+notification records are not backfilled. State is bound to the current
+destination, verified repository identity, and PR, and an exclusive file
+lock coordinates local processes. A shared PR reference coordinates routing,
+not cross-user event deduplication: another operator's review remains its own
+notification. Historical conversations are not moved or deleted.
+
+In shared mode, an offline author handler or unavailable reference does not
+make reviewers create competing roots. Definitely-unsent notifications enter a
+bounded protected local outbox. Each role drains it on later operational cycles,
+even when no new review work is selected. Current subscriptions and PR/commit
+state are checked again; stale notifications are not replayed as current advice.
+An ambiguous POST is quarantined, not treated as retryable queued work.
+
+**Concurrency limit:** run one author-handler bootstrapper for a PR. A PR comment
+is **not an atomic distributed lock**, including when two machines use the same
+author identity. Pending claims precede root creation, but conflicting or
+uncertain claims fail closed rather than authorizing takeover. A confirmed local
+root can be reconciled with its PR reference; a lost Teams POST acknowledgement
+cannot safely be recovered by blindly creating another root. Strict global
+exactly-once creation is not claimed.
+
+The `notification.delivery` audit event reports delivery outcomes without changing
+the PR work result. Local-only threading retains its audited independent fallback
+after a definite stale-root rejection. Shared-reference mode does **not** create
+an independent fallback root when the registered root or reference is unavailable.
+Invalid state, contention, or an ambiguous send must not create another root:
+an unconfirmed outcome stays unconfirmed rather than being blindly retried.
+Do not delete pending PR references, thread state, outbox records, or lock files
+to force a retry after a timeout;
+first inspect the destination for the possibly delivered message.
+Explicit Graph throttles are retried only when the transport exposes a valid
+`Retry-After`, up to three attempts within the notification deadline; a
+required delay is never shortened to fit that budget.
 
 Running the agent twice, once to preview and once to post, does **not** give
 you any of this: the second run is an independent model run with a fresh nonce
