@@ -1302,6 +1302,30 @@ function Get-ManualTurnKey {
     return "$RepositoryKey|$Role"
 }
 
+function Get-ManualWrapperNotificationArguments {
+    param(
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][hashtable]$RoleDescriptor
+    )
+    # These are wrapper permissions, not request-editable or delegable model capabilities.
+    if (@($RoleDescriptor.absoluteDenies).Count -gt 0) { return '-PreviewOnly' }
+    if (-not $descriptor.ContainsKey('launcherControl')) { return }
+    $sources = @($descriptor.launcherControl.automaticWorkers | Where-Object { $_.role -ceq $Role })
+    if ($sources.Count -ne 1) { return }
+    $ownedArguments = @($sources[0].arguments)
+    $switches = @()
+    for ($i = 0; $i -lt $ownedArguments.Count; $i++) {
+        if ($ownedArguments[$i] -cin @('-File', '-ConfigFile', '-StateDir', '-DurableStateRoot', '-LeaseRoot',
+            '-AgentName', '-OperatorAlias', '-OutputMode', '-IntervalSeconds', '-PullRequestId', '-Model')) { $i++; continue }
+        $switches += $ownedArguments[$i]
+    }
+    if ($switches -ccontains '-PreviewOnly' -or $switches -cnotcontains '-EnableTeamsNotifications') { return }
+    '-EnableTeamsNotifications'
+    if ($Role -ceq 'review-handler' -and $switches -ccontains '-EnableTeamsPrReferenceWrites') {
+        '-EnableTeamsPrReferenceWrites'
+    }
+}
+
 function Initialize-BrokerLauncherControl {
     if (-not $descriptor.ContainsKey('launcherControl')) { return }
     $control = $descriptor.launcherControl
@@ -1345,15 +1369,28 @@ function Initialize-BrokerLauncherControl {
                 if ($i -ge $argv.Count) { throw '[launcher-control-invalid] Missing automatic option value.' }
                 $values[$option] = $argv[$i]
             }
-            elseif ($option -cin @('-Once', '-IncludeOwnPullRequests', '-EnableTeamsNotifications') -or
+            elseif ($option -cin @('-Once', '-IncludeOwnPullRequests', '-EnableTeamsNotifications', '-EnableTeamsPrReferenceWrites', '-PreviewOnly') -or
                 ($option.StartsWith('-') -and $option.Substring(1) -cin $capabilities)) {
                 if ($option.Substring(1) -cin @($role.absoluteDenies) -or
-                    ($option -ceq '-EnableTeamsNotifications' -and @($role.absoluteDenies).Count -gt 0)) {
+                    ($option -cin @('-EnableTeamsNotifications', '-EnableTeamsPrReferenceWrites') -and @($role.absoluteDenies).Count -gt 0) -or
+                    ($option -ceq '-EnableTeamsPrReferenceWrites' -and $spec.role -cne 'review-handler')) {
                     throw '[launcher-control-invalid] Automatic option exceeds the launch ceiling.'
                 }
                 $values[$option] = $true
             }
             else { throw '[launcher-control-invalid] Unsupported automatic option.' }
+        }
+        if (($values.ContainsKey('-EnableTeamsPrReferenceWrites') -and -not $values.ContainsKey('-EnableTeamsNotifications')) -or
+            ($values.ContainsKey('-PreviewOnly') -and @($values.Keys | Where-Object {
+                $_ -cin @('-EnableTeamsNotifications', '-EnableTeamsPrReferenceWrites') -or $_.Substring(1) -cin $capabilities
+            }).Count -gt 0)) {
+            throw '[launcher-control-invalid] Notification permission exceeds the launch ceiling.'
+        }
+        if ($values.ContainsKey('-PreviewOnly')) {
+            $previewDenies = @((Get-AgentHarnessCapabilityDescriptor -Role $spec.role -PreviewOnly).absoluteDenies)
+            if (@($previewDenies | Where-Object { @($role.absoluteDenies) -cnotcontains $_ }).Count -gt 0) {
+                throw '[launcher-control-invalid] Preview requires the complete manual and automatic launch ceiling.'
+            }
         }
         foreach ($binding in @(
             @('-ConfigFile', $role.configFile), @('-StateDir', (Join-Path $stateRoot $spec.role)),
@@ -2266,6 +2303,7 @@ function Invoke-DispatchCore {
     foreach ($capability in @($draft.Policy.capabilities)) {
         $args += "-$capability"
     }
+    $args += @(Get-ManualWrapperNotificationArguments -Role $draft.Role -RoleDescriptor $draft.RoleDescriptor)
     $diagnostics = Join-Path $draft.Snapshot.Root 'diagnostics'
     # issue #105 PR5 requirement 7: everything from child creation through the pipe write/flush is
     # its own try/catch so a failure ANYWHERE in this sequence (e.g. the child executable fails to

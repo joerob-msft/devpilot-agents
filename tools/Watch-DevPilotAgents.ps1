@@ -99,6 +99,9 @@ param(
     [switch]$EnableReviewHandlerTeamsNotifications,
 
     [Parameter(ParameterSetName = 'Launch')]
+    [switch]$EnableReviewHandlerTeamsPrReferenceWrites,
+
+    [Parameter(ParameterSetName = 'Launch')]
     [switch]$EnableReviewHandlerCodeUpdates,
 
     [Parameter(ParameterSetName = 'Launch')]
@@ -220,6 +223,7 @@ function Resolve-WatchLaunchPolicy {
         [bool]$Once,
         [bool]$EnableReviewerTeamsNotifications,
         [bool]$EnableReviewHandlerTeamsNotifications,
+        [bool]$EnableReviewHandlerTeamsPrReferenceWrites,
         [bool]$EnableReviewHandlerCodeUpdates,
         [bool]$EnableManualReviewer,
         [bool]$EnableManualReviewHandler,
@@ -274,13 +278,16 @@ function Resolve-WatchLaunchPolicy {
     if ($EnableReviewHandlerTeamsNotifications -and -not $launchReviewHandler) {
         [void]$failures.Add('-EnableReviewHandlerTeamsNotifications requires -Agent ReviewHandler or -Agent Both.')
     }
+    if ($EnableReviewHandlerTeamsPrReferenceWrites -and (-not $launchReviewHandler -or -not $EnableReviewHandlerTeamsNotifications)) {
+        [void]$failures.Add('-EnableReviewHandlerTeamsPrReferenceWrites requires the review-handler and -EnableReviewHandlerTeamsNotifications.')
+    }
     if ((& $explicit 'EnableReviewHandlerCodeUpdates') -and -not $launchReviewHandler) {
         [void]$failures.Add('-EnableReviewHandlerCodeUpdates requires -Agent ReviewHandler or -Agent Both.')
     }
     # Only EXPLICIT side-effect switches are a conflict. Golden's own implied writes are not: they
     # are defaults, and -PreviewOnly is documented to override them.
     $explicitSideEffects = @('EnableReviewerTeamsNotifications', 'EnableReviewHandlerTeamsNotifications',
-        'EnableReviewHandlerCodeUpdates') | Where-Object { & $explicit $_ }
+        'EnableReviewHandlerTeamsPrReferenceWrites', 'EnableReviewHandlerCodeUpdates') | Where-Object { & $explicit $_ }
     if (-not $operational -and @($explicitSideEffects).Count -gt 0) {
         [void]$failures.Add('Notifications and review-handler code updates require -Operational. Preview runs never enable side effects.')
     }
@@ -341,6 +348,7 @@ function Resolve-WatchLaunchPolicy {
         ReviewHandlerCodeUpdates = $reviewHandlerCodeUpdates
         ReviewerTeamsNotifications = $operational -and $EnableReviewerTeamsNotifications
         ReviewHandlerTeamsNotifications = $operational -and $EnableReviewHandlerTeamsNotifications
+        ReviewHandlerTeamsPrReferenceWrites = $operational -and $EnableReviewHandlerTeamsNotifications -and $EnableReviewHandlerTeamsPrReferenceWrites
         Reviewer = [ordered]@{
             Role = 'reviewer'
             AutomaticCapabilities = @($reviewerAutomatic)
@@ -482,6 +490,7 @@ $launch = Resolve-WatchLaunchPolicy -Agent $Agent -ExplicitParameters @($PSBound
     -Golden:$Golden -PreviewOnly:$PreviewOnly -Operational:$Operational -Continuous:$Continuous -Once:$Once `
     -EnableReviewerTeamsNotifications:$EnableReviewerTeamsNotifications `
     -EnableReviewHandlerTeamsNotifications:$EnableReviewHandlerTeamsNotifications `
+    -EnableReviewHandlerTeamsPrReferenceWrites:$EnableReviewHandlerTeamsPrReferenceWrites `
     -EnableReviewHandlerCodeUpdates:$EnableReviewHandlerCodeUpdates `
     -EnableManualReviewer:$EnableManualReviewer -EnableManualReviewHandler:$EnableManualReviewHandler `
     -EnableManualReviewerWrites:$EnableManualReviewerWrites `
@@ -683,6 +692,9 @@ foreach ($role in @($launch.Reviewer, $launch.ReviewHandler)) {
 }
 if ($launch.ReviewerTeamsNotifications) { [void]$enabledWrites.Add('reviewer automatic: Teams notifications') }
 if ($launch.ReviewHandlerTeamsNotifications) { [void]$enabledWrites.Add('review-handler automatic: Teams notifications') }
+if ($launch.ReviewHandlerTeamsPrReferenceWrites) {
+    [void]$enabledWrites.Add('review-handler wrapper: Teams PR coordination comments (also inherited by owned manual turns)')
+}
 $defaultDenials = [Collections.Generic.List[string]]::new()
 foreach ($role in @($launch.Reviewer, $launch.ReviewHandler)) {
     foreach ($capability in @($role.MandatoryDenies)) {
@@ -831,6 +843,7 @@ if ($launchReviewer) {
         IncludeOwn = [bool]$IncludeOwnPullRequests
         Capabilities = @($launch.Reviewer.AutomaticCapabilities)
         TeamsNotifications = $launch.ReviewerTeamsNotifications
+        TeamsPrReferenceWrites = $false
     })
 }
 if ($launchReviewHandler) {
@@ -845,6 +858,7 @@ if ($launchReviewHandler) {
         IncludeOwn = $false
         Capabilities = @($launch.ReviewHandler.AutomaticCapabilities)
         TeamsNotifications = $launch.ReviewHandlerTeamsNotifications
+        TeamsPrReferenceWrites = $launch.ReviewHandlerTeamsPrReferenceWrites
     })
 }
 
@@ -882,6 +896,8 @@ try {
         if ($spec.TeamsNotifications) {
             $childArguments += '-EnableTeamsNotifications'
         }
+        if ($spec.TeamsPrReferenceWrites) { $childArguments += '-EnableTeamsPrReferenceWrites' }
+        if ($launch.PreviewOnly) { $childArguments += '-PreviewOnly' }
 
         if ($launch.Golden) {
             # The trusted dashboard broker is the sole process/containment owner for Golden.
@@ -955,6 +971,7 @@ if ($launch.LaunchMode -eq 'operational') {
     Write-Information 'OPERATIONAL: this launch authorizes pull-request mutations. See the launch plan above for the exact automatic and manual capabilities.' -InformationAction Continue
     Write-Information "Review-handler code updates: $([bool]$launch.ReviewHandlerCodeUpdates) (code changes, local validation, session resume, and push)." -InformationAction Continue
     Write-Information "Teams notifications: reviewer=$([bool]$launch.ReviewerTeamsNotifications) review-handler=$([bool]$launch.ReviewHandlerTeamsNotifications)." -InformationAction Continue
+    Write-Information "Wrapper-owned Teams PR reference writes: review-handler=$([bool]$launch.ReviewHandlerTeamsPrReferenceWrites)." -InformationAction Continue
     Write-Warning 'Closing the dashboard immediately stops owned agent process trees. Quit while agents are waiting when possible to avoid interrupting an in-flight operation.'
 }
 else {

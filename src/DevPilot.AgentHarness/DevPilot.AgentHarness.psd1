@@ -77,6 +77,8 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Get-AgentLaunchFailureReason', 'Remove-StaleAgentAttempts', 
                'Get-AgentCliJsonOutcome', 'Invoke-AgentWorkIqTool', 
                'Send-AgentTeamsChannelMessage', 'Send-AgentTeamsThreadedChannelMessage', 'Send-AgentTeamsDirectMessage',
+               'New-AgentTeamsPrReferenceContext', 'Initialize-AgentTeamsPrThread',
+               'Invoke-AgentTeamsNotificationOutbox', 'Test-AgentTeamsPrReferenceComment',
                'Resolve-AgentTeamsUserChatId', 'New-AgentTeamsMessageHtml', 
                'Get-AgentRequiredProperty', 'Get-AgentDefaultModelSentinel', 
                'Assert-AgentSupportedModel', 'Test-ParserValidity', 

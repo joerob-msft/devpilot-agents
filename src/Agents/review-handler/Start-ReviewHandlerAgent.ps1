@@ -51,6 +51,13 @@
     safe and otherwise falls back to Compact. Compact emits concise summaries,
     Detailed retains individual diagnostics, and Json emits JSON Lines events.
 
+.PARAMETER EnableTeamsPrReferenceWrites
+    Allows only wrapper-owned Teams coordination comments on authenticated own
+    PRs. Requires enabled shared channel notifications. Never grants model tools.
+
+.PARAMETER PreviewOnly
+    Forbids notifications, PR reference registration, and mutating capabilities.
+
 .EXAMPLE
     .\Start-ReviewHandlerAgent.ps1 -DryRun
     Validate the agent end-to-end (all self-checks) without any side effects.
@@ -125,6 +132,8 @@ param(
     [switch]$EnableThreadReplies,
     [switch]$EnableBuddyRequeue,
     [switch]$EnableTeamsNotifications,
+    [switch]$EnableTeamsPrReferenceWrites,
+    [switch]$PreviewOnly,
 
     # Authoritative over config.teamsNotifications.directAuthor.recipientUpn,
     # for the same reason -OperatorAlias overrides its config counterpart: a
@@ -187,6 +196,8 @@ $script:HandlerUtf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $script:HandlerUtf8
 $OutputEncoding = $script:HandlerUtf8
 $script:HandlerOutputContext = $null
+$script:HandlerTeamsAdoSession = $null
+$script:HandlerTeamsManualAuthorized = $false
 $script:HandlerDurableContext = $null
 $script:HandlerLeaseRoot = $null
 if ($ForceAnalysis -and $PullRequestId -le 0) {
@@ -378,7 +389,8 @@ function Get-HandlerThreadClassification {
         $unique = [string](Get-HandlerHashValue -Container $c -Key 'authorUniqueName' -Default '')
         $content = [string](Get-HandlerHashValue -Container $c -Key 'content' -Default '')
         $idText = "$display`n$unique"
-        $isSystem = Test-HandlerContainsAny -Text $idText -Needles $SystemSubstrings
+        $isSystem = (Test-AgentTeamsPrReferenceComment -CommentText $content) -or
+            (Test-HandlerContainsAny -Text $idText -Needles $SystemSubstrings)
         $isBot = (-not $isSystem) -and (Test-HandlerContainsAny -Text $idText -Needles $BotSubstrings)
         $isOperator = (-not $isSystem) -and (-not $isBot) -and (Test-HandlerCommentIsOperator -Comment $c -OperatorAlias $OperatorAlias)
         $isAgentFinding = $isOperator -and (Test-HandlerAgentSignature -Content $content -Markers $AgentSignatureMarkers)
@@ -483,6 +495,10 @@ function Get-HandlerMaxThreadDate {
     param([object[]]$Threads)
     $max = ""
     foreach ($t in @($Threads)) {
+        $comments = @(Get-HandlerHashValue -Container $t -Key comments -Default @())
+        if ($comments.Count -gt 0 -and @($comments | Where-Object {
+            -not (Test-AgentTeamsPrReferenceComment -CommentText ([string](Get-HandlerHashValue -Container $_ -Key content -Default '')))
+        }).Count -eq 0) { continue }
         $d = [string](Get-HandlerHashValue -Container $t -Key 'lastUpdatedDate' -Default '')
         if ($d -and ($d -gt $max)) { $max = $d }
     }
@@ -802,6 +818,12 @@ $TeamsThreadReuseEnabled = if ($teamsChannelCfg.PSObject.Properties['threadReuse
     }
     Get-AgentConfigBool -Object $teamsChannelCfg -Name "threadReuseEnabled" -Where "config.teamsNotifications.channel"
 } else { $true }
+$TeamsPrReferenceEnabled = if ($teamsChannelCfg.PSObject.Properties['prReferenceEnabled']) {
+    if ($teamsChannelCfg.prReferenceEnabled -isnot [bool]) {
+        throw 'config.teamsNotifications.channel.prReferenceEnabled must be a JSON boolean.'
+    }
+    Get-AgentConfigBool -Object $teamsChannelCfg -Name "prReferenceEnabled" -Where "config.teamsNotifications.channel"
+} else { $false }
 $TeamsTeamId = Get-AgentConfigString -Object $teamsChannelCfg -Name "teamId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
 $TeamsChannelId = Get-AgentConfigString -Object $teamsChannelCfg -Name "channelId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
 $TeamsSupportedEvents = Get-AgentConfigStringArray -Object $teamsCfg -Name "supportedEvents" -Where "config.teamsNotifications"
@@ -823,6 +845,14 @@ foreach ($evt in (@($TeamsChannelEvents) + @($TeamsDirectEvents))) {
     if ($TeamsSupportedEvents -cnotcontains $evt) {
         throw "config.teamsNotifications events contain '$evt', which is not in supportedEvents ($($TeamsSupportedEvents -join ', '))."
     }
+}
+if ($PreviewOnly -and ($EnableTeamsNotifications -or $EnableTeamsPrReferenceWrites -or $EnableCodeChanges -or
+    $EnablePush -or $EnableThreadReplies -or $EnableBuddyRequeue -or $EnableAutoComplete -or $LocalValidation -or $ResumeCodingSession)) {
+    throw '-PreviewOnly cannot be combined with write or notification switches.'
+}
+if ($EnableTeamsPrReferenceWrites -and (-not $EnableTeamsNotifications -or -not $TeamsChannelEnabled -or
+    -not $TeamsThreadReuseEnabled -or -not $TeamsPrReferenceEnabled)) {
+    throw '-EnableTeamsPrReferenceWrites requires -EnableTeamsNotifications and enabled channel, threading, and prReferenceEnabled configuration.'
 }
 if ($EnableTeamsNotifications) {
     # Channel and direct message are INDEPENDENT destinations: either alone is a
@@ -1832,6 +1862,112 @@ function Resolve-HandlerWorktree {
     return (Resolve-Path -LiteralPath $wtPath).Path
 }
 
+function Get-HandlerPullRequestLink {
+    # Routing identity comes from validated wrapper config, never notification text.
+    param([Parameter(Mandatory)][int]$PrId)
+    if ($PrId -le 0) { return "" }
+    return "https://dev.azure.com/$([Uri]::EscapeDataString($Organization))/$([Uri]::EscapeDataString($ExpectedProject))/_git/$([Uri]::EscapeDataString($RepositoryName))/pullrequest/$PrId"
+}
+
+function Invoke-HandlerTeamsMaintenance {
+    param(
+        [Parameter(Mandatory)][hashtable]$AdoSession,
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [object[]]$Candidates = @(),
+        [switch]$Bootstrap
+    )
+    if ($PreviewOnly -or -not $EnableTeamsNotifications -or -not $TeamsChannelEnabled -or
+        -not $TeamsThreadReuseEnabled -or -not $TeamsPrReferenceEnabled -or @($TeamsChannelEvents).Count -eq 0) { return }
+    if ($ManualDispatchManifest -and -not $script:HandlerTeamsManualAuthorized) { return }
+    if ($ManualDispatchManifest -and (Test-AgentManualCancellationRequested -RepositoryIdentity $repositoryIdentity -PullRequestId $PullRequestId -Role review-handler)) { return }
+    if ($Bootstrap -and (-not $EnableTeamsPrReferenceWrites -or $Candidates.Count -eq 0)) { return }
+    $workIqSession = $null
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(60)
+        $referenceContext = New-AgentTeamsPrReferenceContext -AdoSession $AdoSession -RepositoryIdentity $repositoryIdentity `
+            -Role review-handler -AllowWrites:$EnableTeamsPrReferenceWrites
+        $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server workiq -TimeoutSeconds 15
+        if ($Bootstrap) {
+            # Persist the rotation independently of review completion so an already-registered
+            # prefix (or one failing PR) cannot starve new roots across cycles or restarts.
+            $cursorPath = Join-Path $script:HandlerDurableContext.RoleRoot 'teams-pr-reference-bootstrap.v1.json'
+            $state = Get-JsonState -Path $cursorPath
+            $cursor = [int](Get-HandlerHashValue -Container $state -Key lastPrId -Default 0)
+            $ids = @($Candidates | ForEach-Object { [int](Get-HandlerHashValue -Container $_ -Key pullRequestId -Default 0) } |
+                Where-Object { $_ -gt 0 -and ($PullRequestId -le 0 -or $_ -eq $PullRequestId) } | Sort-Object -Unique)
+            $orderedIds = @(@($ids | Where-Object { $_ -gt $cursor }) + @($ids | Where-Object { $_ -le $cursor }))
+            $attempted = 0
+            foreach ($id in $orderedIds) {
+                if ($attempted -ge 10 -or [DateTime]::UtcNow -ge $deadline) { break }
+                $attempted++
+                Set-JsonState -Path $cursorPath -State @{ lastPrId = $id }
+                try {
+                    Initialize-AgentTeamsPrThread -Session $workIqSession -ReferenceContext $referenceContext `
+                        -DurableStateRoot $DurableStateRoot -RepositoryIdentity $repositoryIdentity -PullRequestId $id `
+                        -PullRequestUrl (Get-HandlerPullRequestLink -PrId $id) -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
+                        -DeadlineUtc $deadline -OutputContext $script:HandlerOutputContext | Out-Null
+                }
+                catch {
+                    if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
+                    Write-Warning "Teams PR $id reference initialization deferred; review selection is unaffected."
+                }
+            }
+            if ($attempted -lt $orderedIds.Count -and $script:HandlerOutputContext) {
+                Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery `
+                    -Data @{ outcome = 'deferred'; code = 'reference-bootstrap-budget'; attempted = $attempted; remaining = $orderedIds.Count - $attempted } `
+                    -Message 'Remaining Teams PR references will rotate into the next cycle.' | Out-Null
+            }
+        }
+        if ([DateTime]::UtcNow -lt $deadline) {
+            Invoke-AgentTeamsNotificationOutbox -Session $workIqSession -ReferenceContext $referenceContext `
+                -DurableStateRoot $DurableStateRoot -RepositoryIdentity $repositoryIdentity -Role review-handler `
+                -TeamId $TeamsTeamId -ChannelId $TeamsChannelId -AllowedEvents $TeamsChannelEvents `
+                -PullRequestId $PullRequestId -DeadlineUtc $deadline -OutputContext $script:HandlerOutputContext | Out-Null
+        }
+    }
+    catch {
+        if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
+        if ($script:HandlerOutputContext) {
+            Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery -Level warning `
+                -Data @{ outcome = 'deferred'; code = 'reference-maintenance-error' } `
+                -Message 'Teams reference maintenance deferred; review selection is unaffected.' | Out-Null
+        }
+        Write-Warning 'Teams reference maintenance deferred; review selection is unaffected.'
+    }
+    finally {
+        if ($workIqSession) {
+            try { Close-AgentMcpSession -Session $workIqSession }
+            catch { Write-Warning 'Teams maintenance session cleanup failed; review selection is unaffected.' }
+        }
+    }
+}
+
+function Get-HandlerTeamsNotificationSourceCommit {
+    param(
+        [Parameter(Mandatory)][hashtable]$AdoSession,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceRefName,
+        [string]$ExpectedSourceCommit = ''
+    )
+    $fresh = Invoke-AgentMcpTool -Session $AdoSession -Name repo_pull_request -Arguments @{
+        action = 'get'; project = $repositoryIdentity.project
+        repositoryId = $repositoryIdentity.repositoryId; pullRequestId = $PrId
+    }
+    $freshRepository = Get-HandlerHashValue -Container $fresh -Key repository
+    $draft = Get-HandlerHashValue -Container $fresh -Key isDraft
+    $head = [string](Get-HandlerHashValue -Container (Get-HandlerHashValue -Container $fresh -Key lastMergeSourceCommit) -Key commitId -Default '')
+    if ([int](Get-HandlerHashValue -Container $fresh -Key pullRequestId -Default 0) -ne $PrId -or
+        [string](Get-HandlerHashValue -Container $freshRepository -Key id -Default '') -ine [string]$repositoryIdentity.repositoryId -or
+        [string](Get-HandlerHashValue -Container $fresh -Key sourceRefName -Default '') -cne $SourceRefName -or
+        [string](Get-HandlerHashValue -Container $fresh -Key status -Default '') -ine 'active' -or
+        $draft -isnot [bool] -or $draft -or
+        $head -notmatch '^[0-9a-fA-F]{40}$' -or
+        ($ExpectedSourceCommit -and $head -ine $ExpectedSourceCommit)) {
+        throw 'Teams notification source could not be bound to the current active PR head.'
+    }
+    return $head.ToLowerInvariant()
+}
+
 function Send-HandlerTeamsNotification {
     <#
         Wrapper-owned Teams delivery. The model never sends notifications.
@@ -1848,18 +1984,24 @@ function Send-HandlerTeamsNotification {
         [Parameter(Mandatory)][string]$Body,
         [int]$PrId = 0,
         [string]$SourceCommit = "",
+        [string]$SourceRefName = "",
+        [string]$ExpectedSourceCommit = "",
         [string[]]$Links = @()
     )
-    if (-not $EnableTeamsNotifications) { return }
+    if ($PreviewOnly -or -not $EnableTeamsNotifications) { return }
+    if ($ManualDispatchManifest -and -not $script:HandlerTeamsManualAuthorized) { return }
+    if ($ManualDispatchManifest -and ($PrId -le 0 -or $PrId -ne $PullRequestId)) { return }
+    if ($ManualDispatchManifest -and (Test-AgentManualCancellationRequested -RepositoryIdentity $repositoryIdentity -PullRequestId $PrId -Role review-handler)) { return }
     $wantChannel = $TeamsChannelEnabled -and ($TeamsChannelEvents -ccontains $Event)
     $wantDirect = $TeamsDirectEnabled -and ($TeamsDirectEvents -ccontains $Event)
     if (-not $wantChannel -and -not $wantDirect) { return }
 
     $workIqSession = $null
+    $referenceSession = $null
     try {
         $dedupeKey = "$Event|$PrId|$SourceCommit"
         $notifState = Get-JsonState -Path $notificationsStatePath
-        $threadedChannel = $wantChannel -and $TeamsThreadReuseEnabled -and $PrId -gt 0 -and $repositoryIdentity.verified -eq $true
+        $threadedChannel = $wantChannel -and $TeamsThreadReuseEnabled -and $PrId -gt 0 -and ($TeamsPrReferenceEnabled -or $repositoryIdentity.verified -eq $true)
         $previousDestinations = @()
         if ($notifState.ContainsKey($dedupeKey) -and $threadedChannel) {
             $previousDestinations = @(Get-HandlerHashValue -Container $notifState[$dedupeKey] -Key 'destinations' -Default @())
@@ -1876,12 +2018,34 @@ function Send-HandlerTeamsNotification {
             try {
                 $channelConfirmed = $true
                 if ($threadedChannel) {
+                    $referenceParameters = @{}
+                    $channelSourceCommit = $SourceCommit
+                    if ($TeamsPrReferenceEnabled) {
+                        $ado = $script:HandlerTeamsAdoSession
+                        if (-not $ado) {
+                            $referenceSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
+                                -Organization $Organization -Toolsets @('repos') -TimeoutSeconds 30
+                            $ado = $referenceSession
+                        }
+                        $referenceParameters.ReferenceContext = New-AgentTeamsPrReferenceContext -AdoSession $ado `
+                            -RepositoryIdentity $repositoryIdentity -Role review-handler -AllowWrites:$EnableTeamsPrReferenceWrites
+                        if ($SourceRefName) {
+                            # The model may have pushed before returning (including before a
+                            # failure). Queue only a fresh server head, never its original bound SHA.
+                            $channelSourceCommit = Get-HandlerTeamsNotificationSourceCommit -AdoSession $ado -PrId $PrId `
+                                -SourceRefName $SourceRefName -ExpectedSourceCommit $ExpectedSourceCommit
+                        }
+                    }
                     $result = Send-AgentTeamsThreadedChannelMessage -Session $workIqSession -DurableStateRoot $DurableStateRoot `
                         -RepositoryIdentity $repositoryIdentity -Role review-handler -NotificationEvent $Event `
-                        -PullRequestId $PrId -SourceCommit $SourceCommit -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
-                        -Title $Title -Body $Body -Links $Links -OutputContext $script:HandlerOutputContext
+                        -PullRequestId $PrId -SourceCommit $channelSourceCommit -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
+                        -PullRequestUrl (Get-HandlerPullRequestLink -PrId $PrId) `
+                        -Title $Title -Body $Body -Links $Links -OutputContext $script:HandlerOutputContext @referenceParameters
                     $channelConfirmed = $result.Delivered -or $result.Deduped
-                    if (-not $channelConfirmed) {
+                    if ([bool](Get-HandlerHashValue -Container $result -Key Queued -Default $false)) {
+                        Write-Host "Teams '$Event' queued for its shared PR thread; not yet delivered." -ForegroundColor DarkGray
+                    }
+                    elseif (-not $channelConfirmed) {
                         Write-Warning "Teams '$Event' channel delivery is $($result.Outcome) ($($result.Code)); review work is unaffected."
                     }
                 }
@@ -1933,6 +2097,10 @@ function Send-HandlerTeamsNotification {
         Write-Warning "Teams '$Event' notification failed (review work is unaffected): $($_.Exception.Message)"
     }
     finally {
+        if ($referenceSession) {
+            try { Close-AgentMcpSession -Session $referenceSession }
+            catch { Write-Warning 'Teams PR reference session cleanup failed; review work is unaffected.' }
+        }
         if ($workIqSession) {
             try { Close-AgentMcpSession -Session $workIqSession }
             catch {
@@ -2045,6 +2213,9 @@ function Invoke-HandlerCycle {
         $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
             -Organization $Organization -Toolsets @("repos", "builds") -TimeoutSeconds $McpTimeoutSeconds
 
+        $script:HandlerTeamsAdoSession = $session
+        Invoke-HandlerTeamsMaintenance -AdoSession $session -AgencyPath $AgencyPath
+
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
         if ($PullRequestId -gt 0) {
             $direct = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
@@ -2095,6 +2266,8 @@ function Invoke-HandlerCycle {
                 } -Message "PR $filteredId skipped ($filteredReason)."
             }
         }
+
+        Invoke-HandlerTeamsMaintenance -AdoSession $session -AgencyPath $AgencyPath -Candidates $candidates -Bootstrap
 
         # The lock-free snapshot only orders and filters candidates. The
         # selected candidate is rechecked under both authorities before work.
@@ -2457,9 +2630,10 @@ function Invoke-HandlerCycle {
             $result.ExitCode = 1
             $result.Summary = "PR $prId failed: $reason"
             Send-HandlerTeamsNotification -AgencyPath $AgencyPath -Event "handlerFailed" -PrId $prId -SourceCommit $bound.SourceCommit `
+                -SourceRefName "refs/heads/$($bound.SourceBranch)" `
                 -Title "Review-handler could not process PR $prId" `
                 -Body "$reason. Branch $($bound.SourceBranch). See the failure transcript on the agent host." `
-                -Links @("https://dev.azure.com/$Organization/$ExpectedProject/_git/$RepositoryName/pullrequest/$prId")
+                -Links @(Get-HandlerPullRequestLink -PrId $prId)
             Send-HandlerEvent work.completed -Level error -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
                 title = [string](Get-HandlerHashValue -Container $bound.Pr -Key 'title' -Default "PR $prId")
                 result = 'failed'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
@@ -2614,9 +2788,11 @@ function Invoke-HandlerCycle {
         if (Test-HandlerReadyToComplete -Marker $marker -ActionableThreadCount $bound.ActionableCount) {
             $prTitle = [string](Get-HandlerHashValue -Container $bound.Pr -Key 'title' -Default "PR $prId")
             Send-HandlerTeamsNotification -AgencyPath $AgencyPath -Event "prReadyToComplete" -PrId $prId -SourceCommit $bound.SourceCommit `
+                -SourceRefName "refs/heads/$($bound.SourceBranch)" `
+                -ExpectedSourceCommit $(if ($pushedCommit) { $pushedCommit } else { $bound.SourceCommit }) `
                 -Title "PR $prId is ready to complete" `
                 -Body "$prTitle - all $($bound.ActionableCount) actionable review thread(s) addressed, validation $($marker.validation)$(if ($autoCompleted) { ', auto-complete set' } else { '' })." `
-                -Links @("https://dev.azure.com/$Organization/$ExpectedProject/_git/$RepositoryName/pullrequest/$prId")
+                -Links @(Get-HandlerPullRequestLink -PrId $prId)
         }
         Send-HandlerEvent cycle.completed -Cycle $CycleNumber -Data @{
             result = 'completed'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
@@ -2637,6 +2813,7 @@ function Invoke-HandlerCycle {
     finally {
         if ($durableLock) { Exit-AgentLock -Stream $durableLock.Stream }
         if ($workLease) { Exit-AgentLock -Stream $workLease.Stream }
+        $script:HandlerTeamsAdoSession = $null
         if ($session) { Close-AgentMcpSession -Session $session }
     }
 }
@@ -2718,6 +2895,11 @@ try {
                 -RepositoryIdentity $repositoryIdentity -RepositoryRoot ([IO.Path]::GetFullPath($RepoPath)) `
                 -DurableContext $script:HandlerDurableContext `
                 -LeaseRoot $LeaseRoot -Role review-handler -EventLogPath $script:HandlerOutputContext.LogPath `
+                -BoundWrapperPermissions @{
+                    EnableTeamsNotifications = [bool]$EnableTeamsNotifications
+                    EnableTeamsPrReferenceWrites = [bool]$EnableTeamsPrReferenceWrites
+                    PreviewOnly = [bool]$PreviewOnly
+                } `
                 -BoundCapabilities @{
                     EnableThreadReplies = [bool]$EnableThreadReplies
                     EnableBuddyRequeue = [bool]$EnableBuddyRequeue
@@ -2727,6 +2909,8 @@ try {
                     ResumeCodingSession = [bool]$ResumeCodingSession
                     EnableAutoComplete = [bool]$EnableAutoComplete
                 })
+            # Startup returns only after the broker's authenticated ready/proceed exchange.
+            $script:HandlerTeamsManualAuthorized = $true
         }
     }
     finally {
@@ -2736,7 +2920,7 @@ try {
     Confirm-AgentLauncherWorkerStartup
     Write-Host "review-handler: operator=$OperatorAlias org=$Organization project=$ExpectedProject repo=$RepositoryName" -ForegroundColor Cyan
     if ($PullRequestId -gt 0) { Write-Host "Target: PR $PullRequestId only." -ForegroundColor Cyan }
-    Write-Host "Capabilities: codeChanges=$([bool]$EnableCodeChanges) push=$([bool]$EnablePush) threadReplies=$([bool]$EnableThreadReplies) localValidation=$([bool]$LocalValidation) buddyRequeue=$([bool]$EnableBuddyRequeue) autoComplete=$([bool]$EnableAutoComplete) teams=$([bool]$EnableTeamsNotifications)" -ForegroundColor Cyan
+    Write-Host "Capabilities: codeChanges=$([bool]$EnableCodeChanges) push=$([bool]$EnablePush) threadReplies=$([bool]$EnableThreadReplies) localValidation=$([bool]$LocalValidation) buddyRequeue=$([bool]$EnableBuddyRequeue) autoComplete=$([bool]$EnableAutoComplete) teams=$([bool]$EnableTeamsNotifications) wrapperTeamsPrReferenceWrites=$([bool]$EnableTeamsPrReferenceWrites)" -ForegroundColor Cyan
     Write-Host "Session: resume=$([bool]$ResumeCodingSession) requireLocalSession=$([bool]$RequireCodingSession)$(if ($RequireCodingSession) { ' (ownership mode - only PRs coded on this box)' })" -ForegroundColor Cyan
     $handlerWrites = @(
         $(if ($EnableCodeChanges) { 'code changes' })
@@ -2744,12 +2928,16 @@ try {
         $(if ($EnableThreadReplies) { 'replies' })
         $(if ($EnableBuddyRequeue) { 'build requeue' })
         $(if ($EnableAutoComplete) { 'auto-complete' })
+        $(if ($EnableTeamsNotifications) { 'Teams notifications' })
+        $(if ($EnableTeamsPrReferenceWrites) { 'wrapper Teams PR reference comments' })
     ) | Where-Object { $_ }
     if (@($handlerWrites).Count -eq 0) { $handlerWrites = @('analysis only') }
     Send-HandlerEvent agent.started -Data @{
         organization = $Organization; project = $ExpectedProject; repository = $RepositoryName
         target = 'operator pull requests'; operator = $OperatorAlias; writes = ($handlerWrites -join ', ')
         vote = 'n/a'; outputMode = $script:HandlerOutputContext.Mode; diagnosticLog = $eventLogPath
+        wrapperTeamsPrReferenceWrites = [bool]$EnableTeamsPrReferenceWrites
+        teamsNotifications = [bool]$EnableTeamsNotifications; previewOnly = [bool]$PreviewOnly
     } -Message "review-handler: operator=$OperatorAlias org=$Organization project=$ExpectedProject repo=$RepositoryName"
 
     $consecutiveBackoff = $MinBackoffSeconds

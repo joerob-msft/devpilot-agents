@@ -1,5 +1,5 @@
-# Caller-gated channel notifications only. No message reads, DM threading, or
-# server idempotency are assumed. A persisted intent is not proof of delivery.
+# Caller-gated channel notifications only. Local mode needs no message reads;
+# shared references verify known roots separately. An intent is not delivery.
 
 function Test-AgentTeamsOpaqueId {
     param([AllowNull()]$Value)
@@ -17,7 +17,7 @@ function New-AgentTeamsThreadResult {
     param(
         [string]$Outcome, [string]$Code, [string]$MessageId = '',
         [AllowNull()][hashtable]$OutputContext, [int]$PullRequestId,
-        [ValidateSet('', 'root', 'reply', 'fallback')][string]$Operation = '',
+        [ValidateSet('', 'root', 'reply', 'fallback', 'reference', 'outbox')][string]$Operation = '',
         [AllowNull()][Collections.Generic.List[object]]$AuditHistory
     )
     $audit = @{ outcome = $Outcome; code = $Code }
@@ -26,6 +26,8 @@ function New-AgentTeamsThreadResult {
     $result = @{
         Delivered = $Outcome -cin @('root-created', 'reply-delivered', 'fallback-delivered', 'deduped')
         Deduped = $Outcome -ceq 'deduped'
+        Queued = $Outcome -ceq 'queued'
+        Ready = $Outcome -ceq 'reference-ready'
         Outcome = $Outcome
         Code = $Code
         Audit = @($priorAudit) + @($audit)
@@ -35,7 +37,7 @@ function New-AgentTeamsThreadResult {
         try {
             $operationLabel = if ($Operation) { " ($Operation)" } else { '' }
             $published = Publish-AgentEvent -Context $OutputContext -EventType notification.delivery `
-                -Level $(if ($result.Delivered) { 'info' } else { 'warning' }) -PrId $PullRequestId `
+                -Level $(if ($result.Delivered -or $result.Ready) { 'info' } else { 'warning' }) -PrId $PullRequestId `
                 -Data $audit -Message "Teams notification${operationLabel}: $Outcome ($Code)."
             if ($null -eq $published) { $result.Audit += @{ outcome = $Outcome; code = 'audit-unavailable' } }
         }
@@ -60,8 +62,11 @@ function Assert-AgentTeamsFields {
 
 function Assert-AgentTeamsThreadState {
     param($State, [hashtable]$Context)
-    Assert-AgentTeamsFields $State @('schemaVersion', 'repositoryKey', 'teamId', 'channelId', 'pullRequestId', 'rootMessageId', 'records')
-    if (-not (Test-StrictJsonInt $State.schemaVersion -Min 1 -Max 1) -or
+    $fields = @('schemaVersion', 'repositoryKey', 'teamId', 'channelId', 'pullRequestId', 'rootMessageId', 'records')
+    $shared = $State -is [Collections.IDictionary] -and (Test-StrictJsonInt $State.schemaVersion -Min 2 -Max 2)
+    if ($shared) { $fields += 'rootProvenance' }
+    Assert-AgentTeamsFields $State $fields
+    if (-not (Test-StrictJsonInt $State.schemaVersion -Min 1 -Max 2) -or
         $State.repositoryKey -isnot [string] -or $State.repositoryKey -cne $Context.RepositoryKey -or
         $State.teamId -isnot [string] -or $State.teamId -cne $Context.TeamId -or
         $State.channelId -isnot [string] -or $State.channelId -cne $Context.ChannelId -or
@@ -72,7 +77,13 @@ function Assert-AgentTeamsThreadState {
         $State.records -isnot [System.Collections.IDictionary] -or $State.records.Count -gt 256) {
         throw [IO.InvalidDataException]::new('Teams state binding or bounds are invalid.')
     }
+    if ($shared -and ($State.rootProvenance -isnot [string] -or
+        $State.rootProvenance -cnotin @('none', 'local', 'shared-reference') -or
+        (($State.rootMessageId -ceq '') -ne ($State.rootProvenance -ceq 'none')))) {
+        throw [IO.InvalidDataException]::new('Teams root provenance is invalid.')
+    }
     $confirmedRoots = 0
+    $localCanonicalReceipts = 0
     $uncertainRoots = 0
     foreach ($key in $State.records.Keys) {
         $record = $State.records[$key]
@@ -113,7 +124,8 @@ function Assert-AgentTeamsThreadState {
             }
             if ($record.kind -ceq 'root') {
                 $confirmedRoots++
-                if ($record.messageId -cne $State.rootMessageId) { throw [IO.InvalidDataException]::new('Teams root receipt mismatches.') }
+                if ($record.messageId -ceq $State.rootMessageId) { $localCanonicalReceipts++ }
+                elseif (-not $shared) { throw [IO.InvalidDataException]::new('Teams root receipt mismatches.') }
             }
         }
         elseif ($record.messageId -cne '') { throw [IO.InvalidDataException]::new('Teams unconfirmed receipt carries a message id.') }
@@ -125,8 +137,10 @@ function Assert-AgentTeamsThreadState {
             throw [IO.InvalidDataException]::new('Teams reply has no confirmed root.')
         }
     }
-    if (($State.rootMessageId -and ($confirmedRoots -ne 1 -or $uncertainRoots -ne 0)) -or
-        (-not $State.rootMessageId -and ($confirmedRoots -ne 0 -or $uncertainRoots -gt 1))) {
+    if (($confirmedRoots + $uncertainRoots -gt 1) -or
+        (-not $shared -and $State.rootMessageId -and ($confirmedRoots -ne 1 -or $uncertainRoots -ne 0)) -or
+        (-not $State.rootMessageId -and ($confirmedRoots -ne 0 -or $uncertainRoots -gt 1)) -or
+        ($shared -and $State.rootProvenance -ceq 'local' -and $localCanonicalReceipts -ne 1)) {
         throw [IO.InvalidDataException]::new('Teams root state is inconsistent.')
     }
 }
@@ -164,6 +178,7 @@ function Write-AgentTeamsThreadState {
     Assert-AgentTeamsThreadState $State $Context
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $State -Depth 6 -Compress))
     if ($bytes.Length -gt 1MB) { throw [IO.InvalidDataException]::new('Teams state exceeds its size limit.') }
+    Assert-AgentCapabilityJsonRawShape -Bytes $bytes -MaxDepth 4 -MaxElements 4096 -MaxStringLength 1024 -ErrorCode teams-state-invalid
     $staging = Join-Path $Context.Root "$($Context.PullRequestId).write-$([Guid]::NewGuid().ToString('N'))"
     try {
         if (Test-Path -LiteralPath $Context.StatePath) {
@@ -228,7 +243,7 @@ function Get-AgentTeamsConfirmedMessageId {
     return $id.Value
 }
 
-function Send-AgentTeamsThreadedChannelMessage {
+function Invoke-AgentTeamsLocalChannelMessage {
     <#
         The wrapper must gate this call and validate DurableStateRoot against
         its actual consumer repository. This helper revalidates private paths.
@@ -250,7 +265,8 @@ function Send-AgentTeamsThreadedChannelMessage {
         [Parameter(Mandatory)][ValidateLength(1, 24576)][string]$Body,
         [string[]]$Links = @(),
         [Nullable[DateTime]]$DeadlineUtc,
-        [AllowNull()][hashtable]$OutputContext
+        [AllowNull()][hashtable]$OutputContext,
+        [AllowNull()][hashtable]$SharedAuthority
     )
     $repositoryKey = Get-AgentRepositoryIdentityKey $RepositoryIdentity
     if ((Get-AgentProviderValue $RepositoryIdentity 'verified') -isnot [bool] -or $repositoryKey.Length -gt 1024 -or
@@ -319,6 +335,19 @@ function Send-AgentTeamsThreadedChannelMessage {
             if ($record.status -cin @('pending', 'unknown')) { return New-AgentTeamsThreadResult unknown send-unknown @resultOptions }
             if ($record.status -ceq 'failed') { return New-AgentTeamsThreadResult failed $record.code @resultOptions }
         }
+        if ($null -ne $SharedAuthority) {
+            if ($SharedAuthority.Mode -ceq 'reply') {
+                if (-not (Test-AgentTeamsOpaqueId $SharedAuthority.RootId)) { throw 'Invalid shared root authority.' }
+                $state.schemaVersion = 2
+                $state.rootMessageId = $SharedAuthority.RootId
+                $state.rootProvenance = 'shared-reference'
+                Write-AgentTeamsThreadState $context $state
+                if ($record -and $record.status -ceq 'not-sent') { $record.kind = 'reply' }
+            }
+            elseif ($SharedAuthority.Mode -cne 'bootstrap' -or $state.rootMessageId) {
+                return New-AgentTeamsThreadResult deferred bootstrap-local-root-changed @resultOptions
+            }
+        }
         if (-not $state.rootMessageId -and @($state.records.Values | Where-Object {
                     $_.kind -ceq 'root' -and $_.status -cin @('pending', 'unknown')
                 }).Count -gt 0) {
@@ -341,6 +370,7 @@ function Send-AgentTeamsThreadedChannelMessage {
         $resultOptions.Operation = $record.kind
         $messagesPath = "/teams/$([Uri]::EscapeDataString($TeamId))/channels/$([Uri]::EscapeDataString($ChannelId))/messages"
         $html = New-AgentTeamsMessageHtml -Title $Title -Body $Body -Links $Links
+        if ($SharedAuthority -and $SharedAuthority.Mode -ceq 'bootstrap') { $html = $SharedAuthority.RootPrefix + $html }
         while ($true) {
             if ($record.attempts -ge 3) { return New-AgentTeamsThreadResult deferred attempt-limit @resultOptions }
             if ($record.code -ceq 'throttled-metadata-unavailable') {
@@ -388,7 +418,7 @@ function Send-AgentTeamsThreadedChannelMessage {
                 Write-AgentTeamsThreadState $context $state
                 continue
             }
-            if ($httpStatus -in @(404, 410) -and $record.kind -ceq 'reply') {
+            if (-not $SharedAuthority -and $httpStatus -in @(404, 410) -and $record.kind -ceq 'reply') {
                 $sendMayHaveLanded = $false
                 $record.kind = 'fallback'
                 $record.status = 'not-sent'
@@ -416,13 +446,17 @@ function Send-AgentTeamsThreadedChannelMessage {
             $record.status = 'delivered'
             $record.messageId = $messageId
             $record.code = 'confirmed'
-            if ($record.kind -ceq 'root') { $state.rootMessageId = $messageId }
+            if ($record.kind -ceq 'root') {
+                $state.rootMessageId = $messageId
+                if ($state.schemaVersion -eq 2) { $state.rootProvenance = 'local' }
+            }
             Write-AgentTeamsThreadState $context $state
             $outcome = switch ($record.kind) {
                 root { 'root-created' }
                 reply { 'reply-delivered' }
                 fallback { 'fallback-delivered' }
             }
+
             return New-AgentTeamsThreadResult $outcome confirmed $messageId @resultOptions
         }
     }
@@ -433,4 +467,30 @@ function Send-AgentTeamsThreadedChannelMessage {
         return New-AgentTeamsThreadResult failed state-unavailable @resultOptions
     }
     finally { if ($lock -and $lock.Acquired) { Exit-AgentLock $lock.Stream } }
+}
+
+function Send-AgentTeamsThreadedChannelMessage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$DurableStateRoot,
+        [Parameter(Mandatory)]$RepositoryIdentity,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][ValidatePattern('\A[a-zA-Z][a-zA-Z0-9-]{0,63}\z')][string]$NotificationEvent,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][AllowEmptyString()][ValidatePattern('\A[0-9A-Za-z._-]{0,128}\z')][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$TeamId, [Parameter(Mandatory)][string]$ChannelId,
+        [Parameter(Mandatory)][ValidateLength(1, 4096)][string]$Title,
+        [Parameter(Mandatory)][ValidateLength(1, 24576)][string]$Body,
+        [string[]]$Links = @(), [string]$PullRequestUrl = '',
+        [Nullable[DateTime]]$DeadlineUtc, [AllowNull()][hashtable]$OutputContext,
+        [AllowNull()][hashtable]$ReferenceContext, [switch]$PreviewOnly
+    )
+    if ($PreviewOnly) {
+        return New-AgentTeamsThreadResult deferred preview -OutputContext $OutputContext -PullRequestId $PullRequestId
+    }
+    if ($null -ne $ReferenceContext) { return Send-AgentTeamsSharedChannelMessage @PSBoundParameters }
+    $arguments = @{} + $PSBoundParameters
+    foreach ($name in @('ReferenceContext', 'PreviewOnly', 'PullRequestUrl')) { $arguments.Remove($name) }
+    return Invoke-AgentTeamsLocalChannelMessage @arguments
 }

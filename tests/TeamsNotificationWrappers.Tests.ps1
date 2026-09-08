@@ -3,8 +3,8 @@ BeforeAll {
 }
 
 Describe '<Role> Teams notification integration' -ForEach @(
-    @{ Role = 'reviewer'; ScriptName = 'Start-ReviewerAgent.ps1'; NotificationFunction = 'Send-ReviewerTeamsNotification'; HashFunction = 'Get-ReviewerHashValue'; EventParameter = 'NotificationEvent'; NotificationEvent = 'reviewCompleted' }
-    @{ Role = 'review-handler'; ScriptName = 'Start-ReviewHandlerAgent.ps1'; NotificationFunction = 'Send-HandlerTeamsNotification'; HashFunction = 'Get-HandlerHashValue'; EventParameter = 'Event'; NotificationEvent = 'prReadyToComplete' }
+    @{ Role = 'reviewer'; ScriptName = 'Start-ReviewerAgent.ps1'; NotificationFunction = 'Send-ReviewerTeamsNotification'; HashFunction = 'Get-ReviewerHashValue'; LinkFunction = 'Get-ReviewerPullRequestLink'; EventParameter = 'NotificationEvent'; NotificationEvent = 'reviewCompleted' }
+    @{ Role = 'review-handler'; ScriptName = 'Start-ReviewHandlerAgent.ps1'; NotificationFunction = 'Send-HandlerTeamsNotification'; HashFunction = 'Get-HandlerHashValue'; LinkFunction = 'Get-HandlerPullRequestLink'; EventParameter = 'Event'; NotificationEvent = 'prReadyToComplete' }
 ) {
     BeforeAll {
         $tokens = $null
@@ -20,7 +20,16 @@ Describe '<Role> Teams notification integration' -ForEach @(
         }, $true)
         if (-not $threadFlagAssignment) { throw 'Missing threading flag configuration assignment' }
         $script:threadFlagConfig = [scriptblock]::Create($threadFlagAssignment.Extent.Text)
-        foreach ($name in @($NotificationFunction, $HashFunction)) {
+        $referenceFlagAssignment = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -eq 'TeamsPrReferenceEnabled'
+        }, $true)
+        $script:referenceFlagConfig = [scriptblock]::Create($referenceFlagAssignment.Extent.Text)
+        $functionsToLoad = @($NotificationFunction, $HashFunction, $LinkFunction)
+        if ($Role -eq 'review-handler') { $functionsToLoad += 'Get-HandlerTeamsNotificationSourceCommit' }
+        foreach ($name in $functionsToLoad) {
             $definition = $ast.Find({
                 param($node)
                 $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -35,18 +44,35 @@ Describe '<Role> Teams notification integration' -ForEach @(
         $script:notificationAgentPath = $path
 
         function Invoke-TestNotification {
-            param([int]$PrId = 42, [AllowEmptyString()][string]$Commit = 'abc123')
+            param(
+                [int]$PrId = 42, [AllowEmptyString()][string]$Commit = 'abc123', [string[]]$Links = @(),
+                [string]$SourceRefName = '', [string]$ExpectedSourceCommit = '', [string]$EventOverride = ''
+            )
             $parameters = @{
                 AgencyPath = 'unused-agency'; Title = 'Synthetic notification'; Body = 'Synthetic body'
-                PrId = $PrId; SourceCommit = $Commit; Links = @()
+                PrId = $PrId; SourceCommit = $Commit; Links = $Links
             }
-            $parameters[$script:eventParameter] = $script:notificationEvent
+            $parameters[$script:eventParameter] = if ($EventOverride) { $EventOverride } else { $script:notificationEvent }
+            if ($SourceRefName) {
+                $parameters.SourceRefName = $SourceRefName
+                $parameters.ExpectedSourceCommit = $ExpectedSourceCommit
+            }
             & $script:notificationFunction @parameters
         }
     }
 
     BeforeEach {
         $script:EnableTeamsNotifications = $true
+        $script:EnableTeamsPrReferenceWrites = $false
+        $script:PreviewOnly = $false
+        $script:ManualDispatchManifest = ''
+        $script:PullRequestId = 42
+        $script:ReviewerTeamsManualAuthorized = $false
+        $script:HandlerTeamsManualAuthorized = $false
+        $script:TeamsPrReferenceEnabled = $false
+        $script:ReviewerTeamsAdoSession = $null
+        $script:HandlerTeamsAdoSession = $null
+        $script:McpSensitiveEnvironmentVariables = @()
         $script:TeamsThreadReuseEnabled = $true
         $script:TeamsChannelEnabled = $true
         $script:TeamsChannelEvents = @($script:notificationEvent)
@@ -56,9 +82,15 @@ Describe '<Role> Teams notification integration' -ForEach @(
         $script:TeamsDirectEvents = @($script:notificationEvent)
         $script:TeamsDirectRecipientFallback = 'author@example.test'
         $script:TeamsDirectRecipient = 'author@example.test'
+        $script:Organization = 'example-org'
+        $script:ExpectedProject = 'ExampleProject'
+        $script:RepositoryName = 'example-repository'
         $script:notificationsStatePath = Join-Path $TestDrive 'notifications.json'
         $script:DurableStateRoot = Join-Path $TestDrive 'durable'
-        $script:repositoryIdentity = @{ verified = $true; key = 'v1:github:12345' }
+        $script:repositoryIdentity = @{
+            verified = $true; key = 'v1:github:12345'; project = 'verified-project-id'
+            repositoryId = 'verified-repository-id'
+        }
         $script:ReviewerOutputContext = @{ Agent = 'reviewer' }
         $script:HandlerOutputContext = @{ Agent = 'review-handler' }
         $script:notificationState = @{}
@@ -68,6 +100,9 @@ Describe '<Role> Teams notification integration' -ForEach @(
         Mock Get-JsonState { return $script:notificationState }
         Mock Set-JsonState { param($State) $script:notificationState = $State }
         Mock Send-AgentTeamsThreadedChannelMessage { return $script:threadResult }
+        Mock New-AgentTeamsPrReferenceContext { param($AdoSession, $AllowWrites) return @{ AdoSession = $AdoSession; AllowWrites = [bool]$AllowWrites } }
+        Mock Invoke-AgentMcpTool { throw 'Unexpected MCP transport call' }
+        Mock Test-AgentManualCancellationRequested { $false }
         Mock Send-AgentTeamsChannelMessage { return @{ id = 'independent-message' } }
         Mock Send-AgentTeamsDirectMessage { return @{ id = 'direct-message' } }
         Mock Publish-AgentEvent {} -RemoveParameterValidation EventType
@@ -80,6 +115,21 @@ Describe '<Role> Teams notification integration' -ForEach @(
         . $script:threadFlagConfig
         $TeamsThreadReuseEnabled | Should -BeTrue
         $teamsChannelCfg.enabled | Should -BeFalse
+    }
+
+    It 'defaults omitted shared references off and validates explicit boolean values' {
+        $teamsChannelCfg = [pscustomobject]@{}
+        . $script:referenceFlagConfig
+        $TeamsPrReferenceEnabled | Should -BeFalse
+        foreach ($flag in @($false, $true)) {
+            $teamsChannelCfg = [pscustomobject]@{ prReferenceEnabled = $flag }
+            . $script:referenceFlagConfig
+            $TeamsPrReferenceEnabled | Should -Be $flag
+        }
+        foreach ($invalid in @('true', 1, $null, @($true))) {
+            $teamsChannelCfg = [pscustomobject]@{ prReferenceEnabled = $invalid }
+            { . $script:referenceFlagConfig } | Should -Throw '*must be a JSON boolean*'
+        }
     }
 
     It 'honors an explicit JSON boolean <Flag>' -ForEach @(@{ Flag = $false }, @{ Flag = $true }) {
@@ -125,12 +175,156 @@ Describe '<Role> Teams notification integration' -ForEach @(
         Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -Exactly -ParameterFilter {
             $RepositoryIdentity.verified -eq $true -and $Role -eq $script:notificationRole -and
             $PullRequestId -eq 42 -and $SourceCommit -eq 'abc123' -and
+            $PullRequestUrl -eq 'https://dev.azure.com/example-org/ExampleProject/_git/example-repository/pullrequest/42' -and
             $TeamId -eq 'synthetic-team' -and $ChannelId -eq 'synthetic-channel' -and
             $DurableStateRoot -eq $script:DurableStateRoot -and $null -ne $OutputContext
         }
         Should -Invoke Send-AgentTeamsChannelMessage -Times 0
         Should -Invoke Set-JsonState -Times 1
         Should -Invoke Close-AgentMcpSession -Times 1
+    }
+
+    It 'builds PR routing identity from trusted config rather than caller-supplied links' {
+        Invoke-TestNotification -Links @('https://example.test/unrelated/pull/42')
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -Exactly -ParameterFilter {
+            $PullRequestUrl -eq 'https://dev.azure.com/example-org/ExampleProject/_git/example-repository/pullrequest/42'
+        }
+    }
+
+    It 'escapes every trusted PR URL component including valid project spaces' {
+        $script:Organization = 'example org'
+        $script:ExpectedProject = 'Example Project'
+        $script:RepositoryName = 'example repo#1'
+        Invoke-TestNotification -Links @('https://example.test/fake')
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -ParameterFilter {
+            $PullRequestUrl -ceq 'https://dev.azure.com/example%20org/Example%20Project/_git/example%20repo%231/pullrequest/42'
+        }
+    }
+
+    It 'passes a read-only live ADO reference context without opening a second ADO session' {
+        $script:TeamsPrReferenceEnabled = $true
+        $script:ReviewerTeamsAdoSession = @{ LiveCycle = $true }
+        $script:HandlerTeamsAdoSession = @{ LiveCycle = $true }
+        Invoke-TestNotification
+        Should -Invoke New-AgentTeamsPrReferenceContext -Times 1 -ParameterFilter {
+            $AdoSession.LiveCycle -and -not $AllowWrites -and $Role -ceq $script:notificationRole
+        }
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -ParameterFilter { $ReferenceContext.AdoSession.LiveCycle }
+        Should -Invoke Open-AgentMcpSession -Times 0 -ParameterFilter { $Server -ceq 'ado' }
+    }
+
+    It 'opens and closes a dedicated reference session outside a cycle' {
+        $script:TeamsPrReferenceEnabled = $true
+        Invoke-TestNotification
+        Should -Invoke Open-AgentMcpSession -Times 1 -ParameterFilter { $Server -ceq 'ado' }
+        Should -Invoke Close-AgentMcpSession -Times 2
+    }
+
+    It 'never grants reference writes to the reviewer and requires the explicit handler switch' {
+        $script:TeamsPrReferenceEnabled = $true
+        $script:EnableTeamsPrReferenceWrites = $true
+        Invoke-TestNotification
+        Should -Invoke New-AgentTeamsPrReferenceContext -Times 1 -ParameterFilter {
+            [bool]$AllowWrites -eq ($script:notificationRole -ceq 'review-handler')
+        }
+    }
+
+    It 'fails closed for shared channel references while keeping direct delivery independent' {
+        $script:TeamsPrReferenceEnabled = $true
+        $script:TeamsDirectEnabled = $true
+        Mock New-AgentTeamsPrReferenceContext { throw 'Unverified reference context' }
+        Invoke-TestNotification
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 0
+        Should -Invoke Send-AgentTeamsChannelMessage -Times 0
+        Should -Invoke Send-AgentTeamsDirectMessage -Times 1
+        Should -Invoke Close-AgentMcpSession -Times 2
+    }
+
+    It 'does not call or queue any notification under the absolute preview ceiling' {
+        $script:PreviewOnly = $true
+        $script:TeamsPrReferenceEnabled = $true
+        $script:EnableTeamsPrReferenceWrites = $true
+        $script:TeamsDirectEnabled = $true
+        Invoke-TestNotification
+        Should -Invoke Open-AgentMcpSession -Times 0
+        Should -Invoke Get-JsonState -Times 0
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 0
+        Should -Invoke Send-AgentTeamsDirectMessage -Times 0
+    }
+
+    It 'does not deliver notifications for a denied or cancelled-before-proceed manual startup' {
+        $script:ManualDispatchManifest = 'manual-fixture'
+        $script:TeamsPrReferenceEnabled = $true
+        $script:TeamsDirectEnabled = $true
+        Invoke-TestNotification
+        Should -Invoke Open-AgentMcpSession -Times 0
+        Should -Invoke Get-JsonState -Times 0
+        Should -Invoke Test-AgentManualCancellationRequested -Times 0
+    }
+
+    It 'retains normal event delivery after proceed but suppresses a subsequently cancelled manual turn' {
+        $script:ManualDispatchManifest = 'manual-fixture'
+        $script:ReviewerTeamsManualAuthorized = $true
+        $script:HandlerTeamsManualAuthorized = $true
+        Invoke-TestNotification
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1
+        Mock Test-AgentManualCancellationRequested { $true }
+        Invoke-TestNotification
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1
+        Should -Invoke Get-JsonState -Times 1
+    }
+
+    It 'reports durable queued delivery without recording success or claiming a failed send' {
+        $script:threadResult = @{ Delivered = $false; Deduped = $false; Queued = $true; Outcome = 'queued'; Code = 'reference-pending' }
+        Invoke-TestNotification
+        Should -Invoke Set-JsonState -Times 0
+        Should -Invoke Send-AgentTeamsChannelMessage -Times 0
+        Should -Invoke Write-Warning -Times 0
+        Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -match 'queued.*not yet delivered' }
+    }
+
+    It 'binds post-push handler notification queues to the fresh validated PR head' -Skip:($Role -ne 'review-handler') {
+        $script:TeamsPrReferenceEnabled = $true
+        $script:HandlerTeamsAdoSession = @{ LiveCycle = $true }
+        $script:threadResult = @{ Delivered = $false; Deduped = $false; Queued = $true; Outcome = 'queued'; Code = 'reference-pending' }
+        Mock Invoke-AgentMcpTool {
+            @{ pullRequestId = 42; status = 'active'; isDraft = $false
+                sourceRefName = 'refs/heads/operator/topic'; repository = @{ id = 'verified-repository-id' }
+                lastMergeSourceCommit = @{ commitId = 'b' * 40 } }
+        }
+        Invoke-TestNotification -Commit ('a' * 40) -SourceRefName 'refs/heads/operator/topic' -ExpectedSourceCommit ('b' * 40)
+        Should -Invoke Invoke-AgentMcpTool -Times 1 -ParameterFilter {
+            $Name -eq 'repo_pull_request' -and $Arguments.action -eq 'get' -and
+            $Arguments.project -eq 'verified-project-id' -and $Arguments.repositoryId -eq 'verified-repository-id'
+        }
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -ParameterFilter { $SourceCommit -eq ('b' * 40) }
+        Should -Invoke Set-JsonState -Times 0
+    }
+
+    It 'refreshes a failure notification even when a failed model already pushed without a marker' -Skip:($Role -ne 'review-handler') {
+        $script:TeamsPrReferenceEnabled = $true
+        $script:TeamsChannelEvents += 'handlerFailed'
+        Mock Invoke-AgentMcpTool {
+            @{ pullRequestId = 42; status = 'active'; isDraft = $false
+                sourceRefName = 'refs/heads/operator/topic'; repository = @{ id = 'verified-repository-id' }
+                lastMergeSourceCommit = @{ commitId = 'b' * 40 } }
+        }
+        Invoke-TestNotification -Commit ('a' * 40) -SourceRefName 'refs/heads/operator/topic' -EventOverride handlerFailed
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -ParameterFilter { $SourceCommit -eq ('b' * 40) }
+    }
+
+    It 'does not retag ready work onto an unrelated or unverifiable head, and preserves independent DMs' -Skip:($Role -ne 'review-handler') {
+        $script:TeamsPrReferenceEnabled = $true
+        $script:TeamsDirectEnabled = $true
+        Mock Invoke-AgentMcpTool {
+            @{ pullRequestId = 42; status = 'active'; isDraft = $false
+                sourceRefName = 'refs/heads/operator/topic'; repository = @{ id = 'verified-repository-id' }
+                lastMergeSourceCommit = @{ commitId = 'c' * 40 } }
+        }
+        Invoke-TestNotification -Commit ('a' * 40) -SourceRefName 'refs/heads/operator/topic' -ExpectedSourceCommit ('b' * 40)
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 0
+        Should -Invoke Send-AgentTeamsChannelMessage -Times 0
+        Should -Invoke Send-AgentTeamsDirectMessage -Times 1
     }
 
     It 'does not bypass the notification capability ceiling' {

@@ -32,6 +32,17 @@ BeforeAll {
 }
 
 Describe 'Reviewer output modes' {
+    It 'reports a queued notification distinctly from review completion' {
+        $context = New-TestReviewerContext -Mode Json
+        Publish-AgentEvent $context notification.delivery -PrId 42 `
+            -Data @{ outcome = 'queued'; code = 'reference-pending' } `
+            -Message 'Teams notification queued; not yet delivered.' | Out-Null
+        $event = $script:reviewerLines[0] | ConvertFrom-Json
+        $event.eventType | Should -Be 'notification.delivery'
+        $event.data.outcome | Should -Be 'queued'
+        $event.message | Should -Match 'not yet delivered'
+    }
+
     It 'renders notification diagnostics separately from the work outcome' {
         $context = New-TestReviewerContext
         Publish-AgentEvent $context notification.delivery -Level warning -PrId 42 `
