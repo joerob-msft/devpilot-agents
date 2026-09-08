@@ -1871,7 +1871,6 @@ function Get-HandlerPullRequestLink {
 
 function Invoke-HandlerTeamsMaintenance {
     param(
-        [Parameter(Mandatory)][hashtable]$AdoSession,
         [Parameter(Mandatory)][string]$AgencyPath,
         [object[]]$Candidates = @(),
         [switch]$Bootstrap
@@ -1881,12 +1880,18 @@ function Invoke-HandlerTeamsMaintenance {
     if ($ManualDispatchManifest -and -not $script:HandlerTeamsManualAuthorized) { return }
     if ($ManualDispatchManifest -and (Test-AgentManualCancellationRequested -RepositoryIdentity $repositoryIdentity -PullRequestId $PullRequestId -Role review-handler)) { return }
     if ($Bootstrap -and (-not $EnableTeamsPrReferenceWrites -or $Candidates.Count -eq 0)) { return }
+    $adoSession = $null
     $workIqSession = $null
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds(60)
-        $referenceContext = New-AgentTeamsPrReferenceContext -AdoSession $AdoSession -RepositoryIdentity $repositoryIdentity `
+        $maintenanceSessionTimeoutSeconds = [Math]::Max(1, [Math]::Min(15, $McpTimeoutSeconds))
+        $adoSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
+            -Organization $Organization -Toolsets @('repos') -TimeoutSeconds $maintenanceSessionTimeoutSeconds
+        if ([DateTime]::UtcNow -ge $deadline) { throw 'Teams reference maintenance deadline exhausted during ADO session startup.' }
+        $referenceContext = New-AgentTeamsPrReferenceContext -AdoSession $adoSession -RepositoryIdentity $repositoryIdentity `
             -Role review-handler -AllowWrites:$EnableTeamsPrReferenceWrites
         $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server workiq -TimeoutSeconds 15
+        if ([DateTime]::UtcNow -ge $deadline) { throw 'Teams reference maintenance deadline exhausted during WorkIQ session startup.' }
         if ($Bootstrap) {
             # Persist the rotation independently of review completion so an already-registered
             # prefix (or one failing PR) cannot starve new roots across cycles or restarts.
@@ -1909,7 +1914,10 @@ function Invoke-HandlerTeamsMaintenance {
                 }
                 catch {
                     if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
-                    Write-Warning "Teams PR $id reference initialization deferred; review selection is unaffected."
+                    Write-Warning "Teams PR $id reference initialization deferred; review selection is unaffected: $($_.Exception.Message)"
+                }
+                if (-not $adoSession.Process) {
+                    throw "Teams reference maintenance ADO session closed while initializing PR $id."
                 }
             }
             if ($attempted -lt $orderedIds.Count -and $script:HandlerOutputContext) {
@@ -1923,21 +1931,29 @@ function Invoke-HandlerTeamsMaintenance {
                 -DurableStateRoot $DurableStateRoot -RepositoryIdentity $repositoryIdentity -Role review-handler `
                 -TeamId $TeamsTeamId -ChannelId $TeamsChannelId -AllowedEvents $TeamsChannelEvents `
                 -PullRequestId $PullRequestId -DeadlineUtc $deadline -OutputContext $script:HandlerOutputContext | Out-Null
+            if (-not $adoSession.Process) {
+                throw 'Teams reference maintenance ADO session closed while draining the notification outbox.'
+            }
         }
     }
     catch {
         if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
+        $reason = $_.Exception.Message
         if ($script:HandlerOutputContext) {
             Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery -Level warning `
-                -Data @{ outcome = 'deferred'; code = 'reference-maintenance-error' } `
-                -Message 'Teams reference maintenance deferred; review selection is unaffected.' | Out-Null
+                -Data @{ outcome = 'deferred'; code = 'reference-maintenance-error'; reason = $reason } `
+                -Message "Teams reference maintenance deferred; review selection is unaffected: $reason" | Out-Null
         }
-        Write-Warning 'Teams reference maintenance deferred; review selection is unaffected.'
+        Write-Warning "Teams reference maintenance deferred; review selection is unaffected: $reason"
     }
     finally {
         if ($workIqSession) {
             try { Close-AgentMcpSession -Session $workIqSession }
             catch { Write-Warning 'Teams maintenance session cleanup failed; review selection is unaffected.' }
+        }
+        if ($adoSession) {
+            try { Close-AgentMcpSession -Session $adoSession }
+            catch { Write-Warning 'Teams maintenance ADO session cleanup failed; review selection is unaffected.' }
         }
     }
 }
@@ -2214,7 +2230,7 @@ function Invoke-HandlerCycle {
             -Organization $Organization -Toolsets @("repos", "builds") -TimeoutSeconds $McpTimeoutSeconds
 
         $script:HandlerTeamsAdoSession = $session
-        Invoke-HandlerTeamsMaintenance -AdoSession $session -AgencyPath $AgencyPath
+        Invoke-HandlerTeamsMaintenance -AgencyPath $AgencyPath
 
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
         if ($PullRequestId -gt 0) {
@@ -2267,7 +2283,7 @@ function Invoke-HandlerCycle {
             }
         }
 
-        Invoke-HandlerTeamsMaintenance -AdoSession $session -AgencyPath $AgencyPath -Candidates $candidates -Bootstrap
+        Invoke-HandlerTeamsMaintenance -AgencyPath $AgencyPath -Candidates $candidates -Bootstrap
 
         # The lock-free snapshot only orders and filters candidates. The
         # selected candidate is rechecked under both authorities before work.
