@@ -28,7 +28,9 @@ Describe '<Role> Teams notification integration' -ForEach @(
         }, $true)
         $script:referenceFlagConfig = [scriptblock]::Create($referenceFlagAssignment.Extent.Text)
         $functionsToLoad = @($NotificationFunction, $HashFunction, $LinkFunction)
-        if ($Role -eq 'reviewer') { $functionsToLoad += 'Get-ReviewerAuthorMentionIdentity' }
+        if ($Role -eq 'reviewer') {
+            $functionsToLoad += @('Get-ReviewerAuthorMentionIdentity', 'Get-ReviewerConfiguredTeamsMentionIdentities')
+        }
         if ($Role -eq 'review-handler') { $functionsToLoad += 'Get-HandlerTeamsNotificationSourceCommit' }
         foreach ($name in $functionsToLoad) {
             $definition = $ast.Find({
@@ -50,7 +52,8 @@ Describe '<Role> Teams notification integration' -ForEach @(
                 [string]$SourceRefName = '', [string]$ExpectedSourceCommit = '', [string]$EventOverride = '',
                 [string]$OwnerUpn = 'owner@example.test',
                 [string]$OwnerMentionId = '22222222-2222-2222-2222-222222222222',
-                [string]$OwnerDisplayName = 'PR Owner'
+                [string]$OwnerDisplayName = 'PR Owner',
+                [string[]]$AdditionalChannelMentionUpns = @()
             )
             $parameters = @{
                 AgencyPath = 'unused-agency'; Title = 'Synthetic notification'; Body = 'Synthetic body'
@@ -61,6 +64,7 @@ Describe '<Role> Teams notification integration' -ForEach @(
                 $parameters.DirectRecipientUpn = $OwnerUpn
                 $parameters.MentionRecipientId = $OwnerMentionId
                 $parameters.MentionRecipientDisplayName = $OwnerDisplayName
+                $parameters.AdditionalChannelMentionUpns = $AdditionalChannelMentionUpns
             }
             if ($SourceRefName) {
                 $parameters.SourceRefName = $SourceRefName
@@ -114,6 +118,13 @@ Describe '<Role> Teams notification integration' -ForEach @(
         Mock Test-AgentManualCancellationRequested { $false }
         Mock Send-AgentTeamsChannelMessage { return @{ id = 'independent-message' } }
         Mock Send-AgentTeamsDirectMessage { return @{ id = 'direct-message' } }
+        Mock Invoke-AgentWorkIqTool {
+            [pscustomobject]@{
+                id = '33333333-3333-3333-3333-333333333333'
+                displayName = 'Review operator'
+                userPrincipalName = 'reviewer@example.test'
+            }
+        }
         Mock Publish-AgentEvent {} -RemoveParameterValidation EventType
         Mock Write-Host {}
         Mock Write-Warning {}
@@ -205,6 +216,49 @@ Describe '<Role> Teams notification integration' -ForEach @(
         Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -Exactly -ParameterFilter {
             $MentionRecipientId -eq '' -and $MentionRecipientDisplayName -eq ''
         }
+    }
+
+    It 'adds the configured reviewer mention without replacing the PR owner' {
+        if ($script:notificationRole -ne 'reviewer') {
+            Set-ItResult -Skipped -Because 'Only reviewer notifications add the clean-review handoff mention.'
+            return
+        }
+        Invoke-TestNotification -AdditionalChannelMentionUpns @('reviewer@example.test')
+        Should -Invoke Invoke-AgentWorkIqTool -Times 1 -Exactly -ParameterFilter {
+            $Name -ceq 'fetch' -and
+            $Arguments.entityUrls[0] -ceq '/users/reviewer%40example.test?$select=id,displayName,userPrincipalName'
+        }
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -Exactly -ParameterFilter {
+            $MentionRecipientDisplayName -ceq 'PR Owner' -and
+            $AdditionalMentionRecipients.Count -eq 1 -and
+            $AdditionalMentionRecipients[0].displayName -ceq 'Review operator'
+        }
+    }
+
+    It 'preserves the owner mention when configured reviewer resolution fails' {
+        if ($script:notificationRole -ne 'reviewer') {
+            Set-ItResult -Skipped -Because 'Only reviewer notifications add the clean-review handoff mention.'
+            return
+        }
+        $script:openedWorkIqSessions = [Collections.Generic.List[object]]::new()
+        Mock Open-AgentMcpSession {
+            param($Server)
+            $session = @{ Server = $Server; Sequence = $script:openedWorkIqSessions.Count + 1; Process = [pscustomobject]@{ Alive = $true } }
+            if ($Server -ceq 'workiq') { $script:openedWorkIqSessions.Add($session) }
+            return $session
+        }
+        Mock Invoke-AgentWorkIqTool {
+            param($Session)
+            $Session.Process = $null
+            throw 'Synthetic identity transport failure'
+        }
+        Invoke-TestNotification -AdditionalChannelMentionUpns @('reviewer@example.test')
+        $script:openedWorkIqSessions | Should -HaveCount 2
+        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -Exactly -ParameterFilter {
+            $Session.Sequence -eq 2 -and $null -ne $Session.Process -and
+            $MentionRecipientDisplayName -ceq 'PR Owner' -and $AdditionalMentionRecipients.Count -eq 0
+        }
+        Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -match 'clean-review mention was skipped' }
     }
 
     It 'builds PR routing identity from trusted config rather than caller-supplied links' {
@@ -489,6 +543,30 @@ Describe '<Role> Teams notification integration' -ForEach @(
         Invoke-TestNotification -Commit ''
         Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -Exactly -ParameterFilter {
             $SourceCommit -eq '' -and $PullRequestId -eq 42
+        }
+    }
+
+    Describe 'clean review mention gating' {
+        It 'requests the reviewer mention only for zero-finding completion notifications' {
+            $path = (Resolve-Path "$PSScriptRoot\..\src\Agents\reviewer\Start-ReviewerAgent.ps1").Path
+            $tokens = $null
+            $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+            $errors | Should -HaveCount 0
+            $commands = @($ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -ceq 'Send-ReviewerTeamsNotification'
+            }, $true))
+            $cleanCompletionCalls = @($commands | Where-Object {
+                $_.Extent.Text -match "-NotificationEvent\s+'reviewCompleted'" -and
+                    $_.Extent.Text -match 'AdditionalChannelMentionUpns.+\$allFindings\.Count -eq 0.+TeamsCleanReviewCcUpns'
+            })
+            $cleanCompletionCalls | Should -HaveCount 2
+            @($commands | Where-Object {
+                $_.Extent.Text -notmatch "-NotificationEvent\s+'reviewCompleted'" -and
+                    $_.Extent.Text -match 'AdditionalChannelMentionUpns'
+            }) | Should -HaveCount 0
         }
     }
 }

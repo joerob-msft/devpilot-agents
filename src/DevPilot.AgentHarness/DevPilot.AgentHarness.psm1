@@ -6073,26 +6073,47 @@ function New-AgentTeamsChannelMessagePayload {
         [Parameter(Mandatory)][string]$Body,
         [string[]]$Links = @(),
         [string]$MentionRecipientId = '',
-        [string]$MentionRecipientDisplayName = ''
+        [string]$MentionRecipientDisplayName = '',
+        [object[]]$AdditionalMentionRecipients = @()
     )
     $html = New-AgentTeamsMessageHtml -Title $Title -Body $Body -Links $Links
     $payload = @{ body = @{ contentType = 'html'; content = $html } }
-    $id = $MentionRecipientId.Trim()
-    $displayName = $MentionRecipientDisplayName.Trim()
-    if (-not $id -and -not $displayName) { return $payload }
-    $objectId = [Guid]::Empty
-    if (-not [Guid]::TryParse($id, [ref]$objectId) -or -not $displayName -or
-        $displayName.Length -gt 256 -or $displayName -match '[\p{C}]') {
-        Write-Warning 'Teams PR-owner mention was skipped because the bound owner identity is incomplete or invalid.'
-        return $payload
+    $candidates = [Collections.Generic.List[object]]::new()
+    if ($MentionRecipientId -or $MentionRecipientDisplayName) {
+        $candidates.Add(@{ id = $MentionRecipientId; displayName = $MentionRecipientDisplayName })
     }
-    $mentionText = [System.Net.WebUtility]::HtmlEncode($displayName)
-    $payload.body.content = "<at id=`"0`">$mentionText</at><br/>$html"
-    $payload.mentions = @(@{
-            id = 0
-            mentionText = $displayName
-            mentioned = @{ user = @{ id = $objectId.ToString(); displayName = $displayName; userIdentityType = 'aadUser' } }
-        })
+    foreach ($recipient in @($AdditionalMentionRecipients)) {
+        if ($null -ne $recipient) { $candidates.Add($recipient) }
+    }
+
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $mentions = [Collections.Generic.List[object]]::new()
+    $mentionTags = [Collections.Generic.List[string]]::new()
+    foreach ($candidate in $candidates) {
+        $id = [string](Get-AgentProviderValue -InputObject $candidate -Name 'id')
+        $displayName = [string](Get-AgentProviderValue -InputObject $candidate -Name 'displayName')
+        $id = $id.Trim()
+        $displayName = $displayName.Trim()
+        $objectId = [Guid]::Empty
+        if (-not [Guid]::TryParse($id, [ref]$objectId) -or -not $displayName -or
+            $displayName.Length -gt 256 -or $displayName -match '[\p{C}]') {
+            Write-Warning 'A Teams mention was skipped because its identity is incomplete or invalid.'
+            continue
+        }
+        $normalizedId = $objectId.ToString()
+        if (-not $seen.Add($normalizedId)) { continue }
+        $mentionId = $mentions.Count
+        $mentionTags.Add("<at id=`"$mentionId`">$([System.Net.WebUtility]::HtmlEncode($displayName))</at>")
+        $mentions.Add(@{
+                id = $mentionId
+                mentionText = $displayName
+                mentioned = @{ user = @{ id = $normalizedId; displayName = $displayName; userIdentityType = 'aadUser' } }
+            })
+    }
+    if ($mentions.Count -gt 0) {
+        $payload.body.content = "$($mentionTags -join ' ')<br/>$html"
+        $payload.mentions = $mentions.ToArray()
+    }
     return $payload
 }
 
@@ -6111,10 +6132,12 @@ function Send-AgentTeamsChannelMessage {
         [string[]]$Links = @(),
         [string]$MentionRecipientId = '',
         [string]$MentionRecipientDisplayName = '',
+        [object[]]$AdditionalMentionRecipients = @(),
         [Nullable[DateTime]]$DeadlineUtc
     )
     $payload = New-AgentTeamsChannelMessagePayload -Title $Title -Body $Body -Links $Links `
-        -MentionRecipientId $MentionRecipientId -MentionRecipientDisplayName $MentionRecipientDisplayName
+        -MentionRecipientId $MentionRecipientId -MentionRecipientDisplayName $MentionRecipientDisplayName `
+        -AdditionalMentionRecipients $AdditionalMentionRecipients
     $arguments = @{
         parentUrl = "/teams/$TeamId/channels/$ChannelId/messages"
         jsonBody  = $payload

@@ -266,6 +266,7 @@ function Invoke-AgentTeamsLocalChannelMessage {
         [string[]]$Links = @(),
         [string]$MentionRecipientId = '',
         [string]$MentionRecipientDisplayName = '',
+        [object[]]$AdditionalMentionRecipients = @(),
         [Nullable[DateTime]]$DeadlineUtc,
         [AllowNull()][hashtable]$OutputContext,
         [AllowNull()][hashtable]$SharedAuthority
@@ -372,7 +373,8 @@ function Invoke-AgentTeamsLocalChannelMessage {
         $resultOptions.Operation = $record.kind
         $messagesPath = "/teams/$([Uri]::EscapeDataString($TeamId))/channels/$([Uri]::EscapeDataString($ChannelId))/messages"
         $payload = New-AgentTeamsChannelMessagePayload -Title $Title -Body $Body -Links $Links `
-            -MentionRecipientId $MentionRecipientId -MentionRecipientDisplayName $MentionRecipientDisplayName
+            -MentionRecipientId $MentionRecipientId -MentionRecipientDisplayName $MentionRecipientDisplayName `
+            -AdditionalMentionRecipients $AdditionalMentionRecipients
         if ($SharedAuthority -and $SharedAuthority.Mode -ceq 'bootstrap') {
             $payload.body.content = $SharedAuthority.RootPrefix + $payload.body.content
         }
@@ -488,6 +490,7 @@ function Send-AgentTeamsThreadedChannelMessage {
         [Parameter(Mandatory)][ValidateLength(1, 4096)][string]$Title,
         [Parameter(Mandatory)][ValidateLength(1, 24576)][string]$Body,
         [string[]]$Links = @(), [string]$MentionRecipientId = '', [string]$MentionRecipientDisplayName = '',
+        [object[]]$AdditionalMentionRecipients = @(),
         [string]$PullRequestUrl = '',
         [Nullable[DateTime]]$DeadlineUtc, [AllowNull()][hashtable]$OutputContext,
         [AllowNull()][hashtable]$ReferenceContext, [switch]$PreviewOnly
