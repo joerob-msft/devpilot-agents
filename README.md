@@ -50,6 +50,7 @@ marker. Anything else it prints is ignored.
 src/
   DevPilot.AgentHarness/     # the shared, provider-agnostic module
   DevPilot.OwnerPipeline/    # experimental generic Owner review facade
+  DevPilot.OwnerAdapters/    # read-only production/replay acquisition boundary
   DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
   Agents/
     review-handler/          # an agent: script + prompt + fixtures
@@ -59,10 +60,11 @@ tools/                       # launchers, dashboard entry point, and repo checks
 docs/                        # how to add an agent
 ```
 
-The experimental Owner facade is documented in
-[docs/owner-pipeline-facade.md](docs/owner-pipeline-facade.md). It is an
-offline, zero-write-by-default contract only; it is not connected to the
-deployed reviewer or scheduler.
+The experimental Owner facade and its acquisition boundary are documented in
+[docs/owner-pipeline-facade.md](docs/owner-pipeline-facade.md) and
+[docs/owner-production-adapters.md](docs/owner-production-adapters.md). They
+remain preview-only and separate from the deployed reviewer, scheduler, state,
+and writer.
 
 **Consumers keep only a config file.** Nothing employer-, repository-, or
 person-specific lives in this repo outside `samples/` — a CI check enforces that
