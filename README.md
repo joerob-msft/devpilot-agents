@@ -52,6 +52,7 @@ src/
   DevPilot.OwnerPipeline/    # experimental generic Owner review facade
   DevPilot.OwnerAdapters/    # read-only production/replay acquisition boundary
   DevPilot.OwnerCapability/  # preview-only injected Owner semantic boundary
+  DevPilot.OwnerModelRunner/ # bounded test-child and offline replay runner
   DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
   Agents/
     review-handler/          # an agent: script + prompt + fixtures
@@ -65,7 +66,9 @@ The experimental Owner facade and its acquisition boundary are documented in
 [docs/owner-pipeline-facade.md](docs/owner-pipeline-facade.md) and
 [docs/owner-production-adapters.md](docs/owner-production-adapters.md). The
 injected semantic execution layer is documented in
-[docs/owner-semantic-capability.md](docs/owner-semantic-capability.md). These
+[docs/owner-semantic-capability.md](docs/owner-semantic-capability.md), and its
+bounded process/replay adapter in
+[docs/owner-model-runner.md](docs/owner-model-runner.md). These
 layers remain preview-only and separate from the deployed reviewer, scheduler,
 state, and writer.
 
