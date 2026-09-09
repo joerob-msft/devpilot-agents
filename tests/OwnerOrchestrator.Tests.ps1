@@ -117,6 +117,9 @@ Describe 'Owner v2 preview orchestrator manifest and state' {
     It 'prepares immutable v2-only declarations, evidence, records, and index outside the repository' {
         $stateRoot = New-TestStateRoot
         $manifestPath = New-TestManifestFile -Name 'cohort.json'
+        & $script:OrchestratorModule {
+            param($Root) Resolve-OwnerV2StateRoot -StateRoot $Root -Create
+        } $stateRoot | Out-Null
         $v1Sentinel = Join-Path $stateRoot (Join-Path 'owner-v1-state' (Join-Path 'queues' 'sentinel.json'))
         New-Item -ItemType Directory -Path (Split-Path -Parent $v1Sentinel) -Force | Out-Null
         Set-Content -LiteralPath $v1Sentinel -Value 'v1-sentinel' -NoNewline
@@ -416,7 +419,7 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $run.records[0].reason | Should -Be 'reservation-lost'
         (Get-Content -LiteralPath $recordFile.FullName -Raw |
             ConvertFrom-Json -AsHashtable -Depth 32).lease.id | Should -Be 'replacement-lease'
-        @(Get-ChildItem -LiteralPath $recordFile.DirectoryName -Filter '*.json').Count |
+        @(Get-ChildItem -LiteralPath $recordFile.DirectoryName -Filter '*.json' -Force).Count |
             Should -Be 2
     }
 
