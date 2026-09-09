@@ -53,6 +53,7 @@ src/
   DevPilot.OwnerAdapters/    # read-only production/replay acquisition boundary
   DevPilot.OwnerCapability/  # preview-only injected Owner semantic boundary
   DevPilot.OwnerModelRunner/ # bounded test-child and offline replay runner
+  DevPilot.OwnerOrchestrator/ # preview-only v2 cohort state lifecycle
   DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
   Agents/
     review-handler/          # an agent: script + prompt + fixtures
@@ -68,9 +69,11 @@ The experimental Owner facade and its acquisition boundary are documented in
 injected semantic execution layer is documented in
 [docs/owner-semantic-capability.md](docs/owner-semantic-capability.md), and its
 bounded process/replay adapter in
-[docs/owner-model-runner.md](docs/owner-model-runner.md). These
-layers remain preview-only and separate from the deployed reviewer, scheduler,
-state, and writer.
+[docs/owner-model-runner.md](docs/owner-model-runner.md). The layer 5 preview
+cohort orchestrator is documented in
+[docs/owner-preview-orchestrator.md](docs/owner-preview-orchestrator.md).
+These layers remain preview-only and separate from the deployed reviewer,
+scheduler, state, and writer.
 
 **Consumers keep only a config file.** Nothing employer-, repository-, or
 person-specific lives in this repo outside `samples/` — a CI check enforces that

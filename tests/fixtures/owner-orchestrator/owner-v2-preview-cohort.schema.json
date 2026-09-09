@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/devpilot/owner-v2-preview-cohort.schema.json",
+  "title": "Owner v2 preview cohort",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "entries"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "owner-v2-preview-cohort" },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^v1:sha256:[0-9a-f]{64}$" },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "safeText": { "type": "string", "minLength": 1, "maxLength": 512, "not": { "pattern": "[\\r\\n]" } },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "mode", "subject", "head", "target", "rule", "capability", "model", "config", "acquisition"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$" },
+        "mode": { "enum": ["replay", "live"] },
+        "subject": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repositoryId", "projectId", "pullRequestId"],
+          "properties": {
+            "repositoryId": { "$ref": "#/$defs/safeText" },
+            "projectId": { "$ref": "#/$defs/safeText" },
+            "pullRequestId": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "head": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sourceCommit"],
+          "properties": { "sourceCommit": { "$ref": "#/$defs/commit" } }
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["targetCommit", "targetRef"],
+          "properties": {
+            "targetCommit": { "$ref": "#/$defs/commit" },
+            "targetRef": { "$ref": "#/$defs/safeText" }
+          }
+        },
+        "rule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repositoryId", "path", "commit", "section", "hash", "length"],
+          "properties": {
+            "repositoryId": { "$ref": "#/$defs/safeText" },
+            "path": { "$ref": "#/$defs/safeText" },
+            "commit": { "$ref": "#/$defs/commit" },
+            "section": { "$ref": "#/$defs/safeText" },
+            "hash": { "$ref": "#/$defs/digest" },
+            "length": { "type": "integer", "minimum": 1, "maximum": 134217728 }
+          }
+        },
+        "capability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "digest"],
+          "properties": {
+            "id": { "$ref": "#/$defs/safeText" },
+            "digest": { "$ref": "#/$defs/digest" }
+          }
+        },
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "digest"],
+          "properties": {
+            "id": { "$ref": "#/$defs/safeText" },
+            "digest": { "$ref": "#/$defs/digest" }
+          }
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "digest"],
+          "properties": {
+            "id": { "$ref": "#/$defs/safeText" },
+            "digest": { "$ref": "#/$defs/digest" }
+          }
+        },
+        "acquisition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["payloadDigest"],
+          "properties": {
+            "payloadDigest": { "$ref": "#/$defs/digest" },
+            "package": { "type": "object" }
+          }
+        },
+        "replay": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["modelRecords"],
+          "properties": {
+            "modelRecords": {
+              "type": "array",
+              "maxItems": 128,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["executionUnitId", "nonce", "inputDigest", "subjectBinding", "responseBytesBase64"],
+                "properties": {
+                  "executionUnitId": { "$ref": "#/$defs/safeText" },
+                  "nonce": { "type": "string", "pattern": "^[0-9a-f]{36}$" },
+                  "inputDigest": { "$ref": "#/$defs/digest" },
+                  "subjectBinding": { "$ref": "#/$defs/digest" },
+                  "responseBytesBase64": { "type": "string", "pattern": "^[A-Za-z0-9+/]*={0,2}$" }
+                }
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "replay" } }, "required": ["mode"] },
+          "then": { "required": ["replay"] }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "live" } }, "required": ["mode"] },
+          "then": {
+            "not": { "required": ["replay"] },
+            "properties": {
+              "acquisition": { "not": { "required": ["package"] } }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
