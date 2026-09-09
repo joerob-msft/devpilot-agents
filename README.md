@@ -101,6 +101,31 @@ must live inside that repository.
 | `review-handler` | Your own open PRs | Finds reviewer feedback you have not answered, resumes the coding session where the code was written, makes the fix, replies, pushes, optionally requeues missing, failed, stale, or expired validation (even when no commit was needed), and sets auto-complete |
 | `reviewer` | Other people's PRs | Reviews the diff, reports findings, and assesses human review comments; optionally posts findings, replies in-place, and casts a non-blocking vote |
 
+### Repository handler skill
+
+A consumer can opt the review-handler into repository-owned guidance:
+
+```json
+"handlerSkills": {
+  "primary": ".github/skills/pr-comment-handler/SKILL.md"
+}
+```
+
+The path must be a repository-relative Markdown file under `.github/skills`.
+It is resolved from the consumer repository identified by `RepoPath`, even when
+the handler runs the model from a separate PR worktree. The skill is read as
+unattended, wrapper-managed guidance only: it cannot change tool grants,
+permissions, model selection, PreviewOnly behavior, PR/worktree binding, or the
+`REVIEW_HANDLER_RESULT_V1` contract, and its metadata is not executed as
+configuration. Invalid explicit configuration fails startup. Omitting
+`handlerSkills` preserves the existing handler behavior.
+
+Roll out the setting only after the consumer has both the referenced skill file
+and a devpilot-agents toolkit version that supports `handlerSkills.primary`.
+Do not enable it against an older immutable toolkit cache; update the toolkit
+through the consumer's normal rollout mechanism first. The default sample stays
+unconfigured so it remains usable without shipping a repository-specific skill.
+
 ### `reviewer` — a model with no write tools
 
 The reviewer inverts the usual arrangement. The model is granted **no write tool

@@ -31,14 +31,19 @@ BeforeAll {
     function New-TestLaunch {
         param(
             [Parameter(Mandatory)][hashtable[]]$Responses,
-            [string]$ResumeSessionId = 'stale-session'
+            [string]$ResumeSessionId = 'stale-session',
+            [string]$StandardInputContent = 'prompt'
         )
         $calls = New-Object System.Collections.Generic.List[hashtable]
         $responseQueue = New-Object System.Collections.Generic.Queue[hashtable]
         foreach ($response in $Responses) { $responseQueue.Enqueue($response) }
         $invoker = {
             param([hashtable]$Parameters)
-            $calls.Add(@{ ArgumentList = @($Parameters.ArgumentList) })
+            $calls.Add(@{
+                    ArgumentList = @($Parameters.ArgumentList)
+                    StandardInputContent = [string]$Parameters.StandardInputContent
+                    WorkingDirectory = [string]$Parameters.WorkingDirectory
+                })
             return $responseQueue.Dequeue()
         }.GetNewClosure()
         $rejected = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -47,7 +52,7 @@ BeforeAll {
             -AgencyPath 'agency.exe' `
             -ResumeArgumentList @('copilot', '--resume', $ResumeSessionId) `
             -FreshArgumentList @('copilot') `
-            -StandardInputContent 'prompt' `
+            -StandardInputContent $StandardInputContent `
             -WorkingDirectory $TestDrive `
             -EnvironmentVariablesToRemove @() `
             -TimeoutSeconds 30 `
@@ -65,7 +70,8 @@ BeforeAll {
 
 Describe 'review-handler resume fallback' {
     It 'retries an unknown resume target exactly once without --resume' {
-        $result = New-TestLaunch -Responses @(
+        $payload = 'Primary handler skill: C:\consumer\.github\skills\handler\SKILL.md'
+        $result = New-TestLaunch -StandardInputContent $payload -Responses @(
             @{ ExitCode = 1; TimedOut = $false; StdOut = ''; StdErr = 'No session, task, or name matched: stale-session' },
             @{ ExitCode = 0; TimedOut = $false; StdOut = 'ok'; StdErr = '' }
         )
@@ -73,6 +79,10 @@ Describe 'review-handler resume fallback' {
         $result.Calls.Count | Should -Be 2
         $result.Calls[0].ArgumentList | Should -Contain '--resume'
         $result.Calls[1].ArgumentList | Should -Not -Contain '--resume'
+        $result.Calls[0].StandardInputContent | Should -BeExactly $payload
+        $result.Calls[1].StandardInputContent | Should -BeExactly $payload
+        $result.Calls[0].WorkingDirectory | Should -BeExactly $TestDrive
+        $result.Calls[1].WorkingDirectory | Should -BeExactly $TestDrive
         $result.Launch.RetriedFresh | Should -BeTrue
         $result.Launch.Run.ExitCode | Should -Be 0
         $result.Rejected.Contains('stale-session') | Should -BeTrue
