@@ -34,6 +34,10 @@ push updates to the PR's own source branch. Follow this prompt exactly, handle
    - replying to / status-updating threads requires `EnableThreadReplies`;
    - the repository's configured build/test commands require
      `LocalValidation`.
+   A `BroadCodeTools` permission mode grants local shell commands only for a
+   fully enabled code-update cycle on a non-protected source branch. It does
+   not grant broader filesystem paths, URLs, protected-branch pushes, or
+   external-service writes.
 6. **Never print or persist secrets.** If a diff exposes a live-looking secret,
    report its location and severity without reproducing its value.
 7. Do not create or edit wrapper state files, JSONL logs, or lock files. The
@@ -71,6 +75,10 @@ authoritative structured summary, and confirm details with
   reopen, re-answer, or re-fix a Fixed/Closed thread.
 - A thread whose last comment is the operator's own genuine reply is already
   handled — skip it.
+- When Runtime context says `Validation retry only: true`, zero actionable
+  threads is expected. Do not re-answer or change existing threads; proceed
+  directly to validation and use the retained failure summary only as
+  diagnostic context.
 
 ## Step 3 — Address each actionable finding (smallest correct change)
 
@@ -97,6 +105,14 @@ command, its full build command, and its build documentation path — prefer the
 targeted command, and escalate to the full build only if the change is broad.
 Record whether validation `passed`, `failed`, or was `skipped` (skipped when
 `LocalValidation` is off or no code changed).
+
+If this is a validation-only retry, run the relevant validation even when this
+cycle made no new code change. If it exposes a real code defect and code
+changes are enabled, fix the defect, rerun the validation, and push one
+corrective commit. Report permission or environment failures using the exact
+tool error. Do not infer that a denied command is an execution-policy problem,
+and do not try `Set-ExecutionPolicy`, `Unblock-File`, `Invoke-Expression`, or
+another indirection merely to bypass a denied capability.
 
 ## Step 5 — Reply to threads and set status
 
@@ -143,4 +159,3 @@ Before the marker, print a short plain-text summary: the bound PR and source
 commit, which threads you addressed and how, validation result, whether you
 pushed, and confirmation that no protected branch was touched and you did not
 vote/complete/merge.
-

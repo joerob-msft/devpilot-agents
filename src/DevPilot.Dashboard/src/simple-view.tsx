@@ -5,7 +5,8 @@ import type { PullRequestHistoryEntry } from "./history.js";
 import type { AutomationAgentStatus, AutomationStatus, CapabilitySummary, ResolvedManualTarget, RunPrepared, RunScheduleMode, ScanNowResult } from "./dispatch.js";
 import type { ManualProgress } from "./manual-progress.js";
 import type { ManualMode } from "./app.js";
-import { eventNarrative, line, shortCommit } from "./format.js";
+import { age, duration, eventNarrative, line, shortCommit } from "./format.js";
+import { liveElapsedMilliseconds } from "./reducer.js";
 
 export interface SimpleColors {
   panel: string; panelAlt: string; border: string; accent: string;
@@ -72,11 +73,15 @@ export function simpleCapability(name: string): string {
 }
 
 export function simpleInstanceRow(state: InstanceState): SimpleRow {
+  const now = Date.now();
   const event = state.timeline.at(-1);
   const failure = state.blocked?.reason || (state.status === "failed" ? state.completion?.reason : "") ||
     state.sourceDiagnostics.at(-1)?.message || "";
   const outcome = state.completion?.result || (state.exitObservedMs !== null ? "Interrupted / outcome unknown" : "Not reported");
-  const activity = failure || (event ? eventNarrative(event) : state.modelActivity) || "No activity reported";
+  const baseActivity = failure || (event ? eventNarrative(event) : state.modelActivity) || "No activity reported";
+  const showLiveTiming = state.status === "running" || state.status === "stale";
+  const phaseTiming = showLiveTiming ? duration(liveElapsedMilliseconds(state, now)) : "";
+  const activity = showLiveTiming ? `${baseActivity} (${phaseTiming})` : baseActivity;
   const reference = `${event?.repositoryIdentity?.slug || state.repository || "Repository not reported"} / ${state.pullRequestId ? `PR #${state.pullRequestId}` : "No PR selected"}`;
   return {
     key: `instance:${state.key}`, kind: "instance", agent: simpleRole(state.agent), pullRequestId: state.pullRequestId, reference,
@@ -87,7 +92,9 @@ export function simpleInstanceRow(state: InstanceState): SimpleRow {
       ...(failure ? [`Action needed: ${failure}`] : []),
       state.pullRequestTitle || "Title not reported",
       ...(state.pullRequestAuthor ? [`Author: ${state.pullRequestAuthor}`] : []),
-      `Phase: ${state.phase || "Not reported"}`, `Latest activity: ${activity}`,
+      `Phase: ${state.phase || "Not reported"}${showLiveTiming ? ` (${phaseTiming})` : ""}`,
+      ...(state.lastHeartbeatMs ? [`Heartbeat: ${age(state.lastHeartbeatMs, now)}`] : []),
+      `Latest activity: ${activity}`,
       `Outcome: ${outcome}`,
       ...(state.completion?.summary ? [state.completion.summary] : []),
       ...(state.completion?.reason && state.completion.reason !== failure ? [state.completion.reason] : []),
