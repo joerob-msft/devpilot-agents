@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "kind": "owner-parity-qualification",
+  "expectedV1Snapshot": {
+    "fileCount": 1,
+    "byteCount": 2,
+    "newestWriteTicks": 3,
+    "rootHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "entries": [
+    {
+      "id": "generic-preserved-case",
+      "baseline": {
+        "headKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "candidate": {
+        "mode": "read",
+        "observationPath": "C:\\private\\owner-v2-state\\observation.json"
+      },
+      "evidence": {
+        "class": "synthetic",
+        "semanticProvenance": "offline-replay-deterministic",
+        "inputContract": "independently-validated",
+        "truthCoverage": "complete"
+      },
+      "adjudication": [
+        {
+          "key": "method-case-001",
+          "eligibility": "method",
+          "truth": "violation",
+          "baseline": {
+            "identity": "owner-v1:rule:method-001",
+            "disposition": "violation"
+          },
+          "candidate": {
+            "identity": "owner-v2:rule:method-001",
+            "disposition": "violation"
+          }
+        }
+      ]
+    }
+  ]
+}
