@@ -309,7 +309,10 @@ activity beside it on wider terminals, or a compact list on narrow terminals.
 Use `Enter` for details and **`m` Start agent, `h` History, `a` Advanced, `q` Quit**.
 Advanced keeps the full panes, filters, diagnostics, settings, and stale-instance
 controls; press `a` again to return to Simple. Changing the view never changes
-the launch's authority.
+the launch's authority. Running rows show live phase elapsed time and heartbeat
+age so a long model call is visibly active rather than appearing frozen. Event
+log discovery uses asynchronous filesystem traversal and cannot block keyboard
+input while scanning retained launch history.
 
 Golden still starts **both agents automatically**, without a manual command,
 and waits **900 seconds (15 minutes)** between successful scans by default.

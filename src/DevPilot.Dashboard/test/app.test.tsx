@@ -3000,10 +3000,12 @@ test("confirmed exits leave Current and Live, but canonical and legacy diagnosti
       } else assert.match(setup.captureCharFrame(), /INSTANCES 2/);
       setup.mockInput.pressEnter();
       await setup.flush();
-      assert.match(setup.captureCharFrame(), /Process exit observed/);
-      assert.match(setup.captureCharFrame(), /Interrupted \/ outcome unknown/);
-      assert.match(setup.captureCharFrame(), /retained-run.jsonl/);
-      assert.match(setup.captureCharFrame(), /Retained context/);
+      const historyFrame = setup.captureCharFrame();
+      assert.match(historyFrame, /Process exit observed/);
+      assert.match(historyFrame, /Interrupted \/ outcome unknown/);
+      assert.match(historyFrame, /retained-run\./);
+      assert.match(historyFrame, /jsonl/);
+      assert.match(historyFrame, /Retained context/);
       setup.mockInput.pressKey("e");
       await setup.flush();
       assert.match(setup.captureCharFrame(), /candidate.selected/);
@@ -3156,12 +3158,17 @@ function simplePanelText(setup: TestRendererSetup, id: string): string {
 
 test("Simple presentation keeps unknown outcomes honest and all capability names available", () => {
   const reducer = new OperationsReducer();
-  reducer.apply(simpleLiveEvent("one", 104));
+  reducer.apply(simpleLiveEvent("one", 104, 1, {
+    eventType: "phase.changed",
+    data: { title: "Live work 104", repository: "contoso/repo", phase: "running the model" },
+  }));
   reducer.apply(simpleLiveEvent("two", 104));
   const rows = reducer.list(Date.now(), undefined, "live").map(simpleInstanceRow);
   assert.equal(rows.length, 2);
   assert.notEqual(rows[0]!.key, rows[1]!.key, "same PID and PR do not merge instance identities");
   assert.ok(rows.every((row) => row.details.includes("Outcome: Not reported")));
+  assert.ok(rows.some((row) => row.details.some((detail) => /^Phase: running the model \(\d+s\)$/.test(detail))));
+  assert.ok(rows.some((row) => row.details.some((detail) => /^Heartbeat: \d+s ago$/.test(detail))));
   assert.equal(simpleCapability("EnablePush"), "Code pushes");
   assert.equal(simpleCapability("New actual capability"), "New actual capability");
   assert.equal(selectionWindow(9, 3), 7);

@@ -56,7 +56,7 @@ test("accepted event paths can be registered dynamically without duplicates", ()
   assert.equal(tailer.registerEventLogPath(path), false);
 });
 
-test("more than 500 dispatch-like directories cannot hide canonical flat event logs", () => {
+test("more than 500 dispatch-like directories cannot hide canonical flat event logs", async () => {
   const root = join(process.cwd(), `.tailer-discovery-${process.pid}-${Date.now()}`);
   try {
     for (let index = 0; index < 501; index++) mkdirSync(join(root, `dispatch-${String(index).padStart(3, "0")}`), { recursive: true });
@@ -64,7 +64,7 @@ test("more than 500 dispatch-like directories cannot hide canonical flat event l
     mkdirSync(eventDirectory, { recursive: true });
     const eventPath = join(eventDirectory, "instance.jsonl");
     writeFileSync(eventPath, "");
-    assert.ok(discoverEventLogs([root], []).includes(eventPath));
+    assert.ok((await discoverEventLogs([root], [])).includes(eventPath));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
