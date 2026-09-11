@@ -434,15 +434,14 @@ Describe 'Owner no-tools model provider' {
         }
     }
 
-    It 'locks the Copilot CLI to an exact empty tool and no-session argument contract' {
+    It 'locks the Copilot CLI to an exact prompt-mode empty-tool contract' {
         $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
             -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
         @($provider.ArgumentPrefix) | Should -Be @(
-            '--acp',
-            '--stdio',
             '--no-ask-user',
             '--disallow-temp-dir',
             '--available-tools=__devpilot_no_such_tool_7f2c17a64a3e4d6b__',
+            '--allow-all-tools',
             '--disable-builtin-mcps',
             '--no-custom-instructions',
             '--no-remote',
@@ -456,9 +455,9 @@ Describe 'Owner no-tools model provider' {
             '--secret-env-vars=COPILOT_GITHUB_TOKEN'
         )
         foreach ($forbidden in @(
-                '--prompt', '--interactive',
+                '--acp', '--stdio', '--prompt', '--interactive',
                 '--resume', '--continue', '--connect', '--session-id',
-                '--allow-all', '--allow-all-tools', '--yolo',
+                '--allow-all', '--yolo',
                 '--additional-mcp-config', '--enable-mcp-server',
                 '--plugin-dir', '--agent', '--enable-memory', '--add-dir'
             )) {
@@ -466,7 +465,10 @@ Describe 'Owner no-tools model provider' {
         }
         Test-Path -LiteralPath $provider.LaunchRoot | Should -BeFalse
 
-        $provider.ArgumentPrefix += '--allow-all-tools'
+        $provider.ArgumentPrefix = @($provider.ArgumentPrefix | ForEach-Object {
+                if ($_ -clike '--available-tools=*') { '--available-tools=shell' }
+                else { $_ }
+            })
         {
             New-OwnerModelProcessRunner -Provider $provider -EnableRealLaunch
         } | Should -Throw '*policy was mutated*'
@@ -551,32 +553,94 @@ Describe 'Owner no-tools model provider' {
         $staged.publisher | Should -BeTrue
     }
 
-    It 'refuses the real provider before placing bounded stimulus in process arguments' {
-        $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
-            -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
-        $message = & (Get-Module DevPilot.OwnerModelRunner) {
-            param($Provider)
-            $directory = New-OwnerModelAttemptDirectory -Provider $Provider
-            try {
+    It 'places only a bounded credential-free stimulus in the supported prompt argument' {
+        $prior = $env:GH_TOKEN
+        try {
+            $env:GH_TOKEN = 'gho_testcredentialvalue'
+            $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
+                -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
+            $summary = & (Get-Module DevPilot.OwnerModelRunner) {
+                param($Provider)
+                $directory = New-OwnerModelAttemptDirectory -Provider $Provider
                 try {
-                    [void](New-OwnerModelInvocation -Provider $Provider `
-                            -EnvelopeBase64 'private-source-stimulus' `
-                            -AttemptDirectory $directory)
-                    return 'unexpected-success'
+                    $json = '{"nonce":"bounded-nonce","stimulus":{"rule":{"content":"generic rule"},"construct":{"name":"GenericMethod"},"executionUnitId":"unit:' + ('a' * 64) + '"}}'
+                    $envelope = ConvertTo-OwnerModelBase64Url -Bytes (
+                        [Text.Encoding]::UTF8.GetBytes($json))
+                    $invocation = New-OwnerModelInvocation -Provider $Provider `
+                        -EnvelopeBase64 $envelope -AttemptDirectory $directory `
+                        -IncludeCredential
+                    [ordered]@{
+                        argumentsBeforePrompt = @($invocation.ArgumentList[0..(
+                                    $invocation.ArgumentList.Count - 2)])
+                        prompt = [string]$invocation.ArgumentList[-1]
+                        directoryEntries = @(
+                            Get-ChildItem -LiteralPath $directory -Force |
+                                Select-Object -ExpandProperty Name |
+                                Sort-Object)
+                        invocationDigest = $invocation.InvocationDigest
+                    }
                 }
-                catch {
-                    return $_.Exception.Message
+                finally {
+                    Remove-Item -LiteralPath $directory -Recurse -Force
+                    Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
                 }
-            }
-            finally {
-                Remove-Item -LiteralPath $directory -Recurse -Force
-                Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
-            }
-        } $provider
+            } $provider
 
-        $message | Should -BeExactly (
-            '[owner-model-launch-unavailable] ' +
-            'copilot-cli-acp-confidentiality-unproven')
+            $summary.argumentsBeforePrompt[-1] | Should -BeExactly '--prompt'
+            $summary.argumentsBeforePrompt[-3..-2] | Should -Be @('--model', 'gpt-5.6-sol')
+            $summary.prompt | Should -Match 'BOUNDED_STIMULUS_JSON'
+            $summary.prompt | Should -Match 'GenericMethod'
+            $summary.prompt | Should -Not -Match 'gho_testcredentialvalue'
+            [Text.Encoding]::UTF8.GetByteCount($summary.prompt) | Should -BeLessOrEqual 12288
+            @($summary.directoryEntries) | Should -Be @(
+                'appdata', 'home', 'localappdata', 'temp')
+            $summary.invocationDigest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        }
+        finally {
+            $env:GH_TOKEN = $prior
+        }
+    }
+
+    It 'rejects oversized or credential-bearing prompts without echoing them' -TestCases @(
+        @{ Content = 'gho_testcredentialvalue'; Expected = '*provider credential*' }
+        @{ Content = ('x' * 20000); Expected = '*byte limit*' }
+    ) {
+        param($Content, $Expected)
+        $prior = $env:GH_TOKEN
+        try {
+            $env:GH_TOKEN = 'gho_testcredentialvalue'
+            $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
+                -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
+            $message = & (Get-Module DevPilot.OwnerModelRunner) {
+                param($Provider, $Content)
+                $directory = New-OwnerModelAttemptDirectory -Provider $Provider
+                try {
+                    $json = ConvertTo-Json -Compress -InputObject @{
+                        stimulus = @{ construct = @{ snippet = $Content } }
+                    }
+                    $envelope = ConvertTo-OwnerModelBase64Url -Bytes (
+                        [Text.Encoding]::UTF8.GetBytes($json))
+                    try {
+                        [void](New-OwnerModelInvocation -Provider $Provider `
+                                -EnvelopeBase64 $envelope -AttemptDirectory $directory `
+                                -IncludeCredential)
+                        'unexpected-success'
+                    }
+                    catch {
+                        $_.Exception.Message
+                    }
+                }
+                finally {
+                    Remove-Item -LiteralPath $directory -Recurse -Force
+                    Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
+                }
+            } $provider $Content
+            $message | Should -BeLike $Expected
+            $message | Should -Not -Match [regex]::Escape($Content)
+        }
+        finally {
+            $env:GH_TOKEN = $prior
+        }
     }
 
     It 'negotiates only ACP v1 with no client file, terminal, or auth capability' {
@@ -687,31 +751,67 @@ Describe 'Owner no-tools model provider' {
         $digests[0] | Should -Not -BeExactly $digests[2]
     }
 
-    It 'fails closed before a real ACP launch when platform proof is incomplete' {
+    It 'reports prompt-mode preflight unavailable when native provider identity is unproven' {
         $prior = $env:GH_TOKEN
         try {
             $env:GH_TOKEN = 'gho_testcredentialvalue'
             $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
                 -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
             $preflight = Test-OwnerModelProviderPreflight -Provider $provider
-            $expectedReason = if ($IsWindows) {
-                'acp-atomic-process-containment-unavailable'
-            }
-            else {
-                'copilot-cli-publisher-identity-unproven'
-            }
             $preflight.available | Should -BeFalse
-            $preflight.reason | Should -Be $expectedReason
-            $preflight.effectiveTools | Should -Be 'not-proven-acp-session-scope'
+            $preflight.reason | Should -Be 'copilot-cli-publisher-identity-unproven'
+            @($preflight.effectiveTools).Count | Should -Be 0
+            $preflight.promptTransport | Should -BeExactly 'argv'
+            $preflight.localProcessMetadataExposure | Should -BeTrue
             $preflight.modelCalls | Should -Be 0
             $preflight.providerWrites | Should -Be 0
             Test-Path -LiteralPath $provider.LaunchRoot | Should -BeFalse
             {
                 New-OwnerModelProcessRunner -Provider $provider -EnableRealLaunch
-            } | Should -Throw "*$expectedReason*"
+            } | Should -Throw '*publisher-identity-unproven*'
         }
         finally {
             $env:GH_TOKEN = $prior
+        }
+    }
+
+    It 'reports available and unavailable credential states for a compatible native CLI' {
+        if (-not $IsWindows) {
+            Set-ItResult -Skipped -Because 'The native publisher check is Windows-only.'
+            return
+        }
+        $copilot = @(Get-Command copilot -CommandType Application -ErrorAction SilentlyContinue)
+        if ($copilot.Count -ne 1) {
+            Set-ItResult -Skipped -Because 'Exactly one native Copilot CLI is not installed.'
+            return
+        }
+        $saved = @{}
+        foreach ($name in @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+            $saved[$name] = [Environment]::GetEnvironmentVariable($name)
+            [Environment]::SetEnvironmentVariable($name, $null)
+        }
+        try {
+            $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
+                -CredentialEnvironmentName GH_TOKEN
+            $missing = Test-OwnerModelProviderPreflight -Provider $provider
+            $missing.available | Should -BeFalse
+            $missing.reason | Should -BeExactly 'copilot-cli-credential-unavailable'
+
+            $env:GH_TOKEN = 'gho_testcredentialvalue'
+            $available = Test-OwnerModelProviderPreflight -Provider $provider
+            $available.available | Should -BeTrue
+            $available.reason | Should -BeExactly 'available-with-local-process-metadata-risk'
+            $available.cliVersion | Should -Match '^1\.0\.(?:79|8[0-9])'
+            @($available.effectiveTools).Count | Should -Be 0
+            $available.localProcessMetadataExposure | Should -BeTrue
+            $available.atomicProcessContainment | Should -BeFalse
+            $available.modelCalls | Should -Be 0
+            $available.providerWrites | Should -Be 0
+        }
+        finally {
+            foreach ($name in $saved.Keys) {
+                [Environment]::SetEnvironmentVariable($name, $saved[$name])
+            }
         }
     }
 
@@ -743,7 +843,12 @@ Describe 'Owner no-tools model provider' {
         $run = Invoke-TestProcessRunner -Mode valid
         $run.Telemetry.attempts | Should -Be 1
         $run.Telemetry.modelStarts | Should -Be 0
+        $run.Telemetry.modelCalls | Should -Be 0
+        $run.Telemetry.providerWrites | Should -Be 0
+        @($run.Telemetry.effectiveTools).Count | Should -Be 0
         $run.Telemetry.provider.kind | Should -Be 'fake-process'
+        $run.Telemetry.provider.promptTransport | Should -BeExactly 'private-file'
+        $run.Telemetry.provider.localProcessMetadataExposure | Should -BeFalse
         $run.Telemetry.policy.availableTools.Count | Should -Be 0
         $run.Telemetry.policy.providerWrite | Should -BeFalse
         $run.Telemetry.records[0].processStarted | Should -BeTrue
