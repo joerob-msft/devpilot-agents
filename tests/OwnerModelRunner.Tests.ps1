@@ -3,6 +3,7 @@ BeforeAll {
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1" -Force
 
     $script:child = (Resolve-Path "$PSScriptRoot\fixtures\OwnerModelChild.ps1").Path
+    $script:acpChild = (Resolve-Path "$PSScriptRoot\fixtures\OwnerAcpChild.ps1").Path
     $script:pwsh = (Get-Command pwsh).Source
 
     function New-TestModelRequest {
@@ -50,6 +51,34 @@ BeforeAll {
             Response = $response
             Telemetry = Get-OwnerModelRunnerTelemetry -Runner $runner
         }
+    }
+
+    function Invoke-TestAcpInitialize {
+        param(
+            [Parameter(Mandatory)][string]$Mode,
+            [string]$StatePath,
+            [int]$DeadlineMilliseconds = 3000
+        )
+        $arguments = @('-NoProfile', '-File', $script:acpChild, $Mode)
+        if ($StatePath) { $arguments += $StatePath }
+        else { $arguments += '-' }
+        $provider = New-OwnerModelFakeProvider -FilePath $script:pwsh `
+            -ArgumentList $arguments
+        return & (Get-Module DevPilot.OwnerModelRunner) {
+            param($Provider, $Arguments, $DeadlineMilliseconds)
+            $directory = New-OwnerModelAttemptDirectory -Provider $Provider
+            try {
+                Invoke-OwnerModelAcpInitializePreflight -Provider $Provider `
+                    -AttemptDirectory $directory -ArgumentList $Arguments `
+                    -DeadlineMilliseconds $DeadlineMilliseconds
+            }
+            finally {
+                if (Test-Path -LiteralPath $directory -PathType Container) {
+                    Remove-Item -LiteralPath $directory -Recurse -Force
+                }
+                Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
+            }
+        } $provider $arguments $DeadlineMilliseconds
     }
 }
 
@@ -397,7 +426,8 @@ Describe 'Owner no-tools model provider' {
         $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
             -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
         @($provider.ArgumentPrefix) | Should -Be @(
-            '--silent',
+            '--acp',
+            '--stdio',
             '--no-ask-user',
             '--disallow-temp-dir',
             '--available-tools=__devpilot_no_such_tool_7f2c17a64a3e4d6b__',
@@ -409,12 +439,12 @@ Describe 'Owner no-tools model provider' {
             '--no-bash-env',
             '--no-experimental',
             '--no-color',
-            '--stream', 'off',
-            '--output-format', 'text',
             '--log-level', 'none',
-            '--max-autopilot-continues', '1'
+            '--max-autopilot-continues', '1',
+            '--secret-env-vars=COPILOT_GITHUB_TOKEN'
         )
         foreach ($forbidden in @(
+                '--prompt', '--interactive',
                 '--resume', '--continue', '--connect', '--session-id',
                 '--allow-all', '--allow-all-tools', '--yolo',
                 '--additional-mcp-config', '--enable-mcp-server',
@@ -472,6 +502,43 @@ Describe 'Owner no-tools model provider' {
         }
     }
 
+    It 'resolves, publisher-verifies, and privately stages the native Copilot executable' {
+        if (-not $IsWindows) {
+            Set-ItResult -Skipped -Because 'Authenticode publisher identity is Windows-only.'
+            return
+        }
+        $copilot = @(Get-Command copilot -CommandType Application -ErrorAction SilentlyContinue)
+        if ($copilot.Count -ne 1) {
+            Set-ItResult -Skipped -Because 'Exactly one native Copilot CLI is not installed.'
+            return
+        }
+        $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol
+        $provider.PublisherIdentity | Should -BeExactly 'verified-github'
+        $provider.ExecutableSha256 | Should -Match '^[0-9a-f]{64}$'
+        $staged = & (Get-Module DevPilot.OwnerModelRunner) {
+            param($Provider)
+            $directory = New-OwnerModelAttemptDirectory -Provider $Provider
+            try {
+                $path = Copy-OwnerModelPinnedExecutable -Provider $Provider `
+                    -AttemptDirectory $directory
+                [pscustomobject]@{
+                    path = $path
+                    hash = (Get-OwnerModelFileDigest -Path $path).Substring(10)
+                    publisher = Test-OwnerCopilotPublisherIdentity -Path $path
+                }
+            }
+            finally {
+                if (Test-Path -LiteralPath $directory -PathType Container) {
+                    Remove-Item -LiteralPath $directory -Recurse -Force
+                }
+                Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
+            }
+        } $provider
+        $staged.path | Should -Not -BeExactly $provider.FilePath
+        $staged.hash | Should -BeExactly $provider.ExecutableSha256
+        $staged.publisher | Should -BeTrue
+    }
+
     It 'refuses the real provider before placing bounded stimulus in process arguments' {
         $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
             -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
@@ -497,7 +564,90 @@ Describe 'Owner no-tools model provider' {
 
         $message | Should -BeExactly (
             '[owner-model-launch-unavailable] ' +
-            'copilot-cli-confidential-prompt-channel-unavailable')
+            'copilot-cli-acp-confidentiality-unproven')
+    }
+
+    It 'negotiates only ACP v1 with no client file, terminal, or auth capability' {
+        $summaryPath = Join-Path $TestDrive 'acp-initialize.json'
+        $probe = Invoke-TestAcpInitialize -Mode valid -StatePath $summaryPath
+        $probe.protocolVersion | Should -Be 1
+        $probe.agentVersion | Should -BeExactly '1.0.79'
+        $probe.loadSession | Should -BeFalse
+        @($probe.sessionCapabilities) | Should -Be @('close')
+        $probe.modelCalls | Should -Be 0
+        $probe.stdoutDigest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $probe.stderrDigest | Should -BeExactly (
+            'v1:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+
+        $summary = Get-Content -LiteralPath $summaryPath -Raw |
+            ConvertFrom-Json -AsHashtable
+        $summary.method | Should -BeExactly 'initialize'
+        $summary.protocolVersion | Should -Be 1
+        $summary.clientCapabilities.fs.readTextFile | Should -BeFalse
+        $summary.clientCapabilities.fs.writeTextFile | Should -BeFalse
+        $summary.clientCapabilities.terminal | Should -BeFalse
+        $summary.clientCapabilities.auth.terminal | Should -BeFalse
+        $summary.commandLine | Should -Not -Match 'private-source-stimulus'
+        @($summary.environmentNames | Where-Object {
+                $_ -match '(?i)(?:token|secret|password|credential|api[_-]?key|github|azure|ado|copilot)'
+            }) | Should -Be @()
+    }
+
+    It 'reports ACP session history capabilities without exercising them' {
+        $probe = Invoke-TestAcpInitialize -Mode persistent
+        $probe.loadSession | Should -BeTrue
+        @($probe.sessionCapabilities) | Should -Be @('close', 'list')
+        $probe.modelCalls | Should -Be 0
+    }
+
+    It 'rejects malformed, misbound, flooding, disconnecting, and stalled ACP peers' -TestCases @(
+        @{ Mode = 'wrong-id'; Pattern = '*binding did not match*'; Deadline = 3000 }
+        @{ Mode = 'wrong-version'; Pattern = '*did not select version 1*'; Deadline = 3000 }
+        @{ Mode = 'malformed'; Pattern = '*JSON*'; Deadline = 3000 }
+        @{ Mode = 'bad-utf8'; Pattern = '*Unable to translate bytes*'; Deadline = 3000 }
+        @{ Mode = 'duplicate-property'; Pattern = '*duplicate JSON property*'; Deadline = 3000 }
+        @{ Mode = 'extra-message'; Pattern = '*unexpected protocol message count*'; Deadline = 3000 }
+        @{ Mode = 'stdout-flood'; Pattern = '*fixed limit*'; Deadline = 3000 }
+        @{ Mode = 'stderr-flood'; Pattern = '*fixed limit*'; Deadline = 3000 }
+        @{ Mode = 'disconnect'; Pattern = '*exited before responding*'; Deadline = 3000 }
+        @{ Mode = 'timeout'; Pattern = '*timed out*'; Deadline = 100 }
+    ) {
+        param($Mode, $Pattern, $Deadline)
+        {
+            Invoke-TestAcpInitialize -Mode $Mode -DeadlineMilliseconds $Deadline
+        } | Should -Throw $Pattern
+    }
+
+    It 'reports only digest-safe ACP failures' {
+        $message = try {
+            Invoke-TestAcpInitialize -Mode stderr-flood
+            'unexpected-success'
+        }
+        catch {
+            $_.Exception.Message
+        }
+        $message | Should -BeExactly 'ACP initialize output exceeded its fixed limit.'
+        $message | Should -Not -Match 'private-diagnostic'
+    }
+
+    It 'contains an ACP descendant when initialization times out' {
+        $pidPath = Join-Path $TestDrive 'acp-descendant.pid'
+        {
+            Invoke-TestAcpInitialize -Mode descendant -StatePath $pidPath `
+                -DeadlineMilliseconds 1500
+        } | Should -Throw '*timed out*'
+        $descendantPid = [int](Get-Content -LiteralPath $pidPath -Raw)
+        Start-Sleep -Milliseconds 200
+        Get-Process -Id $descendantPid -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+    }
+
+    It 'detects executable hash policy mutation before starting a child' {
+        $provider = New-OwnerModelFakeProvider -FilePath $script:pwsh `
+            -ArgumentList @('-NoProfile', '-File', $script:acpChild, 'valid', '-')
+        $provider.ExecutableSha256 = '0' * 64
+        {
+            New-OwnerModelProcessRunner -Provider $provider
+        } | Should -Throw '*executable hash changed after construction*'
     }
 
     It 'uses a stable invocation digest bound to the private stimulus bytes' {
@@ -525,22 +675,28 @@ Describe 'Owner no-tools model provider' {
         $digests[0] | Should -Not -BeExactly $digests[2]
     }
 
-    It 'fails closed when the executable cannot prove the Copilot no-tools interface' {
+    It 'fails closed before a real ACP launch when platform proof is incomplete' {
         $prior = $env:GH_TOKEN
         try {
             $env:GH_TOKEN = 'gho_testcredentialvalue'
             $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
                 -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
             $preflight = Test-OwnerModelProviderPreflight -Provider $provider
+            $expectedReason = if ($IsWindows) {
+                'acp-atomic-process-containment-unavailable'
+            }
+            else {
+                'copilot-cli-publisher-identity-unproven'
+            }
             $preflight.available | Should -BeFalse
-            $preflight.reason | Should -Be 'copilot-cli-interface-unproven'
-            $preflight.effectiveTools | Should -Be 'not-proven'
+            $preflight.reason | Should -Be $expectedReason
+            $preflight.effectiveTools | Should -Be 'not-proven-acp-session-scope'
             $preflight.modelCalls | Should -Be 0
             $preflight.providerWrites | Should -Be 0
             Test-Path -LiteralPath $provider.LaunchRoot | Should -BeFalse
             {
                 New-OwnerModelProcessRunner -Provider $provider -EnableRealLaunch
-            } | Should -Throw '*copilot-cli-interface-unproven*'
+            } | Should -Throw "*$expectedReason*"
         }
         finally {
             $env:GH_TOKEN = $prior
