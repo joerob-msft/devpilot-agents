@@ -199,6 +199,7 @@ Describe 'Owner parity qualification contract' {
     It 'accepts an explicitly bound prospective real-model observation' {
         $fixture = Get-Content -LiteralPath $script:QualificationFixture -Raw |
             ConvertFrom-Json -AsHashtable -Depth 32
+        $fixture.entries[0].candidate.observationPath = Join-Path $TestDrive 'candidate.json'
         $fixture.entries[0].candidate.semanticProvenance = 'prospective-real-model'
         $fixture.entries[0].candidate.telemetryPath =
             Join-Path $TestDrive 'telemetry.json'
