@@ -74,7 +74,19 @@ BeforeAll {
             }
             finally {
                 if (Test-Path -LiteralPath $directory -PathType Container) {
-                    Remove-Item -LiteralPath $directory -Recurse -Force
+                    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+                    do {
+                        try {
+                            Remove-Item -LiteralPath $directory -Recurse -Force `
+                                -ErrorAction Stop
+                            break
+                        }
+                        catch {
+                            if (-not (Test-Path -LiteralPath $directory)) { break }
+                            if ([DateTime]::UtcNow -ge $deadline) { throw }
+                            Start-Sleep -Milliseconds 50
+                        }
+                    } while ($true)
                 }
                 Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
             }
