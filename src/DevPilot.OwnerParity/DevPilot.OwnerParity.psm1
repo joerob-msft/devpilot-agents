@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module "$PSScriptRoot\..\OwnerObserver\OwnerObserver.psd1" -Force
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1" -Force
+Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1" -Force
 . "$PSScriptRoot\OwnerParityPaths.ps1"
 
 $script:OwnerParitySchemaPath = Join-Path $PSScriptRoot 'schemas/owner-parity-qualification.v1.json'
@@ -237,34 +238,39 @@ function Test-OwnerParityAnchorEqual {
         [AllowNull()][object]$CandidateFinding
     )
     if ($null -eq $BaselineFinding -or $null -eq $CandidateFinding) { return 'notMeasured' }
-    $left = Get-OwnerParityMember $BaselineFinding 'anchor'
-    $right = Get-OwnerParityMember $CandidateFinding 'anchor'
-    if ($left -is [string] -or $right -is [string]) { return 'notMeasured' }
-    $hasUnknown = $false
-    foreach ($field in @('path', 'line', 'symbol')) {
-        $leftValue = Get-OwnerParityMember $left $field
-        $rightValue = Get-OwnerParityMember $right $field
-        if (-not (Test-OwnerParityKnown $leftValue) -or -not (Test-OwnerParityKnown $rightValue)) {
-            $hasUnknown = $true
-            continue
-        }
-        if ($leftValue -cne $rightValue) { return 'failed' }
+    $left = Get-OwnerParityMember $BaselineFinding 'semanticKey'
+    $right = Get-OwnerParityMember $CandidateFinding 'semanticKey'
+    if (-not (Test-OwnerParityKnown $left) -or -not (Test-OwnerParityKnown $right)) {
+        return 'notMeasured'
     }
-    if ($hasUnknown) { return 'notMeasured' }
-    return 'passed'
+    return $(if ($left -ceq $right) { 'passed' } else { 'failed' })
 }
 
 function Test-OwnerParityObservationAccounting {
     param([Parameter(Mandatory)][object]$Observation)
+    $measurements = Get-OwnerParityMember $Observation 'measurements'
     foreach ($path in @(
+            @('counts', 'checked'),
+            @('counts', 'eligible'),
+            @('counts', 'advisory'),
+            @('counts', 'violations'),
+            @('counts', 'unknown'),
+            @('counts', 'uncovered'),
             @('execution', 'attempts'),
             @('execution', 'modelStarts'),
             @('execution', 'latencyMs'),
-            @('effects', 'operatorIntervention'))) {
-        $container = Get-OwnerParityMember $Observation $path[0]
-        if ($null -eq $container -or $null -eq (Get-OwnerParityMember $container $path[1])) {
+            @('effects', 'operatorIntervention'),
+            @('effects', 'providerWrites'),
+            @('effects', 'writeToolInvocations'))) {
+        $container = Get-OwnerParityMember $measurements $path[0]
+        $measurement = Get-OwnerParityMember $container $path[1]
+        $status = [string](Get-OwnerParityMember $measurement 'status' '')
+        if ($status -notin @('measured', 'unavailable', 'notMeasured')) {
             return $false
         }
+        $value = Get-OwnerParityMember $measurement 'value'
+        if (($status -ceq 'measured' -and $null -eq $value) -or
+            ($status -cne 'measured' -and $null -ne $value)) { return $false }
     }
     return $true
 }
@@ -470,13 +476,7 @@ function Invoke-OwnerParityGateEvaluation {
         @('rule.path', $Baseline.rule.path, $Candidate.rule.path),
         @('rule.section', $Baseline.rule.section, $Candidate.rule.section),
         @('rule.commit', $Baseline.rule.commit, $Candidate.rule.commit),
-        @('rule.sha256', $Baseline.rule.sha256, $Candidate.rule.sha256),
-        @('effects.dedupe.created', $Baseline.effects.dedupe.created, $Candidate.effects.dedupe.created),
-        @('effects.dedupe.updated', $Baseline.effects.dedupe.updated, $Candidate.effects.dedupe.updated),
-        @('effects.dedupe.noOp', $Baseline.effects.dedupe.noOp, $Candidate.effects.dedupe.noOp),
-        @('effects.dedupe.wouldCreate', $Baseline.effects.dedupe.wouldCreate, $Candidate.effects.dedupe.wouldCreate),
-        @('effects.dedupe.wouldUpdate', $Baseline.effects.dedupe.wouldUpdate, $Candidate.effects.dedupe.wouldUpdate),
-        @('effects.dedupe.unknown', $Baseline.effects.dedupe.unknown, $Candidate.effects.dedupe.unknown)
+        @('rule.sha256', $Baseline.rule.sha256, $Candidate.rule.sha256)
     )
     $bindingMismatches = 0
     $bindingUnknown = 0
@@ -508,9 +508,19 @@ function Invoke-OwnerParityGateEvaluation {
     }
     else {
         New-OwnerParityGate -Name bindingEquivalence -Status passed `
-            -EvidenceCode 'all-mutually-exposed-bindings-equal' `
+            -EvidenceCode 'canonical-semantic-bindings-equal' `
             -Measured (($bindingFields.Count - $bindingUnknown) + $anchorMeasured)
     }
+    $providerMarkers = @($units | ForEach-Object {
+            foreach ($finding in @($_.baselineFinding, $_.candidateFinding)) {
+                if ($null -eq $finding) { continue }
+                $marker = Get-OwnerParityMember $finding 'providerMarker'
+                [ordered]@{
+                    availability = [string](Get-OwnerParityMember $marker 'availability' 'unavailable')
+                    integrity = [string](Get-OwnerParityMember $marker 'integrity' 'unavailable')
+                }
+            }
+        })
 
     $baselineUnknowns = @($Baseline.findings | Where-Object disposition -CEQ 'unknown')
     $mappedBaselineUnknownKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -611,11 +621,11 @@ function Invoke-OwnerParityGateEvaluation {
         (Test-OwnerParityObservationAccounting -Observation $Baseline) -and
         (Test-OwnerParityObservationAccounting -Observation $Candidate)) {
         New-OwnerParityGate -Name latencyAccounting -Status passed `
-            -EvidenceCode 'explicit-values-or-unknowns-recorded' -Measured 8
+            -EvidenceCode 'measurement-state-explicit' -Measured 24
     }
     else {
         New-OwnerParityGate -Name latencyAccounting -Status failed `
-            -EvidenceCode 'accounting-field-omitted' -Measured 8 -Failures 1
+            -EvidenceCode 'accounting-field-omitted' -Measured 24 -Failures 1
     }
 
     return [pscustomobject][ordered]@{
@@ -637,6 +647,13 @@ function Invoke-OwnerParityGateEvaluation {
             baselineCompleted = $Baseline.lifecycle.completed
             retentionMeasured = [string]$retentionGate.status -in @('passed', 'failed')
             retentionPopulationKnown = [string]$retentionGate.status -cne 'blocked'
+            falsePositiveMeasured = [string]$falsePositiveGate.status -in @('passed', 'failed')
+            providerMarkersAvailable = @($providerMarkers |
+                Where-Object availability -CEQ 'available').Count
+            providerMarkersVerified = @($providerMarkers |
+                Where-Object integrity -CEQ 'verified').Count
+            providerMarkersInvalid = @($providerMarkers |
+                Where-Object integrity -CEQ 'invalid').Count
         }
     }
 }
@@ -658,12 +675,47 @@ function Read-OwnerParityManifest {
     }
     $ids = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $headKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $referenceIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $referencePaths = [Collections.Generic.HashSet[string]]::new(
+        $(if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }))
+    foreach ($reference in @($manifest.attestation.critical) + @($manifest.attestation.volatile)) {
+        if (-not $referenceIds.Add([string]$reference.id)) {
+            throw "Owner parity attestation reference id '$($reference.id)' is duplicated."
+        }
+        $relative = ConvertTo-OwnerParityRelativePath `
+            -Path ([string]$reference.relativePath) -Name attestation.relativePath
+        if (-not $referencePaths.Add($relative)) {
+            throw "Owner parity attestation path '$relative' is duplicated or case-colliding."
+        }
+    }
+    $candidateReferences = [Collections.Generic.HashSet[string]]::new(
+        $(if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }))
     foreach ($entry in @($manifest.entries)) {
         if (-not $ids.Add([string]$entry.id)) {
             throw "Owner parity qualification entry id '$($entry.id)' is duplicated."
         }
         if (-not $headKeys.Add([string]$entry.baseline.headKey)) {
             throw "Owner parity qualification baseline headKey '$($entry.baseline.headKey)' is duplicated."
+        }
+        if ([string]$entry.candidate.mode -ceq 'read') {
+            if ([string]$entry.evidence.semanticProvenance -cne 'unknown') {
+                throw "Owner parity qualification entry '$($entry.id)' must declare unknown semantic provenance for a read candidate."
+            }
+            $candidateReference = 'read|' + (Resolve-OwnerParityAbsolutePath `
+                    -Path ([string]$entry.candidate.observationPath) `
+                    -Name candidate.observationPath -Kind File -AllowMissing)
+            if (-not $candidateReferences.Add($candidateReference)) {
+                throw "Owner parity qualification candidate observation is reused by multiple entries."
+            }
+        }
+        elseif ([string]$entry.candidate.mode -ceq 'run') {
+            $candidateReference = 'run|' + (Resolve-OwnerParityAbsolutePath `
+                    -Path ([string]$entry.candidate.manifestPath) `
+                    -Name candidate.manifestPath -Kind File -AllowMissing) + '|' +
+                [string]$entry.candidate.entryId
+            if (-not $candidateReferences.Add($candidateReference)) {
+                throw "Owner parity qualification candidate replay is reused by multiple entries."
+            }
         }
         $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $baselineSelectors = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -978,7 +1030,7 @@ function New-OwnerParityUnavailableEvaluation {
             (New-OwnerParityGate -Name writeIsolation -Status blocked `
                     -EvidenceCode $reasonCode -Blocked 1)
             (New-OwnerParityGate -Name latencyAccounting -Status blocked `
-                    -EvidenceCode $reasonCode -Blocked 4)
+                    -EvidenceCode $reasonCode -Blocked 12)
         )
         metrics = [ordered]@{
             verifiedMethodFindings = $verifiedMethodFindings.Count
@@ -990,6 +1042,7 @@ function New-OwnerParityUnavailableEvaluation {
             baselineCompleted = $Baseline.lifecycle.completed
             retentionMeasured = $false
             retentionPopulationKnown = [string]$retentionGate.status -cne 'blocked'
+            falsePositiveMeasured = $false
         }
     }
 }
@@ -1081,7 +1134,13 @@ function ConvertTo-OwnerParitySanitizedSummary {
                     [int]$_.metrics.verifiedMethodFindings
                 } | Measure-Object -Sum).Sum)
     $candidateViolations = [int](($entries.metrics.candidateViolations | Measure-Object -Sum).Sum)
-    $falsePositives = [int](($entries.metrics.eligibleFalsePositives | Measure-Object -Sum).Sum)
+    $falsePositiveEntries = @($entries | Where-Object {
+            $_.metrics.falsePositiveMeasured -eq $true
+        })
+    $falsePositives = if ($falsePositiveEntries.Count -gt 0) {
+        [int](($falsePositiveEntries.metrics.eligibleFalsePositives | Measure-Object -Sum).Sum)
+    }
+    else { $null }
     $baselineComplete = @($entries | Where-Object {
             $_.metrics.baselineCompleted -eq $true
         }).Count
@@ -1092,7 +1151,7 @@ function ConvertTo-OwnerParitySanitizedSummary {
             $_.metrics.candidateCompleted -isnot [bool]
         }).Count
     return [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         kind = 'owner-parity-sanitized-summary'
         scope = 'retrospective-offline'
         sample = [ordered]@{
@@ -1106,6 +1165,8 @@ function ConvertTo-OwnerParitySanitizedSummary {
             structuralMethodMatches = $structuralMatches
             candidateViolations = $candidateViolations
             eligibleFalsePositives = $falsePositives
+            falsePositiveMeasuredEntries = $falsePositiveEntries.Count
+            falsePositiveUnmeasuredEntries = $entries.Count - $falsePositiveEntries.Count
         }
         gates = @(
             foreach ($gate in $gates) {
@@ -1162,13 +1223,28 @@ function Invoke-OwnerParityQualification {
             -Path (Split-Path -Parent $summaryPath) -Name SanitizedSummaryDirectory -Kind Directory)
 
     $manifest = Read-OwnerParityManifest -Path $QualificationManifestPath
-    $before = Get-OwnerParityStateSnapshot -Root $isolation.v1StateRoot
+    if (-not (Test-Path -LiteralPath $isolation.v2StateRoot)) {
+        [void](New-Item -ItemType Directory -Path $isolation.v2StateRoot)
+    }
+    [void](Resolve-OwnerParityAbsolutePath `
+            -Path $isolation.v2StateRoot -Name V2StateRoot -Kind Directory)
+    $before = Get-OwnerParityAttestationSnapshot `
+        -Root $isolation.v1StateRoot -Attestation $manifest.value.attestation `
+        -ValidateVolatileBaseline
+    $snapshotRoot = New-OwnerParityImmutableSnapshotRoot `
+        -DestinationRoot (Join-Path $isolation.v2StateRoot (
+                '.v1-read-snapshot-' + [guid]::NewGuid().ToString('N'))) `
+        -Snapshot $before
     $entryReports = [Collections.Generic.List[object]]::new()
     $executionError = $null
     try {
         foreach ($entry in @($manifest.value.entries)) {
             $baseline = Read-OwnerV1Observation `
-                -StateRoot $isolation.v1StateRoot -HeadKey ([string]$entry.baseline.headKey)
+                -StateRoot $snapshotRoot `
+                -SubjectRootOverride $snapshotRoot `
+                -StateRootRelocationSource $isolation.v1StateRoot `
+                -SubjectRootRelocationSource $isolation.v1StateRoot `
+                -HeadKey ([string]$entry.baseline.headKey)
             try {
                 $candidateResult = Resolve-OwnerParityCandidate `
                     -Candidate $entry.candidate -V2StateRoot $isolation.v2StateRoot
@@ -1225,11 +1301,20 @@ function Invoke-OwnerParityQualification {
         $executionError = $_
     }
     finally {
-        $after = Get-OwnerParityStateSnapshot -Root $isolation.v1StateRoot
+        try {
+            $after = Get-OwnerParityAttestationSnapshot `
+                -Root $isolation.v1StateRoot -Attestation $manifest.value.attestation
+        }
+        finally {
+            if (Test-Path -LiteralPath $snapshotRoot -PathType Container) {
+                Remove-Item -LiteralPath $snapshotRoot -Recurse -Force
+            }
+        }
     }
-    $expectedSnapshot = Get-OwnerParityMember $manifest.value 'expectedV1Snapshot'
-    $rollback = New-OwnerParityRollbackProof `
-        -Expected $expectedSnapshot -Before $before -After $after
+    $rollback = Compare-OwnerParityAttestationSnapshots `
+        -Before $before -After $after -Attestation $manifest.value.attestation
+    Remove-OwnerParitySnapshotContent -Snapshot $before
+    Remove-OwnerParitySnapshotContent -Snapshot $after
     if ($executionError) { throw $executionError }
 
     $aggregateGates = [Collections.Generic.List[object]]::new()
@@ -1256,10 +1341,7 @@ function Invoke-OwnerParityQualification {
             })
     }
     [void]$aggregateGates.Add((New-OwnerParityCompletionGate -EntryReports @($entryReports)))
-    $rollbackStatus = if ($null -eq $rollback.expected) {
-        'blocked'
-    }
-    elseif ($rollback.unchanged) {
+    $rollbackStatus = if ($rollback.unchanged) {
         'passed'
     }
     else {
@@ -1267,21 +1349,19 @@ function Invoke-OwnerParityQualification {
     }
     [void]$aggregateGates.Add((New-OwnerParityGate -Name rollbackProof `
             -Status $rollbackStatus `
-            -EvidenceCode $(if ($null -eq $rollback.expected) {
-                    'expected-v1-snapshot-absent'
-                }
-                elseif ($rollback.unchanged) {
-                    'v1-root-hash-count-size-and-timestamps-unchanged'
+            -EvidenceCode $(if ($rollback.unchanged) {
+                    'critical-bytes-identical-and-volatile-append-only'
                 }
                 else {
-                    'v1-root-snapshot-changed'
+                    'read-only-attestation-failed'
                 }) `
-            -Measured $(if ($null -eq $rollback.expected) { 0 } else { 4 }) `
+            -Measured (@($manifest.value.attestation.critical).Count +
+                @($manifest.value.attestation.volatile).Count) `
             -Failures $(if ($rollbackStatus -ceq 'failed') { 1 } else { 0 }) `
-            -Blocked $(if ($rollbackStatus -ceq 'blocked') { 1 } else { 0 })))
+            -Blocked 0))
 
     $report = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         kind = 'owner-parity-private-report'
         manifestSha256 = $manifest.sha256
         v1StateRoot = $isolation.v1StateRoot

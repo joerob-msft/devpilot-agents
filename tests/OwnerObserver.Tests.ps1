@@ -7,6 +7,8 @@ BeforeAll {
     $script:OwnerV2FixturePath = Join-Path $PSScriptRoot `
         'fixtures/owner-orchestrator/generic-cohort.json'
     Import-Module $script:ModulePath -Force
+    Import-Module (Join-Path $script:RepoRoot `
+            'src/OwnerObservationContract/OwnerObservationContract.psd1') -Force
 
     function Write-OwnerObserverTestText {
         param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Text)
@@ -367,12 +369,41 @@ Describe 'Owner v1 read-only adapter' {
         $finding = $outcome.findings | Where-Object identity -EQ 'test-ownership@1:rs0:dc1'
         $finding.anchor.path | Should -Be 'src/WidgetTests.cs'
         $finding.anchor.line | Should -Be 12
+        $finding.providerMarker.availability | Should -Be 'available'
+        $finding.providerMarker.integrity | Should -Be 'verified'
+        $finding.semanticKey | Should -Match '^v1:sha256:[0-9a-f]{64}$'
         $outcome.effects.providerWrites | Should -Be 0
         $outcome.effects.dedupe.noOp | Should -Be 1
         $outcome.effects.operatorIntervention | Should -BeTrue
         $outcome.validationErrors | Should -HaveCount 0
         @($outcome.sourceArtifacts | Where-Object signature -EQ 'verified') | Should -HaveCount 4
         Test-OwnerObservation -Observation $outcome | Should -BeTrue
+    }
+
+    It 'relocates absolute artifact and subject roots into an immutable snapshot' {
+        $fixture = New-OwnerObserverV1Fixture -Root (Join-Path $TestDrive 'relocation-source')
+        $snapshot = Join-Path $TestDrive 'relocation-snapshot'
+        New-Item -ItemType Directory -Path $snapshot | Out-Null
+        Get-ChildItem -LiteralPath $fixture.StateRoot -Force |
+            Copy-Item -Destination $snapshot -Recurse
+        $relativeSubject = [IO.Path]::GetRelativePath(
+            (Split-Path -Parent $fixture.StateRoot), $fixture.SubjectRoot)
+        $relocatedSubject = Join-Path $snapshot $relativeSubject
+        New-Item -ItemType Directory -Path $relocatedSubject -Force | Out-Null
+        Get-ChildItem -LiteralPath $fixture.SubjectRoot -Force |
+            Copy-Item -Destination $relocatedSubject -Recurse
+
+        $observation = Read-OwnerV1Observation `
+            -StateRoot $snapshot `
+            -SubjectRootOverride $snapshot `
+            -StateRootRelocationSource $fixture.StateRoot `
+            -SubjectRootRelocationSource (Split-Path -Parent $fixture.StateRoot) `
+            -HeadKey $fixture.QueueHeadKey
+
+        $observation.lifecycle.completed | Should -BeTrue
+        $observation.validationErrors | Should -HaveCount 0
+        $observation.counts.checked | Should -Be 2
+        $observation.counts.eligible | Should -Be 3
     }
 
     It 'rejects a tampered signed index' {
@@ -480,7 +511,7 @@ Describe 'Owner v1 read-only adapter' {
 }
 
 Describe 'Owner parity report' {
-    It 'deterministically reports retained, lost and new findings and latency' {
+    It 'deterministically compares canonical findings and leaves unbound findings unknown' {
         $fixture = New-OwnerObserverV1Fixture -Root (Join-Path $TestDrive 'parity')
         $baseline = Read-OwnerV1Observation -StateRoot $fixture.StateRoot -HeadKey $fixture.QueueHeadKey
         $candidate = Read-OwnerNormalizedObservation `
@@ -488,15 +519,16 @@ Describe 'Owner parity report' {
 
         $report = Compare-OwnerObservations -Baseline $baseline -Candidate $candidate
 
-        $report.findings.retained | Should -Be @('test-ownership@1:rs0:dc1')
-        $report.findings.lost | Should -Be @('test-ownership@1:rs0:dc2')
-        $report.findings.new | Should -Be @('test-ownership@1:rs0:dc3')
+        $report.findings.retained | Should -HaveCount 1
+        $report.findings.retained[0] | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $report.findings.lost | Should -HaveCount 0
+        $report.findings.new | Should -HaveCount 0
         $report.binding.matches | Should -BeTrue
         $report.writes.matches | Should -BeTrue
         $report.completion.regression | Should -BeFalse
         $report.latency.deltaMs | Should -Be -300
         $report.latency.comparison | Should -Be 'faster'
-        $report.parity | Should -BeFalse
+        $report.parity | Should -Be 'unknown'
     }
 
     It 'reports completion, count, binding and write regressions' {
@@ -522,16 +554,44 @@ Describe 'Owner parity report' {
         $report.completion.regression | Should -BeTrue
     }
 
+    It 'compares canonical rule fields rather than provider rule identity representations' {
+        $fixture = New-OwnerObserverV1Fixture -Root (Join-Path $TestDrive 'rule-binding')
+        $baseline = Read-OwnerV1Observation -StateRoot $fixture.StateRoot -HeadKey $fixture.QueueHeadKey
+        $candidate = $baseline | ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -Depth 64 -AsHashtable
+        $candidate.rule.identity = 'provider-specific-rule-marker'
+
+        $report = Compare-OwnerObservations -Baseline $baseline -Candidate $candidate
+
+        $report.binding.mismatches | Should -Not -Contain 'rule.identity'
+        $report.binding.matches | Should -BeTrue
+
+        $candidate.rule.sha256 = '9' * 64
+        $report = Compare-OwnerObservations -Baseline $baseline -Candidate $candidate
+        $report.binding.mismatches | Should -Contain 'rule.sha256'
+    }
+
     It 'uses ordinal finding ordering across cultures' {
+        Import-Module (Join-Path $script:RepoRoot `
+                'src/OwnerObservationContract/OwnerObservationContract.psd1') -Force
         $path = (Resolve-Path (Join-Path $script:FixtureRoot 'v2-outcome.json')).Path
         $baseline = Read-OwnerNormalizedObservation -Path $path
         $candidate = Read-OwnerNormalizedObservation -Path $path
         $baseline.findings = @(
-            [ordered]@{ identity = 'z'; disposition = 'violation'; ruleRef = 'r'; constructRef = 'z'; anchor = 'unknown' },
-            [ordered]@{ identity = 'A'; disposition = 'violation'; ruleRef = 'r'; constructRef = 'A'; anchor = 'unknown' },
-            [ordered]@{ identity = '_'; disposition = 'violation'; ruleRef = 'r'; constructRef = '_'; anchor = 'unknown' }
+            foreach ($name in @('z', 'A', '_')) {
+                $finding = $baseline.findings[0] | ConvertTo-Json -Depth 32 |
+                    ConvertFrom-Json -AsHashtable -Depth 32
+                $finding.identity = $name
+                $finding.constructRef = $name
+                $finding.binding.constructIdentity = $name
+                $finding.semanticKey = Get-OwnerSemanticFindingKey `
+                    -Subject $baseline.subject -Rule $baseline.rule `
+                    -Capability ([string]$baseline.capability) -Binding $finding.binding
+                $finding
+            }
         )
         $candidate.findings = @($baseline.findings)
+        $expected = @($baseline.findings.semanticKey | Sort-Object -CaseSensitive)
         $originalCulture = [Globalization.CultureInfo]::CurrentCulture
         try {
             [Globalization.CultureInfo]::CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('en-US')
@@ -543,11 +603,11 @@ Describe 'Owner parity report' {
             [Globalization.CultureInfo]::CurrentCulture = $originalCulture
         }
 
-        $english | Should -Be @('A', '_', 'z')
+        $english | Should -Be $expected
         $danish | Should -Be $english
     }
 
-    It 'treats finding identity casing as semantically distinct' {
+    It 'does not treat provider finding identity casing as semantic binding' {
         $path = (Resolve-Path (Join-Path $script:FixtureRoot 'v2-outcome.json')).Path
         $baseline = Read-OwnerNormalizedObservation -Path $path
         $candidate = Read-OwnerNormalizedObservation -Path $path
@@ -555,10 +615,10 @@ Describe 'Owner parity report' {
 
         $report = Compare-OwnerObservations -Baseline $baseline -Candidate $candidate
 
-        $report.findings.retained | Should -Not -Contain $baseline.findings[0].identity
-        $report.findings.lost | Should -Contain $baseline.findings[0].identity
-        $report.findings.new | Should -Contain $candidate.findings[0].identity
-        $report.parity | Should -BeFalse
+        $report.findings.retained | Should -Contain $baseline.findings[0].semanticKey
+        $report.findings.lost | Should -HaveCount 0
+        $report.findings.new | Should -HaveCount 0
+        $report.parity | Should -BeTrue
     }
 
     It 'degrades parity when findings lack comparable identities' {

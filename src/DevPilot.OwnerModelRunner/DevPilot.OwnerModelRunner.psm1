@@ -373,10 +373,16 @@ function Get-OwnerModelTelemetrySnapshot {
             }
         }
     )
+    $latency = if ($records.Count -eq 0) {
+        0L
+    }
+    else {
+        [long](($records | Measure-Object -Property latencyMs -Sum).Sum)
+    }
     return [ordered]@{
         attempts = $records.Count
         modelStarts = @($records | Where-Object modelStarted).Count
-        latencyMs = [long](($records | Measure-Object -Property latencyMs -Sum).Sum)
+        latencyMs = $latency
         refusalReason = if ($failures.Count -eq 0) { 'none' } else { [string]$failures[-1] }
         records = @(
             foreach ($record in $records) {
@@ -450,7 +456,7 @@ function New-OwnerModelReplayRecord {
 
 function New-OwnerModelReplayFixture {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][object[]]$Records)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records)
 
     $copies = [Collections.Generic.List[object]]::new()
     $ids = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)

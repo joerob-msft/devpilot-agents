@@ -1,5 +1,7 @@
 Set-StrictMode -Version Latest
 
+Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1" -Force
+
 $script:OwnerObserverSchemaPath = Join-Path $PSScriptRoot 'schemas/owner-observation.v1.json'
 $script:OwnerObserverUnknown = 'unknown'
 $script:OwnerObserverMaximumDiagnosticLength = 512
@@ -327,6 +329,26 @@ function Resolve-OwnerObserverContainedFile {
     return $full
 }
 
+function ConvertTo-OwnerObserverRelocatedPath {
+    param(
+        [Parameter(Mandatory)][string]$OriginalPath,
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [Parameter(Mandatory)][string]$DestinationRoot,
+        [Parameter(Mandatory)][string]$Label
+    )
+    if (-not [IO.Path]::IsPathFullyQualified($OriginalPath) -or
+        -not [IO.Path]::IsPathFullyQualified($SourceRoot)) {
+        throw "$Label and its relocation source must be absolute paths."
+    }
+    $source = [IO.Path]::GetFullPath($SourceRoot)
+    $original = [IO.Path]::GetFullPath($OriginalPath)
+    if (-not (Test-OwnerObserverPathWithin -Path $original -Root $source)) {
+        throw "$Label is outside its relocation source."
+    }
+    $relative = [IO.Path]::GetRelativePath($source, $original)
+    return Join-Path $DestinationRoot $relative
+}
+
 function Resolve-OwnerObserverFile {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Label)
     if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathFullyQualified($Path)) {
@@ -528,6 +550,8 @@ function Read-OwnerObserverAudit {
         [Parameter(Mandatory)][AllowEmptyCollection()][Collections.Generic.List[string]]$Errors
     )
     $anchors = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $providerMarkers = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $outcomeMarkers = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     $intentCount = 0
     $outcomeCount = 0
     $pendingIntent = $false
@@ -544,6 +568,7 @@ function Read-OwnerObserverAudit {
     if (-not (Test-Path -LiteralPath $auditRoot -PathType Container)) {
         return [pscustomobject]@{
             Anchors = $anchors
+            ProviderMarkers = $providerMarkers
             OperatorIntervention = $false
             ProviderWrites = 0L
             Dedupe = $dedupe
@@ -579,6 +604,11 @@ function Read-OwnerObserverAudit {
                     $name = [string](Get-OwnerObserverValue $result 'outcome' '')
                     if ($dedupe.Contains($name)) { $dedupe[$name] = [long]$dedupe[$name] + 1 }
                     else { $dedupe.unknown = [long]$dedupe.unknown + 1 }
+                    $findingId = [string](Get-OwnerObserverValue $result 'findingId' '')
+                    $dedupeKey = [string](Get-OwnerObserverValue $result 'dedupeKey' '')
+                    if ($findingId) {
+                        $outcomeMarkers[$findingId] = $dedupeKey
+                    }
                 }
             }
             else {
@@ -594,6 +624,24 @@ function Read-OwnerObserverAudit {
                     $path = Get-OwnerObserverKnownText -Container $selection -Name 'path'
                     $line = Get-OwnerObserverKnownNumber -Container $selection -Name 'line'
                     $symbol = Get-OwnerObserverKnownText -Container $selection -Name 'symbol'
+                    $dedupeKey = [string](Get-OwnerObserverValue $selection 'dedupeKey' '')
+                    if ($dedupeKey) {
+                        $outcomeKey = if ($outcomeMarkers.ContainsKey($findingId)) {
+                            [string]$outcomeMarkers[$findingId]
+                        }
+                        else { '' }
+                        $integrity = if ($outcomeKey -and $outcomeKey -ceq $dedupeKey) {
+                            'verified'
+                        }
+                        elseif ($outcomeKey) {
+                            'invalid'
+                        }
+                        else {
+                            'unavailable'
+                        }
+                        $providerMarkers[$findingId] = New-OwnerProviderMarker `
+                            -Value $dedupeKey -Integrity $integrity
+                    }
                     if ($path -eq $script:OwnerObserverUnknown -or
                         $line -is [string] -or [long]$line -lt 1) { continue }
                     $anchors[$findingId] = [ordered]@{
@@ -611,6 +659,7 @@ function Read-OwnerObserverAudit {
     }
     return [pscustomobject]@{
         Anchors = $anchors
+        ProviderMarkers = $providerMarkers
         OperatorIntervention = ($intentCount -gt 0 -or $outcomeCount -gt 0)
         ProviderWrites = $providerWrites
         Dedupe = $dedupe
@@ -622,7 +671,8 @@ function New-OwnerObserverFinding {
         [Parameter(Mandatory)][string]$Capability,
         [Parameter(Mandatory)]$Entry,
         [Parameter(Mandatory)][ValidateSet('violation', 'unknown')][string]$Disposition,
-        [Parameter(Mandatory)][Collections.IDictionary]$Anchors
+        [Parameter(Mandatory)][Collections.IDictionary]$Anchors,
+        [Parameter(Mandatory)][Collections.IDictionary]$ProviderMarkers
     )
     $ruleRef = Get-OwnerObserverKnownText -Container $Entry -Name 'ruleRef'
     $constructRef = Get-OwnerObserverKnownText -Container $Entry -Name 'constructRef'
@@ -639,7 +689,107 @@ function New-OwnerObserverFinding {
         ruleRef = $ruleRef
         constructRef = $constructRef
         anchor = $(if ($anchors.ContainsKey($identity)) { $anchors[$identity] } else { $script:OwnerObserverUnknown })
+        providerMarker = $(if ($ProviderMarkers.ContainsKey($identity)) {
+                $ProviderMarkers[$identity]
+            }
+            else {
+                New-OwnerProviderMarker
+            })
     }
+}
+
+function ConvertTo-OwnerObservationV2 {
+    param([Parameter(Mandatory)][Collections.IDictionary]$Observation)
+
+    $rulePath = [string](Get-OwnerObserverValue $Observation.rule 'path' $script:OwnerObserverUnknown)
+    if ($rulePath -cne $script:OwnerObserverUnknown) {
+        $Observation.rule.path = ConvertTo-OwnerRepositoryPath -Path $rulePath
+    }
+    $counts = $Observation.counts
+    if (-not $counts.Contains('eligible')) {
+        $counts['eligible'] = if ($counts.checked -isnot [string] -and
+            $counts.unknown -isnot [string]) {
+            [long]$counts.checked + [long]$counts.unknown
+        }
+        else {
+            $script:OwnerObserverUnknown
+        }
+    }
+    if (-not $counts.Contains('advisory')) {
+        $counts['advisory'] = 0
+    }
+    $normalizedFindings = [Collections.Generic.List[object]]::new()
+    foreach ($finding in @($Observation.findings)) {
+        $copy = [ordered]@{}
+        foreach ($key in @($finding.Keys)) { $copy[$key] = $finding[$key] }
+        if (-not $copy.Contains('providerMarker')) {
+            $copy['providerMarker'] = New-OwnerProviderMarker
+        }
+        if (-not $copy.Contains('binding')) {
+            $anchor = Get-OwnerObserverValue $copy 'anchor'
+            $constructRef = [string](Get-OwnerObserverValue $copy 'constructRef' '')
+            $copy['binding'] = if ($anchor -is [Collections.IDictionary]) {
+                New-OwnerCanonicalAnchor `
+                    -Path ([string](Get-OwnerObserverValue $anchor 'path' '')) `
+                    -StartLine ([int](Get-OwnerObserverValue $anchor 'line' 0)) `
+                    -EndLine ([int](Get-OwnerObserverValue $anchor 'line' 0)) `
+                    -Symbol ([string](Get-OwnerObserverValue $anchor 'symbol' 'unknown')) `
+                    -ConstructIdentity $constructRef
+            }
+            else {
+                $script:OwnerObserverUnknown
+            }
+        }
+        $copy['semanticKey'] = if ($copy.binding -is [Collections.IDictionary]) {
+            Get-OwnerSemanticFindingKey `
+                -Subject $Observation.subject `
+                -Rule $Observation.rule `
+                -Capability ([string]$Observation.capability) `
+                -Binding $copy.binding
+        }
+        else {
+            $script:OwnerObserverUnknown
+        }
+        [void]$normalizedFindings.Add($copy)
+    }
+    $Observation.findings = @($normalizedFindings)
+    $Observation.schemaVersion = 2
+
+    if (-not $Observation.Contains('measurements')) {
+        $Observation['measurements'] = [ordered]@{
+            counts = [ordered]@{}
+            execution = [ordered]@{}
+            effects = [ordered]@{}
+        }
+        foreach ($name in @('checked', 'eligible', 'advisory', 'violations', 'unknown', 'uncovered')) {
+            $value = Get-OwnerObserverValue $Observation.counts $name $script:OwnerObserverUnknown
+            $Observation.measurements.counts[$name] = if ($value -is [string]) {
+                New-OwnerMeasurement -Status unavailable -Reason 'source-not-exposed'
+            }
+            else {
+                New-OwnerMeasurement -Status measured -Value ([long]$value)
+            }
+        }
+        foreach ($name in @('attempts', 'modelStarts', 'latencyMs')) {
+            $value = Get-OwnerObserverValue $Observation.execution $name $script:OwnerObserverUnknown
+            $Observation.measurements.execution[$name] = if ($value -is [string]) {
+                New-OwnerMeasurement -Status unavailable -Reason 'source-not-exposed'
+            }
+            else {
+                New-OwnerMeasurement -Status measured -Value ([long]$value)
+            }
+        }
+        foreach ($name in @('operatorIntervention', 'providerWrites', 'writeToolInvocations')) {
+            $value = Get-OwnerObserverValue $Observation.effects $name $script:OwnerObserverUnknown
+            $Observation.measurements.effects[$name] = if ($value -is [string]) {
+                New-OwnerMeasurement -Status unavailable -Reason 'source-not-exposed'
+            }
+            else {
+                New-OwnerMeasurement -Status measured -Value $value
+            }
+        }
+    }
+    return $Observation
 }
 
 function Read-OwnerV1Observation {
@@ -652,7 +802,9 @@ function Read-OwnerV1Observation {
         [Parameter(Mandatory)][string]$StateRoot,
         [ValidatePattern('^$|^[0-9a-f]{64}$')][string]$HeadKey = '',
         [AllowEmptyString()][string]$KeyPath = '',
-        [AllowEmptyString()][string]$SubjectRootOverride = ''
+        [AllowEmptyString()][string]$SubjectRootOverride = '',
+        [AllowEmptyString()][string]$StateRootRelocationSource = '',
+        [AllowEmptyString()][string]$SubjectRootRelocationSource = ''
     )
 
     $root = Resolve-OwnerObserverRoot -Path $StateRoot -Label 'Owner v1 state root'
@@ -692,6 +844,14 @@ function Read-OwnerV1Observation {
     $artifactPathValue = [string](Get-OwnerObserverValue $record 'artifact' '')
     if ($artifactPathValue) {
         try {
+            if ($StateRootRelocationSource -and
+                [IO.Path]::IsPathFullyQualified($artifactPathValue)) {
+                $artifactPathValue = ConvertTo-OwnerObserverRelocatedPath `
+                    -OriginalPath $artifactPathValue `
+                    -SourceRoot $StateRootRelocationSource `
+                    -DestinationRoot $root `
+                    -Label 'Owner v1 queue artifact'
+            }
             $artifactPath = Resolve-OwnerObserverContainedFile -Root $root -Path $artifactPathValue `
                 -Label 'Owner v1 queue artifact'
             $signedArtifact = Read-OwnerObserverSignedRecord -Path $artifactPath -Key $key
@@ -703,7 +863,20 @@ function Read-OwnerV1Observation {
                 [string](Get-OwnerObserverValue $artifact 'headKey' '') -cne $queueHeadKey) {
                 throw 'Owner v1 queue artifact has a foreign identity.'
             }
-            $subjectRoot = if ($SubjectRootOverride) {
+            $subjectRoot = if ($SubjectRootRelocationSource) {
+                if (-not $SubjectRootOverride) {
+                    throw 'SubjectRootOverride is required when relocating a subject root.'
+                }
+                $originalSubjectRootValue = [string](Get-OwnerObserverValue $artifact 'subjectRoot' '')
+                Resolve-OwnerObserverRoot `
+                    -Path (ConvertTo-OwnerObserverRelocatedPath `
+                        -OriginalPath $originalSubjectRootValue `
+                        -SourceRoot $SubjectRootRelocationSource `
+                        -DestinationRoot $SubjectRootOverride `
+                        -Label 'Owner v1 original subject root') `
+                    -Label 'Owner v1 relocated subject root'
+            }
+            elseif ($SubjectRootOverride) {
                 $SubjectRootOverride
             }
             else {
@@ -742,6 +915,7 @@ function Read-OwnerV1Observation {
     else {
         [pscustomobject]@{
             Anchors = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+            ProviderMarkers = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
             OperatorIntervention = $script:OwnerObserverUnknown
             ProviderWrites = $script:OwnerObserverUnknown
             Dedupe = [ordered]@{
@@ -773,6 +947,14 @@ function Read-OwnerV1Observation {
     else {
         [long]$notInReach + [long]$notRouted
     }
+    $checkedCount = Get-OwnerObserverKnownNumber -Container $counts -Name 'checked'
+    $unknownCount = Get-OwnerObserverKnownNumber -Container $counts -Name 'unknown'
+    $eligibleCount = if ($checkedCount -isnot [string] -and $unknownCount -isnot [string]) {
+        [long]$checkedCount + [long]$unknownCount
+    }
+    else {
+        $script:OwnerObserverUnknown
+    }
 
     $findings = [Collections.Generic.List[object]]::new()
     $observerFindingsTruncated = $false
@@ -785,7 +967,8 @@ function Read-OwnerV1Observation {
                 break
             }
             [void]$findings.Add((New-OwnerObserverFinding -Capability $capability -Entry $entry `
-                    -Disposition violation -Anchors $audit.Anchors))
+                    -Disposition violation -Anchors $audit.Anchors `
+                    -ProviderMarkers $audit.ProviderMarkers))
         }
         foreach ($entry in $unknownEntries) {
             if ($findings.Count -ge $script:OwnerObserverMaximumFindings) {
@@ -793,7 +976,8 @@ function Read-OwnerV1Observation {
                 break
             }
             [void]$findings.Add((New-OwnerObserverFinding -Capability $capability -Entry $entry `
-                    -Disposition unknown -Anchors $audit.Anchors))
+                    -Disposition unknown -Anchors $audit.Anchors `
+                    -ProviderMarkers $audit.ProviderMarkers))
         }
         if ($observerFindingsTruncated) {
             Add-OwnerObserverValidationError -Errors $errors `
@@ -853,9 +1037,11 @@ function Read-OwnerV1Observation {
         }
         lifecycle = Get-OwnerObserverLifecycle -Record $record
         counts = [ordered]@{
-            checked = Get-OwnerObserverKnownNumber -Container $counts -Name 'checked'
+            checked = $checkedCount
+            eligible = $eligibleCount
+            advisory = 0
             violations = Get-OwnerObserverKnownNumber -Container $counts -Name 'violations'
-            unknown = Get-OwnerObserverKnownNumber -Container $counts -Name 'unknown'
+            unknown = $unknownCount
             uncovered = $uncovered
         }
         findingsComplete = $(if ($status) {
@@ -884,6 +1070,7 @@ function Read-OwnerV1Observation {
         sourceArtifacts = @($artifacts.ToArray())
         validationErrors = @($errors.ToArray())
     }
+    $outcome = ConvertTo-OwnerObservationV2 -Observation $outcome
     if (-not (Test-OwnerObservation -Observation $outcome)) {
         throw 'Owner v1 normalization produced an invalid owner-observation document.'
     }
@@ -915,6 +1102,14 @@ function Read-OwnerNormalizedObservation {
 
     $resolved = Resolve-OwnerObserverFile -Path $Path -Label 'Normalized Owner observation'
     $bytes = [IO.File]::ReadAllBytes($resolved)
+    return ConvertFrom-OwnerNormalizedObservationBytes -Bytes $bytes
+}
+
+function ConvertFrom-OwnerNormalizedObservationBytes {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    $bytes = $Bytes
     if ($bytes.Length -gt 4MB) { throw 'Normalized Owner observation exceeds the 4 MiB limit.' }
     try {
         $text = ([Text.UTF8Encoding]::new($false, $true)).GetString($bytes)
@@ -923,6 +1118,7 @@ function Read-OwnerNormalizedObservation {
     catch {
         throw 'Normalized Owner observation is not valid UTF-8 JSON.'
     }
+    $outcome = ConvertTo-OwnerObservationV2 -Observation $outcome
     if (-not (Test-OwnerObservation -Observation $outcome)) {
         throw 'Normalized Owner observation failed owner-observation schema validation.'
     }
@@ -960,7 +1156,7 @@ function Get-OwnerObserverFindingMap {
     $map = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     $hasUncomparable = $false
     foreach ($finding in @($Observation.findings)) {
-        $identity = [string](Get-OwnerObserverValue $finding 'identity' '')
+        $identity = [string](Get-OwnerObserverValue $finding 'semanticKey' '')
         if (-not $identity -or $identity -ceq $script:OwnerObserverUnknown) {
             $hasUncomparable = $true
             continue
@@ -992,6 +1188,12 @@ function Compare-OwnerObservations {
         [Parameter(Mandatory)]$Baseline,
         [Parameter(Mandatory)]$Candidate
     )
+    if ($Baseline -is [Collections.IDictionary]) {
+        $Baseline = ConvertTo-OwnerObservationV2 -Observation $Baseline
+    }
+    if ($Candidate -is [Collections.IDictionary]) {
+        $Candidate = ConvertTo-OwnerObservationV2 -Observation $Candidate
+    }
     if (-not (Test-OwnerObservation -Observation $Baseline) -or
         -not (Test-OwnerObservation -Observation $Candidate)) {
         throw 'Both parity inputs must satisfy the owner-observation schema.'
@@ -1015,7 +1217,10 @@ function Compare-OwnerObservations {
         @{ Name = 'subject.headCommit'; Left = $Baseline.subject.headCommit; Right = $Candidate.subject.headCommit },
         @{ Name = 'subject.targetCommit'; Left = $Baseline.subject.targetCommit; Right = $Candidate.subject.targetCommit },
         @{ Name = 'subject.targetRef'; Left = $Baseline.subject.targetRef; Right = $Candidate.subject.targetRef },
-        @{ Name = 'rule.identity'; Left = $Baseline.rule.identity; Right = $Candidate.rule.identity }
+        @{ Name = 'rule.path'; Left = $Baseline.rule.path; Right = $Candidate.rule.path },
+        @{ Name = 'rule.section'; Left = $Baseline.rule.section; Right = $Candidate.rule.section },
+        @{ Name = 'rule.commit'; Left = $Baseline.rule.commit; Right = $Candidate.rule.commit },
+        @{ Name = 'rule.sha256'; Left = $Baseline.rule.sha256; Right = $Candidate.rule.sha256 }
     )
     $mismatches = [Collections.Generic.List[string]]::new()
     $bindingUnknown = $false

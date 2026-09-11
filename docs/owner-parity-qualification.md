@@ -14,11 +14,14 @@ reports stay outside git. Only the fixed-shape sanitized aggregate summary is
 suitable for commit. Output parent directories must already exist; device,
 UNC, substituted-drive, provider-drive, and reparse-point aliases are rejected.
 
-For a rigorous run, record `expectedV1Snapshot` in the private manifest before
-deriving any replay candidates. The coordinator compares that snapshot with
-both its immediate pre-run snapshot and its post-run snapshot, so activity
-between evidence capture and execution cannot be hidden by a narrow snapshot
-window.
+For a rigorous run, record every critical v1 file in `attestation.critical`
+with its repository-root-relative path, exact SHA-256, byte length, and
+`critical:<path>` binding. Declare each permitted volatile file separately in
+`attestation.volatile` with its initial prefix hash/length, bounded growth, and
+`affectsParityInputs: false`. The coordinator rejects unexpected files, copies
+the attested bytes to a fresh immutable snapshot under the separate v2 state
+root, reads v1 only from that snapshot, and compares the original files again
+after qualification.
 
 ```powershell
 ./tools/Invoke-OwnerParityQualification.ps1 `
@@ -32,55 +35,54 @@ window.
 Every gate is one of `passed`, `failed`, `blocked`, or `notMeasured`. A
 synthetic fixture cannot pass finding-retention or false-positive gates.
 Unknown or uncovered v1 units are never inferred compliant when v2 lacks a
-unit-level outcome. Missing latency, model-start, attempt, or intervention data
-must remain the literal value `unknown`.
+unit-level outcome. Counts and telemetry use explicit `measured`,
+`unavailable`, or `notMeasured` states so a measured zero cannot be confused
+with absent evidence.
 
 The eight gates are:
 
 1. 100% retention of adjudicated verified v1 method findings.
 2. Zero new comment-eligible false positives against complete truth.
-3. Exact equality for mutually exposed subject, head, target, rule,
-   capability, and finding-anchor bindings.
+3. Equality for mutually exposed subject/head/target/rule/capability fields
+   plus versioned canonical semantic finding keys. Raw path/anchor forms and
+   provider dedupe markers remain audit evidence, not equality requirements.
 4. No unknown or uncovered v1 unit converted to a known outcome.
 5. Zero v2 provider or write-tool activity.
 6. Candidate completion and retained-unit rates no lower than v1.
 7. Explicit latency, model-start, attempt, and operator-intervention
    accounting, including explicit unknowns.
-8. Identical v1 file count, byte count, newest timestamp, and content root
-   before and after qualification.
+8. Byte-identical critical v1 inputs plus only explicitly declared,
+   prefix-preserving, bounded append-only volatile changes.
 
 Offline deterministic or recorded-byte replay proves only retrospective parity
 for the preserved cohort. Prospective real-model parity remains separately
 blocked until the model launcher can prove its no-tools and no-provider-write
 ceiling without widening permissions.
 
-## First preserved-evidence qualification
+## Contract-remediated preserved-evidence qualification
 
-The committed [sanitized aggregate](owner-parity-summary.json) covers five
-preserved cohort entries. Two method-bearing entries completed through the v2
-parser and offline replay path and reproduced all 6 verified v1 method
-findings, with no observed adjudicated eligible false positives. Because the
-judgments came from a deterministic attribute oracle rather than preserved
-model output, those observations are structural evidence and do not pass the
-semantic retention or false-positive gates. The remaining entries expose the
-limits rather than converting them into successes:
+The committed [sanitized aggregate](owner-parity-summary.json) covers the same
+five preserved cohort entries using a new v2 state root and 3,260 exact
+critical references plus one explicitly declared append-only volatile file.
+Four candidates now complete with normalized accounting. All 6 verified v1
+method findings have canonical structural matches, but deterministic attribute
+judgments remain non-semantic evidence.
 
 | Gate | Result | Evidence |
 |---|---|---|
 | Finding retention | `blocked` | 6 of 6 reproduced, but deterministic oracle output is not semantic evidence |
-| Eligible false positives | `blocked` | 0 observed; deterministic provenance and three unavailable entries prevent qualification |
-| Binding equivalence | `failed` | Four exact path/anchor representation mismatches and five dedupe-accounting mismatches |
+| Eligible false positives | `blocked` | No entry has qualifying semantic truth, so the aggregate is unavailable rather than a measured zero |
+| Binding equivalence | `blocked` | 38 measured canonical comparisons pass; the unavailable fifth entry remains blocked |
 | Unknown integrity | `blocked` | 16 unknown, advisory, uncovered, or incomplete outcomes lack candidate proof |
-| Write isolation | `blocked` | Completed replays recorded zero writes; three unavailable results lack normalized write accounting |
-| Completion reliability | `blocked` | Two candidates completed, one did not, and two outcomes remain unknown; the unknown outcomes could still close the completion-rate gap, while semantic retention remains unmeasured |
-| Latency accounting | `blocked` | Completed replays are accounted; unavailable results have no normalized candidate accounting |
-| Rollback proof | `failed` | v1 changed after the original snapshot, and `runner\scheduled.log` also changed during the final coordinator run |
+| Write isolation | `blocked` | Four completed replays measured zero provider/tool writes; the unavailable entry remains blocked |
+| Completion reliability | `blocked` | Four candidates completed, one remains unavailable, and semantic retention is still unmeasured |
+| Latency accounting | `blocked` | 96 explicit measurement states pass; the unavailable entry contributes 12 blocked states |
+| Rollback proof | `passed` | 3,260 critical files were byte-identical; the sole declared volatile file preserved its prefix and file identity within bounded growth |
 
 Prospective real-model parity is also `blocked`. This evidence does not support
 cutover or writer compatibility.
 
-The smallest safe next layer is a contract-only follow-up that canonicalizes
-v1/v2 path representation before comparison, makes zero-unit and advisory-only
-v2 runs emit valid normalized observations, and permits exact local source bytes
-to be referenced without relaxing the manifest secret scanner. A separate
-no-tools real-model launcher is still required for prospective semantic parity.
+These deterministic contracts make the next semantic parity run measurable;
+they do not support cutover, deployment changes, or writer compatibility. A
+separate no-tools real-model launcher and independently adjudicated semantic
+evidence are still required.

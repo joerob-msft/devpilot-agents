@@ -8,6 +8,8 @@ BeforeAll {
         'fixtures/owner-parity/generic-qualification.json'
     Import-Module (Join-Path $script:RepoRoot 'src/OwnerObserver/OwnerObserver.psd1') -Force
     Import-Module $script:ModulePath -Force
+    Import-Module (Join-Path $script:RepoRoot `
+            'src/OwnerObservationContract/OwnerObservationContract.psd1') -Force
     $script:ParityModule = Get-Module DevPilot.OwnerParity
 
     function Copy-TestParityValue {
@@ -30,6 +32,25 @@ BeforeAll {
         $observation.counts.unknown = 0
         $observation.counts.uncovered = 0
         if ($Mutator) { & $Mutator $observation }
+        foreach ($finding in @($observation.findings)) {
+            if ($finding.anchor -is [Collections.IDictionary]) {
+                $finding.binding = New-OwnerCanonicalAnchor `
+                    -Path ([string]$finding.anchor.path) `
+                    -StartLine ([int]$finding.anchor.line) `
+                    -EndLine ([int]$finding.anchor.line) `
+                    -Symbol ([string]$finding.anchor.symbol) `
+                    -ConstructIdentity ([string]$finding.constructRef)
+                $finding.semanticKey = Get-OwnerSemanticFindingKey `
+                    -Subject $observation.subject `
+                    -Rule $observation.rule `
+                    -Capability ([string]$observation.capability) `
+                    -Binding $finding.binding
+            }
+            else {
+                $finding.binding = 'unknown'
+                $finding.semanticKey = 'unknown'
+            }
+        }
         (& $script:ParityModule {
                 param($Value)
                 Test-OwnerObservation -Observation $Value
@@ -94,6 +115,7 @@ Describe 'Owner parity qualification contract' {
             ConvertFrom-Json -AsHashtable -Depth 32
 
         $fixture.kind | Should -Be 'owner-parity-qualification'
+        $fixture.schemaVersion | Should -Be 2
         @($fixture.entries).Count | Should -Be 1
         ($fixture | ConvertTo-Json -Depth 32 -Compress) |
             Should -Not -Match '(?i)bearer|github_pat|ghp_|password|secret|visualstudio\.com|@microsoft\.com'
@@ -133,6 +155,42 @@ Describe 'Owner parity qualification contract' {
                 Read-OwnerParityManifest -Path $ManifestPath
             } $path
         } | Should -Throw '*baseline headKey*duplicated*'
+    }
+
+    It 'rejects duplicate candidate evidence across cohort entries' {
+        $fixture = Get-Content -LiteralPath $script:QualificationFixture -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $duplicate = Copy-TestParityValue -Value $fixture.entries[0]
+        $duplicate.id = 'generic-preserved-case-copy'
+        $duplicate.baseline.headKey = 'b' * 64
+        $duplicate.adjudication[0].key = 'method-case-002'
+        $fixture.entries += $duplicate
+        $path = Join-Path $TestDrive 'duplicate-candidate.json'
+        Set-Content -LiteralPath $path -Value (
+            ConvertTo-Json -InputObject $fixture -Depth 32) -NoNewline
+
+        {
+            & $script:ParityModule {
+                param($ManifestPath)
+                Read-OwnerParityManifest -Path $ManifestPath
+            } $path
+        } | Should -Throw '*candidate observation is reused*'
+    }
+
+    It 'requires read candidates to declare unknown semantic provenance' {
+        $fixture = Get-Content -LiteralPath $script:QualificationFixture -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $fixture.entries[0].evidence.semanticProvenance = 'offline-replay-deterministic'
+        $path = Join-Path $TestDrive 'read-provenance.json'
+        Set-Content -LiteralPath $path -Value (
+            ConvertTo-Json -InputObject $fixture -Depth 32) -NoNewline
+
+        {
+            & $script:ParityModule {
+                param($ManifestPath)
+                Read-OwnerParityManifest -Path $ManifestPath
+            } $path
+        } | Should -Throw '*failed schema or UTF-8 JSON validation*'
     }
 
     It 'derives deterministic provenance from the replay candidate' {
@@ -258,7 +316,7 @@ Describe 'Owner parity qualification contract' {
         $gate.failures | Should -Be 2
     }
 
-    It 'fails dedupe binding mismatches when both observations expose them' {
+    It 'separates provider-specific dedupe accounting from semantic binding' {
         $baseline = New-TestParityObservation
         $candidate = New-TestParityObservation -ImplementationId 'owner-v2-test' -Mutator {
             param($o)
@@ -271,8 +329,37 @@ Describe 'Owner parity qualification contract' {
             -Adjudication @(New-TestParityAdjudication)
 
         $gate = Get-TestParityGate $result bindingEquivalence
-        $gate.status | Should -Be 'failed'
-        $gate.failures | Should -Be 2
+        $gate.status | Should -Be 'passed'
+        $gate.failures | Should -Be 0
+    }
+
+    It 'regresses PR136 representation and dedupe mismatches without passing semantic gates' {
+        $baseline = New-TestParityObservation -Mutator {
+            param($o)
+            $o.findings[0].anchor.path = '/src\WidgetTests.cs'
+            $o.findings[0].providerMarker = New-OwnerProviderMarker `
+                -Value 'v1-private-marker' -Integrity verified
+            $o.effects.dedupe.noOp = 1
+        }
+        $candidate = New-TestParityObservation -ImplementationId 'owner-v2-test' -Mutator {
+            param($o)
+            $o.findings[0].anchor.path = 'src/WidgetTests.cs'
+            $o.findings[0].providerMarker = New-OwnerProviderMarker
+            $o.effects.dedupe.noOp = 0
+            $o.effects.dedupe.unknown = 1
+        }
+        $result = Invoke-OwnerParityGateEvaluation `
+            -Baseline $baseline -Candidate $candidate `
+            -Evidence (New-TestParityEvidence `
+                -SemanticProvenance offline-replay-deterministic) `
+            -Adjudication @(New-TestParityAdjudication)
+
+        (Get-TestParityGate $result bindingEquivalence).status | Should -Be 'passed'
+        (Get-TestParityGate $result findingRetention).status | Should -Be 'blocked'
+        (Get-TestParityGate $result eligibleFalsePositives).status | Should -Be 'blocked'
+        $result.metrics.providerMarkersAvailable | Should -Be 1
+        $result.metrics.providerMarkersVerified | Should -Be 1
+        $result.metrics.providerMarkersInvalid | Should -Be 0
     }
 
     It 'compares anchors for paired unknown findings' {
@@ -386,7 +473,9 @@ Describe 'Owner parity qualification contract' {
         (Get-TestParityGate $result unknownIntegrity).status | Should -Be 'blocked'
         (Get-TestParityGate $result writeIsolation).status | Should -Be 'blocked'
         (Get-TestParityGate $result latencyAccounting).status | Should -Be 'blocked'
+        (Get-TestParityGate $result latencyAccounting).blocked | Should -Be 12
         $result.metrics.candidateCompleted | Should -Be 'unknown'
+        $result.metrics.falsePositiveMeasured | Should -BeFalse
     }
 
     It 'blocks unknown integrity when the uncovered count is unknown' {
@@ -442,8 +531,45 @@ Describe 'Owner parity qualification contract' {
             -Adjudication @(New-TestParityAdjudication)
 
         (Get-TestParityGate $result latencyAccounting).status | Should -Be 'passed'
+        (Get-TestParityGate $result latencyAccounting).measured | Should -Be 24
         $baseline.execution.latencyMs | Should -Be 'unknown'
         $candidate.execution.attempts | Should -Be 'unknown'
+    }
+
+    It 'requires an explicit violation-count measurement state' {
+        $observation = New-TestParityObservation
+        [void]$observation.measurements.counts.Remove('violations')
+
+        $valid = & $script:ParityModule {
+            param($Value)
+            Test-OwnerParityObservationAccounting -Observation $Value
+        } $observation
+
+        $valid | Should -BeFalse
+    }
+
+    It 'distinguishes measured zero from unavailable and not-measured telemetry' {
+        $baseline = New-TestParityObservation
+        $candidate = New-TestParityObservation -ImplementationId 'owner-v2-test'
+        $candidate.execution.latencyMs = 0
+        $candidate.execution.modelStarts = 'unknown'
+        $candidate.execution.attempts = 'unknown'
+        $candidate.measurements.execution.latencyMs =
+            New-OwnerMeasurement -Status measured -Value 0
+        $candidate.measurements.execution.modelStarts =
+            New-OwnerMeasurement -Status unavailable -Reason 'launcher-unavailable'
+        $candidate.measurements.execution.attempts =
+            New-OwnerMeasurement -Status notMeasured -Reason 'replay-not-requested'
+
+        $result = Invoke-OwnerParityGateEvaluation `
+            -Baseline $baseline -Candidate $candidate `
+            -Evidence (New-TestParityEvidence) `
+            -Adjudication @(New-TestParityAdjudication)
+
+        (Get-TestParityGate $result latencyAccounting).status | Should -Be 'passed'
+        $candidate.measurements.execution.latencyMs.value | Should -Be 0
+        $candidate.measurements.execution.modelStarts.value | Should -BeNullOrEmpty
+        $candidate.measurements.execution.attempts.value | Should -BeNullOrEmpty
     }
 
     It 'fails any candidate provider or tool write evidence' {
@@ -737,6 +863,23 @@ Describe 'Owner parity snapshots, paths, and sanitization' {
         }
     }
 
+    It 'requires an exact local-byte reference manifest for replay candidate generation' {
+        $v1 = Join-Path $TestDrive 'reference-v1'
+        $evidence = Join-Path $v1 'evidence'
+        $output = Join-Path $TestDrive 'private-output\candidate.json'
+        New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+        $tool = Join-Path $script:RepoRoot 'tools/New-OwnerParityReplayCandidate.ps1'
+
+        {
+            & $tool `
+                -BaselineObservationPath $script:ObservationFixture `
+                -V1StateRoot $v1 `
+                -PreservedEvidenceRoot $evidence `
+                -OutputPath $output `
+                -EntryId 'missing-reference-manifest'
+        } | Should -Throw '*ReferenceManifestPath is required*'
+    }
+
     It 'emits only fixed-shape aggregate fields and redacts private report detail by omission' {
         $report = [ordered]@{
             entries = @(
@@ -753,6 +896,7 @@ Describe 'Owner parity snapshots, paths, and sanitization' {
                         verifiedMethodFindings = 2
                         retainedMethodFindings = 2
                         retentionMeasured = $true
+                        falsePositiveMeasured = $true
                         candidateViolations = 2
                         eligibleFalsePositives = 0
                         baselineCompleted = $true
@@ -784,9 +928,43 @@ Describe 'Owner parity snapshots, paths, and sanitization' {
         $summary.sample.verifiedMethodFindings | Should -Be 2
         $summary.sample.retainedMethodFindings | Should -Be 2
         $summary.sample.retentionUnmeasured | Should -Be 0
+        $summary.sample.eligibleFalsePositives | Should -Be 0
+        $summary.sample.falsePositiveMeasuredEntries | Should -Be 1
+        $summary.sample.falsePositiveUnmeasuredEntries | Should -Be 0
         $json | Should -Not -Match 'private-pr|secret-repository|private\\evidence|private\\v1'
         @($summary.Keys | Sort-Object) |
             Should -Be @('gates', 'kind', 'prospectiveRealModel', 'rollback', 'sample', 'schemaVersion', 'scope')
+    }
+
+    It 'reports unmeasured false-positive evidence as unavailable rather than zero' {
+        $report = [ordered]@{
+            entries = @(
+                [ordered]@{
+                    metrics = [ordered]@{
+                        verifiedMethodFindings = 0
+                        retainedMethodFindings = 0
+                        retentionMeasured = $false
+                        falsePositiveMeasured = $false
+                        candidateViolations = 0
+                        eligibleFalsePositives = 0
+                        baselineCompleted = $true
+                        candidateCompleted = 'unknown'
+                    }
+                }
+            )
+            gates = @()
+            rollback = [ordered]@{
+                unchanged = $true
+                differences = @()
+                before = [ordered]@{ itemCount = 1 }
+            }
+        }
+
+        $summary = ConvertTo-OwnerParitySanitizedSummary -Report $report
+
+        $summary.sample.eligibleFalsePositives | Should -BeNullOrEmpty
+        $summary.sample.falsePositiveMeasuredEntries | Should -Be 0
+        $summary.sample.falsePositiveUnmeasuredEntries | Should -Be 1
     }
 
     It 'fails completion reliability when v2 completion is below v1' {

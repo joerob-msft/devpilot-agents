@@ -1,22 +1,48 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "owner-parity-qualification.v1",
+  "$id": "owner-parity-qualification.v2",
   "title": "Owner parity qualification manifest",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "kind", "expectedV1Snapshot", "entries"],
+  "required": ["schemaVersion", "kind", "attestation", "entries"],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "const": 2 },
     "kind": { "const": "owner-parity-qualification" },
-    "expectedV1Snapshot": {
+    "attestation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["fileCount", "byteCount", "newestWriteTicks", "rootHash"],
+      "required": ["critical", "volatile"],
       "properties": {
-        "fileCount": { "type": "integer", "minimum": 0 },
-        "byteCount": { "type": "integer", "minimum": 0 },
-        "newestWriteTicks": { "type": "integer", "minimum": 0 },
-        "rootHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        "critical": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/exactReference" }
+        },
+        "volatile": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "relativePath",
+              "expectedPrefixSha256",
+              "expectedPrefixLength",
+              "maximumGrowthBytes",
+              "affectsParityInputs"
+            ],
+            "properties": {
+              "id": { "$ref": "#/$defs/id" },
+              "relativePath": { "$ref": "#/$defs/relativePath" },
+              "expectedPrefixSha256": { "$ref": "#/$defs/sha256" },
+              "expectedPrefixLength": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+              "maximumGrowthBytes": { "type": "integer", "minimum": 0, "maximum": 1048576 },
+              "affectsParityInputs": { "const": false }
+            }
+          }
+        }
       }
     },
     "entries": {
@@ -27,6 +53,32 @@
         "type": "object",
         "additionalProperties": false,
         "required": ["id", "baseline", "candidate", "evidence", "adjudication"],
+        "allOf": [
+          {
+            "if": {
+              "required": ["candidate"],
+              "properties": {
+                "candidate": {
+                  "required": ["mode"],
+                  "properties": {
+                    "mode": { "const": "read" }
+                  }
+                }
+              }
+            },
+            "then": {
+              "required": ["evidence"],
+              "properties": {
+                "evidence": {
+                  "required": ["semanticProvenance"],
+                  "properties": {
+                    "semanticProvenance": { "const": "unknown" }
+                  }
+                }
+              }
+            }
+          }
+        ],
         "properties": {
           "id": { "$ref": "#/$defs/id" },
           "baseline": {
@@ -34,7 +86,7 @@
             "additionalProperties": false,
             "required": ["headKey"],
             "properties": {
-              "headKey": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+              "headKey": { "$ref": "#/$defs/sha256" }
             }
           },
           "candidate": {
@@ -77,16 +129,9 @@
           "evidence": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "class",
-              "semanticProvenance",
-              "inputContract",
-              "truthCoverage"
-            ],
+            "required": ["class", "semanticProvenance", "inputContract", "truthCoverage"],
             "properties": {
-              "class": {
-                "enum": ["preserved-exact-bytes", "synthetic", "unknown"]
-              },
+              "class": { "enum": ["preserved-exact-bytes", "synthetic", "unknown"] },
               "semanticProvenance": {
                 "enum": [
                   "offline-replay-recorded-model",
@@ -96,12 +141,8 @@
                   "unknown"
                 ]
               },
-              "inputContract": {
-                "enum": ["independently-validated", "unknown"]
-              },
-              "truthCoverage": {
-                "enum": ["complete", "partial", "none"]
-              }
+              "inputContract": { "enum": ["independently-validated", "unknown"] },
+              "truthCoverage": { "enum": ["complete", "partial", "none"] }
             }
           },
           "adjudication": {
@@ -110,21 +151,11 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": [
-                "key",
-                "eligibility",
-                "truth",
-                "baseline",
-                "candidate"
-              ],
+              "required": ["key", "eligibility", "truth", "baseline", "candidate"],
               "properties": {
                 "key": { "$ref": "#/$defs/id" },
-                "eligibility": {
-                  "enum": ["method", "class-advisory", "incomplete"]
-                },
-                "truth": {
-                  "enum": ["violation", "compliant", "unknown"]
-                },
+                "eligibility": { "enum": ["method", "class-advisory", "incomplete"] },
+                "truth": { "enum": ["violation", "compliant", "unknown"] },
                 "baseline": { "$ref": "#/$defs/selectorOrNull" },
                 "candidate": { "$ref": "#/$defs/selectorOrNull" }
               }
@@ -143,6 +174,32 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 32767
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.?(?:[/\\\\]|$)).+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "exactReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "relativePath", "sha256", "length", "binding"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "relativePath": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "length": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+        "binding": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      }
     },
     "selector": {
       "type": "object",
