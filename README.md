@@ -52,7 +52,7 @@ src/
   DevPilot.OwnerPipeline/    # experimental generic Owner review facade
   DevPilot.OwnerAdapters/    # read-only production/replay acquisition boundary
   DevPilot.OwnerCapability/  # preview-only injected Owner semantic boundary
-  DevPilot.OwnerModelRunner/ # bounded test-child and offline replay runner
+  DevPilot.OwnerModelRunner/ # fail-closed no-tools preflight, fake process, and replay runner
   DevPilot.OwnerOrchestrator/ # preview-only v2 cohort state lifecycle
   DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
   OwnerObserver/             # read-only Owner implementation parity adapter

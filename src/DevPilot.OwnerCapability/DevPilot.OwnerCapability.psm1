@@ -1214,6 +1214,7 @@ function ConvertTo-OwnerV2Observation {
             [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'method:r:*'
         }).Count
     $modelStarts = 'unknown'
+    $modelStartsReason = 'runner-telemetry-not-requested'
     $latencyMs = 'unknown'
     $refusalReason = 'unknown'
     if ($null -ne $Runner) {
@@ -1235,8 +1236,12 @@ function ConvertTo-OwnerV2Observation {
             $attemptsValue -isnot [int] -and $attemptsValue -isnot [long] -or
             [long]$attemptsValue -lt 0 -or [long]$attemptsValue -gt 1024 -or
             $modelStartsValue -is [bool] -or
-            $modelStartsValue -isnot [int] -and $modelStartsValue -isnot [long] -or
-            [long]$modelStartsValue -lt 0 -or [long]$modelStartsValue -gt [long]$attemptsValue -or
+            ($modelStartsValue -is [string] -and [string]$modelStartsValue -cne 'unknown') -or
+            ($modelStartsValue -isnot [string] -and
+                $modelStartsValue -isnot [int] -and $modelStartsValue -isnot [long]) -or
+            ($modelStartsValue -isnot [string] -and (
+                [long]$modelStartsValue -lt 0 -or
+                [long]$modelStartsValue -gt [long]$attemptsValue)) -or
             $latencyValue -is [bool] -or
             $latencyValue -isnot [int] -and $latencyValue -isnot [long] -or
             [long]$latencyValue -lt 0 -or [long]$latencyValue -gt 86400000 -or
@@ -1248,7 +1253,13 @@ function ConvertTo-OwnerV2Observation {
             throw 'Semantic runner telemetry contained invalid aggregate values.'
         }
         $runnerAttemptCount = [int]$attemptsValue
-        $modelStarts = [int]$modelStartsValue
+        $modelStarts = if ($modelStartsValue -is [string]) {
+            $modelStartsReason = 'model-start-indeterminate'
+            'unknown'
+        }
+        else {
+            [int]$modelStartsValue
+        }
         $latencyMs = [long]$latencyValue
         $refusalReason = [string]$refusalValue
     }
@@ -1338,7 +1349,12 @@ function ConvertTo-OwnerV2Observation {
             execution = [ordered]@{
                 attempts = New-OwnerMeasurement -Status measured -Value $runnerAttemptCount
                 modelStarts = $(if ($modelStarts -is [string]) {
-                        New-OwnerMeasurement -Status notMeasured -Reason 'runner-telemetry-not-requested'
+                        if ($modelStartsReason -ceq 'model-start-indeterminate') {
+                            New-OwnerMeasurement -Status unavailable -Reason $modelStartsReason
+                        }
+                        else {
+                            New-OwnerMeasurement -Status notMeasured -Reason $modelStartsReason
+                        }
                     }
                     else {
                         New-OwnerMeasurement -Status measured -Value $modelStarts
