@@ -1,20 +1,20 @@
 {
   "schemaVersion": 2,
   "kind": "owner-parity-sanitized-summary",
-  "scope": "retrospective-offline",
+  "scope": "prospective-real-model",
   "sample": {
     "entries": 5,
     "baselineCompleted": 4,
-    "candidateCompleted": 4,
+    "candidateCompleted": 2,
     "candidateCompletionUnknown": 1,
     "verifiedMethodFindings": 6,
     "retainedMethodFindings": 0,
     "retentionUnmeasured": 6,
-    "structuralMethodMatches": 6,
-    "candidateViolations": 6,
-    "eligibleFalsePositives": null,
-    "falsePositiveMeasuredEntries": 0,
-    "falsePositiveUnmeasuredEntries": 5
+    "structuralMethodMatches": 0,
+    "candidateViolations": 0,
+    "eligibleFalsePositives": 0,
+    "falsePositiveMeasuredEntries": 2,
+    "falsePositiveUnmeasuredEntries": 3
   },
   "gates": [
     {
@@ -29,15 +29,15 @@
       "name": "eligibleFalsePositives",
       "status": "blocked",
       "evidenceCode": "mixed-cohort-evidence",
-      "measured": 6,
+      "measured": 0,
       "failures": 0,
-      "blocked": 5
+      "blocked": 3
     },
     {
       "name": "bindingEquivalence",
       "status": "blocked",
       "evidenceCode": "mixed-cohort-evidence",
-      "measured": 38,
+      "measured": 36,
       "failures": 0,
       "blocked": 1
     },
@@ -47,7 +47,7 @@
       "evidenceCode": "mixed-cohort-evidence",
       "measured": 15,
       "failures": 0,
-      "blocked": 16
+      "blocked": 18
     },
     {
       "name": "writeIsolation",
@@ -67,11 +67,11 @@
     },
     {
       "name": "completionReliability",
-      "status": "blocked",
-      "evidenceCode": "completion-or-retention-unavailable",
+      "status": "failed",
+      "evidenceCode": "candidate-completion-or-retention-rate-lower",
       "measured": 4,
-      "failures": 0,
-      "blocked": 4
+      "failures": 1,
+      "blocked": 0
     },
     {
       "name": "rollbackProof",
@@ -83,8 +83,8 @@
     }
   ],
   "prospectiveRealModel": {
-    "status": "blocked",
-    "evidenceCode": "safe-real-model-launcher-unavailable"
+    "status": "failed",
+    "evidenceCode": "prospective-real-model-gates-failed"
   },
   "rollback": {
     "unchanged": true,
