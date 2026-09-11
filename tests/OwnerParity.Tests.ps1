@@ -124,6 +124,7 @@ Describe 'Owner parity qualification contract' {
     It 'rejects duplicate adjudication keys and selectors' {
         $fixture = Get-Content -LiteralPath $script:QualificationFixture -Raw |
             ConvertFrom-Json -AsHashtable -Depth 32
+        $fixture.entries[0].candidate.observationPath = Join-Path $TestDrive 'candidate.json'
         $duplicate = Copy-TestParityValue -Value $fixture.entries[0].adjudication[0]
         $duplicate.key = 'method-case-002'
         $fixture.entries[0].adjudication += $duplicate
@@ -142,6 +143,7 @@ Describe 'Owner parity qualification contract' {
     It 'rejects duplicate baseline cohort entries' {
         $fixture = Get-Content -LiteralPath $script:QualificationFixture -Raw |
             ConvertFrom-Json -AsHashtable -Depth 32
+        $fixture.entries[0].candidate.observationPath = Join-Path $TestDrive 'candidate.json'
         $duplicate = Copy-TestParityValue -Value $fixture.entries[0]
         $duplicate.id = 'generic-preserved-case-copy'
         $fixture.entries += $duplicate
@@ -160,6 +162,7 @@ Describe 'Owner parity qualification contract' {
     It 'rejects duplicate candidate evidence across cohort entries' {
         $fixture = Get-Content -LiteralPath $script:QualificationFixture -Raw |
             ConvertFrom-Json -AsHashtable -Depth 32
+        $fixture.entries[0].candidate.observationPath = Join-Path $TestDrive 'candidate.json'
         $duplicate = Copy-TestParityValue -Value $fixture.entries[0]
         $duplicate.id = 'generic-preserved-case-copy'
         $duplicate.baseline.headKey = 'b' * 64
