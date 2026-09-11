@@ -370,6 +370,8 @@ export class OperationsReducer {
         state.outstanding = [];
         break;
       case "phase.changed":
+        if (event.pullRequestId > 0) state.pullRequestId = event.pullRequestId;
+        this.reducePullRequestContext(state, data);
         state.phase = getString(data, "phase") || event.message || state.phase;
         state.phaseElapsedMilliseconds = Math.max(0, getNumber(data, "elapsedMilliseconds"));
         state.phaseTimestampMs = event.timestampMs;
@@ -399,6 +401,8 @@ export class OperationsReducer {
         state.modelActivity = "Review started";
         break;
       case "delivery.retrying":
+        if (event.pullRequestId > 0) state.pullRequestId = event.pullRequestId;
+        this.reducePullRequestContext(state, data);
         state.retryable = true;
         state.outstanding = getStringArray(data, "outstanding");
         break;
@@ -454,6 +458,8 @@ export class OperationsReducer {
       }
       case "cycle.completed":
       case "cycle.failed": {
+        if (event.pullRequestId > 0) state.pullRequestId = event.pullRequestId;
+        this.reducePullRequestContext(state, data);
         const result = event.eventType === "cycle.failed" ? "failed" : getString(data, "result") || "completed";
         state.cycles = addBounded(
           state.cycles,
@@ -475,9 +481,9 @@ export class OperationsReducer {
             delivered: [],
             reason: getString(data, "reason") || event.message,
             findings: { critical: 0, important: 0, suggestion: 0 },
-            summary: "",
+            summary: getString(data, "summary"),
             previewArtifact: "",
-            nextScan: "",
+            nextScan: getString(data, "nextRetry"),
             elapsedMilliseconds: Math.max(0, event.timestampMs - state.currentRunStartedMs),
             timestampMs: event.timestampMs,
           };

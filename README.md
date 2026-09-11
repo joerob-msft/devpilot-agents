@@ -299,6 +299,12 @@ denied. It does **not** enable Teams notifications, shared PR-reference
 writes, Reviewer approval votes, or Review Handler auto-complete. Those remain
 behind their separate gates.
 
+Reviewer candidate selection never shares its ADO MCP session with Teams
+notification delivery. A transient MCP transport closure is retried once with
+a fresh session in the same cycle. If recovery still fails, the failure event
+retains the exact PR ID, title, operation, reason, and next retry so Simple and
+Advanced views do not display a stale prior PR or hide the actionable context.
+
 `-PreviewOnly` is not an omission-based convention. It is a terminal,
 non-delegable ceiling that disables automatic and manual PR mutations,
 notification delivery, Settings widening, and delegated grants. Use `-DryRun`

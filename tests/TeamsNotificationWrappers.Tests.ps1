@@ -224,16 +224,30 @@ Describe '<Role> Teams notification integration' -ForEach @(
         }
     }
 
-    It 'passes a read-only live ADO reference context without opening a second ADO session' {
+    It 'isolates reviewer references while allowing the handler to reuse its live cycle session' {
         $script:TeamsPrReferenceEnabled = $true
         $script:ReviewerTeamsAdoSession = @{ LiveCycle = $true }
         $script:HandlerTeamsAdoSession = @{ LiveCycle = $true }
         Invoke-TestNotification
-        Should -Invoke New-AgentTeamsPrReferenceContext -Times 1 -ParameterFilter {
-            $AdoSession.LiveCycle -and -not $AllowWrites -and $Role -ceq $script:notificationRole
+        if ($script:notificationRole -eq 'reviewer') {
+            Should -Invoke New-AgentTeamsPrReferenceContext -Times 1 -ParameterFilter {
+                $AdoSession.Synthetic -and -not $AllowWrites -and $Role -ceq 'reviewer'
+            }
+            Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -ParameterFilter {
+                $ReferenceContext.AdoSession.Synthetic
+            }
+            Should -Invoke Open-AgentMcpSession -Times 1 -ParameterFilter { $Server -ceq 'ado' }
+            Should -Invoke Close-AgentMcpSession -Times 2
         }
-        Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -ParameterFilter { $ReferenceContext.AdoSession.LiveCycle }
-        Should -Invoke Open-AgentMcpSession -Times 0 -ParameterFilter { $Server -ceq 'ado' }
+        else {
+            Should -Invoke New-AgentTeamsPrReferenceContext -Times 1 -ParameterFilter {
+                $AdoSession.LiveCycle -and -not $AllowWrites -and $Role -ceq 'review-handler'
+            }
+            Should -Invoke Send-AgentTeamsThreadedChannelMessage -Times 1 -ParameterFilter {
+                $ReferenceContext.AdoSession.LiveCycle
+            }
+            Should -Invoke Open-AgentMcpSession -Times 0 -ParameterFilter { $Server -ceq 'ado' }
+        }
     }
 
     It 'opens and closes a dedicated reference session outside a cycle' {
