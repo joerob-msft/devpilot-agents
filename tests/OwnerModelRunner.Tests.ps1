@@ -252,7 +252,7 @@ Describe 'Owner bounded model runner' {
                 -TotalDeadlineMilliseconds 150)
         $total.Response.judgment | Should -Be 'unknown'
         $total.Telemetry.refusalReason | Should -Be 'total-timeout'
-        $total.Telemetry.attempts | Should -Be 1
+        @($total.Telemetry.records | Where-Object processStarted -eq $true).Count | Should -Be 1
     }
 
     It 'contains descendants and closes their process tree on deadline' {
