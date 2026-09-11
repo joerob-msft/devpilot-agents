@@ -87,9 +87,10 @@ adapter. The orchestrator asserts `preview.writeAllowed = false`,
 `delivery.writeCount = 0`, and observation
 `effects.providerWrites/writeToolInvocations = 0`.
 
-Live declarations may be prepared so a pinned cohort can be reviewed, but run
-fails closed as `launcher-unavailable` before any provider or model call. There
-is no production live launcher in this layer.
+Live declarations may be prepared so a pinned cohort can be reviewed, but this
+orchestrator still fails closed as `launcher-unavailable` before any provider
+or model call. The separate no-tools launcher is intentionally not wired into
+cohort execution in this layer.
 
 ## Next convergence layer
 
