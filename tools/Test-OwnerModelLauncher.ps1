@@ -28,6 +28,10 @@ if (-not [string]::IsNullOrWhiteSpace($CopilotPath)) {
 
 $provider = New-OwnerCopilotCliModelProvider @providerParameters
 $result = Test-OwnerModelProviderPreflight -Provider $provider
+if ($result.available -and $result.localProcessMetadataExposure -and
+    [string]::IsNullOrWhiteSpace([string]$result.risk)) {
+    throw '[owner-model-launch-unavailable] Prompt transport risk provenance was missing.'
+}
 $result | ConvertTo-Json -Depth 8
 if (-not $result.available) {
     throw "[owner-model-launch-unavailable] $($result.reason)"

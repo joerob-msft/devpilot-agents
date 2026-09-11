@@ -1,6 +1,6 @@
 @{
     RootModule = 'DevPilot.OwnerModelRunner.psm1'
-    ModuleVersion = '0.3.0'
+    ModuleVersion = '0.4.0'
     GUID = '70707070-8181-9292-a3a3-b4b4b4b4b4b4'
     Author = 'DevPilot Agents contributors'
     CompanyName = 'Unknown'
@@ -24,7 +24,7 @@
     PrivateData = @{
         PSData = @{
             Tags = @('copilot', 'agents', 'review', 'owner', 'model', 'replay', 'powershell')
-            ReleaseNotes = 'Adds bounded ACP v1 capability negotiation while preserving fail-closed launch on unproven session confidentiality.'
+            ReleaseNotes = 'Enables the bounded no-tools runner through supported Copilot CLI prompt mode with explicit local argv exposure provenance.'
         }
     }
 }
