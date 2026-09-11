@@ -233,6 +233,36 @@ test("attention ordering is failed, blocked, running, waiting, completed", () =>
   );
 });
 
+test("cycle failures retain the current PR and actionable diagnostic context", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(event("contextual-failure", 1, "agent.started"));
+  reducer.apply(event("contextual-failure", 2, "cycle.started"));
+  reducer.apply(event("contextual-failure", 3, "phase.changed", {
+    pullRequestId: 16353746,
+    data: {
+      phase: "reading PR metadata, threads, and changed files",
+      title: "Add second Copilot Cowork first-party app",
+    },
+  }));
+  reducer.apply(event("contextual-failure", 4, "cycle.failed", {
+    level: "error",
+    pullRequestId: 16353746,
+    data: {
+      title: "Add second Copilot Cowork first-party app",
+      reason: "Agent MCP session is closed.",
+      summary: "Reviewer failed while reading metadata and review threads for PR 16353746.",
+      nextRetry: "next reviewer retry cycle",
+    },
+  }));
+
+  const state = reducer.get("reviewer:contextual-failure", BASE_TIME + 1_000);
+  assert.equal(state?.pullRequestId, 16353746);
+  assert.equal(state?.pullRequestTitle, "Add second Copilot Cowork first-party app");
+  assert.equal(state?.completion?.reason, "Agent MCP session is closed.");
+  assert.equal(state?.completion?.summary, "Reviewer failed while reading metadata and review threads for PR 16353746.");
+  assert.equal(state?.completion?.nextScan, "next reviewer retry cycle");
+});
+
 test("partially delivered completion preserves an earlier production-order block", () => {
   const reducer = new OperationsReducer();
   reducer.apply(event("partial", 1, "agent.started"));

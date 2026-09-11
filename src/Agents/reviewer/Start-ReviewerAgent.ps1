@@ -269,7 +269,6 @@ $script:ReviewerUtf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $script:ReviewerUtf8
 $OutputEncoding = $script:ReviewerUtf8
 $script:ReviewerOutputContext = $null
-$script:ReviewerTeamsAdoSession = $null
 $script:ReviewerTeamsManualAuthorized = $false
 $script:ReviewerDurableContext = $null
 $script:ReviewerLeaseRoot = $null
@@ -5310,14 +5309,10 @@ function Send-ReviewerTeamsNotification {
                 if ($threadedChannel) {
                     $referenceParameters = @{}
                     if ($TeamsPrReferenceEnabled) {
-                        $ado = $script:ReviewerTeamsAdoSession
-                        if (-not $ado) {
-                            $referenceSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
-                                -Organization $Organization -Toolsets @('repos') -TimeoutSeconds 30 `
-                                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
-                            $ado = $referenceSession
-                        }
-                        $referenceParameters.ReferenceContext = New-AgentTeamsPrReferenceContext -AdoSession $ado `
+                        $referenceSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
+                            -Organization $Organization -Toolsets @('repos') -TimeoutSeconds 30 `
+                            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+                        $referenceParameters.ReferenceContext = New-AgentTeamsPrReferenceContext -AdoSession $referenceSession `
                             -RepositoryIdentity $repositoryIdentity -Role reviewer
                     }
                     $result = Send-AgentTeamsThreadedChannelMessage -Session $workIqSession -DurableStateRoot $DurableStateRoot `
@@ -6347,14 +6342,23 @@ function Invoke-ReviewerPromotion {
     }
 }
 
+function Test-ReviewerRecoverableMcpFailure {
+    param([Parameter(Mandatory)][string]$Message)
+    return ($Message -match '^(Agent MCP session is closed\.|Could not write to Agent MCP\.|Agent MCP exited before returning a response\.|Agent MCP closed stdout before returning a response\.|Agent MCP response timed out\.)$')
+}
+
 function Invoke-ReviewerCycle {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
-        [Parameter(Mandatory)][int]$CycleNumber
+        [Parameter(Mandatory)][int]$CycleNumber,
+        [switch]$McpRecoveryAttempted
     )
 
     $result = @{ ExitCode = 0; Summary = "no PR needed review" }
     $cycleTimer = [Diagnostics.Stopwatch]::StartNew()
+    $currentPrId = 0
+    $currentPrTitle = ''
+    $currentOperation = 'enumerating active pull requests'
     Send-ReviewerEvent cycle.started -Cycle $CycleNumber -Data @{} -Message "Cycle $CycleNumber started."
     Send-ReviewerEvent phase.changed -Cycle $CycleNumber -Data @{ phase = 'enumerating candidates'; elapsedMilliseconds = 0 } `
         -Message "Enumerating active pull requests."
@@ -6364,7 +6368,6 @@ function Invoke-ReviewerCycle {
             -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
             -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
 
-        $script:ReviewerTeamsAdoSession = $session
         Invoke-ReviewerTeamsMaintenance -AgencyPath $AgencyPath
 
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
@@ -6467,8 +6470,12 @@ function Invoke-ReviewerCycle {
                 continue
             }
 
+            $currentPrId = $prId
+            $currentPrTitle = [string](Get-ReviewerHashValue -Container $pr -Key 'title' -Default "PR $prId")
+            $currentOperation = "reading metadata and review threads for PR $prId"
             Send-ReviewerEvent phase.changed -Cycle $CycleNumber -PrId $prId -Data @{
                 phase = 'reading PR metadata, threads, and changed files'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+                title = $currentPrTitle
             } -Message "Reading metadata and review threads for PR $prId."
             # The list record usually already carries the merge source commit;
             # only pay for a detail read when it does not.
@@ -6664,6 +6671,9 @@ function Invoke-ReviewerCycle {
         $summaries = New-Object System.Collections.Generic.List[string]
         foreach ($r in $retried) { [void]$summaries.Add([string]$r) }
         foreach ($b in $bound) {
+            $currentPrId = [int]$b.PrId
+            $currentPrTitle = [string]$b.Title
+            $currentOperation = "reviewing PR $currentPrId"
             $one = Invoke-ReviewerPullRequest -Session $session -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
                 -Bound $b -ReviewedState $reviewedState -AttemptsState $attemptsState
             if ([int]$one.ExitCode -ne 0) { $result.ExitCode = 1 }
@@ -6678,17 +6688,49 @@ function Invoke-ReviewerCycle {
     }
     catch {
         if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
-        Write-Warning "Cycle $CycleNumber failed: $($_.Exception.Message)"
-        Write-ReviewerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "error"; message = $_.Exception.Message }
+        $failureMessage = $_.Exception.Message
+        if (-not $McpRecoveryAttempted -and (Test-ReviewerRecoverableMcpFailure -Message $failureMessage)) {
+            $retrySummary = "ADO session closed while $currentOperation; retrying immediately with a fresh session."
+            Write-Warning $retrySummary
+            Send-ReviewerEvent delivery.retrying -Level warning -Cycle $CycleNumber -PrId $currentPrId -Data @{
+                title = $currentPrTitle
+                reason = $failureMessage
+                summary = $retrySummary
+                outstanding = @('review scan')
+                retryable = $true
+                nextRetry = 'immediate fresh ADO session'
+            } -Message $retrySummary
+            if ($session) {
+                Close-AgentMcpSession -Session $session
+                $session = $null
+            }
+            return Invoke-ReviewerCycle -AgencyPath $AgencyPath -CycleNumber $CycleNumber -McpRecoveryAttempted
+        }
+        $failureSummary = if ($currentPrId -gt 0) {
+            "Reviewer failed while $currentOperation (`"$currentPrTitle`")."
+        }
+        else {
+            "Reviewer failed while $currentOperation."
+        }
+        Write-Warning "Cycle $CycleNumber failed: $failureMessage"
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "live"; result = "error"; message = $failureMessage
+            prId = $currentPrId; title = $currentPrTitle; operation = $currentOperation
+        }
         $result.ExitCode = 1
-        $result.Summary = "cycle error: $($_.Exception.Message)"
-        Send-ReviewerEvent cycle.failed -Level error -Cycle $CycleNumber -Data @{
-            reason = $_.Exception.Message; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+        $result.Summary = "cycle error: $failureMessage"
+        Send-ReviewerEvent cycle.failed -Level error -Cycle $CycleNumber -PrId $currentPrId -Data @{
+            title = $currentPrTitle
+            reason = $failureMessage
+            summary = $failureSummary
+            operation = $currentOperation
+            retryable = $true
+            nextRetry = 'next reviewer retry cycle'
+            elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
         } -Message $result.Summary
         return $result
     }
     finally {
-        $script:ReviewerTeamsAdoSession = $null
         if ($session) { Close-AgentMcpSession -Session $session }
     }
 }
