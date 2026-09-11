@@ -319,7 +319,13 @@ be used:
 `-Golden` is intentionally explicit because it grants write authority. It
 enables Reviewer finding comments, thread replies, and summaries, plus Review
 Handler replies, buddy requeues, code changes, local validation, session
-resume, and push. It does **not** enable Teams notifications, shared PR-reference
+resume, broad local shell commands inside the resolved worktree, and push. The
+broad shell grant is available only when code changes, push, and validation are
+all enabled for a non-protected source branch. Copilot's ordinary path and URL
+boundaries still apply, and configured mandatory tool denials still take
+precedence. Direct cloud/web clients, execution-policy changes, file
+unblocking, dynamic PowerShell evaluation, and SRE deployment commands remain
+denied. It does **not** enable Teams notifications, shared PR-reference
 writes, Reviewer approval votes, or Review Handler auto-complete. Those remain
 behind their separate gates.
 
@@ -333,7 +339,10 @@ activity beside it on wider terminals, or a compact list on narrow terminals.
 Use `Enter` for details and **`m` Start agent, `h` History, `a` Advanced, `q` Quit**.
 Advanced keeps the full panes, filters, diagnostics, settings, and stale-instance
 controls; press `a` again to return to Simple. Changing the view never changes
-the launch's authority.
+the launch's authority. Running rows show live phase elapsed time and heartbeat
+age so a long model call is visibly active rather than appearing frozen. Event
+log discovery uses asynchronous filesystem traversal and cannot block keyboard
+input while scanning retained launch history.
 
 Golden still starts **both agents automatically**, without a manual command,
 and waits **900 seconds (15 minutes)** between successful scans by default.
@@ -408,8 +417,13 @@ replies and buddy requeues. Code changes, pushes, votes, auto-complete, and
 local validation remain disabled by default. Add
 `-EnableReviewHandlerCodeUpdates` to let the review-handler find and resume the
 originating Copilot coding session when available, make code changes, run local
-validation, and push to the PR source branch. A missing local session starts a
-fresh coding session; this option does not require local ownership. Reviewer
+validation with the repository's actual command-line tools, and push to the PR
+source branch. A missing local session starts a fresh coding session. A resumed
+session that stalls is abandoned after a bounded portion of the cycle budget
+and retried once with a fresh session. Failed validation remains pending and is
+eligible for a later cycle even after every review thread is fixed; the
+dashboard shows the retained validation reason instead of treating the work as
+fully handled. This option does not require local ownership. Reviewer
 votes and review-handler auto-complete remain default-denied and require the
 existing explicit, policy-authorized manual widening flow. Teams delivery is
 separate and requires the

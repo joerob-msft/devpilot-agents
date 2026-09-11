@@ -139,6 +139,16 @@
     ],
     "denyTools": [
       "shell(srectl:*)",
+      "shell(az:*)",
+      "shell(gh:*)",
+      "shell(curl:*)",
+      "shell(Invoke-WebRequest:*)",
+      "shell(Invoke-RestMethod:*)",
+      "shell(iwr:*)",
+      "shell(irm:*)",
+      "shell(Set-ExecutionPolicy:*)",
+      "shell(Unblock-File:*)",
+      "shell(Invoke-Expression:*)",
       "ado(pipelines_write)",
       "ado(wit_work_item_write)",
       "ado(wit_work_item_comment_write)",
@@ -149,8 +159,9 @@
       "ado(repo_pull_request_write)"
     ],
     "localValidation": {
-      "note": "Only consulted when the operator passes -EnableLocalValidation. Replace these with your repository's own build and test commands.",
+      "note": "Only consulted when the operator passes -EnableLocalValidation. A bare shell grant is further gated by the wrapper and is available only when code changes, push, and validation are all enabled on a non-protected branch. Replace the guidance with your repository's own build and test commands.",
       "allowTools": [
+        "shell",
         "shell(dotnet build:*)",
         "shell(dotnet test:*)"
       ],

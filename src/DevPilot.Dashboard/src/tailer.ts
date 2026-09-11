@@ -1,6 +1,5 @@
-import { open, stat } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { readdirSync, statSync } from "node:fs";
 import { parseAgentEventLine, type AgentEvent, type SourceDiagnostic } from "./domain.js";
 
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -77,7 +76,7 @@ function identityOf(value: { dev: number | bigint; ino: number | bigint; birthti
   return `${String(value.dev)}:${String(value.ino)}:${value.birthtimeMs}`;
 }
 
-export function discoverEventLogs(stateDirectories: string[], explicitPaths: string[]): string[] {
+export async function discoverEventLogs(stateDirectories: string[], explicitPaths: string[]): Promise<string[]> {
   const found = new Set<string>();
   for (const item of explicitPaths) {
     const path = resolve(item);
@@ -85,7 +84,7 @@ export function discoverEventLogs(stateDirectories: string[], explicitPaths: str
     for (let generation = 1; generation <= 5; generation++) {
       const rotated = `${path}.${generation}`;
       try {
-        if (statSync(rotated).isFile()) found.add(rotated);
+        if ((await stat(rotated)).isFile()) found.add(rotated);
       } catch {
         // A rotation may appear on a later discovery pass.
       }
@@ -99,7 +98,7 @@ export function discoverEventLogs(stateDirectories: string[], explicitPaths: str
       if (!current) break;
       let entries;
       try {
-        entries = readdirSync(current.path, { withFileTypes: true });
+        entries = await readdir(current.path, { withFileTypes: true });
       } catch {
         continue;
       }
@@ -110,11 +109,7 @@ export function discoverEventLogs(stateDirectories: string[], explicitPaths: str
       for (const entry of entries) {
         const path = join(current.path, entry.name);
         if (entry.isFile() && isEventDirectory && /\.jsonl(?:\.\d+)?$/i.test(entry.name)) {
-          try {
-            if (statSync(path).isFile()) found.add(path);
-          } catch {
-            // The next discovery pass will retry files racing creation or rotation.
-          }
+          found.add(path);
         } else if (entry.isDirectory() && current.depth < 6) {
           const name = entry.name.toLowerCase();
           if (name === "manual-dispatch" || name === "runtime") continue;
@@ -177,7 +172,7 @@ export class EventTailer {
     if (this.polling) return;
     this.polling = true;
     try {
-      const paths = discoverEventLogs(this.options.stateDirectories, this.options.eventLogPaths);
+      const paths = await discoverEventLogs(this.options.stateDirectories, this.options.eventLogPaths);
       const bases = new Set(paths.map((path) => /^(.*\.jsonl)(?:\.\d+)?$/i.exec(path)?.[1] ?? path));
       for (const base of bases) await this.pollStream(base);
       await this.options.onPoll?.();

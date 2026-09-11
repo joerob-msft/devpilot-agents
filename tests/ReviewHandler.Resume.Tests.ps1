@@ -43,6 +43,7 @@ BeforeAll {
                     ArgumentList = @($Parameters.ArgumentList)
                     StandardInputContent = [string]$Parameters.StandardInputContent
                     WorkingDirectory = [string]$Parameters.WorkingDirectory
+                    TimeoutSeconds = [int]$Parameters.TimeoutSeconds
                 })
             return $responseQueue.Dequeue()
         }.GetNewClosure()
@@ -97,8 +98,23 @@ Describe 'review-handler resume fallback' {
         $result.Launch.RetriedFresh | Should -BeFalse
     }
 
+    It 'retries a timed-out resume once with a fresh session inside the cycle budget' {
+        $result = New-TestLaunch -Responses @(
+            @{ ExitCode = -1; TimedOut = $true; StdOut = ''; StdErr = '' },
+            @{ ExitCode = 0; TimedOut = $false; StdOut = 'ok'; StdErr = '' }
+        )
+
+        $result.Calls.Count | Should -Be 2
+        $result.Calls[0].ArgumentList | Should -Contain '--resume'
+        $result.Calls[1].ArgumentList | Should -Not -Contain '--resume'
+        $result.Calls[0].TimeoutSeconds | Should -BeLessOrEqual 30
+        $result.Calls[1].TimeoutSeconds | Should -BeLessOrEqual 30
+        $result.Launch.RetriedFresh | Should -BeTrue
+        $result.Launch.Run.ExitCode | Should -Be 0
+        $result.Rejected.Contains('stale-session') | Should -BeTrue
+    }
+
     It 'does not retry unrelated failures' -ForEach @(
-        @{ Name = 'timeout'; Run = @{ ExitCode = -1; TimedOut = $true; StdOut = ''; StdErr = 'No session, task, or name matched' } },
         @{ Name = 'authentication'; Run = @{ ExitCode = 1; TimedOut = $false; StdOut = ''; StdErr = 'No authentication information found' } },
         @{ Name = 'tool failure'; Run = @{ ExitCode = 1; TimedOut = $false; StdOut = ''; StdErr = 'failed to start MCP server ado' } },
         @{ Name = 'arbitrary exit'; Run = @{ ExitCode = 17; TimedOut = $false; StdOut = ''; StdErr = 'unexpected failure' } }
