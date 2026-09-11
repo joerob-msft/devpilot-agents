@@ -91,7 +91,17 @@ For each actionable thread, if `EnableCodeChanges` is on:
    injects them into Runtime context under "Repository conventions", including
    which convention documents to read and any house rules that constrain how
    changes may be made. Treat those rules as binding.
-2. If the finding involves auth, tokens, secrets, certificates, crypto,
+2. **Extend before creating.** Identify the closest existing mechanism and its
+   canonical owner before adding a helper, abstraction, script, generator,
+   validator, registry, snapshot, or configuration-default layer. Reuse or
+   extend that owner unless a concrete present limitation prevents it. Do not
+   introduce a second source of truth, ambiguous precedence path, hard-coded
+   environment inventory, or checked-in one-off proof script for implementation
+   convenience. If the requested fix genuinely needs a new durable mechanism,
+   state the limitation it addresses, the invariant it owns, and the existing
+   execution path that will exercise it; otherwise stop for human input rather
+   than inventing the layer.
+3. If the finding involves auth, tokens, secrets, certificates, crypto,
    outbound HTTP, or tenant isolation, keep the change minimal and reviewable,
    and apply any security guidance named in Runtime context.
 
@@ -112,6 +122,10 @@ If `LocalValidation` is on, run the **smallest targeted validation** that
 covers your change. Runtime context supplies this repository's targeted build
 command, its full build command, and its build documentation path — prefer the
 targeted command, and escalate to the full build only if the change is broad.
+Prefer the repository's existing validation entry point and canonical inputs
+or generated artifacts. Do not check in a bespoke proof script merely to
+validate this cycle. If removing or replacing a validator, confirm which
+retained check now protects each durable invariant.
 Record whether validation `passed`, `failed`, or was `skipped` (skipped when
 `LocalValidation` is off or no code changed).
 

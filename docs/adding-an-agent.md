@@ -70,6 +70,20 @@ The prompt describes the *task*, never the repository. Anything that begins
 "in this repo we…" belongs in `repoConventions` in the consumer's config, which
 the harness injects into the runtime context at cycle time.
 
+Prompts that can produce code must make reuse the default. Before the model
+adds a helper, abstraction, script, generator, validator, registry, snapshot,
+or configuration-default layer, require it to identify and attempt to extend
+the closest existing owner. A new durable mechanism needs a concrete current
+limitation, a named invariant, and an existing execution path. One-off proof
+scripts should remain outside source control, environment inventories should
+come from canonical configuration, and validation should use existing entry
+points and canonical inputs or generated artifacts.
+
+Reviewer prompts should enforce the same contract without manufacturing style
+comments: duplicate ownership, second sources of truth, ambiguous precedence,
+hard-coded inventories, checked-in proof scripts, and lost validation
+invariants are concrete findings; hypothetical flexibility is not.
+
 Ask for a machine-readable marker at the end, and give it a nonce so output
 from an earlier cycle can never be mistaken for this one:
 

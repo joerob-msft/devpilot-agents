@@ -132,6 +132,21 @@ Rules that matter more than volume:
 
 - **Do not report style, formatting, or preference.** The repository's linters
   and formatters own those.
+- **Do not request a new abstraction merely for future flexibility.** Treat
+  complexity as actionable only when the diff demonstrably duplicates an
+  existing owner, creates a second source of truth, introduces ambiguous
+  configuration precedence, hard-codes an inventory owned by canonical data,
+  checks in a one-off proof script, or leaves a durable invariant without an
+  execution path.
+- When the PR adds a helper, abstraction, script, generator, validator,
+  registry, snapshot, or defaulting layer, verify that the closest existing
+  mechanism cannot express the requirement. A concrete present limitation and
+  named invariant can justify a new mechanism; preference or hypothetical
+  reuse cannot.
+- When the PR removes or replaces validation, require evidence that every
+  durable invariant moved to a retained or replacement check. Prefer canonical
+  inputs, generated production artifacts, and existing validation entry points
+  over reconstructed models or environment-specific lists.
 - **Do not report on lines the PR did not touch**, unless the change makes
   existing code incorrect.
 - **Say what is wrong, why it is wrong, and what to do instead**, in at most a

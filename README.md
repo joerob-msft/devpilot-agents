@@ -101,6 +101,11 @@ must live inside that repository.
 | `review-handler` | Your own open PRs | Finds reviewer feedback you have not answered, resumes the coding session where the code was written, makes the fix, replies, pushes, optionally requeues missing, failed, stale, or expired validation (even when no commit was needed), and sets auto-complete |
 | `reviewer` | Other people's PRs | Reviews the diff, reports findings, and assesses human review comments; optionally posts findings, replies in-place, and casts a non-blocking vote |
 
+Both role prompts are reuse-first: the handler extends the closest existing
+owner before creating a durable mechanism, while the reviewer reports concrete
+duplicate ownership or source-of-truth violations without requesting
+abstractions for hypothetical flexibility.
+
 ### Repository handler skill
 
 A consumer can opt the review-handler into repository-owned guidance:

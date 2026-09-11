@@ -2,6 +2,7 @@ BeforeAll {
     $script:repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
     $script:handlerPath = Join-Path $script:repoRoot 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1'
     $script:promptPath = Join-Path $script:repoRoot 'src\Agents\review-handler\handle-cycle.prompt.md'
+    $script:reviewerPromptPath = Join-Path $script:repoRoot 'src\Agents\reviewer\review-cycle.prompt.md'
 
     $tokens = $null
     $parseErrors = $null
@@ -93,6 +94,29 @@ BeforeAll {
             ExitCode = $LASTEXITCODE
             Output = ($output -join "`n")
         }
+    }
+}
+
+Describe 'reuse-first role contracts' {
+    It 'requires the handler to extend existing owners and reuse validation entry points' {
+        $prompt = Get-Content -LiteralPath $script:promptPath -Raw
+
+        $prompt | Should -Match 'Extend before creating'
+        $prompt | Should -Match 'closest existing mechanism and its\s+canonical owner'
+        $prompt | Should -Match 'second source of truth'
+        $prompt | Should -Match 'checked-in one-off proof script'
+        $prompt | Should -Match 'existing validation entry point'
+        $prompt | Should -Match 'retained check now protects each durable invariant'
+    }
+
+    It 'makes duplicate ownership actionable without demanding speculative abstractions' {
+        $prompt = Get-Content -LiteralPath $script:reviewerPromptPath -Raw
+
+        $prompt | Should -Match 'Do not request a new abstraction merely for future flexibility'
+        $prompt | Should -Match 'duplicates an\s+existing owner'
+        $prompt | Should -Match 'ambiguous\s+configuration precedence'
+        $prompt | Should -Match 'hard-codes an inventory owned by canonical data'
+        $prompt | Should -Match 'every\s+durable invariant moved to a retained or replacement check'
     }
 }
 
