@@ -11,13 +11,16 @@
     v2 requests as replay records for the PR133 offline path.
 
     The output contains private source and response bytes. Write it only to an
-    external, untracked qualification directory.
+    external, untracked qualification directory. ReferenceManifestPath must
+    identify every consumed local byte under the exact V1StateRoot by relative
+    path, SHA-256, length, and immutable `critical:<path>` binding.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$BaselineObservationPath,
     [Parameter(Mandatory)][string]$V1StateRoot,
     [Parameter(Mandatory)][string]$PreservedEvidenceRoot,
+    [AllowEmptyString()][string]$ReferenceManifestPath = '',
     [Parameter(Mandatory)][string]$OutputPath,
     [Parameter(Mandatory)]
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')]
@@ -65,6 +68,29 @@ function Test-ParityCandidatePathWithin {
     return Test-OwnerParitySecurePathWithin -Path $Path -Root $Root
 }
 
+function Get-ParityCandidateReferencedBytes {
+    param([Parameter(Mandatory)][string]$Path)
+    $resolved = Resolve-ParityCandidatePath -Path $Path -Name referencedInput -PathType Leaf
+    if (-not $script:ParityCandidateReferences.ContainsKey($resolved)) {
+        throw "Parity input '$resolved' has no exact local-byte reference."
+    }
+    $reference = $script:ParityCandidateReferences[$resolved]
+    return (Read-OwnerParityExactFile `
+            -Root $script:ParityCandidateReferenceRoot -Reference $reference).bytes
+}
+
+function Get-ParityCandidateReferencedText {
+    param([Parameter(Mandatory)][string]$Path)
+    $bytes = Get-ParityCandidateReferencedBytes -Path $Path
+    return [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+}
+
+function Get-ParityCandidateReferencedJson {
+    param([Parameter(Mandatory)][string]$Path)
+    return (Get-ParityCandidateReferencedText -Path $Path) |
+        ConvertFrom-Json -AsHashtable -Depth 64
+}
+
 function Get-ParityCandidatePayloadText {
     param(
         [Parameter(Mandatory)][string]$ReplayRoot,
@@ -77,7 +103,7 @@ function Get-ParityCandidatePayloadText {
     if (-not (Test-ParityCandidatePathWithin -Path $path -Root $ReplayRoot)) {
         throw 'A preserved replay payload escaped its replay root.'
     }
-    $raw = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false, $true))
+    $raw = Get-ParityCandidateReferencedText -Path $path
     try {
         $outer = $raw | ConvertFrom-Json -AsHashtable -Depth 64
         if ($outer -is [Collections.IDictionary] -and $outer.Contains('result')) {
@@ -184,16 +210,52 @@ if ((Test-ParityCandidatePathWithin -Path $output -Root $v1Root) -or
     (Test-ParityCandidatePathWithin -Path $output -Root $repoRoot)) {
     throw 'OutputPath must be outside V1StateRoot and the repository.'
 }
+if ([string]::IsNullOrWhiteSpace($ReferenceManifestPath)) {
+    throw 'ReferenceManifestPath is required for exact local-byte replay.'
+}
+$referenceManifestPathResolved = Resolve-ParityCandidatePath `
+    -Path $ReferenceManifestPath -Name ReferenceManifestPath -PathType Leaf
+$referenceManifestBytes = [IO.File]::ReadAllBytes($referenceManifestPathResolved)
+if ($referenceManifestBytes.Length -gt 4MB) {
+    throw 'Reference manifest exceeds the 4 MiB limit.'
+}
+try {
+    $referenceManifest = ([Text.UTF8Encoding]::new($false, $true)).
+        GetString($referenceManifestBytes) |
+        ConvertFrom-Json -AsHashtable -Depth 32
+}
+catch {
+    throw 'Reference manifest is not valid UTF-8 JSON.'
+}
+if ([int]$referenceManifest.schemaVersion -ne 1 -or
+    [string]$referenceManifest.kind -cne 'owner-parity-local-byte-references') {
+    throw 'Reference manifest has the wrong kind or schema version.'
+}
+$script:ParityCandidateReferenceRoot = Resolve-ParityCandidatePath `
+    -Path ([string]$referenceManifest.root) -Name referenceManifest.root -PathType Container
+if ($script:ParityCandidateReferenceRoot -cne $v1Root) {
+    throw 'Reference manifest root must be the exact V1StateRoot.'
+}
+$referenceValues = @(Read-OwnerParityReferenceSet `
+        -Root $v1Root -References @($referenceManifest.references))
+$script:ParityCandidateReferences = [Collections.Generic.Dictionary[string, object]]::new(
+    $(if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }))
+for ($index = 0; $index -lt $referenceValues.Count; $index++) {
+    $script:ParityCandidateReferences[$referenceValues[$index].path] =
+        $referenceManifest.references[$index]
+}
 
-$baseline = Read-OwnerNormalizedObservation -Path $baselinePath
-$statusFiles = @(Get-ChildItem -LiteralPath (Join-Path $evidenceRoot 'runs') `
-        -Recurse -Filter 'owner-preview-status.json' -File)
+$baseline = ConvertFrom-OwnerNormalizedObservationBytes `
+    -Bytes (Get-ParityCandidateReferencedBytes -Path $baselinePath)
+$statusFiles = @($referenceValues | Where-Object {
+        Test-ParityCandidatePathWithin -Path $_.path -Root $evidenceRoot -and
+        [IO.Path]::GetFileName($_.path) -ceq 'owner-preview-status.json'
+    })
 if ($statusFiles.Count -ne 1) {
     throw "PreservedEvidenceRoot contains $($statusFiles.Count) Owner status files; exactly one is required."
 }
-$runRoot = Split-Path -Parent $statusFiles[0].FullName
-$status = Get-Content -LiteralPath $statusFiles[0].FullName -Raw |
-    ConvertFrom-Json -AsHashtable -Depth 64
+$runRoot = Split-Path -Parent $statusFiles[0].path
+$status = Get-ParityCandidateReferencedJson -Path $statusFiles[0].path
 foreach ($binding in @(
         @($status.subject.pullRequestId, $baseline.subject.pullRequestId, 'pull request'),
         @($status.subject.repositoryId, $baseline.subject.repositoryId, 'repository'),
@@ -208,14 +270,15 @@ foreach ($binding in @(
     }
 }
 
-$replayManifests = @(Get-ChildItem -LiteralPath (Join-Path $runRoot 'materialized\replay') `
-        -Recurse -Filter 'manifest.json' -File)
+$replayManifests = @($referenceValues | Where-Object {
+        Test-ParityCandidatePathWithin -Path $_.path -Root (Join-Path $runRoot 'materialized\replay') -and
+        [IO.Path]::GetFileName($_.path) -ceq 'manifest.json'
+    })
 if ($replayManifests.Count -ne 1) {
     throw "Preserved run contains $($replayManifests.Count) replay manifests; exactly one is required."
 }
-$replayRoot = Split-Path -Parent $replayManifests[0].FullName
-$replayManifest = Get-Content -LiteralPath $replayManifests[0].FullName -Raw |
-    ConvertFrom-Json -AsHashtable -Depth 64
+$replayRoot = Split-Path -Parent $replayManifests[0].path
+$replayManifest = Get-ParityCandidateReferencedJson -Path $replayManifests[0].path
 if ([string]$replayManifest.binding.sourceCommit -cne [string]$baseline.subject.headCommit -or
     [string]$replayManifest.binding.targetCommit -cne [string]$baseline.subject.targetCommit -or
     [long]$replayManifest.binding.pullRequestId -ne [long]$baseline.subject.pullRequestId) {
@@ -225,8 +288,7 @@ if ([string]$replayManifest.binding.sourceCommit -cne [string]$baseline.subject.
 $subjectKey = Split-Path -Leaf $runRoot
 $hunkPath = Join-Path $evidenceRoot (
     "subjects\$subjectKey\entry\corpus\census\right-hand-hunks.json")
-$hunkCensus = Get-Content -LiteralPath $hunkPath -Raw |
-    ConvertFrom-Json -AsHashtable -Depth 64
+$hunkCensus = Get-ParityCandidateReferencedJson -Path $hunkPath
 $hunksByPath = [Collections.Generic.Dictionary[string, object]]::new(
     [StringComparer]::OrdinalIgnoreCase)
 foreach ($entry in @($hunkCensus)) {

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "owner-observation",
   "implementation": {
     "id": "owner-v2-fixture",
@@ -29,6 +29,8 @@
   },
   "counts": {
     "checked": 2,
+    "eligible": 2,
+    "advisory": 0,
     "violations": 1,
     "unknown": 0,
     "uncovered": 1
@@ -37,6 +39,12 @@
   "findings": [
     {
       "identity": "test-ownership@1:rs0:dc1",
+      "semanticKey": "v1:sha256:4998da7a1ffa8f71fa64992dc44adea3949f1f3dc7c9aa1b8729e13f036b5e55",
+      "providerMarker": {
+        "availability": "unavailable",
+        "integrity": "unavailable",
+        "sha256": "unknown"
+      },
       "disposition": "violation",
       "ruleRef": "rs0",
       "constructRef": "dc1",
@@ -44,14 +52,45 @@
         "path": "src/WidgetTests.cs",
         "line": 12,
         "symbol": "CreatesWidget"
+      },
+      "binding": {
+        "schemaVersion": 1,
+        "repositoryPath": "src/WidgetTests.cs",
+        "span": {
+          "startLine": 12,
+          "endLine": 12,
+          "startColumn": "unknown",
+          "endColumn": "unknown"
+        },
+        "symbol": "CreatesWidget",
+        "constructIdentity": "v1:sha256:1cbfacafa105ba9bf893e49c13cc3565eb87eb12ae69a5082cfe3fc9c5328daf",
+        "source": {
+          "representation": {
+            "path": "src/WidgetTests.cs",
+            "startLine": 12,
+            "endLine": 12,
+            "startColumn": "unknown",
+            "endColumn": "unknown",
+            "symbol": "CreatesWidget",
+            "constructIdentity": "dc1"
+          },
+          "sha256": "41d16d51cafd7cf33a2b509a8bfbaf9a40060fb3b8f9a83343431bd93e543741"
+        }
       }
     },
     {
       "identity": "test-ownership@1:rs0:dc3",
+      "semanticKey": "unknown",
+      "providerMarker": {
+        "availability": "unavailable",
+        "integrity": "unavailable",
+        "sha256": "unknown"
+      },
       "disposition": "violation",
       "ruleRef": "rs0",
       "constructRef": "dc3",
-      "anchor": "unknown"
+      "anchor": "unknown",
+      "binding": "unknown"
     }
   ],
   "execution": {
@@ -73,6 +112,26 @@
       "unknown": 0
     },
     "operatorIntervention": true
+  },
+  "measurements": {
+    "counts": {
+      "checked": { "status": "measured", "value": 2, "reason": "unknown" },
+      "eligible": { "status": "measured", "value": 2, "reason": "unknown" },
+      "advisory": { "status": "measured", "value": 0, "reason": "unknown" },
+      "violations": { "status": "measured", "value": 1, "reason": "unknown" },
+      "unknown": { "status": "measured", "value": 0, "reason": "unknown" },
+      "uncovered": { "status": "measured", "value": 1, "reason": "unknown" }
+    },
+    "execution": {
+      "attempts": { "status": "measured", "value": 1, "reason": "unknown" },
+      "modelStarts": { "status": "measured", "value": 1, "reason": "unknown" },
+      "latencyMs": { "status": "measured", "value": 900, "reason": "unknown" }
+    },
+    "effects": {
+      "providerWrites": { "status": "measured", "value": 0, "reason": "unknown" },
+      "writeToolInvocations": { "status": "measured", "value": 0, "reason": "unknown" },
+      "operatorIntervention": { "status": "measured", "value": true, "reason": "unknown" }
+    }
   },
   "sourceArtifacts": [
     {

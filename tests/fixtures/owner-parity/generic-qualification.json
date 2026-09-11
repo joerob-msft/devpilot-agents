@@ -1,11 +1,17 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "owner-parity-qualification",
-  "expectedV1Snapshot": {
-    "fileCount": 1,
-    "byteCount": 2,
-    "newestWriteTicks": 3,
-    "rootHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  "attestation": {
+    "critical": [
+      {
+        "id": "queue-index",
+        "relativePath": "index/current.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "length": 2,
+        "binding": "critical:index/current.json"
+      }
+    ],
+    "volatile": []
   },
   "entries": [
     {
@@ -19,7 +25,7 @@
       },
       "evidence": {
         "class": "synthetic",
-        "semanticProvenance": "offline-replay-deterministic",
+        "semanticProvenance": "unknown",
         "inputContract": "independently-validated",
         "truthCoverage": "complete"
       },

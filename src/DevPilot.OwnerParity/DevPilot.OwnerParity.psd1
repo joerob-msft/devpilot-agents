@@ -1,6 +1,6 @@
 @{
     RootModule = 'DevPilot.OwnerParity.psm1'
-    ModuleVersion = '0.1.0'
+    ModuleVersion = '0.2.0'
     GUID = '19191919-2a2a-3b3b-4c4c-5d5d5d5d5d5d'
     Author = 'DevPilot Agents contributors'
     CompanyName = 'Unknown'
@@ -21,7 +21,7 @@
     PrivateData = @{
         PSData = @{
             Tags = @('copilot', 'agents', 'owner', 'parity', 'qualification', 'powershell')
-            ReleaseNotes = 'Adds retrospective Owner v1/v2 parity execution with explicit blocked and not-measured outcomes.'
+            ReleaseNotes = 'Adds canonical semantic bindings, exact-byte references, explicit telemetry states, and critical/volatile read-only attestation.'
         }
     }
 }
