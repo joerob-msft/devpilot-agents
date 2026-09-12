@@ -724,6 +724,149 @@ function Get-OwnerV2FileConstructs {
     return @($constructs)
 }
 
+function Get-OwnerV2NonEligibleConstructs {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$FileData,
+        [Parameter(Mandatory)][DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits
+    )
+
+    $content = Get-OwnerV2Member -Value $FileData -Name content
+    $spans = @((Get-OwnerV2Member -Value $FileData -Name spans) | Where-Object {
+            [string](Get-OwnerV2Member -Value $_ -Name state) -ceq 'complete'
+        })
+    if ($content -isnot [string] -or $spans.Count -eq 0) { return @() }
+
+    $lines = [regex]::Split($content, '\r?\n')
+    $maskedLines = [Collections.Generic.List[string]]::new()
+    $inBlockComment = $false
+    $inVerbatimString = $false
+    $rawDelimiterLength = 0
+    $commentLines = [Collections.Generic.HashSet[int]]::new()
+    foreach ($line in $lines) {
+        $lineNumber = $maskedLines.Count + 1
+        $wasInVerbatimString = $inVerbatimString
+        $startsInMaskedRegion = $inBlockComment -or $wasInVerbatimString -or $rawDelimiterLength -gt 0
+        $withoutComments = Remove-OwnerV2Comments -Text ([string]$line) `
+            -InBlockComment ([ref]$inBlockComment) `
+            -InVerbatimString ([ref]$inVerbatimString) `
+            -RawDelimiterLength ([ref]$rawDelimiterLength)
+        if ($wasInVerbatimString -and -not $inVerbatimString) {
+            $withoutComments = $withoutComments -replace '"', ' '
+        }
+        if (-not $startsInMaskedRegion -and ([string]$line).TrimStart().StartsWith('//')) {
+            [void]$commentLines.Add($lineNumber)
+        }
+        [void]$maskedLines.Add((Remove-OwnerV2StringLiterals -Text $withoutComments))
+    }
+
+    $constructs = [Collections.Generic.List[object]]::new()
+    $lineNumber = 1
+    while ($lineNumber -le $lines.Count) {
+        if (-not $commentLines.Contains($lineNumber) -or
+            -not (Test-OwnerV2ChangedRange -StartLine $lineNumber -EndLine $lineNumber -Spans $spans)) {
+            $lineNumber++
+            continue
+        }
+        $startLine = $lineNumber
+        while ($lineNumber + 1 -le $lines.Count -and
+            $commentLines.Contains($lineNumber + 1) -and
+            (Test-OwnerV2ChangedRange -StartLine ($lineNumber + 1) -EndLine ($lineNumber + 1) -Spans $spans)) {
+            $lineNumber++
+        }
+        [void]$constructs.Add([ordered]@{
+                kind = 'comment'
+                name = 'comment'
+                startLine = $startLine
+                declarationLine = $lineNumber
+                attributes = @()
+                hasOwner = $false
+                snippet = (@($lines[($startLine - 1)..($lineNumber - 1)]) -join "`n")
+                bounded = $true
+                recognized = $true
+            })
+        $lineNumber++
+    }
+
+    for ($index = 0; $index -lt $maskedLines.Count; $index++) {
+        $startLine = $index + 1
+        if (-not (Test-OwnerV2ChangedRange -StartLine $startLine -EndLine $startLine -Spans $spans)) {
+            continue
+        }
+        $masked = ([string]$maskedLines[$index]).Trim()
+        if ($masked.EndsWith(';') -and
+            $masked -match '^([A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|\?\.)\s*[A-Za-z_][A-Za-z0-9_]*|\s*\[[^\[\]]*\])*)\s*=([^=].*|)$' -and
+            -not ([string]$Matches[2]).StartsWith('>')) {
+            $target = ($Matches[1] -replace '\s+', '')
+            [void]$constructs.Add([ordered]@{
+                    kind = 'assignment'
+                    name = $target
+                    startLine = $startLine
+                    declarationLine = $startLine
+                    attributes = @()
+                    hasOwner = $false
+                    snippet = ([string]$lines[$index]).Trim()
+                    bounded = $masked.Length -le $Limits.MaximumSnippetCharacters
+                    recognized = $true
+                })
+        }
+
+        $depth = 0
+        $openIndex = -1
+        for ($column = $masked.Length - 1; $column -ge 0; $column--) {
+            if ($masked[$column] -eq ')') { $depth++; continue }
+            if ($masked[$column] -ne '(') { continue }
+            if ($depth -gt 0) { $depth--; continue }
+            $before = $masked.Substring(0, $column).TrimEnd()
+            if ($before -match '[A-Za-z0-9_>\]]$') { $openIndex = $column }
+        }
+        if ($openIndex -lt 0) { continue }
+        $calleeText = $masked.Substring(0, $openIndex).TrimEnd()
+        if ($calleeText -notmatch '([A-Za-z_][A-Za-z0-9_]*)\s*(<[^<>]*>)?$') { continue }
+        $callee = $Matches[1]
+        if ($callee -in @('if', 'for', 'foreach', 'while', 'switch', 'using', 'lock', 'catch')) {
+            continue
+        }
+        $depth = 1
+        $closed = $false
+        for ($column = $openIndex + 1; $column -lt $masked.Length; $column++) {
+            if ($masked[$column] -eq '(') { $depth++ }
+            elseif ($masked[$column] -eq ')') {
+                $depth--
+                if ($depth -eq 0) { $closed = $true; break }
+            }
+        }
+        if ($closed) { continue }
+        $endLine = $startLine
+        for ($scan = $index + 1; $scan -lt $maskedLines.Count; $scan++) {
+            $scanLine = [string]$maskedLines[$scan]
+            foreach ($character in $scanLine.ToCharArray()) {
+                if ($character -eq '(') { $depth++ }
+                elseif ($character -eq ')') {
+                    $depth--
+                    if ($depth -eq 0) { $closed = $true; break }
+                }
+            }
+            $endLine = $scan + 1
+            if ($closed -or $endLine - $startLine -ge 64) { break }
+        }
+        if (-not $closed) { continue }
+        $snippet = @($lines[$index..($endLine - 1)]) -join "`n"
+        [void]$constructs.Add([ordered]@{
+                kind = 'invocation'
+                name = $callee
+                startLine = $startLine
+                declarationLine = $endLine
+                attributes = @()
+                hasOwner = $false
+                snippet = $snippet
+                bounded = $snippet.Length -le $Limits.MaximumSnippetCharacters
+                recognized = $true
+            })
+    }
+
+    return @($constructs)
+}
+
 function Invoke-OwnerV2Judgment {
     param(
         [Parameter(Mandatory)][object]$Runner,
@@ -775,6 +918,11 @@ function New-OwnerV2UnknownEvidenceAssessments {
                 assessmentId = $prefix + ':' + (Get-OwnerV2Digest -Value "$BindingId|$unitId").Substring(10)
                 evidenceUnitIds = @($unitId)
                 state = 'unknown'
+                data = [ordered]@{
+                    state = 'uncovered'
+                    reason = 'required-evidence-unavailable'
+                    constructRef = 'evidence:' + (Get-OwnerV2Digest -Value "$BindingId|$unitId").Substring(10)
+                }
                 findings = @()
             }
         }
@@ -873,6 +1021,11 @@ function Invoke-OwnerV2CapabilityResponse {
                     assessmentId = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$fileUnitId").Substring(10)
                     evidenceUnitIds = $atomicEvidenceIds
                     state = 'unknown'
+                    data = [ordered]@{
+                        state = 'uncovered'
+                        reason = 'file-evidence-unavailable'
+                        constructRef = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$fileUnitId").Substring(10)
+                    }
                     findings = @()
                 })
             continue
@@ -902,14 +1055,20 @@ function Invoke-OwnerV2CapabilityResponse {
                     assessmentId = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$fileUnitId").Substring(10)
                     evidenceUnitIds = $atomicEvidenceIds
                     state = 'unknown'
+                    data = [ordered]@{
+                        state = 'uncovered'
+                        reason = 'semantic-unit-cap-exhausted'
+                        constructRef = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$fileUnitId").Substring(10)
+                    }
                     findings = @()
                 })
             continue
         }
+        $semanticUnitCount += $constructs.Count
+        $constructs += @(Get-OwnerV2NonEligibleConstructs -FileData $fileData -Limits $Limits)
 
         foreach ($construct in $constructs) {
-            $semanticUnitCount++
-            $constructMaterial = [ordered]@{
+                $constructMaterial = [ordered]@{
                 bindingId = $bindingId
                 evidenceDigest = $evidenceDigest
                 capabilityId = $CapabilityId
@@ -930,6 +1089,24 @@ function Invoke-OwnerV2CapabilityResponse {
             $constructRef = 'construct:' + $constructDigest
             $assessmentId = "$($construct.kind):n:$constructDigest"
 
+            if ($construct.kind -notin @('method', 'class')) {
+                [void]$assessments.Add([ordered]@{
+                        assessmentId = $assessmentId
+                        evidenceUnitIds = $atomicEvidenceIds
+                        state = 'complete'
+                        data = [ordered]@{
+                            state = 'notEligible'
+                            reason = 'owner-rule-applies-only-to-test-classes-and-methods'
+                            constructRef = $constructRef
+                            path = $path
+                            startLine = [int]$construct.startLine
+                            endLine = [int]$construct.declarationLine
+                            symbol = [string]$construct.name
+                        }
+                        findings = @()
+                    })
+                continue
+            }
             if ($construct.kind -ceq 'class' -or
                 -not [bool]$construct.bounded -or
                 -not [bool]$construct.recognized) {
@@ -943,6 +1120,23 @@ function Invoke-OwnerV2CapabilityResponse {
                         assessmentId = $assessmentId
                         evidenceUnitIds = $atomicEvidenceIds
                         state = 'unknown'
+                        data = [ordered]@{
+                            state = $(if ($construct.kind -ceq 'class') { 'advisory' } else { 'unknown' })
+                            reason = $(if ($construct.kind -ceq 'class') {
+                                    'class-advisory-only'
+                                }
+                                elseif (-not [bool]$construct.bounded) {
+                                    'construct-snippet-unbounded'
+                                }
+                                else {
+                                    'construct-unrecognized'
+                                })
+                            constructRef = $constructRef
+                            path = $path
+                            startLine = [int]$construct.startLine
+                            endLine = [int]$construct.declarationLine
+                            symbol = [string]$construct.name
+                        }
                         findings = @()
                     })
                 continue
@@ -1030,6 +1224,23 @@ function Invoke-OwnerV2CapabilityResponse {
                     assessmentId = $assessmentId
                     evidenceUnitIds = $atomicEvidenceIds
                     state = $assessmentState
+                    data = $(if ($assessmentState -ceq 'unknown') {
+                            [ordered]@{
+                                state = 'unknown'
+                                reason = $(if ($judgment.Failure) {
+                                        [string]$judgment.Failure
+                                    }
+                                    else {
+                                        'semantic-judgment-unknown'
+                                    })
+                                constructRef = $constructRef
+                                path = $path
+                                startLine = [int]$construct.startLine
+                                endLine = [int]$construct.declarationLine
+                                symbol = [string]$construct.name
+                            }
+                        }
+                        else { $null })
                     findings = $findings
                 })
         }
@@ -1113,16 +1324,8 @@ function ConvertTo-OwnerV2Observation {
     $methodAssessments = @($assessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'method:*'
         })
-    $classAssessments = @($assessments | Where-Object {
-            [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'class:*'
-        })
-    $unknownFileAssessments = @($assessments | Where-Object {
-            [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'file:*' -and
-            [string](Get-OwnerV2Member -Value $_ -Name state) -ceq 'unknown'
-        })
-    $unknownEvidenceAssessments = @($assessments | Where-Object {
-            [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'evidence:*' -and
-            [string](Get-OwnerV2Member -Value $_ -Name state) -ceq 'unknown'
+    $outcomeAssessments = @($assessments | Where-Object {
+            $null -ne (Get-OwnerV2Member -Value $_ -Name data)
         })
     $previewFindings = @(Get-OwnerV2Member -Value $preview -Name findings)
     $ruleHash = [string](Get-OwnerV2Member -Value $rule -Name hash)
@@ -1186,27 +1389,59 @@ function ConvertTo-OwnerV2Observation {
                 binding = $binding
             })
     }
-    foreach ($assessment in @($methodAssessments | Where-Object {
-                [string](Get-OwnerV2Member -Value $_ -Name state) -ceq 'unknown'
-            })) {
+    $normalizedOutcomes = [Collections.Generic.List[object]]::new()
+    foreach ($assessment in $outcomeAssessments) {
         $assessmentId = [string](Get-OwnerV2Member -Value $assessment -Name assessmentId)
-        [void]$normalizedFindings.Add([ordered]@{
-                identity = 'unknown:' + $assessmentId
-                semanticKey = 'unknown'
+        $outcome = Get-OwnerV2Member -Value $assessment -Name data
+        $outcomeState = [string](Get-OwnerV2Member -Value $outcome -Name state)
+        $outcomeReason = [string](Get-OwnerV2Member -Value $outcome -Name reason)
+        $constructRef = [string](Get-OwnerV2Member -Value $outcome -Name constructRef)
+        $path = [string](Get-OwnerV2Member -Value $outcome -Name path)
+        $startLine = Get-OwnerV2Member -Value $outcome -Name startLine
+        $endLine = Get-OwnerV2Member -Value $outcome -Name endLine
+        $symbol = [string](Get-OwnerV2Member -Value $outcome -Name symbol)
+        $binding = if (-not [string]::IsNullOrWhiteSpace($path) -and
+            $startLine -is [int] -and $endLine -is [int] -and
+            -not [string]::IsNullOrWhiteSpace($symbol)) {
+            New-OwnerCanonicalAnchor -Path $path -StartLine $startLine -EndLine $endLine `
+                -Symbol $symbol -ConstructIdentity $constructRef
+        }
+        else {
+            'unknown'
+        }
+        $semanticKey = if ($binding -is [Collections.IDictionary]) {
+            Get-OwnerSemanticFindingKey -Subject $observationSubject -Rule $observationRule `
+                -Capability ([string](Get-OwnerV2Member -Value $identity -Name capabilityId)) `
+                -Binding $binding
+        }
+        else {
+            'unknown'
+        }
+        [void]$normalizedOutcomes.Add([ordered]@{
+                identity = 'owner-v2-outcome:' + (Get-OwnerV2Digest -Value ([ordered]@{
+                            bindingId = [string](Get-OwnerV2Member -Value $validation -Name bindingId)
+                            capabilityId = [string](Get-OwnerV2Member -Value $identity -Name capabilityId)
+                            ruleRef = $ruleRef
+                            assessmentId = $assessmentId
+                            state = $outcomeState
+                            reason = $outcomeReason
+                        })).Substring(10)
+                semanticKey = $semanticKey
                 providerMarker = New-OwnerProviderMarker
                 disposition = 'unknown'
+                state = $outcomeState
+                reason = $outcomeReason
                 ruleRef = $ruleRef
-                constructRef = 'construct:' + ($assessmentId -split ':')[-1]
-                anchor = 'unknown'
-                binding = 'unknown'
+                constructRef = $constructRef
+                binding = $binding
+                writerEligible = $false
             })
     }
     $sortedFindings = @($normalizedFindings | Sort-Object identity)
-    $unknownCount = @($methodAssessments | Where-Object {
-            [string](Get-OwnerV2Member -Value $_ -Name state) -ceq 'unknown'
-        }).Count
+    $sortedOutcomes = @($normalizedOutcomes | Sort-Object identity)
+    $unknownCount = @($sortedOutcomes | Where-Object state -CEQ 'unknown').Count
     $eligibleCount = $methodAssessments.Count
-    $advisoryCount = $classAssessments.Count
+    $advisoryCount = @($sortedOutcomes | Where-Object state -CEQ 'advisory').Count
     $checkedCount = @($methodAssessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name state) -ceq 'complete'
         }).Count
@@ -1263,7 +1498,7 @@ function ConvertTo-OwnerV2Observation {
         $latencyMs = [long]$latencyValue
         $refusalReason = [string]$refusalValue
     }
-    $uncoveredCount = $unknownFileAssessments.Count + $unknownEvidenceAssessments.Count
+    $uncoveredCount = @($sortedOutcomes | Where-Object state -CEQ 'uncovered').Count
     $pipelineState = [string](Get-OwnerV2Member -Value $PipelineResult -Name state)
     # Class assessments are advisory-only; completion reflects eligible methods and coverage.
     $completed = $pipelineState -cne 'failed' -and
@@ -1312,6 +1547,7 @@ function ConvertTo-OwnerV2Observation {
         }
         findingsComplete = $completed
         findings = $sortedFindings
+        outcomes = $sortedOutcomes
         execution = [ordered]@{
             attempts = $runnerAttemptCount
             modelStarts = $modelStarts

@@ -499,6 +499,43 @@ Describe 'Owner parity qualification contract' {
         (Get-TestParityGate $blocked unknownIntegrity).status | Should -Be 'blocked'
     }
 
+    It 'accepts a bound non-finding outcome for a baseline unknown construct' {
+        $baseline = New-TestParityObservation -Mutator {
+            param($o)
+            $o.findings[0].disposition = 'unknown'
+            $o.counts.violations = 0
+            $o.counts.unknown = 1
+        }
+        $candidate = New-TestParityObservation -ImplementationId 'owner-v2-test' -Mutator {
+            param($o)
+            $source = $o.findings[0]
+            $o.findings = @(); $o.counts.violations = 0
+            $o.outcomes = @(
+                [ordered]@{
+                    identity = 'owner-v2-outcome:not-eligible'; semanticKey = $source.semanticKey
+                    providerMarker = $source.providerMarker
+                    disposition = 'unknown'; state = 'notEligible'
+                    reason = 'owner-rule-applies-only-to-test-classes-and-methods'
+                    ruleRef = $source.ruleRef; constructRef = $source.constructRef
+                    binding = $source.binding
+                    writerEligible = $false
+                }
+            )
+        }
+        $result = Invoke-OwnerParityGateEvaluation `
+            -Baseline $baseline -Candidate $candidate `
+            -Evidence (New-TestParityEvidence) `
+            -Adjudication @(
+                New-TestParityAdjudication `
+                    -Truth unknown `
+                    -BaselineDisposition unknown `
+                    -CandidateIdentity 'owner-v2-outcome:not-eligible' `
+                    -CandidateDisposition unknown
+            )
+        (Get-TestParityGate $result unknownIntegrity).status | Should -Be 'passed'
+        $candidate.outcomes[0].writerEligible | Should -BeFalse
+    }
+
     It 'blocks incomplete cohorts instead of inferring uncovered units as compliant' {
         $baseline = New-TestParityObservation -Mutator {
             param($o)
