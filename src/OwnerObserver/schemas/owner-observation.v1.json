@@ -176,6 +176,23 @@
         }
       }
     },
+    "outcomes": { "type": "array",
+      "items": { "type": "object", "additionalProperties": false,
+        "required": ["identity", "semanticKey", "providerMarker", "disposition", "state", "reason", "ruleRef", "constructRef", "binding", "writerEligible"],
+        "properties": {
+          "identity": { "$ref": "#/$defs/knownText" },
+          "semanticKey": { "oneOf": [{ "const": "unknown" }, { "type": "string", "pattern": "^v1:sha256:[0-9a-f]{64}$" }] },
+          "providerMarker": { "$ref": "#/$defs/providerMarker" },
+          "disposition": { "const": "unknown" },
+          "state": { "enum": ["unknown", "advisory", "uncovered", "notEligible"] },
+          "reason": { "$ref": "#/$defs/text" },
+          "ruleRef": { "$ref": "#/$defs/knownText" },
+          "constructRef": { "$ref": "#/$defs/knownText" },
+          "binding": { "oneOf": [{ "const": "unknown" }, { "$ref": "#/$defs/findingBinding" }] },
+          "writerEligible": { "const": false }
+        }
+      }
+    },
     "execution": {
       "type": "object",
       "additionalProperties": false,

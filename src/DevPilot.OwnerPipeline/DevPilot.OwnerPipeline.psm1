@@ -707,12 +707,22 @@ function Invoke-OwnerReviewPipeline {
                     })
             }
             if ($validationFailed) { break }
-            [void]$normalizedAssessments.Add([ordered]@{
+            $normalizedAssessment = [ordered]@{
                     assessmentId = $assessmentId
                     evidenceUnitIds = @($assessmentUnitIds)
                     state = $assessmentState
                     findings = @($normalizedFindings)
-                })
+                }
+            if ($assessment.Contains('data')) {
+                try {
+                    $normalizedAssessment['data'] = Copy-OwnerJsonValue -Value $assessment['data']
+                }
+                catch {
+                    $validationFailed = $true
+                    break
+                }
+            }
+            [void]$normalizedAssessments.Add($normalizedAssessment)
         }
 
         if ($validationFailed) {
