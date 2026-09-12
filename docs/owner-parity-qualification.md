@@ -98,34 +98,35 @@ semantic model call from an observation path.
 
 ## Prospective real-model qualification
 
-The current [sanitized aggregate](owner-parity-summary.json) executes the four
-entries with exact evidence using the PR140 supported CLI launcher and the
-same `claude-sonnet-5` identity observed in v1. The fifth entry remains
-unavailable. The six eligible units each made one bounded model call and
-returned one valid semantic response marker. The two clean or advisory-only
-entries completed without a model call.
+The current [sanitized aggregate](owner-parity-summary.json) covers the five
+entries in a locked seven-head cohort that had complete frozen-v1 results and
+valid prospective v2 semantic results. One additional head reached no v1 model
+boundary, and another became a draft before exact source capture; both remain
+explicit evidence-availability controls rather than failed semantic executions.
 
-All six calls retained `effectiveTools: []`, `providerWrites: 0`, and
-`writeToolInvocations: 0`. All 6 verified v1 method findings are semantically
-retained, with no eligible false positives across the four measured entries.
-The six calls completed in 132,078 ms. The unavailable fifth entry still
-prevents an aggregate pass even though the measured semantic cohort completed.
+The five applicable entries used the same `claude-sonnet-5` identity for v1 and
+v2. Eleven eligible v2 units each made one model call and returned one valid
+semantic response marker; two clean/no-eligible entries completed without a
+model call. All calls retained `effectiveTools: []`, `providerWrites: 0`, and
+`writeToolInvocations: 0`, with 233,438 ms aggregate v2 model latency. Both
+verified v1 method findings were retained, v2 found all 11 independently
+adjudicated method violations, and no eligible false positives were observed.
 
 | Gate | Result | Evidence |
 |---|---|---|
-| Finding retention | `blocked` | All 6 verified findings are retained; the unavailable entry remains blocked |
-| Eligible false positives | `blocked` | 0 observed across 4 measured entries; 1 entry remains unmeasured |
-| Binding equivalence | `blocked` | 38 canonical comparisons pass; the unavailable entry remains blocked |
-| Unknown integrity | `blocked` | 15 outcomes measured and 16 remain blocked or incomplete |
-| Write isolation | `blocked` | Four observations prove zero writes; the unavailable entry remains blocked |
-| Completion reliability | `blocked` | v1 and v2 each completed 4 of 5 entries; the fifth entry remains unavailable |
-| Latency accounting | `blocked` | 96 measurement states are explicit; 12 remain blocked |
-| Rollback proof | `passed` | 3,260 critical files remained byte-identical and the declared volatile log stayed prefix-preserving and append-only |
+| Finding retention | `passed` | Both verified v1 method findings were retained |
+| Eligible false positives | `passed` | 0 observed across 11 candidate violations and 5 measured entries |
+| Binding equivalence | `passed` | 45 canonical comparisons passed |
+| Unknown integrity | `blocked` | 10 frozen-v1 unknown findings were not exposed as corresponding v2 unknown outcomes |
+| Write isolation | `passed` | Five observations prove zero provider and tool writes |
+| Completion reliability | `passed` | v1 and v2 each completed all 5 applicable entries |
+| Latency accounting | `passed` | 120 measurement states are explicit |
+| Rollback proof | `passed` | 710 declared critical files remained byte-identical |
 
-Prospective parity remains blocked. The evidence does not justify an operator-approved
-canary, cutover, writer compatibility, deployment, or any provider write.
-
-The no-tools launcher now produces valid, bound semantic responses. The
-remaining blocker is the unavailable fifth evidence entry; all eight gates
-must pass before canary authorization, cutover, deployment changes, or writer
-compatibility.
+Prospective parity remains blocked. The unavailable controls do not block
+unrelated semantic gates, but the measured unknown-integrity gate still does
+not pass. The evidence therefore does not justify a canary, cutover, deployment
+change, writer compatibility, or any provider write. The next action is to
+expose stable v2 unknown outcomes for the ten frozen-v1 unknown constructs (or
+independently prove those constructs outside the applicable unknown
+denominator), then rerun this same locked cohort.

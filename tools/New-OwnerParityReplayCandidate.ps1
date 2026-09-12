@@ -248,7 +248,7 @@ for ($index = 0; $index -lt $referenceValues.Count; $index++) {
 $baseline = ConvertFrom-OwnerNormalizedObservationBytes `
     -Bytes (Get-ParityCandidateReferencedBytes -Path $baselinePath)
 $statusFiles = @($referenceValues | Where-Object {
-        Test-ParityCandidatePathWithin -Path $_.path -Root $evidenceRoot -and
+        (Test-ParityCandidatePathWithin -Path $_.path -Root $evidenceRoot) -and
         [IO.Path]::GetFileName($_.path) -ceq 'owner-preview-status.json'
     })
 if ($statusFiles.Count -ne 1) {
@@ -261,7 +261,10 @@ foreach ($binding in @(
         @($status.subject.repositoryId, $baseline.subject.repositoryId, 'repository'),
         @($status.subject.sourceCommit, $baseline.subject.headCommit, 'head'),
         @($status.subject.targetCommit, $baseline.subject.targetCommit, 'target'),
-        @($status.rule.path, $baseline.rule.path, 'rule path'),
+        @(
+            (ConvertTo-ParityCandidatePath -Path ([string]$status.rule.path)),
+            $baseline.rule.path,
+            'rule path'),
         @($status.rule.section, $baseline.rule.section, 'rule section'),
         @($status.rule.commit, $baseline.rule.commit, 'rule commit'),
         @($status.rule.sha256, $baseline.rule.sha256, 'rule hash'))) {
@@ -271,7 +274,7 @@ foreach ($binding in @(
 }
 
 $replayManifests = @($referenceValues | Where-Object {
-        Test-ParityCandidatePathWithin -Path $_.path -Root (Join-Path $runRoot 'materialized\replay') -and
+        (Test-ParityCandidatePathWithin -Path $_.path -Root (Join-Path $runRoot 'materialized\replay')) -and
         [IO.Path]::GetFileName($_.path) -ceq 'manifest.json'
     })
 if ($replayManifests.Count -ne 1) {

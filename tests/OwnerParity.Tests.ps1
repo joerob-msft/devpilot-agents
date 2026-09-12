@@ -955,6 +955,18 @@ Describe 'Owner parity snapshots, paths, and sanitization' {
         } | Should -Throw '*ReferenceManifestPath is required*'
     }
 
+    It 'groups replay path predicates before applying boolean filters' {
+        $tool = Get-Content -LiteralPath (
+            Join-Path $script:RepoRoot 'tools/New-OwnerParityReplayCandidate.ps1') -Raw
+
+        $tool | Should -Match ([regex]::Escape(
+                '(Test-ParityCandidatePathWithin -Path $_.path -Root $evidenceRoot) -and'))
+        $tool | Should -Match ([regex]::Escape(
+                "(Test-ParityCandidatePathWithin -Path `$_.path -Root (Join-Path `$runRoot 'materialized\replay')) -and"))
+        $tool | Should -Match ([regex]::Escape(
+                '(ConvertTo-ParityCandidatePath -Path ([string]$status.rule.path))'))
+    }
+
     It 'emits only fixed-shape aggregate fields and redacts private report detail by omission' {
         $report = [ordered]@{
             entries = @(
