@@ -72,6 +72,53 @@ function Assert-CohortEntry {
     Write-Host "  ok   $Name" -ForegroundColor DarkGray
 }
 
+function New-CohortEntryTransportResult {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [string]$Text = "line one`nline two`n",
+        [string]$MimeType = 'text/plain'
+    )
+    return [pscustomobject][ordered]@{
+        content = [object[]]@(
+            [pscustomobject][ordered]@{
+                type = 'resource'
+                resource = [pscustomobject][ordered]@{
+                    blob = [Convert]::ToBase64String($script:Utf8.GetBytes($Text))
+                    mimeType = $MimeType
+                    uri = $Uri
+                }
+            })
+    }
+}
+
+function Copy-CohortEntryTransportRead {
+    param([Parameter(Mandatory)]$Read)
+    $arguments = [ordered]@{}
+    foreach ($key in $Read.Arguments.Keys) { $arguments[$key] = $Read.Arguments[$key] }
+    $copy = [pscustomobject][ordered]@{}
+    foreach ($property in $Read.PSObject.Properties) {
+        $value = if ($property.Name -ceq 'Arguments') { $arguments } else { $property.Value }
+        $copy | Add-Member -MemberType NoteProperty -Name $property.Name -Value $value
+    }
+    return $copy
+}
+
+function Get-CohortEntryTransportDecodeError {
+    param(
+        [Parameter(Mandatory)]$Read,
+        [Parameter(Mandatory)]$ToolResult
+    )
+    try {
+        $decoderResult = ConvertTo-ReviewerCohortEntryDecoderResourceResult -ToolResult $ToolResult -Read $Read
+        ConvertFrom-AgentMcpResourceContent -ToolResult $decoderResult -ExpectedUri $Read.ResourceUri `
+            -MaxBytes 65536 -AllowedMimeTypes @([string]$Read.MimeType) | Out-Null
+        return ''
+    }
+    catch {
+        return [string]$_.Exception.Message
+    }
+}
+
 function Get-CohortEntryRefusalCode {
     <#
     .SYNOPSIS
@@ -775,10 +822,9 @@ function New-CohortEntryFixture {
     [IO.File]::WriteAllBytes($runSetKeyPath, $script:Utf8.GetBytes('raw:' + [Convert]::ToBase64String($keyBytes)))
 
     # -- the sealed snapshot ---------------------------------------------
-    # The wrapper answers an embedded resource under the repository-relative
-    # PATH. The fixture answers under the same URI a live wrapper does, so a
-    # fixture that passes is evidence about the live contract rather than about
-    # a URI the fixture invented for itself.
+    # Replays retain the historical repository-relative URI. A separate matrix
+    # above proves that current Agency item URLs normalize to this exact form
+    # only when every planned request binding matches.
     $uriFor = {
         param([string]$Path)
         $Path
@@ -1229,6 +1275,156 @@ Assert-CohortEntry -Name 'the live session narrows the tool child to the repos t
     -Condition ($builderBody -cmatch "-Toolsets\s+@\('repos'\)")
 Assert-CohortEntry -Name 'the live session passes its scrub list to the session opener' `
     -Condition ($builderBody -cmatch '-EnvironmentVariablesToRemove\s+\$script:ReviewerCohortEntrySensitiveEnvironmentVariables')
+
+# Agency currently wraps repo_file text in a canonical Azure DevOps item URL.
+# This matrix pins the narrow compatibility layer independently of the larger
+# package fixture so every URL binding can be mutated one at a time.
+Write-Host 'Agency resource URI compatibility' -ForegroundColor Cyan
+$transportOrganization = 'fabrikam'
+$transportProject = 'Contoso'
+$transportRepositoryId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+$transportPath = '/src/a.ps1'
+$transportCommit = 'a' * 40
+$transportRead = Get-ReviewerCohortEntryFileRead -Request ([pscustomobject]@{
+        Organization = $transportOrganization
+        Project = $transportProject
+    }) -Id 'transport-fixture' -RepositoryId $transportRepositoryId -ProviderPath $transportPath `
+    -Commit $transportCommit -Role 'changed' -PayloadFile 'payloads/transport.txt'
+$transportUrl = (
+    'https://dev.azure.com/{0}/{1}/_apis/git/repositories/{2}/items?' +
+    'path={3}&versionDescriptor.version={4}&versionDescriptor.versionType=Commit'
+) -f (
+    [Uri]::EscapeDataString($transportOrganization),
+    [Uri]::EscapeDataString($transportProject),
+    $transportRepositoryId,
+    [Uri]::EscapeDataString($transportPath),
+    $transportCommit
+)
+$bareResult = New-CohortEntryTransportResult -Uri $transportPath
+$urlResult = New-CohortEntryTransportResult -Uri $transportUrl
+$normalizedUrlResult = ConvertTo-ReviewerCohortEntryDecoderResourceResult -ToolResult $urlResult -Read $transportRead
+$bareDecoded = ConvertFrom-AgentMcpResourceContent -ToolResult $bareResult -ExpectedUri $transportPath `
+    -MaxBytes 65536 -AllowedMimeTypes @('text/plain')
+$urlDecoded = ConvertFrom-AgentMcpResourceContent -ToolResult $normalizedUrlResult -ExpectedUri $transportPath `
+    -MaxBytes 65536 -AllowedMimeTypes @('text/plain')
+Assert-CohortEntry -Name 'the historical bare resource URI remains accepted unchanged' `
+    -Condition ([object]::ReferenceEquals(
+        $bareResult, (ConvertTo-ReviewerCohortEntryDecoderResourceResult -ToolResult $bareResult -Read $transportRead)))
+Assert-CohortEntry -Name 'the exact observed Agency item URL is accepted with byte and hash equivalence' `
+    -Condition (
+        $urlDecoded.Text -ceq $bareDecoded.Text -and
+        $urlDecoded.ByteLength -eq $bareDecoded.ByteLength -and
+        $urlDecoded.Sha256 -ceq $bareDecoded.Sha256
+    )
+Assert-CohortEntry -Name 'Agency URI normalization copies the result and leaves raw evidence untouched' `
+    -Condition (
+        -not [object]::ReferenceEquals($urlResult, $normalizedUrlResult) -and
+        [string]$urlResult.content[0].resource.uri -ceq $transportUrl -and
+        [string]$normalizedUrlResult.content[0].resource.uri -ceq $transportPath
+    )
+$reorderedUrl = (
+    'https://dev.azure.com/{0}/{1}/_apis/git/repositories/{2}/items?' +
+    'versionDescriptor.versionType=Commit&path={3}&versionDescriptor.version={4}'
+) -f (
+    [Uri]::EscapeDataString($transportOrganization),
+    [Uri]::EscapeDataString($transportProject),
+    $transportRepositoryId,
+    [Uri]::EscapeDataString($transportPath),
+    $transportCommit
+)
+Assert-CohortEntry -Name 'Agency item URL query ordering is not significant' `
+    -Condition ((Get-CohortEntryTransportDecodeError -Read $transportRead `
+            -ToolResult (New-CohortEntryTransportResult -Uri $reorderedUrl)) -ceq '')
+
+$badTransportUris = [ordered]@{
+    'wrong scheme' = $transportUrl.Replace('https://', 'http://')
+    'wrong host' = $transportUrl.Replace('dev.azure.com', 'dev.azure.com.example.invalid')
+    'non-default port' = $transportUrl.Replace('dev.azure.com', 'dev.azure.com:444')
+    'userinfo' = $transportUrl.Replace('https://', 'https://fixture@')
+    'fragment' = "$transportUrl#fragment"
+    'wrong organization' = $transportUrl.Replace('/fabrikam/', '/northwind/')
+    'wrong project' = $transportUrl.Replace('/Contoso/', '/OtherProject/')
+    'wrong repository' = $transportUrl.Replace($transportRepositoryId, 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
+    'wrong path' = $transportUrl.Replace('%2Fsrc%2Fa.ps1', '%2Fsrc%2Fb.ps1')
+    'wrong path case' = $transportUrl.Replace('%2Fsrc%2Fa.ps1', '%2Fsrc%2FA.ps1')
+    'wrong commit' = $transportUrl.Replace($transportCommit, ('b' * 40))
+    'wrong version type' = $transportUrl.Replace('versionType=Commit', 'versionType=Branch')
+    'missing query key' = $transportUrl.Replace('&versionDescriptor.versionType=Commit', '')
+    'duplicate query key' = "$transportUrl&path=%2Fsrc%2Fa.ps1"
+    'extra query key' = "$transportUrl&api-version=7.1"
+    'double-encoded path' = $transportUrl.Replace('%2Fsrc%2Fa.ps1', '%252Fsrc%252Fa.ps1')
+    'traversing path' = $transportUrl.Replace('%2Fsrc%2Fa.ps1', '%2Fsrc%2F..%2Fa.ps1')
+}
+foreach ($case in $badTransportUris.GetEnumerator()) {
+    Assert-CohortEntry -Name "Agency item URL refuses $($case.Key)" `
+        -Condition ((Get-CohortEntryTransportDecodeError -Read $transportRead `
+                -ToolResult (New-CohortEntryTransportResult -Uri ([string]$case.Value))).Contains(
+            'URI did not exactly match'))
+}
+
+foreach ($toolAction in @(
+        @{ Name = 'a non-repo_file read'; Tool = 'other_tool'; Action = 'get_content' },
+        @{ Name = 'a non-get_content action'; Tool = 'repo_file'; Action = 'list' })) {
+    $mutatedRead = Copy-CohortEntryTransportRead -Read $transportRead
+    $mutatedRead.Tool = $toolAction.Tool
+    $mutatedRead.Arguments['action'] = $toolAction.Action
+    Assert-CohortEntry -Name "Agency item URL refuses $($toolAction.Name)" `
+        -Condition ((Get-CohortEntryTransportDecodeError -Read $mutatedRead -ToolResult $urlResult).Contains(
+            'URI did not exactly match'))
+}
+
+$bindingMutations = [ordered]@{
+    Organization = { param($read) $read.PSObject.Properties.Remove('Organization') }
+    ResourceUri = { param($read) $read.PSObject.Properties.Remove('ResourceUri') }
+    action = { param($read) [void]$read.Arguments.Remove('action') }
+    project = { param($read) [void]$read.Arguments.Remove('project') }
+    repositoryId = { param($read) [void]$read.Arguments.Remove('repositoryId') }
+    path = { param($read) [void]$read.Arguments.Remove('path') }
+    versionType = { param($read) [void]$read.Arguments.Remove('versionType') }
+    version = { param($read) [void]$read.Arguments.Remove('version') }
+}
+foreach ($mutation in $bindingMutations.GetEnumerator()) {
+    $mutatedRead = Copy-CohortEntryTransportRead -Read $transportRead
+    & $mutation.Value $mutatedRead
+    $errorText = ''
+    try {
+        $decoderResult = ConvertTo-ReviewerCohortEntryDecoderResourceResult -ToolResult $urlResult -Read $mutatedRead
+        $expectedUri = if ($mutatedRead.PSObject.Properties['ResourceUri']) {
+            [string]$mutatedRead.ResourceUri
+        }
+        else { $transportPath }
+        ConvertFrom-AgentMcpResourceContent -ToolResult $decoderResult -ExpectedUri $expectedUri `
+            -MaxBytes 65536 -AllowedMimeTypes @('text/plain') | Out-Null
+    }
+    catch { $errorText = [string]$_.Exception.Message }
+    Assert-CohortEntry -Name "Agency item URL fails when planned binding '$($mutation.Key)' is removed" `
+        -Condition ($errorText.Contains('URI did not exactly match'))
+}
+
+$malformedTransportResults = [ordered]@{
+    'missing blob' = {
+        $result = New-CohortEntryTransportResult -Uri $transportUrl
+        $result.content[0].resource.PSObject.Properties.Remove('blob')
+        $result
+    }
+    'noncanonical blob' = {
+        $result = New-CohortEntryTransportResult -Uri $transportUrl
+        $result.content[0].resource.blob = '%%%='
+        $result
+    }
+    'wrong MIME type' = {
+        New-CohortEntryTransportResult -Uri $transportUrl -MimeType 'application/octet-stream'
+    }
+    'extra resource property' = {
+        $result = New-CohortEntryTransportResult -Uri $transportUrl
+        $result.content[0].resource | Add-Member -MemberType NoteProperty -Name extra -Value 'refuse'
+        $result
+    }
+}
+foreach ($case in $malformedTransportResults.GetEnumerator()) {
+    $errorText = Get-CohortEntryTransportDecodeError -Read $transportRead -ToolResult (& $case.Value)
+    Assert-CohortEntry -Name "the original decoder still refuses $($case.Key)" -Condition ($errorText -cne '')
+}
 
 # A refusal code nobody can raise is not a refusal. The catalogue is the
 # operator-facing contract, so every code in it has to have a site that raises
@@ -2730,6 +2926,20 @@ Invoke-CohortEntryCase -Name 'a file served under a URI nobody requested' -Expec
 # Serving it here is the exact confusion that refused every live read once.
 Invoke-CohortEntryCase -Name 'a file served under the corpus-seal provenance URI form' -ExpectedCode 'CE304' -Mutate {
     param($state) $state.RuleResourceUri = "ado://$($state.Organization)/$($state.Project)/$($state.RepositoryId)/docs/rules/RULES.md"
+}
+
+Invoke-CohortEntryCase -Name 'a file served under the exact Agency Azure DevOps item URL' -ExpectedCode '' -Mutate {
+    param($state)
+    $state.RuleResourceUri = (
+        'https://dev.azure.com/{0}/{1}/_apis/git/repositories/{2}/items?' +
+        'path={3}&versionDescriptor.version={4}&versionDescriptor.versionType=Commit'
+    ) -f (
+        [Uri]::EscapeDataString([string]$state.Organization),
+        [Uri]::EscapeDataString([string]$state.Project),
+        [string]$state.RepositoryId,
+        [Uri]::EscapeDataString('/docs/rules/review.md'),
+        [string]$state.RuleCommit
+    )
 }
 
 Invoke-CohortEntryCase -Name 'a rule section that drifted from its pin' -ExpectedCode 'CE310' -Mutate {
