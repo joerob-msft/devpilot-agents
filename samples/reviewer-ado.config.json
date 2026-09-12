@@ -89,7 +89,8 @@
       "events": [
         "candidateStarved",
         "reviewFailed"
-      ]
+      ],
+      "cleanReviewCcUpns": []
     },
     "directAuthor": {
       "note": "One-on-one Teams chat to the reviewed PR's author. The wrapper resolves the recipient from ADO createdBy.uniqueName for each PR. recipientUpn is only a fallback when ADO does not expose a usable author UPN. Independent of the channel destination - either alone is valid.",

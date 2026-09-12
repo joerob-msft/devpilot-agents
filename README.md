@@ -595,7 +595,11 @@ author UPN. Channel and direct delivery are deduplicated independently.
 Reviewer channel notifications also tag that PR owner using the Entra identity
 bound to the fresh ADO author record. If ADO does not expose a valid mention
 identity, the original unmentioned notification is still sent rather than
-losing the review signal.
+losing the review signal. Set channel `cleanReviewCcUpns` to one or more UPNs
+that should receive an additional real Teams mention when a completed review
+has zero findings. The PR owner remains the first mention; identities that
+cannot be validated are skipped, and duplicate owner/reviewer identities are
+collapsed.
 
 **Local Teams channel threads (default):** the optional
 `teamsNotifications.channel.threadReuseEnabled` setting defaults to `true`.
