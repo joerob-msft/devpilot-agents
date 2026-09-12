@@ -568,8 +568,11 @@ Describe 'Owner no-tools model provider' {
             Set-ItResult -Skipped -Because 'The test drive path is already too long for this boundary fixture.'
             return
         }
-        $provider = New-OwnerCopilotCliModelProvider -Model 'claude-sonnet-5' `
+        $provider = New-OwnerModelFakeProvider -FilePath $script:pwsh `
             -LaunchRoot (Join-Path $TestDrive ('x' * $paddingLength))
+        $provider.Kind = 'copilot-cli'
+        $provider.PublisherIdentity = 'verified-github'
+        Mock -ModuleName DevPilot.OwnerModelRunner Assert-OwnerModelProvider {}
         { Test-OwnerModelProviderPreflight -Provider $provider } |
             Should -Throw '*launch root is too long*'
         Test-Path -LiteralPath $provider.LaunchRoot | Should -BeFalse
