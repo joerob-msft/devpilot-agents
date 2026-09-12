@@ -51,6 +51,8 @@ Each attempt gets a fresh private home, application-data, working, and
 temporary directory outside the repository. The child environment starts
 empty and receives only the strict OS bootstrap allowlist, fixed safety
 settings, and the selected credential mapped to `COPILOT_GITHUB_TOKEN`. The
+private directory names retain 128 bits of randomness in a compact path-safe
+encoding so Windows leaves room for Copilot's per-session SQLite files. The
 pinned native executable is copied into the attempt directory and its digest
 and Windows GitHub publisher identity are rechecked before launch. Stdin is
 closed; stdout and stderr are drained with byte, line, activity, call, total,
