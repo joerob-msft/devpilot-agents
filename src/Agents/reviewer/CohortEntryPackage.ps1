@@ -34,6 +34,172 @@ Set-StrictMode -Version Latest
 # Capture through the reviewed read seam
 # ---------------------------------------------------------------------------
 
+function ConvertFrom-ReviewerCohortEntryUriComponent {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    if ($Value -match '%(?![0-9A-Fa-f]{2})') {
+        throw 'The URI component contains an incomplete percent escape.'
+    }
+    return [Uri]::UnescapeDataString($Value)
+}
+
+function Test-ReviewerCohortEntryCanonicalFileResourceUri {
+    <#
+    .SYNOPSIS
+        Whether an Agency resource URI is the canonical Azure DevOps item URL
+        for the exact repo_file request already present in the closed plan.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ResourceUri,
+        [Parameter(Mandatory)]$Read
+    )
+
+    try {
+        if (-not $Read.PSObject.Properties['Organization'] -or
+            -not $Read.PSObject.Properties['ResourceUri'] -or
+            -not $Read.PSObject.Properties['Tool'] -or
+            [string]$Read.Tool -cne 'repo_file' -or
+            $Read.Arguments -isnot [System.Collections.IDictionary]) {
+            return $false
+        }
+        $arguments = $Read.Arguments
+        foreach ($name in @('action', 'project', 'repositoryId', 'path', 'versionType', 'version')) {
+            if (-not $arguments.Contains($name) -or $arguments[$name] -isnot [string] -or
+                [string]::IsNullOrEmpty([string]$arguments[$name])) {
+                return $false
+            }
+        }
+        if ([string]$arguments['action'] -cne 'get_content' -or
+            [string]$arguments['versionType'] -cne 'Commit' -or
+            [string]$Read.ResourceUri -cne [string]$arguments['path'] -or
+            [string]::IsNullOrEmpty([string]$Read.Organization)) {
+            return $false
+        }
+
+        $parsed = $null
+        if (-not [Uri]::TryCreate($ResourceUri, [UriKind]::Absolute, [ref]$parsed) -or
+            -not $parsed.Scheme.Equals('https', [StringComparison]::OrdinalIgnoreCase) -or
+            -not $parsed.DnsSafeHost.Equals('dev.azure.com', [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::IsNullOrEmpty($parsed.UserInfo) -or
+            -not [string]::IsNullOrEmpty($parsed.Fragment) -or
+            -not $parsed.IsDefaultPort) {
+            return $false
+        }
+
+        $match = [regex]::Match($ResourceUri,
+            '^(?i:https)://(?<authority>[^/?#]+)(?<path>/[^?#]*)\?(?<query>[^#]*)$',
+            [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+        if (-not $match.Success) { return $false }
+
+        $segments = [string[]]$match.Groups['path'].Value.Substring(1).Split(
+            [char[]]@('/'), [StringSplitOptions]::None)
+        if ($segments.Count -ne 7 -or
+            $segments[2] -cne '_apis' -or $segments[3] -cne 'git' -or
+            $segments[4] -cne 'repositories' -or $segments[6] -cne 'items') {
+            return $false
+        }
+        $organization = ConvertFrom-ReviewerCohortEntryUriComponent -Value $segments[0]
+        $project = ConvertFrom-ReviewerCohortEntryUriComponent -Value $segments[1]
+        $repositoryId = ConvertFrom-ReviewerCohortEntryUriComponent -Value $segments[5]
+        $plannedRepositoryId = [Guid]::Empty
+        if (-not [Guid]::TryParseExact([string]$arguments['repositoryId'], 'D', [ref]$plannedRepositoryId) -or
+            $organization -cne [string]$Read.Organization -or
+            $project -cne [string]$arguments['project'] -or
+            $repositoryId -cne $plannedRepositoryId.ToString('D')) {
+            return $false
+        }
+
+        $query = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+        $pairs = [string[]]$match.Groups['query'].Value.Split([char[]]@('&'), [StringSplitOptions]::None)
+        if ($pairs.Count -ne 3) { return $false }
+        foreach ($pair in $pairs) {
+            $equals = $pair.IndexOf([char]'=')
+            if ($equals -lt 1) { return $false }
+            $key = $pair.Substring(0, $equals)
+            if (@('path', 'versionDescriptor.version', 'versionDescriptor.versionType') -cnotcontains $key -or
+                $query.ContainsKey($key)) {
+                return $false
+            }
+            $query.Add($key, (ConvertFrom-ReviewerCohortEntryUriComponent -Value $pair.Substring($equals + 1)))
+        }
+        foreach ($key in @('path', 'versionDescriptor.version', 'versionDescriptor.versionType')) {
+            if (-not $query.ContainsKey($key)) { return $false }
+        }
+        $decodedPath = [string]$query['path']
+        if (-not $decodedPath.StartsWith('/', [StringComparison]::Ordinal) -or
+            $decodedPath.Contains('\') -or $decodedPath.Contains('//') -or $decodedPath.EndsWith('/', [StringComparison]::Ordinal) -or
+            @($decodedPath.Split('/') | Where-Object { $_ -ceq '.' -or $_ -ceq '..' }).Count -gt 0 -or
+            $decodedPath -cne [string]$arguments['path'] -or
+            [string]$query['versionDescriptor.version'] -cnotmatch '^[0-9A-Fa-f]{40}$' -or
+            [string]$query['versionDescriptor.version'] -cne [string]$arguments['version'] -or
+            [string]$query['versionDescriptor.versionType'] -cne 'Commit') {
+            return $false
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Copy-ReviewerCohortEntryResourceResultWithUri {
+    param(
+        [Parameter(Mandatory)]$ToolResult,
+        [Parameter(Mandatory)][string]$ResourceUri
+    )
+
+    $resourceCopy = [pscustomobject][ordered]@{}
+    foreach ($property in $ToolResult.content[0].resource.PSObject.Properties) {
+        $value = if ($property.Name -ceq 'uri') { $ResourceUri } else { $property.Value }
+        $resourceCopy | Add-Member -MemberType NoteProperty -Name $property.Name -Value $value
+    }
+    $itemCopy = [pscustomobject][ordered]@{}
+    foreach ($property in $ToolResult.content[0].PSObject.Properties) {
+        $value = if ($property.Name -ceq 'resource') { $resourceCopy } else { $property.Value }
+        $itemCopy | Add-Member -MemberType NoteProperty -Name $property.Name -Value $value
+    }
+    $resultCopy = [pscustomobject][ordered]@{}
+    foreach ($property in $ToolResult.PSObject.Properties) {
+        $value = if ($property.Name -ceq 'content') { [object[]]@($itemCopy) } else { $property.Value }
+        $resultCopy | Add-Member -MemberType NoteProperty -Name $property.Name -Value $value
+    }
+    return $resultCopy
+}
+
+function ConvertTo-ReviewerCohortEntryDecoderResourceResult {
+    <#
+    .SYNOPSIS
+        Normalizes only a request-bound Agency item URL to the historical bare
+        path expected by the unchanged strict embedded-resource decoder.
+    #>
+    param(
+        [Parameter(Mandatory)]$ToolResult,
+        [Parameter(Mandatory)]$Read
+    )
+
+    if ($ToolResult -isnot [System.Management.Automation.PSCustomObject] -or
+        -not $ToolResult.PSObject.Properties['content']) {
+        return $ToolResult
+    }
+    $content = @($ToolResult.content)
+    if ($content.Count -ne 1 -or $content[0] -isnot [System.Management.Automation.PSCustomObject] -or
+        -not $content[0].PSObject.Properties['resource'] -or
+        $content[0].resource -isnot [System.Management.Automation.PSCustomObject] -or
+        -not $content[0].resource.PSObject.Properties['uri'] -or
+        $content[0].resource.uri -isnot [string]) {
+        return $ToolResult
+    }
+    $answeredUri = [string]$content[0].resource.uri
+    if ($Read.PSObject.Properties['ResourceUri'] -and $answeredUri -ceq [string]$Read.ResourceUri) {
+        return $ToolResult
+    }
+    if (-not (Test-ReviewerCohortEntryCanonicalFileResourceUri -ResourceUri $answeredUri -Read $Read)) {
+        return $ToolResult
+    }
+    return (Copy-ReviewerCohortEntryResourceResultWithUri -ToolResult $ToolResult `
+            -ResourceUri ([string]$Read.ResourceUri))
+}
+
 function Get-ReviewerCohortEntryTextPayload {
     <#
     .SYNOPSIS
@@ -129,7 +295,8 @@ function Get-ReviewerCohortEntryResourcePayload {
     }
     $resource = $null
     try {
-        $resource = ConvertFrom-AgentMcpResourceContent -ToolResult $result -ExpectedUri $Read.ResourceUri `
+        $decoderResult = ConvertTo-ReviewerCohortEntryDecoderResourceResult -ToolResult $result -Read $Read
+        $resource = ConvertFrom-AgentMcpResourceContent -ToolResult $decoderResult -ExpectedUri $Read.ResourceUri `
             -MaxBytes $MaxBytes -AllowedMimeTypes @([string]$Read.MimeType)
     }
     catch {

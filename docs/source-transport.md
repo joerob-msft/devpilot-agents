@@ -23,6 +23,14 @@ does not: binary resource payloads are not inlined, so the model receives an
 > `PROBE_READABLE: no` — "The tool returned no output at all — empty result with
 > no content, no error message, and no text of any kind."
 
+Agency versions that wrap `repo_file get_content` under the canonical Azure
+DevOps item URL are normalized only at the cohort-entry capture boundary. The
+URL must bind exactly to the planned organization, project, repository GUID,
+path, commit, and `Commit` version type, with no additional query keys. Only a
+copied response's `resource.uri` is changed to the historical bare path before
+the unchanged strict decoder runs; raw evidence and corpus resource URIs are not
+rewritten.
+
 The remaining channel, the pull-request change-set tool with line content, is
 one enormous tool result: 1.6 MB for a ten-file change. Most of it never reaches
 the transcript, so coverage silently degrades to whatever fits.

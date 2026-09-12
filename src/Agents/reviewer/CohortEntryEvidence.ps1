@@ -1137,19 +1137,19 @@ function Get-ReviewerCohortEntryShortBranch {
 function Get-ReviewerCohortEntryResourceUri {
     <#
     .SYNOPSIS
-        The exact embedded-resource URI the wrapper answers for one repository
-        path.
+        The historical bare-path URI the decoder and replay corpus use for one
+        repository path.
 
     .DESCRIPTION
         It is the repository-relative path itself, unchanged. This looks like a
         function that does nothing, and that is the point: the natural mistake -
         made once already while building this - is to compose a synthetic
         'ado://<org>/<project>/<repoId><path>' URI, because that IS the form the
-        offline corpus-seal RECORD uses for provenance. The wrapper does not
-        answer under that URI, so every live embedded-resource read is refused at
-        CE304 while the reviewer, which passes the bare path as its expected URI
-        at every repo_file call site, reads the same bytes without complaint.
-        Naming the identity here keeps the two URIs from being confused again.
+        offline corpus-seal RECORD uses for provenance. Current Agency versions
+        answer live reads under a canonical Azure DevOps item URL, which the
+        package boundary validates against the planned request and copies to
+        this historical form before decoding. Naming the identity here keeps
+        the transport URL, decoder URI, and provenance URI distinct.
     #>
     param(
         [Parameter(Mandatory)][string]$Path
@@ -1170,6 +1170,7 @@ function New-ReviewerCohortEntryRead {
         [Parameter(Mandatory)][ValidateSet('mcpTextContent', 'mcpResourceContent')][string]$Envelope,
         [Parameter(Mandatory)][string]$PayloadFile,
         [Parameter(Mandatory)][string]$Role,
+        [AllowEmptyString()][string]$Organization = '',
         [AllowEmptyString()][string]$ResourceUri = '',
         [AllowEmptyString()][string]$MimeType = '',
         [AllowEmptyString()][string]$ProviderPath = '',
@@ -1182,6 +1183,7 @@ function New-ReviewerCohortEntryRead {
         Envelope = $Envelope
         PayloadFile = $PayloadFile
         Role = $Role
+        Organization = $Organization
         ResourceUri = $ResourceUri
         MimeType = $MimeType
         ProviderPath = $ProviderPath
@@ -1320,6 +1322,7 @@ function Get-ReviewerCohortEntryFileRead {
                 versionType = 'Commit'
                 version = $Commit
             }) -Envelope 'mcpResourceContent' -PayloadFile $PayloadFile `
+            -Organization ([string]$Request.Organization) `
             -ResourceUri (Get-ReviewerCohortEntryResourceUri -Path $ProviderPath) `
             -MimeType $MimeType -ProviderPath $ProviderPath)
 }
