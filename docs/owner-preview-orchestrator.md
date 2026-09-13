@@ -58,6 +58,7 @@ owner-v2-preview-state/
         records/
         evidence/
         observations/
+        telemetry/
         index/
         staging/
 ```
@@ -87,10 +88,17 @@ adapter. The orchestrator asserts `preview.writeAllowed = false`,
 `delivery.writeCount = 0`, and observation
 `effects.providerWrites/writeToolInvocations = 0`.
 
-Live declarations may be prepared so a pinned cohort can be reviewed, but this
-orchestrator still fails closed as `launcher-unavailable` before any provider
-or model call. The separate no-tools launcher is intentionally not wired into
-cohort execution in this layer.
+Live declarations remain off by default. `Invoke-OwnerV2PreviewRun` requires
+the host-only `-EnableLiveModel` switch plus an existing read-only acquisition
+provider. The manifest-derived contract constructs the production acquisition
+adapter; the wrapper carries the model id and credential environment name, so
+repository data cannot enable launch. It reuses the Copilot provider, preflight,
+bounded real runner, and fake-provider seam with bounded argv, `effectiveTools:
+[]`, fresh isolation, strict environment allowlisting, disabled ambient
+features, deadlines/output caps/process containment, and zero writes. Live
+acquisition retains the qualified 64-file/16 MiB/128-read cap. Telemetry is
+persisted and bound into observations; preflight failures remain truthful and
+completed records immutable. No delivery adapter or authorization is added.
 
 ## Next convergence layer
 
@@ -107,6 +115,5 @@ It must enforce the eight recorded parity gates:
 7. deterministic observation/index digest parity; and
 8. stale lease/retry/idempotency parity.
 
-Do not copy, cherry-pick, or depend on PR128 in this layer. Writer
-compatibility, live model enablement, production scheduling, and cutover remain
-later gates.
+Writer compatibility, scheduled-task registration, production deployment,
+notifications, comments, votes, summaries, and cutover remain separate gates.
