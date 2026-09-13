@@ -101,35 +101,31 @@ semantic model call from an observation path.
 The current [sanitized aggregate](owner-parity-summary.json) executes the four
 entries with exact evidence using the PR140 supported CLI launcher and the
 same `claude-sonnet-5` identity observed in v1. The fifth entry remains
-unavailable. The six eligible units made 12 bounded process attempts; every
-attempt exited with no valid semantic response marker. Model calls and starts
-therefore remain unavailable rather than being inferred from process starts.
-The two clean or advisory-only entries completed without a model call.
+unavailable. The six eligible units each made one bounded model call and
+returned one valid semantic response marker. The two clean or advisory-only
+entries completed without a model call.
 
-Every call retained `effectiveTools: []`, `providerWrites: 0`, and
-`writeToolInvocations: 0`. No candidate finding was produced: 0 of 6 verified
-v1 method findings are semantically retained, but the 6 are unavailable rather
-than conclusively lost because candidate findings are incomplete. Zero
-observed false positives covers only two entries and is not an aggregate pass.
-The 229,575 ms of v2 attempt latency is not comparable to completed v1 latency
-because no eligible v2 unit produced semantic output.
+All six calls retained `effectiveTools: []`, `providerWrites: 0`, and
+`writeToolInvocations: 0`. All 6 verified v1 method findings are semantically
+retained, with no eligible false positives across the four measured entries.
+The six calls completed in 132,078 ms. The unavailable fifth entry still
+prevents an aggregate pass even though the measured semantic cohort completed.
 
 | Gate | Result | Evidence |
 |---|---|---|
-| Finding retention | `blocked` | 6 verified findings measured; all 6 lack complete semantic candidate evidence |
-| Eligible false positives | `blocked` | 0 observed only across 2 measured entries; 3 entries remain unmeasured |
-| Binding equivalence | `blocked` | 36 canonical comparisons pass; the unavailable entry remains blocked |
-| Unknown integrity | `blocked` | 15 outcomes measured and 18 remain blocked or incomplete |
+| Finding retention | `blocked` | All 6 verified findings are retained; the unavailable entry remains blocked |
+| Eligible false positives | `blocked` | 0 observed across 4 measured entries; 1 entry remains unmeasured |
+| Binding equivalence | `blocked` | 38 canonical comparisons pass; the unavailable entry remains blocked |
+| Unknown integrity | `blocked` | 15 outcomes measured and 16 remain blocked or incomplete |
 | Write isolation | `blocked` | Four observations prove zero writes; the unavailable entry remains blocked |
-| Completion reliability | `failed` | v1 completed 4 of 5 entries; v2 completed 2 of 5 |
+| Completion reliability | `blocked` | v1 and v2 each completed 4 of 5 entries; the fifth entry remains unavailable |
 | Latency accounting | `blocked` | 96 measurement states are explicit; 12 remain blocked |
 | Rollback proof | `passed` | 3,260 critical files remained byte-identical and the declared volatile log stayed prefix-preserving and append-only |
 
-Prospective parity failed. The evidence does not justify an operator-approved
+Prospective parity remains blocked. The evidence does not justify an operator-approved
 canary, cutover, writer compatibility, deployment, or any provider write.
 
-These deterministic contracts make the next semantic parity run measurable;
-they do not support cutover, deployment changes, or writer compatibility. The
-separate no-tools launcher remains unavailable at the confidential prompt
-transport gate; a later layer must first resolve that blocker and then run it
-against independently adjudicated semantic evidence.
+The no-tools launcher now produces valid, bound semantic responses. The
+remaining blocker is the unavailable fifth evidence entry; all eight gates
+must pass before canary authorization, cutover, deployment changes, or writer
+compatibility.

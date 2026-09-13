@@ -760,6 +760,10 @@ function Assert-OwnerModelPathIsNotLink {
     }
 }
 
+function New-OwnerModelDirectoryToken {
+    return ConvertTo-OwnerModelBase64Url -Bytes ([guid]::NewGuid().ToByteArray())
+}
+
 function New-OwnerModelPrivateLaunchRoot {
     param([Parameter(Mandatory)][string]$BasePath)
     $absoluteBase = [IO.Path]::GetFullPath($BasePath)
@@ -771,7 +775,7 @@ function New-OwnerModelPrivateLaunchRoot {
         New-Item -ItemType Directory -Path $absoluteBase -Force | Out-Null
     }
     Assert-OwnerModelPathIsNotLink -Path $absoluteBase
-    $privateRoot = Join-Path $absoluteBase ([guid]::NewGuid().ToString('N'))
+    $privateRoot = Join-Path $absoluteBase (New-OwnerModelDirectoryToken)
     [void][IO.Directory]::CreateDirectory($privateRoot)
     Assert-OwnerModelPathIsNotLink -Path $privateRoot
     if (-not $IsWindows) {
@@ -1056,7 +1060,14 @@ function New-OwnerModelAttemptDirectory {
         }
     }
     Assert-OwnerModelPathIsNotLink -Path $Provider.LaunchRoot
-    $directory = Join-Path $Provider.LaunchRoot ([guid]::NewGuid().ToString('N'))
+    $directory = Join-Path $Provider.LaunchRoot (New-OwnerModelDirectoryToken)
+    if ($IsWindows) {
+        $sessionDatabaseJournalPath = Join-Path $directory (
+            'home\session-state\' + ('0' * 36) + '\session.db-journal')
+        if ($sessionDatabaseJournalPath.Length -gt 259) {
+            throw '[owner-model-launch-unavailable] Model launch root is too long for isolated Copilot session state.'
+        }
+    }
     [void][IO.Directory]::CreateDirectory($directory)
     Assert-OwnerModelPathIsNotLink -Path $directory
     if (-not $IsWindows) {
@@ -1726,8 +1737,9 @@ function Test-OwnerModelProviderPreflight {
         Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
         return $result
     }
-    $attemptDirectory = New-OwnerModelAttemptDirectory -Provider $Provider
+    $attemptDirectory = $null
     try {
+        $attemptDirectory = New-OwnerModelAttemptDirectory -Provider $Provider
         $executablePath = Copy-OwnerModelPinnedExecutable -Provider $Provider `
             -AttemptDirectory $attemptDirectory
         $credential = [Environment]::GetEnvironmentVariable(
@@ -1838,7 +1850,8 @@ function Test-OwnerModelProviderPreflight {
         }
     }
     finally {
-        if (Test-Path -LiteralPath $attemptDirectory -PathType Container) {
+        if ($attemptDirectory -and
+            (Test-Path -LiteralPath $attemptDirectory -PathType Container)) {
             Remove-Item -LiteralPath $attemptDirectory -Recurse -Force
         }
         Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
