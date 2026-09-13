@@ -14,7 +14,18 @@ param(
 
     [int]$MaxAttempts = 3,
 
-    [int]$LeaseSeconds = 300
+    [int]$LeaseSeconds = 300,
+
+    [switch]$EnableLiveModel,
+
+    [string]$LiveModel,
+
+    [ValidateSet('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')]
+    [string]$LiveCredentialEnvironmentName,
+
+    [AllowNull()][object]$LiveAcquisitionProvider,
+
+    [AllowNull()][object]$LiveModelProvider
 )
 
 Set-StrictMode -Version Latest
@@ -29,6 +40,17 @@ if (-not [IO.Path]::IsPathFullyQualified($ManifestPath)) {
 
 Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1" -Force
 
+$liveArguments = @{}
+if ($EnableLiveModel) { $liveArguments.EnableLiveModel = $true }
+if (-not [string]::IsNullOrWhiteSpace($LiveModel)) { $liveArguments.LiveModel = $LiveModel }
+if (-not [string]::IsNullOrWhiteSpace($LiveCredentialEnvironmentName)) {
+    $liveArguments.LiveCredentialEnvironmentName = $LiveCredentialEnvironmentName
+}
+if ($null -ne $LiveAcquisitionProvider) {
+    $liveArguments.LiveAcquisitionProvider = $LiveAcquisitionProvider
+}
+if ($null -ne $LiveModelProvider) { $liveArguments.LiveModelProvider = $LiveModelProvider }
+
 switch ($Command) {
     'prepare' {
         Invoke-OwnerV2PreviewPrepare -StateRoot $StateRoot -ManifestPath $ManifestPath `
@@ -36,13 +58,13 @@ switch ($Command) {
     }
     'run' {
         Invoke-OwnerV2PreviewRun -StateRoot $StateRoot -ManifestPath $ManifestPath `
-            -LeaseSeconds $LeaseSeconds
+            -LeaseSeconds $LeaseSeconds @liveArguments
     }
     'prepare-run' {
         [void](Invoke-OwnerV2PreviewPrepare -StateRoot $StateRoot -ManifestPath $ManifestPath `
                 -MaxAttempts $MaxAttempts)
         Invoke-OwnerV2PreviewRun -StateRoot $StateRoot -ManifestPath $ManifestPath `
-            -LeaseSeconds $LeaseSeconds
+            -LeaseSeconds $LeaseSeconds @liveArguments
     }
     'status' {
         Get-OwnerV2PreviewStatus -StateRoot $StateRoot -ManifestPath $ManifestPath

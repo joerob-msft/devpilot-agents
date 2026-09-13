@@ -355,7 +355,7 @@ function Get-OwnerV2CapabilityRoot {
 
 function Initialize-OwnerV2CapabilityRoot {
     param([Parameter(Mandatory)][string]$CapabilityRoot)
-    foreach ($leaf in @('declarations', 'records', 'evidence', 'observations', 'index', 'staging')) {
+    foreach ($leaf in @('declarations', 'records', 'evidence', 'observations', 'telemetry', 'index', 'staging')) {
         $path = Join-Path $CapabilityRoot $leaf
         if (-not (Test-Path -LiteralPath $path -PathType Container)) {
             New-Item -ItemType Directory -Path $path -Force | Out-Null
@@ -438,6 +438,11 @@ function Get-OwnerV2ObservationPath {
     return Join-Path (Join-Path $CapabilityRoot 'observations') "$Identity.json"
 }
 
+function Get-OwnerV2TelemetryPath {
+    param([Parameter(Mandatory)][string]$CapabilityRoot, [Parameter(Mandatory)][string]$Identity)
+    return Join-Path (Join-Path $CapabilityRoot 'telemetry') "$Identity.json"
+}
+
 function Assert-OwnerV2Record {
     param([Parameter(Mandatory)][Collections.IDictionary]$Record)
     Assert-OwnerV2NoUnsafeShape -Value $Record
@@ -464,6 +469,12 @@ function Assert-OwnerV2Record {
 
 function New-OwnerV2AcquisitionContract {
     param([Parameter(Mandatory)][Collections.IDictionary]$Entry)
+    $limits = if ([string]$Entry.mode -ceq 'live') {
+        New-OwnerAdapterLimits -MaximumFiles 64 -MaximumBytes 16777216 -MaximumReads 128
+    }
+    else {
+        New-OwnerAdapterLimits
+    }
     return New-OwnerAcquisitionContract `
         -RepositoryId ([string]$Entry.subject.repositoryId) `
         -ProjectId ([string]$Entry.subject.projectId) `
@@ -480,7 +491,8 @@ function New-OwnerV2AcquisitionContract {
         -ConfigId ([string]$Entry.config.id) `
         -ConfigDigest ([string]$Entry.config.digest) `
         -CapabilityId ([string]$Entry.capability.id) `
-        -CapabilityDigest ([string]$Entry.capability.digest)
+        -CapabilityDigest ([string]$Entry.capability.digest) `
+        -Limits $limits
 }
 
 function ConvertTo-OwnerV2ModelReplayRecord {
@@ -844,12 +856,139 @@ function Invoke-OwnerV2Replay {
     }
 }
 
+function New-OwnerV2PersistedTelemetry {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Telemetry,
+        [Parameter(Mandatory)][object]$Preflight
+    )
+    $persisted = [ordered]@{}
+    foreach ($key in @($Telemetry.Keys)) { $persisted[[string]$key] = $Telemetry[$key] }
+    $persisted['writeToolInvocations'] = 0
+    $persisted['acceptedArgvRisk'] = [ordered]@{
+        explicitlyEnabled = $true
+        accepted = [string]$Preflight.promptTransport -ceq 'argv' -and
+            [bool]$Preflight.localProcessMetadataExposure
+        promptTransport = [string]$Preflight.promptTransport
+        localProcessMetadataExposure = [bool]$Preflight.localProcessMetadataExposure
+        risk = [string]$Preflight.risk
+    }
+    return $persisted
+}
+
+function New-OwnerV2PreflightTelemetry {
+    param(
+        [Parameter(Mandatory)][object]$Preflight,
+        [Parameter(Mandatory)][string]$Reason
+    )
+    return New-OwnerV2PersistedTelemetry -Preflight $Preflight -Telemetry ([ordered]@{
+            attempts = 0
+            modelStarts = 0
+            modelCalls = 0
+            modelStartsMinimum = 0
+            latencyMs = 0
+            refusalReason = $Reason
+            providerWrites = 0
+            effectiveTools = @($Preflight.effectiveTools)
+            provider = [ordered]@{
+                kind = 'copilot-cli'
+                modelIdentity = [string]$Preflight.modelIdentity
+                promptTransport = [string]$Preflight.promptTransport
+                localProcessMetadataExposure = [bool]$Preflight.localProcessMetadataExposure
+            }
+            policy = [ordered]@{
+                availableTools = @($Preflight.effectiveTools)
+                providerWrite = $false
+            }
+            records = @()
+        })
+}
+
+function New-OwnerV2LiveOutcome {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][string]$Reason,
+        [AllowNull()][object]$Telemetry
+    )
+    return [pscustomobject][ordered]@{
+        Observation = New-OwnerV2LiveUnavailableObservation -Entry $Entry -Reason $Reason
+        Telemetry = $Telemetry
+        State = 'incomplete'
+        Reason = $Reason
+    }
+}
+
+function Invoke-OwnerV2Live {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][bool]$EnableLiveModel,
+        [AllowNull()][object]$AcquisitionProvider,
+        [AllowNull()][object]$ModelProvider,
+        [AllowNull()][string]$Model,
+        [AllowNull()][string]$CredentialEnvironmentName
+    )
+    if (-not $EnableLiveModel) {
+        return New-OwnerV2LiveOutcome -Entry $Entry -Reason 'live-model-disabled'
+    }
+    if ($null -eq $AcquisitionProvider) {
+        return New-OwnerV2LiveOutcome -Entry $Entry -Reason 'acquisition-provider-unavailable'
+    }
+
+    $provider = $ModelProvider
+    if ($null -eq $provider) {
+        if ([string]::IsNullOrWhiteSpace($Model) -or
+            [string]::IsNullOrWhiteSpace($CredentialEnvironmentName)) {
+            return New-OwnerV2LiveOutcome -Entry $Entry `
+                -Reason 'live-model-configuration-missing'
+        }
+        $provider = New-OwnerCopilotCliModelProvider -Model $Model `
+            -CredentialEnvironmentName $CredentialEnvironmentName
+    }
+    $preflight = Test-OwnerModelProviderPreflight -Provider $provider
+    if ([string]$preflight.modelIdentity -cne [string]$Entry.Declaration.model.id) {
+        return New-OwnerV2LiveOutcome -Entry $Entry -Reason 'model-binding-mismatch'
+    }
+    if (-not [bool]$preflight.available) {
+        $reason = [string]$preflight.reason
+        return New-OwnerV2LiveOutcome -Entry $Entry -Reason $reason `
+            -Telemetry (New-OwnerV2PreflightTelemetry -Preflight $preflight -Reason $reason)
+    }
+
+    $runner = New-OwnerModelProcessRunner -Provider $provider `
+        -Limits (New-OwnerModelRunnerLimits -MaximumAttemptsPerUnit 1) `
+        -EnableRealLaunch
+    $acquisition = New-OwnerProductionAcquisitionAdapter `
+        -Contract $Entry.Contract -Provider $AcquisitionProvider
+    $capability = New-OwnerV2CapabilityAdapter -Runner $runner `
+        -CapabilityId ([string]$Entry.Declaration.capability.id) `
+        -CapabilityDigest ([string]$Entry.Declaration.capability.digest)
+    $result = Invoke-OwnerReviewPipeline -Binding $Entry.Contract.Binding `
+        -AcquisitionAdapter $acquisition -CapabilityAdapter $capability
+    $observation = ConvertTo-OwnerV2Observation -PipelineResult $result -Runner $runner `
+        -ImplementationId 'owner-v2-preview-orchestrator' -ImplementationVersion '0.3.0'
+    Assert-OwnerV2PipelineNoWrites -PipelineResult $result -Observation $observation
+    $telemetry = New-OwnerV2PersistedTelemetry `
+        -Telemetry (Get-OwnerModelRunnerTelemetry -Runner $runner) `
+        -Preflight $preflight
+    $state = if ([string]$observation.lifecycle.status -ceq 'completed') { 'completed' }
+    elseif ([string]$observation.lifecycle.status -ceq 'incomplete') { 'incomplete' }
+    else { 'unknown' }
+    return [pscustomobject][ordered]@{
+        Observation = $observation
+        Telemetry = $telemetry
+        State = $state
+        Reason = [string]$observation.execution.incompleteReason
+    }
+}
+
 function New-OwnerV2LiveUnavailableObservation {
-    param([Parameter(Mandatory)][object]$Entry)
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][string]$Reason
+    )
     $observation = [ordered]@{
         schemaVersion = 2
         kind = 'owner-observation'
-        implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.2.0' }
+        implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.3.0' }
         capability = [string]$Entry.Declaration.capability.id
         subject = [ordered]@{
             pullRequestId = [long]$Entry.Declaration.subject.pullRequestId
@@ -883,11 +1022,11 @@ function New-OwnerV2LiveUnavailableObservation {
         findingsComplete = $false
         findings = @()
         execution = [ordered]@{
-            attempts = 'unknown'
-            modelStarts = 'unknown'
-            latencyMs = 'unknown'
-            refusalReason = 'launcher-unavailable'
-            incompleteReason = 'launcher-unavailable'
+            attempts = 0
+            modelStarts = 0
+            latencyMs = 0
+            refusalReason = $Reason
+            incompleteReason = $Reason
         }
         effects = [ordered]@{
             providerWrites = 0
@@ -905,9 +1044,9 @@ function New-OwnerV2LiveUnavailableObservation {
                 uncovered = New-OwnerMeasurement -Status measured -Value 1
             }
             execution = [ordered]@{
-                attempts = New-OwnerMeasurement -Status unavailable -Reason 'launcher-unavailable'
-                modelStarts = New-OwnerMeasurement -Status unavailable -Reason 'launcher-unavailable'
-                latencyMs = New-OwnerMeasurement -Status unavailable -Reason 'launcher-unavailable'
+                attempts = New-OwnerMeasurement -Status measured -Value 0
+                modelStarts = New-OwnerMeasurement -Status measured -Value 0
+                latencyMs = New-OwnerMeasurement -Status measured -Value 0
             }
             effects = [ordered]@{
                 providerWrites = New-OwnerMeasurement -Status measured -Value 0
@@ -922,7 +1061,7 @@ function New-OwnerV2LiveUnavailableObservation {
                 signature = 'not-applicable'
             }
         )
-        validationErrors = @('launcher-unavailable: live Owner v2 preview has no production-safe launcher')
+        validationErrors = @("$Reason`: live Owner v2 preview did not start a model")
     }
     $observationJson = $observation | ConvertTo-Json -Depth 64 -Compress
     if (-not (Test-Json -Json $observationJson `
@@ -996,7 +1135,13 @@ function Invoke-OwnerV2PreviewRun {
     param(
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][string]$ManifestPath,
-        [int]$LeaseSeconds = 300
+        [int]$LeaseSeconds = 300,
+        [switch]$EnableLiveModel,
+        [AllowNull()][object]$LiveAcquisitionProvider,
+        [AllowNull()][object]$LiveModelProvider,
+        [AllowNull()][string]$LiveModel,
+        [ValidateSet('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')]
+        [AllowNull()][string]$LiveCredentialEnvironmentName
     )
     if ($LeaseSeconds -lt 1 -or $LeaseSeconds -gt 86400) { throw 'LeaseSeconds must be between 1 and 86400.' }
     $resolvedStateRoot = Resolve-OwnerV2StateRoot -StateRoot $StateRoot -Create
@@ -1013,6 +1158,7 @@ function Invoke-OwnerV2PreviewRun {
         $identity = $entry.Identity
         $recordPath = Get-OwnerV2RecordPath -CapabilityRoot $capabilityRoot -Identity $identity
         $observationPath = Get-OwnerV2ObservationPath -CapabilityRoot $capabilityRoot -Identity $identity
+        $telemetryPath = Get-OwnerV2TelemetryPath -CapabilityRoot $capabilityRoot -Identity $identity
         $reserved = $false
         $reservationId = $null
         $record = $null
@@ -1071,6 +1217,7 @@ function Invoke-OwnerV2PreviewRun {
 
         $outcome = $null
         $observation = $null
+        $telemetry = $null
         $finalState = 'unknown'
         $reason = $null
         try {
@@ -1092,9 +1239,16 @@ function Invoke-OwnerV2PreviewRun {
                 throw 'Declaration digest did not match the manifest entry.'
             }
             if ([string]$entry.Declaration.mode -ceq 'live') {
-                $observation = New-OwnerV2LiveUnavailableObservation -Entry $entry
-                $finalState = 'incomplete'
-                $reason = 'launcher-unavailable'
+                $outcome = Invoke-OwnerV2Live -Entry $entry `
+                    -EnableLiveModel ([bool]$EnableLiveModel) `
+                    -AcquisitionProvider $LiveAcquisitionProvider `
+                    -ModelProvider $LiveModelProvider `
+                    -Model $LiveModel `
+                    -CredentialEnvironmentName $LiveCredentialEnvironmentName
+                $observation = $outcome.Observation
+                $telemetry = $outcome.Telemetry
+                $finalState = [string]$outcome.State
+                $reason = [string]$outcome.Reason
             }
             else {
                 if ([string]$evidence.acquisitionPayloadDigest -cne [string]$entry.Declaration.acquisitionPayloadDigest) {
@@ -1110,13 +1264,20 @@ function Invoke-OwnerV2PreviewRun {
             }
         }
         catch {
-            $observation = New-OwnerV2LiveUnavailableObservation -Entry $entry
+            $observation = New-OwnerV2LiveUnavailableObservation -Entry $entry `
+                -Reason 'orchestrator-refusal'
             $observation.lifecycle.status = 'unknown'
             $observation.execution.attempts = [int]$record.attempts
+            $observation.execution.modelStarts = 'unknown'
+            $observation.execution.latencyMs = 'unknown'
             $observation.execution.refusalReason = 'orchestrator-refusal'
             $observation.execution.incompleteReason = 'orchestrator-refusal'
             $observation.measurements.execution.attempts =
                 New-OwnerMeasurement -Status measured -Value ([int]$record.attempts)
+            $observation.measurements.execution.modelStarts =
+                New-OwnerMeasurement -Status unavailable -Reason 'orchestrator-refusal'
+            $observation.measurements.execution.latencyMs =
+                New-OwnerMeasurement -Status unavailable -Reason 'orchestrator-refusal'
             $observation.validationErrors = @([string]$_.Exception.Message)
             $finalState = 'unknown'
             $reason = 'orchestrator-refusal'
@@ -1139,6 +1300,19 @@ function Invoke-OwnerV2PreviewRun {
                     })
                 continue
             }
+            if ($null -ne $telemetry) {
+                [void](Write-OwnerV2AtomicJson -Path $telemetryPath -Value $telemetry)
+                $telemetrySha = ([Convert]::ToHexString(
+                        [Security.Cryptography.SHA256]::HashData(
+                            [IO.File]::ReadAllBytes($telemetryPath)))).ToLowerInvariant()
+                $observation.sourceArtifacts = @($observation.sourceArtifacts) + @(
+                    [ordered]@{
+                        kind = 'owner-model-runner-telemetry'
+                        sha256 = $telemetrySha
+                        signature = 'not-applicable'
+                    }
+                )
+            }
             [void](Write-OwnerV2AtomicJson -Path $observationPath -Value $observation)
             $record.state = $finalState
             $record.lease = $null
@@ -1153,6 +1327,7 @@ function Invoke-OwnerV2PreviewRun {
                     attempts = [int]$record.attempts
                     resultDigest = [string]$record.resultDigest
                     reason = $reason
+                    telemetryPath = $(if ($null -ne $telemetry) { $telemetryPath } else { $null })
                 })
         }
         finally {
