@@ -82,6 +82,10 @@ person-specific lives in this repo outside `samples/` — a CI check enforces th
 
 The independent [Owner observer](docs/owner-observer.md) reads sanitized local
 v1 or future v2 artifacts into one normalized, zero-write parity contract.
+The [Owner parity qualification layer](docs/owner-parity-qualification.md)
+executes replay candidates in a separate state root, evaluates eight explicit
+gates, proves the frozen v1 tree stayed unchanged, and emits only a sanitized
+aggregate artifact for source control.
 
 ---
 

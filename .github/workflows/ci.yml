@@ -188,6 +188,7 @@ jobs:
             './tests/OwnerCapability.Tests.ps1',
             './tests/OwnerModelRunner.Tests.ps1',
             './tests/OwnerOrchestrator.Tests.ps1',
+            './tests/OwnerParity.Tests.ps1',
             './tests/OwnerPipeline.Tests.ps1',
             './tests/ReviewHandler.Resume.Tests.ps1',
             './tests/ReviewerOutput.Tests.ps1'

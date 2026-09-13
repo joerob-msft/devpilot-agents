@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "kind": "owner-parity-sanitized-summary",
+  "scope": "retrospective-offline",
+  "sample": {
+    "entries": 5,
+    "baselineCompleted": 4,
+    "candidateCompleted": 2,
+    "candidateCompletionUnknown": 2,
+    "verifiedMethodFindings": 6,
+    "retainedMethodFindings": 0,
+    "retentionUnmeasured": 6,
+    "structuralMethodMatches": 6,
+    "candidateViolations": 6,
+    "eligibleFalsePositives": 0
+  },
+  "gates": [
+    {
+      "name": "findingRetention",
+      "status": "blocked",
+      "evidenceCode": "mixed-cohort-evidence",
+      "measured": 6,
+      "failures": 0,
+      "blocked": 7
+    },
+    {
+      "name": "eligibleFalsePositives",
+      "status": "blocked",
+      "evidenceCode": "mixed-cohort-evidence",
+      "measured": 6,
+      "failures": 0,
+      "blocked": 5
+    },
+    {
+      "name": "bindingEquivalence",
+      "status": "failed",
+      "evidenceCode": "mixed-cohort-evidence",
+      "measured": 32,
+      "failures": 9,
+      "blocked": 3
+    },
+    {
+      "name": "unknownIntegrity",
+      "status": "blocked",
+      "evidenceCode": "mixed-cohort-evidence",
+      "measured": 12,
+      "failures": 0,
+      "blocked": 16
+    },
+    {
+      "name": "writeIsolation",
+      "status": "blocked",
+      "evidenceCode": "mixed-cohort-evidence",
+      "measured": 4,
+      "failures": 0,
+      "blocked": 3
+    },
+    {
+      "name": "latencyAccounting",
+      "status": "blocked",
+      "evidenceCode": "mixed-cohort-evidence",
+      "measured": 16,
+      "failures": 0,
+      "blocked": 12
+    },
+    {
+      "name": "completionReliability",
+      "status": "blocked",
+      "evidenceCode": "completion-or-retention-unavailable",
+      "measured": 3,
+      "failures": 0,
+      "blocked": 5
+    },
+    {
+      "name": "rollbackProof",
+      "status": "failed",
+      "evidenceCode": "v1-root-snapshot-changed",
+      "measured": 4,
+      "failures": 1,
+      "blocked": 0
+    }
+  ],
+  "prospectiveRealModel": {
+    "status": "blocked",
+    "evidenceCode": "safe-real-model-launcher-unavailable"
+  },
+  "rollback": {
+    "unchanged": false,
+    "differingFields": 6
+  }
+}
