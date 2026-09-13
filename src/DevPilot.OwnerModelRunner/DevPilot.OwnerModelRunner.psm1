@@ -128,16 +128,16 @@ $script:NoncePattern = '^[0-9a-f]{36}$'
 $script:ExecutionUnitPattern = '^unit:[0-9a-f]{64}$'
 $script:Judgments = @('compliant', 'violation', 'unknown')
 $script:CopilotCliMinimumVersion = [version]'1.0.79'
-$script:CopilotCliInvocationContract = 'github-copilot-cli-acp-no-tools-v1'
-$script:CopilotCliInvocationVersion = '2'
+$script:CopilotCliInvocationContract = 'github-copilot-cli-prompt-no-tools-v1'
+$script:CopilotCliInvocationVersion = '3'
 $script:CopilotCliCredentialNames = @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')
 $script:CopilotCliNoToolsSentinel = '__devpilot_no_such_tool_7f2c17a64a3e4d6b__'
+$script:CopilotCliMaximumPromptBytes = 12288
 $script:CopilotCliArguments = @(
-    '--acp',
-    '--stdio',
     '--no-ask-user',
     '--disallow-temp-dir',
     "--available-tools=$script:CopilotCliNoToolsSentinel",
+    '--allow-all-tools',
     '--disable-builtin-mcps',
     '--no-custom-instructions',
     '--no-remote',
@@ -498,9 +498,12 @@ function Get-OwnerModelTelemetrySnapshot {
     return [ordered]@{
         attempts = $records.Count
         modelStarts = $modelStarts
+        modelCalls = $modelStarts
         modelStartsMinimum = @($records | Where-Object { $_.modelStarted -eq $true }).Count
         latencyMs = $latency
         refusalReason = if ($failures.Count -eq 0) { 'none' } else { [string]$failures[-1] }
+        providerWrites = 0
+        effectiveTools = @()
         provider = $State.Provider
         policy = $State.Policy
         records = @(
@@ -1136,28 +1139,80 @@ function Get-OwnerModelPolicyEnvironmentNames {
     return @($names | Sort-Object -Unique)
 }
 
+function New-OwnerCopilotPrompt {
+    param([Parameter(Mandatory)][string]$EnvelopeBase64)
+
+    try {
+        $stimulusBytes = ConvertFrom-OwnerModelBase64Url -Text $EnvelopeBase64
+        $stimulusJson = [Text.UTF8Encoding]::new($false, $true).GetString($stimulusBytes)
+    }
+    catch {
+        throw '[owner-model-prompt-invalid] Bounded stimulus encoding was invalid.'
+    }
+    $prompt = @"
+You are a judgment-only evaluator with no tools or external context. Evaluate exactly the bounded Owner semantic stimulus below. Determine whether stimulus.construct complies with stimulus.rule.content.
+
+Return exactly one single-line response and no other text:
+DEV_PILOT_OWNER_RESULT_JSON {"schemaVersion":2,"nonce":"<copy exactly>","inputDigest":"<copy exactly>","subjectBinding":"<copy exactly>","modelIdentity":"<copy exactly>","responses":[{"executionUnitId":"<copy stimulus.executionUnitId exactly>","judgment":"compliant|violation|unknown"}]}
+
+Copy all binding values exactly from the input. Use "unknown" when the bounded stimulus is insufficient. Do not use Markdown. Do not add keys. An optional single-line "rationale" of at most 512 characters may be added to the response item.
+
+BOUNDED_STIMULUS_JSON
+$stimulusJson
+"@
+    $promptBytes = [Text.Encoding]::UTF8.GetBytes($prompt)
+    if ($promptBytes.Length -gt $script:CopilotCliMaximumPromptBytes) {
+        throw '[owner-model-prompt-invalid] Bounded prompt byte limit exceeded.'
+    }
+    foreach ($name in $script:CopilotCliCredentialNames) {
+        $credential = [Environment]::GetEnvironmentVariable($name)
+        if (-not [string]::IsNullOrEmpty($credential) -and
+            $prompt.Contains($credential, [StringComparison]::Ordinal)) {
+            throw '[owner-model-prompt-invalid] Bounded prompt contained a provider credential.'
+        }
+    }
+    if ($prompt -cmatch '(?<![A-Za-z0-9_])(?:github_pat_|gh[pous]_)[A-Za-z0-9_]{8,}') {
+        throw '[owner-model-prompt-invalid] Bounded prompt contained credential-shaped text.'
+    }
+    return $prompt
+}
+
 function New-OwnerModelInvocation {
     param(
         [Parameter(Mandatory)][object]$Provider,
         [Parameter(Mandatory)][string]$EnvelopeBase64,
         [Parameter(Mandatory)][string]$AttemptDirectory,
+        [string]$ExecutablePath = [string]$Provider.FilePath,
         [switch]$IncludeCredential
     )
     Assert-OwnerModelProvider -Provider $Provider
     if ($Provider.Kind -ceq 'copilot-cli') {
-        throw '[owner-model-launch-unavailable] copilot-cli-acp-confidentiality-unproven'
+        $prompt = New-OwnerCopilotPrompt -EnvelopeBase64 $EnvelopeBase64
+        $arguments = @($Provider.ArgumentPrefix) + @(
+            '--model', [string]$Provider.ModelIdentity,
+            '--prompt', $prompt
+        )
+        $normalizedArguments = @($Provider.ArgumentPrefix) + @(
+            '--model', [string]$Provider.ModelIdentity,
+            '--prompt', '<bounded-prompt>'
+        )
+        $workingDirectoryPolicy = 'fresh-isolated-empty-directory'
     }
-    $stimulusPath = Join-Path $AttemptDirectory 'bounded-stimulus.b64'
-    [IO.File]::WriteAllText(
-        $stimulusPath,
-        $EnvelopeBase64,
-        [Text.UTF8Encoding]::new($false))
-    if (-not $IsWindows) {
-        [IO.File]::SetUnixFileMode(
+    else {
+        $stimulusPath = Join-Path $AttemptDirectory 'bounded-stimulus.b64'
+        [IO.File]::WriteAllText(
             $stimulusPath,
-            [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+            $EnvelopeBase64,
+            [Text.UTF8Encoding]::new($false))
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode(
+                $stimulusPath,
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        $arguments = @($Provider.ArgumentPrefix) + @($stimulusPath)
+        $normalizedArguments = @($Provider.ArgumentPrefix) + @('bounded-stimulus.b64')
+        $workingDirectoryPolicy = 'fresh-isolated-directory-with-bounded-stimulus'
     }
-    $arguments = @($Provider.ArgumentPrefix) + @($stimulusPath)
     $environment = Get-OwnerModelProcessEnvironment -Provider $Provider `
         -AttemptDirectory $AttemptDirectory -IncludeCredential:$IncludeCredential
     $safeEnvironmentNames = @($environment.Keys | ForEach-Object { [string]$_ } | Sort-Object)
@@ -1166,18 +1221,18 @@ function New-OwnerModelInvocation {
         throw 'Owner model invocation environment did not match the code-defined allowlist.'
     }
     return [pscustomobject][ordered]@{
-        FilePath = [string]$Provider.FilePath
+        FilePath = [IO.Path]::GetFullPath($ExecutablePath)
         ArgumentList = @($arguments)
         Environment = $environment
         EnvironmentNames = $safeEnvironmentNames
         WorkingDirectory = $AttemptDirectory
         InvocationDigest = 'v1:sha256:' + (Get-AgentCanonicalDigest -InputObject ([ordered]@{
                     fileSha256 = 'v1:sha256:' + [string]$Provider.ExecutableSha256
-                    arguments = @($Provider.ArgumentPrefix) + @('bounded-stimulus.b64')
+                    arguments = $normalizedArguments
                     stimulusDigest = Get-OwnerModelBytesDigest -Bytes (
                         [Text.Encoding]::UTF8.GetBytes($EnvelopeBase64))
                     environmentNames = $safeEnvironmentNames
-                    workingDirectoryPolicy = 'fresh-isolated-directory-with-bounded-stimulus'
+                    workingDirectoryPolicy = $workingDirectoryPolicy
                 }))
     }
 }
@@ -1570,31 +1625,28 @@ function New-OwnerModelPreflightResult {
         invocationContract = $Provider.InvocationContract
         invocationVersion = $Provider.InvocationVersion
         promptTransport = $(if ($Provider.Kind -ceq 'copilot-cli') {
-                'acp-v1-ndjson-stdio-not-proven'
+                'argv'
             }
             else {
                 'private-file'
             })
-        acpProtocolVersion = 'not-proven'
-        acpAgentVersion = 'not-proven'
-        acpSessionCapabilities = @()
-        blockedCapabilities = $(if ($Provider.Kind -ceq 'copilot-cli') {
-                @(
-                    'session-persistence-disable-not-documented',
-                    'memory-disable-not-documented',
-                    'acp-session-scope-of-hardening-flags-not-documented',
-                    'acp-public-preview'
-                )
+        localProcessMetadataExposure = $Provider.Kind -ceq 'copilot-cli'
+        risk = $(if ($Provider.Kind -ceq 'copilot-cli') {
+                'bounded-prompt-may-be-visible-to-local-process-metadata-edr-or-administrators'
             }
             else {
-                @()
+                'none'
             })
-        sessionPersistence = 'not-proven'
+        acpProtocolVersion = 'diagnostic-not-run'
+        acpAgentVersion = 'diagnostic-not-run'
+        acpSessionCapabilities = @()
+        blockedCapabilities = @()
+        sessionPersistence = 'isolated-ephemeral-home'
         initializeStdoutDigest = $null
         initializeStderrDigest = $null
         initializeFailureDigest = $null
         effectiveTools = $(if ($Provider.Kind -ceq 'copilot-cli') {
-                'not-proven-acp-session-scope'
+                Write-Output -NoEnumerate ([object[]]@())
             }
             else {
                 'not-proven'
@@ -1634,6 +1686,8 @@ function Test-OwnerModelProviderPreflight {
             invocationContract = $Provider.InvocationContract
             invocationVersion = $Provider.InvocationVersion
             promptTransport = 'private-file'
+            localProcessMetadataExposure = $false
+            risk = 'none'
             acpProtocolVersion = 'not-applicable'
             acpAgentVersion = 'not-applicable'
             acpSessionCapabilities = @()
@@ -1659,24 +1713,16 @@ function Test-OwnerModelProviderPreflight {
         return $result
     }
     $processContainmentAvailable = Test-OwnerModelContainmentAvailable
-    $atomicContainmentAvailable = Test-OwnerModelAcpAtomicContainmentAvailable
     if (-not $processContainmentAvailable) {
         $result = New-OwnerModelPreflightResult -Provider $Provider -Available $false `
             -Reason process-containment-unavailable -CredentialState not-checked
         Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
         return $result
     }
-    if (-not $atomicContainmentAvailable) {
-        $result = New-OwnerModelPreflightResult -Provider $Provider -Available $false `
-            -Reason acp-atomic-process-containment-unavailable -CredentialState not-checked `
-            -ProcessContainment $true
-        Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
-        return $result
-    }
     if ($Provider.PublisherIdentity -cne 'verified-github') {
         $result = New-OwnerModelPreflightResult -Provider $Provider -Available $false `
             -Reason copilot-cli-publisher-identity-unproven -CredentialState not-checked `
-            -ProcessContainment $true -AtomicProcessContainment $true
+            -ProcessContainment $true
         Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
         return $result
     }
@@ -1717,7 +1763,7 @@ function Test-OwnerModelProviderPreflight {
         catch {
             return New-OwnerModelPreflightResult -Provider $Provider -Available $false `
                 -Reason copilot-cli-probe-failed -CredentialState $credentialState `
-                -ProcessContainment $true -AtomicProcessContainment $true
+                -ProcessContainment $true
         }
         $versionMatch = [regex]::Match($versionResult.Stdout, 'GitHub Copilot CLI (?<v>\d+\.\d+\.\d+)')
         $version = if ($versionMatch.Success) { [version]$versionMatch.Groups['v'].Value } else { $null }
@@ -1725,7 +1771,7 @@ function Test-OwnerModelProviderPreflight {
             @($Provider.ArgumentPrefix | Where-Object {
                     $_ -clike '--*' -and $_ -cne '--stdio'
                 }) +
-            @('--model')
+            @('--model', '--prompt')
         ) | ForEach-Object { ([string]$_ -split '=', 2)[0] } | Select-Object -Unique
         $allOptionsDocumented = @($requiredOptions | Where-Object {
                 $helpResult.Stdout -cnotmatch (
@@ -1739,57 +1785,18 @@ function Test-OwnerModelProviderPreflight {
             $allOptionsDocumented -and
             $permissionsResult.Stdout -cmatch (
                 'The --available-tools option\s+disables all other tools') -and
-            $atomicContainmentAvailable
-        $acpProbe = $null
-        $acpProbeFailureDigest = $null
-        if ($interfaceValid) {
-            try {
-                $acpProbe = Invoke-OwnerModelAcpInitializePreflight `
-                    -Provider $Provider -AttemptDirectory $attemptDirectory `
-                    -ExecutablePath $executablePath
-            }
-            catch {
-                $acpProbeFailureDigest = Get-OwnerModelBytesDigest -Bytes (
-                    [Text.Encoding]::UTF8.GetBytes($_.Exception.Message))
-            }
-        }
-        $agentVersionMatches = $null -ne $acpProbe -and
-            $acpProbe.agentVersion -ceq $version.ToString()
-        $blockedCapabilities = [Collections.Generic.List[string]]::new()
-        if ($null -ne $acpProbe) {
-            if ($acpProbe.loadSession) {
-                [void]$blockedCapabilities.Add('session-load-advertised')
-            }
-            if (@($acpProbe.sessionCapabilities) -ccontains 'list') {
-                [void]$blockedCapabilities.Add('session-list-advertised')
-            }
-            if (@($acpProbe.sessionCapabilities) -cnotcontains 'delete') {
-                [void]$blockedCapabilities.Add('session-delete-not-advertised')
-            }
-        }
-        [void]$blockedCapabilities.Add('session-persistence-disable-not-documented')
-        [void]$blockedCapabilities.Add('memory-disable-not-documented')
-        [void]$blockedCapabilities.Add(
-            'acp-session-scope-of-hardening-flags-not-documented')
-        [void]$blockedCapabilities.Add('acp-public-preview')
-        $available = $false
-        $reason = if (-not $processContainmentAvailable) {
-            'process-containment-unavailable'
-        }
-        elseif (-not $atomicContainmentAvailable) {
-            'acp-atomic-process-containment-unavailable'
-        }
-        elseif (-not $interfaceValid) {
+            $permissionsResult.Stdout -cmatch (
+                'do not expose tools\s+that were filtered out')
+        $available = $interfaceValid -and
+            $credentialState -ceq 'present-supported-shape'
+        $reason = if (-not $interfaceValid) {
             'copilot-cli-interface-unproven'
         }
-        elseif ($null -eq $acpProbe) {
-            'copilot-cli-acp-initialize-unproven'
-        }
-        elseif (-not $agentVersionMatches) {
-            'copilot-cli-acp-runtime-identity-unproven'
+        elseif ($credentialState -cne 'present-supported-shape') {
+            'copilot-cli-credential-unavailable'
         }
         else {
-            'copilot-cli-acp-confidentiality-unproven'
+            'available-with-local-process-metadata-risk'
         }
         return [pscustomobject][ordered]@{
             available = $available
@@ -1805,57 +1812,18 @@ function Test-OwnerModelProviderPreflight {
             modelIdentity = $Provider.ModelIdentity
             invocationContract = $Provider.InvocationContract
             invocationVersion = $Provider.InvocationVersion
-            promptTransport = $(if ($null -ne $acpProbe) {
-                    'acp-v1-ndjson-stdio-blocked'
-                }
-                else {
-                    'acp-v1-ndjson-stdio-not-proven'
-                })
-            acpProtocolVersion = $(if ($acpProbe) {
-                    [int]$acpProbe.protocolVersion
-                }
-                else {
-                    'not-proven'
-                })
-            acpAgentVersion = $(if ($acpProbe) {
-                    [string]$acpProbe.agentVersion
-                }
-                else {
-                    'not-proven'
-                })
-            acpSessionCapabilities = $(if ($acpProbe) {
-                    Write-Output -NoEnumerate (
-                        [object[]]@($acpProbe.sessionCapabilities))
-                }
-                else {
-                    Write-Output -NoEnumerate ([object[]]@())
-                })
-            blockedCapabilities = @($blockedCapabilities)
-            sessionPersistence = $(if ($null -ne $acpProbe -and (
-                        $acpProbe.loadSession -or
-                        @($acpProbe.sessionCapabilities) -ccontains 'list')) {
-                    'advertised'
-                }
-                elseif ($null -eq $acpProbe) {
-                    'not-proven'
-                }
-                else {
-                    'disable-control-not-documented'
-                })
-            initializeStdoutDigest = $(if ($acpProbe) {
-                    [string]$acpProbe.stdoutDigest
-                }
-                else {
-                    $null
-                })
-            initializeStderrDigest = $(if ($acpProbe) {
-                    [string]$acpProbe.stderrDigest
-                }
-                else {
-                    $null
-                })
-            initializeFailureDigest = $acpProbeFailureDigest
-            effectiveTools = 'not-proven-acp-session-scope'
+            promptTransport = 'argv'
+            localProcessMetadataExposure = $true
+            risk = 'bounded-prompt-may-be-visible-to-local-process-metadata-edr-or-administrators'
+            acpProtocolVersion = 'diagnostic-not-run'
+            acpAgentVersion = 'diagnostic-not-run'
+            acpSessionCapabilities = @()
+            blockedCapabilities = @()
+            sessionPersistence = 'isolated-ephemeral-home'
+            initializeStdoutDigest = $null
+            initializeStderrDigest = $null
+            initializeFailureDigest = $null
+            effectiveTools = @()
             availabilityFilter = $script:CopilotCliNoToolsSentinel
             environmentNames = @(Get-OwnerModelPolicyEnvironmentNames -Provider $Provider)
             mcpServers = @()
@@ -1864,7 +1832,7 @@ function Test-OwnerModelProviderPreflight {
             resume = $false
             repositoryAccess = $false
             processContainment = $processContainmentAvailable
-            atomicProcessContainment = $atomicContainmentAvailable
+            atomicProcessContainment = $false
             providerWrites = 0
             modelCalls = 0
         }
@@ -1983,9 +1951,12 @@ function Invoke-OwnerModelProcessAttempt {
     $stderrBytes = [byte[]]::new(0)
     try {
         $attemptDirectory = New-OwnerModelAttemptDirectory -Provider $Provider
+        $executablePath = Copy-OwnerModelPinnedExecutable -Provider $Provider `
+            -AttemptDirectory $attemptDirectory
         $invocation = New-OwnerModelInvocation -Provider $Provider `
             -EnvelopeBase64 $envelope `
-            -AttemptDirectory $attemptDirectory -IncludeCredential:($Provider.Kind -ceq 'copilot-cli')
+            -AttemptDirectory $attemptDirectory -ExecutablePath $executablePath `
+            -IncludeCredential:($Provider.Kind -ceq 'copilot-cli')
         $psi = New-OwnerModelProcessStartInfo -Invocation $invocation
         $process = [Diagnostics.Process]::new()
         $process.StartInfo = $psi
@@ -2212,6 +2183,8 @@ function New-OwnerModelProviderRunner {
         invocationContract = [string]$Provider.InvocationContract
         invocationVersion = [string]$Provider.InvocationVersion
         executableSha256 = [string]$Provider.ExecutableSha256
+        promptTransport = $(if ($Provider.Kind -ceq 'copilot-cli') { 'argv' } else { 'private-file' })
+        localProcessMetadataExposure = $Provider.Kind -ceq 'copilot-cli'
     }
     $policyTelemetry = [ordered]@{
         availableTools = @()
