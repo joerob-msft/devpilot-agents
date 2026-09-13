@@ -55,6 +55,7 @@ src/
   DevPilot.OwnerModelRunner/ # bounded test-child and offline replay runner
   DevPilot.OwnerOrchestrator/ # preview-only v2 cohort state lifecycle
   DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
+  OwnerObserver/             # read-only Owner implementation parity adapter
   Agents/
     review-handler/          # an agent: script + prompt + fixtures
     reviewer/                # an agent: script + prompt
@@ -78,6 +79,9 @@ scheduler, state, and writer.
 **Consumers keep only a config file.** Nothing employer-, repository-, or
 person-specific lives in this repo outside `samples/` — a CI check enforces that
 (`tools/Test-NoEmployerSpecifics.ps1`).
+
+The independent [Owner observer](docs/owner-observer.md) reads sanitized local
+v1 or future v2 artifacts into one normalized, zero-write parity contract.
 
 ---
 
