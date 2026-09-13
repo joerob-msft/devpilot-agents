@@ -296,6 +296,37 @@ Describe 'Owner v2 preview orchestrator manifest and state' {
                 Should -Throw '*link or reparse*'
         }
     }
+
+    It 'treats source and rule bytes as opaque while rejecting sensitive control-plane values' {
+        $opaqueRule = 'password=fixture-only'
+        $opaqueSource = 'const token = "ghp_fixture_only";'
+        $opaquePath = New-TestManifestFile -Name 'opaque-source.json' -Mutator {
+            param($m)
+            $ruleDigest = Get-TestDigest $opaqueRule
+            $m.entries[0].rule.hash = $ruleDigest
+            $m.entries[0].rule.length = [Text.UTF8Encoding]::new($false).
+                GetByteCount($opaqueRule)
+            $m.entries[0].acquisition.package.rule.ruleHash = $ruleDigest
+            $m.entries[0].acquisition.package.rule.ruleLength = $m.entries[0].rule.length
+            $m.entries[0].acquisition.package.rule.content = $opaqueRule
+            $m.entries[0].acquisition.package.rule.sourceDigest = $ruleDigest
+            $m.entries[0].acquisition.package.files[0].content = $opaqueSource
+        }
+
+        {
+            Invoke-OwnerV2PreviewPrepare `
+                -StateRoot (New-TestStateRoot) -ManifestPath $opaquePath
+        } | Should -Not -Throw
+
+        $unsafeControlPath = New-TestManifestFile -Name 'unsafe-control.json' -Mutator {
+            param($m)
+            $m.entries[0].config.id = 'password=fixture-only'
+        }
+        {
+            Invoke-OwnerV2PreviewPrepare `
+                -StateRoot (New-TestStateRoot) -ManifestPath $unsafeControlPath
+        } | Should -Throw '*looked sensitive*'
+    }
 }
 
 Describe 'Owner v2 preview orchestrator run lifecycle' {
@@ -311,9 +342,10 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $run = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $manifestPath
         $observation = Get-TestObservation -StateRoot $stateRoot
 
-        $run.records[0].state | Should -Be 'incomplete'
+        $run.records[0].state | Should -Be 'completed'
         $observation.kind | Should -Be 'owner-observation'
         $observation.execution.modelStarts | Should -Be 0
+        $observation.measurements.execution.modelStarts.status | Should -Be 'measured'
         $observation.execution.attempts | Should -Be 1
         $observation.effects.providerWrites | Should -Be 0
         $observation.effects.writeToolInvocations | Should -Be 0
@@ -336,7 +368,14 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
 
         $run.records[0].state | Should -Be 'incomplete'
         $run.records[0].reason | Should -Be 'launcher-unavailable'
-        $observation.execution.modelStarts | Should -Be 0
+        $observation.schemaVersion | Should -Be 2
+        $observation.implementation.version | Should -Be '0.2.0'
+        $observationJson = $observation | ConvertTo-Json -Depth 64 -Compress
+        $observationSchema = Join-Path $PSScriptRoot `
+            '..\src\OwnerObserver\schemas\owner-observation.v1.json'
+        Test-Json -Json $observationJson -SchemaFile $observationSchema | Should -BeTrue
+        $observation.execution.modelStarts | Should -Be 'unknown'
+        $observation.measurements.execution.modelStarts.status | Should -Be 'unavailable'
         $observation.execution.refusalReason | Should -Be 'launcher-unavailable'
         $observation.effects.providerWrites | Should -Be 0
         $observation.effects.writeToolInvocations | Should -Be 0
@@ -363,7 +402,7 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
             Remove-Item -Force
         [void](Invoke-OwnerV2PreviewRun -StateRoot $partialState -ManifestPath $partialManifest)
         $partialObservation = Get-TestObservation -StateRoot $partialState
-        $partialObservation.execution.modelStarts | Should -Be 0
+        $partialObservation.execution.modelStarts | Should -Be 'unknown'
         $partialObservation.lifecycle.status | Should -Be 'unknown'
     }
 
@@ -390,7 +429,7 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         Set-TestCheckpoint $null
         $run = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $manifestPath
         $run.records[0].attempts | Should -Be 2
-        $run.records[0].state | Should -Be 'incomplete'
+        $run.records[0].state | Should -Be 'completed'
     }
 
     It 'fences publication to the exact reservation lease and ignores orphaned staging files' {

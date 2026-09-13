@@ -17,11 +17,12 @@
     "findings",
     "execution",
     "effects",
+    "measurements",
     "sourceArtifacts",
     "validationErrors"
   ],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "const": 2 },
     "kind": { "const": "owner-observation" },
     "implementation": {
       "type": "object",
@@ -30,6 +31,46 @@
       "properties": {
         "id": { "$ref": "#/$defs/text" },
         "version": { "$ref": "#/$defs/text" }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["counts", "execution", "effects"],
+      "properties": {
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["checked", "eligible", "advisory", "violations", "unknown", "uncovered"],
+          "properties": {
+            "checked": { "$ref": "#/$defs/countMeasurement" },
+            "eligible": { "$ref": "#/$defs/countMeasurement" },
+            "advisory": { "$ref": "#/$defs/countMeasurement" },
+            "violations": { "$ref": "#/$defs/countMeasurement" },
+            "unknown": { "$ref": "#/$defs/countMeasurement" },
+            "uncovered": { "$ref": "#/$defs/countMeasurement" }
+          }
+        },
+        "execution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attempts", "modelStarts", "latencyMs"],
+          "properties": {
+            "attempts": { "$ref": "#/$defs/countMeasurement" },
+            "modelStarts": { "$ref": "#/$defs/countMeasurement" },
+            "latencyMs": { "$ref": "#/$defs/countMeasurement" }
+          }
+        },
+        "effects": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operatorIntervention", "providerWrites", "writeToolInvocations"],
+          "properties": {
+            "operatorIntervention": { "$ref": "#/$defs/boolMeasurement" },
+            "providerWrites": { "$ref": "#/$defs/countMeasurement" },
+            "writeToolInvocations": { "$ref": "#/$defs/countMeasurement" }
+          }
+        }
       }
     },
     "capability": { "$ref": "#/$defs/knownText" },
@@ -72,9 +113,11 @@
     "counts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["checked", "violations", "unknown", "uncovered"],
+      "required": ["checked", "eligible", "advisory", "violations", "unknown", "uncovered"],
       "properties": {
         "checked": { "$ref": "#/$defs/countOrUnknown" },
+        "eligible": { "$ref": "#/$defs/countOrUnknown" },
+        "advisory": { "$ref": "#/$defs/countOrUnknown" },
         "violations": { "$ref": "#/$defs/countOrUnknown" },
         "unknown": { "$ref": "#/$defs/countOrUnknown" },
         "uncovered": { "$ref": "#/$defs/countOrUnknown" }
@@ -87,9 +130,25 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["identity", "disposition", "ruleRef", "constructRef", "anchor"],
+        "required": [
+          "identity",
+          "semanticKey",
+          "providerMarker",
+          "disposition",
+          "ruleRef",
+          "constructRef",
+          "anchor",
+          "binding"
+        ],
         "properties": {
           "identity": { "$ref": "#/$defs/knownText" },
+          "semanticKey": {
+            "oneOf": [
+              { "const": "unknown" },
+              { "type": "string", "pattern": "^v1:sha256:[0-9a-f]{64}$" }
+            ]
+          },
+          "providerMarker": { "$ref": "#/$defs/providerMarker" },
           "disposition": { "enum": ["violation", "unknown"] },
           "ruleRef": { "$ref": "#/$defs/knownText" },
           "constructRef": { "$ref": "#/$defs/knownText" },
@@ -106,6 +165,12 @@
                   "symbol": { "$ref": "#/$defs/knownText" }
                 }
               }
+            ]
+          },
+          "binding": {
+            "oneOf": [
+              { "const": "unknown" },
+              { "$ref": "#/$defs/findingBinding" }
             ]
           }
         }
@@ -179,6 +244,125 @@
       "oneOf": [
         { "const": "unknown" },
         { "type": "boolean" }
+      ]
+    },
+    "providerMarker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "integrity", "sha256"],
+      "properties": {
+        "availability": { "enum": ["available", "unavailable"] },
+        "integrity": { "enum": ["verified", "invalid", "unavailable"] },
+        "sha256": {
+          "oneOf": [
+            { "const": "unknown" },
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          ]
+        }
+      }
+    },
+    "findingBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "repositoryPath", "span", "symbol", "constructIdentity", "source"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "repositoryPath": { "$ref": "#/$defs/repositoryPath" },
+        "span": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["startLine", "endLine", "startColumn", "endColumn"],
+          "properties": {
+            "startLine": { "type": "integer", "minimum": 1 },
+            "endLine": { "type": "integer", "minimum": 1 },
+            "startColumn": { "$ref": "#/$defs/countPositiveOrUnknown" },
+            "endColumn": { "$ref": "#/$defs/countPositiveOrUnknown" }
+          }
+        },
+        "symbol": { "$ref": "#/$defs/text" },
+        "constructIdentity": { "$ref": "#/$defs/text" },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["representation", "sha256"],
+          "properties": {
+            "representation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "startLine", "endLine", "startColumn", "endColumn", "symbol", "constructIdentity"],
+              "properties": {
+                "path": { "$ref": "#/$defs/text" },
+                "startLine": { "type": "integer", "minimum": 1 },
+                "endLine": { "type": "integer", "minimum": 1 },
+                "startColumn": { "$ref": "#/$defs/countPositiveOrUnknown" },
+                "endColumn": { "$ref": "#/$defs/countPositiveOrUnknown" },
+                "symbol": { "$ref": "#/$defs/text" },
+                "constructIdentity": { "$ref": "#/$defs/text" }
+              }
+            },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        }
+      }
+    },
+    "repositoryPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^/\\\\].*[^/\\\\.]$|^[^/\\\\.]$"
+    },
+    "countPositiveOrUnknown": {
+      "oneOf": [
+        { "const": "unknown" },
+        { "type": "integer", "minimum": 1 }
+      ]
+    },
+    "countMeasurement": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value", "reason"],
+          "properties": {
+            "status": { "const": "measured" },
+            "value": { "type": "integer", "minimum": 0 },
+            "reason": { "const": "unknown" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value", "reason"],
+          "properties": {
+            "status": { "enum": ["unavailable", "notMeasured"] },
+            "value": { "type": "null" },
+            "reason": { "$ref": "#/$defs/text" }
+          }
+        }
+      ]
+    },
+    "boolMeasurement": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value", "reason"],
+          "properties": {
+            "status": { "const": "measured" },
+            "value": { "type": "boolean" },
+            "reason": { "const": "unknown" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value", "reason"],
+          "properties": {
+            "status": { "enum": ["unavailable", "notMeasured"] },
+            "value": { "type": "null" },
+            "reason": { "$ref": "#/$defs/text" }
+          }
+        }
       ]
     }
   }

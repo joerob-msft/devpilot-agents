@@ -6,8 +6,12 @@ $ErrorActionPreference = 'Stop'
 Import-Module "$PSScriptRoot\..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1" -Force
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1" -Force
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1" -Force
+Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1" -Force
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerModelRunner\DevPilot.OwnerModelRunner.psd1" -Force
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1" -Force
+
+$script:OwnerV2ObservationSchemaPath = Join-Path $PSScriptRoot `
+    '..\OwnerObserver\schemas\owner-observation.v1.json'
 
 if ($IsWindows -and -not ('DevPilot.OwnerOrchestrator.NativePaths' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -130,7 +134,12 @@ function Assert-OwnerV2NoUnsafeShape {
     if ($NodeCount.Value -gt 8192) { throw 'JSON shape exceeded the maximum node count.' }
     if ($null -eq $Value) { return }
     if ($Value -is [string]) {
-        if ($Value -match $script:OwnerV2UnsafeValuePattern) { throw "JSON value at $Path looked sensitive." }
+        $opaqueEvidence = $Path -match (
+            '^\$(?:(?:\.entries\[\d+\])?\.acquisition)?\.package\.' +
+            '(?:rule\.content|files\[\d+\]\.content)$')
+        if (-not $opaqueEvidence -and $Value -match $script:OwnerV2UnsafeValuePattern) {
+            throw "JSON value at $Path looked sensitive."
+        }
         return
     }
     if ($Value -is [bool] -or $Value -is [int] -or $Value -is [long] -or
@@ -610,7 +619,7 @@ function ConvertTo-OwnerV2Declaration {
             throw 'Replay acquisition package did not match the independently pinned payload digest.'
         }
         $evidence = [ordered]@{
-            schemaVersion = 1
+            schemaVersion = 2
             kind = 'owner-v2-preview-replay-evidence'
             acquisitionPayloadDigest = [string]$Entry.acquisition.payloadDigest
             package = ConvertTo-OwnerV2JsonValue -Value $Entry.acquisition.package
@@ -837,10 +846,10 @@ function Invoke-OwnerV2Replay {
 
 function New-OwnerV2LiveUnavailableObservation {
     param([Parameter(Mandatory)][object]$Entry)
-    return [ordered]@{
-        schemaVersion = 1
+    $observation = [ordered]@{
+        schemaVersion = 2
         kind = 'owner-observation'
-        implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.1' }
+        implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.2.0' }
         capability = [string]$Entry.Declaration.capability.id
         subject = [ordered]@{
             pullRequestId = [long]$Entry.Declaration.subject.pullRequestId
@@ -851,7 +860,7 @@ function New-OwnerV2LiveUnavailableObservation {
         }
         rule = [ordered]@{
             identity = 'rule:' + ([string]$Entry.Declaration.rule.hash).Substring(10)
-            path = [string]$Entry.Declaration.rule.path
+            path = ConvertTo-OwnerRepositoryPath -Path ([string]$Entry.Declaration.rule.path)
             section = [string]$Entry.Declaration.rule.section
             commit = [string]$Entry.Declaration.rule.commit
             sha256 = ([string]$Entry.Declaration.rule.hash).Substring(10)
@@ -863,13 +872,20 @@ function New-OwnerV2LiveUnavailableObservation {
             incomplete = $true
             pending = $false
         }
-        counts = [ordered]@{ checked = 0; violations = 0; unknown = 1; uncovered = 1 }
+        counts = [ordered]@{
+            checked = 0
+            eligible = 0
+            advisory = 0
+            violations = 0
+            unknown = 0
+            uncovered = 1
+        }
         findingsComplete = $false
         findings = @()
         execution = [ordered]@{
-            attempts = 0
-            modelStarts = 0
-            latencyMs = 0
+            attempts = 'unknown'
+            modelStarts = 'unknown'
+            latencyMs = 'unknown'
             refusalReason = 'launcher-unavailable'
             incompleteReason = 'launcher-unavailable'
         }
@@ -878,6 +894,26 @@ function New-OwnerV2LiveUnavailableObservation {
             writeToolInvocations = 0
             dedupe = [ordered]@{ created = 0; updated = 0; noOp = 0; wouldCreate = 0; wouldUpdate = 0; unknown = 1 }
             operatorIntervention = $true
+        }
+        measurements = [ordered]@{
+            counts = [ordered]@{
+                checked = New-OwnerMeasurement -Status measured -Value 0
+                eligible = New-OwnerMeasurement -Status measured -Value 0
+                advisory = New-OwnerMeasurement -Status measured -Value 0
+                violations = New-OwnerMeasurement -Status measured -Value 0
+                unknown = New-OwnerMeasurement -Status measured -Value 0
+                uncovered = New-OwnerMeasurement -Status measured -Value 1
+            }
+            execution = [ordered]@{
+                attempts = New-OwnerMeasurement -Status unavailable -Reason 'launcher-unavailable'
+                modelStarts = New-OwnerMeasurement -Status unavailable -Reason 'launcher-unavailable'
+                latencyMs = New-OwnerMeasurement -Status unavailable -Reason 'launcher-unavailable'
+            }
+            effects = [ordered]@{
+                providerWrites = New-OwnerMeasurement -Status measured -Value 0
+                writeToolInvocations = New-OwnerMeasurement -Status measured -Value 0
+                operatorIntervention = New-OwnerMeasurement -Status measured -Value $true
+            }
         }
         sourceArtifacts = @(
             [ordered]@{
@@ -888,6 +924,12 @@ function New-OwnerV2LiveUnavailableObservation {
         )
         validationErrors = @('launcher-unavailable: live Owner v2 preview has no production-safe launcher')
     }
+    $observationJson = $observation | ConvertTo-Json -Depth 64 -Compress
+    if (-not (Test-Json -Json $observationJson `
+            -SchemaFile $script:OwnerV2ObservationSchemaPath -ErrorAction Stop)) {
+        throw 'Owner v2 unavailable observation failed owner-observation schema validation.'
+    }
+    return $observation
 }
 
 function Invoke-OwnerV2PreviewPrepare {
@@ -1068,16 +1110,14 @@ function Invoke-OwnerV2PreviewRun {
             }
         }
         catch {
-            $observation = [ordered]@{
-                schemaVersion = 1
-                kind = 'owner-observation'
-                implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.1' }
-                capability = [string]$entry.Declaration.capability.id
-                lifecycle = [ordered]@{ status = 'unknown'; prepared = $true; completed = $false; incomplete = $true; pending = $false }
-                execution = [ordered]@{ attempts = [int]$record.attempts; modelStarts = 0; latencyMs = 0; refusalReason = 'orchestrator-refusal'; incompleteReason = 'orchestrator-refusal' }
-                effects = [ordered]@{ providerWrites = 0; writeToolInvocations = 0 }
-                validationErrors = @([string]$_.Exception.Message)
-            }
+            $observation = New-OwnerV2LiveUnavailableObservation -Entry $entry
+            $observation.lifecycle.status = 'unknown'
+            $observation.execution.attempts = [int]$record.attempts
+            $observation.execution.refusalReason = 'orchestrator-refusal'
+            $observation.execution.incompleteReason = 'orchestrator-refusal'
+            $observation.measurements.execution.attempts =
+                New-OwnerMeasurement -Status measured -Value ([int]$record.attempts)
+            $observation.validationErrors = @([string]$_.Exception.Message)
             $finalState = 'unknown'
             $reason = 'orchestrator-refusal'
         }

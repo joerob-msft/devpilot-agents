@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
+Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1" -Force
 
 $limitsTypeName = 'DevPilot.OwnerCapability.OwnerV2CapabilityLimits'
 if (-not ($limitsTypeName -as [type])) {
@@ -1140,46 +1141,79 @@ function ConvertTo-OwnerV2Observation {
                     hash = $ruleHash
                 })).Substring(10)
     }
+    $observationSubject = [ordered]@{
+        pullRequestId = Get-OwnerV2Member -Value $identity -Name pullRequestId
+        repositoryId = [string](Get-OwnerV2Member -Value $identity -Name repositoryId)
+        headCommit = [string](Get-OwnerV2Member -Value $identity -Name sourceCommit)
+        targetCommit = [string](Get-OwnerV2Member -Value $identity -Name targetCommit)
+        targetRef = [string](Get-OwnerV2Member -Value $identity -Name targetRef)
+    }
+    $observationRule = [ordered]@{
+        identity = $ruleRef
+        path = ConvertTo-OwnerRepositoryPath `
+            -Path ([string](Get-OwnerV2Member -Value $rule -Name path))
+        section = [string](Get-OwnerV2Member -Value $rule -Name section)
+        commit = [string](Get-OwnerV2Member -Value $rule -Name commit)
+        sha256 = $ruleSha
+    }
 
     $normalizedFindings = [Collections.Generic.List[object]]::new()
     foreach ($finding in $previewFindings) {
         $data = Get-OwnerV2Member -Value $finding -Name data
         $anchor = Get-OwnerV2Member -Value $data -Name anchor
+        $constructRef = [string](Get-OwnerV2Member -Value $data -Name constructRef)
+        $binding = New-OwnerCanonicalAnchor `
+            -Path ([string](Get-OwnerV2Member -Value $anchor -Name path)) `
+            -StartLine ([int](Get-OwnerV2Member -Value $anchor -Name line)) `
+            -EndLine ([int](Get-OwnerV2Member -Value $anchor -Name line)) `
+            -Symbol ([string](Get-OwnerV2Member -Value $anchor -Name symbol)) `
+            -ConstructIdentity $constructRef
         [void]$normalizedFindings.Add([ordered]@{
                 identity = [string](Get-OwnerV2Member -Value $finding -Name findingId)
+                semanticKey = Get-OwnerSemanticFindingKey `
+                    -Subject $observationSubject -Rule $observationRule `
+                    -Capability ([string](Get-OwnerV2Member -Value $identity -Name capabilityId)) `
+                    -Binding $binding
+                providerMarker = New-OwnerProviderMarker
                 disposition = 'violation'
                 ruleRef = [string](Get-OwnerV2Member -Value $data -Name ruleRef)
-                constructRef = [string](Get-OwnerV2Member -Value $data -Name constructRef)
+                constructRef = $constructRef
                 anchor = [ordered]@{
                     path = [string](Get-OwnerV2Member -Value $anchor -Name path)
                     line = [int](Get-OwnerV2Member -Value $anchor -Name line)
                     symbol = [string](Get-OwnerV2Member -Value $anchor -Name symbol)
                 }
+                binding = $binding
             })
     }
-    foreach ($assessment in @($methodAssessments + $classAssessments | Where-Object {
+    foreach ($assessment in @($methodAssessments | Where-Object {
                 [string](Get-OwnerV2Member -Value $_ -Name state) -ceq 'unknown'
             })) {
         $assessmentId = [string](Get-OwnerV2Member -Value $assessment -Name assessmentId)
         [void]$normalizedFindings.Add([ordered]@{
                 identity = 'unknown:' + $assessmentId
+                semanticKey = 'unknown'
+                providerMarker = New-OwnerProviderMarker
                 disposition = 'unknown'
                 ruleRef = $ruleRef
                 constructRef = 'construct:' + ($assessmentId -split ':')[-1]
                 anchor = 'unknown'
+                binding = 'unknown'
             })
     }
     $sortedFindings = @($normalizedFindings | Sort-Object identity)
-    $unknownCount = @($methodAssessments + $classAssessments | Where-Object {
+    $unknownCount = @($methodAssessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name state) -ceq 'unknown'
         }).Count
+    $eligibleCount = $methodAssessments.Count
+    $advisoryCount = $classAssessments.Count
     $checkedCount = @($methodAssessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name state) -ceq 'complete'
         }).Count
     $runnerAttemptCount = @($methodAssessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'method:r:*'
         }).Count
-    $modelStarts = $runnerAttemptCount
+    $modelStarts = 'unknown'
     $latencyMs = 'unknown'
     $refusalReason = 'unknown'
     if ($null -ne $Runner) {
@@ -1220,7 +1254,9 @@ function ConvertTo-OwnerV2Observation {
     }
     $uncoveredCount = $unknownFileAssessments.Count + $unknownEvidenceAssessments.Count
     $pipelineState = [string](Get-OwnerV2Member -Value $PipelineResult -Name state)
-    $completed = $pipelineState -ceq 'complete'
+    # Class assessments are advisory-only; completion reflects eligible methods and coverage.
+    $completed = $pipelineState -cne 'failed' -and
+        $unknownCount -eq 0 -and $uncoveredCount -eq 0
     $diagnostics = @(Get-OwnerV2Member -Value $PipelineResult -Name diagnostics)
     $validationErrors = @(
         foreach ($diagnostic in $diagnostics | Select-Object -First 32) {
@@ -1239,27 +1275,15 @@ function ConvertTo-OwnerV2Observation {
     }
 
     return [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         kind = 'owner-observation'
         implementation = [ordered]@{
             id = $ImplementationId
             version = $ImplementationVersion
         }
         capability = [string](Get-OwnerV2Member -Value $identity -Name capabilityId)
-        subject = [ordered]@{
-            pullRequestId = Get-OwnerV2Member -Value $identity -Name pullRequestId
-            repositoryId = [string](Get-OwnerV2Member -Value $identity -Name repositoryId)
-            headCommit = [string](Get-OwnerV2Member -Value $identity -Name sourceCommit)
-            targetCommit = [string](Get-OwnerV2Member -Value $identity -Name targetCommit)
-            targetRef = [string](Get-OwnerV2Member -Value $identity -Name targetRef)
-        }
-        rule = [ordered]@{
-            identity = $ruleRef
-            path = [string](Get-OwnerV2Member -Value $rule -Name path)
-            section = [string](Get-OwnerV2Member -Value $rule -Name section)
-            commit = [string](Get-OwnerV2Member -Value $rule -Name commit)
-            sha256 = $ruleSha
-        }
+        subject = $observationSubject
+        rule = $observationRule
         lifecycle = [ordered]@{
             status = if ($completed) { 'completed' } elseif ($pipelineState -ceq 'failed') { 'blocked' } else { 'incomplete' }
             prepared = $true
@@ -1269,6 +1293,8 @@ function ConvertTo-OwnerV2Observation {
         }
         counts = [ordered]@{
             checked = $checkedCount
+            eligible = $eligibleCount
+            advisory = $advisoryCount
             violations = $previewFindings.Count
             unknown = $unknownCount
             uncovered = $uncoveredCount
@@ -1299,6 +1325,36 @@ function ConvertTo-OwnerV2Observation {
                 }
             }
             operatorIntervention = $true
+        }
+        measurements = [ordered]@{
+            counts = [ordered]@{
+                checked = New-OwnerMeasurement -Status measured -Value $checkedCount
+                eligible = New-OwnerMeasurement -Status measured -Value $eligibleCount
+                advisory = New-OwnerMeasurement -Status measured -Value $advisoryCount
+                violations = New-OwnerMeasurement -Status measured -Value $previewFindings.Count
+                unknown = New-OwnerMeasurement -Status measured -Value $unknownCount
+                uncovered = New-OwnerMeasurement -Status measured -Value $uncoveredCount
+            }
+            execution = [ordered]@{
+                attempts = New-OwnerMeasurement -Status measured -Value $runnerAttemptCount
+                modelStarts = $(if ($modelStarts -is [string]) {
+                        New-OwnerMeasurement -Status notMeasured -Reason 'runner-telemetry-not-requested'
+                    }
+                    else {
+                        New-OwnerMeasurement -Status measured -Value $modelStarts
+                    })
+                latencyMs = $(if ($latencyMs -is [string]) {
+                        New-OwnerMeasurement -Status notMeasured -Reason 'runner-telemetry-not-requested'
+                    }
+                    else {
+                        New-OwnerMeasurement -Status measured -Value $latencyMs
+                    })
+            }
+            effects = [ordered]@{
+                providerWrites = New-OwnerMeasurement -Status measured -Value 0
+                writeToolInvocations = New-OwnerMeasurement -Status measured -Value 0
+                operatorIntervention = New-OwnerMeasurement -Status measured -Value $true
+            }
         }
         sourceArtifacts = @(
             [ordered]@{

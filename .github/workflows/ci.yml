@@ -187,6 +187,7 @@ jobs:
             './tests/OwnerAdapters.Tests.ps1',
             './tests/OwnerCapability.Tests.ps1',
             './tests/OwnerModelRunner.Tests.ps1',
+            './tests/OwnerObservationContract.Tests.ps1',
             './tests/OwnerOrchestrator.Tests.ps1',
             './tests/OwnerParity.Tests.ps1',
             './tests/OwnerPipeline.Tests.ps1',
