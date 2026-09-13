@@ -79,10 +79,14 @@ judgments remain non-semantic evidence.
 | Latency accounting | `blocked` | 96 explicit measurement states pass; the unavailable entry contributes 12 blocked states |
 | Rollback proof | `passed` | 3,260 critical files were byte-identical; the sole declared volatile file preserved its prefix and file identity within bounded growth |
 
-Prospective real-model parity is also `blocked`. This evidence does not support
-cutover or writer compatibility.
+The separate launcher layer now proves a Copilot CLI interface with a literal
+empty tool set but fails closed because the supported prompt transport exposes
+the bounded stimulus in process arguments. Prospective real-model parity
+remains blocked until a supported confidential prompt channel is available.
+This evidence does not support cutover or writer compatibility.
 
 These deterministic contracts make the next semantic parity run measurable;
-they do not support cutover, deployment changes, or writer compatibility. A
-separate no-tools real-model launcher and independently adjudicated semantic
-evidence are still required.
+they do not support cutover, deployment changes, or writer compatibility. The
+separate no-tools launcher remains unavailable at the confidential prompt
+transport gate; a later layer must first resolve that blocker and then run it
+against independently adjudicated semantic evidence.

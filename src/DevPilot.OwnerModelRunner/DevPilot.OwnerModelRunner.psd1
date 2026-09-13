@@ -1,6 +1,6 @@
 @{
     RootModule = 'DevPilot.OwnerModelRunner.psm1'
-    ModuleVersion = '0.1.0'
+    ModuleVersion = '0.2.0'
     GUID = '70707070-8181-9292-a3a3-b4b4b4b4b4b4'
     Author = 'DevPilot Agents contributors'
     CompanyName = 'Unknown'
@@ -9,11 +9,14 @@
     PowerShellVersion = '7.0'
     FunctionsToExport = @(
         'Get-OwnerModelRunnerTelemetry',
+        'New-OwnerCopilotCliModelProvider',
+        'New-OwnerModelFakeProvider',
         'New-OwnerModelProcessRunner',
         'New-OwnerModelReplayFixture',
         'New-OwnerModelReplayRecord',
         'New-OwnerModelReplayRunner',
-        'New-OwnerModelRunnerLimits'
+        'New-OwnerModelRunnerLimits',
+        'Test-OwnerModelProviderPreflight'
     )
     CmdletsToExport = @()
     VariablesToExport = @()
@@ -21,7 +24,7 @@
     PrivateData = @{
         PSData = @{
             Tags = @('copilot', 'agents', 'review', 'owner', 'model', 'replay', 'powershell')
-            ReleaseNotes = 'Adds bounded test-child supervision and exact offline response replay. Real model launch remains unavailable.'
+            ReleaseNotes = 'Adds a fail-closed Copilot CLI no-tools preflight, private-file deterministic fake provider, and replay-grade provenance.'
         }
     }
 }

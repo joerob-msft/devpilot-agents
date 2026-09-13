@@ -122,11 +122,34 @@ namespace DevPilot.OwnerModelRunner
 }
 
 $script:MarkerPrefix = 'DEV_PILOT_OWNER_RESULT '
+$script:JsonMarkerPrefix = 'DEV_PILOT_OWNER_RESULT_JSON '
 $script:DigestPattern = '^v1:sha256:[0-9a-f]{64}$'
 $script:NoncePattern = '^[0-9a-f]{36}$'
 $script:ExecutionUnitPattern = '^unit:[0-9a-f]{64}$'
 $script:Judgments = @('compliant', 'violation', 'unknown')
-$script:SensitiveEnvironmentPattern = '(?i)(?:token|secret|password|credential|api[_-]?key|github|azure|ado|copilot)'
+$script:CopilotCliMinimumVersion = [version]'1.0.79'
+$script:CopilotCliInvocationContract = 'github-copilot-cli-no-tools-prompt-v1'
+$script:CopilotCliInvocationVersion = '1'
+$script:CopilotCliCredentialNames = @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')
+$script:CopilotCliNoToolsSentinel = '__devpilot_no_such_tool_7f2c17a64a3e4d6b__'
+$script:CopilotCliArguments = @(
+    '--silent',
+    '--no-ask-user',
+    '--disallow-temp-dir',
+    "--available-tools=$script:CopilotCliNoToolsSentinel",
+    '--disable-builtin-mcps',
+    '--no-custom-instructions',
+    '--no-remote',
+    '--no-remote-export',
+    '--no-auto-update',
+    '--no-bash-env',
+    '--no-experimental',
+    '--no-color',
+    '--stream', 'off',
+    '--output-format', 'text',
+    '--log-level', 'none',
+    '--max-autopilot-continues', '1'
+)
 
 function Assert-OwnerModelText {
     param(
@@ -173,6 +196,13 @@ function Get-OwnerModelMember {
 function Get-OwnerModelInputDigest {
     param([Parameter(Mandatory)][object]$Request)
     return 'v1:sha256:' + (Get-AgentCanonicalDigest -InputObject $Request)
+}
+
+function Get-OwnerModelBytesDigest {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
+    return 'v1:sha256:' + [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($Bytes)
+    ).ToLowerInvariant()
 }
 
 function Get-OwnerModelSubjectBinding {
@@ -230,7 +260,8 @@ function ConvertFrom-OwnerModelResponseBytes {
         [Parameter(Mandatory)][string]$ExpectedNonce,
         [Parameter(Mandatory)][string]$ExpectedInputDigest,
         [Parameter(Mandatory)][string]$ExpectedSubjectBinding,
-        [Parameter(Mandatory)][string]$ExpectedExecutionUnitId
+        [Parameter(Mandatory)][string]$ExpectedExecutionUnitId,
+        [string]$ExpectedModelIdentity
     )
 
     try {
@@ -243,32 +274,54 @@ function ConvertFrom-OwnerModelResponseBytes {
 
     $markers = @(
         foreach ($line in $text.Split("`n")) {
-            if ($line.StartsWith($script:MarkerPrefix, [StringComparison]::Ordinal)) { $line }
+            if ($line.StartsWith($script:MarkerPrefix, [StringComparison]::Ordinal) -or
+                $line.StartsWith($script:JsonMarkerPrefix, [StringComparison]::Ordinal)) {
+                $line
+            }
         }
     )
-    if ($markers.Count -ne 1 -or
-        $markers[0] -cnotmatch ('^' + [regex]::Escape($script:MarkerPrefix) + '[A-Za-z0-9_-]+$')) {
+    if ($markers.Count -ne 1) {
+        return [pscustomobject]@{ Valid = $false; AtomicFailure = $false; Judgment = 'unknown'; Failure = 'marker-invalid' }
+    }
+    if ($markers[0].StartsWith($script:MarkerPrefix, [StringComparison]::Ordinal) -and
+        $markers[0] -cnotmatch (
+            '^' + [regex]::Escape($script:MarkerPrefix) + '[A-Za-z0-9_-]+$')) {
         return [pscustomobject]@{ Valid = $false; AtomicFailure = $false; Judgment = 'unknown'; Failure = 'marker-invalid' }
     }
 
     try {
-        $payloadText = $markers[0].Substring($script:MarkerPrefix.Length)
-        $payloadBytes = ConvertFrom-OwnerModelBase64Url -Text $payloadText
-        $json = $utf8.GetString($payloadBytes)
+        if ($markers[0].StartsWith($script:JsonMarkerPrefix, [StringComparison]::Ordinal)) {
+            $json = $markers[0].Substring($script:JsonMarkerPrefix.Length)
+            if ([string]::IsNullOrWhiteSpace($json)) { throw 'empty JSON marker' }
+        }
+        else {
+            $payloadText = $markers[0].Substring($script:MarkerPrefix.Length)
+            $payloadBytes = ConvertFrom-OwnerModelBase64Url -Text $payloadText
+            $json = $utf8.GetString($payloadBytes)
+        }
         $response = ConvertFrom-Json -InputObject $json -AsHashtable -Depth 8 -NoEnumerate
     }
     catch {
         return [pscustomobject]@{ Valid = $false; AtomicFailure = $false; Judgment = 'unknown'; Failure = 'json-invalid' }
     }
 
-    if ($response -isnot [Collections.IDictionary] -or
-        -not (Test-OwnerModelExactKeys -Value $response -Expected @(
-                'schemaVersion', 'nonce', 'inputDigest', 'subjectBinding', 'responses'
-            )) -or
-        $response.schemaVersion -ne 1 -or
+    $responseSchemaVersion = Get-OwnerModelMember -Value $response -Name schemaVersion
+    $topLevelValid = $response -is [Collections.IDictionary] -and (
+        ($responseSchemaVersion -eq 1 -and [string]::IsNullOrEmpty($ExpectedModelIdentity) -and
+            (Test-OwnerModelExactKeys -Value $response -Expected @(
+                    'schemaVersion', 'nonce', 'inputDigest', 'subjectBinding', 'responses'
+                ))) -or
+        ($responseSchemaVersion -eq 2 -and
+            (Test-OwnerModelExactKeys -Value $response -Expected @(
+                    'schemaVersion', 'nonce', 'inputDigest', 'subjectBinding',
+                    'modelIdentity', 'responses'
+                )))
+    )
+    if (-not $topLevelValid -or
         $response.nonce -isnot [string] -or
         $response.inputDigest -isnot [string] -or
         $response.subjectBinding -isnot [string] -or
+        ($responseSchemaVersion -eq 2 -and $response.modelIdentity -isnot [string]) -or
         $response.responses -isnot [Collections.IList] -or
         @($response.responses).Count -gt 16) {
         return [pscustomobject]@{ Valid = $false; AtomicFailure = $false; Judgment = 'unknown'; Failure = 'schema-invalid' }
@@ -276,18 +329,30 @@ function ConvertFrom-OwnerModelResponseBytes {
 
     if ([string]$response.nonce -cne $ExpectedNonce -or
         [string]$response.inputDigest -cne $ExpectedInputDigest -or
-        [string]$response.subjectBinding -cne $ExpectedSubjectBinding) {
+        [string]$response.subjectBinding -cne $ExpectedSubjectBinding -or
+        ($responseSchemaVersion -eq 2 -and
+            [string]$response.modelIdentity -cne $ExpectedModelIdentity)) {
         return [pscustomobject]@{ Valid = $false; AtomicFailure = $true; Judgment = 'unknown'; Failure = 'binding-mismatch' }
     }
 
     $matched = [Collections.Generic.List[string]]::new()
     foreach ($item in @($response.responses)) {
-        if ($item -isnot [Collections.IDictionary] -or
-            -not (Test-OwnerModelExactKeys -Value $item -Expected @('executionUnitId', 'judgment')) -or
+        $itemKeysValid = $item -is [Collections.IDictionary] -and (
+            (Test-OwnerModelExactKeys -Value $item -Expected @('executionUnitId', 'judgment')) -or
+            (Test-OwnerModelExactKeys -Value $item -Expected @('executionUnitId', 'judgment', 'rationale'))
+        )
+        if (-not $itemKeysValid -or
             $item.executionUnitId -isnot [string] -or
             [string]$item.executionUnitId -cnotmatch $script:ExecutionUnitPattern -or
             $item.judgment -isnot [string] -or
-            [string]$item.judgment -cnotin $script:Judgments) {
+            [string]$item.judgment -cnotin $script:Judgments -or
+            ($item.Contains('rationale') -and (
+                $item.rationale -isnot [string] -or
+                [string]::IsNullOrWhiteSpace([string]$item.rationale) -or
+                [string]$item.rationale -cne ([string]$item.rationale).Trim() -or
+                ([string]$item.rationale).Length -gt 512 -or
+                [string]$item.rationale -match '[\r\n]'
+            ))) {
             return [pscustomobject]@{ Valid = $false; AtomicFailure = $false; Judgment = 'unknown'; Failure = 'schema-invalid' }
         }
         if ([string]$item.executionUnitId -ceq $ExpectedExecutionUnitId) {
@@ -305,6 +370,7 @@ function ConvertFrom-OwnerModelResponseBytes {
         AtomicFailure = $false
         Judgment = $matched[0]
         Failure = $(if ($matched[0] -ceq 'unknown') { 'model-unknown' } else { 'none' })
+        MarkerBytes = [Text.Encoding]::UTF8.GetBytes($markers[0] + "`n")
     }
 }
 
@@ -331,7 +397,14 @@ function New-OwnerModelRunnerLimits {
 }
 
 function New-OwnerModelTelemetryState {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Provider,
+        [Parameter(Mandatory)][Collections.IDictionary]$Policy
+    )
+
     return [pscustomobject]@{
+        Provider = $Provider
+        Policy = $Policy
         Records = [Collections.Generic.List[object]]::new()
     }
 }
@@ -341,17 +414,37 @@ function Add-OwnerModelTelemetryRecord {
         [Parameter(Mandatory)][object]$State,
         [Parameter(Mandatory)][string]$ExecutionUnitId,
         [Parameter(Mandatory)][int]$Attempt,
-        [Parameter(Mandatory)][bool]$ModelStarted,
+        [Parameter(Mandatory)][bool]$ProcessStarted,
+        [Parameter(Mandatory)][AllowNull()][object]$ModelStarted,
         [Parameter(Mandatory)][long]$LatencyMilliseconds,
-        [Parameter(Mandatory)][string]$Outcome
+        [Parameter(Mandatory)][string]$Outcome,
+        [Parameter(Mandatory)][string]$InputDigest,
+        [Parameter(Mandatory)][string]$Nonce,
+        [Parameter(Mandatory)][string]$SubjectBinding,
+        [Parameter(Mandatory)][string]$InvocationDigest,
+        [Parameter(Mandatory)][string]$StdoutDigest,
+        [Parameter(Mandatory)][string]$StderrDigest,
+        [Parameter(Mandatory)][AllowNull()][object]$ExitCode,
+        [Parameter(Mandatory)][string]$Timeout,
+        [AllowNull()][string]$ResponseBytesBase64
     )
 
     [void]$State.Records.Add([pscustomobject][ordered]@{
             executionUnitId = $ExecutionUnitId
             attempt = $Attempt
+            processStarted = $ProcessStarted
             modelStarted = $ModelStarted
             latencyMs = [Math]::Max(0L, $LatencyMilliseconds)
             outcome = $Outcome
+            inputDigest = $InputDigest
+            nonce = $Nonce
+            subjectBinding = $SubjectBinding
+            invocationDigest = $InvocationDigest
+            stdoutDigest = $StdoutDigest
+            stderrDigest = $StderrDigest
+            exitCode = $ExitCode
+            timeout = $Timeout
+            responseBytesBase64 = $ResponseBytesBase64
         })
 }
 
@@ -379,19 +472,38 @@ function Get-OwnerModelTelemetrySnapshot {
     else {
         [long](($records | Measure-Object -Property latencyMs -Sum).Sum)
     }
+    $modelStarts = if (@($records | Where-Object { $_.modelStarted -is [string] }).Count -gt 0) {
+        'unknown'
+    }
+    else {
+        @($records | Where-Object { $_.modelStarted -eq $true }).Count
+    }
     return [ordered]@{
         attempts = $records.Count
-        modelStarts = @($records | Where-Object modelStarted).Count
+        modelStarts = $modelStarts
+        modelStartsMinimum = @($records | Where-Object { $_.modelStarted -eq $true }).Count
         latencyMs = $latency
         refusalReason = if ($failures.Count -eq 0) { 'none' } else { [string]$failures[-1] }
+        provider = $State.Provider
+        policy = $State.Policy
         records = @(
             foreach ($record in $records) {
                 [ordered]@{
                     executionUnitId = $record.executionUnitId
                     attempt = $record.attempt
+                    processStarted = $record.processStarted
                     modelStarted = $record.modelStarted
                     latencyMs = $record.latencyMs
                     outcome = $record.outcome
+                    inputDigest = $record.inputDigest
+                    nonce = $record.nonce
+                    subjectBinding = $record.subjectBinding
+                    invocationDigest = $record.invocationDigest
+                    stdoutDigest = $record.stdoutDigest
+                    stderrDigest = $record.stderrDigest
+                    exitCode = $record.exitCode
+                    timeout = $record.timeout
+                    responseBytesBase64 = $record.responseBytesBase64
                 }
             }
         )
@@ -416,6 +528,7 @@ function New-OwnerModelReplayRecord {
         [Parameter(Mandatory)][object]$Request,
         [ValidateSet('compliant', 'violation', 'unknown')][string]$Judgment,
         [string]$Nonce = (New-AgentNonce),
+        [string]$ModelIdentity,
         [byte[]]$ResponseBytes
     )
 
@@ -432,8 +545,8 @@ function New-OwnerModelReplayRecord {
         if ([string]::IsNullOrWhiteSpace($Judgment)) {
             throw 'Judgment is required when ResponseBytes is not supplied.'
         }
-        $ResponseBytes = ConvertTo-OwnerModelMarkerBytes -Response ([ordered]@{
-                schemaVersion = 1
+        $response = [ordered]@{
+                schemaVersion = $(if ([string]::IsNullOrEmpty($ModelIdentity)) { 1 } else { 2 })
                 nonce = $Nonce
                 inputDigest = $inputDigest
                 subjectBinding = $subjectBinding
@@ -443,13 +556,18 @@ function New-OwnerModelReplayRecord {
                         judgment = $Judgment
                     }
                 )
-            })
+            }
+        if (-not [string]::IsNullOrEmpty($ModelIdentity)) {
+            $response.Insert(4, 'modelIdentity', $ModelIdentity)
+        }
+        $ResponseBytes = ConvertTo-OwnerModelMarkerBytes -Response $response
     }
     return [pscustomobject][ordered]@{
         executionUnitId = $executionUnitId
         nonce = $Nonce
         inputDigest = $inputDigest
         subjectBinding = $subjectBinding
+        modelIdentity = $ModelIdentity
         responseBytes = [byte[]]$ResponseBytes.Clone()
     }
 }
@@ -465,12 +583,18 @@ function New-OwnerModelReplayFixture {
         $nonce = [string](Get-OwnerModelMember -Value $record -Name nonce)
         $inputDigest = [string](Get-OwnerModelMember -Value $record -Name inputDigest)
         $subjectBinding = [string](Get-OwnerModelMember -Value $record -Name subjectBinding)
+        $modelIdentity = [string](Get-OwnerModelMember -Value $record -Name modelIdentity)
         $responseBytes = Get-OwnerModelMember -Value $record -Name responseBytes
         if ($executionUnitId -cnotmatch $script:ExecutionUnitPattern -or
             -not $ids.Add($executionUnitId) -or
             $nonce -cnotmatch $script:NoncePattern -or
             $inputDigest -cnotmatch $script:DigestPattern -or
             $subjectBinding -cnotmatch $script:DigestPattern -or
+            (-not [string]::IsNullOrEmpty($modelIdentity) -and (
+                [string]::IsNullOrWhiteSpace($modelIdentity) -or
+                $modelIdentity -cne $modelIdentity.Trim() -or
+                $modelIdentity.Length -gt 128 -or
+                $modelIdentity -match '[\r\n]')) -or
             $responseBytes -isnot [byte[]] -or
             $responseBytes.Length -gt 1048576) {
             throw 'Replay record violated the bounded sanitized fixture contract.'
@@ -480,6 +604,7 @@ function New-OwnerModelReplayFixture {
                 nonce = $nonce
                 inputDigest = $inputDigest
                 subjectBinding = $subjectBinding
+                modelIdentity = $modelIdentity
                 responseBytes = [byte[]]$responseBytes.Clone()
             })
     }
@@ -501,11 +626,30 @@ function New-OwnerModelReplayRunner {
     }
     $records = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     foreach ($record in @($Fixture.Records)) { $records.Add($record.executionUnitId, $record) }
-    $telemetry = New-OwnerModelTelemetryState
+    $providerTelemetry = [ordered]@{
+        kind = 'offline-replay'
+        name = $Name
+        modelIdentity = 'recorded-response-bytes'
+        invocationContract = 'owner-model-replay-v1'
+        invocationVersion = '1'
+    }
+    $policyTelemetry = [ordered]@{
+        availableTools = @()
+        mcpServers = @()
+        customInstructions = $false
+        memory = $false
+        resume = $false
+        repositoryAccess = $false
+        networkAccess = $false
+        providerWrite = $false
+        environmentNames = @()
+    }
+    $telemetry = New-OwnerModelTelemetryState -Provider $providerTelemetry -Policy $policyTelemetry
     $getMemberCommand = Get-Command Get-OwnerModelMember -CommandType Function
     $getInputDigestCommand = Get-Command Get-OwnerModelInputDigest -CommandType Function
     $getSubjectBindingCommand = Get-Command Get-OwnerModelSubjectBinding -CommandType Function
     $parseResponseCommand = Get-Command ConvertFrom-OwnerModelResponseBytes -CommandType Function
+    $getBytesDigestCommand = Get-Command Get-OwnerModelBytesDigest -CommandType Function
     $addTelemetryCommand = Get-Command Add-OwnerModelTelemetryRecord -CommandType Function
     $getTelemetryCommand = Get-Command Get-OwnerModelTelemetrySnapshot -CommandType Function
     $handler = {
@@ -514,10 +658,14 @@ function New-OwnerModelReplayRunner {
         $stopwatch = [Diagnostics.Stopwatch]::StartNew()
         $outcome = 'response-omitted'
         $judgment = 'unknown'
+        $record = $null
+        $inputDigest = & $getInputDigestCommand -Request $request
+        $subjectBinding = & $getSubjectBindingCommand -ExecutionUnitId $unitId
+        $responseBytes = [byte[]]::new(0)
+        $responseValid = $false
         if ($records.ContainsKey($unitId)) {
             $record = $records[$unitId]
-            $inputDigest = & $getInputDigestCommand -Request $request
-            $subjectBinding = & $getSubjectBindingCommand -ExecutionUnitId $unitId
+            $responseBytes = [byte[]]$record.responseBytes.Clone()
             if ($inputDigest -cne $record.inputDigest -or $subjectBinding -cne $record.subjectBinding) {
                 $outcome = 'binding-mismatch'
             }
@@ -527,15 +675,27 @@ function New-OwnerModelReplayRunner {
                     -ExpectedNonce $record.nonce `
                     -ExpectedInputDigest $inputDigest `
                     -ExpectedSubjectBinding $subjectBinding `
-                    -ExpectedExecutionUnitId $unitId
+                    -ExpectedExecutionUnitId $unitId `
+                    -ExpectedModelIdentity ([string]$record.modelIdentity)
                 $judgment = $parsed.Judgment
                 $outcome = $parsed.Failure
+                $responseValid = $parsed.Valid
             }
         }
         $stopwatch.Stop()
+        $responseBase64 = if ($responseValid) {
+            [Convert]::ToBase64String($responseBytes)
+        }
+        else { $null }
         & $addTelemetryCommand -State $telemetry -ExecutionUnitId $unitId `
-            -Attempt 1 -ModelStarted $false -LatencyMilliseconds $stopwatch.ElapsedMilliseconds `
-            -Outcome $outcome
+            -Attempt 1 -ProcessStarted $false -ModelStarted $false `
+            -LatencyMilliseconds $stopwatch.ElapsedMilliseconds -Outcome $outcome `
+            -InputDigest $inputDigest -Nonce $(if ($record) { $record.nonce } else { '0' * 36 }) `
+            -SubjectBinding $subjectBinding `
+            -InvocationDigest ('v1:sha256:' + ('0' * 64)) `
+            -StdoutDigest (& $getBytesDigestCommand -Bytes $responseBytes) `
+            -StderrDigest (& $getBytesDigestCommand -Bytes ([byte[]]::new(0))) `
+            -ExitCode 0 -Timeout none -ResponseBytesBase64 $responseBase64
         return @{
             schemaVersion = 2
             executionUnitId = $unitId
@@ -546,39 +706,640 @@ function New-OwnerModelReplayRunner {
     return New-OwnerSemanticRunner -Name $Name -Handler $handler -TelemetryProvider $telemetryProvider
 }
 
-function New-OwnerModelProcessStartInfo {
+function Get-OwnerModelRepositoryRoot {
+    return [IO.Path]::GetFullPath((Join-Path (Join-Path $PSScriptRoot '..') '..'))
+}
+
+function Test-OwnerModelPathWithin {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Root
+    )
+    $comparison = if ($IsWindows) {
+        [StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [StringComparison]::Ordinal
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    return $fullPath.Equals($fullRoot, $comparison) -or
+        $fullPath.StartsWith($fullRoot + [IO.Path]::DirectorySeparatorChar, $comparison)
+}
+
+function Assert-OwnerModelPathIsNotLink {
+    param([Parameter(Mandatory)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $null -ne $item.LinkType -or $null -ne $item.LinkTarget) {
+        throw "Owner model isolation path '$Path' must not be a link or reparse point."
+    }
+}
+
+function New-OwnerModelPrivateLaunchRoot {
+    param([Parameter(Mandatory)][string]$BasePath)
+    $absoluteBase = [IO.Path]::GetFullPath($BasePath)
+    if (-not [IO.Path]::IsPathFullyQualified($absoluteBase) -or
+        (Test-OwnerModelPathWithin -Path $absoluteBase -Root (Get-OwnerModelRepositoryRoot))) {
+        throw 'Model launch root must be an absolute path outside the repository.'
+    }
+    if (-not (Test-Path -LiteralPath $absoluteBase -PathType Container)) {
+        New-Item -ItemType Directory -Path $absoluteBase -Force | Out-Null
+    }
+    Assert-OwnerModelPathIsNotLink -Path $absoluteBase
+    $privateRoot = Join-Path $absoluteBase ([guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($privateRoot)
+    Assert-OwnerModelPathIsNotLink -Path $privateRoot
+    if (-not $IsWindows) {
+        [IO.File]::SetUnixFileMode(
+            $privateRoot,
+            [IO.UnixFileMode]::UserRead -bor
+            [IO.UnixFileMode]::UserWrite -bor
+            [IO.UnixFileMode]::UserExecute)
+    }
+    return [IO.Path]::GetFullPath($privateRoot)
+}
+
+function Assert-OwnerModelExecutableShape {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Kind
+    )
+    if ($Kind -ne 'copilot-cli') { return }
+    if ($IsWindows -and [IO.Path]::GetExtension($Path) -cne '.exe') {
+        throw '[owner-model-launch-unavailable] Copilot CLI must resolve to a native .exe on Windows.'
+    }
+    if (-not $IsWindows) {
+        $stream = [IO.File]::OpenRead($Path)
+        try {
+            if ($stream.Length -ge 2 -and $stream.ReadByte() -eq 35 -and $stream.ReadByte() -eq 33) {
+                throw '[owner-model-launch-unavailable] Copilot CLI must be a native executable, not an interpreter shim.'
+            }
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+}
+
+function New-OwnerModelProviderObject {
+    param(
+        [Parameter(Mandatory)][ValidateSet('copilot-cli', 'fake-process')][string]$Kind,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string]$ModelIdentity,
+        [Parameter(Mandatory)][string]$InvocationContract,
+        [Parameter(Mandatory)][string]$InvocationVersion,
+        [Parameter(Mandatory)][string]$LaunchRoot,
+        [string[]]$ArgumentPrefix = @(),
+        [AllowNull()][string]$CredentialEnvironmentName,
+        [ValidateSet('real-when-valid', 'always-zero')][string]$ModelStartPolicy
+    )
+
+    Assert-OwnerModelText -Value $Name -Name Name -MaximumLength 128
+    Assert-OwnerModelText -Value $ModelIdentity -Name ModelIdentity -MaximumLength 128
+    Assert-OwnerModelText -Value $InvocationContract -Name InvocationContract -MaximumLength 128
+    Assert-OwnerModelText -Value $InvocationVersion -Name InvocationVersion -MaximumLength 32
+    $absolute = [IO.Path]::GetFullPath($FilePath)
+    if (-not [IO.Path]::IsPathFullyQualified($absolute) -or
+        -not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
+        throw 'Model provider executable must be an existing absolute file.'
+    }
+    Assert-OwnerModelExecutableShape -Path $absolute -Kind $Kind
+    $absoluteRoot = New-OwnerModelPrivateLaunchRoot -BasePath $LaunchRoot
+    $provider = [pscustomobject][ordered]@{
+        Kind = $Kind
+        Name = $Name
+        FilePath = $absolute
+        ModelIdentity = $ModelIdentity
+        InvocationContract = $InvocationContract
+        InvocationVersion = $InvocationVersion
+        LaunchRoot = $absoluteRoot
+        ArgumentPrefix = @($ArgumentPrefix)
+        CredentialEnvironmentName = $CredentialEnvironmentName
+        ModelStartPolicy = $ModelStartPolicy
+    }
+    $provider.PSTypeNames.Insert(0, 'DevPilot.OwnerModelRunner.ModelProvider')
+    Remove-OwnerModelPrivateLaunchRoot -Provider $provider
+    return $provider
+}
+
+function New-OwnerCopilotCliModelProvider {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Model,
+        [string]$FilePath,
+        [ValidateSet('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')]
+        [string]$CredentialEnvironmentName,
+        [string]$LaunchRoot = (Join-Path ([IO.Path]::GetTempPath()) 'devpilot-owner-model-launch'),
+        [string]$Name = 'owner-model-copilot-cli-no-tools'
+    )
+
+    [void](Assert-AgentSupportedModel -ModelId $Model -Where 'Owner model')
+    if ([string]::IsNullOrWhiteSpace($FilePath)) {
+        $commands = @(Get-Command copilot -CommandType Application -ErrorAction SilentlyContinue)
+        if ($commands.Count -ne 1) {
+            throw '[owner-model-launch-unavailable] Exactly one Copilot CLI executable is required.'
+        }
+        $FilePath = $commands[0].Source
+    }
+    if ([string]::IsNullOrWhiteSpace($CredentialEnvironmentName)) {
+        $selectedCredentialNames = @(
+            $script:CopilotCliCredentialNames | Where-Object {
+                -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($_))
+            } | Select-Object -First 1
+        )
+        if ($selectedCredentialNames.Count -eq 0) {
+            $CredentialEnvironmentName = 'COPILOT_GITHUB_TOKEN'
+        }
+        else {
+            $CredentialEnvironmentName = [string]$selectedCredentialNames[0]
+        }
+    }
+    return New-OwnerModelProviderObject -Kind copilot-cli -Name $Name `
+        -FilePath $FilePath -ModelIdentity $Model `
+        -InvocationContract $script:CopilotCliInvocationContract `
+        -InvocationVersion $script:CopilotCliInvocationVersion `
+        -LaunchRoot $LaunchRoot -ArgumentPrefix $script:CopilotCliArguments `
+        -CredentialEnvironmentName $CredentialEnvironmentName `
+        -ModelStartPolicy real-when-valid
+}
+
+function New-OwnerModelFakeProvider {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [string]$LaunchRoot = (Join-Path ([IO.Path]::GetTempPath()) 'devpilot-owner-model-fake'),
+        [string]$Name = 'owner-model-deterministic-fake'
+    )
+
+    return New-OwnerModelProviderObject -Kind fake-process -Name $Name `
+        -FilePath $FilePath -ModelIdentity 'deterministic-fake-process' `
+        -InvocationContract 'owner-model-fake-process-v1' -InvocationVersion '1' `
+        -LaunchRoot $LaunchRoot -ArgumentPrefix $ArgumentList -ModelStartPolicy always-zero
+}
+
+function Assert-OwnerModelProvider {
+    param([Parameter(Mandatory)][object]$Provider)
+
+    if ($Provider.PSTypeNames -cnotcontains 'DevPilot.OwnerModelRunner.ModelProvider') {
+        throw 'Expected an Owner model provider.'
+    }
+    if ($Provider.Kind -ceq 'copilot-cli') {
+        if ($Provider.InvocationContract -cne $script:CopilotCliInvocationContract -or
+            $Provider.InvocationVersion -cne $script:CopilotCliInvocationVersion -or
+            (@($Provider.ArgumentPrefix) -join "`0") -cne ($script:CopilotCliArguments -join "`0") -or
+            $Provider.CredentialEnvironmentName -cnotin $script:CopilotCliCredentialNames -or
+            $Provider.ModelStartPolicy -cne 'real-when-valid') {
+            throw '[owner-model-launch-unavailable] Copilot provider policy was mutated.'
+        }
+    }
+    elseif ($Provider.Kind -ceq 'fake-process') {
+        if ($Provider.InvocationContract -cne 'owner-model-fake-process-v1' -or
+            $Provider.ModelStartPolicy -cne 'always-zero' -or
+            -not [string]::IsNullOrEmpty([string]$Provider.CredentialEnvironmentName)) {
+            throw 'Fake model provider policy was mutated.'
+        }
+    }
+    else {
+        throw 'Owner model provider kind is unsupported.'
+    }
+}
+
+function New-OwnerModelAttemptDirectory {
+    param([Parameter(Mandatory)][object]$Provider)
+    Assert-OwnerModelProvider -Provider $Provider
+    if (-not (Test-Path -LiteralPath $Provider.LaunchRoot -PathType Container)) {
+        [void][IO.Directory]::CreateDirectory($Provider.LaunchRoot)
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode(
+                $Provider.LaunchRoot,
+                [IO.UnixFileMode]::UserRead -bor
+                [IO.UnixFileMode]::UserWrite -bor
+                [IO.UnixFileMode]::UserExecute)
+        }
+    }
+    Assert-OwnerModelPathIsNotLink -Path $Provider.LaunchRoot
+    $directory = Join-Path $Provider.LaunchRoot ([guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($directory)
+    Assert-OwnerModelPathIsNotLink -Path $directory
+    if (-not $IsWindows) {
+        [IO.File]::SetUnixFileMode(
+            $directory,
+            [IO.UnixFileMode]::UserRead -bor
+            [IO.UnixFileMode]::UserWrite -bor
+            [IO.UnixFileMode]::UserExecute)
+    }
+    foreach ($leaf in @('home', 'appdata', 'localappdata', 'temp')) {
+        New-Item -ItemType Directory -Path (Join-Path $directory $leaf) | Out-Null
+    }
+    return [IO.Path]::GetFullPath($directory)
+}
+
+function Remove-OwnerModelPrivateLaunchRoot {
+    param([Parameter(Mandatory)][object]$Provider)
+    if (-not (Test-Path -LiteralPath $Provider.LaunchRoot -PathType Container)) { return }
+    Assert-OwnerModelPathIsNotLink -Path $Provider.LaunchRoot
+    if (@(Get-ChildItem -LiteralPath $Provider.LaunchRoot -Force).Count -eq 0) {
+        Remove-Item -LiteralPath $Provider.LaunchRoot -Force
+    }
+}
+
+function Get-OwnerModelProcessEnvironment {
+    param(
+        [Parameter(Mandatory)][object]$Provider,
+        [Parameter(Mandatory)][string]$AttemptDirectory,
+        [switch]$IncludeCredential
+    )
+    Assert-OwnerModelProvider -Provider $Provider
+    $environment = [ordered]@{
+        HOME = Join-Path $AttemptDirectory 'home'
+        USERPROFILE = Join-Path $AttemptDirectory 'home'
+        APPDATA = Join-Path $AttemptDirectory 'appdata'
+        LOCALAPPDATA = Join-Path $AttemptDirectory 'localappdata'
+        TEMP = Join-Path $AttemptDirectory 'temp'
+        TMP = Join-Path $AttemptDirectory 'temp'
+    }
+    if ($IsWindows) {
+        foreach ($name in @('SystemRoot', 'WINDIR')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if (-not [string]::IsNullOrEmpty($value)) { $environment[$name] = $value }
+        }
+    }
+    if ($Provider.Kind -ceq 'copilot-cli') {
+        $environment['COPILOT_HOME'] = Join-Path $AttemptDirectory 'home'
+        $environment['COPILOT_AUTO_UPDATE'] = 'false'
+        $environment['COPILOT_OTEL_ENABLED'] = 'false'
+        $environment['COPILOT_MULTIPLEXER'] = 'none'
+        $environment['NO_COLOR'] = '1'
+        if ($IncludeCredential) {
+            $credential = [Environment]::GetEnvironmentVariable(
+                [string]$Provider.CredentialEnvironmentName)
+            if ([string]::IsNullOrEmpty($credential)) {
+                throw '[owner-model-launch-unavailable] Selected Copilot credential is absent.'
+            }
+            $environment['COPILOT_GITHUB_TOKEN'] = $credential
+        }
+    }
+    else {
+        foreach ($name in @('PATH', 'PATHEXT', 'PSModulePath')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if (-not [string]::IsNullOrEmpty($value)) { $environment[$name] = $value }
+        }
+        $environment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
+        $environment['DEV_PILOT_OWNER_MODEL_TEST_ONLY'] = '1'
+    }
+    return $environment
+}
+
+function Get-OwnerModelPolicyEnvironmentNames {
+    param([Parameter(Mandatory)][object]$Provider)
+    $names = @(
+        (Get-OwnerModelProcessEnvironment -Provider $Provider `
+            -AttemptDirectory (Join-Path $Provider.LaunchRoot 'policy')).Keys |
+            ForEach-Object { [string]$_ }
+    )
+    if ($Provider.Kind -ceq 'copilot-cli') { $names += 'COPILOT_GITHUB_TOKEN' }
+    return @($names | Sort-Object -Unique)
+}
+
+function New-OwnerModelInvocation {
+    param(
+        [Parameter(Mandatory)][object]$Provider,
+        [Parameter(Mandatory)][string]$EnvelopeBase64,
+        [Parameter(Mandatory)][string]$AttemptDirectory,
+        [switch]$IncludeCredential
+    )
+    Assert-OwnerModelProvider -Provider $Provider
+    if ($Provider.Kind -ceq 'copilot-cli') {
+        throw '[owner-model-launch-unavailable] copilot-cli-confidential-prompt-channel-unavailable'
+    }
+    $stimulusPath = Join-Path $AttemptDirectory 'bounded-stimulus.b64'
+    [IO.File]::WriteAllText(
+        $stimulusPath,
+        $EnvelopeBase64,
+        [Text.UTF8Encoding]::new($false))
+    if (-not $IsWindows) {
+        [IO.File]::SetUnixFileMode(
+            $stimulusPath,
+            [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+    }
+    $arguments = @($Provider.ArgumentPrefix) + @($stimulusPath)
+    $environment = Get-OwnerModelProcessEnvironment -Provider $Provider `
+        -AttemptDirectory $AttemptDirectory -IncludeCredential:$IncludeCredential
+    $safeEnvironmentNames = @($environment.Keys | ForEach-Object { [string]$_ } | Sort-Object)
+    $expectedEnvironmentNames = @(Get-OwnerModelPolicyEnvironmentNames -Provider $Provider)
+    if (($safeEnvironmentNames -join "`0") -cne ($expectedEnvironmentNames -join "`0")) {
+        throw 'Owner model invocation environment did not match the code-defined allowlist.'
+    }
+    return [pscustomobject][ordered]@{
+        FilePath = [string]$Provider.FilePath
+        ArgumentList = @($arguments)
+        Environment = $environment
+        EnvironmentNames = $safeEnvironmentNames
+        WorkingDirectory = $AttemptDirectory
+        InvocationDigest = 'v1:sha256:' + (Get-AgentCanonicalDigest -InputObject ([ordered]@{
+                    fileSha256 = Get-OwnerModelBytesDigest -Bytes ([IO.File]::ReadAllBytes($Provider.FilePath))
+                    arguments = @($Provider.ArgumentPrefix) + @('bounded-stimulus.b64')
+                    stimulusDigest = Get-OwnerModelBytesDigest -Bytes (
+                        [Text.Encoding]::UTF8.GetBytes($EnvelopeBase64))
+                    environmentNames = $safeEnvironmentNames
+                    workingDirectoryPolicy = 'fresh-isolated-directory-with-bounded-stimulus'
+                }))
+    }
+}
+
+function Invoke-OwnerModelPreflightCommand {
+    param(
+        [Parameter(Mandatory)][object]$Provider,
         [Parameter(Mandatory)][string[]]$ArgumentList,
-        [Parameter(Mandatory)][string]$Envelope
+        [Parameter(Mandatory)][string]$AttemptDirectory
+    )
+    $environment = Get-OwnerModelProcessEnvironment -Provider $Provider `
+        -AttemptDirectory $AttemptDirectory
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    Set-OwnerModelContainedCommand -Psi $psi -FilePath $Provider.FilePath `
+        -ArgumentList $ArgumentList
+    $psi.WorkingDirectory = $AttemptDirectory
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.Environment.Clear()
+    foreach ($entry in $environment.GetEnumerator()) {
+        $psi.Environment[[string]$entry.Key] = [string]$entry.Value
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    $containment = $null
+    $started = $false
+    $stdoutDrain = [DevPilot.OwnerModelRunner.BoundedByteDrain]::new(131072, 4096)
+    $stderrDrain = [DevPilot.OwnerModelRunner.BoundedByteDrain]::new(131072, 4096)
+    try {
+        if (-not $process.Start()) { throw 'Copilot preflight process did not start.' }
+        $started = $true
+        $containment = New-AgentProcessContainment -Process $process
+        $process.StandardInput.Close()
+        $stdoutTask = $stdoutDrain.ReadAsync($process.StandardOutput.BaseStream)
+        $stderrTask = $stderrDrain.ReadAsync($process.StandardError.BaseStream)
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        while (-not $process.HasExited) {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                [void](Stop-AgentProcessContainment -Containment $containment -Process $process)
+                throw 'Copilot preflight process timed out.'
+            }
+            if ($stdoutDrain.Overflowed -or $stderrDrain.Overflowed) {
+                [void](Stop-AgentProcessContainment -Containment $containment -Process $process)
+                throw 'Copilot preflight output exceeded its fixed limit.'
+            }
+            Start-Sleep -Milliseconds 20
+        }
+        $settleDeadline = [DateTime]::UtcNow.AddMilliseconds(750)
+        while ([DateTime]::UtcNow -lt $settleDeadline -and
+            -not (Test-AgentProcessContainmentExited -Containment $containment -Process $process)) {
+            Start-Sleep -Milliseconds 20
+        }
+        if (-not (Test-AgentProcessContainmentExited -Containment $containment -Process $process)) {
+            [void](Stop-AgentProcessContainment -Containment $containment -Process $process)
+            throw 'Copilot preflight descendant process survived.'
+        }
+        if (-not [Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask), 5000)) {
+            throw 'Copilot preflight output drain timed out.'
+        }
+        if ($stdoutDrain.Overflowed -or $stderrDrain.Overflowed) {
+            throw 'Copilot preflight output exceeded its fixed limit.'
+        }
+        $utf8 = [Text.UTF8Encoding]::new($false, $true)
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Stdout = $utf8.GetString($stdoutDrain.GetBytes())
+            Stderr = $utf8.GetString($stderrDrain.GetBytes())
+        }
+    }
+    finally {
+        if ($started -and -not $process.HasExited) {
+            if ($containment) {
+                [void](Stop-AgentProcessContainment -Containment $containment -Process $process)
+            }
+            else {
+                Stop-ProcessTree -Process $process
+            }
+        }
+        Close-AgentProcessContainment -Containment $containment
+        $process.Dispose()
+    }
+}
+
+function Test-OwnerModelContainmentAvailable {
+    if ($IsWindows) { return $true }
+    if (Get-Command setsid -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1) {
+        return $true
+    }
+    return $null -ne (
+        Get-Command perl -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1)
+}
+
+function New-OwnerModelPreflightResult {
+    param(
+        [Parameter(Mandatory)][object]$Provider,
+        [Parameter(Mandatory)][bool]$Available,
+        [Parameter(Mandatory)][string]$Reason,
+        [Parameter(Mandatory)][string]$CredentialState,
+        [string]$CliVersion = 'not-checked',
+        [bool]$ProcessContainment = $false
+    )
+    return [pscustomobject][ordered]@{
+        available = $Available
+        reason = $Reason
+        credential = [ordered]@{
+            sourceName = [string]$Provider.CredentialEnvironmentName
+            childName = 'COPILOT_GITHUB_TOKEN'
+            state = $CredentialState
+        }
+        cliVersion = $CliVersion
+        executableSha256 = (Get-OwnerModelBytesDigest -Bytes (
+                [IO.File]::ReadAllBytes($Provider.FilePath))).Substring(10)
+        modelIdentity = $Provider.ModelIdentity
+        invocationContract = $Provider.InvocationContract
+        invocationVersion = $Provider.InvocationVersion
+        promptTransport = $(if ($Provider.Kind -ceq 'copilot-cli') {
+                'unavailable-argv-only'
+            }
+            else {
+                'private-file'
+            })
+        effectiveTools = 'not-proven'
+        availabilityFilter = $script:CopilotCliNoToolsSentinel
+        environmentNames = @(Get-OwnerModelPolicyEnvironmentNames -Provider $Provider)
+        mcpServers = @()
+        customInstructions = $false
+        memory = $false
+        resume = $false
+        repositoryAccess = $false
+        processContainment = $ProcessContainment
+        providerWrites = 0
+        modelCalls = 0
+    }
+}
+
+function Test-OwnerModelProviderPreflight {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Provider)
+
+    Assert-OwnerModelProvider -Provider $Provider
+    if ($Provider.Kind -ne 'copilot-cli') {
+        $result = [pscustomobject][ordered]@{
+            available = $true
+            reason = 'fake-offline'
+            credential = [ordered]@{
+                sourceName = 'none'
+                childName = 'none'
+                state = 'not-required'
+            }
+            cliVersion = 'not-applicable'
+            executableSha256 = (Get-OwnerModelBytesDigest -Bytes (
+                    [IO.File]::ReadAllBytes($Provider.FilePath))).Substring(10)
+            modelIdentity = $Provider.ModelIdentity
+            invocationContract = $Provider.InvocationContract
+            invocationVersion = $Provider.InvocationVersion
+            promptTransport = 'private-file'
+            effectiveTools = @()
+            availabilityFilter = 'not-applicable'
+            environmentNames = @(Get-OwnerModelPolicyEnvironmentNames -Provider $Provider)
+            mcpServers = @()
+            customInstructions = $false
+            memory = $false
+            resume = $false
+            repositoryAccess = $false
+            processContainment = Test-OwnerModelContainmentAvailable
+            modelCalls = 0
+            providerWrites = 0
+        }
+        Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
+        return $result
+    }
+    $containmentAvailable = Test-OwnerModelContainmentAvailable
+    if (-not $containmentAvailable) {
+        $result = New-OwnerModelPreflightResult -Provider $Provider -Available $false `
+            -Reason process-containment-unavailable -CredentialState not-checked
+        Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
+        return $result
+    }
+    $attemptDirectory = New-OwnerModelAttemptDirectory -Provider $Provider
+    try {
+        $credential = [Environment]::GetEnvironmentVariable(
+            [string]$Provider.CredentialEnvironmentName)
+        $credentialState = if ([string]::IsNullOrEmpty($credential)) {
+            'absent'
+        }
+        elseif ($credential.StartsWith('ghp_', [StringComparison]::Ordinal)) {
+            'classic-pat-unsupported'
+        }
+        elseif ($credential -cmatch '^(github_pat_|gh[osu]_)[A-Za-z0-9_]+$') {
+            'present-supported-shape'
+        }
+        else {
+            'unrecognized-shape'
+        }
+        try {
+            $versionResult = Invoke-OwnerModelPreflightCommand -Provider $Provider `
+                -ArgumentList @('--version') -AttemptDirectory $attemptDirectory
+            $helpResult = Invoke-OwnerModelPreflightCommand -Provider $Provider `
+                -ArgumentList @('--help') -AttemptDirectory $attemptDirectory
+            $permissionsResult = Invoke-OwnerModelPreflightCommand -Provider $Provider `
+                -ArgumentList @('help', 'permissions') -AttemptDirectory $attemptDirectory
+            $syntaxResult = Invoke-OwnerModelPreflightCommand -Provider $Provider `
+                -ArgumentList (@($Provider.ArgumentPrefix) + @(
+                        '--model', [string]$Provider.ModelIdentity, '--version'
+                    )) -AttemptDirectory $attemptDirectory
+        }
+        catch {
+            return New-OwnerModelPreflightResult -Provider $Provider -Available $false `
+                -Reason copilot-cli-probe-failed -CredentialState $credentialState `
+                -ProcessContainment $true
+        }
+        $versionMatch = [regex]::Match($versionResult.Stdout, 'GitHub Copilot CLI (?<v>\d+\.\d+\.\d+)')
+        $version = if ($versionMatch.Success) { [version]$versionMatch.Groups['v'].Value } else { $null }
+        $requiredOptions = @(
+            @($Provider.ArgumentPrefix | Where-Object { $_ -clike '--*' }) +
+            @('--model', '--prompt')
+        ) | ForEach-Object { ([string]$_ -split '=', 2)[0] } | Select-Object -Unique
+        $allOptionsDocumented = @($requiredOptions | Where-Object {
+                $helpResult.Stdout -cnotmatch (
+                    [regex]::Escape($_) + '(?![A-Za-z0-9-])')
+            }).Count -eq 0
+        $interfaceValid = $versionResult.ExitCode -eq 0 -and
+            $helpResult.ExitCode -eq 0 -and
+            $permissionsResult.ExitCode -eq 0 -and
+            $syntaxResult.ExitCode -eq 0 -and
+            $null -ne $version -and $version -ge $script:CopilotCliMinimumVersion -and
+            $allOptionsDocumented -and
+            $permissionsResult.Stdout -cmatch (
+                'The --available-tools option\s+disables all other tools') -and
+            $containmentAvailable
+        $available = $false
+        $reason = if (-not $containmentAvailable) {
+            'process-containment-unavailable'
+        }
+        elseif (-not $interfaceValid) {
+            'copilot-cli-interface-unproven'
+        }
+        else {
+            'copilot-cli-confidential-prompt-channel-unavailable'
+        }
+        return [pscustomobject][ordered]@{
+            available = $available
+            reason = $reason
+            credential = [ordered]@{
+                sourceName = [string]$Provider.CredentialEnvironmentName
+                childName = 'COPILOT_GITHUB_TOKEN'
+                state = $credentialState
+            }
+            cliVersion = if ($version) { $version.ToString() } else { 'unknown' }
+            executableSha256 = (Get-OwnerModelBytesDigest -Bytes (
+                    [IO.File]::ReadAllBytes($Provider.FilePath))).Substring(10)
+            modelIdentity = $Provider.ModelIdentity
+            invocationContract = $Provider.InvocationContract
+            invocationVersion = $Provider.InvocationVersion
+            promptTransport = 'unavailable-argv-only'
+            effectiveTools = $(if ($interfaceValid) { @() } else { 'not-proven' })
+            availabilityFilter = $script:CopilotCliNoToolsSentinel
+            environmentNames = @(Get-OwnerModelPolicyEnvironmentNames -Provider $Provider)
+            mcpServers = @()
+            customInstructions = $false
+            memory = $false
+            resume = $false
+            repositoryAccess = $false
+            processContainment = $containmentAvailable
+            providerWrites = 0
+            modelCalls = 0
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $attemptDirectory -PathType Container) {
+            Remove-Item -LiteralPath $attemptDirectory -Recurse -Force
+        }
+        Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
+    }
+}
+
+function New-OwnerModelProcessStartInfo {
+    param(
+        [Parameter(Mandatory)][object]$Invocation
     )
 
     $psi = [Diagnostics.ProcessStartInfo]::new()
-    if ($IsWindows) {
-        $psi.FileName = $FilePath
-        Set-TimedProcessArguments -Psi $psi -ArgumentList (@($ArgumentList) + @($Envelope))
-    }
-    else {
-        $setsid = Get-Command setsid -CommandType Application -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($setsid) {
-            $psi.FileName = [IO.Path]::GetFullPath($setsid.Source)
-            Set-TimedProcessArguments -Psi $psi -ArgumentList (@($FilePath) + @($ArgumentList) + @($Envelope))
-        }
-        else {
-            $perl = Get-Command perl -CommandType Application -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-            if (-not $perl) {
-                throw 'Unix process containment requires a trusted setsid executable or Perl POSIX shim.'
-            }
-            $psi.FileName = [IO.Path]::GetFullPath($perl.Source)
-            Set-TimedProcessArguments -Psi $psi -ArgumentList (@(
-                    '-MPOSIX', '-e',
-                    'POSIX::setsid() >= 0 or die "setsid failed: $!"; exec @ARGV or die "exec failed: $!";',
-                    '--', $FilePath
-                ) + @($ArgumentList) + @($Envelope))
-        }
-    }
+    Set-OwnerModelContainedCommand -Psi $psi -FilePath $Invocation.FilePath `
+        -ArgumentList $Invocation.ArgumentList
+    $psi.WorkingDirectory = $Invocation.WorkingDirectory
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardInput = $true
@@ -588,22 +1349,50 @@ function New-OwnerModelProcessStartInfo {
     $psi.StandardInputEncoding = $utf8
     $psi.StandardOutputEncoding = $utf8
     $psi.StandardErrorEncoding = $utf8
-    foreach ($name in @($psi.Environment.Keys)) {
-        if ($name -match $script:SensitiveEnvironmentPattern) {
-            [void]$psi.Environment.Remove($name)
+    $psi.Environment.Clear()
+    foreach ($entry in $Invocation.Environment.GetEnumerator()) {
+        $psi.Environment[[string]$entry.Key] = [string]$entry.Value
+    }
+    return $psi
+}
+
+function Set-OwnerModelContainedCommand {
+    param(
+        [Parameter(Mandatory)][Diagnostics.ProcessStartInfo]$Psi,
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$ArgumentList
+    )
+    if ($IsWindows) {
+        $Psi.FileName = $FilePath
+        Set-TimedProcessArguments -Psi $Psi -ArgumentList $ArgumentList
+    }
+    else {
+        $setsid = Get-Command setsid -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($setsid) {
+            $Psi.FileName = [IO.Path]::GetFullPath($setsid.Source)
+            Set-TimedProcessArguments -Psi $Psi -ArgumentList (
+                @($FilePath) + @($ArgumentList))
+        }
+        else {
+            $perl = Get-Command perl -CommandType Application -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if (-not $perl) {
+                throw 'Unix process containment requires a trusted setsid executable or Perl POSIX shim.'
+            }
+            $Psi.FileName = [IO.Path]::GetFullPath($perl.Source)
+            Set-TimedProcessArguments -Psi $Psi -ArgumentList (@(
+                    '-MPOSIX', '-e',
+                    'POSIX::setsid() >= 0 or die "setsid failed: $!"; exec @ARGV or die "exec failed: $!";',
+                    '--', $FilePath
+                ) + @($ArgumentList))
         }
     }
-    foreach ($name in (Get-AgentSessionIsolationEnvVars)) {
-        [void]$psi.Environment.Remove($name)
-    }
-    $psi.Environment['DEV_PILOT_OWNER_MODEL_TEST_ONLY'] = '1'
-    return $psi
 }
 
 function Invoke-OwnerModelProcessAttempt {
     param(
-        [Parameter(Mandatory)][string]$FilePath,
-        [Parameter(Mandatory)][string[]]$ArgumentList,
+        [Parameter(Mandatory)][object]$Provider,
         [Parameter(Mandatory)][object]$Request,
         [Parameter(Mandatory)][string]$Nonce,
         [Parameter(Mandatory)][string]$InputDigest,
@@ -614,11 +1403,12 @@ function Invoke-OwnerModelProcessAttempt {
 
     $unitId = [string](Get-OwnerModelMember -Value $Request -Name executionUnitId)
     $envelopeObject = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         semantics = 'owner-model-stimulus-v1'
         nonce = $Nonce
         inputDigest = $InputDigest
         subjectBinding = $SubjectBinding
+        modelIdentity = [string]$Provider.ModelIdentity
         toolCeiling = [ordered]@{
             context = @('capability-stimulus')
             tools = @()
@@ -632,27 +1422,59 @@ function Invoke-OwnerModelProcessAttempt {
     }
     $envelopeJson = ConvertTo-AgentCanonicalJson -InputObject $envelopeObject
     $envelope = ConvertTo-OwnerModelBase64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($envelopeJson))
-    $psi = New-OwnerModelProcessStartInfo -FilePath $FilePath -ArgumentList $ArgumentList -Envelope $envelope
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $psi
+    $attemptDirectory = $null
+    $invocation = $null
+    $process = $null
     $containment = $null
-    $stdoutDrain = [DevPilot.OwnerModelRunner.BoundedByteDrain]::new(
-        $Limits.MaximumStdoutBytes, $Limits.MaximumOutputLines)
-    $stderrDrain = [DevPilot.OwnerModelRunner.BoundedByteDrain]::new(
-        $Limits.MaximumStderrBytes, $Limits.MaximumOutputLines)
+    $stdoutDrain = $null
+    $stderrDrain = $null
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $outcome = 'start-failed'
     $started = $false
+    $exitCode = $null
+    $timeout = 'none'
+    $stdoutBytes = [byte[]]::new(0)
+    $stderrBytes = [byte[]]::new(0)
     try {
-        if (-not $process.Start()) { return [pscustomobject]@{ Started = $false; LatencyMs = 0L; Failure = $outcome } }
+        $attemptDirectory = New-OwnerModelAttemptDirectory -Provider $Provider
+        $invocation = New-OwnerModelInvocation -Provider $Provider `
+            -EnvelopeBase64 $envelope `
+            -AttemptDirectory $attemptDirectory -IncludeCredential:($Provider.Kind -ceq 'copilot-cli')
+        $psi = New-OwnerModelProcessStartInfo -Invocation $invocation
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $psi
+        $stdoutDrain = [DevPilot.OwnerModelRunner.BoundedByteDrain]::new(
+            $Limits.MaximumStdoutBytes, $Limits.MaximumOutputLines)
+        $stderrDrain = [DevPilot.OwnerModelRunner.BoundedByteDrain]::new(
+            $Limits.MaximumStderrBytes, $Limits.MaximumOutputLines)
+        if (-not $process.Start()) {
+            return [pscustomobject]@{
+                Started = $false
+                ModelStarted = $(if ($Provider.ModelStartPolicy -ceq 'always-zero') { $false } else { 'unknown' })
+                LatencyMs = 0L
+                Failure = $outcome
+                AtomicFailure = $false
+                Valid = $false
+                Judgment = 'unknown'
+                InvocationDigest = $invocation.InvocationDigest
+                StdoutDigest = Get-OwnerModelBytesDigest -Bytes $stdoutBytes
+                StderrDigest = Get-OwnerModelBytesDigest -Bytes $stderrBytes
+                ExitCode = $null
+                Timeout = 'none'
+                ResponseBytesBase64 = $null
+                EnvironmentNames = $invocation.EnvironmentNames
+            }
+        }
         $started = $true
         try {
             $containment = New-AgentProcessContainment -Process $process
         }
         catch {
+            $outcome = 'containment-failed'
             Stop-ProcessTree -Process $process
             throw
         }
+        $outcome = 'none'
         $process.StandardInput.Close()
         $stdoutTask = $stdoutDrain.ReadAsync($process.StandardOutput.BaseStream)
         $stderrTask = $stderrDrain.ReadAsync($process.StandardError.BaseStream)
@@ -663,14 +1485,15 @@ function Invoke-OwnerModelProcessAttempt {
             $process.Refresh()
             if ($process.HasExited) { break }
             $now = [DateTime]::UtcNow
-            if ($now -ge $TotalDeadlineUtc) { $outcome = 'total-timeout'; break }
-            if ($now -ge $callDeadlineUtc) { $outcome = 'call-timeout'; break }
+            if ($now -ge $TotalDeadlineUtc) { $outcome = 'total-timeout'; $timeout = 'total'; break }
+            if ($now -ge $callDeadlineUtc) { $outcome = 'call-timeout'; $timeout = 'call'; break }
             $lastActivity = [Math]::Max(
                 $stdoutDrain.LastActivityTimestamp,
                 $stderrDrain.LastActivityTimestamp)
             $activityMs = 1000.0 * ([Diagnostics.Stopwatch]::GetTimestamp() - $lastActivity) / $frequency
             if ($activityMs -ge $Limits.ActivityDeadlineMilliseconds) {
                 $outcome = 'activity-timeout'
+                $timeout = 'activity'
                 break
             }
             if ($stdoutDrain.Overflowed -or $stderrDrain.Overflowed) {
@@ -711,34 +1534,105 @@ function Invoke-OwnerModelProcessAttempt {
             $outcome = 'early-exit'
         }
         else {
+            $exitCode = $process.ExitCode
+            $stdoutBytes = $stdoutDrain.GetBytes()
+            $stderrBytes = $stderrDrain.GetBytes()
             $parsed = ConvertFrom-OwnerModelResponseBytes `
-                -Bytes $stdoutDrain.GetBytes() `
+                -Bytes $stdoutBytes `
                 -ExpectedNonce $Nonce `
                 -ExpectedInputDigest $InputDigest `
                 -ExpectedSubjectBinding $SubjectBinding `
-                -ExpectedExecutionUnitId $unitId
+                -ExpectedExecutionUnitId $unitId `
+                -ExpectedModelIdentity ([string]$Provider.ModelIdentity)
             $stopwatch.Stop()
             return [pscustomobject]@{
                 Started = $true
+                ModelStarted = $(if ($Provider.ModelStartPolicy -ceq 'always-zero') {
+                        $false
+                    }
+                    elseif ($parsed.Valid) {
+                        $true
+                    }
+                    else {
+                        'unknown'
+                    })
                 LatencyMs = $stopwatch.ElapsedMilliseconds
                 Failure = $parsed.Failure
                 AtomicFailure = $parsed.AtomicFailure
                 Valid = $parsed.Valid
                 Judgment = $parsed.Judgment
+                InvocationDigest = $invocation.InvocationDigest
+                StdoutDigest = Get-OwnerModelBytesDigest -Bytes $stdoutBytes
+                StderrDigest = Get-OwnerModelBytesDigest -Bytes $stderrBytes
+                ExitCode = $exitCode
+                Timeout = $timeout
+                ResponseBytesBase64 = $(if ($parsed.Valid) {
+                        [Convert]::ToBase64String([byte[]]$parsed.MarkerBytes)
+                    }
+                    else {
+                        $null
+                    })
+                EnvironmentNames = $invocation.EnvironmentNames
             }
         }
+        if ($process.HasExited) { $exitCode = $process.ExitCode }
+        $stdoutBytes = $stdoutDrain.GetBytes()
+        $stderrBytes = $stderrDrain.GetBytes()
         $stopwatch.Stop()
         return [pscustomobject]@{
             Started = $started
+            ModelStarted = $(if ($Provider.ModelStartPolicy -ceq 'always-zero') {
+                    $false
+                }
+                else {
+                    'unknown'
+                })
             LatencyMs = $stopwatch.ElapsedMilliseconds
             Failure = $outcome
             AtomicFailure = $false
             Valid = $false
             Judgment = 'unknown'
+            InvocationDigest = $invocation.InvocationDigest
+            StdoutDigest = Get-OwnerModelBytesDigest -Bytes $stdoutBytes
+            StderrDigest = Get-OwnerModelBytesDigest -Bytes $stderrBytes
+            ExitCode = $exitCode
+            Timeout = $timeout
+            ResponseBytesBase64 = $null
+            EnvironmentNames = $invocation.EnvironmentNames
+        }
+    }
+    catch {
+        $stopwatch.Stop()
+        $failure = if ($outcome -cne 'none') { $outcome } else { 'process-failed' }
+        return [pscustomobject]@{
+            Started = $started
+            ModelStarted = $(if ($Provider.ModelStartPolicy -ceq 'always-zero') {
+                    $false
+                }
+                else {
+                    'unknown'
+                })
+            LatencyMs = $stopwatch.ElapsedMilliseconds
+            Failure = $failure
+            AtomicFailure = $false
+            Valid = $false
+            Judgment = 'unknown'
+            InvocationDigest = $(if ($invocation) {
+                    $invocation.InvocationDigest
+                }
+                else {
+                    'v1:sha256:' + ('0' * 64)
+                })
+            StdoutDigest = Get-OwnerModelBytesDigest -Bytes $stdoutBytes
+            StderrDigest = Get-OwnerModelBytesDigest -Bytes $stderrBytes
+            ExitCode = $exitCode
+            Timeout = $timeout
+            ResponseBytesBase64 = $null
+            EnvironmentNames = $(if ($invocation) { @($invocation.EnvironmentNames) } else { @() })
         }
     }
     finally {
-        if ($started -and -not $process.HasExited) {
+        if ($process -and $started -and -not $process.HasExited) {
             if ($containment) {
                 [void](Stop-AgentProcessContainment -Containment $containment -Process $process)
             }
@@ -747,28 +1641,48 @@ function Invoke-OwnerModelProcessAttempt {
             }
         }
         Close-AgentProcessContainment -Containment $containment
-        $process.Dispose()
+        if ($process) { $process.Dispose() }
+        if ($attemptDirectory -and (Test-Path -LiteralPath $attemptDirectory -PathType Container)) {
+            Remove-Item -LiteralPath $attemptDirectory -Recurse -Force
+        }
+        Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
     }
 }
 
-function New-OwnerModelTestProcessRunner {
-    [CmdletBinding()]
+function New-OwnerModelProviderRunner {
     param(
-        [Parameter(Mandatory)][string]$FilePath,
-        [string[]]$ArgumentList = @(),
+        [Parameter(Mandatory)][object]$Provider,
         [DevPilot.OwnerModelRunner.OwnerModelRunnerLimits]$Limits = (New-OwnerModelRunnerLimits),
-        [string]$Name = 'owner-model-contained-test-child'
+        [Parameter(Mandatory)][string]$Name
     )
 
+    Assert-OwnerModelProvider -Provider $Provider
     Assert-OwnerModelText -Value $Name -Name Name -MaximumLength 128
-    $absolute = [IO.Path]::GetFullPath($FilePath)
-    if (-not [IO.Path]::IsPathFullyQualified($absolute) -or
-        -not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
-        throw 'Test child executable must be an existing absolute file.'
+    $policyEnvironmentNames = @(Get-OwnerModelPolicyEnvironmentNames -Provider $Provider)
+    $providerTelemetry = [ordered]@{
+        kind = [string]$Provider.Kind
+        name = [string]$Provider.Name
+        modelIdentity = [string]$Provider.ModelIdentity
+        invocationContract = [string]$Provider.InvocationContract
+        invocationVersion = [string]$Provider.InvocationVersion
+        executableSha256 = (Get-OwnerModelBytesDigest -Bytes (
+                [IO.File]::ReadAllBytes($Provider.FilePath))).Substring(10)
     }
-    $capturedArguments = @($ArgumentList)
+    $policyTelemetry = [ordered]@{
+        availableTools = @()
+        mcpServers = @()
+        customInstructions = $false
+        memory = $false
+        resume = $false
+        repositoryAccess = $false
+        networkAccess = $Provider.Kind -ceq 'copilot-cli'
+        providerWrite = $false
+        environmentNames = @($policyEnvironmentNames | Sort-Object -Unique)
+        workingDirectory = 'fresh-isolated-directory-with-bounded-stimulus'
+    }
+    $capturedProvider = $Provider
     $capturedLimits = $Limits
-    $telemetry = New-OwnerModelTelemetryState
+    $telemetry = New-OwnerModelTelemetryState -Provider $providerTelemetry -Policy $policyTelemetry
     $getMemberCommand = Get-Command Get-OwnerModelMember -CommandType Function
     $getInputDigestCommand = Get-Command Get-OwnerModelInputDigest -CommandType Function
     $getSubjectBindingCommand = Get-Command Get-OwnerModelSubjectBinding -CommandType Function
@@ -776,27 +1690,33 @@ function New-OwnerModelTestProcessRunner {
     $addTelemetryCommand = Get-Command Add-OwnerModelTelemetryRecord -CommandType Function
     $getTelemetryCommand = Get-Command Get-OwnerModelTelemetrySnapshot -CommandType Function
     $newNonceCommand = Get-Command New-AgentNonce -CommandType Function
+    $executionUnitPattern = $script:ExecutionUnitPattern
     $handler = {
         param($request)
         $unitId = [string](& $getMemberCommand -Value $request -Name executionUnitId)
-        if ($unitId -cnotmatch $script:ExecutionUnitPattern) {
+        if ($unitId -cnotmatch $executionUnitPattern) {
             throw 'Owner model runner received an invalid execution-unit reference.'
         }
         $totalDeadlineUtc = [DateTime]::UtcNow.AddMilliseconds(
             $capturedLimits.TotalDeadlineMilliseconds)
         $judgment = 'unknown'
         for ($attempt = 1; $attempt -le $capturedLimits.MaximumAttemptsPerUnit; $attempt++) {
-            if ([DateTime]::UtcNow -ge $totalDeadlineUtc) {
-                & $addTelemetryCommand -State $telemetry -ExecutionUnitId $unitId `
-                    -Attempt $attempt -ModelStarted $false -LatencyMilliseconds 0 -Outcome 'total-timeout'
-                break
-            }
             $nonce = & $newNonceCommand
             $inputDigest = & $getInputDigestCommand -Request $request
             $subjectBinding = & $getSubjectBindingCommand -ExecutionUnitId $unitId
+            if ([DateTime]::UtcNow -ge $totalDeadlineUtc) {
+                & $addTelemetryCommand -State $telemetry -ExecutionUnitId $unitId `
+                    -Attempt $attempt -ProcessStarted $false -ModelStarted $false `
+                    -LatencyMilliseconds 0 -Outcome 'total-timeout' `
+                    -InputDigest $inputDigest -Nonce $nonce -SubjectBinding $subjectBinding `
+                    -InvocationDigest ('v1:sha256:' + ('0' * 64)) `
+                    -StdoutDigest ('v1:sha256:' + ('0' * 64)) `
+                    -StderrDigest ('v1:sha256:' + ('0' * 64)) `
+                    -ExitCode $null -Timeout total -ResponseBytesBase64 $null
+                break
+            }
             $result = & $invokeAttemptCommand `
-                -FilePath $absolute `
-                -ArgumentList $capturedArguments `
+                -Provider $capturedProvider `
                 -Request $request `
                 -Nonce $nonce `
                 -InputDigest $inputDigest `
@@ -804,8 +1724,15 @@ function New-OwnerModelTestProcessRunner {
                 -Limits $capturedLimits `
                 -TotalDeadlineUtc $totalDeadlineUtc
             & $addTelemetryCommand -State $telemetry -ExecutionUnitId $unitId `
-                -Attempt $attempt -ModelStarted ([bool]$result.Started) `
-                -LatencyMilliseconds ([long]$result.LatencyMs) -Outcome ([string]$result.Failure)
+                -Attempt $attempt -ProcessStarted ([bool]$result.Started) `
+                -ModelStarted $result.ModelStarted `
+                -LatencyMilliseconds ([long]$result.LatencyMs) -Outcome ([string]$result.Failure) `
+                -InputDigest $inputDigest -Nonce $nonce -SubjectBinding $subjectBinding `
+                -InvocationDigest ([string]$result.InvocationDigest) `
+                -StdoutDigest ([string]$result.StdoutDigest) `
+                -StderrDigest ([string]$result.StderrDigest) `
+                -ExitCode $result.ExitCode -Timeout ([string]$result.Timeout) `
+                -ResponseBytesBase64 $result.ResponseBytesBase64
             if ($result.Valid) {
                 $judgment = [string]$result.Judgment
                 break
@@ -828,20 +1755,33 @@ function New-OwnerModelTestProcessRunner {
 function New-OwnerModelProcessRunner {
     [CmdletBinding()]
     param(
-        [string]$FilePath,
-        [string[]]$ArgumentList = @(),
+        [Parameter(Mandatory)][object]$Provider,
         [DevPilot.OwnerModelRunner.OwnerModelRunnerLimits]$Limits = (New-OwnerModelRunnerLimits),
-        [string]$Name = 'owner-model-process-unavailable'
+        [switch]$EnableRealLaunch,
+        [string]$Name = 'owner-model-contained-provider'
     )
 
-    throw '[owner-model-launch-unavailable] Current model CLI no-tools enforcement is not proven; live launch is fail-closed.'
+    Assert-OwnerModelProvider -Provider $Provider
+    if ($Provider.Kind -ceq 'copilot-cli') {
+        if (-not $EnableRealLaunch) {
+            throw '[owner-model-launch-unavailable] Real model launch requires explicit -EnableRealLaunch opt-in.'
+        }
+        $preflight = Test-OwnerModelProviderPreflight -Provider $Provider
+        if (-not $preflight.available) {
+            throw "[owner-model-launch-unavailable] $($preflight.reason)"
+        }
+    }
+    return New-OwnerModelProviderRunner -Provider $Provider -Limits $Limits -Name $Name
 }
 
 Export-ModuleMember -Function @(
     'Get-OwnerModelRunnerTelemetry',
+    'New-OwnerCopilotCliModelProvider',
+    'New-OwnerModelFakeProvider',
     'New-OwnerModelProcessRunner',
     'New-OwnerModelReplayFixture',
     'New-OwnerModelReplayRecord',
     'New-OwnerModelReplayRunner',
-    'New-OwnerModelRunnerLimits'
+    'New-OwnerModelRunnerLimits',
+    'Test-OwnerModelProviderPreflight'
 )

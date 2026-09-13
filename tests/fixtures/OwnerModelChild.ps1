@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory)][string]$Mode,
     [string]$StatePath,
-    [Parameter(Mandatory)][string]$Envelope
+    [Parameter(Mandatory)][string]$EnvelopePath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,7 +22,8 @@ function ConvertTo-Base64Url([byte[]]$Bytes) {
     return [Convert]::ToBase64String($Bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
 
-$inputObject = [Text.Encoding]::UTF8.GetString((ConvertFrom-Base64Url $Envelope)) |
+$envelope = [IO.File]::ReadAllText($EnvelopePath, [Text.Encoding]::UTF8)
+$inputObject = [Text.Encoding]::UTF8.GetString((ConvertFrom-Base64Url $envelope)) |
     ConvertFrom-Json -AsHashtable -Depth 16
 $unitId = [string]$inputObject.stimulus.executionUnitId
 $judgment = if ([string]$inputObject.stimulus.construct.name -match 'Compliant') {
@@ -32,10 +33,11 @@ else {
     'violation'
 }
 $response = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     nonce = $inputObject.nonce
     inputDigest = $inputObject.inputDigest
     subjectBinding = $inputObject.subjectBinding
+    modelIdentity = $inputObject.modelIdentity
     responses = @([ordered]@{ executionUnitId = $unitId; judgment = $judgment })
 }
 
@@ -52,6 +54,8 @@ switch ($Mode) {
     'wrong-nonce' { $response.nonce = '0' * 36 }
     'wrong-digest' { $response.inputDigest = 'v1:sha256:' + ('0' * 64) }
     'wrong-subject' { $response.subjectBinding = 'v1:sha256:' + ('0' * 64) }
+    'wrong-model' { $response.modelIdentity = 'wrong-model' }
+    'rationale' { $response.responses[0].rationale = 'Bounded deterministic rationale.' }
     'malformed-marker' {
         [Console]::Out.WriteLine('DEV_PILOT_OWNER_RESULT !!!')
         exit 0
@@ -59,6 +63,10 @@ switch ($Mode) {
     'malformed-json' {
         $bytes = [Text.Encoding]::UTF8.GetBytes('{')
         [Console]::Out.WriteLine('DEV_PILOT_OWNER_RESULT ' + (ConvertTo-Base64Url $bytes))
+        exit 0
+    }
+    'missing-schema' {
+        [Console]::Out.WriteLine('DEV_PILOT_OWNER_RESULT_JSON {"unexpected":true}')
         exit 0
     }
     'malformed-schema' { $response.Remove('responses') }
@@ -114,6 +122,19 @@ switch ($Mode) {
             toolCeiling = $inputObject.toolCeiling
             sensitiveEnvironmentNames = $sensitiveNames
             testOnly = $env:DEV_PILOT_OWNER_MODEL_TEST_ONLY
+            currentDirectory = [Environment]::CurrentDirectory
+            envelopeFile = [IO.Path]::GetFileName($EnvelopePath)
+            commandLineContainsSnippet = [Environment]::CommandLine.Contains(
+                [string]$inputObject.stimulus.construct.snippet,
+                [StringComparison]::Ordinal)
+            directoryEntries = @(
+                Get-ChildItem -LiteralPath ([Environment]::CurrentDirectory) -Force |
+                    Select-Object -ExpandProperty Name |
+                    Sort-Object
+            )
+            environmentNames = @(
+                Get-ChildItem env: | Select-Object -ExpandProperty Name | Sort-Object
+            )
         }
         [IO.File]::WriteAllText(
             $StatePath,

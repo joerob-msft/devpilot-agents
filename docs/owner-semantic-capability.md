@@ -72,10 +72,12 @@ under a dedicated v2 preview state root and pass that sanitized local artifact
 to the observer. It must not share, migrate, repair, or reinterpret deployed v1
 state.
 
-Layer 4 adds a bounded out-of-process test-child adapter and exact offline
-response replay through the same parser. Live model launch remains fail-closed
-until a model CLI can prove a literal read-only/no-tools mode. See
-`owner-model-runner.md`.
+The no-tools launcher layer adds a bounded out-of-process Copilot CLI provider,
+a deterministic fake process, and exact offline response replay through the
+same parser. Real launch is explicit opt-in and remains fail-closed. The
+no-call preflight proves the literal empty tool set and isolated environment,
+then reports that the supported CLI lacks a confidential prompt channel
+compatible with closed stdin. See `owner-model-runner.md`.
 
 ## Safety and migration status
 
@@ -89,7 +91,7 @@ Later layers must separately add and validate:
 
 - a parallel scheduler/orchestrator with separate preview state;
 - a sustained parity cohort;
-- a proven no-tools real model launch mode;
+- a prospective real-model parity cohort using the proven no-tools launch mode;
 - writer compatibility;
 - relation-aware capabilities; and
 - an explicit cutover and rollback plan.
