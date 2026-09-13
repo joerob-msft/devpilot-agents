@@ -722,7 +722,7 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
 
         $replayState = New-TestStateRoot
         $replay = & "$PSScriptRoot\..\tools\Invoke-OwnerV2Preview.ps1" prepare-run `
-            -StateRoot $replayState -ManifestPath $script:FixturePath
+            -StateRoot $replayState -ManifestPath $manifestPath
         $replay.records[0].state | Should -Be 'completed'
     }
 }
