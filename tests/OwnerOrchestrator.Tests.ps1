@@ -1,11 +1,14 @@
 BeforeAll {
     Import-Module "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1" -Force
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1" -Force
+    Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerModelRunner\DevPilot.OwnerModelRunner.psd1" -Force
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1" -Force
 
     $script:FixturePath = (Resolve-Path "$PSScriptRoot\fixtures\owner-orchestrator\generic-cohort.json").Path
     $script:SchemaPath = (Resolve-Path "$PSScriptRoot\fixtures\owner-orchestrator\owner-v2-preview-cohort.schema.json").Path
     $script:OrchestratorModule = Get-Module DevPilot.OwnerOrchestrator
+    $script:OwnerModelChild = (Resolve-Path "$PSScriptRoot\fixtures\OwnerModelChild.ps1").Path
+    $script:Pwsh = (Get-Command pwsh).Source
 
     function Get-TestDigest {
         param([Parameter(Mandatory)][string]$Text)
@@ -99,6 +102,53 @@ BeforeAll {
             Select-Object -First 1
         return Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json -AsHashtable -Depth 64
     }
+
+    function New-TestLiveContext {
+        param([Parameter(Mandatory)][string]$Name, [switch]$CopilotProvider)
+        $manifest = New-TestManifest
+        $package = Copy-TestValue $manifest.entries[0].acquisition.package
+        $manifest.entries[0].mode = 'live'
+        $manifest.entries[0].Remove('replay')
+        $manifest.entries[0].acquisition.Remove('package')
+        $manifest.entries[0].model.id = if ($CopilotProvider) { 'gpt-5.6-sol' }
+        else { 'deterministic-fake-process' }
+        $manifest.entries[0].model.digest = Get-TestDigest $manifest.entries[0].model.id
+        $manifestPath = Write-TestJson -Path (Join-Path $TestDrive $Name) -Value $manifest
+        $acquisitionProvider = & $script:OrchestratorModule {
+            param($Package)
+            $state = @{ SubjectReads = 0 }
+            $captured = $Package
+            New-OwnerReadOnlyProviderAdapter -Name 'orchestrator-live-fixture' -Handler {
+                param($Operation, $Arguments)
+                switch ($Operation) {
+                    'GetSubject' {
+                        $value = if ($state.SubjectReads++ -eq 0) { $captured.subjectBefore }
+                        else { $captured.subjectAfter }
+                        return $value
+                    }
+                    'GetChangedFilesPage' { return $captured.changePages[[int]$Arguments.pageOrdinal] }
+                    'GetRule' { return $captured.rule }
+                    'GetFile' { return @($captured.files | Where-Object path -CEQ $Arguments.path)[0] }
+                }
+            }.GetNewClosure()
+        } $package
+        $provider = if ($CopilotProvider) {
+            & $script:OrchestratorModule {
+                param($Pwsh)
+                New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol -FilePath $Pwsh `
+                    -CredentialEnvironmentName GH_TOKEN
+            } $script:Pwsh
+        }
+        else {
+            & $script:OrchestratorModule {
+                param($Pwsh, $Child)
+                New-OwnerModelFakeProvider -FilePath $Pwsh -ArgumentList @(
+                    '-NoProfile', '-File', $Child, 'valid', '-')
+            } $script:Pwsh $script:OwnerModelChild
+        }
+        return [pscustomobject]@{ ManifestPath = $manifestPath
+            AcquisitionProvider = $acquisitionProvider; ModelProvider = $provider }
+    }
 }
 
 Describe 'Owner v2 preview orchestrator manifest and state' {
@@ -132,7 +182,7 @@ Describe 'Owner v2 preview orchestrator manifest and state' {
         $result.records[0].capabilityRoot | Should -Match 'schema-1'
         $result.records[0].capabilityRoot | Should -Not -Match '(keys|queues|ledgers|audits|subjects)'
         Get-Content -LiteralPath $v1Sentinel -Raw | Should -BeExactly 'v1-sentinel'
-        foreach ($leaf in @('declarations', 'records', 'evidence', 'observations', 'index', 'staging')) {
+        foreach ($leaf in @('declarations', 'records', 'evidence', 'observations', 'telemetry', 'index', 'staging')) {
             Test-Path -LiteralPath (Join-Path $result.records[0].capabilityRoot $leaf) | Should -BeTrue
         }
         $index = Get-Content -LiteralPath (Join-Path $result.records[0].capabilityRoot (Join-Path 'index' 'records.json')) -Raw |
@@ -352,7 +402,7 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $observation.findings.identity | Should -Contain 'owner-v2:4bc00185dca8dd54e89d01a35990b46d8cb31ed777f2dd0fdf9175cf6f80dca9'
     }
 
-    It 'fails live declarations closed before provider or model launch' {
+    It 'fails live declarations closed before provider or model launch unless explicitly enabled' {
         $stateRoot = New-TestStateRoot
         $manifestPath = New-TestManifestFile -Name 'live.json' -Mutator {
             param($m)
@@ -367,18 +417,106 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $observation = Get-TestObservation -StateRoot $stateRoot
 
         $run.records[0].state | Should -Be 'incomplete'
-        $run.records[0].reason | Should -Be 'launcher-unavailable'
-        $observation.schemaVersion | Should -Be 2
-        $observation.implementation.version | Should -Be '0.2.0'
-        $observationJson = $observation | ConvertTo-Json -Depth 64 -Compress
-        $observationSchema = Join-Path $PSScriptRoot `
-            '..\src\OwnerObserver\schemas\owner-observation.v1.json'
-        Test-Json -Json $observationJson -SchemaFile $observationSchema | Should -BeTrue
-        $observation.execution.modelStarts | Should -Be 'unknown'
-        $observation.measurements.execution.modelStarts.status | Should -Be 'unavailable'
-        $observation.execution.refusalReason | Should -Be 'launcher-unavailable'
+        $run.records[0].reason | Should -Be 'live-model-disabled'
+        $observation.execution.modelStarts | Should -Be 0
+        $observation.measurements.execution.modelStarts.status | Should -Be 'measured'
+        $observation.execution.refusalReason | Should -Be 'live-model-disabled'
         $observation.effects.providerWrites | Should -Be 0
         $observation.effects.writeToolInvocations | Should -Be 0
+    }
+
+    It 'injects the existing provider runner into live semantic units with exact zero-write telemetry' {
+        $stateRoot = New-TestStateRoot
+        $live = New-TestLiveContext -Name 'live-fake.json'
+        [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
+                -ManifestPath $live.ManifestPath)
+
+        $run = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $live.ManifestPath `
+            -EnableLiveModel -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $observation = Get-TestObservation -StateRoot $stateRoot
+        $telemetry = Get-Content -LiteralPath $run.records[0].telemetryPath -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+
+        $run.records[0].state | Should -Be 'completed'
+        $observation.execution.attempts | Should -Be 1
+        $observation.counts.eligible | Should -BeGreaterThan 0
+        @($telemetry.Keys) | Should -Be @(
+            'acceptedArgvRisk', 'attempts', 'effectiveTools', 'latencyMs', 'modelCalls',
+            'modelStarts', 'modelStartsMinimum', 'policy', 'provider', 'providerWrites',
+            'records', 'refusalReason', 'writeToolInvocations')
+        @($telemetry.effectiveTools).Count | Should -Be 0
+        @($telemetry.policy.availableTools).Count | Should -Be 0
+        @($telemetry.attempts, $telemetry.modelCalls, $telemetry.modelStarts,
+            $telemetry.providerWrites, $telemetry.writeToolInvocations) |
+            Should -Be @(1, 0, 0, 0, 0)
+        $telemetry.refusalReason | Should -Be 'none'
+        $telemetry.acceptedArgvRisk.promptTransport | Should -Be 'private-file'
+        $telemetry.acceptedArgvRisk.accepted | Should -BeFalse
+        @($observation.sourceArtifacts | Where-Object kind -CEQ owner-model-runner-telemetry).Count |
+            Should -Be 1
+    }
+
+    It 'propagates real provider preflight unavailability as truthful incomplete telemetry' {
+        $prior = $env:GH_TOKEN
+        try {
+            $env:GH_TOKEN = 'gho_testcredentialvalue'
+            $stateRoot = New-TestStateRoot
+            $live = New-TestLiveContext -Name 'live-preflight.json' -CopilotProvider
+            [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
+                    -ManifestPath $live.ManifestPath)
+
+            $run = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $live.ManifestPath `
+                -EnableLiveModel -LiveAcquisitionProvider $live.AcquisitionProvider `
+                -LiveModelProvider $live.ModelProvider
+            $observation = Get-TestObservation -StateRoot $stateRoot
+            $telemetry = Get-Content -LiteralPath $run.records[0].telemetryPath -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 64
+
+            $run.records[0].state | Should -Be 'incomplete'
+            $run.records[0].reason | Should -Be 'copilot-cli-publisher-identity-unproven'
+            $observation.execution.refusalReason | Should -Be $run.records[0].reason
+            @($observation.execution.attempts, $telemetry.modelCalls,
+                $telemetry.providerWrites) | Should -Be @(0, 0, 0)
+            @($telemetry.effectiveTools).Count | Should -Be 0
+            $telemetry.acceptedArgvRisk.promptTransport | Should -Be 'argv'
+            $telemetry.acceptedArgvRisk.localProcessMetadataExposure | Should -BeTrue
+            $telemetry.acceptedArgvRisk.accepted | Should -BeTrue
+        }
+        finally {
+            $env:GH_TOKEN = $prior
+        }
+    }
+
+    It 'reuses a completed live result without another provider call' {
+        $stateRoot = New-TestStateRoot
+        $live = New-TestLiveContext -Name 'live-idempotent.json'
+        [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
+                -ManifestPath $live.ManifestPath)
+        $first = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $live.ManifestPath `
+            -EnableLiveModel -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $before = [IO.File]::ReadAllBytes($first.records[0].telemetryPath)
+
+        $second = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $live.ManifestPath `
+            -EnableLiveModel -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $after = [IO.File]::ReadAllBytes($first.records[0].telemetryPath)
+
+        $second.records[0].reason | Should -Be 'already-terminal'
+        [Convert]::ToHexString($after) | Should -BeExactly ([Convert]::ToHexString($before))
+        (Get-Content -LiteralPath $first.records[0].telemetryPath -Raw |
+            ConvertFrom-Json -AsHashtable).attempts | Should -Be 1
+    }
+
+    It 'fails its live wiring mutation guard when provider runner construction is removed' {
+        $source = Get-Content -LiteralPath (
+            Join-Path $PSScriptRoot '..\src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psm1') -Raw
+        $wiring = 'New-OwnerModelProcessRunner -Provider $provider'
+
+        $source | Should -Match ([regex]::Escape($wiring))
+        ($source.Replace($wiring, 'New-OwnerModelReplayRunner')) |
+            Should -Not -Match ([regex]::Escape($wiring))
     }
 
     It 'handles unknown units and partial evidence without launching a model' {
@@ -581,5 +719,10 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
             -StateRoot $stateRoot -ManifestPath $manifestPath
         $output.kind | Should -Be 'owner-v2-preview-status'
         $output.records[0].state | Should -Be 'unknown'
+
+        $replayState = New-TestStateRoot
+        $replay = & "$PSScriptRoot\..\tools\Invoke-OwnerV2Preview.ps1" prepare-run `
+            -StateRoot $replayState -ManifestPath $manifestPath
+        $replay.records[0].state | Should -Be 'completed'
     }
 }
