@@ -24,10 +24,12 @@ function Get-OwnerParityMember {
         if ($Value.Contains($Name)) { return $Value[$Name] }
         return $Default
     }
+
     if ($null -ne $Value) {
         $property = $Value.PSObject.Properties[$Name]
         if ($null -ne $property) { return $property.Value }
     }
+
     return $Default
 }
 
@@ -39,6 +41,59 @@ function Get-OwnerParitySha256 {
 function Get-OwnerParityTextSha256 {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
     return Get-OwnerParitySha256 -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($Text))
+}
+
+function Assert-OwnerParityProspectiveTelemetry {
+    param(
+        [Parameter(Mandatory)][object]$Observation,
+        [Parameter(Mandatory)][string]$TelemetryPath,
+        [Parameter(Mandatory)][string]$V2StateRoot
+    )
+    $resolved = Resolve-OwnerParityAbsolutePath `
+        -Path $TelemetryPath -Name candidate.telemetryPath -Kind File
+    if (-not (Test-OwnerParityPathWithin -Path $resolved -Root $V2StateRoot)) {
+        throw 'Candidate telemetryPath must be inside V2StateRoot.'
+    }
+    $bytes = [IO.File]::ReadAllBytes($resolved)
+    if ($bytes.Length -gt 4MB) { throw 'Candidate telemetry exceeds 4 MiB.' }
+    try {
+        $telemetry = ([Text.UTF8Encoding]::new($false, $true).GetString($bytes)) |
+            ConvertFrom-Json -AsHashtable -Depth 64
+    }
+    catch {
+        throw 'Candidate telemetry failed UTF-8 JSON validation.'
+    }
+    $telemetrySha = Get-OwnerParitySha256 -Bytes $bytes
+    $artifactMatches = @($Observation.sourceArtifacts | Where-Object {
+            [string]$_.kind -ceq 'owner-model-runner-telemetry' -and
+            [string]$_.sha256 -ceq $telemetrySha
+        })
+    $attempts = Get-OwnerParityMember $telemetry 'attempts'
+    $latency = Get-OwnerParityMember $telemetry 'latencyMs'
+    $modelStarts = Get-OwnerParityMember $telemetry 'modelStarts'
+    $records = @(Get-OwnerParityMember $telemetry 'records')
+    $provider = Get-OwnerParityMember $telemetry 'provider'
+    $policy = Get-OwnerParityMember $telemetry 'policy'
+    if ($artifactMatches.Count -ne 1 -or
+        [string](Get-OwnerParityMember $provider 'kind') -cne 'copilot-cli' -or
+        [string]::IsNullOrWhiteSpace([string](Get-OwnerParityMember $provider 'modelIdentity')) -or
+        @(Get-OwnerParityMember $telemetry 'effectiveTools').Count -ne 0 -or
+        [int](Get-OwnerParityMember $telemetry 'providerWrites' -1) -ne 0 -or
+        @(Get-OwnerParityMember $policy 'availableTools').Count -ne 0 -or
+        (Get-OwnerParityMember $policy 'providerWrite' $true) -ne $false -or
+        $attempts -is [bool] -or
+        ($attempts -isnot [int] -and $attempts -isnot [long]) -or
+        [long]$attempts -ne [long]$Observation.execution.attempts -or
+        $records.Count -ne [long]$attempts -or
+        $latency -is [bool] -or
+        ($latency -isnot [int] -and $latency -isnot [long]) -or
+        [long]$latency -ne [long]$Observation.execution.latencyMs -or
+        [string]$modelStarts -cne [string]$Observation.execution.modelStarts -or
+        ([long]$attempts -gt 0 -and
+            @($records | Where-Object processStarted -eq $true).Count -eq 0)) {
+        throw 'Candidate prospective telemetry did not prove the normalized real-model execution.'
+    }
+    return $telemetry
 }
 
 function Test-OwnerParityPathWithin {
@@ -317,9 +372,6 @@ function Invoke-OwnerParityGateEvaluation {
             if ($null -ne $baselineSelector -and $null -eq $baselineFinding) {
                 throw "Adjudication '$([string](Get-OwnerParityMember $unit 'key'))' references a missing baseline finding."
             }
-            if ($null -ne $candidateSelector -and $null -eq $candidateFinding) {
-                throw "Adjudication '$([string](Get-OwnerParityMember $unit 'key'))' references a missing candidate finding."
-            }
             [pscustomobject][ordered]@{
                 source = $unit
                 baselineFinding = $baselineFinding
@@ -417,6 +469,14 @@ function Invoke-OwnerParityGateEvaluation {
     $mappedCandidateViolationKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $eligibleFalsePositives = 0
     $unadjudicatedCandidateViolations = 0
+    $unresolvedNonRetentionSelectors = @($units | Where-Object {
+            $null -ne (Get-OwnerParityMember $_.source 'candidate') -and
+            $null -eq $_.candidateFinding -and
+            -not (
+                [string](Get-OwnerParityMember $_.source 'eligibility') -ceq 'method' -and
+                [string](Get-OwnerParityMember $_.source 'truth') -ceq 'violation'
+            )
+        }).Count
     foreach ($unit in $units) {
         if ($null -eq $unit.candidateFinding -or
             [string]$unit.candidateFinding.disposition -cne 'violation') { continue }
@@ -440,6 +500,11 @@ function Invoke-OwnerParityGateEvaluation {
         New-OwnerParityGate -Name eligibleFalsePositives -Status blocked `
             -EvidenceCode 'candidate-findings-incomplete' -Measured $candidateViolationMetric `
             -Blocked ([Math]::Max(1, $unadjudicatedCandidateViolations))
+    }
+    elseif ($unresolvedNonRetentionSelectors -gt 0) {
+        New-OwnerParityGate -Name eligibleFalsePositives -Status blocked `
+            -EvidenceCode 'candidate-selectors-unresolved' -Measured $candidateViolations.Count `
+            -Blocked $unresolvedNonRetentionSelectors
     }
     elseif ($truthCoverage -cne 'complete') {
         New-OwnerParityGate -Name eligibleFalsePositives -Status blocked `
@@ -501,6 +566,12 @@ function Invoke-OwnerParityGateEvaluation {
             -EvidenceCode 'binding-mismatch' `
             -Measured (($bindingFields.Count - $bindingUnknown) + $anchorMeasured) `
             -Failures ($bindingMismatches + $anchorFailures)
+    }
+    elseif ($unresolvedNonRetentionSelectors -gt 0) {
+        New-OwnerParityGate -Name bindingEquivalence -Status blocked `
+            -EvidenceCode 'candidate-selectors-unresolved' `
+            -Measured (($bindingFields.Count - $bindingUnknown) + $anchorMeasured) `
+            -Blocked $unresolvedNonRetentionSelectors
     }
     elseif ($bindingUnknown -eq $bindingFields.Count) {
         New-OwnerParityGate -Name bindingEquivalence -Status notMeasured `
@@ -698,12 +769,20 @@ function Read-OwnerParityManifest {
             throw "Owner parity qualification baseline headKey '$($entry.baseline.headKey)' is duplicated."
         }
         if ([string]$entry.candidate.mode -ceq 'read') {
-            if ([string]$entry.evidence.semanticProvenance -cne 'unknown') {
-                throw "Owner parity qualification entry '$($entry.id)' must declare unknown semantic provenance for a read candidate."
+            $candidateProvenance = [string](Get-OwnerParityMember `
+                    $entry.candidate 'semanticProvenance' 'unknown')
+            if ([string]$entry.evidence.semanticProvenance -cne $candidateProvenance) {
+                throw "Owner parity qualification entry '$($entry.id)' candidate and evidence provenance must match."
             }
             $candidateReference = 'read|' + (Resolve-OwnerParityAbsolutePath `
                     -Path ([string]$entry.candidate.observationPath) `
-                    -Name candidate.observationPath -Kind File -AllowMissing)
+                    -Name candidate.observationPath -Kind File -AllowMissing) + '|' +
+                $(if ($candidateProvenance -ceq 'prospective-real-model') {
+                        Resolve-OwnerParityAbsolutePath `
+                            -Path ([string]$entry.candidate.telemetryPath) `
+                            -Name candidate.telemetryPath -Kind File -AllowMissing
+                    }
+                    else { 'none' })
             if (-not $candidateReferences.Add($candidateReference)) {
                 throw "Owner parity qualification candidate observation is reused by multiple entries."
             }
@@ -790,13 +869,21 @@ function Resolve-OwnerParityCandidate {
             throw 'Candidate observationPath must be inside V2StateRoot.'
         }
         $observation = Read-OwnerNormalizedObservation -Path $observationPath
+        $semanticProvenance = [string](Get-OwnerParityMember `
+                $Candidate 'semanticProvenance' 'unknown')
+        if ($semanticProvenance -ceq 'prospective-real-model') {
+            [void](Assert-OwnerParityProspectiveTelemetry `
+                    -Observation $observation `
+                    -TelemetryPath ([string]$Candidate.telemetryPath) `
+                    -V2StateRoot $V2StateRoot)
+        }
         return [pscustomobject][ordered]@{
             observation = $observation
             observationPath = $observationPath
             runState = 'read'
             blockingReason = $null
             runReason = 'provided-observation'
-            semanticProvenance = 'unknown'
+            semanticProvenance = $semanticProvenance
             errorId = $null
             candidateCompleted = $observation.lifecycle.completed
         }
@@ -1150,10 +1237,32 @@ function ConvertTo-OwnerParitySanitizedSummary {
     $candidateCompletionUnknown = @($entries | Where-Object {
             $_.metrics.candidateCompleted -isnot [bool]
         }).Count
+    $prospectiveEntries = @($entries | Where-Object {
+            $entryEvidence = Get-OwnerParityMember $_ 'evidence'
+            [string](Get-OwnerParityMember `
+                    $entryEvidence 'semanticProvenance' 'unknown') -ceq 'prospective-real-model'
+        })
+    $prospectiveStatus = if ($prospectiveEntries.Count -eq 0) {
+        'blocked'
+    }
+    elseif (@($gates | Where-Object status -CEQ 'failed').Count -gt 0) {
+        'failed'
+    }
+    elseif (@($gates | Where-Object status -CEQ 'blocked').Count -gt 0) {
+        'blocked'
+    }
+    else {
+        'passed'
+    }
     return [ordered]@{
         schemaVersion = 2
         kind = 'owner-parity-sanitized-summary'
-        scope = 'retrospective-offline'
+        scope = $(if ($prospectiveEntries.Count -gt 0) {
+                'prospective-real-model'
+            }
+            else {
+                'retrospective-offline'
+            })
         sample = [ordered]@{
             entries = $entries.Count
             baselineCompleted = $baselineComplete
@@ -1181,8 +1290,19 @@ function ConvertTo-OwnerParitySanitizedSummary {
             }
         )
         prospectiveRealModel = [ordered]@{
-            status = 'blocked'
-            evidenceCode = 'safe-real-model-launcher-unavailable'
+            status = $prospectiveStatus
+            evidenceCode = $(if ($prospectiveEntries.Count -eq 0) {
+                    'safe-real-model-launcher-unavailable'
+                }
+                elseif ($prospectiveStatus -ceq 'passed') {
+                    'prospective-real-model-qualified'
+                }
+                elseif ($prospectiveStatus -ceq 'failed') {
+                    'prospective-real-model-gates-failed'
+                }
+                else {
+                    'prospective-real-model-gates-blocked'
+                })
         }
         rollback = [ordered]@{
             unchanged = [bool]$Report.rollback.unchanged

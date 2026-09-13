@@ -53,32 +53,6 @@
         "type": "object",
         "additionalProperties": false,
         "required": ["id", "baseline", "candidate", "evidence", "adjudication"],
-        "allOf": [
-          {
-            "if": {
-              "required": ["candidate"],
-              "properties": {
-                "candidate": {
-                  "required": ["mode"],
-                  "properties": {
-                    "mode": { "const": "read" }
-                  }
-                }
-              }
-            },
-            "then": {
-              "required": ["evidence"],
-              "properties": {
-                "evidence": {
-                  "required": ["semanticProvenance"],
-                  "properties": {
-                    "semanticProvenance": { "const": "unknown" }
-                  }
-                }
-              }
-            }
-          }
-        ],
         "properties": {
           "id": { "$ref": "#/$defs/id" },
           "baseline": {
@@ -105,9 +79,24 @@
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["mode", "observationPath"],
+                "allOf": [
+                  {
+                    "if": {
+                      "required": ["semanticProvenance"],
+                      "properties": {
+                        "semanticProvenance": { "const": "prospective-real-model" }
+                      }
+                    },
+                    "then": { "required": ["telemetryPath"] }
+                  }
+                ],
                 "properties": {
                   "mode": { "const": "read" },
-                  "observationPath": { "$ref": "#/$defs/path" }
+                  "observationPath": { "$ref": "#/$defs/path" },
+                  "telemetryPath": { "$ref": "#/$defs/path" },
+                  "semanticProvenance": {
+                    "enum": ["prospective-real-model", "unknown"]
+                  }
                 }
               },
               {

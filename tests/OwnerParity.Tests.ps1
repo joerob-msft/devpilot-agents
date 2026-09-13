@@ -180,11 +180,49 @@ Describe 'Owner parity qualification contract' {
         } | Should -Throw '*candidate observation is reused*'
     }
 
-    It 'requires read candidates to declare unknown semantic provenance' {
+    It 'requires read candidate and evidence provenance to match' {
         $fixture = Get-Content -LiteralPath $script:QualificationFixture -Raw |
             ConvertFrom-Json -AsHashtable -Depth 32
         $fixture.entries[0].evidence.semanticProvenance = 'offline-replay-deterministic'
         $path = Join-Path $TestDrive 'read-provenance.json'
+        Set-Content -LiteralPath $path -Value (
+            ConvertTo-Json -InputObject $fixture -Depth 32) -NoNewline
+
+        {
+            & $script:ParityModule {
+                param($ManifestPath)
+                Read-OwnerParityManifest -Path $ManifestPath
+            } $path
+        } | Should -Throw '*candidate and evidence provenance must match*'
+    }
+
+    It 'accepts an explicitly bound prospective real-model observation' {
+        $fixture = Get-Content -LiteralPath $script:QualificationFixture -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $fixture.entries[0].candidate.observationPath = Join-Path $TestDrive 'candidate.json'
+        $fixture.entries[0].candidate.semanticProvenance = 'prospective-real-model'
+        $fixture.entries[0].candidate.telemetryPath =
+            Join-Path $TestDrive 'telemetry.json'
+        $fixture.entries[0].evidence.semanticProvenance = 'prospective-real-model'
+        $path = Join-Path $TestDrive 'read-prospective.json'
+        Set-Content -LiteralPath $path -Value (
+            ConvertTo-Json -InputObject $fixture -Depth 32) -NoNewline
+
+        $actual = & $script:ParityModule {
+            param($ManifestPath)
+            Read-OwnerParityManifest -Path $ManifestPath
+        } $path
+
+        $actual.value.entries[0].candidate.semanticProvenance |
+            Should -Be 'prospective-real-model'
+    }
+
+    It 'requires prospective read candidates to identify telemetry evidence' {
+        $fixture = Get-Content -LiteralPath $script:QualificationFixture -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $fixture.entries[0].candidate.semanticProvenance = 'prospective-real-model'
+        $fixture.entries[0].evidence.semanticProvenance = 'prospective-real-model'
+        $path = Join-Path $TestDrive 'read-prospective-no-telemetry.json'
         Set-Content -LiteralPath $path -Value (
             ConvertTo-Json -InputObject $fixture -Depth 32) -NoNewline
 
@@ -246,6 +284,40 @@ Describe 'Owner parity qualification contract' {
         $gate = Get-TestParityGate $result findingRetention
         $gate.status | Should -Be 'failed'
         $gate.failures | Should -Be 1
+    }
+
+    It 'records a missing expected candidate selector as a lost finding' {
+        $baseline = New-TestParityObservation
+        $candidate = New-TestParityObservation -ImplementationId 'owner-v2-test' -Mutator {
+            param($o)
+            $o.findings = @()
+            $o.counts.violations = 0
+        }
+        $result = Invoke-OwnerParityGateEvaluation `
+            -Baseline $baseline -Candidate $candidate `
+            -Evidence (New-TestParityEvidence) `
+            -Adjudication @(New-TestParityAdjudication)
+
+        $gate = Get-TestParityGate $result findingRetention
+        $gate.status | Should -Be 'failed'
+        $gate.evidenceCode | Should -Be 'verified-method-findings-lost'
+        $gate.failures | Should -Be 1
+    }
+
+    It 'blocks non-retention gates when an expected candidate selector is unresolved' {
+        $baseline = New-TestParityObservation
+        $candidate = New-TestParityObservation -ImplementationId 'owner-v2-test'
+        $adjudication = New-TestParityAdjudication `
+            -Eligibility method -Truth compliant `
+            -BaselineIdentity '' -CandidateIdentity 'missing-candidate'
+
+        $result = Invoke-OwnerParityGateEvaluation `
+            -Baseline $baseline -Candidate $candidate `
+            -Evidence (New-TestParityEvidence) `
+            -Adjudication @($adjudication)
+
+        (Get-TestParityGate $result eligibleFalsePositives).status | Should -Be 'blocked'
+        (Get-TestParityGate $result bindingEquivalence).status | Should -Be 'blocked'
     }
 
     It 'blocks retention when a baseline violation is omitted from adjudication' {
@@ -937,6 +1009,46 @@ Describe 'Owner parity snapshots, paths, and sanitization' {
         $json | Should -Not -Match 'private-pr|secret-repository|private\\evidence|private\\v1'
         @($summary.Keys | Sort-Object) |
             Should -Be @('gates', 'kind', 'prospectiveRealModel', 'rollback', 'sample', 'schemaVersion', 'scope')
+        $summary.scope | Should -Be 'retrospective-offline'
+        $summary.prospectiveRealModel.status | Should -Be 'blocked'
+    }
+
+    It 'reports prospective real-model gate outcomes without claiming launcher unavailability' {
+        $report = [ordered]@{
+            entries = @(
+                [ordered]@{
+                    evidence = [ordered]@{ semanticProvenance = 'prospective-real-model' }
+                    metrics = [ordered]@{
+                        verifiedMethodFindings = 1
+                        retainedMethodFindings = 0
+                        retentionMeasured = $false
+                        falsePositiveMeasured = $false
+                        candidateViolations = 0
+                        eligibleFalsePositives = 0
+                        baselineCompleted = $true
+                        candidateCompleted = $false
+                    }
+                }
+            )
+            gates = @(
+                [ordered]@{
+                    name = 'findingRetention'
+                    status = 'blocked'
+                    evidenceCode = 'candidate-findings-incomplete'
+                    measured = 1
+                    failures = 0
+                    blocked = 1
+                }
+            )
+            rollback = [ordered]@{ unchanged = $true; differences = @() }
+        }
+
+        $summary = ConvertTo-OwnerParitySanitizedSummary -Report $report
+
+        $summary.scope | Should -Be 'prospective-real-model'
+        $summary.prospectiveRealModel.status | Should -Be 'blocked'
+        $summary.prospectiveRealModel.evidenceCode |
+            Should -Be 'prospective-real-model-gates-blocked'
     }
 
     It 'reports unmeasured false-positive evidence as unavailable rather than zero' {
