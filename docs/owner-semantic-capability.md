@@ -4,6 +4,9 @@
 the generic facade and the normalized acquisition evidence from layers 1 and 2.
 It does not import, modify, copy, or replace the deployed reviewer.
 
+Current rollout and authorization status is defined only in the
+[authoritative operating state](owner-preview-orchestrator.md#current-operating-state-authoritative).
+
 ```text
 normalized immutable evidence
         |
@@ -72,34 +75,27 @@ lifecycle, counts, zero provider/tool writes, and the evidence digest. This
 module does not import observer code or schema files and does not create a
 branch dependency on that work.
 
-The observation is returned in memory. A later integration may persist it
+The observation is returned in memory. The preview orchestrator may persist it
 under a dedicated v2 preview state root and pass that sanitized local artifact
-to the observer. It must not share, migrate, repair, or reinterpret deployed v1
-state.
+to the observer. It does not share, migrate, repair, or reinterpret v1 state.
 
 The no-tools launcher layer adds a bounded out-of-process Copilot CLI provider,
 a deterministic fake process, and exact offline response replay through the
 same parser. Real launch is explicit opt-in and remains fail-closed. The
-no-call preflight proves the literal empty tool set and isolated environment,
-then reports that the supported CLI lacks a confidential prompt channel
-compatible with closed stdin. See `owner-model-runner.md`.
+no-call preflight proves the literal empty tool set and isolated environment.
+The supported semantic transport is bounded ordinary `--prompt` argv with the
+accepted local process-metadata exposure documented in
+`owner-model-runner.md`; no credential is included in the prompt or argv.
 
 ## Safety and migration status
 
-Frozen v1 remains deployed and solely writer-eligible. This v2 capability is
-shadow/preview-only, has no delivery adapter, and receives no host, model,
-provider, scheduler, queue, notification, approval, vote, comment, credential,
-or deployment authority. The committed runner and corpus are deterministic,
-offline, and generic.
-
-Later layers must separately add and validate:
-
-- a parallel scheduler/orchestrator with separate preview state;
-- a sustained parity cohort;
-- a prospective real-model parity cohort using the proven no-tools launch mode;
-- writer compatibility;
-- relation-aware capabilities; and
-- an explicit cutover and rollback plan.
-
-No production writer or deployment switch should consume v2 results before
-those gates are complete.
+This v2 capability remains preview-only, has no delivery adapter, and receives
+no scheduler, queue, notification, approval, vote, comment, credential, or
+deployment authority from repository data. Host-opt-in live orchestration,
+bounded prospective qualification, and a manual canary are complete for the
+scoped Owner capability. Scheduler registration remains an operator action.
+Sustained reliability, writer compatibility, automatic comments or votes,
+relation-aware capabilities, and consumer migration remain separate decisions.
+V1 remains the sole manual approved-comment writer. See the
+[authoritative operating state](owner-preview-orchestrator.md#current-operating-state-authoritative)
+for current operator deployment evidence and rollback.

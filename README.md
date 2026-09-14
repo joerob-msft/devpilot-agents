@@ -73,8 +73,11 @@ bounded process/replay adapter in
 [docs/owner-model-runner.md](docs/owner-model-runner.md). The layer 5 preview
 cohort orchestrator is documented in
 [docs/owner-preview-orchestrator.md](docs/owner-preview-orchestrator.md).
-These layers remain preview-only and separate from the deployed reviewer,
-scheduler, state, and writer.
+Its
+[authoritative operating state](docs/owner-preview-orchestrator.md#current-operating-state-authoritative)
+distinguishes code capability, operator deployment, state separation, and
+writer authority. These layers remain preview-only and do not themselves
+register scheduling or authorize writes.
 
 **Consumers keep only a config file.** Nothing employer-, repository-, or
 person-specific lives in this repo outside `samples/` — a CI check enforces that

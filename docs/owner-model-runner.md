@@ -4,6 +4,9 @@
 by `DevPilot.OwnerCapability`. It remains preview-only and does not schedule,
 persist, deliver, notify, vote, comment, or authorize findings.
 
+Current rollout and authorization status is defined only in the
+[authoritative operating state](owner-preview-orchestrator.md#current-operating-state-authoritative).
+
 The runner receives only the layer-3 bounded capability request. The process
 envelope adds an unpredictable nonce, canonical input digest, opaque subject
 binding, and a literal empty tool ceiling. The response marker can contain only opaque execution-unit references,
@@ -96,7 +99,21 @@ digest, or opaque subject-binding mismatch atomically fails that execution.
 Layer 3 can project sanitized attempts, latency, starts, and refusal outcome
 through the existing `owner-observation.execution` shape.
 
-The launcher does not run the preserved parity cohort. No real model validation
-call is permitted while ACP session persistence and memory controls remain
-unproven. Writer compatibility, deployment, notifications, votes, comments,
-and cutover remain separate later gates.
+## Historical transport investigations
+
+Earlier revisions treated ACP session persistence, memory controls,
+confidential prompt transport, and atomic pre-start containment as blockers to
+real-model validation. Those investigations remain useful history, but they are
+not current production-transport blockers. The accepted v1 threat model uses
+the bounded ordinary `--prompt` argv transport described above, with
+no credential in the prompt or argv, empty effective tools, disabled ambient
+features, and explicit local process-metadata exposure. The selected credential
+continues to enter only through the isolated child environment contract
+described above.
+
+The bounded prospective cohort and a manual live preview canary have since
+passed. Live launch still requires host opt-in and provider configuration, and
+the runner remains preview-only. Sustained reliability, writer compatibility,
+deployment authorization, notifications, votes, comments, and cutover remain
+separate decisions. See the
+[authoritative operating state](owner-preview-orchestrator.md#current-operating-state-authoritative).
