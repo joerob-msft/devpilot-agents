@@ -1,0 +1,170 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "cold-read",
+      "expectedVerdict": "violation",
+      "question": "Does a first public read guarantee that the confidential setting is omitted while ordinary configuration remains available?",
+      "evidence": [
+        {
+          "id": "projection",
+          "type": "source",
+          "path": "src/Example/Projection.cs",
+          "startLine": 10,
+          "endLine": 14,
+          "roles": ["projection"],
+          "content": "The persisted configuration map, including confidential and ordinary entries, is copied into the public response object."
+        },
+        {
+          "id": "fresh-state",
+          "type": "source",
+          "path": "src/Example/MetadataCache.cs",
+          "startLine": 20,
+          "endLine": 24,
+          "roles": ["initial-state"],
+          "content": "A new metadata provider starts with no snapshot."
+        },
+        {
+          "id": "cache-read",
+          "type": "source",
+          "path": "src/Example/MetadataCache.cs",
+          "startLine": 30,
+          "endLine": 38,
+          "roles": ["cache-lookup"],
+          "content": "The synchronous cache lookup returns false when the snapshot is absent and does not retrieve or populate metadata."
+        },
+        {
+          "id": "sanitizer",
+          "type": "source",
+          "path": "src/Example/ResponseFilter.cs",
+          "startLine": 40,
+          "endLine": 52,
+          "roles": ["sanitizer"],
+          "content": "The response filter removes the confidential entry only inside the successful metadata cache-hit branch. A miss leaves the projected response unchanged."
+        },
+        {
+          "id": "public-read",
+          "type": "source",
+          "path": "src/Example/PublicApi.cs",
+          "startLine": 60,
+          "endLine": 74,
+          "roles": ["public-path"],
+          "content": "The public GET and list paths project persisted records, invoke the response filter, and then serialize the result."
+        },
+        {
+          "id": "guidance",
+          "type": "guidance",
+          "path": ".config/review-guidance.md",
+          "startLine": 5,
+          "endLine": 10,
+          "roles": ["authoritative-rule", "test-expectation"],
+          "content": "Public responses must omit confidential values. Tests must cover cache hit, cache miss, fallback, response completeness, and warm-up behavior."
+        }
+      ]
+    },
+    {
+      "id": "warm-read",
+      "expectedVerdict": "compliant",
+      "question": "After authoritative metadata retrieval, does the public response omit the confidential setting and preserve ordinary configuration?",
+      "evidence": [
+        {
+          "id": "projection",
+          "type": "source",
+          "path": "src/Example/Projection.cs",
+          "startLine": 10,
+          "endLine": 14,
+          "roles": ["projection"],
+          "content": "The persisted configuration map is copied into the public response object."
+        },
+        {
+          "id": "warm-load",
+          "type": "source",
+          "path": "src/Example/MetadataCache.cs",
+          "startLine": 80,
+          "endLine": 92,
+          "roles": ["authoritative-load"],
+          "content": "The create or update path retrieves authoritative metadata and stores a fresh snapshot before response filtering."
+        },
+        {
+          "id": "sanitizer",
+          "type": "source",
+          "path": "src/Example/ResponseFilter.cs",
+          "startLine": 40,
+          "endLine": 52,
+          "roles": ["sanitizer"],
+          "content": "On a metadata hit, the response filter builds a copy without the confidential setting and retains publicSetting with its original value."
+        },
+        {
+          "id": "public-read",
+          "type": "source",
+          "path": "src/Example/PublicApi.cs",
+          "startLine": 60,
+          "endLine": 74,
+          "roles": ["public-path"],
+          "content": "The public response is serialized only after the shared response filter runs."
+        },
+        {
+          "id": "guidance",
+          "type": "guidance",
+          "path": ".config/review-guidance.md",
+          "startLine": 5,
+          "endLine": 10,
+          "roles": ["authoritative-rule"],
+          "content": "Public responses must omit confidential values while preserving non-confidential response data."
+        }
+      ]
+    },
+    {
+      "id": "corrected-read",
+      "expectedVerdict": "compliant",
+      "question": "Does the corrected first-read path guarantee confidential-value omission without requiring earlier requests?",
+      "evidence": [
+        {
+          "id": "projection",
+          "type": "synthetic",
+          "path": "synthetic/Projection.cs",
+          "startLine": 10,
+          "endLine": 14,
+          "roles": ["projection"],
+          "content": "The stored configuration is projected into a response candidate."
+        },
+        {
+          "id": "cache-read",
+          "type": "synthetic",
+          "path": "synthetic/MetadataCache.cs",
+          "startLine": 30,
+          "endLine": 40,
+          "roles": ["cache-lookup"],
+          "content": "When metadata is missing, the corrected lookup retrieves and populates it before returning."
+        },
+        {
+          "id": "sanitizer",
+          "type": "synthetic",
+          "path": "synthetic/ResponseFilter.cs",
+          "startLine": 45,
+          "endLine": 55,
+          "roles": ["sanitizer"],
+          "content": "The filter uses the retrieved metadata to remove confidentialValue and retain publicSetting."
+        },
+        {
+          "id": "public-read",
+          "type": "synthetic",
+          "path": "synthetic/PublicApi.cs",
+          "startLine": 60,
+          "endLine": 70,
+          "roles": ["public-path"],
+          "content": "The corrected public read awaits filtering before serialization."
+        },
+        {
+          "id": "guidance",
+          "type": "guidance",
+          "path": ".config/review-guidance.md",
+          "startLine": 5,
+          "endLine": 10,
+          "roles": ["authoritative-rule"],
+          "content": "Public responses must omit confidential values while preserving non-confidential response data."
+        }
+      ]
+    }
+  ]
+}

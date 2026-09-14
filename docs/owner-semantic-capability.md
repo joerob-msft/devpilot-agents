@@ -95,7 +95,9 @@ deployment authority from repository data. Host-opt-in live orchestration,
 bounded prospective qualification, and a manual canary are complete for the
 scoped Owner capability. Scheduler registration remains an operator action.
 Sustained reliability, writer compatibility, automatic comments or votes,
-relation-aware capabilities, and consumer migration remain separate decisions.
+broader relation-aware rollout, and consumer migration remain separate
+decisions. The bounded relation-evidence demonstration is documented in
+[relation-evidence-capability.md](relation-evidence-capability.md).
 V1 remains the sole manual approved-comment writer. See the
 [authoritative operating state](owner-preview-orchestrator.md#current-operating-state-authoritative)
 for current operator deployment evidence and rollback.

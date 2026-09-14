@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "kind": "relation-evidence-demonstration-summary",
+  "modelIdentity": "claude-sonnet-5",
+  "cases": [
+    {
+      "id": "source-pinned-cold",
+      "synthetic": false,
+      "expected": "violation",
+      "observed": "violation",
+      "evidenceBytes": 4492,
+      "modelInputBytes": 9676,
+      "acceptedModelAttempts": 1,
+      "priorEvaluationAttempts": 3,
+      "latencyMs": 33874
+    },
+    {
+      "id": "synthetic-warm",
+      "synthetic": true,
+      "expected": "compliant",
+      "observed": "compliant",
+      "evidenceBytes": 453,
+      "modelInputBytes": 3884,
+      "acceptedModelAttempts": 1,
+      "priorEvaluationAttempts": 3,
+      "latencyMs": 24754
+    },
+    {
+      "id": "missing-decisive-evidence",
+      "synthetic": false,
+      "expected": "unknown",
+      "observed": "unknown",
+      "evidenceBytes": 3315,
+      "modelInputBytes": 0,
+      "acceptedModelAttempts": 0,
+      "latencyMs": 0
+    }
+  ],
+  "aggregate": {
+    "acceptedModelAttempts": 2,
+    "acceptedModelLatencyMs": 58628,
+    "priorEvaluationAttempts": 6,
+    "effectiveTools": [],
+    "providerWrites": 0,
+    "writeToolInvocations": 0,
+    "deliveryAuthorized": false,
+    "cost": {
+      "status": "unavailable",
+      "value": null
+    }
+  },
+  "limitations": [
+    "One bounded contextual multi-evidence case does not establish general reviewer reliability.",
+    "The source-pinned result is a static relationship assessment, not an observed runtime leak.",
+    "Runtime startup and request ordering remain unverified."
+  ]
+}
