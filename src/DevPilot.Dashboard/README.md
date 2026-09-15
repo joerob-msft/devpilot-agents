@@ -25,8 +25,11 @@ launch into preview-only mode.
 
 The History view is an independent retained PR projection keyed by
 provider-verified repository identity plus PR number. It merges Reviewer and
-Review Handler outcomes without merging same-numbered PRs from different
-repositories. History also lists automatically archived **exited instances**
+Review Handler outcomes and scan decisions without merging same-numbered PRs
+from different repositories. Each row shows its local last-activity timestamp;
+details retain per-role terminal outcome timestamps and newer scan activity.
+Heartbeats, phase changes, and notification maintenance never create or reorder
+PR History. History also lists automatically archived **exited instances**
 with their raw events, source log path, and reported outcome (or explicit
 unknown outcome). Legacy schema-v2 streams use these instance rows but never
 enter canonical PR history.
@@ -373,7 +376,10 @@ normal state roots, the namespace is the directory immediately above
 `logs\events`; shared launcher role containers such as `reviewer` and
 `review-handler` use their parent watch directory; for explicit event files,
 it is the containing directory.
-History rows include their completion timestamp and reported outcome.
+History rows include local timestamps and reported outcomes. A candidate that
+was inspected but needed no work is labeled with its role and skip reason
+instead of `Unknown agent` or `Outcome not reported`. Terminal outcomes remain
+visible when a later scan skips an already-delivered PR.
 
 `Delete` dismisses a stale or finished instance from Current session. Dismissals
 survive Watch restarts in local display-preference files under

@@ -9,6 +9,7 @@ import {
   eventNarrative,
   eventSummary,
   line,
+  localTimestamp,
   roleLabel,
   shortCommit,
   shortId,
@@ -399,6 +400,23 @@ function History(props: {
 }) {
   const selected = () => props.entries[props.selected];
   const selectedExit = () => props.exited[props.selected - props.entries.length];
+  const roleSummary = (entry: PullRequestHistoryEntry, role: AgentRole): string => {
+    const outcome = entry.outcomes[role];
+    const activity = entry.activities[role];
+    if (!outcome && !activity) return "no reported activity";
+    const primary = outcome ?? activity!;
+    let result = `${outcome?.result ?? activity!.status} at ${localTimestamp(primary.timestampMs)} local`;
+    if (outcome && activity && activity.timestampMs > outcome.timestampMs) {
+      result += `; latest ${activity.status} at ${localTimestamp(activity.timestampMs)} local`;
+    }
+    return result;
+  };
+  const latestStatus = (entry: PullRequestHistoryEntry): string => {
+    const latest = Object.values(entry.activities)
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .sort((left, right) => right.timestampMs - left.timestampMs)[0];
+    return latest?.status ?? "activity not reported";
+  };
   return (
     <>
       <Show when={!props.compact || !props.detailOpen || !selectedExit()}>
@@ -412,7 +430,9 @@ function History(props: {
                     {index === props.selected ? "> " : "  "}{entry().repositoryIdentity.repositoryName} PR #{entry().pullRequestId}
                   </text>
                   <text height={1} fg={COLORS.text}>{line(entry().title || "title not reported", 32)}</text>
-                  <text height={1} fg={COLORS.muted}>{line(entry().author || "author unknown", 32)}</text>
+                  <text height={1} fg={COLORS.muted}>
+                    {line(`${localTimestamp(entry().lastSeenTimestampMs, true)} | ${latestStatus(entry())}`, 32)}
+                  </text>
                 </box>
               )}
             </Index>
@@ -445,8 +465,11 @@ function History(props: {
                 <text height={1} fg={COLORS.accent}>{entry().repositoryIdentity.slug} / PR #{entry().pullRequestId}</text>
                 <text height={1} fg={COLORS.text}>{line(entry().title || "title not reported", 100)}</text>
                 <text height={1} fg={COLORS.muted}>{entry().author || "author unknown"} | {entry().sourceBranch || "?"} -&gt; {entry().targetBranch || "?"}</text>
-                <text height={1} fg={COLORS.text}>Reviewer: {entry().outcomes.reviewer?.result ?? "no terminal outcome"}</text>
-                <text height={1} fg={COLORS.text}>Handler: {entry().outcomes["review-handler"]?.result ?? "no terminal outcome"}</text>
+                <text height={1} fg={COLORS.muted}>
+                  Last activity: {localTimestamp(entry().lastSeenTimestampMs)} local ({age(entry().lastSeenTimestampMs, props.now)})
+                </text>
+                <text height={1} fg={COLORS.text}>Reviewer: {roleSummary(entry(), "reviewer")}</text>
+                <text height={1} fg={COLORS.text}>Handler: {roleSummary(entry(), "review-handler")}</text>
                 <text height={1} fg={COLORS.muted}>Canonical key: {line(entry().key, 100)}</text>
               </box>
             )}
@@ -1211,7 +1234,8 @@ export function App(props: AppProps) {
     revision();
     const entries = props.history?.list(historyFilter()) ?? [];
     const selectedRole = role();
-    return selectedRole === "all" ? entries : entries.filter((entry) => Boolean(entry.outcomes[selectedRole]));
+    return selectedRole === "all" ? entries :
+      entries.filter((entry) => Boolean(entry.outcomes[selectedRole] || entry.activities[selectedRole]));
   });
   const exitedHistory = createMemo(() => {
     const needle = historyFilter().trim().toLowerCase();
@@ -1220,7 +1244,7 @@ export function App(props: AppProps) {
         state.instanceId, state.completion?.result || "exited outcome unknown"].some((text) => text.toLowerCase().includes(needle))));
   });
   const simpleRows = createMemo(() => view() === "history" && props.history
-    ? [...historyEntries().map(simpleHistoryRow),
+    ? [...historyEntries().map((entry) => simpleHistoryRow(entry, now())),
       ...instances().filter((state) => state.exitObservedMs !== null || state.schemaVersion < 3).map(simpleInstanceRow)]
     : instances().map(simpleInstanceRow));
   createEffect(() => {

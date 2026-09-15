@@ -5227,8 +5227,46 @@ function Get-ReviewerPullRequestLink {
     return "https://dev.azure.com/$([Uri]::EscapeDataString($Organization))/$([Uri]::EscapeDataString($ExpectedProject))/_git/$([Uri]::EscapeDataString($RepositoryName))/pullrequest/$PrId"
 }
 
+function Get-ReviewerPullRequestHistoryData {
+    param(
+        [Parameter(Mandatory)][object]$PullRequest,
+        [hashtable]$Additional = @{}
+    )
+    $prId = [int](Get-ReviewerHashValue -Container $PullRequest -Key 'pullRequestId' -Default 0)
+    $createdBy = Get-ReviewerHashValue -Container $PullRequest -Key 'createdBy'
+    $author = [string](Get-ReviewerHashValue -Container $createdBy -Key 'displayName' -Default '')
+    if ([string]::IsNullOrWhiteSpace($author)) {
+        $author = [string](Get-ReviewerHashValue -Container $createdBy -Key 'uniqueName' -Default '')
+    }
+    $data = @{
+        title = [string](Get-ReviewerHashValue -Container $PullRequest -Key 'title' -Default "PR $prId")
+        author = $author
+        url = Get-ReviewerPullRequestLink -PrId $prId
+        sourceBranch = (([string](Get-ReviewerHashValue -Container $PullRequest -Key 'sourceRefName' -Default '')) -replace '^refs/heads/', '')
+        targetBranch = (([string](Get-ReviewerHashValue -Container $PullRequest -Key 'targetRefName' -Default '')) -replace '^refs/heads/', '')
+    }
+    foreach ($key in $Additional.Keys) { $data[$key] = $Additional[$key] }
+    return $data
+}
+
+function Test-ReviewerTeamsMaintenanceRecoverableFailure {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [AllowNull()][hashtable]$AdoSession,
+        [AllowNull()][hashtable]$WorkIqSession
+    )
+    if ($Message -eq 'Teams outbox ADO session closed while draining queued notifications.') { return $true }
+    if (-not (Test-ReviewerRecoverableMcpFailure -Message $Message)) { return $false }
+    if (-not $WorkIqSession) { return $true }
+    return [bool]($AdoSession -and -not $AdoSession.Process -and $WorkIqSession.Process)
+}
+
 function Invoke-ReviewerTeamsMaintenance {
-    param([Parameter(Mandatory)][string]$AgencyPath)
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [switch]$McpRecoveryAttempted,
+        [DateTime]$DeadlineUtc = [DateTime]::MinValue
+    )
     if ($PreviewOnly -or -not $EnableTeamsNotifications -or -not $TeamsChannelEnabled -or
         -not $TeamsThreadReuseEnabled -or -not $TeamsPrReferenceEnabled -or @($TeamsChannelEvents).Count -eq 0) { return }
     if ($ManualDispatchManifest -and -not $script:ReviewerTeamsManualAuthorized) { return }
@@ -5236,7 +5274,7 @@ function Invoke-ReviewerTeamsMaintenance {
     $adoSession = $null
     $workIqSession = $null
     try {
-        $deadline = [DateTime]::UtcNow.AddSeconds(60)
+        $deadline = if ($DeadlineUtc -eq [DateTime]::MinValue) { [DateTime]::UtcNow.AddSeconds(60) } else { $DeadlineUtc }
         $maintenanceSessionTimeoutSeconds = [Math]::Max(1, [Math]::Min(15, $McpTimeoutSeconds))
         $adoSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
             -Organization $Organization -Toolsets @('repos') -TimeoutSeconds $maintenanceSessionTimeoutSeconds `
@@ -5256,6 +5294,27 @@ function Invoke-ReviewerTeamsMaintenance {
     catch {
         if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
         $reason = $_.Exception.Message
+        if (-not $McpRecoveryAttempted -and [DateTime]::UtcNow -lt $deadline -and
+            (Test-ReviewerTeamsMaintenanceRecoverableFailure -Message $reason `
+                -AdoSession $adoSession -WorkIqSession $workIqSession)) {
+            if ($script:ReviewerOutputContext) {
+                Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -Level warning `
+                    -Data @{ outcome = 'retrying'; code = 'outbox-cycle-retrying'; reason = $reason } `
+                    -Message "Teams outbox transport failed; retrying immediately with fresh ADO and WorkIQ sessions." | Out-Null
+            }
+            Write-Warning "Teams outbox transport failed; retrying immediately with fresh sessions: $reason"
+            if ($workIqSession) {
+                try { Close-AgentMcpSession -Session $workIqSession }
+                catch { Write-Warning 'Teams outbox session cleanup failed before retry; review selection is unaffected.' }
+                $workIqSession = $null
+            }
+            if ($adoSession) {
+                try { Close-AgentMcpSession -Session $adoSession }
+                catch { Write-Warning 'Teams outbox ADO session cleanup failed before retry; review selection is unaffected.' }
+                $adoSession = $null
+            }
+            return Invoke-ReviewerTeamsMaintenance -AgencyPath $AgencyPath -McpRecoveryAttempted -DeadlineUtc $deadline
+        }
         if ($script:ReviewerOutputContext) {
             Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -Level warning `
                 -Data @{ outcome = 'deferred'; code = 'outbox-cycle-error'; reason = $reason } `
@@ -6504,9 +6563,10 @@ function Invoke-ReviewerCycle {
                 $normalizedReason = Get-AgentNormalizedSkipReason ([string]$decision.Reason)
                 $skipCounts[$normalizedReason]++
                 if ($prId -gt 0) {
-                    Send-ReviewerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -Data @{
+                    Send-ReviewerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId `
+                        -Data (Get-ReviewerPullRequestHistoryData -PullRequest $pr -Additional @{
                         reason = [string]$decision.Reason; normalizedReason = $normalizedReason
-                    } -Message "PR $prId skipped ($($decision.Reason))."
+                    }) -Message "PR $prId skipped ($($decision.Reason))."
                 }
                 continue
             }
@@ -6515,9 +6575,10 @@ function Invoke-ReviewerCycle {
             $attempts = if ($attemptRecord -is [int]) { [int]$attemptRecord } else { [int](Get-ReviewerHashValue -Container $attemptRecord -Key 'count' -Default 0) }
             if ($attempts -ge $ConsecutiveFailureThreshold) {
                 $skipCounts.starved++
-                Send-ReviewerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId -Data @{
+                Send-ReviewerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId `
+                    -Data (Get-ReviewerPullRequestHistoryData -PullRequest $pr -Additional @{
                     reason = "starved after $attempts consecutive failures"; normalizedReason = 'starved'; retryable = $true
-                } -Message "PR $prId skipped (starved: $attempts consecutive failures). Clear with -ResetStarvedCandidates."
+                }) -Message "PR $prId skipped (starved: $attempts consecutive failures). Clear with -ResetStarvedCandidates."
                 # The most valuable notification this agent sends. A starved PR
                 # is silent by construction: the loop keeps running, exits 0,
                 # and reviews nothing - indistinguishable from having no work,
@@ -6553,9 +6614,10 @@ function Invoke-ReviewerCycle {
             }
             if (-not $sourceCommit) {
                 $skipCounts.invalidCommit++
-                Send-ReviewerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId -Data @{
+                Send-ReviewerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId `
+                    -Data (Get-ReviewerPullRequestHistoryData -PullRequest $prRecord -Additional @{
                     reason = 'no valid 40-hex source commit'; normalizedReason = 'invalidCommit'
-                } -Message "PR $prId skipped (no valid 40-hex source commit)."
+                }) -Message "PR $prId skipped (no valid 40-hex source commit)."
                 continue
             }
 
@@ -6587,9 +6649,10 @@ function Invoke-ReviewerCycle {
                     -ThreadTargetsKnown $true -CurrentThreadReplyTargets @($digest.AllAssessmentTargets) `
                     -WantSummary ([bool]$EnableSummaryComment) -WantVote ([bool]$EnableApprovalVote))) {
                 $skipCounts.delivered++
-                Send-ReviewerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                Send-ReviewerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
+                    -Data (Get-ReviewerPullRequestHistoryData -PullRequest $prRecord -Additional @{
                     reason = 'already reviewed and delivered'; normalizedReason = 'delivered'
-                } -Message "PR $prId skipped (already reviewed and delivered at this commit)."
+                }) -Message "PR $prId skipped (already reviewed and delivered at this commit)."
                 continue
             }
 

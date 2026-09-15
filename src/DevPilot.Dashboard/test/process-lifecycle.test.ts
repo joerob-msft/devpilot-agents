@@ -154,8 +154,7 @@ test("definite absence archives interrupted work without synthesizing completion
   assert.deepEqual(archived.timeline, [started]);
   assert.deepEqual(archived.sources, [SOURCE]);
   assert.equal(JSON.stringify(history.list()), priorHistory);
-  assert.equal(history.list()[0]?.title, "Preserved PR");
-  assert.deepEqual(history.list()[0]?.outcomes, {});
+  assert.equal(history.list().length, 0, "incidental lifecycle events do not fabricate PR history");
   assert.equal(reducer.forgetHistorical(archived.key), true);
   assert.equal(reducer.restoreAllHistorical(), 1);
   assert.equal(reducer.list(NOW, undefined, "history").length, 1);
@@ -268,7 +267,7 @@ test("tailer archives after ingestion and re-derives exits on reload without cha
       await tailer.poll();
       assert.equal(reducer.list(NOW, undefined, "current").length, 0);
       assert.equal(reducer.list(NOW, undefined, "history").length, 1);
-      assert.equal(history.list().length, 1);
+      assert.equal(history.list().length, 0);
       assert.equal(await readFile(path, "utf8"), contents);
       if (reload === 1) {
         now = NOW + 5_001;

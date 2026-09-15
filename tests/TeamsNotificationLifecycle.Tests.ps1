@@ -72,8 +72,9 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         $script:HandlerDurableContext = @{ RoleRoot = $script:DurableStateRoot }
         $script:bootstrapCursorPath = Join-Path $script:DurableStateRoot 'teams-pr-reference-bootstrap.v1.json'
         $script:prs = @(@{
-            pullRequestId = 42; status = 'active'; isDraft = $false
-            createdBy = @{ uniqueName = 'operator@example.test' }
+            pullRequestId = 42; status = 'active'; isDraft = $false; title = 'Fixture PR'
+            sourceRefName = 'refs/heads/feature/history'; targetRefName = 'refs/heads/main'
+            createdBy = @{ uniqueName = 'operator@example.test'; displayName = 'Fixture Author' }
             lastMergeSourceCommit = @{ commitId = 'a' * 40 }
         })
         Mock Open-AgentMcpSession {
@@ -141,6 +142,16 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         }
     }
 
+    It 'includes PR metadata in retained skip activity' {
+        $result = & $script:cycleFunction -AgencyPath unused -CycleNumber 1
+        $result.ExitCode | Should -Be 0 -Because $result.Summary
+        Should -Invoke $script:eventFunction -Times 1 -ParameterFilter {
+            $EventType -eq 'candidate.skipped' -and $PrId -eq 42 -and
+            $Data.title -eq 'Fixture PR' -and $Data.author -eq 'Fixture Author' -and
+            $Data.sourceBranch -eq 'feature/history' -and $Data.targetBranch -eq 'main'
+        }
+    }
+
     It 'performs no Teams calls or enqueues when <Ceiling> is disabled' -ForEach @(
         @{ Ceiling = 'EnableTeamsNotifications' }, @{ Ceiling = 'TeamsChannelEnabled' }
         @{ Ceiling = 'TeamsThreadReuseEnabled' }, @{ Ceiling = 'TeamsPrReferenceEnabled' }
@@ -194,8 +205,9 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         Should -Invoke Close-AgentMcpSession -Times 3
     }
 
-    It 'isolates reviewer outbox timeouts from the work session' -Skip:($Role -ne 'reviewer') {
+    It 'retries a closed reviewer outbox session without affecting the work session' -Skip:($Role -ne 'reviewer') {
         $script:adoSessions = [Collections.Generic.List[hashtable]]::new()
+        $script:maintenanceCalls = 0
         Mock Open-AgentMcpSession {
             param($Server, $TimeoutSeconds)
             $session = @{
@@ -209,7 +221,8 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         }
         Mock Invoke-AgentTeamsNotificationOutbox {
             param($ReferenceContext)
-            $ReferenceContext.Ado.Process = $null
+            $script:maintenanceCalls++
+            if ($script:maintenanceCalls -eq 1) { $ReferenceContext.Ado.Process = $null }
             @{ Outcome = 'deferred' }
         }
         Mock Invoke-AgentMcpTool {
@@ -224,22 +237,45 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         $result = & $script:cycleFunction -AgencyPath unused -CycleNumber 1
 
         $result.ExitCode | Should -Be 0 -Because $result.Summary
-        $script:adoSessions.Count | Should -Be 2
+        $script:adoSessions.Count | Should -Be 3
         $script:adoSessions[0].TimeoutSeconds | Should -Be 120
         $script:adoSessions[1].TimeoutSeconds | Should -Be 15
         $script:adoSessions[0].Process | Should -Not -BeNullOrEmpty
         $script:adoSessions[1].Process | Should -BeNullOrEmpty
+        $script:adoSessions[2].Process | Should -Not -BeNullOrEmpty
         Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter {
-            $Data.code -eq 'outbox-cycle-error' -and
+            $Data.code -eq 'outbox-cycle-retrying' -and
             $Data.reason -eq 'Teams outbox ADO session closed while draining queued notifications.'
         }
+        Should -Invoke Publish-AgentEvent -Times 0 -ParameterFilter { $Data.code -eq 'outbox-cycle-error' }
         Should -Invoke Invoke-AgentMcpTool -Times 1 -ParameterFilter {
             $Name -eq 'repo_pull_request' -and $Session.SessionId -eq $script:adoSessions[0].SessionId
         }
     }
 
-    It 'isolates Teams maintenance timeouts from the handler work session' -Skip:($Role -ne 'review-handler') {
+    It 'does not retry an unknown WorkIQ send' {
+        Mock Invoke-AgentTeamsNotificationOutbox {
+            param($Session)
+            $Session.Process = $null
+            throw 'Agent MCP response timed out.'
+        }
+
+        & $script:maintenanceFunction -AgencyPath unused
+
+        Should -Invoke Open-AgentMcpSession -Times 1 -ParameterFilter { $Server -eq 'ado' }
+        Should -Invoke Open-AgentMcpSession -Times 1 -ParameterFilter { $Server -eq 'workiq' }
+        Should -Invoke Publish-AgentEvent -Times 0 -ParameterFilter {
+            $Data.code -in @('outbox-cycle-retrying', 'reference-maintenance-retrying')
+        }
+        Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter {
+            $Data.code -eq $(if ($script:role -eq 'reviewer') { 'outbox-cycle-error' } else { 'reference-maintenance-error' }) -and
+            $Data.reason -eq 'Agent MCP response timed out.'
+        }
+    }
+
+    It 'retries handler Teams maintenance timeouts without affecting the work session' -Skip:($Role -ne 'review-handler') {
         $script:adoSessions = [Collections.Generic.List[hashtable]]::new()
+        $script:maintenanceCalls = 0
         Mock Open-AgentMcpSession {
             param($Server, $TimeoutSeconds)
             $session = @{
@@ -253,8 +289,12 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         }
         Mock Initialize-AgentTeamsPrThread {
             param($ReferenceContext)
-            $ReferenceContext.Ado.Process = $null
-            throw 'Agent MCP response timed out.'
+            $script:maintenanceCalls++
+            if ($script:maintenanceCalls -eq 1) {
+                $ReferenceContext.Ado.Process = $null
+                throw 'Agent MCP response timed out.'
+            }
+            @{ Outcome = 'ready' }
         }
         Mock Invoke-AgentMcpTool {
             param($Session, $Name)
@@ -268,22 +308,25 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         $result = & $script:cycleFunction -AgencyPath unused -CycleNumber 1
 
         $result.ExitCode | Should -Be 0 -Because $result.Summary
-        $script:adoSessions.Count | Should -Be 3
+        $script:adoSessions.Count | Should -Be 4
         $script:adoSessions[0].TimeoutSeconds | Should -Be 120
         $script:adoSessions[1].TimeoutSeconds | Should -Be 15
         $script:adoSessions[2].TimeoutSeconds | Should -Be 15
+        $script:adoSessions[3].TimeoutSeconds | Should -Be 15
         $script:adoSessions[0].Process | Should -Not -BeNullOrEmpty
         $script:adoSessions[2].Process | Should -BeNullOrEmpty
+        $script:adoSessions[3].Process | Should -Not -BeNullOrEmpty
         Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter {
-            $Data.code -eq 'reference-maintenance-error' -and
-            $Data.reason -eq 'Teams reference maintenance ADO session closed while initializing PR 42.'
+            $Data.code -eq 'reference-maintenance-retrying' -and
+            $Data.reason -eq 'Agent MCP response timed out.' -and $PrId -eq 42
         }
+        Should -Invoke Publish-AgentEvent -Times 0 -ParameterFilter { $Data.code -eq 'reference-maintenance-error' }
         Should -Invoke Invoke-AgentMcpTool -Times 1 -ParameterFilter {
             $Name -eq 'repo_pull_request_thread' -and $Session.SessionId -eq $script:adoSessions[0].SessionId
         }
     }
 
-    It 'reports a maintenance ADO closure during outbox draining' -Skip:($Role -ne 'review-handler') {
+    It 'defers a handler maintenance ADO closure only after one fresh-session retry' -Skip:($Role -ne 'review-handler') {
         Mock Invoke-AgentTeamsNotificationOutbox {
             param($ReferenceContext)
             $ReferenceContext.Ado.Process = $null
@@ -292,6 +335,11 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
 
         Invoke-HandlerTeamsMaintenance -AgencyPath unused
 
+        Should -Invoke Open-AgentMcpSession -Times 2 -ParameterFilter { $Server -eq 'ado' }
+        Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter {
+            $Data.code -eq 'reference-maintenance-retrying' -and
+            $Data.reason -eq 'Teams reference maintenance ADO session closed while draining the notification outbox.'
+        }
         Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter {
             $Data.code -eq 'reference-maintenance-error' -and
             $Data.reason -eq 'Teams reference maintenance ADO session closed while draining the notification outbox.'

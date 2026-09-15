@@ -2036,11 +2036,52 @@ function Get-HandlerPullRequestLink {
     return "https://dev.azure.com/$([Uri]::EscapeDataString($Organization))/$([Uri]::EscapeDataString($ExpectedProject))/_git/$([Uri]::EscapeDataString($RepositoryName))/pullrequest/$PrId"
 }
 
+function Get-HandlerPullRequestHistoryData {
+    param(
+        [Parameter(Mandatory)][object]$PullRequest,
+        [hashtable]$Additional = @{}
+    )
+    $prId = [int](Get-HandlerHashValue -Container $PullRequest -Key 'pullRequestId' -Default 0)
+    $createdBy = Get-HandlerHashValue -Container $PullRequest -Key 'createdBy'
+    $author = [string](Get-HandlerHashValue -Container $createdBy -Key 'displayName' -Default '')
+    if ([string]::IsNullOrWhiteSpace($author)) {
+        $author = [string](Get-HandlerHashValue -Container $createdBy -Key 'uniqueName' -Default '')
+    }
+    $data = @{
+        title = [string](Get-HandlerHashValue -Container $PullRequest -Key 'title' -Default "PR $prId")
+        author = $author
+        url = Get-HandlerPullRequestLink -PrId $prId
+        sourceBranch = (([string](Get-HandlerHashValue -Container $PullRequest -Key 'sourceRefName' -Default '')) -replace '^refs/heads/', '')
+        targetBranch = (([string](Get-HandlerHashValue -Container $PullRequest -Key 'targetRefName' -Default '')) -replace '^refs/heads/', '')
+    }
+    foreach ($key in $Additional.Keys) { $data[$key] = $Additional[$key] }
+    return $data
+}
+
+function Test-HandlerTeamsMaintenanceRecoverableFailure {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [AllowNull()][hashtable]$AdoSession,
+        [AllowNull()][hashtable]$WorkIqSession
+    )
+    if ($Message -match '^Teams reference maintenance ADO session closed while (initializing PR [1-9][0-9]*|draining the notification outbox)\.$') {
+        return $true
+    }
+    if ($Message -notmatch '^(Agent MCP session is closed\.|Could not write to Agent MCP\.|Agent MCP exited before returning a response\.|Agent MCP closed stdout before returning a response\.|Agent MCP response timed out\.)$') {
+        return $false
+    }
+    if (-not $WorkIqSession) { return $true }
+    return [bool]($AdoSession -and -not $AdoSession.Process -and $WorkIqSession.Process)
+}
+
 function Invoke-HandlerTeamsMaintenance {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
         [object[]]$Candidates = @(),
-        [switch]$Bootstrap
+        [switch]$Bootstrap,
+        [switch]$McpRecoveryAttempted,
+        [ValidateRange(0, 2147483647)][int]$RetryPullRequestId,
+        [DateTime]$DeadlineUtc = [DateTime]::MinValue
     )
     if ($PreviewOnly -or -not $EnableTeamsNotifications -or -not $TeamsChannelEnabled -or
         -not $TeamsThreadReuseEnabled -or -not $TeamsPrReferenceEnabled -or @($TeamsChannelEvents).Count -eq 0) { return }
@@ -2049,8 +2090,9 @@ function Invoke-HandlerTeamsMaintenance {
     if ($Bootstrap -and (-not $EnableTeamsPrReferenceWrites -or $Candidates.Count -eq 0)) { return }
     $adoSession = $null
     $workIqSession = $null
+    $currentReferencePrId = 0
     try {
-        $deadline = [DateTime]::UtcNow.AddSeconds(60)
+        $deadline = if ($DeadlineUtc -eq [DateTime]::MinValue) { [DateTime]::UtcNow.AddSeconds(60) } else { $DeadlineUtc }
         $maintenanceSessionTimeoutSeconds = [Math]::Max(1, [Math]::Min(15, $McpTimeoutSeconds))
         $adoSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
             -Organization $Organization -Toolsets @('repos') -TimeoutSeconds $maintenanceSessionTimeoutSeconds
@@ -2068,10 +2110,14 @@ function Invoke-HandlerTeamsMaintenance {
             $ids = @($Candidates | ForEach-Object { [int](Get-HandlerHashValue -Container $_ -Key pullRequestId -Default 0) } |
                 Where-Object { $_ -gt 0 -and ($PullRequestId -le 0 -or $_ -eq $PullRequestId) } | Sort-Object -Unique)
             $orderedIds = @(@($ids | Where-Object { $_ -gt $cursor }) + @($ids | Where-Object { $_ -le $cursor }))
+            if ($RetryPullRequestId -gt 0 -and $RetryPullRequestId -in $orderedIds) {
+                $orderedIds = @($RetryPullRequestId) + @($orderedIds | Where-Object { $_ -ne $RetryPullRequestId })
+            }
             $attempted = 0
             foreach ($id in $orderedIds) {
                 if ($attempted -ge 10 -or [DateTime]::UtcNow -ge $deadline) { break }
                 $attempted++
+                $currentReferencePrId = $id
                 Set-JsonState -Path $cursorPath -State @{ lastPrId = $id }
                 try {
                     Initialize-AgentTeamsPrThread -Session $workIqSession -ReferenceContext $referenceContext `
@@ -2081,6 +2127,8 @@ function Invoke-HandlerTeamsMaintenance {
                 }
                 catch {
                     if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
+                    if (Test-HandlerTeamsMaintenanceRecoverableFailure -Message $_.Exception.Message `
+                            -AdoSession $adoSession -WorkIqSession $workIqSession) { throw }
                     Write-Warning "Teams PR $id reference initialization deferred; review selection is unaffected: $($_.Exception.Message)"
                 }
                 if (-not $adoSession.Process) {
@@ -2106,6 +2154,29 @@ function Invoke-HandlerTeamsMaintenance {
     catch {
         if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
         $reason = $_.Exception.Message
+        if (-not $McpRecoveryAttempted -and [DateTime]::UtcNow -lt $deadline -and
+            (Test-HandlerTeamsMaintenanceRecoverableFailure -Message $reason `
+                -AdoSession $adoSession -WorkIqSession $workIqSession)) {
+            if ($script:HandlerOutputContext) {
+                Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery -Level warning `
+                    -PrId $currentReferencePrId `
+                    -Data @{ outcome = 'retrying'; code = 'reference-maintenance-retrying'; reason = $reason } `
+                    -Message 'Teams reference maintenance transport failed; retrying immediately with fresh ADO and WorkIQ sessions.' | Out-Null
+            }
+            Write-Warning "Teams reference maintenance transport failed; retrying immediately with fresh sessions: $reason"
+            if ($workIqSession) {
+                try { Close-AgentMcpSession -Session $workIqSession }
+                catch { Write-Warning 'Teams maintenance session cleanup failed before retry; review selection is unaffected.' }
+                $workIqSession = $null
+            }
+            if ($adoSession) {
+                try { Close-AgentMcpSession -Session $adoSession }
+                catch { Write-Warning 'Teams maintenance ADO session cleanup failed before retry; review selection is unaffected.' }
+                $adoSession = $null
+            }
+            return Invoke-HandlerTeamsMaintenance -AgencyPath $AgencyPath -Candidates $Candidates -Bootstrap:$Bootstrap `
+                -McpRecoveryAttempted -RetryPullRequestId $currentReferencePrId -DeadlineUtc $deadline
+        }
         if ($script:HandlerOutputContext) {
             Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery -Level warning `
                 -Data @{ outcome = 'deferred'; code = 'reference-maintenance-error'; reason = $reason } `
@@ -2454,9 +2525,10 @@ function Invoke-HandlerCycle {
                 $filteredReason = 'not authored by the operator'
             }
             if ($filteredReason) {
-                Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $filteredId -Data @{
+                Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $filteredId `
+                    -Data (Get-HandlerPullRequestHistoryData -PullRequest $filtered -Additional @{
                     reason = $filteredReason; normalizedReason = $filteredNormalized
-                } -Message "PR $filteredId skipped ($filteredReason)."
+                }) -Message "PR $filteredId skipped ($filteredReason)."
             }
         }
 
@@ -2500,9 +2572,10 @@ function Invoke-HandlerCycle {
             $attempts = if ($attemptRecord -is [int]) { [int]$attemptRecord } else { [int](Get-HandlerHashValue -Container $attemptRecord -Key 'count' -Default 0) }
             if ($attempts -ge $ConsecutiveFailureThreshold) {
                 $skipCounts.starved++
-                Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId -Data @{
+                Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId `
+                    -Data (Get-HandlerPullRequestHistoryData -PullRequest $pr -Additional @{
                     reason = "starved after $attempts consecutive failures"; normalizedReason = 'starved'; retryable = $true
-                } -Message "PR $prId skipped (starved: $attempts consecutive failures). Clear with -ResetStarvedCandidates."
+                }) -Message "PR $prId skipped (starved: $attempts consecutive failures). Clear with -ResetStarvedCandidates."
                 Send-HandlerEvent delivery.blocked -Level warning -Cycle $CycleNumber -PrId $prId -Data @{
                     title = [string](Get-HandlerHashValue -Container $pr -Key 'title' -Default "PR $prId")
                     reason = "$attempts consecutive failures reached the starvation threshold"
@@ -2533,9 +2606,10 @@ function Invoke-HandlerCycle {
             $validationPending = (([string](Get-HandlerHashValue -Container $priorHandledRecord -Key 'validation' -Default '')) -eq 'failed')
             if (-not (Test-HandlerCandidateNeedsWork -ActionableThreadCount $actionable -HandledRecord $priorHandledRecord)) {
                 $skipCounts.other++
-                Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -Data @{
+                Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId `
+                    -Data (Get-HandlerPullRequestHistoryData -PullRequest $pr -Additional @{
                     reason = 'no actionable reviewer feedback'; normalizedReason = 'other'
-                } -Message "PR $prId skipped (no actionable reviewer feedback)."
+                }) -Message "PR $prId skipped (no actionable reviewer feedback)."
                 continue
             }
 
@@ -2546,9 +2620,10 @@ function Invoke-HandlerCycle {
             $sourceCommit = [string](Get-HandlerHashValue -Container $mergeSrc -Key 'commitId' -Default '')
             if ($sourceCommit -notmatch '^[0-9a-fA-F]{40}$') {
                 $skipCounts.invalidCommit++
-                Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId -Data @{
+                Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId `
+                    -Data (Get-HandlerPullRequestHistoryData -PullRequest $prDetail -Additional @{
                     reason = 'no valid 40-hex source commit'; normalizedReason = 'invalidCommit'
-                } -Message "PR $prId skipped (no valid 40-hex source commit)."
+                }) -Message "PR $prId skipped (no valid 40-hex source commit)."
                 continue
             }
 
@@ -2556,9 +2631,10 @@ function Invoke-HandlerCycle {
             if (-not $ForceAnalysis -and
                 (Test-HandlerAlreadyHandled -HandledState $handledState -PrId $prId -SourceCommit $sourceCommit -MaxThreadDate $maxThreadDate)) {
                 $skipCounts.delivered++
-                Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
+                    -Data (Get-HandlerPullRequestHistoryData -PullRequest $prDetail -Additional @{
                     reason = 'already handled and delivered'; normalizedReason = 'delivered'
-                } -Message "PR $prId skipped (already handled at this commit and comment state)."
+                }) -Message "PR $prId skipped (already handled at this commit and comment state)."
                 continue
             }
 
@@ -2575,9 +2651,10 @@ function Invoke-HandlerCycle {
                     -RejectedSessionIds $script:HandlerRejectedResumeSessionIds
                 if (-not $candidateSessions -or $candidateSessions.Count -eq 0) {
                     $skipCounts.other++
-                    Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
+                    Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
+                        -Data (Get-HandlerPullRequestHistoryData -PullRequest $prDetail -Additional @{
                         reason = 'no local coding session; another host owns this PR'; normalizedReason = 'other'
-                    } -Message "PR $prId skipped (no local coding session for '$candidateBranch')."
+                    }) -Message "PR $prId skipped (no local coding session for '$candidateBranch')."
                     continue
                 }
             }
@@ -2590,9 +2667,9 @@ function Invoke-HandlerCycle {
                 ValidationRetryOnly = ($validationPending -and $actionable -le 0)
                 PriorValidationSummary = [string](Get-HandlerHashValue -Container $priorHandledRecord -Key 'validationSummary' -Default '')
             }
-            Send-HandlerEvent candidate.selected -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
-                title = [string](Get-HandlerHashValue -Container $prDetail -Key 'title' -Default "PR $prId")
-            } -Message "Selected PR $prId - $([string](Get-HandlerHashValue -Container $prDetail -Key 'title' -Default "PR $prId"))"
+            Send-HandlerEvent candidate.selected -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
+                -Data (Get-HandlerPullRequestHistoryData -PullRequest $prDetail) `
+                -Message "Selected PR $prId - $([string](Get-HandlerHashValue -Container $prDetail -Key 'title' -Default "PR $prId"))"
             break
         }
 
