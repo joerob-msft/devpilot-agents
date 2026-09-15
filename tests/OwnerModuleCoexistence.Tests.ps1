@@ -26,6 +26,9 @@ Describe 'Owner dependency module coexistence' {
             $Target.Replace('.', '-') + '-' + $Force.ToString().ToLowerInvariant())
         $probePath = Join-Path $caseRoot 'probe.ps1'
         [void](New-Item -ItemType Directory -Path $caseRoot -Force)
+        Copy-Item -LiteralPath (
+            Join-Path $repoRoot 'tests\fixtures\owner-orchestrator\generic-cohort.json'
+        ) -Destination (Join-Path $caseRoot 'cohort.json')
         [IO.File]::WriteAllText($probePath, @'
 param(
     [Parameter(Mandatory)][string]$HarnessManifest,
@@ -53,8 +56,7 @@ $targetModule = Get-Module $TargetName
 $commandWorked = switch ($TargetName) {
     'DevPilot.OwnerOrchestrator' {
         $stateRoot = Join-Path $CaseRoot 'state'
-        $manifestPath = Join-Path $RepositoryRoot `
-            'tests\fixtures\owner-orchestrator\generic-cohort.json'
+        $manifestPath = Join-Path $CaseRoot 'cohort.json'
         [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot -ManifestPath $manifestPath)
         (Get-OwnerV2PreviewStatus -StateRoot $stateRoot -ManifestPath $manifestPath).kind -ceq `
             'owner-v2-preview-status'
