@@ -28,6 +28,14 @@ The module exports only:
 `-StateRoot` and `-ManifestPath` values. It does not register Task Scheduler,
 automation, deployment, notification, vote, comment, summary, or writer work.
 
+The same state machine also accepts the separately bounded
+`relation-v2-preview-cohort` manifest through
+`tools/Invoke-RelationV2Preview.ps1`. That wrapper exposes only `prepare-run`
+and `status`, caps cohorts at 10 entries, and dispatches to
+`DevPilot.RelationEvidence` with an injected read-only provider. Existing Owner
+manifest behavior and scheduled deployment remain unchanged; relation
+deployment is separate.
+
 ## Current operating state (authoritative)
 
 This section is the authoritative current operating state for the Owner v2
