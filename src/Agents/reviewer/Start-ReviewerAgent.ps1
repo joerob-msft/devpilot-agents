@@ -2047,10 +2047,11 @@ $TeamsPrReferenceEnabled = if ($teamsChannelCfg.PSObject.Properties['prReference
 $TeamsTeamId = Get-AgentConfigString -Object $teamsChannelCfg -Name "teamId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
 $TeamsChannelId = Get-AgentConfigString -Object $teamsChannelCfg -Name "channelId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
 $TeamsChannelEvents = Get-AgentConfigStringArray -Object $teamsChannelCfg -Name "events" -Where "config.teamsNotifications.channel"
-$TeamsCleanReviewCcUpns = if ($teamsChannelCfg.PSObject.Properties["cleanReviewCcUpns"]) {
-    Get-AgentConfigStringArray -Object $teamsChannelCfg -Name "cleanReviewCcUpns" -Where "config.teamsNotifications.channel"
+$TeamsCleanReviewCcUpns = [string[]]@()
+if ($teamsChannelCfg.PSObject.Properties["cleanReviewCcUpns"]) {
+    $TeamsCleanReviewCcUpns = @(Get-AgentConfigStringArray -Object $teamsChannelCfg `
+        -Name "cleanReviewCcUpns" -Where "config.teamsNotifications.channel")
 }
-else { [string[]]@() }
 $teamsDirectCfg = Get-AgentConfigObject -Object $teamsCfg -Name "directAuthor" -Where "config.teamsNotifications"
 $TeamsDirectEnabled = Get-AgentConfigBool -Object $teamsDirectCfg -Name "enabled" -Where "config.teamsNotifications.directAuthor"
 $TeamsDirectEvents = Get-AgentConfigStringArray -Object $teamsDirectCfg -Name "events" -Where "config.teamsNotifications.directAuthor"

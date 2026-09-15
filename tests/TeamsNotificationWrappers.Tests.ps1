@@ -174,6 +174,9 @@ Describe '<Role> Teams notification integration' -ForEach @(
         $sample = if ($script:notificationRole -eq 'reviewer') { 'reviewer-ado.config.json' } else { 'handler-ado.config.json' }
         $config = Get-Content -LiteralPath "$PSScriptRoot\..\samples\$sample" -Raw | ConvertFrom-Json
         $config.teamsNotifications.channel.PSObject.Properties.Remove('threadReuseEnabled')
+        if ($script:notificationRole -eq 'reviewer') {
+            $config.teamsNotifications.channel.PSObject.Properties.Remove('cleanReviewCcUpns')
+        }
         $config.teamsNotifications.channel.enabled = $false
         $config.teamsNotifications.directAuthor.enabled = $Mode -eq 'direct-only'
         $config.teamsNotifications.directAuthor.recipientUpn = 'author@example.test'
