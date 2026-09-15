@@ -706,6 +706,45 @@ function Get-ReviewerAuthorMentionIdentity {
     return @{ Id = $objectId.ToString(); DisplayName = $displayName }
 }
 
+function Get-ReviewerConfiguredTeamsMentionIdentities {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [string[]]$RecipientUpns = @()
+    )
+    $identities = [Collections.Generic.List[object]]::new()
+    $seenUpns = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($recipientUpn in @($RecipientUpns)) {
+        $upn = ([string]$recipientUpn).Trim()
+        if (-not $upn -or -not $seenUpns.Add($upn)) { continue }
+        $session = $null
+        try {
+            $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server workiq -TimeoutSeconds 30
+            $recipient = Invoke-AgentWorkIqTool -Session $session -Name fetch -AllowedTools @('fetch') -AllowedPathPrefixes @('/users/') `
+                -Arguments @{ entityUrls = @("/users/$([Uri]::EscapeDataString($upn))?`$select=id,displayName,userPrincipalName") }
+            $id = [string](Get-AgentRequiredProperty -Object $recipient -Name id)
+            $displayName = [string](Get-AgentRequiredProperty -Object $recipient -Name displayName)
+            $resolvedUpn = [string](Get-AgentRequiredProperty -Object $recipient -Name userPrincipalName)
+            $objectId = [Guid]::Empty
+            if (-not [Guid]::TryParse($id, [ref]$objectId) -or
+                -not [string]::Equals($resolvedUpn, $upn, [StringComparison]::OrdinalIgnoreCase) -or
+                $displayName.Length -gt 256 -or $displayName -match '[\p{C}]') {
+                throw [IO.InvalidDataException]::new('The configured Teams mention identity is invalid.')
+            }
+            $identities.Add(@{ id = $objectId.ToString(); displayName = $displayName })
+        }
+        catch {
+            Write-Warning 'A configured Teams clean-review mention was skipped because its identity could not be validated.'
+        }
+        finally {
+            if ($session) {
+                try { Close-AgentMcpSession -Session $session }
+                catch { Write-Warning 'Teams clean-review mention session cleanup failed; notification delivery is unaffected.' }
+            }
+        }
+    }
+    return $identities.ToArray()
+}
+
 function Test-ReviewerTitleSkipped {
     <# Title-only, and deliberately so. Authors mark work-in-progress in the
        TITLE; matching the same words in a description or a diff would silence
@@ -2008,6 +2047,10 @@ $TeamsPrReferenceEnabled = if ($teamsChannelCfg.PSObject.Properties['prReference
 $TeamsTeamId = Get-AgentConfigString -Object $teamsChannelCfg -Name "teamId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
 $TeamsChannelId = Get-AgentConfigString -Object $teamsChannelCfg -Name "channelId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
 $TeamsChannelEvents = Get-AgentConfigStringArray -Object $teamsChannelCfg -Name "events" -Where "config.teamsNotifications.channel"
+$TeamsCleanReviewCcUpns = if ($teamsChannelCfg.PSObject.Properties["cleanReviewCcUpns"]) {
+    Get-AgentConfigStringArray -Object $teamsChannelCfg -Name "cleanReviewCcUpns" -Where "config.teamsNotifications.channel"
+}
+else { [string[]]@() }
 $teamsDirectCfg = Get-AgentConfigObject -Object $teamsCfg -Name "directAuthor" -Where "config.teamsNotifications"
 $TeamsDirectEnabled = Get-AgentConfigBool -Object $teamsDirectCfg -Name "enabled" -Where "config.teamsNotifications.directAuthor"
 $TeamsDirectEvents = Get-AgentConfigStringArray -Object $teamsDirectCfg -Name "events" -Where "config.teamsNotifications.directAuthor"
@@ -2023,6 +2066,14 @@ if ($PSBoundParameters.ContainsKey('TeamsRecipientUpn')) {
 }
 if ($TeamsDirectRecipientFallback -and $TeamsDirectRecipientFallback -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
     throw "Teams fallback direct recipient '$TeamsDirectRecipientFallback' is not a valid UPN."
+}
+if ($TeamsCleanReviewCcUpns.Count -gt 4) {
+    throw 'config.teamsNotifications.channel.cleanReviewCcUpns supports at most four recipients.'
+}
+foreach ($upn in @($TeamsCleanReviewCcUpns)) {
+    if ($upn -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        throw "Teams clean-review cc recipient '$upn' is not a valid UPN."
+    }
 }
 
 # An event this agent never raises would be configured, look enabled, and
@@ -5254,6 +5305,7 @@ function Send-ReviewerTeamsNotification {
         [string]$DirectRecipientUpn = "",
         [string]$MentionRecipientId = "",
         [string]$MentionRecipientDisplayName = "",
+        [string[]]$AdditionalChannelMentionUpns = @(),
         [string[]]$Links = @()
     )
     if ($PreviewOnly -or -not $EnableTeamsNotifications) { return }
@@ -5302,6 +5354,13 @@ function Send-ReviewerTeamsNotification {
         }
 
         $delivered = New-Object System.Collections.Generic.List[string]
+        $additionalMentionRecipients = @()
+        if ($sendChannel -and $AdditionalChannelMentionUpns.Count -gt 0) {
+            $additionalMentionRecipients = @(
+                Get-ReviewerConfiguredTeamsMentionIdentities -AgencyPath $AgencyPath `
+                    -RecipientUpns $AdditionalChannelMentionUpns
+            )
+        }
         $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "workiq" -TimeoutSeconds 60
         if ($sendChannel) {
             try {
@@ -5321,6 +5380,7 @@ function Send-ReviewerTeamsNotification {
                         -PullRequestUrl (Get-ReviewerPullRequestLink -PrId $PrId) `
                         -Title $Title -Body $Body -Links $Links -MentionRecipientId $MentionRecipientId `
                         -MentionRecipientDisplayName $MentionRecipientDisplayName `
+                        -AdditionalMentionRecipients $additionalMentionRecipients `
                         -OutputContext $script:ReviewerOutputContext @referenceParameters
                     $channelConfirmed = $result.Delivered -or $result.Deduped
                     if ([bool](Get-ReviewerHashValue -Container $result -Key Queued -Default $false)) {
@@ -5333,7 +5393,8 @@ function Send-ReviewerTeamsNotification {
                 else {
                     Send-AgentTeamsChannelMessage -Session $workIqSession -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
                         -Title $Title -Body $Body -Links $Links -MentionRecipientId $MentionRecipientId `
-                        -MentionRecipientDisplayName $MentionRecipientDisplayName | Out-Null
+                        -MentionRecipientDisplayName $MentionRecipientDisplayName `
+                        -AdditionalMentionRecipients $additionalMentionRecipients | Out-Null
                     if ($TeamsThreadReuseEnabled -and $script:ReviewerOutputContext) {
                         Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -PrId $PrId `
                             -SourceCommit $SourceCommit -Data @{ outcome = 'fallback-delivered'; code = 'thread-scope-unavailable' } `
@@ -5841,7 +5902,9 @@ function Invoke-ReviewerPullRequest {
                 "$postedCount finding(s) posted, $threadRepliesPosted human-comment assessment(s) posted, $($withheld.Count) withheld by config. " +
                 "Vote: $(if ($castVote) { $castVote } else { 'none' }).") `
             -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) `
-            -MentionRecipientId ([string]$Bound.AuthorMentionId) -MentionRecipientDisplayName ([string]$Bound.AuthorDisplay) -Links @($prLink)
+            -MentionRecipientId ([string]$Bound.AuthorMentionId) -MentionRecipientDisplayName ([string]$Bound.AuthorDisplay) `
+            -AdditionalChannelMentionUpns $(if ($allFindings.Count -eq 0) { [string[]]@($TeamsCleanReviewCcUpns) } else { [string[]]@() }) `
+            -Links @($prLink)
     }
     elseif ($allFindings.Count -gt 0 -or $threadReplies.Count -gt 0) {
         Send-ReviewerTeamsNotification -NotificationEvent 'previewReady' -AgencyPath $AgencyPath `
@@ -6327,6 +6390,7 @@ function Invoke-ReviewerPromotion {
             -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$delivery.AuthorUpn) `
             -MentionRecipientId ([string]$delivery.AuthorMentionId) `
             -MentionRecipientDisplayName ([string]$delivery.AuthorMentionDisplayName) `
+            -AdditionalChannelMentionUpns $(if ($allFindings.Count -eq 0) { [string[]]@($TeamsCleanReviewCcUpns) } else { [string[]]@() }) `
             -Links @(Get-ReviewerPullRequestLink -PrId $prId)
         Write-Host "Promoted the stored review of PR $prId." -ForegroundColor Green
         Send-ReviewerEvent work.completed -PrId $prId -SourceCommit $sourceCommit -Data @{

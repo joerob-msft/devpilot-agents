@@ -137,6 +137,30 @@ Describe 'WorkIQ structured rejection metadata' {
         }
     }
 
+    It 'tags the PR owner and reviewer once each in an independent channel message' {
+        $script:posted = $null
+        Mock Send-AgentMcpRequest -ModuleName DevPilot.AgentHarness {
+            param($Params)
+            $script:posted = $Params.arguments
+            return [pscustomobject]@{ structuredContent = [pscustomobject]@{
+                statusCode = 201; data = [pscustomobject]@{ id = 'message-id' }
+            } }
+        }
+
+        $null = Send-AgentTeamsChannelMessage -Session $session -TeamId fixture -ChannelId channel `
+            -Title title -Body body -MentionRecipientId '22222222-2222-2222-2222-222222222222' `
+            -MentionRecipientDisplayName 'PR <Owner>' -AdditionalMentionRecipients @(
+                @{ id = '33333333-3333-3333-3333-333333333333'; displayName = 'Review <Operator>' }
+                @{ id = '22222222-2222-2222-2222-222222222222'; displayName = 'Duplicate owner' }
+            )
+
+        $posted.jsonBody.mentions | Should -HaveCount 2
+        $posted.jsonBody.mentions[0].mentionText | Should -BeExactly 'PR <Owner>'
+        $posted.jsonBody.mentions[1].mentionText | Should -BeExactly 'Review <Operator>'
+        $posted.jsonBody.body.content |
+            Should -Match '<at id="0">PR &lt;Owner&gt;</at> <at id="1">Review &lt;Operator&gt;</at>'
+    }
+
     It 'sends without a mention when the bound owner identity is invalid' {
         $script:posted = $null
         Mock Send-AgentMcpRequest -ModuleName DevPilot.AgentHarness {
@@ -152,7 +176,7 @@ Describe 'WorkIQ structured rejection metadata' {
             -MentionRecipientDisplayName 'Owner' -WarningVariable warnings
 
         $posted.jsonBody.ContainsKey('mentions') | Should -BeFalse
-        $warnings | Should -Match 'bound owner identity is incomplete or invalid'
+        $warnings | Should -Match 'identity is incomplete or invalid'
     }
 }
 

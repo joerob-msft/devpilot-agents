@@ -655,15 +655,27 @@ function Initialize-AgentTeamsPrThread {
 
 function Assert-AgentTeamsPayload {
     param([Collections.IDictionary]$Payload)
-    Assert-AgentTeamsFields $Payload @('pullRequestId', 'pullRequestUrl', 'notificationEvent', 'sourceCommit', 'title', 'body', 'links', 'status')
+    if (-not $Payload.Contains('additionalMentionRecipients')) { $Payload.additionalMentionRecipients = @() }
+    Assert-AgentTeamsFields $Payload @('pullRequestId', 'pullRequestUrl', 'notificationEvent', 'sourceCommit', 'title', 'body', 'links', 'additionalMentionRecipients', 'status')
     if (-not (Test-StrictJsonInt $Payload.pullRequestId -Min 1 -Max ([int]::MaxValue)) -or
         $Payload.notificationEvent -isnot [string] -or $Payload.notificationEvent -cnotmatch '\A[a-zA-Z][a-zA-Z0-9-]{0,63}\z' -or
         $Payload.sourceCommit -isnot [string] -or $Payload.sourceCommit -cnotmatch '\A[0-9A-Za-z._-]{0,128}\z' -or
         $Payload.title -isnot [string] -or $Payload.title.Length -lt 1 -or $Payload.title.Length -gt 4096 -or
         $Payload.body -isnot [string] -or $Payload.body.Length -lt 1 -or $Payload.body.Length -gt 24576 -or
         $Payload.links -isnot [array] -or $Payload.links.Count -gt 16 -or
+        $Payload.additionalMentionRecipients -isnot [array] -or $Payload.additionalMentionRecipients.Count -gt 4 -or
         $Payload.status -isnot [string] -or $Payload.status -cnotin @('queued', 'unknown', 'failed', 'stale') -or $Payload.pullRequestUrl -isnot [string]) {
         throw [IO.InvalidDataException]::new('Invalid Teams outbox payload.')
+    }
+    foreach ($recipient in @($Payload.additionalMentionRecipients)) {
+        $id = Get-AgentProviderValue $recipient id
+        $displayName = Get-AgentProviderValue $recipient displayName
+        $objectId = [Guid]::Empty
+        if ($id -isnot [string] -or -not [Guid]::TryParse($id, [ref]$objectId) -or
+            $displayName -isnot [string] -or $displayName.Length -lt 1 -or $displayName.Length -gt 256 -or
+            $displayName -match '[\p{C}]') {
+            throw [IO.InvalidDataException]::new('Invalid Teams outbox mention identity.')
+        }
     }
     foreach ($link in @($Payload.links) + @($Payload.pullRequestUrl)) {
         $uri = $null
@@ -736,6 +748,7 @@ function Send-AgentTeamsSharedChannelMessage {
         [string]$Role, [string]$NotificationEvent, [int]$PullRequestId, [AllowEmptyString()][string]$SourceCommit,
         [string]$TeamId, [string]$ChannelId, [string]$Title, [string]$Body, [string[]]$Links = @(),
         [string]$MentionRecipientId = '', [string]$MentionRecipientDisplayName = '',
+        [object[]]$AdditionalMentionRecipients = @(),
         [string]$PullRequestUrl = '', [Nullable[DateTime]]$DeadlineUtc, [hashtable]$OutputContext, [switch]$PreviewOnly
     )
     $Role = $Role.ToLowerInvariant()
@@ -745,7 +758,8 @@ function Send-AgentTeamsSharedChannelMessage {
     $deadline = Get-AgentTeamsReferenceDeadline $DeadlineUtc
     $payload = @{
         pullRequestId = $PullRequestId; pullRequestUrl = $PullRequestUrl; notificationEvent = $NotificationEvent
-        sourceCommit = $SourceCommit; title = $Title; body = $Body; links = @($Links); status = 'queued'
+        sourceCommit = $SourceCommit; title = $Title; body = $Body; links = @($Links)
+        additionalMentionRecipients = @($AdditionalMentionRecipients); status = 'queued'
     }
     Assert-AgentTeamsPayload $payload
     $queued = $false
@@ -796,6 +810,7 @@ function Send-AgentTeamsSharedChannelMessage {
             -Title $payload.title -Body $payload.body -Links $payload.links `
             -MentionRecipientId $(if ($Role -ceq 'reviewer') { $pr.OwnerMentionId } else { '' }) `
             -MentionRecipientDisplayName $(if ($Role -ceq 'reviewer') { $pr.OwnerDisplayName } else { '' }) `
+            -AdditionalMentionRecipients $payload.additionalMentionRecipients `
             -DeadlineUtc $deadline -OutputContext $OutputContext `
             -SharedAuthority @{ Mode = 'reply'; RootId = $reference.Reference.messageId }
         if ($result.Delivered) { Set-AgentTeamsOutboxDisposition $context $Role $key delivered $deadline }
@@ -853,6 +868,7 @@ function Invoke-AgentTeamsNotificationOutbox {
                 -DurableStateRoot $DurableStateRoot -RepositoryIdentity $RepositoryIdentity -Role $Role `
                 -NotificationEvent $entry.notificationEvent -PullRequestId $entry.pullRequestId -SourceCommit $entry.sourceCommit `
                 -TeamId $TeamId -ChannelId $ChannelId -Title $entry.title -Body $entry.body -Links $entry.links `
+                -AdditionalMentionRecipients $entry.additionalMentionRecipients `
                 -PullRequestUrl $entry.pullRequestUrl -DeadlineUtc $deadline -OutputContext $OutputContext
             $summary.Processed++
             if ($result.Delivered) { $summary.DeliveredCount++ }

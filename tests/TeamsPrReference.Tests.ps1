@@ -215,6 +215,9 @@ Describe 'authenticated Teams PR references and durable outbox' {
     It 'queues before a reference exists, then drains without repeating review work' {
         $send.MentionRecipientId = '44444444-4444-4444-4444-444444444444'
         $send.MentionRecipientDisplayName = 'Wrong person'
+        $send.AdditionalMentionRecipients = @(
+            @{ id = '55555555-5555-5555-5555-555555555555'; displayName = 'Review operator' }
+        )
         $queued = Send-AgentTeamsThreadedChannelMessage @send
         $queued.Outcome | Should -Be 'queued'
         $queued.Queued | Should -BeTrue
@@ -226,8 +229,11 @@ Describe 'authenticated Teams PR references and durable outbox' {
         $drained.QueuedCount | Should -Be 0
         $fake.TeamsPosts.Count | Should -Be 2
         $fake.TeamsPosts[1].parentUrl | Should -Match '/root-1/replies$'
+        $fake.TeamsPosts[1].jsonBody.mentions | Should -HaveCount 2
         $fake.TeamsPosts[1].jsonBody.mentions[0].mentionText | Should -BeExactly $fake.Pr.createdBy.displayName
+        $fake.TeamsPosts[1].jsonBody.mentions[1].mentionText | Should -BeExactly 'Review operator'
         $fake.TeamsPosts[1].jsonBody.body.content | Should -Match '<at id="0">'
+        $fake.TeamsPosts[1].jsonBody.body.content | Should -Match '<at id="1">'
         $fake.TeamsPosts[1].jsonBody.body.content | Should -Match '&lt;script&gt;body&lt;/script&gt;'
         (Send-AgentTeamsThreadedChannelMessage @send).Deduped | Should -BeTrue
         $fake.TeamsPosts.Count | Should -Be 2
