@@ -77,6 +77,48 @@ test("history merges only newer metadata and retains independent role outcomes",
   assert.equal(entry.outcomes["review-handler"]?.result, "handled");
 });
 
+test("history ignores incidental PR events and retains explicit skip activity", () => {
+  const history = new PullRequestHistoryProjection();
+  for (const [index, type] of ["agent.heartbeat", "phase.changed", "notification.delivery"].entries()) {
+    assert.equal(history.apply(event("9007199254740993", 7, index + 1, { type })), false);
+  }
+  assert.equal(history.list().length, 0);
+
+  history.apply(event("9007199254740993", 7, 4, {
+    role: "review-handler",
+    type: "candidate.skipped",
+    data: {
+      title: "No feedback needed",
+      author: "Ada",
+      sourceBranch: "feature/history",
+      targetBranch: "main",
+      reason: "no actionable reviewer feedback",
+    },
+  }));
+  const entry = history.list()[0]!;
+  assert.equal(entry.title, "No feedback needed");
+  assert.equal(entry.outcomes["review-handler"], undefined);
+  assert.equal(entry.activities["review-handler"]?.status, "skipped - no actionable reviewer feedback");
+  assert.equal(history.list("actionable reviewer feedback")[0]?.pullRequestId, 7);
+});
+
+test("later scan activity does not replace a terminal outcome", () => {
+  const history = new PullRequestHistoryProjection();
+  history.apply(event("9007199254740993", 7, 1, {
+    type: "work.completed",
+    data: { title: "Reviewed PR", result: "reviewed" },
+  }));
+  history.apply(event("9007199254740993", 7, 2, {
+    type: "candidate.skipped",
+    data: { title: "Reviewed PR", reason: "already reviewed and delivered" },
+  }));
+  const entry = history.list()[0]!;
+  assert.equal(entry.outcomes.reviewer?.result, "reviewed");
+  assert.equal(entry.outcomes.reviewer?.sequence, 1);
+  assert.equal(entry.activities.reviewer?.status, "skipped - already reviewed and delivered");
+  assert.equal(entry.lastSequence, 2);
+});
+
 test("history filtering, hiding, restoring, and deterministic eviction are local", () => {
   const history = new PullRequestHistoryProjection(2);
   history.apply(event("9007199254740993", 1, 1, { data: { title: "Alpha", author: "Ada" } }));

@@ -20,7 +20,12 @@ test("real Delete dismisses stale instances across dashboard restarts and Live o
 }, async () => {
   const root = await mkdtemp(resolve(".devpilot-dismissal-pty-"));
   const log = join(root, "events.jsonl");
-  const contents = event("reviewer", "dismissal-pty", 1, "agent.started", { repository: "old-watch" }) + "\n";
+  const startedLine = event("reviewer", "dismissal-pty", 1, "agent.started", { repository: "old-watch" });
+  const selectedLine = event("reviewer", "dismissal-pty", 2, "candidate.selected", {
+    title: "Dismissal history fixture",
+    author: "Ada",
+  });
+  const contents = `${startedLine}\n${selectedLine}\n`;
   let expectedContents = contents;
   const dashboardRoot = resolve(".");
   const bun = resolve("node_modules", "bun", "bin", "bun.exe");
@@ -86,8 +91,8 @@ test("real Delete dismisses stale instances across dashboard restarts and Live o
           assert.equal(await readFile(log, "utf8"), contents);
           await send("\x1b[3~", "Instance dismissed across Watch restarts");
           await wait("INSTANCES 0");
-          const heartbeat = JSON.parse(contents);
-          heartbeat.sequence = 2;
+          const heartbeat = JSON.parse(startedLine);
+          heartbeat.sequence = 3;
           heartbeat.eventType = "agent.heartbeat";
           heartbeat.timestamp = new Date().toISOString();
           const heartbeatLine = JSON.stringify(heartbeat) + "\n";

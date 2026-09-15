@@ -334,6 +334,11 @@ notification delivery. A transient MCP transport closure is retried once with
 a fresh session in the same cycle. If recovery still fails, the failure event
 retains the exact PR ID, title, operation, reason, and next retry so Simple and
 Advanced views do not display a stale prior PR or hide the actionable context.
+Reviewer outbox and Review Handler reference maintenance also retry one
+pre-send startup or confirmed ADO-session failure with fresh sessions inside the
+existing 60-second maintenance budget. Their durable receipts, claims, and
+outbox state remain authoritative; an unknown WorkIQ send stays quarantined
+instead of being repeated or creating a competing Teams root.
 
 `-PreviewOnly` is not an omission-based convention. It is a terminal,
 non-delegable ceiling that disables automatic and manual PR mutations,

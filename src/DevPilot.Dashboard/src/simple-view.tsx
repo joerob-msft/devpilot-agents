@@ -5,7 +5,7 @@ import type { PullRequestHistoryEntry } from "./history.js";
 import type { AutomationAgentStatus, AutomationStatus, CapabilitySummary, ResolvedManualTarget, RunPrepared, RunScheduleMode, ScanNowResult } from "./dispatch.js";
 import type { ManualProgress } from "./manual-progress.js";
 import type { ManualMode } from "./app.js";
-import { age, duration, eventNarrative, line, shortCommit } from "./format.js";
+import { age, duration, eventNarrative, line, localTimestamp, shortCommit } from "./format.js";
 import { liveElapsedMilliseconds } from "./reducer.js";
 
 export interface SimpleColors {
@@ -102,22 +102,41 @@ export function simpleInstanceRow(state: InstanceState): SimpleRow {
   };
 }
 
-export function simpleHistoryRow(entry: PullRequestHistoryEntry): SimpleRow {
-  const outcomes = (["reviewer", "review-handler"] as const)
-    .filter((role) => entry.outcomes[role])
-    .map((role) => `${simpleRole(role)}: ${entry.outcomes[role]!.result}`);
-  const status = outcomes.join("; ") || "Outcome not reported";
+export function simpleHistoryRow(entry: PullRequestHistoryEntry, now = Date.now()): SimpleRow {
+  const roles = (["reviewer", "review-handler"] as const)
+    .filter((role) => entry.outcomes[role] || entry.activities[role]);
+  const roleStatus = (role: AgentRole): string =>
+    entry.activities[role]?.status ?? entry.outcomes[role]?.result ?? "No reported activity";
+  const summaries = roles.map((role) => `${simpleRole(role)}: ${roleStatus(role)}`);
+  const statusText = summaries.join("; ") || "Activity not reported";
+  const status = `${localTimestamp(entry.lastSeenTimestampMs, true)} | ${statusText}`;
+  const latestActivity = Object.values(entry.activities)
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .sort((left, right) => right.timestampMs - left.timestampMs)[0];
+  const roleDetail = (role: AgentRole): string => {
+    const outcome = entry.outcomes[role];
+    const activity = entry.activities[role];
+    if (!outcome && !activity) return `${simpleRole(role)}: No reported activity`;
+    const primary = outcome ?? activity!;
+    let detail = `${simpleRole(role)}: ${outcome?.result ?? activity!.status} at ${localTimestamp(primary.timestampMs)} local`;
+    if (outcome && activity && activity.timestampMs > outcome.timestampMs) {
+      detail += `; latest activity ${activity.status} at ${localTimestamp(activity.timestampMs)} local`;
+    }
+    return detail;
+  };
   const reference = `${entry.repositoryIdentity.slug} / PR #${entry.pullRequestId}`;
   return {
     key: `pr:${entry.key}`, kind: "pr", pullRequestId: entry.pullRequestId,
-    agent: entry.outcomes.reviewer && entry.outcomes["review-handler"] ? "Both agents" :
-      entry.outcomes["review-handler"] ? "Review Handler" : entry.outcomes.reviewer ? "Reviewer" : "Agent not reported",
+    agent: roles.length === 2 ? "Both agents" :
+      roles[0] ? simpleRole(roles[0]) : "Agent not reported",
     reference, title: entry.title, status, activity: entry.title || "Title not reported",
-    attention: /fail|block|partial|unknown|not reported/i.test(status),
+    attention: /fail|block|partial|unknown|not reported|starved|timed out/i.test(statusText),
     details: [
       reference, entry.title || "Title not reported", `Author: ${entry.author || "Not reported"}`,
-      `Reviewer: ${entry.outcomes.reviewer?.result ?? "No reported outcome"}`,
-      `Review Handler: ${entry.outcomes["review-handler"]?.result ?? "No reported outcome"}`,
+      `Last activity: ${localTimestamp(entry.lastSeenTimestampMs)} local (${age(entry.lastSeenTimestampMs, now)})`,
+      ...(latestActivity ? [`Latest event: ${simpleRole(latestActivity.role)} ${latestActivity.status}`] : []),
+      roleDetail("reviewer"),
+      roleDetail("review-handler"),
       ...(entry.sourceBranch || entry.targetBranch ? [`${entry.sourceBranch || "?"} -> ${entry.targetBranch || "?"}`] : []),
       ...(entry.sourceCommit ? [`Commit: ${shortCommit(entry.sourceCommit)}`] : []),
     ],

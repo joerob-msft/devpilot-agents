@@ -169,6 +169,8 @@ function historyEvent(
     title?: string;
     author?: string;
     timestamp?: string;
+    eventType?: string;
+    data?: Record<string, unknown>;
   } = {},
 ) {
   const repositoryName = options.repositoryName ?? "repo";
@@ -179,7 +181,7 @@ function historyEvent(
     processId: sequence,
     timestamp: options.timestamp ?? `2026-09-03T00:00:${String(sequence).padStart(2, "0")}Z`,
     sequence,
-    eventType: "work.completed",
+    eventType: options.eventType ?? "work.completed",
     level: "info",
     cycleNumber: 1,
     pullRequestId,
@@ -202,6 +204,7 @@ function historyEvent(
       title: options.title ?? `PR ${pullRequestId}`,
       author: options.author ?? "Ada",
       result: options.role === "review-handler" ? "handled" : "reviewed",
+      ...options.data,
     },
     message: "",
   });
@@ -2977,9 +2980,11 @@ test("confirmed exits leave Current and Live, but canonical and legacy diagnosti
       });
       reducer.apply(started, source);
       history.apply(started);
-      reducer.apply(parseAgentEvent({
+      const selected = parseAgentEvent({
         ...started, sequence: 2, eventType: "candidate.selected", data: { title: "Retained context", author: "Ada" },
-      }), source);
+      });
+      reducer.apply(selected, source);
+      history.apply(selected);
       reducer.apply(parseAgentEvent({
         ...started, schemaVersion: 2, repositoryIdentity: null, instanceId: "exited-legacy", pullRequestId: 0,
       }), source);
@@ -3307,6 +3312,45 @@ test("Simple boxed History keeps canonical details pinned across side-by-side re
       assert.match(simplePanelText(setup, "simple-main-content"), /PR #105/);
     }, { history, width, height: 16 });
   }
+});
+
+test("Simple and Advanced History show timestamped skip activity without fabricating an outcome", async (context) => {
+  const history = new PullRequestHistoryProjection();
+  history.apply(historyEvent("101", 104, 1, {
+    role: "review-handler",
+    title: "No feedback needed",
+    timestamp: "2026-09-03T12:34:56Z",
+    eventType: "candidate.skipped",
+    data: {
+      result: undefined,
+      reason: "no actionable reviewer feedback",
+      sourceBranch: "feature/history",
+      targetBranch: "main",
+    },
+  }));
+  await withSimpleRenderer(context, async (setup) => {
+    setup.mockInput.pressKey("h");
+    await setup.flush();
+    let frame = setup.captureCharFrame();
+    assert.match(frame, /Review Handler \| PR #104/);
+    assert.match(frame, /09-03/);
+    assert.match(frame, /skipped - no actionable reviewer feedback/);
+    assert.doesNotMatch(frame, /Unknown agent|Outcome not reported/);
+
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    frame = simplePanelText(setup, "simple-main-content");
+    assert.match(frame, /Last activity: 2026-09-03/);
+    assert.match(frame, /Review Handler: skipped - no actionable reviewer feedback at 2026-09-03/);
+
+    setup.mockInput.pressEscape();
+    setup.mockInput.pressKey("a");
+    setup.mockInput.pressKey("f", { shift: true });
+    await setup.flush();
+    frame = setup.captureCharFrame();
+    assert.match(frame, /Last activity: 2026-09-03/);
+    assert.match(frame, /Handler: skipped - no actionable reviewer feedback at 2026-09-03/);
+  }, { history, width: 140, height: 24 });
 });
 
 test("Simple boxed sidebar scrolls selection while Enter transfers scrolling to pinned details", async (context) => {

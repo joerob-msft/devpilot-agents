@@ -16,6 +16,16 @@ export interface PullRequestRoleOutcome {
   sequence: number;
 }
 
+export interface PullRequestRoleActivity {
+  role: AgentRole;
+  status: string;
+  reason: string;
+  eventType: string;
+  timestampMs: number;
+  instanceId: string;
+  sequence: number;
+}
+
 export interface PullRequestHistoryEntry {
   key: string;
   repositoryIdentity: RepositoryIdentityV1;
@@ -30,7 +40,19 @@ export interface PullRequestHistoryEntry {
   lastInstanceId: string;
   lastSequence: number;
   outcomes: Partial<Record<AgentRole, PullRequestRoleOutcome>>;
+  activities: Partial<Record<AgentRole, PullRequestRoleActivity>>;
 }
+
+const HISTORY_EVENT_TYPES = new Set([
+  "candidate.selected",
+  "candidate.skipped",
+  "delivery.retrying",
+  "delivery.blocked",
+  "work.concurrent",
+  "work.completed",
+  "review.completed",
+  "cycle.failed",
+]);
 
 function canonicalPrKey(identity: RepositoryIdentityV1, pullRequestId: number): string {
   return `${identity.key}:pr:${pullRequestId}`;
@@ -52,11 +74,31 @@ function compareOrdinal(left: string, right: string): number {
 }
 
 function terminalResult(event: AgentEvent): string {
-  if (event.eventType === "cycle.failed") return getString(event.data, "reason") || "failed";
+  if (event.eventType === "cycle.failed") return "failed";
   if (event.eventType === "work.completed" || event.eventType === "review.completed") {
     return getString(event.data, "result") || "completed";
   }
   return "";
+}
+
+function activityStatus(event: AgentEvent): string {
+  const reason = getString(event.data, "reason");
+  const terminal = terminalResult(event);
+  if (terminal) return reason ? `${terminal} - ${reason}` : terminal;
+  switch (event.eventType) {
+    case "candidate.selected":
+      return "selected";
+    case "candidate.skipped":
+      return reason ? `skipped - ${reason}` : "skipped";
+    case "delivery.retrying":
+      return reason ? `retrying - ${reason}` : "retrying";
+    case "delivery.blocked":
+      return reason ? `blocked - ${reason}` : "blocked";
+    case "work.concurrent":
+      return reason ? `deferred - ${reason}` : "deferred";
+    default:
+      return "";
+  }
 }
 
 export class PullRequestHistoryProjection {
@@ -70,9 +112,12 @@ export class PullRequestHistoryProjection {
 
   apply(event: AgentEvent): boolean {
     const identity = event.repositoryIdentity;
-    if (event.schemaVersion !== 3 || !identity?.verified || !identity.dispatchEligible || event.pullRequestId <= 0) {
+    if (event.schemaVersion !== 3 || !identity?.verified || !identity.dispatchEligible ||
+        event.pullRequestId <= 0 || !HISTORY_EVENT_TYPES.has(event.eventType)) {
       return false;
     }
+    const status = activityStatus(event);
+    if (!status) return false;
     const key = canonicalPrKey(identity, event.pullRequestId);
     const current = this.entries.get(key);
     const eventOrder = orderOf(event);
@@ -95,6 +140,7 @@ export class PullRequestHistoryProjection {
       lastInstanceId: event.instanceId,
       lastSequence: event.sequence,
       outcomes: {},
+      activities: {},
     };
     if (newer) {
       next.repositoryIdentity = identity;
@@ -108,8 +154,27 @@ export class PullRequestHistoryProjection {
       next.lastInstanceId = event.instanceId;
       next.lastSequence = event.sequence;
     }
+    let activityChanged = false;
+    const priorActivity = next.activities[event.agent];
+    if (!priorActivity ||
+        compareOrder(eventOrder, [priorActivity.timestampMs, priorActivity.instanceId, priorActivity.sequence]) > 0) {
+      next.activities = {
+        ...next.activities,
+        [event.agent]: {
+          role: event.agent,
+          status: boundedText(status, 200),
+          reason: boundedText(getString(data, "reason"), 160),
+          eventType: event.eventType,
+          timestampMs: event.timestampMs,
+          instanceId: event.instanceId,
+          sequence: event.sequence,
+        },
+      };
+      activityChanged = true;
+    }
     const result = terminalResult(event);
     const priorOutcome = next.outcomes[event.agent];
+    let outcomeChanged = false;
     if (result && (!priorOutcome ||
       compareOrder(eventOrder, [priorOutcome.timestampMs, priorOutcome.instanceId, priorOutcome.sequence]) > 0)) {
       next.outcomes = {
@@ -122,10 +187,11 @@ export class PullRequestHistoryProjection {
           sequence: event.sequence,
         },
       };
+      outcomeChanged = true;
     }
     this.entries.set(key, next);
     this.evict();
-    return newer || Boolean(result);
+    return newer || activityChanged || outcomeChanged;
   }
 
   list(filter = "", repositoryKey = ""): PullRequestHistoryEntry[] {
@@ -192,6 +258,7 @@ export class PullRequestHistoryProjection {
   private matchesFilter(entry: PullRequestHistoryEntry, needle: string): boolean {
     if (!needle) return true;
     const outcomes = Object.values(entry.outcomes).map((item) => item?.result ?? "").join(" ");
+    const activities = Object.values(entry.activities).map((item) => item?.status ?? "").join(" ");
     return [
       String(entry.pullRequestId),
       entry.title,
@@ -199,6 +266,7 @@ export class PullRequestHistoryProjection {
       entry.repositoryIdentity.repositoryName,
       entry.repositoryIdentity.slug,
       outcomes,
+      activities,
     ].some((value) => value.toLowerCase().includes(needle));
   }
 

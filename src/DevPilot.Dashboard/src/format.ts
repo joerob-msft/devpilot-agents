@@ -11,6 +11,15 @@ export function age(timestampMs: number, now = Date.now()): string {
   return `${duration(Math.max(0, now - timestampMs))} ago`;
 }
 
+export function localTimestamp(timestampMs: number, compact = false): string {
+  const value = new Date(timestampMs);
+  if (!Number.isFinite(timestampMs) || Number.isNaN(value.getTime())) return "time unavailable";
+  const pad = (part: number): string => String(part).padStart(2, "0");
+  const date = `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
+  const time = `${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+  return compact ? `${date.slice(5)} ${time.slice(0, 5)}` : `${date} ${time}`;
+}
+
 export function shortId(instanceId: string): string {
   return instanceId.slice(0, 8);
 }
