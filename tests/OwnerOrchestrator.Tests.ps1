@@ -1,4 +1,5 @@
 BeforeAll {
+    $script:RepoRoot = Split-Path $PSScriptRoot -Parent
     Import-Module "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1" -Force
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1" -Force
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1" -Force
@@ -92,11 +93,16 @@ BeforeAll {
             Select-Object -First 1
     }
 
-    function Get-TestObservation {
+    function Get-TestObservationFile {
         param([Parameter(Mandatory)][string]$StateRoot)
-        $file = Get-ChildItem -LiteralPath $StateRoot -Recurse -Filter '*.json' |
+        return Get-ChildItem -LiteralPath $StateRoot -Recurse -Filter '*.json' |
             Where-Object { $_.FullName -match [regex]::Escape([IO.Path]::DirectorySeparatorChar + 'observations' + [IO.Path]::DirectorySeparatorChar) } |
             Select-Object -First 1
+    }
+
+    function Get-TestObservation {
+        param([Parameter(Mandatory)][string]$StateRoot)
+        $file = Get-TestObservationFile -StateRoot $StateRoot
         return Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json -AsHashtable -Depth 64
     }
 }
@@ -361,10 +367,56 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         Get-ChildItem -LiteralPath $partialState -Recurse -Filter '*.json' |
             Where-Object { $_.FullName -match 'evidence' } |
             Remove-Item -Force
-        [void](Invoke-OwnerV2PreviewRun -StateRoot $partialState -ManifestPath $partialManifest)
+        $partialRun = Invoke-OwnerV2PreviewRun -StateRoot $partialState -ManifestPath $partialManifest
+        $partialRecord = Get-Content -LiteralPath (Get-TestRecordFile -StateRoot $partialState).FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $partialObservationFile = Get-TestObservationFile -StateRoot $partialState
         $partialObservation = Get-TestObservation -StateRoot $partialState
+
+        $partialRun.records[0].state | Should -Be 'unknown'
+        $partialRun.records[0].reason | Should -Be 'orchestrator-refusal'
+        $partialRecord.state | Should -Be 'unknown'
+        $partialRecord.incompleteReason | Should -Be 'orchestrator-refusal'
         $partialObservation.execution.modelStarts | Should -Be 0
         $partialObservation.lifecycle.status | Should -Be 'unknown'
+        $partialObservation.lifecycle.prepared | Should -BeTrue
+        $partialObservation.lifecycle.completed | Should -Be 'unknown'
+        $partialObservation.lifecycle.incomplete | Should -Be 'unknown'
+        $partialObservation.lifecycle.pending | Should -Be 'unknown'
+
+        $observerManifest = Join-Path $script:RepoRoot 'src\OwnerObserver\OwnerObserver.psd1'
+        if (Test-Path -LiteralPath $observerManifest -PathType Leaf) {
+            Import-Module $observerManifest
+            $normalized = Read-OwnerNormalizedObservation -Path $partialObservationFile.FullName
+            $normalized.lifecycle.completed | Should -Be 'unknown'
+            $normalized.lifecycle.incomplete | Should -Be 'unknown'
+            $normalized.lifecycle.pending | Should -Be 'unknown'
+
+            $observerFixture = Join-Path $script:RepoRoot 'tests\fixtures\owner-observer\v2-outcome.json'
+            if (Test-Path -LiteralPath $observerFixture -PathType Leaf) {
+                $baseline = Read-OwnerNormalizedObservation -Path $observerFixture
+                $comparison = Compare-OwnerObservations -Baseline $baseline -Candidate $normalized
+                $comparison.parity | Should -Be 'unknown'
+                $comparison.regressions.status | Should -Be 'unknown'
+                $comparison.completion.regression | Should -Be 'unknown'
+            }
+        }
+
+        $parityManifest = Join-Path $script:RepoRoot 'src\DevPilot.OwnerParity\DevPilot.OwnerParity.psd1'
+        if (Test-Path -LiteralPath $parityManifest -PathType Leaf) {
+            Import-Module $parityManifest
+            $parityModule = Get-Module DevPilot.OwnerParity
+            $candidate = & $parityModule {
+                param($ObservationPath, $StateRoot)
+                Resolve-OwnerParityCandidate -Candidate ([ordered]@{
+                        mode = 'read'
+                        observationPath = $ObservationPath
+                        semanticProvenance = 'offline-replay-recorded-model'
+                    }) -V2StateRoot $StateRoot
+            } $partialObservationFile.FullName $partialState
+            $candidate.runState | Should -Be 'read'
+            $candidate.candidateCompleted | Should -Be 'unknown'
+        }
     }
 
     It 'supports prepare crash recovery and stale running lease recovery' {

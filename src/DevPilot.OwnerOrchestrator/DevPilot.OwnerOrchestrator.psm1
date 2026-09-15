@@ -3,11 +3,11 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Import-Module "$PSScriptRoot\..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1" -Force
-Import-Module "$PSScriptRoot\..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1" -Force
-Import-Module "$PSScriptRoot\..\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1" -Force
-Import-Module "$PSScriptRoot\..\DevPilot.OwnerModelRunner\DevPilot.OwnerModelRunner.psd1" -Force
-Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1" -Force
+Import-Module "$PSScriptRoot\..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.OwnerModelRunner\DevPilot.OwnerModelRunner.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
 
 if ($IsWindows -and -not ('DevPilot.OwnerOrchestrator.NativePaths' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -1073,7 +1073,13 @@ function Invoke-OwnerV2PreviewRun {
                 kind = 'owner-observation'
                 implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.1' }
                 capability = [string]$entry.Declaration.capability.id
-                lifecycle = [ordered]@{ status = 'unknown'; prepared = $true; completed = $false; incomplete = $true; pending = $false }
+                lifecycle = [ordered]@{
+                    status = 'unknown'
+                    prepared = $true
+                    completed = 'unknown'
+                    incomplete = 'unknown'
+                    pending = 'unknown'
+                }
                 execution = [ordered]@{ attempts = [int]$record.attempts; modelStarts = 0; latencyMs = 0; refusalReason = 'orchestrator-refusal'; incompleteReason = 'orchestrator-refusal' }
                 effects = [ordered]@{ providerWrites = 0; writeToolInvocations = 0 }
                 validationErrors = @([string]$_.Exception.Message)
