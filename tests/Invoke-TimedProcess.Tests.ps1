@@ -334,6 +334,46 @@ $child = New-AgentPersistentRedirectedProcess -FilePath (Resolve-AgentPwshPath) 
         $result.TimedOut | Should -BeFalse
     }
 
+    It 'reaps descendants when the timed parent exits normally' -Skip:(-not $IsWindows) {
+        $pidPath = Join-Path $TestDrive 'normal-exit-descendant.pid'
+        $descendantPid = 0
+        $escapedPidPath = $pidPath.Replace("'", "''")
+        $command = @"
+`$child = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @(
+    '-NoProfile', '-Command', 'Start-Sleep -Seconds 30'
+) -PassThru
+[IO.File]::WriteAllText('$escapedPidPath', [string]`$child.Id)
+exit 0
+"@
+        try {
+            $result = Invoke-TimedProcess -FilePath (Resolve-AgentPwshPath) `
+                -ArgumentList @('-NoProfile', '-Command', $command) `
+                -CaptureStdOut -CaptureStdErr -ContainDescendants -TimeoutSeconds 10
+            $result.ExitCode | Should -Be 0
+            $result.TimedOut | Should -BeFalse
+            Test-Path -LiteralPath $pidPath | Should -BeTrue
+            $descendantPid = [int](Get-Content -LiteralPath $pidPath -Raw)
+            $deadline = [DateTime]::UtcNow.AddSeconds(5)
+            while ((Get-Process -Id $descendantPid -ErrorAction SilentlyContinue) -and
+                [DateTime]::UtcNow -lt $deadline) {
+                Start-Sleep -Milliseconds 25
+            }
+            Get-Process -Id $descendantPid -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+        }
+        finally {
+            if ($descendantPid -gt 0) {
+                Stop-Process -Id $descendantPid -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    It 'contains both reviewer and review-handler model process trees' {
+        $reviewer = Get-Content -LiteralPath "$PSScriptRoot\..\src\Agents\reviewer\Start-ReviewerAgent.ps1" -Raw
+        $handler = Get-Content -LiteralPath "$PSScriptRoot\..\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1" -Raw
+        $reviewer | Should -Match 'Invoke-TimedProcess[\s\S]+-ContainDescendants'
+        $handler | Should -Match 'ContainDescendants\s*=\s*\$true'
+    }
+
     It 'does not classify unrelated exceptions as closed child stdin' {
         InModuleScope DevPilot.AgentHarness {
             Test-IsClosedChildStdinException -Exception ([System.UnauthorizedAccessException]::new('denied')) |

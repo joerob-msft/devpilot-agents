@@ -185,7 +185,7 @@ Do not reimplement these:
 
 | Need | Function |
 |---|---|
-| Run a child process with isolation + timeout | `Invoke-TimedProcess` |
+| Run a child process with isolation + timeout (`-ContainDescendants` for model trees) | `Invoke-TimedProcess` |
 | Open / call / close an MCP session | `Open-AgentMcpSession`, `Invoke-AgentMcpTool` |
 | Parse the result marker | `Get-AgentResultMarker` |
 | Read and write agent state | `Get-JsonState`, `Save-JsonState` |

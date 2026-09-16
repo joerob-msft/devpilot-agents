@@ -2430,6 +2430,7 @@ function Invoke-HandlerCopilotLaunch {
         WorkingDirectory             = $WorkingDirectory
         EnvironmentVariablesToRemove = $EnvironmentVariablesToRemove
         CancellationProbe             = $CancellationProbe
+        ContainDescendants             = $true
         TimeoutSeconds               = $TimeoutSeconds
     }
     $totalTimer = [Diagnostics.Stopwatch]::StartNew()
