@@ -5646,7 +5646,7 @@ function Invoke-ReviewerPullRequest {
     $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs -StandardInputContent $stdin `
         -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
         -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
-        -CancellationProbe $cancellationProbe -TimeoutSeconds $CycleTimeoutSeconds
+        -CancellationProbe $cancellationProbe -ContainDescendants -TimeoutSeconds $CycleTimeoutSeconds
     if ([bool]$run.Cancelled) {
         throw '[cancelled] Manual dispatch cooperatively acknowledged cancellation.'
     }

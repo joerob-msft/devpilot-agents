@@ -5381,6 +5381,7 @@ function Invoke-TimedProcess {
         [string]$WorkingDirectory,
         [string[]]$EnvironmentVariablesToRemove = @(),
         [scriptblock]$CancellationProbe,
+        [switch]$ContainDescendants,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -5400,8 +5401,20 @@ function Invoke-TimedProcess {
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $proc = $null
+    $containment = $null
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
+        if ($ContainDescendants -and $IsWindows) {
+            try {
+                $containment = New-AgentProcessContainment -Process $proc
+            }
+            catch {
+                Stop-ProcessTree -Process $proc
+                try { $proc.WaitForExit(5000) | Out-Null }
+                catch { Write-Verbose "Timed child did not confirm exit after containment setup failed." }
+                throw
+            }
+        }
 
         $stdoutTask = $null
         $stderrTask = $null
@@ -5445,8 +5458,24 @@ function Invoke-TimedProcess {
         }
 
         if ($timedOut -or $cancelled) {
-            Stop-ProcessTree -Process $proc
-            $proc.WaitForExit(5000) | Out-Null
+            $terminated = if ($containment) {
+                Stop-AgentProcessContainment -Containment $containment -Process $proc
+            }
+            else {
+                Stop-ProcessTree -Process $proc
+                try { $proc.WaitForExit(5000) | Out-Null }
+                catch { Write-Verbose "Uncontained timed child did not confirm exit after termination." }
+                $proc.Refresh()
+                $proc.HasExited
+            }
+            if (-not $terminated) {
+                throw '[process-cleanup-failed] Timed child process tree did not exit after termination.'
+            }
+        }
+        elseif ($containment -and -not (Test-AgentProcessContainmentExited -Containment $containment -Process $proc)) {
+            if (-not (Stop-AgentProcessContainment -Containment $containment -Process $proc)) {
+                throw '[process-cleanup-failed] Timed child exited but left a descendant process tree.'
+            }
         }
 
         $stdoutResult = Get-TaskTextBeforeDeadline -Task $stdoutTask -DeadlineUtc $deadline
@@ -5468,6 +5497,15 @@ function Invoke-TimedProcess {
         }
     }
     finally {
+        if ($containment) {
+            try {
+                if (-not (Test-AgentProcessContainmentExited -Containment $containment -Process $proc)) {
+                    [void](Stop-AgentProcessContainment -Containment $containment -Process $proc)
+                }
+            }
+            catch { Write-Verbose "Timed child containment cleanup failed during final disposal." }
+            finally { Close-AgentProcessContainment -Containment $containment }
+        }
         if ($proc) { $proc.Dispose() }
     }
 }
