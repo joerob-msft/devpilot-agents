@@ -421,6 +421,14 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $partialObservation.lifecycle.completed | Should -Be 'unknown'
         $partialObservation.lifecycle.incomplete | Should -Be 'unknown'
         $partialObservation.lifecycle.pending | Should -Be 'unknown'
+        $partialObservation.measurements.execution.modelStarts.status |
+            Should -Be 'unavailable'
+        $partialObservation.measurements.execution.modelStarts.reason |
+            Should -Be 'orchestrator-refusal'
+        $partialObservation.measurements.execution.latencyMs.status |
+            Should -Be 'unavailable'
+        $partialObservation.measurements.execution.latencyMs.reason |
+            Should -Be 'orchestrator-refusal'
 
         $observerManifest = Join-Path $script:RepoRoot 'src\OwnerObserver\OwnerObserver.psd1'
         if (Test-Path -LiteralPath $observerManifest -PathType Leaf) {

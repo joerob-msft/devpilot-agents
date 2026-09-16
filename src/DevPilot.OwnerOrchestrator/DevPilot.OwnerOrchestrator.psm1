@@ -1120,6 +1120,10 @@ function Invoke-OwnerV2PreviewRun {
             $observation.execution.incompleteReason = 'orchestrator-refusal'
             $observation.measurements.execution.attempts =
                 New-OwnerMeasurement -Status measured -Value ([int]$record.attempts)
+            $observation.measurements.execution.modelStarts =
+                New-OwnerMeasurement -Status unavailable -Reason 'orchestrator-refusal'
+            $observation.measurements.execution.latencyMs =
+                New-OwnerMeasurement -Status unavailable -Reason 'orchestrator-refusal'
             $observation.validationErrors = @([string]$_.Exception.Message)
             $finalState = 'unknown'
             $reason = 'orchestrator-refusal'
