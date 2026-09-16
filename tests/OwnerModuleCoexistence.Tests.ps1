@@ -12,6 +12,8 @@ Describe 'Owner dependency module coexistence' {
         @{ Target = 'DevPilot.OwnerOrchestrator'; Force = $true }
         @{ Target = 'DevPilot.OwnerParity'; Force = $false }
         @{ Target = 'DevPilot.OwnerParity'; Force = $true }
+        @{ Target = 'DevPilot.RelationEvidence'; Force = $false }
+        @{ Target = 'DevPilot.RelationEvidence'; Force = $true }
     ) {
         param($Target, $Force)
 
@@ -23,6 +25,12 @@ Describe 'Owner dependency module coexistence' {
         }
 
         $harnessManifest = Join-Path $repoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1'
+        $contractManifest = Join-Path $repoRoot `
+            'src\OwnerObservationContract\OwnerObservationContract.psd1'
+        $pipelineManifest = Join-Path $repoRoot `
+            'src\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1'
+        $capabilityManifest = Join-Path $repoRoot `
+            'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1'
         $observerManifest = Join-Path $repoRoot 'src\OwnerObserver\OwnerObserver.psd1'
         $orchestratorManifest = Join-Path $repoRoot `
             'src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1'
@@ -37,6 +45,9 @@ Describe 'Owner dependency module coexistence' {
         [IO.File]::WriteAllText($probePath, @'
 param(
     [Parameter(Mandatory)][string]$HarnessManifest,
+    [Parameter(Mandatory)][string]$ContractManifest,
+    [Parameter(Mandatory)][string]$PipelineManifest,
+    [Parameter(Mandatory)][string]$CapabilityManifest,
     [Parameter(Mandatory)][string]$ObserverManifest,
     [Parameter(Mandatory)][string]$OrchestratorManifest,
     [Parameter(Mandatory)][string]$ParityManifest,
@@ -48,20 +59,35 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Import-Module $HarnessManifest -Global
+Import-Module $ContractManifest -Global
+Import-Module $PipelineManifest -Global
+Import-Module $CapabilityManifest -Global
 Import-Module $ObserverManifest -Global
 Import-Module $OrchestratorManifest -Global
 Import-Module $ParityManifest -Global
 $preservedCommands = [ordered]@{
     'DevPilot.AgentHarness' = 'Get-DevPilotAgentPath'
+    'OwnerObservationContract' = 'New-OwnerMeasurement'
+    'DevPilot.OwnerPipeline' = 'New-OwnerPipelineBinding'
+    'DevPilot.OwnerCapability' = 'New-OwnerV2CapabilityAdapter'
     'OwnerObserver' = 'Test-OwnerObservation'
     'DevPilot.OwnerOrchestrator' = 'Get-OwnerV2PreviewStatus'
     'DevPilot.OwnerParity' = 'Test-OwnerParityPathIsolation'
 }
+$preservedApiHubCommands = @(
+    'Invoke-AgentGitHubApi',
+    'Get-AgentProviderPullRequestSnapshot',
+    'Invoke-AgentWorkIqTool'
+)
 $beforeModules = @{}
 $beforeCommands = @{}
 foreach ($name in $preservedCommands.Keys) {
     $beforeModules[$name] = Get-Module $name
     $beforeCommands[$name] = Get-Command $preservedCommands[$name] -ErrorAction Stop
+}
+$beforeApiHubCommands = @{}
+foreach ($name in $preservedApiHubCommands) {
+    $beforeApiHubCommands[$name] = Get-Command $name -ErrorAction Stop
 }
 
 if ($UseForce -ceq 'true') {
@@ -79,6 +105,7 @@ $targetCommands = @{
     'DevPilot.OwnerModelRunner' = 'New-OwnerModelReplayRunner'
     'DevPilot.OwnerOrchestrator' = 'Get-OwnerV2PreviewStatus'
     'DevPilot.OwnerParity' = 'Test-OwnerParityPathIsolation'
+    'DevPilot.RelationEvidence' = 'New-RelationEvidenceRequest'
 }
 $targetCommand = Get-Command $targetCommands[$TargetName] -ErrorAction SilentlyContinue
 $modulesPreserved = $true
@@ -93,6 +120,12 @@ foreach ($name in $preservedCommands.Keys) {
     $commandsPreserved = $commandsPreserved -and
         $null -ne $afterCommand -and
         [object]::ReferenceEquals($beforeCommands[$name].Module, $afterCommand.Module)
+}
+foreach ($name in $preservedApiHubCommands) {
+    $afterCommand = Get-Command $name -ErrorAction SilentlyContinue
+    $commandsPreserved = $commandsPreserved -and
+        $null -ne $afterCommand -and
+        [object]::ReferenceEquals($beforeApiHubCommands[$name].Module, $afterCommand.Module)
 }
 $lifecycleCompatible = $null
 $commandWorked = switch ($TargetName) {
@@ -158,6 +191,9 @@ $commandWorked = switch ($TargetName) {
         $output = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive `
             -File $probePath `
             -HarnessManifest $harnessManifest `
+            -ContractManifest $contractManifest `
+            -PipelineManifest $pipelineManifest `
+            -CapabilityManifest $capabilityManifest `
             -ObserverManifest $observerManifest `
             -OrchestratorManifest $orchestratorManifest `
             -ParityManifest $parityManifest `
