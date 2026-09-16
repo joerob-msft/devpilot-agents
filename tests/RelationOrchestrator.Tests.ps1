@@ -479,6 +479,7 @@ Describe 'Scheduler-callable relation preview' {
         } (Get-Command pwsh).Source $script:Child
         $ownerRoot = Join-Path $TestDrive 'combined-owner'
         $relationRoot = Join-Path $TestDrive 'combined-relation'
+        $global:LASTEXITCODE = 0
         $owner = & "$PSScriptRoot\..\tools\Invoke-OwnerV2Preview.ps1" prepare-run `
             -StateRoot $ownerRoot -ManifestPath $ownerManifest -EnableLiveModel `
             -LiveAcquisitionProvider $sharedProvider -LiveModelProvider $sharedModel

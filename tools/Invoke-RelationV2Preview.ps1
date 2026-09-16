@@ -38,7 +38,7 @@ if (-not [IO.Path]::IsPathFullyQualified($ManifestPath)) {
     throw 'ManifestPath must be an absolute path.'
 }
 
-Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1" -Force
+Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1"
 
 if ($Action -ceq 'status') {
     Get-OwnerV2PreviewStatus -StateRoot $StateRoot -ManifestPath $ManifestPath
