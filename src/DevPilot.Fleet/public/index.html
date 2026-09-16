@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DevPilot Fleet</title>
+  <script nonce="{{NONCE}}">
+    (() => {
+      const param = new URLSearchParams(window.location.search).get("scoutTheme");
+      const theme =
+        param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <style nonce="{{NONCE}}">
+:root {
+  color-scheme: light;
+  --cp-bg: #f7f4ef;
+  --cp-bg-elevated: #fcfbf8;
+  --cp-surface: #ffffff;
+  --cp-surface-soft: #f5f5f5;
+  --cp-border: #dedede;
+  --cp-border-strong: #919191;
+  --cp-text: #242424;
+  --cp-text-muted: #5c5c5c;
+  --cp-text-soft: #6f6f6f;
+  --cp-accent: #b11f4b;
+  --cp-accent-hover: #9a1a41;
+  --cp-accent-soft: rgba(177, 31, 75, 0.08);
+  --cp-accent-fg: #ffffff;
+  --cp-success: #16a34a;
+  --cp-danger: #dc2626;
+  --cp-warning: #f59e0b;
+  --cp-link: #0078d4;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
+  --cp-overlay: rgba(255, 255, 255, 0.8);
+  --cp-panel: rgba(255, 255, 255, 0.86);
+  --cp-panel-strong: rgba(255, 255, 255, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.55);
+  --cp-highlight: rgba(177, 31, 75, 0.12);
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --cp-bg: #3d3b3a;
+  --cp-bg-elevated: #343231;
+  --cp-surface: #292929;
+  --cp-surface-soft: #2e2e2e;
+  --cp-border: #474747;
+  --cp-border-strong: #5f5f5f;
+  --cp-text: #dedede;
+  --cp-text-muted: #919191;
+  --cp-text-soft: #b0b0b0;
+  --cp-accent: #fd8ea1;
+  --cp-accent-hover: #fb7b91;
+  --cp-accent-soft: rgba(253, 142, 161, 0.14);
+  --cp-accent-fg: #1a1a1a;
+  --cp-success: #4ade80;
+  --cp-danger: #f87171;
+  --cp-warning: #fbbf24;
+  --cp-link: #4da6ff;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+  --cp-overlay: rgba(41, 41, 41, 0.88);
+  --cp-panel: rgba(41, 41, 41, 0.72);
+  --cp-panel-strong: rgba(41, 41, 41, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.04);
+  --cp-highlight: rgba(253, 142, 161, 0.12);
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--cp-bg); color: var(--cp-text); font: 15px/1.5 "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif; }
+header { background: var(--cp-surface); border-bottom: 1px solid var(--cp-border); padding: 24px 32px; }
+main { max-width: 1440px; margin: auto; padding: 24px 32px 64px; }
+h1 { margin: 0; font-size: 28px; letter-spacing: -.5px; }
+h2 { font-size: 20px; margin: 24px 0 12px; }
+h3 { margin: 0 0 8px; font-size: 17px; }
+p { margin: 8px 0; }
+.row { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.muted, small { color: var(--cp-text-muted); }
+.mono, code, pre { font-family: Consolas, "Courier New", Courier, monospace; }
+.mono { overflow-wrap: anywhere; }
+.tag { display: inline-block; background: var(--cp-accent-soft); color: var(--cp-accent); border: 1px solid var(--cp-border); padding: 4px 8px; border-radius: .625rem; font-size: 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.card { background: var(--cp-surface); border: 1px solid var(--cp-border); border-radius: 16px; padding: 20px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+button { font: inherit; cursor: pointer; border: 1px solid var(--cp-border-strong); border-radius: .625rem; padding: 8px 12px; background: var(--cp-surface); color: var(--cp-text); }
+button.primary { background: var(--cp-accent); color: var(--cp-accent-fg); border-color: var(--cp-accent); }
+button:hover { border-color: var(--cp-accent); }
+button.primary:hover { background: var(--cp-accent-hover); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button:focus-visible { outline: 2px solid var(--cp-accent); outline-offset: 3px; }
+.status { font-size: 13px; font-weight: 600; }
+.succeeded { color: var(--cp-success); }
+.failed, .unknown, .invalid_result { color: var(--cp-danger); }
+.running, .queued { color: var(--cp-accent); }
+.interrupted, .blocked, .timed_out { color: var(--cp-warning); }
+.notice { padding: 12px 16px; border: 1px solid var(--cp-border); border-radius: .625rem; background: var(--cp-bg-elevated); margin-bottom: 16px; }
+#error { color: var(--cp-danger); border-color: var(--cp-danger); }
+.split { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(300px, 2fr); gap: 16px; align-items: start; }
+.run { display: block; width: 100%; text-align: left; margin-bottom: 8px; padding: 12px; }
+.run.selected { border-color: var(--cp-accent); background: var(--cp-accent-soft); }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 400px; overflow-y: auto; background: var(--cp-surface-soft); border-radius: .625rem; padding: 16px; font-size: 13px; }
+.finding { border-top: 1px solid var(--cp-border); margin-top: 16px; padding-top: 16px; }
+#runs { max-height: 640px; overflow-y: auto; }
+.hidden { display: none; }
+@media (max-width: 780px) { header, main { padding: 20px 16px; } .split { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row"><h1>DevPilot <span class="muted">/ Fleet</span></h1><span class="tag">Local POC · Tool-disabled analysis</span></div>
+    <p id="repository" class="mono muted">Connecting to local host...</p>
+    <div class="row"><span id="capacity">Loading</span><button id="reload">Reload definitions</button></div>
+  </header>
+  <main>
+    <div id="error" class="notice hidden" role="alert"></div>
+    <div id="connection" class="notice hidden" role="status"></div>
+    <div class="notice">
+      Create agents in <code>.devpilot/fleet.json</code> with Markdown prompts. Preview the exact packet before running.
+      Schedules require explicit enable and turn off on restart. No model tools, automatic fixes, or cloud hosting.
+      Model progress and cost are unknown.
+    </div>
+    <h2>Agents</h2><div id="agents" class="grid"></div>
+    <h2>Swarms</h2><div id="swarms" class="grid"></div>
+    <section id="previewSection" class="hidden"><h2>Resolved preview</h2><pre id="preview"></pre></section>
+    <h2>Runs and evidence</h2>
+    <div class="split">
+      <div id="runs"></div>
+      <section id="detail" class="card"><p class="muted">Select a run to inspect its inputs, outcome, and evidence.</p></section>
+    </div>
+    <h2>Existing agents <span class="tag">Observe only</span></h2>
+    <div id="legacy" class="grid"></div>
+    <h2>Host diagnostics</h2><pre id="diagnostics">None</pre>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

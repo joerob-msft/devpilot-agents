@@ -24,6 +24,21 @@ writes to the PR host directly.
 > implemented for Azure DevOps, with a shared read-only dashboard and trusted
 > launchers for observing or operating either or both. Interfaces will change.
 
+**New: repo-local Fleet POC.** Define agents with `.devpilot/fleet.json` and
+Markdown prompts, run tool-disabled repository analyses and worker/synthesis
+swarms, and monitor them from a localhost website. It does not replace or widen
+the existing Reviewer/Review Handler controls.
+
+```powershell
+npm ci --prefix .\src\DevPilot.Fleet
+npm run build --prefix .\src\DevPilot.Fleet
+node .\src\DevPilot.Fleet\dist\src\cli.js serve --repo .
+```
+
+See [Fleet setup, authoring, and limitations](docs/fleet-poc.md). Windows and
+operator authentication are required for live execution; schedules are off
+until explicitly enabled.
+
 ---
 
 ## Why a wrapper
@@ -50,6 +65,7 @@ marker. Anything else it prints is ignored.
 src/
   DevPilot.AgentHarness/     # the shared, provider-agnostic module
   DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
+  DevPilot.Fleet/            # repo-local fleet runner and localhost website POC
   Agents/
     review-handler/          # an agent: script + prompt + fixtures
     reviewer/                # an agent: script + prompt
@@ -58,7 +74,7 @@ tools/                       # launchers, dashboard entry point, and repo checks
 docs/                        # how to add an agent
 ```
 
-**Consumers keep only a config file.** Nothing employer-, repository-, or
+**Consumers keep configuration and, for Fleet, Markdown prompts.** Nothing employer-, repository-, or
 person-specific lives in this repo outside `samples/` — a CI check enforces that
 (`tools/Test-NoEmployerSpecifics.ps1`).
 
@@ -877,8 +893,9 @@ See [`docs/adding-an-agent.md`](docs/adding-an-agent.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Run `.\tools\Test-NoEmployerSpecifics.ps1`
-and the agent `-DryRun` suite before opening a pull request.
+See [the build and test quick-reference](CONTRIBUTING.md#build-and-test) for
+component-specific commands matching CI. Run the generic-toolkit check and
+agent `-DryRun` baseline, then the targeted suite for the component you changed.
 
 ## License
 

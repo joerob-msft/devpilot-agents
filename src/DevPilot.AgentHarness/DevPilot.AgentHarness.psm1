@@ -5107,11 +5107,9 @@ function Get-AgentProcessStartIdentity {
     return "utc:$($Process.StartTime.ToUniversalTime().Ticks)"
 }
 
-function New-AgentProcessContainment {
-    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
-    if ($IsWindows) {
-        if (-not ('DevPilot.Native.Job' -as [type])) {
-            Add-Type -TypeDefinition @'
+function Initialize-AgentWindowsJobType {
+    if (-not ('DevPilot.Native.Job' -as [type])) {
+        Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
@@ -5138,9 +5136,9 @@ namespace DevPilot.Native {
       public IoCounters IoInfo;
       public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
     }
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr CreateJobObject(IntPtr a, string n);
-    [DllImport("kernel32.dll")] public static extern bool SetInformationJobObject(IntPtr j, int c, ref ExtendedLimits i, uint l);
-    [DllImport("kernel32.dll")] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateJobObject(IntPtr a, string n);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j, int c, ref ExtendedLimits i, uint l);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
     [DllImport("kernel32.dll")] public static extern bool TerminateJobObject(IntPtr j, uint c);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(
       IntPtr j, int c, out BasicAccounting i, uint l, IntPtr r);
@@ -5165,7 +5163,13 @@ namespace DevPilot.Native {
   }
 }
 '@
-        }
+    }
+}
+
+function New-AgentProcessContainment {
+    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
+    if ($IsWindows) {
+        Initialize-AgentWindowsJobType
         return @{ Platform = 'Windows'; Handle = [DevPilot.Native.Job]::CreateKillOnClose($Process.Id, $Process.Handle); ProcessGroupId = 0 }
     }
     if (-not ('DevPilot.Native.UnixProcessGroup' -as [type])) {
@@ -5382,6 +5386,7 @@ function Invoke-TimedProcess {
         [string[]]$EnvironmentVariablesToRemove = @(),
         [scriptblock]$CancellationProbe,
         [switch]$ContainDescendants,
+        [ValidateRange(0, 16777216)][int]$MaxOutputCharacters = 0,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -5403,6 +5408,8 @@ function Invoke-TimedProcess {
     $proc = $null
     $containment = $null
     try {
+        # Compile before starting a short-lived child, not while it can exit or spawn descendants.
+        if ($ContainDescendants -and $IsWindows) { Initialize-AgentWindowsJobType }
         $proc = [System.Diagnostics.Process]::Start($psi)
         if ($ContainDescendants -and $IsWindows) {
             try {
@@ -5418,8 +5425,45 @@ function Invoke-TimedProcess {
 
         $stdoutTask = $null
         $stderrTask = $null
-        if ($CaptureStdOut) { $stdoutTask = $proc.StandardOutput.ReadToEndAsync() }
-        if ($CaptureStdErr) { $stderrTask = $proc.StandardError.ReadToEndAsync() }
+        $stdoutReader = $null
+        $stderrReader = $null
+        if ($MaxOutputCharacters -gt 0) {
+            if (-not ('DevPilot.BoundedProcessText' -as [type])) {
+                Add-Type -TypeDefinition @'
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+namespace DevPilot {
+    public sealed class BoundedProcessText {
+        public volatile bool LimitExceeded;
+        public async Task<string> ReadAsync(StreamReader reader, int limit) {
+            var text = new StringBuilder();
+            var buffer = new char[4096];
+            int count;
+            while ((count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
+                int remaining = limit - text.Length;
+                if (count > remaining) LimitExceeded = true;
+                if (remaining > 0) text.Append(buffer, 0, System.Math.Min(count, remaining));
+            }
+            return text.ToString();
+        }
+    }
+}
+'@
+            }
+            if ($CaptureStdOut) {
+                $stdoutReader = [DevPilot.BoundedProcessText]::new()
+                $stdoutTask = $stdoutReader.ReadAsync($proc.StandardOutput, $MaxOutputCharacters)
+            }
+            if ($CaptureStdErr) {
+                $stderrReader = [DevPilot.BoundedProcessText]::new()
+                $stderrTask = $stderrReader.ReadAsync($proc.StandardError, $MaxOutputCharacters)
+            }
+        }
+        else {
+            if ($CaptureStdOut) { $stdoutTask = $proc.StandardOutput.ReadToEndAsync() }
+            if ($CaptureStdErr) { $stderrTask = $proc.StandardError.ReadToEndAsync() }
+        }
 
         $timedOut = $false
         if ($StandardInputContent) {
@@ -5449,6 +5493,10 @@ function Invoke-TimedProcess {
         if (-not $timedOut) {
             while ([DateTime]::UtcNow -lt $deadline) {
                 if ($proc.WaitForExit(100)) { $exited = $true; break }
+                if (($stdoutReader -and $stdoutReader.LimitExceeded) -or ($stderrReader -and $stderrReader.LimitExceeded)) {
+                    $cancelled = $true
+                    break
+                }
                 if ($CancellationProbe -and (& $CancellationProbe)) {
                     $cancelled = $true
                     break
@@ -5494,6 +5542,7 @@ function Invoke-TimedProcess {
             StdOut    = $stdoutResult.Text
             StdErr    = $stderrResult.Text
             ProcessId = $proc.Id
+            OutputLimitExceeded = [bool](($stdoutReader -and $stdoutReader.LimitExceeded) -or ($stderrReader -and $stderrReader.LimitExceeded))
         }
     }
     finally {

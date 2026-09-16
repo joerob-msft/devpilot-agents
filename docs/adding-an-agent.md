@@ -1,5 +1,11 @@
 # Adding an agent
 
+This guide is for a **full harness-backed agent** with its own work-selection
+and execution loop. To add a **tool-disabled Fleet analysis role** using only
+Markdown and a manifest entry, use
+[Fleet role authoring](fleet-poc.md#create-an-agent-without-changing-toolkit-code)
+instead. A Fleet role does not gain the execution permissions of a full agent.
+
 An agent is a loop. Each cycle it picks one unit of work, hands the work to a
 coding model with a bounded prompt, verifies what came back, and records what
 happened. The harness supplies everything that is not specific to the task:

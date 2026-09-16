@@ -136,6 +136,29 @@ jobs:
         shell: pwsh
         run: npm run test:pty
 
+  fleet:
+    name: Repo-local Fleet POC
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src/DevPilot.Fleet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: src/DevPilot.Fleet/package-lock.json
+      - name: Restore locked development dependencies
+        shell: pwsh
+        run: npm ci
+      - name: Build and test offline fleet contracts
+        shell: pwsh
+        run: npm test
+      - name: Check browser JavaScript
+        shell: pwsh
+        run: node --check public/app.js
+
   selfcheck:
     name: Agent self-checks (-DryRun)
     runs-on: windows-latest

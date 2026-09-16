@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "inputHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "summary": "Synthetic reproduction of a rejected maintainer response.",
+  "findings": [
+    {
+      "title": "Clarify commands",
+      "evidence": "README.md points to contributor guidance.",
+      "recommendation": "Keep that pointer near the quick start."
+    },
+    {
+      "path_note": "n/a",
+      "title": "Clarify extension choices",
+      "evidence": "The packet describes both full agents and prompt-defined roles.",
+      "recommendation": "Cross-link their authoring guides."
+    }
+  ]
+}

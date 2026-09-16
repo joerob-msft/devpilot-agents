@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "inputProfiles": {
+    "repo-navigation": {
+      "files": [
+        "README.md",
+        "CONTRIBUTING.md",
+        "docs/adding-an-agent.md",
+        "docs/fleet-poc.md",
+        ".github/workflows/ci.yml",
+        "src/DevPilot.Fleet/package.json"
+      ]
+    },
+    "fleet-implementation": {
+      "files": [
+        "docs/fleet-poc.md",
+        "src/DevPilot.Fleet/src/contracts.ts",
+        "src/DevPilot.Fleet/src/manifest.ts",
+        "src/DevPilot.Fleet/src/runner.ts",
+        "src/DevPilot.Fleet/src/store.ts",
+        "src/DevPilot.Fleet/src/executor.ts",
+        "src/DevPilot.Fleet/src/result-diagnostics.ts",
+        "src/DevPilot.Fleet/src/server.ts",
+        "src/DevPilot.Fleet/bridge/Invoke-FleetAttempt.ps1",
+        "src/DevPilot.Fleet/bridge/FleetProtocol.ps1",
+        "src/DevPilot.Fleet/public/app.js",
+        "src/DevPilot.Fleet/test/fleet.test.ts",
+        "tests/FleetBridge.Tests.ps1",
+        "tests/FleetProtocol.Tests.ps1"
+      ]
+    }
+  },
+  "agents": [
+    {
+      "id": "repo-efficiency",
+      "prompt": ".devpilot/prompts/repo-efficiency.md",
+      "inputProfile": "repo-navigation",
+      "timeoutSeconds": 600,
+      "schedule": {
+        "enabled": false,
+        "everyMinutes": 60
+      }
+    },
+    {
+      "id": "toolkit-maintainer",
+      "prompt": ".devpilot/prompts/toolkit-maintainer.md",
+      "inputProfile": "fleet-implementation",
+      "timeoutSeconds": 600,
+      "schedule": {
+        "enabled": false,
+        "everyMinutes": 60
+      }
+    }
+  ],
+  "swarms": [
+    {
+      "id": "improvement-review",
+      "workers": [
+        "repo-efficiency",
+        "toolkit-maintainer"
+      ],
+      "synthesisPrompt": ".devpilot/prompts/synthesis.md"
+    }
+  ]
+}
