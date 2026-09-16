@@ -334,6 +334,10 @@ notification delivery. A transient MCP transport closure is retried once with
 a fresh session in the same cycle. If recovery still fails, the failure event
 retains the exact PR ID, title, operation, reason, and next retry so Simple and
 Advanced views do not display a stale prior PR or hide the actionable context.
+Before either automatic role acknowledges launcher startup, repository identity
+verification also retries one recoverable ADO transport timeout with a fresh
+session. Provider mismatches and malformed identity responses still fail closed
+without retrying.
 Reviewer outbox and Review Handler reference maintenance also retry one
 pre-send startup or confirmed ADO-session failure with fresh sessions inside the
 existing 60-second maintenance budget. Their durable receipts, claims, and

@@ -2074,6 +2074,50 @@ function Test-HandlerTeamsMaintenanceRecoverableFailure {
     return [bool]($AdoSession -and -not $AdoSession.Process -and $WorkIqSession.Process)
 }
 
+function Test-HandlerRecoverableMcpFailure {
+    param([Parameter(Mandatory)][string]$Message)
+    return ($Message -match '^(Agent MCP session is closed\.|Could not write to Agent MCP\.|Agent MCP exited before returning a response\.|Agent MCP closed stdout before returning a response\.|Agent MCP response timed out\.)$')
+}
+
+function Resolve-HandlerStartupRepositoryIdentity {
+    param([Parameter(Mandatory)][string]$AgencyPath)
+
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        $identitySession = $null
+        try {
+            $identitySession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds 10
+            $identityInvoker = {
+                param($Name, $Arguments, $RawText)
+                Invoke-AgentMcpTool -Session $identitySession -Name $Name -Arguments $Arguments -RawText:$RawText
+            }.GetNewClosure()
+            $providerContext = New-AgentProviderContext -Provider $provider -Organization $Organization `
+                -Project $ExpectedProject -RepositoryName $RepositoryName -RepositoryId $cfgRepoId `
+                -McpInvoker $identityInvoker -TimeoutSeconds 10
+            return Resolve-AgentProviderRepositoryIdentity -Context $providerContext
+        }
+        catch {
+            $reason = $_.Exception.Message
+            if ($attempt -eq 0 -and (Test-HandlerRecoverableMcpFailure -Message $reason)) {
+                Write-Warning "Review-handler startup repository verification failed; retrying immediately with a fresh ADO session: $reason"
+                if ($script:HandlerOutputContext) {
+                    Send-HandlerEvent delivery.retrying -Level warning -Data @{
+                        reason = $reason; summary = 'Retrying startup repository verification.'
+                        outstanding = @('repository identity verification'); retryable = $true
+                        nextRetry = 'immediate fresh ADO session'
+                    } -Message 'Review-handler startup repository verification is retrying with a fresh ADO session.'
+                }
+                continue
+            }
+            throw
+        }
+        finally {
+            if ($identitySession) { Close-AgentMcpSession -Session $identitySession }
+        }
+    }
+    throw 'Review-handler startup repository verification exhausted its retry.'
+}
+
 function Invoke-HandlerTeamsMaintenance {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
@@ -3188,50 +3232,35 @@ try {
             "Add them to '$(Join-Path $RepoPath ".mcp.json")' or your personal '$(Join-Path $HOME ".copilot\mcp-config.json")'.")
     }
 
-    $identitySession = $null
-    try {
-        $identitySession = Open-AgentMcpSession -AgencyPath $agencyPath -Server "ado" `
-            -Organization $Organization -Toolsets @("repos") -TimeoutSeconds 10
-        $identityInvoker = {
-            param($Name, $Arguments, $RawText)
-            Invoke-AgentMcpTool -Session $identitySession -Name $Name -Arguments $Arguments -RawText:$RawText
-        }.GetNewClosure()
-        $providerContext = New-AgentProviderContext -Provider $provider -Organization $Organization `
-            -Project $ExpectedProject -RepositoryName $RepositoryName -RepositoryId $cfgRepoId `
-            -McpInvoker $identityInvoker -TimeoutSeconds 10
-        $repositoryIdentity = Resolve-AgentProviderRepositoryIdentity -Context $providerContext
-        Set-AgentOutputRepositoryIdentity -Context $script:HandlerOutputContext -RepositoryIdentity $repositoryIdentity
-        $script:HandlerDurableContext = Get-AgentDurableStateContext -DurableStateRoot $DurableStateRoot `
-            -RepositoryIdentity $repositoryIdentity -Role review-handler -Create
-        $script:HandlerLeaseRoot = $LeaseRoot
-        if (-not (Test-Path -LiteralPath $script:HandlerDurableContext.InitializedPath)) {
-            throw "Review-handler durable state is not initialized. Run tools\Initialize-DevPilotDurableState.ps1 for this repository and role."
-        }
-        if ($ManualDispatchManifest) {
-            [void](Enter-AgentManualDispatchStartup -ManifestPath $ManualDispatchManifest `
-                -RepositoryIdentity $repositoryIdentity -RepositoryRoot ([IO.Path]::GetFullPath($RepoPath)) `
-                -DurableContext $script:HandlerDurableContext `
-                -LeaseRoot $LeaseRoot -Role review-handler -EventLogPath $script:HandlerOutputContext.LogPath `
-                -BoundWrapperPermissions @{
-                    EnableTeamsNotifications = [bool]$EnableTeamsNotifications
-                    EnableTeamsPrReferenceWrites = [bool]$EnableTeamsPrReferenceWrites
-                    PreviewOnly = [bool]$PreviewOnly
-                } `
-                -BoundCapabilities @{
-                    EnableThreadReplies = [bool]$EnableThreadReplies
-                    EnableBuddyRequeue = [bool]$EnableBuddyRequeue
-                    EnableCodeChanges = [bool]$EnableCodeChanges
-                    EnablePush = [bool]$EnablePush
-                    LocalValidation = [bool]$LocalValidation
-                    ResumeCodingSession = [bool]$ResumeCodingSession
-                    EnableAutoComplete = [bool]$EnableAutoComplete
-                })
-            # Startup returns only after the broker's authenticated ready/proceed exchange.
-            $script:HandlerTeamsManualAuthorized = $true
-        }
+    $repositoryIdentity = Resolve-HandlerStartupRepositoryIdentity -AgencyPath $agencyPath
+    Set-AgentOutputRepositoryIdentity -Context $script:HandlerOutputContext -RepositoryIdentity $repositoryIdentity
+    $script:HandlerDurableContext = Get-AgentDurableStateContext -DurableStateRoot $DurableStateRoot `
+        -RepositoryIdentity $repositoryIdentity -Role review-handler -Create
+    $script:HandlerLeaseRoot = $LeaseRoot
+    if (-not (Test-Path -LiteralPath $script:HandlerDurableContext.InitializedPath)) {
+        throw "Review-handler durable state is not initialized. Run tools\Initialize-DevPilotDurableState.ps1 for this repository and role."
     }
-    finally {
-        if ($identitySession) { Close-AgentMcpSession -Session $identitySession }
+    if ($ManualDispatchManifest) {
+        [void](Enter-AgentManualDispatchStartup -ManifestPath $ManualDispatchManifest `
+            -RepositoryIdentity $repositoryIdentity -RepositoryRoot ([IO.Path]::GetFullPath($RepoPath)) `
+            -DurableContext $script:HandlerDurableContext `
+            -LeaseRoot $LeaseRoot -Role review-handler -EventLogPath $script:HandlerOutputContext.LogPath `
+            -BoundWrapperPermissions @{
+                EnableTeamsNotifications = [bool]$EnableTeamsNotifications
+                EnableTeamsPrReferenceWrites = [bool]$EnableTeamsPrReferenceWrites
+                PreviewOnly = [bool]$PreviewOnly
+            } `
+            -BoundCapabilities @{
+                EnableThreadReplies = [bool]$EnableThreadReplies
+                EnableBuddyRequeue = [bool]$EnableBuddyRequeue
+                EnableCodeChanges = [bool]$EnableCodeChanges
+                EnablePush = [bool]$EnablePush
+                LocalValidation = [bool]$LocalValidation
+                ResumeCodingSession = [bool]$ResumeCodingSession
+                EnableAutoComplete = [bool]$EnableAutoComplete
+            })
+        # Startup returns only after the broker's authenticated ready/proceed exchange.
+        $script:HandlerTeamsManualAuthorized = $true
     }
 
     Confirm-AgentLauncherWorkerStartup

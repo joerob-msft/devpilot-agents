@@ -6471,6 +6471,46 @@ function Test-ReviewerRecoverableMcpFailure {
     return ($Message -match '^(Agent MCP session is closed\.|Could not write to Agent MCP\.|Agent MCP exited before returning a response\.|Agent MCP closed stdout before returning a response\.|Agent MCP response timed out\.)$')
 }
 
+function Resolve-ReviewerStartupRepositoryIdentity {
+    param([Parameter(Mandatory)][string]$AgencyPath)
+
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        $identitySession = $null
+        try {
+            $identitySession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds 10 `
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+            $identityInvoker = {
+                param($Name, $Arguments, $RawText)
+                Invoke-AgentMcpTool -Session $identitySession -Name $Name -Arguments $Arguments -RawText:$RawText
+            }.GetNewClosure()
+            $providerContext = New-AgentProviderContext -Provider $provider -Organization $Organization `
+                -Project $ExpectedProject -RepositoryName $RepositoryName -RepositoryId $cfgRepoId `
+                -McpInvoker $identityInvoker -TimeoutSeconds 10
+            return Resolve-AgentProviderRepositoryIdentity -Context $providerContext
+        }
+        catch {
+            $reason = $_.Exception.Message
+            if ($attempt -eq 0 -and (Test-ReviewerRecoverableMcpFailure -Message $reason)) {
+                Write-Warning "Reviewer startup repository verification failed; retrying immediately with a fresh ADO session: $reason"
+                if ($script:ReviewerOutputContext) {
+                    Send-ReviewerEvent delivery.retrying -Level warning -Data @{
+                        reason = $reason; summary = 'Retrying startup repository verification.'
+                        outstanding = @('repository identity verification'); retryable = $true
+                        nextRetry = 'immediate fresh ADO session'
+                    } -Message 'Reviewer startup repository verification is retrying with a fresh ADO session.'
+                }
+                continue
+            }
+            throw
+        }
+        finally {
+            if ($identitySession) { Close-AgentMcpSession -Session $identitySession }
+        }
+    }
+    throw 'Reviewer startup repository verification exhausted its retry.'
+}
+
 function Invoke-ReviewerCycle {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
@@ -6909,60 +6949,44 @@ try {
             "Add them to '$(Join-Path $RepoPath ".mcp.json")' or your personal '$(Join-Path $HOME ".copilot\mcp-config.json")'.")
     }
 
-    $identitySession = $null
-    try {
-        $identitySession = Open-AgentMcpSession -AgencyPath $agencyPath -Server "ado" `
-            -Organization $Organization -Toolsets @("repos") -TimeoutSeconds 10 `
-            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
-        $identityInvoker = {
-            param($Name, $Arguments, $RawText)
-            Invoke-AgentMcpTool -Session $identitySession -Name $Name -Arguments $Arguments -RawText:$RawText
-        }.GetNewClosure()
-        $providerContext = New-AgentProviderContext -Provider $provider -Organization $Organization `
-            -Project $ExpectedProject -RepositoryName $RepositoryName -RepositoryId $cfgRepoId `
-            -McpInvoker $identityInvoker -TimeoutSeconds 10
-        $repositoryIdentity = Resolve-AgentProviderRepositoryIdentity -Context $providerContext
-        Set-AgentOutputRepositoryIdentity -Context $script:ReviewerOutputContext -RepositoryIdentity $repositoryIdentity
-        $script:ReviewerDurableContext = Get-AgentDurableStateContext -DurableStateRoot $DurableStateRoot `
-            -RepositoryIdentity $repositoryIdentity -Role reviewer -Create
-        $script:ReviewerLeaseRoot = $LeaseRoot
-        if (-not (Test-Path -LiteralPath $script:ReviewerDurableContext.InitializedPath)) {
-            throw "Reviewer durable state is not initialized. Run tools\Initialize-DevPilotDurableState.ps1 for this repository and role."
-        }
-        $artifactKeyPath = Initialize-ReviewerArtifactSigningKeyPath `
-            -DurableRoleRoot $script:ReviewerDurableContext.RoleRoot `
-            -LegacyKeyPath $legacyArtifactKeyPath `
-            -Records (Get-AgentDurableRecordsSnapshot -Context $script:ReviewerDurableContext)
-        $pendingArtifactDir = Join-Path $script:ReviewerDurableContext.RoleRoot 'pending-artifacts'
-        if (-not (Test-Path -LiteralPath $pendingArtifactDir -PathType Container)) {
-            New-Item -ItemType Directory -Path $pendingArtifactDir -Force -ErrorAction Stop | Out-Null
-        }
-        if (-not $IsWindows) {
-            [IO.File]::SetUnixFileMode($pendingArtifactDir,
-                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
-        }
-        if ($ManualDispatchManifest) {
-            [void](Enter-AgentManualDispatchStartup -ManifestPath $ManualDispatchManifest `
-                -RepositoryIdentity $repositoryIdentity -RepositoryRoot ([IO.Path]::GetFullPath($RepoPath)) `
-                -DurableContext $script:ReviewerDurableContext `
-                -LeaseRoot $LeaseRoot -Role reviewer -EventLogPath $script:ReviewerOutputContext.LogPath `
-                -BoundWrapperPermissions @{
-                    EnableTeamsNotifications = [bool]$EnableTeamsNotifications
-                    EnableTeamsPrReferenceWrites = $false
-                    PreviewOnly = [bool]$PreviewOnly
-                } `
-                -BoundCapabilities @{
-                    EnableFindingComments = [bool]$EnableFindingComments
-                    EnableThreadReplies = [bool]$EnableThreadReplies
-                    EnableSummaryComment = [bool]$EnableSummaryComment
-                    EnableApprovalVote = [bool]$EnableApprovalVote
-                })
-            # Startup returns only after the broker's authenticated ready/proceed exchange.
-            $script:ReviewerTeamsManualAuthorized = $true
-        }
+    $repositoryIdentity = Resolve-ReviewerStartupRepositoryIdentity -AgencyPath $agencyPath
+    Set-AgentOutputRepositoryIdentity -Context $script:ReviewerOutputContext -RepositoryIdentity $repositoryIdentity
+    $script:ReviewerDurableContext = Get-AgentDurableStateContext -DurableStateRoot $DurableStateRoot `
+        -RepositoryIdentity $repositoryIdentity -Role reviewer -Create
+    $script:ReviewerLeaseRoot = $LeaseRoot
+    if (-not (Test-Path -LiteralPath $script:ReviewerDurableContext.InitializedPath)) {
+        throw "Reviewer durable state is not initialized. Run tools\Initialize-DevPilotDurableState.ps1 for this repository and role."
     }
-    finally {
-        if ($identitySession) { Close-AgentMcpSession -Session $identitySession }
+    $artifactKeyPath = Initialize-ReviewerArtifactSigningKeyPath `
+        -DurableRoleRoot $script:ReviewerDurableContext.RoleRoot `
+        -LegacyKeyPath $legacyArtifactKeyPath `
+        -Records (Get-AgentDurableRecordsSnapshot -Context $script:ReviewerDurableContext)
+    $pendingArtifactDir = Join-Path $script:ReviewerDurableContext.RoleRoot 'pending-artifacts'
+    if (-not (Test-Path -LiteralPath $pendingArtifactDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $pendingArtifactDir -Force -ErrorAction Stop | Out-Null
+    }
+    if (-not $IsWindows) {
+        [IO.File]::SetUnixFileMode($pendingArtifactDir,
+            [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
+    }
+    if ($ManualDispatchManifest) {
+        [void](Enter-AgentManualDispatchStartup -ManifestPath $ManualDispatchManifest `
+            -RepositoryIdentity $repositoryIdentity -RepositoryRoot ([IO.Path]::GetFullPath($RepoPath)) `
+            -DurableContext $script:ReviewerDurableContext `
+            -LeaseRoot $LeaseRoot -Role reviewer -EventLogPath $script:ReviewerOutputContext.LogPath `
+            -BoundWrapperPermissions @{
+                EnableTeamsNotifications = [bool]$EnableTeamsNotifications
+                EnableTeamsPrReferenceWrites = $false
+                PreviewOnly = [bool]$PreviewOnly
+            } `
+            -BoundCapabilities @{
+                EnableFindingComments = [bool]$EnableFindingComments
+                EnableThreadReplies = [bool]$EnableThreadReplies
+                EnableSummaryComment = [bool]$EnableSummaryComment
+                EnableApprovalVote = [bool]$EnableApprovalVote
+            })
+        # Startup returns only after the broker's authenticated ready/proceed exchange.
+        $script:ReviewerTeamsManualAuthorized = $true
     }
 
     Confirm-AgentLauncherWorkerStartup
