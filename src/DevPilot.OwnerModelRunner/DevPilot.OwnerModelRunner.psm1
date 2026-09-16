@@ -1069,6 +1069,23 @@ function New-OwnerModelAttemptDirectory {
     return [IO.Path]::GetFullPath($directory)
 }
 
+function Remove-OwnerModelAttemptDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            if (-not (Test-Path -LiteralPath $Path)) { return }
+            if ([DateTime]::UtcNow -ge $deadline) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    } while ($true)
+}
+
 function Remove-OwnerModelPrivateLaunchRoot {
     param([Parameter(Mandatory)][object]$Provider)
     if (-not (Test-Path -LiteralPath $Provider.LaunchRoot -PathType Container)) { return }
@@ -1870,9 +1887,7 @@ function Test-OwnerModelProviderPreflight {
         }
     }
     finally {
-        if (Test-Path -LiteralPath $attemptDirectory -PathType Container) {
-            Remove-Item -LiteralPath $attemptDirectory -Recurse -Force
-        }
+        Remove-OwnerModelAttemptDirectory -Path $attemptDirectory
         Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
     }
 }
@@ -2188,8 +2203,8 @@ function Invoke-OwnerModelProcessAttempt {
         }
         Close-AgentProcessContainment -Containment $containment
         if ($process) { $process.Dispose() }
-        if ($attemptDirectory -and (Test-Path -LiteralPath $attemptDirectory -PathType Container)) {
-            Remove-Item -LiteralPath $attemptDirectory -Recurse -Force
+        if ($attemptDirectory) {
+            Remove-OwnerModelAttemptDirectory -Path $attemptDirectory
         }
         Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
     }
