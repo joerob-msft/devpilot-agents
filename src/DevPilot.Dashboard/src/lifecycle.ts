@@ -2,6 +2,7 @@ import type { DispatchBroker } from "./dispatch.js";
 import type { EventTailer } from "./tailer.js";
 
 export interface DashboardLifecycle {
+  shutdownTailer: () => Promise<void>;
   shutdownBroker: () => Promise<void>;
   onRendererDestroy: () => void;
 }
@@ -15,15 +16,21 @@ export function createDashboardLifecycle(
     );
   },
 ): DashboardLifecycle {
+  let tailerShutdown: Promise<void> | undefined;
   let brokerShutdown: Promise<void> | undefined;
+  const shutdownTailer = (): Promise<void> => {
+    tailerShutdown ??= tailer.stop();
+    return tailerShutdown;
+  };
   const shutdownBroker = (): Promise<void> => {
     brokerShutdown ??= broker?.shutdown() ?? Promise.resolve();
     return brokerShutdown;
   };
   return {
+    shutdownTailer,
     shutdownBroker,
     onRendererDestroy: () => {
-      void tailer.stop();
+      void shutdownTailer().catch(reportBrokerShutdownFailure);
       void shutdownBroker().catch(reportBrokerShutdownFailure);
     },
   };

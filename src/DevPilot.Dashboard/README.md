@@ -22,6 +22,9 @@ The main footer is `m Start agent | h History | a Advanced | q Quit`
 is available, with contextual detail/back controls. Authority and
 actionable failures remain visible; Simple does not turn an operational
 launch into preview-only mode.
+`q` performs one broker shutdown, stops the event tailer, destroys the renderer,
+and explicitly exits the production Bun process so the invoking shell always
+regains its prompt.
 
 The History view is an independent retained PR projection keyed by
 provider-verified repository identity plus PR number. It merges Reviewer and

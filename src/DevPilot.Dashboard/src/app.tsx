@@ -94,7 +94,9 @@ export interface AppProps {
   openUrl?: (url: string) => void | Promise<void>;
   broker?: DispatchBroker | undefined;
   brokerFailure?: () => string;
+  shutdownTailer?: () => Promise<void>;
   shutdownBroker?: () => Promise<void>;
+  exitProcess?: (code: number) => void;
   dismissalStorage?: DismissalStorage;
   dismissalLoadError?: string;
 }
@@ -1059,6 +1061,7 @@ export function App(props: AppProps) {
   // mutate settingsStatus or trigger a refresh for a view the operator is no longer looking at.
   let killSwitchGeneration = 0;
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
+  let localTailerShutdown: Promise<void> | undefined;
   let localBrokerShutdown: Promise<void> | undefined;
   // Settings refresh/toggle race guard: every refreshSettingsProfile() call is stamped with a
   // generation token. A response is only applied if its token still matches the latest one, so a
@@ -1093,6 +1096,12 @@ export function App(props: AppProps) {
     return profile && profile.role === settingsRole() ? profile : null;
   });
   let eventScrollbox: ScrollBoxRenderable | undefined;
+
+  function shutdownTailer(): Promise<void> {
+    if (props.shutdownTailer) return props.shutdownTailer();
+    localTailerShutdown ??= props.tailer.stop();
+    return localTailerShutdown;
+  }
 
   function shutdownBroker(): Promise<void> {
     stopAutomationPolling();
@@ -2388,17 +2397,22 @@ export function App(props: AppProps) {
     }
   }
 
-  async function quit(): Promise<void> {
-    manualGeneration += 1;
-    setFeedback("Shutting down broker-owned manual work...");
-    bestEffortCancelWidening();
-    try {
-      await shutdownBroker();
-    } catch (error) {
-      setFeedback(`Broker shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    await props.tailer.stop();
-    renderer.destroy();
+  let quitPromise: Promise<void> | undefined;
+  function quit(): Promise<void> {
+    quitPromise ??= (async () => {
+      manualGeneration += 1;
+      setFeedback("Shutting down broker-owned manual work...");
+      bestEffortCancelWidening();
+      try {
+        await shutdownBroker();
+      } catch (error) {
+        setFeedback(`Broker shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      await shutdownTailer();
+      if (!renderer.isDestroyed) renderer.destroy();
+      props.exitProcess?.(0);
+    })();
+    return quitPromise;
   }
 
   function focusRail(): void {
