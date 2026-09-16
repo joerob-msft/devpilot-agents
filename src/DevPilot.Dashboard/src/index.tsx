@@ -135,13 +135,15 @@ async function main(): Promise<void> {
       broker={broker}
       launchMode={args.launchMode}
       brokerFailure={() => brokerFailure}
+      shutdownTailer={lifecycle.shutdownTailer}
       shutdownBroker={lifecycle.shutdownBroker}
+      exitProcess={(code) => process.exit(code)}
       dismissalStorage={dismissalStorage}
       dismissalLoadError={dismissalError}
     />, renderer);
     refresh = () => renderer.requestRender();
   } catch (error) {
-    await tailer.stop();
+    await lifecycle.shutdownTailer();
     await lifecycle.shutdownBroker();
     if (!renderer.isDestroyed) renderer.destroy();
     throw error;

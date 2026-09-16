@@ -1788,14 +1788,21 @@ test("trusted manual flow binds a fresh preview and explicit start independently
 test("q shuts down the tailer and trusted broker before destroying the renderer", async (context) => {
   const fixture = createFixture();
   let shutdownCount = 0;
+  let exitCount = 0;
+  const order: string[] = [];
   let setup: TestRendererSetup | undefined;
+  const originalStop = fixture.tailer.stop.bind(fixture.tailer);
+  fixture.tailer.stop = async () => {
+    order.push("tailer");
+    await originalStop();
+  };
   const broker: DispatchBroker = {
     describe: async () => { throw new Error("not called"); },
     profileCurrent: async () => { throw new Error("not called"); },
     profile: async () => { throw new Error("not called"); },
     dispatch: async () => { throw new Error("not called"); },
     cancel: async () => { throw new Error("not called"); },
-    shutdown: async () => { shutdownCount++; },
+    shutdown: async () => { shutdownCount++; order.push("broker"); },
     subscribeTerminal: () => () => {},
   };
   const lifecycle = createDashboardLifecycle(fixture.tailer, broker);
@@ -1804,7 +1811,14 @@ test("q shuts down the tailer and trusted broker before destroying the renderer"
       reducer={fixture.reducer}
       tailer={fixture.tailer}
       broker={broker}
+      shutdownTailer={lifecycle.shutdownTailer}
       shutdownBroker={lifecycle.shutdownBroker}
+      exitProcess={(code) => {
+        assert.equal(code, 0);
+        assert.equal(setup?.renderer.isDestroyed, true);
+        exitCount++;
+        order.push("exit");
+      }}
     />, {
       width: 100,
       height: 30,
@@ -1818,7 +1832,13 @@ test("q shuts down the tailer and trusted broker before destroying the renderer"
     setup.mockInput.pressKey("q");
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(shutdownCount, 1);
+    assert.equal(exitCount, 1);
     assert.equal(setup.renderer.isDestroyed, true);
+    assert.deepEqual(order.slice(0, 3), ["broker", "tailer", "exit"]);
+    setup.mockInput.pressKey("q");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(shutdownCount, 1);
+    assert.equal(exitCount, 1);
   } catch (error) {
     if (error instanceof Error && error.message.includes("native FFI is not available")) {
       context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
