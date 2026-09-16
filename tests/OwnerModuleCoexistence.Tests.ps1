@@ -181,4 +181,85 @@ $commandWorked = switch ($TargetName) {
             $result[0].LifecycleCompatible | Should -BeTrue
         }
     }
+
+    It 'preserves pre-imported modules through the live preview wrapper' {
+        $repoRoot = Split-Path $PSScriptRoot -Parent
+        $harnessManifest = Join-Path $repoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1'
+        $observerManifest = Join-Path $repoRoot 'src\OwnerObserver\OwnerObserver.psd1'
+        $parityManifest = Join-Path $repoRoot 'src\DevPilot.OwnerParity\DevPilot.OwnerParity.psd1'
+        $wrapperPath = Join-Path $repoRoot 'tools\Invoke-OwnerV2Preview.ps1'
+        $caseRoot = Join-Path $TestDrive 'live-preview-wrapper'
+        $probePath = Join-Path $caseRoot 'probe.ps1'
+        $manifestPath = Join-Path $caseRoot 'cohort.json'
+        $stateRoot = Join-Path $caseRoot 'state'
+        [void](New-Item -ItemType Directory -Path $caseRoot -Force)
+        Copy-Item -LiteralPath (
+            Join-Path $repoRoot 'tests\fixtures\owner-orchestrator\generic-cohort.json'
+        ) -Destination $manifestPath
+        [IO.File]::WriteAllText($probePath, @'
+param(
+    [Parameter(Mandatory)][string]$HarnessManifest,
+    [Parameter(Mandatory)][string]$ObserverManifest,
+    [Parameter(Mandatory)][string]$ParityManifest,
+    [Parameter(Mandatory)][string]$WrapperPath,
+    [Parameter(Mandatory)][string]$ManifestPath,
+    [Parameter(Mandatory)][string]$StateRoot
+)
+$ErrorActionPreference = 'Stop'
+Import-Module $HarnessManifest -Global
+Import-Module $ObserverManifest -Global
+Import-Module $ParityManifest -Global
+$preservedCommands = [ordered]@{
+    'DevPilot.AgentHarness' = 'Get-DevPilotAgentPath'
+    'OwnerObserver' = 'Test-OwnerObservation'
+    'DevPilot.OwnerParity' = 'Test-OwnerParityPathIsolation'
+}
+$beforeModules = @{}
+$beforeCommands = @{}
+foreach ($name in $preservedCommands.Keys) {
+    $beforeModules[$name] = Get-Module $name
+    $beforeCommands[$name] = Get-Command $preservedCommands[$name] -ErrorAction Stop
+}
+
+[void](& $WrapperPath prepare-run -StateRoot $StateRoot -ManifestPath $ManifestPath)
+$status = & $WrapperPath status -StateRoot $StateRoot -ManifestPath $ManifestPath
+
+$modulesPreserved = $true
+$commandsPreserved = $true
+foreach ($name in $preservedCommands.Keys) {
+    $afterModules = @(Get-Module $name)
+    $afterCommand = Get-Command $preservedCommands[$name] -ErrorAction SilentlyContinue
+    $modulesPreserved = $modulesPreserved -and
+        $afterModules.Count -eq 1 -and
+        [object]::ReferenceEquals($beforeModules[$name], $afterModules[0])
+    $commandsPreserved = $commandsPreserved -and
+        $null -ne $afterCommand -and
+        [object]::ReferenceEquals($beforeCommands[$name].Module, $afterCommand.Module)
+}
+
+[pscustomobject]@{
+    ModulesPreserved = $modulesPreserved
+    CommandsPreserved = $commandsPreserved
+    StatusWorked = [string]$status.kind -ceq 'owner-v2-preview-status'
+} | ConvertTo-Json -Compress
+'@, [Text.UTF8Encoding]::new($false))
+
+        $output = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive `
+            -File $probePath `
+            -HarnessManifest $harnessManifest `
+            -ObserverManifest $observerManifest `
+            -ParityManifest $parityManifest `
+            -WrapperPath $wrapperPath `
+            -ManifestPath $manifestPath `
+            -StateRoot $stateRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw ($output | Out-String)
+        }
+        $result = @($output | Select-Object -Last 1 | ConvertFrom-Json)
+
+        $result | Should -HaveCount 1
+        $result[0].ModulesPreserved | Should -BeTrue
+        $result[0].CommandsPreserved | Should -BeTrue
+        $result[0].StatusWorked | Should -BeTrue
+    }
 }

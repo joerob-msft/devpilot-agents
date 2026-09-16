@@ -917,6 +917,37 @@ function New-OwnerV2LiveOutcome {
     }
 }
 
+function Test-OwnerV2LiveRetryEligible {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][Collections.IDictionary]$Record,
+        [Parameter(Mandatory)][bool]$EnableLiveModel,
+        [AllowNull()][object]$AcquisitionProvider,
+        [AllowNull()][object]$ModelProvider,
+        [AllowNull()][string]$Model,
+        [AllowNull()][string]$CredentialEnvironmentName
+    )
+    if ([string]$Record.incompleteReason -ceq 'interrupted') {
+        return $true
+    }
+    if ([string]$Entry.Declaration.mode -cne 'live' -or -not $EnableLiveModel) {
+        return $false
+    }
+    switch ([string]$Record.incompleteReason) {
+        'live-model-disabled' { return $true }
+        'acquisition-provider-unavailable' { return $null -ne $AcquisitionProvider }
+        'live-model-configuration-missing' {
+            return $null -ne $AcquisitionProvider -and (
+                $null -ne $ModelProvider -or (
+                    -not [string]::IsNullOrWhiteSpace($Model) -and
+                    -not [string]::IsNullOrWhiteSpace($CredentialEnvironmentName)
+                )
+            )
+        }
+        default { return $false }
+    }
+}
+
 function Invoke-OwnerV2Live {
     param(
         [Parameter(Mandatory)][object]$Entry,
@@ -1171,9 +1202,14 @@ function Invoke-OwnerV2PreviewRun {
             $record = Read-OwnerV2JsonFile -Path $recordPath
             Assert-OwnerV2Record -Record $record
             $now = [DateTime]::UtcNow
+            $retryEligible = Test-OwnerV2LiveRetryEligible -Entry $entry -Record $record `
+                -EnableLiveModel ([bool]$EnableLiveModel) `
+                -AcquisitionProvider $LiveAcquisitionProvider `
+                -ModelProvider $LiveModelProvider `
+                -Model $LiveModel `
+                -CredentialEnvironmentName $LiveCredentialEnvironmentName
             if ([string]$record.state -ceq 'completed' -or [string]$record.state -ceq 'unknown' -or
-                ([string]$record.state -ceq 'incomplete' -and
-                    [string]$record.incompleteReason -cne 'interrupted')) {
+                ([string]$record.state -ceq 'incomplete' -and -not $retryEligible)) {
                 [void]$ran.Add([ordered]@{
                         identity = $identity
                         state = [string]$record.state

@@ -429,6 +429,36 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $observation.execution.refusalReason | Should -Be 'live-model-disabled'
         $observation.effects.providerWrites | Should -Be 0
         $observation.effects.writeToolInvocations | Should -Be 0
+
+        $unchanged = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $manifestPath
+        $status = Get-OwnerV2PreviewStatus -StateRoot $stateRoot -ManifestPath $manifestPath
+        $unchanged.records[0].reason | Should -Be 'already-terminal'
+        $status.records[0].attempts | Should -Be 1
+    }
+
+    It 'runs a live declaration after explicit opt-in without state surgery' {
+        $stateRoot = New-TestStateRoot
+        $live = New-TestLiveContext -Name 'live-late-opt-in.json'
+        [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
+                -ManifestPath $live.ManifestPath)
+
+        $disabled = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath
+        $enabled = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath `
+            -EnableLiveModel -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $observation = Get-TestObservation -StateRoot $stateRoot
+
+        $disabled.records[0].state | Should -Be 'incomplete'
+        $disabled.records[0].reason | Should -Be 'live-model-disabled'
+        $disabled.records[0].attempts | Should -Be 1
+        $enabled.records[0].state | Should -Be 'completed'
+        $enabled.records[0].attempts | Should -Be 2
+        $enabled.records[0].telemetryPath | Should -Not -BeNullOrEmpty
+        $observation.lifecycle.status | Should -Be 'completed'
+        $observation.effects.providerWrites | Should -Be 0
+        $observation.effects.writeToolInvocations | Should -Be 0
     }
 
     It 'injects the existing provider runner into live semantic units with exact zero-write telemetry' {

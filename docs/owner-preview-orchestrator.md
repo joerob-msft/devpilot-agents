@@ -90,7 +90,10 @@ adapter. The orchestrator asserts `preview.writeAllowed = false`,
 
 Live declarations remain off by default. `Invoke-OwnerV2PreviewRun` requires
 the host-only `-EnableLiveModel` switch plus an existing read-only acquisition
-provider. The manifest-derived contract constructs the production acquisition
+provider. A disabled or not-yet-configured live declaration remains idempotent
+for the same inputs and becomes eligible when the host later supplies the
+missing opt-in or configuration; completed and model-attempted outcomes remain
+terminal. The manifest-derived contract constructs the production acquisition
 adapter; the wrapper carries the model id and credential environment name, so
 repository data cannot enable launch. It reuses the Copilot provider, preflight,
 bounded real runner, and fake-provider seam with bounded argv, `effectiveTools:
