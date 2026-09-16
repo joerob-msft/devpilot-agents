@@ -4,7 +4,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
-Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1" -Force
+Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1"
 
 $limitsTypeName = 'DevPilot.OwnerCapability.OwnerV2CapabilityLimits'
 if (-not ($limitsTypeName -as [type])) {

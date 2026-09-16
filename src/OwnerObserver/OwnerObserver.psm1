@@ -1,6 +1,6 @@
 Set-StrictMode -Version Latest
 
-Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1" -Force
+Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1"
 
 $script:OwnerObserverSchemaPath = Join-Path $PSScriptRoot 'schemas/owner-observation.v1.json'
 $script:OwnerObserverUnknown = 'unknown'
