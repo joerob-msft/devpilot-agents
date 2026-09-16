@@ -153,11 +153,14 @@ acquisition retains the qualified 64-file/16 MiB/128-read cap. Telemetry is
 persisted and bound into observations; preflight failures remain truthful and
 completed records immutable. No delivery adapter or authorization is added.
 
-## Historical convergence plan
+## Historical convergence checklist
 
-The following was the pre-parity convergence plan. The observer integration and
-the eight bounded gates are now implemented and passed for the qualified cohort;
-the list is retained to record what that qualification measured:
+The following was the pre-parity implementation checklist. It is retained only
+as historical design context; it is not the qualification gate set and does not
+claim that the sanitized aggregate measured every orchestrator-state property
+listed here. The implemented qualification gates and their evidence are defined
+in [Owner parity qualification](owner-parity-qualification.md) and the
+[sanitized aggregate](owner-parity-summary.json):
 
 1. exact subject/head/rule/capability/config/model binding parity;
 2. acquisition evidence digest parity;
