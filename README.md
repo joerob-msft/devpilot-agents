@@ -541,8 +541,12 @@ automatic and manual process trees, never another launcher's workers.
 
 Describe and dispatch failures remain distinct in the UI, including
 `source-changed`, `policy-changed`, `pr-state-changed`, `delivery-pending`,
-`already-running` with lease/state contention detail, broker launch failure,
-child failure, and cooperative versus forced cancellation.
+`already-running` with lease/state contention detail, `mcp-unavailable` after
+bounded fresh-session ADO retries, broker launch failure, child failure, and
+cooperative versus forced cancellation. Recoverable MCP transport closures and
+timeouts are retried only with a new session; malformed or provider-rejected
+responses still fail immediately, and no draft or child is created from a
+partial response.
 
 Simple shows its boxed sidebar at 100 columns and wider when at least four
 content rows are available; otherwise it uses a single-pane list and detail
@@ -662,6 +666,11 @@ bounded protected local outbox. Each role drains it on later operational cycles,
 even when no new review work is selected. Current subscriptions and PR/commit
 state are checked again; stale notifications are not replayed as current advice.
 An ambiguous POST is quarantined, not treated as retryable queued work.
+ADO-session closures during reference lookup use bounded fresh-session retries
+within the existing maintenance deadline. An uncertain WorkIQ send is never
+retried. If ADO remains unavailable, the notification stays queued and the
+review scan continues; the activity message identifies ADO MCP rather than
+misreporting the failure as a Teams send error.
 
 **Concurrency limit:** run one author-handler bootstrapper for a PR. A PR comment
 is **not an atomic distributed lock**, including when two machines use the same

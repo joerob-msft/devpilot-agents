@@ -164,6 +164,7 @@ export function dispatchResultDetail(code: string, detail = "", role?: AgentRole
     "already-running": safe.includes("state-contended")
       ? `Another ${role === "reviewer" ? "Reviewer" : role === "review-handler" ? "Review Handler" : "agent"} is using this repository's state; wait for it to finish, then retry.`
       : "Already running: this PR and role hold the work lease.",
+    "mcp-unavailable": "ADO MCP remained unavailable after bounded fresh-session retries; no child was started.",
     "launch-failed": "Broker could not safely launch the child.",
     "role-not-allowed": "This manual role is not enabled by the trusted launcher.",
     "narrowing-invalid": "The requested narrowing scope, capability, or action is not valid.",

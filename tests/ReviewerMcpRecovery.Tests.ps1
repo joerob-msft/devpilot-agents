@@ -1,4 +1,18 @@
 BeforeAll {
+    $harnessPath = (Resolve-Path "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psm1").Path
+    $harnessAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $harnessPath,
+        [ref]$null,
+        [ref]$null
+    )
+    $transportFunction = $harnessAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Test-AgentRecoverableMcpTransportFailure'
+        }, $true)
+    if (-not $transportFunction) { throw 'Shared MCP transport recovery helper was not found.' }
+    . ([scriptblock]::Create($transportFunction.Extent.Text))
+
     $reviewerPath = (Resolve-Path "$PSScriptRoot\..\src\Agents\reviewer\Start-ReviewerAgent.ps1").Path
     $tokens = $null
     $parseErrors = $null
@@ -74,6 +88,7 @@ Describe 'reviewer MCP session recovery' {
     It 'recognizes transport closures that are safe to retry with a fresh session' -ForEach @(
         'Agent MCP session is closed.',
         'Could not write to Agent MCP.',
+        'Could not write an Agent MCP notification.',
         'Agent MCP exited before returning a response.',
         'Agent MCP closed stdout before returning a response.',
         'Agent MCP response timed out.'

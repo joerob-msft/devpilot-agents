@@ -54,6 +54,14 @@ The harness strips these, but only if you launch through it:
 Invoke-TimedProcess -FilePath $exe -ArgumentList $args -TimeoutSeconds $t
 ```
 
+For model or tool trees that must never outlive the invocation, also pass
+`-ContainDescendants` to establish a per-invocation containment boundary.
+Dedicated broker or worker processes should additionally call
+`Initialize-AgentParentProcessContainment` before launching children. On
+Windows that process-wide kill-on-close backstop reaps descendants after an
+abrupt host shutdown. Never call it from an interactive or long-lived host
+that launches children intended to survive that host.
+
 **Verify writes by re-reading.** Some hosts confirm a write in prose. Parsing
 that as JSON throws *after* the write has landed, so the agent reports failure
 for work that actually succeeded — and then retries it. Read the resulting

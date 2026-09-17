@@ -5107,16 +5107,16 @@ function Get-AgentProcessStartIdentity {
     return "utc:$($Process.StartTime.ToUniversalTime().Ticks)"
 }
 
-function New-AgentProcessContainment {
-    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
-    if ($IsWindows) {
-        if (-not ('DevPilot.Native.Job' -as [type])) {
-            Add-Type -TypeDefinition @'
+function Initialize-AgentWindowsJobType {
+    if (-not $IsWindows -or ('DevPilot.Native.JobV2' -as [type])) { return }
+    Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 namespace DevPilot.Native {
-  public static class Job {
+  public static class JobV2 {
+    private static readonly object ParentGate = new object();
+    private static IntPtr parentJob = IntPtr.Zero;
     [StructLayout(LayoutKind.Sequential)] public struct BasicAccounting {
       public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
       public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
@@ -5138,20 +5138,40 @@ namespace DevPilot.Native {
       public IoCounters IoInfo;
       public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
     }
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr CreateJobObject(IntPtr a, string n);
-    [DllImport("kernel32.dll")] public static extern bool SetInformationJobObject(IntPtr j, int c, ref ExtendedLimits i, uint l);
-    [DllImport("kernel32.dll")] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
-    [DllImport("kernel32.dll")] public static extern bool TerminateJobObject(IntPtr j, uint c);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateJobObject(IntPtr a, string n);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j, int c, ref ExtendedLimits i, uint l);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j, uint c);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(
       IntPtr j, int c, out BasicAccounting i, uint l, IntPtr r);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
-    public static IntPtr CreateKillOnClose(int pid, IntPtr processHandle) {
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    private static IntPtr CreateConfiguredJob() {
       IntPtr job = CreateJobObject(IntPtr.Zero, null);
       if (job == IntPtr.Zero) throw new Win32Exception();
       var limits = new ExtendedLimits();
       limits.BasicLimitInformation.LimitFlags = 0x00002000;
-      if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<ExtendedLimits>()) ||
-          !AssignProcessToJobObject(job, processHandle)) {
+      if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<ExtendedLimits>())) {
+        int error = Marshal.GetLastWin32Error(); CloseHandle(job); throw new Win32Exception(error);
+      }
+      return job;
+    }
+    public static void BindCurrentProcessToKillOnClose() {
+      lock (ParentGate) {
+        if (parentJob != IntPtr.Zero) return;
+        IntPtr job = CreateConfiguredJob();
+        if (!AssignProcessToJobObject(job, GetCurrentProcess())) {
+          int error = Marshal.GetLastWin32Error(); CloseHandle(job); throw new Win32Exception(error);
+        }
+        // Deliberately retained for the host lifetime. When the host exits,
+        // Windows closes this final handle and terminates every remaining job member.
+        parentJob = job;
+      }
+    }
+    public static IntPtr CreateKillOnClose(int pid, IntPtr processHandle) {
+      if (pid <= 0) throw new ArgumentOutOfRangeException(nameof(pid));
+      IntPtr job = CreateConfiguredJob();
+      if (!AssignProcessToJobObject(job, processHandle)) {
         int error = Marshal.GetLastWin32Error(); CloseHandle(job); throw new Win32Exception(error);
       }
       return job;
@@ -5165,8 +5185,24 @@ namespace DevPilot.Native {
   }
 }
 '@
-        }
-        return @{ Platform = 'Windows'; Handle = [DevPilot.Native.Job]::CreateKillOnClose($Process.Id, $Process.Handle); ProcessGroupId = 0 }
+}
+
+function Initialize-AgentParentProcessContainment {
+    if (-not $IsWindows) { return }
+    Initialize-AgentWindowsJobType
+    try {
+        [DevPilot.Native.JobV2]::BindCurrentProcessToKillOnClose()
+    }
+    catch {
+        throw "[process-containment-unavailable] Dedicated host could not establish Windows descendant cleanup: $($_.Exception.Message)"
+    }
+}
+
+function New-AgentProcessContainment {
+    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
+    if ($IsWindows) {
+        Initialize-AgentWindowsJobType
+        return @{ Platform = 'Windows'; Handle = [DevPilot.Native.JobV2]::CreateKillOnClose($Process.Id, $Process.Handle); ProcessGroupId = 0 }
     }
     if (-not ('DevPilot.Native.UnixProcessGroup' -as [type])) {
         Add-Type -TypeDefinition @'
@@ -5235,7 +5271,7 @@ function Invoke-AgentUnixProcessGroupSignal {
 function Stop-AgentProcessContainment {
     param([Parameter(Mandatory)][hashtable]$Containment, [Diagnostics.Process]$Process)
     if ($Containment.Platform -eq 'Windows') {
-        [void][DevPilot.Native.Job]::TerminateJobObject($Containment.Handle, 1)
+        [void][DevPilot.Native.JobV2]::TerminateJobObject($Containment.Handle, 1)
     }
     else {
         try {
@@ -5270,7 +5306,7 @@ function Stop-AgentProcessContainment {
         catch { return $false }
     }
     else {
-        [void][DevPilot.Native.Job]::TerminateJobObject($Containment.Handle, 1)
+        [void][DevPilot.Native.JobV2]::TerminateJobObject($Containment.Handle, 1)
     }
     $killDeadline = [DateTime]::UtcNow.AddSeconds(5)
     while ([DateTime]::UtcNow -lt $killDeadline) {
@@ -5284,7 +5320,7 @@ function Test-AgentProcessContainmentExited {
     param([Parameter(Mandatory)][hashtable]$Containment, [Diagnostics.Process]$Process)
     if ($Process) { $Process.Refresh() }
     if ($Containment.Platform -eq 'Windows') {
-        return [DevPilot.Native.Job]::IsEmpty($Containment.Handle)
+        return [DevPilot.Native.JobV2]::IsEmpty($Containment.Handle)
     }
     try {
         if (-not $Process) { return $false }
@@ -5304,7 +5340,7 @@ function Test-AgentProcessContainmentExited {
 function Close-AgentProcessContainment {
     param([AllowNull()][hashtable]$Containment)
     if ($Containment -and $Containment.Platform -eq 'Windows' -and $Containment.Handle -ne [IntPtr]::Zero) {
-        [void][DevPilot.Native.Job]::CloseHandle($Containment.Handle)
+        [void][DevPilot.Native.JobV2]::CloseHandle($Containment.Handle)
         $Containment.Handle = [IntPtr]::Zero
     }
 }
@@ -5514,6 +5550,11 @@ function Invoke-TimedProcess {
 # Generic Agency MCP JSON-RPC stdio client (portable; used only in live mode)
 # ---------------------------------------------------------------------------
 
+function Test-AgentRecoverableMcpTransportFailure {
+    param([Parameter(Mandatory)][string]$Message)
+    return ($Message -match '^(Agent MCP session is closed\.|Could not write to Agent MCP\.|Could not write an Agent MCP notification\.|Agent MCP exited before returning a response\.|Agent MCP closed stdout before returning a response\.|Agent MCP response timed out\.)$')
+}
+
 function Send-AgentMcpRequest {
     param(
         [Parameter(Mandatory)][hashtable]$Session,
@@ -5613,6 +5654,7 @@ function Open-AgentMcpSession {
         [string]$Organization,
         [string[]]$Toolsets = @(),
         [ValidateRange(5, 120)][int]$TimeoutSeconds = 30,
+        [Nullable[DateTime]]$DeadlineUtc,
         [string]$ProtocolVersion = "2024-11-05",
         [string]$ClientName = "copilot-agent-harness",
         [string[]]$EnvironmentVariablesToRemove = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
@@ -5648,7 +5690,7 @@ function Open-AgentMcpSession {
             protocolVersion = $ProtocolVersion
             capabilities    = @{}
             clientInfo      = @{ name = $ClientName; version = "1.0" }
-        }
+        } -DeadlineUtc $DeadlineUtc
         if ($initializeResult -isnot [System.Management.Automation.PSCustomObject] -or
             -not $initializeResult.PSObject.Properties["protocolVersion"]) {
             throw "Agent MCP did not return a protocol version during initialize."
@@ -7220,6 +7262,7 @@ Export-ModuleMember -Function @(
     "New-AgentPersistentRedirectedProcess",
     "Complete-AgentRedirectedProcess",
     "Get-AgentProcessStartIdentity",
+    "Initialize-AgentParentProcessContainment",
     "New-AgentProcessContainment",
     "Stop-AgentProcessContainment",
     "Test-AgentProcessContainmentExited",
@@ -7227,6 +7270,7 @@ Export-ModuleMember -Function @(
     "Stop-ProcessTree",
     "Get-TaskTextBeforeDeadline",
     "Invoke-TimedProcess",
+    "Test-AgentRecoverableMcpTransportFailure",
     "Open-AgentMcpSession",
     "Close-AgentMcpSession",
     "Send-AgentMcpRequest",

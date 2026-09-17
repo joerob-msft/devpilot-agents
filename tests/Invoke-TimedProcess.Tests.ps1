@@ -367,11 +367,79 @@ exit 0
         }
     }
 
+    It 'reaps an orphaned uncontained grandchild when the worker host is terminated' -Skip:(-not $IsWindows) {
+        $pidPath = Join-Path $TestDrive 'abrupt-worker-grandchild.pid'
+        $readyPath = Join-Path $TestDrive 'abrupt-worker.ready'
+        $workerScript = Join-Path $TestDrive 'abrupt-worker.ps1'
+        $launcherScript = Join-Path $TestDrive 'spawn-grandchild.ps1'
+        $grandchildPid = 0
+        @'
+param($PidPath)
+$grandchild = Start-Process -FilePath (Get-Command pwsh).Source `
+    -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') -PassThru
+[IO.File]::WriteAllText($PidPath, [string]$grandchild.Id)
+'@ | Set-Content -LiteralPath $launcherScript -Encoding utf8NoBOM
+        @'
+param($ModulePath, $LauncherScript, $PidPath, $ReadyPath)
+Import-Module $ModulePath -Force
+Initialize-AgentParentProcessContainment
+$launcher = Start-Process -FilePath (Resolve-AgentPwshPath) `
+    -ArgumentList @('-NoProfile', '-File', $LauncherScript, $PidPath) -PassThru
+if (-not $launcher.WaitForExit(10000) -or $launcher.ExitCode -ne 0) {
+    throw 'Grandchild launcher failed.'
+}
+[IO.File]::WriteAllText($ReadyPath, 'ready')
+Start-Sleep -Seconds 30
+'@ | Set-Content -LiteralPath $workerScript -Encoding utf8NoBOM
+        $modulePath = (Resolve-Path "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1").Path
+        $worker = Start-Process -FilePath (Resolve-AgentPwshPath) -PassThru -ArgumentList @(
+            '-NoProfile', '-File', $workerScript, $modulePath, $launcherScript, $pidPath, $readyPath)
+        try {
+            $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while ([DateTime]::UtcNow -lt $readyDeadline) {
+                $pidText = Get-Content -LiteralPath $pidPath -Raw -ErrorAction SilentlyContinue
+                if ((Test-Path -LiteralPath $readyPath) -and
+                    [int]::TryParse($pidText, [ref]$grandchildPid) -and $grandchildPid -gt 0) {
+                    break
+                }
+                Start-Sleep -Milliseconds 25
+            }
+            Test-Path -LiteralPath $readyPath | Should -BeTrue
+            $grandchildPid | Should -BeGreaterThan 0
+            Get-Process -Id $grandchildPid -ErrorAction Stop | Should -Not -BeNullOrEmpty
+
+            # Simulate the dashboard/broker disappearing without giving the
+            # worker an opportunity to execute PowerShell cleanup blocks. The
+            # intermediate launcher has already exited, matching the observed
+            # Agency-parent/Copilot-grandchild failure shape.
+            $worker.Kill()
+            $worker.WaitForExit(10000) | Should -BeTrue
+
+            $deadline = [DateTime]::UtcNow.AddSeconds(5)
+            while ((Get-Process -Id $grandchildPid -ErrorAction SilentlyContinue) -and
+                [DateTime]::UtcNow -lt $deadline) {
+                Start-Sleep -Milliseconds 25
+            }
+            Get-Process -Id $grandchildPid -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+        }
+        finally {
+            if (-not $worker.HasExited) { $worker.Kill($true) }
+            $worker.Dispose()
+            if ($grandchildPid -gt 0) {
+                Stop-Process -Id $grandchildPid -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
     It 'contains both reviewer and review-handler model process trees' {
         $reviewer = Get-Content -LiteralPath "$PSScriptRoot\..\src\Agents\reviewer\Start-ReviewerAgent.ps1" -Raw
         $handler = Get-Content -LiteralPath "$PSScriptRoot\..\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1" -Raw
+        $broker = Get-Content -LiteralPath "$PSScriptRoot\..\tools\Invoke-DevPilotAgentDispatch.ps1" -Raw
         $reviewer | Should -Match 'Invoke-TimedProcess[\s\S]+-ContainDescendants'
         $handler | Should -Match 'ContainDescendants\s*=\s*\$true'
+        $reviewer | Should -Match 'if \(\$ManualDispatchManifest -or \$LauncherWorkerManifest\) \{\r?\n\s*Initialize-AgentParentProcessContainment'
+        $handler | Should -Match 'if \(\$ManualDispatchManifest -or \$LauncherWorkerManifest\) \{\r?\n\s*Initialize-AgentParentProcessContainment'
+        $broker | Should -Match 'Initialize-AgentParentProcessContainment'
     }
 
     It 'does not classify unrelated exceptions as closed child stdin' {

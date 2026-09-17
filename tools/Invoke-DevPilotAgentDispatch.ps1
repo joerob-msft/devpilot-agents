@@ -12,6 +12,10 @@ Set-StrictMode -Version Latest
 $utf8 = [Text.UTF8Encoding]::new($false, $true)
 $toolkitRoot = Split-Path $PSScriptRoot -Parent
 Import-Module (Join-Path $toolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
+# The broker owns every automatic and manual worker it launches. Bind the broker
+# before descriptor processing can start any child so abrupt dashboard/broker
+# shutdown still reaps the full worker and model process hierarchy.
+Initialize-AgentParentProcessContainment
 
 $descriptorFullPath = [IO.Path]::GetFullPath($DescriptorPath)
 $descriptorParent = Split-Path $descriptorFullPath -Parent
@@ -305,7 +309,11 @@ function Remove-ExpiredNarrowingPreviews {
 }
 
 function Open-BrokerProvider {
-    param([hashtable]$RoleDescriptor)
+    param(
+        [hashtable]$RoleDescriptor,
+        [ValidateRange(5, 120)][int]$TimeoutSeconds = 15,
+        [Nullable[DateTime]]$DeadlineUtc
+    )
     $configurationRoot = [IO.Path]::GetFullPath([string]$RoleDescriptor.configRoot)
     $expectedConfigPath = [IO.Path]::GetFullPath([string]$RoleDescriptor.configFile)
     $configPath = Assert-AgentTrustedFile -Path ([IO.Path]::GetFullPath([string]$RoleDescriptor.configFile)) `
@@ -323,20 +331,29 @@ function Open-BrokerProvider {
     $provider = [string]$config.provider
     if ($provider -eq 'GitHub') {
         $context = New-AgentProviderContext -Provider GitHub -Organization ([string]$repository.organization) `
-            -RepositoryName ([string]$repository.name) -TimeoutSeconds 10
+            -RepositoryName ([string]$repository.name) -TimeoutSeconds $TimeoutSeconds
         return @{ ConfigPath = $configPath; Config = $config; Context = $context; Session = $null; RepositoryRoot = $repositoryRoot }
     }
     $agency = Get-Command agency -CommandType Application -ErrorAction Stop | Select-Object -First 1
-    $session = Open-AgentMcpSession -AgencyPath $agency.Source -Server ado `
-        -Organization ([string]$repository.organization) -Toolsets @('repos') -TimeoutSeconds 10
-    $invoker = {
-        param($Name, $Arguments, $RawText)
-        Invoke-AgentMcpTool -Session $session -Name $Name -Arguments $Arguments -RawText:$RawText
-    }.GetNewClosure()
-    $context = New-AgentProviderContext -Provider AzureDevOps -Organization ([string]$repository.organization) `
-        -Project ([string]$repository.project) -RepositoryName ([string]$repository.name) `
-        -RepositoryId ([string]$repository.id) -McpInvoker $invoker -TimeoutSeconds 10
-    return @{ ConfigPath = $configPath; Config = $config; Context = $context; Session = $session; RepositoryRoot = $repositoryRoot }
+    $session = $null
+    try {
+        $session = Open-AgentMcpSession -AgencyPath $agency.Source -Server ado `
+            -Organization ([string]$repository.organization) -Toolsets @('repos') `
+            -TimeoutSeconds $TimeoutSeconds -DeadlineUtc $DeadlineUtc
+        $invoker = {
+            param($Name, $Arguments, $RawText)
+            Invoke-AgentMcpTool -Session $session -Name $Name -Arguments $Arguments `
+                -DeadlineUtc $DeadlineUtc -RawText:$RawText
+        }.GetNewClosure()
+        $context = New-AgentProviderContext -Provider AzureDevOps -Organization ([string]$repository.organization) `
+            -Project ([string]$repository.project) -RepositoryName ([string]$repository.name) `
+            -RepositoryId ([string]$repository.id) -McpInvoker $invoker -TimeoutSeconds $TimeoutSeconds
+        return @{ ConfigPath = $configPath; Config = $config; Context = $context; Session = $session; RepositoryRoot = $repositoryRoot }
+    }
+    catch {
+        if ($session) { Close-AgentMcpSession -Session $session -Abort }
+        throw
+    }
 }
 
 function Get-BrokerPullRequest {
@@ -379,6 +396,62 @@ function ConvertTo-BrokerPrSnapshot {
                 Get-OptionalMember (Get-OptionalMember $PullRequest 'user') 'login'
             })
         title = [string]$PullRequest.title
+    }
+}
+
+function Resolve-BrokerProviderSnapshot {
+    param(
+        [Parameter(Mandatory)][hashtable]$RoleDescriptor,
+        [Parameter(Mandatory)][hashtable]$Request,
+        [Parameter(Mandatory)][int]$PullRequestId,
+        [switch]$DiscoverCurrent,
+        [ValidateRange(1, 5)][int]$MaxAttempts = 2,
+        [ValidateRange(5, 120)][int]$AttemptTimeoutSeconds = 15,
+        [ValidateRange(5, 180)][int]$DeadlineSeconds = 32
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($DeadlineSeconds)
+    $lastFailure = ''
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $provider = $null
+        try {
+            $remainingSeconds = [Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds)
+            if ($remainingSeconds -lt 5) {
+                throw "[mcp-unavailable] ADO MCP PR resolution exhausted its ${DeadlineSeconds}s deadline."
+            }
+            $attemptTimeout = [Math]::Min($AttemptTimeoutSeconds, [int]$remainingSeconds)
+            $attemptDeadline = [DateTime]::UtcNow.AddSeconds($attemptTimeout)
+            if ($attemptDeadline -gt $deadline) { $attemptDeadline = $deadline }
+            $provider = Open-BrokerProvider -RoleDescriptor $RoleDescriptor -TimeoutSeconds $attemptTimeout `
+                -DeadlineUtc $attemptDeadline
+            $identity = Resolve-AgentProviderRepositoryIdentity -Context $provider.Context
+            if (-not $DiscoverCurrent -and [string]$Request.repositoryKey -cne [string]$identity.key) {
+                throw '[repository-mismatch] Repository key does not match the provider.'
+            }
+            $pr = ConvertTo-BrokerPrSnapshot -PullRequest (Get-BrokerPullRequest $provider $PullRequestId) `
+                -PullRequestId $PullRequestId
+            return @{ Provider = $provider; Identity = $identity; PullRequest = $pr; Attempts = $attempt }
+        }
+        catch {
+            $failureRecord = $_
+            $lastFailure = $_.Exception.Message
+            $cleanupFailure = ''
+            if ($provider -and $provider.Session) {
+                try { Close-AgentMcpSession -Session $provider.Session -Abort }
+                catch { $cleanupFailure = $_.Exception.Message }
+            }
+            if (-not (Test-AgentRecoverableMcpTransportFailure -Message $lastFailure)) { throw $failureRecord }
+            if ($cleanupFailure) {
+                throw "[mcp-unavailable] ADO MCP session cleanup failed after attempt ${attempt}; no additional session was opened. Last failure: $lastFailure. Cleanup failure: $cleanupFailure"
+            }
+            if ($attempt -ge $MaxAttempts) {
+                throw "[mcp-unavailable] ADO MCP did not resolve the PR data after $attempt attempts. Last failure: $lastFailure"
+            }
+            $retryDelayMilliseconds = if ($attempt -eq 1) { 250 } else { 1000 }
+            if ([DateTime]::UtcNow.AddMilliseconds($retryDelayMilliseconds).AddSeconds(5) -ge $deadline) {
+                throw "[mcp-unavailable] ADO MCP PR resolution exhausted its ${DeadlineSeconds}s deadline. Last failure: $lastFailure"
+            }
+            Start-Sleep -Milliseconds $retryDelayMilliseconds
+        }
     }
 }
 
@@ -461,14 +534,14 @@ function Get-BrokerCapabilityProfile {
     }
     $prId = [int]$prNumber
     $roleDescriptor = Get-RoleDescriptor $role
-    $provider = Open-BrokerProvider $roleDescriptor
+    $provider = $null
     try {
+        $resolvedProvider = Resolve-BrokerProviderSnapshot -RoleDescriptor $roleDescriptor -Request $Request `
+            -PullRequestId $prId -DiscoverCurrent:$DiscoverCurrent
+        $provider = $resolvedProvider.Provider
+        $identity = $resolvedProvider.Identity
+        $pr = $resolvedProvider.PullRequest
         $roleDescriptor['repositoryRoot'] = $provider.RepositoryRoot
-        $identity = Resolve-AgentProviderRepositoryIdentity -Context $provider.Context
-        if (-not $DiscoverCurrent -and [string]$Request.repositoryKey -cne [string]$identity.key) {
-            throw '[repository-mismatch] Repository key does not match the provider.'
-        }
-        $pr = ConvertTo-BrokerPrSnapshot -PullRequest (Get-BrokerPullRequest $provider $prId) -PullRequestId $prId
         if (-not $pr.active -or $pr.draft) { throw '[pr-state-changed] Pull request is not active and ready.' }
         $constraints = @()
         if ($role -eq 'reviewer') {
@@ -545,7 +618,7 @@ function Get-BrokerCapabilityProfile {
         $provenance = $effect.provenance
     }
     catch {
-        if ($provider.Session) { Close-AgentMcpSession $provider.Session }
+        if ($provider -and $provider.Session) { Close-AgentMcpSession $provider.Session }
         throw
     }
     return @{
@@ -2154,11 +2227,13 @@ function Invoke-DispatchCore {
     $snapshotRoleDescriptor = @{} + $draft.RoleDescriptor
     $snapshotRoleDescriptor.configFile = $draft.Snapshot.SnapshotPath
     $snapshotRoleDescriptor.configRoot = Split-Path $draft.Snapshot.SnapshotPath -Parent
-    $provider = Open-BrokerProvider $snapshotRoleDescriptor
+    $resolvedProvider = Resolve-BrokerProviderSnapshot -RoleDescriptor $snapshotRoleDescriptor -Request @{
+        repositoryKey = $draft.RepositoryIdentity.key
+    } -PullRequestId $draft.PullRequestId
+    $provider = $resolvedProvider.Provider
     try {
-        $identity = Resolve-AgentProviderRepositoryIdentity $provider.Context
-        if ([string]$identity.key -cne [string]$draft.RepositoryIdentity.key) { throw '[repository-mismatch] Repository identity changed.' }
-        $livePr = ConvertTo-BrokerPrSnapshot (Get-BrokerPullRequest $provider $draft.PullRequestId) $draft.PullRequestId
+        $identity = $resolvedProvider.Identity
+        $livePr = $resolvedProvider.PullRequest
         if ([string]$livePr.sourceCommit -cne [string]$draft.PrSnapshot.sourceCommit -or
             [string]$livePr.sourceRef -cne [string]$draft.PrSnapshot.sourceRef) { throw '[source-changed] Pull request source changed.' }
         $liveFingerprint = Get-AgentCanonicalDigest ([ordered]@{

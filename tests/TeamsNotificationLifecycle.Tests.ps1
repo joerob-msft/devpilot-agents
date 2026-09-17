@@ -98,6 +98,7 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         }
         Mock Write-Host {}
         Mock Write-Warning {}
+        Mock Start-Sleep {}
         Mock $script:eventFunction {}
         Mock "Write-${Prefix}CycleMetadata" {}
         Mock "Get-${Prefix}ActivePullRequests" {
@@ -245,7 +246,8 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         $script:adoSessions[2].Process | Should -Not -BeNullOrEmpty
         Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter {
             $Data.code -eq 'outbox-cycle-retrying' -and
-            $Data.reason -eq 'Teams outbox ADO session closed while draining queued notifications.'
+            $Data.reason -eq 'Teams outbox ADO session closed while draining queued notifications.' -and
+            $Data.attempt -eq 2 -and $Data.maxAttempts -eq 3
         }
         Should -Invoke Publish-AgentEvent -Times 0 -ParameterFilter { $Data.code -eq 'outbox-cycle-error' }
         Should -Invoke Invoke-AgentMcpTool -Times 1 -ParameterFilter {
@@ -318,7 +320,8 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         $script:adoSessions[3].Process | Should -Not -BeNullOrEmpty
         Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter {
             $Data.code -eq 'reference-maintenance-retrying' -and
-            $Data.reason -eq 'Agent MCP response timed out.' -and $PrId -eq 42
+            $Data.reason -eq 'Agent MCP response timed out.' -and $PrId -eq 42 -and
+            $Data.attempt -eq 2 -and $Data.maxAttempts -eq 3
         }
         Should -Invoke Publish-AgentEvent -Times 0 -ParameterFilter { $Data.code -eq 'reference-maintenance-error' }
         Should -Invoke Invoke-AgentMcpTool -Times 1 -ParameterFilter {
@@ -326,23 +329,31 @@ Describe '<Role> shared Teams cycle lifecycle' -ForEach @(
         }
     }
 
-    It 'defers a handler maintenance ADO closure only after one fresh-session retry' -Skip:($Role -ne 'review-handler') {
+    It 'defers an ADO-closed Teams outbox only after bounded fresh-session retries' {
         Mock Invoke-AgentTeamsNotificationOutbox {
             param($ReferenceContext)
             $ReferenceContext.Ado.Process = $null
             @{ Outcome = 'deferred' }
         }
 
-        Invoke-HandlerTeamsMaintenance -AgencyPath unused
+        & $script:maintenanceFunction -AgencyPath unused
 
-        Should -Invoke Open-AgentMcpSession -Times 2 -ParameterFilter { $Server -eq 'ado' }
-        Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter {
-            $Data.code -eq 'reference-maintenance-retrying' -and
-            $Data.reason -eq 'Teams reference maintenance ADO session closed while draining the notification outbox.'
+        $retryCode = if ($Role -eq 'reviewer') { 'outbox-cycle-retrying' } else { 'reference-maintenance-retrying' }
+        $errorCode = if ($Role -eq 'reviewer') { 'outbox-cycle-error' } else { 'reference-maintenance-error' }
+        $reason = if ($Role -eq 'reviewer') {
+            'Teams outbox ADO session closed while draining queued notifications.'
+        }
+        else {
+            'Teams reference maintenance ADO session closed while draining the notification outbox.'
+        }
+        Should -Invoke Open-AgentMcpSession -Times 3 -ParameterFilter { $Server -eq 'ado' }
+        Should -Invoke Publish-AgentEvent -Times 2 -ParameterFilter {
+            $Data.code -eq $retryCode -and $Data.reason -eq $reason -and
+            $Data.maxAttempts -eq 3 -and $Data.attempt -in @(2, 3)
         }
         Should -Invoke Publish-AgentEvent -Times 1 -ParameterFilter {
-            $Data.code -eq 'reference-maintenance-error' -and
-            $Data.reason -eq 'Teams reference maintenance ADO session closed while draining the notification outbox.'
+            $Data.code -eq $errorCode -and $Data.reason -eq $reason -and
+            $Data.dependency -eq 'ADO MCP' -and $Data.attempts -eq 3
         }
     }
 

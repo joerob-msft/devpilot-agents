@@ -324,6 +324,12 @@ $HarnessPath = $importedHarness.Path
 Assert-AgentManualDispatchEarlyContext -ManifestPath $ManualDispatchManifest
 if ($ManualDispatchManifest -and $LauncherWorkerManifest) { throw 'Worker and manual authority cannot be combined.' }
 Initialize-AgentLauncherWorker -ManifestPath $LauncherWorkerManifest
+# Broker-launched workers are dedicated child processes and own every MCP/model
+# process they start. Bind only these attested hosts; a direct interactive
+# invocation must not permanently enroll the caller's shell in a Windows job.
+if ($ManualDispatchManifest -or $LauncherWorkerManifest) {
+    Initialize-AgentParentProcessContainment
+}
 
 $ResultMarkerPrefix = "REVIEWER_RESULT_V3:"
 $script:ReviewerLegacyResultMarkerPrefix = "REVIEWER_RESULT_V1:"
@@ -5265,7 +5271,7 @@ function Test-ReviewerTeamsMaintenanceRecoverableFailure {
 function Invoke-ReviewerTeamsMaintenance {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
-        [switch]$McpRecoveryAttempted,
+        [ValidateRange(0, 2)][int]$McpRecoveryAttempt = 0,
         [DateTime]$DeadlineUtc = [DateTime]::MinValue
     )
     if ($PreviewOnly -or -not $EnableTeamsNotifications -or -not $TeamsChannelEnabled -or
@@ -5276,13 +5282,15 @@ function Invoke-ReviewerTeamsMaintenance {
     $workIqSession = $null
     try {
         $deadline = if ($DeadlineUtc -eq [DateTime]::MinValue) { [DateTime]::UtcNow.AddSeconds(60) } else { $DeadlineUtc }
+        $maxAttempts = 3
         $maintenanceSessionTimeoutSeconds = [Math]::Max(1, [Math]::Min(15, $McpTimeoutSeconds))
         $adoSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
             -Organization $Organization -Toolsets @('repos') -TimeoutSeconds $maintenanceSessionTimeoutSeconds `
-            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+            -DeadlineUtc $deadline -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
         if ([DateTime]::UtcNow -ge $deadline) { throw 'Teams outbox deadline exhausted during ADO session startup.' }
         $referenceContext = New-AgentTeamsPrReferenceContext -AdoSession $adoSession -RepositoryIdentity $repositoryIdentity -Role reviewer
-        $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server workiq -TimeoutSeconds 15
+        $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server workiq `
+            -TimeoutSeconds 15 -DeadlineUtc $deadline
         if ([DateTime]::UtcNow -ge $deadline) { throw 'Teams outbox deadline exhausted during WorkIQ session startup.' }
         Invoke-AgentTeamsNotificationOutbox -Session $workIqSession -ReferenceContext $referenceContext `
             -DurableStateRoot $DurableStateRoot -RepositoryIdentity $repositoryIdentity -Role reviewer `
@@ -5295,42 +5303,57 @@ function Invoke-ReviewerTeamsMaintenance {
     catch {
         if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
         $reason = $_.Exception.Message
-        if (-not $McpRecoveryAttempted -and [DateTime]::UtcNow -lt $deadline -and
+        $retryDelayMilliseconds = if ($McpRecoveryAttempt -eq 0) { 250 } else { 1000 }
+        if ($McpRecoveryAttempt -lt ($maxAttempts - 1) -and
+            [DateTime]::UtcNow.AddMilliseconds($retryDelayMilliseconds).AddSeconds(5) -lt $deadline -and
             (Test-ReviewerTeamsMaintenanceRecoverableFailure -Message $reason `
                 -AdoSession $adoSession -WorkIqSession $workIqSession)) {
+            $nextAttempt = $McpRecoveryAttempt + 1
             if ($script:ReviewerOutputContext) {
                 Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -Level warning `
-                    -Data @{ outcome = 'retrying'; code = 'outbox-cycle-retrying'; reason = $reason } `
-                    -Message "Teams outbox transport failed; retrying immediately with fresh ADO and WorkIQ sessions." | Out-Null
+                    -Data @{
+                        outcome = 'retrying'; code = 'outbox-cycle-retrying'; reason = $reason
+                        attempt = $nextAttempt + 1; maxAttempts = $maxAttempts
+                    } `
+                    -Message "Teams outbox transport failed; retrying with fresh ADO and WorkIQ sessions (attempt $($nextAttempt + 1)/$maxAttempts)." | Out-Null
             }
-            Write-Warning "Teams outbox transport failed; retrying immediately with fresh sessions: $reason"
+            Write-Warning "Teams outbox transport failed; retrying with fresh sessions (attempt $($nextAttempt + 1)/$maxAttempts): $reason"
             if ($workIqSession) {
                 try { Close-AgentMcpSession -Session $workIqSession }
-                catch { Write-Warning 'Teams outbox session cleanup failed before retry; review selection is unaffected.' }
+                catch { Write-Warning 'Teams outbox session cleanup failed before retry; the notification remains queued.' }
                 $workIqSession = $null
             }
             if ($adoSession) {
                 try { Close-AgentMcpSession -Session $adoSession }
-                catch { Write-Warning 'Teams outbox ADO session cleanup failed before retry; review selection is unaffected.' }
+                catch { Write-Warning 'Teams outbox ADO session cleanup failed before retry; the notification remains queued.' }
                 $adoSession = $null
             }
-            return Invoke-ReviewerTeamsMaintenance -AgencyPath $AgencyPath -McpRecoveryAttempted -DeadlineUtc $deadline
+            Start-Sleep -Milliseconds $retryDelayMilliseconds
+            return Invoke-ReviewerTeamsMaintenance -AgencyPath $AgencyPath -McpRecoveryAttempt $nextAttempt -DeadlineUtc $deadline
         }
+        $attempts = $McpRecoveryAttempt + 1
+        $dependency = if ($reason -eq 'Teams outbox ADO session closed while draining queued notifications.') {
+            'ADO MCP'
+        }
+        else { 'Teams transport' }
+        $message = "$dependency remained unavailable after $attempts attempt(s); Teams notifications remain queued and the review scan will continue."
         if ($script:ReviewerOutputContext) {
             Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType notification.delivery -Level warning `
-                -Data @{ outcome = 'deferred'; code = 'outbox-cycle-error'; reason = $reason } `
-                -Message "Teams outbox flush deferred; review selection is unaffected: $reason" | Out-Null
+                -Data @{
+                    outcome = 'deferred'; code = 'outbox-cycle-error'; reason = $reason
+                    dependency = $dependency; attempts = $attempts
+                } -Message $message | Out-Null
         }
-        Write-Warning "Teams outbox flush deferred; review selection is unaffected: $reason"
+        Write-Warning "$message Reason: $reason"
     }
     finally {
         if ($workIqSession) {
             try { Close-AgentMcpSession -Session $workIqSession }
-            catch { Write-Warning 'Teams outbox session cleanup failed; review selection is unaffected.' }
+            catch { Write-Warning 'Teams outbox session cleanup failed; the notification remains queued.' }
         }
         if ($adoSession) {
             try { Close-AgentMcpSession -Session $adoSession }
-            catch { Write-Warning 'Teams outbox ADO session cleanup failed; review selection is unaffected.' }
+            catch { Write-Warning 'Teams outbox ADO session cleanup failed; the notification remains queued.' }
         }
     }
 }
@@ -6468,7 +6491,7 @@ function Invoke-ReviewerPromotion {
 
 function Test-ReviewerRecoverableMcpFailure {
     param([Parameter(Mandatory)][string]$Message)
-    return ($Message -match '^(Agent MCP session is closed\.|Could not write to Agent MCP\.|Agent MCP exited before returning a response\.|Agent MCP closed stdout before returning a response\.|Agent MCP response timed out\.)$')
+    return Test-AgentRecoverableMcpTransportFailure -Message $Message
 }
 
 function Resolve-ReviewerStartupRepositoryIdentity {

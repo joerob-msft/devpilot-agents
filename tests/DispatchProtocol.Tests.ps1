@@ -770,7 +770,7 @@ Describe 'dispatch protocol primitives' {
                 $names = @(
                     'Get-OptionalMember', 'Assert-RoleCapabilityPolicy', 'Get-RoleDescriptor',
                     'Remove-ExpiredDrafts', 'Open-BrokerProvider', 'Get-BrokerPullRequest', 'ConvertTo-BrokerPrSnapshot',
-                    'New-ConfigSnapshot', 'Get-BrokerNarrowingEffect', 'Get-BrokerCapabilityProfile',
+                    'Resolve-BrokerProviderSnapshot', 'New-ConfigSnapshot', 'Get-BrokerNarrowingEffect', 'Get-BrokerCapabilityProfile',
                     'Invoke-Profile', 'Invoke-ProfileCurrent', 'Invoke-Describe', 'Write-DispatchProtocolMessage'
                 )
                 $definitions = $ast.FindAll({
@@ -1613,5 +1613,137 @@ $child.Process.WaitForExit(15000) | Out-Null
         $anchorBody | Should -Not -BeNullOrEmpty
         $anchorBody | Should -Match 'NOT a defense against a deliberate'
         $anchorBody | Should -Match 'out of scope'
+    }
+
+    It 'retries recoverable broker preview failures with fresh MCP sessions' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            $brokerPath, [ref]$tokens, [ref]$parseErrors)
+        $parseErrors | Should -BeNullOrEmpty
+        foreach ($name in @('Open-BrokerProvider', 'Get-BrokerPullRequest', 'ConvertTo-BrokerPrSnapshot',
+                'Resolve-BrokerProviderSnapshot')) {
+            $definition = $ast.Find({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq $name
+                }, $true)
+            $definition | Should -Not -BeNullOrEmpty
+            . ([scriptblock]::Create($definition.Extent.Text))
+        }
+
+        $script:brokerOpenCount = 0
+        $script:brokerAttemptTimeouts = [Collections.Generic.List[int]]::new()
+        $script:brokerAttemptDeadlines = [Collections.Generic.List[DateTime]]::new()
+        Mock Open-BrokerProvider {
+            param($TimeoutSeconds, $DeadlineUtc)
+            $script:brokerOpenCount++
+            $script:brokerAttemptTimeouts.Add($TimeoutSeconds)
+            $script:brokerAttemptDeadlines.Add([DateTime]$DeadlineUtc)
+            @{
+                Context = @{ Provider = 'AzureDevOps' }
+                Session = @{ Id = $script:brokerOpenCount; Process = [pscustomobject]@{ Alive = $true } }
+            }
+        }
+        Mock Resolve-AgentProviderRepositoryIdentity { @{ key = 'v1:azuredevops:repo' } }
+        Mock Get-BrokerPullRequest {
+            if ($script:brokerOpenCount -lt 3) { throw 'Agent MCP response timed out.' }
+            @{ status = 'active' }
+        }
+        Mock ConvertTo-BrokerPrSnapshot { @{ active = $true; draft = $false } }
+        Mock Close-AgentMcpSession {}
+        Mock Start-Sleep {}
+
+        $result = Resolve-BrokerProviderSnapshot -RoleDescriptor @{} -Request @{
+            repositoryKey = 'v1:azuredevops:repo'
+        } -PullRequestId 42 -MaxAttempts 3 -AttemptTimeoutSeconds 15 -DeadlineSeconds 50
+
+        $result.Attempts | Should -Be 3
+        $script:brokerAttemptTimeouts.ToArray() | Should -Be @(15, 15, 15)
+        $script:brokerAttemptDeadlines.Count | Should -Be 3
+        foreach ($deadline in $script:brokerAttemptDeadlines) {
+            $deadline | Should -BeGreaterThan ([DateTime]::UtcNow.AddSeconds(-1))
+            $deadline | Should -BeLessOrEqual ([DateTime]::UtcNow.AddSeconds(16))
+        }
+        Should -Invoke Open-BrokerProvider -Times 3 -Exactly
+        Should -Invoke Close-AgentMcpSession -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 2 -Exactly
+
+        $openDefinition = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Open-BrokerProvider'
+            }, $true)
+        $openDefinition.Extent.Text | Should -Match 'Open-AgentMcpSession[\s\S]+-DeadlineUtc \$DeadlineUtc'
+        $openDefinition.Extent.Text | Should -Match 'Invoke-AgentMcpTool[\s\S]+-DeadlineUtc \$DeadlineUtc'
+    }
+
+    It 'does not retry malformed or provider-rejected broker preview responses' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            $brokerPath, [ref]$tokens, [ref]$parseErrors)
+        $parseErrors | Should -BeNullOrEmpty
+        foreach ($name in @('Open-BrokerProvider', 'Get-BrokerPullRequest', 'ConvertTo-BrokerPrSnapshot',
+                'Resolve-BrokerProviderSnapshot')) {
+            $definition = $ast.Find({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq $name
+                }, $true)
+            . ([scriptblock]::Create($definition.Extent.Text))
+        }
+
+        Mock Open-BrokerProvider {
+            @{ Context = @{ Provider = 'AzureDevOps' }; Session = @{ Process = [pscustomobject]@{ Alive = $true } } }
+        }
+        Mock Resolve-AgentProviderRepositoryIdentity { @{ key = 'v1:azuredevops:repo' } }
+        Mock Get-BrokerPullRequest { throw 'Agent MCP tool returned malformed JSON content.' }
+        Mock Close-AgentMcpSession { throw 'Synthetic cleanup failure' }
+        Mock Start-Sleep {}
+
+        {
+            Resolve-BrokerProviderSnapshot -RoleDescriptor @{} -Request @{
+                repositoryKey = 'v1:azuredevops:repo'
+            } -PullRequestId 42
+        } | Should -Throw '*malformed JSON content*'
+
+        Should -Invoke Open-BrokerProvider -Times 1 -Exactly
+        Should -Invoke Close-AgentMcpSession -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+    }
+
+    It 'reports a distinct MCP-unavailable rejection after broker retries are exhausted' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            $brokerPath, [ref]$tokens, [ref]$parseErrors)
+        foreach ($name in @('Open-BrokerProvider', 'Get-BrokerPullRequest', 'ConvertTo-BrokerPrSnapshot',
+                'Resolve-BrokerProviderSnapshot')) {
+            $definition = $ast.Find({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq $name
+                }, $true)
+            . ([scriptblock]::Create($definition.Extent.Text))
+        }
+
+        Mock Open-BrokerProvider {
+            @{ Context = @{ Provider = 'AzureDevOps' }; Session = @{ Process = [pscustomobject]@{ Alive = $true } } }
+        }
+        Mock Resolve-AgentProviderRepositoryIdentity { @{ key = 'v1:azuredevops:repo' } }
+        Mock Get-BrokerPullRequest { throw 'Agent MCP response timed out.' }
+        Mock Close-AgentMcpSession {}
+        Mock Start-Sleep {}
+
+        {
+            Resolve-BrokerProviderSnapshot -RoleDescriptor @{} -Request @{
+                repositoryKey = 'v1:azuredevops:repo'
+            } -PullRequestId 42 -MaxAttempts 3 -AttemptTimeoutSeconds 15 -DeadlineSeconds 50
+        } | Should -Throw '*mcp-unavailable*after 3 attempts*'
+
+        Should -Invoke Open-BrokerProvider -Times 3 -Exactly
+        Should -Invoke Close-AgentMcpSession -Times 3 -Exactly
+        Should -Invoke Start-Sleep -Times 2 -Exactly
     }
 }

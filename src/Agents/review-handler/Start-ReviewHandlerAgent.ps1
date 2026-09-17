@@ -240,6 +240,12 @@ $HarnessPath = $importedHarness.Path
 Assert-AgentManualDispatchEarlyContext -ManifestPath $ManualDispatchManifest
 if ($ManualDispatchManifest -and $LauncherWorkerManifest) { throw 'Worker and manual authority cannot be combined.' }
 Initialize-AgentLauncherWorker -ManifestPath $LauncherWorkerManifest
+# Broker-launched workers are dedicated child processes and own every MCP/model
+# process they start. Bind only these attested hosts; a direct interactive
+# invocation must not permanently enroll the caller's shell in a Windows job.
+if ($ManualDispatchManifest -or $LauncherWorkerManifest) {
+    Initialize-AgentParentProcessContainment
+}
 
 $ResultMarkerPrefix = "REVIEW_HANDLER_RESULT_V1:"
 $script:HandlerRejectedResumeSessionIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -2067,7 +2073,7 @@ function Test-HandlerTeamsMaintenanceRecoverableFailure {
     if ($Message -match '^Teams reference maintenance ADO session closed while (initializing PR [1-9][0-9]*|draining the notification outbox)\.$') {
         return $true
     }
-    if ($Message -notmatch '^(Agent MCP session is closed\.|Could not write to Agent MCP\.|Agent MCP exited before returning a response\.|Agent MCP closed stdout before returning a response\.|Agent MCP response timed out\.)$') {
+    if (-not (Test-AgentRecoverableMcpTransportFailure -Message $Message)) {
         return $false
     }
     if (-not $WorkIqSession) { return $true }
@@ -2123,7 +2129,7 @@ function Invoke-HandlerTeamsMaintenance {
         [Parameter(Mandatory)][string]$AgencyPath,
         [object[]]$Candidates = @(),
         [switch]$Bootstrap,
-        [switch]$McpRecoveryAttempted,
+        [ValidateRange(0, 2)][int]$McpRecoveryAttempt = 0,
         [ValidateRange(0, 2147483647)][int]$RetryPullRequestId,
         [DateTime]$DeadlineUtc = [DateTime]::MinValue
     )
@@ -2137,13 +2143,16 @@ function Invoke-HandlerTeamsMaintenance {
     $currentReferencePrId = 0
     try {
         $deadline = if ($DeadlineUtc -eq [DateTime]::MinValue) { [DateTime]::UtcNow.AddSeconds(60) } else { $DeadlineUtc }
+        $maxAttempts = 3
         $maintenanceSessionTimeoutSeconds = [Math]::Max(1, [Math]::Min(15, $McpTimeoutSeconds))
         $adoSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
-            -Organization $Organization -Toolsets @('repos') -TimeoutSeconds $maintenanceSessionTimeoutSeconds
+            -Organization $Organization -Toolsets @('repos') `
+            -TimeoutSeconds $maintenanceSessionTimeoutSeconds -DeadlineUtc $deadline
         if ([DateTime]::UtcNow -ge $deadline) { throw 'Teams reference maintenance deadline exhausted during ADO session startup.' }
         $referenceContext = New-AgentTeamsPrReferenceContext -AdoSession $adoSession -RepositoryIdentity $repositoryIdentity `
             -Role review-handler -AllowWrites:$EnableTeamsPrReferenceWrites
-        $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server workiq -TimeoutSeconds 15
+        $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server workiq `
+            -TimeoutSeconds 15 -DeadlineUtc $deadline
         if ([DateTime]::UtcNow -ge $deadline) { throw 'Teams reference maintenance deadline exhausted during WorkIQ session startup.' }
         if ($Bootstrap) {
             # Persist the rotation independently of review completion so an already-registered
@@ -2198,44 +2207,59 @@ function Invoke-HandlerTeamsMaintenance {
     catch {
         if ($_.Exception.Message -match '^\[(cancelled|launcher-[a-z-]+)\]') { throw }
         $reason = $_.Exception.Message
-        if (-not $McpRecoveryAttempted -and [DateTime]::UtcNow -lt $deadline -and
+        $retryDelayMilliseconds = if ($McpRecoveryAttempt -eq 0) { 250 } else { 1000 }
+        if ($McpRecoveryAttempt -lt ($maxAttempts - 1) -and
+            [DateTime]::UtcNow.AddMilliseconds($retryDelayMilliseconds).AddSeconds(5) -lt $deadline -and
             (Test-HandlerTeamsMaintenanceRecoverableFailure -Message $reason `
                 -AdoSession $adoSession -WorkIqSession $workIqSession)) {
+            $nextAttempt = $McpRecoveryAttempt + 1
             if ($script:HandlerOutputContext) {
                 Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery -Level warning `
                     -PrId $currentReferencePrId `
-                    -Data @{ outcome = 'retrying'; code = 'reference-maintenance-retrying'; reason = $reason } `
-                    -Message 'Teams reference maintenance transport failed; retrying immediately with fresh ADO and WorkIQ sessions.' | Out-Null
+                    -Data @{
+                        outcome = 'retrying'; code = 'reference-maintenance-retrying'; reason = $reason
+                        attempt = $nextAttempt + 1; maxAttempts = $maxAttempts
+                    } `
+                    -Message "Teams reference maintenance transport failed; retrying with fresh ADO and WorkIQ sessions (attempt $($nextAttempt + 1)/$maxAttempts)." | Out-Null
             }
-            Write-Warning "Teams reference maintenance transport failed; retrying immediately with fresh sessions: $reason"
+            Write-Warning "Teams reference maintenance transport failed; retrying with fresh sessions (attempt $($nextAttempt + 1)/$maxAttempts): $reason"
             if ($workIqSession) {
                 try { Close-AgentMcpSession -Session $workIqSession }
-                catch { Write-Warning 'Teams maintenance session cleanup failed before retry; review selection is unaffected.' }
+                catch { Write-Warning 'Teams maintenance session cleanup failed before retry; notifications remain queued.' }
                 $workIqSession = $null
             }
             if ($adoSession) {
                 try { Close-AgentMcpSession -Session $adoSession }
-                catch { Write-Warning 'Teams maintenance ADO session cleanup failed before retry; review selection is unaffected.' }
+                catch { Write-Warning 'Teams maintenance ADO session cleanup failed before retry; notifications remain queued.' }
                 $adoSession = $null
             }
+            Start-Sleep -Milliseconds $retryDelayMilliseconds
             return Invoke-HandlerTeamsMaintenance -AgencyPath $AgencyPath -Candidates $Candidates -Bootstrap:$Bootstrap `
-                -McpRecoveryAttempted -RetryPullRequestId $currentReferencePrId -DeadlineUtc $deadline
+                -McpRecoveryAttempt $nextAttempt -RetryPullRequestId $currentReferencePrId -DeadlineUtc $deadline
         }
+        $attempts = $McpRecoveryAttempt + 1
+        $dependency = if ($reason -match '^Teams reference maintenance ADO session closed while ') {
+            'ADO MCP'
+        }
+        else { 'Teams transport' }
+        $message = "$dependency remained unavailable after $attempts attempt(s); Teams notifications remain queued and the review scan will continue."
         if ($script:HandlerOutputContext) {
             Publish-AgentEvent -Context $script:HandlerOutputContext -EventType notification.delivery -Level warning `
-                -Data @{ outcome = 'deferred'; code = 'reference-maintenance-error'; reason = $reason } `
-                -Message "Teams reference maintenance deferred; review selection is unaffected: $reason" | Out-Null
+                -Data @{
+                    outcome = 'deferred'; code = 'reference-maintenance-error'; reason = $reason
+                    dependency = $dependency; attempts = $attempts
+                } -Message $message | Out-Null
         }
-        Write-Warning "Teams reference maintenance deferred; review selection is unaffected: $reason"
+        Write-Warning "$message Reason: $reason"
     }
     finally {
         if ($workIqSession) {
             try { Close-AgentMcpSession -Session $workIqSession }
-            catch { Write-Warning 'Teams maintenance session cleanup failed; review selection is unaffected.' }
+            catch { Write-Warning 'Teams maintenance session cleanup failed; notifications remain queued.' }
         }
         if ($adoSession) {
             try { Close-AgentMcpSession -Session $adoSession }
-            catch { Write-Warning 'Teams maintenance ADO session cleanup failed; review selection is unaffected.' }
+            catch { Write-Warning 'Teams maintenance ADO session cleanup failed; notifications remain queued.' }
         }
     }
 }
