@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "owner-parity-qualification.v1",
+  "title": "Owner parity qualification manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "expectedV1Snapshot", "entries"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "owner-parity-qualification" },
+    "expectedV1Snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fileCount", "byteCount", "newestWriteTicks", "rootHash"],
+      "properties": {
+        "fileCount": { "type": "integer", "minimum": 0 },
+        "byteCount": { "type": "integer", "minimum": 0 },
+        "newestWriteTicks": { "type": "integer", "minimum": 0 },
+        "rootHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "baseline", "candidate", "evidence", "adjudication"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "baseline": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["headKey"],
+            "properties": {
+              "headKey": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          },
+          "candidate": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["mode", "manifestPath", "entryId"],
+                "properties": {
+                  "mode": { "const": "run" },
+                  "manifestPath": { "$ref": "#/$defs/path" },
+                  "entryId": { "$ref": "#/$defs/id" }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["mode", "observationPath"],
+                "properties": {
+                  "mode": { "const": "read" },
+                  "observationPath": { "$ref": "#/$defs/path" }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["mode", "reason"],
+                "properties": {
+                  "mode": { "const": "unavailable" },
+                  "reason": {
+                    "enum": [
+                      "exact-evidence-unavailable",
+                      "safe-real-model-launcher-unavailable"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "evidence": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "class",
+              "semanticProvenance",
+              "inputContract",
+              "truthCoverage"
+            ],
+            "properties": {
+              "class": {
+                "enum": ["preserved-exact-bytes", "synthetic", "unknown"]
+              },
+              "semanticProvenance": {
+                "enum": [
+                  "offline-replay-recorded-model",
+                  "offline-replay-deterministic",
+                  "prospective-real-model",
+                  "unavailable",
+                  "unknown"
+                ]
+              },
+              "inputContract": {
+                "enum": ["independently-validated", "unknown"]
+              },
+              "truthCoverage": {
+                "enum": ["complete", "partial", "none"]
+              }
+            }
+          },
+          "adjudication": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "key",
+                "eligibility",
+                "truth",
+                "baseline",
+                "candidate"
+              ],
+              "properties": {
+                "key": { "$ref": "#/$defs/id" },
+                "eligibility": {
+                  "enum": ["method", "class-advisory", "incomplete"]
+                },
+                "truth": {
+                  "enum": ["violation", "compliant", "unknown"]
+                },
+                "baseline": { "$ref": "#/$defs/selectorOrNull" },
+                "candidate": { "$ref": "#/$defs/selectorOrNull" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32767
+    },
+    "selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "disposition"],
+      "properties": {
+        "identity": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "disposition": { "enum": ["violation", "unknown"] }
+      }
+    },
+    "selectorOrNull": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/selector" }
+      ]
+    }
+  }
+}
