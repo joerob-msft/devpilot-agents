@@ -186,6 +186,7 @@ jobs:
             './tests/ManualRedispatch.Tests.ps1',
             './tests/OwnerAdapters.Tests.ps1',
             './tests/OwnerCapability.Tests.ps1',
+            './tests/OwnerModelRunner.Tests.ps1',
             './tests/OwnerPipeline.Tests.ps1',
             './tests/ReviewHandler.Resume.Tests.ps1',
             './tests/ReviewerOutput.Tests.ps1'
