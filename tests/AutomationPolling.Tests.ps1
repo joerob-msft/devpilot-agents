@@ -29,10 +29,20 @@ BeforeAll {
             Manifest = @{ workerId = [Guid]::NewGuid().ToString('D'); nonce = New-AgentNonce }
         }
     }
-    function Set-PollingCheckpoint([hashtable]$Worker, [string]$Phase, [switch]$BadProof) {
+    function Set-PollingCheckpoint(
+        [hashtable]$Worker,
+        [string]$Phase,
+        [switch]$BadProof,
+        [int]$RetryAttempt = 0,
+        [int]$RetryDelaySeconds = 0
+    ) {
         $record = @{
             workerId = $Worker.Manifest.workerId; sequence = $Worker.Sequence + 1; phase = $Phase
             repositoryKey = $Worker.RepositoryKey; pullRequestId = $Worker.PullRequestId; workId = $Worker.WorkId
+        }
+        if ($Phase -ceq 'retrying') {
+            $record.retryAttempt = $RetryAttempt
+            $record.retryDelaySeconds = $RetryDelaySeconds
         }
         $proof = Get-AgentAttestationProof $Worker.Secret $Worker.Manifest.nonce (Get-AgentCanonicalDigest $record)
         if ($BadProof) { $proof = '0' * 64 }
@@ -58,6 +68,8 @@ Describe 'Polling and scan-now authority state' {
         $script:utf8 = [Text.UTF8Encoding]::new($false, $true)
         $script:MaximumLineBytes = 65536
         $script:AcceptRequestId = $true
+        $script:AutomaticStartupInitialDeadlineSeconds = 120
+        $script:AutomaticStartupRetryAttemptBudgetSeconds = 120
     }
 
     It 'reads polling state without changing policy, wake flags, admission, or lifecycle' {
@@ -166,6 +178,70 @@ Describe 'Polling and scan-now authority state' {
         $Replies.Count | Should -Be 0
     }
 
+    It 'refreshes the startup deadline for authenticated retry checkpoints without advancing startup' {
+        $worker = New-PollingWorker -Phase ready
+        $worker.StartupAcknowledged = $false
+        $worker.RepositoryKey = ''
+        $worker.PullRequestId = 0
+        $worker.WorkId = ''
+        $worker.StartupDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        $automaticWorkers.reviewer = $worker
+        $before = $worker.StartupDeadline
+        Set-PollingCheckpoint $worker retrying -RetryAttempt 6 -RetryDelaySeconds 300
+
+        Update-AutomaticWorkers
+
+        $worker.Phase | Should -BeExactly ready
+        $worker.StartupAcknowledged | Should -BeFalse
+        $worker.StartupDeadline | Should -BeGreaterThan $before
+        $worker.StartupDeadline | Should -BeGreaterThan ([DateTime]::UtcNow.AddSeconds(415))
+        $worker.RetryAttempt | Should -Be 6
+        $worker.RetryDelaySeconds | Should -Be 300
+        $Replies[0].record.action | Should -BeExactly proceed
+    }
+
+    It 'accepts repeated startup retries and then acknowledges normal startup' {
+        $worker = New-PollingWorker -Phase ready
+        $worker.StartupAcknowledged = $false
+        $worker.RepositoryKey = ''
+        $worker.PullRequestId = 0
+        $worker.WorkId = ''
+        $worker.StartupDeadline = [DateTime]::UtcNow.AddMinutes(1)
+        $automaticWorkers.reviewer = $worker
+
+        Set-PollingCheckpoint $worker retrying -RetryAttempt 1 -RetryDelaySeconds 5
+        Update-AutomaticWorkers
+        Set-PollingCheckpoint $worker retrying -RetryAttempt 2 -RetryDelaySeconds 15
+        Update-AutomaticWorkers
+        Set-PollingCheckpoint $worker started
+        Update-AutomaticWorkers
+
+        $worker.StartupAcknowledged | Should -BeTrue
+        $worker.Phase | Should -BeExactly started
+        $worker.RetryAttempt | Should -Be 0
+        $worker.RetryDelaySeconds | Should -Be 0
+        $worker.RetryAtUtc | Should -BeNullOrEmpty
+        $Replies.Count | Should -Be 3
+    }
+
+    It 'rejects startup retry checkpoints after startup or with invalid retry metadata' {
+        $worker = New-PollingWorker -Phase started
+        $automaticWorkers.reviewer = $worker
+        Set-PollingCheckpoint $worker retrying -RetryAttempt 1 -RetryDelaySeconds 5
+        { Update-AutomaticWorkers } | Should -Throw '*startup retry checkpoint is invalid*'
+
+        $worker = New-PollingWorker -Phase ready
+        $worker.StartupAcknowledged = $false
+        $worker.RepositoryKey = ''
+        $worker.PullRequestId = 0
+        $worker.WorkId = ''
+        $worker.StartupDeadline = [DateTime]::UtcNow.AddMinutes(1)
+        $worker.Deadline = [DateTime]::UtcNow.AddMinutes(1)
+        $automaticWorkers.reviewer = $worker
+        Set-PollingCheckpoint $worker retrying -RetryAttempt 0 -RetryDelaySeconds 5
+        { Update-AutomaticWorkers } | Should -Throw '*startup retry checkpoint is invalid*'
+    }
+
     It 'services <Operation> without interrupting pending manual startup' -ForEach @(
         @{ Operation = 'get-automation-status' }, @{ Operation = 'scan-now' }
     ) {
@@ -221,7 +297,56 @@ Describe 'Polling and scan-now authority state' {
                         $script:AgentLauncherWorker.WakeCurrentWait | Should -BeFalse
                     }
                 }
+
                 finally { [Array]::Clear($secret, 0, $secret.Length); $script:AgentLauncherWorker = $null }
+            }
+        }
+    }
+
+    It 'emits an authenticated worker retry checkpoint and can still acknowledge startup' {
+        & (Get-Module DevPilot.AgentHarness) {
+            $secret = New-AgentBrokerAttestationSecret
+            $nonce = New-AgentNonce
+            $workerId = [Guid]::NewGuid().ToString('D')
+            $replyLines = [Collections.Generic.Queue[string]]::new()
+            foreach ($sequence in 1, 2) {
+                $record = @{ workerId = $workerId; sequence = $sequence; action = 'proceed' }
+                $replyLines.Enqueue((ConvertTo-AgentCanonicalJson @{
+                    record = $record
+                    proof = Get-AgentAttestationProof $secret $nonce (Get-AgentCanonicalDigest $record)
+                }))
+            }
+            $reader = [pscustomobject]@{ Lines = $replyLines }
+            $reader | Add-Member ScriptMethod ReadLineAsync {
+                [Threading.Tasks.Task]::FromResult($this.Lines.Dequeue())
+            }
+            $writer = [pscustomobject]@{ Lines = [Collections.Generic.List[string]]::new() }
+            $writer | Add-Member ScriptMethod WriteLine { param($Line) $this.Lines.Add($Line) }
+            $script:AgentLauncherWorker = @{
+                Secret = $secret; Manifest = @{ workerId = $workerId; nonce = $nonce }
+                Reader = $reader; Writer = $writer; Sequence = 0; Lease = $null; State = $null
+                RepositoryKey = ''; PullRequestId = 0; WorkId = ''; WakeCurrentWait = $false
+            }
+            try {
+                Send-AgentLauncherWorkerStartupRetry -Attempt 3 -DelaySeconds 30
+                Confirm-AgentLauncherWorkerStartup
+
+                $writer.Lines.Count | Should -Be 2
+                $retry = $writer.Lines[0] | ConvertFrom-Json -AsHashtable
+                $started = $writer.Lines[1] | ConvertFrom-Json -AsHashtable
+                $retry.record.phase | Should -BeExactly retrying
+                $retry.record.retryAttempt | Should -Be 3
+                $retry.record.retryDelaySeconds | Should -Be 30
+                $started.record.phase | Should -BeExactly started
+                $started.record.sequence | Should -Be 2
+                foreach ($message in $retry, $started) {
+                    $message.proof | Should -BeExactly (
+                        Get-AgentAttestationProof $secret $nonce (Get-AgentCanonicalDigest $message.record))
+                }
+            }
+            finally {
+                [Array]::Clear($secret, 0, $secret.Length)
+                $script:AgentLauncherWorker = $null
             }
         }
     }

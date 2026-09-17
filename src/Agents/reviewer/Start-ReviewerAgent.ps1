@@ -6497,7 +6497,8 @@ function Test-ReviewerRecoverableMcpFailure {
 function Resolve-ReviewerStartupRepositoryIdentity {
     param([Parameter(Mandatory)][string]$AgencyPath)
 
-    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+    $failedAttempts = 0
+    while ($true) {
         $identitySession = $null
         try {
             $identitySession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
@@ -6514,24 +6515,41 @@ function Resolve-ReviewerStartupRepositoryIdentity {
         }
         catch {
             $reason = $_.Exception.Message
-            if ($attempt -eq 0 -and (Test-ReviewerRecoverableMcpFailure -Message $reason)) {
-                Write-Warning "Reviewer startup repository verification failed; retrying immediately with a fresh ADO session: $reason"
-                if ($script:ReviewerOutputContext) {
-                    Send-ReviewerEvent delivery.retrying -Level warning -Data @{
-                        reason = $reason; summary = 'Retrying startup repository verification.'
-                        outstanding = @('repository identity verification'); retryable = $true
-                        nextRetry = 'immediate fresh ADO session'
-                    } -Message 'Reviewer startup repository verification is retrying with a fresh ADO session.'
-                }
-                continue
+            if (-not (Test-ReviewerRecoverableMcpFailure -Message $reason)) { throw }
+            $failedAttempts++
+            $persistentRetry = [bool]$LauncherWorkerManifest
+            if (-not $persistentRetry -and $failedAttempts -ge 2) { throw }
+            $delaySeconds = if ($persistentRetry) {
+                Get-AgentStartupMcpRetryDelaySeconds -Attempt $failedAttempts -Role reviewer
             }
-            throw
+            else { 0 }
+            $nextRetry = if ($delaySeconds -gt 0) {
+                "in $delaySeconds second(s) with a fresh ADO session"
+            }
+            else { 'immediate fresh ADO session' }
+            Write-Warning "Reviewer startup repository verification failed; retrying $nextRetry (attempt $($failedAttempts + 1)): $reason"
+            if ($script:ReviewerOutputContext) {
+                Send-ReviewerEvent delivery.retrying -Level warning -Data @{
+                    reason = $reason; summary = 'Retrying startup repository verification.'
+                    outstanding = @('repository identity verification'); retryable = $true
+                    attempt = $failedAttempts + 1; retryDelaySeconds = $delaySeconds
+                    nextRetry = $nextRetry
+                } -Message "Reviewer startup repository verification will retry $nextRetry."
+            }
+            if ($identitySession) {
+                Close-AgentMcpSession -Session $identitySession
+                $identitySession = $null
+            }
+            if ($persistentRetry) {
+                Send-AgentLauncherWorkerStartupRetry -Attempt $failedAttempts -DelaySeconds $delaySeconds
+                Wait-AgentLauncherStartupRetry -Seconds $delaySeconds
+            }
+            continue
         }
         finally {
             if ($identitySession) { Close-AgentMcpSession -Session $identitySession }
         }
     }
-    throw 'Reviewer startup repository verification exhausted its retry.'
 }
 
 function Invoke-ReviewerCycle {

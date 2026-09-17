@@ -71,7 +71,9 @@ PowerShellVersion = '7.0'
 # Functions to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no functions to export.
 FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get-AgentSupportedModels', 'Get-AgentSessionIsolationEnvVars', 
                'Initialize-AgentLauncherWorker', 'Test-AgentLauncherCancellationRequested',
-               'Wait-AgentLauncherInterval', 'Close-AgentLauncherWorker', 'Confirm-AgentLauncherWorkerStartup',
+               'Wait-AgentLauncherInterval', 'Wait-AgentLauncherStartupRetry', 'Close-AgentLauncherWorker',
+               'Confirm-AgentLauncherWorkerStartup', 'Send-AgentLauncherWorkerStartupRetry',
+               'Get-AgentStartupMcpRetryDelaySeconds',
                'Get-AgentHarnessCapabilityDescriptor', 'Assert-AgentDashboardLaunchAuthority',
                'Get-AgentWorkIqTargetUrl', 'Get-AgentMissingMcpServers', 
                'Get-AgentLaunchFailureReason', 'Remove-StaleAgentAttempts', 

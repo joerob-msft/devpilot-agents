@@ -18,8 +18,11 @@ export interface AutomationAgentStatus {
   role: AgentRole;
   continuous: boolean;
   intervalSeconds: number | null;
-  state: "starting" | "scanning" | "waiting" | "paused" | "stopped" | "failed";
+  state: "starting" | "retrying" | "scanning" | "waiting" | "paused" | "stopped" | "failed";
   canScanNow: boolean;
+  retryAttempt: number;
+  retryDelaySeconds: number;
+  retryAtUtc: string | null;
 }
 
 export interface AutomationStatus {
@@ -918,7 +921,10 @@ function parseAutomationResponse(record: Record<string, unknown>): AutomationSta
     }
     const agents = record.agents.map((value): AutomationAgentStatus => {
       const agent = asRecord(value);
-      exactResponseFields(agent, ["role", "continuous", "intervalSeconds", "state", "canScanNow"]);
+      exactResponseFields(agent, [
+        "role", "continuous", "intervalSeconds", "state", "canScanNow",
+        "retryAttempt", "retryDelaySeconds", "retryAtUtc",
+      ]);
       const role = roleField(agent, "role");
       if (seen.has(role)) throw new Error("duplicate automation role");
       seen.add(role);
@@ -935,13 +941,30 @@ function parseAutomationResponse(record: Record<string, unknown>): AutomationSta
         intervalSeconds = null;
       }
       const state = agent.state;
-      if (typeof state !== "string" || !["starting", "scanning", "waiting", "paused", "stopped", "failed"].includes(state)) {
+      if (typeof state !== "string" ||
+          !["starting", "retrying", "scanning", "waiting", "paused", "stopped", "failed"].includes(state)) {
         throw new Error("invalid automation state");
       }
       const canScanNow = booleanField(agent, "canScanNow");
       if (canScanNow && (!continuous || state !== "waiting")) throw new Error("invalid scan-now eligibility");
+      const retryAttempt = agent.retryAttempt;
+      const retryDelaySeconds = agent.retryDelaySeconds;
+      const retryAtUtc = agent.retryAtUtc;
+      if (typeof retryAttempt !== "number" || !Number.isSafeInteger(retryAttempt) || retryAttempt < 0 ||
+          typeof retryDelaySeconds !== "number" || !Number.isSafeInteger(retryDelaySeconds) ||
+          retryDelaySeconds < 0 || retryDelaySeconds > 300) {
+        throw new Error("invalid automation retry metadata");
+      }
+      if (state === "retrying") {
+        if (retryAttempt < 1 || typeof retryAtUtc !== "string" || !Number.isFinite(Date.parse(retryAtUtc))) {
+          throw new Error("invalid automation retry state");
+        }
+      } else if (retryAttempt !== 0 || retryDelaySeconds !== 0 || retryAtUtc !== null) {
+        throw new Error("unexpected automation retry metadata");
+      }
       return { role, continuous, intervalSeconds,
-        state: state as AutomationAgentStatus["state"], canScanNow };
+        state: state as AutomationAgentStatus["state"], canScanNow,
+        retryAttempt, retryDelaySeconds, retryAtUtc: retryAtUtc as string | null };
     });
     return { ...envelope, operation: "automation-status", available, scope: available ? "current-launcher" : null, agents };
   }

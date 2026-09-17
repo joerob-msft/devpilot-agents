@@ -361,7 +361,12 @@ input while scanning retained launch history.
 
 Golden still starts **both agents automatically**, without a manual command,
 and waits **900 seconds (15 minutes)** between successful scans by default.
-Failures use the existing retry backoff. The compact automatic-polling status
+Recoverable ADO MCP failures during automatic startup keep retrying with fresh
+sessions and a role-staggered `5s → 15s → 30s → 60s → 120s → 300s` capped
+backoff; an authenticated startup-retry checkpoint keeps the broker alive
+without treating process creation as successful initialization. Configuration,
+policy, attestation, and malformed-response failures remain terminal. Later
+cycle failures use the existing retry backoff. The compact automatic-polling status
 shows the configured cadence and whether agents are scanning, waiting, or
 paused for manual work. Press **`r` Scan now** in a main view to wake this
 launcher's idle pollers early. It does not interrupt running work, queue an

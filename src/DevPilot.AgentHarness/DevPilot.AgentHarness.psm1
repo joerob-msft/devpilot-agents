@@ -1143,8 +1143,10 @@ function Initialize-AgentLauncherWorker {
 
 function Invoke-AgentLauncherCheckpoint {
     param(
-        [Parameter(Mandatory)][ValidateSet('ready', 'started', 'admission', 'acquired', 'released', 'idle', 'scanning')][string]$Phase,
-        [string]$RepositoryKey = '', [int]$PullRequestId = 0, [string]$Role = ''
+        [Parameter(Mandatory)][ValidateSet('ready', 'retrying', 'started', 'admission', 'acquired', 'released', 'idle', 'scanning')][string]$Phase,
+        [string]$RepositoryKey = '', [int]$PullRequestId = 0, [string]$Role = '',
+        [ValidateRange(0, [int]::MaxValue)][int]$RetryAttempt = 0,
+        [ValidateRange(0, 300)][int]$RetryDelaySeconds = 0
     )
     $worker = $script:AgentLauncherWorker
     if (-not $worker) { return }
@@ -1159,10 +1161,19 @@ function Invoke-AgentLauncherCheckpoint {
         $worker.PullRequestId = $PullRequestId
         $worker.WorkId = [Guid]::NewGuid().ToString('D')
     }
+    elseif ($Phase -ceq 'retrying' -and
+        ($RetryAttempt -lt 1 -or $worker.Lease -or $worker.State -or $worker.RepositoryKey -or
+            $worker.PullRequestId -gt 0 -or $worker.WorkId)) {
+        throw '[launcher-control-invalid] Worker startup retry transition is invalid.'
+    }
     $worker.Sequence++
     $record = [ordered]@{
         workerId = $worker.Manifest.workerId; sequence = $worker.Sequence; phase = $Phase
         repositoryKey = $worker.RepositoryKey; pullRequestId = $worker.PullRequestId; workId = $worker.WorkId
+    }
+    if ($Phase -ceq 'retrying') {
+        $record.retryAttempt = $RetryAttempt
+        $record.retryDelaySeconds = $RetryDelaySeconds
     }
     $digest = Get-AgentCanonicalDigest $record
     $proof = Get-AgentAttestationProof -SecretBytes $worker.Secret -Nonce $worker.Manifest.nonce -Digest $digest
@@ -1185,6 +1196,39 @@ function Invoke-AgentLauncherCheckpoint {
 
 function Confirm-AgentLauncherWorkerStartup {
     Invoke-AgentLauncherCheckpoint -Phase started
+}
+
+function Get-AgentStartupMcpRetryDelaySeconds {
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$Attempt,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role
+    )
+    $delays = @(5, 15, 30, 60, 120, 300)
+    $base = $delays[[Math]::Min($Attempt - 1, $delays.Count - 1)]
+    if ($Role -eq 'review-handler' -and $base -lt 300) {
+        $base += [Math]::Min(15, [Math]::Max(3, [Math]::Ceiling($base * 0.2)))
+    }
+    return [Math]::Min(300, [int]$base)
+}
+
+function Send-AgentLauncherWorkerStartupRetry {
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$Attempt,
+        [Parameter(Mandatory)][ValidateRange(0, 300)][int]$DelaySeconds
+    )
+    Invoke-AgentLauncherCheckpoint -Phase retrying -RetryAttempt $Attempt -RetryDelaySeconds $DelaySeconds
+}
+
+function Wait-AgentLauncherStartupRetry {
+    param([Parameter(Mandatory)][ValidateRange(0, 300)][int]$Seconds)
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-AgentLauncherCancellationRequested) {
+            throw '[cancelled] Automatic worker startup retry was cancelled.'
+        }
+        $remainingMilliseconds = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        Start-Sleep -Milliseconds ([Math]::Min(250, $remainingMilliseconds))
+    }
 }
 
 function Test-AgentLauncherCancellationRequested {
@@ -7135,7 +7179,9 @@ function Set-AgentProviderPullRequestVote {
 
 Export-ModuleMember -Function @(
     'Initialize-AgentLauncherWorker', 'Test-AgentLauncherCancellationRequested',
-    'Wait-AgentLauncherInterval', 'Close-AgentLauncherWorker', 'Confirm-AgentLauncherWorkerStartup',
+    'Wait-AgentLauncherInterval', 'Wait-AgentLauncherStartupRetry', 'Close-AgentLauncherWorker',
+    'Confirm-AgentLauncherWorkerStartup', 'Send-AgentLauncherWorkerStartupRetry',
+    'Get-AgentStartupMcpRetryDelaySeconds',
     "Get-DevPilotAgentPath",
     "Resolve-AgentRepositoryRoot",
     "Get-AgentSupportedModels",

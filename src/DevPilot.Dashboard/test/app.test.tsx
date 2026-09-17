@@ -4987,8 +4987,14 @@ async function automationFixture() {
     schemaVersion: 1, requestId: "automation", operation: "automation-status", automationVersion: 1,
     available: true, scope: "current-launcher",
     agents: [
-      { role: "reviewer", continuous: true, intervalSeconds: 900, state: "waiting", canScanNow: true },
-      { role: "review-handler", continuous: true, intervalSeconds: 900, state: "waiting", canScanNow: true },
+      {
+        role: "reviewer", continuous: true, intervalSeconds: 900, state: "waiting", canScanNow: true,
+        retryAttempt: 0, retryDelaySeconds: 0, retryAtUtc: null,
+      },
+      {
+        role: "review-handler", continuous: true, intervalSeconds: 900, state: "waiting", canScanNow: true,
+        retryAttempt: 0, retryDelaySeconds: 0, retryAtUtc: null,
+      },
     ],
   };
   let result: ScanNowResult = {
@@ -5018,6 +5024,13 @@ test("Auto polling presentation uses negotiated intervals and role-specific resu
     { ...agents[0]!, intervalSeconds: 61, state: "scanning" },
     { ...agents[1]!, continuous: false, intervalSeconds: null, state: "stopped", canScanNow: false },
   ] }), "Auto: Reviewer every 61s scanning; Handler once stopped");
+  assert.equal(automationStatusText({ ...fixture.status(), agents: [
+    {
+      ...agents[0]!, state: "retrying", canScanNow: false,
+      retryAttempt: 4, retryDelaySeconds: 60, retryAtUtc: "2026-09-17T20:00:00.000Z",
+    },
+    agents[1]!,
+  ] }), "Auto: Both / every 15m / Reviewer retrying attempt 4 (60s backoff); Handler waiting");
   fixture.setResults([{ role: "reviewer", outcome: "requested" }, { role: "review-handler", outcome: "already-running" }]);
   assert.equal(scanNowResultText(fixture.result()), "Scan: Reviewer wake requested; Handler already working");
   assert.doesNotMatch(automationStatusText(fixture.status()), /Next|countdown|PID/);

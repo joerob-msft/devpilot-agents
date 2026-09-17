@@ -38,17 +38,25 @@ function automationCadence(agent: AutomationAgentStatus): string {
   return `every ${interval}`;
 }
 
+function automationState(agent: AutomationAgentStatus): string {
+  if (agent.state !== "retrying") return agent.state;
+  return `retrying attempt ${agent.retryAttempt} (${agent.retryDelaySeconds}s backoff)`;
+}
+
 export function automationStatusText(status: AutomationStatus): string {
   if (!status.available || status.scope !== "current-launcher") return "Auto: unavailable";
   const first = status.agents[0];
   if (!first) return "Auto: available / no workers reported";
   if (status.agents.every((agent) => automationCadence(agent) === automationCadence(first))) {
     const roles = status.agents.length === 2 ? "Both" : compactRole(first.role);
-    const state = status.agents.every((agent) => agent.state === first.state) ? first.state :
-      status.agents.map((agent) => `${compactRole(agent.role)} ${agent.state}`).join("; ");
+    const state = status.agents.every((agent) => agent.state === first.state &&
+      agent.retryAttempt === first.retryAttempt && agent.retryDelaySeconds === first.retryDelaySeconds)
+      ? automationState(first) :
+      status.agents.map((agent) => `${compactRole(agent.role)} ${automationState(agent)}`).join("; ");
     return `Auto: ${roles} / ${automationCadence(first)} / ${state}`;
   }
-  return `Auto: ${status.agents.map((agent) => `${compactRole(agent.role)} ${automationCadence(agent)} ${agent.state}`).join("; ")}`;
+  return `Auto: ${status.agents.map((agent) =>
+    `${compactRole(agent.role)} ${automationCadence(agent)} ${automationState(agent)}`).join("; ")}`;
 }
 
 export function scanNowResultText(result: ScanNowResult): string {

@@ -2082,13 +2082,14 @@ function Test-HandlerTeamsMaintenanceRecoverableFailure {
 
 function Test-HandlerRecoverableMcpFailure {
     param([Parameter(Mandatory)][string]$Message)
-    return ($Message -match '^(Agent MCP session is closed\.|Could not write to Agent MCP\.|Agent MCP exited before returning a response\.|Agent MCP closed stdout before returning a response\.|Agent MCP response timed out\.)$')
+    return Test-AgentRecoverableMcpTransportFailure -Message $Message
 }
 
 function Resolve-HandlerStartupRepositoryIdentity {
     param([Parameter(Mandatory)][string]$AgencyPath)
 
-    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+    $failedAttempts = 0
+    while ($true) {
         $identitySession = $null
         try {
             $identitySession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
@@ -2104,24 +2105,41 @@ function Resolve-HandlerStartupRepositoryIdentity {
         }
         catch {
             $reason = $_.Exception.Message
-            if ($attempt -eq 0 -and (Test-HandlerRecoverableMcpFailure -Message $reason)) {
-                Write-Warning "Review-handler startup repository verification failed; retrying immediately with a fresh ADO session: $reason"
-                if ($script:HandlerOutputContext) {
-                    Send-HandlerEvent delivery.retrying -Level warning -Data @{
-                        reason = $reason; summary = 'Retrying startup repository verification.'
-                        outstanding = @('repository identity verification'); retryable = $true
-                        nextRetry = 'immediate fresh ADO session'
-                    } -Message 'Review-handler startup repository verification is retrying with a fresh ADO session.'
-                }
-                continue
+            if (-not (Test-HandlerRecoverableMcpFailure -Message $reason)) { throw }
+            $failedAttempts++
+            $persistentRetry = [bool]$LauncherWorkerManifest
+            if (-not $persistentRetry -and $failedAttempts -ge 2) { throw }
+            $delaySeconds = if ($persistentRetry) {
+                Get-AgentStartupMcpRetryDelaySeconds -Attempt $failedAttempts -Role review-handler
             }
-            throw
+            else { 0 }
+            $nextRetry = if ($delaySeconds -gt 0) {
+                "in $delaySeconds second(s) with a fresh ADO session"
+            }
+            else { 'immediate fresh ADO session' }
+            Write-Warning "Review-handler startup repository verification failed; retrying $nextRetry (attempt $($failedAttempts + 1)): $reason"
+            if ($script:HandlerOutputContext) {
+                Send-HandlerEvent delivery.retrying -Level warning -Data @{
+                    reason = $reason; summary = 'Retrying startup repository verification.'
+                    outstanding = @('repository identity verification'); retryable = $true
+                    attempt = $failedAttempts + 1; retryDelaySeconds = $delaySeconds
+                    nextRetry = $nextRetry
+                } -Message "Review-handler startup repository verification will retry $nextRetry."
+            }
+            if ($identitySession) {
+                Close-AgentMcpSession -Session $identitySession
+                $identitySession = $null
+            }
+            if ($persistentRetry) {
+                Send-AgentLauncherWorkerStartupRetry -Attempt $failedAttempts -DelaySeconds $delaySeconds
+                Wait-AgentLauncherStartupRetry -Seconds $delaySeconds
+            }
+            continue
         }
         finally {
             if ($identitySession) { Close-AgentMcpSession -Session $identitySession }
         }
     }
-    throw 'Review-handler startup repository verification exhausted its retry.'
 }
 
 function Invoke-HandlerTeamsMaintenance {

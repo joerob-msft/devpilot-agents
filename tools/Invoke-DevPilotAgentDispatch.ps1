@@ -156,6 +156,8 @@ $pollRequestIdOrder = [Collections.Generic.Queue[string]]::new()
 # requiring a fresh preview. Broker-local, exactly like $drafts.
 $narrowingPreviews = @{}
 $accepting = $true
+[int]$AutomaticStartupInitialDeadlineSeconds = 120
+[int]$AutomaticStartupRetryAttemptBudgetSeconds = 120
 
 function Register-BrokerRequestId {
     <#
@@ -1529,7 +1531,8 @@ function Start-AutomaticWorker {
         Child = $null; Containment = $null; Phase = 'starting'; Sequence = 0
         WorkId = ''; RepositoryKey = ''; PullRequestId = 0
         Deadline = [DateTime]::UtcNow.AddSeconds(30); ExitConfirmed = $false
-        StartupDeadline = [DateTime]::UtcNow.AddSeconds(120); StartupAcknowledged = $false
+        StartupDeadline = [DateTime]::UtcNow.AddSeconds($AutomaticStartupInitialDeadlineSeconds)
+        StartupAcknowledged = $false; RetryAttempt = 0; RetryDelaySeconds = 0; RetryAtUtc = $null
         ExitResult = $null; FailureCode = ''; ExpectedExit = $false; WakePending = $false
     }
     $automaticWorkers[$role] = $entry
@@ -1611,7 +1614,7 @@ function Update-AutomaticWorkers {
             -Digest (Get-AgentCanonicalDigest $r)
         if ($message.proof -cne $proof -or $r.workerId -cne $entry.Manifest.workerId -or
             $r.sequence -ne ($entry.Sequence + 1) -or
-            $r.phase -cnotin @('ready', 'started', 'admission', 'acquired', 'released', 'idle', 'scanning')) {
+            $r.phase -cnotin @('ready', 'retrying', 'started', 'admission', 'acquired', 'released', 'idle', 'scanning')) {
             throw '[launcher-control-invalid] Worker checkpoint authentication failed.'
         }
         $entry.Sequence++
@@ -1625,7 +1628,22 @@ function Update-AutomaticWorkers {
             ($r.phase -ceq 'scanning' -and $entry.Phase -cnotin @('idle', 'waking'))) {
             throw '[launcher-control-invalid] Worker idle interval transition is invalid.'
         }
-        if ($r.phase -ceq 'admission') {
+        if ($r.phase -ceq 'retrying') {
+            if ($entry.StartupAcknowledged -or $entry.Phase -cne 'ready' -or
+                $r.repositoryKey -cne '' -or $r.pullRequestId -ne 0 -or $r.workId -cne '' -or
+                -not (Test-StrictJsonInt -Value $r.retryAttempt -Min 1 -Max ([int]::MaxValue)) -or
+                -not (Test-StrictJsonInt -Value $r.retryDelaySeconds -Min 0 -Max 300)) {
+                throw '[launcher-control-invalid] Worker startup retry checkpoint is invalid.'
+            }
+            $entry.RetryAttempt = [int]$r.retryAttempt
+            $entry.RetryDelaySeconds = [int]$r.retryDelaySeconds
+            $entry.RetryAtUtc = [DateTime]::UtcNow.AddSeconds($entry.RetryDelaySeconds)
+            $entry.StartupDeadline = [DateTime]::UtcNow.AddSeconds(
+                [Math]::Max(
+                    $AutomaticStartupInitialDeadlineSeconds,
+                    $entry.RetryDelaySeconds + $AutomaticStartupRetryAttemptBudgetSeconds))
+        }
+        elseif ($r.phase -ceq 'admission') {
             if ($entry.Phase -cnotin @('started', 'scanning', 'released') -or
                 $r.repositoryKey -isnot [string] -or $r.repositoryKey.Length -gt 512 -or
                 $r.repositoryKey -cnotmatch '^v1:(github|azuredevops):' -or
@@ -1644,19 +1662,21 @@ function Update-AutomaticWorkers {
         elseif ($r.phase -ceq 'released' -and $r.workId -cne $entry.WorkId) {
             throw '[launcher-control-invalid] Worker release checkpoint is invalid.'
         }
-        $entry.Phase = $r.phase
-        if ($r.phase -cne 'idle') { $entry['WakePending'] = $false }
-        $key = Get-ManualTurnKey $entry.RepositoryKey $entry.Spec.role
-        if (($manualTurns.ContainsKey($key) -and $r.phase -cin @('admission', 'acquired', 'released')) -or
-            ($r.phase -cin @('idle', 'scanning') -and (Test-AutomaticManualPriority $entry))) {
-            $action = 'yield'
-            $entry.Phase = 'yielding'
-            $entry['WakePending'] = $false
-        }
-        elseif ($r.phase -ceq 'idle' -and $entry.Spec.continuous -and $entry.WakePending) {
-            $action = 'wake'
-            $entry.WakePending = $false
-            $entry.Phase = 'waking'
+        if ($r.phase -cne 'retrying') {
+            $entry.Phase = $r.phase
+            if ($r.phase -cne 'idle') { $entry['WakePending'] = $false }
+            $key = Get-ManualTurnKey $entry.RepositoryKey $entry.Spec.role
+            if (($manualTurns.ContainsKey($key) -and $r.phase -cin @('admission', 'acquired', 'released')) -or
+                ($r.phase -cin @('idle', 'scanning') -and (Test-AutomaticManualPriority $entry))) {
+                $action = 'yield'
+                $entry.Phase = 'yielding'
+                $entry['WakePending'] = $false
+            }
+            elseif ($r.phase -ceq 'idle' -and $entry.Spec.continuous -and $entry.WakePending) {
+                $action = 'wake'
+                $entry.WakePending = $false
+                $entry.Phase = 'waking'
+            }
         }
         $reply = @{ workerId = $entry.Manifest.workerId; sequence = $entry.Sequence; action = $action }
         $entry.Writer.WriteLine((ConvertTo-AgentCanonicalJson @{
@@ -1666,6 +1686,9 @@ function Update-AutomaticWorkers {
         }))
         if ($r.phase -ceq 'started') {
             $entry.StartupAcknowledged = $true
+            $entry.RetryAttempt = 0
+            $entry.RetryDelaySeconds = 0
+            $entry.RetryAtUtc = $null
             foreach ($turnKey in @($manualTurns.Keys)) {
                 $turn = $manualTurns[$turnKey]
                 if ($turn.Phase -ceq 'resuming' -and $turn.ResumeWorkerId -ceq $entry.Manifest.workerId) {
@@ -1687,6 +1710,7 @@ function Test-AutomaticManualPriority {
 function Get-AutomaticPollingState {
     param([hashtable]$Worker)
     if ($Worker.FailureCode -or $Worker.Phase -ceq 'failed') { return 'failed' }
+    if (-not $Worker.StartupAcknowledged -and [int]$Worker.RetryAttempt -gt 0) { return 'retrying' }
     if (Test-AutomaticManualPriority $Worker) { return 'paused' }
     if ($Worker.ExitConfirmed -or ($Worker.Child -and $Worker.Child.Process.HasExited)) { return 'stopped' }
     if ($Worker.ExpectedExit -or $Worker.Phase -ceq 'yielding') { return 'paused' }
@@ -1719,6 +1743,8 @@ function Invoke-GetAutomationStatus {
             $agents += @{
                 role = $role; continuous = [bool]$worker.Spec.continuous; intervalSeconds = $worker.Spec.IntervalSeconds
                 state = $state; canScanNow = ($state -ceq 'waiting' -and $worker.Spec.continuous -and -not $worker.WakePending)
+                retryAttempt = [int]$worker.RetryAttempt; retryDelaySeconds = [int]$worker.RetryDelaySeconds
+                retryAtUtc = $(if ($worker.RetryAtUtc) { ([DateTime]$worker.RetryAtUtc).ToString('O') } else { $null })
             }
         }
     }
@@ -1738,7 +1764,7 @@ function Invoke-ScanNow {
         if (-not $automaticWorkers.ContainsKey($role)) { continue }
         $worker = $automaticWorkers[$role]
         $state = Get-AutomaticPollingState $worker
-        $outcome = if (-not $worker.Spec.continuous -or $state -cin @('starting', 'stopped', 'failed')) {
+        $outcome = if (-not $worker.Spec.continuous -or $state -cin @('starting', 'retrying', 'stopped', 'failed')) {
             'unavailable'
         }
         elseif ($state -ceq 'paused') { 'manual-priority' }

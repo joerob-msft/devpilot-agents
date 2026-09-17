@@ -24,8 +24,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $reads++
     $response.operation='automation-status'; $response.available=$true
     $response.agents=@(
-      @{role='reviewer';continuous=$true;intervalSeconds=900;state='waiting';canScanNow=$true},
-      @{role='review-handler';continuous=$true;intervalSeconds=900;state='scanning';canScanNow=$false}
+      @{role='reviewer';continuous=$true;intervalSeconds=900;state='waiting';canScanNow=$true;retryAttempt=0;retryDelaySeconds=0;retryAtUtc=$null},
+      @{role='review-handler';continuous=$true;intervalSeconds=900;state='scanning';canScanNow=$false;retryAttempt=0;retryDelaySeconds=0;retryAtUtc=$null}
     )
     switch ($d.mode) {
       'unavailable' {$response.available=$false; $response.scope=$null; $response.agents=@()}
@@ -47,6 +47,16 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       'once-interval' {$response.agents[0].continuous=$false; $response.agents[0].canScanNow=$false}
       'once-wake' {$response.agents[0].continuous=$false; $response.agents[0].intervalSeconds=$null}
       'scanning-wake' {$response.agents[0].state='scanning'}
+      'retrying' {
+        $response.agents[0].state='retrying'; $response.agents[0].canScanNow=$false
+        $response.agents[0].retryAttempt=4; $response.agents[0].retryDelaySeconds=60
+        $response.agents[0].retryAtUtc='2026-09-17T20:00:00.000Z'
+      }
+      'retry-zero' {$response.agents[0].state='retrying'; $response.agents[0].canScanNow=$false}
+      'retry-on-wait' {
+        $response.agents[0].retryAttempt=1; $response.agents[0].retryDelaySeconds=5
+        $response.agents[0].retryAtUtc='2026-09-17T20:00:00.000Z'
+      }
       'unknown-state' {$response.agents[0].state='idle'}
       'bad-wake-type' {$response.agents[0].canScanNow=1}
       'source-failure' {
@@ -59,6 +69,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $response.operation='scan-now-result'
     $response.results=@(@{role='reviewer';outcome='requested'},@{role='review-handler';outcome='already-running'})
     switch ($d.mode) {
+      'retrying' {$response.results[0].outcome='unavailable'}
       'mismatched-results' {$response.results=@(@{role='reviewer';outcome='requested'})}
       'scan-version' {$response.automationVersion=2}
       'scan-role' {$response.results[0].role='foreign'}
@@ -129,10 +140,21 @@ test("status source failure clears previously verified automation availability",
   });
 });
 
+test("retrying automation remains available but cannot be manually woken", async () => {
+  await fixture("retrying", async (client) => {
+    const status = await client.getAutomationStatus();
+    assert.equal(status.agents[0]?.state, "retrying");
+    assert.equal(status.agents[0]?.retryAttempt, 4);
+    assert.equal(status.agents[0]?.retryDelaySeconds, 60);
+    const result = await client.scanNow();
+    assert.equal(result.results[0]?.outcome, "unavailable");
+  });
+});
+
 for (const mode of ["version", "unknown-top", "unknown-agent", "unknown-role", "duplicate-role", "too-many",
   "empty-available", "bad-available", "unavailable-nonempty", "unavailable-scope", "foreign-scope", "low-interval",
   "high-interval", "float-interval", "string-interval", "once-interval", "once-wake", "scanning-wake",
-  "unknown-state", "bad-wake-type"]) {
+  "retry-zero", "retry-on-wait", "unknown-state", "bad-wake-type"]) {
   test(`automation status rejects ${mode}`, async () => {
     await fixture(mode, async (client) => {
       await assert.rejects(client.getAutomationStatus(), /invalid protocol frame/);
