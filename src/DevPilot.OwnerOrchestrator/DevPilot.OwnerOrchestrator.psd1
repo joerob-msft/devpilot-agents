@@ -1,6 +1,6 @@
 @{
     RootModule = 'DevPilot.OwnerOrchestrator.psm1'
-    ModuleVersion = '0.1.0'
+    ModuleVersion = '0.2.0'
     GUID = '81818181-9292-a3a3-b4b4-c5c5c5c5c5c5'
     Author = 'DevPilot Agents contributors'
     CompanyName = 'Unknown'
@@ -18,7 +18,7 @@
     PrivateData = @{
         PSData = @{
             Tags = @('copilot', 'agents', 'owner', 'preview', 'orchestrator', 'powershell')
-            ReleaseNotes = 'Adds the layer 5 preview-only Owner v2 cohort orchestrator and state lifecycle.'
+            ReleaseNotes = 'Adds normalized completed/incomplete observations for zero-unit, advisory, all-unknown, and unavailable replay outcomes.'
         }
     }
 }

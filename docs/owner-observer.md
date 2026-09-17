@@ -4,7 +4,7 @@
 implementations. It does not instrument either implementation, start a model,
 call a provider, mutate evidence, or publish comments or votes.
 
-The shared `owner-observation.v1` shape records implementation and capability
+The shared version 2 Owner observation shape records implementation and capability
 identity, pull request/head/target/rule binding, lifecycle state, checked,
 violation, unknown and uncovered counts, stable findings and anchors when
 available, attempts/model starts/latency, refusal or incomplete reasons,
@@ -60,7 +60,8 @@ Parity input files are normalized observations:
     -CandidatePath C:\observations\owner-v2.json
 ```
 
-The report is deterministic: finding identities are sorted and classified as
-retained, lost or new; subject/rule binding and write mismatches are named;
-completion and count regressions are explicit; and latency is reported as a
-signed delta with `faster`, `slower`, `equal` or `unknown`.
+The report is deterministic: versioned semantic finding keys are sorted and
+classified as retained, lost or new; canonical repository paths and spans are
+compared while raw representations remain hashed audit evidence; provider
+markers are reported separately; and measured zero is distinct from
+unavailable or not-measured telemetry.

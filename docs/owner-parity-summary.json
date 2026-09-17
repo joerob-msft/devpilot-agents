@@ -1,18 +1,20 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "owner-parity-sanitized-summary",
   "scope": "retrospective-offline",
   "sample": {
     "entries": 5,
     "baselineCompleted": 4,
-    "candidateCompleted": 2,
-    "candidateCompletionUnknown": 2,
+    "candidateCompleted": 4,
+    "candidateCompletionUnknown": 1,
     "verifiedMethodFindings": 6,
     "retainedMethodFindings": 0,
     "retentionUnmeasured": 6,
     "structuralMethodMatches": 6,
     "candidateViolations": 6,
-    "eligibleFalsePositives": 0
+    "eligibleFalsePositives": null,
+    "falsePositiveMeasuredEntries": 0,
+    "falsePositiveUnmeasuredEntries": 5
   },
   "gates": [
     {
@@ -33,17 +35,17 @@
     },
     {
       "name": "bindingEquivalence",
-      "status": "failed",
+      "status": "blocked",
       "evidenceCode": "mixed-cohort-evidence",
-      "measured": 32,
-      "failures": 9,
-      "blocked": 3
+      "measured": 38,
+      "failures": 0,
+      "blocked": 1
     },
     {
       "name": "unknownIntegrity",
       "status": "blocked",
       "evidenceCode": "mixed-cohort-evidence",
-      "measured": 12,
+      "measured": 15,
       "failures": 0,
       "blocked": 16
     },
@@ -51,15 +53,15 @@
       "name": "writeIsolation",
       "status": "blocked",
       "evidenceCode": "mixed-cohort-evidence",
-      "measured": 4,
+      "measured": 8,
       "failures": 0,
-      "blocked": 3
+      "blocked": 1
     },
     {
       "name": "latencyAccounting",
       "status": "blocked",
       "evidenceCode": "mixed-cohort-evidence",
-      "measured": 16,
+      "measured": 96,
       "failures": 0,
       "blocked": 12
     },
@@ -67,16 +69,16 @@
       "name": "completionReliability",
       "status": "blocked",
       "evidenceCode": "completion-or-retention-unavailable",
-      "measured": 3,
+      "measured": 4,
       "failures": 0,
-      "blocked": 5
+      "blocked": 4
     },
     {
       "name": "rollbackProof",
-      "status": "failed",
-      "evidenceCode": "v1-root-snapshot-changed",
-      "measured": 4,
-      "failures": 1,
+      "status": "passed",
+      "evidenceCode": "critical-bytes-identical-and-volatile-append-only",
+      "measured": 3261,
+      "failures": 0,
       "blocked": 0
     }
   ],
@@ -85,7 +87,7 @@
     "evidenceCode": "safe-real-model-launcher-unavailable"
   },
   "rollback": {
-    "unchanged": false,
-    "differingFields": 6
+    "unchanged": true,
+    "differingFields": 0
   }
 }

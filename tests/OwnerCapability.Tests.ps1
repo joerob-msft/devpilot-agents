@@ -263,10 +263,14 @@ Describe 'Owner v2 semantic capability' {
 
         $run.Observation.counts.checked | Should -Be 7
         $run.Observation.counts.violations | Should -Be 4
-        $run.Observation.counts.unknown | Should -Be 1
+        $run.Observation.counts.unknown | Should -Be 0
+        $run.Observation.counts.advisory | Should -Be 1
         $run.Observation.counts.uncovered | Should -Be 0
+        $run.Observation.lifecycle.completed | Should -BeTrue
+        $run.Observation.findingsComplete | Should -BeTrue
         $run.Observation.execution.attempts | Should -Be 4
-        $run.Observation.execution.modelStarts | Should -Be 4
+        $run.Observation.execution.modelStarts | Should -Be 'unknown'
+        $run.Observation.measurements.execution.modelStarts.status | Should -Be 'notMeasured'
         $run.Observation.effects.providerWrites | Should -Be 0
         $run.Observation.effects.writeToolInvocations | Should -Be 0
         $run.Observation.effects.dedupe.noOp | Should -Be 0
@@ -286,11 +290,12 @@ Describe 'Owner v2 semantic capability' {
             Should -Be $case.expectedRunnerUnknownCount
         @($run.Result.diagnostics.code) | Should -Contain 'runner-response-invalid'
         $run.Observation.counts.violations | Should -Be 3
-        $run.Observation.counts.unknown | Should -Be 4
+        $run.Observation.counts.unknown | Should -Be 3
+        $run.Observation.counts.advisory | Should -Be 1
         @($run.Observation.findings | Where-Object disposition -CEQ violation).Count |
             Should -Be 3
         @($run.Observation.findings | Where-Object disposition -CEQ unknown).Count |
-            Should -Be 4
+            Should -Be 3
     }
 
     It 'keeps incomplete file, span, and rule evidence unknown without starting the runner' -TestCases @(
@@ -372,7 +377,8 @@ Describe 'Owner v2 semantic capability' {
         @($run.Result.diagnostics.code) | Should -Contain 'construct-unrecognized'
         $run.Result.state | Should -Be 'unknown'
         $run.Observation.counts.violations | Should -Be 8
-        $run.Observation.counts.unknown | Should -Be 2
+        $run.Observation.counts.unknown | Should -Be 1
+        $run.Observation.counts.advisory | Should -Be 1
     }
 
     It 'rejects attribute-argument spoofing and masks multi-line verbatim string contents' {
@@ -425,7 +431,48 @@ Describe 'Owner v2 semantic capability' {
             @($run.Result.validation.assessments |
                     Where-Object assessmentId -Like 'file:*').state |
                 Should -Be @('complete')
+            $run.Observation.lifecycle.completed | Should -BeTrue
+            $run.Observation.findingsComplete | Should -BeTrue
+            $run.Observation.counts.eligible | Should -Be 0
+            $run.Observation.counts.advisory | Should -Be 0
+            $run.Observation.counts.unknown | Should -Be 0
+            $run.Observation.measurements.counts.eligible.status | Should -Be 'measured'
+            $run.Observation.measurements.counts.eligible.value | Should -Be 0
         }
+    }
+
+    It 'completes class-only input as advisory without claiming method compliance' {
+        $case = [ordered]@{
+            id = 'class-only'
+            path = 'src/ClassOnly.cs'
+            lines = @('[TestClass]', '[Owner("advisory")]', 'public class ClassOnly {}')
+            spans = @([ordered]@{ startLine = 1; endLine = 3 })
+        }
+        $run = Invoke-TestOwnerV2Case -Case $case
+
+        $run.Observation.lifecycle.completed | Should -BeTrue
+        $run.Observation.counts.checked | Should -Be 0
+        $run.Observation.counts.eligible | Should -Be 0
+        $run.Observation.counts.advisory | Should -Be 1
+        $run.Observation.counts.violations | Should -Be 0
+        $run.Observation.counts.unknown | Should -Be 0
+    }
+
+    It 'emits an incomplete all-unknown observation with explicit denominators' {
+        $case = Get-TestOwnerV2Case -Id 'adjacent-response-failures'
+        $modes = @{}
+        foreach ($name in @(
+                'ValidFirst', 'Malformed', 'ValidMiddle', 'Omitted', 'Duplicated', 'ValidLast')) {
+            $modes[$name] = 'omitted'
+        }
+        $run = Invoke-TestOwnerV2Case -Case $case -RunnerModes $modes
+
+        $run.Observation.lifecycle.completed | Should -BeFalse
+        $run.Observation.counts.checked | Should -Be 0
+        $run.Observation.counts.eligible | Should -Be 6
+        $run.Observation.counts.advisory | Should -Be 1
+        $run.Observation.counts.unknown | Should -Be 6
+        $run.Observation.counts.uncovered | Should -Be 0
     }
 
     It 'accounts every preview finding in unknown dedupe outcomes' {
@@ -443,16 +490,16 @@ Describe 'Owner v2 semantic capability' {
         @($observation.Keys) | Should -Be @(
             'schemaVersion', 'kind', 'implementation', 'capability', 'subject', 'rule',
             'lifecycle', 'counts', 'findingsComplete', 'findings', 'execution', 'effects',
-            'sourceArtifacts', 'validationErrors'
+            'measurements', 'sourceArtifacts', 'validationErrors'
         )
-        $observation.schemaVersion | Should -Be 1
+        $observation.schemaVersion | Should -Be 2
         $observation.kind | Should -Be 'owner-observation'
         $observation.capability | Should -Be $script:OwnerCapabilityId
         $observation.subject.headCommit | Should -Be ('a' * 40)
         $observation.rule.identity | Should -Match '^rule:[0-9a-f]{64}$'
         $observation.rule.sha256 | Should -Match '^[0-9a-f]{64}$'
         @($observation.findings.disposition | Select-Object -Unique | Sort-Object) |
-            Should -Be @('unknown', 'violation')
+            Should -Be @('violation')
         $observation.sourceArtifacts[0].sha256 | Should -Match '^[0-9a-f]{64}$'
         $observation.lifecycle.pending | Should -BeFalse
         $observation.effects.operatorIntervention | Should -BeTrue

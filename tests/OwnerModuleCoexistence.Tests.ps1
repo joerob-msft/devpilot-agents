@@ -1,5 +1,13 @@
 Describe 'Owner dependency module coexistence' {
-    It 'preserves a global AgentHarness import through <Target> (caller Force=<Force>)' -ForEach @(
+    It 'preserves pre-imported Owner modules through <Target> (caller Force=<Force>)' -ForEach @(
+        @{ Target = 'OwnerObservationContract'; Force = $false }
+        @{ Target = 'OwnerObservationContract'; Force = $true }
+        @{ Target = 'OwnerObserver'; Force = $false }
+        @{ Target = 'OwnerObserver'; Force = $true }
+        @{ Target = 'DevPilot.OwnerCapability'; Force = $false }
+        @{ Target = 'DevPilot.OwnerCapability'; Force = $true }
+        @{ Target = 'DevPilot.OwnerModelRunner'; Force = $false }
+        @{ Target = 'DevPilot.OwnerModelRunner'; Force = $true }
         @{ Target = 'DevPilot.OwnerOrchestrator'; Force = $false }
         @{ Target = 'DevPilot.OwnerOrchestrator'; Force = $true }
         @{ Target = 'DevPilot.OwnerParity'; Force = $false }
@@ -8,14 +16,7 @@ Describe 'Owner dependency module coexistence' {
         param($Target, $Force)
 
         $repoRoot = Split-Path $PSScriptRoot -Parent
-        $targetManifest = switch ($Target) {
-            'DevPilot.OwnerOrchestrator' {
-                Join-Path $repoRoot 'src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1'
-            }
-            'DevPilot.OwnerParity' {
-                Join-Path $repoRoot 'src\DevPilot.OwnerParity\DevPilot.OwnerParity.psd1'
-            }
-        }
+        $targetManifest = Join-Path $repoRoot "src\$Target\$Target.psd1"
         if (-not (Test-Path -LiteralPath $targetManifest -PathType Leaf)) {
             Set-ItResult -Skipped -Because "$Target is introduced by an upper stack layer."
             return
@@ -25,6 +26,7 @@ Describe 'Owner dependency module coexistence' {
         $observerManifest = Join-Path $repoRoot 'src\OwnerObserver\OwnerObserver.psd1'
         $orchestratorManifest = Join-Path $repoRoot `
             'src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1'
+        $parityManifest = Join-Path $repoRoot 'src\DevPilot.OwnerParity\DevPilot.OwnerParity.psd1'
         $caseRoot = Join-Path $TestDrive (
             $Target.Replace('.', '-') + '-' + $Force.ToString().ToLowerInvariant())
         $probePath = Join-Path $caseRoot 'probe.ps1'
@@ -37,6 +39,7 @@ param(
     [Parameter(Mandatory)][string]$HarnessManifest,
     [Parameter(Mandatory)][string]$ObserverManifest,
     [Parameter(Mandatory)][string]$OrchestratorManifest,
+    [Parameter(Mandatory)][string]$ParityManifest,
     [Parameter(Mandatory)][string]$TargetManifest,
     [Parameter(Mandatory)][string]$TargetName,
     [Parameter(Mandatory)][string]$UseForce,
@@ -45,16 +48,20 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Import-Module $HarnessManifest -Global
-$beforeModule = Get-Module DevPilot.AgentHarness
-$beforeCommand = Get-Command Get-DevPilotAgentPath -ErrorAction Stop
-$dependenciesPreserved = $null
-if ($TargetName -ceq 'DevPilot.OwnerParity') {
-    Import-Module $ObserverManifest -Global
-    Import-Module $OrchestratorManifest -Global
-    $beforeObserver = Get-Module OwnerObserver
-    $beforeObserverCommand = Get-Command Test-OwnerObservation -ErrorAction Stop
-    $beforeOrchestrator = Get-Module DevPilot.OwnerOrchestrator
-    $beforeOrchestratorCommand = Get-Command Get-OwnerV2PreviewStatus -ErrorAction Stop
+Import-Module $ObserverManifest -Global
+Import-Module $OrchestratorManifest -Global
+Import-Module $ParityManifest -Global
+$preservedCommands = [ordered]@{
+    'DevPilot.AgentHarness' = 'Get-DevPilotAgentPath'
+    'OwnerObserver' = 'Test-OwnerObservation'
+    'DevPilot.OwnerOrchestrator' = 'Get-OwnerV2PreviewStatus'
+    'DevPilot.OwnerParity' = 'Test-OwnerParityPathIsolation'
+}
+$beforeModules = @{}
+$beforeCommands = @{}
+foreach ($name in $preservedCommands.Keys) {
+    $beforeModules[$name] = Get-Module $name
+    $beforeCommands[$name] = Get-Command $preservedCommands[$name] -ErrorAction Stop
 }
 
 if ($UseForce -ceq 'true') {
@@ -64,27 +71,30 @@ else {
     Import-Module $TargetManifest
 }
 
-$afterModules = @(Get-Module DevPilot.AgentHarness)
-$afterCommand = Get-Command Get-DevPilotAgentPath -ErrorAction SilentlyContinue
 $targetModule = Get-Module $TargetName
-$lifecycleCompatible = $null
-if ($TargetName -ceq 'DevPilot.OwnerParity') {
-    $afterObservers = @(Get-Module OwnerObserver)
-    $afterObserverCommand = Get-Command Test-OwnerObservation -ErrorAction SilentlyContinue
-    $afterOrchestrators = @(Get-Module DevPilot.OwnerOrchestrator)
-    $afterOrchestratorCommand = Get-Command Get-OwnerV2PreviewStatus -ErrorAction SilentlyContinue
-    $dependenciesPreserved =
-        $afterObservers.Count -eq 1 -and
-        [object]::ReferenceEquals($beforeObserver, $afterObservers[0]) -and
-        $null -ne $afterObserverCommand -and
-        [object]::ReferenceEquals($beforeObserverCommand.Module, $afterObserverCommand.Module) -and
-        $afterOrchestrators.Count -eq 1 -and
-        [object]::ReferenceEquals($beforeOrchestrator, $afterOrchestrators[0]) -and
-        $null -ne $afterOrchestratorCommand -and
-        [object]::ReferenceEquals(
-            $beforeOrchestratorCommand.Module,
-            $afterOrchestratorCommand.Module)
+$targetCommands = @{
+    'OwnerObservationContract' = 'New-OwnerMeasurement'
+    'OwnerObserver' = 'Test-OwnerObservation'
+    'DevPilot.OwnerCapability' = 'New-OwnerV2CapabilityAdapter'
+    'DevPilot.OwnerModelRunner' = 'New-OwnerModelReplayRunner'
+    'DevPilot.OwnerOrchestrator' = 'Get-OwnerV2PreviewStatus'
+    'DevPilot.OwnerParity' = 'Test-OwnerParityPathIsolation'
 }
+$targetCommand = Get-Command $targetCommands[$TargetName] -ErrorAction SilentlyContinue
+$modulesPreserved = $true
+$commandsPreserved = $true
+foreach ($name in $preservedCommands.Keys) {
+    if ($name -ceq $TargetName) { continue }
+    $afterModules = @(Get-Module $name)
+    $afterCommand = Get-Command $preservedCommands[$name] -ErrorAction SilentlyContinue
+    $modulesPreserved = $modulesPreserved -and
+        $afterModules.Count -eq 1 -and
+        [object]::ReferenceEquals($beforeModules[$name], $afterModules[0])
+    $commandsPreserved = $commandsPreserved -and
+        $null -ne $afterCommand -and
+        [object]::ReferenceEquals($beforeCommands[$name].Module, $afterCommand.Module)
+}
+$lifecycleCompatible = $null
 $commandWorked = switch ($TargetName) {
     'DevPilot.OwnerOrchestrator' {
         $stateRoot = Join-Path $CaseRoot 'state'
@@ -132,18 +142,15 @@ $commandWorked = switch ($TargetName) {
             $lifecycle.Pending -ceq 'unknown'
         $pathIsolated -and $lifecycleCompatible
     }
+    default { $null -ne $targetCommand }
 }
 
 [pscustomobject]@{
-    HarnessCount = $afterModules.Count
-    SameHarnessModule = $afterModules.Count -eq 1 -and
-        [object]::ReferenceEquals($beforeModule, $afterModules[0])
-    HarnessCommandAvailable = $null -ne $afterCommand
-    SameCommandModule = $null -ne $afterCommand -and
-        [object]::ReferenceEquals($beforeCommand.Module, $afterCommand.Module)
+    ModulesPreserved = $modulesPreserved
+    CommandsPreserved = $commandsPreserved
     TargetLoaded = $null -ne $targetModule
+    TargetCommandAvailable = $null -ne $targetCommand
     TargetCommandWorked = [bool]$commandWorked
-    DependenciesPreserved = $dependenciesPreserved
     LifecycleCompatible = $lifecycleCompatible
 } | ConvertTo-Json -Compress
 '@, [Text.UTF8Encoding]::new($false))
@@ -153,6 +160,7 @@ $commandWorked = switch ($TargetName) {
             -HarnessManifest $harnessManifest `
             -ObserverManifest $observerManifest `
             -OrchestratorManifest $orchestratorManifest `
+            -ParityManifest $parityManifest `
             -TargetManifest $targetManifest `
             -TargetName $Target `
             -UseForce $Force.ToString().ToLowerInvariant() `
@@ -164,14 +172,12 @@ $commandWorked = switch ($TargetName) {
         $result = @($output | Select-Object -Last 1 | ConvertFrom-Json)
 
         $result | Should -HaveCount 1
-        $result[0].HarnessCount | Should -Be 1
-        $result[0].SameHarnessModule | Should -BeTrue
-        $result[0].HarnessCommandAvailable | Should -BeTrue
-        $result[0].SameCommandModule | Should -BeTrue
+        $result[0].ModulesPreserved | Should -BeTrue
+        $result[0].CommandsPreserved | Should -BeTrue
         $result[0].TargetLoaded | Should -BeTrue
+        $result[0].TargetCommandAvailable | Should -BeTrue
         $result[0].TargetCommandWorked | Should -BeTrue
         if ($Target -ceq 'DevPilot.OwnerParity') {
-            $result[0].DependenciesPreserved | Should -BeTrue
             $result[0].LifecycleCompatible | Should -BeTrue
         }
     }
