@@ -255,14 +255,16 @@ function New-OwnerParityGate {
 function Get-OwnerParityFindingMap {
     param([Parameter(Mandatory)][object]$Observation)
     $map = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    foreach ($finding in @($Observation.findings)) {
-        $identity = [string](Get-OwnerParityMember $finding 'identity' '')
-        $disposition = [string](Get-OwnerParityMember $finding 'disposition' '')
+    foreach ($item in @(@($Observation.findings) + @(
+                Get-OwnerParityMember $Observation 'outcomes' @()
+            ))) {
+        $identity = [string](Get-OwnerParityMember $item 'identity' '')
+        $disposition = [string](Get-OwnerParityMember $item 'disposition' '')
         $key = "$disposition|$identity"
         if ($map.ContainsKey($key)) {
-            throw "Observation contains duplicate finding selector '$key'."
+            throw "Observation contains duplicate result selector '$key'."
         }
-        $map[$key] = $finding
+        $map[$key] = $item
     }
     return $map
 }
@@ -626,7 +628,11 @@ function Invoke-OwnerParityGateEvaluation {
         $unknownBlocked++
     }
     if ($Baseline.findingsComplete -ne $true) { $unknownBlocked++ }
-    $candidateUnknowns = @($Candidate.findings | Where-Object disposition -CEQ 'unknown')
+    $candidateUnknowns = @(
+        @($Candidate.findings | Where-Object disposition -CEQ 'unknown') +
+        @((Get-OwnerParityMember $Candidate 'outcomes' @()) |
+            Where-Object state -CEQ 'unknown')
+    )
     $candidateUnknownCount = Get-OwnerParityMember `
         $Candidate.counts 'unknown' $script:OwnerParityUnknown
     if ($Candidate.findingsComplete -ne $true -or

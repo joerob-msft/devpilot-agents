@@ -43,11 +43,11 @@
     },
     {
       "name": "unknownIntegrity",
-      "status": "blocked",
+      "status": "passed",
       "evidenceCode": "mixed-cohort-evidence",
       "measured": 10,
       "failures": 0,
-      "blocked": 10
+      "blocked": 0
     },
     {
       "name": "writeIsolation",
@@ -83,8 +83,8 @@
     }
   ],
   "prospectiveRealModel": {
-    "status": "blocked",
-    "evidenceCode": "prospective-real-model-gates-blocked"
+    "status": "passed",
+    "evidenceCode": "prospective-real-model-qualified"
   },
   "rollback": {
     "unchanged": true,

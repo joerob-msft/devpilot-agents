@@ -266,6 +266,8 @@ Describe 'Owner v2 semantic capability' {
         $run.Observation.counts.unknown | Should -Be 0
         $run.Observation.counts.advisory | Should -Be 1
         $run.Observation.counts.uncovered | Should -Be 0
+        @($run.Observation.outcomes | Where-Object state -CEQ advisory).Count | Should -Be 1
+        @($run.Observation.outcomes | Where-Object writerEligible).Count | Should -Be 0
         $run.Observation.lifecycle.completed | Should -BeTrue
         $run.Observation.findingsComplete | Should -BeTrue
         $run.Observation.execution.attempts | Should -Be 4
@@ -294,7 +296,7 @@ Describe 'Owner v2 semantic capability' {
         $run.Observation.counts.advisory | Should -Be 1
         @($run.Observation.findings | Where-Object disposition -CEQ violation).Count |
             Should -Be 3
-        @($run.Observation.findings | Where-Object disposition -CEQ unknown).Count |
+        @($run.Observation.outcomes | Where-Object state -CEQ unknown).Count |
             Should -Be 3
     }
 
@@ -315,6 +317,7 @@ Describe 'Owner v2 semantic capability' {
         $run.Observation.counts.violations | Should -Be 0
         $run.Observation.findingsComplete | Should -BeFalse
         $run.Observation.counts.uncovered | Should -BeGreaterThan 0
+        @($run.Observation.outcomes | Where-Object state -CEQ uncovered).Count | Should -BeGreaterThan 0
     }
 
     It 'produces stable wrapper identities and changes them when the bound head changes' {
@@ -379,6 +382,7 @@ Describe 'Owner v2 semantic capability' {
         $run.Observation.counts.violations | Should -Be 8
         $run.Observation.counts.unknown | Should -Be 1
         $run.Observation.counts.advisory | Should -Be 1
+        @($run.Observation.outcomes | Where-Object state -CEQ unknown).Count | Should -Be 1
     }
 
     It 'rejects attribute-argument spoofing and masks multi-line verbatim string contents' {
@@ -394,6 +398,7 @@ Describe 'Owner v2 semantic capability' {
         $run.Result.preview.findings.Count | Should -Be 4
         @($run.Result.preview.findings.data.anchor.symbol) |
             Should -Contain 'OwnerIdentifierArgument'
+        @($run.Observation.outcomes | Where-Object { $_.binding.symbol -ceq 'comment' }).Count | Should -Be 0
         @($run.Result.diagnostics.code) | Should -Not -Contain 'construct-unrecognized'
     }
 
@@ -412,6 +417,7 @@ Describe 'Owner v2 semantic capability' {
                 Where-Object state -CEQ unknown).Count |
             Should -Be $case.expectedUnrecognizedMethodCount
         @($run.Result.diagnostics.code) | Should -Contain 'construct-unrecognized'
+        @($run.Observation.outcomes | Where-Object { $_.binding.symbol -ceq 'comment' }).Count | Should -Be 0
         $run.Observation.effects.dedupe.unknown |
             Should -BeGreaterOrEqual $run.Observation.counts.violations
     }
@@ -456,6 +462,41 @@ Describe 'Owner v2 semantic capability' {
         $run.Observation.counts.advisory | Should -Be 1
         $run.Observation.counts.violations | Should -Be 0
         $run.Observation.counts.unknown | Should -Be 0
+        @($run.Observation.outcomes).Count | Should -Be 1
+        $run.Observation.outcomes[0].state | Should -Be 'advisory'
+        $run.Observation.outcomes[0].reason | Should -Be 'class-advisory-only'
+        $run.Observation.outcomes[0].writerEligible | Should -BeFalse
+    }
+
+    It 'exposes ten stable non-eligible construct outcomes without widening method execution' {
+        $case = Get-TestOwnerV2Case -Id 'non-eligible-unknown-parity'
+        $first = Invoke-TestOwnerV2Case -Case $case
+        $second = Invoke-TestOwnerV2Case -Case $case
+
+        @($first.Requests.construct.name) | Should -Be @($case.expectedRunnerMethods)
+        @($first.Observation.outcomes | Where-Object state -CEQ notEligible).Count |
+            Should -Be $case.expectedNotEligibleCount
+        @($first.Observation.outcomes | Where-Object reason -CEQ (
+                    'owner-rule-applies-only-to-test-classes-and-methods'
+                )).Count | Should -Be $case.expectedNotEligibleCount
+        @($first.Observation.outcomes | Where-Object writerEligible).Count | Should -Be 0
+        @($first.Observation.outcomes |
+                Where-Object { $_.binding.symbol -ceq 'Format' }).Count |
+            Should -Be 1
+        @($first.Observation.outcomes |
+                Where-Object state -CEQ notEligible |
+                ForEach-Object identity) |
+            Should -Be @($second.Observation.outcomes |
+                Where-Object state -CEQ notEligible |
+                ForEach-Object identity)
+        @($first.Observation.outcomes |
+                Where-Object state -CEQ notEligible |
+                ForEach-Object semanticKey) |
+            Should -Not -Contain 'unknown'
+        $first.Observation.lifecycle.completed | Should -BeTrue
+        $first.Observation.findingsComplete | Should -BeTrue
+        $first.Observation.counts.unknown | Should -Be 0
+        $first.Observation.counts.violations | Should -Be 1
     }
 
     It 'emits an incomplete all-unknown observation with explicit denominators' {
@@ -473,6 +514,9 @@ Describe 'Owner v2 semantic capability' {
         $run.Observation.counts.advisory | Should -Be 1
         $run.Observation.counts.unknown | Should -Be 6
         $run.Observation.counts.uncovered | Should -Be 0
+        $run.Observation.findings.Count | Should -Be 0
+        @($run.Observation.outcomes | Where-Object state -CEQ unknown).Count |
+            Should -Be 6
     }
 
     It 'accounts every preview finding in unknown dedupe outcomes' {
@@ -489,8 +533,8 @@ Describe 'Owner v2 semantic capability' {
 
         @($observation.Keys) | Should -Be @(
             'schemaVersion', 'kind', 'implementation', 'capability', 'subject', 'rule',
-            'lifecycle', 'counts', 'findingsComplete', 'findings', 'execution', 'effects',
-            'measurements', 'sourceArtifacts', 'validationErrors'
+            'lifecycle', 'counts', 'findingsComplete', 'findings', 'outcomes', 'execution',
+            'effects', 'measurements', 'sourceArtifacts', 'validationErrors'
         )
         $observation.schemaVersion | Should -Be 2
         $observation.kind | Should -Be 'owner-observation'

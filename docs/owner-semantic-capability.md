@@ -31,12 +31,14 @@ files, select a subject, interpret provider state, or recover missing evidence.
 For Owner, the wrapper recognizes changed method declarations carrying
 `TestMethod` or `DataTestMethod`. Methods that already carry `Owner` are
 wrapper-complete and never sent to the runner. Only changed MSTest methods
-without `Owner` become semantic runner units. Helpers, unchanged methods,
-declarations outside complete changed spans, and other constructs are never
-eligible. Attributed classes are represented as advisory `unknown`
-assessments and cannot produce an eligible finding. A changed attributed
-declaration that the bounded recognizer cannot classify is explicit `unknown`,
-never a clear result.
+without `Owner` become semantic runner units. Helpers, unchanged methods, and
+declarations outside complete changed spans are never eligible. Changed
+comments, assignments, and multi-line invocations in a changed test file are
+exposed as stable `notEligible` outcomes without becoming findings or runner
+units. Attributed classes are exposed as advisory outcomes and cannot produce
+an eligible finding. A changed attributed declaration that the bounded
+recognizer cannot classify is an explicit `unknown` outcome, never a clear
+result. Missing file or control evidence is exposed as `uncovered`.
 
 Each runner request contains only:
 
@@ -62,10 +64,13 @@ stable while a different head cannot reuse an old finding identity.
 
 `ConvertTo-OwnerV2Observation` converts a completed facade result into the
 narrow `owner-observation` schema documented by the independent read-only
-observer work. The artifact states lifecycle, bindings, findings, counts,
-unknowns, zero provider/tool writes, and the evidence digest. This module does
-not import observer code or schema files and does not create a branch
-dependency on that work.
+observer work. The artifact separates comment-eligible violation findings from
+non-writer outcomes (`unknown`, `advisory`, `uncovered`, and `notEligible`),
+while preserving canonical subject, rule, capability, path, span, construct,
+and semantic identities wherever evidence permits. The artifact also states
+lifecycle, counts, zero provider/tool writes, and the evidence digest. This
+module does not import observer code or schema files and does not create a
+branch dependency on that work.
 
 The observation is returned in memory. A later integration may persist it
 under a dedicated v2 preview state root and pass that sanitized local artifact
