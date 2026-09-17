@@ -41,12 +41,9 @@ BeforeAll {
         $arguments = @('-NoProfile', '-File', $script:child, $Mode)
         if ($StatePath) { $arguments += $StatePath }
         else { $arguments += '-' }
-        $module = Get-Module DevPilot.OwnerModelRunner
-        $runner = & $module {
-            param($FilePath, $ArgumentList, $Limits)
-            New-OwnerModelTestProcessRunner -FilePath $FilePath `
-                -ArgumentList $ArgumentList -Limits $Limits
-        } $script:pwsh $arguments $Limits
+        $provider = New-OwnerModelFakeProvider -FilePath $script:pwsh `
+            -ArgumentList $arguments
+        $runner = New-OwnerModelProcessRunner -Provider $provider -Limits $Limits
         $response = & $runner.Handler ([pscustomobject]$Request)
         return [pscustomobject]@{
             Runner = $runner
@@ -57,10 +54,12 @@ BeforeAll {
 }
 
 Describe 'Owner bounded model runner' {
-    It 'keeps the public live model launcher unconditionally unavailable' {
+    It 'requires explicit opt-in before any real model launch' {
+        $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
+            -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
         {
-            New-OwnerModelProcessRunner -FilePath $script:pwsh
-        } | Should -Throw '*owner-model-launch-unavailable*'
+            New-OwnerModelProcessRunner -Provider $provider
+        } | Should -Throw '*explicit -EnableRealLaunch*'
     }
 
     It 'returns success, no-findings, mixed verdicts, and explicit model unknowns' {
@@ -86,9 +85,20 @@ Describe 'Owner bounded model runner' {
         $run.Telemetry.refusalReason | Should -Be $Expected
     }
 
+    It 'rejects non-opaque execution-unit identifiers before starting a process' {
+        $provider = New-OwnerModelFakeProvider -FilePath $script:pwsh `
+            -ArgumentList @('-NoProfile', '-File', $script:child, 'valid', '-')
+        $runner = New-OwnerModelProcessRunner -Provider $provider
+        {
+            & $runner.Handler ([pscustomobject]@{ executionUnitId = 'method:raw-name' })
+        } | Should -Throw '*invalid execution-unit reference*'
+        (Get-OwnerModelRunnerTelemetry -Runner $runner).attempts | Should -Be 0
+    }
+
     It 'rejects malformed marker, JSON, and schema deterministically' -TestCases @(
         @{ Mode = 'malformed-marker'; Expected = 'marker-invalid' }
         @{ Mode = 'malformed-json'; Expected = 'json-invalid' }
+        @{ Mode = 'missing-schema'; Expected = 'schema-invalid' }
         @{ Mode = 'malformed-schema'; Expected = 'schema-invalid' }
     ) {
         param($Mode, $Expected)
@@ -104,6 +114,7 @@ Describe 'Owner bounded model runner' {
         @{ Mode = 'wrong-nonce' }
         @{ Mode = 'wrong-digest' }
         @{ Mode = 'wrong-subject' }
+        @{ Mode = 'wrong-model' }
     ) {
         param($Mode)
         $run = Invoke-TestProcessRunner -Mode $Mode -Limits (
@@ -111,6 +122,7 @@ Describe 'Owner bounded model runner' {
         $run.Response.judgment | Should -Be 'unknown'
         $run.Telemetry.attempts | Should -Be 1
         $run.Telemetry.refusalReason | Should -Be 'binding-mismatch'
+        $run.Telemetry.records[0].responseBytesBase64 | Should -BeNullOrEmpty
     }
 
     It 'caps stdout and stderr floods without exposing child content' -TestCases @(
@@ -133,8 +145,8 @@ Describe 'Owner bounded model runner' {
         $run.Response.judgment | Should -Be 'violation'
         $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json -AsHashtable
         $summary.envelopeKeys | Should -Be @(
-            'inputDigest', 'nonce', 'schemaVersion', 'semantics', 'stimulus',
-            'subjectBinding', 'toolCeiling'
+            'inputDigest', 'modelIdentity', 'nonce', 'schemaVersion', 'semantics',
+            'stimulus', 'subjectBinding', 'toolCeiling'
         )
         $summary.stimulusKeys | Should -Be @(
             'capability', 'construct', 'executionUnitId', 'rule', 'schemaVersion', 'semantics'
@@ -149,6 +161,14 @@ Describe 'Owner bounded model runner' {
         $summary.toolCeiling.delegation | Should -BeFalse
         @($summary.sensitiveEnvironmentNames) | Should -Be @()
         $summary.testOnly | Should -Be '1'
+        $summary.currentDirectory | Should -Not -Match [regex]::Escape((Resolve-Path "$PSScriptRoot\..").Path)
+        $summary.envelopeFile | Should -Be 'bounded-stimulus.b64'
+        $summary.commandLineContainsSnippet | Should -BeFalse
+        @($summary.directoryEntries) | Should -Be @(
+            'appdata', 'bounded-stimulus.b64', 'home', 'localappdata', 'temp')
+        @($summary.environmentNames | Where-Object {
+                $_ -match '(?i)(?:token|secret|password|credential|api[_-]?key|github|azure|ado|copilot)'
+            }) | Should -Be @()
         ($summary | ConvertTo-Json -Depth 8 -Compress) |
             Should -Not -Match '(?i)headCommit|targetCommit|anchor|groupRef|eligibility|delivery'
     }
@@ -158,7 +178,7 @@ Describe 'Owner bounded model runner' {
             New-OwnerModelRunnerLimits -MaximumAttemptsPerUnit 1)
         $early.Response.judgment | Should -Be 'unknown'
         $early.Telemetry.attempts | Should -Be 1
-        $early.Telemetry.modelStarts | Should -Be 1
+        $early.Telemetry.modelStarts | Should -Be 0
         $early.Telemetry.refusalReason | Should -Be 'early-exit'
 
         $counter = Join-Path $TestDrive 'retry-count.txt'
@@ -166,7 +186,7 @@ Describe 'Owner bounded model runner' {
             New-OwnerModelRunnerLimits -MaximumAttemptsPerUnit 2)
         $retry.Response.judgment | Should -Be 'violation'
         $retry.Telemetry.attempts | Should -Be 2
-        $retry.Telemetry.modelStarts | Should -Be 2
+        $retry.Telemetry.modelStarts | Should -Be 0
         $retry.Telemetry.refusalReason | Should -Be 'none'
         [int](Get-Content -LiteralPath $counter -Raw) | Should -Be 2
     }
@@ -198,8 +218,8 @@ Describe 'Owner bounded model runner' {
         $pidPath = Join-Path $TestDrive 'descendant.pid'
         $run = Invoke-TestProcessRunner -Mode descendant -StatePath $pidPath -Limits (
             New-OwnerModelRunnerLimits -MaximumAttemptsPerUnit 1 `
-                -ActivityDeadlineMilliseconds 1500 -PerCallDeadlineMilliseconds 3000 `
-                -TotalDeadlineMilliseconds 4000)
+                -ActivityDeadlineMilliseconds 3000 -PerCallDeadlineMilliseconds 5000 `
+                -TotalDeadlineMilliseconds 6000)
         $run.Response.judgment | Should -Be 'unknown'
         $run.Telemetry.refusalReason | Should -Be 'activity-timeout'
         Test-Path -LiteralPath $pidPath | Should -BeTrue
@@ -226,6 +246,37 @@ Describe 'Owner bounded model runner' {
             Should -Not -Match '(?i)filepath|argumentlist|provider|write|shell|web|delegation'
     }
 
+    It 'accepts only a bounded optional rationale' {
+        (Invoke-TestProcessRunner -Mode rationale).Response.judgment | Should -Be 'violation'
+    }
+
+    It 'synthesizes a model-bound replay marker when model identity is supplied' {
+        $request = New-TestModelRequest
+        $record = New-OwnerModelReplayRecord -Request $request -Judgment violation `
+            -ModelIdentity 'model-example'
+        $runner = New-OwnerModelReplayRunner -Fixture (
+            New-OwnerModelReplayFixture -Records @($record))
+
+        (& $runner.Handler ([pscustomobject]$request)).judgment | Should -Be 'violation'
+    }
+
+    It 'replays the exact fake-process response bytes with equivalent judgment' {
+        $request = New-TestModelRequest
+        $fake = Invoke-TestProcessRunner -Mode valid -Request $request
+        $record = New-OwnerModelReplayRecord -Request $request `
+            -Nonce $fake.Telemetry.records[0].nonce `
+            -ModelIdentity $fake.Telemetry.provider.modelIdentity `
+            -ResponseBytes ([Convert]::FromBase64String(
+                $fake.Telemetry.records[0].responseBytesBase64))
+        $replay = New-OwnerModelReplayRunner -Fixture (
+            New-OwnerModelReplayFixture -Records @($record))
+
+        (& $replay.Handler ([pscustomobject]$request)).judgment |
+            Should -Be $fake.Response.judgment
+        (Get-OwnerModelRunnerTelemetry -Runner $replay).records[0].responseBytesBase64 |
+            Should -BeExactly $fake.Telemetry.records[0].responseBytesBase64
+    }
+
     It 'retains a valid replayed unit when a sibling fixture is malformed' {
         $validRequest = New-TestModelRequest -Suffix ('1' * 64)
         $badRequest = New-TestModelRequest -Suffix ('2' * 64)
@@ -241,6 +292,7 @@ Describe 'Owner bounded model runner' {
         $telemetry.attempts | Should -Be 2
         $telemetry.modelStarts | Should -Be 0
         $telemetry.refusalReason | Should -Be 'marker-invalid'
+        $telemetry.records[1].responseBytesBase64 | Should -BeNullOrEmpty
     }
 
     It 'emits complete sanitized telemetry through the existing observation execution shape' {
@@ -298,6 +350,243 @@ Describe 'Owner bounded model runner' {
         $observation.execution.refusalReason | Should -Be 'none'
         $observation.effects.providerWrites | Should -Be 0
         $observation.effects.writeToolInvocations | Should -Be 0
+
+        $indeterminateRunner = New-OwnerSemanticRunner -Name 'indeterminate-start' `
+            -Handler { throw 'not invoked' } -TelemetryProvider {
+                [ordered]@{
+                    attempts = 1
+                    modelStarts = 'unknown'
+                    latencyMs = 1
+                    refusalReason = 'early-exit'
+                }
+            }
+        $indeterminate = ConvertTo-OwnerV2Observation -PipelineResult $pipelineResult `
+            -Runner $indeterminateRunner
+        $indeterminate.execution.modelStarts | Should -Be 'unknown'
+        $indeterminate.measurements.execution.modelStarts.status | Should -Be 'unavailable'
+        $indeterminate.measurements.execution.modelStarts.reason |
+            Should -Be 'model-start-indeterminate'
+    }
+}
+
+Describe 'Owner no-tools model provider' {
+    It 'selects a credential name without scalar indexing and remains fail-closed when absent' {
+        $saved = @{}
+        foreach ($name in @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+            $saved[$name] = [Environment]::GetEnvironmentVariable($name)
+            [Environment]::SetEnvironmentVariable($name, $null)
+        }
+        try {
+            $absent = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
+                -FilePath $script:pwsh
+            $absent.CredentialEnvironmentName | Should -Be 'COPILOT_GITHUB_TOKEN'
+
+            $env:GH_TOKEN = 'gho_testcredentialvalue'
+            $present = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
+                -FilePath $script:pwsh
+            $present.CredentialEnvironmentName | Should -Be 'GH_TOKEN'
+        }
+        finally {
+            foreach ($name in $saved.Keys) {
+                [Environment]::SetEnvironmentVariable($name, $saved[$name])
+            }
+        }
+    }
+
+    It 'locks the Copilot CLI to an exact empty tool and no-session argument contract' {
+        $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
+            -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
+        @($provider.ArgumentPrefix) | Should -Be @(
+            '--silent',
+            '--no-ask-user',
+            '--disallow-temp-dir',
+            '--available-tools=__devpilot_no_such_tool_7f2c17a64a3e4d6b__',
+            '--disable-builtin-mcps',
+            '--no-custom-instructions',
+            '--no-remote',
+            '--no-remote-export',
+            '--no-auto-update',
+            '--no-bash-env',
+            '--no-experimental',
+            '--no-color',
+            '--stream', 'off',
+            '--output-format', 'text',
+            '--log-level', 'none',
+            '--max-autopilot-continues', '1'
+        )
+        foreach ($forbidden in @(
+                '--resume', '--continue', '--connect', '--session-id',
+                '--allow-all', '--allow-all-tools', '--yolo',
+                '--additional-mcp-config', '--enable-mcp-server',
+                '--plugin-dir', '--agent', '--enable-memory', '--add-dir'
+            )) {
+            @($provider.ArgumentPrefix) | Should -Not -Contain $forbidden
+        }
+        Test-Path -LiteralPath $provider.LaunchRoot | Should -BeFalse
+
+        $provider.ArgumentPrefix += '--allow-all-tools'
+        {
+            New-OwnerModelProcessRunner -Provider $provider -EnableRealLaunch
+        } | Should -Throw '*policy was mutated*'
+    }
+
+    It 'uses a strict environment allowlist and maps only the selected credential' {
+        $priorGh = $env:GH_TOKEN
+        $priorAdo = $env:AZURE_DEVOPS_EXT_PAT
+        try {
+            $env:GH_TOKEN = 'gho_testcredentialvalue'
+            $env:AZURE_DEVOPS_EXT_PAT = 'secret-ado-value'
+            $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
+                -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
+            $module = Get-Module DevPilot.OwnerModelRunner
+            $summary = & $module {
+                param($Provider)
+                $directory = New-OwnerModelAttemptDirectory -Provider $Provider
+                try {
+                    $environment = Get-OwnerModelProcessEnvironment -Provider $Provider `
+                        -AttemptDirectory $directory -IncludeCredential
+                    return [ordered]@{
+                        environmentNames = @($environment.Keys | Sort-Object)
+                        credential = $environment.COPILOT_GITHUB_TOKEN
+                        hasSourceCredentialName = $environment.Contains('GH_TOKEN')
+                        hasAdoCredential = $environment.Contains('AZURE_DEVOPS_EXT_PAT')
+                        workingDirectory = $directory
+                    }
+                }
+                finally {
+                    Remove-Item -LiteralPath $directory -Recurse -Force
+                }
+            } $provider
+
+            $summary.credential | Should -BeExactly 'gho_testcredentialvalue'
+            $summary.hasSourceCredentialName | Should -BeFalse
+            $summary.hasAdoCredential | Should -BeFalse
+            $summary.workingDirectory | Should -Not -Match [regex]::Escape(
+                (Resolve-Path "$PSScriptRoot\..").Path)
+            ($summary | ConvertTo-Json -Depth 8 -Compress) |
+                Should -Not -Match 'secret-ado-value'
+        }
+        finally {
+            $env:GH_TOKEN = $priorGh
+            $env:AZURE_DEVOPS_EXT_PAT = $priorAdo
+        }
+    }
+
+    It 'refuses the real provider before placing bounded stimulus in process arguments' {
+        $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
+            -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
+        $message = & (Get-Module DevPilot.OwnerModelRunner) {
+            param($Provider)
+            $directory = New-OwnerModelAttemptDirectory -Provider $Provider
+            try {
+                try {
+                    [void](New-OwnerModelInvocation -Provider $Provider `
+                            -EnvelopeBase64 'private-source-stimulus' `
+                            -AttemptDirectory $directory)
+                    return 'unexpected-success'
+                }
+                catch {
+                    return $_.Exception.Message
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $directory -Recurse -Force
+                Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
+            }
+        } $provider
+
+        $message | Should -BeExactly (
+            '[owner-model-launch-unavailable] ' +
+            'copilot-cli-confidential-prompt-channel-unavailable')
+    }
+
+    It 'uses a stable invocation digest bound to the private stimulus bytes' {
+        $provider = New-OwnerModelFakeProvider -FilePath $script:pwsh `
+            -ArgumentList @('-NoProfile', '-File', $script:child, 'valid', '-')
+        $digests = & (Get-Module DevPilot.OwnerModelRunner) {
+            param($Provider)
+            $values = [Collections.Generic.List[string]]::new()
+            foreach ($envelope in @('same-private-stimulus', 'same-private-stimulus', 'different')) {
+                $directory = New-OwnerModelAttemptDirectory -Provider $Provider
+                try {
+                    $invocation = New-OwnerModelInvocation -Provider $Provider `
+                        -EnvelopeBase64 $envelope -AttemptDirectory $directory
+                    [void]$values.Add($invocation.InvocationDigest)
+                }
+                finally {
+                    Remove-Item -LiteralPath $directory -Recurse -Force
+                    Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
+                }
+            }
+            return @($values)
+        } $provider
+
+        $digests[0] | Should -BeExactly $digests[1]
+        $digests[0] | Should -Not -BeExactly $digests[2]
+    }
+
+    It 'fails closed when the executable cannot prove the Copilot no-tools interface' {
+        $prior = $env:GH_TOKEN
+        try {
+            $env:GH_TOKEN = 'gho_testcredentialvalue'
+            $provider = New-OwnerCopilotCliModelProvider -Model gpt-5.6-sol `
+                -FilePath $script:pwsh -CredentialEnvironmentName GH_TOKEN
+            $preflight = Test-OwnerModelProviderPreflight -Provider $provider
+            $preflight.available | Should -BeFalse
+            $preflight.reason | Should -Be 'copilot-cli-interface-unproven'
+            $preflight.effectiveTools | Should -Be 'not-proven'
+            $preflight.modelCalls | Should -Be 0
+            $preflight.providerWrites | Should -Be 0
+            Test-Path -LiteralPath $provider.LaunchRoot | Should -BeFalse
+            {
+                New-OwnerModelProcessRunner -Provider $provider -EnableRealLaunch
+            } | Should -Throw '*copilot-cli-interface-unproven*'
+        }
+        finally {
+            $env:GH_TOKEN = $prior
+        }
+    }
+
+    It 'rejects a linked launch root instead of following it' {
+        $target = Join-Path $TestDrive 'launch-target'
+        $link = Join-Path $TestDrive 'launch-link'
+        New-Item -ItemType Directory -Path $target | Out-Null
+        $created = $false
+        try {
+            if ($IsWindows) {
+                New-Item -ItemType Junction -Path $link -Target $target -ErrorAction Stop | Out-Null
+            }
+            else {
+                New-Item -ItemType SymbolicLink -Path $link -Target $target -ErrorAction Stop | Out-Null
+            }
+            $created = $true
+        }
+        catch {
+            Set-ItResult -Skipped -Because 'This host cannot create a test link.'
+        }
+        if ($created) {
+            {
+                New-OwnerModelFakeProvider -FilePath $script:pwsh -LaunchRoot $link
+            } | Should -Throw '*must not be a link or reparse point*'
+        }
+    }
+
+    It 'reports fake process starts as measured zero model calls with replay-grade provenance' {
+        $run = Invoke-TestProcessRunner -Mode valid
+        $run.Telemetry.attempts | Should -Be 1
+        $run.Telemetry.modelStarts | Should -Be 0
+        $run.Telemetry.provider.kind | Should -Be 'fake-process'
+        $run.Telemetry.policy.availableTools.Count | Should -Be 0
+        $run.Telemetry.policy.providerWrite | Should -BeFalse
+        $run.Telemetry.records[0].processStarted | Should -BeTrue
+        $run.Telemetry.records[0].modelStarted | Should -BeFalse
+        $run.Telemetry.records[0].inputDigest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $run.Telemetry.records[0].nonce | Should -Match '^[0-9a-f]{36}$'
+        $run.Telemetry.records[0].subjectBinding | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $run.Telemetry.records[0].stdoutDigest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $run.Telemetry.records[0].stderrDigest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $run.Telemetry.records[0].timeout | Should -Be 'none'
+        $run.Telemetry.records[0].responseBytesBase64 | Should -Not -BeNullOrEmpty
     }
 }
 
@@ -305,11 +594,14 @@ Describe 'Owner model runner module surface' {
     It 'exports only bounded runner construction, replay, and telemetry functions' {
         @((Get-Command -Module DevPilot.OwnerModelRunner).Name | Sort-Object) | Should -Be @(
             'Get-OwnerModelRunnerTelemetry',
+            'New-OwnerCopilotCliModelProvider',
+            'New-OwnerModelFakeProvider',
             'New-OwnerModelProcessRunner',
             'New-OwnerModelReplayFixture',
             'New-OwnerModelReplayRecord',
             'New-OwnerModelReplayRunner',
-            'New-OwnerModelRunnerLimits'
+            'New-OwnerModelRunnerLimits',
+            'Test-OwnerModelProviderPreflight'
         )
     }
 }
