@@ -62,6 +62,23 @@ $response = [ordered]@{
 }
 
 switch ($Mode) {
+    'count-valid' {
+        $count = if ($StatePath -and (Test-Path -LiteralPath $StatePath)) {
+            [int][IO.File]::ReadAllText($StatePath)
+        }
+        else { 0 }
+        [IO.File]::WriteAllText($StatePath, [string]($count + 1))
+    }
+    'count-malformed-json' {
+        $count = if ($StatePath -and (Test-Path -LiteralPath $StatePath)) {
+            [int][IO.File]::ReadAllText($StatePath)
+        }
+        else { 0 }
+        [IO.File]::WriteAllText($StatePath, [string]($count + 1))
+        $bytes = [Text.Encoding]::UTF8.GetBytes('{')
+        [Console]::Out.WriteLine('DEV_PILOT_OWNER_RESULT ' + (ConvertTo-Base64Url $bytes))
+        exit 0
+    }
     'no-findings' {
         if ($isRelationEvidence) { $response.responses[0].verdict = 'compliant' }
         else { $response.responses[0].judgment = 'compliant' }

@@ -130,6 +130,19 @@ the preview work, and publishes the record, observation, and sorted index
 atomically per file. Stale running leases can be recovered; malformed records
 are refused.
 
+Record schema 2 owns `modelExecutionState` as a durable execution-phase fact.
+New records start at `notAttempted`; immediately before the first semantic
+runner call, the orchestrator atomically changes the leased record to
+`attempted`. The state never moves backward. Preflight, credential, containment,
+provider availability, and other environment failures before that boundary
+remain explicitly `notAttempted`. Any call that may have reached the model is
+conservatively `attempted`, including crash recovery after the transition.
+An expired running lease already marked `attempted` is closed as
+`interrupted-after-model-attempt` without another model call.
+Legacy schema-1 records are fail-closed unless they are pristine pending records
+with zero attempts and no result or failure, which are upgraded in place to
+schema 2 with `notAttempted`.
+
 ## Preview-only safety
 
 Replay mode composes:
@@ -150,8 +163,21 @@ Live declarations remain off by default. `Invoke-OwnerV2PreviewRun` requires
 the host-only `-EnableLiveModel` switch plus an existing read-only acquisition
 provider. A disabled or not-yet-configured live declaration remains idempotent
 for the same inputs and becomes eligible when the host later supplies the
-missing opt-in or configuration; completed and model-attempted outcomes remain
-terminal. The manifest-derived contract constructs the production acquisition
+missing opt-in or configuration. An incomplete or unknown live record can be
+retried only when its schema-2 execution state is explicitly `notAttempted`,
+attempts remain, all manifest-derived identity and state digests still match,
+and current opt-in, acquisition, and model-provider configuration are present.
+The non-recoverable denylist is limited to durable-state integrity failure,
+model binding mismatch, rule evidence unavailable or misbound, evidence-cap
+exhaustion, relation outcome unknown, and orchestrator refusal. Completed and
+model-attempted outcomes remain terminal; model-runner transport and schema
+retry behavior is unchanged and semantic disagreement is never retried.
+
+Each orchestration attempt with telemetry writes an immutable
+`<identity>.attempt-NNNN.json` audit artifact as well as the current
+`<identity>.json` telemetry view. Repair therefore creates a new bounded record
+without deleting the prior failure evidence. The manifest-derived contract
+constructs the production acquisition
 adapter; the wrapper carries the model id and credential environment name, so
 repository data cannot enable launch. It reuses the Copilot provider, preflight,
 bounded real runner, and fake-provider seam with bounded argv, `effectiveTools:
