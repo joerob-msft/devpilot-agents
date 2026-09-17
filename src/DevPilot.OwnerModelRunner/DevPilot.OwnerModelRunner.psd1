@@ -1,6 +1,6 @@
 @{
     RootModule = 'DevPilot.OwnerModelRunner.psm1'
-    ModuleVersion = '0.4.0'
+    ModuleVersion = '0.5.0'
     GUID = '70707070-8181-9292-a3a3-b4b4b4b4b4b4'
     Author = 'DevPilot Agents contributors'
     CompanyName = 'Unknown'
@@ -16,6 +16,7 @@
         'New-OwnerModelReplayRecord',
         'New-OwnerModelReplayRunner',
         'New-OwnerModelRunnerLimits',
+        'New-RelationEvidenceModelProcessRunner',
         'Test-OwnerModelProviderPreflight'
     )
     CmdletsToExport = @()
@@ -24,7 +25,7 @@
     PrivateData = @{
         PSData = @{
             Tags = @('copilot', 'agents', 'review', 'owner', 'model', 'replay', 'powershell')
-            ReleaseNotes = 'Enables the bounded no-tools runner through supported Copilot CLI prompt mode with explicit local argv exposure provenance.'
+            ReleaseNotes = 'Adds a relation-evidence response contract while preserving the existing bounded Owner prompt, provider, containment, and telemetry path.'
         }
     }
 }

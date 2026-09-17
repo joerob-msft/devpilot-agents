@@ -53,6 +53,7 @@ src/
   DevPilot.OwnerAdapters/    # read-only production/replay acquisition boundary
   DevPilot.OwnerCapability/  # preview-only injected Owner semantic boundary
   DevPilot.OwnerModelRunner/ # fail-closed no-tools preflight, fake process, and replay runner
+  DevPilot.RelationEvidence/ # bounded contextual relation/evidence assessment
   DevPilot.OwnerOrchestrator/ # preview-only v2 cohort state lifecycle
   DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
   OwnerObserver/             # read-only Owner implementation parity adapter
@@ -73,6 +74,9 @@ bounded process/replay adapter in
 [docs/owner-model-runner.md](docs/owner-model-runner.md). The layer 5 preview
 cohort orchestrator is documented in
 [docs/owner-preview-orchestrator.md](docs/owner-preview-orchestrator.md).
+The capability-specific contextual assessment and its sanitized demonstration
+result are documented in
+[docs/relation-evidence-capability.md](docs/relation-evidence-capability.md).
 Its
 [authoritative operating state](docs/owner-preview-orchestrator.md#current-operating-state-authoritative)
 distinguishes code capability, operator deployment, state separation, and

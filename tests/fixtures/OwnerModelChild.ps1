@@ -26,11 +26,31 @@ $envelope = [IO.File]::ReadAllText($EnvelopePath, [Text.Encoding]::UTF8)
 $inputObject = [Text.Encoding]::UTF8.GetString((ConvertFrom-Base64Url $envelope)) |
     ConvertFrom-Json -AsHashtable -Depth 16
 $unitId = [string]$inputObject.stimulus.executionUnitId
-$judgment = if ([string]$inputObject.stimulus.construct.name -match 'Compliant') {
+$isRelationEvidence = [string]$inputObject.stimulus.semantics -ceq 'relation-evidence-judgment-v1'
+$judgment = if ($isRelationEvidence) {
+    'violation'
+}
+elseif ([string]$inputObject.stimulus.construct.name -match 'Compliant') {
     'compliant'
 }
 else {
     'violation'
+}
+$responseItem = if ($isRelationEvidence) {
+    [ordered]@{
+        executionUnitId = $unitId
+        verdict = $judgment
+        citedEvidenceRefs = @(
+            @($inputObject.stimulus.evidence) |
+                Select-Object -First 2 |
+                ForEach-Object { [string]$_.ref }
+        )
+        explanation = 'The supplied relationship evidence supports the bounded verdict.'
+        remediation = 'Make the required behavior independent of incidental prior state.'
+    }
+}
+else {
+    [ordered]@{ executionUnitId = $unitId; judgment = $judgment }
 }
 $response = [ordered]@{
     schemaVersion = 2
@@ -38,24 +58,35 @@ $response = [ordered]@{
     inputDigest = $inputObject.inputDigest
     subjectBinding = $inputObject.subjectBinding
     modelIdentity = $inputObject.modelIdentity
-    responses = @([ordered]@{ executionUnitId = $unitId; judgment = $judgment })
+    responses = @($responseItem)
 }
 
 switch ($Mode) {
-    'no-findings' { $response.responses[0].judgment = 'compliant' }
-    'unknown' { $response.responses[0].judgment = 'unknown' }
+    'no-findings' {
+        if ($isRelationEvidence) { $response.responses[0].verdict = 'compliant' }
+        else { $response.responses[0].judgment = 'compliant' }
+    }
+    'unknown' {
+        if ($isRelationEvidence) {
+            $response.responses[0].verdict = 'unknown'
+            $response.responses[0].citedEvidenceRefs = @()
+        }
+        else { $response.responses[0].judgment = 'unknown' }
+    }
     'omitted' { $response.responses = @() }
     'duplicate' { $response.responses += $response.responses[0] }
     'unknown-ref' {
-        $response.responses = @(
-            [ordered]@{ executionUnitId = ('unit:' + ('f' * 64)); judgment = 'violation' }
-        )
+        $response.responses[0].executionUnitId = 'unit:' + ('f' * 64)
     }
     'wrong-nonce' { $response.nonce = '0' * 36 }
     'wrong-digest' { $response.inputDigest = 'v1:sha256:' + ('0' * 64) }
     'wrong-subject' { $response.subjectBinding = 'v1:sha256:' + ('0' * 64) }
     'wrong-model' { $response.modelIdentity = 'wrong-model' }
-    'rationale' { $response.responses[0].rationale = 'Bounded deterministic rationale.' }
+    'rationale' {
+        if (-not $isRelationEvidence) {
+            $response.responses[0].rationale = 'Bounded deterministic rationale.'
+        }
+    }
     'malformed-marker' {
         [Console]::Out.WriteLine('DEV_PILOT_OWNER_RESULT !!!')
         exit 0

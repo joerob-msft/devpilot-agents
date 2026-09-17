@@ -69,6 +69,12 @@ are retained only as digests. Telemetry reports model-call accounting,
 provider writes as zero, the empty effective tool set, response provenance,
 and no raw prompt.
 
+`New-RelationEvidenceModelProcessRunner` uses this same provider, containment,
+binding, and telemetry path for the capability-specific relation-evidence
+response contract. That contract adds bounded evidence citations, a short
+explanation, and optional remediation direction; it does not expose wrapper
+anchors, severity, policy, finding identity, or write authority.
+
 Run the model-free preflight with:
 
 ```powershell
