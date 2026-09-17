@@ -516,6 +516,68 @@ Describe 'Owner no-tools model provider' {
         }
     }
 
+    It 'keeps isolated Windows session database sidecars below the legacy path limit' {
+        if (-not $IsWindows) {
+            Set-ItResult -Skipped -Because 'The reproduced SQLite path failure is Windows-only.'
+            return
+        }
+        $targetBaseLength = 120
+        $paddingLength = $targetBaseLength - $TestDrive.Length - 1
+        if ($paddingLength -lt 1) {
+            Set-ItResult -Skipped -Because 'The test drive path is already too long for this boundary fixture.'
+            return
+        }
+        $launchRoot = Join-Path $TestDrive ('x' * $paddingLength)
+        $legacyPath = Join-Path (
+            Join-Path (Join-Path $launchRoot ('a' * 32)) ('b' * 32)
+        ) ('home\session-state\' + ('c' * 36) + '\session.db-journal')
+        $legacyPath.Length | Should -BeGreaterThan 259
+
+        $provider = New-OwnerModelFakeProvider -FilePath $script:pwsh `
+            -LaunchRoot $launchRoot
+        $summary = & (Get-Module DevPilot.OwnerModelRunner) {
+            param($Provider)
+            $directory = New-OwnerModelAttemptDirectory -Provider $Provider
+            try {
+                [pscustomobject]@{
+                    privateToken = Split-Path -Leaf $Provider.LaunchRoot
+                    attemptToken = Split-Path -Leaf $directory
+                    journalPath = Join-Path $directory (
+                        'home\session-state\' + ('c' * 36) + '\session.db-journal')
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $directory -Recurse -Force
+                Remove-OwnerModelPrivateLaunchRoot -Provider $Provider
+            }
+        } $provider
+
+        $summary.privateToken | Should -Match '^[A-Za-z0-9_-]{22}$'
+        $summary.attemptToken | Should -Match '^[A-Za-z0-9_-]{22}$'
+        $summary.attemptToken | Should -Not -Be $summary.privateToken
+        $summary.journalPath.Length | Should -BeLessThan 260
+    }
+
+    It 'rejects a Windows launch root that cannot fit isolated session state' {
+        if (-not $IsWindows) {
+            Set-ItResult -Skipped -Because 'The Copilot SQLite path budget is Windows-only.'
+            return
+        }
+        $paddingLength = 150 - $TestDrive.Length - 1
+        if ($paddingLength -lt 1) {
+            Set-ItResult -Skipped -Because 'The test drive path is already too long for this boundary fixture.'
+            return
+        }
+        $provider = New-OwnerModelFakeProvider -FilePath $script:pwsh `
+            -LaunchRoot (Join-Path $TestDrive ('x' * $paddingLength))
+        $provider.Kind = 'copilot-cli'
+        $provider.PublisherIdentity = 'verified-github'
+        Mock -ModuleName DevPilot.OwnerModelRunner Assert-OwnerModelProvider {}
+        { Test-OwnerModelProviderPreflight -Provider $provider } |
+            Should -Throw '*launch root is too long*'
+        Test-Path -LiteralPath $provider.LaunchRoot | Should -BeFalse
+    }
+
     It 'resolves, publisher-verifies, and privately stages the native Copilot executable' {
         if (-not $IsWindows) {
             Set-ItResult -Skipped -Because 'Authenticode publisher identity is Windows-only.'
