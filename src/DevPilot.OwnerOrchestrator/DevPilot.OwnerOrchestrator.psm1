@@ -9,6 +9,7 @@ Import-Module "$PSScriptRoot\..\DevPilot.OwnerCapability\DevPilot.OwnerCapabilit
 Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerModelRunner\DevPilot.OwnerModelRunner.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.RelationEvidence\DevPilot.RelationEvidence.psd1"
 
 $script:OwnerV2ObservationSchemaPath = Join-Path $PSScriptRoot `
     '..\OwnerObserver\schemas\owner-observation.v1.json'
@@ -39,6 +40,7 @@ namespace DevPilot.OwnerOrchestrator
 }
 
 $script:OwnerV2MaximumEntries = 32
+$script:RelationV2MaximumEntries = 10
 $script:OwnerV2DigestPattern = '^v1:sha256:[0-9a-f]{64}$'
 $script:OwnerV2CommitPattern = '^[0-9a-f]{40}$'
 $script:OwnerV2SafeIdPattern = '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
@@ -210,6 +212,13 @@ function ConvertTo-OwnerV2CanonicalJson {
 function Get-OwnerV2Digest {
     param([Parameter(Mandatory)][AllowNull()][object]$Value)
     return 'v1:sha256:' + (Get-AgentCanonicalDigest -InputObject (ConvertTo-OwnerV2JsonValue -Value $Value))
+}
+
+function Get-OwnerV2RawTextDigest {
+    param([Parameter(Mandatory)][string]$Value)
+    return 'v1:sha256:' + [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Value))
+    ).ToLowerInvariant()
 }
 
 function Get-OwnerV2SafeCapabilityLeaf {
@@ -676,6 +685,7 @@ function ConvertTo-OwnerV2Declaration {
         capabilityKey = $contract.Binding.CapabilityKey
     }
     return [pscustomobject][ordered]@{
+        CapabilityKind = 'owner'
         Identity = $identity
         StateDigest = $stateDigest
         Declaration = $declaration
@@ -684,6 +694,228 @@ function ConvertTo-OwnerV2Declaration {
         ReplayRecords = @($replayRecords)
         CapabilityRoot = $null
         ManifestEntry = ConvertTo-OwnerV2JsonValue -Value $Entry
+    }
+}
+
+function Test-RelationV2PathPattern {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][Collections.IDictionary]$Pattern
+    )
+    $value = [string]$Pattern.value
+    if ([string]$Pattern.kind -ceq 'exact') {
+        return $Path -ceq $value
+    }
+    return $Path -ceq $value -or
+        $Path.EndsWith("/$value", [StringComparison]::Ordinal)
+}
+
+function ConvertTo-RelationV2Declaration {
+    param([Parameter(Mandatory)][Collections.IDictionary]$Entry)
+
+    Assert-OwnerV2NoUnsafeShape -Value $Entry
+    Assert-OwnerV2ExactKeys -Value $Entry -Name entry -Expected @(
+        'id', 'subject', 'head', 'target', 'rule', 'capability', 'model', 'config'
+    )
+    Assert-OwnerV2SafeText -Value ([string]$Entry.id) -Name id -MaximumLength 128
+    if ([string]$Entry.id -cnotmatch $script:OwnerV2SafeIdPattern) {
+        throw 'Relation preview entry id must be a safe identifier.'
+    }
+    Assert-OwnerV2ExactKeys -Value $Entry.subject -Name subject -Expected @(
+        'repositoryId', 'projectId', 'pullRequestId'
+    )
+    Assert-OwnerV2ExactKeys -Value $Entry.head -Name head -Expected @('sourceCommit')
+    Assert-OwnerV2ExactKeys -Value $Entry.target -Name target -Expected @(
+        'targetCommit', 'targetRef'
+    )
+    Assert-OwnerV2ExactKeys -Value $Entry.rule -Name rule -Expected @(
+        'id', 'repositoryId', 'path', 'commit', 'section', 'hash', 'length'
+    )
+    Assert-OwnerV2ExactKeys -Value $Entry.capability -Name capability -Expected @('id', 'digest')
+    Assert-OwnerV2ExactKeys -Value $Entry.model -Name model -Expected @('id', 'digest')
+    Assert-OwnerV2ExactKeys -Value $Entry.config -Name config -Expected @(
+        'id', 'digest', 'claimId', 'question', 'severity', 'policy', 'anchorRole', 'selectors'
+    )
+    foreach ($item in @(
+            @{ Value = [string]$Entry.subject.repositoryId; Name = 'subject.repositoryId'; Max = 256 },
+            @{ Value = [string]$Entry.subject.projectId; Name = 'subject.projectId'; Max = 256 },
+            @{ Value = [string]$Entry.target.targetRef; Name = 'target.targetRef'; Max = 512 },
+            @{ Value = [string]$Entry.rule.id; Name = 'rule.id'; Max = 256 },
+            @{ Value = [string]$Entry.rule.repositoryId; Name = 'rule.repositoryId'; Max = 256 },
+            @{ Value = [string]$Entry.rule.path; Name = 'rule.path'; Max = 512 },
+            @{ Value = [string]$Entry.rule.section; Name = 'rule.section'; Max = 256 },
+            @{ Value = [string]$Entry.capability.id; Name = 'capability.id'; Max = 256 },
+            @{ Value = [string]$Entry.model.id; Name = 'model.id'; Max = 128 },
+            @{ Value = [string]$Entry.config.id; Name = 'config.id'; Max = 256 },
+            @{ Value = [string]$Entry.config.claimId; Name = 'config.claimId'; Max = 128 },
+            @{ Value = [string]$Entry.config.question; Name = 'config.question'; Max = 1200 },
+            @{ Value = [string]$Entry.config.policy; Name = 'config.policy'; Max = 128 },
+            @{ Value = [string]$Entry.config.anchorRole; Name = 'config.anchorRole'; Max = 64 }
+        )) {
+        Assert-OwnerV2SafeText -Value $item.Value -Name $item.Name -MaximumLength $item.Max
+    }
+    if ([long]$Entry.subject.pullRequestId -lt 1) {
+        throw 'subject.pullRequestId must be positive.'
+    }
+    Assert-OwnerV2Commit -Value ([string]$Entry.head.sourceCommit) -Name head.sourceCommit
+    Assert-OwnerV2Commit -Value ([string]$Entry.target.targetCommit) -Name target.targetCommit
+    Assert-OwnerV2Commit -Value ([string]$Entry.rule.commit) -Name rule.commit
+    foreach ($item in @(
+            @{ Value = [string]$Entry.rule.hash; Name = 'rule.hash' },
+            @{ Value = [string]$Entry.capability.digest; Name = 'capability.digest' },
+            @{ Value = [string]$Entry.model.digest; Name = 'model.digest' },
+            @{ Value = [string]$Entry.config.digest; Name = 'config.digest' }
+        )) {
+        Assert-OwnerV2Digest -Value $item.Value -Name $item.Name
+    }
+    if ([long]$Entry.rule.length -lt 1 -or [long]$Entry.rule.length -gt 4000) {
+        throw 'rule.length must be between 1 and 4000 bytes.'
+    }
+    if ([string]$Entry.config.severity -cnotin @(
+            'critical', 'high', 'medium', 'low', 'informational'
+        )) {
+        throw 'config.severity is invalid.'
+    }
+    if ([string]$Entry.config.claimId -cnotmatch '^[a-z0-9][a-z0-9_.-]{0,127}$' -or
+        [string]$Entry.config.anchorRole -cnotmatch '^[a-z][a-z0-9-]{0,63}$') {
+        throw 'Relation claim and anchor role identities must use neutral safe identifiers.'
+    }
+
+    $selectors = @($Entry.config.selectors)
+    if ($selectors.Count -lt 1 -or $selectors.Count -gt 16) {
+        throw 'config.selectors must contain 1 to 16 bounded role selectors.'
+    }
+    $roles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $hasTrigger = $false
+    $anchorSelectorRequired = $false
+    $normalizedSelectors = [Collections.Generic.List[object]]::new()
+    foreach ($selector in $selectors) {
+        if ($selector -isnot [Collections.IDictionary]) {
+            throw 'Relation selectors must be dictionaries.'
+        }
+        Assert-OwnerV2ExactKeys -Value $selector -Name selector -Expected @(
+            'role', 'required', 'trigger', 'evidenceType', 'patterns'
+        )
+        $role = [string]$selector.role
+        if ($role -cnotmatch '^[a-z][a-z0-9-]{0,63}$' -or -not $roles.Add($role)) {
+            throw 'Relation selector roles must be unique neutral identifiers.'
+        }
+        if ($selector.required -isnot [bool] -or $selector.trigger -isnot [bool]) {
+            throw "Relation selector '$role' requires Boolean required and trigger values."
+        }
+        if ([bool]$selector.trigger) { $hasTrigger = $true }
+        if ($role -ceq [string]$Entry.config.anchorRole -and [bool]$selector.required) {
+            $anchorSelectorRequired = $true
+        }
+        $evidenceType = [string]$selector.evidenceType
+        if ($evidenceType -cnotin @('source', 'guidance', 'test')) {
+            throw "Relation selector '$role' used an unsupported evidence type."
+        }
+        $patterns = @($selector.patterns)
+        if ($patterns.Count -lt 1 -or $patterns.Count -gt 4) {
+            throw "Relation selector '$role' requires 1 to 4 path patterns."
+        }
+        $normalizedPatterns = [Collections.Generic.List[object]]::new()
+        foreach ($pattern in $patterns) {
+            if ($pattern -isnot [Collections.IDictionary]) {
+                throw "Relation selector '$role' path patterns must be dictionaries."
+            }
+            Assert-OwnerV2ExactKeys -Value $pattern -Name pattern -Expected @('kind', 'value')
+            $kind = [string]$pattern.kind
+            $value = [string]$pattern.value
+            if ($kind -cnotin @('exact', 'suffix') -or
+                [string]::IsNullOrWhiteSpace($value) -or $value.Length -gt 512 -or
+                $value -match '[\r\n*?\[\]\\]' -or $value.StartsWith('/', [StringComparison]::Ordinal) -or
+                $value.Contains('..', [StringComparison]::Ordinal)) {
+                throw "Relation selector '$role' used an unsafe exact or glob-suffix pattern."
+            }
+            [void]$normalizedPatterns.Add([ordered]@{ kind = $kind; value = $value })
+        }
+        [void]$normalizedSelectors.Add([ordered]@{
+                role = $role
+                required = [bool]$selector.required
+                trigger = [bool]$selector.trigger
+                evidenceType = $evidenceType
+                patterns = @($normalizedPatterns)
+            })
+    }
+    if (-not $hasTrigger -or -not $roles.Contains([string]$Entry.config.anchorRole) -or
+        -not $anchorSelectorRequired) {
+        throw 'Relation routing requires a trigger selector and a required anchor role selector.'
+    }
+    $configForDigest = [ordered]@{
+        id = [string]$Entry.config.id
+        claimId = [string]$Entry.config.claimId
+        question = [string]$Entry.config.question
+        severity = [string]$Entry.config.severity
+        policy = [string]$Entry.config.policy
+        anchorRole = [string]$Entry.config.anchorRole
+        selectors = @($normalizedSelectors | Sort-Object { [string]$_.role })
+    }
+    if ((Get-OwnerV2Digest -Value $configForDigest) -cne [string]$Entry.config.digest) {
+        throw 'config.digest did not match the bounded relation routing declaration.'
+    }
+    $normalizedConfig = [ordered]@{} + $configForDigest
+    $normalizedConfig['digest'] = [string]$Entry.config.digest
+    $normalizedEntry = [ordered]@{
+        id = [string]$Entry.id
+        mode = 'live'
+        subject = ConvertTo-OwnerV2JsonValue -Value $Entry.subject
+        head = ConvertTo-OwnerV2JsonValue -Value $Entry.head
+        target = ConvertTo-OwnerV2JsonValue -Value $Entry.target
+        rule = ConvertTo-OwnerV2JsonValue -Value $Entry.rule
+        capability = ConvertTo-OwnerV2JsonValue -Value $Entry.capability
+        model = ConvertTo-OwnerV2JsonValue -Value $Entry.model
+        config = ConvertTo-OwnerV2JsonValue -Value $normalizedConfig
+    }
+    $acquisitionPayloadDigest = Get-OwnerV2Digest -Value ([ordered]@{
+            subject = $normalizedEntry.subject
+            head = $normalizedEntry.head
+            target = $normalizedEntry.target
+            rule = $normalizedEntry.rule
+            selectors = $normalizedEntry.config.selectors
+        })
+    $contractEntry = [ordered]@{} + $normalizedEntry
+    $contractEntry['acquisition'] = [ordered]@{ payloadDigest = $acquisitionPayloadDigest }
+    $contract = New-OwnerV2AcquisitionContract -Entry $contractEntry
+    $declarationForDigest = [ordered]@{
+        schemaVersion = 1
+        kind = 'relation-v2-preview-declaration'
+        mode = 'live'
+        subject = $normalizedEntry.subject
+        head = $normalizedEntry.head
+        target = $normalizedEntry.target
+        rule = $normalizedEntry.rule
+        capability = $normalizedEntry.capability
+        model = $normalizedEntry.model
+        config = $normalizedEntry.config
+        acquisitionPayloadDigest = $acquisitionPayloadDigest
+    }
+    $stateDigest = Get-OwnerV2Digest -Value $declarationForDigest
+    $identity = $stateDigest.Substring(10)
+    $declaration = [ordered]@{} + $declarationForDigest
+    $declaration['stateDigest'] = $stateDigest
+    $declaration['facadeBinding'] = [ordered]@{
+        bindingId = $contract.Binding.BindingId
+        subjectKey = $contract.Binding.SubjectKey
+        headKey = $contract.Binding.HeadKey
+        ruleKey = $contract.Binding.RuleKey
+        capabilityKey = $contract.Binding.CapabilityKey
+    }
+    return [pscustomobject][ordered]@{
+        CapabilityKind = 'relation'
+        Identity = $identity
+        StateDigest = $stateDigest
+        Declaration = $declaration
+        Evidence = [ordered]@{
+            schemaVersion = 1
+            kind = 'relation-v2-live-acquisition-pin'
+            acquisitionPayloadDigest = $acquisitionPayloadDigest
+        }
+        Contract = $contract
+        ReplayRecords = @()
+        CapabilityRoot = $null
+        ManifestEntry = ConvertTo-OwnerV2JsonValue -Value $normalizedEntry
     }
 }
 
@@ -696,23 +928,39 @@ function Read-OwnerV2Manifest {
     $manifest = Get-Content -LiteralPath $resolved -Raw | ConvertFrom-Json -AsHashtable -Depth 64
     Assert-OwnerV2NoUnsafeShape -Value $manifest
     Assert-OwnerV2ExactKeys -Value $manifest -Name manifest -Expected @('schemaVersion', 'kind', 'entries')
-    if ([int]$manifest.schemaVersion -ne 1 -or [string]$manifest.kind -cne 'owner-v2-preview-cohort') {
-        throw 'Owner v2 preview manifest must use schemaVersion 1 and kind owner-v2-preview-cohort.'
+    $kind = [string]$manifest.kind
+    if ([int]$manifest.schemaVersion -ne 1 -or
+        $kind -cnotin @('owner-v2-preview-cohort', 'relation-v2-preview-cohort')) {
+        throw 'Preview manifest must use schemaVersion 1 and a supported bounded cohort kind.'
     }
     $entries = @($manifest.entries)
-    if ($entries.Count -lt 1 -or $entries.Count -gt $script:OwnerV2MaximumEntries) {
-        throw "Owner v2 preview manifest must contain 1 to $script:OwnerV2MaximumEntries entries."
+    $maximumEntries = if ($kind -ceq 'relation-v2-preview-cohort') {
+        $script:RelationV2MaximumEntries
     }
-    $declarations = @($entries | ForEach-Object { ConvertTo-OwnerV2Declaration -Entry $_ } |
+    else {
+        $script:OwnerV2MaximumEntries
+    }
+    if ($entries.Count -lt 1 -or $entries.Count -gt $maximumEntries) {
+        throw "Preview manifest must contain 1 to $maximumEntries entries."
+    }
+    $declarations = @($entries | ForEach-Object {
+            if ($kind -ceq 'relation-v2-preview-cohort') {
+                ConvertTo-RelationV2Declaration -Entry $_
+            }
+            else {
+                ConvertTo-OwnerV2Declaration -Entry $_
+            }
+        } |
         Sort-Object -Property StateDigest)
     $manifestDigest = Get-OwnerV2Digest -Value ([ordered]@{
             schemaVersion = 1
-            kind = 'owner-v2-preview-cohort'
+            kind = $kind
             entries = @($declarations | ForEach-Object { $_.Declaration })
         })
     return [pscustomobject][ordered]@{
         Path = $resolved
         Digest = $manifestDigest
+        Kind = $kind
         Entries = @($declarations)
     }
 }
@@ -945,6 +1193,396 @@ function Test-OwnerV2LiveRetryEligible {
             )
         }
         default { return $false }
+    }
+}
+
+function New-RelationV2UnavailableObservation {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][string]$Reason,
+        [ValidateSet('incomplete', 'unknown')][string]$Status = 'incomplete'
+    )
+    return [ordered]@{
+        schemaVersion = 1
+        kind = 'relation-evidence-observation'
+        implementation = [ordered]@{ id = 'relation-v2-preview-orchestrator'; version = '0.1' }
+        capability = ConvertTo-OwnerV2JsonValue -Value $Entry.Declaration.capability
+        subject = [ordered]@{
+            repositoryId = [string]$Entry.Declaration.subject.repositoryId
+            projectId = [string]$Entry.Declaration.subject.projectId
+            pullRequestId = [long]$Entry.Declaration.subject.pullRequestId
+            sourceCommit = [string]$Entry.Declaration.head.sourceCommit
+            targetCommit = [string]$Entry.Declaration.target.targetCommit
+            targetRef = [string]$Entry.Declaration.target.targetRef
+        }
+        rule = [ordered]@{
+            id = [string]$Entry.Declaration.rule.id
+            digest = [string]$Entry.Declaration.rule.hash
+        }
+        lifecycle = [ordered]@{
+            status = $Status
+            completed = $false
+            incomplete = $Status -ceq 'incomplete'
+            unknown = $Status -ceq 'unknown'
+        }
+        counts = [ordered]@{
+            claims = 1
+            violations = 0
+            compliant = 0
+            unknown = 1
+            notApplicable = 0
+        }
+        findingsComplete = $false
+        findings = @()
+        outcomes = @(
+            [ordered]@{
+                assessmentId = 'relation:unavailable'
+                state = 'unknown'
+                data = [ordered]@{ state = 'unknown'; reason = $Reason }
+                writerEligible = $false
+            }
+        )
+        execution = [ordered]@{
+            attempts = 0
+            modelStarts = 0
+            modelCalls = 0
+            latencyMs = 0
+            refusalReason = $Reason
+            cost = [ordered]@{ status = 'unavailable'; reason = 'provider-cost-unavailable' }
+            records = @()
+        }
+        effects = [ordered]@{
+            providerWrites = 0
+            writeToolInvocations = 0
+            effectiveTools = @()
+            deliveryAuthorized = $false
+        }
+        budgets = [ordered]@{
+            maximumEvidenceBytes = 10000
+            maximumModelInputBytes = 9000
+        }
+        evidenceDigest = $null
+        requestDigest = $null
+        sourceArtifacts = @()
+        limitations = @('static-source-assessment', 'runtime-behavior-unverified')
+        validationErrors = @()
+    }
+}
+
+function New-RelationV2LiveOutcome {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][string]$Reason,
+        [ValidateSet('incomplete', 'unknown')][string]$State = 'incomplete',
+        [AllowNull()][object]$Telemetry
+    )
+    return [pscustomobject]@{
+        Observation = New-RelationV2UnavailableObservation -Entry $Entry -Reason $Reason `
+            -Status $State
+        Telemetry = $Telemetry
+        State = $State
+        Reason = $Reason
+    }
+}
+
+function Get-RelationV2AcquisitionSnapshot {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][object]$Provider
+    )
+    $adapter = New-OwnerProductionAcquisitionAdapter -Contract $Entry.Contract `
+        -Provider $Provider -Name 'relation-v2-production-acquisition'
+    $values = @(& $adapter.Handler ([pscustomobject][ordered]@{
+                schemaVersion = 1
+                binding = $Entry.Contract.Binding
+            }))
+    if ($values.Count -ne 1 -or $values[0] -isnot [Collections.IDictionary]) {
+        throw 'Relation acquisition did not return one bounded provider snapshot.'
+    }
+    return ConvertTo-OwnerV2JsonValue -Value $values[0]
+}
+
+function New-RelationV2RequestFromSnapshot {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][Collections.IDictionary]$Snapshot
+    )
+    $ruleUnits = @($Snapshot.evidenceUnits | Where-Object {
+            [string]$_.unitId -ceq 'rule'
+        })
+    if ($ruleUnits.Count -ne 1 -or [string]$ruleUnits[0].state -cne 'complete' -or
+        $ruleUnits[0].data.content -isnot [string]) {
+        return [pscustomobject]@{ Request = $null; Reason = 'rule-evidence-unavailable' }
+    }
+    $ruleText = [string]$ruleUnits[0].data.content
+    if ([Text.Encoding]::UTF8.GetByteCount($ruleText) -ne [long]$Entry.Declaration.rule.length -or
+        (Get-OwnerV2RawTextDigest -Value $ruleText) -cne [string]$Entry.Declaration.rule.hash) {
+        return [pscustomobject]@{ Request = $null; Reason = 'rule-evidence-binding-mismatch' }
+    }
+    $fileUnits = @($Snapshot.evidenceUnits | Where-Object {
+            ([string]$_.unitId).StartsWith('file:', [StringComparison]::Ordinal)
+        })
+    $selectedByRole = [Collections.Generic.Dictionary[string,object]]::new(
+        [StringComparer]::Ordinal)
+    $selectorResults = [Collections.Generic.List[object]]::new()
+    $missingRequired = $false
+    $routingUnknown = $false
+    $triggerMatched = $false
+    foreach ($selector in @($Entry.Declaration.config.selectors)) {
+        $matchingUnits = [Collections.Generic.List[object]]::new()
+        foreach ($unit in $fileUnits) {
+            $path = [string]$unit.data.path
+            $matched = $false
+            foreach ($pattern in @($selector.patterns)) {
+                if (Test-RelationV2PathPattern -Path $path -Pattern $pattern) {
+                    $matched = $true
+                    break
+                }
+            }
+            if ($matched) { [void]$matchingUnits.Add($unit) }
+        }
+        $role = [string]$selector.role
+        $selected = if ($matchingUnits.Count -eq 1) { $matchingUnits[0] } else { $null }
+        if ($matchingUnits.Count -gt 1) { $routingUnknown = $true }
+        if ($null -eq $selected -and [bool]$selector.required) { $missingRequired = $true }
+        if ($null -ne $selected -and [bool]$selector.trigger) { $triggerMatched = $true }
+        if ($null -ne $selected) { $selectedByRole[$role] = $selected }
+        [void]$selectorResults.Add([ordered]@{
+                selector = $selector
+                selected = $selected
+            })
+    }
+    $groups = [Collections.Generic.SortedDictionary[string,object]]::new(
+        [StringComparer]::Ordinal)
+    $roleRefs = [Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($result in $selectorResults) {
+        $selected = $result.selected
+        if ($null -eq $selected) { continue }
+        $selector = $result.selector
+        $role = [string]$selector.role
+        $key = [string]$selected.unitId + [char]0 + [string]$selector.evidenceType
+        if (-not $groups.ContainsKey($key)) {
+            $groups[$key] = [ordered]@{
+                selected = $selected
+                type = [string]$selector.evidenceType
+                ref = "evidence:$role"
+                roles = [Collections.Generic.List[string]]::new()
+            }
+        }
+        [void]$groups[$key].roles.Add($role)
+        $roleRefs[$role] = [string]$groups[$key].ref
+    }
+    $slots = [Collections.Generic.List[object]]::new()
+    foreach ($result in $selectorResults) {
+        $selector = $result.selector
+        $role = [string]$selector.role
+        [void]$slots.Add([ordered]@{
+                role = $role
+                evidenceRef = $(if ($roleRefs.ContainsKey($role)) { $roleRefs[$role] } else { $null })
+                required = [bool]$selector.required
+            })
+    }
+    $evidenceRefs = [Collections.Generic.List[object]]::new()
+    foreach ($group in $groups.Values) {
+        $selected = $group.selected
+        $content = $selected.data.content
+        $complete = [string]$selected.state -ceq 'complete' -and $content -is [string]
+        $spans = @($selected.data.spans)
+        $startLine = if ($spans.Count) {
+            [int](($spans | ForEach-Object { [int]$_.startLine } |
+                    Measure-Object -Minimum).Minimum)
+        }
+        else { 1 }
+        $endLine = if ($spans.Count) {
+            [int](($spans | ForEach-Object { [int]$_.endLine } |
+                    Measure-Object -Maximum).Maximum)
+        }
+        elseif ($complete) {
+            [Math]::Max(1, ([regex]::Matches([string]$content, "`n").Count + 1))
+        }
+        else { 1 }
+        [void]$evidenceRefs.Add([ordered]@{
+                ref = [string]$group.ref
+                type = [string]$group.type
+                path = [string]$selected.data.path
+                span = [ordered]@{ startLine = $startLine; endLine = $endLine }
+                digest = $(if ($complete) {
+                        Get-OwnerV2Digest -Value ([string]$content)
+                    }
+                    else {
+                        [string]$selected.data.sourceDigest
+                    })
+                provenance = [ordered]@{
+                    repositoryId = [string]$Entry.Declaration.subject.repositoryId
+                    commit = [string]$Entry.Declaration.head.sourceCommit
+                    sourceKind = 'repository'
+                }
+                roleLabels = @($group.roles | Sort-Object -CaseSensitive)
+                state = $(if ($complete) { 'complete' } else { 'unknown' })
+                content = $(if ($complete) { [string]$content } else { $null })
+            })
+    }
+    $evidenceBytes = [long]((
+            @($evidenceRefs | Where-Object state -CEQ 'complete' | ForEach-Object {
+                    [Text.Encoding]::UTF8.GetByteCount([string]$_.content)
+                }) | Measure-Object -Sum
+        ).Sum)
+    if ($evidenceBytes -gt 10000) {
+        foreach ($evidence in $evidenceRefs) {
+            $evidence.state = 'unknown'
+            $evidence.content = $null
+        }
+        $missingRequired = $true
+    }
+    $applicability = if ($missingRequired -or $routingUnknown) {
+        'unknown'
+    }
+    elseif (-not $triggerMatched) {
+        'not-applicable'
+    }
+    else {
+        'applicable'
+    }
+    $anchorRole = [string]$Entry.Declaration.config.anchorRole
+    $anchorUnit = if ($selectedByRole.ContainsKey($anchorRole)) {
+        $selectedByRole[$anchorRole]
+    }
+    elseif ($fileUnits.Count) {
+        $fileUnits[0]
+    }
+    else {
+        $null
+    }
+    $anchorSpans = @($(if ($null -ne $anchorUnit) { $anchorUnit.data.spans }))
+    $anchorPath = if ($null -ne $anchorUnit) {
+        [string]$anchorUnit.data.path
+    }
+    else {
+        [string]$Entry.Declaration.rule.path
+    }
+    $anchorStart = if ($anchorSpans.Count) {
+        [int](($anchorSpans | ForEach-Object { [int]$_.startLine } |
+                Measure-Object -Minimum).Minimum)
+    }
+    else { 1 }
+    $anchorEnd = if ($anchorSpans.Count) {
+        [int](($anchorSpans | ForEach-Object { [int]$_.endLine } |
+                Measure-Object -Maximum).Maximum)
+    }
+    else { $anchorStart }
+    $limits = New-RelationEvidenceLimits -MaximumEvidenceRefs 16 `
+        -MaximumEvidenceBytes 10000 -MaximumModelInputBytes 9000
+    $request = New-RelationEvidenceRequest `
+        -RepositoryId ([string]$Entry.Declaration.subject.repositoryId) `
+        -ProjectId ([string]$Entry.Declaration.subject.projectId) `
+        -PullRequestId ([long]$Entry.Declaration.subject.pullRequestId) `
+        -SourceCommit ([string]$Entry.Declaration.head.sourceCommit) `
+        -TargetCommit ([string]$Entry.Declaration.target.targetCommit) `
+        -TargetRef ([string]$Entry.Declaration.target.targetRef) `
+        -CapabilityId ([string]$Entry.Declaration.capability.id) `
+        -CapabilityDigest ([string]$Entry.Declaration.capability.digest) `
+        -RuleId ([string]$Entry.Declaration.rule.id) `
+        -RuleDigest (Get-OwnerV2Digest -Value $ruleText) `
+        -RuleText $ruleText `
+        -EvidenceRefs @($evidenceRefs) `
+        -Claims @(
+            [ordered]@{
+                claimId = [string]$Entry.Declaration.config.claimId
+                question = [string]$Entry.Declaration.config.question
+                applicability = $applicability
+                slots = @($slots)
+                anchorCandidateIds = @('selected-anchor')
+                severity = [string]$Entry.Declaration.config.severity
+                policy = [string]$Entry.Declaration.config.policy
+            }
+        ) `
+        -AnchorCandidates @(
+            [ordered]@{
+                anchorId = 'selected-anchor'
+                path = $anchorPath
+                startLine = $anchorStart
+                endLine = $anchorEnd
+                symbol = "role:$anchorRole"
+            }
+        ) `
+        -Limits $limits
+    return [pscustomobject]@{
+        Request = $request
+        Reason = $(if ($evidenceBytes -gt 10000) { 'evidence-cap-exhausted' } else { $null })
+    }
+}
+
+function Invoke-RelationV2Live {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][bool]$EnableLiveModel,
+        [AllowNull()][object]$AcquisitionProvider,
+        [AllowNull()][object]$ModelProvider,
+        [AllowNull()][string]$Model,
+        [AllowNull()][string]$CredentialEnvironmentName
+    )
+    if (-not $EnableLiveModel) {
+        return New-RelationV2LiveOutcome -Entry $Entry -Reason 'live-model-disabled'
+    }
+    if ($null -eq $AcquisitionProvider) {
+        return New-RelationV2LiveOutcome -Entry $Entry -Reason 'acquisition-provider-unavailable'
+    }
+    $provider = $ModelProvider
+    if ($null -eq $provider) {
+        if ([string]::IsNullOrWhiteSpace($Model) -or
+            [string]::IsNullOrWhiteSpace($CredentialEnvironmentName)) {
+            return New-RelationV2LiveOutcome -Entry $Entry `
+                -Reason 'live-model-configuration-missing'
+        }
+        $provider = New-OwnerCopilotCliModelProvider -Model $Model `
+            -CredentialEnvironmentName $CredentialEnvironmentName
+    }
+    $preflight = Test-OwnerModelProviderPreflight -Provider $provider
+    if ([string]$preflight.modelIdentity -cne [string]$Entry.Declaration.model.id) {
+        return New-RelationV2LiveOutcome -Entry $Entry -Reason 'model-binding-mismatch'
+    }
+    if (-not [bool]$preflight.available) {
+        $reason = [string]$preflight.reason
+        return New-RelationV2LiveOutcome -Entry $Entry -Reason $reason `
+            -Telemetry (New-OwnerV2PreflightTelemetry -Preflight $preflight -Reason $reason)
+    }
+
+    $snapshot = Get-RelationV2AcquisitionSnapshot -Entry $Entry -Provider $AcquisitionProvider
+    $built = New-RelationV2RequestFromSnapshot -Entry $Entry -Snapshot $snapshot
+    if ($null -eq $built.Request) {
+        $unavailable = New-RelationV2LiveOutcome -Entry $Entry -Reason ([string]$built.Reason) `
+            -State unknown -Telemetry (New-OwnerV2PreflightTelemetry -Preflight $preflight `
+                -Reason ([string]$built.Reason))
+        $unavailable | Add-Member -NotePropertyName Acquisition -NotePropertyValue $snapshot
+        $unavailable | Add-Member -NotePropertyName Request -NotePropertyValue $null
+        return $unavailable
+    }
+    $runner = New-RelationEvidenceModelProcessRunner -Provider $provider `
+        -Limits (New-OwnerModelRunnerLimits -MaximumAttemptsPerUnit 1) -EnableRealLaunch
+    $request = $built.Request
+    $result = Invoke-OwnerReviewPipeline -Binding $request.Binding `
+        -AcquisitionAdapter (New-RelationEvidenceAcquisitionAdapter -Request $request) `
+        -CapabilityAdapter (New-RelationEvidenceCapabilityAdapter -Runner $runner -Limits $request.Limits)
+    $observation = ConvertTo-RelationEvidenceObservation -PipelineResult $result -Runner $runner `
+        -ImplementationId 'relation-v2-preview-orchestrator' -ImplementationVersion '0.1'
+    $observation['requestDigest'] = [string]$request.RequestDigest
+    $observation.rule['modelDigest'] = [string]$observation.rule.digest
+    $observation.rule.digest = [string]$Entry.Declaration.rule.hash
+    Assert-OwnerV2PipelineNoWrites -PipelineResult $result -Observation $observation
+    $telemetry = New-OwnerV2PersistedTelemetry `
+        -Telemetry (Get-OwnerModelRunnerTelemetry -Runner $runner) -Preflight $preflight
+    $unknown = @($observation.outcomes | Where-Object state -CEQ 'unknown').Count -gt 0
+    return [pscustomobject]@{
+        Observation = $observation
+        Telemetry = $telemetry
+        State = $(if ($unknown) { 'unknown' } else { 'completed' })
+        Reason = $(if ($unknown) {
+                if ($built.Reason) { [string]$built.Reason } else { 'relation-outcome-unknown' }
+            }
+            else { $null })
+        Acquisition = $snapshot
+        Request = $request.Request
     }
 }
 
@@ -1254,6 +1892,8 @@ function Invoke-OwnerV2PreviewRun {
         $outcome = $null
         $observation = $null
         $telemetry = $null
+        $relationAcquisition = $null
+        $relationRequest = $null
         $finalState = 'unknown'
         $reason = $null
         try {
@@ -1275,14 +1915,30 @@ function Invoke-OwnerV2PreviewRun {
                 throw 'Declaration digest did not match the manifest entry.'
             }
             if ([string]$entry.Declaration.mode -ceq 'live') {
-                $outcome = Invoke-OwnerV2Live -Entry $entry `
-                    -EnableLiveModel ([bool]$EnableLiveModel) `
-                    -AcquisitionProvider $LiveAcquisitionProvider `
-                    -ModelProvider $LiveModelProvider `
-                    -Model $LiveModel `
-                    -CredentialEnvironmentName $LiveCredentialEnvironmentName
+                $outcome = if ([string]$entry.CapabilityKind -ceq 'relation') {
+                    Invoke-RelationV2Live -Entry $entry `
+                        -EnableLiveModel ([bool]$EnableLiveModel) `
+                        -AcquisitionProvider $LiveAcquisitionProvider `
+                        -ModelProvider $LiveModelProvider `
+                        -Model $LiveModel `
+                        -CredentialEnvironmentName $LiveCredentialEnvironmentName
+                }
+                else {
+                    Invoke-OwnerV2Live -Entry $entry `
+                        -EnableLiveModel ([bool]$EnableLiveModel) `
+                        -AcquisitionProvider $LiveAcquisitionProvider `
+                        -ModelProvider $LiveModelProvider `
+                        -Model $LiveModel `
+                        -CredentialEnvironmentName $LiveCredentialEnvironmentName
+                }
                 $observation = $outcome.Observation
                 $telemetry = $outcome.Telemetry
+                $acquisitionProperty = $outcome.PSObject.Properties['Acquisition']
+                $requestProperty = $outcome.PSObject.Properties['Request']
+                $relationAcquisition = if ($null -ne $acquisitionProperty) {
+                    $acquisitionProperty.Value
+                }
+                $relationRequest = if ($null -ne $requestProperty) { $requestProperty.Value }
                 $finalState = [string]$outcome.State
                 $reason = [string]$outcome.Reason
             }
@@ -1300,24 +1956,32 @@ function Invoke-OwnerV2PreviewRun {
             }
         }
         catch {
-            $observation = New-OwnerV2LiveUnavailableObservation -Entry $entry `
-                -Reason 'orchestrator-refusal'
-            $observation.lifecycle.status = 'unknown'
-            $observation.lifecycle.completed = 'unknown'
-            $observation.lifecycle.incomplete = 'unknown'
-            $observation.lifecycle.pending = 'unknown'
-            $observation.execution.attempts = [int]$record.attempts
-            $observation.execution.modelStarts = 'unknown'
-            $observation.execution.latencyMs = 'unknown'
-            $observation.execution.refusalReason = 'orchestrator-refusal'
-            $observation.execution.incompleteReason = 'orchestrator-refusal'
-            $observation.measurements.execution.attempts =
-                New-OwnerMeasurement -Status measured -Value ([int]$record.attempts)
-            $observation.measurements.execution.modelStarts =
-                New-OwnerMeasurement -Status unavailable -Reason 'orchestrator-refusal'
-            $observation.measurements.execution.latencyMs =
-                New-OwnerMeasurement -Status unavailable -Reason 'orchestrator-refusal'
-            $observation.validationErrors = @([string]$_.Exception.Message)
+            if ([string]$entry.CapabilityKind -ceq 'relation') {
+                $observation = New-RelationV2UnavailableObservation -Entry $entry `
+                    -Reason 'orchestrator-refusal' -Status unknown
+                $observation.execution.attempts = [int]$record.attempts
+                $observation['validationErrors'] = @([string]$_.Exception.Message)
+            }
+            else {
+                $observation = New-OwnerV2LiveUnavailableObservation -Entry $entry `
+                    -Reason 'orchestrator-refusal'
+                $observation.lifecycle.status = 'unknown'
+                $observation.lifecycle.completed = 'unknown'
+                $observation.lifecycle.incomplete = 'unknown'
+                $observation.lifecycle.pending = 'unknown'
+                $observation.execution.attempts = [int]$record.attempts
+                $observation.execution.modelStarts = 'unknown'
+                $observation.execution.latencyMs = 'unknown'
+                $observation.execution.refusalReason = 'orchestrator-refusal'
+                $observation.execution.incompleteReason = 'orchestrator-refusal'
+                $observation.measurements.execution.attempts =
+                    New-OwnerMeasurement -Status measured -Value ([int]$record.attempts)
+                $observation.measurements.execution.modelStarts =
+                    New-OwnerMeasurement -Status unavailable -Reason 'orchestrator-refusal'
+                $observation.measurements.execution.latencyMs =
+                    New-OwnerMeasurement -Status unavailable -Reason 'orchestrator-refusal'
+                $observation.validationErrors = @([string]$_.Exception.Message)
+            }
             $finalState = 'unknown'
             $reason = 'orchestrator-refusal'
         }
@@ -1338,6 +2002,37 @@ function Invoke-OwnerV2PreviewRun {
                         reason = 'reservation-lost'
                     })
                 continue
+            }
+            if ($null -ne $relationAcquisition) {
+                    $acquisitionPath = Join-Path (Join-Path $capabilityRoot 'evidence') `
+                        "$identity.acquisition.json"
+                    [void](Write-OwnerV2AtomicJson -Path $acquisitionPath `
+                        -Value $relationAcquisition -Immutable)
+                    $acquisitionSha = ([Convert]::ToHexString(
+                            [Security.Cryptography.SHA256]::HashData(
+                                [IO.File]::ReadAllBytes($acquisitionPath)))).ToLowerInvariant()
+                    $observation.sourceArtifacts = @($observation.sourceArtifacts) + @(
+                        [ordered]@{
+                            kind = 'relation-live-acquisition'
+                            sha256 = $acquisitionSha
+                            signature = 'not-applicable'
+                        }
+                    )
+            }
+            if ($null -ne $relationRequest) {
+                    $requestPath = Join-Path (Join-Path $capabilityRoot 'evidence') `
+                        "$identity.request.json"
+                    [void](Write-OwnerV2AtomicJson -Path $requestPath -Value $relationRequest -Immutable)
+                    $requestSha = ([Convert]::ToHexString(
+                            [Security.Cryptography.SHA256]::HashData(
+                                [IO.File]::ReadAllBytes($requestPath)))).ToLowerInvariant()
+                    $observation.sourceArtifacts = @($observation.sourceArtifacts) + @(
+                        [ordered]@{
+                            kind = 'relation-model-request'
+                            sha256 = $requestSha
+                            signature = 'not-applicable'
+                        }
+                    )
             }
             if ($null -ne $telemetry) {
                 [void](Write-OwnerV2AtomicJson -Path $telemetryPath -Value $telemetry)

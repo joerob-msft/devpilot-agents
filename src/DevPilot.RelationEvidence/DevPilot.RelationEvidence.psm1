@@ -1146,6 +1146,10 @@ function ConvertTo-RelationEvidenceObservation {
             modelCalls = Get-RelationMember -Value $telemetry -Name modelCalls
             latencyMs = Get-RelationMember -Value $telemetry -Name latencyMs
             refusalReason = [string](Get-RelationMember -Value $telemetry -Name refusalReason)
+            cost = [ordered]@{
+                status = 'unavailable'
+                reason = 'provider-cost-unavailable'
+            }
             records = $observationRecords
         }
         effects = [ordered]@{
@@ -1156,6 +1160,9 @@ function ConvertTo-RelationEvidenceObservation {
         }
         budgets = Get-RelationMember -Value $declaration -Name budgets
         evidenceDigest = [string](Get-RelationMember -Value $evidence -Name evidenceDigest)
+        sourceArtifacts = @()
+        limitations = @('static-source-assessment', 'runtime-behavior-unverified')
+        validationErrors = @()
     }
 }
 

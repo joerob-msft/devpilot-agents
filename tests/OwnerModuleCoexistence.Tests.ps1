@@ -298,4 +298,213 @@ foreach ($name in $preservedCommands.Keys) {
         $result[0].CommandsPreserved | Should -BeTrue
         $result[0].StatusWorked | Should -BeTrue
     }
+
+    It 'preserves pre-imported modules through the relation wrapper (caller Force=<Force>)' -ForEach @(
+        @{ Force = $false }
+        @{ Force = $true }
+    ) {
+        param($Force)
+
+        $repoRoot = Split-Path $PSScriptRoot -Parent
+        $moduleNames = @(
+            'DevPilot.AgentHarness',
+            'OwnerObservationContract',
+            'DevPilot.OwnerPipeline',
+            'DevPilot.OwnerCapability',
+            'DevPilot.OwnerAdapters',
+            'DevPilot.OwnerModelRunner',
+            'DevPilot.RelationEvidence',
+            'DevPilot.OwnerOrchestrator',
+            'OwnerObserver',
+            'DevPilot.OwnerParity'
+        )
+        $manifests = @(
+            foreach ($name in $moduleNames) {
+                Join-Path $repoRoot "src\$name\$name.psd1"
+            }
+        )
+        $orchestratorManifest = Join-Path $repoRoot `
+            'src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1'
+        $wrapperPath = Join-Path $repoRoot 'tools\Invoke-RelationV2Preview.ps1'
+        $caseRoot = Join-Path $TestDrive "relation-wrapper-$($Force.ToString().ToLowerInvariant())"
+        $probePath = Join-Path $caseRoot 'probe.ps1'
+        $manifestPath = Join-Path $caseRoot 'cohort.json'
+        $stateRoot = Join-Path $caseRoot 'state'
+        [void](New-Item -ItemType Directory -Path $caseRoot -Force)
+        [IO.File]::WriteAllText($probePath, @'
+param(
+    [Parameter(Mandatory)][string]$ManifestList,
+    [Parameter(Mandatory)][string]$OrchestratorManifest,
+    [Parameter(Mandatory)][string]$WrapperPath,
+    [Parameter(Mandatory)][string]$ManifestPath,
+    [Parameter(Mandatory)][string]$StateRoot,
+    [Parameter(Mandatory)][string]$UseForce
+)
+$ErrorActionPreference = 'Stop'
+foreach ($manifest in $ManifestList.Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
+    Import-Module $manifest -Global
+}
+$preservedCommands = [ordered]@{
+    'DevPilot.AgentHarness' = 'Get-DevPilotAgentPath'
+    'OwnerObservationContract' = 'New-OwnerMeasurement'
+    'DevPilot.OwnerPipeline' = 'New-OwnerPipelineBinding'
+    'DevPilot.OwnerCapability' = 'New-OwnerV2CapabilityAdapter'
+    'DevPilot.OwnerAdapters' = 'New-OwnerProductionAcquisitionAdapter'
+    'DevPilot.OwnerModelRunner' = 'New-RelationEvidenceModelProcessRunner'
+    'DevPilot.RelationEvidence' = 'New-RelationEvidenceRequest'
+    'DevPilot.OwnerOrchestrator' = 'Get-OwnerV2PreviewStatus'
+    'OwnerObserver' = 'Test-OwnerObservation'
+    'DevPilot.OwnerParity' = 'Test-OwnerParityPathIsolation'
+}
+$preservedApiHubCommands = @(
+    'Invoke-AgentGitHubApi',
+    'Get-AgentProviderPullRequestSnapshot',
+    'Invoke-AgentWorkIqTool'
+)
+$beforeModules = @{}
+$beforeCommands = @{}
+foreach ($name in $preservedCommands.Keys) {
+    $beforeModules[$name] = Get-Module $name
+    $beforeCommands[$name] = Get-Command $preservedCommands[$name] -ErrorAction Stop
+}
+$beforeApiHubCommands = @{}
+foreach ($name in $preservedApiHubCommands) {
+    $beforeApiHubCommands[$name] = Get-Command $name -ErrorAction Stop
+}
+
+if ($UseForce -ceq 'true') {
+    Import-Module $OrchestratorManifest -Force
+}
+else {
+    Import-Module $OrchestratorManifest
+}
+
+$orchestrator = Get-Module DevPilot.OwnerOrchestrator
+$selectors = @(
+    [ordered]@{
+        role = 'sanitizer'
+        required = $true
+        trigger = $true
+        evidenceType = 'source'
+        patterns = @([ordered]@{ kind = 'exact'; value = 'src/public-response.cs' })
+    }
+)
+$configBody = [ordered]@{
+    id = 'coexistence-routing-v1'
+    claimId = 'cache-independent-sanitization'
+    question = 'Does every cache state apply response sanitization?'
+    severity = 'high'
+    policy = 'preview-only'
+    anchorRole = 'sanitizer'
+    selectors = $selectors
+}
+$digest = {
+    param($Value)
+    & $orchestrator {
+        param($InputValue)
+        Get-OwnerV2Digest -Value $InputValue
+    } $Value
+}
+$ruleText = 'Public response sanitization must not depend on cache metadata.'
+$ruleHash = 'v1:sha256:' + [Convert]::ToHexString(
+    [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($ruleText))
+).ToLowerInvariant()
+$cohort = [ordered]@{
+    schemaVersion = 1
+    kind = 'relation-v2-preview-cohort'
+    entries = @([ordered]@{
+        id = 'coexistence-relation'
+        subject = [ordered]@{
+            repositoryId = 'repository-example'
+            projectId = 'project-example'
+            pullRequestId = 43
+        }
+        head = [ordered]@{ sourceCommit = 'a' * 40 }
+        target = [ordered]@{
+            targetCommit = 'b' * 40
+            targetRef = 'refs/heads/main'
+        }
+        rule = [ordered]@{
+            id = 'public-response-sanitization-v1'
+            repositoryId = 'rules-example'
+            path = 'rules/public-response-sanitization.md'
+            commit = 'c' * 40
+            section = 'cache-independent-sanitization'
+            hash = $ruleHash
+            length = [Text.Encoding]::UTF8.GetByteCount($ruleText)
+        }
+        capability = [ordered]@{
+            id = 'relation-contextual-review-v1'
+            digest = & $digest 'relation-contextual-review-v1'
+        }
+        model = [ordered]@{
+            id = 'deterministic-fake-process'
+            digest = & $digest 'deterministic-fake-process'
+        }
+        config = [ordered]@{} + $configBody + @{
+            digest = & $digest $configBody
+        }
+    })
+}
+[IO.File]::WriteAllText(
+    $ManifestPath,
+    (ConvertTo-Json -InputObject $cohort -Depth 32),
+    [Text.UTF8Encoding]::new($false))
+
+[void](& $WrapperPath prepare-run -StateRoot $StateRoot `
+        -ManifestPath $ManifestPath -MaxAttempts 1)
+$status = & $WrapperPath status -StateRoot $StateRoot -ManifestPath $ManifestPath
+
+$modulesPreserved = $true
+$commandsPreserved = $true
+foreach ($name in $preservedCommands.Keys) {
+    if ($UseForce -ceq 'true' -and $name -ceq 'DevPilot.OwnerOrchestrator') {
+        continue
+    }
+    $afterModules = @(Get-Module $name)
+    $afterCommand = Get-Command $preservedCommands[$name] -ErrorAction SilentlyContinue
+    $modulesPreserved = $modulesPreserved -and
+        $afterModules.Count -eq 1 -and
+        [object]::ReferenceEquals($beforeModules[$name], $afterModules[0])
+    $commandsPreserved = $commandsPreserved -and
+        $null -ne $afterCommand -and
+        [object]::ReferenceEquals($beforeCommands[$name].Module, $afterCommand.Module)
+}
+foreach ($name in $preservedApiHubCommands) {
+    $afterCommand = Get-Command $name -ErrorAction SilentlyContinue
+    $commandsPreserved = $commandsPreserved -and
+        $null -ne $afterCommand -and
+        [object]::ReferenceEquals($beforeApiHubCommands[$name].Module, $afterCommand.Module)
+}
+
+[pscustomobject]@{
+    ModulesPreserved = $modulesPreserved
+    CommandsPreserved = $commandsPreserved
+    StatusWorked = [string]$status.kind -ceq 'owner-v2-preview-status'
+    RecordState = [string]$status.records[0].state
+} | ConvertTo-Json -Compress
+'@, [Text.UTF8Encoding]::new($false))
+
+        $arguments = @(
+            '-NoLogo', '-NoProfile', '-NonInteractive',
+            '-File', $probePath,
+            '-ManifestList', ($manifests -join ';'),
+            '-OrchestratorManifest', $orchestratorManifest,
+            '-WrapperPath', $wrapperPath,
+            '-ManifestPath', $manifestPath,
+            '-StateRoot', $stateRoot,
+            '-UseForce', $Force.ToString().ToLowerInvariant()
+        )
+        $output = & (Get-Process -Id $PID).Path @arguments
+        if ($LASTEXITCODE -ne 0) {
+            throw ($output | Out-String)
+        }
+        $result = @($output | Select-Object -Last 1 | ConvertFrom-Json)
+
+        $result | Should -HaveCount 1
+        $result[0].ModulesPreserved | Should -BeTrue
+        $result[0].CommandsPreserved | Should -BeTrue
+        $result[0].StatusWorked | Should -BeTrue
+        $result[0].RecordState | Should -Be 'incomplete'
+    }
 }
