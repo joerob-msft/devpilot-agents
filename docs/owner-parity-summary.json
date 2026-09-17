@@ -4,80 +4,80 @@
   "scope": "prospective-real-model",
   "sample": {
     "entries": 5,
-    "baselineCompleted": 4,
-    "candidateCompleted": 4,
-    "candidateCompletionUnknown": 1,
-    "verifiedMethodFindings": 6,
-    "retainedMethodFindings": 6,
+    "baselineCompleted": 5,
+    "candidateCompleted": 5,
+    "candidateCompletionUnknown": 0,
+    "verifiedMethodFindings": 2,
+    "retainedMethodFindings": 2,
     "retentionUnmeasured": 0,
-    "structuralMethodMatches": 6,
-    "candidateViolations": 6,
+    "structuralMethodMatches": 2,
+    "candidateViolations": 11,
     "eligibleFalsePositives": 0,
-    "falsePositiveMeasuredEntries": 4,
-    "falsePositiveUnmeasuredEntries": 1
+    "falsePositiveMeasuredEntries": 5,
+    "falsePositiveUnmeasuredEntries": 0
   },
   "gates": [
     {
       "name": "findingRetention",
-      "status": "blocked",
+      "status": "passed",
       "evidenceCode": "mixed-cohort-evidence",
-      "measured": 6,
+      "measured": 2,
       "failures": 0,
-      "blocked": 1
+      "blocked": 0
     },
     {
       "name": "eligibleFalsePositives",
-      "status": "blocked",
-      "evidenceCode": "mixed-cohort-evidence",
-      "measured": 6,
+      "status": "passed",
+      "evidenceCode": "zero-new-eligible-false-positives",
+      "measured": 11,
       "failures": 0,
-      "blocked": 1
+      "blocked": 0
     },
     {
       "name": "bindingEquivalence",
-      "status": "blocked",
-      "evidenceCode": "mixed-cohort-evidence",
-      "measured": 38,
+      "status": "passed",
+      "evidenceCode": "canonical-semantic-bindings-equal",
+      "measured": 45,
       "failures": 0,
-      "blocked": 1
+      "blocked": 0
     },
     {
       "name": "unknownIntegrity",
       "status": "blocked",
       "evidenceCode": "mixed-cohort-evidence",
-      "measured": 15,
+      "measured": 10,
       "failures": 0,
-      "blocked": 16
+      "blocked": 10
     },
     {
       "name": "writeIsolation",
-      "status": "blocked",
-      "evidenceCode": "mixed-cohort-evidence",
-      "measured": 8,
+      "status": "passed",
+      "evidenceCode": "zero-provider-and-tool-writes",
+      "measured": 10,
       "failures": 0,
-      "blocked": 1
+      "blocked": 0
     },
     {
       "name": "latencyAccounting",
-      "status": "blocked",
-      "evidenceCode": "mixed-cohort-evidence",
-      "measured": 96,
+      "status": "passed",
+      "evidenceCode": "measurement-state-explicit",
+      "measured": 120,
       "failures": 0,
-      "blocked": 12
+      "blocked": 0
     },
     {
       "name": "completionReliability",
-      "status": "blocked",
-      "evidenceCode": "completion-or-retention-unavailable",
-      "measured": 4,
+      "status": "passed",
+      "evidenceCode": "candidate-completion-and-retention-not-lower",
+      "measured": 5,
       "failures": 0,
-      "blocked": 2
+      "blocked": 0
     },
     {
       "name": "rollbackProof",
       "status": "passed",
       "evidenceCode": "critical-bytes-identical-and-volatile-append-only",
-      "measured": 3261,
+      "measured": 710,
       "failures": 0,
       "blocked": 0
     }
