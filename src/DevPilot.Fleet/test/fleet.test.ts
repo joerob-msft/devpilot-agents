@@ -137,11 +137,13 @@ test("restart marks unfinished work interrupted, disables schedules, and preserv
     f.fleet.runAgent("repo-efficiency", "restart-request-01");
     await until(() => f.store.state.attempts[0]?.status === "succeeded");
     f.store.state.attempts[0]!.status = "running";
+    f.store.state.attempts[0]!.transportNote = "Input echo omitted after independent journal audit.";
     f.store.state.schedules["repo-efficiency"]!.enabled = true;
     f.store.save();
     f.store.close();
     const restored = new Store(f.state, f.repo);
     assert.equal(restored.state.attempts[0]!.status, "interrupted");
+    assert.equal(restored.state.attempts[0]!.transportNote, "Input echo omitted after independent journal audit.");
     assert.equal(restored.state.schedules["repo-efficiency"]!.enabled, false);
     assert.throws(() => new Store(f.state, f.repo), /ownership/);
     assert.throws(() => recover(f.state, f.repo), /still present/);
@@ -242,12 +244,14 @@ test("corrupt persisted state refuses startup and releases only the newly acquir
       state => { delete state.attempts[0]!.result; },
       state => { state.attempts[0]!.prepared.timeoutSeconds = -1; },
       state => { state.repository = "another-repo"; },
+      state => { Reflect.set(state.attempts[0]!, "transportNote", { unexpected: true }); },
+      state => { state.attempts[0]!.transportNote = "x".repeat(1001); },
     ];
     for (const corrupt of cases) {
       const state = structuredClone(original);
       corrupt(state);
       writeFileSync(path.join(f.state, "state.json"), JSON.stringify(state));
-      assert.throws(() => new Store(f.state, f.repo), /Invalid|Corrupt|Duplicate|lacks/);
+      assert.throws(() => new Store(f.state, f.repo), /Invalid|Corrupt|Duplicate|lacks|transportNote/);
       assert.equal(existsSync(path.join(f.state, "owner.json")), false);
     }
   } finally {

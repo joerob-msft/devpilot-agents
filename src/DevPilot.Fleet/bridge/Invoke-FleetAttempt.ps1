@@ -11,6 +11,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Import-Module (Join-Path $PSScriptRoot '..\..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -DisableNameChecking
 . (Join-Path $PSScriptRoot 'FleetProtocol.ps1')
+. (Join-Path $PSScriptRoot 'FleetCliStream.ps1')
 $directory = Split-Path -Parent $RequestPath
 $outcomePath = Join-Path $directory 'outcome.json'
 $cleanupConfirmed = $true
@@ -38,8 +39,9 @@ try {
     if ($request.timeoutSeconds -lt 10 -or $request.timeoutSeconds -gt 600) { throw 'Invalid timeout.' }
     if ($request.nonce -notmatch '^[a-f0-9]{32}$' -or $request.inputHash -notmatch '^[a-f0-9]{64}$') { throw 'Invalid request binding.' }
     if ($request.prompt -isnot [string] -or $request.prompt.Length -gt 200000) { throw 'Invalid prompt.' }
+    $sessionId = [guid]::NewGuid().ToString('D')
     Write-FleetJson -Path (Join-Path $directory 'bridge.json') -Value @{
-        pid = $PID; startedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+        pid = $PID; startedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o'); sessionId = $sessionId
     }
     $homePath = Join-Path $directory 'cli-home'
     $workPath = Join-Path $directory 'workspace'
@@ -71,7 +73,7 @@ try {
         '--deny-tool=shell, write, read',
         '--disable-builtin-mcps', '--no-custom-instructions', '--no-ask-user',
         '--no-auto-update', '--no-remote-export', '--disallow-temp-dir',
-        '--output-format', 'json', '--silent'
+        '--output-format', 'json', '--silent', '--session-id', $sessionId
     )
     $cancelPath = Join-Path $directory 'cancel'
     $probe = {
@@ -96,20 +98,26 @@ try {
     $errorText = $null
     $result = $null
     $model = $null
+    $transportNote = $null
     if ($process.OutputLimitExceeded) { $errorText = 'Executor output exceeded 1,048,576 characters per stream.' }
     elseif ($process.Cancelled) { $status = 'cancelled' }
     elseif ($process.TimedOut) { $status = 'timed_out' }
     elseif ($process.ExitCode -ne 0) { $errorText = "Executor exited $($process.ExitCode). Check local authentication and CLI compatibility." }
     else {
-        $outcome = Get-AgentCliJsonOutcome -StdOutText $process.StdOut
-        if (-not $outcome -or -not $outcome.ModelActuallyRan -or $outcome.ExitCode -ne 0) {
-            throw 'Missing successful structured CLI outcome.'
+        try {
+            $journalPath = Join-Path $homePath "session-state\$sessionId\events.jsonl"
+            [void](Assert-AgentTrustedFile -Path $journalPath -AllowedRoot $homePath -Private)
+            if ((Get-Item -LiteralPath $journalPath).Length -gt 4MB) { throw 'Private session journal exceeds 4 MiB.' }
+            $journal = [IO.File]::ReadAllText($journalPath, [Text.UTF8Encoding]::new($false, $true))
+            $outcome = Get-FleetCliOutcome -StdOutText $process.StdOut -SessionJournalText $journal -SessionId $sessionId
         }
-        # Availability filtering is the enforcement; reject any evidence it was bypassed.
-        foreach ($line in ($process.StdOut -split "`r?`n")) {
-            if (-not $line.Trim().StartsWith('{')) { continue }
-            $event = $line | ConvertFrom-Json
-            if ($event.type -like 'tool.execution*') { throw 'Tool execution observed in tool-disabled profile.' }
+        catch {
+            [IO.File]::WriteAllText((Join-Path $directory 'stdout.jsonl'), $process.StdOut, [Text.UTF8Encoding]::new($false))
+            throw
+        }
+        $transportNote = $outcome.TransportNote
+        if ($transportNote) {
+            [IO.File]::WriteAllText((Join-Path $directory 'stdout.jsonl'), $process.StdOut, [Text.UTF8Encoding]::new($false))
         }
         $schema = New-FleetResultSchema -Nonce $request.nonce -InputHash $request.inputHash
         $result = ConvertFrom-FleetAnswer -Answer $outcome.Answer -Schema $schema
@@ -123,7 +131,8 @@ try {
         else { $status = 'succeeded' }
     }
     Write-FleetJson -Path $outcomePath -Value @{
-        status = $status; result = $result; model = $model; error = $errorText; cleanupConfirmed = $cleanupConfirmed
+        status = $status; result = $result; model = $model; error = $errorText
+        transportNote = $transportNote; cleanupConfirmed = $cleanupConfirmed
     }
 }
 catch {

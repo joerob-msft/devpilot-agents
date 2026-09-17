@@ -23,10 +23,12 @@
         "src/DevPilot.Fleet/src/server.ts",
         "src/DevPilot.Fleet/bridge/Invoke-FleetAttempt.ps1",
         "src/DevPilot.Fleet/bridge/FleetProtocol.ps1",
+        "src/DevPilot.Fleet/bridge/FleetCliStream.ps1",
         "src/DevPilot.Fleet/public/app.js",
         "src/DevPilot.Fleet/test/fleet.test.ts",
         "tests/FleetBridge.Tests.ps1",
-        "tests/FleetProtocol.Tests.ps1"
+        "tests/FleetProtocol.Tests.ps1",
+        "tests/FleetCliStream.Tests.ps1"
       ]
     }
   },

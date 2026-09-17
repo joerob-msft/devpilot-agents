@@ -28,7 +28,7 @@ No Copilot authentication or live model calls are needed for the offline suites.
 | --- | --- |
 | Fleet build | `npm run build --prefix .\src\DevPilot.Fleet` |
 | Fleet offline suite, including build | `npm test --prefix .\src\DevPilot.Fleet` |
-| Fleet bridge/protocol | `Invoke-Pester -Path .\tests\FleetBridge.Tests.ps1,.\tests\FleetProtocol.Tests.ps1,.\tests\FleetOutputLimit.Tests.ps1` |
+| Fleet bridge/protocol | `Invoke-Pester -Path .\tests\FleetBridge.Tests.ps1,.\tests\FleetProtocol.Tests.ps1,.\tests\FleetOutputLimit.Tests.ps1,.\tests\FleetCliStream.Tests.ps1` |
 | Dashboard build | `npm run build --prefix .\src\DevPilot.Dashboard` |
 | Dashboard logic suite, including build | `npm test --prefix .\src\DevPilot.Dashboard` |
 | Specific harness/agent behavior | `Invoke-Pester -Path .\tests\<relevant-suite>.Tests.ps1 -Output Detailed` |

@@ -139,6 +139,7 @@ function renderRuns() {
       () => mutation("/api/cancel", { runId: attempt.runId })));
   }
   if (attempt.error) detail.append(element("pre", attempt.error));
+  if (attempt.transportNote) detail.append(element("p", `Execution note: ${attempt.transportNote}`, "muted"));
   if (attempt.status === "invalid_result") {
     const rejected = rejectedAnswers.get(attempt.id);
     if (!rejected) {

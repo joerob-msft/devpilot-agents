@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import type { Attempt, ExecutionOutcome, Executor } from "./contracts.js";
 import { atomicJson, Store } from "./store.js";
-import { object, readBounded, validateResult } from "./manifest.js";
+import { object, readBounded, text, validateResult } from "./manifest.js";
 import { rejectedResultError } from "./result-diagnostics.js";
 
 export const packageRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -93,6 +93,7 @@ export function createExecutor(store: Store, executable: string): Executor {
           finish({ status,
             result: status === "succeeded" ? validateResult(outcome.result, attempt.nonce, attempt.prepared.packet.inputHash) : undefined,
             model: typeof outcome.model === "string" ? outcome.model.slice(0, 100) : undefined,
+            transportNote: outcome.transportNote == null ? undefined : text(outcome.transportNote, 1000, "transportNote"),
             error: status === "invalid_result" ? rejectedResultError(directory, attempt.nonce, attempt.prepared.packet.inputHash) :
               typeof outcome.error === "string" ? outcome.error.slice(0, 1000) : undefined });
         } catch (error) {

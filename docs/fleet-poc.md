@@ -122,6 +122,18 @@ can be inspected without rewriting their original generic error. If capture
 reached its limit, the view explicitly warns that the answer may be incomplete.
 Diagnostics explain a rejection; they never override the bridge's decision.
 
+The CLI can mask credential-like examples in its stdout input echoes and break
+their JSON quoting. Fleet leaves masking enabled. Each attempt selects an
+explicit CLI session ID and audits that session's private journal (maximum
+4 MiB) for completion, event identities, and tool activity. Only malformed
+`user.message` / `system.message` stdout echo envelopes may be omitted, with a
+persisted **Execution note**. Completed answer identities must match the journal,
+and the final stdout result must match the session. Malformed answer/result/tool
+records, unknown malformed records, and missing or invalid journals still fail
+closed. Answers come only from redacted stdout, never unredacted journal text.
+For transport failures or omitted echoes, bounded stdout is retained privately
+as `stdout.jsonl`; it is not exposed by a generic file-serving endpoint.
+
 ## Schedules and swarms
 
 Schedules are disabled at startup, including after restart. Enable one explicitly
@@ -250,7 +262,7 @@ renewal. Those are follow-on adapters, not disguised demo integrations.
 
 ```powershell
 npm test --prefix .\src\DevPilot.Fleet
-Invoke-Pester -Path .\tests\FleetOutputLimit.Tests.ps1,.\tests\FleetProtocol.Tests.ps1,.\tests\FleetBridge.Tests.ps1
+Invoke-Pester -Path .\tests\FleetOutputLimit.Tests.ps1,.\tests\FleetProtocol.Tests.ps1,.\tests\FleetBridge.Tests.ps1,.\tests\FleetCliStream.Tests.ps1
 ```
 
 Offline tests use an explicitly injected fixture executor, never a production

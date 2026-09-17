@@ -123,6 +123,7 @@ function assertState(input: unknown, repository: string): asserts input is State
     if (typeof item.status !== "string" || !statuses.includes(item.status) ||
         !["agent", "worker", "synthesis"].includes(String(item.kind))) throw new Error("Corrupt attempt state");
     const packet = checkPrepared(item.prepared);
+    if (item.transportNote !== undefined) text(item.transportNote, 1000, "transportNote");
     if (item.result !== undefined) validateResult(item.result, String(item.nonce), String(packet.inputHash));
     if (item.status === "succeeded" && !item.result) throw new Error("Successful attempt lacks a result");
   }

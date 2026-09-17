@@ -58,6 +58,7 @@ export interface Attempt {
   result?: Result;
   error?: string;
   model?: string;
+  transportNote?: string;
 }
 export interface SwarmRun {
   id: string;
@@ -88,6 +89,7 @@ export interface ExecutionOutcome {
   result?: Result;
   error?: string;
   model?: string;
+  transportNote?: string;
 }
 export interface Execution {
   done: Promise<ExecutionOutcome>;
