@@ -5,6 +5,9 @@ Owner observer and the preview-only v2 orchestrator. It runs no provider write,
 does not authorize delivery, and requires the v2 state root to be separate from
 both v1 and this repository.
 
+Current rollout and authorization status is defined only in the
+[authoritative operating state](owner-preview-orchestrator.md#current-operating-state-authoritative).
+
 The qualification manifest identifies one signed v1 queue record and one v2
 replay manifest, normalized observation, or explicit unavailable reason per
 cohort entry. Expected fail-closed manifest rejection and absent exact replay
@@ -55,11 +58,10 @@ The eight gates are:
    prefix-preserving, bounded append-only volatile changes.
 
 Offline deterministic or recorded-byte replay proves only retrospective parity
-for the preserved cohort. Prospective real-model parity remains separately
-blocked until the model launcher can prove its no-tools and no-provider-write
-ceiling without widening permissions.
+for the preserved cohort. The later prospective qualification used the bounded
+no-tools launcher and is reported separately below.
 
-## Prior contract-remediated preserved-evidence qualification
+## Historical contract-remediated preserved-evidence qualification
 
 The PR137 retrospective aggregate covered the same five preserved cohort
 entries using a separate v2 state root and 3,260 exact critical references plus
@@ -79,11 +81,11 @@ non-semantic evidence.
 | Latency accounting | `blocked` | 96 explicit measurement states pass; the unavailable entry contributes 12 blocked states |
 | Rollback proof | `passed` | 3,260 critical files were byte-identical; the sole declared volatile file preserved its prefix and file identity within bounded growth |
 
-The separate launcher layer now proves a Copilot CLI interface with a literal
-empty tool set but fails closed because the supported prompt transport exposes
-the bounded stimulus in process arguments. Prospective real-model parity
-remains blocked until a supported confidential prompt channel is available.
-This evidence does not support cutover or writer compatibility.
+At this historical snapshot, the launcher failed closed because confidential
+prompt transport was still treated as a gate. The accepted v1 threat model now
+supports bounded ordinary Copilot CLI argv transport, as described in the
+[authoritative operating state](owner-preview-orchestrator.md#current-operating-state-authoritative).
+This earlier evidence still does not support cutover or writer compatibility.
 
 An external v2 state root may also provide a normalized observation produced
 by that supported launcher. The read candidate must explicitly bind
@@ -96,13 +98,16 @@ attempt/start records, and aggregate execution accounting. Omitted, mismatched,
 or unbound provenance remains `unknown`; the coordinator does not infer a
 semantic model call from an observation path.
 
-## Prospective real-model qualification
+## Current prospective real-model qualification
 
-The current [sanitized aggregate](owner-parity-summary.json) covers the five
-entries in a locked seven-head cohort that had complete frozen-v1 results and
-valid prospective v2 semantic results. One additional head reached no v1 model
-boundary, and another became a draft before exact source capture; both remain
-explicit evidence-availability controls rather than failed semantic executions.
+The schema-version 2 [sanitized aggregate](owner-parity-summary.json) is the
+post-PR146 qualification snapshot. It covers the five entries in a locked
+seven-head cohort that had complete frozen-v1 results and valid prospective v2
+semantic results. One additional head reached no v1 model boundary, and another
+became a draft before exact source capture; both remain explicit
+evidence-availability controls rather than failed semantic executions. The
+snapshot is qualification evidence only and intentionally contains no scheduler
+or deployment metadata.
 
 The five applicable entries used the same `claude-sonnet-5` identity for v1 and
 v2. Eleven eligible v2 units each made one model call and returned one valid
@@ -117,16 +122,17 @@ adjudicated method violations, and no eligible false positives were observed.
 | Finding retention | `passed` | Both verified v1 method findings were retained |
 | Eligible false positives | `passed` | 0 observed across 11 candidate violations and 5 measured entries |
 | Binding equivalence | `passed` | 45 canonical comparisons passed |
-| Unknown integrity | `blocked` | 10 frozen-v1 unknown findings were not exposed as corresponding v2 unknown outcomes |
+| Unknown integrity | `passed` | 10 frozen-v1 unknown constructs were preserved through explicit v2 `unknown` or `notEligible` outcomes |
 | Write isolation | `passed` | Five observations prove zero provider and tool writes |
 | Completion reliability | `passed` | v1 and v2 each completed all 5 applicable entries |
 | Latency accounting | `passed` | 120 measurement states are explicit |
 | Rollback proof | `passed` | 710 declared critical files remained byte-identical |
 
-Prospective parity remains blocked. The unavailable controls do not block
-unrelated semantic gates, but the measured unknown-integrity gate still does
-not pass. The evidence therefore does not justify a canary, cutover, deployment
-change, writer compatibility, or any provider write. The next action is to
-expose stable v2 unknown outcomes for the ten frozen-v1 unknown constructs (or
-independently prove those constructs outside the applicable unknown
-denominator), then rerun this same locked cohort.
+All eight gates passed for this bounded prospective cohort after explicit v2
+non-eligible and unknown outcomes were added. A later manual live preview canary
+also passed. Those results support a scoped Owner preview and informed a
+separate operator deployment action; they do not prove sustained or generic
+reliability, authorize a scheduler, grant writer readiness, migrate existing
+consumers, or permit provider writes. See the
+[authoritative operating state](owner-preview-orchestrator.md#current-operating-state-authoritative)
+for the current deployment, writer, rollback, and remaining-gate boundaries.

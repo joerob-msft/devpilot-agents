@@ -28,6 +28,56 @@ The module exports only:
 `-StateRoot` and `-ManifestPath` values. It does not register Task Scheduler,
 automation, deployment, notification, vote, comment, summary, or writer work.
 
+## Current operating state (authoritative)
+
+This section is the authoritative current operating state for the Owner v2
+stack. Component documents link here rather than restating rollout status.
+
+- **Code-supported modes:** replay and bounded live preview. Live execution
+  requires host opt-in with `-EnableLiveModel`, an existing read-only
+  acquisition provider, and manifest/provider configuration supplied outside
+  repository data, including model identity and credential-environment name.
+  Both modes retain exact bindings, bounded execution, explicit `unknown` and
+  `notEligible` outcomes, immutable completed-head reuse, and zero writes. The
+  repository does not register a scheduler or authorize a deployment.
+- **Semantic transport and threat model:** the supported transport is ordinary
+  Copilot CLI `--prompt`, capped at 12 KiB. The prompt and argv contain no
+  credential; the selected credential is separately mapped into the isolated
+  child environment as `COPILOT_GITHUB_TOKEN`. The bounded prompt can be
+  transiently visible to local same-user process inspection, endpoint
+  monitoring, or administrators. That argv exposure is an accepted residual
+  risk for this v1 threat model. Preflight requires `effectiveTools: []`; MCP,
+  custom instructions, memory, resume, remote execution/export, plugins,
+  repository context, and other ambient inputs remain disabled.
+- **Qualification scope:** the schema-version 2
+  [sanitized aggregate](owner-parity-summary.json) is the post-PR146
+  prospective-cohort snapshot. All eight bounded parity gates passed for the
+  applicable locked cohort, and a manual live preview canary subsequently
+  passed. This supports the scoped Owner capability; it is not proof of generic
+  contextual-review reliability, sustained production equivalence, or
+  automatic authorization.
+- **Operator deployment state:** scheduler registration and cutover are
+  operator actions, not effects of this code. Operator-reported evidence from
+  later work outside this PR records that, as of 2026-09-14, the scheduled Owner
+  v2 preview service was pinned to exact PR147 head
+  `eeb32f38b80d2dd4cc308cd4acaec98e967a506e`, with separate v2 toolkit and
+  state. The v1 scheduled preview is disabled but retained for rollback. This
+  dated snapshot is deployment evidence, not a repository-created task or
+  broader authority.
+- **Authority boundary:** v2 remains preview-only and performs zero provider or
+  writer writes. V1 remains the sole manual approved-comment writer. Existing
+  consumer entry points, configuration, and users were not migrated by this
+  stack. Writer compatibility, automatic comments or votes, and any consumer
+  migration require separate decisions.
+- **State and rollback:** v1 and v2 toolkit/state roots remain separate. Rollback
+  is an operator action: stop or disable the v2 preview service and restore the
+  retained v1 scheduled preview if needed; no v1 state migration or repair is
+  required.
+
+Remaining rollout gates are sustained reliability evidence, an explicit
+writer-compatibility and authorization decision, deliberate consumer migration,
+and separate proof for any broader contextual-review capability.
+
 ## Cohort manifest
 
 The manifest is `schemaVersion: 1`, `kind: owner-v2-preview-cohort`, with a
@@ -103,11 +153,14 @@ acquisition retains the qualified 64-file/16 MiB/128-read cap. Telemetry is
 persisted and bound into observations; preflight failures remain truthful and
 completed records immutable. No delivery adapter or authorization is added.
 
-## Next convergence layer
+## Historical convergence checklist
 
-The next convergence layer must incorporate the reviewed PR128 observer delta
-or an equivalent dependency, then run v1 and v2 on identical pinned evidence.
-It must enforce the eight recorded parity gates:
+The following was the pre-parity implementation checklist. It is retained only
+as historical design context; it is not the qualification gate set and does not
+claim that the sanitized aggregate measured every orchestrator-state property
+listed here. The implemented qualification gates and their evidence are defined
+in [Owner parity qualification](owner-parity-qualification.md) and the
+[sanitized aggregate](owner-parity-summary.json):
 
 1. exact subject/head/rule/capability/config/model binding parity;
 2. acquisition evidence digest parity;
@@ -118,5 +171,7 @@ It must enforce the eight recorded parity gates:
 7. deterministic observation/index digest parity; and
 8. stale lease/retry/idempotency parity.
 
-Writer compatibility, scheduled-task registration, production deployment,
-notifications, comments, votes, summaries, and cutover remain separate gates.
+The completed bounded cohort does not grant writer compatibility, scheduling,
+deployment, notifications, comments, votes, summaries, or cutover authority.
+See [Current operating state](#current-operating-state-authoritative) for the
+current code, deployment, and remaining-gate distinction.
