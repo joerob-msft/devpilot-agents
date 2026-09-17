@@ -47,7 +47,9 @@ BeforeAll {
             [string]$SourceCommit = ('a' * 40),
             [string]$ConfigId = 'relation-routing-v1',
             [long]$PullRequestId = 43,
-            [string]$EmptySpanRole = ''
+            [string]$EmptySpanRole = '',
+            [string]$ModelMode = 'valid',
+            [string]$ModelStatePath = '-'
         )
         $evidence = @(
             foreach ($item in @($script:Case.evidence)) {
@@ -259,10 +261,10 @@ BeforeAll {
             }.GetNewClosure()
         } "$Name-provider" $counts $captured
         $model = & $script:OrchestratorModule {
-            param($Pwsh, $Child)
+            param($Pwsh, $Child, $Mode, $StatePath)
             New-OwnerModelFakeProvider -FilePath $Pwsh `
-                -ArgumentList @('-NoProfile', '-File', $Child, 'valid', '-')
-        } (Get-Command pwsh).Source $script:Child
+                -ArgumentList @('-NoProfile', '-File', $Child, $Mode, $StatePath)
+        } (Get-Command pwsh).Source $script:Child $ModelMode $ModelStatePath
         $manifestPath = Write-TestJson -Path (Join-Path $TestDrive "$Name.json") -Value $manifest
         return [pscustomobject]@{
             Manifest = $manifest
@@ -271,6 +273,19 @@ BeforeAll {
             Model = $model
             Counts = $counts
             Package = $package
+        }
+    }
+
+    function New-TestRelationPreflight {
+        param([Parameter(Mandatory)][bool]$Available, [Parameter(Mandatory)][string]$Reason)
+        return [pscustomobject][ordered]@{
+            available = $Available
+            reason = $Reason
+            modelIdentity = 'deterministic-fake-process'
+            promptTransport = 'private-file'
+            localProcessMetadataExposure = $false
+            risk = 'none'
+            effectiveTools = @()
         }
     }
 
@@ -390,6 +405,56 @@ Describe 'Scheduler-callable relation preview' {
             Should -Be 1
     }
 
+    It 'retries a relation preflight failure once after repair and then stays terminal' {
+        $root = Join-Path $TestDrive 'relation-preflight-repair-state'
+        $counterPath = Join-Path $TestDrive 'relation-preflight-model-calls.txt'
+        $context = New-TestRelationContext -Name relation-preflight-repair `
+            -MissingRole 'test-expectation' -ModelMode count-valid `
+            -ModelStatePath $counterPath
+        [void](Invoke-OwnerV2PreviewPrepare -StateRoot $root `
+                -ManifestPath $context.ManifestPath)
+        $script:RelationPreflightInvocation = 0
+        Mock Test-OwnerModelProviderPreflight -ModuleName DevPilot.OwnerOrchestrator {
+            $script:RelationPreflightInvocation++
+            if ($script:RelationPreflightInvocation -eq 1) {
+                return New-TestRelationPreflight -Available $false `
+                    -Reason process-containment-unavailable
+            }
+            New-TestRelationPreflight -Available $true -Reason fake-offline
+        }
+
+        $failed = Invoke-OwnerV2PreviewRun -StateRoot $root `
+            -ManifestPath $context.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $context.Provider -LiveModelProvider $context.Model
+        $recordFile = Get-ChildItem -LiteralPath $root -Recurse -Filter '*.json' |
+            Where-Object FullName -Match '[\\/]records[\\/]' | Select-Object -First 1
+        $failedRecord = Get-Content -LiteralPath $recordFile.FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $repaired = Invoke-OwnerV2PreviewRun -StateRoot $root `
+            -ManifestPath $context.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $context.Provider -LiveModelProvider $context.Model
+        $third = Invoke-OwnerV2PreviewRun -StateRoot $root `
+            -ManifestPath $context.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $context.Provider -LiveModelProvider $context.Model
+        $completedRecord = Get-Content -LiteralPath $recordFile.FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $observation = Get-TestRelationObservation -StateRoot $root
+
+        $failed.records[0].reason | Should -Be 'process-containment-unavailable'
+        $failedRecord.modelExecutionState | Should -Be 'notAttempted'
+        $repaired.records[0].state | Should -Be 'completed'
+        $repaired.records[0].attempts | Should -Be 2
+        $completedRecord.modelExecutionState | Should -Be 'attempted'
+        [int](Get-Content -LiteralPath $counterPath -Raw) | Should -Be 1
+        @(Get-ChildItem -LiteralPath $root -Recurse -Filter '*.attempt-*.json').Count |
+            Should -Be 2
+        $observation.effects.effectiveTools.Count | Should -Be 0
+        $observation.effects.providerWrites | Should -Be 0
+        $observation.effects.writeToolInvocations | Should -Be 0
+        $third.records[0].reason | Should -Be 'already-terminal'
+        [int](Get-Content -LiteralPath $counterPath -Raw) | Should -Be 1
+    }
+
     It 'routes missing and oversize decisive evidence to unknown without model attempts' {
         foreach ($case in @(
                 @{ Name = 'missing'; Context = New-TestRelationContext -Name missing `
@@ -421,6 +486,11 @@ Describe 'Scheduler-callable relation preview' {
             $telemetry.modelCalls | Should -Be 0
             $telemetry.providerWrites | Should -Be 0
             $case.Context.Counts.writes | Should -Be 0
+            (& $script:Wrapper prepare-run -StateRoot $root `
+                    -ManifestPath $case.Context.ManifestPath -EnableLiveModel `
+                    -LiveAcquisitionProvider $case.Context.Provider `
+                    -LiveModelProvider $case.Context.Model).records[0].reason |
+                Should -Be 'already-terminal'
         }
     }
 

@@ -110,7 +110,12 @@ BeforeAll {
     }
 
     function New-TestLiveContext {
-        param([Parameter(Mandatory)][string]$Name, [switch]$CopilotProvider)
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [switch]$CopilotProvider,
+            [string]$ModelMode = 'valid',
+            [string]$ModelStatePath = '-'
+        )
         $manifest = New-TestManifest
         $package = Copy-TestValue $manifest.entries[0].acquisition.package
         $manifest.entries[0].mode = 'live'
@@ -147,13 +152,30 @@ BeforeAll {
         }
         else {
             & $script:OrchestratorModule {
-                param($Pwsh, $Child)
+                param($Pwsh, $Child, $Mode, $StatePath)
                 New-OwnerModelFakeProvider -FilePath $Pwsh -ArgumentList @(
-                    '-NoProfile', '-File', $Child, 'valid', '-')
-            } $script:Pwsh $script:OwnerModelChild
+                    '-NoProfile', '-File', $Child, $Mode, $StatePath)
+            } $script:Pwsh $script:OwnerModelChild $ModelMode $ModelStatePath
         }
         return [pscustomobject]@{ ManifestPath = $manifestPath
             AcquisitionProvider = $acquisitionProvider; ModelProvider = $provider }
+    }
+
+    function New-TestPreflight {
+        param(
+            [Parameter(Mandatory)][bool]$Available,
+            [Parameter(Mandatory)][string]$Reason,
+            [string]$ModelIdentity = 'deterministic-fake-process'
+        )
+        return [pscustomobject][ordered]@{
+            available = $Available
+            reason = $Reason
+            modelIdentity = $ModelIdentity
+            promptTransport = 'private-file'
+            localProcessMetadataExposure = $false
+            risk = 'none'
+            effectiveTools = @()
+        }
     }
 }
 
@@ -461,6 +483,174 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $observation.effects.writeToolInvocations | Should -Be 0
     }
 
+    It 'retries explicit pre-model credential and containment failures after repair' -TestCases @(
+        @{ Reason = 'copilot-cli-credential-unavailable' }
+        @{ Reason = 'process-containment-unavailable' }
+    ) {
+        param($Reason)
+        $stateRoot = New-TestStateRoot
+        $counterPath = Join-Path $TestDrive "$Reason-model-calls.txt"
+        $live = New-TestLiveContext -Name "$Reason.json" -ModelMode count-valid `
+            -ModelStatePath $counterPath
+        [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
+                -ManifestPath $live.ManifestPath)
+        $script:TestPreflightInvocation = 0
+        Mock Test-OwnerModelProviderPreflight -ModuleName DevPilot.OwnerOrchestrator {
+            $script:TestPreflightInvocation++
+            if ($script:TestPreflightInvocation -eq 1) {
+                return New-TestPreflight -Available $false -Reason $Reason
+            }
+            New-TestPreflight -Available $true -Reason fake-offline
+        }
+
+        $failed = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $recordFile = Get-TestRecordFile -StateRoot $stateRoot
+        $failedRecord = Get-Content -LiteralPath $recordFile.FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $attemptOne = Get-ChildItem -LiteralPath $stateRoot -Recurse `
+            -Filter '*.attempt-0001.json' | Select-Object -First 1
+        $attemptOneTelemetry = Get-Content -LiteralPath $attemptOne.FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+
+        $failed.records[0].state | Should -Be 'incomplete'
+        $failed.records[0].reason | Should -Be $Reason
+        $failedRecord.attempts | Should -Be 1
+        $failedRecord.modelExecutionState | Should -Be 'notAttempted'
+        $attemptOneTelemetry.refusalReason | Should -Be $Reason
+        $attemptOneTelemetry.modelCalls | Should -Be 0
+        Test-Path -LiteralPath $counterPath | Should -BeFalse
+
+        $repaired = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $completedRecord = Get-Content -LiteralPath $recordFile.FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $currentTelemetry = Get-Content -LiteralPath $repaired.records[0].telemetryPath -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $third = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+
+        $repaired.records[0].state | Should -Be 'completed'
+        $repaired.records[0].attempts | Should -Be 2
+        $completedRecord.modelExecutionState | Should -Be 'attempted'
+        [int](Get-Content -LiteralPath $counterPath -Raw) | Should -Be 1
+        @(Get-ChildItem -LiteralPath $stateRoot -Recurse -Filter '*.attempt-*.json').Count |
+            Should -Be 2
+        $attemptOneTelemetry.refusalReason | Should -Be $Reason
+        @($currentTelemetry.effectiveTools).Count | Should -Be 0
+        $currentTelemetry.providerWrites | Should -Be 0
+        $currentTelemetry.writeToolInvocations | Should -Be 0
+        $third.records[0].reason | Should -Be 'already-terminal'
+        [int](Get-Content -LiteralPath $counterPath -Raw) | Should -Be 1
+    }
+
+    It 'keeps immutable model binding failures terminal without a model call' {
+        $stateRoot = New-TestStateRoot
+        $counterPath = Join-Path $TestDrive 'binding-model-calls.txt'
+        $live = New-TestLiveContext -Name 'binding-mismatch.json' -ModelMode count-valid `
+            -ModelStatePath $counterPath
+        [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
+                -ManifestPath $live.ManifestPath)
+        $script:TestPreflightInvocation = 0
+        Mock Test-OwnerModelProviderPreflight -ModuleName DevPilot.OwnerOrchestrator {
+            $script:TestPreflightInvocation++
+            New-TestPreflight -Available $true -Reason fake-offline -ModelIdentity wrong-model
+        }
+
+        $first = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $second = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $record = Get-Content -LiteralPath (Get-TestRecordFile -StateRoot $stateRoot).FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+
+        $first.records[0].reason | Should -Be 'model-binding-mismatch'
+        $record.modelExecutionState | Should -Be 'notAttempted'
+        $second.records[0].reason | Should -Be 'already-terminal'
+        $script:TestPreflightInvocation | Should -Be 1
+        Test-Path -LiteralPath $counterPath | Should -BeFalse
+    }
+
+    It 'does not amplify retries after a malformed post-model response' {
+        $stateRoot = New-TestStateRoot
+        $counterPath = Join-Path $TestDrive 'malformed-model-calls.txt'
+        $live = New-TestLiveContext -Name 'malformed-live.json' `
+            -ModelMode count-malformed-json -ModelStatePath $counterPath
+        [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
+                -ManifestPath $live.ManifestPath)
+
+        $first = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $second = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $record = Get-Content -LiteralPath (Get-TestRecordFile -StateRoot $stateRoot).FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+
+        $record.modelExecutionState | Should -Be 'attempted'
+        $record.attempts | Should -Be 1
+        [int](Get-Content -LiteralPath $counterPath -Raw) | Should -Be 1
+        $second.records[0].reason | Should -Be 'already-terminal'
+        @($first.records).Count | Should -Be 1
+    }
+
+    It 'fails closed for legacy failed records and exhausted pre-model attempts' {
+        foreach ($case in @(
+                @{ Name = 'legacy'; MaxAttempts = 3; Legacy = $true },
+                @{ Name = 'exhausted'; MaxAttempts = 1; Legacy = $false }
+            )) {
+            $stateRoot = New-TestStateRoot
+            $counterPath = Join-Path $TestDrive "$($case.Name)-model-calls.txt"
+            $live = New-TestLiveContext -Name "$($case.Name).json" -ModelMode count-valid `
+                -ModelStatePath $counterPath
+            [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
+                    -ManifestPath $live.ManifestPath -MaxAttempts $case.MaxAttempts)
+            $script:TestPreflightInvocation = 0
+            Mock Test-OwnerModelProviderPreflight -ModuleName DevPilot.OwnerOrchestrator {
+                $script:TestPreflightInvocation++
+                if ($script:TestPreflightInvocation -eq 1) {
+                    return New-TestPreflight -Available $false `
+                        -Reason copilot-cli-credential-unavailable
+                }
+                New-TestPreflight -Available $true -Reason fake-offline
+            }
+            [void](Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+                    -ManifestPath $live.ManifestPath -EnableLiveModel `
+                    -LiveAcquisitionProvider $live.AcquisitionProvider `
+                    -LiveModelProvider $live.ModelProvider)
+            if ($case.Legacy) {
+                $recordFile = Get-TestRecordFile -StateRoot $stateRoot
+                $record = Get-Content -LiteralPath $recordFile.FullName -Raw |
+                    ConvertFrom-Json -AsHashtable -Depth 64
+                $record.schemaVersion = 1
+                $record.Remove('modelExecutionState')
+                Write-TestJson -Path $recordFile.FullName -Value $record | Out-Null
+            }
+
+            $again = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+                -ManifestPath $live.ManifestPath -EnableLiveModel `
+                -LiveAcquisitionProvider $live.AcquisitionProvider `
+                -LiveModelProvider $live.ModelProvider
+
+            $again.records[0].reason | Should -Be 'already-terminal'
+            $script:TestPreflightInvocation | Should -Be 1
+            Test-Path -LiteralPath $counterPath | Should -BeFalse
+        }
+    }
+
     It 'injects the existing provider runner into live semantic units with exact zero-write telemetry' {
         $stateRoot = New-TestStateRoot
         $live = New-TestLiveContext -Name 'live-fake.json'
@@ -580,9 +770,9 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $partialObservationFile = Get-TestObservationFile -StateRoot $partialState
         $partialObservation = Get-TestObservation -StateRoot $partialState
         $partialRun.records[0].state | Should -Be 'unknown'
-        $partialRun.records[0].reason | Should -Be 'orchestrator-refusal'
+        $partialRun.records[0].reason | Should -Be 'durable-state-integrity-failure'
         $partialRecord.state | Should -Be 'unknown'
-        $partialRecord.incompleteReason | Should -Be 'orchestrator-refusal'
+        $partialRecord.incompleteReason | Should -Be 'durable-state-integrity-failure'
         $partialObservation.execution.modelStarts | Should -Be 'unknown'
         $partialObservation.lifecycle.status | Should -Be 'unknown'
         $partialObservation.lifecycle.prepared | Should -BeTrue
@@ -592,11 +782,11 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $partialObservation.measurements.execution.modelStarts.status |
             Should -Be 'unavailable'
         $partialObservation.measurements.execution.modelStarts.reason |
-            Should -Be 'orchestrator-refusal'
+            Should -Be 'durable-state-integrity-failure'
         $partialObservation.measurements.execution.latencyMs.status |
             Should -Be 'unavailable'
         $partialObservation.measurements.execution.latencyMs.reason |
-            Should -Be 'orchestrator-refusal'
+            Should -Be 'durable-state-integrity-failure'
 
         $observerManifest = Join-Path $script:RepoRoot 'src\OwnerObserver\OwnerObserver.psd1'
         if (Test-Path -LiteralPath $observerManifest -PathType Leaf) {
@@ -657,6 +847,41 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $run = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $manifestPath
         $run.records[0].attempts | Should -Be 2
         $run.records[0].state | Should -Be 'completed'
+    }
+
+    It 'never repeats a model call after an attempted running lease becomes stale' {
+        $stateRoot = New-TestStateRoot
+        $counterPath = Join-Path $TestDrive 'stale-attempted-model-calls.txt'
+        $live = New-TestLiveContext -Name 'stale-attempted.json' -ModelMode count-valid `
+            -ModelStatePath $counterPath
+        [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
+                -ManifestPath $live.ManifestPath)
+        $recordFile = Get-TestRecordFile -StateRoot $stateRoot
+        $record = Get-Content -LiteralPath $recordFile.FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $record.state = 'running'
+        $record.attempts = 1
+        $record.modelExecutionState = 'attempted'
+        $record.lease = [ordered]@{
+            id = 'stale-attempted'
+            acquiredUtc = 'utc:2000-01-01T00:00:00Z'
+            expiresUtc = 'utc:2000-01-01T00:00:00Z'
+        }
+        Write-TestJson -Path $recordFile.FullName -Value $record | Out-Null
+
+        $run = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $persisted = Get-Content -LiteralPath $recordFile.FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+
+        $run.records[0].state | Should -Be 'incomplete'
+        $run.records[0].reason | Should -Be 'interrupted-after-model-attempt'
+        $persisted.modelExecutionState | Should -Be 'attempted'
+        $persisted.attempts | Should -Be 1
+        $persisted.lease | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $counterPath | Should -BeFalse
     }
 
     It 'fences publication to the exact reservation lease and ignores orphaned staging files' {
@@ -746,6 +971,20 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
             Should -Throw '*unsafe*'
         { Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $manifestPath } |
             Should -Throw '*unsafe*'
+    }
+
+    It 'refuses a validly shaped persisted record whose durable binding was changed' {
+        $stateRoot = New-TestStateRoot
+        $manifestPath = New-TestManifestFile -Name 'binding-tamper.json'
+        [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot -ManifestPath $manifestPath)
+        $recordFile = Get-TestRecordFile -StateRoot $stateRoot
+        $record = Get-Content -LiteralPath $recordFile.FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $record.configDigest = Get-TestDigest 'tampered-config-binding'
+        Write-TestJson -Path $recordFile.FullName -Value $record | Out-Null
+
+        { Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $manifestPath } |
+            Should -Throw "*record binding 'configDigest'*"
     }
 
     It 'returns deterministic status, sorted index, and persisted observation' {

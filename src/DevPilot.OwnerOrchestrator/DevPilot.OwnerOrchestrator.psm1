@@ -47,6 +47,16 @@ $script:OwnerV2SafeIdPattern = '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
 $script:OwnerV2UnsafeKeyPattern = '(?i)(authorize|authorization|delivery|writer|adapter|tool|secret|password|credential|scheduler|notification|vote|comment|summary|permission|deploy|accessToken|refreshToken|idToken|apiKey|privateKey)'
 $script:OwnerV2UnsafeValuePattern = '(?i)(ghp_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|bearer\s+[A-Za-z0-9._-]+|authorization:|password=|secret=|token=)'
 $script:OwnerV2States = @('pending', 'running', 'completed', 'incomplete', 'unknown')
+$script:OwnerV2ModelExecutionStates = @('notAttempted', 'attempted')
+$script:OwnerV2NonRecoverableRetryReasons = @(
+    'durable-state-integrity-failure',
+    'evidence-cap-exhausted',
+    'model-binding-mismatch',
+    'orchestrator-refusal',
+    'relation-outcome-unknown',
+    'rule-evidence-binding-mismatch',
+    'rule-evidence-unavailable'
+)
 $script:OwnerV2TestCheckpoint = $null
 $script:OwnerV2RepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 
@@ -452,18 +462,35 @@ function Get-OwnerV2TelemetryPath {
     return Join-Path (Join-Path $CapabilityRoot 'telemetry') "$Identity.json"
 }
 
+function Get-OwnerV2AttemptTelemetryPath {
+    param(
+        [Parameter(Mandatory)][string]$CapabilityRoot,
+        [Parameter(Mandatory)][string]$Identity,
+        [Parameter(Mandatory)][int]$Attempt
+    )
+    return Join-Path (Join-Path $CapabilityRoot 'telemetry') (
+        "$Identity.attempt-$($Attempt.ToString('0000')).json")
+}
+
 function Assert-OwnerV2Record {
     param([Parameter(Mandatory)][Collections.IDictionary]$Record)
     Assert-OwnerV2NoUnsafeShape -Value $Record
-    Assert-OwnerV2ExactKeys -Value $Record -Name record -Expected @(
+    $expected = @(
         'schemaVersion', 'kind', 'identity', 'stateDigest', 'mode', 'capabilityId',
         'capabilityDigest', 'subjectDigest', 'headDigest', 'ruleDigest', 'modelDigest',
         'configDigest', 'acquisitionPayloadDigest', 'state', 'attempts', 'maxAttempts',
         'lease', 'createdUtc', 'updatedUtc', 'declarationPath', 'evidencePath',
         'observationPath', 'resultDigest', 'incompleteReason'
     )
-    if ([int]$Record.schemaVersion -ne 1 -or [string]$Record.kind -cne 'owner-v2-preview-record') {
+    if ([int]$Record.schemaVersion -eq 2) { $expected += 'modelExecutionState' }
+    Assert-OwnerV2ExactKeys -Value $Record -Name record -Expected $expected
+    if ([int]$Record.schemaVersion -notin @(1, 2) -or
+        [string]$Record.kind -cne 'owner-v2-preview-record') {
         throw 'Owner v2 record has an unsupported schema or kind.'
+    }
+    if ([int]$Record.schemaVersion -eq 2 -and
+        [string]$Record.modelExecutionState -cnotin $script:OwnerV2ModelExecutionStates) {
+        throw 'Owner v2 record model execution state is invalid.'
     }
     if ([string]$Record.state -cnotin $script:OwnerV2States) { throw 'Owner v2 record state is invalid.' }
     if ([int]$Record.attempts -lt 0 -or [int]$Record.attempts -gt [int]$Record.maxAttempts -or
@@ -474,6 +501,43 @@ function Assert-OwnerV2Record {
             'modelDigest', 'configDigest', 'acquisitionPayloadDigest')) {
         Assert-OwnerV2Digest -Value ([string]$Record[$name]) -Name $name
     }
+}
+
+function Assert-OwnerV2RecordBinding {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Record,
+        [Parameter(Mandatory)][object]$Entry
+    )
+    $expected = [ordered]@{
+        identity = [string]$Entry.Identity
+        stateDigest = [string]$Entry.StateDigest
+        mode = [string]$Entry.Declaration.mode
+        capabilityId = [string]$Entry.Declaration.capability.id
+        capabilityDigest = [string]$Entry.Declaration.capability.digest
+        subjectDigest = Get-OwnerV2Digest -Value $Entry.Declaration.subject
+        headDigest = Get-OwnerV2Digest -Value $Entry.Declaration.head
+        ruleDigest = Get-OwnerV2Digest -Value $Entry.Declaration.rule
+        modelDigest = Get-OwnerV2Digest -Value $Entry.Declaration.model
+        configDigest = Get-OwnerV2Digest -Value $Entry.Declaration.config
+        acquisitionPayloadDigest = [string]$Entry.Declaration.acquisitionPayloadDigest
+    }
+    foreach ($name in $expected.Keys) {
+        if ([string]$Record[$name] -cne [string]$expected[$name]) {
+            throw "Owner v2 record binding '$name' did not match the manifest entry."
+        }
+    }
+}
+
+function ConvertTo-OwnerV2CurrentRecord {
+    param([Parameter(Mandatory)][Collections.IDictionary]$Record)
+    if ([int]$Record.schemaVersion -eq 2) { return $false }
+    if ([string]$Record.state -cne 'pending' -or [int]$Record.attempts -ne 0 -or
+        $null -ne $Record.resultDigest -or $null -ne $Record.incompleteReason) {
+        return $false
+    }
+    $Record.schemaVersion = 2
+    $Record['modelExecutionState'] = 'notAttempted'
+    return $true
 }
 
 function New-OwnerV2AcquisitionContract {
@@ -975,7 +1039,7 @@ function New-OwnerV2Record {
     $identity = $Entry.Identity
     $nowText = 'utc:' + ([DateTime]::UtcNow).ToString('o')
     return [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         kind = 'owner-v2-preview-record'
         identity = $identity
         stateDigest = $Entry.StateDigest
@@ -989,6 +1053,7 @@ function New-OwnerV2Record {
         configDigest = Get-OwnerV2Digest -Value $Entry.Declaration.config
         acquisitionPayloadDigest = [string]$Entry.Declaration.acquisitionPayloadDigest
         state = 'pending'
+        modelExecutionState = 'notAttempted'
         attempts = 0
         maxAttempts = $MaxAttempts
         lease = $null
@@ -1016,6 +1081,10 @@ function Get-OwnerV2IndexRecord {
         ruleDigest = [string]$Record.ruleDigest
         modelDigest = [string]$Record.modelDigest
         configDigest = [string]$Record.configDigest
+        modelExecutionState = $(if ([int]$Record.schemaVersion -eq 2) {
+                [string]$Record.modelExecutionState
+            }
+            else { 'unknown' })
         attempts = [int]$Record.attempts
         maxAttempts = [int]$Record.maxAttempts
         updatedUtc = [string]$Record.updatedUtc
@@ -1175,25 +1244,66 @@ function Test-OwnerV2LiveRetryEligible {
         [AllowNull()][string]$Model,
         [AllowNull()][string]$CredentialEnvironmentName
     )
-    if ([string]$Record.incompleteReason -ceq 'interrupted') {
-        return $true
-    }
     if ([string]$Entry.Declaration.mode -cne 'live' -or -not $EnableLiveModel) {
         return $false
     }
-    switch ([string]$Record.incompleteReason) {
-        'live-model-disabled' { return $true }
-        'acquisition-provider-unavailable' { return $null -ne $AcquisitionProvider }
-        'live-model-configuration-missing' {
-            return $null -ne $AcquisitionProvider -and (
-                $null -ne $ModelProvider -or (
-                    -not [string]::IsNullOrWhiteSpace($Model) -and
-                    -not [string]::IsNullOrWhiteSpace($CredentialEnvironmentName)
-                )
-            )
-        }
-        default { return $false }
+    if ([int]$Record.schemaVersion -ne 2 -or
+        [string]$Record.modelExecutionState -cne 'notAttempted' -or
+        [int]$Record.attempts -ge [int]$Record.maxAttempts -or
+        $null -eq $AcquisitionProvider -or
+        ($null -eq $ModelProvider -and (
+            [string]::IsNullOrWhiteSpace($Model) -or
+            [string]::IsNullOrWhiteSpace($CredentialEnvironmentName)
+        ))) {
+        return $false
     }
+    return [string]$Record.incompleteReason -cnotin $script:OwnerV2NonRecoverableRetryReasons
+}
+
+function Set-OwnerV2ModelExecutionAttempted {
+    param(
+        [Parameter(Mandatory)][string]$CapabilityRoot,
+        [Parameter(Mandatory)][string]$RecordPath,
+        [Parameter(Mandatory)][string]$ReservationId
+    )
+    $lock = Enter-AgentLock -Path (Join-Path $CapabilityRoot 'owner-v2-preview.lock') `
+        -AgentName 'owner-v2-orchestrator'
+    try {
+        $record = Read-OwnerV2JsonFile -Path $RecordPath
+        Assert-OwnerV2Record -Record $record
+        if ([int]$record.schemaVersion -ne 2 -or [string]$record.state -cne 'running' -or
+            $record.lease -isnot [Collections.IDictionary] -or
+            [string]$record.lease.id -cne $ReservationId) {
+            throw 'Owner v2 model execution reservation was lost before launch.'
+        }
+        if ([string]$record.modelExecutionState -ceq 'attempted') { return }
+        $record.modelExecutionState = 'attempted'
+        $record.updatedUtc = 'utc:' + ([DateTime]::UtcNow).ToString('o')
+        [void](Write-OwnerV2AtomicJson -Path $RecordPath -Value $record)
+        [void](Write-OwnerV2Index -CapabilityRoot $CapabilityRoot)
+    }
+    finally {
+        Exit-AgentLock -Stream $lock
+    }
+}
+
+function New-OwnerV2AttemptTrackingRunner {
+    param(
+        [Parameter(Mandatory)][object]$Runner,
+        [Parameter(Mandatory)][scriptblock]$MarkModelAttempted
+    )
+    $marked = $false
+    $handler = {
+        param($Request)
+        if (-not $marked) {
+            & $MarkModelAttempted
+            $marked = $true
+        }
+        & $Runner.Handler $Request
+    }.GetNewClosure()
+    $telemetryProvider = { & $Runner.TelemetryProvider }.GetNewClosure()
+    return New-OwnerSemanticRunner -Name ([string]$Runner.Name) -Handler $handler `
+        -TelemetryProvider $telemetryProvider
 }
 
 function New-RelationV2UnavailableObservation {
@@ -1520,7 +1630,8 @@ function Invoke-RelationV2Live {
         [AllowNull()][object]$AcquisitionProvider,
         [AllowNull()][object]$ModelProvider,
         [AllowNull()][string]$Model,
-        [AllowNull()][string]$CredentialEnvironmentName
+        [AllowNull()][string]$CredentialEnvironmentName,
+        [Parameter(Mandatory)][scriptblock]$MarkModelAttempted
     )
     if (-not $EnableLiveModel) {
         return New-RelationV2LiveOutcome -Entry $Entry -Reason 'live-model-disabled'
@@ -1540,7 +1651,9 @@ function Invoke-RelationV2Live {
     }
     $preflight = Test-OwnerModelProviderPreflight -Provider $provider
     if ([string]$preflight.modelIdentity -cne [string]$Entry.Declaration.model.id) {
-        return New-RelationV2LiveOutcome -Entry $Entry -Reason 'model-binding-mismatch'
+        return New-RelationV2LiveOutcome -Entry $Entry -Reason 'model-binding-mismatch' `
+            -Telemetry (New-OwnerV2PreflightTelemetry -Preflight $preflight `
+                -Reason 'model-binding-mismatch')
     }
     if (-not [bool]$preflight.available) {
         $reason = [string]$preflight.reason
@@ -1560,6 +1673,8 @@ function Invoke-RelationV2Live {
     }
     $runner = New-RelationEvidenceModelProcessRunner -Provider $provider `
         -Limits (New-OwnerModelRunnerLimits -MaximumAttemptsPerUnit 1) -EnableRealLaunch
+    $runner = New-OwnerV2AttemptTrackingRunner -Runner $runner `
+        -MarkModelAttempted $MarkModelAttempted
     $request = $built.Request
     $result = Invoke-OwnerReviewPipeline -Binding $request.Binding `
         -AcquisitionAdapter (New-RelationEvidenceAcquisitionAdapter -Request $request) `
@@ -1593,7 +1708,8 @@ function Invoke-OwnerV2Live {
         [AllowNull()][object]$AcquisitionProvider,
         [AllowNull()][object]$ModelProvider,
         [AllowNull()][string]$Model,
-        [AllowNull()][string]$CredentialEnvironmentName
+        [AllowNull()][string]$CredentialEnvironmentName,
+        [Parameter(Mandatory)][scriptblock]$MarkModelAttempted
     )
     if (-not $EnableLiveModel) {
         return New-OwnerV2LiveOutcome -Entry $Entry -Reason 'live-model-disabled'
@@ -1614,7 +1730,9 @@ function Invoke-OwnerV2Live {
     }
     $preflight = Test-OwnerModelProviderPreflight -Provider $provider
     if ([string]$preflight.modelIdentity -cne [string]$Entry.Declaration.model.id) {
-        return New-OwnerV2LiveOutcome -Entry $Entry -Reason 'model-binding-mismatch'
+        return New-OwnerV2LiveOutcome -Entry $Entry -Reason 'model-binding-mismatch' `
+            -Telemetry (New-OwnerV2PreflightTelemetry -Preflight $preflight `
+                -Reason 'model-binding-mismatch')
     }
     if (-not [bool]$preflight.available) {
         $reason = [string]$preflight.reason
@@ -1625,6 +1743,8 @@ function Invoke-OwnerV2Live {
     $runner = New-OwnerModelProcessRunner -Provider $provider `
         -Limits (New-OwnerModelRunnerLimits -MaximumAttemptsPerUnit 1) `
         -EnableRealLaunch
+    $runner = New-OwnerV2AttemptTrackingRunner -Runner $runner `
+        -MarkModelAttempted $MarkModelAttempted
     $acquisition = New-OwnerProductionAcquisitionAdapter `
         -Contract $Entry.Contract -Provider $AcquisitionProvider
     $capability = New-OwnerV2CapabilityAdapter -Runner $runner `
@@ -1839,6 +1959,11 @@ function Invoke-OwnerV2PreviewRun {
             }
             $record = Read-OwnerV2JsonFile -Path $recordPath
             Assert-OwnerV2Record -Record $record
+            Assert-OwnerV2RecordBinding -Record $record -Entry $entry
+            if (ConvertTo-OwnerV2CurrentRecord -Record $record) {
+                [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $record)
+                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
+            }
             $now = [DateTime]::UtcNow
             $retryEligible = Test-OwnerV2LiveRetryEligible -Entry $entry -Record $record `
                 -EnableLiveModel ([bool]$EnableLiveModel) `
@@ -1846,8 +1971,8 @@ function Invoke-OwnerV2PreviewRun {
                 -ModelProvider $LiveModelProvider `
                 -Model $LiveModel `
                 -CredentialEnvironmentName $LiveCredentialEnvironmentName
-            if ([string]$record.state -ceq 'completed' -or [string]$record.state -ceq 'unknown' -or
-                ([string]$record.state -ceq 'incomplete' -and -not $retryEligible)) {
+            if ([string]$record.state -ceq 'completed' -or
+                ([string]$record.state -cin @('incomplete', 'unknown') -and -not $retryEligible)) {
                 [void]$ran.Add([ordered]@{
                         identity = $identity
                         state = [string]$record.state
@@ -1857,6 +1982,28 @@ function Invoke-OwnerV2PreviewRun {
             }
             if ([string]$record.state -ceq 'running' -and -not (Test-OwnerV2LeaseStale -Record $record -NowUtc $now)) {
                 [void]$ran.Add([ordered]@{ identity = $identity; state = 'running'; reason = 'lease-active' })
+                continue
+            }
+            if ([string]$record.state -ceq 'running' -and
+                (Test-OwnerV2LeaseStale -Record $record -NowUtc $now) -and (
+                    [int]$record.schemaVersion -ne 2 -or
+                    [string]$record.modelExecutionState -ceq 'attempted'
+                )) {
+                $record.state = 'incomplete'
+                $record.lease = $null
+                $record.updatedUtc = 'utc:' + $now.ToString('o')
+                $record.incompleteReason = $(if ([int]$record.schemaVersion -eq 2) {
+                        'interrupted-after-model-attempt'
+                    }
+                    else { 'legacy-model-execution-unknown' })
+                [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $record)
+                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
+                [void]$ran.Add([ordered]@{
+                        identity = $identity
+                        state = 'incomplete'
+                        attempts = [int]$record.attempts
+                        reason = [string]$record.incompleteReason
+                    })
                 continue
             }
             if ([int]$record.attempts -ge [int]$record.maxAttempts) {
@@ -1896,23 +2043,43 @@ function Invoke-OwnerV2PreviewRun {
         $relationRequest = $null
         $finalState = 'unknown'
         $reason = $null
+        $executionTracker = @{ State = $(if ([int]$record.schemaVersion -eq 2) {
+                    [string]$record.modelExecutionState
+                }
+                else { 'unknown' }) }
+        $setModelExecutionAttemptedCommand = ${function:Set-OwnerV2ModelExecutionAttempted}
+        $markModelAttempted = {
+            & $setModelExecutionAttemptedCommand -CapabilityRoot $capabilityRoot `
+                -RecordPath $recordPath -ReservationId $reservationId
+            $executionTracker.State = 'attempted'
+        }.GetNewClosure()
         try {
-            $declarationPath = Get-OwnerV2DeclarationPath -CapabilityRoot $capabilityRoot -Identity $identity
-            $evidencePath = Get-OwnerV2EvidencePath -CapabilityRoot $capabilityRoot -Identity $identity
-            $declaration = Read-OwnerV2JsonFile -Path $declarationPath
-            $evidence = Read-OwnerV2JsonFile -Path $evidencePath
-            Assert-OwnerV2NoUnsafeShape -Value $declaration
-            Assert-OwnerV2NoUnsafeShape -Value $evidence
-            if ((Get-OwnerV2Digest -Value ($declaration | ForEach-Object {
-                            $copy = [ordered]@{}
-                            foreach ($key in @($_.Keys | Where-Object {
-                                        $_ -cne 'stateDigest' -and $_ -cne 'facadeBinding'
-                                    } | Sort-Object -CaseSensitive)) {
-                                $copy[$key] = $_[$key]
-                            }
-                            $copy
-                        })) -cne [string]$entry.StateDigest) {
-                throw 'Declaration digest did not match the manifest entry.'
+            try {
+                $declarationPath = Get-OwnerV2DeclarationPath -CapabilityRoot $capabilityRoot -Identity $identity
+                $evidencePath = Get-OwnerV2EvidencePath -CapabilityRoot $capabilityRoot -Identity $identity
+                $declaration = Read-OwnerV2JsonFile -Path $declarationPath
+                $evidence = Read-OwnerV2JsonFile -Path $evidencePath
+                Assert-OwnerV2NoUnsafeShape -Value $declaration
+                Assert-OwnerV2NoUnsafeShape -Value $evidence
+                if ((Get-OwnerV2Digest -Value ($declaration | ForEach-Object {
+                                $copy = [ordered]@{}
+                                foreach ($key in @($_.Keys | Where-Object {
+                                            $_ -cne 'stateDigest' -and $_ -cne 'facadeBinding'
+                                        } | Sort-Object -CaseSensitive)) {
+                                    $copy[$key] = $_[$key]
+                                }
+                                $copy
+                            })) -cne [string]$entry.StateDigest) {
+                    throw 'Declaration digest did not match the manifest entry.'
+                }
+                if ([string]$entry.Declaration.mode -cne 'live' -and
+                    [string]$evidence.acquisitionPayloadDigest -cne
+                    [string]$entry.Declaration.acquisitionPayloadDigest) {
+                    throw 'Evidence payload digest did not match the declaration.'
+                }
+            }
+            catch {
+                throw "[owner-v2-durable-integrity] $([string]$_.Exception.Message)"
             }
             if ([string]$entry.Declaration.mode -ceq 'live') {
                 $outcome = if ([string]$entry.CapabilityKind -ceq 'relation') {
@@ -1921,7 +2088,8 @@ function Invoke-OwnerV2PreviewRun {
                         -AcquisitionProvider $LiveAcquisitionProvider `
                         -ModelProvider $LiveModelProvider `
                         -Model $LiveModel `
-                        -CredentialEnvironmentName $LiveCredentialEnvironmentName
+                        -CredentialEnvironmentName $LiveCredentialEnvironmentName `
+                        -MarkModelAttempted $markModelAttempted
                 }
                 else {
                     Invoke-OwnerV2Live -Entry $entry `
@@ -1929,7 +2097,8 @@ function Invoke-OwnerV2PreviewRun {
                         -AcquisitionProvider $LiveAcquisitionProvider `
                         -ModelProvider $LiveModelProvider `
                         -Model $LiveModel `
-                        -CredentialEnvironmentName $LiveCredentialEnvironmentName
+                        -CredentialEnvironmentName $LiveCredentialEnvironmentName `
+                        -MarkModelAttempted $markModelAttempted
                 }
                 $observation = $outcome.Observation
                 $telemetry = $outcome.Telemetry
@@ -1943,9 +2112,6 @@ function Invoke-OwnerV2PreviewRun {
                 $reason = [string]$outcome.Reason
             }
             else {
-                if ([string]$evidence.acquisitionPayloadDigest -cne [string]$entry.Declaration.acquisitionPayloadDigest) {
-                    throw 'Evidence payload digest did not match the declaration.'
-                }
                 $outcome = Invoke-OwnerV2Replay -Entry $entry
                 $observation = $outcome.Observation
                 $lifecycleStatus = [string]$observation.lifecycle.status
@@ -1956,15 +2122,23 @@ function Invoke-OwnerV2PreviewRun {
             }
         }
         catch {
+            $reason = if (([string]$_.Exception.Message).StartsWith(
+                    '[owner-v2-durable-integrity]', [StringComparison]::Ordinal)) {
+                'durable-state-integrity-failure'
+            }
+            elseif ([string]$executionTracker.State -ceq 'notAttempted') {
+                'pre-model-execution-failure'
+            }
+            else { 'orchestrator-refusal' }
             if ([string]$entry.CapabilityKind -ceq 'relation') {
                 $observation = New-RelationV2UnavailableObservation -Entry $entry `
-                    -Reason 'orchestrator-refusal' -Status unknown
+                    -Reason $reason -Status unknown
                 $observation.execution.attempts = [int]$record.attempts
                 $observation['validationErrors'] = @([string]$_.Exception.Message)
             }
             else {
                 $observation = New-OwnerV2LiveUnavailableObservation -Entry $entry `
-                    -Reason 'orchestrator-refusal'
+                    -Reason $reason
                 $observation.lifecycle.status = 'unknown'
                 $observation.lifecycle.completed = 'unknown'
                 $observation.lifecycle.incomplete = 'unknown'
@@ -1972,18 +2146,17 @@ function Invoke-OwnerV2PreviewRun {
                 $observation.execution.attempts = [int]$record.attempts
                 $observation.execution.modelStarts = 'unknown'
                 $observation.execution.latencyMs = 'unknown'
-                $observation.execution.refusalReason = 'orchestrator-refusal'
-                $observation.execution.incompleteReason = 'orchestrator-refusal'
+                $observation.execution.refusalReason = $reason
+                $observation.execution.incompleteReason = $reason
                 $observation.measurements.execution.attempts =
                     New-OwnerMeasurement -Status measured -Value ([int]$record.attempts)
                 $observation.measurements.execution.modelStarts =
-                    New-OwnerMeasurement -Status unavailable -Reason 'orchestrator-refusal'
+                    New-OwnerMeasurement -Status unavailable -Reason $reason
                 $observation.measurements.execution.latencyMs =
-                    New-OwnerMeasurement -Status unavailable -Reason 'orchestrator-refusal'
+                    New-OwnerMeasurement -Status unavailable -Reason $reason
                 $observation.validationErrors = @([string]$_.Exception.Message)
             }
             $finalState = 'unknown'
-            $reason = 'orchestrator-refusal'
         }
 
         Invoke-OwnerV2Checkpoint -Name 'run-before-publish'
@@ -2035,6 +2208,11 @@ function Invoke-OwnerV2PreviewRun {
                     )
             }
             if ($null -ne $telemetry) {
+                $attemptTelemetryPath = Get-OwnerV2AttemptTelemetryPath `
+                    -CapabilityRoot $capabilityRoot -Identity $identity `
+                    -Attempt ([int]$record.attempts)
+                [void](Write-OwnerV2AtomicJson -Path $attemptTelemetryPath `
+                    -Value $telemetry -Immutable)
                 [void](Write-OwnerV2AtomicJson -Path $telemetryPath -Value $telemetry)
                 $telemetrySha = ([Convert]::ToHexString(
                         [Security.Cryptography.SHA256]::HashData(
@@ -2111,6 +2289,7 @@ function Get-OwnerV2PreviewStatus {
                     ruleDigest = Get-OwnerV2Digest -Value $entry.Declaration.rule
                     modelDigest = Get-OwnerV2Digest -Value $entry.Declaration.model
                     configDigest = Get-OwnerV2Digest -Value $entry.Declaration.config
+                    modelExecutionState = 'unknown'
                     attempts = 0
                     maxAttempts = 0
                     updatedUtc = $null
