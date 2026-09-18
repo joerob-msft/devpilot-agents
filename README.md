@@ -128,7 +128,8 @@ It is resolved from the consumer repository identified by `RepoPath`, even when
 the handler runs the model from a separate PR worktree. The skill is read as
 unattended, wrapper-managed guidance only: it cannot change tool grants,
 permissions, model selection, PreviewOnly behavior, PR/worktree binding, or the
-`REVIEW_HANDLER_RESULT_V1` contract, and its metadata is not executed as
+`REVIEW_HANDLER_RESULT_V2` contract (with V1 parsing retained for compatibility),
+and its metadata is not executed as
 configuration. Invalid explicit configuration fails startup. Omitting
 `handlerSkills` preserves the existing handler behavior.
 
@@ -375,7 +376,16 @@ without treating process creation as successful initialization. Configuration,
 policy, attestation, and malformed-response failures remain terminal. Later
 cycle failures use the existing retry backoff. The compact automatic-polling status
 shows the configured cadence and whether agents are scanning, waiting, or
-paused for manual work. Press **`r` Scan now** in a main view to wake this
+paused for manual work.
+
+Candidate starvation is source-commit scoped. Only independently verified,
+deterministic PR failures (for example repeated validation failures) increment
+the threshold on the same source commit. MCP/host faults, model timeouts,
+missing result markers, partial-work recovery, and a PR source changing during
+the cycle are transient states: they retain diagnostics, use backoff, and are
+reconciled or retried without permanently blocking the PR. Legacy PR-wide
+attempt records and records for an older source commit are cleared when the
+latest source is selected. Press **`r` Scan now** in a main view to wake this
 launcher's idle pollers early. It does not interrupt running work, queue an
 extra scan behind a busy agent, or bypass manual-work priority. It also does
 not restart stopped agents or grant control to an observe-only dashboard.

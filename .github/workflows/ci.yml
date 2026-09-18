@@ -186,6 +186,7 @@ jobs:
             './tests/DispatchProtocol.Tests.ps1',
             './tests/DurableState.Tests.ps1',
             './tests/DurableStateMigration.Tests.ps1',
+            './tests/FailureRecovery.Tests.ps1',
             './tests/Invoke-TimedProcess.Tests.ps1',
             './tests/ManualRedispatch.Tests.ps1',
             './tests/ReviewHandler.Resume.Tests.ps1',

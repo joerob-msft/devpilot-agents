@@ -58,6 +58,19 @@ test("stable event names become concise narrative while raw summaries retain ide
   assert.match(eventSummary(completed), /^review\.completed PR 94/);
 });
 
+test("transient recovery classes remain distinct from deterministic starvation", () => {
+  assert.match(eventNarrative(namedEvent("work.completed", { failureClass: "source-changed" }, "latest source queued")),
+    /^Source changed; latest commit will retry/);
+  assert.match(eventNarrative(namedEvent("work.completed", { failureClass: "timed-out" }, "backoff")),
+    /^Model timed out; transient retry scheduled/);
+  assert.match(eventNarrative(namedEvent("work.completed", { failureClass: "contract-failure" }, "marker missing")),
+    /^Result contract missing; retry scheduled/);
+  assert.match(eventNarrative(namedEvent("work.completed", { failureClass: "partial-work-unconfirmed" }, "reconcile")),
+    /^Partial work detected; reconciliation required/);
+  assert.match(eventNarrative(namedEvent("delivery.blocked", { failureClass: "deterministic" }, "threshold")),
+    /^Deterministic PR failure/);
+});
+
 test("repository-state contention names only the requested role, retains the reason, and distinguishes PR leases", () => {
   const detail = "state-contended: repository state is busy";
   for (const [role, label] of [["reviewer", "Reviewer"], ["review-handler", "Review Handler"]] as const) {

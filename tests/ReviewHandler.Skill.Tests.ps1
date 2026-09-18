@@ -140,10 +140,13 @@ Describe 'review-handler repository skill selection' {
         $script:PrimaryHandlerSkillPath =
             Resolve-HandlerPrimarySkillConfig -Config $fixture.Config -RepositoryRoot $fixture.Root
 
+        $started = [DateTime]::UtcNow
         $runtime = Get-HandlerRuntimeContext -Nonce ('a' * 36) -PermissionMode Constrained -PrId 42 `
             -RepositoryId '11111111-1111-1111-1111-111111111111' -SourceCommit ('b' * 40) `
             -SourceBranch 'operator/change' -WorktreePath $fixture.Worktree -ResolvedSessionId none `
-            -ThreadDigestText 'threadId=7; actionable=true'
+            -ThreadDigestText 'threadId=7; actionable=true' -CycleStartedAtUtc $started `
+            -CycleDeadlineUtc $started.AddMinutes(30) -FinalizationCutoffUtc $started.AddMinutes(27) `
+            -EffectiveFinalizationReserveSeconds 180
         $input = Get-HandlerModelInput -PromptPath $script:promptPath -RuntimeContext $runtime
 
         $script:PrimaryHandlerSkillPath | Should -BeExactly ([IO.Path]::GetFullPath($fixture.SkillPath))
@@ -158,10 +161,13 @@ Describe 'review-handler repository skill selection' {
         $fixture = New-ConsumerFixture -IncludeSkill
         $script:PrimaryHandlerSkillPath =
             Resolve-HandlerPrimarySkillConfig -Config $fixture.Config -RepositoryRoot $fixture.Root
+        $started = [DateTime]::UtcNow
         $runtime = Get-HandlerRuntimeContext -Nonce ('c' * 36) -PermissionMode Constrained -PrId 84 `
             -RepositoryId '11111111-1111-1111-1111-111111111111' -SourceCommit ('d' * 40) `
             -SourceBranch 'operator/manual' -WorktreePath $fixture.Worktree -ResolvedSessionId none `
-            -ThreadDigestText 'threadId=9; actionable=true'
+            -ThreadDigestText 'threadId=9; actionable=true' -CycleStartedAtUtc $started `
+            -CycleDeadlineUtc $started.AddMinutes(30) -FinalizationCutoffUtc $started.AddMinutes(27) `
+            -EffectiveFinalizationReserveSeconds 180
 
         $input = Get-HandlerModelInput -PromptPath $script:promptPath -RuntimeContext $runtime `
             -OperatorContext 'Manual dispatch request: inspect the reviewer evidence.'

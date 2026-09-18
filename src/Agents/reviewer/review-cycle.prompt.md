@@ -60,8 +60,8 @@ all hold:
 - the current source commit exactly equals the injected full 40-hex commit.
 
 If anything mismatches, print a one-line reason and stop — do **not** emit a
-marker. The wrapper treats a missing marker as a failed cycle, which is correct
-here.
+marker. The wrapper independently re-reads the source and classifies a verified
+source change as transient recovery, not as a PR-specific starvation failure.
 
 ## Step 2 — Read the change
 
@@ -193,6 +193,12 @@ severity list and the PR's current state, and casts a vote only if the operator
 explicitly enabled voting. Never assume a vote happened.
 
 ## Step 6 — Emit the result marker
+
+The Runtime context includes an exact hard deadline and an earlier finalization
+cutoff. Do not start new investigation or tool calls after the cutoff. Use the
+reserved finalization window to re-read the source commit, summarize, and emit
+the marker. If the source changed, report that fact and stop without a marker;
+the wrapper verifies and requeues the latest source.
 
 The **final non-blank output line** must be exactly one line of the form:
 

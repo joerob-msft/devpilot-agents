@@ -163,10 +163,15 @@ leave your changes staged/committed locally as the wrapper directs and report
 
 ## Step 7 — Emit the result marker
 
+The Runtime context includes an exact hard deadline and an earlier finalization
+cutoff. Do not start new investigation, edits, validation, or tool calls after
+the finalization cutoff. Use the reserved finalization window to re-read the PR
+source commit, summarize observable effects, and emit the terminal marker.
+
 The **final non-blank output line** must be exactly one line of the form:
 
 ```text
-REVIEW_HANDLER_RESULT_V1: {"schemaVersion":1,"prId":<int>,"repositoryId":"<guid>","project":"<string>","handledSourceCommit":"<40-hex>","threadsAddressed":<int>,"threadsReplied":<int>,"commitsPushed":<int>,"pushedCommit":"<40-hex|null>","validation":"<passed|failed|skipped>","readyToComplete":<bool>,"nonce":"<runtime nonce>"}
+REVIEW_HANDLER_RESULT_V2: {"schemaVersion":2,"prId":<int>,"repositoryId":"<guid>","project":"<string>","handledSourceCommit":"<40-hex>","threadsAddressed":<int>,"threadsReplied":<int>,"commitsPushed":<int>,"pushedCommit":"<40-hex|null>","validation":"<passed|failed|skipped>","readyToComplete":<bool>,"nonce":"<runtime nonce>","outcome":"<handled|source-changed|deadline-reached|no-safe-progress>","observedSourceCommit":"<40-hex|null>"}
 ```
 
 Requirements:
@@ -174,6 +179,17 @@ Requirements:
 - Copy the Runtime context **nonce** exactly and case-sensitively into `nonce`.
 - Copy the wrapper-bound `project`, `repositoryId` GUID, `prId`, and
   `handledSourceCommit` (the injected 40-hex source commit) exactly.
+- Use `outcome: "handled"` for the ordinary successful contract.
+- If the PR source commit no longer equals the bound commit, stop making
+  changes, set `outcome: "source-changed"`, copy the newly observed commit into
+  `observedSourceCommit`, set `readyToComplete: false`, and still emit the
+  marker. The wrapper independently verifies the source change.
+- If the finalization cutoff has arrived and you cannot safely finish, use
+  `deadline-reached` or `no-safe-progress`, set `readyToComplete: false`, and
+  report only effects you can verify. Never invent successful writes.
+- For `handled`, set `observedSourceCommit` to the current PR source commit
+  after final revalidation; it should equal the bound commit unless your own
+  pushed commit advanced the source.
 - `pushedCommit` is the 40-hex commit you pushed, or JSON `null` if you pushed
   nothing.
 - `threadsAddressed` counts actionable threads you resolved or answered;

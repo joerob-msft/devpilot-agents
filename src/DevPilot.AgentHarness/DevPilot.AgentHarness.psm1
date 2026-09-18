@@ -5558,9 +5558,14 @@ function Invoke-TimedProcess {
             }
         }
 
-        $stdoutResult = Get-TaskTextBeforeDeadline -Task $stdoutTask -DeadlineUtc $deadline
-        $stderrResult = Get-TaskTextBeforeDeadline -Task $stderrTask -DeadlineUtc $deadline
-        if (-not $stdoutResult.Completed -or -not $stderrResult.Completed) { $timedOut = $true }
+        # The execution deadline controls termination, not diagnostic loss.
+        # After a timeout/cancellation, give closed stdout/stderr pipes a fresh
+        # bounded grace period to flush buffered JSONL and error text.
+        $drainDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        $stdoutResult = Get-TaskTextBeforeDeadline -Task $stdoutTask -DeadlineUtc $drainDeadline
+        $stderrResult = Get-TaskTextBeforeDeadline -Task $stderrTask -DeadlineUtc $drainDeadline
+        $outputDrained = $stdoutResult.Completed -and $stderrResult.Completed
+        if (-not $outputDrained) { $timedOut = $true }
 
         $exitCode = -1
         if ($exited -and -not $timedOut) {
@@ -5573,6 +5578,7 @@ function Invoke-TimedProcess {
             Cancelled = $cancelled
             StdOut    = $stdoutResult.Text
             StdErr    = $stderrResult.Text
+            OutputDrained = $outputDrained
             ProcessId = $proc.Id
         }
     }
@@ -5981,6 +5987,91 @@ function Remove-StaleAgentAttempts {
     }
     foreach ($key in $stale) { $AttemptsState.Remove($key) }
     return $stale.Count
+}
+
+function Get-AgentSourceScopedAttemptRecord {
+    param(
+        [AllowNull()]$Record,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$SourceCommit
+    )
+    $empty = @{
+        MatchesSource = $false; DeterministicCount = 0; FailureClass = ''
+        LastReason = ''; LastAt = ''; Retryable = $true; NextRetryAt = ''
+    }
+    $get = {
+        param($Value, [string]$Name, $Default)
+        if ($Value -is [Collections.IDictionary]) {
+            return $(if ($Value.Contains($Name)) { $Value[$Name] } else { $Default })
+        }
+        if ($Value -is [Management.Automation.PSCustomObject]) {
+            $property = $Value.PSObject.Properties[$Name]
+            return $(if ($property) { $property.Value } else { $Default })
+        }
+        return $Default
+    }
+    if ($Record -isnot [Collections.IDictionary] -and
+        $Record -isnot [Management.Automation.PSCustomObject]) {
+        return $empty
+    }
+    if ([int](& $get $Record 'schemaVersion' 0) -ne 2) { return $empty }
+    $recordSource = [string](& $get $Record 'sourceCommit' '')
+    if ($recordSource -ine $SourceCommit) { return $empty }
+    $failureClass = [string](& $get $Record 'failureClass' '')
+    $deterministicCount = [Math]::Max(0, [int](& $get $Record 'deterministicCount' 0))
+    return @{
+        MatchesSource = $true
+        DeterministicCount = $deterministicCount
+        FailureClass = $failureClass
+        LastReason = [string](& $get $Record 'lastReason' '')
+        LastAt = [string](& $get $Record 'lastAt' '')
+        Retryable = [bool](& $get $Record 'retryable' $true)
+        NextRetryAt = [string](& $get $Record 'nextRetryAt' '')
+    }
+}
+
+function Set-AgentSourceScopedAttemptRecord {
+    param(
+        [Parameter(Mandatory)][hashtable]$AttemptsState,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$SourceCommit,
+        [Parameter(Mandatory)][ValidateSet(
+            'source-changed', 'environment', 'stalled', 'timed-out',
+            'contract-failure', 'partial-work-unconfirmed', 'deterministic'
+        )][string]$FailureClass,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Reason,
+        [bool]$Retryable = $true,
+        [Nullable[DateTime]]$NextRetryAtUtc,
+        [ValidateRange(0, [int]::MaxValue)][int]$CarryDeterministicCount = 0
+    )
+    $key = [string]$PullRequestId
+    $prior = Get-AgentSourceScopedAttemptRecord -Record $AttemptsState[$key] -SourceCommit $SourceCommit
+    $priorCount = [Math]::Max([int]$prior.DeterministicCount, $CarryDeterministicCount)
+    $count = if ($FailureClass -eq 'deterministic') { $priorCount + 1 } else { $priorCount }
+    $AttemptsState[$key] = @{
+        schemaVersion = 2
+        sourceCommit = $SourceCommit.ToLowerInvariant()
+        failureClass = $FailureClass
+        deterministicCount = $count
+        lastAt = [DateTime]::UtcNow.ToString('o')
+        lastReason = $Reason
+        retryable = $Retryable
+        nextRetryAt = $(if ($NextRetryAtUtc) { ([DateTime]$NextRetryAtUtc).ToUniversalTime().ToString('o') } else { '' })
+    }
+    return $AttemptsState[$key]
+}
+
+function Remove-AgentAttemptRecordForDifferentSource {
+    param(
+        [Parameter(Mandatory)][hashtable]$AttemptsState,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$SourceCommit
+    )
+    $key = [string]$PullRequestId
+    if (-not $AttemptsState.ContainsKey($key)) { return $false }
+    $record = Get-AgentSourceScopedAttemptRecord -Record $AttemptsState[$key] -SourceCommit $SourceCommit
+    if ($record.MatchesSource) { return $false }
+    $AttemptsState.Remove($key)
+    return $true
 }
 
 function Get-AgentWorkIqTargetUrl {
@@ -7192,6 +7283,9 @@ Export-ModuleMember -Function @(
     "Get-AgentMissingMcpServers",
     "Get-AgentLaunchFailureReason",
     "Remove-StaleAgentAttempts",
+    "Get-AgentSourceScopedAttemptRecord",
+    "Set-AgentSourceScopedAttemptRecord",
+    "Remove-AgentAttemptRecordForDifferentSource",
     "Get-AgentCliJsonOutcome",
     "Invoke-AgentWorkIqTool",
     "Send-AgentTeamsChannelMessage",
