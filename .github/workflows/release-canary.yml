@@ -169,7 +169,8 @@ jobs:
           else { throw 'Unsupported canary resolutionMode.' }
           $pin | ConvertTo-Json | Set-Content -LiteralPath $pinPath -Encoding utf8
           $env:HOME = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-canary"
-          New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
+          $env:LOCALAPPDATA = Join-Path $env:HOME 'localappdata'
+          New-Item -ItemType Directory -Path $env:HOME, $env:LOCALAPPDATA -Force | Out-Null
           for ($attempt = 1; $attempt -le $count; $attempt++) {
             Write-Host "Read-only canary attempt $attempt of $count."
             $installed = & (Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1') `
