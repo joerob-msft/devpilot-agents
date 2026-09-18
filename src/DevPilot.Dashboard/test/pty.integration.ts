@@ -1629,8 +1629,9 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
     await writeAndWait("\x1b[B", "> EnableThreadReplies");
     await writeAndWait("o", "repo-worktree / EnableThreadReplies -> off");
     await waitForVisible("First confirmation: press c to review the final apply gate; Esc cancels.");
-    await writeAndWait("\x1b", "SETTINGS - EDIT PERSISTED NARROWING");
-    await writeAndWait("\x1b", "SETTINGS - EFFECTIVE CAPABILITY PROFILE");
+    await writeAndWaitForHidden("\x1b", "First confirmation: press c to review the final apply gate; Esc cancels.");
+    await writeAndWaitForHidden("\x1b", "SETTINGS - EDIT PERSISTED NARROWING");
+    await waitForVisible("SETTINGS - EFFECTIVE CAPABILITY PROFILE");
 
     // Kill switch first-stage cancel: k shows the full-disclosure warning; Esc backs out with no
     // set-kill-switch RPC.
