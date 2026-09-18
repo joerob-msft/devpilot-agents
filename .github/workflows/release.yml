@@ -273,7 +273,7 @@ jobs:
             mode = 'exactCommit'
             commit = $env:CANDIDATE_COMMIT
           } | ConvertTo-Json | Set-Content -LiteralPath $pinPath -Encoding utf8
-          $env:HOME = Join-Path $env:RUNNER_TEMP 'devpilot-home'
+          $env:HOME = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-installed"
           $env:USERPROFILE = $env:HOME
           New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
           $installer = Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1'
@@ -291,6 +291,12 @@ jobs:
           & (Join-Path $installed.Root 'tools\Invoke-InstalledReleaseQualification.ps1') `
             -ToolkitRoot $installed.Root -ExpectedVersion $env:RELEASE_VERSION `
             -ExpectedCommit $env:CANDIDATE_COMMIT
+      - name: Remove temporary installed-artifact cache
+        if: always()
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-installed"
+          if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
 
   publish:
     name: Publish immutable patch and promote channel
@@ -420,7 +426,7 @@ jobs:
             exactVersion = $env:RELEASE_VERSION
           } | ConvertTo-Json | Set-Content -LiteralPath `
             (Join-Path $consumer '.github\copilot\agents\devpilot-toolkit.lock.json') -Encoding utf8
-          $env:HOME = Join-Path $env:RUNNER_TEMP 'final-smoke-home'
+          $env:HOME = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-publish"
           $env:USERPROFILE = $env:HOME
           New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
           $installed = & (Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1') `
@@ -459,3 +465,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Could not create the local v0.4 channel tag.' }
           git push --force origin refs/tags/v0.4
           if ($LASTEXITCODE -ne 0) { throw 'Could not advance the protected v0.4 channel.' }
+      - name: Remove temporary publication cache
+        if: always()
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-publish"
+          if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }

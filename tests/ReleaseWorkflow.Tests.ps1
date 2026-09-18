@@ -28,6 +28,7 @@ Describe 'Release publication boundary' {
         $release | Should -Match 'main moved after final smoke'
         $release | Should -Match 'resumePublishedTag'
         $release | Should -Match 'WORKFLOW_RUN_SHA: \$\{\{ github\.sha \}\}'
+        $release | Should -Match 'Remove temporary publication cache'
     }
 
     It 'qualifies a clean commit-addressed consumer installation before publication' {
@@ -35,6 +36,7 @@ Describe 'Release publication boundary' {
         $release | Should -Match 'Invoke-InstalledReleaseQualification\.ps1'
         $release | Should -Match 'Install-DevPilotAgents\.Tests\.ps1'
         $release | Should -Match 'Start-DevPilot\.Tests\.ps1'
+        $release | Should -Match 'Remove temporary installed-artifact cache'
         $installedQualification | Should -Match 'DEVPILOT_INSTALLED_PESTER_PATHS'
         $installedQualification | Should -Match '-NoProfile -NonInteractive'
         $installedQualification | Should -Match 'Push-Location \$dashboard'
@@ -47,6 +49,7 @@ Describe 'Release publication boundary' {
         $canary | Should -Match 'PreviewOnly = \$true'
         $canary | Should -Match 'consecutiveRuns must be between 3 and 5'
         $canary | Should -Match 'Canary \$\{\{ inputs\.resolutionMode \}\}'
+        $canary | Should -Match 'Remove temporary canary cache'
         $release | Should -Match 'Verify mandatory live canary'
     }
 
@@ -60,6 +63,7 @@ Describe 'Release publication boundary' {
         $promotion | Should -Match 'main moved after rollback smoke'
         $promotion | Should -Match 'GH_TOKEN: \$\{\{ github\.token \}\}'
         $promotion | Should -Match 'Rollback stable GitHub Release changed during qualification'
+        $promotion | Should -Match 'Remove temporary rollback cache'
         $promotion | Should -Match 'git push --force origin refs/tags/v0.4'
     }
 

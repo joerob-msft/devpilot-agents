@@ -167,7 +167,7 @@ jobs:
           }
           else { throw 'Unsupported canary resolutionMode.' }
           $pin | ConvertTo-Json | Set-Content -LiteralPath $pinPath -Encoding utf8
-          $env:HOME = Join-Path $env:RUNNER_TEMP 'devpilot-home'
+          $env:HOME = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-canary"
           $env:USERPROFILE = $env:HOME
           New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
           $installed = & (Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1') `
@@ -189,3 +189,9 @@ jobs:
             & (Join-Path $consumer 'Start-DevPilot.ps1') @arguments
             if ($LASTEXITCODE -ne 0) { throw "Read-only canary attempt $attempt failed." }
           }
+      - name: Remove temporary canary cache
+        if: always()
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-canary"
+          if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
