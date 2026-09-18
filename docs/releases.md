@@ -64,14 +64,15 @@ and is the sole compatible patch tag on that commit. An existing Release must
 be stable. All deterministic, consumer, canary, and final installed gates run
 again before the channel can move.
 
-The live canary is **mandatory before advancing `v0.4`**. It runs three to five
-consecutive `Start-DevPilot.ps1 -PreviewOnly -Once` launches from the installed
-candidate cache on a dedicated self-hosted Windows runner labeled
-`devpilot-canary`. PreviewOnly disables PR, repository, pipeline, work-item,
-Teams, and notification writes while still exercising authenticated MCP
-startup and representative repository/PR reads. The runner must execute as the
-dedicated operator account with Agency/Copilot, ADO, and WorkIQ already
-authenticated. The canary opts its Agency children out of the
+The live canary is **mandatory before advancing `v0.4`**. It performs three to
+five consecutive installed-candidate resolutions and fresh authenticated ADO
+and WorkIQ MCP sessions on a dedicated self-hosted Windows runner labeled
+`devpilot-canary`. Each attempt verifies repository identity, reads the
+configured reviewer and review-handler PR snapshots, and reads WorkIQ `/me`.
+The script exposes no write operation and does not start a model or dashboard;
+those process boundaries are covered by deterministic installed-artifact
+qualification. The runner must execute as the dedicated operator account with
+Agency/Copilot, ADO, and WorkIQ already authenticated. The canary opts its Agency children out of the
 `GITHUB_ACTIONS` pipeline-auth marker so they use that desktop identity; the
 workflow itself remains a GitHub Actions job. HOME, LOCALAPPDATA, watch state,
 durable state, and leases are run-scoped so operator caches and legacy records
