@@ -73,8 +73,10 @@ startup and representative repository/PR reads. The runner must execute as the
 dedicated operator account with Agency/Copilot, ADO, and WorkIQ already
 authenticated. The canary opts its Agency children out of the
 `GITHUB_ACTIONS` pipeline-auth marker so they use that desktop identity; the
-workflow itself remains a GitHub Actions job. Never assign this label to
-pull-request jobs or a shared general-purpose runner.
+workflow itself remains a GitHub Actions job. HOME, LOCALAPPDATA, watch state,
+durable state, and leases are run-scoped so operator caches and legacy records
+cannot affect the result. Never assign this label to pull-request jobs or a
+shared general-purpose runner.
 
 ## Required environments and credentials
 
