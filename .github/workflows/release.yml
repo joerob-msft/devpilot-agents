@@ -21,7 +21,7 @@ on:
         required: true
         type: string
       resumePublishedTag:
-        description: Resume an exact immutable tag left without a GitHub Release
+        description: Resume an exact immutable tag after interrupted Release or channel publication
         required: true
         default: false
         type: boolean
@@ -131,10 +131,13 @@ jobs:
             $releaseLookup = @(gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$candidateTag" 2>&1)
             $releaseExit = $LASTEXITCODE
             if ($releaseExit -eq 0) {
-              throw 'Resume is allowed only for an immutable tag without a GitHub Release.'
+              $existingRelease = ($releaseLookup -join "`n") | ConvertFrom-Json
+              if ($existingRelease.draft -or $existingRelease.prerelease) {
+                throw 'Existing resume Release is not stable.'
+              }
             }
-            if (($releaseLookup -join "`n") -notmatch 'HTTP 404') {
-              throw 'Could not prove that the resume tag has no GitHub Release.'
+            elseif (($releaseLookup -join "`n") -notmatch 'HTTP 404') {
+              throw 'Could not verify the resume Release state.'
             }
           }
 
@@ -298,27 +301,20 @@ jobs:
           $path = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-installed"
           if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
 
-  publish:
-    name: Publish immutable patch and promote channel
+  publish-immutable:
+    name: Publish immutable patch tag
     needs: [windows-complete, platform-safety, canary-gate, installed-artifact]
-    runs-on: [self-hosted, Windows, X64, devpilot-canary]
-    timeout-minutes: 120
+    runs-on: windows-latest
+    timeout-minutes: 30
     environment: release-publish
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.candidateCommit }}
           fetch-depth: 0
-          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          package-manager-cache: false
-      - name: Install Pester
-        shell: pwsh
-        run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+          persist-credentials: false
       - name: Recheck publication boundary
         shell: pwsh
         env:
@@ -358,13 +354,31 @@ jobs:
           $releaseLookup = @(gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tagName" 2>&1)
           $releaseExit = $LASTEXITCODE
           if ($releaseExit -eq 0) {
-            throw 'A GitHub Release already exists for the requested immutable version.'
+            if (-not $resume) {
+              throw 'A GitHub Release already exists for the requested immutable version.'
+            }
+            $existingRelease = ($releaseLookup -join "`n") | ConvertFrom-Json
+            if ($existingRelease.draft -or $existingRelease.prerelease) {
+              throw 'Existing resume Release is not stable.'
+            }
           }
-          if (($releaseLookup -join "`n") -notmatch 'HTTP 404') {
-            throw 'Could not prove that the requested version has no GitHub Release.'
+          elseif (($releaseLookup -join "`n") -notmatch 'HTTP 404') {
+            throw 'Could not verify the requested GitHub Release state.'
           }
-          ./tools/Test-DevPilotVersion.ps1 -ExpectedVersion $env:RELEASE_VERSION `
-            -ExpectedTag $tagName
+          $version = (Get-Content -LiteralPath .\VERSION -Raw -Encoding UTF8).Trim()
+          $package = Get-Content -LiteralPath .\src\DevPilot.Dashboard\package.json -Raw |
+            ConvertFrom-Json
+          $metadata = Get-Content -LiteralPath .\release\release-metadata.json -Raw |
+            ConvertFrom-Json
+          $manifestText = Get-Content -LiteralPath `
+            .\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1 -Raw
+          if ($version -cne $env:RELEASE_VERSION -or
+              [string]$package.version -cne $env:RELEASE_VERSION -or
+              [string]$metadata.toolkitVersion -cne $env:RELEASE_VERSION -or
+              [string]$metadata.immutableTag -cne $tagName -or
+              $manifestText -cnotmatch "(?m)^\s*ModuleVersion\s*=\s*'$([regex]::Escape($env:RELEASE_VERSION))'\s*$") {
+            throw 'Fixed publication metadata no longer matches the qualified version.'
+          }
           $tagsOnCandidate = @(git tag --points-at $env:CANDIDATE_COMMIT |
             Where-Object { $_ -like 'v0.4.*' })
           if (-not $resume -and $tagsOnCandidate.Count -gt 0) {
@@ -379,14 +393,50 @@ jobs:
         env:
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
         run: |
-          git config user.name 'devpilot-release[bot]'
-          git config user.email 'devpilot-release[bot]@users.noreply.github.com'
-          $tagName = "v$($env:RELEASE_VERSION)"
-          git tag -a $tagName $env:CANDIDATE_COMMIT -m "DevPilot Agents $tagName"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not create the immutable annotated tag.' }
-          git push origin "refs/tags/$tagName"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not publish the immutable annotated tag.' }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'devpilot-release-key'
+          try {
+            [IO.File]::WriteAllText($keyPath, $env:RELEASE_DEPLOY_KEY,
+              [Text.UTF8Encoding]::new($false))
+            & icacls $keyPath /inheritance:r /grant:r "${env:USERNAME}:(R)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not protect the temporary release key.' }
+            git config user.name 'devpilot-release[bot]'
+            git config user.email 'devpilot-release[bot]@users.noreply.github.com'
+            $tagName = "v$($env:RELEASE_VERSION)"
+            git tag -a $tagName $env:CANDIDATE_COMMIT -m "DevPilot Agents $tagName"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the immutable annotated tag.' }
+            $ssh = "ssh -i `"$keyPath`" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            git -c "core.sshCommand=$ssh" push "git@github.com:$env:GITHUB_REPOSITORY.git" `
+              "refs/tags/$tagName"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not publish the immutable annotated tag.' }
+          }
+          finally {
+            Remove-Item -LiteralPath $keyPath -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:RELEASE_DEPLOY_KEY -ErrorAction SilentlyContinue
+          }
+
+  immutable-smoke:
+    name: Resolve immutable tag and repeat installed smoke
+    needs: publish-immutable
+    runs-on: [self-hosted, Windows, X64, devpilot-canary]
+    timeout-minutes: 120
+    environment: release-qualification
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.workflowCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
       - name: Clone protected consumer for final immutable-tag smoke test
         shell: pwsh
         env:
@@ -435,13 +485,35 @@ jobs:
               $installed.Version -cne $env:RELEASE_VERSION) {
             throw 'Immutable release did not resolve to the qualified candidate.'
           }
-          & (Join-Path $installed.Root 'tools\Invoke-InstalledReleaseQualification.ps1') `
-            -ToolkitRoot $installed.Root -ExpectedVersion $env:RELEASE_VERSION `
+          & .\tools\Invoke-InstalledReleaseQualification.ps1 -ToolkitRoot $installed.Root `
+            -ExpectedVersion $env:RELEASE_VERSION `
             -ExpectedCommit $env:CANDIDATE_COMMIT
+      - name: Remove temporary immutable smoke cache
+        if: always()
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-publish"
+          if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+
+  promote:
+    name: Publish stable Release and advance channel
+    needs: immutable-smoke
+    runs-on: windows-latest
+    timeout-minutes: 30
+    environment: release-publish
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.workflowCommit }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Publish stable Release and advance protected v0.4 channel
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
           WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RELEASE_VERSION: ${{ inputs.version }}
@@ -459,15 +531,35 @@ jobs:
               (git cat-file -t "refs/tags/$tagName").Trim() -cne 'tag') {
             throw 'Candidate commit must carry exactly one compatible annotated immutable release tag.'
           }
-          gh release create $tagName --verify-tag --generate-notes --title "DevPilot Agents $tagName"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not create the stable GitHub Release.' }
-          git tag -fa v0.4 $env:CANDIDATE_COMMIT -m 'DevPilot Agents 0.4 stable channel'
-          if ($LASTEXITCODE -ne 0) { throw 'Could not create the local v0.4 channel tag.' }
-          git push --force origin refs/tags/v0.4
-          if ($LASTEXITCODE -ne 0) { throw 'Could not advance the protected v0.4 channel.' }
-      - name: Remove temporary publication cache
-        if: always()
-        shell: pwsh
-        run: |
-          $path = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-publish"
-          if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+          $releaseLookup = @(gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tagName" 2>&1)
+          $releaseExit = $LASTEXITCODE
+          if ($releaseExit -eq 0) {
+            $releaseState = ($releaseLookup -join "`n") | ConvertFrom-Json
+            if ($releaseState.draft -or $releaseState.prerelease) {
+              throw 'Existing GitHub Release is not stable.'
+            }
+          }
+          elseif (($releaseLookup -join "`n") -match 'HTTP 404') {
+            gh release create $tagName --verify-tag --generate-notes --title "DevPilot Agents $tagName"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the stable GitHub Release.' }
+          }
+          else { throw 'Could not verify the existing GitHub Release state.' }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'devpilot-release-key'
+          try {
+            [IO.File]::WriteAllText($keyPath, $env:RELEASE_DEPLOY_KEY,
+              [Text.UTF8Encoding]::new($false))
+            & icacls $keyPath /inheritance:r /grant:r "${env:USERNAME}:(R)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not protect the temporary release key.' }
+            git config user.name 'devpilot-release[bot]'
+            git config user.email 'devpilot-release[bot]@users.noreply.github.com'
+            git tag -fa v0.4 $env:CANDIDATE_COMMIT -m 'DevPilot Agents 0.4 stable channel'
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the local v0.4 channel tag.' }
+            $ssh = "ssh -i `"$keyPath`" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            git -c "core.sshCommand=$ssh" push --force `
+              "git@github.com:$env:GITHUB_REPOSITORY.git" refs/tags/v0.4
+            if ($LASTEXITCODE -ne 0) { throw 'Could not advance the protected v0.4 channel.' }
+          }
+          finally {
+            Remove-Item -LiteralPath $keyPath -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:RELEASE_DEPLOY_KEY -ErrorAction SilentlyContinue
+          }

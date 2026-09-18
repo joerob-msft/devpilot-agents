@@ -170,16 +170,21 @@ jobs:
           $env:HOME = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-canary"
           $env:USERPROFILE = $env:HOME
           New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
-          $installed = & (Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1') `
-            -SetupDashboard -Refresh -PassThru
-          if ($installed.Commit -cne $env:CANDIDATE_COMMIT) {
-            throw 'Canary pin did not resolve to candidateCommit.'
-          }
           for ($attempt = 1; $attempt -le $count; $attempt++) {
             Write-Host "Read-only canary attempt $attempt of $count."
+            $installed = & (Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1') `
+              -SetupDashboard -Refresh -PassThru
+            if ($installed.Commit -cne $env:CANDIDATE_COMMIT) {
+              throw "Canary resolution attempt $attempt did not resolve to candidateCommit."
+            }
+            $attemptRoot = Join-Path $env:HOME "attempt-$attempt"
             $arguments = @{
+              ToolkitRoot = $installed.Root
               PreviewOnly = $true
               Once = $true
+              StateDir = Join-Path $attemptRoot 'watch'
+              DurableStateRoot = Join-Path $attemptRoot 'durable'
+              LeaseRoot = Join-Path $attemptRoot 'leases'
               EnableReviewerTeamsNotifications = $false
               EnableReviewHandlerTeamsNotifications = $false
               EnableReviewHandlerTeamsPrReferenceWrites = $false

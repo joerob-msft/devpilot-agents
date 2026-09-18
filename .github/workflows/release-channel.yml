@@ -25,20 +25,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  qualify-and-promote:
-    name: Verify qualified rollback or repromotion
+  qualify:
+    name: Qualify rollback or repromotion target
     runs-on: [self-hosted, Windows, X64, devpilot-canary]
     timeout-minutes: 120
-    environment: release-publish
+    environment: release-qualification
     permissions:
       actions: read
       contents: read
+    outputs:
+      target_commit: ${{ steps.target.outputs.commit }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.workflowCommit }}
           fetch-depth: 0
-          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+          persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
@@ -47,6 +49,7 @@ jobs:
         shell: pwsh
         run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
       - name: Verify main, immutable target, release, and canary
+        id: target
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -96,7 +99,7 @@ jobs:
               $run.display_title -cne "Canary exactVersion $($env:TARGET_VERSION) $targetCommit") {
             throw 'Mandatory exact-version canary did not qualify the target commit.'
           }
-          "TARGET_COMMIT=$targetCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "commit=$targetCommit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
       - name: Clone protected consumer
         shell: pwsh
         env:
@@ -126,6 +129,7 @@ jobs:
         shell: pwsh
         env:
           TARGET_VERSION: ${{ inputs.targetVersion }}
+          TARGET_COMMIT: ${{ steps.target.outputs.commit }}
         run: |
           $consumer = Join-Path $env:RUNNER_TEMP 'consumer'
           [ordered]@{
@@ -147,12 +151,35 @@ jobs:
           & .\tools\Invoke-InstalledReleaseQualification.ps1 -ToolkitRoot $installed.Root `
             -ExpectedVersion $env:TARGET_VERSION `
             -ExpectedCommit $env:TARGET_COMMIT
-      - name: Move protected v0.4 channel
+      - name: Remove temporary rollback cache
+        if: always()
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-rollback"
+          if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+
+  promote:
+    name: Move protected v0.4 channel
+    needs: qualify
+    runs-on: windows-latest
+    timeout-minutes: 30
+    environment: release-publish
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.workflowCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Revalidate and move channel
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
           WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
           TARGET_VERSION: ${{ inputs.targetVersion }}
+          TARGET_COMMIT: ${{ needs.qualify.outputs.target_commit }}
         run: |
           git fetch --quiet origin main --tags
           if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main after rollback smoke.' }
@@ -171,15 +198,22 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $stable -cne 'true') {
             throw 'Rollback stable GitHub Release changed during qualification.'
           }
-          git config user.name 'devpilot-release[bot]'
-          git config user.email 'devpilot-release[bot]@users.noreply.github.com'
-          git tag -fa v0.4 $env:TARGET_COMMIT -m 'DevPilot Agents 0.4 stable channel'
-          if ($LASTEXITCODE -ne 0) { throw 'Could not create the local v0.4 rollback tag.' }
-          git push --force origin refs/tags/v0.4
-          if ($LASTEXITCODE -ne 0) { throw 'Could not move the protected v0.4 channel.' }
-      - name: Remove temporary rollback cache
-        if: always()
-        shell: pwsh
-        run: |
-          $path = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-rollback"
-          if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'devpilot-release-key'
+          try {
+            [IO.File]::WriteAllText($keyPath, $env:RELEASE_DEPLOY_KEY,
+              [Text.UTF8Encoding]::new($false))
+            & icacls $keyPath /inheritance:r /grant:r "${env:USERNAME}:(R)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not protect the temporary release key.' }
+            git config user.name 'devpilot-release[bot]'
+            git config user.email 'devpilot-release[bot]@users.noreply.github.com'
+            git tag -fa v0.4 $env:TARGET_COMMIT -m 'DevPilot Agents 0.4 stable channel'
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the local v0.4 rollback tag.' }
+            $ssh = "ssh -i `"$keyPath`" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            git -c "core.sshCommand=$ssh" push --force `
+              "git@github.com:$env:GITHUB_REPOSITORY.git" refs/tags/v0.4
+            if ($LASTEXITCODE -ne 0) { throw 'Could not move the protected v0.4 channel.' }
+          }
+          finally {
+            Remove-Item -LiteralPath $keyPath -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:RELEASE_DEPLOY_KEY -ErrorAction SilentlyContinue
+          }

@@ -47,19 +47,22 @@ commit-addressed cache, runs consumer launch-contract tests, and runs the
 installed Golden, broker, dashboard, renderer, ConPTY, MCP-recovery, and
 agent-DryRun qualification.
 
-Only after all deterministic and live gates succeed does the protected publish
-job create the annotated immutable tag. It then resolves that immutable tag
-through the consumer installer and repeats final installed smoke tests. A
-fresh short-lived App token creates the stable GitHub Release and moves `v0.4`
-last, after rechecking that `main` still names the qualified commit. A failed,
-skipped, or cancelled prerequisite therefore cannot move the channel.
+Only after all deterministic and live gates succeed does a minimal protected
+job materialize the deploy key, create the annotated immutable tag, push it,
+and immediately remove the key. A separate read-only qualification job then
+resolves that immutable tag through the consumer installer and repeats final
+installed smoke tests. A final minimal protected job creates the stable GitHub
+Release and moves `v0.4` last, after rechecking that `main` still names the
+qualified workflow commit. No repository-controlled candidate code executes
+in a job while a write credential is available.
 
 If interruption occurs after the immutable tag is pushed but before its
 GitHub Release is created, rerun the same version and commit with
 `resumePublishedTag` enabled. Resume is accepted only when the tag is the
 latest stable patch, remains an annotated tag at the exact qualified commit,
-is the sole compatible patch tag on that commit, and has no GitHub Release.
-All deterministic, consumer, canary, and final installed gates run again.
+and is the sole compatible patch tag on that commit. An existing Release must
+be stable. All deterministic, consumer, canary, and final installed gates run
+again before the channel can move.
 
 The live canary is **mandatory before advancing `v0.4`**. It runs three to five
 consecutive `Start-DevPilot.ps1 -PreviewOnly -Once` launches from the installed
@@ -80,8 +83,8 @@ Create all three environments before the first release:
 - `release-qualification`: required reviewers, self-review disabled,
   deployment branch limited to `main`, dedicated self-hosted canary runner.
 - `release-publish`: required reviewers, self-review disabled, deployment
-  branch limited to `main`, dedicated self-hosted canary runner, and the
-  release deploy key.
+  branch limited to `main`, and the release deploy key. Publication jobs use
+  hosted Windows runners and execute only fixed workflow commands.
 
 Configure these variables and secrets in the environments:
 
