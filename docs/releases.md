@@ -76,8 +76,9 @@ Agency/Copilot, ADO, and WorkIQ already authenticated. The canary opts its Agenc
 `GITHUB_ACTIONS` pipeline-auth marker so they use that desktop identity; the
 workflow itself remains a GitHub Actions job. HOME, LOCALAPPDATA, watch state,
 durable state, and leases are run-scoped so operator caches and legacy records
-cannot affect the result. Never assign this label to pull-request jobs or a
-shared general-purpose runner.
+cannot affect the result. Agency logging is restricted to errors for the MCP
+probe so diagnostic chatter cannot enter the strict JSON-RPC stdout channel.
+Never assign this label to pull-request jobs or a shared general-purpose runner.
 
 ## Required environments and credentials
 

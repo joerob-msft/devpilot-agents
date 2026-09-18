@@ -59,6 +59,7 @@ Describe 'Release publication boundary' {
         $canary | Should -Not -Match 'Start-DevPilot\.ps1'
         $canary | Should -Not -Match '\$env:USERPROFILE = \$env:HOME'
         $canary | Should -Match 'DEVPILOT_SELF_HOSTED_DESKTOP_MCP_AUTH: "1"'
+        $canary | Should -Match 'AGENCY_VERBOSITY: error'
         $canary | Should -Match '\$env:LOCALAPPDATA = Join-Path \$env:HOME ''localappdata'''
         $release | Should -Match 'Verify mandatory live canary'
     }
