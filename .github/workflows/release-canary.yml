@@ -1,0 +1,202 @@
+name: Release Canary
+run-name: Canary ${{ inputs.resolutionMode }} ${{ inputs.exactVersion || '-' }} ${{ inputs.candidateCommit }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      workflowCommit:
+        description: Exact current main commit containing the canary workflow
+        required: true
+        type: string
+      candidateCommit:
+        description: Exact candidate or rollback target commit to qualify
+        required: true
+        type: string
+      resolutionMode:
+        description: Resolve an unpublished commit or an existing immutable version
+        required: true
+        default: exactCommit
+        type: choice
+        options:
+          - exactCommit
+          - exactVersion
+      exactVersion:
+        description: Existing stable version for rollback qualification
+        required: false
+        type: string
+      consecutiveRuns:
+        description: Consecutive read-only startup attempts
+        required: true
+        default: "3"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-canary-${{ inputs.candidateCommit }}
+  cancel-in-progress: false
+
+jobs:
+  live-read-only:
+    name: Protected ADO and WorkIQ canary
+    runs-on: [self-hosted, Windows, X64, devpilot-canary]
+    timeout-minutes: 120
+    environment: release-canary
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.workflowCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify dedicated canary host prerequisites
+        shell: pwsh
+        run: |
+          foreach ($command in @('agency', 'git', 'node', 'npm', 'pwsh')) {
+            if (-not (Get-Command $command -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+              throw "Dedicated canary host is missing required command '$command'."
+            }
+          }
+          $nodeVersion = (& node --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v(\d+)\.' -or [int]$Matches[1] -lt 24) {
+            throw "Dedicated canary host requires Node.js 24 or newer, found '$nodeVersion'."
+          }
+
+      - name: Verify exact current main commit
+        shell: pwsh
+        env:
+          WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          WORKFLOW_RUN_SHA: ${{ github.sha }}
+          RESOLUTION_MODE: ${{ inputs.resolutionMode }}
+          EXACT_VERSION: ${{ inputs.exactVersion }}
+        run: |
+          if ($env:WORKFLOW_COMMIT -cnotmatch '^[0-9a-f]{40}$' -or
+              $env:CANDIDATE_COMMIT -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'workflowCommit and candidateCommit must be full lowercase SHA-1 values.'
+          }
+          if ($env:WORKFLOW_RUN_SHA -cne $env:WORKFLOW_COMMIT) {
+            throw 'Dispatch Release Canary from the exact current main workflow commit.'
+          }
+          if ($env:RESOLUTION_MODE -eq 'exactCommit') {
+            if ($env:CANDIDATE_COMMIT -cne $env:WORKFLOW_COMMIT -or $env:EXACT_VERSION) {
+              throw 'An unpublished exactCommit canary must qualify the exact current main commit.'
+            }
+          }
+          elseif ($env:RESOLUTION_MODE -eq 'exactVersion') {
+            if ($env:EXACT_VERSION -cnotmatch '^0\.4\.(0|[1-9][0-9]*)$') {
+              throw 'An exactVersion canary requires one stable 0.4.x version.'
+            }
+          }
+          else { throw 'Unsupported canary resolutionMode.' }
+          git fetch --quiet origin main
+          if ($LASTEXITCODE -ne 0) { throw 'Could not refresh origin/main for canary qualification.' }
+          $main = (git rev-parse origin/main).Trim()
+          if ($LASTEXITCODE -ne 0 -or $main -cne $env:WORKFLOW_COMMIT -or
+              (git rev-parse HEAD).Trim() -cne $main) {
+            throw "Canary must run against the exact current main commit ($main)."
+          }
+          ./tools/Test-DevPilotVersion.ps1
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+
+      - name: Clone protected consumer
+        shell: pwsh
+        env:
+          CONSUMER_REPOSITORY: ${{ vars.RELEASE_CONSUMER_REPOSITORY_URL }}
+          CONSUMER_REF: ${{ vars.RELEASE_CONSUMER_REF }}
+          CONSUMER_READ_PAT: ${{ secrets.RELEASE_CONSUMER_READ_PAT }}
+        run: |
+          if (-not $env:CONSUMER_REPOSITORY) {
+            throw 'The release-canary environment is missing its consumer repository URL.'
+          }
+          $destination = Join-Path $env:RUNNER_TEMP 'consumer'
+          if ($env:CONSUMER_READ_PAT) {
+            $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:CONSUMER_READ_PAT"))
+            $env:GIT_CONFIG_COUNT = '1'
+            $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+            $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          }
+          try {
+            git clone --quiet --branch $(if ($env:CONSUMER_REF) { $env:CONSUMER_REF } else { 'dev' }) `
+              --single-branch --template= $env:CONSUMER_REPOSITORY $destination
+            if ($LASTEXITCODE -ne 0) { throw 'Could not clone the protected consumer repository.' }
+          }
+          finally {
+            Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
+          }
+
+      - name: Run consecutive read-only launches
+        shell: pwsh
+        env:
+          REVIEWER_PR: ${{ vars.RELEASE_CANARY_REVIEWER_PR }}
+          HANDLER_PR: ${{ vars.RELEASE_CANARY_HANDLER_PR }}
+          RESOLUTION_MODE: ${{ inputs.resolutionMode }}
+          EXACT_VERSION: ${{ inputs.exactVersion }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          CONSECUTIVE_RUNS: ${{ inputs.consecutiveRuns }}
+        run: |
+          $count = 0
+          if (-not [int]::TryParse($env:CONSECUTIVE_RUNS, [ref]$count) -or $count -lt 3 -or $count -gt 5) {
+            throw 'consecutiveRuns must be between 3 and 5.'
+          }
+          $consumer = Join-Path $env:RUNNER_TEMP 'consumer'
+          $pinPath = Join-Path $consumer '.github\copilot\agents\devpilot-toolkit.lock.json'
+          if ($env:RESOLUTION_MODE -eq 'exactVersion') {
+            if ($env:EXACT_VERSION -cnotmatch '^0\.4\.(0|[1-9][0-9]*)$') {
+              throw 'exactVersion must be a stable 0.4.x version.'
+            }
+            $pin = [ordered]@{
+              schemaVersion = 2
+              repository = 'https://github.com/joerob-msft/devpilot-agents.git'
+              mode = 'exactVersion'
+              exactVersion = $env:EXACT_VERSION
+            }
+          }
+          elseif ($env:RESOLUTION_MODE -eq 'exactCommit') {
+            if ($env:EXACT_VERSION) { throw 'exactVersion must be empty in exactCommit mode.' }
+            $pin = [ordered]@{
+              schemaVersion = 2
+              repository = 'https://github.com/joerob-msft/devpilot-agents.git'
+              mode = 'exactCommit'
+              commit = $env:CANDIDATE_COMMIT
+            }
+          }
+          else { throw 'Unsupported canary resolutionMode.' }
+          $pin | ConvertTo-Json | Set-Content -LiteralPath $pinPath -Encoding utf8
+          $env:HOME = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-canary"
+          $env:USERPROFILE = $env:HOME
+          New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
+          for ($attempt = 1; $attempt -le $count; $attempt++) {
+            Write-Host "Read-only canary attempt $attempt of $count."
+            $installed = & (Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1') `
+              -SetupDashboard -Refresh -PassThru
+            if ($installed.Commit -cne $env:CANDIDATE_COMMIT) {
+              throw "Canary resolution attempt $attempt did not resolve to candidateCommit."
+            }
+            $attemptRoot = Join-Path $env:HOME "attempt-$attempt"
+            $arguments = @{
+              ToolkitRoot = $installed.Root
+              PreviewOnly = $true
+              Once = $true
+              StateDir = Join-Path $attemptRoot 'watch'
+              DurableStateRoot = Join-Path $attemptRoot 'durable'
+              LeaseRoot = Join-Path $attemptRoot 'leases'
+              EnableReviewerTeamsNotifications = $false
+              EnableReviewHandlerTeamsNotifications = $false
+              EnableReviewHandlerTeamsPrReferenceWrites = $false
+            }
+            if ($env:REVIEWER_PR) { $arguments.ReviewerPullRequestId = [int]$env:REVIEWER_PR }
+            if ($env:HANDLER_PR) { $arguments.ReviewHandlerPullRequestId = [int]$env:HANDLER_PR }
+            & (Join-Path $consumer 'Start-DevPilot.ps1') @arguments
+            if ($LASTEXITCODE -ne 0) { throw "Read-only canary attempt $attempt failed." }
+          }
+      - name: Remove temporary canary cache
+        if: always()
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-canary"
+          if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }

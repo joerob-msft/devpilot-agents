@@ -1390,6 +1390,19 @@ test("built dashboard exercises the PR3 settings editor through real ConPTY and 
     await waitForVisible(expected, start);
   }
 
+  async function writeAndWaitForHidden(bytes: string, unexpected: string): Promise<void> {
+    assert.ok(terminal, "terminal must be running");
+    const start = revision + 1;
+    terminal.write(bytes);
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline) {
+      if (revision >= start && !visibleOutput().includes(unexpected)) return;
+      if (exited) throw failureContext(`dashboard exited before hiding ${JSON.stringify(unexpected)}`);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+    throw failureContext(`timed out waiting to hide ${JSON.stringify(unexpected)}`);
+  }
+
   async function waitForExit(message: string): Promise<{ exitCode: number; signal?: number }> {
     let timeout: NodeJS.Timeout | undefined;
     try {
@@ -1622,13 +1635,13 @@ while ($accepting -and $null -ne ($line = [Console]::In.ReadLine())) {
     // Kill switch first-stage cancel: k shows the full-disclosure warning; Esc backs out with no
     // set-kill-switch RPC.
     await writeAndWait("k", "WARNING: machine+user-wide emergency lever");
-    await writeAndWait("\x1b", "SETTINGS - EFFECTIVE CAPABILITY PROFILE");
+    await writeAndWaitForHidden("\x1b", "WARNING: machine+user-wide emergency lever");
 
     // Kill switch final-stage cancel: k -> c reaches the terse final gate; Esc still backs out
     // with no RPC.
     await writeAndWait("k", "WARNING: machine+user-wide emergency lever");
     await writeAndWait("c", "FINAL CONFIRMATION: enable the kill switch machine+user-wide");
-    await writeAndWait("\x1b", "SETTINGS - EFFECTIVE CAPABILITY PROFILE");
+    await writeAndWaitForHidden("\x1b", "FINAL CONFIRMATION: enable the kill switch machine+user-wide");
 
     // Enable: k -> c -> y actually toggles it on, and Settings displays the TTL expiry.
     await writeAndWait("k", "WARNING: machine+user-wide emergency lever");

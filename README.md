@@ -56,11 +56,18 @@ src/
 samples/                     # example configs for real repositories
 tools/                       # launchers, dashboard entry point, and repo checks
 docs/                        # how to add an agent
+release/                     # mechanically checked release metadata
 ```
 
 **Consumers keep only a config file.** Nothing employer-, repository-, or
 person-specific lives in this repo outside `samples/` — a CI check enforces that
 (`tools/Test-NoEmployerSpecifics.ps1`).
+
+Release publication is deliberately separate from merging to `main`.
+Immutable annotated patch tags such as `v0.4.0` are qualified first, while the
+protected `v0.4` channel moves only after installed-artifact and mandatory live
+read-only canary gates pass. See [DevPilot Agents releases](docs/releases.md)
+for the trust model, required rulesets, checklist, and rollback procedure.
 
 ---
 

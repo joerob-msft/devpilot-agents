@@ -1,0 +1,222 @@
+name: Release Channel Promotion
+run-name: Move v0.4 to v${{ inputs.targetVersion }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      workflowCommit:
+        description: Exact current main commit containing the release workflow
+        required: true
+        type: string
+      targetVersion:
+        description: Existing qualified stable 0.4.x version
+        required: true
+        type: string
+      canaryRunId:
+        description: Successful exactVersion Release Canary run for the target
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devpilot-release
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Qualify rollback or repromotion target
+    runs-on: [self-hosted, Windows, X64, devpilot-canary]
+    timeout-minutes: 120
+    environment: release-qualification
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      target_commit: ${{ steps.target.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.workflowCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+      - name: Verify main, immutable target, release, and canary
+        id: target
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
+          WORKFLOW_RUN_SHA: ${{ github.sha }}
+          TARGET_VERSION: ${{ inputs.targetVersion }}
+          CANARY_RUN_ID: ${{ inputs.canaryRunId }}
+        run: |
+          $canaryRunId = 0L
+          if ($env:WORKFLOW_COMMIT -cnotmatch '^[0-9a-f]{40}$' -or
+              $env:TARGET_VERSION -cnotmatch '^0\.4\.(0|[1-9][0-9]*)$' -or
+              [Version]$env:TARGET_VERSION -lt [Version]'0.4.0' -or
+              -not [long]::TryParse($env:CANARY_RUN_ID, [ref]$canaryRunId) -or $canaryRunId -lt 1) {
+            throw 'Invalid workflow commit or target version.'
+          }
+          if ($env:WORKFLOW_RUN_SHA -cne $env:WORKFLOW_COMMIT) {
+            throw 'Dispatch Release Channel Promotion from the exact current main workflow commit.'
+          }
+          git fetch --quiet origin main --tags
+          if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main and immutable tags.' }
+          if ((git rev-parse origin/main).Trim() -cne $env:WORKFLOW_COMMIT) {
+            throw 'Channel promotion must use the exact current main workflow.'
+          }
+          $tagName = "v$($env:TARGET_VERSION)"
+          $tagObject = (git rev-parse "refs/tags/$tagName^{tag}").Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Target immutable tag is missing or not annotated.' }
+          $targetCommit = (git rev-parse "refs/tags/$tagName^{}").Trim()
+          if ($tagObject -cnotmatch '^[0-9a-f]{40}$' -or $targetCommit -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'Target must be an annotated immutable release tag.'
+          }
+          $compatible = @(git tag --points-at $targetCommit |
+            Where-Object { $_ -cmatch '^v0\.4\.(0|[1-9][0-9]*)$' })
+          if ($compatible.Count -ne 1 -or $compatible[0] -cne $tagName) {
+            throw 'Rollback target must carry exactly one compatible immutable 0.4 patch tag.'
+          }
+          $stable = gh release view $tagName --json isDraft,isPrerelease `
+            --jq '(.isDraft == false) and (.isPrerelease == false)'
+          if ($LASTEXITCODE -ne 0 -or $stable -cne 'true') {
+            throw 'Target stable GitHub Release is missing.'
+          }
+          $runJson = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$canaryRunId"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read mandatory canary evidence.' }
+          $run = $runJson | ConvertFrom-Json
+          if ($run.path -cne '.github/workflows/release-canary.yml' -or
+              $run.event -cne 'workflow_dispatch' -or $run.conclusion -cne 'success' -or
+              $run.head_sha -cne $env:WORKFLOW_COMMIT -or
+              $run.display_title -cne "Canary exactVersion $($env:TARGET_VERSION) $targetCommit") {
+            throw 'Mandatory exact-version canary did not qualify the target commit.'
+          }
+          "commit=$targetCommit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Clone protected consumer
+        shell: pwsh
+        env:
+          CONSUMER_REPOSITORY: ${{ vars.RELEASE_CONSUMER_REPOSITORY_URL }}
+          CONSUMER_REF: ${{ vars.RELEASE_CONSUMER_REF }}
+          CONSUMER_READ_PAT: ${{ secrets.RELEASE_CONSUMER_READ_PAT }}
+        run: |
+          if (-not $env:CONSUMER_REPOSITORY) {
+            throw 'The release-publish environment is missing its consumer repository URL.'
+          }
+          $destination = Join-Path $env:RUNNER_TEMP 'consumer'
+          if ($env:CONSUMER_READ_PAT) {
+            $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:CONSUMER_READ_PAT"))
+            $env:GIT_CONFIG_COUNT = '1'
+            $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+            $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          }
+          try {
+            git clone --quiet --branch $(if ($env:CONSUMER_REF) { $env:CONSUMER_REF } else { 'dev' }) `
+              --single-branch --template= $env:CONSUMER_REPOSITORY $destination
+            if ($LASTEXITCODE -ne 0) { throw 'Could not clone the protected consumer repository.' }
+          }
+          finally {
+            Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
+          }
+      - name: Re-resolve and smoke-test rollback target
+        shell: pwsh
+        env:
+          TARGET_VERSION: ${{ inputs.targetVersion }}
+          TARGET_COMMIT: ${{ steps.target.outputs.commit }}
+        run: |
+          $consumer = Join-Path $env:RUNNER_TEMP 'consumer'
+          [ordered]@{
+            schemaVersion = 2
+            repository = 'https://github.com/joerob-msft/devpilot-agents.git'
+            mode = 'exactVersion'
+            exactVersion = $env:TARGET_VERSION
+          } | ConvertTo-Json | Set-Content -LiteralPath `
+            (Join-Path $consumer '.github\copilot\agents\devpilot-toolkit.lock.json') -Encoding utf8
+          $env:HOME = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-rollback"
+          $env:USERPROFILE = $env:HOME
+          New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
+          $installed = & (Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1') `
+            -SetupDashboard -Refresh -PassThru
+          if ($installed.Commit -cne $env:TARGET_COMMIT -or
+              $installed.Version -cne $env:TARGET_VERSION) {
+            throw 'Rollback target did not resolve to the immutable release commit.'
+          }
+          & .\tools\Invoke-InstalledReleaseQualification.ps1 -ToolkitRoot $installed.Root `
+            -ExpectedVersion $env:TARGET_VERSION `
+            -ExpectedCommit $env:TARGET_COMMIT
+      - name: Remove temporary rollback cache
+        if: always()
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-rollback"
+          if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+
+  promote:
+    name: Move protected v0.4 channel
+    needs: qualify
+    runs-on: windows-latest
+    timeout-minutes: 30
+    environment: release-publish
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.workflowCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Revalidate and move channel
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
+          WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
+          TARGET_VERSION: ${{ inputs.targetVersion }}
+          TARGET_COMMIT: ${{ needs.qualify.outputs.target_commit }}
+        run: |
+          git fetch --quiet origin main --tags
+          if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main after rollback smoke.' }
+          $main = (git rev-parse origin/main).Trim()
+          if ($LASTEXITCODE -ne 0 -or $main -cne $env:WORKFLOW_COMMIT) {
+            throw "main moved after rollback smoke; expected '$($env:WORKFLOW_COMMIT)', found '$main'."
+          }
+          $tagName = "v$($env:TARGET_VERSION)"
+          $targetCommit = (git rev-parse "refs/tags/$tagName^{}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $targetCommit -cne $env:TARGET_COMMIT -or
+              (git cat-file -t "refs/tags/$tagName").Trim() -cne 'tag') {
+            throw 'Rollback immutable tag changed during qualification.'
+          }
+          $stable = gh release view $tagName --json isDraft,isPrerelease `
+            --jq '(.isDraft == false) and (.isPrerelease == false)'
+          if ($LASTEXITCODE -ne 0 -or $stable -cne 'true') {
+            throw 'Rollback stable GitHub Release changed during qualification.'
+          }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'devpilot-release-key'
+          try {
+            [IO.File]::WriteAllText($keyPath, $env:RELEASE_DEPLOY_KEY,
+              [Text.UTF8Encoding]::new($false))
+            & icacls $keyPath /inheritance:r /grant:r "${env:USERNAME}:(F)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not protect the temporary release key.' }
+            git config user.name 'devpilot-release[bot]'
+            git config user.email 'devpilot-release[bot]@users.noreply.github.com'
+            git tag -fa v0.4 $env:TARGET_COMMIT -m 'DevPilot Agents 0.4 stable channel'
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the local v0.4 rollback tag.' }
+            $ssh = "ssh -i `"$keyPath`" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            git -c "core.sshCommand=$ssh" push --force `
+              "git@github.com:$env:GITHUB_REPOSITORY.git" refs/tags/v0.4
+            if ($LASTEXITCODE -ne 0) { throw 'Could not move the protected v0.4 channel.' }
+          }
+          finally {
+            if (Test-Path -LiteralPath $keyPath) {
+              Remove-Item -LiteralPath $keyPath -Force -ErrorAction Stop
+            }
+            if (Test-Path -LiteralPath $keyPath) { throw 'Temporary release key cleanup failed.' }
+            Remove-Item Env:RELEASE_DEPLOY_KEY -ErrorAction SilentlyContinue
+          }
