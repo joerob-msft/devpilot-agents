@@ -75,21 +75,25 @@ finally {
 }
 
 $dashboard = Join-Path $root 'src\DevPilot.Dashboard'
-$logicTests = @(Get-ChildItem -LiteralPath (Join-Path $dashboard 'dist\test') -Filter '*.test.js' -File |
-    Where-Object Name -ne 'app.test.js' | ForEach-Object FullName)
-if ($logicTests.Count -eq 0) { throw 'Installed dashboard logic artifacts are missing.' }
-& node --test @logicTests
-if ($LASTEXITCODE -ne 0) { throw 'Installed dashboard logic tests failed.' }
+Push-Location $dashboard
+try {
+    $logicTests = @(Get-ChildItem -LiteralPath '.\dist\test' -Filter '*.test.js' -File |
+        Where-Object Name -ne 'app.test.js' | ForEach-Object FullName)
+    if ($logicTests.Count -eq 0) { throw 'Installed dashboard logic artifacts are missing.' }
+    & node --test @logicTests
+    if ($LASTEXITCODE -ne 0) { throw 'Installed dashboard logic tests failed.' }
 
-$bun = if ($IsWindows) {
-    Join-Path $dashboard 'node_modules\bun\bin\bun.exe'
+    $bun = if ($IsWindows) {
+        '.\node_modules\bun\bin\bun.exe'
+    }
+    else {
+        './node_modules/bun/bin/bun'
+    }
+    & $bun --conditions=browser test '.\dist\test\app.test.js'
+    if ($LASTEXITCODE -ne 0) { throw 'Installed dashboard renderer test failed.' }
+    if ($IsWindows) {
+        & node --test '.\dist\test\pty.integration.js'
+        if ($LASTEXITCODE -ne 0) { throw 'Installed dashboard ConPTY test failed.' }
+    }
 }
-else {
-    Join-Path $dashboard 'node_modules\bun\bin\bun'
-}
-& $bun --conditions=browser test (Join-Path $dashboard 'dist\test\app.test.js')
-if ($LASTEXITCODE -ne 0) { throw 'Installed dashboard renderer test failed.' }
-if ($IsWindows) {
-    & node --test (Join-Path $dashboard 'dist\test\pty.integration.js')
-    if ($LASTEXITCODE -ne 0) { throw 'Installed dashboard ConPTY test failed.' }
-}
+finally { Pop-Location }

@@ -36,6 +36,7 @@ Describe 'Release publication boundary' {
         $release | Should -Match 'Start-DevPilot\.Tests\.ps1'
         $installedQualification | Should -Match 'DEVPILOT_INSTALLED_PESTER_PATHS'
         $installedQualification | Should -Match '-NoProfile -NonInteractive'
+        $installedQualification | Should -Match 'Push-Location \$dashboard'
     }
 
     It 'makes the separate protected live canary mandatory' {
