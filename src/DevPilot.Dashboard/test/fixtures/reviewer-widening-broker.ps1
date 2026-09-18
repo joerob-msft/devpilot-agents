@@ -84,8 +84,10 @@ function Automation-Status-Response([object]$request) {
     $response.available = $true
     $response.scope = 'current-launcher'
     $response.agents = @(
-      @{role='reviewer';continuous=$true;intervalSeconds=900;state='waiting';canScanNow=$true},
-      @{role='review-handler';continuous=$true;intervalSeconds=900;state='scanning';canScanNow=$false}
+      @{role='reviewer';continuous=$true;intervalSeconds=900;state='waiting';canScanNow=$true
+        retryAttempt=0;retryDelaySeconds=0;retryAtUtc=$null},
+      @{role='review-handler';continuous=$true;intervalSeconds=900;state='scanning';canScanNow=$false
+        retryAttempt=0;retryDelaySeconds=0;retryAtUtc=$null}
     )
   }
   return $response | ConvertTo-Json -Compress -Depth 10
