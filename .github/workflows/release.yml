@@ -1,0 +1,475 @@
+name: Release
+run-name: Release v${{ inputs.version }} from ${{ inputs.candidateCommit }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable 0.4.x version without the v prefix
+        required: true
+        type: string
+      workflowCommit:
+        description: Exact current main commit containing this release workflow
+        required: true
+        type: string
+      candidateCommit:
+        description: Exact release candidate commit
+        required: true
+        type: string
+      canaryRunId:
+        description: Successful Release Canary workflow run for this commit
+        required: true
+        type: string
+      resumePublishedTag:
+        description: Resume an exact immutable tag left without a GitHub Release
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devpilot-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Exact main and version preflight
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.candidateCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact main commit and clean version
+        shell: pwsh
+        env:
+          WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          WORKFLOW_RUN_SHA: ${{ github.sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RESUME_PUBLISHED_TAG: ${{ inputs.resumePublishedTag }}
+        run: |
+          if ($env:WORKFLOW_COMMIT -cnotmatch '^[0-9a-f]{40}$' -or
+              $env:CANDIDATE_COMMIT -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'workflowCommit and candidateCommit must be full lowercase SHA-1 values.'
+          }
+          if ($env:RELEASE_VERSION -cnotmatch '^0\.4\.(0|[1-9][0-9]*)$') {
+            throw 'version must be a stable 0.4.x version.'
+          }
+          if ($env:WORKFLOW_RUN_SHA -cne $env:WORKFLOW_COMMIT) {
+            throw 'Dispatch Release from the exact current main workflow commit.'
+          }
+          if ($env:RESUME_PUBLISHED_TAG -cne 'true' -and
+              $env:CANDIDATE_COMMIT -cne $env:WORKFLOW_COMMIT) {
+            throw 'A fresh release candidate must be the exact current main commit.'
+          }
+          git fetch --quiet origin main --tags
+          if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main and release tags.' }
+          $main = (git rev-parse origin/main).Trim()
+          if ($LASTEXITCODE -ne 0 -or $main -cne $env:WORKFLOW_COMMIT -or
+              (git rev-parse HEAD).Trim() -cne $env:CANDIDATE_COMMIT) {
+            throw "Release workflow or candidate commit is not exact (main is $main)."
+          }
+          if (git status --porcelain=v1 --untracked-files=all) {
+            throw 'Release checkout is not clean.'
+          }
+          ./tools/Test-DevPilotVersion.ps1 -ExpectedVersion $env:RELEASE_VERSION `
+            -ExpectedTag "v$($env:RELEASE_VERSION)"
+
+      - name: Refuse existing or non-monotonic patch
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RESUME_PUBLISHED_TAG: ${{ inputs.resumePublishedTag }}
+        run: |
+          $resume = $env:RESUME_PUBLISHED_TAG -ceq 'true'
+          $candidate = [Version]$env:RELEASE_VERSION
+          $candidateTag = "v$($env:RELEASE_VERSION)"
+          $lines = @(git ls-remote --tags --refs origin 'refs/tags/v0.4.*')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read immutable release tags.' }
+          $tagVersions = [ordered]@{}
+          foreach ($line in $lines) {
+            if ($line -notmatch '^[0-9a-f]{40}\s+refs/tags/(v0\.4\..+)$') {
+              throw "Malformed immutable tag response: '$line'."
+            }
+            $tag = $Matches[1]
+            if ($tag -cnotmatch '^v0\.4\.(0|[1-9][0-9]*)$') {
+              throw "Malformed or prerelease tag occupies the immutable 0.4 namespace: '$tag'."
+            }
+            if ((git cat-file -t "refs/tags/$tag").Trim() -cne 'tag') {
+              throw "Immutable release tag is not annotated: '$tag'."
+            }
+            $tagVersions[$tag] = [Version]$tag.Substring(1)
+          }
+          $versions = @($tagVersions.Values)
+          $latest = $versions | Sort-Object -Descending | Select-Object -First 1
+          $tagExists = $tagVersions.Contains($candidateTag)
+          if (-not $resume -and $tagExists) { throw "Immutable tag $candidateTag already exists." }
+          if (-not $resume -and $latest -and $candidate -le $latest) {
+            throw "Release $candidate is not newer than existing release $latest."
+          }
+          if ($resume -and (-not $tagExists -or ($latest -and $candidate -lt $latest))) {
+            throw 'Resume requires the latest existing immutable patch tag.'
+          }
+          $tagsOnCandidate = @(git tag --points-at $env:CANDIDATE_COMMIT |
+            Where-Object { $_ -like 'v0.4.*' })
+          if (-not $resume -and $tagsOnCandidate.Count -gt 0) {
+            throw "Candidate commit already carries a 0.4 patch-like tag: $($tagsOnCandidate -join ', ')."
+          }
+          if ($resume) {
+            $resolved = (git rev-parse "refs/tags/$candidateTag^{}").Trim()
+            if ($LASTEXITCODE -ne 0 -or $resolved -cne $env:CANDIDATE_COMMIT -or
+                $tagsOnCandidate.Count -ne 1 -or $tagsOnCandidate[0] -cne $candidateTag) {
+              throw 'Resume tag is not the sole compatible tag on the requested candidate commit.'
+            }
+            $releaseLookup = @(gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$candidateTag" 2>&1)
+            $releaseExit = $LASTEXITCODE
+            if ($releaseExit -eq 0) {
+              throw 'Resume is allowed only for an immutable tag without a GitHub Release.'
+            }
+            if (($releaseLookup -join "`n") -notmatch 'HTTP 404') {
+              throw 'Could not prove that the resume tag has no GitHub Release.'
+            }
+          }
+
+  windows-complete:
+    name: Complete Windows qualification
+    needs: preflight
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.candidateCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: src/DevPilot.Dashboard/package-lock.json
+          package-manager-cache: false
+      - name: Install PowerShell test modules
+        shell: pwsh
+        run: |
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+      - name: Run complete CI and release tests
+        shell: pwsh
+        run: ./tools/Invoke-DevPilotCi.ps1 -Mode WindowsComplete
+
+  platform-safety:
+    name: Platform qualification (${{ matrix.os }})
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.candidateCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: src/DevPilot.Dashboard/package-lock.json
+          package-manager-cache: false
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+      - name: Run platform-sensitive suites
+        shell: pwsh
+        run: ./tools/Invoke-DevPilotCi.ps1 -Mode PlatformSafety
+
+  canary-gate:
+    name: Verify mandatory live canary
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Verify successful canary for the candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.canaryRunId }}
+          EXPECTED_SHA: ${{ inputs.candidateCommit }}
+          EXPECTED_TITLE: Canary exactCommit - ${{ inputs.candidateCommit }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}")"
+          test "$(jq -r .path <<<"$run")" = ".github/workflows/release-canary.yml"
+          test "$(jq -r .event <<<"$run")" = "workflow_dispatch"
+          test "$(jq -r .head_sha <<<"$run")" = "$EXPECTED_SHA"
+          test "$(jq -r .conclusion <<<"$run")" = "success"
+          test "$(jq -r .display_title <<<"$run")" = "$EXPECTED_TITLE"
+
+  installed-artifact:
+    name: Clean consumer installation qualification
+    needs: [windows-complete, platform-safety, canary-gate]
+    runs-on: windows-latest
+    timeout-minutes: 120
+    environment: release-qualification
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.candidateCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+      - name: Clone protected consumer
+        shell: pwsh
+        env:
+          CONSUMER_REPOSITORY: ${{ vars.RELEASE_CONSUMER_REPOSITORY_URL }}
+          CONSUMER_REF: ${{ vars.RELEASE_CONSUMER_REF }}
+          CONSUMER_READ_PAT: ${{ secrets.RELEASE_CONSUMER_READ_PAT }}
+        run: |
+          if (-not $env:CONSUMER_REPOSITORY -or -not $env:CONSUMER_READ_PAT) {
+            throw 'The release-qualification environment is missing its read-only consumer configuration.'
+          }
+          $destination = Join-Path $env:RUNNER_TEMP 'consumer'
+          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:CONSUMER_READ_PAT"))
+          $env:GIT_CONFIG_COUNT = '1'
+          $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+          $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          try {
+            git clone --quiet --branch $(if ($env:CONSUMER_REF) { $env:CONSUMER_REF } else { 'dev' }) `
+              --single-branch --template= $env:CONSUMER_REPOSITORY $destination
+            if ($LASTEXITCODE -ne 0) { throw 'Could not clone the protected consumer repository.' }
+          }
+          finally {
+            Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
+          }
+      - name: Resolve, install, and qualify exact candidate
+        shell: pwsh
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $consumer = Join-Path $env:RUNNER_TEMP 'consumer'
+          $pinPath = Join-Path $consumer '.github\copilot\agents\devpilot-toolkit.lock.json'
+          [ordered]@{
+            schemaVersion = 2
+            repository = 'https://github.com/joerob-msft/devpilot-agents.git'
+            mode = 'exactCommit'
+            commit = $env:CANDIDATE_COMMIT
+          } | ConvertTo-Json | Set-Content -LiteralPath $pinPath -Encoding utf8
+          $env:HOME = Join-Path $env:RUNNER_TEMP 'devpilot-home'
+          $env:USERPROFILE = $env:HOME
+          New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
+          $installer = Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1'
+          $installed = & $installer -SetupDashboard -Refresh -PassThru
+          if ($installed.Commit -cne $env:CANDIDATE_COMMIT) { throw 'Consumer installed the wrong candidate commit.' }
+          $containers = @(
+            New-PesterContainer -Path (Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.Tests.ps1')
+            New-PesterContainer -Path (Join-Path $consumer 'Start-DevPilot.Tests.ps1') `
+              -Data @{ ToolkitContractRoot = $installed.Root }
+          )
+          $consumerTests = Invoke-Pester -Container $containers -Output Detailed -PassThru
+          if ($consumerTests.FailedCount -gt 0 -or $consumerTests.SkippedCount -gt 0) {
+            throw "Consumer qualification failures/skips: $($consumerTests.FailedCount)/$($consumerTests.SkippedCount)."
+          }
+          & (Join-Path $installed.Root 'tools\Invoke-InstalledReleaseQualification.ps1') `
+            -ToolkitRoot $installed.Root -ExpectedVersion $env:RELEASE_VERSION `
+            -ExpectedCommit $env:CANDIDATE_COMMIT
+
+  publish:
+    name: Publish immutable patch and promote channel
+    needs: [windows-complete, platform-safety, canary-gate, installed-artifact]
+    runs-on: windows-latest
+    timeout-minutes: 120
+    environment: release-publish
+    steps:
+      - name: Create release app token
+        id: release-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.candidateCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ steps.release-token.outputs.token }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+      - name: Recheck publication boundary
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
+          WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RESUME_PUBLISHED_TAG: ${{ inputs.resumePublishedTag }}
+        run: |
+          gh auth setup-git
+          if ($LASTEXITCODE -ne 0) { throw 'Could not configure authenticated Git transport.' }
+          git fetch --quiet origin main --tags
+          if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main and release tags at the publication boundary.' }
+          $main = (git rev-parse origin/main).Trim()
+          if ($LASTEXITCODE -ne 0 -or $main -cne $env:WORKFLOW_COMMIT -or
+              (git rev-parse HEAD).Trim() -cne $env:CANDIDATE_COMMIT) {
+            throw "main or candidate changed after qualification; expected workflow '$($env:WORKFLOW_COMMIT)' and candidate '$($env:CANDIDATE_COMMIT)', found main '$main'."
+          }
+          $tagName = "v$($env:RELEASE_VERSION)"
+          $resume = $env:RESUME_PUBLISHED_TAG -ceq 'true'
+          $remoteTag = @(git ls-remote --tags origin "refs/tags/$tagName" "refs/tags/$tagName^{}")
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify immutable tag state.' }
+          if (-not $resume -and $remoteTag.Count -ne 0) {
+            throw 'Immutable tag appeared after qualification.'
+          }
+          if ($resume) {
+            $basePattern = "^[0-9a-f]{40}\s+refs/tags/$([regex]::Escape($tagName))$"
+            $peeledPattern = "^([0-9a-f]{40})\s+refs/tags/$([regex]::Escape($tagName))\^\{\}$"
+            $base = @($remoteTag | Where-Object { $_ -cmatch $basePattern })
+            $peeled = @($remoteTag | Where-Object { $_ -cmatch $peeledPattern })
+            $peeledCommit = if ($peeled.Count -eq 1) {
+              [regex]::Match($peeled[0], $peeledPattern).Groups[1].Value
+            } else { '' }
+            if ($remoteTag.Count -ne 2 -or $base.Count -ne 1 -or $peeled.Count -ne 1 -or
+                $peeledCommit -cne $env:CANDIDATE_COMMIT) {
+              throw 'Resume tag moved or is not an annotated tag for the qualified commit.'
+            }
+          }
+          $releaseLookup = @(gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tagName" 2>&1)
+          $releaseExit = $LASTEXITCODE
+          if ($releaseExit -eq 0) {
+            throw 'A GitHub Release already exists for the requested immutable version.'
+          }
+          if (($releaseLookup -join "`n") -notmatch 'HTTP 404') {
+            throw 'Could not prove that the requested version has no GitHub Release.'
+          }
+          ./tools/Test-DevPilotVersion.ps1 -ExpectedVersion $env:RELEASE_VERSION `
+            -ExpectedTag $tagName
+          $tagsOnCandidate = @(git tag --points-at $env:CANDIDATE_COMMIT |
+            Where-Object { $_ -like 'v0.4.*' })
+          if (-not $resume -and $tagsOnCandidate.Count -gt 0) {
+            throw "Candidate commit acquired a 0.4 patch-like tag: $($tagsOnCandidate -join ', ')."
+          }
+          if ($resume -and ($tagsOnCandidate.Count -ne 1 -or $tagsOnCandidate[0] -cne $tagName)) {
+            throw 'Resume tag is not the sole patch-like tag on the qualified commit.'
+          }
+      - name: Create immutable annotated tag
+        if: ${{ !inputs.resumePublishedTag }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name '${{ steps.release-token.outputs.app-slug }}[bot]'
+          git config user.email '${{ steps.release-token.outputs.app-slug }}[bot]@users.noreply.github.com'
+          $tagName = "v$($env:RELEASE_VERSION)"
+          git tag -a $tagName $env:CANDIDATE_COMMIT -m "DevPilot Agents $tagName"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the immutable annotated tag.' }
+          git push origin "refs/tags/$tagName"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish the immutable annotated tag.' }
+      - name: Clone protected consumer for final immutable-tag smoke test
+        shell: pwsh
+        env:
+          CONSUMER_REPOSITORY: ${{ vars.RELEASE_CONSUMER_REPOSITORY_URL }}
+          CONSUMER_REF: ${{ vars.RELEASE_CONSUMER_REF }}
+          CONSUMER_READ_PAT: ${{ secrets.RELEASE_CONSUMER_READ_PAT }}
+        run: |
+          if (-not $env:CONSUMER_REPOSITORY -or -not $env:CONSUMER_READ_PAT) {
+            throw 'The release-publish environment is missing its read-only consumer configuration.'
+          }
+          $destination = Join-Path $env:RUNNER_TEMP 'consumer'
+          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:CONSUMER_READ_PAT"))
+          $env:GIT_CONFIG_COUNT = '1'
+          $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+          $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          try {
+            git clone --quiet --branch $(if ($env:CONSUMER_REF) { $env:CONSUMER_REF } else { 'dev' }) `
+              --single-branch --template= $env:CONSUMER_REPOSITORY $destination
+            if ($LASTEXITCODE -ne 0) { throw 'Could not clone the protected consumer repository.' }
+          }
+          finally {
+            Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
+          }
+      - name: Resolve immutable version exactly and run final smoke tests
+        shell: pwsh
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $consumer = Join-Path $env:RUNNER_TEMP 'consumer'
+          [ordered]@{
+            schemaVersion = 2
+            repository = 'https://github.com/joerob-msft/devpilot-agents.git'
+            mode = 'exactVersion'
+            exactVersion = $env:RELEASE_VERSION
+          } | ConvertTo-Json | Set-Content -LiteralPath `
+            (Join-Path $consumer '.github\copilot\agents\devpilot-toolkit.lock.json') -Encoding utf8
+          $env:HOME = Join-Path $env:RUNNER_TEMP 'final-smoke-home'
+          $env:USERPROFILE = $env:HOME
+          New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
+          $installed = & (Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1') `
+            -SetupDashboard -Refresh -PassThru
+          if ($installed.Commit -cne $env:CANDIDATE_COMMIT -or
+              $installed.Version -cne $env:RELEASE_VERSION) {
+            throw 'Immutable release did not resolve to the qualified candidate.'
+          }
+          & (Join-Path $installed.Root 'tools\Invoke-InstalledReleaseQualification.ps1') `
+            -ToolkitRoot $installed.Root -ExpectedVersion $env:RELEASE_VERSION `
+            -ExpectedCommit $env:CANDIDATE_COMMIT
+      - name: Create fresh promotion app token
+        id: promotion-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - name: Publish stable Release and advance protected v0.4 channel
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.promotion-token.outputs.token }}
+          WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          gh auth setup-git
+          if ($LASTEXITCODE -ne 0) { throw 'Could not configure authenticated Git transport.' }
+          git fetch --quiet origin main --tags
+          if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main and tags after final smoke.' }
+          $main = (git rev-parse origin/main).Trim()
+          if ($LASTEXITCODE -ne 0 -or $main -cne $env:WORKFLOW_COMMIT) {
+            throw "main moved after final smoke; expected '$($env:WORKFLOW_COMMIT)', found '$main'."
+          }
+          $tagName = "v$($env:RELEASE_VERSION)"
+          $compatible = @(git tag --points-at $env:CANDIDATE_COMMIT |
+            Where-Object { $_ -cmatch '^v0\.4\.(0|[1-9][0-9]*)$' })
+          if ($compatible.Count -ne 1 -or $compatible[0] -cne $tagName -or
+              (git cat-file -t "refs/tags/$tagName").Trim() -cne 'tag') {
+            throw 'Candidate commit must carry exactly one compatible annotated immutable release tag.'
+          }
+          gh release create $tagName --verify-tag --generate-notes --title "DevPilot Agents $tagName"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the stable GitHub Release.' }
+          git tag -fa v0.4 $env:CANDIDATE_COMMIT -m 'DevPilot Agents 0.4 stable channel'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the local v0.4 channel tag.' }
+          git push --force origin refs/tags/v0.4
+          if ($LASTEXITCODE -ne 0) { throw 'Could not advance the protected v0.4 channel.' }
