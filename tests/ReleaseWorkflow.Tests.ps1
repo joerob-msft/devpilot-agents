@@ -3,6 +3,8 @@ BeforeAll {
     $release = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release.yml') -Raw
     $promotion = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release-channel.yml') -Raw
     $canary = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release-canary.yml') -Raw
+    $installedQualification = Get-Content -LiteralPath (
+        Join-Path $root 'tools\Invoke-InstalledReleaseQualification.ps1') -Raw
     function Get-WorkflowRunBlocks {
         param([Parameter(Mandatory)][string]$Text)
         @([regex]::Matches($Text, '(?m)^[ ]+run: \|\r?\n(?<body>(?:[ ]{10,}.*(?:\r?\n|$))*)') |
@@ -32,6 +34,8 @@ Describe 'Release publication boundary' {
         $release | Should -Match 'Invoke-InstalledReleaseQualification\.ps1'
         $release | Should -Match 'Install-DevPilotAgents\.Tests\.ps1'
         $release | Should -Match 'Start-DevPilot\.Tests\.ps1'
+        $installedQualification | Should -Match 'DEVPILOT_INSTALLED_PESTER_PATHS'
+        $installedQualification | Should -Match '-NoProfile -NonInteractive'
     }
 
     It 'makes the separate protected live canary mandatory' {
