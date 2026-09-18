@@ -541,6 +541,7 @@ function Get-AgentNormalizedSkipReason {
     if ($value -match 'title marks .*not ready') { return 'notReady' }
     if ($value -match 'already reviewed|already delivered') { return 'delivered' }
     if ($value -match 'starved|consecutive failures') { return 'starved' }
+    if ($value -match 'recovery cooldown|reconciliation') { return 'recovery' }
     if ($value -match 'source commit|40-hex') { return 'invalidCommit' }
     if ($value -match 'selection budget') { return 'budgetExhausted' }
     if ($value -match 'unfinished delivery|delivery plan') { return 'unfinishedDelivery' }
@@ -620,7 +621,7 @@ function Format-AgentSkipSummary {
     param([System.Collections.IDictionary]$Counts)
     $labels = [ordered]@{
         draft = 'draft'; delivered = 'delivered'; own = 'own'; notReady = 'not ready'
-        starved = 'starved'; invalidCommit = 'invalid commit'; budgetExhausted = 'budget exhausted'
+        starved = 'starved'; recovery = 'recovery cooldown'; invalidCommit = 'invalid commit'; budgetExhausted = 'budget exhausted'
         unfinishedDelivery = 'unfinished delivery'; other = 'other'
     }
     $parts = New-Object System.Collections.Generic.List[string]

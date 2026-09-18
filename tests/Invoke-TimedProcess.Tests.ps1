@@ -334,6 +334,18 @@ $child = New-AgentPersistentRedirectedProcess -FilePath (Resolve-AgentPwshPath) 
         $result.TimedOut | Should -BeFalse
     }
 
+    It 'drains buffered output after terminating a timed-out child' {
+        $result = Invoke-TimedProcess -FilePath (Resolve-AgentPwshPath) `
+            -ArgumentList @('-NoProfile', '-Command',
+                '[Console]::Out.WriteLine("before-timeout"); [Console]::Out.Flush(); [Console]::Error.WriteLine("diagnostic"); [Console]::Error.Flush(); Start-Sleep -Seconds 30') `
+            -CaptureStdOut -CaptureStdErr -ContainDescendants -TimeoutSeconds 1
+
+        $result.TimedOut | Should -BeTrue
+        $result.OutputDrained | Should -BeTrue
+        $result.StdOut | Should -Match 'before-timeout'
+        $result.StdErr | Should -Match 'diagnostic'
+    }
+
     It 'reaps descendants when the timed parent exits normally' -Skip:(-not $IsWindows) {
         $pidPath = Join-Path $TestDrive 'normal-exit-descendant.pid'
         $descendantPid = 0

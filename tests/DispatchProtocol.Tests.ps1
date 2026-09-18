@@ -324,7 +324,7 @@ Describe 'dispatch protocol primitives' {
             $source | Should -Match 'Authoritative durable state v2'
             $source | Should -Match 'Durable state v2 is uninitialized'
             $source | Should -Match 'Migration or explicit initialization is required'
-            $source | Should -Match 'Legacy operational failure attempts'
+            $source | Should -Match 'Source-scoped operational recovery state'
         }
     }
 

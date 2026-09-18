@@ -174,6 +174,9 @@ param(
     [ValidateRange(30, 7200)]
     [int]$CycleTimeoutSeconds = 1800,
 
+    [ValidateRange(10, 900)]
+    [int]$FinalizationReserveSeconds = 180,
+
     [ValidateSet('Auto', 'Compact', 'Detailed', 'Json')]
     [string]$OutputMode = 'Auto'
 )
@@ -247,7 +250,8 @@ if ($ManualDispatchManifest -or $LauncherWorkerManifest) {
     Initialize-AgentParentProcessContainment
 }
 
-$ResultMarkerPrefix = "REVIEW_HANDLER_RESULT_V1:"
+$ResultMarkerPrefix = "REVIEW_HANDLER_RESULT_V2:"
+$script:HandlerLegacyResultMarkerPrefix = "REVIEW_HANDLER_RESULT_V1:"
 $script:HandlerRejectedResumeSessionIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
 # ---------------------------------------------------------------------------
@@ -631,11 +635,16 @@ function Get-HandlerActivePullRequests {
 }
 
 function Get-HandlerMarkerSchema {
-    param([Parameter(Mandatory)][string]$ExpectedProject, [Parameter(Mandatory)][string]$ExpectedNonce)
-    return @{
-        Keys   = @('schemaVersion', 'prId', 'repositoryId', 'project', 'handledSourceCommit', 'threadsAddressed', 'threadsReplied', 'commitsPushed', 'pushedCommit', 'validation', 'readyToComplete', 'nonce')
-        Fields = @{
-            schemaVersion       = @{ Type = 'int'; Min = 1; Max = 1 }
+    param(
+        [Parameter(Mandatory)][string]$ExpectedProject,
+        [Parameter(Mandatory)][string]$ExpectedNonce,
+        [ValidateSet(1, 2)][int]$SchemaVersion = 1
+    )
+    $keys = @('schemaVersion', 'prId', 'repositoryId', 'project', 'handledSourceCommit',
+        'threadsAddressed', 'threadsReplied', 'commitsPushed', 'pushedCommit',
+        'validation', 'readyToComplete', 'nonce')
+    $fields = @{
+            schemaVersion       = @{ Type = 'int'; Min = $SchemaVersion; Max = $SchemaVersion }
             prId                = @{ Type = 'int'; Min = 1; Max = [int]::MaxValue }
             repositoryId        = @{ Type = 'guid' }
             project             = @{ Type = 'exact'; Expected = $ExpectedProject }
@@ -647,8 +656,13 @@ function Get-HandlerMarkerSchema {
             validation          = @{ Type = 'enum'; Values = @('passed', 'failed', 'skipped') }
             readyToComplete     = @{ Type = 'bool' }
             nonce               = @{ Type = 'exact'; Expected = $ExpectedNonce }
-        }
     }
+    if ($SchemaVersion -eq 2) {
+        $keys += @('outcome', 'observedSourceCommit')
+        $fields.outcome = @{ Type = 'enum'; Values = @('handled', 'source-changed', 'deadline-reached', 'no-safe-progress') }
+        $fields.observedSourceCommit = @{ Type = 'hexOrNull'; Length = 40 }
+    }
+    return @{ Keys = $keys; Fields = $fields }
 }
 
 function Test-HandlerMarkerBinding {
@@ -1188,12 +1202,18 @@ if ($ShowState -or $ResetStarvedCandidates) {
                 (Get-HandlerHashValue -Container $h -Key 'validation' -Default '?'),
                 (Get-HandlerHashValue -Container $h -Key 'at' -Default '?'))
         }
-        Write-Host "`nLegacy operational failure attempts ($($attemptsNow.Count)) - threshold ${ConsecutiveFailureThreshold}:" -ForegroundColor Cyan
+        Write-Host "`nSource-scoped operational recovery state ($($attemptsNow.Count)) - deterministic threshold ${ConsecutiveFailureThreshold}:" -ForegroundColor Cyan
         foreach ($k in @($attemptsNow.Keys | Sort-Object)) {
             $a = $attemptsNow[$k]
-            $count = if ($a -is [int]) { $a } else { [int](Get-HandlerHashValue -Container $a -Key 'count' -Default 0) }
-            $starved = if ($count -ge $ConsecutiveFailureThreshold) { "  <-- STARVED (skipped)" } else { "" }
-            Write-Host ("  PR {0,-10} failures={1} last={2}{3}" -f $k, $count, (Get-HandlerHashValue -Container $a -Key 'lastAt' -Default '?'), $starved) -ForegroundColor $(if ($starved) { "Yellow" } else { "Gray" })
+            $failureClass = [string](Get-HandlerHashValue -Container $a -Key 'failureClass' -Default 'legacy')
+            $count = [int](Get-HandlerHashValue -Container $a -Key 'deterministicCount' -Default 0)
+            $source = [string](Get-HandlerHashValue -Container $a -Key 'sourceCommit' -Default '')
+            $sourceShort = $source.Substring(0, [Math]::Min(12, $source.Length))
+            $starved = if ($failureClass -eq 'deterministic' -and $count -ge $ConsecutiveFailureThreshold) { "  <-- STARVED (skipped)" } else { "" }
+            Write-Host ("  PR {0,-10} class={1,-24} deterministic={2} commit={3} last={4}{5}" -f
+                $k, $failureClass, $count, $sourceShort,
+                (Get-HandlerHashValue -Container $a -Key 'lastAt' -Default '?'), $starved) `
+                -ForegroundColor $(if ($starved) { "Yellow" } else { "Gray" })
         }
         Write-Host "`nLegacy operational PR -> coding session ($($sessionsNow.Count)):" -ForegroundColor Cyan
         foreach ($k in @($sessionsNow.Keys | Sort-Object)) {
@@ -1223,6 +1243,12 @@ function Get-HandlerRuntimeContext {
         [Parameter(Mandatory)][string]$WorktreePath,
         [Parameter(Mandatory)][string]$ResolvedSessionId,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ThreadDigestText,
+        [Parameter(Mandatory)][DateTime]$CycleStartedAtUtc,
+        [Parameter(Mandatory)][DateTime]$CycleDeadlineUtc,
+        [Parameter(Mandatory)][DateTime]$FinalizationCutoffUtc,
+        [Parameter(Mandatory)][ValidateRange(10, 900)][int]$EffectiveFinalizationReserveSeconds,
+        [AllowEmptyString()][string]$RecoveryFailureClass = '',
+        [AllowEmptyString()][string]$RecoveryReason = '',
         [bool]$ValidationRetryOnly = $false,
         [AllowEmptyString()][string]$PriorValidationSummary = ''
     )
@@ -1233,6 +1259,10 @@ function Get-HandlerRuntimeContext {
     $lines.Add("Nonce you MUST copy exactly (case-sensitive) into the marker ``nonce`` field: ``$Nonce``")
     $lines.Add("Permission mode: ``$PermissionMode``")
     $lines.Add("Operator (PR author) alias being monitored: ``$OperatorAlias``")
+    $lines.Add("Cycle started at UTC: ``$($CycleStartedAtUtc.ToUniversalTime().ToString('o'))``")
+    $lines.Add("Hard cycle deadline UTC: ``$($CycleDeadlineUtc.ToUniversalTime().ToString('o'))``")
+    $lines.Add("Stop starting new work and begin final reconciliation by UTC: ``$($FinalizationCutoffUtc.ToUniversalTime().ToString('o'))``")
+    $lines.Add("Reserved finalization window: ``$EffectiveFinalizationReserveSeconds`` second(s). Use it to re-read the PR source, summarize observable effects, and emit exactly one terminal marker.")
     $lines.Add("")
     $lines.Add("Effective capability flags for THIS cycle:")
     $lines.Add("- EnableCodeChanges: ``$([bool]$EnableCodeChanges)``")
@@ -1251,6 +1281,13 @@ function Get-HandlerRuntimeContext {
     }
     else {
         $lines.Add("Resolved prior coding session id: ``none`` - no prior coding session for this branch exists on this machine. This is normal and NOT an error: sessions are local and ephemeral, and a branch authored elsewhere will never have one here. Work from the bound PR, the repository, and the thread digest below. Do not search for, wait for, or ask about a session.")
+    }
+    if ($RecoveryFailureClass) {
+        $lines.Add("Recovery mode: ``$RecoveryFailureClass``. A prior cycle ended without a verified terminal result.")
+        $lines.Add("Before any new write, reconcile the current PR source, branch HEAD, worktree status, existing commits, and thread replies. Treat already-landed effects as completed and continue only remaining work. Never repeat a reply, commit, or push merely because the prior marker was missing.")
+        if ($RecoveryReason) {
+            $lines.Add("Prior recovery reason: $RecoveryReason")
+        }
     }
     if ($ValidationRetryOnly) {
         $lines.Add("Validation retry only: ``true`` - prior review replies and code delivery already completed. Re-run the smallest relevant validation now. Do not re-answer or change existing review threads. If validation exposes a real code defect and code changes are enabled, fix it, validate again, and push one corrective commit.")
@@ -1426,10 +1463,10 @@ function Invoke-DryRunSelfChecks {
 
     Write-Host "[DRY-RUN] Self-check 6/$total : result-marker parsing (valid / wrong-nonce / not-final / duplicate / non-strict-int / binding / ready-gating)" -ForegroundColor Cyan
     $nonce = "testnonce123"
-    $schema = Get-HandlerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce
+    $schema = Get-HandlerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -SchemaVersion 2
     $guid = $cfgRepoId
     $commit = ("a" * 40)
-    $mkBody = "{`"schemaVersion`":1,`"prId`":16600300,`"repositoryId`":`"$guid`",`"project`":`"$ExpectedProject`",`"handledSourceCommit`":`"$commit`",`"threadsAddressed`":8,`"threadsReplied`":8,`"commitsPushed`":1,`"pushedCommit`":`"$commit`",`"validation`":`"passed`",`"readyToComplete`":true,`"nonce`":`"$nonce`"}"
+    $mkBody = "{`"schemaVersion`":2,`"prId`":16600300,`"repositoryId`":`"$guid`",`"project`":`"$ExpectedProject`",`"handledSourceCommit`":`"$commit`",`"threadsAddressed`":8,`"threadsReplied`":8,`"commitsPushed`":1,`"pushedCommit`":`"$commit`",`"validation`":`"passed`",`"readyToComplete`":true,`"nonce`":`"$nonce`",`"outcome`":`"handled`",`"observedSourceCommit`":`"$commit`"}"
     $validLine = "$ResultMarkerPrefix $mkBody"
     $mValid = ConvertFrom-AgentResultMarker -StdOutText "some chatter`n$validLine" -MarkerPrefix $ResultMarkerPrefix -Schema $schema
     if ($null -eq $mValid) { $failures.Add("Valid marker was rejected.") } else { Write-Host "  OK - valid marker accepted" -ForegroundColor Green }
@@ -1447,6 +1484,13 @@ function Invoke-DryRunSelfChecks {
         if (-not (Test-HandlerReadyToComplete -Marker $mValid -ActionableThreadCount 8)) { $failures.Add("readyToComplete not honored when addressed>=actionable and validation passed.") } else { Write-Host "  OK - readyToComplete honored when fully addressed" -ForegroundColor Green }
         if (Test-HandlerReadyToComplete -Marker $mValid -ActionableThreadCount 9) { $failures.Add("readyToComplete honored even though addressed<actionable.") } else { Write-Host "  OK - readyToComplete withheld when threads remain" -ForegroundColor Green }
     }
+    $legacySchema = Get-HandlerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -SchemaVersion 1
+    $legacyBody = "{`"schemaVersion`":1,`"prId`":16600300,`"repositoryId`":`"$guid`",`"project`":`"$ExpectedProject`",`"handledSourceCommit`":`"$commit`",`"threadsAddressed`":1,`"threadsReplied`":1,`"commitsPushed`":0,`"pushedCommit`":null,`"validation`":`"skipped`",`"readyToComplete`":false,`"nonce`":`"$nonce`"}"
+    if (-not (ConvertFrom-AgentResultMarker -StdOutText "$script:HandlerLegacyResultMarkerPrefix $legacyBody" `
+            -MarkerPrefix $script:HandlerLegacyResultMarkerPrefix -Schema $legacySchema)) {
+        $failures.Add("Legacy V1 marker was rejected.")
+    }
+    else { Write-Host "  OK - legacy V1 marker remains accepted" -ForegroundColor Green }
     $failureNarrative = Get-HandlerValidationSummary -ResultText "Work delivered.`nValidation failed because Invoke-Pester was permission denied.`n$validLine" -MarkerPrefix $ResultMarkerPrefix
     if ($failureNarrative -notmatch 'Invoke-Pester was permission denied') { $failures.Add("Validation failure narrative was not retained for dashboard diagnostics.") }
     else { Write-Host "  OK - bounded validation failure narrative retained" -ForegroundColor Green }
@@ -1539,9 +1583,12 @@ function Invoke-DryRunSelfChecks {
     $digest = Build-HandlerThreadDigest -Classifications $cls
     if ($digest.Text -match 'Null deref' -or $digest.Text -match 'Fixed in commit' -or $digest.Text -match 'retry') { $failures.Add("Thread digest leaked raw comment text.") } else { Write-Host "  OK - digest contains no raw comment text" -ForegroundColor Green }
     if ($digest.ActionableCount -ne 3) { $failures.Add("Digest actionable count = $($digest.ActionableCount), expected 3.") } else { Write-Host "  OK - digest actionable count correct (3)" -ForegroundColor Green }
+    $runtimeProbeStart = [DateTime]::UtcNow
     $runtimeProbe = Get-HandlerRuntimeContext -Nonce ("a" * 36) -PermissionMode "Constrained" -PrId 1 `
         -RepositoryId $cfgRepoId -SourceCommit ("b" * 40) -SourceBranch "operator/probe" `
-        -WorktreePath $RepoPath -ResolvedSessionId "none" -ThreadDigestText $digest.Text
+        -WorktreePath $RepoPath -ResolvedSessionId "none" -ThreadDigestText $digest.Text `
+        -CycleStartedAtUtc $runtimeProbeStart -CycleDeadlineUtc $runtimeProbeStart.AddMinutes(30) `
+        -FinalizationCutoffUtc $runtimeProbeStart.AddMinutes(27) -EffectiveFinalizationReserveSeconds 180
     $stdinProbe = (Get-Content -LiteralPath $PromptFile -Raw) + "`n`n---`n" + $runtimeProbe + "`n"
     if ($stdinProbe -match 'System\.Collections\.Hashtable') { $failures.Add("Runtime context stringified the thread-digest hashtable.") }
     elseif ($stdinProbe -notmatch 'threadId=1') { $failures.Add("Runtime context omitted the structured thread digest.") }
@@ -1730,8 +1777,8 @@ function Invoke-DryRunSelfChecks {
 
     Write-Host "[DRY-RUN] Self-check 18/$total : robust marker extraction + CLI JSONL channel" -ForegroundColor Cyan
     $mkNonce = "aa" * 18
-    $mkSchema = Get-HandlerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $mkNonce
-    $mkJson = "{`"schemaVersion`":1,`"prId`":42,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"handledSourceCommit`":`"$('a' * 40)`",`"threadsAddressed`":1,`"threadsReplied`":1,`"commitsPushed`":0,`"pushedCommit`":null,`"validation`":`"skipped`",`"readyToComplete`":false,`"nonce`":`"$mkNonce`"}"
+    $mkSchema = Get-HandlerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $mkNonce -SchemaVersion 2
+    $mkJson = "{`"schemaVersion`":2,`"prId`":42,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"handledSourceCommit`":`"$('a' * 40)`",`"threadsAddressed`":1,`"threadsReplied`":1,`"commitsPushed`":0,`"pushedCommit`":null,`"validation`":`"skipped`",`"readyToComplete`":false,`"nonce`":`"$mkNonce`",`"outcome`":`"handled`",`"observedSourceCommit`":`"$('a' * 40)`"}"
     $mkLine = "$ResultMarkerPrefix $mkJson"
 
     # The real failures: trailing prose glued onto the marker line, and the
@@ -2590,7 +2637,7 @@ function Invoke-HandlerCycle {
                 @{ Expression = { [int](Get-HandlerHashValue -Container $_ -Key 'pullRequestId' -Default 0) }; Ascending = $true })
         $skipCounts = [ordered]@{
             draft = @(@($rawPrs) | Where-Object { $_ -and [bool](Get-HandlerHashValue -Container $_ -Key 'isDraft' -Default $false) }).Count
-            delivered = 0; own = 0; notReady = 0; starved = 0; invalidCommit = 0
+            delivered = 0; own = 0; notReady = 0; starved = 0; recovery = 0; invalidCommit = 0
             budgetExhausted = 0; unfinishedDelivery = 0
             other = [Math]::Max(0, @($rawPrs).Count - $candidates.Count -
                 @(@($rawPrs) | Where-Object { $_ -and [bool](Get-HandlerHashValue -Container $_ -Key 'isDraft' -Default $false) }).Count)
@@ -2652,11 +2699,43 @@ function Invoke-HandlerCycle {
             $prId = [int](Get-HandlerHashValue -Container $pr -Key 'pullRequestId' -Default 0)
             if ($prId -le 0) { continue }
 
-            # Tolerates both the legacy plain-int record and the current
-            # {count,lastAt,lastReason} shape, so an existing state file from a
-            # prior version does not silently read as zero failures.
-            $attemptRecord = $attemptsState[[string]$prId]
-            $attempts = if ($attemptRecord -is [int]) { [int]$attemptRecord } else { [int](Get-HandlerHashValue -Container $attemptRecord -Key 'count' -Default 0) }
+            $prDetail = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
+                action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $prId
+            }
+            $mergeSrc = Get-HandlerHashValue -Container $prDetail -Key 'lastMergeSourceCommit'
+            $sourceCommit = [string](Get-HandlerHashValue -Container $mergeSrc -Key 'commitId' -Default '')
+            if ($sourceCommit -notmatch '^[0-9a-fA-F]{40}$') {
+                $skipCounts.invalidCommit++
+                Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId `
+                    -Data (Get-HandlerPullRequestHistoryData -PullRequest $prDetail -Additional @{
+                    reason = 'no valid 40-hex source commit'; normalizedReason = 'invalidCommit'
+                }) -Message "PR $prId skipped (no valid 40-hex source commit)."
+                continue
+            }
+            if (Remove-AgentAttemptRecordForDifferentSource -AttemptsState $attemptsState `
+                    -PullRequestId $prId -SourceCommit $sourceCommit) {
+                Set-JsonState -Path $attemptsStatePath -State $attemptsState
+            }
+            $attemptRecord = Get-AgentSourceScopedAttemptRecord -Record $attemptsState[[string]$prId] `
+                -SourceCommit $sourceCommit
+            $attempts = [int]$attemptRecord.DeterministicCount
+            $retryAt = [DateTime]::MinValue
+            $retryPending = ($attemptRecord.FailureClass -and $attemptRecord.FailureClass -ne 'deterministic' -and
+                [DateTime]::TryParse([string]$attemptRecord.NextRetryAt,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind, [ref]$retryAt) -and
+                $retryAt.ToUniversalTime() -gt [DateTime]::UtcNow)
+            if ($retryPending) {
+                $skipCounts.recovery++
+                Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId `
+                    -SourceCommit $sourceCommit -Data (Get-HandlerPullRequestHistoryData -PullRequest $prDetail -Additional @{
+                    reason = "recovery cooldown until $($retryAt.ToUniversalTime().ToString('o'))"
+                    normalizedReason = 'recovery'; retryable = $true
+                    failureClass = [string]$attemptRecord.FailureClass
+                    nextRetry = $retryAt.ToUniversalTime().ToString('o')
+                }) -Message "PR $prId is waiting for recovery cooldown before reconciliation."
+                continue
+            }
             if ($attempts -ge $ConsecutiveFailureThreshold) {
                 $skipCounts.starved++
                 Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId `
@@ -2700,20 +2779,6 @@ function Invoke-HandlerCycle {
                 continue
             }
 
-            $prDetail = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
-                action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $prId
-            }
-            $mergeSrc = Get-HandlerHashValue -Container $prDetail -Key 'lastMergeSourceCommit'
-            $sourceCommit = [string](Get-HandlerHashValue -Container $mergeSrc -Key 'commitId' -Default '')
-            if ($sourceCommit -notmatch '^[0-9a-fA-F]{40}$') {
-                $skipCounts.invalidCommit++
-                Send-HandlerEvent candidate.skipped -Level warning -Cycle $CycleNumber -PrId $prId `
-                    -Data (Get-HandlerPullRequestHistoryData -PullRequest $prDetail -Additional @{
-                    reason = 'no valid 40-hex source commit'; normalizedReason = 'invalidCommit'
-                }) -Message "PR $prId skipped (no valid 40-hex source commit)."
-                continue
-            }
-
             $maxThreadDate = Get-HandlerMaxThreadDate -Threads $threads
             if (-not $ForceAnalysis -and
                 (Test-HandlerAlreadyHandled -HandledState $handledState -PrId $prId -SourceCommit $sourceCommit -MaxThreadDate $maxThreadDate)) {
@@ -2753,6 +2818,8 @@ function Invoke-HandlerCycle {
                 Sessions = $candidateSessions
                 ValidationRetryOnly = ($validationPending -and $actionable -le 0)
                 PriorValidationSummary = [string](Get-HandlerHashValue -Container $priorHandledRecord -Key 'validationSummary' -Default '')
+                RecoveryFailureClass = [string]$attemptRecord.FailureClass
+                RecoveryReason = [string]$attemptRecord.LastReason
             }
             Send-HandlerEvent candidate.selected -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
                 -Data (Get-HandlerPullRequestHistoryData -PullRequest $prDetail) `
@@ -2860,9 +2927,34 @@ function Invoke-HandlerCycle {
         $nonce = New-AgentNonce
         $permissionMode = if ($Yolo) { "YoloPrototype" } elseif ($allowTools -ccontains 'shell') { "BroadCodeTools" } elseif ($LocalValidation) { "LocalValidation" } else { "Constrained" }
         $digest = Build-HandlerThreadDigest -Classifications $bound.Classifications
+        $preRunLocalHead = ''
+        $preRunWorktreeStatus = ''
+        if ($EnableCodeChanges) {
+            try {
+                $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                $preRunLocalHead = [string](& $git.Source -C $worktreePath rev-parse HEAD 2>$null | Select-Object -First 1)
+                $preRunLocalHead = $preRunLocalHead.Trim()
+                $preRunWorktreeStatus = [string]((& $git.Source -C $worktreePath status --porcelain=v1 -uno 2>$null) -join "`n")
+            }
+            catch {
+                $preRunLocalHead = ''
+                $preRunWorktreeStatus = ''
+            }
+        }
+        $modelStartedAtUtc = [DateTime]::UtcNow
+        $cycleDeadlineUtc = $modelStartedAtUtc.AddSeconds($CycleTimeoutSeconds)
+        $effectiveFinalizationReserve = [Math]::Min(
+            $FinalizationReserveSeconds,
+            [Math]::Max(10, [Math]::Floor($CycleTimeoutSeconds / 3)))
+        $finalizationCutoffUtc = $cycleDeadlineUtc.AddSeconds(-$effectiveFinalizationReserve)
         $runtimeContext = Get-HandlerRuntimeContext -Nonce $nonce -PermissionMode $permissionMode -PrId $prId `
             -RepositoryId $cfgRepoId -SourceCommit $bound.SourceCommit -SourceBranch $bound.SourceBranch `
             -WorktreePath $worktreePath -ResolvedSessionId $resolvedSessionId -ThreadDigestText $digest.Text `
+            -CycleStartedAtUtc $modelStartedAtUtc -CycleDeadlineUtc $cycleDeadlineUtc `
+            -FinalizationCutoffUtc $finalizationCutoffUtc `
+            -EffectiveFinalizationReserveSeconds $effectiveFinalizationReserve `
+            -RecoveryFailureClass ([string]$bound.RecoveryFailureClass) `
+            -RecoveryReason ([string]$bound.RecoveryReason) `
             -ValidationRetryOnly ([bool]$bound.ValidationRetryOnly) `
             -PriorValidationSummary ([string]$bound.PriorValidationSummary)
         $operatorContext = if ($ManualDispatchManifest) {
@@ -2921,13 +3013,22 @@ function Invoke-HandlerCycle {
             }
         }
         $marker = $null
+        $structuredFailureClass = ''
+        $structuredFailureReason = ''
+        $acceptedMarkerPrefix = $ResultMarkerPrefix
         Send-HandlerEvent phase.changed -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
             phase = 'validating the result'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
         } -Message "Validating the model result for PR $prId."
         if ($run.ExitCode -eq 0 -and -not $run.TimedOut) {
             $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
                 -MarkerPrefix $ResultMarkerPrefix `
-                -Schema (Get-HandlerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce)
+                -Schema (Get-HandlerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -SchemaVersion 2)
+            if (-not $marker) {
+                $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
+                    -MarkerPrefix $script:HandlerLegacyResultMarkerPrefix `
+                    -Schema (Get-HandlerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -SchemaVersion 1)
+                if ($marker) { $acceptedMarkerPrefix = $script:HandlerLegacyResultMarkerPrefix }
+            }
         }
         if ($marker) {
             if (-not (Test-HandlerMarkerBinding -Marker $marker -PrId $prId -RepositoryId $cfgRepoId -SourceCommit $bound.SourceCommit)) {
@@ -2935,13 +3036,61 @@ function Invoke-HandlerCycle {
                 $marker = $null
             }
         }
+        if ($marker -and ([int]$marker.schemaVersion -eq 1 -or [string]$marker.outcome -eq 'handled')) {
+            $expectedObservedCommit = if ($marker.pushedCommit) {
+                [string]$marker.pushedCommit
+            }
+            else { $bound.SourceCommit }
+            $observedSourceCommit = if ([int]$marker.schemaVersion -eq 2) {
+                [string]$marker.observedSourceCommit
+            }
+            else { $expectedObservedCommit }
+            $verifiedObservedCommit = ''
+            try {
+                $verifyPr = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
+                    action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $prId
+                }
+                $verifyMergeSource = Get-HandlerHashValue -Container $verifyPr -Key 'lastMergeSourceCommit'
+                $verifiedObservedCommit = [string](Get-HandlerHashValue -Container $verifyMergeSource -Key 'commitId' -Default '')
+            }
+            catch {
+                $structuredFailureClass = 'environment'
+                $structuredFailureReason = "could not verify the marker's observed source commit: $($_.Exception.Message)"
+                $marker = $null
+            }
+            $adoMayStillShowBoundCommitAfterPush = ($marker -and $marker.pushedCommit -and
+                $verifiedObservedCommit -ieq $bound.SourceCommit)
+            if ($marker -and ($observedSourceCommit -notmatch '^[0-9a-fA-F]{40}$' -or
+                    $observedSourceCommit -ine $expectedObservedCommit -or
+                    ($verifiedObservedCommit -ine $observedSourceCommit -and
+                        -not $adoMayStillShowBoundCommitAfterPush))) {
+                $structuredFailureClass = 'source-changed'
+                $structuredFailureReason = "marker observed source '$observedSourceCommit' did not match the independently verified source '$verifiedObservedCommit'"
+                $marker = $null
+            }
+        }
+        if ($marker -and [int]$marker.schemaVersion -eq 2 -and [string]$marker.outcome -ne 'handled') {
+            $structuredFailureClass = switch ([string]$marker.outcome) {
+                'source-changed' { 'source-changed' }
+                'deadline-reached' { 'timed-out' }
+                default { 'contract-failure' }
+            }
+            $structuredFailureReason = "model reported outcome '$($marker.outcome)'"
+            if ($marker.observedSourceCommit) {
+                $structuredFailureReason += " at observed source $($marker.observedSourceCommit)"
+            }
+            $marker = $null
+        }
         $validationSummary = if ($marker -and ([string]$marker.validation) -eq 'failed') {
-            Get-HandlerValidationSummary -ResultText $markerSource -MarkerPrefix $ResultMarkerPrefix
+            Get-HandlerValidationSummary -ResultText $markerSource -MarkerPrefix $acceptedMarkerPrefix
         }
         else { '' }
 
         if (-not $marker) {
-            $reason = if ($run.TimedOut) { "cycle timed out after ${CycleTimeoutSeconds}s" } elseif ($run.ExitCode -ne 0) { "copilot exited $($run.ExitCode)" } else { "missing or invalid result marker" }
+            $reason = if ($structuredFailureReason) { $structuredFailureReason }
+            elseif ($run.TimedOut) { "cycle timed out after ${CycleTimeoutSeconds}s" }
+            elseif ($run.ExitCode -ne 0) { "copilot exited $($run.ExitCode)" }
+            else { "missing or invalid result marker" }
 
             # A PR is not "unreviewable" because the host lost its credentials.
             # Launch signatures are read from STDERR ONLY (see
@@ -2953,17 +3102,71 @@ function Invoke-HandlerCycle {
             $launchFailureReason = $null
             if (-not $modelActuallyRan) { $launchFailureReason = Get-AgentLaunchFailureReason -StdErrText ([string]$run.StdErr) }
 
+            $currentSourceCommit = ''
+            $sourceRevalidationFailure = ''
+            try {
+                $freshPr = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
+                    action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $prId
+                }
+                $freshMergeSource = Get-HandlerHashValue -Container $freshPr -Key 'lastMergeSourceCommit'
+                $currentSourceCommit = [string](Get-HandlerHashValue -Container $freshMergeSource -Key 'commitId' -Default '')
+                if ($currentSourceCommit -notmatch '^[0-9a-fA-F]{40}$') { $currentSourceCommit = '' }
+            }
+            catch { $sourceRevalidationFailure = $_.Exception.Message }
+
+            $localHead = ''
+            $postRunWorktreeStatus = ''
+            try {
+                $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                $localHead = [string](& $git.Source -C $worktreePath rev-parse HEAD 2>$null | Select-Object -First 1)
+                $localHead = $localHead.Trim()
+                if ($localHead -notmatch '^[0-9a-fA-F]{40}$') { $localHead = '' }
+                $postRunWorktreeStatus = [string]((& $git.Source -C $worktreePath status --porcelain=v1 -uno 2>$null) -join "`n")
+            }
+            catch { $localHead = '' }
+            $modifiedFiles = if ($cliOutcome) { @($cliOutcome.ModifiedFiles) } else { @() }
+            $partialWorkDetected = ($EnableCodeChanges -and (
+                $modifiedFiles.Count -gt 0 -or
+                ($preRunLocalHead -and $localHead -and $localHead -ine $preRunLocalHead) -or
+                $postRunWorktreeStatus -cne $preRunWorktreeStatus))
+
+            $failureClass = if ($structuredFailureClass) { $structuredFailureClass } else { 'contract-failure' }
             if ($launchFailureReason) {
                 Write-Warning "PR $prId not handled - ENVIRONMENT fault, not counted toward starvation: $launchFailureReason"
                 $reason = "environment: $launchFailureReason"
+                $failureClass = 'environment'
+            }
+            elseif ($currentSourceCommit -and $currentSourceCommit -ine $bound.SourceCommit) {
+                $reason = "source changed from $($bound.SourceCommit) to $currentSourceCommit during the cycle"
+                $failureClass = 'source-changed'
+                Write-Warning "PR $prId changed source during the cycle; the latest commit will be reconsidered without starvation."
+            }
+            elseif ($failureClass -eq 'source-changed') {
+                $reason = "model reported a source change that authoritative revalidation did not confirm"
+                $failureClass = 'contract-failure'
+                Write-Warning "PR $prId model source-change outcome was not confirmed; retrying as a contract recovery."
+            }
+            elseif ($run.TimedOut -or $failureClass -eq 'timed-out') {
+                $failureClass = if ($partialWorkDetected) { 'partial-work-unconfirmed' } else { 'timed-out' }
+                Write-Warning "PR $prId model execution timed out; this transient execution failure is not counted toward starvation."
+            }
+            elseif ($partialWorkDetected) {
+                $failureClass = 'partial-work-unconfirmed'
+                $reason = "model completed without a valid marker after observable local or reported file changes"
+                Write-Warning "PR $prId may contain partial work; the next cycle must reconcile observed state before making more changes."
             }
             else {
-                Write-Warning "PR $prId not handled: $reason."
-                $prior = $attemptsState[[string]$prId]
-                $priorCount = if ($prior -is [int]) { [int]$prior } else { [int](Get-HandlerHashValue -Container $prior -Key 'count' -Default 0) }
-                $attemptsState[[string]$prId] = @{ count = ($priorCount + 1); lastAt = (Get-Date).ToUniversalTime().ToString("o"); lastReason = $reason }
-                Set-JsonState -Path $attemptsStatePath -State $attemptsState
+                Write-Warning "PR $prId model result did not satisfy the marker contract; this is not counted toward starvation."
             }
+            if ($sourceRevalidationFailure) {
+                $reason += "; source revalidation failed: $sourceRevalidationFailure"
+                if ($failureClass -eq 'contract-failure') { $failureClass = 'environment' }
+            }
+            $recordSourceCommit = if ($currentSourceCommit) { $currentSourceCommit } else { $bound.SourceCommit }
+            [void](Set-AgentSourceScopedAttemptRecord -AttemptsState $attemptsState -PullRequestId $prId `
+                -SourceCommit $recordSourceCommit -FailureClass $failureClass -Reason $reason -Retryable $true `
+                -NextRetryAtUtc ([DateTime]::UtcNow.AddSeconds($MinBackoffSeconds)))
+            Set-JsonState -Path $attemptsStatePath -State $attemptsState
 
             # Persist the failed transcript so an operator can diagnose WHY the
             # model produced no usable marker. Transcripts are wrapper-owned,
@@ -2977,6 +3180,7 @@ function Invoke-HandlerCycle {
                     "reason      : $reason"
                     "exitCode    : $($run.ExitCode)"
                     "timedOut    : $($run.TimedOut)"
+                    "outputDrained: $($run.OutputDrained)"
                     "nonce       : $nonce"
                     "markerPrefix: $ResultMarkerPrefix"
                     "--------------- STDOUT ---------------"
@@ -2994,18 +3198,35 @@ function Invoke-HandlerCycle {
             }
             catch { Write-Warning "Could not write failure transcript: $($_.Exception.Message)" }
 
-            Write-HandlerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId; reason = $reason; environmentFault = [bool]$launchFailureReason }
+            Write-HandlerCycleMetadata -Fields @{
+                cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId; reason = $reason
+                environmentFault = ($failureClass -eq 'environment'); failureClass = $failureClass
+                countedTowardStarvation = $false; boundSourceCommit = $bound.SourceCommit
+                currentSourceCommit = $currentSourceCommit; localHead = $localHead
+                preRunLocalHead = $preRunLocalHead; modifiedFileCount = $modifiedFiles.Count
+                worktreeStatusChanged = ($postRunWorktreeStatus -cne $preRunWorktreeStatus)
+                outputDrained = [bool]$run.OutputDrained
+            }
             $result.ExitCode = 1
-            $result.Summary = "PR $prId failed: $reason"
-            Send-HandlerTeamsNotification -AgencyPath $AgencyPath -Event "handlerFailed" -PrId $prId -SourceCommit $bound.SourceCommit `
-                -SourceRefName "refs/heads/$($bound.SourceBranch)" `
-                -Title "Review-handler could not process PR $prId" `
-                -Body "$reason. Branch $($bound.SourceBranch). See the failure transcript on the agent host." `
-                -Links @(Get-HandlerPullRequestLink -PrId $prId)
-            Send-HandlerEvent work.completed -Level error -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
+            $result.Summary = "PR $prId deferred for recovery: $reason"
+            if ($failureClass -ne 'source-changed') {
+                Send-HandlerTeamsNotification -AgencyPath $AgencyPath -Event "handlerFailed" -PrId $prId -SourceCommit $bound.SourceCommit `
+                    -SourceRefName "refs/heads/$($bound.SourceBranch)" `
+                    -Title "Review-handler deferred PR $prId for recovery" `
+                    -Body "$reason. Branch $($bound.SourceBranch). The handler will reconcile authoritative state before retrying." `
+                    -Links @(Get-HandlerPullRequestLink -PrId $prId)
+            }
+            Send-HandlerEvent work.completed -Level warning -Cycle $CycleNumber -PrId $prId -SourceCommit $bound.SourceCommit -Data @{
                 title = [string](Get-HandlerHashValue -Container $bound.Pr -Key 'title' -Default "PR $prId")
-                result = 'failed'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
-                delivered = 'none'; reason = $reason; summary = 'No review feedback was handled.'
+                result = 'deferred'; elapsedMilliseconds = $cycleTimer.ElapsedMilliseconds
+                delivered = 'none'; reason = $reason; summary = 'No verified terminal result was produced.'
+                failureClass = $failureClass; retryable = $true; countedTowardStarvation = $false
+                boundSourceCommit = $bound.SourceCommit; currentSourceCommit = $currentSourceCommit
+                localHead = $localHead; preRunLocalHead = $preRunLocalHead
+                modifiedFileCount = $modifiedFiles.Count
+                worktreeStatusChanged = ($postRunWorktreeStatus -cne $preRunWorktreeStatus)
+                outputDrained = [bool]$run.OutputDrained
+                nextRetry = 'after cycle backoff and authoritative reconciliation'
             } -Message $result.Summary
             return $result
         }
@@ -3121,13 +3342,17 @@ function Invoke-HandlerCycle {
         Set-AgentDurableRecords -Context $script:HandlerDurableContext -Records $handledState | Out-Null
 
         if ($validationFailed) {
-            $priorAttempt = $attemptsState[[string]$prId]
-            $priorCount = if ($priorAttempt -is [int]) { [int]$priorAttempt } else { [int](Get-HandlerHashValue -Container $priorAttempt -Key 'count' -Default 0) }
-            $attemptsState[[string]$prId] = @{
-                count = ($priorCount + 1)
-                lastAt = (Get-Date).ToUniversalTime().ToString("o")
-                lastReason = $(if ($validationSummary) { $validationSummary } else { 'local validation failed' })
+            $carryDeterministicCount = 0
+            if ($pushedCommit -and $stateSourceCommit -ine $bound.SourceCommit) {
+                $priorBoundAttempt = Get-AgentSourceScopedAttemptRecord `
+                    -Record $attemptsState[[string]$prId] -SourceCommit $bound.SourceCommit
+                $carryDeterministicCount = [int]$priorBoundAttempt.DeterministicCount
             }
+            [void](Set-AgentSourceScopedAttemptRecord -AttemptsState $attemptsState -PullRequestId $prId `
+                -SourceCommit $stateSourceCommit -FailureClass deterministic `
+                -Reason $(if ($validationSummary) { $validationSummary } else { 'local validation failed' }) `
+                -Retryable $true -NextRetryAtUtc ([DateTime]::UtcNow.AddSeconds($MinBackoffSeconds)) `
+                -CarryDeterministicCount $carryDeterministicCount)
             Set-JsonState -Path $attemptsStatePath -State $attemptsState
         }
         elseif ($attemptsState.ContainsKey([string]$prId)) {

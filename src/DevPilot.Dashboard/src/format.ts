@@ -77,9 +77,21 @@ const EVENT_NARRATIVE: Record<string, string> = {
 };
 
 export function eventNarrative(event: AgentEvent): string {
+  const failureClass = typeof event.data.failureClass === "string" ? event.data.failureClass : "";
+  const recoveryLabel: Record<string, string> = {
+    "source-changed": "Source changed; latest commit will retry",
+    "timed-out": "Model timed out; transient retry scheduled",
+    "stalled": "Model stalled; transient retry scheduled",
+    "contract-failure": "Result contract missing; retry scheduled",
+    "partial-work-unconfirmed": "Partial work detected; reconciliation required",
+    environment: "Environment recovery required",
+    deterministic: "Deterministic PR failure",
+  };
   const label =
     event.eventType === "phase.changed"
       ? `Phase: ${typeof event.data.phase === "string" ? boundedText(event.data.phase, 80) : "changed"}`
+      : failureClass && recoveryLabel[failureClass]
+        ? recoveryLabel[failureClass]
       : EVENT_NARRATIVE[event.eventType] ?? "Agent activity";
   const detail =
     event.message ||
