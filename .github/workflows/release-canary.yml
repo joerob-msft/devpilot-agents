@@ -129,7 +129,7 @@ jobs:
             Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
           }
 
-      - name: Run consecutive read-only launches
+      - name: Run consecutive read-only MCP qualifications
         shell: pwsh
         env:
           REVIEWER_PR: ${{ vars.RELEASE_CANARY_REVIEWER_PR }}
@@ -178,22 +178,15 @@ jobs:
             if ($installed.Commit -cne $env:CANDIDATE_COMMIT) {
               throw "Canary resolution attempt $attempt did not resolve to candidateCommit."
             }
-            $attemptRoot = Join-Path $env:HOME "attempt-$attempt"
-            $arguments = @{
-              ToolkitRoot = $installed.Root
-              PreviewOnly = $true
-              Once = $true
-              StateDir = Join-Path $attemptRoot 'watch'
-              DurableStateRoot = Join-Path $attemptRoot 'durable'
-              LeaseRoot = Join-Path $attemptRoot 'leases'
-              EnableReviewerTeamsNotifications = $false
-              EnableReviewHandlerTeamsNotifications = $false
-              EnableReviewHandlerTeamsPrReferenceWrites = $false
+            if (-not $env:REVIEWER_PR -or -not $env:HANDLER_PR) {
+              throw 'Protected canary PR IDs are required.'
             }
-            if ($env:REVIEWER_PR) { $arguments.ReviewerPullRequestId = [int]$env:REVIEWER_PR }
-            if ($env:HANDLER_PR) { $arguments.ReviewHandlerPullRequestId = [int]$env:HANDLER_PR }
-            & (Join-Path $consumer 'Start-DevPilot.ps1') @arguments
-            if ($LASTEXITCODE -ne 0) { throw "Read-only canary attempt $attempt failed." }
+            $result = & (Join-Path $installed.Root 'tools\Test-DevPilotLiveCanary.ps1') `
+              -ReviewerConfigFile (Join-Path $consumer '.github\copilot\agents\reviewer.config.json') `
+              -ReviewHandlerConfigFile (Join-Path $consumer '.github\copilot\agents\review-handler.config.json') `
+              -ReviewerPullRequestId ([int]$env:REVIEWER_PR) `
+              -ReviewHandlerPullRequestId ([int]$env:HANDLER_PR)
+            if (-not $result.workIqVerified) { throw "Read-only canary attempt $attempt failed." }
           }
       - name: Remove temporary canary cache
         if: always()
