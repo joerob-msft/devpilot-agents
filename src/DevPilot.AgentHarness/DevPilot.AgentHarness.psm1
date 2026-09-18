@@ -600,7 +600,7 @@ function Get-AgentSessionIsolationEnvVars {
         it injects the parent's custom instructions into the child, which competes
         with the agent's own cycle prompt.
     #>
-    return @(
+    $variables = @(
         "COPILOT_AGENT_SESSION_ID",
         "COPILOT_SESSION_ID",
         "COPILOT_LOADER_PID",
@@ -611,6 +611,15 @@ function Get-AgentSessionIsolationEnvVars {
         "AGENCY_LOG_SESSION_DIR",
         "AGENCY_REPO_DIR"
     )
+    if ([Environment]::GetEnvironmentVariable("DEVPILOT_SELF_HOSTED_DESKTOP_MCP_AUTH") -ceq "1") {
+        if (-not $IsWindows -or
+            [Environment]::GetEnvironmentVariable("GITHUB_ACTIONS") -cne "true" -or
+            -not [Environment]::GetEnvironmentVariable("RUNNER_NAME")) {
+            throw "DEVPILOT_SELF_HOSTED_DESKTOP_MCP_AUTH is valid only on an identified Windows self-hosted GitHub Actions runner."
+        }
+        $variables += "GITHUB_ACTIONS"
+    }
+    return $variables
 }
 
 # ---------------------------------------------------------------------------

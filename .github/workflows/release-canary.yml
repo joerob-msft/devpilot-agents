@@ -138,6 +138,7 @@ jobs:
           EXACT_VERSION: ${{ inputs.exactVersion }}
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           CONSECUTIVE_RUNS: ${{ inputs.consecutiveRuns }}
+          DEVPILOT_SELF_HOSTED_DESKTOP_MCP_AUTH: "1"
         run: |
           $count = 0
           if (-not [int]::TryParse($env:CONSECUTIVE_RUNS, [ref]$count) -or $count -lt 3 -or $count -gt 5) {

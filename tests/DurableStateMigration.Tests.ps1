@@ -15,6 +15,14 @@ Describe 'legacy durable-state migration validation' {
         $source | Should -Match 'Close-AgentMcpSession -Session \$session -Abort'
     }
 
+    It 'allows the dedicated Windows canary to remove only the Agency pipeline-auth marker' {
+        $moduleSource = Get-Content -LiteralPath (
+            Join-Path $PSScriptRoot '..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psm1') -Raw
+        $moduleSource | Should -Match 'DEVPILOT_SELF_HOSTED_DESKTOP_MCP_AUTH'
+        $moduleSource | Should -Match '\$variables \+= "GITHUB_ACTIONS"'
+        $moduleSource | Should -Match 'identified Windows self-hosted GitHub Actions runner'
+    }
+
     It 'reads an Azure DevOps fixture through the provider-neutral snapshot API' {
         $commit = 'a' * 40
         $calls = [Collections.Generic.List[object]]::new()

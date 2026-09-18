@@ -60,6 +60,7 @@ Describe 'Release publication boundary' {
         $canary | Should -Match 'DurableStateRoot = Join-Path \$attemptRoot'
         $canary | Should -Match 'LeaseRoot = Join-Path \$attemptRoot'
         $canary | Should -Not -Match '\$env:USERPROFILE = \$env:HOME'
+        $canary | Should -Match 'DEVPILOT_SELF_HOSTED_DESKTOP_MCP_AUTH: "1"'
         $release | Should -Match 'Verify mandatory live canary'
     }
 
