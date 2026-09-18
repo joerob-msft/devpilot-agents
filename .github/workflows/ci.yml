@@ -49,6 +49,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate unified toolkit version
+        shell: pwsh
+        run: ./tools/Test-DevPilotVersion.ps1
+
       - name: Validate manifest and import module
         shell: pwsh
         run: |
