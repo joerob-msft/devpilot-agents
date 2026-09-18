@@ -218,7 +218,7 @@ jobs:
   installed-artifact:
     name: Clean consumer installation qualification
     needs: [windows-complete, platform-safety, canary-gate]
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, devpilot-canary]
     timeout-minutes: 120
     environment: release-qualification
     steps:
@@ -241,14 +241,16 @@ jobs:
           CONSUMER_REF: ${{ vars.RELEASE_CONSUMER_REF }}
           CONSUMER_READ_PAT: ${{ secrets.RELEASE_CONSUMER_READ_PAT }}
         run: |
-          if (-not $env:CONSUMER_REPOSITORY -or -not $env:CONSUMER_READ_PAT) {
-            throw 'The release-qualification environment is missing its read-only consumer configuration.'
+          if (-not $env:CONSUMER_REPOSITORY) {
+            throw 'The release-qualification environment is missing its consumer repository URL.'
           }
           $destination = Join-Path $env:RUNNER_TEMP 'consumer'
-          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:CONSUMER_READ_PAT"))
-          $env:GIT_CONFIG_COUNT = '1'
-          $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
-          $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          if ($env:CONSUMER_READ_PAT) {
+            $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:CONSUMER_READ_PAT"))
+            $env:GIT_CONFIG_COUNT = '1'
+            $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+            $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          }
           try {
             git clone --quiet --branch $(if ($env:CONSUMER_REF) { $env:CONSUMER_REF } else { 'dev' }) `
               --single-branch --template= $env:CONSUMER_REPOSITORY $destination
@@ -293,23 +295,17 @@ jobs:
   publish:
     name: Publish immutable patch and promote channel
     needs: [windows-complete, platform-safety, canary-gate, installed-artifact]
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, devpilot-canary]
     timeout-minutes: 120
     environment: release-publish
+    permissions:
+      contents: write
     steps:
-      - name: Create release app token
-        id: release-token
-        uses: actions/create-github-app-token@v3
-        with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.candidateCommit }}
           fetch-depth: 0
-          persist-credentials: false
-          token: ${{ steps.release-token.outputs.token }}
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
@@ -320,14 +316,12 @@ jobs:
       - name: Recheck publication boundary
         shell: pwsh
         env:
-          GH_TOKEN: ${{ steps.release-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RELEASE_VERSION: ${{ inputs.version }}
           RESUME_PUBLISHED_TAG: ${{ inputs.resumePublishedTag }}
         run: |
-          gh auth setup-git
-          if ($LASTEXITCODE -ne 0) { throw 'Could not configure authenticated Git transport.' }
           git fetch --quiet origin main --tags
           if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main and release tags at the publication boundary.' }
           $main = (git rev-parse origin/main).Trim()
@@ -377,12 +371,11 @@ jobs:
         if: ${{ !inputs.resumePublishedTag }}
         shell: pwsh
         env:
-          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          git config user.name '${{ steps.release-token.outputs.app-slug }}[bot]'
-          git config user.email '${{ steps.release-token.outputs.app-slug }}[bot]@users.noreply.github.com'
+          git config user.name 'devpilot-release[bot]'
+          git config user.email 'devpilot-release[bot]@users.noreply.github.com'
           $tagName = "v$($env:RELEASE_VERSION)"
           git tag -a $tagName $env:CANDIDATE_COMMIT -m "DevPilot Agents $tagName"
           if ($LASTEXITCODE -ne 0) { throw 'Could not create the immutable annotated tag.' }
@@ -395,14 +388,16 @@ jobs:
           CONSUMER_REF: ${{ vars.RELEASE_CONSUMER_REF }}
           CONSUMER_READ_PAT: ${{ secrets.RELEASE_CONSUMER_READ_PAT }}
         run: |
-          if (-not $env:CONSUMER_REPOSITORY -or -not $env:CONSUMER_READ_PAT) {
-            throw 'The release-publish environment is missing its read-only consumer configuration.'
+          if (-not $env:CONSUMER_REPOSITORY) {
+            throw 'The release-publish environment is missing its consumer repository URL.'
           }
           $destination = Join-Path $env:RUNNER_TEMP 'consumer'
-          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:CONSUMER_READ_PAT"))
-          $env:GIT_CONFIG_COUNT = '1'
-          $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
-          $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          if ($env:CONSUMER_READ_PAT) {
+            $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:CONSUMER_READ_PAT"))
+            $env:GIT_CONFIG_COUNT = '1'
+            $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+            $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          }
           try {
             git clone --quiet --branch $(if ($env:CONSUMER_REF) { $env:CONSUMER_REF } else { 'dev' }) `
               --single-branch --template= $env:CONSUMER_REPOSITORY $destination
@@ -437,23 +432,14 @@ jobs:
           & (Join-Path $installed.Root 'tools\Invoke-InstalledReleaseQualification.ps1') `
             -ToolkitRoot $installed.Root -ExpectedVersion $env:RELEASE_VERSION `
             -ExpectedCommit $env:CANDIDATE_COMMIT
-      - name: Create fresh promotion app token
-        id: promotion-token
-        uses: actions/create-github-app-token@v3
-        with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
       - name: Publish stable Release and advance protected v0.4 channel
         shell: pwsh
         env:
-          GH_TOKEN: ${{ steps.promotion-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          gh auth setup-git
-          if ($LASTEXITCODE -ne 0) { throw 'Could not configure authenticated Git transport.' }
           git fetch --quiet origin main --tags
           if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main and tags after final smoke.' }
           $main = (git rev-parse origin/main).Trim()

@@ -40,7 +40,7 @@ concurrency:
 jobs:
   live-read-only:
     name: Protected ADO and WorkIQ canary
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, devpilot-canary]
     timeout-minutes: 120
     environment: release-canary
     steps:
@@ -49,6 +49,19 @@ jobs:
           ref: ${{ inputs.workflowCommit }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify dedicated canary host prerequisites
+        shell: pwsh
+        run: |
+          foreach ($command in @('agency', 'git', 'node', 'npm', 'pwsh')) {
+            if (-not (Get-Command $command -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+              throw "Dedicated canary host is missing required command '$command'."
+            }
+          }
+          $nodeVersion = (& node --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v(\d+)\.' -or [int]$Matches[1] -lt 24) {
+            throw "Dedicated canary host requires Node.js 24 or newer, found '$nodeVersion'."
+          }
 
       - name: Verify exact current main commit
         shell: pwsh
@@ -97,14 +110,16 @@ jobs:
           CONSUMER_REF: ${{ vars.RELEASE_CONSUMER_REF }}
           CONSUMER_READ_PAT: ${{ secrets.RELEASE_CONSUMER_READ_PAT }}
         run: |
-          if (-not $env:CONSUMER_REPOSITORY -or -not $env:CONSUMER_READ_PAT) {
-            throw 'The release-canary environment is missing its read-only consumer repository configuration.'
+          if (-not $env:CONSUMER_REPOSITORY) {
+            throw 'The release-canary environment is missing its consumer repository URL.'
           }
           $destination = Join-Path $env:RUNNER_TEMP 'consumer'
-          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:CONSUMER_READ_PAT"))
-          $env:GIT_CONFIG_COUNT = '1'
-          $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
-          $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          if ($env:CONSUMER_READ_PAT) {
+            $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:CONSUMER_READ_PAT"))
+            $env:GIT_CONFIG_COUNT = '1'
+            $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+            $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          }
           try {
             git clone --quiet --branch $(if ($env:CONSUMER_REF) { $env:CONSUMER_REF } else { 'dev' }) `
               --single-branch --template= $env:CONSUMER_REPOSITORY $destination

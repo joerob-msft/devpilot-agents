@@ -63,23 +63,25 @@ All deterministic, consumer, canary, and final installed gates run again.
 
 The live canary is **mandatory before advancing `v0.4`**. It runs three to five
 consecutive `Start-DevPilot.ps1 -PreviewOnly -Once` launches from the installed
-candidate cache. PreviewOnly disables PR, repository, pipeline, work-item,
+candidate cache on a dedicated self-hosted Windows runner labeled
+`devpilot-canary`. PreviewOnly disables PR, repository, pipeline, work-item,
 Teams, and notification writes while still exercising authenticated MCP
-startup and representative repository/PR reads. Keep this workflow separate
-from pull-request CI because it depends on protected credentials and live
-service availability.
+startup and representative repository/PR reads. The runner must execute as the
+dedicated operator account with Agency/Copilot, ADO, and WorkIQ already
+authenticated. Never assign this label to pull-request jobs or a shared
+general-purpose runner.
 
 ## Required environments and credentials
 
-Create both environments before the first release:
+Create all three environments before the first release:
 
 - `release-canary`: required reviewers, self-review disabled, deployment branch
-  limited to `main`, read-only consumer credential, canary PR IDs.
+  limited to `main`, dedicated self-hosted canary runner, canary PR IDs.
 - `release-qualification`: required reviewers, self-review disabled,
-  deployment branch limited to `main`, read-only consumer credential.
+  deployment branch limited to `main`, dedicated self-hosted canary runner.
 - `release-publish`: required reviewers, self-review disabled, deployment
-  branch limited to `main`, the same read-only consumer credential, and the
-  release GitHub App private key.
+  branch limited to `main`, dedicated self-hosted canary runner, and the
+  release deploy key.
 
 Configure these variables and secrets in the environments:
 
@@ -87,15 +89,17 @@ Configure these variables and secrets in the environments:
 |---|---|---|
 | `RELEASE_CONSUMER_REPOSITORY_URL` | variable | Protected consumer Git URL |
 | `RELEASE_CONSUMER_REF` | variable | Consumer qualification branch |
-| `RELEASE_CONSUMER_READ_PAT` | secret | Read-only consumer clone credential |
+| `RELEASE_CONSUMER_READ_PAT` | optional secret | Read-only clone credential when the runner has no approved ambient ADO credential |
 | `RELEASE_CANARY_REVIEWER_PR` | variable | Stable PR for reviewer read checks |
 | `RELEASE_CANARY_HANDLER_PR` | variable | Stable PR for handler read checks |
-| `RELEASE_APP_CLIENT_ID` | variable | Release GitHub App client ID |
-| `RELEASE_APP_PRIVATE_KEY` | secret | Release GitHub App private key |
+| `RELEASE_DEPLOY_KEY` | secret | Private half of the repository's dedicated write-enabled release deploy key |
 
-The consumer credential must not have write scopes. The GitHub App needs repository Contents write. The rollback workflow also
-requests Actions read so it can verify the exact protected canary run. The App
-must be the only bypass actor on release-tag creation and channel rulesets.
+The dedicated runner's ADO credential and any optional PAT must be read-only.
+The release deploy key exists only in `release-publish`; its public half is a
+write-enabled repository deploy key and it is the only bypass actor on
+release-tag creation and channel rulesets. The workflow's `GITHUB_TOKEN`
+creates the GitHub Release only after protected-environment approval and final
+smoke tests; Git tag writes use the deploy key.
 
 ## Required rulesets
 
@@ -106,11 +110,11 @@ protected release environments:
    pushes and deletion, require the current CI checks, and require the branch
    to be up to date.
 2. `release-tag-creation`: target `v0.4` and `v0.4.*`; restrict tag creation;
-   the release GitHub App is the only bypass actor.
+   the release deploy key is the only bypass actor.
 3. `immutable-v0.4-patches`: target `v0.4.*`; restrict updates and deletions;
-   configure no bypass actor, including the release App.
+   configure no bypass actor, including the release deploy key.
 4. `v0.4-channel`: target exactly `v0.4`; restrict updates and deletions; the
-   release GitHub App is the only bypass actor.
+   release deploy key is the only bypass actor.
 
 Environment approvers must verify the rulesets in repository settings before
 approving the first publication. The required `main` checks are:
@@ -128,9 +132,9 @@ approving the first publication. The required `main` checks are:
 - `Dashboard dispatch groundwork (ubuntu-latest)`
 - `Dashboard dispatch groundwork (macos-latest)`
 
-Layering the tag rulesets is intentional. The release App can create patch
-tags, but the no-bypass immutable ruleset prevents that same identity from
-updating or deleting them.
+Layering the tag rulesets is intentional. The release deploy key can create
+patch tags, but the no-bypass immutable ruleset prevents that same identity
+from updating or deleting them.
 
 ## Release checklist
 

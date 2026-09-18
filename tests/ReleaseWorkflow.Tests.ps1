@@ -16,8 +16,9 @@ Describe 'Release publication boundary' {
     It 'keeps publication behind complete deterministic, installed, and live gates' {
         $release | Should -Match 'needs: \[windows-complete, platform-safety, canary-gate, installed-artifact\]'
         $release | Should -Match 'environment: release-publish'
-        $release | Should -Match 'actions/create-github-app-token@v3'
-        $release | Should -Match 'permission-contents: write'
+        $release | Should -Match 'ssh-key: \$\{\{ secrets\.RELEASE_DEPLOY_KEY \}\}'
+        $release | Should -Match '(?s)publish:.*permissions:\s+contents: write'
+        $release | Should -Not -Match 'create-github-app-token'
         $release | Should -Match 'git tag -a \$tagName \$env:CANDIDATE_COMMIT'
         $release.IndexOf('Invoke-InstalledReleaseQualification.ps1') |
             Should -BeLessThan $release.IndexOf('gh release create $tagName')
@@ -41,6 +42,8 @@ Describe 'Release publication boundary' {
 
     It 'makes the separate protected live canary mandatory' {
         $canary | Should -Match 'environment: release-canary'
+        $canary | Should -Match 'runs-on: \[self-hosted, Windows, X64, devpilot-canary\]'
+        $canary | Should -Match 'Get-Command \$command'
         $canary | Should -Match 'PreviewOnly = \$true'
         $canary | Should -Match 'consecutiveRuns must be between 3 and 5'
         $canary | Should -Match 'Canary \$\{\{ inputs\.resolutionMode \}\}'
@@ -49,12 +52,13 @@ Describe 'Release publication boundary' {
 
     It 'allows only qualified immutable 0.4 releases to receive rollback promotion' {
         $promotion | Should -Match "mode = 'exactVersion'"
-        $promotion | Should -Match 'permission-actions: read'
+        $promotion | Should -Match 'actions: read'
+        $promotion | Should -Match 'ssh-key: \$\{\{ secrets\.RELEASE_DEPLOY_KEY \}\}'
         $promotion | Should -Match 'Target must be an annotated immutable release tag'
         $promotion | Should -Match 'exactly one compatible immutable 0\.4 patch tag'
         $promotion | Should -Match 'Re-resolve and smoke-test rollback target'
         $promotion | Should -Match 'main moved after rollback smoke'
-        $promotion | Should -Match 'GH_TOKEN: \$\{\{ steps\.promotion-token\.outputs\.token \}\}'
+        $promotion | Should -Match 'GH_TOKEN: \$\{\{ github\.token \}\}'
         $promotion | Should -Match 'Rollback stable GitHub Release changed during qualification'
         $promotion | Should -Match 'git push --force origin refs/tags/v0.4'
     }
