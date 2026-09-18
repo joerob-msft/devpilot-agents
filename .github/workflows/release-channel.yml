@@ -202,7 +202,7 @@ jobs:
           try {
             [IO.File]::WriteAllText($keyPath, $env:RELEASE_DEPLOY_KEY,
               [Text.UTF8Encoding]::new($false))
-            & icacls $keyPath /inheritance:r /grant:r "${env:USERNAME}:(R)" | Out-Null
+            & icacls $keyPath /inheritance:r /grant:r "${env:USERNAME}:(F)" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Could not protect the temporary release key.' }
             git config user.name 'devpilot-release[bot]'
             git config user.email 'devpilot-release[bot]@users.noreply.github.com'
@@ -214,6 +214,9 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Could not move the protected v0.4 channel.' }
           }
           finally {
-            Remove-Item -LiteralPath $keyPath -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $keyPath) {
+              Remove-Item -LiteralPath $keyPath -Force -ErrorAction Stop
+            }
+            if (Test-Path -LiteralPath $keyPath) { throw 'Temporary release key cleanup failed.' }
             Remove-Item Env:RELEASE_DEPLOY_KEY -ErrorAction SilentlyContinue
           }

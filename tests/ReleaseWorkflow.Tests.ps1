@@ -85,6 +85,8 @@ Describe 'Release publication boundary' {
             $credentialBlocks.Count | Should -BeGreaterThan 0
             foreach ($block in $credentialBlocks) {
                 $block | Should -Not -Match 'Invoke-InstalledReleaseQualification|Install-DevPilotAgents|Invoke-Pester|npm|node --test|Test-DevPilotVersion'
+                $block | Should -Match '\$\{env:USERNAME\}:\(F\)'
+                $block | Should -Match 'Temporary release key cleanup failed'
             }
         }
     }
