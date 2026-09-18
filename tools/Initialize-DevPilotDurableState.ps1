@@ -21,6 +21,9 @@ param(
     [string]$DurableStateRoot,
     [string]$LeaseRoot,
     [string]$AgencyPath,
+    [ValidateRange(10, 120)][int]$McpTimeoutSeconds = 60,
+    [ValidateRange(1, 5)][int]$McpStartupAttempts = 3,
+    [ValidateRange(0, 30)][int]$McpRetryDelaySeconds = 5,
     [Parameter(DontShow)][AllowNull()]$ProviderContext
 )
 
@@ -87,18 +90,41 @@ $lock = $null
 try {
     if ($ProviderContext) {
         $provider = $ProviderContext
+        $identity = Resolve-AgentProviderRepositoryIdentity -Context $provider
     }
     else {
-        $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado -Organization $Organization `
-            -Toolsets @('repos') -TimeoutSeconds 10
-        $invoker = {
-            param($Name, $Arguments, $RawText)
-            Invoke-AgentMcpTool -Session $session -Name $Name -Arguments $Arguments -RawText:$RawText
-        }.GetNewClosure()
-        $provider = New-AgentProviderContext -Provider AzureDevOps -Organization $Organization -Project $Project `
-            -RepositoryName $RepositoryName -RepositoryId $RepositoryId -McpInvoker $invoker -TimeoutSeconds 10
+        for ($attempt = 1; $attempt -le $McpStartupAttempts; $attempt++) {
+            try {
+                $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server ado `
+                    -Organization $Organization -Toolsets @('repos') -TimeoutSeconds $McpTimeoutSeconds
+                $invoker = {
+                    param($Name, $Arguments, $RawText)
+                    Invoke-AgentMcpTool -Session $session -Name $Name -Arguments $Arguments -RawText:$RawText
+                }.GetNewClosure()
+                $provider = New-AgentProviderContext -Provider AzureDevOps -Organization $Organization `
+                    -Project $Project -RepositoryName $RepositoryName -RepositoryId $RepositoryId `
+                    -McpInvoker $invoker -TimeoutSeconds $McpTimeoutSeconds
+                $identity = Resolve-AgentProviderRepositoryIdentity -Context $provider
+                break
+            }
+            catch {
+                $startupFailure = $_
+                if ($session) {
+                    Close-AgentMcpSession -Session $session -Abort
+                    $session = $null
+                }
+                $message = [string]$startupFailure.Exception.Message
+                $recoverable = (Test-AgentRecoverableMcpTransportFailure -Message $message) -or
+                    $message -match '^Agent MCP request failed \(JSON-RPC error code -32000\)(?::|\.|$)'
+                if (-not $recoverable -or $attempt -ge $McpStartupAttempts) {
+                    throw $startupFailure
+                }
+                Write-Warning "ADO MCP startup/read attempt $attempt/$McpStartupAttempts failed; retrying with a fresh session. $message"
+                if ($McpRetryDelaySeconds -gt 0) { Start-Sleep -Seconds $McpRetryDelaySeconds }
+            }
+        }
     }
-    $identity = Resolve-AgentProviderRepositoryIdentity -Context $provider
+    if (-not $identity) { throw 'ADO MCP startup/read attempts ended without a verified repository identity.' }
     $reader = {
         param([int]$PullRequestId)
         Get-AgentProviderPullRequestSnapshot -Context $provider -PullRequestId $PullRequestId

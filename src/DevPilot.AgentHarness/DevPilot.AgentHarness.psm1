@@ -5653,7 +5653,15 @@ function Send-AgentMcpRequest {
             if ($hasResult -eq $hasError) { throw "Agent MCP returned an invalid result/error envelope." }
             if ($hasError) {
                 $errorCode = if ($response.error -and $response.error.PSObject.Properties["code"]) { [string]$response.error.code } else { "unknown" }
-                throw "Agent MCP request failed (JSON-RPC error code $errorCode)."
+                $errorMessage = if ($response.error -and
+                    $response.error.PSObject.Properties["message"] -and
+                    $response.error.message -is [string]) {
+                    ([string]$response.error.message -replace '[\x00-\x1f]+', ' ').Trim()
+                }
+                else { '' }
+                if ($errorMessage.Length -gt 500) { $errorMessage = $errorMessage.Substring(0, 500) }
+                throw "Agent MCP request failed (JSON-RPC error code $errorCode).$(
+                    if ($errorMessage) { " $errorMessage" })"
             }
             return $response.result
         }

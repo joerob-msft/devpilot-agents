@@ -4,6 +4,17 @@ BeforeAll {
 }
 
 Describe 'legacy durable-state migration validation' {
+    It 'uses a bounded cold-start budget and fresh-session retries for recoverable live ADO reads' {
+        $source = Get-Content -LiteralPath $script:migrationTool -Raw
+        $source | Should -Match '\[int\]\$McpTimeoutSeconds = 60'
+        $source | Should -Match '\[int\]\$McpStartupAttempts = 3'
+        $source | Should -Match 'Open-AgentMcpSession[\s\S]+-TimeoutSeconds \$McpTimeoutSeconds'
+        $source | Should -Match 'New-AgentProviderContext[\s\S]+-TimeoutSeconds \$McpTimeoutSeconds'
+        $source | Should -Match 'Test-AgentRecoverableMcpTransportFailure'
+        $source | Should -Match 'JSON-RPC error code -32000'
+        $source | Should -Match 'Close-AgentMcpSession -Session \$session -Abort'
+    }
+
     It 'reads an Azure DevOps fixture through the provider-neutral snapshot API' {
         $commit = 'a' * 40
         $calls = [Collections.Generic.List[object]]::new()
