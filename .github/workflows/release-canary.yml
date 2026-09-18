@@ -168,7 +168,6 @@ jobs:
           else { throw 'Unsupported canary resolutionMode.' }
           $pin | ConvertTo-Json | Set-Content -LiteralPath $pinPath -Encoding utf8
           $env:HOME = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-canary"
-          $env:USERPROFILE = $env:HOME
           New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
           for ($attempt = 1; $attempt -le $count; $attempt++) {
             Write-Host "Read-only canary attempt $attempt of $count."

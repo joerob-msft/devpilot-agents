@@ -59,6 +59,7 @@ Describe 'Release publication boundary' {
         $canary | Should -Match 'StateDir = Join-Path \$attemptRoot'
         $canary | Should -Match 'DurableStateRoot = Join-Path \$attemptRoot'
         $canary | Should -Match 'LeaseRoot = Join-Path \$attemptRoot'
+        $canary | Should -Not -Match '\$env:USERPROFILE = \$env:HOME'
         $release | Should -Match 'Verify mandatory live canary'
     }
 
