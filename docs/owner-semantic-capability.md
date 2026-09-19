@@ -72,9 +72,10 @@ under a dedicated v2 preview state root and pass that sanitized local artifact
 to the observer. It must not share, migrate, repair, or reinterpret deployed v1
 state.
 
-The committed runner is in-process and deterministic. A later real-model
-adapter must add an out-of-process deadline and cancellation boundary rather
-than extending this preview contract with host or scheduler authority.
+Layer 4 adds a bounded out-of-process test-child adapter and exact offline
+response replay through the same parser. Live model launch remains fail-closed
+until a model CLI can prove a literal read-only/no-tools mode. See
+`owner-model-runner.md`.
 
 ## Safety and migration status
 
@@ -86,9 +87,9 @@ offline, and generic.
 
 Later layers must separately add and validate:
 
-- a parallel runner and scheduler;
-- a real model adapter;
+- a parallel scheduler/orchestrator with separate preview state;
 - a sustained parity cohort;
+- a proven no-tools real model launch mode;
 - writer compatibility;
 - relation-aware capabilities; and
 - an explicit cutover and rollback plan.
