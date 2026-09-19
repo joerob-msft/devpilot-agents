@@ -69,7 +69,13 @@ if ($Mode -eq 'PlatformSafety') {
         else {
             './node_modules/bun/bin/bun.exe'
         }
-        & $bun --conditions=browser test .\dist\test\dispatch.test.js
+        $dispatchTest = if ($IsWindows) {
+            '.\dist\test\dispatch.test.js'
+        }
+        else {
+            './dist/test/dispatch.test.js'
+        }
+        & $bun --conditions=browser test $dispatchTest
         if ($LASTEXITCODE -ne 0) { throw 'Dashboard dispatch test failed.' }
     }
     finally { Pop-Location }

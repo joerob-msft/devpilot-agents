@@ -50,6 +50,7 @@ Describe 'Release publication boundary' {
         $ciRunner | Should -Match '\$pesterPath = \$env:PATH'
         $ciRunner | Should -Match '(?s)if \(\$IsWindows\).*pwsh\.exe'
         $ciRunner | Should -Match '\./node_modules/bun/bin/bun\.exe'
+        $ciRunner | Should -Match '\./dist/test/dispatch\.test\.js'
     }
 
     It 'makes the separate protected live canary mandatory' {
