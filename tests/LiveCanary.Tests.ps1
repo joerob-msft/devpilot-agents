@@ -25,4 +25,13 @@ Describe 'Protected live canary contract' {
         $source | Should -Match 'WorkIQ /me read returned no data'
         $source | Should -Match 'workIqVerified = \$true'
     }
+
+    It 'retries only transport and startup protocol failures with fresh sessions' {
+        $source | Should -Match '\[int\]\$McpAttempts = 3'
+        $source | Should -Match 'Test-AgentRecoverableMcpTransportFailure'
+        $source | Should -Match 'Agent MCP returned malformed JSON-RPC'
+        $source | Should -Match 'JSON-RPC error code -32000'
+        $source | Should -Match 'Close-AgentMcpSession -Session \$workIqSession -Abort'
+        $source | Should -Match 'Close-AgentMcpSession -Session \$adoSession -Abort'
+    }
 }
