@@ -71,7 +71,10 @@ and WorkIQ MCP sessions on a dedicated self-hosted Windows runner labeled
 configured reviewer and review-handler PR snapshots, and reads WorkIQ `/me`.
 The script exposes no write operation and does not start a model or dashboard;
 those process boundaries are covered by deterministic installed-artifact
-qualification. The runner must execute as the dedicated operator account with
+qualification. Recoverable transport, generic `-32000` startup, and malformed
+startup frames are retried only with entirely fresh ADO and WorkIQ sessions;
+repository/PR validation and WorkIQ HTTP failures remain terminal. The runner
+must execute as the dedicated operator account with
 Agency/Copilot, ADO, and WorkIQ already authenticated. The canary opts its Agency children out of the
 `GITHUB_ACTIONS` pipeline-auth marker so they use that desktop identity; the
 workflow itself remains a GitHub Actions job. HOME, LOCALAPPDATA, watch state,
