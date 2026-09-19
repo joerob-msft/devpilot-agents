@@ -200,7 +200,9 @@ jobs:
           }
           $keyPath = Join-Path $env:RUNNER_TEMP 'devpilot-release-key'
           try {
-            [IO.File]::WriteAllText($keyPath, $env:RELEASE_DEPLOY_KEY,
+            $keyText = $env:RELEASE_DEPLOY_KEY.Replace("`r`n", "`n")
+            $keyText = $keyText.TrimEnd([char[]]"`r`n") + "`n"
+            [IO.File]::WriteAllText($keyPath, $keyText,
               [Text.UTF8Encoding]::new($false))
             & icacls $keyPath /inheritance:r /grant:r "${env:USERNAME}:(F)" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Could not protect the temporary release key.' }
