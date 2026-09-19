@@ -1,0 +1,152 @@
+{
+  "schemaVersion": 1,
+  "kind": "owner-v2-preview-cohort",
+  "entries": [
+    {
+      "id": "generic-replay-owner-cohort",
+      "mode": "replay",
+      "subject": {
+        "repositoryId": "repository-example",
+        "projectId": "project-example",
+        "pullRequestId": 42
+      },
+      "head": {
+        "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "target": {
+        "targetCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "targetRef": "refs/heads/main"
+      },
+      "rule": {
+        "repositoryId": "rules-example",
+        "path": "rules/owner-policy.md",
+        "commit": "cccccccccccccccccccccccccccccccccccccccc",
+        "section": "owner-policy",
+        "hash": "v1:sha256:33498ffae13dc90a8a3194dd5c8859906c7406e09b9ce14fe2f6482796529d19",
+        "length": 50
+      },
+      "capability": {
+        "id": "owner-mstest-owner-v2",
+        "digest": "v1:sha256:17f338d4468c54ec4aa9d34c2058ca3506513697ab54b959311eba20d68d8711"
+      },
+      "model": {
+        "id": "owner-offline-replay",
+        "digest": "v1:sha256:2d35f4cc7bbb13f668a0cc7048b73a31092e37eb2282b3f8776d29341ba59423"
+      },
+      "config": {
+        "id": "owner-preview-config",
+        "digest": "v1:sha256:ed40825e26e77533f8914bd94575e3797be09659d387bc691550b82af2eb203d"
+      },
+      "acquisition": {
+        "payloadDigest": "v1:sha256:2f922a3120352e09b93d646d5b601975501d003f1d8763e6f491f649718c330e",
+        "package": {
+          "schemaVersion": 1,
+          "semantics": "owner-acquisition-v1",
+          "contractDigest": "v1:sha256:7a6f3a79b5b87e38c8ca92a19886fff1f814336e331da8136c860f4f101d85b5",
+          "subjectBefore": {
+            "schemaVersion": 1,
+            "repositoryId": "repository-example",
+            "projectId": "project-example",
+            "pullRequestId": 42,
+            "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "targetCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "targetRef": "refs/heads/main",
+            "changedFileCount": 1,
+            "state": "complete",
+            "sourceDigest": "v1:sha256:3e0e27f54c1ee7f96ecd414ad07a37e14dfcefbf34af71808df27215ee891c91"
+          },
+          "changePages": [
+            {
+              "schemaVersion": 1,
+              "repositoryId": "repository-example",
+              "projectId": "project-example",
+              "pullRequestId": 42,
+              "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "targetCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "targetRef": "refs/heads/main",
+              "pageOrdinal": 0,
+              "continuationToken": null,
+              "nextToken": null,
+              "state": "complete",
+              "sourceDigest": "v1:sha256:d13b539dd8c2f8e3d5825b88cceea2d0216d34f4146d1918f7d021999cc53032",
+              "changes": [
+                {
+                  "path": "src/WidgetTests.cs",
+                  "changeType": "modified",
+                  "isBinary": false,
+                  "sourceDigest": "v1:sha256:d1a856c9875732cd7f0ae4db8cc6ca0359f45a793914060cda43a8838e9c86fb",
+                  "spans": [
+                    {
+                      "startLine": 1,
+                      "endLine": 10,
+                      "state": "complete",
+                      "sourceDigest": "v1:sha256:e4c26c45661086352e404351678c2923097620db2c7a11aeecb68cd27e9f0d40"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "rule": {
+            "schemaVersion": 1,
+            "repositoryId": "repository-example",
+            "projectId": "project-example",
+            "pullRequestId": 42,
+            "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "targetCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "targetRef": "refs/heads/main",
+            "ruleRepositoryId": "rules-example",
+            "rulePath": "rules/owner-policy.md",
+            "ruleCommit": "cccccccccccccccccccccccccccccccccccccccc",
+            "ruleSection": "owner-policy",
+            "ruleHash": "v1:sha256:33498ffae13dc90a8a3194dd5c8859906c7406e09b9ce14fe2f6482796529d19",
+            "ruleLength": 50,
+            "state": "complete",
+            "content": "Changed MSTest methods require an Owner attribute.",
+            "sourceDigest": "v1:sha256:60e7af4e7c1f758349be5f479503793edc8c62c650c2d17e5a32cbcd9f18087f"
+          },
+          "files": [
+            {
+              "schemaVersion": 1,
+              "repositoryId": "repository-example",
+              "projectId": "project-example",
+              "pullRequestId": 42,
+              "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "targetCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "targetRef": "refs/heads/main",
+              "path": "src/WidgetTests.cs",
+              "state": "complete",
+              "byteLength": 177,
+              "truncated": false,
+              "content": "using Microsoft.VisualStudio.TestTools.UnitTesting;\nnamespace Example.Project;\n[TestClass]\npublic class WidgetTests\n{\n    [TestMethod]\n    public void NeedsOwner()\n    {\n    }\n}",
+              "sourceDigest": "v1:sha256:01cbd4be8a1cf586339e1aa228c6ee57e225a675ea20483b2c80da735693e049"
+            }
+          ],
+          "subjectAfter": {
+            "schemaVersion": 1,
+            "repositoryId": "repository-example",
+            "projectId": "project-example",
+            "pullRequestId": 42,
+            "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "targetCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "targetRef": "refs/heads/main",
+            "changedFileCount": 1,
+            "state": "complete",
+            "sourceDigest": "v1:sha256:3e0e27f54c1ee7f96ecd414ad07a37e14dfcefbf34af71808df27215ee891c91"
+          }
+        }
+      },
+      "replay": {
+        "modelRecords": [
+          {
+            "executionUnitId": "unit:137a2bb269651b49684d8f97346024d69d555bd20ee77ea65204bbbcaf933c9c",
+            "nonce": "0123456789abcdef0123456789abcdef0123",
+            "inputDigest": "v1:sha256:03824290b6a607ebe8d308e3271523bf07332087dbc5759a1731a6ff9872185f",
+            "subjectBinding": "v1:sha256:729bb8b59f26f53967f022fd53d8e8f1043cc0fc99b50cdf03cde6a6ac0b9eff",
+            "responseBytesBase64": "REVWX1BJTE9UX09XTkVSX1JFU1VMVCBleUpwYm5CMWRFUnBaMlZ6ZENJNkluWXhPbk5vWVRJMU5qb3dNemd5TkRJNU1HSTJZVFl3TjJWaVpUaGtNekE0WlRNeU56RTFNak5pWmpBM016TXlNRGczWkdKak5UYzFPV0V4TnpNeFlUWm1aams0TnpJeE9EVm1JaXdpYm05dVkyVWlPaUl3TVRJek5EVTJOemc1WVdKalpHVm1NREV5TXpRMU5qYzRPV0ZpWTJSbFpqQXhNak1pTENKeVpYTndiMjV6WlhNaU9sdDdJbVY0WldOMWRHbHZibFZ1YVhSSlpDSTZJblZ1YVhRNk1UTTNZVEppWWpJMk9UWTFNV0kwT1RZNE5HUTRaamszTXpRMk1ESTBaRFk1WkRVMU5XSmtNakJsWlRjM1pXRTJOVEl3TkdKaVltTmhaamt6TTJNNVl5SXNJbXAxWkdkdFpXNTBJam9pZG1sdmJHRjBhVzl1SW4xZExDSnpZMmhsYldGV1pYSnphVzl1SWpveExDSnpkV0pxWldOMFFtbHVaR2x1WnlJNkluWXhPbk5vWVRJMU5qbzNNamxpWWpoaU5UbG1NalptTlRNNU5qZG1NREl5Wm1RMU0yUTRaVGhtTVRBME0yTmpNR1pqT1RsaU5UQmpaR1l3TTJOa1pUWmhObUZqTUdJNVpXWm1JbjAK"
+          }
+        ]
+      }
+    }
+  ]
+}
