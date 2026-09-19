@@ -12,13 +12,16 @@ Set-StrictMode -Version Latest
 $root = Split-Path $PSScriptRoot -Parent
 $dashboard = Join-Path $root 'src\DevPilot.Dashboard'
 $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-$primaryPwshDirectory = Split-Path $pwsh -Parent
-$pathSeparator = [IO.Path]::PathSeparator
-$pesterPath = (($env:PATH -split [regex]::Escape([string]$pathSeparator)) |
-    Where-Object {
-        -not (Test-Path -LiteralPath (Join-Path $_ $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' }))) -or
-        [IO.Path]::GetFullPath($_) -eq [IO.Path]::GetFullPath($primaryPwshDirectory)
-    }) -join $pathSeparator
+$pesterPath = $env:PATH
+if ($IsWindows) {
+    $primaryPwshDirectory = Split-Path $pwsh -Parent
+    $pathSeparator = [IO.Path]::PathSeparator
+    $pesterPath = (($env:PATH -split [regex]::Escape([string]$pathSeparator)) |
+        Where-Object {
+            -not (Test-Path -LiteralPath (Join-Path $_ 'pwsh.exe')) -or
+            [IO.Path]::GetFullPath($_) -eq [IO.Path]::GetFullPath($primaryPwshDirectory)
+        }) -join $pathSeparator
+}
 
 function Invoke-DevPilotPesterIsolated {
     param([Parameter(Mandatory)][string[]]$Path)
@@ -60,7 +63,12 @@ if ($Mode -eq 'PlatformSafety') {
         if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
         & npm test
         if ($LASTEXITCODE -ne 0) { throw 'Dashboard logic tests failed.' }
-        $bun = '.\node_modules\bun\bin\bun.exe'
+        $bun = if ($IsWindows) {
+            '.\node_modules\bun\bin\bun.exe'
+        }
+        else {
+            './node_modules/bun/bin/bun.exe'
+        }
         & $bun --conditions=browser test .\dist\test\dispatch.test.js
         if ($LASTEXITCODE -ne 0) { throw 'Dashboard dispatch test failed.' }
     }

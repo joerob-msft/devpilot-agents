@@ -5,6 +5,7 @@ BeforeAll {
     $canary = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release-canary.yml') -Raw
     $installedQualification = Get-Content -LiteralPath (
         Join-Path $root 'tools\Invoke-InstalledReleaseQualification.ps1') -Raw
+    $ciRunner = Get-Content -LiteralPath (Join-Path $root 'tools\Invoke-DevPilotCi.ps1') -Raw
     function Get-WorkflowRunBlocks {
         param([Parameter(Mandatory)][string]$Text)
         @([regex]::Matches($Text, '(?m)^[ ]+run: \|\r?\n(?<body>(?:[ ]{10,}.*(?:\r?\n|$))*)') |
@@ -46,6 +47,9 @@ Describe 'Release publication boundary' {
         $installedQualification | Should -Match 'DEVPILOT_INSTALLED_PESTER_PATHS'
         $installedQualification | Should -Match '-NoProfile -NonInteractive'
         $installedQualification | Should -Match 'Push-Location \$dashboard'
+        $ciRunner | Should -Match '\$pesterPath = \$env:PATH'
+        $ciRunner | Should -Match '(?s)if \(\$IsWindows\).*pwsh\.exe'
+        $ciRunner | Should -Match '\./node_modules/bun/bin/bun\.exe'
     }
 
     It 'makes the separate protected live canary mandatory' {
