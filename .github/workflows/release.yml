@@ -270,17 +270,23 @@ jobs:
         run: |
           $consumer = Join-Path $env:RUNNER_TEMP 'consumer'
           $pinPath = Join-Path $consumer '.github\copilot\agents\devpilot-toolkit.lock.json'
-          [ordered]@{
-            schemaVersion = 2
-            repository = 'https://github.com/joerob-msft/devpilot-agents.git'
-            mode = 'exactCommit'
-            commit = $env:CANDIDATE_COMMIT
-          } | ConvertTo-Json | Set-Content -LiteralPath $pinPath -Encoding utf8
+          $originalPin = [IO.File]::ReadAllBytes($pinPath)
           $env:HOME = Join-Path $env:USERPROFILE "dpc\$env:GITHUB_RUN_ID-installed"
           $env:USERPROFILE = $env:HOME
           New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
           $installer = Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.ps1'
-          $installed = & $installer -SetupDashboard -Refresh -PassThru
+          try {
+            [ordered]@{
+              schemaVersion = 2
+              repository = 'https://github.com/joerob-msft/devpilot-agents.git'
+              mode = 'exactCommit'
+              commit = $env:CANDIDATE_COMMIT
+            } | ConvertTo-Json | Set-Content -LiteralPath $pinPath -Encoding utf8
+            $installed = & $installer -SetupDashboard -Refresh -PassThru
+          }
+          finally {
+            [IO.File]::WriteAllBytes($pinPath, $originalPin)
+          }
           if ($installed.Commit -cne $env:CANDIDATE_COMMIT) { throw 'Consumer installed the wrong candidate commit.' }
           $containers = @(
             New-PesterContainer -Path (Join-Path $consumer '.github\copilot\agents\Install-DevPilotAgents.Tests.ps1')

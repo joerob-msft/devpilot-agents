@@ -43,6 +43,10 @@ Describe 'Release publication boundary' {
         $release | Should -Match 'Invoke-InstalledReleaseQualification\.ps1'
         $release | Should -Match 'Install-DevPilotAgents\.Tests\.ps1'
         $release | Should -Match 'Start-DevPilot\.Tests\.ps1'
+        $release.IndexOf('[IO.File]::ReadAllBytes($pinPath)') |
+            Should -BeLessThan $release.IndexOf("mode = 'exactCommit'")
+        $release.IndexOf('[IO.File]::WriteAllBytes($pinPath, $originalPin)') |
+            Should -BeLessThan $release.IndexOf('New-PesterContainer')
         $release | Should -Match 'Remove temporary installed-artifact cache'
         $installedQualification | Should -Match 'DEVPILOT_INSTALLED_PESTER_PATHS'
         $installedQualification | Should -Match '-NoProfile -NonInteractive'
