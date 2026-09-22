@@ -73,14 +73,26 @@ stack. Component documents link here rather than restating rollout status.
   dated snapshot is deployment evidence, not a repository-created task or
   broader authority.
 - **Authority boundary:** v2 remains preview-only and performs zero provider or
-  writer writes. V1 remains the sole manual approved-comment writer. Existing
-  consumer entry points, configuration, and users were not migrated by this
-  stack. Writer compatibility, automatic comments or votes, and any consumer
+  writer writes. Live Owner observations can read bounded PR discussions after
+  semantic execution and classify the V1-compatible queue as `wouldCreate`,
+  `wouldUpdate`, `noOp`, or explicit `unknown`; that read-only queue does not
+  grant delivery authority. V1 remains the sole manual approved-comment
+  writer. Existing consumer entry points, configuration, and users were not
+  migrated by this stack. Automatic comments or votes and any consumer
   migration require separate decisions.
 - **State and rollback:** v1 and v2 toolkit/state roots remain separate. Rollback
   is an operator action: stop or disable the v2 preview service and restore the
   retained v1 scheduled preview if needed; no v1 state migration or repair is
   required.
+
+After this layer is accepted, deployment must update the external live provider
+to implement the documented `GetDiscussionPage` read contract before pinning
+the new toolkit. Existing semantic results, model execution state, attempts,
+identity, and telemetry remain immutable. A scheduled run with the new provider
+refreshes only the discussion reconciliation overlay and durable result digest,
+including upgrading a pre-reconciliation completed observation, without
+starting the model again. That deployment action is intentionally outside this
+repository change.
 
 Remaining rollout gates are sustained reliability evidence, an explicit
 writer-compatibility and authorization decision, deliberate consumer migration,
@@ -159,6 +171,34 @@ adapter. The orchestrator asserts `preview.writeAllowed = false`,
 `delivery.writeCount = 0`, and observation
 `effects.providerWrites/writeToolInvocations = 0`.
 
+For live Owner entries with eligible findings, the orchestrator performs one
+additional wrapper-only phase after the facade/model path: bounded
+`GetDiscussionPage` acquisition followed by V1-compatible marker/body/anchor
+reconciliation. The discussion snapshot is never model evidence. Its canonical
+digest is recorded as an observation source artifact, and each finding carries
+an actionable classification, reason, expected body digest, and sanitized
+thread identity. Discussion acquisition or integrity failure changes only the
+dedupe result to `unknown`; it does not change the semantic disposition,
+lifecycle verdict, lease, retry boundary, or model-execution state.
+Later runs with a live provider refresh this discussion-only overlay even when
+the semantic record is already completed. They verify the persisted observation
+against its durable digest, perform no preflight or model call, retain the same
+attempt count and telemetry, and replace rather than accumulate discussion
+snapshot provenance. Transient failures are therefore retryable without
+repeating semantic execution.
+
+Completed refreshes use an optimistic compare-and-swap: the provider read runs
+outside the capability lock, then publication rechecks the completed record and
+prior result digest. A small bounded journal in `staging/` fences the observation
+and record updates. If the process stops after writing the observation but
+before updating the record digest, the next run accepts only the journal's exact
+old/new digest pair, completes the interrupted record update, removes the
+journal, and continues. Any other mismatch remains a durable-state integrity
+failure. Provider acquisition, reconciliation, and refresh publication failures
+are contained to that entry and do not skip later cohort entries; durable-state
+integrity failures retain the orchestrator's existing fail-closed whole-run
+behavior.
+
 Live declarations remain off by default. `Invoke-OwnerV2PreviewRun` requires
 the host-only `-EnableLiveModel` switch plus an existing read-only acquisition
 provider. A disabled or not-yet-configured live declaration remains idempotent
@@ -205,7 +245,8 @@ in [Owner parity qualification](owner-parity-qualification.md) and the
 7. deterministic observation/index digest parity; and
 8. stale lease/retry/idempotency parity.
 
-The completed bounded cohort does not grant writer compatibility, scheduling,
-deployment, notifications, comments, votes, summaries, or cutover authority.
+The completed bounded cohort and discussion reconciliation do not grant
+scheduling, deployment, notifications, comments, votes, summaries, or cutover
+authority.
 See [Current operating state](#current-operating-state-authoritative) for the
 current code, deployment, and remaining-gate distinction.

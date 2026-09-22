@@ -874,11 +874,163 @@ Describe 'Owner production and replay acquisition' {
     }
 }
 
+Describe 'Owner discussion acquisition' {
+    It 'paginates, validates, and stably orders bounded read-only discussion data' {
+        $contract = New-TestOwnerContract
+        $request = $contract.Request
+        $identity = [ordered]@{
+            schemaVersion = 1
+            repositoryId = $request.RepositoryId
+            projectId = $request.ProjectId
+            pullRequestId = $request.PullRequestId
+            sourceCommit = $request.SourceCommit
+            targetCommit = $request.TargetCommit
+            targetRef = $request.TargetRef
+        }
+        $makeThread = {
+            param([int]$ThreadId, [int]$CommentId, [string]$Body)
+            return [ordered]@{
+                threadId = $ThreadId
+                status = 'active'
+                isDeleted = $false
+                isOutdated = $false
+                sourceCommit = $request.SourceCommit
+                anchor = [ordered]@{ path = 'src/WidgetTests.cs'; line = 7 }
+                comments = @(
+                    [ordered]@{
+                        commentId = $CommentId
+                        commentType = 'text'
+                        isDeleted = $false
+                        reviewerOwned = $true
+                        body = $Body
+                        bodyDigest = Get-TestOwnerDigest $Body
+                    }
+                )
+            }
+        }
+        $pages = @(
+            ([ordered]@{} + $identity + [ordered]@{
+                pageOrdinal = 0
+                state = 'complete'
+                sourceDigest = Get-TestOwnerDigest 'discussion-page-0'
+                nextToken = 'page-1'
+                threads = @(& $makeThread 20 200 'later')
+            }),
+            ([ordered]@{} + $identity + [ordered]@{
+                pageOrdinal = 1
+                state = 'complete'
+                sourceDigest = Get-TestOwnerDigest 'discussion-page-1'
+                nextToken = $null
+                threads = @(& $makeThread 10 100 'earlier')
+            })
+        )
+        $operations = [Collections.Generic.List[string]]::new()
+        $provider = New-OwnerReadOnlyProviderAdapter -Name 'discussion-pages' -Handler {
+            param($Operation, $Arguments)
+            [void]$operations.Add($Operation)
+            if ($Operation -cne 'GetDiscussionPage') { throw 'unexpected operation' }
+            return $pages[[int]$Arguments.pageOrdinal]
+        }.GetNewClosure()
+
+        $snapshot = Get-OwnerDiscussionSnapshot -Contract $contract -Provider $provider `
+            -Limits (New-OwnerDiscussionLimits -MaximumPages 2 -PageSize 1 `
+                -MaximumThreads 2 -MaximumComments 2 -MaximumBytes 100)
+
+        $snapshot.GetType().FullName | Should -Be 'DevPilot.OwnerAdapters.OwnerDiscussionSnapshot'
+        $snapshot.State | Should -Be 'complete'
+        $snapshot.PageCount | Should -Be 2
+        $snapshot.ThreadCount | Should -Be 2
+        $snapshot.CommentCount | Should -Be 2
+        @($snapshot.Threads.threadId) | Should -Be @(10, 20)
+        @($operations) | Should -Be @('GetDiscussionPage', 'GetDiscussionPage')
+        $snapshot.Digest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        @($snapshot.SourceDigests).Count | Should -Be 2
+    }
+
+    It 'fails closed on repeated discussion tokens, duplicate threads, and invalid body digests' -TestCases @(
+        @{ Case = 'token'; Mutate = {
+                param($pages)
+                $pages[1].nextToken = 'repeat'
+                $pages[0].nextToken = 'repeat'
+            } }
+        @{ Case = 'thread'; Mutate = {
+                param($pages)
+                $pages[1].threads[0].threadId = $pages[0].threads[0].threadId
+            } }
+        @{ Case = 'digest'; Mutate = {
+                param($pages)
+                $pages[0].threads[0].comments[0].bodyDigest = Get-TestOwnerDigest 'different'
+            } }
+    ) {
+        param($Case, $Mutate)
+        $contract = New-TestOwnerContract
+        $request = $contract.Request
+        $identity = [ordered]@{
+            schemaVersion = 1
+            repositoryId = $request.RepositoryId
+            projectId = $request.ProjectId
+            pullRequestId = $request.PullRequestId
+            sourceCommit = $request.SourceCommit
+            targetCommit = $request.TargetCommit
+            targetRef = $request.TargetRef
+        }
+        $thread = {
+            param([int]$Id)
+            [ordered]@{
+                threadId = $Id
+                status = 'active'
+                isDeleted = $false
+                isOutdated = $false
+                sourceCommit = $request.SourceCommit
+                anchor = [ordered]@{ path = 'src/WidgetTests.cs'; line = 7 }
+                comments = @([ordered]@{
+                        commentId = $Id
+                        commentType = 'text'
+                        isDeleted = $false
+                        reviewerOwned = $true
+                        body = "body-$Id"
+                        bodyDigest = Get-TestOwnerDigest "body-$Id"
+                    })
+            }
+        }
+        $pages = @(
+            ([ordered]@{} + $identity + [ordered]@{
+                pageOrdinal = 0
+                state = 'complete'
+                sourceDigest = Get-TestOwnerDigest 'discussion-page-0'
+                nextToken = 'next'
+                threads = @(& $thread 1)
+            }),
+            ([ordered]@{} + $identity + [ordered]@{
+                pageOrdinal = 1
+                state = 'complete'
+                sourceDigest = Get-TestOwnerDigest 'discussion-page-1'
+                nextToken = $null
+                threads = @(& $thread 2)
+            })
+        )
+        & $Mutate $pages
+        $provider = New-OwnerReadOnlyProviderAdapter -Name "discussion-$Case" -Handler {
+            param($Operation, $Arguments)
+            if ($Operation -cne 'GetDiscussionPage') { throw 'unexpected operation' }
+            return $pages[[int]$Arguments.pageOrdinal]
+        }.GetNewClosure()
+
+        {
+            Get-OwnerDiscussionSnapshot -Contract $contract -Provider $provider `
+                -Limits (New-OwnerDiscussionLimits -MaximumPages 3 -PageSize 1 `
+                    -MaximumThreads 3 -MaximumComments 3 -MaximumBytes 1000)
+        } | Should -Throw
+    }
+}
+
 Describe 'Owner adapter module surface' {
     It 'exports only the layer-two contract and acquisition adapters' {
         @(Get-Command -Module DevPilot.OwnerAdapters).Name | Sort-Object | Should -Be @(
+            'Get-OwnerDiscussionSnapshot',
             'New-OwnerAcquisitionContract',
             'New-OwnerAdapterLimits',
+            'New-OwnerDiscussionLimits',
             'New-OwnerProductionAcquisitionAdapter',
             'New-OwnerReadOnlyProviderAdapter',
             'New-OwnerReplayAcquisitionAdapter',

@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1"
 Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1"
 
 $limitsTypeName = 'DevPilot.OwnerCapability.OwnerV2CapabilityLimits'
@@ -40,6 +41,10 @@ $script:OwnerV2States = @('complete', 'incomplete', 'unknown')
 $script:OwnerV2Judgments = @('compliant', 'violation', 'unknown')
 $script:OwnerV2DigestPattern = '^v1:sha256:[0-9a-f]{64}$'
 $script:OwnerV2CommitPattern = '^[0-9a-f]{40}$'
+$script:OwnerV1WriterCapability = 'bpm-test-ownership@1'
+$script:OwnerV1WriterVersion = 1
+$script:OwnerV1WriterRuleRef = 'rs0'
+$script:OwnerV1WriterMarkerPrefix = 'devpilot-owner-comment:v1'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -58,6 +63,339 @@ function Assert-OwnerV2Text {
         $Value -match '[\r\n]') {
         throw "$Name must be non-empty, trimmed, single-line text no longer than $MaximumLength characters."
     }
+}
+
+function Get-OwnerV1WriterSha256 {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    return ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                [Text.UTF8Encoding]::new($false).GetBytes($Text)))).ToLowerInvariant()
+}
+
+function ConvertTo-OwnerV1WriterPath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $normalized = ConvertTo-OwnerRepositoryPath -Path $Path
+    if ($normalized.Length -gt 1023 -or $normalized -match '[|`<>]') {
+        throw 'Owner finding path is not compatible with the approved v1 writer path contract.'
+    }
+    return '/' + $normalized
+}
+
+function ConvertTo-OwnerV1WriterMarkdownCode {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    return (($Text -replace '[\x00-\x1f\x7f]', ' ') -replace '`', '｀').Trim()
+}
+
+function Get-OwnerV1WriterMarkerKey {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding
+    )
+
+    $request = $Contract.Request
+    $anchor = Get-OwnerV2Member -Value $Finding -Name anchor
+    if ($anchor -isnot [Collections.IDictionary]) {
+        throw 'Owner finding has no canonical writer anchor.'
+    }
+    $path = ConvertTo-OwnerV1WriterPath -Path (
+        [string](Get-OwnerV2Member -Value $anchor -Name path)
+    )
+    $line = [int](Get-OwnerV2Member -Value $anchor -Name line)
+    $symbol = [string](Get-OwnerV2Member -Value $anchor -Name symbol)
+    if ($line -lt 1 -or [string]::IsNullOrWhiteSpace($symbol)) {
+        throw 'Owner finding has an incomplete canonical writer anchor.'
+    }
+    $rulePath = ConvertTo-OwnerV1WriterPath -Path $request.RulePath
+    $ruleIdentity = @(
+        [string]$request.RuleRepositoryId,
+        $rulePath,
+        [string]$request.RuleSection,
+        [string]$request.RuleCommit,
+        ([string]$request.RuleHash).Substring(10),
+        $script:OwnerV1WriterRuleRef
+    ) -join '|'
+    $material = @(
+        $script:OwnerV1WriterCapability
+        [string]$script:OwnerV1WriterVersion
+        ([string]$request.RepositoryId).ToLowerInvariant()
+        [string][long]$request.PullRequestId
+        ([string]$request.SourceCommit).ToLowerInvariant()
+        $ruleIdentity.ToLowerInvariant()
+        $path.ToLowerInvariant()
+        [string]$line
+        $symbol
+    ) -join "`n"
+    return Get-OwnerV1WriterSha256 -Text $material
+}
+
+function Format-OwnerV1WriterComment {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [Parameter(Mandatory)][string]$MarkerKey
+    )
+
+    $request = $Contract.Request
+    $anchor = Get-OwnerV2Member -Value $Finding -Name anchor
+    $path = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path (
+            [string](Get-OwnerV2Member -Value $anchor -Name path)
+        )
+    )
+    $symbol = ConvertTo-OwnerV1WriterMarkdownCode (
+        [string](Get-OwnerV2Member -Value $anchor -Name symbol)
+    )
+    $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path $request.RulePath
+    )
+    $section = ConvertTo-OwnerV1WriterMarkdownCode ([string]$request.RuleSection)
+    return @(
+        '**Owner attribute missing**'
+        ''
+        "Method ``$symbol`` at ``$path`:$([int](Get-OwnerV2Member -Value $anchor -Name line))`` is a changed MSTest method and has no ``Owner`` attribute."
+        ''
+        'Suggested fix: add `[Owner("<owner-alias>")]` to this test method.'
+        ''
+        "Rule: ``$rulePath`` / ``$section`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+        ''
+        "<!-- ${script:OwnerV1WriterMarkerPrefix}:$MarkerKey -->"
+    ) -join "`n"
+}
+
+function New-OwnerV2DiscussionReconciliation {
+    param(
+        [Parameter(Mandatory)][ValidateSet('wouldCreate', 'wouldUpdate', 'noOp', 'unknown')]
+        [string]$Classification,
+        [Parameter(Mandatory)][string]$Reason,
+        [Parameter(Mandatory)][string]$DiscussionDigest,
+        [Parameter(Mandatory)][string]$BodyDigest,
+        [ValidateSet('none', 'available', 'ambiguous')][string]$ThreadAvailability = 'none',
+        [long]$ThreadId = 0,
+        [long]$CommentId = 0,
+        [string]$ThreadStatus = 'unknown'
+    )
+
+    return [ordered]@{
+        classification = $Classification
+        reason = $Reason
+        bodySha256 = $BodyDigest
+        discussionSha256 = $DiscussionDigest
+        thread = [ordered]@{
+            availability = $ThreadAvailability
+            threadId = $(if ($ThreadAvailability -ceq 'available') { $ThreadId } else { 'unknown' })
+            commentId = $(if ($ThreadAvailability -ceq 'available') { $CommentId } else { 'unknown' })
+            status = $(if ($ThreadAvailability -ceq 'available') { $ThreadStatus } else { 'unknown' })
+        }
+    }
+}
+
+function Resolve-OwnerV2DiscussionReconciliation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)][object]$Contract,
+        [AllowNull()][DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]$Snapshot,
+        [ValidatePattern('^[a-z][a-z0-9-]{0,127}$')]
+        [string]$FailureReason = 'discussion-acquisition-unavailable'
+    )
+
+    $findings = @($Observation.findings)
+    if ($findings.Count -eq 0 -or
+        [string]$Observation.lifecycle.status -cne 'completed') {
+        return $Observation
+    }
+    $counts = [ordered]@{
+        created = 0
+        updated = 0
+        noOp = 0
+        wouldCreate = 0
+        wouldUpdate = 0
+        unknown = 0
+    }
+    $snapshotAvailable = $null -ne $Snapshot -and
+        $Snapshot.State -ceq 'complete' -and
+        $Snapshot.Digest -match $script:OwnerV2DigestPattern
+    $discussionDigest = if ($snapshotAvailable) {
+        $Snapshot.Digest.Substring(10)
+    }
+    else {
+        'unknown'
+    }
+    $allMarkerPattern = '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
+
+    foreach ($finding in $findings) {
+        $markerKey = $null
+        $body = $null
+        try {
+            $markerKey = Get-OwnerV1WriterMarkerKey -Contract $Contract -Finding $finding
+            $body = Format-OwnerV1WriterComment -Contract $Contract -Finding $finding `
+                -MarkerKey $markerKey
+        }
+        catch {
+            $finding.providerMarker = New-OwnerProviderMarker
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason 'marker-derivation-failed' `
+                -DiscussionDigest $discussionDigest -BodyDigest 'unknown'
+            $counts.unknown++
+            continue
+        }
+
+        $bodyDigest = Get-OwnerV1WriterSha256 -Text $body
+        if (-not $snapshotAvailable) {
+            $finding.providerMarker = New-OwnerProviderMarker
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason $FailureReason `
+                -DiscussionDigest 'unknown' -BodyDigest $bodyDigest
+            $counts.unknown++
+            continue
+        }
+
+        $candidates = [Collections.Generic.List[object]]::new()
+        foreach ($thread in @($Snapshot.Threads)) {
+            foreach ($comment in @($thread.comments)) {
+                $matches = [regex]::Matches([string]$comment.body, $allMarkerPattern)
+                if (-not [bool]$comment.reviewerOwned -or
+                    [string]$comment.commentType -cne 'text' -or
+                    [bool]$comment.isDeleted) {
+                    continue
+                }
+                $targetMatches = @($matches | Where-Object {
+                        $_.Groups[1].Value -ceq $markerKey
+                    })
+                if ($targetMatches.Count -gt 0) {
+                    [void]$candidates.Add([pscustomobject]@{
+                            Thread = $thread
+                            Comment = $comment
+                            MarkerCount = $targetMatches.Count
+                        })
+                }
+            }
+        }
+
+        if ($candidates.Count -eq 0) {
+            $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity verified
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification wouldCreate -Reason 'reviewer-marker-not-found' `
+                -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest
+            $counts.wouldCreate++
+            continue
+        }
+        if ($candidates.Count -ne 1 -or [int]$candidates[0].MarkerCount -ne 1) {
+            $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason 'duplicate-reviewer-markers' `
+                -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                -ThreadAvailability ambiguous
+            $counts.unknown++
+            continue
+        }
+
+        $candidate = $candidates[0]
+        $thread = $candidate.Thread
+        $comment = $candidate.Comment
+        $anchor = Get-OwnerV2Member -Value $finding -Name anchor
+        $expectedPath = ConvertTo-OwnerV1WriterPath -Path (
+            [string](Get-OwnerV2Member -Value $anchor -Name path)
+        )
+        try {
+            $actualPath = if ($null -ne $thread.anchor) {
+                ConvertTo-OwnerV1WriterPath -Path ([string]$thread.anchor.path)
+            }
+            else {
+                ''
+            }
+        }
+        catch {
+            $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason 'reviewer-marker-anchor-unreadable' `
+                -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                -ThreadAvailability available -ThreadId ([long]$thread.threadId) `
+                -CommentId ([long]$comment.commentId) -ThreadStatus ([string]$thread.status)
+            $counts.unknown++
+            continue
+        }
+        $trusted = [string]::Equals(
+            $expectedPath,
+            $actualPath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -and
+            [int]$thread.anchor.line -eq [int](Get-OwnerV2Member -Value $anchor -Name line)
+        if (-not $trusted) {
+            $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason 'reviewer-marker-owner-or-anchor-mismatch' `
+                -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                -ThreadAvailability available -ThreadId ([long]$thread.threadId) `
+                -CommentId ([long]$comment.commentId) -ThreadStatus ([string]$thread.status)
+            $counts.unknown++
+            continue
+        }
+        if ($null -ne $thread.sourceCommit -and
+            [string]$thread.sourceCommit -cne [string]$Contract.Request.SourceCommit) {
+            $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason 'reviewer-marker-source-mismatch' `
+                -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                -ThreadAvailability available -ThreadId ([long]$thread.threadId) `
+                -CommentId ([long]$comment.commentId) -ThreadStatus ([string]$thread.status)
+            $counts.unknown++
+            continue
+        }
+
+        $classification = $null
+        $reason = $null
+        if ([bool]$thread.isDeleted) {
+            $classification = 'wouldCreate'
+            $reason = 'reviewer-marker-thread-deleted'
+        }
+        elseif ([bool]$thread.isOutdated) {
+            $classification = 'wouldCreate'
+            $reason = 'reviewer-marker-thread-outdated'
+        }
+        elseif ([string]$thread.status -cin @('fixed', 'closed', 'resolved')) {
+            $classification = 'wouldCreate'
+            $reason = 'reviewer-marker-thread-inactive'
+        }
+        elseif ([string]$thread.status -cne 'active') {
+            $classification = 'unknown'
+            $reason = 'reviewer-marker-thread-status-unknown'
+        }
+        elseif ([string]$comment.body -ceq $body) {
+            $classification = 'noOp'
+            $reason = 'reviewer-marker-body-current'
+        }
+        else {
+            $classification = 'wouldUpdate'
+            $reason = 'reviewer-marker-body-stale'
+        }
+        $integrity = if ($classification -ceq 'unknown') { 'invalid' } else { 'verified' }
+        $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity $integrity
+        $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+            -Classification $classification -Reason $reason `
+            -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+            -ThreadAvailability available -ThreadId ([long]$thread.threadId) `
+            -CommentId ([long]$comment.commentId) -ThreadStatus ([string]$thread.status)
+        $counts[$classification]++
+    }
+
+    $Observation.effects.dedupe = $counts
+    $artifacts = [Collections.Generic.List[object]]::new()
+    foreach ($artifact in @($Observation.sourceArtifacts)) {
+        if ([string](Get-OwnerV2Member -Value $artifact -Name kind) -cne
+            'owner-v2-discussion-snapshot') {
+            [void]$artifacts.Add($artifact)
+        }
+    }
+    if ($snapshotAvailable) {
+        [void]$artifacts.Add([ordered]@{
+                kind = 'owner-v2-discussion-snapshot'
+                sha256 = $Snapshot.Digest.Substring(10)
+                signature = 'not-applicable'
+            })
+    }
+    $Observation.sourceArtifacts = @($artifacts)
+    return $Observation
 }
 
 function Get-OwnerV2Digest {
@@ -1623,5 +1961,6 @@ Export-ModuleMember -Function @(
     'ConvertTo-OwnerV2Observation',
     'New-OwnerSemanticRunner',
     'New-OwnerV2CapabilityAdapter',
-    'New-OwnerV2CapabilityLimits'
+    'New-OwnerV2CapabilityLimits',
+    'Resolve-OwnerV2DiscussionReconciliation'
 )

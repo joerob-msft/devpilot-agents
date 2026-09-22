@@ -2,6 +2,7 @@ BeforeAll {
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1" -Force
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1" -Force
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1" -Force
+    $script:OwnerCapabilityModule = Get-Module DevPilot.OwnerCapability
 
     $script:OwnerCapabilityId = 'owner-mstest-owner-v2'
     $script:OwnerRuleText = 'Changed MSTest methods require an Owner attribute.'
@@ -228,9 +229,133 @@ BeforeAll {
             Observation = ConvertTo-OwnerV2Observation -PipelineResult $result
         }
     }
+
+    function Get-TestOwnerV1WriterComment {
+        param(
+            [Parameter(Mandatory)][object]$Contract,
+            [Parameter(Mandatory)][Collections.IDictionary]$Finding
+        )
+        return & $script:OwnerCapabilityModule {
+            param($BoundContract, $BoundFinding)
+            $marker = Get-OwnerV1WriterMarkerKey `
+                -Contract $BoundContract -Finding $BoundFinding
+            [pscustomobject]@{
+                Marker = $marker
+                Body = Format-OwnerV1WriterComment `
+                    -Contract $BoundContract -Finding $BoundFinding -MarkerKey $marker
+            }
+        } $Contract $Finding
+    }
+
+    function New-TestOwnerDiscussionSnapshot {
+        param(
+            [Parameter(Mandatory)][object]$Contract,
+            [AllowEmptyCollection()][object[]]$Threads = @()
+        )
+        $request = $Contract.Request
+        $page = [ordered]@{
+            schemaVersion = 1
+            repositoryId = $request.RepositoryId
+            projectId = $request.ProjectId
+            pullRequestId = $request.PullRequestId
+            sourceCommit = $request.SourceCommit
+            targetCommit = $request.TargetCommit
+            targetRef = $request.TargetRef
+            pageOrdinal = 0
+            state = 'complete'
+            sourceDigest = Get-TestOwnerV2Digest 'discussion-page'
+            nextToken = $null
+            threads = @($Threads)
+        }
+        $provider = New-OwnerReadOnlyProviderAdapter -Name 'owner-discussion-fixture' -Handler {
+            param($Operation, $Arguments)
+            if ($Operation -cne 'GetDiscussionPage' -or [int]$Arguments.pageOrdinal -ne 0) {
+                throw 'unexpected discussion operation'
+            }
+            return $page
+        }.GetNewClosure()
+        return Get-OwnerDiscussionSnapshot -Contract $Contract -Provider $provider
+    }
+
+    function New-TestOwnerDiscussionThread {
+        param(
+            [Parameter(Mandatory)][object]$Contract,
+            [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+            [Parameter(Mandatory)][string]$Body,
+            [int]$ThreadId = 10,
+            [int]$CommentId = 100,
+            [string]$Status = 'active',
+            [bool]$ReviewerOwned = $true,
+            [bool]$ThreadDeleted = $false,
+            [bool]$CommentDeleted = $false,
+            [bool]$Outdated = $false,
+            [AllowNull()][string]$SourceCommit = $null,
+            [AllowNull()][string]$Path = $null,
+            [int]$Line = 0
+        )
+        return [ordered]@{
+            threadId = $ThreadId
+            status = $Status
+            isDeleted = $ThreadDeleted
+            isOutdated = $Outdated
+            sourceCommit = $(if ($PSBoundParameters.ContainsKey('SourceCommit')) {
+                    $SourceCommit
+                }
+                else {
+                    [string]$Contract.Request.SourceCommit
+                })
+            anchor = [ordered]@{
+                path = $(if (-not [string]::IsNullOrWhiteSpace($Path)) {
+                        $Path
+                    }
+                    else {
+                        [string]$Finding.anchor.path
+                    })
+                line = $(if ($Line -gt 0) { $Line } else { [int]$Finding.anchor.line })
+            }
+            comments = @(
+                [ordered]@{
+                    commentId = $CommentId
+                    commentType = 'text'
+                    isDeleted = $CommentDeleted
+                    reviewerOwned = $ReviewerOwned
+                    body = $Body
+                    bodyDigest = Get-TestOwnerV2Digest $Body
+                }
+            )
+        }
+    }
 }
 
 Describe 'Owner v2 semantic capability' {
+    It 'pins the approved v1 writer marker and body bytes with a frozen golden' {
+        $contract = New-TestOwnerV2Contract
+        $finding = [ordered]@{
+            anchor = [ordered]@{
+                path = 'src/WidgetTests.cs'
+                line = 7
+                symbol = 'NeedsOwner'
+            }
+        }
+        $actual = Get-TestOwnerV1WriterComment -Contract $contract -Finding $finding
+        $expectedBody = @(
+            '**Owner attribute missing**'
+            ''
+            'Method `NeedsOwner` at `/src/WidgetTests.cs:7` is a changed MSTest method and has no `Owner` attribute.'
+            ''
+            'Suggested fix: add `[Owner("<owner-alias>")]` to this test method.'
+            ''
+            'Rule: `/.config/owner-rules.md` / `owner-policy` at `cccccccccccccccccccccccccccccccccccccccc` (SHA-256 `33498ffae13dc90a8a3194dd5c8859906c7406e09b9ce14fe2f6482796529d19`).'
+            ''
+            '<!-- devpilot-owner-comment:v1:9642698498d4e90b0a84cf948cb521f68cae5a8f84718821fda7f722a7a6233c -->'
+        ) -join "`n"
+
+        $actual.Marker | Should -BeExactly (
+            '9642698498d4e90b0a84cf948cb521f68cae5a8f84718821fda7f722a7a6233c'
+        )
+        $actual.Body | Should -BeExactly $expectedBody
+    }
+
     It 'assesses only changed MSTest methods and keeps classes advisory and unknown' {
         $case = Get-TestOwnerV2Case -Id 'proven-owner-cases'
         $run = Invoke-TestOwnerV2Case -Case $case
@@ -527,6 +652,179 @@ Describe 'Owner v2 semantic capability' {
         }
     }
 
+    It 'reconciles v1-compatible Owner markers without exposing discussions to the semantic runner' {
+            $base = Invoke-TestOwnerV2Case -Case (Get-TestOwnerV2Case -Id 'proven-owner-cases')
+            $finding = $base.Observation.findings[0]
+            $writer = Get-TestOwnerV1WriterComment -Contract $base.Contract -Finding $finding
+
+            $cases = @(
+                [ordered]@{
+                    Name = 'no matching thread'
+                    Threads = @()
+                    Classification = 'wouldCreate'
+                    Reason = 'reviewer-marker-not-found'
+                },
+                [ordered]@{
+                    Name = 'exact current reviewer comment'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body $writer.Body)
+                    Classification = 'noOp'
+                    Reason = 'reviewer-marker-body-current'
+                },
+                [ordered]@{
+                    Name = 'stale reviewer body'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body (
+                                "stale body`n<!-- devpilot-owner-comment:v1:$($writer.Marker) -->"
+                            ))
+                    Classification = 'wouldUpdate'
+                    Reason = 'reviewer-marker-body-stale'
+                },
+                [ordered]@{
+                    Name = 'quoted unrelated marker'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body (
+                                $writer.Body + "`n<!-- devpilot-owner-comment:v1:$('f' * 64) -->"
+                            ))
+                    Classification = 'wouldUpdate'
+                    Reason = 'reviewer-marker-body-stale'
+                },
+                [ordered]@{
+                    Name = 'unrelated human comment'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body 'please consider this' -ReviewerOwned $false)
+                    Classification = 'wouldCreate'
+                    Reason = 'reviewer-marker-not-found'
+                },
+                [ordered]@{
+                    Name = 'foreign copied marker'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body $writer.Body -ReviewerOwned $false)
+                    Classification = 'wouldCreate'
+                    Reason = 'reviewer-marker-not-found'
+                },
+                [ordered]@{
+                    Name = 'closed reviewer thread'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body $writer.Body -Status closed)
+                    Classification = 'wouldCreate'
+                    Reason = 'reviewer-marker-thread-inactive'
+                },
+                [ordered]@{
+                    Name = 'deleted reviewer thread'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body $writer.Body -ThreadDeleted $true)
+                    Classification = 'wouldCreate'
+                    Reason = 'reviewer-marker-thread-deleted'
+                },
+                [ordered]@{
+                    Name = 'outdated reviewer thread'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body $writer.Body -Outdated $true)
+                    Classification = 'wouldCreate'
+                    Reason = 'reviewer-marker-thread-outdated'
+                },
+                [ordered]@{
+                    Name = 'current-head mismatch'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body $writer.Body -SourceCommit ('d' * 40))
+                    Classification = 'unknown'
+                    Reason = 'reviewer-marker-source-mismatch'
+                },
+                [ordered]@{
+                    Name = 'unreadable reviewer anchor'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body $writer.Body -Path 'src/a`b.cs')
+                    Classification = 'unknown'
+                    Reason = 'reviewer-marker-anchor-unreadable'
+                }
+            )
+
+            foreach ($case in $cases) {
+                $run = Invoke-TestOwnerV2Case -Case (Get-TestOwnerV2Case -Id 'proven-owner-cases')
+                $snapshot = New-TestOwnerDiscussionSnapshot -Contract $run.Contract -Threads $case.Threads
+                $beforeRequests = $run.Requests.Count
+                $reconciled = Resolve-OwnerV2DiscussionReconciliation `
+                    -Observation $run.Observation -Contract $run.Contract -Snapshot $snapshot
+                $result = $reconciled.findings[0].reconciliation
+                $result.classification | Should -Be $case.Classification -Because $case.Name
+                $result.reason | Should -Be $case.Reason -Because $case.Name
+                $run.Requests.Count | Should -Be $beforeRequests
+                $reconciled.effects.providerWrites | Should -Be 0
+                $reconciled.effects.writeToolInvocations | Should -Be 0
+                $reconciled.findings[0].providerMarker.availability |
+                    Should -Be 'available'
+            }
+        }
+
+    It 'fails duplicate reviewer markers closed and keeps acquisition failures separate from semantic verdicts' {
+            $run = Invoke-TestOwnerV2Case -Case (Get-TestOwnerV2Case -Id 'proven-owner-cases')
+            $finding = $run.Observation.findings[0]
+            $writer = Get-TestOwnerV1WriterComment -Contract $run.Contract -Finding $finding
+            $threads = @(
+                New-TestOwnerDiscussionThread -Contract $run.Contract -Finding $finding `
+                    -Body $writer.Body -ThreadId 10 -CommentId 100
+                New-TestOwnerDiscussionThread -Contract $run.Contract -Finding $finding `
+                    -Body $writer.Body -ThreadId 11 -CommentId 101
+            )
+            $snapshot = New-TestOwnerDiscussionSnapshot -Contract $run.Contract -Threads $threads
+            $duplicate = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $run.Observation -Contract $run.Contract -Snapshot $snapshot
+
+            $duplicate.findings[0].reconciliation.classification | Should -Be 'unknown'
+            $duplicate.findings[0].reconciliation.reason | Should -Be 'duplicate-reviewer-markers'
+            $duplicate.findings[0].providerMarker.integrity | Should -Be 'invalid'
+
+            $failedRun = Invoke-TestOwnerV2Case -Case (Get-TestOwnerV2Case -Id 'proven-owner-cases')
+            $semanticDisposition = $failedRun.Observation.findings[0].disposition
+            $semanticLifecycle = $failedRun.Observation.lifecycle.status
+            $failed = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $failedRun.Observation -Contract $failedRun.Contract `
+                -Snapshot $null -FailureReason discussion-acquisition-failed
+
+            $failed.findings[0].disposition | Should -Be $semanticDisposition
+            $failed.lifecycle.status | Should -Be $semanticLifecycle
+            $failed.findings[0].reconciliation.classification | Should -Be 'unknown'
+            $failed.findings[0].reconciliation.reason | Should -Be 'discussion-acquisition-failed'
+            $failed.effects.providerWrites | Should -Be 0
+            $failed.effects.writeToolInvocations | Should -Be 0
+        }
+
+        It 'does not turn findings from an incomplete semantic run into an actionable queue' {
+            $run = Invoke-TestOwnerV2Case `
+                -Case (Get-TestOwnerV2Case -Id 'adjacent-response-failures') `
+                -RunnerModes @{ Malformed = 'omitted' }
+            $snapshot = New-TestOwnerDiscussionSnapshot -Contract $run.Contract
+            $unknownBefore = $run.Observation.effects.dedupe.unknown
+
+            $result = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $run.Observation -Contract $run.Contract -Snapshot $snapshot
+
+            $result.lifecycle.status | Should -Be 'incomplete'
+            $result.counts.violations | Should -BeGreaterThan 0
+            $result.effects.dedupe.unknown | Should -Be $unknownBefore
+            $result.effects.dedupe.wouldCreate | Should -Be 0
+            $result.findings[0].Contains('reconciliation') | Should -BeFalse
+        }
+
+        It 'is idempotent for the same semantic observation and discussion replay' {
+            $first = Invoke-TestOwnerV2Case -Case (Get-TestOwnerV2Case -Id 'proven-owner-cases')
+            $finding = $first.Observation.findings[0]
+            $writer = Get-TestOwnerV1WriterComment -Contract $first.Contract -Finding $finding
+            $snapshot = New-TestOwnerDiscussionSnapshot -Contract $first.Contract -Threads @(
+                New-TestOwnerDiscussionThread -Contract $first.Contract -Finding $finding -Body $writer.Body
+            )
+            $second = Invoke-TestOwnerV2Case -Case (Get-TestOwnerV2Case -Id 'proven-owner-cases')
+
+            $firstResult = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $first.Observation -Contract $first.Contract -Snapshot $snapshot
+            $secondResult = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $second.Observation -Contract $second.Contract -Snapshot $snapshot
+
+            ($firstResult | ConvertTo-Json -Depth 64 -Compress) |
+                Should -Be ($secondResult | ConvertTo-Json -Depth 64 -Compress)
+    }
+
     It 'emits the narrow normalized observation shape documented by the independent observer layer' {
         $case = Get-TestOwnerV2Case -Id 'proven-owner-cases'
         $observation = (Invoke-TestOwnerV2Case -Case $case).Observation
@@ -556,7 +854,8 @@ Describe 'Owner capability module surface' {
             'ConvertTo-OwnerV2Observation',
             'New-OwnerSemanticRunner',
             'New-OwnerV2CapabilityAdapter',
-            'New-OwnerV2CapabilityLimits'
+            'New-OwnerV2CapabilityLimits',
+            'Resolve-OwnerV2DiscussionReconciliation'
         )
     }
 }

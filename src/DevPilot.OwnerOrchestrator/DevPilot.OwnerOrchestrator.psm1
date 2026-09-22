@@ -472,6 +472,15 @@ function Get-OwnerV2AttemptTelemetryPath {
         "$Identity.attempt-$($Attempt.ToString('0000')).json")
 }
 
+function Get-OwnerV2DiscussionRefreshJournalPath {
+    param(
+        [Parameter(Mandatory)][string]$CapabilityRoot,
+        [Parameter(Mandatory)][string]$Identity
+    )
+    return Join-Path (Join-Path $CapabilityRoot 'staging') (
+        "$Identity.discussion-refresh.json")
+}
+
 function Assert-OwnerV2Record {
     param([Parameter(Mandatory)][Collections.IDictionary]$Record)
     Assert-OwnerV2NoUnsafeShape -Value $Record
@@ -1753,7 +1762,42 @@ function Invoke-OwnerV2Live {
     $result = Invoke-OwnerReviewPipeline -Binding $Entry.Contract.Binding `
         -AcquisitionAdapter $acquisition -CapabilityAdapter $capability
     $observation = ConvertTo-OwnerV2Observation -PipelineResult $result -Runner $runner `
-        -ImplementationId 'owner-v2-preview-orchestrator' -ImplementationVersion '0.3.0'
+        -ImplementationId 'owner-v2-preview-orchestrator' -ImplementationVersion '0.4.0'
+    if (@($observation.findings).Count -gt 0 -and
+        [string]$observation.lifecycle.status -ceq 'completed') {
+        $discussionSnapshot = $null
+        $discussionFailure = $null
+        try {
+            $discussionSnapshot = Get-OwnerDiscussionSnapshot `
+                -Contract $Entry.Contract -Provider $AcquisitionProvider `
+                -Limits (New-OwnerDiscussionLimits -MaximumPages 20 -PageSize 100 `
+                    -MaximumThreads 1000 -MaximumComments 5000 -MaximumBytes 4194304)
+        }
+        catch {
+            $discussionFailure = 'discussion-acquisition-failed'
+        }
+        try {
+            $observation = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $observation -Contract $Entry.Contract `
+                -Snapshot $discussionSnapshot `
+                -FailureReason $(if ($discussionFailure) {
+                        $discussionFailure
+                    }
+                    else {
+                        'discussion-acquisition-unavailable'
+                    })
+        }
+        catch {
+            $observation = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $observation -Contract $Entry.Contract `
+                -Snapshot $null -FailureReason 'discussion-reconciliation-failed'
+        }
+    }
+    $observationJson = $observation | ConvertTo-Json -Depth 64 -Compress
+    if (-not (Test-Json -Json $observationJson `
+            -SchemaFile $script:OwnerV2ObservationSchemaPath -ErrorAction Stop)) {
+        throw 'Owner v2 reconciled observation failed owner-observation schema validation.'
+    }
     Assert-OwnerV2PipelineNoWrites -PipelineResult $result -Observation $observation
     $telemetry = New-OwnerV2PersistedTelemetry `
         -Telemetry (Get-OwnerModelRunnerTelemetry -Runner $runner) `
@@ -1777,7 +1821,7 @@ function New-OwnerV2LiveUnavailableObservation {
     $observation = [ordered]@{
         schemaVersion = 2
         kind = 'owner-observation'
-        implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.3.0' }
+        implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.4.0' }
         capability = [string]$Entry.Declaration.capability.id
         subject = [ordered]@{
             pullRequestId = [long]$Entry.Declaration.subject.pullRequestId
@@ -1858,6 +1902,159 @@ function New-OwnerV2LiveUnavailableObservation {
         throw 'Owner v2 unavailable observation failed owner-observation schema validation.'
     }
     return $observation
+}
+
+function Assert-OwnerV2CompletedDiscussionObservation {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][Collections.IDictionary]$Observation
+    )
+
+    $observationJson = $Observation | ConvertTo-Json -Depth 64 -Compress
+    if (-not (Test-Json -Json $observationJson `
+            -SchemaFile $script:OwnerV2ObservationSchemaPath -ErrorAction Stop)) {
+        throw 'Completed Owner v2 observation failed owner-observation schema validation.'
+    }
+    if ([string]$Observation.capability -cne [string]$Entry.Declaration.capability.id -or
+        [string]$Observation.subject.repositoryId -cne [string]$Entry.Declaration.subject.repositoryId -or
+        [long]$Observation.subject.pullRequestId -ne [long]$Entry.Declaration.subject.pullRequestId -or
+        [string]$Observation.subject.headCommit -cne [string]$Entry.Declaration.head.sourceCommit -or
+        [string]$Observation.subject.targetCommit -cne [string]$Entry.Declaration.target.targetCommit -or
+        [string]$Observation.subject.targetRef -cne [string]$Entry.Declaration.target.targetRef) {
+        throw 'Completed Owner v2 observation is bound to a different manifest subject.'
+    }
+}
+
+function Read-OwnerV2CompletedDiscussionObservation {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][Collections.IDictionary]$Record,
+        [Parameter(Mandatory)][string]$ObservationPath
+    )
+
+    $observation = Read-OwnerV2JsonFile -Path $ObservationPath
+    $existingDigest = Get-OwnerV2Digest -Value $observation
+    if ($existingDigest -cne [string]$Record.resultDigest) {
+        throw 'Completed Owner v2 observation no longer matches its durable result digest.'
+    }
+    Assert-OwnerV2CompletedDiscussionObservation -Entry $Entry -Observation $observation
+    return $observation
+}
+
+function Repair-OwnerV2DiscussionRefreshJournal {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][string]$CapabilityRoot,
+        [Parameter(Mandatory)][string]$RecordPath,
+        [Parameter(Mandatory)][string]$ObservationPath
+    )
+
+    $journalPath = Get-OwnerV2DiscussionRefreshJournalPath `
+        -CapabilityRoot $CapabilityRoot -Identity ([string]$Entry.Identity)
+    if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) { return $false }
+    $journal = Read-OwnerV2JsonFile -Path $journalPath
+    Assert-OwnerV2ExactKeys -Value $journal -Name discussionRefreshJournal -Expected @(
+        'schemaVersion', 'kind', 'identity', 'expectedResultDigest', 'newResultDigest'
+    )
+    if ([int]$journal.schemaVersion -ne 1 -or
+        [string]$journal.kind -cne 'owner-v2-discussion-refresh-journal' -or
+        [string]$journal.identity -cne [string]$Entry.Identity) {
+        throw 'Owner v2 discussion refresh journal has a foreign identity.'
+    }
+    Assert-OwnerV2Digest -Value ([string]$journal.expectedResultDigest) `
+        -Name expectedResultDigest
+    Assert-OwnerV2Digest -Value ([string]$journal.newResultDigest) `
+        -Name newResultDigest
+
+    $record = Read-OwnerV2JsonFile -Path $RecordPath
+    Assert-OwnerV2Record -Record $record
+    Assert-OwnerV2RecordBinding -Record $record -Entry $Entry
+    if ([string]$record.state -cne 'completed') {
+        throw 'Owner v2 discussion refresh journal found a non-completed record.'
+    }
+    $observation = Read-OwnerV2JsonFile -Path $ObservationPath
+    Assert-OwnerV2CompletedDiscussionObservation -Entry $Entry -Observation $observation
+    $observationDigest = Get-OwnerV2Digest -Value $observation
+    $recordDigest = [string]$record.resultDigest
+    $expectedDigest = [string]$journal.expectedResultDigest
+    $newDigest = [string]$journal.newResultDigest
+
+    if ($observationDigest -ceq $newDigest -and $recordDigest -ceq $expectedDigest) {
+        $record.resultDigest = $newDigest
+        $record.updatedUtc = 'utc:' + ([DateTime]::UtcNow).ToString('o')
+        [void](Write-OwnerV2AtomicJson -Path $RecordPath -Value $record)
+        Remove-Item -LiteralPath $journalPath -Force
+        return $true
+    }
+    if (($observationDigest -ceq $newDigest -and $recordDigest -ceq $newDigest) -or
+        ($observationDigest -ceq $expectedDigest -and $recordDigest -ceq $expectedDigest)) {
+        Remove-Item -LiteralPath $journalPath -Force
+        return $true
+    }
+    throw 'Owner v2 discussion refresh journal does not match the durable observation and record.'
+}
+
+function Resolve-OwnerV2CompletedDiscussionRefresh {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)][object]$AcquisitionProvider
+    )
+
+    if (@($Observation.findings).Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            Observation = $Observation
+            ResultDigest = Get-OwnerV2Digest -Value $Observation
+            Reason = 'already-terminal'
+        }
+        $Observation.implementation.version = '0.4.0'
+    }
+    $snapshot = $null
+    $failureReason = $null
+    try {
+        $snapshot = Get-OwnerDiscussionSnapshot `
+            -Contract $Entry.Contract -Provider $AcquisitionProvider `
+            -Limits (New-OwnerDiscussionLimits -MaximumPages 20 -PageSize 100 `
+                -MaximumThreads 1000 -MaximumComments 5000 -MaximumBytes 4194304)
+    }
+    catch {
+        $failureReason = 'discussion-acquisition-failed'
+    }
+    try {
+        $observation = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $observation -Contract $Entry.Contract -Snapshot $snapshot `
+            -FailureReason $(if ($failureReason) {
+                    $failureReason
+                }
+                else {
+                    'discussion-acquisition-unavailable'
+                })
+    }
+    catch {
+        $failureReason = 'discussion-reconciliation-failed'
+        $observation = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $observation -Contract $Entry.Contract -Snapshot $null `
+            -FailureReason $failureReason
+    }
+    $reconciledJson = $observation | ConvertTo-Json -Depth 64 -Compress
+    if (-not (Test-Json -Json $reconciledJson `
+            -SchemaFile $script:OwnerV2ObservationSchemaPath -ErrorAction Stop)) {
+        throw 'Refreshed Owner v2 observation failed owner-observation schema validation.'
+    }
+    $resultDigest = Get-OwnerV2Digest -Value $observation
+    $unknown = @($observation.findings | Where-Object {
+            [string]$_.reconciliation.classification -ceq 'unknown'
+        }).Count
+    return [pscustomobject][ordered]@{
+        Observation = $observation
+        ResultDigest = $resultDigest
+        Reason = $(if ($unknown -gt 0) {
+                if ($failureReason) { $failureReason } else { 'discussion-reconciliation-unknown' }
+            }
+            else {
+                'discussion-reconciled'
+            })
+    }
 }
 
 function Invoke-OwnerV2PreviewPrepare {
@@ -1964,6 +2161,89 @@ function Invoke-OwnerV2PreviewRun {
                 [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $record)
                 [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
             }
+            if (Repair-OwnerV2DiscussionRefreshJournal `
+                    -Entry $entry -CapabilityRoot $capabilityRoot `
+                    -RecordPath $recordPath -ObservationPath $observationPath) {
+                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
+                $record = Read-OwnerV2JsonFile -Path $recordPath
+                Assert-OwnerV2Record -Record $record
+                Assert-OwnerV2RecordBinding -Record $record -Entry $entry
+            }
+            if ([string]$record.state -ceq 'completed' -and
+                [string]$entry.CapabilityKind -ceq 'owner' -and
+                [string]$entry.Declaration.mode -ceq 'live' -and
+                $null -ne $LiveAcquisitionProvider -and
+                (Test-Path -LiteralPath $observationPath -PathType Leaf)) {
+                try {
+                    $expectedResultDigest = [string]$record.resultDigest
+                    $refreshObservation = Read-OwnerV2CompletedDiscussionObservation `
+                        -Entry $entry -Record $record -ObservationPath $observationPath
+                    Exit-AgentLock -Stream $lock
+                    $lock = $null
+                    $refresh = Resolve-OwnerV2CompletedDiscussionRefresh `
+                        -Entry $entry -Observation $refreshObservation `
+                        -AcquisitionProvider $LiveAcquisitionProvider
+
+                    $lock = Enter-AgentLock -Path (
+                        Join-Path $capabilityRoot 'owner-v2-preview.lock'
+                    ) -AgentName 'owner-v2-orchestrator'
+                    $currentRecord = Read-OwnerV2JsonFile -Path $recordPath
+                    Assert-OwnerV2Record -Record $currentRecord
+                    Assert-OwnerV2RecordBinding -Record $currentRecord -Entry $entry
+                    if ([string]$currentRecord.state -cne 'completed' -or
+                        [string]$currentRecord.resultDigest -cne $expectedResultDigest) {
+                        [void]$ran.Add([ordered]@{
+                                identity = $identity
+                                state = [string]$currentRecord.state
+                                attempts = [int]$currentRecord.attempts
+                                resultDigest = [string]$currentRecord.resultDigest
+                                reason = 'discussion-refresh-raced'
+                            })
+                        continue
+                    }
+                    if ([string]$refresh.ResultDigest -cne $expectedResultDigest) {
+                        $journalPath = Get-OwnerV2DiscussionRefreshJournalPath `
+                            -CapabilityRoot $capabilityRoot -Identity $identity
+                        $journal = [ordered]@{
+                            schemaVersion = 1
+                            kind = 'owner-v2-discussion-refresh-journal'
+                            identity = $identity
+                            expectedResultDigest = $expectedResultDigest
+                            newResultDigest = [string]$refresh.ResultDigest
+                        }
+                        [void](Write-OwnerV2AtomicJson -Path $journalPath `
+                            -Value $journal -Immutable)
+                        Invoke-OwnerV2Checkpoint -Name 'discussion-refresh-before-observation'
+                        [void](Write-OwnerV2AtomicJson -Path $observationPath `
+                            -Value $refresh.Observation)
+                        Invoke-OwnerV2Checkpoint -Name 'discussion-refresh-after-observation'
+                        $currentRecord.resultDigest = [string]$refresh.ResultDigest
+                        $currentRecord.updatedUtc = 'utc:' + ([DateTime]::UtcNow).ToString('o')
+                        [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $currentRecord)
+                        Invoke-OwnerV2Checkpoint -Name 'discussion-refresh-after-record'
+                        [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
+                        Remove-Item -LiteralPath $journalPath -Force
+                    }
+                    [void]$ran.Add([ordered]@{
+                            identity = $identity
+                            state = 'completed'
+                            attempts = [int]$currentRecord.attempts
+                            resultDigest = [string]$refresh.ResultDigest
+                            reason = [string]$refresh.Reason
+                        })
+                    continue
+                }
+                catch {
+                    [void]$ran.Add([ordered]@{
+                            identity = $identity
+                            state = 'completed'
+                            attempts = [int]$record.attempts
+                            resultDigest = [string]$record.resultDigest
+                            reason = 'discussion-refresh-unavailable'
+                        })
+                    continue
+                }
+            }
             $now = [DateTime]::UtcNow
             $retryEligible = Test-OwnerV2LiveRetryEligible -Entry $entry -Record $record `
                 -EnableLiveModel ([bool]$EnableLiveModel) `
@@ -2032,7 +2312,7 @@ function Invoke-OwnerV2PreviewRun {
             Invoke-OwnerV2Checkpoint -Name 'run-after-reservation'
         }
         finally {
-            Exit-AgentLock -Stream $lock
+            if ($null -ne $lock) { Exit-AgentLock -Stream $lock }
         }
         if (-not $reserved) { continue }
 

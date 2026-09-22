@@ -1,6 +1,6 @@
 @{
     RootModule = 'DevPilot.OwnerCapability.psm1'
-    ModuleVersion = '0.2.0'
+    ModuleVersion = '0.3.0'
     GUID = '6f6f6f6f-7070-8181-9292-a3a3a3a3a3a3'
     Author = 'DevPilot Agents contributors'
     CompanyName = 'Unknown'
@@ -11,7 +11,8 @@
         'ConvertTo-OwnerV2Observation',
         'New-OwnerSemanticRunner',
         'New-OwnerV2CapabilityAdapter',
-        'New-OwnerV2CapabilityLimits'
+        'New-OwnerV2CapabilityLimits',
+        'Resolve-OwnerV2DiscussionReconciliation'
     )
     CmdletsToExport = @()
     VariablesToExport = @()
@@ -19,7 +20,7 @@
     PrivateData = @{
         PSData = @{
             Tags = @('copilot', 'agents', 'review', 'owner', 'capability', 'powershell')
-            ReleaseNotes = 'Adds canonical semantic findings and explicit zero-unit, advisory, unknown, and telemetry accounting. No writer or live model.'
+            ReleaseNotes = 'Adds wrapper-owned v1-compatible Owner discussion reconciliation while preserving zero-write semantic execution.'
         }
     }
 }

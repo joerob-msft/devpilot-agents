@@ -113,6 +113,7 @@ BeforeAll {
         param(
             [Parameter(Mandatory)][string]$Name,
             [switch]$CopilotProvider,
+            [switch]$DiscussionFailure,
             [string]$ModelMode = 'valid',
             [string]$ModelStatePath = '-'
         )
@@ -125,12 +126,19 @@ BeforeAll {
         else { 'deterministic-fake-process' }
         $manifest.entries[0].model.digest = Get-TestDigest $manifest.entries[0].model.id
         $manifestPath = Write-TestJson -Path (Join-Path $TestDrive $Name) -Value $manifest
-        $acquisitionProvider = & $script:OrchestratorModule {
-            param($Package)
-            $state = @{ SubjectReads = 0 }
+        $discussionDigest = Get-TestDigest 'empty-discussion-page'
+        $acquisition = & $script:OrchestratorModule {
+            param($Package, $DiscussionDigest, $FailDiscussion)
+            $state = @{
+                SubjectReads = 0
+                FailDiscussion = [bool]$FailDiscussion
+                Operations = [Collections.Generic.List[string]]::new()
+            }
             $captured = $Package
-            New-OwnerReadOnlyProviderAdapter -Name 'orchestrator-live-fixture' -Handler {
+            $capturedDiscussionDigest = $DiscussionDigest
+            $provider = New-OwnerReadOnlyProviderAdapter -Name 'orchestrator-live-fixture' -Handler {
                 param($Operation, $Arguments)
+                [void]$state.Operations.Add([string]$Operation)
                 switch ($Operation) {
                     'GetSubject' {
                         $value = if ($state.SubjectReads++ -eq 0) { $captured.subjectBefore }
@@ -140,9 +148,27 @@ BeforeAll {
                     'GetChangedFilesPage' { return $captured.changePages[[int]$Arguments.pageOrdinal] }
                     'GetRule' { return $captured.rule }
                     'GetFile' { return @($captured.files | Where-Object path -CEQ $Arguments.path)[0] }
+                    'GetDiscussionPage' {
+                        if ($state.FailDiscussion) { throw 'sensitive discussion provider detail' }
+                        return [ordered]@{
+                            schemaVersion = 1
+                            repositoryId = $Arguments.repositoryId
+                            projectId = $Arguments.projectId
+                            pullRequestId = $Arguments.pullRequestId
+                            sourceCommit = $Arguments.sourceCommit
+                            targetCommit = $Arguments.targetCommit
+                            targetRef = $Arguments.targetRef
+                            pageOrdinal = [int]$Arguments.pageOrdinal
+                            state = 'complete'
+                            sourceDigest = $capturedDiscussionDigest
+                            nextToken = $null
+                            threads = @()
+                        }
+                    }
                 }
             }.GetNewClosure()
-        } $package
+            return [pscustomobject]@{ Provider = $provider; State = $state }
+        } $package $discussionDigest ([bool]$DiscussionFailure)
         $provider = if ($CopilotProvider) {
             & $script:OrchestratorModule {
                 param($Pwsh)
@@ -158,7 +184,9 @@ BeforeAll {
             } $script:Pwsh $script:OwnerModelChild $ModelMode $ModelStatePath
         }
         return [pscustomobject]@{ ManifestPath = $manifestPath
-            AcquisitionProvider = $acquisitionProvider; ModelProvider = $provider }
+            AcquisitionProvider = $acquisition.Provider
+            AcquisitionState = $acquisition.State
+            ModelProvider = $provider }
     }
 
     function New-TestPreflight {
@@ -479,8 +507,76 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $enabled.records[0].attempts | Should -Be 2
         $enabled.records[0].telemetryPath | Should -Not -BeNullOrEmpty
         $observation.lifecycle.status | Should -Be 'completed'
+        $observation.findings[0].reconciliation.reason | Should -Be 'reviewer-marker-not-found'
+        $observation.findings[0].reconciliation.classification | Should -Be 'wouldCreate'
+        $observation.effects.dedupe.wouldCreate | Should -Be $observation.counts.violations
+        $observation.effects.dedupe.unknown | Should -Be 0
         $observation.effects.providerWrites | Should -Be 0
         $observation.effects.writeToolInvocations | Should -Be 0
+    }
+
+    It 'keeps semantic violations completed when discussion acquisition fails' {
+        $stateRoot = New-TestStateRoot
+        $live = New-TestLiveContext -Name 'live-discussion-failure.json' -DiscussionFailure
+        [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
+                -ManifestPath $live.ManifestPath)
+
+        $run = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath -EnableLiveModel `
+            -LiveAcquisitionProvider $live.AcquisitionProvider `
+            -LiveModelProvider $live.ModelProvider
+        $observation = Get-TestObservation -StateRoot $stateRoot
+
+        $run.records[0].state | Should -Be 'completed'
+        $observation.lifecycle.status | Should -Be 'completed'
+        $observation.counts.violations | Should -Be 1
+        $observation.findings[0].disposition | Should -Be 'violation'
+        $observation.findings[0].reconciliation.classification | Should -Be 'unknown'
+        $observation.findings[0].reconciliation.reason | Should -Be 'discussion-acquisition-failed'
+        $observation.effects.dedupe.unknown | Should -Be 1
+        $observation.effects.providerWrites | Should -Be 0
+        $observation.effects.writeToolInvocations | Should -Be 0
+        ($observation | ConvertTo-Json -Depth 64 -Compress) |
+            Should -Not -Match 'sensitive discussion provider detail'
+
+        $live.AcquisitionState.FailDiscussion = $false
+        Set-TestCheckpoint -Name 'discussion-refresh-after-observation'
+        try {
+            $interrupted = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+                -ManifestPath $live.ManifestPath `
+                -LiveAcquisitionProvider $live.AcquisitionProvider
+        }
+        finally {
+            Set-TestCheckpoint -Name $null
+        }
+        $journal = Get-ChildItem -LiteralPath $stateRoot -Recurse `
+            -Filter '*.discussion-refresh.json' -File
+
+        $interrupted.records[0].state | Should -Be 'completed'
+        $interrupted.records[0].attempts | Should -Be 1
+        $interrupted.records[0].reason | Should -Be 'discussion-refresh-unavailable'
+        @($journal).Count | Should -Be 1
+
+        $repaired = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot `
+            -ManifestPath $live.ManifestPath `
+            -LiveAcquisitionProvider $live.AcquisitionProvider
+        $repairedObservation = Get-TestObservation -StateRoot $stateRoot
+
+        $repaired.records[0].state | Should -Be 'completed'
+        $repaired.records[0].attempts | Should -Be 1
+        $repaired.records[0].reason | Should -Be 'discussion-reconciled'
+        $repairedObservation.findings[0].reconciliation.classification |
+            Should -Be 'wouldCreate'
+        $repairedObservation.effects.dedupe.unknown | Should -Be 0
+        $repairedObservation.effects.providerWrites | Should -Be 0
+        $repairedObservation.effects.writeToolInvocations | Should -Be 0
+        @(Get-ChildItem -LiteralPath $stateRoot -Recurse `
+                -Filter '*.discussion-refresh.json' -File).Count | Should -Be 0
+        $record = Get-Content -LiteralPath (Get-TestRecordFile -StateRoot $stateRoot).FullName -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $record.resultDigest | Should -Be (& $script:OrchestratorModule {
+                param($Value) Get-OwnerV2Digest -Value $Value
+            } $repairedObservation)
     }
 
     It 'retries explicit pre-model credential and containment failures after repair' -TestCases @(
@@ -546,7 +642,8 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         @($currentTelemetry.effectiveTools).Count | Should -Be 0
         $currentTelemetry.providerWrites | Should -Be 0
         $currentTelemetry.writeToolInvocations | Should -Be 0
-        $third.records[0].reason | Should -Be 'already-terminal'
+        $third.records[0].reason | Should -Be 'discussion-reconciled'
+        $third.records[0].attempts | Should -Be 2
         [int](Get-Content -LiteralPath $counterPath -Raw) | Should -Be 1
     }
 
@@ -714,7 +811,7 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         }
     }
 
-    It 'reuses a completed live result without another provider call' {
+    It 'refreshes completed discussion reconciliation without another model call' {
         $stateRoot = New-TestStateRoot
         $live = New-TestLiveContext -Name 'live-idempotent.json'
         [void](Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot `
@@ -723,13 +820,17 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
             -EnableLiveModel -LiveAcquisitionProvider $live.AcquisitionProvider `
             -LiveModelProvider $live.ModelProvider
         $before = [IO.File]::ReadAllBytes($first.records[0].telemetryPath)
+        $operationsBefore = $live.AcquisitionState.Operations.Count
 
         $second = Invoke-OwnerV2PreviewRun -StateRoot $stateRoot -ManifestPath $live.ManifestPath `
-            -EnableLiveModel -LiveAcquisitionProvider $live.AcquisitionProvider `
-            -LiveModelProvider $live.ModelProvider
+            -LiveAcquisitionProvider $live.AcquisitionProvider
         $after = [IO.File]::ReadAllBytes($first.records[0].telemetryPath)
 
-        $second.records[0].reason | Should -Be 'already-terminal'
+        $second.records[0].reason | Should -Be 'discussion-reconciled'
+        $second.records[0].attempts | Should -Be 1
+        @($live.AcquisitionState.Operations)[$operationsBefore..(
+                $live.AcquisitionState.Operations.Count - 1
+            )] | Should -Be @('GetDiscussionPage')
         [Convert]::ToHexString($after) | Should -BeExactly ([Convert]::ToHexString($before))
         (Get-Content -LiteralPath $first.records[0].telemetryPath -Raw |
             ConvertFrom-Json -AsHashtable).attempts | Should -Be 1

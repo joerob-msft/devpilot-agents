@@ -1,6 +1,6 @@
 @{
     RootModule = 'DevPilot.OwnerOrchestrator.psm1'
-    ModuleVersion = '0.4.0'
+    ModuleVersion = '0.5.0'
     GUID = '81818181-9292-a3a3-b4b4-c5c5c5c5c5c5'
     Author = 'DevPilot Agents contributors'
     CompanyName = 'Unknown'
@@ -18,7 +18,7 @@
     PrivateData = @{
         PSData = @{
             Tags = @('copilot', 'agents', 'owner', 'preview', 'orchestrator', 'powershell')
-            ReleaseNotes = 'Adds bounded external relation manifests to the existing scheduler-callable preview state machine without changing the Owner path.'
+            ReleaseNotes = 'Adds bounded post-semantic Owner discussion reconciliation while preserving preview-only zero-write orchestration and relation coexistence.'
         }
     }
 }

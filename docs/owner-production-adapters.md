@@ -32,18 +32,38 @@ responses must echo the exact subject/head/target identity on every read.
 ## Injected provider boundary
 
 `New-OwnerReadOnlyProviderAdapter` accepts one caller-supplied handler. The
-production adapter invokes only four named operations:
+production adapter invokes only five named operations:
 
 1. `GetSubject`
 2. `GetChangedFilesPage`
 3. `GetRule`
 4. `GetFile`
+5. `GetDiscussionPage`
 
 The module contains no provider client, credentials, MCP or CLI invocation, or
 write operation. The injected handler is the host-specific trust boundary and
 must itself expose read-only implementations. The adapter verifies the
 operation allow-list before use, performs a final subject read to detect races,
 and rejects stale or mixed identities.
+
+`GetDiscussionPage` is separate from semantic acquisition. The orchestrator
+calls it only after semantic execution, and raw thread/comment bodies are never
+added to facade evidence or model input. The provider returns only the typed
+reconciliation shape: exact echoed subject identity, page ordinal and
+continuation, source digest, normalized thread status/deleted/outdated/current
+head metadata, an optional repository-relative anchor, and bounded comments
+with text/system type, deleted state, reviewer-ownership attestation, body, and
+body digest. Author names, email addresses, credentials, provider tokens, and
+other provider artifacts are not part of the contract.
+
+Discussion acquisition has independent explicit ceilings: 20 pages, 100
+threads per page, 1,000 total threads, 5,000 total comments, and 4 MiB of UTF-8
+comment text in the live Owner orchestrator. Duplicate thread/comment IDs,
+repeated continuation tokens, oversized pages or bodies, invalid digests,
+mixed subject identity, incomplete pages, and cap exhaustion fail closed.
+Threads and comments are ordinally sorted before the wrapper computes the
+snapshot digest. A discussion failure does not rewrite or downgrade a semantic
+finding; it makes only that finding's dedupe classification `unknown`.
 
 Changed-file pagination must be complete, ordered, continuation-consistent,
 and equal the subject's declared file denominator. Paths are normalized to
@@ -61,6 +81,10 @@ The common live/replay normalizer emits deterministic evidence units:
 - `file:NNNNNN` units contain ordinally sorted paths, rename/deletion/binary
   identity, changed spans, content state, lengths, truncation, and source
   digests.
+
+Discussion snapshots are intentionally absent from these evidence units. They
+are wrapper-owned post-semantic reconciliation input, with their own digest and
+observation provenance.
 
 Complete text and rule content is checked against its declared UTF-8 byte
 length and SHA-256. For incomplete or truncated file responses, `byteLength`
@@ -107,8 +131,8 @@ checksums, stale identities, or live/replay contract divergence are rejected.
 
 ## Explicit deferrals
 
-This layer does not add capability or model execution, v1 compatibility,
-relation-aware evidence contracts, parity runs, writer eligibility, delivery,
+This layer does not add capability or model execution, relation-aware evidence
+contracts, parity runs, writer eligibility, delivery,
 notifications, scheduling, queues, deployment switches, or cutover. It does
 not read or migrate deployed reviewer state. Those remain separate later-layer
 migration gates after parallel evidence acquisition has demonstrated stable
