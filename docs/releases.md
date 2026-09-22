@@ -150,6 +150,11 @@ from updating or deleting them.
 
 ## Release checklist
 
+Repository agents can use
+`.github/skills/devpilot-release/SKILL.md` to prepare the version-bump pull
+request and dispatch the protected workflows after merge. The skill does not
+replace environment approvals, rulesets, or any qualification gate.
+
 1. Update `VERSION`, the harness manifest, dashboard package files, and release
    metadata to the intended stable `0.4.x` value.
 2. Run `tools/Test-DevPilotVersion.ps1`.
