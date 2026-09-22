@@ -167,6 +167,7 @@
               }
             ]
           },
+          "reconciliation": { "$ref": "#/$defs/discussionReconciliation" },
           "binding": {
             "oneOf": [
               { "const": "unknown" },
@@ -275,6 +276,53 @@
             { "const": "unknown" },
             { "type": "string", "pattern": "^[0-9a-f]{64}$" }
           ]
+        }
+      }
+    },
+    "discussionReconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classification", "reason", "bodySha256", "discussionSha256", "thread"],
+      "properties": {
+        "classification": { "enum": ["wouldCreate", "wouldUpdate", "noOp", "unknown"] },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "bodySha256": {
+          "oneOf": [
+            { "const": "unknown" },
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          ]
+        },
+        "discussionSha256": {
+          "oneOf": [
+            { "const": "unknown" },
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          ]
+        },
+        "thread": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "threadId", "commentId", "status"],
+          "properties": {
+            "availability": { "enum": ["none", "available", "ambiguous"] },
+            "threadId": {
+              "oneOf": [
+                { "const": "unknown" },
+                { "type": "integer", "minimum": 1 }
+              ]
+            },
+            "commentId": {
+              "oneOf": [
+                { "const": "unknown" },
+                { "type": "integer", "minimum": 1 }
+              ]
+            },
+            "status": { "$ref": "#/$defs/knownText" }
+          }
         }
       }
     },

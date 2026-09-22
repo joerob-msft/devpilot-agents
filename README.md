@@ -50,8 +50,8 @@ marker. Anything else it prints is ignored.
 src/
   DevPilot.AgentHarness/     # the shared, provider-agnostic module
   DevPilot.OwnerPipeline/    # experimental generic Owner review facade
-  DevPilot.OwnerAdapters/    # read-only production/replay acquisition boundary
-  DevPilot.OwnerCapability/  # preview-only injected Owner semantic boundary
+  DevPilot.OwnerAdapters/    # read-only evidence and PR-discussion acquisition boundary
+  DevPilot.OwnerCapability/  # preview-only Owner semantics and dedupe reconciliation
   DevPilot.OwnerModelRunner/ # fail-closed no-tools preflight, fake process, and replay runner
   DevPilot.RelationEvidence/ # bounded contextual relation/evidence assessment
   DevPilot.OwnerOrchestrator/ # preview-only v2 cohort state lifecycle
@@ -80,8 +80,10 @@ result are documented in
 Its
 [authoritative operating state](docs/owner-preview-orchestrator.md#current-operating-state-authoritative)
 distinguishes code capability, operator deployment, state separation, and
-writer authority. These layers remain preview-only and do not themselves
-register scheduling or authorize writes.
+writer authority. Live Owner observations can reconcile bounded provider
+discussions into an actionable V1-compatible create/update/no-op/unknown queue,
+but these layers remain preview-only and do not themselves register scheduling
+or authorize writes.
 
 **Consumers keep only a config file.** Nothing employer-, repository-, or
 person-specific lives in this repo outside `samples/` — a CI check enforces that

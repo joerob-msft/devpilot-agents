@@ -103,6 +103,72 @@ namespace DevPilot.OwnerAdapters
 '@
 }
 
+if (-not ('DevPilot.OwnerAdapters.OwnerDiscussionLimits' -as [type])) {
+    Add-Type -TypeDefinition @'
+namespace DevPilot.OwnerAdapters
+{
+    public sealed class OwnerDiscussionLimits
+    {
+        public int MaximumPages { get; }
+        public int PageSize { get; }
+        public int MaximumThreads { get; }
+        public int MaximumComments { get; }
+        public long MaximumBytes { get; }
+
+        public OwnerDiscussionLimits(
+            int maximumPages,
+            int pageSize,
+            int maximumThreads,
+            int maximumComments,
+            long maximumBytes)
+        {
+            MaximumPages = maximumPages;
+            PageSize = pageSize;
+            MaximumThreads = maximumThreads;
+            MaximumComments = maximumComments;
+            MaximumBytes = maximumBytes;
+        }
+    }
+
+    public sealed class OwnerDiscussionSnapshot
+    {
+        public int SchemaVersion { get { return 1; } }
+        public string State { get; }
+        public string Reason { get; }
+        public int PageCount { get; }
+        public int ThreadCount { get; }
+        public int CommentCount { get; }
+        public long ByteCount { get; }
+        public string Digest { get; }
+        public string[] SourceDigests { get; }
+        public object[] Threads { get; }
+
+        public OwnerDiscussionSnapshot(
+            string state,
+            string reason,
+            int pageCount,
+            int threadCount,
+            int commentCount,
+            long byteCount,
+            string digest,
+            string[] sourceDigests,
+            object[] threads)
+        {
+            State = state;
+            Reason = reason;
+            PageCount = pageCount;
+            ThreadCount = threadCount;
+            CommentCount = commentCount;
+            ByteCount = byteCount;
+            Digest = digest;
+            SourceDigests = sourceDigests;
+            Threads = threads;
+        }
+    }
+}
+'@
+}
+
 $script:OwnerAdapterSemantics = 'owner-acquisition-v1'
 $script:OwnerAdapterContractMaterial = (
     'owner-acquisition-v1|ordinal-paths|complete-pages|subject-race|' +
@@ -113,8 +179,15 @@ $script:OwnerAdapterContractDigest = 'v1:sha256:' + [Convert]::ToHexString(
         [Text.Encoding]::UTF8.GetBytes($script:OwnerAdapterContractMaterial))
 ).ToLowerInvariant()
 $script:OwnerAdapterStates = @('complete', 'incomplete', 'unknown')
-$script:OwnerProviderOperations = @('GetSubject', 'GetChangedFilesPage', 'GetRule', 'GetFile')
+$script:OwnerProviderOperations = @(
+    'GetSubject',
+    'GetChangedFilesPage',
+    'GetRule',
+    'GetFile',
+    'GetDiscussionPage'
+)
 $script:OwnerAdapterMaximumJsonNodes = 100000
+$script:OwnerDiscussionStates = @('active', 'fixed', 'closed', 'resolved', 'unknown')
 $script:OwnerUnknownReasons = @(
     'binary',
     'cap-exhausted',
@@ -373,6 +446,27 @@ function New-OwnerAdapterLimits {
         $MaximumDiagnostics)
 }
 
+function New-OwnerDiscussionLimits {
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1, 100)][int]$MaximumPages = 20,
+        [ValidateRange(1, 200)][int]$PageSize = 100,
+        [ValidateRange(1, 2000)][int]$MaximumThreads = 1000,
+        [ValidateRange(1, 10000)][int]$MaximumComments = 5000,
+        [ValidateRange(1, 16777216)][long]$MaximumBytes = 4194304
+    )
+
+    if ($MaximumThreads -gt ($MaximumPages * $PageSize)) {
+        throw 'MaximumThreads cannot exceed the configured discussion page capacity.'
+    }
+    return [DevPilot.OwnerAdapters.OwnerDiscussionLimits]::new(
+        $MaximumPages,
+        $PageSize,
+        $MaximumThreads,
+        $MaximumComments,
+        $MaximumBytes)
+}
+
 function New-OwnerAcquisitionContract {
     [CmdletBinding()]
     param(
@@ -578,6 +672,256 @@ function Invoke-OwnerProviderRead {
         throw "Provider operation '$Operation' must return exactly one dictionary."
     }
     return ConvertTo-OwnerAdapterCanonicalValue -Value $values[0]
+}
+
+function ConvertTo-OwnerDiscussionStatus {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $normalized = $Value.Trim().ToLowerInvariant()
+    if ($normalized -cnotin $script:OwnerDiscussionStates) {
+        throw "Discussion thread status '$Value' is not supported."
+    }
+    return $normalized
+}
+
+function ConvertTo-OwnerDiscussionThread {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Thread,
+        [Parameter(Mandatory)][DevPilot.OwnerAdapters.OwnerDiscussionLimits]$Limits,
+        [Parameter(Mandatory)][ref]$CommentCount,
+        [Parameter(Mandatory)][ref]$ByteCount
+    )
+
+    $threadId = Get-OwnerAdapterInt64 -Value (
+        Get-OwnerAdapterMember -Value $Thread -Name threadId -Required
+    ) -Name threadId -Minimum 1 -Maximum ([int]::MaxValue)
+    $status = ConvertTo-OwnerDiscussionStatus -Value (
+        [string](Get-OwnerAdapterMember -Value $Thread -Name status -Required)
+    )
+    $isDeleted = Get-OwnerAdapterBoolean -Value (
+        Get-OwnerAdapterMember -Value $Thread -Name isDeleted -Required
+    ) -Name isDeleted
+    $isOutdated = Get-OwnerAdapterBoolean -Value (
+        Get-OwnerAdapterMember -Value $Thread -Name isOutdated -Required
+    ) -Name isOutdated
+
+    $sourceCommitValue = Get-OwnerAdapterMember -Value $Thread -Name sourceCommit
+    $sourceCommit = if ($null -eq $sourceCommitValue -or
+        [string]::IsNullOrWhiteSpace([string]$sourceCommitValue)) {
+        $null
+    }
+    else {
+        $value = [string]$sourceCommitValue
+        Assert-OwnerAdapterCommit -Value $value -Name sourceCommit
+        $value
+    }
+
+    $anchorValue = Get-OwnerAdapterMember -Value $Thread -Name anchor
+    $anchor = $null
+    if ($null -ne $anchorValue) {
+        if ($anchorValue -isnot [Collections.IDictionary]) {
+            throw 'Discussion thread anchor must be a dictionary or null.'
+        }
+        $anchor = [ordered]@{
+            path = ConvertTo-OwnerSafePath -Path (
+                [string](Get-OwnerAdapterMember -Value $anchorValue -Name path -Required)
+            ) -Name anchor.path
+            line = Get-OwnerAdapterInt64 -Value (
+                Get-OwnerAdapterMember -Value $anchorValue -Name line -Required
+            ) -Name anchor.line -Minimum 1 -Maximum ([int]::MaxValue)
+        }
+    }
+
+    $comments = [Collections.Generic.List[object]]::new()
+    $seenComments = [Collections.Generic.HashSet[long]]::new()
+    foreach ($comment in @(Get-OwnerAdapterMember -Value $Thread -Name comments -Required)) {
+        if ($comment -isnot [Collections.IDictionary]) {
+            throw 'Discussion threads must contain only comment dictionaries.'
+        }
+        $commentId = Get-OwnerAdapterInt64 -Value (
+            Get-OwnerAdapterMember -Value $comment -Name commentId -Required
+        ) -Name commentId -Minimum 1 -Maximum ([int]::MaxValue)
+        if (-not $seenComments.Add($commentId)) {
+            throw "Discussion thread '$threadId' repeated comment '$commentId'."
+        }
+        $commentCount.Value++
+        if ($CommentCount.Value -gt $Limits.MaximumComments) {
+            throw 'Discussion acquisition exceeded the configured comment cap.'
+        }
+        $commentDeleted = Get-OwnerAdapterBoolean -Value (
+            Get-OwnerAdapterMember -Value $comment -Name isDeleted -Required
+        ) -Name comment.isDeleted
+        $reviewerOwned = Get-OwnerAdapterBoolean -Value (
+            Get-OwnerAdapterMember -Value $comment -Name reviewerOwned -Required
+        ) -Name comment.reviewerOwned
+        $commentType = [string](Get-OwnerAdapterMember -Value $comment -Name commentType -Required)
+        if ($commentType -cnotin @('text', 'system')) {
+            throw "Discussion comment '$commentId' has unsupported type '$commentType'."
+        }
+        $body = [string](Get-OwnerAdapterMember -Value $comment -Name body -Required)
+        if ($body.Length -gt 65536 -or $body -match '\x00') {
+            throw "Discussion comment '$commentId' body is unsafe or unbounded."
+        }
+        $bodyBytes = [Text.Encoding]::UTF8.GetByteCount($body)
+        $byteCount.Value += $bodyBytes
+        if ($ByteCount.Value -gt $Limits.MaximumBytes) {
+            throw 'Discussion acquisition exceeded the configured UTF-8 byte cap.'
+        }
+        $declaredBodyDigest = [string](Get-OwnerAdapterMember -Value $comment -Name bodyDigest -Required)
+        Assert-OwnerAdapterDigest -Value $declaredBodyDigest -Name comment.bodyDigest
+        $actualBodyDigest = Get-OwnerAdapterDigest -Value $body
+        if ($actualBodyDigest -cne $declaredBodyDigest) {
+            throw "Discussion comment '$commentId' body digest did not match its text."
+        }
+        [void]$comments.Add([ordered]@{
+                commentId = $commentId
+                commentType = $commentType
+                isDeleted = $commentDeleted
+                reviewerOwned = $reviewerOwned
+                body = $body
+                bodyDigest = $actualBodyDigest
+            })
+    }
+
+    return [ordered]@{
+        threadId = $threadId
+        status = $status
+        isDeleted = $isDeleted
+        isOutdated = $isOutdated
+        sourceCommit = $sourceCommit
+        anchor = $anchor
+        comments = @($comments | Sort-Object { [long]$_.commentId })
+    }
+}
+
+function Get-OwnerDiscussionSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][object]$Provider,
+        [DevPilot.OwnerAdapters.OwnerDiscussionLimits]$Limits = (New-OwnerDiscussionLimits)
+    )
+
+    Test-OwnerAcquisitionContract -Contract $Contract
+    Test-OwnerProviderAdapter -Provider $Provider
+    if ($Limits.MaximumPages -lt 1 -or $Limits.MaximumPages -gt 100 -or
+        $Limits.PageSize -lt 1 -or $Limits.PageSize -gt 200 -or
+        $Limits.MaximumThreads -lt 1 -or $Limits.MaximumThreads -gt 2000 -or
+        $Limits.MaximumComments -lt 1 -or $Limits.MaximumComments -gt 10000 -or
+        $Limits.MaximumBytes -lt 1 -or $Limits.MaximumBytes -gt 16777216 -or
+        $Limits.MaximumThreads -gt ($Limits.MaximumPages * $Limits.PageSize)) {
+        throw 'Discussion limits were outside the adapter contract bounds.'
+    }
+
+    $request = $Contract.Request
+    $baseArguments = [ordered]@{
+        repositoryId = $request.RepositoryId
+        projectId = $request.ProjectId
+        pullRequestId = $request.PullRequestId
+        sourceCommit = $request.SourceCommit
+        targetCommit = $request.TargetCommit
+        targetRef = $request.TargetRef
+    }
+    $readCount = 0
+    $pageOrdinal = 0
+    $token = $null
+    $tokens = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $threads = [Collections.Generic.List[object]]::new()
+    $seenThreads = [Collections.Generic.HashSet[long]]::new()
+    $sourceDigests = [Collections.Generic.List[string]]::new()
+    $commentCount = 0
+    $byteCount = 0L
+    do {
+        if ($pageOrdinal -ge $Limits.MaximumPages) {
+            throw 'Discussion pagination exceeded the configured page cap.'
+        }
+        $arguments = [ordered]@{}
+        foreach ($entry in $baseArguments.GetEnumerator()) { $arguments[$entry.Key] = $entry.Value }
+        $arguments['pageOrdinal'] = $pageOrdinal
+        $arguments['pageSize'] = $Limits.PageSize
+        $arguments['continuationToken'] = $token
+        $page = Invoke-OwnerProviderRead -Provider $Provider -Operation GetDiscussionPage `
+            -Arguments $arguments -Limits (
+                [DevPilot.OwnerAdapters.OwnerAdapterLimits]::new(
+                    1,
+                    $Limits.MaximumBytes,
+                    $Limits.MaximumPages,
+                    1)
+            ) -ReadCount ([ref]$readCount)
+        Test-OwnerIdentityResponse -Response $page -Request $request -Operation GetDiscussionPage
+        if ([int](Get-OwnerAdapterMember -Value $page -Name pageOrdinal -Required) -ne $pageOrdinal) {
+            throw 'Discussion pagination returned a stale or ambiguous page ordinal.'
+        }
+        $pageState = [string](Get-OwnerAdapterMember -Value $page -Name state -Required)
+        Assert-OwnerAdapterState -Value $pageState -Name discussion.state
+        if ($pageState -cne 'complete') {
+            throw 'Discussion pagination returned an incomplete or unknown page.'
+        }
+        $sourceDigest = [string](Get-OwnerAdapterMember -Value $page -Name sourceDigest -Required)
+        Assert-OwnerAdapterDigest -Value $sourceDigest -Name discussion.sourceDigest
+        [void]$sourceDigests.Add($sourceDigest)
+        $pageThreads = @(Get-OwnerAdapterMember -Value $page -Name threads -Required)
+        if ($pageThreads.Count -gt $Limits.PageSize) {
+            throw 'Discussion provider returned more threads than the requested page size.'
+        }
+        foreach ($thread in $pageThreads) {
+            if ($thread -isnot [Collections.IDictionary]) {
+                throw 'Discussion pages must contain only thread dictionaries.'
+            }
+            $normalized = ConvertTo-OwnerDiscussionThread -Thread $thread -Limits $Limits `
+                -CommentCount ([ref]$commentCount) -ByteCount ([ref]$byteCount)
+            if (-not $seenThreads.Add([long]$normalized.threadId)) {
+                throw "Discussion pagination repeated thread '$($normalized.threadId)'."
+            }
+            [void]$threads.Add($normalized)
+            if ($threads.Count -gt $Limits.MaximumThreads) {
+                throw 'Discussion acquisition exceeded the configured thread cap.'
+            }
+        }
+        $nextTokenValue = Get-OwnerAdapterMember -Value $page -Name nextToken
+        $token = if ($null -eq $nextTokenValue -or
+            [string]::IsNullOrEmpty([string]$nextTokenValue)) {
+            $null
+        }
+        else {
+            $next = [string]$nextTokenValue
+            Assert-OwnerAdapterText -Value $next -Name discussion.nextToken -MaximumLength 512
+            if ($pageThreads.Count -eq 0) {
+                throw 'Non-final discussion pages cannot be empty.'
+            }
+            if (-not $tokens.Add($next)) {
+                throw 'Discussion pagination repeated a continuation token.'
+            }
+            $next
+        }
+        $pageOrdinal++
+    } while ($null -ne $token)
+
+    $orderedThreads = @($threads | Sort-Object { [long]$_.threadId })
+    $digestMaterial = [ordered]@{
+        schemaVersion = 1
+        identity = $baseArguments
+        limits = [ordered]@{
+            maximumPages = $Limits.MaximumPages
+            pageSize = $Limits.PageSize
+            maximumThreads = $Limits.MaximumThreads
+            maximumComments = $Limits.MaximumComments
+            maximumBytes = $Limits.MaximumBytes
+        }
+        sourceDigests = @($sourceDigests)
+        threads = $orderedThreads
+    }
+    $digest = Get-OwnerAdapterDigest -Value $digestMaterial
+    return [DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]::new(
+        'complete',
+        'complete',
+        $pageOrdinal,
+        $orderedThreads.Count,
+        $commentCount,
+        $byteCount,
+        $digest,
+        [string[]]@($sourceDigests),
+        [object[]]$orderedThreads)
 }
 
 function New-OwnerSyntheticFileResponse {
@@ -1304,8 +1648,10 @@ function New-OwnerReplayAcquisitionAdapter {
 Export-ModuleMember -Function @(
     'New-OwnerAcquisitionContract',
     'New-OwnerAdapterLimits',
+    'New-OwnerDiscussionLimits',
     'New-OwnerReadOnlyProviderAdapter',
     'New-OwnerProductionAcquisitionAdapter',
+    'Get-OwnerDiscussionSnapshot',
     'New-OwnerReplayFixture',
     'New-OwnerReplayAcquisitionAdapter'
 )
