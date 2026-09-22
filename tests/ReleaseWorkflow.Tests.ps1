@@ -3,6 +3,8 @@ BeforeAll {
     $release = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release.yml') -Raw
     $promotion = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release-channel.yml') -Raw
     $canary = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release-canary.yml') -Raw
+    $releaseSkill = Get-Content -LiteralPath (
+        Join-Path $root '.github\skills\devpilot-release\SKILL.md') -Raw
     $installedQualification = Get-Content -LiteralPath (
         Join-Path $root 'tools\Invoke-InstalledReleaseQualification.ps1') -Raw
     $ciRunner = Get-Content -LiteralPath (Join-Path $root 'tools\Invoke-DevPilotCi.ps1') -Raw
@@ -110,5 +112,18 @@ Describe 'Release publication boundary' {
                 $block | Should -Not -Match '\$\{\{ inputs\.'
             }
         }
+    }
+
+    It 'keeps the release skill behind protected workflow boundaries' {
+        $releaseSkill | Should -Match '(?m)^name: devpilot-release\r?$'
+        $releaseSkill | Should -Not -Match '(?m)^allowed-tools:'
+        $releaseSkill | Should -Match 'release-canary\.yml'
+        $releaseSkill | Should -Match 'release\.yml'
+        $releaseSkill | Should -Match 'Never create or push release tags directly'
+        $releaseSkill | Should -Match 'never\s+bypass or self-approve that gate'
+        $releaseSkill.IndexOf('gh workflow run release-canary.yml') |
+            Should -BeLessThan $releaseSkill.IndexOf('gh workflow run release.yml')
+        $releaseSkill | Should -Match 'resumePublishedTag=true'
+        $releaseSkill | Should -Match 'use only\s+`release-channel\.yml`'
     }
 }
