@@ -1998,6 +1998,8 @@ function ConvertTo-OwnerV2Observation {
 
 Export-ModuleMember -Function @(
     'ConvertTo-OwnerV2Observation',
+    'Format-OwnerV1WriterComment',
+    'Get-OwnerV1WriterMarkerKey',
     'New-OwnerSemanticRunner',
     'New-OwnerV2CapabilityAdapter',
     'New-OwnerV2CapabilityLimits',

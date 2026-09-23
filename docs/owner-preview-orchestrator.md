@@ -72,14 +72,16 @@ stack. Component documents link here rather than restating rollout status.
   state. The v1 scheduled preview is disabled but retained for rollback. This
   dated snapshot is deployment evidence, not a repository-created task or
   broader authority.
-- **Authority boundary:** v2 remains preview-only and performs zero provider or
-  writer writes. Live Owner observations can read bounded PR discussions after
-  semantic execution and classify the V1-compatible queue as `wouldCreate`,
-  `wouldUpdate`, `noOp`, or explicit `unknown`; that read-only queue does not
-  grant delivery authority. V1 remains the sole manual approved-comment
-  writer. Existing consumer entry points, configuration, and users were not
-  migrated by this stack. Automatic comments or votes and any consumer
-  migration require separate decisions.
+- **Authority boundary:** scheduled v2 remains preview-only and performs zero
+  provider or writer writes. Live Owner observations can read bounded PR
+  discussions after semantic execution and classify the V1-compatible queue as
+  `wouldCreate`, `wouldUpdate`, `noOp`, or explicit `unknown`; that read-only
+  queue does not grant delivery authority. A separate manual v2 approved-comment
+  command can export proposals, sign an exact operator selection, dry-run it,
+  and only then publish when the operator separately supplies `-Publish`.
+  Nothing adds the command to a scheduler or gives a model, dashboard, provider
+  adapter, or observation delivery authority. Automatic comments remain
+  unauthorized.
 - **State and rollback:** v1 and v2 toolkit/state roots remain separate. Rollback
   is an operator action: stop or disable the v2 preview service and restore the
   retained v1 scheduled preview if needed; no v1 state migration or repair is
@@ -96,9 +98,9 @@ including upgrading a pre-reconciliation completed observation, without
 starting the model again. That deployment action is intentionally outside this
 repository change.
 
-Remaining rollout gates are sustained reliability evidence, an explicit
-writer-compatibility and authorization decision, deliberate consumer migration,
-and separate proof for any broader contextual-review capability.
+Remaining rollout gates are sustained reliability evidence, explicit
+per-batch human publish authorization, deliberate consumer migration, and
+separate proof for any broader contextual-review capability.
 
 ## Cohort manifest
 
@@ -257,3 +259,89 @@ scheduling, deployment, notifications, comments, votes, summaries, or cutover
 authority.
 See [Current operating state](#current-operating-state-authoritative) for the
 current code, deployment, and remaining-gate distinction.
+
+## Manual approved-comment flow
+
+`tools/Invoke-ApprovedOwnerV2Comment.ps1` is the only v2 comment-writer entry
+point. It consumes one exact completed Owner v2 record, observation, telemetry
+view, declaration, and discussion overlay from the durable preview state. It
+rejects relation results, incomplete findings, advisory/class/helper/unknown
+outcomes, non-actionable reconciliation states, modified state files, and
+selections larger than five. The scheduler and preview commands never invoke
+it.
+
+The operator uses a private root outside the repository. Initialization creates
+a 32-byte HMAC key in that owner-only root. The unsigned review package contains
+the exact proposed body and V1-compatible marker for every eligible finding; it
+does not authorize delivery:
+
+```powershell
+$tool = '.\tools\Invoke-ApprovedOwnerV2Comment.ps1'
+
+& $tool initialize-key `
+    -ApprovalRoot C:\private\owner-v2-approved-comments
+
+& $tool export `
+    -ApprovalRoot C:\private\owner-v2-approved-comments `
+    -StateRoot C:\private\owner-v2-preview-instance `
+    -Identity <64-lowercase-hex-state-identity> `
+    -ToolkitConfigPath C:\private\owner-v2-preview-instance\config\owner-v2-live-config.json `
+    -ReviewPackagePath C:\private\owner-v2-approved-comments\reviews\review.json
+```
+
+After reviewing the exact bodies, paths, lines, symbols, rationales, markers,
+construct identities, and digests, the operator signs one to five explicit
+finding IDs. The command never infers "all findings". The GUID, descriptor, UPN,
+and reason identify the exact approving operator:
+
+```powershell
+& $tool approve `
+    -ApprovalRoot C:\private\owner-v2-approved-comments `
+    -StateRoot C:\private\owner-v2-preview-instance `
+    -Identity <state-identity> `
+    -ToolkitConfigPath C:\private\owner-v2-preview-instance\config\owner-v2-live-config.json `
+    -ReviewPackagePath C:\private\owner-v2-approved-comments\reviews\review.json `
+    -ApprovalPackagePath C:\private\owner-v2-approved-comments\approvals\batch-1.json `
+    -FindingId <finding-1>,<finding-2> `
+    -OperatorId <reviewer-guid> `
+    -OperatorDescriptor <reviewer-descriptor> `
+    -OperatorUpn <reviewer-upn> `
+    -Reason 'Reviewed the exact proposed comments.' `
+    -Approve
+```
+
+Invocation defaults to dry-run and requires `-Approve` again. The direct Azure
+DevOps provider re-reads the active PR, source head, target commit/ref, current
+iteration and change tracking IDs, changed right-side line spans, full bounded
+REST discussions, and exact reviewer identity. It then recomputes the
+repository-owned discussion snapshot and marker classification. Any state,
+head, target, anchor, rule, implementation, result, snapshot, identity,
+pagination, or signature drift fails closed:
+
+```powershell
+& $tool invoke `
+    -ApprovalRoot C:\private\owner-v2-approved-comments `
+    -StateRoot C:\private\owner-v2-preview-instance `
+    -Identity <state-identity> `
+    -ToolkitConfigPath C:\private\owner-v2-preview-instance\config\owner-v2-live-config.json `
+    -ProviderConfigPath C:\private\owner-v2-preview-instance\config\owner-v2-live-config.json `
+    -ApprovalPackagePath C:\private\owner-v2-approved-comments\approvals\batch-1.json `
+    -Approve
+```
+
+Only a later, explicit operator decision adds `-Publish`. Updates additionally
+require `-ApproveUpdate` both when signing and invoking. Before every individual
+write the command repeats the full read-only validation. It writes only the
+selected anchored text comment, performs an immediate REST readback, and records
+immutable HMAC-signed intent and outcome audits. An interrupted intent is
+reconciled from the live marker/body before retry, preventing duplicate posts.
+The command never votes, changes PR status, sends notifications, publishes
+summaries, or resolves unrelated threads.
+
+After publication, run the scheduled v2 preview normally to reconcile the new
+discussion snapshot into the Owner observation. Expected selected findings then
+become `noOp`. Rollback is operational: stop using the manual writer, preserve
+the signed approval/intents/outcomes for audit, and refresh the observation.
+Comments already created are provider records and must not be silently deleted
+or hidden by this tool; any correction requires another explicit signed update
+approval.

@@ -984,9 +984,11 @@ Describe 'Owner v2 semantic capability' {
 }
 
 Describe 'Owner capability module surface' {
-    It 'exports only the preview capability contract and adapter seam' {
+    It 'exports only the preview contract, exact writer formatter, and adapter seam' {
         @((Get-Command -Module DevPilot.OwnerCapability).Name | Sort-Object) | Should -Be @(
             'ConvertTo-OwnerV2Observation',
+            'Format-OwnerV1WriterComment',
+            'Get-OwnerV1WriterMarkerKey',
             'New-OwnerSemanticRunner',
             'New-OwnerV2CapabilityAdapter',
             'New-OwnerV2CapabilityLimits',
