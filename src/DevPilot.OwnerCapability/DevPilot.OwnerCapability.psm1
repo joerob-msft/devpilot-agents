@@ -251,27 +251,41 @@ function Resolve-OwnerV2DiscussionReconciliation {
         }
 
         $candidates = [Collections.Generic.List[object]]::new()
+        $ambiguousReviewerMarkers = 0
         foreach ($thread in @($Snapshot.Threads)) {
             foreach ($comment in @($thread.comments)) {
                 $matches = [regex]::Matches([string]$comment.body, $allMarkerPattern)
-                if (-not [bool]$comment.reviewerOwned -or
+                $targetMatches = @($matches | Where-Object {
+                        $_.Groups[1].Value -ceq $markerKey
+                    })
+                if ($targetMatches.Count -eq 0 -or
                     [string]$comment.commentType -cne 'text' -or
                     [bool]$comment.isDeleted) {
                     continue
                 }
-                $targetMatches = @($matches | Where-Object {
-                        $_.Groups[1].Value -ceq $markerKey
-                    })
-                if ($targetMatches.Count -gt 0) {
+                if ([string]$comment.reviewerIdentityState -ceq 'ambiguous') {
+                    $ambiguousReviewerMarkers += $targetMatches.Count
+                    continue
+                }
+                if ([bool]$comment.reviewerOwned) {
                     [void]$candidates.Add([pscustomobject]@{
-                            Thread = $thread
-                            Comment = $comment
-                            MarkerCount = $targetMatches.Count
-                        })
+                        Thread = $thread
+                        Comment = $comment
+                        MarkerCount = $targetMatches.Count
+                    })
                 }
             }
         }
 
+        if ($ambiguousReviewerMarkers -gt 0) {
+            $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason 'reviewer-marker-owner-ambiguous' `
+                -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                -ThreadAvailability ambiguous
+            $counts.unknown++
+            continue
+        }
         if ($candidates.Count -eq 0) {
             $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity verified
             $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
@@ -331,18 +345,16 @@ function Resolve-OwnerV2DiscussionReconciliation {
             $counts.unknown++
             continue
         }
-        if ($null -ne $thread.sourceCommit -and
-            [string]$thread.sourceCommit -cne [string]$Contract.Request.SourceCommit) {
+        if ([string]$thread.contextState -ceq 'ambiguous') {
             $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
             $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
-                -Classification unknown -Reason 'reviewer-marker-source-mismatch' `
+                -Classification unknown -Reason 'reviewer-marker-context-ambiguous' `
                 -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
                 -ThreadAvailability available -ThreadId ([long]$thread.threadId) `
                 -CommentId ([long]$comment.commentId) -ThreadStatus ([string]$thread.status)
             $counts.unknown++
             continue
         }
-
         $classification = $null
         $reason = $null
         if ([bool]$thread.isDeleted) {
@@ -382,8 +394,12 @@ function Resolve-OwnerV2DiscussionReconciliation {
     $Observation.effects.dedupe = $counts
     $artifacts = [Collections.Generic.List[object]]::new()
     foreach ($artifact in @($Observation.sourceArtifacts)) {
-        if ([string](Get-OwnerV2Member -Value $artifact -Name kind) -cne
-            'owner-v2-discussion-snapshot') {
+        if ([string](Get-OwnerV2Member -Value $artifact -Name kind) -cnotin @(
+                'owner-v2-discussion-snapshot',
+                'owner-v2-discussion-mapping',
+                'owner-v2-discussion-reviewer-identity',
+                'owner-v2-discussion-raw-page'
+            )) {
             [void]$artifacts.Add($artifact)
         }
     }
@@ -393,6 +409,29 @@ function Resolve-OwnerV2DiscussionReconciliation {
                 sha256 = $Snapshot.Digest.Substring(10)
                 signature = 'not-applicable'
             })
+        if ([string]$Snapshot.MappingDigest -match $script:OwnerV2DigestPattern) {
+            [void]$artifacts.Add([ordered]@{
+                    kind = 'owner-v2-discussion-mapping'
+                    sha256 = ([string]$Snapshot.MappingDigest).Substring(10)
+                    signature = 'not-applicable'
+                })
+        }
+        if ([string]$Snapshot.ReviewerIdentityDigest -match $script:OwnerV2DigestPattern) {
+            [void]$artifacts.Add([ordered]@{
+                    kind = 'owner-v2-discussion-reviewer-identity'
+                    sha256 = ([string]$Snapshot.ReviewerIdentityDigest).Substring(10)
+                    signature = 'not-applicable'
+                })
+        }
+        foreach ($rawDigest in @($Snapshot.RawProvenanceDigests)) {
+            if ([string]$rawDigest -match $script:OwnerV2DigestPattern) {
+                [void]$artifacts.Add([ordered]@{
+                        kind = 'owner-v2-discussion-raw-page'
+                        sha256 = ([string]$rawDigest).Substring(10)
+                        signature = 'not-applicable'
+                    })
+            }
+        }
     }
     $Observation.sourceArtifacts = @($artifacts)
     return $Observation

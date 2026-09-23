@@ -85,6 +85,10 @@ discussions into an actionable V1-compatible create/update/no-op/unknown queue,
 but these layers remain preview-only and do not themselves register scheduling
 or authorize writes.
 
+Azure DevOps live discussion acquisition uses the full REST thread and
+iteration shapes through the repository-owned normalizer; the reduced MCP
+thread projection is not accepted for production reconciliation.
+
 **Consumers keep only a config file.** Nothing employer-, repository-, or
 person-specific lives in this repo outside `samples/` — a CI check enforces that
 (`tools/Test-NoEmployerSpecifics.ps1`).

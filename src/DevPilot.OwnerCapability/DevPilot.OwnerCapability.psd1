@@ -1,6 +1,6 @@
 @{
     RootModule = 'DevPilot.OwnerCapability.psm1'
-    ModuleVersion = '0.3.0'
+    ModuleVersion = '0.4.0'
     GUID = '6f6f6f6f-7070-8181-9292-a3a3a3a3a3a3'
     Author = 'DevPilot Agents contributors'
     CompanyName = 'Unknown'
@@ -20,7 +20,7 @@
     PrivateData = @{
         PSData = @{
             Tags = @('copilot', 'agents', 'review', 'owner', 'capability', 'powershell')
-            ReleaseNotes = 'Adds wrapper-owned v1-compatible Owner discussion reconciliation while preserving zero-write semantic execution.'
+            ReleaseNotes = 'Binds Owner reconciliation to the persisted Azure DevOps REST discussion mapping and exact reviewer identity provenance.'
         }
     }
 }

@@ -86,8 +86,10 @@ stack. Component documents link here rather than restating rollout status.
   required.
 
 After this layer is accepted, deployment must update the external live provider
-to implement the documented `GetDiscussionPage` read contract before pinning
-the new toolkit. Existing semantic results, model execution state, attempts,
+to acquire full REST thread and iteration pages and call the documented
+`ConvertTo-OwnerAzureDevOpsDiscussionPage` function before pinning the new
+toolkit. The configured reviewer GUID, descriptor, and full UPN remain external
+immutable deployment inputs. Existing semantic results, model execution state, attempts,
 identity, and telemetry remain immutable. A scheduled run with the new provider
 refreshes only the discussion reconciliation overlay and durable result digest,
 including upgrading a pre-reconciliation completed observation, without
@@ -180,6 +182,11 @@ an actionable classification, reason, expected body digest, and sanitized
 thread identity. Discussion acquisition or integrity failure changes only the
 dedupe result to `unknown`; it does not change the semantic disposition,
 lifecycle verdict, lease, retry boundary, or model-execution state.
+Live runs require the Azure DevOps REST provenance contract from
+`ConvertTo-OwnerAzureDevOpsDiscussionPage`; a provider page without the pinned
+mapping digest, exact reviewer-identity digest, current iteration, typed-page
+digest, and raw REST provenance digest is rejected. The lossy Agency MCP thread
+projection is not a supported live discussion source.
 Later runs with a live provider refresh this discussion-only overlay even when
 the semantic record is already completed. They verify the persisted observation
 against its durable digest, perform no preflight or model call, retain the same

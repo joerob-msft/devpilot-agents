@@ -169,6 +169,30 @@ namespace DevPilot.OwnerAdapters
 '@
 }
 
+if (-not ('DevPilot.OwnerAdapters.OwnerAzureDevOpsReviewerIdentity' -as [type])) {
+    Add-Type -TypeDefinition @'
+namespace DevPilot.OwnerAdapters
+{
+    public sealed class OwnerAzureDevOpsReviewerIdentity
+    {
+        public string Id { get; }
+        public string Descriptor { get; }
+        public string UniqueName { get; }
+
+        public OwnerAzureDevOpsReviewerIdentity(
+            string id,
+            string descriptor,
+            string uniqueName)
+        {
+            Id = id;
+            Descriptor = descriptor;
+            UniqueName = uniqueName;
+        }
+    }
+}
+'@
+}
+
 $script:OwnerAdapterSemantics = 'owner-acquisition-v1'
 $script:OwnerAdapterContractMaterial = (
     'owner-acquisition-v1|ordinal-paths|complete-pages|subject-race|' +
@@ -188,6 +212,84 @@ $script:OwnerProviderOperations = @(
 )
 $script:OwnerAdapterMaximumJsonNodes = 100000
 $script:OwnerDiscussionStates = @('active', 'fixed', 'closed', 'resolved', 'unknown')
+$script:OwnerAzureDevOpsDiscussionSemantics = 'owner-azuredevops-discussion-v1'
+$script:OwnerAzureDevOpsThreadStatusMap = [ordered]@{
+    '0' = 'unknown'
+    'unknown' = 'unknown'
+    '1' = 'active'
+    'active' = 'active'
+    '6' = 'active'
+    'pending' = 'active'
+    '2' = 'fixed'
+    'fixed' = 'fixed'
+    '3' = 'closed'
+    'wontfix' = 'closed'
+    'wont_fix' = 'closed'
+    '4' = 'closed'
+    'closed' = 'closed'
+    '5' = 'closed'
+    'bydesign' = 'closed'
+    'by_design' = 'closed'
+}
+$script:OwnerAzureDevOpsCommentTypeMap = [ordered]@{
+    '0' = 'reject'
+    'unknown' = 'reject'
+    '1' = 'text'
+    'text' = 'text'
+    '2' = 'system'
+    'codechange' = 'system'
+    'code_change' = 'system'
+    '3' = 'system'
+    'system' = 'system'
+}
+$script:OwnerAzureDevOpsThreadStatusDefault = 'unknown'
+$script:OwnerAzureDevOpsCommentTypeDefault = 'reject'
+$script:OwnerAzureDevOpsContextStates = @(
+    'current',
+    'outdated',
+    'ambiguous',
+    'notApplicable'
+)
+$script:OwnerAzureDevOpsReviewerIdentityFields = @(
+    'id',
+    'descriptor',
+    'uniqueName'
+)
+$script:OwnerAzureDevOpsReviewerIdentityStates = @(
+    'matched',
+    'foreign',
+    'ambiguous'
+)
+$script:OwnerAzureDevOpsPagingPrefix = 'skip:'
+$script:OwnerAzureDevOpsMaximumRestThreads = 1000
+$script:OwnerAzureDevOpsDiscussionContractMaterial = ConvertTo-Json -InputObject ([ordered]@{
+        semantics = $script:OwnerAzureDevOpsDiscussionSemantics
+        source = 'azure-devops-rest'
+        reviewerIdentity = $script:OwnerAzureDevOpsReviewerIdentityFields
+        reviewerIdentityStates = $script:OwnerAzureDevOpsReviewerIdentityStates
+        missingReviewerIdentity = 'ambiguous'
+        threadStatus = $script:OwnerAzureDevOpsThreadStatusMap
+        threadStatusDefault = $script:OwnerAzureDevOpsThreadStatusDefault
+        commentType = $script:OwnerAzureDevOpsCommentTypeMap
+        commentTypeDefault = $script:OwnerAzureDevOpsCommentTypeDefault
+        contextStates = $script:OwnerAzureDevOpsContextStates
+        anchorSource = 'threadContext.filePath+rightFileStart.line'
+        iterationRule = (
+            'positive-changeTrackingId+secondComparingIteration:' +
+            'equal-current,less-outdated,other-ambiguous'
+        )
+        pageOrdering = @('threadId', 'commentId')
+        pagingPrefix = $script:OwnerAzureDevOpsPagingPrefix
+        maximumRestThreads = $script:OwnerAzureDevOpsMaximumRestThreads
+        fullResponsePaging = 'normalizer-slice'
+        pageOffsetRule = 'pageOrdinal*pageSize'
+        typedPageDigest = 'canonical-json'
+        rawProvenanceDigest = 'canonical-full-rest-response'
+    }) -Depth 8 -Compress -EscapeHandling EscapeNonAscii
+$script:OwnerAzureDevOpsDiscussionMappingDigest = 'v1:sha256:' + [Convert]::ToHexString(
+    [Security.Cryptography.SHA256]::HashData(
+        [Text.Encoding]::UTF8.GetBytes($script:OwnerAzureDevOpsDiscussionContractMaterial))
+).ToLowerInvariant()
 $script:OwnerUnknownReasons = @(
     'binary',
     'cap-exhausted',
@@ -467,6 +569,430 @@ function New-OwnerDiscussionLimits {
         $MaximumBytes)
 }
 
+function New-OwnerAzureDevOpsReviewerIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$Descriptor,
+        [Parameter(Mandatory)][string]$UniqueName
+    )
+
+    $parsedId = [guid]::Empty
+    if (-not [guid]::TryParseExact($Id, 'D', [ref]$parsedId) -or
+        $parsedId -eq [guid]::Empty) {
+        throw 'Azure DevOps reviewer Id must be a non-empty GUID in D format.'
+    }
+    Assert-OwnerAdapterText -Value $Descriptor -Name Descriptor -MaximumLength 512
+    Assert-OwnerAdapterText -Value $UniqueName -Name UniqueName -MaximumLength 320
+    if ($UniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+        throw 'Azure DevOps reviewer UniqueName must be one exact UPN.'
+    }
+    return [DevPilot.OwnerAdapters.OwnerAzureDevOpsReviewerIdentity]::new(
+        $parsedId.ToString('D').ToLowerInvariant(),
+        $Descriptor,
+        $UniqueName.ToLowerInvariant())
+}
+
+function Get-OwnerAzureDevOpsReviewerIdentityDigest {
+    param(
+        [Parameter(Mandatory)]
+        [DevPilot.OwnerAdapters.OwnerAzureDevOpsReviewerIdentity]$ReviewerIdentity
+    )
+
+    $material = [ordered]@{}
+    foreach ($field in $script:OwnerAzureDevOpsReviewerIdentityFields) {
+        $propertyName = $field.Substring(0, 1).ToUpperInvariant() + $field.Substring(1)
+        $material[$field] = $ReviewerIdentity.$propertyName
+    }
+    return Get-OwnerAdapterDigest -Value $material
+}
+
+function Get-OwnerAzureDevOpsDiscussionMappingDigest {
+    [CmdletBinding()]
+    param()
+    return $script:OwnerAzureDevOpsDiscussionMappingDigest
+}
+
+function ConvertTo-OwnerAzureDevOpsThreadStatus {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return 'unknown'
+    }
+    $normalized = ([string]$Value).Trim().ToLowerInvariant()
+    if ($script:OwnerAzureDevOpsThreadStatusMap.Contains($normalized)) {
+        return [string]$script:OwnerAzureDevOpsThreadStatusMap[$normalized]
+    }
+    return $script:OwnerAzureDevOpsThreadStatusDefault
+}
+
+function ConvertTo-OwnerAzureDevOpsCommentType {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Comment,
+        [Parameter(Mandatory)][long]$CommentId
+    )
+
+    $raw = Get-OwnerAdapterMember -Value $Comment -Name commentType
+    if ($null -eq $raw) {
+        throw "Azure DevOps REST comment '$CommentId' omitted commentType."
+    }
+    $normalized = ([string]$raw).Trim().ToLowerInvariant()
+    if (-not $script:OwnerAzureDevOpsCommentTypeMap.Contains($normalized)) {
+        throw "Azure DevOps REST comment '$CommentId' used unsupported commentType '$raw'."
+    }
+    $mapped = [string]$script:OwnerAzureDevOpsCommentTypeMap[$normalized]
+    if ($mapped -ceq $script:OwnerAzureDevOpsCommentTypeDefault) {
+        throw "Azure DevOps REST comment '$CommentId' used unknown commentType."
+    }
+    return $mapped
+}
+
+function ConvertTo-OwnerAzureDevOpsRestNode {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTime]) {
+        return $Value.ToUniversalTime().ToString(
+            'o',
+            [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [DateTimeOffset]) {
+        return $Value.ToUniversalTime().ToString(
+            'o',
+            [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [Collections.IDictionary]) {
+        $map = [ordered]@{}
+        foreach ($key in @($Value.Keys)) {
+            $map[[string]$key] = ConvertTo-OwnerAzureDevOpsRestNode -Value $Value[$key]
+        }
+        return $map
+    }
+    if ($Value -is [Management.Automation.PSCustomObject]) {
+        $map = [ordered]@{}
+        foreach ($property in $Value.PSObject.Properties) {
+            $map[$property.Name] = ConvertTo-OwnerAzureDevOpsRestNode -Value $property.Value
+        }
+        return $map
+    }
+    if ($Value -is [Collections.IEnumerable] -and $Value -isnot [string]) {
+        return , @($Value | ForEach-Object {
+                ConvertTo-OwnerAzureDevOpsRestNode -Value $_
+            })
+    }
+    return $Value
+}
+
+function ConvertTo-OwnerAzureDevOpsRawProvenance {
+    param([Parameter(Mandatory)][object]$RawResponse)
+
+    $copy = ConvertTo-OwnerAdapterCanonicalValue -Value (
+        ConvertTo-OwnerAzureDevOpsRestNode -Value $RawResponse)
+    if ($copy -isnot [Collections.IDictionary]) {
+        throw 'Azure DevOps REST discussion response must be a dictionary.'
+    }
+    $rawThreads = @(Get-OwnerAdapterMember -Value $copy -Name value -Required)
+    $threads = [Collections.Generic.List[object]]::new()
+    foreach ($rawThread in @($rawThreads | Sort-Object {
+                [long](Get-OwnerAdapterMember -Value $_ -Name id -Required)
+            })) {
+        if ($rawThread -isnot [Collections.IDictionary]) {
+            throw 'Azure DevOps REST discussion value must contain only thread dictionaries.'
+        }
+        $thread = ConvertTo-OwnerAdapterCanonicalValue -Value $rawThread
+        $comments = @(Get-OwnerAdapterMember -Value $thread -Name comments -Required)
+        $thread['comments'] = @($comments | Sort-Object {
+                [long](Get-OwnerAdapterMember -Value $_ -Name id -Required)
+            })
+        [void]$threads.Add($thread)
+    }
+    $copy['value'] = @($threads)
+    return $copy
+}
+
+function ConvertTo-OwnerAzureDevOpsDiscussionPage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Arguments,
+        [Parameter(Mandatory)][object]$RawResponse,
+        [Parameter(Mandatory)][object]$CurrentIteration,
+        [Parameter(Mandatory)]
+        [DevPilot.OwnerAdapters.OwnerAzureDevOpsReviewerIdentity]$ReviewerIdentity
+    )
+
+    $argumentsMap = ConvertTo-OwnerAdapterCanonicalValue -Value $Arguments
+    if ($argumentsMap -isnot [Collections.IDictionary]) {
+        throw 'Azure DevOps discussion arguments must be a dictionary.'
+    }
+    $identity = [ordered]@{
+        schemaVersion = 1
+        repositoryId = [string](Get-OwnerAdapterMember -Value $argumentsMap -Name repositoryId -Required)
+        projectId = [string](Get-OwnerAdapterMember -Value $argumentsMap -Name projectId -Required)
+        pullRequestId = Get-OwnerAdapterInt64 -Value (
+            Get-OwnerAdapterMember -Value $argumentsMap -Name pullRequestId -Required
+        ) -Name pullRequestId -Minimum 1
+        sourceCommit = [string](Get-OwnerAdapterMember -Value $argumentsMap -Name sourceCommit -Required)
+        targetCommit = [string](Get-OwnerAdapterMember -Value $argumentsMap -Name targetCommit -Required)
+        targetRef = [string](Get-OwnerAdapterMember -Value $argumentsMap -Name targetRef -Required)
+    }
+    foreach ($name in @('repositoryId', 'projectId', 'targetRef')) {
+        Assert-OwnerAdapterText -Value ([string]$identity[$name]) -Name $name -MaximumLength 512
+    }
+    Assert-OwnerAdapterCommit -Value $identity.sourceCommit -Name sourceCommit
+    Assert-OwnerAdapterCommit -Value $identity.targetCommit -Name targetCommit
+    $pageOrdinal = Get-OwnerAdapterInt64 -Value (
+        Get-OwnerAdapterMember -Value $argumentsMap -Name pageOrdinal -Required
+    ) -Name pageOrdinal -Minimum 0 -Maximum 99
+    $pageSize = Get-OwnerAdapterInt64 -Value (
+        Get-OwnerAdapterMember -Value $argumentsMap -Name pageSize -Required
+    ) -Name pageSize -Minimum 1 -Maximum 200
+    $continuationValue = Get-OwnerAdapterMember -Value $argumentsMap -Name continuationToken
+    $continuationToken = if ($null -eq $continuationValue -or
+        [string]::IsNullOrEmpty([string]$continuationValue)) {
+        $null
+    }
+    else {
+        $token = [string]$continuationValue
+        Assert-OwnerAdapterText -Value $token -Name continuationToken -MaximumLength 512
+        $token
+    }
+    $pageOffset = $pageOrdinal * $pageSize
+    if (($pageOrdinal -eq 0 -and $null -ne $continuationToken) -or
+        ($pageOrdinal -gt 0 -and
+            $continuationToken -cne "$($script:OwnerAzureDevOpsPagingPrefix)$pageOffset")) {
+        throw 'Azure DevOps discussion continuation token did not match the requested page ordinal.'
+    }
+
+    $iterationMap = ConvertTo-OwnerAdapterCanonicalValue -Value (
+        ConvertTo-OwnerAzureDevOpsRestNode -Value $CurrentIteration)
+    if ($iterationMap -isnot [Collections.IDictionary]) {
+        throw 'Azure DevOps current iteration must be a dictionary.'
+    }
+    $iterationId = Get-OwnerAdapterInt64 -Value (
+        Get-OwnerAdapterMember -Value $iterationMap -Name id -Required
+    ) -Name currentIteration.id -Minimum 1 -Maximum ([int]::MaxValue)
+    $iterationSource = [string](Get-OwnerAdapterMember -Value $iterationMap -Name sourceCommit -Required)
+    $iterationTarget = [string](Get-OwnerAdapterMember -Value $iterationMap -Name targetCommit -Required)
+    Assert-OwnerAdapterCommit -Value $iterationSource -Name currentIteration.sourceCommit
+    Assert-OwnerAdapterCommit -Value $iterationTarget -Name currentIteration.targetCommit
+    if ($iterationSource -cne $identity.sourceCommit -or
+        $iterationTarget -cne $identity.targetCommit) {
+        throw 'Azure DevOps current iteration did not match the bound source and target commits.'
+    }
+
+    $rawCanonical = ConvertTo-OwnerAzureDevOpsRawProvenance -RawResponse $RawResponse
+    $rawMap = $rawCanonical
+    $rawProvenanceDigest = Get-OwnerAdapterDigest -Value $rawCanonical
+    $rawThreads = @(Get-OwnerAdapterMember -Value $rawMap -Name value -Required)
+    $declaredCount = Get-OwnerAdapterInt64 -Value (
+        Get-OwnerAdapterMember -Value $rawMap -Name count -Required
+    ) -Name discussion.count -Minimum 0 `
+        -Maximum $script:OwnerAzureDevOpsMaximumRestThreads
+    if ($declaredCount -ne $rawThreads.Count) {
+        throw 'Azure DevOps discussion response count did not match its full value array.'
+    }
+    $orderedRawThreads = @($rawThreads | Sort-Object {
+            [long](Get-OwnerAdapterMember -Value $_ -Name id -Required)
+        })
+    $pageRawThreads = @($orderedRawThreads | Select-Object -Skip $pageOffset -First $pageSize)
+    if ($pageOffset -gt $rawThreads.Count -or
+        ($pageOffset -lt $rawThreads.Count -and $pageRawThreads.Count -eq 0)) {
+        throw 'Azure DevOps discussion page ordinal was outside the full REST response.'
+    }
+    $reviewerIdentityDigest = Get-OwnerAzureDevOpsReviewerIdentityDigest `
+        -ReviewerIdentity $ReviewerIdentity
+    $seenThreads = [Collections.Generic.HashSet[long]]::new()
+    $normalizedThreads = [Collections.Generic.List[object]]::new()
+    foreach ($rawThread in $pageRawThreads) {
+        if ($rawThread -isnot [Collections.IDictionary]) {
+            $rawThread = ConvertTo-OwnerAdapterCanonicalValue -Value $rawThread
+        }
+        $threadId = Get-OwnerAdapterInt64 -Value (
+            Get-OwnerAdapterMember -Value $rawThread -Name id -Required
+        ) -Name thread.id -Minimum 1 -Maximum ([int]::MaxValue)
+        if (-not $seenThreads.Add($threadId)) {
+            throw "Azure DevOps discussion page repeated thread '$threadId'."
+        }
+        $threadDeletedValue = Get-OwnerAdapterMember -Value $rawThread -Name isDeleted
+        $threadDeleted = if ($null -eq $threadDeletedValue) {
+            $false
+        }
+        else {
+            Get-OwnerAdapterBoolean -Value $threadDeletedValue -Name thread.isDeleted
+        }
+        $status = ConvertTo-OwnerAzureDevOpsThreadStatus -Value (
+            Get-OwnerAdapterMember -Value $rawThread -Name status
+        )
+        $threadContext = Get-OwnerAdapterMember -Value $rawThread -Name threadContext
+        $anchor = $null
+        $hasFileContext = $false
+        if ($null -ne $threadContext) {
+            if ($threadContext -isnot [Collections.IDictionary]) {
+                throw "Azure DevOps thread '$threadId' threadContext must be a dictionary."
+            }
+            $filePath = [string](Get-OwnerAdapterMember -Value $threadContext -Name filePath)
+            $hasFileContext = -not [string]::IsNullOrWhiteSpace($filePath)
+            $rightStart = Get-OwnerAdapterMember -Value $threadContext -Name rightFileStart
+            if ($hasFileContext -and
+                $rightStart -is [Collections.IDictionary]) {
+                $lineValue = Get-OwnerAdapterMember -Value $rightStart -Name line
+                if ($null -ne $lineValue) {
+                    $line = Get-OwnerAdapterInt64 -Value $lineValue -Name anchor.line `
+                        -Minimum 1 -Maximum ([int]::MaxValue)
+                    $anchor = [ordered]@{
+                        path = ConvertTo-OwnerSafePath -Path $filePath.TrimStart('/') -Name anchor.path
+                        line = $line
+                    }
+                }
+            }
+        }
+
+        $contextState = if ($hasFileContext) { 'ambiguous' } else { 'notApplicable' }
+        $threadSourceCommit = $null
+        $isOutdated = $false
+        if ($null -ne $anchor) {
+            $contextState = 'ambiguous'
+            $pullRequestContext = Get-OwnerAdapterMember -Value $rawThread -Name pullRequestThreadContext
+            if ($pullRequestContext -is [Collections.IDictionary]) {
+                $iterationContext = Get-OwnerAdapterMember -Value $pullRequestContext -Name iterationContext
+                $trackingValue = Get-OwnerAdapterMember -Value $pullRequestContext -Name changeTrackingId
+                if ($iterationContext -is [Collections.IDictionary] -and
+                    $null -ne $trackingValue) {
+                    $secondValue = Get-OwnerAdapterMember -Value $iterationContext `
+                        -Name secondComparingIteration
+                    try {
+                        $trackingId = Get-OwnerAdapterInt64 -Value $trackingValue `
+                            -Name changeTrackingId -Minimum 1 -Maximum ([int]::MaxValue)
+                        $secondIteration = Get-OwnerAdapterInt64 -Value $secondValue `
+                            -Name secondComparingIteration -Minimum 1 -Maximum ([int]::MaxValue)
+                        [void]$trackingId
+                        if ($secondIteration -eq $iterationId) {
+                            $contextState = 'current'
+                            $threadSourceCommit = $identity.sourceCommit
+                        }
+                        elseif ($secondIteration -lt $iterationId) {
+                            $contextState = 'outdated'
+                            $isOutdated = $true
+                        }
+                    }
+                    catch {
+                        $contextState = 'ambiguous'
+                    }
+                }
+            }
+        }
+
+        $seenComments = [Collections.Generic.HashSet[long]]::new()
+        $comments = [Collections.Generic.List[object]]::new()
+        foreach ($rawComment in @(
+                @(Get-OwnerAdapterMember -Value $rawThread -Name comments -Required) |
+                    Sort-Object {
+                        [long](Get-OwnerAdapterMember -Value $_ -Name id -Required)
+                    }
+            )) {
+            if ($rawComment -isnot [Collections.IDictionary]) {
+                $rawComment = ConvertTo-OwnerAdapterCanonicalValue -Value $rawComment
+            }
+            $commentId = Get-OwnerAdapterInt64 -Value (
+                Get-OwnerAdapterMember -Value $rawComment -Name id -Required
+            ) -Name comment.id -Minimum 1 -Maximum ([int]::MaxValue)
+            if (-not $seenComments.Add($commentId)) {
+                throw "Azure DevOps thread '$threadId' repeated comment '$commentId'."
+            }
+            $commentType = ConvertTo-OwnerAzureDevOpsCommentType `
+                -Comment $rawComment -CommentId $commentId
+            $deletedValue = Get-OwnerAdapterMember -Value $rawComment -Name isDeleted
+            $commentDeleted = if ($null -eq $deletedValue) {
+                $false
+            }
+            else {
+                Get-OwnerAdapterBoolean -Value $deletedValue -Name comment.isDeleted
+            }
+            $contentValue = Get-OwnerAdapterMember -Value $rawComment -Name content
+            if ($null -eq $contentValue -and -not $commentDeleted) {
+                throw "Azure DevOps non-deleted comment '$commentId' omitted content."
+            }
+            $body = if ($null -eq $contentValue) { '' } else { [string]$contentValue }
+            if ($body.Length -gt 65536 -or $body -match '\x00') {
+                throw "Azure DevOps comment '$commentId' body is unsafe or unbounded."
+            }
+            $author = Get-OwnerAdapterMember -Value $rawComment -Name author
+            $reviewerOwned = $false
+            $reviewerIdentityState = 'ambiguous'
+            if ($author -is [Collections.IDictionary]) {
+                $authorId = [string](Get-OwnerAdapterMember -Value $author -Name id)
+                $authorDescriptor = [string](Get-OwnerAdapterMember -Value $author -Name descriptor)
+                $authorUniqueName = [string](Get-OwnerAdapterMember -Value $author -Name uniqueName)
+                if (-not [string]::IsNullOrWhiteSpace($authorId) -and
+                    -not [string]::IsNullOrWhiteSpace($authorDescriptor) -and
+                    -not [string]::IsNullOrWhiteSpace($authorUniqueName)) {
+                    $reviewerOwned = (
+                        $authorId -ieq $ReviewerIdentity.Id -and
+                        $authorDescriptor -ceq $ReviewerIdentity.Descriptor -and
+                        $authorUniqueName -ieq $ReviewerIdentity.UniqueName
+                    )
+                    $reviewerIdentityState = if ($reviewerOwned) {
+                        'matched'
+                    }
+                    else {
+                        'foreign'
+                    }
+                }
+            }
+            [void]$comments.Add([ordered]@{
+                    commentId = $commentId
+                    commentType = $commentType
+                    isDeleted = $commentDeleted
+                    reviewerOwned = $reviewerOwned
+                    reviewerIdentityState = $reviewerIdentityState
+                    body = $body
+                    bodyDigest = Get-OwnerAdapterDigest -Value $body
+                })
+        }
+        [void]$normalizedThreads.Add([ordered]@{
+                threadId = $threadId
+                status = $status
+                isDeleted = $threadDeleted
+                isOutdated = $isOutdated
+                sourceCommit = $threadSourceCommit
+                contextState = $contextState
+                anchor = $anchor
+                comments = @($comments)
+            })
+    }
+
+    $nextOffset = $pageOffset + $pageRawThreads.Count
+    $nextToken = if ($nextOffset -lt $rawThreads.Count) {
+        "$($script:OwnerAzureDevOpsPagingPrefix)$nextOffset"
+    }
+    else {
+        $null
+    }
+    $typedMaterial = [ordered]@{
+        semantics = $script:OwnerAzureDevOpsDiscussionSemantics
+        mappingDigest = $script:OwnerAzureDevOpsDiscussionMappingDigest
+        reviewerIdentityDigest = $reviewerIdentityDigest
+        identity = $identity
+        pageOrdinal = $pageOrdinal
+        continuationToken = $continuationToken
+        nextToken = $nextToken
+        currentIterationId = $iterationId
+        threads = @($normalizedThreads)
+    }
+    $sourceDigest = Get-OwnerAdapterDigest -Value $typedMaterial
+    return [ordered]@{} + $identity + [ordered]@{
+        pageOrdinal = $pageOrdinal
+        state = 'complete'
+        sourceDigest = $sourceDigest
+        rawProvenanceDigest = $rawProvenanceDigest
+        mappingDigest = $script:OwnerAzureDevOpsDiscussionMappingDigest
+        reviewerIdentityDigest = $reviewerIdentityDigest
+        currentIterationId = $iterationId
+        nextToken = $nextToken
+        threads = @($normalizedThreads)
+    }
+}
+
 function New-OwnerAcquisitionContract {
     [CmdletBinding()]
     param(
@@ -603,6 +1129,25 @@ function New-OwnerReadOnlyProviderAdapter {
     return $provider
 }
 
+function New-OwnerAzureDevOpsReadOnlyProviderAdapter {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]
+        [DevPilot.OwnerAdapters.OwnerAzureDevOpsReviewerIdentity]$ReviewerIdentity,
+        [Parameter(Mandatory)][scriptblock]$Handler
+    )
+
+    $provider = New-OwnerReadOnlyProviderAdapter -Name $Name -Handler $Handler
+    $provider | Add-Member -NotePropertyName AzureDevOpsDiscussionMappingDigest `
+        -NotePropertyValue $script:OwnerAzureDevOpsDiscussionMappingDigest
+    $provider | Add-Member -NotePropertyName AzureDevOpsReviewerIdentityDigest `
+        -NotePropertyValue (
+            Get-OwnerAzureDevOpsReviewerIdentityDigest -ReviewerIdentity $ReviewerIdentity
+        )
+    return $provider
+}
+
 function Test-OwnerAcquisitionContract {
     param([Parameter(Mandatory)][object]$Contract)
 
@@ -715,6 +1260,7 @@ function ConvertTo-OwnerDiscussionThread {
         Assert-OwnerAdapterCommit -Value $value -Name sourceCommit
         $value
     }
+    $contextStateValue = Get-OwnerAdapterMember -Value $Thread -Name contextState
 
     $anchorValue = Get-OwnerAdapterMember -Value $Thread -Name anchor
     $anchor = $null
@@ -730,6 +1276,35 @@ function ConvertTo-OwnerDiscussionThread {
                 Get-OwnerAdapterMember -Value $anchorValue -Name line -Required
             ) -Name anchor.line -Minimum 1 -Maximum ([int]::MaxValue)
         }
+    }
+    $contextState = if ($null -eq $contextStateValue -or
+        [string]::IsNullOrWhiteSpace([string]$contextStateValue)) {
+        if ($isOutdated) { 'outdated' }
+        elseif ($null -ne $sourceCommit) { 'current' }
+        elseif ($null -ne $anchor) { 'ambiguous' }
+        else { 'notApplicable' }
+    }
+    else {
+        [string]$contextStateValue
+    }
+    if ($contextState -cnotin $script:OwnerAzureDevOpsContextStates) {
+        throw "Discussion thread '$threadId' has unsupported contextState '$contextState'."
+    }
+    if (($contextState -ceq 'current' -and (
+                $null -eq $anchor -or $null -eq $sourceCommit -or $isOutdated
+            )) -or
+        ($contextState -ceq 'outdated' -and (
+                $null -eq $anchor -or $null -ne $sourceCommit -or -not $isOutdated
+            )) -or
+        ($contextState -ceq 'ambiguous' -and (
+                $null -ne $sourceCommit -or $isOutdated
+            )) -or
+        ($contextState -ceq 'notApplicable' -and (
+                $null -ne $anchor -or $null -ne $sourceCommit -or $isOutdated
+            ))) {
+        $contextState = 'ambiguous'
+        $sourceCommit = $null
+        $isOutdated = $false
     }
 
     $comments = [Collections.Generic.List[object]]::new()
@@ -754,6 +1329,20 @@ function ConvertTo-OwnerDiscussionThread {
         $reviewerOwned = Get-OwnerAdapterBoolean -Value (
             Get-OwnerAdapterMember -Value $comment -Name reviewerOwned -Required
         ) -Name comment.reviewerOwned
+        $identityStateValue = Get-OwnerAdapterMember -Value $comment `
+            -Name reviewerIdentityState
+        $reviewerIdentityState = if ($null -eq $identityStateValue -or
+            [string]::IsNullOrWhiteSpace([string]$identityStateValue)) {
+            if ($reviewerOwned) { 'matched' } else { 'foreign' }
+        }
+        else {
+            [string]$identityStateValue
+        }
+        if ($reviewerIdentityState -cnotin $script:OwnerAzureDevOpsReviewerIdentityStates -or
+            ($reviewerOwned -and $reviewerIdentityState -cne 'matched') -or
+            (-not $reviewerOwned -and $reviewerIdentityState -ceq 'matched')) {
+            throw "Discussion comment '$commentId' reviewer identity state is inconsistent."
+        }
         $commentType = [string](Get-OwnerAdapterMember -Value $comment -Name commentType -Required)
         if ($commentType -cnotin @('text', 'system')) {
             throw "Discussion comment '$commentId' has unsupported type '$commentType'."
@@ -778,6 +1367,7 @@ function ConvertTo-OwnerDiscussionThread {
                 commentType = $commentType
                 isDeleted = $commentDeleted
                 reviewerOwned = $reviewerOwned
+                reviewerIdentityState = $reviewerIdentityState
                 body = $body
                 bodyDigest = $actualBodyDigest
             })
@@ -789,6 +1379,7 @@ function ConvertTo-OwnerDiscussionThread {
         isDeleted = $isDeleted
         isOutdated = $isOutdated
         sourceCommit = $sourceCommit
+        contextState = $contextState
         anchor = $anchor
         comments = @($comments | Sort-Object { [long]$_.commentId })
     }
@@ -799,11 +1390,35 @@ function Get-OwnerDiscussionSnapshot {
     param(
         [Parameter(Mandatory)][object]$Contract,
         [Parameter(Mandatory)][object]$Provider,
-        [DevPilot.OwnerAdapters.OwnerDiscussionLimits]$Limits = (New-OwnerDiscussionLimits)
+        [DevPilot.OwnerAdapters.OwnerDiscussionLimits]$Limits = (New-OwnerDiscussionLimits),
+        [switch]$RequireAzureDevOpsProvenance
     )
 
     Test-OwnerAcquisitionContract -Contract $Contract
     Test-OwnerProviderAdapter -Provider $Provider
+    $expectedAzureMappingDigest = $null
+    $expectedAzureReviewerDigest = $null
+    if ($RequireAzureDevOpsProvenance) {
+        $mappingProperty = $Provider.PSObject.Properties[
+            'AzureDevOpsDiscussionMappingDigest'
+        ]
+        $reviewerProperty = $Provider.PSObject.Properties[
+            'AzureDevOpsReviewerIdentityDigest'
+        ]
+        if ($null -eq $mappingProperty -or $null -eq $reviewerProperty) {
+            throw 'Azure DevOps discussion acquisition requires a reviewer-bound provider adapter.'
+        }
+        $expectedAzureMappingDigest = [string]$mappingProperty.Value
+        $expectedAzureReviewerDigest = [string]$reviewerProperty.Value
+        Assert-OwnerAdapterDigest -Value $expectedAzureMappingDigest `
+            -Name AzureDevOpsDiscussionMappingDigest
+        Assert-OwnerAdapterDigest -Value $expectedAzureReviewerDigest `
+            -Name AzureDevOpsReviewerIdentityDigest
+        if ($expectedAzureMappingDigest -cne
+            $script:OwnerAzureDevOpsDiscussionMappingDigest) {
+            throw 'Azure DevOps provider adapter used an unsupported discussion mapping.'
+        }
+    }
     if ($Limits.MaximumPages -lt 1 -or $Limits.MaximumPages -gt 100 -or
         $Limits.PageSize -lt 1 -or $Limits.PageSize -gt 200 -or
         $Limits.MaximumThreads -lt 1 -or $Limits.MaximumThreads -gt 2000 -or
@@ -829,12 +1444,18 @@ function Get-OwnerDiscussionSnapshot {
     $threads = [Collections.Generic.List[object]]::new()
     $seenThreads = [Collections.Generic.HashSet[long]]::new()
     $sourceDigests = [Collections.Generic.List[string]]::new()
+    $rawProvenanceDigests = [Collections.Generic.List[string]]::new()
+    $mappingDigest = $null
+    $reviewerIdentityDigest = $null
+    $currentIterationId = $null
+    $expectedRawProvenanceDigest = $null
     $commentCount = 0
     $byteCount = 0L
     do {
         if ($pageOrdinal -ge $Limits.MaximumPages) {
             throw 'Discussion pagination exceeded the configured page cap.'
         }
+        $requestedToken = $token
         $arguments = [ordered]@{}
         foreach ($entry in $baseArguments.GetEnumerator()) { $arguments[$entry.Key] = $entry.Value }
         $arguments['pageOrdinal'] = $pageOrdinal
@@ -860,10 +1481,59 @@ function Get-OwnerDiscussionSnapshot {
         $sourceDigest = [string](Get-OwnerAdapterMember -Value $page -Name sourceDigest -Required)
         Assert-OwnerAdapterDigest -Value $sourceDigest -Name discussion.sourceDigest
         [void]$sourceDigests.Add($sourceDigest)
+        $pageRawDigest = Get-OwnerAdapterMember -Value $page -Name rawProvenanceDigest
+        $pageMappingDigest = Get-OwnerAdapterMember -Value $page -Name mappingDigest
+        $pageReviewerDigest = Get-OwnerAdapterMember -Value $page -Name reviewerIdentityDigest
+        $pageIterationId = Get-OwnerAdapterMember -Value $page -Name currentIterationId
+        $hasAzureProvenance = $null -ne $pageRawDigest -or
+            $null -ne $pageMappingDigest -or
+            $null -ne $pageReviewerDigest -or
+            $null -ne $pageIterationId
+        if ($RequireAzureDevOpsProvenance -or $hasAzureProvenance) {
+            if ($null -eq $pageRawDigest -or $null -eq $pageMappingDigest -or
+                $null -eq $pageReviewerDigest -or $null -eq $pageIterationId) {
+                throw 'Azure DevOps discussion page omitted required provenance fields.'
+            }
+            $pageRawDigest = [string]$pageRawDigest
+            $pageMappingDigest = [string]$pageMappingDigest
+            $pageReviewerDigest = [string]$pageReviewerDigest
+            Assert-OwnerAdapterDigest -Value $pageRawDigest -Name discussion.rawProvenanceDigest
+            Assert-OwnerAdapterDigest -Value $pageMappingDigest -Name discussion.mappingDigest
+            Assert-OwnerAdapterDigest -Value $pageReviewerDigest -Name discussion.reviewerIdentityDigest
+            if ($pageMappingDigest -cne $script:OwnerAzureDevOpsDiscussionMappingDigest) {
+                throw 'Azure DevOps discussion page used an unsupported mapping contract.'
+            }
+            if ($RequireAzureDevOpsProvenance -and (
+                    $pageMappingDigest -cne $expectedAzureMappingDigest -or
+                    $pageReviewerDigest -cne $expectedAzureReviewerDigest
+                )) {
+                throw 'Azure DevOps discussion page did not match the provider reviewer binding.'
+            }
+            $pageIterationId = Get-OwnerAdapterInt64 -Value $pageIterationId `
+                -Name discussion.currentIterationId -Minimum 1 -Maximum ([int]::MaxValue)
+            if ($null -eq $mappingDigest) {
+                $mappingDigest = $pageMappingDigest
+                $reviewerIdentityDigest = $pageReviewerDigest
+                $currentIterationId = $pageIterationId
+            }
+            elseif ($mappingDigest -cne $pageMappingDigest -or
+                $reviewerIdentityDigest -cne $pageReviewerDigest -or
+                [long]$currentIterationId -ne [long]$pageIterationId) {
+                throw 'Azure DevOps discussion pages disagreed on mapping, reviewer, or iteration provenance.'
+            }
+            if ($null -eq $expectedRawProvenanceDigest) {
+                $expectedRawProvenanceDigest = $pageRawDigest
+                [void]$rawProvenanceDigests.Add($pageRawDigest)
+            }
+            elseif ($expectedRawProvenanceDigest -cne $pageRawDigest) {
+                throw 'Azure DevOps discussion pages came from different full REST responses.'
+            }
+        }
         $pageThreads = @(Get-OwnerAdapterMember -Value $page -Name threads -Required)
         if ($pageThreads.Count -gt $Limits.PageSize) {
             throw 'Discussion provider returned more threads than the requested page size.'
         }
+        $pageNormalizedThreads = [Collections.Generic.List[object]]::new()
         foreach ($thread in $pageThreads) {
             if ($thread -isnot [Collections.IDictionary]) {
                 throw 'Discussion pages must contain only thread dictionaries.'
@@ -873,13 +1543,18 @@ function Get-OwnerDiscussionSnapshot {
             if (-not $seenThreads.Add([long]$normalized.threadId)) {
                 throw "Discussion pagination repeated thread '$($normalized.threadId)'."
             }
+            if ([string]$normalized.contextState -ceq 'current' -and
+                [string]$normalized.sourceCommit -cne $request.SourceCommit) {
+                throw "Current discussion thread '$($normalized.threadId)' did not bind the current source commit."
+            }
+            [void]$pageNormalizedThreads.Add($normalized)
             [void]$threads.Add($normalized)
             if ($threads.Count -gt $Limits.MaximumThreads) {
                 throw 'Discussion acquisition exceeded the configured thread cap.'
             }
         }
         $nextTokenValue = Get-OwnerAdapterMember -Value $page -Name nextToken
-        $token = if ($null -eq $nextTokenValue -or
+        $nextToken = if ($null -eq $nextTokenValue -or
             [string]::IsNullOrEmpty([string]$nextTokenValue)) {
             $null
         }
@@ -894,6 +1569,27 @@ function Get-OwnerDiscussionSnapshot {
             }
             $next
         }
+        if ($RequireAzureDevOpsProvenance -or $hasAzureProvenance) {
+            $pageIdentity = [ordered]@{ schemaVersion = 1 }
+            foreach ($entry in $baseArguments.GetEnumerator()) {
+                $pageIdentity[$entry.Key] = $entry.Value
+            }
+            $expectedSourceDigest = Get-OwnerAdapterDigest -Value ([ordered]@{
+                    semantics = $script:OwnerAzureDevOpsDiscussionSemantics
+                    mappingDigest = $pageMappingDigest
+                    reviewerIdentityDigest = $pageReviewerDigest
+                    identity = $pageIdentity
+                    pageOrdinal = $pageOrdinal
+                    continuationToken = $requestedToken
+                    nextToken = $nextToken
+                    currentIterationId = $pageIterationId
+                    threads = @($pageNormalizedThreads)
+                })
+            if ($sourceDigest -cne $expectedSourceDigest) {
+                throw 'Azure DevOps discussion page source digest did not match its typed content.'
+            }
+        }
+        $token = $nextToken
         $pageOrdinal++
     } while ($null -ne $token)
 
@@ -909,10 +1605,24 @@ function Get-OwnerDiscussionSnapshot {
             maximumBytes = $Limits.MaximumBytes
         }
         sourceDigests = @($sourceDigests)
+        rawProvenanceDigests = @($rawProvenanceDigests)
+        mappingDigest = $(if ($null -eq $mappingDigest) { 'unknown' } else { $mappingDigest })
+        reviewerIdentityDigest = $(if ($null -eq $reviewerIdentityDigest) {
+                'unknown'
+            }
+            else {
+                $reviewerIdentityDigest
+            })
+        currentIterationId = $(if ($null -eq $currentIterationId) {
+                'unknown'
+            }
+            else {
+                $currentIterationId
+            })
         threads = $orderedThreads
     }
     $digest = Get-OwnerAdapterDigest -Value $digestMaterial
-    return [DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]::new(
+    $snapshot = [DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]::new(
         'complete',
         'complete',
         $pageOrdinal,
@@ -922,6 +1632,25 @@ function Get-OwnerDiscussionSnapshot {
         $digest,
         [string[]]@($sourceDigests),
         [object[]]$orderedThreads)
+    $snapshot | Add-Member -NotePropertyName RawProvenanceDigests `
+        -NotePropertyValue ([string[]]@($rawProvenanceDigests))
+    $snapshot | Add-Member -NotePropertyName MappingDigest `
+        -NotePropertyValue $(if ($null -eq $mappingDigest) { 'unknown' } else { $mappingDigest })
+    $snapshot | Add-Member -NotePropertyName ReviewerIdentityDigest `
+        -NotePropertyValue $(if ($null -eq $reviewerIdentityDigest) {
+            'unknown'
+        }
+        else {
+            $reviewerIdentityDigest
+        })
+    $snapshot | Add-Member -NotePropertyName CurrentIterationId `
+        -NotePropertyValue $(if ($null -eq $currentIterationId) {
+            'unknown'
+        }
+        else {
+            $currentIterationId
+        })
+    return $snapshot
 }
 
 function New-OwnerSyntheticFileResponse {
@@ -1646,8 +2375,12 @@ function New-OwnerReplayAcquisitionAdapter {
 }
 
 Export-ModuleMember -Function @(
+    'ConvertTo-OwnerAzureDevOpsDiscussionPage',
+    'Get-OwnerAzureDevOpsDiscussionMappingDigest',
     'New-OwnerAcquisitionContract',
     'New-OwnerAdapterLimits',
+    'New-OwnerAzureDevOpsReadOnlyProviderAdapter',
+    'New-OwnerAzureDevOpsReviewerIdentity',
     'New-OwnerDiscussionLimits',
     'New-OwnerReadOnlyProviderAdapter',
     'New-OwnerProductionAcquisitionAdapter',

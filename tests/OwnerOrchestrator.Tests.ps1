@@ -126,17 +126,25 @@ BeforeAll {
         else { 'deterministic-fake-process' }
         $manifest.entries[0].model.digest = Get-TestDigest $manifest.entries[0].model.id
         $manifestPath = Write-TestJson -Path (Join-Path $TestDrive $Name) -Value $manifest
-        $discussionDigest = Get-TestDigest 'empty-discussion-page'
+        $reviewerIdentity = New-OwnerAzureDevOpsReviewerIdentity `
+            -Id '11111111-2222-3333-4444-555555555555' `
+            -Descriptor 'aad.orchestrator-fixture' `
+            -UniqueName 'reviewer@example.com'
         $acquisition = & $script:OrchestratorModule {
-            param($Package, $DiscussionDigest, $FailDiscussion)
+            param(
+                $Package,
+                $ReviewerIdentity,
+                $FailDiscussion
+            )
             $state = @{
                 SubjectReads = 0
                 FailDiscussion = [bool]$FailDiscussion
                 Operations = [Collections.Generic.List[string]]::new()
             }
             $captured = $Package
-            $capturedDiscussionDigest = $DiscussionDigest
-            $provider = New-OwnerReadOnlyProviderAdapter -Name 'orchestrator-live-fixture' -Handler {
+            $provider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+                -Name 'orchestrator-live-fixture' `
+                -ReviewerIdentity $ReviewerIdentity -Handler {
                 param($Operation, $Arguments)
                 [void]$state.Operations.Add([string]$Operation)
                 switch ($Operation) {
@@ -150,25 +158,24 @@ BeforeAll {
                     'GetFile' { return @($captured.files | Where-Object path -CEQ $Arguments.path)[0] }
                     'GetDiscussionPage' {
                         if ($state.FailDiscussion) { throw 'sensitive discussion provider detail' }
-                        return [ordered]@{
-                            schemaVersion = 1
-                            repositoryId = $Arguments.repositoryId
-                            projectId = $Arguments.projectId
-                            pullRequestId = $Arguments.pullRequestId
-                            sourceCommit = $Arguments.sourceCommit
-                            targetCommit = $Arguments.targetCommit
-                            targetRef = $Arguments.targetRef
-                            pageOrdinal = [int]$Arguments.pageOrdinal
-                            state = 'complete'
-                            sourceDigest = $capturedDiscussionDigest
-                            nextToken = $null
-                            threads = @()
-                        }
+                        return ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                            -Arguments $Arguments `
+                            -RawResponse ([ordered]@{
+                                count = 0
+                                continuation_token = $null
+                                value = @()
+                            }) `
+                            -CurrentIteration ([ordered]@{
+                                id = 1
+                                sourceCommit = [string]$Arguments.sourceCommit
+                                targetCommit = [string]$Arguments.targetCommit
+                            }) `
+                            -ReviewerIdentity $ReviewerIdentity
                     }
                 }
             }.GetNewClosure()
             return [pscustomobject]@{ Provider = $provider; State = $state }
-        } $package $discussionDigest ([bool]$DiscussionFailure)
+        } $package $reviewerIdentity ([bool]$DiscussionFailure)
         $provider = if ($CopilotProvider) {
             & $script:OrchestratorModule {
                 param($Pwsh)
@@ -511,6 +518,12 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $observation.findings[0].reconciliation.classification | Should -Be 'wouldCreate'
         $observation.effects.dedupe.wouldCreate | Should -Be $observation.counts.violations
         $observation.effects.dedupe.unknown | Should -Be 0
+        @($observation.sourceArtifacts.kind) | Should -Contain 'owner-v2-discussion-snapshot'
+        @($observation.sourceArtifacts.kind) | Should -Contain 'owner-v2-discussion-mapping'
+        @($observation.sourceArtifacts.kind) | Should -Contain (
+            'owner-v2-discussion-reviewer-identity'
+        )
+        @($observation.sourceArtifacts.kind) | Should -Contain 'owner-v2-discussion-raw-page'
         $observation.effects.providerWrites | Should -Be 0
         $observation.effects.writeToolInvocations | Should -Be 0
     }

@@ -306,6 +306,127 @@ BeforeAll {
                 -ExpectedPayloadDigest $fixture.PayloadDigest) `
             -CapabilityAdapter (New-TestOwnerCapabilityAdapter)
     }
+
+    function New-TestAdoReviewerIdentity {
+        return New-OwnerAzureDevOpsReviewerIdentity `
+            -Id '11111111-2222-3333-4444-555555555555' `
+            -Descriptor 'aad.test-reviewer-descriptor' `
+            -UniqueName 'reviewer@example.com'
+    }
+
+    function New-TestAdoDiscussionArguments {
+        return [pscustomobject][ordered]@{
+            repositoryId = 'repository-example'
+            projectId = 'project-example'
+            pullRequestId = 42
+            sourceCommit = ('a' * 40)
+            targetCommit = ('b' * 40)
+            targetRef = 'refs/heads/main'
+            pageOrdinal = 0
+            pageSize = 100
+            continuationToken = $null
+        }
+    }
+
+    function New-TestAdoAuthor {
+        param(
+            [string]$Id = '11111111-2222-3333-4444-555555555555',
+            [string]$Descriptor = 'aad.test-reviewer-descriptor',
+            [string]$UniqueName = 'reviewer@example.com'
+        )
+        return [ordered]@{
+            id = $Id
+            descriptor = $Descriptor
+            uniqueName = $UniqueName
+            displayName = 'Private display name not transported'
+        }
+    }
+
+    function New-TestAdoComment {
+        param(
+            [int]$Id,
+            [AllowNull()][object]$CommentType = 'text',
+            [AllowNull()][string]$Content = "comment-$Id",
+            [AllowNull()][object]$IsDeleted = $null,
+            [object]$Author = (New-TestAdoAuthor)
+        )
+        $comment = [ordered]@{
+            id = $Id
+            parentCommentId = 0
+            author = $Author
+            content = $Content
+            commentType = $CommentType
+            publishedDate = '2026-01-01T00:00:00.0000000Z'
+            lastUpdatedDate = '2026-01-01T00:00:01.0000000Z'
+            usersLiked = @()
+        }
+        if ($null -ne $IsDeleted) { $comment['isDeleted'] = $IsDeleted }
+        return $comment
+    }
+
+    function New-TestAdoThread {
+        param(
+            [int]$Id,
+            [AllowNull()][string]$Status = 'active',
+            [AllowNull()][string]$Path = '/src/WidgetTests.cs',
+            [int]$Line = 7,
+            [AllowNull()][object]$SecondIteration = 2,
+            [AllowEmptyCollection()][object[]]$Comments = @(
+                (New-TestAdoComment -Id 1)
+            )
+        )
+        $thread = [ordered]@{
+            id = $Id
+            status = $Status
+            isDeleted = $false
+            publishedDate = '2026-01-01T00:00:00.0000000Z'
+            lastUpdatedDate = '2026-01-01T00:00:01.0000000Z'
+            comments = @($Comments)
+            properties = [ordered]@{}
+        }
+        if ($null -ne $Path) {
+            $thread['threadContext'] = [ordered]@{
+                filePath = $Path
+                rightFileStart = [ordered]@{ line = $Line; offset = 1 }
+                rightFileEnd = [ordered]@{ line = $Line; offset = 2 }
+            }
+            if ($null -ne $SecondIteration) {
+                $thread['pullRequestThreadContext'] = [ordered]@{
+                    changeTrackingId = $Id
+                    iterationContext = [ordered]@{
+                        firstComparingIteration = 1
+                        secondComparingIteration = $SecondIteration
+                    }
+                }
+            }
+        }
+        return $thread
+    }
+
+    function New-TestAdoDiscussionResponse {
+        $foreignAuthor = New-TestAdoAuthor `
+            -Id 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' `
+            -Descriptor 'aad.other-reviewer-descriptor' `
+            -UniqueName 'reviewer@other.example'
+        return [ordered]@{
+            count = 4
+            continuation_token = $null
+            value = @(
+                New-TestAdoThread -Id 4 -Status $null -Path $null -Comments @(
+                    New-TestAdoComment -Id 1 -CommentType system -Author $foreignAuthor
+                )
+                New-TestAdoThread -Id 2 -SecondIteration 1 -Comments @(
+                    New-TestAdoComment -Id 2 -CommentType 2 -Author $foreignAuthor
+                    New-TestAdoComment -Id 1 -CommentType text
+                )
+                New-TestAdoThread -Id 3 -SecondIteration $null
+                New-TestAdoThread -Id 1 -Comments @(
+                    New-TestAdoComment -Id 2 -CommentType 3 -Author $foreignAuthor
+                    New-TestAdoComment -Id 1 -CommentType 1
+                )
+            )
+        }
+    }
 }
 
 Describe 'Owner acquisition contracts' {
@@ -874,7 +995,371 @@ Describe 'Owner production and replay acquisition' {
     }
 }
 
+Describe 'Azure DevOps REST discussion normalization' {
+    It 'maps official enums, exact reviewer identity, iteration context, and stable provenance' {
+        $arguments = New-TestAdoDiscussionArguments
+        $response = New-TestAdoDiscussionResponse
+        $iteration = [ordered]@{
+            id = 2
+            sourceCommit = ('a' * 40)
+            targetCommit = ('b' * 40)
+        }
+        $reviewer = New-TestAdoReviewerIdentity
+
+        $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse $response `
+            -CurrentIteration $iteration -ReviewerIdentity $reviewer
+
+        @($page.threads.threadId) | Should -Be @(1, 2, 3, 4)
+        @($page.threads[0].comments.commentId) | Should -Be @(1, 2)
+        @($page.threads[0].comments.commentType) | Should -Be @('text', 'system')
+        @($page.threads[0].comments.reviewerOwned) | Should -Be @($true, $false)
+        $page.threads[0].contextState | Should -Be 'current'
+        $page.threads[0].sourceCommit | Should -Be ('a' * 40)
+        $page.threads[0].isOutdated | Should -BeFalse
+        $page.threads[1].contextState | Should -Be 'outdated'
+        $page.threads[1].sourceCommit | Should -BeNullOrEmpty
+        $page.threads[1].isOutdated | Should -BeTrue
+        $page.threads[2].contextState | Should -Be 'ambiguous'
+        $page.threads[2].sourceCommit | Should -BeNullOrEmpty
+        $page.threads[2].isOutdated | Should -BeFalse
+        $page.threads[3].contextState | Should -Be 'notApplicable'
+        $page.threads[3].anchor | Should -BeNullOrEmpty
+        $page.threads[3].status | Should -Be 'unknown'
+        $page.mappingDigest | Should -Be (
+            'v1:sha256:6d876e001cfd64dabb2e905287041caf0ee77a7ec713f767cf76ad2ef4c94d2d'
+        )
+        Get-OwnerAzureDevOpsDiscussionMappingDigest | Should -Be $page.mappingDigest
+        $page.sourceDigest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $page.rawProvenanceDigest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $page.reviewerIdentityDigest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
+
+        [array]::Reverse($response.value)
+        [array]::Reverse($response.value[2].comments)
+        $reordered = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse $response `
+            -CurrentIteration $iteration -ReviewerIdentity $reviewer
+        $reordered.sourceDigest | Should -Be $page.sourceDigest
+        $reordered.rawProvenanceDigest | Should -Be $page.rawProvenanceDigest
+        ($reordered.threads | ConvertTo-Json -Depth 16 -Compress) |
+            Should -Be ($page.threads | ConvertTo-Json -Depth 16 -Compress)
+
+        $objectResponse = ConvertFrom-Json -InputObject (
+            ConvertTo-Json -InputObject $response -Depth 32 -Compress
+        ) -Depth 32
+        $objectIteration = ConvertFrom-Json -InputObject (
+            ConvertTo-Json -InputObject ([ordered]@{} + $iteration + [ordered]@{
+                    createdDate = '2026-01-01T00:00:00.0000000Z'
+                    updatedDate = '2026-01-01T00:01:00.0000000Z'
+                }) -Compress
+        )
+        $objectPage = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse $objectResponse `
+            -CurrentIteration $objectIteration -ReviewerIdentity $reviewer
+        $objectPage.sourceDigest | Should -Be $page.sourceDigest
+        $objectPage.rawProvenanceDigest | Should -Be $page.rawProvenanceDigest
+    }
+
+    It 'requires the complete immutable reviewer id, descriptor, and UPN' {
+        $arguments = New-TestAdoDiscussionArguments
+        $response = New-TestAdoDiscussionResponse
+        $response.value = @(
+            New-TestAdoThread -Id 1 -Comments @(
+                New-TestAdoComment -Id 1 -Author (
+                    New-TestAdoAuthor -UniqueName 'reviewer@other.example'
+                )
+            )
+        )
+        $response.count = 1
+        $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse $response `
+            -CurrentIteration @{
+                id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+            } -ReviewerIdentity (New-TestAdoReviewerIdentity)
+
+        $page.threads[0].comments[0].reviewerOwned | Should -BeFalse
+        $page.threads[0].comments[0].reviewerIdentityState | Should -Be 'foreign'
+
+        $response.value[0].comments[0].author.Remove('id')
+        $ambiguous = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse $response `
+            -CurrentIteration @{
+                id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+            } -ReviewerIdentity (New-TestAdoReviewerIdentity)
+        $ambiguous.threads[0].comments[0].reviewerOwned | Should -BeFalse
+        $ambiguous.threads[0].comments[0].reviewerIdentityState | Should -Be 'ambiguous'
+        {
+            New-OwnerAzureDevOpsReviewerIdentity `
+                -Id 'not-a-guid' -Descriptor descriptor -UniqueName reviewer
+        } | Should -Throw
+    }
+
+    It 'fails closed on absent, unknown, or unsupported REST comment types' -TestCases @(
+        @{ Mode = 'missing' }
+        @{ Mode = 'unknown-number' }
+        @{ Mode = 'unknown-name' }
+        @{ Mode = 'unsupported' }
+    ) {
+        param($Mode)
+        $response = New-TestAdoDiscussionResponse
+        $comment = $response.value[3].comments[0]
+        switch ($Mode) {
+            'missing' { [void]$comment.Remove('commentType') }
+            'unknown-number' { $comment.commentType = 0 }
+            'unknown-name' { $comment.commentType = 'unknown' }
+            'unsupported' { $comment.commentType = 'text-ish' }
+        }
+        {
+            ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                -Arguments (New-TestAdoDiscussionArguments) -RawResponse $response `
+                -CurrentIteration @{
+                    id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+                } -ReviewerIdentity (New-TestAdoReviewerIdentity)
+        } | Should -Throw
+    }
+
+    It 'keeps deleted REST comments explicit and accepts null deleted content only' {
+        $response = [ordered]@{
+            count = 1
+            continuation_token = $null
+            value = @(
+                New-TestAdoThread -Id 1 -Comments @(
+                    New-TestAdoComment -Id 1 -CommentType text `
+                        -Content $null -IsDeleted $true
+                )
+            )
+        }
+        $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments (New-TestAdoDiscussionArguments) -RawResponse $response `
+            -CurrentIteration @{
+                id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+            } -ReviewerIdentity (New-TestAdoReviewerIdentity)
+
+        $page.threads[0].comments[0].isDeleted | Should -BeTrue
+        $page.threads[0].comments[0].body | Should -Be ''
+
+        $response.value[0].comments[0].isDeleted = $false
+        $response.value[0].comments[0].content = $null
+        {
+            ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                -Arguments (New-TestAdoDiscussionArguments) -RawResponse $response `
+                -CurrentIteration @{
+                    id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+                } -ReviewerIdentity (New-TestAdoReviewerIdentity)
+        } | Should -Throw
+    }
+
+    It 'keeps left-side or file-only REST context explicitly ambiguous' {
+        $thread = New-TestAdoThread -Id 1 -Path $null
+        $thread['threadContext'] = [ordered]@{
+            filePath = '/src/DeletedWidgetTests.cs'
+            leftFileStart = [ordered]@{ line = 9; offset = 1 }
+            leftFileEnd = [ordered]@{ line = 9; offset = 2 }
+        }
+        $response = [ordered]@{
+            count = 1
+            continuation_token = $null
+            value = @($thread)
+        }
+        $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments (New-TestAdoDiscussionArguments) -RawResponse $response `
+            -CurrentIteration @{
+                id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+            } -ReviewerIdentity (New-TestAdoReviewerIdentity)
+
+        $page.threads[0].anchor | Should -BeNullOrEmpty
+        $page.threads[0].contextState | Should -Be 'ambiguous'
+        $page.threads[0].sourceCommit | Should -BeNullOrEmpty
+        $page.threads[0].isOutdated | Should -BeFalse
+    }
+
+    It 'builds a provenance-bound typed snapshot from the REST normalizer' {
+        $contract = New-TestOwnerContract
+        $arguments = New-TestAdoDiscussionArguments
+        $reviewer = New-TestAdoReviewerIdentity
+        $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse (New-TestAdoDiscussionResponse) `
+            -CurrentIteration @{
+                id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+            } -ReviewerIdentity $reviewer
+        $provider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+            -Name 'ado-rest-discussions' -ReviewerIdentity $reviewer -Handler {
+            param($Operation, $ProviderArguments)
+            if ($Operation -cne 'GetDiscussionPage') { throw 'unexpected operation' }
+            return $page
+        }.GetNewClosure()
+
+        $snapshot = Get-OwnerDiscussionSnapshot -Contract $contract -Provider $provider `
+            -RequireAzureDevOpsProvenance
+
+        $snapshot.MappingDigest | Should -Be (Get-OwnerAzureDevOpsDiscussionMappingDigest)
+        $snapshot.ReviewerIdentityDigest | Should -Be $page.reviewerIdentityDigest
+        $snapshot.CurrentIterationId | Should -Be 2
+        @($snapshot.RawProvenanceDigests) | Should -Be @($page.rawProvenanceDigest)
+        $snapshot.SourceDigests | Should -Be @($page.sourceDigest)
+        $snapshot.ThreadCount | Should -Be 4
+        $snapshot.CommentCount | Should -Be 6
+    }
+
+    It 'rejects missing or mutated Azure DevOps typed-page provenance' {
+        $contract = New-TestOwnerContract
+        $arguments = New-TestAdoDiscussionArguments
+        $reviewer = New-TestAdoReviewerIdentity
+        $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse (New-TestAdoDiscussionResponse) `
+            -CurrentIteration @{
+                id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+            } -ReviewerIdentity $reviewer
+        $page.threads[0].status = 'closed'
+        $mutatedProvider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+            -Name 'mutated-ado-page' -ReviewerIdentity $reviewer -Handler {
+            param($Operation, $ProviderArguments)
+            return $page
+        }.GetNewClosure()
+        {
+            Get-OwnerDiscussionSnapshot -Contract $contract `
+                -Provider $mutatedProvider -RequireAzureDevOpsProvenance
+        } | Should -Throw
+
+        $legacyPage = [ordered]@{} + $page
+        foreach ($name in @(
+                'rawProvenanceDigest',
+                'mappingDigest',
+                'reviewerIdentityDigest',
+                'currentIterationId'
+            )) {
+            $legacyPage.Remove($name)
+        }
+        $legacyProvider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+            -Name 'legacy-ado-page' -ReviewerIdentity $reviewer -Handler {
+            param($Operation, $ProviderArguments)
+            return $legacyPage
+        }.GetNewClosure()
+        {
+            Get-OwnerDiscussionSnapshot -Contract $contract `
+                -Provider $legacyProvider -RequireAzureDevOpsProvenance
+        } | Should -Throw
+    }
+
+    It 'slices the full REST response into deterministic typed pages' {
+        $contract = New-TestOwnerContract
+        $arguments = New-TestAdoDiscussionArguments
+        $arguments.pageSize = 2
+        $response = New-TestAdoDiscussionResponse
+        $response.value = @($response.value | Select-Object -First 3)
+        $response.count = 3
+        $iteration = @{
+            id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+        }
+        $reviewer = New-TestAdoReviewerIdentity
+
+        $first = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse $response `
+            -CurrentIteration $iteration -ReviewerIdentity $reviewer
+        $arguments.pageOrdinal = 1
+        $arguments.continuationToken = 'skip:2'
+        $second = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse $response `
+            -CurrentIteration $iteration -ReviewerIdentity $reviewer
+
+        @($first.threads.threadId) | Should -Be @(2, 3)
+        $first.nextToken | Should -Be 'skip:2'
+        @($second.threads.threadId) | Should -Be @(4)
+        $second.nextToken | Should -BeNullOrEmpty
+        $second.rawProvenanceDigest | Should -Be $first.rawProvenanceDigest
+        $second.sourceDigest | Should -Not -Be $first.sourceDigest
+
+        $provider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+            -Name 'full-rest-sliced' -ReviewerIdentity $reviewer -Handler {
+            param($Operation, $ProviderArguments)
+            return ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                -Arguments $ProviderArguments -RawResponse $response `
+                -CurrentIteration $iteration -ReviewerIdentity $reviewer
+        }.GetNewClosure()
+        $snapshot = Get-OwnerDiscussionSnapshot -Contract $contract -Provider $provider `
+            -Limits (New-OwnerDiscussionLimits -MaximumPages 2 -PageSize 2 `
+                -MaximumThreads 4 -MaximumComments 10 -MaximumBytes 100000) `
+            -RequireAzureDevOpsProvenance
+
+        @($snapshot.Threads.threadId) | Should -Be @(2, 3, 4)
+        $snapshot.PageCount | Should -Be 2
+        @($snapshot.RawProvenanceDigests) | Should -Be @($first.rawProvenanceDigest)
+
+        $movingResponse = New-TestAdoDiscussionResponse
+        $movingResponse.value = @($movingResponse.value | Select-Object -First 3)
+        $movingResponse.count = 3
+        $movingState = @{ Calls = 0 }
+        $movingProvider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+            -Name 'moving-full-rest' -ReviewerIdentity $reviewer -Handler {
+            param($Operation, $ProviderArguments)
+            $movingState.Calls++
+            if ($movingState.Calls -eq 2) {
+                $movingResponse.value = @($movingResponse.value |
+                    Where-Object { [int]$_.id -ne 2 })
+                $movingResponse.count = $movingResponse.value.Count
+            }
+            return ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                -Arguments $ProviderArguments -RawResponse $movingResponse `
+                -CurrentIteration $iteration -ReviewerIdentity $reviewer
+        }.GetNewClosure()
+        {
+            Get-OwnerDiscussionSnapshot -Contract $contract -Provider $movingProvider `
+                -Limits (New-OwnerDiscussionLimits -MaximumPages 2 -PageSize 2 `
+                    -MaximumThreads 4 -MaximumComments 10 -MaximumBytes 100000) `
+                -RequireAzureDevOpsProvenance
+        } | Should -Throw
+    }
+}
+
 Describe 'Owner discussion acquisition' {
+    It 'degrades inconsistent generic thread context to ambiguous per thread' {
+        $contract = New-TestOwnerContract
+        $request = $contract.Request
+        $body = 'generic context'
+        $page = [ordered]@{
+            schemaVersion = 1
+            repositoryId = $request.RepositoryId
+            projectId = $request.ProjectId
+            pullRequestId = $request.PullRequestId
+            sourceCommit = $request.SourceCommit
+            targetCommit = $request.TargetCommit
+            targetRef = $request.TargetRef
+            pageOrdinal = 0
+            state = 'complete'
+            sourceDigest = Get-TestOwnerDigest 'generic-context-page'
+            nextToken = $null
+            threads = @(
+                [ordered]@{
+                    threadId = 1
+                    status = 'active'
+                    isDeleted = $false
+                    isOutdated = $true
+                    sourceCommit = $null
+                    anchor = $null
+                    comments = @(
+                        [ordered]@{
+                            commentId = 1
+                            commentType = 'text'
+                            isDeleted = $false
+                            reviewerOwned = $false
+                            body = $body
+                            bodyDigest = Get-TestOwnerDigest $body
+                        }
+                    )
+                }
+            )
+        }
+        $provider = New-OwnerReadOnlyProviderAdapter -Name 'generic-context' -Handler {
+            param($Operation, $Arguments)
+            return $page
+        }.GetNewClosure()
+
+        $snapshot = Get-OwnerDiscussionSnapshot -Contract $contract -Provider $provider
+        $snapshot.Threads[0].contextState | Should -Be 'ambiguous'
+        $snapshot.Threads[0].isOutdated | Should -BeFalse
+        $snapshot.Threads[0].sourceCommit | Should -BeNullOrEmpty
+    }
+
     It 'paginates, validates, and stably orders bounded read-only discussion data' {
         $contract = New-TestOwnerContract
         $request = $contract.Request
@@ -1027,9 +1512,13 @@ Describe 'Owner discussion acquisition' {
 Describe 'Owner adapter module surface' {
     It 'exports only the layer-two contract and acquisition adapters' {
         @(Get-Command -Module DevPilot.OwnerAdapters).Name | Sort-Object | Should -Be @(
+            'ConvertTo-OwnerAzureDevOpsDiscussionPage',
+            'Get-OwnerAzureDevOpsDiscussionMappingDigest',
             'Get-OwnerDiscussionSnapshot',
             'New-OwnerAcquisitionContract',
             'New-OwnerAdapterLimits',
+            'New-OwnerAzureDevOpsReadOnlyProviderAdapter',
+            'New-OwnerAzureDevOpsReviewerIdentity',
             'New-OwnerDiscussionLimits',
             'New-OwnerProductionAcquisitionAdapter',
             'New-OwnerReadOnlyProviderAdapter',

@@ -56,6 +56,90 @@ with text/system type, deleted state, reviewer-ownership attestation, body, and
 body digest. Author names, email addresses, credentials, provider tokens, and
 other provider artifacts are not part of the contract.
 
+For Azure DevOps, `ConvertTo-OwnerAzureDevOpsDiscussionPage` is the
+repository-owned production normalizer. The external host must acquire the full
+REST `pullRequestThreads` response plus the current
+`pullRequestIterations` record, then pass those values to this function. The
+Agency MCP thread projection is not authoritative for this boundary: observed
+live responses omitted `commentType` and iteration context even though the REST
+response carried them.
+
+The ADO threads endpoint returns the full thread set; it does not provide the
+`$top`/`$skip` paging contract used by the MCP projection. The normalizer sorts
+that full REST `value` array by thread ID and slices it using the wrapper's
+`pageOrdinal`/`pageSize`. It emits deterministic `skip:<offset>` continuation
+tokens until the full set is consumed. The host may cache one full REST response
+for the bounded acquisition call, but every page passed to the normalizer is
+the same complete response. `rawProvenanceDigest` therefore covers that
+canonical full response, while each page `sourceDigest` covers only its typed
+slice and continuation identity.
+
+The normalizer requires an immutable reviewer identity created by
+`New-OwnerAzureDevOpsReviewerIdentity`: exact non-empty ADO identity GUID,
+descriptor, and full UPN. `reviewerOwned` is true only when all three comment
+author fields match; aliases and display names are never sufficient. A marker
+comment whose REST author omits any of those fields is `ambiguous` and forces
+that finding to `unknown` rather than predicting a duplicate create. Only the
+official ADO comment-type enum is accepted: `1`/`text` is text,
+`2`/`codeChange` and `3`/`system` are system. `0`/`unknown`, an absent value,
+or any unrecognized value fails the page closed.
+
+Thread source/current/outdated state comes from the current iteration and each
+anchored thread's `pullRequestThreadContext`:
+
+- matching `secondComparingIteration` plus a positive `changeTrackingId` is
+  `current` and binds the exact source commit;
+- an older comparing iteration is `outdated`, with no source commit;
+- missing, malformed, or future iteration/tracking context is `ambiguous`;
+- PR-level threads without an anchor are `notApplicable`.
+
+Deleted flags remain explicit. REST omission of `isDeleted` means false, while
+a deleted comment with null content is normalized to an empty body and ignored
+for marker matching. Paths use only `threadContext.filePath` and
+`rightFileStart.line`; timestamps, links, identities, and other raw fields are
+not transported into the typed page.
+
+The typed page is sorted by numeric thread/comment ID before hashing. Its
+`sourceDigest` covers canonical identity, page/continuation identity, current
+iteration, mapping digest, reviewer-identity digest, and normalized threads.
+Separately, `rawProvenanceDigest` hashes a recursively canonicalized REST
+response after only thread/comment array ordering is stabilized; raw content
+and identities are never persisted. `Get-OwnerDiscussionSnapshot` requires
+these ADO provenance fields in live orchestration and binds the mapping,
+reviewer, iteration, typed-page digests, and raw-page digests into its final
+snapshot digest.
+
+Host provider sketch:
+
+```powershell
+$reviewer = New-OwnerAzureDevOpsReviewerIdentity `
+  -Id $configuredReviewerId `
+  -Descriptor $configuredReviewerDescriptor `
+  -UniqueName $configuredReviewerUpn
+
+New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+  -Name 'ado-owner-discussions' `
+  -ReviewerIdentity $reviewer `
+  -Handler {
+  param($operation, $arguments)
+  if ($operation -ceq 'GetDiscussionPage') {
+    $rawThreads = Read-AdoPullRequestThreadsRest -Arguments $arguments
+    $iteration = Read-AdoCurrentPullRequestIteration -Arguments $arguments
+    return ConvertTo-OwnerAzureDevOpsDiscussionPage `
+      -Arguments $arguments `
+      -RawResponse $rawThreads `
+      -CurrentIteration $iteration `
+      -ReviewerIdentity $reviewer
+  }
+  # Existing GetSubject/GetChangedFilesPage/GetRule/GetFile cases remain.
+  }
+```
+
+The specialized provider adapter pins the expected mapping and reviewer
+identity digests independently of each returned page. Live snapshot acquisition
+rejects a page that is self-consistent but bound to a different configured
+reviewer.
+
 Discussion acquisition has independent explicit ceilings: 20 pages, 100
 threads per page, 1,000 total threads, 5,000 total comments, and 4 MiB of UTF-8
 comment text in the live Owner orchestrator. Duplicate thread/comment IDs,

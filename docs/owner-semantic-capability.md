@@ -93,6 +93,18 @@ The byte contract was transcribed and frozen from the approved V1 writer at
 commit `dbc8ddd5`, `src/Agents/reviewer/ApprovedOwnerComments.ps1`
 (`Get-ApprovedOwnerDedupeKey` and `Format-ApprovedOwnerComment`).
 
+Live ADO ownership and context are supplied only by the persisted REST
+normalizer in `DevPilot.OwnerAdapters`. The semantic/reconciliation module does
+not infer text comments from missing enum values, infer reviewer ownership from
+an alias, or treat an anchored thread with missing iteration/tracking context
+as current. Ambiguous context is an explicit `unknown` reconciliation outcome.
+An Owner marker with incomplete REST author identity is likewise `unknown`;
+only a complete foreign identity is ignored as an unrelated marker copy.
+Read-only validation against two existing V1 Owner comments confirmed that the
+writer-created inline threads carry text comment types, the exact configured
+reviewer identity, positive change-tracking IDs, and iteration context bound to
+their source iteration.
+
 Only one reviewer-owned text comment carrying that marker at the exact anchor
 may participate. Arbitrary human text cannot suppress a finding. Exact active
 content is `noOp`; one active marker with stale body is `wouldUpdate`; no

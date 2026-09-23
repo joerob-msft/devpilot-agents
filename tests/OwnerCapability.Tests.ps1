@@ -286,6 +286,7 @@ BeforeAll {
             [int]$CommentId = 100,
             [string]$Status = 'active',
             [bool]$ReviewerOwned = $true,
+            [AllowNull()][string]$ReviewerIdentityState = $null,
             [bool]$ThreadDeleted = $false,
             [bool]$CommentDeleted = $false,
             [bool]$Outdated = $false,
@@ -301,8 +302,21 @@ BeforeAll {
             sourceCommit = $(if ($PSBoundParameters.ContainsKey('SourceCommit')) {
                     $SourceCommit
                 }
+                elseif ($Outdated) {
+                    $null
+                }
                 else {
                     [string]$Contract.Request.SourceCommit
+                })
+            contextState = $(if ($Outdated) {
+                    'outdated'
+                }
+                elseif ($PSBoundParameters.ContainsKey('SourceCommit') -and
+                    [string]::IsNullOrWhiteSpace($SourceCommit)) {
+                    'ambiguous'
+                }
+                else {
+                    'current'
                 })
             anchor = [ordered]@{
                 path = $(if (-not [string]::IsNullOrWhiteSpace($Path)) {
@@ -319,6 +333,14 @@ BeforeAll {
                     commentType = 'text'
                     isDeleted = $CommentDeleted
                     reviewerOwned = $ReviewerOwned
+                    reviewerIdentityState = $(if (
+                            [string]::IsNullOrWhiteSpace($ReviewerIdentityState)
+                        ) {
+                            if ($ReviewerOwned) { 'matched' } else { 'foreign' }
+                        }
+                        else {
+                            $ReviewerIdentityState
+                        })
                     body = $Body
                     bodyDigest = Get-TestOwnerV2Digest $Body
                 }
@@ -704,6 +726,14 @@ Describe 'Owner v2 semantic capability' {
                     Reason = 'reviewer-marker-not-found'
                 },
                 [ordered]@{
+                    Name = 'ambiguous reviewer identity'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body $writer.Body -ReviewerOwned $false `
+                            -ReviewerIdentityState ambiguous)
+                    Classification = 'unknown'
+                    Reason = 'reviewer-marker-owner-ambiguous'
+                },
+                [ordered]@{
                     Name = 'closed reviewer thread'
                     Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
                             -Finding $finding -Body $writer.Body -Status closed)
@@ -725,11 +755,11 @@ Describe 'Owner v2 semantic capability' {
                     Reason = 'reviewer-marker-thread-outdated'
                 },
                 [ordered]@{
-                    Name = 'current-head mismatch'
+                    Name = 'ambiguous iteration context'
                     Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
-                            -Finding $finding -Body $writer.Body -SourceCommit ('d' * 40))
+                            -Finding $finding -Body $writer.Body -SourceCommit $null)
                     Classification = 'unknown'
-                    Reason = 'reviewer-marker-source-mismatch'
+                    Reason = 'reviewer-marker-context-ambiguous'
                 },
                 [ordered]@{
                     Name = 'unreadable reviewer anchor'
@@ -757,7 +787,112 @@ Describe 'Owner v2 semantic capability' {
             }
         }
 
-    It 'fails duplicate reviewer markers closed and keeps acquisition failures separate from semantic verdicts' {
+        It 'reconciles Azure DevOps REST-normalized reviewer threads end to end' {
+            $run = Invoke-TestOwnerV2Case -Case (Get-TestOwnerV2Case -Id 'proven-owner-cases')
+            $firstFinding = $run.Observation.findings[0]
+            $secondFinding = $run.Observation.findings[1]
+            $firstWriter = Get-TestOwnerV1WriterComment `
+                -Contract $run.Contract -Finding $firstFinding
+            $secondWriter = Get-TestOwnerV1WriterComment `
+                -Contract $run.Contract -Finding $secondFinding
+            $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
+                -Id '11111111-2222-3333-4444-555555555555' `
+                -Descriptor 'aad.owner-reviewer' `
+                -UniqueName 'owner-reviewer@example.com'
+            $author = [ordered]@{
+                id = $reviewer.Id
+                descriptor = $reviewer.Descriptor
+                uniqueName = $reviewer.UniqueName
+            }
+            $makeThread = {
+                param($Id, $Finding, $Body)
+                [ordered]@{
+                    id = $Id
+                    status = 'active'
+                    isDeleted = $false
+                    threadContext = [ordered]@{
+                        filePath = '/' + [string]$Finding.anchor.path
+                        rightFileStart = [ordered]@{
+                            line = [int]$Finding.anchor.line
+                            offset = 1
+                        }
+                        rightFileEnd = [ordered]@{
+                            line = [int]$Finding.anchor.line
+                            offset = 2
+                        }
+                    }
+                    pullRequestThreadContext = [ordered]@{
+                        changeTrackingId = $Id
+                        iterationContext = [ordered]@{
+                            firstComparingIteration = 1
+                            secondComparingIteration = 1
+                        }
+                    }
+                    comments = @(
+                        [ordered]@{
+                            id = 1
+                            commentType = 'text'
+                            content = $Body
+                            author = $author
+                        }
+                    )
+                }
+            }.GetNewClosure()
+            $rawResponse = [ordered]@{
+                count = 2
+                continuation_token = $null
+                value = @(
+                    & $makeThread 20 $secondFinding (
+                        "stale body`n<!-- devpilot-owner-comment:v1:$($secondWriter.Marker) -->"
+                    )
+                    & $makeThread 10 $firstFinding $firstWriter.Body
+                )
+            }
+            $request = $run.Contract.Request
+            $arguments = [pscustomobject][ordered]@{
+                repositoryId = $request.RepositoryId
+                projectId = $request.ProjectId
+                pullRequestId = $request.PullRequestId
+                sourceCommit = $request.SourceCommit
+                targetCommit = $request.TargetCommit
+                targetRef = $request.TargetRef
+                pageOrdinal = 0
+                pageSize = 100
+                continuationToken = $null
+            }
+            $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                -Arguments $arguments -RawResponse $rawResponse `
+                -CurrentIteration ([pscustomobject]@{
+                    id = 1
+                    sourceCommit = $request.SourceCommit
+                    targetCommit = $request.TargetCommit
+                    createdDate = [DateTime]::UtcNow
+                }) -ReviewerIdentity $reviewer
+            $provider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+                -Name 'owner-rest-reconciliation' -ReviewerIdentity $reviewer -Handler {
+                param($Operation, $ProviderArguments)
+                return $page
+            }.GetNewClosure()
+            $snapshot = Get-OwnerDiscussionSnapshot `
+                -Contract $run.Contract -Provider $provider -RequireAzureDevOpsProvenance
+            $result = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $run.Observation -Contract $run.Contract -Snapshot $snapshot
+            $firstResult = @($result.findings |
+                Where-Object identity -CEQ $firstFinding.identity)[0]
+            $secondResult = @($result.findings |
+                Where-Object identity -CEQ $secondFinding.identity)[0]
+
+            $firstResult.reconciliation.classification | Should -Be 'noOp'
+            $secondResult.reconciliation.classification | Should -Be 'wouldUpdate'
+            $firstResult.reconciliation.thread.threadId | Should -Be 10
+            $secondResult.reconciliation.thread.threadId | Should -Be 20
+            @($result.sourceArtifacts.kind) | Should -Contain 'owner-v2-discussion-raw-page'
+            @($result.sourceArtifacts.kind) | Should -Contain 'owner-v2-discussion-mapping'
+            $result.effects.providerWrites | Should -Be 0
+            $result.effects.writeToolInvocations | Should -Be 0
+        }
+
+        It 'fails duplicate reviewer markers closed and keeps acquisition failures separate from semantic verdicts' {
             $run = Invoke-TestOwnerV2Case -Case (Get-TestOwnerV2Case -Id 'proven-owner-cases')
             $finding = $run.Observation.findings[0]
             $writer = Get-TestOwnerV1WriterComment -Contract $run.Contract -Finding $finding

@@ -1762,7 +1762,7 @@ function Invoke-OwnerV2Live {
     $result = Invoke-OwnerReviewPipeline -Binding $Entry.Contract.Binding `
         -AcquisitionAdapter $acquisition -CapabilityAdapter $capability
     $observation = ConvertTo-OwnerV2Observation -PipelineResult $result -Runner $runner `
-        -ImplementationId 'owner-v2-preview-orchestrator' -ImplementationVersion '0.4.0'
+        -ImplementationId 'owner-v2-preview-orchestrator' -ImplementationVersion '0.5.0'
     if (@($observation.findings).Count -gt 0 -and
         [string]$observation.lifecycle.status -ceq 'completed') {
         $discussionSnapshot = $null
@@ -1771,7 +1771,8 @@ function Invoke-OwnerV2Live {
             $discussionSnapshot = Get-OwnerDiscussionSnapshot `
                 -Contract $Entry.Contract -Provider $AcquisitionProvider `
                 -Limits (New-OwnerDiscussionLimits -MaximumPages 20 -PageSize 100 `
-                    -MaximumThreads 1000 -MaximumComments 5000 -MaximumBytes 4194304)
+                    -MaximumThreads 1000 -MaximumComments 5000 -MaximumBytes 4194304) `
+                -RequireAzureDevOpsProvenance
         }
         catch {
             $discussionFailure = 'discussion-acquisition-failed'
@@ -1821,7 +1822,7 @@ function New-OwnerV2LiveUnavailableObservation {
     $observation = [ordered]@{
         schemaVersion = 2
         kind = 'owner-observation'
-        implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.4.0' }
+        implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.5.0' }
         capability = [string]$Entry.Declaration.capability.id
         subject = [ordered]@{
             pullRequestId = [long]$Entry.Declaration.subject.pullRequestId
@@ -2007,7 +2008,7 @@ function Resolve-OwnerV2CompletedDiscussionRefresh {
             ResultDigest = Get-OwnerV2Digest -Value $Observation
             Reason = 'already-terminal'
         }
-        $Observation.implementation.version = '0.4.0'
+        $Observation.implementation.version = '0.5.0'
     }
     $snapshot = $null
     $failureReason = $null
@@ -2015,7 +2016,8 @@ function Resolve-OwnerV2CompletedDiscussionRefresh {
         $snapshot = Get-OwnerDiscussionSnapshot `
             -Contract $Entry.Contract -Provider $AcquisitionProvider `
             -Limits (New-OwnerDiscussionLimits -MaximumPages 20 -PageSize 100 `
-                -MaximumThreads 1000 -MaximumComments 5000 -MaximumBytes 4194304)
+                -MaximumThreads 1000 -MaximumComments 5000 -MaximumBytes 4194304) `
+            -RequireAzureDevOpsProvenance
     }
     catch {
         $failureReason = 'discussion-acquisition-failed'
