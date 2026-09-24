@@ -1508,7 +1508,9 @@ Describe 'Automatic Owner v2 create-only delivery' {
                 Join-Path $repoRoot `
                     'samples\owner-v2-auto-delivery.config.json'
             ) -DeliveryRoot $delivery 2>&1)
-        $LASTEXITCODE | Should -Be 0
+        if ($LASTEXITCODE -ne 0) {
+            throw "Disabled scheduler exited $LASTEXITCODE`: $($output -join "`n")"
+        }
         ($output -join "`n") | Should -Match 'disabled'
         Test-Path -LiteralPath $delivery | Should -BeFalse
     }
