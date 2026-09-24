@@ -9,6 +9,7 @@ BeforeAll {
     Import-Module (Join-Path $repoRoot `
             'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1') -Force
     . (Join-Path $repoRoot 'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1')
+    . (Join-Path $repoRoot 'src\Agents\reviewer\AutomaticOwnerV2Comments.ps1')
 
     function New-TestOwnerV2Evidence {
         param(
@@ -274,6 +275,8 @@ BeforeAll {
                 writerSha256 = '3' * 64
                 providerSha256 = '4' * 64
                 cliSha256 = '5' * 64
+                automaticWriterSha256 = '6' * 64
+                schedulerSha256 = '7' * 64
             }
             Provider = [ordered]@{
                 kind = 'azure-devops-rest-owner-discussions-v1'
@@ -415,6 +418,7 @@ BeforeAll {
             readSelectionCounts = [Collections.Generic.List[int]]::new()
         }
         $newSnapshot = ${function:New-TestOwnerV2Snapshot}
+
         $newThread = ${function:New-TestOwnerV2Thread}
         $provider = {
             param([string]$Action, [hashtable]$Arguments)
@@ -477,6 +481,245 @@ BeforeAll {
             throw "Unexpected provider action '$Action'."
         }.GetNewClosure()
         return [pscustomobject]@{ Handler = $provider; State = $state }
+    }
+
+    function Expand-TestOwnerV2Evidence {
+        param(
+            [Parameter(Mandatory)]$Evidence,
+            [ValidateRange(1, 12)][int]$Count
+        )
+        $base = $Evidence.Observation.findings[0]
+        $findings = [Collections.Generic.List[object]]::new()
+        for ($index = 1; $index -le $Count; $index++) {
+            $finding = $base | ConvertTo-Json -Depth 32 -Compress |
+                ConvertFrom-Json -AsHashtable -Depth 32
+            $hex = $index.ToString('x64')
+            $constructHex = ($index + 100).ToString('x64')
+            $line = 11 + $index
+            $finding.identity = "owner-v2:$hex"
+            $finding.semanticKey = "v1:sha256:$hex"
+            $finding.constructRef = "construct:$constructHex"
+            $finding.anchor.line = $line
+            $finding.anchor.symbol = "CreatesWidget$index"
+            $finding.binding.span.startLine = $line
+            $finding.binding.span.endLine = $line
+            $finding.binding.symbol = $finding.anchor.symbol
+            $finding.binding.constructIdentity =
+                "v1:sha256:$constructHex"
+            $finding.binding.source.representation.startLine = $line
+            $finding.binding.source.representation.endLine = $line
+            $finding.binding.source.representation.symbol =
+                $finding.anchor.symbol
+            $finding.binding.source.representation.constructIdentity =
+                $finding.constructRef
+            $marker = Get-OwnerV1WriterMarkerKey `
+                -Contract $Evidence.Contract -Finding $finding
+            $body = Format-OwnerV1WriterComment `
+                -Contract $Evidence.Contract -Finding $finding `
+                -MarkerKey $marker
+            $finding.providerMarker.sha256 =
+                Get-ApprovedOwnerV2TextSha256 $marker
+            $finding.reconciliation.bodySha256 =
+                Get-ApprovedOwnerV2TextSha256 $body
+            [void]$findings.Add($finding)
+        }
+        $Evidence.Observation.findings = $findings.ToArray()
+        $Evidence.Observation.counts.checked = $Count
+        $Evidence.Observation.counts.eligible = $Count
+        $Evidence.Observation.counts.violations = $Count
+        $Evidence.Observation.effects.dedupe.wouldCreate = $Count
+        $Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $Evidence.Observation
+        return $Evidence
+    }
+
+    function New-TestAutomaticOwnerV2Provider {
+        param(
+            [Parameter(Mandatory)]$Evidence,
+            [switch]$ForeignIdentity,
+            [switch]$StaleHead,
+            [switch]$StaleAnchor,
+            [switch]$FailCreateAfterWrite,
+            [switch]$FailCreateBeforeWrite,
+            [switch]$FailReadback,
+            [switch]$DuplicateReadback
+        )
+        $state = [ordered]@{
+            threads = @()
+            digest = '9' * 64
+            writes = 0
+            nextThreadId = 100
+            readCount = 0
+            failReadback = [bool]$FailReadback
+            duplicateReadback = [bool]$DuplicateReadback
+        }
+        $newSnapshot = ${function:New-TestOwnerV2Snapshot}
+        $provider = {
+            param([string]$Action, [hashtable]$Arguments)
+            if ($Action -ceq 'ReadCurrent') {
+                $state.readCount++
+                if ([bool]$state.failReadback -and $state.writes -gt 0) {
+                    throw 'readback unavailable'
+                }
+                $anchors = @($Arguments.selections | ForEach-Object {
+                        [ordered]@{
+                            path = [string]$_.path
+                            startLine = $(if ($StaleAnchor) {
+                                    [int]$_.line + 10
+                                }
+                                else { [int]$_.line })
+                            endLine = $(if ($StaleAnchor) {
+                                    [int]$_.line + 10
+                                }
+                                else { [int]$_.line })
+                            changeTrackingId = 7
+                            iterationId = 2
+                        }
+                    })
+                $snapshotThreads = @($state.threads)
+                if ([bool]$state.duplicateReadback -and
+                    $state.writes -gt 0 -and $snapshotThreads.Count -gt 0) {
+                    $duplicate = $snapshotThreads[0] |
+                        ConvertTo-Json -Depth 16 -Compress |
+                        ConvertFrom-Json -AsHashtable -Depth 16
+                    $duplicate.threadId = 999
+                    $duplicate.comments[0].commentId = 1999
+                    $snapshotThreads += $duplicate
+                }
+                return [pscustomobject]@{
+                    ProviderBinding = $Evidence.Provider
+                    PullRequest = [ordered]@{
+                        pullRequestId = 42
+                        status = 'active'
+                        isDraft = $false
+                        repositoryId =
+                            $Evidence.Declaration.subject.repositoryId
+                        projectId = $Evidence.Declaration.subject.projectId
+                        sourceCommit = $(if ($StaleHead) { '0' * 40 }
+                            else { $Evidence.Declaration.head.sourceCommit })
+                        targetCommit =
+                            $Evidence.Declaration.target.targetCommit
+                        targetRef = $Evidence.Declaration.target.targetRef
+                    }
+                    Reviewer = [ordered]@{
+                        id = $(if ($ForeignIdentity) {
+                                'ffffffff-ffff-ffff-ffff-ffffffffffff'
+                            }
+                            else {
+                                'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+                            })
+                        descriptor = 'aad.test-descriptor'
+                        uniqueName = 'operator@example.com'
+                    }
+                    Snapshot = & $newSnapshot -Evidence $Evidence `
+                        -Threads $snapshotThreads -Digest $state.digest
+                    Anchors = $anchors
+                }
+            }
+            if ($Action -ceq 'CreateThread') {
+                if ($FailCreateBeforeWrite) {
+                    throw 'provider rejected create'
+                }
+                $selection = $Arguments.selection
+                $threadId = $state.nextThreadId
+                $state.nextThreadId++
+                $state.writes++
+                $bodyBytes = [Text.UTF8Encoding]::new($false).GetBytes(
+                    [string]$selection.body)
+                $bodySha256 = ([Convert]::ToHexString(
+                        [Security.Cryptography.SHA256]::HashData(
+                            $bodyBytes))).ToLowerInvariant()
+                $state.threads += [ordered]@{
+                    threadId = $threadId
+                    status = 'active'
+                    isDeleted = $false
+                    isOutdated = $false
+                    sourceCommit =
+                        $Evidence.Declaration.head.sourceCommit
+                    contextState = 'current'
+                    anchor = [ordered]@{
+                        path = [string]$selection.path
+                        line = [int]$selection.line
+                    }
+                    comments = @([ordered]@{
+                            commentId = $threadId + 1000
+                            commentType = 'text'
+                            isDeleted = $false
+                            reviewerOwned = $true
+                            reviewerIdentityState = 'matched'
+                            body = [string]$selection.body
+                            bodyDigest = "v1:sha256:$bodySha256"
+                        })
+                }
+                $digestBytes = [Text.UTF8Encoding]::new($false).GetBytes(
+                    (@($state.threads.comments.body) -join "`n"))
+                $state.digest = ([Convert]::ToHexString(
+                        [Security.Cryptography.SHA256]::HashData(
+                            $digestBytes))).ToLowerInvariant()
+                if ($FailCreateAfterWrite) {
+                    throw 'provider response lost after create'
+                }
+                return [ordered]@{ id = $threadId }
+            }
+            throw "Unexpected provider action '$Action'."
+        }.GetNewClosure()
+        return [pscustomobject]@{ Handler = $provider; State = $state }
+    }
+
+    function New-TestAutomaticOwnerV2Context {
+        param([ValidateRange(1, 12)][int]$FindingCount = 1)
+        $evidence = Expand-TestOwnerV2Evidence `
+            -Evidence (New-TestOwnerV2Evidence) -Count $FindingCount
+        $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        foreach ($leaf in @(
+                'keys', 'policies', 'intents', 'outcomes', 'events', 'locks'
+            )) {
+            New-Item -ItemType Directory -Path (Join-Path $root $leaf) -Force |
+                Out-Null
+        }
+        $key = [byte[]](33..64)
+        $policy = New-AutomaticOwnerV2ServicePolicy -Evidence $evidence `
+            -PolicyId 'owner-v2-test-policy' `
+            -MaxCreatesPerRun 5 -MaxCreatesPerPullRequest 25 `
+            -CreatedUtc '20260101T000000Z'
+        return [pscustomobject]@{
+            Evidence = $evidence
+            Root = $root
+            Key = $key
+            Policy = $policy
+        }
+    }
+
+    function Update-TestAutomaticOwnerV2Discussion {
+        param(
+            [Parameter(Mandatory)]$Context,
+            [Parameter(Mandatory)]$Provider
+        )
+        $snapshot = & ${function:New-TestOwnerV2Snapshot} `
+            -Evidence $Context.Evidence `
+            -Threads $Provider.State.threads `
+            -Digest $Provider.State.digest
+        $mini = [ordered]@{
+            lifecycle = [ordered]@{ status = 'completed' }
+            findings = $Context.Evidence.Observation.findings
+            effects = [ordered]@{
+                dedupe = [ordered]@{}
+                providerWrites = 0
+                writeToolInvocations = 0
+            }
+            sourceArtifacts = @()
+        }
+        $resolved = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $mini -Contract $Context.Evidence.Contract `
+            -Snapshot $snapshot
+        $Context.Evidence.Observation.findings = $resolved.findings
+        foreach ($artifact in $Context.Evidence.Observation.sourceArtifacts) {
+            if ([string]$artifact.kind -ceq 'owner-v2-discussion-snapshot') {
+                $artifact.sha256 = $Provider.State.digest
+            }
+        }
+        $Context.Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $Context.Evidence.Observation
     }
 }
 
@@ -749,5 +992,524 @@ Describe 'Approved Owner v2 live safety boundary' {
         $provider | Should -Not -Match 'Open-AgentMcpSession|vote|status update|notification'
         $provider | Should -Match "'CreateThread'"
         $provider | Should -Match "'UpdateComment'"
+    }
+}
+
+Describe 'Automatic Owner v2 create-only delivery' {
+    It 'is disabled by default and fails closed on an unbound true value' {
+        $disabled = Get-AutomaticOwnerV2Configuration -ToolkitConfig ([ordered]@{})
+        $disabled.Enabled | Should -BeFalse
+
+        {
+            Get-AutomaticOwnerV2Configuration -ToolkitConfig ([ordered]@{
+                    autoCreateOwnerComments = $true
+                })
+        } | Should -Throw '*signed policy*'
+        {
+            Get-AutomaticOwnerV2Configuration -ToolkitConfig ([ordered]@{
+                    autoCreateOwnerComments = [ordered]@{
+                        enabled = 'false'
+                        policyPath = 'C:\private\policy.json'
+                        policySha256 = 'a' * 64
+                    }
+                })
+        } | Should -Throw '*exact JSON boolean*'
+    }
+
+    It 'creates only the exact allowed Owner method violation' {
+        $context = New-TestAutomaticOwnerV2Context
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly 'healthy'
+        $result.providerWrites | Should -Be 1
+        $result.modelWrites | Should -Be 0
+        (Get-ApprovedOwnerV2Value $result.events[0] 'action' '') |
+            Should -BeExactly 'create'
+        (Get-ApprovedOwnerV2Value $result.events[0] 'outcome' '') |
+            Should -BeExactly 'created'
+        (Get-ApprovedOwnerV2Value $result.events[0] 'url' '') |
+            Should -Match 'discussionId=100$'
+        $provider.State.writes | Should -Be 1
+    }
+
+    It 'refuses stale rule, capability, identity, and implementation policies' `
+        -TestCases @(
+            @{ Name = 'rule'; Path = 'rule.hash' }
+            @{ Name = 'capability'; Path = 'capability.id' }
+            @{ Name = 'identity'; Path = 'reviewerIdentity.id' }
+            @{ Name = 'implementation'; Path = 'implementation.providerSha256' }
+        ) {
+        param($Name, $Path)
+        $context = New-TestAutomaticOwnerV2Context
+        $parts = $Path.Split('.')
+        $cursor = $context.Policy
+        for ($index = 0; $index -lt $parts.Count - 1; $index++) {
+            $cursor = $cursor[$parts[$index]]
+        }
+        $cursor[$parts[-1]] = 'tampered'
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly 'refused'
+        $result.diagnostic.code | Should -BeExactly 'policy-refused'
+        $provider.State.writes | Should -Be 0
+    }
+
+    It 'refuses wrong construct, disposition, and update classification' `
+        -TestCases @(
+            @{ Name = 'construct'; Mutation = 'construct' }
+            @{ Name = 'disposition'; Mutation = 'disposition' }
+            @{ Name = 'update'; Mutation = 'update' }
+        ) {
+        param($Name, $Mutation)
+        $context = New-TestAutomaticOwnerV2Context
+        $finding = $context.Evidence.Observation.findings[0]
+        if ($Mutation -ceq 'construct') {
+            $finding.binding.source.representation.endLine++
+        }
+        elseif ($Mutation -ceq 'disposition') {
+            $finding.disposition = 'advisory'
+        }
+        else {
+            $finding.reconciliation.classification = 'wouldUpdate'
+            $finding.reconciliation.reason = 'reviewer-marker-body-stale'
+        }
+        $context.Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $context.Evidence.Observation
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly 'refused'
+        $provider.State.writes | Should -Be 0
+    }
+
+    It 'fails closed on live identity, head, and anchor drift' `
+        -TestCases @(
+            @{ Name = 'identity'; Arguments = @{ ForeignIdentity = $true } }
+            @{ Name = 'head'; Arguments = @{ StaleHead = $true } }
+            @{ Name = 'anchor'; Arguments = @{ StaleAnchor = $true } }
+        ) {
+        param($Name, $Arguments)
+        $context = New-TestAutomaticOwnerV2Context
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence @Arguments
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly 'refused'
+        $result.diagnostic.code | Should -BeExactly 'live-preflight-refused'
+        $provider.State.writes | Should -Be 0
+    }
+
+    It 'refuses snapshot drift plus duplicate or foreign copied markers' `
+        -TestCases @(
+            @{ Name = 'snapshot'; Mode = 'snapshot' }
+            @{ Name = 'duplicate'; Mode = 'duplicate' }
+            @{ Name = 'foreign'; Mode = 'foreign' }
+        ) {
+        param($Name, $Mode)
+        $context = New-TestAutomaticOwnerV2Context
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence
+        if ($Mode -ceq 'snapshot') {
+            $artifact = @($context.Evidence.Observation.sourceArtifacts |
+                Where-Object kind -EQ 'owner-v2-discussion-snapshot')[0]
+            $artifact.sha256 = '0' * 64
+            $context.Evidence.Record.resultDigest =
+                Get-ApprovedOwnerV2Digest $context.Evidence.Observation
+        }
+        else {
+            $proposal = (New-ApprovedOwnerV2ReviewPackage `
+                    -Evidence $context.Evidence).proposals[0]
+            $first = New-TestOwnerV2Thread -Evidence $context.Evidence `
+                -Body ([string]$proposal.body) `
+                -ReviewerOwned:($Mode -cne 'foreign') `
+                -ReviewerIdentityState $(if ($Mode -ceq 'foreign') {
+                        'foreign'
+                    }
+                    else { 'matched' })
+            $provider.State.threads = @($first)
+            if ($Mode -ceq 'duplicate') {
+                $provider.State.threads += New-TestOwnerV2Thread `
+                    -Evidence $context.Evidence `
+                    -Body ([string]$proposal.body) `
+                    -ThreadId 20 -CommentId 21
+            }
+        }
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly 'refused'
+        $provider.State.writes | Should -Be 0
+    }
+
+    It 'delivers nine findings as five then four and then no-ops' {
+        $context = New-TestAutomaticOwnerV2Context -FindingCount 9
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence
+
+        $first = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $first.providerWrites | Should -Be 5
+        $first.health | Should -BeExactly 'partial'
+        $first.remainingWouldCreate | Should -Be 4
+
+        Update-TestAutomaticOwnerV2Discussion `
+            -Context $context -Provider $provider
+        $second = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $second.providerWrites | Should -Be 4
+        $second.health | Should -BeExactly 'healthy'
+        $second.remainingWouldCreate | Should -Be 0
+
+        Update-TestAutomaticOwnerV2Discussion `
+            -Context $context -Provider $provider
+        $third = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $third.providerWrites | Should -Be 0
+        $third.health | Should -BeExactly 'healthy'
+        $provider.State.writes | Should -Be 9
+    }
+
+    It 'enforces the signed per-PR create ceiling across runs' {
+        $context = New-TestAutomaticOwnerV2Context -FindingCount 2
+        $context.Policy = New-AutomaticOwnerV2ServicePolicy `
+            -Evidence $context.Evidence -PolicyId 'owner-v2-test-policy' `
+            -MaxCreatesPerRun 1 -MaxCreatesPerPullRequest 1 `
+            -CreatedUtc '20260101T000000Z'
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence
+        $first = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $first.providerWrites | Should -Be 1
+
+        Update-TestAutomaticOwnerV2Discussion `
+            -Context $context -Provider $provider
+        $second = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $second.health | Should -BeExactly 'refused'
+        $second.providerWrites | Should -Be 0
+        $provider.State.writes | Should -Be 1
+    }
+
+    It 'does not write an existing exact noOp comment' {
+        $context = New-TestAutomaticOwnerV2Context
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence
+        $selection = (New-ApprovedOwnerV2ReviewPackage `
+                -Evidence $context.Evidence).proposals[0]
+        [void](& $provider.Handler 'CreateThread' @{
+                evidence = $context.Evidence
+                selection = $selection
+                anchor = [ordered]@{}
+            })
+        Update-TestAutomaticOwnerV2Discussion `
+            -Context $context -Provider $provider
+        $before = $provider.State.writes
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly 'healthy'
+        $result.providerWrites | Should -Be 0
+        $provider.State.writes | Should -Be $before
+    }
+
+    It 'confirms a successful create after a lost provider response' {
+        $context = New-TestAutomaticOwnerV2Context
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence -FailCreateAfterWrite
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly 'healthy'
+        $result.providerWrites | Should -Be 1
+        (Get-ApprovedOwnerV2Value $result.events[0] 'outcome' '') |
+            Should -BeExactly 'created-confirmed-after-error'
+        $provider.State.writes | Should -Be 1
+    }
+
+    It 'blocks blind retries when post-write readback is unavailable' {
+        $context = New-TestAutomaticOwnerV2Context
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence -FailReadback
+        $first = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $first.health | Should -BeExactly 'refused'
+        $first.events[-1].outcome | Should -BeExactly 'ambiguous-post-write'
+        $first.providerWrites | Should -Be 1
+        (Get-ApprovedOwnerV2Value `
+            $first.events[-1] 'providerWriteState' '') |
+            Should -BeExactly 'unknown'
+        $writes = $provider.State.writes
+        $second = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $second.health | Should -BeExactly 'refused'
+        $provider.State.writes | Should -Be $writes
+    }
+
+    It 'charges an ambiguous write against the whole PR ceiling' {
+        $context = New-TestAutomaticOwnerV2Context -FindingCount 2
+        $context.Policy = New-AutomaticOwnerV2ServicePolicy `
+            -Evidence $context.Evidence -PolicyId 'owner-v2-test-policy' `
+            -MaxCreatesPerRun 1 -MaxCreatesPerPullRequest 1 `
+            -CreatedUtc '20260101T000000Z'
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence -FailCreateAfterWrite -FailReadback
+        $first = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $first.health | Should -BeExactly 'refused'
+        $first.providerWrites | Should -Be 1
+        $provider.State.failReadback = $false
+        $writes = $provider.State.writes
+
+        $second = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $second.health | Should -BeExactly 'refused'
+        $second.providerWrites | Should -Be 0
+        $provider.State.writes | Should -Be $writes
+    }
+
+    It 'treats duplicate post-write readback as ambiguous and blocks retry' {
+        $context = New-TestAutomaticOwnerV2Context
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence -DuplicateReadback
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly 'refused'
+        $result.providerWrites | Should -Be 1
+        (Get-ApprovedOwnerV2Value $result.events[-1] 'outcome' '') |
+            Should -BeExactly 'ambiguous-post-write'
+        (Get-ApprovedOwnerV2Value `
+            $result.events[-1] 'providerWriteState' '') |
+            Should -BeExactly 'unknown'
+    }
+
+    It 'recovers an interrupted signed intent without duplicating the comment' {
+        $context = New-TestAutomaticOwnerV2Context
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence
+        $selection = (New-ApprovedOwnerV2ReviewPackage `
+                -Evidence $context.Evidence).proposals[0]
+        [void](& $provider.Handler 'CreateThread' @{
+                evidence = $context.Evidence
+                selection = $selection
+                anchor = [ordered]@{}
+            })
+        $intent = [ordered]@{
+            schemaVersion = 1
+            kind = 'owner-v2-service-create-intent'
+            runId = 'interrupted-run'
+            state = [ordered]@{ identity = $context.Evidence.Identity }
+            subject = [ordered]@{ pullRequestId = 42 }
+            reviewerIdentity = $context.Policy.reviewerIdentity
+            selections = @($selection)
+        }
+        [void](Write-ApprovedOwnerV2SignedRecord -Path (
+                Join-Path $context.Root (
+                    "intents\$($context.Evidence.Identity)\interrupted-run.json")
+            ) -Payload $intent -Key $context.Key)
+        $before = $provider.State.writes
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        @($result.events | Where-Object {
+                (Get-ApprovedOwnerV2Value $_ 'outcome' '') -ceq
+                    'recovered-confirmed'
+            }) |
+            Should -HaveCount 1
+        $provider.State.writes | Should -Be $before
+    }
+
+    It 'binds each repaired outcome only to that interrupted intent events' {
+        $context = New-TestAutomaticOwnerV2Context -FindingCount 2
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence
+        $proposals = (New-ApprovedOwnerV2ReviewPackage `
+                -Evidence $context.Evidence).proposals
+        for ($index = 0; $index -lt 2; $index++) {
+            [void](& $provider.Handler 'CreateThread' @{
+                    evidence = $context.Evidence
+                    selection = $proposals[$index]
+                    anchor = [ordered]@{}
+                })
+            $runId = "interrupted-$index"
+            $intent = [ordered]@{
+                schemaVersion = 1
+                kind = 'owner-v2-service-create-intent'
+                runId = $runId
+                state = [ordered]@{ identity = $context.Evidence.Identity }
+                subject = [ordered]@{ pullRequestId = 42 }
+                reviewerIdentity = $context.Policy.reviewerIdentity
+                selections = @($proposals[$index])
+            }
+            [void](Write-ApprovedOwnerV2SignedRecord -Path (
+                    Join-Path $context.Root (
+                        "intents\$($context.Evidence.Identity)\$runId.json")
+                ) -Payload $intent -Key $context.Key)
+        }
+        [void](Invoke-AutomaticOwnerV2Comments `
+                -Evidence $context.Evidence -Policy $context.Policy `
+                -DeliveryRoot $context.Root -Key $context.Key `
+                -Provider $provider.Handler)
+        $outcomes = @(Get-ChildItem -LiteralPath (
+                Join-Path $context.Root "outcomes\$($context.Evidence.Identity)"
+            ) -Filter 'interrupted-*.json' -File | ForEach-Object {
+                Read-ApprovedOwnerV2SignedRecord `
+                    -Path $_.FullName -Key $context.Key
+            })
+        $outcomes | Should -HaveCount 2
+        foreach ($outcome in $outcomes) {
+            @($outcome.eventIds) | Should -HaveCount 1
+            $eventPath = Join-Path $context.Root (
+                "events\$($outcome.eventIds[0]).json")
+            $event = Read-ApprovedOwnerV2SignedRecord `
+                -Path $eventPath -Key $context.Key
+            $event.runId | Should -BeExactly $outcome.runId
+        }
+    }
+
+    It 'uses a distinct private key and emits signed dashboard-ready events' {
+        $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $initialized = Initialize-AutomaticOwnerV2DeliveryRoot `
+            -DeliveryRoot $root -RepoRoot $repoRoot
+        $key = Get-AutomaticOwnerV2ServiceKey `
+            -DeliveryRoot $initialized.Root
+        $key | Should -HaveCount 32
+        $initialized.KeyPath | Should -Match 'service-authorization'
+
+        $context = New-TestAutomaticOwnerV2Context
+        $provider = New-TestAutomaticOwnerV2Provider `
+            -Evidence $context.Evidence
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $eventPath = Get-ChildItem -LiteralPath (
+            Join-Path $context.Root 'events') -Filter '*.json' -File |
+            Select-Object -First 1
+        $event = Read-ApprovedOwnerV2SignedRecord `
+            -Path $eventPath.FullName -Key $context.Key
+        $event.kind | Should -BeExactly 'owner-v2-delivery-event'
+        $event.modelWriteCount | Should -Be 0
+        $event.providerWriteCount | Should -Be 1
+        $event.url | Should -Match '^https://dev.azure.com/'
+        $finding = Get-ApprovedOwnerV2Value $result.events[0] 'finding'
+        (Get-ApprovedOwnerV2Value $finding 'path' '') |
+            Should -BeExactly 'tests/WidgetTests.cs'
+    }
+
+    It 'keeps model tools empty and relation delivery isolated' {
+        $automatic = Get-Content -LiteralPath (
+            Join-Path $repoRoot `
+                'src\Agents\reviewer\AutomaticOwnerV2Comments.ps1') -Raw
+        $scheduled = Get-Content -LiteralPath (
+            Join-Path $repoRoot 'tools\Invoke-OwnerV2ScheduledDelivery.ps1') -Raw
+        $modelRunner = Get-Content -LiteralPath (
+            Join-Path $repoRoot `
+                'src\DevPilot.OwnerModelRunner\DevPilot.OwnerModelRunner.psm1') -Raw
+
+        $automatic | Should -Not -Match 'Open-AgentMcpSession|UpdateComment'
+        $scheduled | Should -Match "owner-v2-preview-cohort"
+        $scheduled | Should -Not -Match 'relation-v2-preview-cohort'
+        $modelRunner | Should -Match 'effectiveTools'
+        $modelRunner | Should -Match '@\(\)'
+        (Get-AutomaticOwnerV2ExitCode -Health healthy) | Should -Be 0
+        (Get-AutomaticOwnerV2ExitCode -Health disabled) | Should -Be 0
+        (Get-AutomaticOwnerV2ExitCode -Health partial) | Should -Be 2
+        (Get-AutomaticOwnerV2ExitCode -Health refused) | Should -Be 3
+        (Get-AutomaticOwnerV2ExitCode -Health unexpected) | Should -Be 1
+        (Get-AutomaticOwnerV2RunLimit `
+            -PolicyMaximum 1 -RequestedMaximum 5) | Should -Be 1
+        (Get-AutomaticOwnerV2RunLimit `
+            -PolicyMaximum 5 -RequestedMaximum 3) | Should -Be 3
+        {
+            Get-AutomaticOwnerV2RunLimit `
+                -PolicyMaximum 6 -RequestedMaximum 5
+        } | Should -Throw '*per-run create ceiling*'
+        (Get-AutomaticOwnerV2ScheduledHealth `
+            -FailedCount 0 -CompletedCount 1 -AutomaticEnabled $true `
+            -DeliveryResults @([pscustomobject]@{ health = 'healthy' }) `
+            -RemainingRunCreates 0 -ProcessedRecords 1) |
+            Should -BeExactly 'healthy'
+        (Get-AutomaticOwnerV2ScheduledHealth `
+            -FailedCount 0 -CompletedCount 2 -AutomaticEnabled $true `
+            -DeliveryResults @([pscustomobject]@{ health = 'healthy' }) `
+            -RemainingRunCreates 0 -ProcessedRecords 1) |
+            Should -BeExactly 'partial'
+        (Get-AutomaticOwnerV2ScheduledHealth `
+            -FailedCount 0 -CompletedCount 2 -AutomaticEnabled $true `
+            -DeliveryResults @(
+                [pscustomobject]@{ health = 'refused' },
+                [pscustomobject]@{ health = 'healthy' }
+            ) -RemainingRunCreates 4 -ProcessedRecords 2) |
+            Should -BeExactly 'partial'
+        (Get-AutomaticOwnerV2ScheduledHealth `
+            -FailedCount 0 -CompletedCount 1 -AutomaticEnabled $true `
+            -DeliveryResults @([pscustomobject]@{ health = 'refused' }) `
+            -RemainingRunCreates 5 -ProcessedRecords 1) |
+            Should -BeExactly 'refused'
+    }
+
+    It 'runs the scheduler wrapper disabled with zero delivery state or writes' {
+        $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $state = Join-Path $root 'state'
+        $delivery = Join-Path $root 'delivery'
+        $output = @(& (Get-Command pwsh).Source -NoProfile -File (
+                Join-Path $repoRoot 'tools\Invoke-OwnerV2ScheduledDelivery.ps1'
+            ) -StateRoot $state -ManifestPath (
+                Join-Path $repoRoot `
+                    'tests\fixtures\owner-orchestrator\generic-cohort.json'
+            ) -ToolkitConfigPath (
+                Join-Path $repoRoot `
+                    'samples\owner-v2-auto-delivery.config.json'
+            ) -DeliveryRoot $delivery 2>&1)
+        $LASTEXITCODE | Should -Be 0
+        ($output -join "`n") | Should -Match 'disabled'
+        Test-Path -LiteralPath $delivery | Should -BeFalse
     }
 }

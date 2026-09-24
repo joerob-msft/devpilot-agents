@@ -74,6 +74,9 @@ bounded process/replay adapter in
 [docs/owner-model-runner.md](docs/owner-model-runner.md). The layer 5 preview
 cohort orchestrator is documented in
 [docs/owner-preview-orchestrator.md](docs/owner-preview-orchestrator.md).
+The separately gated wrapper-owned create-only delivery phase, signed service
+policy, recovery rules, and dashboard event feed are documented in
+[docs/owner-automatic-delivery.md](docs/owner-automatic-delivery.md).
 The capability-specific contextual assessment and its sanitized demonstration
 result are documented in
 [docs/relation-evidence-capability.md](docs/relation-evidence-capability.md).
@@ -82,8 +85,10 @@ Its
 distinguishes code capability, operator deployment, state separation, and
 writer authority. Live Owner observations can reconcile bounded provider
 discussions into an actionable V1-compatible create/update/no-op/unknown queue,
-but these layers remain preview-only and do not themselves register scheduling
-or authorize writes.
+while the semantic/model layers remain preview-only. Automatic delivery is
+absent/false by default, accepts only the exact Owner method-level
+`wouldCreate` rule, and cannot grant any authority to the model or relation
+capability.
 
 Azure DevOps live discussion acquisition uses the full REST thread and
 iteration shapes through the repository-owned normalizer; the reduced MCP
