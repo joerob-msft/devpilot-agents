@@ -1497,17 +1497,25 @@ Describe 'Automatic Owner v2 create-only delivery' {
 
     It 'runs the scheduler wrapper disabled with zero delivery state or writes' {
         $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $root | Out-Null
         $state = Join-Path $root 'state'
         $delivery = Join-Path $root 'delivery'
+        $manifestPath = Join-Path $root 'cohort.json'
+        $configPath = Join-Path $root 'config.json'
+        [IO.File]::WriteAllText(
+            $manifestPath,
+            [IO.File]::ReadAllText((Join-Path $repoRoot `
+                    'tests\fixtures\owner-orchestrator\generic-cohort.json')),
+            [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText(
+            $configPath,
+            [IO.File]::ReadAllText((Join-Path $repoRoot `
+                    'samples\owner-v2-auto-delivery.config.json')),
+            [Text.UTF8Encoding]::new($false))
         $output = @(& (Get-Command pwsh).Source -NoProfile -File (
                 Join-Path $repoRoot 'tools\Invoke-OwnerV2ScheduledDelivery.ps1'
-            ) -StateRoot $state -ManifestPath (
-                Join-Path $repoRoot `
-                    'tests\fixtures\owner-orchestrator\generic-cohort.json'
-            ) -ToolkitConfigPath (
-                Join-Path $repoRoot `
-                    'samples\owner-v2-auto-delivery.config.json'
-            ) -DeliveryRoot $delivery 2>&1)
+            ) -StateRoot $state -ManifestPath $manifestPath `
+            -ToolkitConfigPath $configPath -DeliveryRoot $delivery 2>&1)
         if ($LASTEXITCODE -ne 0) {
             throw "Disabled scheduler exited $LASTEXITCODE`: $($output -join "`n")"
         }
