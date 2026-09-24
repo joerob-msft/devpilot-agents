@@ -349,6 +349,11 @@ function Read-ApprovedOwnerV2Evidence {
                     'src\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
             cliSha256 = Get-ApprovedOwnerV2FileSha256 (
                 Join-Path $RepoRoot 'tools\Invoke-ApprovedOwnerV2Comment.ps1')
+            automaticWriterSha256 = Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'src\Agents\reviewer\AutomaticOwnerV2Comments.ps1')
+            schedulerSha256 = Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot 'tools\Invoke-OwnerV2ScheduledDelivery.ps1')
         }
         Provider = [ordered]@{
             kind = [string]$discussionProvider.kind
