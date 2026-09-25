@@ -95,7 +95,7 @@ export interface RunSummary {
   health: string;
   durationMilliseconds: number | null;
   attempts: number;
-  modelCalls: number;
+  modelCalls: number | null;
   ownerCompleted: number;
   ownerFailed: number;
   relationCompleted: number;
@@ -584,15 +584,26 @@ async function listFiles(
   return result;
 }
 
-async function defaultKeyPermissionChecker(path: string, root: string, toolkitRoot: string): Promise<boolean> {
+async function defaultKeyPermissionChecker(
+  path: string,
+  root: string,
+  toolkitRoot: string,
+  guard: RootGuard,
+): Promise<boolean> {
   if (process.platform !== "win32") {
     const info = await stat(path);
     return (info.mode & 0o077) === 0;
   }
   const harness = join(toolkitRoot, "src", "DevPilot.AgentHarness", "DevPilot.AgentHarness.psd1");
+  if (guard.rootFor(harness) !== resolve(toolkitRoot)) return false;
+  try {
+    await guard.assertSafe(harness, "file");
+  } catch {
+    return false;
+  }
   const script = [
     "$ErrorActionPreference='Stop'",
-    "Import-Module -LiteralPath $env:DEVPILOT_REPORT_HARNESS -Force",
+    "Import-Module -Name $env:DEVPILOT_REPORT_HARNESS -Force",
     "[void](Assert-AgentTrustedFile -Path $env:DEVPILOT_REPORT_KEY -AllowedRoot $env:DEVPILOT_REPORT_ROOT -Private)",
     "'true'",
   ].join(";");
@@ -802,35 +813,139 @@ export function buildAzureDevOpsLinks(input: AzureDevOpsLinkInput): { prUrl: str
   return { prUrl: pr.toString(), commentUrl: comment.toString() };
 }
 
-function parseRun(value: unknown, fallbackId: string): RunSummary {
-  const raw = asRecord(value);
-  const observation = asRecord(raw.observation);
-  const delivery = asRecord(raw.delivery);
+function requiredCount(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function requiredTimestamp(value: unknown, name: string): string {
+  const timestamp = normalizeTimestamp(value);
+  if (!timestamp) throw new Error(`${name} must be a valid timestamp`);
+  return timestamp;
+}
+
+function requiredRunId(value: unknown, name: string): string {
+  const id = boundedText(value, 128);
+  if (!id || !/^[A-Za-z0-9._-]+$/.test(id)) throw new Error(`${name} is invalid`);
+  return id;
+}
+
+function requiredHealth(value: unknown, name: string): string {
+  const health = boundedText(value, 40);
+  if (!["healthy", "partial", "refused", "disabled"].includes(health)) {
+    throw new Error(`${name} is unsupported`);
+  }
+  return health;
+}
+
+function parseRecordCounts(value: unknown, name: string): {
+  completed: number;
+  failed: number;
+  attempts: number;
+} {
+  const records = asArray(value).map(asRecord);
+  let completed = 0;
+  let failed = 0;
+  let attempts = 0;
+  for (const [index, record] of records.entries()) {
+    const state = boundedText(record.state, 40);
+    if (!["pending", "running", "completed", "incomplete", "unknown"].includes(state)) {
+      throw new Error(`${name}[${index}].state is unsupported`);
+    }
+    attempts += requiredCount(record.attempts, `${name}[${index}].attempts`);
+    if (state === "completed") completed++;
+    else failed++;
+  }
+  return { completed, failed, attempts };
+}
+
+function parseCompositeScheduledRun(raw: JsonRecord): RunSummary {
+  const completedUtc = requiredTimestamp(raw.completedUtc, "completedUtc");
+  const toolkitHead = boundedText(raw.toolkitHead, 40);
+  const toolkitTree = boundedText(raw.toolkitTree, 40);
+  if (!isHex(toolkitHead, 40) || !isHex(toolkitTree, 40)) {
+    throw new Error("scheduled run toolkit identity is invalid");
+  }
+  const owner = parseRecordCounts(raw.records, "records");
+  const relation = parseRecordCounts(raw.relationRecords, "relationRecords");
+  const operatorOutput = asRecord(raw.ownerOperatorOutput);
+  const reconciliation = asRecord(operatorOutput.reconciliation);
+  const delivery = asRecord(raw.ownerAutoDelivery);
+  if (delivery.schemaVersion !== 1 || delivery.kind !== "owner-v2-automatic-delivery-result") {
+    throw new Error("scheduled run automatic delivery result is unsupported");
+  }
+  const overallOutcome = boundedText(raw.overallOutcome, 40);
+  if (!["success", "partial", "failure"].includes(overallOutcome)) {
+    throw new Error("scheduled run overallOutcome is unsupported");
+  }
+  const deliveryHealth = requiredHealth(delivery.health, "ownerAutoDelivery.health");
+  if (overallOutcome === "success" && owner.failed + relation.failed > 0) {
+    throw new Error("successful scheduled run contains incomplete Owner or relation records");
+  }
+  requiredCount(reconciliation.wouldCreate, "reconciliation.wouldCreate");
+  requiredCount(reconciliation.wouldUpdate, "reconciliation.wouldUpdate");
+  const unknown = requiredCount(reconciliation.unknown, "reconciliation.unknown");
+  const pending = requiredCount(delivery.remainingWouldCreate, "ownerAutoDelivery.remainingWouldCreate");
+  const posted = requiredCount(reconciliation.noOp, "reconciliation.noOp") +
+    requiredCount(reconciliation.created, "reconciliation.created") +
+    requiredCount(reconciliation.updated, "reconciliation.updated");
+  const incomplete = owner.failed + relation.failed > 0 || unknown > 0 || overallOutcome !== "success";
+  const health = incomplete && deliveryHealth === "healthy"
+    ? overallOutcome === "failure" ? "refused" : "partial"
+    : incomplete && deliveryHealth === "disabled" ? "partial"
+      : deliveryHealth;
+  return {
+    runId: requiredRunId(delivery.runId, "ownerAutoDelivery.runId"),
+    occurredUtc: completedUtc,
+    health,
+    durationMilliseconds: null,
+    attempts: owner.attempts + relation.attempts,
+    modelCalls: null,
+    ownerCompleted: owner.completed,
+    ownerFailed: owner.failed,
+    relationCompleted: relation.completed,
+    relationFailed: relation.failed,
+    queuePending: pending,
+    queuePosted: posted,
+    providerWrites: requiredCount(delivery.providerWrites, "ownerAutoDelivery.providerWrites"),
+    modelWrites: requiredCount(delivery.modelWrites, "ownerAutoDelivery.modelWrites"),
+    deliveryOutcome: deliveryHealth,
+    diagnostic: "Model-call count is unavailable in owner-relation-v2-preview-scheduled-run v1.",
+  };
+}
+
+function parseReportingRunProjection(raw: JsonRecord): RunSummary {
   const owner = asRecord(raw.owner);
   const relation = asRecord(raw.relation);
   const queue = asRecord(raw.queue);
-  const start = normalizeTimestamp(raw.startedUtc ?? raw.startUtc);
-  const end = normalizeTimestamp(raw.completedUtc ?? raw.occurredUtc ?? raw.updatedUtc);
-  const durationMilliseconds = nullableInteger(raw.durationMilliseconds) ??
-    (start && end ? Math.max(0, Date.parse(end) - Date.parse(start)) : null);
   return {
-    runId: boundedText(raw.runId, 128) || fallbackId,
-    occurredUtc: end ?? start ?? "",
-    health: boundedText(raw.health, 80) || "unknown",
-    durationMilliseconds,
-    attempts: safeCount(raw.attempts ?? owner.attempts),
-    modelCalls: safeCount(raw.modelCalls ?? owner.modelCalls),
-    ownerCompleted: safeCount(owner.completed ?? observation.completed),
-    ownerFailed: safeCount(owner.failed ?? observation.failed),
-    relationCompleted: safeCount(relation.completed),
-    relationFailed: safeCount(relation.failed),
-    queuePending: safeCount(queue.pending ?? delivery.remainingWouldCreate),
-    queuePosted: safeCount(queue.posted ?? delivery.providerWrites),
-    providerWrites: safeCount(raw.providerWrites ?? delivery.providerWrites),
-    modelWrites: safeCount(raw.modelWrites ?? delivery.modelWrites),
-    deliveryOutcome: boundedText(raw.deliveryOutcome ?? delivery.health ?? raw.outcome, 120) || "unknown",
-    diagnostic: boundedText(raw.diagnostic ?? asRecord(delivery.diagnostic).message, 240),
+    runId: requiredRunId(raw.runId, "runId"),
+    occurredUtc: requiredTimestamp(raw.completedUtc, "completedUtc"),
+    health: requiredHealth(raw.health, "health"),
+    durationMilliseconds: nullableInteger(raw.durationMilliseconds),
+    attempts: requiredCount(raw.attempts, "attempts"),
+    modelCalls: requiredCount(raw.modelCalls, "modelCalls"),
+    ownerCompleted: requiredCount(owner.completed, "owner.completed"),
+    ownerFailed: requiredCount(owner.failed, "owner.failed"),
+    relationCompleted: requiredCount(relation.completed, "relation.completed"),
+    relationFailed: requiredCount(relation.failed, "relation.failed"),
+    queuePending: requiredCount(queue.pending, "queue.pending"),
+    queuePosted: requiredCount(queue.posted, "queue.posted"),
+    providerWrites: requiredCount(raw.providerWrites, "providerWrites"),
+    modelWrites: requiredCount(raw.modelWrites, "modelWrites"),
+    deliveryOutcome: requiredHealth(raw.deliveryOutcome, "deliveryOutcome"),
+    diagnostic: boundedText(raw.diagnostic, 240),
   };
+}
+
+function parseRun(value: unknown): RunSummary {
+  const raw = asRecord(value);
+  if (raw.schemaVersion !== 1) throw new Error("run schemaVersion is unsupported");
+  if (raw.kind === "owner-relation-v2-preview-scheduled-run") return parseCompositeScheduledRun(raw);
+  if (raw.kind === "devpilot-owner-reporting-run-projection") return parseReportingRunProjection(raw);
+  throw new Error("run kind is unsupported");
 }
 
 async function readRunHistory(context: ScanContext): Promise<RunSummary[]> {
@@ -839,7 +954,7 @@ async function readRunHistory(context: ScanContext): Promise<RunSummary[]> {
   const lastRun = context.config.files.lastRun;
   if (lastRun && runnerRoot) {
     try {
-      runs.push(parseRun(await readJson(context, lastRun, runnerRoot), "last-run"));
+      runs.push(parseRun(await readJson(context, lastRun, runnerRoot)));
     } catch (error) {
       context.diagnostics.push(`last-run unavailable: ${boundedText(error instanceof Error ? error.message : String(error), 180)}`);
     }
@@ -853,7 +968,7 @@ async function readRunHistory(context: ScanContext): Promise<RunSummary[]> {
         try {
           const value: unknown = JSON.parse(line);
           assertJsonShape(value);
-          runs.push(parseRun(value, `scheduled-${index}`));
+          runs.push(parseRun(value));
         } catch {
           context.quarantine.push({ file: relative(runnerRoot, log), reason: `scheduled log line ${index + 1} is invalid`, occurredUtc: "" });
         }
@@ -1300,8 +1415,58 @@ function manualDeliveries(
         symbol: boundedText(selection.symbol, 256),
       } : findingAnchor(observed ?? {});
       const reconciliation = asRecord(observed?.reconciliation);
-      const threadId = nullableInteger(reconciliation.threadId);
-      const commentId = nullableInteger(reconciliation.commentId);
+      const writeOutcome = boundedText(result.outcome ?? outcome.status, 120) || "unknown";
+      const linkEligible = intent?.publish === true &&
+        boundedText(outcome.status, 80) === "completed" &&
+        safeCount(result.providerWrites) > 0 &&
+        ["created", "updated"].includes(writeOutcome);
+      const thread = asRecord(reconciliation.thread);
+      const nestedThreadId = nullableInteger(thread.threadId);
+      const nestedCommentId = nullableInteger(thread.commentId);
+      const flatThreadId = nullableInteger(reconciliation.threadId);
+      const flatCommentId = nullableInteger(reconciliation.commentId);
+      const nestedPresent = Object.keys(thread).length > 0;
+      const flatPresent = reconciliation.threadId !== undefined || reconciliation.commentId !== undefined;
+      let threadId: number | null = null;
+      let commentId: number | null = null;
+      let linkBindingDiagnostic = "";
+      if (linkEligible) {
+        const observedAnchor = findingAnchor(observed ?? {});
+        const selectionDigest = boundedText(selection?.bodySha256, 64);
+        const resultDigest = boundedText(result.bodySha256, 64);
+        const observedDigest = boundedText(reconciliation.bodySha256, 64);
+        const selectionMarker = boundedText(selection?.marker, 64);
+        const resultMarker = boundedText(result.marker, 64);
+        const anchorMatches = Boolean(selection) &&
+          anchor.path === observedAnchor.path &&
+          anchor.line === observedAnchor.line &&
+          anchor.symbol === observedAnchor.symbol;
+        if (!selection || !observed || !anchorMatches ||
+            !isHex(selectionDigest, 64) || !isHex(resultDigest, 64) ||
+            selectionDigest !== resultDigest || selectionDigest !== observedDigest ||
+            !isHex(selectionMarker, 64) || selectionMarker !== resultMarker) {
+          linkBindingDiagnostic = "Manual comment link binding is incomplete or mismatched.";
+        } else if (nestedPresent) {
+          if (boundedText(thread.availability, 40) !== "available" ||
+              nestedThreadId === null || nestedCommentId === null) {
+            linkBindingDiagnostic = "Manual comment nested thread identity is unavailable or malformed.";
+          } else if (flatPresent && (flatThreadId !== nestedThreadId || flatCommentId !== nestedCommentId)) {
+            linkBindingDiagnostic = "Manual comment thread identity is ambiguous across nested and legacy fields.";
+          } else {
+            threadId = nestedThreadId;
+            commentId = nestedCommentId;
+          }
+        } else if (flatPresent) {
+          if (flatThreadId === null || flatCommentId === null) {
+            linkBindingDiagnostic = "Legacy manual comment thread identity is incomplete.";
+          } else {
+            threadId = flatThreadId;
+            commentId = flatCommentId;
+          }
+        } else {
+          linkBindingDiagnostic = "Manual comment thread identity is unavailable.";
+        }
+      }
       const links = safeLinks(config, projectId, repositoryId, pullRequestId, threadId, commentId, anchor.path, anchor.line);
       const body = typeof selection?.body === "string" ? selection.body : "";
       const digest = boundedText(selection?.bodySha256 ?? result.bodySha256, 64);
@@ -1309,7 +1474,7 @@ function manualDeliveries(
       deliveries.push({
         id: `manual:${invocationId}:${index}`, mode: "manual",
         action: intent?.publish === true ? "publish" : "preview",
-        outcome: boundedText(result.outcome ?? outcome.status, 120) || "unknown",
+        outcome: writeOutcome,
         occurredUtc, pullRequestId, threadId, commentId,
         prUrl: links.prUrl, commentUrl: links.commentUrl,
         ...anchor,
@@ -1322,7 +1487,7 @@ function manualDeliveries(
         body: bodyVerified ? body : null,
         bodySha256: digest,
         bodyStatus: bodyVerified ? "verified" : digest ? "digest-only" : "unavailable",
-        diagnostic: boundedText(outcome.diagnostic, 240) || links.diagnostic,
+        diagnostic: boundedText(outcome.diagnostic, 240) || linkBindingDiagnostic || links.diagnostic,
       });
     });
     if (boundedText(outcome.status, 80) === "failed" || outcome.providerWrites === "unknown") {
@@ -1468,7 +1633,7 @@ export class LocalReportingAdapter {
       quarantine: [],
       diagnostics: [],
       keyPermissionChecker: this.options.keyPermissionChecker ??
-        ((path, root) => defaultKeyPermissionChecker(path, root, config.roots.toolkit)),
+        ((path, root) => defaultKeyPermissionChecker(path, root, config.roots.toolkit, guard)),
     };
     const taskReader = this.options.taskReader ?? readWindowsScheduledTask;
     const task = config.scheduledTaskName

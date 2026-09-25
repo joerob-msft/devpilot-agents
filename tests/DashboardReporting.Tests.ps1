@@ -7,6 +7,17 @@ BeforeAll {
 
 Describe 'Owner reporting dashboard startup boundary' {
     It 'accepts a reporting-only configuration during startup validation' {
+        $dashboardRoot = Join-Path $script:RepoRoot 'src\DevPilot.Dashboard'
+        $npm = (Get-Command npm -CommandType Application -ErrorAction Stop |
+                Select-Object -First 1).Source
+        Push-Location $dashboardRoot
+        try {
+            $buildOutput = & $npm run build 2>&1
+            $LASTEXITCODE | Should -Be 0 -Because ($buildOutput -join [Environment]::NewLine)
+        }
+        finally {
+            Pop-Location
+        }
         $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop |
                 Select-Object -First 1).Source
         $output = & $pwsh -NoProfile -NonInteractive -File $script:Launcher `

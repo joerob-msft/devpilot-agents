@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   LocalReportingAdapter,
   buildAzureDevOpsLinks,
@@ -19,6 +21,11 @@ import {
 } from "../src/reporting-view.js";
 
 type JsonRecord = Record<string, unknown>;
+const execFileAsync = promisify(execFile);
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
 
 function canonical(value: unknown): string {
   if (value === null) return "null";
@@ -52,6 +59,36 @@ async function write(path: string, value: string | Buffer): Promise<void> {
 
 async function writeJson(path: string, value: unknown): Promise<void> {
   await write(path, `${JSON.stringify(value)}\n`);
+}
+
+async function hardenWindowsPrivateTree(root: string): Promise<void> {
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "$root=$env:DEVPILOT_TEST_PRIVATE_ROOT",
+    "$current=[Security.Principal.WindowsIdentity]::GetCurrent().User",
+    "$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
+    "$allow=[Security.AccessControl.AccessControlType]::Allow",
+    "$full=[Security.AccessControl.FileSystemRights]::FullControl",
+    "$inherit=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit",
+    "$none=[Security.AccessControl.InheritanceFlags]::None",
+    "$prop=[Security.AccessControl.PropagationFlags]::None",
+    "function Set-Private([string]$path,[bool]$directory){",
+    "$acl=$(if($directory){[Security.AccessControl.DirectorySecurity]::new()}else{[Security.AccessControl.FileSecurity]::new()})",
+    "$acl.SetAccessRuleProtection($true,$false)",
+    "$flags=$(if($directory){$inherit}else{$none})",
+    "$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($current,$full,$flags,$prop,$allow))",
+    "$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system,$full,$flags,$prop,$allow))",
+    "Set-Acl -LiteralPath $path -AclObject $acl",
+    "}",
+    "Set-Private $root $true",
+    "Get-ChildItem -LiteralPath $root -Recurse -Force | Sort-Object { $_.FullName.Length } | ForEach-Object { Set-Private $_.FullName $_.PSIsContainer }",
+  ].join(";");
+  await execFileAsync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    env: { ...process.env, DEVPILOT_TEST_PRIVATE_ROOT: root },
+    timeout: 30_000,
+    maxBuffer: 64 * 1_024,
+    windowsHide: true,
+  });
 }
 
 const healthyTask: TaskHealth = {
@@ -147,9 +184,15 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
       disposition: "violation",
       anchor: { path: "tests/Widget Tests.cs", line: 12, symbol: "<script>alert(1)</script>" },
       reconciliation: {
-        classification: "wouldCreate",
-        reason: "reviewer-marker-not-found",
+        classification: "noOp",
+        reason: "reviewer-marker-body-current",
         bodySha256,
+        thread: {
+          availability: "available",
+          threadId: 200,
+          commentId: 201,
+          status: "active",
+        },
       },
     }],
   });
@@ -295,27 +338,29 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
     stateIdentity: identity,
     status: "completed",
     providerWrites: 1,
-    results: [{ findingId, outcome: "created", bodySha256, providerWrites: 1 }],
+    results: [{ findingId, marker, outcome: "created", bodySha256, providerWrites: 1 }],
     createdUtc: "20260924T190100Z",
   }, manualKey));
 
-  await writeJson(join(runnerRoot, "last-run.json"), {
-    runId: "scheduled-latest",
-    health: "healthy",
-    startedUtc: "2026-09-24T19:59:00Z",
-    completedUtc: "2026-09-24T20:00:00Z",
-    attempts: 1,
-    modelCalls: 1,
-    observation: { completed: 1, failed: 0 },
-    relation: { completed: 1, failed: 0 },
-    queue: { pending: 1, posted: 1 },
-    delivery: { providerWrites: 1, modelWrites: 0, health: "healthy" },
-  });
+  const scheduledRunFixture = JSON.parse(await readFile(
+    join(process.cwd(), "test", "fixtures", "owner-relation-scheduled-run.json"), "utf8",
+  ));
+  await writeJson(join(runnerRoot, "last-run.json"), scheduledRunFixture);
   const logLines = Array.from({ length: 20 }, (_, index) => JSON.stringify({
+    schemaVersion: 1,
+    kind: "devpilot-owner-reporting-run-projection",
     runId: `scheduled-${index}`,
     health: index === 0 ? "refused" : "healthy",
-    occurredUtc: `2026-09-${String(index + 1).padStart(2, "0")}T00:00:00Z`,
-    delivery: { providerWrites: index % 2, modelWrites: 0, health: index === 0 ? "refused" : "healthy" },
+    completedUtc: `2026-09-${String(index + 1).padStart(2, "0")}T00:00:00Z`,
+    attempts: 1,
+    modelCalls: 1,
+    owner: { completed: 1, failed: 0 },
+    relation: { completed: 1, failed: 0 },
+    queue: { pending: 0, posted: index % 2 },
+    providerWrites: index % 2,
+    modelWrites: 0,
+    deliveryOutcome: index === 0 ? "refused" : "healthy",
+    diagnostic: "",
   })).join("\n");
   await write(join(runnerRoot, "scheduled-runs.jsonl"), `${logLines}\n`);
 
@@ -444,18 +489,221 @@ test("reporting adapter verifies signed feeds, isolates relation findings, deriv
     assert.equal(snapshot.relations[0]?.writerEligible, false);
     assert.equal(snapshot.deliveries.length, 2);
     const automatic = snapshot.deliveries.find((row) => row.mode === "automatic");
+    const manual = snapshot.deliveries.find((row) => row.mode === "manual");
     assert.equal(automatic?.bodyStatus, "verified");
     assert.equal(automatic?.body, fixture.body);
     assert.equal(automatic?.providerWrites, 1);
     assert.match(automatic?.commentUrl ?? "", /dev\.azure\.com/);
     assert.doesNotMatch(automatic?.commentUrl ?? "", /foreign\.example/);
+    assert.match(manual?.commentUrl ?? "", /discussionId=200/);
+    assert.match(manual?.commentUrl ?? "", /commentId=201/);
     assert.equal(snapshot.overall.modelWrites, 0);
     assert.equal(snapshot.toolkit.matches, true);
+    const compositeRun = snapshot.runs.find((run) => run.runId === "sanitized-live-run");
+    assert.equal(compositeRun?.ownerCompleted, 1);
+    assert.equal(compositeRun?.relationCompleted, 1);
+    assert.equal(compositeRun?.attempts, 2);
+    assert.equal(compositeRun?.modelCalls, null);
+    assert.equal(compositeRun?.queuePosted, 9);
     const relationRows = reportingRows(snapshot, "relations");
     assert.match(relationRows[0]?.text.join(" ") ?? "", /NOT WRITER ELIGIBLE/);
     const deliveryRows = reportingRows(snapshot, "deliveries");
     assert.match(deliveryRows[0]?.text.join(" ") ?? "", /<script>alert\(1\)<\/script>/);
     assert.match(overviewLines(snapshot).join("\n"), /SERVICE HEALTHY/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("manual live audit links bind nine authoritative nested thread identities and reject ambiguity", async () => {
+  const fixture = await createFixture();
+  try {
+    const liveFixture = JSON.parse(await readFile(
+      join(process.cwd(), "test", "fixtures", "manual-nested-links.json"), "utf8",
+    )) as JsonRecord;
+    const observationPath = join(
+      fixture.stateRoot, "owner-v2-preview-state", "schema-1", "capabilities", "owner",
+      "observations", `${fixture.identity}.json`,
+    );
+    const observation = JSON.parse(await readFile(observationPath, "utf8")) as JsonRecord;
+    const body = String(liveFixture.body);
+    const bodySha256 = String(liveFixture.bodySha256);
+    const fixtureFindings = asArray(liveFixture.findings).map(asObject);
+    const findings = fixtureFindings.map((finding) => ({
+        identity: finding.findingId,
+        disposition: "violation",
+        anchor: {
+          path: finding.path,
+          line: finding.line,
+          symbol: finding.symbol,
+        },
+        reconciliation: {
+          classification: "noOp",
+          reason: "reviewer-marker-body-current",
+          bodySha256,
+          thread: {
+            availability: "available",
+            threadId: finding.threadId,
+            commentId: finding.commentId,
+            status: "active",
+          },
+        },
+      }));
+    const selections = fixtureFindings.map((finding) => ({
+        findingId: finding.findingId,
+        marker: finding.marker,
+        path: finding.path,
+        line: finding.line,
+        symbol: finding.symbol,
+        body,
+        bodySha256,
+      }));
+    const results = fixtureFindings.map((finding) => ({
+        findingId: finding.findingId,
+        marker: finding.marker,
+        outcome: "created",
+        bodySha256,
+        providerWrites: 1,
+      }));
+    observation.findings = findings;
+    await writeJson(observationPath, observation);
+    await rm(join(fixture.manualRoot, "intents", fixture.identity), { recursive: true, force: true });
+    await rm(join(fixture.manualRoot, "outcomes", fixture.identity), { recursive: true, force: true });
+    const invocationId = String(liveFixture.invocationId);
+    await write(join(fixture.manualRoot, "intents", fixture.identity, `${invocationId}.json`), signedEnvelope({
+      schemaVersion: 1,
+      kind: "owner-v2-comment-intent",
+      invocationId,
+      stateIdentity: fixture.identity,
+      publish: true,
+      selections,
+      createdUtc: "20260924T190000Z",
+    }, fixture.manualKey));
+    await write(join(fixture.manualRoot, "outcomes", fixture.identity, `${invocationId}.json`), signedEnvelope({
+      schemaVersion: 1,
+      kind: "owner-v2-comment-outcome",
+      invocationId,
+      stateIdentity: fixture.identity,
+      status: "completed",
+      providerWrites: 9,
+      results,
+      createdUtc: "20260924T190100Z",
+    }, fixture.manualKey));
+
+    const adapter = createAdapter(fixture.configPath, { taskReader: async () => healthyTask });
+    const snapshot = await adapter.read();
+    const published = snapshot.deliveries.filter((row) => row.mode === "manual" && row.outcome === "created");
+    assert.equal(published.length, 9);
+    assert.equal(published.filter((row) => row.commentUrl !== null).length, 9);
+    assert.ok(published.every((row) => row.commentUrl?.includes(`discussionId=${row.threadId}`)));
+
+    const firstReconciliation = asObject(asObject(findings[0]).reconciliation);
+    firstReconciliation.threadId = 9999;
+    firstReconciliation.commentId = 9999;
+    await writeJson(observationPath, observation);
+    const ambiguous = await adapter.read();
+    const first = ambiguous.deliveries.find((row) => row.mode === "manual" && row.outcome === "created" &&
+      row.path === "tests/Synthetic1.cs");
+    assert.equal(first?.commentUrl, null);
+    assert.match(first?.diagnostic ?? "", /ambiguous/);
+
+    delete firstReconciliation.thread;
+    firstReconciliation.threadId = 1001;
+    firstReconciliation.commentId = 2001;
+    await writeJson(observationPath, observation);
+    const legacy = await adapter.read();
+    const legacyFirst = legacy.deliveries.find((row) => row.mode === "manual" && row.outcome === "created" &&
+      row.path === "tests/Synthetic1.cs");
+    assert.match(legacyFirst?.commentUrl ?? "", /discussionId=1001/);
+    assert.match(legacyFirst?.commentUrl ?? "", /commentId=2001/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("last-run parsing rejects unknown envelopes instead of manufacturing health", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeJson(join(fixture.runnerRoot, "last-run.json"), {
+      schemaVersion: 1,
+      kind: "unknown-run-envelope",
+      health: "healthy",
+    });
+    const snapshot = await createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-24T20:30:00Z"),
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.ok(snapshot.diagnostics.some((message) => /last-run unavailable: run kind is unsupported/.test(message)));
+    assert.equal(snapshot.overall.status, "degraded");
+    assert.equal(snapshot.runs.some((run) => run.runId === "last-run"), false);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("composite run producer partial/failure and unknown reconciliation cannot surface healthy", async () => {
+  const fixture = await createFixture();
+  try {
+    const path = join(fixture.runnerRoot, "last-run.json");
+    const run = JSON.parse(await readFile(path, "utf8")) as JsonRecord;
+    run.overallOutcome = "partial";
+    asObject(asObject(run.ownerOperatorOutput).reconciliation).unknown = 1;
+    await writeJson(path, run);
+    const partial = await createAdapter(fixture.configPath, {
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.equal(partial.runs.find((item) => item.runId === "sanitized-live-run")?.health, "partial");
+
+    run.overallOutcome = "failure";
+    asObject(asObject(run.ownerOperatorOutput).reconciliation).unknown = 0;
+    await writeJson(path, run);
+    const failed = await createAdapter(fixture.configPath, {
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.equal(failed.runs.find((item) => item.runId === "sanitized-live-run")?.health, "refused");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("Windows default key verification loads valid feeds and quarantines invalid signatures", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const fixture = await createFixture();
+  try {
+    const repoRoot = resolve(process.cwd(), "..", "..");
+    const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as JsonRecord;
+    asObject(config.roots).toolkit = repoRoot;
+    await writeJson(fixture.configPath, config);
+    await write(join(fixture.deliveryRoot, "events", "invalid-windows.json"), signedEnvelope({
+      schemaVersion: 1,
+      kind: "owner-v2-delivery-event",
+      eventId: "invalid-windows",
+      runId: "invalid-windows",
+      occurredUtc: "20260924T200200Z",
+      runHealth: "healthy",
+      subject: {},
+      finding: {},
+      action: "none",
+      outcome: "noOp",
+      threadId: null,
+      commentId: null,
+      url: null,
+      modelWriteCount: 0,
+      providerWriteCount: 0,
+      providerWriteState: "none",
+      diagnostic: null,
+    }, randomBytes(32)));
+    await hardenWindowsPrivateTree(fixture.deliveryRoot);
+    await hardenWindowsPrivateTree(fixture.manualRoot);
+    const snapshot = await new LocalReportingAdapter(fixture.configPath, {
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.equal(snapshot.deliveries.some((row) => row.mode === "automatic"), true);
+    assert.equal(snapshot.deliveries.some((row) => row.mode === "manual"), true);
+    assert.ok(snapshot.quarantine.some((row) => row.file.endsWith("invalid-windows.json") &&
+      /signature verification failed/.test(row.reason)));
+    assert.equal(snapshot.diagnostics.some((message) => /permissions are not restrictive/.test(message)), false);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

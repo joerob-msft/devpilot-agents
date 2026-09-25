@@ -122,7 +122,7 @@ function runRow(run: RunSummary): ReportingRow {
   const text = [
     `${run.occurredUtc || "time unavailable"} | ${run.health} | run ${run.runId}`,
     `Owner ${run.ownerCompleted} completed / ${run.ownerFailed} failed | Relation ${run.relationCompleted} completed / ${run.relationFailed} failed`,
-    `Attempts ${run.attempts} | model calls ${run.modelCalls} | queue pending ${run.queuePending} / posted ${run.queuePosted}`,
+    `Attempts ${run.attempts} | model calls ${run.modelCalls ?? "unknown"} | queue pending ${run.queuePending} / posted ${run.queuePosted}`,
     `Provider writes ${run.providerWrites} | model writes ${run.modelWrites} | delivery ${run.deliveryOutcome}`,
     ...(run.durationMilliseconds === null ? [] : [`Duration ${run.durationMilliseconds} ms`]),
     ...(run.diagnostic ? [`Diagnostic: ${run.diagnostic}`] : []),

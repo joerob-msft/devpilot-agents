@@ -60,6 +60,18 @@ The adapter resolves every file under its declared root and rejects traversal,
 symbolic links, junctions/reparse points, foreign real paths, oversized files,
 and scans that exceed the count or time budget.
 
+`files.lastRun` should point directly at the scheduler's
+`owner-relation-v2-preview-scheduled-run` schema-v1 `last-run.json`. The
+adapter validates that exact kind, top-level completion/toolkit identity,
+Owner and relation record arrays, Owner reconciliation counts, and the nested
+`owner-v2-automatic-delivery-result`. Model-call count is shown as unavailable
+because this envelope does not expose it. The explicitly typed
+`devpilot-owner-reporting-run-projection` v1 shape remains accepted for
+existing installations; arbitrary flat JSON is rejected rather than treated
+as a healthy run. Producer `partial`/`failure`, incomplete records, or unknown
+Owner reconciliation always downgrade run health even when the automatic
+delivery sub-result alone says healthy.
+
 The automatic HMAC key is read only from
 `delivery\keys\owner-v2-service-authorization.hmac`; the manual key is read
 only from `manual\keys\owner-v2-comment-approval.hmac`. Each must be exactly
@@ -137,6 +149,15 @@ Success is never inferred from an intent or process exit.
 
 Manual intent/outcome audits use the distinct manual root and manual key.
 They are verified with the same envelope rules and remain labeled manual.
+Published manual links bind the signed outcome state/finding/marker/body
+digest to the matching signed intent selection and current observation
+finding. Authoritative IDs are read from
+`finding.reconciliation.thread.threadId/commentId` only when availability is
+`available` and the path/line/symbol/body bindings match. The earlier typed
+flat `reconciliation.threadId/commentId` shape remains accepted only when the
+nested shape is absent; conflicting nested and flat IDs are reported as
+ambiguous and no comment link is produced. Preview/dry-run audits never borrow
+links from a later live observation.
 
 The automatic event deliberately contains no comment body. Exact deterministic
 text is displayed only when all of these local bindings match:
@@ -195,6 +216,10 @@ The repository renderer fixture uses synthetic IDs, paths, and comments.
   file itself is readable.
 - **HMAC permissions are not restrictive**: repair the private root ACL; do
   not copy the key into the repository or loosen it for the dashboard.
+- **Signed feeds disappear only on Windows**: use a build containing the
+  absolute-path `Import-Module -Name <manifest-path>` key verifier. The module
+  manifest path is root-confined and link-checked before PowerShell starts;
+  module-name lookup is not used.
 - **Quarantine**: preserve the file and key, disable automatic delivery if a
   write may be ambiguous, and reconcile the exact marker/thread manually.
 - **Toolkit mismatch**: compare expected head/tree with the external toolkit
@@ -206,6 +231,9 @@ The repository renderer fixture uses synthetic IDs, paths, and comments.
 - **No exact body**: inspect the signed intent, observation body digest,
   toolkit identity, and formatter digest. The dashboard intentionally refuses
   partial derivation.
+- **Last run unavailable**: point `files.lastRun` at the scheduler's composite
+  schema-v1 envelope, not an untyped launch-time projection. Unknown
+  schema/kind or inconsistent success/count fields fail closed.
 
 ## Rollback and uninstall
 

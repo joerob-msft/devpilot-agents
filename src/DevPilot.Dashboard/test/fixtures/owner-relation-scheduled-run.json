@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "kind": "owner-relation-v2-preview-scheduled-run",
+  "completedUtc": "2026-09-25T00:30:32.446092Z",
+  "toolkitHead": "ffffffffffffffffffffffffffffffffffffffff",
+  "toolkitTree": "1111111111111111111111111111111111111111",
+  "manifestDigest": "v1:sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "records": [
+    {
+      "identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "state": "completed",
+      "attempts": 1
+    }
+  ],
+  "ownerOperatorOutput": {
+    "reconciliation": {
+      "created": 0,
+      "noOp": 9,
+      "unknown": 0,
+      "updated": 0,
+      "wouldCreate": 0,
+      "wouldUpdate": 0
+    }
+  },
+  "ownerAutoDelivery": {
+    "schemaVersion": 1,
+    "kind": "owner-v2-automatic-delivery-result",
+    "runId": "sanitized-live-run",
+    "health": "healthy",
+    "providerWrites": 0,
+    "modelWrites": 0,
+    "remainingWouldCreate": 0,
+    "events": [],
+    "diagnostic": null
+  },
+  "relationRecords": [
+    {
+      "identity": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "state": "completed",
+      "attempts": 1
+    }
+  ],
+  "capabilities": {
+    "owner": {
+      "outcome": "complete"
+    },
+    "ownerAutoDelivery": {
+      "outcome": "healthy"
+    },
+    "relation": {
+      "outcome": "complete"
+    }
+  },
+  "overallOutcome": "success"
+}

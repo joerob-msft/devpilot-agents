@@ -1,0 +1,89 @@
+{
+  "stateIdentity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "invocationId": "sanitized-manual-run",
+  "body": "Synthetic Owner comment",
+  "bodySha256": "d96c66e5cf7c7902af50b12e13371a049496b2a1fa25f05bc2c37a89d753e1df",
+  "findings": [
+    {
+      "findingId": "owner-v2:0000000000000000000000000000000000000000000000000000000000000001",
+      "marker": "1000000000000000000000000000000000000000000000000000000000000001",
+      "path": "tests/Synthetic1.cs",
+      "line": 11,
+      "symbol": "Synthetic1",
+      "threadId": 1001,
+      "commentId": 2001
+    },
+    {
+      "findingId": "owner-v2:0000000000000000000000000000000000000000000000000000000000000002",
+      "marker": "1000000000000000000000000000000000000000000000000000000000000002",
+      "path": "tests/Synthetic2.cs",
+      "line": 12,
+      "symbol": "Synthetic2",
+      "threadId": 1002,
+      "commentId": 2002
+    },
+    {
+      "findingId": "owner-v2:0000000000000000000000000000000000000000000000000000000000000003",
+      "marker": "1000000000000000000000000000000000000000000000000000000000000003",
+      "path": "tests/Synthetic3.cs",
+      "line": 13,
+      "symbol": "Synthetic3",
+      "threadId": 1003,
+      "commentId": 2003
+    },
+    {
+      "findingId": "owner-v2:0000000000000000000000000000000000000000000000000000000000000004",
+      "marker": "1000000000000000000000000000000000000000000000000000000000000004",
+      "path": "tests/Synthetic4.cs",
+      "line": 14,
+      "symbol": "Synthetic4",
+      "threadId": 1004,
+      "commentId": 2004
+    },
+    {
+      "findingId": "owner-v2:0000000000000000000000000000000000000000000000000000000000000005",
+      "marker": "1000000000000000000000000000000000000000000000000000000000000005",
+      "path": "tests/Synthetic5.cs",
+      "line": 15,
+      "symbol": "Synthetic5",
+      "threadId": 1005,
+      "commentId": 2005
+    },
+    {
+      "findingId": "owner-v2:0000000000000000000000000000000000000000000000000000000000000006",
+      "marker": "1000000000000000000000000000000000000000000000000000000000000006",
+      "path": "tests/Synthetic6.cs",
+      "line": 16,
+      "symbol": "Synthetic6",
+      "threadId": 1006,
+      "commentId": 2006
+    },
+    {
+      "findingId": "owner-v2:0000000000000000000000000000000000000000000000000000000000000007",
+      "marker": "1000000000000000000000000000000000000000000000000000000000000007",
+      "path": "tests/Synthetic7.cs",
+      "line": 17,
+      "symbol": "Synthetic7",
+      "threadId": 1007,
+      "commentId": 2007
+    },
+    {
+      "findingId": "owner-v2:0000000000000000000000000000000000000000000000000000000000000008",
+      "marker": "1000000000000000000000000000000000000000000000000000000000000008",
+      "path": "tests/Synthetic8.cs",
+      "line": 18,
+      "symbol": "Synthetic8",
+      "threadId": 1008,
+      "commentId": 2008
+    },
+    {
+      "findingId": "owner-v2:0000000000000000000000000000000000000000000000000000000000000009",
+      "marker": "1000000000000000000000000000000000000000000000000000000000000009",
+      "path": "tests/Synthetic9.cs",
+      "line": 19,
+      "symbol": "Synthetic9",
+      "threadId": 1009,
+      "commentId": 2009
+    }
+  ]
+}
