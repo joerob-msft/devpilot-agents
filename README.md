@@ -24,6 +24,10 @@ writes to the PR host directly.
 > implemented for Azure DevOps, with a shared read-only dashboard and trusted
 > launchers for observing or operating either or both. Interfaces will change.
 
+The optional [sign-off confidence replay preview](docs/signoff-replay.md) evaluates
+strict exported snapshots into local advisory artifacts. It is a standalone
+experiment, not a third agent role or permission to approve pull requests.
+
 ---
 
 ## Why a wrapper

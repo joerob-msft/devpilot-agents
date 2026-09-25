@@ -14,3 +14,7 @@ failed-cycles/
 *.user
 .DS_Store
 Thumbs.db
+
+# Standalone Python replay cache (dependencies/artifacts live outside the checkout).
+__pycache__/
+*.pyc

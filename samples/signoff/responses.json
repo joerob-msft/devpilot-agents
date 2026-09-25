@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "cases": {
+    "synthetic-ready": [
+      {
+        "recommendation": "APPROVE",
+        "readinessProbability": 0.9,
+        "risk": "LOW",
+        "questions": [
+          {"id": "intent", "answer": "YES", "evidenceRefs": ["intent"], "reason": "Synthetic criterion is satisfied."},
+          {"id": "correctness", "answer": "YES", "evidenceRefs": ["code"], "reason": "Synthetic guard handles the stated input."},
+          {"id": "validation", "answer": "YES", "evidenceRefs": ["check"], "reason": "Synthetic checks pass."}
+        ],
+        "blockers": []
+      },
+      {
+        "recommendation": "APPROVE",
+        "readinessProbability": 0.9,
+        "risk": "LOW",
+        "questions": [
+          {"id": "intent", "answer": "YES", "evidenceRefs": ["intent"], "reason": "Independent synthetic criterion check."},
+          {"id": "correctness", "answer": "YES", "evidenceRefs": ["code"], "reason": "Independent synthetic guard check."},
+          {"id": "validation", "answer": "YES", "evidenceRefs": ["check"], "reason": "Independent synthetic validation check."}
+        ],
+        "blockers": []
+      }
+    ]
+  }
+}

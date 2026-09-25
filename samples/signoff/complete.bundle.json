@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "caseId": "synthetic-ready",
+  "familyId": "fixture:example:1",
+  "cohort": "SYNTHETIC",
+  "provenance": {
+    "provider": "FIXTURE",
+    "repository": "example/widget",
+    "pullRequestId": "1",
+    "sourceRef": "refs/heads/fix",
+    "targetRef": "refs/heads/main",
+    "sourceCommit": "1111111111111111111111111111111111111111",
+    "targetCommit": "2222222222222222222222222222222222222222",
+    "iteration": 1,
+    "cutoff": "2026-01-01T12:00:00Z",
+    "exportedAt": "2026-01-01T12:01:00Z"
+  },
+  "reconstruction": {"status": "EXACT", "reason": "Synthetic closed-world control, not a historical observation."},
+  "completeness": [
+    {"category": "CODE", "status": "COMPLETE", "reason": "Entire synthetic patch.", "evidenceRefs": ["code"]},
+    {"category": "INTENT", "status": "COMPLETE", "reason": "Synthetic acceptance criterion.", "evidenceRefs": ["intent"]},
+    {"category": "POLICY", "status": "COMPLETE", "reason": "Synthetic policy inventory.", "evidenceRefs": ["policy"]},
+    {"category": "VALIDATION", "status": "COMPLETE", "reason": "Synthetic required check.", "evidenceRefs": ["check"]}
+  ],
+  "guidance": [{"id": "review", "revision": "fixture-v1", "approved": true, "content": "Require intent, complete code, known policy, and passing required checks. Do not act on this recommendation."}],
+  "evidence": [
+    {"id": "code", "kind": "CODE", "observedAt": "2026-01-01T11:00:00Z", "sourceCommit": "1111111111111111111111111111111111111111", "targetCommit": "2222222222222222222222222222222222222222", "status": "INFO", "content": "Synthetic patch: reject negative counts before allocation."},
+    {"id": "intent", "kind": "INTENT", "observedAt": "2026-01-01T11:00:00Z", "sourceCommit": "1111111111111111111111111111111111111111", "targetCommit": "2222222222222222222222222222222222222222", "status": "INFO", "content": "Negative counts must fail explicitly."},
+    {"id": "policy", "kind": "POLICY", "observedAt": "2026-01-01T11:00:00Z", "sourceCommit": "1111111111111111111111111111111111111111", "targetCommit": "2222222222222222222222222222222222222222", "status": "PASS", "content": "The only synthetic required validation is check."},
+    {"id": "check", "kind": "CODE_CHECK", "observedAt": "2026-01-01T11:00:00Z", "sourceCommit": "1111111111111111111111111111111111111111", "targetCommit": "2222222222222222222222222222222222222222", "status": "PASS", "content": "Synthetic unit checks passed on this exact source and target."}
+  ],
+  "label": {"recommendation": "APPROVE", "source": "synthetic-control", "asOf": "2026-01-02T00:00:00Z"}
+}

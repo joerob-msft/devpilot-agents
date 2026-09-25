@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:signoff:bundle:1",
+  "title": "Sign-off replay evidence bundle v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "caseId", "familyId", "cohort", "provenance", "reconstruction", "completeness", "guidance", "evidence", "label"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "caseId": {"$ref": "#/$defs/id"},
+    "familyId": {"type": "string", "minLength": 1, "maxLength": 512},
+    "cohort": {"enum": ["NATURAL", "HISTORICAL", "SYNTHETIC"]},
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "repository", "pullRequestId", "sourceRef", "targetRef", "sourceCommit", "targetCommit", "iteration", "cutoff", "exportedAt"],
+      "properties": {
+        "provider": {"enum": ["ADO", "GITHUB", "FIXTURE"]},
+        "repository": {"type": "string", "minLength": 1, "maxLength": 512},
+        "pullRequestId": {"type": "string", "minLength": 1, "maxLength": 128},
+        "sourceRef": {"type": "string", "minLength": 1, "maxLength": 512},
+        "targetRef": {"type": "string", "minLength": 1, "maxLength": 512},
+        "sourceCommit": {"$ref": "#/$defs/commit"},
+        "targetCommit": {"$ref": "#/$defs/commit"},
+        "iteration": {"type": ["integer", "null"], "minimum": 1},
+        "cutoff": {"type": "string", "format": "date-time"},
+        "exportedAt": {"type": "string", "format": "date-time"}
+      }
+    },
+    "reconstruction": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": {"enum": ["EXACT", "CURRENT_SNAPSHOT", "UNSUPPORTED"]},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 4000}
+      }
+    },
+    "completeness": {
+      "type": "array", "minItems": 4, "maxItems": 64,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["category", "status", "reason", "evidenceRefs"],
+        "properties": {
+          "category": {"enum": ["CODE", "INTENT", "POLICY", "VALIDATION"]},
+          "status": {"enum": ["COMPLETE", "MISSING", "PARTIAL", "STALE", "UNSUPPORTED"]},
+          "reason": {"type": "string", "minLength": 1, "maxLength": 4000},
+          "evidenceRefs": {"$ref": "#/$defs/refs"}
+        }
+      }
+    },
+    "guidance": {
+      "type": "array", "minItems": 1, "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "revision", "approved", "content"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "revision": {"type": "string", "minLength": 1, "maxLength": 512},
+          "approved": {"type": "boolean"},
+          "content": {"type": "string", "minLength": 1, "maxLength": 64000}
+        }
+      }
+    },
+    "evidence": {
+      "type": "array", "maxItems": 256,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "kind", "observedAt", "sourceCommit", "targetCommit", "status", "content"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "kind": {"enum": ["CODE", "INTENT", "POLICY", "CODE_CHECK", "CONTEXT"]},
+          "observedAt": {"type": "string", "format": "date-time"},
+          "sourceCommit": {"$ref": "#/$defs/commit"},
+          "targetCommit": {"$ref": "#/$defs/commit"},
+          "status": {"enum": ["PASS", "FAIL", "UNKNOWN", "INFO"]},
+          "content": {"type": "string", "minLength": 1, "maxLength": 128000}
+        }
+      }
+    },
+    "label": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["recommendation", "source", "asOf"],
+          "properties": {
+            "recommendation": {"enum": ["APPROVE", "REQUEST_CHANGES", "NEEDS_HUMAN_REVIEW"]},
+            "source": {"type": "string", "minLength": 1, "maxLength": 512},
+            "asOf": {"type": "string", "format": "date-time"}
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "commit": {"type": "string", "pattern": "^([a-fA-F0-9]{40}|[a-fA-F0-9]{64})$"},
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "refs": {"type": "array", "maxItems": 256, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}}
+  }
+}

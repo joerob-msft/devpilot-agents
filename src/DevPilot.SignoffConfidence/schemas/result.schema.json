@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:signoff:result:1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "caseId", "familyId", "cohort", "provenance", "reconstruction", "completeness", "inputFingerprint", "pipelineFingerprint", "recommendation", "readinessProbability", "probabilitySource", "calibration", "risk", "authorization", "blockers", "runs", "exploratory", "historicalBenchmarkEligible", "modelOnlyDiagnostic", "modelMetadata", "usage"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "caseId": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
+    "familyId": {"type": "string"},
+    "cohort": {"$ref": "urn:devpilot:signoff:bundle:1#/properties/cohort"},
+    "provenance": {"$ref": "urn:devpilot:signoff:bundle:1#/properties/provenance"},
+    "reconstruction": {"$ref": "urn:devpilot:signoff:bundle:1#/properties/reconstruction"},
+    "completeness": {"$ref": "urn:devpilot:signoff:bundle:1#/properties/completeness"},
+    "inputFingerprint": {"$ref": "#/$defs/hash"},
+    "pipelineFingerprint": {"$ref": "#/$defs/hash"},
+    "recommendation": {"$ref": "urn:devpilot:signoff:assessment:1#/properties/recommendation"},
+    "readinessProbability": {"$ref": "urn:devpilot:signoff:assessment:1#/properties/readinessProbability"},
+    "probabilitySource": {"enum": [null, "PRIMARY_DIRECT_ESTIMATE"]},
+    "calibration": {"const": "UNCALIBRATED"},
+    "risk": {"$ref": "urn:devpilot:signoff:assessment:1#/properties/risk"},
+    "authorization": {"const": "NONE"},
+    "blockers": {
+      "type": "array", "items": {
+        "type": "object", "additionalProperties": false, "required": ["code", "evidenceRefs", "reason"],
+        "properties": {
+          "code": {"enum": ["GUIDANCE_NOT_APPROVED", "INCOMPLETE_CODE", "INCOMPLETE_INTENT", "INCOMPLETE_POLICY", "INCOMPLETE_VALIDATION", "DETERMINISTIC_CODE_FAILURE", "REQUIRED_STATUS_UNKNOWN", "HISTORICAL_RECONSTRUCTION_UNSUPPORTED", "ITERATION_UNKNOWN", "ASSESSMENT_FAILED", "LIVE_CAPABILITY_NO_GO", "ASSESSOR_DISAGREEMENT", "LOW_MODEL_SUPPORT", "MODEL_ABSTENTION", "CODE_DEFECT", "MISSING_EVIDENCE", "POLICY_UNKNOWN", "RISK_UNKNOWN"]},
+          "evidenceRefs": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/refs"},
+          "reason": {"type": "string", "minLength": 1, "maxLength": 4000}
+        }
+      }
+    },
+    "runs": {
+      "type": "array", "maxItems": 2, "items": {
+        "type": "object", "additionalProperties": false, "required": ["index", "status", "assessment", "attempts"],
+        "properties": {
+          "index": {"type": "integer", "minimum": 1, "maximum": 2},
+          "status": {"enum": ["VALID", "FAILED"]},
+          "assessment": {"oneOf": [{"type": "null"}, {"$ref": "urn:devpilot:signoff:assessment:1"}]},
+          "attempts": {
+            "type": "array", "minItems": 1, "maxItems": 2, "items": {
+              "type": "object", "additionalProperties": false, "required": ["index", "status", "error", "usage", "model"],
+              "properties": {
+                "index": {"type": "integer", "minimum": 1, "maximum": 2},
+                "status": {"enum": ["VALID", "FAILED"]},
+                "error": {"type": ["string", "null"], "maxLength": 256},
+                "usage": {"$ref": "#/$defs/usage"},
+                "model": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        }
+      }
+    },
+    "exploratory": {"type": "boolean"},
+    "historicalBenchmarkEligible": {"type": "boolean"},
+    "modelOnlyDiagnostic": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["recommendation", "readinessProbability", "calibration", "policyEligible"],
+          "properties": {
+            "recommendation": {"$ref": "urn:devpilot:signoff:assessment:1#/properties/recommendation"},
+            "readinessProbability": {"$ref": "urn:devpilot:signoff:assessment:1#/properties/readinessProbability"},
+            "calibration": {"const": "UNCALIBRATED"},
+            "policyEligible": {"const": false}
+          }
+        }
+      ]
+    },
+    "modelMetadata": {
+      "type": "object", "additionalProperties": false, "required": ["provider", "model", "sdk", "runtime"],
+      "properties": {
+        "provider": {"type": "string"},
+        "model": {"type": "string"},
+        "sdk": {"type": ["string", "null"]},
+        "runtime": {"type": ["string", "null"]},
+        "runtimeFingerprint": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "usage": {"$ref": "#/$defs/usage"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "usage": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "array", "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["model", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "billing"],
+            "properties": {
+              "model": {"type": "string"},
+              "inputTokens": {"type": ["integer", "null"], "minimum": 0},
+              "outputTokens": {"type": ["integer", "null"], "minimum": 0},
+              "cacheReadTokens": {"type": ["integer", "null"], "minimum": 0},
+              "cacheWriteTokens": {"type": ["integer", "null"], "minimum": 0},
+              "billing": {"type": "null"}
+            }
+          }
+        }
+      ]
+    }
+  }
+}
