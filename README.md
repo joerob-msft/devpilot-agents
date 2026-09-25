@@ -77,6 +77,10 @@ cohort orchestrator is documented in
 The separately gated wrapper-owned create-only delivery phase, signed service
 policy, recovery rules, and dashboard event feed are documented in
 [docs/owner-automatic-delivery.md](docs/owner-automatic-delivery.md).
+The existing local Operations dashboard's verified read-only reporting view,
+external-root configuration, health semantics, privacy boundary, and rollback
+are documented in
+[docs/owner-reporting-dashboard.md](docs/owner-reporting-dashboard.md).
 The capability-specific contextual assessment and its sanitized demonstration
 result are documented in
 [docs/relation-evidence-capability.md](docs/relation-evidence-capability.md).

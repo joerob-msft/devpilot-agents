@@ -7,6 +7,7 @@ import { createDashboardLifecycle } from "./lifecycle.js";
 import { OperationsReducer } from "./reducer.js";
 import { EventTailer } from "./tailer.js";
 import { FileDismissalStorage } from "./dismissals.js";
+import { LocalReportingAdapter } from "./reporting.js";
 
 interface Arguments {
   stateDirectories: string[];
@@ -14,6 +15,7 @@ interface Arguments {
   broker: BrokerLaunchDescriptor | null;
   launchMode: LaunchMode;
   viewStateDirectory?: string;
+  reportingConfigPath?: string;
 }
 
 export function parseArguments(argv: string[]): Arguments {
@@ -35,6 +37,10 @@ export function parseArguments(argv: string[]): Arguments {
       const value = argv[++index];
       if (!value) throw new Error("--view-state-dir requires a path");
       result.viewStateDirectory = value;
+    } else if (argument === "--reporting-config") {
+      const value = argv[++index];
+      if (!value) throw new Error("--reporting-config requires a path");
+      result.reportingConfigPath = value;
     } else if (argument === "--launch-mode") {
       const value = argv[++index];
       if (value !== "observe" && value !== "preview" && value !== "operational") {
@@ -49,9 +55,9 @@ export function parseArguments(argv: string[]): Arguments {
       else broker.descriptorPath = value;
     } else if (argument === "--help" || argument === "-h") {
       process.stdout.write(
-        "Usage: npm start -- [--state-dir <path>]... [--event-log <path>]... [--launch-mode <observe|preview|operational>]\n" +
+        "Usage: npm start -- [--state-dir <path>]... [--event-log <path>]... [--reporting-config <path>] [--launch-mode <observe|preview|operational>]\n" +
           "  [--view-state-dir <path>] overrides local dashboard dismissal storage only.\n" +
-          "Observe DevPilot reviewer and review-handler JSONL event streams.\n",
+          "Observe DevPilot event streams and verified local Owner reporting state.\n",
       );
       process.exitCode = 0;
       return result;
@@ -64,8 +70,9 @@ export function parseArguments(argv: string[]): Arguments {
   const brokerValues = Object.values(broker);
   if (brokerValues.length && brokerValues.length !== 3) throw new Error("all trusted broker arguments are required together");
   if (brokerValues.length === 3) result.broker = broker as BrokerLaunchDescriptor;
-  if (!result.stateDirectories.length && !result.eventLogPaths.length && process.exitCode === undefined) {
-    throw new Error("provide at least one --state-dir or --event-log path");
+  if (!result.stateDirectories.length && !result.eventLogPaths.length && !result.reportingConfigPath &&
+      process.exitCode === undefined) {
+    throw new Error("provide at least one --state-dir, --event-log, or --reporting-config path");
   }
   return result;
 }
@@ -82,6 +89,9 @@ async function main(): Promise<void> {
       return new OperationsReducer();
     });
   const history = new PullRequestHistoryProjection();
+  const reporting = args.reportingConfigPath
+    ? new LocalReportingAdapter(args.reportingConfigPath)
+    : undefined;
   let brokerFailure = "";
   let refresh = (): void => {};
   const tailer = new EventTailer({
@@ -138,6 +148,7 @@ async function main(): Promise<void> {
       shutdownBroker={lifecycle.shutdownBroker}
       dismissalStorage={dismissalStorage}
       dismissalLoadError={dismissalError}
+      reporting={reporting}
     />, renderer);
     refresh = () => renderer.requestRender();
   } catch (error) {
