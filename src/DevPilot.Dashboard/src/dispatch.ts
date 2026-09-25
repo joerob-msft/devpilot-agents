@@ -83,9 +83,10 @@ export type NarrowingAction = (typeof NARROWING_ACTIONS)[number];
 // holds the identical closed mapping and rejects any other value outright, whether it is a
 // capability the operator requests to widen or one a broker response claims is delegable. See
 // assertDelegableCapability/assertDelegableAvailable below.
-export const DELEGABLE_CAPABILITY_BY_ROLE: Record<AgentRole, string> = {
+export const DELEGABLE_CAPABILITY_BY_ROLE: Record<AgentRole, string | null> = {
   reviewer: "EnableApprovalVote",
   "review-handler": "EnableAutoComplete",
+  "signoff-observer": null,
 };
 
 export interface CapabilitySummary {
@@ -523,7 +524,7 @@ function stringField(record: Record<string, unknown>, name: string): string {
 // wire value silently.
 function roleField(record: Record<string, unknown>, name: string): AgentRole {
   const value = record[name];
-  if (typeof value !== "string" || !(AGENTS as readonly string[]).includes(value)) {
+  if (typeof value !== "string" || value === "signoff-observer" || !(AGENTS as readonly string[]).includes(value)) {
     throw new Error(`broker response ${name} is invalid`);
   }
   return value as AgentRole;

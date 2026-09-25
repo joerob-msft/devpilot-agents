@@ -535,6 +535,52 @@ test("URL validation only permits credential-free HTTP(S) URLs", () => {
   assert.equal(safeHttpUrl("not a URL"), null);
 });
 
+test("observer native details distinguish policy, diagnostic and capture gaps without manual authority", async (context) => {
+  const reducer = new OperationsReducer();
+  const tailer = new EventTailer({ stateDirectories: [], eventLogPaths: [], onEvent: () => {}, onDiagnostic: () => {} });
+  const base = {
+    schemaVersion: 2, agent: "signoff-observer", instanceId: "observer-render", processId: 123,
+    timestamp: new Date().toISOString(), level: "info", cycleNumber: 1, pullRequestId: 0,
+    sourceCommit: "", message: "",
+  };
+  reducer.apply(parseAgentEvent({ ...base, sequence: 1, eventType: "agent.started", data: { repository: "public-study" } }));
+  reducer.apply(parseAgentEvent({ ...base, sequence: 2, eventType: "observer.updated", data: {
+    studyId: "public-study", mode: "collection-only", deadline: "2026-10-02T00:00:00Z",
+    families: 25, admissions: 0, eligibleAgreement: 0, reportPath: "private-report.md",
+    finalRecommendation: "NEEDS_HUMAN_REVIEW", diagnostic: "APPROVE",
+    eligibilityReasons: ["POLICY_MISSING", "CAPTURE_INCOMPLETE"],
+    collectionStatus: "incomplete", lastFamilyId: "fixture:1",
+  } }));
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App reducer={reducer} tailer={tailer} launchMode="observe" />,
+      { width: 140, height: 42, kittyKeyboard: true });
+    await setup.renderOnce();
+    assert.match(setup.captureCharFrame(), /Sign-off Observer/);
+    setup.mockInput.pressEnter();
+    await setup.flush();
+    const frame = setup.captureCharFrame();
+    assert.match(frame, /Last snapshot final policy \(not study-wide\): NEEDS_HUMAN_REVIEW/);
+    assert.match(frame, /Model-only diagnostic \(not policy approval\): APPROVE/);
+    assert.match(frame, /Families: 25; evaluations admitted: 0; eligible human comparisons: 0/);
+    assert.match(frame, /Capture incomplete/);
+    assert.match(frame, /No approval authorization/);
+    setup.mockInput.pressEscape();
+    setup.mockInput.pressKey("m");
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /START AGENT BY PR ID/);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await tailer.stop();
+  }
+});
+
 test("partial and failure result phrases retain semantic colors", () => {
   assert.equal(completionResultColor("partially delivered"), "#f0b45a");
   assert.equal(completionResultColor("delivery failed"), "#ff6b6b");

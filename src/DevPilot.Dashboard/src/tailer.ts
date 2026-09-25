@@ -104,7 +104,8 @@ export async function discoverEventLogs(stateDirectories: string[], explicitPath
       }
       const normalized = current.path.replaceAll("\\", "/").toLowerCase();
       const isEventDirectory =
-        normalized.endsWith("/logs/events/reviewer") || normalized.endsWith("/logs/events/review-handler");
+        normalized.endsWith("/logs/events/reviewer") || normalized.endsWith("/logs/events/review-handler") ||
+        normalized.endsWith("/logs/events/signoff-observer");
       const directories: Array<{ path: string; depth: number; priority: number }> = [];
       for (const entry of entries) {
         const path = join(current.path, entry.name);
@@ -113,7 +114,7 @@ export async function discoverEventLogs(stateDirectories: string[], explicitPath
         } else if (entry.isDirectory() && current.depth < 6) {
           const name = entry.name.toLowerCase();
           if (name === "manual-dispatch" || name === "runtime") continue;
-          const priority = name === "logs" || name === "events" || name === "reviewer" || name === "review-handler" ? 0 : 1;
+          const priority = name === "logs" || name === "events" || name === "reviewer" || name === "review-handler" || name === "signoff-observer" ? 0 : 1;
           directories.push({ path, depth: current.depth + 1, priority });
         }
       }

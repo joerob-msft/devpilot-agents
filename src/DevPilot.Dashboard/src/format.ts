@@ -47,7 +47,7 @@ export function statusColor(status: InstanceStatus): string {
 }
 
 export function roleLabel(role: InstanceState["agent"]): string {
-  return role === "review-handler" ? "HANDLER" : "REVIEWER";
+  return role === "signoff-observer" ? "OBSERVER" : role === "review-handler" ? "HANDLER" : "REVIEWER";
 }
 
 export function eventSummary(event: AgentEvent): string {

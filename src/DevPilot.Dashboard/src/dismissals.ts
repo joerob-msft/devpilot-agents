@@ -23,7 +23,7 @@ function missing(error: unknown): boolean {
 function validRecord(value: unknown): value is InstanceDismissal {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   return "key" in value && typeof value.key === "string" &&
-    /^(reviewer|review-handler):[^\u0000-\u001f\u007f]{1,512}$/.test(value.key) &&
+    /^(reviewer|review-handler|signoff-observer):[^\u0000-\u001f\u007f]{1,512}$/.test(value.key) &&
     "throughSequence" in value && typeof value.throughSequence === "number" &&
     Number.isSafeInteger(value.throughSequence) && value.throughSequence > 0;
 }

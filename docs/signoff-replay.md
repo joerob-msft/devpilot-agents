@@ -204,3 +204,10 @@ fabricated references, label exclusion, hostile content as data, low support,
 policy/history abstention, effective zero-tool gates, bounded attempts,
 cancellation including teardown failure, exact resume, and output collisions.
 There are no live tests in the offline suite.
+
+## Prospective studies
+
+The replay CLI remains standalone and backward compatible. For opt-in
+continuous observation, use the separate [sign-off observer](signoff-observer.md):
+it adds a durable study ledger and outcome-separated reporting without
+changing historical reconstruction semantics or granting approval authority.

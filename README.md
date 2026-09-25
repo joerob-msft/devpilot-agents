@@ -20,13 +20,19 @@ and binds the work, owns all state, performs every external write, and validates
 everything the model returns. The model never selects its own work and never
 writes to the PR host directly.
 
-> **Status: pilot.** Two agents (`reviewer` and `review-handler`) are
+> **Status: pilot.** Two operational agents (`reviewer` and `review-handler`) are
 > implemented for Azure DevOps, with a shared read-only dashboard and trusted
 > launchers for observing or operating either or both. Interfaces will change.
 
 The optional [sign-off confidence replay preview](docs/signoff-replay.md) evaluates
 strict exported snapshots into local advisory artifacts. It is a standalone
 experiment, not a third agent role or permission to approve pull requests.
+
+The separate, default-off [sign-off observer checkout preview](docs/signoff-observer.md)
+adds a read-only third role for prospective seven-day studies, with an
+append-only ledger, bounded model admissions, local reports, observer-only
+TUI selection, and independently supervised headless ownership. `Both` still
+means Reviewer and Review Handler; no approval permission is added.
 
 ---
 
@@ -53,10 +59,12 @@ marker. Anything else it prints is ignored.
 ```text
 src/
   DevPilot.AgentHarness/     # the shared, provider-agnostic module
-  DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
+  DevPilot.Dashboard/        # operational agents and optional observer TUI
+  DevPilot.SignoffConfidence/ # strict replay and prospective observer engine
   Agents/
     review-handler/          # an agent: script + prompt + fixtures
     reviewer/                # an agent: script + prompt
+    signoff-observer/        # no-write observer and separate report dispatcher
 samples/                     # example configs for real repositories
 tools/                       # launchers, dashboard entry point, and repo checks
 docs/                        # how to add an agent

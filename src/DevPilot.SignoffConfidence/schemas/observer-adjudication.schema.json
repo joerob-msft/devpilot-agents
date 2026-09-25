@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:signoff:observer-adjudication:1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "id", "studyId", "decisionId", "adjudicatedAt", "recommendation", "evidenceRefs", "reason"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "id": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
+    "studyId": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
+    "decisionId": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
+    "adjudicatedAt": {"type": "string", "format": "date-time"},
+    "recommendation": {"enum": ["APPROVE", "REQUEST_CHANGES", "NEEDS_HUMAN_REVIEW"]},
+    "evidenceRefs": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/refs"},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 4000}
+  }
+}

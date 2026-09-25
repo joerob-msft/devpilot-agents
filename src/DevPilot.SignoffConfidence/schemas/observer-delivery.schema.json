@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:signoff:observer-delivery:1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "enabled", "privateOperatorDestination", "chatId", "stateRoot", "studyRoot", "studyId"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "enabled": {"type": "boolean"},
+    "privateOperatorDestination": {"const": true},
+    "chatId": {"type": "string", "pattern": "^[A-Za-z0-9_:@.=-]{1,256}$"},
+    "stateRoot": {"type": "string", "minLength": 1},
+    "studyRoot": {"type": "string", "minLength": 1},
+    "studyId": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"}
+  }
+}

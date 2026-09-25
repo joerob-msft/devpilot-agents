@@ -3111,7 +3111,7 @@ export function App(props: AppProps) {
       setOverlay("help");
       notify("Help opened");
     } else if (key.name === "tab") {
-      const values: RoleFilter[] = ["all", "reviewer", "review-handler"];
+      const values: RoleFilter[] = ["all", "reviewer", "review-handler", "signoff-observer"];
       const direction = key.shift ? -1 : 1;
       setRole((value) => values[(values.indexOf(value) + direction + values.length) % values.length] ?? "all");
       setSelected(0);

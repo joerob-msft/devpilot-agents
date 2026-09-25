@@ -391,6 +391,7 @@ $script:AgentOutputEventTypes = @(
     'cycle.completed',
     'cycle.failed',
     'agent.waiting'
+    'observer.updated'
 )
 
 function Test-AgentInteractiveOutput {
@@ -404,7 +405,7 @@ function Test-AgentInteractiveOutput {
 
 function New-AgentOutputContext {
     param(
-        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Agent,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler', 'signoff-observer')][string]$Agent,
         [ValidateSet('Auto', 'Compact', 'Detailed', 'Json')]
         [string]$OutputMode = 'Auto',
         [string]$LogPath,

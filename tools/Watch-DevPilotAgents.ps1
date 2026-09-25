@@ -42,8 +42,13 @@
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Low', DefaultParameterSetName = 'Launch')]
 param(
     [Parameter(ParameterSetName = 'Launch')]
-    [ValidateSet('Reviewer', 'ReviewHandler', 'Both')]
+    [ValidateSet('Reviewer', 'ReviewHandler', 'Both', 'SignoffObserver')]
     [string]$Agent = 'Both',
+
+    [Parameter(ParameterSetName = 'Launch')][switch]$EnableSignoffObserver,
+    [Parameter(ParameterSetName = 'Launch')][string]$ObserverConfigFile,
+    [Parameter(ParameterSetName = 'Launch')][string]$ObserverPythonPath = 'python',
+    [Parameter(ParameterSetName = 'Launch')][switch]$ObserverEnableModel,
 
     [Parameter(Mandatory, ParameterSetName = 'Attach')]
     [switch]$AttachOnly,
@@ -87,6 +92,7 @@ param(
     [switch]$Golden,
 
     [Parameter(ParameterSetName = 'Launch')]
+    [Parameter(ParameterSetName = 'Attach')]
     [switch]$PreviewOnly,
 
     [Parameter(ParameterSetName = 'Launch')]
@@ -144,6 +150,27 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# Isolated selection bypasses Golden/manual role defaults and all mutation capability paths.
+if ($Agent -eq 'SignoffObserver' -and -not $AttachOnly) {
+    $allowed = @('Agent', 'ObserverConfigFile', 'ObserverPythonPath', 'ObserverEnableModel',
+        'StateDir', 'Continuous', 'Once', 'PreviewOnly', 'WhatIf', 'Confirm')
+    foreach ($name in $PSBoundParameters.Keys) {
+        if ($name -notin $allowed) { throw "Observer-only launch does not accept -$name." }
+    }
+    if (-not $ObserverConfigFile) { throw 'Observer-only launch requires -ObserverConfigFile.' }
+    $observerParameters = @{}
+    foreach ($name in $PSBoundParameters.Keys) {
+        if ($name -ne 'Agent') { $observerParameters[$name] = $PSBoundParameters[$name] }
+    }
+    & (Join-Path $PSScriptRoot 'Watch-SignoffObserver.ps1') @observerParameters
+    return
+}
+if (($EnableSignoffObserver -and -not $ObserverConfigFile) -or
+    ($ObserverConfigFile -and -not $EnableSignoffObserver) -or
+    ($ObserverEnableModel -and -not $EnableSignoffObserver)) {
+    throw 'Alongside observation requires -EnableSignoffObserver and -ObserverConfigFile.'
+}
 
 $toolkitRoot = Split-Path $PSScriptRoot -Parent
 $harnessManifest = Join-Path $toolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1'
@@ -866,6 +893,27 @@ $pwsh = Resolve-AgentPwshPath
 $children = New-Object System.Collections.Generic.List[object]
 $automaticSpecs = [Collections.Generic.List[object]]::new()
 try {
+    if ($EnableSignoffObserver) {
+        $observerScript = Join-Path $toolkitRoot 'src\Agents\signoff-observer\Start-SignoffObserver.ps1'
+        $observerState = Join-Path $StateDir 'signoff-observer'
+        $observerCheck = @{ ConfigFile = $ObserverConfigFile; PythonPath = $ObserverPythonPath
+            StateDir = $observerState; EnableModel = $ObserverEnableModel; PreviewOnly = $launch.PreviewOnly }
+        & $observerScript @observerCheck -ValidateOnly
+        if ($LASTEXITCODE -ne 0) { throw 'Observer validation failed; no observer was started.' }
+        $observerArgs = @('-NoProfile', '-NonInteractive', '-File', $observerScript,
+            '-ConfigFile', $ObserverConfigFile, '-PythonPath', $ObserverPythonPath, '-StateDir', $observerState)
+        if (-not $launch.Continuous) { $observerArgs += '-Once' }
+        if ($ObserverEnableModel) { $observerArgs += '-EnableModel' }
+        if ($launch.PreviewOnly) { $observerArgs += '-PreviewOnly' }
+        $observerOwned = New-AgentRedirectedProcess -FilePath $pwsh -ArgumentList $observerArgs `
+            -StandardOutputPath (Join-Path $StateDir 'signoff-observer.stdout.log') `
+            -StandardErrorPath (Join-Path $StateDir 'signoff-observer.stderr.log') -WorkingDirectory $toolkitRoot
+        [void]$children.Add([pscustomobject]@{
+            Role = 'signoff-observer'; Process = $observerOwned.Process; Owned = $observerOwned
+            StdOutPath = (Join-Path $StateDir 'signoff-observer.stdout.log')
+            StdErrPath = (Join-Path $StateDir 'signoff-observer.stderr.log')
+        })
+    }
     foreach ($spec in $specs) {
         New-Item -ItemType Directory -Force -Path $spec.StateDir | Out-Null
         $childArguments = @(
@@ -945,7 +993,7 @@ try {
             $brokerDescriptor.localObservation = [ordered]@{
                 schemaVersion = 1
                 ownerStartIdentity = Get-AgentProcessStartIdentity -Process (Get-Process -Id $PID)
-                streams = @($children | ForEach-Object {
+                streams = @($children | Where-Object { $_.Role -ne 'signoff-observer' } | ForEach-Object {
                     [ordered]@{ role = $_.Role; processId = $_.Process.Id; eventLogPath = $_.StdOutPath }
                 })
             }
@@ -1016,6 +1064,10 @@ finally {
         $agentsStoppedByDashboard = $true
     }
     else {
+        foreach ($child in @($children | Where-Object { $_.Role -eq 'signoff-observer' })) {
+            Close-OwnedAgentProcess -Process $child.Process -Role $child.Role
+            [void](Complete-AgentRedirectedProcess -Child $child.Owned)
+        }
         $running = @($children | Where-Object {
             $_.Process.Refresh()
             -not $_.Process.HasExited

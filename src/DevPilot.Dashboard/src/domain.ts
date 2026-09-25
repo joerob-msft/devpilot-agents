@@ -1,4 +1,4 @@
-export const AGENTS = ["reviewer", "review-handler"] as const;
+export const AGENTS = ["reviewer", "review-handler", "signoff-observer"] as const;
 export type AgentRole = (typeof AGENTS)[number];
 export type EventLevel = "debug" | "info" | "warning" | "error";
 
@@ -92,6 +92,11 @@ export interface CycleSummary {
 }
 
 export interface InstanceState {
+  observer?: {
+    studyId: string; mode: string; families: number; admissions: number; eligibleAgreement: number;
+    deadline: string; reportPath: string; finalRecommendation: string; diagnostic: string; eligibilityReasons: string[];
+    collectionStatus: string; lastFamilyId: string;
+  };
   key: string;
   agent: AgentRole;
   instanceId: string;
@@ -250,8 +255,8 @@ function parseDispatch(value: unknown): AgentDispatchV1 | null {
 export function parseAgentEvent(value: unknown): AgentEvent {
   const raw = asRecord(value);
   const agent = raw.agent;
-  if (agent !== "reviewer" && agent !== "review-handler") {
-    throw new Error("agent must be reviewer or review-handler");
+  if (agent !== "reviewer" && agent !== "review-handler" && agent !== "signoff-observer") {
+    throw new Error("agent must be reviewer, review-handler or signoff-observer");
   }
   const instanceId = boundedString(raw.instanceId);
   if (!instanceId) throw new Error("instanceId is required");

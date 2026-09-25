@@ -58,7 +58,7 @@ export function sessionNamespaceFromSource(source: string, agent: AgentRole): st
   const namespacePath = markerIndex >= 0 ? normalized.slice(0, markerIndex) : dirname(normalized);
   const namespaceLeaf = basename(namespacePath) || "root";
   const normalizedLeaf = namespaceLeaf.toLowerCase().replace(/[\s_-]+/g, "");
-  const roleContainer = normalizedLeaf === "reviewer" || normalizedLeaf === "reviewhandler";
+  const roleContainer = normalizedLeaf === "reviewer" || normalizedLeaf === "reviewhandler" || normalizedLeaf === "signoffobserver";
   const namespace = roleContainer ? basename(dirname(namespacePath)) || namespaceLeaf : namespaceLeaf;
   return boundedText(namespace, 48) || "root";
 }
@@ -379,6 +379,21 @@ export class OperationsReducer {
         state.modelActivity = /model|prompt|inference|review/i.test(state.phase)
           ? `Active: ${state.phase}`
           : `Last phase: ${state.phase}`;
+        break;
+      case "observer.updated":
+        if (state.agent !== "signoff-observer") break;
+        state.observer = {
+          studyId: getString(data, "studyId"), mode: getString(data, "mode"),
+          families: getNumber(data, "families"), admissions: getNumber(data, "admissions"),
+          eligibleAgreement: getNumber(data, "eligibleAgreement"), deadline: getString(data, "deadline"),
+          reportPath: getString(data, "reportPath"), finalRecommendation: getString(data, "finalRecommendation"),
+          diagnostic: getString(data, "diagnostic"), eligibilityReasons: getStringArray(data, "eligibilityReasons"),
+          collectionStatus: getString(data, "collectionStatus"), lastFamilyId: getString(data, "lastFamilyId"),
+        };
+        state.modelActivity = `Observer policy: ${state.observer.finalRecommendation}; diagnostic: ${state.observer.diagnostic}`;
+        state.writes = "none";
+        state.vote = "off";
+        state.capabilities = [];
         break;
       case "candidate.selected":
         this.reducePullRequestContext(state, data);

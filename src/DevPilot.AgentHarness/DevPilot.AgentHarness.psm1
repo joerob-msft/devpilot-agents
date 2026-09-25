@@ -86,7 +86,7 @@ function Get-AgentDefaultModelSentinel {
 function Get-AgentHarnessCapabilityDescriptor {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler', 'signoff-observer')][string]$Role,
         # issue #114: projects the SAME descriptor under the launcher's terminal preview-only
         # ceiling. Nothing new is declared here -- the preview projection is derived purely from
         # the role's own operational tiers and its single delegable capability, so a preview
@@ -94,6 +94,16 @@ function Get-AgentHarnessCapabilityDescriptor {
         # pre-#114 caller) reproduces the previous behavior byte for byte.
         [switch]$PreviewOnly
     )
+    if ($Role -eq 'signoff-observer') {
+        return [ordered]@{
+            schemaVersion = 1; role = $Role; operationalTiers = [ordered]@{ base = @() }
+            delegableDefaultOff = @(); allowedManualCapabilities = @()
+            absoluteDenies = @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment',
+                'EnableApprovalVote', 'EnableAutoComplete', 'EnableBuddyRequeue', 'EnableCodeChanges',
+                'EnablePush', 'LocalValidation', 'ResumeCodingSession', 'EnableTeamsNotifications',
+                'EnableTeamsPrReferenceWrites')
+        }
+    }
     $operationalTiers = if ($Role -eq 'reviewer') {
         [ordered]@{
             base = @('EnableFindingComments', 'EnableThreadReplies', 'EnableSummaryComment')

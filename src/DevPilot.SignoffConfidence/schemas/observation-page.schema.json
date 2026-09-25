@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:signoff:observation-page:1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "studyId", "captureId", "page", "window", "inventory", "snapshots", "outcomes", "gaps"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "studyId": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
+    "captureId": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
+    "page": {
+      "type": "object", "additionalProperties": false, "required": ["cursor", "nextCursor", "complete"],
+      "properties": {
+        "cursor": {"type": ["string", "null"], "maxLength": 256},
+        "nextCursor": {"type": ["string", "null"], "maxLength": 256},
+        "complete": {"type": "boolean"}
+      }
+    },
+    "window": {
+      "type": "object", "additionalProperties": false, "required": ["startedAt", "completedAt"],
+      "properties": {"startedAt": {"type": "string", "format": "date-time"}, "completedAt": {"type": "string", "format": "date-time"}}
+    },
+    "inventory": {
+      "type": "array", "maxItems": 25, "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["familyId", "pullRequestId", "targetRef", "state", "isDraft", "sourceCommit", "targetCommit"],
+        "properties": {
+          "familyId": {"type": "string", "minLength": 1, "maxLength": 512},
+          "pullRequestId": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+          "targetRef": {"type": "string", "maxLength": 512},
+          "state": {"enum": ["ACTIVE", "COMPLETED", "ABANDONED", "UNKNOWN"]},
+          "isDraft": {"type": "boolean"},
+          "sourceCommit": {"oneOf": [{"type": "null"}, {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/commit"}]},
+          "targetCommit": {"oneOf": [{"type": "null"}, {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/commit"}]}
+        }
+      }
+    },
+    "snapshots": {
+      "type": "array", "maxItems": 25, "items": {
+        "type": "object", "additionalProperties": false, "required": ["bundle", "observation"],
+        "properties": {
+          "bundle": {"$ref": "urn:devpilot:signoff:bundle:1"},
+          "observation": {
+            "type": "object", "additionalProperties": false,
+            "required": ["capturedAt", "state", "baselineDecision", "stable", "eligibilityReasons"],
+            "properties": {
+              "capturedAt": {"type": "string", "format": "date-time"},
+              "state": {"enum": ["ACTIVE", "COMPLETED", "ABANDONED", "UNKNOWN"]},
+              "baselineDecision": {"enum": ["APPROVED", "NOT_APPROVED", "UNKNOWN"]},
+              "stable": {"type": "boolean"},
+              "eligibilityReasons": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 256}}
+            }
+          }
+        }
+      }
+    },
+    "outcomes": {
+      "type": "array", "maxItems": 1000, "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "familyId", "kind", "occurredAt", "capturedAt", "sourceCommit", "targetCommit", "iteration", "actorKind", "evidenceRefs", "reason"],
+        "properties": {
+          "id": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
+          "familyId": {"type": "string", "minLength": 1, "maxLength": 512},
+          "kind": {"enum": ["APPROVED", "CHANGES_REQUESTED", "COMPLETED", "ABANDONED", "REOPENED", "APPROVAL_RESET", "ADJUDICATED_APPROVE", "ADJUDICATED_REQUEST_CHANGES"]},
+          "occurredAt": {"type": ["string", "null"], "format": "date-time"},
+          "capturedAt": {"type": "string", "format": "date-time"},
+          "sourceCommit": {"oneOf": [{"type": "null"}, {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/commit"}]},
+          "targetCommit": {"oneOf": [{"type": "null"}, {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/commit"}]},
+          "iteration": {"type": ["integer", "null"], "minimum": 1},
+          "actorKind": {"enum": ["HUMAN", "AUTOMATION", "UNKNOWN"]},
+          "evidenceRefs": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/refs"},
+          "reason": {"type": "string", "minLength": 1, "maxLength": 4000}
+        }
+      }
+    },
+    "gaps": {
+      "type": "array", "maxItems": 1000, "items": {
+        "type": "object", "additionalProperties": false, "required": ["code", "familyId", "reason"],
+        "properties": {
+          "code": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
+          "familyId": {"type": ["string", "null"], "maxLength": 512},
+          "reason": {"type": "string", "minLength": 1, "maxLength": 4000}
+        }
+      }
+    }
+  }
+}

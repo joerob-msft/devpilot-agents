@@ -68,7 +68,7 @@ def blocker(code: str, refs: list[str], reason: str) -> dict[str, Any]:
     return {"code": code, "evidenceRefs": refs, "reason": reason}
 
 
-def prechecks(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+def prechecks(bundle: dict[str, Any], *, prospective: bool = False) -> list[dict[str, Any]]:
     result = []
     if any(not guidance["approved"] for guidance in bundle["guidance"]):
         result.append(blocker("GUIDANCE_NOT_APPROVED", [], "Operator-approved guidance is required."))
@@ -80,7 +80,7 @@ def prechecks(bundle: dict[str, Any]) -> list[dict[str, Any]]:
             result.append(blocker("DETERMINISTIC_CODE_FAILURE", [item["id"]], "Snapshot-bound code check failed."))
         elif item["kind"] in ("CODE_CHECK", "POLICY") and item["status"] != "PASS":
             result.append(blocker("REQUIRED_STATUS_UNKNOWN", [item["id"]], "Required policy/validation is not proven passing."))
-    if bundle["reconstruction"]["status"] != "EXACT":
+    if bundle["reconstruction"]["status"] != "EXACT" and not prospective:
         result.append(blocker("HISTORICAL_RECONSTRUCTION_UNSUPPORTED", [], bundle["reconstruction"]["reason"]))
     if bundle["provenance"]["iteration"] is None:
         result.append(blocker("ITERATION_UNKNOWN", [], "Snapshot iteration is unavailable."))
@@ -119,10 +119,11 @@ async def bounded_assess(provider: Provider, bundle: dict[str, Any], prompt: str
 
 
 async def evaluate(bundle: dict[str, Any], provider: Provider, deadline: int, max_attempts: int,
-                   exploratory: bool = False, cancel_file: Path | None = None) -> dict[str, Any]:
+                   exploratory: bool = False, cancel_file: Path | None = None,
+                   *, prospective: bool = False) -> dict[str, Any]:
     validate_bundle(bundle)
     is_cancelled(cancel_file)
-    blockers = prechecks(bundle)
+    blockers = prechecks(bundle, prospective=prospective)
     failed_check = any(item["code"] == "DETERMINISTIC_CODE_FAILURE" for item in blockers)
     completeness = {item["category"]: item["status"] for item in bundle["completeness"]}
     can_describe = exploratory and all(completeness[x] == "COMPLETE" for x in ("CODE", "INTENT"))

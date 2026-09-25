@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:signoff:observer-config:1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "studyId", "stateRoot", "collector", "evaluation", "pollSeconds", "maxPages", "maxItems"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "studyId": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
+    "stateRoot": {"type": "string", "minLength": 1},
+    "collector": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scriptPath", "configPath", "scriptSha256", "configSha256"],
+      "properties": {
+        "scriptPath": {"type": "string", "minLength": 1},
+        "configPath": {"type": "string", "minLength": 1},
+        "scriptSha256": {"$ref": "#/$defs/hash"},
+        "configSha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "evaluation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "model", "fixturePath", "runtimePath", "deadlineSeconds", "maxAttempts", "maxAiCredits", "dailyLimit", "studyLimit", "exploratory"],
+      "properties": {
+        "mode": {"enum": ["collection-only", "offline", "live"]},
+        "model": {"type": ["string", "null"], "minLength": 1},
+        "fixturePath": {"type": ["string", "null"], "minLength": 1},
+        "runtimePath": {"type": ["string", "null"], "minLength": 1},
+        "deadlineSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
+        "maxAttempts": {"type": "integer", "minimum": 1, "maximum": 2},
+        "maxAiCredits": {"type": "number", "minimum": 30, "maximum": 100},
+        "dailyLimit": {"type": "integer", "minimum": 0, "maximum": 100},
+        "studyLimit": {"type": "integer", "minimum": 0, "maximum": 500},
+        "exploratory": {"type": "boolean"}
+      }
+    },
+    "pollSeconds": {"type": "integer", "minimum": 30, "maximum": 86400},
+    "maxPages": {"type": "integer", "minimum": 1, "maximum": 100},
+    "maxItems": {"type": "integer", "minimum": 1, "maximum": 25}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
+}

@@ -26,9 +26,10 @@ export interface SimpleRow {
   details: string[];
 }
 
-export const simpleRole = (role: AgentRole): string => role === "reviewer" ? "Reviewer" : "Review Handler";
+export const simpleRole = (role: AgentRole): string =>
+  role === "signoff-observer" ? "Sign-off Observer" : role === "reviewer" ? "Reviewer" : "Review Handler";
 
-const compactRole = (role: AgentRole): string => role === "reviewer" ? "Reviewer" : "Handler";
+const compactRole = (role: AgentRole): string => role === "signoff-observer" ? "Observer" : role === "reviewer" ? "Reviewer" : "Handler";
 
 function automationCadence(agent: AutomationAgentStatus): string {
   if (!agent.continuous) return "once";
@@ -83,7 +84,8 @@ export function simpleCapability(name: string): string {
 export function simpleInstanceRow(state: InstanceState): SimpleRow {
   const now = Date.now();
   const event = state.timeline.at(-1);
-  const failure = state.blocked?.reason || (state.status === "failed" ? state.completion?.reason : "") ||
+  const failure = (state.observer?.collectionStatus === "incomplete" ? "Capture incomplete; inspect private capture diagnostics and report gaps." : "") ||
+    state.blocked?.reason || (state.status === "failed" ? state.completion?.reason : "") ||
     state.sourceDiagnostics.at(-1)?.message || "";
   const outcome = state.completion?.result || (state.exitObservedMs !== null ? "Interrupted / outcome unknown" : "Not reported");
   const baseActivity = failure || (event ? eventNarrative(event) : state.modelActivity) || "No activity reported";
@@ -106,12 +108,22 @@ export function simpleInstanceRow(state: InstanceState): SimpleRow {
       `Outcome: ${outcome}`,
       ...(state.completion?.summary ? [state.completion.summary] : []),
       ...(state.completion?.reason && state.completion.reason !== failure ? [state.completion.reason] : []),
+      ...(state.observer ? [
+        `Study: ${state.observer.studyId} | ${state.observer.mode} | deadline ${state.observer.deadline}`,
+        `Last capture: ${state.observer.collectionStatus || "unknown"}; last evaluated family: ${state.observer.lastFamilyId || "none"}`,
+        `Families: ${state.observer.families}; evaluations admitted: ${state.observer.admissions}; eligible human comparisons: ${state.observer.eligibleAgreement}`,
+        `Last snapshot final policy (not study-wide): ${state.observer.finalRecommendation}`,
+        `Model-only diagnostic (not policy approval): ${state.observer.diagnostic}`,
+        `Eligibility gaps: ${state.observer.eligibilityReasons.join(", ") || "none"}`,
+        `Report: ${state.observer.reportPath}`,
+        "Read-only. No approval authorization. Lead time is not time saved.",
+      ] : []),
     ],
   };
 }
 
 export function simpleHistoryRow(entry: PullRequestHistoryEntry, now = Date.now()): SimpleRow {
-  const roles = (["reviewer", "review-handler"] as const)
+  const roles = (["reviewer", "review-handler", "signoff-observer"] as const)
     .filter((role) => entry.outcomes[role] || entry.activities[role]);
   const roleStatus = (role: AgentRole): string =>
     entry.activities[role]?.status ?? entry.outcomes[role]?.result ?? "No reported activity";
@@ -145,6 +157,7 @@ export function simpleHistoryRow(entry: PullRequestHistoryEntry, now = Date.now(
       ...(latestActivity ? [`Latest event: ${simpleRole(latestActivity.role)} ${latestActivity.status}`] : []),
       roleDetail("reviewer"),
       roleDetail("review-handler"),
+      ...(roles.includes("signoff-observer") ? [roleDetail("signoff-observer")] : []),
       ...(entry.sourceBranch || entry.targetBranch ? [`${entry.sourceBranch || "?"} -> ${entry.targetBranch || "?"}`] : []),
       ...(entry.sourceCommit ? [`Commit: ${shortCommit(entry.sourceCommit)}`] : []),
     ],
