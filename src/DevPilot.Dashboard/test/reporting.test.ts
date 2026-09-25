@@ -41,6 +41,10 @@ function sha256Text(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+function canonicalDigest(value: unknown): string {
+  return `v1:sha256:${sha256Text(canonical(value))}`;
+}
+
 function signedEnvelope(payload: JsonRecord, key: Buffer): string {
   const manifestJson = canonical(payload);
   return `${canonical({
@@ -145,18 +149,31 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
   ].join("\n");
   const bodySha256 = sha256Text(body);
   const capabilityRoot = join(stateRoot, "owner-v2-preview-state", "schema-1", "capabilities", "owner");
-  await writeJson(join(capabilityRoot, "declarations", `${identity}.json`), {
+  const ownerDeclaration = {
     kind: "owner-v2-preview-declaration",
+    stateDigest: `v1:sha256:${identity}`,
     subject: {
       projectId: "11111111-1111-1111-1111-111111111111",
       repositoryId: "22222222-2222-2222-2222-222222222222",
       pullRequestId: 42,
     },
     head: { sourceCommit: "d".repeat(40) },
+    target: { targetCommit: "2".repeat(40), targetRef: "refs/heads/main" },
+    capability: {
+      id: "bpm-test-ownership@1",
+      digest: `v1:sha256:${"3".repeat(64)}`,
+    },
     rule: { section: "MSTest Owner", path: "rules/owner.md" },
-  });
+  };
+  await writeJson(join(capabilityRoot, "declarations", `${identity}.json`), ownerDeclaration);
   await writeJson(join(capabilityRoot, "records", `${identity}.json`), {
+    identity,
+    stateDigest: ownerDeclaration.stateDigest,
     state: "completed",
+    capabilityId: ownerDeclaration.capability.id,
+    capabilityDigest: ownerDeclaration.capability.digest,
+    subjectDigest: canonicalDigest(ownerDeclaration.subject),
+    headDigest: canonicalDigest(ownerDeclaration.head),
     updatedUtc: "utc:2026-09-24T20:00:00Z",
   });
   await writeJson(join(capabilityRoot, "observations", `${identity}.json`), {
@@ -164,10 +181,12 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
     kind: "owner-observation",
     capability: "bpm-test-ownership@1",
     subject: {
-      projectId: "11111111-1111-1111-1111-111111111111",
+      projectId: null,
       repositoryId: "22222222-2222-2222-2222-222222222222",
       pullRequestId: 42,
       headCommit: "d".repeat(40),
+      targetCommit: "2".repeat(40),
+      targetRef: "refs/heads/main",
     },
     rule: { id: "mstest-owner", path: "rules/owner.md", section: "MSTest Owner" },
     lifecycle: { status: "completed" },
@@ -190,16 +209,30 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
   });
   const relationIdentity = "e".repeat(64);
   const relationRoot = join(stateRoot, "owner-v2-preview-state", "schema-1", "capabilities", "relation");
-  await writeJson(join(relationRoot, "declarations", `${relationIdentity}.json`), {
+  const relationDeclaration = {
     kind: "relation-v2-preview-declaration",
+    stateDigest: `v1:sha256:${relationIdentity}`,
     subject: {
       projectId: "11111111-1111-1111-1111-111111111111",
       repositoryId: "22222222-2222-2222-2222-222222222222",
       pullRequestId: 42,
     },
-  });
+    head: { sourceCommit: "d".repeat(40) },
+    target: { targetCommit: "2".repeat(40), targetRef: "refs/heads/main" },
+    capability: {
+      id: "relation-evidence@1",
+      digest: `v1:sha256:${"4".repeat(64)}`,
+    },
+  };
+  await writeJson(join(relationRoot, "declarations", `${relationIdentity}.json`), relationDeclaration);
   await writeJson(join(relationRoot, "records", `${relationIdentity}.json`), {
+    identity: relationIdentity,
+    stateDigest: relationDeclaration.stateDigest,
     state: "completed",
+    capabilityId: relationDeclaration.capability.id,
+    capabilityDigest: relationDeclaration.capability.digest,
+    subjectDigest: canonicalDigest(relationDeclaration.subject),
+    headDigest: canonicalDigest(relationDeclaration.head),
     updatedUtc: "utc:2026-09-24T19:00:00Z",
   });
   await writeJson(join(relationRoot, "observations", `${relationIdentity}.json`), {
@@ -211,6 +244,8 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
       repositoryId: "22222222-2222-2222-2222-222222222222",
       pullRequestId: 42,
       sourceCommit: "d".repeat(40),
+      targetCommit: "2".repeat(40),
+      targetRef: "refs/heads/main",
     },
     rule: { id: "relation-rule" },
     lifecycle: { status: "completed" },
@@ -639,6 +674,39 @@ test("pending findings use validated PR URLs and foreign identities fail closed"
     }).read();
     assert.match(pending.findings[0]?.url ?? "", /pullrequest\/42/);
     assert.doesNotMatch(pending.findings[0]?.url ?? "", /discussionId|commentId/);
+
+    const declarationPath = join(
+      fixture.stateRoot, "owner-v2-preview-state", "schema-1", "capabilities", "owner",
+      "declarations", `${fixture.identity}.json`,
+    );
+    const declaration = JSON.parse(await readFile(declarationPath, "utf8")) as JsonRecord;
+    const declarationSubject = asObject(declaration.subject);
+    const originalProjectId = declarationSubject.projectId;
+    declarationSubject.projectId = "88888888-8888-8888-8888-888888888888";
+    await writeJson(declarationPath, declaration);
+    const mismatchedDeclaration = await createAdapter(fixture.configPath, {
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.equal(mismatchedDeclaration.findings[0]?.url, null);
+    assert.ok(mismatchedDeclaration.failures.some((failure) =>
+      /not fully bound/.test(failure.message)));
+    declarationSubject.projectId = originalProjectId;
+    await writeJson(declarationPath, declaration);
+
+    const recordPath = join(
+      fixture.stateRoot, "owner-v2-preview-state", "schema-1", "capabilities", "owner",
+      "records", `${fixture.identity}.json`,
+    );
+    const record = JSON.parse(await readFile(recordPath, "utf8")) as JsonRecord;
+    const originalIdentity = record.identity;
+    record.identity = "f".repeat(64);
+    await writeJson(recordPath, record);
+    const mismatchedRecord = await createAdapter(fixture.configPath, {
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.equal(mismatchedRecord.findings[0]?.url, null);
+    record.identity = originalIdentity;
+    await writeJson(recordPath, record);
 
     const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as JsonRecord;
     asObject(config.azureDevOps).projectId = "99999999-9999-9999-9999-999999999999";

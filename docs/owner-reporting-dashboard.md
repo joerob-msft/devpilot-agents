@@ -119,6 +119,11 @@ The reporting overlay extends the existing OpenTUI application:
   model calls, pending/posted queue counts, writes, delivery outcome.
 - **Findings**: PR, capability, rule, severity, reconciliation state, path,
   line, symbol, reason, source-head freshness, and a validated PR link.
+  When an observation omits `projectId`, the adapter may use the durable
+  declaration only after filename/state identity, state/capability/subject/head
+  digests, PR/repository/source/target bindings, completed record state, and
+  configured project/repository all match. Any mismatch produces no URL and an
+  explicit drift diagnostic.
 - **Deliveries**: automatic/manual create/update/preview/no-op outcomes,
   thread/comment IDs, write state, run/event IDs, anchors, body status, and
   validated Azure DevOps links.

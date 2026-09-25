@@ -1068,6 +1068,93 @@ function observationTimestamp(state: StateObservation): string {
     asRecord(state.observation.lifecycle).completedUtc) ?? "";
 }
 
+function getCanonicalDigest(value: unknown): string {
+  return `v1:sha256:${digestText(canonicalJson(value))}`;
+}
+
+function resolveObservationSubject(
+  state: StateObservation | undefined,
+  config: ReportingConfiguration,
+): {
+  projectId: string;
+  repositoryId: string;
+  pullRequestId: number;
+  diagnostic: string;
+} {
+  if (!state?.declaration || !state.record) {
+    return {
+      projectId: "", repositoryId: "", pullRequestId: 0,
+      diagnostic: "Observation has no complete durable declaration and record binding.",
+    };
+  }
+  const observation = state.observation;
+  const observationSubject = asRecord(observation.subject);
+  const declaration = state.declaration;
+  const declarationSubject = asRecord(declaration.subject);
+  const declarationHead = asRecord(declaration.head);
+  const declarationTarget = asRecord(declaration.target);
+  const declarationCapability = asRecord(declaration.capability);
+  const record = state.record;
+  const projectId = boundedText(declarationSubject.projectId, 128);
+  const repositoryId = boundedText(declarationSubject.repositoryId, 128);
+  const pullRequestId = safeCount(declarationSubject.pullRequestId);
+  const observedProjectId = boundedText(observationSubject.projectId, 128);
+  const observedRepositoryId = boundedText(observationSubject.repositoryId, 128);
+  const observedPullRequestId = safeCount(observationSubject.pullRequestId);
+  const sourceCommit = boundedText(declarationHead.sourceCommit, 40);
+  const observedSourceCommit = boundedText(
+    observationSubject.headCommit ?? observationSubject.sourceCommit, 40,
+  );
+  const targetCommit = boundedText(declarationTarget.targetCommit, 40);
+  const targetRef = boundedText(declarationTarget.targetRef, 256);
+  const observedTargetCommit = boundedText(observationSubject.targetCommit, 40);
+  const observedTargetRef = boundedText(observationSubject.targetRef, 256);
+  const capabilityId = boundedText(declarationCapability.id, 160);
+  const capabilityDigest = boundedText(declarationCapability.digest, 80);
+  const observationCapability = typeof observation.capability === "string"
+    ? boundedText(observation.capability, 160)
+    : boundedText(asRecord(observation.capability).id, 160);
+  const expectedStateDigest = `v1:sha256:${state.identity}`;
+  const configured = config.azureDevOps;
+  const valid = (
+    ["owner-v2-preview-declaration", "relation-v2-preview-declaration"]
+      .includes(boundedText(declaration.kind, 80)) &&
+    boundedText(declaration.stateDigest, 80) === expectedStateDigest &&
+    boundedText(record.identity, 64) === state.identity &&
+    boundedText(record.stateDigest, 80) === expectedStateDigest &&
+    boundedText(record.state, 40) === "completed" &&
+    capabilityId !== "" &&
+    boundedText(record.capabilityId, 160) === capabilityId &&
+    capabilityDigest !== "" &&
+    boundedText(record.capabilityDigest, 80) === capabilityDigest &&
+    boundedText(record.subjectDigest, 80) === getCanonicalDigest(declarationSubject) &&
+    boundedText(record.headDigest, 80) === getCanonicalDigest(declarationHead) &&
+    observationCapability === capabilityId &&
+    projectId !== "" &&
+    repositoryId !== "" &&
+    pullRequestId > 0 &&
+    (!observedProjectId || observedProjectId === projectId) &&
+    observedRepositoryId === repositoryId &&
+    observedPullRequestId === pullRequestId &&
+    isHex(sourceCommit, 40) &&
+    observedSourceCommit === sourceCommit &&
+    isHex(targetCommit, 40) &&
+    observedTargetCommit === targetCommit &&
+    targetRef.startsWith("refs/heads/") &&
+    observedTargetRef === targetRef &&
+    Boolean(configured) &&
+    configured?.projectId === projectId &&
+    configured?.repositoryId === repositoryId
+  );
+  return {
+    projectId: valid ? projectId : "",
+    repositoryId: valid ? repositoryId : "",
+    pullRequestId,
+    diagnostic: valid ? "" :
+      "Observation URL identity is not fully bound to its durable declaration, record, and configured repository.",
+  };
+}
+
 function projectState(
   observations: StateObservation[],
   latestHeads: Map<number, string>,
@@ -1080,16 +1167,24 @@ function projectState(
     const observation = state.observation;
     const kind = boundedText(observation.kind, 80);
     const subject = asRecord(observation.subject);
+    const resolvedSubject = resolveObservationSubject(state, config);
     const rule = asRecord(observation.rule);
     const capabilityValue = observation.capability;
     const capability = typeof capabilityValue === "string" ? boundedText(capabilityValue, 160) :
       boundedText(asRecord(capabilityValue).id, 160);
-    const pullRequestId = safeCount(subject.pullRequestId);
+    const pullRequestId = resolvedSubject.pullRequestId;
     const sourceCommit = boundedText(subject.headCommit ?? subject.sourceCommit, 40);
     const updatedUtc = observationTimestamp(state);
     const lifecycle = asRecord(observation.lifecycle);
     const recordState = boundedText(state.record?.state, 40);
     const indexState = boundedText(state.indexRecord?.state, 40);
+    if (resolvedSubject.diagnostic) {
+      failures.push({
+        id: `subject-drift:${state.identity}`, category: "drift",
+        occurredUtc: updatedUtc, health: "degraded", pullRequestId, runId: "",
+        message: resolvedSubject.diagnostic,
+      });
+    }
     if (!state.declaration || !state.record) {
       failures.push({
         id: `state-binding-missing:${state.identity}`, category: "missing-data",
@@ -1118,8 +1213,8 @@ function projectState(
         const anchor = findingAnchor(finding);
         const links = safeLinks(
           config,
-          boundedText(subject.projectId, 128),
-          boundedText(subject.repositoryId, 128),
+          resolvedSubject.projectId,
+          resolvedSubject.repositoryId,
           pullRequestId,
           null,
           null,
@@ -1151,8 +1246,8 @@ function projectState(
       const latest = latestHeads.get(pullRequestId);
       const prLinks = safeLinks(
         config,
-        boundedText(subject.projectId, 128),
-        boundedText(subject.repositoryId, 128),
+        resolvedSubject.projectId,
+        resolvedSubject.repositoryId,
         pullRequestId,
         null,
         null,
@@ -1171,8 +1266,8 @@ function projectState(
       const commentLinks = authoritativePostedThread
         ? safeLinks(
             config,
-            boundedText(subject.projectId, 128),
-            boundedText(subject.repositoryId, 128),
+            resolvedSubject.projectId,
+            resolvedSubject.repositoryId,
             pullRequestId,
             threadId,
             commentId,
@@ -1436,11 +1531,10 @@ function manualDeliveries(
     const intent = intentByInvocation.get(invocationId);
     const identity = boundedText(outcome.stateIdentity ?? intent?.stateIdentity, 64);
     const state = observations.get(identity);
-    const subject = asRecord(state?.observation.subject);
-    const declarationSubject = asRecord(state?.declaration?.subject);
-    const pullRequestId = safeCount(subject.pullRequestId ?? declarationSubject.pullRequestId);
-    const projectId = boundedText(subject.projectId ?? declarationSubject.projectId, 128);
-    const repositoryId = boundedText(subject.repositoryId ?? declarationSubject.repositoryId, 128);
+    const resolvedSubject = resolveObservationSubject(state, config);
+    const pullRequestId = resolvedSubject.pullRequestId;
+    const projectId = resolvedSubject.projectId;
+    const repositoryId = resolvedSubject.repositoryId;
     const occurredUtc = eventOccurred(outcome);
     const results = asArray(outcome.results).map(asRecord);
     const selections = asArray(intent?.selections).map(asRecord);
@@ -1533,7 +1627,8 @@ function manualDeliveries(
         body: bodyVerified ? body : null,
         bodySha256: digest,
         bodyStatus: bodyVerified ? "verified" : digest ? "digest-only" : "unavailable",
-        diagnostic: boundedText(outcome.diagnostic, 240) || linkBindingDiagnostic || links.diagnostic,
+        diagnostic: boundedText(outcome.diagnostic, 240) || resolvedSubject.diagnostic ||
+          linkBindingDiagnostic || links.diagnostic,
       });
     });
     if (boundedText(outcome.status, 80) === "failed" || outcome.providerWrites === "unknown") {
