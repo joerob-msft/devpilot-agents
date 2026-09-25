@@ -587,12 +587,16 @@ test("verified local reporting renders inside the existing dashboard and opens o
     truncated: false,
   });
   let setup: TestRendererSetup | undefined;
+  let openFailure = false;
   try {
     setup = await testRender(() => <App
       reducer={fixture.reducer}
       tailer={fixture.tailer}
       reporting={reporting}
-      openUrl={(url) => { opened.push(url); }}
+      openUrl={(url) => {
+        if (openFailure) throw new Error("shell association failed");
+        opened.push(url);
+      }}
     />, { width: 140, height: 34, kittyKeyboard: true });
     await setup.renderOnce();
     setup.mockInput.pressKey("d");
@@ -609,6 +613,14 @@ test("verified local reporting renders inside the existing dashboard and opens o
     assert.deepEqual(opened, [
       "https://dev.azure.com/example/Project/_git/repo/pullrequest/42?_a=files&discussionId=100&commentId=101",
     ]);
+    assert.match(setup.captureCharFrame(), /Opened validated Azure DevOps URL/);
+    openFailure = true;
+    setup.mockInput.pressKey("o");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /Could not open reporting URL: shell association failed/);
+    setup.mockInput.pressArrow("right");
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /Could not open reporting URL: shell association failed/);
     setup.mockInput.pressEscape();
     await setup.flush();
     assert.doesNotMatch(setup.captureCharFrame(), /VERIFIED LOCAL OWNER REPORTING - READ ONLY/);

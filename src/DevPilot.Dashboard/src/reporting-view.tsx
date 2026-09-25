@@ -245,6 +245,7 @@ export function ReportingView(props: {
   snapshot: ReportingSnapshot | null;
   error: string;
   refreshing: boolean;
+  actionStatus: { message: string; error: boolean } | null;
   section: ReportingSection;
   filters: ReportingFilters;
   rows: ReportingRow[];
@@ -263,6 +264,10 @@ export function ReportingView(props: {
       <text flexShrink={0} fg={props.colors.muted}>
         Range {props.filters.timeRange} | posting {props.filters.posting} | mode {props.filters.mode} | search {props.filters.search || "(none)"}
       </text>
+      <Show when={props.actionStatus}>
+        {(status: () => { message: string; error: boolean }) => <text flexShrink={0} wrapMode="word"
+          fg={status().error ? props.colors.error : props.colors.ok}>{status().message}</text>}
+      </Show>
       <Show when={props.section !== "overview" && props.rows.length > 0}>
         <text flexShrink={0} fg={props.colors.muted}>
           Showing {windowStart() + 1}-{Math.min(props.rows.length, windowStart() + visibleRows().length)} of {props.rows.length}

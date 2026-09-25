@@ -133,6 +133,15 @@ Search supports free text plus `pr:`, `capability:`, `health:`, and `outcome:`
 tokens. Rows are sorted deterministically and capped by `maxHistory`. `o`
 opens only the selected validated URL.
 
+On Windows, `o` uses the system URL association through a fixed PowerShell
+`Start-Process -FilePath $url` launcher. The validated URL is passed only in
+an environment variable, never interpolated into PowerShell or cmd source, so
+`&`, `?`, `%`, and percent-encoded Unicode remain data. The dashboard waits
+for the PowerShell association request to exit successfully and reports a
+nonzero exit, spawn failure, or timeout instead of treating process creation
+as proof that the browser launch succeeded. macOS continues to use `open` and
+Linux continues to use `xdg-open`.
+
 ## Signed feed and body rules
 
 Automatic delivery events are the PR172 immutable files:
@@ -234,6 +243,10 @@ The repository renderer fixture uses synthetic IDs, paths, and comments.
 - **Last run unavailable**: point `files.lastRun` at the scheduler's composite
   schema-v1 envelope, not an untyped launch-time projection. Unknown
   schema/kind or inconsistent success/count fields fail closed.
+- **`o` reports a launch failure**: verify `pwsh.exe` is available and the
+  current Windows user has an HTTP/HTTPS shell association. The URL is already
+  validated; the dashboard will not fall back to `cmd`, `rundll32`, or an
+  interpolated shell command.
 
 ## Rollback and uninstall
 

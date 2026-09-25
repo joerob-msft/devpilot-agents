@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { useKeyboard, usePaste, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import type { ScrollBoxRenderable } from "@opentui/core";
@@ -23,6 +22,7 @@ import type { EventTailer } from "./tailer.js";
 import { manualProgress, type ManualProgress } from "./manual-progress.js";
 import { SimpleView, SimpleManualPanel, simpleInstanceRow, simpleHistoryRow, selectionWindow, automationStatusText, scanNowResultText } from "./simple-view.js";
 import type { LocalReportingAdapter, ReportingSnapshot } from "./reporting.js";
+import { defaultOpenUrl, safeHttpUrl } from "./url-launcher.js";
 import {
   REPORTING_SECTIONS,
   ReportingView,
@@ -477,49 +477,7 @@ interface PaletteCommand {
   run: () => void;
 }
 
-export function safeHttpUrl(value: string): string | null {
-  if (!value || value.length > 2_048) return null;
-  try {
-    const parsed = new URL(value);
-    if (
-      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
-      !parsed.hostname ||
-      parsed.username ||
-      parsed.password
-    ) {
-      return null;
-    }
-    return parsed.href;
-  } catch {
-    return null;
-  }
-}
-
-export function defaultOpenUrl(value: string): Promise<void> {
-  const url = safeHttpUrl(value);
-  if (!url) return Promise.reject(new Error("PR URL is missing or unsupported"));
-
-  const platform = process.platform;
-  const command =
-    platform === "win32" ? "rundll32.exe" : platform === "darwin" ? "open" : platform === "linux" ? "xdg-open" : "";
-  const args =
-    platform === "win32" ? ["url.dll,FileProtocolHandler", url] : command ? [url] : [];
-  if (!command) return Promise.reject(new Error(`URL opening is unavailable on ${platform}`));
-
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-      shell: false,
-    });
-    child.once("error", reject);
-    child.once("spawn", () => {
-      child.unref();
-      resolve();
-    });
-  });
-}
+export { defaultOpenUrl, safeHttpUrl };
 
 export function completionResultColor(result: string): string {
   const normalized = result.toLowerCase();
@@ -908,6 +866,8 @@ export function App(props: AppProps) {
   const [reportingSnapshot, setReportingSnapshot] = createSignal<ReportingSnapshot | null>(null);
   const [reportingError, setReportingError] = createSignal("");
   const [reportingRefreshing, setReportingRefreshing] = createSignal(false);
+  const [reportingActionStatus, setReportingActionStatus] =
+    createSignal<{ message: string; error: boolean } | null>(null);
   const [reportingSection, setReportingSection] = createSignal<ReportingSection>("overview");
   const [reportingSelected, setReportingSelected] = createSignal(0);
   const [reportingFilters, setReportingFilters] = createSignal<ReportingFilters>({
@@ -1142,6 +1102,7 @@ export function App(props: AppProps) {
   async function refreshReporting(manual = false): Promise<void> {
     if (!props.reporting || reportingDisposed || reportingRefreshing()) return;
     const generation = ++reportingGeneration;
+    setReportingActionStatus(null);
     setReportingRefreshing(true);
     if (manual) setReportingError("");
     try {
@@ -1171,6 +1132,7 @@ export function App(props: AppProps) {
     setOverlay("reporting");
     setReportingSearchMode(false);
     setReportingSelected(0);
+    setReportingActionStatus(null);
     reportingScroll?.scrollTo(0);
     if (!reportingSnapshot() && !reportingRefreshing()) void refreshReporting();
     notify("Verified local reporting opened");
@@ -1179,14 +1141,18 @@ export function App(props: AppProps) {
   async function openReportingUrl(): Promise<void> {
     const url = safeHttpUrl(reportingRows()[reportingSelected()]?.url ?? "");
     if (!url) {
+      setReportingActionStatus({ message: "Selected reporting row has no validated URL", error: true });
       notify("Selected reporting row has no validated URL");
       return;
     }
     try {
       await (props.openUrl ?? defaultOpenUrl)(url);
+      setReportingActionStatus({ message: "Opened validated Azure DevOps URL", error: false });
       notify("Opened validated Azure DevOps URL");
     } catch (error) {
-      notify(`Could not open reporting URL: ${error instanceof Error ? error.message : String(error)}`);
+      const message = `Could not open reporting URL: ${error instanceof Error ? error.message : String(error)}`;
+      setReportingActionStatus({ message, error: true });
+      notify(message);
     }
   }
 
@@ -1196,6 +1162,7 @@ export function App(props: AppProps) {
       (current + direction + REPORTING_SECTIONS.length) % REPORTING_SECTIONS.length
     ] ?? "overview");
     setReportingSelected(0);
+    setReportingActionStatus(null);
     reportingScroll?.scrollTo(0);
   }
 
@@ -1206,6 +1173,7 @@ export function App(props: AppProps) {
       timeRange: ranges[(ranges.indexOf(filters.timeRange) + direction + ranges.length) % ranges.length] ?? "7d",
     }));
     setReportingSelected(0);
+    setReportingActionStatus(null);
   }
 
   function cycleReportingPosting(): void {
@@ -1215,6 +1183,7 @@ export function App(props: AppProps) {
       posting: values[(values.indexOf(filters.posting) + 1) % values.length] ?? "all",
     }));
     setReportingSelected(0);
+    setReportingActionStatus(null);
   }
 
   function cycleReportingMode(): void {
@@ -1224,6 +1193,7 @@ export function App(props: AppProps) {
       mode: values[(values.indexOf(filters.mode) + 1) % values.length] ?? "all",
     }));
     setReportingSelected(0);
+    setReportingActionStatus(null);
   }
 
   function stopAutomationPolling(): void {
@@ -3034,6 +3004,7 @@ export function App(props: AppProps) {
           setReportingFilters((filters) => ({ ...filters, search: reportingSearchInput() }));
           setReportingSearchMode(false);
           setReportingSelected(0);
+          setReportingActionStatus(null);
           reportingScroll?.scrollTo(0);
           notify("Reporting search applied");
         } else {
@@ -3069,12 +3040,14 @@ export function App(props: AppProps) {
         const count = reportingRows().length;
         if (count) {
           setReportingSelected((value) => (value + count - 1) % count);
+          setReportingActionStatus(null);
           reportingScroll?.scrollTo(0);
         }
       } else if (key.name === "down" || key.name === "j") {
         const count = reportingRows().length;
         if (count) {
           setReportingSelected((value) => (value + 1) % count);
+          setReportingActionStatus(null);
           reportingScroll?.scrollTo(0);
         }
       } else if (scrollAmount(key.name)) {
@@ -3632,6 +3605,7 @@ export function App(props: AppProps) {
             snapshot={reportingSnapshot()}
             error={reportingError()}
             refreshing={reportingRefreshing()}
+            actionStatus={reportingActionStatus()}
             section={reportingSection()}
             filters={reportingFilters()}
             rows={reportingRows()}

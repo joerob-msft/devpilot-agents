@@ -16,6 +16,9 @@ Pass `-ReportingConfigPath`, then press `d`. This reporting plane has no
 provider writes, approvals, task mutations, listener, credential handling, or
 telemetry upload. See
 [`docs/owner-reporting-dashboard.md`](../../docs/owner-reporting-dashboard.md).
+Press `o` on a reporting delivery to open its validated Azure DevOps URL. On
+Windows this uses the current user's HTTP/HTTPS shell association through a
+fixed PowerShell `Start-Process` request and reports launcher exit failures.
 
 Every launch starts in **Simple**. At 100 columns and wider, a clearly boxed
 left sidebar lists agents, PRs, and statuses, with the selected item's latest
