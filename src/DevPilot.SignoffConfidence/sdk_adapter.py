@@ -1,4 +1,4 @@
-"""Pinned official SDK adapter. No CLI-output inference, implicit installs, or auth fallback."""
+"""Pinned official SDK adapter with explicit, isolated GitHub credential handoff."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
+import stat
 import tempfile
 from typing import Any
 
@@ -19,6 +21,93 @@ from replay import AssessmentFailure, CapabilityError
 SDK_VERSION = "1.0.14"
 RUNTIME_VERSION = "1.0.85"
 DISABLED_MCP_SERVERS = ["github", "github-mcp-server"]
+TOKEN_OVERRIDE = "DEVPILOT_SIGNOFF_GITHUB_TOKEN"
+AUTH_TIMEOUT_SECONDS = 10
+MAX_TOKEN_BYTES = 8192
+
+
+def resolve_gh_path() -> Path:
+    """Resolve a native PATH executable, never a checkout shim or shell command."""
+    executable = "gh.exe" if os.name == "nt" else "gh"
+    checkout = Path(__file__).resolve().parents[2]
+    for entry in os.get_exec_path():
+        directory = Path(entry)
+        if not entry or not directory.is_absolute():
+            continue
+        candidate = directory / executable
+        if not candidate.is_file():
+            continue
+        resolved = candidate.resolve()
+        if (str(candidate).startswith(("\\\\", "//")) or resolved.is_relative_to(checkout)
+                or resolved.parent == Path.cwd().resolve()
+                or any((parent / ".git").exists() for parent in resolved.parents)):
+            raise CapabilityError("LIVE_GH_EXECUTABLE_MUST_BE_OUTSIDE_CHECKOUT")
+        for part in (candidate, *candidate.parents):
+            if part.is_symlink() or getattr(part.stat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise CapabilityError("LIVE_GH_EXECUTABLE_LINK_NOT_ALLOWED")
+        if not os.access(resolved, os.X_OK):
+            raise CapabilityError("LIVE_GH_EXECUTABLE_NOT_RUNNABLE")
+        return resolved
+    raise CapabilityError("LIVE_GH_NOT_FOUND_INSTALL_GITHUB_CLI_OR_SET_" + TOKEN_OVERRIDE)
+
+
+def gh_auth_environment() -> dict[str, str]:
+    # Only gh may consult the normal user login. Never expose this environment to the runtime.
+    names = ("SystemRoot", "WINDIR", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+             "GH_TOKEN", "GITHUB_TOKEN")
+    env = {key: os.environ[key] for key in names if key in os.environ}
+    env.update(GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", GH_NO_EXTENSION_UPDATE_NOTIFIER="1")
+    return env
+
+
+def checked_token(value: str, source: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,8192}", value):
+        raise CapabilityError("LIVE_" + source + "_TOKEN_EMPTY_OR_MALFORMED")
+    return value
+
+
+async def resolve_github_token(directory: Path) -> str:
+    """Select once, fail closed; stdout remains in memory and stderr is never surfaced."""
+    if TOKEN_OVERRIDE in os.environ:
+        return checked_token(os.environ[TOKEN_OVERRIDE], "EXPLICIT")
+    try:
+        executable = resolve_gh_path()
+        process = await asyncio.create_subprocess_exec(
+            str(executable), "auth", "token", "--hostname", "github.com",
+            cwd=directory, env=gh_auth_environment(), stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    except OSError:
+        raise CapabilityError("LIVE_GH_AUTH_PROCESS_UNAVAILABLE") from None
+    try:
+        async with asyncio.timeout(AUTH_TIMEOUT_SECONDS):
+            output = bytearray()
+            while True:
+                chunk = await process.stdout.read(MAX_TOKEN_BYTES + 1 - len(output))
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > MAX_TOKEN_BYTES:
+                    raise CapabilityError("LIVE_GH_TOKEN_OUTPUT_TOO_LARGE")
+            await process.wait()
+        if process.returncode != 0:
+            raise CapabilityError("LIVE_GH_AUTH_UNAVAILABLE_RUN_gh_auth_login_--hostname_github.com")
+        try:
+            token = output.decode("ascii").removesuffix("\n").removesuffix("\r")
+        except UnicodeDecodeError:
+            raise CapabilityError("LIVE_GH_TOKEN_EMPTY_OR_MALFORMED") from None
+        return checked_token(token, "GH")
+    except TimeoutError:
+        raise CapabilityError("LIVE_GH_AUTH_DEADLINE") from None
+    finally:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), 5)
+            except (TimeoutError, OSError, asyncio.CancelledError):
+                raise CapabilityError("LIVE_GH_CLEANUP_UNCONFIRMED") from None
 
 
 def deny_permission(_request: Any, _invocation: Any) -> Any:
@@ -115,9 +204,7 @@ class SdkProvider:
         self.runtime = runtime.resolve()
         if not self.runtime.is_file() or not (self.runtime.parent / "runtime.node").is_file():
             raise CapabilityError("PREPROVISION_PINNED_RUNTIME_1.0.85_OUTSIDE_EVALUATION")
-        self.token = os.environ.get("DEVPILOT_SIGNOFF_GITHUB_TOKEN")
-        if not self.token:
-            raise CapabilityError("SET_DEVPILOT_SIGNOFF_GITHUB_TOKEN_WITH_COPILOT_ENTITLEMENT")
+        self.token: str | None = None
         self.model = model
         self.credits = credits
         self.metadata = {
@@ -134,6 +221,8 @@ class SdkProvider:
         logger.propagate = False
         with tempfile.TemporaryDirectory(prefix="devpilot-signoff-") as temporary:
             directory = Path(temporary)
+            if self.token is None:
+                self.token = await resolve_github_token(directory)
             client = CopilotClient(
                 connection=RuntimeConnection.for_stdio(path=str(self.runtime)),
                 mode="empty", working_directory=str(directory), base_directory=str(directory / "state"),

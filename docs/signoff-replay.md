@@ -135,20 +135,91 @@ C:\pilot\venv\Scripts\python.exe -m pip install -r .\src\DevPilot.SignoffConfide
 C:\pilot\venv\Scripts\python.exe -m pip install -r .\src\DevPilot.SignoffConfidence\requirements-live.txt
 $env:COPILOT_CLI_EXTRACT_DIR = 'C:\pilot\runtime-1.0.85'
 C:\pilot\venv\Scripts\python.exe -m copilot download-runtime
-# Supply DEVPILOT_SIGNOFF_GITHUB_TOKEN through your approved secret mechanism.
-# It must carry Copilot model entitlement. No credential is accepted on the CLI.
+# Reuse your existing GitHub CLI login; no custom token environment setting.
+# Only if not already signed in: gh auth login --hostname github.com
 .\tools\Invoke-SignoffReplay.ps1 -Action Run -Mode Live `
   -PythonPath C:\pilot\venv\Scripts\python.exe `
   -RuntimePath C:\pilot\runtime-1.0.85\prebuilds\win32-x64\copilot-runtime.exe `
   -InputPath C:\pilot\cases -OutputRoot C:\pilot\live-result `
-  -Model gpt-5.4-mini -MaxCases 1 -MaxAttempts 1 -DeadlineSeconds 60 -MaxAiCredits 30
+  -Model gpt-6-astra -MaxCases 1 -MaxAttempts 1 -DeadlineSeconds 300 -MaxAiCredits 30
 ```
 
 The released `github-copilot-sdk==1.0.14` wheel pins runtime **1.0.85**; the SDK's
 explicit download command verifies upstream release SHA256SUMS. Runtime assets
 are fingerprinted and the running runtime version is checked. Evaluation passes
 an explicit binary and disables automatic downloads. SDK/dependency versions are
-pinned in the manifests; no first-use package install or authentication fallback.
+pinned in the manifests; no first-use package install or account/model fallback.
+
+### Existing GitHub authentication
+
+Live evaluation no longer requires `DEVPILOT_SIGNOFF_GITHUB_TOKEN`. Credential
+selection is explicit and fail-closed:
+
+1. If `DEVPILOT_SIGNOFF_GITHUB_TOKEN` is present, use it exclusively. Empty,
+   malformed, rejected, or unentitled overrides do **not** fall back to another
+   token or account. This preserves existing automated secret provisioning.
+2. Otherwise, invoke the installed native GitHub CLI's `auth token` operation
+   with the fixed host `github.com`, no `--user`, and no shell. GitHub CLI's
+   documented precedence applies: `GH_TOKEN`, then `GITHUB_TOKEN`, then the
+   active stored account for that host. No new variable is required for an
+   already authenticated GitHub CLI user.
+
+Use `gh auth status --hostname github.com --active` to check the intended
+account without displaying its token. If necessary, sign in or explicitly
+switch accounts outside evaluation. There is no interactive authentication,
+automatic account switch, alternate-host retry, or Copilot/BYOK credential
+fallback. The selected credential must carry Copilot entitlement; current
+[SDK authentication documentation](https://github.com/github/copilot-sdk/blob/main/docs/auth/authenticate.md)
+does not support classic `ghp_` PATs.
+Unsupported or unentitled credentials fail rather than borrowing another
+account.
+
+If an older launch environment still defines the dedicated override, remove
+it deliberately to select existing GitHub CLI auth:
+`Remove-Item Env:DEVPILOT_SIGNOFF_GITHUB_TOKEN -ErrorAction SilentlyContinue`.
+Setting it to an empty value is not removal and is intentionally rejected.
+
+The resolver accepts only a native `gh.exe`/`gh` in an absolute PATH directory
+outside checkouts/current directory, with no links/reparse points; shell
+shims and relative/CWD lookup are forbidden. Install a trusted GitHub CLI
+outside the repository. The command is bounded to ten seconds within the
+existing process containment. Standard user home/config paths are available
+**only to that credential lookup**, along with the two standard GitHub token
+variables. Host/config overrides (`GH_HOST`, `GH_CONFIG_DIR`), debug/proxy
+variables, `COPILOT_GITHUB_TOKEN`, and unrelated provider credentials are not
+passed through.
+
+Token stdout is captured only in memory, bounded and validated; stderr is
+discarded. No token is printed, written to artifacts, placed in command
+arguments, or added to the model prompt. The selected token is handed to the
+official SDK as `github_token` with `use_logged_in_user=False`. The runtime
+still receives private HOME/config directories, not the user's credential
+store or ambient tool configuration. Token fingerprints and account names
+are not study metadata. Missing auth returns an actionable, redacted
+`LIVE_GH_AUTH_UNAVAILABLE...` error.
+
+Lookup is deferred until an SDK assessment is actually admitted. Offline,
+collection-only, bundle validation, observer `ValidateOnly`, and launcher
+`WhatIf` do not authenticate or discover models. Deterministic policy
+abstention without a model likewise does not need credentials.
+
+### Model choice
+
+For the next deep-review trial, explicitly select **`gpt-6-astra`** rather
+than the earlier lightweight `gpt-5.4-mini` smoke model. The account-specific
+SDK catalog on 2026-09-25 reported it enabled; `claude-opus-5.5`,
+`gpt-6-sol`, and `gpt-5.6-sol` were also enabled alternatives. This is a
+trial recommendation, not evidence of superior sign-off accuracy. GitHub's
+[model comparison](https://docs.github.com/en/copilot/reference/ai-models/model-comparison)
+describes task fit; evaluate real held-out outcomes before making quality
+claims.
+
+Allow an explicit 300-second per-run deadline for the stronger-model trial.
+The soft 30-credit per-session ceiling, two-run rule, attempt limits, and
+approval policy are unchanged. No new reasoning-effort override is introduced;
+backend defaults/versions remain unknown where not reported. Availability is
+checked again for the exact ID during evaluation, with no substitute model.
+Changing model or this engine source requires a **new output/study root**.
 
 Live uses the Windows wrapper's Job Object descendant containment; portable
 offline Python does not imply supported uncontained live execution. Each
@@ -191,6 +262,24 @@ gate. No runtime descendants remained after the successful wrapper returned.
 This establishes SDK/auth/isolation viability only, **not** model accuracy,
 historical fidelity, a 25-real-PR model trial, or production readiness.
 
+**Existing-login probe, 2026-09-25:** with the custom override explicitly absent,
+the contained SDK authenticated using the `GH_CLI` resolver and returned the
+enabled model catalog above. It created **zero sessions and sent zero
+assessment prompts**. This verifies credential reuse/catalog access, not
+generation quality or selected-model assessment compatibility.
+
+**Stronger-model smoke, 2026-09-25:** the contained wrapper subsequently reused
+existing GitHub CLI auth with the custom override absent and completed exactly
+two tool-free `gpt-6-astra` assessment sends on the public synthetic case
+(one attempt each, 300-second deadline, soft 30-credit session limit). Both
+outputs passed strict validation and produced advisory APPROVE with
+`authorization:NONE`. The effective zero-tool/model checks passed before and
+after each send, and cleanup completed. An earlier invocation left the override
+present but empty; it correctly failed closed before SDK startup or any send.
+The successful smoke establishes this model's current transport/structured-output
+compatibility, not sign-off accuracy. Billing and provider/backend version remain
+unknown; no real-PR trial or monitoring was started.
+
 ## Targeted checks
 
 ```powershell
@@ -203,6 +292,9 @@ Tests cover a mixed 25-case synthetic replay, strict schemas/JSON, future and
 fabricated references, label exclusion, hostile content as data, low support,
 policy/history abstention, effective zero-tool gates, bounded attempts,
 cancellation including teardown failure, exact resume, and output collisions.
+Auth regressions cover exclusive/invalid overrides, existing-login lookup,
+native path/host/environment restrictions, timeout/cancellation cleanup,
+redacted errors, and no credential lookup in offline/validation/abstention paths.
 There are no live tests in the offline suite.
 
 ## Prospective studies

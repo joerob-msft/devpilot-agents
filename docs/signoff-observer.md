@@ -70,6 +70,25 @@ launch switch. Set positive daily/study admission limits deliberately.
 Changing modes/model/config/source/dependencies/runtime requires a **new study
 root**; it never reuses results from a different pipeline.
 
+For a stronger-model trial, use explicit `gpt-6-astra` and
+`deadlineSeconds:300`; it was enabled in the account's SDK catalog on
+2026-09-25. `claude-opus-5.5` was also enabled as an alternative for a separate
+study. Availability is rechecked, not guaranteed permanently, and neither
+catalog access nor the successful two-send `gpt-6-astra` public synthetic smoke
+proves sign-off accuracy.
+The two assessments, evidence requirements, and soft credit ceiling do not
+change with model selection.
+
+**No custom token setting is required.** Live assessments reuse the installed
+GitHub CLI's existing active `github.com` authentication. Optional
+`DEVPILOT_SIGNOFF_GITHUB_TOKEN` takes exclusive precedence; if present but
+invalid it fails closed, without switching accounts. Otherwise standard
+`gh` precedence is `GH_TOKEN`, `GITHUB_TOKEN`, then the active stored login.
+See [credential isolation and troubleshooting](signoff-replay.md#existing-github-authentication).
+Collection-only/offline/validation/WhatIf never resolve credentials or probe
+models. The token remains memory-only and the SDK keeps its private HOME and
+zero-tool boundary.
+
 ## Launch and ownership
 
 Validate without starting collection:
@@ -123,6 +142,36 @@ An independent TUI can attach without acquiring worker ownership:
 
 Closing an attachment cannot kill the separately supervised worker.
 Concurrent workers using the same study root fail the exclusive owner lock.
+
+### Restart an existing collection-only TUI as a live seven-day study
+
+Close the **owning** TUI to stop its worker. If the TUI is attach-only, closing
+it does not stop the independent owner: stop that owner deliberately (for
+example via its configured cancel file). Do not run a competing daemon.
+Preserve the old study directory and reports; do not change its frozen config.
+
+Create a **new** private study ID/root and event directory using the consumer's
+initializer. Select `gpt-6-astra`, the already provisioned runtime, a
+300-second deadline, and deliberate positive admission limits. For example,
+100/day and 500/study are the current maximum limits, not unlimited access.
+Keep the consumer's normal full-inventory selection, not a selected-PR smoke
+list. Inspect the generated config, then use the validation command above.
+Validation is local only; it does not authenticate or authorize inference.
+
+Run the new config using the observer-only attended command with
+`-ObserverEnableModel`, or the foreground supervised worker with
+`-EnableModel`. These explicit switches are required even though the observer
+remains `PreviewOnly` for PR mutations. Attach the dashboard to the same new
+event directory if using a headless owner.
+
+The new seven-day clock starts on the first worker invocation, not during
+initialization/ValidateOnly. Keep the owning host awake and the process running;
+there is no automatic service installation. Restart the same new config after
+interruptions without extending its deadline. Inspect `reports\latest.md` for
+collection health, admissions, policy gaps, and separate diagnostics. Exhausted
+model budgets leave collection running. Missing required evidence still
+abstains, regardless of model strength; enable exploratory diagnostics only
+deliberately, without calling them final policy approval.
 
 ## Collector interchange
 
