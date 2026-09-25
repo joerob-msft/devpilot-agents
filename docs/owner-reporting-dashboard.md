@@ -118,14 +118,15 @@ The reporting overlay extends the existing OpenTUI application:
 - **Runs**: Owner/relation completed and failed counts, duration, attempts,
   model calls, pending/posted queue counts, writes, delivery outcome.
 - **Findings**: PR, capability, rule, severity, reconciliation state, path,
-  line, symbol, reason, and source-head freshness.
+  line, symbol, reason, source-head freshness, and a validated PR link.
 - **Deliveries**: automatic/manual create/update/preview/no-op outcomes,
   thread/comment IDs, write state, run/event IDs, anchors, body status, and
   validated Azure DevOps links.
 - **Failures**: invalid signatures, ambiguous writes, refusals, drift, stale
   state, task failures, missing data, and recovery-required incidents.
 - **Relations**: relation findings in a separate view, always labeled
-  **READ ONLY / NOT WRITER ELIGIBLE**.
+  **READ ONLY / NOT WRITER ELIGIBLE**, with a validated PR link when the
+  configured project/repository identity matches.
 
 Use `Tab`/`Shift+Tab` for sections, Left/Right for `24h`/`7d`/`30d`/all,
 `p` for all/pending/posted, `t` for all/automatic/manual, and `/` for search.

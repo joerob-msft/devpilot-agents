@@ -122,6 +122,7 @@ export interface FindingSummary {
   sourceCommit: string;
   sourceFreshness: "current" | "stale" | "unknown";
   updatedUtc: string;
+  url: string | null;
 }
 
 export interface RelationSummary {
@@ -136,6 +137,7 @@ export interface RelationSummary {
   reason: string;
   updatedUtc: string;
   writerEligible: false;
+  url: string | null;
 }
 
 export interface DeliverySummary {
@@ -1069,6 +1071,7 @@ function observationTimestamp(state: StateObservation): string {
 function projectState(
   observations: StateObservation[],
   latestHeads: Map<number, string>,
+  config: ReportingConfiguration,
 ): { findings: FindingSummary[]; relations: RelationSummary[]; failures: FailureSummary[] } {
   const findings: FindingSummary[] = [];
   const relations: RelationSummary[] = [];
@@ -1113,6 +1116,16 @@ function projectState(
       for (const item of asArray(observation.findings)) {
         const finding = asRecord(item);
         const anchor = findingAnchor(finding);
+        const links = safeLinks(
+          config,
+          boundedText(subject.projectId, 128),
+          boundedText(subject.repositoryId, 128),
+          pullRequestId,
+          null,
+          null,
+          anchor.path,
+          anchor.line,
+        );
         relations.push({
           id: boundedText(finding.identity ?? finding.findingId, 160) || `relation:${state.identity}:${relations.length}`,
           capability, pullRequestId,
@@ -1122,6 +1135,7 @@ function projectState(
           reason: boundedText(finding.reason ?? finding.explanation, 240),
           updatedUtc,
           writerEligible: false,
+          url: links.prUrl,
         });
       }
       continue;
@@ -1135,6 +1149,37 @@ function projectState(
         classification === "noOp" ? classification : "unknown";
       const anchor = findingAnchor(finding);
       const latest = latestHeads.get(pullRequestId);
+      const prLinks = safeLinks(
+        config,
+        boundedText(subject.projectId, 128),
+        boundedText(subject.repositoryId, 128),
+        pullRequestId,
+        null,
+        null,
+        anchor.path,
+        anchor.line,
+      );
+      const thread = asRecord(reconciliation.thread);
+      const threadId = nullableInteger(thread.threadId);
+      const commentId = nullableInteger(thread.commentId);
+      const authoritativePostedThread = stateValue === "noOp" &&
+        isHex(boundedText(reconciliation.bodySha256, 64), 64) &&
+        boundedText(thread.availability, 40) === "available" &&
+        boundedText(thread.status, 40) === "active" &&
+        threadId !== null &&
+        commentId !== null;
+      const commentLinks = authoritativePostedThread
+        ? safeLinks(
+            config,
+            boundedText(subject.projectId, 128),
+            boundedText(subject.repositoryId, 128),
+            pullRequestId,
+            threadId,
+            commentId,
+            anchor.path,
+            anchor.line,
+          )
+        : null;
       findings.push({
         id: boundedText(finding.identity ?? finding.findingId, 160) || `owner:${state.identity}:${findings.length}`,
         capability, pullRequestId,
@@ -1146,6 +1191,7 @@ function projectState(
         sourceCommit,
         sourceFreshness: !latest || !sourceCommit ? "unknown" : latest === sourceCommit ? "current" : "stale",
         updatedUtc,
+        url: commentLinks?.commentUrl ?? prLinks.prUrl,
       });
       if (stateValue === "unknown") {
         failures.push({
@@ -1715,7 +1761,7 @@ export class LocalReportingAdapter {
     const automatic = automaticDeliveries(
       automaticEvents, automaticIntents, observationMap, toolkit, localFormatterDigest, config,
     );
-    const projected = projectState(observations, automatic.latestHeads);
+    const projected = projectState(observations, automatic.latestHeads, config);
     const manual = manualDeliveries(manualIntents, manualOutcomes, observationMap, config);
     const deliveries = [...automatic.deliveries, ...manual.deliveries]
       .sort((left, right) => Date.parse(right.occurredUtc || "1970-01-01") - Date.parse(left.occurredUtc || "1970-01-01") ||

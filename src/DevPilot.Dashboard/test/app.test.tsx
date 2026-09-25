@@ -554,7 +554,22 @@ test("verified local reporting renders inside the existing dashboard and opens o
       deliveryOutcome: "created",
       diagnostic: "",
     }],
-    findings: [],
+    findings: [{
+      id: "finding-1",
+      capability: "bpm-test-ownership@1",
+      pullRequestId: 42,
+      rule: "mstest-owner",
+      severity: "violation",
+      state: "noOp",
+      path: "tests/WidgetTests.cs",
+      line: 12,
+      symbol: "CreatesWidget",
+      reason: "reviewer-marker-body-current",
+      sourceCommit: "a".repeat(40),
+      sourceFreshness: "current",
+      updatedUtc: "2026-09-24T20:00:00.000Z",
+      url: "https://dev.azure.com/example/Project/_git/repo/pullrequest/42?_a=files",
+    }],
     deliveries: [{
       id: "automatic:event-1",
       mode: "automatic",
@@ -605,12 +620,20 @@ test("verified local reporting renders inside the existing dashboard and opens o
     assert.match(setup.captureCharFrame(), /SERVICE HEALTHY/);
     setup.mockInput.pressTab();
     setup.mockInput.pressTab();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /FINDINGS/);
+    setup.mockInput.pressKey("o");
+    await setup.flush();
+    assert.deepEqual(opened, [
+      "https://dev.azure.com/example/Project/_git/repo/pullrequest/42?_a=files",
+    ]);
     setup.mockInput.pressTab();
     await setup.flush();
     assert.match(setup.captureCharFrame(), /automatic create/i);
     setup.mockInput.pressKey("o");
     await setup.flush();
     assert.deepEqual(opened, [
+      "https://dev.azure.com/example/Project/_git/repo/pullrequest/42?_a=files",
       "https://dev.azure.com/example/Project/_git/repo/pullrequest/42?_a=files&discussionId=100&commentId=101",
     ]);
     assert.match(setup.captureCharFrame(), /Opened validated Azure DevOps URL/);

@@ -149,7 +149,7 @@ function findingRow(finding: FindingSummary): ReportingRow {
     pullRequestId: finding.pullRequestId, capability: finding.capability,
     health: finding.sourceFreshness === "stale" || finding.state === "unknown" ? "degraded" : "healthy",
     outcome: finding.state, posting: finding.state === "wouldCreate" || finding.state === "wouldUpdate" ? "pending" : "posted",
-    mode: "none", text, searchText: clean(text.join(" ")).toLowerCase(), url: null,
+    mode: "none", text, searchText: clean(text.join(" ")).toLowerCase(), url: finding.url,
     attention: finding.sourceFreshness === "stale" || finding.state === "unknown",
   };
 }
@@ -210,7 +210,7 @@ function relationRow(relation: RelationSummary): ReportingRow {
     pullRequestId: relation.pullRequestId, capability: relation.capability,
     health: relation.state === "unknown" ? "degraded" : "healthy", outcome: relation.state,
     posting: "none", mode: "none", text, searchText: clean(text.join(" ")).toLowerCase(),
-    url: null, attention: relation.state === "unknown",
+    url: relation.url, attention: relation.state === "unknown",
   };
 }
 

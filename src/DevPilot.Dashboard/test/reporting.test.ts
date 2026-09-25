@@ -477,8 +477,12 @@ test("reporting adapter verifies signed feeds, isolates relation findings, deriv
     assert.equal(snapshot.overall.status, "healthy");
     assert.equal(snapshot.runs.length, 10);
     assert.equal(snapshot.findings.length, 1);
+    assert.match(snapshot.findings[0]?.url ?? "", /pullrequest\/42/);
+    assert.match(snapshot.findings[0]?.url ?? "", /discussionId=200/);
+    assert.match(snapshot.findings[0]?.url ?? "", /commentId=201/);
     assert.equal(snapshot.relations.length, 1);
     assert.equal(snapshot.relations[0]?.writerEligible, false);
+    assert.match(snapshot.relations[0]?.url ?? "", /pullrequest\/42/);
     assert.equal(snapshot.deliveries.length, 2);
     const automatic = snapshot.deliveries.find((row) => row.mode === "automatic");
     const manual = snapshot.deliveries.find((row) => row.mode === "manual");
@@ -588,6 +592,8 @@ test("manual live audit links bind nine authoritative nested thread identities a
     assert.equal(published.length, 9);
     assert.equal(published.filter((row) => row.commentUrl !== null).length, 9);
     assert.ok(published.every((row) => row.commentUrl?.includes(`discussionId=${row.threadId}`)));
+    assert.equal(snapshot.findings.length, 9);
+    assert.equal(snapshot.findings.filter((finding) => finding.url?.includes("discussionId=")).length, 9);
 
     const firstReconciliation = asObject(asObject(findings[0]).reconciliation);
     firstReconciliation.threadId = 9999;
@@ -608,6 +614,40 @@ test("manual live audit links bind nine authoritative nested thread identities a
       row.path === "tests/Synthetic1.cs");
     assert.match(legacyFirst?.commentUrl ?? "", /discussionId=1001/);
     assert.match(legacyFirst?.commentUrl ?? "", /commentId=2001/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("pending findings use validated PR URLs and foreign identities fail closed", async () => {
+  const fixture = await createFixture();
+  try {
+    const observationPath = join(
+      fixture.stateRoot, "owner-v2-preview-state", "schema-1", "capabilities", "owner",
+      "observations", `${fixture.identity}.json`,
+    );
+    const observation = JSON.parse(await readFile(observationPath, "utf8")) as JsonRecord;
+    const finding = asObject(asArray(observation.findings)[0]);
+    const reconciliation = asObject(finding.reconciliation);
+    reconciliation.classification = "wouldCreate";
+    reconciliation.reason = "reviewer-marker-not-found";
+    delete reconciliation.thread;
+    await writeJson(observationPath, observation);
+
+    const pending = await createAdapter(fixture.configPath, {
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.match(pending.findings[0]?.url ?? "", /pullrequest\/42/);
+    assert.doesNotMatch(pending.findings[0]?.url ?? "", /discussionId|commentId/);
+
+    const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as JsonRecord;
+    asObject(config.azureDevOps).projectId = "99999999-9999-9999-9999-999999999999";
+    await writeJson(fixture.configPath, config);
+    const foreign = await createAdapter(fixture.configPath, {
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.equal(foreign.findings[0]?.url, null);
+    assert.equal(foreign.relations[0]?.url, null);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
