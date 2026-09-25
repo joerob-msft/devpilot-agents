@@ -61,31 +61,22 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   await write(path, `${JSON.stringify(value)}\n`);
 }
 
-async function hardenWindowsPrivateTree(root: string): Promise<void> {
+async function copyIntoWindowsTrustedRoot(source: string, target: string, repositoryRoot: string): Promise<void> {
+  const harness = join(repositoryRoot, "src", "DevPilot.AgentHarness", "DevPilot.AgentHarness.psd1");
   const script = [
     "$ErrorActionPreference='Stop'",
-    "$root=$env:DEVPILOT_TEST_PRIVATE_ROOT",
-    "$current=[Security.Principal.WindowsIdentity]::GetCurrent().User",
-    "$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
-    "$allow=[Security.AccessControl.AccessControlType]::Allow",
-    "$full=[Security.AccessControl.FileSystemRights]::FullControl",
-    "$inherit=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit",
-    "$none=[Security.AccessControl.InheritanceFlags]::None",
-    "$prop=[Security.AccessControl.PropagationFlags]::None",
-    "function Set-Private([string]$path,[bool]$directory){",
-    "$acl=$(if($directory){[Security.AccessControl.DirectorySecurity]::new()}else{[Security.AccessControl.FileSecurity]::new()})",
-    "$acl.SetOwner($current)",
-    "$acl.SetAccessRuleProtection($true,$false)",
-    "$flags=$(if($directory){$inherit}else{$none})",
-    "$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($current,$full,$flags,$prop,$allow))",
-    "$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system,$full,$flags,$prop,$allow))",
-    "Set-Acl -LiteralPath $path -AclObject $acl",
-    "}",
-    "Set-Private $root $true",
-    "Get-ChildItem -LiteralPath $root -Recurse -Force | Sort-Object { $_.FullName.Length } | ForEach-Object { Set-Private $_.FullName $_.PSIsContainer }",
+    "Import-Module -Name $env:DEVPILOT_TEST_HARNESS -Force",
+    "$root=Resolve-AgentTrustedRoot -Path $env:DEVPILOT_TEST_TARGET -Kind durable-state -RepositoryRoot $env:DEVPILOT_TEST_REPO -Create",
+    "Get-ChildItem -LiteralPath $env:DEVPILOT_TEST_SOURCE -Force | Copy-Item -Destination $root -Recurse -Force",
   ].join(";");
   await execFileAsync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], {
-    env: { ...process.env, DEVPILOT_TEST_PRIVATE_ROOT: root },
+    env: {
+      ...process.env,
+      DEVPILOT_TEST_HARNESS: harness,
+      DEVPILOT_TEST_SOURCE: source,
+      DEVPILOT_TEST_TARGET: target,
+      DEVPILOT_TEST_REPO: repositoryRoot,
+    },
     timeout: 30_000,
     maxBuffer: 64 * 1_024,
     windowsHide: true,
@@ -675,8 +666,15 @@ test("Windows default key verification loads valid feeds and quarantines invalid
     const repoRoot = resolve(process.cwd(), "..", "..");
     const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as JsonRecord;
     asObject(config.roots).toolkit = repoRoot;
+    const trustedDelivery = join(fixture.root, "trusted-delivery");
+    const trustedManual = join(fixture.root, "trusted-manual");
+    await copyIntoWindowsTrustedRoot(fixture.deliveryRoot, trustedDelivery, repoRoot);
+    await copyIntoWindowsTrustedRoot(fixture.manualRoot, trustedManual, repoRoot);
+    asObject(config.roots).delivery = trustedDelivery;
+    asObject(config.roots).manual = trustedManual;
+    asObject(config.budgets).maxScanMilliseconds = 30_000;
     await writeJson(fixture.configPath, config);
-    await write(join(fixture.deliveryRoot, "events", "invalid-windows.json"), signedEnvelope({
+    await write(join(trustedDelivery, "events", "invalid-windows.json"), signedEnvelope({
       schemaVersion: 1,
       kind: "owner-v2-delivery-event",
       eventId: "invalid-windows",
@@ -695,8 +693,6 @@ test("Windows default key verification loads valid feeds and quarantines invalid
       providerWriteState: "none",
       diagnostic: null,
     }, randomBytes(32)));
-    await hardenWindowsPrivateTree(fixture.deliveryRoot);
-    await hardenWindowsPrivateTree(fixture.manualRoot);
     const snapshot = await new LocalReportingAdapter(fixture.configPath, {
       taskReader: async () => healthyTask,
     }).read();
