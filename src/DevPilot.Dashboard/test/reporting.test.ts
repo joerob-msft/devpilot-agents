@@ -74,6 +74,7 @@ async function hardenWindowsPrivateTree(root: string): Promise<void> {
     "$prop=[Security.AccessControl.PropagationFlags]::None",
     "function Set-Private([string]$path,[bool]$directory){",
     "$acl=$(if($directory){[Security.AccessControl.DirectorySecurity]::new()}else{[Security.AccessControl.FileSecurity]::new()})",
+    "$acl.SetOwner($current)",
     "$acl.SetAccessRuleProtection($true,$false)",
     "$flags=$(if($directory){$inherit}else{$none})",
     "$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($current,$full,$flags,$prop,$allow))",
@@ -699,8 +700,13 @@ test("Windows default key verification loads valid feeds and quarantines invalid
     const snapshot = await new LocalReportingAdapter(fixture.configPath, {
       taskReader: async () => healthyTask,
     }).read();
-    assert.equal(snapshot.deliveries.some((row) => row.mode === "automatic"), true);
-    assert.equal(snapshot.deliveries.some((row) => row.mode === "manual"), true);
+    const context = JSON.stringify({
+      diagnostics: snapshot.diagnostics,
+      quarantine: snapshot.quarantine,
+      failures: snapshot.failures,
+    });
+    assert.equal(snapshot.deliveries.some((row) => row.mode === "automatic"), true, context);
+    assert.equal(snapshot.deliveries.some((row) => row.mode === "manual"), true, context);
     assert.ok(snapshot.quarantine.some((row) => row.file.endsWith("invalid-windows.json") &&
       /signature verification failed/.test(row.reason)));
     assert.equal(snapshot.diagnostics.some((message) => /permissions are not restrictive/.test(message)), false);
