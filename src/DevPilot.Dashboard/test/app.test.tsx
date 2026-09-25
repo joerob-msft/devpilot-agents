@@ -42,10 +42,11 @@ import type {
 } from "../src/dispatch.js";
 import { BrokerRejectionError } from "../src/dispatch.js";
 import { FileDismissalStorage, type DismissalStorage } from "../src/dismissals.js";
+import { LocalReportingAdapter, type ReportingSnapshot } from "../src/reporting.js";
 
 const DOCUMENTED_COMMAND_COVERAGE = [
   "Left", "Right", "Up", "Down", "j", "k", "Enter", "Esc", "b",
-  "Tab", "Shift+Tab", "f", "Shift+f", "l", "Delete", "Shift+Delete", "x", "Shift+x", "/",
+  "Tab", "Shift+Tab", "f", "Shift+f", "l", "d", "Delete", "Shift+Delete", "x", "Shift+x", "/",
   "number then Enter", "m", "target Tab", "target Enter", "preview p", "prompt Enter",
   "Enter preview then Enter start", "Shift+Enter newline", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
   "s", "settings Tab", "settings r",
@@ -57,6 +58,16 @@ async function renderAdvanced(...args: Parameters<typeof testRender>): ReturnTyp
   setup.mockInput.pressKey("a");
   await setup.flush();
   return setup;
+}
+
+class FixtureReportingAdapter extends LocalReportingAdapter {
+  constructor(private readonly snapshot: ReportingSnapshot) {
+    super(join(tmpdir(), "fixture-reporting.json"));
+  }
+
+  override async read(): Promise<ReportingSnapshot> {
+    return this.snapshot;
+  }
 }
 
 function createFixture(prUrl = "https://github.com/joerob-msft/devpilot-agents/pull/94"): {
@@ -482,11 +493,135 @@ test("help legend spells out Live only, persistent dismissal, and preserved logs
 test("documented command coverage matrix enumerates every dashboard command", () => {
   assert.deepEqual(DOCUMENTED_COMMAND_COVERAGE, [
     "Left", "Right", "Up", "Down", "j", "k", "Enter", "Esc", "b",
-    "Tab", "Shift+Tab", "f", "Shift+f", "l", "Delete", "Shift+Delete", "x", "Shift+x", "/",
+    "Tab", "Shift+Tab", "f", "Shift+f", "l", "d", "Delete", "Shift+Delete", "x", "Shift+x", "/",
     "number then Enter", "m", "target Tab", "target Enter", "preview p", "prompt Enter",
     "Enter preview then Enter start", "Shift+Enter newline", "c", "i", "e", "w", "o", "Ctrl+P", "?", "q",
     "s", "settings Tab", "settings r",
   ]);
+});
+
+test("verified local reporting renders inside the existing dashboard and opens only validated links", async (context) => {
+  const fixture = createFixture();
+  const opened: string[] = [];
+  const reporting = new FixtureReportingAdapter({
+    generatedAtUtc: "2026-09-24T20:30:00.000Z",
+    dataTimestampUtc: "2026-09-24T20:01:00.000Z",
+    overall: {
+      status: "healthy",
+      lastSuccessfulRunUtc: "2026-09-24T20:00:00.000Z",
+      lastSuccessfulRunAgeMinutes: 30,
+      nextRunUtc: "2026-09-24T21:00:00.000Z",
+      providerWrites: 1,
+      modelWrites: 0,
+      reason: "Verified local state is healthy.",
+    },
+    task: {
+      available: true,
+      enabled: true,
+      state: "Ready",
+      lastRunUtc: "2026-09-24T20:00:00.000Z",
+      nextRunUtc: "2026-09-24T21:00:00.000Z",
+      lastResult: 0,
+      diagnostic: "",
+    },
+    toolkit: {
+      expectedHead: "a".repeat(40),
+      expectedTree: "b".repeat(40),
+      actualHead: "a".repeat(40),
+      actualTree: "b".repeat(40),
+      matches: true,
+      automaticEnabled: true,
+      policyId: "owner-production",
+      maxCreatesPerRun: 5,
+      maxCreatesPerPullRequest: 25,
+      diagnostic: "",
+    },
+    runs: [{
+      runId: "run-1",
+      occurredUtc: "2026-09-24T20:00:00.000Z",
+      health: "healthy",
+      durationMilliseconds: 1000,
+      attempts: 1,
+      modelCalls: 1,
+      ownerCompleted: 1,
+      ownerFailed: 0,
+      relationCompleted: 1,
+      relationFailed: 0,
+      queuePending: 0,
+      queuePosted: 1,
+      providerWrites: 1,
+      modelWrites: 0,
+      deliveryOutcome: "created",
+      diagnostic: "",
+    }],
+    findings: [],
+    deliveries: [{
+      id: "automatic:event-1",
+      mode: "automatic",
+      action: "create",
+      outcome: "created",
+      occurredUtc: "2026-09-24T20:01:00.000Z",
+      pullRequestId: 42,
+      threadId: 100,
+      commentId: 101,
+      prUrl: "https://dev.azure.com/example/Project/_git/repo/pullrequest/42?_a=files",
+      commentUrl: "https://dev.azure.com/example/Project/_git/repo/pullrequest/42?_a=files&discussionId=100&commentId=101",
+      path: "tests/WidgetTests.cs",
+      line: 12,
+      symbol: "CreatesWidget",
+      rule: "mstest-owner",
+      runId: "run-1",
+      eventId: "event-1",
+      providerWriteState: "confirmed",
+      providerWrites: 1,
+      modelWrites: 0,
+      body: "**Owner attribute missing**",
+      bodySha256: "c".repeat(64),
+      bodyStatus: "verified",
+      diagnostic: "",
+    }],
+    failures: [],
+    relations: [],
+    quarantine: [],
+    diagnostics: [],
+    truncated: false,
+  });
+  let setup: TestRendererSetup | undefined;
+  try {
+    setup = await testRender(() => <App
+      reducer={fixture.reducer}
+      tailer={fixture.tailer}
+      reporting={reporting}
+      openUrl={(url) => { opened.push(url); }}
+    />, { width: 140, height: 34, kittyKeyboard: true });
+    await setup.renderOnce();
+    setup.mockInput.pressKey("d");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /VERIFIED LOCAL OWNER REPORTING - READ ONLY/);
+    assert.match(setup.captureCharFrame(), /SERVICE HEALTHY/);
+    setup.mockInput.pressTab();
+    setup.mockInput.pressTab();
+    setup.mockInput.pressTab();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /automatic create/i);
+    setup.mockInput.pressKey("o");
+    await setup.flush();
+    assert.deepEqual(opened, [
+      "https://dev.azure.com/example/Project/_git/repo/pullrequest/42?_a=files&discussionId=100&commentId=101",
+    ]);
+    setup.mockInput.pressEscape();
+    await setup.flush();
+    assert.doesNotMatch(setup.captureCharFrame(), /VERIFIED LOCAL OWNER REPORTING - READ ONLY/);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("native FFI is not available")) {
+      context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+      return;
+    }
+    throw error;
+  } finally {
+    setup?.renderer.destroy();
+    await fixture.tailer.stop();
+  }
 });
 
 test("brand plane renders on one center column", async (context) => {

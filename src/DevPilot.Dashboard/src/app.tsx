@@ -22,6 +22,18 @@ import { PullRequestHistoryProjection, type PullRequestHistoryEntry } from "./hi
 import type { EventTailer } from "./tailer.js";
 import { manualProgress, type ManualProgress } from "./manual-progress.js";
 import { SimpleView, SimpleManualPanel, simpleInstanceRow, simpleHistoryRow, selectionWindow, automationStatusText, scanNowResultText } from "./simple-view.js";
+import type { LocalReportingAdapter, ReportingSnapshot } from "./reporting.js";
+import {
+  REPORTING_SECTIONS,
+  ReportingView,
+  filterReportingRows,
+  reportingRows as projectReportingRows,
+  type ReportingFilters,
+  type ReportingModeFilter,
+  type ReportingPostingFilter,
+  type ReportingSection,
+  type ReportingTimeRange,
+} from "./reporting-view.js";
 import {
   AUTOMATIC_FAILURE_CODES,
   BrokerRejectionError,
@@ -80,7 +92,7 @@ const COLORS = {
   ok: "#61d6a7",
 };
 
-type Overlay = "none" | "events" | "palette" | "help" | "settings";
+type Overlay = "none" | "events" | "palette" | "help" | "settings" | "reporting";
 type RoleFilter = "all" | AgentRole;
 type PaneFocus = "rail" | "detail" | "timeline" | "inspector";
 export type LaunchMode = "observe" | "preview" | "operational";
@@ -96,6 +108,7 @@ export interface AppProps {
   shutdownBroker?: () => Promise<void>;
   dismissalStorage?: DismissalStorage;
   dismissalLoadError?: string;
+  reporting?: LocalReportingAdapter | undefined;
 }
 
 export type ManualMode = "closed" | "target" | "resolving" | "prompt" | "describing" | "confirm" | "confirm-final" | "dispatching" | "active" | "cancelling" | "terminal"
@@ -892,6 +905,29 @@ export function App(props: AppProps) {
   const [historyFilter, setHistoryFilter] = createSignal("");
   const [historyInputMode, setHistoryInputMode] = createSignal<"none" | "filter" | "jump">("none");
   const [historyInput, setHistoryInput] = createSignal("");
+  const [reportingSnapshot, setReportingSnapshot] = createSignal<ReportingSnapshot | null>(null);
+  const [reportingError, setReportingError] = createSignal("");
+  const [reportingRefreshing, setReportingRefreshing] = createSignal(false);
+  const [reportingSection, setReportingSection] = createSignal<ReportingSection>("overview");
+  const [reportingSelected, setReportingSelected] = createSignal(0);
+  const [reportingFilters, setReportingFilters] = createSignal<ReportingFilters>({
+    timeRange: "7d",
+    search: "",
+    posting: "all",
+    mode: "all",
+  });
+  const [reportingSearchMode, setReportingSearchMode] = createSignal(false);
+  const [reportingSearchInput, setReportingSearchInput] = createSignal("");
+  let reportingScroll: ScrollBoxRenderable | undefined;
+  let reportingTimer: ReturnType<typeof setTimeout> | undefined;
+  let reportingDisposed = false;
+  let reportingGeneration = 0;
+  const reportingRows = createMemo(() => {
+    const snapshot = reportingSnapshot();
+    return snapshot
+      ? filterReportingRows(projectReportingRows(snapshot, reportingSection()), reportingFilters(), now())
+      : [];
+  });
   const defaultFeedback = props.launchMode === "operational"
     ? "OPERATIONAL: this launch authorizes pull-request mutations"
     : props.launchMode === "preview"
@@ -1096,6 +1132,100 @@ export function App(props: AppProps) {
     feedbackTimer = setTimeout(() => setFeedback(defaultFeedback), 2_500);
   }
 
+  function scheduleReportingRefresh(): void {
+    if (!props.reporting || reportingDisposed) return;
+    if (reportingTimer) clearTimeout(reportingTimer);
+    reportingTimer = setTimeout(() => { void refreshReporting(); },
+      props.reporting.refreshIntervalMilliseconds);
+  }
+
+  async function refreshReporting(manual = false): Promise<void> {
+    if (!props.reporting || reportingDisposed || reportingRefreshing()) return;
+    const generation = ++reportingGeneration;
+    setReportingRefreshing(true);
+    if (manual) setReportingError("");
+    try {
+      const snapshot = await props.reporting.read();
+      if (reportingDisposed || generation !== reportingGeneration) return;
+      setReportingSnapshot(snapshot);
+      setReportingError("");
+      setReportingSelected((value) => Math.max(0, Math.min(value, Math.max(0, reportingRows().length - 1))));
+      if (manual) notify("Verified local reporting state refreshed");
+    } catch (error) {
+      if (reportingDisposed || generation !== reportingGeneration) return;
+      setReportingError(error instanceof Error ? error.message : String(error));
+      if (manual) notify("Verified local reporting refresh failed");
+    } finally {
+      if (generation === reportingGeneration) {
+        setReportingRefreshing(false);
+        scheduleReportingRefresh();
+      }
+    }
+  }
+
+  function openReporting(): void {
+    if (!props.reporting) {
+      notify("Verified local reporting is not configured");
+      return;
+    }
+    setOverlay("reporting");
+    setReportingSearchMode(false);
+    setReportingSelected(0);
+    reportingScroll?.scrollTo(0);
+    if (!reportingSnapshot() && !reportingRefreshing()) void refreshReporting();
+    notify("Verified local reporting opened");
+  }
+
+  async function openReportingUrl(): Promise<void> {
+    const url = safeHttpUrl(reportingRows()[reportingSelected()]?.url ?? "");
+    if (!url) {
+      notify("Selected reporting row has no validated URL");
+      return;
+    }
+    try {
+      await (props.openUrl ?? defaultOpenUrl)(url);
+      notify("Opened validated Azure DevOps URL");
+    } catch (error) {
+      notify(`Could not open reporting URL: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  function cycleReportingSection(direction: number): void {
+    const current = REPORTING_SECTIONS.indexOf(reportingSection());
+    setReportingSection(REPORTING_SECTIONS[
+      (current + direction + REPORTING_SECTIONS.length) % REPORTING_SECTIONS.length
+    ] ?? "overview");
+    setReportingSelected(0);
+    reportingScroll?.scrollTo(0);
+  }
+
+  function cycleReportingTime(direction: number): void {
+    const ranges: ReportingTimeRange[] = ["24h", "7d", "30d", "all"];
+    setReportingFilters((filters) => ({
+      ...filters,
+      timeRange: ranges[(ranges.indexOf(filters.timeRange) + direction + ranges.length) % ranges.length] ?? "7d",
+    }));
+    setReportingSelected(0);
+  }
+
+  function cycleReportingPosting(): void {
+    const values: ReportingPostingFilter[] = ["all", "pending", "posted"];
+    setReportingFilters((filters) => ({
+      ...filters,
+      posting: values[(values.indexOf(filters.posting) + 1) % values.length] ?? "all",
+    }));
+    setReportingSelected(0);
+  }
+
+  function cycleReportingMode(): void {
+    const values: ReportingModeFilter[] = ["all", "automatic", "manual"];
+    setReportingFilters((filters) => ({
+      ...filters,
+      mode: values[(values.indexOf(filters.mode) + 1) % values.length] ?? "all",
+    }));
+    setReportingSelected(0);
+  }
+
   function stopAutomationPolling(): void {
     setAutomationHalted(true);
     automationReadGeneration++;
@@ -1189,10 +1319,17 @@ export function App(props: AppProps) {
     }
   }
 
-  onMount(() => { if (getAutomationStatus) void refreshAutomationStatus(); });
+  onMount(() => {
+    if (getAutomationStatus) void refreshAutomationStatus();
+    if (props.reporting) void refreshReporting();
+  });
   onCleanup(() => {
     automationDisposed = true;
     stopAutomationPolling();
+    reportingDisposed = true;
+    reportingGeneration++;
+    if (reportingTimer) clearTimeout(reportingTimer);
+    reportingTimer = undefined;
   });
   createEffect(() => {
     revision();
@@ -2659,6 +2796,12 @@ export function App(props: AppProps) {
       run: openManual,
     },
     {
+      label: "Open verified local reporting",
+      enabled: Boolean(props.reporting),
+      unavailable: "Verified local reporting is not configured",
+      run: openReporting,
+    },
+    {
       label: view() === "live" ? "Show Current session (including stale)" : "Show Live only",
       enabled: true,
       unavailable: "",
@@ -2680,6 +2823,7 @@ export function App(props: AppProps) {
   ]);
   const palette = createMemo<PaletteCommand[]>(() => uiMode() === "advanced" ? advancedPalette() : [
     { label: "Start Agent by PR ID", enabled: Boolean(props.broker), unavailable: "Observe-only: trusted manual broker is unavailable", run: openManual },
+    { label: "Open verified local reporting", enabled: Boolean(props.reporting), unavailable: "Verified local reporting is not configured", run: openReporting },
     { label: view() === "history" ? "Show Live" : "Show History", enabled: true, unavailable: "", run: toggleSimpleHistory },
     { label: simpleDetail() ? "Back to list" : "Open selected details", enabled: Boolean(simpleDetail() || simpleRows().length),
       unavailable: "No item is available", run: () => simpleDetail() ? setSimpleDetail(null) : openSimpleDetail() },
@@ -2876,6 +3020,68 @@ export function App(props: AppProps) {
       } else if (scrollAmount(key.name)) helpScroll?.scrollBy({ x: 0, y: scrollAmount(key.name) });
       return;
     }
+    if (overlay() === "reporting") {
+      if (reportingSearchMode()) {
+        if (key.name === "escape") {
+          setReportingSearchMode(false);
+          setReportingSearchInput("");
+          notify("Reporting search cancelled");
+        } else if (key.ctrl && key.name === "u") {
+          setReportingSearchInput("");
+        } else if (key.name === "backspace") {
+          setReportingSearchInput((value) => Array.from(value).slice(0, -1).join(""));
+        } else if (key.name === "return") {
+          setReportingFilters((filters) => ({ ...filters, search: reportingSearchInput() }));
+          setReportingSearchMode(false);
+          setReportingSelected(0);
+          reportingScroll?.scrollTo(0);
+          notify("Reporting search applied");
+        } else {
+          const printable = printableKeySequence(key);
+          if (printable !== null) {
+            setReportingSearchInput((value) => `${value}${printable}`.slice(0, 160));
+          }
+        }
+        return;
+      }
+      if (key.name === "escape" || key.name === "d") {
+        setOverlay("none");
+        notify("Verified local reporting closed");
+      } else if (key.name === "tab") {
+        cycleReportingSection(key.shift ? -1 : 1);
+      } else if (key.name === "left") {
+        cycleReportingTime(-1);
+      } else if (key.name === "right") {
+        cycleReportingTime(1);
+      } else if (key.name === "p") {
+        cycleReportingPosting();
+      } else if (key.name === "t") {
+        cycleReportingMode();
+      } else if (key.name === "/") {
+        setReportingSearchInput(reportingFilters().search);
+        setReportingSearchMode(true);
+        notify("Enter reporting search; tokens: pr:, capability:, health:, outcome:");
+      } else if (key.name === "r") {
+        void refreshReporting(true);
+      } else if (key.name === "o") {
+        void openReportingUrl();
+      } else if (key.name === "up" || key.name === "k") {
+        const count = reportingRows().length;
+        if (count) {
+          setReportingSelected((value) => (value + count - 1) % count);
+          reportingScroll?.scrollTo(0);
+        }
+      } else if (key.name === "down" || key.name === "j") {
+        const count = reportingRows().length;
+        if (count) {
+          setReportingSelected((value) => (value + 1) % count);
+          reportingScroll?.scrollTo(0);
+        }
+      } else if (scrollAmount(key.name)) {
+        reportingScroll?.scrollBy({ x: 0, y: scrollAmount(key.name) });
+      }
+      return;
+    }
     if (overlay() === "settings") {
       const editing = narrowingMode();
       if (editing === "browsing") {
@@ -2990,7 +3196,8 @@ export function App(props: AppProps) {
     }
     if (key.name === "a") { toggleUiMode(); return; }
     if (uiMode() === "simple") {
-      if (key.name === "m") openManual();
+      if (key.name === "d") openReporting();
+      else if (key.name === "m") openManual();
       else if (key.name === "h") toggleSimpleHistory();
       else if (key.name === "?") setOverlay("help");
       else if (key.name === "escape") setSimpleDetail(null);
@@ -3041,6 +3248,8 @@ export function App(props: AppProps) {
         setFocus(opening ? "inspector" : "detail");
         notify(opening ? "Inspector opened and focused" : "Inspector closed");
       }
+    } else if (key.name === "d") {
+      openReporting();
     } else if (key.name === "e") {
       setOverlay("events");
       notify("Raw events overlay opened");
@@ -3140,7 +3349,9 @@ export function App(props: AppProps) {
         ? "Up/Down select | Enter run | Esc close" : "Up/Down/PgUp/PgDn scroll | Esc close" };
       return {
         summary: simpleDetail() ? "Esc Back | Up/Down/PgUp/PgDn scroll" : simpleRows().length ? "Enter Details" : "",
-        hint: `m Start agent | ${scanVisible() ? "r Scan now | " : ""}h ${view() === "history" ? "Live" : "History"} | a Advanced | q Quit`,
+        hint: props.reporting
+          ? `m Start | d Report | ${scanVisible() ? "r Scan | " : ""}h ${view() === "history" ? "Live" : "History"} | a Advanced | q Quit`
+          : `m Start agent | ${scanVisible() ? "r Scan now | " : ""}h ${view() === "history" ? "Live" : "History"} | a Advanced | q Quit`,
       };
     }
     const scanHint = (hint: string): string => scanMainVisible()
@@ -3167,9 +3378,15 @@ export function App(props: AppProps) {
     const summary = dimensions().width < 80
       ? `${viewLabel(view())} ${instances().length} | L ${live} H ${history} S ${stale}`
       : `${viewLabel(view())} ${instances().length} | Live ${live} History ${history} Stale ${stale}`;
-    if (dimensions().width >= 120) return { summary, hint: scanHint("m Start Agent by PR ID | l Live/Current | Del dismiss | f view | Ctrl+P | ? | q") };
-    if (dimensions().width >= 80) return { summary: `${viewLabel(view())} ${instances().length}`, hint: scanHint("m Start Agent by PR ID | l Live/Current | Del dismiss | f | ? | q") };
-    return { summary: `${viewLabel(view())} ${instances().length}`, hint: scanHint("m Start Agent by PR ID | l Live | Del | Enter | q") };
+    if (dimensions().width >= 120) return { summary, hint: scanHint(props.reporting
+      ? "m Start | d Reporting | l Live/Current | Del dismiss | f view | Ctrl+P | ? | q"
+      : "m Start Agent by PR ID | l Live/Current | Del dismiss | f view | Ctrl+P | ? | q") };
+    if (dimensions().width >= 80) return { summary: `${viewLabel(view())} ${instances().length}`, hint: scanHint(props.reporting
+      ? "m Start | d Report | l Live/Current | Del | f | ? | q"
+      : "m Start Agent by PR ID | l Live/Current | Del dismiss | f | ? | q") };
+    return { summary: `${viewLabel(view())} ${instances().length}`, hint: scanHint(props.reporting
+      ? "m Start | d Report | l Live | Del | q"
+      : "m Start Agent by PR ID | l Live | Del | Enter | q") };
   });
   const headerContext = createMemo(() => {
     if (dimensions().width >= 120) {
@@ -3359,6 +3576,7 @@ export function App(props: AppProps) {
             <>
               <text flexShrink={0} wrapMode="word" fg={COLORS.text}>m Start agent: enter PR ID, Enter loads preview, Enter starts.</text>
               <text flexShrink={0} wrapMode="word" fg={COLORS.text}>h History / Live</text>
+              <text flexShrink={0} wrapMode="word" fg={COLORS.text}>d Verified local reporting (read-only, when configured)</text>
               <text flexShrink={0} wrapMode="word" fg={COLORS.text}>Up/Down select; Enter details; Esc back. PageUp/PageDown scroll.</text>
               <text flexShrink={0} wrapMode="word" fg={COLORS.text}>p Optional instructions in preview; c cancels a running manual agent.</text>
               <text flexShrink={0} wrapMode="word" fg={COLORS.text}>a Advanced (from the main view); a returns to Simple.</text>
@@ -3379,6 +3597,7 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.text}>x / Shift+x        Hide selected / restore hidden PR history rows</text>
           <text height={1} fg={COLORS.text}>i                  Open/close inspector</text>
           <text height={1} fg={COLORS.text}>e                  Raw events; Up/Down scroll; Left/Right filter</text>
+          <text height={1} fg={COLORS.text}>d                  Verified local reporting; Tab sections; r refresh; / search</text>
           <text height={1} fg={COLORS.text}>w                  Next attention item</text>
           <text height={1} fg={COLORS.text}>o                  Open validated http/https PR URL</text>
           <text height={1} fg={COLORS.text}>Ctrl+P             Context command palette</text>
@@ -3400,6 +3619,29 @@ export function App(props: AppProps) {
           <text height={1} fg={COLORS.warning}>{HELP_LEGEND[2]}</text>
           </Show>
           </scrollbox>
+        </OverlayPanel>
+      </Show>
+      <Show when={overlay() === "reporting"}>
+        <OverlayPanel title="VERIFIED LOCAL OWNER REPORTING - READ ONLY" width={142} height={32} bounded>
+          <Show when={reportingSearchMode()}>
+            <text flexShrink={0} fg={COLORS.warning}>
+              Search: {reportingSearchInput() || "(blank)"} | Enter apply | Ctrl+U clear | Esc cancel
+            </text>
+          </Show>
+          <ReportingView
+            snapshot={reportingSnapshot()}
+            error={reportingError()}
+            refreshing={reportingRefreshing()}
+            section={reportingSection()}
+            filters={reportingFilters()}
+            rows={reportingRows()}
+            selected={reportingSelected()}
+            colors={COLORS}
+            scrollRef={(value) => { reportingScroll = value; }}
+          />
+          <text flexShrink={0} fg={COLORS.muted}>
+            Tab section | Left/Right time | p pending/posted | t auto/manual | / search (pr:, capability:, health:, outcome:) | r refresh | o open link | Esc close
+          </text>
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "settings"}>

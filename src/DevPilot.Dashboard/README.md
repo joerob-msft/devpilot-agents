@@ -10,6 +10,13 @@ review-handler instances and, only under a trusted launcher, manually
 starting either agent by PR ID through the restricted broker contract,
 without requiring retained history.
 
+The same application can also show verified local Owner/relation service
+health, runs, findings, deliveries, failures, and read-only relation findings.
+Pass `-ReportingConfigPath`, then press `d`. This reporting plane has no
+provider writes, approvals, task mutations, listener, credential handling, or
+telemetry upload. See
+[`docs/owner-reporting-dashboard.md`](../../docs/owner-reporting-dashboard.md).
+
 Every launch starts in **Simple**. At 100 columns and wider, a clearly boxed
 left sidebar lists agents, PRs, and statuses, with the selected item's latest
 activity beside it. The sidebar is bounded to 40-42 columns; it is not the
@@ -226,12 +233,15 @@ The repository launcher intentionally does not install dependencies:
 .\tools\Start-DevPilotDashboard.ps1 `
   -StateDir C:\ReviewerState,C:\HandlerState `
   -EventLogPath C:\captures\reviewer.jsonl
+.\tools\Start-DevPilotDashboard.ps1 `
+  -ReportingConfigPath C:\private\owner-v2-reporting.json
 ```
 
 For direct debugging:
 
 ```powershell
 npm start -- --launch-mode observe --state-dir C:\DevPilot\state --event-log C:\captures\events.jsonl
+npm start -- --reporting-config C:\private\owner-v2-reporting.json
 ```
 
 Each state directory is recursively scanned (to a bounded depth) for:
@@ -254,6 +264,7 @@ polled until they appear.
 | `Enter` / `Esc` | Open details / return to the list |
 | `h` | Switch Live / History |
 | `m` | Start Agent by PR ID, with the same explicit preview and start confirmations |
+| `d` | Open verified local Owner reporting, when configured |
 | `r` | Scan now: wake eligible current-launcher automatic workers, when available |
 | `a` | Switch to Advanced; from Advanced, return to Simple |
 | PageUp / PageDown, Up / Down | Scroll details, long previews, or help |

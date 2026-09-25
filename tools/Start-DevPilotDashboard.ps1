@@ -7,6 +7,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string[]]$EventLogPath = @(),
 
+    [Parameter()]
+    [string]$ReportingConfigPath,
+
     [Parameter(DontShow)]
     [string]$BrokerDescriptorPath,
 
@@ -43,8 +46,9 @@ if (-not $ValidateOnly -and ([Console]::IsInputRedirected -or [Console]::IsOutpu
     Stop-DashboardLaunch 'DevPilot Operations requires an interactive terminal; input or output is redirected.'
 }
 
-if ($StateDir.Count -eq 0 -and $EventLogPath.Count -eq 0) {
-    Stop-DashboardLaunch 'Provide at least one -StateDir or -EventLogPath.'
+if ($StateDir.Count -eq 0 -and $EventLogPath.Count -eq 0 -and
+    [string]::IsNullOrWhiteSpace($ReportingConfigPath)) {
+    Stop-DashboardLaunch 'Provide at least one -StateDir, -EventLogPath, or -ReportingConfigPath.'
 }
 
 $width = try { [Console]::WindowWidth } catch { 0 }
@@ -206,6 +210,14 @@ foreach ($path in $StateDir) {
 foreach ($path in $EventLogPath) {
     [void]$arguments.Add('--event-log')
     [void]$arguments.Add([IO.Path]::GetFullPath($path))
+}
+if ($ReportingConfigPath) {
+    $reportingConfig = [IO.Path]::GetFullPath($ReportingConfigPath)
+    if (-not (Test-Path -LiteralPath $reportingConfig -PathType Leaf)) {
+        Stop-DashboardLaunch "The reporting configuration does not exist: $reportingConfig"
+    }
+    [void]$arguments.Add('--reporting-config')
+    [void]$arguments.Add($reportingConfig)
 }
 if ($descriptor) {
     $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source

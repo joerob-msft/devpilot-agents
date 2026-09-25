@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "kind": "devpilot-owner-reporting-config",
+  "roots": {
+    "state": "C:\\private\\owner-v2-state",
+    "toolkit": "C:\\src\\devpilot-agents",
+    "config": "C:\\private",
+    "delivery": "C:\\private\\owner-v2-delivery",
+    "manual": "C:\\private\\owner-v2-approvals",
+    "runner": "C:\\private\\owner-v2-runner"
+  },
+  "files": {
+    "toolkitConfig": "C:\\private\\owner-v2-config.json",
+    "lastRun": "C:\\private\\owner-v2-runner\\last-run.json",
+    "scheduledLog": "C:\\private\\owner-v2-runner\\scheduled-runs.jsonl"
+  },
+  "expectedToolkit": {
+    "head": "0000000000000000000000000000000000000000",
+    "tree": "0000000000000000000000000000000000000000"
+  },
+  "azureDevOps": {
+    "organizationUrl": "https://dev.azure.com/example",
+    "projectId": "00000000-0000-0000-0000-000000000000",
+    "projectName": "Example Project",
+    "repositoryId": "00000000-0000-0000-0000-000000000000"
+  },
+  "scheduledTaskName": "DevPilot Owner v2",
+  "scheduledTaskPath": "\\",
+  "refreshIntervalSeconds": 30,
+  "staleAfterMinutes": 120,
+  "budgets": {
+    "maxFileBytes": 1048576,
+    "maxFiles": 2000,
+    "maxHistory": 500,
+    "maxScanMilliseconds": 5000
+  }
+}
