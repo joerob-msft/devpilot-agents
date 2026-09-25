@@ -206,6 +206,23 @@ One-shot failed/incomplete capture exits 2, not success. Private per-capture
 `collector.stderr.log` receipts retain operator diagnostics; they never enter
 model inputs, event messages, or public reports.
 
+The per-page outer collector limit is **660 seconds**, allowing the consumer's
+600-second transport deadline plus 60 seconds for teardown. This is separate
+from `evaluation.deadlineSeconds`, which only limits each model assessment.
+The old 300-second outer limit could kill a healthy multi-PR collection before
+its own deadline. Increasing the model deadline cannot fix that failure.
+
+If collection exceeds the outer limit, the owner still exits for descendant
+containment cleanup; it must not silently retry with surviving MCP processes.
+`COLLECTOR_TIMEOUT_REQUIRES_CONTAINMENT_CLEANUP` distinguishes timeout from
+`COLLECTOR_CANCELLED_REQUIRES_CONTAINMENT_CLEANUP`. A private
+`collector.interruption.json` records the reason, elapsed time and bound, and
+the report retains the safe interruption code. Missing pages are not successes.
+Restarting unchanged code/config keeps the seven-day deadline and reservations.
+Applying this fix to an already-started study changes its pipeline fingerprint:
+preserve that study and initialize a **new** study ID/root with the fixed code.
+Do not edit the old ledger or bypass its fingerprint check.
+
 Snapshot evidence is bound to source **and** target commit and iteration.
 Capture time, evidence cutoff, and human event time are distinct. Current
 observations remain `CURRENT_SNAPSHOT`; they are not relabeled historical

@@ -18,6 +18,9 @@ from observer_contracts import file_hash, validate, validate_config, validate_pa
 from replay import (CapabilityError, Cancelled, FixtureProvider, assert_output_root, atomic_write,
                     evaluate, exclusive_output, is_cancelled, pipeline_fingerprint, prechecks)
 
+# The consumer allows 600 seconds of collection; leave time for transport teardown.
+COLLECTOR_TIMEOUT_SECONDS = 660
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -431,6 +434,7 @@ async def collect_page(config: dict[str, Any], request: dict[str, Any], folder: 
     validate(request, "observation-request")
     request_path, output_path = folder / "request.json", folder / "response.json"
     atomic_write(request_path, canonical(request) + "\n")
+    started = asyncio.get_running_loop().time()
     # Private receipt for operator diagnosis; never ingested into model input or public events.
     with (folder / "collector.stderr.log").open("wb") as diagnostics:
         process = await asyncio.create_subprocess_exec(pwsh, "-NoProfile", "-NonInteractive", "-File",
@@ -438,7 +442,7 @@ async def collect_page(config: dict[str, Any], request: dict[str, Any], folder: 
             "-RequestPath", str(request_path), "-OutputPath", str(output_path), "-LocalToolkitRoot", str(toolkit),
             stdout=asyncio.subprocess.DEVNULL, stderr=diagnostics, cwd=folder)
     try:
-        async with asyncio.timeout(300):
+        async with asyncio.timeout(COLLECTOR_TIMEOUT_SECONDS):
             while process.returncode is None:
                 is_cancelled(cancel_file)
                 try:
@@ -450,11 +454,24 @@ async def collect_page(config: dict[str, Any], request: dict[str, Any], folder: 
         page = load_json(output_path)
         validate_page(page, request)
         return page
-    except (TimeoutError, Cancelled, asyncio.CancelledError):
-        process.kill()
-        await process.wait()
+    except (TimeoutError, Cancelled, asyncio.CancelledError) as error:
+        code = "COLLECTOR_TIMEOUT" if isinstance(error, TimeoutError) else "COLLECTOR_CANCELLED"
+        try:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+        except OSError:
+            raise CapabilityError(code + "_CLEANUP_FAILED_REQUIRES_CONTAINMENT_CLEANUP") from None
+        try:
+            atomic_write(folder / "collector.interruption.json", canonical({
+                "code": code, "timeoutSeconds": COLLECTOR_TIMEOUT_SECONDS,
+                "elapsedSeconds": asyncio.get_running_loop().time() - started,
+                "authorization": "NONE",
+            }) + "\n")
+        except OSError:
+            raise CapabilityError(code + "_DIAGNOSTIC_WRITE_FAILED_REQUIRES_CONTAINMENT_CLEANUP") from None
         # Outer Job Object contains MCP grandchildren; stop rather than launch another collector.
-        raise CapabilityError("COLLECTOR_INTERRUPTED_REQUIRES_CONTAINMENT_CLEANUP")
+        raise CapabilityError(code + "_REQUIRES_CONTAINMENT_CLEANUP") from None
 
 
 async def worker(args) -> int:
@@ -573,9 +590,12 @@ async def worker(args) -> int:
                     await asyncio.sleep(min(5, max(0, stop - asyncio.get_running_loop().time())))
             persist_report(ledger, utc_now())
             return 0
-        except (CapabilityError, Cancelled, asyncio.CancelledError):
+        except (CapabilityError, Cancelled, asyncio.CancelledError) as error:
             with ledger.db:
-                ledger.gap("WORKER_INTERRUPTED", None, "Owner exits for containment cleanup; restart preserves admission and deadline.", utc_now())
+                code = str(error) if isinstance(error, CapabilityError) else "CANCELLED"
+                ledger.gap("WORKER_INTERRUPTED", None,
+                           code + ": owner exits for containment cleanup; unchanged-pipeline restart preserves admission and deadline.",
+                           utc_now())
             persist_report(ledger, utc_now())
             raise
         finally:

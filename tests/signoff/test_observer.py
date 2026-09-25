@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, Mock, patch
 
 from test_replay import FakeProvider, answer, bundle
 from contracts import ContractError, canonical, digest, make_prompt
-from observer import (Ledger, assess_pending, import_adjudication, persist_report, report, snapshot_key)
+from observer import (COLLECTOR_TIMEOUT_SECONDS, Ledger, assess_pending, collect_page,
+                      import_adjudication, persist_report, report, snapshot_key)
 from observer_contracts import file_hash, validate_config, validate_page
 from replay import Cancelled, CapabilityError, exclusive_output
 from report_delivery import prepare
@@ -115,6 +119,81 @@ class ObserverTests(unittest.IsolatedAsyncioTestCase):
             mutate(changed)
             with self.subTest(mutate=mutate), self.assertRaises(ContractError):
                 validate_page(changed, request)
+
+    async def test_collector_can_finish_after_old_300_second_limit(self):
+        request, page = capture()
+        folder = self.root / "slow-collector"
+        folder.mkdir()
+        (folder / "response.json").write_text(canonical(page), encoding="utf-8")
+        clock = {"elapsed": 0}
+        process = Mock(returncode=None)
+
+        async def wait():
+            clock["elapsed"] = 400
+            process.returncode = 0
+            return 0
+
+        @asynccontextmanager
+        async def deadline(seconds):
+            yield
+            if clock["elapsed"] > seconds:
+                raise TimeoutError()
+
+        process.wait = AsyncMock(side_effect=wait)
+        with patch("observer.asyncio.create_subprocess_exec", AsyncMock(return_value=process)), \
+                patch("observer.asyncio.timeout", side_effect=deadline):
+            result = await collect_page(self.config, request, folder, self.root, "unused-pwsh", None)
+        self.assertEqual(result, page)
+        self.assertEqual(COLLECTOR_TIMEOUT_SECONDS, 600 + 60)
+        process.kill.assert_not_called()
+        self.assertFalse((folder / "collector.interruption.json").exists())
+
+    async def test_collector_timeout_and_cancellation_keep_containment_fail_closed(self):
+        for cause, code in ((TimeoutError(), "COLLECTOR_TIMEOUT"),
+                            (Cancelled(), "COLLECTOR_CANCELLED"),
+                            (asyncio.CancelledError(), "COLLECTOR_CANCELLED")):
+            with self.subTest(cause=type(cause).__name__):
+                request, _ = capture()
+                folder = self.root / type(cause).__name__
+                folder.mkdir()
+                process = Mock(returncode=None, wait=AsyncMock(return_value=-1))
+
+                @asynccontextmanager
+                async def interrupted(seconds):
+                    raise cause
+                    yield
+
+                with patch("observer.asyncio.create_subprocess_exec", AsyncMock(return_value=process)), \
+                        patch("observer.asyncio.timeout", side_effect=interrupted), \
+                        self.assertRaisesRegex(CapabilityError, code + "_REQUIRES_CONTAINMENT_CLEANUP"):
+                    await collect_page(self.config, request, folder, self.root, "unused-pwsh", None)
+                process.kill.assert_called_once()
+                process.wait.assert_awaited_once()
+                receipt = json.loads((folder / "collector.interruption.json").read_text())
+                self.assertEqual(receipt["code"], code)
+                self.assertEqual(receipt["timeoutSeconds"], COLLECTOR_TIMEOUT_SECONDS)
+                self.assertGreaterEqual(receipt["elapsedSeconds"], 0)
+                self.assertEqual(receipt["authorization"], "NONE")
+                self.assertFalse((folder / "response.json").exists())
+
+    async def test_interruption_diagnostic_failure_cannot_resume_with_live_collector(self):
+        request, _ = capture()
+        folder = self.root / "diagnostic-write-failed"
+        folder.mkdir()
+        process = Mock(returncode=None, wait=AsyncMock(return_value=-1))
+
+        @asynccontextmanager
+        async def interrupted(seconds):
+            raise TimeoutError()
+            yield
+
+        with patch("observer.asyncio.create_subprocess_exec", AsyncMock(return_value=process)), \
+                patch("observer.asyncio.timeout", side_effect=interrupted), \
+                patch("observer.atomic_write", side_effect=[None, OSError("synthetic disk failure")]), \
+                self.assertRaisesRegex(CapabilityError, "DIAGNOSTIC_WRITE_FAILED_REQUIRES_CONTAINMENT_CLEANUP"):
+            await collect_page(self.config, request, folder, self.root, "unused-pwsh", None)
+        process.kill.assert_called_once()
+        process.wait.assert_awaited_once()
 
     async def test_two_assessments_prospective_not_historical(self):
         self.ingest()
