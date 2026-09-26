@@ -25,8 +25,8 @@ active PR iteration, file and source line with read-only Azure DevOps GETs
 using an existing `az` sign-in; failures do not open a generic link. This
 navigation remains read-only and not writer eligible.
 Pass `-ReportingConfigPath`, then press `d`. This reporting plane has no
-provider writes, approvals, task mutations, listener, credential handling, or
-telemetry upload. See
+provider writes, approvals, task mutations, listener, credential prompt,
+persistent credential storage, or telemetry upload. See
 [`docs/owner-reporting-dashboard.md`](../../docs/owner-reporting-dashboard.md).
 Press `o` on a reporting delivery to open its validated Azure DevOps URL. On
 Windows this uses the current user's HTTP/HTTPS shell association through a
