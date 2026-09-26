@@ -13,6 +13,7 @@ export interface RuleEvidence {
   evaluatedUtc: string;
   findingIds: string[];
   findings: number;
+  affectedMethodAttributes?: number;
   noOp: number;
   wouldCreate: number;
   unknown: number;
@@ -48,6 +49,7 @@ export interface RuleSummary {
   lastGeneration: string | null;
   lastEvaluatedUtc: string | null;
   counts: RuleOutcomeCounts;
+  affectedMethodAttributes: number | null;
   findingIds: string[];
   deliveryIds: string[];
   url: string | null;
@@ -60,7 +62,7 @@ interface RuleDefinition {
   provenance: string;
   implementationVersion: string;
   capabilityId: string;
-  runChannel: "owner" | "relation" | "coverage";
+  runChannel: "owner" | "relation" | "coverage" | "redundant";
 }
 
 // Source inventory is not an installation or deployment manifest.
@@ -89,22 +91,39 @@ export const IMPLEMENTED_RULES: readonly RuleDefinition[] = [
     capabilityId: "bpm-test-class-coverage@1",
     runChannel: "coverage",
   },
+  {
+    id: "bpm-redundant-method-coverage@1",
+    description: "Changed MSTest method-level [ExcludeFromCodeCoverage] is redundant when its changed-head MSTest class is excluded.",
+    provenance: "Independent deterministic convention; source implemented, not deployed or authorized in the pinned service",
+    implementationVersion: "bpm-redundant-method-coverage@1",
+    capabilityId: "bpm-redundant-method-coverage@1",
+    runChannel: "redundant",
+  },
 ];
 
 function runIdentities(run: RunSummary, channel: RuleDefinition["runChannel"]): string[] {
   if (channel === "relation") return run.relationStateIdentities ?? [];
   if (channel === "coverage" && run.deliveryCapabilityId !== "bpm-test-class-coverage@1") return [];
-  if (channel === "owner" && run.deliveryCapabilityId === "bpm-test-class-coverage@1") return [];
+  if (channel === "redundant" && run.deliveryCapabilityId !== "bpm-redundant-method-coverage@1") return [];
+  if (channel === "owner" && run.deliveryCapabilityId) return [];
   return run.ownerStateIdentities ?? [];
 }
 
 function matchingDelivery(
-  delivery: DeliverySummary, definition: RuleDefinition, evidence: RuleEvidence[],
+  delivery: DeliverySummary, definition: RuleDefinition,
+  bound: { state: RuleEvidence; run: RunSummary }[],
 ): boolean {
   return delivery.capabilityId === definition.capabilityId &&
-    evidence.some((state) => state.pullRequestId === delivery.pullRequestId &&
+    (definition.runChannel !== "redundant" ||
+      (["create", "none"].includes(delivery.action) && !/update/i.test(delivery.outcome))) &&
+    bound.some(({ state, run }) => state.pullRequestId === delivery.pullRequestId &&
       state.findingIds.includes(delivery.findingId ?? "") &&
-      (definition.runChannel !== "coverage" || delivery.rule === definition.id));
+      (definition.runChannel !== "redundant" ||
+        (delivery.stateIdentity === state.identity &&
+          delivery.runId === run.runId &&
+          Date.parse(delivery.occurredUtc) <= Date.parse(run.occurredUtc) &&
+          Date.parse(delivery.occurredUtc) >= Date.parse(state.evaluatedUtc))) &&
+      (!["coverage", "redundant"].includes(definition.runChannel) || delivery.rule === definition.id));
 }
 
 export function projectRuleRegistry(
@@ -177,13 +196,15 @@ export function projectRuleRegistry(
     const linkedFindings = snapshot.findings.filter((finding: FindingSummary) =>
       finding.capability === definition.capabilityId &&
       scoped.some((state) => state.pullRequestId === finding.pullRequestId &&
-        state.findingIds.includes(finding.id)));
+        state.findingIds.includes(finding.id) &&
+        (definition.runChannel !== "redundant" ||
+          (finding.stateIdentity === state.identity && finding.rule === definition.id))));
     const linkedRelations = snapshot.relations.filter((finding) =>
       finding.capability === definition.capabilityId &&
       scoped.some((state) => state.pullRequestId === finding.pullRequestId &&
         state.findingIds.includes(finding.id)));
     const linkedDeliveries = snapshot.deliveries.filter((delivery) =>
-      matchingDelivery(delivery, definition, scoped));
+      matchingDelivery(delivery, definition, bound));
     const deliveryEvidenceComplete = complete && (feeds.automatic || feeds.manual);
     if (!deliveryEvidenceComplete) gaps.push("Verified delivery feed unavailable; posting and refusal counts are unknown.");
     gaps.push("Skipped/PR-intake denominator is not emitted per rule; skipped count and total coverage are unknown.");
@@ -200,18 +221,22 @@ export function projectRuleRegistry(
       posted: latest && deliveryEvidenceComplete
         ? linkedDeliveries.filter((item) => item.providerWrites > 0 &&
           item.providerWriteState === "confirmed" &&
-          /^(created|updated|created-confirmed-after-error|recovered-confirmed)$/.test(item.outcome)).length : null,
+          (definition.runChannel === "redundant"
+            ? item.action === "create" &&
+              /^(created|created-confirmed-after-error|recovered-confirmed)$/.test(item.outcome)
+            : /^(created|updated|created-confirmed-after-error|recovered-confirmed)$/.test(item.outcome))
+        ).length : null,
     };
-    const classRule = definition.runChannel === "coverage";
-    const classPinnedOut = classRule && !latest && toolkitVerified && complete;
-    const deployment: RuleStatus = classPinnedOut ? "not-deployed" :
+    const separateRule = definition.runChannel === "coverage" || definition.runChannel === "redundant";
+    const pinnedOut = separateRule && !latest && toolkitVerified && complete;
+    const deployment: RuleStatus = pinnedOut ? "not-deployed" :
       latest && toolkitVerified ? "verified" : "unknown";
-    const enablement: RuleStatus = classPinnedOut ? "disabled" :
+    const enablement: RuleStatus = pinnedOut ? "disabled" :
       !snapshot.task.available ? "unknown" :
         snapshot.task.enabled === false ? "disabled" :
           snapshot.task.enabled === true && deployment === "verified" ? "verified" : "unknown";
     const authorization: PublishingStatus = definition.runChannel === "relation" ? "not-eligible" :
-      classPinnedOut ? "disabled" :
+      pinnedOut ? "disabled" :
         !toolkitVerified || !feeds.automatic ? "unknown" :
           definition.runChannel === "owner" && snapshot.toolkit.automaticEnabled === true &&
             snapshot.toolkit.policyId && snapshot.toolkit.maxCreatesPerRun !== null &&
@@ -223,9 +248,11 @@ export function projectRuleRegistry(
     const publishing: PublishingStatus = authorization === "not-eligible" ? "not-eligible" :
       authorization === "disabled" || enablement === "disabled" ? "disabled" :
         authorization === "enabled" && enablement === "verified" ? "enabled" : "unknown";
-    if (classPinnedOut) gaps.push("Operator reports class coverage not deployed; local data has no bound class run. Do not infer deployment from PR 174 code.");
-    if (definition.runChannel === "coverage" && !classPinnedOut && publishing === "unknown") {
-      gaps.push("No verified class-specific automatic authorization; code or Owner policy is not enablement.");
+    if (pinnedOut) gaps.push(definition.runChannel === "coverage"
+      ? "Operator reports class coverage not deployed; local data has no bound class run. Do not infer deployment from PR 174 code."
+      : "Redundant method coverage is not deployed in the pinned service; no bound rule-specific run exists.");
+    if (separateRule && !pinnedOut && publishing === "unknown") {
+      gaps.push("No verified rule-specific automatic authorization; another rule's policy does not authorize this rule.");
     }
     return {
       id: definition.id,
@@ -252,6 +279,10 @@ export function projectRuleRegistry(
       lastGeneration: latest?.run.runId ?? null,
       lastEvaluatedUtc: evaluatedUtc,
       counts,
+      affectedMethodAttributes: definition.runChannel === "redundant" && latest &&
+        scoped.every((state) => Number.isSafeInteger(state.affectedMethodAttributes))
+        ? scoped.reduce((total, state) => total + state.affectedMethodAttributes!, 0)
+        : null,
       findingIds,
       deliveryIds: linkedDeliveries.map((item) => item.id),
       url: linkedDeliveries.find((item) => item.commentUrl)?.commentUrl ??

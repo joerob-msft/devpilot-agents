@@ -126,9 +126,10 @@ export function filterReportingRows(
 
 function runRow(run: RunSummary): ReportingRow {
   const coverage = run.deliveryCapabilityId === "bpm-test-class-coverage@1";
+  const redundant = run.deliveryCapabilityId === "bpm-redundant-method-coverage@1";
   const text = [
     `${run.occurredUtc || "time unavailable"} | ${run.health} | run ${run.runId}`,
-    `${coverage ? "Coverage" : "Owner"} ${run.ownerCompleted} completed / ${run.ownerFailed} failed | Relation ${run.relationCompleted} completed / ${run.relationFailed} failed`,
+    `${redundant ? "Redundant method coverage" : coverage ? "Coverage" : "Owner"} ${run.ownerCompleted} completed / ${run.ownerFailed} failed | Relation ${run.relationCompleted} completed / ${run.relationFailed} failed`,
     `Attempts ${run.attempts} | model calls ${run.modelCalls ?? "unknown"} | queue pending ${run.queuePending} / posted ${run.queuePosted}`,
     `Provider writes ${run.providerWrites} | model writes ${run.modelWrites} | delivery ${run.deliveryOutcome}`,
     ...(run.durationMilliseconds === null ? [] : [`Duration ${run.durationMilliseconds} ms`]),
@@ -145,13 +146,19 @@ function runRow(run: RunSummary): ReportingRow {
 }
 
 function findingRow(finding: FindingSummary): ReportingRow {
+  const redundant = finding.capability === "bpm-redundant-method-coverage@1";
   const needsReview = finding.state === "humanCovered" ||
-    (finding.capability === "bpm-test-class-coverage@1" &&
+    (["bpm-test-class-coverage@1", "bpm-redundant-method-coverage@1"].includes(finding.capability) &&
       finding.state === "unknown" &&
       finding.reason === "historical-human-review-needs-review");
   const text = [
     `PR #${finding.pullRequestId} | ${finding.severity} | ${needsReview ? `${finding.state} (needs-review)` : finding.state} | ${finding.capability}`,
     `${finding.path || "path unavailable"}:${finding.line || "?"} | ${finding.symbol || "symbol unavailable"}`,
+    ...(redundant ? [
+      `One class finding (at most one comment; first changed attribute anchor) | ${finding.affectedMethodCount ?? "unknown"} affected method attribute(s)`,
+      `Affected methods (bounded sample): ${finding.affectedMethods?.length
+        ? finding.affectedMethods.join(", ") : "unknown"}${finding.methodListTruncated ? " (list truncated)" : ""}`,
+    ] : []),
     `Rule: ${finding.rule || "unavailable"} | source ${shortCommit(finding.sourceCommit)} (${finding.sourceFreshness})`,
     `Reason: ${finding.reason || "unavailable"}`,
   ];
@@ -168,7 +175,8 @@ function findingRow(finding: FindingSummary): ReportingRow {
 }
 
 function deliveryRow(delivery: DeliverySummary): ReportingRow {
-  const needsReview = delivery.capabilityId === "bpm-test-class-coverage@1" &&
+  const needsReview = ["bpm-test-class-coverage@1", "bpm-redundant-method-coverage@1"]
+    .includes(delivery.capabilityId) &&
     delivery.action === "none" && delivery.outcome === "refused" &&
     delivery.diagnosticCode === "historical-human-review-needs-review";
   const verifiedBody = delivery.bodyStatus === "verified" ? exactDisplayBody(delivery.body) : null;
@@ -236,6 +244,7 @@ function relationRow(relation: RelationSummary): ReportingRow {
 
 function ruleRow(rule: RuleSummary): ReportingRow {
   const count = (value: number | null) => value === null ? "unknown" : String(value);
+  const redundant = rule.id === "bpm-redundant-method-coverage@1";
   const text = [
     `${rule.id} | ${rule.capabilityId} | implementation ${rule.implementationVersion}`,
     `Durable source rule: ${rule.sourceRuleId ?? "unknown"}`,
@@ -245,7 +254,8 @@ function ruleRow(rule: RuleSummary): ReportingRow {
     `Deployment ${rule.deployment} | task ${rule.enablement} | evaluated ${rule.execution} | auto policy ${rule.authorization} | auto-post ${rule.publishing}`,
     ...(rule.policyCaps ? [`Owner create caps: ${rule.policyCaps.perRun}/run, ${rule.policyCaps.perPullRequest}/PR`] : []),
     `PR scope: ${rule.scope.length ? rule.scope.map((pr) => `#${pr}`).join(", ") : "unknown"} | generation ${rule.lastGeneration ?? "unknown"} | evaluated ${rule.lastEvaluatedUtc ?? "unknown"}`,
-    `Outcomes: finding ${count(rule.counts.finding)} | noOp ${count(rule.counts.noOp)} | wouldCreate ${count(rule.counts.wouldCreate)} | unknown ${count(rule.counts.unknown)} | skipped ${count(rule.counts.skipped)} | refused ${count(rule.counts.refused)} | posted ${count(rule.counts.posted)}`,
+    `${redundant ? "Class outcomes" : "Outcomes"}: finding ${count(rule.counts.finding)}${redundant ? " class(es)" : ""} | noOp ${count(rule.counts.noOp)} | wouldCreate ${count(rule.counts.wouldCreate)} | unknown ${count(rule.counts.unknown)} | skipped ${count(rule.counts.skipped)} | refused ${count(rule.counts.refused)} | posted ${count(rule.counts.posted)}${redundant ? " class comment(s)" : ""}`,
+    ...(redundant ? [`Affected method attributes across bound class findings: ${count(rule.affectedMethodAttributes)}; f: bounded method-name summary per class`] : []),
     `Bound findings ${rule.findingIds.length} / deliveries ${rule.deliveryIds.length}; f: findings, e: deliveries`,
     ...rule.gaps.map((gap) => `Coverage gap: ${gap}`),
   ];
