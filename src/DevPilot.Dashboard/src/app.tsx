@@ -1139,16 +1139,23 @@ export function App(props: AppProps) {
   }
 
   async function openReportingUrl(): Promise<void> {
-    const url = safeHttpUrl(reportingRows()[reportingSelected()]?.url ?? "");
-    if (!url) {
+    const row = reportingRows()[reportingSelected()];
+    if (!row || (!row.relation && !safeHttpUrl(row.url ?? ""))) {
       setReportingActionStatus({ message: "Selected reporting row has no validated URL", error: true });
       notify("Selected reporting row has no validated URL");
       return;
     }
     try {
+      const url = row.relation
+        ? safeHttpUrl(await props.reporting!.resolveRelationUrl(row.relation))
+        : safeHttpUrl(row.url ?? "");
+      if (!url) throw new Error("Selected reporting row has no validated URL");
       await (props.openUrl ?? defaultOpenUrl)(url);
-      setReportingActionStatus({ message: "Opened validated Azure DevOps URL", error: false });
-      notify("Opened validated Azure DevOps URL");
+      const message = row.relation
+        ? "Opened current PR iteration/file; verdict is historical and NOT WRITER ELIGIBLE"
+        : "Opened validated Azure DevOps URL";
+      setReportingActionStatus({ message, error: false });
+      notify(message);
     } catch (error) {
       const message = `Could not open reporting URL: ${error instanceof Error ? error.message : String(error)}`;
       setReportingActionStatus({ message, error: true });

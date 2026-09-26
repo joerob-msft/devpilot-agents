@@ -6,7 +6,11 @@ from verified local state. This is a read-only
 reporting plane: it adds no HTTP listener, provider write endpoint, task
 mutation, approval flow, credential prompt, telemetry upload, or deployment.
 If reporting is unavailable or malformed, the reviewer scheduler continues
-independently.
+independently. Relation navigation alone uses the existing Azure CLI sign-in
+to acquire an in-memory Azure DevOps access token on demand; the token and
+provider response are not stored or displayed. Without that sign-in or a
+valid live anchor, navigation fails visibly instead of opening a generic PR
+link.
 
 ## Configure external roots
 
@@ -143,8 +147,20 @@ The reporting overlay extends the existing OpenTUI application:
 - **Failures**: invalid signatures, ambiguous writes, refusals, drift, stale
   state, task failures, missing data, and recovery-required incidents.
 - **Relations**: relation findings in a separate view, always labeled
-  **READ ONLY / NOT WRITER ELIGIBLE**, with a validated PR link when the
-  configured project/repository identity matches.
+  **READ ONLY / NOT WRITER ELIGIBLE**. The sanitized, bounded durable
+  `data.explanation` (or bounded fallback reason) is shown as a violation
+  explanation or a non-violation assessment. The durable evaluation timestamp,
+  elapsed age, historical source/target commits, and stale-verdict warning
+  distinguish that historical judgment from the current PR head.
+  Press `o` to read the active PR and latest iteration, verify the configured
+  project/repository/PR identity and stable source/target heads, check that the
+  file belongs to the current iteration and its line exists in the current
+  source commit, then open a file/line deep link with the verified iteration,
+  target branch, and `base=0`. Any missing identity, auth, file, line or
+  concurrent head change shows an error; it never falls back to the generic
+  PR URL or claims the historical verdict applies to the new head. A Rules
+  relation row can open the same link only when it represents one unique
+  bound relation; `f` can select among multiple findings.
 - **Rules**: source inventory for the MSTest Owner rule (`mstest-owner`),
   relation evidence (`relation-contextual-review-v1`, with each bound
   relation rule's actual durable ID shown separately), and class-level

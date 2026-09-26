@@ -11,6 +11,7 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { projectRuleRegistry, type RuleEvidence, type RuleSummary } from "./rule-registry.js";
+import { resolveCurrentRelationLink, type RelationReadJson } from "./relation-link.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -145,6 +146,12 @@ export interface RelationSummary {
   line: number;
   symbol: string;
   reason: string;
+  projectId: string;
+  repositoryId: string;
+  sourceCommit: string;
+  targetCommit: string;
+  targetRef: string;
+  staleAfterMinutes: number;
   updatedUtc: string;
   writerEligible: false;
   url: string | null;
@@ -249,6 +256,7 @@ export interface ReportingAdapterOptions {
   now?: () => number;
   taskReader?: (taskName: string, taskPath?: string) => Promise<TaskHealth>;
   keyPermissionChecker?: (path: string, root: string) => Promise<boolean>;
+  relationReader?: RelationReadJson;
 }
 
 interface SignedPayload {
@@ -1361,27 +1369,25 @@ function projectState(
           (boundedText(data.capabilityId, 160) === capability &&
             boundedText(data.ruleId, 160) === ruleIdentity);
         const anchor = findingAnchor(data);
-        const links = safeLinks(
-          config,
-          ruleBound && nestedBinding ? resolvedSubject.projectId : "",
-          ruleBound && nestedBinding ? resolvedSubject.repositoryId : "",
-          pullRequestId,
-          null,
-          null,
-          anchor.path,
-          anchor.line,
-        );
+        const bound = ruleBound && nestedBinding && !resolvedSubject.diagnostic &&
+          recordState === "completed" && boundedText(lifecycle.status, 40) === "completed";
         relations.push({
           id: boundedText(finding.identity ?? finding.findingId, 160) || `relation:${state.identity}:${relations.length}`,
           capability, pullRequestId,
           rule: ruleIdentity,
-          state: ruleBound && nestedBinding
+          state: bound
             ? boundedText(data.state ?? data.disposition, 80) || "unknown" : "unknown",
           ...anchor,
-          reason: boundedText(finding.reason, 240),
+          reason: bound ? boundedText(data.explanation ?? data.reason ?? finding.reason, 320) : "",
+          projectId: bound ? resolvedSubject.projectId : "",
+          repositoryId: bound ? resolvedSubject.repositoryId : "",
+          sourceCommit: bound ? boundedText(subject.headCommit ?? subject.sourceCommit, 40) : "",
+          targetCommit: bound ? boundedText(subject.targetCommit, 40) : "",
+          targetRef: bound ? boundedText(subject.targetRef, 256) : "",
+          staleAfterMinutes: config.staleAfterMinutes,
           updatedUtc,
           writerEligible: false,
-          url: links.prUrl,
+          url: null,
         });
       }
       continue;
@@ -2076,6 +2082,18 @@ export class LocalReportingAdapter {
 
   get refreshIntervalMilliseconds(): number {
     return this.cachedRefreshIntervalMs;
+  }
+
+  async resolveRelationUrl(relation: RelationSummary): Promise<string> {
+    const configInfo = await lstat(this.configPath);
+    if (!configInfo.isFile() || configInfo.isSymbolicLink() ||
+        configInfo.size > DEFAULT_MAX_FILE_BYTES) {
+      throw new Error("Reporting config is unavailable for relation navigation");
+    }
+    const value: unknown = JSON.parse(await readFile(this.configPath, "utf8"));
+    assertJsonShape(value);
+    const config = parseReportingConfiguration(value);
+    return resolveCurrentRelationLink(relation, config, this.options.relationReader);
   }
 
   async read(): Promise<ReportingSnapshot> {

@@ -61,12 +61,22 @@ async function renderAdvanced(...args: Parameters<typeof testRender>): ReturnTyp
 }
 
 class FixtureReportingAdapter extends LocalReportingAdapter {
+  relationUrl = "";
+  relationFailure = "";
+  relationResolutions = 0;
+
   constructor(private readonly snapshot: ReportingSnapshot) {
     super(join(tmpdir(), "fixture-reporting.json"));
   }
 
   override async read(): Promise<ReportingSnapshot> {
     return this.snapshot;
+  }
+
+  override async resolveRelationUrl(): Promise<string> {
+    this.relationResolutions++;
+    if (this.relationFailure) throw new Error(this.relationFailure);
+    return this.relationUrl;
   }
 }
 
@@ -597,7 +607,17 @@ test("verified local reporting renders inside the existing dashboard and opens o
       diagnostic: "",
     }],
     failures: [],
-    relations: [],
+    relations: [{
+      id: "relation:synthetic", capability: "relation-contextual-review-v1",
+      pullRequestId: 42, rule: "synthetic-rule", state: "violation",
+      path: "src/NewWidget.cs", line: 193, symbol: "Widget",
+      reason: "Historical synthetic assessment", updatedUtc: "2026-09-24T19:00:00Z",
+      projectId: "11111111-1111-1111-1111-111111111111",
+      repositoryId: "22222222-2222-2222-2222-222222222222",
+      sourceCommit: "a".repeat(40), targetCommit: "b".repeat(40),
+      targetRef: "refs/heads/master", staleAfterMinutes: 120,
+      writerEligible: false, url: null,
+    }],
     rules: [{
       id: "mstest-owner",
       sourceRuleId: "## Claim ownership",
@@ -630,6 +650,10 @@ test("verified local reporting renders inside the existing dashboard and opens o
   });
   let setup: TestRendererSetup | undefined;
   let openFailure = false;
+  const relationUrl = "https://dev.azure.com/example/Project/_git/repo/pullrequest/42" +
+    "?path=/src/NewWidget.cs&version=GBmaster&line=193&lineEnd=194" +
+    "&lineStartColumn=1&lineEndColumn=1&type=2&lineStyle=plain&_a=files&iteration=21&base=0";
+  reporting.relationUrl = relationUrl;
   try {
     setup = await testRender(() => <App
       reducer={fixture.reducer}
@@ -668,11 +692,26 @@ test("verified local reporting renders inside the existing dashboard and opens o
     setup.mockInput.pressKey("o");
     await setup.flush();
     assert.match(setup.captureCharFrame(), /Could not open reporting URL: shell association failed/);
+    openFailure = false;
+    setup.mockInput.pressTab();
+    setup.mockInput.pressTab();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /RELATIONS/);
+    assert.match(setup.captureCharFrame(), /STALE VERDICT/);
+    assert.match(setup.captureCharFrame(), /NOT WRITER ELIGIBLE/);
+    setup.mockInput.pressKey("o");
+    await setup.flush();
+    assert.equal(reporting.relationResolutions, 1);
+    assert.equal(opened.at(-1), relationUrl);
+    reporting.relationFailure = "Azure DevOps read returned HTTP 401; no link was opened";
+    setup.mockInput.pressKey("o");
+    await setup.flush();
+    assert.equal(reporting.relationResolutions, 2);
+    assert.equal(opened.length, 3);
+    assert.match(setup.captureCharFrame(), /HTTP 401; no link was opened/);
     setup.mockInput.pressArrow("right");
     await setup.flush();
     assert.doesNotMatch(setup.captureCharFrame(), /Could not open reporting URL: shell association failed/);
-    setup.mockInput.pressTab();
-    setup.mockInput.pressTab();
     setup.mockInput.pressTab();
     await setup.flush();
     assert.match(setup.captureCharFrame(), /\[RULES\]/);

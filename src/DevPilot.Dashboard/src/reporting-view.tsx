@@ -38,6 +38,7 @@ export interface ReportingRow {
   text: string[];
   searchText: string;
   url: string | null;
+  relation?: RelationSummary;
   attention: boolean;
 }
 
@@ -225,20 +226,25 @@ function failureRow(failure: FailureSummary): ReportingRow {
 }
 
 function relationRow(relation: RelationSummary): ReportingRow {
+  const minutes = Math.max(0, Math.floor((Date.now() - Date.parse(relation.updatedUtc)) / 60_000));
+  const age = Number.isFinite(minutes) ? ageText(minutes) : "unknown";
+  const stale = !Number.isFinite(minutes) || minutes >= relation.staleAfterMinutes;
   const text = [
     `PR #${relation.pullRequestId} | ${relation.state} | ${relation.capability}`,
     `${relation.path || "path unavailable"}:${relation.line || "?"} | ${relation.symbol || "symbol unavailable"}`,
     `Rule: ${relation.rule || "unavailable"}`,
-    `Reason: ${relation.reason || "unavailable"}`,
+    `${relation.state === "violation" ? "Violation explanation" : "Assessment"}: ${relation.reason || "not recorded"}`,
+    `${stale ? "STALE VERDICT" : "HISTORICAL VERDICT"}: evaluated ${relation.updatedUtc || "unknown"} (${age} ago); current head not assessed`,
+    `Evidence source ${shortCommit(relation.sourceCommit)} / target ${shortCommit(relation.targetCommit)}; o verifies current iteration/file before navigation`,
     "READ ONLY / NOT WRITER ELIGIBLE",
   ];
   return {
     key: `relation:${relation.id}`, timestamp: relation.updatedUtc,
     pullRequestId: relation.pullRequestId, capability: relation.capability,
-    health: relation.state === "unknown" ? "degraded" : "healthy", outcome: relation.state,
+    health: relation.state === "unknown" || stale ? "degraded" : "healthy", outcome: relation.state,
     ruleId: relation.rule,
     posting: "none", mode: "none", text, searchText: clean(text.join(" ")).toLowerCase(),
-    url: relation.url, attention: relation.state === "unknown",
+    url: null, relation, attention: relation.state === "unknown" || stale,
   };
 }
 
@@ -273,7 +279,13 @@ function ruleRow(rule: RuleSummary): ReportingRow {
 }
 
 export function reportingRows(snapshot: ReportingSnapshot, section: ReportingSection): ReportingRow[] {
-  if (section === "rules") return (snapshot.rules ?? []).map(ruleRow);
+  if (section === "rules") return (snapshot.rules ?? []).map((rule) => {
+    const row = ruleRow(rule);
+    if (rule.capabilityId !== "relation-contextual-review-v1") return row;
+    const related = snapshot.relations.filter((relation) =>
+      relation.capability === rule.capabilityId && relation.rule === rule.sourceRuleId);
+    return { ...row, url: null, ...(related.length === 1 ? { relation: related[0]! } : {}) };
+  });
   if (section === "runs") return snapshot.runs.map(runRow);
   if (section === "findings") return snapshot.findings.map(findingRow);
   if (section === "deliveries") return snapshot.deliveries.map(deliveryRow);
@@ -362,8 +374,10 @@ export function ReportingView(props: {
                     : props.colors.text}>{text()}</text>}
               </Index>
             </Show>
-            <Show when={selectedRow()?.url}>
-              <text flexShrink={0} fg={props.colors.accent}>Press o to open the selected validated Azure DevOps link.</text>
+            <Show when={selectedRow()?.url || selectedRow()?.relation}>
+              <text flexShrink={0} fg={props.colors.accent}>Press o to {selectedRow()?.relation
+                ? "verify the current Azure DevOps iteration and file before opening (historical verdict)."
+                : "open the selected validated Azure DevOps link."}</text>
             </Show>
           </scrollbox>
         )}
