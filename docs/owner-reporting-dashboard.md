@@ -65,9 +65,10 @@ and scans that exceed the count or time budget.
 `owner-relation-v2-preview-scheduled-run` schema-v1 `last-run.json`. The
 adapter validates that exact kind, top-level completion/toolkit identity,
 Owner and relation record arrays, reconciliation counts, and the nested
-`owner-v2-automatic-delivery-result` or
-`coverage-v2-automatic-delivery-result`; coverage runs are labeled with the
-class-coverage capability rather than Owner. Model-call count is shown as unavailable
+`owner-v2-automatic-delivery-result`,
+`coverage-v2-automatic-delivery-result`, or
+`redundant-coverage-v2-automatic-delivery-result`; dedicated coverage runs
+are labeled with their exact capability rather than Owner. Model-call count is shown as unavailable
 because this envelope does not expose it. The explicitly typed
 `devpilot-owner-reporting-run-projection` v1 shape remains accepted for
 existing installations; arbitrary flat JSON is rejected rather than treated
@@ -147,7 +148,20 @@ The reporting overlay extends the existing OpenTUI application:
 - **Rules**: source inventory for the MSTest Owner rule (`mstest-owner`),
   relation evidence (`relation-contextual-review-v1`, with each bound
   relation rule's actual durable ID shown separately), and class-level
-  `[ExcludeFromCodeCoverage]` (`bpm-test-class-coverage@1`). Each row separates
+  `[ExcludeFromCodeCoverage]` (`bpm-test-class-coverage@1`), and the independent
+  deterministic redundant method-level exclusion convention
+  (`bpm-redundant-method-coverage@1`). A changed MSTest method-level
+  `[ExcludeFromCodeCoverage]` is redundant when its containing changed-head
+  MSTest class is already excluded. There is **one finding and at most one
+  create-only comment per affected class**, anchored to the first changed
+  redundant method attribute. The finding shows its class symbol, a bounded
+  count (up to 256 changed attribute lines), up to 12 sanitized distinct
+  affected method names, and whether that name sample was truncated. The Rules
+  row counts class findings/comments separately from the total affected
+  method attributes: 22 attributes in one class are **one** class finding,
+  not 22 comments. Malformed or missing per-class summary data is excluded
+  rather than guessed. This does **not** come from the Owner
+  policy or the class-coverage rule. Each row separates
   implemented version/provenance from installed deployment, task enablement,
   bound execution generation/time, configured automatic authorization, and
   effective automatic publishing (authorization plus enabled task).
@@ -162,8 +176,10 @@ The reporting overlay extends the existing OpenTUI application:
   `588c0045e24542d10a76bbfadc6e6d1aa2c4c528`, but that code is **not
   deployed** to the reported PR 173-pinned dashboard/service cohort; a green
   PR is not deployment evidence. Class auto-post is not authorized by Owner
-  policy. Without sufficient local bindings, deployment, execution, and counts
-  remain **unknown** rather than asserting coverage. `f` opens a rule's
+  policy. Redundant method coverage is implemented in source but is **not
+  deployed or authorized** by that pinned service; neither Owner nor class
+  authorization extends to it. Without sufficient local bindings, deployment,
+  execution, and counts remain **unknown** rather than asserting coverage. `f` opens a rule's
   capability-filtered Findings (Relations for read-only relation evidence);
   `e` opens its Deliveries; `o` opens only a confidently bound, validated
   finding/delivery URL. `rule:` filters exact rule identity within rows that
@@ -174,7 +190,8 @@ The reporting overlay extends the existing OpenTUI application:
   last evaluated time is the durable observation timestamp, not merely a
   recent scheduler run that reused an older state. A historical relation
   observation can therefore be stale even when today's run references it.
-  findings are violation observations, while `noOp`, `wouldCreate`, and
+  Findings are violation observations (classes, not methods, for redundant
+  method coverage), while `noOp`, `wouldCreate`, and
   `unknown` are reconciliation outcomes. `refused` and `posted` come from
   verified, bound delivery events, with posted requiring a confirmed provider
   write; an observation `noOp` is not itself proof of a new post.
@@ -194,13 +211,18 @@ tokens. Rows are sorted deterministically and capped by `maxHistory`. `o`
 opens only the selected validated URL.
 
 The registry is an explicit source inventory in `rule-registry.ts`, not a
-deployment declaration. When implementing a new rule (for example redundant
-method-level coverage exclusions or named `Assert.AreEqual` arguments), add
-its stable ID, capability, version, provenance, and run channel *after* its
-producer emits a bound state/run contract; add its publishing policy separately
-only after deployment and authorization. Those future rules and active-PR
-intake are not implemented or live today. The adapter never scans ADO or
-writes provider comments to fill telemetry gaps.
+deployment declaration. New rule IDs require their own capability, version,
+provenance, and run channel; publishing requires separate deployment and
+authorization. Redundant method coverage has its own `redundant-coverage-v2:`
+finding identity and automatic delivery/result kinds. The dashboard accepts
+its completed, durable owner-observation and signed delivery bindings, but
+does not interpret an Owner or class run as its evaluation. If a scheduled
+envelope cannot identify this capability's run, `ownerStateIdentities` alone
+is insufficient: generation and counts remain **unknown**. With a verified
+pinned installation but no matching run, the separate rule is shown as
+**not-deployed**, not as successfully evaluated. Active-PR
+intake and its skipped denominator are not emitted. The adapter never scans
+ADO or writes provider comments to fill telemetry gaps.
 
 On Windows, `o` uses the system URL association through a fixed PowerShell
 `Start-Process -FilePath $url` launcher. The validated URL is passed only in
@@ -221,13 +243,20 @@ Automatic delivery events are the PR172 immutable files:
 
 The adapter requires the exact `owner-v2-comment-signed-envelope` v1 contract,
 HMAC-SHA256 verification, canonical `manifestJson`, and an
-`owner-v2-delivery-event` or `coverage-v2-delivery-event` v1 payload.
-Coverage delivery requires the signed event's `ruleId` and `capabilityId`
-both to be `bpm-test-class-coverage@1`, with a class finding identity and
-symbol. Created, recovered, ambiguous-write, and no-op coverage events
-require a separately verified matching coverage intent, class selection,
-state identity, rule/capability, and PR source/target binding before entering
-the feed. The dashboard pairs their body only with a matching coverage intent.
+`owner-v2-delivery-event`, `coverage-v2-delivery-event`, or
+`redundant-coverage-v2-delivery-event` v1 payload. Dedicated coverage
+delivery requires matching signed `ruleId`/`capabilityId` and its own
+`coverage-v2:` class or `redundant-coverage-v2:` class finding identity and
+class symbol. Created, recovered, ambiguous-write, and no-op events require a
+separately verified matching capability-specific create intent, selection,
+state identity, and PR source/target binding before entering the feed.
+Redundant-method events also require a completed matching durable observation
+and exact method anchor. The rule inventory counts delivery only when its
+state identity, rule/capability, finding, and event run ID match the bound
+generation; an otherwise valid event from another run is not evidence of that
+generation's post. Redundant method coverage is create-only: update actions
+or outcomes are excluded as drift and never linked or counted as posts, even
+if signed. The dashboard pairs the body only with the matching intent.
 Older Owner events without capability IDs remain labeled Owner. Foreign
 rule/capability bindings are displayed as drift failures, not deliveries.
 An automatic coverage event with `action: none`, `outcome: refused`, and

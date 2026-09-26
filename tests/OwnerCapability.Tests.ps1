@@ -988,8 +988,10 @@ Describe 'Owner capability module surface' {
         @((Get-Command -Module DevPilot.OwnerCapability).Name | Sort-Object) | Should -Be @(
             'ConvertTo-OwnerV2Observation',
             'Format-OwnerV1WriterComment',
+            'Format-RedundantMethodCoverageComment',
             'Format-TestClassCoverageComment',
             'Get-OwnerV1WriterMarkerKey',
+            'Get-RedundantMethodCoverageMarkerKey',
             'Get-TestClassCoverageMarkerKey',
             'New-OwnerSemanticRunner',
             'New-OwnerV2CapabilityAdapter',

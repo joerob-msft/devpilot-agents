@@ -19,6 +19,7 @@ import {
   reportingRows,
   type ReportingFilters,
 } from "../src/reporting-view.js";
+import { projectRuleRegistry } from "../src/rule-registry.js";
 
 type JsonRecord = Record<string, unknown>;
 const execFileAsync = promisify(execFile);
@@ -568,6 +569,7 @@ test("rules registry separates source, deployment, enablement, evaluation and ve
     const rules = snapshot.rules ?? [];
     assert.deepEqual(rules.map((rule) => rule.id), [
       "mstest-owner", "synthetic-relation-rule-v1", "bpm-test-class-coverage@1",
+      "bpm-redundant-method-coverage@1",
     ]);
     const owner = rules[0]!;
     assert.equal(owner.implemented, true);
@@ -611,9 +613,23 @@ test("rules registry separates source, deployment, enablement, evaluation and ve
     assert.equal(classRule.lastGeneration, null);
     assert.match(classRule.provenance, /588c0045/);
     assert.match(classRule.gaps.join(" "), /not deployed/i);
+    const redundant = rules[3]!;
+    assert.equal(redundant.implemented, true);
+    assert.equal(redundant.deployment, "not-deployed");
+    assert.equal(redundant.enablement, "disabled");
+    assert.equal(redundant.execution, "unknown");
+    assert.equal(redundant.authorization, "disabled");
+    assert.equal(redundant.publishing, "disabled");
+    assert.equal(redundant.policyCaps, null);
+    assert.equal(redundant.counts.finding, null);
+    assert.equal(redundant.counts.posted, null);
+    assert.equal(redundant.lastGeneration, null);
+    assert.deepEqual(redundant.scope, []);
+    assert.match(redundant.gaps.join(" "), /not deployed in the pinned service/i);
     const rows = reportingRows(snapshot, "rules");
-    assert.equal(rows.length, 3);
+    assert.equal(rows.length, 4);
     assert.match(rows[2]!.text.join(" "), /finding unknown.*skipped unknown/);
+    assert.match(rows[3]!.text.join(" "), /auto policy disabled.*auto-post disabled/);
     assert.equal(filterReportingRows(rows, {
       timeRange: "24h", search: "rule:synthetic-relation-rule outcome:verified",
       posting: "all", mode: "all",
@@ -621,6 +637,9 @@ test("rules registry separates source, deployment, enablement, evaluation and ve
     assert.equal(filterReportingRows(rows, {
       timeRange: "all", search: "class-coverage", posting: "all", mode: "all",
     })[0]?.key, "rule:bpm-test-class-coverage@1");
+    assert.equal(filterReportingRows(rows, {
+      timeRange: "all", search: "rule:bpm-redundant-method-coverage@1", posting: "all", mode: "all",
+    })[0]?.key, "rule:bpm-redundant-method-coverage@1");
     const taskOff = await createAdapter(fixture.configPath, {
       now: () => Date.parse("2026-09-24T21:05:00Z"),
       taskReader: async () => ({ ...healthyTask, enabled: false }),
@@ -925,6 +944,210 @@ test("coverage events show the bound class and rule while human-covered findings
       /signature verification failed/.test(item.reason)));
     assert.equal(invalid.deliveries.some((delivery) => delivery.eventId === "event-foreign-coverage"), false);
     assert.ok(invalid.failures.some((failure) => failure.id === "event-binding:event-foreign-coverage"));
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("redundant method coverage remains independent of Owner and class deployment and delivery", async () => {
+  const fixture = await createFixture();
+  try {
+    const capabilityId = "bpm-redundant-method-coverage@1";
+    const identity = "9".repeat(64);
+    const findingId = `redundant-coverage-v2:${"8".repeat(64)}`;
+    const marker = "7".repeat(64);
+    const body = "**Redundant method exclusions in WidgetTests**\n\nOne class comment covers 22 changed method attributes.";
+    const bodySha256 = sha256Text(body);
+    const affectedMethods = Array.from({ length: 12 }, (_, index) => `ShouldRun${index + 1}`);
+    const affectedAttributeLines = Array.from({ length: 22 }, (_, index) => index + 17);
+    const subject = {
+      projectId: "11111111-1111-1111-1111-111111111111",
+      repositoryId: "22222222-2222-2222-2222-222222222222",
+      pullRequestId: 42,
+    };
+    const head = { sourceCommit: "d".repeat(40) };
+    const target = { targetCommit: "2".repeat(40), targetRef: "refs/heads/main" };
+    const declaration = {
+      kind: "owner-v2-preview-declaration", stateDigest: `v1:sha256:${identity}`,
+      subject, head, target,
+      capability: { id: capabilityId, digest: `v1:sha256:${"6".repeat(64)}` },
+      rule: {
+        section: capabilityId,
+        path: "src/DevPilot.OwnerCapability/Policy/redundant-method-coverage.v1.txt",
+        commit: "e".repeat(40),
+      },
+    };
+    const root = join(fixture.stateRoot, "owner-v2-preview-state", "schema-1", "capabilities", "redundant");
+    await writeJson(join(root, "declarations", `${identity}.json`), declaration);
+    await writeJson(join(root, "records", `${identity}.json`), {
+      identity, stateDigest: declaration.stateDigest, state: "completed",
+      capabilityId, capabilityDigest: declaration.capability.digest,
+      subjectDigest: canonicalDigest(subject), headDigest: canonicalDigest(head),
+      updatedUtc: "utc:2026-09-24T20:02:00Z",
+    });
+    await writeJson(join(root, "observations", `${identity}.json`), {
+      schemaVersion: 2, kind: "owner-observation", capability: capabilityId,
+      subject: {
+        projectId: null, repositoryId: subject.repositoryId, pullRequestId: subject.pullRequestId,
+        headCommit: head.sourceCommit, ...target,
+      },
+      rule: { section: capabilityId, path: declaration.rule.path, commit: declaration.rule.commit },
+      lifecycle: { status: "completed" },
+      findings: [{
+        identity: findingId, disposition: "violation",
+        anchor: { path: "tests/WidgetTests.cs", line: 17, symbol: "WidgetTests" },
+        affectedMethodCount: 22, affectedMethods, affectedAttributeLines, methodListTruncated: true,
+        reconciliation: { classification: "wouldCreate", bodySha256 },
+      }],
+    });
+    const signedSubject = { ...subject, sourceCommit: head.sourceCommit, ...target };
+    const intent = {
+      schemaVersion: 1, kind: "redundant-coverage-v2-service-create-intent",
+      runId: "run-redundant", state: { identity },
+      capability: { id: capabilityId }, rule: { section: capabilityId },
+      subject: signedSubject,
+      implementation: {
+        toolkitHead: "f".repeat(40), toolkitTree: "1".repeat(40),
+        formatterSha256: sha256Text("formatter fixture\n"),
+      },
+      selections: [{
+        findingId, marker, path: "tests/WidgetTests.cs", line: 17,
+        symbol: "WidgetTests", body, bodySha256,
+      }],
+    };
+    await write(join(fixture.deliveryRoot, "intents", identity, "run-redundant.json"),
+      signedEnvelope(intent, fixture.serviceKey));
+    const event = {
+      schemaVersion: 1, kind: "redundant-coverage-v2-delivery-event",
+      eventId: "event-redundant", runId: "run-redundant", ruleId: capabilityId, capabilityId,
+      occurredUtc: "20260924T200300Z", runHealth: "healthy", subject: signedSubject,
+      finding: {
+        stateIdentity: identity, findingId, marker,
+        path: "tests/WidgetTests.cs", line: 17, symbol: "WidgetTests",
+      },
+      action: "create", outcome: "created", threadId: 400, commentId: 401,
+      providerWriteCount: 1, modelWriteCount: 0, providerWriteState: "confirmed",
+    };
+    await write(join(fixture.deliveryRoot, "events", "event-redundant.json"),
+      signedEnvelope(event, fixture.serviceKey));
+    const adapter = createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-24T20:35:00Z"), taskReader: async () => healthyTask,
+    });
+    const unbound = await adapter.read();
+    const redundantFinding = unbound.findings.find((finding) => finding.id === findingId);
+    assert.equal(redundantFinding?.rule, capabilityId);
+    assert.equal(redundantFinding?.state, "wouldCreate");
+    assert.equal(redundantFinding?.symbol, "WidgetTests");
+    assert.equal(redundantFinding?.affectedMethodCount, 22);
+    assert.deepEqual(redundantFinding?.affectedMethods, affectedMethods);
+    assert.equal(redundantFinding?.methodListTruncated, true);
+    const classFindingRow = reportingRows(unbound, "findings").find((row) => row.key === `finding:${findingId}`);
+    assert.match(classFindingRow?.text.join(" ") ?? "", /One class finding \(at most one comment.*22 affected method attribute/);
+    assert.match(classFindingRow?.text.join(" ") ?? "", /ShouldRun1.*ShouldRun12.*list truncated/);
+    assert.match(redundantFinding?.url ?? "", /pullrequest\/42/);
+    assert.equal(unbound.deliveries.find((delivery) => delivery.eventId === event.eventId)?.body, body);
+    assert.equal(unbound.rules?.[3]?.counts.finding, null);
+    assert.equal(unbound.rules?.[3]?.counts.posted, null);
+    assert.equal(unbound.rules?.[3]?.deployment, "not-deployed");
+    const runPath = join(fixture.runnerRoot, "last-run.json");
+    const run = JSON.parse(await readFile(runPath, "utf8")) as JsonRecord;
+    run.completedUtc = "2026-09-24T20:30:00Z";
+    asObject(asArray(run.records)[0]).identity = identity;
+    asObject(run.ownerAutoDelivery).kind = "coverage-v2-automatic-delivery-result";
+    await writeJson(runPath, run);
+    const classRun = await adapter.read();
+    assert.equal(classRun.rules?.[3]?.execution, "unknown");
+    assert.equal(classRun.rules?.[3]?.counts.finding, null);
+    asObject(run.ownerAutoDelivery).kind = "redundant-coverage-v2-automatic-delivery-result";
+    asObject(run.ownerAutoDelivery).runId = "run-redundant";
+    await writeJson(runPath, run);
+    const matched = await adapter.read();
+    const rule = matched.rules?.[3];
+    assert.equal(matched.runs[0]?.deliveryCapabilityId, capabilityId);
+    assert.equal(rule?.deployment, "verified");
+    assert.equal(rule?.execution, "verified");
+    assert.equal(rule?.counts.finding, 1);
+    assert.equal(rule?.affectedMethodAttributes, 22);
+    assert.equal(rule?.counts.wouldCreate, 1);
+    assert.equal(rule?.counts.posted, 1);
+    assert.match(reportingRows(matched, "rules")[3]?.text.join(" ") ?? "",
+      /Class outcomes: finding 1 class\(es\).*posted 1 class comment\(s\).*Affected method attributes across bound class findings: 22/);
+    assert.equal(rule?.authorization, "unknown");
+    assert.equal(rule?.publishing, "unknown");
+    assert.equal(rule?.policyCaps, null);
+    assert.deepEqual(rule?.deliveryIds, ["automatic:event-redundant"]);
+    assert.equal(matched.rules?.[0]?.counts.finding, null);
+    assert.match(reportingRows(matched, "runs")[0]?.text.join(" ") ?? "", /Redundant method coverage/);
+    const confirmedCreate = matched.deliveries.find((delivery) => delivery.eventId === event.eventId)!;
+    const projectedUpdate = projectRuleRegistry({
+      ...matched,
+      deliveries: [...matched.deliveries, {
+        ...confirmedCreate, id: "automatic:event-updated", eventId: "event-updated",
+        action: "update", outcome: "updated",
+      }, {
+        ...confirmedCreate, id: "automatic:event-updated-outcome",
+        eventId: "event-updated-outcome", outcome: "updated",
+      }],
+    }, [{
+      identity, capabilityId, ruleId: capabilityId, pullRequestId: 42,
+      evaluatedUtc: redundantFinding!.updatedUtc, findingIds: [findingId],
+      findings: 1, affectedMethodAttributes: 22, noOp: 0, wouldCreate: 1, unknown: 0,
+    }], 120, { automatic: true, manual: true })[3]!;
+    assert.equal(projectedUpdate.counts.posted, 1);
+    assert.deepEqual(projectedUpdate.deliveryIds, ["automatic:event-redundant"]);
+    await write(join(fixture.deliveryRoot, "events", "event-updated.json"),
+      signedEnvelope({ ...event, eventId: "event-updated", action: "update", outcome: "updated" },
+        fixture.serviceKey));
+    const updated = await adapter.read();
+    assert.equal(updated.deliveries.some((delivery) => delivery.eventId === "event-updated"), false);
+    assert.ok(updated.failures.some((failure) => failure.id === "event-binding:event-updated" &&
+      /create-only/.test(failure.message)));
+    assert.equal(updated.rules?.[3]?.counts.posted, null);
+    await rm(join(fixture.deliveryRoot, "events", "event-updated.json"));
+    await write(join(fixture.deliveryRoot, "intents", identity, "run-other.json"),
+      signedEnvelope({ ...intent, runId: "run-other" }, fixture.serviceKey));
+    await write(join(fixture.deliveryRoot, "events", "event-other-run.json"),
+      signedEnvelope({ ...event, eventId: "event-other-run", runId: "run-other" }, fixture.serviceKey));
+    const otherRun = await adapter.read();
+    assert.ok(otherRun.deliveries.some((delivery) => delivery.eventId === "event-other-run"));
+    assert.equal(otherRun.rules?.[3]?.counts.posted, 1);
+    assert.deepEqual(otherRun.rules?.[3]?.deliveryIds, ["automatic:event-redundant"]);
+    const observationPath = join(root, "observations", `${identity}.json`);
+    const observation = JSON.parse(await readFile(observationPath, "utf8")) as JsonRecord;
+    asObject(observation.rule).section = "bpm-test-class-coverage@1";
+    await writeJson(observationPath, observation);
+    const foreignRule = await adapter.read();
+    assert.equal(foreignRule.findings.some((finding) => finding.id === findingId), false);
+    assert.ok(foreignRule.failures.some((failure) => failure.id === `rule-binding:${identity}`));
+    assert.equal(foreignRule.rules?.[3]?.counts.finding, null);
+    asObject(observation.rule).section = capabilityId;
+    await writeJson(observationPath, observation);
+    asObject(asArray(observation.findings)[0]).affectedMethods = ["ShouldRun", "<script>"];
+    await writeJson(observationPath, observation);
+    const malformedSummary = await adapter.read();
+    assert.equal(malformedSummary.findings.some((finding) => finding.id === findingId), false);
+    assert.ok(malformedSummary.failures.some((failure) => failure.id === `rule-binding:${identity}`));
+    assert.equal(malformedSummary.rules?.[3]?.affectedMethodAttributes, null);
+    asObject(asArray(observation.findings)[0]).affectedMethods = affectedMethods;
+    await writeJson(observationPath, observation);
+    observation.findings = [...asArray(observation.findings), {
+      ...asObject(asArray(observation.findings)[0]),
+      identity: `redundant-coverage-v2:${"5".repeat(64)}`,
+    }];
+    await writeJson(observationPath, observation);
+    const duplicatedClass = await adapter.read();
+    assert.equal(duplicatedClass.findings.some((finding) => finding.id === findingId), false);
+    assert.ok(duplicatedClass.failures.some((failure) => failure.id === `rule-binding:${identity}`));
+    assert.equal(duplicatedClass.rules?.[3]?.counts.finding, null);
+    observation.findings = asArray(observation.findings).slice(0, 1);
+    await writeJson(observationPath, observation);
+    await write(join(fixture.deliveryRoot, "events", "event-redundant-bad.json"),
+      signedEnvelope({ ...event, eventId: "event-redundant-bad",
+        subject: { ...signedSubject, sourceCommit: "e".repeat(40) } }, fixture.serviceKey));
+    const drifted = await adapter.read();
+    assert.equal(drifted.deliveries.some((delivery) => delivery.eventId === "event-redundant-bad"), false);
+    assert.ok(drifted.failures.some((failure) => failure.id === "event-binding:event-redundant-bad"));
+    assert.equal(drifted.rules?.[3]?.counts.posted, null);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

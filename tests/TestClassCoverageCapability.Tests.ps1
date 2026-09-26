@@ -193,6 +193,51 @@ BeforeAll {
                     })
         }
     }
+
+    function New-RedundantCoverageTestManifest {
+        param(
+            [string]$Source = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using System.Diagnostics.CodeAnalysis;
+[TestClass]
+[ExcludeFromCodeCoverage]
+public class SampleTests {
+    [TestMethod]
+    [ExcludeFromCodeCoverage]
+    public void Verify() {}
+}
+'@
+            ,
+            [int]$First = 7,
+            [int]$Last = 7,
+            [string]$SourceCommit = ('a' * 40)
+        )
+        $manifest = New-CoverageTestManifest -First $Source -SourceCommit $SourceCommit
+        $entry = $manifest.entries[0]
+        $package = $entry.acquisition.package
+        $policy = [IO.File]::ReadAllText((Join-Path $PSScriptRoot `
+            '..\src\DevPilot.OwnerCapability\Policy\redundant-method-coverage.v1.txt'),
+            [Text.UTF8Encoding]::new($false))
+        $manifest.kind = 'redundant-coverage-v2-preview-cohort'
+        $entry.capability.id = 'bpm-redundant-method-coverage@1'
+        $entry.capability.digest = Get-CoverageDigest 'redundant-method-coverage-capability-v1'
+        $entry.rule.path = 'src/DevPilot.OwnerCapability/Policy/redundant-method-coverage.v1.txt'
+        $entry.rule.section = $entry.capability.id
+        $entry.rule.hash = Get-CoverageDigest $policy
+        $entry.rule.length = [Text.Encoding]::UTF8.GetByteCount($policy)
+        $entry.config.id = 'redundant-method-coverage-v1-user-approved'
+        $entry.config.digest = Get-CoverageDigest $entry.config.id
+        $package.rule.rulePath = $entry.rule.path
+        $package.rule.ruleSection = $entry.rule.section
+        $package.rule.ruleHash = $entry.rule.hash
+        $package.rule.ruleLength = $entry.rule.length
+        $package.rule.content = $policy
+        $package.changePages[0].changes[0].changeType = 'modified'
+        $package.changePages[0].changes[0].spans[0].startLine = $First
+        $package.changePages[0].changes[0].spans[0].endLine = $Last
+        $entry.acquisition.payloadDigest = (New-OwnerReplayFixture -Package $package).PayloadDigest
+        return $manifest
+    }
 }
 
 Describe 'Bound test-class coverage capability' {
@@ -460,5 +505,189 @@ Describe 'Bound test-class coverage capability' {
                 -Snapshot (New-CoverageTestSnapshot -Contract $contract -Threads $case.Threads)
             $state.findings[0].reconciliation.classification | Should -BeExactly $case.Expected
         }
+    }
+}
+
+Describe 'Separate redundant method exclusion capability' {
+    It 'finds only the changed method exclusion attribute under a covered MSTest class' {
+        $result = Invoke-CoverageTestReplay -Manifest (New-RedundantCoverageTestManifest)
+        $result.Observation.capability | Should -BeExactly 'bpm-redundant-method-coverage@1'
+        $result.Observation.counts.violations | Should -Be 1
+        $result.Observation.findings[0].identity | Should -Match '^redundant-coverage-v2:[0-9a-f]{64}$'
+        $result.Observation.findings[0].anchor.line | Should -Be 7
+        $result.Observation.findings[0].anchor.symbol | Should -BeExactly 'SampleTests'
+        $result.Observation.findings[0].affectedMethodCount | Should -Be 1
+        $result.Observation.findings[0].affectedMethods | Should -Be @('Verify')
+        $result.Observation.execution.modelStarts | Should -Be 0
+        $result.Observation.effects.providerWrites | Should -Be 0
+        $result.Observation.lifecycle.status | Should -BeExactly 'completed'
+    }
+
+    It 'does not flag class-only exclusions, unchanged attributes, or uncovered classes' {
+        $onlyClass = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using System.Diagnostics.CodeAnalysis;
+[TestClass]
+[ExcludeFromCodeCoverage]
+class SampleTests { [TestMethod] public void Verify() {} }
+'@
+        (Invoke-CoverageTestReplay -Manifest (
+            New-RedundantCoverageTestManifest -Source $onlyClass -First 4 -Last 4
+        )).Observation.counts.violations | Should -Be 0
+        (Invoke-CoverageTestReplay -Manifest (
+            New-RedundantCoverageTestManifest -First 8 -Last 8
+        )).Observation.counts.violations | Should -Be 0
+        $withoutClass = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using System.Diagnostics.CodeAnalysis;
+[TestClass]
+public class SampleTests {
+    [TestMethod]
+    [ExcludeFromCodeCoverage]
+    public void Verify() {}
+}
+'@
+        (Invoke-CoverageTestReplay -Manifest (
+            New-RedundantCoverageTestManifest -Source $withoutClass -First 6 -Last 6
+        )).Observation.counts.violations | Should -Be 0
+    }
+
+    It 'keeps partial classes and mixed method attributes unknown' {
+        foreach ($transform in @('partial', 'mixed')) {
+            $source = (New-RedundantCoverageTestManifest).entries[0].acquisition.package.files[0].content
+            if ($transform -eq 'partial') {
+                $source = $source.Replace('public class SampleTests', 'public partial class SampleTests')
+            }
+            else {
+                $source = $source.Replace('    [ExcludeFromCodeCoverage]',
+                    '    [ExcludeFromCodeCoverage, Obsolete]')
+            }
+            $result = Invoke-CoverageTestReplay -Manifest (
+                New-RedundantCoverageTestManifest -Source $source
+            )
+            $result.Observation.counts.violations | Should -Be 0
+            $result.Observation.counts.unknown | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'dedupes exact current human review from the reviewer account and blocks historical review' {
+        $result = Invoke-CoverageTestReplay -Manifest (New-RedundantCoverageTestManifest)
+        $contract = New-CoverageTestContract $result.Manifest.entries[0]
+        $finding = $result.Observation.findings[0]
+        $body = 'Method attributes have no effect because the class exclusion covers the entire class.'
+        $human = New-CoverageTestThread -Contract $contract -Finding $finding -Body $body -Human $false
+        $state = Resolve-OwnerV2DiscussionReconciliation -Observation $result.Observation `
+            -Contract $contract -Snapshot (New-CoverageTestSnapshot -Contract $contract -Threads @($human))
+        $state.findings[0].reconciliation.classification | Should -BeExactly 'humanCovered'
+        $state.effects.dedupe.wouldCreate | Should -Be 0
+        $prior = New-CoverageTestThread -Contract $contract -Finding $finding -Body $body `
+            -Line 6 -Context outdated -Outdated $true -Status closed
+        $fresh = $result.Observation | ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $old = Resolve-OwnerV2DiscussionReconciliation -Observation $fresh -Contract $contract `
+            -Snapshot (New-CoverageTestSnapshot -Contract $contract -Threads @($prior))
+        $old.findings[0].reconciliation.reason | Should -BeExactly 'historical-human-review-needs-review'
+        $old.effects.dedupe.wouldCreate | Should -Be 0
+    }
+
+    It 'emits one class finding and marker for 22 changed attributes and dedupes a later anchor' {
+        $methods = @(1..22 | ForEach-Object {
+            "    [TestMethod]`n    [ExcludeFromCodeCoverage]`n    void Check$_() {}"
+        })
+        $source = @(
+            'using Microsoft.VisualStudio.TestTools.UnitTesting;'
+            'using System.Diagnostics.CodeAnalysis;'
+            '[TestClass]'
+            '[ExcludeFromCodeCoverage]'
+            'class SampleTests {'
+            $methods
+            '}'
+        ) -join "`n"
+        $result = Invoke-CoverageTestReplay -Manifest (
+            New-RedundantCoverageTestManifest -Source $source -First 1 -Last 72
+        )
+        $result.Observation.counts.eligible | Should -Be 1
+        $result.Observation.counts.violations | Should -Be 1
+        $result.Observation.findings.Count | Should -Be 1
+        $finding = $result.Observation.findings[0]
+        $finding.anchor.line | Should -Be 7
+        $finding.anchor.symbol | Should -BeExactly 'SampleTests'
+        $finding.affectedMethodCount | Should -Be 22
+        $finding.affectedAttributeLines.Count | Should -Be 22
+        $finding.affectedMethods.Count | Should -Be 12
+        $finding.methodListTruncated | Should -BeTrue
+        $contract = New-CoverageTestContract $result.Manifest.entries[0]
+        $marker = Get-RedundantMethodCoverageMarkerKey -Contract $contract -Finding $finding
+        $body = Format-RedundantMethodCoverageComment -Contract $contract `
+            -Finding $finding -MarkerKey $marker
+        $body | Should -Match '22 changed method-level'
+        $body | Should -Match 'Check12'
+        $body | Should -Not -Match 'Check22'
+        $human = New-CoverageTestThread -Contract $contract -Finding $finding -Line 10 `
+            -Body 'These method attributes have no effect because the class exclusion covers the entire class.' `
+            -Human $false
+        $state = Resolve-OwnerV2DiscussionReconciliation -Observation $result.Observation `
+            -Contract $contract -Snapshot (
+                New-CoverageTestSnapshot -Contract $contract -Threads @($human))
+        $state.findings[0].reconciliation.classification | Should -BeExactly 'humanCovered'
+        $state.effects.dedupe.wouldCreate | Should -Be 0
+        $state.effects.providerWrites | Should -Be 0
+
+        $next = Invoke-CoverageTestReplay -Manifest (
+            New-RedundantCoverageTestManifest -Source $source -First 1 -Last 72 `
+                -SourceCommit ('d' * 40)
+        )
+        $nextContract = New-CoverageTestContract $next.Manifest.entries[0]
+        $nextMarker = Get-RedundantMethodCoverageMarkerKey -Contract $nextContract `
+            -Finding $next.Observation.findings[0]
+        $nextMarker | Should -Not -BeExactly $marker
+        $staleThread = New-CoverageTestThread -Contract $nextContract `
+            -Finding $next.Observation.findings[0] -Line 10 `
+            -Body 'Method attributes have no effect because the class exclusion covers the entire class.'
+        $staleThread.sourceCommit = [string]$contract.Request.SourceCommit
+        { New-CoverageTestSnapshot -Contract $nextContract -Threads @($staleThread) } |
+            Should -Throw '*did not bind the current source commit*'
+    }
+
+    It 'keeps ambiguous and negated current human discussion unknown rather than auto-create' {
+        $result = Invoke-CoverageTestReplay -Manifest (New-RedundantCoverageTestManifest)
+        $contract = New-CoverageTestContract $result.Manifest.entries[0]
+        $finding = $result.Observation.findings[0]
+        foreach ($body in @(
+                'Is the method exclusion unnecessary because the class excludes everything?',
+                "The method exclusion is not redundant because the class does not cover it.",
+                "Don't remove the method exclusion even though the class excludes the entire method."
+            )) {
+            $thread = New-CoverageTestThread -Contract $contract -Finding $finding -Body $body
+            $fresh = $result.Observation | ConvertTo-Json -Depth 64 |
+                ConvertFrom-Json -AsHashtable -Depth 64
+            $state = Resolve-OwnerV2DiscussionReconciliation -Observation $fresh `
+                -Contract $contract -Snapshot (
+                    New-CoverageTestSnapshot -Contract $contract -Threads @($thread))
+            $state.findings[0].reconciliation.classification | Should -BeExactly 'unknown'
+            $state.effects.dedupe.wouldCreate | Should -Be 0
+        }
+    }
+
+    It 'recognizes only its exact reviewer marker and body as no-op' {
+        $result = Invoke-CoverageTestReplay -Manifest (New-RedundantCoverageTestManifest)
+        $contract = New-CoverageTestContract $result.Manifest.entries[0]
+        $finding = $result.Observation.findings[0]
+        $marker = Get-RedundantMethodCoverageMarkerKey -Contract $contract -Finding $finding
+        $body = Format-RedundantMethodCoverageComment -Contract $contract `
+            -Finding $finding -MarkerKey $marker
+        $thread = New-CoverageTestThread -Contract $contract -Finding $finding `
+            -Body $body -Human $false
+        $state = Resolve-OwnerV2DiscussionReconciliation -Observation $result.Observation `
+            -Contract $contract -Snapshot (New-CoverageTestSnapshot -Contract $contract -Threads @($thread))
+        $state.findings[0].reconciliation.classification | Should -BeExactly 'noOp'
+        $state.effects.dedupe.noOp | Should -Be 1
+        $other = New-CoverageTestThread -Contract $contract -Finding $finding `
+            -Body ($body.Replace('redundant-method-coverage', 'test-class-coverage')) -Human $false
+        $fresh = $result.Observation | ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $state = Resolve-OwnerV2DiscussionReconciliation -Observation $fresh -Contract $contract `
+            -Snapshot (New-CoverageTestSnapshot -Contract $contract -Threads @($other))
+        $state.findings[0].reconciliation.classification | Should -Not -BeExactly 'noOp'
     }
 }

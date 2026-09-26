@@ -49,6 +49,9 @@ $script:OwnerV1WriterMarkerPrefix = 'devpilot-owner-comment:v1'
 $script:TestClassCoverageCapability = 'bpm-test-class-coverage@1'
 $script:TestClassCoverageDigest = 'v1:sha256:2307b3880530a8be4f1cbfbdd258673fb8e06e8b1bddd08613bbd641736a6658'
 $script:TestClassCoverageMarkerPrefix = 'devpilot-test-class-coverage:v1'
+$script:RedundantMethodCoverageCapability = 'bpm-redundant-method-coverage@1'
+$script:RedundantMethodCoverageDigest = 'v1:sha256:1d9d2a3d8416b7004f6193043f8cfd43a6969d61bc9c18deb2e8fcc0c52d58ca'
+$script:RedundantMethodCoverageMarkerPrefix = 'devpilot-redundant-method-coverage:v1'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -249,6 +252,105 @@ function Format-TestClassCoverageComment {
     ) -join "`n"
 }
 
+function Get-RedundantMethodCoverageMarkerKey {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding
+    )
+    $request = $Contract.Request
+    if ([string]$request.CapabilityId -cne $script:RedundantMethodCoverageCapability -or
+        [string]$request.RuleSection -cne $script:RedundantMethodCoverageCapability) {
+        throw 'Redundant method coverage requires its independently bound rule.'
+    }
+    $anchor = $Finding.anchor
+    $source = $Finding.binding.source.representation
+    $methods = @($Finding.affectedMethods)
+    $lines = @($Finding.affectedAttributeLines)
+    if ($anchor -isnot [Collections.IDictionary] -or
+        $source -isnot [Collections.IDictionary] -or
+        [string]$Finding.disposition -cne 'violation' -or
+        [string]$Finding.constructRef -cnotmatch '^construct:[0-9a-f]{64}$' -or
+        [string]$source.constructIdentity -cne [string]$Finding.constructRef -or
+        [string]$source.path -cne [string]$anchor.path -or
+        [string]$source.symbol -cne [string]$anchor.symbol -or
+        [int]$source.startLine -ne [int]$anchor.line -or
+        [int]$source.endLine -ne [int]$anchor.line -or
+        [int]$anchor.line -lt 1 -or
+        ([string]$anchor.symbol).Length -gt 256 -or
+        [string]$anchor.symbol -cnotmatch '^[\p{L}_][\p{L}\p{N}_]*(?:\.[\p{L}_][\p{L}\p{N}_]*)*$' -or
+        [int]$Finding.affectedMethodCount -lt 1 -or
+        [int]$Finding.affectedMethodCount -gt 256 -or
+        $methods.Count -lt 1 -or $methods.Count -gt 12 -or
+        $methods.Count -gt [int]$Finding.affectedMethodCount -or
+        @($methods | Where-Object {
+                ([string]$_).Length -gt 128 -or
+                [string]$_ -cnotmatch '^[\p{L}_][\p{L}\p{N}_]*$'
+            }).Count -gt 0 -or
+        $lines.Count -ne [int]$Finding.affectedMethodCount -or
+        [int]$lines[0] -ne [int]$anchor.line) {
+        throw 'Redundant coverage finding has no bounded class and changed method attributes.'
+    }
+    for ($index = 1; $index -lt $lines.Count; $index++) {
+        if ([int]$lines[$index] -le [int]$lines[$index - 1]) {
+            throw 'Redundant coverage attribute anchors are not strictly ordered.'
+        }
+    }
+    $material = @(
+        $script:RedundantMethodCoverageMarkerPrefix
+        [string]$request.RepositoryId
+        [string]$request.PullRequestId
+        [string]$request.SourceCommit
+        [string]$request.RuleRepositoryId
+        (ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+        [string]$request.RuleSection
+        [string]$request.RuleCommit
+        [string]$request.RuleHash
+        (ConvertTo-OwnerV1WriterPath -Path ([string]$anchor.path))
+        [string]$anchor.line
+        [string]$anchor.symbol
+    ) -join "`n"
+    return Get-OwnerV1WriterSha256 -Text $material
+}
+
+function Format-RedundantMethodCoverageComment {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [Parameter(Mandatory)][string]$MarkerKey
+    )
+    if ($MarkerKey -cne (Get-RedundantMethodCoverageMarkerKey `
+            -Contract $Contract -Finding $Finding)) {
+        throw 'Redundant coverage marker does not match the bound method finding.'
+    }
+    $request = $Contract.Request
+    $path = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path ([string]$Finding.anchor.path))
+    $symbol = ConvertTo-OwnerV1WriterMarkdownCode ([string]$Finding.anchor.symbol)
+    $methods = @($Finding.affectedMethods | ForEach-Object {
+            ConvertTo-OwnerV1WriterMarkdownCode ([string]$_)
+        })
+    $count = [int]$Finding.affectedMethodCount
+    $methodSummary = ($methods | ForEach-Object { "``$_``" }) -join ', '
+    if ([bool]$Finding.methodListTruncated) {
+        $methodSummary += " (bounded sample; $count affected attributes total)"
+    }
+    $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+    return @(
+        '**Redundant method-level coverage exclusions in one MSTest class**'
+        ''
+        "Class ``$symbol`` has $count changed method-level ``ExcludeFromCodeCoverage`` attribute(s), first anchored at ``$path`:$([int]$Finding.anchor.line)``. Its class-level exclusion already covers the entire class."
+        ''
+        "Affected method names (up to 12 distinct): $methodSummary"
+        ''
+        'Suggested fix: remove only these redundant method-level `[ExcludeFromCodeCoverage]` attributes; keep the class exclusion and all other method attributes.'
+        ''
+        "User-approved convention: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+        ''
+        "<!-- ${script:RedundantMethodCoverageMarkerPrefix}:$MarkerKey -->"
+    ) -join "`n"
+}
+
 function New-OwnerV2DiscussionReconciliation {
     param(
         [Parameter(Mandatory)][ValidateSet('wouldCreate', 'wouldUpdate', 'noOp', 'humanCovered', 'unknown')]
@@ -309,9 +411,13 @@ function Resolve-OwnerV2DiscussionReconciliation {
     else {
         'unknown'
     }
-    $isCoverage = [string](Get-OwnerV2Member -Value $Observation -Name capability) -ceq
-        $script:TestClassCoverageCapability
-    $allMarkerPattern = if ($isCoverage) {
+    $capabilityId = [string](Get-OwnerV2Member -Value $Observation -Name capability)
+    $isRedundantMethod = $capabilityId -ceq $script:RedundantMethodCoverageCapability
+    $isCoverage = $capabilityId -ceq $script:TestClassCoverageCapability
+    $allMarkerPattern = if ($isRedundantMethod) {
+        '<!--\s*devpilot-redundant-method-coverage:v1:([0-9a-f]{64})\s*-->'
+    }
+    elseif ($isCoverage) {
         '<!--\s*devpilot-test-class-coverage:v1:([0-9a-f]{64})\s*-->'
     }
     else {
@@ -322,7 +428,12 @@ function Resolve-OwnerV2DiscussionReconciliation {
         $markerKey = $null
         $body = $null
         try {
-            if ($isCoverage) {
+            if ($isRedundantMethod) {
+                $markerKey = Get-RedundantMethodCoverageMarkerKey -Contract $Contract -Finding $finding
+                $body = Format-RedundantMethodCoverageComment -Contract $Contract -Finding $finding `
+                    -MarkerKey $markerKey
+            }
+            elseif ($isCoverage) {
                 $markerKey = Get-TestClassCoverageMarkerKey -Contract $Contract -Finding $finding
                 $body = Format-TestClassCoverageComment -Contract $Contract -Finding $finding `
                     -MarkerKey $markerKey
@@ -377,7 +488,7 @@ function Resolve-OwnerV2DiscussionReconciliation {
                         MarkerCount = $targetMatches.Count
                     })
                 }
-                elseif ($isCoverage) {
+                elseif ($isCoverage -or $isRedundantMethod) {
                     $foreignMarkers += $targetMatches.Count
                 }
             }
@@ -397,11 +508,18 @@ function Resolve-OwnerV2DiscussionReconciliation {
         }
         if ($candidates.Count -eq 0) {
             $anchor = $finding.anchor
+            $affectedLines = if ($isRedundantMethod) {
+                @($finding.affectedAttributeLines)
+            }
+            else { @([int]$anchor.line) }
             $expectedPath = ConvertTo-OwnerV1WriterPath -Path ([string]$anchor.path)
             $human = [Collections.Generic.List[object]]::new()
             $ambiguousHuman = $false
             $historicalHuman = [Collections.Generic.List[object]]::new()
-            $discussionPattern = if ($isCoverage) {
+            $discussionPattern = if ($isRedundantMethod) {
+                '(?i)\b(?:method|attribute|coverage|exclusion|class|exclude)\b'
+            }
+            elseif ($isCoverage) {
                 '(?i)\bexclude\s+from\s+code\s+coverage\b'
             }
             else {
@@ -413,11 +531,13 @@ function Resolve-OwnerV2DiscussionReconciliation {
                 }
                 $historicalNearAnchor = [bool]$thread.isOutdated -and
                     [string]$thread.contextState -ceq 'outdated' -and
-                    [int]$thread.anchor.line -ge ([int]$anchor.line - 2) -and
-                    [int]$thread.anchor.line -le [int]$anchor.line
+                    @($affectedLines | Where-Object {
+                            [int]$thread.anchor.line -ge ([int]$_ - 2) -and
+                            [int]$thread.anchor.line -le [int]$_
+                        }).Count -gt 0
                 $currentAnchor = -not [bool]$thread.isOutdated -and
                     [string]$thread.status -ceq 'active' -and
-                    [int]$thread.anchor.line -eq [int]$anchor.line
+                    [int]$thread.anchor.line -in $affectedLines
                 if (-not $historicalNearAnchor -and -not $currentAnchor) { continue }
                 $samePath = try {
                     [string]::Equals($expectedPath,
@@ -429,17 +549,29 @@ function Resolve-OwnerV2DiscussionReconciliation {
                 foreach ($comment in @($thread.comments)) {
                     if ([string]$comment.commentType -cne 'text' -or
                         [bool]$comment.isDeleted -or
-                        [string]$comment.body -cnotmatch $discussionPattern) {
+                        (-not $isRedundantMethod -and
+                            [string]$comment.body -cnotmatch $discussionPattern)) {
                         continue
                     }
                     $containsReviewerMarker = [regex]::IsMatch(
                         [string]$comment.body,
-                        '<!--\s*devpilot-(?:owner-comment|test-class-coverage):v1:[0-9a-f]{64}\s*-->'
+                        '<!--\s*devpilot-(?:owner-comment|test-class-coverage|redundant-method-coverage):v1:[0-9a-f]{64}\s*-->'
                     )
-                    $affirmativeCoverage = -not $isCoverage -or [regex]::IsMatch(
-                        [string]$comment.body,
-                        '(?i)^\s*(?:(?:please|kindly)\s+)?(?:add\s+(?:an?\s+)?)?exclude\s+from\s+code\s+coverage\s*[.!]?\s*$'
-                    )
+                    $affirmativeCoverage = if ($isRedundantMethod) {
+                        $text = [string]$comment.body
+                        $text -notmatch '(?i)\b(?:do\s+not|don''t|shouldn''t|keep|retain|must\s+not)\s+(?:remove|delete)\b' -and
+                        $text -notmatch '\?' -and
+                        $text -notmatch '(?i)\b(?:not|never|doesn''t|isn''t|aren''t)\s+(?:\w+\s+){0,3}(?:redundan\w*|unnecess\w*|cover\w*|exclu\w*)\b' -and
+                        $text -match '(?i)\bmethod(?:-level)?\b' -and
+                        $text -match '(?i)\b(?:class|class-level)\b' -and
+                        $text -match '(?i)\b(?:exclu\w*|cover\w*)\b' -and
+                        $text -match '(?i)\b(?:redundan\w*|unnecess\w*|no\s+need|no\s+effect|already|entire|whole)\b'
+                    }
+                    else {
+                        -not $isCoverage -or [regex]::IsMatch(
+                            [string]$comment.body,
+                            '(?i)^\s*(?:(?:please|kindly)\s+)?(?:add\s+(?:an?\s+)?)?exclude\s+from\s+code\s+coverage\s*[.!]?\s*$')
+                    }
                     if ($historicalNearAnchor) {
                         if (-not $containsReviewerMarker) {
                             [void]$historicalHuman.Add(
@@ -1883,7 +2015,8 @@ function Invoke-TestClassCoverageCapabilityResponse {
     param(
         [Parameter(Mandatory)][object]$Context,
         [Parameter(Mandatory)][string]$CapabilityDigest,
-        [Parameter(Mandatory)][DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits
+        [Parameter(Mandatory)][DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits,
+        [switch]$RedundantMethod
     )
 
     $binding = Get-OwnerV2Member -Value $Context -Name binding
@@ -1901,16 +2034,22 @@ function Invoke-TestClassCoverageCapabilityResponse {
     $files = @($units | Where-Object { [string]$_.unitId -like 'file:*' } |
         Sort-Object { [string]$_.unitId })
     $diagnostics = [Collections.Generic.List[object]]::new()
+    $capabilityId = if ($RedundantMethod) {
+        $script:RedundantMethodCoverageCapability
+    } else { $script:TestClassCoverageCapability }
+    $policyLeaf = if ($RedundantMethod) {
+        'Policy\redundant-method-coverage.v1.txt'
+    } else { 'Policy\test-class-coverage.v1.txt' }
     $policyText = [IO.File]::ReadAllText(
-        (Join-Path $PSScriptRoot 'Policy\test-class-coverage.v1.txt'),
+        (Join-Path $PSScriptRoot $policyLeaf),
         [Text.UTF8Encoding]::new($false))
     $policyDigest = Get-OwnerV2Digest -Value $policyText
     $controlsComplete = $identityUnits.Count -eq 1 -and $ruleUnits.Count -eq 1 -and
         [string]$identityUnits[0].state -ceq 'complete' -and
         [string]$ruleUnits[0].state -ceq 'complete' -and
-        [string]$identityUnits[0].data.capabilityId -ceq $script:TestClassCoverageCapability -and
+        [string]$identityUnits[0].data.capabilityId -ceq $capabilityId -and
         [string]$identityUnits[0].data.capabilityDigest -ceq $CapabilityDigest -and
-        [string]$ruleUnits[0].data.section -ceq $script:TestClassCoverageCapability -and
+        [string]$ruleUnits[0].data.section -ceq $capabilityId -and
         [string]$ruleUnits[0].data.hash -ceq $policyDigest -and
         [string]$ruleUnits[0].data.content -ceq $policyText -and
         $files.Count -le $Limits.MaximumFiles
@@ -1974,8 +2113,13 @@ function Invoke-TestClassCoverageCapabilityResponse {
         }
         $constructs = @()
         if ($path.EndsWith('.cs', [StringComparison]::OrdinalIgnoreCase)) {
-            $constructs = @(Get-TestClassCoverageConstructs -Content ([string]$data.content) `
-                -Spans $spans -Path $path)
+            $constructs = @(if ($RedundantMethod) {
+                Get-RedundantMethodCoverageConstructs -Content ([string]$data.content) `
+                    -Spans $spans -Path $path
+            } else {
+                Get-TestClassCoverageConstructs -Content ([string]$data.content) `
+                    -Spans $spans -Path $path
+            })
         }
         if ($count + $constructs.Count -gt $Limits.MaximumSemanticUnits) {
             Add-OwnerV2Diagnostic -Diagnostics $diagnostics -Limits $Limits `
@@ -2007,7 +2151,7 @@ function Invoke-TestClassCoverageCapabilityResponse {
             $material = [ordered]@{
                 bindingId = $bindingId
                 evidenceDigest = $evidenceDigest
-                capabilityId = $script:TestClassCoverageCapability
+                capabilityId = $capabilityId
                 capabilityDigest = $CapabilityDigest
                 ruleRef = $ruleRef
                 evidenceUnitId = $id
@@ -2019,59 +2163,86 @@ function Invoke-TestClassCoverageCapabilityResponse {
                 recognized = [bool]$construct.recognized
                 hasExclude = [bool]$construct.hasExclude
             }
+            if ($RedundantMethod) {
+                $material.affectedMethodCount = [int]$construct.affectedMethodCount
+                $material.affectedMethods = @($construct.affectedMethods)
+                $material.affectedAttributeLines = @($construct.affectedAttributeLines)
+            }
             $digest = (Get-OwnerV2Digest -Value $material).Substring(10)
             $constructRef = "construct:$digest"
-            $assessmentId = "class:n:$digest"
+            $assessmentId = $(if ($RedundantMethod) { "class-coverage:n:$digest" }
+                else { "class:n:$digest" })
             $resolved = [bool]$construct.recognized -and
                 -not [string]::IsNullOrWhiteSpace([string]$construct.name) -and
                 [int]$construct.declarationLine -ge 1
             $state = if (-not $resolved) { 'unknown' }
+            elseif ($RedundantMethod) {
+                if ([bool]$construct.hasExclude) { 'violation' }
+                else { 'compliant' }
+            }
             elseif ([bool]$construct.hasExclude) { 'compliant' }
             else { 'violation' }
             $finding = @()
             if ($state -ceq 'violation') {
+                $findingData = [ordered]@{
+                    disposition = 'violation'
+                    eligibility = $(if ($RedundantMethod) {
+                        'changed-mstest-class-method-exclusions'
+                    } else { 'changed-mstest-class' })
+                    capabilityId = $capabilityId
+                    bindingId = $bindingId
+                    evidenceDigest = $evidenceDigest
+                    ruleRef = $ruleRef
+                    constructRef = $constructRef
+                    groupRef = $assessmentId
+                    headCommit = [string]$identityUnits[0].data.sourceCommit
+                    anchor = [ordered]@{
+                        path = $path
+                        line = $(if ($RedundantMethod) { [int]$construct.startLine }
+                            else { [int]$construct.declarationLine })
+                        symbol = [string]$construct.name
+                    }
+                }
+                if ($RedundantMethod) {
+                    $findingData.affectedMethodCount = [int]$construct.affectedMethodCount
+                    $findingData.affectedMethods = @($construct.affectedMethods)
+                    $findingData.affectedAttributeLines = @($construct.affectedAttributeLines)
+                    $findingData.methodListTruncated = [bool]$construct.methodListTruncated
+                }
                 $finding = @([ordered]@{
-                        findingId = 'coverage-v2:' + (Get-OwnerV2Digest -Value ([ordered]@{
+                        findingId = $(if ($RedundantMethod) { 'redundant-coverage-v2:' }
+                            else { 'coverage-v2:' }) + (Get-OwnerV2Digest -Value ([ordered]@{
                                     bindingId = $bindingId
-                                    capabilityId = $script:TestClassCoverageCapability
+                                    capabilityId = $capabilityId
                                     ruleRef = $ruleRef
                                     constructRef = $constructRef
                                     disposition = 'violation'
                                 })).Substring(10)
-                        summary = 'Changed MSTest test class lacks a class-level coverage exclusion.'
-                        data = [ordered]@{
-                            disposition = 'violation'
-                            eligibility = 'changed-mstest-class'
-                            capabilityId = $script:TestClassCoverageCapability
-                            bindingId = $bindingId
-                            evidenceDigest = $evidenceDigest
-                            ruleRef = $ruleRef
-                            constructRef = $constructRef
-                            groupRef = $assessmentId
-                            headCommit = [string]$identityUnits[0].data.sourceCommit
-                            anchor = [ordered]@{
-                                path = $path
-                                line = [int]$construct.declarationLine
-                                symbol = [string]$construct.name
-                            }
-                        }
+                        summary = $(if ($RedundantMethod) {
+                            'Changed method-level exclusions are redundant across the containing MSTest class.'
+                        } else { 'Changed MSTest test class lacks a class-level coverage exclusion.' })
+                        data = $findingData
                     })
+            }
+            $outcomeData = if ($state -ceq 'violation') { $null } else {
+                [ordered]@{
+                    state = $state
+                    reason = [string]$construct.reason
+                    constructRef = $constructRef
+                    path = $path
+                    startLine = [int]$construct.startLine
+                    endLine = [int]$construct.endLine
+                    symbol = $(if ($resolved) { [string]$construct.name } else { 'unrecognized' })
+                }
+            }
+            if ($RedundantMethod -and $null -ne $outcomeData) {
+                $outcomeData.affectedMethodCount = [int]$construct.affectedMethodCount
             }
             [void]$assessments.Add([ordered]@{
                     assessmentId = $assessmentId
                     evidenceUnitIds = $evidenceIds
                     state = $(if ($state -ceq 'unknown') { 'unknown' } else { 'complete' })
-                    data = $(if ($state -ceq 'violation') { $null } else {
-                            [ordered]@{
-                                state = $state
-                                reason = [string]$construct.reason
-                                constructRef = $constructRef
-                                path = $path
-                                startLine = [int]$construct.startLine
-                                endLine = [int]$construct.endLine
-                                symbol = $(if ($resolved) { [string]$construct.name } else { 'unrecognized' })
-                            }
-                        })
+                    data = $outcomeData
                     findings = $finding
                 })
         }
@@ -2093,20 +2264,27 @@ function New-TestClassCoverageCapabilityAdapter {
     param(
         [Parameter(Mandatory)][string]$CapabilityId,
         [Parameter(Mandatory)][string]$CapabilityDigest,
-        [DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits = (New-OwnerV2CapabilityLimits)
+        [DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits = (New-OwnerV2CapabilityLimits),
+        [switch]$RedundantMethod
     )
-    if ($CapabilityId -cne $script:TestClassCoverageCapability -or
-        $CapabilityDigest -cne $script:TestClassCoverageDigest) {
+    $expectedId = if ($RedundantMethod) {
+        $script:RedundantMethodCoverageCapability
+    } else { $script:TestClassCoverageCapability }
+    $expectedDigest = if ($RedundantMethod) {
+        $script:RedundantMethodCoverageDigest
+    } else { $script:TestClassCoverageDigest }
+    if ($CapabilityId -cne $expectedId -or $CapabilityDigest -cne $expectedDigest) {
         throw 'Test-class coverage capability identity or digest is invalid.'
     }
     $capturedDigest = $CapabilityDigest
     $capturedLimits = $Limits
+    $capturedRedundantMethod = [bool]$RedundantMethod
     $command = Get-Command Invoke-TestClassCoverageCapabilityResponse -CommandType Function
     return New-OwnerPipelineAdapter -Stage capability `
         -Name 'test-class-coverage-v1-capability' -Handler {
         param($context)
         return & $command -Context $context -CapabilityDigest $capturedDigest `
-            -Limits $capturedLimits
+            -Limits $capturedLimits -RedundantMethod:$capturedRedundantMethod
     }.GetNewClosure()
 }
 
@@ -2143,11 +2321,14 @@ function ConvertTo-OwnerV2Observation {
     $identity = Get-OwnerV2Member -Value $identityUnit -Name data
     $rule = Get-OwnerV2Member -Value $ruleUnit -Name data
     $assessments = @(Get-OwnerV2Member -Value $validation -Name assessments)
-    $isCoverage = [string](Get-OwnerV2Member -Value $identity -Name capabilityId) -ceq
-        $script:TestClassCoverageCapability
+    $capabilityId = [string](Get-OwnerV2Member -Value $identity -Name capabilityId)
+    $isCoverage = $capabilityId -cin @(
+        $script:TestClassCoverageCapability, $script:RedundantMethodCoverageCapability)
     $methodAssessments = @($assessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like
-                $(if ($isCoverage) { 'class:*' } else { 'method:*' })
+                $(if ($capabilityId -ceq $script:RedundantMethodCoverageCapability) {
+                    'class-coverage:*'
+                } elseif ($isCoverage) { 'class:*' } else { 'method:*' })
         })
     $outcomeAssessments = @($assessments | Where-Object {
             $null -ne (Get-OwnerV2Member -Value $_ -Name data)
@@ -2196,7 +2377,7 @@ function ConvertTo-OwnerV2Observation {
             -EndLine ([int](Get-OwnerV2Member -Value $anchor -Name line)) `
             -Symbol ([string](Get-OwnerV2Member -Value $anchor -Name symbol)) `
             -ConstructIdentity $constructRef
-        [void]$normalizedFindings.Add([ordered]@{
+        $normalizedFinding = [ordered]@{
                 identity = [string](Get-OwnerV2Member -Value $finding -Name findingId)
                 semanticKey = Get-OwnerSemanticFindingKey `
                     -Subject $observationSubject -Rule $observationRule `
@@ -2212,7 +2393,14 @@ function ConvertTo-OwnerV2Observation {
                     symbol = [string](Get-OwnerV2Member -Value $anchor -Name symbol)
                 }
                 binding = $binding
-            })
+            }
+        if ($capabilityId -ceq $script:RedundantMethodCoverageCapability) {
+            $normalizedFinding.affectedMethodCount = [int]$data.affectedMethodCount
+            $normalizedFinding.affectedMethods = @($data.affectedMethods)
+            $normalizedFinding.affectedAttributeLines = @($data.affectedAttributeLines)
+            $normalizedFinding.methodListTruncated = [bool]$data.methodListTruncated
+        }
+        [void]$normalizedFindings.Add($normalizedFinding)
     }
     $normalizedOutcomes = [Collections.Generic.List[object]]::new()
     foreach ($assessment in $outcomeAssessments) {
@@ -2242,7 +2430,7 @@ function ConvertTo-OwnerV2Observation {
         else {
             'unknown'
         }
-        [void]$normalizedOutcomes.Add([ordered]@{
+        $normalizedOutcome = [ordered]@{
                 identity = 'owner-v2-outcome:' + (Get-OwnerV2Digest -Value ([ordered]@{
                             bindingId = [string](Get-OwnerV2Member -Value $validation -Name bindingId)
                             capabilityId = [string](Get-OwnerV2Member -Value $identity -Name capabilityId)
@@ -2260,7 +2448,11 @@ function ConvertTo-OwnerV2Observation {
                 constructRef = $constructRef
                 binding = $binding
                 writerEligible = $false
-            })
+            }
+        if ($capabilityId -ceq $script:RedundantMethodCoverageCapability) {
+            $normalizedOutcome.affectedMethodCount = [int]$outcome.affectedMethodCount
+        }
+        [void]$normalizedOutcomes.Add($normalizedOutcome)
     }
     $sortedFindings = @($normalizedFindings | Sort-Object identity)
     $sortedOutcomes = @($normalizedOutcomes | Sort-Object identity)
@@ -2450,8 +2642,10 @@ Export-ModuleMember -Function @(
     'ConvertTo-OwnerV2Observation',
     'Format-OwnerV1WriterComment',
     'Format-TestClassCoverageComment',
+    'Format-RedundantMethodCoverageComment',
     'Get-OwnerV1WriterMarkerKey',
     'Get-TestClassCoverageMarkerKey',
+    'Get-RedundantMethodCoverageMarkerKey',
     'New-OwnerSemanticRunner',
     'New-TestClassCoverageCapabilityAdapter',
     'New-OwnerV2CapabilityAdapter',

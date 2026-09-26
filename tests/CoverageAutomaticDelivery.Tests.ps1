@@ -12,8 +12,20 @@ BeforeAll {
     . (Join-Path $repoRoot 'src\Agents\reviewer\AutomaticOwnerV2Comments.ps1')
 
     function New-CoverageDeliveryContext {
-        param([ValidateRange(1, 9)][int]$Count = 1)
+        param(
+            [ValidateRange(1, 9)][int]$Count = 1,
+            [switch]$RedundantMethod
+        )
         $id = 'a' * 64
+        $capabilityId = if ($RedundantMethod) {
+            'bpm-redundant-method-coverage@1'
+        } else { 'bpm-test-class-coverage@1' }
+        $rulePath = if ($RedundantMethod) {
+            'src/DevPilot.OwnerCapability/Policy/redundant-method-coverage.v1.txt'
+        } else {
+            'src/DevPilot.OwnerCapability/Policy/test-class-coverage.v1.txt'
+        }
+        $line = if ($RedundantMethod) { 7 } else { 25 }
         $declaration = [ordered]@{
             mode = 'live'
             subject = [ordered]@{
@@ -28,14 +40,14 @@ BeforeAll {
             }
             rule = [ordered]@{
                 repositoryId = '33333333-3333-3333-3333-333333333333'
-                path = 'src/DevPilot.OwnerCapability/Policy/test-class-coverage.v1.txt'
+                path = $rulePath
                 commit = 'c' * 40
-                section = 'bpm-test-class-coverage@1'
+                section = $capabilityId
                 hash = 'v1:sha256:' + ('d' * 64)
                 length = 100
             }
             capability = [ordered]@{
-                id = 'bpm-test-class-coverage@1'
+                id = $capabilityId
                 digest = 'v1:sha256:' + ('e' * 64)
             }
             model = [ordered]@{
@@ -43,7 +55,9 @@ BeforeAll {
                 digest = 'v1:sha256:' + ('f' * 64)
             }
             config = [ordered]@{
-                id = 'coverage-v1-user-approved'
+                id = $(if ($RedundantMethod) {
+                        'redundant-method-coverage-v1-user-approved'
+                    } else { 'coverage-v1-user-approved' })
                 digest = 'v1:sha256:' + ('1' * 64)
             }
         }
@@ -68,15 +82,18 @@ BeforeAll {
                 -MaximumBytes 16777216 -MaximumReads 128)
         $findings = [Collections.Generic.List[object]]::new()
         for ($i = 1; $i -le $Count; $i++) {
-            $symbol = "MissingTests$i"
+            $symbol = if ($RedundantMethod) { "Tests$i" } else { "MissingTests$i" }
             $finding = [ordered]@{
-                identity = 'coverage-v2:' + $i.ToString('x').PadLeft(64, '0')
+                identity = $(if ($RedundantMethod) {
+                        'redundant-coverage-v2:'
+                    } else { 'coverage-v2:' }) +
+                    $i.ToString('x').PadLeft(64, '0')
                 semanticKey = 'v1:sha256:' + ('4' * 64)
                 disposition = 'violation'
                 constructRef = 'construct:' + $i.ToString('x').PadLeft(64, '0')
                 anchor = [ordered]@{
                     path = "tests/$symbol.cs"
-                    line = 25
+                    line = $line
                     symbol = $symbol
                 }
                 binding = [ordered]@{
@@ -84,18 +101,34 @@ BeforeAll {
                     source = [ordered]@{
                         representation = [ordered]@{
                             path = "tests/$symbol.cs"
-                            startLine = 25
-                            endLine = 25
+                            startLine = $line
+                            endLine = $line
                             symbol = $symbol
                             constructIdentity = 'construct:' + $i.ToString('x').PadLeft(64, '0')
                         }
                     }
                 }
             }
-            $marker = Get-TestClassCoverageMarkerKey `
-                -Contract $contract -Finding $finding
-            $body = Format-TestClassCoverageComment `
-                -Contract $contract -Finding $finding -MarkerKey $marker
+            if ($RedundantMethod) {
+                $finding['affectedMethods'] = @("Check$i")
+                $finding['affectedAttributeLines'] = @($line)
+                $finding['affectedMethodCount'] = 1
+                $finding['methodListTruncated'] = $false
+            }
+            $marker = if ($RedundantMethod) {
+                Get-RedundantMethodCoverageMarkerKey `
+                    -Contract $contract -Finding $finding
+            } else {
+                Get-TestClassCoverageMarkerKey `
+                    -Contract $contract -Finding $finding
+            }
+            $body = if ($RedundantMethod) {
+                Format-RedundantMethodCoverageComment `
+                    -Contract $contract -Finding $finding -MarkerKey $marker
+            } else {
+                Format-TestClassCoverageComment `
+                    -Contract $contract -Finding $finding -MarkerKey $marker
+            }
             $finding['providerMarker'] = [ordered]@{
                 integrity = 'verified'
                 sha256 = Get-ApprovedOwnerV2TextSha256 $marker
@@ -108,7 +141,7 @@ BeforeAll {
             [void]$findings.Add($finding)
         }
         $observation = [ordered]@{
-            capability = 'bpm-test-class-coverage@1'
+            capability = $capabilityId
             rule = [ordered]@{
                 section = $declaration.rule.section
                 path = $declaration.rule.path
@@ -183,12 +216,18 @@ BeforeAll {
             }
         }
         $deliveryRoot = Join-Path $root 'delivery'
+        if ($RedundantMethod) {
+            $deliveryRoot = Join-Path $deliveryRoot `
+                'redundant-method-coverage-v1'
+        }
         foreach ($leaf in @('intents', 'outcomes', 'events', 'locks')) {
             New-Item -ItemType Directory `
                 -Path (Join-Path $deliveryRoot $leaf) -Force | Out-Null
         }
         $policy = New-AutomaticOwnerV2ServicePolicy -Evidence $evidence `
-            -PolicyId coverage-v2-production
+            -PolicyId $(if ($RedundantMethod) {
+                    'redundant-coverage-v2-production'
+                } else { 'coverage-v2-production' })
         return [pscustomobject]@{
             Evidence = $evidence
             Policy = $policy
@@ -203,6 +242,11 @@ BeforeAll {
             [switch]$ForeignReviewer,
             [switch]$StaleAnchor,
             [switch]$StaleHead,
+            [switch]$StaleTarget,
+            [switch]$Draft,
+            [switch]$StaleIteration,
+            [switch]$StaleDiscussion,
+            [switch]$IncludeAllMethodAnchors,
             [switch]$Unconfirmed
         )
         $state = [ordered]@{
@@ -248,11 +292,12 @@ BeforeAll {
             }
             $snapshot = [DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]::new(
                 'complete', 'unknown', 1, @($state.threads).Count,
-                @($state.threads).Count, 0, "v1:sha256:$($state.digest)",
+                @($state.threads).Count, 0,
+                "v1:sha256:$(if ($StaleDiscussion) { 'b' * 64 } else { $state.digest })",
                 [string[]]@('v1:sha256:' + ('f' * 64)),
                 [object[]]@($state.threads))
             $snapshot | Add-Member -NotePropertyName CurrentIterationId `
-                -NotePropertyValue 2
+                -NotePropertyValue $(if ($StaleIteration) { 3 } else { 2 })
             $snapshot | Add-Member -NotePropertyName RawProvenanceDigests `
                 -NotePropertyValue ([string[]]@('v1:sha256:' + ('c' * 64)))
             $snapshot | Add-Member -NotePropertyName MappingDigest `
@@ -264,13 +309,15 @@ BeforeAll {
                 PullRequest = [ordered]@{
                     pullRequestId = 42
                     status = 'active'
-                    isDraft = $false
+                    isDraft = [bool]$Draft
                     repositoryId = $Evidence.Declaration.subject.repositoryId
                     projectId = $Evidence.Declaration.subject.projectId
                     sourceCommit = $(if ($StaleHead) { 'e' * 40 } else {
                             $Evidence.Declaration.head.sourceCommit
                         })
-                    targetCommit = $Evidence.Declaration.target.targetCommit
+                    targetCommit = $(if ($StaleTarget) { 'f' * 40 } else {
+                            $Evidence.Declaration.target.targetCommit
+                        })
                     targetRef = $Evidence.Declaration.target.targetRef
                 }
                 Reviewer = [ordered]@{
@@ -281,15 +328,26 @@ BeforeAll {
                     uniqueName = $Evidence.Provider.reviewerIdentity.uniqueName
                 }
                 Snapshot = $snapshot
-                Anchors = @($Arguments.selections | ForEach-Object {
+                Anchors = @(foreach ($selection in @($Arguments.selections)) {
+                    $lines = if ($IncludeAllMethodAnchors -and
+                        $selection -is [Collections.IDictionary] -and
+                        $selection.Contains('affectedAttributeLines')) {
+                        @($selection.affectedAttributeLines)
+                    } else { @($selection.line) }
+                    foreach ($line in $lines) {
                         [ordered]@{
-                            path = $_.path
-                            startLine = $(if ($StaleAnchor) { 26 } else { 25 })
-                            endLine = $(if ($StaleAnchor) { 26 } else { 25 })
+                            path = $selection.path
+                            startLine = $(if ($StaleAnchor) {
+                                    [int]$line + 1
+                                } else { [int]$line })
+                            endLine = $(if ($StaleAnchor) {
+                                    [int]$line + 1
+                                } else { [int]$line })
                             changeTrackingId = 7
                             iterationId = 2
                         }
-                    })
+                    }
+                })
             }
         }.GetNewClosure()
         return [pscustomobject]@{ Handler = $handler; State = $state }
@@ -1106,6 +1164,573 @@ Describe 'Independent automatic class coverage delivery' {
 
     It 'blocks blind retry after an unconfirmed create' {
         $context = New-CoverageDeliveryContext
+        $provider = New-CoverageDeliveryProvider `
+            -Evidence $context.Evidence -Unconfirmed
+        $first = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $second = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $first.events[0].outcome | Should -BeExactly ambiguous-post-write
+        $second.health | Should -BeExactly refused
+        $provider.State.writes | Should -Be 1
+    }
+}
+
+Describe 'Independent redundant method coverage automatic delivery' {
+    It 'keeps the new switch off independently and produces zero local or provider writes when absent' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $state = Write-CoverageDeliveryState -Context $context
+        $delivery = Join-Path $script:coverageTestRoot (
+            'unused-delivery-' + [guid]::NewGuid().ToString('N'))
+        $tool = Join-Path $repoRoot 'tools\Invoke-AutomaticOwnerV2Delivery.ps1'
+        $output = @(& (Get-Command pwsh).Source -NoProfile -File $tool `
+                invoke -Delivery redundant-coverage -DeliveryRoot $delivery `
+                -StateRoot $state.StateRoot -Identity $context.Evidence.Identity `
+                -ToolkitConfigPath $state.ConfigPath -RepoRoot $repoRoot 2>&1)
+        $LASTEXITCODE | Should -Be 0
+        ($output -join "`n") | Should -Match 'disabled'
+        Test-Path -LiteralPath $delivery | Should -BeFalse
+        (Get-AutomaticOwnerV2Configuration -ToolkitConfig ([ordered]@{
+                    autoCreateCoverageComments = $true
+                    autoCreateOwnerComments = $true
+                }) -Delivery redundant-coverage).Enabled | Should -BeFalse
+        {
+            Get-AutomaticOwnerV2Configuration -ToolkitConfig ([ordered]@{
+                    autoCreateRedundantMethodCoverageComments = $true
+                }) -Delivery redundant-coverage
+        } | Should -Throw '*signed policy*'
+    }
+
+    It 'isolates the private key, policy root, and signed rule authority' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $class = New-CoverageDeliveryContext
+        $base = Join-Path $script:coverageTestRoot (
+            'service-' + [guid]::NewGuid().ToString('N'))
+        $boundary = Join-Path $script:coverageTestRoot (
+            'boundary-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $boundary | Out-Null
+        $methodRoot = Initialize-AutomaticOwnerV2DeliveryRoot `
+            -DeliveryRoot $base -RepoRoot $boundary `
+            -Delivery redundant-coverage
+        $ownerRoot = Initialize-AutomaticOwnerV2DeliveryRoot `
+            -DeliveryRoot $base -RepoRoot $boundary
+        $methodRoot.Root | Should -Not -BeExactly $ownerRoot.Root
+        $methodRoot.KeyPath | Should -Not -BeExactly $ownerRoot.KeyPath
+        $methodKey = Get-AutomaticOwnerV2ServiceKey `
+            -DeliveryRoot $methodRoot.Root -Delivery redundant-coverage
+        $ownerKey = Get-AutomaticOwnerV2ServiceKey `
+            -DeliveryRoot $ownerRoot.Root
+        [Convert]::ToHexString($methodKey) |
+            Should -Not -BeExactly ([Convert]::ToHexString($ownerKey))
+        $policyPath = Join-Path $methodRoot.Root `
+            'policies\redundant-coverage-v2-production.json'
+        [void](Write-AutomaticOwnerV2ServicePolicy -Path $policyPath `
+                -Policy $context.Policy -Key $methodKey)
+        $signed = Read-ApprovedOwnerV2SignedRecord -Path $policyPath `
+            -Key $methodKey
+        $signed.kind | Should -BeExactly `
+            redundant-coverage-v2-service-authorization-policy
+        $signed.authority.construct | Should -BeExactly `
+            changed-mstest-class-method-exclusions
+        $signed.rule.path | Should -BeExactly `
+            'src/DevPilot.OwnerCapability/Policy/redundant-method-coverage.v1.txt'
+        {
+            Read-ApprovedOwnerV2SignedRecord -Path $policyPath -Key $ownerKey
+        } | Should -Throw
+        {
+            Assert-AutomaticOwnerV2ServicePolicy `
+                -Evidence $context.Evidence -Policy $class.Policy
+        } | Should -Throw
+        {
+            Assert-AutomaticOwnerV2ServicePolicy `
+                -Evidence $class.Evidence -Policy $signed
+        } | Should -Throw
+        $context.Policy.authority.updates = $true
+        {
+            Assert-AutomaticOwnerV2ServicePolicy `
+                -Evidence $context.Evidence -Policy $context.Policy
+        } | Should -Throw '*create-only*'
+    }
+
+    It 'reads only the redundant capability, policy path, and model-free completed state' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $state = Write-CoverageDeliveryState -Context $context
+        $loaded = Read-AutomaticRedundantCoverageEvidence `
+            -StateRoot $state.StateRoot -Identity $context.Evidence.Identity `
+            -RepoRoot $repoRoot -ToolkitConfigPath $state.ConfigPath
+        $proposal = Get-ApprovedOwnerV2Proposal -Evidence $loaded `
+            -Finding $loaded.Observation.findings[0] `
+            -Delivery redundant-coverage
+        $proposal.symbol | Should -BeExactly 'Tests1'
+        $proposal.line | Should -Be 7
+        $proposal.markerComment | Should -Match `
+            'devpilot-redundant-method-coverage:v1'
+        {
+            Read-ApprovedOwnerV2Evidence -StateRoot $state.StateRoot `
+                -Identity $context.Evidence.Identity -RepoRoot $repoRoot `
+                -ToolkitConfigPath $state.ConfigPath -Delivery coverage
+        } | Should -Throw
+        {
+            New-ApprovedOwnerV2ReviewPackage -Evidence $loaded
+        } | Should -Throw
+        $loaded.Observation.findings[0].identity = 'coverage-v2:' + ('1' * 64)
+        $loaded.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $loaded.Observation
+        {
+            Get-ApprovedOwnerV2Proposal -Evidence $loaded `
+                -Finding $loaded.Observation.findings[0] `
+                -Delivery redundant-coverage
+        } | Should -Throw
+    }
+
+    It 'refuses an incoherent <Case> class-level method list before provider reads' `
+        -TestCases @(
+            @{ Case = 'truncation-flag' }
+            @{ Case = 'count-mismatch' }
+            @{ Case = 'duplicate-names' }
+            @{ Case = 'invalid-name' }
+            @{ Case = 'line-mismatch' }
+            @{ Case = 'duplicate-lines' }
+            @{ Case = 'unsorted-lines' }
+            @{ Case = 'missing-list' }
+        ) {
+        param($Case)
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $finding = $context.Evidence.Observation.findings[0]
+        switch ($Case) {
+            truncation-flag { $finding.methodListTruncated = $true }
+            count-mismatch { $finding.affectedMethodCount = 2 }
+            duplicate-names {
+                $finding.affectedMethodCount = 2
+                $finding.affectedMethods = @('Check1', 'Check1')
+                $finding.affectedAttributeLines = @(7, 11)
+                $finding.methodListTruncated = $false
+            }
+            invalid-name { $finding.affectedMethods = @('Check.1') }
+            line-mismatch { $finding.affectedAttributeLines = @(11) }
+            duplicate-lines {
+                $finding.affectedMethodCount = 2
+                $finding.affectedMethods = @('Check1', 'Check2')
+                $finding.affectedAttributeLines = @(7, 7)
+            }
+            unsorted-lines {
+                $finding.affectedMethodCount = 2
+                $finding.affectedMethods = @('Check1', 'Check2')
+                $finding.affectedAttributeLines = @(7, 6)
+            }
+            missing-list { [void]$finding.Remove('affectedMethods') }
+        }
+        $context.Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $context.Evidence.Observation
+        {
+            Get-ApprovedOwnerV2Proposal -Evidence $context.Evidence `
+                -Finding $finding -Delivery redundant-coverage
+        } | Should -Throw '*group*'
+        $provider = New-CoverageDeliveryProvider -Evidence $context.Evidence
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $result.health | Should -BeExactly refused
+        $provider.State.operations.Count | Should -Be 0
+    }
+
+    It 'accepts a qualified class symbol while binding the exact first attribute line' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $finding = $context.Evidence.Observation.findings[0]
+        $finding.anchor.symbol = 'Company.Tests1'
+        $finding.binding.source.representation.symbol = 'Company.Tests1'
+        $marker = Get-RedundantMethodCoverageMarkerKey `
+            -Contract $context.Evidence.Contract -Finding $finding
+        $body = Format-RedundantMethodCoverageComment `
+            -Contract $context.Evidence.Contract -Finding $finding `
+            -MarkerKey $marker
+        $finding.providerMarker.sha256 = Get-ApprovedOwnerV2TextSha256 $marker
+        $finding.reconciliation.bodySha256 = Get-ApprovedOwnerV2TextSha256 $body
+        $context.Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $context.Evidence.Observation
+        $proposal = Get-ApprovedOwnerV2Proposal `
+            -Evidence $context.Evidence -Finding $finding `
+            -Delivery redundant-coverage
+        $proposal.symbol | Should -BeExactly 'Company.Tests1'
+        $proposal.line | Should -Be 7
+        $proposal.affectedMethods | Should -Be @('Check1')
+    }
+
+    It 'requires every grouped method attribute line to remain changed and current' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $finding = $context.Evidence.Observation.findings[0]
+        $finding.affectedMethodCount = 2
+        $finding.affectedMethods = @('Check1', 'Check2')
+        $finding.affectedAttributeLines = @(7, 11)
+        $marker = Get-RedundantMethodCoverageMarkerKey `
+            -Contract $context.Evidence.Contract -Finding $finding
+        $body = Format-RedundantMethodCoverageComment `
+            -Contract $context.Evidence.Contract -Finding $finding `
+            -MarkerKey $marker
+        $finding.reconciliation.bodySha256 = Get-ApprovedOwnerV2TextSha256 $body
+        $context.Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $context.Evidence.Observation
+        $proposal = (New-AutomaticCoverageReviewPackage `
+                -Evidence $context.Evidence).proposals[0]
+        $proposal.symbol | Should -BeExactly Tests1
+        $proposal.affectedMethodCount | Should -Be 2
+        $proposal.affectedAttributeLines | Should -Be @(7, 11)
+        $proposal.body | Should -Match 'Check1'
+        $proposal.body | Should -Match 'Check2'
+        $missingLine = New-CoverageDeliveryProvider -Evidence $context.Evidence
+        $refused = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $missingLine.Handler
+        $refused.health | Should -BeExactly refused
+        $missingLine.State.writes | Should -Be 0
+        $complete = New-CoverageDeliveryProvider `
+            -Evidence $context.Evidence -IncludeAllMethodAnchors
+        $created = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $complete.Handler
+        $created.health | Should -BeExactly healthy
+        $created.providerWrites | Should -Be 1
+    }
+
+    It 'delivers one bounded class comment for 22 changed method attributes' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $finding = $context.Evidence.Observation.findings[0]
+        $finding.affectedMethodCount = 22
+        $finding.affectedMethods = @(1..12 | ForEach-Object { "Check$_" })
+        $finding.affectedAttributeLines = @(7..28)
+        $finding.methodListTruncated = $true
+        $marker = Get-RedundantMethodCoverageMarkerKey `
+            -Contract $context.Evidence.Contract -Finding $finding
+        $body = Format-RedundantMethodCoverageComment `
+            -Contract $context.Evidence.Contract -Finding $finding `
+            -MarkerKey $marker
+        $finding.reconciliation.bodySha256 = Get-ApprovedOwnerV2TextSha256 $body
+        $context.Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $context.Evidence.Observation
+        $provider = New-CoverageDeliveryProvider `
+            -Evidence $context.Evidence -IncludeAllMethodAnchors
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $result.health | Should -BeExactly healthy
+        $result.providerWrites | Should -Be 1
+        $provider.State.writes | Should -Be 1
+        $result.events.Count | Should -Be 1
+        $result.events[0].finding.symbol | Should -BeExactly Tests1
+        $result.events[0].finding.line | Should -Be 7
+        $provider.State.threads[0].comments[0].body |
+            Should -Match '22 changed method-level'
+    }
+
+    It 'honors an unmarked plural human thread on a later method line for the whole class' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $finding = $context.Evidence.Observation.findings[0]
+        $finding.affectedMethodCount = 2
+        $finding.affectedMethods = @('Check1', 'Check2')
+        $finding.affectedAttributeLines = @(7, 36)
+        $marker = Get-RedundantMethodCoverageMarkerKey `
+            -Contract $context.Evidence.Contract -Finding $finding
+        $finding.reconciliation.bodySha256 = Get-ApprovedOwnerV2TextSha256 (
+            Format-RedundantMethodCoverageComment `
+                -Contract $context.Evidence.Contract -Finding $finding `
+                -MarkerKey $marker)
+        $context.Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $context.Evidence.Observation
+        $proposal = (New-AutomaticCoverageReviewPackage `
+                -Evidence $context.Evidence).proposals[0]
+        $proposal.line | Should -Be 7
+        $proposal.symbol | Should -BeExactly Tests1
+        $proposal.affectedMethodCount | Should -Be 2
+        $provider = New-CoverageDeliveryProvider `
+            -Evidence $context.Evidence -IncludeAllMethodAnchors
+        $provider.State.threads = @([ordered]@{
+                threadId = 1001
+                status = 'active'
+                isDeleted = $false
+                isOutdated = $false
+                sourceCommit = $context.Evidence.Declaration.head.sourceCommit
+                contextState = 'current'
+                anchor = [ordered]@{
+                    path = $proposal.path
+                    line = 36
+                }
+                comments = @([ordered]@{
+                        commentId = 1002
+                        commentType = 'text'
+                        isDeleted = $false
+                        reviewerOwned = $false
+                        reviewerIdentityState = 'notMatched'
+                        body = 'Please remove these redundant method-level coverage ' +
+                            'exclusions; the whole class is already excluded.'
+                    })
+            })
+        Update-CoverageDeliveryObservation -Context $context -Provider $provider
+        @($context.Evidence.Observation.findings).Count | Should -Be 1
+        $finding.reconciliation.classification | Should -BeExactly humanCovered
+        $covered = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $covered.health | Should -BeExactly refused
+        $provider.State.writes | Should -Be 0
+        $provider.State.operations | Should -Not -Contain CreateThread
+
+        $provider.State.threads[0].comments[0].body =
+            'Should we keep these method exclusions? Class coverage is unclear.'
+        Update-CoverageDeliveryObservation -Context $context -Provider $provider
+        $finding.reconciliation.classification | Should -BeExactly unknown
+        $finding.reconciliation.reason | Should -BeExactly `
+            matching-human-review-ambiguous
+        $ambiguous = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $ambiguous.health | Should -BeExactly refused
+        $provider.State.writes | Should -Be 0
+    }
+
+    It 'creates only an exact changed method attribute and persists isolated signed artifacts' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $provider = New-CoverageDeliveryProvider -Evidence $context.Evidence
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $result.health | Should -BeExactly healthy
+        $result.providerWrites | Should -Be 1
+        $result.kind | Should -BeExactly `
+            redundant-coverage-v2-automatic-delivery-result
+        $provider.State.operations | Should -Be @(
+            'ReadCurrent', 'ReadCurrent', 'CreateThread', 'ReadCurrent')
+        $result.events[0].finding.symbol | Should -BeExactly 'Tests1'
+        $result.events[0].kind | Should -BeExactly `
+            redundant-coverage-v2-delivery-event
+        $intent = Read-ApprovedOwnerV2SignedRecord `
+            -Path $result.intentPath -Key $context.Key
+        $intent.kind | Should -BeExactly `
+            redundant-coverage-v2-service-create-intent
+        (Read-ApprovedOwnerV2SignedRecord -Path $result.outcomePath `
+                -Key $context.Key).kind | Should -BeExactly `
+            redundant-coverage-v2-service-create-outcome
+        $eventPath = Join-Path $context.Root (
+            "events\$($result.events[0].eventId).json")
+        (Read-ApprovedOwnerV2SignedRecord -Path $eventPath `
+                -Key $context.Key).ruleId | Should -BeExactly `
+            bpm-redundant-method-coverage@1
+        Update-CoverageDeliveryObservation -Context $context -Provider $provider
+        $again = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $again.providerWrites | Should -Be 0
+        $again.health | Should -BeExactly healthy
+        $context.Evidence.Observation.findings[0].reconciliation.classification |
+            Should -BeExactly noOp
+        $provider.State.writes | Should -Be 1
+    }
+
+    It 'refuses <Drift> PR/discussion/line or cross-rule marker before any create' `
+        -TestCases @(
+            @{ Drift = 'anchor' }
+            @{ Drift = 'head' }
+            @{ Drift = 'target' }
+            @{ Drift = 'draft' }
+            @{ Drift = 'iteration' }
+            @{ Drift = 'discussion' }
+            @{ Drift = 'foreign-marker' }
+        ) {
+        param($Drift)
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $provider = New-CoverageDeliveryProvider `
+            -Evidence $context.Evidence `
+            -StaleAnchor:($Drift -ceq 'anchor') `
+            -StaleHead:($Drift -ceq 'head') `
+            -StaleTarget:($Drift -ceq 'target') `
+            -Draft:($Drift -ceq 'draft') `
+            -StaleIteration:($Drift -ceq 'iteration') `
+            -StaleDiscussion:($Drift -ceq 'discussion')
+        if ($Drift -ceq 'foreign-marker') {
+            $provider.State.threads = @([ordered]@{
+                    threadId = 20
+                    status = 'active'
+                    isDeleted = $false
+                    isOutdated = $false
+                    sourceCommit = $context.Evidence.Declaration.head.sourceCommit
+                    contextState = 'current'
+                    anchor = [ordered]@{
+                        path = 'tests/Tests1.cs'
+                        line = 7
+                    }
+                    comments = @([ordered]@{
+                            commentId = 21
+                            commentType = 'text'
+                            isDeleted = $false
+                            reviewerOwned = $true
+                            reviewerIdentityState = 'matched'
+                            body = '<!-- devpilot-test-class-coverage:v1:' +
+                                ('a' * 64) + ' -->'
+                        })
+                })
+        }
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $result.health | Should -BeExactly refused
+        $result.diagnostic.code | Should -BeExactly live-preflight-refused
+        $provider.State.writes | Should -Be 0
+    }
+
+    It 'refuses current human coverage and preserves historical human review without writes' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $context.Evidence.Observation.findings[0].reconciliation.classification =
+            'humanCovered'
+        $context.Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $context.Evidence.Observation
+        $provider = New-CoverageDeliveryProvider -Evidence $context.Evidence
+        $current = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $current.health | Should -BeExactly refused
+        $provider.State.operations.Count | Should -Be 0
+
+        $finding = $context.Evidence.Observation.findings[0]
+        $finding.providerMarker.integrity = 'invalid'
+        $finding.reconciliation.classification = 'unknown'
+        $finding.reconciliation.reason = 'historical-human-review-needs-review'
+        $context.Evidence.Observation.counts.unknown = 0
+        $finding.reconciliation.thread = [ordered]@{
+            availability = 'available'
+            threadId = 1001
+            commentId = 1002
+            status = 'closed'
+        }
+        $context.Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $context.Evidence.Observation
+        $historical = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $historical.health | Should -BeExactly refused
+        $historical.providerWrites | Should -Be 0
+        $historical.events.Count | Should -Be 1
+        $historical.events[0].outcome | Should -BeExactly refused
+        $historical.events[0].diagnostic.code | Should -BeExactly `
+            historical-human-review-needs-review
+        $provider.State.operations.Count | Should -Be 0
+    }
+
+    It 'reconciles actual current versus historical method discussions without creating' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $provider = New-CoverageDeliveryProvider -Evidence $context.Evidence
+        $selection = (New-AutomaticCoverageReviewPackage `
+                -Evidence $context.Evidence).proposals[0]
+        $provider.State.threads = @([ordered]@{
+                threadId = 1001
+                status = 'active'
+                isDeleted = $false
+                isOutdated = $false
+                sourceCommit = $context.Evidence.Declaration.head.sourceCommit
+                contextState = 'current'
+                anchor = [ordered]@{
+                    path = $selection.path
+                    line = $selection.line
+                }
+                comments = @([ordered]@{
+                        commentId = 1002
+                        commentType = 'text'
+                        isDeleted = $false
+                        reviewerOwned = $true
+                        reviewerIdentityState = 'matched'
+                        body = 'The method-level coverage exclusion is redundant ' +
+                            'because the class-level exclusion already covers it.'
+                    })
+            })
+        Update-CoverageDeliveryObservation -Context $context -Provider $provider
+        $context.Evidence.Observation.findings[0].reconciliation.classification |
+            Should -BeExactly humanCovered
+        $current = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $current.health | Should -BeExactly refused
+        $provider.State.writes | Should -Be 0
+
+        $provider.State.threads[0].isOutdated = $true
+        $provider.State.threads[0].status = 'closed'
+        $provider.State.threads[0].contextState = 'outdated'
+        Update-CoverageDeliveryObservation -Context $context -Provider $provider
+        $context.Evidence.Observation.findings[0].reconciliation.classification |
+            Should -BeExactly unknown
+        $context.Evidence.Observation.counts.unknown | Should -Be 0
+        $context.Evidence.Observation.effects.dedupe.unknown | Should -Be 1
+        $historical = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $historical.health | Should -BeExactly refused
+        $historical.providerWrites | Should -Be 0
+        $historical.events[0].diagnostic.code | Should -BeExactly `
+            historical-human-review-needs-review
+        $provider.State.writes | Should -Be 0
+    }
+
+    It 'enforces independent method per-run and per-PR ceilings' {
+        $context = New-CoverageDeliveryContext -Count 2 -RedundantMethod
+        $context.Policy = New-AutomaticOwnerV2ServicePolicy `
+            -Evidence $context.Evidence `
+            -PolicyId redundant-coverage-v2-production `
+            -MaxCreatesPerRun 1 -MaxCreatesPerPullRequest 1
+        $provider = New-CoverageDeliveryProvider -Evidence $context.Evidence
+        $first = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        Update-CoverageDeliveryObservation -Context $context -Provider $provider
+        $second = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $first.providerWrites | Should -Be 1
+        $second.health | Should -BeExactly refused
+        $second.providerWrites | Should -Be 0
+        $provider.State.writes | Should -Be 1
+    }
+
+    It 'recovers an interrupted method intent without a second create' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
+        $provider = New-CoverageDeliveryProvider -Evidence $context.Evidence
+        $first = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $first.providerWrites | Should -Be 1
+        Remove-Item -LiteralPath $first.outcomePath
+        $recovered = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+        $recovered.providerWrites | Should -Be 0
+        $provider.State.writes | Should -Be 1
+        @($recovered.events | Where-Object {
+                $_.outcome -ceq 'recovered-confirmed'
+            }).Count | Should -Be 1
+        (Read-ApprovedOwnerV2SignedRecord -Path $first.outcomePath `
+                -Key $context.Key).kind | Should -BeExactly `
+            redundant-coverage-v2-service-create-outcome
+    }
+
+    It 'blocks blind retry when method comment readback is unconfirmed' {
+        $context = New-CoverageDeliveryContext -RedundantMethod
         $provider = New-CoverageDeliveryProvider `
             -Evidence $context.Evidence -Unconfirmed
         $first = Invoke-AutomaticOwnerV2Comments `

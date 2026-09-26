@@ -116,6 +116,10 @@ export interface RunSummary {
 
 export interface FindingSummary {
   id: string;
+  stateIdentity?: string;
+  affectedMethodCount?: number;
+  affectedMethods?: string[];
+  methodListTruncated?: boolean;
   capability: string;
   pullRequestId: number;
   rule: string;
@@ -148,6 +152,7 @@ export interface RelationSummary {
 
 export interface DeliverySummary {
   id: string;
+  stateIdentity?: string;
   mode: DeliveryMode;
   capabilityId: string;
   action: string;
@@ -892,8 +897,9 @@ function parseCompositeScheduledRun(raw: JsonRecord): RunSummary {
   const reconciliation = asRecord(operatorOutput.reconciliation);
   const delivery = asRecord(raw.ownerAutoDelivery);
   const coverage = delivery.kind === "coverage-v2-automatic-delivery-result";
+  const redundant = delivery.kind === "redundant-coverage-v2-automatic-delivery-result";
   if (delivery.schemaVersion !== 1 ||
-    (!coverage && delivery.kind !== "owner-v2-automatic-delivery-result")) {
+    (!coverage && !redundant && delivery.kind !== "owner-v2-automatic-delivery-result")) {
     throw new Error("scheduled run automatic delivery result is unsupported");
   }
   const overallOutcome = boundedText(raw.overallOutcome, 40);
@@ -934,7 +940,8 @@ function parseCompositeScheduledRun(raw: JsonRecord): RunSummary {
     providerWrites: requiredCount(delivery.providerWrites, "ownerAutoDelivery.providerWrites"),
     modelWrites: requiredCount(delivery.modelWrites, "ownerAutoDelivery.modelWrites"),
     deliveryOutcome: deliveryHealth,
-    ...(coverage ? { deliveryCapabilityId: "bpm-test-class-coverage@1" } : {}),
+    ...(coverage ? { deliveryCapabilityId: "bpm-test-class-coverage@1" } :
+      redundant ? { deliveryCapabilityId: "bpm-redundant-method-coverage@1" } : {}),
     toolkitHead, toolkitTree,
     ownerStateIdentities: owner.identities,
     relationStateIdentities: relation.identities,
@@ -1096,6 +1103,30 @@ function findingAnchor(finding: JsonRecord): { path: string; line: number; symbo
   };
 }
 
+function redundantClassSummary(finding: JsonRecord): {
+  affectedMethodCount: number; affectedMethods: string[]; methodListTruncated: boolean;
+} | null {
+  const count = finding.affectedMethodCount;
+  const names = finding.affectedMethods;
+  const lines = finding.affectedAttributeLines;
+  const firstLine = findingAnchor(finding).line;
+  if (!Number.isSafeInteger(count) || (count as number) < 1 || (count as number) > 256 ||
+    !Array.isArray(names) || names.length < 1 || names.length > 12 ||
+    names.length > (count as number) ||
+    !names.every((name) => typeof name === "string" && name.length <= 128 &&
+      /^[\p{L}_][\p{L}\p{N}_]*$/u.test(name)) ||
+    new Set(names).size !== names.length ||
+    !Array.isArray(lines) || lines.length !== count ||
+    !lines.every((line, index) => Number.isSafeInteger(line) && line > 0 &&
+      (index === 0 ? line === firstLine : line > lines[index - 1])) ||
+    typeof finding.methodListTruncated !== "boolean") return null;
+  return {
+    affectedMethodCount: count as number,
+    affectedMethods: names as string[],
+    methodListTruncated: finding.methodListTruncated,
+  };
+}
+
 function observationTimestamp(state: StateObservation): string {
   return normalizeTimestamp(state.record?.updatedUtc ?? state.observation.updatedUtc ??
     asRecord(state.observation.lifecycle).completedUtc) ?? "";
@@ -1231,11 +1262,29 @@ function projectState(
     const ruleFindingsBound = items.every((item) => !relationRule || item.data === undefined ||
       (boundedText(asRecord(item.data).capabilityId, 160) === capability &&
         boundedText(asRecord(item.data).ruleId, 160) === ruleIdentity));
+    if (kind === "owner-observation" && capability === "bpm-redundant-method-coverage@1" &&
+      (boundedText(rule.id ?? rule.section, 160) !== capability ||
+        items.some((item) =>
+          !/^redundant-coverage-v2:[0-9a-f]{64}$/.test(
+            boundedText(item.identity ?? item.findingId, 160)) ||
+          !redundantClassSummary(item)) ||
+        new Set(items.map((item) => {
+          const anchor = findingAnchor(item);
+          return `${anchor.path}\n${anchor.symbol}`;
+        })).size !== items.length)) {
+      failures.push({
+        id: `rule-binding:${state.identity}`, category: "drift",
+        occurredUtc: updatedUtc, health: "degraded", pullRequestId, runId: "",
+        message: "Redundant method coverage observation has a foreign rule or finding identity.",
+      });
+      continue;
+    }
     if (resolvedSubject.diagnostic === "" && recordState === "completed" &&
         boundedText(lifecycle.status, 40) === "completed" &&
         Array.isArray(observation.findings) && updatedUtc && ruleBound && ruleFindingsBound &&
         ((kind === "owner-observation" && observation.schemaVersion === 2 &&
-          ["bpm-test-ownership@1", "bpm-test-class-coverage@1"].includes(capability)) ||
+          ["bpm-test-ownership@1", "bpm-test-class-coverage@1",
+            "bpm-redundant-method-coverage@1"].includes(capability)) ||
          (kind === "relation-evidence-observation" && observation.schemaVersion === 1 &&
           capability === evidenceCapability))) {
       const ids = items.map((item) => boundedText(item.identity ?? item.findingId, 160));
@@ -1256,6 +1305,9 @@ function projectState(
           noOp: states.filter((value) => value === "noOp").length,
           wouldCreate: states.filter((value) => value === "wouldCreate").length,
           unknown: states.filter((value) => value === "unknown").length,
+          ...(capability === "bpm-redundant-method-coverage@1"
+            ? { affectedMethodAttributes: items.reduce((sum, item) =>
+                sum + redundantClassSummary(item)!.affectedMethodCount, 0) } : {}),
         });
       } else {
         failures.push({
@@ -1362,7 +1414,8 @@ function projectState(
         boundedText(thread.status, 40) === "active" &&
         threadId !== null &&
         commentId !== null;
-      const historicalReviewThread = capability === "bpm-test-class-coverage@1" &&
+      const historicalReviewThread = ["bpm-test-class-coverage@1",
+        "bpm-redundant-method-coverage@1"].includes(capability) &&
         stateValue === "unknown" &&
         boundedText(reconciliation.reason, 120) === "historical-human-review-needs-review" &&
         boundedText(thread.availability, 40) === "available" &&
@@ -1382,6 +1435,9 @@ function projectState(
         : null;
       findings.push({
         id: boundedText(finding.identity ?? finding.findingId, 160) || `owner:${state.identity}:${findings.length}`,
+        stateIdentity: state.identity,
+        ...(capability === "bpm-redundant-method-coverage@1"
+          ? redundantClassSummary(finding) ?? {} : {}),
         capability, pullRequestId,
         rule: boundedText(rule.id ?? rule.section ?? rule.path, 256),
         severity: boundedText(finding.severity ?? finding.disposition, 80) || "unknown",
@@ -1459,8 +1515,11 @@ function selectionMatchesEvent(selection: JsonRecord, event: JsonRecord): boolea
     boundedText(selection.symbol, 256) === boundedText(finding.symbol, 256);
 }
 
-function coverageIntentMatchesEvent(event: JsonRecord, intent: JsonRecord | undefined): boolean {
-  if (!intent || intent.schemaVersion !== 1 || intent.kind !== "coverage-v2-service-create-intent") return false;
+function coverageIntentMatchesEvent(
+  event: JsonRecord, intent: JsonRecord | undefined, prefix: "coverage-v2" | "redundant-coverage-v2",
+  capabilityId: string,
+): boolean {
+  if (!intent || intent.schemaVersion !== 1 || intent.kind !== `${prefix}-service-create-intent`) return false;
   const finding = asRecord(event.finding);
   const subject = asRecord(event.subject);
   const intentSubject = asRecord(intent.subject);
@@ -1468,8 +1527,8 @@ function coverageIntentMatchesEvent(event: JsonRecord, intent: JsonRecord | unde
   return isHex(identity, 64) &&
     boundedText(intent.runId, 128) === boundedText(event.runId, 128) &&
     boundedText(asRecord(intent.state).identity, 64) === identity &&
-    boundedText(asRecord(intent.capability).id, 160) === "bpm-test-class-coverage@1" &&
-    boundedText(asRecord(intent.rule).section, 160) === "bpm-test-class-coverage@1" &&
+    boundedText(asRecord(intent.capability).id, 160) === capabilityId &&
+    boundedText(asRecord(intent.rule).section, 160) === capabilityId &&
     isHex(boundedText(finding.marker, 64), 64) &&
     boundedText(subject.projectId, 128) !== "" &&
     boundedText(subject.repositoryId, 128) !== "" &&
@@ -1499,15 +1558,18 @@ function deriveBody(
   localFormatterDigest: string,
 ): { body: string | null; digest: string; status: DeliverySummary["bodyStatus"] } {
   const coverage = event.kind === "coverage-v2-delivery-event";
-  if (!intent || intent.kind !== (coverage
-    ? "coverage-v2-service-create-intent" : "owner-v2-service-create-intent")) {
+  const redundant = event.kind === "redundant-coverage-v2-delivery-event";
+  if (!intent || intent.kind !== (coverage ? "coverage-v2-service-create-intent" :
+    redundant ? "redundant-coverage-v2-service-create-intent" : "owner-v2-service-create-intent")) {
     return { body: null, digest: "", status: "unavailable" };
   }
   const finding = asRecord(event.finding);
   const identity = boundedText(finding.stateIdentity, 64);
-  if (coverage && (boundedText(asRecord(intent.state).identity, 64) !== identity ||
-    boundedText(asRecord(intent.capability).id, 160) !== "bpm-test-class-coverage@1" ||
-    boundedText(asRecord(intent.rule).section, 160) !== "bpm-test-class-coverage@1")) {
+  if ((coverage || redundant) && (boundedText(asRecord(intent.state).identity, 64) !== identity ||
+    boundedText(asRecord(intent.capability).id, 160) !== (coverage
+      ? "bpm-test-class-coverage@1" : "bpm-redundant-method-coverage@1") ||
+    boundedText(asRecord(intent.rule).section, 160) !== (coverage
+      ? "bpm-test-class-coverage@1" : "bpm-redundant-method-coverage@1"))) {
     return { body: null, digest: "", status: "unavailable" };
   }
   const selection = asArray(intent.selections).map(asRecord).find((candidate) => selectionMatchesEvent(candidate, event));
@@ -1580,7 +1642,8 @@ function automaticDeliveries(
   const latestHeads = new Map<number, { timestamp: number; commit: string }>();
   const intentByRun = new Map(intents
     .filter(({ payload }) => payload.kind === "owner-v2-service-create-intent" ||
-      payload.kind === "coverage-v2-service-create-intent")
+      payload.kind === "coverage-v2-service-create-intent" ||
+      payload.kind === "redundant-coverage-v2-service-create-intent")
     .map(({ payload }) => [boundedText(payload.runId, 128), payload]));
   const grouped = new Map<string, SignedPayload[]>();
   for (const event of events) {
@@ -1592,24 +1655,30 @@ function automaticDeliveries(
     if (!eventId || group.length !== 1) continue;
     const event = group[0]!.payload;
     if (event.schemaVersion !== 1 ||
-      (event.kind !== "owner-v2-delivery-event" && event.kind !== "coverage-v2-delivery-event")) continue;
+      (event.kind !== "owner-v2-delivery-event" && event.kind !== "coverage-v2-delivery-event" &&
+        event.kind !== "redundant-coverage-v2-delivery-event")) continue;
     const subject = asRecord(event.subject);
     const finding = asRecord(event.finding);
     const pullRequestId = safeCount(subject.pullRequestId);
     const runId = boundedText(event.runId, 128);
     const occurredUtc = eventOccurred(event);
     const coverage = event.kind === "coverage-v2-delivery-event";
+    const redundant = event.kind === "redundant-coverage-v2-delivery-event";
+    const dedicatedCapability = coverage ? "bpm-test-class-coverage@1" :
+      redundant ? "bpm-redundant-method-coverage@1" : "";
+    const prefix = coverage ? "coverage-v2" : "redundant-coverage-v2";
     const intent = intentByRun.get(runId);
     const capabilityId = boundedText(event.capabilityId, 160) ||
-      (coverage ? "" : "bpm-test-ownership@1");
+      (dedicatedCapability ? "" : "bpm-test-ownership@1");
     const ruleId = boundedText(event.ruleId, 160);
-    if ((coverage && (capabilityId !== "bpm-test-class-coverage@1" ||
-      ruleId !== capabilityId || !/^coverage-v2:[0-9a-f]{64}$/.test(boundedText(finding.findingId, 160)) ||
+    if ((dedicatedCapability && (capabilityId !== dedicatedCapability ||
+      ruleId !== capabilityId ||
+      !new RegExp(`^${prefix}:[0-9a-f]{64}$`).test(boundedText(finding.findingId, 160)) ||
       !boundedText(finding.symbol, 256))) ||
-      (!coverage && capabilityId !== "bpm-test-ownership@1")) {
+      (!dedicatedCapability && capabilityId !== "bpm-test-ownership@1")) {
       failures.push({
         id: `event-binding:${eventId}`, category: "drift", occurredUtc, health: "degraded",
-        pullRequestId, runId, message: "Signed delivery event has a foreign rule, capability, or class finding binding.",
+        pullRequestId, runId, message: "Signed delivery event has a foreign rule, capability, or finding binding.",
       });
       continue;
     }
@@ -1619,20 +1688,58 @@ function automaticDeliveries(
     const commentId = nullableInteger(event.commentId);
     const eventDiagnostic = asRecord(event.diagnostic);
     const diagnosticCode = boundedText(eventDiagnostic.code, 80);
-    const historicalRefusal = coverage && diagnosticCode === "historical-human-review-needs-review";
+    const historicalRefusal = Boolean(dedicatedCapability) &&
+      diagnosticCode === "historical-human-review-needs-review";
     const outcome = boundedText(event.outcome, 120) || "unknown";
-    const postedCoverage = coverage && (
+    if (redundant && (!["create", "none"].includes(boundedText(event.action, 80)) ||
+      /update/i.test(outcome))) {
+      failures.push({
+        id: `event-binding:${eventId}`, category: "drift", occurredUtc, health: "degraded",
+        pullRequestId, runId, message: "Redundant method coverage is create-only; update delivery is not eligible.",
+      });
+      continue;
+    }
+    const postedCoverage = Boolean(dedicatedCapability) && (
       ["created", "created-confirmed-after-error", "recovered-confirmed", "ambiguous-post-write"].includes(outcome) ||
       outcome === "noOp"
     );
     if (postedCoverage &&
       (boundedText(event.action, 80) !== (outcome === "noOp" ? "none" : "create") ||
-        !coverageIntentMatchesEvent(event, intent))) {
+        !coverageIntentMatchesEvent(event, intent, prefix, dedicatedCapability))) {
       failures.push({
         id: `event-binding:${eventId}`, category: "drift", occurredUtc, health: "degraded",
         pullRequestId, runId, message: "Signed coverage delivery event has no matching signed create intent and class selection.",
       });
       continue;
+    }
+    if (redundant) {
+      const identity = boundedText(finding.stateIdentity, 64);
+      const observedState = observations.get(identity);
+      const observedFinding = findObservationFinding(observations, identity, boundedText(finding.findingId, 160));
+      const binding = resolveObservationSubject(observedState, config);
+      const observedAnchor = findingAnchor(asRecord(observedFinding));
+      const observedSubject = asRecord(observedState?.observation.subject);
+      if (binding.diagnostic || boundedText(observedState?.record?.state, 40) !== "completed" ||
+        boundedText(observedState?.observation.capability, 160) !== dedicatedCapability ||
+        boundedText(asRecord(observedState?.declaration?.capability).id, 160) !== dedicatedCapability ||
+        boundedText(asRecord(observedState?.observation.rule).section ??
+          asRecord(observedState?.observation.rule).id, 160) !== ruleId ||
+        !observedFinding ||
+        boundedText(finding.path, 1_024) !== observedAnchor.path ||
+        safeCount(finding.line) !== observedAnchor.line ||
+        boundedText(finding.symbol, 256) !== observedAnchor.symbol ||
+        pullRequestId !== binding.pullRequestId ||
+        boundedText(subject.projectId, 128) !== binding.projectId ||
+        boundedText(subject.repositoryId, 128) !== binding.repositoryId ||
+        boundedText(subject.sourceCommit, 40) !== boundedText(observedSubject.headCommit, 40) ||
+        boundedText(subject.targetCommit, 40) !== boundedText(observedSubject.targetCommit, 40) ||
+        boundedText(subject.targetRef, 256) !== boundedText(observedSubject.targetRef, 256)) {
+        failures.push({
+          id: `event-binding:${eventId}`, category: "drift", occurredUtc, health: "degraded",
+          pullRequestId, runId, message: "Redundant method coverage delivery does not match its completed observation and source/target binding.",
+        });
+        continue;
+      }
     }
     if (historicalRefusal) {
       const identity = boundedText(finding.stateIdentity, 64);
@@ -1654,8 +1761,8 @@ function automaticDeliveries(
         : null;
       const valid = observedSubjectBinding?.diagnostic === "" &&
         boundedText(observedState?.record?.state, 40) === "completed" &&
-        boundedText(observedState?.observation.capability, 160) === "bpm-test-class-coverage@1" &&
-        boundedText(asRecord(observedState?.declaration?.capability).id, 160) === "bpm-test-class-coverage@1" &&
+        boundedText(observedState?.observation.capability, 160) === dedicatedCapability &&
+        boundedText(asRecord(observedState?.declaration?.capability).id, 160) === dedicatedCapability &&
         boundedText(event.action, 40) === "none" &&
         boundedText(event.outcome, 40) === "refused" &&
         safeCount(event.providerWriteCount) === 0 && safeCount(event.modelWriteCount) === 0 &&
@@ -1691,6 +1798,7 @@ function automaticDeliveries(
     const diagnostic = boundedText(eventDiagnostic.message, 240) || links.diagnostic;
     deliveries.push({
       id: `automatic:${eventId}`, mode: "automatic",
+      stateIdentity: boundedText(finding.stateIdentity, 64),
       capabilityId,
       action: boundedText(event.action, 80) || "unknown", outcome, occurredUtc, pullRequestId,
       threadId, commentId, prUrl: links.prUrl, commentUrl: links.commentUrl,
@@ -1828,6 +1936,7 @@ function manualDeliveries(
       const bodyVerified = body && isHex(digest, 64) && digestText(body) === digest;
       deliveries.push({
         id: `manual:${invocationId}:${index}`, mode: "manual",
+        stateIdentity: identity,
         capabilityId: "bpm-test-ownership@1",
         action: intent?.publish === true ? "publish" : "preview",
         outcome: writeOutcome,

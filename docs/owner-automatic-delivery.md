@@ -148,6 +148,89 @@ well. Consumers must distinguish event kinds, verify HMAC envelopes, and
 must not mistake a coverage event for an Owner event. The existing ambiguous
 write block and interrupted-intent recovery rules apply unchanged.
 
+## Redundant method-level coverage exclusion (toolkit only)
+
+The single-state toolkit source
+`tools/Invoke-AutomaticOwnerV2Delivery.ps1 -Delivery redundant-coverage`
+accepts completed **live, model-free** observations for the separate
+`bpm-redundant-method-coverage@1` rule/capability from a
+`redundant-coverage-v2-preview-cohort` manifest. The rule path is
+`src/DevPilot.OwnerCapability/Policy/redundant-method-coverage.v1.txt`.
+Only `redundant-coverage-v2:<sha>` violation findings for changed,
+method-level `[ExcludeFromCodeCoverage]` attributes on MSTest methods
+inside an excluded test class are eligible. One bounded finding groups the
+changed method attributes in that class: its symbol is the class name,
+its anchor is the **first changed method attribute line**, and it carries
+the count, ordered attribute lines, and up to 12 distinct identifier-only
+method names. A truncated list must be flagged exactly when the affected
+attribute count exceeds the displayed names; incoherent metadata refuses
+delivery before provider access. It is not
+anchored to the class declaration or a method signature. The formatter uses
+the independently bound `devpilot-redundant-method-coverage:v1` marker and
+asks to remove **only** the redundant method attributes.
+
+This is **not** an update to the deployed scheduled task or its deployment
+configuration. The redundant-method switch is absent/false by default;
+neither `autoCreateCoverageComments` nor `autoCreateOwnerComments` enables
+it. A disabled `invoke` reads the completed evidence but creates no local
+delivery root, key, intent, or external comment. An enabled external config
+would need this exact independent binding:
+
+```json
+{
+  "autoCreateRedundantMethodCoverageComments": {
+    "enabled": true,
+    "policyPath": "C:\\private\\owner-v2-delivery\\redundant-method-coverage-v1\\policies\\redundant-coverage-v2-production.json",
+    "policySha256": "<64 lowercase hex>"
+  }
+}
+```
+
+The toolkit `initialize-key -Delivery redundant-coverage` creates a
+**separate** `redundant-method-coverage-v1` subroot under `-DeliveryRoot`
+with its own `keys\redundant-method-coverage-service-authorization.hmac`,
+policy, intents, outcomes, events, and locks. No Owner or class coverage
+key, policy, event history, or create ceiling authorizes this mode. While
+the switch remains disabled, `authorize-policy -Delivery redundant-coverage`
+can sign `redundant-coverage-v2-service-authorization-policy` for an exact
+completed redundant-method state identity. It binds the repository,
+organization/project, rule/capability, reviewer, implementation digests,
+`wouldCreate`, `changed-mstest-class-method-exclusions`, `violation`,
+create-only authority, and independent per-run/per-PR caps (hard ceilings
+5/50). For example, with private absolute paths:
+
+```powershell
+.\tools\Invoke-AutomaticOwnerV2Delivery.ps1 initialize-key `
+    -Delivery redundant-coverage -DeliveryRoot C:\private\owner-v2-delivery
+.\tools\Invoke-AutomaticOwnerV2Delivery.ps1 authorize-policy `
+    -Delivery redundant-coverage -DeliveryRoot C:\private\owner-v2-delivery `
+    -StateRoot C:\private\owner-v2-state `
+    -Identity <completed-redundant-coverage-state-identity> `
+    -ToolkitConfigPath C:\private\redundant-coverage-config.json `
+    -PolicyId redundant-coverage-v2-production
+```
+
+The returned policy file SHA-256 must be bound in the independent config
+before a toolkit `invoke -Delivery redundant-coverage` can deliver anything.
+Do **not** run a live invocation merely to test this change; tests use
+fake providers only. Live preflight and every candidate recheck require the
+same active, non-draft PR source head, target/ref, current iteration, **every**
+listed changed attribute line, exact reviewer identity, and complete current
+discussions.
+Only `wouldCreate` can call `CreateThread`, once. A current, unmarked,
+affirmative plural human discussion on **any listed changed method attribute
+line** (including a later line such as 36) covers the whole class as
+`humanCovered`, never as a writer `noOp`. A question, negation, conflicting
+discussion, or ambiguous identity fails closed. Earlier closed/outdated
+human discussions produce a signed refusal event and block the batch for
+operator review. `noOp` requires the exact current reviewer marker/body and
+anchor. Foreign/cross-rule or duplicate markers, stale anchors/bodies,
+`wouldUpdate`, ambiguous readback, and changed source refuse or block writes.
+There are no updates, resolutions, votes, PR-status changes, summaries,
+notifications, or model writes. Signed artifacts use distinct
+`redundant-coverage-v2-*` kinds; an uncertain create is conservatively
+counted and never blindly retried.
+
 ## Fail-closed configuration
 
 `autoCreateOwnerComments` is absent or `false` by default. A true boolean is

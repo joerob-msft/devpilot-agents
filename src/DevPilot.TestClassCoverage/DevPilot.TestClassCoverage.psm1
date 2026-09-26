@@ -235,7 +235,9 @@ function Get-TestClassCoverageConstructs {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Spans,
-        [Parameter(Mandatory)][string]$Path
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$IncludeUnchanged,
+        [switch]$IncludeResolutionContext
     )
 
     if ([Text.Encoding]::UTF8.GetByteCount($Content) -ge 16MB -or $Spans.Count -gt 4096 -or
@@ -401,6 +403,7 @@ function Get-TestClassCoverageConstructs {
         $name = (@($nsParts) + @($classParts) + @($className)) -join '.'
         $entry = @{ name = $name; namespace = $namespace; kind = $kind
             isPartial = $isPartial
+            bodyOpen = $(if ($j -lt $count -and $tokens[$j].text -eq '{') { $j } else { -1 })
             declarationLine = [int]$tokens[$i].line
             first = [int]$tokens[$declarationStart].line
             last = $(if ($j -lt $count) { [int]$tokens[$j].line } else { [int]$tokens[$nameIndex].line })
@@ -418,7 +421,7 @@ function Get-TestClassCoverageConstructs {
         foreach ($attr in $entry.attrs) {
             if (Test-CoverageChanged $attr.first $attr.last $ranges) { $changed = $true }
         }
-        if (-not $changed) { continue }
+        if (-not $changed -and -not $IncludeUnchanged) { continue }
         $testState = 'other'
         $excludeState = 'other'
         $container = $entry.name.Substring(0, [Math]::Max(0, $entry.name.LastIndexOf('.')))
@@ -441,7 +444,7 @@ function Get-TestClassCoverageConstructs {
             -not $scan.conditional -and -not $scan.unterminated
         $firstLine = $entry.first
         foreach ($attr in $entry.attrs) { $firstLine = [Math]::Min($firstLine, $attr.first) }
-        @{
+        $result = @{
             name = [string]$entry.name
             declarationLine = [int]$entry.declarationLine
             startLine = [int]$firstLine
@@ -449,6 +452,8 @@ function Get-TestClassCoverageConstructs {
             recognized = [bool]$recognized
             hasTestClass = [bool]($testState -eq 'yes')
             hasExclude = [bool]($excludeState -eq 'yes')
+            isPartial = [bool]$entry.isPartial
+            bodyOpen = [int]$entry.bodyOpen
             reason = $(if ($recognized -and $excludeState -eq 'yes') {
                     'class-level-coverage-exclusion-present'
                 }
@@ -462,7 +467,214 @@ function Get-TestClassCoverageConstructs {
                 else { 'class-attribute-resolution-unknown' })
             path = $Path
         }
+        if ($IncludeResolutionContext) {
+            $result['namespace'] = $entry.namespace
+            $result['usings'] = $usingArray
+            $result['declaredNames'] = $declaredNames
+        }
+        $result
     }
 }
 
-Export-ModuleMember -Function Get-TestClassCoverageConstructs
+function Get-RedundantMethodCoverageConstructs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Spans,
+        [Parameter(Mandatory)][string]$Path
+    )
+    if ([Text.Encoding]::UTF8.GetByteCount($Content) -ge 16MB -or
+        $Spans.Count -gt 4096 -or $Path.Length -gt 2048) {
+        throw 'C# coverage input exceeds the bounded content or span limit.'
+    }
+    $safeContent = $Content
+    if ($Content -match '(?m)^\s*#\s*(?:if|elif|else|endif|define|undef)\b') {
+        $lines = [regex]::Split($Content, '(?<=\n)')
+        $sanitized = [Collections.Generic.List[string]]::new()
+        $inside = $false
+        $aliasCount = 0
+        $safe = $true
+        foreach ($line in $lines) {
+            if ($line -match '^\s*#\s*if\b') {
+                if ($inside) { $safe = $false; break }
+                $inside = $true
+                $aliasCount = 0
+            }
+            elseif ($line -match '^\s*#\s*endif\b') {
+                if (-not $inside -or $aliasCount -ne 1) { $safe = $false; break }
+                $inside = $false
+            }
+            elseif ($inside) {
+                if ($line -notmatch '^\s*using\s+(?<alias>[A-Za-z_]\w*)\s*=\s*(?:global::)?(?<target>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*;\s*$' -or
+                    $Matches.alias -in @('TestClass', 'TestMethod', 'DataTestMethod',
+                        'ExcludeFromCodeCoverage') -or
+                    $Matches.target -match '^(?:Microsoft\.VisualStudio\.TestTools\.UnitTesting|System\.Diagnostics\.CodeAnalysis)(?:\.|$)' -or
+                    $Matches.target -match '(?:^|\.)(?:TestClass|TestMethod|DataTestMethod|ExcludeFromCodeCoverage)(?:Attribute)?$') {
+                    $safe = $false; break
+                }
+                $aliasCount++
+            }
+            elseif ($line -match '^\s*#\s*(?:elif|else|endif|define|undef)\b') {
+                $safe = $false; break
+            }
+            if ($inside -or $line -match '^\s*#\s*endif\b') {
+                [void]$sanitized.Add(([regex]::Match($line, '\r?\n$')).Value)
+            }
+            else { [void]$sanitized.Add($line) }
+        }
+        if ($safe -and -not $inside) { $safeContent = $sanitized -join '' }
+    }
+    $scan = Get-CoverageTokens -Text $safeContent
+    $tokens = $scan.tokens.ToArray()
+    $stack = [Collections.Generic.Stack[string]]::new()
+    $pairs = @{ '}' = '{'; ')' = '('; ']' = '[' }
+    $malformed = [bool]($scan.unterminated -or $scan.conditional)
+    foreach ($token in $tokens) {
+        $text = [string]$token.text
+        if ($text -in @('{', '(', '[')) { $stack.Push($text) }
+        elseif ($pairs.ContainsKey($text)) {
+            if ($stack.Count -eq 0 -or $stack.Pop() -cne $pairs[$text]) {
+                $malformed = $true
+                break
+            }
+        }
+    }
+    if ($stack.Count -gt 0) { $malformed = $true }
+    if ($malformed) {
+        if ($Spans.Count -gt 0) {
+            @{ name = 'unrecognized'; declarationLine = 0
+                startLine = [int]$Spans[0].startLine
+                endLine = [int]$Spans[0].endLine
+                recognized = $false; hasExclude = $false
+                reason = 'lexical-input-unknown'; path = $Path }
+        }
+        return
+    }
+    $classes = @(Get-TestClassCoverageConstructs -Content $safeContent -Spans $Spans `
+        -Path $Path -IncludeUnchanged -IncludeResolutionContext)
+    if ($classes.Count -eq 0) { return }
+    $ranges = @($Spans | ForEach-Object {
+        @{ start = [int]$_.startLine; end = [int]$_.endLine }
+    })
+    foreach ($class in $classes) {
+        if (-not $class.hasTestClass -or $class.bodyOpen -lt 0) { continue }
+        $candidates = [Collections.Generic.List[object]]::new()
+        $depth = 1
+        for ($i = $class.bodyOpen + 1; $i -lt $tokens.Count -and $depth -gt 0; $i++) {
+            $text = [string]$tokens[$i].text
+            if ($text -eq '{') { $depth++; continue }
+            if ($text -eq '}') { $depth--; continue }
+            if ($depth -ne 1 -or $text -ne '[') { continue }
+            $first = $i
+            $attributes = [Collections.Generic.List[object]]::new()
+            while ($i -lt $tokens.Count -and $tokens[$i].text -eq '[') {
+                $begin = $i
+                $level = 1
+                while ($i + 1 -lt $tokens.Count -and $level -gt 0) {
+                    $i++
+                    if ($tokens[$i].text -eq '[') { $level++ }
+                    if ($tokens[$i].text -eq ']') { $level-- }
+                }
+                if ($level -ne 0) { break }
+                [void]$attributes.Add(@{ first = [int]$tokens[$begin].line
+                    last = [int]$tokens[$i].line
+                    names = @(Get-CoverageAttributeNames -Tokens $tokens -First $begin -Last $i) })
+                $i++
+            }
+            if ($i -ge $tokens.Count -or $attributes.Count -eq 0) { break }
+            $header = $i
+            $paren = -1
+            $end = $i
+            while ($end -lt $tokens.Count -and $end - $header -lt 256 -and
+                [int]$tokens[$end].line - [int]$tokens[$first].line -le 64) {
+                $part = [string]$tokens[$end].text
+                if ($part -eq '(' -and $paren -lt 0) { $paren = $end }
+                if ($part -in @('{', '}', ';', '=>')) { break }
+                $end++
+            }
+            $methodName = if ($paren -gt $header -and
+                [string]$tokens[$paren - 1].text -match '^@?[\p{L}_][\p{L}\p{N}_]*$') {
+                [string]$tokens[$paren - 1].text -replace '^@', ''
+            } else { '' }
+            $test = 'other'
+            $exclude = 'other'
+            $excludeAttribute = $null
+            $excludeCount = 0
+            $mixed = $false
+            $classNamespace = [string]$class.namespace
+            foreach ($attr in $attributes) {
+                foreach ($name in $attr.names) {
+                    foreach ($short in @('TestMethod', 'DataTestMethod')) {
+                        $resolved = Resolve-CoverageAttribute $name $classNamespace $short `
+                            "Microsoft.VisualStudio.TestTools.UnitTesting.$short" `
+                            $class.usings $class.declaredNames ([string]$class.name)
+                        if ($resolved -eq 'yes') { $test = 'yes' }
+                        elseif ($resolved -eq 'unknown' -and $test -ne 'yes') { $test = 'unknown' }
+                    }
+                    $resolved = Resolve-CoverageAttribute $name $classNamespace `
+                        ExcludeFromCodeCoverage System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage `
+                        $class.usings $class.declaredNames ([string]$class.name)
+                    if ($resolved -eq 'yes') {
+                        $exclude = 'yes'
+                        $excludeCount++
+                        $excludeAttribute = $attr
+                        if ($attr.names.Count -ne 1) { $mixed = $true }
+                    }
+                    elseif ($resolved -eq 'unknown' -and $exclude -ne 'yes') {
+                        $exclude = 'unknown'
+                    }
+                }
+            }
+            if ($exclude -eq 'other') { $i--; continue }
+            if ($exclude -eq 'yes' -and -not (Test-CoverageChanged `
+                    $excludeAttribute.first $excludeAttribute.last $ranges)) { $i--; continue }
+            if ($exclude -eq 'unknown' -and -not (Test-CoverageChanged `
+                    $tokens[$first].line $tokens[$i - 1].line $ranges)) { $i--; continue }
+            $exactChangedAnchor = $exclude -eq 'yes' -and
+                (Test-CoverageChanged $excludeAttribute.first $excludeAttribute.first $ranges)
+            $valid = $methodName -and $methodName.Length -le 128 -and
+                $class.name.Length -le 256 -and $end -lt $tokens.Count -and
+                $tokens[$end].text -in @('{', '=>') -and
+                $methodName -cne ($class.name -split '\.')[-1]
+            [void]$candidates.Add(@{
+                name = $methodName
+                startLine = $(if ($excludeAttribute) { [int]$excludeAttribute.first } else { [int]$tokens[$first].line })
+                endLine = $(if ($excludeAttribute) { [int]$excludeAttribute.last } else { [int]$tokens[$i - 1].line })
+                recognized = [bool]($valid -and $class.recognized -and
+                    -not $class.isPartial -and $test -eq 'yes' -and
+                    $exclude -eq 'yes' -and $excludeCount -eq 1 -and
+                    $exactChangedAnchor -and -not $mixed)
+            })
+            $i--
+        }
+        if ($candidates.Count -eq 0) { continue }
+        $ordered = @($candidates | Sort-Object startLine, endLine)
+        $attributeLines = @($ordered | ForEach-Object startLine | Sort-Object -Unique)
+        $allKnown = $candidates.Count -le 256 -and
+            @($classes | Where-Object { $_.name -ceq $class.name }).Count -eq 1 -and
+            $attributeLines.Count -eq $candidates.Count -and
+            @($candidates | Where-Object { -not $_.recognized }).Count -eq 0
+        $names = @()
+        if ($allKnown) {
+            $names = @($ordered | ForEach-Object name | Select-Object -Unique -First 12)
+        }
+        @{
+            name = [string]$class.name
+            declarationLine = [int]$class.declarationLine
+            startLine = [int]$ordered[0].startLine
+            endLine = [int]$ordered[0].endLine
+            recognized = [bool]$allKnown
+            hasExclude = [bool]$class.hasExclude
+            affectedMethodCount = $(if ($allKnown) { [int]$candidates.Count } else { 0 })
+            affectedMethods = $names
+            affectedAttributeLines = $(if ($allKnown) { $attributeLines } else { @() })
+            methodListTruncated = [bool]($allKnown -and $candidates.Count -gt $names.Count)
+            reason = $(if (-not $allKnown) { 'method-coverage-containment-unknown' }
+                elseif ($class.hasExclude) { 'redundant-method-coverage-exclusion' }
+                else { 'class-level-coverage-exclusion-absent' })
+            path = $Path
+        }
+    }
+}
+
+Export-ModuleMember -Function Get-TestClassCoverageConstructs, Get-RedundantMethodCoverageConstructs

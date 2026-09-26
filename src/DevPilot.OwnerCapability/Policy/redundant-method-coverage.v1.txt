@@ -1,0 +1,1 @@
+bpm-redundant-method-coverage@1: One class-level finding for changed redundant method-level ExcludeFromCodeCoverage attributes in an MSTest class with class-level ExcludeFromCodeCoverage; preserve all other attributes.
