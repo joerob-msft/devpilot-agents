@@ -13,6 +13,7 @@ import {
   type TaskHealth,
 } from "../src/reporting.js";
 import {
+  REPORTING_SECTIONS,
   filterReportingRows,
   overviewLines,
   reportingRows,
@@ -547,6 +548,121 @@ test("reporting adapter verifies signed feeds, isolates relation findings, deriv
   }
 });
 
+test("rules registry separates source, deployment, enablement, evaluation and verified outcomes", async () => {
+  const fixture = await createFixture();
+  try {
+    const snapshot = await createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-25T00:35:00Z"),
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.equal(REPORTING_SECTIONS.at(-1), "rules");
+    const rules = snapshot.rules ?? [];
+    assert.deepEqual(rules.map((rule) => rule.id), [
+      "mstest-owner", "relation-evidence@1", "bpm-test-class-coverage@1",
+    ]);
+    const owner = rules[0]!;
+    assert.equal(owner.implemented, true);
+    assert.equal(owner.installedHead, "f".repeat(40));
+    assert.equal(owner.pinnedHead, "f".repeat(40));
+    assert.equal(owner.deployment, "verified");
+    assert.equal(owner.enablement, "verified");
+    assert.equal(owner.execution, "verified");
+    assert.equal(owner.authorization, "enabled");
+    assert.equal(owner.publishing, "enabled");
+    assert.deepEqual(owner.policyCaps, { perRun: 5, perPullRequest: 25 });
+    assert.equal(owner.lastGeneration, "sanitized-live-run");
+    assert.deepEqual(owner.scope, [42]);
+    assert.equal(owner.counts.finding, 1);
+    assert.equal(owner.counts.noOp, 1);
+    assert.equal(owner.counts.wouldCreate, 0);
+    assert.equal(owner.counts.unknown, 0);
+    assert.equal(owner.counts.skipped, null);
+    assert.equal(owner.counts.posted, 2);
+    assert.deepEqual(owner.deliveryIds.sort(), ["automatic:event-auto", "manual:manual-run:0"]);
+    assert.match(owner.url ?? "", /discussionId=100/);
+    const relation = rules[1]!;
+    assert.equal(relation.deployment, "verified");
+    assert.equal(relation.execution, "verified");
+    assert.equal(relation.authorization, "not-eligible");
+    assert.equal(relation.publishing, "not-eligible");
+    assert.equal(relation.counts.finding, 1);
+    assert.match(relation.url ?? "", /pullrequest\/42/);
+    const classRule = rules[2]!;
+    assert.equal(classRule.deployment, "not-deployed");
+    assert.equal(classRule.enablement, "disabled");
+    assert.equal(classRule.execution, "unknown");
+    assert.equal(classRule.authorization, "disabled");
+    assert.equal(classRule.publishing, "disabled");
+    assert.equal(classRule.policyCaps, null);
+    assert.equal(classRule.counts.finding, null);
+    assert.equal(classRule.lastGeneration, null);
+    assert.match(classRule.provenance, /588c0045/);
+    assert.match(classRule.gaps.join(" "), /not deployed/i);
+    const rows = reportingRows(snapshot, "rules");
+    assert.equal(rows.length, 3);
+    assert.match(rows[2]!.text.join(" "), /finding unknown.*skipped unknown/);
+    assert.equal(filterReportingRows(rows, {
+      timeRange: "24h", search: "rule:relation-evidence outcome:verified",
+      posting: "all", mode: "all",
+    }).length, 1);
+    assert.equal(filterReportingRows(rows, {
+      timeRange: "all", search: "class-coverage", posting: "all", mode: "all",
+    })[0]?.key, "rule:bpm-test-class-coverage@1");
+    const taskOff = await createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-25T00:35:00Z"),
+      taskReader: async () => ({ ...healthyTask, enabled: false }),
+    }).read();
+    assert.equal(taskOff.rules?.[0]?.authorization, "enabled");
+    assert.equal(taskOff.rules?.[0]?.publishing, "disabled");
+    assert.equal(taskOff.rules?.[1]?.publishing, "not-eligible");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("rules fail closed on missing or malformed run, truncated feeds, and stale evaluations", async () => {
+  const fixture = await createFixture();
+  try {
+    const adapter = createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-26T00:35:00Z"),
+      taskReader: async () => healthyTask,
+    });
+    const stale = await adapter.read();
+    assert.equal(stale.rules?.[0]?.execution, "stale");
+    assert.equal(stale.rules?.[0]?.lastGeneration, "sanitized-live-run");
+    const path = join(fixture.runnerRoot, "last-run.json");
+    const run = JSON.parse(await readFile(path, "utf8")) as JsonRecord;
+    asArray(run.records)[0] && (asObject(asArray(run.records)[0]).identity = "invalid");
+    await writeJson(path, run);
+    const malformed = await adapter.read();
+    assert.equal(malformed.rules?.[0]?.deployment, "unknown");
+    assert.equal(malformed.rules?.[0]?.execution, "unknown");
+    assert.equal(malformed.rules?.[0]?.counts.noOp, null);
+    assert.equal(malformed.rules?.[0]?.counts.posted, null);
+    assert.ok(malformed.rules?.[0]?.gaps.some((gap) => /missing, malformed/.test(gap)));
+    asObject(asArray(run.records)[0]).identity = fixture.identity;
+    await writeJson(path, run);
+    const observationPath = join(fixture.stateRoot, "owner-v2-preview-state", "schema-1",
+      "capabilities", "owner", "observations", `${fixture.identity}.json`);
+    const observation = JSON.parse(await readFile(observationPath, "utf8")) as JsonRecord;
+    asObject(asArray(observation.findings)[0]).reconciliation = { classification: "unexpected" };
+    await writeJson(observationPath, observation);
+    const invalidObservation = await adapter.read();
+    assert.ok(invalidObservation.failures.some((item) => item.id === `rule-evidence:${fixture.identity}`));
+    assert.equal(invalidObservation.rules?.[0]?.counts.finding, null);
+    assert.equal(invalidObservation.rules?.[1]?.counts.finding, null);
+    const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as JsonRecord;
+    asObject(config.budgets).maxHistory = 10;
+    await writeJson(fixture.configPath, config);
+    const truncated = await adapter.read();
+    assert.equal(truncated.truncated, true);
+    assert.equal(truncated.rules?.[1]?.counts.finding, null);
+    assert.equal(truncated.rules?.[1]?.scope.length, 0);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("coverage events show the bound class and rule while human-covered findings need review", async () => {
   const fixture = await createFixture();
   try {
@@ -666,6 +782,9 @@ test("coverage events show the bound class and rule while human-covered findings
     assert.equal(snapshot.deliveries.find((delivery) => delivery.eventId === "event-auto")?.bodyStatus,
       "verified");
     const coverage = snapshot.deliveries.find((delivery) => delivery.eventId === "event-coverage");
+    assert.notEqual(snapshot.rules?.[2]?.deployment, "verified");
+    assert.notEqual(snapshot.rules?.[2]?.execution, "verified");
+    assert.equal(snapshot.rules?.[2]?.counts.posted, null);
     assert.equal(coverage?.capabilityId, capabilityId);
     assert.equal(coverage?.rule, capabilityId);
     assert.equal(coverage?.symbol, "MissingTests");

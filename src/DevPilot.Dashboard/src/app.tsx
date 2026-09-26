@@ -3031,7 +3031,20 @@ export function App(props: AppProps) {
       } else if (key.name === "/") {
         setReportingSearchInput(reportingFilters().search);
         setReportingSearchMode(true);
-        notify("Enter reporting search; tokens: pr:, capability:, health:, outcome:");
+        notify("Enter reporting search; tokens: pr:, capability:, rule:, health:, outcome:");
+      } else if (reportingSection() === "rules" && (key.name === "f" || key.name === "e")) {
+        const capability = reportingRows()[reportingSelected()]?.capability;
+        if (capability) {
+          setReportingSection(key.name === "e" ? "deliveries" :
+            capability === "relation-evidence@1" ? "relations" : "findings");
+          setReportingFilters((filters) => ({
+            ...filters, timeRange: "all", posting: "all", mode: "all",
+            search: `capability:${capability}`,
+          }));
+          setReportingSelected(0);
+          setReportingActionStatus(null);
+          reportingScroll?.scrollTo(0);
+        }
       } else if (key.name === "r") {
         void refreshReporting(true);
       } else if (key.name === "o") {
@@ -3595,7 +3608,7 @@ export function App(props: AppProps) {
         </OverlayPanel>
       </Show>
       <Show when={overlay() === "reporting"}>
-        <OverlayPanel title="VERIFIED LOCAL OWNER REPORTING - READ ONLY" width={142} height={32} bounded>
+        <OverlayPanel title="VERIFIED LOCAL OPERATIONS REPORTING - READ ONLY" width={142} height={32} bounded>
           <Show when={reportingSearchMode()}>
             <text flexShrink={0} fg={COLORS.warning}>
               Search: {reportingSearchInput() || "(blank)"} | Enter apply | Ctrl+U clear | Esc cancel

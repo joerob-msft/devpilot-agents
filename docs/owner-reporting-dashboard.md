@@ -1,7 +1,8 @@
 # Owner reporting dashboard
 
 The existing DevPilot Operations terminal dashboard can project the scheduled
-Owner and relation service from verified local state. This is a read-only
+Owner and relation service and browse the implemented reviewer-rule inventory
+from verified local state. This is a read-only
 reporting plane: it adds no HTTP listener, provider write endpoint, task
 mutation, approval flow, credential prompt, telemetry upload, or deployment.
 If reporting is unavailable or malformed, the reviewer scheduler continues
@@ -143,12 +144,55 @@ The reporting overlay extends the existing OpenTUI application:
 - **Relations**: relation findings in a separate view, always labeled
   **READ ONLY / NOT WRITER ELIGIBLE**, with a validated PR link when the
   configured project/repository identity matches.
+- **Rules**: source inventory for the MSTest Owner rule (`mstest-owner`),
+  relation evidence (`relation-evidence@1`), and class-level
+  `[ExcludeFromCodeCoverage]` (`bpm-test-class-coverage@1`). Each row separates
+  implemented version/provenance from installed deployment, task enablement,
+  bound execution generation/time, configured automatic authorization, and
+  effective automatic publishing (authorization plus enabled task).
+  Owner and relation have operator-reported live cohorts (PR 17109075 and
+  PR 16950415), but their **verified** status requires the configured toolkit
+  head/tree and a matching completed composite scheduled-run record and durable
+  observation. PR 174 implements class coverage at
+  `588c0045e24542d10a76bbfadc6e6d1aa2c4c528`, but that code is **not
+  deployed** to the reported PR 173-pinned dashboard/service cohort; a green
+  PR is not deployment evidence. Class auto-post is not authorized by Owner
+  policy. Without sufficient local bindings, deployment, execution, and counts
+  remain **unknown** rather than asserting coverage. `f` opens a rule's
+  capability-filtered Findings (Relations for read-only relation evidence);
+  `e` opens its Deliveries; `o` opens only a confidently bound, validated
+  finding/delivery URL. `rule:` filters exact rule identity within rows that
+  carry it.
 
-Use `Tab`/`Shift+Tab` for sections, Left/Right for `24h`/`7d`/`30d`/all,
+  Counts are for distinct completed state identities tied to a successful
+  generation whose toolkit head/tree match the configured installation;
+  findings are violation observations, while `noOp`, `wouldCreate`, and
+  `unknown` are reconciliation outcomes. `refused` and `posted` come from
+  verified, bound delivery events, with posted requiring a confirmed provider
+  write; an observation `noOp` is not itself proof of a new post.
+  `skipped`/total PR intake are **unknown** because the current envelopes do
+  not expose a per-rule intake denominator, including already-open non-draft
+  PR heads. Missing, malformed, quarantined, or truncated sources fail closed
+  to unknown counts. A stale generation remains visible as **stale**, not
+  freshly evaluated. Publishing status is separate from evaluation: relation
+  is never writer-eligible, class auto-post is off in the reported cohort,
+  and Owner requires the verified signed policy and automatic feed.
+
+Use `Tab`/`Shift+Tab` for sections, Left/Right for `24h`/`7d`/`30d`/all
+(the Rules inventory is always shown across generations),
 `p` for all/pending/posted, `t` for all/automatic/manual, and `/` for search.
-Search supports free text plus `pr:`, `capability:`, `health:`, and `outcome:`
+Search supports free text plus `pr:`, `capability:`, `rule:`, `health:`, and `outcome:`
 tokens. Rows are sorted deterministically and capped by `maxHistory`. `o`
 opens only the selected validated URL.
+
+The registry is an explicit source inventory in `rule-registry.ts`, not a
+deployment declaration. When implementing a new rule (for example redundant
+method-level coverage exclusions or named `Assert.AreEqual` arguments), add
+its stable ID, capability, version, provenance, and run channel *after* its
+producer emits a bound state/run contract; add its publishing policy separately
+only after deployment and authorization. Those future rules and active-PR
+intake are not implemented or live today. The adapter never scans ADO or
+writes provider comments to fill telemetry gaps.
 
 On Windows, `o` uses the system URL association through a fixed PowerShell
 `Start-Process -FilePath $url` launcher. The validated URL is passed only in

@@ -8,9 +8,10 @@ import type {
   ReportingSnapshot,
   RunSummary,
 } from "./reporting.js";
+import type { RuleSummary } from "./rule-registry.js";
 
 export const REPORTING_SECTIONS = [
-  "overview", "runs", "findings", "deliveries", "failures", "relations",
+  "overview", "runs", "findings", "deliveries", "failures", "relations", "rules",
 ] as const;
 export type ReportingSection = (typeof REPORTING_SECTIONS)[number];
 export type ReportingTimeRange = "24h" | "7d" | "30d" | "all";
@@ -31,6 +32,7 @@ export interface ReportingRow {
   capability: string;
   health: string;
   outcome: string;
+  ruleId?: string;
   posting: "pending" | "posted" | "none";
   mode: "automatic" | "manual" | "none";
   text: string[];
@@ -78,8 +80,10 @@ function queryTokens(search: string): {
   capability: string;
   health: string;
   outcome: string;
+  rule: string;
 } {
-  const result = { text: [] as string[], pr: null as number | null, capability: "", health: "", outcome: "" };
+  const result = { text: [] as string[], pr: null as number | null,
+    capability: "", health: "", outcome: "", rule: "" };
   for (const token of search.trim().split(/\s+/).filter(Boolean)) {
     const [prefix, ...rest] = token.split(":");
     const value = rest.join(":").toLowerCase();
@@ -87,6 +91,7 @@ function queryTokens(search: string): {
     else if (prefix?.toLowerCase() === "capability") result.capability = value;
     else if (prefix?.toLowerCase() === "health") result.health = value;
     else if (prefix?.toLowerCase() === "outcome") result.outcome = value;
+    else if (prefix?.toLowerCase() === "rule") result.rule = value;
     else result.text.push(token.toLowerCase());
   }
   return result;
@@ -112,6 +117,7 @@ export function filterReportingRows(
     if (query.capability && !row.capability.toLowerCase().includes(query.capability)) return false;
     if (query.health && !row.health.toLowerCase().includes(query.health)) return false;
     if (query.outcome && !row.outcome.toLowerCase().includes(query.outcome)) return false;
+    if (query.rule && !(row.ruleId ?? "").toLowerCase().includes(query.rule)) return false;
     if (filters.posting !== "all" && row.posting !== filters.posting) return false;
     if (filters.mode !== "all" && row.mode !== filters.mode) return false;
     return query.text.every((token) => row.searchText.includes(token));
@@ -155,6 +161,7 @@ function findingRow(finding: FindingSummary): ReportingRow {
     health: needsReview ? "needs-review" :
       finding.sourceFreshness === "stale" || finding.state === "unknown" ? "degraded" : "healthy",
     outcome: finding.state, posting: finding.state === "noOp" ? "posted" : "pending",
+    ruleId: finding.rule,
     mode: "none", text, searchText: clean(text.join(" ")).toLowerCase(), url: finding.url,
     attention: finding.sourceFreshness === "stale" || finding.state === "unknown" || needsReview,
   };
@@ -186,6 +193,7 @@ function deliveryRow(delivery: DeliverySummary): ReportingRow {
     health: needsReview ? "needs-review" :
       /ambiguous|refused|failed|unknown/i.test(`${delivery.outcome} ${delivery.providerWriteState}`) ? "degraded" : "healthy",
     outcome: delivery.outcome,
+    ruleId: delivery.rule,
     posting: delivery.providerWrites > 0 || /created|updated|recovered|noOp/i.test(delivery.outcome) ? "posted" : "pending",
     mode: delivery.mode, text,
     searchText: clean(text.join(" ")).toLowerCase(), url: delivery.commentUrl ?? delivery.prUrl,
@@ -220,12 +228,41 @@ function relationRow(relation: RelationSummary): ReportingRow {
     key: `relation:${relation.id}`, timestamp: relation.updatedUtc,
     pullRequestId: relation.pullRequestId, capability: relation.capability,
     health: relation.state === "unknown" ? "degraded" : "healthy", outcome: relation.state,
+    ruleId: relation.rule,
     posting: "none", mode: "none", text, searchText: clean(text.join(" ")).toLowerCase(),
     url: relation.url, attention: relation.state === "unknown",
   };
 }
 
+function ruleRow(rule: RuleSummary): ReportingRow {
+  const count = (value: number | null) => value === null ? "unknown" : String(value);
+  const text = [
+    `${rule.id} | ${rule.capabilityId} | implementation ${rule.implementationVersion}`,
+    rule.description,
+    `Provenance: ${rule.provenance}`,
+    `Observed service toolkit ${rule.installedHead ?? "unknown"} | configured pin ${rule.pinnedHead ?? "unknown"} (not proof this rule is installed)`,
+    `Deployment ${rule.deployment} | task ${rule.enablement} | evaluated ${rule.execution} | auto policy ${rule.authorization} | auto-post ${rule.publishing}`,
+    ...(rule.policyCaps ? [`Owner create caps: ${rule.policyCaps.perRun}/run, ${rule.policyCaps.perPullRequest}/PR`] : []),
+    `PR scope: ${rule.scope.length ? rule.scope.map((pr) => `#${pr}`).join(", ") : "unknown"} | generation ${rule.lastGeneration ?? "unknown"} | evaluated ${rule.lastEvaluatedUtc ?? "unknown"}`,
+    `Outcomes: finding ${count(rule.counts.finding)} | noOp ${count(rule.counts.noOp)} | wouldCreate ${count(rule.counts.wouldCreate)} | unknown ${count(rule.counts.unknown)} | skipped ${count(rule.counts.skipped)} | refused ${count(rule.counts.refused)} | posted ${count(rule.counts.posted)}`,
+    `Bound findings ${rule.findingIds.length} / deliveries ${rule.deliveryIds.length}; f: findings, e: deliveries`,
+    ...rule.gaps.map((gap) => `Coverage gap: ${gap}`),
+  ];
+  return {
+    key: `rule:${rule.id}`, timestamp: "",
+    pullRequestId: rule.scope.length === 1 ? rule.scope[0]! : 0,
+    capability: rule.capabilityId,
+    health: rule.execution, outcome: rule.deployment,
+    ruleId: rule.id,
+    posting: rule.counts.posted ? "posted" : rule.counts.wouldCreate ? "pending" : "none",
+    mode: "none",
+    text, searchText: clean(text.join(" "), 4_096).toLowerCase(),
+    url: rule.url, attention: rule.execution !== "verified" || rule.gaps.length > 1,
+  };
+}
+
 export function reportingRows(snapshot: ReportingSnapshot, section: ReportingSection): ReportingRow[] {
+  if (section === "rules") return (snapshot.rules ?? []).map(ruleRow);
   if (section === "runs") return snapshot.runs.map(runRow);
   if (section === "findings") return snapshot.findings.map(findingRow);
   if (section === "deliveries") return snapshot.deliveries.map(deliveryRow);
@@ -273,7 +310,7 @@ export function ReportingView(props: {
         {REPORTING_SECTIONS.map((section) => section === props.section ? `[${section.toUpperCase()}]` : section).join("  ")}
       </text>
       <text flexShrink={0} fg={props.colors.muted}>
-        Range {props.filters.timeRange} | posting {props.filters.posting} | mode {props.filters.mode} | search {props.filters.search || "(none)"}
+        Range {props.section === "rules" ? "all generations" : props.filters.timeRange} | posting {props.filters.posting} | mode {props.filters.mode} | search {props.filters.search || "(none)"}
       </text>
       <Show when={props.actionStatus}>
         {(status: () => { message: string; error: boolean }) => <text flexShrink={0} wrapMode="word"

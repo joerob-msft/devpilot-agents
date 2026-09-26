@@ -10,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import { projectRuleRegistry, type RuleEvidence, type RuleSummary } from "./rule-registry.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -107,6 +108,10 @@ export interface RunSummary {
   deliveryOutcome: string;
   diagnostic: string;
   deliveryCapabilityId?: string;
+  toolkitHead?: string;
+  toolkitTree?: string;
+  ownerStateIdentities?: string[];
+  relationStateIdentities?: string[];
 }
 
 export interface FindingSummary {
@@ -167,6 +172,7 @@ export interface DeliverySummary {
   bodyStatus: "verified" | "digest-only" | "unavailable";
   diagnostic: string;
   diagnosticCode?: string;
+  findingId?: string;
 }
 
 export interface FailureSummary {
@@ -214,6 +220,7 @@ export interface ReportingSnapshot {
   deliveries: DeliverySummary[];
   failures: FailureSummary[];
   relations: RelationSummary[];
+  rules?: RuleSummary[];
   quarantine: QuarantineSummary[];
   diagnostics: string[];
   truncated: boolean;
@@ -849,21 +856,27 @@ function parseRecordCounts(value: unknown, name: string): {
   completed: number;
   failed: number;
   attempts: number;
+  identities: string[];
 } {
+  if (!Array.isArray(value)) throw new Error(`${name} must be an array`);
   const records = asArray(value).map(asRecord);
   let completed = 0;
   let failed = 0;
   let attempts = 0;
+  const identities: string[] = [];
   for (const [index, record] of records.entries()) {
     const state = boundedText(record.state, 40);
     if (!["pending", "running", "completed", "incomplete", "unknown"].includes(state)) {
       throw new Error(`${name}[${index}].state is unsupported`);
     }
     attempts += requiredCount(record.attempts, `${name}[${index}].attempts`);
-    if (state === "completed") completed++;
+    const identity = boundedText(record.identity, 64);
+    if (!isHex(identity, 64)) throw new Error(`${name}[${index}].identity is invalid`);
+    if (identities.includes(identity)) throw new Error(`${name} contains a duplicate identity`);
+    if (state === "completed") { completed++; identities.push(identity); }
     else failed++;
   }
-  return { completed, failed, attempts };
+  return { completed, failed, attempts, identities };
 }
 
 function parseCompositeScheduledRun(raw: JsonRecord): RunSummary {
@@ -922,6 +935,9 @@ function parseCompositeScheduledRun(raw: JsonRecord): RunSummary {
     modelWrites: requiredCount(delivery.modelWrites, "ownerAutoDelivery.modelWrites"),
     deliveryOutcome: deliveryHealth,
     ...(coverage ? { deliveryCapabilityId: "bpm-test-class-coverage@1" } : {}),
+    toolkitHead, toolkitTree,
+    ownerStateIdentities: owner.identities,
+    relationStateIdentities: relation.identities,
     diagnostic: `Model-call count is unavailable in owner-relation-v2-preview-scheduled-run v1.${humanCovered
       ? ` ${humanCovered} human-covered finding(s) need review; they are not posted comments.` : ""}`,
   };
@@ -974,7 +990,9 @@ async function readRunHistory(context: ScanContext): Promise<RunSummary[]> {
   if (log && runnerRoot) {
     try {
       const text = (await readBoundedFile(context, log, runnerRoot)).toString("utf8");
-      const lines = text.split(/\r?\n/).filter(Boolean).slice(-context.config.budgets.maxHistory);
+      const allLines = text.split(/\r?\n/).filter(Boolean);
+      if (allLines.length > context.config.budgets.maxHistory) context.truncated = true;
+      const lines = allLines.slice(-context.config.budgets.maxHistory);
       lines.forEach((line, index) => {
         try {
           const value: unknown = JSON.parse(line);
@@ -1014,7 +1032,13 @@ async function readStateObservations(context: ScanContext): Promise<StateObserva
   const indexCache = new Map<string, JsonRecord | null>();
   for (const file of files) {
     const identity = file.split(/[\\/]/).at(-1)?.replace(/\.json$/i, "") ?? "";
-    if (!isHex(identity, 64)) continue;
+    if (!isHex(identity, 64)) {
+      context.quarantine.push({
+        file: relative(root, file), reason: "Observation filename has an invalid state identity.",
+        occurredUtc: "",
+      });
+      continue;
+    }
     try {
       const observation = await readJson(context, file, root);
       const capabilityRoot = dirname(dirname(file));
@@ -1168,10 +1192,11 @@ function projectState(
   observations: StateObservation[],
   latestHeads: Map<number, string>,
   config: ReportingConfiguration,
-): { findings: FindingSummary[]; relations: RelationSummary[]; failures: FailureSummary[] } {
+): { findings: FindingSummary[]; relations: RelationSummary[]; failures: FailureSummary[]; evidence: RuleEvidence[] } {
   const findings: FindingSummary[] = [];
   const relations: RelationSummary[] = [];
   const failures: FailureSummary[] = [];
+  const evidence: RuleEvidence[] = [];
   for (const state of observations) {
     const observation = state.observation;
     const kind = boundedText(observation.kind, 80);
@@ -1187,6 +1212,40 @@ function projectState(
     const lifecycle = asRecord(observation.lifecycle);
     const recordState = boundedText(state.record?.state, 40);
     const indexState = boundedText(state.indexRecord?.state, 40);
+    if (resolvedSubject.diagnostic === "" && recordState === "completed" &&
+        boundedText(lifecycle.status, 40) === "completed" &&
+        Array.isArray(observation.findings) && updatedUtc &&
+        ((kind === "owner-observation" && observation.schemaVersion === 2 &&
+          ["bpm-test-ownership@1", "bpm-test-class-coverage@1"].includes(capability)) ||
+         (kind === "relation-evidence-observation" && observation.schemaVersion === 1 &&
+          capability === "relation-evidence@1"))) {
+      const items = observation.findings.map(asRecord);
+      const ids = items.map((item) => boundedText(item.identity ?? item.findingId, 160));
+      const states = items.map((item) => kind === "owner-observation"
+        ? boundedText(asRecord(item.reconciliation).classification, 40)
+        : boundedText(item.state, 40));
+      const valid = ids.every(Boolean) && new Set(ids).size === ids.length &&
+        states.every((value) => kind === "owner-observation"
+          ? ["wouldCreate", "wouldUpdate", "noOp", "humanCovered", "unknown"].includes(value)
+          : ["violation", "noOp", "unknown"].includes(value));
+      if (valid) {
+        evidence.push({
+          identity: state.identity, capabilityId: capability,
+          ruleId: boundedText(rule.id ?? rule.section, 160),
+          pullRequestId, evaluatedUtc: updatedUtc, findingIds: ids,
+          findings: items.filter((item) => boundedText(item.disposition ?? item.state, 40) === "violation").length,
+          noOp: states.filter((value) => value === "noOp").length,
+          wouldCreate: states.filter((value) => value === "wouldCreate").length,
+          unknown: states.filter((value) => value === "unknown").length,
+        });
+      } else {
+        failures.push({
+          id: `rule-evidence:${state.identity}`, category: "missing-data",
+          occurredUtc: updatedUtc, health: "degraded", pullRequestId, runId: "",
+          message: "Rule observation has malformed or duplicate finding identities/outcomes.",
+        });
+      }
+    }
     if (resolvedSubject.diagnostic) {
       failures.push({
         id: `subject-drift:${state.identity}`, category: "drift",
@@ -1316,7 +1375,7 @@ function projectState(
     left.pullRequestId - right.pullRequestId || left.id.localeCompare(right.id));
   relations.sort((left, right) => Date.parse(right.updatedUtc || "1970-01-01") - Date.parse(left.updatedUtc || "1970-01-01") ||
     left.pullRequestId - right.pullRequestId || left.id.localeCompare(right.id));
-  return { findings, relations, failures };
+  return { findings, relations, failures, evidence };
 }
 
 function toolkitProjection(
@@ -1611,6 +1670,7 @@ function automaticDeliveries(
       modelWrites: safeCount(event.modelWriteCount),
       body: derived.body, bodySha256: derived.digest, bodyStatus: derived.status,
       diagnostic, diagnosticCode,
+      findingId: boundedText(finding.findingId, 160),
     });
     if (outcome === "ambiguous-post-write" || boundedText(event.providerWriteState, 80) === "unknown") {
       failures.push({
@@ -1754,6 +1814,7 @@ function manualDeliveries(
         bodyStatus: bodyVerified ? "verified" : digest ? "digest-only" : "unavailable",
         diagnostic: boundedText(outcome.diagnostic, 240) || resolvedSubject.diagnostic ||
           linkBindingDiagnostic || links.diagnostic,
+        findingId,
       });
     });
     if (boundedText(outcome.status, 80) === "failed" || outcome.providerWrites === "unknown") {
@@ -2025,7 +2086,7 @@ export class LocalReportingAdapter {
       ...projected.relations.map((relation) => relation.updatedUtc || null),
       ...deliveries.map((delivery) => delivery.occurredUtc || null),
     ]);
-    return {
+    const snapshot: ReportingSnapshot = {
       generatedAtUtc: new Date(now).toISOString(),
       dataTimestampUtc,
       overall,
@@ -2040,5 +2101,13 @@ export class LocalReportingAdapter {
       diagnostics: context.diagnostics.slice(0, 50),
       truncated: context.truncated,
     };
+    snapshot.rules = projectRuleRegistry(
+      snapshot, projected.evidence, config.staleAfterMinutes,
+      { automatic: Boolean(config.roots.delivery) &&
+          !context.diagnostics.some((item) => item.startsWith("automatic delivery feed unavailable:")),
+        manual: Boolean(config.roots.manual) &&
+          !context.diagnostics.some((item) => item.startsWith("manual audit feed unavailable:")) },
+    );
+    return snapshot;
   }
 }
