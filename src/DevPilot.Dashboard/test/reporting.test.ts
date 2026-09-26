@@ -636,7 +636,7 @@ test("intake fails closed on duplicate or drifting denominators, claimed evaluat
     assert.equal(snapshot.intake?.state, "unknown");
     assert.equal(snapshot.intake?.discovered, null);
     assert.deepEqual(snapshot.intake?.gaps, ["intake-file-unavailable"]);
-    assert.equal(snapshot.rules?.length, 4);
+    assert.equal(snapshot.rules?.length, 5);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -692,7 +692,7 @@ test("intake reader rejects foreign paths and marks old inventory stale without 
     const foreign = await adapter.read();
     assert.deepEqual(foreign.intake?.gaps, ["intake-path-untrusted"]);
     assert.equal(foreign.intake?.eligible, null);
-    assert.equal(foreign.rules?.length, 4);
+    assert.equal(foreign.rules?.length, 5);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
