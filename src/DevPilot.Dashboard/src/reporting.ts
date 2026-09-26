@@ -88,6 +88,7 @@ export interface ToolkitHealth {
   actualTree: string;
   matches: boolean | null;
   automaticEnabled: boolean | null;
+  namedAreEqualAutomaticEnabled?: boolean | null;
   policyId: string;
   maxCreatesPerRun: number | null;
   maxCreatesPerPullRequest: number | null;
@@ -124,6 +125,9 @@ export interface FindingSummary {
   affectedMethodCount?: number;
   affectedMethods?: string[];
   methodListTruncated?: boolean;
+  affectedCallCount?: number;
+  affectedCallLines?: number[];
+  callListTruncated?: boolean;
   capability: string;
   pullRequestId: number;
   rule: string;
@@ -930,8 +934,10 @@ function parseCompositeScheduledRun(raw: JsonRecord): RunSummary {
   const delivery = asRecord(raw.ownerAutoDelivery);
   const coverage = delivery.kind === "coverage-v2-automatic-delivery-result";
   const redundant = delivery.kind === "redundant-coverage-v2-automatic-delivery-result";
+  const namedAreEqual = delivery.kind === "named-areequal-v2-automatic-delivery-result";
   if (delivery.schemaVersion !== 1 ||
-    (!coverage && !redundant && delivery.kind !== "owner-v2-automatic-delivery-result")) {
+    (!coverage && !redundant && !namedAreEqual &&
+      delivery.kind !== "owner-v2-automatic-delivery-result")) {
     throw new Error("scheduled run automatic delivery result is unsupported");
   }
   const overallOutcome = boundedText(raw.overallOutcome, 40);
@@ -973,7 +979,8 @@ function parseCompositeScheduledRun(raw: JsonRecord): RunSummary {
     modelWrites: requiredCount(delivery.modelWrites, "ownerAutoDelivery.modelWrites"),
     deliveryOutcome: deliveryHealth,
     ...(coverage ? { deliveryCapabilityId: "bpm-test-class-coverage@1" } :
-      redundant ? { deliveryCapabilityId: "bpm-redundant-method-coverage@1" } : {}),
+      redundant ? { deliveryCapabilityId: "bpm-redundant-method-coverage@1" } :
+        namedAreEqual ? { deliveryCapabilityId: "bpm-named-areequal-arguments@1" } : {}),
     toolkitHead, toolkitTree,
     ownerStateIdentities: owner.identities,
     relationStateIdentities: relation.identities,
@@ -1159,6 +1166,27 @@ function redundantClassSummary(finding: JsonRecord): {
   };
 }
 
+function namedAreEqualMethodSummary(finding: JsonRecord): {
+  affectedCallCount: number; affectedCallLines: number[]; callListTruncated: boolean;
+} | null {
+  const count = finding.affectedCallCount;
+  const lines = finding.affectedCallLines;
+  const anchor = findingAnchor(finding);
+  if (!Number.isSafeInteger(count) || (count as number) < 1 || (count as number) > 256 ||
+    !Array.isArray(lines) || lines.length !== count ||
+    !lines.every((line, index) => Number.isSafeInteger(line) && line > 0 && line <= 200_000 &&
+      (index === 0 ? line === anchor.line : line > lines[index - 1])) ||
+    typeof finding.callListTruncated !== "boolean" ||
+    finding.callListTruncated !== ((count as number) > 12) ||
+    !anchor.path || anchor.symbol.length > 256 ||
+    !/^[\p{L}_][\p{L}\p{N}_]*(?:\.[\p{L}_][\p{L}\p{N}_]*)*$/u.test(anchor.symbol)) return null;
+  return {
+    affectedCallCount: count as number,
+    affectedCallLines: lines as number[],
+    callListTruncated: finding.callListTruncated,
+  };
+}
+
 function observationTimestamp(state: StateObservation): string {
   return normalizeTimestamp(state.record?.updatedUtc ?? state.observation.updatedUtc ??
     asRecord(state.observation.lifecycle).completedUtc) ?? "";
@@ -1311,12 +1339,34 @@ function projectState(
       });
       continue;
     }
+    if (kind === "owner-observation" && capability === "bpm-named-areequal-arguments@1" &&
+      (!ruleBound || resolvedSubject.diagnostic || recordState !== "completed" ||
+        boundedText(lifecycle.status, 40) !== "completed" ||
+        boundedText(rule.id ?? rule.section, 160) !== capability ||
+        items.some((item) =>
+          !/^named-areequal-v2:[0-9a-f]{64}$/.test(
+            boundedText(item.identity ?? item.findingId, 160)) ||
+          boundedText(item.disposition, 40) !== "violation" ||
+          boundedText(asRecord(item.reconciliation).classification, 40) === "wouldUpdate" ||
+          !namedAreEqualMethodSummary(item)) ||
+        new Set(items.map((item) => {
+          const anchor = findingAnchor(item);
+          return `${anchor.path}\n${anchor.symbol}`;
+        })).size !== items.length)) {
+      failures.push({
+        id: `rule-binding:${state.identity}`, category: "drift",
+        occurredUtc: updatedUtc, health: "degraded", pullRequestId, runId: "",
+        message: "Named AreEqual observation has a foreign rule, method, or finding identity.",
+      });
+      continue;
+    }
     if (resolvedSubject.diagnostic === "" && recordState === "completed" &&
         boundedText(lifecycle.status, 40) === "completed" &&
         Array.isArray(observation.findings) && updatedUtc && ruleBound && ruleFindingsBound &&
         ((kind === "owner-observation" && observation.schemaVersion === 2 &&
           ["bpm-test-ownership@1", "bpm-test-class-coverage@1",
-            "bpm-redundant-method-coverage@1"].includes(capability)) ||
+            "bpm-redundant-method-coverage@1",
+            "bpm-named-areequal-arguments@1"].includes(capability)) ||
          (kind === "relation-evidence-observation" && observation.schemaVersion === 1 &&
           capability === evidenceCapability))) {
       const ids = items.map((item) => boundedText(item.identity ?? item.findingId, 160));
@@ -1340,6 +1390,9 @@ function projectState(
           ...(capability === "bpm-redundant-method-coverage@1"
             ? { affectedMethodAttributes: items.reduce((sum, item) =>
                 sum + redundantClassSummary(item)!.affectedMethodCount, 0) } : {}),
+          ...(capability === "bpm-named-areequal-arguments@1"
+            ? { affectedCalls: items.reduce((sum, item) =>
+                sum + namedAreEqualMethodSummary(item)!.affectedCallCount, 0) } : {}),
         });
       } else {
         failures.push({
@@ -1445,7 +1498,7 @@ function projectState(
         threadId !== null &&
         commentId !== null;
       const historicalReviewThread = ["bpm-test-class-coverage@1",
-        "bpm-redundant-method-coverage@1"].includes(capability) &&
+        "bpm-redundant-method-coverage@1", "bpm-named-areequal-arguments@1"].includes(capability) &&
         stateValue === "unknown" &&
         boundedText(reconciliation.reason, 120) === "historical-human-review-needs-review" &&
         boundedText(thread.availability, 40) === "available" &&
@@ -1468,6 +1521,8 @@ function projectState(
         stateIdentity: state.identity,
         ...(capability === "bpm-redundant-method-coverage@1"
           ? redundantClassSummary(finding) ?? {} : {}),
+        ...(capability === "bpm-named-areequal-arguments@1"
+          ? namedAreEqualMethodSummary(finding) ?? {} : {}),
         capability, pullRequestId,
         rule: boundedText(rule.id ?? rule.section ?? rule.path, 256),
         severity: boundedText(finding.severity ?? finding.disposition, 80) || "unknown",
@@ -1503,6 +1558,7 @@ function toolkitProjection(
 ): ToolkitHealth {
   const toolkit = asRecord(toolkitConfig?.toolkit);
   const automatic = toolkitConfig ? toolkitConfig.autoCreateOwnerComments : undefined;
+  const namedAutomatic = toolkitConfig ? toolkitConfig.autoCreateNamedAreEqualComments : undefined;
   const policyLimits = asRecord(policy?.limits);
   const actualHead = boundedText(toolkit.head, 40);
   const actualTree = boundedText(toolkit.tree, 40);
@@ -1515,6 +1571,8 @@ function toolkitProjection(
     expectedHead, expectedTree, actualHead, actualTree, matches,
     automaticEnabled: automatic === false || automatic === undefined ? false :
       asRecord(automatic).enabled === true ? true : null,
+    namedAreEqualAutomaticEnabled: namedAutomatic === false || namedAutomatic === undefined
+      ? false : asRecord(namedAutomatic).enabled === true ? true : null,
     policyId: boundedText(policy?.policyId, 128),
     maxCreatesPerRun: nullableInteger(policyLimits.maxCreatesPerRun),
     maxCreatesPerPullRequest: nullableInteger(policyLimits.maxCreatesPerPullRequest),
@@ -1545,8 +1603,26 @@ function selectionMatchesEvent(selection: JsonRecord, event: JsonRecord): boolea
     boundedText(selection.symbol, 256) === boundedText(finding.symbol, 256);
 }
 
+function namedSelectionMatchesObservation(
+  selection: JsonRecord, event: JsonRecord, observedFinding: JsonRecord,
+): boolean {
+  const summary = namedAreEqualMethodSummary(observedFinding);
+  const eventFinding = asRecord(event.finding);
+  const marker = boundedText(eventFinding.marker, 64);
+  const digest = boundedText(eventFinding.bodySha256, 64);
+  return Boolean(summary) &&
+    selection.affectedCallCount === summary!.affectedCallCount &&
+    selection.callListTruncated === summary!.callListTruncated &&
+    JSON.stringify(selection.affectedCallLines) === JSON.stringify(summary!.affectedCallLines) &&
+    selection.markerComment === `<!-- devpilot-named-areequal:v1:${marker} -->` &&
+    isHex(digest, 64) && digest === selection.bodySha256 &&
+    digest === asRecord(observedFinding.reconciliation).bodySha256 &&
+    ["wouldCreate", "noOp"].includes(boundedText(selection.classification, 40));
+}
+
 function coverageIntentMatchesEvent(
-  event: JsonRecord, intent: JsonRecord | undefined, prefix: "coverage-v2" | "redundant-coverage-v2",
+  event: JsonRecord, intent: JsonRecord | undefined,
+  prefix: "coverage-v2" | "redundant-coverage-v2" | "named-areequal-v2",
   capabilityId: string,
 ): boolean {
   if (!intent || intent.schemaVersion !== 1 || intent.kind !== `${prefix}-service-create-intent`) return false;
@@ -1589,17 +1665,22 @@ function deriveBody(
 ): { body: string | null; digest: string; status: DeliverySummary["bodyStatus"] } {
   const coverage = event.kind === "coverage-v2-delivery-event";
   const redundant = event.kind === "redundant-coverage-v2-delivery-event";
+  const namedAreEqual = event.kind === "named-areequal-v2-delivery-event";
   if (!intent || intent.kind !== (coverage ? "coverage-v2-service-create-intent" :
-    redundant ? "redundant-coverage-v2-service-create-intent" : "owner-v2-service-create-intent")) {
+    redundant ? "redundant-coverage-v2-service-create-intent" :
+      namedAreEqual ? "named-areequal-v2-service-create-intent" : "owner-v2-service-create-intent")) {
     return { body: null, digest: "", status: "unavailable" };
   }
   const finding = asRecord(event.finding);
   const identity = boundedText(finding.stateIdentity, 64);
-  if ((coverage || redundant) && (boundedText(asRecord(intent.state).identity, 64) !== identity ||
+  if ((coverage || redundant || namedAreEqual) &&
+    (boundedText(asRecord(intent.state).identity, 64) !== identity ||
     boundedText(asRecord(intent.capability).id, 160) !== (coverage
-      ? "bpm-test-class-coverage@1" : "bpm-redundant-method-coverage@1") ||
+      ? "bpm-test-class-coverage@1" : redundant
+        ? "bpm-redundant-method-coverage@1" : "bpm-named-areequal-arguments@1") ||
     boundedText(asRecord(intent.rule).section, 160) !== (coverage
-      ? "bpm-test-class-coverage@1" : "bpm-redundant-method-coverage@1"))) {
+      ? "bpm-test-class-coverage@1" : redundant
+        ? "bpm-redundant-method-coverage@1" : "bpm-named-areequal-arguments@1"))) {
     return { body: null, digest: "", status: "unavailable" };
   }
   const selection = asArray(intent.selections).map(asRecord).find((candidate) => selectionMatchesEvent(candidate, event));
@@ -1673,8 +1754,9 @@ function automaticDeliveries(
   const intentByRun = new Map(intents
     .filter(({ payload }) => payload.kind === "owner-v2-service-create-intent" ||
       payload.kind === "coverage-v2-service-create-intent" ||
-      payload.kind === "redundant-coverage-v2-service-create-intent")
-    .map(({ payload }) => [boundedText(payload.runId, 128), payload]));
+      payload.kind === "redundant-coverage-v2-service-create-intent" ||
+      payload.kind === "named-areequal-v2-service-create-intent")
+    .map(({ payload }) => [`${boundedText(payload.kind, 80)}:${boundedText(payload.runId, 128)}`, payload]));
   const grouped = new Map<string, SignedPayload[]>();
   for (const event of events) {
     const id = boundedText(event.payload.eventId, 128);
@@ -1686,7 +1768,8 @@ function automaticDeliveries(
     const event = group[0]!.payload;
     if (event.schemaVersion !== 1 ||
       (event.kind !== "owner-v2-delivery-event" && event.kind !== "coverage-v2-delivery-event" &&
-        event.kind !== "redundant-coverage-v2-delivery-event")) continue;
+        event.kind !== "redundant-coverage-v2-delivery-event" &&
+        event.kind !== "named-areequal-v2-delivery-event")) continue;
     const subject = asRecord(event.subject);
     const finding = asRecord(event.finding);
     const pullRequestId = safeCount(subject.pullRequestId);
@@ -1694,10 +1777,13 @@ function automaticDeliveries(
     const occurredUtc = eventOccurred(event);
     const coverage = event.kind === "coverage-v2-delivery-event";
     const redundant = event.kind === "redundant-coverage-v2-delivery-event";
+    const namedAreEqual = event.kind === "named-areequal-v2-delivery-event";
     const dedicatedCapability = coverage ? "bpm-test-class-coverage@1" :
-      redundant ? "bpm-redundant-method-coverage@1" : "";
-    const prefix = coverage ? "coverage-v2" : "redundant-coverage-v2";
-    const intent = intentByRun.get(runId);
+      redundant ? "bpm-redundant-method-coverage@1" :
+        namedAreEqual ? "bpm-named-areequal-arguments@1" : "";
+    const prefix = coverage ? "coverage-v2" : redundant ? "redundant-coverage-v2" : "named-areequal-v2";
+    const intent = intentByRun.get(`${prefix}-service-create-intent:${runId}`) ??
+      (dedicatedCapability ? undefined : intentByRun.get(`owner-v2-service-create-intent:${runId}`));
     const capabilityId = boundedText(event.capabilityId, 160) ||
       (dedicatedCapability ? "" : "bpm-test-ownership@1");
     const ruleId = boundedText(event.ruleId, 160);
@@ -1721,11 +1807,12 @@ function automaticDeliveries(
     const historicalRefusal = Boolean(dedicatedCapability) &&
       diagnosticCode === "historical-human-review-needs-review";
     const outcome = boundedText(event.outcome, 120) || "unknown";
-    if (redundant && (!["create", "none"].includes(boundedText(event.action, 80)) ||
+    if ((redundant || namedAreEqual) &&
+      (!["create", "none"].includes(boundedText(event.action, 80)) ||
       /update/i.test(outcome))) {
       failures.push({
         id: `event-binding:${eventId}`, category: "drift", occurredUtc, health: "degraded",
-        pullRequestId, runId, message: "Redundant method coverage is create-only; update delivery is not eligible.",
+        pullRequestId, runId, message: `${namedAreEqual ? "Named AreEqual" : "Redundant method coverage"} is create-only; update delivery is not eligible.`,
       });
       continue;
     }
@@ -1742,10 +1829,12 @@ function automaticDeliveries(
       });
       continue;
     }
-    if (redundant) {
+    if (redundant || namedAreEqual) {
       const identity = boundedText(finding.stateIdentity, 64);
       const observedState = observations.get(identity);
       const observedFinding = findObservationFinding(observations, identity, boundedText(finding.findingId, 160));
+      const selected = asArray(intent?.selections).map(asRecord).find((item) =>
+        selectionMatchesEvent(item, event));
       const binding = resolveObservationSubject(observedState, config);
       const observedAnchor = findingAnchor(asRecord(observedFinding));
       const observedSubject = asRecord(observedState?.observation.subject);
@@ -1754,7 +1843,21 @@ function automaticDeliveries(
         boundedText(asRecord(observedState?.declaration?.capability).id, 160) !== dedicatedCapability ||
         boundedText(asRecord(observedState?.observation.rule).section ??
           asRecord(observedState?.observation.rule).id, 160) !== ruleId ||
+        (namedAreEqual && (
+          !isHex(boundedText(finding.bodySha256, 64), 64) ||
+          boundedText(finding.bodySha256, 64) !==
+            boundedText(asRecord(asRecord(observedFinding).reconciliation).bodySha256, 64) ||
+          boundedText(asRecord(observedState?.observation.rule).path, 1_024) !==
+            boundedText(asRecord(observedState?.declaration?.rule).path, 1_024) ||
+          boundedText(asRecord(observedState?.observation.rule).commit, 40) !==
+            boundedText(asRecord(observedState?.declaration?.rule).commit, 40) ||
+          boundedText(asRecord(observedState?.declaration?.rule).section, 160) !== ruleId)) ||
         !observedFinding ||
+        (namedAreEqual && (!/^named-areequal-v2:[0-9a-f]{64}$/.test(
+          boundedText(finding.findingId, 160)) ||
+          !namedAreEqualMethodSummary(asRecord(observedFinding)) ||
+          (postedCoverage && (!selected ||
+            !namedSelectionMatchesObservation(selected, event, asRecord(observedFinding)))))) ||
         boundedText(finding.path, 1_024) !== observedAnchor.path ||
         safeCount(finding.line) !== observedAnchor.line ||
         boundedText(finding.symbol, 256) !== observedAnchor.symbol ||
@@ -1766,7 +1869,7 @@ function automaticDeliveries(
         boundedText(subject.targetRef, 256) !== boundedText(observedSubject.targetRef, 256)) {
         failures.push({
           id: `event-binding:${eventId}`, category: "drift", occurredUtc, health: "degraded",
-          pullRequestId, runId, message: "Redundant method coverage delivery does not match its completed observation and source/target binding.",
+          pullRequestId, runId, message: "Rule delivery does not match its completed observation and source/target binding.",
         });
         continue;
       }
@@ -1815,16 +1918,23 @@ function automaticDeliveries(
         continue;
       }
     }
-    const sourceCommit = boundedText(subject.sourceCommit, 40);
-    const previous = latestHeads.get(pullRequestId);
-    if (sourceCommit && (!previous || Date.parse(occurredUtc || "1970-01-01") > previous.timestamp)) {
-      latestHeads.set(pullRequestId, { timestamp: Date.parse(occurredUtc || "1970-01-01"), commit: sourceCommit });
-    }
     const links = safeLinks(config, boundedText(subject.projectId, 128), boundedText(subject.repositoryId, 128),
       pullRequestId, threadId, commentId, path, line);
     const derived = historicalRefusal
       ? { body: null, digest: "", status: "unavailable" as const }
       : deriveBody(event, intent, observations, toolkit, localFormatterDigest);
+    if (namedAreEqual && postedCoverage && derived.status !== "verified") {
+      failures.push({
+        id: `event-binding:${eventId}`, category: "drift", occurredUtc, health: "degraded",
+        pullRequestId, runId, message: "Named AreEqual event body does not match the signed intent and completed method finding.",
+      });
+      continue;
+    }
+    const sourceCommit = boundedText(subject.sourceCommit, 40);
+    const previous = latestHeads.get(pullRequestId);
+    if (sourceCommit && (!previous || Date.parse(occurredUtc || "1970-01-01") > previous.timestamp)) {
+      latestHeads.set(pullRequestId, { timestamp: Date.parse(occurredUtc || "1970-01-01"), commit: sourceCommit });
+    }
     const diagnostic = boundedText(eventDiagnostic.message, 240) || links.diagnostic;
     deliveries.push({
       id: `automatic:${eventId}`, mode: "automatic",
@@ -2132,6 +2242,7 @@ export class LocalReportingAdapter {
     const config = parseReportingConfiguration(configValue);
     this.cachedRefreshIntervalMs = config.refreshIntervalSeconds * 1_000;
     const roots = Object.values(config.roots).filter((value): value is string => Boolean(value));
+    if (config.roots.delivery) roots.push(join(config.roots.delivery, "named-areequal-v1"));
     const guard = new RootGuard(roots);
     const context: ScanContext = {
       config,
@@ -2195,6 +2306,9 @@ export class LocalReportingAdapter {
     let policy: JsonRecord | null = null;
     let automaticEvents: SignedPayload[] = [];
     let automaticIntents: SignedPayload[] = [];
+    let namedEvents: SignedPayload[] = [];
+    let namedIntents: SignedPayload[] = [];
+    let namedFeedVerified = false;
     let manualIntents: SignedPayload[] = [];
     let manualOutcomes: SignedPayload[] = [];
 
@@ -2219,6 +2333,26 @@ export class LocalReportingAdapter {
       } catch (error) {
         context.diagnostics.push(`automatic delivery feed unavailable: ${boundedText(error instanceof Error ? error.message : String(error), 180)}`);
       }
+      const namedRoot = join(root, "named-areequal-v1");
+      try {
+        const info = await lstat(namedRoot);
+        if (!info.isDirectory() || info.isSymbolicLink()) {
+          throw new Error("named AreEqual delivery root is not a regular directory");
+        }
+        const key = await assertPrivateKey(
+          join(namedRoot, "keys", "named-areequal-service-authorization.hmac"),
+          context, namedRoot,
+        );
+        namedEvents = await readSignedDirectory(context, namedRoot, join(namedRoot, "events"), key);
+        namedIntents = await readSignedDirectory(context, namedRoot, join(namedRoot, "intents"), key);
+        namedFeedVerified = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" ||
+          await lstat(namedRoot).then(() => true, () => false)) {
+          context.diagnostics.push(`named AreEqual delivery feed unavailable: ${
+            boundedText(error instanceof Error ? error.message : String(error), 180)}`);
+        }
+      }
     }
     if (config.roots.manual) {
       const root = config.roots.manual;
@@ -2240,6 +2374,41 @@ export class LocalReportingAdapter {
         automaticIntents, config.roots.delivery, "automatic runId",
         (payload) => boundedText(payload.runId, 128), context,
       );
+      if (namedFeedVerified) {
+        const namedRoot = join(config.roots.delivery, "named-areequal-v1");
+        namedEvents = deduplicateSignedPayloads(
+          namedEvents, namedRoot, "named AreEqual delivery eventId",
+          (payload) => boundedText(payload.eventId, 128), context,
+        );
+        namedIntents = deduplicateSignedPayloads(
+          namedIntents, namedRoot, "named AreEqual automatic runId",
+          (payload) => boundedText(payload.runId, 128), context,
+        );
+      }
+      const onlyNamed = (item: SignedPayload, kind: string) => {
+        if (item.payload.kind === kind) return true;
+        context.quarantine.push({
+          file: relative(config.roots.delivery!, item.file),
+          reason: "named AreEqual audit root contains a foreign signed kind",
+          occurredUtc: "",
+        });
+        return false;
+      };
+      const withoutNamed = (item: SignedPayload, kind: string) => {
+        if (item.payload.kind !== kind) return true;
+        context.quarantine.push({
+          file: relative(config.roots.delivery!, item.file),
+          reason: "named AreEqual audit requires its independent signed root and key",
+          occurredUtc: "",
+        });
+        return false;
+      };
+      automaticEvents = automaticEvents.filter((item) =>
+        withoutNamed(item, "named-areequal-v2-delivery-event"));
+      automaticIntents = automaticIntents.filter((item) =>
+        withoutNamed(item, "named-areequal-v2-service-create-intent"));
+      namedEvents = namedEvents.filter((item) => onlyNamed(item, "named-areequal-v2-delivery-event"));
+      namedIntents = namedIntents.filter((item) => onlyNamed(item, "named-areequal-v2-service-create-intent"));
     }
     if (config.roots.manual) {
       manualIntents = deduplicateSignedPayloads(
@@ -2254,7 +2423,8 @@ export class LocalReportingAdapter {
     const toolkit = toolkitProjection(toolkitConfig, config.expectedToolkit, policy, toolkitDiagnostic);
     const localFormatterDigest = await formatterDigest(context);
     const automatic = automaticDeliveries(
-      automaticEvents, automaticIntents, observationMap, toolkit, localFormatterDigest, config,
+      [...automaticEvents, ...namedEvents], [...automaticIntents, ...namedIntents],
+      observationMap, toolkit, localFormatterDigest, config,
     );
     const projected = projectState(observations, automatic.latestHeads, config);
     const manual = manualDeliveries(manualIntents, manualOutcomes, observationMap, config);
@@ -2320,6 +2490,7 @@ export class LocalReportingAdapter {
       snapshot, projected.evidence, config.staleAfterMinutes,
       { automatic: Boolean(config.roots.delivery) &&
           !context.diagnostics.some((item) => item.startsWith("automatic delivery feed unavailable:")),
+        namedAutomatic: namedFeedVerified,
         manual: Boolean(config.roots.manual) &&
           !context.diagnostics.some((item) => item.startsWith("manual audit feed unavailable:")) },
     );

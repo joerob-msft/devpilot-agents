@@ -15,6 +15,7 @@ export interface RuleEvidence {
   findingIds: string[];
   findings: number;
   affectedMethodAttributes?: number;
+  affectedCalls?: number;
   noOp: number;
   wouldCreate: number;
   unknown: number;
@@ -51,6 +52,7 @@ export interface RuleSummary {
   lastEvaluatedUtc: string | null;
   counts: RuleOutcomeCounts;
   affectedMethodAttributes: number | null;
+  affectedCalls: number | null;
   findingIds: string[];
   deliveryIds: string[];
   url: string | null;
@@ -64,7 +66,7 @@ interface RuleDefinition {
   provenance: string;
   implementationVersion: string;
   capabilityId: string;
-  runChannel: "owner" | "relation" | "coverage" | "redundant";
+  runChannel: "owner" | "relation" | "coverage" | "redundant" | "named-areequal";
 }
 
 // Source inventory is not an installation or deployment manifest.
@@ -101,12 +103,21 @@ export const IMPLEMENTED_RULES: readonly RuleDefinition[] = [
     capabilityId: "bpm-redundant-method-coverage@1",
     runChannel: "redundant",
   },
+  {
+    id: "bpm-named-areequal-arguments@1",
+    description: "Changed positional Assert.AreEqual calls in MSTest methods require named arguments; one finding per method.",
+    provenance: "Independent EngHub Named parameters for Assert convention; source implemented, not deployed or authorized in the pinned service",
+    implementationVersion: "bpm-named-areequal-arguments@1",
+    capabilityId: "bpm-named-areequal-arguments@1",
+    runChannel: "named-areequal",
+  },
 ];
 
 function runIdentities(run: RunSummary, channel: RuleDefinition["runChannel"]): string[] {
   if (channel === "relation") return run.relationStateIdentities ?? [];
   if (channel === "coverage" && run.deliveryCapabilityId !== "bpm-test-class-coverage@1") return [];
   if (channel === "redundant" && run.deliveryCapabilityId !== "bpm-redundant-method-coverage@1") return [];
+  if (channel === "named-areequal" && run.deliveryCapabilityId !== "bpm-named-areequal-arguments@1") return [];
   if (channel === "owner" && run.deliveryCapabilityId) return [];
   return run.ownerStateIdentities ?? [];
 }
@@ -116,16 +127,17 @@ function matchingDelivery(
   bound: { state: RuleEvidence; run: RunSummary }[],
 ): boolean {
   return delivery.capabilityId === definition.capabilityId &&
-    (definition.runChannel !== "redundant" ||
+    (!["redundant", "named-areequal"].includes(definition.runChannel) ||
       (["create", "none"].includes(delivery.action) && !/update/i.test(delivery.outcome))) &&
     bound.some(({ state, run }) => state.pullRequestId === delivery.pullRequestId &&
       state.findingIds.includes(delivery.findingId ?? "") &&
-      (definition.runChannel !== "redundant" ||
+      (!["redundant", "named-areequal"].includes(definition.runChannel) ||
         (delivery.stateIdentity === state.identity &&
           delivery.runId === run.runId &&
           Date.parse(delivery.occurredUtc) <= Date.parse(run.occurredUtc) &&
           Date.parse(delivery.occurredUtc) >= Date.parse(state.evaluatedUtc))) &&
-      (!["coverage", "redundant"].includes(definition.runChannel) || delivery.rule === definition.id));
+      (!["coverage", "redundant", "named-areequal"].includes(definition.runChannel) ||
+        delivery.rule === definition.id));
 }
 
 export function projectRuleRegistry(
@@ -133,7 +145,7 @@ export function projectRuleRegistry(
     "findings" | "relations" | "deliveries" | "failures" | "quarantine" | "diagnostics" | "truncated" | "intake">,
   evidence: RuleEvidence[],
   staleAfterMinutes: number,
-  feeds: { automatic: boolean; manual: boolean },
+  feeds: { automatic: boolean; manual: boolean; namedAutomatic?: boolean },
 ): RuleSummary[] {
   const toolkitVerified = snapshot.toolkit.matches === true &&
     /^[a-f0-9]{40}$/i.test(snapshot.toolkit.actualHead) &&
@@ -199,7 +211,7 @@ export function projectRuleRegistry(
       finding.capability === definition.capabilityId &&
       scoped.some((state) => state.pullRequestId === finding.pullRequestId &&
         state.findingIds.includes(finding.id) &&
-        (definition.runChannel !== "redundant" ||
+        (!["redundant", "named-areequal"].includes(definition.runChannel) ||
           (finding.stateIdentity === state.identity && finding.rule === definition.id))));
     const linkedRelations = snapshot.relations.filter((finding) =>
       finding.capability === definition.capabilityId &&
@@ -207,7 +219,9 @@ export function projectRuleRegistry(
         state.findingIds.includes(finding.id)));
     const linkedDeliveries = snapshot.deliveries.filter((delivery) =>
       matchingDelivery(delivery, definition, bound));
-    const deliveryEvidenceComplete = complete && (feeds.automatic || feeds.manual);
+    const deliveryEvidenceComplete = complete && (definition.runChannel === "named-areequal"
+      ? feeds.namedAutomatic === true
+      : feeds.automatic || feeds.manual);
     if (!deliveryEvidenceComplete) gaps.push("Verified delivery feed unavailable; posting and refusal counts are unknown.");
     gaps.push("Skipped/PR-intake denominator is not emitted per rule; skipped count and total coverage are unknown.");
     const sum = (field: "findings" | "noOp" | "wouldCreate" | "unknown") =>
@@ -223,13 +237,13 @@ export function projectRuleRegistry(
       posted: latest && deliveryEvidenceComplete
         ? linkedDeliveries.filter((item) => item.providerWrites > 0 &&
           item.providerWriteState === "confirmed" &&
-          (definition.runChannel === "redundant"
+          (["redundant", "named-areequal"].includes(definition.runChannel)
             ? item.action === "create" &&
               /^(created|created-confirmed-after-error|recovered-confirmed)$/.test(item.outcome)
             : /^(created|updated|created-confirmed-after-error|recovered-confirmed)$/.test(item.outcome))
         ).length : null,
     };
-    const separateRule = definition.runChannel === "coverage" || definition.runChannel === "redundant";
+    const separateRule = ["coverage", "redundant", "named-areequal"].includes(definition.runChannel);
     const pinnedOut = separateRule && !latest && toolkitVerified && complete;
     const deployment: RuleStatus = pinnedOut ? "not-deployed" :
       latest && toolkitVerified ? "verified" : "unknown";
@@ -239,6 +253,8 @@ export function projectRuleRegistry(
           snapshot.task.enabled === true && deployment === "verified" ? "verified" : "unknown";
     const authorization: PublishingStatus = definition.runChannel === "relation" ? "not-eligible" :
       pinnedOut ? "disabled" :
+        definition.runChannel === "named-areequal" &&
+          snapshot.toolkit.namedAreEqualAutomaticEnabled === false ? "disabled" :
         !toolkitVerified || !feeds.automatic ? "unknown" :
           definition.runChannel === "owner" && snapshot.toolkit.automaticEnabled === true &&
             snapshot.toolkit.policyId && snapshot.toolkit.maxCreatesPerRun !== null &&
@@ -252,7 +268,9 @@ export function projectRuleRegistry(
         authorization === "enabled" && enablement === "verified" ? "enabled" : "unknown";
     if (pinnedOut) gaps.push(definition.runChannel === "coverage"
       ? "Operator reports class coverage not deployed; local data has no bound class run. Do not infer deployment from PR 174 code."
-      : "Redundant method coverage is not deployed in the pinned service; no bound rule-specific run exists.");
+      : definition.runChannel === "redundant"
+        ? "Redundant method coverage is not deployed in the pinned service; no bound rule-specific run exists."
+        : "Named AreEqual arguments is not deployed in the pinned service; no bound rule-specific run exists.");
     if (separateRule && !pinnedOut && publishing === "unknown") {
       gaps.push("No verified rule-specific automatic authorization; another rule's policy does not authorize this rule.");
     }
@@ -284,6 +302,10 @@ export function projectRuleRegistry(
       affectedMethodAttributes: definition.runChannel === "redundant" && latest &&
         scoped.every((state) => Number.isSafeInteger(state.affectedMethodAttributes))
         ? scoped.reduce((total, state) => total + state.affectedMethodAttributes!, 0)
+        : null,
+      affectedCalls: definition.runChannel === "named-areequal" && latest &&
+        scoped.every((state) => Number.isSafeInteger(state.affectedCalls))
+        ? scoped.reduce((total, state) => total + state.affectedCalls!, 0)
         : null,
       findingIds,
       deliveryIds: linkedDeliveries.map((item) => item.id),

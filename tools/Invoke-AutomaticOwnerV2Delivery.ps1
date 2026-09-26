@@ -12,7 +12,7 @@ param(
     [ValidatePattern('^$|^[0-9a-f]{64}$')][string]$Identity,
     [string]$ToolkitConfigPath,
     [string]$PolicyPath,
-    [ValidateSet('owner', 'coverage', 'redundant-coverage')]
+    [ValidateSet('owner', 'coverage', 'redundant-coverage', 'named-areequal')]
     [string]$Delivery = 'owner',
     [ValidatePattern('^[a-z0-9][a-z0-9_.-]{2,63}$')]
     [string]$PolicyId = '',
@@ -38,7 +38,8 @@ Import-Module (Join-Path $RepoRoot `
 . (Join-Path $RepoRoot `
     'src\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
 
-if ($Command -ceq 'invoke' -and $Delivery -ceq 'redundant-coverage') {
+if ($Command -ceq 'invoke' -and $Delivery -cin @(
+        'redundant-coverage', 'named-areequal')) {
     if ([string]::IsNullOrWhiteSpace($StateRoot) -or
         [string]::IsNullOrWhiteSpace($Identity) -or
         [string]::IsNullOrWhiteSpace($ToolkitConfigPath) -or
@@ -50,12 +51,20 @@ if ($Command -ceq 'invoke' -and $Delivery -ceq 'redundant-coverage') {
     $configured = Get-AutomaticOwnerV2Configuration `
         -ToolkitConfig $toolkitConfig -Delivery $Delivery
     if (-not $configured.Enabled) {
-        $disabledEvidence = Read-AutomaticRedundantCoverageEvidence `
-            -StateRoot $StateRoot -Identity $Identity -RepoRoot $RepoRoot `
-            -ToolkitConfigPath $ToolkitConfigPath
+        $disabledEvidence = if ($Delivery -ceq 'named-areequal') {
+            Read-AutomaticNamedAreEqualEvidence `
+                -StateRoot $StateRoot -Identity $Identity -RepoRoot $RepoRoot `
+                -ToolkitConfigPath $ToolkitConfigPath
+        } else {
+            Read-AutomaticRedundantCoverageEvidence `
+                -StateRoot $StateRoot -Identity $Identity -RepoRoot $RepoRoot `
+                -ToolkitConfigPath $ToolkitConfigPath
+        }
         [pscustomobject][ordered]@{
             schemaVersion = 1
-            kind = 'redundant-coverage-v2-automatic-delivery-result'
+            kind = $(if ($Delivery -ceq 'named-areequal') {
+                    'named-areequal-v2-automatic-delivery-result'
+                } else { 'redundant-coverage-v2-automatic-delivery-result' })
             health = 'disabled'
             providerWrites = 0
             modelWrites = 0
@@ -71,7 +80,9 @@ if ($Command -ceq 'invoke' -and $Delivery -ceq 'redundant-coverage') {
 $context = Initialize-AutomaticOwnerV2DeliveryRoot `
     -DeliveryRoot $DeliveryRoot -RepoRoot $RepoRoot -Delivery $Delivery
 if (-not $PolicyId) {
-    $PolicyId = if ($Delivery -ceq 'redundant-coverage') {
+    $PolicyId = if ($Delivery -ceq 'named-areequal') {
+        'named-areequal-v1-production'
+    } elseif ($Delivery -ceq 'redundant-coverage') {
         'redundant-coverage-v2-production'
     } elseif ($Delivery -ceq 'coverage') {
         'coverage-v2-production'
@@ -95,7 +106,11 @@ if ([string]::IsNullOrWhiteSpace($StateRoot) -or
     -not [IO.Path]::IsPathFullyQualified($ToolkitConfigPath)) {
     throw "$Command requires absolute state/config paths and an exact state identity."
 }
-$evidence = if ($Delivery -ceq 'redundant-coverage') {
+$evidence = if ($Delivery -ceq 'named-areequal') {
+    Read-AutomaticNamedAreEqualEvidence -StateRoot $StateRoot `
+        -Identity $Identity -RepoRoot $RepoRoot `
+        -ToolkitConfigPath $ToolkitConfigPath
+} elseif ($Delivery -ceq 'redundant-coverage') {
     Read-AutomaticRedundantCoverageEvidence -StateRoot $StateRoot `
         -Identity $Identity -RepoRoot $RepoRoot `
         -ToolkitConfigPath $ToolkitConfigPath
@@ -144,6 +159,8 @@ if (-not $automatic.Enabled) {
         schemaVersion = 1
         kind = $(if ($Delivery -ceq 'redundant-coverage') {
                 'redundant-coverage-v2-automatic-delivery-result'
+            } elseif ($Delivery -ceq 'named-areequal') {
+                'named-areequal-v2-automatic-delivery-result'
             } elseif ($Delivery -ceq 'coverage') {
                 'coverage-v2-automatic-delivery-result'
             } else { 'owner-v2-automatic-delivery-result' })

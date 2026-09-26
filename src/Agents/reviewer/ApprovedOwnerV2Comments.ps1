@@ -9,6 +9,9 @@ $script:ApprovedCoverageCapability = 'bpm-test-class-coverage@1'
 $script:ApprovedRedundantCoverageCapability = 'bpm-redundant-method-coverage@1'
 $script:ApprovedRedundantCoveragePolicyPath =
     'src/DevPilot.OwnerCapability/Policy/redundant-method-coverage.v1.txt'
+$script:ApprovedNamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
+$script:ApprovedNamedAreEqualPolicyPath =
+    'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
 $script:ApprovedOwnerV2MaximumSelections = 5
@@ -255,12 +258,44 @@ function Assert-ApprovedOwnerV2RedundantMethodGroup {
     }
 }
 
+function Assert-ApprovedOwnerV2NamedAreEqualGroup {
+    param([Parameter(Mandatory)][Collections.IDictionary]$Finding)
+    $count = Get-ApprovedOwnerV2Value $Finding 'affectedCallCount'
+    $lines = $Finding['affectedCallLines']
+    $truncated = Get-ApprovedOwnerV2Value $Finding 'callListTruncated'
+    if (($count -isnot [int] -and $count -isnot [long]) -or
+        [long]$count -lt 1 -or [long]$count -gt 256 -or
+        $lines -isnot [Collections.IList] -or
+        @($lines).Count -ne [int]$count -or
+        $truncated -isnot [bool] -or
+        [bool]$truncated -ne ([int]$count -gt 12) -or
+        ([string]$Finding.anchor.symbol).Length -gt 256 -or
+        [string]$Finding.anchor.symbol -cnotmatch
+        '^[\p{L}_][\p{L}\p{N}_]*(?:\.[\p{L}_][\p{L}\p{N}_]*)*$') {
+        throw 'Named AreEqual method group requires bounded count, lines, and symbol.'
+    }
+    $previous = 0
+    foreach ($line in $lines) {
+        if (($line -isnot [int] -and $line -isnot [long]) -or
+            [long]$line -le $previous -or [long]$line -gt 200000) {
+            throw 'Named AreEqual changed call anchors must be strictly ordered.'
+        }
+        $previous = [long]$line
+    }
+    if ([int]$lines[0] -ne [int]$Finding.anchor.line) {
+        throw 'Named AreEqual method must anchor its first changed violating call.'
+    }
+}
+
 function Get-ApprovedOwnerV2HistoricalCoverageFindings {
     param(
         [Parameter(Mandatory)][Collections.IDictionary]$Observation,
-        [switch]$RedundantMethod
+        [switch]$RedundantMethod,
+        [switch]$NamedAreEqual
     )
-    $identityPattern = if ($RedundantMethod) {
+    $identityPattern = if ($NamedAreEqual) {
+        '^named-areequal-v2:[0-9a-f]{64}$'
+    } elseif ($RedundantMethod) {
         '^redundant-coverage-v2:[0-9a-f]{64}$'
     } else { '^coverage-v2:[0-9a-f]{64}$' }
     $findings = @($Observation.findings)
@@ -294,7 +329,7 @@ function Get-ApprovedOwnerV2HistoricalCoverageFindings {
                 [int]$_.binding.source.representation.startLine -or
                 [int]$_.anchor.line -ne
                 [int]$_.binding.source.representation.endLine -or
-                ($RedundantMethod -and
+                (($RedundantMethod -or $NamedAreEqual) -and
                     [string]$_.anchor.symbol -cnotmatch
                     '^[\p{L}_][\p{L}\p{N}_]*(?:\.[\p{L}_][\p{L}\p{N}_]*)*$')
             }).Count -gt 0) {
@@ -303,6 +338,11 @@ function Get-ApprovedOwnerV2HistoricalCoverageFindings {
     if ($RedundantMethod) {
         foreach ($finding in $historical) {
             Assert-ApprovedOwnerV2RedundantMethodGroup -Finding $finding
+        }
+    }
+    if ($NamedAreEqual) {
+        foreach ($finding in $historical) {
+            Assert-ApprovedOwnerV2NamedAreEqualGroup -Finding $finding
         }
     }
     return $historical
@@ -315,13 +355,16 @@ function Read-ApprovedOwnerV2Evidence {
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$Identity,
         [Parameter(Mandatory)][string]$RepoRoot,
         [Parameter(Mandatory)][string]$ToolkitConfigPath,
-        [ValidateSet('owner', 'coverage', 'redundant-coverage')]
+        [ValidateSet('owner', 'coverage', 'redundant-coverage', 'named-areequal')]
         [string]$Delivery = 'owner'
     )
     $state = [IO.Path]::GetFullPath($StateRoot)
     $redundant = $Delivery -ceq 'redundant-coverage'
+    $namedAreEqual = $Delivery -ceq 'named-areequal'
     $coverage = $Delivery -cne 'owner'
-    $expectedCapability = if ($redundant) {
+    $expectedCapability = if ($namedAreEqual) {
+        $script:ApprovedNamedAreEqualCapability
+    } elseif ($redundant) {
         $script:ApprovedRedundantCoverageCapability
     } elseif ($coverage) {
         $script:ApprovedCoverageCapability
@@ -387,6 +430,11 @@ function Read-ApprovedOwnerV2Evidence {
                 $script:ApprovedRedundantCoveragePolicyPath -or
                 [string]$declaration.config.id -cne
                 'redundant-method-coverage-v1-user-approved')) -or
+        ($namedAreEqual -and
+            ([string]$declaration.rule.path -cne
+                $script:ApprovedNamedAreEqualPolicyPath -or
+                [string]$declaration.config.id -cne
+                'named-areequal-arguments-v1-user-approved')) -or
         [string]$declaration.capability.digest -cne $capabilityDigest -or
         [string]$declaration.subject.projectId -cne
         [string]$subjectProvider.projectId -or
@@ -400,7 +448,8 @@ function Read-ApprovedOwnerV2Evidence {
     }
     if ($coverage) {
         [void]@(Get-ApprovedOwnerV2HistoricalCoverageFindings `
-                -Observation $observation -RedundantMethod:$redundant)
+                -Observation $observation -RedundantMethod:$redundant `
+                -NamedAreEqual:$namedAreEqual)
     }
     if ([int]$observation.schemaVersion -ne 2 -or
         [string]$observation.kind -cne 'owner-observation' -or
@@ -516,12 +565,15 @@ function Assert-ApprovedOwnerV2CoverageEvidence {
     param([Parameter(Mandatory)]$Evidence)
     $capability = [string]$Evidence.Declaration.capability.id
     $redundant = $capability -ceq $script:ApprovedRedundantCoverageCapability
+    $namedAreEqual = $capability -ceq $script:ApprovedNamedAreEqualCapability
     if ($capability -cnotin @($script:ApprovedCoverageCapability,
-            $script:ApprovedRedundantCoverageCapability)) {
-        throw 'Only class or redundant method coverage evidence is eligible.'
+            $script:ApprovedRedundantCoverageCapability,
+            $script:ApprovedNamedAreEqualCapability)) {
+        throw 'Only independently bound deterministic rule evidence is eligible.'
     }
     [void]@(Get-ApprovedOwnerV2HistoricalCoverageFindings `
-            -Observation $Evidence.Observation -RedundantMethod:$redundant)
+            -Observation $Evidence.Observation -RedundantMethod:$redundant `
+            -NamedAreEqual:$namedAreEqual)
     if (
         [string]$Evidence.Declaration.rule.section -cne
         $capability -or
@@ -536,6 +588,13 @@ function Assert-ApprovedOwnerV2CoverageEvidence {
                 $script:ApprovedRedundantCoveragePolicyPath -or
                 [string]$Evidence.Declaration.config.id -cne
                 'redundant-method-coverage-v1-user-approved')) -or
+        ($namedAreEqual -and
+            ([string]$Evidence.Declaration.rule.path -cne
+                $script:ApprovedNamedAreEqualPolicyPath -or
+                [string]$Evidence.Observation.rule.path -cne
+                $script:ApprovedNamedAreEqualPolicyPath -or
+                [string]$Evidence.Declaration.config.id -cne
+                'named-areequal-arguments-v1-user-approved')) -or
         [string]$Evidence.Declaration.mode -cne 'live' -or
         [string]$Evidence.Record.mode -cne 'live' -or
         [string]$Evidence.Observation.lifecycle.status -cne 'completed' -or
@@ -559,17 +618,22 @@ function Get-ApprovedOwnerV2Proposal {
     param(
         [Parameter(Mandatory)]$Evidence,
         [Parameter(Mandatory)][Collections.IDictionary]$Finding,
-        [ValidateSet('owner', 'coverage', 'redundant-coverage')]
+        [ValidateSet('owner', 'coverage', 'redundant-coverage', 'named-areequal')]
         [string]$Delivery = 'owner'
     )
     if ($Delivery -cne 'owner') {
         $redundant = $Delivery -ceq 'redundant-coverage'
-        $identityPattern = if ($redundant) {
+        $namedAreEqual = $Delivery -ceq 'named-areequal'
+        $identityPattern = if ($namedAreEqual) {
+            '^named-areequal-v2:[0-9a-f]{64}$'
+        } elseif ($redundant) {
             '^redundant-coverage-v2:[0-9a-f]{64}$'
         } else { '^coverage-v2:[0-9a-f]{64}$' }
         Assert-ApprovedOwnerV2CoverageEvidence -Evidence $Evidence
         if (
-            [string]$Evidence.Declaration.capability.id -cne $(if ($redundant) {
+            [string]$Evidence.Declaration.capability.id -cne $(if ($namedAreEqual) {
+                    $script:ApprovedNamedAreEqualCapability
+                } elseif ($redundant) {
                     $script:ApprovedRedundantCoverageCapability
                 } else { $script:ApprovedCoverageCapability }) -or
             [string]$Finding.identity -cnotmatch $identityPattern -or
@@ -596,6 +660,9 @@ function Get-ApprovedOwnerV2Proposal {
         if ($redundant) {
             Assert-ApprovedOwnerV2RedundantMethodGroup -Finding $Finding
         }
+        elseif ($namedAreEqual) {
+            Assert-ApprovedOwnerV2NamedAreEqualGroup -Finding $Finding
+        }
         $source = $Finding.binding.source.representation
         if ($source -isnot [Collections.IDictionary] -or
             [string]$source.constructIdentity -cne
@@ -604,19 +671,24 @@ function Get-ApprovedOwnerV2Proposal {
             [string]$source.symbol -cne [string]$Finding.anchor.symbol -or
             [int]$source.startLine -ne [int]$Finding.anchor.line -or
             [int]$source.endLine -ne [int]$Finding.anchor.line -or
-            ($redundant -and
+            (($redundant -or $namedAreEqual) -and
                 [string]$Finding.anchor.symbol -cnotmatch
                 '^[\p{L}_][\p{L}\p{N}_]*(?:\.[\p{L}_][\p{L}\p{N}_]*)*$')) {
             throw 'Coverage finding is not one exact changed class or method attribute anchor.'
         }
-        $marker = if ($redundant) {
+        $marker = if ($namedAreEqual) {
+            Get-NamedAreEqualMarkerKey -Contract $Evidence.Contract -Finding $Finding
+        } elseif ($redundant) {
             Get-RedundantMethodCoverageMarkerKey -Contract $Evidence.Contract `
                 -Finding $Finding
         } else {
             Get-TestClassCoverageMarkerKey -Contract $Evidence.Contract `
                 -Finding $Finding
         }
-        $body = if ($redundant) {
+        $body = if ($namedAreEqual) {
+            Format-NamedAreEqualComment -Contract $Evidence.Contract `
+                -Finding $Finding -MarkerKey $marker
+        } elseif ($redundant) {
             Format-RedundantMethodCoverageComment -Contract $Evidence.Contract `
                 -Finding $Finding -MarkerKey $marker
         } else {
@@ -639,7 +711,9 @@ function Get-ApprovedOwnerV2Proposal {
             line = [int]$Finding.anchor.line
             symbol = [string]$Finding.anchor.symbol
             marker = $marker
-            markerComment = $(if ($redundant) {
+            markerComment = $(if ($namedAreEqual) {
+                    "<!-- devpilot-named-areequal:v1:$marker -->"
+                } elseif ($redundant) {
                     "<!-- devpilot-redundant-method-coverage:v1:$marker -->"
                 } else { "<!-- devpilot-test-class-coverage:v1:$marker -->" })
             body = $body
@@ -652,6 +726,11 @@ function Get-ApprovedOwnerV2Proposal {
             $proposal['affectedMethods'] = @($Finding.affectedMethods)
             $proposal['affectedAttributeLines'] = @($Finding.affectedAttributeLines)
             $proposal['methodListTruncated'] = [bool]$Finding.methodListTruncated
+        }
+        elseif ($namedAreEqual) {
+            $proposal['affectedCallCount'] = [int]$Finding.affectedCallCount
+            $proposal['affectedCallLines'] = @($Finding.affectedCallLines)
+            $proposal['callListTruncated'] = [bool]$Finding.callListTruncated
         }
         return $proposal
     }
