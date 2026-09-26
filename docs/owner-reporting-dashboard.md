@@ -63,8 +63,10 @@ and scans that exceed the count or time budget.
 `files.lastRun` should point directly at the scheduler's
 `owner-relation-v2-preview-scheduled-run` schema-v1 `last-run.json`. The
 adapter validates that exact kind, top-level completion/toolkit identity,
-Owner and relation record arrays, Owner reconciliation counts, and the nested
-`owner-v2-automatic-delivery-result`. Model-call count is shown as unavailable
+Owner and relation record arrays, reconciliation counts, and the nested
+`owner-v2-automatic-delivery-result` or
+`coverage-v2-automatic-delivery-result`; coverage runs are labeled with the
+class-coverage capability rather than Owner. Model-call count is shown as unavailable
 because this envelope does not expose it. The explicitly typed
 `devpilot-owner-reporting-run-projection` v1 shape remains accepted for
 existing installations; arbitrary flat JSON is rejected rather than treated
@@ -119,13 +121,22 @@ The reporting overlay extends the existing OpenTUI application:
   model calls, pending/posted queue counts, writes, delivery outcome.
 - **Findings**: PR, capability, rule, severity, reconciliation state, path,
   line, symbol, reason, source-head freshness, and a validated PR link.
+  `humanCovered` remains distinct from `noOp`: it is highlighted as
+  **needs-review**, appears under pending rather than posted, and never borrows
+  an existing human thread as an authoritative reviewer comment link.
+  A coverage `unknown` with the exact
+  `historical-human-review-needs-review` reason is likewise **needs-review**
+  and pending. Its single closed/outdated historical thread link is shown
+  only when the thread IDs and observation/repository identity validate;
+  it is not treated as a posted reviewer comment.
   When an observation omits `projectId`, the adapter may use the durable
   declaration only after filename/state identity, state/capability/subject/head
   digests, PR/repository/source/target bindings, completed record state, and
   configured project/repository all match. Any mismatch produces no URL and an
   explicit drift diagnostic.
 - **Deliveries**: automatic/manual create/update/preview/no-op outcomes,
-  thread/comment IDs, write state, run/event IDs, anchors, body status, and
+  rule/capability identity, class or method symbol, thread/comment IDs,
+  write state, run/event IDs, anchors, body status, and
   validated Azure DevOps links.
 - **Failures**: invalid signatures, ambiguous writes, refusals, drift, stale
   state, task failures, missing data, and recovery-required incidents.
@@ -158,7 +169,22 @@ Automatic delivery events are the PR172 immutable files:
 
 The adapter requires the exact `owner-v2-comment-signed-envelope` v1 contract,
 HMAC-SHA256 verification, canonical `manifestJson`, and an
-`owner-v2-delivery-event` v1 payload. Invalid, truncated, missing-ID, or
+`owner-v2-delivery-event` or `coverage-v2-delivery-event` v1 payload.
+Coverage delivery requires the signed event's `ruleId` and `capabilityId`
+both to be `bpm-test-class-coverage@1`, with a class finding identity and
+symbol. Created, recovered, ambiguous-write, and no-op coverage events
+require a separately verified matching coverage intent, class selection,
+state identity, rule/capability, and PR source/target binding before entering
+the feed. The dashboard pairs their body only with a matching coverage intent.
+Older Owner events without capability IDs remain labeled Owner. Foreign
+rule/capability bindings are displayed as drift failures, not deliveries.
+An automatic coverage event with `action: none`, `outcome: refused`, and
+`historical-human-review-needs-review` diagnostic appears as a pending
+**needs-review** delivery with zero writes. Its historical thread/comment
+IDs must match the observed class reconciliation and source head; otherwise
+the event is excluded as drift. The dashboard rebuilds the link from the
+validated identity, rather than trusting the signed event's URL.
+Invalid, truncated, missing-ID, or
 duplicate-ID events are quarantined and excluded from deliveries and counts.
 Success is never inferred from an intent or process exit.
 

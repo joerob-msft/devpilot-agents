@@ -10,8 +10,11 @@
     FunctionsToExport = @(
         'ConvertTo-OwnerV2Observation',
         'Format-OwnerV1WriterComment',
+        'Format-TestClassCoverageComment',
         'Get-OwnerV1WriterMarkerKey',
+        'Get-TestClassCoverageMarkerKey',
         'New-OwnerSemanticRunner',
+        'New-TestClassCoverageCapabilityAdapter',
         'New-OwnerV2CapabilityAdapter',
         'New-OwnerV2CapabilityLimits',
         'Resolve-OwnerV2DiscussionReconciliation'

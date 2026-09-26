@@ -988,11 +988,63 @@ Describe 'Owner capability module surface' {
         @((Get-Command -Module DevPilot.OwnerCapability).Name | Sort-Object) | Should -Be @(
             'ConvertTo-OwnerV2Observation',
             'Format-OwnerV1WriterComment',
+            'Format-TestClassCoverageComment',
             'Get-OwnerV1WriterMarkerKey',
+            'Get-TestClassCoverageMarkerKey',
             'New-OwnerSemanticRunner',
             'New-OwnerV2CapabilityAdapter',
             'New-OwnerV2CapabilityLimits',
+            'New-TestClassCoverageCapabilityAdapter',
             'Resolve-OwnerV2DiscussionReconciliation'
         )
+    }
+}
+
+Describe 'Matching human discussion is not a reviewer no-op or an automatic create' {
+    It 'recognizes only a current active Owner request at the exact method anchor' {
+        $run = Invoke-TestOwnerV2Case -Case (Get-TestOwnerV2Case 'proven-owner-cases')
+        $finding = @($run.Observation.findings)[0]
+        $matching = New-TestOwnerDiscussionThread -Contract $run.Contract `
+            -Finding $finding -Body 'add owner claim' -ReviewerOwned $true `
+            -ThreadId 100
+        $snapshot = New-TestOwnerDiscussionSnapshot -Contract $run.Contract -Threads @($matching)
+        $result = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $run.Observation -Contract $run.Contract -Snapshot $snapshot
+        $covered = @($result.findings | Where-Object identity -CEQ $finding.identity)[0]
+        $covered.reconciliation.classification | Should -BeExactly 'humanCovered'
+        $covered.reconciliation.reason | Should -BeExactly 'matching-human-review-present'
+        $covered.reconciliation.thread.threadId | Should -Be 100
+        $result.effects.dedupe.humanCovered | Should -Be 1
+    }
+
+    It 'does not suppress an unrelated anchor or a closed, outdated, or deleted human thread' {
+        $run = Invoke-TestOwnerV2Case -Case (Get-TestOwnerV2Case 'proven-owner-cases')
+        $finding = @($run.Observation.findings)[0]
+        foreach ($variant in @(
+                @{ Line = [int]$finding.anchor.line + 1 },
+                @{ Status = 'closed' },
+                @{ Outdated = $true },
+                @{ ThreadDeleted = $true },
+                @{ CommentDeleted = $true }
+            )) {
+            $options = @{
+                Contract = $run.Contract
+                Finding = $finding
+                Body = 'add owner claim'
+                ReviewerOwned = $false
+            }
+            foreach ($key in $variant.Keys) { $options[$key] = $variant[$key] }
+            $thread = New-TestOwnerDiscussionThread @options
+            $snapshot = New-TestOwnerDiscussionSnapshot -Contract $run.Contract -Threads @($thread)
+            $copy = $run.Observation | ConvertTo-Json -Depth 64 |
+                ConvertFrom-Json -AsHashtable -Depth 64
+            $result = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $copy -Contract $run.Contract -Snapshot $snapshot
+            $actual = @($result.findings | Where-Object identity -CEQ $finding.identity)[0]
+            $actual.reconciliation.classification | Should -BeExactly $(if ($variant.ContainsKey('Outdated')) {
+                    'unknown'
+                }
+                else { 'wouldCreate' })
+        }
     }
 }

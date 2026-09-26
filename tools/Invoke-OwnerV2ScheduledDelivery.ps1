@@ -46,8 +46,21 @@ Import-Module (Join-Path $RepoRoot `
     'src\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
 
 $manifest = Read-ApprovedOwnerV2Json -Path $ManifestPath
-if ([string]$manifest.kind -cne 'owner-v2-preview-cohort') {
-    throw 'Scheduled automatic Owner delivery accepts only the Owner cohort.'
+if ([string]$manifest.kind -cnotin @(
+        'owner-v2-preview-cohort', 'coverage-v2-preview-cohort'
+    )) {
+    throw 'Scheduled automatic delivery accepts only Owner or class coverage cohorts.'
+}
+$delivery = if ([string]$manifest.kind -ceq 'coverage-v2-preview-cohort') {
+    'coverage'
+} else { 'owner' }
+if ($delivery -ceq 'coverage') {
+    $toolkit = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
+    if (-not $toolkit.Contains('autoCreateCoverageComments')) {
+        throw 'Scheduled coverage delivery requires an explicit autoCreateCoverageComments configuration.'
+    }
+    $automatic = Get-AutomaticOwnerV2Configuration `
+        -ToolkitConfig $toolkit -Delivery coverage
 }
 
 [void](Invoke-OwnerV2PreviewPrepare -StateRoot $StateRoot `
@@ -68,8 +81,18 @@ if ($null -ne $LiveModelProvider) {
 $observation = Invoke-OwnerV2PreviewRun -StateRoot $StateRoot `
     -ManifestPath $ManifestPath -LeaseSeconds $LeaseSeconds @liveArguments
 
-$toolkit = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
-$automatic = Get-AutomaticOwnerV2Configuration -ToolkitConfig $toolkit
+if ($delivery -ceq 'coverage') {
+    $toolkit = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
+    if (-not $toolkit.Contains('autoCreateCoverageComments')) {
+        throw 'Scheduled coverage delivery requires an explicit autoCreateCoverageComments configuration.'
+    }
+    $automatic = Get-AutomaticOwnerV2Configuration `
+        -ToolkitConfig $toolkit -Delivery coverage
+}
+else {
+    $toolkit = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
+    $automatic = Get-AutomaticOwnerV2Configuration -ToolkitConfig $toolkit
+}
 $completed = @($observation.records | Where-Object {
         [string]$_.state -ceq 'completed'
     } | Sort-Object identity)
@@ -105,7 +128,9 @@ if ($automatic.Enabled) {
     }
     catch {
         [void]$deliveryResults.Add([pscustomobject][ordered]@{
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $(if ($delivery -ceq 'coverage') {
+                        'coverage-v2-automatic-delivery-result'
+                    } else { 'owner-v2-automatic-delivery-result' })
                 health = 'refused'
                 providerWrites = 0
                 modelWrites = 0
@@ -118,9 +143,15 @@ if ($automatic.Enabled) {
     }
     if ($deliveryReady) {
         foreach ($record in $completed) {
-            $evidence = Read-ApprovedOwnerV2Evidence -StateRoot $StateRoot `
-                -Identity ([string]$record.identity) -RepoRoot $RepoRoot `
-                -ToolkitConfigPath $ToolkitConfigPath
+            $evidence = if ($delivery -ceq 'coverage') {
+                Read-AutomaticCoverageEvidence -StateRoot $StateRoot `
+                    -Identity ([string]$record.identity) -RepoRoot $RepoRoot `
+                    -ToolkitConfigPath $ToolkitConfigPath
+            } else {
+                Read-ApprovedOwnerV2Evidence -StateRoot $StateRoot `
+                    -Identity ([string]$record.identity) -RepoRoot $RepoRoot `
+                    -ToolkitConfigPath $ToolkitConfigPath
+            }
             $result = Invoke-AutomaticOwnerV2Comments -Evidence $evidence `
                 -Policy $policy -DeliveryRoot $context.Root -Key $key `
                 -Provider $provider -MaximumCreates $remainingRunCreates
@@ -147,7 +178,9 @@ foreach ($deliveryResult in $deliveryResults) {
 }
 $result = [pscustomobject][ordered]@{
     schemaVersion = 1
-    kind = 'owner-v2-scheduled-delivery-result'
+    kind = $(if ($delivery -ceq 'coverage') {
+            'coverage-v2-scheduled-delivery-result'
+        } else { 'owner-v2-scheduled-delivery-result' })
     health = $health
     observation = [ordered]@{
         records = @($observation.records).Count

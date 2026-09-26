@@ -39,7 +39,7 @@ an exact completed `bpm-test-ownership@1` finding that:
 - remains on the same active non-draft PR source head, target commit, target
   ref, repository, project, and current iteration.
 
-The authority explicitly excludes class findings, advisory, `notEligible`,
+The Owner authority explicitly excludes class findings, advisory, `notEligible`,
 `unknown`, uncovered evidence, relation capability, `wouldUpdate`, thread
 status changes, resolve operations, votes, PR status, summaries,
 notifications, and every other provider write. An existing exact comment is
@@ -52,6 +52,101 @@ The manual signed-selection writer remains available for human-controlled
 creates or explicitly approved updates. Automatic service authorization uses a
 different local key, policy kind, intent kind, outcome kind, directories, and
 CLI. A human approval artifact cannot be substituted for a service policy.
+
+## Independent test-class coverage delivery
+
+The same create-only wrapper also supports the independently bound
+`bpm-test-class-coverage@1` rule **and** capability. This is a separate,
+default-off deployment decision; `autoCreateOwnerComments` never enables
+coverage, and `autoCreateCoverageComments` never enables Owner. Coverage
+accepts only completed live `coverage-v2-preview-cohort` observations with
+class-level `violation` findings on changed MSTest classes and an exact
+`wouldCreate` reconciliation. Its comment is the rule-bound
+`devpilot-test-class-coverage:v1` marker/body, anchored to the changed class
+declaration line. `noOp` does not write; `wouldUpdate`, ambiguous, foreign,
+advisory, uncovered, or otherwise ineligible evidence does not write. The
+writer accepts `noOp` only for a current, active, exactly anchored reviewer
+thread containing the class marker and exact formatted body; sharing the
+configured reviewer's account or GUID without that marker is never `noOp`.
+Only `wouldCreate` can reach `CreateThread`. The `humanCovered`
+classification is a human-review outcome, **not** `noOp`
+or automatic eligibility; it cannot create a comment. A closed/outdated
+human discussion from an earlier PR iteration may instead classify as
+`unknown` (`historical-human-review-needs-review`), which also refuses
+automatic delivery. A completed, model-free observation containing only this
+specific kind of `unknown` (and no other unknowns) is readable so the writer
+can emit a signed `action: none`, `outcome: refused` event per blocked class
+with `historical-human-review-needs-review` diagnostic, zero writes, and
+the prior thread/comment IDs and HTTPS URL when safely available. It does
+not create another comment; if the observation also has `wouldCreate`
+findings, that batch is refused pending operator review. Every other
+`unknown` still fails closed. Even a completed `wouldCreate` observation is
+refused if the live source head, current iteration, discussion snapshot, or
+changed class line has drifted (for example, the declaration moved from line
+25 to 26). Rerun observation against the new head before retrying; do not
+reuse a stale decision. The existing signed policy is reusable only while
+its exact rule, capability, reviewer, repository, and implementation
+bindings remain valid.
+The runtime calls only `ReadCurrent` and (after validation) `CreateThread`
+for create-eligible observations; a historical-human refusal does neither.
+it cannot update comments, statuses, votes, relations, or model output.
+The shared evidence/proposal validator accepts coverage only when explicitly
+selected by the automatic delivery caller. It requires a completed
+`modelExecutionState: notAttempted` record, no model telemetry artifact,
+and the bound coverage rule section and formatter output. The manual Owner
+review and approval signer remains Owner-only and cannot authorize coverage.
+
+Add the independent switch to an **external** toolkit config for the coverage
+capability. An absent switch disables the single-state CLI, but the scheduled
+coverage wrapper **requires the key to be explicitly present** before it
+prepares or runs the cohort; literal `false` permits read-only scheduled
+observation with delivery disabled:
+
+```json
+{
+  "autoCreateCoverageComments": {
+    "enabled": true,
+    "policyPath": "C:\\private\\owner-v2-delivery\\policies\\coverage-v2-production.json",
+    "policySha256": "<64 lowercase hex>"
+  }
+}
+```
+
+The signed `coverage-v2-service-authorization-policy` is separate from the
+Owner policy and binds exact rule/capability identity, project/repository,
+reviewer, toolkit and writer/provider/scheduler digests, `wouldCreate`,
+`changed-mstest-class`, `violation`, and per-run/per-PR ceilings. Generate
+it from a **completed live coverage** state identity while delivery is still
+disabled:
+
+```powershell
+.\tools\Invoke-AutomaticOwnerV2Delivery.ps1 authorize-policy `
+    -Delivery coverage `
+    -DeliveryRoot C:\private\owner-v2-delivery `
+    -StateRoot C:\private\owner-v2-state `
+    -Identity <completed-coverage-state-identity> `
+    -ToolkitConfigPath C:\private\coverage-config.json `
+    -PolicyId coverage-v2-production
+```
+
+Initialize the private key using `initialize-key` as above, then bind the
+returned policy file SHA-256 in the coverage config. A single-state invocation
+uses `invoke -Delivery coverage` with the same absolute paths and identity.
+The scheduled wrapper selects coverage only for a coverage cohort manifest;
+its `-EnableLiveModel` flag enables live **acquisition**, but the coverage
+capability itself does not start or authorize a model. The scheduler's
+aggregate create ceiling remains five across its completed coverage cohort,
+with the signed per-PR limit checked against coverage delivery history.
+
+Coverage signed intents, outcomes, and events use `coverage-v2-*` kinds;
+the single-state and scheduled coverage results likewise use `coverage-v2-*`
+kinds;
+events share the authenticated event directory and include `ruleId`,
+`capabilityId`, and the exact class name in `finding.symbol`. Owner events
+retain their original kind and now carry their own rule/capability IDs as
+well. Consumers must distinguish event kinds, verify HMAC envelopes, and
+must not mistake a coverage event for an Owner event. The existing ambiguous
+write block and interrupted-intent recovery rules apply unchanged.
 
 ## Fail-closed configuration
 
@@ -172,6 +267,8 @@ The stable payload is `schemaVersion: 1`,
   "kind": "owner-v2-delivery-event",
   "eventId": "<opaque id>",
   "runId": "<opaque id>",
+  "ruleId": "<rule section>",
+  "capabilityId": "<bound capability>",
   "occurredUtc": "yyyyMMddTHHmmssZ",
   "runHealth": "healthy|partial|refused",
   "subject": {

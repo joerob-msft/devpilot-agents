@@ -23,7 +23,7 @@ const MAX_TEXT = 512;
 type JsonRecord = Record<string, unknown>;
 
 export type ReportingHealth = "healthy" | "degraded" | "disabled" | "stale" | "unknown";
-export type FindingState = "wouldCreate" | "wouldUpdate" | "noOp" | "unknown";
+export type FindingState = "wouldCreate" | "wouldUpdate" | "noOp" | "humanCovered" | "unknown";
 export type DeliveryMode = "automatic" | "manual";
 
 export interface ReportingBudgets {
@@ -106,6 +106,7 @@ export interface RunSummary {
   modelWrites: number;
   deliveryOutcome: string;
   diagnostic: string;
+  deliveryCapabilityId?: string;
 }
 
 export interface FindingSummary {
@@ -143,6 +144,7 @@ export interface RelationSummary {
 export interface DeliverySummary {
   id: string;
   mode: DeliveryMode;
+  capabilityId: string;
   action: string;
   outcome: string;
   occurredUtc: string;
@@ -164,6 +166,7 @@ export interface DeliverySummary {
   bodySha256: string;
   bodyStatus: "verified" | "digest-only" | "unavailable";
   diagnostic: string;
+  diagnosticCode?: string;
 }
 
 export interface FailureSummary {
@@ -875,7 +878,9 @@ function parseCompositeScheduledRun(raw: JsonRecord): RunSummary {
   const operatorOutput = asRecord(raw.ownerOperatorOutput);
   const reconciliation = asRecord(operatorOutput.reconciliation);
   const delivery = asRecord(raw.ownerAutoDelivery);
-  if (delivery.schemaVersion !== 1 || delivery.kind !== "owner-v2-automatic-delivery-result") {
+  const coverage = delivery.kind === "coverage-v2-automatic-delivery-result";
+  if (delivery.schemaVersion !== 1 ||
+    (!coverage && delivery.kind !== "owner-v2-automatic-delivery-result")) {
     throw new Error("scheduled run automatic delivery result is unsupported");
   }
   const overallOutcome = boundedText(raw.overallOutcome, 40);
@@ -889,6 +894,8 @@ function parseCompositeScheduledRun(raw: JsonRecord): RunSummary {
   requiredCount(reconciliation.wouldCreate, "reconciliation.wouldCreate");
   requiredCount(reconciliation.wouldUpdate, "reconciliation.wouldUpdate");
   const unknown = requiredCount(reconciliation.unknown, "reconciliation.unknown");
+  const humanCovered = reconciliation.humanCovered === undefined ? 0 :
+    requiredCount(reconciliation.humanCovered, "reconciliation.humanCovered");
   const pending = requiredCount(delivery.remainingWouldCreate, "ownerAutoDelivery.remainingWouldCreate");
   const posted = requiredCount(reconciliation.noOp, "reconciliation.noOp") +
     requiredCount(reconciliation.created, "reconciliation.created") +
@@ -914,7 +921,9 @@ function parseCompositeScheduledRun(raw: JsonRecord): RunSummary {
     providerWrites: requiredCount(delivery.providerWrites, "ownerAutoDelivery.providerWrites"),
     modelWrites: requiredCount(delivery.modelWrites, "ownerAutoDelivery.modelWrites"),
     deliveryOutcome: deliveryHealth,
-    diagnostic: "Model-call count is unavailable in owner-relation-v2-preview-scheduled-run v1.",
+    ...(coverage ? { deliveryCapabilityId: "bpm-test-class-coverage@1" } : {}),
+    diagnostic: `Model-call count is unavailable in owner-relation-v2-preview-scheduled-run v1.${humanCovered
+      ? ` ${humanCovered} human-covered finding(s) need review; they are not posted comments.` : ""}`,
   };
 }
 
@@ -1241,7 +1250,7 @@ function projectState(
       const reconciliation = asRecord(finding.reconciliation);
       const classification = boundedText(reconciliation.classification, 40);
       const stateValue: FindingState = classification === "wouldCreate" || classification === "wouldUpdate" ||
-        classification === "noOp" ? classification : "unknown";
+        classification === "noOp" || classification === "humanCovered" ? classification : "unknown";
       const anchor = findingAnchor(finding);
       const latest = latestHeads.get(pullRequestId);
       const prLinks = safeLinks(
@@ -1263,7 +1272,13 @@ function projectState(
         boundedText(thread.status, 40) === "active" &&
         threadId !== null &&
         commentId !== null;
-      const commentLinks = authoritativePostedThread
+      const historicalReviewThread = capability === "bpm-test-class-coverage@1" &&
+        stateValue === "unknown" &&
+        boundedText(reconciliation.reason, 120) === "historical-human-review-needs-review" &&
+        boundedText(thread.availability, 40) === "available" &&
+        ["closed", "active"].includes(boundedText(thread.status, 40)) &&
+        threadId !== null && threadId > 0 && commentId !== null && commentId > 0;
+      const commentLinks = authoritativePostedThread || historicalReviewThread
         ? safeLinks(
             config,
             resolvedSubject.projectId,
@@ -1354,6 +1369,29 @@ function selectionMatchesEvent(selection: JsonRecord, event: JsonRecord): boolea
     boundedText(selection.symbol, 256) === boundedText(finding.symbol, 256);
 }
 
+function coverageIntentMatchesEvent(event: JsonRecord, intent: JsonRecord | undefined): boolean {
+  if (!intent || intent.schemaVersion !== 1 || intent.kind !== "coverage-v2-service-create-intent") return false;
+  const finding = asRecord(event.finding);
+  const subject = asRecord(event.subject);
+  const intentSubject = asRecord(intent.subject);
+  const identity = boundedText(finding.stateIdentity, 64);
+  return isHex(identity, 64) &&
+    boundedText(intent.runId, 128) === boundedText(event.runId, 128) &&
+    boundedText(asRecord(intent.state).identity, 64) === identity &&
+    boundedText(asRecord(intent.capability).id, 160) === "bpm-test-class-coverage@1" &&
+    boundedText(asRecord(intent.rule).section, 160) === "bpm-test-class-coverage@1" &&
+    isHex(boundedText(finding.marker, 64), 64) &&
+    boundedText(subject.projectId, 128) !== "" &&
+    boundedText(subject.repositoryId, 128) !== "" &&
+    safeCount(subject.pullRequestId) > 0 &&
+    isHex(boundedText(subject.sourceCommit, 40), 40) &&
+    isHex(boundedText(subject.targetCommit, 40), 40) &&
+    boundedText(subject.targetRef, 256).startsWith("refs/heads/") &&
+    ["projectId", "repositoryId", "pullRequestId", "sourceCommit", "targetCommit", "targetRef"]
+      .every((key) => intentSubject[key] === subject[key]) &&
+    asArray(intent.selections).map(asRecord).some((selection) => selectionMatchesEvent(selection, event));
+}
+
 async function formatterDigest(context: ScanContext): Promise<string> {
   const path = join(context.config.roots.toolkit, "src", "DevPilot.OwnerCapability", "DevPilot.OwnerCapability.psm1");
   try {
@@ -1370,11 +1408,18 @@ function deriveBody(
   toolkit: ToolkitHealth,
   localFormatterDigest: string,
 ): { body: string | null; digest: string; status: DeliverySummary["bodyStatus"] } {
-  if (!intent || intent.kind !== "owner-v2-service-create-intent") {
+  const coverage = event.kind === "coverage-v2-delivery-event";
+  if (!intent || intent.kind !== (coverage
+    ? "coverage-v2-service-create-intent" : "owner-v2-service-create-intent")) {
     return { body: null, digest: "", status: "unavailable" };
   }
   const finding = asRecord(event.finding);
   const identity = boundedText(finding.stateIdentity, 64);
+  if (coverage && (boundedText(asRecord(intent.state).identity, 64) !== identity ||
+    boundedText(asRecord(intent.capability).id, 160) !== "bpm-test-class-coverage@1" ||
+    boundedText(asRecord(intent.rule).section, 160) !== "bpm-test-class-coverage@1")) {
+    return { body: null, digest: "", status: "unavailable" };
+  }
   const selection = asArray(intent.selections).map(asRecord).find((candidate) => selectionMatchesEvent(candidate, event));
   if (!selection) return { body: null, digest: "", status: "unavailable" };
   const hasBody = typeof selection.body === "string" && selection.body.length > 0;
@@ -1444,7 +1489,8 @@ function automaticDeliveries(
   const failures: FailureSummary[] = [];
   const latestHeads = new Map<number, { timestamp: number; commit: string }>();
   const intentByRun = new Map(intents
-    .filter(({ payload }) => payload.kind === "owner-v2-service-create-intent")
+    .filter(({ payload }) => payload.kind === "owner-v2-service-create-intent" ||
+      payload.kind === "coverage-v2-service-create-intent")
     .map(({ payload }) => [boundedText(payload.runId, 128), payload]));
   const grouped = new Map<string, SignedPayload[]>();
   for (const event of events) {
@@ -1455,39 +1501,116 @@ function automaticDeliveries(
   for (const [eventId, group] of grouped) {
     if (!eventId || group.length !== 1) continue;
     const event = group[0]!.payload;
-    if (event.schemaVersion !== 1 || event.kind !== "owner-v2-delivery-event") continue;
+    if (event.schemaVersion !== 1 ||
+      (event.kind !== "owner-v2-delivery-event" && event.kind !== "coverage-v2-delivery-event")) continue;
     const subject = asRecord(event.subject);
     const finding = asRecord(event.finding);
     const pullRequestId = safeCount(subject.pullRequestId);
     const runId = boundedText(event.runId, 128);
     const occurredUtc = eventOccurred(event);
-    const sourceCommit = boundedText(subject.sourceCommit, 40);
-    const previous = latestHeads.get(pullRequestId);
-    if (sourceCommit && (!previous || Date.parse(occurredUtc || "1970-01-01") > previous.timestamp)) {
-      latestHeads.set(pullRequestId, { timestamp: Date.parse(occurredUtc || "1970-01-01"), commit: sourceCommit });
+    const coverage = event.kind === "coverage-v2-delivery-event";
+    const intent = intentByRun.get(runId);
+    const capabilityId = boundedText(event.capabilityId, 160) ||
+      (coverage ? "" : "bpm-test-ownership@1");
+    const ruleId = boundedText(event.ruleId, 160);
+    if ((coverage && (capabilityId !== "bpm-test-class-coverage@1" ||
+      ruleId !== capabilityId || !/^coverage-v2:[0-9a-f]{64}$/.test(boundedText(finding.findingId, 160)) ||
+      !boundedText(finding.symbol, 256))) ||
+      (!coverage && capabilityId !== "bpm-test-ownership@1")) {
+      failures.push({
+        id: `event-binding:${eventId}`, category: "drift", occurredUtc, health: "degraded",
+        pullRequestId, runId, message: "Signed delivery event has a foreign rule, capability, or class finding binding.",
+      });
+      continue;
     }
     const path = boundedText(finding.path, 1_024);
     const line = safeCount(finding.line);
     const threadId = nullableInteger(event.threadId);
     const commentId = nullableInteger(event.commentId);
+    const eventDiagnostic = asRecord(event.diagnostic);
+    const diagnosticCode = boundedText(eventDiagnostic.code, 80);
+    const historicalRefusal = coverage && diagnosticCode === "historical-human-review-needs-review";
+    const outcome = boundedText(event.outcome, 120) || "unknown";
+    const postedCoverage = coverage && (
+      ["created", "created-confirmed-after-error", "recovered-confirmed", "ambiguous-post-write"].includes(outcome) ||
+      outcome === "noOp"
+    );
+    if (postedCoverage &&
+      (boundedText(event.action, 80) !== (outcome === "noOp" ? "none" : "create") ||
+        !coverageIntentMatchesEvent(event, intent))) {
+      failures.push({
+        id: `event-binding:${eventId}`, category: "drift", occurredUtc, health: "degraded",
+        pullRequestId, runId, message: "Signed coverage delivery event has no matching signed create intent and class selection.",
+      });
+      continue;
+    }
+    if (historicalRefusal) {
+      const identity = boundedText(finding.stateIdentity, 64);
+      const observedState = observations.get(identity);
+      const observedFinding = findObservationFinding(observations, identity, boundedText(finding.findingId, 160));
+      const observedSubject = asRecord(observedState?.observation.subject);
+      const observedAnchor = findingAnchor(asRecord(observedFinding));
+      const reconciliation = asRecord(asRecord(observedFinding).reconciliation);
+      const thread = asRecord(reconciliation.thread);
+      const threadAvailable = boundedText(thread.availability, 40) === "available";
+      const threadMatches = threadAvailable
+        ? ["closed", "active"].includes(boundedText(thread.status, 40)) &&
+          threadId !== null && threadId > 0 && threadId === nullableInteger(thread.threadId) &&
+          commentId !== null && commentId > 0 && commentId === nullableInteger(thread.commentId)
+        : boundedText(thread.availability, 40) === "ambiguous" &&
+          threadId === null && commentId === null;
+      const observedSubjectBinding = observedState
+        ? resolveObservationSubject(observedState, config)
+        : null;
+      const valid = observedSubjectBinding?.diagnostic === "" &&
+        boundedText(observedState?.record?.state, 40) === "completed" &&
+        boundedText(observedState?.observation.capability, 160) === "bpm-test-class-coverage@1" &&
+        boundedText(asRecord(observedState?.declaration?.capability).id, 160) === "bpm-test-class-coverage@1" &&
+        boundedText(event.action, 40) === "none" &&
+        boundedText(event.outcome, 40) === "refused" &&
+        safeCount(event.providerWriteCount) === 0 && safeCount(event.modelWriteCount) === 0 &&
+        boundedText(event.providerWriteState, 40) === "none" &&
+        boundedText(reconciliation.classification, 40) === "unknown" &&
+        boundedText(reconciliation.reason, 120) === diagnosticCode &&
+        threadMatches &&
+        boundedText(finding.path, 1_024) === observedAnchor.path &&
+        safeCount(finding.line) === observedAnchor.line &&
+        boundedText(finding.symbol, 256) === observedAnchor.symbol &&
+        pullRequestId === safeCount(observedSubject.pullRequestId) &&
+        boundedText(subject.projectId, 128) === observedSubjectBinding.projectId &&
+        boundedText(subject.repositoryId, 128) === boundedText(observedSubject.repositoryId, 128) &&
+        boundedText(subject.sourceCommit, 40) === boundedText(observedSubject.headCommit, 40);
+      if (!valid) {
+        failures.push({
+          id: `event-binding:${eventId}`, category: "drift", occurredUtc, health: "degraded",
+          pullRequestId, runId, message: "Historical coverage refusal is not bound to its observed class and discussion.",
+        });
+        continue;
+      }
+    }
+    const sourceCommit = boundedText(subject.sourceCommit, 40);
+    const previous = latestHeads.get(pullRequestId);
+    if (sourceCommit && (!previous || Date.parse(occurredUtc || "1970-01-01") > previous.timestamp)) {
+      latestHeads.set(pullRequestId, { timestamp: Date.parse(occurredUtc || "1970-01-01"), commit: sourceCommit });
+    }
     const links = safeLinks(config, boundedText(subject.projectId, 128), boundedText(subject.repositoryId, 128),
       pullRequestId, threadId, commentId, path, line);
-    const derived = deriveBody(event, intentByRun.get(runId), observations, toolkit, localFormatterDigest);
-    const eventDiagnostic = asRecord(event.diagnostic);
+    const derived = historicalRefusal
+      ? { body: null, digest: "", status: "unavailable" as const }
+      : deriveBody(event, intent, observations, toolkit, localFormatterDigest);
     const diagnostic = boundedText(eventDiagnostic.message, 240) || links.diagnostic;
-    const diagnosticCode = boundedText(eventDiagnostic.code, 80);
-    const outcome = boundedText(event.outcome, 120) || "unknown";
     deliveries.push({
       id: `automatic:${eventId}`, mode: "automatic",
+      capabilityId,
       action: boundedText(event.action, 80) || "unknown", outcome, occurredUtc, pullRequestId,
       threadId, commentId, prUrl: links.prUrl, commentUrl: links.commentUrl,
-      path, line, symbol: boundedText(finding.symbol, 256), rule: "",
+      path, line, symbol: boundedText(finding.symbol, 256), rule: ruleId,
       runId, eventId,
       providerWriteState: boundedText(event.providerWriteState, 80) || "unknown",
       providerWrites: safeCount(event.providerWriteCount),
       modelWrites: safeCount(event.modelWriteCount),
       body: derived.body, bodySha256: derived.digest, bodyStatus: derived.status,
-      diagnostic,
+      diagnostic, diagnosticCode,
     });
     if (outcome === "ambiguous-post-write" || boundedText(event.providerWriteState, 80) === "unknown") {
       failures.push({
@@ -1497,7 +1620,8 @@ function automaticDeliveries(
     } else if (outcome === "refused") {
       failures.push({
         id: `refused:${eventId}`,
-        category: /stale.*head|head.*stale/.test(diagnosticCode) ? "stale-head" : "drift",
+        category: historicalRefusal ? "diagnostic" :
+          /stale.*head|head.*stale/.test(diagnosticCode) ? "stale-head" : "drift",
         occurredUtc, health: "degraded",
         pullRequestId, runId, message: diagnostic || "Automatic delivery was refused.",
       });
@@ -1613,6 +1737,7 @@ function manualDeliveries(
       const bodyVerified = body && isHex(digest, 64) && digestText(body) === digest;
       deliveries.push({
         id: `manual:${invocationId}:${index}`, mode: "manual",
+        capabilityId: "bpm-test-ownership@1",
         action: intent?.publish === true ? "publish" : "preview",
         outcome: writeOutcome,
         occurredUtc, pullRequestId, threadId, commentId,

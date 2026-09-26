@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
@@ -65,7 +64,9 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   await write(path, `${JSON.stringify(value)}\n`);
 }
 
-async function copyIntoWindowsTrustedRoot(source: string, target: string, repositoryRoot: string): Promise<void> {
+async function copyIntoWindowsTrustedRoot(
+  source: string, target: string, repositoryRoot: string, trustBoundary = repositoryRoot,
+): Promise<void> {
   const harness = join(repositoryRoot, "src", "DevPilot.AgentHarness", "DevPilot.AgentHarness.psd1");
   const script = [
     "$ErrorActionPreference='Stop'",
@@ -79,7 +80,7 @@ async function copyIntoWindowsTrustedRoot(source: string, target: string, reposi
       DEVPILOT_TEST_HARNESS: harness,
       DEVPILOT_TEST_SOURCE: source,
       DEVPILOT_TEST_TARGET: target,
-      DEVPILOT_TEST_REPO: repositoryRoot,
+      DEVPILOT_TEST_REPO: trustBoundary,
     },
     timeout: 30_000,
     maxBuffer: 64 * 1_024,
@@ -121,7 +122,7 @@ function createAdapter(path: string, options: ReportingAdapterOptions = {}): Loc
 }
 
 async function createFixture(options: { maxHistory?: number } = {}): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "devpilot-reporting-"));
+  const root = await mkdtemp(join(process.cwd(), ".reporting-test-"));
   const stateRoot = join(root, "state");
   const toolkitRoot = join(root, "toolkit");
   const deliveryRoot = join(root, "delivery");
@@ -488,11 +489,11 @@ test("reporting config paths resolve locally and scheduled task names are exact"
     schemaVersion: 1,
     kind: "devpilot-owner-reporting-config",
     roots: {
-      state: join(tmpdir(), "state"),
-      toolkit: join(tmpdir(), "toolkit"),
-      config: join(tmpdir(), "config"),
+      state: join(process.cwd(), "reporting-config-example", "state"),
+      toolkit: join(process.cwd(), "reporting-config-example", "toolkit"),
+      config: join(process.cwd(), "reporting-config-example", "config"),
     },
-    files: { toolkitConfig: join(tmpdir(), "config", "toolkit.json") },
+    files: { toolkitConfig: join(process.cwd(), "reporting-config-example", "config", "toolkit.json") },
     scheduledTaskName: "DevPilot Owner *",
     refreshIntervalSeconds: 30,
     staleAfterMinutes: 120,
@@ -541,6 +542,193 @@ test("reporting adapter verifies signed feeds, isolates relation findings, deriv
     const deliveryRows = reportingRows(snapshot, "deliveries");
     assert.match(deliveryRows[0]?.text.join(" ") ?? "", /<script>alert\(1\)<\/script>/);
     assert.match(overviewLines(snapshot).join("\n"), /SERVICE HEALTHY/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("coverage events show the bound class and rule while human-covered findings need review", async () => {
+  const fixture = await createFixture();
+  try {
+    const identity = "9".repeat(64);
+    const findingId = `coverage-v2:${"8".repeat(64)}`;
+    const marker = "7".repeat(64);
+    const body = "**Test class coverage exclusion missing**\n\nChanged MSTest class `MissingTests`.";
+    const bodySha256 = sha256Text(body);
+    const subject = {
+      projectId: "11111111-1111-1111-1111-111111111111",
+      repositoryId: "22222222-2222-2222-2222-222222222222",
+      pullRequestId: 42,
+    };
+    const head = { sourceCommit: "d".repeat(40) };
+    const capabilityId = "bpm-test-class-coverage@1";
+    const declaration = {
+      kind: "owner-v2-preview-declaration",
+      stateDigest: `v1:sha256:${identity}`,
+      subject, head,
+      target: { targetCommit: "2".repeat(40), targetRef: "refs/heads/main" },
+      capability: { id: capabilityId, digest: `v1:sha256:${"6".repeat(64)}` },
+      rule: { section: capabilityId, path: "rules/coverage.md" },
+    };
+    const coverageRoot = join(fixture.stateRoot, "owner-v2-preview-state", "schema-1", "capabilities", "coverage");
+    await writeJson(join(coverageRoot, "declarations", `${identity}.json`), declaration);
+    await writeJson(join(coverageRoot, "records", `${identity}.json`), {
+      identity, stateDigest: declaration.stateDigest, state: "completed",
+      capabilityId, capabilityDigest: declaration.capability.digest,
+      subjectDigest: canonicalDigest(subject), headDigest: canonicalDigest(head),
+      modelExecutionState: "notAttempted", updatedUtc: "utc:2026-09-24T20:02:00Z",
+    });
+    await writeJson(join(coverageRoot, "observations", `${identity}.json`), {
+      schemaVersion: 2, kind: "owner-observation", capability: capabilityId,
+      subject: {
+        projectId: null, repositoryId: subject.repositoryId, pullRequestId: 42,
+        headCommit: head.sourceCommit, targetCommit: declaration.target.targetCommit,
+        targetRef: declaration.target.targetRef,
+      },
+      rule: { section: capabilityId, path: declaration.rule.path },
+      lifecycle: { status: "completed" },
+      effects: { dedupe: { humanCovered: 1 } },
+      findings: [{
+        identity: findingId, disposition: "violation",
+        anchor: { path: "tests/MissingTests.cs", line: 3, symbol: "MissingTests" },
+        reconciliation: { classification: "wouldCreate", bodySha256 },
+      }, {
+        identity: `coverage-v2:${"5".repeat(64)}`, disposition: "violation",
+        anchor: { path: "tests/HumanCoveredTests.cs", line: 24, symbol: "HumanCoveredTests" },
+        reconciliation: {
+          classification: "humanCovered", reason: "existing-human-discussion",
+          thread: { availability: "available", status: "active", threadId: 300, commentId: 301 },
+        },
+      }, {
+        identity: `coverage-v2:${"6".repeat(64)}`, disposition: "violation",
+        anchor: { path: "tests/HistoricalTests.cs", line: 26, symbol: "HistoricalTests" },
+        reconciliation: {
+          classification: "unknown", reason: "historical-human-review-needs-review",
+          thread: { availability: "available", status: "closed", threadId: 1001, commentId: 1002 },
+        },
+      }],
+    });
+    const formatterSha256 = sha256Text("formatter fixture\n");
+    const coverageIntent = {
+      schemaVersion: 1, kind: "coverage-v2-service-create-intent", runId: "run-coverage",
+      state: { identity }, capability: { id: capabilityId }, rule: { section: capabilityId },
+      subject: {
+        ...subject, sourceCommit: head.sourceCommit,
+        targetCommit: declaration.target.targetCommit, targetRef: declaration.target.targetRef,
+      },
+      implementation: {
+        toolkitHead: "f".repeat(40), toolkitTree: "1".repeat(40), formatterSha256,
+      },
+      selections: [{
+        findingId, marker, path: "tests/MissingTests.cs", line: 3, symbol: "MissingTests", body, bodySha256,
+      }],
+    };
+    await write(join(fixture.deliveryRoot, "intents", identity, "run-coverage.json"),
+      signedEnvelope(coverageIntent, fixture.serviceKey));
+    const coverageEvent = {
+      schemaVersion: 1, kind: "coverage-v2-delivery-event",
+      eventId: "event-coverage", runId: "run-coverage", ruleId: capabilityId, capabilityId,
+      occurredUtc: "20260924T200300Z", runHealth: "healthy",
+      subject: {
+        ...subject, sourceCommit: head.sourceCommit,
+        targetCommit: declaration.target.targetCommit, targetRef: declaration.target.targetRef,
+      },
+      finding: {
+        stateIdentity: identity, findingId, marker,
+        path: "tests/MissingTests.cs", line: 3, symbol: "MissingTests",
+      },
+      action: "create", outcome: "created", threadId: 400, commentId: 401,
+      providerWriteCount: 1, modelWriteCount: 0, providerWriteState: "confirmed",
+    };
+    await write(join(fixture.deliveryRoot, "events", "event-coverage.json"),
+      signedEnvelope(coverageEvent, fixture.serviceKey));
+    const historicalEvent = {
+      ...coverageEvent,
+      eventId: "event-coverage-historical",
+      finding: {
+        stateIdentity: identity, findingId: `coverage-v2:${"6".repeat(64)}`,
+        marker: "e".repeat(64), path: "tests/HistoricalTests.cs", line: 26, symbol: "HistoricalTests",
+      },
+      action: "none", outcome: "refused", runHealth: "refused",
+      threadId: 1001, commentId: 1002, providerWriteCount: 0,
+      providerWriteState: "none",
+      diagnostic: {
+        code: "historical-human-review-needs-review",
+        message: "Historical human coverage review (closed) needs operator review; no comment was created.",
+      },
+    };
+    await write(join(fixture.deliveryRoot, "events", "event-coverage-historical.json"),
+      signedEnvelope(historicalEvent, fixture.serviceKey));
+    const adapter = createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-24T20:30:00Z"), taskReader: async () => healthyTask,
+    });
+    const snapshot = await adapter.read();
+    assert.equal(snapshot.deliveries.find((delivery) => delivery.eventId === "event-auto")?.bodyStatus,
+      "verified");
+    const coverage = snapshot.deliveries.find((delivery) => delivery.eventId === "event-coverage");
+    assert.equal(coverage?.capabilityId, capabilityId);
+    assert.equal(coverage?.rule, capabilityId);
+    assert.equal(coverage?.symbol, "MissingTests");
+    assert.equal(coverage?.bodyStatus, "verified");
+    assert.equal(coverage?.body, body);
+    const deliveryRow = reportingRows(snapshot, "deliveries").find((row) => row.key === "automatic:event-coverage");
+    assert.equal(deliveryRow?.capability, capabilityId);
+    assert.match(deliveryRow?.text.join(" ") ?? "", /bpm-test-class-coverage@1.*MissingTests/);
+    assert.equal(filterReportingRows(reportingRows(snapshot, "deliveries"), {
+      timeRange: "all", search: "capability:class-coverage", posting: "posted", mode: "automatic",
+    }).length, 1);
+
+    const humanCovered = snapshot.findings.find((finding) => finding.symbol === "HumanCoveredTests");
+    assert.equal(humanCovered?.state, "humanCovered");
+    assert.doesNotMatch(humanCovered?.url ?? "", /discussionId|commentId/);
+    const reviewRow = reportingRows(snapshot, "findings").find((row) => row.outcome === "humanCovered");
+    assert.equal(reviewRow?.posting, "pending");
+    assert.equal(reviewRow?.health, "needs-review");
+    assert.equal(reviewRow?.attention, true);
+    assert.match(reviewRow?.text.join(" ") ?? "", /humanCovered \(needs-review\)/);
+
+    const historical = snapshot.findings.find((finding) => finding.symbol === "HistoricalTests");
+    assert.equal(historical?.state, "unknown");
+    assert.match(historical?.url ?? "", /discussionId=1001&commentId=1002/);
+    const historicalFindingRow = reportingRows(snapshot, "findings").find((row) => row.key === `finding:${historical?.id}`);
+    assert.equal(historicalFindingRow?.health, "needs-review");
+    assert.equal(historicalFindingRow?.posting, "pending");
+    assert.match(historicalFindingRow?.text.join(" ") ?? "", /unknown \(needs-review\)/);
+    const refusal = snapshot.deliveries.find((delivery) => delivery.eventId === "event-coverage-historical");
+    assert.equal(refusal?.action, "none");
+    assert.equal(refusal?.outcome, "refused");
+    assert.equal(refusal?.diagnosticCode, "historical-human-review-needs-review");
+    assert.equal(refusal?.bodyStatus, "unavailable");
+    assert.equal(refusal?.providerWrites, 0);
+    assert.match(refusal?.commentUrl ?? "", /discussionId=1001&commentId=1002/);
+    const refusalRow = reportingRows(snapshot, "deliveries").find((row) => row.key === "automatic:event-coverage-historical");
+    assert.equal(refusalRow?.health, "needs-review");
+    assert.equal(refusalRow?.posting, "pending");
+    assert.match(refusalRow?.text.join(" ") ?? "", /historical-human-review-needs-review/);
+    assert.ok(snapshot.failures.some((failure) => failure.id === "refused:event-coverage-historical" &&
+      failure.category === "diagnostic"));
+
+    await write(join(fixture.deliveryRoot, "events", "event-coverage-historical-mismatch.json"),
+      signedEnvelope({ ...historicalEvent, eventId: "event-coverage-historical-mismatch", threadId: 999 },
+        fixture.serviceKey));
+    await write(join(fixture.deliveryRoot, "events", "event-coverage-no-intent.json"),
+      signedEnvelope({ ...coverageEvent, eventId: "event-coverage-no-intent", runId: "missing-run" },
+        fixture.serviceKey));
+    await write(join(fixture.deliveryRoot, "events", "event-coverage-invalid-signature.json"),
+      signedEnvelope({ ...coverageEvent, eventId: "event-coverage-invalid-signature" }, randomBytes(32)));
+    await write(join(fixture.deliveryRoot, "events", "event-foreign-coverage.json"),
+      signedEnvelope({ ...coverageEvent, eventId: "event-foreign-coverage", capabilityId: "bpm-test-ownership@1" },
+        fixture.serviceKey));
+    const invalid = await adapter.read();
+    assert.equal(invalid.deliveries.some((delivery) => delivery.eventId === "event-coverage-historical-mismatch"), false);
+    assert.ok(invalid.failures.some((failure) => failure.id === "event-binding:event-coverage-historical-mismatch"));
+    assert.equal(invalid.deliveries.some((delivery) => delivery.eventId === "event-coverage-no-intent"), false);
+    assert.ok(invalid.failures.some((failure) => failure.id === "event-binding:event-coverage-no-intent"));
+    assert.equal(invalid.deliveries.some((delivery) => delivery.eventId === "event-coverage-invalid-signature"), false);
+    assert.ok(invalid.quarantine.some((item) => item.file.endsWith("event-coverage-invalid-signature.json") &&
+      /signature verification failed/.test(item.reason)));
+    assert.equal(invalid.deliveries.some((delivery) => delivery.eventId === "event-foreign-coverage"), false);
+    assert.ok(invalid.failures.some((failure) => failure.id === "event-binding:event-foreign-coverage"));
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -748,11 +936,15 @@ test("composite run producer partial/failure and unknown reconciliation cannot s
     const run = JSON.parse(await readFile(path, "utf8")) as JsonRecord;
     run.overallOutcome = "partial";
     asObject(asObject(run.ownerOperatorOutput).reconciliation).unknown = 1;
+    asObject(asObject(run.ownerOperatorOutput).reconciliation).humanCovered = 2;
     await writeJson(path, run);
     const partial = await createAdapter(fixture.configPath, {
       taskReader: async () => healthyTask,
     }).read();
     assert.equal(partial.runs.find((item) => item.runId === "sanitized-live-run")?.health, "partial");
+    assert.equal(partial.runs.find((item) => item.runId === "sanitized-live-run")?.queuePosted, 9);
+    assert.match(partial.runs.find((item) => item.runId === "sanitized-live-run")?.diagnostic ?? "",
+      /2 human-covered finding\(s\) need review/);
 
     run.overallOutcome = "failure";
     asObject(asObject(run.ownerOperatorOutput).reconciliation).unknown = 0;
@@ -761,6 +953,36 @@ test("composite run producer partial/failure and unknown reconciliation cannot s
       taskReader: async () => healthyTask,
     }).read();
     assert.equal(failed.runs.find((item) => item.runId === "sanitized-live-run")?.health, "refused");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("composite coverage delivery results retain class capability identity without changing Owner rows", async () => {
+  const fixture = await createFixture();
+  try {
+    const path = join(fixture.runnerRoot, "last-run.json");
+    const run = JSON.parse(await readFile(path, "utf8")) as JsonRecord;
+    asObject(run.ownerAutoDelivery).kind = "coverage-v2-automatic-delivery-result";
+    await writeJson(path, run);
+    const snapshot = await createAdapter(fixture.configPath, {
+      taskReader: async () => healthyTask,
+    }).read();
+    const coverageRun = snapshot.runs.find((item) => item.runId === "sanitized-live-run");
+    assert.equal(coverageRun?.deliveryCapabilityId, "bpm-test-class-coverage@1");
+    const coverageRow = reportingRows(snapshot, "runs").find((item) => item.key.startsWith("run:sanitized-live-run:"));
+    assert.equal(coverageRow?.capability, "bpm-test-class-coverage@1");
+    assert.match(coverageRow?.text.join(" ") ?? "", /Coverage \d+ completed/);
+    const ownerRow = reportingRows(snapshot, "runs").find((item) => item.key.startsWith("run:scheduled-"));
+    assert.equal(ownerRow?.capability, "owner");
+
+    asObject(run.ownerAutoDelivery).kind = "foreign-automatic-delivery-result";
+    await writeJson(path, run);
+    const rejected = await createAdapter(fixture.configPath, {
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.equal(rejected.runs.some((item) => item.runId === "sanitized-live-run"), false);
+    assert.ok(rejected.diagnostics.some((item) => /automatic delivery result is unsupported/.test(item)));
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -776,8 +998,9 @@ test("Windows default key verification loads valid feeds and quarantines invalid
     asObject(config.roots).toolkit = repoRoot;
     const trustedDelivery = join(fixture.root, "trusted-delivery");
     const trustedManual = join(fixture.root, "trusted-manual");
-    await copyIntoWindowsTrustedRoot(fixture.deliveryRoot, trustedDelivery, repoRoot);
-    await copyIntoWindowsTrustedRoot(fixture.manualRoot, trustedManual, repoRoot);
+    const trustBoundary = join(fixture.root, "repository-boundary");
+    await copyIntoWindowsTrustedRoot(fixture.deliveryRoot, trustedDelivery, repoRoot, trustBoundary);
+    await copyIntoWindowsTrustedRoot(fixture.manualRoot, trustedManual, repoRoot, trustBoundary);
     asObject(config.roots).delivery = trustedDelivery;
     asObject(config.roots).manual = trustedManual;
     asObject(config.budgets).maxScanMilliseconds = 30_000;
@@ -1031,7 +1254,7 @@ test("filters cover time, PR, capability, health/outcome, posting state, and del
 });
 
 test("missing/new installation and non-Windows task state stay explicit without failing startup", async () => {
-  const root = await mkdtemp(join(tmpdir(), "devpilot-reporting-empty-"));
+  const root = await mkdtemp(join(process.cwd(), ".reporting-test-empty-"));
   try {
     const state = join(root, "state");
     const toolkit = join(root, "toolkit");

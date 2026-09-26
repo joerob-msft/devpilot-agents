@@ -12,8 +12,9 @@ param(
     [ValidatePattern('^$|^[0-9a-f]{64}$')][string]$Identity,
     [string]$ToolkitConfigPath,
     [string]$PolicyPath,
+    [ValidateSet('owner', 'coverage')][string]$Delivery = 'owner',
     [ValidatePattern('^[a-z0-9][a-z0-9_.-]{2,63}$')]
-    [string]$PolicyId = 'owner-v2-production',
+    [string]$PolicyId = '',
     [ValidateRange(1, 5)][int]$MaxCreatesPerRun = 5,
     [ValidateRange(1, 50)][int]$MaxCreatesPerPullRequest = 25,
     [AllowNull()][object]$DeliveryProvider,
@@ -38,6 +39,11 @@ Import-Module (Join-Path $RepoRoot `
 
 $context = Initialize-AutomaticOwnerV2DeliveryRoot `
     -DeliveryRoot $DeliveryRoot -RepoRoot $RepoRoot
+if (-not $PolicyId) {
+    $PolicyId = if ($Delivery -ceq 'coverage') {
+        'coverage-v2-production'
+    } else { 'owner-v2-production' }
+}
 if ($Command -ceq 'initialize-key') {
     [pscustomobject][ordered]@{
         schemaVersion = 1
@@ -56,9 +62,15 @@ if ([string]::IsNullOrWhiteSpace($StateRoot) -or
     -not [IO.Path]::IsPathFullyQualified($ToolkitConfigPath)) {
     throw "$Command requires absolute state/config paths and an exact state identity."
 }
-$evidence = Read-ApprovedOwnerV2Evidence -StateRoot $StateRoot `
-    -Identity $Identity -RepoRoot $RepoRoot `
-    -ToolkitConfigPath $ToolkitConfigPath
+$evidence = if ($Delivery -ceq 'coverage') {
+    Read-AutomaticCoverageEvidence -StateRoot $StateRoot `
+        -Identity $Identity -RepoRoot $RepoRoot `
+        -ToolkitConfigPath $ToolkitConfigPath
+} else {
+    Read-ApprovedOwnerV2Evidence -StateRoot $StateRoot `
+        -Identity $Identity -RepoRoot $RepoRoot `
+        -ToolkitConfigPath $ToolkitConfigPath
+}
 $key = Get-AutomaticOwnerV2ServiceKey -DeliveryRoot $context.Root
 
 if ($Command -ceq 'authorize-policy') {
@@ -87,11 +99,14 @@ if ($Command -ceq 'authorize-policy') {
 }
 
 $toolkitConfig = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
-$automatic = Get-AutomaticOwnerV2Configuration -ToolkitConfig $toolkitConfig
+$automatic = Get-AutomaticOwnerV2Configuration -ToolkitConfig $toolkitConfig `
+    -Delivery $Delivery
 if (-not $automatic.Enabled) {
     [pscustomobject][ordered]@{
         schemaVersion = 1
-        kind = 'owner-v2-automatic-delivery-result'
+        kind = $(if ($Delivery -ceq 'coverage') {
+                'coverage-v2-automatic-delivery-result'
+            } else { 'owner-v2-automatic-delivery-result' })
         health = 'disabled'
         providerWrites = 0
         modelWrites = 0

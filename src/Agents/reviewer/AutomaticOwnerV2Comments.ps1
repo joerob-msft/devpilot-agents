@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:AutomaticOwnerV2Capability = 'bpm-test-ownership@1'
+$script:AutomaticCoverageCapability = 'bpm-test-class-coverage@1'
 $script:AutomaticOwnerV2MaximumCreatesPerRun = 5
 $script:AutomaticOwnerV2MaximumCreatesPerPullRequest = 50
 
@@ -97,20 +98,39 @@ function Get-AutomaticOwnerV2ServiceKey {
     return $key
 }
 
+function Read-AutomaticCoverageEvidence {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$StateRoot,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$Identity,
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$ToolkitConfigPath
+    )
+    return Read-ApprovedOwnerV2Evidence -StateRoot $StateRoot `
+        -Identity $Identity -RepoRoot $RepoRoot `
+        -ToolkitConfigPath $ToolkitConfigPath -Delivery coverage
+}
+
 function Get-AutomaticOwnerV2Configuration {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][Collections.IDictionary]$ToolkitConfig)
-    if (-not $ToolkitConfig.Contains('autoCreateOwnerComments')) {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$ToolkitConfig,
+        [ValidateSet('owner', 'coverage')][string]$Delivery = 'owner'
+    )
+    $key = if ($Delivery -ceq 'coverage') {
+        'autoCreateCoverageComments'
+    } else { 'autoCreateOwnerComments' }
+    if (-not $ToolkitConfig.Contains($key)) {
         return [pscustomobject][ordered]@{
             Enabled = $false
             PolicyPath = ''
             PolicySha256 = ''
         }
     }
-    $value = $ToolkitConfig.autoCreateOwnerComments
+    $value = $ToolkitConfig[$key]
     if ($value -is [bool]) {
         if ($value) {
-            throw 'autoCreateOwnerComments=true requires an exact signed policy binding.'
+            throw "$key=true requires an exact signed policy binding."
         }
         return [pscustomobject][ordered]@{
             Enabled = $false
@@ -119,19 +139,19 @@ function Get-AutomaticOwnerV2Configuration {
         }
     }
     if ($value -isnot [Collections.IDictionary]) {
-        throw 'autoCreateOwnerComments must be false or an exact configuration object.'
+        throw "$key must be false or an exact configuration object."
     }
     $enabledValue = Get-ApprovedOwnerV2Value $value 'enabled' $null
     if ($enabledValue -isnot [bool]) {
-        throw 'autoCreateOwnerComments.enabled must be an exact JSON boolean.'
+        throw "$key.enabled must be an exact JSON boolean."
     }
     $enabled = [bool]$enabledValue
     if (-not $enabled) {
-        throw 'Use the literal false value to disable automatic Owner delivery.'
+        throw "Use the literal false value to disable automatic $Delivery delivery."
     }
     Assert-ApprovedOwnerV2ExactKeys -Value $value `
         -Expected @('enabled', 'policyPath', 'policySha256') `
-        -Name autoCreateOwnerComments
+        -Name $key
     $path = [string]$value.policyPath
     $sha256 = [string]$value.policySha256
     if (-not [IO.Path]::IsPathFullyQualified($path) -or
@@ -159,20 +179,41 @@ function New-AutomaticOwnerV2ServicePolicy {
     if ($MaxCreatesPerPullRequest -lt $MaxCreatesPerRun) {
         throw 'The per-PR create ceiling cannot be lower than the per-run ceiling.'
     }
+    $coverage = [string]$Evidence.Declaration.capability.id -ceq
+        $script:AutomaticCoverageCapability
+    if (-not $coverage -and
+        [string]$Evidence.Declaration.capability.id -cne
+        $script:AutomaticOwnerV2Capability) {
+        throw 'Only the exact Owner or class coverage capability may authorize delivery.'
+    }
+    if ($coverage -and [string]$Evidence.Declaration.rule.section -cne
+        $script:AutomaticCoverageCapability) {
+        throw 'Class coverage requires the exact independent rule section.'
+    }
     $copy = {
         param($Value)
         return ConvertTo-ApprovedOwnerV2CanonicalJson $Value |
             ConvertFrom-Json -AsHashtable -Depth 64
     }
+    $repository = [ordered]@{
+        projectId = [string]$Evidence.Declaration.subject.projectId
+        repositoryId = [string]$Evidence.Declaration.subject.repositoryId
+    }
+    if ($coverage) {
+        $repository['organization'] = [string]$Evidence.Provider.organization
+        $repository['projectName'] = [string]$Evidence.Provider.projectName
+        if ([string]::IsNullOrWhiteSpace($repository.organization) -or
+            [string]::IsNullOrWhiteSpace($repository.projectName)) {
+            throw 'Coverage policy requires an exact organization and project binding.'
+        }
+    }
     return [ordered]@{
         schemaVersion = 1
-        kind = 'owner-v2-service-authorization-policy'
+        kind = $(if ($coverage) { 'coverage-v2-service-authorization-policy' }
+            else { 'owner-v2-service-authorization-policy' })
         enabled = $true
         policyId = $PolicyId
-        repository = [ordered]@{
-            projectId = [string]$Evidence.Declaration.subject.projectId
-            repositoryId = [string]$Evidence.Declaration.subject.repositoryId
-        }
+        repository = $repository
         capability = & $copy $Evidence.Declaration.capability
         rule = & $copy $Evidence.Declaration.rule
         reviewerIdentity = & $copy $Evidence.Provider.reviewerIdentity
@@ -195,7 +236,8 @@ function New-AutomaticOwnerV2ServicePolicy {
         authority = [ordered]@{
             action = 'create'
             classification = 'wouldCreate'
-            construct = 'changed-mstest-method'
+            construct = $(if ($coverage) { 'changed-mstest-class' }
+                else { 'changed-mstest-method' })
             disposition = 'violation'
             updates = $false
             threadStatusWrites = $false
@@ -226,8 +268,16 @@ function Assert-AutomaticOwnerV2ServicePolicy {
         'rule', 'reviewerIdentity', 'implementation', 'limits', 'authority',
         'createdUtc'
     )
+    $coverage = [string]$Evidence.Declaration.capability.id -ceq
+        $script:AutomaticCoverageCapability
+    $expectedKind = if ($coverage) {
+        'coverage-v2-service-authorization-policy'
+    } else { 'owner-v2-service-authorization-policy' }
+    $expectedConstruct = if ($coverage) {
+        'changed-mstest-class'
+    } else { 'changed-mstest-method' }
     if ([int]$Policy.schemaVersion -ne 1 -or
-        [string]$Policy.kind -cne 'owner-v2-service-authorization-policy' -or
+        [string]$Policy.kind -cne $expectedKind -or
         -not [bool]$Policy.enabled -or
         [string]$Policy.policyId -cnotmatch '^[a-z0-9][a-z0-9_.-]{2,63}$') {
         throw 'Automatic Owner service policy is disabled or unsupported.'
@@ -263,7 +313,7 @@ function Assert-AutomaticOwnerV2ServicePolicy {
     $authority = $Policy.authority
     if ([string]$authority.action -cne 'create' -or
         [string]$authority.classification -cne 'wouldCreate' -or
-        [string]$authority.construct -cne 'changed-mstest-method' -or
+        [string]$authority.construct -cne $expectedConstruct -or
         [string]$authority.disposition -cne 'violation' -or
         [bool]$authority.updates -or [bool]$authority.threadStatusWrites -or
         [bool]$authority.relationCapability -or
@@ -298,6 +348,206 @@ function Get-AutomaticOwnerV2Diagnostic {
     return [ordered]@{ code = $Code; message = $clean }
 }
 
+function New-AutomaticCoverageReviewPackage {
+    param([Parameter(Mandatory)]$Evidence)
+    Assert-ApprovedOwnerV2CoverageEvidence -Evidence $Evidence
+    $findings = @($Evidence.Observation.findings)
+    if ([string]$Evidence.Observation.capability -cne
+        $script:AutomaticCoverageCapability -or
+        [string]$Evidence.Declaration.rule.section -cne
+        $script:AutomaticCoverageCapability -or
+        [int]$Evidence.Observation.counts.violations -ne $findings.Count) {
+        throw 'Coverage findings are incomplete, mixed, or foreign.'
+    }
+    $proposals = @($findings | ForEach-Object {
+            Get-ApprovedOwnerV2Proposal -Evidence $Evidence `
+                -Finding $_ -Delivery coverage
+        } | Sort-Object findingId)
+    return [ordered]@{
+        proposals = $proposals
+    }
+}
+
+function New-AutomaticCoverageHistoricalRefusalEvent {
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)]$Evidence,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding
+    )
+    $marker = Get-TestClassCoverageMarkerKey -Contract $Evidence.Contract `
+        -Finding $Finding
+    $body = Format-TestClassCoverageComment -Contract $Evidence.Contract `
+        -Finding $Finding -MarkerKey $marker
+    if ([string]$Finding.reconciliation.bodySha256 -cne
+        (Get-ApprovedOwnerV2TextSha256 $body)) {
+        throw 'Historical coverage finding does not match the class formatter.'
+    }
+    $thread = $Finding.reconciliation.thread
+    $threadId = [long]0
+    $commentId = [long]0
+    $hasThread = [string]$thread.availability -ceq 'available' -and
+        [long]::TryParse([string]$thread.threadId, [ref]$threadId) -and
+        [long]::TryParse([string]$thread.commentId, [ref]$commentId) -and
+        $threadId -gt 0 -and $commentId -gt 0
+    if (-not $hasThread) {
+        $threadId = 0
+        $commentId = 0
+    }
+    $status = if ([string]$thread.status -cmatch
+        '^(active|closed|fixed|wontFix|byDesign|pending)$') {
+        [string]$thread.status
+    }
+    else { 'unknown' }
+    $organization = $null
+    $parsedOrganization = [Uri]::TryCreate(
+        [string]$Evidence.Provider.organization, [UriKind]::Absolute,
+        [ref]$organization)
+    $organizationHost = if ($parsedOrganization) {
+        $organization.Host.ToLowerInvariant()
+    }
+    else { '' }
+    $organizationParts = @(if ($parsedOrganization) {
+            $organization.AbsolutePath.Trim('/').Split(
+                '/', [StringSplitOptions]::RemoveEmptyEntries)
+        })
+    $safeOrganization = $parsedOrganization -and
+        $organization.Scheme -ceq 'https' -and
+        -not $organization.UserInfo -and
+        -not $organization.Query -and -not $organization.Fragment -and
+        (($organizationHost -ceq 'dev.azure.com' -and
+                $organizationParts.Count -eq 1) -or
+            ($organizationHost.EndsWith('.visualstudio.com') -and
+                $organizationParts.Count -eq 0))
+    $url = if ($hasThread -and $safeOrganization) {
+        (Get-AutomaticOwnerV2CommentUrl -Provider $Evidence.Provider `
+                -PullRequestId ([long]$Evidence.Declaration.subject.pullRequestId) `
+                -ThreadId $threadId) + "&commentId=$commentId"
+    }
+    else { '' }
+    $selection = [ordered]@{
+        findingId = [string]$Finding.identity
+        marker = $marker
+        path = [string]$Finding.anchor.path
+        line = [int]$Finding.anchor.line
+        symbol = [string]$Finding.anchor.symbol
+    }
+    return New-AutomaticOwnerV2Event -RunId $RunId -Evidence $Evidence `
+        -Selection $selection -Action none -Outcome refused -RunHealth refused `
+        -ThreadId $threadId -CommentId $commentId -Url $url `
+        -Diagnostic (Get-AutomaticOwnerV2Diagnostic `
+            -Code 'historical-human-review-needs-review' `
+            -Message "Historical human coverage review ($status) needs operator review; no comment was created.")
+}
+
+function Get-AutomaticCoverageMarkerEntries {
+    param(
+        [Parameter(Mandatory)]$Snapshot,
+        [Parameter(Mandatory)][string]$Marker
+    )
+    $entries = [Collections.Generic.List[object]]::new()
+    foreach ($thread in @($Snapshot.Threads)) {
+        foreach ($comment in @($thread.comments)) {
+            foreach ($match in [regex]::Matches([string]$comment.body,
+                    '<!--\s*devpilot-test-class-coverage:v1:([0-9a-f]{64})\s*-->')) {
+                if ([string]$match.Groups[1].Value -ceq $Marker) {
+                    [void]$entries.Add([pscustomobject]@{
+                            Thread = $thread
+                            Comment = $comment
+                        })
+                }
+            }
+        }
+    }
+    return $entries.ToArray()
+}
+
+function Assert-AutomaticOwnerV2LiveRead {
+    param(
+        [Parameter(Mandatory)]$Evidence,
+        [Parameter(Mandatory)][Collections.IDictionary]$Approval,
+        [Parameter(Mandatory)]$Live,
+        [Parameter(Mandatory)][object[]]$Selections,
+        [Parameter(Mandatory)][string]$ExpectedSnapshotSha256
+    )
+    if ([string]$Evidence.Declaration.capability.id -cne
+        $script:AutomaticCoverageCapability) {
+        return Assert-ApprovedOwnerV2LiveRead -Evidence $Evidence `
+            -Approval $Approval -Live $Live -Selections $Selections `
+            -ExpectedSnapshotSha256 $ExpectedSnapshotSha256
+    }
+    $subject = $Approval.subject
+    $pr = $Live.PullRequest
+    if ([string]$pr.status -cne 'active' -or [bool]$pr.isDraft -or
+        [string]$pr.repositoryId -cne [string]$subject.repositoryId -or
+        [string]$pr.projectId -cne [string]$subject.projectId -or
+        [long]$pr.pullRequestId -ne [long]$subject.pullRequestId -or
+        [string]$pr.sourceCommit -cne [string]$subject.sourceCommit -or
+        [string]$pr.targetCommit -cne [string]$subject.targetCommit -or
+        [string]$pr.targetRef -cne [string]$subject.targetRef -or
+        $Live.ProviderBinding -isnot [Collections.IDictionary] -or
+        (Get-ApprovedOwnerV2Digest $Live.ProviderBinding) -cne
+        (Get-ApprovedOwnerV2Digest $Approval.provider) -or
+        [string]$Live.Reviewer.id -cne [string]$Approval.operator.id -or
+        [string]$Live.Reviewer.descriptor -cne [string]$Approval.operator.descriptor -or
+        [string]$Live.Reviewer.uniqueName -cne [string]$Approval.operator.uniqueName -or
+        [string]$Live.Snapshot.Digest -cne
+        "v1:sha256:$ExpectedSnapshotSha256") {
+        throw 'Live coverage PR, reviewer, provider, or discussions drifted.'
+    }
+    $selected = [Collections.Generic.List[object]]::new()
+    foreach ($selection in $Selections) {
+        $anchors = @($Live.Anchors | Where-Object {
+                [string]$_.path -ieq [string]$selection.path -and
+                [int]$selection.line -ge [int]$_.startLine -and
+                [int]$selection.line -le [int]$_.endLine
+            })
+        if ($anchors.Count -ne 1 -or
+            [int]$anchors[0].changeTrackingId -lt 1 -or
+            [int]$anchors[0].iterationId -ne
+            [int]$Live.Snapshot.CurrentIterationId) {
+            throw 'Changed coverage class anchor is stale or ambiguous.'
+        }
+        $entries = @(Get-AutomaticCoverageMarkerEntries `
+                -Snapshot $Live.Snapshot -Marker ([string]$selection.marker))
+        if ($entries.Count -gt 1 -or @($entries | Where-Object {
+                    -not [bool]$_.Comment.reviewerOwned -or
+                    [string]$_.Comment.reviewerIdentityState -cne 'matched'
+                }).Count -gt 0) {
+            throw 'Coverage marker is foreign, duplicate, or ambiguous.'
+        }
+        $matches = @($Evidence.Observation.findings | Where-Object {
+                [string]$_.identity -ceq [string]$selection.findingId
+            })
+        if ($matches.Count -ne 1) {
+            throw 'Coverage selection is not bound to one finding.'
+        }
+        [void]$selected.Add(($matches[0] | ConvertTo-Json -Depth 32 -Compress |
+                    ConvertFrom-Json -AsHashtable -Depth 32))
+    }
+    $mini = [ordered]@{
+        capability = $script:AutomaticCoverageCapability
+        lifecycle = [ordered]@{ status = 'completed' }
+        findings = $selected.ToArray()
+        effects = [ordered]@{
+            dedupe = [ordered]@{}
+            providerWrites = 0
+            writeToolInvocations = 0
+        }
+        sourceArtifacts = @()
+    }
+    $resolved = Resolve-OwnerV2DiscussionReconciliation `
+        -Observation $mini -Contract $Evidence.Contract -Snapshot $Live.Snapshot
+    $classifications = [ordered]@{}
+    foreach ($finding in @($resolved.findings)) {
+        $classifications[[string]$finding.identity] =
+            [string]$finding.reconciliation.classification
+    }
+    return [pscustomobject]@{
+        Classifications = $classifications
+        Anchors = $Live.Anchors
+    }
+}
+
 function Write-AutomaticOwnerV2Event {
     param(
         [Parameter(Mandatory)][string]$DeliveryRoot,
@@ -326,11 +576,16 @@ function New-AutomaticOwnerV2Event {
         [string]$ProviderWriteState = 'none',
         [AllowNull()][Collections.IDictionary]$Diagnostic = $null
     )
+    $coverage = [string]$Evidence.Declaration.capability.id -ceq
+        $script:AutomaticCoverageCapability
     return [ordered]@{
         schemaVersion = 1
-        kind = 'owner-v2-delivery-event'
+        kind = $(if ($coverage) { 'coverage-v2-delivery-event' }
+            else { 'owner-v2-delivery-event' })
         eventId = [guid]::NewGuid().ToString('N')
         runId = $RunId
+        ruleId = [string]$Evidence.Declaration.rule.section
+        capabilityId = [string]$Evidence.Declaration.capability.id
         occurredUtc = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
         runHealth = $RunHealth
         subject = [ordered]@{
@@ -409,7 +664,7 @@ function Assert-AutomaticOwnerV2EvidenceCurrent {
         recordSha256 = Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.record
         observationSha256 =
             Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.observation
-        telemetrySha256 = Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.telemetry
+        telemetrySha256 = Get-AutomaticOwnerV2TelemetrySha256 -Evidence $Evidence
         resultDigest = [string]$Evidence.Record.resultDigest
     }
     foreach ($entry in $bindings.GetEnumerator()) {
@@ -419,13 +674,31 @@ function Assert-AutomaticOwnerV2EvidenceCurrent {
     }
 }
 
+function Get-AutomaticOwnerV2TelemetrySha256 {
+    param([Parameter(Mandatory)]$Evidence)
+    if ([string]$Evidence.Declaration.capability.id -ceq
+        $script:AutomaticCoverageCapability) {
+        if (Test-Path -LiteralPath $Evidence.Paths.telemetry) {
+            throw 'Model-free coverage telemetry unexpectedly appeared.'
+        }
+        return 'none'
+    }
+    return Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.telemetry
+}
+
 function Get-AutomaticOwnerV2ConfirmedEntry {
     param(
         [Parameter(Mandatory)]$Snapshot,
-        [Parameter(Mandatory)][Collections.IDictionary]$Selection
+        [Parameter(Mandatory)][Collections.IDictionary]$Selection,
+        [switch]$Coverage
     )
-    $entries = @(Get-ApprovedOwnerV2MarkerEntries -Snapshot $Snapshot `
-            -Marker ([string]$Selection.marker))
+    $entries = @(if ($Coverage) {
+            Get-AutomaticCoverageMarkerEntries -Snapshot $Snapshot `
+                -Marker ([string]$Selection.marker)
+        } else {
+            Get-ApprovedOwnerV2MarkerEntries -Snapshot $Snapshot `
+                -Marker ([string]$Selection.marker)
+        })
     $confirmed = @($entries | Where-Object {
             [bool]$_.Comment.reviewerOwned -and
             [string]$_.Comment.reviewerIdentityState -ceq 'matched' -and
@@ -439,6 +712,26 @@ function Get-AutomaticOwnerV2ConfirmedEntry {
         throw "Finding '$($Selection.findingId)' marker is duplicate, foreign, or stale."
     }
     return $null
+}
+
+function Assert-AutomaticCoverageLiveNoOp {
+    param(
+        [Parameter(Mandatory)]$Snapshot,
+        [Parameter(Mandatory)][Collections.IDictionary]$Selection,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    $entry = Get-AutomaticOwnerV2ConfirmedEntry `
+        -Snapshot $Snapshot -Selection $Selection -Coverage
+    if ($null -eq $entry -or
+        [bool]$entry.Thread.isDeleted -or
+        [bool]$entry.Thread.isOutdated -or
+        [string]$entry.Thread.status -cne 'active' -or
+        [string]$entry.Thread.contextState -cne 'current' -or
+        [string]$entry.Thread.sourceCommit -cne $SourceCommit -or
+        [string]$entry.Thread.anchor.path -ine [string]$Selection.path -or
+        [int]$entry.Thread.anchor.line -ne [int]$Selection.line) {
+        throw 'Coverage noOp requires one current reviewer marker with the exact class body and anchor.'
+    }
 }
 
 function Get-AutomaticOwnerV2DeliveryHistory {
@@ -455,9 +748,16 @@ function Get-AutomaticOwnerV2DeliveryHistory {
                     Join-Path $DeliveryRoot 'events') -Filter '*.json' -File `
                 -ErrorAction SilentlyContinue)) {
         $event = Read-ApprovedOwnerV2SignedRecord -Path $file.FullName -Key $Key
-        if ([string]$event.kind -cne 'owner-v2-delivery-event') {
+        if ([string]$event.kind -cnotin @(
+                'owner-v2-delivery-event', 'coverage-v2-delivery-event'
+            )) {
             throw "Automatic Owner event '$($file.FullName)' is foreign."
         }
+        if ([string]$event.kind -cne $(if (
+                    [string]$Evidence.Declaration.capability.id -ceq
+                    $script:AutomaticCoverageCapability) {
+                    'coverage-v2-delivery-event'
+                } else { 'owner-v2-delivery-event' })) { continue }
         if ([string]$event.subject.repositoryId -cne
             [string]$Evidence.Declaration.subject.repositoryId -or
             [long]$event.subject.pullRequestId -ne
@@ -498,7 +798,11 @@ function Repair-AutomaticOwnerV2Intents {
             continue
         }
         $intent = Read-ApprovedOwnerV2SignedRecord -Path $file.FullName -Key $Key
-        if ([string]$intent.kind -cne 'owner-v2-service-create-intent' -or
+        $coverage = [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticCoverageCapability
+        if ([string]$intent.kind -cne $(if ($coverage) {
+                    'coverage-v2-service-create-intent'
+                } else { 'owner-v2-service-create-intent' }) -or
             [string]$intent.state.identity -cne [string]$Evidence.Identity) {
             throw "Automatic Owner intent '$($file.FullName)' is foreign."
         }
@@ -513,7 +817,8 @@ function Repair-AutomaticOwnerV2Intents {
             $entry = $null
             try {
                 $entry = Get-AutomaticOwnerV2ConfirmedEntry `
-                    -Snapshot $live.Snapshot -Selection $selection
+                    -Snapshot $live.Snapshot -Selection $selection `
+                    -Coverage:$coverage
             }
             catch { $entry = $null }
             if ($null -ne $entry) {
@@ -548,7 +853,8 @@ function Repair-AutomaticOwnerV2Intents {
         }
         $outcome = [ordered]@{
             schemaVersion = 1
-            kind = 'owner-v2-service-create-outcome'
+            kind = $(if ($coverage) { 'coverage-v2-service-create-outcome' }
+                else { 'owner-v2-service-create-outcome' })
             runId = [string]$intent.runId
             stateIdentity = [string]$Evidence.Identity
             status = $(if ($ambiguous -gt 0) {
@@ -581,6 +887,11 @@ function Invoke-AutomaticOwnerV2Comments {
         [ValidateRange(0, 5)][int]$MaximumCreates = 5
     )
     $runId = [guid]::NewGuid().ToString('N')
+    $coverage = [string]$Evidence.Declaration.capability.id -ceq
+        $script:AutomaticCoverageCapability
+    $resultKind = if ($coverage) {
+        'coverage-v2-automatic-delivery-result'
+    } else { 'owner-v2-automatic-delivery-result' }
     $events = [Collections.Generic.List[object]]::new()
     $repaired = @()
     $writes = 0
@@ -598,7 +909,7 @@ function Invoke-AutomaticOwnerV2Comments {
         catch {
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $resultKind
                 runId = $runId
                 health = 'refused'
                 providerWrites = 0
@@ -631,13 +942,67 @@ function Invoke-AutomaticOwnerV2Comments {
             -RequestedMaximum $MaximumCreates
         $available = [Math]::Max(0, [Math]::Min($runLimit, $prRemaining))
 
+        if ($coverage) {
+            try {
+                Assert-ApprovedOwnerV2CoverageEvidence -Evidence $Evidence
+                $historical = @(Get-ApprovedOwnerV2HistoricalCoverageFindings `
+                        -Observation $Evidence.Observation)
+                $blockedEvents = @($historical | ForEach-Object {
+                        New-AutomaticCoverageHistoricalRefusalEvent `
+                            -RunId $runId -Evidence $Evidence -Finding $_
+                    })
+            }
+            catch {
+                return [pscustomobject][ordered]@{
+                    schemaVersion = 1
+                    kind = $resultKind
+                    runId = $runId
+                    health = 'refused'
+                    providerWrites = 0
+                    modelWrites = 0
+                    remainingWouldCreate = 0
+                    events = @($repaired + $events.ToArray())
+                    diagnostic = Get-AutomaticOwnerV2Diagnostic `
+                        -Code 'finding-contract-refused' `
+                        -Message 'Coverage evidence is incomplete or ineligible.'
+                }
+            }
+            if ($blockedEvents.Count -gt 0) {
+                foreach ($event in $blockedEvents) {
+                    [void](Write-AutomaticOwnerV2Event `
+                            -DeliveryRoot $DeliveryRoot -Event $event -Key $Key)
+                    [void]$events.Add($event)
+                }
+                return [pscustomobject][ordered]@{
+                    schemaVersion = 1
+                    kind = $resultKind
+                    runId = $runId
+                    health = 'refused'
+                    providerWrites = 0
+                    modelWrites = 0
+                    remainingWouldCreate = @($Evidence.Observation.findings |
+                        Where-Object {
+                            [string]$_.reconciliation.classification -ceq 'wouldCreate'
+                        }).Count
+                    events = @($repaired + $events.ToArray())
+                    diagnostic = Get-AutomaticOwnerV2Diagnostic `
+                        -Code 'historical-human-review-needs-review' `
+                        -Message 'Historical human coverage review requires operator review; automatic delivery refused.'
+                }
+            }
+        }
+
         try {
-            $review = New-ApprovedOwnerV2ReviewPackage -Evidence $Evidence
+            $review = if ($coverage) {
+                New-AutomaticCoverageReviewPackage -Evidence $Evidence
+            } else {
+                New-ApprovedOwnerV2ReviewPackage -Evidence $Evidence
+            }
         }
         catch {
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $resultKind
                 runId = $runId
                 health = 'refused'
                 providerWrites = 0
@@ -654,7 +1019,7 @@ function Invoke-AutomaticOwnerV2Comments {
                 }).Count -gt 0) {
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $resultKind
                 runId = $runId
                 health = 'refused'
                 providerWrites = 0
@@ -688,7 +1053,7 @@ function Invoke-AutomaticOwnerV2Comments {
             else { 'partial' }
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $resultKind
                 runId = $runId
                 health = $health
                 providerWrites = 0
@@ -729,7 +1094,7 @@ function Invoke-AutomaticOwnerV2Comments {
             $snapshot = Get-ApprovedOwnerV2SourceArtifact `
                 -Observation $Evidence.Observation `
                 -Kind 'owner-v2-discussion-snapshot'
-            $liveState = Assert-ApprovedOwnerV2LiveRead `
+            $liveState = Assert-AutomaticOwnerV2LiveRead `
                 -Evidence $Evidence -Approval $authorization -Live $initial `
                 -Selections $selections -ExpectedSnapshotSha256 $snapshot
             $iterationId = [int]$initial.Snapshot.CurrentIterationId
@@ -740,7 +1105,7 @@ function Invoke-AutomaticOwnerV2Comments {
         catch {
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $resultKind
                 runId = $runId
                 health = 'refused'
                 providerWrites = 0
@@ -755,7 +1120,8 @@ function Invoke-AutomaticOwnerV2Comments {
 
         $intent = [ordered]@{
             schemaVersion = 1
-            kind = 'owner-v2-service-create-intent'
+            kind = $(if ($coverage) { 'coverage-v2-service-create-intent' }
+                else { 'owner-v2-service-create-intent' })
             runId = $runId
             policyDigest = Get-ApprovedOwnerV2Digest $Policy
             state = [ordered]@{
@@ -770,7 +1136,7 @@ function Invoke-AutomaticOwnerV2Comments {
                 observationSha256 =
                     Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.observation
                 telemetrySha256 =
-                    Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.telemetry
+                    Get-AutomaticOwnerV2TelemetrySha256 -Evidence $Evidence
             }
             subject = $authorization.subject
             currentIterationId = $iterationId
@@ -802,7 +1168,7 @@ function Invoke-AutomaticOwnerV2Comments {
                 if ([int]$fresh.Snapshot.CurrentIterationId -ne $iterationId) {
                     throw 'Current pull request iteration changed.'
                 }
-                $freshState = Assert-ApprovedOwnerV2LiveRead `
+                $freshState = Assert-AutomaticOwnerV2LiveRead `
                     -Evidence $Evidence -Approval $authorization -Live $fresh `
                     -Selections @($selection) `
                     -ExpectedSnapshotSha256 $expectedSnapshot
@@ -811,6 +1177,11 @@ function Invoke-AutomaticOwnerV2Comments {
                 $classification = [string]$freshState.Classifications[
                     [string]$selection.findingId]
                 if ($classification -ceq 'noOp') {
+                    if ($coverage) {
+                        Assert-AutomaticCoverageLiveNoOp `
+                            -Snapshot $fresh.Snapshot -Selection $selection `
+                            -SourceCommit ([string]$Evidence.Declaration.head.sourceCommit)
+                    }
                     $event = New-AutomaticOwnerV2Event -RunId $runId `
                         -Evidence $Evidence -Selection $selection -Action none `
                         -Outcome noOp -RunHealth healthy
@@ -871,7 +1242,8 @@ function Invoke-AutomaticOwnerV2Comments {
                 $entry = $null
                 try {
                     $entry = Get-AutomaticOwnerV2ConfirmedEntry `
-                        -Snapshot $confirmed.Snapshot -Selection $selection
+                        -Snapshot $confirmed.Snapshot -Selection $selection `
+                        -Coverage:$coverage
                 }
                 catch { $entry = $null }
                 if ($null -eq $entry) {
@@ -944,7 +1316,8 @@ function Invoke-AutomaticOwnerV2Comments {
         }
         $outcomeRecord = [ordered]@{
             schemaVersion = 1
-            kind = 'owner-v2-service-create-outcome'
+            kind = $(if ($coverage) { 'coverage-v2-service-create-outcome' }
+                else { 'owner-v2-service-create-outcome' })
             runId = $runId
             stateIdentity = [string]$Evidence.Identity
             status = $status
@@ -966,7 +1339,7 @@ function Invoke-AutomaticOwnerV2Comments {
         ) -Payload $outcomeRecord -Key $Key
         return [pscustomobject][ordered]@{
             schemaVersion = 1
-            kind = 'owner-v2-automatic-delivery-result'
+            kind = $resultKind
             runId = $runId
             health = $(if ($status -ceq 'completed') { 'healthy' }
                 elseif ($status -ceq 'operator-review-required') { 'refused' }

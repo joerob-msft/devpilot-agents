@@ -573,6 +573,7 @@ test("verified local reporting renders inside the existing dashboard and opens o
     deliveries: [{
       id: "automatic:event-1",
       mode: "automatic",
+      capabilityId: "bpm-test-ownership@1",
       action: "create",
       outcome: "created",
       occurredUtc: "2026-09-24T20:01:00.000Z",

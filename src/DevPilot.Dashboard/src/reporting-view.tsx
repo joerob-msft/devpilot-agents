@@ -119,9 +119,10 @@ export function filterReportingRows(
 }
 
 function runRow(run: RunSummary): ReportingRow {
+  const coverage = run.deliveryCapabilityId === "bpm-test-class-coverage@1";
   const text = [
     `${run.occurredUtc || "time unavailable"} | ${run.health} | run ${run.runId}`,
-    `Owner ${run.ownerCompleted} completed / ${run.ownerFailed} failed | Relation ${run.relationCompleted} completed / ${run.relationFailed} failed`,
+    `${coverage ? "Coverage" : "Owner"} ${run.ownerCompleted} completed / ${run.ownerFailed} failed | Relation ${run.relationCompleted} completed / ${run.relationFailed} failed`,
     `Attempts ${run.attempts} | model calls ${run.modelCalls ?? "unknown"} | queue pending ${run.queuePending} / posted ${run.queuePosted}`,
     `Provider writes ${run.providerWrites} | model writes ${run.modelWrites} | delivery ${run.deliveryOutcome}`,
     ...(run.durationMilliseconds === null ? [] : [`Duration ${run.durationMilliseconds} ms`]),
@@ -129,7 +130,7 @@ function runRow(run: RunSummary): ReportingRow {
   ];
   return {
     key: `run:${run.runId}:${run.occurredUtc}`, timestamp: run.occurredUtc,
-    pullRequestId: 0, capability: "owner", health: run.health, outcome: run.deliveryOutcome,
+    pullRequestId: 0, capability: run.deliveryCapabilityId ?? "owner", health: run.health, outcome: run.deliveryOutcome,
     posting: run.queuePending > 0 ? "pending" : run.queuePosted > 0 ? "posted" : "none",
     mode: "automatic", text,
     searchText: clean(text.join(" ")).toLowerCase(), url: null,
@@ -138,8 +139,12 @@ function runRow(run: RunSummary): ReportingRow {
 }
 
 function findingRow(finding: FindingSummary): ReportingRow {
+  const needsReview = finding.state === "humanCovered" ||
+    (finding.capability === "bpm-test-class-coverage@1" &&
+      finding.state === "unknown" &&
+      finding.reason === "historical-human-review-needs-review");
   const text = [
-    `PR #${finding.pullRequestId} | ${finding.severity} | ${finding.state} | ${finding.capability}`,
+    `PR #${finding.pullRequestId} | ${finding.severity} | ${needsReview ? `${finding.state} (needs-review)` : finding.state} | ${finding.capability}`,
     `${finding.path || "path unavailable"}:${finding.line || "?"} | ${finding.symbol || "symbol unavailable"}`,
     `Rule: ${finding.rule || "unavailable"} | source ${shortCommit(finding.sourceCommit)} (${finding.sourceFreshness})`,
     `Reason: ${finding.reason || "unavailable"}`,
@@ -147,14 +152,18 @@ function findingRow(finding: FindingSummary): ReportingRow {
   return {
     key: `finding:${finding.id}`, timestamp: finding.updatedUtc,
     pullRequestId: finding.pullRequestId, capability: finding.capability,
-    health: finding.sourceFreshness === "stale" || finding.state === "unknown" ? "degraded" : "healthy",
-    outcome: finding.state, posting: finding.state === "wouldCreate" || finding.state === "wouldUpdate" ? "pending" : "posted",
+    health: needsReview ? "needs-review" :
+      finding.sourceFreshness === "stale" || finding.state === "unknown" ? "degraded" : "healthy",
+    outcome: finding.state, posting: finding.state === "noOp" ? "posted" : "pending",
     mode: "none", text, searchText: clean(text.join(" ")).toLowerCase(), url: finding.url,
-    attention: finding.sourceFreshness === "stale" || finding.state === "unknown",
+    attention: finding.sourceFreshness === "stale" || finding.state === "unknown" || needsReview,
   };
 }
 
 function deliveryRow(delivery: DeliverySummary): ReportingRow {
+  const needsReview = delivery.capabilityId === "bpm-test-class-coverage@1" &&
+    delivery.action === "none" && delivery.outcome === "refused" &&
+    delivery.diagnosticCode === "historical-human-review-needs-review";
   const verifiedBody = delivery.bodyStatus === "verified" ? exactDisplayBody(delivery.body) : null;
   const body = verifiedBody !== null
     ? verifiedBody
@@ -162,18 +171,20 @@ function deliveryRow(delivery: DeliverySummary): ReportingRow {
       ? `Body unavailable; verified digest ${delivery.bodySha256}`
       : "Body unavailable; no locally bound digest.";
   const text = [
-    `PR #${delivery.pullRequestId} | ${delivery.mode} ${delivery.action} | ${delivery.outcome}`,
+    `PR #${delivery.pullRequestId} | ${delivery.mode} ${delivery.action} | ${needsReview ? "refused (needs-review)" : delivery.outcome} | ${delivery.capabilityId}`,
     `${delivery.path || "path unavailable"}:${delivery.line || "?"} | ${delivery.symbol || "symbol unavailable"}`,
+    `Rule: ${delivery.rule || "unavailable"}`,
     `Thread ${delivery.threadId ?? "n/a"} / comment ${delivery.commentId ?? "n/a"} | write ${delivery.providerWriteState}`,
     `Run ${delivery.runId || "n/a"}${delivery.eventId ? ` | event ${delivery.eventId}` : ""}`,
     body,
-    ...(delivery.diagnostic ? [`Diagnostic: ${delivery.diagnostic}`] : []),
+    ...(delivery.diagnostic ? [`Diagnostic: ${delivery.diagnosticCode ? `${delivery.diagnosticCode}: ` : ""}${delivery.diagnostic}`] : []),
     ...(delivery.commentUrl || delivery.prUrl ? [`Link: ${delivery.commentUrl ?? delivery.prUrl}`] : ["Link unavailable: identity or target was not safely validated."]),
   ];
   return {
     key: delivery.id, timestamp: delivery.occurredUtc,
-    pullRequestId: delivery.pullRequestId, capability: "bpm-test-ownership@1",
-    health: /ambiguous|refused|failed|unknown/i.test(`${delivery.outcome} ${delivery.providerWriteState}`) ? "degraded" : "healthy",
+    pullRequestId: delivery.pullRequestId, capability: delivery.capabilityId,
+    health: needsReview ? "needs-review" :
+      /ambiguous|refused|failed|unknown/i.test(`${delivery.outcome} ${delivery.providerWriteState}`) ? "degraded" : "healthy",
     outcome: delivery.outcome,
     posting: delivery.providerWrites > 0 || /created|updated|recovered|noOp/i.test(delivery.outcome) ? "posted" : "pending",
     mode: delivery.mode, text,
