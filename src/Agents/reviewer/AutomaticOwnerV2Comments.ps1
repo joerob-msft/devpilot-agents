@@ -71,6 +71,8 @@ function Initialize-AutomaticOwnerV2DeliveryRoot {
         [string]$Delivery = 'owner'
     )
     if ($Delivery -ceq 'redundant-coverage') {
+        $DeliveryRoot = Resolve-AgentTrustedRoot -Path $DeliveryRoot `
+            -Kind durable-state -RepositoryRoot $RepoRoot -Create
         $DeliveryRoot = Join-Path $DeliveryRoot `
             $script:AutomaticRedundantCoverageRoot
     }
