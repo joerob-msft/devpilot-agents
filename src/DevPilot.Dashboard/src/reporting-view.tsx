@@ -11,7 +11,7 @@ import type {
 import type { RuleSummary } from "./rule-registry.js";
 
 export const REPORTING_SECTIONS = [
-  "overview", "runs", "findings", "deliveries", "failures", "relations", "rules",
+  "overview", "runs", "findings", "deliveries", "failures", "relations", "intake", "rules",
 ] as const;
 export type ReportingSection = (typeof REPORTING_SECTIONS)[number];
 export type ReportingTimeRange = "24h" | "7d" | "30d" | "all";
@@ -263,6 +263,11 @@ function ruleRow(rule: RuleSummary): ReportingRow {
     `${redundant ? "Class outcomes" : "Outcomes"}: finding ${count(rule.counts.finding)}${redundant ? " class(es)" : ""} | noOp ${count(rule.counts.noOp)} | wouldCreate ${count(rule.counts.wouldCreate)} | unknown ${count(rule.counts.unknown)} | skipped ${count(rule.counts.skipped)} | refused ${count(rule.counts.refused)} | posted ${count(rule.counts.posted)}${redundant ? " class comment(s)" : ""}`,
     ...(redundant ? [`Affected method attributes across bound class findings: ${count(rule.affectedMethodAttributes)}; f: bounded method-name summary per class`] : []),
     `Bound findings ${rule.findingIds.length} / deliveries ${rule.deliveryIds.length}; f: findings, e: deliveries`,
+    ...(rule.intake ? [
+      `READ-ONLY INTAKE ${rule.intake.state} | generation ${rule.intake.generation || "unknown"} | discovered ${rule.intake.discovered} / eligible ${rule.intake.eligible} / evaluated ${rule.intake.evaluated} / skipped ${rule.intake.skipped} / error ${rule.intake.error} / unknown ${rule.intake.unknown} / pending ${rule.intake.pending}`,
+      "Historical scheduled-rule execution above is NOT current-head intake evaluation or posting authority.",
+      ...rule.intake.gaps.map((gap) => `Intake gap: ${gap}`),
+    ] : []),
     ...rule.gaps.map((gap) => `Coverage gap: ${gap}`),
   ];
   return {
@@ -279,6 +284,30 @@ function ruleRow(rule: RuleSummary): ReportingRow {
 }
 
 export function reportingRows(snapshot: ReportingSnapshot, section: ReportingSection): ReportingRow[] {
+  if (section === "intake") {
+    const intake = snapshot.intake;
+    if (!intake) return [];
+    return intake.heads.map((head): ReportingRow => {
+      const text = [
+        `PR #${head.pullRequestId} | ${head.state} (${head.reason}) | target ${head.targetRef}`,
+        `Source ${shortCommit(head.sourceCommit ?? "")} / target ${shortCommit(head.targetCommit ?? "")} | iteration ${head.iterationId ?? "unknown"}`,
+        ...head.rules.map((rule) =>
+          `${rule.ruleId} (${rule.capabilityId}): ${rule.state} / ${rule.reason}`),
+        `Inventory ${intake.state} as of ${intake.observedUtc}; navigation and discovery are NOT current-head rule evaluation`,
+      ];
+      return {
+        key: `intake:${intake.generation}:${head.pullRequestId}`,
+        timestamp: intake.observedUtc,
+        pullRequestId: head.pullRequestId,
+        capability: "intake",
+        health: head.state === "unknown" || head.state === "error" ? "degraded" : intake.state,
+        outcome: head.state,
+        posting: "none", mode: "none", text,
+        searchText: clean(text.join(" ")).toLowerCase(),
+        url: null, attention: head.state !== "pending" || intake.state !== "complete",
+      };
+    });
+  }
   if (section === "rules") return (snapshot.rules ?? []).map((rule) => {
     const row = ruleRow(rule);
     if (rule.capabilityId !== "relation-contextual-review-v1") return row;
@@ -308,6 +337,10 @@ export function overviewLines(snapshot: ReportingSnapshot): string[] {
     `Writes: provider ${snapshot.overall.providerWrites} | model ${snapshot.overall.modelWrites}`,
     `Runs ${snapshot.runs.length} | findings ${snapshot.findings.length} | deliveries ${snapshot.deliveries.length} | failures ${snapshot.failures.length}`,
     `Relation findings ${snapshot.relations.length} (read-only) | quarantine ${snapshot.quarantine.length}${snapshot.truncated ? " | HISTORY TRUNCATED BY BUDGET" : ""}`,
+    ...(snapshot.intake ? [
+      `READ-ONLY INTAKE ${snapshot.intake.state} as of ${snapshot.intake.observedUtc || "unavailable"} | discovered ${snapshot.intake.discovered ?? "unknown"} / eligible master ${snapshot.intake.eligible ?? "unknown"} / excluded other targets ${snapshot.intake.excludedOtherTargets ?? "unknown"} | generation ${snapshot.intake.generation || "unknown"}`,
+      `Intake is NOT scheduled-rule coverage; evaluated requires new current-head completed durable observations. ${snapshot.intake.gaps.join(", ")}`,
+    ] : ["Active-PR intake is not configured; denominator and skipped counts are unknown."]),
     ...(snapshot.diagnostics.length ? snapshot.diagnostics.map((diagnostic) => `Missing/unavailable: ${diagnostic}`) : []),
   ];
 }

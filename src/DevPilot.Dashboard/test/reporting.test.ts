@@ -20,6 +20,7 @@ import {
   type ReportingFilters,
 } from "../src/reporting-view.js";
 import { projectRuleRegistry } from "../src/rule-registry.js";
+import { parseIntakeCohort } from "../src/intake-report.js";
 
 type JsonRecord = Record<string, unknown>;
 const execFileAsync = promisify(execFile);
@@ -507,6 +508,194 @@ test("reporting config paths resolve locally and scheduled task names are exact"
     budgets: { maxFileBytes: 1_048_576, maxFiles: 100, maxHistory: 50, maxScanMilliseconds: 5_000 },
   };
   assert.throws(() => parseReportingConfiguration(base), /exact task name/);
+  const withIntake = {
+    ...base,
+    scheduledTaskName: "DevPilot Owner v2",
+    roots: { ...base.roots, intake: join(process.cwd(), "reporting-config-example", "intake") },
+  };
+  assert.throws(() => parseReportingConfiguration(withIntake), /configured together/);
+  assert.throws(() => parseReportingConfiguration({
+    ...base,
+    scheduledTaskName: "DevPilot Owner v2",
+    files: { ...base.files, intakeCohort: join(process.cwd(), "reporting-config-example", "intake", "cohort.json") },
+  }), /configured together/);
+});
+
+function syntheticIntake(size = 347): JsonRecord {
+  const heads = Array.from({ length: size }, (_, index) => ({
+    pullRequestId: index + 1,
+    sourceCommit: index < 20 ? (index + 1).toString(16).padStart(40, "0") : null,
+    targetCommit: index < 20 ? "a".repeat(40) : null,
+    targetRef: index < 275 ? "refs/heads/master" : "refs/heads/release",
+    iterationId: index < 20 ? 21 : null,
+    status: index < 275 ? "pending" : "skipped",
+    reason: index < 275 ? "awaiting-scheduled-observation" : "target-out-of-policy",
+    rules: [{
+      capabilityId: "bpm-future-rule@1", ruleId: "future-rule",
+      status: index < 275 ? "pending" : "skipped",
+      reasonCode: index < 275 ? "no-evaluator" : "target-out-of-policy",
+    }],
+  }));
+  return {
+    schemaVersion: 1, kind: "active-pr-intake-cohort",
+    generation: "f".repeat(32),
+    generationFile: join("generations", `${"f".repeat(32)}.json`),
+    observedUtc: "2026-09-24T21:00:00.000Z",
+    binding: {
+      organization: "https://dev.azure.com/example",
+      projectId: "11111111-1111-1111-1111-111111111111",
+      repositoryId: "22222222-2222-2222-2222-222222222222",
+    },
+    inventory: {
+      state: "complete", discovered: size,
+      eligible: Math.min(size, 275),
+      excludedOtherTargets: Math.max(0, size - 275),
+    },
+    heads,
+    rules: [{
+      capabilityId: "bpm-future-rule@1",
+      ruleId: "future-rule",
+      discovered: size,
+      eligible: Math.min(size, 275),
+      evaluated: 0,
+      skipped: Math.max(0, size - 275),
+      error: 0,
+      pending: Math.min(size, 275),
+      gaps: ["scheduled-execution-not-wired"],
+    }],
+    gaps: ["scheduled-execution-not-wired"],
+  };
+}
+
+test("read-only intake reports 347 distinct heads, excluded targets, and generic rules without fabricated evaluation", async () => {
+  const feed = syntheticIntake();
+  const parsed = parseIntakeCohort(feed);
+  assert.equal(parsed.discovered, 347);
+  assert.equal(parsed.eligible, 275);
+  assert.equal(parsed.excludedOtherTargets, 72);
+  assert.equal(parsed.rules[0]?.evaluated, 0);
+  const fixture = await createFixture();
+  try {
+    const intakeRoot = join(fixture.root, "intake");
+    const intakeFile = join(intakeRoot, "cohort.json");
+    await writeJson(intakeFile, feed);
+    await writeJson(join(intakeRoot, "generations", `${"f".repeat(32)}.json`), feed);
+    const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as JsonRecord;
+    asObject(config.roots).intake = intakeRoot;
+    asObject(config.files).intakeCohort = intakeFile;
+    await writeJson(fixture.configPath, config);
+    const snapshot = await createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-24T21:05:00Z"),
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.equal(snapshot.intake?.state, "complete");
+    assert.equal(reportingRows(snapshot, "intake").length, 347);
+    assert.match(overviewLines(snapshot).join(" "), /discovered 347 \/ eligible master 275 \/ excluded other targets 72/);
+    const generic = snapshot.rules?.find((rule) => rule.id === "future-rule");
+    assert.equal(generic?.implemented, false);
+    assert.equal(generic?.execution, "unknown");
+    assert.equal(generic?.publishing, "unknown");
+    assert.equal(generic?.intake?.evaluated, 0);
+    assert.equal(generic?.lastEvaluatedUtc, null);
+    assert.match(reportingRows(snapshot, "rules").at(-1)?.text.join(" ") ?? "", /evaluated 0.*pending 275/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("intake fails closed on duplicate or drifting denominators, claimed evaluations, and missing feed", async () => {
+  const duplicate = syntheticIntake();
+  (duplicate.heads as JsonRecord[])[1]!.pullRequestId = 1;
+  assert.throws(() => parseIntakeCohort(duplicate), /duplicate/);
+  const truncated = syntheticIntake();
+  (truncated.heads as JsonRecord[]).pop();
+  assert.throws(() => parseIntakeCohort(truncated), /denominator/);
+  const silent = syntheticIntake();
+  ((silent.rules as JsonRecord[])[0]!).pending = 274;
+  assert.throws(() => parseIntakeCohort(silent), /cannot claim evaluation/);
+  const nonmaster = syntheticIntake();
+  (nonmaster.heads as JsonRecord[])[275]!.status = "pending";
+  assert.throws(() => parseIntakeCohort(nonmaster), /denominator/);
+  const claimed = syntheticIntake();
+  ((claimed.rules as JsonRecord[])[0]!).evaluated = 1;
+  assert.throws(() => parseIntakeCohort(claimed), /cannot claim evaluation/);
+  const injection = syntheticIntake();
+  (injection.heads as JsonRecord[])[0]!.reason = "Bearer private-secret";
+  assert.throws(() => parseIntakeCohort(injection), /reason code/);
+  const fixture = await createFixture();
+  try {
+    const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as JsonRecord;
+    asObject(config.roots).intake = join(fixture.root, "intake");
+    asObject(config.files).intakeCohort = join(fixture.root, "intake", "missing.json");
+    await mkdir(join(fixture.root, "intake"));
+    await writeJson(fixture.configPath, config);
+    const snapshot = await createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-24T21:05:00Z"),
+      taskReader: async () => healthyTask,
+    }).read();
+    assert.equal(snapshot.intake?.state, "unknown");
+    assert.equal(snapshot.intake?.discovered, null);
+    assert.deepEqual(snapshot.intake?.gaps, ["intake-file-unavailable"]);
+    assert.equal(snapshot.rules?.length, 4);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("intake preserves inaccessible heads as explicit unknown without inventing commits or coverage", () => {
+  const feed = syntheticIntake(1);
+  feed.inventory = {
+    state: "unknown", discovered: null, eligible: null, excludedOtherTargets: null,
+  };
+  feed.heads = [{
+    pullRequestId: 1, sourceCommit: null, targetCommit: null,
+    targetRef: "refs/heads/master", iterationId: null,
+    status: "unknown", reason: "head-inaccessible",
+    rules: [],
+  }];
+  feed.rules = [];
+  feed.gaps = ["inaccessible-head"];
+  const report = parseIntakeCohort(feed);
+  assert.equal(report.state, "unknown");
+  assert.equal(report.heads[0]?.iterationId, null);
+  assert.equal(report.eligible, null);
+  assert.equal(report.rules.length, 0);
+});
+
+test("intake reader rejects foreign paths and marks old inventory stale without changing verified rule observations", async () => {
+  const fixture = await createFixture();
+  try {
+    const intakeRoot = join(fixture.root, "intake");
+    const intakeFile = join(intakeRoot, "cohort.json");
+    await writeJson(intakeFile, syntheticIntake());
+    await writeJson(join(intakeRoot, "generations", `${"f".repeat(32)}.json`), syntheticIntake());
+    const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as JsonRecord;
+    asObject(config.roots).intake = intakeRoot;
+    asObject(config.files).intakeCohort = intakeFile;
+    await writeJson(fixture.configPath, config);
+    const adapter = createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-27T21:05:00Z"),
+      taskReader: async () => healthyTask,
+    });
+    const stale = await adapter.read();
+    assert.equal(stale.intake?.state, "unknown");
+    assert.ok(stale.intake?.gaps.includes("stale-inventory"));
+    const wrongRepository = syntheticIntake();
+    asObject(wrongRepository.binding).repositoryId = "33333333-3333-3333-3333-333333333333";
+    await writeJson(intakeFile, wrongRepository);
+    await writeJson(join(intakeRoot, "generations", `${"f".repeat(32)}.json`), wrongRepository);
+    const mismatched = await adapter.read();
+    assert.deepEqual(mismatched.intake?.gaps, ["invalid-intake-cohort"]);
+    assert.equal(mismatched.intake?.discovered, null);
+    asObject(config.files).intakeCohort = join(fixture.toolkitRoot, "owner-v2-config.json");
+    await writeJson(fixture.configPath, config);
+    const foreign = await adapter.read();
+    assert.deepEqual(foreign.intake?.gaps, ["intake-path-untrusted"]);
+    assert.equal(foreign.intake?.eligible, null);
+    assert.equal(foreign.rules?.length, 4);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
 });
 
 test("reporting adapter verifies signed feeds, isolates relation findings, derives bodies, and bounds histories", async () => {
