@@ -636,7 +636,7 @@ test("intake fails closed on duplicate or drifting denominators, claimed evaluat
     assert.equal(snapshot.intake?.state, "unknown");
     assert.equal(snapshot.intake?.discovered, null);
     assert.deepEqual(snapshot.intake?.gaps, ["intake-file-unavailable"]);
-    assert.equal(snapshot.rules?.length, 4);
+    assert.equal(snapshot.rules?.length, 5);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -692,7 +692,7 @@ test("intake reader rejects foreign paths and marks old inventory stale without 
     const foreign = await adapter.read();
     assert.deepEqual(foreign.intake?.gaps, ["intake-path-untrusted"]);
     assert.equal(foreign.intake?.eligible, null);
-    assert.equal(foreign.rules?.length, 4);
+    assert.equal(foreign.rules?.length, 5);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -789,7 +789,7 @@ test("rules registry separates source, deployment, enablement, evaluation and ve
     const rules = snapshot.rules ?? [];
     assert.deepEqual(rules.map((rule) => rule.id), [
       "mstest-owner", "synthetic-relation-rule-v1", "bpm-test-class-coverage@1",
-      "bpm-redundant-method-coverage@1",
+      "bpm-redundant-method-coverage@1", "bpm-named-areequal-arguments@1",
     ]);
     const owner = rules[0]!;
     assert.equal(owner.implemented, true);
@@ -846,8 +846,19 @@ test("rules registry separates source, deployment, enablement, evaluation and ve
     assert.equal(redundant.lastGeneration, null);
     assert.deepEqual(redundant.scope, []);
     assert.match(redundant.gaps.join(" "), /not deployed in the pinned service/i);
+    const named = rules[4]!;
+    assert.equal(named.implemented, true);
+    assert.equal(named.deployment, "not-deployed");
+    assert.equal(named.enablement, "disabled");
+    assert.equal(named.execution, "unknown");
+    assert.equal(named.authorization, "disabled");
+    assert.equal(named.publishing, "disabled");
+    assert.equal(named.counts.finding, null);
+    assert.equal(named.counts.posted, null);
+    assert.equal(named.affectedCalls, null);
+    assert.deepEqual(named.scope, []);
     const rows = reportingRows(snapshot, "rules");
-    assert.equal(rows.length, 4);
+    assert.equal(rows.length, 5);
     assert.equal(rows[1]?.relation?.id, snapshot.relations[0]?.id);
     assert.match(rows[2]!.text.join(" "), /finding unknown.*skipped unknown/);
     assert.match(rows[3]!.text.join(" "), /auto policy disabled.*auto-post disabled/);
@@ -1369,6 +1380,219 @@ test("redundant method coverage remains independent of Owner and class deploymen
     assert.equal(drifted.deliveries.some((delivery) => delivery.eventId === "event-redundant-bad"), false);
     assert.ok(drifted.failures.some((failure) => failure.id === "event-binding:event-redundant-bad"));
     assert.equal(drifted.rules?.[3]?.counts.posted, null);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("named AreEqual source findings stay undeployed until a separate matching run binds method counts", async () => {
+  const fixture = await createFixture();
+  try {
+    const capabilityId = "bpm-named-areequal-arguments@1";
+    const identity = "9".repeat(64);
+    const findingId = `named-areequal-v2:${"8".repeat(64)}`;
+    const marker = "7".repeat(64);
+    const path = "tests/WidgetTests.cs";
+    const symbol = "WidgetTests.ShouldCompare";
+    const body = "**Use named arguments for Assert.AreEqual in this test method**\n\nChanged calls: 2.";
+    const bodySha256 = sha256Text(body);
+    const subject = {
+      projectId: "11111111-1111-1111-1111-111111111111",
+      repositoryId: "22222222-2222-2222-2222-222222222222",
+      pullRequestId: 42,
+    };
+    const head = { sourceCommit: "d".repeat(40) };
+    const target = { targetCommit: "2".repeat(40), targetRef: "refs/heads/main" };
+    const declaration = {
+      kind: "owner-v2-preview-declaration", stateDigest: `v1:sha256:${identity}`,
+      subject, head, target,
+      capability: { id: capabilityId, digest: `v1:sha256:${"6".repeat(64)}` },
+      rule: { section: capabilityId,
+        path: "src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt",
+        commit: "e".repeat(40) },
+    };
+    const root = join(fixture.stateRoot, "owner-v2-preview-state", "schema-1", "capabilities", "named-areequal");
+    const namedDeliveryRoot = join(fixture.deliveryRoot, "named-areequal-v1");
+    const namedKey = randomBytes(32);
+    const namedKeyPath = join(namedDeliveryRoot, "keys", "named-areequal-service-authorization.hmac");
+    await write(namedKeyPath, namedKey);
+    await chmod(namedKeyPath, 0o600);
+    const observationPath = join(root, "observations", `${identity}.json`);
+    const finding = {
+      identity: findingId, disposition: "violation",
+      anchor: { path, line: 17, symbol },
+      affectedCallCount: 2, affectedCallLines: [17, 24], callListTruncated: false,
+      reconciliation: { classification: "wouldCreate", bodySha256 },
+    };
+    const observation = {
+      schemaVersion: 2, kind: "owner-observation", capability: capabilityId,
+      subject: { projectId: null, repositoryId: subject.repositoryId,
+        pullRequestId: subject.pullRequestId, headCommit: head.sourceCommit, ...target },
+      rule: { section: capabilityId, path: declaration.rule.path, commit: declaration.rule.commit },
+      lifecycle: { status: "completed" }, findings: [finding],
+    };
+    await writeJson(join(root, "declarations", `${identity}.json`), declaration);
+    await writeJson(join(root, "records", `${identity}.json`), {
+      identity, stateDigest: declaration.stateDigest, state: "completed",
+      capabilityId, capabilityDigest: declaration.capability.digest,
+      subjectDigest: canonicalDigest(subject), headDigest: canonicalDigest(head),
+      updatedUtc: "utc:2026-09-24T20:02:00Z",
+    });
+    await writeJson(observationPath, observation);
+    const signedSubject = { ...subject, sourceCommit: head.sourceCommit, ...target };
+    const intent = {
+      schemaVersion: 1, kind: "named-areequal-v2-service-create-intent",
+      runId: "run-named", state: { identity }, capability: { id: capabilityId },
+      rule: { section: capabilityId }, subject: signedSubject,
+      implementation: { toolkitHead: "f".repeat(40), toolkitTree: "1".repeat(40),
+        formatterSha256: sha256Text("formatter fixture\n") },
+      selections: [{
+        findingId, marker, markerComment: `<!-- devpilot-named-areequal:v1:${marker} -->`,
+        path, line: 17, symbol, body, bodySha256, classification: "wouldCreate",
+        affectedCallCount: 2, affectedCallLines: [17, 24], callListTruncated: false,
+      }],
+    };
+    await write(join(namedDeliveryRoot, "intents", identity, "run-named.json"),
+      signedEnvelope(intent, namedKey));
+    const event = {
+      schemaVersion: 1, kind: "named-areequal-v2-delivery-event",
+      eventId: "event-named", runId: "run-named", ruleId: capabilityId, capabilityId,
+      occurredUtc: "20260924T200300Z", runHealth: "healthy", subject: signedSubject,
+      finding: { stateIdentity: identity, findingId, marker, bodySha256, path, line: 17, symbol },
+      action: "create", outcome: "created", threadId: 400, commentId: 401,
+      providerWriteCount: 1, modelWriteCount: 0, providerWriteState: "confirmed",
+    };
+    const eventPath = join(namedDeliveryRoot, "events", "event-named.json");
+    await write(eventPath, signedEnvelope(event, namedKey));
+    const adapter = createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-24T20:35:00Z"), taskReader: async () => healthyTask,
+    });
+    const unbound = await adapter.read();
+    const source = unbound.rules?.[4];
+    assert.equal(source?.deployment, "not-deployed");
+    assert.equal(source?.execution, "unknown");
+    assert.equal(source?.counts.finding, null);
+    assert.equal(source?.affectedCalls, null);
+    assert.equal(source?.counts.posted, null);
+    assert.equal(unbound.rules?.[0]?.counts.finding, 1);
+    const findingRow = unbound.findings.find((item) => item.id === findingId);
+    assert.deepEqual(findingRow?.affectedCallLines, [17, 24]);
+    assert.equal(findingRow?.affectedCallCount, 2);
+    assert.equal(findingRow?.state, "wouldCreate");
+    assert.match(findingRow?.url ?? "", /pullrequest\/42/);
+    const delivery = unbound.deliveries.find((item) => item.eventId === event.eventId);
+    assert.equal(delivery?.bodyStatus, "verified");
+    assert.equal(delivery?.body, body);
+    assert.match(delivery?.commentUrl ?? "", /discussionId=400/);
+    const runPath = join(fixture.runnerRoot, "last-run.json");
+    const run = JSON.parse(await readFile(runPath, "utf8")) as JsonRecord;
+    run.completedUtc = "2026-09-24T20:30:00Z";
+    asObject(asArray(run.records)[0]).identity = identity;
+    asObject(run.ownerAutoDelivery).kind = "redundant-coverage-v2-automatic-delivery-result";
+    await writeJson(runPath, run);
+    const otherChannel = await adapter.read();
+    assert.equal(otherChannel.rules?.[4]?.counts.finding, null);
+    asObject(run.ownerAutoDelivery).kind = "named-areequal-v2-automatic-delivery-result";
+    asObject(run.ownerAutoDelivery).runId = "run-named";
+    await writeJson(runPath, run);
+    const bound = await adapter.read();
+    const named = bound.rules?.[4];
+    assert.equal(bound.runs[0]?.deliveryCapabilityId, capabilityId);
+    assert.equal(named?.deployment, "verified");
+    assert.equal(named?.execution, "verified");
+    assert.equal(named?.counts.finding, 1);
+    assert.equal(named?.counts.wouldCreate, 1);
+    assert.equal(named?.affectedCalls, 2);
+    assert.equal(named?.counts.posted, 1);
+    assert.equal(named?.authorization, "disabled");
+    assert.equal(named?.publishing, "disabled");
+    assert.equal(named?.policyCaps, null);
+    assert.deepEqual(named?.deliveryIds, ["automatic:event-named"]);
+    assert.equal(bound.rules?.[0]?.counts.finding, null);
+    const impostorPath = join(fixture.deliveryRoot, "events", "event-named-owner-key.json");
+    await write(impostorPath, signedEnvelope({
+      ...event, eventId: "event-named-owner-key",
+    }, fixture.serviceKey));
+    const wrongKeyRoot = await adapter.read();
+    assert.equal(wrongKeyRoot.deliveries.some((item) => item.eventId === "event-named-owner-key"), false);
+    assert.ok(wrongKeyRoot.quarantine.some((item) => item.file.endsWith("event-named-owner-key.json")));
+    await rm(impostorPath);
+    await rm(namedKeyPath);
+    const unavailableNamedFeed = await adapter.read();
+    assert.equal(unavailableNamedFeed.rules?.[4]?.counts.posted, null);
+    assert.ok(unavailableNamedFeed.diagnostics.some((item) =>
+      item.startsWith("named AreEqual delivery feed unavailable:")));
+    await write(namedKeyPath, namedKey);
+    await chmod(namedKeyPath, 0o600);
+    await write(join(namedDeliveryRoot, "events", "event-named-update.json"),
+      signedEnvelope({ ...event, eventId: "event-named-update",
+        action: "update", outcome: "updated" }, namedKey));
+    const updated = await adapter.read();
+    assert.equal(updated.deliveries.some((item) => item.eventId === "event-named-update"), false);
+    assert.ok(updated.failures.some((item) => item.id === "event-binding:event-named-update" &&
+      /create-only/.test(item.message)));
+    assert.equal(updated.rules?.[4]?.counts.posted, null);
+    await rm(join(namedDeliveryRoot, "events", "event-named-update.json"));
+    await write(join(namedDeliveryRoot, "events", "event-named-foreign.json"),
+      signedEnvelope({ ...event, eventId: "event-named-foreign",
+        capabilityId: "bpm-test-ownership@1" }, namedKey));
+    const foreign = await adapter.read();
+    assert.equal(foreign.deliveries.some((item) => item.eventId === "event-named-foreign"), false);
+    assert.ok(foreign.failures.some((item) => item.id === "event-binding:event-named-foreign"));
+    await rm(join(namedDeliveryRoot, "events", "event-named-foreign.json"));
+    await write(join(namedDeliveryRoot, "events", "event-named-wrong-method.json"),
+      signedEnvelope({ ...event, eventId: "event-named-wrong-method",
+        finding: { ...event.finding, symbol: "WidgetTests.OtherMethod" } }, namedKey));
+    const wrongMethod = await adapter.read();
+    assert.equal(wrongMethod.deliveries.some((item) => item.eventId === "event-named-wrong-method"), false);
+    assert.ok(wrongMethod.failures.some((item) => item.id === "event-binding:event-named-wrong-method"));
+    await rm(join(namedDeliveryRoot, "events", "event-named-wrong-method.json"));
+    await write(join(namedDeliveryRoot, "events", "event-named-wrong-body.json"),
+      signedEnvelope({ ...event, eventId: "event-named-wrong-body",
+        finding: { ...event.finding, bodySha256: "0".repeat(64) } }, namedKey));
+    const wrongEventBody = await adapter.read();
+    assert.equal(wrongEventBody.deliveries.some((item) => item.eventId === "event-named-wrong-body"), false);
+    assert.ok(wrongEventBody.failures.some((item) => item.id === "event-binding:event-named-wrong-body"));
+    await rm(join(namedDeliveryRoot, "events", "event-named-wrong-body.json"));
+    await write(join(namedDeliveryRoot, "events", "event-named-refusal-wrong-body.json"),
+      signedEnvelope({ ...event, eventId: "event-named-refusal-wrong-body",
+        finding: { ...event.finding, bodySha256: "0".repeat(64) },
+        action: "none", outcome: "refused", threadId: null, commentId: null,
+        providerWriteCount: 0, providerWriteState: "none" }, namedKey));
+    const wrongRefusalBody = await adapter.read();
+    assert.equal(wrongRefusalBody.deliveries.some((item) =>
+      item.eventId === "event-named-refusal-wrong-body"), false);
+    assert.ok(wrongRefusalBody.failures.some((item) =>
+      item.id === "event-binding:event-named-refusal-wrong-body"));
+    await rm(join(namedDeliveryRoot, "events", "event-named-refusal-wrong-body.json"));
+    const intentPath = join(namedDeliveryRoot, "intents", identity, "run-named.json");
+    await write(intentPath, signedEnvelope({
+      ...intent, selections: [{ ...intent.selections[0], body: `${body} Tampered.` }],
+    }, namedKey));
+    const wrongBody = await adapter.read();
+    assert.equal(wrongBody.deliveries.some((item) => item.eventId === "event-named"), false);
+    assert.ok(wrongBody.failures.some((item) => item.id === "event-binding:event-named" &&
+      /body/.test(item.message)));
+    await write(intentPath, signedEnvelope({
+      ...intent, selections: [{ ...intent.selections[0], affectedCallCount: 3 }],
+    }, namedKey));
+    const wrongCallCount = await adapter.read();
+    assert.equal(wrongCallCount.deliveries.some((item) => item.eventId === "event-named"), false);
+    assert.ok(wrongCallCount.failures.some((item) => item.id === "event-binding:event-named"));
+    await write(intentPath, signedEnvelope(intent, namedKey));
+    await write(join(namedDeliveryRoot, "events", "event-named-tampered.json"),
+      signedEnvelope({ ...event, eventId: "event-named-tampered" }, randomBytes(32)));
+    const invalidSignature = await adapter.read();
+    assert.ok(invalidSignature.quarantine.some((item) =>
+      item.file.endsWith("event-named-tampered.json")));
+    assert.equal(invalidSignature.deliveries.some((item) => item.eventId === "event-named-tampered"), false);
+    await rm(join(namedDeliveryRoot, "events", "event-named-tampered.json"));
+    finding.affectedCallLines = [17, 17];
+    await writeJson(observationPath, observation);
+    const malformed = await adapter.read();
+    assert.ok(malformed.failures.some((item) => item.id === `rule-binding:${identity}`));
+    assert.equal(malformed.findings.some((item) => item.id === findingId), false);
+    assert.equal(malformed.rules?.[4]?.counts.finding, null);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

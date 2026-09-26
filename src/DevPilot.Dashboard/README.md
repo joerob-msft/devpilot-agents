@@ -15,6 +15,16 @@ health, runs, findings, deliveries, failures, read-only relation findings,
 and a searchable **Rules** inventory distinguishing implementation from
 deployment, enablement, evaluation, and publishing. Class-level coverage is
 implemented in PR 174 but not deployed in the reported service cohort.
+The independent named `Assert.AreEqual` arguments rule (`bpm-named-areequal-arguments@1`)
+is source-implemented, not deployed or evaluated in the pinned service, and
+defaults off; Owner or coverage runs and policies do not establish its status.
+It matches changed C# test-method calls spelled `Assert.AreEqual` with at least
+two arguments syntactically; reporting does not claim resolved MSTest symbols.
+Only a verified rule-specific completed run binds method findings and affected
+call counts (otherwise unknown), and only signed, matching create-only delivery
+events from its separate `named-areequal-v1` audit root and private key can
+establish posted comments. An absent or unreadable named feed cannot borrow
+Owner delivery counts. Per-rule intake coverage remains unknown.
 The relation rule ID comes from the declaration bound to the local
 observation, not a hard-coded customer rule name; older relation evidence is
 marked stale even if a later scheduled run reused that state. Relation rows

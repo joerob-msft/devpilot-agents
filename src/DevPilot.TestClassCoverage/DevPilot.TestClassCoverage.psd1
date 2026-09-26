@@ -7,7 +7,7 @@
     Copyright = '(c) DevPilot Agents contributors. All rights reserved.'
     Description = 'Bounded, conservative extraction of changed C# MSTest class coverage constructs.'
     PowerShellVersion = '7.0'
-    FunctionsToExport = @('Get-TestClassCoverageConstructs', 'Get-RedundantMethodCoverageConstructs')
+    FunctionsToExport = @('Get-TestClassCoverageConstructs', 'Get-RedundantMethodCoverageConstructs', 'Get-NamedAreEqualConstructs')
     CmdletsToExport = @()
     VariablesToExport = @()
     AliasesToExport = @()
