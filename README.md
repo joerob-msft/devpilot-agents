@@ -80,7 +80,7 @@ policy, recovery rules, and dashboard event feed are documented in
 The independent, no-model changed-MSTest-class coverage rule and its separate
 default-off authority are documented in
 [docs/test-class-coverage-convention.md](docs/test-class-coverage-convention.md).
-The separately pinned EngHub rule for named arguments in changed MSTest
+The separately pinned EngHub rule for named arguments in changed test-code
 `Assert.AreEqual` calls is documented in
 [docs/named-areequal-arguments-convention.md](docs/named-areequal-arguments-convention.md).
 The existing local Operations dashboard's verified read-only reporting view,

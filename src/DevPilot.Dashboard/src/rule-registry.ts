@@ -105,7 +105,7 @@ export const IMPLEMENTED_RULES: readonly RuleDefinition[] = [
   },
   {
     id: "bpm-named-areequal-arguments@1",
-    description: "Changed positional Assert.AreEqual calls in MSTest methods require named arguments; one finding per method.",
+    description: "Changed C# test-method calls spelled Assert.AreEqual with at least two arguments require named arguments; one finding per method (syntactic match, not symbol resolution).",
     provenance: "Independent EngHub Named parameters for Assert convention; source implemented, not deployed or authorized in the pinned service",
     implementationVersion: "bpm-named-areequal-arguments@1",
     capabilityId: "bpm-named-areequal-arguments@1",

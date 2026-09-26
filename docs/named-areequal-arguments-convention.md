@@ -1,4 +1,4 @@
-# Named arguments for changed MSTest `Assert.AreEqual` calls
+# Named arguments for changed test-code `Assert.AreEqual` calls
 
 `bpm-named-areequal-arguments@1` is an independent deterministic, model-free
 review rule. Its authority is EngHub
@@ -15,18 +15,23 @@ multi-parameter assertions should name their arguments, especially
 assertion's meaning. This is **not** the EngHub Owner convention or either
 coverage rule. The repository's short [rule policy](../src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt)
 records the source pin without copying private test code or discussion.
-The 525-byte policy is pinned independently at SHA-256
-`008e56acc64ecdb92a2bcd4974bdaff85e23a9fdea610d1d055ddb88cf6aed61`;
+The 653-byte local policy is pinned independently at SHA-256
+`8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4`;
 the declaration and capability both reject a changed local policy.
 
-Only a confidently resolved C# MSTest `Assert.AreEqual` invocation in a test
-method, with an exact changed call opening line and at least one positional
-argument, is actionable. Every supplied argument must be named according to
-the overload (`expected:`, `actual:`, and any further supplied argument).
+Only a confidently parsed C# test-method call spelled `Assert.AreEqual` with
+at least two supplied arguments, an exact changed call opening line, and at
+least one positional argument is actionable. Ordinary namespace imports alone
+do not change its call-site spelling or the named-argument style requirement;
+the rule does not claim the receiver's resolved type is MSTest. Aliases,
+receiver shadowing, and uncertain syntax or method containment remain unknown.
+Every supplied argument must be named according to its actual overload. In a
+conventional MSTest call these include `expected:` and `actual:`, but a
+different overload may use other names.
 There is **one finding/comment per affected test method**, not one per
 assertion. It anchors the first changed violating call and records up to 256
 exact changed call lines with a bounded 12-line display sample. Unknown syntax,
-binding, containment, or changed-line provenance is not actionable. The rule
+receiver shape, containment, or changed-line provenance is not actionable. The rule
 does not reorder arguments or change assertion values.
 
 Preview accepts a separate `named-areequal-v2-preview-cohort`, signed source
@@ -54,10 +59,15 @@ non-draft PR at its original source/target commits and an active, unmarked
 same-account human request on its exact changed call line. The provider exposed
 that thread's comment as local ID 1; the separately supplied large comment ID
 did not resolve, so this is not proof of that specific comment identifier.
-The changed file has five additional non-allowlisted namespace imports, so
-the file-only parser cannot prove its bare `Assert` binds MSTest. Its six
-candidate method groups (26 calls, including the motivating line) therefore
-remain **unknown**, with zero actionable findings and zero `wouldCreate`.
-This is not a measured live `humanCovered` outcome: current unmarked human
-discussion covers a method only when its MSTest call binding is known.
+With the syntactic call-site rule, an in-memory read-only replay of the
+unchanged source/target generation recognized **six method groups and 26
+positional calls** across the changed test file. All 18 discussion threads
+normalized. The one-call group at the motivating line is `humanCovered` by
+that current unmarked human request, with **zero `wouldCreate` for that
+method**. Five other affected methods are distinct groups and remain
+`wouldCreate`; the whole-PR aggregate is `humanCovered: 1`,
+`wouldCreate: 5`, `unknown: 0`, `noOp: 0`, and `providerWrites: 0`.
+This is parser plus manually bound, in-memory discussion reconciliation,
+**not** a full facade run: the private installed config still identifies
+another capability. It does not claim whole-PR zero creates.
 No private test code, discussion text, or provider response is stored here.

@@ -202,7 +202,7 @@ Describe 'Bound named Assert.AreEqual method capability' {
                 -ManifestPath $path } | Should -Throw '*separate user-approved rule*'
     }
 
-    It 'keeps a shadowed Assert binding unknown without an actionable finding' {
+    It 'applies call-site style to a different Assert type without claiming MSTest binding' {
         $source = @'
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 class Assert { public static void AreEqual(int expected, int actual) {} }
@@ -214,21 +214,20 @@ class Checks {
 '@
         $result = Invoke-NamedTestReplay -Manifest (
             New-NamedTestManifest -Content $source -First 6 -Last 6)
-        $result.Observation.lifecycle.status | Should -BeExactly incomplete
-        $result.Observation.counts.unknown | Should -BeGreaterThan 0
-        @($result.Observation.findings).Count | Should -Be 0
+        $result.Observation.lifecycle.status | Should -BeExactly completed
+        $result.Observation.counts.unknown | Should -Be 0
+        @($result.Observation.findings).Count | Should -Be 1
+        $result.Observation.findings[0].anchor.line | Should -Be 6
         $result.Observation.effects.providerWrites | Should -Be 0
         $contract = New-NamedTestContract -Entry $result.Entry
-        $candidate = [ordered]@{
-            anchor = [ordered]@{ path = 'tests/Checks.cs'; line = 6 }
-            affectedCallLines = @(6)
-        }
-        $thread = New-NamedTestThread -Contract $contract -Finding $candidate `
+        $thread = New-NamedTestThread -Contract $contract `
+            -Finding $result.Observation.findings[0] `
             -Body 'Please use named arguments for Assert.AreEqual.' -ReviewerOwned $true
         $snapshot = New-NamedTestDiscussion -Contract $contract -Threads @($thread)
-        $unresolved = Resolve-OwnerV2DiscussionReconciliation `
+        $reconciled = Resolve-OwnerV2DiscussionReconciliation `
             -Observation $result.Observation -Contract $contract -Snapshot $snapshot
-        $unresolved.effects.dedupe.wouldCreate | Should -Be 0
+        $reconciled.findings[0].reconciliation.classification | Should -BeExactly humanCovered
+        $reconciled.effects.dedupe.wouldCreate | Should -Be 0
     }
 
     It 'treats a current unmarked same-account human request as method coverage, not bot no-op' {
@@ -243,6 +242,65 @@ class Checks {
             -Observation $result.Observation -Contract $contract -Snapshot $snapshot
         $observation.findings[0].reconciliation.classification | Should -BeExactly humanCovered
         $observation.effects.dedupe.wouldCreate | Should -Be 0
+        $observation.effects.providerWrites | Should -Be 0
+    }
+
+    It 'recognizes a short imperative named-parameters request on a changed call' {
+        $result = Invoke-NamedTestReplay -Manifest (New-NamedTestManifest)
+        $contract = New-NamedTestContract -Entry $result.Entry
+        $thread = New-NamedTestThread -Contract $contract `
+            -Finding $result.Observation.findings[0] `
+            -Body 'Please use named parameters.' -ReviewerOwned $true
+        $snapshot = New-NamedTestDiscussion -Contract $contract -Threads @($thread)
+        $observation = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $result.Observation -Contract $contract -Snapshot $snapshot
+        $observation.findings[0].reconciliation.classification | Should -BeExactly humanCovered
+        $observation.effects.dedupe.wouldCreate | Should -Be 0
+    }
+
+    It 'keeps a covered method separate from five other changed method groups' {
+        $lines = [Collections.Generic.List[string]]::new()
+        foreach ($import in @('using System;', 'using System.Collections.Generic;',
+                'using Example.First;', 'using Example.Second;',
+                'using Microsoft.VisualStudio.TestTools.UnitTesting;')) {
+            [void]$lines.Add($import)
+        }
+        [void]$lines.Add('[TestClass] class Checks {')
+        $index = 0
+        foreach ($callCount in @(6, 11, 1, 6, 1, 1)) {
+            $index++
+            [void]$lines.Add("    [TestMethod] void Check$index() {")
+            foreach ($call in 1..$callCount) {
+                [void]$lines.Add("        Assert.AreEqual($call, value);")
+            }
+            [void]$lines.Add('    }')
+        }
+        [void]$lines.Add('}')
+        $manifest = New-NamedTestManifest -Content ($lines -join "`n") `
+            -First 1 -Last $lines.Count
+        $result = Invoke-NamedTestReplay -Manifest $manifest
+        $result.Observation.lifecycle.status | Should -BeExactly completed
+        $result.Observation.counts.violations | Should -Be 6
+        @($result.Observation.findings | Measure-Object -Property affectedCallCount -Sum)[0].Sum |
+            Should -Be 26
+        $covered = @($result.Observation.findings | Where-Object {
+                $_.anchor.symbol -ceq 'Checks.Check6'
+            })
+        $covered.Count | Should -Be 1
+        $covered[0].affectedCallCount | Should -Be 1
+        $contract = New-NamedTestContract -Entry $result.Entry
+        $thread = New-NamedTestThread -Contract $contract -Finding $covered[0] `
+            -Body 'Please use named parameters.' -ReviewerOwned $true
+        $snapshot = New-NamedTestDiscussion -Contract $contract -Threads @($thread)
+        $observation = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $result.Observation -Contract $contract -Snapshot $snapshot
+        $covered = @($observation.findings | Where-Object {
+                $_.anchor.symbol -ceq 'Checks.Check6'
+            })
+        $covered[0].reconciliation.classification | Should -BeExactly humanCovered
+        $observation.effects.dedupe.humanCovered | Should -Be 1
+        $observation.effects.dedupe.wouldCreate | Should -Be 5
+        $observation.effects.dedupe.unknown | Should -Be 0
         $observation.effects.providerWrites | Should -Be 0
     }
 

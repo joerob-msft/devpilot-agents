@@ -681,6 +681,32 @@ function Get-RedundantMethodCoverageConstructs {
     }
 }
 
+function Test-NamedAreEqualTestAttribute {
+    param(
+        [object[]]$Tokens, [hashtable]$Pairs, [int]$First, [int]$Last,
+        [string]$ShortName, [bool]$HasMstestImport, [hashtable]$Aliases
+    )
+    $full = "Microsoft.VisualStudio.TestTools.UnitTesting.$ShortName"
+    for ($i = $First; $i -le $Last; $i++) {
+        if ($Tokens[$i].text -ne '[' -or -not $Pairs.ContainsKey($i) -or
+            $Pairs[$i] -gt $Last) { continue }
+        foreach ($attribute in @(Get-CoverageAttributeNames -Tokens $Tokens `
+                -First $i -Last $Pairs[$i])) {
+            $name = ([string]$attribute -replace 'Attribute$', '')
+            if ($name -ceq $full -or $name -ceq "global::$full") { return $true }
+            if ($name -ceq $ShortName -and $HasMstestImport -and
+                -not $Aliases.ContainsKey($ShortName)) { return $true }
+            $pieces = $name -split '\.|::', 2
+            if ($Aliases.ContainsKey($pieces[0])) {
+                $suffix = if ($pieces.Count -gt 1) { '.' + $pieces[1] } else { '' }
+                if (($Aliases[$pieces[0]] + $suffix) -ceq $full) { return $true }
+            }
+        }
+        $i = [int]$Pairs[$i]
+    }
+    return $false
+}
+
 function Get-NamedAreEqualConstructs {
     [CmdletBinding()]
     param(
@@ -728,18 +754,10 @@ function Get-NamedAreEqualConstructs {
     if ($stack.Count) { $malformed = $true }
 
     $mstestNamespace = 'Microsoft.VisualStudio.TestTools.UnitTesting'
-    $mstestAssert = "$mstestNamespace.Assert"
     $imports = [Collections.Generic.List[string]]::new()
     $aliases = @{}
-    $unsafeBinding = $false
-    $declaredAssert = $false
-    $declaredMicrosoft = $false
     for ($i = 0; $i -lt $tokens.Count; $i++) {
         $t = [string]$tokens[$i].text
-        if ($t -in @('class', 'struct', 'interface', 'record', 'enum') -and $i + 1 -lt $tokens.Count) {
-            if ($tokens[$i + 1].text -ceq 'Assert') { $declaredAssert = $true }
-            if ($tokens[$i + 1].text -ceq 'Microsoft') { $declaredMicrosoft = $true }
-        }
         if ($t -ne 'using' -or $i + 1 -ge $tokens.Count) { continue }
         $j = $i + 1
         $isStatic = $tokens[$j].text -eq 'static'
@@ -753,13 +771,9 @@ function Get-NamedAreEqualConstructs {
         $value = $parts -join ''
         if ($value -match '^(@?[\p{L}_][\p{L}\p{N}_]*)=(.+)$') {
             $key = $Matches[1] -replace '^@', ''
-            if ($aliases.ContainsKey($key)) { $unsafeBinding = $true }
             $aliases[$key] = $Matches[2] -replace '^global::', ''
         }
-        elseif ($isStatic) {
-            if ($value -match '(^|\.|::)Assert$') { $unsafeBinding = $true }
-        }
-        else { [void]$imports.Add(($value -replace '^global::', '')) }
+        elseif (-not $isStatic) { [void]$imports.Add(($value -replace '^global::', '')) }
     }
 
     $scope = [Collections.Generic.List[object]]::new()
@@ -798,6 +812,9 @@ function Get-NamedAreEqualConstructs {
         elseif ($header -match '\b(class|struct|record)\s+(@?[\p{L}_][\p{L}\p{N}_]*)\b') {
             $kind = 'type'
             $name = $Matches[2] -replace '^@', ''
+            $testClass = Test-NamedAreEqualTestAttribute -Tokens $tokens -Pairs $pairs `
+                -First ($begin + 1) -Last ($i - 1) -ShortName TestClass `
+                -HasMstestImport ($mstestNamespace -cin $imports) -Aliases $aliases
         }
         elseif ($scope.Count -gt 0 -and $scope[$scope.Count - 1].kind -eq 'type') {
             $rightParen = -1
@@ -823,6 +840,12 @@ function Get-NamedAreEqualConstructs {
                     $kind = 'method'
                     $name = [string]$tokens[$nameIndex].text -replace '^@', ''
                     $declarationLine = [int]$tokens[$nameIndex].line
+                    $testMethod = (Test-NamedAreEqualTestAttribute -Tokens $tokens -Pairs $pairs `
+                            -First ($begin + 1) -Last ($openParen - 1) -ShortName TestMethod `
+                            -HasMstestImport ($mstestNamespace -cin $imports) -Aliases $aliases) -or
+                        (Test-NamedAreEqualTestAttribute -Tokens $tokens -Pairs $pairs `
+                            -First ($begin + 1) -Last ($openParen - 1) -ShortName DataTestMethod `
+                            -HasMstestImport ($mstestNamespace -cin $imports) -Aliases $aliases)
                     $parts = @($fileNamespace) + @($scope | Where-Object {
                             $_.kind -in @('namespace', 'type')
                         } | ForEach-Object name) + @($name)
@@ -835,6 +858,8 @@ function Get-NamedAreEqualConstructs {
             }
         }
         [void]$scope.Add(@{ kind = $kind; name = $name
+            isTestClass = [bool]($kind -eq 'type' -and $testClass)
+            isTestMethod = [bool]($kind -eq 'method' -and $testMethod)
             declarationLine = $(if ($kind -eq 'method') { $declarationLine } else { 0 })
             end = $(if ($pairs.ContainsKey($i)) { [int]$tokens[$pairs[$i]].line } else { [int]$tokens[$i].line }) })
     }
@@ -878,48 +903,18 @@ function Get-NamedAreEqualConstructs {
             }
         }
         $symbol = $symbolParts -join '.'
-        $binding = $false
-        $resolved = $receiver -replace '^global::', ''
-        if ($resolved -ceq $mstestAssert) {
-            $binding = $receiver.StartsWith('global::') -or
-                (-not $declaredMicrosoft -and -not $aliases.ContainsKey('Microsoft'))
-        }
-        elseif ($receiver -ceq 'Assert') {
-            $binding = -not $declaredAssert -and
-                (($aliases.ContainsKey('Assert') -and $aliases['Assert'] -ceq $mstestAssert) -or
-                    (-not $aliases.ContainsKey('Assert') -and
-                        $mstestNamespace -cin $imports -and
-                        @($imports | Where-Object { $_ -cne $mstestNamespace }).Count -eq 0))
-        }
-        else {
-            $components = $receiver -split '\.|::', 2
-            if ($aliases.ContainsKey($components[0])) {
-                $tail = if ($components.Count -gt 1) { '.' + $components[1] } else { '' }
-                $binding = ($aliases[$components[0]] + $tail) -ceq $mstestAssert
-            }
-        }
-        if ($receiverStart -gt 0 -and $tokens[$receiverStart - 1].text -in @('.', '::')) {
-            $binding = $false
-        }
-        if ($unsafeBinding -or $malformed) { $binding = $false }
-        # An identifier declared as a value can shadow an imported type or alias.
-        $rootName = ($receiver -split '\.|::')[0] -replace '^@', ''
-        if ($rootName -and -not $receiver.StartsWith('global::')) {
-            for ($j = 1; $j -lt $tokens.Count - 1; $j++) {
-                if ($j -eq $receiverStart -or $tokens[$j].text -cne $rootName) { continue }
-                if ($tokens[$j - 1].text -notin @('.', '::', 'using') -and
-                    $tokens[$j + 1].text -in @('=', ';', ',', ')', '=>')) {
-                    $binding = $false; break
-                }
-            }
-        }
+        $exactSpelling = $receiver -ceq 'Assert' -and
+            ($receiverStart -eq 0 -or $tokens[$receiverStart - 1].text -notin @('.', '::', '?', '!'))
+        $testClass = @($contexts | Where-Object { $_.kind -eq 'type' -and $_.isTestClass })
         $exactAnchor = Test-CoverageChanged $start $start $ranges
-        $known = $binding -and $callValid -and $exactAnchor -and $method.Count -eq 1 -and
-            $method[0].declarationLine -ge 1 -and
+        $known = $exactSpelling -and -not $malformed -and $callValid -and $exactAnchor -and
+            $method.Count -eq 1 -and $method[0].isTestMethod -and
+            $testClass.Count -eq 1 -and $method[0].declarationLine -ge 1 -and
             $symbol.Length -gt 0 -and $symbol.Length -le 256 -and
             $symbol -cmatch '^([\p{L}_][\p{L}\p{N}_]*\.)*[\p{L}_][\p{L}\p{N}_]*$' -and
             $methodSymbols.ContainsKey($symbol) -and $methodSymbols[$symbol] -eq 1
         $positional = $false
+        $argumentCount = 0
         if ($callValid) {
             $segment = $openParen + 1
             $closeParen = [int]$pairs[$openParen]
@@ -940,10 +935,22 @@ function Get-NamedAreEqualConstructs {
                 }
                 elseif ($t -eq '>' -and $nestedAngles -gt 0) { $nestedAngles-- }
                 if ($t -eq ',' -and $nestedAngles -eq 0) {
+                    if ($j -gt $segment) {
+                        $argumentCount++
+                        if ($tokens[$j - 1].text -in @(':', '.', '?', '+', '-', '*', '/', '=', '=>')) {
+                            $known = $false
+                        }
+                    }
                     if ($j -eq $segment) { $known = $false }
                     elseif ($segment + 1 -ge $j -or
                         [string]$tokens[$segment].text -cnotmatch '^@?[\p{L}_][\p{L}\p{N}_]*$' -or
-                        $tokens[$segment + 1].text -ne ':') { $positional = $true }
+                        $tokens[$segment + 1].text -ne ':') {
+                        $positional = $true
+                        if ($tokens[$segment].text -in @(':', '.', '?', '+', '-', '*', '/', '=')) {
+                            $known = $false
+                        }
+                    }
+                    elseif ($segment + 2 -ge $j) { $known = $false }
                     $segment = $j + 1
                 }
                 elseif ($t -in @('(', '[', '{') -and $pairs.ContainsKey($j)) {
@@ -951,7 +958,9 @@ function Get-NamedAreEqualConstructs {
                 }
             }
         }
-        if (-not $callValid) { $known = $false }
+        if (-not $callValid -or $argumentCount -lt 2 -or $nestedAngles -ne 0) {
+            $known = $false
+        }
         $key = if ($method.Count -eq 1 -and $symbol.Length -le 256) {
             "$symbol`:$($method[0].declarationLine)"
         } else { "unknown:$start" }

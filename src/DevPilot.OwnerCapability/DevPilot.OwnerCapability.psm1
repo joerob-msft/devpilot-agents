@@ -55,7 +55,7 @@ $script:RedundantMethodCoverageMarkerPrefix = 'devpilot-redundant-method-coverag
 $script:NamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
 $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a'
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
-$script:NamedAreEqualPolicyDigest = 'v1:sha256:008e56acc64ecdb92a2bcd4974bdaff85e23a9fdea610d1d055ddb88cf6aed61'
+$script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -439,7 +439,7 @@ function Format-NamedAreEqualComment {
         ''
         "Method ``$symbol`` contains $count changed positional ``Assert.AreEqual`` call(s) at ``$path`` (lines $lineSummary). This comment is anchored at the first changed call, line $([int]$Finding.anchor.line)."
         ''
-        'Name every supplied argument according to its MSTest overload, including `expected:` and `actual:` (and `delta:`, `message:`, or any additional arguments when supplied). Preserve the existing argument order and values.'
+        'Name every supplied argument according to the selected overload. For MSTest, this commonly includes `expected:` and `actual:` (and further supplied arguments such as `delta:` or `message:`). Preserve the existing argument order and values.'
         ''
         "Convention: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
         ''
@@ -673,8 +673,9 @@ function Resolve-OwnerV2DiscussionReconciliation {
                         $text -notmatch '\?' -and
                         $text -notmatch '(?i)\b(?:do\s+not|don''t|shouldn''t|avoid|never)\s+(?:use|name|add)\b' -and
                         $text -match '(?i)\b(?:named|name|label|explicit)\b' -and
-                        $text -match '(?i)\b(?:argument|parameter|expected|actual)\b' -and
-                        $text -match '(?i)\b(?:AreEqual|assert|expected|actual)\b'
+                        $text -match '(?i)\b(?:arguments?|parameters?|expected|actual)\b' -and
+                        ($text -match '(?i)\b(?:AreEqual|assert|expected|actual)\b' -or
+                            $text -match '(?i)^\s*(?:please\s+)?(?:use|add|prefer)\s+(?:the\s+)?named\s+(?:arguments?|parameters?)\s*[.!]?\s*$')
                     }
                     elseif ($isRedundantMethod) {
                         $text = [string]$comment.body
@@ -2336,7 +2337,7 @@ function Invoke-TestClassCoverageCapabilityResponse {
                 $findingData = [ordered]@{
                     disposition = 'violation'
                     eligibility = $(if ($NamedAreEqual) {
-                        'changed-mstest-areequal-method'
+                        'changed-assert-areequal-test-method'
                     } elseif ($RedundantMethod) {
                         'changed-mstest-class-method-exclusions'
                     } else { 'changed-mstest-class' })

@@ -1,3 +1,3 @@
 bpm-named-areequal-arguments@1
-Changed C# MSTest Assert.AreEqual calls in test methods must name every supplied argument, including expected: and actual:. Report one finding per method, anchored at its first changed positional call. Unknown parsing or binding is not actionable.
+Changed C# test-method calls spelled Assert.AreEqual with at least two supplied arguments must name every supplied argument using the selected overload's parameter names. For MSTest's usual overload, these include expected: and actual:. Report one finding per method, anchored at its first changed positional call. Unknown syntax or test-method containment is not actionable.
 Source: EngHub documentation/EngineeringProcesses/Conventions/AutomatedTests.md, "Named parameters for Assert", commit f6db83436b48f48a8521095a888d79f67823bbb2, section SHA-256 b3935a2ac811353d1da72e9a310938679cf119963677bd2ebc90510aab85a03a.
