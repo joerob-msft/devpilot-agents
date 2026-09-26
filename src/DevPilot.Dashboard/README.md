@@ -15,9 +15,15 @@ health, runs, findings, deliveries, failures, read-only relation findings,
 and a searchable **Rules** inventory distinguishing implementation from
 deployment, enablement, evaluation, and publishing. Class-level coverage is
 implemented in PR 174 but not deployed in the reported service cohort.
-The relation rule ID comes from the declaration bound to the current local
+The relation rule ID comes from the declaration bound to the local
 observation, not a hard-coded customer rule name; older relation evidence is
-marked stale even if a later scheduled run reused that state.
+marked stale even if a later scheduled run reused that state. Relation rows
+show the bounded durable assessment, evaluation time and age, and historical
+source/target, never treating a prior violation as a current-head verdict.
+Press `o` on a relation (or its unique Rules row) to validate the current
+active PR iteration, file and source line with read-only Azure DevOps GETs
+using an existing `az` sign-in; failures do not open a generic link. This
+navigation remains read-only and not writer eligible.
 Pass `-ReportingConfigPath`, then press `d`. This reporting plane has no
 provider writes, approvals, task mutations, listener, credential handling, or
 telemetry upload. See

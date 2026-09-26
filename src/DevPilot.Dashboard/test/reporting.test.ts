@@ -259,9 +259,9 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
         capabilityId: "relation-contextual-review-v1",
         ruleId: "synthetic-relation-rule-v1",
         disposition: "violation",
+        explanation: "Synthetic relation assessment is bound to the historical snapshot.",
         anchor: { path: "src/Widget.cs", startLine: 8, symbol: "Widget" },
       },
-      reason: "relation mismatch",
       writerEligible: false,
     }],
   });
@@ -525,7 +525,11 @@ test("reporting adapter verifies signed feeds, isolates relation findings, deriv
     assert.match(snapshot.findings[0]?.url ?? "", /commentId=201/);
     assert.equal(snapshot.relations.length, 1);
     assert.equal(snapshot.relations[0]?.writerEligible, false);
-    assert.match(snapshot.relations[0]?.url ?? "", /pullrequest\/42/);
+    assert.equal(snapshot.relations[0]?.url, null);
+    assert.equal(snapshot.relations[0]?.reason,
+      "Synthetic relation assessment is bound to the historical snapshot.");
+    assert.equal(snapshot.relations[0]?.state, "violation");
+    assert.equal(snapshot.relations[0]?.sourceCommit, "d".repeat(40));
     assert.equal(snapshot.deliveries.length, 2);
     const automatic = snapshot.deliveries.find((row) => row.mode === "automatic");
     const manual = snapshot.deliveries.find((row) => row.mode === "manual");
@@ -546,9 +550,36 @@ test("reporting adapter verifies signed feeds, isolates relation findings, deriv
     assert.equal(compositeRun?.queuePosted, 9);
     const relationRows = reportingRows(snapshot, "relations");
     assert.match(relationRows[0]?.text.join(" ") ?? "", /NOT WRITER ELIGIBLE/);
+    assert.match(relationRows[0]?.text.join(" ") ?? "", /STALE VERDICT.*current head not assessed/);
+    assert.match(relationRows[0]?.text.join(" ") ?? "", /Violation explanation: Synthetic relation assessment/);
+    assert.equal(relationRows[0]?.url, null);
     const deliveryRows = reportingRows(snapshot, "deliveries");
     assert.match(deliveryRows[0]?.text.join(" ") ?? "", /<script>alert\(1\)<\/script>/);
     assert.match(overviewLines(snapshot).join("\n"), /SERVICE HEALTHY/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("relation no-op assessments and absent explanations never masquerade as violations", async () => {
+  const fixture = await createFixture();
+  try {
+    const path = join(fixture.stateRoot, "owner-v2-preview-state", "schema-1",
+      "capabilities", "relation", "observations", `${"e".repeat(64)}.json`);
+    const observation = JSON.parse(await readFile(path, "utf8")) as JsonRecord;
+    const finding = (observation.findings as JsonRecord[])[0]!;
+    const data = finding.data as JsonRecord;
+    data.disposition = "noOp";
+    delete data.explanation;
+    await writeJson(path, observation);
+    const adapter = createAdapter(fixture.configPath, {
+      now: () => Date.parse("2026-09-24T20:30:00Z"), taskReader: async () => healthyTask,
+    });
+    const snapshot = await adapter.read();
+    assert.equal(snapshot.relations[0]?.state, "noOp");
+    assert.equal(snapshot.relations[0]?.reason, "");
+    assert.match(reportingRows(snapshot, "relations")[0]?.text.join(" ") ?? "", /Assessment: not recorded/);
+    assert.doesNotMatch(reportingRows(snapshot, "relations")[0]?.text.join(" ") ?? "", /Violation explanation/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -601,7 +632,7 @@ test("rules registry separates source, deployment, enablement, evaluation and ve
     assert.equal(relation.publishing, "not-eligible");
     assert.equal(relation.counts.finding, 1);
     assert.equal(relation.counts.unknown, 0);
-    assert.match(relation.url ?? "", /pullrequest\/42/);
+    assert.equal(relation.url, null);
     const classRule = rules[2]!;
     assert.equal(classRule.deployment, "not-deployed");
     assert.equal(classRule.enablement, "disabled");
@@ -628,6 +659,7 @@ test("rules registry separates source, deployment, enablement, evaluation and ve
     assert.match(redundant.gaps.join(" "), /not deployed in the pinned service/i);
     const rows = reportingRows(snapshot, "rules");
     assert.equal(rows.length, 4);
+    assert.equal(rows[1]?.relation?.id, snapshot.relations[0]?.id);
     assert.match(rows[2]!.text.join(" "), /finding unknown.*skipped unknown/);
     assert.match(rows[3]!.text.join(" "), /auto policy disabled.*auto-post disabled/);
     assert.equal(filterReportingRows(rows, {
