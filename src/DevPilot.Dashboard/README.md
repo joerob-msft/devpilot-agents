@@ -11,7 +11,10 @@ starting either agent by PR ID through the restricted broker contract,
 without requiring retained history.
 
 The same application can also show verified local Owner/relation service
-health, runs, findings, deliveries, failures, and read-only relation findings.
+health, runs, findings, deliveries, failures, read-only relation findings,
+and a searchable **Rules** inventory distinguishing implementation from
+deployment, enablement, evaluation, and publishing. Class-level coverage is
+implemented in PR 174 but not deployed in the reported service cohort.
 Pass `-ReportingConfigPath`, then press `d`. This reporting plane has no
 provider writes, approvals, task mutations, listener, credential handling, or
 telemetry upload. See
@@ -19,6 +22,8 @@ telemetry upload. See
 Press `o` on a reporting delivery to open its validated Azure DevOps URL. On
 Windows this uses the current user's HTTP/HTTPS shell association through a
 fixed PowerShell `Start-Process` request and reports launcher exit failures.
+In Rules, press `f` for capability-filtered findings/relations or `e` for
+deliveries. Missing per-rule intake/skipped telemetry remains unknown.
 
 Every launch starts in **Simple**. At 100 columns and wider, a clearly boxed
 left sidebar lists agents, PRs, and statuses, with the selected item's latest

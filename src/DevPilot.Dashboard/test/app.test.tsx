@@ -598,6 +598,31 @@ test("verified local reporting renders inside the existing dashboard and opens o
     }],
     failures: [],
     relations: [],
+    rules: [{
+      id: "mstest-owner",
+      description: "Changed MSTest methods require Owner.",
+      provenance: "Owner cohort PR 17109075; installed head verified locally",
+      implementationVersion: "bpm-test-ownership@1",
+      installedHead: "a".repeat(40),
+      pinnedHead: "a".repeat(40),
+      capabilityId: "bpm-test-ownership@1",
+      implemented: true,
+      deployment: "verified",
+      enablement: "verified",
+      execution: "verified",
+      authorization: "enabled",
+      publishing: "enabled",
+      policyCaps: { perRun: 5, perPullRequest: 25 },
+      scope: [42],
+      lastGeneration: "run-1",
+      lastEvaluatedUtc: "2026-09-24T20:00:00.000Z",
+      counts: { finding: 1, noOp: 1, wouldCreate: 0, unknown: 0,
+        skipped: null, refused: 0, posted: 1 },
+      findingIds: ["finding-1"],
+      deliveryIds: ["automatic:event-1"],
+      url: "https://dev.azure.com/example/Project/_git/repo/pullrequest/42?_a=files",
+      gaps: ["Skipped/PR-intake denominator unavailable."],
+    }],
     quarantine: [],
     diagnostics: [],
     truncated: false,
@@ -617,7 +642,7 @@ test("verified local reporting renders inside the existing dashboard and opens o
     await setup.renderOnce();
     setup.mockInput.pressKey("d");
     await setup.flush();
-    assert.match(setup.captureCharFrame(), /VERIFIED LOCAL OWNER REPORTING - READ ONLY/);
+    assert.match(setup.captureCharFrame(), /VERIFIED LOCAL OPERATIONS REPORTING - READ ONLY/);
     assert.match(setup.captureCharFrame(), /SERVICE HEALTHY/);
     setup.mockInput.pressTab();
     setup.mockInput.pressTab();
@@ -645,9 +670,19 @@ test("verified local reporting renders inside the existing dashboard and opens o
     setup.mockInput.pressArrow("right");
     await setup.flush();
     assert.doesNotMatch(setup.captureCharFrame(), /Could not open reporting URL: shell association failed/);
+    setup.mockInput.pressTab();
+    setup.mockInput.pressTab();
+    setup.mockInput.pressTab();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /\[RULES\]/);
+    assert.match(setup.captureCharFrame(), /mstest-owner/);
+    setup.mockInput.pressKey("f");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /\[FINDINGS\]/);
+    assert.match(setup.captureCharFrame(), /capability:bpm-test-ownership@1/);
     setup.mockInput.pressEscape();
     await setup.flush();
-    assert.doesNotMatch(setup.captureCharFrame(), /VERIFIED LOCAL OWNER REPORTING - READ ONLY/);
+    assert.doesNotMatch(setup.captureCharFrame(), /VERIFIED LOCAL OPERATIONS REPORTING - READ ONLY/);
   } catch (error) {
     if (error instanceof Error && error.message.includes("native FFI is not available")) {
       context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
