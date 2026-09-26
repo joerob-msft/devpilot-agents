@@ -52,6 +52,10 @@ $script:TestClassCoverageMarkerPrefix = 'devpilot-test-class-coverage:v1'
 $script:RedundantMethodCoverageCapability = 'bpm-redundant-method-coverage@1'
 $script:RedundantMethodCoverageDigest = 'v1:sha256:1d9d2a3d8416b7004f6193043f8cfd43a6969d61bc9c18deb2e8fcc0c52d58ca'
 $script:RedundantMethodCoverageMarkerPrefix = 'devpilot-redundant-method-coverage:v1'
+$script:NamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
+$script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a'
+$script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
+$script:NamedAreEqualPolicyDigest = 'v1:sha256:008e56acc64ecdb92a2bcd4974bdaff85e23a9fdea610d1d055ddb88cf6aed61'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -351,6 +355,98 @@ function Format-RedundantMethodCoverageComment {
     ) -join "`n"
 }
 
+function Get-NamedAreEqualMarkerKey {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding
+    )
+    $request = $Contract.Request
+    if ([string]$request.CapabilityId -cne $script:NamedAreEqualCapability -or
+        [string]$request.RuleSection -cne $script:NamedAreEqualCapability) {
+        throw 'Named AreEqual arguments require their independently bound rule.'
+    }
+    $anchor = $Finding.anchor
+    $source = $Finding.binding.source.representation
+    $lines = @($Finding.affectedCallLines)
+    if ($anchor -isnot [Collections.IDictionary] -or
+        $source -isnot [Collections.IDictionary] -or
+        [string]$Finding.disposition -cne 'violation' -or
+        [string]$Finding.constructRef -cnotmatch '^construct:[0-9a-f]{64}$' -or
+        [string]$source.constructIdentity -cne [string]$Finding.constructRef -or
+        [string]$source.path -cne [string]$anchor.path -or
+        [string]$source.symbol -cne [string]$anchor.symbol -or
+        [int]$source.startLine -ne [int]$anchor.line -or
+        [int]$source.endLine -ne [int]$anchor.line -or
+        [int]$anchor.line -lt 1 -or
+        ([string]$anchor.symbol).Length -gt 256 -or
+        [string]$anchor.symbol -cnotmatch '^[\p{L}_][\p{L}\p{N}_]*(?:\.[\p{L}_][\p{L}\p{N}_]*)*$' -or
+        [int]$Finding.affectedCallCount -lt 1 -or
+        [int]$Finding.affectedCallCount -gt 256 -or
+        $lines.Count -ne [int]$Finding.affectedCallCount -or
+        $Finding.callListTruncated -isnot [bool] -or
+        [bool]$Finding.callListTruncated -ne
+            ([int]$Finding.affectedCallCount -gt 12) -or
+        [int]$lines[0] -ne [int]$anchor.line) {
+        throw 'Named AreEqual finding has no bounded changed method and call anchors.'
+    }
+    for ($index = 1; $index -lt $lines.Count; $index++) {
+        if ([int]$lines[$index] -le [int]$lines[$index - 1] -or
+            [int]$lines[$index] -gt 200000) {
+            throw 'Named AreEqual call anchors are not strictly ordered.'
+        }
+    }
+    $material = @(
+        $script:NamedAreEqualMarkerPrefix
+        [string]$request.RepositoryId
+        [string]$request.PullRequestId
+        [string]$request.SourceCommit
+        [string]$request.RuleRepositoryId
+        (ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+        [string]$request.RuleSection
+        [string]$request.RuleCommit
+        [string]$request.RuleHash
+        (ConvertTo-OwnerV1WriterPath -Path ([string]$anchor.path))
+        [string]$anchor.line
+        [string]$anchor.symbol
+    ) -join "`n"
+    return Get-OwnerV1WriterSha256 -Text $material
+}
+
+function Format-NamedAreEqualComment {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [Parameter(Mandatory)][string]$MarkerKey
+    )
+    if ($MarkerKey -cne (Get-NamedAreEqualMarkerKey `
+            -Contract $Contract -Finding $Finding)) {
+        throw 'Named AreEqual marker does not match the bound method finding.'
+    }
+    $request = $Contract.Request
+    $path = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path ([string]$Finding.anchor.path))
+    $symbol = ConvertTo-OwnerV1WriterMarkdownCode ([string]$Finding.anchor.symbol)
+    $count = [int]$Finding.affectedCallCount
+    $sample = @($Finding.affectedCallLines | Select-Object -First 12)
+    $lineSummary = $sample -join ', '
+    if ($count -gt $sample.Count) {
+        $lineSummary += " (first 12 of $count)"
+    }
+    $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+    return @(
+        '**Use named arguments for Assert.AreEqual in this test method**'
+        ''
+        "Method ``$symbol`` contains $count changed positional ``Assert.AreEqual`` call(s) at ``$path`` (lines $lineSummary). This comment is anchored at the first changed call, line $([int]$Finding.anchor.line)."
+        ''
+        'Name every supplied argument according to its MSTest overload, including `expected:` and `actual:` (and `delta:`, `message:`, or any additional arguments when supplied). Preserve the existing argument order and values.'
+        ''
+        "Convention: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+        ''
+        "<!-- ${script:NamedAreEqualMarkerPrefix}:$MarkerKey -->"
+    ) -join "`n"
+}
+
 function New-OwnerV2DiscussionReconciliation {
     param(
         [Parameter(Mandatory)][ValidateSet('wouldCreate', 'wouldUpdate', 'noOp', 'humanCovered', 'unknown')]
@@ -413,8 +509,12 @@ function Resolve-OwnerV2DiscussionReconciliation {
     }
     $capabilityId = [string](Get-OwnerV2Member -Value $Observation -Name capability)
     $isRedundantMethod = $capabilityId -ceq $script:RedundantMethodCoverageCapability
+    $isNamedAreEqual = $capabilityId -ceq $script:NamedAreEqualCapability
     $isCoverage = $capabilityId -ceq $script:TestClassCoverageCapability
-    $allMarkerPattern = if ($isRedundantMethod) {
+    $allMarkerPattern = if ($isNamedAreEqual) {
+        '<!--\s*devpilot-named-areequal:v1:([0-9a-f]{64})\s*-->'
+    }
+    elseif ($isRedundantMethod) {
         '<!--\s*devpilot-redundant-method-coverage:v1:([0-9a-f]{64})\s*-->'
     }
     elseif ($isCoverage) {
@@ -428,7 +528,12 @@ function Resolve-OwnerV2DiscussionReconciliation {
         $markerKey = $null
         $body = $null
         try {
-            if ($isRedundantMethod) {
+            if ($isNamedAreEqual) {
+                $markerKey = Get-NamedAreEqualMarkerKey -Contract $Contract -Finding $finding
+                $body = Format-NamedAreEqualComment -Contract $Contract -Finding $finding `
+                    -MarkerKey $markerKey
+            }
+            elseif ($isRedundantMethod) {
                 $markerKey = Get-RedundantMethodCoverageMarkerKey -Contract $Contract -Finding $finding
                 $body = Format-RedundantMethodCoverageComment -Contract $Contract -Finding $finding `
                     -MarkerKey $markerKey
@@ -488,7 +593,7 @@ function Resolve-OwnerV2DiscussionReconciliation {
                         MarkerCount = $targetMatches.Count
                     })
                 }
-                elseif ($isCoverage -or $isRedundantMethod) {
+                elseif ($isCoverage -or $isRedundantMethod -or $isNamedAreEqual) {
                     $foreignMarkers += $targetMatches.Count
                 }
             }
@@ -508,7 +613,10 @@ function Resolve-OwnerV2DiscussionReconciliation {
         }
         if ($candidates.Count -eq 0) {
             $anchor = $finding.anchor
-            $affectedLines = if ($isRedundantMethod) {
+            $affectedLines = if ($isNamedAreEqual) {
+                @($finding.affectedCallLines)
+            }
+            elseif ($isRedundantMethod) {
                 @($finding.affectedAttributeLines)
             }
             else { @([int]$anchor.line) }
@@ -516,7 +624,10 @@ function Resolve-OwnerV2DiscussionReconciliation {
             $human = [Collections.Generic.List[object]]::new()
             $ambiguousHuman = $false
             $historicalHuman = [Collections.Generic.List[object]]::new()
-            $discussionPattern = if ($isRedundantMethod) {
+            $discussionPattern = if ($isNamedAreEqual) {
+                '(?i)\b(?:AreEqual|expected|actual|named|positional)\b'
+            }
+            elseif ($isRedundantMethod) {
                 '(?i)\b(?:method|attribute|coverage|exclusion|class|exclude)\b'
             }
             elseif ($isCoverage) {
@@ -555,9 +666,17 @@ function Resolve-OwnerV2DiscussionReconciliation {
                     }
                     $containsReviewerMarker = [regex]::IsMatch(
                         [string]$comment.body,
-                        '<!--\s*devpilot-(?:owner-comment|test-class-coverage|redundant-method-coverage):v1:[0-9a-f]{64}\s*-->'
+                        '<!--\s*devpilot-(?:owner-comment|test-class-coverage|redundant-method-coverage|named-areequal):v1:[0-9a-f]{64}\s*-->'
                     )
-                    $affirmativeCoverage = if ($isRedundantMethod) {
+                    $affirmativeCoverage = if ($isNamedAreEqual) {
+                        $text = [string]$comment.body
+                        $text -notmatch '\?' -and
+                        $text -notmatch '(?i)\b(?:do\s+not|don''t|shouldn''t|avoid|never)\s+(?:use|name|add)\b' -and
+                        $text -match '(?i)\b(?:named|name|label|explicit)\b' -and
+                        $text -match '(?i)\b(?:argument|parameter|expected|actual)\b' -and
+                        $text -match '(?i)\b(?:AreEqual|assert|expected|actual)\b'
+                    }
+                    elseif ($isRedundantMethod) {
                         $text = [string]$comment.body
                         $text -notmatch '(?i)\b(?:do\s+not|don''t|shouldn''t|keep|retain|must\s+not)\s+(?:remove|delete)\b' -and
                         $text -notmatch '\?' -and
@@ -703,16 +822,22 @@ function Resolve-OwnerV2DiscussionReconciliation {
         }
         $classification = $null
         $reason = $null
-        if ([bool]$thread.isDeleted) {
-            $classification = 'wouldCreate'
+        if ($isNamedAreEqual -and
+            ([string]$thread.contextState -cne 'current' -or
+                [string]$thread.sourceCommit -cne [string]$Contract.Request.SourceCommit)) {
+            $classification = 'unknown'
+            $reason = 'reviewer-marker-generation-unknown'
+        }
+        elseif ([bool]$thread.isDeleted) {
+            $classification = $(if ($isNamedAreEqual) { 'unknown' } else { 'wouldCreate' })
             $reason = 'reviewer-marker-thread-deleted'
         }
         elseif ([bool]$thread.isOutdated) {
-            $classification = 'wouldCreate'
+            $classification = $(if ($isNamedAreEqual) { 'unknown' } else { 'wouldCreate' })
             $reason = 'reviewer-marker-thread-outdated'
         }
         elseif ([string]$thread.status -cin @('fixed', 'closed', 'resolved')) {
-            $classification = 'wouldCreate'
+            $classification = $(if ($isNamedAreEqual) { 'unknown' } else { 'wouldCreate' })
             $reason = 'reviewer-marker-thread-inactive'
         }
         elseif ([string]$thread.status -cne 'active') {
@@ -724,7 +849,7 @@ function Resolve-OwnerV2DiscussionReconciliation {
             $reason = 'reviewer-marker-body-current'
         }
         else {
-            $classification = 'wouldUpdate'
+            $classification = $(if ($isNamedAreEqual) { 'unknown' } else { 'wouldUpdate' })
             $reason = 'reviewer-marker-body-stale'
         }
         $integrity = if ($classification -ceq 'unknown') { 'invalid' } else { 'verified' }
@@ -2016,7 +2141,8 @@ function Invoke-TestClassCoverageCapabilityResponse {
         [Parameter(Mandatory)][object]$Context,
         [Parameter(Mandatory)][string]$CapabilityDigest,
         [Parameter(Mandatory)][DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits,
-        [switch]$RedundantMethod
+        [switch]$RedundantMethod,
+        [switch]$NamedAreEqual
     )
 
     $binding = Get-OwnerV2Member -Value $Context -Name binding
@@ -2034,16 +2160,26 @@ function Invoke-TestClassCoverageCapabilityResponse {
     $files = @($units | Where-Object { [string]$_.unitId -like 'file:*' } |
         Sort-Object { [string]$_.unitId })
     $diagnostics = [Collections.Generic.List[object]]::new()
-    $capabilityId = if ($RedundantMethod) {
+    $capabilityId = if ($NamedAreEqual) {
+        $script:NamedAreEqualCapability
+    }
+    elseif ($RedundantMethod) {
         $script:RedundantMethodCoverageCapability
     } else { $script:TestClassCoverageCapability }
-    $policyLeaf = if ($RedundantMethod) {
+    $policyLeaf = if ($NamedAreEqual) {
+        'Policy\named-areequal-arguments.v1.txt'
+    }
+    elseif ($RedundantMethod) {
         'Policy\redundant-method-coverage.v1.txt'
     } else { 'Policy\test-class-coverage.v1.txt' }
     $policyText = [IO.File]::ReadAllText(
         (Join-Path $PSScriptRoot $policyLeaf),
         [Text.UTF8Encoding]::new($false))
     $policyDigest = Get-OwnerV2Digest -Value $policyText
+    if ($NamedAreEqual -and
+        $policyDigest -cne $script:NamedAreEqualPolicyDigest) {
+        throw 'Named AreEqual policy no longer matches the pinned source-backed version.'
+    }
     $controlsComplete = $identityUnits.Count -eq 1 -and $ruleUnits.Count -eq 1 -and
         [string]$identityUnits[0].state -ceq 'complete' -and
         [string]$ruleUnits[0].state -ceq 'complete' -and
@@ -2113,7 +2249,10 @@ function Invoke-TestClassCoverageCapabilityResponse {
         }
         $constructs = @()
         if ($path.EndsWith('.cs', [StringComparison]::OrdinalIgnoreCase)) {
-            $constructs = @(if ($RedundantMethod) {
+            $constructs = @(if ($NamedAreEqual) {
+                Get-NamedAreEqualConstructs -Content ([string]$data.content) `
+                    -Spans $spans -Path $path
+            } elseif ($RedundantMethod) {
                 Get-RedundantMethodCoverageConstructs -Content ([string]$data.content) `
                     -Spans $spans -Path $path
             } else {
@@ -2161,21 +2300,31 @@ function Invoke-TestClassCoverageCapabilityResponse {
                 declarationLine = [int]$construct.declarationLine
                 endLine = [int]$construct.endLine
                 recognized = [bool]$construct.recognized
-                hasExclude = [bool]$construct.hasExclude
+                hasExclude = $(if ($NamedAreEqual) { $false }
+                    else { [bool]$construct.hasExclude })
             }
             if ($RedundantMethod) {
                 $material.affectedMethodCount = [int]$construct.affectedMethodCount
                 $material.affectedMethods = @($construct.affectedMethods)
                 $material.affectedAttributeLines = @($construct.affectedAttributeLines)
             }
+            elseif ($NamedAreEqual) {
+                $material.affectedCallCount = [int]$construct.affectedCallCount
+                $material.affectedCallLines = @($construct.affectedCallLines)
+            }
             $digest = (Get-OwnerV2Digest -Value $material).Substring(10)
             $constructRef = "construct:$digest"
-            $assessmentId = $(if ($RedundantMethod) { "class-coverage:n:$digest" }
+            $assessmentId = $(if ($NamedAreEqual) { "method:n:$digest" }
+                elseif ($RedundantMethod) { "class-coverage:n:$digest" }
                 else { "class:n:$digest" })
             $resolved = [bool]$construct.recognized -and
                 -not [string]::IsNullOrWhiteSpace([string]$construct.name) -and
                 [int]$construct.declarationLine -ge 1
             $state = if (-not $resolved) { 'unknown' }
+            elseif ($NamedAreEqual) {
+                if ([bool]$construct.hasPositional) { 'violation' }
+                else { 'compliant' }
+            }
             elseif ($RedundantMethod) {
                 if ([bool]$construct.hasExclude) { 'violation' }
                 else { 'compliant' }
@@ -2186,7 +2335,9 @@ function Invoke-TestClassCoverageCapabilityResponse {
             if ($state -ceq 'violation') {
                 $findingData = [ordered]@{
                     disposition = 'violation'
-                    eligibility = $(if ($RedundantMethod) {
+                    eligibility = $(if ($NamedAreEqual) {
+                        'changed-mstest-areequal-method'
+                    } elseif ($RedundantMethod) {
                         'changed-mstest-class-method-exclusions'
                     } else { 'changed-mstest-class' })
                     capabilityId = $capabilityId
@@ -2198,7 +2349,7 @@ function Invoke-TestClassCoverageCapabilityResponse {
                     headCommit = [string]$identityUnits[0].data.sourceCommit
                     anchor = [ordered]@{
                         path = $path
-                        line = $(if ($RedundantMethod) { [int]$construct.startLine }
+                        line = $(if ($NamedAreEqual -or $RedundantMethod) { [int]$construct.startLine }
                             else { [int]$construct.declarationLine })
                         symbol = [string]$construct.name
                     }
@@ -2209,8 +2360,14 @@ function Invoke-TestClassCoverageCapabilityResponse {
                     $findingData.affectedAttributeLines = @($construct.affectedAttributeLines)
                     $findingData.methodListTruncated = [bool]$construct.methodListTruncated
                 }
+                elseif ($NamedAreEqual) {
+                    $findingData.affectedCallCount = [int]$construct.affectedCallCount
+                    $findingData.affectedCallLines = @($construct.affectedCallLines)
+                    $findingData.callListTruncated = [bool]$construct.callListTruncated
+                }
                 $finding = @([ordered]@{
-                        findingId = $(if ($RedundantMethod) { 'redundant-coverage-v2:' }
+                        findingId = $(if ($NamedAreEqual) { 'named-areequal-v2:' }
+                            elseif ($RedundantMethod) { 'redundant-coverage-v2:' }
                             else { 'coverage-v2:' }) + (Get-OwnerV2Digest -Value ([ordered]@{
                                     bindingId = $bindingId
                                     capabilityId = $capabilityId
@@ -2218,7 +2375,9 @@ function Invoke-TestClassCoverageCapabilityResponse {
                                     constructRef = $constructRef
                                     disposition = 'violation'
                                 })).Substring(10)
-                        summary = $(if ($RedundantMethod) {
+                        summary = $(if ($NamedAreEqual) {
+                            'Changed Assert.AreEqual calls in this test method require named arguments.'
+                        } elseif ($RedundantMethod) {
                             'Changed method-level exclusions are redundant across the containing MSTest class.'
                         } else { 'Changed MSTest test class lacks a class-level coverage exclusion.' })
                         data = $findingData
@@ -2237,6 +2396,9 @@ function Invoke-TestClassCoverageCapabilityResponse {
             }
             if ($RedundantMethod -and $null -ne $outcomeData) {
                 $outcomeData.affectedMethodCount = [int]$construct.affectedMethodCount
+            }
+            elseif ($NamedAreEqual -and $null -ne $outcomeData) {
+                $outcomeData.affectedCallCount = [int]$construct.affectedCallCount
             }
             [void]$assessments.Add([ordered]@{
                     assessmentId = $assessmentId
@@ -2265,12 +2427,22 @@ function New-TestClassCoverageCapabilityAdapter {
         [Parameter(Mandatory)][string]$CapabilityId,
         [Parameter(Mandatory)][string]$CapabilityDigest,
         [DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits = (New-OwnerV2CapabilityLimits),
-        [switch]$RedundantMethod
+        [switch]$RedundantMethod,
+        [switch]$NamedAreEqual
     )
-    $expectedId = if ($RedundantMethod) {
+    if ($RedundantMethod -and $NamedAreEqual) {
+        throw 'Only one independent deterministic rule can be selected.'
+    }
+    $expectedId = if ($NamedAreEqual) {
+        $script:NamedAreEqualCapability
+    }
+    elseif ($RedundantMethod) {
         $script:RedundantMethodCoverageCapability
     } else { $script:TestClassCoverageCapability }
-    $expectedDigest = if ($RedundantMethod) {
+    $expectedDigest = if ($NamedAreEqual) {
+        $script:NamedAreEqualDigest
+    }
+    elseif ($RedundantMethod) {
         $script:RedundantMethodCoverageDigest
     } else { $script:TestClassCoverageDigest }
     if ($CapabilityId -cne $expectedId -or $CapabilityDigest -cne $expectedDigest) {
@@ -2279,12 +2451,15 @@ function New-TestClassCoverageCapabilityAdapter {
     $capturedDigest = $CapabilityDigest
     $capturedLimits = $Limits
     $capturedRedundantMethod = [bool]$RedundantMethod
+    $capturedNamedAreEqual = [bool]$NamedAreEqual
     $command = Get-Command Invoke-TestClassCoverageCapabilityResponse -CommandType Function
     return New-OwnerPipelineAdapter -Stage capability `
-        -Name 'test-class-coverage-v1-capability' -Handler {
+        -Name $(if ($NamedAreEqual) { 'named-areequal-v1-capability' }
+            else { 'test-class-coverage-v1-capability' }) -Handler {
         param($context)
         return & $command -Context $context -CapabilityDigest $capturedDigest `
-            -Limits $capturedLimits -RedundantMethod:$capturedRedundantMethod
+            -Limits $capturedLimits -RedundantMethod:$capturedRedundantMethod `
+            -NamedAreEqual:$capturedNamedAreEqual
     }.GetNewClosure()
 }
 
@@ -2323,11 +2498,14 @@ function ConvertTo-OwnerV2Observation {
     $assessments = @(Get-OwnerV2Member -Value $validation -Name assessments)
     $capabilityId = [string](Get-OwnerV2Member -Value $identity -Name capabilityId)
     $isCoverage = $capabilityId -cin @(
-        $script:TestClassCoverageCapability, $script:RedundantMethodCoverageCapability)
+        $script:TestClassCoverageCapability, $script:RedundantMethodCoverageCapability,
+        $script:NamedAreEqualCapability)
     $methodAssessments = @($assessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like
                 $(if ($capabilityId -ceq $script:RedundantMethodCoverageCapability) {
                     'class-coverage:*'
+                } elseif ($capabilityId -ceq $script:NamedAreEqualCapability) {
+                    'method:n:*'
                 } elseif ($isCoverage) { 'class:*' } else { 'method:*' })
         })
     $outcomeAssessments = @($assessments | Where-Object {
@@ -2400,6 +2578,11 @@ function ConvertTo-OwnerV2Observation {
             $normalizedFinding.affectedAttributeLines = @($data.affectedAttributeLines)
             $normalizedFinding.methodListTruncated = [bool]$data.methodListTruncated
         }
+        elseif ($capabilityId -ceq $script:NamedAreEqualCapability) {
+            $normalizedFinding.affectedCallCount = [int]$data.affectedCallCount
+            $normalizedFinding.affectedCallLines = @($data.affectedCallLines)
+            $normalizedFinding.callListTruncated = [bool]$data.callListTruncated
+        }
         [void]$normalizedFindings.Add($normalizedFinding)
     }
     $normalizedOutcomes = [Collections.Generic.List[object]]::new()
@@ -2451,6 +2634,9 @@ function ConvertTo-OwnerV2Observation {
             }
         if ($capabilityId -ceq $script:RedundantMethodCoverageCapability) {
             $normalizedOutcome.affectedMethodCount = [int]$outcome.affectedMethodCount
+        }
+        elseif ($capabilityId -ceq $script:NamedAreEqualCapability) {
+            $normalizedOutcome.affectedCallCount = [int]$outcome.affectedCallCount
         }
         [void]$normalizedOutcomes.Add($normalizedOutcome)
     }
@@ -2643,9 +2829,11 @@ Export-ModuleMember -Function @(
     'Format-OwnerV1WriterComment',
     'Format-TestClassCoverageComment',
     'Format-RedundantMethodCoverageComment',
+    'Format-NamedAreEqualComment',
     'Get-OwnerV1WriterMarkerKey',
     'Get-TestClassCoverageMarkerKey',
     'Get-RedundantMethodCoverageMarkerKey',
+    'Get-NamedAreEqualMarkerKey',
     'New-OwnerSemanticRunner',
     'New-TestClassCoverageCapabilityAdapter',
     'New-OwnerV2CapabilityAdapter',

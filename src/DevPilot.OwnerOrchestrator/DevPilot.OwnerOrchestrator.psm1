@@ -45,6 +45,9 @@ $script:CoverageV2CapabilityId = 'bpm-test-class-coverage@1'
 $script:CoverageV2PolicyPath = 'src/DevPilot.OwnerCapability/Policy/test-class-coverage.v1.txt'
 $script:RedundantCoverageCapabilityId = 'bpm-redundant-method-coverage@1'
 $script:RedundantCoveragePolicyPath = 'src/DevPilot.OwnerCapability/Policy/redundant-method-coverage.v1.txt'
+$script:NamedAreEqualCapabilityId = 'bpm-named-areequal-arguments@1'
+$script:NamedAreEqualPolicyPath = 'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
+$script:NamedAreEqualPolicyDigest = 'v1:sha256:008e56acc64ecdb92a2bcd4974bdaff85e23a9fdea610d1d055ddb88cf6aed61'
 $script:OwnerV2DigestPattern = '^v1:sha256:[0-9a-f]{64}$'
 $script:OwnerV2CommitPattern = '^[0-9a-f]{40}$'
 $script:OwnerV2SafeIdPattern = '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
@@ -705,22 +708,34 @@ function ConvertTo-OwnerV2Declaration {
         throw 'rule.length is outside the Owner v2 preview bounds.'
     }
     $redundantMethod = [string]$Entry.capability.id -ceq $script:RedundantCoverageCapabilityId
-    $isCoverage = $redundantMethod -or
+    $namedAreEqual = [string]$Entry.capability.id -ceq $script:NamedAreEqualCapabilityId
+    $isCoverage = $redundantMethod -or $namedAreEqual -or
         [string]$Entry.capability.id -ceq $script:CoverageV2CapabilityId
     if ($isCoverage) {
-        $policyPath = if ($redundantMethod) {
+        $policyPath = if ($namedAreEqual) {
+            $script:NamedAreEqualPolicyPath
+        } elseif ($redundantMethod) {
             $script:RedundantCoveragePolicyPath
         } else { $script:CoverageV2PolicyPath }
-        $capabilityText = if ($redundantMethod) {
+        $capabilityText = if ($namedAreEqual) {
+            'named-areequal-arguments-capability-v1'
+        } elseif ($redundantMethod) {
             'redundant-method-coverage-capability-v1'
         } else { 'test-class-coverage-capability-v1' }
-        $configId = if ($redundantMethod) {
+        $configId = if ($namedAreEqual) {
+            'named-areequal-arguments-v1-user-approved'
+        } elseif ($redundantMethod) {
             'redundant-method-coverage-v1-user-approved'
         } else { 'coverage-v1-user-approved' }
         $policyText = [IO.File]::ReadAllText(
             (Join-Path $script:OwnerV2RepositoryRoot (
                     $policyPath.Replace('/', [IO.Path]::DirectorySeparatorChar)
                 )), [Text.UTF8Encoding]::new($false))
+        if ($namedAreEqual -and
+            (Get-OwnerV2RawTextDigest -Value $policyText) -cne
+            $script:NamedAreEqualPolicyDigest) {
+            throw 'Named AreEqual source-backed policy bytes do not match the pinned version.'
+        }
         if ([string]$Entry.capability.digest -cne (
                 Get-OwnerV2RawTextDigest -Value $capabilityText
             ) -or
@@ -1044,7 +1059,8 @@ function Read-OwnerV2Manifest {
     $kind = [string]$manifest.kind
     if ([int]$manifest.schemaVersion -ne 1 -or
         $kind -cnotin @('owner-v2-preview-cohort', 'relation-v2-preview-cohort',
-            'coverage-v2-preview-cohort', 'redundant-coverage-v2-preview-cohort')) {
+            'coverage-v2-preview-cohort', 'redundant-coverage-v2-preview-cohort',
+            'named-areequal-v2-preview-cohort')) {
         throw 'Preview manifest must use schemaVersion 1 and a supported bounded cohort kind.'
     }
     $entries = @($manifest.entries)
@@ -1064,11 +1080,15 @@ function Read-OwnerV2Manifest {
             else {
                 $entry = ConvertTo-OwnerV2Declaration -Entry $_
                 $expectedCoverage = $kind -cin @(
-                    'coverage-v2-preview-cohort', 'redundant-coverage-v2-preview-cohort')
+                    'coverage-v2-preview-cohort', 'redundant-coverage-v2-preview-cohort',
+                    'named-areequal-v2-preview-cohort')
                 if ($expectedCoverage -ne ([string]$entry.CapabilityKind -ceq 'coverage') -or
                     ($kind -ceq 'redundant-coverage-v2-preview-cohort') -ne
                     ([string]$entry.Declaration.capability.id -ceq
-                        $script:RedundantCoverageCapabilityId)) {
+                        $script:RedundantCoverageCapabilityId) -or
+                    ($kind -ceq 'named-areequal-v2-preview-cohort') -ne
+                    ([string]$entry.Declaration.capability.id -ceq
+                        $script:NamedAreEqualCapabilityId)) {
                     throw 'Coverage and Owner cohorts must have separate capability identities.'
                 }
                 $entry
@@ -1223,7 +1243,9 @@ function Invoke-OwnerV2Replay {
             -CapabilityId ([string]$Entry.Declaration.capability.id) `
             -CapabilityDigest ([string]$Entry.Declaration.capability.digest) `
             -RedundantMethod:([string]$Entry.Declaration.capability.id -ceq
-                $script:RedundantCoverageCapabilityId)
+                $script:RedundantCoverageCapabilityId) `
+            -NamedAreEqual:([string]$Entry.Declaration.capability.id -ceq
+                $script:NamedAreEqualCapabilityId)
     }
     else {
         $runnerFixture = New-OwnerModelReplayFixture -Records @($Entry.ReplayRecords)
@@ -1893,11 +1915,16 @@ function Invoke-TestClassCoverageLive {
         -CapabilityId ([string]$Entry.Declaration.capability.id) `
         -CapabilityDigest ([string]$Entry.Declaration.capability.digest) `
         -RedundantMethod:([string]$Entry.Declaration.capability.id -ceq
-            $script:RedundantCoverageCapabilityId)
+            $script:RedundantCoverageCapabilityId) `
+        -NamedAreEqual:([string]$Entry.Declaration.capability.id -ceq
+            $script:NamedAreEqualCapabilityId)
     $result = Invoke-OwnerReviewPipeline -Binding $Entry.Contract.Binding `
         -AcquisitionAdapter $acquisition -CapabilityAdapter $capability
     $observation = ConvertTo-OwnerV2Observation -PipelineResult $result `
         -ImplementationId $(if ([string]$Entry.Declaration.capability.id -ceq
+            $script:NamedAreEqualCapabilityId) {
+            'named-areequal-arguments-v1-orchestrator'
+        } elseif ([string]$Entry.Declaration.capability.id -ceq
             $script:RedundantCoverageCapabilityId) {
             'redundant-method-coverage-v1-orchestrator'
         } else { 'test-class-coverage-v1-orchestrator' }) `
@@ -2570,6 +2597,10 @@ function Invoke-OwnerV2PreviewRun {
                 $noModel = [string]$entry.CapabilityKind -ceq 'coverage'
                 if ($noModel) {
                     $observation.implementation.id = $(if (
+                        [string]$entry.Declaration.capability.id -ceq
+                        $script:NamedAreEqualCapabilityId) {
+                        'named-areequal-arguments-v1-orchestrator'
+                    } elseif (
                         [string]$entry.Declaration.capability.id -ceq
                         $script:RedundantCoverageCapabilityId) {
                         'redundant-method-coverage-v1-orchestrator'

@@ -233,6 +233,71 @@ counted and never blindly retried.
 
 ## Fail-closed configuration
 
+### Named `Assert.AreEqual` arguments (toolkit only)
+
+`tools/Invoke-AutomaticOwnerV2Delivery.ps1 -Delivery named-areequal` is an
+independent, **default-off** create-only path for completed live, model-free
+`bpm-named-areequal-arguments@1` observations. This does not deploy a
+scheduler, enable a service, or post a comment. Neither the Owner, class
+coverage, nor redundant coverage switch enables this rule. Its rule path is
+`src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt`.
+An absent switch or literal `false` on `invoke` reads the completed evidence
+and returns `disabled`, without creating a delivery root, key, intent, or
+provider write. Boolean `true` is invalid; an enabled *external* toolkit
+config requires a signed policy file and its exact SHA-256 binding. The paths
+below are synthetic examples, not deployment values:
+
+```json
+{
+  "autoCreateNamedAreEqualComments": {
+    "enabled": true,
+    "policyPath": "C:\\example\\owner-v2-delivery\\named-areequal-v1\\policies\\named-areequal-v1-production.json",
+    "policySha256": "<64 lowercase hex>"
+  }
+}
+```
+
+The independent `named-areequal-v1` subroot has its own
+`keys\named-areequal-service-authorization.hmac`, `policies`, `intents`,
+`outcomes`, `events`, and `locks`. Owner and either coverage key/policy/event
+history cannot authorize or exhaust its caps. Initialize its key and sign a
+policy from a completed live state identity while the switch is **off**:
+
+```powershell
+.\tools\Invoke-AutomaticOwnerV2Delivery.ps1 initialize-key `
+    -Delivery named-areequal -DeliveryRoot C:\example\owner-v2-delivery
+.\tools\Invoke-AutomaticOwnerV2Delivery.ps1 authorize-policy `
+    -Delivery named-areequal -DeliveryRoot C:\example\owner-v2-delivery `
+    -StateRoot C:\example\owner-v2-state `
+    -Identity <completed-named-areequal-state-identity> `
+    -ToolkitConfigPath C:\example\named-areequal-config.json `
+    -PolicyId named-areequal-v1-production
+```
+
+Only a `named-areequal-v2:<sha>` *violation* with exact `wouldCreate`
+reconciliation may create one `devpilot-named-areequal:v1` comment per
+changed method. Its symbol is the full method name; its anchor is the first
+changed violating call, and its bounded metadata records the integer call
+count, strictly sorted unique changed call lines (at most 256), and an exact
+truncation flag. Every listed line must still be changed in the current
+iteration. The signed `named-areequal-v1-service-authorization-policy`
+binds this rule, capability, repository, reviewer, implementation and
+create-only authority, with independent per-run/per-PR ceilings (hard
+maximums 5/50). Source head, target commit/ref, active non-draft PR,
+current iteration, reviewer identity, discussion snapshot, finding metadata,
+and changed lines are rechecked before each create. Only `ReadCurrent`
+and `CreateThread` are permitted; readback must confirm one current,
+exactly anchored reviewer marker and body. A same-account unmarked human
+comment is **not** a bot `noOp`. Current affirmative human review blocks
+creation; historical/outdated human review emits a signed no-write refusal
+event and requires operator review. A foreign/duplicate/stale marker,
+uncertain create, ambiguous readback, or drift fails closed. Signed
+`named-areequal-v2-*` results, intents, outcomes, and events carry independent audit
+and conservative write accounting. No updates, thread-status changes,
+votes, PR statuses, summaries, notifications, relation writes, or model
+writes are authorized. Tests use a fake provider; do not run a live `invoke`
+merely to test this integration.
+
 `autoCreateOwnerComments` is absent or `false` by default. A true boolean is
 invalid because it has no immutable policy binding. Enabled configuration is
 external deployment data and has exactly this shape:

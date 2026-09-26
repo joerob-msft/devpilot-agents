@@ -14,7 +14,7 @@ function Test-CoverageChanged {
 }
 
 function Get-CoverageTokens {
-    param([string]$Text)
+    param([string]$Text, [switch]$IncludeLiteralTokens)
     $tokens = [Collections.Generic.List[object]]::new()
     $length = $Text.Length
     $i = 0
@@ -61,6 +61,7 @@ function Get-CoverageTokens {
             $i - $prefix -lt 9) { $i++ }
         if ($i -lt $length -and $Text[$i] -eq '"' -or
             ($i -eq $prefix -and $ch -eq "'")) {
+            $literalLine = $line
             $quote = $Text[$i]
             $interpolated = $Text.Substring($prefix, $i - $prefix).Contains('$')
             $verbatim = $Text.Substring($prefix, $i - $prefix).Contains('@')
@@ -108,6 +109,9 @@ function Get-CoverageTokens {
                 $i++
             }
             if (-not $closed) { $unterminated = $true }
+            if ($IncludeLiteralTokens) {
+                [void]$tokens.Add(@{ text = '__literal__'; line = $literalLine })
+            }
             continue
         }
         $i = $prefix
@@ -677,4 +681,316 @@ function Get-RedundantMethodCoverageConstructs {
     }
 }
 
-Export-ModuleMember -Function Get-TestClassCoverageConstructs, Get-RedundantMethodCoverageConstructs
+function Get-NamedAreEqualConstructs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Spans,
+        [Parameter(Mandatory)][string]$Path
+    )
+    if ([Text.Encoding]::UTF8.GetByteCount($Content) -ge 16MB -or
+        $Spans.Count -gt 4096 -or $Path.Length -gt 2048) {
+        throw 'C# coverage input exceeds the bounded content or span limit.'
+    }
+    $ranges = @(
+        foreach ($span in $Spans) {
+            $first = Get-CoverageMember $span startLine
+            $last = Get-CoverageMember $span endLine
+            $state = Get-CoverageMember $span state
+            if ($first -isnot [int] -or $last -isnot [int] -or $first -lt 1 -or
+                $last -lt $first -or $last -gt 200000 -or
+                ($null -ne $state -and $state -cne 'complete')) {
+                throw 'C# coverage span is incomplete or invalid.'
+            }
+            @{ start = $first; end = $last }
+        }
+    )
+    if ($ranges.Count -eq 0 -or -not $Content) { return }
+    $scan = Get-CoverageTokens -Text $Content -IncludeLiteralTokens
+    $tokens = $scan.tokens.ToArray()
+    $pairs = @{}
+    $stack = [Collections.Generic.Stack[int]]::new()
+    $closing = @{ ')' = '('; ']' = '['; '}' = '{' }
+    $malformed = [bool]($scan.unterminated -or $scan.conditional)
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $text = [string]$tokens[$i].text
+        if ($text -in @('(', '[', '{')) { $stack.Push($i) }
+        elseif ($closing.ContainsKey($text)) {
+            if ($stack.Count -eq 0 -or $tokens[$stack.Peek()].text -cne $closing[$text]) {
+                $malformed = $true
+                break
+            }
+            $opener = $stack.Pop()
+            $pairs[$opener] = $i
+            $pairs[$i] = $opener
+        }
+    }
+    if ($stack.Count) { $malformed = $true }
+
+    $mstestNamespace = 'Microsoft.VisualStudio.TestTools.UnitTesting'
+    $mstestAssert = "$mstestNamespace.Assert"
+    $imports = [Collections.Generic.List[string]]::new()
+    $aliases = @{}
+    $unsafeBinding = $false
+    $declaredAssert = $false
+    $declaredMicrosoft = $false
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $t = [string]$tokens[$i].text
+        if ($t -in @('class', 'struct', 'interface', 'record', 'enum') -and $i + 1 -lt $tokens.Count) {
+            if ($tokens[$i + 1].text -ceq 'Assert') { $declaredAssert = $true }
+            if ($tokens[$i + 1].text -ceq 'Microsoft') { $declaredMicrosoft = $true }
+        }
+        if ($t -ne 'using' -or $i + 1 -ge $tokens.Count) { continue }
+        $j = $i + 1
+        $isStatic = $tokens[$j].text -eq 'static'
+        if ($isStatic) { $j++ }
+        $parts = [Collections.Generic.List[string]]::new()
+        while ($j -lt $tokens.Count -and $tokens[$j].text -ne ';' -and
+            $j - $i -lt 64 -and $tokens[$j].text -notin @('{', '}')) {
+            [void]$parts.Add([string]$tokens[$j].text); $j++
+        }
+        if ($j -ge $tokens.Count -or $tokens[$j].text -ne ';') { continue }
+        $value = $parts -join ''
+        if ($value -match '^(@?[\p{L}_][\p{L}\p{N}_]*)=(.+)$') {
+            $key = $Matches[1] -replace '^@', ''
+            if ($aliases.ContainsKey($key)) { $unsafeBinding = $true }
+            $aliases[$key] = $Matches[2] -replace '^global::', ''
+        }
+        elseif ($isStatic) {
+            if ($value -match '(^|\.|::)Assert$') { $unsafeBinding = $true }
+        }
+        else { [void]$imports.Add(($value -replace '^global::', '')) }
+    }
+
+    $scope = [Collections.Generic.List[object]]::new()
+    $fileNamespace = ''
+    $location = @{}
+    $methodSymbols = @{}
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $text = [string]$tokens[$i].text
+        if ($text -eq '}') {
+            if ($scope.Count) { $scope.RemoveAt($scope.Count - 1) }
+            continue
+        }
+        $location[$i] = @($scope)
+        if ($text -eq 'namespace') {
+            $j = $i + 1
+            $parts = [Collections.Generic.List[string]]::new()
+            while ($j -lt $tokens.Count -and $j - $i -lt 64 -and
+                $tokens[$j].text -notin @('{', ';')) {
+                [void]$parts.Add([string]$tokens[$j].text); $j++
+            }
+            if ($j -lt $tokens.Count -and $tokens[$j].text -eq ';' -and
+                ($parts -join '') -match '^[\w]+(\.[\w]+)*$') {
+                $fileNamespace = $parts -join ''
+            }
+        }
+        if ($text -ne '{') { continue }
+        $begin = $i - 1
+        while ($begin -ge 0 -and $tokens[$begin].text -notin @(';', '{', '}')) { $begin-- }
+        $header = @($tokens[($begin + 1)..($i - 1)] | ForEach-Object text) -join ' '
+        $kind = 'other'
+        $name = ''
+        if ($header -match '\bnamespace\s+([\w]+(?:\s*\.\s*[\w]+)*)\s*$') {
+            $kind = 'namespace'
+            $name = $Matches[1] -replace '\s+', ''
+        }
+        elseif ($header -match '\b(class|struct|record)\s+(@?[\p{L}_][\p{L}\p{N}_]*)\b') {
+            $kind = 'type'
+            $name = $Matches[2] -replace '^@', ''
+        }
+        elseif ($scope.Count -gt 0 -and $scope[$scope.Count - 1].kind -eq 'type') {
+            $rightParen = -1
+            for ($j = $i - 1; $j -gt $begin; $j--) {
+                if ($tokens[$j].text -eq ')') { $rightParen = $j; break }
+            }
+            if ($rightParen -gt 0 -and $pairs.ContainsKey($rightParen)) {
+                $openParen = [int]$pairs[$rightParen]
+                $nameIndex = $openParen - 1
+                if ($nameIndex -ge 0 -and $tokens[$nameIndex].text -eq '>') {
+                    $level = 1
+                    $nameIndex--
+                    while ($nameIndex -gt $begin -and $level -gt 0) {
+                        if ($tokens[$nameIndex].text -eq '>') { $level++ }
+                        if ($tokens[$nameIndex].text -eq '<') { $level-- }
+                        $nameIndex--
+                    }
+                }
+                if ($nameIndex -gt $begin -and
+                    [string]$tokens[$nameIndex].text -cmatch '^@?[\p{L}_][\p{L}\p{N}_]*$' -and
+                    $tokens[$nameIndex - 1].text -notin @('.', '::', 'new', '=') -and
+                    $header -notmatch '\b(?:if|while|for|foreach|switch|catch|lock|using)\s*\(') {
+                    $kind = 'method'
+                    $name = [string]$tokens[$nameIndex].text -replace '^@', ''
+                    $declarationLine = [int]$tokens[$nameIndex].line
+                    $parts = @($fileNamespace) + @($scope | Where-Object {
+                            $_.kind -in @('namespace', 'type')
+                        } | ForEach-Object name) + @($name)
+                    $methodSymbol = (@($parts | Where-Object { $_ }) -join '.')
+                    if (-not $methodSymbols.ContainsKey($methodSymbol)) {
+                        $methodSymbols[$methodSymbol] = 0
+                    }
+                    $methodSymbols[$methodSymbol]++
+                }
+            }
+        }
+        [void]$scope.Add(@{ kind = $kind; name = $name
+            declarationLine = $(if ($kind -eq 'method') { $declarationLine } else { 0 })
+            end = $(if ($pairs.ContainsKey($i)) { [int]$tokens[$pairs[$i]].line } else { [int]$tokens[$i].line }) })
+    }
+
+    $groups = @{}
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        if ($tokens[$i].text -cne 'AreEqual' -or $i -lt 2 -or
+            $tokens[$i - 1].text -ne '.') { continue }
+        $receiverEnd = $i - 2
+        $receiverStart = $receiverEnd
+        while ($receiverStart -ge 2 -and $tokens[$receiverStart - 1].text -in @('.', '::') -and
+            [string]$tokens[$receiverStart - 2].text -cmatch '^@?[\p{L}_][\p{L}\p{N}_]*$') {
+            $receiverStart -= 2
+        }
+        $receiver = @($tokens[$receiverStart..$receiverEnd] | ForEach-Object text) -join ''
+        if ($receiver -notmatch '(^|\.|::)Assert$' -and
+            -not $aliases.ContainsKey($receiver)) { continue }
+        $start = [int]$tokens[$receiverStart].line
+        $openParen = $i + 1
+        if ($openParen -lt $tokens.Count -and $tokens[$openParen].text -eq '<') {
+            $level = 1
+            $openParen++
+            while ($openParen -lt $tokens.Count -and $level -gt 0 -and
+                $openParen - $i -lt 128) {
+                if ($tokens[$openParen].text -eq '<') { $level++ }
+                if ($tokens[$openParen].text -eq '>') { $level-- }
+                $openParen++
+            }
+        }
+        $callValid = $openParen -lt $tokens.Count -and $tokens[$openParen].text -eq '(' -and
+            $pairs.ContainsKey($openParen)
+        $end = if ($callValid) { [int]$tokens[$pairs[$openParen]].line } else { [int]$tokens[$i].line }
+        if (-not (Test-CoverageChanged $start $end $ranges)) { continue }
+        $contexts = @($location[$i])
+        $method = @($contexts | Where-Object kind -eq 'method' | Select-Object -Last 1)
+        $symbolParts = [Collections.Generic.List[string]]::new()
+        if ($fileNamespace) { [void]$symbolParts.Add($fileNamespace) }
+        foreach ($entry in $contexts) {
+            if ($entry.kind -in @('namespace', 'type', 'method')) {
+                [void]$symbolParts.Add([string]$entry.name)
+            }
+        }
+        $symbol = $symbolParts -join '.'
+        $binding = $false
+        $resolved = $receiver -replace '^global::', ''
+        if ($resolved -ceq $mstestAssert) {
+            $binding = $receiver.StartsWith('global::') -or
+                (-not $declaredMicrosoft -and -not $aliases.ContainsKey('Microsoft'))
+        }
+        elseif ($receiver -ceq 'Assert') {
+            $binding = -not $declaredAssert -and
+                (($aliases.ContainsKey('Assert') -and $aliases['Assert'] -ceq $mstestAssert) -or
+                    (-not $aliases.ContainsKey('Assert') -and
+                        $mstestNamespace -cin $imports -and
+                        @($imports | Where-Object { $_ -cne $mstestNamespace }).Count -eq 0))
+        }
+        else {
+            $components = $receiver -split '\.|::', 2
+            if ($aliases.ContainsKey($components[0])) {
+                $tail = if ($components.Count -gt 1) { '.' + $components[1] } else { '' }
+                $binding = ($aliases[$components[0]] + $tail) -ceq $mstestAssert
+            }
+        }
+        if ($receiverStart -gt 0 -and $tokens[$receiverStart - 1].text -in @('.', '::')) {
+            $binding = $false
+        }
+        if ($unsafeBinding -or $malformed) { $binding = $false }
+        # An identifier declared as a value can shadow an imported type or alias.
+        $rootName = ($receiver -split '\.|::')[0] -replace '^@', ''
+        if ($rootName -and -not $receiver.StartsWith('global::')) {
+            for ($j = 1; $j -lt $tokens.Count - 1; $j++) {
+                if ($j -eq $receiverStart -or $tokens[$j].text -cne $rootName) { continue }
+                if ($tokens[$j - 1].text -notin @('.', '::', 'using') -and
+                    $tokens[$j + 1].text -in @('=', ';', ',', ')', '=>')) {
+                    $binding = $false; break
+                }
+            }
+        }
+        $exactAnchor = Test-CoverageChanged $start $start $ranges
+        $known = $binding -and $callValid -and $exactAnchor -and $method.Count -eq 1 -and
+            $method[0].declarationLine -ge 1 -and
+            $symbol.Length -gt 0 -and $symbol.Length -le 256 -and
+            $symbol -cmatch '^([\p{L}_][\p{L}\p{N}_]*\.)*[\p{L}_][\p{L}\p{N}_]*$' -and
+            $methodSymbols.ContainsKey($symbol) -and $methodSymbols[$symbol] -eq 1
+        $positional = $false
+        if ($callValid) {
+            $segment = $openParen + 1
+            $closeParen = [int]$pairs[$openParen]
+            $nestedAngles = 0
+            for ($j = $segment; $j -le $closeParen; $j++) {
+                $t = if ($j -eq $closeParen) { ',' } else { [string]$tokens[$j].text }
+                if ($t -eq '<') {
+                    $angleEnd = $j + 1
+                    $depth = 1
+                    while ($angleEnd -lt $closeParen -and $depth -gt 0 -and
+                        $angleEnd - $j -lt 128) {
+                        if ($tokens[$angleEnd].text -eq '<') { $depth++ }
+                        elseif ($tokens[$angleEnd].text -eq '>') { $depth-- }
+                        elseif ($tokens[$angleEnd].text -notmatch '^[\w@]+$|^(\.|::|,|\?|\[|\])$') { break }
+                        $angleEnd++
+                    }
+                    if ($depth -eq 0) { $nestedAngles++ }
+                }
+                elseif ($t -eq '>' -and $nestedAngles -gt 0) { $nestedAngles-- }
+                if ($t -eq ',' -and $nestedAngles -eq 0) {
+                    if ($j -eq $segment) { $known = $false }
+                    elseif ($segment + 1 -ge $j -or
+                        [string]$tokens[$segment].text -cnotmatch '^@?[\p{L}_][\p{L}\p{N}_]*$' -or
+                        $tokens[$segment + 1].text -ne ':') { $positional = $true }
+                    $segment = $j + 1
+                }
+                elseif ($t -in @('(', '[', '{') -and $pairs.ContainsKey($j)) {
+                    $j = [int]$pairs[$j]
+                }
+            }
+        }
+        if (-not $callValid) { $known = $false }
+        $key = if ($method.Count -eq 1 -and $symbol.Length -le 256) {
+            "$symbol`:$($method[0].declarationLine)"
+        } else { "unknown:$start" }
+        if (-not $groups.ContainsKey($key)) {
+            $groups[$key] = [Collections.Generic.List[object]]::new()
+        }
+        [void]$groups[$key].Add(@{ name = $(if ($symbol.Length -gt 0 -and
+                    $symbol.Length -le 256) { $symbol } else { 'unrecognized' })
+            declarationLine = $(if ($method.Count -eq 1) { [int]$method[0].declarationLine } else { 0 })
+            start = $start; end = $end; known = [bool]$known; positional = [bool]$positional })
+    }
+    foreach ($key in @($groups.Keys | Sort-Object)) {
+        $calls = @($groups[$key] | Sort-Object start, end)
+        $distinctLines = @($calls | ForEach-Object start | Sort-Object -Unique)
+        $ambiguousLine = $distinctLines.Count -ne $calls.Count
+        $allKnown = $calls.Count -le 256 -and -not $ambiguousLine -and
+            @($calls | Where-Object { -not $_.known }).Count -eq 0
+        $violations = @($calls | Where-Object positional)
+        $reported = $calls
+        if ($allKnown -and $violations.Count) { $reported = $violations }
+        $lines = @($reported | ForEach-Object start | Sort-Object -Unique | Select-Object -First 256)
+        $anchor = $reported[0]
+        @{
+            name = [string]$calls[0].name
+            declarationLine = [int]$calls[0].declarationLine
+            startLine = [int]$lines[0]
+            endLine = [int]$anchor.end
+            recognized = [bool]$allKnown
+            hasPositional = [bool]($allKnown -and $violations.Count -gt 0)
+            affectedCallCount = [int]$lines.Count
+            affectedCallLines = $lines
+            callListTruncated = [bool]($lines.Count -gt 12)
+            reason = $(if ($ambiguousLine) { 'same-line-call-ambiguity' }
+                elseif (-not $allKnown) { 'named-areequal-call-unknown' }
+                elseif ($violations.Count) { 'positional-areequal-arguments' }
+                else { 'named-areequal-arguments' })
+            path = $Path
+        }
+    }
+}
+
+Export-ModuleMember -Function Get-TestClassCoverageConstructs, Get-RedundantMethodCoverageConstructs, Get-NamedAreEqualConstructs

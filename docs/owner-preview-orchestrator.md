@@ -41,6 +41,10 @@ acquisition and durable observation lifecycle without a model invocation.
 Its class-only rule identity and default-off delivery boundary are documented
 in [Changed MSTest class coverage convention](test-class-coverage-convention.md).
 It does not change the existing Owner fixed cohort or relation semantics.
+The separate `named-areequal-v2-preview-cohort` binds the
+[named-argument rule](named-areequal-arguments-convention.md) to immutable
+changed test-code evidence and a no-model adapter. Its automatic writer
+authorization is separate and default off.
 
 ## Current operating state (authoritative)
 
