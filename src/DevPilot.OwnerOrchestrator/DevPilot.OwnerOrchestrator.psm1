@@ -41,6 +41,8 @@ namespace DevPilot.OwnerOrchestrator
 
 $script:OwnerV2MaximumEntries = 32
 $script:RelationV2MaximumEntries = 10
+$script:CoverageV2CapabilityId = 'bpm-test-class-coverage@1'
+$script:CoverageV2PolicyPath = 'src/DevPilot.OwnerCapability/Policy/test-class-coverage.v1.txt'
 $script:OwnerV2DigestPattern = '^v1:sha256:[0-9a-f]{64}$'
 $script:OwnerV2CommitPattern = '^[0-9a-f]{40}$'
 $script:OwnerV2SafeIdPattern = '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
@@ -700,6 +702,28 @@ function ConvertTo-OwnerV2Declaration {
     if ([long]$Entry.rule.length -lt 1 -or [long]$Entry.rule.length -gt 134217728) {
         throw 'rule.length is outside the Owner v2 preview bounds.'
     }
+    $isCoverage = [string]$Entry.capability.id -ceq $script:CoverageV2CapabilityId
+    if ($isCoverage) {
+        $policyText = [IO.File]::ReadAllText(
+            (Join-Path $script:OwnerV2RepositoryRoot (
+                    $script:CoverageV2PolicyPath.Replace('/', [IO.Path]::DirectorySeparatorChar)
+                )), [Text.UTF8Encoding]::new($false))
+        if ([string]$Entry.capability.digest -cne (
+                Get-OwnerV2RawTextDigest -Value 'test-class-coverage-capability-v1'
+            ) -or
+            [string]$Entry.rule.path -cne $script:CoverageV2PolicyPath -or
+            [string]$Entry.rule.section -cne $script:CoverageV2CapabilityId -or
+            [string]$Entry.rule.hash -cne (Get-OwnerV2RawTextDigest -Value $policyText) -or
+            [long]$Entry.rule.length -ne [Text.Encoding]::UTF8.GetByteCount($policyText) -or
+            [string]$Entry.model.id -cne 'none' -or
+            [string]$Entry.model.digest -cne (Get-OwnerV2RawTextDigest -Value 'none') -or
+            [string]$Entry.config.id -cne 'coverage-v1-user-approved' -or
+            [string]$Entry.config.digest -cne (
+                Get-OwnerV2RawTextDigest -Value 'coverage-v1-user-approved'
+            )) {
+            throw 'Coverage declaration must bind the separate user-approved rule, no-model identity, and configuration.'
+        }
+    }
 
     $contract = New-OwnerV2AcquisitionContract -Entry $Entry
     $replayRecords = @()
@@ -707,6 +731,9 @@ function ConvertTo-OwnerV2Declaration {
     if ($mode -ceq 'replay') {
         Assert-OwnerV2ExactKeys -Value $Entry.replay -Name replay -Expected @('modelRecords')
         $replayRecords = @($Entry.replay.modelRecords | ForEach-Object { ConvertTo-OwnerV2ModelReplayRecord -Record $_ })
+        if ($isCoverage -and $replayRecords.Count -ne 0) {
+            throw 'Coverage replay cannot include model responses.'
+        }
         Assert-OwnerV2PackageBinding -Entry $Entry -Package $Entry.acquisition.package
         $fixture = New-OwnerReplayFixture -Package $Entry.acquisition.package
         if ($fixture.PayloadDigest -cne [string]$Entry.acquisition.payloadDigest) {
@@ -758,7 +785,7 @@ function ConvertTo-OwnerV2Declaration {
         capabilityKey = $contract.Binding.CapabilityKey
     }
     return [pscustomobject][ordered]@{
-        CapabilityKind = 'owner'
+        CapabilityKind = $(if ($isCoverage) { 'coverage' } else { 'owner' })
         Identity = $identity
         StateDigest = $stateDigest
         Declaration = $declaration
@@ -1003,7 +1030,8 @@ function Read-OwnerV2Manifest {
     Assert-OwnerV2ExactKeys -Value $manifest -Name manifest -Expected @('schemaVersion', 'kind', 'entries')
     $kind = [string]$manifest.kind
     if ([int]$manifest.schemaVersion -ne 1 -or
-        $kind -cnotin @('owner-v2-preview-cohort', 'relation-v2-preview-cohort')) {
+        $kind -cnotin @('owner-v2-preview-cohort', 'relation-v2-preview-cohort',
+            'coverage-v2-preview-cohort')) {
         throw 'Preview manifest must use schemaVersion 1 and a supported bounded cohort kind.'
     }
     $entries = @($manifest.entries)
@@ -1021,7 +1049,12 @@ function Read-OwnerV2Manifest {
                 ConvertTo-RelationV2Declaration -Entry $_
             }
             else {
-                ConvertTo-OwnerV2Declaration -Entry $_
+                $entry = ConvertTo-OwnerV2Declaration -Entry $_
+                if (($kind -ceq 'coverage-v2-preview-cohort') -ne
+                    ([string]$entry.CapabilityKind -ceq 'coverage')) {
+                    throw 'Coverage and Owner cohorts must have separate capability identities.'
+                }
+                $entry
             }
         } |
         Sort-Object -Property StateDigest)
@@ -1167,11 +1200,19 @@ function Invoke-OwnerV2Replay {
     $fixture = New-OwnerReplayFixture -Package $Entry.ManifestEntry.acquisition.package
     $acquisition = New-OwnerReplayAcquisitionAdapter -Contract $Entry.Contract `
         -Fixture $fixture -ExpectedPayloadDigest ([string]$Entry.Declaration.acquisitionPayloadDigest)
-    $runnerFixture = New-OwnerModelReplayFixture -Records @($Entry.ReplayRecords)
-    $runner = New-OwnerModelReplayRunner -Fixture $runnerFixture
-    $capability = New-OwnerV2CapabilityAdapter -Runner $runner `
-        -CapabilityId ([string]$Entry.Declaration.capability.id) `
-        -CapabilityDigest ([string]$Entry.Declaration.capability.digest)
+    $runner = $null
+    $capability = if ([string]$Entry.CapabilityKind -ceq 'coverage') {
+        New-TestClassCoverageCapabilityAdapter `
+            -CapabilityId ([string]$Entry.Declaration.capability.id) `
+            -CapabilityDigest ([string]$Entry.Declaration.capability.digest)
+    }
+    else {
+        $runnerFixture = New-OwnerModelReplayFixture -Records @($Entry.ReplayRecords)
+        $runner = New-OwnerModelReplayRunner -Fixture $runnerFixture
+        New-OwnerV2CapabilityAdapter -Runner $runner `
+            -CapabilityId ([string]$Entry.Declaration.capability.id) `
+            -CapabilityDigest ([string]$Entry.Declaration.capability.digest)
+    }
     $result = Invoke-OwnerReviewPipeline -Binding $Entry.Contract.Binding `
         -AcquisitionAdapter $acquisition -CapabilityAdapter $capability
     $observation = ConvertTo-OwnerV2Observation -PipelineResult $result -Runner $runner
@@ -1260,7 +1301,8 @@ function Test-OwnerV2LiveRetryEligible {
         [string]$Record.modelExecutionState -cne 'notAttempted' -or
         [int]$Record.attempts -ge [int]$Record.maxAttempts -or
         $null -eq $AcquisitionProvider -or
-        ($null -eq $ModelProvider -and (
+        ([string]$Entry.CapabilityKind -cne 'coverage' -and
+            $null -eq $ModelProvider -and (
             [string]::IsNullOrWhiteSpace($Model) -or
             [string]::IsNullOrWhiteSpace($CredentialEnvironmentName)
         ))) {
@@ -1814,15 +1856,88 @@ function Invoke-OwnerV2Live {
     }
 }
 
+function Invoke-TestClassCoverageLive {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][bool]$EnableLiveModel,
+        [AllowNull()][object]$AcquisitionProvider
+    )
+    if (-not $EnableLiveModel) {
+        return New-OwnerV2LiveOutcome -Entry $Entry -Reason 'live-coverage-disabled'
+    }
+    if ($null -eq $AcquisitionProvider) {
+        return New-OwnerV2LiveOutcome -Entry $Entry -Reason 'acquisition-provider-unavailable'
+    }
+    $acquisition = New-OwnerProductionAcquisitionAdapter `
+        -Contract $Entry.Contract -Provider $AcquisitionProvider
+    $capability = New-TestClassCoverageCapabilityAdapter `
+        -CapabilityId ([string]$Entry.Declaration.capability.id) `
+        -CapabilityDigest ([string]$Entry.Declaration.capability.digest)
+    $result = Invoke-OwnerReviewPipeline -Binding $Entry.Contract.Binding `
+        -AcquisitionAdapter $acquisition -CapabilityAdapter $capability
+    $observation = ConvertTo-OwnerV2Observation -PipelineResult $result `
+        -ImplementationId 'test-class-coverage-v1-orchestrator' `
+        -ImplementationVersion '1.0.0'
+    if (@($observation.findings).Count -gt 0 -and
+        [string]$observation.lifecycle.status -ceq 'completed') {
+        $discussionSnapshot = $null
+        $discussionFailure = $null
+        try {
+            $discussionSnapshot = Get-OwnerDiscussionSnapshot `
+                -Contract $Entry.Contract -Provider $AcquisitionProvider `
+                -Limits (New-OwnerDiscussionLimits -MaximumPages 20 -PageSize 100 `
+                    -MaximumThreads 1000 -MaximumComments 5000 -MaximumBytes 4194304) `
+                -RequireAzureDevOpsProvenance
+        }
+        catch {
+            $discussionFailure = 'discussion-acquisition-failed'
+        }
+        try {
+            $observation = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $observation -Contract $Entry.Contract `
+                -Snapshot $discussionSnapshot `
+                -FailureReason $(if ($discussionFailure) {
+                        $discussionFailure
+                    }
+                    else { 'discussion-acquisition-unavailable' })
+        }
+        catch {
+            $observation = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $observation -Contract $Entry.Contract `
+                -Snapshot $null -FailureReason 'discussion-reconciliation-failed'
+        }
+    }
+    $observationJson = $observation | ConvertTo-Json -Depth 64 -Compress
+    if (-not (Test-Json -Json $observationJson `
+            -SchemaFile $script:OwnerV2ObservationSchemaPath -ErrorAction Stop)) {
+        throw 'Coverage observation failed the normalized observation schema.'
+    }
+    Assert-OwnerV2PipelineNoWrites -PipelineResult $result -Observation $observation
+    return [pscustomobject][ordered]@{
+        Observation = $observation
+        Telemetry = $null
+        State = $(if ([string]$observation.lifecycle.status -ceq 'completed') {
+                'completed'
+            }
+            else { 'unknown' })
+        Reason = [string]$observation.execution.incompleteReason
+    }
+}
+
 function New-OwnerV2LiveUnavailableObservation {
     param(
         [Parameter(Mandatory)][object]$Entry,
         [Parameter(Mandatory)][string]$Reason
     )
+    $isCoverage = [string]$Entry.CapabilityKind -ceq 'coverage'
     $observation = [ordered]@{
         schemaVersion = 2
         kind = 'owner-observation'
-        implementation = [ordered]@{ id = 'owner-v2-preview-orchestrator'; version = '0.5.0' }
+        implementation = [ordered]@{
+            id = $(if ($isCoverage) { 'test-class-coverage-v1-orchestrator' }
+                else { 'owner-v2-preview-orchestrator' })
+            version = $(if ($isCoverage) { '1.0.0' } else { '0.5.0' })
+        }
         capability = [string]$Entry.Declaration.capability.id
         subject = [ordered]@{
             pullRequestId = [long]$Entry.Declaration.subject.pullRequestId
@@ -1895,7 +2010,10 @@ function New-OwnerV2LiveUnavailableObservation {
                 signature = 'not-applicable'
             }
         )
-        validationErrors = @("$Reason`: live Owner v2 preview did not start a model")
+        validationErrors = @($(if ($isCoverage) {
+                    "$Reason`: live coverage acquisition did not run"
+                }
+                else { "$Reason`: live Owner v2 preview did not start a model" }))
     }
     $observationJson = $observation | ConvertTo-Json -Depth 64 -Compress
     if (-not (Test-Json -Json $observationJson `
@@ -2008,7 +2126,6 @@ function Resolve-OwnerV2CompletedDiscussionRefresh {
             ResultDigest = Get-OwnerV2Digest -Value $Observation
             Reason = 'already-terminal'
         }
-        $Observation.implementation.version = '0.5.0'
     }
     $snapshot = $null
     $failureReason = $null
@@ -2024,7 +2141,7 @@ function Resolve-OwnerV2CompletedDiscussionRefresh {
     }
     try {
         $observation = Resolve-OwnerV2DiscussionReconciliation `
-            -Observation $observation -Contract $Entry.Contract -Snapshot $snapshot `
+            -Observation $Observation -Contract $Entry.Contract -Snapshot $snapshot `
             -FailureReason $(if ($failureReason) {
                     $failureReason
                 }
@@ -2035,7 +2152,7 @@ function Resolve-OwnerV2CompletedDiscussionRefresh {
     catch {
         $failureReason = 'discussion-reconciliation-failed'
         $observation = Resolve-OwnerV2DiscussionReconciliation `
-            -Observation $observation -Contract $Entry.Contract -Snapshot $null `
+            -Observation $Observation -Contract $Entry.Contract -Snapshot $null `
             -FailureReason $failureReason
     }
     $reconciledJson = $observation | ConvertTo-Json -Depth 64 -Compress
@@ -2172,7 +2289,7 @@ function Invoke-OwnerV2PreviewRun {
                 Assert-OwnerV2RecordBinding -Record $record -Entry $entry
             }
             if ([string]$record.state -ceq 'completed' -and
-                [string]$entry.CapabilityKind -ceq 'owner' -and
+                [string]$entry.CapabilityKind -cin @('owner', 'coverage') -and
                 [string]$entry.Declaration.mode -ceq 'live' -and
                 $null -ne $LiveAcquisitionProvider -and
                 (Test-Path -LiteralPath $observationPath -PathType Leaf)) {
@@ -2364,7 +2481,12 @@ function Invoke-OwnerV2PreviewRun {
                 throw "[owner-v2-durable-integrity] $([string]$_.Exception.Message)"
             }
             if ([string]$entry.Declaration.mode -ceq 'live') {
-                $outcome = if ([string]$entry.CapabilityKind -ceq 'relation') {
+                $outcome = if ([string]$entry.CapabilityKind -ceq 'coverage') {
+                    Invoke-TestClassCoverageLive -Entry $entry `
+                        -EnableLiveModel ([bool]$EnableLiveModel) `
+                        -AcquisitionProvider $LiveAcquisitionProvider
+                }
+                elseif ([string]$entry.CapabilityKind -ceq 'relation') {
                     Invoke-RelationV2Live -Entry $entry `
                         -EnableLiveModel ([bool]$EnableLiveModel) `
                         -AcquisitionProvider $LiveAcquisitionProvider `
@@ -2421,19 +2543,26 @@ function Invoke-OwnerV2PreviewRun {
             else {
                 $observation = New-OwnerV2LiveUnavailableObservation -Entry $entry `
                     -Reason $reason
+                $noModel = [string]$entry.CapabilityKind -ceq 'coverage'
+                if ($noModel) {
+                    $observation.implementation.id = 'test-class-coverage-v1-orchestrator'
+                    $observation.implementation.version = '1.0.0'
+                }
                 $observation.lifecycle.status = 'unknown'
                 $observation.lifecycle.completed = 'unknown'
                 $observation.lifecycle.incomplete = 'unknown'
                 $observation.lifecycle.pending = 'unknown'
                 $observation.execution.attempts = [int]$record.attempts
-                $observation.execution.modelStarts = 'unknown'
+                $observation.execution.modelStarts = $(if ($noModel) { 0 } else { 'unknown' })
                 $observation.execution.latencyMs = 'unknown'
                 $observation.execution.refusalReason = $reason
                 $observation.execution.incompleteReason = $reason
                 $observation.measurements.execution.attempts =
                     New-OwnerMeasurement -Status measured -Value ([int]$record.attempts)
-                $observation.measurements.execution.modelStarts =
-                    New-OwnerMeasurement -Status unavailable -Reason $reason
+                $observation.measurements.execution.modelStarts = $(if ($noModel) {
+                        New-OwnerMeasurement -Status measured -Value 0
+                    }
+                    else { New-OwnerMeasurement -Status unavailable -Reason $reason })
                 $observation.measurements.execution.latencyMs =
                     New-OwnerMeasurement -Status unavailable -Reason $reason
                 $observation.validationErrors = @([string]$_.Exception.Message)

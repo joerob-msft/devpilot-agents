@@ -77,6 +77,9 @@ cohort orchestrator is documented in
 The separately gated wrapper-owned create-only delivery phase, signed service
 policy, recovery rules, and dashboard event feed are documented in
 [docs/owner-automatic-delivery.md](docs/owner-automatic-delivery.md).
+The independent, no-model changed-MSTest-class coverage rule and its separate
+default-off authority are documented in
+[docs/test-class-coverage-convention.md](docs/test-class-coverage-convention.md).
 The existing local Operations dashboard's verified read-only reporting view,
 external-root configuration, health semantics, privacy boundary, and rollback
 are documented in
@@ -90,9 +93,10 @@ distinguishes code capability, operator deployment, state separation, and
 writer authority. Live Owner observations can reconcile bounded provider
 discussions into an actionable V1-compatible create/update/no-op/unknown queue,
 while the semantic/model layers remain preview-only. Automatic delivery is
-absent/false by default, accepts only the exact Owner method-level
-`wouldCreate` rule, and cannot grant any authority to the model or relation
-capability.
+absent/false by default: Owner accepts only exact method-level `wouldCreate`
+findings, and the independently authorized coverage path accepts only exact
+class-level `wouldCreate` findings. Neither grants authority to the model or
+relation capability.
 
 Azure DevOps live discussion acquisition uses the full REST thread and
 iteration shapes through the repository-owned normalizer; the reduced MCP

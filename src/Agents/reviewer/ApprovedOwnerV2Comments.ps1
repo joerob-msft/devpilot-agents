@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:ApprovedOwnerV2SchemaVersion = 1
 $script:ApprovedOwnerV2Capability = 'bpm-test-ownership@1'
+$script:ApprovedCoverageCapability = 'bpm-test-class-coverage@1'
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
 $script:ApprovedOwnerV2MaximumSelections = 5
@@ -119,7 +120,8 @@ function Assert-ApprovedOwnerV2Record {
         [Parameter(Mandatory)][Collections.IDictionary]$Record,
         [Parameter(Mandatory)][Collections.IDictionary]$Declaration,
         [Parameter(Mandatory)][string]$Identity,
-        [Parameter(Mandatory)][Collections.IDictionary]$Observation
+        [Parameter(Mandatory)][Collections.IDictionary]$Observation,
+        [switch]$Coverage
     )
     $expected = @(
         'schemaVersion', 'kind', 'identity', 'stateDigest', 'mode', 'capabilityId',
@@ -137,8 +139,10 @@ function Assert-ApprovedOwnerV2Record {
         $null -ne $Record.lease -or [string]$Record.incompleteReason -cne 'unknown') {
         throw 'Owner v2 record is not one exact completed record.'
     }
-    if ([int]$Record.schemaVersion -eq 2 -and
-        [string]$Record.modelExecutionState -cne 'attempted') {
+    $expectedModelState = if ($Coverage) { 'notAttempted' } else { 'attempted' }
+    if (($Coverage -and [int]$Record.schemaVersion -ne 2) -or
+        ([int]$Record.schemaVersion -eq 2 -and
+            [string]$Record.modelExecutionState -cne $expectedModelState)) {
         throw 'Completed Owner v2 record has an unexpected model execution state.'
     }
     $bindings = [ordered]@{
@@ -199,19 +203,63 @@ function Get-ApprovedOwnerV2SourceArtifacts {
     return @($values | Sort-Object)
 }
 
+function Get-ApprovedOwnerV2HistoricalCoverageFindings {
+    param([Parameter(Mandatory)][Collections.IDictionary]$Observation)
+    $findings = @($Observation.findings)
+    $unknown = @($findings | Where-Object {
+            [string]$_.reconciliation.classification -ceq 'unknown'
+        })
+    $historical = @($unknown | Where-Object {
+            [string]$_.reconciliation.reason -ceq
+            'historical-human-review-needs-review'
+        })
+    if ([int]$Observation.counts.violations -ne $findings.Count -or
+        [int]$Observation.counts.unknown -ne 0 -or
+        @($findings | Where-Object {
+                [string]$_.disposition -cne 'violation'
+            }).Count -gt 0 -or
+        $unknown.Count -ne $historical.Count -or
+        @($historical | Where-Object {
+                [string]$_.identity -cnotmatch '^coverage-v2:[0-9a-f]{64}$' -or
+                [string]$_.disposition -cne 'violation' -or
+                [string]$_.constructRef -cnotmatch '^construct:[0-9a-f]{64}$' -or
+                [string]$_.binding.source.representation.constructIdentity -cne
+                [string]$_.constructRef -or
+                [string]$_.providerMarker.integrity -cne 'invalid' -or
+                [string]::IsNullOrWhiteSpace([string]$_.anchor.symbol) -or
+                [string]$_.anchor.symbol -cne
+                [string]$_.binding.source.representation.symbol -or
+                [string]$_.anchor.path -cne
+                [string]$_.binding.source.representation.path -or
+                [int]$_.anchor.line -lt 1 -or
+                [int]$_.anchor.line -ne
+                [int]$_.binding.source.representation.startLine -or
+                [int]$_.anchor.line -ne
+                [int]$_.binding.source.representation.endLine
+            }).Count -gt 0) {
+        throw 'Coverage unknown findings require exact historical-human-review-needs-review evidence.'
+    }
+    return $historical
+}
+
 function Read-ApprovedOwnerV2Evidence {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$Identity,
         [Parameter(Mandatory)][string]$RepoRoot,
-        [Parameter(Mandatory)][string]$ToolkitConfigPath
+        [Parameter(Mandatory)][string]$ToolkitConfigPath,
+        [ValidateSet('owner', 'coverage')][string]$Delivery = 'owner'
     )
     $state = [IO.Path]::GetFullPath($StateRoot)
+    $coverage = $Delivery -ceq 'coverage'
+    $expectedCapability = if ($coverage) {
+        $script:ApprovedCoverageCapability
+    } else { $script:ApprovedOwnerV2Capability }
     $toolkitConfig = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
     $capability = $toolkitConfig.capability
     if ($capability -isnot [Collections.IDictionary] -or
-        [string]$capability.id -cne $script:ApprovedOwnerV2Capability -or
+        [string]$capability.id -cne $expectedCapability -or
         [string]$capability.implementationSha256 -cnotmatch '^[0-9a-f]{64}$') {
         throw 'Toolkit config has no exact Owner v2 capability binding.'
     }
@@ -252,11 +300,18 @@ function Read-ApprovedOwnerV2Evidence {
     $pin = Read-ApprovedOwnerV2Json $evidencePath
     $record = Read-ApprovedOwnerV2Json $recordPath
     $observation = Read-ApprovedOwnerV2Json $observationPath
-    $telemetry = Read-ApprovedOwnerV2Json $telemetryPath
+    $telemetry = if ($coverage) {
+        if (Test-Path -LiteralPath $telemetryPath) {
+            throw 'Model-free coverage state must not contain model telemetry.'
+        }
+        $null
+    } else { Read-ApprovedOwnerV2Json $telemetryPath }
 
     if ([string]$declaration.kind -cne 'owner-v2-preview-declaration' -or
         [string]$declaration.mode -cne 'live' -or
-        [string]$declaration.capability.id -cne $script:ApprovedOwnerV2Capability -or
+        [string]$declaration.capability.id -cne $expectedCapability -or
+        ($coverage -and [string]$declaration.rule.section -cne
+            $script:ApprovedCoverageCapability) -or
         [string]$declaration.capability.digest -cne $capabilityDigest -or
         [string]$declaration.subject.projectId -cne
         [string]$subjectProvider.projectId -or
@@ -268,19 +323,24 @@ function Read-ApprovedOwnerV2Evidence {
         [string]$declaration.acquisitionPayloadDigest) {
         throw 'Owner v2 declaration or evidence pin is stale, unsupported, or foreign.'
     }
+    if ($coverage) {
+        [void]@(Get-ApprovedOwnerV2HistoricalCoverageFindings `
+                -Observation $observation)
+    }
     if ([int]$observation.schemaVersion -ne 2 -or
         [string]$observation.kind -cne 'owner-observation' -or
-        [string]$observation.capability -cne $script:ApprovedOwnerV2Capability -or
+        [string]$observation.capability -cne $expectedCapability -or
         [string]$observation.lifecycle.status -cne 'completed' -or
         -not [bool]$observation.findingsComplete -or
-        [int]$observation.counts.unknown -ne 0 -or
+        (-not $coverage -and [int]$observation.counts.unknown -ne 0) -or
         [int]$observation.counts.uncovered -ne 0 -or
         [int]$observation.effects.providerWrites -ne 0 -or
-        [int]$observation.effects.writeToolInvocations -ne 0) {
+        [int]$observation.effects.writeToolInvocations -ne 0 -or
+        ($coverage -and [int]$observation.execution.modelStarts -ne 0)) {
         throw 'Owner v2 observation is not a completed zero-write actionable result.'
     }
     Assert-ApprovedOwnerV2Record -Record $record -Declaration $declaration `
-        -Identity $Identity -Observation $observation
+        -Identity $Identity -Observation $observation -Coverage:$coverage
     $contract = New-ApprovedOwnerV2Contract -Declaration $declaration
     foreach ($entry in ([ordered]@{
             bindingId = $contract.Binding.BindingId
@@ -306,7 +366,12 @@ function Read-ApprovedOwnerV2Evidence {
         [string]$declaration.target.targetRef -or
         [string]$observation.rule.commit -cne [string]$declaration.rule.commit -or
         [string]$observation.rule.sha256 -cne
-        ([string]$declaration.rule.hash).Substring(10)) {
+        ([string]$declaration.rule.hash).Substring(10) -or
+        ($coverage -and
+            ([string]$observation.rule.section -cne
+                $script:ApprovedCoverageCapability -or
+                [string]$observation.rule.path -cne
+                [string]$declaration.rule.path))) {
         throw 'Owner v2 observation subject, target, or rule binding is stale.'
     }
     $toolkit = $toolkitConfig.toolkit
@@ -372,11 +437,104 @@ function Read-ApprovedOwnerV2Evidence {
     }
 }
 
+function Assert-ApprovedOwnerV2CoverageEvidence {
+    param([Parameter(Mandatory)]$Evidence)
+    [void]@(Get-ApprovedOwnerV2HistoricalCoverageFindings `
+            -Observation $Evidence.Observation)
+    if ([string]$Evidence.Declaration.capability.id -cne
+        $script:ApprovedCoverageCapability -or
+        [string]$Evidence.Declaration.rule.section -cne
+        $script:ApprovedCoverageCapability -or
+        [string]$Evidence.Observation.capability -cne
+        $script:ApprovedCoverageCapability -or
+        [string]$Evidence.Observation.rule.section -cne
+        $script:ApprovedCoverageCapability -or
+        [string]$Evidence.Declaration.mode -cne 'live' -or
+        [string]$Evidence.Record.mode -cne 'live' -or
+        [string]$Evidence.Observation.lifecycle.status -cne 'completed' -or
+        -not [bool]$Evidence.Observation.findingsComplete -or
+        [int]$Evidence.Observation.counts.uncovered -ne 0 -or
+        [int]$Evidence.Observation.execution.modelStarts -ne 0 -or
+        [int]$Evidence.Observation.effects.providerWrites -ne 0 -or
+        [int]$Evidence.Observation.effects.writeToolInvocations -ne 0 -or
+        [string]$Evidence.Record.kind -cne 'owner-v2-preview-record' -or
+        [int]$Evidence.Record.schemaVersion -ne 2 -or
+        [string]$Evidence.Record.state -cne 'completed' -or
+        [string]$Evidence.Record.modelExecutionState -cne 'notAttempted' -or
+        [string]$Evidence.Record.resultDigest -cne
+        (Get-ApprovedOwnerV2Digest $Evidence.Observation) -or
+        (Test-Path -LiteralPath $Evidence.Paths.telemetry)) {
+        throw 'Only completed live model-free class coverage evidence is eligible.'
+    }
+}
+
 function Get-ApprovedOwnerV2Proposal {
     param(
         [Parameter(Mandatory)]$Evidence,
-        [Parameter(Mandatory)][Collections.IDictionary]$Finding
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [ValidateSet('owner', 'coverage')][string]$Delivery = 'owner'
     )
+    if ($Delivery -ceq 'coverage') {
+        Assert-ApprovedOwnerV2CoverageEvidence -Evidence $Evidence
+        if (
+            [string]$Finding.identity -cnotmatch '^coverage-v2:[0-9a-f]{64}$' -or
+            [string]$Finding.disposition -cne 'violation' -or
+            [string]$Finding.constructRef -cnotmatch '^construct:[0-9a-f]{64}$' -or
+            $Finding.binding -isnot [Collections.IDictionary] -or
+            $Finding.anchor -isnot [Collections.IDictionary] -or
+            [string]$Finding.binding.constructIdentity -cnotmatch
+            '^v1:sha256:[0-9a-f]{64}$' -or
+            [string]$Finding.reconciliation.classification -cnotin @(
+                'wouldCreate', 'noOp'
+            ) -or
+            ([string]$Finding.reconciliation.classification -ceq 'noOp' -and
+                ([string]$Finding.reconciliation.reason -cne
+                    'reviewer-marker-body-current' -or
+                    [string]$Finding.reconciliation.thread.availability -cne
+                    'available' -or
+                    [string]$Finding.reconciliation.thread.status -cne
+                    'active' -or
+                    [long]$Finding.reconciliation.thread.threadId -lt 1 -or
+                    [long]$Finding.reconciliation.thread.commentId -lt 1))) {
+            throw 'Only exact changed MSTest class coverage violations are create-only eligible.'
+        }
+        $source = $Finding.binding.source.representation
+        if ($source -isnot [Collections.IDictionary] -or
+            [string]$source.constructIdentity -cne
+            [string]$Finding.constructRef -or
+            [string]$source.path -cne [string]$Finding.anchor.path -or
+            [string]$source.symbol -cne [string]$Finding.anchor.symbol -or
+            [int]$source.startLine -ne [int]$Finding.anchor.line -or
+            [int]$source.endLine -ne [int]$Finding.anchor.line) {
+            throw 'Coverage finding is not one exact changed class declaration anchor.'
+        }
+        $marker = Get-TestClassCoverageMarkerKey -Contract $Evidence.Contract `
+            -Finding $Finding
+        $body = Format-TestClassCoverageComment -Contract $Evidence.Contract `
+            -Finding $Finding -MarkerKey $marker
+        $bodySha256 = Get-ApprovedOwnerV2TextSha256 $body
+        if ([string]$Finding.reconciliation.bodySha256 -cne $bodySha256 -or
+            [string]$Finding.providerMarker.integrity -cne 'verified' -or
+            [string]$Finding.providerMarker.sha256 -cne
+            (Get-ApprovedOwnerV2TextSha256 $marker)) {
+            throw 'Coverage finding does not match its exact formatter contract.'
+        }
+        return [ordered]@{
+            findingId = [string]$Finding.identity
+            semanticKey = [string]$Finding.semanticKey
+            constructRef = [string]$Finding.constructRef
+            constructIdentity = [string]$Finding.binding.constructIdentity
+            path = [string]$Finding.anchor.path
+            line = [int]$Finding.anchor.line
+            symbol = [string]$Finding.anchor.symbol
+            marker = $marker
+            markerComment = "<!-- devpilot-test-class-coverage:v1:$marker -->"
+            body = $body
+            bodySha256 = $bodySha256
+            classification = [string]$Finding.reconciliation.classification
+            rationale = [string]$Finding.reconciliation.reason
+        }
+    }
     if ([string]$Finding.identity -notmatch '^owner-v2:[0-9a-f]{64}$' -or
         [string]$Finding.disposition -cne 'violation' -or
         [string]$Finding.constructRef -notmatch '^construct:[0-9a-f]{64}$' -or
@@ -428,6 +586,10 @@ function Get-ApprovedOwnerV2Proposal {
 function New-ApprovedOwnerV2ReviewPackage {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Evidence)
+    if ([string]$Evidence.Declaration.capability.id -cne
+        $script:ApprovedOwnerV2Capability) {
+        throw 'Manual Owner review does not authorize coverage delivery.'
+    }
     $findings = @($Evidence.Observation.findings)
     if ($findings.Count -lt 1 -or
         [int]$Evidence.Observation.counts.violations -ne $findings.Count) {
@@ -641,7 +803,8 @@ function Approve-OwnerV2ReviewPackage {
     }
     $review = Read-ApprovedOwnerV2Json $ReviewPackagePath
     if ([string]$review.kind -cne 'owner-v2-comment-review-package' -or
-        [string]$review.authorization -cne 'none') {
+        [string]$review.authorization -cne 'none' -or
+        [string]$review.capability.id -cne $script:ApprovedOwnerV2Capability) {
         throw 'Only an unsigned Owner v2 review package can be approved.'
     }
     if ([string]$OperatorId -ine
@@ -701,7 +864,9 @@ function Assert-ApprovedOwnerV2ApprovalCurrent {
         [Parameter(Mandatory)]$Evidence,
         [Parameter(Mandatory)][Collections.IDictionary]$Approval
     )
-    if ([string]$Approval.kind -cne 'owner-v2-approved-comment-selection' -or
+    if ([string]$Evidence.Declaration.capability.id -cne
+        $script:ApprovedOwnerV2Capability -or
+        [string]$Approval.kind -cne 'owner-v2-approved-comment-selection' -or
         @($Approval.selections).Count -lt 1 -or
         @($Approval.selections).Count -gt $script:ApprovedOwnerV2MaximumSelections) {
         throw 'Signed Owner v2 approval has an unsupported selection contract.'
@@ -851,6 +1016,7 @@ function Assert-ApprovedOwnerV2LiveRead {
                 ConvertFrom-Json -AsHashtable -Depth 32)
     }
     $mini = [ordered]@{
+        capability = [string]$Evidence.Observation.capability
         lifecycle = [ordered]@{ status = 'completed' }
         findings = $selectedFindings
         effects = [ordered]@{

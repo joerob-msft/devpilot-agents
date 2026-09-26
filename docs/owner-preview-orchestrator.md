@@ -36,6 +36,12 @@ and `status`, caps cohorts at 10 entries, and dispatches to
 manifest behavior and scheduled deployment remain unchanged; relation
 deployment is separate.
 
+The independent `coverage-v2-preview-cohort` uses the same bound read-only
+acquisition and durable observation lifecycle without a model invocation.
+Its class-only rule identity and default-off delivery boundary are documented
+in [Changed MSTest class coverage convention](test-class-coverage-convention.md).
+It does not change the existing Owner fixed cohort or relation semantics.
+
 ## Current operating state (authoritative)
 
 This section is the authoritative current operating state for the Owner v2

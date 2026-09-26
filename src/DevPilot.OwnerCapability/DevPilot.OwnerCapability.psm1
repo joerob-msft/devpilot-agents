@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1"
 Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1"
 
 $limitsTypeName = 'DevPilot.OwnerCapability.OwnerV2CapabilityLimits'
 if (-not ($limitsTypeName -as [type])) {
@@ -45,6 +46,9 @@ $script:OwnerV1WriterCapability = 'bpm-test-ownership@1'
 $script:OwnerV1WriterVersion = 1
 $script:OwnerV1WriterRuleRef = 'rs0'
 $script:OwnerV1WriterMarkerPrefix = 'devpilot-owner-comment:v1'
+$script:TestClassCoverageCapability = 'bpm-test-class-coverage@1'
+$script:TestClassCoverageDigest = 'v1:sha256:2307b3880530a8be4f1cbfbdd258673fb8e06e8b1bddd08613bbd641736a6658'
+$script:TestClassCoverageMarkerPrefix = 'devpilot-test-class-coverage:v1'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -162,9 +166,92 @@ function Format-OwnerV1WriterComment {
     ) -join "`n"
 }
 
+function Get-TestClassCoverageMarkerKey {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding
+    )
+
+    $request = $Contract.Request
+    if ([string]$request.CapabilityId -cne $script:TestClassCoverageCapability -or
+        [string]$request.RuleSection -cne $script:TestClassCoverageCapability) {
+        throw 'Coverage marker requires the independently bound test-class coverage rule.'
+    }
+    $anchor = Get-OwnerV2Member -Value $Finding -Name anchor
+    $source = Get-OwnerV2Member -Value (
+        Get-OwnerV2Member -Value (
+            Get-OwnerV2Member -Value $Finding -Name binding
+        ) -Name source
+    ) -Name representation
+    if ($anchor -isnot [Collections.IDictionary] -or
+        $source -isnot [Collections.IDictionary] -or
+        [string]$Finding.disposition -cne 'violation' -or
+        [string]$Finding.constructRef -cnotmatch '^construct:[0-9a-f]{64}$' -or
+        [string]$source.constructIdentity -cne [string]$Finding.constructRef -or
+        [string]$source.path -cne [string]$anchor.path -or
+        [string]$source.symbol -cne [string]$anchor.symbol -or
+        [int]$source.startLine -ne [int]$anchor.line -or
+        [int]$source.endLine -ne [int]$anchor.line) {
+        throw 'Coverage finding has no canonical class anchor.'
+    }
+    $path = ConvertTo-OwnerV1WriterPath -Path ([string]$anchor.path)
+    $line = [int]$anchor.line
+    $symbol = [string]$anchor.symbol
+    if ($line -lt 1 -or [string]::IsNullOrWhiteSpace($symbol)) {
+        throw 'Coverage finding has an incomplete class anchor.'
+    }
+    $material = @(
+        $script:TestClassCoverageMarkerPrefix
+        [string]$request.RepositoryId
+        [string]$request.PullRequestId
+        [string]$request.SourceCommit
+        [string]$request.RuleRepositoryId
+        (ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+        [string]$request.RuleSection
+        [string]$request.RuleCommit
+        [string]$request.RuleHash
+        $path
+        [string]$line
+        $symbol
+    ) -join "`n"
+    return Get-OwnerV1WriterSha256 -Text $material
+}
+
+function Format-TestClassCoverageComment {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [Parameter(Mandatory)][string]$MarkerKey
+    )
+
+    if ($MarkerKey -cne (Get-TestClassCoverageMarkerKey -Contract $Contract -Finding $Finding)) {
+        throw 'Coverage marker does not match the bound class finding.'
+    }
+    $request = $Contract.Request
+    $anchor = $Finding.anchor
+    $path = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path ([string]$anchor.path)
+    )
+    $symbol = ConvertTo-OwnerV1WriterMarkdownCode ([string]$anchor.symbol)
+    $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path $request.RulePath
+    )
+    return @(
+        '**Test class coverage exclusion missing**'
+        ''
+        "Changed MSTest class ``$symbol`` at ``$path`:$([int]$anchor.line)`` has no class-level ``ExcludeFromCodeCoverage`` attribute."
+        ''
+        'Suggested fix: add `[ExcludeFromCodeCoverage]` to this test class.'
+        ''
+        "User-approved convention: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+        ''
+        "<!-- ${script:TestClassCoverageMarkerPrefix}:$MarkerKey -->"
+    ) -join "`n"
+}
+
 function New-OwnerV2DiscussionReconciliation {
     param(
-        [Parameter(Mandatory)][ValidateSet('wouldCreate', 'wouldUpdate', 'noOp', 'unknown')]
+        [Parameter(Mandatory)][ValidateSet('wouldCreate', 'wouldUpdate', 'noOp', 'humanCovered', 'unknown')]
         [string]$Classification,
         [Parameter(Mandatory)][string]$Reason,
         [Parameter(Mandatory)][string]$DiscussionDigest,
@@ -210,6 +297,7 @@ function Resolve-OwnerV2DiscussionReconciliation {
         noOp = 0
         wouldCreate = 0
         wouldUpdate = 0
+        humanCovered = 0
         unknown = 0
     }
     $snapshotAvailable = $null -ne $Snapshot -and
@@ -221,15 +309,29 @@ function Resolve-OwnerV2DiscussionReconciliation {
     else {
         'unknown'
     }
-    $allMarkerPattern = '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
+    $isCoverage = [string](Get-OwnerV2Member -Value $Observation -Name capability) -ceq
+        $script:TestClassCoverageCapability
+    $allMarkerPattern = if ($isCoverage) {
+        '<!--\s*devpilot-test-class-coverage:v1:([0-9a-f]{64})\s*-->'
+    }
+    else {
+        '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
+    }
 
     foreach ($finding in $findings) {
         $markerKey = $null
         $body = $null
         try {
-            $markerKey = Get-OwnerV1WriterMarkerKey -Contract $Contract -Finding $finding
-            $body = Format-OwnerV1WriterComment -Contract $Contract -Finding $finding `
-                -MarkerKey $markerKey
+            if ($isCoverage) {
+                $markerKey = Get-TestClassCoverageMarkerKey -Contract $Contract -Finding $finding
+                $body = Format-TestClassCoverageComment -Contract $Contract -Finding $finding `
+                    -MarkerKey $markerKey
+            }
+            else {
+                $markerKey = Get-OwnerV1WriterMarkerKey -Contract $Contract -Finding $finding
+                $body = Format-OwnerV1WriterComment -Contract $Contract -Finding $finding `
+                    -MarkerKey $markerKey
+            }
         }
         catch {
             $finding.providerMarker = New-OwnerProviderMarker
@@ -252,6 +354,7 @@ function Resolve-OwnerV2DiscussionReconciliation {
 
         $candidates = [Collections.Generic.List[object]]::new()
         $ambiguousReviewerMarkers = 0
+        $foreignMarkers = 0
         foreach ($thread in @($Snapshot.Threads)) {
             foreach ($comment in @($thread.comments)) {
                 $matches = [regex]::Matches([string]$comment.body, $allMarkerPattern)
@@ -274,19 +377,130 @@ function Resolve-OwnerV2DiscussionReconciliation {
                         MarkerCount = $targetMatches.Count
                     })
                 }
+                elseif ($isCoverage) {
+                    $foreignMarkers += $targetMatches.Count
+                }
             }
         }
 
-        if ($ambiguousReviewerMarkers -gt 0) {
+        if ($ambiguousReviewerMarkers -gt 0 -or $foreignMarkers -gt 0) {
             $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
             $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
-                -Classification unknown -Reason 'reviewer-marker-owner-ambiguous' `
+                -Classification unknown -Reason $(if ($foreignMarkers -gt 0) {
+                        'foreign-coverage-marker'
+                    }
+                    else { 'reviewer-marker-owner-ambiguous' }) `
                 -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
                 -ThreadAvailability ambiguous
             $counts.unknown++
             continue
         }
         if ($candidates.Count -eq 0) {
+            $anchor = $finding.anchor
+            $expectedPath = ConvertTo-OwnerV1WriterPath -Path ([string]$anchor.path)
+            $human = [Collections.Generic.List[object]]::new()
+            $ambiguousHuman = $false
+            $historicalHuman = [Collections.Generic.List[object]]::new()
+            $discussionPattern = if ($isCoverage) {
+                '(?i)\bexclude\s+from\s+code\s+coverage\b'
+            }
+            else {
+                '(?i)\badd\s+owner\s+claim\b|\badd\s+(?:an?\s+)?owner\s+attribute\b'
+            }
+            foreach ($thread in @($Snapshot.Threads)) {
+                if ($null -eq $thread.anchor -or [bool]$thread.isDeleted) {
+                    continue
+                }
+                $historicalNearAnchor = [bool]$thread.isOutdated -and
+                    [string]$thread.contextState -ceq 'outdated' -and
+                    [int]$thread.anchor.line -ge ([int]$anchor.line - 2) -and
+                    [int]$thread.anchor.line -le [int]$anchor.line
+                $currentAnchor = -not [bool]$thread.isOutdated -and
+                    [string]$thread.status -ceq 'active' -and
+                    [int]$thread.anchor.line -eq [int]$anchor.line
+                if (-not $historicalNearAnchor -and -not $currentAnchor) { continue }
+                $samePath = try {
+                    [string]::Equals($expectedPath,
+                        (ConvertTo-OwnerV1WriterPath -Path ([string]$thread.anchor.path)),
+                        [StringComparison]::OrdinalIgnoreCase)
+                }
+                catch { $false }
+                if (-not $samePath) { continue }
+                foreach ($comment in @($thread.comments)) {
+                    if ([string]$comment.commentType -cne 'text' -or
+                        [bool]$comment.isDeleted -or
+                        [string]$comment.body -cnotmatch $discussionPattern) {
+                        continue
+                    }
+                    $containsReviewerMarker = [regex]::IsMatch(
+                        [string]$comment.body,
+                        '<!--\s*devpilot-(?:owner-comment|test-class-coverage):v1:[0-9a-f]{64}\s*-->'
+                    )
+                    $affirmativeCoverage = -not $isCoverage -or [regex]::IsMatch(
+                        [string]$comment.body,
+                        '(?i)^\s*(?:(?:please|kindly)\s+)?(?:add\s+(?:an?\s+)?)?exclude\s+from\s+code\s+coverage\s*[.!]?\s*$'
+                    )
+                    if ($historicalNearAnchor) {
+                        if (-not $containsReviewerMarker) {
+                            [void]$historicalHuman.Add(
+                                [pscustomobject]@{ Thread = $thread; Comment = $comment }
+                            )
+                        }
+                        continue
+                    }
+                    if ([string]$thread.contextState -cne 'current' -or
+                        [string]$thread.sourceCommit -cne [string]$Contract.Request.SourceCommit -or
+                        [string]$comment.reviewerIdentityState -ceq 'ambiguous' -or
+                        $containsReviewerMarker -or -not $affirmativeCoverage) {
+                        $ambiguousHuman = $true
+                    }
+                    else {
+                        [void]$human.Add([pscustomobject]@{ Thread = $thread; Comment = $comment })
+                    }
+                }
+            }
+            if ($ambiguousHuman -or $human.Count -gt 1) {
+                $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
+                $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                    -Classification unknown -Reason 'matching-human-review-ambiguous' `
+                    -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                    -ThreadAvailability ambiguous
+                $counts.unknown++
+                continue
+            }
+            if ($historicalHuman.Count -gt 0) {
+                $singleHistorical = $historicalHuman.Count -eq 1
+                $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
+                $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                    -Classification unknown -Reason 'historical-human-review-needs-review' `
+                    -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                    -ThreadAvailability $(if ($singleHistorical) { 'available' } else { 'ambiguous' }) `
+                    -ThreadId $(if ($singleHistorical) {
+                            [long]$historicalHuman[0].Thread.threadId
+                        }
+                        else { 0 }) `
+                    -CommentId $(if ($singleHistorical) {
+                            [long]$historicalHuman[0].Comment.commentId
+                        }
+                        else { 0 }) `
+                    -ThreadStatus $(if ($singleHistorical) {
+                            [string]$historicalHuman[0].Thread.status
+                        }
+                        else { 'unknown' })
+                $counts.unknown++
+                continue
+            }
+            if ($human.Count -eq 1) {
+                $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity verified
+                $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                    -Classification humanCovered -Reason 'matching-human-review-present' `
+                    -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                    -ThreadAvailability available -ThreadId ([long]$human[0].Thread.threadId) `
+                    -CommentId ([long]$human[0].Comment.commentId) `
+                    -ThreadStatus ([string]$human[0].Thread.status)
+                $counts.humanCovered++
+                continue
+            }
             $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity verified
             $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
                 -Classification wouldCreate -Reason 'reviewer-marker-not-found' `
@@ -1665,6 +1879,237 @@ function New-OwnerV2CapabilityAdapter {
     }.GetNewClosure()
 }
 
+function Invoke-TestClassCoverageCapabilityResponse {
+    param(
+        [Parameter(Mandatory)][object]$Context,
+        [Parameter(Mandatory)][string]$CapabilityDigest,
+        [Parameter(Mandatory)][DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits
+    )
+
+    $binding = Get-OwnerV2Member -Value $Context -Name binding
+    $evidence = Get-OwnerV2Member -Value $Context -Name evidence
+    $bindingId = [string](Get-OwnerV2Member -Value $binding -Name BindingId)
+    $evidenceDigest = [string](Get-OwnerV2Member -Value $evidence -Name evidenceDigest)
+    $units = @(Get-OwnerV2Member -Value $evidence -Name evidenceUnits)
+    if ([string]::IsNullOrWhiteSpace($bindingId) -or
+        [string](Get-OwnerV2Member -Value $evidence -Name bindingId) -cne $bindingId -or
+        $evidenceDigest -cnotmatch $script:OwnerV2DigestPattern) {
+        throw 'Coverage capability did not preserve the facade evidence binding.'
+    }
+    $identityUnits = @($units | Where-Object { [string]$_.unitId -ceq 'identity' })
+    $ruleUnits = @($units | Where-Object { [string]$_.unitId -ceq 'rule' })
+    $files = @($units | Where-Object { [string]$_.unitId -like 'file:*' } |
+        Sort-Object { [string]$_.unitId })
+    $diagnostics = [Collections.Generic.List[object]]::new()
+    $policyText = [IO.File]::ReadAllText(
+        (Join-Path $PSScriptRoot 'Policy\test-class-coverage.v1.txt'),
+        [Text.UTF8Encoding]::new($false))
+    $policyDigest = Get-OwnerV2Digest -Value $policyText
+    $controlsComplete = $identityUnits.Count -eq 1 -and $ruleUnits.Count -eq 1 -and
+        [string]$identityUnits[0].state -ceq 'complete' -and
+        [string]$ruleUnits[0].state -ceq 'complete' -and
+        [string]$identityUnits[0].data.capabilityId -ceq $script:TestClassCoverageCapability -and
+        [string]$identityUnits[0].data.capabilityDigest -ceq $CapabilityDigest -and
+        [string]$ruleUnits[0].data.section -ceq $script:TestClassCoverageCapability -and
+        [string]$ruleUnits[0].data.hash -ceq $policyDigest -and
+        [string]$ruleUnits[0].data.content -ceq $policyText -and
+        $files.Count -le $Limits.MaximumFiles
+    if (-not $controlsComplete) {
+        Add-OwnerV2Diagnostic -Diagnostics $diagnostics -Limits $Limits `
+            -Code 'coverage-rule-evidence-unknown' `
+            -Message 'The independently pinned coverage policy, identity, or bounded files are unavailable.'
+        return [ordered]@{
+            schemaVersion = 1
+            bindingId = $bindingId
+            state = 'unknown'
+            assessments = New-OwnerV2UnknownEvidenceAssessments `
+                -EvidenceUnits $units -BindingId $bindingId
+            diagnostics = @($diagnostics)
+        }
+    }
+    $ruleData = $ruleUnits[0].data
+    $ruleRef = 'rule:' + (Get-OwnerV2Digest -Value ([ordered]@{
+                repositoryId = $ruleData.repositoryId
+                path = $ruleData.path
+                commit = $ruleData.commit
+                section = $ruleData.section
+                hash = $ruleData.hash
+            })).Substring(10)
+    $assessments = [Collections.Generic.List[object]]::new()
+    [void]$assessments.Add([ordered]@{
+            assessmentId = 'binding:' + (Get-OwnerV2Digest -Value "$bindingId|$ruleRef").Substring(10)
+            evidenceUnitIds = @('identity', 'rule')
+            state = 'complete'
+            findings = @()
+        })
+    $count = 0
+    foreach ($file in $files) {
+        $id = [string]$file.unitId
+        $data = $file.data
+        $path = [string](Get-OwnerV2Member -Value $data -Name path)
+        $evidenceIds = @('identity', 'rule', $id)
+        $spans = if ($data -is [Collections.IDictionary]) {
+            @(Get-OwnerV2Member -Value $data -Name spans)
+        }
+        else { @() }
+        if ([string]$file.state -cne 'complete' -or
+            $data -isnot [Collections.IDictionary] -or
+            $data.content -isnot [string] -or
+            [string]::IsNullOrWhiteSpace($path) -or
+            ($path.EndsWith('.cs', [StringComparison]::OrdinalIgnoreCase) -and
+                ($spans.Count -eq 0 -or
+                    @($spans | Where-Object { [string]$_.state -cne 'complete' }).Count -gt 0))) {
+            [void]$assessments.Add([ordered]@{
+                    assessmentId = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$id").Substring(10)
+                    evidenceUnitIds = $evidenceIds
+                    state = 'unknown'
+                    data = [ordered]@{
+                        state = 'uncovered'
+                        reason = 'file-evidence-unavailable'
+                        constructRef = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$id").Substring(10)
+                    }
+                    findings = @()
+                })
+            continue
+        }
+        $constructs = @()
+        if ($path.EndsWith('.cs', [StringComparison]::OrdinalIgnoreCase)) {
+            $constructs = @(Get-TestClassCoverageConstructs -Content ([string]$data.content) `
+                -Spans $spans -Path $path)
+        }
+        if ($count + $constructs.Count -gt $Limits.MaximumSemanticUnits) {
+            Add-OwnerV2Diagnostic -Diagnostics $diagnostics -Limits $Limits `
+                -Code 'coverage-construct-cap-exhausted' `
+                -Message 'Changed test classes exceed the bounded construct capacity.' -UnitId $id
+            [void]$assessments.Add([ordered]@{
+                    assessmentId = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$id").Substring(10)
+                    evidenceUnitIds = $evidenceIds
+                    state = 'unknown'
+                    data = [ordered]@{
+                        state = 'uncovered'
+                        reason = 'coverage-construct-cap-exhausted'
+                        constructRef = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$id").Substring(10)
+                    }
+                    findings = @()
+                })
+            continue
+        }
+        $count += $constructs.Count
+        if ($constructs.Count -eq 0) {
+            [void]$assessments.Add([ordered]@{
+                    assessmentId = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$id").Substring(10)
+                    evidenceUnitIds = $evidenceIds
+                    state = 'complete'
+                    findings = @()
+                })
+        }
+        foreach ($construct in $constructs) {
+            $material = [ordered]@{
+                bindingId = $bindingId
+                evidenceDigest = $evidenceDigest
+                capabilityId = $script:TestClassCoverageCapability
+                capabilityDigest = $CapabilityDigest
+                ruleRef = $ruleRef
+                evidenceUnitId = $id
+                path = $path
+                name = [string]$construct.name
+                startLine = [int]$construct.startLine
+                declarationLine = [int]$construct.declarationLine
+                endLine = [int]$construct.endLine
+                recognized = [bool]$construct.recognized
+                hasExclude = [bool]$construct.hasExclude
+            }
+            $digest = (Get-OwnerV2Digest -Value $material).Substring(10)
+            $constructRef = "construct:$digest"
+            $assessmentId = "class:n:$digest"
+            $resolved = [bool]$construct.recognized -and
+                -not [string]::IsNullOrWhiteSpace([string]$construct.name) -and
+                [int]$construct.declarationLine -ge 1
+            $state = if (-not $resolved) { 'unknown' }
+            elseif ([bool]$construct.hasExclude) { 'compliant' }
+            else { 'violation' }
+            $finding = @()
+            if ($state -ceq 'violation') {
+                $finding = @([ordered]@{
+                        findingId = 'coverage-v2:' + (Get-OwnerV2Digest -Value ([ordered]@{
+                                    bindingId = $bindingId
+                                    capabilityId = $script:TestClassCoverageCapability
+                                    ruleRef = $ruleRef
+                                    constructRef = $constructRef
+                                    disposition = 'violation'
+                                })).Substring(10)
+                        summary = 'Changed MSTest test class lacks a class-level coverage exclusion.'
+                        data = [ordered]@{
+                            disposition = 'violation'
+                            eligibility = 'changed-mstest-class'
+                            capabilityId = $script:TestClassCoverageCapability
+                            bindingId = $bindingId
+                            evidenceDigest = $evidenceDigest
+                            ruleRef = $ruleRef
+                            constructRef = $constructRef
+                            groupRef = $assessmentId
+                            headCommit = [string]$identityUnits[0].data.sourceCommit
+                            anchor = [ordered]@{
+                                path = $path
+                                line = [int]$construct.declarationLine
+                                symbol = [string]$construct.name
+                            }
+                        }
+                    })
+            }
+            [void]$assessments.Add([ordered]@{
+                    assessmentId = $assessmentId
+                    evidenceUnitIds = $evidenceIds
+                    state = $(if ($state -ceq 'unknown') { 'unknown' } else { 'complete' })
+                    data = $(if ($state -ceq 'violation') { $null } else {
+                            [ordered]@{
+                                state = $state
+                                reason = [string]$construct.reason
+                                constructRef = $constructRef
+                                path = $path
+                                startLine = [int]$construct.startLine
+                                endLine = [int]$construct.endLine
+                                symbol = $(if ($resolved) { [string]$construct.name } else { 'unrecognized' })
+                            }
+                        })
+                    findings = $finding
+                })
+        }
+    }
+    return [ordered]@{
+        schemaVersion = 1
+        bindingId = $bindingId
+        state = $(if (@($assessments | Where-Object { $_.state -ceq 'unknown' }).Count) {
+                'unknown'
+            }
+            else { 'complete' })
+        assessments = @($assessments)
+        diagnostics = @($diagnostics)
+    }
+}
+
+function New-TestClassCoverageCapabilityAdapter {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CapabilityId,
+        [Parameter(Mandatory)][string]$CapabilityDigest,
+        [DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits = (New-OwnerV2CapabilityLimits)
+    )
+    if ($CapabilityId -cne $script:TestClassCoverageCapability -or
+        $CapabilityDigest -cne $script:TestClassCoverageDigest) {
+        throw 'Test-class coverage capability identity or digest is invalid.'
+    }
+    $capturedDigest = $CapabilityDigest
+    $capturedLimits = $Limits
+    $command = Get-Command Invoke-TestClassCoverageCapabilityResponse -CommandType Function
+    return New-OwnerPipelineAdapter -Stage capability `
+        -Name 'test-class-coverage-v1-capability' -Handler {
+        param($context)
+        return & $command -Context $context -CapabilityDigest $capturedDigest `
+            -Limits $capturedLimits
+    }.GetNewClosure()
+}
+
 function ConvertTo-OwnerV2Observation {
     [CmdletBinding()]
     param(
@@ -1698,8 +2143,11 @@ function ConvertTo-OwnerV2Observation {
     $identity = Get-OwnerV2Member -Value $identityUnit -Name data
     $rule = Get-OwnerV2Member -Value $ruleUnit -Name data
     $assessments = @(Get-OwnerV2Member -Value $validation -Name assessments)
+    $isCoverage = [string](Get-OwnerV2Member -Value $identity -Name capabilityId) -ceq
+        $script:TestClassCoverageCapability
     $methodAssessments = @($assessments | Where-Object {
-            [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'method:*'
+            [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like
+                $(if ($isCoverage) { 'class:*' } else { 'method:*' })
         })
     $outcomeAssessments = @($assessments | Where-Object {
             $null -ne (Get-OwnerV2Member -Value $_ -Name data)
@@ -1822,13 +2270,15 @@ function ConvertTo-OwnerV2Observation {
     $checkedCount = @($methodAssessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name state) -ceq 'complete'
         }).Count
-    $runnerAttemptCount = @($methodAssessments | Where-Object {
-            [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'method:r:*'
-        }).Count
-    $modelStarts = 'unknown'
+    $runnerAttemptCount = if ($isCoverage) { 0 } else {
+        @($methodAssessments | Where-Object {
+                [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'method:r:*'
+            }).Count
+    }
+    $modelStarts = if ($isCoverage) { 0 } else { 'unknown' }
     $modelStartsReason = 'runner-telemetry-not-requested'
-    $latencyMs = 'unknown'
-    $refusalReason = 'unknown'
+    $latencyMs = if ($isCoverage) { 0 } else { 'unknown' }
+    $refusalReason = if ($isCoverage) { 'not-applicable' } else { 'unknown' }
     if ($null -ne $Runner) {
         Test-OwnerV2Runner -Runner $Runner
         if ($null -eq $Runner.PSObject.Properties['TelemetryProvider']) {
@@ -1877,7 +2327,7 @@ function ConvertTo-OwnerV2Observation {
     }
     $uncoveredCount = @($sortedOutcomes | Where-Object state -CEQ 'uncovered').Count
     $pipelineState = [string](Get-OwnerV2Member -Value $PipelineResult -Name state)
-    # Class assessments are advisory-only; completion reflects eligible methods and coverage.
+    # Owner class assessments remain advisory; coverage assesses changed classes independently.
     $completed = $pipelineState -cne 'failed' -and
         $unknownCount -eq 0 -and $uncoveredCount -eq 0
     $diagnostics = @(Get-OwnerV2Member -Value $PipelineResult -Name diagnostics)
@@ -1999,8 +2449,11 @@ function ConvertTo-OwnerV2Observation {
 Export-ModuleMember -Function @(
     'ConvertTo-OwnerV2Observation',
     'Format-OwnerV1WriterComment',
+    'Format-TestClassCoverageComment',
     'Get-OwnerV1WriterMarkerKey',
+    'Get-TestClassCoverageMarkerKey',
     'New-OwnerSemanticRunner',
+    'New-TestClassCoverageCapabilityAdapter',
     'New-OwnerV2CapabilityAdapter',
     'New-OwnerV2CapabilityLimits',
     'Resolve-OwnerV2DiscussionReconciliation'

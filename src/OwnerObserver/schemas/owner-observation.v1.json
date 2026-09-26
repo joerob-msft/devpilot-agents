@@ -185,7 +185,7 @@
           "semanticKey": { "oneOf": [{ "const": "unknown" }, { "type": "string", "pattern": "^v1:sha256:[0-9a-f]{64}$" }] },
           "providerMarker": { "$ref": "#/$defs/providerMarker" },
           "disposition": { "const": "unknown" },
-          "state": { "enum": ["unknown", "advisory", "uncovered", "notEligible"] },
+          "state": { "enum": ["unknown", "advisory", "uncovered", "notEligible", "compliant"] },
           "reason": { "$ref": "#/$defs/text" },
           "ruleRef": { "$ref": "#/$defs/knownText" },
           "constructRef": { "$ref": "#/$defs/knownText" },
@@ -224,6 +224,7 @@
             "noOp": { "$ref": "#/$defs/countOrUnknown" },
             "wouldCreate": { "$ref": "#/$defs/countOrUnknown" },
             "wouldUpdate": { "$ref": "#/$defs/countOrUnknown" },
+            "humanCovered": { "$ref": "#/$defs/countOrUnknown" },
             "unknown": { "$ref": "#/$defs/countOrUnknown" }
           }
         }
@@ -284,7 +285,7 @@
       "additionalProperties": false,
       "required": ["classification", "reason", "bodySha256", "discussionSha256", "thread"],
       "properties": {
-        "classification": { "enum": ["wouldCreate", "wouldUpdate", "noOp", "unknown"] },
+        "classification": { "enum": ["wouldCreate", "wouldUpdate", "noOp", "humanCovered", "unknown"] },
         "reason": {
           "type": "string",
           "minLength": 1,

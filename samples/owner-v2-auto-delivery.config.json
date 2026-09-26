@@ -1,3 +1,4 @@
 {
-  "autoCreateOwnerComments": false
+  "autoCreateOwnerComments": false,
+  "autoCreateCoverageComments": false
 }
