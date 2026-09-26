@@ -5,9 +5,13 @@
     Runs a bounded read-only active PR intake manually.
 .DESCRIPTION
     Does not schedule execution, evaluate rules automatically, or post comments.
-    Writes immutable private cohort generations and an atomic latest snapshot.
+    Without -Run or with enabled=false, only validates and returns a disabled
+    summary without ADO requests or durable writes. Explicit enabled -Run
+    writes immutable private cohort generations and an atomic latest snapshot.
     The CLI's GET-only change listing has no reliable changed-line total:
     selected heads remain unknown with the changed-line-counts capability unmet.
+    ADO PR listing has no atomic snapshot token or guaranteed totalCount; intake
+    reconciles two full bounded passes but cannot guarantee an atomic snapshot.
 #>
 [CmdletBinding()]
 param(

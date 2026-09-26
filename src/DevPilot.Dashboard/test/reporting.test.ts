@@ -785,7 +785,7 @@ test("rules registry separates source, deployment, enablement, evaluation and ve
       now: () => Date.parse("2026-09-24T21:05:00Z"),
       taskReader: async () => healthyTask,
     }).read();
-    assert.equal(REPORTING_SECTIONS.at(-1), "rules");
+    assert.deepEqual(REPORTING_SECTIONS.slice(-2), ["rules", "intake"]);
     const rules = snapshot.rules ?? [];
     assert.deepEqual(rules.map((rule) => rule.id), [
       "mstest-owner", "synthetic-relation-rule-v1", "bpm-test-class-coverage@1",

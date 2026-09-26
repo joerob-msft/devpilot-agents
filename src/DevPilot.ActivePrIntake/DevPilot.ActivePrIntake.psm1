@@ -127,7 +127,7 @@ function Get-IntakePass {
         if ($seen.Count -gt [int]$Config.limits.maxPullRequests) { throw 'pr-budget' }
         $offset += $raw.items.Count
         if ($null -ne $total -and $offset -gt $total) { throw 'mutable-page' }
-        if ($raw.items.Count -lt $size) {
+        if ($raw.items.Count -eq 0) {
             if ($duplicates -gt 0 -and $null -eq $total) { throw 'missing-page' }
             if ($null -ne $total -and ($offset -ne $total -or $seen.Count -ne $total)) {
                 throw 'missing-page'
@@ -376,6 +376,111 @@ function Get-IntakeRuleIdentity {
         })
 }
 
+function Test-IntakeStateRootReadOnly {
+    param([string]$Path, [string]$RepositoryRoot)
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not [IO.Path]::IsPathFullyQualified($Path)) {
+        throw 'Durable state root must be an absolute path.'
+    }
+    $root = [IO.Path]::GetFullPath($Path)
+    $repository = [IO.Path]::GetFullPath($RepositoryRoot)
+    $relative = [IO.Path]::GetRelativePath($repository, $root)
+    if ($relative -eq '.' -or
+        ($relative -ne '..' -and
+            -not $relative.StartsWith("..$([IO.Path]::DirectorySeparatorChar)") -and
+            -not [IO.Path]::IsPathFullyQualified($relative))) {
+        throw 'Durable state root must be outside the repository.'
+    }
+    $candidate = $root
+    while ($candidate) {
+        $item = Get-Item -LiteralPath $candidate -Force `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $item) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'Durable state root path contains a link.'
+            }
+            if ($candidate -eq $root) {
+                [void](Resolve-AgentTrustedRoot -Path $root -Kind durable-state `
+                        -RepositoryRoot $repository)
+            }
+        }
+        $parent = [IO.Path]::GetDirectoryName($candidate)
+        if (-not $parent -or $parent -eq $candidate) { break }
+        $candidate = $parent
+    }
+    return $root
+}
+
+function New-IntakeDisabledSummary {
+    param([Collections.IDictionary]$Config)
+    $rules = @($Config.rules | ForEach-Object {
+            [ordered]@{
+                capabilityId = [string]$_.capability
+                ruleId = [string]$_.id
+                discovered = $null
+                eligible = $null
+                evaluated = 0
+                skipped = 0
+                error = 0
+                pending = 0
+                gaps = @('default-off', 'inventory-unknown')
+            }
+        })
+    return [ordered]@{
+        schemaVersion = 1
+        kind = 'active-pr-intake-cohort'
+        generation = $null
+        generationOrdinal = $null
+        generationFile = $null
+        createdAtUtc = [DateTime]::UtcNow.ToString('o')
+        observedUtc = [DateTime]::UtcNow.ToString('o')
+        binding = [ordered]@{
+            organization = [string]$Config.organization
+            projectId = ([string]$Config.projectId).ToLowerInvariant()
+            repositoryId = ([string]$Config.repositoryId).ToLowerInvariant()
+            configDigest = Get-IntakeDigest $Config
+        }
+        mode = 'dry-run-read-only'
+        writerEligible = $false
+        autoPost = $false
+        state = 'disabled'
+        populationKnown = $false
+        inventory = [ordered]@{
+            state = 'unknown'
+            consistency = 'two-pass-reconciled-no-atomic-snapshot'
+            active = $null
+            discovered = $null
+            eligible = $null
+            excludedOtherTargets = $null
+            nonDraftExcludedOtherTargets = $null
+            draft = $null
+            nonDraft = $null
+            byTargetRef = $null
+            gaps = @('default-off')
+        }
+        denominators = [ordered]@{
+            active = 0; nonDraft = 0; draft = 0; eligible = 0
+            outOfPolicy = 0; byTargetRef = @{}
+        }
+        counts = [ordered]@{
+            discovered = 0; attempted = 0; evaluated = 0; evaluatedRules = 0
+            skipped = 0; error = 0; deferred = 0
+        }
+        gaps = @('default-off', 'inventory-unknown')
+        gapCounts = [ordered]@{
+            enumerationUnknown = 0; duplicateEntries = 0; deferred = 0
+            unknownHeads = 0; unknownRules = 0; staleRules = 0; drift = 0
+        }
+        pages = [ordered]@{ first = 0; second = 0 }
+        cursor = [ordered]@{ nextPullRequestId = $null }
+        heads = @()
+        rules = $rules
+        unmetCapabilities = @()
+        reasonCodes = @('default-off')
+        readCount = 0
+    }
+}
+
 function Invoke-ActivePrIntake {
     [CmdletBinding()]
     param(
@@ -386,6 +491,11 @@ function Invoke-ActivePrIntake {
         [switch]$Run
     )
     Assert-IntakeConfig $Config
+    $StateRoot = Test-IntakeStateRootReadOnly -Path $StateRoot `
+        -RepositoryRoot $RepositoryRoot
+    if (-not $Run -or -not $Config.enabled) {
+        return New-IntakeDisabledSummary -Config $Config
+    }
     $root = Resolve-AgentTrustedRoot -Path $StateRoot -Kind durable-state `
         -RepositoryRoot $RepositoryRoot -Create
     $root = Resolve-AgentTrustedRoot -Path (Join-Path $root 'active-pr-intake-v1') `
@@ -456,6 +566,7 @@ function Invoke-ActivePrIntake {
             populationKnown = $false
             inventory = [ordered]@{
                 state = 'unknown'
+                consistency = 'two-pass-reconciled-no-atomic-snapshot'
                 active = $null
                 discovered = $null
                 eligible = $null
@@ -483,12 +594,7 @@ function Invoke-ActivePrIntake {
         $heads = [Collections.Generic.List[object]]::new()
         $reads = 0
         $clock = [Diagnostics.Stopwatch]::StartNew()
-        if (-not $Run -or -not $Config.enabled) {
-            $envelope.state = 'disabled'
-            [void]$reasons.Add('default-off')
-        }
-        else {
-            try {
+        try {
                 $identity = Invoke-IntakeRead $Provider Identity @{} $Config ([ref]$reads) $clock
                 if ([string]$identity.id -ine [string]$Config.expectedAccount.id -or
                     [string]$identity.uniqueName -ine [string]$Config.expectedAccount.uniqueName) {
@@ -508,6 +614,7 @@ function Invoke-ActivePrIntake {
                 }
                 $envelope.populationKnown = $true
                 $envelope.inventory.state = 'complete'
+                $envelope.inventory.gaps = @('no-atomic-snapshot-token')
                 $ids = @($first.seen.Keys | ForEach-Object { [int]$_ } | Sort-Object)
                 $envelope.denominators.active = $ids.Count
                 foreach ($id in $ids) {
@@ -544,7 +651,7 @@ function Invoke-ActivePrIntake {
                 $envelope.inventory.nonDraft = $envelope.denominators.nonDraft
                 $envelope.inventory.byTargetRef = $envelope.denominators.byTargetRef
                 if ($envelope.gaps.duplicateEntries -gt 0) {
-                    $envelope.inventory.gaps = @('duplicate-list-entries-reconciled')
+                    $envelope.inventory.gaps += 'duplicate-list-entries-reconciled'
                 }
                 $eligible = @($ids | Where-Object {
                         $item = $first.seen[[string]$_].value
@@ -710,7 +817,8 @@ function Invoke-ActivePrIntake {
                         catch {
                             $reason = [string]$_.Exception.Message
                             if ($reason -cnotin @('invalid-head', 'head-drift', 'file-budget',
-                                    'line-budget', 'line-count-unavailable', 'invalid-discussions',
+                                    'line-budget', 'line-count-unavailable',
+                                    'change-list-truncated', 'change-page-budget', 'invalid-discussions',
                                     'mutable-discussions', 'comment-budget', 'invalid-evaluator',
                                     'invalid-observation', 'read-budget', 'time-budget')) {
                                 $reason = 'provider-inaccessible'
@@ -753,23 +861,20 @@ function Invoke-ActivePrIntake {
                     $envelope.gaps.staleRules -gt 0) {
                     'partial'
                 } else { 'enumerated' }
-            }
-            catch {
-                $reason = [string]$_.Exception.Message
-                if ($reason -cnotin @('account-mismatch', 'invalid-page', 'mutable-page',
-                        'missing-page', 'page-budget', 'pr-budget', 'read-budget',
-                        'time-budget')) { $reason = 'page-inaccessible' }
-                $envelope.gaps.enumerationUnknown = 1
-                $envelope.counts.error = 1
-                $envelope.state = 'unknown'
-                [void]$reasons.Add($reason)
-            }
+        }
+        catch {
+            $reason = [string]$_.Exception.Message
+            if ($reason -cnotin @('account-mismatch', 'invalid-page', 'mutable-page',
+                    'missing-page', 'page-budget', 'pr-budget', 'read-budget',
+                    'time-budget')) { $reason = 'page-inaccessible' }
+            $envelope.gaps.enumerationUnknown = 1
+            $envelope.counts.error = 1
+            $envelope.state = 'unknown'
+            [void]$reasons.Add($reason)
         }
         $envelope.reasonCodes = @($reasons)
         if ($envelope.inventory.state -ceq 'unknown') {
-            $envelope.inventory.gaps = if ($envelope.state -ceq 'disabled') {
-                @('default-off')
-            } else { @($reasons) }
+            $envelope.inventory.gaps = @($reasons)
         }
         foreach ($head in $heads) {
             $head.sourceCommit = if ($head.declaration) {
@@ -916,9 +1021,14 @@ function New-ActivePrAzureDevOpsProvider {
     $repo = [string]$Config.repositoryId
     $maxFiles = [int]$Config.limits.maxChangedFiles
     $maxThreads = [int]$Config.limits.maxThreads
+    $parseNumber = ${function:Assert-IntakeNumber}
+    $readCeiling = [int]$Config.limits.maxReads
+    $transportReads = [pscustomobject]@{ Count = 0 }
     $invoke = {
         param([string]$Area, [string]$Resource, [string[]]$Route,
             [string[]]$Query, [DateTime]$Deadline)
+        if ($transportReads.Count -ge $readCeiling) { throw 'read-budget' }
+        $transportReads.Count++
         $argv = @('devops', 'invoke', '--organization', $org, '--area', $Area,
             '--resource', $Resource, '--http-method', 'GET', '--api-version', '7.1',
             '-o', 'json', '--only-show-errors')
@@ -1077,18 +1187,69 @@ function New-ActivePrAzureDevOpsProvider {
             Changes {
                 $id = [int]$Request.pullRequestId
                 $iteration = [int]$Request.iterationId
-                $r = & $invoke 'git' 'pullRequestIterationChanges' @(
-                    "project=$project", "repositoryId=$repo",
-                    "pullRequestId=$id", "iterationId=$iteration") @(
-                    "`$top=$($maxFiles + 1)", '$compareTo=0') $deadline
-                if ($r['changeEntries'] -isnot [array]) { throw 'change-list-truncated' }
-                $entries = @($r.changeEntries)
-                if ($entries.Count -gt $maxFiles -or
-                    ($null -ne $r['nextSkip'] -and $r['nextSkip'] -gt 0)) {
-                    throw 'change-list-truncated'
+                $skip = 0
+                $seenChanges = [Collections.Generic.HashSet[int]]::new()
+                $declaredTotal = $null
+                $pageSize = [Math]::Min(100, $maxFiles + 1)
+                $complete = $false
+                for ($page = 0; $page -lt [int]$Config.limits.maxPages; $page++) {
+                    $r = & $invoke 'git' 'pullRequestIterationChanges' @(
+                        "project=$project", "repositoryId=$repo",
+                        "pullRequestId=$id", "iterationId=$iteration") @(
+                        "`$top=$pageSize", "`$skip=$skip", '$compareTo=0') $deadline
+                    if ($r['changeEntries'] -isnot [array]) {
+                        throw 'change-list-truncated'
+                    }
+                    $entries = @($r.changeEntries)
+                    if ($entries.Count -gt $pageSize) { throw 'change-list-truncated' }
+                    if ($null -ne $r['count'] -and
+                        (& $parseNumber $r['count'] changeCount 0 $pageSize) -ne
+                        $entries.Count) { throw 'change-list-truncated' }
+                    if ($null -ne $r['totalCount']) {
+                        $total = & $parseNumber $r['totalCount'] totalChanges 0 100000
+                        if ($null -ne $declaredTotal -and $total -ne $declaredTotal) {
+                            throw 'change-list-truncated'
+                        }
+                        if ($total -gt $maxFiles) { throw 'file-budget' }
+                        $declaredTotal = $total
+                    }
+                    if ($entries.Count -eq 0) {
+                        if (($null -ne $declaredTotal -and
+                                $seenChanges.Count -ne $declaredTotal) -or
+                            ($null -ne $r['nextSkip'] -and
+                                (& $parseNumber $r['nextSkip'] nextSkip 0 100000) -gt
+                                $skip)) {
+                            throw 'change-list-truncated'
+                        }
+                        $complete = $true
+                        break
+                    }
+                    foreach ($entry in $entries) {
+                        if ($entry -isnot [Collections.IDictionary] -or
+                            $null -eq $entry['changeTrackingId']) {
+                            throw 'change-list-truncated'
+                        }
+                        $trackingId = & $parseNumber $entry['changeTrackingId'] `
+                            changeTrackingId 1 ([int]::MaxValue)
+                        if (-not $seenChanges.Add($trackingId)) {
+                            throw 'change-list-truncated'
+                        }
+                    }
+                    if ($seenChanges.Count -gt $maxFiles) { throw 'file-budget' }
+                    $next = $skip + $entries.Count
+                    if ($null -ne $r['nextSkip']) {
+                        $nextSkip = & $parseNumber $r['nextSkip'] nextSkip 0 100000
+                        if ($nextSkip -ne 0 -and $nextSkip -ne $next) {
+                            throw 'change-list-truncated'
+                        }
+                    }
+                    if ($null -ne $declaredTotal -and $seenChanges.Count -gt
+                        $declaredTotal) { throw 'change-list-truncated' }
+                    $skip = $next
                 }
+                if (-not $complete) { throw 'change-page-budget' }
                 # ADO iteration changes have no reliable changed-line total. Do not fetch source.
-                return @{ changedFiles = $entries.Count; changedLines = $null }
+                return @{ changedFiles = $seenChanges.Count; changedLines = $null }
             }
             Discussions {
                 $id = [int]$Request.pullRequestId

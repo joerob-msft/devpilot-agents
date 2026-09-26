@@ -289,7 +289,9 @@ Run the optional adapter manually with
 `tools\Invoke-ActivePrIntake.ps1 -ConfigPath <private-config> -StateRoot <private-state> -Run`
 after copying `samples\active-pr-intake.config.json` outside this repository,
 pinning the organization/repository/reviewer identity, and deliberately
-enabling it. Without `-Run`, it makes no ADO request. Each run retains an
+enabling it. Without `-Run` or with the config disabled, it validates and
+returns a disabled summary without ADO requests or durable writes. Each
+enabled run retains an
 immutable `active-pr-intake-v1\generations\<generation>.json` and replaces
 only `active-pr-intake-v1\cohort.json` as the latest pointer. Configure the
 dashboard's `roots.intake` to that `active-pr-intake-v1` directory and

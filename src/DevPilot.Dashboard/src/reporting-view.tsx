@@ -11,7 +11,7 @@ import type {
 import type { RuleSummary } from "./rule-registry.js";
 
 export const REPORTING_SECTIONS = [
-  "overview", "runs", "findings", "deliveries", "failures", "relations", "intake", "rules",
+  "overview", "runs", "findings", "deliveries", "failures", "relations", "rules", "intake",
 ] as const;
 export type ReportingSection = (typeof REPORTING_SECTIONS)[number];
 export type ReportingTimeRange = "24h" | "7d" | "30d" | "all";

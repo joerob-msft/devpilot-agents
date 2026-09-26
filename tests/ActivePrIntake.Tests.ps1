@@ -25,7 +25,7 @@ BeforeAll {
         $state = @{ rows = $rows; calls = [Collections.Generic.List[string]]::new()
             drift = 0; failPage = 0; failHead = 0
             reorder = $false; duplicate = $false
-            noTotal = $false
+            noTotal = $false; listCap = 0
             comments = @(); changeLines = 3; headVisits = @{}
             sourceContent = $null
             iteration = 1; commit = 'a' * 40
@@ -40,10 +40,13 @@ BeforeAll {
                 }
                 ListPage {
                     if ($state.failPage -eq $request.skip + 1) { throw 'private provider diagnostic' }
-                    $items = @($state.rows | Select-Object -Skip $request.skip -First $request.top)
+                    $top = if ($state.listCap -gt 0) {
+                        [Math]::Min($request.top, $state.listCap)
+                    } else { $request.top }
+                    $items = @($state.rows | Select-Object -Skip $request.skip -First $top)
                     if ($state.reorder -and $request.pass -eq 2) {
                         $items = @($state.rows[($state.rows.Count - 1)..0] |
-                            Select-Object -Skip $request.skip -First $request.top)
+                            Select-Object -Skip $request.skip -First $top)
                     }
                     if ($state.duplicate -and $request.skip -eq 3) {
                         $items[0] = $state.rows[2]
@@ -116,6 +119,8 @@ Describe 'Active PR read-only intake' {
         $e.inventory.discovered | Should -Be 347
         $e.inventory.eligible | Should -Be 346
         $e.inventory.excludedOtherTargets | Should -Be 1
+        $e.inventory.gaps | Should -Contain 'no-atomic-snapshot-token'
+        $e.gaps | Should -Contain 'no-atomic-snapshot-token'
         $e.heads.Count | Should -Be 347
         @($e.heads | Where-Object pullRequestId -le 227).Count | Should -Be 0
         $e.rules[0].capabilityId | Should -Be $c.config.rules[0].capability
@@ -148,7 +153,14 @@ Describe 'Active PR read-only intake' {
         $c.state.noTotal = $true
         $e = Invoke-IntakeCase $c
         $e.counts.discovered | Should -Be 7
-        $e.pages.first | Should -Be 3
+        $e.pages.first | Should -Be 4
+        $c = New-IntakeCase -Count 7
+        $c.state.noTotal = $true
+        $c.state.listCap = 2
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeTrue
+        $e.counts.discovered | Should -Be 7
+        $e.pages.first | Should -Be 5
     }
     It 'fails closed for duplicate shifting, inaccessible pages and page or PR caps' {
         $c = New-IntakeCase -Count 7
@@ -357,12 +369,60 @@ Describe 'Active PR read-only intake' {
         (Get-Content (Join-Path $c.root 'active-pr-intake-v1\cohort.json') -Raw) |
             Should -Not -Match 'navigation GET/link'
     }
-    It 'defaults off and refuses state inside the repository or a changed account' {
+    It 'is non-mutating without -Run and when disabled, including existing cohorts' {
         $c = New-IntakeCase -Count 1
+        $c.config.enabled = $true
+        $dry = Invoke-ActivePrIntake -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo
+        $dry.state | Should -Be 'disabled'
+        $dry.generation | Should -BeNullOrEmpty
+        $dry.generationFile | Should -BeNullOrEmpty
+        $dry.inventory.discovered | Should -BeNullOrEmpty
+        $dry.readCount | Should -Be 0
+        (Test-Path -LiteralPath $c.root) | Should -BeFalse
+        $scriptPath = Join-Path $repo 'tools\Invoke-ActivePrIntake.ps1'
+        $samplePath = Join-Path $repo 'samples\active-pr-intake.config.json'
+        $wrapper = & pwsh -NoProfile -NonInteractive -File $scriptPath `
+            -ConfigPath $samplePath -StateRoot $c.root `
+            -AzureCliPath 'no-ado-cli-required-for-disabled-summary' |
+            ConvertFrom-Json -AsHashtable
+        $LASTEXITCODE | Should -Be 0
+        $wrapper.state | Should -Be 'disabled'
+        $wrapper.generation | Should -BeNullOrEmpty
+        (Test-Path -LiteralPath $c.root) | Should -BeFalse
+        $active = Invoke-IntakeCase $c
+        $path = Join-Path $c.root 'active-pr-intake-v1\cohort.json'
+        $latestBytes = [IO.File]::ReadAllBytes($path)
+        $generationPath = Join-Path (Join-Path $c.root 'active-pr-intake-v1') `
+            $active.generationFile
+        $immutableBytes = [IO.File]::ReadAllBytes($generationPath)
+        $beforeFiles = @(
+            Get-ChildItem -LiteralPath (Join-Path $c.root 'active-pr-intake-v1') `
+                -Recurse -File | ForEach-Object FullName | Sort-Object
+        )
         $c.config.enabled = $false
         $e = Invoke-IntakeCase $c
         $e.state | Should -Be 'disabled'
         $e.readCount | Should -Be 0
+        $e.generation | Should -BeNullOrEmpty
+        $c.config.enabled = $true
+        $again = Invoke-ActivePrIntake -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo
+        $again.state | Should -Be 'disabled'
+        [Convert]::ToHexString([IO.File]::ReadAllBytes($path)) |
+            Should -Be ([Convert]::ToHexString($latestBytes))
+        [Convert]::ToHexString([IO.File]::ReadAllBytes($generationPath)) |
+            Should -Be ([Convert]::ToHexString($immutableBytes))
+        @(Get-ChildItem -LiteralPath (Join-Path $c.root 'active-pr-intake-v1') `
+                -Recurse -File | ForEach-Object FullName | Sort-Object) |
+            Should -Be $beforeFiles
+        $c = New-IntakeCase -Count 1
+        $c.config.enabled = $false
+        (Invoke-IntakeCase $c).state | Should -Be 'disabled'
+        (Test-Path -LiteralPath $c.root) | Should -BeFalse
+    }
+    It 'refuses state inside the repository or a changed account' {
+        $c = New-IntakeCase -Count 1
         $c.config.enabled = $true
         $c.config.expectedAccount.id = '99999999-9999-9999-9999-999999999999'
         $c.provider = {         param($op,$request)
@@ -374,6 +434,9 @@ Describe 'Active PR read-only intake' {
         $e.reasonCodes | Should -Contain 'account-mismatch'
         { Invoke-ActivePrIntake -Config $c.config -Provider $c.provider `
                 -StateRoot (Join-Path $repo 'state') -RepositoryRoot $repo -Run } |
+            Should -Throw
+        { Invoke-ActivePrIntake -Config $c.config -Provider $c.provider `
+                -StateRoot (Join-Path $repo 'state') -RepositoryRoot $repo } |
             Should -Throw
     }
     It 'refuses to advance a latest snapshot whose immutable generation was changed' {
@@ -389,10 +452,87 @@ Describe 'Active PR read-only intake' {
             -Raw | ConvertFrom-Json
         $latest.generation | Should -Be $old.generation
     }
+    It 'pages server-capped ADO iteration changes to an empty terminator or fails closed' {
+        $c = New-IntakeCase -Count 1
+        New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+        $stub = Join-Path $c.root 'az-paged-changes.ps1'
+        $log = Join-Path $c.root 'az-change-skips.log'
+        @'
+$skipArgument = @($args | Where-Object { $_.StartsWith('$skip=') })
+if ($skipArgument.Count -ne 1) { exit 5 }
+$skip = [int]$skipArgument[0].Substring(6)
+[IO.File]::AppendAllText($env:ACTIVE_PR_INTAKE_CHANGE_LOG, "$skip`n")
+$ids = if ($skip -ge 110) { @() }
+elseif ($env:ACTIVE_PR_INTAKE_CHANGE_MODE -eq 'duplicate' -and $skip -gt 0) {
+    @(1..37)
+}
+else { @(($skip + 1)..([Math]::Min($skip + 37, 110))) }
+$response = @{
+    changeEntries = @($ids | ForEach-Object { @{ changeTrackingId = $_ } })
+    count = $ids.Count
+    nextSkip = if ($ids.Count -eq 0) { 0 } else { $skip + $ids.Count }
+}
+if ($env:ACTIVE_PR_INTAKE_CHANGE_MODE -eq 'wrong-total') {
+    $response.totalCount = 111
+}
+$response | ConvertTo-Json -Depth 8 -Compress
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        $env:ACTIVE_PR_INTAKE_CHANGE_LOG = $log
+        try {
+            $provider = New-ActivePrAzureDevOpsProvider -Config $c.config `
+                -AzureCliPath $stub
+            $changes = & $provider 'Changes' @{
+                pullRequestId = 1; iterationId = 1
+                timeoutMilliseconds = 15000
+            }
+            $changes.changedFiles | Should -Be 110
+            $changes.changedLines | Should -BeNullOrEmpty
+            @(Get-Content -LiteralPath $log) | Should -Be @('0', '37', '74', '110')
+            $env:ACTIVE_PR_INTAKE_CHANGE_MODE = 'duplicate'
+            { & $provider 'Changes' @{
+                    pullRequestId = 1; iterationId = 1
+                    timeoutMilliseconds = 15000
+                } } | Should -Throw 'change-list-truncated'
+            $env:ACTIVE_PR_INTAKE_CHANGE_MODE = 'wrong-total'
+            { & $provider 'Changes' @{
+                    pullRequestId = 1; iterationId = 1
+                    timeoutMilliseconds = 15000
+                } } | Should -Throw 'change-list-truncated'
+            $env:ACTIVE_PR_INTAKE_CHANGE_MODE = ''
+            $c.config.limits.maxPages = 3
+            { & $provider 'Changes' @{
+                    pullRequestId = 1; iterationId = 1
+                    timeoutMilliseconds = 15000
+                } } | Should -Throw 'change-page-budget'
+            $c.config.limits.maxPages = 10
+            $c.config.limits.maxChangedFiles = 109
+            $capped = New-ActivePrAzureDevOpsProvider -Config $c.config `
+                -AzureCliPath $stub
+            { & $capped 'Changes' @{
+                    pullRequestId = 1; iterationId = 1
+                    timeoutMilliseconds = 15000
+                } } | Should -Throw 'file-budget'
+            $c.config.limits.maxChangedFiles = 200
+            $c.config.limits.maxReads = 2
+            $readLimited = New-ActivePrAzureDevOpsProvider -Config $c.config `
+                -AzureCliPath $stub
+            { & $readLimited 'Changes' @{
+                    pullRequestId = 1; iterationId = 1
+                    timeoutMilliseconds = 15000
+                } } | Should -Throw 'read-budget'
+        }
+        finally {
+            Remove-Item Env:\ACTIVE_PR_INTAKE_CHANGE_LOG `
+                -ErrorAction SilentlyContinue
+            Remove-Item Env:\ACTIVE_PR_INTAKE_CHANGE_MODE `
+                -ErrorAction SilentlyContinue
+        }
+    }
     It 'pins Azure CLI transport to GET, organization, project, repository and account' {
         $c = New-IntakeCase -Count 1
         $c.config.enabled = $false
         [void](Invoke-IntakeCase $c)
+        New-Item -ItemType Directory -Path $c.root -Force | Out-Null
         $stub = Join-Path $c.root 'az-read-stub.ps1'
         $log = Join-Path $c.root 'az-requests.log'
         $env:ACTIVE_PR_INTAKE_TEST_LOG = $log
@@ -411,6 +551,8 @@ if ($CliArguments -contains 'connectionData') {
     '{"value":[],"count":0}'
 } elseif ($CliArguments -contains 'pullRequestId=1') {
     '{"pullRequestId":1,"status":"active","isDraft":false,"sourceRefName":"refs/heads/feature","targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}'
+} elseif ($CliArguments -contains '$skip=1') {
+    '{"value":[],"count":0}'
 } else {
     '{"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}],"count":1}'
 }
