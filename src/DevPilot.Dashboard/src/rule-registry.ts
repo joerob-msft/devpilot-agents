@@ -30,6 +30,7 @@ export interface RuleOutcomeCounts {
 
 export interface RuleSummary {
   id: string;
+  sourceRuleId: string | null;
   description: string;
   provenance: string;
   implementationVersion: string;
@@ -73,11 +74,11 @@ export const IMPLEMENTED_RULES: readonly RuleDefinition[] = [
     runChannel: "owner",
   },
   {
-    id: "relation-evidence@1",
+    id: "relation-contextual-review-v1",
     description: "Relation evidence on changed PRs; read-only, never writer eligible.",
     provenance: "Relation service cohort PR 16950415 (operator-reported; installed head must be verified)",
-    implementationVersion: "relation-evidence@1",
-    capabilityId: "relation-evidence@1",
+    implementationVersion: "relation-contextual-review-v1",
+    capabilityId: "relation-contextual-review-v1",
     runChannel: "relation",
   },
   {
@@ -122,7 +123,13 @@ export function projectRuleRegistry(
   const complete = !snapshot.truncated && !snapshot.quarantine.length &&
     !snapshot.diagnostics.length && !blocked;
   const now = Date.parse(snapshot.generatedAtUtc);
-  return IMPLEMENTED_RULES.map((definition) => {
+  const definitions = IMPLEMENTED_RULES.flatMap((definition) => {
+    if (definition.runChannel !== "relation") return [definition];
+    const identities = [...new Set(evidence.filter((item) =>
+      item.capabilityId === definition.capabilityId).map((item) => item.ruleId))].sort();
+    return identities.length ? identities.map((id) => ({ ...definition, id })) : [definition];
+  });
+  return definitions.map((definition) => {
     const gaps: string[] = [];
     if (!toolkitVerified) gaps.push("Installed toolkit head/tree is not verified against the configured pin.");
     if (!complete) gaps.push("Local feeds are missing, malformed, quarantined, or truncated; counts are unknown.");
@@ -133,14 +140,19 @@ export function projectRuleRegistry(
       run.health === "healthy" &&
       (definition.runChannel === "relation" ? run.relationFailed === 0 : run.ownerFailed === 0),
     );
+    const ownerRuleIds = new Set(evidence.filter((item) =>
+      item.capabilityId === definition.capabilityId).map((item) => item.ruleId));
+    const ambiguousOwner = definition.runChannel === "owner" && ownerRuleIds.size > 1;
+    if (ambiguousOwner) gaps.push("Multiple Owner source rule identities share one capability; mapping is ambiguous.");
     const matched = new Map<string, { state: RuleEvidence; run: RunSummary }>();
-    if (toolkitVerified && complete) {
+    if (toolkitVerified && complete && !ambiguousOwner) {
       for (const run of runs) {
         for (const identity of runIdentities(run, definition.runChannel)) {
           const states = evidence.filter((candidate) =>
             candidate.identity === identity && candidate.capabilityId === definition.capabilityId &&
-            (definition.runChannel !== "relation" || candidate.ruleId.length > 0) &&
-            (definition.runChannel === "relation" || candidate.ruleId === definition.id));
+            candidate.ruleId.length > 0 &&
+            (definition.runChannel === "owner" ||
+              candidate.ruleId === definition.id));
           if (states.length !== 1) continue;
           const state = states[0]!;
           if (Date.parse(state.evaluatedUtc) > Date.parse(run.occurredUtc)) continue;
@@ -154,8 +166,9 @@ export function projectRuleRegistry(
     const bound = [...matched.values()];
     const latest = [...bound].sort((a, b) => Date.parse(b.run.occurredUtc) - Date.parse(a.run.occurredUtc))[0];
     if (!latest) gaps.push("No completed observation is bound to a matching pinned run generation.");
-    const evaluatedUtc = latest?.run.occurredUtc ?? null;
-    const fresh = evaluatedUtc !== null && Number.isFinite(now) &&
+    const evaluatedUtc = latest?.state.evaluatedUtc ?? null;
+    const fresh = latest !== undefined && evaluatedUtc !== null && Number.isFinite(now) &&
+      now >= Date.parse(latest.run.occurredUtc) &&
       now >= Date.parse(evaluatedUtc) &&
       now - Date.parse(evaluatedUtc) <= staleAfterMinutes * 60_000;
     if (latest && !fresh) gaps.push("Last bound evaluation is stale or has an invalid/future timestamp.");
@@ -216,6 +229,7 @@ export function projectRuleRegistry(
     }
     return {
       id: definition.id,
+      sourceRuleId: latest?.state.ruleId ?? null,
       description: definition.description,
       provenance: definition.provenance,
       implementationVersion: definition.implementationVersion,

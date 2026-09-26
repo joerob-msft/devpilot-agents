@@ -15,6 +15,9 @@ health, runs, findings, deliveries, failures, read-only relation findings,
 and a searchable **Rules** inventory distinguishing implementation from
 deployment, enablement, evaluation, and publishing. Class-level coverage is
 implemented in PR 174 but not deployed in the reported service cohort.
+The relation rule ID comes from the declaration bound to the current local
+observation, not a hard-coded customer rule name; older relation evidence is
+marked stale even if a later scheduled run reused that state.
 Pass `-ReportingConfigPath`, then press `d`. This reporting plane has no
 provider writes, approvals, task mutations, listener, credential handling, or
 telemetry upload. See

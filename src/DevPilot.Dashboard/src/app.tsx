@@ -3036,7 +3036,7 @@ export function App(props: AppProps) {
         const capability = reportingRows()[reportingSelected()]?.capability;
         if (capability) {
           setReportingSection(key.name === "e" ? "deliveries" :
-            capability === "relation-evidence@1" ? "relations" : "findings");
+            capability === "relation-contextual-review-v1" ? "relations" : "findings");
           setReportingFilters((filters) => ({
             ...filters, timeRange: "all", posting: "all", mode: "all",
             search: `capability:${capability}`,

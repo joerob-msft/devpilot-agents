@@ -600,6 +600,7 @@ test("verified local reporting renders inside the existing dashboard and opens o
     relations: [],
     rules: [{
       id: "mstest-owner",
+      sourceRuleId: "## Claim ownership",
       description: "Changed MSTest methods require Owner.",
       provenance: "Owner cohort PR 17109075; installed head verified locally",
       implementationVersion: "bpm-test-ownership@1",
@@ -679,6 +680,13 @@ test("verified local reporting renders inside the existing dashboard and opens o
     setup.mockInput.pressKey("f");
     await setup.flush();
     assert.match(setup.captureCharFrame(), /\[FINDINGS\]/);
+    assert.match(setup.captureCharFrame(), /capability:bpm-test-ownership@1/);
+    for (let index = 0; index < 4; index++) setup.mockInput.pressTab();
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /\[RULES\]/);
+    setup.mockInput.pressKey("e");
+    await setup.flush();
+    assert.match(setup.captureCharFrame(), /\[DELIVERIES\]/);
     assert.match(setup.captureCharFrame(), /capability:bpm-test-ownership@1/);
     setup.mockInput.pressEscape();
     await setup.flush();

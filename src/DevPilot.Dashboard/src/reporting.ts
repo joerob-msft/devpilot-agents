@@ -1091,7 +1091,7 @@ function findingAnchor(finding: JsonRecord): { path: string; line: number; symbo
   const anchor = asRecord(finding.anchor);
   return {
     path: boundedText(anchor.path ?? finding.path, 1_024),
-    line: safeCount(anchor.line ?? finding.line),
+    line: safeCount(anchor.line ?? anchor.startLine ?? finding.line),
     symbol: boundedText(anchor.symbol ?? finding.symbol, 256),
   };
 }
@@ -1212,18 +1212,36 @@ function projectState(
     const lifecycle = asRecord(observation.lifecycle);
     const recordState = boundedText(state.record?.state, 40);
     const indexState = boundedText(state.indexRecord?.state, 40);
+    const declaredRule = asRecord(state.declaration?.rule);
+    const relationRule = kind === "relation-evidence-observation";
+    const ruleIdentity = boundedText(relationRule ? rule.id : rule.section, 160);
+    const declaredRuleIdentity = boundedText(relationRule ? declaredRule.id : declaredRule.section, 160);
+    const ruleBound = ruleIdentity !== "" && ruleIdentity === declaredRuleIdentity &&
+      (relationRule
+        ? boundedText(rule.digest, 80) !== "" &&
+          boundedText(rule.digest, 80) === boundedText(declaredRule.hash, 80)
+        : boundedText(rule.path, 1_024) !== "" &&
+          boundedText(rule.path, 1_024) === boundedText(declaredRule.path, 1_024) &&
+          boundedText(rule.commit, 40) !== "" &&
+          boundedText(rule.commit, 40) === boundedText(declaredRule.commit, 40));
+    const evidenceCapability = relationRule ? "relation-contextual-review-v1" : capability;
+    const items = asArray(observation.findings).map(asRecord);
+    const findingData = items.map((item) => relationRule && item.data !== undefined
+      ? asRecord(item.data) : item);
+    const ruleFindingsBound = items.every((item) => !relationRule || item.data === undefined ||
+      (boundedText(asRecord(item.data).capabilityId, 160) === capability &&
+        boundedText(asRecord(item.data).ruleId, 160) === ruleIdentity));
     if (resolvedSubject.diagnostic === "" && recordState === "completed" &&
         boundedText(lifecycle.status, 40) === "completed" &&
-        Array.isArray(observation.findings) && updatedUtc &&
+        Array.isArray(observation.findings) && updatedUtc && ruleBound && ruleFindingsBound &&
         ((kind === "owner-observation" && observation.schemaVersion === 2 &&
           ["bpm-test-ownership@1", "bpm-test-class-coverage@1"].includes(capability)) ||
          (kind === "relation-evidence-observation" && observation.schemaVersion === 1 &&
-          capability === "relation-evidence@1"))) {
-      const items = observation.findings.map(asRecord);
+          capability === evidenceCapability))) {
       const ids = items.map((item) => boundedText(item.identity ?? item.findingId, 160));
       const states = items.map((item) => kind === "owner-observation"
         ? boundedText(asRecord(item.reconciliation).classification, 40)
-        : boundedText(item.state, 40));
+        : boundedText(item.data === undefined ? item.state : asRecord(item.data).disposition, 40));
       const valid = ids.every(Boolean) && new Set(ids).size === ids.length &&
         states.every((value) => kind === "owner-observation"
           ? ["wouldCreate", "wouldUpdate", "noOp", "humanCovered", "unknown"].includes(value)
@@ -1231,9 +1249,10 @@ function projectState(
       if (valid) {
         evidence.push({
           identity: state.identity, capabilityId: capability,
-          ruleId: boundedText(rule.id ?? rule.section, 160),
+          ruleId: ruleIdentity,
           pullRequestId, evaluatedUtc: updatedUtc, findingIds: ids,
-          findings: items.filter((item) => boundedText(item.disposition ?? item.state, 40) === "violation").length,
+          findings: findingData.filter((item) =>
+            boundedText(item.disposition ?? item.state, 40) === "violation").length,
           noOp: states.filter((value) => value === "noOp").length,
           wouldCreate: states.filter((value) => value === "wouldCreate").length,
           unknown: states.filter((value) => value === "unknown").length,
@@ -1245,6 +1264,13 @@ function projectState(
           message: "Rule observation has malformed or duplicate finding identities/outcomes.",
         });
       }
+    } else if (resolvedSubject.diagnostic === "" && recordState === "completed" &&
+        (kind === "owner-observation" || relationRule) && (!ruleBound || !ruleFindingsBound)) {
+      failures.push({
+        id: `rule-binding:${state.identity}`, category: "drift",
+        occurredUtc: updatedUtc, health: "degraded", pullRequestId, runId: "",
+        message: "Observation rule identity or finding capability is not bound to the durable declaration.",
+      });
     }
     if (resolvedSubject.diagnostic) {
       failures.push({
@@ -1278,11 +1304,15 @@ function projectState(
     if (kind === "relation-evidence-observation") {
       for (const item of asArray(observation.findings)) {
         const finding = asRecord(item);
-        const anchor = findingAnchor(finding);
+        const data = finding.data === undefined ? finding : asRecord(finding.data);
+        const nestedBinding = finding.data === undefined ||
+          (boundedText(data.capabilityId, 160) === capability &&
+            boundedText(data.ruleId, 160) === ruleIdentity);
+        const anchor = findingAnchor(data);
         const links = safeLinks(
           config,
-          resolvedSubject.projectId,
-          resolvedSubject.repositoryId,
+          ruleBound && nestedBinding ? resolvedSubject.projectId : "",
+          ruleBound && nestedBinding ? resolvedSubject.repositoryId : "",
           pullRequestId,
           null,
           null,
@@ -1292,10 +1322,11 @@ function projectState(
         relations.push({
           id: boundedText(finding.identity ?? finding.findingId, 160) || `relation:${state.identity}:${relations.length}`,
           capability, pullRequestId,
-          rule: boundedText(rule.id ?? rule.section ?? rule.path, 256),
-          state: boundedText(finding.state ?? finding.disposition, 80) || "unknown",
+          rule: ruleIdentity,
+          state: ruleBound && nestedBinding
+            ? boundedText(data.state ?? data.disposition, 80) || "unknown" : "unknown",
           ...anchor,
-          reason: boundedText(finding.reason ?? finding.explanation, 240),
+          reason: boundedText(finding.reason, 240),
           updatedUtc,
           writerEligible: false,
           url: links.prUrl,

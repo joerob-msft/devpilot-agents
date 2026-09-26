@@ -145,7 +145,8 @@ The reporting overlay extends the existing OpenTUI application:
   **READ ONLY / NOT WRITER ELIGIBLE**, with a validated PR link when the
   configured project/repository identity matches.
 - **Rules**: source inventory for the MSTest Owner rule (`mstest-owner`),
-  relation evidence (`relation-evidence@1`), and class-level
+  relation evidence (`relation-contextual-review-v1`, with each bound
+  relation rule's actual durable ID shown separately), and class-level
   `[ExcludeFromCodeCoverage]` (`bpm-test-class-coverage@1`). Each row separates
   implemented version/provenance from installed deployment, task enablement,
   bound execution generation/time, configured automatic authorization, and
@@ -153,7 +154,11 @@ The reporting overlay extends the existing OpenTUI application:
   Owner and relation have operator-reported live cohorts (PR 17109075 and
   PR 16950415), but their **verified** status requires the configured toolkit
   head/tree and a matching completed composite scheduled-run record and durable
-  observation. PR 174 implements class coverage at
+  observation. The Owner section/path/commit must match its declaration; a
+  relation observation must match the declaration's rule ID and digest and each
+  nested finding's rule/capability. Multiple Owner source-rule identities
+  sharing the capability remain ambiguous, not combined under one row. PR 174
+  implements class coverage at
   `588c0045e24542d10a76bbfadc6e6d1aa2c4c528`, but that code is **not
   deployed** to the reported PR 173-pinned dashboard/service cohort; a green
   PR is not deployment evidence. Class auto-post is not authorized by Owner
@@ -166,6 +171,9 @@ The reporting overlay extends the existing OpenTUI application:
 
   Counts are for distinct completed state identities tied to a successful
   generation whose toolkit head/tree match the configured installation;
+  last evaluated time is the durable observation timestamp, not merely a
+  recent scheduler run that reused an older state. A historical relation
+  observation can therefore be stale even when today's run references it.
   findings are violation observations, while `noOp`, `wouldCreate`, and
   `unknown` are reconciliation outcomes. `refused` and `posted` come from
   verified, bound delivery events, with posted requiring a confirmed provider

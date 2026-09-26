@@ -165,7 +165,7 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
       id: "bpm-test-ownership@1",
       digest: `v1:sha256:${"3".repeat(64)}`,
     },
-    rule: { section: "MSTest Owner", path: "rules/owner.md" },
+    rule: { section: "## Claim ownership", path: "rules/owner.md", commit: "d".repeat(40) },
   };
   await writeJson(join(capabilityRoot, "declarations", `${identity}.json`), ownerDeclaration);
   await writeJson(join(capabilityRoot, "records", `${identity}.json`), {
@@ -190,7 +190,7 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
       targetCommit: "2".repeat(40),
       targetRef: "refs/heads/main",
     },
-    rule: { id: "mstest-owner", path: "rules/owner.md", section: "MSTest Owner" },
+    rule: { path: "rules/owner.md", section: "## Claim ownership", commit: "d".repeat(40) },
     lifecycle: { status: "completed" },
     findings: [{
       identity: findingId,
@@ -222,9 +222,10 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
     head: { sourceCommit: "d".repeat(40) },
     target: { targetCommit: "2".repeat(40), targetRef: "refs/heads/main" },
     capability: {
-      id: "relation-evidence@1",
+      id: "relation-contextual-review-v1",
       digest: `v1:sha256:${"4".repeat(64)}`,
     },
+    rule: { id: "synthetic-relation-rule-v1", hash: `v1:sha256:${"5".repeat(64)}` },
   };
   await writeJson(join(relationRoot, "declarations", `${relationIdentity}.json`), relationDeclaration);
   await writeJson(join(relationRoot, "records", `${relationIdentity}.json`), {
@@ -240,7 +241,7 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
   await writeJson(join(relationRoot, "observations", `${relationIdentity}.json`), {
     schemaVersion: 1,
     kind: "relation-evidence-observation",
-    capability: { id: "relation-evidence@1" },
+    capability: { id: "relation-contextual-review-v1" },
     subject: {
       projectId: "11111111-1111-1111-1111-111111111111",
       repositoryId: "22222222-2222-2222-2222-222222222222",
@@ -249,12 +250,16 @@ async function createFixture(options: { maxHistory?: number } = {}): Promise<Fix
       targetCommit: "2".repeat(40),
       targetRef: "refs/heads/main",
     },
-    rule: { id: "relation-rule" },
+    rule: { id: "synthetic-relation-rule-v1", digest: `v1:sha256:${"5".repeat(64)}` },
     lifecycle: { status: "completed" },
     findings: [{
       findingId: "relation:1",
-      state: "violation",
-      anchor: { path: "src/Widget.cs", line: 8, symbol: "Widget" },
+      data: {
+        capabilityId: "relation-contextual-review-v1",
+        ruleId: "synthetic-relation-rule-v1",
+        disposition: "violation",
+        anchor: { path: "src/Widget.cs", startLine: 8, symbol: "Widget" },
+      },
       reason: "relation mismatch",
       writerEligible: false,
     }],
@@ -551,17 +556,22 @@ test("reporting adapter verifies signed feeds, isolates relation findings, deriv
 test("rules registry separates source, deployment, enablement, evaluation and verified outcomes", async () => {
   const fixture = await createFixture();
   try {
+    const runPath = join(fixture.runnerRoot, "last-run.json");
+    const run = JSON.parse(await readFile(runPath, "utf8")) as JsonRecord;
+    run.completedUtc = "2026-09-24T20:30:00Z";
+    await writeJson(runPath, run);
     const snapshot = await createAdapter(fixture.configPath, {
-      now: () => Date.parse("2026-09-25T00:35:00Z"),
+      now: () => Date.parse("2026-09-24T21:05:00Z"),
       taskReader: async () => healthyTask,
     }).read();
     assert.equal(REPORTING_SECTIONS.at(-1), "rules");
     const rules = snapshot.rules ?? [];
     assert.deepEqual(rules.map((rule) => rule.id), [
-      "mstest-owner", "relation-evidence@1", "bpm-test-class-coverage@1",
+      "mstest-owner", "synthetic-relation-rule-v1", "bpm-test-class-coverage@1",
     ]);
     const owner = rules[0]!;
     assert.equal(owner.implemented, true);
+    assert.equal(owner.sourceRuleId, "## Claim ownership");
     assert.equal(owner.installedHead, "f".repeat(40));
     assert.equal(owner.pinnedHead, "f".repeat(40));
     assert.equal(owner.deployment, "verified");
@@ -582,10 +592,13 @@ test("rules registry separates source, deployment, enablement, evaluation and ve
     assert.match(owner.url ?? "", /discussionId=100/);
     const relation = rules[1]!;
     assert.equal(relation.deployment, "verified");
-    assert.equal(relation.execution, "verified");
+    assert.equal(relation.execution, "stale");
+    assert.equal(relation.sourceRuleId, "synthetic-relation-rule-v1");
+    assert.equal(relation.lastEvaluatedUtc, "2026-09-24T19:00:00.000Z");
     assert.equal(relation.authorization, "not-eligible");
     assert.equal(relation.publishing, "not-eligible");
     assert.equal(relation.counts.finding, 1);
+    assert.equal(relation.counts.unknown, 0);
     assert.match(relation.url ?? "", /pullrequest\/42/);
     const classRule = rules[2]!;
     assert.equal(classRule.deployment, "not-deployed");
@@ -602,14 +615,14 @@ test("rules registry separates source, deployment, enablement, evaluation and ve
     assert.equal(rows.length, 3);
     assert.match(rows[2]!.text.join(" "), /finding unknown.*skipped unknown/);
     assert.equal(filterReportingRows(rows, {
-      timeRange: "24h", search: "rule:relation-evidence outcome:verified",
+      timeRange: "24h", search: "rule:synthetic-relation-rule outcome:verified",
       posting: "all", mode: "all",
     }).length, 1);
     assert.equal(filterReportingRows(rows, {
       timeRange: "all", search: "class-coverage", posting: "all", mode: "all",
     })[0]?.key, "rule:bpm-test-class-coverage@1");
     const taskOff = await createAdapter(fixture.configPath, {
-      now: () => Date.parse("2026-09-25T00:35:00Z"),
+      now: () => Date.parse("2026-09-24T21:05:00Z"),
       taskReader: async () => ({ ...healthyTask, enabled: false }),
     }).read();
     assert.equal(taskOff.rules?.[0]?.authorization, "enabled");
@@ -663,6 +676,70 @@ test("rules fail closed on missing or malformed run, truncated feeds, and stale 
   }
 });
 
+test("rules reject drifted durable source bindings and ambiguous Owner aliases", async () => {
+  const fixture = await createFixture();
+  try {
+    const root = join(fixture.stateRoot, "owner-v2-preview-state", "schema-1", "capabilities");
+    const ownerFile = join(root, "owner", "observations", `${fixture.identity}.json`);
+    const owner = JSON.parse(await readFile(ownerFile, "utf8")) as JsonRecord;
+    asObject(owner.rule).section = "Different rule";
+    await writeJson(ownerFile, owner);
+    const adapter = createAdapter(fixture.configPath, {
+      taskReader: async () => healthyTask,
+    });
+    const changedSection = await adapter.read();
+    assert.ok(changedSection.failures.some((item) => item.id === `rule-binding:${fixture.identity}`));
+    assert.equal(changedSection.rules?.[0]?.counts.finding, null);
+    assert.equal(changedSection.rules?.[0]?.url, null);
+    asObject(owner.rule).section = "## Claim ownership";
+    await writeJson(ownerFile, owner);
+
+    const relationIdentity = "e".repeat(64);
+    const relationFile = join(root, "relation", "observations", `${relationIdentity}.json`);
+    const relation = JSON.parse(await readFile(relationFile, "utf8")) as JsonRecord;
+    asObject(relation.rule).digest = `v1:sha256:${"0".repeat(64)}`;
+    await writeJson(relationFile, relation);
+    const wrongDigest = await adapter.read();
+    assert.ok(wrongDigest.failures.some((item) => item.id === `rule-binding:${relationIdentity}`));
+    assert.equal(wrongDigest.relations[0]?.url, null);
+    assert.equal(wrongDigest.rules?.[1]?.counts.finding, null);
+    asObject(relation.rule).digest = `v1:sha256:${"5".repeat(64)}`;
+    asObject(asObject(asArray(relation.findings)[0]).data).ruleId = "wrong-rule";
+    await writeJson(relationFile, relation);
+    const wrongFindingRule = await adapter.read();
+    assert.ok(wrongFindingRule.failures.some((item) => item.id === `rule-binding:${relationIdentity}`));
+    assert.equal(wrongFindingRule.relations[0]?.url, null);
+
+    asObject(asObject(asArray(relation.findings)[0]).data).ruleId = "synthetic-relation-rule-v1";
+    await writeJson(relationFile, relation);
+    const otherIdentity = "7".repeat(64);
+    const ownerBase = join(root, "owner");
+    const declaration = JSON.parse(await readFile(
+      join(ownerBase, "declarations", `${fixture.identity}.json`), "utf8",
+    )) as JsonRecord;
+    const record = JSON.parse(await readFile(
+      join(ownerBase, "records", `${fixture.identity}.json`), "utf8",
+    )) as JsonRecord;
+    asObject(declaration.rule).section = "Other Owner convention";
+    declaration.stateDigest = `v1:sha256:${otherIdentity}`;
+    asObject(owner.rule).section = "Other Owner convention";
+    record.identity = otherIdentity;
+    record.stateDigest = declaration.stateDigest;
+    await writeJson(join(ownerBase, "declarations", `${otherIdentity}.json`), declaration);
+    await writeJson(join(ownerBase, "records", `${otherIdentity}.json`), record);
+    await writeJson(join(ownerBase, "observations", `${otherIdentity}.json`), owner);
+    await writeJson(ownerFile, {
+      ...owner, rule: { ...asObject(owner.rule), section: "## Claim ownership" },
+    });
+    const ambiguous = await adapter.read();
+    assert.ok(ambiguous.rules?.[0]?.gaps.some((gap) => /ambiguous/.test(gap)));
+    assert.equal(ambiguous.rules?.[0]?.deployment, "unknown");
+    assert.equal(ambiguous.rules?.[0]?.counts.noOp, null);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("coverage events show the bound class and rule while human-covered findings need review", async () => {
   const fixture = await createFixture();
   try {
@@ -684,7 +761,7 @@ test("coverage events show the bound class and rule while human-covered findings
       subject, head,
       target: { targetCommit: "2".repeat(40), targetRef: "refs/heads/main" },
       capability: { id: capabilityId, digest: `v1:sha256:${"6".repeat(64)}` },
-      rule: { section: capabilityId, path: "rules/coverage.md" },
+      rule: { section: capabilityId, path: "rules/coverage.md", commit: head.sourceCommit },
     };
     const coverageRoot = join(fixture.stateRoot, "owner-v2-preview-state", "schema-1", "capabilities", "coverage");
     await writeJson(join(coverageRoot, "declarations", `${identity}.json`), declaration);
@@ -701,7 +778,7 @@ test("coverage events show the bound class and rule while human-covered findings
         headCommit: head.sourceCommit, targetCommit: declaration.target.targetCommit,
         targetRef: declaration.target.targetRef,
       },
-      rule: { section: capabilityId, path: declaration.rule.path },
+      rule: { section: capabilityId, path: declaration.rule.path, commit: head.sourceCommit },
       lifecycle: { status: "completed" },
       effects: { dedupe: { humanCovered: 1 } },
       findings: [{

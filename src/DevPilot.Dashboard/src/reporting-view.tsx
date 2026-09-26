@@ -238,6 +238,7 @@ function ruleRow(rule: RuleSummary): ReportingRow {
   const count = (value: number | null) => value === null ? "unknown" : String(value);
   const text = [
     `${rule.id} | ${rule.capabilityId} | implementation ${rule.implementationVersion}`,
+    `Durable source rule: ${rule.sourceRuleId ?? "unknown"}`,
     rule.description,
     `Provenance: ${rule.provenance}`,
     `Observed service toolkit ${rule.installedHead ?? "unknown"} | configured pin ${rule.pinnedHead ?? "unknown"} (not proof this rule is installed)`,
@@ -253,7 +254,7 @@ function ruleRow(rule: RuleSummary): ReportingRow {
     pullRequestId: rule.scope.length === 1 ? rule.scope[0]! : 0,
     capability: rule.capabilityId,
     health: rule.execution, outcome: rule.deployment,
-    ruleId: rule.id,
+    ruleId: `${rule.id} ${rule.sourceRuleId ?? ""}`,
     posting: rule.counts.posted ? "posted" : rule.counts.wouldCreate ? "pending" : "none",
     mode: "none",
     text, searchText: clean(text.join(" "), 4_096).toLowerCase(),
