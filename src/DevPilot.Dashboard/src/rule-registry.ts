@@ -349,6 +349,7 @@ export function projectRuleRegistry(
           skipped: null, refused: null, posted: null,
         },
         affectedMethodAttributes: null,
+        affectedCalls: null,
         findingIds: [],
         deliveryIds: [],
         url: null,
