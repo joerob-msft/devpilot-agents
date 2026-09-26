@@ -1,8 +1,9 @@
 # Owner reporting dashboard
 
 The existing DevPilot Operations terminal dashboard can project the scheduled
-Owner and relation service and browse the implemented reviewer-rule inventory
-from verified local state. This is a read-only
+Owner and relation service, browse the implemented reviewer-rule inventory
+from verified local state, and optionally display a separate read-only
+active-PR intake snapshot. This is a read-only
 reporting plane: it adds no HTTP listener, provider write endpoint, task
 mutation, approval flow, credential prompt, telemetry upload, or deployment.
 If reporting is unavailable or malformed, the reviewer scheduler continues
@@ -211,10 +212,12 @@ The reporting overlay extends the existing OpenTUI application:
   `unknown` are reconciliation outcomes. `refused` and `posted` come from
   verified, bound delivery events, with posted requiring a confirmed provider
   write; an observation `noOp` is not itself proof of a new post.
-  `skipped`/total PR intake are **unknown** because the current envelopes do
-  not expose a per-rule intake denominator, including already-open non-draft
-  PR heads. Missing, malformed, quarantined, or truncated sources fail closed
-  to unknown counts. A stale generation remains visible as **stale**, not
+  `skipped`/total PR intake from the **existing scheduled envelopes** are
+  **unknown**: they do not expose a per-rule intake denominator, including
+  already-open non-draft PR heads. An independently configured read-only
+  intake snapshot must not turn historical completed observations into
+  current-head evaluations. Missing, malformed, quarantined, or truncated
+  sources fail closed to unknown counts. A stale generation remains visible as **stale**, not
   freshly evaluated. Publishing status is separate from evaluation: relation
   is never writer-eligible, class auto-post is off in the reported cohort,
   and Owner requires the verified signed policy and automatic feed.
@@ -236,9 +239,67 @@ does not interpret an Owner or class run as its evaluation. If a scheduled
 envelope cannot identify this capability's run, `ownerStateIdentities` alone
 is insufficient: generation and counts remain **unknown**. With a verified
 pinned installation but no matching run, the separate rule is shown as
-**not-deployed**, not as successfully evaluated. Active-PR
-intake and its skipped denominator are not emitted. The adapter never scans
-ADO or writes provider comments to fill telemetry gaps.
+**not-deployed**, not as successfully evaluated. Existing scheduled envelopes do not emit active-PR intake or its skipped
+denominator. The reporting adapter never scans ADO or writes provider
+comments to fill telemetry gaps.
+
+## Separate active-PR intake
+
+The optional active-PR intake is a **manual, read-only** inventory of current
+non-draft heads, not an extension of the installed Owner/relation scheduler.
+Its external state root is distinct from the historical Owner v2 observation
+root; it must not overwrite or repair earlier attempts. Inventory includes
+all non-draft active PRs and the exact target ref for each. Initial automatic
+eligibility is limited to `refs/heads/master`; other target refs remain in
+the denominator as explicitly out of policy. Neither an ADO navigation GET
+nor a successful task exit is a completed rule evaluation. In particular,
+a historical relation verdict from an earlier iteration is not a current-head
+verdict after the PR advances; relation remains read-only and never writer
+eligible.
+
+To show one immutable cohort in the dashboard, configure **both**
+`roots.intake` (an absolute private state root) and `files.intakeCohort`
+(the absolute path of that cohort's JSON under the root) in a copy of the
+reporting config. Omitting both keeps the installed dashboard behavior and
+its unknown intake denominator unchanged. An unavailable, foreign, malformed,
+duplicate, truncated, or stale snapshot is labeled unknown; it cannot turn
+another rule's completed observation into intake coverage. The **Intake**
+view shows bounded per-head status and exact target ref, while **Rules**
+shows each configured rule's separate discovered/eligible/evaluated/skipped/
+error/pending counts and generation. New rule names appear as declarations
+with unknown implementation, deployment, and authorization until separately
+verified, never as installed policies. The configured `azureDevOps`
+organization/project/repository identity must match the cohort's binding;
+a foreign repository's denominator is rejected rather than combined.
+
+Until a separate scheduled execution path creates **new**, immutable
+source/target/iteration-bound declarations and completes rule-specific
+observations, the intake's eligible PRs are pending or unknown, not
+evaluated. The intake adds no authorization for Owner, class coverage,
+redundant method coverage, relation, or a future named rule. No service task,
+deployed dashboard configuration, signed policy, or ADO comment permissions
+are changed by this repository layer. ADO offset pages are mutable, not a
+transactional snapshot: reconciliation and per-head rechecks can reject
+observed drift, but an undetected concurrent mutation cannot be represented
+as proof of every current head. A subsequent scheduled evaluator must repeat
+exact-head checks before treating any declaration as current or considering
+create-only delivery.
+
+Run the optional adapter manually with
+`tools\Invoke-ActivePrIntake.ps1 -ConfigPath <private-config> -StateRoot <private-state> -Run`
+after copying `samples\active-pr-intake.config.json` outside this repository,
+pinning the organization/repository/reviewer identity, and deliberately
+enabling it. Without `-Run`, it makes no ADO request. Each run retains an
+immutable `active-pr-intake-v1\generations\<generation>.json` and replaces
+only `active-pr-intake-v1\cohort.json` as the latest pointer. Configure the
+dashboard's `roots.intake` to that `active-pr-intake-v1` directory and
+`files.intakeCohort` to its `cohort.json`; the reader verifies the referenced
+immutable file byte-for-byte. The adapter never calls an ADO write endpoint.
+Its current Azure CLI changes endpoint does **not** supply authoritative
+changed-line counts. Selected heads therefore become explicit
+`line-count-unavailable` unknowns instead of passing changed-line validation
+or claiming evaluation; a future bounded changed-line provider and scheduled
+rule runner remain necessary for at-scale enforcement.
 
 On Windows, `o` uses the system URL association through a fixed PowerShell
 `Start-Process -FilePath $url` launcher. The validated URL is passed only in

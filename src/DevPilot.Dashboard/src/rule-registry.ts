@@ -1,6 +1,7 @@
 import type {
   DeliverySummary, FindingSummary, ReportingSnapshot, RunSummary,
 } from "./reporting.js";
+import type { IntakeRule, IntakeSummary } from "./intake-report.js";
 
 export type RuleStatus = "verified" | "not-deployed" | "disabled" | "stale" | "unknown";
 export type PublishingStatus = "enabled" | "disabled" | "not-eligible" | "unknown";
@@ -38,7 +39,7 @@ export interface RuleSummary {
   installedHead: string | null;
   pinnedHead: string | null;
   capabilityId: string;
-  implemented: true;
+  implemented: boolean;
   deployment: RuleStatus;
   enablement: RuleStatus;
   execution: RuleStatus;
@@ -54,6 +55,7 @@ export interface RuleSummary {
   deliveryIds: string[];
   url: string | null;
   gaps: string[];
+  intake?: IntakeRule & { generation: string; state: IntakeSummary["state"] };
 }
 
 interface RuleDefinition {
@@ -128,7 +130,7 @@ function matchingDelivery(
 
 export function projectRuleRegistry(
   snapshot: Pick<ReportingSnapshot, "generatedAtUtc" | "task" | "toolkit" | "runs" |
-    "findings" | "relations" | "deliveries" | "failures" | "quarantine" | "diagnostics" | "truncated">,
+    "findings" | "relations" | "deliveries" | "failures" | "quarantine" | "diagnostics" | "truncated" | "intake">,
   evidence: RuleEvidence[],
   staleAfterMinutes: number,
   feeds: { automatic: boolean; manual: boolean },
@@ -148,7 +150,7 @@ export function projectRuleRegistry(
       item.capabilityId === definition.capabilityId).map((item) => item.ruleId))].sort();
     return identities.length ? identities.map((id) => ({ ...definition, id })) : [definition];
   });
-  return definitions.map((definition) => {
+  const registry: RuleSummary[] = definitions.map((definition) => {
     const gaps: string[] = [];
     if (!toolkitVerified) gaps.push("Installed toolkit head/tree is not verified against the configured pin.");
     if (!complete) gaps.push("Local feeds are missing, malformed, quarantined, or truncated; counts are unknown.");
@@ -291,4 +293,47 @@ export function projectRuleRegistry(
       gaps,
     };
   });
+  const intake = snapshot.intake;
+  if (intake) {
+    for (const rule of intake.rules) {
+      const match = registry.find((entry) => entry.id === rule.ruleId &&
+        entry.capabilityId === rule.capabilityId);
+      const coverage = { ...rule, generation: intake.generation, state: intake.state };
+      if (match) {
+        match.intake = coverage;
+        continue;
+      }
+      registry.push({
+        id: rule.ruleId,
+        sourceRuleId: null,
+        description: "Declared in read-only intake; implementation and deployment are not verified.",
+        provenance: "Optional local intake declaration, not a signed service policy.",
+        implementationVersion: "unknown",
+        installedHead: null,
+        pinnedHead: null,
+        capabilityId: rule.capabilityId,
+        implemented: false,
+        deployment: "unknown",
+        enablement: "unknown",
+        execution: "unknown",
+        authorization: rule.capabilityId === "relation-contextual-review-v1" ? "not-eligible" : "unknown",
+        publishing: rule.capabilityId === "relation-contextual-review-v1" ? "not-eligible" : "unknown",
+        policyCaps: null,
+        scope: [],
+        lastGeneration: null,
+        lastEvaluatedUtc: null,
+        counts: {
+          finding: null, noOp: null, wouldCreate: null, unknown: null,
+          skipped: null, refused: null, posted: null,
+        },
+        affectedMethodAttributes: null,
+        findingIds: [],
+        deliveryIds: [],
+        url: null,
+        gaps: ["Intake alone is not a completed durable observation or deployment evidence."],
+        intake: coverage,
+      });
+    }
+  }
+  return registry;
 }

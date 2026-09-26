@@ -12,6 +12,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { projectRuleRegistry, type RuleEvidence, type RuleSummary } from "./rule-registry.js";
 import { resolveCurrentRelationLink, type RelationReadJson } from "./relation-link.js";
+import { parseIntakeCohort, type IntakeSummary } from "./intake-report.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -45,11 +46,13 @@ export interface ReportingConfiguration {
     delivery?: string;
     manual?: string;
     runner?: string;
+    intake?: string;
   };
   files: {
     toolkitConfig: string;
     lastRun?: string;
     scheduledLog?: string;
+    intakeCohort?: string;
   };
   expectedToolkit?: {
     head: string;
@@ -233,6 +236,7 @@ export interface ReportingSnapshot {
   failures: FailureSummary[];
   relations: RelationSummary[];
   rules?: RuleSummary[];
+  intake?: IntakeSummary;
   quarantine: QuarantineSummary[];
   diagnostics: string[];
   truncated: boolean;
@@ -428,6 +432,19 @@ function parseBudgets(value: unknown): ReportingBudgets {
   };
 }
 
+function intakeFailureCode(error: unknown): string {
+  if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "intake-file-unavailable";
+  const message = error instanceof Error ? error.message : "";
+  if (/outside configured roots|expected configured root|link or reparse|escaped configured root/i.test(message)) {
+    return "intake-path-untrusted";
+  }
+  if (/budget|exceeds/i.test(message)) return "intake-budget-exhausted";
+  if (error instanceof SyntaxError || /intake|JSON|unsupported/i.test(message)) {
+    return "invalid-intake-cohort";
+  }
+  return "intake-read-failed";
+}
+
 export function parseReportingConfiguration(value: unknown): ReportingConfiguration {
   const raw = asRecord(value);
   if (raw.schemaVersion !== 1 || raw.kind !== "devpilot-owner-reporting-config") {
@@ -469,8 +486,13 @@ export function parseReportingConfiguration(value: unknown): ReportingConfigurat
   const deliveryRoot = optionalAbsolute(roots.delivery, "roots.delivery");
   const manualRoot = optionalAbsolute(roots.manual, "roots.manual");
   const runnerRoot = optionalAbsolute(roots.runner, "roots.runner");
+  const intakeRoot = optionalAbsolute(roots.intake, "roots.intake");
   const lastRun = optionalAbsolute(files.lastRun, "files.lastRun");
   const scheduledLog = optionalAbsolute(files.scheduledLog, "files.scheduledLog");
+  const intakeCohort = optionalAbsolute(files.intakeCohort, "files.intakeCohort");
+  if (Boolean(intakeRoot) !== Boolean(intakeCohort)) {
+    throw new Error("roots.intake and files.intakeCohort must be configured together");
+  }
   const scheduledTaskName = boundedText(raw.scheduledTaskName, 256);
   const scheduledTaskPath = boundedText(raw.scheduledTaskPath, 256);
   if (scheduledTaskName && (
@@ -494,11 +516,13 @@ export function parseReportingConfiguration(value: unknown): ReportingConfigurat
       ...(deliveryRoot ? { delivery: deliveryRoot } : {}),
       ...(manualRoot ? { manual: manualRoot } : {}),
       ...(runnerRoot ? { runner: runnerRoot } : {}),
+      ...(intakeRoot ? { intake: intakeRoot } : {}),
     },
     files: {
       toolkitConfig: ensureAbsolute(files.toolkitConfig, "files.toolkitConfig"),
       ...(lastRun ? { lastRun } : {}),
       ...(scheduledLog ? { scheduledLog } : {}),
+      ...(intakeCohort ? { intakeCohort } : {}),
     },
     ...(expectedToolkit ? { expectedToolkit } : {}),
     ...(azureDevOps ? { azureDevOps } : {}),
@@ -2136,6 +2160,38 @@ export class LocalReportingAdapter {
     const observations = await readStateObservations(context);
     const observationMap = new Map(observations.map((state) => [state.identity, state]));
     const runs = await readRunHistory(context);
+    let intake: IntakeSummary | undefined;
+    if (config.roots.intake && config.files.intakeCohort) {
+      try {
+        const cohortBytes = await readBoundedFile(context, config.files.intakeCohort, config.roots.intake);
+        const cohortValue: unknown = JSON.parse(cohortBytes.toString("utf8"));
+        assertJsonShape(cohortValue);
+        intake = parseIntakeCohort(cohortValue);
+        const immutableBytes = await readBoundedFile(
+          context, join(config.roots.intake, "generations", `${intake.generation}.json`),
+          config.roots.intake,
+        );
+        if (!cohortBytes.equals(immutableBytes)) {
+          throw new Error("intake immutable generation differs from latest snapshot");
+        }
+        if (!config.azureDevOps || !intake.binding ||
+            intake.binding.projectId.toLowerCase() !== config.azureDevOps.projectId.toLowerCase() ||
+            intake.binding.repositoryId.toLowerCase() !== config.azureDevOps.repositoryId.toLowerCase() ||
+            intake.binding.organization.toLowerCase() !== config.azureDevOps.organizationUrl.replace(/\/$/, "").toLowerCase()) {
+          throw new Error("intake repository binding does not match the reporting configuration");
+        }
+        if (now - Date.parse(intake.observedUtc) > config.staleAfterMinutes * 60_000 ||
+            Date.parse(intake.observedUtc) > now) {
+          intake = { ...intake, state: "unknown", gaps: [...intake.gaps, "stale-inventory"] };
+        }
+      } catch (error) {
+        intake = {
+          binding: null, generation: "", observedUtc: "", state: "unknown",
+          discovered: null, eligible: null, excludedOtherTargets: null,
+          heads: [], rules: [], gaps: [intakeFailureCode(error)],
+        };
+      }
+    }
     let policy: JsonRecord | null = null;
     let automaticEvents: SignedPayload[] = [];
     let automaticIntents: SignedPayload[] = [];
@@ -2255,6 +2311,7 @@ export class LocalReportingAdapter {
       deliveries,
       failures,
       relations: projected.relations.slice(0, config.budgets.maxHistory),
+      ...(intake ? { intake } : {}),
       quarantine: context.quarantine.slice(0, config.budgets.maxHistory),
       diagnostics: context.diagnostics.slice(0, 50),
       truncated: context.truncated,
