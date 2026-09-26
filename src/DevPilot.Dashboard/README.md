@@ -18,6 +18,8 @@ implemented in PR 174 but not deployed in the reported service cohort.
 The independent named `Assert.AreEqual` arguments rule (`bpm-named-areequal-arguments@1`)
 is source-implemented, not deployed or evaluated in the pinned service, and
 defaults off; Owner or coverage runs and policies do not establish its status.
+It matches changed C# test-method calls spelled `Assert.AreEqual` with at least
+two arguments syntactically; reporting does not claim resolved MSTest symbols.
 Only a verified rule-specific completed run binds method findings and affected
 call counts (otherwise unknown), and only signed, matching create-only delivery
 events from its separate `named-areequal-v1` audit root and private key can
