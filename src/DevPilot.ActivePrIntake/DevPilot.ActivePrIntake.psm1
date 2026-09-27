@@ -31,7 +31,7 @@ function Assert-IntakeConfig {
     $guidPattern = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
     if ($Config.schemaVersion -ne 1 -or $Config.readOnly -cne $true -or
         $Config.dryRun -cne $true -or $Config.enabled -isnot [bool] -or
-        [string]$Config.organization -cnotmatch '^https://dev\.azure\.com/[A-Za-z0-9_-]+/?$' -or
+        [string]$Config.organization -cnotmatch '^https://(?:dev\.azure\.com/[A-Za-z0-9_-]+|[A-Za-z0-9_-]+\.visualstudio\.com)/?$' -or
         [string]$Config.projectName -cnotmatch '^[\w .-]{1,128}$' -or
         [string]$Config.projectId -cnotmatch $guidPattern -or
         [string]$Config.repositoryId -cnotmatch $guidPattern -or
@@ -46,6 +46,8 @@ function Assert-IntakeConfig {
             @('maxPullRequests', 1, 10000), @('maxHeadsPerRun', 1, 10000),
             @('maxReads', 1, 30000), @('maxSeconds', 1, 3600),
             @('maxChangedFiles', 1, 2000), @('maxChangedLines', 1, 100000),
+            @('maxFileBytes', 1, 1048576), @('maxTotalBytes', 1, 16777216),
+            @('maxDiffCells', 1, 4000000),
             @('maxThreads', 1, 1000), @('maxComments', 1, 10000)
         )) {
         [void](Assert-IntakeNumber $Config.limits[$setting[0]] $setting[0] $setting[1] $setting[2])
@@ -72,12 +74,157 @@ function Invoke-IntakeRead {
     if ($Reads.Value -ge [int]$Config.limits.maxReads) { throw 'read-budget' }
     if ($Clock.Elapsed.TotalSeconds -ge [int]$Config.limits.maxSeconds) { throw 'time-budget' }
     $Reads.Value++
+    $Arguments.remainingReads = [int]$Config.limits.maxReads - $Reads.Value
     $Arguments.timeoutMilliseconds = [Math]::Max(1,
         [int]([int]$Config.limits.maxSeconds * 1000 - $Clock.ElapsedMilliseconds))
     $answer = & $Provider $Operation $Arguments
     if ($Clock.Elapsed.TotalSeconds -ge [int]$Config.limits.maxSeconds) { throw 'time-budget' }
     if ($answer -isnot [Collections.IDictionary]) { throw 'provider-contract' }
+    if ($null -ne $answer['readCount']) {
+        $additional = Assert-IntakeNumber $answer.readCount readCount 0 30000
+        if ($additional -gt $Arguments.remainingReads) { throw 'read-budget' }
+        $Reads.Value += $additional
+    }
     return $answer
+}
+
+function Get-IntakeLineTokens {
+    param([string]$Content)
+    $lines = [Collections.Generic.List[string]]::new()
+    foreach ($match in [regex]::Matches($Content, '[^\r\n]*(?:\r\n|\r|\n|$)')) {
+        if ($match.Length -gt 0) { $lines.Add($match.Value) }
+    }
+    return ,$lines.ToArray()
+}
+
+function Get-IntakeLineDelta {
+    param([string]$Old, [string]$New, [int]$MaxCells, [int]$MaxLines,
+        [DateTime]$Deadline)
+    if ([DateTime]::UtcNow -ge $Deadline) { throw 'time-budget' }
+    $before = Get-IntakeLineTokens $Old
+    $after = Get-IntakeLineTokens $New
+    $n = $before.Count
+    $m = $after.Count
+    if ($n + $m -gt $MaxLines) { throw 'diff-budget' }
+    $prefix = 0
+    while ($prefix -lt [Math]::Min($n, $m) -and
+        [string]::Equals($before[$prefix], $after[$prefix],
+            [StringComparison]::Ordinal)) {
+        if ($prefix % 256 -eq 0 -and [DateTime]::UtcNow -ge $Deadline) {
+            throw 'time-budget'
+        }
+        $prefix++
+    }
+    $suffix = 0
+    while ($n - $suffix -gt $prefix -and $m - $suffix -gt $prefix -and
+        [string]::Equals($before[$n - $suffix - 1], $after[$m - $suffix - 1],
+            [StringComparison]::Ordinal)) {
+        if ($suffix % 256 -eq 0 -and [DateTime]::UtcNow -ge $Deadline) {
+            throw 'time-budget'
+        }
+        $suffix++
+    }
+    $oldCount = $n - $prefix - $suffix
+    $newCount = $m - $prefix - $suffix
+    $cells = [long]($oldCount + 1) * ($newCount + 1)
+    if ($cells -gt $MaxCells) { throw 'diff-budget' }
+    $width = $newCount + 1
+    $table = [int[]]::new([int]$cells)
+    for ($i = $oldCount - 1; $i -ge 0; $i--) {
+        if ([DateTime]::UtcNow -ge $Deadline) { throw 'time-budget' }
+        for ($j = $newCount - 1; $j -ge 0; $j--) {
+            if ($j % 256 -eq 0 -and [DateTime]::UtcNow -ge $Deadline) {
+                throw 'time-budget'
+            }
+            $at = $i * $width + $j
+            $table[$at] = if ([string]::Equals($before[$prefix + $i], $after[$prefix + $j],
+                    [StringComparison]::Ordinal)) {
+                1 + $table[$at + $width + 1]
+            } else {
+                [Math]::Max($table[$at + $width], $table[$at + 1])
+            }
+        }
+    }
+    $spans = [Collections.Generic.List[object]]::new()
+    $i = 0
+    $j = 0
+    $added = 0
+    $deleted = 0
+    $start = 0
+    while ($i -lt $oldCount -or $j -lt $newCount) {
+        if ([DateTime]::UtcNow -ge $Deadline) { throw 'time-budget' }
+        if ($i -lt $oldCount -and $j -lt $newCount -and
+            [string]::Equals($before[$prefix + $i], $after[$prefix + $j],
+                [StringComparison]::Ordinal)) {
+            if ($start -gt 0) {
+                $spans.Add([ordered]@{ startLine = $start; endLine = $prefix + $j })
+                $start = 0
+            }
+            $i++; $j++
+        }
+        elseif ($i -lt $oldCount -and ($j -eq $newCount -or
+                $table[($i + 1) * $width + $j] -ge $table[$i * $width + $j + 1])) {
+            $deleted++; $i++
+        }
+        else {
+            if ($start -eq 0) { $start = $prefix + $j + 1 }
+            $added++; $j++
+        }
+    }
+    if ($start -gt 0) {
+        $spans.Add([ordered]@{ startLine = $start; endLine = $prefix + $j })
+    }
+    return @{ addedLines = $added; deletedLines = $deleted
+        newLineCount = $m; spans = @($spans.ToArray())
+        cells = [int]$cells }
+}
+
+function Assert-IntakeBlob {
+    param([Collections.IDictionary]$Item, [string]$Path, [string]$ObjectId,
+        [int]$MaxBytes)
+    if ([string]$Item.path -cne $Path -or $Item.gitObjectType -cne 'blob' -or
+        $Item['isFolder'] -eq $true -or $Item['isSymLink'] -eq $true -or
+        $Item.contentMetadata -isnot [Collections.IDictionary] -or
+        $Item.contentMetadata['isBinary'] -eq $true -or
+        [string]$Item.contentMetadata.contentType -cnotmatch
+            '^(?:text/[^;\s]+|application/(?:json|xml|javascript|[^/;\s]+\+(?:json|xml)))(?:;\s*charset=[\w-]+)?$' -or
+        $Item.contentMetadata.encoding -notin @(65001, '65001', 1252, '1252') -or
+        $Item.content -isnot [string] -or
+        [string]$Item.objectId -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        [string]$Item.objectId -ine $ObjectId) { throw 'invalid-item' }
+    if ($Item.content -cmatch '[\x00-\x08\x0b\x0c\x0e-\x1f]') {
+        throw 'unsupported-change'
+    }
+    try {
+        $encoding = if ([int]$Item.contentMetadata.encoding -eq 65001) {
+            [Text.UTF8Encoding]::new($false, $true)
+        } else {
+            [Text.Encoding]::GetEncoding(1252, [Text.EncoderFallback]::ExceptionFallback,
+                [Text.DecoderFallback]::ExceptionFallback)
+        }
+        $bytes = $encoding.GetBytes($Item.content)
+    }
+    catch { throw 'invalid-item' }
+    $verified = $false
+    $withBom = $false
+    foreach ($candidate in @($bytes, [byte[]](@(239, 187, 191) + $bytes))) {
+        if ($withBom -and [int]$Item.contentMetadata.encoding -ne 65001) { break }
+        if ($candidate.Length -gt $MaxBytes) { throw 'byte-budget' }
+        $header = [Text.Encoding]::ASCII.GetBytes("blob $($candidate.Length)`0")
+        $payload = [byte[]]::new($header.Length + $candidate.Length)
+        [Array]::Copy($header, $payload, $header.Length)
+        [Array]::Copy($candidate, 0, $payload, $header.Length, $candidate.Length)
+        if ([Convert]::ToHexString([Security.Cryptography.SHA1]::HashData($payload)) -ieq
+            $ObjectId) {
+            $verified = $true
+            break
+        }
+        $withBom = $true
+    }
+    if (-not $verified) { throw 'invalid-item' }
+    return @{ text = if ($withBom) { [string][char]0xfeff + $Item.content } else {
+            $Item.content
+        }; bytes = $candidate.Length }
 }
 
 function Get-IntakePass {
@@ -154,7 +301,8 @@ function Assert-IntakeHead {
         ([string]$Head.sourceRef).Length -gt 512 -or
         ([string]$Head.targetRef).Length -gt 512 -or
         [string]$Head.sourceCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
-        [string]$Head.targetCommit -cnotmatch '^[a-fA-F0-9]{40}$') {
+        [string]$Head.targetCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        [string]$Head.commonCommit -cnotmatch '^[a-fA-F0-9]{40}$') {
         throw 'invalid-head'
     }
     [void](Assert-IntakeNumber $Head.iterationId iterationId 1 ([int]::MaxValue))
@@ -166,6 +314,7 @@ function Assert-IntakeHead {
         targetRef = [string]$Head.targetRef
         sourceCommit = ([string]$Head.sourceCommit).ToLowerInvariant()
         targetCommit = ([string]$Head.targetCommit).ToLowerInvariant()
+        commonCommit = ([string]$Head.commonCommit).ToLowerInvariant()
         iterationId = [int]$Head.iterationId
         status = [string]$Head.status
         isDraft = [bool]$Head.isDraft
@@ -368,6 +517,7 @@ function Get-IntakeRuleIdentity {
             pullRequestId = $Head.pullRequestId
             sourceCommit = $Head.sourceCommit
             targetCommit = $Head.targetCommit
+            commonCommit = $Head.commonCommit
             targetRef = $Head.targetRef
             iterationId = $Head.iterationId
             ruleId = $RuleId
@@ -597,7 +747,8 @@ function Invoke-ActivePrIntake {
         try {
                 $identity = Invoke-IntakeRead $Provider Identity @{} $Config ([ref]$reads) $clock
                 if ([string]$identity.id -ine [string]$Config.expectedAccount.id -or
-                    [string]$identity.uniqueName -ine [string]$Config.expectedAccount.uniqueName) {
+                    [string]$identity.uniqueName -ine [string]$Config.expectedAccount.uniqueName -or
+                    [string]$identity.descriptor -cne [string]$Config.expectedAccount.descriptor) {
                     throw 'account-mismatch'
                 }
                 $first = Get-IntakePass $Provider $Config ([ref]$reads) $clock 1
@@ -688,6 +839,8 @@ function Invoke-ActivePrIntake {
                         state = 'pending'
                         reasonCode = 'not-selected'
                         discussion = $null
+                        lineEvidence = $null
+                        lineEvidenceDigest = $null
                         rules = @($Config.rules | ForEach-Object {
                                 [ordered]@{ id = [string]$_.id; capability = [string]$_.capability
                                     state = 'pending'; reasonCode = 'not-selected'
@@ -745,6 +898,9 @@ function Invoke-ActivePrIntake {
                                 try {
                                 $changes = Invoke-IntakeRead $Provider Changes @{
                                     pullRequestId = $id; iterationId = $before.iterationId
+                                    sourceCommit = $before.sourceCommit
+                                    targetCommit = $before.targetCommit
+                                    commonCommit = $before.commonCommit
                                 } $Config ([ref]$reads) $clock
                                 $files = Assert-IntakeNumber $changes.changedFiles changedFiles 0 100000
                                 if ($files -gt [int]$Config.limits.maxChangedFiles) { throw 'file-budget' }
@@ -753,12 +909,79 @@ function Invoke-ActivePrIntake {
                                     $lines = Assert-IntakeNumber $changes.changedLines changedLines 0 1000000
                                     if ($lines -gt [int]$Config.limits.maxChangedLines) { throw 'line-budget' }
                                 }
+                                $evidence = $null
+                                if ($null -ne $lines) {
+                                    if ($null -eq $changes['files']) {
+                                        throw 'line-count-unavailable'
+                                    }
+                                    if ($changes.files -isnot [array] -or
+                                        $changes.files.Count -ne $files -or
+                                        $changes['baseCommit'] -cne $before.commonCommit) {
+                                        throw 'invalid-change'
+                                    }
+                                    $added = 0
+                                    $deleted = 0
+                                    $seenPaths = [Collections.Generic.HashSet[string]]::new(
+                                        [StringComparer]::Ordinal)
+                                    foreach ($file in $changes.files) {
+                                        if ($file -isnot [Collections.IDictionary] -or
+                                            [string]$file.pathDigest -cnotmatch '^[a-f0-9]{64}$' -or
+                                            -not $seenPaths.Add([string]$file.pathDigest) -or
+                                            $file.spans -isnot [array] -or
+                                            $file.spans.Count -gt [int]$Config.limits.maxChangedLines) {
+                                            throw 'invalid-change'
+                                        }
+                                        $plus = Assert-IntakeNumber $file.addedLines addedLines 0 1000000
+                                        $minus = Assert-IntakeNumber $file.deletedLines deletedLines 0 1000000
+                                        $newCount = Assert-IntakeNumber $file.newLineCount newLineCount 0 1000000
+                                        if ($plus + $minus -eq 0 -or
+                                            [string]$file.changeType -cnotin @(
+                                                'add', 'edit', 'delete', 'rename') -or
+                                            ($file.changeType -ceq 'add' -and $minus -ne 0) -or
+                                            ($file.changeType -ceq 'delete' -and
+                                                ($plus -ne 0 -or $newCount -ne 0)) -or
+                                            ($file.changeType -ceq 'rename' -and
+                                                [string]$file.originalPathDigest -cnotmatch
+                                                '^[a-f0-9]{64}$')) {
+                                            throw 'invalid-change'
+                                        }
+                                        $covered = 0
+                                        $end = 0
+                                        foreach ($span in $file.spans) {
+                                            if ($span -isnot [Collections.IDictionary]) { throw 'invalid-change' }
+                                            $start = Assert-IntakeNumber $span.startLine startLine 1 1000000
+                                            $last = Assert-IntakeNumber $span.endLine endLine $start 1000000
+                                            if ($start -le $end -or $last -gt $newCount) { throw 'invalid-change' }
+                                            $covered += $last - $start + 1
+                                            $end = $last
+                                        }
+                                        if ($covered -ne $plus) { throw 'invalid-change' }
+                                        $added += $plus
+                                        $deleted += $minus
+                                    }
+                                    if ($added + $deleted -ne $lines) { throw 'invalid-change' }
+                                    $evidence = [ordered]@{
+                                        generation = $envelope.generation
+                                        declarationDigest = $entry.declarationDigest
+                                        configDigest = $envelope.binding.configDigest
+                                        baseCommit = $before.commonCommit
+                                        changedFiles = $files
+                                        changedLines = $lines
+                                        addedLines = $added
+                                        deletedLines = $deleted
+                                        files = $changes.files
+                                    }
+                                }
                                 $discussion = Invoke-IntakeRead $Provider Discussions @{
                                     pullRequestId = $id; iterationId = $before.iterationId
                                 } $Config ([ref]$reads) $clock
                                 $entry.discussion = Get-IntakeDiscussionCounts $discussion $Config $before
                                 if ($null -eq $lines) {
                                     throw 'line-count-unavailable'
+                                }
+                                if ($evidence) {
+                                    $entry.lineEvidence = $evidence
+                                    $entry.lineEvidenceDigest = Get-IntakeDigest $evidence
                                 }
                                 $entry.rules = @()
                                 foreach ($rule in $Config.rules) {
@@ -816,15 +1039,21 @@ function Invoke-ActivePrIntake {
                         }
                         catch {
                             $reason = [string]$_.Exception.Message
-                            if ($reason -cnotin @('invalid-head', 'head-drift', 'file-budget',
+                            if ($reason -cnotin @('invalid-head', 'head-inconsistent',
+                                    'head-drift', 'file-budget',
                                     'line-budget', 'line-count-unavailable',
-                                    'change-list-truncated', 'change-page-budget', 'invalid-discussions',
+                                    'change-list-truncated', 'change-page-budget',
+                                    'invalid-discussions',
                                     'mutable-discussions', 'comment-budget', 'invalid-evaluator',
-                                    'invalid-observation', 'read-budget', 'time-budget')) {
+                                    'invalid-observation', 'read-budget', 'time-budget',
+                                    'invalid-change', 'invalid-item', 'byte-budget',
+                                    'diff-budget', 'change-list-truncated', 'unsupported-change')) {
                                 $reason = 'provider-inaccessible'
                             }
                             $entry.state = 'unknown'
                             $entry.reasonCode = $reason
+                            $entry.lineEvidence = $null
+                            $entry.lineEvidenceDigest = $null
                             $entry.rules = @($Config.rules | ForEach-Object {
                                     [ordered]@{ id = [string]$_.id; capability = [string]$_.capability
                                         state = 'unknown'; reasonCode = $reason
@@ -907,7 +1136,9 @@ function Invoke-ActivePrIntake {
             }
         }
         $envelope.heads = @($heads | Sort-Object { [int]$_['pullRequestId'] })
-        if (@($envelope.heads | Where-Object reasonCode -eq 'line-count-unavailable').Count -gt 0) {
+        if (@($envelope.heads | Where-Object {
+                    $_.state -ceq 'unknown' -and -not $_.lineEvidence
+                }).Count -gt 0) {
             $envelope.unmetCapabilities = @('changed-line-counts')
         }
         $aggregate = [Collections.Generic.List[object]]::new()
@@ -972,7 +1203,7 @@ function Invoke-ActivePrIntake {
             -not $gapCodes.Contains('pending-rules')) {
             [void]$gapCodes.Add('pending-rules')
         }
-        if ($envelope.unmetCapabilities.Count -gt 0 -and
+        if (@($envelope.heads | Where-Object reasonCode -eq 'line-count-unavailable').Count -gt 0 -and
             -not $gapCodes.Contains('line-count-unavailable')) {
             [void]$gapCodes.Add('line-count-unavailable')
         }
@@ -1026,15 +1257,24 @@ function New-ActivePrAzureDevOpsProvider {
     $transportReads = [pscustomobject]@{ Count = 0 }
     $invoke = {
         param([string]$Area, [string]$Resource, [string[]]$Route,
-            [string[]]$Query, [DateTime]$Deadline)
+            [string[]]$Query, [DateTime]$Deadline,
+            [int]$MaxOutputBytes = 16777216)
         if ($transportReads.Count -ge $readCeiling) { throw 'read-budget' }
         $transportReads.Count++
-        $argv = @('devops', 'invoke', '--organization', $org, '--area', $Area,
-            '--resource', $Resource, '--http-method', 'GET', '--api-version', '7.1',
-            '-o', 'json', '--only-show-errors')
+        $argv = if ($Area -eq 'connection') {
+            @('rest', '--method', 'get',
+                '--url', "$($org.TrimEnd('/'))/_apis/connectionData?api-version=7.1-preview.1",
+                '--resource', [string]$Config.identityResource,
+                '-o', 'json', '--only-show-errors')
+        } else {
+            @('devops', 'invoke', '--organization', $org, '--area', $Area,
+                '--resource', $Resource, '--http-method', 'GET', '--api-version', '7.1',
+                '-o', 'json', '--only-show-errors')
+        }
         if ($Route.Count) { $argv += @('--route-parameters') + $Route }
         if ($Query.Count) { $argv += @('--query-parameters') + $Query }
-        $tool = Get-Command -Name $AzureCliPath -CommandType Application,ExternalScript -ErrorAction Stop
+        $tool = Get-Command -Name $AzureCliPath -CommandType Application,ExternalScript `
+            -ErrorAction Stop | Select-Object -First 1
         $start = [Diagnostics.ProcessStartInfo]::new()
         $start.UseShellExecute = $false
         $start.RedirectStandardOutput = $true
@@ -1093,9 +1333,9 @@ function New-ActivePrAzureDevOpsProvider {
                         $n = $outputRead.GetAwaiter().GetResult()
                         if ($n -eq 0) { $outputRead = $null }
                         else {
-                            if ($output.Length + $n -gt 16777216) {
+                            if ($output.Length + $n -gt $MaxOutputBytes) {
                                 if (-not $process.HasExited) { $process.Kill($true) }
-                                throw 'read-budget'
+                                throw 'byte-budget'
                             }
                             $output.Write($outputBuffer, 0, $n)
                             $outputRead = $process.StandardOutput.BaseStream.ReadAsync(
@@ -1132,6 +1372,10 @@ function New-ActivePrAzureDevOpsProvider {
         if ([string]::IsNullOrWhiteSpace($text)) { throw 'read-inaccessible' }
         return ($text | ConvertFrom-Json -AsHashtable -Depth 32)
     }.GetNewClosure()
+    $assertNumber = ${function:Assert-IntakeNumber}
+    $assertBlob = ${function:Assert-IntakeBlob}
+    $lineDelta = ${function:Get-IntakeLineDelta}
+    $digest = ${function:Get-IntakeDigest}
     $handler = {
         param([string]$Operation, [Collections.IDictionary]$Request)
         $budget = if ($null -ne $Request['timeoutMilliseconds']) {
@@ -1141,12 +1385,19 @@ function New-ActivePrAzureDevOpsProvider {
         switch -CaseSensitive ($Operation) {
             Identity {
                 $r = & $invoke 'connection' 'connectionData' @() @() $deadline
-                return @{ id = $r.authenticatedUser.id
-                    uniqueName = $r.authenticatedUser.uniqueName }
+                $user = $r.authenticatedUser
+                $name = [string]$user.uniqueName
+                if (-not $name -and
+                    [string]$user.descriptor -cmatch '\\(?<upn>[^\\\s]+@[^\\\s]+)$') {
+                    $name = $Matches.upn
+                }
+                return @{ id = $user.id; descriptor = $user.subjectDescriptor
+                    uniqueName = $name }
             }
             ListPage {
                 $r = & $invoke 'git' 'pullRequests' @("project=$project", "repositoryId=$repo") @(
-                    'searchCriteria.status=active', "`$skip=$($Request.skip)", "`$top=$($Request.top)") $deadline
+                    'searchCriteria.status=active', "searchCriteria.repositoryId=$repo",
+                    "`$skip=$($Request.skip)", "`$top=$($Request.top)") $deadline
                 $items = @($r.value | ForEach-Object {
                         if ([string]$_.repository.id -ine $repo -or
                             [string]$_.repository.project.id -ine $projectId) {
@@ -1177,26 +1428,56 @@ function New-ActivePrAzureDevOpsProvider {
                         [string]$last.targetRefCommit.commitId)) {
                     throw 'head-inconsistent'
                 }
+                foreach ($pair in @(
+                        @([string]$r.sourceRefName, [string]$last.sourceRefCommit.commitId),
+                        @([string]$r.targetRefName, [string]$last.targetRefCommit.commitId)
+                    )) {
+                    if ($pair[0] -cnotmatch '^refs/heads/[^~^:?*\[\\]+$' -or
+                        $pair[1] -cnotmatch '^[a-fA-F0-9]{40}$') { throw 'head-inconsistent' }
+                    $refs = & $invoke 'git' 'refs' @(
+                        "project=$project", "repositoryId=$repo") @(
+                        "filter=$($pair[0].Substring(5))", '$top=100') $deadline
+                    if ($refs['value'] -isnot [array]) { throw 'head-inconsistent' }
+                    $exact = @($refs.value | Where-Object { $_.name -ceq $pair[0] })
+                    if ($exact.Count -ne 1 -or
+                        [string]$exact[0].objectId -ine $pair[1]) {
+                        throw 'head-inconsistent'
+                    }
+                }
                 return @{ pullRequestId = $r.pullRequestId
                     repositoryId = $r.repository.id; projectId = $r.repository.project.id
                     status = $r.status; isDraft = $r.isDraft
                     sourceRef = $r.sourceRefName; targetRef = $r.targetRefName
                     sourceCommit = $last.sourceRefCommit.commitId
-                    targetCommit = $last.targetRefCommit.commitId; iterationId = $last.id }
+                    targetCommit = $last.targetRefCommit.commitId
+                    commonCommit = $last.commonRefCommit.commitId; iterationId = $last.id }
             }
             Changes {
                 $id = [int]$Request.pullRequestId
                 $iteration = [int]$Request.iterationId
+                $remaining = if ($null -eq $Request['remainingReads']) {
+                    [int]$Config.limits.maxReads
+                } else {
+                    & $assertNumber $Request.remainingReads remainingReads 0 30000
+                }
+                $counter = @{ used = 0 }
+                $read = {
+                    param($Resource, $Route, $Query, [int]$Cap)
+                    if ($counter.used -ge $remaining) { throw 'read-budget' }
+                    $counter.used++
+                    return & $invoke 'git' $Resource $Route $Query $deadline $Cap
+                }
+                $route = @("project=$project", "repositoryId=$repo")
+                $changeRoute = $route + @("pullRequestId=$id", "iterationId=$iteration")
                 $skip = 0
                 $seenChanges = [Collections.Generic.HashSet[int]]::new()
+                $entries = [Collections.Generic.List[object]]::new()
                 $declaredTotal = $null
                 $pageSize = [Math]::Min(100, $maxFiles + 1)
                 $complete = $false
                 for ($page = 0; $page -lt [int]$Config.limits.maxPages; $page++) {
-                    $r = & $invoke 'git' 'pullRequestIterationChanges' @(
-                        "project=$project", "repositoryId=$repo",
-                        "pullRequestId=$id", "iterationId=$iteration") @(
-                        "`$top=$pageSize", "`$skip=$skip", '$compareTo=0') $deadline
+                    $r = & $read 'pullRequestIterationChanges' $changeRoute @(
+                        "`$top=$pageSize", "`$skip=$skip", '$compareTo=0') 16777216
                     if ($r['changeEntries'] -isnot [array]) {
                         throw 'change-list-truncated'
                     }
@@ -1234,6 +1515,7 @@ function New-ActivePrAzureDevOpsProvider {
                         if (-not $seenChanges.Add($trackingId)) {
                             throw 'change-list-truncated'
                         }
+                        $entries.Add($entry)
                     }
                     if ($seenChanges.Count -gt $maxFiles) { throw 'file-budget' }
                     $next = $skip + $entries.Count
@@ -1248,8 +1530,103 @@ function New-ActivePrAzureDevOpsProvider {
                     $skip = $next
                 }
                 if (-not $complete) { throw 'change-page-budget' }
-                # ADO iteration changes have no reliable changed-line total. Do not fetch source.
-                return @{ changedFiles = $seenChanges.Count; changedLines = $null }
+                if ($null -eq $Request['sourceCommit'] -and
+                    $null -eq $Request['targetCommit'] -and
+                    $null -eq $Request['commonCommit']) {
+                    return @{ changedFiles = $seenChanges.Count; changedLines = $null
+                        readCount = $counter.used }
+                }
+                foreach ($commit in @('sourceCommit', 'targetCommit', 'commonCommit')) {
+                    if ([string]$Request[$commit] -cnotmatch '^[a-fA-F0-9]{40}$') {
+                        throw 'invalid-change'
+                    }
+                }
+                $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                $results = [Collections.Generic.List[object]]::new()
+                $totalBytes = 0
+                $totalLines = 0
+                $cellsLeft = [int]$Config.limits.maxDiffCells
+                foreach ($change in $entries) {
+                    if ($change -isnot [Collections.IDictionary] -or
+                        $change.item -isnot [Collections.IDictionary] -or
+                        [string]$change.item.path -cnotmatch '^/[^?#\x00-\x1f]{1,2048}$' -or
+                        -not $seen.Add([string]$change.item.path)) {
+                        throw 'invalid-change'
+                    }
+                    $path = [string]$change.item.path
+                    $kind = [string]$change.changeType
+                    if ($kind -cnotin @('add', 'edit', 'delete', 'rename')) {
+                        throw 'unsupported-change'
+                    }
+                    if ($kind -ne 'delete' -and
+                        [string]$change.item.objectId -cnotmatch '^[a-fA-F0-9]{40}$') {
+                        throw 'invalid-change'
+                    }
+                    if ($kind -eq 'rename' -and
+                        ([string]$change.originalPath -cnotmatch '^/[^?#\x00-\x1f]{1,2048}$' -or
+                            [string]$change.originalPath -ceq $path)) {
+                        throw 'unsupported-change'
+                    }
+                    $oldPath = if ($kind -eq 'rename') { [string]$change.originalPath } else { $path }
+                    $old = ''
+                    $new = ''
+                    $cap = [Math]::Min([int]$Config.limits.maxFileBytes,
+                        [int]$Config.limits.maxTotalBytes - $totalBytes)
+                    if ($cap -lt 1) { throw 'byte-budget' }
+                    if ($kind -ne 'add') {
+                        $item = & $read 'items' $route @(
+                            "path=$oldPath", "versionDescriptor.version=$($Request.commonCommit)",
+                            'versionDescriptor.versionType=commit', 'includeContent=true',
+                            'includeContentMetadata=true') ($cap * 6 + 65536)
+                        $blob = & $assertBlob $item $oldPath ([string]$item.objectId) $cap
+                        if ($change.item['originalObjectId'] -and
+                            [string]$change.item.originalObjectId -ine [string]$item.objectId) {
+                            throw 'invalid-item'
+                        }
+                        $old = $blob.text
+                        $totalBytes += $blob.bytes
+                    }
+                    if ($kind -ne 'delete') {
+                        $cap = [Math]::Min([int]$Config.limits.maxFileBytes,
+                            [int]$Config.limits.maxTotalBytes - $totalBytes)
+                        if ($cap -lt 1) { throw 'byte-budget' }
+                        $item = & $read 'items' $route @(
+                            "path=$path", "versionDescriptor.version=$($Request.sourceCommit)",
+                            'versionDescriptor.versionType=commit', 'includeContent=true',
+                            'includeContentMetadata=true') ($cap * 6 + 65536)
+                        $blob = & $assertBlob $item $path ([string]$change.item.objectId) $cap
+                        $new = $blob.text
+                        $totalBytes += $blob.bytes
+                    }
+                    if ($old.StartsWith("version https://git-lfs.github.com/spec/v1`n") -or
+                        $new.StartsWith("version https://git-lfs.github.com/spec/v1`n")) {
+                        throw 'unsupported-change'
+                    }
+                    $delta = & $lineDelta $old $new $cellsLeft `
+                        ([int]$Config.limits.maxChangedLines * 2) $deadline
+                    $cellsLeft -= $delta.cells
+                    $totalLines += $delta.addedLines + $delta.deletedLines
+                    if ($totalLines -gt [int]$Config.limits.maxChangedLines) {
+                        throw 'line-budget'
+                    }
+                    if ($delta.addedLines + $delta.deletedLines -eq 0) {
+                        throw 'unsupported-change'
+                    }
+                    $results.Add([ordered]@{
+                            pathDigest = & $digest $path
+                            originalPathDigest = if ($kind -eq 'rename') {
+                                & $digest $oldPath
+                            } else { $null }
+                            changeType = $kind
+                            addedLines = $delta.addedLines
+                            deletedLines = $delta.deletedLines
+                            newLineCount = $delta.newLineCount
+                            spans = @($delta.spans)
+                        })
+                }
+                return @{ changedFiles = $entries.Count; changedLines = $totalLines
+                    baseCommit = ([string]$Request.commonCommit).ToLowerInvariant()
+                    files = @($results.ToArray()); readCount = $counter.used }
             }
             Discussions {
                 $id = [int]$Request.pullRequestId

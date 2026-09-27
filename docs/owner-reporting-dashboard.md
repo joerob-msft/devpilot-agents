@@ -297,11 +297,20 @@ only `active-pr-intake-v1\cohort.json` as the latest pointer. Configure the
 dashboard's `roots.intake` to that `active-pr-intake-v1` directory and
 `files.intakeCohort` to its `cohort.json`; the reader verifies the referenced
 immutable file byte-for-byte. The adapter never calls an ADO write endpoint.
-Its current Azure CLI changes endpoint does **not** supply authoritative
-changed-line counts. Selected heads therefore become explicit
-`line-count-unavailable` unknowns instead of passing changed-line validation
-or claiming evaluation; a future bounded changed-line provider and scheduled
-rule runner remain necessary for at-scale enforcement.
+The Azure CLI iteration changes endpoint supplies file paths, not line hunks.
+The optional adapter now reads bounded text blobs at the iteration's common
+commit and exact source commit (the ADO PR diff base is the **common** commit,
+not a possibly advanced target tip), verifies Git blob hashes including UTF-8
+BOM and Windows-1252 encodings, and derives deterministic new-side spans and
+added/deleted line totals in memory. It checks both live branch tips before
+and after the reads. Evidence and its SHA-256 digest bind the source, target,
+common commit, iteration, rule configuration, and immutable generation;
+the dashboard validates the digest and displays only file-path digests and
+line ranges. Binary, oversized, unsupported, drifting, or incomplete changes
+remain unknown rather than becoming zero-line successes. A verified line count
+does **not** evaluate a rule: selected heads remain pending until a separate
+scheduled evaluator dispatches exact-head rule checks. This PR does not add
+that dispatch, enable posting, or claim coverage of every open PR.
 
 On Windows, `o` uses the system URL association through a fixed PowerShell
 `Start-Process -FilePath $url` launcher. The validated URL is passed only in

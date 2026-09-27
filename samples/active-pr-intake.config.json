@@ -28,6 +28,9 @@
     "maxSeconds": 240,
     "maxChangedFiles": 200,
     "maxChangedLines": 5000,
+    "maxFileBytes": 262144,
+    "maxTotalBytes": 2097152,
+    "maxDiffCells": 1000000,
     "maxThreads": 500,
     "maxComments": 2000
   }

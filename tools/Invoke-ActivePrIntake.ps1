@@ -8,8 +8,8 @@
     Without -Run or with enabled=false, only validates and returns a disabled
     summary without ADO requests or durable writes. Explicit enabled -Run
     writes immutable private cohort generations and an atomic latest snapshot.
-    The CLI's GET-only change listing has no reliable changed-line total:
-    selected heads remain unknown with the changed-line-counts capability unmet.
+    Selected heads receive bounded, verified changed-line evidence when all
+    exact-commit item reads succeed; unsupported or incomplete diffs stay unknown.
     ADO PR listing has no atomic snapshot token or guaranteed totalCount; intake
     reconciles two full bounded passes but cannot guarantee an atomic snapshot.
 #>
