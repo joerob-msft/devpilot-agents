@@ -892,4 +892,24 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
         $t.fixture.pages['0'].changeEntries[0].item.objectId = $old.objectId
         (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'unsupported-change'
     }
+    It 'diffs long unchanged context under the cell ceiling and keeps deletions off the new side' {
+        InModuleScope DevPilot.ActivePrIntake {
+            $prefix = "same`n" * 250
+            $suffix = "tail`n" * 250
+            $deadline = [DateTime]::UtcNow.AddSeconds(10)
+            $delta = Get-IntakeLineDelta ($prefix + "old`n" + $suffix) `
+                ($prefix + "new`n" + $suffix) 4 1100 $deadline
+            $delta.cells | Should -Be 4
+            $delta.addedLines | Should -Be 1
+            $delta.deletedLines | Should -Be 1
+            $delta.spans[0].startLine | Should -Be 251
+            $delta.spans[0].endLine | Should -Be 251
+            $onlyDeletion = Get-IntakeLineDelta "a`nb`nc`n" "a`nc`n" 4 10 $deadline
+            $onlyDeletion.deletedLines | Should -Be 1
+            $onlyDeletion.addedLines | Should -Be 0
+            $onlyDeletion.spans.Count | Should -Be 0
+            { Get-IntakeLineDelta 'old' 'new' 4 2 ([DateTime]::UtcNow.AddSeconds(-1)) } |
+                Should -Throw 'time-budget'
+        }
+    }
 }
