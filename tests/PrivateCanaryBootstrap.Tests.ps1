@@ -177,6 +177,24 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             -ExpectedAccountUniqueName 'service@example.invalid' `
             -StateRoot $Case.root -RepositoryRoot $repo -Read $Case.provider -Run
     }
+    function Get-RegistryCase {
+        $case = Get-BootstrapCase
+        [void](Invoke-BootstrapCase $case)
+        return @{
+            case = $case
+            config = Get-Content -LiteralPath (
+                Join-Path $case.root 'provider-config.json') -Raw |
+                ConvertFrom-Json -AsHashtable
+            sources = Get-Content -LiteralPath (
+                Join-Path $case.root 'approved-sources.json') -Raw |
+                ConvertFrom-Json -AsHashtable
+        }
+    }
+    function Invoke-RegistryCase($InputCase) {
+        New-VerifiedCanaryRuleRegistry -ProviderConfig $InputCase.config `
+            -ApprovedSources $InputCase.sources -RepositoryRoot $repo `
+            -Read $InputCase.case.provider -Run
+    }
 }
 AfterAll {
     & (Get-Module DevPilot.ActivePrCanary) {
@@ -204,6 +222,132 @@ Describe 'Read-only private canary input bootstrap' {
         $result.signed | Should -BeFalse
         $c.state.reads.Count | Should -Be 0
         Test-Path $c.root | Should -BeFalse
+    }
+    Describe 'Four-source read-only registry from verified receipts' {
+        It 'defaults off without consuming even a malformed receipt or contacting ADO' {
+            $c = Get-BootstrapCase
+            $result = New-VerifiedCanaryRuleRegistry -ProviderConfig @{} `
+                -ApprovedSources @{} -RepositoryRoot $repo -Read $c.provider
+            $result.state | Should -Be 'disabled'
+            $result.providerWrites | Should -Be 0
+            $c.state.reads.Count | Should -Be 0
+            Test-Path $c.root | Should -BeFalse
+        }
+        It 'keeps the repository command disabled with actual trusted bootstrap files' {
+            $inputCase = Get-RegistryCase
+            $json = & (Join-Path $repo 'tools\Invoke-PrivateCanaryRuleRegistry.ps1') `
+                -ProviderConfigPath (Join-Path $inputCase.case.root 'provider-config.json') `
+                -ApprovedSourcesPath (Join-Path $inputCase.case.root 'approved-sources.json')
+            $result = $json | ConvertFrom-Json -AsHashtable
+            $result.state | Should -Be 'disabled'
+            $result.providerReads | Should -Be 0
+            $result.providerWrites | Should -Be 0
+        }
+        It 'rechecks both immutable documents and head and binds four disabled distinct sources' {
+            $inputCase = Get-RegistryCase
+            $result = Invoke-RegistryCase $inputCase
+            $result.state | Should -Be 'verified-not-evaluated'
+            $result.evaluated | Should -BeFalse
+            $result.writerEligible | Should -BeFalse
+            $result.providerWrites | Should -Be 0
+            $result.providerReads | Should -Be 17
+            $result.rules.Count | Should -Be 4
+            $result.rules['bpm-test-ownership@1'].sourceAuthority |
+                Should -Be 'pinned-owner-section'
+            $result.rules['bpm-test-class-coverage@2'].sourceAuthority |
+                Should -Be 'verified-unmerged-candidate-only'
+            $result.rules['bpm-test-class-coverage@2'].declarationDigest |
+                Should -Not -Be $result.rules['bpm-redundant-method-coverage@2'].declarationDigest
+            $result.rules['bpm-named-areequal-arguments@1'].sourceAuthority |
+                Should -Be 'repository-local-commit'
+            @($result.rules.Values | Where-Object { $_.enabled -or $_.evaluated -or
+                    $_.writerEligible }).Count | Should -Be 0
+            @($inputCase.case.state.reads | Where-Object {
+                    $_ -in @('ListPage', 'Head', 'Changes', 'Discussions',
+                        'Write', 'Post') }).Count | Should -Be 0
+            ($result | ConvertTo-Json -Depth 10) | Should -Not -Match 'Synthetic convention'
+            $inputCase.sources.rules['bpm-test-ownership@1'].sectionHash |
+                Should -Not -Be $inputCase.sources.namedSection.sectionHash
+        }
+        It 'rejects wrong or missing receipts and independently mutated Owner and Named pins' {
+            foreach ($failure in @('schema', 'missing', 'owner', 'owner-length',
+                    'named-section', 'named-blob', 'class', 'redundant',
+                    'class-head', 'named-policy', 'named-digest', 'repository',
+                    'project')) {
+                $inputCase = Get-RegistryCase
+                switch ($failure) {
+                    schema { $inputCase.sources.schemaVersion = 1 }
+                    missing {
+                        $inputCase.sources.rules.Remove('bpm-test-class-coverage@2')
+                    }
+                    owner {
+                        $inputCase.sources.rules['bpm-test-ownership@1'].sectionHash =
+                            'v1:sha256:' + ('a' * 64)
+                    }
+                    'owner-length' {
+                        $inputCase.sources.rules['bpm-test-ownership@1'].sectionLength++
+                    }
+                    'named-section' {
+                        $inputCase.sources.namedSection.sectionHash =
+                            'v1:sha256:' + ('a' * 64)
+                    }
+                    'named-blob' { $inputCase.sources.namedSection.blobId = 'a' * 40 }
+                    class {
+                        $inputCase.sources.rules['bpm-test-class-coverage@2'].policyLineHash =
+                            'v1:sha256:' + ('a' * 64)
+                    }
+                    redundant {
+                        $inputCase.sources.rules['bpm-redundant-method-coverage@2'].declarationDigest =
+                            'v1:sha256:' + ('a' * 64)
+                    }
+                    'class-head' {
+                        $inputCase.sources.rules['bpm-test-class-coverage@2'].headVerified =
+                            $false
+                    }
+                    'named-policy' {
+                        $inputCase.sources.rules['bpm-named-areequal-arguments@1'].policyHash =
+                            'v1:sha256:' + ('a' * 64)
+                    }
+                    'named-digest' {
+                        $inputCase.sources.rules['bpm-named-areequal-arguments@1'].declarationDigest =
+                            'v1:sha256:' + ('a' * 64)
+                    }
+                    repository {
+                        $inputCase.config.repository.id =
+                            'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+                    }
+                    project {
+                        $inputCase.config.projectId =
+                            'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+                    }
+                }
+                { Invoke-RegistryCase $inputCase } | Should -Throw -Because $failure
+                @($inputCase.case.state.reads | Where-Object {
+                        $_ -in @('Write', 'Post', 'Changes', 'ListPage')
+                    }).Count | Should -Be 0
+            }
+        }
+        It 'fails on a changed current PR head, source blob, or principal after preparation' {
+            foreach ($failure in @('head', 'head-after', 'blob',
+                    'principal-final')) {
+                $inputCase = Get-RegistryCase
+                switch ($failure) {
+                    head { $inputCase.case.state.head = 'a' * 40 }
+                    'head-after' {
+                        $inputCase.case.state.headChecks = 0
+                        $inputCase.case.state.wrong = 'head-drift'
+                    }
+                    blob { $inputCase.case.state.wrong = 'blob' }
+                    'principal-final' {
+                        $inputCase.case.state.wrong = 'principal-final'
+                    }
+                }
+                { Invoke-RegistryCase $inputCase } | Should -Throw -Because $failure
+                @($inputCase.case.state.reads | Where-Object {
+                        $_ -in @('Write', 'Post', 'Changes', 'ListPage')
+                    }).Count | Should -Be 0
+            }
+        }
     }
     It 'derives private provider identity and four distinct candidate/local source bindings' {
         $c = Get-BootstrapCase

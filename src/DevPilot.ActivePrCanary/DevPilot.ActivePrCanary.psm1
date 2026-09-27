@@ -430,6 +430,38 @@ function Assert-CanaryBootstrapHead {
     }
 }
 
+function Read-CanaryVerifiedDocument {
+    param([scriptblock]$Read, [string]$RepositoryId, [string]$Revision)
+    $request = @{ projectName = 'Engineering'; repositoryId = $RepositoryId
+        path = $script:DocumentPath; commit = $Revision }
+    $item = & $Read Item $request
+    if ($item -isnot [Collections.IDictionary] -or
+        [string]$item.path -cne $script:DocumentPath -or
+        [string]$item.objectId -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        [string]$item.gitObjectType -cne 'blob' -or
+        $item['isFolder'] -eq $true -or $item['isSymLink'] -eq $true) {
+        throw 'bootstrap-blob-unverified'
+    }
+    $raw = & $Read RawItem $request
+    if ($raw -isnot [Collections.IDictionary] -or
+        $raw.bytes -isnot [byte[]] -or $raw.bytes.Length -gt 262144) {
+        throw 'bootstrap-blob-unverified'
+    }
+    $bytes = [byte[]]$raw.bytes
+    $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+    $oid = [Convert]::ToHexString(
+        [Security.Cryptography.SHA1]::HashData(
+            [byte[]]($header + $bytes))).ToLowerInvariant()
+    if ($oid -ine [string]$item.objectId) {
+        throw 'bootstrap-blob-unverified'
+    }
+    try {
+        return @{ text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+            blobId = $oid }
+    }
+    catch { throw 'bootstrap-blob-unverified' }
+}
+
 function Invoke-PrivateCanaryBootstrap {
     [CmdletBinding()]
     param(
@@ -484,11 +516,11 @@ function Invoke-PrivateCanaryBootstrap {
                     $Operation $Request $readDeadline
             }.GetNewClosure()
         }
-        $reads = 0
+        $readBudget = @{ count = 0 }
         $bounded = {
             param($Operation, $Request)
-            if ($reads -ge 20) { throw 'bootstrap-read-budget' }
-            $reads++
+            if ($readBudget.count -ge 20) { throw 'bootstrap-read-budget' }
+            $readBudget.count++
             $result = & $Read $Operation $Request
             if ($result -isnot [Collections.IDictionary]) {
                 throw 'bootstrap-read-inaccessible'
@@ -531,37 +563,7 @@ function Invoke-PrivateCanaryBootstrap {
         if ([string]$commit.commitId -ine $script:CoverageCommit) {
             throw 'coverage-commit-unverified'
         }
-        $documentPath = $script:DocumentPath
-        $readDocument = {
-            param([string]$Revision)
-            $request = @{ projectName = 'Engineering'; repositoryId = $engId
-                path = $documentPath; commit = $Revision }
-            $item = & $bounded Item $request
-            if ([string]$item.path -cne $documentPath -or
-                [string]$item.objectId -cnotmatch '^[a-fA-F0-9]{40}$' -or
-                [string]$item.gitObjectType -cne 'blob' -or
-                $item['isFolder'] -eq $true -or $item['isSymLink'] -eq $true) {
-                throw 'bootstrap-blob-unverified'
-            }
-            $raw = & $bounded RawItem $request
-            if ($raw.bytes -isnot [byte[]] -or $raw.bytes.Length -gt 262144) {
-                throw 'bootstrap-blob-unverified'
-            }
-            $bytes = [byte[]]$raw.bytes
-            $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
-            $oid = [Convert]::ToHexString(
-                [Security.Cryptography.SHA1]::HashData(
-                    [byte[]]($header + $bytes))).ToLowerInvariant()
-            if ($oid -ine [string]$item.objectId) {
-                throw 'bootstrap-blob-unverified'
-            }
-            try {
-                return @{ text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
-                    blobId = $oid }
-            }
-            catch { throw 'bootstrap-blob-unverified' }
-        }.GetNewClosure()
-        $ownerSource = & $readDocument $script:OwnerCommit
+        $ownerSource = Read-CanaryVerifiedDocument $bounded $engId $script:OwnerCommit
         $ownerSection = Get-CanarySection $ownerSource.text '## Claim ownership'
         $namedSection = Get-CanaryRawSection $ownerSource.text `
             '## Named parameters for Assert'
@@ -571,7 +573,7 @@ function Invoke-PrivateCanaryBootstrap {
                 $script:NamedSectionLength) {
             throw 'bootstrap-section-mismatch'
         }
-        $coverageSource = & $readDocument $script:CoverageCommit
+        $coverageSource = Read-CanaryVerifiedDocument $bounded $engId $script:CoverageCommit
         $coverageBytes = [Text.Encoding]::UTF8.GetBytes($coverageSource.text)
         if ($coverageBytes.Length -ne $script:CoverageDocumentLength -or
             (Get-CanaryHash $coverageBytes) -cne $script:CoverageDocumentHash) {
@@ -701,13 +703,313 @@ function Invoke-PrivateCanaryBootstrap {
         }
         return [ordered]@{
             state = 'prepared-read-only'; signed = $false
-            canaryExecuted = $false; providerReads = $reads; providerWrites = 0
+            canaryExecuted = $false; providerReads = $readBudget.count
+            providerWrites = 0
             ruleCount = 4; candidateCount = 2
             documentHash = 'v1:sha256:' + $script:CoverageDocumentHash
             localCommit = $localCommit
         }
     }
     finally { if ($client) { $client.Dispose() } }
+}
+
+function New-VerifiedCanaryRuleRegistry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$ProviderConfig,
+        [Parameter(Mandatory)][Collections.IDictionary]$ApprovedSources,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [scriptblock]$Read,
+        [switch]$Run
+    )
+    if (-not $Run) {
+        return [ordered]@{ state = 'disabled'; providerReads = 0
+            providerWrites = 0; evaluated = $false; writerEligible = $false }
+    }
+    if (-not $Read -or -not [IO.Path]::IsPathFullyQualified($RepositoryRoot) -or
+        $ProviderConfig.provider -cne 'AzureDevOps' -or
+        $ProviderConfig.repository -isnot [Collections.IDictionary] -or
+        $ProviderConfig.expectedAccount -isnot [Collections.IDictionary] -or
+        [string]$ProviderConfig.repository.organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$' -or
+        [string]$ProviderConfig.repository.project -cnotmatch '^[\w .-]{1,128}$' -or
+        [string]$ProviderConfig.repository.name -cnotmatch '^[A-Za-z0-9._-]{1,128}$' -or
+        [string]$ProviderConfig.repository.id -cnotmatch
+            '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+        [string]$ProviderConfig.projectId -cnotmatch
+            '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+        [string]$ProviderConfig.expectedAccount.id -cnotmatch
+            '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+        [string]$ProviderConfig.expectedAccount.descriptor -cnotmatch '^\S{1,512}$' -or
+        [string]$ProviderConfig.expectedAccount.uniqueName -cnotmatch
+            '^[^@\s]+@[^@\s]+$' -or
+        [string]$ProviderConfig.operator.defaultAlias -ine
+            [string]$ProviderConfig.expectedAccount.uniqueName -or
+        $ApprovedSources.schemaVersion -ne 2 -or
+        $ApprovedSources.kind -cne 'private-read-only-canary-sources' -or
+        $ApprovedSources.sourceAuthority -cne
+            'unmerged-reviewed-pr-is-candidate-only' -or
+        $ApprovedSources.rules -isnot [Collections.IDictionary] -or
+        $ApprovedSources.rules.Count -ne 4) {
+        throw 'canary-receipt-invalid'
+    }
+    $rules = $ApprovedSources.rules
+    $owner = $rules['bpm-test-ownership@1']
+    $namedSection = $ApprovedSources['namedSection']
+    $named = $rules['bpm-named-areequal-arguments@1']
+    $class = $rules['bpm-test-class-coverage@2']
+    $redundant = $rules['bpm-redundant-method-coverage@2']
+    $engId = [string]$owner.repositoryId
+    foreach ($source in @($owner, $namedSection, $class, $redundant)) {
+        $expectedCommit = if ($source -eq $class -or $source -eq $redundant) {
+            $script:CoverageCommit
+        } else { $script:OwnerCommit }
+        Assert-CanarySource $source $script:DocumentPath $expectedCommit
+        if ([string]$source.projectName -cne 'Engineering' -or
+            [string]$source.repositoryName -cne 'EngHub' -or
+            [string]$source.repositoryId -cne $engId -or
+            [string]$source.blobId -cnotmatch '^[a-f0-9]{40}$') {
+            throw 'canary-receipt-invalid'
+        }
+    }
+    if ($owner.section -cne '## Claim ownership' -or
+        $owner.sectionHash -cne ('v1:sha256:' + $script:OwnerHash) -or
+        [string]$owner.sectionLength -cnotmatch '^[1-9][0-9]{0,4}$' -or
+        [int]$owner.sectionLength -gt 65536 -or
+        $namedSection.section -cne '## Named parameters for Assert' -or
+        $namedSection.sectionHash -cne
+            ('v1:sha256:' + $script:NamedSectionHash) -or
+        $namedSection.sectionLength -ne $script:NamedSectionLength -or
+        $namedSection.blobId -cne $owner.blobId -or
+        $owner.declarationDigest -cne ('v1:sha256:' + (Get-CanaryTextHash (
+                    ConvertTo-AgentCanonicalJson -InputObject ([ordered]@{
+                            ruleId = 'bpm-test-ownership@1'
+                            repositoryId = $engId
+                            commit = $script:OwnerCommit
+                            path = $script:DocumentPath
+                            sectionHash = $owner.sectionHash
+                            sectionLength = $owner.sectionLength
+                        }))))) {
+        throw 'canary-receipt-invalid'
+    }
+    $readBudget = @{ count = 0 }
+    $bounded = {
+        param($Operation, $Request)
+        if ($readBudget.count -ge 20 -or $Operation -cnotin @('Identity', 'Project',
+                'Repository', 'PullRequest', 'Iterations', 'Ref', 'Commit',
+                'Item', 'RawItem')) {
+            throw 'registry-read-budget'
+        }
+        $readBudget.count++
+        $answer = & $Read $Operation $Request
+        if ($answer -isnot [Collections.IDictionary]) {
+            throw 'registry-read-inaccessible'
+        }
+        return $answer
+    }.GetNewClosure()
+    $identity = & $bounded Identity @{}
+    $projectName = [string]$ProviderConfig.repository.project
+    $project = & $bounded Project @{ projectName = $projectName }
+    $repo = & $bounded Repository @{
+        projectName = $projectName
+        repositoryName = [string]$ProviderConfig.repository.name
+    }
+    $engineering = & $bounded Project @{ projectName = 'Engineering' }
+    $enghub = & $bounded Repository @{
+        projectName = 'Engineering'; repositoryName = 'EngHub'
+    }
+    if ([string]$identity.id -ine [string]$ProviderConfig.expectedAccount.id -or
+        [string]$identity.descriptor -cne
+            [string]$ProviderConfig.expectedAccount.descriptor -or
+        [string]$identity.uniqueName -ine
+            [string]$ProviderConfig.expectedAccount.uniqueName -or
+        [string]$project.id -ine [string]$ProviderConfig.projectId -or
+        [string]$project.name -cne $projectName -or
+        [string]$repo.id -ine [string]$ProviderConfig.repository.id -or
+        [string]$repo.name -cne [string]$ProviderConfig.repository.name -or
+        [string]$repo.project.id -ine [string]$project.id -or
+        [string]$repo.project.name -cne $projectName -or
+        [string]$engineering.id -cnotmatch
+            '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+        [string]$engineering.name -cne 'Engineering' -or
+        [string]$enghub.id -ine $engId -or
+        [string]$enghub.name -cne 'EngHub' -or
+        [string]$enghub.project.id -ine [string]$engineering.id -or
+        [string]$enghub.project.name -cne 'Engineering') {
+        throw 'canary-identity-drift'
+    }
+    Assert-CanaryBootstrapHead $bounded $engId ([string]$engineering.id)
+    $commit = & $bounded Commit @{
+        projectName = 'Engineering'; repositoryId = $engId
+        commit = $script:CoverageCommit
+    }
+    if ([string]$commit.commitId -ine $script:CoverageCommit) {
+        throw 'coverage-commit-unverified'
+    }
+    $ownerSource = Read-CanaryVerifiedDocument $bounded $engId $script:OwnerCommit
+    $ownerBytes = Get-CanarySection $ownerSource.text '## Claim ownership'
+    $namedBytes = Get-CanaryRawSection $ownerSource.text `
+        '## Named parameters for Assert'
+    if ($ownerSource.blobId -cne $owner.blobId -or
+        (Get-CanaryTextHash $ownerBytes) -cne $script:OwnerHash -or
+        [Text.Encoding]::UTF8.GetByteCount($ownerBytes) -ne
+            [int]$owner.sectionLength -or
+        (Get-CanaryTextHash $namedBytes) -cne $script:NamedSectionHash -or
+        [Text.Encoding]::UTF8.GetByteCount($namedBytes) -ne
+            $script:NamedSectionLength) {
+        throw 'canary-section-drift'
+    }
+    $coverageSource = Read-CanaryVerifiedDocument $bounded $engId $script:CoverageCommit
+    $coverageBytes = [Text.Encoding]::UTF8.GetBytes($coverageSource.text)
+    if ($coverageBytes.Length -ne $script:CoverageDocumentLength -or
+        (Get-CanaryHash $coverageBytes) -cne $script:CoverageDocumentHash) {
+        throw 'coverage-source-bytes-mismatch'
+    }
+    $declarations = @(Get-CanaryCoverageDeclarations $coverageSource.text $engId)
+    $candidateSources = @($class, $redundant)
+    for ($i = 0; $i -lt 2; $i++) {
+        $source = $candidateSources[$i]
+        $expected = $declarations[$i]
+        if ($source.ruleId -cne $expected.ruleId -or
+            $source.provenance -cne 'unmerged-reviewed-pr' -or
+            $source.reviewedPullRequestId -ne 17307009 -or
+            $source.reviewedHead -cne $script:CoverageCommit -or
+            $source.headVerified -cne $true -or
+            $source.documentHash -cne
+                ('v1:sha256:' + $script:CoverageDocumentHash) -or
+            $source.blobId -cne $coverageSource.blobId -or
+            $source.section -cne $expected.section -or
+            $source.sectionHash -cne $expected.sectionHash -or
+            $source.policyLine -ne $expected.policyLine -or
+            $source.policyLineHash -cne $expected.policyLineHash -or
+            $source.declarationDigest -cne $expected.declarationDigest) {
+            throw 'coverage-receipt-drift'
+        }
+    }
+    Assert-CanaryBootstrapHead $bounded $engId ([string]$engineering.id)
+    $finalIdentity = & $bounded Identity @{}
+    if ([string]$finalIdentity.id -ine [string]$identity.id -or
+        [string]$finalIdentity.descriptor -cne [string]$identity.descriptor -or
+        [string]$finalIdentity.uniqueName -ine [string]$identity.uniqueName) {
+        throw 'canary-identity-drift'
+    }
+    $path = 'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
+    if ($named -isnot [Collections.IDictionary] -or
+        $named.approved -cne $true -or
+        $named.provenance -cne 'repository-local-commit' -or
+        $named.path -cne $path -or
+        [string]$named.commit -cnotmatch '^[a-f0-9]{40}$' -or
+        $named.ruleRepository -cne (Get-CanaryGitRepository $RepositoryRoot) -or
+        $named.namedSectionHash -cne $namedSection.sectionHash -or
+        $named.capabilityDigest -cne ('v1:sha256:' + (
+                Get-CanaryTextHash 'named-areequal-arguments-capability-v1')) -or
+        $named.policyHash -cnotmatch '^v1:sha256:[a-f0-9]{64}$') {
+        throw 'named-rule-receipt-invalid'
+    }
+    $localPath = Join-Path $RepositoryRoot (
+        $path -replace '/', [IO.Path]::DirectorySeparatorChar)
+    $local = [IO.File]::ReadAllBytes($localPath)
+    if ($local.Length -gt 65536 -or
+        $named.policyHash -cne ('v1:sha256:' + (Get-CanaryHash $local)) -or
+        (Get-CanaryGitValue $RepositoryRoot @(
+                'rev-parse', "$($named.commit):$path")) -cne
+        (Get-CanaryGitValue $RepositoryRoot @('hash-object', '--', $path)) -or
+        $named.declarationDigest -cne ('v1:sha256:' + (Get-CanaryTextHash (
+                    ConvertTo-AgentCanonicalJson -InputObject ([ordered]@{
+                            ruleId = 'bpm-named-areequal-arguments@1'
+                            ruleRepository = $named.ruleRepository
+                            commit = $named.commit; path = $path
+                            policyHash = $named.policyHash
+                            namedSectionHash = $named.namedSectionHash
+                            capabilityDigest = $named.capabilityDigest
+                        }))))) {
+        throw 'named-rule-receipt-invalid'
+    }
+    $registry = [ordered]@{}
+    foreach ($ruleId in @('bpm-test-ownership@1',
+            'bpm-test-class-coverage@2',
+            'bpm-redundant-method-coverage@2',
+            'bpm-named-areequal-arguments@1')) {
+        $source = $rules[$ruleId]
+        $registry[$ruleId] = [ordered]@{
+            id = $ruleId
+            enabled = $false
+            evaluated = $false
+            writerEligible = $false
+            sourceAuthority = if ($ruleId -in @(
+                    'bpm-test-class-coverage@2',
+                    'bpm-redundant-method-coverage@2')) {
+                'verified-unmerged-candidate-only'
+            } elseif ($ruleId -eq 'bpm-named-areequal-arguments@1') {
+                'repository-local-commit'
+            } else { 'pinned-owner-section' }
+            declarationDigest = [string]$source.declarationDigest
+            sourceCommit = [string]$source.commit
+            sourceHash = if ($ruleId -eq 'bpm-named-areequal-arguments@1') {
+                [string]$source.policyHash
+            } else { [string]$source.sectionHash }
+        }
+    }
+    return [ordered]@{
+        schemaVersion = 1
+        kind = 'verified-read-only-canary-registry'
+        state = 'verified-not-evaluated'
+        sourceAuthority = 'unmerged-reviewed-pr-is-candidate-only'
+        receiptDigest = 'v1:sha256:' + (Get-CanaryTextHash (
+                ConvertTo-AgentCanonicalJson -InputObject ([ordered]@{
+                        schemaVersion = $ApprovedSources.schemaVersion
+                        kind = $ApprovedSources.kind
+                        sourceAuthority = $ApprovedSources.sourceAuthority
+                        namedSection = $namedSection
+                        rules = $rules
+                    })))
+        verifiedUtc = [DateTime]::UtcNow.ToString('o')
+        providerReads = $readBudget.count
+        providerWrites = 0
+        evaluated = $false
+        writerEligible = $false
+        owner = 'not-attempted;no-model-or-tools'
+        rules = $registry
+    }
+}
+
+function Invoke-PrivateCanaryRuleRegistry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$ProviderConfig,
+        [Parameter(Mandatory)][Collections.IDictionary]$ApprovedSources,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [string]$AzureCliPath = 'az',
+        [switch]$Run
+    )
+    if (-not $Run) {
+        return New-VerifiedCanaryRuleRegistry -ProviderConfig $ProviderConfig `
+            -ApprovedSources $ApprovedSources -RepositoryRoot $RepositoryRoot
+    }
+    $organization = [string]$ProviderConfig.repository.organization
+    if ($organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$') {
+        throw 'canary-receipt-invalid'
+    }
+    $template = Get-Content -LiteralPath (Join-Path $RepositoryRoot `
+            'samples\active-pr-intake.config.json') -Raw |
+        ConvertFrom-Json -AsHashtable
+    $token = Get-CanaryAadToken $AzureCliPath `
+        ([string]$template.identityResource)
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $client = [Net.Http.HttpClient]::new($handler)
+    try {
+        $client.Timeout = [TimeSpan]::FromSeconds(120)
+        $deadline = [DateTime]::UtcNow.AddSeconds(120)
+        $aadGet = ${function:Invoke-CanaryAadGet}
+        $read = {
+            param($Operation, $Request)
+            & $aadGet $client $token $organization $Operation $Request $deadline
+        }.GetNewClosure()
+        return New-VerifiedCanaryRuleRegistry -ProviderConfig $ProviderConfig `
+            -ApprovedSources $ApprovedSources -RepositoryRoot $RepositoryRoot `
+            -Read $read -Run
+    }
+    finally { $client.Dispose() }
 }
 
 function Invoke-ActivePrCanaryQualification {
@@ -996,4 +1298,5 @@ function Invoke-ActivePrCanaryQualification {
 }
 
 Export-ModuleMember -Function Invoke-ActivePrCanaryQualification,
-    Assert-CanaryCoverageSource, Invoke-PrivateCanaryBootstrap
+    Assert-CanaryCoverageSource, Invoke-PrivateCanaryBootstrap,
+    New-VerifiedCanaryRuleRegistry, Invoke-PrivateCanaryRuleRegistry
