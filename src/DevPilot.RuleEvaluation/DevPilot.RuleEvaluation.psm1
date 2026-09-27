@@ -346,9 +346,14 @@ function Invoke-BoundedRuleEvaluation {
             enabled = $false; providerReads = 0; providerWrites = 0 }
     }
     if (-not [IO.Path]::IsPathFullyQualified($StateRoot) -or
-        -not [IO.Path]::IsPathFullyQualified($RepositoryRoot) -or
-        [IO.Path]::GetRelativePath([IO.Path]::GetFullPath($RepositoryRoot),
-            [IO.Path]::GetFullPath($StateRoot)) -notmatch '^\.\.[\\/]|^\.\.$') {
+        -not [IO.Path]::IsPathFullyQualified($RepositoryRoot)) {
+        throw 'Rule evaluation state must be an absolute path outside the repository.'
+    }
+    $relative = [IO.Path]::GetRelativePath([IO.Path]::GetFullPath($RepositoryRoot),
+        [IO.Path]::GetFullPath($StateRoot))
+    if ($relative -eq '.' -or
+        ($relative -notmatch '^\.\.[\\/]|^\.\.$' -and
+            -not [IO.Path]::IsPathFullyQualified($relative))) {
         throw 'Rule evaluation state must be an absolute path outside the repository.'
     }
     $state = Resolve-AgentTrustedRoot -Path $StateRoot -Kind durable-state `

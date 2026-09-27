@@ -199,6 +199,16 @@ Describe 'Bounded read-only scheduled rule evaluation' {
         $c.state.calls.Count | Should -Be 0
         (Test-Path (Join-Path $c.root 'rule-evaluation-v1')) | Should -BeFalse
     }
+    It 'rejects state inside the repository while accepting external absolute roots' {
+        $c = New-RuleCase -EnableCoverage
+        { Invoke-BoundedRuleEvaluation -Config $c.config `
+                -IntakeConfig $c.intakeConfig -Provider $c.provider `
+                -StateRoot (Join-Path $repo 'inside-repository') -RepositoryRoot $repo `
+                -SignatureKey 'synthetic-key' -Run } |
+            Should -Throw '*outside the repository*'
+        $result = Invoke-RuleCase $c
+        $result.rules[1].evaluated | Should -Be 1
+    }
     It 'rejects invalid signatures and tampered or incomplete immutable intake' {
         $c = New-RuleCase -EnableCoverage
         $c.config.limits.maxHeadsPerRun = 21
