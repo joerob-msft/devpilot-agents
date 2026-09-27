@@ -127,6 +127,13 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                 new string(DriftRef ? 'f' : (feature ? 'a' : 'b'), 40) + "\"}]}";
         } else if (path.EndsWith("/pullRequests/7/iterations/1/changes")) {
             body = "{\"changeEntries\":[],\"count\":0,\"totalCount\":0,\"nextSkip\":0}";
+        } else if (path.EndsWith("/items") &&
+                   request.Headers.Accept.ToString() == "application/octet-stream") {
+            body = "synthetic bytes";
+        } else if (path.EndsWith("/commits/" + new string('a', 40))) {
+            body = "{\"commitId\":\"" + new string('a', 40) + "\"}";
+        } else if (path.EndsWith("/trees/" + new string('a', 40))) {
+            body = "{\"treeId\":\"" + new string('a', 40) + "\"}";
         } else if (path.EndsWith("/threads")) {
             body = "{\"value\":[],\"count\":0}";
         } else {
@@ -845,6 +852,17 @@ Describe 'Read-only private canary input bootstrap' {
         $result.schemaVersion | Should -Be 2
         $result.providerWrites | Should -Be 0
         $result.modelToolInvocations | Should -Be 0
+        $c.state.threads = @(New-RunnerThread $c 1 'Exclude from code coverage.')
+        $human = Invoke-RunnerCase $c
+        $human.rules[1].humanCovered | Should -Be 2
+        $human.rules[1].wouldCreate | Should -Be 0
+        $marker = New-RunnerThread $c 1 (Get-RunnerClassMarkerBody $c)
+        $marker.comments[0].author = [ordered]@{} + $c.input.config.expectedAccount
+        $marker.comments[0].author.descriptor = 'aad.other'
+        $c.state.threads = @($marker)
+        $ambiguous = Invoke-RunnerCase $c
+        $ambiguous.rules[1].unknown | Should -Be 2
+        $ambiguous.rules[1].wouldCreate | Should -Be 0
     }
     It 'refuses a half-injected credential path without creating state' {
         $c = Get-SignedIntakeCase
@@ -1679,12 +1697,50 @@ Describe 'Read-only private canary input bootstrap' {
             $head = & $provider Head @{ pullRequestId = 7
                 remainingReads = 10; timeoutMilliseconds = 5000 }
             $head.sourceCommit | Should -Be ('a' * 40)
-            $head.readCount | Should -Be 3
+            $head.readCount | Should -Be 4
             $changes = & $provider Changes @{ pullRequestId = 7
                 iterationId = 1; remainingReads = 10
                 timeoutMilliseconds = 5000 }
             $changes.changedFiles | Should -Be 0
-            $handler.Paths.Count | Should -Be 12
+            $finalHead = & $provider Head @{ pullRequestId = 7
+                remainingReads = 10; timeoutMilliseconds = 5000 }
+            $finalHead.sourceCommit | Should -Be $head.sourceCommit
+            $intakeModule = Get-Module DevPilot.ActivePrIntake
+            foreach ($route in @(
+                    @{ resource = 'items'; suffix = '/items?'
+                        query = @('path=/Tests/Example.cs',
+                            "versionDescriptor.version=$('a' * 40)",
+                            'versionDescriptor.versionType=commit'); raw = $true },
+                    @{ resource = 'commits'; suffix = "/commits/$('a' * 40)?"
+                        pathId = 'commitId'; raw = $false },
+                    @{ resource = 'trees'; suffix = "/trees/$('a' * 40)?"
+                        pathId = 'sha1'; raw = $false }
+                )) {
+                $routeParts = @("project=$($config.projectName)",
+                    "repositoryId=$($config.repositoryId)")
+                if ($route.pathId) {
+                    $routeParts += "$($route.pathId)=$('a' * 40)"
+                }
+                $url = & $intakeModule {
+                    param($Org, $Project, $Resource, $Parts, $Query)
+                    Get-IntakeBearerRoute $Org $Project 'git' $Resource `
+                        $Parts $Query
+                } 'example-org' $config.projectName $route.resource `
+                    $routeParts $route.query
+                $response = & $intakeModule {
+                    param($Client, $Bearer, $Url, $Raw)
+                    Invoke-IntakeBearerGet $Client $Bearer $Url `
+                        ([DateTime]::UtcNow.AddSeconds(5)) 65536 -Raw:$Raw
+                } $client $token $url $route.raw
+                if ($route.raw) {
+                    [Text.Encoding]::UTF8.GetString($response.bytes) |
+                        Should -Be 'synthetic bytes'
+                } else {
+                    $response.Count | Should -Be 1
+                }
+                $url | Should -Match ([regex]::Escape($route.suffix))
+            }
+            $handler.Paths.Count | Should -Be 19
             @($handler.Tokens | Where-Object { $_ -cne $token }).Count |
                 Should -Be 0
             $handler.Paths[0] | Should -Match '/_apis/connectionData\?'
@@ -1695,6 +1751,11 @@ Describe 'Read-only private canary input bootstrap' {
             $handler.Paths[5] | Should -Match '/_apis/git/repositories/.*/pullRequests\?'
             $handler.Paths[6] | Should -Match '/pullRequests/7/threads\?'
             $handler.Paths[11] | Should -Match '/pullRequests/7/iterations/1/changes\?'
+            $handler.Paths[12] | Should -Match '/pullRequests/7\?'
+            $handler.Paths[13] | Should -Match '/pullRequests/7/iterations\?'
+            $handler.Paths[16] | Should -Match '/items\?'
+            $handler.Paths[17] | Should -Match '/commits/'
+            $handler.Paths[18] | Should -Match '/trees/'
         }
         finally { $client.Dispose() }
     }

@@ -2336,7 +2336,7 @@ function New-ActivePrAzureDevOpsProvider {
             Head {
                 $id = [int]$Request.pullRequestId
                 if ($null -ne $Request['remainingReads'] -and
-                    $Request.remainingReads -lt 3) { throw 'read-budget' }
+                    $Request.remainingReads -lt 4) { throw 'read-budget' }
                 $r = & $invoke 'git' 'pullRequests' @(
                     "project=$project", "repositoryId=$repo", "pullRequestId=$id") @() $deadline
                 $iterations = & $invoke 'git' 'pullRequestIterations' @(
@@ -2375,7 +2375,7 @@ function New-ActivePrAzureDevOpsProvider {
                     sourceCommit = $last.sourceRefCommit.commitId
                     targetCommit = $last.targetRefCommit.commitId
                     commonCommit = $last.commonRefCommit.commitId; iterationId = $last.id
-                    readCount = 3 }
+                    readCount = 4 }
             }
             Changes {
                 $id = [int]$Request.pullRequestId
