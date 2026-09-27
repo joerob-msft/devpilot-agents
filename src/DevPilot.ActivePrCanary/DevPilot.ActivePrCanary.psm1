@@ -1614,11 +1614,27 @@ function Invoke-PrivateCanarySignedIntake {
     catch {
         $failure = $_
         if ($null -ne $creationState -and $creationState.created) {
-            $created = $true
-            $root = $StateRoot
-        }
-        if ($created -and $root -and (Test-Path -LiteralPath $root)) {
-            try { Remove-Item -LiteralPath $root -Recurse -Force }
+            $root = [string]$creationState.root
+            $canonical = [IO.Path]::GetFullPath($StateRoot)
+            $comparison = if ($IsWindows) {
+                [StringComparison]::OrdinalIgnoreCase
+            } else { [StringComparison]::Ordinal }
+            if (-not $root.Equals($canonical, $comparison) -or
+                (Test-AgentPathWithin $root $RepositoryRoot) -or
+                (Test-AgentPathWithin $RepositoryRoot $root)) {
+                throw 'canary-private-state-cleanup-failed'
+            }
+            $parent = [IO.Path]::GetDirectoryName($root)
+            if (-not $parent -or
+                $parent.Equals($root, $comparison)) {
+                throw 'canary-private-state-cleanup-failed'
+            }
+            try {
+                Remove-AgentContainedDirectory -Path $root `
+                    -AllowedRoot $parent -LeafPattern (
+                        '^(?:' + [regex]::Escape(
+                            [IO.Path]::GetFileName($root)) + ')$')
+            }
             catch { throw 'canary-private-state-cleanup-failed' }
         }
         throw $failure

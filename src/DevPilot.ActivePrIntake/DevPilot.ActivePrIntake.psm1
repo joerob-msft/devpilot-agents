@@ -1126,8 +1126,15 @@ function Invoke-ActivePrIntake {
             -not $PSBoundParameters.ContainsKey('CanaryPullRequestIds') -or
             $Config.projectEvidence.enabled -cne $true -or
             $null -eq $CreationState -or
+            $CreationState.Contains('root') -or
+            $CreationState.Contains('created') -and
+                $CreationState.created -cne $false -or
             (Test-Path -LiteralPath $StateRoot))) {
         throw 'deferred-intake-invalid'
+    }
+    if ($deferred) {
+        $CreationState.created = $false
+        $CreationState.root = $StateRoot
     }
     $preflightReads = 0
     if ($Config.schemaVersion -eq 2) {
@@ -1821,6 +1828,7 @@ function Invoke-ActivePrIntake {
             }
             finally { $CreationState.created = $created }
             if (-not $created) { throw 'canary-state-root-must-be-new' }
+            $CreationState.root = $StateRoot
             $root = Resolve-AgentTrustedRoot -Path (
                 Join-Path $StateRoot 'active-pr-intake-v1') `
                 -Kind durable-state -RepositoryRoot $RepositoryRoot -Create

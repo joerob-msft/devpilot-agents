@@ -1121,6 +1121,79 @@ Describe 'Read-only private canary input bootstrap' {
                         }).Count | Should -Be 0
                 }
             }
+            It 'removes only its canonical root after an aliased post-proof file failure' {
+                $c = Get-SignedIntakeCase -Code
+                $canonical = [IO.Path]::GetFullPath($c.root)
+                $sibling = "$canonical-neighbor"
+                $script:roots.Add($sibling)
+                [void](New-Item -ItemType Directory -Path $sibling)
+                [IO.File]::WriteAllText((Join-Path $sibling 'keep.txt'), 'keep')
+                $c.root = Join-Path (Split-Path $canonical -Parent) (
+                    '.\' + (Split-Path $canonical -Leaf))
+                Mock Write-CanaryPrivateFile -ModuleName DevPilot.ActivePrCanary {
+                    throw 'signed-file-failed'
+                } -ParameterFilter { $Path -like '*canary-dispatcher.json' }
+                { Invoke-SignedIntakeCase $c } |
+                    Should -Throw '*signed-file-failed*'
+                Test-Path -LiteralPath $canonical | Should -BeFalse
+                [IO.File]::ReadAllText((Join-Path $sibling 'keep.txt')) |
+                    Should -Be 'keep'
+                @($c.state.calls | Where-Object {
+                        $_ -in @('Write', 'Post')
+                    }).Count | Should -Be 0
+            }
+            It 'removes only a root attributed to itself after partial ACL creation' {
+                $c = Get-SignedIntakeCase -Code
+                $canonical = [IO.Path]::GetFullPath($c.root)
+                $sibling = "$canonical-neighbor"
+                $script:roots.Add($sibling)
+                [void](New-Item -ItemType Directory -Path $sibling)
+                [IO.File]::WriteAllText((Join-Path $sibling 'keep.txt'), 'keep')
+                Mock Resolve-AgentTrustedRoot -ModuleName DevPilot.ActivePrIntake {
+                    [void](New-Item -ItemType Directory -Path $Path)
+                    $CreatedByCaller.Value = $true
+                    throw 'synthetic-acl-failed'
+                } -ParameterFilter { $Create -and $Path -ceq $canonical }
+                { Invoke-SignedIntakeCase $c } |
+                    Should -Throw '*synthetic-acl-failed*'
+                Test-Path -LiteralPath $canonical | Should -BeFalse
+                [IO.File]::ReadAllText((Join-Path $sibling 'keep.txt')) |
+                    Should -Be 'keep'
+            }
+            It 'removes its new root when opening the post-proof lock fails' {
+                $c = Get-SignedIntakeCase -Code
+                $canonical = [IO.Path]::GetFullPath($c.root)
+                $sibling = "$canonical-neighbor"
+                $script:roots.Add($sibling)
+                [void](New-Item -ItemType Directory -Path $sibling)
+                [IO.File]::WriteAllText((Join-Path $sibling 'keep.txt'), 'keep')
+                Mock Resolve-AgentTrustedRoot -ModuleName DevPilot.ActivePrIntake {
+                    [void](New-Item -ItemType Directory -Path $Path)
+                    [void](New-Item -ItemType Directory -Path (
+                            Join-Path (Split-Path $Path -Parent) 'cohort.lock'))
+                    return $Path
+                } -ParameterFilter {
+                    $Create -and $Path -ceq (
+                        Join-Path $canonical 'active-pr-intake-v1\generations')
+                }
+                { Invoke-SignedIntakeCase $c } | Should -Throw
+                Test-Path -LiteralPath $canonical | Should -BeFalse
+                [IO.File]::ReadAllText((Join-Path $sibling 'keep.txt')) |
+                    Should -Be 'keep'
+            }
+            It 'never deletes an existing signed root presented through a path alias' {
+                $c = Get-SignedIntakeCase
+                $canonical = [IO.Path]::GetFullPath($c.root)
+                [void](New-Item -ItemType Directory -Path $canonical)
+                [IO.File]::WriteAllText((Join-Path $canonical 'keep.txt'), 'keep')
+                $c.root = Join-Path (Split-Path $canonical -Parent) (
+                    '.\' + (Split-Path $canonical -Leaf))
+                { Invoke-SignedIntakeCase $c } |
+                    Should -Throw '*canary-state-root-must-be-new*'
+                [IO.File]::ReadAllText((Join-Path $canonical 'keep.txt')) |
+                    Should -Be 'keep'
+                $c.state.calls.Count | Should -Be 0
+            }
             It 'rejects cross-volume aliases without treating an external path as repository state' {
                 if (-not $IsWindows) { Set-ItResult -Skipped -Because 'Windows drives only' }
                 else {
