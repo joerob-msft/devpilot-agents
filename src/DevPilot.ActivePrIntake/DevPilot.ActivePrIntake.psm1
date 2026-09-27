@@ -1134,7 +1134,7 @@ function Invoke-ActivePrIntake {
     }
     if ($deferred) {
         $CreationState.created = $false
-        $CreationState.root = $StateRoot
+        $CreationState.root = [IO.Path]::GetFullPath($StateRoot)
     }
     $preflightReads = 0
     if ($Config.schemaVersion -eq 2) {

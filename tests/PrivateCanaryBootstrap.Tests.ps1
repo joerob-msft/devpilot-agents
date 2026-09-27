@@ -1149,6 +1149,8 @@ Describe 'Read-only private canary input bootstrap' {
                 $script:roots.Add($sibling)
                 [void](New-Item -ItemType Directory -Path $sibling)
                 [IO.File]::WriteAllText((Join-Path $sibling 'keep.txt'), 'keep')
+                $c.root = Join-Path (Split-Path $canonical -Parent) (
+                    '.\' + (Split-Path $canonical -Leaf))
                 Mock Resolve-AgentTrustedRoot -ModuleName DevPilot.ActivePrIntake {
                     [void](New-Item -ItemType Directory -Path $Path)
                     $CreatedByCaller.Value = $true
