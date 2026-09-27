@@ -207,6 +207,24 @@ function Write-CanaryPrivateFile {
     finally { $stream.Dispose() }
 }
 
+function Get-CanarySignature {
+    param([Collections.IDictionary]$Config, [string]$Key)
+    $unsigned = [ordered]@{}
+    foreach ($entry in $Config.Keys) {
+        if ([string]$entry -cne 'signature') { $unsigned[[string]$entry] = $Config[$entry] }
+    }
+    $hmac = [Security.Cryptography.HMACSHA256]::new(
+        [Text.Encoding]::UTF8.GetBytes($Key))
+    try {
+        return 'v1:hmac-sha256:' +
+            [Convert]::ToHexString($hmac.ComputeHash(
+                    [Text.Encoding]::UTF8.GetBytes(
+                        (ConvertTo-AgentCanonicalJson -InputObject $unsigned))
+                )).ToLowerInvariant()
+    }
+    finally { $hmac.Dispose() }
+}
+
 function Get-CanaryGitValue {
     param([string]$RepositoryRoot, [string[]]$Arguments)
     try { $answer = & git -C $RepositoryRoot @Arguments 2>$null }
@@ -1012,6 +1030,208 @@ function Invoke-PrivateCanaryRuleRegistry {
     finally { $client.Dispose() }
 }
 
+function Invoke-PrivateCanarySignedIntake {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$ProviderConfig,
+        [Parameter(Mandatory)][Collections.IDictionary]$ApprovedSources,
+        [Parameter(Mandatory)][string]$StateRoot,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][int[]]$CanaryPullRequestIds,
+        [string]$AzureCliPath = 'az',
+        [scriptblock]$Read,
+        [scriptblock]$Provider,
+        [switch]$Run
+    )
+    if ($CanaryPullRequestIds.Count -lt 1 -or $CanaryPullRequestIds.Count -gt 2 -or
+        @($CanaryPullRequestIds | Where-Object { $_ -lt 1 }).Count -gt 0 -or
+        @($CanaryPullRequestIds | Select-Object -Unique).Count -ne
+            $CanaryPullRequestIds.Count) { throw 'invalid-canary-selection' }
+    if (-not [IO.Path]::IsPathFullyQualified($StateRoot) -or
+        -not [IO.Path]::IsPathFullyQualified($RepositoryRoot) -or
+        (Test-AgentPathWithin $StateRoot $RepositoryRoot) -or
+        (Test-AgentPathWithin $RepositoryRoot $StateRoot)) {
+        throw 'state-root-must-be-external'
+    }
+    if (Test-Path -LiteralPath $StateRoot) { throw 'canary-state-root-must-be-new' }
+    if (-not $Run) {
+        return [ordered]@{ state = 'disabled'; signed = $false
+            evaluated = $false; providerReads = 0; providerWrites = 0
+            modelToolInvocations = 0; writerEligible = $false }
+    }
+    $sourceSnapshot = ConvertTo-Json -InputObject $ApprovedSources -Depth 32 -Compress
+    $providerSnapshot = ConvertTo-Json -InputObject $ProviderConfig -Depth 32 -Compress
+    $registryArgs = @{ ProviderConfig = $ProviderConfig
+        ApprovedSources = $ApprovedSources; RepositoryRoot = $RepositoryRoot; Run = $true }
+    if ($Read) {
+        $registryArgs.Read = $Read
+        $registry = New-VerifiedCanaryRuleRegistry @registryArgs
+    } else {
+        $registry = Invoke-PrivateCanaryRuleRegistry @registryArgs -AzureCliPath $AzureCliPath
+    }
+    if ($registry.state -cne 'verified-not-evaluated' -or
+        $registry.rules.Count -ne 4 -or $registry.providerWrites -ne 0) {
+        throw 'canary-registry-incomplete'
+    }
+    $templateRoot = Join-Path $RepositoryRoot 'samples'
+    $intake = Get-Content -LiteralPath (Join-Path $templateRoot `
+            'active-pr-intake.config.json') -Raw | ConvertFrom-Json -AsHashtable
+    $intake.organization = "https://dev.azure.com/$($ProviderConfig.repository.organization)"
+    $intake.projectName = [string]$ProviderConfig.repository.project
+    $intake.projectId = [string]$ProviderConfig.projectId
+    $intake.repositoryId = [string]$ProviderConfig.repository.id
+    $intake.expectedAccount = $ProviderConfig.expectedAccount
+    $intake.enabled = $true
+    $intake.pagination = [ordered]@{ mode = 'created-time-keyset' }
+    $intake.projectEvidence.enabled = $true
+    $intake.rules = @($registry.rules.Keys | ForEach-Object {
+            [ordered]@{ id = [string]$_; capability = [string]$_ }
+        })
+    $intake.limits.maxHeadsPerRun = $CanaryPullRequestIds.Count
+    if (-not $Provider) {
+        $Provider = New-ActivePrAzureDevOpsProvider -Config $intake `
+            -AzureCliPath $AzureCliPath -VerifyReadPrincipal
+    }
+    $created = $false
+    $root = Resolve-AgentTrustedRoot -Path $StateRoot -Kind durable-state `
+        -RepositoryRoot $RepositoryRoot -Create -CreatedByCaller ([ref]$created)
+    if (-not $created) { throw 'canary-state-root-must-be-new' }
+    $cohort = Invoke-ActivePrIntake -Config $intake -Provider $Provider `
+        -StateRoot $root -RepositoryRoot $RepositoryRoot `
+        -CanaryPullRequestIds $CanaryPullRequestIds -Run
+    if ($cohort.inventory.state -cne 'complete' -or
+        $cohort.populationKnown -cne $true -or
+        $cohort.gapCounts.enumerationUnknown -ne 0 -or
+        $cohort.gapCounts.duplicateEntries -ne 0 -or
+        $cohort.inventory.nonDraft -ne $cohort.heads.Count -or
+        $cohort.inventory.active -ne
+            ($cohort.inventory.draft + $cohort.inventory.nonDraft) -or
+        $cohort.inventory.eligible -ne
+            ($cohort.inventory.nonDraft - $cohort.inventory.excludedOtherTargets)) {
+        throw 'canary-inventory-unknown'
+    }
+    $pins = @($CanaryPullRequestIds | ForEach-Object {
+            $id = $_
+            $heads = @($cohort.heads | Where-Object pullRequestId -EQ $id)
+            if ($heads.Count -ne 1 -or
+                $heads[0].status -cne 'pending' -or
+                $heads[0].targetRef -cne 'refs/heads/master' -or
+                $null -eq $heads[0].lineEvidence -or
+                [string]$heads[0].lineEvidenceDigest -cnotmatch '^[a-f0-9]{64}$' -or
+                $null -eq $heads[0].projectEvidence -or
+                $heads[0].projectEvidence.complete -cne $true -or
+                [string]$heads[0].projectEvidenceDigest -cnotmatch '^[a-f0-9]{64}$') {
+                throw 'canary-head-or-evidence-unknown'
+            }
+            [ordered]@{
+                pullRequestId = $id
+                sourceCommit = $heads[0].sourceCommit
+                targetCommit = $heads[0].targetCommit
+                targetRef = $heads[0].targetRef
+                iterationId = $heads[0].iterationId
+                declarationDigest = $heads[0].declarationDigest
+                lineEvidenceDigest = $heads[0].lineEvidenceDigest
+                projectEvidenceDigest = $heads[0].projectEvidenceDigest
+            }
+        })
+    if ($Read) {
+        $finalRegistry = New-VerifiedCanaryRuleRegistry @registryArgs
+    } else {
+        $finalRegistry = Invoke-PrivateCanaryRuleRegistry @registryArgs `
+            -AzureCliPath $AzureCliPath
+    }
+    if ($finalRegistry.receiptDigest -cne $registry.receiptDigest -or
+        $finalRegistry.state -cne 'verified-not-evaluated' -or
+        (ConvertTo-Json -InputObject $ApprovedSources -Depth 32 -Compress) -cne
+            $sourceSnapshot -or
+        (ConvertTo-Json -InputObject $ProviderConfig -Depth 32 -Compress) -cne
+            $providerSnapshot) {
+        throw 'canary-source-drift'
+    }
+    $config = [ordered]@{
+        schemaVersion = 1
+        kind = 'private-canary-signed-intake'
+        enabled = $false
+        readOnly = $true
+        dryRun = $true
+        writerEligible = $false
+        modelEnabled = $false
+        organization = $intake.organization
+        projectId = $intake.projectId
+        repositoryId = $intake.repositoryId
+        expectedAccount = $intake.expectedAccount
+        sourceAuthority = 'unmerged-reviewed-pr-is-candidate-only'
+        receiptDigest = $registry.receiptDigest
+        intakeGeneration = $cohort.generation
+        intakeConfigDigest = $cohort.binding.configDigest
+        heads = $pins
+        rules = @($registry.rules.Keys | ForEach-Object {
+                $rule = $registry.rules[$_]
+                [ordered]@{
+                    capabilityId = $rule.id
+                    enabled = $false
+                    evaluated = $false
+                    writerEligible = $false
+                    sourceAuthority = $rule.sourceAuthority
+                    sourceCommit = $rule.sourceCommit
+                    sourceHash = $rule.sourceHash
+                    declarationDigest = $rule.declarationDigest
+                }
+            })
+        limits = [ordered]@{
+            maxHeadsPerRun = $CanaryPullRequestIds.Count
+            maxReads = 3000
+            maxSeconds = 240
+            maxFindingsPerHead = 8
+        }
+        signature = ''
+    }
+    $key = [Convert]::ToBase64String(
+        [Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
+    $config.signature = Get-CanarySignature $config $key
+    foreach ($entry in @(
+            @{ name = 'provider-config.json'; value = $ProviderConfig },
+            @{ name = 'approved-sources.json'; value = $ApprovedSources },
+            @{ name = 'canary-intake.json'; value = $intake },
+            @{ name = 'canary-dispatcher.json'; value = $config })) {
+        $file = Join-Path $root $entry.name
+        Write-CanaryPrivateFile $file ([Text.Encoding]::UTF8.GetBytes(
+                (ConvertTo-Json -InputObject $entry.value -Depth 32)))
+        [void](Assert-AgentTrustedFile -Path $file -AllowedRoot $root -Private)
+    }
+    $keyFile = Join-Path $root 'signature.key'
+    Write-CanaryPrivateFile $keyFile ([Text.Encoding]::ASCII.GetBytes($key))
+    [void](Assert-AgentTrustedFile -Path $keyFile -AllowedRoot $root -Private)
+    return [ordered]@{
+        state = 'signed-intake-not-evaluated'
+        signed = $true
+        evaluated = $false
+        writerEligible = $false
+        providerReads = $registry.providerReads + $cohort.readCount +
+            $finalRegistry.providerReads
+        providerWrites = 0
+        modelToolInvocations = 0
+        inventory = [ordered]@{
+            active = $cohort.inventory.active
+            nonDraft = $cohort.inventory.nonDraft
+            draft = $cohort.inventory.draft
+            eligible = $cohort.inventory.eligible
+            pagesFirst = $cohort.pages.first
+            pagesSecond = $cohort.pages.second
+        }
+        intakeGeneration = $cohort.generation
+        selected = $pins.Count
+        pending = $cohort.counts.deferred + $pins.Count
+        skipped = $cohort.counts.skipped
+        unknown = $cohort.counts.error
+        rules = @($config.rules | ForEach-Object {
+                [ordered]@{ capabilityId = $_.capabilityId
+                    evaluated = 0; humanCovered = 0; wouldCreate = 0
+                    unknown = $pins.Count }
+            })
+    }
+}
+
 function Invoke-ActivePrCanaryQualification {
     [CmdletBinding()]
     param(
@@ -1223,20 +1443,7 @@ function Invoke-ActivePrCanaryQualification {
     $config.signature = ''
     $keyBytes = [Security.Cryptography.RandomNumberGenerator]::GetBytes(48)
     $key = [Convert]::ToBase64String($keyBytes)
-    $unsigned = [ordered]@{}
-    foreach ($entry in $config.Keys) {
-        if ([string]$entry -cne 'signature') { $unsigned[[string]$entry] = $config[$entry] }
-    }
-    $hmac = [Security.Cryptography.HMACSHA256]::new(
-        [Text.Encoding]::UTF8.GetBytes($key))
-    try {
-        $config.signature = 'v1:hmac-sha256:' +
-            [Convert]::ToHexString($hmac.ComputeHash(
-                    [Text.Encoding]::UTF8.GetBytes(
-                        (ConvertTo-AgentCanonicalJson -InputObject $unsigned))
-                )).ToLowerInvariant()
-    }
-    finally { $hmac.Dispose() }
+    $config.signature = Get-CanarySignature $config $key
     Write-CanaryPrivateFile (Join-Path $root 'signature.key') `
         ([Text.Encoding]::ASCII.GetBytes($key))
     [void](Assert-AgentTrustedFile -Path (Join-Path $root 'signature.key') `
@@ -1299,4 +1506,5 @@ function Invoke-ActivePrCanaryQualification {
 
 Export-ModuleMember -Function Invoke-ActivePrCanaryQualification,
     Assert-CanaryCoverageSource, Invoke-PrivateCanaryBootstrap,
-    New-VerifiedCanaryRuleRegistry, Invoke-PrivateCanaryRuleRegistry
+    New-VerifiedCanaryRuleRegistry, Invoke-PrivateCanaryRuleRegistry,
+    Invoke-PrivateCanarySignedIntake

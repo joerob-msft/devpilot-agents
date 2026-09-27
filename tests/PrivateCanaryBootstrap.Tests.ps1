@@ -195,6 +195,126 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             -ApprovedSources $InputCase.sources -RepositoryRoot $repo `
             -Read $InputCase.case.provider -Run
     }
+    function Get-SignedIntakeCase {
+        $inputCase = Get-RegistryCase
+        $root = $inputCase.case.root + '-signed'
+        $script:roots.Add($root)
+        $state = @{
+            calls = [Collections.Generic.List[string]]::new()
+            wrong = ''
+            visits = 0
+            cutoff = $null
+            rows = @(
+                @{ pullRequestId = 17007699; status = 'active'
+                    isDraft = $false; targetRef = 'refs/heads/master'
+                    creationDate = [DateTime]::UtcNow.AddMinutes(-4).ToString('o') },
+                @{ pullRequestId = 17109075; status = 'active'
+                    isDraft = $false; targetRef = 'refs/heads/master'
+                    creationDate = [DateTime]::UtcNow.AddMinutes(-5).ToString('o') },
+                @{ pullRequestId = 17109076; status = 'active'
+                    isDraft = $true; targetRef = 'refs/heads/master'
+                    creationDate = [DateTime]::UtcNow.AddMinutes(-6).ToString('o') },
+                @{ pullRequestId = 17109077; status = 'active'
+                    isDraft = $false; targetRef = 'refs/heads/release'
+                    creationDate = [DateTime]::UtcNow.AddMinutes(-7).ToString('o') }
+            )
+        }
+        $config = $inputCase.config
+        $digest = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData(
+                [Text.Encoding]::UTF8.GetBytes('"/notes.txt"'))).ToLowerInvariant()
+        $provider = {
+            param($op, $request)
+            $state.calls.Add($op) | Out-Null
+            switch -CaseSensitive ($op) {
+                Identity {
+                    return $config.expectedAccount
+                }
+                ListPage {
+                    if ($request.skip -ne 0 -or $request.top -ne 51 -or
+                        [string]$request.maxTime -cnotmatch
+                            '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z$') {
+                        throw 'unbounded or offset inventory'
+                    }
+                    if ($null -eq $state.cutoff) {
+                        $state.cutoff = [string]$request.maxTime
+                    } elseif ($request.pass -eq 2 -and
+                        $request.maxTime -gt $state.cutoff) {
+                        throw 'changed inventory cutoff'
+                    }
+                    if ($state.wrong -eq 'split-page' -and
+                        $request.pass -eq 2 -and $request.skip -eq 0) {
+                        return @{ items = @($state.rows[0]); count = 1
+                            totalCount = 1 }
+                    }
+                    $items = @($state.rows | Where-Object {
+                            [DateTimeOffset]::Parse($_.creationDate) -lt
+                            [DateTimeOffset]::Parse($request.maxTime)
+                        } | Select-Object -First $request.top)
+                    return @{ items = $items; count = $items.Count }
+                }
+                Head {
+                    $state.visits++
+                    $id = [int]$request.pullRequestId
+                    $row = @($state.rows | Where-Object pullRequestId -EQ $id)[0]
+                    return @{ pullRequestId = $id
+                        repositoryId = $config.repository.id
+                        projectId = $config.projectId
+                        status = 'active'; isDraft = $false
+                        sourceRef = 'refs/heads/feature'
+                        targetRef = $row.targetRef
+                        sourceCommit = if ($state.wrong -eq 'stale-head' -and
+                            $state.visits -gt 1) { 'f' * 40 } else { 'a' * 40 }
+                        targetCommit = 'b' * 40
+                        commonCommit = 'c' * 40; iterationId = 1 }
+                }
+                Changes {
+                    if ($state.wrong -eq 'provider-drift') {
+                        $config.expectedAccount.uniqueName = 'other@example.invalid'
+                    }
+                    return @{ changedFiles = 1; changedLines = 1
+                        baseCommit = $request.commonCommit
+                        files = @(@{ pathDigest = $digest
+                                originalPathDigest = $null
+                                changeType = 'add'; addedLines = 1
+                                deletedLines = 0; newLineCount = 1
+                                spans = @(@{ startLine = 1; endLine = 1 }) })
+                        evaluationFiles = @(@{ path = '/notes.txt'
+                                content = 'synthetic'; objectId = 'd' * 40 })
+                        projectEvidence = @{
+                            schemaVersion = 1
+                            kind = 'source-bound-project-scope-summary-v1'
+                            repositoryId = $config.repository.id
+                            sourceCommit = if ($state.wrong -eq 'fake-graph') {
+                                'f' * 40
+                            } else { $request.sourceCommit }
+                            rootTreeId = $null; complete = $true
+                            files = @()
+                        } }
+                }
+                Discussions { return @{ threads = @(); count = 0 } }
+                default { throw 'unexpected or writing provider operation' }
+            }
+        }.GetNewClosure()
+        $baseline = $inputCase.case.state.headChecks
+        $read = {
+            param($operation, $request)
+            if ($state.wrong -eq 'late-head' -and
+                $operation -ceq 'PullRequest' -and
+                $inputCase.case.state.headChecks -ge ($baseline + 2)) {
+                $inputCase.case.state.head = 'f' * 40
+            }
+            & $inputCase.case.provider $operation $request
+        }.GetNewClosure()
+        return @{ input = $inputCase; root = $root; state = $state
+            read = $read; provider = $provider }
+    }
+    function Invoke-SignedIntakeCase($Case) {
+        Invoke-PrivateCanarySignedIntake -ProviderConfig $Case.input.config `
+            -ApprovedSources $Case.input.sources -StateRoot $Case.root `
+            -RepositoryRoot $repo -CanaryPullRequestIds @(17007699, 17109075) `
+            -Read $Case.read -Provider $Case.provider -Run
+    }
 }
 AfterAll {
     & (Get-Module DevPilot.ActivePrCanary) {
@@ -232,6 +352,134 @@ Describe 'Read-only private canary input bootstrap' {
             $result.providerWrites | Should -Be 0
             $c.state.reads.Count | Should -Be 0
             Test-Path $c.root | Should -BeFalse
+        }
+        Describe 'Signed four-source intake handoff without evaluation' {
+            It 'defaults off with no source reads, state, signing, or model' {
+                $c = Get-SignedIntakeCase
+                $c.input.case.state.reads.Clear()
+                $result = Invoke-PrivateCanarySignedIntake -ProviderConfig @{} `
+                    -ApprovedSources @{} -StateRoot $c.root -RepositoryRoot $repo `
+                    -CanaryPullRequestIds @(17007699, 17109075) `
+                    -Read $c.input.case.provider -Provider $c.provider
+                $result.state | Should -Be 'disabled'
+                $result.providerReads | Should -Be 0
+                $result.modelToolInvocations | Should -Be 0
+                $c.state.calls.Count | Should -Be 0
+                $c.input.case.state.reads.Count | Should -Be 0
+                Test-Path $c.root | Should -BeFalse
+                $json = & (Join-Path $repo 'tools\Invoke-PrivateCanarySignedIntake.ps1') `
+                    -ProviderConfigPath (Join-Path $c.input.case.root 'provider-config.json') `
+                    -ApprovedSourcesPath (Join-Path $c.input.case.root 'approved-sources.json') `
+                    -StateRoot $c.root -CanaryPullRequestIds @(17007699, 17109075)
+                ($json | ConvertFrom-Json -AsHashtable).state | Should -Be 'disabled'
+                Test-Path $c.root | Should -BeFalse
+            }
+            It 'signs only a complete two-pass cohort and leaves all four rules disabled' {
+                $c = Get-SignedIntakeCase
+                $result = Invoke-SignedIntakeCase $c
+                $result.state | Should -Be 'signed-intake-not-evaluated'
+                $result.signed | Should -BeTrue
+                $result.evaluated | Should -BeFalse
+                $result.writerEligible | Should -BeFalse
+                $result.providerWrites | Should -Be 0
+                $result.modelToolInvocations | Should -Be 0
+                $result.inventory.active | Should -Be 4
+                $result.inventory.nonDraft | Should -Be 3
+                $result.inventory.draft | Should -Be 1
+                $result.inventory.eligible | Should -Be 2
+                $result.selected | Should -Be 2
+                $result.pending | Should -Be 2
+                $result.skipped | Should -Be 1
+                @($result.rules | Where-Object {
+                        $_.evaluated -ne 0 -or $_.wouldCreate -ne 0
+                    }).Count | Should -Be 0
+                $config = Get-Content -LiteralPath (
+                    Join-Path $c.root 'canary-dispatcher.json') -Raw |
+                    ConvertFrom-Json -AsHashtable
+                $key = Get-Content -LiteralPath (
+                    Join-Path $c.root 'signature.key') -Raw
+                $signed = $config.signature
+                $config.Remove('signature')
+                $hmac = [Security.Cryptography.HMACSHA256]::new(
+                    [Text.Encoding]::UTF8.GetBytes($key))
+                try {
+                    $expected = 'v1:hmac-sha256:' +
+                        [Convert]::ToHexString($hmac.ComputeHash(
+                                [Text.Encoding]::UTF8.GetBytes(
+                                    (ConvertTo-AgentCanonicalJson -InputObject $config))
+                            )).ToLowerInvariant()
+                    $signed | Should -Be $expected
+                }
+                finally { $hmac.Dispose() }
+                $config.rules.Count | Should -Be 4
+                $config.rules[1].declarationDigest |
+                    Should -Not -Be $config.rules[2].declarationDigest
+                @($config.rules | Where-Object {
+                        $_.enabled -or $_.evaluated -or $_.writerEligible
+                    }).Count | Should -Be 0
+                @($c.state.calls | Where-Object {
+                        $_ -notin @('Identity', 'ListPage', 'Head', 'Changes',
+                            'Discussions')
+                    }).Count | Should -Be 0
+                @($c.input.case.state.reads | Where-Object {
+                        $_ -in @('Post', 'Write', 'ListPage', 'Changes')
+                    }).Count | Should -Be 0
+                ($result | ConvertTo-Json -Depth 10) | Should -Not -Match `
+                    'synthetic|signature|service@example.invalid'
+                foreach ($name in @('signature.key', 'provider-config.json',
+                        'approved-sources.json', 'canary-intake.json',
+                        'canary-dispatcher.json')) {
+                    [void](Assert-AgentTrustedFile -Path (Join-Path $c.root $name) `
+                            -AllowedRoot $c.root -Private)
+                }
+            }
+            It 'refuses split inventory, stale heads, fake graph and forged receipt before signing' {
+                foreach ($failure in @('split-page', 'stale-head', 'fake-graph',
+                        'forged-receipt', 'cursor-collision', 'late-head',
+                        'provider-drift')) {
+                    $c = Get-SignedIntakeCase
+                    if ($failure -eq 'forged-receipt') {
+                        $c.input.sources.rules['bpm-redundant-method-coverage@2'].blobId =
+                            'f' * 40
+                    } elseif ($failure -eq 'cursor-collision') {
+                        $c.state.rows = @($c.state.rows) + @(
+                            for ($n = 0; $n -lt 48; $n++) {
+                                @{ pullRequestId = 17110000 + $n
+                                    status = 'active'; isDraft = $true
+                                    targetRef = 'refs/heads/master'
+                                    creationDate = [DateTime]::UtcNow.AddMinutes(
+                                        -20 - $n).ToString('o') }
+                            }
+                        )
+                        $c.state.rows[50].creationDate =
+                            $c.state.rows[49].creationDate
+                    } else { $c.state.wrong = $failure }
+                    { Invoke-SignedIntakeCase $c } | Should -Throw -Because $failure
+                    Test-Path (Join-Path $c.root 'signature.key') | Should -BeFalse
+                    @($c.state.calls | Where-Object {
+                            $_ -notin @('Identity', 'ListPage', 'Head', 'Changes',
+                                'Discussions')
+                        }).Count | Should -Be 0
+                }
+            }
+            It 'rejects cross-volume aliases without treating an external path as repository state' {
+                if (-not $IsWindows) { Set-ItResult -Skipped -Because 'Windows drives only' }
+                else {
+                    (Test-AgentPathWithin -Path 'Z:\synthetic\private-state' `
+                        -Root $repo) | Should -BeFalse
+                    (Test-AgentPathWithin -Path $repo `
+                        -Root 'Z:\synthetic\private-state') | Should -BeFalse
+                }
+            }
+            It 'rejects a preexisting or repository-ancestor state root without reading' {
+                $c = Get-SignedIntakeCase
+                $c.root = $repo
+                { Invoke-SignedIntakeCase $c } | Should -Throw '*state-root-must-be-external*'
+                $c.state.calls.Count | Should -Be 0
+                $c.root = $c.input.case.root
+                { Invoke-SignedIntakeCase $c } | Should -Throw '*must-be-new*'
+                $c.state.calls.Count | Should -Be 0
+            }
         }
         It 'keeps the repository command disabled with actual trusted bootstrap files' {
             $inputCase = Get-RegistryCase

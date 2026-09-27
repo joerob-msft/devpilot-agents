@@ -63,6 +63,11 @@ function Assert-IntakeConfig {
         [void](Assert-IntakeNumber $scope.maxTreeEntries maxTreeEntries 1 10000)
         [void](Assert-IntakeNumber $scope.maxProjects maxProjects 1 32)
     }
+    if ($null -ne $Config['pagination'] -and
+        ($Config.pagination -isnot [Collections.IDictionary] -or
+            $Config.pagination.mode -cne 'created-time-keyset')) {
+        throw 'Invalid intake pagination mode.'
+    }
     if ($Config.rules -isnot [array] -or $Config.rules.Count -eq 0 -or
         $Config.rules.Count -gt 32) { throw 'A bounded generic rule registry is required.' }
     if ([int]$Config.limits.maxPullRequests * $Config.rules.Count -gt 20000) {
@@ -386,25 +391,71 @@ function Assert-IntakeProjectScope {
 
 function Get-IntakePass {
     param([scriptblock]$Provider, [Collections.IDictionary]$Config,
-        [ref]$Reads, [Diagnostics.Stopwatch]$Clock, [int]$Pass)
+        [ref]$Reads, [Diagnostics.Stopwatch]$Clock, [int]$Pass,
+        [string]$Cutoff)
     $seen = @{}
     $duplicates = 0
     $offset = 0
     $size = [int]$Config.limits.pageSize
     $total = $null
+    $keyset = $null -ne $Config['pagination']
+    $cursor = $Cutoff
+    $shortPage = $false
     for ($page = 0; $page -lt [int]$Config.limits.maxPages; $page++) {
-        $raw = Invoke-IntakeRead $Provider 'ListPage' @{
-            pass = $Pass; skip = $offset; top = $size
-        } $Config $Reads $Clock
+        $request = @{ pass = $Pass; skip = $offset; top = $size }
+        if ($keyset) {
+            $request.skip = 0
+            $request.top = $size + 1
+            $request.maxTime = $cursor
+        }
+        $raw = Invoke-IntakeRead $Provider 'ListPage' $request $Config $Reads $Clock
         if ($raw.items -isnot [array] -or $null -eq $raw.count -or
-            (Assert-IntakeNumber $raw.count count 0 $size) -ne $raw.items.Count) {
+            (Assert-IntakeNumber $raw.count count 0 $request.top) -ne $raw.items.Count) {
             throw 'invalid-page'
         }
+        if ($keyset) {
+            if ($raw.items.Count -eq 0) {
+                return @{ seen = $seen; duplicates = $duplicates; pages = $page + 1 }
+            }
+            if ($shortPage) { throw 'missing-page' }
+            $windowTime = [DateTimeOffset]::Parse($cursor,
+                [Globalization.CultureInfo]::InvariantCulture)
+            $times = [Collections.Generic.List[DateTimeOffset]]::new()
+            foreach ($item in $raw.items) {
+                $date = [DateTimeOffset]::MinValue
+                if ($item -isnot [Collections.IDictionary] -or
+                    [string]$item.creationDate -cnotmatch
+                        '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{1,7}Z$' -or
+                    -not [DateTimeOffset]::TryParseExact(
+                        [string]$item.creationDate, 'yyyy-MM-ddTHH:mm:ss.FFFFFFFK',
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [Globalization.DateTimeStyles]::None, [ref]$date) -or
+                    $date -ge $windowTime -or
+                    ($times.Count -gt 0 -and $date -gt $times[$times.Count - 1])) {
+                    throw 'mutable-page'
+                }
+                $times.Add($date)
+            }
+            $take = [Math]::Min($size, $raw.items.Count)
+            if ($raw.items.Count -gt $size -and
+                $times[$size] -eq $times[$size - 1]) {
+                throw 'page-cursor-collision'
+            }
+            $raw.items = @($raw.items | Select-Object -First $take)
+            $raw.count = $take
+            $cursor = $times[$take - 1].UtcDateTime.ToString('o')
+            $shortPage = $times.Count -lt ($size + 1)
+            if ($seen.Count + $take -gt [int]$Config.limits.maxPullRequests) {
+                throw 'pr-budget'
+            }
+        }
         if ($null -ne $raw['totalCount']) {
-            $declared = Assert-IntakeNumber $raw['totalCount'] totalCount 0 10000
-            if ($null -ne $total -and $total -ne $declared) { throw 'mutable-page' }
-            $total = $declared
-            if ($total -gt [int]$Config.limits.maxPullRequests) { throw 'pr-budget' }
+            if (-not $keyset) {
+                $declared = Assert-IntakeNumber $raw['totalCount'] totalCount 0 10000
+                if ($null -ne $total -and $total -ne $declared) { throw 'mutable-page' }
+                $total = $declared
+                if ($total -gt [int]$Config.limits.maxPullRequests) { throw 'pr-budget' }
+            }
         }
         foreach ($item in $raw.items) {
             if ($item -isnot [Collections.IDictionary]) { throw 'invalid-page' }
@@ -423,12 +474,14 @@ function Get-IntakePass {
             $key = [string]$id
             $digest = Get-IntakeDigest $value
             if ($seen.ContainsKey($key)) {
+                if ($keyset) { throw 'mutable-page' }
                 $duplicates++
                 if ($seen[$key].digest -cne $digest) { throw 'mutable-page' }
             }
             else { $seen[$key] = @{ digest = $digest; value = $value } }
         }
         if ($seen.Count -gt [int]$Config.limits.maxPullRequests) { throw 'pr-budget' }
+        if ($keyset) { continue }
         $offset += $raw.items.Count
         if ($null -ne $total -and $offset -gt $total) { throw 'mutable-page' }
         if ($raw.items.Count -eq 0) {
@@ -976,6 +1029,7 @@ function Invoke-ActivePrIntake {
         $heads = [Collections.Generic.List[object]]::new()
         $reads = 0
         $clock = [Diagnostics.Stopwatch]::StartNew()
+        $cutoff = [DateTime]::UtcNow.ToString('o')
         try {
                 $identity = Invoke-IntakeRead $Provider Identity @{} $Config ([ref]$reads) $clock
                 if ([string]$identity.id -ine [string]$Config.expectedAccount.id -or
@@ -983,9 +1037,9 @@ function Invoke-ActivePrIntake {
                     [string]$identity.descriptor -cne [string]$Config.expectedAccount.descriptor) {
                     throw 'account-mismatch'
                 }
-                $first = Get-IntakePass $Provider $Config ([ref]$reads) $clock 1
+                $first = Get-IntakePass $Provider $Config ([ref]$reads) $clock 1 $cutoff
                 $envelope.pages.first = $first.pages
-                $second = Get-IntakePass $Provider $Config ([ref]$reads) $clock 2
+                $second = Get-IntakePass $Provider $Config ([ref]$reads) $clock 2 $cutoff
                 $envelope.pages.second = $second.pages
                 $envelope.gaps.duplicateEntries = $first.duplicates + $second.duplicates
                 if ($first.seen.Count -ne $second.seen.Count) { throw 'mutable-page' }
@@ -997,6 +1051,9 @@ function Invoke-ActivePrIntake {
                 }
                 $envelope.populationKnown = $true
                 $envelope.inventory.state = 'complete'
+                if ($null -ne $Config['pagination']) {
+                    $envelope.inventory.cutoffUtc = $cutoff
+                }
                 $envelope.inventory.gaps = @('no-atomic-snapshot-token')
                 $ids = @($first.seen.Keys | ForEach-Object { [int]$_ } | Sort-Object)
                 $envelope.denominators.active = $ids.Count
@@ -1400,6 +1457,7 @@ function Invoke-ActivePrIntake {
         catch {
             $reason = [string]$_.Exception.Message
             if ($reason -cnotin @('account-mismatch', 'invalid-page', 'mutable-page',
+                    'page-cursor-collision',
                     'canary-not-in-complete-eligible-inventory',
                     'missing-page', 'page-budget', 'pr-budget', 'read-budget',
                     'time-budget')) { $reason = 'page-inaccessible' }
@@ -1941,16 +1999,35 @@ function New-ActivePrAzureDevOpsProvider {
                     commit = $commit; path = $path }
             }
             ListPage {
-                $r = & $invoke 'git' 'pullRequests' @("project=$project", "repositoryId=$repo") @(
-                    'searchCriteria.status=active', "searchCriteria.repositoryId=$repo",
-                    "`$skip=$($Request.skip)", "`$top=$($Request.top)") $deadline
+                $query = @('searchCriteria.status=active',
+                    "searchCriteria.repositoryId=$repo",
+                    "`$skip=$($Request.skip)", "`$top=$($Request.top)")
+                if ($null -ne $Config['pagination']) {
+                    if ($Request.skip -ne 0 -or $Request.top -gt 201 -or
+                        [string]$Request.maxTime -cnotmatch
+                            '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z$') {
+                        throw 'invalid-page'
+                    }
+                    $query += 'searchCriteria.queryTimeRangeType=created'
+                    $query += "searchCriteria.maxTime=$($Request.maxTime)"
+                }
+                $r = & $invoke 'git' 'pullRequests' @(
+                    "project=$project", "repositoryId=$repo") $query $deadline
+                if ($null -ne $Config['pagination'] -and
+                    ($r['value'] -isnot [array] -or
+                        $null -eq $r['count'])) {
+                    throw 'invalid-page'
+                }
                 $items = @($r.value | ForEach-Object {
                         if ([string]$_.repository.id -ine $repo -or
                             [string]$_.repository.project.id -ine $projectId) {
                             throw 'repository-mismatch'
                         }
                         @{ pullRequestId = $_.pullRequestId; status = $_.status
-                            isDraft = $_.isDraft; targetRef = $_.targetRefName }
+                            isDraft = $_.isDraft; targetRef = $_.targetRefName
+                            creationDate = if ($null -ne $_.creationDate) {
+                                ([DateTimeOffset]$_.creationDate).UtcDateTime.ToString('o')
+                            } else { $null } }
                     })
                 if ($null -ne $r['count'] -and $r['count'] -ne $items.Count) {
                     throw 'page-count-mismatch'
