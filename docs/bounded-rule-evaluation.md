@@ -57,11 +57,29 @@ commits, target ref, iteration, rule identity, rule declaration digest,
 timestamp and aggregate outcome. The independent per-rule cap and global
 cap both apply. Unknown
 parser resolution or a cap excess cannot become a finding. Before recording
-would-create counts, the command reuses the repository's ADO discussion
-normalizer: duplicate comments are deduplicated; an unmarked same-account
-comment is human, not automation. Any relevant but unresolvable discussion
-leaves a finding unknown instead of claiming safe deduplication. These
-counts are **read-only hypothetical outcomes**, never posting authority.
+would-create counts, each enabled deterministic rule must carry a signed
+`binding` with `ruleRepositoryId`, `rulePath`, `ruleCommit` (40 lowercase hex),
+`ruleHash` (`v1:sha256:` of the repository-owned policy text), and
+`capabilityDigest` (the repository-owned capability version). The path must be
+the corresponding `src/DevPilot.OwnerCapability/Policy/<rule>.v1.txt`; the
+capability digest is `v1:sha256:` of the UTF-8 policy basename followed by
+`-capability-v1` (for example, `named-areequal-arguments-capability-v1`).
+The dispatcher checks the local policy hash. A missing or changed binding fails
+closed; the sample intentionally leaves rules disabled and has no live rule
+commit to infer. The rule commit and repository ID must be the **actual pinned
+rule source** used by the reviewer; signing invented values will not match
+existing markers. No rule pin is inferred from the BPM PR head.
+
+The command reuses the repository's ADO discussion normalizer and OwnerCapability
+marker/body and reconciliation code per class or method group: duplicate
+comments are deduplicated; an unmarked same-account comment is human, not
+automation. Only a current exact marker/body/anchor is `noOp`, current exact
+unmarked human coverage is `humanCovered`, and an absent relevant thread is
+`wouldCreate`. Stale, moved, closed, or ambiguous discussion is `unknown`.
+The immutable observation stores only digest-bound per-finding classifications,
+counts (`findings`, `noOp`, `humanCovered`, `wouldCreate`, `unknown`) and a
+normalized discussion digest, not source or comment bodies. These are
+**read-only hypothetical outcomes**, never posting authority.
 Source text and comment bodies are transient and are never written to the
 cohort, observation, or normal log.
 
@@ -82,7 +100,7 @@ observation rather than treating a link or old state as execution.
 
 The optional dashboard `roots.ruleEvaluation` /
 `files.ruleEvaluationCohort` pair points to the private dispatcher root and
-its `cohort.json`, respectively. The Rules view reports current-generation
-scope, evaluated, pending, skipped, unknown, and errors separately from
+its `cohort.json`, respectively. The Rules view reports current-generation scope, classified finding counts,
+evaluated, pending, skipped, unknown, and errors separately from
 the pinned canary history. Configuration of this optional feed does not
 deploy the dispatcher.

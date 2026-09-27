@@ -64,6 +64,8 @@ export interface RuleSummary {
     state: RuleEvaluationSummary["state"];
     scope: number[];
     draftExcluded: number | null;
+    findingCounts: { findings: number; noOp: number; humanCovered: number;
+      wouldCreate: number; unknown: number };
   };
 }
 
@@ -370,9 +372,19 @@ export function projectRuleRegistry(
     for (const rule of scheduled.rules) {
       const match = registry.find((entry) => entry.id === rule.ruleId &&
         entry.capabilityId === rule.capabilityId);
+      const completed = scheduled.heads.flatMap((head) => head.rules.filter((entry) =>
+        entry.capabilityId === rule.capabilityId && entry.ruleId === rule.ruleId &&
+        entry.status === "evaluated" && entry.outcome));
+      const sum = (field: "findings" | "noOp" | "humanCovered" | "wouldCreate" | "unknown") =>
+        completed.reduce((total, entry) => total + (entry.outcome?.[field] ?? 0), 0);
       const coverage = {
         ...rule, generation: scheduled.generation, state: scheduled.state,
         draftExcluded: scheduled.draftExcluded,
+        findingCounts: {
+          findings: sum("findings"), noOp: sum("noOp"), humanCovered: sum("humanCovered"),
+          wouldCreate: sum("wouldCreate"), unknown: sum("unknown"),
+        },
+        gaps: sum("unknown") ? [...new Set([...rule.gaps, "discussion-needs-review"])] : rule.gaps,
         scope: scheduled.heads.filter((head) => head.rules.some((entry) =>
           entry.capabilityId === rule.capabilityId && entry.ruleId === rule.ruleId &&
           entry.status === "evaluated")).map((head) => head.pullRequestId),

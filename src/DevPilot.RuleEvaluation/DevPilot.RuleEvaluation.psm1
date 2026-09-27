@@ -4,12 +4,20 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
 Import-Module (Join-Path $PSScriptRoot '..\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1')
 Import-Module (Join-Path $PSScriptRoot '..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1')
+Import-Module (Join-Path $PSScriptRoot '..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
+Import-Module (Join-Path $PSScriptRoot '..\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1')
+Import-Module (Join-Path $PSScriptRoot '..\OwnerObservationContract\OwnerObservationContract.psd1')
 
 $script:RuleIds = [ordered]@{
     'bpm-test-ownership@1' = 'mstest-owner'
     'bpm-test-class-coverage@1' = 'bpm-test-class-coverage@1'
     'bpm-redundant-method-coverage@1' = 'bpm-redundant-method-coverage@1'
     'bpm-named-areequal-arguments@1' = 'bpm-named-areequal-arguments@1'
+}
+$script:RulePolicies = @{
+    'bpm-test-class-coverage@1' = 'test-class-coverage'
+    'bpm-redundant-method-coverage@1' = 'redundant-method-coverage'
+    'bpm-named-areequal-arguments@1' = 'named-areequal-arguments'
 }
 
 function Get-RuleDigest {
@@ -58,6 +66,20 @@ function Assert-RuleConfig {
         if ($rule.maxFindingsPerHead -gt $Config.limits.maxFindingsPerHead) {
             throw 'Rule cap exceeds the per-head envelope.'
         }
+        if ($rule.enabled -and $script:RulePolicies.ContainsKey([string]$rule.capabilityId)) {
+            $binding = $rule['binding']
+            $policy = $script:RulePolicies[[string]$rule.capabilityId]
+            if ($binding -isnot [Collections.IDictionary] -or
+                [string]$binding.ruleRepositoryId -cnotmatch '^[A-Za-z0-9._/-]{1,256}$' -or
+                [string]$binding.rulePath -cne
+                    "src/DevPilot.OwnerCapability/Policy/$policy.v1.txt" -or
+                [string]$binding.ruleCommit -cnotmatch '^[a-f0-9]{40}$' -or
+                [string]$binding.ruleHash -cnotmatch '^v1:sha256:[a-f0-9]{64}$' -or
+                [string]$binding.capabilityDigest -cne
+                    ('v1:sha256:' + (Get-RuleTextDigest "$policy-capability-v1"))) {
+                throw 'rule-binding-unavailable'
+            }
+        }
     }
     if ($Config.enabled -and $RequireSignature) {
         if ([string]::IsNullOrEmpty($SignatureKey) -or
@@ -78,6 +100,43 @@ function Assert-RuleConfig {
         if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
                 $expected, $provided)) { throw 'invalid-signature' }
     }
+}
+
+function Get-RuleTextDigest {
+    param([string]$Text)
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+            [Text.Encoding]::UTF8.GetBytes($Text))).ToLowerInvariant()
+}
+
+function New-RuleContract {
+    param([Collections.IDictionary]$Config, [Collections.IDictionary]$Rule,
+        [Collections.IDictionary]$Head, [string]$RepositoryRoot)
+    $binding = $Rule.binding
+    $policy = $script:RulePolicies[[string]$Rule.capabilityId]
+    $policyFile = Join-Path $RepositoryRoot (
+        "src\DevPilot.OwnerCapability\Policy\$policy.v1.txt")
+    if (-not (Test-Path -LiteralPath $policyFile -PathType Leaf)) {
+        throw 'rule-binding-unavailable'
+    }
+    $text = [IO.File]::ReadAllText($policyFile, [Text.UTF8Encoding]::new($false, $true))
+    if ([string]$binding.ruleHash -cne ('v1:sha256:' + (Get-RuleTextDigest $text))) {
+        throw 'rule-binding-unavailable'
+    }
+    return New-OwnerAcquisitionContract `
+        -RepositoryId ([string]$Head.repositoryId).ToLowerInvariant() `
+        -ProjectId ([string]$Head.projectId).ToLowerInvariant() `
+        -PullRequestId ([long]$Head.pullRequestId) `
+        -SourceCommit ([string]$Head.sourceCommit).ToLowerInvariant() `
+        -TargetCommit ([string]$Head.targetCommit).ToLowerInvariant() `
+        -TargetRef ([string]$Head.targetRef) `
+        -RuleRepositoryId ([string]$binding.ruleRepositoryId) `
+        -RulePath ([string]$binding.rulePath) -RuleCommit ([string]$binding.ruleCommit) `
+        -RuleSection ([string]$Rule.capabilityId) -RuleHash ([string]$binding.ruleHash) `
+        -RuleLength ([Text.Encoding]::UTF8.GetByteCount($text)) `
+        -ConfigId 'bounded-rule-evaluation-v1' `
+        -ConfigDigest ('v1:sha256:' + (Get-RuleDigest $Config)) `
+        -CapabilityId ([string]$Rule.capabilityId) `
+        -CapabilityDigest ([string]$binding.capabilityDigest)
 }
 
 function Read-RuleJson {
@@ -294,8 +353,10 @@ function Assert-RuleHead {
 }
 
 function Get-RuleEvaluation {
-    param([string]$Capability, [object[]]$Files, [int]$MaximumFindings)
+    param([string]$Capability, [object[]]$Files, [int]$MaximumFindings,
+        [object]$Contract, [AllowNull()][object]$Snapshot)
     $findings = 0; $unknown = 0
+    $boundFindings = [Collections.Generic.List[object]]::new()
     foreach ($file in $Files) {
         if ($file.path -notmatch '\.cs$') { continue }
         $spans = @($file.spans | ForEach-Object {
@@ -322,6 +383,33 @@ function Get-RuleEvaluation {
                 ($Capability -ceq 'bpm-named-areequal-arguments@1' -and
                     $item.hasPositional)) {
                 $findings++
+                $line = if ($Capability -ceq 'bpm-test-class-coverage@1') {
+                    [int]$item.declarationLine
+                } else { [int]$item.startLine }
+                $constructRef = 'construct:' + (Get-RuleDigest @(
+                    $Capability, $file.path, [string]$item.name,
+                    [int]$item.declarationLine, $line))
+                $binding = New-OwnerCanonicalAnchor -Path $file.path.TrimStart('/') `
+                    -StartLine $line -Symbol ([string]$item.name) `
+                    -ConstructIdentity $constructRef
+                $finding = [ordered]@{
+                    disposition = 'violation'; constructRef = $constructRef
+                    anchor = [ordered]@{ path = $file.path.TrimStart('/')
+                        line = $line; symbol = [string]$item.name }
+                    binding = $binding
+                }
+                if ($Capability -ceq 'bpm-redundant-method-coverage@1') {
+                    $finding.affectedMethodCount = [int]$item.affectedMethodCount
+                    $finding.affectedMethods = @($item.affectedMethods)
+                    $finding.affectedAttributeLines = @($item.affectedAttributeLines)
+                    $finding.methodListTruncated = [bool]$item.methodListTruncated
+                }
+                elseif ($Capability -ceq 'bpm-named-areequal-arguments@1') {
+                    $finding.affectedCallCount = [int]$item.affectedCallCount
+                    $finding.affectedCallLines = @($item.affectedCallLines)
+                    $finding.callListTruncated = [bool]$item.callListTruncated
+                }
+                [void]$boundFindings.Add($finding)
             }
         }
     }
@@ -329,7 +417,101 @@ function Get-RuleEvaluation {
             findings = 0; unknown = $findings } }
     if ($unknown -gt 0) { return @{ state = 'unknown'; reason = 'rule-ambiguous'
             findings = $findings; unknown = $unknown } }
-    return @{ state = 'evaluated'; reason = 'completed'; findings = $findings; unknown = 0 }
+    if ($null -eq $Contract -or $null -eq $Snapshot) {
+        return @{ state = 'unknown'; reason = 'discussion-acquisition-unavailable'
+            findings = $findings; unknown = [Math]::Max(1, $findings) }
+    }
+    $observation = [ordered]@{
+        capability = $Capability
+        lifecycle = @{ status = 'completed' }
+        findings = @($boundFindings)
+        effects = @{ dedupe = @{} }
+        sourceArtifacts = @()
+    }
+    $resolved = Resolve-OwnerV2DiscussionReconciliation -Observation $observation `
+        -Contract $Contract -Snapshot $Snapshot
+    $outcomes = [Collections.Generic.List[object]]::new()
+    $counts = @{ noOp = 0; humanCovered = 0; wouldCreate = 0; unknown = 0 }
+    foreach ($finding in $resolved.findings) {
+        $reconciliation = $finding.reconciliation
+        $classification = [string]$reconciliation.classification
+        $anchor = $finding.anchor
+        $lines = if ($Capability -ceq 'bpm-named-areequal-arguments@1') {
+            @($finding.affectedCallLines)
+        } elseif ($Capability -ceq 'bpm-redundant-method-coverage@1') {
+            @($finding.affectedAttributeLines)
+        } else { @([int]$anchor.line) }
+        $discussionPattern = switch ($Capability) {
+            'bpm-test-class-coverage@1' { '(?i)\b(?:exclu\w*|cover\w*)\b' }
+            'bpm-redundant-method-coverage@1' { '(?i)\b(?:method|exclu\w*|cover\w*)\b' }
+            default { '(?i)\b(?:AreEqual|named|expected|actual)\b' }
+        }
+        $relevant = @($Snapshot.Threads | Where-Object {
+                $thread = $_
+                $thread.anchor -and
+                [string]$thread.anchor.path -ieq [string]$anchor.path -and
+                @($lines | Where-Object {
+                        [int]$thread.anchor.line -ge ([int]$_ - 2) -and
+                        [int]$thread.anchor.line -le ([int]$_ + 2)
+                    }).Count -gt 0 -and
+                @($thread.comments | Where-Object {
+                        [string]$_.commentType -ceq 'text' -and -not $_.isDeleted -and
+                        [string]$_.body -match $discussionPattern
+                    }).Count -gt 0
+            })
+        $unanchored = @($Snapshot.Threads | Where-Object {
+                -not $_.anchor -and
+                @($_.comments | Where-Object {
+                        [string]$_.commentType -ceq 'text' -and -not $_.isDeleted -and
+                        [string]$_.body -match $discussionPattern
+                    }).Count -gt 0
+            })
+        if ($unanchored.Count -gt 0) { $classification = 'unknown' }
+        if ($classification -ceq 'wouldUpdate' -or
+            ($classification -ceq 'wouldCreate' -and
+                ([string]$reconciliation.reason -cne 'reviewer-marker-not-found' -or
+                    @($relevant | Where-Object {
+                            [string]$_.status -cne 'active' -or
+                            [string]$_.contextState -cne 'current' -or $_.isOutdated -or
+                            [int]$_.anchor.line -notin $lines
+                        }).Count -gt 0))) {
+            $classification = 'unknown'
+        }
+        if (($classification -ceq 'noOp' -or $classification -ceq 'humanCovered') -and
+            $relevant.Count -gt 1) {
+            $classification = 'unknown'
+        }
+        if ($classification -ceq 'noOp' -or $classification -ceq 'humanCovered') {
+            $threadId = $reconciliation.thread.threadId
+            $matched = @($Snapshot.Threads | Where-Object threadId -EQ $threadId)
+            if ($matched.Count -ne 1 -or
+                [string]$matched[0].contextState -cne 'current' -or
+                [string]$matched[0].sourceCommit -cne $Contract.Request.SourceCommit -or
+                [string]$matched[0].status -cne 'active' -or
+                [bool]$matched[0].isDeleted -or [bool]$matched[0].isOutdated) {
+                $classification = 'unknown'
+            }
+        }
+        if (-not $counts.ContainsKey($classification)) { $classification = 'unknown' }
+        $counts[$classification]++
+        [void]$outcomes.Add([ordered]@{
+                findingDigest = Get-RuleDigest @($Capability, $anchor.path,
+                    [int]$anchor.line, $anchor.symbol, $finding.constructRef)
+                classification = $classification
+                reason = if ($classification -ceq [string]$reconciliation.classification) {
+                    [string]$reconciliation.reason
+                } else { 'discussion-needs-review' }
+            })
+    }
+    if (($counts.noOp + $counts.humanCovered + $counts.wouldCreate + $counts.unknown) -ne $findings) {
+        return @{ state = 'unknown'; reason = 'rule-ambiguous'
+            findings = $findings; unknown = [Math]::Max(1, $findings) }
+    }
+    return @{ state = 'evaluated'; reason = 'completed'; findings = $findings
+        noOp = [int]$counts.noOp; humanCovered = [int]$counts.humanCovered
+        wouldCreate = [int]$counts.wouldCreate; unknown = [int]$counts.unknown
+        discussionDigest = $Snapshot.Digest.Substring(10)
+        findingOutcomes = @($outcomes) }
 }
 
 function Invoke-BoundedRuleEvaluation {
@@ -534,6 +716,17 @@ function Invoke-BoundedRuleEvaluation {
                             lineEvidenceDigest = $head.lineEvidenceDigest
                             configDigest = $cohort.binding.configDigest
                             capabilityId = $rule.capabilityId; ruleId = $rule.ruleId
+                            ruleBinding = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
+                                $null
+                            } else {
+                                [ordered]@{
+                                    ruleRepositoryId = [string]$ruleConfig.binding.ruleRepositoryId
+                                    rulePath = [string]$ruleConfig.binding.rulePath
+                                    ruleCommit = [string]$ruleConfig.binding.ruleCommit
+                                    ruleHash = [string]$ruleConfig.binding.ruleHash
+                                    capabilityDigest = [string]$ruleConfig.binding.capabilityDigest
+                                }
+                            }
                             maxFindingsPerHead = [int]$ruleConfig.maxFindingsPerHead
                             writerEligible = $false
                         }
@@ -555,16 +748,18 @@ function Invoke-BoundedRuleEvaluation {
                                     $ruleDeclaration $rule.declarationDigest
                             }
                         } else {
+                            $contract = New-RuleContract $Config $ruleConfig $declaration $RepositoryRoot
+                            $snapshot = Get-ActivePrDiscussionSnapshot $discussions `
+                                $IntakeConfig $declaration $contract
                             Get-RuleEvaluation $rule.capabilityId $files.ToArray() `
-                                $ruleConfig.maxFindingsPerHead
+                                $ruleConfig.maxFindingsPerHead $contract $snapshot
                         }
                         if ($evaluation -isnot [Collections.IDictionary] -or
                             $evaluation.state -cnotin @('evaluated', 'unknown') -or
                             [string]$evaluation.reason -cnotmatch '^[a-z][a-z0-9-]{0,79}$' -or
                             (Assert-RuleNumber $evaluation.findings findings 0 32) -gt
                                 $ruleConfig.maxFindingsPerHead -or
-                            ((Assert-RuleNumber $evaluation.unknown unknown 0 100000) -gt 0 -and
-                                $evaluation.state -ceq 'evaluated')) {
+                            (Assert-RuleNumber $evaluation.unknown unknown 0 100000) -gt 32) {
                             $rule.status = 'unknown'; $rule.reasonCode = 'rule-ambiguous'
                             continue
                         }
@@ -589,7 +784,8 @@ function Invoke-BoundedRuleEvaluation {
                             continue
                         }
                         if ($evaluation.state -cne 'evaluated' -or
-                            ($evaluation.findings -gt 0 -and
+                            ($rule.capabilityId -ceq 'bpm-test-ownership@1' -and
+                                $evaluation.findings -gt 0 -and
                                 ($discussion.ambiguous -gt 0 -or $discussion.human -gt 0 -or
                                     $discussion.automation -gt 0))) {
                             $rule.status = 'unknown'
@@ -612,7 +808,17 @@ function Invoke-BoundedRuleEvaluation {
                             declarationDigest = $rule.declarationDigest
                             completedUtc = [DateTime]::UtcNow.ToString('o')
                             outcome = [ordered]@{ findings = [int]$evaluation.findings
-                                noOp = 0; wouldCreate = [int]$evaluation.findings; unknown = 0 }
+                                noOp = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
+                                    0 } else { [int]$evaluation.noOp }
+                                humanCovered = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
+                                    0 } else { [int]$evaluation.humanCovered }
+                                wouldCreate = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
+                                    [int]$evaluation.findings } else { [int]$evaluation.wouldCreate }
+                                unknown = [int]$evaluation.unknown }
+                            discussionDigest = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
+                                $null } else { [string]$evaluation.discussionDigest }
+                            findingOutcomes = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
+                                @() } else { @($evaluation.findingOutcomes) }
                             providerWrites = 0; modelToolInvocations = 0
                         }
                         $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
@@ -636,7 +842,8 @@ function Invoke-BoundedRuleEvaluation {
                     if ($code -cnotin @('head-drift', 'head-left-policy', 'changed-lines-mismatch',
                             'source-unverified', 'read-budget', 'time-budget',
                             'account-mismatch', 'invalid-discussions', 'mutable-discussions',
-                            'comment-budget', 'state-integrity-failed')) {
+                            'comment-budget', 'state-integrity-failed',
+                            'rule-binding-unavailable', 'discussion-head-mismatch')) {
                         $code = 'ado-read-failed'
                     }
                     foreach ($rule in $entry.rules) {
