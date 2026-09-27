@@ -153,6 +153,9 @@ must match the expected UPN. Missing or inconsistent proof stops before
 subsequent reads; only fixed status/reason and attempted GET count are
 returned. An identity proof does not authorize source/intake/evaluation
 reads or any write, and each live use requires its own explicit approval.
+The CLI validates its fixed, Int64-safe JSON result before emitting it; it
+does not persist observations. An uncaptured result cannot be reconstructed
+by retrying under an exhausted GET authorization.
 
 `tools/Initialize-PrivateActivePrCanaryInputs.ps1` is a **preparation-only**
 bootstrap for the private syntactic canary. It is disabled without `-Run`;

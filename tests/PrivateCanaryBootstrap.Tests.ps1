@@ -7,6 +7,7 @@ BeforeAll {
     Import-Module (Join-Path $repo 'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1')
     Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.ActivePrCanary.psm1') -Force
     Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.PrivateCanaryRunner.psd1') -Force
+    . (Join-Path $repo 'src\DevPilot.ActivePrCanary\PrivateCanaryIdentityOutput.ps1')
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -1288,6 +1289,41 @@ Describe 'Read-only private canary input bootstrap' {
         $result.state | Should -Be 'disabled'
         $result.getAttempts | Should -Be 0
         $result.providerWrites | Should -Be 0
+    }
+    It 'retains sanitized Int64 GET counts after a JSON round trip without another read' {
+        foreach ($case in @(
+                @{ state = 'unknown'; reason = 'identity-fields-missing'; gets = 1 },
+                @{ state = 'unknown'; reason = 'graph-user-mismatch'; gets = 2 },
+                @{ state = 'verified'; reason = 'valid'; gets = 3 })) {
+            $json = [ordered]@{
+                state = $case.state; reason = $case.reason
+                getAttempts = $case.gets
+                providerWrites = 0; modelToolInvocations = 0
+            } | ConvertTo-Json -Compress
+            $parsed = $json | ConvertFrom-Json -AsHashtable
+            $parsed.getAttempts | Should -BeOfType [long]
+            $output = ConvertTo-PrivateCanaryIdentityOutput -Json $json `
+                -Run $true -VerifyGraph $true
+            $result = $output | ConvertFrom-Json -AsHashtable
+            $result.getAttempts | Should -Be $case.gets
+            $result.state | Should -Be $case.state
+            $result.reason | Should -Be $case.reason
+            $result.providerWrites | Should -Be 0
+            $result.modelToolInvocations | Should -Be 0
+            $output | Should -Not -Match 'example\.invalid|private-sentinel'
+        }
+        foreach ($json in @(
+                '{"state":"verified","reason":"valid","getAttempts":4,"providerWrites":0,"modelToolInvocations":0}',
+                '{"state":"verified","reason":"valid","getAttempts":2,"providerWrites":0,"modelToolInvocations":0}',
+                '{"state":"unknown","reason":"private-sentinel","getAttempts":1,"providerWrites":0,"modelToolInvocations":0}',
+                '{"state":"unknown","reason":"unclassified","getAttempts":1,"providerWrites":0,"modelToolInvocations":0,"identity":"private-sentinel"}',
+                '{"state":"unknown","reason":"unclassified","getAttempts":1,"providerWrites":1,"modelToolInvocations":0}',
+                '{"state":"unknown","reason":"unclassified","getAttempts":1,"providerWrites":"0","modelToolInvocations":0}',
+                '{"state":"unknown","reason":"unclassified","getAttempts":1.5,"providerWrites":0,"modelToolInvocations":0}')) {
+            { ConvertTo-PrivateCanaryIdentityOutput -Json $json `
+                    -Run $true -VerifyGraph $true } |
+                Should -Throw 'identity-diagnostic-result-invalid'
+        }
     }
     It 'uses exactly one bounded Identity GET on success and failure without state or private output' {
         foreach ($case in @(

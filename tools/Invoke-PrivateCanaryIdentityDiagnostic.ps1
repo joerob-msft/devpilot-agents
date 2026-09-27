@@ -15,9 +15,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
+. (Join-Path $repo 'src\DevPilot.ActivePrCanary\PrivateCanaryIdentityOutput.ps1')
 Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.ActivePrCanary.psm1')
-Invoke-PrivateCanaryIdentityDiagnostic -Organization $Organization `
+$result = Invoke-PrivateCanaryIdentityDiagnostic -Organization $Organization `
     -ExpectedAccountUniqueName $ExpectedAccountUniqueName `
     -RepositoryRoot $repo -AzureCliPath $AzureCliPath `
-    -VerifyGraph:$VerifyGraph -Run:$Run |
-    ConvertTo-Json -Depth 4
+    -VerifyGraph:$VerifyGraph -Run:$Run
+ConvertTo-PrivateCanaryIdentityOutput `
+    -Json (ConvertTo-Json -InputObject $result -Depth 4) `
+    -VerifyGraph:$VerifyGraph -Run:$Run
