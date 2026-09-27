@@ -17,6 +17,7 @@ using System.Threading;
 using System.Threading.Tasks;
 public sealed class CanarySyntheticHandler : HttpMessageHandler {
     public List<string> Paths = new List<string>();
+    public HttpStatusCode Status = HttpStatusCode.OK;
     protected override Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken) {
         if (request.Method != HttpMethod.Get ||
@@ -31,7 +32,7 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             : request.Headers.Accept.ToString() == "application/octet-stream"
             ? Encoding.UTF8.GetBytes("synthetic bytes")
             : Encoding.UTF8.GetBytes("{\"id\":\"synthetic\"}");
-        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
+        return Task.FromResult(new HttpResponseMessage(Status) {
             Content = new ByteArrayContent(content)
         });
     }
@@ -1067,6 +1068,36 @@ Describe 'Read-only private canary input bootstrap' {
             $malicious.commit = 'malicious'
             { & $read Item $malicious } | Should -Throw
             $handler.Paths.Count | Should -Be 4
+        }
+        finally { $client.Dispose() }
+    }
+    It 'reports only the operation and HTTP status when a bounded source GET fails' {
+        $handler = [CanarySyntheticHandler]::new()
+        $handler.Status = [Net.HttpStatusCode]::Redirect
+        $client = [Net.Http.HttpClient]::new($handler)
+        $module = Get-Module DevPilot.ActivePrCanary
+        $c = Get-BootstrapCase
+        $state = $c.state
+        $c.provider = {
+            param($operation, $request)
+            $state.reads.Add($operation) | Out-Null
+            & $module {
+                param($Client, $Operation, $Request)
+                Invoke-CanaryAadGet $Client 'synthetic-bearer' 'example-org' `
+                    $Operation $Request ([DateTime]::UtcNow.AddSeconds(5))
+            } $client $operation $request
+        }.GetNewClosure()
+        try {
+            $message = try {
+                Invoke-BootstrapCase $c
+                ''
+            }
+            catch { $_.Exception.Message }
+            $message | Should -Be 'bootstrap-read-inaccessible:Identity:http-302'
+            Test-Path $c.root | Should -BeFalse
+            $state.reads.Count | Should -Be 1
+            $state.reads[0] | Should -Be 'Identity'
+            $handler.Paths.Count | Should -Be 1
         }
         finally { $client.Dispose() }
     }

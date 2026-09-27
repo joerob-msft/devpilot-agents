@@ -359,14 +359,18 @@ function Invoke-CanaryAadGet {
             } else { 'application/json' }))
     $remaining = [Math]::Max(1, [int]($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
     $cancel = [Threading.CancellationTokenSource]::new($remaining)
+    $failureStatus = 0
     try {
         $response = $Client.SendAsync($message,
             [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
             $cancel.Token).GetAwaiter().GetResult()
         try {
-            if (-not $response.IsSuccessStatusCode -or
-                ($null -ne $response.Content.Headers.ContentLength -and
-                    $response.Content.Headers.ContentLength -gt $limit)) {
+            if (-not $response.IsSuccessStatusCode) {
+                $failureStatus = [int]$response.StatusCode
+                throw 'bootstrap-read-inaccessible'
+            }
+            if ($null -ne $response.Content.Headers.ContentLength -and
+                    $response.Content.Headers.ContentLength -gt $limit) {
                 throw 'bootstrap-read-inaccessible'
             }
             $stream = $response.Content.ReadAsStreamAsync(
@@ -396,7 +400,13 @@ function Invoke-CanaryAadGet {
         }
         return $result
     }
-    catch { throw 'bootstrap-read-inaccessible' }
+    catch {
+        if ($failureStatus -gt 0) {
+            throw ('bootstrap-read-inaccessible:{0}:http-{1}' -f
+                $Operation, $failureStatus)
+        }
+        throw 'bootstrap-read-inaccessible'
+    }
     finally {
         $cancel.Dispose()
         $message.Dispose()
