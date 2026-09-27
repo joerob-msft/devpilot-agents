@@ -2,6 +2,7 @@ import type {
   DeliverySummary, FindingSummary, ReportingSnapshot, RunSummary,
 } from "./reporting.js";
 import type { IntakeRule, IntakeSummary } from "./intake-report.js";
+import type { EvaluationRule, RuleEvaluationSummary } from "./rule-evaluation-report.js";
 
 export type RuleStatus = "verified" | "not-deployed" | "disabled" | "stale" | "unknown";
 export type PublishingStatus = "enabled" | "disabled" | "not-eligible" | "unknown";
@@ -58,6 +59,12 @@ export interface RuleSummary {
   url: string | null;
   gaps: string[];
   intake?: IntakeRule & { generation: string; state: IntakeSummary["state"] };
+  scheduled?: EvaluationRule & {
+    generation: string;
+    state: RuleEvaluationSummary["state"];
+    scope: number[];
+    draftExcluded: number | null;
+  };
 }
 
 interface RuleDefinition {
@@ -142,7 +149,7 @@ function matchingDelivery(
 
 export function projectRuleRegistry(
   snapshot: Pick<ReportingSnapshot, "generatedAtUtc" | "task" | "toolkit" | "runs" |
-    "findings" | "relations" | "deliveries" | "failures" | "quarantine" | "diagnostics" | "truncated" | "intake">,
+    "findings" | "relations" | "deliveries" | "failures" | "quarantine" | "diagnostics" | "truncated" | "intake" | "ruleEvaluation">,
   evidence: RuleEvidence[],
   staleAfterMinutes: number,
   feeds: { automatic: boolean; manual: boolean; namedAutomatic?: boolean },
@@ -356,6 +363,40 @@ export function projectRuleRegistry(
         gaps: ["Intake alone is not a completed durable observation or deployment evidence."],
         intake: coverage,
       });
+    }
+  }
+  const scheduled = snapshot.ruleEvaluation;
+  if (scheduled) {
+    for (const rule of scheduled.rules) {
+      const match = registry.find((entry) => entry.id === rule.ruleId &&
+        entry.capabilityId === rule.capabilityId);
+      const coverage = {
+        ...rule, generation: scheduled.generation, state: scheduled.state,
+        draftExcluded: scheduled.draftExcluded,
+        scope: scheduled.heads.filter((head) => head.rules.some((entry) =>
+          entry.capabilityId === rule.capabilityId && entry.ruleId === rule.ruleId &&
+          entry.status === "evaluated")).map((head) => head.pullRequestId),
+      };
+      if (match) {
+        match.scheduled = coverage;
+      } else {
+        registry.push({
+          id: rule.ruleId, sourceRuleId: null,
+          description: "Declared by scheduled rule evaluation; service deployment is not verified.",
+          provenance: "Optional private scheduled read-only evaluation, not writer authorization.",
+          implementationVersion: "unknown", installedHead: null, pinnedHead: null,
+          capabilityId: rule.capabilityId, implemented: false,
+          deployment: "unknown", enablement: "unknown", execution: "unknown",
+          authorization: "unknown", publishing: "unknown", policyCaps: null,
+          scope: [], lastGeneration: null, lastEvaluatedUtc: null,
+          counts: { finding: null, noOp: null, wouldCreate: null, unknown: null,
+            skipped: null, refused: null, posted: null },
+          affectedMethodAttributes: null, affectedCalls: null,
+          findingIds: [], deliveryIds: [], url: null,
+          gaps: ["Scheduled read-only evaluation does not verify pinned service deployment or posting authority."],
+          scheduled: coverage,
+        });
+      }
     }
   }
   return registry;

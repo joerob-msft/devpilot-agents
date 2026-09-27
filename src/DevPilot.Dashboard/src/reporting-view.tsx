@@ -268,6 +268,12 @@ function ruleRow(rule: RuleSummary): ReportingRow {
       "Historical scheduled-rule execution above is NOT current-head intake evaluation or posting authority.",
       ...rule.intake.gaps.map((gap) => `Intake gap: ${gap}`),
     ] : []),
+    ...(rule.scheduled ? [
+      `SCHEDULED READ-ONLY RULE EVALUATION ${rule.scheduled.state} | generation ${rule.scheduled.generation} | discovered ${rule.scheduled.discovered} / eligible ${rule.scheduled.eligible} / evaluated ${rule.scheduled.evaluated} / pending ${rule.scheduled.pending} / skipped ${rule.scheduled.skipped} / unknown ${rule.scheduled.unknown} / error ${rule.scheduled.error}`,
+      `Draft PRs excluded separately: ${rule.scheduled.draftExcluded ?? "unknown"} (outside non-draft rule denominator).`,
+      `Current-head evaluated PR scope: ${rule.scheduled.scope.length ? rule.scheduled.scope.map((pr) => `#${pr}`).join(", ") : "none"}. Not pinned service execution or posting authority.`,
+      ...rule.scheduled.gaps.map((gap) => `Scheduled gap: ${gap}`),
+    ] : []),
     ...rule.gaps.map((gap) => `Coverage gap: ${gap}`),
   ];
   return {
@@ -313,13 +319,40 @@ export function reportingRows(snapshot: ReportingSnapshot, section: ReportingSec
       };
     });
   }
-  if (section === "rules") return (snapshot.rules ?? []).map((rule) => {
-    const row = ruleRow(rule);
-    if (rule.capabilityId !== "relation-contextual-review-v1") return row;
-    const related = snapshot.relations.filter((relation) =>
-      relation.capability === rule.capabilityId && relation.rule === rule.sourceRuleId);
-    return { ...row, url: null, ...(related.length === 1 ? { relation: related[0]! } : {}) };
-  });
+  if (section === "rules") {
+    const rules = (snapshot.rules ?? []).map((rule) => {
+      const row = ruleRow(rule);
+      if (snapshot.ruleEvaluation?.state === "unknown") {
+        row.text.push(`SCHEDULED READ-ONLY RULE EVALUATION unknown | evaluated unknown / pending unknown / skipped unknown / unknown unknown / error unknown | ${snapshot.ruleEvaluation.gaps.join(", ")}`);
+        row.searchText = clean(row.text.join(" "), 4_096).toLowerCase();
+      }
+      if (rule.capabilityId !== "relation-contextual-review-v1") return row;
+      const related = snapshot.relations.filter((relation) =>
+        relation.capability === rule.capabilityId && relation.rule === rule.sourceRuleId);
+      return { ...row, url: null, ...(related.length === 1 ? { relation: related[0]! } : {}) };
+    });
+    const evaluation = snapshot.ruleEvaluation;
+    if (evaluation?.state === "complete") {
+      for (const head of evaluation.heads) {
+        for (const rule of head.rules) {
+          const text = [
+            `PR #${head.pullRequestId} | ${rule.ruleId} (${rule.capabilityId}) | ${rule.status} / ${rule.reasonCode}`,
+            `Source ${shortCommit(head.sourceCommit ?? "")} / target ${shortCommit(head.targetCommit ?? "")} | ${head.targetRef ?? "unknown"} | iteration ${head.iterationId ?? "unknown"}`,
+            `Scheduled generation ${evaluation.generation} / intake ${evaluation.intakeGeneration} | observation ${rule.observationDigest ?? "none"}; no posting authority`,
+          ];
+          rules.push({
+            key: `scheduled:${evaluation.generation}:${head.pullRequestId}:${rule.capabilityId}:${rule.ruleId}`,
+            timestamp: evaluation.observedUtc, pullRequestId: head.pullRequestId,
+            capability: rule.capabilityId, health: rule.status, outcome: rule.status,
+            ruleId: rule.ruleId, posting: "none", mode: "none", text,
+            searchText: clean(text.join(" "), 4_096).toLowerCase(),
+            url: head.url ?? null, attention: rule.status === "unknown" || rule.status === "error",
+          });
+        }
+      }
+    }
+    return rules;
+  }
   if (section === "runs") return snapshot.runs.map(runRow);
   if (section === "findings") return snapshot.findings.map(findingRow);
   if (section === "deliveries") return snapshot.deliveries.map(deliveryRow);
@@ -346,6 +379,10 @@ export function overviewLines(snapshot: ReportingSnapshot): string[] {
       `READ-ONLY INTAKE ${snapshot.intake.state} as of ${snapshot.intake.observedUtc || "unavailable"} | discovered ${snapshot.intake.discovered ?? "unknown"} / eligible master ${snapshot.intake.eligible ?? "unknown"} / excluded other targets ${snapshot.intake.excludedOtherTargets ?? "unknown"} | generation ${snapshot.intake.generation || "unknown"}`,
       `Intake is NOT scheduled-rule coverage; evaluated requires new current-head completed durable observations. ${snapshot.intake.gaps.join(", ")}`,
     ] : ["Active-PR intake is not configured; denominator and skipped counts are unknown."]),
+    ...(snapshot.ruleEvaluation ? [
+      `SCHEDULED READ-ONLY RULE EVALUATION ${snapshot.ruleEvaluation.state} | generation ${snapshot.ruleEvaluation.generation || "unknown"} / intake ${snapshot.ruleEvaluation.intakeGeneration || "unknown"} | ${snapshot.ruleEvaluation.gaps.join(", ") || "per-rule coverage in Rules tab"}`,
+      `Scheduled inventory is non-draft: discovered ${snapshot.ruleEvaluation.discovered ?? "unknown"} / eligible ${snapshot.ruleEvaluation.eligible ?? "unknown"} / excluded other targets ${snapshot.ruleEvaluation.excludedOtherTargets ?? "unknown"}; drafts excluded separately ${snapshot.ruleEvaluation.draftExcluded ?? "unknown"} (not in the rule denominator).`,
+    ] : ["Scheduled rule evaluation is not configured; current-head evaluated coverage is unknown."]),
     ...(snapshot.diagnostics.length ? snapshot.diagnostics.map((diagnostic) => `Missing/unavailable: ${diagnostic}`) : []),
   ];
 }

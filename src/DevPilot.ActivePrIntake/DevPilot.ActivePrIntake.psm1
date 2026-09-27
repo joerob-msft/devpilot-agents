@@ -473,6 +473,16 @@ function Get-IntakeDiscussionCounts {
     }
 }
 
+function Get-ActivePrDiscussionCounts {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][Collections.IDictionary]$Response,
+        [Parameter(Mandatory)][Collections.IDictionary]$Config,
+        [Parameter(Mandatory)][Collections.IDictionary]$Head)
+    Assert-IntakeConfig $Config
+    $verified = Assert-IntakeHead $Head ([int]$Head.pullRequestId) $Config
+    return Get-IntakeDiscussionCounts $Response $Config $verified
+}
+
 function Get-IntakePriorObservation {
     param($Previous, [int]$Id, [string]$RuleId, [string]$Capability,
         [string]$CurrentDigest, [string]$ConfigDigest)
@@ -1418,6 +1428,8 @@ function New-ActivePrAzureDevOpsProvider {
             }
             Head {
                 $id = [int]$Request.pullRequestId
+                if ($null -ne $Request['remainingReads'] -and
+                    $Request.remainingReads -lt 3) { throw 'read-budget' }
                 $r = & $invoke 'git' 'pullRequests' @(
                     "project=$project", "repositoryId=$repo", "pullRequestId=$id") @() $deadline
                 $iterations = & $invoke 'git' 'pullRequestIterations' @(
@@ -1455,7 +1467,8 @@ function New-ActivePrAzureDevOpsProvider {
                     sourceRef = $r.sourceRefName; targetRef = $r.targetRefName
                     sourceCommit = $last.sourceRefCommit.commitId
                     targetCommit = $last.targetRefCommit.commitId
-                    commonCommit = $last.commonRefCommit.commitId; iterationId = $last.id }
+                    commonCommit = $last.commonRefCommit.commitId; iterationId = $last.id
+                    readCount = 3 }
             }
             Changes {
                 $id = [int]$Request.pullRequestId
@@ -1549,6 +1562,7 @@ function New-ActivePrAzureDevOpsProvider {
                 if ($entries.Count -eq 0) { throw 'unsupported-change' }
                 $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
                 $results = [Collections.Generic.List[object]]::new()
+                $evaluationFiles = [Collections.Generic.List[object]]::new()
                 $totalBytes = 0
                 $totalLines = 0
                 $cellsLeft = [int]$Config.limits.maxDiffCells
@@ -1629,10 +1643,19 @@ function New-ActivePrAzureDevOpsProvider {
                             newLineCount = $delta.newLineCount
                             spans = @($delta.spans)
                         })
+                    if ($Request['includeEvaluationFiles'] -ceq $true -and
+                        $kind -ne 'delete') {
+                        $evaluationFiles.Add(@{ path = $path; content = $new
+                            objectId = ([string]$change.item.objectId).ToLowerInvariant() })
+                    }
                 }
-                return @{ changedFiles = $entries.Count; changedLines = $totalLines
+                $answer = @{ changedFiles = $entries.Count; changedLines = $totalLines
                     baseCommit = ([string]$Request.commonCommit).ToLowerInvariant()
                     files = @($results.ToArray()); readCount = $counter.used }
+                if ($Request['includeEvaluationFiles'] -ceq $true) {
+                    $answer.evaluationFiles = @($evaluationFiles.ToArray())
+                }
+                return $answer
             }
             Discussions {
                 $id = [int]$Request.pullRequestId
@@ -1651,4 +1674,4 @@ function New-ActivePrAzureDevOpsProvider {
     return $handler
 }
 
-Export-ModuleMember -Function Invoke-ActivePrIntake, New-ActivePrAzureDevOpsProvider
+Export-ModuleMember -Function Invoke-ActivePrIntake, New-ActivePrAzureDevOpsProvider, Get-ActivePrDiscussionCounts

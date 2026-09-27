@@ -24,7 +24,7 @@ Only a verified rule-specific completed run binds method findings and affected
 call counts (otherwise unknown), and only signed, matching create-only delivery
 events from its separate `named-areequal-v1` audit root and private key can
 establish posted comments. An absent or unreadable named feed cannot borrow
-Owner delivery counts. Per-rule intake coverage remains unknown.
+Owner delivery counts. Intake alone cannot establish evaluated coverage.
 The relation rule ID comes from the declaration bound to the local
 observation, not a hard-coded customer rule name; older relation evidence is
 marked stale even if a later scheduled run reused that state. Relation rows
@@ -42,7 +42,36 @@ Press `o` on a reporting delivery to open its validated Azure DevOps URL. On
 Windows this uses the current user's HTTP/HTTPS shell association through a
 fixed PowerShell `Start-Process` request and reports launcher exit failures.
 In Rules, press `f` for capability-filtered findings/relations or `e` for
-deliveries. Missing per-rule intake/skipped telemetry remains unknown.
+deliveries. Without a valid, current scheduled rule-evaluation cohort, current-head
+per-rule coverage remains unknown.
+
+The optional **read-only scheduled evaluation** feed is configured as a pair:
+`roots.ruleEvaluation` (an absolute private state directory, or its
+`rule-evaluation-v1` child) and `files.ruleEvaluationCohort` (the corresponding
+`rule-evaluation-v1/cohort.json`). Configure both alongside the existing
+`roots.intake` / `files.intakeCohort` pair and `azureDevOps`. The cohort
+must be byte-identical to `rule-evaluation-v1/generations/<generation>.json`,
+bind the current verified intake generation and configured repository (with a
+64-hex SHA-256 digest of the canonical dispatcher config), and
+reconcile each rule's counts against every immutable intake head. Evaluated
+heads additionally require a matching independent
+`rule-evaluation-v1/observations/<sha256-of-exact-bytes>.json`. Missing,
+tampered, stale, drifted or unsafe evidence is reported as unknown rather than
+evaluated. The Rules tab displays scheduled per-rule discovered/eligible,
+evaluated/pending/skipped/unknown/error and navigable per-head PR rows.
+Each completed observation must match its head and rule (including the
+declaration digest), generation, intake generation and completion timestamp,
+and explicitly attest zero provider writes and model-tool invocations.
+Its independently stored `rule-evaluation-v1/declarations/<sha256-of-exact-bytes>.json`
+must also bind the verified intake declaration and changed-line evidence,
+dispatcher config digest, current head/rule identity, finding cap, and
+`writerEligible: false`; missing or mismatched declarations cannot earn
+evaluated coverage.
+When present, `inventory.draftExcluded` is displayed separately as excluded
+draft PRs, outside the non-draft discovered/eligible rule denominator.
+These scheduled observations are distinct from historical pinned-service runs,
+intake discoveries, deployment verification, and posting authorization; this
+dashboard never posts from this feed.
 
 Every launch starts in **Simple**. At 100 columns and wider, a clearly boxed
 left sidebar lists agents, PRs, and statuses, with the selected item's latest
