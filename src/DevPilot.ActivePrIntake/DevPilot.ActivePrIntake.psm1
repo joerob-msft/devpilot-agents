@@ -1103,6 +1103,8 @@ function Invoke-ActivePrIntake {
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [int[]]$CanaryPullRequestIds,
+        [scriptblock]$BeforePersist,
+        [Collections.IDictionary]$CreationState,
         [switch]$Run
     )
     Assert-IntakeConfig $Config
@@ -1119,6 +1121,14 @@ function Invoke-ActivePrIntake {
     if (-not $Run -or -not $Config.enabled) {
         return New-IntakeDisabledSummary -Config $Config
     }
+    $deferred = $null -ne $BeforePersist
+    if ($deferred -and ($Config.schemaVersion -ne 2 -or
+            -not $PSBoundParameters.ContainsKey('CanaryPullRequestIds') -or
+            $Config.projectEvidence.enabled -cne $true -or
+            $null -eq $CreationState -or
+            (Test-Path -LiteralPath $StateRoot))) {
+        throw 'deferred-intake-invalid'
+    }
     $preflightReads = 0
     if ($Config.schemaVersion -eq 2) {
         $preflight = & $Provider Identity @{
@@ -1133,17 +1143,22 @@ function Invoke-ActivePrIntake {
             throw 'read-budget'
         }
     }
-    $root = Resolve-AgentTrustedRoot -Path $StateRoot -Kind durable-state `
-        -RepositoryRoot $RepositoryRoot -Create
-    $root = Resolve-AgentTrustedRoot -Path (Join-Path $root 'active-pr-intake-v1') `
-        -Kind durable-state -RepositoryRoot $RepositoryRoot -Create
-    $generationRoot = Resolve-AgentTrustedRoot -Path (Join-Path $root 'generations') `
-        -Kind durable-state -RepositoryRoot $RepositoryRoot -Create
-    $lock = [IO.File]::Open((Join-Path $root 'cohort.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+    $root = Join-Path $StateRoot 'active-pr-intake-v1'
+    $generationRoot = Join-Path $root 'generations'
+    $lock = $null
+    if (-not $deferred) {
+        $root = Resolve-AgentTrustedRoot -Path $StateRoot -Kind durable-state `
+            -RepositoryRoot $RepositoryRoot -Create
+        $root = Resolve-AgentTrustedRoot -Path (Join-Path $root 'active-pr-intake-v1') `
+            -Kind durable-state -RepositoryRoot $RepositoryRoot -Create
+        $generationRoot = Resolve-AgentTrustedRoot -Path (Join-Path $root 'generations') `
+            -Kind durable-state -RepositoryRoot $RepositoryRoot -Create
+        $lock = [IO.File]::Open((Join-Path $root 'cohort.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+    }
     try {
         $path = Join-Path $root 'cohort.json'
         $previous = $null
-        if (Test-Path -LiteralPath $path) {
+        if (-not $deferred -and (Test-Path -LiteralPath $path)) {
             $file = Get-Item -LiteralPath $path -Force
             if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint -or $file.Length -gt 8388608) {
                 throw 'Untrusted previous intake state.'
@@ -1406,6 +1421,7 @@ function Invoke-ActivePrIntake {
                                         $previous $id $ruleResult.id $ruleResult.capability `
                                         $entry.declarationDigest $envelope.binding.configDigest
                                 }
+                                $checkFinalHead = $true
                                 try {
                                 $changes = Invoke-IntakeRead $Provider Changes @{
                                     pullRequestId = $id; iterationId = $before.iterationId
@@ -1572,12 +1588,21 @@ function Invoke-ActivePrIntake {
                                     $entry.rules += $result
                                 }
                                 }
+                                catch {
+                                    if ($deferred -and
+                                        $_.Exception.Message -ceq 'read-throttled') {
+                                        $checkFinalHead = $false
+                                    }
+                                    throw
+                                }
                                 finally {
-                                    $after = Assert-IntakeHead (
-                                        Invoke-IntakeRead $Provider Head @{ pullRequestId = $id } $Config ([ref]$reads) $clock
-                                    ) $id $Config
-                                    if ((Get-IntakeDigest $before) -cne (Get-IntakeDigest $after)) {
-                                        throw 'head-drift'
+                                    if ($checkFinalHead) {
+                                        $after = Assert-IntakeHead (
+                                            Invoke-IntakeRead $Provider Head @{ pullRequestId = $id } $Config ([ref]$reads) $clock
+                                        ) $id $Config
+                                        if ((Get-IntakeDigest $before) -cne (Get-IntakeDigest $after)) {
+                                            throw 'head-drift'
+                                        }
                                     }
                                 }
                                 $envelope.counts.evaluatedRules += @(
@@ -1599,6 +1624,9 @@ function Invoke-ActivePrIntake {
                         }
                         catch {
                             $reason = [string]$_.Exception.Message
+                            if ($deferred -and $reason -ceq 'read-throttled') {
+                                throw
+                            }
                             if ($reason -cnotin @('invalid-head', 'head-inconsistent',
                                     'head-drift', 'file-budget',
                                     'line-budget', 'line-count-unavailable',
@@ -1657,6 +1685,9 @@ function Invoke-ActivePrIntake {
         }
         catch {
             $reason = [string]$_.Exception.Message
+            if ($deferred -and $reason -ceq 'read-throttled') {
+                throw
+            }
             if ($reason -cnotin @('account-mismatch', 'invalid-page', 'mutable-page',
                     'page-cursor-collision',
                     'canary-not-in-complete-eligible-inventory',
@@ -1780,6 +1811,25 @@ function Invoke-ActivePrIntake {
         $serialized = ConvertTo-Json -InputObject $envelope -Depth 32
         $bytes = [Text.UTF8Encoding]::new($false).GetBytes($serialized)
         if ($bytes.Length -gt 8388608) { throw 'Intake envelope exceeds its durable size budget.' }
+        if ($deferred) {
+            & $BeforePersist $envelope
+            $created = $false
+            try {
+                $StateRoot = Resolve-AgentTrustedRoot -Path $StateRoot `
+                    -Kind durable-state -RepositoryRoot $RepositoryRoot `
+                    -Create -CreatedByCaller ([ref]$created)
+            }
+            finally { $CreationState.created = $created }
+            if (-not $created) { throw 'canary-state-root-must-be-new' }
+            $root = Resolve-AgentTrustedRoot -Path (
+                Join-Path $StateRoot 'active-pr-intake-v1') `
+                -Kind durable-state -RepositoryRoot $RepositoryRoot -Create
+            $generationRoot = Resolve-AgentTrustedRoot -Path (
+                Join-Path $root 'generations') `
+                -Kind durable-state -RepositoryRoot $RepositoryRoot -Create
+            $lock = [IO.File]::Open((Join-Path $root 'cohort.lock'),
+                'CreateNew', 'ReadWrite', 'None')
+        }
         $generationPath = Join-Path $generationRoot "$($envelope.generation).json"
         $generationTemp = Join-Path $generationRoot (
             "staging-$([guid]::NewGuid().ToString('N')).json")
@@ -1805,7 +1855,7 @@ function Invoke-ActivePrIntake {
         finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force } }
         return $envelope
     }
-    finally { $lock.Dispose() }
+    finally { if ($lock) { $lock.Dispose() } }
 }
 
 function New-ActivePrAzureDevOpsProvider {

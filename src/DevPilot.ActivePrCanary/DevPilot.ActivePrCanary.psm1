@@ -1459,61 +1459,74 @@ function Invoke-PrivateCanarySignedIntake {
         }
         $preflightReads += $extra
     }
-    $root = Resolve-AgentTrustedRoot -Path $StateRoot -Kind durable-state `
-        -RepositoryRoot $RepositoryRoot -Create -CreatedByCaller ([ref]$created)
-    if (-not $created) { throw 'canary-state-root-must-be-new' }
+    $gate = @{ pins = $null; finalRegistry = $null }
+    $beforePersist = {
+        param([Collections.IDictionary]$cohort)
+        if ($cohort.inventory.state -cne 'complete' -or
+            $cohort.populationKnown -cne $true -or
+            $cohort.gapCounts.enumerationUnknown -ne 0 -or
+            $cohort.gapCounts.duplicateEntries -ne 0 -or
+            $cohort.inventory.nonDraft -ne $cohort.heads.Count -or
+            $cohort.inventory.active -ne
+                ($cohort.inventory.draft + $cohort.inventory.nonDraft) -or
+            $cohort.inventory.eligible -ne
+                ($cohort.inventory.nonDraft - $cohort.inventory.excludedOtherTargets)) {
+            throw 'canary-inventory-unknown'
+        }
+        $pins = @($CanaryPullRequestIds | ForEach-Object {
+                $id = $_
+                $heads = @($cohort.heads | Where-Object pullRequestId -EQ $id)
+                if ($heads.Count -ne 1 -or
+                    $heads[0].status -cne 'pending' -or
+                    $heads[0].targetRef -cne 'refs/heads/master' -or
+                    $null -eq $heads[0].lineEvidence -or
+                    [string]$heads[0].lineEvidenceDigest -cnotmatch '^[a-f0-9]{64}$' -or
+                    $null -eq $heads[0].projectEvidence -or
+                    $heads[0].projectEvidence.complete -cne $true -or
+                    [string]$heads[0].projectEvidenceDigest -cnotmatch '^[a-f0-9]{64}$') {
+                    throw 'canary-head-or-evidence-unknown'
+                }
+                [ordered]@{
+                    pullRequestId = $id
+                    sourceCommit = $heads[0].sourceCommit
+                    targetCommit = $heads[0].targetCommit
+                    targetRef = $heads[0].targetRef
+                    iterationId = $heads[0].iterationId
+                    declarationDigest = $heads[0].declarationDigest
+                    lineEvidenceDigest = $heads[0].lineEvidenceDigest
+                    projectEvidenceDigest = $heads[0].projectEvidenceDigest
+                }
+            })
+        if ($Read) {
+            $finalRegistry = New-VerifiedCanaryRuleRegistry @registryArgs
+        } else {
+            $finalRegistry = Invoke-PrivateCanaryRuleRegistry @registryArgs `
+                -BearerSession $session
+        }
+        if ($finalRegistry.receiptDigest -cne $registry.receiptDigest -or
+            $finalRegistry.state -cne 'verified-not-evaluated' -or
+            (ConvertTo-Json -InputObject $ApprovedSources -Depth 32 -Compress) -cne
+                $sourceSnapshot -or
+            (ConvertTo-Json -InputObject $ProviderConfig -Depth 32 -Compress) -cne
+                $providerSnapshot) {
+            throw 'canary-source-drift'
+        }
+        $gate.pins = $pins
+        $gate.finalRegistry = $finalRegistry
+    }.GetNewClosure()
+    $creationState = @{ created = $false }
+    $root = $StateRoot
     $cohort = Invoke-ActivePrIntake -Config $intake -Provider $Provider `
         -StateRoot $root -RepositoryRoot $RepositoryRoot `
-        -CanaryPullRequestIds $CanaryPullRequestIds -Run
-    if ($cohort.inventory.state -cne 'complete' -or
-        $cohort.populationKnown -cne $true -or
-        $cohort.gapCounts.enumerationUnknown -ne 0 -or
-        $cohort.gapCounts.duplicateEntries -ne 0 -or
-        $cohort.inventory.nonDraft -ne $cohort.heads.Count -or
-        $cohort.inventory.active -ne
-            ($cohort.inventory.draft + $cohort.inventory.nonDraft) -or
-        $cohort.inventory.eligible -ne
-            ($cohort.inventory.nonDraft - $cohort.inventory.excludedOtherTargets)) {
-        throw 'canary-inventory-unknown'
+        -CanaryPullRequestIds $CanaryPullRequestIds -BeforePersist $beforePersist `
+        -CreationState $creationState -Run
+    $created = $creationState.created
+    if (-not $created -or $null -eq $gate.pins -or
+        $null -eq $gate.finalRegistry) {
+        throw 'canary-intake-not-verified'
     }
-    $pins = @($CanaryPullRequestIds | ForEach-Object {
-            $id = $_
-            $heads = @($cohort.heads | Where-Object pullRequestId -EQ $id)
-            if ($heads.Count -ne 1 -or
-                $heads[0].status -cne 'pending' -or
-                $heads[0].targetRef -cne 'refs/heads/master' -or
-                $null -eq $heads[0].lineEvidence -or
-                [string]$heads[0].lineEvidenceDigest -cnotmatch '^[a-f0-9]{64}$' -or
-                $null -eq $heads[0].projectEvidence -or
-                $heads[0].projectEvidence.complete -cne $true -or
-                [string]$heads[0].projectEvidenceDigest -cnotmatch '^[a-f0-9]{64}$') {
-                throw 'canary-head-or-evidence-unknown'
-            }
-            [ordered]@{
-                pullRequestId = $id
-                sourceCommit = $heads[0].sourceCommit
-                targetCommit = $heads[0].targetCommit
-                targetRef = $heads[0].targetRef
-                iterationId = $heads[0].iterationId
-                declarationDigest = $heads[0].declarationDigest
-                lineEvidenceDigest = $heads[0].lineEvidenceDigest
-                projectEvidenceDigest = $heads[0].projectEvidenceDigest
-            }
-        })
-    if ($Read) {
-        $finalRegistry = New-VerifiedCanaryRuleRegistry @registryArgs
-    } else {
-        $finalRegistry = Invoke-PrivateCanaryRuleRegistry @registryArgs `
-            -BearerSession $session
-    }
-    if ($finalRegistry.receiptDigest -cne $registry.receiptDigest -or
-        $finalRegistry.state -cne 'verified-not-evaluated' -or
-        (ConvertTo-Json -InputObject $ApprovedSources -Depth 32 -Compress) -cne
-            $sourceSnapshot -or
-        (ConvertTo-Json -InputObject $ProviderConfig -Depth 32 -Compress) -cne
-            $providerSnapshot) {
-        throw 'canary-source-drift'
-    }
+    $pins = $gate.pins
+    $finalRegistry = $gate.finalRegistry
     $config = [ordered]@{
         schemaVersion = 2
         kind = 'private-canary-signed-intake'
@@ -1600,6 +1613,10 @@ function Invoke-PrivateCanarySignedIntake {
     }
     catch {
         $failure = $_
+        if ($null -ne $creationState -and $creationState.created) {
+            $created = $true
+            $root = $StateRoot
+        }
         if ($created -and $root -and (Test-Path -LiteralPath $root)) {
             try { Remove-Item -LiteralPath $root -Recurse -Force }
             catch { throw 'canary-private-state-cleanup-failed' }

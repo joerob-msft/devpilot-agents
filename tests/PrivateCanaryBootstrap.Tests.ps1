@@ -483,10 +483,14 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                         commonCommit = 'c' * 40; iterationId = 1 }
                 }
                 Changes {
+                    if ($state.wrong -eq 'throttle-changes') {
+                        throw 'read-throttled'
+                    }
                     if ($state.wrong -eq 'provider-drift') {
                         $config.expectedAccount.uniqueName = 'other@example.invalid'
                     }
-                    $graph = if ($state.code) {
+                    $graph = if ($state.code -and
+                        $state.wrong -ne 'unknown-project') {
                         @{
                             schemaVersion = 1
                             kind = 'source-bound-evaluated-project-graph-v1'
@@ -527,6 +531,11 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                                         [Text.Encoding]::UTF8.GetBytes(
                                             (ConvertTo-Json $graph -Depth 32 -Compress))
                                     )).ToLowerInvariant() })
+                    } elseif ($state.code -and
+                        $state.wrong -eq 'unknown-project') {
+                        $receipt = @(@{ pathDigest = $digest
+                                objectId = $state.objectId
+                                status = 'unknown'; attestationDigest = $null })
                     }
                     return @{ changedFiles = 1; changedLines = $state.lines
                         baseCommit = $request.commonCommit
@@ -544,7 +553,8 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                                 'f' * 40
                             } else { $request.sourceCommit }
                             rootTreeId = if ($state.code) { 'f' * 40 } else { $null }
-                            complete = $true; files = $receipt
+                            complete = $state.wrong -ne 'unknown-project'
+                            files = $receipt
                         } }
                 }
                 Discussions {
@@ -1052,6 +1062,62 @@ Describe 'Read-only private canary input bootstrap' {
                     @($c.state.calls | Where-Object {
                             $_ -notin @('Identity', 'ListPage', 'Head', 'Changes',
                                 'Discussions')
+                        }).Count | Should -Be 0
+                }
+            }
+            It 'keeps the private root absent through complete and failed signed-intake proofs' {
+                foreach ($mode in @('complete', 'split-page',
+                        'unknown-project', 'stale-head', 'throttle-changes',
+                        'throttle-final')) {
+                    $c = Get-SignedIntakeCase -Code
+                    if ($mode -ne 'complete') { $c.state.wrong = $mode }
+                    $root = $c.root
+                    $originalRead = $c.read
+                    $originalProvider = $c.provider
+                    $observed = @{ source = 0; intake = 0 }
+                    $c.read = {
+                        param($operation, $request)
+                        if (Test-Path -LiteralPath $root) {
+                            throw 'state-created-before-source-proof'
+                        }
+                        $observed.source++
+                        & $originalRead $operation $request
+                    }.GetNewClosure()
+                    $c.provider = {
+                        param($operation, $request)
+                        if (Test-Path -LiteralPath $root) {
+                            throw 'state-created-before-intake-proof'
+                        }
+                        $observed.intake++
+                        & $originalProvider $operation $request
+                    }.GetNewClosure()
+                    if ($mode -eq 'complete') {
+                        (Invoke-SignedIntakeCase $c).state |
+                            Should -Be 'signed-intake-not-evaluated'
+                        (Test-Path -LiteralPath (
+                                Join-Path $root 'signature.key')) |
+                            Should -BeTrue
+                    } else {
+                        $message = try {
+                            [void](Invoke-SignedIntakeCase $c)
+                            ''
+                        } catch { $_.Exception.Message }
+                        $message | Should -Not -BeNullOrEmpty
+                        $message | Should -Not -Match 'state-created-before-'
+                        Test-Path -LiteralPath $root | Should -BeFalse
+                    }
+                    $observed.source | Should -BeGreaterThan 0
+                    $observed.intake | Should -BeGreaterThan 0
+                    if ($mode -eq 'throttle-changes') {
+                        @($c.state.calls | Where-Object { $_ -eq 'Head' }).Count |
+                            Should -Be 1
+                        @($c.state.calls | Where-Object {
+                                $_ -eq 'Discussions'
+                            }).Count | Should -Be 0
+                    }
+                    @($c.state.calls | Where-Object {
+                            $_ -notin @('Identity', 'ListPage', 'Head',
+                                'Changes', 'Discussions')
                         }).Count | Should -Be 0
                 }
             }

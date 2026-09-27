@@ -249,13 +249,17 @@ recheck and subsequent read-only evaluation, not a replay of a bootstrap
 bearer. Its initial and final account proofs must agree with the signed
 immutable identity.
 
-Only after complete intake and a second source/head check does the command
-copy the verified provider JSON and four-source manifest into the fresh
-ACL-private root, mint a random HMAC key, and sign `canary-dispatcher.json`
-over the repository canonical JSON representation. It also writes the exact
-intake config and immutable intake generation. The signed handoff binds
-each selected source/target/iteration, changed-line/project-scope digests,
-and four **distinct, disabled** source declarations. The class/redundant
+The two-pass inventory and selected-head changed-line/project-graph evidence
+are assembled in bounded memory. Unknown inventory, incomplete selected
+graph, changed head, source/identity drift, or throttle abort before creating
+any signed-intake root, lock, generation, file, or key. Only after complete
+intake and a second source/head/account check does the command create the
+fresh ACL-private root, persist the immutable intake generation, copy the
+verified provider JSON and four-source manifest, mint a random HMAC key, and
+sign `canary-dispatcher.json` over the repository canonical JSON
+representation. It also writes the exact intake config. The signed handoff
+binds each selected source/target/iteration, changed-line/project-scope
+digests, and four **distinct, disabled** source declarations. The class/redundant
 bindings remain **unmerged candidate-only**. This config has
 `enabled: false`, `writerEligible: false`, and `modelEnabled: false`; it is
 **not** accepted by the older `@1` dispatcher and must not be enabled or
