@@ -129,7 +129,42 @@ verify the pinned EngHub section and configure the live model; this command
 does not supply credentials, signed live configuration, or an active intake
 generation.
 
-For a **private syntactic canary only**, use
+`tools/Initialize-PrivateActivePrCanaryInputs.ps1` is a **preparation-only**
+bootstrap for the private syntactic canary. It is disabled without `-Run`;
+it requires a new absolute external `-StateRoot`, the expected organization
+slug, BPM project/repository names, and the expected reviewer UPN. These are
+selectors to check, not operator-invented GUIDs or source digests. With
+`-Run`, it acquires one AAD bearer in memory via `az account get-access-token`,
+uses bounded GETs only, and checks the connection identity before and after
+the source reads. It derives the project/repository GUIDs and account
+ID/descriptor from those GETs. It checks the EngHub project/repository
+identity, active PR 17307009's exact source commit against its latest
+iteration and source ref twice, the pinned commit, and raw UTF-8 document
+bytes against both the Git blob object ID and the independently pinned
+section/document digests. The Owner and named-parameters sections are
+independent approvals at the Owner commit. The class and redundant rules
+have distinct versioned declaration digests for lines 221 and 223 of the
+**unmerged** document; their `headVerified` receipt means only that the
+reviewed PR still pointed to the approved immutable candidate during
+preparation, never that master contains the convention. The named-rule
+local policy is bound to the checked-out repository commit and byte-identical
+Git blob, not misidentified as an EngHub or BPM policy. No raw source, token,
+or alias secret is written into the repository or normal command output.
+
+After all checks it creates only `provider-config.json` and
+`approved-sources.json` in a fresh ACL-private external directory. The latter
+is a version 2 four-rule source **receipt** plus a separate named-section
+entry. It is **not** the legacy approval manifest consumed by
+`Invoke-ActivePrCanaryQualification.ps1`. There is no HMAC key, signed
+dispatcher config, intake, canary GET evaluation, model call, or provider
+write in this preparation layer; do not feed these receipts to the old
+`@1`-only command or treat the verified candidate as master authority.
+Actual `@2` registry/dispatcher binding, complete two-pass intake and
+source-bound project graph qualification require the next dependent layer.
+Do not run the private bootstrap until its own and parent exact-head CI
+and input provenance have been checked.
+
+For the existing **private syntactic `@1` canary only**, use
 `tools/Invoke-ActivePrCanaryQualification.ps1` instead of hand-signing a
 configuration or fabricating a cohort. Its `-Run` switch is default-off.
 It accepts one or two explicit `-CanaryPullRequestIds` and a **new**, absolute
@@ -191,11 +226,10 @@ The reviewed PR was **not merged**; an immutable commit does not establish
 that it is still the PR's live head or that its policy was merged to master.
 The existing canary does not call this function, accept `@2` in its signed
 registry, or treat these approvals as an `@1` local policy replacement.
-A later private-input generator must recheck the PR's exact live head,
-reverify its raw blob, derive the actual BPM/provider IDs, adapt the signed
-read-only `@2` registry, and prove source-head-bound project ownership before
-signing. Do not create an external manifest by guessing repository IDs or
-declaration digests; do not run a live ADO canary from this candidate receipt.
+The preparation-only generator above rechecks the PR's live head and immutable
+blob and derives provider IDs, but does **not** adapt the signed read-only
+`@2` registry or prove source-head-bound project ownership. Do not sign a
+dispatcher configuration or run a live ADO canary from its candidate receipt.
 
 The tool then uses the intake provider's two complete bounded listing passes
 over *all* active PRs, excludes drafts and non-master targets, and pins the
