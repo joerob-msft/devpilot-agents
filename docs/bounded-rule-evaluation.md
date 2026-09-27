@@ -164,6 +164,33 @@ source-bound project graph qualification require the next dependent layer.
 Do not run the private bootstrap until its own and parent exact-head CI
 and input provenance have been checked.
 
+`tools/Invoke-PrivateCanaryRuleRegistry.ps1` consumes **only** that
+bootstrap's external ACL-private `provider-config.json` and version 2
+`approved-sources.json`. It is disabled without `-Run`; it never creates
+private state, signs configuration, selects PRs, evaluates rules, invokes a
+model, or writes to ADO. When explicitly run after the exact-head CI and
+source gates, it obtains one AAD bearer in memory and performs at most 20
+bounded GETs. It checks the BPM and EngHub identities, independent Owner and
+Named section bytes against their raw Git blobs, the two distinct candidate
+declarations at the immutable EngHub commit, the current reviewed PR's head
+and latest iteration/source ref both before and after the source reads,
+the principal before and after, and the locally pinned Named policy blob.
+It returns four **disabled**, separately digest-bound rule entries and
+`verified-not-evaluated`, not a dispatcher registry or a master-approved
+rule. A receipt field cannot substitute for a fresh read; changed or missing
+receipts and source drift fail closed. Do not persist or treat this output
+as proof of changed-line evaluation, ownership, thread reconciliation, or
+Owner no-tools execution.
+
+The follow-on runner must still adapt these verified candidate bindings to
+an independently signed `@2` dispatcher configuration, perform complete
+two-pass active-PR intake before selecting at most two explicit master-target
+heads, verify full source-head project ownership and changed lines, recheck
+current heads and discussions, reconcile human versus marked automation,
+and retain Owner as unknown unless separately executed with a completed
+no-tools/no-write proof. This registry step cannot credit any rule as
+evaluated or enable posting.
+
 For the existing **private syntactic `@1` canary only**, use
 `tools/Invoke-ActivePrCanaryQualification.ps1` instead of hand-signing a
 configuration or fabricating a cohort. Its `-Run` switch is default-off.
