@@ -18,6 +18,9 @@ using System.Threading.Tasks;
 public sealed class CanarySyntheticHandler : HttpMessageHandler {
     public List<string> Paths = new List<string>();
     public HttpStatusCode Status = HttpStatusCode.OK;
+    public bool FailTransport = false;
+    public bool Oversize = false;
+    public bool InvalidJson = false;
     protected override Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken) {
         if (request.Method != HttpMethod.Get ||
@@ -27,11 +30,16 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             throw new InvalidOperationException("unbound synthetic GET");
         }
         Paths.Add(request.RequestUri.AbsoluteUri);
+        if (FailTransport) {
+            throw new HttpRequestException("private transport detail");
+        }
         var content = request.RequestUri.AbsolutePath.EndsWith("/connectionData")
             ? Encoding.UTF8.GetBytes("{\"authenticatedUser\":{\"id\":\"33333333-3333-3333-3333-333333333333\",\"subjectDescriptor\":\"aad.synthetic\",\"uniqueName\":\"service@example.invalid\"}}")
             : request.Headers.Accept.ToString() == "application/octet-stream"
             ? Encoding.UTF8.GetBytes("synthetic bytes")
             : Encoding.UTF8.GetBytes("{\"id\":\"synthetic\"}");
+        if (Oversize) content = new byte[65537];
+        if (InvalidJson) content = Encoding.UTF8.GetBytes("{");
         return Task.FromResult(new HttpResponseMessage(Status) {
             Content = new ByteArrayContent(content)
         });
@@ -1100,5 +1108,70 @@ Describe 'Read-only private canary input bootstrap' {
             $handler.Paths.Count | Should -Be 1
         }
         finally { $client.Dispose() }
+    }
+    It 'redacts transport failures before any state creation or provider write' {
+        $handler = [CanarySyntheticHandler]::new()
+        $handler.FailTransport = $true
+        $client = [Net.Http.HttpClient]::new($handler)
+        $module = Get-Module DevPilot.ActivePrCanary
+        $c = Get-BootstrapCase
+        $state = $c.state
+        $c.provider = {
+            param($operation, $request)
+            $state.reads.Add($operation) | Out-Null
+            & $module {
+                param($Client, $Operation, $Request)
+                Invoke-CanaryAadGet $Client 'synthetic-bearer' 'example-org' `
+                    $Operation $Request ([DateTime]::UtcNow.AddSeconds(5))
+            } $client $operation $request
+        }.GetNewClosure()
+        try {
+            $message = try {
+                Invoke-BootstrapCase $c
+                ''
+            }
+            catch { $_.Exception.Message }
+            $message | Should -Be 'bootstrap-read-inaccessible:Identity:send'
+            Test-Path $c.root | Should -BeFalse
+            $state.reads.Count | Should -Be 1
+            $state.reads[0] | Should -Be 'Identity'
+            $handler.Paths.Count | Should -Be 1
+        }
+        finally { $client.Dispose() }
+    }
+    It 'redacts bounded response read and decode failures without private state' {
+        foreach ($case in @(
+                @{ phase = 'read'; oversize = $true; invalidJson = $false },
+                @{ phase = 'decode'; oversize = $false; invalidJson = $true })) {
+            $handler = [CanarySyntheticHandler]::new()
+            $handler.Oversize = $case.oversize
+            $handler.InvalidJson = $case.invalidJson
+            $client = [Net.Http.HttpClient]::new($handler)
+            $module = Get-Module DevPilot.ActivePrCanary
+            $c = Get-BootstrapCase
+            $state = $c.state
+            $c.provider = {
+                param($operation, $request)
+                $state.reads.Add($operation) | Out-Null
+                & $module {
+                    param($Client, $Operation, $Request)
+                    Invoke-CanaryAadGet $Client 'synthetic-bearer' 'example-org' `
+                        $Operation $Request ([DateTime]::UtcNow.AddSeconds(5))
+                } $client $operation $request
+            }.GetNewClosure()
+            try {
+                $message = try {
+                    Invoke-BootstrapCase $c
+                    ''
+                }
+                catch { $_.Exception.Message }
+                $message | Should -Be "bootstrap-read-inaccessible:Identity:$($case.phase)"
+                Test-Path $c.root | Should -BeFalse
+                $state.reads.Count | Should -Be 1
+                $state.reads[0] | Should -Be 'Identity'
+                $handler.Paths.Count | Should -Be 1
+            }
+            finally { $client.Dispose() }
+        }
     }
 }

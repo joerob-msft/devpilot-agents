@@ -360,6 +360,7 @@ function Invoke-CanaryAadGet {
     $remaining = [Math]::Max(1, [int]($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
     $cancel = [Threading.CancellationTokenSource]::new($remaining)
     $failureStatus = 0
+    $phase = 'send'
     try {
         $response = $Client.SendAsync($message,
             [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
@@ -369,6 +370,7 @@ function Invoke-CanaryAadGet {
                 $failureStatus = [int]$response.StatusCode
                 throw 'bootstrap-read-inaccessible'
             }
+            $phase = 'read'
             if ($null -ne $response.Content.Headers.ContentLength -and
                     $response.Content.Headers.ContentLength -gt $limit) {
                 throw 'bootstrap-read-inaccessible'
@@ -391,6 +393,7 @@ function Invoke-CanaryAadGet {
         }
         finally { $response.Dispose() }
         if ($Operation -ceq 'RawItem') { return @{ bytes = $bytes } }
+        $phase = 'decode'
         $result = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) |
             ConvertFrom-Json -AsHashtable -Depth 12
         if ($Operation -ceq 'Identity') {
@@ -405,7 +408,7 @@ function Invoke-CanaryAadGet {
             throw ('bootstrap-read-inaccessible:{0}:http-{1}' -f
                 $Operation, $failureStatus)
         }
-        throw 'bootstrap-read-inaccessible'
+        throw ('bootstrap-read-inaccessible:{0}:{1}' -f $Operation, $phase)
     }
     finally {
         $cancel.Dispose()
