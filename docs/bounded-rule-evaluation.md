@@ -18,6 +18,15 @@ complete line evidence is `unknown`, never `evaluated`. The intake timestamp
 must be current (at most 120 minutes old in the sample), or dispatch fails
 before reading ADO.
 
+Optional test-project ownership receipts are described in
+[`test-project-scope-evidence.md`](test-project-scope-evidence.md). A complete
+source-head-bound receipt is an additional prerequisite for the dormant `@2`
+all-class coverage capabilities: dispatch re-reads the graph through
+Changes and binds its digest in the declaration and observation. An absent,
+partial, mismatched, or mixed-owner receipt stays unknown, and neither the
+intake receipt alone nor an old observation counts as evaluation. `@1`
+MSTest rules retain their existing source and changed-line semantics.
+
 The sample [`rule-evaluation.config.json`](../samples/rule-evaluation.config.json)
 has both global and per-capability switches disabled. To run an enabled
 configuration, the operator supplies `DEVPILOT_RULE_EVALUATION_KEY` outside

@@ -175,6 +175,58 @@ function Read-RuleJson {
     throw 'untrusted-state-file'
 }
 
+function Assert-RuleProjectEvidence {
+    param([Collections.IDictionary]$Head, [string]$Generation)
+    $scope = $Head['projectEvidence']
+    if ($null -eq $scope) {
+        if ($null -ne $Head['projectEvidenceDigest']) {
+            throw 'intake-project-evidence-invalid'
+        }
+        return
+    }
+    if ($scope -isnot [Collections.IDictionary] -or
+        $Head.lineEvidence -isnot [Collections.IDictionary] -or
+        [string]$Head.projectEvidenceDigest -cnotmatch '^[a-f0-9]{64}$' -or
+        (Get-RuleDigest $scope) -cne $Head.projectEvidenceDigest -or
+        $scope.schemaVersion -ne 1 -or
+        $scope.kind -cne 'source-bound-project-scope-summary-v1' -or
+        $scope.generation -cne $Generation -or
+        $scope.declarationDigest -cne $Head.declarationDigest -or
+        $scope.repositoryId -ine $Head.declaration.repositoryId -or
+        $scope.sourceCommit -cne $Head.sourceCommit -or
+        $scope.complete -isnot [bool] -or $scope.files -isnot [array] -or
+        $scope.files.Count -gt $Head.lineEvidence.changedFiles -or
+        ($null -ne $scope.rootTreeId -and
+            [string]$scope.rootTreeId -cnotmatch '^[a-f0-9]{40}$') -or
+        ($scope.complete -and $scope.files.Count -gt 0 -and
+            [string]$scope.rootTreeId -cnotmatch '^[a-f0-9]{40}$')) {
+        throw 'intake-project-evidence-invalid'
+    }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $unknown = 0
+    foreach ($file in $scope.files) {
+        if ($file -isnot [Collections.IDictionary] -or
+            [string]$file.pathDigest -cnotmatch '^[a-f0-9]{64}$' -or
+            -not $seen.Add([string]$file.pathDigest) -or
+            @($Head.lineEvidence.files | Where-Object {
+                    $_.pathDigest -ceq $file.pathDigest -and
+                    $_.changeType -cne 'delete'
+                }).Count -ne 1 -or
+            [string]$file.objectId -cnotmatch '^[a-f0-9]{40}$' -or
+            $file.status -cnotin @('complete', 'unknown') -or
+            ($file.status -ceq 'complete' -and
+                [string]$file.attestationDigest -cnotmatch '^[a-f0-9]{64}$') -or
+            ($file.status -ceq 'unknown' -and
+                $null -ne $file.attestationDigest)) {
+            throw 'intake-project-evidence-invalid'
+        }
+        if ($file.status -ceq 'unknown') { $unknown++ }
+    }
+    if ($scope.complete -ne ($unknown -eq 0)) {
+        throw 'intake-project-evidence-invalid'
+    }
+}
+
 function Assert-RuleIntake {
     param([string]$StateRoot, [Collections.IDictionary]$Config,
         [Collections.IDictionary]$IntakeConfig, [string]$RepositoryRoot)
@@ -252,7 +304,11 @@ function Assert-RuleIntake {
             throw 'intake-target-invalid'
         }
         if ($null -eq $head.lineEvidence) {
-            if ($null -ne $head.lineEvidenceDigest) { throw 'intake-evidence-invalid' }
+            if ($null -ne $head.lineEvidenceDigest -or
+                $null -ne $head['projectEvidence'] -or
+                $null -ne $head['projectEvidenceDigest']) {
+                throw 'intake-evidence-invalid'
+            }
             continue
         }
         $declaration = $head.declaration
@@ -304,6 +360,12 @@ function Assert-RuleIntake {
         }
         if ($added -ne $evidence.addedLines -or $deleted -ne $evidence.deletedLines) {
             throw 'intake-evidence-invalid'
+        }
+        Assert-RuleProjectEvidence $head $intake.generation
+        if ($null -ne $IntakeConfig['projectEvidence'] -and
+            $IntakeConfig.projectEvidence.enabled -ceq $true -and
+            $null -eq $head['projectEvidence']) {
+            throw 'intake-project-evidence-invalid'
         }
     }
     if ($master -ne $intake.inventory.eligible) { throw 'intake-denominator-invalid' }
@@ -788,6 +850,11 @@ function Invoke-BoundedRuleEvaluation {
                         targetCommit = $declaration.targetCommit
                         commonCommit = $declaration.commonCommit
                         includeEvaluationFiles = $true
+                        includeProjectEvidence = (@($Config.rules | Where-Object {
+                                    $_.enabled -and $_.capabilityId -cin @(
+                                        'bpm-test-class-coverage@2',
+                                        'bpm-redundant-method-coverage@2')
+                                }).Count -gt 0)
                     } ([ref]$reads) $limits.maxReads $clock $limits.maxSeconds
                     $digestFiles = @($changed.files)
                     if ($changed.changedLines -ne $head.lineEvidence.changedLines -or
@@ -830,6 +897,39 @@ function Invoke-BoundedRuleEvaluation {
                     if ($changed.evaluationFiles.Count -ne $files.Count) {
                         throw 'source-unverified'
                     }
+                    $projectBound = $false
+                    if ($head['projectEvidence'] -is [Collections.IDictionary] -and
+                        $head.projectEvidence.complete -ceq $true -and
+                        $changed['projectEvidence'] -is [Collections.IDictionary]) {
+                        $expectedScope = [ordered]@{
+                            schemaVersion = 1
+                            kind = 'source-bound-project-scope-summary-v1'
+                            repositoryId = $head.projectEvidence.repositoryId
+                            sourceCommit = $head.projectEvidence.sourceCommit
+                            rootTreeId = $head.projectEvidence.rootTreeId
+                            complete = $head.projectEvidence.complete
+                            files = $head.projectEvidence.files
+                        }
+                        $projectBound = (Get-RuleDigest $expectedScope) -ceq
+                            (Get-RuleDigest $changed.projectEvidence)
+                        if ($projectBound) {
+                            foreach ($receipt in $head.projectEvidence.files) {
+                                $source = @($files | Where-Object {
+                                        (Get-RuleDigest $_.path) -ceq $receipt.pathDigest -and
+                                        $_.objectId -ceq $receipt.objectId
+                                    })
+                                if ($receipt.status -cne 'complete' -or
+                                    $source.Count -ne 1 -or
+                                    $source[0].projectEvidence -isnot
+                                        [Collections.IDictionary] -or
+                                    (Get-RuleDigest $source[0].projectEvidence) -cne
+                                        $receipt.attestationDigest) {
+                                    $projectBound = $false
+                                    break
+                                }
+                            }
+                        }
+                    }
                     $discussions = Invoke-RuleRead $Provider Discussions @{
                         pullRequestId = $id; iterationId = $declaration.iterationId
                     } ([ref]$reads) $limits.maxReads $clock $limits.maxSeconds
@@ -839,6 +939,13 @@ function Invoke-BoundedRuleEvaluation {
                     Assert-RuleHead $after $declaration
                     foreach ($rule in $entry.rules) {
                         if ($rule.status -eq 'skipped') { continue }
+                        $projectRule = $rule.capabilityId -cin @(
+                            'bpm-test-class-coverage@2', 'bpm-redundant-method-coverage@2')
+                        if ($projectRule -and -not $projectBound) {
+                            $rule.status = 'unknown'
+                            $rule.reasonCode = 'test-project-identity-unknown'
+                            continue
+                        }
                         if ($clock.Elapsed.TotalSeconds -ge $limits.maxSeconds) {
                             throw 'time-budget'
                         }
@@ -883,6 +990,10 @@ function Invoke-BoundedRuleEvaluation {
                             } else { $null }
                             writerEligible = $false
                         }
+                        if ($projectRule) {
+                            $ruleDeclaration.projectEvidenceDigest =
+                                $head.projectEvidenceDigest
+                        }
                         $declarationBytes = [Text.UTF8Encoding]::new($false).GetBytes(
                             (ConvertTo-Json -InputObject $ruleDeclaration -Depth 16))
                         $rule.declarationDigest = [Convert]::ToHexString(
@@ -907,6 +1018,12 @@ function Invoke-BoundedRuleEvaluation {
                             Get-RuleEvaluation $rule.capabilityId $files.ToArray() `
                                 $ruleConfig.maxFindingsPerHead $contract $snapshot `
                                 $declaration.repositoryId $declaration.sourceCommit
+                        }
+                        if ($projectRule) {
+                            $finalProjectHead = Invoke-RuleRead $Provider Head @{
+                                pullRequestId = $id
+                            } ([ref]$reads) $limits.maxReads $clock $limits.maxSeconds
+                            Assert-RuleHead $finalProjectHead $declaration
                         }
                         if ($rule.capabilityId -ceq 'bpm-test-ownership@1' -and $OwnerEvaluator) {
                             $postHead = Invoke-RuleRead $Provider Head @{ pullRequestId = $id } `
@@ -1046,6 +1163,10 @@ function Invoke-BoundedRuleEvaluation {
                                 }
                             } else { $null }
                             providerWrites = 0; modelToolInvocations = 0
+                        }
+                        if ($projectRule) {
+                            $observation.projectEvidenceDigest =
+                                $head.projectEvidenceDigest
                         }
                         $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
                             (ConvertTo-Json -InputObject $observation -Depth 16))

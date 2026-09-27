@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
 Import-Module (Join-Path $PSScriptRoot '..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
+Import-Module (Join-Path $PSScriptRoot '..\DevPilot.TestProjectEvidence\DevPilot.TestProjectEvidence.psd1')
 
 function Assert-IntakeNumber {
     param($Value, [string]$Name, [int]$Minimum, [int]$Maximum)
@@ -52,6 +53,15 @@ function Assert-IntakeConfig {
             @('maxThreads', 1, 1000), @('maxComments', 1, 10000)
         )) {
         [void](Assert-IntakeNumber $Config.limits[$setting[0]] $setting[0] $setting[1] $setting[2])
+    }
+    if ($null -ne $Config['projectEvidence']) {
+        $scope = $Config.projectEvidence
+        if ($scope -isnot [Collections.IDictionary] -or
+            $scope.schemaVersion -ne 1 -or $scope.enabled -isnot [bool]) {
+            throw 'Invalid project evidence configuration.'
+        }
+        [void](Assert-IntakeNumber $scope.maxTreeEntries maxTreeEntries 1 10000)
+        [void](Assert-IntakeNumber $scope.maxProjects maxProjects 1 32)
     }
     if ($Config.rules -isnot [array] -or $Config.rules.Count -eq 0 -or
         $Config.rules.Count -gt 32) { throw 'A bounded generic rule registry is required.' }
@@ -226,6 +236,152 @@ function Assert-IntakeBlob {
     return @{ text = if ($withBom) { [string][char]0xfeff + $Item.content } else {
             $Item.content
         }; bytes = $candidate.Length }
+}
+
+function Assert-IntakeRawBlob {
+    param([byte[]]$Bytes, [string]$ObjectId, [int]$MaxBytes)
+    if ($null -eq $Bytes -or $Bytes.Length -gt $MaxBytes -or
+        [string]$ObjectId -cnotmatch '^[a-fA-F0-9]{40}$') {
+        throw 'invalid-item'
+    }
+    $header = [Text.Encoding]::ASCII.GetBytes("blob $($Bytes.Length)`0")
+    $actual = [Convert]::ToHexString(
+        [Security.Cryptography.SHA1]::HashData([byte[]]($header + $Bytes))
+    ).ToLowerInvariant()
+    if ($actual -ine $ObjectId) { throw 'invalid-item' }
+    try {
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes)
+    }
+    catch { throw 'unsupported-change' }
+    if ($text -cmatch '[\x00-\x08\x0b\x0c\x0e-\x1f]' -or
+        $text.StartsWith("version https://git-lfs.github.com/spec/v1`n")) {
+        throw 'unsupported-change'
+    }
+    return @{ text = $text; bytes = $Bytes.Length }
+}
+
+function Get-IntakeSourceTree {
+    param([scriptblock]$Read, [string[]]$Route, [string]$Commit,
+        [int]$MaxEntries)
+    $commitResponse = & $Read 'commits' ($Route + @("commitId=$Commit")) @() 65536
+    if ([string]$commitResponse.commitId -ine $Commit -or
+        [string]$commitResponse.treeId -cnotmatch '^[a-fA-F0-9]{40}$') {
+        throw 'project-identity-unknown'
+    }
+    $queue = [Collections.Generic.Queue[object]]::new()
+    $queue.Enqueue(@{ path = ''; objectId = ([string]$commitResponse.treeId).ToLowerInvariant() })
+    $entries = [Collections.Generic.List[object]]::new()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    while ($queue.Count -gt 0) {
+        if ($entries.Count + $queue.Count -gt $MaxEntries) {
+            throw 'project-identity-unknown'
+        }
+        $directory = $queue.Dequeue()
+        $tree = & $Read 'trees' ($Route + @("sha1=$($directory.objectId)")) @(
+            'recursive=false') 2097152
+        if ([string]$tree.objectId -ine [string]$directory.objectId -or
+            $tree['treeEntries'] -isnot [array] -or
+            $tree.treeEntries.Count + $entries.Count -gt $MaxEntries) {
+            throw 'project-identity-unknown'
+        }
+        $raw = [IO.MemoryStream]::new()
+        try {
+            $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($item in $tree.treeEntries) {
+                if ($item -isnot [Collections.IDictionary] -or
+                    [string]$item.relativePath -cnotmatch '^[^/\\?#\x00-\x1f]{1,255}$' -or
+                    $item.relativePath -in @('.', '..') -or
+                    -not $names.Add([string]$item.relativePath) -or
+                    [string]$item.objectId -cnotmatch '^[a-fA-F0-9]{40}$') {
+                    throw 'project-identity-unknown'
+                }
+                $mode = [string]$item.mode
+                $kind = [string]$item.gitObjectType
+                if (($kind -ceq 'tree' -and $mode -cne '40000') -or
+                    ($kind -ceq 'blob' -and $mode -cnotin @('100644', '100755')) -or
+                    $kind -cnotin @('blob', 'tree')) {
+                    throw 'project-identity-unknown'
+                }
+                $path = "$($directory.path)/$($item.relativePath)"
+                if ($path.Length -gt 2048 -or -not $seen.Add($path)) {
+                    throw 'project-identity-unknown'
+                }
+                $oid = ([string]$item.objectId).ToLowerInvariant()
+                $prefix = [Text.Encoding]::UTF8.GetBytes("$mode $($item.relativePath)`0")
+                $raw.Write($prefix, 0, $prefix.Length)
+                $hash = [Convert]::FromHexString($oid)
+                $raw.Write($hash, 0, $hash.Length)
+                $entries.Add(@{ path = $path; objectId = $oid; gitObjectType = $kind })
+                if ($kind -ceq 'tree') {
+                    $queue.Enqueue(@{ path = $path; objectId = $oid })
+                }
+            }
+            $bytes = $raw.ToArray()
+            if ($null -ne $tree['size'] -and [string]$tree.size -cne
+                [string]$bytes.Length) { throw 'project-identity-unknown' }
+            $header = [Text.Encoding]::ASCII.GetBytes("tree $($bytes.Length)`0")
+            $digest = [Convert]::ToHexString(
+                [Security.Cryptography.SHA1]::HashData([byte[]]($header + $bytes))
+            ).ToLowerInvariant()
+            if ($digest -cne [string]$directory.objectId) {
+                throw 'project-identity-unknown'
+            }
+        }
+        finally { $raw.Dispose() }
+    }
+    return @{ rootTreeId = ([string]$commitResponse.treeId).ToLowerInvariant()
+        entries = @($entries.ToArray()) }
+}
+
+function Assert-IntakeProjectScope {
+    param([Collections.IDictionary]$Scope, [object[]]$Sources,
+        [string]$RepositoryId, [string]$SourceCommit, [int]$MaxFiles)
+    if ($null -eq $Scope -or $Scope.schemaVersion -ne 1 -or
+        $Scope.kind -cne 'source-bound-project-scope-summary-v1' -or
+        $Scope.repositoryId -ine $RepositoryId -or
+        $Scope.sourceCommit -ine $SourceCommit -or
+        $Scope.complete -isnot [bool] -or $Scope.files -isnot [array] -or
+        $Scope.files.Count -gt $MaxFiles) {
+        throw 'project-identity-unknown'
+    }
+    $expected = @($Sources | Where-Object { $_.path -cmatch '\.cs$' })
+    if ($Scope.files.Count -ne $expected.Count -or
+        ($Scope.complete -and $expected.Count -gt 0 -and
+            [string]$Scope.rootTreeId -cnotmatch '^[a-f0-9]{40}$') -or
+        ($null -ne $Scope.rootTreeId -and
+            [string]$Scope.rootTreeId -cnotmatch '^[a-f0-9]{40}$')) {
+        throw 'project-identity-unknown'
+    }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $incomplete = $false
+    foreach ($receipt in $Scope.files) {
+        if ($receipt -isnot [Collections.IDictionary] -or
+            [string]$receipt.pathDigest -cnotmatch '^[a-f0-9]{64}$' -or
+            -not $seen.Add([string]$receipt.pathDigest) -or
+            [string]$receipt.objectId -cnotmatch '^[a-f0-9]{40}$' -or
+            $receipt.status -cnotin @('complete', 'unknown') -or
+            ($receipt.status -ceq 'complete' -and
+                [string]$receipt.attestationDigest -cnotmatch '^[a-f0-9]{64}$') -or
+            ($receipt.status -ceq 'unknown' -and
+                $null -ne $receipt.attestationDigest)) {
+            throw 'project-identity-unknown'
+        }
+        $source = @($expected | Where-Object {
+                (Get-IntakeDigest $_.path) -ceq $receipt.pathDigest -and
+                $_.objectId -ceq $receipt.objectId
+            })
+        if ($source.Count -ne 1 -or
+            ($receipt.status -ceq 'complete' -and
+                ($source[0].projectEvidence -isnot [Collections.IDictionary] -or
+                    (Get-IntakeDigest $source[0].projectEvidence) -cne
+                        $receipt.attestationDigest)) -or
+            ($receipt.status -ceq 'unknown' -and
+                $null -ne $source[0]['projectEvidence'])) {
+            throw 'project-identity-unknown'
+        }
+        if ($receipt.status -ceq 'unknown') { $incomplete = $true }
+    }
+    if ($Scope.complete -eq $incomplete) { throw 'project-identity-unknown' }
 }
 
 function Get-IntakePass {
@@ -936,6 +1092,8 @@ function Invoke-ActivePrIntake {
                         discussion = $null
                         lineEvidence = $null
                         lineEvidenceDigest = $null
+                        projectEvidence = $null
+                        projectEvidenceDigest = $null
                         rules = @($Config.rules | ForEach-Object {
                                 [ordered]@{ id = [string]$_.id; capability = [string]$_.capability
                                     state = 'pending'; reasonCode = 'not-selected'
@@ -996,6 +1154,10 @@ function Invoke-ActivePrIntake {
                                     sourceCommit = $before.sourceCommit
                                     targetCommit = $before.targetCommit
                                     commonCommit = $before.commonCommit
+                                    includeProjectEvidence = ($null -ne $Config['projectEvidence'] -and
+                                        $Config.projectEvidence.enabled -ceq $true)
+                                    includeEvaluationFiles = ($null -ne $Config['projectEvidence'] -and
+                                        $Config.projectEvidence.enabled -ceq $true)
                                 } $Config ([ref]$reads) $clock
                                 $files = Assert-IntakeNumber $changes.changedFiles changedFiles 0 100000
                                 if ($files -gt [int]$Config.limits.maxChangedFiles) { throw 'file-budget' }
@@ -1081,6 +1243,48 @@ function Invoke-ActivePrIntake {
                                     $entry.lineEvidence = $evidence
                                     $entry.lineEvidenceDigest = Get-IntakeDigest $evidence
                                 }
+                                if ($null -ne $Config['projectEvidence'] -and
+                                    $Config.projectEvidence.enabled -ceq $true) {
+                                    $scope = $changes['projectEvidence']
+                                    if ($changes.evaluationFiles -isnot [array]) {
+                                        throw 'project-identity-unknown'
+                                    }
+                                    $nonDeleted = @($changes.files | Where-Object {
+                                            $_.changeType -cne 'delete'
+                                        })
+                                    if ($changes.evaluationFiles.Count -ne
+                                        $nonDeleted.Count) {
+                                        throw 'project-identity-unknown'
+                                    }
+                                    foreach ($source in $changes.evaluationFiles) {
+                                        if ($source -isnot [Collections.IDictionary] -or
+                                            [string]$source.path -cnotmatch
+                                                '^/[^?#\x00-\x1f]{1,2048}$' -or
+                                            [string]$source.objectId -cnotmatch
+                                                '^[a-f0-9]{40}$' -or
+                                            @($nonDeleted | Where-Object {
+                                                    $_.pathDigest -ceq
+                                                        (Get-IntakeDigest $source.path)
+                                                }).Count -ne 1) {
+                                            throw 'project-identity-unknown'
+                                        }
+                                    }
+                                    Assert-IntakeProjectScope $scope $changes.evaluationFiles `
+                                        $before.repositoryId $before.sourceCommit $files
+                                    $entry.projectEvidence = [ordered]@{
+                                        schemaVersion = 1
+                                        kind = 'source-bound-project-scope-summary-v1'
+                                        generation = $envelope.generation
+                                        declarationDigest = $entry.declarationDigest
+                                        repositoryId = $before.repositoryId
+                                        sourceCommit = $before.sourceCommit
+                                        rootTreeId = $scope.rootTreeId
+                                        complete = $scope.complete
+                                        files = $scope.files
+                                    }
+                                    $entry.projectEvidenceDigest =
+                                        Get-IntakeDigest $entry.projectEvidence
+                                }
                                 $entry.rules = @()
                                 foreach ($rule in $Config.rules) {
                                     $result = [ordered]@{
@@ -1140,18 +1344,22 @@ function Invoke-ActivePrIntake {
                             if ($reason -cnotin @('invalid-head', 'head-inconsistent',
                                     'head-drift', 'file-budget',
                                     'line-budget', 'line-count-unavailable',
+                                    'account-mismatch',
                                     'change-list-truncated', 'change-page-budget',
                                     'invalid-discussions',
                                     'mutable-discussions', 'comment-budget', 'invalid-evaluator',
                                     'invalid-observation', 'read-budget', 'time-budget',
                                     'invalid-change', 'invalid-item', 'byte-budget',
-                                    'diff-budget', 'change-list-truncated', 'unsupported-change')) {
+                                    'diff-budget', 'change-list-truncated', 'unsupported-change',
+                                    'project-identity-unknown')) {
                                 $reason = 'provider-inaccessible'
                             }
                             $entry.state = 'unknown'
                             $entry.reasonCode = $reason
                             $entry.lineEvidence = $null
                             $entry.lineEvidenceDigest = $null
+                            $entry.projectEvidence = $null
+                            $entry.projectEvidenceDigest = $null
                             $entry.rules = @($Config.rules | ForEach-Object {
                                     [ordered]@{ id = [string]$_.id; capability = [string]$_.capability
                                         state = 'unknown'; reasonCode = $reason
@@ -1344,7 +1552,8 @@ function Invoke-ActivePrIntake {
 function New-ActivePrAzureDevOpsProvider {
     [CmdletBinding()]
     param([Parameter(Mandatory)][Collections.IDictionary]$Config,
-        [string]$AzureCliPath = 'az', [switch]$Bootstrap)
+        [string]$AzureCliPath = 'az', [switch]$Bootstrap,
+        [scriptblock]$RawGet)
     if ($Bootstrap) {
         if ([string]$Config.organization -cnotmatch
                 '^https://(?:dev\.azure\.com/[A-Za-z0-9_-]+|[A-Za-z0-9_-]+\.visualstudio\.com)/?$' -or
@@ -1375,7 +1584,10 @@ function New-ActivePrAzureDevOpsProvider {
             [int]$MaxOutputBytes = 16777216)
         if ($transportReads.Count -ge $readCeiling) { throw 'read-budget' }
         $transportReads.Count++
-        $argv = if ($Area -eq 'connection') {
+        $argv = if ($Area -eq 'token') {
+            @('account', 'get-access-token', '--resource', $identityResource,
+                '--output', 'json', '--only-show-errors')
+        } elseif ($Area -eq 'connection') {
             @('rest', '--method', 'get',
                 '--url', "$($org.TrimEnd('/'))/_apis/connectionData?api-version=7.1-preview.1",
                 '--resource', $identityResource,
@@ -1486,8 +1698,105 @@ function New-ActivePrAzureDevOpsProvider {
         if ([string]::IsNullOrWhiteSpace($text)) { throw 'read-inaccessible' }
         return ($text | ConvertFrom-Json -AsHashtable -Depth 32)
     }.GetNewClosure()
+    $rawToken = $null
+    $rawIdentityVerified = $false
+    if ($null -eq $RawGet) {
+        $RawGet = {
+            param([string]$Operation, [Collections.IDictionary]$RawRequest)
+            $deadline = [DateTime]$RawRequest.deadline
+            if ($null -eq $rawToken) {
+                $credential = & $invoke 'token' 'accessToken' @() @() $deadline 16384
+                if ([string]$credential.accessToken -cnotmatch
+                        '^[A-Za-z0-9._~+/=-]{100,8192}$' -or
+                    [string]$credential.tokenType -ine 'Bearer') {
+                    throw 'read-inaccessible'
+                }
+                $rawToken = [string]$credential.accessToken
+            }
+            $base = "$($org.TrimEnd('/'))/$([Uri]::EscapeDataString($project))" +
+                "/_apis/git/repositories/$repo/items"
+            $url = if ($Operation -ceq 'Identity') {
+                "$($org.TrimEnd('/'))/_apis/connectionData?api-version=7.1-preview.1"
+            } elseif ($Operation -ceq 'Item' -and
+                [string]$RawRequest.path -cmatch '^/[^?#\\\x00-\x1f]{1,2048}$' -and
+                [string]$RawRequest.commit -cmatch '^[a-fA-F0-9]{40}$') {
+                "$base`?path=$([Uri]::EscapeDataString([string]$RawRequest.path))" +
+                    "&versionDescriptor.version=$($RawRequest.commit)" +
+                    '&versionDescriptor.versionType=commit&api-version=7.1'
+            } elseif ($Operation -ceq 'Commit' -and
+                [string]$RawRequest.commit -cmatch '^[a-fA-F0-9]{40}$') {
+                "$($org.TrimEnd('/'))/$([Uri]::EscapeDataString($project))" +
+                    "/_apis/git/repositories/$repo/commits/$($RawRequest.commit)?api-version=7.1"
+            } elseif ($Operation -ceq 'Tree' -and
+                [string]$RawRequest.treeId -cmatch '^[a-fA-F0-9]{40}$') {
+                "$($org.TrimEnd('/'))/$([Uri]::EscapeDataString($project))" +
+                    "/_apis/git/repositories/$repo/trees/$($RawRequest.treeId)" +
+                    '?recursive=false&api-version=7.1'
+            } else { throw 'read-inaccessible' }
+            $handler = [Net.Http.HttpClientHandler]::new()
+            $handler.AllowAutoRedirect = $false
+            $client = [Net.Http.HttpClient]::new($handler)
+            $request = [Net.Http.HttpRequestMessage]::new(
+                [Net.Http.HttpMethod]::Get, $url)
+            $request.Headers.Authorization =
+                [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $rawToken)
+            $request.Headers.Accept.ParseAdd($(if ($Operation -ceq 'Item') {
+                        'application/octet-stream'
+                    } else { 'application/json' }))
+            $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            $cancel = [Threading.CancellationTokenSource]::new($remaining)
+            try {
+                $response = $client.SendAsync($request,
+                    [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+                    $cancel.Token).GetAwaiter().GetResult()
+                try {
+                    if (-not $response.IsSuccessStatusCode) {
+                        throw 'read-inaccessible'
+                    }
+                    $limit = if ($Operation -ceq 'Item') {
+                        [int]$RawRequest.maxBytes
+                    } else { 65536 }
+                    if ($null -ne $response.Content.Headers.ContentLength -and
+                        $response.Content.Headers.ContentLength -gt $limit) {
+                        throw 'byte-budget'
+                    }
+                    $stream = $response.Content.ReadAsStreamAsync(
+                        $cancel.Token).GetAwaiter().GetResult()
+                    $buffer = [byte[]]::new(8192)
+                    $output = [IO.MemoryStream]::new()
+                    try {
+                        while (($n = $stream.ReadAsync($buffer, 0, $buffer.Length,
+                                    $cancel.Token).GetAwaiter().GetResult()) -gt 0) {
+                            if ($output.Length + $n -gt $limit) { throw 'byte-budget' }
+                            $output.Write($buffer, 0, $n)
+                        }
+                        $bytes = $output.ToArray()
+                    }
+                    finally { $output.Dispose() }
+                    if ($Operation -ceq 'Item') { return @{ bytes = $bytes } }
+                    $identity = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) |
+                        ConvertFrom-Json -AsHashtable -Depth 8
+                    if ($Operation -cne 'Identity') { return $identity }
+                    return @{ id = $identity.authenticatedUser.id
+                        descriptor = $identity.authenticatedUser.subjectDescriptor
+                        uniqueName = $identity.authenticatedUser.uniqueName }
+                }
+                finally { $response.Dispose() }
+            }
+            catch [OperationCanceledException] { throw 'time-budget' }
+            finally {
+                $cancel.Dispose()
+                $request.Dispose()
+                $client.Dispose()
+                $handler.Dispose()
+            }
+        }.GetNewClosure()
+    }
     $assertNumber = ${function:Assert-IntakeNumber}
     $assertBlob = ${function:Assert-IntakeBlob}
+    $assertRawBlob = ${function:Assert-IntakeRawBlob}
+    $sourceTree = ${function:Get-IntakeSourceTree}
+    $projectGraph = Get-Command Get-TestProjectGraphEvidence -ErrorAction Stop
     $lineDelta = ${function:Get-IntakeLineDelta}
     $digest = ${function:Get-IntakeDigest}
     $handler = {
@@ -1635,6 +1944,33 @@ function New-ActivePrAzureDevOpsProvider {
                     & $assertNumber $Request.remainingReads remainingReads 0 30000
                 }
                 $counter = @{ used = 0 }
+                $rawEnabled = $Request['includeProjectEvidence'] -ceq $true
+                $rawTransport = $RawGet
+                $rawVerifier = $assertRawBlob
+                $graphLimits = $Config.limits
+                $graphCommit = [string]$Request.sourceCommit
+                $readRaw = {
+                    param([string]$Operation, [Collections.IDictionary]$RawRequest)
+                    if ($counter.used -ge $remaining) { throw 'read-budget' }
+                    $counter.used++
+                    $RawRequest.deadline = $deadline
+                    $result = & $rawTransport $Operation $RawRequest
+                    if ($result -isnot [Collections.IDictionary]) {
+                        throw 'read-inaccessible'
+                    }
+                    return $result
+                }.GetNewClosure()
+                if ($rawEnabled -and -not $rawIdentityVerified) {
+                    $identity = & $readRaw 'Identity' @{}
+                    if ([string]$identity.id -ine [string]$Config.expectedAccount.id -or
+                        [string]$identity.descriptor -cne
+                            [string]$Config.expectedAccount.descriptor -or
+                        [string]$identity.uniqueName -ine
+                            [string]$Config.expectedAccount.uniqueName) {
+                        throw 'account-mismatch'
+                    }
+                    $rawIdentityVerified = $true
+                }
                 $read = {
                     param($Resource, $Route, $Query, [int]$Cap)
                     if ($counter.used -ge $remaining) { throw 'read-budget' }
@@ -1752,9 +2088,22 @@ function New-ActivePrAzureDevOpsProvider {
                     if ($kind -ne 'add') {
                         $item = & $read 'items' $route @(
                             "path=$oldPath", "versionDescriptor.version=$($Request.commonCommit)",
-                            'versionDescriptor.versionType=commit', 'includeContent=true',
+                            'versionDescriptor.versionType=commit',
+                            "includeContent=$(!$rawEnabled)",
                             'includeContentMetadata=true') ($cap * 6 + 65536)
-                        $blob = & $assertBlob $item $oldPath ([string]$item.objectId) $cap
+                        $blob = if ($rawEnabled) {
+                            if ([string]$item.path -cne $oldPath -or
+                                [string]$item.gitObjectType -cne 'blob' -or
+                                [string]$item.objectId -cnotmatch '^[a-fA-F0-9]{40}$') {
+                                throw 'invalid-item'
+                            }
+                            $raw = & $readRaw 'Item' @{ path = $oldPath
+                                commit = [string]$Request.commonCommit; maxBytes = $cap }
+                            & $assertRawBlob $raw.bytes `
+                                ([string]$item.objectId) $cap
+                        } else {
+                            & $assertBlob $item $oldPath ([string]$item.objectId) $cap
+                        }
                         if ($change.item['originalObjectId'] -and
                             [string]$change.item.originalObjectId -ine [string]$item.objectId) {
                             throw 'invalid-item'
@@ -1766,11 +2115,20 @@ function New-ActivePrAzureDevOpsProvider {
                         $cap = [Math]::Min([int]$Config.limits.maxFileBytes,
                             [int]$Config.limits.maxTotalBytes - $totalBytes)
                         if ($cap -lt 1) { throw 'byte-budget' }
-                        $item = & $read 'items' $route @(
-                            "path=$path", "versionDescriptor.version=$($Request.sourceCommit)",
-                            'versionDescriptor.versionType=commit', 'includeContent=true',
-                            'includeContentMetadata=true') ($cap * 6 + 65536)
-                        $blob = & $assertBlob $item $path ([string]$change.item.objectId) $cap
+                        $blob = if ($rawEnabled) {
+                            $raw = & $readRaw 'Item' @{ path = $path
+                                commit = [string]$Request.sourceCommit; maxBytes = $cap }
+                            & $assertRawBlob $raw.bytes `
+                                ([string]$change.item.objectId) $cap
+                        } else {
+                            $item = & $read 'items' $route @(
+                                "path=$path",
+                                "versionDescriptor.version=$($Request.sourceCommit)",
+                                'versionDescriptor.versionType=commit',
+                                'includeContent=true', 'includeContentMetadata=true') `
+                                ($cap * 6 + 65536)
+                            & $assertBlob $item $path ([string]$change.item.objectId) $cap
+                        }
                         $new = $blob.text
                         $totalBytes += $blob.bytes
                     }
@@ -1799,10 +2157,119 @@ function New-ActivePrAzureDevOpsProvider {
                             newLineCount = $delta.newLineCount
                             spans = @($delta.spans)
                         })
-                    if ($Request['includeEvaluationFiles'] -ceq $true -and
+                    if (($Request['includeEvaluationFiles'] -ceq $true -or
+                            $Request['includeProjectEvidence'] -ceq $true) -and
                         $kind -ne 'delete') {
                         $evaluationFiles.Add(@{ path = $path; content = $new
                             objectId = ([string]$change.item.objectId).ToLowerInvariant() })
+                    }
+                }
+                $scopeSummary = $null
+                if ($Request['includeProjectEvidence'] -ceq $true) {
+                    $sourceFiles = @($evaluationFiles.ToArray() | Where-Object {
+                            $_.path -cmatch '\.cs$'
+                        })
+                    $scopeReceipts = [Collections.Generic.List[object]]::new()
+                    $tree = $null
+                    if ($sourceFiles.Count -gt 0) {
+                        try {
+                            $readGraph = {
+                                param([string]$Resource, [string[]]$GraphRoute,
+                                    [string[]]$Query, [int]$Cap)
+                                $name = if ($Resource -ceq 'commits') {
+                                    'commitId'
+                                } elseif ($Resource -ceq 'trees') {
+                                    'sha1'
+                                } else { throw 'project-identity-unknown' }
+                                $matching = @($GraphRoute | Where-Object {
+                                        $_ -clike "$name=*"
+                                    })
+                                if ($matching.Count -ne 1) {
+                                    throw 'project-identity-unknown'
+                                }
+                                $id = ($matching[0] -split '=', 2)[1]
+                                if ([string]$id -cnotmatch '^[a-fA-F0-9]{40}$') {
+                                    throw 'project-identity-unknown'
+                                }
+                                if ($Resource -ceq 'commits') {
+                                    return & $readRaw 'Commit' @{
+                                        commit = $id; maxBytes = $Cap }
+                                }
+                                return & $readRaw 'Tree' @{
+                                    treeId = $id; maxBytes = $Cap }
+                            }.GetNewClosure()
+                            $tree = & $sourceTree $readGraph $route `
+                                ([string]$Request.sourceCommit) `
+                                $(if ($null -ne $Config['projectEvidence']) {
+                                        [int]$Config.projectEvidence.maxTreeEntries
+                                    } else { 4096 })
+                        }
+                        catch {
+                            if ($_.Exception.Message -cnotin @(
+                                    'project-identity-unknown', 'read-inaccessible',
+                                    'byte-budget', 'read-budget', 'time-budget')) { throw }
+                        }
+                    }
+                    $graphBudget = @{ used = 0 }
+                    $graphCache = @{}
+                    foreach ($source in $sourceFiles) {
+                        $receipt = [ordered]@{
+                            pathDigest = & $digest $source.path
+                            objectId = $source.objectId
+                            status = 'unknown'
+                            attestationDigest = $null
+                        }
+                        if ($null -ne $tree) {
+                            $readGraphItem = {
+                                param([string]$ItemPath, [string]$ItemId)
+                                $key = "$ItemPath|$ItemId"
+                                if ($graphCache.ContainsKey($key)) {
+                                    return $graphCache[$key]
+                                }
+                                $cap = [Math]::Min([int]$graphLimits.maxFileBytes,
+                                    [int]$graphLimits.maxTotalBytes - $graphBudget.used)
+                                if ($cap -lt 1) { throw 'byte-budget' }
+                                $raw = & $readRaw 'Item' @{ path = $ItemPath
+                                    commit = $graphCommit
+                                    maxBytes = $cap }
+                                $blob = & $rawVerifier $raw.bytes $ItemId $cap
+                                $graphBudget.used += $blob.bytes
+                                $graphCache[$key] = $blob.text
+                                return $blob.text
+                            }.GetNewClosure()
+                            try {
+                                $proof = & $projectGraph `
+                                    -RepositoryId $repo `
+                                    -SourceCommit ([string]$Request.sourceCommit) `
+                                    -Path $source.path -ObjectId $source.objectId `
+                                    -Entries $tree.entries -ReadItem $readGraphItem `
+                                    -MaxProjects $(if ($null -ne $Config['projectEvidence']) {
+                                            [int]$Config.projectEvidence.maxProjects
+                                        } else { 32 }) `
+                                    -MaxFiles $(if ($null -ne $Config['projectEvidence']) {
+                                            [int]$Config.projectEvidence.maxTreeEntries
+                                        } else { 4096 })
+                                $source.projectEvidence = $proof
+                                $receipt.status = 'complete'
+                                $receipt.attestationDigest = & $digest $proof
+                            }
+                            catch {
+                                if ($_.Exception.Message -cnotin @(
+                                        'project-identity-unknown', 'invalid-item',
+                                        'read-inaccessible', 'byte-budget', 'read-budget',
+                                        'time-budget', 'unsupported-change')) { throw }
+                            }
+                        }
+                        $scopeReceipts.Add($receipt)
+                    }
+                    $scopeSummary = [ordered]@{
+                        schemaVersion = 1
+                        kind = 'source-bound-project-scope-summary-v1'
+                        repositoryId = $repo.ToLowerInvariant()
+                        sourceCommit = ([string]$Request.sourceCommit).ToLowerInvariant()
+                        rootTreeId = if ($null -ne $tree) { $tree.rootTreeId } else { $null }
+                        complete = (@($scopeReceipts | Where-Object status -NE 'complete').Count -eq 0)
+                        files = @($scopeReceipts.ToArray())
                     }
                 }
                 $answer = @{ changedFiles = $entries.Count; changedLines = $totalLines
@@ -1811,6 +2278,7 @@ function New-ActivePrAzureDevOpsProvider {
                 if ($Request['includeEvaluationFiles'] -ceq $true) {
                     $answer.evaluationFiles = @($evaluationFiles.ToArray())
                 }
+                if ($null -ne $scopeSummary) { $answer.projectEvidence = $scopeSummary }
                 return $answer
             }
             Discussions {

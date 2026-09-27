@@ -301,6 +301,9 @@ export function reportingRows(snapshot: ReportingSnapshot, section: ReportingSec
         head.lineEvidence
           ? `Verified changed lines ${head.lineEvidence.changedLines} (added ${head.lineEvidence.addedLines}, deleted ${head.lineEvidence.deletedLines}) across ${head.lineEvidence.changedFiles} files | evidence ${head.lineEvidence.digest.slice(0, 12)}`
           : "Changed-line evidence unknown; no verified count or spans",
+        ...(head.projectEvidence ? [
+          `Project graph ${head.projectEvidence.complete ? "complete" : "unknown"} for ${head.projectEvidence.files.length} changed C# files | root ${head.projectEvidence.rootTreeId?.slice(0, 12) ?? "unverified"} | evidence ${head.projectEvidence.digest.slice(0, 12)}`,
+        ] : []),
         ...(head.lineEvidence?.files.map((file) =>
           `${file.changeType} ${file.pathDigest.slice(0, 12)}: +${file.addedLines} -${file.deletedLines}; new-side ${file.spans.map((span) => `${span.startLine}-${span.endLine}`).join(", ") || "no added lines"}`) ?? []),
         ...head.rules.map((rule) =>
@@ -312,11 +315,14 @@ export function reportingRows(snapshot: ReportingSnapshot, section: ReportingSec
         timestamp: intake.observedUtc,
         pullRequestId: head.pullRequestId,
         capability: "intake",
-        health: head.state === "unknown" || head.state === "error" ? "degraded" : intake.state,
+        health: head.state === "unknown" || head.state === "error" ||
+          (head.projectEvidence !== null && !head.projectEvidence.complete)
+          ? "degraded" : intake.state,
         outcome: head.state,
         posting: "none", mode: "none", text,
         searchText: clean(text.join(" ")).toLowerCase(),
-        url: null, attention: head.state !== "pending" || intake.state !== "complete",
+        url: null, attention: head.state !== "pending" || intake.state !== "complete" ||
+          (head.projectEvidence !== null && !head.projectEvidence.complete),
       };
     });
   }
