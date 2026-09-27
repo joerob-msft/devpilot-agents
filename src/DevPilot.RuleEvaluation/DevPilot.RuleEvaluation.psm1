@@ -981,6 +981,20 @@ function Invoke-BoundedRuleEvaluation {
                         $rule.status = 'evaluated'; $rule.reasonCode = 'completed'
                         $rule.observationDigest = $digest
                     }
+                    if ($null -ne $canary) {
+                        $finalDiscussions = Invoke-RuleRead $Provider Discussions @{
+                            pullRequestId = $id; iterationId = $declaration.iterationId
+                        } ([ref]$reads) $limits.maxReads $clock $limits.maxSeconds
+                        [void](Get-ActivePrDiscussionCounts $finalDiscussions `
+                            $IntakeConfig $declaration)
+                        if ((Get-RuleDigest $finalDiscussions) -cne
+                            (Get-RuleDigest $discussions)) {
+                            throw 'discussion-head-mismatch'
+                        }
+                        $finalHead = Invoke-RuleRead $Provider Head @{ pullRequestId = $id } `
+                            ([ref]$reads) $limits.maxReads $clock $limits.maxSeconds
+                        Assert-RuleHead $finalHead $declaration
+                    }
                     if ($clock.Elapsed.TotalSeconds -ge $limits.maxSeconds) {
                         throw 'time-budget'
                     }

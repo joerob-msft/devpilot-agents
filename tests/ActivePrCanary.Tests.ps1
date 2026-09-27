@@ -83,8 +83,9 @@ Outside both sections.
                         targetRef = 'refs/heads/master' }
                 }
             )
-            drift = 0; omitPage = $false; omitEvidence = $false
-            headVisits = @{} }
+            drift = 0; driftAfterEvaluation = 0; discussionDrift = 0
+            omitPage = $false; omitEvidence = $false
+            headVisits = @{}; discussionVisits = @{} }
         $document = $script:document
         $repositoryRoot = $repo
         $provider = {
@@ -111,7 +112,9 @@ Outside both sections.
                     }
                     $state.headVisits[$id]++
                     $sha = if ($state.drift -eq $id -and
-                        $state.headVisits[$id] -gt 2) { 'd' * 40 }
+                        $state.headVisits[$id] -gt 2 -or
+                        $state.driftAfterEvaluation -eq $id -and
+                        $state.headVisits[$id] -gt 3) { 'd' * 40 }
                     else { 'a' * 40 }
                     return @{ pullRequestId = $id; repositoryId = $repoId
                         projectId = $projectId; status = 'active'; isDraft = $false
@@ -133,7 +136,34 @@ Outside both sections.
                     }
                     return $result
                 }
-                Discussions { return @{ threads = @(); count = 0 } }
+                Discussions {
+                    $id = [int]$request.pullRequestId
+                    if (-not $state.discussionVisits.ContainsKey($id)) {
+                        $state.discussionVisits[$id] = 0
+                    }
+                    $state.discussionVisits[$id]++
+                    if ($state.discussionDrift -eq $id -and
+                        $state.discussionVisits[$id] -gt 2) {
+                        return @{ count = 1; threads = @(@{
+                                    id = 1; status = 'active'
+                                    comments = @(@{ id = 1; author = @{
+                                                id = '44444444-4444-4444-4444-444444444444'
+                                                descriptor = 'aad.other'
+                                                uniqueName = 'human@example.invalid' }
+                                            commentType = 'text'; content = 'review' })
+                                    threadContext = @{
+                                        filePath = '/Example.cs'
+                                        rightFileStart = @{ line = 5 }
+                                        rightFileEnd = @{ line = 5 } }
+                                    pullRequestThreadContext = @{
+                                        changeTrackingId = 1
+                                        iterationContext = @{
+                                            firstComparingIteration = 1
+                                            secondComparingIteration = 1 } }
+                                }) }
+                    }
+                    return @{ threads = @(); count = 0 }
+                }
                 RuleSource {
                     $text = if ($request.path -ceq $owner.path) {
                         $document
@@ -299,11 +329,14 @@ $response | ConvertTo-Json -Depth 8 -Compress
         }
     }
     It 'fails closed for incomplete inventory, unknown evidence and changed head' {
-        foreach ($failure in @('omitPage', 'omitEvidence', 'drift')) {
+        foreach ($failure in @('omitPage', 'omitEvidence', 'drift',
+                'driftAfterEvaluation', 'discussionDrift')) {
             $c = New-CanaryCase
-            if ($failure -eq 'drift') { $c.state.drift = 1 }
+            if ($failure -in @('drift', 'driftAfterEvaluation', 'discussionDrift')) {
+                $c.state[$failure] = 1
+            }
             else { $c.state[$failure] = $true }
-            if ($failure -eq 'drift') {
+            if ($failure -in @('drift', 'driftAfterEvaluation', 'discussionDrift')) {
                 $result = Invoke-CanaryCase $c
                 $result.state | Should -Be 'unknown'
                 @($result.ruleCounts | Where-Object unknown -GT 0).Count |
