@@ -116,7 +116,27 @@ BeforeAll {
         return @{ objectId = $hash; path = $Path; gitObjectType = 'blob'
             isFolder = $false; contentMetadata = @{ isBinary = $false
                 encoding = 65001; contentType = 'text/plain' }
-            content = $Text }
+            content = $Text; rawBytes = $bytes }
+    }
+    function New-TestTree {
+        param([object[]]$Entries)
+        $raw = [IO.MemoryStream]::new()
+        try {
+            foreach ($entry in $Entries) {
+                $prefix = [Text.Encoding]::UTF8.GetBytes(
+                    "$($entry.mode) $($entry.relativePath)`0")
+                $raw.Write($prefix, 0, $prefix.Length)
+                $id = [Convert]::FromHexString([string]$entry.objectId)
+                $raw.Write($id, 0, $id.Length)
+            }
+            $bytes = $raw.ToArray()
+            $header = [Text.Encoding]::ASCII.GetBytes("tree $($bytes.Length)`0")
+            return @{ objectId = [Convert]::ToHexString(
+                    [Security.Cryptography.SHA1]::HashData(
+                        [byte[]]($header + $bytes))).ToLowerInvariant()
+                size = $bytes.Length; treeEntries = $Entries }
+        }
+        finally { $raw.Dispose() }
     }
     function New-IntakeTransportCase {
         $case = New-IntakeCase -Count 1
@@ -126,7 +146,8 @@ BeforeAll {
                 '0' = @{ changeEntries = @(); nextSkip = 0 }
                 '1' = @{ changeEntries = @(); nextSkip = 0 }
             }
-            items = @{}; drift = $false; refDrift = $false
+            items = @{}; trees = @{}; rootTreeId = $null
+            drift = $false; refDrift = $false; rawIdentityMismatch = $false
         }
         $fixturePath = Join-Path $case.root 'fixture.json'
         $log = Join-Path $case.root 'requests.log'
@@ -196,6 +217,21 @@ switch ($resource) {
         if (-not $fixture.items.ContainsKey($key)) { throw 'missing item' }
         $answer = $fixture.items[$key]
     }
+    commits {
+        $id = @($argv | Where-Object { $_ -like 'commitId=*' })
+        if ($id.Count -ne 1 -or $id[0] -ne "commitId=$($fixture.source)") {
+            throw 'unbound commit'
+        }
+        $answer = @{ commitId = $fixture.source; treeId = $fixture.rootTreeId }
+    }
+    trees {
+        $id = @($argv | Where-Object { $_ -like 'sha1=*' })
+        if ($id.Count -ne 1 -or
+            -not $fixture.trees.ContainsKey(($id[0] -split '=', 2)[1])) {
+            throw 'missing tree'
+        }
+        $answer = $fixture.trees[($id[0] -split '=', 2)[1]]
+    }
     pullRequestThreads { $answer = @{ value = @(); count = 0 } }
     default { throw 'A write or unknown resource was attempted' }
 }
@@ -212,7 +248,7 @@ $answer | ConvertTo-Json -Depth 20 -Compress
         $env:ACTIVE_PR_INTAKE_TEST_LOG = $Case.log
         try {
             $provider = New-ActivePrAzureDevOpsProvider -Config $Case.case.config `
-                -AzureCliPath $Case.stub
+                -AzureCliPath $Case.stub -RawGet (New-TestRawGet $Case)
             return Invoke-ActivePrIntake -Config $Case.case.config -Provider $provider `
                 -StateRoot $Case.case.root -RepositoryRoot $repo -Run
         }
@@ -220,6 +256,71 @@ $answer | ConvertTo-Json -Depth 20 -Compress
             Remove-Item Env:\ACTIVE_PR_INTAKE_FIXTURE, Env:\ACTIVE_PR_INTAKE_TEST_LOG `
                 -ErrorAction SilentlyContinue
         }
+    }
+    function Set-ProjectTreeCase {
+        param($Case, [string]$ProjectXml = '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><IsTestProject>true</IsTestProject></PropertyGroup></Project>')
+        $Case.case.config.projectEvidence.enabled = $true
+        $source = $Case.fixture.source
+        $file = New-TestBlob '/Tests/Fixture.cs' "class Fixture {}`n"
+        $project = New-TestBlob '/Tests/Tests.csproj' $ProjectXml
+        $Case.fixture.items["$source|/Tests/Fixture.cs"] = $file
+        $Case.fixture.items["$source|/Tests/Tests.csproj"] = $project
+        $Case.fixture.pages = @{
+            '0' = @{ changeEntries = @(
+                    @{ changeTrackingId = 1; changeType = 'add'
+                        item = @{ path = '/Tests/Fixture.cs'; objectId = $file.objectId } }
+                ); nextSkip = 0 }
+            '1' = @{ changeEntries = @(); nextSkip = 0 }
+        }
+        $tests = New-TestTree @(
+            @{ relativePath = 'Fixture.cs'; mode = '100644'
+                gitObjectType = 'blob'; objectId = $file.objectId }
+            @{ relativePath = 'Tests.csproj'; mode = '100644'
+                gitObjectType = 'blob'; objectId = $project.objectId }
+        )
+        $root = New-TestTree @(
+            @{ relativePath = 'Tests'; mode = '40000'
+                gitObjectType = 'tree'; objectId = $tests.objectId }
+        )
+        $Case.fixture.rootTreeId = $root.objectId
+        $Case.fixture.trees[$root.objectId] = $root
+        $Case.fixture.trees[$tests.objectId] = $tests
+        return @{ file = $file; project = $project; root = $root; tests = $tests }
+    }
+    function New-TestRawGet {
+        param($Case)
+        $fixture = $Case.fixture
+        $log = $Case.log
+        $config = $Case.case.config
+        return {
+            param([string]$Operation, [Collections.IDictionary]$RawRequest)
+            [IO.File]::AppendAllText($log, "raw|--http-method|GET|$Operation|$($RawRequest.commit)|$($RawRequest.path)`n")
+            switch -CaseSensitive ($Operation) {
+                Identity {
+                    return @{ id = if ($fixture.rawIdentityMismatch) {
+                            'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+                        } else { $config.expectedAccount.id }
+                        descriptor = $config.expectedAccount.descriptor
+                        uniqueName = $config.expectedAccount.uniqueName }
+                }
+                Commit {
+                    if ($RawRequest.commit -cne $fixture.source) { throw 'wrong commit' }
+                    return @{ commitId = $fixture.source; treeId = $fixture.rootTreeId }
+                }
+                Tree {
+                    if (-not $fixture.trees.ContainsKey([string]$RawRequest.treeId)) {
+                        throw 'missing tree'
+                    }
+                    return $fixture.trees[[string]$RawRequest.treeId]
+                }
+                Item {
+                    $key = "$($RawRequest.commit)|$($RawRequest.path)"
+                    if (-not $fixture.items.ContainsKey($key)) { throw 'missing item' }
+                    return @{ bytes = [byte[]]$fixture.items[$key].rawBytes }
+                }
+                default { throw 'unexpected raw operation' }
+            }
+        }.GetNewClosure()
     }
 }
 AfterAll {
@@ -809,6 +910,131 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
             $request | Should -Match '(^rest\|--method\|get\|)|(\|--http-method\|GET\|)'
             $request | Should -Not -Match '\|--http-method\|(POST|PATCH|PUT|DELETE)\||--in-file'
         }
+    }
+    It 'attests a changed helper against every verified project owner without persisting source' {
+        $t = New-IntakeTransportCase
+        $graph = Set-ProjectTreeCase $t
+        $e = Invoke-TransportCase $t
+        $head = $e.heads[0]
+        $head.status | Should -Be 'pending' -Because $head.reasonCode
+        $head.projectEvidence.complete | Should -BeTrue
+        $head.projectEvidence.sourceCommit | Should -Be $t.fixture.source
+        $head.projectEvidence.rootTreeId | Should -Be $graph.root.objectId
+        $head.projectEvidence.files.Count | Should -Be 1
+        $head.projectEvidence.files[0].status | Should -Be 'complete'
+        $head.projectEvidence.files[0].objectId | Should -Be $graph.file.objectId
+        $head.projectEvidence.files[0].attestationDigest |
+            Should -Match '^[a-f0-9]{64}$'
+        $head.projectEvidenceDigest | Should -Match '^[a-f0-9]{64}$'
+        $saved = Get-Content -LiteralPath (
+            Join-Path $t.case.root 'active-pr-intake-v1\cohort.json') -Raw
+        $saved | Should -Not -Match 'Fixture\.cs|Tests\.csproj|class Fixture|IsTestProject'
+        $log = Get-Content -LiteralPath $t.log
+        @($log | Where-Object { $_ -match '\|Commit\|' }).Count | Should -Be 1
+        @($log | Where-Object { $_ -match '\|Tree\|' }).Count | Should -Be 2
+        foreach ($request in $log) {
+            $request | Should -Match '(^rest\|--method\|get\|)|(\|--http-method\|GET\|)'
+            $request | Should -Not -Match '\|--http-method\|(POST|PATCH|PUT|DELETE)\|'
+        }
+    }
+    It 'keeps complete mixed ownership distinct from test-only scope' {
+        $t = New-IntakeTransportCase
+        $graph = Set-ProjectTreeCase $t
+        $product = New-TestBlob '/Tests/Product.csproj' @'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><IsTestProject>false</IsTestProject></PropertyGroup>
+</Project>
+'@
+        $t.fixture.items["$($t.fixture.source)|/Tests/Product.csproj"] = $product
+        $tests = New-TestTree @(
+            @{ relativePath = 'Fixture.cs'; mode = '100644'
+                gitObjectType = 'blob'; objectId = $graph.file.objectId }
+            @{ relativePath = 'Product.csproj'; mode = '100644'
+                gitObjectType = 'blob'; objectId = $product.objectId }
+            @{ relativePath = 'Tests.csproj'; mode = '100644'
+                gitObjectType = 'blob'; objectId = $graph.project.objectId }
+        )
+        $root = New-TestTree @(
+            @{ relativePath = 'Tests'; mode = '40000'
+                gitObjectType = 'tree'; objectId = $tests.objectId }
+        )
+        $t.fixture.rootTreeId = $root.objectId
+        $t.fixture.trees = @{ $root.objectId = $root; $tests.objectId = $tests }
+        $e = Invoke-TransportCase $t
+        $e.heads[0].projectEvidence.complete | Should -BeTrue
+        $provider = New-ActivePrAzureDevOpsProvider -Config $t.case.config `
+            -AzureCliPath $t.stub -RawGet (New-TestRawGet $t)
+        $env:ACTIVE_PR_INTAKE_FIXTURE = $t.path
+        $env:ACTIVE_PR_INTAKE_TEST_LOG = $t.log
+        try {
+            $changed = & $provider Changes @{
+                pullRequestId = 1; iterationId = 1
+                sourceCommit = $t.fixture.source; targetCommit = $t.fixture.target
+                commonCommit = $t.fixture.common; includeEvaluationFiles = $true
+                includeProjectEvidence = $true; remainingReads = 100
+            }
+            $owners = $changed.evaluationFiles[0].projectEvidence.projects
+            $owners.Count | Should -Be 2
+            @($owners | Where-Object isTestProject -eq $true).Count | Should -Be 1
+            @($owners | Where-Object isTestProject -eq $false).Count | Should -Be 1
+        }
+        finally {
+            Remove-Item Env:\ACTIVE_PR_INTAKE_FIXTURE, Env:\ACTIVE_PR_INTAKE_TEST_LOG `
+                -ErrorAction SilentlyContinue
+        }
+    }
+    It 'fails project scope closed on missing owner, tree truncation, caps and head drift' {
+        $t = New-IntakeTransportCase
+        $graph = Set-ProjectTreeCase $t
+        $t.fixture.trees[$graph.tests.objectId].treeEntries =
+            @($graph.tests.treeEntries | Where-Object relativePath -ne 'Tests.csproj')
+        $partial = Invoke-TransportCase $t
+        $partial.heads[0].projectEvidence.complete | Should -BeFalse
+        $partial.heads[0].projectEvidence.files[0].status | Should -Be 'unknown'
+        $partial.heads[0].lineEvidence | Should -Not -BeNullOrEmpty
+
+        $t = New-IntakeTransportCase
+        $null = Set-ProjectTreeCase $t
+        $t.case.config.projectEvidence.maxTreeEntries = 1
+        (Invoke-TransportCase $t).heads[0].projectEvidence.complete | Should -BeFalse
+
+        $t = New-IntakeTransportCase
+        $null = Set-ProjectTreeCase $t
+        $t.fixture.pages['0'].nextSkip = 9
+        $brokenPage = Invoke-TransportCase $t
+        $brokenPage.heads[0].reasonCode | Should -Be 'change-list-truncated'
+        $brokenPage.heads[0].projectEvidence | Should -BeNullOrEmpty
+
+        $t = New-IntakeTransportCase
+        $null = Set-ProjectTreeCase $t
+        $t.fixture.drift = $true
+        $drift = Invoke-TransportCase $t
+        $drift.heads[0].reasonCode | Should -Be 'head-drift'
+        $drift.heads[0].projectEvidence | Should -BeNullOrEmpty
+    }
+    It 'uses attested octet-stream bytes rather than rendered item text' {
+        $t = New-IntakeTransportCase
+        $graph = Set-ProjectTreeCase $t
+        $t.fixture.items["$($t.fixture.source)|/Tests/Fixture.cs"].content =
+            'rendered text with altered line endings'
+        $t.fixture.items["$($t.fixture.source)|/Tests/Tests.csproj"].content =
+            'rendered project content is not the Git blob'
+        (Invoke-TransportCase $t).heads[0].projectEvidence.complete | Should -BeTrue
+
+        $t = New-IntakeTransportCase
+        $null = Set-ProjectTreeCase $t
+        $t.fixture.items["$($t.fixture.source)|/Tests/Tests.csproj"].rawBytes =
+            [Text.Encoding]::UTF8.GetBytes('<Project><IsTestProject>true</IsTestProject></Project>')
+        $corrupt = Invoke-TransportCase $t
+        $corrupt.heads[0].projectEvidence.complete | Should -BeFalse
+        $corrupt.heads[0].projectEvidence.files[0].status | Should -Be 'unknown'
+
+        $t = New-IntakeTransportCase
+        $null = Set-ProjectTreeCase $t
+        $t.fixture.rawIdentityMismatch = $true
+        $wrongPrincipal = Invoke-TransportCase $t
+        $wrongPrincipal.heads[0].reasonCode | Should -Be 'account-mismatch'
+        $wrongPrincipal.heads[0].projectEvidence | Should -BeNullOrEmpty
     }
     It 'rejects malformed paging, byte limits and drifting heads without claiming evidence' {
         $t = New-IntakeTransportCase

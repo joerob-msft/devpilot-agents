@@ -685,6 +685,55 @@ test("intake line evidence fails closed on mismatched binding, totals and out-of
   assert.throws(() => parseIntakeCohort(feed), /binding/);
 });
 
+test("intake project receipts require immutable source, generation and complete matching digests", () => {
+  const feed = syntheticIntake(1);
+  const head = (feed.heads as JsonRecord[])[0]!;
+  asObject(feed.binding).configDigest = "c".repeat(64);
+  head.declaration = {
+    repositoryId: asObject(feed.binding).repositoryId,
+    projectId: asObject(feed.binding).projectId,
+    pullRequestId: head.pullRequestId, sourceRef: "refs/heads/feature",
+    targetRef: head.targetRef, sourceCommit: head.sourceCommit,
+    targetCommit: head.targetCommit, commonCommit: "b".repeat(40),
+    iterationId: head.iterationId, status: "active", isDraft: false,
+  };
+  head.declarationDigest = createHash("sha256").update(JSON.stringify(head.declaration)).digest("hex");
+  head.lineEvidence = {
+    generation: feed.generation, declarationDigest: head.declarationDigest,
+    configDigest: asObject(feed.binding).configDigest, baseCommit: "b".repeat(40),
+    changedFiles: 1, changedLines: 1, addedLines: 1, deletedLines: 0,
+    files: [{ pathDigest: "a".repeat(64), originalPathDigest: null,
+      changeType: "add", addedLines: 1, deletedLines: 0, newLineCount: 1,
+      spans: [{ startLine: 1, endLine: 1 }] }],
+  };
+  head.lineEvidenceDigest = createHash("sha256").update(JSON.stringify(head.lineEvidence)).digest("hex");
+  head.projectEvidence = {
+    schemaVersion: 1, kind: "source-bound-project-scope-summary-v1",
+    generation: feed.generation, declarationDigest: head.declarationDigest,
+    repositoryId: asObject(feed.binding).repositoryId, sourceCommit: head.sourceCommit,
+    rootTreeId: "b".repeat(40), complete: true,
+    files: [{ pathDigest: "a".repeat(64), objectId: "c".repeat(40),
+      status: "complete", attestationDigest: "d".repeat(64) }],
+  };
+  const signScope = () => {
+    head.projectEvidenceDigest = createHash("sha256").update(
+      JSON.stringify(head.projectEvidence)).digest("hex");
+  };
+  signScope();
+  assert.equal(parseIntakeCohort(feed).heads[0]?.projectEvidence?.complete, true);
+  asObject(head.projectEvidence).sourceCommit = "e".repeat(40);
+  signScope();
+  assert.throws(() => parseIntakeCohort(feed), /project evidence binding/);
+  asObject(head.projectEvidence).sourceCommit = head.sourceCommit;
+  asObject(head.projectEvidence).complete = false;
+  signScope();
+  assert.throws(() => parseIntakeCohort(feed), /incomplete/);
+  asObject(head.projectEvidence).complete = true;
+  asObject((asObject(head.projectEvidence).files as JsonRecord[])[0]).pathDigest = "f".repeat(64);
+  signScope();
+  assert.throws(() => parseIntakeCohort(feed), /receipt/);
+});
+
 test("intake fails closed on duplicate or drifting denominators, claimed evaluations, and missing feed", async () => {
   const duplicate = syntheticIntake();
   (duplicate.heads as JsonRecord[])[1]!.pullRequestId = 1;
@@ -2657,4 +2706,67 @@ test("Owner scheduled observations require exact pinned rule and completed no-wr
   const tools = encoded({ ...observation,
     ownerProof: { ...observation.ownerProof, modelToolInvocations: 1 } });
   assert.equal(verifyRuleObservation(tools, digest(tools), summary, head, rule, 8), false);
+});
+
+test("dormant all-class observations require the current intake project receipt", () => {
+  const raw = syntheticIntake(1);
+  const intake = parseIntakeCohort(raw);
+  const source = intake.heads[0]!;
+  const projectDigest = "9".repeat(64);
+  const intakeHead = { ...source,
+    lineEvidence: { changedFiles: 1, changedLines: 1, addedLines: 1,
+      deletedLines: 0, files: [], digest: "8".repeat(64) },
+    projectEvidence: { complete: true, digest: projectDigest,
+      rootTreeId: "a".repeat(40), files: [] } };
+  const rule = { capabilityId: "bpm-test-class-coverage@2", ruleId: "all-class",
+    status: "evaluated" as const, reasonCode: "completed",
+    observationDigest: "b".repeat(64), declarationDigest: "c".repeat(64) };
+  const head: EvaluationHead = { pullRequestId: source.pullRequestId,
+    sourceCommit: source.sourceCommit, targetCommit: source.targetCommit,
+    targetRef: source.targetRef, iterationId: source.iterationId, rules: [rule] };
+  const summary: RuleEvaluationSummary = {
+    state: "complete", generation: "d".repeat(32), intakeGeneration: intake.generation,
+    observedUtc: "2026-09-24T21:01:00Z",
+    binding: { organization: intake.binding!.organization,
+      projectId: intake.binding!.projectId, repositoryId: intake.binding!.repositoryId,
+      configDigest: "e".repeat(64) },
+    discovered: 1, eligible: 1, excludedOtherTargets: 0, draftExcluded: 0,
+    heads: [head], rules: [], gaps: [],
+  };
+  const declaration = {
+    schemaVersion: 1, kind: "scheduled-rule-declaration",
+    generation: summary.generation, intakeGeneration: summary.intakeGeneration,
+    pullRequestId: head.pullRequestId, sourceCommit: head.sourceCommit,
+    targetCommit: head.targetCommit, targetRef: head.targetRef,
+    iterationId: head.iterationId, intakeDeclarationDigest: "f".repeat(64),
+    lineEvidenceDigest: intakeHead.lineEvidence.digest,
+    projectEvidenceDigest: projectDigest,
+    configDigest: summary.binding!.configDigest, capabilityId: rule.capabilityId,
+    ruleId: rule.ruleId, maxFindingsPerHead: 8, writerEligible: false,
+  };
+  const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+  const bytes = Buffer.from(JSON.stringify(declaration));
+  assert.equal(verifyRuleDeclaration(bytes, digest(bytes), summary, head, rule,
+    intakeHead, declaration.intakeDeclarationDigest), 8);
+  const stale = Buffer.from(JSON.stringify({
+    ...declaration, projectEvidenceDigest: "1".repeat(64),
+  }));
+  assert.equal(verifyRuleDeclaration(stale, digest(stale), summary, head, rule,
+    intakeHead, declaration.intakeDeclarationDigest), null);
+  const observation = Buffer.from(JSON.stringify({
+    schemaVersion: 1, kind: "scheduled-rule-observation",
+    generation: summary.generation, intakeGeneration: summary.intakeGeneration,
+    pullRequestId: head.pullRequestId, sourceCommit: head.sourceCommit,
+    targetCommit: head.targetCommit, targetRef: head.targetRef,
+    iterationId: head.iterationId, capabilityId: rule.capabilityId,
+    ruleId: rule.ruleId, declarationDigest: rule.declarationDigest,
+    projectEvidenceDigest: projectDigest, completedUtc: "2026-09-24T21:00:20Z",
+    outcome: { findings: 0, noOp: 0, humanCovered: 0, wouldCreate: 0, unknown: 0 },
+    discussionDigest: "f".repeat(64), findingOutcomes: [],
+    providerWrites: 0, modelToolInvocations: 0,
+  }));
+  assert.equal(verifyRuleObservation(observation, digest(observation),
+    summary, head, rule, 8, projectDigest), true);
+  assert.equal(verifyRuleObservation(observation, digest(observation),
+    summary, head, rule, 8, "1".repeat(64)), false);
 });

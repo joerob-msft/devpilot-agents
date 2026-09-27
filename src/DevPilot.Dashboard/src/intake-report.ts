@@ -18,6 +18,13 @@ export interface IntakeLineEvidence {
   digest: string;
 }
 
+export interface IntakeProjectEvidence {
+  complete: boolean;
+  digest: string;
+  rootTreeId: string | null;
+  files: Array<{ pathDigest: string; objectId: string; status: "complete" | "unknown"; attestationDigest: string | null }>;
+}
+
 export interface IntakeHead {
   pullRequestId: number;
   sourceCommit: string | null;
@@ -27,6 +34,7 @@ export interface IntakeHead {
   state: IntakeHeadState;
   reason: string;
   lineEvidence: IntakeLineEvidence | null;
+  projectEvidence: IntakeProjectEvidence | null;
   rules: Array<{ capabilityId: string; ruleId: string; state: IntakeHeadState; reason: string }>;
 }
 
@@ -237,6 +245,52 @@ export function parseIntakeCohort(value: unknown): IntakeSummary {
     } else if (head.lineEvidenceDigest !== null && head.lineEvidenceDigest !== undefined) {
       throw new Error("intake line evidence digest has no evidence");
     }
+    let projectEvidence: IntakeProjectEvidence | null = null;
+    if (head.projectEvidence !== null && head.projectEvidence !== undefined) {
+      const scope = object(head.projectEvidence);
+      const files = scope.files;
+      const complete = scope.complete;
+      const rootTreeId = scope.rootTreeId;
+      if (!lineEvidence || typeof complete !== "boolean" ||
+          scope.schemaVersion !== 1 || scope.kind !== "source-bound-project-scope-summary-v1" ||
+          scope.generation !== generation || scope.declarationDigest !== head.declarationDigest ||
+          scope.repositoryId !== repositoryId || scope.sourceCommit !== sourceCommit ||
+          sha(head.projectEvidenceDigest) !==
+            createHash("sha256").update(JSON.stringify(scope)).digest("hex") ||
+          (rootTreeId !== null && (typeof rootTreeId !== "string" || !/^[a-f0-9]{40}$/.test(rootTreeId))) ||
+          !Array.isArray(files) || files.length > lineEvidence.changedFiles ||
+          (complete && files.length > 0 && rootTreeId === null)) {
+        throw new Error("intake project evidence binding is invalid");
+      }
+      const seen = new Set<string>();
+      const receipts = files.map((value: unknown) => {
+        const file = object(value);
+        const pathDigest = sha(file.pathDigest);
+        const objectId = file.objectId;
+        const status = file.status;
+        const attestationDigest = file.attestationDigest;
+        if (seen.has(pathDigest) ||
+            !lineEvidence.files.some((candidate) =>
+              candidate.pathDigest === pathDigest && candidate.changeType !== "delete") ||
+            typeof objectId !== "string" || !/^[a-f0-9]{40}$/.test(objectId) ||
+            (status !== "complete" && status !== "unknown") ||
+            (status === "complete" && (typeof attestationDigest !== "string" ||
+              !/^[a-f0-9]{64}$/.test(attestationDigest))) ||
+            (status === "unknown" && attestationDigest !== null)) {
+          throw new Error("intake project evidence receipt is invalid");
+        }
+        seen.add(pathDigest);
+        return { pathDigest, objectId, status: status as "complete" | "unknown",
+          attestationDigest: attestationDigest as string | null };
+      });
+      if (complete !== receipts.every((receipt) => receipt.status === "complete")) {
+        throw new Error("intake project evidence is incomplete");
+      }
+      projectEvidence = { complete, digest: head.projectEvidenceDigest as string,
+        rootTreeId: rootTreeId as string | null, files: receipts };
+    } else if (head.projectEvidenceDigest !== null && head.projectEvidenceDigest !== undefined) {
+      throw new Error("intake project evidence digest has no evidence");
+    }
     const seenHeadRules = new Set<string>();
     const rules = head.rules.map((item: unknown) => {
       const rule = object(item);
@@ -255,7 +309,8 @@ export function parseIntakeCohort(value: unknown): IntakeSummary {
       pullRequestId, sourceCommit: sourceCommit as string | null,
       targetCommit: targetCommit as string | null,
       targetRef: targetRef as string | null, iterationId,
-      state: state as IntakeHeadState, reason: reason(head.reason), lineEvidence, rules,
+      state: state as IntakeHeadState, reason: reason(head.reason), lineEvidence,
+      projectEvidence, rules,
     };
   });
   if (inventory.state === "complete" &&

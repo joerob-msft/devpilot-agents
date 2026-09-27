@@ -224,6 +224,7 @@ function sourceCommitMissing(head: IntakeSummary["heads"][number]): boolean {
 export function verifyRuleObservation(
   bytes: Buffer, digest: string, summary: RuleEvaluationSummary,
   head: EvaluationHead, rule: EvaluationHead["rules"][number], maxFindingsPerHead: number,
+  projectEvidenceDigest?: string | null,
 ): boolean {
   try {
     if (createHash("sha256").update(bytes).digest("hex") !== digest) return false;
@@ -244,6 +245,12 @@ export function verifyRuleObservation(
     }
     const findingOutcomes = observation.findingOutcomes;
     const completed = utc(observation.completedUtc);
+    if (rule.capabilityId === "bpm-test-class-coverage@2" ||
+        rule.capabilityId === "bpm-redundant-method-coverage@2") {
+      if (!projectEvidenceDigest || observation.projectEvidenceDigest !== projectEvidenceDigest) {
+        return false;
+      }
+    }
     if (observation.schemaVersion !== 1 || observation.kind !== "scheduled-rule-observation" ||
         observation.generation !== summary.generation ||
         observation.intakeGeneration !== summary.intakeGeneration ||
@@ -341,6 +348,11 @@ export function verifyRuleDeclaration(
         declaration.capabilityId !== rule.capabilityId ||
         declaration.ruleId !== rule.ruleId ||
         declaration.writerEligible !== false || max < 1 || max > 32) return null;
+    if (rule.capabilityId === "bpm-test-class-coverage@2" ||
+        rule.capabilityId === "bpm-redundant-method-coverage@2") {
+      if (!intakeHead.projectEvidence?.complete ||
+          declaration.projectEvidenceDigest !== intakeHead.projectEvidence.digest) return null;
+    }
     return max;
   } catch {
     return null;
@@ -369,7 +381,8 @@ export async function validateRuleObservations(
           intakeDeclarationDigests.get(head.pullRequestId));
         if (max !== null) {
           const observationBytes = await readObservation(rule.observationDigest);
-          if (verifyRuleObservation(observationBytes, rule.observationDigest, summary, head, rule, max)) {
+          if (verifyRuleObservation(observationBytes, rule.observationDigest, summary, head, rule, max,
+            intakeHeads.get(head.pullRequestId)?.projectEvidence?.digest)) {
             const outcome = record(jsonBytes(observationBytes).outcome);
             rules.push({ ...rule, outcome: {
               findings: outcome.findings as number, noOp: outcome.noOp as number,

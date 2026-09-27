@@ -14,6 +14,12 @@
     "uniqueName": "service@example.invalid"
   },
   "automationMarker": "[DevPilot-Automation:v1]",
+  "projectEvidence": {
+    "schemaVersion": 1,
+    "enabled": false,
+    "maxTreeEntries": 4096,
+    "maxProjects": 32
+  },
   "rules": [
     {
       "id": "example-rule@1",
