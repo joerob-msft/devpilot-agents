@@ -32,6 +32,7 @@ function Assert-IntakeConfig {
     if ($Config.schemaVersion -ne 1 -or $Config.readOnly -cne $true -or
         $Config.dryRun -cne $true -or $Config.enabled -isnot [bool] -or
         [string]$Config.organization -cnotmatch '^https://(?:dev\.azure\.com/[A-Za-z0-9_-]+|[A-Za-z0-9_-]+\.visualstudio\.com)/?$' -or
+        [string]$Config.identityResource -cnotmatch '^https://[A-Za-z0-9-]+\.vssps\.visualstudio\.com/?$' -or
         [string]$Config.projectName -cnotmatch '^[\w .-]{1,128}$' -or
         [string]$Config.projectId -cnotmatch $guidPattern -or
         [string]$Config.repositoryId -cnotmatch $guidPattern -or
@@ -1250,6 +1251,7 @@ function New-ActivePrAzureDevOpsProvider {
     $project = [string]$Config.projectName
     $projectId = [string]$Config.projectId
     $repo = [string]$Config.repositoryId
+    $identityResource = [string]$Config.identityResource
     $maxFiles = [int]$Config.limits.maxChangedFiles
     $maxThreads = [int]$Config.limits.maxThreads
     $parseNumber = ${function:Assert-IntakeNumber}
@@ -1264,7 +1266,7 @@ function New-ActivePrAzureDevOpsProvider {
         $argv = if ($Area -eq 'connection') {
             @('rest', '--method', 'get',
                 '--url', "$($org.TrimEnd('/'))/_apis/connectionData?api-version=7.1-preview.1",
-                '--resource', [string]$Config.identityResource,
+                '--resource', $identityResource,
                 '-o', 'json', '--only-show-errors')
         } else {
             @('devops', 'invoke', '--organization', $org, '--area', $Area,

@@ -290,8 +290,9 @@ Run the optional adapter manually with
 after copying `samples\active-pr-intake.config.json` outside this repository,
 pinning the organization/repository/reviewer identity, and deliberately
 enabling it. Without `-Run` or with the config disabled, it validates and
-returns a disabled summary without ADO requests or durable writes. Each
-enabled run retains an
+returns a disabled summary without ADO requests or durable writes. The
+sample also pins the Azure DevOps identity token audience used for a
+read-only `connectionData` GET. Each enabled run retains an
 immutable `active-pr-intake-v1\generations\<generation>.json` and replaces
 only `active-pr-intake-v1\cohort.json` as the latest pointer. Configure the
 dashboard's `roots.intake` to that `active-pr-intake-v1` directory and

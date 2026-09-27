@@ -4,6 +4,7 @@
   "readOnly": true,
   "dryRun": true,
   "organization": "https://dev.azure.com/example-org",
+  "identityResource": "https://app.vssps.visualstudio.com",
   "projectName": "ExampleProject",
   "projectId": "22222222-2222-2222-2222-222222222222",
   "repositoryId": "11111111-1111-1111-1111-111111111111",
