@@ -7,7 +7,12 @@ Import-Module (Join-Path $PSScriptRoot '..\DevPilot.RuleEvaluation\DevPilot.Rule
 
 $script:OwnerCommit = 'f6db83436b48f48a8521095a888d79f67823bbb2'
 $script:OwnerHash = 'bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f'
+$script:NamedSectionHash = 'b3935a2ac811353d1da72e9a310938679cf119963677bd2ebc90510aab85a03a'
+$script:NamedSectionLength = 412
 $script:DocumentPath = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
+$script:CoverageCommit = '7e6620ec40c9bc37c5a5e13d506053b0139c9206'
+$script:CoverageDocumentHash = '68a5cb1aa2604b971c8c446c77ef50f74409407f65eaa2e9389acd636cddacee'
+$script:CoverageDocumentLength = 16286
 $script:StaticPolicies = @(
     @{ name = 'class'; index = 1; file = 'test-class-coverage' },
     @{ name = 'redundant'; index = 2; file = 'redundant-method-coverage' },
@@ -42,13 +47,18 @@ function Assert-CanarySource {
 
 function Get-CanarySection {
     param([string]$Document, [string]$Heading)
+    return (Get-CanaryRawSection $Document $Heading).Trim()
+}
+
+function Get-CanaryRawSection {
+    param([string]$Document, [string]$Heading)
     $pattern = '(?m)^' + [regex]::Escape($Heading) +
         '[ \t]*(?:\r\n|\n|\r)(?:(?!^##[ \t]).)*(?=^##[ \t]|\z)'
-    $matches = [regex]::Matches($Document, $pattern,
+    $sections = [regex]::Matches($Document, $pattern,
         [Text.RegularExpressions.RegexOptions]::Singleline -bor
         [Text.RegularExpressions.RegexOptions]::Multiline)
-    if ($matches.Count -ne 1) { throw 'rule-section-unavailable' }
-    return $matches[0].Value.Trim()
+    if ($sections.Count -ne 1) { throw 'rule-section-unavailable' }
+    return $sections[0].Value
 }
 
 function Read-CanarySource {
@@ -71,6 +81,95 @@ function Read-CanarySource {
         throw 'rule-source-mismatch'
     }
     return [string]$result.content
+}
+
+function Assert-CanaryCoverageSource {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$ApprovedSources,
+        [Parameter(Mandatory)][scriptblock]$Provider,
+        [switch]$Run
+    )
+    if (-not $Run) {
+        return [ordered]@{ state = 'disabled'; headVerified = $false
+            providerReads = 0; providerWrites = 0 }
+    }
+    $ruleIds = @('bpm-test-class-coverage@2',
+        'bpm-redundant-method-coverage@2')
+    $sources = @($ApprovedSources[$ruleIds[0]], $ApprovedSources[$ruleIds[1]])
+    foreach ($i in 0..1) {
+        $source = $sources[$i]
+        Assert-CanarySource $source $script:DocumentPath $script:CoverageCommit
+        if ([string]$source.ruleId -cne $ruleIds[$i] -or
+            [string]$source.projectName -cne 'Engineering' -or
+            [string]$source.repositoryName -cne 'EngHub' -or
+            [string]$source.provenance -cne 'unmerged-reviewed-pr' -or
+            [string]$source.reviewedPullRequestId -cne '17307009' -or
+            [string]$source.reviewedHead -cne $script:CoverageCommit -or
+            [string]$source.documentHash -cne
+                ('v1:sha256:' + $script:CoverageDocumentHash) -or
+            [string]$source.declarationDigest -cnotmatch '^v1:sha256:[a-f0-9]{64}$') {
+            throw 'coverage-source-not-approved'
+        }
+    }
+    if ([string]$sources[0].repositoryId -ine [string]$sources[1].repositoryId) {
+        throw 'coverage-source-identity-mismatch'
+    }
+    $document = Read-CanarySource $Provider $sources[0] $script:DocumentPath
+    $bytes = [Text.Encoding]::UTF8.GetBytes($document)
+    if ($bytes.Length -ne $script:CoverageDocumentLength -or
+        (Get-CanaryHash $bytes) -cne $script:CoverageDocumentHash) {
+        throw 'coverage-source-bytes-mismatch'
+    }
+    $lines = [regex]::Split($document, '\r\n|\n|\r')
+    if ($lines.Count -lt 223) { throw 'coverage-source-section-mismatch' }
+    $headingIndex = -1
+    for ($i = 0; $i -lt 220; $i++) {
+        if ($lines[$i] -cmatch '^## [^\r\n]+$') { $headingIndex = $i }
+    }
+    if ($headingIndex -lt 0 -or
+        @($lines[220..222] | Where-Object { $_ -cmatch '^## ' }).Count -ne 0) {
+        throw 'coverage-source-section-mismatch'
+    }
+    $heading = $lines[$headingIndex]
+    $section = Get-CanarySection $document $heading
+    $sectionHash = 'v1:sha256:' + (Get-CanaryTextHash $section)
+    $declarations = @(
+        for ($i = 0; $i -lt 2; $i++) {
+            $line = @(221, 223)[$i]
+            $declaration = [ordered]@{
+                ruleId = $ruleIds[$i]
+                repositoryId = ([string]$sources[$i].repositoryId).ToLowerInvariant()
+                commit = $script:CoverageCommit
+                path = $script:DocumentPath.Substring(1)
+                section = $heading
+                sectionHash = $sectionHash
+                policyLine = $line
+                policyLineHash = 'v1:sha256:' + (Get-CanaryTextHash $lines[$line - 1])
+            }
+            $digest = 'v1:sha256:' + (Get-CanaryTextHash (
+                    ConvertTo-AgentCanonicalJson -InputObject $declaration))
+            if ([string]$sources[$i].declarationDigest -cne $digest) {
+                throw 'coverage-declaration-digest-mismatch'
+            }
+            [ordered]@{ ruleId = $ruleIds[$i]; declarationDigest = $digest
+                sectionHash = $sectionHash; policyLine = $line }
+        }
+    )
+    return [ordered]@{
+        schemaVersion = 1
+        state = 'immutable-candidate-only'
+        provenance = 'unmerged-reviewed-pr'
+        reviewCaution = 'pending-human-review; not-master-authority'
+        reviewedPullRequestId = 17307009
+        reviewedHead = $script:CoverageCommit
+        headVerified = $false
+        repositoryId = ([string]$sources[0].repositoryId).ToLowerInvariant()
+        commit = $script:CoverageCommit
+        path = $script:DocumentPath.Substring(1)
+        documentHash = 'v1:sha256:' + $script:CoverageDocumentHash
+        declarations = $declarations
+    }
 }
 
 function Write-CanaryPrivateFile {
@@ -243,7 +342,12 @@ function Invoke-ActivePrCanaryQualification {
     }
     $namedDocument = Read-CanarySource $Provider $ApprovedSources.namedSection `
         $script:DocumentPath
-    $namedSection = Get-CanarySection $namedDocument '## Named parameters for Assert'
+    $namedSection = Get-CanaryRawSection $namedDocument '## Named parameters for Assert'
+    if ((Get-CanaryTextHash $namedSection) -cne $script:NamedSectionHash -or
+        [Text.Encoding]::UTF8.GetByteCount($namedSection) -ne
+            $script:NamedSectionLength) {
+        throw 'named-rule-digest-mismatch'
+    }
     $config.provenance = [ordered]@{
         ownerSection = [ordered]@{
             repositoryId = [string]$ApprovedSources.owner.repositoryId
@@ -368,4 +472,5 @@ function Invoke-ActivePrCanaryQualification {
     }
 }
 
-Export-ModuleMember -Function Invoke-ActivePrCanaryQualification
+Export-ModuleMember -Function Invoke-ActivePrCanaryQualification,
+    Assert-CanaryCoverageSource

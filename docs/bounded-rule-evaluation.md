@@ -163,6 +163,39 @@ the immutable raw Git blob and verified against its item object ID, rather
 than trusting the API's rendered `content` field. It does not attribute class
 or redundant policy to EngHub. Missing approvals or mismatched content stop
 provisioning; do not invent a commit or repository ID to satisfy the contract.
+The named section is independently pinned to its 412 raw UTF-8 bytes
+(`v1:sha256:b3935a2ac811353d1da72e9a310938679cf119963677bd2ebc90510aab85a03a`);
+the trimmed Owner section remains a different digest at its own commit.
+
+`Assert-CanaryCoverageSource` is a separate, **candidate-only** source
+allowlist for the dormant `bpm-test-class-coverage@2` and
+`bpm-redundant-method-coverage@2` rules. It takes two independently approved
+external entries keyed by those rule IDs and a read-only `RuleSource` provider;
+without `-Run` it returns disabled without making a source read.
+Each entry must identify the actual EngHub repository GUID, `Engineering`
+project, immutable `AutomatedTests.md` path, reviewed unmerged PR 17307009
+head `7e6620ec40c9bc37c5a5e13d506053b0139c9206`, provenance
+`unmerged-reviewed-pr`, full 16,286-byte document SHA-256
+`68a5cb1aa2604b971c8c446c77ef50f74409407f65eaa2e9389acd636cddacee`,
+and its own approved `v1:sha256:` declaration digest. The declaration digest
+is SHA-256 of `ConvertTo-AgentCanonicalJson` over the rule ID, lower-case
+repository GUID, commit, repository-relative path, enclosing `## ` section
+heading/hash, and the appropriate policy line/hash (221 for class, 223 for
+redundant). The two digests are distinct even though the document and section
+may be shared. Use a provider constructed with `-VerifyReadPrincipal`: its
+raw blob verification precedes this allowlist's document, section, and
+declaration checks. No source text is returned or persisted.
+
+This function returns `immutable-candidate-only` and `headVerified: false`.
+The reviewed PR was **not merged**; an immutable commit does not establish
+that it is still the PR's live head or that its policy was merged to master.
+The existing canary does not call this function, accept `@2` in its signed
+registry, or treat these approvals as an `@1` local policy replacement.
+A later private-input generator must recheck the PR's exact live head,
+reverify its raw blob, derive the actual BPM/provider IDs, adapt the signed
+read-only `@2` registry, and prove source-head-bound project ownership before
+signing. Do not create an external manifest by guessing repository IDs or
+declaration digests; do not run a live ADO canary from this candidate receipt.
 
 The tool then uses the intake provider's two complete bounded listing passes
 over *all* active PRs, excludes drafts and non-master targets, and pins the
