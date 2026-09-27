@@ -714,16 +714,13 @@ test("verified local reporting renders inside the existing dashboard and opens o
     assert.doesNotMatch(setup.captureCharFrame(), /Could not open reporting URL: shell association failed/);
     setup.mockInput.pressTab();
     await setup.flush();
-    assert.match(setup.captureCharFrame(), /\[INTAKE\]/);
-    setup.mockInput.pressTab();
-    await setup.flush();
     assert.match(setup.captureCharFrame(), /\[RULES\]/);
     assert.match(setup.captureCharFrame(), /mstest-owner/);
     setup.mockInput.pressKey("f");
     await setup.flush();
     assert.match(setup.captureCharFrame(), /\[FINDINGS\]/);
     assert.match(setup.captureCharFrame(), /capability:bpm-test-ownership@1/);
-    for (let index = 0; index < 5; index++) setup.mockInput.pressTab();
+    for (let index = 0; index < 4; index++) setup.mockInput.pressTab();
     await setup.flush();
     assert.match(setup.captureCharFrame(), /\[RULES\]/);
     setup.mockInput.pressKey("e");
