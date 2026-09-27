@@ -274,7 +274,7 @@ function Get-CanaryAadToken {
 
 function Get-CanaryIdentityPayload {
     param([byte[]]$Bytes, [AllowEmptyString()][string]$MediaType,
-        [bool]$Encoded)
+        [bool]$Encoded, [switch]$AllowMissingUniqueName)
     if ($Encoded) { return @{ reason = 'encoded-response' } }
     if ($MediaType -and $MediaType -cne 'application/json' -and
         $MediaType -cnotmatch '^application/[A-Za-z0-9._-]+\+json$') {
@@ -319,10 +319,13 @@ function Get-CanaryIdentityPayload {
         return @{ reason = 'identity-fields-missing' }
     }
     $user = $result['authenticatedUser']
-    foreach ($field in @('id', 'subjectDescriptor', 'uniqueName')) {
+    foreach ($field in @('id', 'subjectDescriptor')) {
         if (-not $user.Contains($field)) {
             return @{ reason = 'identity-fields-missing' }
         }
+    }
+    if (-not $AllowMissingUniqueName -and -not $user.Contains('uniqueName')) {
+        return @{ reason = 'identity-fields-missing' }
     }
     return @{ reason = 'valid'; identity = @{
             id = $user['id']; descriptor = $user['subjectDescriptor']
@@ -342,7 +345,21 @@ function Invoke-CanaryAadGet {
     $esc = [Uri]::EscapeDataString
     $base = "https://dev.azure.com/$Organization"
     $url = switch -CaseSensitive ($Operation) {
-        Identity { "$base/_apis/connectionData?api-version=7.1-preview.1" }
+        { $_ -cin @('Identity', 'IdentityProof') } {
+            "$base/_apis/connectionData?api-version=7.1-preview.1"
+        }
+        { $_ -cin @('GraphUser', 'GraphStorageKey') } {
+            $descriptor = [string]$Request['subjectDescriptor']
+            if ($descriptor -cnotmatch '^[A-Za-z0-9._-]{1,512}$') {
+                throw 'bootstrap-request-invalid'
+            }
+            $graphBase = "https://vssps.dev.azure.com/$Organization/_apis/graph"
+            if ($Operation -ceq 'GraphUser') {
+                "$graphBase/users/$($esc.Invoke($descriptor))?api-version=7.1-preview.1"
+            } else {
+                "$graphBase/storagekeys/$($esc.Invoke($descriptor))?api-version=7.1"
+            }
+        }
         Project {
             if ($project -cnotmatch '^[\w .-]{1,128}$' -or
                 $project -in @('.', '..')) {
@@ -456,14 +473,30 @@ function Invoke-CanaryAadGet {
         finally { $response.Dispose() }
         if ($Operation -ceq 'RawItem') { return @{ bytes = $bytes } }
         $phase = 'decode'
-        if ($Operation -ceq 'Identity') {
+        if ($Operation -cin @('Identity', 'IdentityProof')) {
             $classified = Get-CanaryIdentityPayload -Bytes $bytes `
-                -MediaType $mediaType -Encoded $encoded
+                -MediaType $mediaType -Encoded $encoded `
+                -AllowMissingUniqueName:($Operation -ceq 'IdentityProof')
             $decodeReason = [string]$classified.reason
             if ($decodeReason -cne 'valid') {
                 throw 'bootstrap-read-inaccessible'
             }
             return $classified.identity
+        }
+        if ($Operation -cin @('GraphUser', 'GraphStorageKey')) {
+            if ($encoded -or
+                ($mediaType -and $mediaType -cne 'application/json' -and
+                    $mediaType -cnotmatch '^application/[A-Za-z0-9._-]+\+json$') -or
+                ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and
+                    $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf)) {
+                throw 'bootstrap-read-inaccessible'
+            }
+            $result = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) |
+                ConvertFrom-Json -AsHashtable -Depth 12
+            if ($result -isnot [Collections.IDictionary]) {
+                throw 'bootstrap-read-inaccessible'
+            }
+            return $result
         }
         $result = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) |
             ConvertFrom-Json -AsHashtable -Depth 12
@@ -474,12 +507,13 @@ function Invoke-CanaryAadGet {
             throw ('bootstrap-read-inaccessible:{0}:http-{1}' -f
                 $Operation, $failureStatus)
         }
-        if ($Operation -ceq 'Identity' -and $phase -ceq 'decode' -and
+        if ($Operation -cin @('Identity', 'IdentityProof') -and
+            $phase -ceq 'decode' -and
             $decodeReason -cin @('encoded-response', 'non-json-media',
                 'utf8-bom', 'invalid-utf8', 'invalid-json',
                 'json-depth-over-12', 'identity-fields-missing',
                 'unclassified')) {
-            throw "bootstrap-read-inaccessible:Identity:$decodeReason"
+            throw "bootstrap-read-inaccessible:$($Operation):$decodeReason"
         }
         throw ('bootstrap-read-inaccessible:{0}:{1}' -f $Operation, $phase)
     }
@@ -497,6 +531,7 @@ function Invoke-PrivateCanaryIdentityDiagnostic {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [string]$AzureCliPath = 'az',
         [scriptblock]$Read,
+        [switch]$VerifyGraph,
         [switch]$Run
     )
     if ($Organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$' -or
@@ -524,11 +559,83 @@ function Invoke-PrivateCanaryIdentityDiagnostic {
             $readClient = $client
             $readToken = $token
             $readOrg = $Organization
+            $readDeadline = [DateTime]::UtcNow.AddSeconds(90)
             $Read = {
                 param($Operation, $Request)
                 & $aadGet $readClient $readToken $readOrg `
-                    $Operation $Request ([DateTime]::UtcNow.AddSeconds(30))
+                    $Operation $Request $readDeadline
             }.GetNewClosure()
+        }
+        if ($VerifyGraph) {
+            $attempts = [pscustomobject]@{ Count = 0 }
+            $reason = 'unclassified'
+            $bounded = {
+                param([string]$Operation, [Collections.IDictionary]$Request)
+                if ($attempts.Count -ge 3 -or $Operation -cnotin @(
+                        'IdentityProof', 'GraphUser', 'GraphStorageKey')) {
+                    throw 'identity-diagnostic-budget'
+                }
+                $attempts.Count++
+                return & $Read $Operation $Request
+            }.GetNewClosure()
+            try {
+                $identity = & $bounded IdentityProof @{}
+                $guid = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
+                if ($identity -isnot [Collections.IDictionary] -or
+                    [string]$identity['id'] -cnotmatch $guid -or
+                    [string]$identity['descriptor'] -cnotmatch
+                        '^[A-Za-z0-9._-]{1,512}$') {
+                    $reason = 'identity-fields-invalid'
+                    throw 'identity-proof-stopped'
+                }
+                $descriptor = [string]$identity['descriptor']
+                $uniqueName = [string]$identity['uniqueName']
+                if ($null -ne $identity['uniqueName'] -and
+                    ($uniqueName -cnotmatch '^[^@\s]+@[^@\s]+$' -or
+                        $uniqueName -ine $ExpectedAccountUniqueName)) {
+                    $reason = 'optional-name-mismatch'
+                    throw 'identity-proof-stopped'
+                }
+                $user = & $bounded GraphUser @{
+                    subjectDescriptor = $descriptor
+                }
+                if ($user -isnot [Collections.IDictionary] -or
+                    [string]$user['descriptor'] -cne $descriptor -or
+                    [string]$user['subjectKind'] -cne 'user' -or
+                    [string]$user['principalName'] -cnotmatch
+                        '^[^@\s]+@[^@\s]+$' -or
+                    [string]$user['principalName'] -ine
+                        $ExpectedAccountUniqueName) {
+                    $reason = 'graph-user-mismatch'
+                    throw 'identity-proof-stopped'
+                }
+                $storage = & $bounded GraphStorageKey @{
+                    subjectDescriptor = $descriptor
+                }
+                if ($storage -isnot [Collections.IDictionary] -or
+                    [string]$storage['value'] -cnotmatch $guid -or
+                    [string]$storage['value'] -ine [string]$identity['id']) {
+                    $reason = 'storage-key-mismatch'
+                    throw 'identity-proof-stopped'
+                }
+                return [ordered]@{ state = 'verified'; reason = 'valid'
+                    getAttempts = $attempts.Count; providerWrites = 0
+                    modelToolInvocations = 0 }
+            }
+            catch {
+                $message = [string]$_.Exception.Message
+                if ($message -cmatch
+                        '^bootstrap-read-inaccessible:IdentityProof:(encoded-response|non-json-media|utf8-bom|invalid-utf8|invalid-json|json-depth-over-12|identity-fields-missing|unclassified)$') {
+                    $reason = $Matches[1]
+                } elseif ($reason -ceq 'unclassified' -and
+                    $message -cmatch
+                        '^bootstrap-read-inaccessible:(IdentityProof|GraphUser|GraphStorageKey):http-[0-9]{3}$') {
+                    $reason = 'http-failure'
+                }
+                return [ordered]@{ state = 'unknown'; reason = $reason
+                    getAttempts = $attempts.Count; providerWrites = 0
+                    modelToolInvocations = 0 }
+            }
         }
         try {
             $identity = & $Read Identity @{}

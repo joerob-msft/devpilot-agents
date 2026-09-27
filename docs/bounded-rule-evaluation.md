@@ -129,8 +129,9 @@ verify the pinned EngHub section and configure the live model; this command
 does not supply credentials, signed live configuration, or an active intake
 generation.
 
-`tools/Invoke-PrivateCanaryIdentityDiagnostic.ps1` is a separate default-off,
-single-request diagnostic for an explicitly authorized Identity check. Pass
+`tools/Invoke-PrivateCanaryIdentityDiagnostic.ps1` is a separate default-off
+diagnostic for an explicitly authorized Identity check. Without
+`-VerifyGraph`, pass
 the organization slug and expected reviewer UPN with `-Run`; it obtains an
 in-memory AAD bearer, makes **one bounded GET** to `connectionData`, and
 stops on both success and failure. It returns only a fixed reason, minimal
@@ -139,6 +140,19 @@ private state, read projects or source documents, sign intake, evaluate rules,
 or authorize any model or writer. A verified Identity response alone is not
 source, cohort, or rule qualification; the command must not be used as a
 substitute for the signed-intake and evaluation gates.
+
+With a separately authorized `-VerifyGraph -Run`, the same diagnostic
+uses at most three GETs under one in-memory bearer: token-bound
+`connectionData.authenticatedUser` followed by a Graph user and Graph
+storage key for its exact subject descriptor. It requires the
+authenticated user's storage-key GUID and subject descriptor, the Graph
+user's matching descriptor, user kind, and principal name matching the
+expected UPN, and a storage-key GUID matching the authenticated user's
+GUID. `uniqueName` is optional in the connection response but, if present,
+must match the expected UPN. Missing or inconsistent proof stops before
+subsequent reads; only fixed status/reason and attempted GET count are
+returned. An identity proof does not authorize source/intake/evaluation
+reads or any write, and each live use requires its own explicit approval.
 
 `tools/Initialize-PrivateActivePrCanaryInputs.ps1` is a **preparation-only**
 bootstrap for the private syntactic canary. It is disabled without `-Run`;

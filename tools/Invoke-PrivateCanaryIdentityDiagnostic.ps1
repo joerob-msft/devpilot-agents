@@ -9,6 +9,7 @@ param(
     [Parameter(Mandatory)][string]$Organization,
     [Parameter(Mandatory)][string]$ExpectedAccountUniqueName,
     [string]$AzureCliPath = 'az',
+    [switch]$VerifyGraph,
     [switch]$Run
 )
 Set-StrictMode -Version Latest
@@ -17,5 +18,6 @@ $repo = Split-Path $PSScriptRoot -Parent
 Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.ActivePrCanary.psm1')
 Invoke-PrivateCanaryIdentityDiagnostic -Organization $Organization `
     -ExpectedAccountUniqueName $ExpectedAccountUniqueName `
-    -RepositoryRoot $repo -AzureCliPath $AzureCliPath -Run:$Run |
+    -RepositoryRoot $repo -AzureCliPath $AzureCliPath `
+    -VerifyGraph:$VerifyGraph -Run:$Run |
     ConvertTo-Json -Depth 4

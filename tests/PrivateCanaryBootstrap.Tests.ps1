@@ -22,29 +22,44 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
     public bool Oversize = false;
     public bool InvalidJson = false;
     public byte[] Body;
+    public byte[] GraphUserBody;
+    public byte[] StorageKeyBody;
     public string MediaType;
     public string ContentEncoding;
+    public HttpStatusCode GraphUserStatus = HttpStatusCode.OK;
+    public HttpStatusCode StorageKeyStatus = HttpStatusCode.OK;
     protected override Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken) {
         if (request.Method != HttpMethod.Get ||
             request.Headers.Authorization?.Scheme != "Bearer" ||
             request.Headers.Authorization?.Parameter != "synthetic-bearer" ||
-            request.RequestUri.Host != "dev.azure.com") {
+            (request.RequestUri.Host != "dev.azure.com" &&
+             (request.RequestUri.Host != "vssps.dev.azure.com" ||
+              (request.RequestUri.AbsolutePath != "/example-org/_apis/graph/users/aad.synthetic" &&
+               request.RequestUri.AbsolutePath != "/example-org/_apis/graph/storagekeys/aad.synthetic")))) {
             throw new InvalidOperationException("unbound synthetic GET");
         }
         Paths.Add(request.RequestUri.AbsoluteUri);
         if (FailTransport) {
             throw new HttpRequestException("private transport detail");
         }
-        var content = request.RequestUri.AbsolutePath.EndsWith("/connectionData")
+        var isUser = request.RequestUri.AbsolutePath.Contains("/_apis/graph/users/");
+        var isStorage = request.RequestUri.AbsolutePath.Contains("/_apis/graph/storagekeys/");
+        var content = isUser
+            ? GraphUserBody ?? Encoding.UTF8.GetBytes("{\"descriptor\":\"aad.synthetic\",\"subjectKind\":\"user\",\"principalName\":\"service@example.invalid\"}")
+            : isStorage
+            ? StorageKeyBody ?? Encoding.UTF8.GetBytes("{\"value\":\"33333333-3333-3333-3333-333333333333\"}")
+            : request.RequestUri.AbsolutePath.EndsWith("/connectionData")
             ? Encoding.UTF8.GetBytes("{\"authenticatedUser\":{\"id\":\"33333333-3333-3333-3333-333333333333\",\"subjectDescriptor\":\"aad.synthetic\",\"uniqueName\":\"service@example.invalid\"}}")
             : request.Headers.Accept.ToString() == "application/octet-stream"
             ? Encoding.UTF8.GetBytes("synthetic bytes")
             : Encoding.UTF8.GetBytes("{\"id\":\"synthetic\"}");
         if (Oversize) content = new byte[65537];
         if (InvalidJson) content = Encoding.UTF8.GetBytes("{");
-        var response = new HttpResponseMessage(Status) {
-            Content = new ByteArrayContent(Body ?? content)
+        var response = new HttpResponseMessage(isUser ? GraphUserStatus :
+            isStorage ? StorageKeyStatus : Status) {
+            Content = new ByteArrayContent(isUser || isStorage
+                ? content : Body ?? content)
         };
         if (MediaType != null) {
             response.Content.Headers.ContentType =
@@ -1333,6 +1348,130 @@ Describe 'Read-only private canary input bootstrap' {
         $result.reason | Should -Be 'unclassified'
         $result.getAttempts | Should -Be 1
         $state.reads | Should -Be 1
+        (ConvertTo-Json -InputObject $result) | Should -Not -Match 'private-sentinel'
+    }
+    It 'binds a token identity to the same Graph user and storage key in at most three GETs' {
+        $utf8 = [Text.Encoding]::UTF8
+        $id = '33333333-3333-3333-3333-333333333333'
+        $fullIdentity = '{"authenticatedUser":{"id":"' + $id +
+            '","subjectDescriptor":"aad.synthetic","uniqueName":"service@example.invalid"}}'
+        $noUniqueName = '{"authenticatedUser":{"id":"' + $id +
+            '","subjectDescriptor":"aad.synthetic"}}'
+        $missingId = '{"authenticatedUser":{"subjectDescriptor":"aad.synthetic"}}'
+        $missingDescriptor = '{"authenticatedUser":{"id":"' + $id + '"}}'
+        foreach ($case in @(
+                @{ reason = 'valid'; gets = 3; identity = $noUniqueName; user = $null; storage = $null; userStatus = 200 },
+                @{ reason = 'valid'; gets = 3; identity = $fullIdentity; user = $null; storage = $null; userStatus = 200 },
+                @{ reason = 'identity-fields-missing'; gets = 1; identity = $missingId; user = $null; storage = $null; userStatus = 200 },
+                @{ reason = 'identity-fields-missing'; gets = 1; identity = $missingDescriptor; user = $null; storage = $null; userStatus = 200 },
+                @{ reason = 'optional-name-mismatch'; gets = 1; identity = $fullIdentity.Replace('service@example.invalid', 'other@example.invalid'); user = $null; storage = $null; userStatus = 200 },
+                @{ reason = 'graph-user-mismatch'; gets = 2; identity = $noUniqueName; user = '{"descriptor":"aad.different","subjectKind":"user","principalName":"service@example.invalid"}'; storage = $null; userStatus = 200 },
+                @{ reason = 'graph-user-mismatch'; gets = 2; identity = $noUniqueName; user = '{"descriptor":"aad.synthetic","subjectKind":"user","principalName":"other@example.invalid"}'; storage = $null; userStatus = 200 },
+                @{ reason = 'graph-user-mismatch'; gets = 2; identity = $noUniqueName; user = '{"descriptor":"aad.synthetic","subjectKind":"group","principalName":"service@example.invalid"}'; storage = $null; userStatus = 200 },
+                @{ reason = 'http-failure'; gets = 2; identity = $noUniqueName; user = $null; storage = $null; userStatus = 403 },
+                @{ reason = 'http-failure'; gets = 2; identity = $noUniqueName; user = $null; storage = $null; userStatus = 302 },
+                @{ reason = 'storage-key-mismatch'; gets = 3; identity = $noUniqueName; user = $null; storage = '{"value":"44444444-4444-4444-4444-444444444444"}'; userStatus = 200 })) {
+            $handler = [CanarySyntheticHandler]::new()
+            $handler.Body = $utf8.GetBytes($case.identity)
+            if ($case.user) { $handler.GraphUserBody = $utf8.GetBytes($case.user) }
+            if ($case.storage) { $handler.StorageKeyBody = $utf8.GetBytes($case.storage) }
+            $handler.GraphUserStatus = [Net.HttpStatusCode]$case.userStatus
+            $client = [Net.Http.HttpClient]::new($handler)
+            $module = Get-Module DevPilot.ActivePrCanary
+            $c = Get-BootstrapCase
+            $state = @{ operations = [Collections.Generic.List[string]]::new() }
+            $read = {
+                param($operation, $request)
+                $state.operations.Add($operation) | Out-Null
+                & $module {
+                    param($Client, $Operation, $Request)
+                    Invoke-CanaryAadGet $Client 'synthetic-bearer' 'example-org' `
+                        $Operation $Request ([DateTime]::UtcNow.AddSeconds(5))
+                } $client $operation $request
+            }.GetNewClosure()
+            try {
+                $result = Invoke-PrivateCanaryIdentityDiagnostic `
+                    -Organization 'example-org' `
+                    -ExpectedAccountUniqueName 'service@example.invalid' `
+                    -RepositoryRoot $repo -Read $read -VerifyGraph -Run
+                $result.reason | Should -Be $case.reason
+                $result.state | Should -Be $(if ($case.reason -eq 'valid') {
+                        'verified'
+                    } else { 'unknown' })
+                $result.getAttempts | Should -Be $case.gets
+                $result.providerWrites | Should -Be 0
+                $result.modelToolInvocations | Should -Be 0
+                $state.operations.Count | Should -Be $case.gets
+                $handler.Paths.Count | Should -Be $case.gets
+                $state.operations[0] | Should -Be 'IdentityProof'
+                $handler.Paths[0] | Should -Match '^https://dev\.azure\.com/example-org/_apis/connectionData\?api-version=7\.1-preview\.1$'
+                if ($case.gets -gt 1) {
+                    $state.operations[1] | Should -Be 'GraphUser'
+                    $handler.Paths[1] | Should -Match '^https://vssps\.dev\.azure\.com/example-org/_apis/graph/users/aad\.synthetic\?api-version=7\.1-preview\.1$'
+                }
+                if ($case.gets -gt 2) {
+                    $state.operations[2] | Should -Be 'GraphStorageKey'
+                    $handler.Paths[2] | Should -Match '^https://vssps\.dev\.azure\.com/example-org/_apis/graph/storagekeys/aad\.synthetic\?api-version=7\.1$'
+                }
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+                (ConvertTo-Json -InputObject $result -Compress) |
+                    Should -Not -Match 'aad\.synthetic|example\.invalid|33333333|private-sentinel'
+            }
+            finally { $client.Dispose() }
+        }
+    }
+    It 'keeps Graph verification disabled and redacts injected read errors' {
+        $state = @{ operations = [Collections.Generic.List[string]]::new() }
+        $read = {
+            param($operation, $request)
+            $state.operations.Add($operation) | Out-Null
+            throw 'private-sentinel'
+        }.GetNewClosure()
+        $args = @{
+            Organization = 'example-org'
+            ExpectedAccountUniqueName = 'service@example.invalid'
+            RepositoryRoot = $repo
+            Read = $read
+            VerifyGraph = $true
+        }
+        (Invoke-PrivateCanaryIdentityDiagnostic @args).getAttempts | Should -Be 0
+        $state.operations.Count | Should -Be 0
+        $result = Invoke-PrivateCanaryIdentityDiagnostic @args -Run
+        $result.reason | Should -Be 'unclassified'
+        $result.getAttempts | Should -Be 1
+        $state.operations.Count | Should -Be 1
+        $state.operations[0] | Should -Be 'IdentityProof'
+        (ConvertTo-Json -InputObject $result) | Should -Not -Match 'private-sentinel'
+    }
+    It 'stops after the third attempted GET on an unavailable Graph storage key' {
+        $state = @{ operations = [Collections.Generic.List[string]]::new() }
+        $read = {
+            param($operation, $request)
+            $state.operations.Add($operation) | Out-Null
+            switch ($operation) {
+                IdentityProof {
+                    return @{ id = '33333333-3333-3333-3333-333333333333'
+                        descriptor = 'aad.synthetic'; uniqueName = $null }
+                }
+                GraphUser {
+                    return @{ descriptor = 'aad.synthetic'; subjectKind = 'user'
+                        principalName = 'service@example.invalid' }
+                }
+                GraphStorageKey { throw 'private-sentinel' }
+                default { throw 'unexpected operation' }
+            }
+        }.GetNewClosure()
+        $c = Get-BootstrapCase
+        $result = Invoke-PrivateCanaryIdentityDiagnostic `
+            -Organization 'example-org' `
+            -ExpectedAccountUniqueName 'service@example.invalid' `
+            -RepositoryRoot $repo -Read $read -VerifyGraph -Run
+        $result.state | Should -Be 'unknown'
+        $result.reason | Should -Be 'unclassified'
+        $result.getAttempts | Should -Be 3
+        $state.operations.ToArray() -join ',' |
+            Should -Be 'IdentityProof,GraphUser,GraphStorageKey'
+        Test-Path -LiteralPath $c.root | Should -BeFalse
         (ConvertTo-Json -InputObject $result) | Should -Not -Match 'private-sentinel'
     }
 }
