@@ -66,6 +66,29 @@ function Assert-RuleConfig {
         if ($rule.maxFindingsPerHead -gt $Config.limits.maxFindingsPerHead) {
             throw 'Rule cap exceeds the per-head envelope.'
         }
+        if ($rule.enabled -and $rule.capabilityId -ceq 'bpm-test-ownership@1') {
+            $binding = $rule['binding']
+            if ($binding -isnot [Collections.IDictionary] -or
+                [string]$binding.ruleRepositoryId -cnotmatch
+                    '^[A-Za-z0-9._/-]{1,256}$' -or
+                [string]$binding.rulePath -cne
+                    'documentation/EngineeringProcesses/Conventions/AutomatedTests.md' -or
+                [string]$binding.ruleSection -cne '## Claim ownership' -or
+                [string]$binding.ruleCommit -cne
+                    'f6db83436b48f48a8521095a888d79f67823bbb2' -or
+                [string]$binding.ruleHash -cne
+                    'v1:sha256:bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f' -or
+                [string]$binding.capabilityDigest -cnotmatch
+                    '^v1:sha256:[a-f0-9]{64}$' -or
+                $rule.model -isnot [Collections.IDictionary] -or
+                $rule.model.Count -ne 2 -or
+                [string]$rule.model.id -cnotmatch '^[a-zA-Z0-9_.-]{1,128}$' -or
+                [string]$rule.model.digest -cne
+                    ('v1:sha256:' + (Get-RuleTextDigest ([string]$rule.model.id)))) {
+                throw 'owner-rule-binding-unavailable'
+            }
+            [void](Assert-RuleNumber $binding.ruleLength ruleLength 1 65536)
+        }
         if ($rule.enabled -and $script:RulePolicies.ContainsKey([string]$rule.capabilityId)) {
             $binding = $rule['binding']
             $policy = $script:RulePolicies[[string]$rule.capabilityId]
@@ -722,7 +745,15 @@ function Invoke-BoundedRuleEvaluation {
                             configDigest = $cohort.binding.configDigest
                             capabilityId = $rule.capabilityId; ruleId = $rule.ruleId
                             ruleBinding = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
-                                $null
+                                [ordered]@{
+                                    ruleRepositoryId = [string]$ruleConfig.binding.ruleRepositoryId
+                                    rulePath = [string]$ruleConfig.binding.rulePath
+                                    ruleSection = [string]$ruleConfig.binding.ruleSection
+                                    ruleCommit = [string]$ruleConfig.binding.ruleCommit
+                                    ruleHash = [string]$ruleConfig.binding.ruleHash
+                                    ruleLength = [int]$ruleConfig.binding.ruleLength
+                                    capabilityDigest = [string]$ruleConfig.binding.capabilityDigest
+                                }
                             } else {
                                 [ordered]@{
                                     ruleRepositoryId = [string]$ruleConfig.binding.ruleRepositoryId
@@ -733,6 +764,10 @@ function Invoke-BoundedRuleEvaluation {
                                 }
                             }
                             maxFindingsPerHead = [int]$ruleConfig.maxFindingsPerHead
+                            model = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
+                                [ordered]@{ id = [string]$ruleConfig.model.id
+                                    digest = [string]$ruleConfig.model.digest }
+                            } else { $null }
                             writerEligible = $false
                         }
                         $declarationBytes = [Text.UTF8Encoding]::new($false).GetBytes(
@@ -750,7 +785,7 @@ function Invoke-BoundedRuleEvaluation {
                             } else {
                                 & $OwnerEvaluator $declaration $files.ToArray() $discussion `
                                     $head.lineEvidence $generation $ruleConfig `
-                                    $ruleDeclaration $rule.declarationDigest
+                                    $ruleDeclaration $rule.declarationDigest $discussions
                             }
                         } else {
                             $contract = New-RuleContract $Config $ruleConfig $declaration $RepositoryRoot
@@ -758,6 +793,37 @@ function Invoke-BoundedRuleEvaluation {
                                 $IntakeConfig $declaration $contract
                             Get-RuleEvaluation $rule.capabilityId $files.ToArray() `
                                 $ruleConfig.maxFindingsPerHead $contract $snapshot
+                        }
+                        if ($rule.capabilityId -ceq 'bpm-test-ownership@1' -and $OwnerEvaluator) {
+                            $postHead = Invoke-RuleRead $Provider Head @{ pullRequestId = $id } `
+                                ([ref]$reads) $limits.maxReads $clock $limits.maxSeconds
+                            Assert-RuleHead $postHead $declaration
+                            $postChanges = Invoke-RuleRead $Provider Changes @{
+                                pullRequestId = $id; iterationId = $declaration.iterationId
+                                sourceCommit = $declaration.sourceCommit
+                                targetCommit = $declaration.targetCommit
+                                commonCommit = $declaration.commonCommit
+                            } ([ref]$reads) $limits.maxReads $clock $limits.maxSeconds
+                            if ($postChanges.changedLines -ne $head.lineEvidence.changedLines -or
+                                $postChanges.changedFiles -ne $head.lineEvidence.changedFiles -or
+                                $postChanges.baseCommit -cne $declaration.commonCommit -or
+                                (Get-RuleDigest @($postChanges.files)) -cne
+                                    (Get-RuleDigest @($head.lineEvidence.files))) {
+                                throw 'changed-lines-mismatch'
+                            }
+                            $postDiscussions = Invoke-RuleRead $Provider Discussions @{
+                                pullRequestId = $id; iterationId = $declaration.iterationId
+                            } ([ref]$reads) $limits.maxReads $clock $limits.maxSeconds
+                            [void](Get-ActivePrDiscussionCounts $postDiscussions `
+                                $IntakeConfig $declaration)
+                            if ((Get-RuleDigest $postDiscussions) -cne
+                                (Get-RuleDigest $discussions)) {
+                                throw 'discussion-head-mismatch'
+                            }
+                            $finalHead = Invoke-RuleRead $Provider Head @{
+                                pullRequestId = $id
+                            } ([ref]$reads) $limits.maxReads $clock $limits.maxSeconds
+                            Assert-RuleHead $finalHead $declaration
                         }
                         if ($evaluation -isnot [Collections.IDictionary] -or
                             $evaluation.state -cnotin @('evaluated', 'unknown') -or
@@ -769,12 +835,21 @@ function Invoke-BoundedRuleEvaluation {
                             continue
                         }
                         if ($rule.capabilityId -ceq 'bpm-test-ownership@1' -and $OwnerEvaluator -and
+                            $evaluation.state -ceq 'evaluated' -and
                             ($evaluation.completed -cne $true -or
                                 $evaluation.providerWrites -cne 0 -or
                                 $evaluation.writeToolInvocations -cne 0 -or
                                 $evaluation.modelToolInvocations -cne 0 -or
                                 (Assert-RuleNumber $evaluation.manifestEntryCount `
-                                    manifestEntryCount 1 32) -gt $limits.maxHeadsPerRun -or
+                                    manifestEntryCount 1 32) -ne 1 -or
+                                $evaluation.durableProof -isnot
+                                    [Collections.IDictionary] -or
+                                [string]$evaluation.durableProof.identity -cnotmatch
+                                    '^[a-f0-9]{64}$' -or
+                                [string]$evaluation.durableProof.stateDigest -cne
+                                    ('v1:sha256:' + [string]$evaluation.durableProof.identity) -or
+                                [string]$evaluation.durableProof.observationDigest -cnotmatch
+                                    '^v1:sha256:[a-f0-9]{64}$' -or
                                 [string]$evaluation.manifestDigest -cnotmatch
                                     '^v1:sha256:[a-f0-9]{64}$' -or
                                 $evaluation.intakeGeneration -cne $intake.generation -or
@@ -788,17 +863,36 @@ function Invoke-BoundedRuleEvaluation {
                             $rule.status = 'unknown'; $rule.reasonCode = 'owner-proof-unbound'
                             continue
                         }
-                        if ($evaluation.state -cne 'evaluated' -or
-                            ($rule.capabilityId -ceq 'bpm-test-ownership@1' -and
-                                $evaluation.findings -gt 0 -and
-                                ($discussion.ambiguous -gt 0 -or $discussion.human -gt 0 -or
-                                    $discussion.automation -gt 0))) {
+                        if ($evaluation.state -cne 'evaluated') {
                             $rule.status = 'unknown'
-                            $rule.reasonCode = if ($discussion.ambiguous -gt 0) {
-                                'ambiguous-discussion'
-                            } elseif ($evaluation.state -cne 'evaluated') {
-                                [string]$evaluation.reason
-                            } else { 'discussion-needs-review' }
+                            $rule.reasonCode = [string]$evaluation.reason
+                            continue
+                        }
+                        $outcomes = @($evaluation.findingOutcomes)
+                        $counts = @{ noOp = 0; humanCovered = 0; wouldCreate = 0
+                            unknown = 0 }
+                        $findingIds = [Collections.Generic.HashSet[string]]::new(
+                            [StringComparer]::Ordinal)
+                        $validOutcomes = $outcomes.Count -eq $evaluation.findings -and
+                            [string]$evaluation.discussionDigest -cmatch '^[a-f0-9]{64}$'
+                        foreach ($outcome in $outcomes) {
+                            if ($outcome -isnot [Collections.IDictionary] -or
+                                [string]$outcome.findingDigest -cnotmatch '^[a-f0-9]{64}$' -or
+                                -not $findingIds.Add([string]$outcome.findingDigest) -or
+                                -not $counts.ContainsKey([string]$outcome.classification) -or
+                                [string]$outcome.reason -cnotmatch '^[a-z][a-z0-9-]{0,79}$') {
+                                $validOutcomes = $false
+                                break
+                            }
+                            $counts[[string]$outcome.classification]++
+                        }
+                        foreach ($classification in $counts.Keys) {
+                            if ($evaluation[$classification] -cne $counts[$classification]) {
+                                $validOutcomes = $false
+                            }
+                        }
+                        if (-not $validOutcomes) {
+                            $rule.status = 'unknown'; $rule.reasonCode = 'rule-ambiguous'
                             continue
                         }
                         $observation = [ordered]@{
@@ -813,17 +907,30 @@ function Invoke-BoundedRuleEvaluation {
                             declarationDigest = $rule.declarationDigest
                             completedUtc = [DateTime]::UtcNow.ToString('o')
                             outcome = [ordered]@{ findings = [int]$evaluation.findings
-                                noOp = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
-                                    0 } else { [int]$evaluation.noOp }
-                                humanCovered = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
-                                    0 } else { [int]$evaluation.humanCovered }
-                                wouldCreate = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
-                                    [int]$evaluation.findings } else { [int]$evaluation.wouldCreate }
-                                unknown = [int]$evaluation.unknown }
-                            discussionDigest = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
-                                $null } else { [string]$evaluation.discussionDigest }
-                            findingOutcomes = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
-                                @() } else { @($evaluation.findingOutcomes) }
+                                noOp = $counts.noOp; humanCovered = $counts.humanCovered
+                                wouldCreate = $counts.wouldCreate
+                                unknown = $counts.unknown }
+                            discussionDigest = [string]$evaluation.discussionDigest
+                            findingOutcomes = $outcomes
+                            ownerProof = if ($rule.capabilityId -ceq 'bpm-test-ownership@1') {
+                                [ordered]@{
+                                    completed = $evaluation.completed
+                                    manifestDigest = $evaluation.manifestDigest
+                                    manifestEntryCount = $evaluation.manifestEntryCount
+                                    providerWrites = $evaluation.providerWrites
+                                    writeToolInvocations = $evaluation.writeToolInvocations
+                                    modelToolInvocations = $evaluation.modelToolInvocations
+                                    identity = $evaluation.durableProof.identity
+                                    stateDigest = $evaluation.durableProof.stateDigest
+                                    observationDigest = $evaluation.durableProof.observationDigest
+                                    recordFileDigest =
+                                        $evaluation.durableProof.recordFileDigest
+                                    manifestFileDigest =
+                                        $evaluation.durableProof.manifestFileDigest
+                                    acquisitionPayloadDigest =
+                                        $evaluation.durableProof.acquisitionPayloadDigest
+                                }
+                            } else { $null }
                             providerWrites = 0; modelToolInvocations = 0
                         }
                         $bytes = [Text.UTF8Encoding]::new($false).GetBytes(

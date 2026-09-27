@@ -229,6 +229,19 @@ export function verifyRuleObservation(
     if (createHash("sha256").update(bytes).digest("hex") !== digest) return false;
     const observation = jsonBytes(bytes);
     const outcome = record(observation.outcome);
+    if (rule.capabilityId === "bpm-test-ownership@1") {
+      const proof = record(observation.ownerProof);
+      if (proof.completed !== true || proof.providerWrites !== 0 ||
+          proof.writeToolInvocations !== 0 || proof.modelToolInvocations !== 0 ||
+          nonnegative(proof.manifestEntryCount) !== 1 ||
+          typeof proof.identity !== "string" ||
+          !/^[a-f0-9]{64}$/.test(proof.identity) ||
+          proof.stateDigest !== `v1:sha256:${proof.identity}` ||
+          ["manifestDigest", "observationDigest", "recordFileDigest",
+            "manifestFileDigest", "acquisitionPayloadDigest"].some((key) =>
+            typeof proof[key] !== "string" ||
+            !/^v1:sha256:[a-f0-9]{64}$/.test(proof[key]))) return false;
+    }
     const findingOutcomes = observation.findingOutcomes;
     const completed = utc(observation.completedUtc);
     if (observation.schemaVersion !== 1 || observation.kind !== "scheduled-rule-observation" ||
@@ -286,6 +299,21 @@ export function verifyRuleDeclaration(
       "bpm-redundant-method-coverage@1": "redundant-method-coverage",
       "bpm-named-areequal-arguments@1": "named-areequal-arguments",
     } as Record<string, string>)[rule.capabilityId];
+    if (rule.capabilityId === "bpm-test-ownership@1") {
+      const binding = record(declaration.ruleBinding);
+      const model = record(declaration.model);
+      if (typeof binding.ruleRepositoryId !== "string" ||
+          !/^[A-Za-z0-9._/-]{1,256}$/.test(binding.ruleRepositoryId) ||
+          binding.rulePath !== "documentation/EngineeringProcesses/Conventions/AutomatedTests.md" ||
+          binding.ruleSection !== "## Claim ownership" ||
+          binding.ruleCommit !== "f6db83436b48f48a8521095a888d79f67823bbb2" ||
+          binding.ruleHash !== "v1:sha256:bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f" ||
+          nonnegative(binding.ruleLength) < 1 || (binding.ruleLength as number) > 65_536 ||
+          typeof binding.capabilityDigest !== "string" ||
+          !/^v1:sha256:[a-f0-9]{64}$/.test(binding.capabilityDigest) ||
+          typeof model.id !== "string" || !/^[a-zA-Z0-9_.-]{1,128}$/.test(model.id) ||
+          model.digest !== `v1:sha256:${createHash("sha256").update(model.id).digest("hex")}`) return null;
+    }
     if (policy) {
       const binding = record(declaration.ruleBinding);
       if (typeof binding.ruleRepositoryId !== "string" ||

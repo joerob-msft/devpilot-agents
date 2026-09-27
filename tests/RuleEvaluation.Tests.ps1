@@ -3,6 +3,8 @@ BeforeAll {
     $repo = Split-Path $PSScriptRoot -Parent
     Import-Module (Join-Path $repo 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
     Import-Module (Join-Path $repo 'src\DevPilot.RuleEvaluation\DevPilot.RuleEvaluation.psd1') -Force
+    Import-Module (Join-Path $repo `
+        'src\DevPilot.ActiveOwnerEvaluation\DevPilot.ActiveOwnerEvaluation.psd1')
     Import-Module (Join-Path $repo 'src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
     Import-Module (Join-Path $repo 'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1')
     $script:roots = [Collections.Generic.List[string]]::new()
@@ -37,7 +39,25 @@ BeforeAll {
             ConvertFrom-Json -AsHashtable
         $config.enabled = $true
         if ($EnableCoverage) { $config.rules[1].enabled = $true }
-        if ($EnableOwner) { $config.rules[0].enabled = $true }
+        if ($EnableOwner) {
+            $config.rules[0].enabled = $true
+            $config.rules[0].binding = [ordered]@{
+                ruleRepositoryId = 'enghub-example'
+                rulePath = 'documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
+                ruleSection = '## Claim ownership'
+                ruleCommit = 'f6db83436b48f48a8521095a888d79f67823bbb2'
+                ruleHash = 'v1:sha256:bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f'
+                ruleLength = 100
+                capabilityDigest = 'v1:sha256:' + ('e' * 64)
+            }
+            $config.rules[0].model = [ordered]@{
+                id = 'gpt-5.6-sol'
+                digest = 'v1:sha256:' + ([Convert]::ToHexString(
+                        [Security.Cryptography.SHA256]::HashData(
+                            [Text.Encoding]::UTF8.GetBytes('gpt-5.6-sol'))
+                    )).ToLowerInvariant()
+            }
+        }
         if ($EnableRedundant) { $config.rules[2].enabled = $true }
         if ($EnableNamed) { $config.rules[3].enabled = $true }
         $policies = @('test-class-coverage', 'redundant-method-coverage',
@@ -156,7 +176,8 @@ BeforeAll {
         [IO.File]::WriteAllText(
             (Join-Path $intakeRoot "generations\$generation.json"), $json)
         $state = @{ calls = [Collections.Generic.List[string]]::new()
-            failHead = 0; drift = 0; visits = @{}; discussions = @()
+            failHead = 0; drift = 0; driftAfterVisit = 0
+            visits = @{}; discussions = @()
             declarations = $declarations; proofs = $proofs
             blockLatest = 0; lock = $null; changeLines = $lineCount }
         $provider = {
@@ -179,7 +200,9 @@ BeforeAll {
                     foreach ($key in $state.declarations[$id].Keys) {
                         $copy[$key] = $state.declarations[$id][$key]
                     }
-                    if ($state.drift -eq $id -and $state.visits[$id] -gt 1) {
+                    if (($state.drift -eq $id -and $state.visits[$id] -gt 1) -or
+                        ($state.driftAfterVisit -eq $id -and
+                            $state.visits[$id] -ge 4)) {
                         $copy.sourceCommit = 'd' * 40
                     }
                     return $copy
@@ -202,10 +225,10 @@ BeforeAll {
         return @{ config = $config; intakeConfig = $intakeConfig; provider = $provider
             state = $state; root = $root; intake = $intake }
     }
-    function Invoke-RuleCase($Case) {
+    function Invoke-RuleCase($Case, [scriptblock]$OwnerEvaluator) {
         Invoke-BoundedRuleEvaluation -Config $Case.config -IntakeConfig $Case.intakeConfig `
             -Provider $Case.provider -StateRoot $Case.root -RepositoryRoot $repo `
-            -SignatureKey 'synthetic-key' -Run
+            -SignatureKey 'synthetic-key' -OwnerEvaluator $OwnerEvaluator -Run
     }
     function Get-RuleCaseObservation($Case, $Result, [int]$RuleIndex = 1) {
         $digest = $Result.heads[0].rules[$RuleIndex].observationDigest
@@ -700,6 +723,131 @@ public class Example {
             Should -Be 'owner-evaluator-unavailable'
         $result.rules[0].evaluated | Should -Be 0
         $result.providerWrites | Should -Be 0
+    }
+    It 'requires a signed exact EngHub Owner section binding before reading ADO' {
+        $c = New-RuleCase -EnableOwner
+        $c.config.rules[0].binding.ruleCommit = 'a' * 40
+        Sign-TestConfig $c.config
+        { Invoke-RuleCase $c } | Should -Throw '*owner-rule-binding-unavailable*'
+        $c.state.calls.Count | Should -Be 0
+    }
+    It 'reports missing pinned Owner bytes explicitly without crediting a head' {
+        $c = New-RuleCase -EnableOwner
+        $owner = New-ActiveOwnerEvaluator -StateRoot $c.root `
+            -IntakeConfig $c.intakeConfig `
+            -ReviewerIdentity $c.intakeConfig.expectedAccount
+        $result = Invoke-RuleCase $c $owner
+        $result.rules[0].evaluated | Should -Be 0
+        $result.heads[0].rules[0].reasonCode |
+            Should -Be 'owner-rule-bytes-unavailable'
+        $result.providerWrites | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $c.root 'active-owner-evaluation-v1') |
+            Should -BeFalse
+    }
+    It 'preserves exact Owner per-finding outcomes despite unrelated human discussion' {
+        $c = New-RuleCase -EnableOwner
+        $c.state.discussions = @(New-RuleCaseThread $c 3 'Unrelated test discussion.')
+        $intakeGeneration = $c.intake.generation
+        $owner = {
+            param($head, $files, $discussion, $evidence, $generation,
+                $ruleConfig, $ruleDeclaration, $declarationDigest)
+            return @{ state = 'evaluated'; reason = 'completed'; findings = 2
+                unknown = 0; noOp = 1; humanCovered = 1; wouldCreate = 0
+                discussionDigest = 'd' * 64
+                findingOutcomes = @(
+                    @{ findingDigest = 'e' * 64; classification = 'noOp'
+                        reason = 'exact-marker' },
+                    @{ findingDigest = 'f' * 64; classification = 'humanCovered'
+                        reason = 'human-discussion' })
+                completed = $true; providerWrites = 0; writeToolInvocations = 0
+                modelToolInvocations = 0; manifestEntryCount = 1
+                manifestDigest = 'v1:sha256:' + ('a' * 64)
+                durableProof = @{
+                    identity = 'b' * 64
+                    stateDigest = 'v1:sha256:' + ('b' * 64)
+                    observationDigest = 'v1:sha256:' + ('c' * 64)
+                    recordFileDigest = 'v1:sha256:' + ('d' * 64)
+                    manifestFileDigest = 'v1:sha256:' + ('e' * 64)
+                    acquisitionPayloadDigest = 'v1:sha256:' + ('f' * 64)
+                }
+                intakeGeneration = $intakeGeneration
+                declarationDigest = $declarationDigest
+                sourceCommit = $head.sourceCommit; targetCommit = $head.targetCommit
+                targetRef = $head.targetRef; iterationId = $head.iterationId
+                ruleId = $ruleConfig.ruleId }
+        }.GetNewClosure()
+        $result = Invoke-RuleCase $c $owner
+        $result.rules[0].evaluated | Should -Be 1
+        $observation = Get-RuleCaseObservation $c $result 0
+        $observation.outcome | Should -Not -BeNullOrEmpty
+        $observation.outcome.findings | Should -Be 2
+        $observation.outcome.noOp | Should -Be 1
+        $observation.outcome.humanCovered | Should -Be 1
+        $observation.outcome.wouldCreate | Should -Be 0
+        $observation.findingOutcomes.Count | Should -Be 2
+        $c.state.calls[-1] | Should -Be 'Head:1'
+        @($c.state.calls | Where-Object { $_ -eq 'Discussions:1' }).Count |
+            Should -Be 2
+        $initialDiscussion = $c.state.discussions
+        $state = $c.state
+        $racing = {
+            param($head, $files, $discussion, $evidence, $generation,
+                $ruleConfig, $ruleDeclaration, $declarationDigest)
+            $state.discussions = @()
+            & $owner $head $files $discussion $evidence $generation `
+                $ruleConfig $ruleDeclaration $declarationDigest
+        }.GetNewClosure()
+        $race = Invoke-RuleCase $c $racing
+        $race.rules[0].evaluated | Should -Be 0
+        $race.heads[0].rules[0].reasonCode | Should -Be 'discussion-head-mismatch'
+        $race.providerWrites | Should -Be 0
+        $c.state.discussions = $initialDiscussion
+    }
+    It 'rejects duplicate Owner finding identities and post-model drift' {
+        $c = New-RuleCase -EnableOwner
+        $intakeGeneration = $c.intake.generation
+        $owner = {
+            param($head, $files, $discussion, $evidence, $generation,
+                $ruleConfig, $ruleDeclaration, $declarationDigest)
+            return @{ state = 'evaluated'; reason = 'completed'; findings = 2
+                noOp = 0; humanCovered = 0; wouldCreate = 2; unknown = 0
+                discussionDigest = 'd' * 64
+                findingOutcomes = @(
+                    @{ findingDigest = 'e' * 64; classification = 'wouldCreate'
+                        reason = 'reviewer-marker-not-found' },
+                    @{ findingDigest = 'e' * 64; classification = 'wouldCreate'
+                        reason = 'reviewer-marker-not-found' })
+                completed = $true; providerWrites = 0; writeToolInvocations = 0
+                modelToolInvocations = 0; manifestEntryCount = 1
+                manifestDigest = 'v1:sha256:' + ('a' * 64)
+                durableProof = @{
+                    identity = 'b' * 64
+                    stateDigest = 'v1:sha256:' + ('b' * 64)
+                    observationDigest = 'v1:sha256:' + ('c' * 64)
+                    recordFileDigest = 'v1:sha256:' + ('d' * 64)
+                    manifestFileDigest = 'v1:sha256:' + ('e' * 64)
+                    acquisitionPayloadDigest = 'v1:sha256:' + ('f' * 64)
+                }
+                intakeGeneration = $intakeGeneration
+                declarationDigest = $declarationDigest
+                sourceCommit = $head.sourceCommit; targetCommit = $head.targetCommit
+                targetRef = $head.targetRef; iterationId = $head.iterationId
+                ruleId = $ruleConfig.ruleId }
+        }.GetNewClosure()
+        $duplicate = Invoke-RuleCase $c $owner
+        $duplicate.heads[0].rules[0].reasonCode | Should -Be 'rule-ambiguous'
+        $duplicate.rules[0].evaluated | Should -Be 0
+        $c.state.drift = 1
+        $drift = Invoke-RuleCase $c $owner
+        $drift.rules[0].evaluated | Should -Be 0
+        $drift.heads[0].rules[0].reasonCode | Should -Be 'head-drift'
+        $drift.providerWrites | Should -Be 0
+        $c.state.drift = 0
+        $c.state.visits.Clear()
+        $c.state.driftAfterVisit = 1
+        $lastReadDrift = Invoke-RuleCase $c $owner
+        $lastReadDrift.rules[0].evaluated | Should -Be 0
+        $lastReadDrift.heads[0].rules[0].reasonCode | Should -Be 'head-drift'
     }
     It 'retains the cursor and immutable generation on a crash before persistence' {
         $c = New-RuleCase -Master 23 -EnableCoverage
