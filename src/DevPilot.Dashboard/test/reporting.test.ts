@@ -21,7 +21,13 @@ import {
 } from "../src/reporting-view.js";
 import { projectRuleRegistry } from "../src/rule-registry.js";
 import { parseIntakeCohort } from "../src/intake-report.js";
-import { parseRuleEvaluationCohort } from "../src/rule-evaluation-report.js";
+import {
+  parseRuleEvaluationCohort,
+  verifyRuleDeclaration,
+  verifyRuleObservation,
+  type EvaluationHead,
+  type RuleEvaluationSummary,
+} from "../src/rule-evaluation-report.js";
 
 type JsonRecord = Record<string, unknown>;
 const execFileAsync = promisify(execFile);
@@ -2560,4 +2566,95 @@ test("scheduled evaluation rejects unsupported totals, duplicate heads, unbound 
   assert.throws(() => parseReportingConfiguration({
     ...base, files: { ...base.files, ruleEvaluationCohort: resolve("cohort.json") },
   }), /configured together/);
+});
+
+test("Owner scheduled observations require exact pinned rule and completed no-write proof", () => {
+  const raw = syntheticIntake(1);
+  const intake = parseIntakeCohort(raw);
+  const source = intake.heads[0]!;
+  const intakeHead = { ...source, lineEvidence: {
+    changedFiles: 1, changedLines: 1, addedLines: 1, deletedLines: 0,
+    files: [{ pathDigest: "a".repeat(64), changeType: "add",
+      addedLines: 1, deletedLines: 0, spans: [{ startLine: 1, endLine: 1 }] }],
+    digest: "9".repeat(64),
+  } };
+  const head: EvaluationHead = {
+    pullRequestId: source.pullRequestId, sourceCommit: source.sourceCommit,
+    targetCommit: source.targetCommit, targetRef: source.targetRef,
+    iterationId: source.iterationId,
+    rules: [{ capabilityId: "bpm-test-ownership@1", ruleId: "mstest-owner",
+      status: "evaluated", reasonCode: "completed",
+      observationDigest: "a".repeat(64), declarationDigest: "b".repeat(64) }],
+  };
+  const rule = head.rules[0]!;
+  const summary: RuleEvaluationSummary = {
+    state: "complete", generation: "c".repeat(32),
+    intakeGeneration: intake.generation, observedUtc: "2026-09-24T21:01:00Z",
+    binding: { organization: intake.binding!.organization,
+      projectId: intake.binding!.projectId, repositoryId: intake.binding!.repositoryId,
+      configDigest: "d".repeat(64) },
+    discovered: 1, eligible: 1, excludedOtherTargets: 0, draftExcluded: 0,
+    heads: [head], rules: [], gaps: [],
+  };
+  const binding = {
+    ruleRepositoryId: "enghub-example",
+    rulePath: "documentation/EngineeringProcesses/Conventions/AutomatedTests.md",
+    ruleSection: "## Claim ownership",
+    ruleCommit: "f6db83436b48f48a8521095a888d79f67823bbb2",
+    ruleHash: "v1:sha256:bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f",
+    ruleLength: 100, capabilityDigest: `v1:sha256:${"e".repeat(64)}`,
+  };
+  const intakeDeclarationDigest = "8".repeat(64);
+  const declaration = {
+    schemaVersion: 1, kind: "scheduled-rule-declaration",
+    generation: summary.generation, intakeGeneration: summary.intakeGeneration,
+    pullRequestId: head.pullRequestId, sourceCommit: head.sourceCommit,
+    targetCommit: head.targetCommit, targetRef: head.targetRef,
+    iterationId: head.iterationId, intakeDeclarationDigest,
+    lineEvidenceDigest: intakeHead.lineEvidence.digest,
+    configDigest: summary.binding!.configDigest,
+    capabilityId: rule.capabilityId, ruleId: rule.ruleId,
+    maxFindingsPerHead: 8, writerEligible: false, ruleBinding: binding,
+    model: { id: "gpt-5.6-sol",
+      digest: `v1:sha256:${sha256Text("gpt-5.6-sol")}` },
+  };
+  const encoded = (value: unknown) => Buffer.from(JSON.stringify(value));
+  const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+  const declarationBytes = encoded(declaration);
+  assert.equal(verifyRuleDeclaration(declarationBytes, digest(declarationBytes),
+    summary, head, rule, intakeHead, intakeDeclarationDigest), 8);
+  const wrongRule = encoded({ ...declaration,
+    ruleBinding: { ...binding, ruleCommit: "f".repeat(40) } });
+  assert.equal(verifyRuleDeclaration(wrongRule, digest(wrongRule),
+    summary, head, rule, intakeHead, intakeDeclarationDigest), null);
+  const observation = {
+    schemaVersion: 1, kind: "scheduled-rule-observation",
+    generation: summary.generation, intakeGeneration: summary.intakeGeneration,
+    pullRequestId: head.pullRequestId, sourceCommit: head.sourceCommit,
+    targetCommit: head.targetCommit, targetRef: head.targetRef,
+    iterationId: head.iterationId, capabilityId: rule.capabilityId, ruleId: rule.ruleId,
+    declarationDigest: rule.declarationDigest,
+    completedUtc: "2026-09-24T21:00:20Z",
+    outcome: { findings: 1, noOp: 0, humanCovered: 1, wouldCreate: 0, unknown: 0 },
+    discussionDigest: "f".repeat(64),
+    findingOutcomes: [{ findingDigest: "e".repeat(64),
+      classification: "humanCovered", reason: "human-discussion" }],
+    ownerProof: { completed: true, manifestDigest: `v1:sha256:${"a".repeat(64)}`,
+      manifestEntryCount: 1, providerWrites: 0,
+      writeToolInvocations: 0, modelToolInvocations: 0,
+      identity: "b".repeat(64), stateDigest: `v1:sha256:${"b".repeat(64)}`,
+      observationDigest: `v1:sha256:${"c".repeat(64)}`,
+      recordFileDigest: `v1:sha256:${"d".repeat(64)}`,
+      manifestFileDigest: `v1:sha256:${"e".repeat(64)}`,
+      acquisitionPayloadDigest: `v1:sha256:${"f".repeat(64)}` },
+    providerWrites: 0, modelToolInvocations: 0,
+  };
+  const observationBytes = encoded(observation);
+  assert.equal(verifyRuleObservation(observationBytes, digest(observationBytes),
+    summary, head, rule, 8), true);
+  const noProof = encoded({ ...observation, ownerProof: undefined });
+  assert.equal(verifyRuleObservation(noProof, digest(noProof), summary, head, rule, 8), false);
+  const tools = encoded({ ...observation,
+    ownerProof: { ...observation.ownerProof, modelToolInvocations: 1 } });
+  assert.equal(verifyRuleObservation(tools, digest(tools), summary, head, rule, 8), false);
 });
