@@ -180,8 +180,9 @@ function Get-TestClassCoverageMarkerKey {
     )
 
     $request = $Contract.Request
-    if ([string]$request.CapabilityId -cne $script:TestClassCoverageCapability -or
-        [string]$request.RuleSection -cne $script:TestClassCoverageCapability) {
+    if ([string]$request.CapabilityId -cnotin @($script:TestClassCoverageCapability,
+            'bpm-test-class-coverage@2') -or
+        [string]$request.RuleSection -cne [string]$request.CapabilityId) {
         throw 'Coverage marker requires the independently bound test-class coverage rule.'
     }
     $anchor = Get-OwnerV2Member -Value $Finding -Name anchor
@@ -243,14 +244,19 @@ function Format-TestClassCoverageComment {
     $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
         ConvertTo-OwnerV1WriterPath -Path $request.RulePath
     )
+    $candidate = [string]$request.CapabilityId -ceq 'bpm-test-class-coverage@2'
+    $classKind = if ($candidate) { 'test-project' } else { 'MSTest' }
+    $authority = if ($candidate) {
+        'Reviewed unmerged candidate-only convention'
+    } else { 'User-approved convention' }
     return @(
         '**Test class coverage exclusion missing**'
         ''
-        "Changed MSTest class ``$symbol`` at ``$path`:$([int]$anchor.line)`` has no class-level ``ExcludeFromCodeCoverage`` attribute."
+        "Changed $classKind class ``$symbol`` at ``$path`:$([int]$anchor.line)`` has no class-level ``ExcludeFromCodeCoverage`` attribute."
         ''
         'Suggested fix: add `[ExcludeFromCodeCoverage]` to this test class.'
         ''
-        "User-approved convention: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+        "${authority}: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
         ''
         "<!-- ${script:TestClassCoverageMarkerPrefix}:$MarkerKey -->"
     ) -join "`n"
@@ -262,8 +268,9 @@ function Get-RedundantMethodCoverageMarkerKey {
         [Parameter(Mandatory)][Collections.IDictionary]$Finding
     )
     $request = $Contract.Request
-    if ([string]$request.CapabilityId -cne $script:RedundantMethodCoverageCapability -or
-        [string]$request.RuleSection -cne $script:RedundantMethodCoverageCapability) {
+    if ([string]$request.CapabilityId -cnotin @($script:RedundantMethodCoverageCapability,
+            'bpm-redundant-method-coverage@2') -or
+        [string]$request.RuleSection -cne [string]$request.CapabilityId) {
         throw 'Redundant method coverage requires its independently bound rule.'
     }
     $anchor = $Finding.anchor
@@ -340,8 +347,13 @@ function Format-RedundantMethodCoverageComment {
     }
     $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
         ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+    $candidate = [string]$request.CapabilityId -ceq 'bpm-redundant-method-coverage@2'
+    $classKind = if ($candidate) { 'test-project' } else { 'MSTest' }
+    $authority = if ($candidate) {
+        'Reviewed unmerged candidate-only convention'
+    } else { 'User-approved convention' }
     return @(
-        '**Redundant method-level coverage exclusions in one MSTest class**'
+        "**Redundant method-level coverage exclusions in one $classKind class**"
         ''
         "Class ``$symbol`` has $count changed method-level ``ExcludeFromCodeCoverage`` attribute(s), first anchored at ``$path`:$([int]$Finding.anchor.line)``. Its class-level exclusion already covers the entire class."
         ''
@@ -349,7 +361,7 @@ function Format-RedundantMethodCoverageComment {
         ''
         'Suggested fix: remove only these redundant method-level `[ExcludeFromCodeCoverage]` attributes; keep the class exclusion and all other method attributes.'
         ''
-        "User-approved convention: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+        "${authority}: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
         ''
         "<!-- ${script:RedundantMethodCoverageMarkerPrefix}:$MarkerKey -->"
     ) -join "`n"
@@ -508,9 +520,11 @@ function Resolve-OwnerV2DiscussionReconciliation {
         'unknown'
     }
     $capabilityId = [string](Get-OwnerV2Member -Value $Observation -Name capability)
-    $isRedundantMethod = $capabilityId -ceq $script:RedundantMethodCoverageCapability
+    $isRedundantMethod = $capabilityId -cin @($script:RedundantMethodCoverageCapability,
+        'bpm-redundant-method-coverage@2')
     $isNamedAreEqual = $capabilityId -ceq $script:NamedAreEqualCapability
-    $isCoverage = $capabilityId -ceq $script:TestClassCoverageCapability
+    $isCoverage = $capabilityId -cin @($script:TestClassCoverageCapability,
+        'bpm-test-class-coverage@2')
     $allMarkerPattern = if ($isNamedAreEqual) {
         '<!--\s*devpilot-named-areequal:v1:([0-9a-f]{64})\s*-->'
     }

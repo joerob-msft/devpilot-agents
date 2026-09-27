@@ -155,6 +155,7 @@ BeforeAll {
                 '1' = @{ changeEntries = @(); nextSkip = 0 }
             }
             items = @{}; trees = @{}; rootTreeId = $null
+            threadResponse = $null
             drift = $false; refDrift = $false; rawIdentityMismatch = $false
         }
         $fixturePath = Join-Path $case.root 'fixture.json'
@@ -240,7 +241,12 @@ switch ($resource) {
         }
         $answer = $fixture.trees[($id[0] -split '=', 2)[1]]
     }
-    pullRequestThreads { $answer = @{ value = @(); count = 0 } }
+    pullRequestThreads {
+        if ($skip.Count) { throw 'unsupported discussion pagination' }
+        $answer = if ($null -eq $fixture.threadResponse) {
+            @{ value = @(); count = 0 }
+        } else { $fixture.threadResponse }
+    }
     default { throw 'A write or unknown resource was attempted' }
 }
 $answer | ConvertTo-Json -Depth 20 -Compress
@@ -903,6 +909,51 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
                 Should -Throw 'byte-budget'
         }
         finally { Remove-Item Env:\ACTIVE_PR_INTAKE_TEST_LOG -ErrorAction SilentlyContinue }
+    }
+    It 'GETs the bounded complete thread response without unsupported pagination' {
+        $c = New-IntakeTransportCase
+        $c.case.config.limits.maxThreads = 250
+        $all = @(1..201 | ForEach-Object {
+                @{ id = $_; comments = @(); status = 'active' }
+            })
+        $c.fixture.threadResponse = @{ value = $all; count = 201 }
+        $c.fixture | ConvertTo-Json -Depth 20 |
+            Set-Content -LiteralPath $c.path -Encoding utf8
+        $env:ACTIVE_PR_INTAKE_FIXTURE = $c.path
+        $env:ACTIVE_PR_INTAKE_TEST_LOG = $c.log
+        try {
+            $transport = New-ActivePrAzureDevOpsProvider -Config $c.case.config `
+                -AzureCliPath $c.stub -RawGet (New-TestRawGet $c)
+            $pages = & $transport Discussions @{
+                pullRequestId = 1; iterationId = 1; timeoutMilliseconds = 30000
+            }
+            $pages.count | Should -Be 201
+            @($pages.threads).Count | Should -Be 201
+            $requests = @(Get-Content -LiteralPath $c.log | Where-Object {
+                    $_ -match '\|pullRequestThreads\|'
+                })
+            $requests.Count | Should -Be 1
+            $requests[0] | Should -Not -Match '\$skip=|\$top='
+            @($requests | Where-Object { $_ -notmatch '\|--http-method\|GET\|' }).Count |
+                Should -Be 0
+            $c.fixture.threadResponse.count = 200
+            $c.fixture | ConvertTo-Json -Depth 20 |
+                Set-Content -LiteralPath $c.path -Encoding utf8
+            { & $transport Discussions @{
+                    pullRequestId = 1; iterationId = 1; timeoutMilliseconds = 30000
+                } } | Should -Throw 'discussion-list-truncated'
+            $c.fixture.threadResponse.count = 201
+            $c.fixture.threadResponse.continuationToken = 'unexpected'
+            $c.fixture | ConvertTo-Json -Depth 20 |
+                Set-Content -LiteralPath $c.path -Encoding utf8
+            { & $transport Discussions @{
+                    pullRequestId = 1; iterationId = 1; timeoutMilliseconds = 30000
+                } } | Should -Throw 'discussion-list-truncated'
+        }
+        finally {
+            Remove-Item Env:\ACTIVE_PR_INTAKE_FIXTURE, Env:\ACTIVE_PR_INTAKE_TEST_LOG `
+                -ErrorAction SilentlyContinue
+        }
     }
     It 'sends bounded created-time keyset queries using GET and a fixed cutoff' {
         $c = New-IntakeCase -Count 1

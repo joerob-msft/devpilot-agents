@@ -2428,12 +2428,14 @@ function New-ActivePrAzureDevOpsProvider {
                 $id = [int]$Request.pullRequestId
                 $r = & $invoke 'git' 'pullRequestThreads' @(
                     "project=$project", "repositoryId=$repo", "pullRequestId=$id") @() $deadline
-                $threads = @($r.value)
-                if ($threads.Count -gt $maxThreads -or
-                    ($null -ne $r['count'] -and $r['count'] -ne $threads.Count)) {
+                if ($r['value'] -isnot [array] -or $null -eq $r['count'] -or
+                    $null -ne $r['continuationToken'] -or $null -ne $r['nextLink'] -or
+                    $r.value.Count -gt $maxThreads -or
+                    (& $parseNumber $r.count threadCount 0 $maxThreads) -ne
+                        $r.value.Count) {
                     throw 'discussion-list-truncated'
                 }
-                return @{ threads = $threads; count = $threads.Count }
+                return @{ threads = @($r.value); count = $r.value.Count }
             }
             default { throw 'unsupported-operation' }
         }

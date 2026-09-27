@@ -211,22 +211,43 @@ and four **distinct, disabled** source declarations. The class/redundant
 bindings remain **unmerged candidate-only**. This config has
 `enabled: false`, `writerEligible: false`, and `modelEnabled: false`; it is
 **not** accepted by the older `@1` dispatcher and must not be enabled or
-hand-signed to bypass the absent `@2` runner. Its output is
+hand-signed to bypass the independent `@2` runner. Its output is
 `signed-intake-not-evaluated`, with zero evaluated/humanCovered/wouldCreate
 and Owner unknown. The key and private source stay outside the repository
 and normal output. Do not run this against the private service until this
 PR and PR189/190 have green checks at their exact heads and the source PR
 head and blob are reconfirmed.
 
-A further dependent runner must verify this signed handoff and immutable
-generation, bind the `@2` rules only to complete current-head changed lines,
-the distinct verified candidate declarations and full project-ownership
-graph, independently bind the named syntactic rule, and leave Owner unknown
-without a separate no-tools/no-write model proof. It must reread current
-heads and complete discussion pages, reconcile exact finding markers versus
-unmarked human comments, and report fresh evaluated/unknown/humanCovered/
-wouldCreate per rule. Neither this signing layer nor the disabled registry
-can claim rule evaluation or authorize posting.
+`tools/Invoke-PrivateCanaryEvaluation.ps1 -StateRoot <private-external-root>`
+is default-off and does not open the root until `-Run` is specified. The
+root must be the ACL-private output of the signed-intake tool above, not a
+repository file or a new configuration. On `-Run`, the runner verifies the
+canonical unsigned HMAC, all five private input files, the unchanged
+immutable intake generation, exact selected heads and evidence digests,
+and the freshly verified four-source registry. It rechecks EngHub's live
+unmerged candidate head, commit and raw Git blob; it never promotes that
+candidate to merged policy. The selected active, non-draft master-target
+heads require current changed spans and complete source-commit-bound
+project-ownership evidence before either `@2` coverage parser can run.
+Named Assert uses its separate local policy binding. Owner is always
+`unknown`/not evaluated; this command never invokes a model.
+
+The GET-only provider requires the API's complete bounded all-threads
+response (the threads endpoint has no documented server-side pagination),
+rejecting count mismatches and unexpected continuation. The discussion
+adapter checks distinct threads/comments and splits the response into
+bounded local pages. For each selected head, the runner reconciles
+per-finding body/marker/anchor against the current discussion snapshot and
+then re-GETs discussions and the exact source/target/iteration before
+returning. Same-account unmarked comments can count as human coverage;
+outdated, duplicate, or foreign candidate markers remain unknown.
+The summary reports per-rule `evaluated`, `unknown`, `humanCovered`,
+`wouldCreate`, `pending`, and `skipped`, plus draft exclusions and the
+immutable intake generation. These are hypothetical, candidate-only
+read-only observations, **not** authority to write, vote, notify, mutate
+policy/tasks, or enable relation. Live private ADO execution remains
+gated on exact-head green CI for this PR and its parents and fresh
+source/head/identity verification; synthetic/local tests are the default.
 
 For the existing **private syntactic `@1` canary only**, use
 `tools/Invoke-ActivePrCanaryQualification.ps1` instead of hand-signing a

@@ -623,6 +623,17 @@ function Get-RuleEvaluation {
                     }).Count -gt 0
             })
         if ($unanchored.Count -gt 0) { $classification = 'unknown' }
+        if ($classification -ceq 'wouldCreate' -and
+            $Capability -cin @('bpm-test-class-coverage@2',
+                'bpm-redundant-method-coverage@2') -and
+            @($relevant | Where-Object {
+                    @($_.comments | Where-Object {
+                            [string]$_.body -cmatch
+                                '<!--\s*devpilot-(?:test-class-coverage|redundant-method-coverage):v1:[0-9a-f]{64}\s*-->'
+                        }).Count -gt 0
+                }).Count -gt 0) {
+            $classification = 'unknown'
+        }
         if ($classification -ceq 'wouldUpdate' -or
             ($classification -ceq 'wouldCreate' -and
                 ([string]$reconciliation.reason -cne 'reviewer-marker-not-found' -or
@@ -1251,4 +1262,38 @@ function Invoke-BoundedRuleEvaluation {
     finally { $lock.Dispose() }
 }
 
-Export-ModuleMember -Function Invoke-BoundedRuleEvaluation
+function Assert-BoundedCandidateIntake {
+    param([string]$StateRoot, [Collections.IDictionary]$Dispatcher,
+        [Collections.IDictionary]$IntakeConfig, [string]$RepositoryRoot)
+    $validation = @{
+        organization = $Dispatcher.organization
+        projectId = $Dispatcher.projectId
+        repositoryId = $Dispatcher.repositoryId
+        limits = @{ maxIntakeAgeMinutes = 15 }
+    }
+    return Assert-RuleIntake $StateRoot $validation $IntakeConfig $RepositoryRoot
+}
+
+function Invoke-BoundedCandidateParser {
+    param([Collections.IDictionary]$Dispatcher, [Collections.IDictionary]$Rule,
+        [Collections.IDictionary]$Head, [object[]]$Files,
+        [Collections.IDictionary]$Discussions, [Collections.IDictionary]$IntakeConfig,
+        [int]$MaximumFindings)
+    $contract = New-OwnerAcquisitionContract `
+        -RepositoryId $Head.repositoryId -ProjectId $Head.projectId `
+        -PullRequestId $Head.pullRequestId -SourceCommit $Head.sourceCommit `
+        -TargetCommit $Head.targetCommit -TargetRef $Head.targetRef `
+        -RuleRepositoryId $Rule.repositoryId -RulePath $Rule.path `
+        -RuleCommit $Rule.commit -RuleSection $Rule.section `
+        -RuleHash $Rule.hash -RuleLength $Rule.length `
+        -ConfigId 'private-canary-signed-intake-v1' `
+        -ConfigDigest ('v1:sha256:' + (Get-RuleTextDigest (
+                    ConvertTo-AgentCanonicalJson -InputObject $Dispatcher))) `
+        -CapabilityId $Rule.id -CapabilityDigest $Rule.declarationDigest
+    $snapshot = Get-ActivePrDiscussionSnapshot $Discussions $IntakeConfig $Head $contract
+    return Get-RuleEvaluation $Rule.id $Files $MaximumFindings $contract `
+        $snapshot $Head.repositoryId $Head.sourceCommit
+}
+
+Export-ModuleMember -Function Invoke-BoundedRuleEvaluation,
+    Assert-BoundedCandidateIntake, Invoke-BoundedCandidateParser
