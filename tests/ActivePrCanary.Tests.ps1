@@ -16,14 +16,31 @@ Outside both sections.
     $script:originalOwnerHash = & (Get-Module DevPilot.ActivePrCanary) {
         $script:OwnerHash
     }
+    $script:originalNamedHash = & (Get-Module DevPilot.ActivePrCanary) {
+        $script:NamedSectionHash
+    }
+    $script:originalNamedLength = & (Get-Module DevPilot.ActivePrCanary) {
+        $script:NamedSectionLength
+    }
     $hash = & (Get-Module DevPilot.ActivePrCanary) {
         param($Document)
         Get-CanaryTextHash (Get-CanarySection $Document '## Claim ownership')
     } $script:document
+    $namedHash = & (Get-Module DevPilot.ActivePrCanary) {
+        param($Document)
+        Get-CanaryTextHash (Get-CanaryRawSection $Document '## Named parameters for Assert')
+    } $script:document
+    $namedLength = & (Get-Module DevPilot.ActivePrCanary) {
+        param($Document)
+        [Text.Encoding]::UTF8.GetByteCount(
+            (Get-CanaryRawSection $Document '## Named parameters for Assert'))
+    } $script:document
     & (Get-Module DevPilot.ActivePrCanary) {
-        param($Digest)
-        $script:OwnerHash = $Digest
-    } $hash
+        param($OwnerDigest, $NamedDigest, $Length)
+        $script:OwnerHash = $OwnerDigest
+        $script:NamedSectionHash = $NamedDigest
+        $script:NamedSectionLength = $Length
+    } $hash $namedHash $namedLength
     function New-CanaryCase {
         param([int]$Count = 350, [int]$Selected = 2)
         $root = Join-Path $env:USERPROFILE (
@@ -85,8 +102,7 @@ Outside both sections.
             )
             drift = 0; driftAfterEvaluation = 0; discussionDrift = 0
             omitPage = $false; omitEvidence = $false
-            headVisits = @{}; discussionVisits = @{} }
-        $document = $script:document
+            headVisits = @{}; discussionVisits = @{}; document = $script:document }
         $repositoryRoot = $repo
         $provider = {
             param($op, $request)
@@ -166,7 +182,7 @@ Outside both sections.
                 }
                 RuleSource {
                     $text = if ($request.path -ceq $owner.path) {
-                        $document
+                        $state.document
                     } else {
                         [IO.File]::ReadAllText((Join-Path $repositoryRoot (
                                     $request.path.TrimStart('/') -replace '/', '\')))
@@ -260,9 +276,11 @@ $response | ConvertTo-Json -Depth 8 -Compress
 }
 AfterAll {
     & (Get-Module DevPilot.ActivePrCanary) {
-        param($Digest)
-        $script:OwnerHash = $Digest
-    } $script:originalOwnerHash
+        param($OwnerDigest, $NamedDigest, $Length)
+        $script:OwnerHash = $OwnerDigest
+        $script:NamedSectionHash = $NamedDigest
+        $script:NamedSectionLength = $Length
+    } $script:originalOwnerHash $script:originalNamedHash $script:originalNamedLength
     foreach ($root in $script:roots) {
         if (Test-Path -LiteralPath $root) {
             Remove-Item -LiteralPath $root -Recurse -Force
@@ -428,6 +446,13 @@ Describe 'Explicit signed read-only canary qualification' {
         $c.sources.namedSection.approved = $false
         { Invoke-CanaryCase $c } | Should -Throw '*rule-source-not-approved*'
         $c.state.calls.Count | Should -Be 0
+    }
+    It 'rejects changed named-section bytes independently of the Owner section' {
+        $c = New-CanaryCase
+        $c.state.document = $c.state.document.Replace(
+            'Name the arguments for readability.', 'Reverse the arguments.')
+        { Invoke-CanaryCase $c } | Should -Throw '*named-rule-digest-mismatch*'
+        (Test-Path (Join-Path $c.root 'signature.key')) | Should -BeFalse
     }
     It 'defaults off without provider reads or private state' {
         $c = New-CanaryCase
