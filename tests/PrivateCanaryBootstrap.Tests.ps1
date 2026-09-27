@@ -2,7 +2,11 @@
 BeforeAll {
     $repo = Split-Path $PSScriptRoot -Parent
     Import-Module (Join-Path $repo 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
+    Import-Module (Join-Path $repo 'src\OwnerObservationContract\OwnerObservationContract.psd1')
+    Import-Module (Join-Path $repo 'src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
+    Import-Module (Join-Path $repo 'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1')
     Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.ActivePrCanary.psm1') -Force
+    Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.PrivateCanaryRunner.psd1') -Force
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -196,6 +200,7 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             -Read $InputCase.case.provider -Run
     }
     function Get-SignedIntakeCase {
+        param([switch]$Code)
         $inputCase = Get-RegistryCase
         $root = $inputCase.case.root + '-signed'
         $script:roots.Add($root)
@@ -203,6 +208,8 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             calls = [Collections.Generic.List[string]]::new()
             wrong = ''
             visits = 0
+            threads = @()
+            discussionVisits = 0
             cutoff = $null
             rows = @(
                 @{ pullRequestId = 17007699; status = 'active'
@@ -220,9 +227,24 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             )
         }
         $config = $inputCase.config
+        $path = if ($Code) { '/Tests/Example.cs' } else { '/notes.txt' }
+        $content = if ($Code) {
+            "using Microsoft.VisualStudio.TestTools.UnitTesting;`n[TestClass]`nclass Example {}`n"
+        }
+        else { 'synthetic' }
+        $bytes = [Text.Encoding]::UTF8.GetBytes($content)
+        $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+        $objectId = [Convert]::ToHexString([Security.Cryptography.SHA1]::HashData(
+                [byte[]]($header + $bytes))).ToLowerInvariant()
         $digest = [Convert]::ToHexString(
             [Security.Cryptography.SHA256]::HashData(
-                [Text.Encoding]::UTF8.GetBytes('"/notes.txt"'))).ToLowerInvariant()
+                [Text.Encoding]::UTF8.GetBytes(
+                    (ConvertTo-Json $path -Compress)))).ToLowerInvariant()
+        $state.path = $path
+        $state.content = $content
+        $state.objectId = $objectId
+        $state.lines = if ($Code) { 3 } else { 1 }
+        $state.code = [bool]$Code
         $provider = {
             param($op, $request)
             $state.calls.Add($op) | Out-Null
@@ -272,15 +294,56 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
                     if ($state.wrong -eq 'provider-drift') {
                         $config.expectedAccount.uniqueName = 'other@example.invalid'
                     }
-                    return @{ changedFiles = 1; changedLines = 1
+                    $graph = if ($state.code) {
+                        @{
+                            schemaVersion = 1
+                            kind = 'source-bound-evaluated-project-graph-v1'
+                            repositoryId = $config.repository.id
+                            sourceCommit = $request.sourceCommit
+                            path = $state.path
+                            objectId = $state.objectId
+                            complete = $true
+                            projects = @(@{
+                                    path = '/Tests/Tests.csproj'
+                                    objectId = 'e' * 40
+                                    compileIncluded = $true
+                                    isTestProject = $true
+                                })
+                        }
+                    } else { $null }
+                    if ($graph -and $state.wrong -eq 'mixed-project') {
+                        $graph.projects += @{
+                            path = '/Product/Product.csproj'
+                            objectId = 'a' * 40
+                            compileIncluded = $true
+                            isTestProject = $false
+                        }
+                    }
+                    $file = @{ path = $state.path
+                        content = if ($state.wrong -eq 'blob-content') {
+                            $state.content + 'tampered'
+                        } else { $state.content }
+                        objectId = $state.objectId }
+                    if ($graph) { $file.projectEvidence = $graph }
+                    $receipt = @()
+                    if ($graph) {
+                        $receipt = @(@{ pathDigest = $digest
+                                objectId = $state.objectId
+                                status = 'complete'
+                                attestationDigest = [Convert]::ToHexString(
+                                    [Security.Cryptography.SHA256]::HashData(
+                                        [Text.Encoding]::UTF8.GetBytes(
+                                            (ConvertTo-Json $graph -Depth 32 -Compress))
+                                    )).ToLowerInvariant() })
+                    }
+                    return @{ changedFiles = 1; changedLines = $state.lines
                         baseCommit = $request.commonCommit
                         files = @(@{ pathDigest = $digest
-                                originalPathDigest = $null
-                                changeType = 'add'; addedLines = 1
-                                deletedLines = 0; newLineCount = 1
-                                spans = @(@{ startLine = 1; endLine = 1 }) })
-                        evaluationFiles = @(@{ path = '/notes.txt'
-                                content = 'synthetic'; objectId = 'd' * 40 })
+                                originalPathDigest = $null; changeType = 'add'
+                                addedLines = $state.lines; deletedLines = 0
+                                newLineCount = $state.lines
+                                spans = @(@{ startLine = 1; endLine = $state.lines }) })
+                        evaluationFiles = @($file)
                         projectEvidence = @{
                             schemaVersion = 1
                             kind = 'source-bound-project-scope-summary-v1'
@@ -288,11 +351,19 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
                             sourceCommit = if ($state.wrong -eq 'fake-graph') {
                                 'f' * 40
                             } else { $request.sourceCommit }
-                            rootTreeId = $null; complete = $true
-                            files = @()
+                            rootTreeId = if ($state.code) { 'f' * 40 } else { $null }
+                            complete = $true; files = $receipt
                         } }
                 }
-                Discussions { return @{ threads = @(); count = 0 } }
+                Discussions {
+                    $state.discussionVisits++
+                    $threads = @($state.threads)
+                    if ($state.wrong -eq 'discussion-drift' -and
+                        $state.discussionVisits -gt 1) {
+                        $threads = @()
+                    }
+                    return @{ threads = $threads; count = $threads.Count }
+                }
                 default { throw 'unexpected or writing provider operation' }
             }
         }.GetNewClosure()
@@ -315,6 +386,102 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             -RepositoryRoot $repo -CanaryPullRequestIds @(17007699, 17109075) `
             -Read $Case.read -Provider $Case.provider -Run
     }
+    function Invoke-RunnerCase($Case) {
+        Invoke-PrivateCanaryEvaluation -StateRoot $Case.root `
+            -RepositoryRoot $repo -Read $Case.read -Provider $Case.provider -Run
+    }
+    function New-RunnerThread($Case, [int]$Id, [string]$Body,
+        [switch]$Outdated) {
+        return @{
+            id = $Id; status = 'active'
+            comments = @(@{ id = 1; author = $Case.input.config.expectedAccount
+                    commentType = 'text'; content = $Body })
+            threadContext = @{ filePath = $Case.state.path
+                rightFileStart = @{ line = 3 }; rightFileEnd = @{ line = 3 } }
+            pullRequestThreadContext = @{
+                changeTrackingId = 1
+                iterationContext = @{
+                    firstComparingIteration = if ($Outdated) { 0 } else { 1 }
+                    secondComparingIteration = if ($Outdated) { 0 } else { 1 }
+                }
+            }
+        }
+    }
+    function Get-RunnerClassMarkerBody($Case) {
+                $config = Get-Content -LiteralPath (
+                    Join-Path $Case.root 'canary-dispatcher.json') -Raw |
+                    ConvertFrom-Json -AsHashtable -Depth 32
+                $sources = Get-Content -LiteralPath (
+                    Join-Path $Case.root 'approved-sources.json') -Raw |
+                    ConvertFrom-Json -AsHashtable -Depth 32
+                $cohort = Get-Content -LiteralPath (
+                    Join-Path $Case.root 'active-pr-intake-v1\cohort.json') -Raw |
+                    ConvertFrom-Json -AsHashtable -Depth 32
+                $head = $cohort.heads[0].declaration
+                $ruleId = 'bpm-test-class-coverage@2'
+                $source = $sources.rules[$ruleId]
+                $rule = @($config.rules | Where-Object capabilityId -CEQ $ruleId)[0]
+                $changes = & $Case.provider Changes @{
+                    pullRequestId = $head.pullRequestId
+                    sourceCommit = $head.sourceCommit; commonCommit = $head.commonCommit
+                }
+                $graph = $changes.evaluationFiles[0].projectEvidence
+                $digest = Get-BootstrapHash ([Text.Encoding]::UTF8.GetBytes(
+                        (ConvertTo-Json -InputObject $graph -Depth 32 -Compress)))
+                $identity = @($ruleId, $Case.state.path, 'Example', 3, 3, $digest)
+                $constructRef = 'construct:' + (Get-BootstrapHash (
+                        [Text.Encoding]::UTF8.GetBytes(
+                            (ConvertTo-Json -InputObject $identity -Depth 32 -Compress))))
+                $finding = @{
+                    disposition = 'violation'; constructRef = $constructRef
+                    anchor = @{ path = 'Tests/Example.cs'; line = 3; symbol = 'Example' }
+                    binding = (New-OwnerCanonicalAnchor -Path 'Tests/Example.cs' `
+                            -StartLine 3 -Symbol 'Example' -ConstructIdentity $constructRef)
+                }
+                $contract = New-OwnerAcquisitionContract `
+                    -RepositoryId $head.repositoryId -ProjectId $head.projectId `
+                    -PullRequestId $head.pullRequestId -SourceCommit $head.sourceCommit `
+                    -TargetCommit $head.targetCommit -TargetRef $head.targetRef `
+                    -RuleRepositoryId $source.repositoryId `
+                    -RulePath $source.path.TrimStart('/') -RuleCommit $source.commit `
+                    -RuleSection $ruleId -RuleHash $rule.sourceHash -RuleLength 16286 `
+                    -ConfigId 'private-canary-signed-intake-v1' `
+                    -ConfigDigest ('v1:sha256:' + (Get-BootstrapHash (
+                                [Text.Encoding]::UTF8.GetBytes(
+                                    (ConvertTo-AgentCanonicalJson $config))))) `
+                    -CapabilityId $ruleId -CapabilityDigest $rule.declarationDigest
+                $marker = Get-TestClassCoverageMarkerKey $contract $finding
+                return Format-TestClassCoverageComment $contract $finding $marker
+    }
+    function Set-RunnerFile($Case, [string]$Name, [scriptblock]$Mutate) {
+        $path = Join-Path $Case.root $Name
+        $document = Get-Content -LiteralPath $path -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        & $Mutate $document
+        [IO.File]::WriteAllText($path, (ConvertTo-Json $document -Depth 32))
+    }
+    function Sign-RunnerConfig($Case, [scriptblock]$Mutate) {
+        $path = Join-Path $Case.root 'canary-dispatcher.json'
+        $document = Get-Content -LiteralPath $path -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        & $Mutate $document
+        $key = Get-Content -LiteralPath (Join-Path $Case.root 'signature.key') -Raw
+        $unsigned = [ordered]@{}
+        foreach ($name in $document.Keys) {
+            if ($name -cne 'signature') { $unsigned[$name] = $document[$name] }
+        }
+        $hmac = [Security.Cryptography.HMACSHA256]::new(
+            [Text.Encoding]::UTF8.GetBytes($key))
+        try {
+            $document.signature = 'v1:hmac-sha256:' +
+                [Convert]::ToHexString($hmac.ComputeHash(
+                        [Text.Encoding]::UTF8.GetBytes(
+                            (ConvertTo-AgentCanonicalJson $unsigned))
+                    )).ToLowerInvariant()
+        }
+        finally { $hmac.Dispose() }
+        [IO.File]::WriteAllText($path, (ConvertTo-Json $document -Depth 32))
+    }
 }
 AfterAll {
     & (Get-Module DevPilot.ActivePrCanary) {
@@ -332,6 +499,192 @@ AfterAll {
     }
 }
 Describe 'Read-only private canary input bootstrap' {
+    Describe 'Signed GET-only candidate evaluation runner' {
+        It 'remains disabled without opening even a nonexistent private root' {
+            $c = Get-SignedIntakeCase
+            $result = Invoke-PrivateCanaryEvaluation -StateRoot $c.root `
+                -RepositoryRoot $repo -Read $c.read -Provider $c.provider
+            $result.state | Should -Be 'disabled'
+            $result.providerReads | Should -Be 0
+            $result.providerWrites | Should -Be 0
+            $c.state.calls.Count | Should -Be 0
+            Test-Path $c.root | Should -BeFalse
+        }
+        It 'evaluates the exact generation syntactically and leaves Owner unknown' {
+            $c = Get-SignedIntakeCase
+            [void](Invoke-SignedIntakeCase $c)
+            $c.state.calls.Clear()
+            $result = Invoke-RunnerCase $c
+            $result.state | Should -Be 'candidate-only-read-only'
+            $result.selected | Should -Be 2
+            $result.draft | Should -Be 1
+            $result.skipped | Should -Be 1
+            $result.pending | Should -Be 0
+            $result.providerWrites | Should -Be 0
+            $result.modelToolInvocations | Should -Be 0
+            $result.writerEligible | Should -BeFalse
+            $result.rules[0].unknown | Should -Be 2
+            @($result.rules | Select-Object -Skip 1 |
+                Where-Object evaluated -NE 2).Count | Should -Be 0
+            @($c.state.calls | Where-Object {
+                    $_ -notin @('Identity', 'Head', 'Changes', 'Discussions')
+                }).Count | Should -Be 0
+            @($c.state.calls | Where-Object { $_ -eq 'Discussions' }).Count |
+                Should -Be 4
+            ($result | ConvertTo-Json -Depth 16) |
+                Should -Not -Match 'signature|synthetic|service@example.invalid'
+        }
+        It 'binds the distinct coverage candidates to complete changed C# graph evidence' {
+            $c = Get-SignedIntakeCase -Code
+            [void](Invoke-SignedIntakeCase $c)
+            $result = Invoke-RunnerCase $c
+            $result.rules[0].unknown | Should -Be 2
+            $result.rules[1].evaluated | Should -Be 2
+            $result.rules[1].wouldCreate | Should -Be 2
+            $result.rules[2].evaluated | Should -Be 2
+            $result.rules[3].evaluated | Should -Be 2
+            $result.providerWrites | Should -Be 0
+            $result.writerEligible | Should -BeFalse
+        }
+        It 'rejects forged signature, receipt, generation, head, commit and graph' {
+            foreach ($failure in @('signature', 'receipt', 'generation',
+                    'config', 'head', 'commit', 'graph', 'principal')) {
+                $c = Get-SignedIntakeCase
+                [void](Invoke-SignedIntakeCase $c)
+                $c.state.calls.Clear()
+                switch ($failure) {
+                    signature {
+                        Set-RunnerFile $c 'canary-dispatcher.json' {
+                            param($value)
+                            $value.rules[1].declarationDigest = 'v1:sha256:' + 'f' * 64
+                        }
+                    }
+                    receipt {
+                        Set-RunnerFile $c 'approved-sources.json' {
+                            param($value)
+                            $value.rules['bpm-test-class-coverage@2'].blobId = 'f' * 40
+                        }
+                    }
+                    generation {
+                        $path = Join-Path $c.root 'active-pr-intake-v1\cohort.json'
+                        $value = Get-Content $path -Raw |
+                            ConvertFrom-Json -AsHashtable -Depth 32
+                        $value.inventory.draft = 0
+                        [IO.File]::WriteAllText($path, (ConvertTo-Json $value -Depth 32))
+                    }
+                    config {
+                        Sign-RunnerConfig $c {
+                            param($value)
+                            $value.heads[0].sourceCommit = 'f' * 40
+                        }
+                    }
+                    head { $c.state.wrong = 'stale-head' }
+                    commit { $c.input.case.state.wrong = 'commit' }
+                    graph { $c.state.wrong = 'fake-graph' }
+                    principal { $c.input.case.state.wrong = 'principal' }
+                }
+                { Invoke-RunnerCase $c } | Should -Throw -Because $failure
+                @($c.state.calls | Where-Object {
+                        $_ -notin @('Identity', 'Head', 'Changes', 'Discussions')
+                    }).Count | Should -Be 0
+            }
+        }
+        It 'rejects altered source blob and mixed project ownership after signing' {
+            foreach ($failure in @('blob-content', 'mixed-project')) {
+                $c = Get-SignedIntakeCase -Code
+                [void](Invoke-SignedIntakeCase $c)
+                $c.state.wrong = $failure
+                { Invoke-RunnerCase $c } | Should -Throw -Because $failure
+                @($c.state.calls | Where-Object {
+                        $_ -notin @('Identity', 'ListPage', 'Head',
+                            'Changes', 'Discussions')
+                    }).Count | Should -Be 0
+            }
+        }
+        It 'counts same-account unmarked comments as human, not automation' {
+                $c = Get-SignedIntakeCase -Code
+                [void](Invoke-SignedIntakeCase $c)
+                $c.state.threads = @(New-RunnerThread $c 1 'Exclude from code coverage.')
+                $result = Invoke-RunnerCase $c
+                $result.rules[1].humanCovered | Should -Be 2
+                $result.rules[1].wouldCreate | Should -Be 0
+                $result.providerWrites | Should -Be 0
+            }
+        It 'treats duplicate nearby comments and concurrent discussion edits as unknown' {
+                $c = Get-SignedIntakeCase -Code
+                [void](Invoke-SignedIntakeCase $c)
+                $c.state.threads = @(
+                    (New-RunnerThread $c 1 'Exclude from code coverage.'),
+                    (New-RunnerThread $c 2 'Exclude from code coverage.')
+                )
+                $ambiguous = Invoke-RunnerCase $c
+                $ambiguous.rules[1].unknown | Should -Be 2
+                $ambiguous.rules[1].humanCovered | Should -Be 0
+                $ambiguous.rules[1].wouldCreate | Should -Be 0
+                $c.state.threads = @(New-RunnerThread $c 1 'Exclude from code coverage.')
+                $c.state.discussionVisits = 0
+                $c.state.wrong = 'discussion-drift'
+                { Invoke-RunnerCase $c } | Should -Throw '*canary-discussion-drift*'
+        }
+        It 'keeps colliding exact current-generation reviewer markers unknown' {
+            $c = Get-SignedIntakeCase -Code
+            [void](Invoke-SignedIntakeCase $c)
+            $body = Get-RunnerClassMarkerBody $c
+            $body | Should -Match 'unmerged candidate-only convention'
+            $body | Should -Not -Match 'User-approved convention'
+            $c.state.threads = @(New-RunnerThread $c 1 $body)
+            $single = Invoke-RunnerCase $c
+            $single.heads[0].rules[1].status | Should -Be 'evaluated'
+            $single.heads[0].rules[1].wouldCreate | Should -Be 0
+            $c.state.threads = @(
+                (New-RunnerThread $c 1 $body),
+                (New-RunnerThread $c 2 $body)
+            )
+            $result = Invoke-RunnerCase $c
+            $result.rules[1].evaluated | Should -Be 0
+            $result.rules[1].unknown | Should -Be 2
+            $result.rules[1].wouldCreate | Should -Be 0
+            $result.providerWrites | Should -Be 0
+        }
+        It 'does not count an outdated marker as current coverage' {
+            $c = Get-SignedIntakeCase -Code
+            [void](Invoke-SignedIntakeCase $c)
+            $body = Get-RunnerClassMarkerBody $c
+            $c.state.threads = @(New-RunnerThread $c 1 $body -Outdated)
+            $result = Invoke-RunnerCase $c
+            $result.heads[0].rules[1].status | Should -Be 'unknown'
+            $result.heads[0].rules[1].wouldCreate | Should -Be 0
+            $result.providerWrites | Should -Be 0
+        }
+        It 'rejects state under or containing the repository before contacting ADO' {
+            $c = Get-SignedIntakeCase
+            { Invoke-PrivateCanaryEvaluation -StateRoot $repo `
+                    -RepositoryRoot $repo -Read $c.read -Provider $c.provider -Run } |
+                Should -Throw '*external*'
+            $c.state.calls.Count | Should -Be 0
+        }
+        It 'rejects a formerly private input with newly permissive ACL before reads' {
+            $c = Get-SignedIntakeCase
+            [void](Invoke-SignedIntakeCase $c)
+            $c.state.calls.Clear()
+            $file = Join-Path $c.root 'canary-dispatcher.json'
+            if ($IsWindows) {
+                $acl = Get-Acl -LiteralPath $file
+                $everyone = [Security.Principal.SecurityIdentifier]::new(
+                    [Security.Principal.WellKnownSidType]::WorldSid, $null)
+                $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                        $everyone, [Security.AccessControl.FileSystemRights]::Read,
+                        [Security.AccessControl.AccessControlType]::Allow))
+                Set-Acl -LiteralPath $file -AclObject $acl
+            } else {
+                [IO.File]::SetUnixFileMode($file,
+                    ([IO.File]::GetUnixFileMode($file) -bor
+                        [IO.UnixFileMode]::OtherRead))
+            }
+            { Invoke-RunnerCase $c } | Should -Throw
+            $c.state.calls.Count | Should -Be 0
+        }
+    }
     It 'defaults off with zero reads, writes, or private state' {
         $c = Get-BootstrapCase
         $result = Invoke-PrivateCanaryBootstrap -Organization 'example-org' `
