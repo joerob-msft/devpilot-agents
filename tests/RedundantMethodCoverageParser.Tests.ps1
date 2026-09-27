@@ -139,4 +139,61 @@ class Tests {
         $unknown.Count | Should -Be 1
         $unknown[0].recognized | Should -BeFalse
     }
+
+    It 'groups changed helper methods without MSTest attributes only in the all-class scope' {
+        $source = @'
+using System.Diagnostics.CodeAnalysis;
+[ExcludeFromCodeCoverage]
+class Fixture {
+    [ExcludeFromCodeCoverage]
+    void Setup() {}
+    [ExcludeFromCodeCoverage]
+    void TearDown() {}
+    [ExcludeFromCodeCoverage]
+    class Nested {
+        [ExcludeFromCodeCoverage]
+        void Prepare() {}
+    }
+}
+'@
+        $spans = @(
+            @{ startLine = 4; endLine = 4; state = 'complete' },
+            @{ startLine = 6; endLine = 6; state = 'complete' },
+            @{ startLine = 10; endLine = 10; state = 'complete' }
+        )
+        @(Get-RedundantMethodCoverageConstructs -Content $source `
+                -Path '/Fixture.cs' -Spans $spans).Count | Should -Be 0
+        $results = @(Get-RedundantMethodCoverageConstructs -Content $source `
+                -Path '/Fixture.cs' -Spans $spans -AllTestProjectClasses)
+        $results.Count | Should -Be 2
+        $fixture = @($results | Where-Object name -CEQ 'Fixture')[0]
+        $fixture.recognized | Should -BeTrue
+        $fixture.affectedMethodCount | Should -Be 2
+        $fixture.affectedAttributeLines | Should -Be @(4, 6)
+        $fixture.startLine | Should -Be 4
+        $nested = @($results | Where-Object name -CEQ 'Fixture.Nested')[0]
+        $nested.recognized | Should -BeTrue
+        $nested.affectedMethodCount | Should -Be 1
+        $nested.startLine | Should -Be 10
+    }
+
+    It 'keeps a partial helper or a changed method body non-actionable' {
+        $source = @'
+using System.Diagnostics.CodeAnalysis;
+[ExcludeFromCodeCoverage]
+partial class Fixture {
+    [ExcludeFromCodeCoverage]
+    void Setup() {}
+}
+'@
+        $changed = @(Get-RedundantMethodCoverageConstructs -Content $source `
+                -Path '/Fixture.cs' -AllTestProjectClasses `
+                -Spans @(@{ startLine = 4; endLine = 4; state = 'complete' }))
+        $changed.Count | Should -Be 1
+        $changed[0].recognized | Should -BeFalse
+        @(Get-RedundantMethodCoverageConstructs -Content $source `
+                -Path '/Fixture.cs' -AllTestProjectClasses `
+                -Spans @(@{ startLine = 5; endLine = 5; state = 'complete' })).Count |
+            Should -Be 0
+    }
 }

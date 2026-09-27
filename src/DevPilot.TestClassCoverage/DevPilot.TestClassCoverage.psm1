@@ -241,7 +241,8 @@ function Get-TestClassCoverageConstructs {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Spans,
         [Parameter(Mandatory)][string]$Path,
         [switch]$IncludeUnchanged,
-        [switch]$IncludeResolutionContext
+        [switch]$IncludeResolutionContext,
+        [switch]$AllTestProjectClasses
     )
 
     if ([Text.Encoding]::UTF8.GetByteCount($Content) -ge 16MB -or $Spans.Count -gt 4096 -or
@@ -441,9 +442,10 @@ function Get-TestClassCoverageConstructs {
                 elseif ($excludeResult -eq 'unknown' -and $excludeState -ne 'yes') { $excludeState = 'unknown' }
             }
         }
-        if ($testState -eq 'other') { continue }
+        if (-not $AllTestProjectClasses -and $testState -eq 'other') { continue }
         $recognized = $entry.kind -eq 'class' -and $entry.valid -and
-            $testState -eq 'yes' -and $excludeState -ne 'unknown' -and
+            ($AllTestProjectClasses -or $testState -eq 'yes') -and
+            $testState -ne 'unknown' -and $excludeState -ne 'unknown' -and
             (-not $entry.isPartial -or $excludeState -eq 'yes') -and
             -not $scan.conditional -and -not $scan.unterminated
         $firstLine = $entry.first
@@ -485,7 +487,8 @@ function Get-RedundantMethodCoverageConstructs {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Spans,
-        [Parameter(Mandatory)][string]$Path
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$AllTestProjectClasses
     )
     if ([Text.Encoding]::UTF8.GetByteCount($Content) -ge 16MB -or
         $Spans.Count -gt 4096 -or $Path.Length -gt 2048) {
@@ -555,13 +558,15 @@ function Get-RedundantMethodCoverageConstructs {
         return
     }
     $classes = @(Get-TestClassCoverageConstructs -Content $safeContent -Spans $Spans `
-        -Path $Path -IncludeUnchanged -IncludeResolutionContext)
+        -Path $Path -IncludeUnchanged -IncludeResolutionContext `
+        -AllTestProjectClasses:$AllTestProjectClasses)
     if ($classes.Count -eq 0) { return }
     $ranges = @($Spans | ForEach-Object {
         @{ start = [int]$_.startLine; end = [int]$_.endLine }
     })
     foreach ($class in $classes) {
-        if (-not $class.hasTestClass -or $class.bodyOpen -lt 0) { continue }
+        if ((-not $AllTestProjectClasses -and -not $class.hasTestClass) -or
+            $class.bodyOpen -lt 0) { continue }
         $candidates = [Collections.Generic.List[object]]::new()
         $depth = 1
         for ($i = $class.bodyOpen + 1; $i -lt $tokens.Count -and $depth -gt 0; $i++) {
@@ -645,7 +650,8 @@ function Get-RedundantMethodCoverageConstructs {
                 startLine = $(if ($excludeAttribute) { [int]$excludeAttribute.first } else { [int]$tokens[$first].line })
                 endLine = $(if ($excludeAttribute) { [int]$excludeAttribute.last } else { [int]$tokens[$i - 1].line })
                 recognized = [bool]($valid -and $class.recognized -and
-                    -not $class.isPartial -and $test -eq 'yes' -and
+                    -not $class.isPartial -and
+                    ($AllTestProjectClasses -or $test -eq 'yes') -and
                     $exclude -eq 'yes' -and $excludeCount -eq 1 -and
                     $exactChangedAnchor -and -not $mixed)
             })

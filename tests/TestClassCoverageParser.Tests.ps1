@@ -367,6 +367,53 @@ class Ordinary
         (Get-CoverageTestResults $source 4 5).Count | Should -Be 0
     }
 
+    It 'includes changed helper, fixture and nested classes only in the all-class scope' {
+        $source = @'
+using System.Diagnostics.CodeAnalysis;
+class Fixture {
+    [ExcludeFromCodeCoverage]
+    class CoveredHelper {}
+    class MissingHelper {}
+}
+'@
+        $spans = @(@{ startLine = 2; endLine = 5; state = 'complete' })
+        @(Get-TestClassCoverageConstructs -Content $source -Path '/Fixture.cs' `
+                -Spans $spans).Count | Should -Be 0
+        $results = @(Get-TestClassCoverageConstructs -Content $source -Path '/Fixture.cs' `
+                -Spans $spans -AllTestProjectClasses)
+        $results.Count | Should -Be 3
+        @($results | Where-Object name -CEQ 'Fixture')[0].hasExclude | Should -BeFalse
+        @($results | Where-Object name -CEQ 'Fixture.CoveredHelper')[0].hasExclude |
+            Should -BeTrue
+        @($results | Where-Object name -CEQ 'Fixture.MissingHelper')[0].hasExclude |
+            Should -BeFalse
+        @(Get-TestClassCoverageConstructs -Content $source -Path '/Fixture.cs' `
+                -Spans @(@{ startLine = 6; endLine = 6; state = 'complete' }) `
+                -AllTestProjectClasses).Count | Should -Be 0
+        $changed = @(Get-TestClassCoverageConstructs -Content $source -Path '/Fixture.cs' `
+                -Spans @(@{ startLine = 5; endLine = 5; state = 'complete' }) `
+                -AllTestProjectClasses)
+        $changed.Count | Should -Be 1
+        $changed[0].declarationLine | Should -Be 5
+    }
+
+    It 'keeps an unexcluded partial helper unknown, and a changed method body out of scope' {
+        $source = @'
+partial class Fixture {
+    void Changed() {}
+}
+'@
+        $result = @(Get-TestClassCoverageConstructs -Content $source -Path '/Fixture.cs' `
+                -Spans @(@{ startLine = 1; endLine = 1; state = 'complete' }) `
+                -AllTestProjectClasses)
+        $result.Count | Should -Be 1
+        $result[0].recognized | Should -BeFalse
+        $result[0].reason | Should -BeExactly 'partial-class-coverage-unknown'
+        @(Get-TestClassCoverageConstructs -Content $source -Path '/Fixture.cs' `
+                -Spans @(@{ startLine = 2; endLine = 2; state = 'complete' }) `
+                -AllTestProjectClasses).Count | Should -Be 0
+    }
+
     It 'anchors both classes in two large source generations without leaking sibling attributes' {
         foreach ($generation in @(
                 @{ total = 1013; missingLine = 25 },

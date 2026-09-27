@@ -294,6 +294,14 @@ Describe 'Bounded read-only scheduled rule evaluation' {
         $c.state.calls.Count | Should -Be 0
         (Test-Path (Join-Path $c.root 'rule-evaluation-v1')) | Should -BeFalse
     }
+    It 'does not accept an all-class rule without a separately approved versioned binding' {
+        $c = New-RuleCase -EnableCoverage
+        $c.config.rules[1].capabilityId = 'bpm-test-class-coverage@2'
+        $c.config.rules[1].ruleId = 'bpm-test-class-coverage@2'
+        Sign-TestConfig $c.config
+        { Invoke-RuleCase $c } | Should -Throw '*unknown, duplicate, or invalid capability*'
+        $c.state.calls.Count | Should -Be 0
+    }
     It 'rejects state inside the repository while accepting external absolute roots' {
         $c = New-RuleCase -EnableCoverage
         { Invoke-BoundedRuleEvaluation -Config $c.config `

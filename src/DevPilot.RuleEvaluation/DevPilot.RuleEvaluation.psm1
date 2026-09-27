@@ -375,13 +375,64 @@ function Assert-RuleHead {
         $Actual.targetRef -cne 'refs/heads/master') { throw 'head-left-policy' }
 }
 
+function Get-RuleTestProjectScope {
+    param([object]$Evidence, [string]$RepositoryId, [string]$SourceCommit,
+        [string]$Path, [string]$ObjectId)
+    if ($Evidence -isnot [Collections.IDictionary] -or
+        ($Evidence.schemaVersion -isnot [int] -and
+            $Evidence.schemaVersion -isnot [long]) -or
+        $Evidence.schemaVersion -ne 1 -or
+        $Evidence.kind -cne 'source-bound-evaluated-project-graph-v1' -or
+        $Evidence.complete -isnot [bool] -or $Evidence.complete -cne $true -or
+        [string]$Evidence.repositoryId -ine $RepositoryId -or
+        [string]$Evidence.sourceCommit -ine $SourceCommit -or
+        [string]$Evidence.path -cne $Path -or
+        [string]$Evidence.objectId -ine $ObjectId -or
+        [string]$RepositoryId -cnotmatch
+            '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+        [string]$SourceCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        [string]$ObjectId -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        $Path -cnotmatch '^/[^?#\x00-\x1f]{1,2048}\.cs$' -or
+        $Evidence.projects -isnot [array] -or
+        $Evidence.projects.Count -lt 1 -or $Evidence.projects.Count -gt 32) {
+        return 'unknown'
+    }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $testCount = 0
+    foreach ($project in $Evidence.projects) {
+        if ($project -isnot [Collections.IDictionary] -or
+            [string]$project.path -cnotmatch '^/[^?#\x00-\x1f]{1,2048}\.csproj$' -or
+            [string]$project.objectId -cnotmatch '^[a-fA-F0-9]{40}$' -or
+            $project.compileIncluded -cne $true -or
+            $project.isTestProject -isnot [bool] -or
+            -not $seen.Add([string]$project.path)) {
+            return 'unknown'
+        }
+        if ($project.isTestProject) { $testCount++ }
+    }
+    if ($testCount -eq $Evidence.projects.Count) { return 'test' }
+    if ($testCount -eq 0) { return 'non-test' }
+    return 'unknown'
+}
+
 function Get-RuleEvaluation {
     param([string]$Capability, [object[]]$Files, [int]$MaximumFindings,
-        [object]$Contract, [AllowNull()][object]$Snapshot)
-    $findings = 0; $unknown = 0
+        [object]$Contract, [AllowNull()][object]$Snapshot,
+        [string]$RepositoryId, [string]$SourceCommit)
+    $findings = 0; $unknown = 0; $projectUnknown = 0
     $boundFindings = [Collections.Generic.List[object]]::new()
     foreach ($file in $Files) {
         if ($file.path -notmatch '\.cs$') { continue }
+        $projectRule = $Capability -cin @('bpm-test-class-coverage@2',
+            'bpm-redundant-method-coverage@2')
+        $projectDigest = ''
+        if ($projectRule) {
+            $scope = Get-RuleTestProjectScope $file.projectEvidence $RepositoryId `
+                $SourceCommit $file.path $file.objectId
+            if ($scope -eq 'unknown') { $unknown++; $projectUnknown++; continue }
+            if ($scope -eq 'non-test') { continue }
+            $projectDigest = Get-RuleDigest $file.projectEvidence
+        }
         $spans = @($file.spans | ForEach-Object {
                 @{ startLine = [int]$_.startLine; endLine = [int]$_.endLine
                     state = 'complete' }
@@ -390,8 +441,16 @@ function Get-RuleEvaluation {
             'bpm-test-class-coverage@1' {
                 @(Get-TestClassCoverageConstructs -Content $file.content -Spans $spans -Path $file.path)
             }
+            'bpm-test-class-coverage@2' {
+                @(Get-TestClassCoverageConstructs -Content $file.content -Spans $spans `
+                    -Path $file.path -AllTestProjectClasses)
+            }
             'bpm-redundant-method-coverage@1' {
                 @(Get-RedundantMethodCoverageConstructs -Content $file.content -Spans $spans -Path $file.path)
+            }
+            'bpm-redundant-method-coverage@2' {
+                @(Get-RedundantMethodCoverageConstructs -Content $file.content -Spans $spans `
+                    -Path $file.path -AllTestProjectClasses)
             }
             'bpm-named-areequal-arguments@1' {
                 @(Get-NamedAreEqualConstructs -Content $file.content -Spans $spans -Path $file.path)
@@ -399,19 +458,23 @@ function Get-RuleEvaluation {
         }
         foreach ($item in $constructs) {
             if (-not $item.recognized) { $unknown++; continue }
-            if (($Capability -ceq 'bpm-test-class-coverage@1' -and
+            if (($Capability -cin @('bpm-test-class-coverage@1',
+                        'bpm-test-class-coverage@2') -and
                     -not $item.hasExclude) -or
-                ($Capability -ceq 'bpm-redundant-method-coverage@1' -and
+                ($Capability -cin @('bpm-redundant-method-coverage@1',
+                        'bpm-redundant-method-coverage@2') -and
                     $item.reason -ceq 'redundant-method-coverage-exclusion') -or
                 ($Capability -ceq 'bpm-named-areequal-arguments@1' -and
                     $item.hasPositional)) {
                 $findings++
-                $line = if ($Capability -ceq 'bpm-test-class-coverage@1') {
+                $line = if ($Capability -cin @('bpm-test-class-coverage@1',
+                        'bpm-test-class-coverage@2')) {
                     [int]$item.declarationLine
                 } else { [int]$item.startLine }
-                $constructRef = 'construct:' + (Get-RuleDigest @(
-                    $Capability, $file.path, [string]$item.name,
-                    [int]$item.declarationLine, $line))
+                $identity = @($Capability, $file.path, [string]$item.name,
+                    [int]$item.declarationLine, $line)
+                if ($projectRule) { $identity += $projectDigest }
+                $constructRef = 'construct:' + (Get-RuleDigest $identity)
                 $binding = New-OwnerCanonicalAnchor -Path $file.path.TrimStart('/') `
                     -StartLine $line -Symbol ([string]$item.name) `
                     -ConstructIdentity $constructRef
@@ -421,7 +484,8 @@ function Get-RuleEvaluation {
                         line = $line; symbol = [string]$item.name }
                     binding = $binding
                 }
-                if ($Capability -ceq 'bpm-redundant-method-coverage@1') {
+                if ($Capability -cin @('bpm-redundant-method-coverage@1',
+                        'bpm-redundant-method-coverage@2')) {
                     $finding.affectedMethodCount = [int]$item.affectedMethodCount
                     $finding.affectedMethods = @($item.affectedMethods)
                     $finding.affectedAttributeLines = @($item.affectedAttributeLines)
@@ -438,6 +502,10 @@ function Get-RuleEvaluation {
     }
     if ($findings -gt $MaximumFindings) { return @{ state = 'unknown'; reason = 'finding-cap'
             findings = 0; unknown = $findings } }
+    if ($projectUnknown -gt 0) {
+        return @{ state = 'unknown'; reason = 'test-project-identity-unknown'
+            findings = $findings; unknown = $unknown }
+    }
     if ($unknown -gt 0) { return @{ state = 'unknown'; reason = 'rule-ambiguous'
             findings = $findings; unknown = $unknown } }
     if ($null -eq $Contract -or $null -eq $Snapshot) {
@@ -461,12 +529,15 @@ function Get-RuleEvaluation {
         $anchor = $finding.anchor
         $lines = if ($Capability -ceq 'bpm-named-areequal-arguments@1') {
             @($finding.affectedCallLines)
-        } elseif ($Capability -ceq 'bpm-redundant-method-coverage@1') {
+        } elseif ($Capability -cin @('bpm-redundant-method-coverage@1',
+                'bpm-redundant-method-coverage@2')) {
             @($finding.affectedAttributeLines)
         } else { @([int]$anchor.line) }
         $discussionPattern = switch ($Capability) {
             'bpm-test-class-coverage@1' { '(?i)\b(?:exclu\w*|cover\w*)\b' }
+            'bpm-test-class-coverage@2' { '(?i)\b(?:exclu\w*|cover\w*)\b' }
             'bpm-redundant-method-coverage@1' { '(?i)\b(?:method|exclu\w*|cover\w*)\b' }
+            'bpm-redundant-method-coverage@2' { '(?i)\b(?:method|exclu\w*|cover\w*)\b' }
             default { '(?i)\b(?:AreEqual|named|expected|actual)\b' }
         }
         $relevant = @($Snapshot.Threads | Where-Object {
@@ -752,6 +823,8 @@ function Invoke-BoundedRuleEvaluation {
                             throw 'source-unverified'
                         }
                         $files.Add(@{ path = $sources[0].path; content = $sources[0].content
+                            objectId = $sources[0].objectId
+                            projectEvidence = $sources[0]['projectEvidence']
                             spans = $proof.spans })
                     }
                     if ($changed.evaluationFiles.Count -ne $files.Count) {
@@ -832,7 +905,8 @@ function Invoke-BoundedRuleEvaluation {
                             $snapshot = Get-ActivePrDiscussionSnapshot $discussions `
                                 $IntakeConfig $declaration $contract
                             Get-RuleEvaluation $rule.capabilityId $files.ToArray() `
-                                $ruleConfig.maxFindingsPerHead $contract $snapshot
+                                $ruleConfig.maxFindingsPerHead $contract $snapshot `
+                                $declaration.repositoryId $declaration.sourceCommit
                         }
                         if ($rule.capabilityId -ceq 'bpm-test-ownership@1' -and $OwnerEvaluator) {
                             $postHead = Invoke-RuleRead $Provider Head @{ pullRequestId = $id } `
