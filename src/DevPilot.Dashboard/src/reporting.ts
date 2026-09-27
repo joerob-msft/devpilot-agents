@@ -8,11 +8,15 @@ import {
   realpath,
   stat,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { projectRuleRegistry, type RuleEvidence, type RuleSummary } from "./rule-registry.js";
 import { resolveCurrentRelationLink, type RelationReadJson } from "./relation-link.js";
 import { parseIntakeCohort, type IntakeSummary } from "./intake-report.js";
+import {
+  parseRuleEvaluationCohort, unknownRuleEvaluation, validateRuleObservations,
+  type RuleEvaluationSummary,
+} from "./rule-evaluation-report.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -47,12 +51,14 @@ export interface ReportingConfiguration {
     manual?: string;
     runner?: string;
     intake?: string;
+    ruleEvaluation?: string;
   };
   files: {
     toolkitConfig: string;
     lastRun?: string;
     scheduledLog?: string;
     intakeCohort?: string;
+    ruleEvaluationCohort?: string;
   };
   expectedToolkit?: {
     head: string;
@@ -241,6 +247,7 @@ export interface ReportingSnapshot {
   relations: RelationSummary[];
   rules?: RuleSummary[];
   intake?: IntakeSummary;
+  ruleEvaluation?: RuleEvaluationSummary;
   quarantine: QuarantineSummary[];
   diagnostics: string[];
   truncated: boolean;
@@ -442,11 +449,22 @@ function intakeFailureCode(error: unknown): string {
   if (/outside configured roots|expected configured root|link or reparse|escaped configured root/i.test(message)) {
     return "intake-path-untrusted";
   }
+
   if (/budget|exceeds/i.test(message)) return "intake-budget-exhausted";
   if (error instanceof SyntaxError || /intake|JSON|unsupported/i.test(message)) {
     return "invalid-intake-cohort";
   }
   return "intake-read-failed";
+}
+
+function ruleEvaluationFailureCode(error: unknown): string {
+  if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "rule-evaluation-file-unavailable";
+  const message = error instanceof Error ? error.message : "";
+  if (/outside configured roots|expected configured root|link or reparse|escaped configured root/i.test(message)) {
+    return "rule-evaluation-path-untrusted";
+  }
+  if (/budget|exceeds/i.test(message)) return "rule-evaluation-budget-exhausted";
+  return "invalid-rule-evaluation-cohort";
 }
 
 export function parseReportingConfiguration(value: unknown): ReportingConfiguration {
@@ -491,11 +509,16 @@ export function parseReportingConfiguration(value: unknown): ReportingConfigurat
   const manualRoot = optionalAbsolute(roots.manual, "roots.manual");
   const runnerRoot = optionalAbsolute(roots.runner, "roots.runner");
   const intakeRoot = optionalAbsolute(roots.intake, "roots.intake");
+  const ruleEvaluationRoot = optionalAbsolute(roots.ruleEvaluation, "roots.ruleEvaluation");
   const lastRun = optionalAbsolute(files.lastRun, "files.lastRun");
   const scheduledLog = optionalAbsolute(files.scheduledLog, "files.scheduledLog");
   const intakeCohort = optionalAbsolute(files.intakeCohort, "files.intakeCohort");
+  const ruleEvaluationCohort = optionalAbsolute(files.ruleEvaluationCohort, "files.ruleEvaluationCohort");
   if (Boolean(intakeRoot) !== Boolean(intakeCohort)) {
     throw new Error("roots.intake and files.intakeCohort must be configured together");
+  }
+  if (Boolean(ruleEvaluationRoot) !== Boolean(ruleEvaluationCohort)) {
+    throw new Error("roots.ruleEvaluation and files.ruleEvaluationCohort must be configured together");
   }
   const scheduledTaskName = boundedText(raw.scheduledTaskName, 256);
   const scheduledTaskPath = boundedText(raw.scheduledTaskPath, 256);
@@ -521,12 +544,14 @@ export function parseReportingConfiguration(value: unknown): ReportingConfigurat
       ...(manualRoot ? { manual: manualRoot } : {}),
       ...(runnerRoot ? { runner: runnerRoot } : {}),
       ...(intakeRoot ? { intake: intakeRoot } : {}),
+      ...(ruleEvaluationRoot ? { ruleEvaluation: ruleEvaluationRoot } : {}),
     },
     files: {
       toolkitConfig: ensureAbsolute(files.toolkitConfig, "files.toolkitConfig"),
       ...(lastRun ? { lastRun } : {}),
       ...(scheduledLog ? { scheduledLog } : {}),
       ...(intakeCohort ? { intakeCohort } : {}),
+      ...(ruleEvaluationCohort ? { ruleEvaluationCohort } : {}),
     },
     ...(expectedToolkit ? { expectedToolkit } : {}),
     ...(azureDevOps ? { azureDevOps } : {}),
@@ -2272,6 +2297,7 @@ export class LocalReportingAdapter {
     const observationMap = new Map(observations.map((state) => [state.identity, state]));
     const runs = await readRunHistory(context);
     let intake: IntakeSummary | undefined;
+    const intakeDeclarationDigests = new Map<number, string>();
     if (config.roots.intake && config.files.intakeCohort) {
       try {
         const cohortBytes = await readBoundedFile(context, config.files.intakeCohort, config.roots.intake);
@@ -2291,6 +2317,17 @@ export class LocalReportingAdapter {
             intake.binding.organization.toLowerCase() !== config.azureDevOps.organizationUrl.replace(/\/$/, "").toLowerCase()) {
           throw new Error("intake repository binding does not match the reporting configuration");
         }
+        const intakeRawHeads = asRecord(cohortValue).heads;
+        if (Array.isArray(intakeRawHeads)) {
+          for (const entry of intakeRawHeads) {
+            const rawHead = asRecord(entry);
+            if (typeof rawHead.pullRequestId === "number" &&
+                typeof rawHead.declarationDigest === "string" &&
+                intake.heads.some((head) => head.pullRequestId === rawHead.pullRequestId && head.lineEvidence)) {
+              intakeDeclarationDigests.set(rawHead.pullRequestId, rawHead.declarationDigest);
+            }
+          }
+        }
         if (now - Date.parse(intake.observedUtc) > config.staleAfterMinutes * 60_000 ||
             Date.parse(intake.observedUtc) > now) {
           intake = { ...intake, state: "unknown", gaps: [...intake.gaps, "stale-inventory"] };
@@ -2301,6 +2338,59 @@ export class LocalReportingAdapter {
           discovered: null, eligible: null, excludedOtherTargets: null,
           heads: [], rules: [], gaps: [intakeFailureCode(error)],
         };
+      }
+    }
+    let ruleEvaluation: RuleEvaluationSummary | undefined;
+    if (config.roots.ruleEvaluation && config.files.ruleEvaluationCohort) {
+      try {
+        if (!intake || intake.state !== "complete") throw new Error("unverified intake generation");
+        const ledgerRoot = basename(config.roots.ruleEvaluation) === "rule-evaluation-v1"
+          ? config.roots.ruleEvaluation
+          : join(config.roots.ruleEvaluation, "rule-evaluation-v1");
+        const cohortPath = join(ledgerRoot, "cohort.json");
+        if (resolve(config.files.ruleEvaluationCohort) !== resolve(cohortPath)) {
+          throw new Error("rule evaluation cohort path is not canonical");
+        }
+        const bytes = await readBoundedFile(context, cohortPath, config.roots.ruleEvaluation);
+        const value: unknown = JSON.parse(bytes.toString("utf8"));
+        assertJsonShape(value);
+        ruleEvaluation = parseRuleEvaluationCohort(value, intake);
+        const immutable = await readBoundedFile(
+          context, join(ledgerRoot, "generations",
+            `${ruleEvaluation.generation}.json`), config.roots.ruleEvaluation,
+        );
+        if (!bytes.equals(immutable)) throw new Error("rule evaluation immutable generation differs");
+        if (!config.azureDevOps || !ruleEvaluation.binding ||
+            ruleEvaluation.binding.organization.toLowerCase() !== config.azureDevOps.organizationUrl.replace(/\/$/, "").toLowerCase() ||
+            ruleEvaluation.binding.projectId.toLowerCase() !== config.azureDevOps.projectId.toLowerCase() ||
+            ruleEvaluation.binding.repositoryId.toLowerCase() !== config.azureDevOps.repositoryId.toLowerCase()) {
+          throw new Error("rule evaluation reporting repository mismatch");
+        }
+        ruleEvaluation = await validateRuleObservations(ruleEvaluation,
+          (digest) => readBoundedFile(context, join(ledgerRoot, "observations",
+            `${digest}.json`), config.roots.ruleEvaluation!),
+          (digest) => readBoundedFile(context, join(ledgerRoot, "declarations",
+            `${digest}.json`), config.roots.ruleEvaluation!),
+          intake, intakeDeclarationDigests);
+        if (now - Date.parse(ruleEvaluation.observedUtc) > config.staleAfterMinutes * 60_000 ||
+            Date.parse(ruleEvaluation.observedUtc) > now) {
+          ruleEvaluation = unknownRuleEvaluation("stale-rule-evaluation");
+        } else {
+          ruleEvaluation = { ...ruleEvaluation, heads: ruleEvaluation.heads.map((head) => ({
+            ...head,
+            url: buildAzureDevOpsLinks({
+              organizationUrl: config.azureDevOps!.organizationUrl,
+              projectName: config.azureDevOps!.projectName,
+              projectId: config.azureDevOps!.projectId,
+              repositoryId: config.azureDevOps!.repositoryId,
+              expectedProjectId: config.azureDevOps!.projectId,
+              expectedRepositoryId: config.azureDevOps!.repositoryId,
+              pullRequestId: head.pullRequestId,
+            }).prUrl,
+          })) };
+        }
+      } catch (error) {
+        ruleEvaluation = unknownRuleEvaluation(ruleEvaluationFailureCode(error));
       }
     }
     let policy: JsonRecord | null = null;
@@ -2482,6 +2572,7 @@ export class LocalReportingAdapter {
       failures,
       relations: projected.relations.slice(0, config.budgets.maxHistory),
       ...(intake ? { intake } : {}),
+      ...(ruleEvaluation ? { ruleEvaluation } : {}),
       quarantine: context.quarantine.slice(0, config.budgets.maxHistory),
       diagnostics: context.diagnostics.slice(0, 50),
       truncated: context.truncated,

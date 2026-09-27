@@ -87,6 +87,9 @@ The existing local Operations dashboard's verified read-only reporting view,
 external-root configuration, health semantics, privacy boundary, and rollback
 are documented in
 [docs/owner-reporting-dashboard.md](docs/owner-reporting-dashboard.md).
+The separate default-off, signed, bounded active-PR rule evaluation path
+and its current-generation read-only coverage report are documented in
+[docs/bounded-rule-evaluation.md](docs/bounded-rule-evaluation.md).
 The capability-specific contextual assessment and its sanitized demonstration
 result are documented in
 [docs/relation-evidence-capability.md](docs/relation-evidence-capability.md).

@@ -21,6 +21,7 @@ import {
 } from "../src/reporting-view.js";
 import { projectRuleRegistry } from "../src/rule-registry.js";
 import { parseIntakeCohort } from "../src/intake-report.js";
+import { parseRuleEvaluationCohort } from "../src/rule-evaluation-report.js";
 
 type JsonRecord = Record<string, unknown>;
 const execFileAsync = promisify(execFile);
@@ -2285,3 +2286,252 @@ test("configured files cannot traverse roots or pass through links/reparse point
 function asObject(value: unknown): JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
 }
+
+test("scheduled current-head evaluation only credits immutable, independently bound observations", async () => {
+  const fixture = await createFixture();
+  const intake = syntheticIntake(2);
+  const intakeRoot = join(fixture.root, "intake");
+  const evaluationRoot = join(fixture.root, "private-evaluation");
+  const ledger = join(evaluationRoot, "rule-evaluation-v1");
+  const generation = "e".repeat(32);
+  asObject(intake.binding).configDigest = "a".repeat(64);
+  const intakeHeads = intake.heads as JsonRecord[];
+  const first = intakeHeads[0]!;
+  first.declaration = {
+    repositoryId: asObject(intake.binding).repositoryId,
+    projectId: asObject(intake.binding).projectId,
+    pullRequestId: first.pullRequestId, sourceRef: "refs/heads/feature",
+    targetRef: first.targetRef, sourceCommit: first.sourceCommit,
+    targetCommit: first.targetCommit, commonCommit: "b".repeat(40),
+    iterationId: first.iterationId, status: "active", isDraft: false,
+  };
+  first.declarationDigest = sha256Text(JSON.stringify(first.declaration));
+  first.lineEvidence = {
+    generation: intake.generation, declarationDigest: first.declarationDigest,
+    configDigest: asObject(intake.binding).configDigest, baseCommit: "b".repeat(40),
+    changedFiles: 1, changedLines: 1, addedLines: 1, deletedLines: 0,
+    files: [{ pathDigest: "a".repeat(64), originalPathDigest: null,
+      changeType: "edit", addedLines: 1, deletedLines: 0, newLineCount: 1,
+      spans: [{ startLine: 1, endLine: 1 }] }],
+  };
+  first.lineEvidenceDigest = sha256Text(JSON.stringify(first.lineEvidence));
+  const ruleDeclaration = {
+    schemaVersion: 1, kind: "scheduled-rule-declaration",
+    generation, intakeGeneration: intake.generation,
+    pullRequestId: first.pullRequestId, sourceCommit: first.sourceCommit,
+    targetCommit: first.targetCommit, targetRef: first.targetRef,
+    iterationId: first.iterationId, intakeDeclarationDigest: first.declarationDigest,
+    lineEvidenceDigest: first.lineEvidenceDigest, configDigest: "c".repeat(64),
+    capabilityId: "bpm-future-rule@1", ruleId: "future-rule",
+    maxFindingsPerHead: 8, writerEligible: false,
+  };
+  const declarationBytes = Buffer.from(JSON.stringify(ruleDeclaration));
+  const declarationDigest = createHash("sha256").update(declarationBytes).digest("hex");
+  const observation = {
+    schemaVersion: 1, kind: "scheduled-rule-observation",
+    generation, intakeGeneration: intake.generation,
+    pullRequestId: first.pullRequestId, sourceCommit: first.sourceCommit,
+    targetCommit: first.targetCommit, targetRef: first.targetRef,
+    iterationId: first.iterationId, capabilityId: "bpm-future-rule@1",
+    ruleId: "future-rule", declarationDigest,
+    completedUtc: "2026-09-24T21:00:20Z",
+    outcome: { findings: 1, noOp: 0, wouldCreate: 1, unknown: 0 },
+    providerWrites: 0, modelToolInvocations: 0,
+  };
+  const observationBytes = Buffer.from(JSON.stringify(observation));
+  const digest = createHash("sha256").update(observationBytes).digest("hex");
+  const cohort: JsonRecord = {
+    schemaVersion: 1, kind: "scheduled-rule-evaluation-cohort",
+    generation, intakeGeneration: intake.generation,
+    binding: {
+      ...asObject(intake.binding), configDigest: "c".repeat(64),
+    },
+    observedUtc: "2026-09-24T21:01:00Z",
+    inventory: { state: "complete", discovered: 2, eligible: 2, excludedOtherTargets: 0,
+      draftExcluded: 3 },
+    heads: intakeHeads.map((head, index) => ({
+      pullRequestId: head.pullRequestId, sourceCommit: head.sourceCommit,
+      targetCommit: head.targetCommit, targetRef: head.targetRef,
+      iterationId: head.iterationId,
+      rules: [{
+        capabilityId: "bpm-future-rule@1", ruleId: "future-rule",
+        status: index ? "pending" : "evaluated",
+        reasonCode: index ? "not-selected" : "completed",
+        observationDigest: index ? null : digest,
+        declarationDigest: index ? null : observation.declarationDigest,
+      }],
+    })),
+    rules: [{
+      capabilityId: "bpm-future-rule@1", ruleId: "future-rule",
+      discovered: 2, eligible: 2, evaluated: 1, skipped: 0, unknown: 0,
+      error: 0, pending: 1, gaps: [],
+    }],
+    gaps: [],
+  };
+  const cohortPath = join(ledger, "cohort.json");
+  const immutable = join(ledger, "generations", `${generation}.json`);
+  const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as JsonRecord;
+  asObject(config.roots).intake = intakeRoot;
+  asObject(config.files).intakeCohort = join(intakeRoot, "cohort.json");
+  asObject(config.roots).ruleEvaluation = evaluationRoot;
+  asObject(config.files).ruleEvaluationCohort = cohortPath;
+  await writeJson(fixture.configPath, config);
+  await writeJson(join(intakeRoot, "cohort.json"), intake);
+  await writeJson(join(intakeRoot, "generations", `${intake.generation}.json`), intake);
+  const save = async () => {
+    await writeJson(cohortPath, cohort);
+    await writeJson(immutable, cohort);
+  };
+  const read = () => createAdapter(fixture.configPath, {
+    now: () => Date.parse("2026-09-24T21:05:00Z"),
+    taskReader: async () => healthyTask,
+  }).read();
+  try {
+    const declarationPath = join(ledger, "declarations", `${declarationDigest}.json`);
+    await write(declarationPath, declarationBytes);
+    await write(join(ledger, "observations", `${digest}.json`), observationBytes);
+    await save();
+    const valid = await read();
+    const rule = valid.rules?.find((entry) => entry.id === "future-rule");
+    assert.equal(rule?.scheduled?.evaluated, 1);
+    assert.equal(rule?.scheduled?.draftExcluded, 3);
+    assert.equal(valid.ruleEvaluation?.draftExcluded, 3);
+    assert.notEqual(valid.intake?.binding?.repositoryId, null);
+    assert.equal(valid.ruleEvaluation?.binding?.configDigest, "c".repeat(64));
+    assert.match(overviewLines(valid).join(" "), /drafts excluded separately 3.*not in the rule denominator/);
+    assert.equal(rule?.scheduled?.pending, 1);
+    assert.deepEqual(rule?.scheduled?.scope, [1]);
+    assert.equal(rule?.intake?.evaluated, 0);
+    assert.equal(rule?.execution, "unknown");
+    assert.equal(rule?.counts.finding, null);
+    const scheduledRows = reportingRows(valid, "rules").filter((row) => row.key.startsWith("scheduled:"));
+    assert.equal(scheduledRows.length, 2);
+    assert.match(scheduledRows[0]?.url ?? "", /dev\.azure\.com\/example.*pullrequest\/1/);
+    assert.match(reportingRows(valid, "rules").find((row) => row.key === "rule:future-rule")?.text.join(" ") ?? "",
+      /evaluated 1 \/ pending 1 \/ skipped 0 \/ unknown 0 \/ error 0/);
+
+    await write(declarationPath, "{}");
+    const brokenDeclaration = await read();
+    assert.equal(brokenDeclaration.rules?.find((entry) => entry.id === "future-rule")?.scheduled?.evaluated, 0);
+    assert.equal(brokenDeclaration.rules?.find((entry) => entry.id === "future-rule")?.scheduled?.unknown, 1);
+    await write(declarationPath, declarationBytes);
+    const mismatchedDeclaration = Buffer.from(JSON.stringify({
+      ...ruleDeclaration, lineEvidenceDigest: "b".repeat(64),
+    }));
+    const mismatchedDeclarationDigest = sha256Text(mismatchedDeclaration.toString("utf8"));
+    await write(join(ledger, "declarations", `${mismatchedDeclarationDigest}.json`), mismatchedDeclaration);
+    (asObject((asObject((cohort.heads as JsonRecord[])[0]).rules as JsonRecord[])[0])).declarationDigest = mismatchedDeclarationDigest;
+    await save();
+    assert.equal((await read()).rules?.find((entry) => entry.id === "future-rule")?.scheduled?.evaluated, 0);
+    (asObject((asObject((cohort.heads as JsonRecord[])[0]).rules as JsonRecord[])[0])).declarationDigest = declarationDigest;
+    await save();
+
+    await write(join(ledger, "observations", `${digest}.json`), "{}");
+    const missingProof = await read();
+    assert.equal(missingProof.rules?.find((entry) => entry.id === "future-rule")?.scheduled?.evaluated, 0);
+    assert.equal(missingProof.rules?.find((entry) => entry.id === "future-rule")?.scheduled?.unknown, 1);
+    assert.match(overviewLines(missingProof).join(" "), /observation-unverified/);
+
+    const driftedBytes = Buffer.from(JSON.stringify({ ...observation, iterationId: 999 }));
+    const driftedDigest = createHash("sha256").update(driftedBytes).digest("hex");
+    await write(join(ledger, "observations", `${driftedDigest}.json`), driftedBytes);
+    (asObject((asObject((cohort.heads as JsonRecord[])[0]).rules as JsonRecord[])[0])).observationDigest = driftedDigest;
+    await save();
+    assert.equal((await read()).rules?.find((entry) => entry.id === "future-rule")?.scheduled?.evaluated, 0);
+    (asObject((asObject((cohort.heads as JsonRecord[])[0]).rules as JsonRecord[])[0])).observationDigest = digest;
+    await save();
+
+    const wrongDeclaration = Buffer.from(JSON.stringify({
+      ...observation, declarationDigest: "b".repeat(64),
+    }));
+    const wrongDeclarationDigest = createHash("sha256").update(wrongDeclaration).digest("hex");
+    await write(join(ledger, "observations", `${wrongDeclarationDigest}.json`), wrongDeclaration);
+    (asObject((asObject((cohort.heads as JsonRecord[])[0]).rules as JsonRecord[])[0])).observationDigest = wrongDeclarationDigest;
+    await save();
+    assert.equal((await read()).rules?.find((entry) => entry.id === "future-rule")?.scheduled?.evaluated, 0);
+    (asObject((asObject((cohort.heads as JsonRecord[])[0]).rules as JsonRecord[])[0])).observationDigest = digest;
+    await save();
+
+    const missingAuthorization = Buffer.from(JSON.stringify({
+      ...observation, providerWrites: undefined,
+    }));
+    const missingAuthorizationDigest = createHash("sha256").update(missingAuthorization).digest("hex");
+    await write(join(ledger, "observations", `${missingAuthorizationDigest}.json`), missingAuthorization);
+    (asObject((asObject((cohort.heads as JsonRecord[])[0]).rules as JsonRecord[])[0])).observationDigest = missingAuthorizationDigest;
+    await save();
+    assert.equal((await read()).rules?.find((entry) => entry.id === "future-rule")?.scheduled?.evaluated, 0);
+    (asObject((asObject((cohort.heads as JsonRecord[])[0]).rules as JsonRecord[])[0])).observationDigest = digest;
+    await save();
+
+    await writeJson(immutable, { ...cohort, observedUtc: "2026-09-24T21:01:01Z" });
+    assert.equal((await read()).ruleEvaluation?.state, "unknown");
+    const invalidSnapshot = await read();
+    assert.equal(invalidSnapshot.rules?.find((entry) => entry.id === "future-rule")?.scheduled, undefined);
+    assert.match(reportingRows(invalidSnapshot, "rules")[0]?.text.join(" ") ?? "",
+      /SCHEDULED READ-ONLY RULE EVALUATION unknown.*evaluated unknown/);
+    await save();
+    asObject(cohort.binding).repositoryId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    await save();
+    assert.equal((await read()).ruleEvaluation?.state, "unknown");
+    asObject(cohort.binding).repositoryId = asObject(intake.binding).repositoryId;
+    cohort.intakeGeneration = "a".repeat(32);
+    await save();
+    assert.equal((await read()).ruleEvaluation?.state, "unknown");
+    cohort.intakeGeneration = intake.generation;
+    await save();
+    asObject(config.files).ruleEvaluationCohort = join(fixture.toolkitRoot, "owner-v2-config.json");
+    await writeJson(fixture.configPath, config);
+    assert.deepEqual((await read()).ruleEvaluation?.gaps, ["invalid-rule-evaluation-cohort"]);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("scheduled evaluation rejects unsupported totals, duplicate heads, unbound outcomes and config pairs", () => {
+  const intakeRaw = syntheticIntake(1);
+  asObject(intakeRaw.binding).configDigest = "a".repeat(64);
+  const intake = parseIntakeCohort(intakeRaw);
+  const head = intake.heads[0]!;
+  const raw: JsonRecord = {
+    schemaVersion: 1, kind: "scheduled-rule-evaluation-cohort",
+    generation: "e".repeat(32), intakeGeneration: intake.generation,
+    binding: { ...intake.binding, configDigest: "c".repeat(64) },
+    observedUtc: "2026-09-24T21:01:00Z",
+    inventory: { state: "complete", discovered: 1, eligible: 1, excludedOtherTargets: 0 },
+    heads: [{
+      pullRequestId: head.pullRequestId, sourceCommit: head.sourceCommit,
+      targetCommit: head.targetCommit, targetRef: head.targetRef, iterationId: head.iterationId,
+      rules: [{ capabilityId: "bpm-future-rule@1", ruleId: "future-rule",
+        status: "pending", reasonCode: "not-selected", observationDigest: null,
+        declarationDigest: null }],
+    }],
+    rules: [{ capabilityId: "bpm-future-rule@1", ruleId: "future-rule",
+      discovered: 1, eligible: 1, evaluated: 0, pending: 1, skipped: 0,
+      unknown: 0, error: 0, gaps: [] }],
+    gaps: [],
+  };
+  assert.equal(parseRuleEvaluationCohort(raw, intake).rules[0]?.pending, 1);
+  assert.equal(parseRuleEvaluationCohort(raw, intake).draftExcluded, null);
+  asObject(raw.inventory).draftExcluded = -1;
+  assert.throws(() => parseRuleEvaluationCohort(raw, intake), /invalid rule evaluation count/);
+  delete asObject(raw.inventory).draftExcluded;
+  asObject((raw.rules as JsonRecord[])[0]).evaluated = 1;
+  assert.throws(() => parseRuleEvaluationCohort(raw, intake), /reconcile/);
+  asObject((raw.rules as JsonRecord[])[0]).evaluated = 0;
+  asObject((raw.heads as JsonRecord[])[0]).sourceCommit = "a".repeat(40);
+  assert.throws(() => parseRuleEvaluationCohort(raw, intake), /match intake/);
+  asObject((raw.heads as JsonRecord[])[0]).sourceCommit = head.sourceCommit;
+  (asObject((raw.heads as JsonRecord[])[0]).rules as JsonRecord[])[0]!.status = "evaluated";
+  assert.throws(() => parseRuleEvaluationCohort(raw, intake), /without current-head evidence/);
+  const base = {
+    schemaVersion: 1, kind: "devpilot-owner-reporting-config",
+    roots: { state: resolve("state"), config: resolve("config"), toolkit: resolve("toolkit") },
+    files: { toolkitConfig: resolve("toolkit-config.json") },
+  };
+  assert.throws(() => parseReportingConfiguration({
+    ...base, roots: { ...base.roots, ruleEvaluation: resolve("rule-evaluation") },
+  }), /configured together/);
+  assert.throws(() => parseReportingConfiguration({
+    ...base, files: { ...base.files, ruleEvaluationCohort: resolve("cohort.json") },
+  }), /configured together/);
+});
