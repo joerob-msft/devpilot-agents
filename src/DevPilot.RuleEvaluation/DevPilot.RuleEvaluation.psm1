@@ -544,7 +544,8 @@ function Invoke-BoundedRuleEvaluation {
         [Parameter(Mandatory)][scriptblock]$Provider,
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][string]$RepositoryRoot,
-        [string]$SignatureKey, [scriptblock]$OwnerEvaluator, [switch]$Run)
+        [string]$SignatureKey, [scriptblock]$OwnerEvaluator,
+        [int[]]$CanaryPullRequestIds, [switch]$Run)
     Assert-RuleConfig $Config $IntakeConfig $SignatureKey ([bool]$Run)
     if (-not $Run -or -not $Config.enabled) {
         return @{ schemaVersion = 1; kind = 'scheduled-rule-evaluation-disabled'
@@ -564,6 +565,37 @@ function Invoke-BoundedRuleEvaluation {
     $state = Resolve-AgentTrustedRoot -Path $StateRoot -Kind durable-state `
         -RepositoryRoot $RepositoryRoot
     $intake = Assert-RuleIntake $state $Config $IntakeConfig $RepositoryRoot
+    $canary = $Config['canary']
+    if ($null -ne $canary -or $PSBoundParameters.ContainsKey('CanaryPullRequestIds')) {
+        if ($canary -isnot [Collections.IDictionary] -or
+            $canary.schemaVersion -ne 1 -or
+            $canary.intakeGeneration -cne $intake.generation -or
+            $canary.intakeConfigDigest -cne $intake.binding.configDigest -or
+            $canary.heads -isnot [array] -or
+            $canary.heads.Count -lt 1 -or $canary.heads.Count -gt 2 -or
+            $CanaryPullRequestIds.Count -ne $canary.heads.Count -or
+            $Config.limits.maxHeadsPerRun -gt 2) {
+            throw 'canary-binding-mismatch'
+        }
+        $seenCanaries = [Collections.Generic.HashSet[int]]::new()
+        foreach ($pin in $canary.heads) {
+            $id = Assert-RuleNumber $pin.pullRequestId pullRequestId 1 ([int]::MaxValue)
+            $head = @($intake.heads | Where-Object pullRequestId -EQ $id)
+            if (-not $seenCanaries.Add($id) -or
+                $id -notin $CanaryPullRequestIds -or $head.Count -ne 1 -or
+                $head[0].targetRef -cne 'refs/heads/master' -or
+                $head[0].status -cne 'pending' -or
+                $null -eq $head[0].lineEvidence -or
+                $pin.sourceCommit -cne $head[0].sourceCommit -or
+                $pin.targetCommit -cne $head[0].targetCommit -or
+                $pin.targetRef -cne $head[0].targetRef -or
+                $pin.iterationId -ne $head[0].iterationId -or
+                $pin.declarationDigest -cne $head[0].declarationDigest -or
+                $pin.lineEvidenceDigest -cne $head[0].lineEvidenceDigest) {
+                throw 'canary-binding-mismatch'
+            }
+        }
+    }
     $root = Resolve-AgentTrustedRoot -Path (Join-Path $state 'rule-evaluation-v1') `
         -Kind durable-state -RepositoryRoot $RepositoryRoot -Create
     $generations = Resolve-AgentTrustedRoot -Path (Join-Path $root 'generations') `
@@ -614,9 +646,16 @@ function Invoke-BoundedRuleEvaluation {
             if ($start -eq $eligible.Count) { $start = 0 }
         }
         $selected = [Collections.Generic.HashSet[int]]::new()
-        $limit = [Math]::Min([int]$limits.maxHeadsPerRun, $eligible.Count)
-        for ($i = 0; $i -lt $limit; $i++) {
-            [void]$selected.Add([int]$eligible[($start + $i) % $eligible.Count].pullRequestId)
+        $limit = if ($null -ne $canary) { $canary.heads.Count }
+        else { [Math]::Min([int]$limits.maxHeadsPerRun, $eligible.Count) }
+        if ($null -ne $canary) {
+            foreach ($pin in $canary.heads) {
+                [void]$selected.Add([int]$pin.pullRequestId)
+            }
+        } else {
+            for ($i = 0; $i -lt $limit; $i++) {
+                [void]$selected.Add([int]$eligible[($start + $i) % $eligible.Count].pullRequestId)
+            }
         }
         $generation = [guid]::NewGuid().ToString('N')
         $cohort = [ordered]@{
@@ -638,7 +677,8 @@ function Invoke-BoundedRuleEvaluation {
                 excludedOtherTargets = $intake.inventory.excludedOtherTargets
                 draftExcluded = $intake.inventory.draft
             }
-            cursor = [ordered]@{ nextPullRequestId = if ($eligible.Count) {
+            cursor = [ordered]@{ nextPullRequestId = if ($eligible.Count -and
+                    $null -eq $canary) {
                     $eligible[($start + $limit) % $eligible.Count].pullRequestId
                 } else { $null } }
             heads = @(); rules = @(); gaps = @()

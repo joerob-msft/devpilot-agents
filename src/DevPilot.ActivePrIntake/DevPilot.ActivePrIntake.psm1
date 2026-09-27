@@ -705,9 +705,18 @@ function Invoke-ActivePrIntake {
         [Parameter(Mandatory)][scriptblock]$Provider,
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][string]$RepositoryRoot,
+        [int[]]$CanaryPullRequestIds,
         [switch]$Run
     )
     Assert-IntakeConfig $Config
+    if ($PSBoundParameters.ContainsKey('CanaryPullRequestIds')) {
+        if ($CanaryPullRequestIds.Count -lt 1 -or $CanaryPullRequestIds.Count -gt 2 -or
+            @($CanaryPullRequestIds | Where-Object { $_ -lt 1 }).Count -gt 0 -or
+            @($CanaryPullRequestIds | Select-Object -Unique).Count -ne
+                $CanaryPullRequestIds.Count) {
+            throw 'invalid-canary-selection'
+        }
+    }
     $StateRoot = Test-IntakeStateRootReadOnly -Path $StateRoot `
         -RepositoryRoot $RepositoryRoot
     if (-not $Run -or -not $Config.enabled) {
@@ -875,6 +884,13 @@ function Invoke-ActivePrIntake {
                         $item = $first.seen[[string]$_].value
                         -not $item.isDraft -and $item.targetRef -ceq 'refs/heads/master'
                     })
+                if ($PSBoundParameters.ContainsKey('CanaryPullRequestIds')) {
+                    foreach ($canaryId in $CanaryPullRequestIds) {
+                        if ($canaryId -notin $eligible) {
+                            throw 'canary-not-in-complete-eligible-inventory'
+                        }
+                    }
+                }
                 $start = 0
                 if ($previous -and $previous.binding.configDigest -ceq $envelope.binding.configDigest -and
                     $null -ne $previous.cursor.nextPullRequestId -and $eligible.Count -gt 0) {
@@ -884,13 +900,25 @@ function Invoke-ActivePrIntake {
                 }
                 $selected = [Collections.Generic.HashSet[int]]::new()
                 $selectedOrder = [Collections.Generic.List[int]]::new()
-                $limit = [Math]::Min($eligible.Count, [int]$Config.limits.maxHeadsPerRun)
-                for ($n = 0; $n -lt $limit; $n++) {
-                    $candidate = $eligible[($start + $n) % $eligible.Count]
-                    [void]$selected.Add($candidate)
-                    $selectedOrder.Add($candidate)
+                $limit = if ($PSBoundParameters.ContainsKey('CanaryPullRequestIds')) {
+                    $CanaryPullRequestIds.Count
+                } else {
+                    [Math]::Min($eligible.Count, [int]$Config.limits.maxHeadsPerRun)
                 }
-                if ($eligible.Count -gt 0) {
+                if ($PSBoundParameters.ContainsKey('CanaryPullRequestIds')) {
+                    foreach ($candidate in $CanaryPullRequestIds) {
+                        [void]$selected.Add($candidate)
+                        $selectedOrder.Add($candidate)
+                    }
+                } else {
+                    for ($n = 0; $n -lt $limit; $n++) {
+                        $candidate = $eligible[($start + $n) % $eligible.Count]
+                        [void]$selected.Add($candidate)
+                        $selectedOrder.Add($candidate)
+                    }
+                }
+                if ($eligible.Count -gt 0 -and
+                    -not $PSBoundParameters.ContainsKey('CanaryPullRequestIds')) {
                     $envelope.cursor.nextPullRequestId =
                         $eligible[($start + $limit) % $eligible.Count]
                 }
@@ -1164,6 +1192,7 @@ function Invoke-ActivePrIntake {
         catch {
             $reason = [string]$_.Exception.Message
             if ($reason -cnotin @('account-mismatch', 'invalid-page', 'mutable-page',
+                    'canary-not-in-complete-eligible-inventory',
                     'missing-page', 'page-budget', 'pr-budget', 'read-budget',
                     'time-budget')) { $reason = 'page-inaccessible' }
             $envelope.gaps.enumerationUnknown = 1
@@ -1314,8 +1343,22 @@ function Invoke-ActivePrIntake {
 
 function New-ActivePrAzureDevOpsProvider {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][Collections.IDictionary]$Config, [string]$AzureCliPath = 'az')
-    Assert-IntakeConfig $Config
+    param([Parameter(Mandatory)][Collections.IDictionary]$Config,
+        [string]$AzureCliPath = 'az', [switch]$Bootstrap)
+    if ($Bootstrap) {
+        if ([string]$Config.organization -cnotmatch
+                '^https://(?:dev\.azure\.com/[A-Za-z0-9_-]+|[A-Za-z0-9_-]+\.visualstudio\.com)/?$' -or
+            [string]$Config.identityResource -cnotmatch
+                '^https://[A-Za-z0-9-]+\.vssps\.visualstudio\.com/?$' -or
+            [string]$Config.projectName -cnotmatch '^[\w .-]{1,128}$' -or
+            [string]$Config.repositoryId -cnotmatch
+                '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+            [string]$Config.repositoryName -cnotmatch '^[A-Za-z0-9._-]{1,128}$') {
+            throw 'bootstrap-repository-invalid'
+        }
+    } else {
+        Assert-IntakeConfig $Config
+    }
     $org = [string]$Config.organization
     $project = [string]$Config.projectName
     $projectId = [string]$Config.projectId
@@ -1449,6 +1492,9 @@ function New-ActivePrAzureDevOpsProvider {
     $digest = ${function:Get-IntakeDigest}
     $handler = {
         param([string]$Operation, [Collections.IDictionary]$Request)
+        if ($Bootstrap -and $Operation -cnotin @('Identity', 'Metadata')) {
+            throw 'bootstrap-read-not-allowed'
+        }
         $budget = if ($null -ne $Request['timeoutMilliseconds']) {
             [int]$Request.timeoutMilliseconds
         } else { [int]$Config.limits.maxSeconds * 1000 }
@@ -1464,6 +1510,60 @@ function New-ActivePrAzureDevOpsProvider {
                 }
                 return @{ id = $user.id; descriptor = $user.subjectDescriptor
                     uniqueName = $name }
+            }
+            Metadata {
+                $name = [string]$Request.repositoryName
+                if ($name -cnotmatch '^[A-Za-z0-9._-]{1,128}$') {
+                    throw 'repository-mismatch'
+                }
+                $p = & $invoke 'core' 'projects' @("project=$project") @() $deadline
+                $r = & $invoke 'git' 'repositories' @(
+                    "project=$project", "repositoryId=$repo") @() $deadline
+                if ([string]$p.id -cnotmatch
+                        '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+                    ($projectId -and [string]$p.id -ine $projectId) -or
+                    [string]$p.name -cne $project -or
+                    [string]$r.id -ine $repo -or
+                    [string]$r.name -cne $name -or
+                    [string]$r.project.id -ine [string]$p.id) {
+                    throw 'repository-mismatch'
+                }
+                return @{ projectId = $p.id; projectName = $p.name
+                    repositoryId = $r.id; repositoryName = $r.name }
+            }
+            RuleSource {
+                $sourceProject = [string]$Request.projectName
+                $sourceRepo = [string]$Request.repositoryId
+                $commit = [string]$Request.commit
+                $path = [string]$Request.path
+                if ($sourceProject -cnotmatch '^[\w .-]{1,128}$' -or
+                    $sourceRepo -cnotmatch
+                        '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+                    $commit -cnotmatch '^[a-f0-9]{40}$' -or
+                    $path -cnotin @(
+                        '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md',
+                        '/src/DevPilot.OwnerCapability/Policy/test-class-coverage.v1.txt',
+                        '/src/DevPilot.OwnerCapability/Policy/redundant-method-coverage.v1.txt',
+                        '/src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
+                    )) {
+                    throw 'rule-source-invalid'
+                }
+                $metadata = & $invoke 'git' 'repositories' @(
+                    "project=$sourceProject", "repositoryId=$sourceRepo") @() $deadline
+                if ([string]$metadata.id -ine $sourceRepo -or
+                    [string]$metadata.project.name -cne $sourceProject -or
+                    [string]$metadata.name -cne [string]$Request.repositoryName) {
+                    throw 'rule-source-mismatch'
+                }
+                $item = & $invoke 'git' 'items' @(
+                    "project=$sourceProject", "repositoryId=$sourceRepo") @(
+                    "path=$path", "versionDescriptor.version=$commit",
+                    'versionDescriptor.versionType=commit', 'includeContent=true',
+                    'includeContentMetadata=true') $deadline 1048576
+                $blob = & $assertBlob $item $path ([string]$item.objectId) 262144
+                return @{ content = $blob.text; repositoryId = $metadata.id
+                    repositoryName = $metadata.name; projectName = $metadata.project.name
+                    commit = $commit; path = $path }
             }
             ListPage {
                 $r = & $invoke 'git' 'pullRequests' @("project=$project", "repositoryId=$repo") @(

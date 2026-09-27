@@ -116,14 +116,56 @@ private external `active-owner-evaluation-v1` state root. The dispatcher
 supplies its already-budgeted discussion response to the Owner adapter;
 there is no second unaccounted ADO discussion read. Source is not written in
 this repository or normal output. An operator must separately acquire and
-verify the pinned EngHub section and configure the live model; this PR does
-not supply credentials, signed live configuration, or an active intake
-generation. A private GET-only canary also remains blocked on a repository-owned
-trusted provisioner for the exact pinned intake configuration, signed
-dispatcher configuration and rule-source metadata, plus a bounded explicit
-PR-ID selection path in the complete two-pass inventory. Do not fabricate a
-cohort, hand-sign a configuration, or treat a prior pinned Owner head as
-evidence for a new one.
+verify the pinned EngHub section and configure the live model; this command
+does not supply credentials, signed live configuration, or an active intake
+generation.
+
+For a **private syntactic canary only**, use
+`tools/Invoke-ActivePrCanaryQualification.ps1` instead of hand-signing a
+configuration or fabricating a cohort. Its `-Run` switch is default-off.
+It accepts one or two explicit `-CanaryPullRequestIds` and a **new**, absolute
+external `-StateRoot`. It reads an existing private ADO provider config from
+`-ProviderConfigPath` (with `provider: AzureDevOps`, `repository.organization`,
+`repository.project`, `repository.name`, `repository.id`, and
+`operator.defaultAlias`) and a separately approved external rule-source
+manifest from `-ApprovedSourcesPath`. Both files must be private and outside
+the repository. Optional `projectId` and `expectedAccount` in the provider
+config are checked against GET results; otherwise the tool derives the exact
+GUID/descriptor/UPN with read-only project, repository, and connection GETs
+and checks the authenticated account against `operator.defaultAlias`.
+
+The approved source manifest has keys `owner`, `class`, `redundant`, and
+`named`. Each entry must explicitly set `approved: true`, `projectName`,
+`repositoryName`, `repositoryId`, `commit`, and `path`. The Owner entry must
+pin EngHub's `documentation/EngineeringProcesses/Conventions/AutomatedTests.md`
+at `f6db83436b48f48a8521095a888d79f67823bbb2`; the other three entries
+must independently identify their *actual approved* policy source commits
+and the corresponding
+`src/DevPilot.OwnerCapability/Policy/{test-class-coverage,redundant-method-coverage,named-areequal-arguments}.v1.txt`
+paths. The tool fetches each pinned source via GET, checks local policy
+bytes against the remote policy bytes, verifies the Owner section digest
+against its fixed SHA-256, and records both Owner and `## Named parameters for Assert`
+section provenance. It does not attribute class or redundant policy to
+EngHub. Missing approvals or mismatched content stop provisioning; do not
+invent a commit or repository ID to satisfy the contract.
+
+The tool then uses the intake provider's two complete bounded listing passes
+over *all* active PRs, excludes drafts and non-master targets, and pins the
+chosen subset's source/target/iteration and changed-line proof. A missing
+candidate, incomplete inventory, or unknown selected line proof stops before
+signing. Only then does it create a cryptographically random signing key,
+private intake/config files, and an HMAC-signed evaluation config under the
+new ACL-checked root. The dispatcher checks the signed canary pins against
+the immutable intake generation before any evaluation GET. No CLI argument
+or normal output contains the key, credentials, raw source, or discussion
+bodies. The qualification tool **never runs the Owner model** (no credential,
+model tool, or posting path): it reports Owner as `unknown/not-attempted`
+and runs only deterministic class, redundant, and named rules. This is
+read-only hypothetical `wouldCreate` evidence, not delivery authorization;
+the signed config cannot grant posting. If a head or discussion changes,
+the result is unknown and zero provider writes. A separate explicitly
+authorized live-model qualification and delivery approval are still required
+before any Owner evaluation or automatic comments.
 
 The signed dispatcher enforces a 20-head batch, 32-finding ceiling,
 configured ADO read/time budgets, and the Owner orchestrator's existing
