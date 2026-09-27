@@ -483,6 +483,62 @@ function Get-ActivePrDiscussionCounts {
     return Get-IntakeDiscussionCounts $Response $Config $verified
 }
 
+function Get-ActivePrDiscussionSnapshot {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][Collections.IDictionary]$Response,
+        [Parameter(Mandatory)][Collections.IDictionary]$Config,
+        [Parameter(Mandatory)][Collections.IDictionary]$Head,
+        [Parameter(Mandatory)][object]$Contract)
+    Assert-IntakeConfig $Config
+    $verified = Assert-IntakeHead $Head ([int]$Head.pullRequestId) $Config
+    $request = $Contract.Request
+    if ([string]$request.RepositoryId -ine $verified.repositoryId -or
+        [string]$request.ProjectId -ine $verified.projectId -or
+        [long]$request.PullRequestId -ne $verified.pullRequestId -or
+        [string]$request.SourceCommit -cne $verified.sourceCommit -or
+        [string]$request.TargetCommit -cne $verified.targetCommit -or
+        [string]$request.TargetRef -cne $verified.targetRef) {
+        throw 'discussion-head-mismatch'
+    }
+    [void](Get-IntakeDiscussionCounts $Response $Config $verified)
+    $threads = [Collections.Generic.List[object]]::new()
+    foreach ($thread in $Response.threads) {
+        $copy = [ordered]@{}
+        foreach ($name in $thread.Keys) { $copy[[string]$name] = $thread[$name] }
+        $unique = [Collections.Generic.List[object]]::new()
+        $seen = [Collections.Generic.HashSet[int]]::new()
+        foreach ($comment in $thread.comments) {
+            if ($seen.Add([int]$comment.id)) { [void]$unique.Add($comment) }
+        }
+        $copy.comments = @($unique)
+        [void]$threads.Add($copy)
+    }
+    $raw = [ordered]@{ count = $threads.Count; value = @($threads) }
+    $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
+        -Id ([string]$Config.expectedAccount.id) `
+        -Descriptor ([string]$Config.expectedAccount.descriptor) `
+        -UniqueName ([string]$Config.expectedAccount.uniqueName)
+    $convertPage = Get-Command ConvertTo-OwnerAzureDevOpsDiscussionPage
+    $handler = {
+        param($operation, $arguments)
+        if ($operation -cne 'GetDiscussionPage') { throw 'unsupported-read' }
+        & $convertPage -Arguments $arguments -RawResponse $raw `
+            -CurrentIteration @{ id = $verified.iterationId
+                sourceCommit = $verified.sourceCommit
+                targetCommit = $verified.targetCommit } -ReviewerIdentity $reviewer
+    }.GetNewClosure()
+    $adapter = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+        -Name 'bounded-rule-discussions' -ReviewerIdentity $reviewer -Handler $handler
+    $limits = New-OwnerDiscussionLimits -MaximumPages 10 -PageSize 200 `
+        -MaximumThreads ([int]$Config.limits.maxThreads) `
+        -MaximumComments ([int]$Config.limits.maxComments) -MaximumBytes 16777216
+    $snapshot = Get-OwnerDiscussionSnapshot -Contract $Contract -Provider $adapter `
+        -Limits $limits -RequireAzureDevOpsProvenance
+    if ($snapshot.CurrentIterationId -ne $verified.iterationId -or
+        $snapshot.ThreadCount -ne $threads.Count) { throw 'invalid-discussions' }
+    return $snapshot
+}
+
 function Get-IntakePriorObservation {
     param($Previous, [int]$Id, [string]$RuleId, [string]$Capability,
         [string]$CurrentDigest, [string]$ConfigDigest)
@@ -1674,4 +1730,4 @@ function New-ActivePrAzureDevOpsProvider {
     return $handler
 }
 
-Export-ModuleMember -Function Invoke-ActivePrIntake, New-ActivePrAzureDevOpsProvider, Get-ActivePrDiscussionCounts
+Export-ModuleMember -Function Invoke-ActivePrIntake, New-ActivePrAzureDevOpsProvider, Get-ActivePrDiscussionCounts, Get-ActivePrDiscussionSnapshot

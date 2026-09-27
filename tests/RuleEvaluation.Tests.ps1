@@ -3,6 +3,8 @@ BeforeAll {
     $repo = Split-Path $PSScriptRoot -Parent
     Import-Module (Join-Path $repo 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
     Import-Module (Join-Path $repo 'src\DevPilot.RuleEvaluation\DevPilot.RuleEvaluation.psd1') -Force
+    Import-Module (Join-Path $repo 'src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
+    Import-Module (Join-Path $repo 'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1')
     $script:roots = [Collections.Generic.List[string]]::new()
     function Get-TestDigest($Value) {
         $json = ConvertTo-Json -InputObject $Value -Depth 32 -Compress
@@ -26,6 +28,7 @@ BeforeAll {
     }
     function New-RuleCase {
         param([int]$Master = 1, [int]$Other = 0, [int]$Unknown = 0,
+            [int]$Iteration = 1,
             [switch]$EnableCoverage, [switch]$EnableOwner,
             [switch]$EnableRedundant, [switch]$EnableNamed, [string]$Content)
         $intakeConfig = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') -Raw |
@@ -37,6 +40,27 @@ BeforeAll {
         if ($EnableOwner) { $config.rules[0].enabled = $true }
         if ($EnableRedundant) { $config.rules[2].enabled = $true }
         if ($EnableNamed) { $config.rules[3].enabled = $true }
+        $policies = @('test-class-coverage', 'redundant-method-coverage',
+            'named-areequal-arguments')
+        for ($ruleIndex = 1; $ruleIndex -le 3; $ruleIndex++) {
+            if (-not $config.rules[$ruleIndex].enabled) { continue }
+            $policy = $policies[$ruleIndex - 1]
+            $text = [IO.File]::ReadAllText((Join-Path $repo (
+                        "src\DevPilot.OwnerCapability\Policy\$policy.v1.txt")))
+            $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                    [Text.Encoding]::UTF8.GetBytes($text))).ToLowerInvariant()
+            $capabilityHash = [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData(
+                    [Text.Encoding]::UTF8.GetBytes("$policy-capability-v1")
+                )).ToLowerInvariant()
+            $config.rules[$ruleIndex].binding = [ordered]@{
+                ruleRepositoryId = 'rules-example'
+                rulePath = "src/DevPilot.OwnerCapability/Policy/$policy.v1.txt"
+                ruleCommit = 'c' * 40
+                ruleHash = "v1:sha256:$hash"
+                capabilityDigest = "v1:sha256:$capabilityHash"
+            }
+        }
         Sign-TestConfig $config
         $root = Join-Path $env:USERPROFILE (
             '.copilot\rule-evaluation-pester-' + [guid]::NewGuid().ToString('N'))
@@ -67,7 +91,7 @@ BeforeAll {
                 pullRequestId = $i; sourceRef = 'refs/heads/feature'
                 targetRef = $target; sourceCommit = 'a' * 40
                 targetCommit = 'b' * 40; commonCommit = 'c' * 40
-                iterationId = 1; status = 'active'; isDraft = $false
+                iterationId = $Iteration; status = 'active'; isDraft = $false
             }
             $declarations[$i] = $declaration
             $file = [ordered]@{
@@ -98,7 +122,7 @@ BeforeAll {
                     declarationDigest = if ($available) { Get-TestDigest $declaration } else { $null }
                     sourceCommit = if ($available) { 'a' * 40 } else { $null }
                     targetCommit = if ($available) { 'b' * 40 } else { $null }
-                    iterationId = if ($available) { 1 } else { $null }
+                    iterationId = if ($available) { $Iteration } else { $null }
                     status = $state; reason = $reason
                     lineEvidence = if ($available) { $evidence } else { $null }
                     lineEvidenceDigest = if ($available) { Get-TestDigest $evidence } else { $null }
@@ -182,6 +206,54 @@ BeforeAll {
         Invoke-BoundedRuleEvaluation -Config $Case.config -IntakeConfig $Case.intakeConfig `
             -Provider $Case.provider -StateRoot $Case.root -RepositoryRoot $repo `
             -SignatureKey 'synthetic-key' -Run
+    }
+    function Get-RuleCaseObservation($Case, $Result, [int]$RuleIndex = 1) {
+        $digest = $Result.heads[0].rules[$RuleIndex].observationDigest
+        Get-Content -LiteralPath (Join-Path $Case.root (
+                "rule-evaluation-v1\observations\$digest.json")) -Raw |
+            ConvertFrom-Json -AsHashtable
+    }
+    function New-RuleCaseThread {
+        param($Case, [int]$Line, [string]$Body, [int]$Id = 1,
+            [int]$Iteration = 1, [string]$Status = 'active',
+            [string]$Path = '/Example.cs', [switch]$Foreign)
+        $author = if ($Foreign) {
+            @{ id = '44444444-4444-4444-4444-444444444444'
+                descriptor = 'aad.foreign'; uniqueName = 'foreign@example.invalid' }
+        } else { $Case.intakeConfig.expectedAccount }
+        return @{ id = $Id; status = $Status
+            comments = @(@{ id = 1; author = $author; commentType = 'text'
+                    content = $Body })
+            threadContext = @{ filePath = $Path; rightFileStart = @{ line = $Line }
+                rightFileEnd = @{ line = $Line } }
+            pullRequestThreadContext = @{ changeTrackingId = 1
+                iterationContext = @{ firstComparingIteration = $Iteration
+                    secondComparingIteration = $Iteration } } }
+    }
+    function Get-RuleCaseClassBody($Case) {
+        $binding = $Case.config.rules[1].binding
+        $head = $Case.state.declarations[1]
+        $contract = New-OwnerAcquisitionContract `
+            -RepositoryId $head.repositoryId -ProjectId $head.projectId `
+            -PullRequestId $head.pullRequestId -SourceCommit $head.sourceCommit `
+            -TargetCommit $head.targetCommit -TargetRef $head.targetRef `
+            -RuleRepositoryId $binding.ruleRepositoryId -RulePath $binding.rulePath `
+            -RuleCommit $binding.ruleCommit -RuleSection $Case.config.rules[1].capabilityId `
+            -RuleHash $binding.ruleHash -RuleLength 100 `
+            -ConfigId 'bounded-rule-evaluation-v1' `
+            -ConfigDigest ("v1:sha256:$(Get-TestDigest $Case.config)") `
+            -CapabilityId $Case.config.rules[1].capabilityId `
+            -CapabilityDigest $binding.capabilityDigest
+        $constructRef = 'construct:' + (Get-TestDigest @(
+                $Case.config.rules[1].capabilityId, '/Example.cs', 'Example', 3, 3))
+        $finding = @{ disposition = 'violation'; constructRef = $constructRef
+            anchor = @{ path = 'Example.cs'; line = 3; symbol = 'Example' }
+            binding = @{ source = @{ representation = @{
+                            constructIdentity = $constructRef; path = 'Example.cs'
+                            symbol = 'Example'; startLine = 3; endLine = 3 } } } }
+        $marker = Get-TestClassCoverageMarkerKey -Contract $contract -Finding $finding
+        Format-TestClassCoverageComment -Contract $contract -Finding $finding `
+            -MarkerKey $marker
     }
 }
 AfterAll {
@@ -289,7 +361,13 @@ Describe 'Bounded read-only scheduled rule evaluation' {
         $declaration.lineEvidenceDigest |
             Should -Be $c.intake.heads[0].lineEvidenceDigest
         $declaration.writerEligible | Should -BeFalse
+        $declaration.ruleBinding.ruleHash | Should -Be $c.config.rules[1].binding.ruleHash
+        $declaration.ruleBinding.capabilityDigest |
+            Should -Be $c.config.rules[1].binding.capabilityDigest
         $observation.declarationDigest | Should -Be $rule.declarationDigest
+        $observation.outcome.noOp + $observation.outcome.humanCovered +
+            $observation.outcome.wouldCreate + $observation.outcome.unknown |
+            Should -Be $observation.outcome.findings
         (Get-Content $path -Raw) | Should -Not -Match 'Example.cs|Assert.AreEqual'
     }
     It 'keeps redundant exclusions per class and named positional calls per method independent' {
@@ -340,7 +418,7 @@ public class Second { }
         $result.heads[0].rules[1].reasonCode | Should -Be 'finding-cap'
         $result.heads[0].rules[1].observationDigest | Should -BeNullOrEmpty
     }
-    It 'treats duplicate historical same-account human comments as human and never posts' {
+    It 'keeps near-shifted same-account human comments unknown and never posts' {
         $c = New-RuleCase -EnableCoverage
         $account = $c.intakeConfig.expectedAccount
         $c.state.discussions = @(
@@ -358,11 +436,197 @@ public class Second { }
                         secondComparingIteration = 1 } } }
         )
         $result = Invoke-RuleCase $c
-        $result.rules[1].unknown | Should -Be 1
-        $result.rules[1].evaluated | Should -Be 0
+        $result.rules[1].evaluated | Should -Be 1
+        $observation = Get-RuleCaseObservation $c $result
+        $observation.outcome.unknown | Should -Be 1
+        $observation.outcome.wouldCreate | Should -Be 0
         ($result | ConvertTo-Json -Depth 32) |
             Should -Not -Match 'Please add|prior note|Example.cs'
         $result.providerWrites | Should -Be 0
+    }
+    It 'distinguishes an exact reviewer marker from same-account unmarked human coverage' {
+        $c = New-RuleCase -EnableCoverage
+        $body = Get-RuleCaseClassBody $c
+        $c.state.discussions = @(New-RuleCaseThread $c 3 $body)
+        $first = Invoke-RuleCase $c
+        $firstObservation = Get-RuleCaseObservation $c $first
+        $firstObservation.outcome.noOp | Should -Be 1
+        $firstObservation.outcome.humanCovered | Should -Be 0
+        $c.state.discussions = @(New-RuleCaseThread $c 3 'Exclude from code coverage.')
+        $second = Invoke-RuleCase $c
+        $secondObservation = Get-RuleCaseObservation $c $second
+        $secondObservation.outcome.humanCovered | Should -Be 1
+        $secondObservation.outcome.noOp | Should -Be 0
+        $secondObservation.outcome.wouldCreate | Should -Be 0
+        $second.generation | Should -Not -Be $first.generation
+        $secondObservation.discussionDigest | Should -Match '^[a-f0-9]{64}$'
+        @($c.state.calls | Where-Object { $_ -match '^(Post|Update|Create):' }).Count |
+            Should -Be 0
+    }
+    It 'treats stale, closed, moved, and overlapping marker threads as unknown' {
+        foreach ($mode in @('historical', 'closed', 'moved', 'overlap')) {
+            $c = New-RuleCase -EnableCoverage -Iteration $(if ($mode -eq 'historical') { 2 } else { 1 })
+            $body = Get-RuleCaseClassBody $c
+            $c.state.discussions = @(switch ($mode) {
+                historical { New-RuleCaseThread $c 3 $body -Iteration 1 }
+                closed { New-RuleCaseThread $c 3 $body -Status 'closed' }
+                moved { New-RuleCaseThread $c 4 $body }
+                overlap {
+                    New-RuleCaseThread $c 3 $body -Id 1
+                    New-RuleCaseThread $c 3 'Exclude from code coverage.' -Id 2
+                }
+            })
+            $result = Invoke-RuleCase $c
+            $result.rules[1].evaluated | Should -Be 1
+            $outcome = (Get-RuleCaseObservation $c $result).outcome
+            $outcome.unknown | Should -Be 1 -Because $mode
+            $outcome.noOp | Should -Be 0
+            $outcome.wouldCreate | Should -Be 0
+        }
+    }
+    It 'groups a plural class review over changed attributes and isolates method reviews' {
+        $content = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using System.Diagnostics.CodeAnalysis;
+[TestClass]
+[ExcludeFromCodeCoverage]
+public class Example {
+  [TestMethod]
+  [ExcludeFromCodeCoverage]
+  public void First() { Assert.AreEqual(1, 1); }
+  [TestMethod]
+  [ExcludeFromCodeCoverage]
+  public void Second() { Assert.AreEqual(2, 2); }
+}
+'@
+        $c = New-RuleCase -EnableRedundant -EnableNamed -Content ($content + "`n")
+        $c.state.discussions = @(
+            (New-RuleCaseThread $c 10 `
+                'These method-level coverage exclusions are redundant because the entire class is already excluded.' -Id 1),
+            (New-RuleCaseThread $c 8 'Please use named expected and actual arguments in Assert.AreEqual.' -Id 2))
+        $result = Invoke-RuleCase $c
+        $redundant = (Get-RuleCaseObservation $c $result 2).outcome
+        $redundant.findings | Should -Be 1
+        $redundant.humanCovered | Should -Be 1
+        $named = (Get-RuleCaseObservation $c $result 3).outcome
+        $named.findings | Should -Be 2
+        $named.humanCovered | Should -Be 1
+        $named.wouldCreate | Should -Be 1
+    }
+    It 'fails closed on incomplete discussion counts and unsigned rule provenance' {
+        $c = New-RuleCase -EnableCoverage
+        $c.config.rules[1].binding.ruleCommit = ''
+        Sign-TestConfig $c.config
+        { Invoke-RuleCase $c } | Should -Throw '*rule-binding-unavailable*'
+        $c.state.calls.Count | Should -Be 0
+        $valid = New-RuleCase -EnableCoverage
+        $provider = $valid.provider
+        $valid.provider = {
+            param($operation, $request)
+            if ($operation -ceq 'Discussions') {
+                return @{ count = 2; threads = @() }
+            }
+            & $provider $operation $request
+        }.GetNewClosure()
+        $result = Invoke-RuleCase $valid
+        $result.rules[1].evaluated | Should -Be 0
+        $result.rules[1].unknown | Should -Be 1
+        $result.heads[0].rules[1].reasonCode | Should -Be 'invalid-discussions'
+        $result.providerWrites | Should -Be 0
+    }
+    It 'does not treat foreign marker text, incomplete anchors or body drift as no-op' {
+        foreach ($mode in @('foreign', 'unanchored', 'unanchored-human', 'body-drift')) {
+            $c = New-RuleCase -EnableCoverage
+            $body = Get-RuleCaseClassBody $c
+            $thread = New-RuleCaseThread $c 3 $body -Foreign:($mode -eq 'foreign')
+            if ($mode -in @('unanchored', 'unanchored-human')) {
+                $thread.threadContext.Remove('rightFileStart')
+            }
+            if ($mode -eq 'unanchored-human') {
+                $thread.comments[0].content = 'Exclude from code coverage.'
+            }
+            if ($mode -eq 'body-drift') {
+                $thread.comments[0].content = $body.Replace(
+                    'Suggested fix:', 'Suggested correction:')
+            }
+            $c.state.discussions = @($thread)
+            $result = Invoke-RuleCase $c
+            $result.rules[1].evaluated | Should -Be 1
+            $outcome = (Get-RuleCaseObservation $c $result).outcome
+            $outcome.unknown | Should -Be 1 -Because $mode
+            $outcome.noOp | Should -Be 0
+            $outcome.wouldCreate | Should -Be 0
+        }
+    }
+    It 'reconciles complete paged discussions without broad human gating' {
+        $c = New-RuleCase -EnableCoverage
+        $threads = [Collections.Generic.List[object]]::new()
+        for ($id = 1; $id -le 201; $id++) {
+            [void]$threads.Add((New-RuleCaseThread $c 3 'Unrelated discussion.' `
+                    -Id $id -Path '/Other.cs' -Foreign))
+        }
+        $c.state.discussions = $threads.ToArray()
+        $result = Invoke-RuleCase $c
+        $result.rules[1].evaluated | Should -Be 1
+        $observation = Get-RuleCaseObservation $c $result
+        $observation.outcome.wouldCreate | Should -Be 1
+        $observation.outcome.unknown | Should -Be 0
+        $result.providerWrites | Should -Be 0
+    }
+    It 'treats 22 changed method attributes as one class finding' {
+        $lines = [Collections.Generic.List[string]]::new()
+        foreach ($line in @('using Microsoft.VisualStudio.TestTools.UnitTesting;',
+                'using System.Diagnostics.CodeAnalysis;', '[TestClass]',
+                '[ExcludeFromCodeCoverage]', 'public class Example {')) {
+            [void]$lines.Add($line)
+        }
+        for ($i = 1; $i -le 22; $i++) {
+            [void]$lines.Add('  [TestMethod]')
+            [void]$lines.Add('  [ExcludeFromCodeCoverage]')
+            [void]$lines.Add("  public void Test$i() {}")
+        }
+        [void]$lines.Add('}')
+        $c = New-RuleCase -EnableRedundant -Content (($lines -join "`n") + "`n")
+        $c.state.discussions = @(New-RuleCaseThread $c 7 `
+                'These method-level exclusions are redundant: the class-level coverage exclusion already applies to the entire class.')
+        $result = Invoke-RuleCase $c
+        $observation = Get-RuleCaseObservation $c $result 2
+        $observation.outcome.findings | Should -Be 1
+        $observation.outcome.humanCovered | Should -Be 1
+        $observation.outcome.wouldCreate | Should -Be 0
+    }
+    It 'binds a line-261 human comment only to its named-argument method among 26 calls' {
+        $lines = [Collections.Generic.List[string]]::new()
+        [void]$lines.Add('using Microsoft.VisualStudio.TestTools.UnitTesting;')
+        while ($lines.Count -lt 254) { [void]$lines.Add('') }
+        [void]$lines.Add('[TestClass]')
+        [void]$lines.Add('public class Example {')
+        $firstCallLine = 0
+        for ($method = 1; $method -le 6; $method++) {
+            [void]$lines.Add('  [TestMethod]')
+            [void]$lines.Add("  public void Test$method() {")
+            $calls = if ($method -le 2) { 5 } else { 4 }
+            for ($call = 1; $call -le $calls; $call++) {
+                if ($method -eq 1 -and $call -eq 1) { $firstCallLine = $lines.Count + 1 }
+                [void]$lines.Add("    Assert.AreEqual($call, $call);")
+            }
+            [void]$lines.Add('  }')
+        }
+        [void]$lines.Add('}')
+        while ($firstCallLine -lt 261) {
+            $lines.Insert(254, '')
+            $firstCallLine++
+        }
+        $firstCallLine | Should -Be 261
+        $c = New-RuleCase -EnableNamed -Content (($lines -join "`n") + "`n")
+        $c.state.discussions = @(New-RuleCaseThread $c 261 `
+                'Please use named expected and actual arguments in Assert.AreEqual.')
+        $result = Invoke-RuleCase $c
+        $observation = Get-RuleCaseObservation $c $result 3
+        $observation.outcome.findings | Should -Be 6
+        $observation.outcome.humanCovered | Should -Be 1
+        $observation.outcome.wouldCreate | Should -Be 5
+        $observation.outcome.unknown | Should -Be 0
     }
     It 'fails closed for mid-cycle drift and ADO failures without leaking diagnostics' {
         $c = New-RuleCase -Master 2 -EnableCoverage

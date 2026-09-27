@@ -270,6 +270,7 @@ function ruleRow(rule: RuleSummary): ReportingRow {
     ] : []),
     ...(rule.scheduled ? [
       `SCHEDULED READ-ONLY RULE EVALUATION ${rule.scheduled.state} | generation ${rule.scheduled.generation} | discovered ${rule.scheduled.discovered} / eligible ${rule.scheduled.eligible} / evaluated ${rule.scheduled.evaluated} / pending ${rule.scheduled.pending} / skipped ${rule.scheduled.skipped} / unknown ${rule.scheduled.unknown} / error ${rule.scheduled.error}`,
+      `Current-generation findings ${rule.scheduled.findingCounts.findings} | noOp ${rule.scheduled.findingCounts.noOp} | humanCovered ${rule.scheduled.findingCounts.humanCovered} | wouldCreate ${rule.scheduled.findingCounts.wouldCreate} | unknown ${rule.scheduled.findingCounts.unknown}; only verified exact-head observations count.`,
       `Draft PRs excluded separately: ${rule.scheduled.draftExcluded ?? "unknown"} (outside non-draft rule denominator).`,
       `Current-head evaluated PR scope: ${rule.scheduled.scope.length ? rule.scheduled.scope.map((pr) => `#${pr}`).join(", ") : "none"}. Not pinned service execution or posting authority.`,
       ...rule.scheduled.gaps.map((gap) => `Scheduled gap: ${gap}`),
@@ -339,6 +340,9 @@ export function reportingRows(snapshot: ReportingSnapshot, section: ReportingSec
             `PR #${head.pullRequestId} | ${rule.ruleId} (${rule.capabilityId}) | ${rule.status} / ${rule.reasonCode}`,
             `Source ${shortCommit(head.sourceCommit ?? "")} / target ${shortCommit(head.targetCommit ?? "")} | ${head.targetRef ?? "unknown"} | iteration ${head.iterationId ?? "unknown"}`,
             `Scheduled generation ${evaluation.generation} / intake ${evaluation.intakeGeneration} | observation ${rule.observationDigest ?? "none"}; no posting authority`,
+            ...(rule.status === "evaluated" && rule.outcome ? [
+              `Findings ${rule.outcome.findings} | noOp ${rule.outcome.noOp} | humanCovered ${rule.outcome.humanCovered} | wouldCreate ${rule.outcome.wouldCreate} | unknown ${rule.outcome.unknown}`,
+            ] : []),
           ];
           rules.push({
             key: `scheduled:${evaluation.generation}:${head.pullRequestId}:${rule.capabilityId}:${rule.ruleId}`,
@@ -346,7 +350,8 @@ export function reportingRows(snapshot: ReportingSnapshot, section: ReportingSec
             capability: rule.capabilityId, health: rule.status, outcome: rule.status,
             ruleId: rule.ruleId, posting: "none", mode: "none", text,
             searchText: clean(text.join(" "), 4_096).toLowerCase(),
-            url: head.url ?? null, attention: rule.status === "unknown" || rule.status === "error",
+            url: head.url ?? null, attention: rule.status === "unknown" ||
+              rule.status === "error" || Boolean(rule.outcome?.unknown),
           });
         }
       }

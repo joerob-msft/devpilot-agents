@@ -2335,7 +2335,10 @@ test("scheduled current-head evaluation only credits immutable, independently bo
     iterationId: first.iterationId, capabilityId: "bpm-future-rule@1",
     ruleId: "future-rule", declarationDigest,
     completedUtc: "2026-09-24T21:00:20Z",
-    outcome: { findings: 1, noOp: 0, wouldCreate: 1, unknown: 0 },
+    outcome: { findings: 1, noOp: 0, humanCovered: 0, wouldCreate: 1, unknown: 0 },
+    discussionDigest: "d".repeat(64),
+    findingOutcomes: [{ findingDigest: "f".repeat(64),
+      classification: "wouldCreate", reason: "reviewer-marker-not-found" }],
     providerWrites: 0, modelToolInvocations: 0,
   };
   const observationBytes = Buffer.from(JSON.stringify(observation));
@@ -2401,14 +2404,37 @@ test("scheduled current-head evaluation only credits immutable, independently bo
     assert.match(overviewLines(valid).join(" "), /drafts excluded separately 3.*not in the rule denominator/);
     assert.equal(rule?.scheduled?.pending, 1);
     assert.deepEqual(rule?.scheduled?.scope, [1]);
+    assert.deepEqual(rule?.scheduled?.findingCounts,
+      { findings: 1, noOp: 0, humanCovered: 0, wouldCreate: 1, unknown: 0 });
     assert.equal(rule?.intake?.evaluated, 0);
     assert.equal(rule?.execution, "unknown");
     assert.equal(rule?.counts.finding, null);
     const scheduledRows = reportingRows(valid, "rules").filter((row) => row.key.startsWith("scheduled:"));
     assert.equal(scheduledRows.length, 2);
     assert.match(scheduledRows[0]?.url ?? "", /dev\.azure\.com\/example.*pullrequest\/1/);
+    assert.match(scheduledRows[0]?.text.join(" ") ?? "",
+      /Findings 1 \| noOp 0 \| humanCovered 0 \| wouldCreate 1 \| unknown 0/);
     assert.match(reportingRows(valid, "rules").find((row) => row.key === "rule:future-rule")?.text.join(" ") ?? "",
       /evaluated 1 \/ pending 1 \/ skipped 0 \/ unknown 0 \/ error 0/);
+
+    const partial = { ...observation,
+      outcome: { findings: 1, noOp: 0, humanCovered: 0, wouldCreate: 0, unknown: 1 },
+      findingOutcomes: [{ findingDigest: "f".repeat(64),
+        classification: "unknown", reason: "discussion-needs-review" }],
+    };
+    const partialBytes = Buffer.from(JSON.stringify(partial));
+    const partialDigest = sha256Text(partialBytes.toString("utf8"));
+    await write(join(ledger, "observations", `${partialDigest}.json`), partialBytes);
+    asObject((asObject((cohort.heads as JsonRecord[])[0]).rules as JsonRecord[])[0]).observationDigest = partialDigest;
+    await save();
+    const partialView = await read();
+    const partialRule = partialView.rules?.find((entry) => entry.id === "future-rule");
+    assert.equal(partialRule?.scheduled?.evaluated, 1);
+    assert.deepEqual(partialRule?.scheduled?.findingCounts,
+      { findings: 1, noOp: 0, humanCovered: 0, wouldCreate: 0, unknown: 1 });
+    assert.ok(partialRule?.scheduled?.gaps.includes("discussion-needs-review"));
+    asObject((asObject((cohort.heads as JsonRecord[])[0]).rules as JsonRecord[])[0]).observationDigest = digest;
+    await save();
 
     await write(declarationPath, "{}");
     const brokenDeclaration = await read();

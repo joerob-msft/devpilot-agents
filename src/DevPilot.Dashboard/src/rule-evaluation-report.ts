@@ -16,6 +16,7 @@ export interface EvaluationHead {
     reasonCode: string;
     observationDigest: string | null;
     declarationDigest: string | null;
+    outcome?: { findings: number; noOp: number; humanCovered: number; wouldCreate: number; unknown: number };
   }>;
 }
 export interface EvaluationRule {
@@ -228,6 +229,7 @@ export function verifyRuleObservation(
     if (createHash("sha256").update(bytes).digest("hex") !== digest) return false;
     const observation = jsonBytes(bytes);
     const outcome = record(observation.outcome);
+    const findingOutcomes = observation.findingOutcomes;
     const completed = utc(observation.completedUtc);
     if (observation.schemaVersion !== 1 || observation.kind !== "scheduled-rule-observation" ||
         observation.generation !== summary.generation ||
@@ -241,8 +243,27 @@ export function verifyRuleObservation(
         observation.declarationDigest !== rule.declarationDigest ||
         Date.parse(completed) > Date.parse(summary.observedUtc) ||
         nonnegative(outcome.findings) > maxFindingsPerHead || nonnegative(outcome.noOp) > 100_000 ||
-        nonnegative(outcome.wouldCreate) > maxFindingsPerHead || nonnegative(outcome.unknown) !== 0 ||
-        (outcome.wouldCreate as number) > (outcome.findings as number) ||
+        nonnegative(outcome.humanCovered) > maxFindingsPerHead ||
+        nonnegative(outcome.wouldCreate) > maxFindingsPerHead ||
+        nonnegative(outcome.unknown) > maxFindingsPerHead ||
+        (outcome.noOp as number) + (outcome.humanCovered as number) +
+          (outcome.wouldCreate as number) + (outcome.unknown as number) !== outcome.findings ||
+        typeof observation.discussionDigest !== "string" ||
+        !/^[a-f0-9]{64}$/.test(observation.discussionDigest) ||
+        !Array.isArray(findingOutcomes) ||
+        findingOutcomes.length !== outcome.findings ||
+        new Set(findingOutcomes.map((item: unknown) => record(item).findingDigest)).size !==
+          findingOutcomes.length ||
+        findingOutcomes.some((item: unknown) => {
+          const finding = record(item);
+          return typeof finding.findingDigest !== "string" ||
+            !/^[a-f0-9]{64}$/.test(finding.findingDigest) ||
+            !["noOp", "humanCovered", "wouldCreate", "unknown"].includes(String(finding.classification)) ||
+            code(finding.reason).length === 0;
+        }) ||
+        ["noOp", "humanCovered", "wouldCreate", "unknown"].some((state) =>
+          findingOutcomes.filter((item: unknown) =>
+            record(item).classification === state).length !== outcome[state]) ||
         observation.providerWrites !== 0 || observation.modelToolInvocations !== 0) return false;
     return true;
   } catch {
@@ -260,6 +281,23 @@ export function verifyRuleDeclaration(
     if (createHash("sha256").update(bytes).digest("hex") !== digest) return null;
     const declaration = jsonBytes(bytes);
     const max = nonnegative(declaration.maxFindingsPerHead);
+    const policy = ({
+      "bpm-test-class-coverage@1": "test-class-coverage",
+      "bpm-redundant-method-coverage@1": "redundant-method-coverage",
+      "bpm-named-areequal-arguments@1": "named-areequal-arguments",
+    } as Record<string, string>)[rule.capabilityId];
+    if (policy) {
+      const binding = record(declaration.ruleBinding);
+      if (typeof binding.ruleRepositoryId !== "string" ||
+          !/^[A-Za-z0-9._/-]{1,256}$/.test(binding.ruleRepositoryId) ||
+          binding.rulePath !== `src/DevPilot.OwnerCapability/Policy/${policy}.v1.txt` ||
+          typeof binding.ruleCommit !== "string" ||
+          !/^[a-f0-9]{40}$/.test(binding.ruleCommit) ||
+          typeof binding.ruleHash !== "string" ||
+          !/^v1:sha256:[a-f0-9]{64}$/.test(binding.ruleHash) ||
+          typeof binding.capabilityDigest !== "string" ||
+          !/^v1:sha256:[a-f0-9]{64}$/.test(binding.capabilityDigest)) return null;
+    }
     if (!intakeHead?.lineEvidence || !intakeDeclarationDigest ||
         hex(intakeDeclarationDigest, 64) !== declaration.intakeDeclarationDigest ||
         declaration.lineEvidenceDigest !== intakeHead.lineEvidence.digest ||
@@ -301,10 +339,17 @@ export async function validateRuleObservations(
         const max = verifyRuleDeclaration(declarationBytes, rule.declarationDigest, summary,
           head, rule, intakeHeads.get(head.pullRequestId),
           intakeDeclarationDigests.get(head.pullRequestId));
-        if (max !== null && verifyRuleObservation(await readObservation(rule.observationDigest),
-          rule.observationDigest, summary, head, rule, max)) {
-          rules.push(rule);
-          continue;
+        if (max !== null) {
+          const observationBytes = await readObservation(rule.observationDigest);
+          if (verifyRuleObservation(observationBytes, rule.observationDigest, summary, head, rule, max)) {
+            const outcome = record(jsonBytes(observationBytes).outcome);
+            rules.push({ ...rule, outcome: {
+              findings: outcome.findings as number, noOp: outcome.noOp as number,
+              humanCovered: outcome.humanCovered as number,
+              wouldCreate: outcome.wouldCreate as number, unknown: outcome.unknown as number,
+            } });
+            continue;
+          }
         }
       } catch { /* Missing or inaccessible evidence is unknown, never evaluated. */ }
       rules.push({ ...rule, status: "unknown", reasonCode: "observation-unverified",
