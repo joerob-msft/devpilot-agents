@@ -49,7 +49,7 @@ Outside both sections.
             commit = 'f6db83436b48f48a8521095a888d79f67823bbb2'
             path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
             modelId = 'synthetic-model' }
-        $sources = @{ owner = $owner }
+        $sources = @{ owner = $owner; namedSection = $owner.Clone() }
         foreach ($policy in @('test-class-coverage',
                 'redundant-method-coverage', 'named-areequal-arguments')) {
             $key = switch ($policy) {
@@ -191,6 +191,68 @@ Outside both sections.
             -RepositoryRoot $repo -CanaryPullRequestIds $Case.ids `
             -Provider $Case.provider -Run
     }
+    function New-CanaryTransportCase {
+        $c = New-CanaryCase
+        New-Item -ItemType Directory -Path $c.root | Out-Null
+        $stub = Join-Path $c.root 'az-stub.ps1'
+        $log = Join-Path $c.root 'requests.log'
+        @'
+$argv = $args
+[IO.File]::AppendAllText($env:CANARY_GET_LOG, ($argv -join '|') + "`n")
+$resource = if ($argv[0] -eq 'rest') { 'connectionData' } else {
+    $argv[[array]::IndexOf($argv, '--resource') + 1]
+}
+$routes = @($argv | Where-Object { $_ -match '^(project|projectId|repositoryId)=' })
+$response = switch ($resource) {
+    connectionData {
+        @{ authenticatedUser = @{ id = if ($argv[0] -eq 'devops' -and $env:CANARY_PAT_MISMATCH) {
+                    '99999999-9999-9999-9999-999999999999'
+                } else { '33333333-3333-3333-3333-333333333333' }
+            subjectDescriptor = 'aad.synthetic-service-account'
+            uniqueName = 'service@example.invalid' } }
+    }
+    projects {
+        if ($routes -cnotcontains 'projectId=ExampleProject' -or
+            $routes.Count -ne 1) { throw 'not a named project GET' }
+        @{ id = '22222222-2222-2222-2222-222222222222'
+            name = 'ExampleProject' }
+    }
+    repositories {
+        if ($routes -ccontains 'project=Engineering') {
+            @{ id = '44444444-4444-4444-4444-444444444444'; name = 'EngHub'
+                project = @{ id = '55555555-5555-5555-5555-555555555555'
+                    name = 'Engineering' } }
+        } else {
+            @{ id = '11111111-1111-1111-1111-111111111111'; name = 'ExampleRepo'
+                project = @{ id = '22222222-2222-2222-2222-222222222222'
+                    name = 'ExampleProject' } }
+        }
+    }
+    items {
+        if ($argv -notcontains 'includeContent=false' -or
+            $argv -notcontains 'includeContentMetadata=true' -or
+            $argv -notcontains "path=$($env:CANARY_BLOB_PATH)" -or
+            $argv -notcontains "versionDescriptor.version=$($env:CANARY_BLOB_COMMIT)" -or
+            $argv -notcontains 'versionDescriptor.versionType=commit' -or
+            $routes -cnotcontains 'project=Engineering') {
+            throw 'unbound item GET'
+        }
+        @{ path = $env:CANARY_BLOB_PATH; objectId = $env:CANARY_BLOB_ID
+            gitObjectType = 'blob'; content = 'rendered text differs from blob' }
+    }
+    default { throw 'non-GET or unsupported resource requested' }
+}
+$response | ConvertTo-Json -Depth 8 -Compress
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        $cfg = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $cfg.organization = 'https://dev.azure.com/example-org'
+        $cfg.projectName = 'ExampleProject'
+        $cfg.projectId = ''
+        $cfg.repositoryId = '11111111-1111-1111-1111-111111111111'
+        $cfg.repositoryName = 'ExampleRepo'
+        return @{ config = $cfg; stub = $stub; log = $log; source = $c.sources.owner }
+    }
 }
 AfterAll {
     & (Get-Module DevPilot.ActivePrCanary) {
@@ -205,44 +267,13 @@ AfterAll {
 }
 Describe 'Explicit signed read-only canary qualification' {
     It 'allows only GET identity and repository metadata during transport bootstrap' {
-        $c = New-CanaryCase
-        New-Item -ItemType Directory -Path $c.root | Out-Null
-        $stub = Join-Path $c.root 'az-stub.ps1'
-        $log = Join-Path $c.root 'requests.log'
-        @'
-$argv = $args
-[IO.File]::AppendAllText($env:CANARY_GET_LOG, ($argv -join '|') + "`n")
-$resource = if ($argv[0] -eq 'rest') { 'connectionData' } else {
-    $argv[[array]::IndexOf($argv, '--resource') + 1]
-}
-$response = switch ($resource) {
-    connectionData {
-        @{ authenticatedUser = @{ id = '33333333-3333-3333-3333-333333333333'
-            subjectDescriptor = 'aad.synthetic-service-account'
-            uniqueName = 'service@example.invalid' } }
-    }
-    projects { @{ id = '22222222-2222-2222-2222-222222222222'
-            name = 'ExampleProject' } }
-    repositories {
-        @{ id = '11111111-1111-1111-1111-111111111111'; name = 'ExampleRepo'
-            project = @{ id = '22222222-2222-2222-2222-222222222222'
-                name = 'ExampleProject' } }
-    }
-    default { throw 'non-bootstrap resource requested' }
-}
-$response | ConvertTo-Json -Depth 8 -Compress
-'@ | Set-Content -LiteralPath $stub -Encoding utf8
-        $cfg = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') -Raw |
-            ConvertFrom-Json -AsHashtable
-        $cfg.organization = 'https://dev.azure.com/example-org'
-        $cfg.projectName = 'ExampleProject'
-        $cfg.projectId = ''
-        $cfg.repositoryId = '11111111-1111-1111-1111-111111111111'
-        $cfg.repositoryName = 'ExampleRepo'
-        $env:CANARY_GET_LOG = $log
+        $t = New-CanaryTransportCase
+        $env:CANARY_GET_LOG = $t.log
         try {
-            $provider = New-ActivePrAzureDevOpsProvider -Config $cfg `
-                -AzureCliPath $stub -Bootstrap
+            $provider = New-ActivePrAzureDevOpsProvider -Config $t.config `
+                -AzureCliPath $t.stub -Bootstrap -VerifyReadPrincipal
+            { & $provider Metadata @{ repositoryName = 'ExampleRepo' } } |
+                Should -Throw '*account-mismatch*'
             (& $provider Identity @{}).uniqueName | Should -Be 'service@example.invalid'
             (& $provider Metadata @{ repositoryName = 'ExampleRepo' }).projectId |
                 Should -Be '22222222-2222-2222-2222-222222222222'
@@ -252,12 +283,132 @@ $response | ConvertTo-Json -Depth 8 -Compress
                 Should -Throw '*bootstrap-read-not-allowed*'
         }
         finally { Remove-Item Env:\CANARY_GET_LOG }
-        $trace = Get-Content -LiteralPath $log
-        $trace.Count | Should -Be 3
+        $trace = Get-Content -LiteralPath $t.log
+        $trace.Count | Should -Be 4
+        @($trace | Where-Object { $_ -match 'projectId=ExampleProject' }).Count |
+            Should -Be 1
         @($trace | Where-Object { $_ -notmatch '\b(GET|get)\b' }).Count |
             Should -Be 0
         @($trace | Where-Object { $_ -match '\b(POST|PATCH|PUT|DELETE)\b' }).Count |
             Should -Be 0
+    }
+    It 'refuses metadata and raw source reads if AAD and CLI identities differ' {
+        $t = New-CanaryTransportCase
+        $env:CANARY_GET_LOG = $t.log
+        $env:CANARY_PAT_MISMATCH = '1'
+        try {
+            $provider = New-ActivePrAzureDevOpsProvider -Config $t.config `
+                -AzureCliPath $t.stub -Bootstrap -VerifyReadPrincipal
+            { & $provider Identity @{} } | Should -Throw '*account-mismatch*'
+            { & $provider Metadata @{ repositoryName = 'ExampleRepo' } } |
+                Should -Throw '*account-mismatch*'
+            (Get-Content -LiteralPath $t.log).Count | Should -Be 2
+        }
+        finally {
+            Remove-Item Env:\CANARY_GET_LOG, Env:\CANARY_PAT_MISMATCH
+        }
+    }
+    It 'binds raw AAD identity and reads exact pinned Git blob bytes, not rendered text' {
+        $t = New-CanaryTransportCase
+        $t.config.projectId = '22222222-2222-2222-2222-222222222222'
+        $t.config.expectedAccount = @{
+            id = '33333333-3333-3333-3333-333333333333'
+            descriptor = 'aad.synthetic-service-account'
+            uniqueName = 'service@example.invalid' }
+        $t.config.enabled = $true
+        $bytes = [Text.Encoding]::UTF8.GetBytes(
+            "## Claim ownership`nRead exact blob bytes.`n")
+        $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+        $oid = [Convert]::ToHexString(
+            [Security.Cryptography.SHA1]::HashData([byte[]]($header + $bytes))
+        ).ToLowerInvariant()
+        $env:CANARY_BLOB_ID = $oid
+        $env:CANARY_BLOB_PATH = $t.source.path
+        $env:CANARY_BLOB_COMMIT = $t.source.commit
+        $env:CANARY_GET_LOG = $t.log
+        $state = @{ bytes = $bytes; rawId = $t.config.expectedAccount.id
+            requests = [Collections.Generic.List[object]]::new() }
+        $raw = {
+            param($op, $request)
+            $state.requests.Add(@{ operation = $op; request = $request }) | Out-Null
+            if ($op -ceq 'Identity') {
+                return @{ id = $state.rawId
+                    descriptor = 'aad.synthetic-service-account'
+                    uniqueName = 'service@example.invalid' }
+            }
+            if ($op -cne 'Item') { throw 'unexpected raw read' }
+            return @{ bytes = $state.bytes }
+        }.GetNewClosure()
+        try {
+            $provider = New-ActivePrAzureDevOpsProvider -Config $t.config `
+                -AzureCliPath $t.stub -RawGet $raw -VerifyReadPrincipal
+            { & $provider RuleSource $t.source } |
+                Should -Throw '*account-mismatch*'
+            $state.rawId = '99999999-9999-9999-9999-999999999999'
+            { & $provider Identity @{} } | Should -Throw '*account-mismatch*'
+            $state.rawId = $t.config.expectedAccount.id
+            [void](& $provider Identity @{})
+            (& $provider Metadata @{ repositoryName = 'ExampleRepo' }).repositoryId |
+                Should -Be $t.config.repositoryId
+            $source = & $provider RuleSource $t.source
+            $source.content | Should -Be ([Text.Encoding]::UTF8.GetString($bytes))
+            $item = @($state.requests | Where-Object operation -EQ 'Item')
+            $item.Count | Should -Be 1
+            $item[0].request.projectName | Should -Be 'Engineering'
+            $item[0].request.repositoryId | Should -Be $t.source.repositoryId
+            $item[0].request.path | Should -Be $t.source.path
+            $item[0].request.commit | Should -Be $t.source.commit
+            $item[0].request.maxBytes | Should -Be 262144
+            $state.bytes = [Text.Encoding]::UTF8.GetBytes('altered raw bytes')
+            { & $provider RuleSource $t.source } | Should -Throw '*invalid-item*'
+            $state.bytes = [byte[]]::new(262145)
+            { & $provider RuleSource $t.source } | Should -Throw '*invalid-item*'
+            $state.bytes = [byte[]](0xff, 0xfe)
+            $header = [Text.Encoding]::ASCII.GetBytes("blob $($state.bytes.Length)`0")
+            $env:CANARY_BLOB_ID = [Convert]::ToHexString(
+                [Security.Cryptography.SHA1]::HashData(
+                    [byte[]]($header + $state.bytes))).ToLowerInvariant()
+            { & $provider RuleSource $t.source } | Should -Throw '*unsupported-change*'
+            @((Get-Content -LiteralPath $t.log) |
+                Where-Object { $_ -match 'rendered text differs from blob' }).Count |
+                Should -Be 0
+        }
+        finally {
+            Remove-Item Env:\CANARY_GET_LOG, Env:\CANARY_BLOB_ID,
+                Env:\CANARY_BLOB_PATH, Env:\CANARY_BLOB_COMMIT
+        }
+    }
+    It 'hashes the trimmed Owner section alone and keeps the named section separate' {
+        $document = "## Claim ownership`r`nOwner body.`r`n`r`n" +
+            "## Named parameters for Assert`r`nNamed body.`r`n`r`n"
+        $sections = & (Get-Module DevPilot.ActivePrCanary) {
+            param($Text)
+            $owner = Get-CanarySection $Text '## Claim ownership'
+            $named = Get-CanarySection $Text '## Named parameters for Assert'
+            return @{ owner = $owner; named = $named
+                hash = Get-CanaryTextHash $owner }
+        } $document
+        $sections.owner | Should -Be "## Claim ownership`r`nOwner body."
+        $sections.named | Should -Be "## Named parameters for Assert`r`nNamed body."
+        $sections.hash | Should -Be (
+            [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                    [Text.Encoding]::UTF8.GetBytes(
+                        "## Claim ownership`r`nOwner body."))).ToLowerInvariant())
+        { & (Get-Module DevPilot.ActivePrCanary) {
+                param($Text)
+                Get-CanarySection $Text '## Claim ownership'
+            } ($document + "## Claim ownership`r`nDuplicate.") } |
+            Should -Throw '*rule-section-unavailable*'
+    }
+    It 'requires independent approval of the named-parameters section before reads' {
+        $c = New-CanaryCase
+        $c.sources.Remove('namedSection')
+        { Invoke-CanaryCase $c } | Should -Throw '*rule-source-not-approved*'
+        $c.state.calls.Count | Should -Be 0
+        $c.sources.namedSection = $c.sources.owner.Clone()
+        $c.sources.namedSection.approved = $false
+        { Invoke-CanaryCase $c } | Should -Throw '*rule-source-not-approved*'
+        $c.state.calls.Count | Should -Be 0
     }
     It 'defaults off without provider reads or private state' {
         $c = New-CanaryCase
@@ -283,6 +434,7 @@ $response | ConvertTo-Json -Depth 8 -Compress
     }
     It 'reconciles 350 paginated heads before evaluating exactly two signed IDs' {
         $c = New-CanaryCase
+        $c.sources.namedSection.commit = 'd' * 40
         $result = Invoke-CanaryCase $c
         $result.inventory.active | Should -Be 350
         $result.inventory.pagesFirst | Should -BeGreaterThan 1
@@ -301,6 +453,10 @@ $response | ConvertTo-Json -Depth 8 -Compress
         $config.canary.heads.Count | Should -Be 2
         $config.provenance.namedSection.section |
             Should -Be '## Named parameters for Assert'
+        $config.provenance.namedSection.commit |
+            Should -Be $c.sources.namedSection.commit
+        $config.provenance.namedSection.repositoryId |
+            Should -Be $c.sources.namedSection.repositoryId
         $config.rules[1].binding.ruleRepositoryId |
             Should -Be $c.sources.class.repositoryId
         $config.provenance.ownerSection.repositoryId |

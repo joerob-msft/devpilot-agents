@@ -1553,7 +1553,7 @@ function New-ActivePrAzureDevOpsProvider {
     [CmdletBinding()]
     param([Parameter(Mandatory)][Collections.IDictionary]$Config,
         [string]$AzureCliPath = 'az', [switch]$Bootstrap,
-        [scriptblock]$RawGet)
+        [scriptblock]$RawGet, [switch]$VerifyReadPrincipal)
     if ($Bootstrap) {
         if ([string]$Config.organization -cnotmatch
                 '^https://(?:dev\.azure\.com/[A-Za-z0-9_-]+|[A-Za-z0-9_-]+\.visualstudio\.com)/?$' -or
@@ -1592,6 +1592,10 @@ function New-ActivePrAzureDevOpsProvider {
                 '--url', "$($org.TrimEnd('/'))/_apis/connectionData?api-version=7.1-preview.1",
                 '--resource', $identityResource,
                 '-o', 'json', '--only-show-errors')
+        } elseif ($Area -eq 'devopsConnection') {
+            @('devops', 'invoke', '--organization', $org, '--area', 'location',
+                '--resource', 'connectionData', '--http-method', 'GET',
+                '--api-version', '7.1', '-o', 'json', '--only-show-errors')
         } else {
             @('devops', 'invoke', '--organization', $org, '--area', $Area,
                 '--resource', $Resource, '--http-method', 'GET', '--api-version', '7.1',
@@ -1698,23 +1702,35 @@ function New-ActivePrAzureDevOpsProvider {
         if ([string]::IsNullOrWhiteSpace($text)) { throw 'read-inaccessible' }
         return ($text | ConvertFrom-Json -AsHashtable -Depth 32)
     }.GetNewClosure()
-    $rawToken = $null
+    $rawCredential = [pscustomobject]@{ Token = $null }
     $rawIdentityVerified = $false
     if ($null -eq $RawGet) {
         $RawGet = {
             param([string]$Operation, [Collections.IDictionary]$RawRequest)
             $deadline = [DateTime]$RawRequest.deadline
-            if ($null -eq $rawToken) {
+            if ($null -eq $rawCredential.Token) {
                 $credential = & $invoke 'token' 'accessToken' @() @() $deadline 16384
                 if ([string]$credential.accessToken -cnotmatch
                         '^[A-Za-z0-9._~+/=-]{100,8192}$' -or
                     [string]$credential.tokenType -ine 'Bearer') {
                     throw 'read-inaccessible'
                 }
-                $rawToken = [string]$credential.accessToken
+                $rawCredential.Token = [string]$credential.accessToken
             }
-            $base = "$($org.TrimEnd('/'))/$([Uri]::EscapeDataString($project))" +
-                "/_apis/git/repositories/$repo/items"
+            $itemProject = $project
+            $itemRepo = $repo
+            if ($Operation -ceq 'Item' -and
+                $null -ne $RawRequest['projectName']) {
+                $itemProject = [string]$RawRequest.projectName
+                $itemRepo = [string]$RawRequest.repositoryId
+                if ($itemProject -cnotmatch '^[\w .-]{1,128}$' -or
+                    $itemRepo -cnotmatch
+                        '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$') {
+                    throw 'read-inaccessible'
+                }
+            }
+            $base = "$($org.TrimEnd('/'))/$([Uri]::EscapeDataString($itemProject))" +
+                "/_apis/git/repositories/$itemRepo/items"
             $url = if ($Operation -ceq 'Identity') {
                 "$($org.TrimEnd('/'))/_apis/connectionData?api-version=7.1-preview.1"
             } elseif ($Operation -ceq 'Item' -and
@@ -1739,7 +1755,8 @@ function New-ActivePrAzureDevOpsProvider {
             $request = [Net.Http.HttpRequestMessage]::new(
                 [Net.Http.HttpMethod]::Get, $url)
             $request.Headers.Authorization =
-                [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $rawToken)
+                [Net.Http.Headers.AuthenticationHeaderValue]::new(
+                    'Bearer', $rawCredential.Token)
             $request.Headers.Accept.ParseAdd($(if ($Operation -ceq 'Item') {
                         'application/octet-stream'
                     } else { 'application/json' }))
@@ -1784,6 +1801,7 @@ function New-ActivePrAzureDevOpsProvider {
                 finally { $response.Dispose() }
             }
             catch [OperationCanceledException] { throw 'time-budget' }
+            catch [Net.Http.HttpRequestException] { throw 'read-inaccessible' }
             finally {
                 $cancel.Dispose()
                 $request.Dispose()
@@ -1799,23 +1817,51 @@ function New-ActivePrAzureDevOpsProvider {
     $projectGraph = Get-Command Get-TestProjectGraphEvidence -ErrorAction Stop
     $lineDelta = ${function:Get-IntakeLineDelta}
     $digest = ${function:Get-IntakeDigest}
+    $principal = [pscustomobject]@{ Verified = $false }
     $handler = {
         param([string]$Operation, [Collections.IDictionary]$Request)
         if ($Bootstrap -and $Operation -cnotin @('Identity', 'Metadata')) {
             throw 'bootstrap-read-not-allowed'
         }
+        if ($VerifyReadPrincipal -and $Operation -cne 'Identity' -and
+            -not $principal.Verified) { throw 'account-mismatch' }
         $budget = if ($null -ne $Request['timeoutMilliseconds']) {
             [int]$Request.timeoutMilliseconds
         } else { [int]$Config.limits.maxSeconds * 1000 }
         $deadline = [DateTime]::UtcNow.AddMilliseconds($budget)
         switch -CaseSensitive ($Operation) {
             Identity {
+                $principal.Verified = $false
                 $r = & $invoke 'connection' 'connectionData' @() @() $deadline
                 $user = $r.authenticatedUser
                 $name = [string]$user.uniqueName
                 if (-not $name -and
                     [string]$user.descriptor -cmatch '\\(?<upn>[^\\\s]+@[^\\\s]+)$') {
                     $name = $Matches.upn
+                }
+                if ($VerifyReadPrincipal) {
+                    $other = & $invoke 'devopsConnection' 'connectionData' @() @() $deadline
+                    $patUser = $other.authenticatedUser
+                    $rawUser = if ($Bootstrap) { $null } else {
+                        & $RawGet 'Identity' @{ deadline = $deadline }
+                    }
+                    if ([string]$user.id -cnotmatch
+                            '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+                        [string]$user.subjectDescriptor -cnotmatch '^\S{1,512}$' -or
+                        [string]$name -cnotmatch '^[^@\s]+@[^@\s]+$' -or
+                        [string]$patUser.id -ine [string]$user.id -or
+                        [string]$patUser.subjectDescriptor -cne
+                            [string]$user.subjectDescriptor -or
+                        [string]$patUser.uniqueName -ine $name -or
+                        (-not $Bootstrap -and
+                            ($rawUser -isnot [Collections.IDictionary] -or
+                                [string]$rawUser.id -ine [string]$user.id -or
+                                [string]$rawUser.descriptor -cne
+                                    [string]$user.subjectDescriptor -or
+                                [string]$rawUser.uniqueName -ine $name))) {
+                        throw 'account-mismatch'
+                    }
+                    $principal.Verified = $true
                 }
                 return @{ id = $user.id; descriptor = $user.subjectDescriptor
                     uniqueName = $name }
@@ -1825,7 +1871,7 @@ function New-ActivePrAzureDevOpsProvider {
                 if ($name -cnotmatch '^[A-Za-z0-9._-]{1,128}$') {
                     throw 'repository-mismatch'
                 }
-                $p = & $invoke 'core' 'projects' @("project=$project") @() $deadline
+                $p = & $invoke 'core' 'projects' @("projectId=$project") @() $deadline
                 $r = & $invoke 'git' 'repositories' @(
                     "project=$project", "repositoryId=$repo") @() $deadline
                 if ([string]$p.id -cnotmatch
@@ -1860,6 +1906,8 @@ function New-ActivePrAzureDevOpsProvider {
                 $metadata = & $invoke 'git' 'repositories' @(
                     "project=$sourceProject", "repositoryId=$sourceRepo") @() $deadline
                 if ([string]$metadata.id -ine $sourceRepo -or
+                    [string]$metadata.project.id -cnotmatch
+                        '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
                     [string]$metadata.project.name -cne $sourceProject -or
                     [string]$metadata.name -cne [string]$Request.repositoryName) {
                     throw 'rule-source-mismatch'
@@ -1867,9 +1915,23 @@ function New-ActivePrAzureDevOpsProvider {
                 $item = & $invoke 'git' 'items' @(
                     "project=$sourceProject", "repositoryId=$sourceRepo") @(
                     "path=$path", "versionDescriptor.version=$commit",
-                    'versionDescriptor.versionType=commit', 'includeContent=true',
+                    'versionDescriptor.versionType=commit', 'includeContent=false',
                     'includeContentMetadata=true') $deadline 1048576
-                $blob = & $assertBlob $item $path ([string]$item.objectId) 262144
+                if ([string]$item.path -cne $path -or
+                    [string]$item.gitObjectType -cne 'blob' -or
+                    $item['isFolder'] -eq $true -or
+                    $item['isSymLink'] -eq $true -or
+                    [string]$item.objectId -cnotmatch '^[a-fA-F0-9]{40}$') {
+                    throw 'invalid-item'
+                }
+                $raw = & $RawGet 'Item' @{
+                    projectName = $sourceProject; repositoryId = $sourceRepo
+                    commit = $commit; path = $path; maxBytes = 262144
+                    deadline = $deadline
+                }
+                if ($raw -isnot [Collections.IDictionary] -or
+                    $raw.bytes -isnot [byte[]]) { throw 'invalid-item' }
+                $blob = & $assertRawBlob $raw.bytes ([string]$item.objectId) 262144
                 return @{ content = $blob.text; repositoryId = $metadata.id
                     repositoryName = $metadata.name; projectName = $metadata.project.name
                     commit = $commit; path = $path }
