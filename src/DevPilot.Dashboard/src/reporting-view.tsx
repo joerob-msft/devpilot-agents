@@ -291,6 +291,11 @@ export function reportingRows(snapshot: ReportingSnapshot, section: ReportingSec
       const text = [
         `PR #${head.pullRequestId} | ${head.state} (${head.reason}) | target ${head.targetRef}`,
         `Source ${shortCommit(head.sourceCommit ?? "")} / target ${shortCommit(head.targetCommit ?? "")} | iteration ${head.iterationId ?? "unknown"}`,
+        head.lineEvidence
+          ? `Verified changed lines ${head.lineEvidence.changedLines} (added ${head.lineEvidence.addedLines}, deleted ${head.lineEvidence.deletedLines}) across ${head.lineEvidence.changedFiles} files | evidence ${head.lineEvidence.digest.slice(0, 12)}`
+          : "Changed-line evidence unknown; no verified count or spans",
+        ...(head.lineEvidence?.files.map((file) =>
+          `${file.changeType} ${file.pathDigest.slice(0, 12)}: +${file.addedLines} -${file.deletedLines}; new-side ${file.spans.map((span) => `${span.startLine}-${span.endLine}`).join(", ") || "no added lines"}`) ?? []),
         ...head.rules.map((rule) =>
           `${rule.ruleId} (${rule.capabilityId}): ${rule.state} / ${rule.reason}`),
         `Inventory ${intake.state} as of ${intake.observedUtc}; navigation and discovery are NOT current-head rule evaluation`,

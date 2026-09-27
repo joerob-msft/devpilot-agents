@@ -26,7 +26,7 @@ BeforeAll {
             drift = 0; failPage = 0; failHead = 0
             reorder = $false; duplicate = $false
             noTotal = $false; listCap = 0
-            comments = @(); changeLines = 3; headVisits = @{}
+            comments = @(); changeLines = 3; omitEvidence = $false; headVisits = @{}
             sourceContent = $null
             iteration = 1; commit = 'a' * 40
             headStatus = @{}; headTarget = @{}; headDraft = @{} }
@@ -36,6 +36,7 @@ BeforeAll {
             switch ($op) {
                 Identity {
                     return @{ id = $config.expectedAccount.id
+                        descriptor = $config.expectedAccount.descriptor
                         uniqueName = $config.expectedAccount.uniqueName }
                 }
                 ListPage {
@@ -75,11 +76,23 @@ BeforeAll {
                             $state.headTarget[$id]
                         } else { $state.rows[$id - 1].targetRef }
                         sourceCommit = $source; targetCommit = 'b' * 40
+                        commonCommit = 'd' * 40
                         iterationId = $state.iteration }
                 }
                 Changes {
-                    return @{ changedFiles = 2; changedLines = $state.changeLines
+                    $files = if ($null -eq $state.changeLines -or $state.omitEvidence) {
+                        $null
+                    } else {
+                        @(@{ pathDigest = 'a' * 64; originalPathDigest = $null
+                                changeType = 'add'; addedLines = $state.changeLines
+                                deletedLines = 0; newLineCount = $state.changeLines
+                                spans = @(@{ startLine = 1; endLine = $state.changeLines }) })
+                    }
+                    $result = @{ changedFiles = 1; changedLines = $state.changeLines
+                        baseCommit = $request.commonCommit; files = $null
                         sourceContent = $state.sourceContent }
+                    if ($null -ne $files) { $result.files = @($files) }
+                    return $result
                 }
                 Discussions {
                     return @{ threads = $state.comments; count = $state.comments.Count }
@@ -93,6 +106,120 @@ BeforeAll {
         param($Case)
         Invoke-ActivePrIntake -Config $Case.config -Provider $Case.provider `
             -StateRoot $Case.root -RepositoryRoot $repo -Run
+    }
+    function New-TestBlob {
+        param([string]$Path, [string]$Text)
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+        $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+        $hash = [Convert]::ToHexString([Security.Cryptography.SHA1]::HashData(
+                [byte[]]($header + $bytes))).ToLowerInvariant()
+        return @{ objectId = $hash; path = $Path; gitObjectType = 'blob'
+            isFolder = $false; contentMetadata = @{ isBinary = $false
+                encoding = 65001; contentType = 'text/plain' }
+            content = $Text }
+    }
+    function New-IntakeTransportCase {
+        $case = New-IntakeCase -Count 1
+        $fixture = @{
+            source = 'a' * 40; target = 'b' * 40; common = 'd' * 40
+            pages = @{
+                '0' = @{ changeEntries = @(); nextSkip = 0 }
+                '1' = @{ changeEntries = @(); nextSkip = 0 }
+            }
+            items = @{}; drift = $false; refDrift = $false
+        }
+        $fixturePath = Join-Path $case.root 'fixture.json'
+        $log = Join-Path $case.root 'requests.log'
+        $stub = Join-Path $case.root 'az-items-stub.ps1'
+        New-Item -ItemType Directory -Path $case.root -Force | Out-Null
+        @'
+$argv = $args
+$fixture = Get-Content -LiteralPath $env:ACTIVE_PR_INTAKE_FIXTURE -Raw |
+    ConvertFrom-Json -AsHashtable
+$resource = if ($argv[0] -eq 'rest') { 'connectionData' } else {
+    $argv[[array]::IndexOf($argv, '--resource') + 1]
+}
+[IO.File]::AppendAllText($env:ACTIVE_PR_INTAKE_TEST_LOG, ($argv -join '|') + "`n")
+$route = @($argv | Where-Object { $_ -like 'pullRequestId=*' })
+$skip = @($argv | Where-Object { $_ -like '$skip=*' })
+$path = @($argv | Where-Object { $_ -like 'path=*' })
+$version = @($argv | Where-Object { $_ -like 'versionDescriptor.version=*' })
+switch ($resource) {
+    connectionData {
+        $answer = @{ authenticatedUser = @{ id = '33333333-3333-3333-3333-333333333333'
+            subjectDescriptor = 'aad.synthetic-service-account'
+            uniqueName = 'service@example.invalid' } }
+    }
+    pullRequests {
+        $pr = @{ pullRequestId = 1; status = 'active'; isDraft = $false
+            sourceRefName = 'refs/heads/feature'; targetRefName = 'refs/heads/master'
+            repository = @{ id = '11111111-1111-1111-1111-111111111111'
+                project = @{ id = '22222222-2222-2222-2222-222222222222' } } }
+        $answer = if ($route.Count) { $pr } else {
+            $pageSkip = @($argv | Where-Object { $_ -like '$skip=*' })
+            if ($pageSkip.Count -ne 1) { throw 'missing PR page offset' }
+            $rows = @()
+            if ($pageSkip[0] -eq '$skip=0') { $rows = @($pr) }
+            @{ value = $rows; count = $rows.Count }
+        }
+    }
+    pullRequestIterations {
+        $prior = @(Get-Content -LiteralPath $env:ACTIVE_PR_INTAKE_TEST_LOG |
+            Where-Object { $_ -match '\|pullRequestIterations\|' }).Count
+        $source = if ($fixture.drift -and $prior -gt 1) { 'c' * 40 } else { $fixture.source }
+        $answer = @{ value = @(@{ id = 1
+            sourceRefCommit = @{ commitId = $source }
+            targetRefCommit = @{ commitId = $fixture.target }
+            commonRefCommit = @{ commitId = $fixture.common } }) }
+    }
+    refs {
+        $prefix = @($argv | Where-Object { $_ -like 'filter=*' })[0] -replace '^filter=', ''
+        $prior = @(Get-Content -LiteralPath $env:ACTIVE_PR_INTAKE_TEST_LOG |
+            Where-Object { $_ -match '\|pullRequestIterations\|' }).Count
+        $source = if ($fixture.drift -and $prior -gt 1) { 'c' * 40 } else { $fixture.source }
+        $refs = @(
+            @{ name = 'refs/heads/feature'; objectId = $source }
+            @{ name = 'refs/heads/master'; objectId = $fixture.target }
+        )
+        if ($fixture.refDrift -and $prior -gt 1) {
+            $refs[1].objectId = 'e' * 40
+        }
+        $answer = @{ value = @($refs | Where-Object { $_.name -like "refs/$prefix*" }) }
+    }
+    pullRequestIterationChanges {
+        $offset = ($skip[0] -split '=', 2)[1]
+        if (-not $fixture.pages.ContainsKey($offset)) { throw 'missing page' }
+        $answer = $fixture.pages[$offset]
+    }
+    items {
+        $key = ($version[0] -split '=', 2)[1] + '|' + ($path[0] -split '=', 2)[1]
+        if (-not $fixture.items.ContainsKey($key)) { throw 'missing item' }
+        $answer = $fixture.items[$key]
+    }
+    pullRequestThreads { $answer = @{ value = @(); count = 0 } }
+    default { throw 'A write or unknown resource was attempted' }
+}
+$answer | ConvertTo-Json -Depth 20 -Compress
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        return @{ case = $case; fixture = $fixture; path = $fixturePath
+            log = $log; stub = $stub }
+    }
+    function Invoke-TransportCase {
+        param($Case)
+        $Case.fixture | ConvertTo-Json -Depth 20 |
+            Set-Content -LiteralPath $Case.path -Encoding utf8
+        $env:ACTIVE_PR_INTAKE_FIXTURE = $Case.path
+        $env:ACTIVE_PR_INTAKE_TEST_LOG = $Case.log
+        try {
+            $provider = New-ActivePrAzureDevOpsProvider -Config $Case.case.config `
+                -AzureCliPath $Case.stub
+            return Invoke-ActivePrIntake -Config $Case.case.config -Provider $provider `
+                -StateRoot $Case.case.root -RepositoryRoot $repo -Run
+        }
+        finally {
+            Remove-Item Env:\ACTIVE_PR_INTAKE_FIXTURE, Env:\ACTIVE_PR_INTAKE_TEST_LOG `
+                -ErrorAction SilentlyContinue
+        }
     }
 }
 AfterAll {
@@ -236,6 +363,16 @@ Describe 'Active PR read-only intake' {
         $e.gapCounts.unknownHeads | Should -Be 3
         $e.unmetCapabilities | Should -Contain 'changed-line-counts'
         $e.gaps | Should -Contain 'line-count-unavailable'
+        $c = New-IntakeCase -Count 1
+        $c.state.omitEvidence = $true
+        $e = Invoke-IntakeCase $c
+        $e.heads[0].reasonCode | Should -Be 'line-count-unavailable'
+        $e.heads[0].lineEvidence | Should -BeNullOrEmpty
+        $c = New-IntakeCase -Count 1
+        $c.state.changeLines = 0
+        $e = Invoke-IntakeCase $c
+        $e.heads[0].reasonCode | Should -Be 'unsupported-change'
+        $e.heads[0].lineEvidence | Should -BeNullOrEmpty
         $c = New-IntakeCase -Count 3
         $c.state.failHead = 2
         $e = Invoke-IntakeCase $c
@@ -542,11 +679,15 @@ $CliArguments = $args
 [IO.File]::AppendAllText($env:ACTIVE_PR_INTAKE_TEST_LOG, ($CliArguments -join '|') + "`n")
 $global:LASTEXITCODE = 0
 if ($CliArguments -contains 'connectionData') {
-    '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueName":"service@example.invalid"}}'
+    '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","subjectDescriptor":"aad.synthetic-service-account","uniqueName":"service@example.invalid"}}'
+} elseif ($CliArguments -contains 'rest') {
+    '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","subjectDescriptor":"aad.synthetic-service-account","uniqueName":"service@example.invalid"}}'
 } elseif ($CliArguments -contains 'pullRequestIterations') {
-    '{"value":[{"id":1,"sourceRefCommit":{"commitId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"targetRefCommit":{"commitId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]}'
+    '{"value":[{"id":1,"sourceRefCommit":{"commitId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"targetRefCommit":{"commitId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"commonRefCommit":{"commitId":"dddddddddddddddddddddddddddddddddddddddd"}}]}'
+} elseif ($CliArguments -contains 'refs') {
+    '{"value":[{"name":"refs/heads/feature","objectId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"name":"refs/heads/master","objectId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}'
 } elseif ($CliArguments -contains 'pullRequestIterationChanges') {
-    '{"changeEntries":[]}'
+    '{"changeEntries":[],"nextSkip":0}'
 } elseif ($CliArguments -contains 'pullRequestThreads') {
     '{"value":[],"count":0}'
 } elseif ($CliArguments -contains 'pullRequestId=1') {
@@ -564,24 +705,32 @@ if ($CliArguments -contains 'connectionData') {
             $page.items[0].pullRequestId | Should -Be 1
             $requests = Get-Content -LiteralPath $log
             $requests.Count | Should -Be 2
-            foreach ($request in $requests) {
+            $requests[0] | Should -Match '^rest\|--method\|get\|'
+            $requests[0] | Should -Match '/_apis/connectionData\?api-version=7\.1-preview\.1'
+            foreach ($request in @($requests | Select-Object -Skip 1)) {
                 $request | Should -Match '\|--http-method\|GET\|'
                 $request | Should -Match '\|--organization\|https://dev.azure.com/example-org\|'
-                $request | Should -Not -Match 'POST|PATCH|PUT|DELETE|--in-file'
+                $request | Should -Not -Match '\|--http-method\|(POST|PATCH|PUT|DELETE)\||--in-file'
             }
             $requests[1] | Should -Match 'project=ExampleProject'
             $requests[1] | Should -Match 'repositoryId=11111111-1111-1111-1111-111111111111'
+            $requests[1] | Should -Match 'searchCriteria.repositoryId=11111111-1111-1111-1111-111111111111'
+            { & $transport 'Changes' @{
+                    pullRequestId = 1; iterationId = 1; sourceCommit = 'a' * 40
+                    targetCommit = 'b' * 40; commonCommit = 'd' * 40
+                    remainingReads = 20; timeoutMilliseconds = 30000
+                } } | Should -Throw 'unsupported-change'
             $c.config.enabled = $true
             $liveShape = Invoke-ActivePrIntake -Config $c.config -Provider $transport `
                 -StateRoot $c.root -RepositoryRoot $repo -Run
             $liveShape.inventory.discovered | Should -Be 1
-            $liveShape.heads[0].reasonCode | Should -Be 'line-count-unavailable'
-            $liveShape.heads[0].status | Should -Be 'unknown'
+            $liveShape.heads[0].reasonCode | Should -Be 'unsupported-change'
+            $liveShape.heads[0].state | Should -Be 'unknown'
             $liveShape.rules[0].evaluated | Should -Be 0
             $liveShape.rules[0].error | Should -Be 1
-            $liveShape.unmetCapabilities | Should -Contain 'changed-line-counts'
+            $liveShape.heads[0].lineEvidence | Should -BeNullOrEmpty
             foreach ($request in (Get-Content -LiteralPath $log)) {
-                $request | Should -Match '\|--http-method\|GET\|'
+                $request | Should -Match '(^rest\|--method\|get\|)|(\|--http-method\|GET\|)'
             }
             if ($IsWindows) {
                 $cmd = Join-Path $c.root 'az-read-stub.cmd'
@@ -607,8 +756,170 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
             $largeTransport = New-ActivePrAzureDevOpsProvider -Config $c.config `
                 -AzureCliPath $largeStub
             { & $largeTransport 'Identity' @{ timeoutMilliseconds = 10000 } } |
-                Should -Throw 'read-budget'
+                Should -Throw 'byte-budget'
         }
         finally { Remove-Item Env:\ACTIVE_PR_INTAKE_TEST_LOG -ErrorAction SilentlyContinue }
+    }
+    It 'pages iteration changes and binds verified add/edit/delete/rename spans without retaining source' {
+        $t = New-IntakeTransportCase
+        $t.fixture.items["$($t.fixture.source)|/added.cs"] = New-TestBlob '/added.cs' "one`ntwo`n"
+        $old = New-TestBlob '/edited.cs' "a`nb`nc`n"
+        $new = New-TestBlob '/edited.cs' "a`nB`nC`n"
+        $t.fixture.items["$($t.fixture.common)|/edited.cs"] = $old
+        $t.fixture.items["$($t.fixture.source)|/edited.cs"] = $new
+        $deleted = New-TestBlob '/deleted.cs' "gone`n"
+        $t.fixture.items["$($t.fixture.common)|/deleted.cs"] = $deleted
+        $renamed = New-TestBlob '/renamed.cs' "R`n"
+        $original = New-TestBlob '/original.cs' "old`n"
+        $t.fixture.items["$($t.fixture.common)|/original.cs"] = $original
+        $t.fixture.items["$($t.fixture.source)|/renamed.cs"] = $renamed
+        $t.fixture.pages = @{
+            '0' = @{ changeEntries = @(
+                    @{ changeTrackingId = 1; changeType = 'add'; item = @{ path = '/added.cs'; objectId = $t.fixture.items["$($t.fixture.source)|/added.cs"].objectId } }
+                    @{ changeTrackingId = 2; changeType = 'edit'; item = @{ path = '/edited.cs'; objectId = $new.objectId
+                            originalObjectId = $old.objectId } }
+                ); nextSkip = 2 }
+            '2' = @{ changeEntries = @(
+                    @{ changeTrackingId = 3; changeType = 'delete'; item = @{ path = '/deleted.cs'; objectId = $deleted.objectId } }
+                    @{ changeTrackingId = 4; changeType = 'rename'; originalPath = '/original.cs'
+                        item = @{ path = '/renamed.cs'; objectId = $renamed.objectId
+                            originalObjectId = $original.objectId } }
+                ); nextSkip = 0 }
+            '4' = @{ changeEntries = @(); nextSkip = 0 }
+        }
+        $e = Invoke-TransportCase $t
+        $e.heads.Count | Should -BeGreaterThan 0 -Because (@($e.reasonCodes) -join ',')
+        $e.heads[0].state | Should -Be 'pending'
+        $proof = $e.heads[0].lineEvidence
+        $proof.changedFiles | Should -Be 4
+        $proof.changedLines | Should -Be 9
+        $proof.addedLines | Should -Be 5
+        $proof.deletedLines | Should -Be 4
+        $proof.baseCommit | Should -Be $t.fixture.common
+        $proof.files[0].spans[0].startLine | Should -Be 1
+        $proof.files[0].spans[0].endLine | Should -Be 2
+        $proof.files[1].spans[0].startLine | Should -Be 2
+        $proof.files[1].spans[0].endLine | Should -Be 3
+        $proof.files[2].spans.Count | Should -Be 0
+        $proof.files[3].spans[0].startLine | Should -Be 1
+        $e.heads[0].lineEvidenceDigest | Should -Match '^[a-f0-9]{64}$'
+        $e.readCount | Should -BeGreaterThan 10
+        ($e | ConvertTo-Json -Depth 32) | Should -Not -Match 'one|gone|original.cs|renamed.cs'
+        foreach ($request in (Get-Content -LiteralPath $t.log)) {
+            $request | Should -Match '(^rest\|--method\|get\|)|(\|--http-method\|GET\|)'
+            $request | Should -Not -Match '\|--http-method\|(POST|PATCH|PUT|DELETE)\||--in-file'
+        }
+    }
+    It 'rejects malformed paging, byte limits and drifting heads without claiming evidence' {
+        $t = New-IntakeTransportCase
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'unsupported-change'
+        $t = New-IntakeTransportCase
+        $t.fixture.pages['0'] = @{ changeEntries = @(); nextSkip = 1 }
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'change-list-truncated'
+        $t = New-IntakeTransportCase
+        $t.fixture.pages['0'] = @{ changeEntries = @(); nextSkip = 0; count = 1 }
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'change-list-truncated'
+        $t = New-IntakeTransportCase
+        $t.fixture.pages['0'] = @{ changeEntries = @(
+                @{ changeTrackingId = 1; changeType = 'rename'; item = @{ path = '/ambiguous.cs'
+                        objectId = 'a' * 40 } }
+            ); nextSkip = 0 }
+        $t.fixture.pages['1'] = @{ changeEntries = @(); nextSkip = 0 }
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'unsupported-change'
+        $t = New-IntakeTransportCase
+        $item = New-TestBlob '/big.cs' "hello`n"
+        $t.fixture.items["$($t.fixture.source)|/big.cs"] = $item
+        $t.fixture.pages['0'] = @{ changeEntries = @(
+                @{ changeTrackingId = 1; changeType = 'add'; item = @{ path = '/big.cs'; objectId = $item.objectId } }
+            ); nextSkip = 0 }
+        $t.case.config.limits.maxFileBytes = 2
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'byte-budget'
+        $t = New-IntakeTransportCase
+        $t.fixture.drift = $true
+        $e = Invoke-TransportCase $t
+        $e.heads[0].reasonCode | Should -Be 'head-drift'
+        $e.heads[0].lineEvidence | Should -BeNullOrEmpty
+        $t = New-IntakeTransportCase
+        $t.fixture.refDrift = $true
+        $e = Invoke-TransportCase $t
+        $e.heads[0].reasonCode | Should -Be 'head-inconsistent'
+        $e.heads[0].lineEvidence | Should -BeNullOrEmpty
+    }
+    It 'reconstructs verified UTF-8 BOM bytes and treats line endings as changed lines' {
+        $t = New-IntakeTransportCase
+        $old = New-TestBlob '/encoding.cs' "a`r`n"
+        $old.contentMetadata.encoding = 1252
+        $new = New-TestBlob '/encoding.cs' ([string][char]0xfeff + "a`n")
+        $new.content = "a`n"
+        $t.fixture.items["$($t.fixture.common)|/encoding.cs"] = $old
+        $t.fixture.items["$($t.fixture.source)|/encoding.cs"] = $new
+        $t.fixture.pages['0'] = @{ changeEntries = @(
+                @{ changeTrackingId = 1; changeType = 'edit'; item = @{
+                        path = '/encoding.cs'; objectId = $new.objectId
+                        originalObjectId = $old.objectId } }
+            ); nextSkip = 0 }
+        $e = Invoke-TransportCase $t
+        $e.heads[0].lineEvidence.changedLines | Should -Be 2
+        $e.heads[0].lineEvidence.files[0].spans[0].startLine | Should -Be 1
+        $e.heads[0].lineEvidence.files[0].newLineCount | Should -Be 1
+    }
+    It 'quarantines invalid blob hashes, binary content, zero-line changes and CPU/read exhaustion' {
+        $t = New-IntakeTransportCase
+        $old = New-TestBlob '/safe.cs' "before`n"
+        $new = New-TestBlob '/safe.cs' "after`n"
+        $t.fixture.items["$($t.fixture.common)|/safe.cs"] = $old
+        $t.fixture.items["$($t.fixture.source)|/safe.cs"] = $new
+        $t.fixture.pages['0'] = @{ changeEntries = @(
+                @{ changeTrackingId = 1; changeType = 'edit'; item = @{
+                        path = '/safe.cs'; objectId = $new.objectId
+                        originalObjectId = $old.objectId } }
+            ); nextSkip = 0 }
+        $t.fixture.items["$($t.fixture.source)|/safe.cs"].content = "spoofed`n"
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'invalid-item'
+        $new = New-TestBlob '/safe.cs' "after`n"
+        $t.fixture.items["$($t.fixture.source)|/safe.cs"] = $new
+        $t.fixture.items["$($t.fixture.source)|/safe.cs"].contentMetadata.isBinary = $true
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'invalid-item'
+        $new = New-TestBlob '/safe.cs' "after`n"
+        $t.fixture.items["$($t.fixture.source)|/safe.cs"] = $new
+        $t.case.config.limits.maxTotalBytes = 12
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'byte-budget'
+        $t.case.config.limits.maxTotalBytes = 2097152
+        $t.fixture.items["$($t.fixture.source)|/safe.cs"].gitObjectType = 'commit'
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'invalid-item'
+        $new = New-TestBlob '/safe.cs' "after`n"
+        $t.fixture.items["$($t.fixture.source)|/safe.cs"] = $new
+        $t.case.config.limits.maxDiffCells = 1
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'diff-budget'
+        $t.case.config.limits.maxDiffCells = 1000000
+        $t.case.config.limits.maxChangedLines = 1
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'line-budget'
+        $t.case.config.limits.maxChangedLines = 5000
+        $t.case.config.limits.maxReads = 6
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'read-budget'
+        $t.case.config.limits.maxReads = 30000
+        $t.fixture.items["$($t.fixture.source)|/safe.cs"] = $old
+        $t.fixture.pages['0'].changeEntries[0].item.objectId = $old.objectId
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'unsupported-change'
+    }
+    It 'diffs long unchanged context under the cell ceiling and keeps deletions off the new side' {
+        InModuleScope DevPilot.ActivePrIntake {
+            $prefix = "same`n" * 250
+            $suffix = "tail`n" * 250
+            $deadline = [DateTime]::UtcNow.AddSeconds(10)
+            $delta = Get-IntakeLineDelta ($prefix + "old`n" + $suffix) `
+                ($prefix + "new`n" + $suffix) 4 1100 $deadline
+            $delta.cells | Should -Be 4
+            $delta.addedLines | Should -Be 1
+            $delta.deletedLines | Should -Be 1
+            $delta.spans[0].startLine | Should -Be 251
+            $delta.spans[0].endLine | Should -Be 251
+            $onlyDeletion = Get-IntakeLineDelta "a`nb`nc`n" "a`nc`n" 4 10 $deadline
+            $onlyDeletion.deletedLines | Should -Be 1
+            $onlyDeletion.addedLines | Should -Be 0
+            $onlyDeletion.spans.Count | Should -Be 0
+            { Get-IntakeLineDelta 'old' 'new' 4 2 ([DateTime]::UtcNow.AddSeconds(-1)) } |
+                Should -Throw 'time-budget'
+        }
     }
 }

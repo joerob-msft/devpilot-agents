@@ -569,11 +569,32 @@ function syntheticIntake(size = 347): JsonRecord {
 
 test("read-only intake reports 347 distinct heads, excluded targets, and generic rules without fabricated evaluation", async () => {
   const feed = syntheticIntake();
+  const first = (feed.heads as JsonRecord[])[0]!;
+  asObject(feed.binding).configDigest = "c".repeat(64);
+  first.declaration = {
+    repositoryId: asObject(feed.binding).repositoryId,
+    projectId: asObject(feed.binding).projectId,
+    pullRequestId: first.pullRequestId, sourceRef: "refs/heads/feature",
+    targetRef: first.targetRef, sourceCommit: first.sourceCommit,
+    targetCommit: first.targetCommit, commonCommit: "b".repeat(40),
+    iterationId: first.iterationId, status: "active", isDraft: false,
+  };
+  first.declarationDigest = createHash("sha256").update(JSON.stringify(first.declaration)).digest("hex");
+  first.lineEvidence = {
+    generation: feed.generation, declarationDigest: first.declarationDigest,
+    configDigest: asObject(feed.binding).configDigest, baseCommit: "b".repeat(40),
+    changedFiles: 1, changedLines: 3, addedLines: 2, deletedLines: 1,
+    files: [{ pathDigest: "a".repeat(64), originalPathDigest: null,
+      changeType: "edit", addedLines: 2, deletedLines: 1, newLineCount: 6,
+      spans: [{ startLine: 3, endLine: 4 }] }],
+  };
+  first.lineEvidenceDigest = createHash("sha256").update(JSON.stringify(first.lineEvidence)).digest("hex");
   const parsed = parseIntakeCohort(feed);
   assert.equal(parsed.discovered, 347);
   assert.equal(parsed.eligible, 275);
   assert.equal(parsed.excludedOtherTargets, 72);
   assert.equal(parsed.rules[0]?.evaluated, 0);
+  assert.equal(parsed.heads[0]?.lineEvidence?.changedLines, 3);
   const fixture = await createFixture();
   try {
     const intakeRoot = join(fixture.root, "intake");
@@ -590,6 +611,8 @@ test("read-only intake reports 347 distinct heads, excluded targets, and generic
     }).read();
     assert.equal(snapshot.intake?.state, "complete");
     assert.equal(reportingRows(snapshot, "intake").length, 347);
+    assert.match(reportingRows(snapshot, "intake")[0]?.text.join(" ") ?? "",
+      /Verified changed lines 3.*new-side 3-4/);
     assert.match(overviewLines(snapshot).join(" "), /discovered 347 \/ eligible master 275 \/ excluded other targets 72/);
     const generic = snapshot.rules?.find((rule) => rule.id === "future-rule");
     assert.equal(generic?.implemented, false);
@@ -601,6 +624,58 @@ test("read-only intake reports 347 distinct heads, excluded targets, and generic
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("intake line evidence fails closed on mismatched binding, totals and out-of-range spans", () => {
+  const feed = syntheticIntake(1);
+  const head = (feed.heads as JsonRecord[])[0]!;
+  asObject(feed.binding).configDigest = "c".repeat(64);
+  head.declaration = {
+    repositoryId: asObject(feed.binding).repositoryId,
+    projectId: asObject(feed.binding).projectId,
+    pullRequestId: 1, sourceRef: "refs/heads/feature",
+    targetRef: head.targetRef, sourceCommit: head.sourceCommit,
+    targetCommit: head.targetCommit, commonCommit: "b".repeat(40),
+    iterationId: 21, status: "active", isDraft: false,
+  };
+  head.declarationDigest = createHash("sha256").update(JSON.stringify(head.declaration)).digest("hex");
+  head.lineEvidence = {
+    generation: feed.generation, declarationDigest: head.declarationDigest,
+    configDigest: asObject(feed.binding).configDigest, baseCommit: "b".repeat(40),
+    changedFiles: 1, changedLines: 2, addedLines: 1, deletedLines: 1,
+    files: [{ pathDigest: "a".repeat(64), originalPathDigest: null,
+      changeType: "edit", addedLines: 1, deletedLines: 1, newLineCount: 2,
+      spans: [{ startLine: 2, endLine: 2 }] }],
+  };
+  head.lineEvidenceDigest = createHash("sha256").update(JSON.stringify(head.lineEvidence)).digest("hex");
+  assert.equal(parseIntakeCohort(feed).heads[0]?.lineEvidence?.changedLines, 2);
+  asObject(head.lineEvidence).changedLines = 0;
+  assert.throws(() => parseIntakeCohort(feed), /binding/);
+  head.lineEvidenceDigest = createHash("sha256").update(JSON.stringify(head.lineEvidence)).digest("hex");
+  assert.throws(() => parseIntakeCohort(feed), /totals/);
+  asObject(head.lineEvidence).changedLines = 2;
+  asObject(head.lineEvidence).changedFiles = 0;
+  asObject(head.lineEvidence).changedLines = 0;
+  asObject(head.lineEvidence).addedLines = 0;
+  asObject(head.lineEvidence).deletedLines = 0;
+  asObject(head.lineEvidence).files = [];
+  head.lineEvidenceDigest = createHash("sha256").update(JSON.stringify(head.lineEvidence)).digest("hex");
+  assert.throws(() => parseIntakeCohort(feed), /totals/);
+  asObject(head.lineEvidence).changedFiles = 1;
+  asObject(head.lineEvidence).changedLines = 2;
+  asObject(head.lineEvidence).addedLines = 1;
+  asObject(head.lineEvidence).deletedLines = 1;
+  asObject(head.lineEvidence).files = [{ pathDigest: "a".repeat(64),
+    originalPathDigest: null, changeType: "edit", addedLines: 1,
+    deletedLines: 1, newLineCount: 2, spans: [{ startLine: 2, endLine: 2 }] }];
+  const span = ((asObject(head.lineEvidence).files as JsonRecord[])[0]!.spans as JsonRecord[])[0]!;
+  span.endLine = 3;
+  head.lineEvidenceDigest = createHash("sha256").update(JSON.stringify(head.lineEvidence)).digest("hex");
+  assert.throws(() => parseIntakeCohort(feed), /span/);
+  span.endLine = 2;
+  asObject(head.lineEvidence).baseCommit = "f".repeat(40);
+  head.lineEvidenceDigest = createHash("sha256").update(JSON.stringify(head.lineEvidence)).digest("hex");
+  assert.throws(() => parseIntakeCohort(feed), /binding/);
 });
 
 test("intake fails closed on duplicate or drifting denominators, claimed evaluations, and missing feed", async () => {
