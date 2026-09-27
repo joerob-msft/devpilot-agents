@@ -48,7 +48,7 @@ function Get-CanarySection {
         [Text.RegularExpressions.RegexOptions]::Singleline -bor
         [Text.RegularExpressions.RegexOptions]::Multiline)
     if ($matches.Count -ne 1) { throw 'rule-section-unavailable' }
-    return $matches[0].Value
+    return $matches[0].Value.Trim()
 }
 
 function Read-CanarySource {
@@ -136,7 +136,8 @@ function Invoke-ActivePrCanaryQualification {
     if ($ApprovedSources -isnot [Collections.IDictionary]) {
         throw 'rule-source-not-approved'
     }
-    Assert-CanarySource $ApprovedSources.owner $script:DocumentPath $script:OwnerCommit
+    Assert-CanarySource $ApprovedSources['owner'] $script:DocumentPath $script:OwnerCommit
+    Assert-CanarySource $ApprovedSources['namedSection'] $script:DocumentPath ''
     foreach ($policy in $script:StaticPolicies) {
         $path = "/src/DevPilot.OwnerCapability/Policy/$($policy.file).v1.txt"
         Assert-CanarySource $ApprovedSources[$policy.name] $path ''
@@ -170,7 +171,7 @@ function Invoke-ActivePrCanaryQualification {
     }
     if (-not $Provider) {
         $Provider = New-ActivePrAzureDevOpsProvider -Config $intake `
-            -AzureCliPath $AzureCliPath -Bootstrap
+            -AzureCliPath $AzureCliPath -Bootstrap -VerifyReadPrincipal
     }
     $identity = & $Provider Identity @{}
     $metadata = & $Provider Metadata @{ repositoryName = $repository.name }
@@ -204,7 +205,7 @@ function Invoke-ActivePrCanaryQualification {
     $config.projectId = $intake.projectId
     if (-not $PSBoundParameters.ContainsKey('Provider')) {
         $Provider = New-ActivePrAzureDevOpsProvider -Config $intake `
-            -AzureCliPath $AzureCliPath
+            -AzureCliPath $AzureCliPath -VerifyReadPrincipal
     }
     $intake.enabled = $true
     $root = Resolve-AgentTrustedRoot -Path $StateRoot -Kind durable-state `
@@ -240,7 +241,9 @@ function Invoke-ActivePrCanaryQualification {
         [Text.Encoding]::UTF8.GetByteCount($ownerSection) -gt 65536) {
         throw 'owner-rule-digest-mismatch'
     }
-    $namedSection = Get-CanarySection $document '## Named parameters for Assert'
+    $namedDocument = Read-CanarySource $Provider $ApprovedSources.namedSection `
+        $script:DocumentPath
+    $namedSection = Get-CanarySection $namedDocument '## Named parameters for Assert'
     $config.provenance = [ordered]@{
         ownerSection = [ordered]@{
             repositoryId = [string]$ApprovedSources.owner.repositoryId
@@ -251,8 +254,8 @@ function Invoke-ActivePrCanaryQualification {
             length = [Text.Encoding]::UTF8.GetByteCount($ownerSection)
         }
         namedSection = [ordered]@{
-            repositoryId = [string]$ApprovedSources.owner.repositoryId
-            commit = $script:OwnerCommit
+            repositoryId = [string]$ApprovedSources.namedSection.repositoryId
+            commit = [string]$ApprovedSources.namedSection.commit
             path = $script:DocumentPath.Substring(1)
             section = '## Named parameters for Assert'
             hash = 'v1:sha256:' + (Get-CanaryTextHash $namedSection)

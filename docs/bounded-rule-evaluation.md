@@ -143,10 +143,11 @@ config are checked against GET results; otherwise the tool derives the exact
 GUID/descriptor/UPN with read-only project, repository, and connection GETs
 and checks the authenticated account against `operator.defaultAlias`.
 
-The approved source manifest has keys `owner`, `class`, `redundant`, and
-`named`. Each entry must explicitly set `approved: true`, `projectName`,
-`repositoryName`, `repositoryId`, `commit`, and `path`. The Owner entry must
-pin EngHub's `documentation/EngineeringProcesses/Conventions/AutomatedTests.md`
+The approved source manifest has keys `owner`, `namedSection`, `class`,
+`redundant`, and `named`. Each entry must explicitly set `approved: true`,
+`projectName`, `repositoryName`, `repositoryId`, `commit`, and `path`. The Owner
+entry must pin EngHub's
+`documentation/EngineeringProcesses/Conventions/AutomatedTests.md`
 at `f6db83436b48f48a8521095a888d79f67823bbb2`; the other three entries
 must independently identify their *actual approved* policy source commits
 and the corresponding
@@ -154,9 +155,14 @@ and the corresponding
 paths. The tool fetches each pinned source via GET, checks local policy
 bytes against the remote policy bytes, verifies the Owner section digest
 against its fixed SHA-256, and records both Owner and `## Named parameters for Assert`
-section provenance. It does not attribute class or redundant policy to
-EngHub. Missing approvals or mismatched content stop provisioning; do not
-invent a commit or repository ID to satisfy the contract.
+section provenance. `namedSection` separately approves the named-parameters
+section in the same document (and may pin the same commit as `owner`); approving
+Owner alone does not approve that section. The CLI bearer identity and Azure
+DevOps CLI identity must match before source reads; source text is read from
+the immutable raw Git blob and verified against its item object ID, rather
+than trusting the API's rendered `content` field. It does not attribute class
+or redundant policy to EngHub. Missing approvals or mismatched content stop
+provisioning; do not invent a commit or repository ID to satisfy the contract.
 
 The tool then uses the intake provider's two complete bounded listing passes
 over *all* active PRs, excludes drafts and non-master targets, and pins the
