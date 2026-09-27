@@ -90,8 +90,23 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
     public bool ThrottleInventory = false;
     public bool TooLarge = false;
     public bool DriftRef = false;
+    public bool GraphEnabled = false;
+    public bool CorruptTree = false;
+    public bool MissingProject = false;
+    public bool ThrottleTree = false;
+    public bool IncompleteChanges = false;
+    public string SourceFile;
+    public string ProjectFile;
+    public string SourceObjectId;
+    public string ProjectObjectId;
+    public string RootTreeId;
+    public string TestsTreeId;
     protected override Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken) {
+        if (request.Method != HttpMethod.Get ||
+            request.Headers.Authorization?.Scheme != "Bearer") {
+            throw new InvalidOperationException("unexpected or writing HTTP operation");
+        }
         Paths.Add(request.RequestUri.AbsoluteUri);
         Tokens.Add(request.Headers.Authorization?.Parameter ?? "");
         var path = request.RequestUri.AbsolutePath;
@@ -126,7 +141,31 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                 (feature ? "feature" : "master") + "\",\"objectId\":\"" +
                 new string(DriftRef ? 'f' : (feature ? 'a' : 'b'), 40) + "\"}]}";
         } else if (path.EndsWith("/pullRequests/7/iterations/1/changes")) {
-            body = "{\"changeEntries\":[],\"count\":0,\"totalCount\":0,\"nextSkip\":0}";
+            if (GraphEnabled && !request.RequestUri.Query.Contains("skip=1")) {
+                body = "{\"changeEntries\":[{\"changeTrackingId\":1,\"changeType\":\"add\",\"item\":{\"path\":\"/Tests/Example.cs\",\"objectId\":\"" +
+                    SourceObjectId + "\"}}],\"count\":1,\"totalCount\":1,\"nextSkip\":" +
+                    (IncompleteChanges ? "5" : "1") + "}";
+            } else {
+                body = "{\"changeEntries\":[],\"count\":0,\"totalCount\":" +
+                    (GraphEnabled ? "1" : "0") + ",\"nextSkip\":0}";
+            }
+        } else if (GraphEnabled && path.EndsWith("/items") &&
+                   request.Headers.Accept.ToString() == "application/octet-stream") {
+            body = Uri.UnescapeDataString(request.RequestUri.Query).Contains("path=/Tests/Tests.csproj")
+                ? ProjectFile : SourceFile;
+        } else if (GraphEnabled && path.EndsWith("/commits/" + new string('a', 40))) {
+            body = "{\"commitId\":\"" + new string('a', 40) +
+                "\",\"treeId\":\"" + RootTreeId + "\"}";
+        } else if (GraphEnabled && path.EndsWith("/trees/" + RootTreeId)) {
+            body = "{\"objectId\":\"" + RootTreeId +
+                "\",\"treeEntries\":[{\"relativePath\":\"Tests\",\"mode\":\"40000\",\"gitObjectType\":\"tree\",\"objectId\":\"" +
+                (CorruptTree ? new string('f', 40) : TestsTreeId) + "\"}]}";
+        } else if (GraphEnabled && path.EndsWith("/trees/" + TestsTreeId)) {
+            body = "{\"objectId\":\"" + TestsTreeId +
+                "\",\"treeEntries\":[{\"relativePath\":\"Example.cs\",\"mode\":\"100644\",\"gitObjectType\":\"blob\",\"objectId\":\"" +
+                SourceObjectId + "\"}" + (MissingProject ? "" :
+                ",{\"relativePath\":\"Tests.csproj\",\"mode\":\"100644\",\"gitObjectType\":\"blob\",\"objectId\":\"" +
+                ProjectObjectId + "\"}") + "]}";
         } else if (path.EndsWith("/items") &&
                    request.Headers.Accept.ToString() == "application/octet-stream") {
             body = "synthetic bytes";
@@ -140,13 +179,17 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             throw new InvalidOperationException("unexpected GET route");
         }
         var response = new HttpResponseMessage(
-            ThrottleInventory && path.EndsWith("/pullRequests")
+            (ThrottleInventory && path.EndsWith("/pullRequests")) ||
+            (ThrottleTree && path.Contains("/trees/"))
                 ? (HttpStatusCode)429 : HttpStatusCode.OK) {
             Content = new ByteArrayContent(TooLarge ? new byte[65537] :
                 Encoding.UTF8.GetBytes(body))
         };
         response.Content.Headers.ContentType =
-            new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+            new System.Net.Http.Headers.MediaTypeHeaderValue(
+                path.EndsWith("/items") &&
+                    request.Headers.Accept.ToString() == "application/octet-stream"
+                    ? "application/octet-stream" : "application/json");
         return Task.FromResult(response);
     }
 }
@@ -169,6 +212,25 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
     function Get-BootstrapHash([byte[]]$Bytes) {
         [Convert]::ToHexString(
             [Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
+    }
+    function Get-BoundGitObjectId([string]$Kind, [byte[]]$Bytes) {
+        $header = [Text.Encoding]::ASCII.GetBytes("$Kind $($Bytes.Length)`0")
+        [Convert]::ToHexString([Security.Cryptography.SHA1]::HashData(
+                [byte[]]($header + $Bytes))).ToLowerInvariant()
+    }
+    function Get-BoundTreeId([object[]]$Entries) {
+        $stream = [IO.MemoryStream]::new()
+        try {
+            foreach ($entry in $Entries) {
+                $prefix = [Text.Encoding]::UTF8.GetBytes(
+                    "$($entry.mode) $($entry.name)`0")
+                $stream.Write($prefix, 0, $prefix.Length)
+                $hash = [Convert]::FromHexString($entry.objectId)
+                $stream.Write($hash, 0, $hash.Length)
+            }
+            Get-BoundGitObjectId 'tree' $stream.ToArray()
+        }
+        finally { $stream.Dispose() }
     }
     & $module {
         param($OwnerDocument, $CoverageDocument)
@@ -1758,6 +1820,126 @@ Describe 'Read-only private canary input bootstrap' {
             $handler.Paths[18] | Should -Match '/trees/'
         }
         finally { $client.Dispose() }
+    }
+    It 'proves a selected PR project graph through one bearer and rejects broken HTTP evidence' {
+        $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `
+            -Raw | ConvertFrom-Json -AsHashtable
+        $config.schemaVersion = 2
+        $config.principalProof = 'aad-graph-storage-key-v1'
+        $config.expectedAccount.descriptor = 'aad.synthetic'
+        $config.expectedAccount.principalName = 'service@example.invalid'
+        $config.expectedAccount.Remove('uniqueName')
+        $config.enabled = $true
+        $config.projectEvidence.enabled = $true
+        $source = "using Microsoft.VisualStudio.TestTools.UnitTesting;`n" +
+            "[TestClass]`nclass Example {}`n"
+        $project = '<Project><PropertyGroup><IsTestProject>true</IsTestProject>' +
+            '</PropertyGroup><ItemGroup><Compile Include="Example.cs"/>' +
+            '</ItemGroup></Project>'
+        $sourceId = Get-BoundGitObjectId 'blob' (
+            [Text.Encoding]::UTF8.GetBytes($source))
+        $projectId = Get-BoundGitObjectId 'blob' (
+            [Text.Encoding]::UTF8.GetBytes($project))
+        $testsTreeId = Get-BoundTreeId @(
+            @{ mode = '100644'; name = 'Example.cs'; objectId = $sourceId },
+            @{ mode = '100644'; name = 'Tests.csproj'; objectId = $projectId })
+        $rootTreeId = Get-BoundTreeId @(
+            @{ mode = '40000'; name = 'Tests'; objectId = $testsTreeId })
+        $missingProjectTreeId = Get-BoundTreeId @(
+            @{ mode = '100644'; name = 'Example.cs'; objectId = $sourceId })
+        $missingProjectRootId = Get-BoundTreeId @(
+            @{ mode = '40000'; name = 'Tests'; objectId = $missingProjectTreeId })
+        foreach ($mode in @('complete', 'corrupt-tree', 'missing-project',
+                'incomplete-changes', 'throttle-tree')) {
+            $handler = [CanaryBoundGetHandler]::new()
+            $handler.GraphEnabled = $true
+            $handler.OmitUniqueName = $true
+            $handler.SourceFile = $source
+            $handler.ProjectFile = $project
+            $handler.SourceObjectId = $sourceId
+            $handler.ProjectObjectId = $projectId
+            $handler.MissingProject = $mode -eq 'missing-project'
+            $handler.RootTreeId = if ($handler.MissingProject) {
+                $missingProjectRootId
+            } else { $rootTreeId }
+            $handler.TestsTreeId = if ($handler.MissingProject) {
+                $missingProjectTreeId
+            } else { $testsTreeId }
+            $handler.CorruptTree = $mode -eq 'corrupt-tree'
+            $handler.IncompleteChanges = $mode -eq 'incomplete-changes'
+            $handler.ThrottleTree = $mode -eq 'throttle-tree'
+            $client = [Net.Http.HttpClient]::new($handler)
+            $token = 'b' * 100
+            try {
+                $provider = New-ActivePrAzureDevOpsProvider -Config $config `
+                    -BearerToken $token -BoundClient $client -VerifyReadPrincipal
+                $identity = & $provider Identity @{ timeoutMilliseconds = 5000 }
+                $identity.Contains('uniqueName') | Should -BeFalse
+                $head = & $provider Head @{ pullRequestId = 7
+                    remainingReads = 30; timeoutMilliseconds = 5000 }
+                $head.status | Should -Be 'active'
+                $head.isDraft | Should -BeFalse
+                $head.targetRef | Should -Be 'refs/heads/master'
+                $changeRequest = @{ pullRequestId = 7; iterationId = $head.iterationId
+                    sourceCommit = $head.sourceCommit
+                    targetCommit = $head.targetCommit
+                    commonCommit = $head.commonCommit
+                    includeEvaluationFiles = $true
+                    includeProjectEvidence = $true
+                    remainingReads = 30; timeoutMilliseconds = 5000 }
+                if ($mode -in @('incomplete-changes', 'throttle-tree')) {
+                    { & $provider Changes $changeRequest } | Should -Throw $(if (
+                            $mode -eq 'incomplete-changes') {
+                            '*change-list-truncated*'
+                        } else { '*read-throttled*' })
+                } else {
+                    $changes = & $provider Changes $changeRequest
+                    $changes.changedFiles | Should -Be 1
+                    $changes.evaluationFiles[0].objectId | Should -Be $sourceId
+                    if ($mode -eq 'complete') {
+                        $changes.projectEvidence.complete | Should -BeTrue
+                        $changes.projectEvidence.rootTreeId |
+                            Should -Be $rootTreeId
+                        $changes.projectEvidence.files[0].status |
+                            Should -Be 'complete'
+                        $graph = $changes.evaluationFiles[0].projectEvidence
+                        $graph.sourceCommit | Should -Be $head.sourceCommit
+                        $graph.objectId | Should -Be $sourceId
+                        $graph.projects[0].path |
+                            Should -Be '/Tests/Tests.csproj'
+                        $graph.projects[0].isTestProject | Should -BeTrue
+                    } else {
+                        $changes.projectEvidence.complete | Should -BeFalse
+                        $changes.projectEvidence.files[0].status |
+                            Should -Be 'unknown'
+                        $changes.evaluationFiles[0].Contains(
+                            'projectEvidence') | Should -BeFalse
+                        if ($mode -eq 'missing-project') {
+                            $changes.projectEvidence.rootTreeId |
+                                Should -Be $missingProjectRootId
+                        }
+                    }
+                    $finalHead = & $provider Head @{ pullRequestId = 7
+                        remainingReads = 30; timeoutMilliseconds = 5000 }
+                    $finalHead.sourceCommit | Should -Be $head.sourceCommit
+                }
+                @($handler.Tokens | Where-Object { $_ -cne $token }).Count |
+                    Should -Be 0
+                @($handler.Paths | Where-Object {
+                        $_ -notlike 'https://dev.azure.com/example-org/*' -and
+                        $_ -notlike 'https://vssps.dev.azure.com/example-org/*'
+                    }).Count | Should -Be 0
+                if ($mode -eq 'complete') {
+                    @($handler.Paths | Where-Object {
+                            $_ -match '/trees/'
+                        }).Count | Should -Be 2
+                    @($handler.Paths | Where-Object {
+                            $_ -match '/items\?'
+                        }).Count | Should -Be 2
+                }
+            }
+            finally { $client.Dispose() }
+        }
     }
     It 'rejects missing-alias drift and storage mismatch before inventory, and stops on throttle' {
         $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `
