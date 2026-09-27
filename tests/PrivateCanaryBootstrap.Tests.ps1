@@ -5,6 +5,7 @@ BeforeAll {
     Import-Module (Join-Path $repo 'src\OwnerObservationContract\OwnerObservationContract.psd1')
     Import-Module (Join-Path $repo 'src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
     Import-Module (Join-Path $repo 'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1')
+    Import-Module (Join-Path $repo 'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1')
     Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.ActivePrCanary.psm1') -Force
     Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.PrivateCanaryRunner.psd1') -Force
     . (Join-Path $repo 'src\DevPilot.ActivePrCanary\PrivateCanaryIdentityOutput.ps1')
@@ -73,6 +74,126 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
     }
 }
 '@
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+public sealed class CanaryBoundGetHandler : HttpMessageHandler {
+    public List<string> Paths = new List<string>();
+    public List<string> Tokens = new List<string>();
+    public bool OmitUniqueName = false;
+    public bool DriftStorageKey = false;
+    public bool ThrottleInventory = false;
+    public bool TooLarge = false;
+    public bool DriftRef = false;
+    public bool GraphEnabled = false;
+    public bool CorruptTree = false;
+    public bool MissingProject = false;
+    public bool ThrottleTree = false;
+    public bool IncompleteChanges = false;
+    public string SourceFile;
+    public string ProjectFile;
+    public string SourceObjectId;
+    public string ProjectObjectId;
+    public string RootTreeId;
+    public string TestsTreeId;
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        if (request.Method != HttpMethod.Get ||
+            request.Headers.Authorization?.Scheme != "Bearer") {
+            throw new InvalidOperationException("unexpected or writing HTTP operation");
+        }
+        Paths.Add(request.RequestUri.AbsoluteUri);
+        Tokens.Add(request.Headers.Authorization?.Parameter ?? "");
+        var path = request.RequestUri.AbsolutePath;
+        string body;
+        if (path.EndsWith("/connectionData")) {
+            body = "{\"authenticatedUser\":{\"id\":\"33333333-3333-3333-3333-333333333333\",\"subjectDescriptor\":\"aad.synthetic\"" +
+                (OmitUniqueName ? "" : ",\"uniqueName\":\"service@example.invalid\"") + "}}";
+        } else if (path.EndsWith("/graph/users/aad.synthetic")) {
+            body = "{\"descriptor\":\"aad.synthetic\",\"subjectKind\":\"user\",\"principalName\":\"service@example.invalid\"}";
+        } else if (path.EndsWith("/graph/storagekeys/aad.synthetic")) {
+            body = "{\"value\":\"" + (DriftStorageKey
+                ? "44444444-4444-4444-4444-444444444444"
+                : "33333333-3333-3333-3333-333333333333") + "\"}";
+        } else if (path.EndsWith("/_apis/projects/ExampleProject")) {
+            body = "{\"id\":\"22222222-2222-2222-2222-222222222222\",\"name\":\"ExampleProject\"}";
+        } else if (path.EndsWith("/_apis/git/repositories/11111111-1111-1111-1111-111111111111")) {
+            body = "{\"id\":\"11111111-1111-1111-1111-111111111111\",\"name\":\"ExampleRepo\",\"project\":{\"id\":\"22222222-2222-2222-2222-222222222222\"}}";
+        } else if (path.EndsWith("/pullRequests")) {
+            body = "{\"value\":[],\"count\":0}";
+        } else if (path.EndsWith("/pullRequests/7")) {
+            body = "{\"pullRequestId\":7,\"status\":\"active\",\"isDraft\":false,\"sourceRefName\":\"refs/heads/feature\",\"targetRefName\":\"refs/heads/master\",\"repository\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"project\":{\"id\":\"22222222-2222-2222-2222-222222222222\"}},\"lastMergeSourceCommit\":{\"commitId\":\"" +
+                new string('a', 40) + "\"},\"lastMergeTargetCommit\":{\"commitId\":\"" +
+                new string('b', 40) + "\"}}";
+        } else if (path.EndsWith("/pullRequests/7/iterations")) {
+            body = "{\"value\":[{\"id\":1,\"sourceRefCommit\":{\"commitId\":\"" +
+                new string('a', 40) + "\"},\"targetRefCommit\":{\"commitId\":\"" +
+                new string('b', 40) + "\"},\"commonRefCommit\":{\"commitId\":\"" +
+                new string('c', 40) + "\"}}]}";
+        } else if (path.EndsWith("/refs")) {
+            var feature = request.RequestUri.Query.Contains("feature");
+            body = "{\"value\":[{\"name\":\"refs/heads/" +
+                (feature ? "feature" : "master") + "\",\"objectId\":\"" +
+                new string(DriftRef ? 'f' : (feature ? 'a' : 'b'), 40) + "\"}]}";
+        } else if (path.EndsWith("/pullRequests/7/iterations/1/changes")) {
+            if (GraphEnabled && !request.RequestUri.Query.Contains("skip=1")) {
+                body = "{\"changeEntries\":[{\"changeTrackingId\":1,\"changeType\":\"add\",\"item\":{\"path\":\"/Tests/Example.cs\",\"objectId\":\"" +
+                    SourceObjectId + "\"}}],\"count\":1,\"totalCount\":1,\"nextSkip\":" +
+                    (IncompleteChanges ? "5" : "1") + "}";
+            } else {
+                body = "{\"changeEntries\":[],\"count\":0,\"totalCount\":" +
+                    (GraphEnabled ? "1" : "0") + ",\"nextSkip\":0}";
+            }
+        } else if (GraphEnabled && path.EndsWith("/items") &&
+                   request.Headers.Accept.ToString() == "application/octet-stream") {
+            body = Uri.UnescapeDataString(request.RequestUri.Query).Contains("path=/Tests/Tests.csproj")
+                ? ProjectFile : SourceFile;
+        } else if (GraphEnabled && path.EndsWith("/commits/" + new string('a', 40))) {
+            body = "{\"commitId\":\"" + new string('a', 40) +
+                "\",\"treeId\":\"" + RootTreeId + "\"}";
+        } else if (GraphEnabled && path.EndsWith("/trees/" + RootTreeId)) {
+            body = "{\"objectId\":\"" + RootTreeId +
+                "\",\"treeEntries\":[{\"relativePath\":\"Tests\",\"mode\":\"40000\",\"gitObjectType\":\"tree\",\"objectId\":\"" +
+                (CorruptTree ? new string('f', 40) : TestsTreeId) + "\"}]}";
+        } else if (GraphEnabled && path.EndsWith("/trees/" + TestsTreeId)) {
+            body = "{\"objectId\":\"" + TestsTreeId +
+                "\",\"treeEntries\":[{\"relativePath\":\"Example.cs\",\"mode\":\"100644\",\"gitObjectType\":\"blob\",\"objectId\":\"" +
+                SourceObjectId + "\"}" + (MissingProject ? "" :
+                ",{\"relativePath\":\"Tests.csproj\",\"mode\":\"100644\",\"gitObjectType\":\"blob\",\"objectId\":\"" +
+                ProjectObjectId + "\"}") + "]}";
+        } else if (path.EndsWith("/items") &&
+                   request.Headers.Accept.ToString() == "application/octet-stream") {
+            body = "synthetic bytes";
+        } else if (path.EndsWith("/commits/" + new string('a', 40))) {
+            body = "{\"commitId\":\"" + new string('a', 40) + "\"}";
+        } else if (path.EndsWith("/trees/" + new string('a', 40))) {
+            body = "{\"treeId\":\"" + new string('a', 40) + "\"}";
+        } else if (path.EndsWith("/threads")) {
+            body = "{\"value\":[],\"count\":0}";
+        } else {
+            throw new InvalidOperationException("unexpected GET route");
+        }
+        var response = new HttpResponseMessage(
+            (ThrottleInventory && path.EndsWith("/pullRequests")) ||
+            (ThrottleTree && path.Contains("/trees/"))
+                ? (HttpStatusCode)429 : HttpStatusCode.OK) {
+            Content = new ByteArrayContent(TooLarge ? new byte[65537] :
+                Encoding.UTF8.GetBytes(body))
+        };
+        response.Content.Headers.ContentType =
+            new System.Net.Http.Headers.MediaTypeHeaderValue(
+                path.EndsWith("/items") &&
+                    request.Headers.Accept.ToString() == "application/octet-stream"
+                    ? "application/octet-stream" : "application/json");
+        return Task.FromResult(response);
+    }
+}
+'@
     $module = Get-Module DevPilot.ActivePrCanary
     $script:roots = [Collections.Generic.List[string]]::new()
     $script:old = & $module {
@@ -91,6 +212,25 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
     function Get-BootstrapHash([byte[]]$Bytes) {
         [Convert]::ToHexString(
             [Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
+    }
+    function Get-BoundGitObjectId([string]$Kind, [byte[]]$Bytes) {
+        $header = [Text.Encoding]::ASCII.GetBytes("$Kind $($Bytes.Length)`0")
+        [Convert]::ToHexString([Security.Cryptography.SHA1]::HashData(
+                [byte[]]($header + $Bytes))).ToLowerInvariant()
+    }
+    function Get-BoundTreeId([object[]]$Entries) {
+        $stream = [IO.MemoryStream]::new()
+        try {
+            foreach ($entry in $Entries) {
+                $prefix = [Text.Encoding]::UTF8.GetBytes(
+                    "$($entry.mode) $($entry.name)`0")
+                $stream.Write($prefix, 0, $prefix.Length)
+                $hash = [Convert]::FromHexString($entry.objectId)
+                $stream.Write($hash, 0, $hash.Length)
+            }
+            Get-BoundGitObjectId 'tree' $stream.ToArray()
+        }
+        finally { $stream.Dispose() }
     }
     & $module {
         param($OwnerDocument, $CoverageDocument)
@@ -131,14 +271,28 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             $oid = [Convert]::ToHexString([Security.Cryptography.SHA1]::HashData(
                     [byte[]]($header + $bytes))).ToLowerInvariant()
             switch -CaseSensitive ($op) {
-                Identity {
+                IdentityProof {
                     return @{ id = '33333333-3333-3333-3333-333333333333'
                         descriptor = if ($state.wrong -eq 'principal-final' -and
                             $state.reads.Count -gt 10) { 'aad.other' }
                         else { 'aad.synthetic' }
                         uniqueName = if ($state.wrong -eq 'principal') {
                             'other@example.invalid'
+                        } elseif ($state.wrong -eq 'missing-unique-name') {
+                            $null
                         } else { 'service@example.invalid' } }
+                }
+                GraphUser {
+                    return @{ descriptor = $request.subjectDescriptor
+                        subjectKind = 'user'
+                        principalName = if ($state.wrong -eq 'graph-upn') {
+                            'other@example.invalid'
+                        } else { 'service@example.invalid' } }
+                }
+                GraphStorageKey {
+                    return @{ value = if ($state.wrong -eq 'storage-key') {
+                            '44444444-4444-4444-4444-444444444444'
+                        } else { '33333333-3333-3333-3333-333333333333' } }
                 }
                 Project {
                     if ($request.projectName -ceq 'Engineering') {
@@ -218,7 +372,9 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             -StateRoot $Case.root -RepositoryRoot $repo -Read $Case.provider -Run
     }
     function Get-RegistryCase {
+        param([switch]$MissingUniqueName)
         $case = Get-BootstrapCase
+        if ($MissingUniqueName) { $case.state.wrong = 'missing-unique-name' }
         [void](Invoke-BootstrapCase $case)
         return @{
             case = $case
@@ -236,8 +392,8 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             -Read $InputCase.case.provider -Run
     }
     function Get-SignedIntakeCase {
-        param([switch]$Code)
-        $inputCase = Get-RegistryCase
+        param([switch]$Code, [switch]$MissingUniqueName)
+        $inputCase = Get-RegistryCase -MissingUniqueName:$MissingUniqueName
         $root = $inputCase.case.root + '-signed'
         $script:roots.Add($root)
         $state = @{
@@ -406,6 +562,11 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
         $baseline = $inputCase.case.state.headChecks
         $read = {
             param($operation, $request)
+            if ($state.wrong -eq 'throttle-final' -and
+                $operation -ceq 'GraphStorageKey' -and
+                @($state.calls | Where-Object { $_ -ceq 'ListPage' }).Count -gt 0) {
+                throw 'read-throttled'
+            }
             if ($state.wrong -eq 'late-head' -and
                 $operation -ceq 'PullRequest' -and
                 $inputCase.case.state.headChecks -ge ($baseline + 2)) {
@@ -584,7 +745,8 @@ Describe 'Read-only private canary input bootstrap' {
         }
         It 'rejects forged signature, receipt, generation, head, commit and graph' {
             foreach ($failure in @('signature', 'receipt', 'generation',
-                    'config', 'head', 'commit', 'graph', 'principal')) {
+                    'config', 'schema-downgrade', 'head', 'commit',
+                    'graph', 'principal')) {
                 $c = Get-SignedIntakeCase
                 [void](Invoke-SignedIntakeCase $c)
                 $c.state.calls.Clear()
@@ -612,6 +774,12 @@ Describe 'Read-only private canary input bootstrap' {
                         Sign-RunnerConfig $c {
                             param($value)
                             $value.heads[0].sourceCommit = 'f' * 40
+                        }
+                    }
+                    'schema-downgrade' {
+                        Sign-RunnerConfig $c {
+                            param($value)
+                            $value.schemaVersion = 1
                         }
                     }
                     head { $c.state.wrong = 'stale-head' }
@@ -732,6 +900,41 @@ Describe 'Read-only private canary input bootstrap' {
         $c.state.reads.Count | Should -Be 0
         Test-Path $c.root | Should -BeFalse
     }
+    It 'carries absent ADO uniqueName as absent through receipts and signed evaluation' {
+        $c = Get-SignedIntakeCase -Code -MissingUniqueName
+        $c.input.config.expectedAccount.Contains('uniqueName') | Should -BeFalse
+        $c.input.sources.accountProofDigest | Should -Match '^v1:sha256:[a-f0-9]{64}$'
+        $signed = Invoke-SignedIntakeCase $c
+        $signed.state | Should -Be 'signed-intake-not-evaluated'
+        $dispatcher = Get-Content (Join-Path $c.root 'canary-dispatcher.json') `
+            -Raw | ConvertFrom-Json -AsHashtable
+        $dispatcher.schemaVersion | Should -Be 2
+        $dispatcher.expectedAccount.Contains('uniqueName') | Should -BeFalse
+        $result = Invoke-RunnerCase $c
+        $result.schemaVersion | Should -Be 2
+        $result.providerWrites | Should -Be 0
+        $result.modelToolInvocations | Should -Be 0
+        $c.state.threads = @(New-RunnerThread $c 1 'Exclude from code coverage.')
+        $human = Invoke-RunnerCase $c
+        $human.rules[1].humanCovered | Should -Be 2
+        $human.rules[1].wouldCreate | Should -Be 0
+        $marker = New-RunnerThread $c 1 (Get-RunnerClassMarkerBody $c)
+        $marker.comments[0].author = [ordered]@{} + $c.input.config.expectedAccount
+        $marker.comments[0].author.descriptor = 'aad.other'
+        $c.state.threads = @($marker)
+        $ambiguous = Invoke-RunnerCase $c
+        $ambiguous.rules[1].unknown | Should -Be 2
+        $ambiguous.rules[1].wouldCreate | Should -Be 0
+    }
+    It 'refuses a half-injected credential path without creating state' {
+        $c = Get-SignedIntakeCase
+        { Invoke-PrivateCanarySignedIntake -ProviderConfig $c.input.config `
+                -ApprovedSources $c.input.sources -StateRoot $c.root `
+                -RepositoryRoot $repo -CanaryPullRequestIds @(17007699) `
+                -Read $c.read -Run } | Should -Throw '*bound-transport-invalid*'
+        Test-Path $c.root | Should -BeFalse
+        $c.state.calls.Count | Should -Be 0
+    }
     Describe 'Four-source read-only registry from verified receipts' {
         It 'defaults off without consuming even a malformed receipt or contacting ADO' {
             $c = Get-BootstrapCase
@@ -825,7 +1028,7 @@ Describe 'Read-only private canary input bootstrap' {
             It 'refuses split inventory, stale heads, fake graph and forged receipt before signing' {
                 foreach ($failure in @('split-page', 'stale-head', 'fake-graph',
                         'forged-receipt', 'cursor-collision', 'late-head',
-                        'provider-drift')) {
+                        'provider-drift', 'throttle-final')) {
                     $c = Get-SignedIntakeCase
                     if ($failure -eq 'forged-receipt') {
                         $c.input.sources.rules['bpm-redundant-method-coverage@2'].blobId =
@@ -844,6 +1047,7 @@ Describe 'Read-only private canary input bootstrap' {
                             $c.state.rows[49].creationDate
                     } else { $c.state.wrong = $failure }
                     { Invoke-SignedIntakeCase $c } | Should -Throw -Because $failure
+                    Test-Path $c.root | Should -BeFalse
                     Test-Path (Join-Path $c.root 'signature.key') | Should -BeFalse
                     @($c.state.calls | Where-Object {
                             $_ -notin @('Identity', 'ListPage', 'Head', 'Changes',
@@ -887,7 +1091,7 @@ Describe 'Read-only private canary input bootstrap' {
             $result.evaluated | Should -BeFalse
             $result.writerEligible | Should -BeFalse
             $result.providerWrites | Should -Be 0
-            $result.providerReads | Should -Be 17
+            $result.providerReads | Should -Be 21
             $result.rules.Count | Should -Be 4
             $result.rules['bpm-test-ownership@1'].sourceAuthority |
                 Should -Be 'pinned-owner-section'
@@ -907,13 +1111,17 @@ Describe 'Read-only private canary input bootstrap' {
                 Should -Not -Be $inputCase.sources.namedSection.sectionHash
         }
         It 'rejects wrong or missing receipts and independently mutated Owner and Named pins' {
-            foreach ($failure in @('schema', 'missing', 'owner', 'owner-length',
+            foreach ($failure in @('schema', 'identity-digest', 'missing',
+                    'owner', 'owner-length',
                     'named-section', 'named-blob', 'class', 'redundant',
                     'class-head', 'named-policy', 'named-digest', 'repository',
                     'project')) {
                 $inputCase = Get-RegistryCase
                 switch ($failure) {
-                    schema { $inputCase.sources.schemaVersion = 1 }
+                    schema { $inputCase.sources.schemaVersion = 2 }
+                    'identity-digest' {
+                        $inputCase.sources.accountProofDigest = 'v1:sha256:' + 'a' * 64
+                    }
                     missing {
                         $inputCase.sources.rules.Remove('bpm-test-class-coverage@2')
                     }
@@ -994,8 +1202,8 @@ Describe 'Read-only private canary input bootstrap' {
         $result.canaryExecuted | Should -BeFalse
         $result.providerWrites | Should -Be 0
         $result.ruleCount | Should -Be 4
-        $c.state.reads.Count | Should -BeLessOrEqual 20
-        $c.state.reads[-1] | Should -Be 'Identity'
+        $c.state.reads.Count | Should -BeLessOrEqual 26
+        $c.state.reads[-1] | Should -Be 'GraphStorageKey'
         @($c.state.reads | Where-Object { $_ -in @('ListPage', 'Head', 'Changes',
                     'Discussions', 'Write', 'Post') }).Count | Should -Be 0
         $config = Get-Content (Join-Path $c.root 'provider-config.json') -Raw |
@@ -1005,6 +1213,8 @@ Describe 'Read-only private canary input bootstrap' {
         $config.projectId | Should -Be '22222222-2222-2222-2222-222222222222'
         $config.repository.id | Should -Be '11111111-1111-1111-1111-111111111111'
         $config.expectedAccount.descriptor | Should -Be 'aad.synthetic'
+        $config.expectedAccount.principalName | Should -Be 'service@example.invalid'
+        $manifest.schemaVersion | Should -Be 3
         $manifest.rules.Count | Should -Be 4
         $manifest.namedSection.commit | Should -Be $manifest.rules['bpm-test-ownership@1'].commit
         $manifest.rules['bpm-test-class-coverage@2'].headVerified | Should -BeTrue
@@ -1027,7 +1237,7 @@ Describe 'Read-only private canary input bootstrap' {
     }
     It 'rejects stale PR head, wrong metadata, commit, blob and partial inputs before writing' {
         foreach ($failure in @('head', 'head-drift', 'project', 'repository',
-                'principal', 'commit', 'blob', 'source-path',
+                'principal', 'graph-upn', 'storage-key', 'commit', 'blob', 'source-path',
                 'partial', 'principal-final', 'named')) {
             $c = Get-BootstrapCase
             switch ($failure) {
@@ -1058,6 +1268,16 @@ Describe 'Read-only private canary input bootstrap' {
         $c.root = Join-Path $repo 'private-state'
         { Invoke-BootstrapCase $c } | Should -Throw '*bootstrap-input-invalid*'
         $c.state.reads.Count | Should -Be 0
+    }
+    It 'removes a newly created bootstrap root if private receipt writing fails' {
+        $c = Get-BootstrapCase
+        Mock Write-CanaryPrivateFile -ModuleName DevPilot.ActivePrCanary {
+            throw 'receipt-write-failed'
+        } -ParameterFilter { $Path -like '*approved-sources.json' }
+        { Invoke-BootstrapCase $c } | Should -Throw '*receipt-write-failed*'
+        Test-Path $c.root | Should -BeFalse
+        @($c.state.reads | Where-Object { $_ -in @('Write', 'Post') }).Count |
+            Should -Be 0
     }
     It 'refuses a local policy that differs from its repository commit instead of treating it as remote' {
         $c = Get-BootstrapCase
@@ -1128,10 +1348,10 @@ Describe 'Read-only private canary input bootstrap' {
                 ''
             }
             catch { $_.Exception.Message }
-            $message | Should -Be 'bootstrap-read-inaccessible:Identity:http-302'
+            $message | Should -Be 'bootstrap-read-inaccessible:IdentityProof:http-302'
             Test-Path $c.root | Should -BeFalse
             $state.reads.Count | Should -Be 1
-            $state.reads[0] | Should -Be 'Identity'
+            $state.reads[0] | Should -Be 'IdentityProof'
             $handler.Paths.Count | Should -Be 1
         }
         finally { $client.Dispose() }
@@ -1158,10 +1378,10 @@ Describe 'Read-only private canary input bootstrap' {
                 ''
             }
             catch { $_.Exception.Message }
-            $message | Should -Be 'bootstrap-read-inaccessible:Identity:send'
+            $message | Should -Be 'bootstrap-read-inaccessible:IdentityProof:send'
             Test-Path $c.root | Should -BeFalse
             $state.reads.Count | Should -Be 1
-            $state.reads[0] | Should -Be 'Identity'
+            $state.reads[0] | Should -Be 'IdentityProof'
             $handler.Paths.Count | Should -Be 1
         }
         finally { $client.Dispose() }
@@ -1192,10 +1412,10 @@ Describe 'Read-only private canary input bootstrap' {
                     ''
                 }
                 catch { $_.Exception.Message }
-                $message | Should -Be "bootstrap-read-inaccessible:Identity:$($case.phase)"
+                $message | Should -Be "bootstrap-read-inaccessible:IdentityProof:$($case.phase)"
                 Test-Path $c.root | Should -BeFalse
                 $state.reads.Count | Should -Be 1
-                $state.reads[0] | Should -Be 'Identity'
+                $state.reads[0] | Should -Be 'IdentityProof'
                 $handler.Paths.Count | Should -Be 1
             }
             finally { $client.Dispose() }
@@ -1212,7 +1432,7 @@ Describe 'Read-only private canary input bootstrap' {
                 @{ reason = 'invalid-json'; bytes = $utf8.GetBytes('{"authenticatedUser":'); media = 'application/json'; encoding = $null },
                 @{ reason = 'utf8-bom'; bytes = [byte[]]@(0xef, 0xbb, 0xbf) + $utf8.GetBytes('{}'); media = 'application/json'; encoding = $null },
                 @{ reason = 'json-depth-over-12'; bytes = $utf8.GetBytes($nested); media = 'application/json'; encoding = $null },
-                @{ reason = 'identity-fields-missing'; bytes = $utf8.GetBytes('{"authenticatedUser":{"id":"synthetic","subjectDescriptor":"aad.synthetic"}}'); media = 'application/json'; encoding = $null },
+                @{ reason = 'identity-fields-missing'; bytes = $utf8.GetBytes('{"authenticatedUser":{"id":"synthetic"}}'); media = 'application/json'; encoding = $null },
                 @{ reason = 'identity-fields-missing'; bytes = $utf8.GetBytes('{}'); media = 'application/json'; encoding = $null })) {
             $handler = [CanarySyntheticHandler]::new()
             $handler.Body = $case.bytes
@@ -1238,10 +1458,10 @@ Describe 'Read-only private canary input bootstrap' {
                 }
                 catch { $_.Exception.Message }
                 $handler.Paths.Count | Should -Be 1
-                $message | Should -Be "bootstrap-read-inaccessible:Identity:$($case.reason)"
+                $message | Should -Be "bootstrap-read-inaccessible:IdentityProof:$($case.reason)"
                 Test-Path $c.root | Should -BeFalse
                 $state.reads.Count | Should -Be 1
-                $state.reads[0] | Should -Be 'Identity'
+                $state.reads[0] | Should -Be 'IdentityProof'
             }
             finally { $client.Dispose() }
         }
@@ -1509,5 +1729,261 @@ Describe 'Read-only private canary input bootstrap' {
             Should -Be 'IdentityProof,GraphUser,GraphStorageKey'
         Test-Path -LiteralPath $c.root | Should -BeFalse
         (ConvertTo-Json -InputObject $result) | Should -Not -Match 'private-sentinel'
+    }
+    It 'uses one attested bearer on identity, Graph, inventory and discussions' {
+        $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `
+            -Raw | ConvertFrom-Json -AsHashtable
+        $config.schemaVersion = 2
+        $config.principalProof = 'aad-graph-storage-key-v1'
+        $config.expectedAccount.descriptor = 'aad.synthetic'
+        $config.expectedAccount.principalName = 'service@example.invalid'
+        $config.enabled = $true
+        $handler = [CanaryBoundGetHandler]::new()
+        $client = [Net.Http.HttpClient]::new($handler)
+        try {
+            $token = 'b' * 100
+            $provider = New-ActivePrAzureDevOpsProvider -Config $config `
+                -BearerToken $token -BoundClient $client -VerifyReadPrincipal
+            $identity = & $provider Identity @{ timeoutMilliseconds = 5000 }
+            $identity.readCount | Should -Be 2
+            $identity.principalName | Should -Be 'service@example.invalid'
+            $metadata = & $provider Metadata @{
+                repositoryName = 'ExampleRepo'; timeoutMilliseconds = 5000 }
+            $metadata.repositoryId | Should -Be $config.repositoryId
+            $page = & $provider ListPage @{ skip = 0; top = 50
+                timeoutMilliseconds = 5000 }
+            $page.count | Should -Be 0
+            $threads = & $provider Discussions @{
+                pullRequestId = 7; timeoutMilliseconds = 5000 }
+            $threads.count | Should -Be 0
+            $head = & $provider Head @{ pullRequestId = 7
+                remainingReads = 10; timeoutMilliseconds = 5000 }
+            $head.sourceCommit | Should -Be ('a' * 40)
+            $head.readCount | Should -Be 4
+            $changes = & $provider Changes @{ pullRequestId = 7
+                iterationId = 1; remainingReads = 10
+                timeoutMilliseconds = 5000 }
+            $changes.changedFiles | Should -Be 0
+            $finalHead = & $provider Head @{ pullRequestId = 7
+                remainingReads = 10; timeoutMilliseconds = 5000 }
+            $finalHead.sourceCommit | Should -Be $head.sourceCommit
+            $intakeModule = Get-Module DevPilot.ActivePrIntake
+            foreach ($route in @(
+                    @{ resource = 'items'; suffix = '/items?'
+                        query = @('path=/Tests/Example.cs',
+                            "versionDescriptor.version=$('a' * 40)",
+                            'versionDescriptor.versionType=commit'); raw = $true },
+                    @{ resource = 'commits'; suffix = "/commits/$('a' * 40)?"
+                        pathId = 'commitId'; raw = $false },
+                    @{ resource = 'trees'; suffix = "/trees/$('a' * 40)?"
+                        pathId = 'sha1'; raw = $false }
+                )) {
+                $routeParts = @("project=$($config.projectName)",
+                    "repositoryId=$($config.repositoryId)")
+                if ($route.pathId) {
+                    $routeParts += "$($route.pathId)=$('a' * 40)"
+                }
+                $url = & $intakeModule {
+                    param($Org, $Project, $Resource, $Parts, $Query)
+                    Get-IntakeBearerRoute $Org $Project 'git' $Resource `
+                        $Parts $Query
+                } 'example-org' $config.projectName $route.resource `
+                    $routeParts $route.query
+                $response = & $intakeModule {
+                    param($Client, $Bearer, $Url, $Raw)
+                    Invoke-IntakeBearerGet $Client $Bearer $Url `
+                        ([DateTime]::UtcNow.AddSeconds(5)) 65536 -Raw:$Raw
+                } $client $token $url $route.raw
+                if ($route.raw) {
+                    [Text.Encoding]::UTF8.GetString($response.bytes) |
+                        Should -Be 'synthetic bytes'
+                } else {
+                    $response.Count | Should -Be 1
+                }
+                $url | Should -Match ([regex]::Escape($route.suffix))
+            }
+            $handler.Paths.Count | Should -Be 19
+            @($handler.Tokens | Where-Object { $_ -cne $token }).Count |
+                Should -Be 0
+            $handler.Paths[0] | Should -Match '/_apis/connectionData\?'
+            $handler.Paths[1] | Should -Match '/_apis/graph/users/'
+            $handler.Paths[2] | Should -Match '/_apis/graph/storagekeys/'
+            $handler.Paths[3] | Should -Match '/_apis/projects/ExampleProject\?'
+            $handler.Paths[4] | Should -Match '/_apis/git/repositories/1111'
+            $handler.Paths[5] | Should -Match '/_apis/git/repositories/.*/pullRequests\?'
+            $handler.Paths[6] | Should -Match '/pullRequests/7/threads\?'
+            $handler.Paths[11] | Should -Match '/pullRequests/7/iterations/1/changes\?'
+            $handler.Paths[12] | Should -Match '/pullRequests/7\?'
+            $handler.Paths[13] | Should -Match '/pullRequests/7/iterations\?'
+            $handler.Paths[16] | Should -Match '/items\?'
+            $handler.Paths[17] | Should -Match '/commits/'
+            $handler.Paths[18] | Should -Match '/trees/'
+        }
+        finally { $client.Dispose() }
+    }
+    It 'proves a selected PR project graph through one bearer and rejects broken HTTP evidence' {
+        $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `
+            -Raw | ConvertFrom-Json -AsHashtable
+        $config.schemaVersion = 2
+        $config.principalProof = 'aad-graph-storage-key-v1'
+        $config.expectedAccount.descriptor = 'aad.synthetic'
+        $config.expectedAccount.principalName = 'service@example.invalid'
+        $config.expectedAccount.Remove('uniqueName')
+        $config.enabled = $true
+        $config.projectEvidence.enabled = $true
+        $source = "using Microsoft.VisualStudio.TestTools.UnitTesting;`n" +
+            "[TestClass]`nclass Example {}`n"
+        $project = '<Project><PropertyGroup><IsTestProject>true</IsTestProject>' +
+            '</PropertyGroup><ItemGroup><Compile Include="Example.cs"/>' +
+            '</ItemGroup></Project>'
+        $sourceId = Get-BoundGitObjectId 'blob' (
+            [Text.Encoding]::UTF8.GetBytes($source))
+        $projectId = Get-BoundGitObjectId 'blob' (
+            [Text.Encoding]::UTF8.GetBytes($project))
+        $testsTreeId = Get-BoundTreeId @(
+            @{ mode = '100644'; name = 'Example.cs'; objectId = $sourceId },
+            @{ mode = '100644'; name = 'Tests.csproj'; objectId = $projectId })
+        $rootTreeId = Get-BoundTreeId @(
+            @{ mode = '40000'; name = 'Tests'; objectId = $testsTreeId })
+        $missingProjectTreeId = Get-BoundTreeId @(
+            @{ mode = '100644'; name = 'Example.cs'; objectId = $sourceId })
+        $missingProjectRootId = Get-BoundTreeId @(
+            @{ mode = '40000'; name = 'Tests'; objectId = $missingProjectTreeId })
+        foreach ($mode in @('complete', 'corrupt-tree', 'missing-project',
+                'incomplete-changes', 'throttle-tree')) {
+            $handler = [CanaryBoundGetHandler]::new()
+            $handler.GraphEnabled = $true
+            $handler.OmitUniqueName = $true
+            $handler.SourceFile = $source
+            $handler.ProjectFile = $project
+            $handler.SourceObjectId = $sourceId
+            $handler.ProjectObjectId = $projectId
+            $handler.MissingProject = $mode -eq 'missing-project'
+            $handler.RootTreeId = if ($handler.MissingProject) {
+                $missingProjectRootId
+            } else { $rootTreeId }
+            $handler.TestsTreeId = if ($handler.MissingProject) {
+                $missingProjectTreeId
+            } else { $testsTreeId }
+            $handler.CorruptTree = $mode -eq 'corrupt-tree'
+            $handler.IncompleteChanges = $mode -eq 'incomplete-changes'
+            $handler.ThrottleTree = $mode -eq 'throttle-tree'
+            $client = [Net.Http.HttpClient]::new($handler)
+            $token = 'b' * 100
+            try {
+                $provider = New-ActivePrAzureDevOpsProvider -Config $config `
+                    -BearerToken $token -BoundClient $client -VerifyReadPrincipal
+                $identity = & $provider Identity @{ timeoutMilliseconds = 5000 }
+                $identity.Contains('uniqueName') | Should -BeFalse
+                $head = & $provider Head @{ pullRequestId = 7
+                    remainingReads = 30; timeoutMilliseconds = 5000 }
+                $head.status | Should -Be 'active'
+                $head.isDraft | Should -BeFalse
+                $head.targetRef | Should -Be 'refs/heads/master'
+                $changeRequest = @{ pullRequestId = 7; iterationId = $head.iterationId
+                    sourceCommit = $head.sourceCommit
+                    targetCommit = $head.targetCommit
+                    commonCommit = $head.commonCommit
+                    includeEvaluationFiles = $true
+                    includeProjectEvidence = $true
+                    remainingReads = 30; timeoutMilliseconds = 5000 }
+                if ($mode -in @('incomplete-changes', 'throttle-tree')) {
+                    { & $provider Changes $changeRequest } | Should -Throw $(if (
+                            $mode -eq 'incomplete-changes') {
+                            '*change-list-truncated*'
+                        } else { '*read-throttled*' })
+                } else {
+                    $changes = & $provider Changes $changeRequest
+                    $changes.changedFiles | Should -Be 1
+                    $changes.evaluationFiles[0].objectId | Should -Be $sourceId
+                    if ($mode -eq 'complete') {
+                        $changes.projectEvidence.complete | Should -BeTrue
+                        $changes.projectEvidence.rootTreeId |
+                            Should -Be $rootTreeId
+                        $changes.projectEvidence.files[0].status |
+                            Should -Be 'complete'
+                        $graph = $changes.evaluationFiles[0].projectEvidence
+                        $graph.sourceCommit | Should -Be $head.sourceCommit
+                        $graph.objectId | Should -Be $sourceId
+                        $graph.projects[0].path |
+                            Should -Be '/Tests/Tests.csproj'
+                        $graph.projects[0].isTestProject | Should -BeTrue
+                    } else {
+                        $changes.projectEvidence.complete | Should -BeFalse
+                        $changes.projectEvidence.files[0].status |
+                            Should -Be 'unknown'
+                        $changes.evaluationFiles[0].Contains(
+                            'projectEvidence') | Should -BeFalse
+                        if ($mode -eq 'missing-project') {
+                            $changes.projectEvidence.rootTreeId |
+                                Should -Be $missingProjectRootId
+                        }
+                    }
+                    $finalHead = & $provider Head @{ pullRequestId = 7
+                        remainingReads = 30; timeoutMilliseconds = 5000 }
+                    $finalHead.sourceCommit | Should -Be $head.sourceCommit
+                }
+                @($handler.Tokens | Where-Object { $_ -cne $token }).Count |
+                    Should -Be 0
+                @($handler.Paths | Where-Object {
+                        $_ -notlike 'https://dev.azure.com/example-org/*' -and
+                        $_ -notlike 'https://vssps.dev.azure.com/example-org/*'
+                    }).Count | Should -Be 0
+                if ($mode -eq 'complete') {
+                    @($handler.Paths | Where-Object {
+                            $_ -match '/trees/'
+                        }).Count | Should -Be 2
+                    @($handler.Paths | Where-Object {
+                            $_ -match '/items\?'
+                        }).Count | Should -Be 2
+                }
+            }
+            finally { $client.Dispose() }
+        }
+    }
+    It 'rejects missing-alias drift and storage mismatch before inventory, and stops on throttle' {
+        $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `
+            -Raw | ConvertFrom-Json -AsHashtable
+        $config.schemaVersion = 2
+        $config.principalProof = 'aad-graph-storage-key-v1'
+        $config.expectedAccount.descriptor = 'aad.synthetic'
+        $config.expectedAccount.principalName = 'service@example.invalid'
+        $config.enabled = $true
+        foreach ($mode in @('missing-alias', 'storage-drift', 'throttle',
+                'ref-drift', 'oversize')) {
+            $handler = [CanaryBoundGetHandler]::new()
+            $handler.OmitUniqueName = $mode -eq 'missing-alias'
+            $handler.DriftStorageKey = $mode -eq 'storage-drift'
+            $handler.ThrottleInventory = $mode -eq 'throttle'
+            $handler.DriftRef = $mode -eq 'ref-drift'
+            $handler.TooLarge = $mode -eq 'oversize'
+            $client = [Net.Http.HttpClient]::new($handler)
+            try {
+                $provider = New-ActivePrAzureDevOpsProvider -Config $config `
+                    -BearerToken ('b' * 100) -BoundClient $client -VerifyReadPrincipal
+                if ($mode -eq 'throttle') {
+                    [void](& $provider Identity @{ timeoutMilliseconds = 5000 })
+                    { & $provider ListPage @{ skip = 0; top = 50
+                            timeoutMilliseconds = 5000 } } |
+                        Should -Throw '*read-throttled*'
+                    $handler.Paths.Count | Should -Be 4
+                } elseif ($mode -eq 'ref-drift') {
+                    [void](& $provider Identity @{ timeoutMilliseconds = 5000 })
+                    { & $provider Head @{ pullRequestId = 7
+                            remainingReads = 10; timeoutMilliseconds = 5000 } } |
+                        Should -Throw '*head-inconsistent*'
+                    $handler.Paths.Count | Should -Be 6
+                } elseif ($mode -eq 'oversize') {
+                    { & $provider Identity @{ timeoutMilliseconds = 5000 } } |
+                        Should -Throw '*byte-budget*'
+                    $handler.Paths.Count | Should -Be 1
+                } else {
+                    { & $provider Identity @{ timeoutMilliseconds = 5000 } } |
+                        Should -Throw '*account-mismatch*'
+                    $handler.Paths.Count | Should -BeLessOrEqual 3
+                }
+            }
+            finally { $client.Dispose() }
+        }
     }
 }
