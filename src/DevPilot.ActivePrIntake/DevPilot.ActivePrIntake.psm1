@@ -1700,7 +1700,8 @@ function New-ActivePrAzureDevOpsProvider {
         }
         finally { $process.Dispose() }
         if ([string]::IsNullOrWhiteSpace($text)) { throw 'read-inaccessible' }
-        return ($text | ConvertFrom-Json -AsHashtable -Depth 32)
+        try { return ($text | ConvertFrom-Json -AsHashtable -Depth 32) }
+        catch { throw 'read-inaccessible' }
     }.GetNewClosure()
     $rawCredential = [pscustomobject]@{ Token = $null }
     $rawIdentityVerified = $false
@@ -1791,8 +1792,11 @@ function New-ActivePrAzureDevOpsProvider {
                     }
                     finally { $output.Dispose() }
                     if ($Operation -ceq 'Item') { return @{ bytes = $bytes } }
-                    $identity = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) |
-                        ConvertFrom-Json -AsHashtable -Depth 8
+                    try {
+                        $identity = [Text.UTF8Encoding]::new($false, $true).GetString(
+                            $bytes) | ConvertFrom-Json -AsHashtable -Depth 8
+                    }
+                    catch { throw 'read-inaccessible' }
                     if ($Operation -cne 'Identity') { return $identity }
                     return @{ id = $identity.authenticatedUser.id
                         descriptor = $identity.authenticatedUser.subjectDescriptor

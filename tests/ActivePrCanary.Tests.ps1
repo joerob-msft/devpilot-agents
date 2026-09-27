@@ -199,6 +199,10 @@ Outside both sections.
         @'
 $argv = $args
 [IO.File]::AppendAllText($env:CANARY_GET_LOG, ($argv -join '|') + "`n")
+if ($env:CANARY_INVALID_RESPONSE) {
+    'sensitive-text https://example.invalid/private'
+    exit 0
+}
 $resource = if ($argv[0] -eq 'rest') { 'connectionData' } else {
     $argv[[array]::IndexOf($argv, '--resource') + 1]
 }
@@ -306,6 +310,21 @@ Describe 'Explicit signed read-only canary qualification' {
         }
         finally {
             Remove-Item Env:\CANARY_GET_LOG, Env:\CANARY_PAT_MISMATCH
+        }
+    }
+    It 'does not expose an invalid CLI response in the read error' {
+        $t = New-CanaryTransportCase
+        $env:CANARY_GET_LOG = $t.log
+        $env:CANARY_INVALID_RESPONSE = '1'
+        try {
+            $provider = New-ActivePrAzureDevOpsProvider -Config $t.config `
+                -AzureCliPath $t.stub -Bootstrap -VerifyReadPrincipal
+            { & $provider Identity @{} } | Should -Throw -ExpectedMessage 'read-inaccessible'
+            { & $provider Metadata @{ repositoryName = 'ExampleRepo' } } |
+                Should -Throw '*account-mismatch*'
+        }
+        finally {
+            Remove-Item Env:\CANARY_GET_LOG, Env:\CANARY_INVALID_RESPONSE
         }
     }
     It 'binds raw AAD identity and reads exact pinned Git blob bytes, not rendered text' {
