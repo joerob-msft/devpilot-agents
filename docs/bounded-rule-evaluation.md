@@ -129,6 +129,17 @@ verify the pinned EngHub section and configure the live model; this command
 does not supply credentials, signed live configuration, or an active intake
 generation.
 
+`tools/Invoke-PrivateCanaryIdentityDiagnostic.ps1` is a separate default-off,
+single-request diagnostic for an explicitly authorized Identity check. Pass
+the organization slug and expected reviewer UPN with `-Run`; it obtains an
+in-memory AAD bearer, makes **one bounded GET** to `connectionData`, and
+stops on both success and failure. It returns only a fixed reason, minimal
+verified/unknown state, and GET attempt/write counts. It does not create
+private state, read projects or source documents, sign intake, evaluate rules,
+or authorize any model or writer. A verified Identity response alone is not
+source, cohort, or rule qualification; the command must not be used as a
+substitute for the signed-intake and evaluation gates.
+
 `tools/Initialize-PrivateActivePrCanaryInputs.ps1` is a **preparation-only**
 bootstrap for the private syntactic canary. It is disabled without `-Run`;
 it requires a new absolute external `-StateRoot`, the expected organization

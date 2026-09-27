@@ -489,6 +489,85 @@ function Invoke-CanaryAadGet {
     }
 }
 
+function Invoke-PrivateCanaryIdentityDiagnostic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Organization,
+        [Parameter(Mandatory)][string]$ExpectedAccountUniqueName,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [string]$AzureCliPath = 'az',
+        [scriptblock]$Read,
+        [switch]$Run
+    )
+    if ($Organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$' -or
+        $ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$' -or
+        -not [IO.Path]::IsPathFullyQualified($RepositoryRoot)) {
+        throw 'identity-diagnostic-input-invalid'
+    }
+    if (-not $Run) {
+        return [ordered]@{ state = 'disabled'; reason = 'disabled'
+            getAttempts = 0; providerWrites = 0; modelToolInvocations = 0 }
+    }
+    $client = $null
+    try {
+        if (-not $Read) {
+            $template = Get-Content -LiteralPath (Join-Path $RepositoryRoot `
+                    'samples\active-pr-intake.config.json') -Raw |
+                ConvertFrom-Json -AsHashtable
+            $token = Get-CanaryAadToken $AzureCliPath `
+                ([string]$template.identityResource)
+            $handler = [Net.Http.HttpClientHandler]::new()
+            $handler.AllowAutoRedirect = $false
+            $client = [Net.Http.HttpClient]::new($handler)
+            $client.Timeout = [TimeSpan]::FromSeconds(30)
+            $aadGet = ${function:Invoke-CanaryAadGet}
+            $readClient = $client
+            $readToken = $token
+            $readOrg = $Organization
+            $Read = {
+                param($Operation, $Request)
+                & $aadGet $readClient $readToken $readOrg `
+                    $Operation $Request ([DateTime]::UtcNow.AddSeconds(30))
+            }.GetNewClosure()
+        }
+        try {
+            $identity = & $Read Identity @{}
+        }
+        catch {
+            $message = [string]$_.Exception.Message
+            $reason = if ($message -cmatch
+                    '^bootstrap-read-inaccessible:Identity:(encoded-response|non-json-media|utf8-bom|invalid-utf8|invalid-json|json-depth-over-12|identity-fields-missing|unclassified)$') {
+                $Matches[1]
+            } elseif ($message -cmatch
+                    '^bootstrap-read-inaccessible:Identity:http-[0-9]{3}$') {
+                'http-failure'
+            } elseif ($message -ceq 'bootstrap-read-inaccessible:Identity:send') {
+                'send-failure'
+            } elseif ($message -ceq 'bootstrap-read-inaccessible:Identity:read') {
+                'read-failure'
+            } else { 'unclassified' }
+            return [ordered]@{ state = 'unknown'; reason = $reason
+                getAttempts = 1; providerWrites = 0; modelToolInvocations = 0 }
+        }
+        $reason = 'valid'
+        if ($identity -isnot [Collections.IDictionary] -or
+            [string]$identity['id'] -cnotmatch
+                '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+            [string]$identity['descriptor'] -cnotmatch '^\S{1,512}$' -or
+            [string]$identity['uniqueName'] -cnotmatch '^[^@\s]+@[^@\s]+$') {
+            $reason = 'identity-fields-invalid'
+        } elseif ([string]$identity['uniqueName'] -ine $ExpectedAccountUniqueName) {
+            $reason = 'principal-mismatch'
+        }
+        return [ordered]@{
+            state = if ($reason -ceq 'valid') { 'verified' } else { 'unknown' }
+            reason = $reason; getAttempts = 1
+            providerWrites = 0; modelToolInvocations = 0
+        }
+    }
+    finally { if ($client) { $client.Dispose() } }
+}
+
 function Assert-CanaryBootstrapHead {
     param([scriptblock]$Read, [string]$RepositoryId, [string]$ProjectId)
     $request = @{ projectName = 'Engineering'; repositoryId = $RepositoryId }
@@ -1593,4 +1672,4 @@ function Invoke-ActivePrCanaryQualification {
 Export-ModuleMember -Function Invoke-ActivePrCanaryQualification,
     Assert-CanaryCoverageSource, Invoke-PrivateCanaryBootstrap,
     New-VerifiedCanaryRuleRegistry, Invoke-PrivateCanaryRuleRegistry,
-    Invoke-PrivateCanarySignedIntake
+    Invoke-PrivateCanarySignedIntake, Invoke-PrivateCanaryIdentityDiagnostic

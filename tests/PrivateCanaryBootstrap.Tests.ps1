@@ -1243,4 +1243,96 @@ Describe 'Read-only private canary input bootstrap' {
         }
         $reason.reason | Should -Be 'unclassified'
     }
+    It 'keeps the one-GET diagnostic disabled and rejects bad selectors without a read' {
+        $state = @{ reads = 0 }
+        $read = {
+            param($operation, $request)
+            $state.reads++
+            throw 'unexpected diagnostic request'
+        }.GetNewClosure()
+        $diagnosticArgs = @{
+            Organization = 'example-org'
+            ExpectedAccountUniqueName = 'service@example.invalid'
+            RepositoryRoot = $repo
+            Read = $read
+        }
+        $result = Invoke-PrivateCanaryIdentityDiagnostic @diagnosticArgs
+        $result.state | Should -Be 'disabled'
+        $result.getAttempts | Should -Be 0
+        $invalidArgs = $diagnosticArgs.Clone()
+        $invalidArgs.Organization = 'example-org/other'
+        { Invoke-PrivateCanaryIdentityDiagnostic @invalidArgs -Run } |
+            Should -Throw
+        $state.reads | Should -Be 0
+    }
+    It 'keeps the public diagnostic script default-off without a credential or ADO GET' {
+        $json = & (Join-Path $repo 'tools\Invoke-PrivateCanaryIdentityDiagnostic.ps1') `
+            -Organization 'example-org' `
+            -ExpectedAccountUniqueName 'service@example.invalid'
+        $result = $json | ConvertFrom-Json -AsHashtable
+        $result.state | Should -Be 'disabled'
+        $result.getAttempts | Should -Be 0
+        $result.providerWrites | Should -Be 0
+    }
+    It 'uses exactly one bounded Identity GET on success and failure without state or private output' {
+        foreach ($case in @(
+                @{ reason = 'valid'; state = 'verified'; body = $null; media = $null; status = 200; failTransport = $false; expected = 'service@example.invalid' },
+                @{ reason = 'principal-mismatch'; state = 'unknown'; body = $null; media = $null; status = 200; failTransport = $false; expected = 'other@example.invalid' },
+                @{ reason = 'non-json-media'; state = 'unknown'; body = [Text.Encoding]::UTF8.GetBytes('<html>private-sentinel</html>'); media = 'text/html'; status = 200; failTransport = $false; expected = 'service@example.invalid' },
+                @{ reason = 'http-failure'; state = 'unknown'; body = $null; media = $null; status = 302; failTransport = $false; expected = 'service@example.invalid' },
+                @{ reason = 'send-failure'; state = 'unknown'; body = $null; media = $null; status = 200; failTransport = $true; expected = 'service@example.invalid' })) {
+            $handler = [CanarySyntheticHandler]::new()
+            if ($case.body) { $handler.Body = $case.body }
+            if ($case.media) { $handler.MediaType = $case.media }
+            $handler.Status = [Net.HttpStatusCode]$case.status
+            $handler.FailTransport = $case.failTransport
+            $client = [Net.Http.HttpClient]::new($handler)
+            $module = Get-Module DevPilot.ActivePrCanary
+            $c = Get-BootstrapCase
+            $state = @{ reads = [Collections.Generic.List[string]]::new() }
+            $read = {
+                param($operation, $request)
+                $state.reads.Add($operation) | Out-Null
+                & $module {
+                    param($Client, $Operation, $Request)
+                    Invoke-CanaryAadGet $Client 'synthetic-bearer' 'example-org' `
+                        $Operation $Request ([DateTime]::UtcNow.AddSeconds(5))
+                } $client $operation $request
+            }.GetNewClosure()
+            try {
+                $result = Invoke-PrivateCanaryIdentityDiagnostic `
+                    -Organization 'example-org' `
+                    -ExpectedAccountUniqueName $case.expected `
+                    -RepositoryRoot $repo -Read $read -Run
+                $result.state | Should -Be $case.state
+                $result.reason | Should -Be $case.reason
+                $result.getAttempts | Should -Be 1
+                $result.providerWrites | Should -Be 0
+                $result.modelToolInvocations | Should -Be 0
+                $state.reads.Count | Should -Be 1
+                $state.reads[0] | Should -Be 'Identity'
+                $handler.Paths.Count | Should -Be 1
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+                $json = ConvertTo-Json -InputObject $result -Compress
+                $json | Should -Not -Match 'private-sentinel|example\.invalid|synthetic|http-302'
+            }
+            finally { $client.Dispose() }
+        }
+    }
+    It 'does not leak unexpected provider errors or make another GET' {
+        $state = @{ reads = 0 }
+        $read = {
+            param($operation, $request)
+            $state.reads++
+            throw 'private-sentinel'
+        }.GetNewClosure()
+        $result = Invoke-PrivateCanaryIdentityDiagnostic `
+            -Organization 'example-org' `
+            -ExpectedAccountUniqueName 'service@example.invalid' `
+            -RepositoryRoot $repo -Read $read -Run
+        $result.reason | Should -Be 'unclassified'
+        $result.getAttempts | Should -Be 1
+        $state.reads | Should -Be 1
+        (ConvertTo-Json -InputObject $result) | Should -Not -Match 'private-sentinel'
+    }
 }
