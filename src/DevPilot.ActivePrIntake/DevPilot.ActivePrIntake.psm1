@@ -912,6 +912,9 @@ function Invoke-ActivePrIntake {
                                 }
                                 $evidence = $null
                                 if ($null -ne $lines) {
+                                    if ($files -eq 0 -or $lines -eq 0) {
+                                        throw 'unsupported-change'
+                                    }
                                     if ($null -eq $changes['files']) {
                                         throw 'line-count-unavailable'
                                     }
@@ -1483,11 +1486,11 @@ function New-ActivePrAzureDevOpsProvider {
                     if ($r['changeEntries'] -isnot [array]) {
                         throw 'change-list-truncated'
                     }
-                    $entries = @($r.changeEntries)
-                    if ($entries.Count -gt $pageSize) { throw 'change-list-truncated' }
+                    $pageEntries = @($r.changeEntries)
+                    if ($pageEntries.Count -gt $pageSize) { throw 'change-list-truncated' }
                     if ($null -ne $r['count'] -and
                         (& $parseNumber $r['count'] changeCount 0 $pageSize) -ne
-                        $entries.Count) { throw 'change-list-truncated' }
+                        $pageEntries.Count) { throw 'change-list-truncated' }
                     if ($null -ne $r['totalCount']) {
                         $total = & $parseNumber $r['totalCount'] totalChanges 0 100000
                         if ($null -ne $declaredTotal -and $total -ne $declaredTotal) {
@@ -1496,7 +1499,7 @@ function New-ActivePrAzureDevOpsProvider {
                         if ($total -gt $maxFiles) { throw 'file-budget' }
                         $declaredTotal = $total
                     }
-                    if ($entries.Count -eq 0) {
+                    if ($pageEntries.Count -eq 0) {
                         if (($null -ne $declaredTotal -and
                                 $seenChanges.Count -ne $declaredTotal) -or
                             ($null -ne $r['nextSkip'] -and
@@ -1507,7 +1510,7 @@ function New-ActivePrAzureDevOpsProvider {
                         $complete = $true
                         break
                     }
-                    foreach ($entry in $entries) {
+                    foreach ($entry in $pageEntries) {
                         if ($entry -isnot [Collections.IDictionary] -or
                             $null -eq $entry['changeTrackingId']) {
                             throw 'change-list-truncated'
@@ -1520,7 +1523,7 @@ function New-ActivePrAzureDevOpsProvider {
                         $entries.Add($entry)
                     }
                     if ($seenChanges.Count -gt $maxFiles) { throw 'file-budget' }
-                    $next = $skip + $entries.Count
+                    $next = $skip + $pageEntries.Count
                     if ($null -ne $r['nextSkip']) {
                         $nextSkip = & $parseNumber $r['nextSkip'] nextSkip 0 100000
                         if ($nextSkip -ne 0 -and $nextSkip -ne $next) {
@@ -1543,6 +1546,7 @@ function New-ActivePrAzureDevOpsProvider {
                         throw 'invalid-change'
                     }
                 }
+                if ($entries.Count -eq 0) { throw 'unsupported-change' }
                 $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
                 $results = [Collections.Generic.List[object]]::new()
                 $totalBytes = 0

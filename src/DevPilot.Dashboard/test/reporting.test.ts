@@ -654,6 +654,20 @@ test("intake line evidence fails closed on mismatched binding, totals and out-of
   head.lineEvidenceDigest = createHash("sha256").update(JSON.stringify(head.lineEvidence)).digest("hex");
   assert.throws(() => parseIntakeCohort(feed), /totals/);
   asObject(head.lineEvidence).changedLines = 2;
+  asObject(head.lineEvidence).changedFiles = 0;
+  asObject(head.lineEvidence).changedLines = 0;
+  asObject(head.lineEvidence).addedLines = 0;
+  asObject(head.lineEvidence).deletedLines = 0;
+  asObject(head.lineEvidence).files = [];
+  head.lineEvidenceDigest = createHash("sha256").update(JSON.stringify(head.lineEvidence)).digest("hex");
+  assert.throws(() => parseIntakeCohort(feed), /totals/);
+  asObject(head.lineEvidence).changedFiles = 1;
+  asObject(head.lineEvidence).changedLines = 2;
+  asObject(head.lineEvidence).addedLines = 1;
+  asObject(head.lineEvidence).deletedLines = 1;
+  asObject(head.lineEvidence).files = [{ pathDigest: "a".repeat(64),
+    originalPathDigest: null, changeType: "edit", addedLines: 1,
+    deletedLines: 1, newLineCount: 2, spans: [{ startLine: 2, endLine: 2 }] }];
   const span = ((asObject(head.lineEvidence).files as JsonRecord[])[0]!.spans as JsonRecord[])[0]!;
   span.endLine = 3;
   head.lineEvidenceDigest = createHash("sha256").update(JSON.stringify(head.lineEvidence)).digest("hex");

@@ -156,7 +156,11 @@ switch ($resource) {
             repository = @{ id = '11111111-1111-1111-1111-111111111111'
                 project = @{ id = '22222222-2222-2222-2222-222222222222' } } }
         $answer = if ($route.Count) { $pr } else {
-            @{ value = @($pr); count = 1 }
+            $pageSkip = @($argv | Where-Object { $_ -like '$skip=*' })
+            if ($pageSkip.Count -ne 1) { throw 'missing PR page offset' }
+            $rows = @()
+            if ($pageSkip[0] -eq '$skip=0') { $rows = @($pr) }
+            @{ value = $rows; count = $rows.Count }
         }
     }
     pullRequestIterations {
@@ -363,6 +367,11 @@ Describe 'Active PR read-only intake' {
         $c.state.omitEvidence = $true
         $e = Invoke-IntakeCase $c
         $e.heads[0].reasonCode | Should -Be 'line-count-unavailable'
+        $e.heads[0].lineEvidence | Should -BeNullOrEmpty
+        $c = New-IntakeCase -Count 1
+        $c.state.changeLines = 0
+        $e = Invoke-IntakeCase $c
+        $e.heads[0].reasonCode | Should -Be 'unsupported-change'
         $e.heads[0].lineEvidence | Should -BeNullOrEmpty
         $c = New-IntakeCase -Count 3
         $c.state.failHead = 2
@@ -706,22 +715,20 @@ if ($CliArguments -contains 'connectionData') {
             $requests[1] | Should -Match 'project=ExampleProject'
             $requests[1] | Should -Match 'repositoryId=11111111-1111-1111-1111-111111111111'
             $requests[1] | Should -Match 'searchCriteria.repositoryId=11111111-1111-1111-1111-111111111111'
-            $probe = & $transport 'Changes' @{
-                pullRequestId = 1; iterationId = 1; sourceCommit = 'a' * 40
-                targetCommit = 'b' * 40; commonCommit = 'd' * 40
-                remainingReads = 20; timeoutMilliseconds = 30000
-            }
-            $probe.changedLines | Should -Be 0
+            { & $transport 'Changes' @{
+                    pullRequestId = 1; iterationId = 1; sourceCommit = 'a' * 40
+                    targetCommit = 'b' * 40; commonCommit = 'd' * 40
+                    remainingReads = 20; timeoutMilliseconds = 30000
+                } } | Should -Throw 'unsupported-change'
             $c.config.enabled = $true
             $liveShape = Invoke-ActivePrIntake -Config $c.config -Provider $transport `
                 -StateRoot $c.root -RepositoryRoot $repo -Run
             $liveShape.inventory.discovered | Should -Be 1
-            $liveShape.heads[0].reasonCode | Should -Be 'rules-incomplete'
-            $liveShape.heads[0].status | Should -Be 'pending'
+            $liveShape.heads[0].reasonCode | Should -Be 'unsupported-change'
+            $liveShape.heads[0].state | Should -Be 'unknown'
             $liveShape.rules[0].evaluated | Should -Be 0
-            $liveShape.rules[0].pending | Should -Be 1
-            $liveShape.heads[0].lineEvidence.changedLines | Should -Be 0
-            $liveShape.heads[0].lineEvidenceDigest | Should -Match '^[a-f0-9]{64}$'
+            $liveShape.rules[0].error | Should -Be 1
+            $liveShape.heads[0].lineEvidence | Should -BeNullOrEmpty
             foreach ($request in (Get-Content -LiteralPath $log)) {
                 $request | Should -Match '(^rest\|--method\|get\|)|(\|--http-method\|GET\|)'
             }
@@ -781,6 +788,7 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
             '4' = @{ changeEntries = @(); nextSkip = 0 }
         }
         $e = Invoke-TransportCase $t
+        $e.heads.Count | Should -BeGreaterThan 0 -Because (@($e.reasonCodes) -join ',')
         $e.heads[0].state | Should -Be 'pending'
         $proof = $e.heads[0].lineEvidence
         $proof.changedFiles | Should -Be 4
@@ -803,6 +811,8 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
         }
     }
     It 'rejects malformed paging, byte limits and drifting heads without claiming evidence' {
+        $t = New-IntakeTransportCase
+        (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'unsupported-change'
         $t = New-IntakeTransportCase
         $t.fixture.pages['0'] = @{ changeEntries = @(); nextSkip = 1 }
         (Invoke-TransportCase $t).heads[0].reasonCode | Should -Be 'change-list-truncated'

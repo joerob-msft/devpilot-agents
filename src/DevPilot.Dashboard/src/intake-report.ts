@@ -183,7 +183,8 @@ export function parseIntakeCohort(value: unknown): IntakeSummary {
           declaration.pullRequestId !== pullRequestId ||
           declaration.projectId !== projectId ||
           declaration.repositoryId !== repositoryId ||
-          !Array.isArray(files) || changedFiles > 2_000 || files.length !== changedFiles ||
+          !Array.isArray(files) || changedFiles < 1 || changedFiles > 2_000 ||
+          files.length !== changedFiles || changedLines < 1 ||
           changedLines > 100_000 || changedLines !== addedLines + deletedLines) {
         throw new Error("intake line evidence binding or totals are invalid");
       }
