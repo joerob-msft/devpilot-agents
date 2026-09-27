@@ -182,14 +182,51 @@ receipts and source drift fail closed. Do not persist or treat this output
 as proof of changed-line evaluation, ownership, thread reconciliation, or
 Owner no-tools execution.
 
-The follow-on runner must still adapt these verified candidate bindings to
-an independently signed `@2` dispatcher configuration, perform complete
-two-pass active-PR intake before selecting at most two explicit master-target
-heads, verify full source-head project ownership and changed lines, recheck
-current heads and discussions, reconcile human versus marked automation,
-and retain Owner as unknown unless separately executed with a completed
-no-tools/no-write proof. This registry step cannot credit any rule as
-evaluated or enable posting.
+`tools/Invoke-PrivateCanarySignedIntake.ps1` is the **next default-off,
+preparation-only** layer. It accepts only the ACL-private external PR189
+`provider-config.json` and version 2 `approved-sources.json`, a new disjoint
+absolute external `-StateRoot`, and one or two explicit `-CanaryPullRequestIds`.
+`-Run` revalidates the PR190 registry and EngHub reviewed PR head/raw blob
+before and after intake; changes to the receipts or provider identity abort
+signing. The intake provider verifies the CLI/AAD principal and project/repo
+binding, permits only GETs, and requests raw blob/project-tree evidence for
+selected changed C# files. Its opt-in created-time keyset listing fixes a
+single UTC upper bound across two full active-PR passes, asks for one
+lookahead entry per page, and rejects order drift, ambiguous timestamp ties
+at page boundaries, truncated pages, missing selections, and mismatched
+passes. ADO has no atomic inventory snapshot: active/draft changes during
+listing can still make the attempt unknown; no evidence is credited from
+such an attempt. All active PRs, including drafts, count in the inventory;
+only the explicit non-draft master-target selections receive changed-line
+and complete project-scope receipts. Nonselected and out-of-policy heads
+remain pending/skipped, never evaluated.
+
+Only after complete intake and a second source/head check does the command
+copy the verified provider JSON and four-source manifest into the fresh
+ACL-private root, mint a random HMAC key, and sign `canary-dispatcher.json`
+over the repository canonical JSON representation. It also writes the exact
+intake config and immutable intake generation. The signed handoff binds
+each selected source/target/iteration, changed-line/project-scope digests,
+and four **distinct, disabled** source declarations. The class/redundant
+bindings remain **unmerged candidate-only**. This config has
+`enabled: false`, `writerEligible: false`, and `modelEnabled: false`; it is
+**not** accepted by the older `@1` dispatcher and must not be enabled or
+hand-signed to bypass the absent `@2` runner. Its output is
+`signed-intake-not-evaluated`, with zero evaluated/humanCovered/wouldCreate
+and Owner unknown. The key and private source stay outside the repository
+and normal output. Do not run this against the private service until this
+PR and PR189/190 have green checks at their exact heads and the source PR
+head and blob are reconfirmed.
+
+A further dependent runner must verify this signed handoff and immutable
+generation, bind the `@2` rules only to complete current-head changed lines,
+the distinct verified candidate declarations and full project-ownership
+graph, independently bind the named syntactic rule, and leave Owner unknown
+without a separate no-tools/no-write model proof. It must reread current
+heads and complete discussion pages, reconcile exact finding markers versus
+unmarked human comments, and report fresh evaluated/unknown/humanCovered/
+wouldCreate per rule. Neither this signing layer nor the disabled registry
+can claim rule evaluation or authorize posting.
 
 For the existing **private syntactic `@1` canary only**, use
 `tools/Invoke-ActivePrCanaryQualification.ps1` instead of hand-signing a

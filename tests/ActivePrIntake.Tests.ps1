@@ -19,7 +19,8 @@ BeforeAll {
         $rows = @(
             for ($i = 1; $i -le $Count; $i++) {
                 @{ pullRequestId = $i; status = 'active'; isDraft = $false
-                    targetRef = 'refs/heads/master' }
+                    targetRef = 'refs/heads/master'
+                    creationDate = [DateTime]::UtcNow.AddMinutes(-$i).ToString('o') }
             }
         )
         $state = @{ rows = $rows; calls = [Collections.Generic.List[string]]::new()
@@ -44,7 +45,14 @@ BeforeAll {
                     $top = if ($state.listCap -gt 0) {
                         [Math]::Min($request.top, $state.listCap)
                     } else { $request.top }
-                    $items = @($state.rows | Select-Object -Skip $request.skip -First $top)
+                    if ($null -ne $config['pagination']) {
+                        $items = @($state.rows | Where-Object {
+                                [DateTimeOffset]::Parse($_.creationDate) -lt
+                                    [DateTimeOffset]::Parse($request.maxTime)
+                            } | Select-Object -First $top)
+                    } else {
+                        $items = @($state.rows | Select-Object -Skip $request.skip -First $top)
+                    }
                     if ($state.reorder -and $request.pass -eq 2) {
                         $items = @($state.rows[($state.rows.Count - 1)..0] |
                             Select-Object -Skip $request.skip -First $top)
@@ -389,6 +397,41 @@ Describe 'Active PR read-only intake' {
         $e.populationKnown | Should -BeTrue
         $e.counts.discovered | Should -Be 7
         $e.pages.first | Should -Be 5
+    }
+    It 'reconciles 100+ keyset pages without relying on an ADO total count' {
+        $c = New-IntakeCase -Count 347 -PageSize 3 -MaxHeads 2
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        $c.state.noTotal = $true
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeTrue -Because (
+            'the keyset traversal must complete: ' + ($e.reasonCodes -join ', '))
+        $e.inventory.active | Should -Be 347
+        $e.inventory.nonDraft | Should -Be 347
+        $e.pages.first | Should -Be 117
+        $e.pages.second | Should -Be 117
+        $e.inventory.cutoffUtc | Should -Match 'Z$'
+        $e.counts.deferred | Should -Be 345
+        $e.rules[0].evaluated | Should -Be 0
+    }
+    It 'fails closed on a keyset boundary tie, duplicate, or split short page' {
+        $c = New-IntakeCase -Count 7
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        $c.state.rows[3].creationDate = $c.state.rows[2].creationDate
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeFalse
+        $e.reasonCodes | Should -Contain 'page-cursor-collision'
+        $c = New-IntakeCase -Count 7
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        $c.state.rows[4].pullRequestId = 3
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeFalse
+        $e.reasonCodes | Should -Contain 'mutable-page'
+        $c = New-IntakeCase -Count 7
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        $c.state.listCap = 2
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeFalse
+        $e.reasonCodes | Should -Contain 'missing-page'
     }
     It 'fails closed for duplicate shifting, inaccessible pages and page or PR caps' {
         $c = New-IntakeCase -Count 7
@@ -860,6 +903,43 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
                 Should -Throw 'byte-budget'
         }
         finally { Remove-Item Env:\ACTIVE_PR_INTAKE_TEST_LOG -ErrorAction SilentlyContinue }
+    }
+    It 'sends bounded created-time keyset queries using GET and a fixed cutoff' {
+        $c = New-IntakeCase -Count 1
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+        $stub = Join-Path $c.root 'az-keyset-stub.ps1'
+        $log = Join-Path $c.root 'az-keyset-requests.log'
+        $env:ACTIVE_PR_INTAKE_TEST_LOG = $log
+        try {
+            @'
+[IO.File]::AppendAllText($env:ACTIVE_PR_INTAKE_TEST_LOG, ($args -join '|') + "`n")
+'{"value":[{"pullRequestId":1,"status":"active","isDraft":false,"creationDate":"2024-01-01T12:00:00.1234567Z","targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}],"count":1}'
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+            $transport = New-ActivePrAzureDevOpsProvider -Config $c.config `
+                -AzureCliPath $stub
+            $page = & $transport 'ListPage' @{
+                pass = 1; skip = 0; top = 51
+                maxTime = '2026-09-27T07:00:00.0000000Z'
+                timeoutMilliseconds = 30000
+            }
+            $page.count | Should -Be 1
+            $page.items[0].creationDate | Should -Be '2024-01-01T12:00:00.1234567Z'
+            $request = Get-Content -LiteralPath $log -Raw
+            $request | Should -Match '\|--http-method\|GET\|'
+            $request | Should -Match 'searchCriteria.status=active'
+            $request | Should -Match 'searchCriteria.queryTimeRangeType=created'
+            $request | Should -Match 'searchCriteria.maxTime=2026-09-27T07:00:00.0000000Z'
+            $request | Should -Match '\$skip=0'
+            $request | Should -Match '\$top=51'
+            { & $transport 'ListPage' @{
+                    pass = 1; skip = 1; top = 51
+                    maxTime = '2026-09-27T07:00:00.0000000Z'
+                } } | Should -Throw 'invalid-page'
+        }
+        finally {
+            Remove-Item Env:\ACTIVE_PR_INTAKE_TEST_LOG -ErrorAction SilentlyContinue
+        }
     }
     It 'pages iteration changes and binds verified add/edit/delete/rename spans without retaining source' {
         $t = New-IntakeTransportCase
