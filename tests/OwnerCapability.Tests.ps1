@@ -797,12 +797,10 @@ Describe 'Owner v2 semantic capability' {
                 -Contract $run.Contract -Finding $secondFinding
             $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
                 -Id '11111111-2222-3333-4444-555555555555' `
-                -Descriptor 'aad.owner-reviewer' `
-                -UniqueName 'owner-reviewer@example.com'
+                -Descriptor 'aad.owner-reviewer'
             $author = [ordered]@{
                 id = $reviewer.Id
                 descriptor = $reviewer.Descriptor
-                uniqueName = $reviewer.UniqueName
             }
             $makeThread = {
                 param($Id, $Finding, $Body)
@@ -890,6 +888,175 @@ Describe 'Owner v2 semantic capability' {
             @($result.sourceArtifacts.kind) | Should -Contain 'owner-v2-discussion-mapping'
             $result.effects.providerWrites | Should -Be 0
             $result.effects.writeToolInvocations | Should -Be 0
+
+            foreach ($variant in @(
+                    @{
+                        Name = 'matching author HUMAN'
+                        Id = $reviewer.Id
+                        Descriptor = $reviewer.Descriptor
+                        Body = 'add owner claim'
+                        IdentityState = 'matched'
+                        Classification = 'humanCovered'
+                    }
+                    @{
+                        Name = 'different author HUMAN'
+                        Id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+                        Descriptor = 'aad.other-reviewer'
+                        Body = 'add owner claim'
+                        IdentityState = 'foreign'
+                        Classification = 'humanCovered'
+                    }
+                    @{
+                        Name = 'missing expected alias, mismatched comment alias HUMAN'
+                        Id = $reviewer.Id
+                        Descriptor = $reviewer.Descriptor
+                        Alias = 'other@example.com'
+                        Body = 'add owner claim'
+                        IdentityState = 'matched'
+                        Classification = 'humanCovered'
+                    }
+                    @{
+                        Name = 'different author copied marker'
+                        Id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+                        Descriptor = 'aad.other-reviewer'
+                        Body = $firstWriter.Body
+                        IdentityState = 'foreign'
+                        Classification = 'wouldCreate'
+                    }
+                    @{
+                        Name = 'conflicting ID marker'
+                        Id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+                        Descriptor = $reviewer.Descriptor
+                        Body = $firstWriter.Body
+                        IdentityState = 'ambiguous'
+                        Classification = 'unknown'
+                    }
+                    @{
+                        Name = 'same ID missing descriptor marker'
+                        Id = $reviewer.Id
+                        Body = $firstWriter.Body
+                        IdentityState = 'ambiguous'
+                        Classification = 'unknown'
+                    }
+                    @{
+                        Name = 'same ID conflicting descriptor marker'
+                        Id = $reviewer.Id
+                        Descriptor = 'aad.other-reviewer'
+                        Body = $firstWriter.Body
+                        IdentityState = 'ambiguous'
+                        Classification = 'unknown'
+                    }
+                    @{
+                        Name = 'same ID conflicting dual descriptors marker'
+                        Id = $reviewer.Id
+                        Descriptor = $reviewer.Descriptor
+                        SubjectDescriptor = 'aad.other-reviewer'
+                        Body = $firstWriter.Body
+                        IdentityState = 'ambiguous'
+                        Classification = 'unknown'
+                    }
+                    @{
+                        Name = 'different author conflicting dual descriptors marker'
+                        Id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+                        Descriptor = 'aad.other-reviewer'
+                        SubjectDescriptor = $reviewer.Descriptor
+                        Body = $firstWriter.Body
+                        IdentityState = 'ambiguous'
+                        Classification = 'unknown'
+                    }
+                    @{
+                        Name = 'subject descriptor without canonical descriptor marker'
+                        Id = $reviewer.Id
+                        SubjectDescriptor = $reviewer.Descriptor
+                        Body = $firstWriter.Body
+                        IdentityState = 'ambiguous'
+                        Classification = 'unknown'
+                    }
+                    @{
+                        Name = 'conflicting ID HUMAN'
+                        Id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+                        Descriptor = $reviewer.Descriptor
+                        Body = 'add owner claim'
+                        IdentityState = 'ambiguous'
+                        Classification = 'unknown'
+                    }
+                    @{
+                        Name = 'same ID conflicting dual descriptors HUMAN'
+                        Id = $reviewer.Id
+                        Descriptor = $reviewer.Descriptor
+                        SubjectDescriptor = 'aad.other-reviewer'
+                        Body = 'add owner claim'
+                        IdentityState = 'ambiguous'
+                        Classification = 'unknown'
+                    }
+                    @{
+                        Name = 'known ADO alias mismatch marker'
+                        Id = $reviewer.Id
+                        Descriptor = $reviewer.Descriptor
+                        Alias = 'other@example.com'
+                        Reviewer = (New-OwnerAzureDevOpsReviewerIdentity `
+                            -Id $reviewer.Id -Descriptor $reviewer.Descriptor `
+                            -UniqueName 'owner-reviewer@example.com')
+                        Body = $firstWriter.Body
+                        IdentityState = 'ambiguous'
+                        Classification = 'unknown'
+                    }
+                    @{
+                        Name = 'known ADO alias mismatch HUMAN'
+                        Id = $reviewer.Id
+                        Descriptor = $reviewer.Descriptor
+                        Alias = 'other@example.com'
+                        Reviewer = (New-OwnerAzureDevOpsReviewerIdentity `
+                            -Id $reviewer.Id -Descriptor $reviewer.Descriptor `
+                            -UniqueName 'owner-reviewer@example.com')
+                        Body = 'add owner claim'
+                        IdentityState = 'ambiguous'
+                        Classification = 'unknown'
+                    }
+                )) {
+                $variantAuthor = [ordered]@{
+                    id = $variant.Id
+                }
+                if ($variant.ContainsKey('Descriptor')) {
+                    $variantAuthor['descriptor'] = $variant.Descriptor
+                }
+                if ($variant.ContainsKey('SubjectDescriptor')) {
+                    $variantAuthor['subjectDescriptor'] = $variant.SubjectDescriptor
+                }
+                if ($variant.ContainsKey('Alias')) {
+                    $variantAuthor['uniqueName'] = $variant.Alias
+                }
+                $rawResponse.value[1].comments[0].author = $variantAuthor
+                $rawResponse.value[1].comments[0].content = $variant.Body
+                $variantReviewer = if ($variant.ContainsKey('Reviewer')) {
+                    $variant.Reviewer
+                }
+                else { $reviewer }
+                $variantPage = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                    -Arguments $arguments -RawResponse $rawResponse `
+                    -CurrentIteration @{
+                        id = 1
+                        sourceCommit = $request.SourceCommit
+                        targetCommit = $request.TargetCommit
+                    } -ReviewerIdentity $variantReviewer
+                $variantPage.threads[0].comments[0].reviewerIdentityState |
+                    Should -Be $variant.IdentityState -Because $variant.Name
+                $variantProvider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+                    -Name 'owner-rest-identity' -ReviewerIdentity $variantReviewer -Handler {
+                    param($Operation, $ProviderArguments)
+                    return $variantPage
+                }.GetNewClosure()
+                $variantSnapshot = Get-OwnerDiscussionSnapshot `
+                    -Contract $run.Contract -Provider $variantProvider `
+                    -RequireAzureDevOpsProvenance
+                $variantResult = Resolve-OwnerV2DiscussionReconciliation `
+                    -Observation $run.Observation -Contract $run.Contract `
+                    -Snapshot $variantSnapshot
+                $firstVariant = @($variantResult.findings |
+                    Where-Object identity -CEQ $firstFinding.identity)[0]
+                $firstVariant.reconciliation.classification |
+                    Should -Be $variant.Classification -Because $variant.Name
+            }
         }
 
         It 'fails duplicate reviewer markers closed and keeps acquisition failures separate from semantic verdicts' {

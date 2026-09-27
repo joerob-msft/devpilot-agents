@@ -427,6 +427,28 @@ BeforeAll {
             )
         }
     }
+
+    function Get-TestAdoNormalizedComment {
+        param(
+            [AllowNull()][object]$Author,
+            [object]$ReviewerIdentity = (New-TestAdoReviewerIdentity)
+        )
+
+        $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments (New-TestAdoDiscussionArguments) `
+            -RawResponse ([ordered]@{
+                count = 1
+                value = @(
+                    New-TestAdoThread -Id 1 -Comments @(
+                        New-TestAdoComment -Id 1 -Author $Author
+                    )
+                )
+            }) `
+            -CurrentIteration @{
+                id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+            } -ReviewerIdentity $ReviewerIdentity
+        return $page.threads[0].comments[0]
+    }
 }
 
 Describe 'Owner acquisition contracts' {
@@ -1027,7 +1049,7 @@ Describe 'Azure DevOps REST discussion normalization' {
         $page.threads[3].anchor | Should -BeNullOrEmpty
         $page.threads[3].status | Should -Be 'unknown'
         $page.mappingDigest | Should -Be (
-            'v1:sha256:6d876e001cfd64dabb2e905287041caf0ee77a7ec713f767cf76ad2ef4c94d2d'
+            'v1:sha256:982fa3fa47a5a7051029d598df2a3cbe7c6aa0b3446b49d227d2c1c47ed66678'
         )
         Get-OwnerAzureDevOpsDiscussionMappingDigest | Should -Be $page.mappingDigest
         $page.sourceDigest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
@@ -1060,38 +1082,129 @@ Describe 'Azure DevOps REST discussion normalization' {
         $objectPage.rawProvenanceDigest | Should -Be $page.rawProvenanceDigest
     }
 
-    It 'requires the complete immutable reviewer id, descriptor, and UPN' {
-        $arguments = New-TestAdoDiscussionArguments
-        $response = New-TestAdoDiscussionResponse
-        $response.value = @(
-            New-TestAdoThread -Id 1 -Comments @(
-                New-TestAdoComment -Id 1 -Author (
+    It 'matches immutable reviewer evidence without an ADO alias on either side' {
+        $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
+            -Id '11111111-2222-3333-4444-555555555555' `
+            -Descriptor 'aad.test-reviewer-descriptor'
+        $reviewer.UniqueName | Should -BeNullOrEmpty
+        (New-OwnerAzureDevOpsReviewerIdentity -Id $reviewer.Id `
+            -Descriptor $reviewer.Descriptor -UniqueName '').UniqueName |
+            Should -BeNullOrEmpty
+        $reviewer.Id | Should -Be '11111111-2222-3333-4444-555555555555'
+        $reviewer.Descriptor | Should -Be 'aad.test-reviewer-descriptor'
+
+        $author = New-TestAdoAuthor -UniqueName 'different@other.example'
+        $author.Remove('displayName')
+        $matched = Get-TestAdoNormalizedComment -Author $author -ReviewerIdentity $reviewer
+        $matched.reviewerIdentityState | Should -Be 'matched'
+        $matched.reviewerOwned | Should -BeTrue
+        $author.Remove('uniqueName')
+        (Get-TestAdoNormalizedComment -Author $author -ReviewerIdentity $reviewer).
+            reviewerIdentityState | Should -Be 'matched'
+        (Get-TestAdoNormalizedComment -Author $author).
+            reviewerIdentityState | Should -Be 'matched'
+        $author['uniqueName'] = $null
+        (Get-TestAdoNormalizedComment -Author $author -ReviewerIdentity $reviewer).
+            reviewerIdentityState | Should -Be 'matched'
+        $author['subjectDescriptor'] = $reviewer.Descriptor
+        (Get-TestAdoNormalizedComment -Author $author -ReviewerIdentity $reviewer).
+            reviewerIdentityState | Should -Be 'matched'
+    }
+
+    It 'keeps contradictory or incomplete immutable evidence ambiguous' {
+        $differentId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        $differentDescriptor = 'aad.other-reviewer-descriptor'
+        $cases = @(
+            @{ Name = 'alias mismatch'; Author = (
                     New-TestAdoAuthor -UniqueName 'reviewer@other.example'
-                )
-            )
+                ) }
+            @{ Name = 'id conflict'; Author = (
+                    New-TestAdoAuthor -Id $differentId
+                ) }
+            @{ Name = 'descriptor conflict'; Author = (
+                    New-TestAdoAuthor -Descriptor $differentDescriptor
+                ) }
+            @{ Name = 'dual descriptor conflict'; Author = (
+                    New-TestAdoAuthor
+                ); SubjectDescriptor = $differentDescriptor }
+            @{ Name = 'dual descriptor conflict on different author'; Author = (
+                    New-TestAdoAuthor -Id $differentId `
+                        -Descriptor $differentDescriptor
+                ); SubjectDescriptor = 'aad.test-reviewer-descriptor' }
+            @{ Name = 'missing id'; Author = (
+                    New-TestAdoAuthor
+                ); Remove = 'id' }
+            @{ Name = 'missing descriptor'; Author = (
+                    New-TestAdoAuthor
+                ); Remove = 'descriptor' }
+            @{ Name = 'subject descriptor without descriptor'; Author = (
+                    New-TestAdoAuthor
+                ); Remove = 'descriptor'
+                SubjectDescriptor = 'aad.test-reviewer-descriptor' }
+            @{ Name = 'invalid id'; Author = (
+                    New-TestAdoAuthor -Id 'not-a-guid'
+                ) }
+            @{ Name = 'empty GUID'; Author = (
+                    New-TestAdoAuthor -Id ([guid]::Empty.ToString('D'))
+                ) }
+            @{ Name = 'invalid descriptor'; Author = (
+                    New-TestAdoAuthor -Descriptor ' aad.test-reviewer-descriptor'
+                ) }
+            @{ Name = 'invalid subject descriptor'; Author = (
+                    New-TestAdoAuthor
+                ); SubjectDescriptor = ' aad.test-reviewer-descriptor' }
+            @{ Name = 'null subject descriptor'; Author = (
+                    New-TestAdoAuthor
+                ); SubjectDescriptor = $null }
+            @{ Name = 'invalid optional alias'; Author = (
+                    New-TestAdoAuthor -UniqueName 'not-a-upn'
+                ) }
+            @{ Name = 'blank optional alias'; Author = (
+                    New-TestAdoAuthor -UniqueName ''
+                ) }
+            @{ Name = 'invalid optional alias on different author'; Author = (
+                    New-TestAdoAuthor -Id $differentId `
+                        -Descriptor $differentDescriptor -UniqueName 'not-a-upn'
+                ) }
         )
-        $response.count = 1
-        $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
-            -Arguments $arguments -RawResponse $response `
-            -CurrentIteration @{
-                id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
-            } -ReviewerIdentity (New-TestAdoReviewerIdentity)
-
-        $page.threads[0].comments[0].reviewerOwned | Should -BeFalse
-        $page.threads[0].comments[0].reviewerIdentityState | Should -Be 'foreign'
-
-        $response.value[0].comments[0].author.Remove('id')
-        $ambiguous = ConvertTo-OwnerAzureDevOpsDiscussionPage `
-            -Arguments $arguments -RawResponse $response `
-            -CurrentIteration @{
-                id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
-            } -ReviewerIdentity (New-TestAdoReviewerIdentity)
-        $ambiguous.threads[0].comments[0].reviewerOwned | Should -BeFalse
-        $ambiguous.threads[0].comments[0].reviewerIdentityState | Should -Be 'ambiguous'
+        foreach ($case in $cases) {
+            if ($case.ContainsKey('Remove')) {
+                $case.Author.Remove($case.Remove)
+            }
+            if ($case.ContainsKey('SubjectDescriptor')) {
+                $case.Author['subjectDescriptor'] = $case.SubjectDescriptor
+            }
+            $comment = Get-TestAdoNormalizedComment -Author $case.Author
+            $comment.reviewerOwned | Should -BeFalse -Because $case.Name
+            $comment.reviewerIdentityState | Should -Be 'ambiguous' -Because $case.Name
+        }
+        {
+            New-OwnerAzureDevOpsReviewerIdentity `
+                -Id '11111111-2222-3333-4444-555555555555' `
+                -Descriptor 'aad.test-reviewer-descriptor' -UniqueName 'not-a-upn'
+        } | Should -Throw
         {
             New-OwnerAzureDevOpsReviewerIdentity `
                 -Id 'not-a-guid' -Descriptor descriptor -UniqueName reviewer
         } | Should -Throw
+    }
+
+    It 'labels only fully different valid immutable authors foreign' {
+        $author = New-TestAdoAuthor `
+            -Id 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' `
+            -Descriptor 'aad.other-reviewer-descriptor'
+        $author.Remove('uniqueName')
+        foreach ($reviewer in @(
+                (New-TestAdoReviewerIdentity),
+                (New-OwnerAzureDevOpsReviewerIdentity `
+                    -Id '11111111-2222-3333-4444-555555555555' `
+                    -Descriptor 'aad.test-reviewer-descriptor')
+            )) {
+            $comment = Get-TestAdoNormalizedComment `
+                -Author $author -ReviewerIdentity $reviewer
+            $comment.reviewerOwned | Should -BeFalse
+            $comment.reviewerIdentityState | Should -Be 'foreign'
+        }
     }
 
     It 'fails closed on absent, unknown, or unsupported REST comment types' -TestCases @(
@@ -1239,6 +1352,42 @@ Describe 'Azure DevOps REST discussion normalization' {
             Get-OwnerDiscussionSnapshot -Contract $contract `
                 -Provider $legacyProvider -RequireAzureDevOpsProvenance
         } | Should -Throw
+        {
+            Get-OwnerDiscussionSnapshot -Contract $contract -Provider $legacyProvider
+        } | Should -Throw -ExpectedMessage '*omitted required provenance fields*'
+    }
+
+    It 'rejects unproved identity states on Azure DevOps pages before legacy inference' {
+        $contract = New-TestOwnerContract
+        $reviewer = New-TestAdoReviewerIdentity
+        $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments (New-TestAdoDiscussionArguments) `
+            -RawResponse (New-TestAdoDiscussionResponse) `
+            -CurrentIteration @{
+                id = 2; sourceCommit = ('a' * 40); targetCommit = ('b' * 40)
+            } -ReviewerIdentity $reviewer
+        $page.threads[0].comments[1].reviewerOwned | Should -BeFalse
+        foreach ($mode in @('missing', 'null', 'blank')) {
+            $unprovedPage = Copy-TestOwnerValue $page
+            $comment = $unprovedPage.threads[0].comments[1]
+            switch ($mode) {
+                'missing' { $comment.Remove('reviewerIdentityState') }
+                'null' { $comment.reviewerIdentityState = $null }
+                'blank' { $comment.reviewerIdentityState = ' ' }
+            }
+            $provider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+                -Name 'unproved-ado-author' -ReviewerIdentity $reviewer -Handler {
+                param($Operation, $ProviderArguments)
+                return $unprovedPage
+            }.GetNewClosure()
+            foreach ($requireProvenance in @($false, $true)) {
+                {
+                    Get-OwnerDiscussionSnapshot -Contract $contract -Provider $provider `
+                        -RequireAzureDevOpsProvenance:$requireProvenance
+                } | Should -Throw -ExpectedMessage '*omitted reviewer identity state*' `
+                    -Because "$mode identity state, require provenance: $requireProvenance"
+            }
+        }
     }
 
     It 'slices the full REST response into deterministic typed pages' {
@@ -1358,6 +1507,7 @@ Describe 'Owner discussion acquisition' {
         $snapshot.Threads[0].contextState | Should -Be 'ambiguous'
         $snapshot.Threads[0].isOutdated | Should -BeFalse
         $snapshot.Threads[0].sourceCommit | Should -BeNullOrEmpty
+        $snapshot.Threads[0].comments[0].reviewerIdentityState | Should -Be 'foreign'
     }
 
     It 'paginates, validates, and stably orders bounded read-only discussion data' {
@@ -1427,6 +1577,7 @@ Describe 'Owner discussion acquisition' {
         $snapshot.ThreadCount | Should -Be 2
         $snapshot.CommentCount | Should -Be 2
         @($snapshot.Threads.threadId) | Should -Be @(10, 20)
+        $snapshot.Threads[0].comments[0].reviewerIdentityState | Should -Be 'matched'
         @($operations) | Should -Be @('GetDiscussionPage', 'GetDiscussionPage')
         $snapshot.Digest | Should -Match '^v1:sha256:[0-9a-f]{64}$'
         @($snapshot.SourceDigests).Count | Should -Be 2

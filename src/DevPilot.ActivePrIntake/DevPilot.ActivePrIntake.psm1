@@ -27,10 +27,183 @@ function Get-IntakeDigest {
     ).ToLowerInvariant()
 }
 
+function Invoke-IntakeBearerGet {
+    param([Net.Http.HttpClient]$Client, [string]$Token, [string]$Url,
+        [DateTime]$Deadline, [int]$MaxBytes, [switch]$Raw)
+    if ([DateTime]::UtcNow -ge $Deadline -or $MaxBytes -lt 1 -or
+        $MaxBytes -gt 16777216 -or
+        $Url -cnotmatch '^https://(?:dev\.azure\.com|vssps\.dev\.azure\.com)/[A-Za-z0-9_-]+/' -or
+        $Token -cnotmatch '^[A-Za-z0-9._~+/=-]{40,8192}$') {
+        throw 'read-inaccessible'
+    }
+    $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $Url)
+    $request.Headers.Authorization =
+        [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $Token)
+    $request.Headers.Accept.ParseAdd($(if ($Raw) {
+                'application/octet-stream'
+            } else { 'application/json' }))
+    $remaining = [Math]::Max(1, [int]($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
+    $cancel = [Threading.CancellationTokenSource]::new($remaining)
+    try {
+        $response = $Client.SendAsync($request,
+            [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+            $cancel.Token).GetAwaiter().GetResult()
+        try {
+            if ([int]$response.StatusCode -in @(429, 503)) { throw 'read-throttled' }
+            if (-not $response.IsSuccessStatusCode -or
+                $response.Headers.Contains('x-ms-continuationtoken') -or
+                $response.Headers.Contains('x-ms-continuation-token') -or
+                $response.Content.Headers.ContentEncoding.Count -gt 0) {
+                throw 'read-inaccessible'
+            }
+            if ($null -ne $response.Content.Headers.ContentLength -and
+                $response.Content.Headers.ContentLength -gt $MaxBytes) {
+                throw 'byte-budget'
+            }
+            $media = if ($response.Content.Headers.ContentType) {
+                [string]$response.Content.Headers.ContentType.MediaType
+            } else { '' }
+            if (-not $Raw -and $media -and $media -cne 'application/json' -and
+                $media -cnotmatch '^application/[A-Za-z0-9._-]+\+json$') {
+                throw 'read-inaccessible'
+            }
+            $stream = $response.Content.ReadAsStreamAsync(
+                $cancel.Token).GetAwaiter().GetResult()
+            $buffer = [byte[]]::new(8192)
+            $output = [IO.MemoryStream]::new()
+            try {
+                while (($n = $stream.ReadAsync($buffer, 0, $buffer.Length,
+                            $cancel.Token).GetAwaiter().GetResult()) -gt 0) {
+                    if ($output.Length + $n -gt $MaxBytes) { throw 'byte-budget' }
+                    $output.Write($buffer, 0, $n)
+                }
+                $bytes = $output.ToArray()
+            }
+            finally { $output.Dispose() }
+            if ($Raw) { return @{ bytes = $bytes } }
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and
+                $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) {
+                throw 'read-inaccessible'
+            }
+            try {
+                $parsed = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) |
+                    ConvertFrom-Json -AsHashtable -Depth 32
+            }
+            catch { throw 'read-inaccessible' }
+            if ($parsed -isnot [Collections.IDictionary]) {
+                throw 'read-inaccessible'
+            }
+            return $parsed
+        }
+        finally { $response.Dispose() }
+    }
+    catch [OperationCanceledException] { throw 'time-budget' }
+    catch [Net.Http.HttpRequestException] { throw 'read-inaccessible' }
+    finally {
+        $cancel.Dispose()
+        $request.Dispose()
+    }
+}
+
+function Get-IntakeBearerRoute {
+    param([string]$Organization, [string]$DefaultProject,
+        [string]$Area, [string]$Resource, [string[]]$Route,
+        [string[]]$Query)
+    $parts = @{}
+    foreach ($pair in $Route) {
+        if ($pair -cnotmatch '^([A-Za-z][A-Za-z0-9]*)=(.{1,512})$' -or
+            $parts.ContainsKey($Matches[1])) { throw 'read-inaccessible' }
+        $parts[$Matches[1]] = $Matches[2]
+    }
+    $project = if ($parts.ContainsKey('project')) {
+        [string]$parts['project']
+    } else { $DefaultProject }
+    if ($project -cnotmatch '^[\w .-]{1,128}$' -or
+        $project -in @('.', '..') -or
+        ($parts['repositoryId'] -and
+            [string]$parts['repositoryId'] -cnotmatch
+                '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$') -or
+        ($parts['pullRequestId'] -and
+            [string]$parts['pullRequestId'] -cnotmatch '^[1-9][0-9]{0,9}$') -or
+        ($parts['iterationId'] -and
+            [string]$parts['iterationId'] -cnotmatch '^[1-9][0-9]{0,5}$')) {
+        throw 'read-inaccessible'
+    }
+    $root = "https://dev.azure.com/$Organization"
+    $git = "$root/$([Uri]::EscapeDataString($project))/_apis/git/repositories"
+    $repository = "$git/$($parts['repositoryId'])"
+    $pr = "$repository/pullRequests/$($parts['pullRequestId'])"
+    $path = switch ("$Area/$Resource") {
+        'core/projects' {
+            if ($parts['projectId'] -ne $DefaultProject) {
+                throw 'read-inaccessible'
+            }
+            "$root/_apis/projects/$([Uri]::EscapeDataString($parts['projectId']))"
+        }
+        'git/repositories' {
+            if (-not $parts['repositoryId']) { throw 'read-inaccessible' }
+            $repository
+        }
+        'git/pullRequests' {
+            if (-not $parts['repositoryId']) { throw 'read-inaccessible' }
+            if ($parts['pullRequestId']) { $pr } else { "$repository/pullRequests" }
+        }
+        'git/pullRequestIterations' {
+            if (-not $parts['pullRequestId']) { throw 'read-inaccessible' }
+            "$pr/iterations"
+        }
+        'git/pullRequestIterationChanges' {
+            if (-not $parts['pullRequestId'] -or -not $parts['iterationId']) {
+                throw 'read-inaccessible'
+            }
+            "$pr/iterations/$($parts['iterationId'])/changes"
+        }
+        'git/pullRequestThreads' {
+            if (-not $parts['pullRequestId']) { throw 'read-inaccessible' }
+            "$pr/threads"
+        }
+        'git/refs' { "$repository/refs" }
+        'git/items' { "$repository/items" }
+        'git/commits' {
+            if ([string]$parts['commitId'] -cnotmatch '^[a-fA-F0-9]{40}$') {
+                throw 'read-inaccessible'
+            }
+            "$repository/commits/$($parts['commitId'])"
+        }
+        'git/trees' {
+            if ([string]$parts['sha1'] -cnotmatch '^[a-fA-F0-9]{40}$') {
+                throw 'read-inaccessible'
+            }
+            "$repository/trees/$($parts['sha1'])"
+        }
+        default { throw 'read-inaccessible' }
+    }
+    $pairs = [Collections.Generic.List[string]]::new()
+    foreach ($pair in $Query) {
+        if ($pair -cnotmatch '^([^=&]{1,100})=(.{0,2048})$') {
+            throw 'read-inaccessible'
+        }
+        $pairs.Add("$([Uri]::EscapeDataString($Matches[1]))=$([Uri]::EscapeDataString($Matches[2]))")
+    }
+    $pairs.Add('api-version=7.1')
+    return "$path`?$($pairs -join '&')"
+}
+
 function Assert-IntakeConfig {
     param([Collections.IDictionary]$Config)
     $guidPattern = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
-    if ($Config.schemaVersion -ne 1 -or $Config.readOnly -cne $true -or
+    if ($Config.schemaVersion -notin @(1, 2) -or
+        ($Config.schemaVersion -eq 2 -and
+            ($Config.principalProof -cne 'aad-graph-storage-key-v1' -or
+                [string]$Config.expectedAccount.principalName -cnotmatch
+                    '^[^@\s]+@[^@\s]+$' -or
+                ($Config.expectedAccount.Contains('uniqueName') -and
+                    [string]$Config.expectedAccount.uniqueName -ine
+                        [string]$Config.expectedAccount.principalName))) -or
+        ($Config.schemaVersion -eq 1 -and
+            [string]$Config.expectedAccount.uniqueName -cnotmatch
+                '^[^@\s]+@[^@\s]+$') -or
+        $Config.readOnly -cne $true -or
         $Config.dryRun -cne $true -or $Config.enabled -isnot [bool] -or
         [string]$Config.organization -cnotmatch '^https://(?:dev\.azure\.com/[A-Za-z0-9_-]+|[A-Za-z0-9_-]+\.visualstudio\.com)/?$' -or
         [string]$Config.identityResource -cnotmatch '^https://[A-Za-z0-9-]+\.vssps\.visualstudio\.com/?$' -or
@@ -39,7 +212,6 @@ function Assert-IntakeConfig {
         [string]$Config.repositoryId -cnotmatch $guidPattern -or
         [string]$Config.expectedAccount.id -cnotmatch $guidPattern -or
         [string]$Config.expectedAccount.descriptor -cnotmatch '^\S{1,512}$' -or
-        [string]$Config.expectedAccount.uniqueName -cnotmatch '^[^@\s]+@[^@\s]+$' -or
         [string]$Config.automationMarker -cnotmatch '^\[[A-Za-z0-9_.:-]{1,64}\]$') {
         throw 'Intake requires a pinned organization/project/repository/account, dryRun and readOnly.'
     }
@@ -78,6 +250,22 @@ function Assert-IntakeConfig {
         if ([string]$rule.id -cnotmatch '^[a-zA-Z0-9_.@-]{1,100}$' -or
             [string]$rule.capability -cnotmatch '^[a-zA-Z0-9_.@-]{1,100}$' -or
             -not $ids.Add([string]$rule.id)) { throw 'Invalid or repeated rule registry entry.' }
+    }
+}
+
+function Assert-IntakeAccount {
+    param([Collections.IDictionary]$Actual, [Collections.IDictionary]$Config)
+    $expected = $Config.expectedAccount
+    if ($Actual -isnot [Collections.IDictionary] -or
+        [string]$Actual.id -ine [string]$expected.id -or
+        [string]$Actual.descriptor -cne [string]$expected.descriptor -or
+        ($Config.schemaVersion -eq 2 -and
+            ([string]$Actual.principalName -ine [string]$expected.principalName -or
+                ($Actual.Contains('uniqueName') -ne
+                    $expected.Contains('uniqueName')))) -or
+        ($expected.Contains('uniqueName') -and
+            [string]$Actual.uniqueName -ine [string]$expected.uniqueName)) {
+        throw 'account-mismatch'
     }
 }
 
@@ -574,7 +762,7 @@ function Get-IntakeDiscussionCounts {
     $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
         -Id ([string]$Config.expectedAccount.id) `
         -Descriptor ([string]$Config.expectedAccount.descriptor) `
-        -UniqueName ([string]$Config.expectedAccount.uniqueName)
+        -UniqueName ([string]$Config.expectedAccount['uniqueName'])
     $rawResponse = [ordered]@{
         count = $uniqueThreads.Count
         value = @($uniqueThreads)
@@ -726,7 +914,7 @@ function Get-ActivePrDiscussionSnapshot {
     $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
         -Id ([string]$Config.expectedAccount.id) `
         -Descriptor ([string]$Config.expectedAccount.descriptor) `
-        -UniqueName ([string]$Config.expectedAccount.uniqueName)
+        -UniqueName ([string]$Config.expectedAccount['uniqueName'])
     $convertPage = Get-Command ConvertTo-OwnerAzureDevOpsDiscussionPage
     $handler = {
         param($operation, $arguments)
@@ -931,6 +1119,20 @@ function Invoke-ActivePrIntake {
     if (-not $Run -or -not $Config.enabled) {
         return New-IntakeDisabledSummary -Config $Config
     }
+    $preflightReads = 0
+    if ($Config.schemaVersion -eq 2) {
+        $preflight = & $Provider Identity @{
+            timeoutMilliseconds = [int]$Config.limits.maxSeconds * 1000 }
+        Assert-IntakeAccount $preflight $Config
+        $preflightReads = 1
+        if ($null -ne $preflight['readCount']) {
+            $preflightReads += Assert-IntakeNumber $preflight.readCount `
+                readCount 0 30000
+        }
+        if ($preflightReads -ge [int]$Config.limits.maxReads) {
+            throw 'read-budget'
+        }
+    }
     $root = Resolve-AgentTrustedRoot -Path $StateRoot -Kind durable-state `
         -RepositoryRoot $RepositoryRoot -Create
     $root = Resolve-AgentTrustedRoot -Path (Join-Path $root 'active-pr-intake-v1') `
@@ -993,6 +1195,9 @@ function Invoke-ActivePrIntake {
                 projectId = ([string]$Config.projectId).ToLowerInvariant()
                 repositoryId = ([string]$Config.repositoryId).ToLowerInvariant()
                 configDigest = Get-IntakeDigest $Config
+                accountProofDigest = if ($Config.schemaVersion -eq 2) {
+                    Get-IntakeDigest $Config.expectedAccount
+                } else { $null }
             }
             mode = 'dry-run-read-only'
             writerEligible = $false
@@ -1027,16 +1232,12 @@ function Invoke-ActivePrIntake {
         $envelope.generationFile = Join-Path 'generations' "$($envelope.generation).json"
         $reasons = [Collections.Generic.List[string]]::new()
         $heads = [Collections.Generic.List[object]]::new()
-        $reads = 0
+        $reads = $preflightReads
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $cutoff = [DateTime]::UtcNow.ToString('o')
         try {
                 $identity = Invoke-IntakeRead $Provider Identity @{} $Config ([ref]$reads) $clock
-                if ([string]$identity.id -ine [string]$Config.expectedAccount.id -or
-                    [string]$identity.uniqueName -ine [string]$Config.expectedAccount.uniqueName -or
-                    [string]$identity.descriptor -cne [string]$Config.expectedAccount.descriptor) {
-                    throw 'account-mismatch'
-                }
+                Assert-IntakeAccount $identity $Config
                 $first = Get-IntakePass $Provider $Config ([ref]$reads) $clock 1 $cutoff
                 $envelope.pages.first = $first.pages
                 $second = Get-IntakePass $Provider $Config ([ref]$reads) $clock 2 $cutoff
@@ -1611,7 +1812,14 @@ function New-ActivePrAzureDevOpsProvider {
     [CmdletBinding()]
     param([Parameter(Mandatory)][Collections.IDictionary]$Config,
         [string]$AzureCliPath = 'az', [switch]$Bootstrap,
-        [scriptblock]$RawGet, [switch]$VerifyReadPrincipal)
+        [scriptblock]$RawGet, [switch]$VerifyReadPrincipal,
+        [string]$BearerToken, [Net.Http.HttpClient]$BoundClient)
+    if (($null -eq $BoundClient) -ne [string]::IsNullOrEmpty($BearerToken) -or
+        ($null -ne $BoundClient -and
+            ($BearerToken -cnotmatch '^[A-Za-z0-9._~+/=-]{40,8192}$' -or
+                $null -ne $RawGet -or -not $VerifyReadPrincipal))) {
+        throw 'bound-transport-invalid'
+    }
     if ($Bootstrap) {
         if ([string]$Config.organization -cnotmatch
                 '^https://(?:dev\.azure\.com/[A-Za-z0-9_-]+|[A-Za-z0-9_-]+\.visualstudio\.com)/?$' -or
@@ -1627,6 +1835,12 @@ function New-ActivePrAzureDevOpsProvider {
         Assert-IntakeConfig $Config
     }
     $org = [string]$Config.organization
+    if ($null -ne $BoundClient -and
+        ($Config.schemaVersion -ne 2 -or
+            $Config.principalProof -cne 'aad-graph-storage-key-v1' -or
+            $org -cnotmatch '^https://dev\.azure\.com/[A-Za-z0-9_-]+/?$')) {
+        throw 'bound-transport-invalid'
+    }
     $project = [string]$Config.projectName
     $projectId = [string]$Config.projectId
     $repo = [string]$Config.repositoryId
@@ -1636,12 +1850,27 @@ function New-ActivePrAzureDevOpsProvider {
     $parseNumber = ${function:Assert-IntakeNumber}
     $readCeiling = [int]$Config.limits.maxReads
     $transportReads = [pscustomobject]@{ Count = 0 }
+    $boundGet = ${function:Invoke-IntakeBearerGet}
+    $boundRoute = ${function:Get-IntakeBearerRoute}
+    $boundOrg = ([Uri]$org).AbsolutePath.Trim('/')
     $invoke = {
         param([string]$Area, [string]$Resource, [string[]]$Route,
             [string[]]$Query, [DateTime]$Deadline,
             [int]$MaxOutputBytes = 16777216)
         if ($transportReads.Count -ge $readCeiling) { throw 'read-budget' }
         $transportReads.Count++
+        if ($null -ne $BoundClient) {
+            if ($Area -ceq 'token' -or $Area -ceq 'devopsConnection') {
+                throw 'bound-transport-invalid'
+            }
+            $url = if ($Area -ceq 'connection') {
+                "https://dev.azure.com/$boundOrg/_apis/connectionData?api-version=7.1-preview.1"
+            } else {
+                & $boundRoute $boundOrg $project $Area $Resource $Route $Query
+            }
+            return & $boundGet $BoundClient $BearerToken $url `
+                $Deadline $MaxOutputBytes
+        }
         $argv = if ($Area -eq 'token') {
             @('account', 'get-access-token', '--resource', $identityResource,
                 '--output', 'json', '--only-show-errors')
@@ -1761,7 +1990,7 @@ function New-ActivePrAzureDevOpsProvider {
         try { return ($text | ConvertFrom-Json -AsHashtable -Depth 32) }
         catch { throw 'read-inaccessible' }
     }.GetNewClosure()
-    $rawCredential = [pscustomobject]@{ Token = $null }
+    $rawCredential = [pscustomobject]@{ Token = $BearerToken }
     $rawIdentityVerified = $false
     if ($null -eq $RawGet) {
         $RawGet = {
@@ -1808,6 +2037,20 @@ function New-ActivePrAzureDevOpsProvider {
                     "/_apis/git/repositories/$repo/trees/$($RawRequest.treeId)" +
                     '?recursive=false&api-version=7.1'
             } else { throw 'read-inaccessible' }
+            if ($null -ne $BoundClient) {
+                if ($transportReads.Count -ge $readCeiling) { throw 'read-budget' }
+                $transportReads.Count++
+                $rawResult = & $boundGet $BoundClient $BearerToken $url $deadline `
+                    $(if ($Operation -ceq 'Item') {
+                            [int]$RawRequest.maxBytes
+                        } else { 65536 }) -Raw:($Operation -ceq 'Item')
+                if ($Operation -ceq 'Identity') {
+                    $user = $rawResult.authenticatedUser
+                    return @{ id = $user.id; descriptor = $user.subjectDescriptor
+                        uniqueName = $user.uniqueName }
+                }
+                return $rawResult
+            }
             $handler = [Net.Http.HttpClientHandler]::new()
             $handler.AllowAutoRedirect = $false
             $client = [Net.Http.HttpClient]::new($handler)
@@ -1894,6 +2137,62 @@ function New-ActivePrAzureDevOpsProvider {
         switch -CaseSensitive ($Operation) {
             Identity {
                 $principal.Verified = $false
+                if ($null -ne $BoundClient) {
+                    $identity = & $RawGet 'Identity' @{ deadline = $deadline }
+                    $guid = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
+                    $descriptor = [string]$identity.descriptor
+                    if ([string]$identity.id -cnotmatch $guid -or
+                        $descriptor -cnotmatch '^[A-Za-z0-9._-]{1,512}$' -or
+                        [string]$identity.id -ine
+                            [string]$Config.expectedAccount.id -or
+                        $descriptor -cne
+                            [string]$Config.expectedAccount.descriptor -or
+                        ($Config.expectedAccount.Contains('uniqueName') -ne
+                            ($null -ne $identity.uniqueName)) -or
+                        ($null -ne $identity.uniqueName -and
+                            ([string]$identity.uniqueName -cnotmatch '^[^@\s]+@[^@\s]+$' -or
+                                [string]$identity.uniqueName -ine
+                                    [string]$Config.expectedAccount.principalName))) {
+                        throw 'account-mismatch'
+                    }
+                    $graphUrl = "https://vssps.dev.azure.com/$boundOrg/_apis/graph"
+                    $escaped = [Uri]::EscapeDataString($descriptor)
+                    if ($transportReads.Count + 2 -gt $readCeiling) {
+                        throw 'read-budget'
+                    }
+                    $transportReads.Count += 2
+                    $user = & $boundGet $BoundClient $BearerToken `
+                        "$graphUrl/users/$escaped`?api-version=7.1-preview.1" `
+                        $deadline 65536
+                    $storage = & $boundGet $BoundClient $BearerToken `
+                        "$graphUrl/storagekeys/$escaped`?api-version=7.1" `
+                        $deadline 65536
+                    if ([string]$user.descriptor -cne $descriptor -or
+                        [string]$user.subjectKind -cne 'user' -or
+                        [string]$user.principalName -ine
+                            [string]$Config.expectedAccount.principalName -or
+                        [string]$storage.value -cnotmatch $guid -or
+                        [string]$storage.value -ine [string]$identity.id -or
+                        [string]$identity.id -ine
+                            [string]$Config.expectedAccount.id -or
+                        $descriptor -cne
+                            [string]$Config.expectedAccount.descriptor -or
+                        ($Config.expectedAccount.Contains('uniqueName') -ne
+                            ($null -ne $identity.uniqueName)) -or
+                        ($Config.expectedAccount.Contains('uniqueName') -and
+                            [string]$identity.uniqueName -ine
+                                [string]$Config.expectedAccount.uniqueName)) {
+                        throw 'account-mismatch'
+                    }
+                    $principal.Verified = $true
+                    $answer = @{ id = $identity.id; descriptor = $descriptor
+                        principalName = $user.principalName }
+                    if ($null -ne $identity.uniqueName) {
+                        $answer.uniqueName = $identity.uniqueName
+                    }
+                    $answer.readCount = 2
+                    return $answer
+                }
                 $r = & $invoke 'connection' 'connectionData' @() @() $deadline
                 $user = $r.authenticatedUser
                 $name = [string]$user.uniqueName
@@ -2103,7 +2402,8 @@ function New-ActivePrAzureDevOpsProvider {
                     }
                     return $result
                 }.GetNewClosure()
-                if ($rawEnabled -and -not $rawIdentityVerified) {
+                if ($rawEnabled -and -not $rawIdentityVerified -and
+                    $null -eq $BoundClient) {
                     $identity = & $readRaw 'Identity' @{}
                     if ([string]$identity.id -ine [string]$Config.expectedAccount.id -or
                         [string]$identity.descriptor -cne

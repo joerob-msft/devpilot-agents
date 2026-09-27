@@ -186,7 +186,7 @@ namespace DevPilot.OwnerAdapters
         {
             Id = id;
             Descriptor = descriptor;
-            UniqueName = uniqueName;
+            UniqueName = string.IsNullOrEmpty(uniqueName) ? null : uniqueName;
         }
     }
 }
@@ -268,6 +268,12 @@ $script:OwnerAzureDevOpsDiscussionContractMaterial = ConvertTo-Json -InputObject
         reviewerIdentity = $script:OwnerAzureDevOpsReviewerIdentityFields
         reviewerIdentityStates = $script:OwnerAzureDevOpsReviewerIdentityStates
         missingReviewerIdentity = 'ambiguous'
+        reviewerIdentityRule = (
+            'valid-guid-D+exact-descriptor;alias-optional;' +
+            'known-alias-mismatch-ambiguous;both-immutable-different-foreign;' +
+            'subjectDescriptor-if-present-must-match-descriptor;' +
+            'invalid-fields-ambiguous'
+        )
         threadStatus = $script:OwnerAzureDevOpsThreadStatusMap
         threadStatusDefault = $script:OwnerAzureDevOpsThreadStatusDefault
         commentType = $script:OwnerAzureDevOpsCommentTypeMap
@@ -574,7 +580,7 @@ function New-OwnerAzureDevOpsReviewerIdentity {
     param(
         [Parameter(Mandatory)][string]$Id,
         [Parameter(Mandatory)][string]$Descriptor,
-        [Parameter(Mandatory)][string]$UniqueName
+        [AllowNull()][AllowEmptyString()][string]$UniqueName = $null
     )
 
     $parsedId = [guid]::Empty
@@ -583,14 +589,22 @@ function New-OwnerAzureDevOpsReviewerIdentity {
         throw 'Azure DevOps reviewer Id must be a non-empty GUID in D format.'
     }
     Assert-OwnerAdapterText -Value $Descriptor -Name Descriptor -MaximumLength 512
-    Assert-OwnerAdapterText -Value $UniqueName -Name UniqueName -MaximumLength 320
-    if ($UniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
-        throw 'Azure DevOps reviewer UniqueName must be one exact UPN.'
+    if (-not [string]::IsNullOrEmpty($UniqueName)) {
+        Assert-OwnerAdapterText -Value $UniqueName -Name UniqueName -MaximumLength 320
+        if ($UniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+            throw 'Azure DevOps reviewer UniqueName must be one exact UPN.'
+        }
+    }
+    $normalizedUniqueName = if ([string]::IsNullOrEmpty($UniqueName)) {
+        $null
+    }
+    else {
+        $UniqueName.ToLowerInvariant()
     }
     return [DevPilot.OwnerAdapters.OwnerAzureDevOpsReviewerIdentity]::new(
         $parsedId.ToString('D').ToLowerInvariant(),
         $Descriptor,
-        $UniqueName.ToLowerInvariant())
+        $normalizedUniqueName)
 }
 
 function Get-OwnerAzureDevOpsReviewerIdentityDigest {
@@ -920,22 +934,58 @@ function ConvertTo-OwnerAzureDevOpsDiscussionPage {
             $reviewerOwned = $false
             $reviewerIdentityState = 'ambiguous'
             if ($author -is [Collections.IDictionary]) {
-                $authorId = [string](Get-OwnerAdapterMember -Value $author -Name id)
-                $authorDescriptor = [string](Get-OwnerAdapterMember -Value $author -Name descriptor)
-                $authorUniqueName = [string](Get-OwnerAdapterMember -Value $author -Name uniqueName)
-                if (-not [string]::IsNullOrWhiteSpace($authorId) -and
-                    -not [string]::IsNullOrWhiteSpace($authorDescriptor) -and
-                    -not [string]::IsNullOrWhiteSpace($authorUniqueName)) {
-                    $reviewerOwned = (
-                        $authorId -ieq $ReviewerIdentity.Id -and
-                        $authorDescriptor -ceq $ReviewerIdentity.Descriptor -and
-                        $authorUniqueName -ieq $ReviewerIdentity.UniqueName
-                    )
-                    $reviewerIdentityState = if ($reviewerOwned) {
-                        'matched'
+                $authorId = Get-OwnerAdapterMember -Value $author -Name id
+                $authorDescriptor = Get-OwnerAdapterMember -Value $author -Name descriptor
+                $authorUniqueName = Get-OwnerAdapterMember -Value $author -Name uniqueName
+                $parsedAuthorId = [guid]::Empty
+                $validAuthor = $authorId -is [string] -and
+                    [guid]::TryParseExact($authorId, 'D', [ref]$parsedAuthorId) -and
+                    $parsedAuthorId -ne [guid]::Empty -and
+                    $authorDescriptor -is [string]
+                if ($validAuthor) {
+                    try {
+                        Assert-OwnerAdapterText -Value $authorDescriptor `
+                            -Name author.descriptor -MaximumLength 512
+                        if ($author.Contains('subjectDescriptor')) {
+                            $subjectDescriptor = Get-OwnerAdapterMember -Value $author `
+                                -Name subjectDescriptor
+                            if ($subjectDescriptor -isnot [string]) {
+                                throw 'Azure DevOps author subjectDescriptor must be text.'
+                            }
+                            Assert-OwnerAdapterText -Value $subjectDescriptor `
+                                -Name author.subjectDescriptor -MaximumLength 512
+                            if ($subjectDescriptor -cne $authorDescriptor) {
+                                throw 'Azure DevOps author descriptors disagree.'
+                            }
+                        }
+                        if ($null -ne $authorUniqueName) {
+                            if ($authorUniqueName -isnot [string]) {
+                                throw 'Azure DevOps author uniqueName must be a UPN.'
+                            }
+                            Assert-OwnerAdapterText -Value $authorUniqueName `
+                                -Name author.uniqueName -MaximumLength 320
+                            if ($authorUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+                                throw 'Azure DevOps author uniqueName must be a UPN.'
+                            }
+                        }
                     }
-                    else {
-                        'foreign'
+                    catch {
+                        $validAuthor = $false
+                    }
+                }
+                if ($validAuthor) {
+                    $sameId = $parsedAuthorId -eq [guid]$ReviewerIdentity.Id
+                    $sameDescriptor = $authorDescriptor -ceq $ReviewerIdentity.Descriptor
+                    if ($sameId -and $sameDescriptor) {
+                        if ($null -eq $ReviewerIdentity.UniqueName -or
+                            $null -eq $authorUniqueName -or
+                            $authorUniqueName -ieq $ReviewerIdentity.UniqueName) {
+                            $reviewerOwned = $true
+                            $reviewerIdentityState = 'matched'
+                        }
+                    }
+                    elseif (-not $sameId -and -not $sameDescriptor) {
+                        $reviewerIdentityState = 'foreign'
                     }
                 }
             }
@@ -1234,7 +1284,8 @@ function ConvertTo-OwnerDiscussionThread {
         [Parameter(Mandatory)][Collections.IDictionary]$Thread,
         [Parameter(Mandatory)][DevPilot.OwnerAdapters.OwnerDiscussionLimits]$Limits,
         [Parameter(Mandatory)][ref]$CommentCount,
-        [Parameter(Mandatory)][ref]$ByteCount
+        [Parameter(Mandatory)][ref]$ByteCount,
+        [switch]$RequireReviewerIdentityState
     )
 
     $threadId = Get-OwnerAdapterInt64 -Value (
@@ -1333,6 +1384,9 @@ function ConvertTo-OwnerDiscussionThread {
             -Name reviewerIdentityState
         $reviewerIdentityState = if ($null -eq $identityStateValue -or
             [string]::IsNullOrWhiteSpace([string]$identityStateValue)) {
+            if ($RequireReviewerIdentityState) {
+                throw "Azure DevOps discussion comment '$commentId' omitted reviewer identity state."
+            }
             if ($reviewerOwned) { 'matched' } else { 'foreign' }
         }
         else {
@@ -1398,13 +1452,15 @@ function Get-OwnerDiscussionSnapshot {
     Test-OwnerProviderAdapter -Provider $Provider
     $expectedAzureMappingDigest = $null
     $expectedAzureReviewerDigest = $null
-    if ($RequireAzureDevOpsProvenance) {
-        $mappingProperty = $Provider.PSObject.Properties[
-            'AzureDevOpsDiscussionMappingDigest'
-        ]
-        $reviewerProperty = $Provider.PSObject.Properties[
-            'AzureDevOpsReviewerIdentityDigest'
-        ]
+    $mappingProperty = $Provider.PSObject.Properties[
+        'AzureDevOpsDiscussionMappingDigest'
+    ]
+    $reviewerProperty = $Provider.PSObject.Properties[
+        'AzureDevOpsReviewerIdentityDigest'
+    ]
+    $requireAzureProvider = $RequireAzureDevOpsProvenance -or
+        $null -ne $mappingProperty -or $null -ne $reviewerProperty
+    if ($requireAzureProvider) {
         if ($null -eq $mappingProperty -or $null -eq $reviewerProperty) {
             throw 'Azure DevOps discussion acquisition requires a reviewer-bound provider adapter.'
         }
@@ -1489,7 +1545,7 @@ function Get-OwnerDiscussionSnapshot {
             $null -ne $pageMappingDigest -or
             $null -ne $pageReviewerDigest -or
             $null -ne $pageIterationId
-        if ($RequireAzureDevOpsProvenance -or $hasAzureProvenance) {
+        if ($requireAzureProvider -or $hasAzureProvenance) {
             if ($null -eq $pageRawDigest -or $null -eq $pageMappingDigest -or
                 $null -eq $pageReviewerDigest -or $null -eq $pageIterationId) {
                 throw 'Azure DevOps discussion page omitted required provenance fields.'
@@ -1503,7 +1559,7 @@ function Get-OwnerDiscussionSnapshot {
             if ($pageMappingDigest -cne $script:OwnerAzureDevOpsDiscussionMappingDigest) {
                 throw 'Azure DevOps discussion page used an unsupported mapping contract.'
             }
-            if ($RequireAzureDevOpsProvenance -and (
+            if ($requireAzureProvider -and (
                     $pageMappingDigest -cne $expectedAzureMappingDigest -or
                     $pageReviewerDigest -cne $expectedAzureReviewerDigest
                 )) {
@@ -1539,7 +1595,8 @@ function Get-OwnerDiscussionSnapshot {
                 throw 'Discussion pages must contain only thread dictionaries.'
             }
             $normalized = ConvertTo-OwnerDiscussionThread -Thread $thread -Limits $Limits `
-                -CommentCount ([ref]$commentCount) -ByteCount ([ref]$byteCount)
+                -CommentCount ([ref]$commentCount) -ByteCount ([ref]$byteCount) `
+                -RequireReviewerIdentityState:($requireAzureProvider -or $hasAzureProvenance)
             if (-not $seenThreads.Add([long]$normalized.threadId)) {
                 throw "Discussion pagination repeated thread '$($normalized.threadId)'."
             }
@@ -1569,7 +1626,7 @@ function Get-OwnerDiscussionSnapshot {
             }
             $next
         }
-        if ($RequireAzureDevOpsProvenance -or $hasAzureProvenance) {
+        if ($requireAzureProvider -or $hasAzureProvenance) {
             $pageIdentity = [ordered]@{ schemaVersion = 1 }
             foreach ($entry in $baseArguments.GetEnumerator()) {
                 $pageIdentity[$entry.Key] = $entry.Value

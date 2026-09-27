@@ -164,8 +164,13 @@ slug, BPM project/repository names, and the expected reviewer UPN. These are
 selectors to check, not operator-invented GUIDs or source digests. With
 `-Run`, it acquires one AAD bearer in memory via `az account get-access-token`,
 uses bounded GETs only, and checks the connection identity before and after
-the source reads. It derives the project/repository GUIDs and account
-ID/descriptor from those GETs. It checks the EngHub project/repository
+the source reads. Both checks bind the authenticated account GUID and subject
+descriptor to the Graph user (whose principal name must equal the expected
+CLI UPN) and Graph storage key under that same bearer. The ADO `uniqueName`
+is optional; if present, it must agree with the expected UPN, and it is never
+invented from the Graph principal name or descriptor. It derives the
+project/repository GUIDs and account ID/descriptor from those GETs. It checks
+the EngHub project/repository
 identity, active PR 17307009's exact source commit against its latest
 iteration and source ref twice, the pinned commit, and raw UTF-8 document
 bytes against both the Git blob object ID and the independently pinned
@@ -181,7 +186,7 @@ or alias secret is written into the repository or normal command output.
 
 After all checks it creates only `provider-config.json` and
 `approved-sources.json` in a fresh ACL-private external directory. The latter
-is a version 2 four-rule source **receipt** plus a separate named-section
+is a version 3 four-rule source **receipt** plus a separate named-section
 entry. It is **not** the legacy approval manifest consumed by
 `Invoke-ActivePrCanaryQualification.ps1`. There is no HMAC key, signed
 dispatcher config, intake, canary GET evaluation, model call, or provider
@@ -193,16 +198,17 @@ Do not run the private bootstrap until its own and parent exact-head CI
 and input provenance have been checked.
 
 `tools/Invoke-PrivateCanaryRuleRegistry.ps1` consumes **only** that
-bootstrap's external ACL-private `provider-config.json` and version 2
+bootstrap's external ACL-private `provider-config.json` and version 3
 `approved-sources.json`. It is disabled without `-Run`; it never creates
 private state, signs configuration, selects PRs, evaluates rules, invokes a
 model, or writes to ADO. When explicitly run after the exact-head CI and
-source gates, it obtains one AAD bearer in memory and performs at most 20
+source gates, it obtains one AAD bearer in memory and performs at most 26
 bounded GETs. It checks the BPM and EngHub identities, independent Owner and
 Named section bytes against their raw Git blobs, the two distinct candidate
 declarations at the immutable EngHub commit, the current reviewed PR's head
 and latest iteration/source ref both before and after the source reads,
-the principal before and after, and the locally pinned Named policy blob.
+the full GUID/descriptor/Graph user/storage key principal proof before and
+after, and the locally pinned Named policy blob.
 It returns four **disabled**, separately digest-bound rule entries and
 `verified-not-evaluated`, not a dispatcher registry or a master-approved
 rule. A receipt field cannot substitute for a fresh read; changed or missing
@@ -212,7 +218,7 @@ Owner no-tools execution.
 
 `tools/Invoke-PrivateCanarySignedIntake.ps1` is the **next default-off,
 preparation-only** layer. It accepts only the ACL-private external PR189
-`provider-config.json` and version 2 `approved-sources.json`, a new disjoint
+`provider-config.json` and version 3 `approved-sources.json`, a new disjoint
 absolute external `-StateRoot`, and one or two explicit `-CanaryPullRequestIds`.
 `-Run` revalidates the PR190 registry and EngHub reviewed PR head/raw blob
 before and after intake; changes to the receipts or provider identity abort
@@ -229,6 +235,20 @@ only the explicit non-draft master-target selections receive changed-line
 and complete project-scope receipts. Nonselected and out-of-policy heads
 remain pending/skipped, never evaluated.
 
+The signed invocation obtains **one AAD bearer** and uses it with a
+redirect-disabled client for the registry's source proofs, the intake's
+ConnectionData/Graph account proof, project/repository metadata, PR inventory,
+commits, trees, raw blobs, changes, and discussions, and the final registry
+recheck. No `az devops invoke` credential or descriptor-derived UPN participates
+in this path. Every request is a bounded GET; HTTP throttling stops rather
+than retries, and failures before signing leave no new external state.
+The v2 signed intake/config binds the v3 identity/source receipt and exact
+head/iteration evidence; v1 handoffs cannot be interpreted as these proofs.
+The independent runner obtains one fresh bearer for its own registry/source
+recheck and subsequent read-only evaluation, not a replay of a bootstrap
+bearer. Its initial and final account proofs must agree with the signed
+immutable identity.
+
 Only after complete intake and a second source/head check does the command
 copy the verified provider JSON and four-source manifest into the fresh
 ACL-private root, mint a random HMAC key, and sign `canary-dispatcher.json`
@@ -243,8 +263,9 @@ hand-signed to bypass the independent `@2` runner. Its output is
 `signed-intake-not-evaluated`, with zero evaluated/humanCovered/wouldCreate
 and Owner unknown. The key and private source stay outside the repository
 and normal output. Do not run this against the private service until this
-PR and PR189/190 have green checks at their exact heads and the source PR
-head and blob are reconfirmed.
+layer and its parent stack layers have green checks at their exact heads,
+the source PR head and blob are reconfirmed, and a separately authorized
+operator owns the live GET budget.
 
 `tools/Invoke-PrivateCanaryEvaluation.ps1 -StateRoot <private-external-root>`
 is default-off and does not open the root until `-Run` is specified. The
@@ -267,8 +288,15 @@ adapter checks distinct threads/comments and splits the response into
 bounded local pages. For each selected head, the runner reconciles
 per-finding body/marker/anchor against the current discussion snapshot and
 then re-GETs discussions and the exact source/target/iteration before
-returning. Same-account unmarked comments can count as human coverage;
-outdated, duplicate, or foreign candidate markers remain unknown.
+returning. The author is same-account only when the comment's valid GUID
+and descriptor both match the authenticated GUID and Graph subject descriptor;
+an absent ADO `uniqueName` does not turn Graph principal name into a comment
+alias. A known ADO alias conflict, incomplete or contradictory immutable
+fields, or conflicting optional descriptor evidence is ambiguous, never
+foreign or sufficient for wouldCreate. Only fully valid, different GUID
+**and** descriptor evidence is foreign. Same-account unmarked comments can
+count as human coverage; only an exact current-generation automation marker
+can count as automation. Outdated or duplicate candidates remain unknown.
 The summary reports per-rule `evaluated`, `unknown`, `humanCovered`,
 `wouldCreate`, `pending`, and `skipped`, plus draft exclusions and the
 immutable intake generation. These are hypothetical, candidate-only
