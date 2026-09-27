@@ -272,6 +272,63 @@ function Get-CanaryAadToken {
     catch { throw 'bootstrap-credential-unavailable' }
 }
 
+function Get-CanaryIdentityPayload {
+    param([byte[]]$Bytes, [AllowEmptyString()][string]$MediaType,
+        [bool]$Encoded)
+    if ($Encoded) { return @{ reason = 'encoded-response' } }
+    if ($MediaType -and $MediaType -cne 'application/json' -and
+        $MediaType -cnotmatch '^application/[A-Za-z0-9._-]+\+json$') {
+        return @{ reason = 'non-json-media' }
+    }
+    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xef -and
+        $Bytes[1] -eq 0xbb -and $Bytes[2] -eq 0xbf) {
+        return @{ reason = 'utf8-bom' }
+    }
+    try { $text = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes) }
+    catch [Text.DecoderFallbackException] {
+        return @{ reason = 'invalid-utf8' }
+    }
+    catch { return @{ reason = 'unclassified' } }
+    try { $result = $text | ConvertFrom-Json -AsHashtable -Depth 12 }
+    catch {
+        $document = $null
+        try {
+            $options = [Text.Json.JsonDocumentOptions]::new()
+            $options.MaxDepth = 65536
+            $document = [Text.Json.JsonDocument]::Parse($text, $options)
+        }
+        catch [Text.Json.JsonException] {
+            return @{ reason = 'invalid-json' }
+        }
+        catch { return @{ reason = 'unclassified' } }
+        finally { if ($document) { $document.Dispose() } }
+        $shallow = $null
+        try {
+            $options.MaxDepth = 12
+            $shallow = [Text.Json.JsonDocument]::Parse($text, $options)
+        }
+        catch [Text.Json.JsonException] {
+            return @{ reason = 'json-depth-over-12' }
+        }
+        catch { return @{ reason = 'unclassified' } }
+        finally { if ($shallow) { $shallow.Dispose() } }
+        return @{ reason = 'unclassified' }
+    }
+    if ($result -isnot [Collections.IDictionary] -or
+        $result['authenticatedUser'] -isnot [Collections.IDictionary]) {
+        return @{ reason = 'identity-fields-missing' }
+    }
+    $user = $result['authenticatedUser']
+    foreach ($field in @('id', 'subjectDescriptor', 'uniqueName')) {
+        if (-not $user.Contains($field)) {
+            return @{ reason = 'identity-fields-missing' }
+        }
+    }
+    return @{ reason = 'valid'; identity = @{
+            id = $user['id']; descriptor = $user['subjectDescriptor']
+            uniqueName = $user['uniqueName'] } }
+}
+
 function Invoke-CanaryAadGet {
     param([Net.Http.HttpClient]$Client, [string]$Token, [string]$Organization,
         [string]$Operation, [Collections.IDictionary]$Request,
@@ -361,6 +418,7 @@ function Invoke-CanaryAadGet {
     $cancel = [Threading.CancellationTokenSource]::new($remaining)
     $failureStatus = 0
     $phase = 'send'
+    $decodeReason = ''
     try {
         $response = $Client.SendAsync($message,
             [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
@@ -375,6 +433,10 @@ function Invoke-CanaryAadGet {
                     $response.Content.Headers.ContentLength -gt $limit) {
                 throw 'bootstrap-read-inaccessible'
             }
+            $mediaType = if ($response.Content.Headers.ContentType) {
+                [string]$response.Content.Headers.ContentType.MediaType
+            } else { '' }
+            $encoded = $response.Content.Headers.ContentEncoding.Count -gt 0
             $stream = $response.Content.ReadAsStreamAsync(
                 $cancel.Token).GetAwaiter().GetResult()
             $output = [IO.MemoryStream]::new()
@@ -394,19 +456,30 @@ function Invoke-CanaryAadGet {
         finally { $response.Dispose() }
         if ($Operation -ceq 'RawItem') { return @{ bytes = $bytes } }
         $phase = 'decode'
+        if ($Operation -ceq 'Identity') {
+            $classified = Get-CanaryIdentityPayload -Bytes $bytes `
+                -MediaType $mediaType -Encoded $encoded
+            $decodeReason = [string]$classified.reason
+            if ($decodeReason -cne 'valid') {
+                throw 'bootstrap-read-inaccessible'
+            }
+            return $classified.identity
+        }
         $result = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) |
             ConvertFrom-Json -AsHashtable -Depth 12
-        if ($Operation -ceq 'Identity') {
-            return @{ id = $result.authenticatedUser.id
-                descriptor = $result.authenticatedUser.subjectDescriptor
-                uniqueName = $result.authenticatedUser.uniqueName }
-        }
         return $result
     }
     catch {
         if ($failureStatus -gt 0) {
             throw ('bootstrap-read-inaccessible:{0}:http-{1}' -f
                 $Operation, $failureStatus)
+        }
+        if ($Operation -ceq 'Identity' -and $phase -ceq 'decode' -and
+            $decodeReason -cin @('encoded-response', 'non-json-media',
+                'utf8-bom', 'invalid-utf8', 'invalid-json',
+                'json-depth-over-12', 'identity-fields-missing',
+                'unclassified')) {
+            throw "bootstrap-read-inaccessible:Identity:$decodeReason"
         }
         throw ('bootstrap-read-inaccessible:{0}:{1}' -f $Operation, $phase)
     }

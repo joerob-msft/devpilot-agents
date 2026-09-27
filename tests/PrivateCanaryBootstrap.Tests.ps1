@@ -21,6 +21,9 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
     public bool FailTransport = false;
     public bool Oversize = false;
     public bool InvalidJson = false;
+    public byte[] Body;
+    public string MediaType;
+    public string ContentEncoding;
     protected override Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken) {
         if (request.Method != HttpMethod.Get ||
@@ -40,9 +43,17 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             : Encoding.UTF8.GetBytes("{\"id\":\"synthetic\"}");
         if (Oversize) content = new byte[65537];
         if (InvalidJson) content = Encoding.UTF8.GetBytes("{");
-        return Task.FromResult(new HttpResponseMessage(Status) {
-            Content = new ByteArrayContent(content)
-        });
+        var response = new HttpResponseMessage(Status) {
+            Content = new ByteArrayContent(Body ?? content)
+        };
+        if (MediaType != null) {
+            response.Content.Headers.ContentType =
+                new System.Net.Http.Headers.MediaTypeHeaderValue(MediaType);
+        }
+        if (ContentEncoding != null) {
+            response.Content.Headers.ContentEncoding.Add(ContentEncoding);
+        }
+        return Task.FromResult(response);
     }
 }
 '@
@@ -1142,7 +1153,7 @@ Describe 'Read-only private canary input bootstrap' {
     It 'redacts bounded response read and decode failures without private state' {
         foreach ($case in @(
                 @{ phase = 'read'; oversize = $true; invalidJson = $false },
-                @{ phase = 'decode'; oversize = $false; invalidJson = $true })) {
+                @{ phase = 'invalid-json'; oversize = $false; invalidJson = $true })) {
             $handler = [CanarySyntheticHandler]::new()
             $handler.Oversize = $case.oversize
             $handler.InvalidJson = $case.invalidJson
@@ -1173,5 +1184,63 @@ Describe 'Read-only private canary input bootstrap' {
             }
             finally { $client.Dispose() }
         }
+    }
+    It 'classifies only fixed reasons from one bounded GET without creating state' {
+        $utf8 = [Text.Encoding]::UTF8
+        $nested = '{"authenticatedUser":{"id":"synthetic","subjectDescriptor":"aad.synthetic","uniqueName":"service@example.invalid"},"locationServiceData":' +
+            ('{"child":' * 14) + '{}' + ('}' * 14) + '}'
+        foreach ($case in @(
+                @{ reason = 'non-json-media'; bytes = $utf8.GetBytes('<html>Sign in</html>'); media = 'text/html'; encoding = $null },
+                @{ reason = 'encoded-response'; bytes = $utf8.GetBytes('{}'); media = 'application/json'; encoding = 'gzip' },
+                @{ reason = 'invalid-utf8'; bytes = [byte[]]@(0xff, 0xfe); media = 'application/json'; encoding = $null },
+                @{ reason = 'invalid-json'; bytes = $utf8.GetBytes('{"authenticatedUser":'); media = 'application/json'; encoding = $null },
+                @{ reason = 'utf8-bom'; bytes = [byte[]]@(0xef, 0xbb, 0xbf) + $utf8.GetBytes('{}'); media = 'application/json'; encoding = $null },
+                @{ reason = 'json-depth-over-12'; bytes = $utf8.GetBytes($nested); media = 'application/json'; encoding = $null },
+                @{ reason = 'identity-fields-missing'; bytes = $utf8.GetBytes('{"authenticatedUser":{"id":"synthetic","subjectDescriptor":"aad.synthetic"}}'); media = 'application/json'; encoding = $null },
+                @{ reason = 'identity-fields-missing'; bytes = $utf8.GetBytes('{}'); media = 'application/json'; encoding = $null })) {
+            $handler = [CanarySyntheticHandler]::new()
+            $handler.Body = $case.bytes
+            if ($case.media) { $handler.MediaType = $case.media }
+            if ($case.encoding) { $handler.ContentEncoding = $case.encoding }
+            $client = [Net.Http.HttpClient]::new($handler)
+            $module = Get-Module DevPilot.ActivePrCanary
+            $c = Get-BootstrapCase
+            $state = $c.state
+            $c.provider = {
+                param($operation, $request)
+                $state.reads.Add($operation) | Out-Null
+                & $module {
+                    param($Client, $Operation, $Request)
+                    Invoke-CanaryAadGet $Client 'synthetic-bearer' 'example-org' `
+                        $Operation $Request ([DateTime]::UtcNow.AddSeconds(5))
+                } $client $operation $request
+            }.GetNewClosure()
+            try {
+                $message = try {
+                    Invoke-BootstrapCase $c
+                    ''
+                }
+                catch { $_.Exception.Message }
+                $handler.Paths.Count | Should -Be 1
+                $message | Should -Be "bootstrap-read-inaccessible:Identity:$($case.reason)"
+                Test-Path $c.root | Should -BeFalse
+                $state.reads.Count | Should -Be 1
+                $state.reads[0] | Should -Be 'Identity'
+            }
+            finally { $client.Dispose() }
+        }
+    }
+    It 'leaves an unexplained parser failure unclassified rather than claiming a cause' {
+        Mock ConvertFrom-Json -ModuleName DevPilot.ActivePrCanary {
+            throw 'synthetic parser detail'
+        } -ParameterFilter { $Depth -eq 12 }
+        $module = Get-Module DevPilot.ActivePrCanary
+        $reason = & $module {
+            Get-CanaryIdentityPayload `
+                -Bytes ([Text.Encoding]::UTF8.GetBytes(
+                    '{"authenticatedUser":{"id":"synthetic"}}')) `
+                -MediaType 'application/json' -Encoded $false
+        }
+        $reason.reason | Should -Be 'unclassified'
     }
 }
