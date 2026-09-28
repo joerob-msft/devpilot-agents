@@ -90,6 +90,9 @@ are documented in
 The separate default-off, signed, bounded active-PR rule evaluation path
 and its current-generation read-only coverage report are documented in
 [docs/bounded-rule-evaluation.md](docs/bounded-rule-evaluation.md).
+The distinct two-rule merged-master coverage-only qualification path, its
+private pin prerequisite, and its read-only limits are documented in
+[docs/coverage-only-canary.md](docs/coverage-only-canary.md).
 The capability-specific contextual assessment and its sanitized demonstration
 result are documented in
 [docs/relation-evidence-capability.md](docs/relation-evidence-capability.md).

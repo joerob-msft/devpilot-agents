@@ -61,9 +61,18 @@ function Assert-PrivateCanarySignature {
 function Assert-PrivateCanaryConfig {
     param([Collections.IDictionary]$Config, [Collections.IDictionary]$Intake,
         [Collections.IDictionary]$ProviderConfig,
-        [Collections.IDictionary]$Registry)
-    if ($Config.schemaVersion -ne 5 -or
-        $Config.kind -cne 'private-canary-signed-intake' -or
+        [Collections.IDictionary]$Registry,
+        [ValidateSet('FourRule', 'CoverageOnly')][string]$Mode)
+    $coverage = $Mode -ceq 'CoverageOnly'
+    $expectedRules = if ($coverage) {
+        @('bpm-test-class-coverage@2', 'bpm-redundant-method-coverage@2')
+    } else { $script:CanaryRules }
+    if ($Config.schemaVersion -ne $(if ($coverage) { 6 } else { 5 }) -or
+        $Config.kind -cne $(if ($coverage) {
+                'private-coverage-only-signed-intake'
+            } else { 'private-canary-signed-intake' }) -or
+        ($coverage -and $Config.mode -cne 'coverage-only') -or
+        (-not $coverage -and $Config.Contains('mode')) -or
         $Config.principalProof -cne 'aad-graph-storage-key-alias-free-v2' -or
         $Intake.schemaVersion -ne 3 -or
         $Intake.principalProof -cne $Config.principalProof -or
@@ -88,13 +97,21 @@ function Assert-PrivateCanaryConfig {
         (ConvertTo-AgentCanonicalJson -InputObject $Config.expectedAccount) -cne
             (ConvertTo-AgentCanonicalJson -InputObject $ProviderConfig.expectedAccount) -or
         $Config.receiptDigest -cne $Registry.receiptDigest -or
-        $Registry.schemaVersion -ne 5 -or
+        $Registry.schemaVersion -ne $(if ($coverage) { 6 } else { 5 }) -or
+        $Registry.kind -cne $(if ($coverage) {
+                'verified-coverage-only-canary-registry'
+            } else { 'verified-read-only-canary-registry' }) -or
+        ($coverage -and $Registry.mode -cne 'coverage-only') -or
         $Registry.sourceAuthority -cne $Config.sourceAuthority -or
         $Registry.state -cne 'verified-not-evaluated' -or
         $Registry.evaluated -cne $false -or
         $Registry.writerEligible -cne $false -or
         $Registry.providerWrites -ne 0 -or
-        $Config.rules -isnot [array] -or $Config.rules.Count -ne 4 -or
+        $Registry.rules.Count -ne $expectedRules.Count -or
+        $Config.rules -isnot [array] -or
+        $Config.rules.Count -ne $expectedRules.Count -or
+        $Intake.rules -isnot [array] -or
+        $Intake.rules.Count -ne $expectedRules.Count -or
         $Config.heads -isnot [array] -or
         $Config.heads.Count -lt 1 -or $Config.heads.Count -gt 2 -or
         $Config.limits -isnot [Collections.IDictionary] -or
@@ -106,10 +123,19 @@ function Assert-PrivateCanaryConfig {
         throw 'canary-config-invalid'
     }
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $intakeSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($rule in $Intake.rules) {
+        if ($rule -isnot [Collections.IDictionary] -or
+            [string]$rule.id -cnotin $expectedRules -or
+            [string]$rule.capability -cne [string]$rule.id -or
+            -not $intakeSeen.Add([string]$rule.id)) {
+            throw 'canary-rule-binding-invalid'
+        }
+    }
     foreach ($binding in $Config.rules) {
         $id = [string]$binding.capabilityId
         $source = $Registry.rules[$id]
-        if ($id -cnotin $script:CanaryRules -or -not $seen.Add($id) -or
+        if ($id -cnotin $expectedRules -or -not $seen.Add($id) -or
             $binding.enabled -cne $false -or $binding.evaluated -cne $false -or
             $binding.writerEligible -cne $false -or
             $source -isnot [Collections.IDictionary] -or
@@ -118,11 +144,16 @@ function Assert-PrivateCanaryConfig {
             $binding.sourceAuthority -cne $source.sourceAuthority -or
             $binding.sourceCommit -cne $source.sourceCommit -or
             $binding.sourceHash -cne $source.sourceHash -or
-            $binding.declarationDigest -cne $source.declarationDigest) {
+            $binding.declarationDigest -cne $source.declarationDigest -or
+            ($coverage -and ($binding.policyLineHash -cne
+                    $source.policyLineHash -or
+                [string]$binding.policyLineHash -cnotmatch
+                    '^v1:sha256:[a-f0-9]{64}$'))) {
             throw 'canary-rule-binding-invalid'
         }
     }
-    if ($seen.Count -ne 4 -or
+    if ($seen.Count -ne $expectedRules.Count -or
+        $intakeSeen.Count -ne $expectedRules.Count -or
         $Registry.rules['bpm-test-class-coverage@2'].declarationDigest -ceq
             $Registry.rules['bpm-redundant-method-coverage@2'].declarationDigest -or
         $Intake.projectEvidence.enabled -cne $true -or
@@ -160,6 +191,7 @@ function Invoke-PrivateCanaryEvaluation {
         [string]$MergedPinKey,
         [scriptblock]$Read,
         [scriptblock]$Provider,
+        [ValidateSet('FourRule', 'CoverageOnly')][string]$Mode = 'FourRule',
         [switch]$Run
     )
     if (-not $Run) {
@@ -185,6 +217,11 @@ function Invoke-PrivateCanaryEvaluation {
     $config = Read-PrivateCanaryFile $root 'canary-dispatcher.json'
     $key = Read-PrivateCanaryFile $root 'signature.key' 128 -Text
     Assert-PrivateCanarySignature $config $key
+    if (($Mode -ceq 'CoverageOnly' -and
+            $config.mode -cne 'coverage-only') -or
+        ($Mode -ceq 'FourRule' -and $config.Contains('mode'))) {
+        throw 'canary-mode-invalid'
+    }
     $providerConfig = Read-PrivateCanaryFile $root 'provider-config.json'
     $sources = Read-PrivateCanaryFile $root 'approved-sources.json'
     $intakeConfig = Read-PrivateCanaryFile $root 'canary-intake.json'
@@ -207,6 +244,7 @@ function Invoke-PrivateCanaryEvaluation {
     }
     $registryArgs = @{ ProviderConfig = $providerConfig
         ApprovedSources = $sources; RepositoryRoot = $RepositoryRoot
+        Mode = $Mode
         ExpectedAccountUniqueName = $ExpectedAccountUniqueName
         SourceSelector = $SourceSelector
         SourceSelectorKey = $SourceSelectorKey
@@ -218,7 +256,8 @@ function Invoke-PrivateCanaryEvaluation {
     } else {
         Invoke-PrivateCanaryRuleRegistry @registryArgs -BearerSession $session
     }
-    Assert-PrivateCanaryConfig $config $intakeConfig $providerConfig $registry
+    Assert-PrivateCanaryConfig $config $intakeConfig $providerConfig `
+        $registry $Mode
     $intakeRoot = Resolve-AgentTrustedRoot `
         -Path (Join-Path $root 'active-pr-intake-v1') -Kind durable-state `
         -RepositoryRoot $RepositoryRoot
@@ -413,7 +452,11 @@ function Invoke-PrivateCanaryEvaluation {
                 $declaration $reviewerAdoUniqueName)
         $evaluations = [Collections.Generic.List[object]]::new()
         $findingCount = 0
-        foreach ($ruleId in $script:CanaryRules) {
+        $activeRules = if ($Mode -ceq 'CoverageOnly') {
+            @('bpm-test-class-coverage@2',
+                'bpm-redundant-method-coverage@2')
+        } else { $script:CanaryRules }
+        foreach ($ruleId in $activeRules) {
             if ($ruleId -ceq 'bpm-test-ownership@1') {
                 $evaluations.Add([ordered]@{ capabilityId = $ruleId
                     status = 'unknown'; reason = 'owner-not-evaluated'
@@ -483,6 +526,16 @@ function Invoke-PrivateCanaryEvaluation {
                 } else { [Math]::Max(1, [int]$evaluation.unknown) }
             })
         }
+        if ($Mode -ceq 'CoverageOnly') {
+            foreach ($unreviewedRuleId in @('bpm-test-ownership@1',
+                    'bpm-named-areequal-arguments@1')) {
+                $evaluations.Add([ordered]@{
+                    capabilityId = $unreviewedRuleId; status = 'unknown'
+                    reason = 'not-attempted'; findings = $null
+                    humanCovered = 0; wouldCreate = 0; unknown = 1
+                })
+            }
+        }
         $after = & $readOnly Discussions @{
             pullRequestId = $id; iterationId = $declaration.iterationId
         }
@@ -495,7 +548,12 @@ function Invoke-PrivateCanaryEvaluation {
         Assert-PrivateCanaryHead (& $readOnly Head @{ pullRequestId = $id }) $declaration
         $results.Add([ordered]@{ pullRequestId = $id; rules = @($evaluations.ToArray()) })
     }
-    $summary = @($script:CanaryRules | ForEach-Object {
+    $summaryRules = if ($Mode -ceq 'CoverageOnly') {
+        @('bpm-test-class-coverage@2',
+            'bpm-redundant-method-coverage@2',
+            'bpm-test-ownership@1', 'bpm-named-areequal-arguments@1')
+    } else { $script:CanaryRules }
+    $summary = @($summaryRules | ForEach-Object {
             $ruleId = $_
             $entries = @($results | ForEach-Object {
                     @($_.rules | Where-Object capabilityId -CEQ $ruleId)
@@ -508,6 +566,16 @@ function Invoke-PrivateCanaryEvaluation {
             }
             [ordered]@{
                 capabilityId = $ruleId
+                status = if ($Mode -ceq 'CoverageOnly' -and $ruleId -cin @(
+                        'bpm-test-ownership@1',
+                        'bpm-named-areequal-arguments@1')) {
+                    'unknown'
+                } else { 'candidate-only' }
+                reason = if ($Mode -ceq 'CoverageOnly' -and $ruleId -cin @(
+                        'bpm-test-ownership@1',
+                        'bpm-named-areequal-arguments@1')) {
+                    'not-attempted'
+                } else { '' }
                 evaluated = @($entries | Where-Object status -CEQ 'evaluated').Count
                 unknown = @($entries | Where-Object status -CEQ 'unknown').Count
                 humanCovered = $humanCovered
@@ -521,8 +589,30 @@ function Invoke-PrivateCanaryEvaluation {
         (ConvertTo-AgentCanonicalJson -InputObject $identity)) {
         throw 'canary-principal-drift'
     }
+    if ($Mode -ceq 'CoverageOnly') {
+        $finalRegistry = if ($Read) {
+            New-VerifiedCanaryRuleRegistry @registryArgs
+        } else {
+            Invoke-PrivateCanaryRuleRegistry @registryArgs `
+                -BearerSession $session
+        }
+        $reads.count += [int]$finalRegistry.providerReads
+        if ($reads.count -gt [int]$config.limits.maxReads -or
+            $clock.Elapsed.TotalSeconds -ge [int]$config.limits.maxSeconds -or
+            $finalRegistry.receiptDigest -cne $registry.receiptDigest -or
+            (ConvertTo-AgentCanonicalJson $finalRegistry.rules) -cne
+                (ConvertTo-AgentCanonicalJson $registry.rules)) {
+            throw 'canary-source-drift'
+        }
+    }
     return [ordered]@{
-        schemaVersion = 5; kind = 'private-canary-read-only-evaluation'
+        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 6 } else { 5 }
+        kind = if ($Mode -ceq 'CoverageOnly') {
+            'private-coverage-only-read-only-evaluation'
+        } else { 'private-canary-read-only-evaluation' }
+        mode = if ($Mode -ceq 'CoverageOnly') {
+            'coverage-only'
+        } else { 'four-rule' }
         state = 'merged-master-read-only'
         sourceAuthority = 'merged-master-verified-read-only'
         intakeGeneration = $intake.generation

@@ -1286,7 +1286,10 @@ function Invoke-BoundedCandidateParser {
         -RuleRepositoryId $Rule.repositoryId -RulePath $Rule.path `
         -RuleCommit $Rule.commit -RuleSection $Rule.section `
         -RuleHash $Rule.hash -RuleLength $Rule.length `
-        -ConfigId $(if ($Dispatcher.schemaVersion -eq 5) {
+        -ConfigId $(if ($Dispatcher['mode'] -ceq 'coverage-only' -and
+                $Dispatcher.schemaVersion -eq 6) {
+                'private-coverage-only-canary-v1'
+            } elseif ($Dispatcher.schemaVersion -eq 5) {
                 'private-merged-master-canary-v1'
             } else { 'private-canary-signed-intake-v1' }) `
         -ConfigDigest ('v1:sha256:' + (Get-RuleTextDigest (

@@ -16,6 +16,7 @@ param(
     [string]$MergedPinPath,
     [string]$MergedPinKeyPath,
     [string]$AzureCliPath = 'az',
+    [ValidateSet('FourRule', 'CoverageOnly')][string]$Mode = 'FourRule',
     [switch]$Run
 )
 Set-StrictMode -Version Latest
@@ -35,4 +36,4 @@ $merged = if ($Run) {
 Invoke-PrivateCanaryEvaluation -StateRoot $StateRoot -RepositoryRoot $repo `
     -SourceSelector $source.selector -SourceSelectorKey $source.key `
     -MergedPinEnvelope $merged.envelope -MergedPinKey $merged.key `
-    -AzureCliPath $AzureCliPath -Run:$Run | ConvertTo-Json -Depth 16
+    -AzureCliPath $AzureCliPath -Mode $Mode -Run:$Run | ConvertTo-Json -Depth 16

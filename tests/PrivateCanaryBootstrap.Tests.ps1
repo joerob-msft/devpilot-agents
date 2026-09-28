@@ -43,6 +43,7 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
                request.RequestUri.AbsolutePath != "/example-org/_apis/graph/storagekeys/aad.synthetic")))) {
             throw new InvalidOperationException("unbound synthetic GET");
         }
+
         Paths.Add(request.RequestUri.AbsoluteUri);
         if (FailTransport) {
             throw new HttpRequestException("private transport detail");
@@ -497,7 +498,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         } $Case.root $repo $Selector $PullRequestId $DocumentPath `
             $Case.provider
     }
-    function Invoke-BootstrapCase($Case) {
+    function Invoke-BootstrapCase($Case, [switch]$CoverageOnly) {
         Invoke-PrivateCanaryBootstrap -Organization $script:sourceOrg `
             -ProjectName 'ExampleProject' -RepositoryName 'ExampleRepo' `
             -SourceSelector $script:sourceSelector `
@@ -505,13 +506,14 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             -MergedPinEnvelope $script:mergedEnvelope `
             -MergedPinKey $script:mergedKey `
             -ExpectedAccountUniqueName 'service@example.invalid' `
-            -StateRoot $Case.root -RepositoryRoot $repo -Read $Case.provider -Run
+            -StateRoot $Case.root -RepositoryRoot $repo -Read $Case.provider `
+            -Mode $(if ($CoverageOnly) { 'CoverageOnly' } else { 'FourRule' }) -Run
     }
     function Get-RegistryCase {
-        param([switch]$MissingUniqueName)
+        param([switch]$MissingUniqueName, [switch]$CoverageOnly)
         $case = Get-BootstrapCase
         if ($MissingUniqueName) { $case.state.wrong = 'missing-unique-name' }
-        [void](Invoke-BootstrapCase $case)
+        [void](Invoke-BootstrapCase $case -CoverageOnly:$CoverageOnly)
         return @{
             case = $case
             config = Get-Content -LiteralPath (
@@ -530,11 +532,16 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             -SourceSelectorKey $script:sourceKey `
             -MergedPinEnvelope $script:mergedEnvelope `
             -MergedPinKey $script:mergedKey `
-            -ExpectedAccountUniqueName 'service@example.invalid' -Run
+            -ExpectedAccountUniqueName 'service@example.invalid' `
+            -Mode $(if ($InputCase.sources.mode -ceq 'coverage-only') {
+                    'CoverageOnly'
+                } else { 'FourRule' }) -Run
     }
     function Get-SignedIntakeCase {
-        param([switch]$Code, [switch]$MissingUniqueName)
-        $inputCase = Get-RegistryCase -MissingUniqueName:$MissingUniqueName
+        param([switch]$Code, [switch]$MissingUniqueName,
+            [switch]$CoverageOnly)
+        $inputCase = Get-RegistryCase -MissingUniqueName:$MissingUniqueName `
+            -CoverageOnly:$CoverageOnly
         $root = $inputCase.case.root + '-signed'
         $script:roots.Add($root)
         $state = @{
@@ -757,7 +764,10 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             -MergedPinEnvelope $script:mergedEnvelope `
             -MergedPinKey $script:mergedKey `
             -ExpectedAccountUniqueName 'service@example.invalid' `
-            -Read $Case.read -Provider $Case.provider -Run
+            -Read $Case.read -Provider $Case.provider `
+            -Mode $(if ($Case.input.sources.mode -ceq 'coverage-only') {
+                    'CoverageOnly'
+                } else { 'FourRule' }) -Run
     }
     function Invoke-RunnerCase($Case) {
         Invoke-PrivateCanaryEvaluation -StateRoot $Case.root `
@@ -766,7 +776,10 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             -MergedPinEnvelope $script:mergedEnvelope `
             -MergedPinKey $script:mergedKey `
             -ExpectedAccountUniqueName 'service@example.invalid' `
-            -RepositoryRoot $repo -Read $Case.read -Provider $Case.provider -Run
+            -RepositoryRoot $repo -Read $Case.read -Provider $Case.provider `
+            -Mode $(if ($Case.input.sources.mode -ceq 'coverage-only') {
+                    'CoverageOnly'
+                } else { 'FourRule' }) -Run
     }
     function New-RunnerThread($Case, [int]$Id, [string]$Body,
         [switch]$Outdated) {
@@ -3186,5 +3199,192 @@ Describe 'Read-only private canary input bootstrap' {
             }
             finally { $client.Dispose() }
         }
+    }
+}
+
+Describe 'Coverage-only signed read-only canary' {
+    It 'keeps coverage entry points disabled without ADO or state' {
+        $c = Get-BootstrapCase
+        (Invoke-PrivateCanaryBootstrap -Organization $script:sourceOrg `
+            -ProjectName 'ExampleProject' -RepositoryName 'ExampleRepo' `
+            -ExpectedAccountUniqueName 'service@example.invalid' `
+            -StateRoot $c.root -RepositoryRoot $repo `
+            -Mode CoverageOnly).state | Should -Be 'disabled'
+        (New-VerifiedCanaryRuleRegistry -ProviderConfig @{} `
+            -ApprovedSources @{} -RepositoryRoot $repo `
+            -Mode CoverageOnly).state | Should -Be 'disabled'
+        (Invoke-PrivateCanarySignedIntake -ProviderConfig @{} `
+            -ApprovedSources @{} -StateRoot $c.root `
+            -RepositoryRoot $repo -CanaryPullRequestIds @(7) `
+            -Mode CoverageOnly).state | Should -Be 'disabled'
+        (Invoke-PrivateCanaryEvaluation -StateRoot $c.root `
+            -RepositoryRoot $repo -Mode CoverageOnly).state | Should -Be 'disabled'
+        $c.state.reads.Count | Should -Be 0
+        Test-Path $c.root | Should -BeFalse
+    }
+    It 'requires a separately reviewed pin before GET or private root' {
+        $c = Get-BootstrapCase
+        $module = Get-Module DevPilot.ActivePrCanary
+        $saved = & $module { $script:ApprovedMergedPinSignature }
+        try {
+            & $module { $script:ApprovedMergedPinSignature = $null }
+            { Invoke-BootstrapCase $c -CoverageOnly } |
+                Should -Throw '*merged-master-pin-unavailable*'
+            $c.state.reads.Count | Should -Be 0
+            Test-Path $c.root | Should -BeFalse
+        }
+        finally {
+            & $module {
+                param($Value)
+                $script:ApprovedMergedPinSignature = $Value
+            } $saved
+        }
+    }
+    It 'prepares exactly two independently hashed receipts without Owner approval' {
+        $c = Get-BootstrapCase
+        $module = Get-Module DevPilot.ActivePrCanary
+        & $module { $script:OwnerSourceReviewedInApprovedRepository = $false }
+        $result = Invoke-BootstrapCase $c -CoverageOnly
+        $result.state | Should -Be 'coverage-sources-prepared-read-only'
+        $result.ruleCount | Should -Be 2
+        $sources = Get-Content (Join-Path $c.root 'approved-sources.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $sources.schemaVersion | Should -Be 7
+        $sources.mode | Should -Be 'coverage-only'
+        $sources.rules.Count | Should -Be 2
+        $sources.rules.Contains('bpm-test-ownership@1') | Should -BeFalse
+        $sources.rules.Contains('bpm-named-areequal-arguments@1') |
+            Should -BeFalse
+        $sources.rules['bpm-test-class-coverage@2'].policyLineHash |
+            Should -Not -Be $sources.rules['bpm-redundant-method-coverage@2'].policyLineHash
+        $sources.rules['bpm-test-class-coverage@2'].declarationDigest |
+            Should -Not -Be $sources.rules['bpm-redundant-method-coverage@2'].declarationDigest
+        (Get-Content (Join-Path $c.root 'provider-config.json') -Raw) |
+            Should -Not -Match 'service@example.invalid'
+        $c.state.reads[-1] | Should -Be 'GraphStorageKey'
+    }
+    It 'rejects source and identity drift before coverage receipt creation' {
+        foreach ($failure in @('merge-content', 'master-content',
+                'master-ref-drift', 'graph-upn', 'storage-key', 'principal-final')) {
+            $c = Get-BootstrapCase
+            $c.state.wrong = $failure
+            { Invoke-BootstrapCase $c -CoverageOnly } |
+                Should -Throw -Because $failure
+            Test-Path $c.root | Should -BeFalse
+        }
+    }
+    It 'rejects injected or swapped receipts without validating Owner/Named' {
+        foreach ($failure in @('extra', 'swap', 'line', 'old-version')) {
+            $c = Get-RegistryCase -CoverageOnly
+            switch ($failure) {
+                extra { $c.sources.rules['bpm-test-ownership@1'] = @{
+                        approved = $true } }
+                swap {
+                    $a = $c.sources.rules['bpm-test-class-coverage@2']
+                    $a.declarationDigest =
+                        $c.sources.rules['bpm-redundant-method-coverage@2'].declarationDigest
+                }
+                line {
+                    $c.sources.rules['bpm-test-class-coverage@2'].policyLineHash =
+                        'v1:sha256:' + ('a' * 64)
+                }
+                'old-version' { $c.sources.schemaVersion = 6 }
+            }
+            { Invoke-RegistryCase $c } | Should -Throw -Because $failure
+        }
+    }
+    It 'signs a two-rule intake and evaluates only coverage rules' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        $result = Invoke-SignedIntakeCase $c
+        $result.signed | Should -BeTrue
+        $result.rules.Count | Should -Be 4
+        $config = Get-Content (Join-Path $c.root 'canary-dispatcher.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $config.schemaVersion | Should -Be 6
+        $config.mode | Should -Be 'coverage-only'
+        $config.rules.Count | Should -Be 2
+        $config.rules[0].policyLineHash | Should -Match '^v1:sha256:'
+        $config.writerEligible | Should -BeFalse
+        $evaluated = Invoke-RunnerCase $c
+        $evaluated.kind | Should -Be 'private-coverage-only-read-only-evaluation'
+        $evaluated.modelToolInvocations | Should -Be 0
+        $evaluated.providerWrites | Should -Be 0
+        $evaluated.writerEligible | Should -BeFalse
+        ($evaluated.rules | Where-Object {
+                $_.capabilityId -ceq 'bpm-test-class-coverage@2'
+            }).wouldCreate | Should -Be 2
+        @($evaluated.rules | Where-Object {
+                $_.capabilityId -in @('bpm-test-ownership@1',
+                    'bpm-named-areequal-arguments@1') -and
+                ($_.unknown -ne $evaluated.selected -or
+                    $_.evaluated -ne 0 -or $_.wouldCreate -ne 0 -or
+                    $_.reason -cne 'not-attempted' -or
+                    $_.status -cne 'unknown')
+            }).Count | Should -Be 0
+    }
+    It 'does not promote a legacy marker or a forged config to coverage authority' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        [void](Invoke-SignedIntakeCase $c)
+        $c.state.threads = @((New-RunnerThread $c 1 `
+            ('<!-- devpilot-test-class-coverage:v1:' + ('a' * 64) + ' -->')))
+        $result = Invoke-RunnerCase $c
+        ($result.rules | Where-Object {
+                $_.capabilityId -ceq 'bpm-test-class-coverage@2'
+            }).wouldCreate | Should -Be 0
+        ($result.rules | Where-Object {
+                $_.capabilityId -ceq 'bpm-test-class-coverage@2'
+            }).unknown | Should -BeGreaterThan 0
+        Sign-RunnerConfig $c { param($config)
+            $config.rules += @{
+                capabilityId = 'bpm-test-ownership@1'; enabled = $false
+                evaluated = $false; writerEligible = $false } }
+        { Invoke-RunnerCase $c } | Should -Throw
+    }
+    It 'rejects incomplete graph and throttles before state creation' {
+        foreach ($failure in @('unknown-project', 'throttle-changes',
+                'split-page', 'stale-head', 'alias-added', 'late-head')) {
+            $c = Get-SignedIntakeCase -Code -CoverageOnly
+            $c.state.wrong = $failure
+            { Invoke-SignedIntakeCase $c } | Should -Throw
+            Test-Path $c.root | Should -BeFalse
+        }
+    }
+    It 'rejects signature tampering before runner GET and head/discussion drift' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        [void](Invoke-SignedIntakeCase $c)
+        Set-RunnerFile $c 'canary-dispatcher.json' {
+            param($config)
+            $config.writerEligible = $true
+        }
+        $c.state.calls.Clear()
+        { Invoke-RunnerCase $c } | Should -Throw '*canary-signature-invalid*'
+        $c.state.calls.Count | Should -Be 0
+        Sign-RunnerConfig $c {
+            param($config)
+            $config.writerEligible = $false
+        }
+        $c.state.wrong = 'stale-head'
+        { Invoke-RunnerCase $c } | Should -Throw
+        $c.state.wrong = 'discussion-drift'
+        $c.state.threads = @(New-RunnerThread $c 1 'Exclude from code coverage.')
+        $c.state.discussionVisits = 0
+        { Invoke-RunnerCase $c } | Should -Throw '*canary-discussion-drift*'
+    }
+    It 'rechecks current merged source after evaluating the selected heads' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        [void](Invoke-SignedIntakeCase $c)
+        $previous = $c.read
+        $source = $c.input.case.state
+        $provider = $c.state
+        $baseline = $provider.discussionVisits
+        $c.read = {
+            param($op, $request)
+            if ($provider.discussionVisits -ge ($baseline + 4)) {
+                $source.wrong = 'master-ref-drift'
+            }
+            & $previous $op $request
+        }.GetNewClosure()
+        { Invoke-RunnerCase $c } | Should -Throw
+        $provider.discussionVisits | Should -Be ($baseline + 4)
     }
 }
