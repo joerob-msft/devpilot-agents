@@ -246,7 +246,10 @@ function Format-TestClassCoverageComment {
     )
     $candidate = [string]$request.CapabilityId -ceq 'bpm-test-class-coverage@2'
     $classKind = if ($candidate) { 'test-project' } else { 'MSTest' }
-    $authority = if ($candidate) {
+    $authority = if ($candidate -and
+        $request.ConfigId -ceq 'private-merged-master-canary-v1') {
+        'Reviewed merged-master read-only convention'
+    } elseif ($candidate) {
         'Reviewed unmerged candidate-only convention'
     } else { 'User-approved convention' }
     return @(
@@ -349,7 +352,10 @@ function Format-RedundantMethodCoverageComment {
         ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
     $candidate = [string]$request.CapabilityId -ceq 'bpm-redundant-method-coverage@2'
     $classKind = if ($candidate) { 'test-project' } else { 'MSTest' }
-    $authority = if ($candidate) {
+    $authority = if ($candidate -and
+        $request.ConfigId -ceq 'private-merged-master-canary-v1') {
+        'Reviewed merged-master read-only convention'
+    } elseif ($candidate) {
         'Reviewed unmerged candidate-only convention'
     } else { 'User-approved convention' }
     return @(

@@ -62,17 +62,20 @@ function Assert-PrivateCanaryConfig {
     param([Collections.IDictionary]$Config, [Collections.IDictionary]$Intake,
         [Collections.IDictionary]$ProviderConfig,
         [Collections.IDictionary]$Registry)
-    if ($Config.schemaVersion -ne 2 -or
+    if ($Config.schemaVersion -ne 4 -or
         $Config.kind -cne 'private-canary-signed-intake' -or
-        $Config.principalProof -cne 'aad-graph-storage-key-v1' -or
-        $Intake.schemaVersion -ne 2 -or
+        $Config.principalProof -cne 'aad-graph-storage-key-alias-free-v2' -or
+        $Intake.schemaVersion -ne 3 -or
         $Intake.principalProof -cne $Config.principalProof -or
-        $ProviderConfig.operator.expectedCliUpn -ine
-            [string]$Config.expectedAccount.principalName -or
+        $ProviderConfig.Contains('operator') -or
+        $Config.expectedAccount -isnot [Collections.IDictionary] -or
+        $Config.expectedAccount.Count -ne 2 -or
+        -not $Config.expectedAccount.Contains('id') -or
+        -not $Config.expectedAccount.Contains('descriptor') -or
         $Config.enabled -cne $false -or $Config.readOnly -cne $true -or
         $Config.dryRun -cne $true -or $Config.writerEligible -cne $false -or
         $Config.modelEnabled -cne $false -or
-        $Config.sourceAuthority -cne 'unmerged-reviewed-pr-is-candidate-only' -or
+        $Config.sourceAuthority -cne 'merged-master-verified-read-only' -or
         $Config.organization -cne $Intake.organization -or
         $Config.organization -cne
             "https://dev.azure.com/$($ProviderConfig.repository.organization)" -or
@@ -85,7 +88,8 @@ function Assert-PrivateCanaryConfig {
         (ConvertTo-AgentCanonicalJson -InputObject $Config.expectedAccount) -cne
             (ConvertTo-AgentCanonicalJson -InputObject $ProviderConfig.expectedAccount) -or
         $Config.receiptDigest -cne $Registry.receiptDigest -or
-        $Registry.schemaVersion -ne 2 -or
+        $Registry.schemaVersion -ne 4 -or
+        $Registry.sourceAuthority -cne $Config.sourceAuthority -or
         $Registry.state -cne 'verified-not-evaluated' -or
         $Registry.evaluated -cne $false -or
         $Registry.writerEligible -cne $false -or
@@ -149,6 +153,7 @@ function Invoke-PrivateCanaryEvaluation {
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [string]$AzureCliPath = 'az',
+        [string]$ExpectedAccountUniqueName,
         [scriptblock]$Read,
         [scriptblock]$Provider,
         [switch]$Run
@@ -175,6 +180,11 @@ function Invoke-PrivateCanaryEvaluation {
     if ([bool]$Read -ne [bool]$Provider) {
         throw 'bound-transport-invalid'
     }
+    if (-not $Read) {
+        $ExpectedAccountUniqueName = Get-CanaryWorkAccountUpn $AzureCliPath
+    } elseif ($ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+        throw 'canary-work-account-unavailable'
+    }
     $session = $null
     try {
     if (-not $Read) {
@@ -185,7 +195,8 @@ function Invoke-PrivateCanaryEvaluation {
         } $RepositoryRoot $AzureCliPath
     }
     $registryArgs = @{ ProviderConfig = $providerConfig
-        ApprovedSources = $sources; RepositoryRoot = $RepositoryRoot; Run = $true }
+        ApprovedSources = $sources; RepositoryRoot = $RepositoryRoot
+        ExpectedAccountUniqueName = $ExpectedAccountUniqueName; Run = $true }
     if ($Read) { $registryArgs.Read = $Read }
     $registry = if ($Read) {
         New-VerifiedCanaryRuleRegistry @registryArgs
@@ -252,7 +263,7 @@ function Invoke-PrivateCanaryEvaluation {
     if (-not $Provider) {
         $Provider = New-ActivePrAzureDevOpsProvider -Config $intakeConfig `
             -BearerToken $session.token -BoundClient $session.client `
-            -VerifyReadPrincipal
+            -VerifyReadPrincipal -ExpectedPrincipalName $ExpectedAccountUniqueName
     }
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $reads = [pscustomobject]@{ count = [int]$registry.providerReads }
@@ -286,16 +297,15 @@ function Invoke-PrivateCanaryEvaluation {
     $identity = & $readOnly Identity @{}
     if ([string]$identity.id -ine [string]$config.expectedAccount.id -or
         [string]$identity.descriptor -cne [string]$config.expectedAccount.descriptor -or
-        [string]$identity.principalName -ine
-            [string]$config.expectedAccount.principalName -or
-        ($identity.Contains('uniqueName') -ne
-            $config.expectedAccount.Contains('uniqueName')) -or
-        ($config.expectedAccount.Contains('uniqueName') -and
-            [string]$identity.uniqueName -ine
-                [string]$config.expectedAccount.uniqueName)) {
+        [string]$identity.principalName -ine $ExpectedAccountUniqueName -or
+        ($identity.Contains('uniqueName') -and
+            [string]$identity.uniqueName -ine $ExpectedAccountUniqueName)) {
         throw 'canary-principal-drift'
     }
     $results = [Collections.Generic.List[object]]::new()
+    $reviewerAdoUniqueName = if ($identity.Contains('uniqueName')) {
+        [string]$identity.uniqueName
+    } else { $null }
     foreach ($head in $selected) {
         $declaration = $head.declaration
         $id = [int]$head.pullRequestId
@@ -384,7 +394,8 @@ function Invoke-PrivateCanaryEvaluation {
         $discussion = & $readOnly Discussions @{
             pullRequestId = $id; iterationId = $declaration.iterationId
         }
-        [void](Get-ActivePrDiscussionCounts $discussion $intakeConfig $declaration)
+        [void](Get-ActivePrDiscussionCounts $discussion $intakeConfig `
+                $declaration $reviewerAdoUniqueName)
         $evaluations = [Collections.Generic.List[object]]::new()
         $findingCount = 0
         foreach ($ruleId in $script:CanaryRules) {
@@ -408,12 +419,12 @@ function Invoke-PrivateCanaryEvaluation {
                 length = if ($ruleId -ceq 'bpm-named-areequal-arguments@1') {
                     ([IO.File]::ReadAllBytes(
                             (Join-Path $RepositoryRoot $source.path))).Length
-                } else { 16286 }
+                } else { [int]$source.documentLength }
                 declarationDigest = $registryRule.declarationDigest
             }
             $evaluation = Invoke-BoundedCandidateParser $config $binding `
                 $declaration $files.ToArray() $discussion $intakeConfig `
-                ([int]$config.limits.maxFindingsPerHead)
+                ([int]$config.limits.maxFindingsPerHead) $reviewerAdoUniqueName
             if ($evaluation.state -cnotin @('evaluated', 'unknown') -or
                 $evaluation.findings -gt [int]$config.limits.maxFindingsPerHead) {
                 throw 'canary-evaluation-invalid'
@@ -460,7 +471,8 @@ function Invoke-PrivateCanaryEvaluation {
         $after = & $readOnly Discussions @{
             pullRequestId = $id; iterationId = $declaration.iterationId
         }
-        [void](Get-ActivePrDiscussionCounts $after $intakeConfig $declaration)
+        [void](Get-ActivePrDiscussionCounts $after $intakeConfig `
+                $declaration $reviewerAdoUniqueName)
         if ((Get-PrivateCanaryDigest $discussion) -cne
             (Get-PrivateCanaryDigest $after)) {
             throw 'canary-discussion-drift'
@@ -495,9 +507,9 @@ function Invoke-PrivateCanaryEvaluation {
         throw 'canary-principal-drift'
     }
     return [ordered]@{
-        schemaVersion = 2; kind = 'private-canary-read-only-evaluation'
-        state = 'candidate-only-read-only'
-        sourceAuthority = 'unmerged-reviewed-pr-is-candidate-only'
+        schemaVersion = 4; kind = 'private-canary-read-only-evaluation'
+        state = 'merged-master-read-only'
+        sourceAuthority = 'merged-master-verified-read-only'
         intakeGeneration = $intake.generation
         selected = $results.Count
         draft = [int]$intake.inventory.draft

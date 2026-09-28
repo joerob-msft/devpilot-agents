@@ -157,12 +157,47 @@ The CLI validates its fixed, Int64-safe JSON result before emitting it; it
 does not persist observations. An uncaptured result cannot be reconstructed
 by retrying under an exhausted GET authorization.
 
+`tools/Discover-PrivateCanaryMergedMaster.ps1` is the separate **default-off,
+stateless discovery** command. With an explicitly authorized single operator
+and `-Run` it uses one freshly acquired bearer for bounded GETs only, checks
+ConnectionData/Graph user/storage-key identity against the in-memory Azure
+CLI user UPN, and attests the completed reviewed PR, immutable merge commit,
+current master ancestry and exact ref, and raw Git item/blob at the reviewed
+candidate commit, merge commit, and current master. The candidate document
+must match the independently reviewed SHA-256 and byte length below. Merge
+and current-master raw bytes must be byte-identical to that candidate, and
+the distinct class/redundant section and policy-line hashes must agree.
+After rechecking PR/ref/identity it returns only immutable commit, blob,
+document, section, line, and recomputed merge-commit declaration digests
+marked `discovered-awaiting-provenance-pin-review`: no path, raw payload,
+account, token, header, private file or state, signing, or write. Any byte
+or section change, incomplete ancestry, drift, or throttle stops without a
+pin; changed content requires separate human review. Identical bytes retain
+the user's reviewed content approval but **do not** automatically establish
+merged provenance or update the pin.
+
+`tools/Invoke-PrivateCanaryMergedPreflight.ps1` is the separate **stateless**
+read-only merged-master source gate, disabled without `-Run`. Its repository-owned
+`MergedMasterPin` is intentionally **unset**: the reported merge is not an
+independently observed and reviewed immutable commit or document digest.
+Until that pin is reviewed and committed, `-Run` fails
+`merged-master-pin-unavailable` before any ADO request. Never populate it
+from a synthetic fixture, from the previously reviewed *source* commit, or
+by assuming a squash/rebase merge preserves its blob bytes. After authorized
+stateless discovery and independent provenance review, update this repo-owned
+pin in a separate commit and rerun exact-head CI. Pin validation requires
+the **same independently reviewed candidate document digest and length**,
+while section/line hashes are verified against those exact bytes and the
+merge-commit-bound declaration digests are recomputed. No live ADO GET or
+private state was used to populate it in this layer.
+
 `tools/Initialize-PrivateActivePrCanaryInputs.ps1` is a **preparation-only**
 bootstrap for the private syntactic canary. It is disabled without `-Run`;
 it requires a new absolute external `-StateRoot`, the expected organization
-slug, BPM project/repository names, and the expected reviewer UPN. These are
-selectors to check, not operator-invented GUIDs or source digests. With
-`-Run`, it acquires one AAD bearer in memory via `az account get-access-token`,
+slug, and BPM project/repository names. The production commands read the
+signed-in Azure CLI **user** account UPN in memory from `az account show`,
+validate its work-account shape, and never print or persist that selector.
+With `-Run`, it acquires one AAD bearer in memory via `az account get-access-token`,
 uses bounded GETs only, and checks the connection identity before and after
 the source reads. Both checks bind the authenticated account GUID and subject
 descriptor to the Graph user (whose principal name must equal the expected
@@ -171,56 +206,64 @@ is optional; if present, it must agree with the expected UPN, and it is never
 invented from the Graph principal name or descriptor. It derives the
 project/repository GUIDs and account ID/descriptor from those GETs. It checks
 the EngHub project/repository
-identity, active PR 17307009's exact source commit against its latest
-iteration and source ref twice, the pinned commit, and raw UTF-8 document
-bytes against both the Git blob object ID and the independently pinned
-section/document digests. The Owner and named-parameters sections are
+identity, completed PR 17307009 targeting `refs/heads/master`, its reviewed
+source commit against the latest iteration, independently pinned immutable
+merge commit, and the current exact master ref/commit. A bounded ancestry
+walk proves the merge commit is reachable from today's master, even when
+master advanced; exhausted or incomplete history is unknown. It reads the
+merge and current-master item and raw UTF-8 Git blobs independently, verifies
+their Git object IDs, and requires byte-identical content matching the
+independent document digest, length and blob pin. Both rule-specific line,
+section and declaration digests must match independent pins. The PR and
+master ref and Graph-bound account are rechecked on the same bearer before
+any state is created; every signed intake and evaluation repeats this source
+proof and final rechecks. A deleted PR source branch is not required, and a
+source SHA is never mistaken for a squash/rebase merge SHA. The Owner and
+named-parameters sections are
 independent approvals at the Owner commit. The class and redundant rules
 have distinct versioned declaration digests for lines 221 and 223 of the
-**unmerged** document; their `headVerified` receipt means only that the
-reviewed PR still pointed to the approved immutable candidate during
-preparation, never that master contains the convention. The named-rule
+**merged** document; their receipts bind both immutable merge commit and
+the current exact master commit. The named-rule
 local policy is bound to the checked-out repository commit and byte-identical
 Git blob, not misidentified as an EngHub or BPM policy. No raw source, token,
 or alias secret is written into the repository or normal command output.
 
 After all checks it creates only `provider-config.json` and
 `approved-sources.json` in a fresh ACL-private external directory. The latter
-is a version 3 four-rule source **receipt** plus a separate named-section
+is a version 5 `private-merged-master-canary-sources` four-rule source
+**receipt** plus a separate named-section
 entry. It is **not** the legacy approval manifest consumed by
 `Invoke-ActivePrCanaryQualification.ps1`. There is no HMAC key, signed
 dispatcher config, intake, canary GET evaluation, model call, or provider
 write in this preparation layer; do not feed these receipts to the old
-`@1`-only command or treat the verified candidate as master authority.
-Actual `@2` registry/dispatcher binding, complete two-pass intake and
-source-bound project graph qualification require the next dependent layer.
-Do not run the private bootstrap until its own and parent exact-head CI
+`@1`-only command. Master provenance is **read-only source authority**, not
+writer permission. Do not run the private bootstrap until its own and parent exact-head CI
 and input provenance have been checked.
 
 `tools/Invoke-PrivateCanaryRuleRegistry.ps1` consumes **only** that
-bootstrap's external ACL-private `provider-config.json` and version 3
+bootstrap's external ACL-private `provider-config.json` and version 5
 `approved-sources.json`. It is disabled without `-Run`; it never creates
 private state, signs configuration, selects PRs, evaluates rules, invokes a
 model, or writes to ADO. When explicitly run after the exact-head CI and
-source gates, it obtains one AAD bearer in memory and performs at most 26
+source gates, it obtains one AAD bearer in memory and performs at most 120
 bounded GETs. It checks the BPM and EngHub identities, independent Owner and
-Named section bytes against their raw Git blobs, the two distinct candidate
-declarations at the immutable EngHub commit, the current reviewed PR's head
-and latest iteration/source ref both before and after the source reads,
+Named section bytes against their raw Git blobs, the two distinct merged
+declarations at the immutable EngHub merge commit and today's master blob,
+the completed PR and exact master ref before and after the source reads,
 the full GUID/descriptor/Graph user/storage key principal proof before and
 after, and the locally pinned Named policy blob.
 It returns four **disabled**, separately digest-bound rule entries and
-`verified-not-evaluated`, not a dispatcher registry or a master-approved
-rule. A receipt field cannot substitute for a fresh read; changed or missing
+`verified-not-evaluated`, not a writer-approved rule. A receipt field cannot
+substitute for a fresh read; changed or missing
 receipts and source drift fail closed. Do not persist or treat this output
 as proof of changed-line evaluation, ownership, thread reconciliation, or
 Owner no-tools execution.
 
 `tools/Invoke-PrivateCanarySignedIntake.ps1` is the **next default-off,
-preparation-only** layer. It accepts only the ACL-private external PR189
-`provider-config.json` and version 3 `approved-sources.json`, a new disjoint
+preparation-only** layer. It accepts only the ACL-private external bootstrap
+`provider-config.json` and version 5 `approved-sources.json`, a new disjoint
 absolute external `-StateRoot`, and one or two explicit `-CanaryPullRequestIds`.
-`-Run` revalidates the PR190 registry and EngHub reviewed PR head/raw blob
+`-Run` revalidates the registry and EngHub merged/current-master blobs
 before and after intake; changes to the receipts or provider identity abort
 signing. The intake provider verifies the CLI/AAD principal and project/repo
 binding, permits only GETs, and requests raw blob/project-tree evidence for
@@ -242,12 +285,28 @@ commits, trees, raw blobs, changes, and discussions, and the final registry
 recheck. No `az devops invoke` credential or descriptor-derived UPN participates
 in this path. Every request is a bounded GET; HTTP throttling stops rather
 than retries, and failures before signing leave no new external state.
-The v2 signed intake/config binds the v3 identity/source receipt and exact
-head/iteration evidence; v1 handoffs cannot be interpreted as these proofs.
+The v4 signed intake/config and registry bind the v5 identity/source receipt
+and exact head/iteration evidence; previous v2/v3 signed handoffs are rejected by the
+runner, not silently promoted to merged authority.
 The independent runner obtains one fresh bearer for its own registry/source
 recheck and subsequent read-only evaluation, not a replay of a bootstrap
 bearer. Its initial and final account proofs must agree with the signed
 immutable identity.
+Only the immutable account GUID and Graph subject descriptor appear in the
+v5 receipt, private provider config, v3 intake config/generation, and v4
+signed dispatcher. The current approved CLI UPN is freshly read into memory
+for **each** bootstrap/registry/signed-intake/runner invocation, checked
+against same-bearer ConnectionData (if it reports `uniqueName`), Graph user
+principal name, and Graph storage-key GUID, and never written to files or
+normal output. No raw UPN, ADO alias, Graph principal name, or unkeyed alias
+hash is included in any signed artifact. During discussion classification
+only an ADO `uniqueName` actually supplied by token-bound ConnectionData is
+passed in memory as the reviewer alias; the CLI UPN/Graph principal name is
+never substituted when that alias is absent. Matching immutable GUID and
+Graph descriptor can establish human coverage without an alias; when a
+verified ADO alias exists, a conflicting author alias remains unknown rather
+than human coverage. Alias presence and value must remain stable within an
+invocation, but need not match an earlier receipt that deliberately omits it.
 
 The two-pass inventory and selected-head changed-line/project-graph evidence
 are assembled in bounded memory. Unknown inventory, incomplete selected
@@ -260,7 +319,7 @@ sign `canary-dispatcher.json` over the repository canonical JSON
 representation. It also writes the exact intake config. The signed handoff
 binds each selected source/target/iteration, changed-line/project-scope
 digests, and four **distinct, disabled** source declarations. The class/redundant
-bindings remain **unmerged candidate-only**. This config has
+bindings have **merged-master read-only** provenance. This config has
 `enabled: false`, `writerEligible: false`, and `modelEnabled: false`; it is
 **not** accepted by the older `@1` dispatcher and must not be enabled or
 hand-signed to bypass the independent `@2` runner. Its output is
@@ -268,7 +327,7 @@ hand-signed to bypass the independent `@2` runner. Its output is
 and Owner unknown. The key and private source stay outside the repository
 and normal output. Do not run this against the private service until this
 layer and its parent stack layers have green checks at their exact heads,
-the source PR head and blob are reconfirmed, and a separately authorized
+the completed source PR, master ref, and both blobs are reconfirmed, and a separately authorized
 operator owns the live GET budget.
 
 `tools/Invoke-PrivateCanaryEvaluation.ps1 -StateRoot <private-external-root>`
@@ -277,9 +336,10 @@ root must be the ACL-private output of the signed-intake tool above, not a
 repository file or a new configuration. On `-Run`, the runner verifies the
 canonical unsigned HMAC, all five private input files, the unchanged
 immutable intake generation, exact selected heads and evidence digests,
-and the freshly verified four-source registry. It rechecks EngHub's live
-unmerged candidate head, commit and raw Git blob; it never promotes that
-candidate to merged policy. The selected active, non-draft master-target
+and the freshly verified four-source registry. It rechecks EngHub's completed
+PR, immutable merge commit, current master ancestry/ref, and both raw Git
+blobs; it never accepts a stale candidate receipt. The selected active,
+non-draft master-target
 heads require current changed spans and complete source-commit-bound
 project-ownership evidence before either `@2` coverage parser can run.
 Named Assert uses its separate local policy binding. Owner is always
@@ -303,11 +363,14 @@ count as human coverage; only an exact current-generation automation marker
 can count as automation. Outdated or duplicate candidates remain unknown.
 The summary reports per-rule `evaluated`, `unknown`, `humanCovered`,
 `wouldCreate`, `pending`, and `skipped`, plus draft exclusions and the
-immutable intake generation. These are hypothetical, candidate-only
+immutable intake generation. These are hypothetical, merged-master
 read-only observations, **not** authority to write, vote, notify, mutate
 policy/tasks, or enable relation. Live private ADO execution remains
 gated on exact-head green CI for this PR and its parents and fresh
 source/head/identity verification; synthetic/local tests are the default.
+No `@2` posting follows from this proof or `wouldCreate`: a distinct signed
+`@2` delivery path, deployment authorization, and current head/discussion
+rechecks would require separate work.
 
 For the existing **private syntactic `@1` canary only**, use
 `tools/Invoke-ActivePrCanaryQualification.ps1` instead of hand-signing a
@@ -366,15 +429,11 @@ may be shared. Use a provider constructed with `-VerifyReadPrincipal`: its
 raw blob verification precedes this allowlist's document, section, and
 declaration checks. No source text is returned or persisted.
 
-This function returns `immutable-candidate-only` and `headVerified: false`.
-The reviewed PR was **not merged**; an immutable commit does not establish
-that it is still the PR's live head or that its policy was merged to master.
-The existing canary does not call this function, accept `@2` in its signed
-registry, or treat these approvals as an `@1` local policy replacement.
-The preparation-only generator above rechecks the PR's live head and immutable
-blob and derives provider IDs, but does **not** adapt the signed read-only
-`@2` registry or prove source-head-bound project ownership. Do not sign a
-dispatcher configuration or run a live ADO canary from its candidate receipt.
+This legacy function returns `immutable-candidate-only` and
+`headVerified: false`. Its reviewed **source** bytes alone do not prove
+current merged master policy. The merged-master bootstrap/registry reject
+its old version 3 candidate receipt; the runner rejects old signed v2
+configs even if re-signed. It does not grant `@1` or `@2` writer authority.
 
 The tool then uses the intake provider's two complete bounded listing passes
 over *all* active PRs, excludes drafts and non-master targets, and pins the
