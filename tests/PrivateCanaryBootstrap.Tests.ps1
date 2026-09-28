@@ -98,6 +98,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
     public List<string> Tokens = new List<string>();
     public bool OmitUniqueName = false;
     public bool DriftStorageKey = false;
+    public bool DriftGraphUpn = false;
     public bool ThrottleInventory = false;
     public bool TooLarge = false;
     public bool DriftRef = false;
@@ -126,7 +127,8 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             body = "{\"authenticatedUser\":{\"id\":\"33333333-3333-3333-3333-333333333333\",\"subjectDescriptor\":\"aad.synthetic\"" +
                 (OmitUniqueName ? "" : ",\"uniqueName\":\"service@example.invalid\"") + "}}";
         } else if (path.EndsWith("/graph/users/aad.synthetic")) {
-            body = "{\"descriptor\":\"aad.synthetic\",\"subjectKind\":\"user\",\"principalName\":\"service@example.invalid\"}";
+            body = "{\"descriptor\":\"aad.synthetic\",\"subjectKind\":\"user\",\"principalName\":\"" +
+                (DriftGraphUpn ? "other@example.invalid" : "service@example.invalid") + "\"}";
         } else if (path.EndsWith("/graph/storagekeys/aad.synthetic")) {
             body = "{\"value\":\"" + (DriftStorageKey
                 ? "44444444-4444-4444-4444-444444444444"
@@ -444,7 +446,8 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
     function Invoke-RegistryCase($InputCase) {
         New-VerifiedCanaryRuleRegistry -ProviderConfig $InputCase.config `
             -ApprovedSources $InputCase.sources -RepositoryRoot $repo `
-            -Read $InputCase.case.provider -Run
+            -Read $InputCase.case.provider `
+            -ExpectedAccountUniqueName 'service@example.invalid' -Run
     }
     function Get-SignedIntakeCase {
         param([switch]$Code, [switch]$MissingUniqueName)
@@ -497,7 +500,17 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             $state.calls.Add($op) | Out-Null
             switch -CaseSensitive ($op) {
                 Identity {
-                    return $config.expectedAccount
+                    $identity = @{ id = $config.expectedAccount.id
+                        descriptor = $config.expectedAccount.descriptor
+                        principalName = if ($state.wrong -eq 'identity-upn') {
+                            'other@example.invalid'
+                        } else { 'service@example.invalid' } }
+                    if (-not $MissingUniqueName) {
+                        $identity.uniqueName = if ($state.wrong -eq 'identity-alias') {
+                            'other@example.invalid'
+                        } else { 'service@example.invalid' }
+                    }
+                    return $identity
                 }
                 ListPage {
                     if ($request.skip -ne 0 -or $request.top -ne 51 -or
@@ -646,10 +659,12 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         Invoke-PrivateCanarySignedIntake -ProviderConfig $Case.input.config `
             -ApprovedSources $Case.input.sources -StateRoot $Case.root `
             -RepositoryRoot $repo -CanaryPullRequestIds @(17007699, 17109075) `
+            -ExpectedAccountUniqueName 'service@example.invalid' `
             -Read $Case.read -Provider $Case.provider -Run
     }
     function Invoke-RunnerCase($Case) {
         Invoke-PrivateCanaryEvaluation -StateRoot $Case.root `
+            -ExpectedAccountUniqueName 'service@example.invalid' `
             -RepositoryRoot $repo -Read $Case.read -Provider $Case.provider -Run
     }
     function New-RunnerThread($Case, [int]$Id, [string]$Body,
@@ -773,7 +788,7 @@ Describe 'Read-only private canary input bootstrap' {
                 -Organization 'example-org' `
                 -ExpectedAccountUniqueName 'service@example.invalid' `
                 -RepositoryRoot $repo -Read $c.provider -Run
-            $result.state | Should -Be 'discovered-awaiting-human-source-review'
+            $result.state | Should -Be 'discovered-awaiting-provenance-pin-review'
             $result.candidateBytesMatch | Should -BeTrue
             $result.proposedPin.mergeCommit | Should -Be ('d' * 40)
             $result.proposedPin.sourceCommit |
@@ -830,6 +845,27 @@ Describe 'Read-only private canary input bootstrap' {
         }
         finally {
             & $module { param($Pin) $script:MergedMasterPin = $Pin } $originalPin
+        }
+    }
+    It 'rejects independently wrong section, line, and declaration pins' {
+        $module = Get-Module DevPilot.ActivePrCanary
+        foreach ($field in @('sectionHash', 'classLineHash',
+                'redundantLineHash', 'classDeclarationDigest',
+                'redundantDeclarationDigest')) {
+            $c = Get-BootstrapCase
+            $originalPin = & $module { @{} + $script:MergedMasterPin }
+            try {
+                & $module {
+                    param($Name)
+                    $script:MergedMasterPin[$Name] = 'v1:sha256:' + 'a' * 64
+                } $field
+                { Invoke-BootstrapCase $c } |
+                    Should -Throw '*merged-master-declaration-drift*' -Because $field
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+            }
+            finally {
+                & $module { param($Pin) $script:MergedMasterPin = $Pin } $originalPin
+            }
         }
     }
     It 'has no live source pin and stops the stateless gate before any GET or state' {
@@ -1000,7 +1036,7 @@ Describe 'Read-only private canary input bootstrap' {
                     'schema-downgrade' {
                         Sign-RunnerConfig $c {
                             param($value)
-                            $value.schemaVersion = 2
+                            $value.schemaVersion = 3
                         }
                     }
                     head { $c.state.wrong = 'stale-head' }
@@ -1020,7 +1056,7 @@ Describe 'Read-only private canary input bootstrap' {
             $c.state.calls.Clear()
             Sign-RunnerConfig $c {
                 param($value)
-                $value.schemaVersion = 2
+                $value.schemaVersion = 3
             }
             { Invoke-RunnerCase $c } | Should -Throw '*canary-config-invalid*'
             $c.state.calls.Count | Should -Be 0
@@ -1140,10 +1176,10 @@ Describe 'Read-only private canary input bootstrap' {
         $signed.state | Should -Be 'signed-intake-not-evaluated'
         $dispatcher = Get-Content (Join-Path $c.root 'canary-dispatcher.json') `
             -Raw | ConvertFrom-Json -AsHashtable
-        $dispatcher.schemaVersion | Should -Be 3
+        $dispatcher.schemaVersion | Should -Be 4
         $dispatcher.expectedAccount.Contains('uniqueName') | Should -BeFalse
         $result = Invoke-RunnerCase $c
-        $result.schemaVersion | Should -Be 3
+        $result.schemaVersion | Should -Be 4
         $result.providerWrites | Should -Be 0
         $result.modelToolInvocations | Should -Be 0
         $c.state.threads = @(New-RunnerThread $c 1 'Exclude from code coverage.')
@@ -1157,6 +1193,12 @@ Describe 'Read-only private canary input bootstrap' {
         $ambiguous = Invoke-RunnerCase $c
         $ambiguous.rules[1].unknown | Should -Be 2
         $ambiguous.rules[1].wouldCreate | Should -Be 0
+        $aliasConflict = New-RunnerThread $c 1 'Exclude from code coverage.'
+        $aliasConflict.comments[0].author.uniqueName = 'other@example.invalid'
+        $c.state.threads = @($aliasConflict)
+        $aliasUnknown = Invoke-RunnerCase $c
+        $aliasUnknown.rules[1].unknown | Should -Be 2
+        $aliasUnknown.rules[1].humanCovered | Should -Be 0
     }
     It 'refuses a half-injected credential path without creating state' {
         $c = Get-SignedIntakeCase
@@ -1257,8 +1299,35 @@ Describe 'Read-only private canary input bootstrap' {
                             -AllowedRoot $c.root -Private)
                 }
             }
+            It 'persists no CLI UPN, Graph principalName, ADO alias, or alias digest' {
+                $c = Get-SignedIntakeCase -Code
+                [void](Invoke-SignedIntakeCase $c)
+                foreach ($root in @($c.input.case.root, $c.root)) {
+                    foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -File) {
+                        $text = [Text.Encoding]::UTF8.GetString(
+                            [IO.File]::ReadAllBytes($file.FullName))
+                        $text | Should -Not -Match `
+                            'service@example.invalid|principalName|uniqueName|expectedCliUpn'
+                    }
+                }
+                $config = Get-Content -LiteralPath (
+                    Join-Path $c.root 'canary-dispatcher.json') -Raw |
+                    ConvertFrom-Json -AsHashtable
+                $config.schemaVersion | Should -Be 4
+                $config.principalProof |
+                    Should -Be 'aad-graph-storage-key-alias-free-v2'
+                $config.expectedAccount.Count | Should -Be 2
+                $config.expectedAccount.Keys | Should -Contain 'id'
+                $config.expectedAccount.Keys | Should -Contain 'descriptor'
+                $intake = Get-Content -LiteralPath (
+                    Join-Path $c.root 'canary-intake.json') -Raw |
+                    ConvertFrom-Json -AsHashtable
+                $intake.schemaVersion | Should -Be 3
+                (Invoke-RunnerCase $c).providerWrites | Should -Be 0
+            }
             It 'refuses split inventory, stale heads, fake graph and forged receipt before signing' {
-                foreach ($failure in @('split-page', 'stale-head', 'fake-graph',
+                foreach ($failure in @('identity-upn', 'identity-alias',
+                        'split-page', 'stale-head', 'fake-graph',
                         'forged-receipt', 'cursor-collision', 'late-head',
                         'provider-drift', 'throttle-final')) {
                     $c = Get-SignedIntakeCase
@@ -1483,7 +1552,7 @@ Describe 'Read-only private canary input bootstrap' {
                 switch ($failure) {
                     schema { $inputCase.sources.schemaVersion = 2 }
                     'previous-v3' {
-                        $inputCase.sources.schemaVersion = 3
+                        $inputCase.sources.schemaVersion = 4
                         $inputCase.sources.kind = 'private-read-only-canary-sources'
                         $inputCase.sources.sourceAuthority =
                             'unmerged-reviewed-pr-is-candidate-only'
@@ -1582,8 +1651,10 @@ Describe 'Read-only private canary input bootstrap' {
         $config.projectId | Should -Be '22222222-2222-2222-2222-222222222222'
         $config.repository.id | Should -Be '11111111-1111-1111-1111-111111111111'
         $config.expectedAccount.descriptor | Should -Be 'aad.synthetic'
-        $config.expectedAccount.principalName | Should -Be 'service@example.invalid'
-        $manifest.schemaVersion | Should -Be 4
+        $config.expectedAccount.Count | Should -Be 2
+        $config.expectedAccount.Contains('principalName') | Should -BeFalse
+        $config.Contains('operator') | Should -BeFalse
+        $manifest.schemaVersion | Should -Be 5
         $manifest.rules.Count | Should -Be 4
         $manifest.namedSection.commit | Should -Be $manifest.rules['bpm-test-ownership@1'].commit
         $manifest.rules['bpm-test-class-coverage@2'].masterCommit |
@@ -2220,6 +2291,47 @@ Describe 'Read-only private canary input bootstrap' {
             $handler.Paths[18] | Should -Match '/trees/'
         }
         finally { $client.Dispose() }
+    }
+    It 'binds alias-free intake v3 to an ephemeral UPN and immutable Graph proof' {
+        $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `
+            -Raw | ConvertFrom-Json -AsHashtable
+        $config.schemaVersion = 3
+        $config.principalProof = 'aad-graph-storage-key-alias-free-v2'
+        $config.expectedAccount = @{
+            id = '33333333-3333-3333-3333-333333333333'
+            descriptor = 'aad.synthetic' }
+        $config.enabled = $true
+        foreach ($mode in @('match', 'upn', 'storage', 'wrong-cli')) {
+            $handler = [CanaryBoundGetHandler]::new()
+            $handler.DriftGraphUpn = $mode -eq 'upn'
+            $handler.DriftStorageKey = $mode -eq 'storage'
+            $client = [Net.Http.HttpClient]::new($handler)
+            try {
+                $expected = if ($mode -eq 'wrong-cli') {
+                    'other@example.invalid'
+                } else { 'service@example.invalid' }
+                $provider = New-ActivePrAzureDevOpsProvider -Config $config `
+                    -BoundClient $client -BearerToken ('b' * 100) `
+                    -ExpectedPrincipalName $expected -VerifyReadPrincipal
+                if ($mode -eq 'match') {
+                    $identity = & $provider Identity @{ timeoutMilliseconds = 5000 }
+                    $identity.id | Should -Be $config.expectedAccount.id
+                    $identity.principalName | Should -Be $expected
+                    $handler.Tokens.Count | Should -Be 3
+                } else {
+                    { & $provider Identity @{ timeoutMilliseconds = 5000 } } |
+                        Should -Throw '*account-mismatch*'
+                }
+                $handler.Paths.Count | Should -Be $(if ($mode -eq 'wrong-cli') {
+                        1
+                    } else { 3 })
+                @($handler.Tokens | Where-Object { $_ -cne ('b' * 100) }).Count |
+                    Should -Be 0
+            }
+            finally { $client.Dispose() }
+        }
+        ($config | ConvertTo-Json -Depth 10) |
+            Should -Not -Match 'service@example.invalid|principalName|uniqueName'
     }
     It 'proves a selected PR project graph through one bearer and rejects broken HTTP evidence' {
         $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `

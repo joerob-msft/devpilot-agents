@@ -452,7 +452,7 @@ function Invoke-CanaryMergedMasterDiscovery {
         Assert-CanaryAccountBinding $finalIdentity $identity
         return [ordered]@{
             schemaVersion = 1
-            state = 'discovered-awaiting-human-source-review'
+            state = 'discovered-awaiting-provenance-pin-review'
             candidateBytesMatch = $true
             observedMasterCommit = $master
             proposedPin = $pin
@@ -747,6 +747,15 @@ function Assert-CanaryAccountProof {
 function Assert-CanaryAccountBinding {
     param([Collections.IDictionary]$Actual,
         [Collections.IDictionary]$Expected)
+    if ($Expected.Count -eq 2 -and
+        $Expected.Contains('id') -and $Expected.Contains('descriptor')) {
+        if ($Actual -isnot [Collections.IDictionary] -or
+            [string]$Actual.id -ine [string]$Expected.id -or
+            [string]$Actual.descriptor -cne [string]$Expected.descriptor) {
+            throw 'canary-identity-drift'
+        }
+        return
+    }
     if ($Actual -isnot [Collections.IDictionary] -or
         $Expected -isnot [Collections.IDictionary] -or
         [string]$Actual.id -ine [string]$Expected.id -or
@@ -1329,10 +1338,8 @@ function Invoke-PrivateCanaryBootstrap {
                 id = ([string]$repository.id).ToLowerInvariant()
             }
             projectId = ([string]$project.id).ToLowerInvariant()
-            expectedAccount = $identity
-            operator = [ordered]@{
-                expectedCliUpn = [string]$identity.principalName
-            }
+            expectedAccount = [ordered]@{
+                id = $identity.id; descriptor = $identity.descriptor }
         }
         $engSource = [ordered]@{
             projectName = 'Engineering'; repositoryName = 'EngHub'
@@ -1401,10 +1408,10 @@ function Invoke-PrivateCanaryBootstrap {
                     })))
         $rules['bpm-named-areequal-arguments@1'] = $namedRule
         $manifest = [ordered]@{
-            schemaVersion = 4; kind = 'private-merged-master-canary-sources'
+            schemaVersion = 5; kind = 'private-merged-master-canary-sources'
             sourceAuthority = 'merged-master-verified-read-only'
             accountProofDigest = 'v1:sha256:' + (Get-CanaryTextHash (
-                ConvertTo-AgentCanonicalJson -InputObject $identity))
+                ConvertTo-AgentCanonicalJson -InputObject $providerConfig.expectedAccount))
             verifiedUtc = [DateTime]::UtcNow.ToString('o')
             namedSection = $namedSectionSource
             rules = $rules
@@ -1447,6 +1454,7 @@ function New-VerifiedCanaryRuleRegistry {
         [Parameter(Mandatory)][Collections.IDictionary]$ApprovedSources,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [scriptblock]$Read,
+        [string]$ExpectedAccountUniqueName,
         [switch]$Run
     )
     if (-not $Run) {
@@ -1454,7 +1462,9 @@ function New-VerifiedCanaryRuleRegistry {
             providerWrites = 0; evaluated = $false; writerEligible = $false }
     }
     Assert-CanaryMergedPin $script:MergedMasterPin
-    if (-not $Read -or -not [IO.Path]::IsPathFullyQualified($RepositoryRoot) -or
+    if (-not $Read -or
+        $ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$' -or
+        -not [IO.Path]::IsPathFullyQualified($RepositoryRoot) -or
         $ProviderConfig.provider -cne 'AzureDevOps' -or
         $ProviderConfig.repository -isnot [Collections.IDictionary] -or
         $ProviderConfig.expectedAccount -isnot [Collections.IDictionary] -or
@@ -1468,14 +1478,11 @@ function New-VerifiedCanaryRuleRegistry {
         [string]$ProviderConfig.expectedAccount.id -cnotmatch
             '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
         [string]$ProviderConfig.expectedAccount.descriptor -cnotmatch '^\S{1,512}$' -or
-        [string]$ProviderConfig.expectedAccount.principalName -cnotmatch
-            '^[^@\s]+@[^@\s]+$' -or
-        [string]$ProviderConfig.operator.expectedCliUpn -ine
-            [string]$ProviderConfig.expectedAccount.principalName -or
-        ($ProviderConfig.expectedAccount.Contains('uniqueName') -and
-            [string]$ProviderConfig.expectedAccount.uniqueName -ine
-                [string]$ProviderConfig.expectedAccount.principalName) -or
-        $ApprovedSources.schemaVersion -ne 4 -or
+        $ProviderConfig.expectedAccount.Count -ne 2 -or
+        -not $ProviderConfig.expectedAccount.Contains('id') -or
+        -not $ProviderConfig.expectedAccount.Contains('descriptor') -or
+        $ProviderConfig.Contains('operator') -or
+        $ApprovedSources.schemaVersion -ne 5 -or
         $ApprovedSources.kind -cne 'private-merged-master-canary-sources' -or
         $ApprovedSources.accountProofDigest -cne ('v1:sha256:' +
             (Get-CanaryTextHash (ConvertTo-AgentCanonicalJson `
@@ -1541,8 +1548,7 @@ function New-VerifiedCanaryRuleRegistry {
         }
         return $answer
     }.GetNewClosure()
-    $identity = Assert-CanaryAccountProof $bounded `
-        ([string]$ProviderConfig.expectedAccount.principalName)
+    $identity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
     $projectName = [string]$ProviderConfig.repository.project
     $project = & $bounded Project @{ projectName = $projectName }
     $repo = & $bounded Repository @{
@@ -1609,8 +1615,7 @@ function New-VerifiedCanaryRuleRegistry {
     }
     [void](Assert-CanaryMergedMasterHead $bounded $engId `
         ([string]$engineering.id) $script:MergedMasterPin $proof.masterCommit)
-    $finalIdentity = Assert-CanaryAccountProof $bounded `
-        ([string]$ProviderConfig.expectedAccount.principalName)
+    $finalIdentity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
     Assert-CanaryAccountBinding $finalIdentity $identity
     $path = 'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
     if ($named -isnot [Collections.IDictionary] -or
@@ -1670,7 +1675,7 @@ function New-VerifiedCanaryRuleRegistry {
         }
     }
     return [ordered]@{
-        schemaVersion = 3
+        schemaVersion = 4
         kind = 'verified-read-only-canary-registry'
         state = 'verified-not-evaluated'
         sourceAuthority = 'merged-master-verified-read-only'
@@ -1701,6 +1706,7 @@ function Invoke-PrivateCanaryRuleRegistry {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [string]$AzureCliPath = 'az',
         [Collections.IDictionary]$BearerSession,
+        [string]$ExpectedAccountUniqueName,
         [switch]$Run
     )
     if (-not $Run) {
@@ -1710,6 +1716,11 @@ function Invoke-PrivateCanaryRuleRegistry {
     $organization = [string]$ProviderConfig.repository.organization
     if ($organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$') {
         throw 'canary-receipt-invalid'
+    }
+    if (-not $BearerSession) {
+        $ExpectedAccountUniqueName = Get-CanaryWorkAccountUpn $AzureCliPath
+    } elseif ($ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+        throw 'canary-work-account-unavailable'
     }
     $owned = $null
     try {
@@ -1733,7 +1744,7 @@ function Invoke-PrivateCanaryRuleRegistry {
         }.GetNewClosure()
         return New-VerifiedCanaryRuleRegistry -ProviderConfig $ProviderConfig `
             -ApprovedSources $ApprovedSources -RepositoryRoot $RepositoryRoot `
-            -Read $read -Run
+            -Read $read -ExpectedAccountUniqueName $ExpectedAccountUniqueName -Run
     }
     finally { if ($owned) { $owned.client.Dispose() } }
 }
@@ -1747,6 +1758,7 @@ function Invoke-PrivateCanarySignedIntake {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][int[]]$CanaryPullRequestIds,
         [string]$AzureCliPath = 'az',
+        [string]$ExpectedAccountUniqueName,
         [scriptblock]$Read,
         [scriptblock]$Provider,
         [switch]$Run
@@ -1772,6 +1784,11 @@ function Invoke-PrivateCanarySignedIntake {
     if ([bool]$Read -ne [bool]$Provider) {
         throw 'bound-transport-invalid'
     }
+    if (-not $Read) {
+        $ExpectedAccountUniqueName = Get-CanaryWorkAccountUpn $AzureCliPath
+    } elseif ($ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+        throw 'canary-work-account-unavailable'
+    }
     $session = $null
     $created = $false
     $root = $null
@@ -1780,7 +1797,8 @@ function Invoke-PrivateCanarySignedIntake {
         $session = New-PrivateCanaryBearerSession $RepositoryRoot $AzureCliPath
     }
     $registryArgs = @{ ProviderConfig = $ProviderConfig
-        ApprovedSources = $ApprovedSources; RepositoryRoot = $RepositoryRoot; Run = $true }
+        ApprovedSources = $ApprovedSources; RepositoryRoot = $RepositoryRoot
+        ExpectedAccountUniqueName = $ExpectedAccountUniqueName; Run = $true }
     if ($Read) {
         $registryArgs.Read = $Read
         $registry = New-VerifiedCanaryRuleRegistry @registryArgs
@@ -1799,8 +1817,8 @@ function Invoke-PrivateCanarySignedIntake {
     $intake.projectName = [string]$ProviderConfig.repository.project
     $intake.projectId = [string]$ProviderConfig.projectId
     $intake.repositoryId = [string]$ProviderConfig.repository.id
-    $intake.schemaVersion = 2
-    $intake.principalProof = 'aad-graph-storage-key-v1'
+    $intake.schemaVersion = 3
+    $intake.principalProof = 'aad-graph-storage-key-alias-free-v2'
     $intake.expectedAccount = $ProviderConfig.expectedAccount
     $intake.enabled = $true
     $intake.pagination = [ordered]@{ mode = 'created-time-keyset' }
@@ -1812,7 +1830,7 @@ function Invoke-PrivateCanarySignedIntake {
     if (-not $Provider) {
         $Provider = New-ActivePrAzureDevOpsProvider -Config $intake `
             -BearerToken $session.token -BoundClient $session.client `
-            -VerifyReadPrincipal
+            -VerifyReadPrincipal -ExpectedPrincipalName $ExpectedAccountUniqueName
     }
     $preflight = & $Provider Identity @{ timeoutMilliseconds = 120000 }
     Assert-CanaryAccountBinding $preflight $ProviderConfig.expectedAccount
@@ -1885,7 +1903,8 @@ function Invoke-PrivateCanarySignedIntake {
     $cohort = Invoke-ActivePrIntake -Config $intake -Provider $Provider `
         -StateRoot $root -RepositoryRoot $RepositoryRoot `
         -CanaryPullRequestIds $CanaryPullRequestIds -BeforePersist $beforePersist `
-        -CreationState $creationState -Run
+        -CreationState $creationState `
+        -ReviewerUniqueName $ExpectedAccountUniqueName -Run
     $created = $creationState.created
     if (-not $created -or $null -eq $gate.pins -or
         $null -eq $gate.finalRegistry) {
@@ -1894,9 +1913,9 @@ function Invoke-PrivateCanarySignedIntake {
     $pins = $gate.pins
     $finalRegistry = $gate.finalRegistry
     $config = [ordered]@{
-        schemaVersion = 3
+        schemaVersion = 4
         kind = 'private-canary-signed-intake'
-        principalProof = 'aad-graph-storage-key-v1'
+        principalProof = 'aad-graph-storage-key-alias-free-v2'
         enabled = $false
         readOnly = $true
         dryRun = $true

@@ -1278,7 +1278,7 @@ function Invoke-BoundedCandidateParser {
     param([Collections.IDictionary]$Dispatcher, [Collections.IDictionary]$Rule,
         [Collections.IDictionary]$Head, [object[]]$Files,
         [Collections.IDictionary]$Discussions, [Collections.IDictionary]$IntakeConfig,
-        [int]$MaximumFindings)
+        [int]$MaximumFindings, [string]$ReviewerUniqueName)
     $contract = New-OwnerAcquisitionContract `
         -RepositoryId $Head.repositoryId -ProjectId $Head.projectId `
         -PullRequestId $Head.pullRequestId -SourceCommit $Head.sourceCommit `
@@ -1286,13 +1286,14 @@ function Invoke-BoundedCandidateParser {
         -RuleRepositoryId $Rule.repositoryId -RulePath $Rule.path `
         -RuleCommit $Rule.commit -RuleSection $Rule.section `
         -RuleHash $Rule.hash -RuleLength $Rule.length `
-        -ConfigId $(if ($Dispatcher.schemaVersion -eq 3) {
+        -ConfigId $(if ($Dispatcher.schemaVersion -eq 4) {
                 'private-merged-master-canary-v1'
             } else { 'private-canary-signed-intake-v1' }) `
         -ConfigDigest ('v1:sha256:' + (Get-RuleTextDigest (
                     ConvertTo-AgentCanonicalJson -InputObject $Dispatcher))) `
         -CapabilityId $Rule.id -CapabilityDigest $Rule.declarationDigest
-    $snapshot = Get-ActivePrDiscussionSnapshot $Discussions $IntakeConfig $Head $contract
+    $snapshot = Get-ActivePrDiscussionSnapshot $Discussions $IntakeConfig `
+        $Head $contract $ReviewerUniqueName
     return Get-RuleEvaluation $Rule.id $Files $MaximumFindings $contract `
         $snapshot $Head.repositoryId $Head.sourceCommit
 }

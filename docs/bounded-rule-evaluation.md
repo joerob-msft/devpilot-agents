@@ -169,7 +169,7 @@ and current-master raw bytes must be byte-identical to that candidate, and
 the distinct class/redundant section and policy-line hashes must agree.
 After rechecking PR/ref/identity it returns only immutable commit, blob,
 document, section, line, and recomputed merge-commit declaration digests
-marked `discovered-awaiting-human-source-review`: no path, raw payload,
+marked `discovered-awaiting-provenance-pin-review`: no path, raw payload,
 account, token, header, private file or state, signing, or write. Any byte
 or section change, incomplete ancestry, drift, or throttle stops without a
 pin; changed content requires separate human review. Identical bytes retain
@@ -230,7 +230,7 @@ or alias secret is written into the repository or normal command output.
 
 After all checks it creates only `provider-config.json` and
 `approved-sources.json` in a fresh ACL-private external directory. The latter
-is a version 4 `private-merged-master-canary-sources` four-rule source
+is a version 5 `private-merged-master-canary-sources` four-rule source
 **receipt** plus a separate named-section
 entry. It is **not** the legacy approval manifest consumed by
 `Invoke-ActivePrCanaryQualification.ps1`. There is no HMAC key, signed
@@ -241,7 +241,7 @@ writer permission. Do not run the private bootstrap until its own and parent exa
 and input provenance have been checked.
 
 `tools/Invoke-PrivateCanaryRuleRegistry.ps1` consumes **only** that
-bootstrap's external ACL-private `provider-config.json` and version 4
+bootstrap's external ACL-private `provider-config.json` and version 5
 `approved-sources.json`. It is disabled without `-Run`; it never creates
 private state, signs configuration, selects PRs, evaluates rules, invokes a
 model, or writes to ADO. When explicitly run after the exact-head CI and
@@ -261,7 +261,7 @@ Owner no-tools execution.
 
 `tools/Invoke-PrivateCanarySignedIntake.ps1` is the **next default-off,
 preparation-only** layer. It accepts only the ACL-private external bootstrap
-`provider-config.json` and version 4 `approved-sources.json`, a new disjoint
+`provider-config.json` and version 5 `approved-sources.json`, a new disjoint
 absolute external `-StateRoot`, and one or two explicit `-CanaryPullRequestIds`.
 `-Run` revalidates the registry and EngHub merged/current-master blobs
 before and after intake; changes to the receipts or provider identity abort
@@ -285,13 +285,23 @@ commits, trees, raw blobs, changes, and discussions, and the final registry
 recheck. No `az devops invoke` credential or descriptor-derived UPN participates
 in this path. Every request is a bounded GET; HTTP throttling stops rather
 than retries, and failures before signing leave no new external state.
-The v3 signed intake/config binds the v4 identity/source receipt and exact
-head/iteration evidence; previous v2 signed handoffs are rejected by the
+The v4 signed intake/config and registry bind the v5 identity/source receipt
+and exact head/iteration evidence; previous v2/v3 signed handoffs are rejected by the
 runner, not silently promoted to merged authority.
 The independent runner obtains one fresh bearer for its own registry/source
 recheck and subsequent read-only evaluation, not a replay of a bootstrap
 bearer. Its initial and final account proofs must agree with the signed
 immutable identity.
+Only the immutable account GUID and Graph subject descriptor appear in the
+v5 receipt, private provider config, v3 intake config/generation, and v4
+signed dispatcher. The current approved CLI UPN is freshly read into memory
+for **each** bootstrap/registry/signed-intake/runner invocation, checked
+against same-bearer ConnectionData (if it reports `uniqueName`), Graph user
+principal name, and Graph storage-key GUID, and never written to files or
+normal output. No raw UPN, ADO alias, Graph principal name, or unkeyed alias
+hash is included in any signed artifact. During discussion classification
+the current UPN is passed only in memory: matching GUID+descriptor with a
+conflicting optional author alias remains unknown, not human coverage.
 
 The two-pass inventory and selected-head changed-line/project-graph evidence
 are assembled in bounded memory. Unknown inventory, incomplete selected
