@@ -44,3 +44,8 @@ use a distinct `v2` namespace; a legacy `v1` marker at the same anchor is
 unknown, not an `@2` no-op or an excuse to create a duplicate. Discussion,
 head, identity, source or project-graph drift aborts rather than granting
 writer eligibility. Findings remain candidate-only and never trigger POST.
+The returned per-head/per-rule aggregates are **not** signed per-finding
+delivery receipts: individual anchors and reconciliation evidence are not
+persisted in a writer-consumable format. A future create-only writer remains
+blocked pending its own reviewed, ACL-private, signed per-finding evidence
+contract and separate authorization.
