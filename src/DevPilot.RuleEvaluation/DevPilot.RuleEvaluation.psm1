@@ -1278,7 +1278,7 @@ function Invoke-BoundedCandidateParser {
     param([Collections.IDictionary]$Dispatcher, [Collections.IDictionary]$Rule,
         [Collections.IDictionary]$Head, [object[]]$Files,
         [Collections.IDictionary]$Discussions, [Collections.IDictionary]$IntakeConfig,
-        [int]$MaximumFindings, [string]$ReviewerUniqueName)
+        [int]$MaximumFindings, [string]$ReviewerAdoUniqueName)
     $contract = New-OwnerAcquisitionContract `
         -RepositoryId $Head.repositoryId -ProjectId $Head.projectId `
         -PullRequestId $Head.pullRequestId -SourceCommit $Head.sourceCommit `
@@ -1293,7 +1293,7 @@ function Invoke-BoundedCandidateParser {
                     ConvertTo-AgentCanonicalJson -InputObject $Dispatcher))) `
         -CapabilityId $Rule.id -CapabilityDigest $Rule.declarationDigest
     $snapshot = Get-ActivePrDiscussionSnapshot $Discussions $IntakeConfig `
-        $Head $contract $ReviewerUniqueName
+        $Head $contract $ReviewerAdoUniqueName
     return Get-RuleEvaluation $Rule.id $Files $MaximumFindings $contract `
         $snapshot $Head.repositoryId $Head.sourceCommit
 }

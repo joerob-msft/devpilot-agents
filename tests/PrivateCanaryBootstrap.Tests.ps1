@@ -505,10 +505,20 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                         principalName = if ($state.wrong -eq 'identity-upn') {
                             'other@example.invalid'
                         } else { 'service@example.invalid' } }
-                    if (-not $MissingUniqueName) {
+                    $identityReads = @($state.calls | Where-Object {
+                            $_ -eq 'Identity'
+                        }).Count
+                    if ((-not $MissingUniqueName -and
+                            $state.wrong -ne 'alias-added') -or
+                        ($state.wrong -eq 'alias-added' -and
+                            $identityReads -gt 1)) {
                         $identity.uniqueName = if ($state.wrong -eq 'identity-alias') {
                             'other@example.invalid'
                         } else { 'service@example.invalid' }
+                    }
+                    if ($state.wrong -eq 'alias-removed' -and
+                        $identityReads -gt 1) {
+                        $identity.Remove('uniqueName')
                     }
                     return $identity
                 }
@@ -1193,12 +1203,55 @@ Describe 'Read-only private canary input bootstrap' {
         $ambiguous = Invoke-RunnerCase $c
         $ambiguous.rules[1].unknown | Should -Be 2
         $ambiguous.rules[1].wouldCreate | Should -Be 0
-        $aliasConflict = New-RunnerThread $c 1 'Exclude from code coverage.'
-        $aliasConflict.comments[0].author.uniqueName = 'other@example.invalid'
-        $c.state.threads = @($aliasConflict)
-        $aliasUnknown = Invoke-RunnerCase $c
-        $aliasUnknown.rules[1].unknown | Should -Be 2
-        $aliasUnknown.rules[1].humanCovered | Should -Be 0
+        $unprovenAlias = New-RunnerThread $c 1 'Exclude from code coverage.'
+        $unprovenAlias.comments[0].author.uniqueName = 'other@example.invalid'
+        $c.state.threads = @($unprovenAlias)
+        $immutableMatch = Invoke-RunnerCase $c
+        $immutableMatch.rules[1].humanCovered | Should -Be 2
+        $immutableMatch.rules[1].wouldCreate | Should -Be 0
+        $c.state.threads = @(New-RunnerThread $c 1 (Get-RunnerClassMarkerBody $c))
+        $matchedMarker = Invoke-RunnerCase $c
+        $matchedMarker.rules[1].unknown | Should -BeLessThan 2
+        $matchedMarker.rules[1].humanCovered | Should -Be 0
+        $matchedMarker.rules[1].wouldCreate | Should -Be 0
+    }
+    It 'uses only a token-bound ADO alias to disambiguate conflicting authors' {
+        $c = Get-SignedIntakeCase -Code
+        [void](Invoke-SignedIntakeCase $c)
+        foreach ($body in @('Exclude from code coverage.',
+                (Get-RunnerClassMarkerBody $c))) {
+            $conflict = New-RunnerThread $c 1 $body
+            $conflict.comments[0].author.uniqueName = 'other@example.invalid'
+            $c.state.threads = @($conflict)
+            $result = Invoke-RunnerCase $c
+            $result.rules[1].unknown | Should -Be 2
+            $result.rules[1].humanCovered | Should -Be 0
+            $result.rules[1].wouldCreate | Should -Be 0
+        }
+    }
+    It 'rejects alias presence and value drift within a runner invocation' {
+        foreach ($mode in @('added', 'removed', 'changed')) {
+            $c = Get-SignedIntakeCase -Code -MissingUniqueName:($mode -eq 'added')
+            [void](Invoke-SignedIntakeCase $c)
+            $original = $c.provider
+            $seen = @{ count = 0 }
+            $c.provider = {
+                param($operation, $request)
+                $answer = & $original $operation $request
+                if ($operation -eq 'Identity') {
+                    $seen.count++
+                    if ($seen.count -eq 2) {
+                        switch ($mode) {
+                            added { $answer.uniqueName = 'service@example.invalid' }
+                            removed { $answer.Remove('uniqueName') }
+                            changed { $answer.uniqueName = 'other@example.invalid' }
+                        }
+                    }
+                }
+                return $answer
+            }.GetNewClosure()
+            { Invoke-RunnerCase $c } | Should -Throw '*canary-principal-drift*'
+        }
     }
     It 'refuses a half-injected credential path without creating state' {
         $c = Get-SignedIntakeCase
@@ -1327,6 +1380,7 @@ Describe 'Read-only private canary input bootstrap' {
             }
             It 'refuses split inventory, stale heads, fake graph and forged receipt before signing' {
                 foreach ($failure in @('identity-upn', 'identity-alias',
+                        'alias-added', 'alias-removed',
                         'split-page', 'stale-head', 'fake-graph',
                         'forged-receipt', 'cursor-collision', 'late-head',
                         'provider-drift', 'throttle-final')) {

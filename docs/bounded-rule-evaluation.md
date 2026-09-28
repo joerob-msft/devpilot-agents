@@ -300,8 +300,13 @@ against same-bearer ConnectionData (if it reports `uniqueName`), Graph user
 principal name, and Graph storage-key GUID, and never written to files or
 normal output. No raw UPN, ADO alias, Graph principal name, or unkeyed alias
 hash is included in any signed artifact. During discussion classification
-the current UPN is passed only in memory: matching GUID+descriptor with a
-conflicting optional author alias remains unknown, not human coverage.
+only an ADO `uniqueName` actually supplied by token-bound ConnectionData is
+passed in memory as the reviewer alias; the CLI UPN/Graph principal name is
+never substituted when that alias is absent. Matching immutable GUID and
+Graph descriptor can establish human coverage without an alias; when a
+verified ADO alias exists, a conflicting author alias remains unknown rather
+than human coverage. Alias presence and value must remain stable within an
+invocation, but need not match an earlier receipt that deliberately omits it.
 
 The two-pass inventory and selected-head changed-line/project-graph evidence
 are assembled in bounded memory. Unknown inventory, incomplete selected

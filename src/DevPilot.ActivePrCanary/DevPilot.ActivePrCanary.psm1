@@ -1834,6 +1834,11 @@ function Invoke-PrivateCanarySignedIntake {
     }
     $preflight = & $Provider Identity @{ timeoutMilliseconds = 120000 }
     Assert-CanaryAccountBinding $preflight $ProviderConfig.expectedAccount
+    if ([string]$preflight.principalName -ine $ExpectedAccountUniqueName -or
+        ($preflight.Contains('uniqueName') -and
+            [string]$preflight.uniqueName -ine $ExpectedAccountUniqueName)) {
+        throw 'canary-principal-drift'
+    }
     $preflightReads = 1
     if ($null -ne $preflight['readCount']) {
         $extra = 0
@@ -1904,7 +1909,8 @@ function Invoke-PrivateCanarySignedIntake {
         -StateRoot $root -RepositoryRoot $RepositoryRoot `
         -CanaryPullRequestIds $CanaryPullRequestIds -BeforePersist $beforePersist `
         -CreationState $creationState `
-        -ReviewerUniqueName $ExpectedAccountUniqueName -Run
+        -ExpectedPrincipalName $ExpectedAccountUniqueName `
+        -ExpectedIdentity $preflight -Run
     $created = $creationState.created
     if (-not $created -or $null -eq $gate.pins -or
         $null -eq $gate.finalRegistry) {

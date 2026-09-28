@@ -261,21 +261,30 @@ function Assert-IntakeConfig {
 
 function Assert-IntakeAccount {
     param([Collections.IDictionary]$Actual, [Collections.IDictionary]$Config,
-        [string]$ReviewerUniqueName)
+        [string]$ExpectedPrincipalName)
     $expected = $Config.expectedAccount
     if ($Actual -isnot [Collections.IDictionary] -or
         [string]$Actual.id -ine [string]$expected.id -or
         [string]$Actual.descriptor -cne [string]$expected.descriptor -or
         ($Config.schemaVersion -eq 3 -and
-            ([string]$Actual.principalName -ine $ReviewerUniqueName -or
+            ([string]$Actual.principalName -ine $ExpectedPrincipalName -or
                 ($Actual.Contains('uniqueName') -and
-                    [string]$Actual.uniqueName -ine $ReviewerUniqueName))) -or
+                    [string]$Actual.uniqueName -ine $ExpectedPrincipalName))) -or
         ($Config.schemaVersion -eq 2 -and
             ([string]$Actual.principalName -ine [string]$expected.principalName -or
                 ($Actual.Contains('uniqueName') -ne
                     $expected.Contains('uniqueName')))) -or
         ($expected.Contains('uniqueName') -and
             [string]$Actual.uniqueName -ine [string]$expected.uniqueName)) {
+        throw 'account-mismatch'
+    }
+}
+
+function Assert-IntakeAliasContinuity {
+    param([Collections.IDictionary]$Actual, [Collections.IDictionary]$Previous)
+    if ($Actual.Contains('uniqueName') -ne $Previous.Contains('uniqueName') -or
+        ($Actual.Contains('uniqueName') -and
+            [string]$Actual.uniqueName -ine [string]$Previous.uniqueName)) {
         throw 'account-mismatch'
     }
 }
@@ -733,7 +742,7 @@ function Assert-IntakeHead {
 function Get-IntakeDiscussionCounts {
     param([Collections.IDictionary]$Response, [Collections.IDictionary]$Config,
         [Collections.IDictionary]$Head, [string]$ReviewerUniqueName)
-    if ($Config.schemaVersion -eq 3 -and
+    if ($Config.schemaVersion -eq 3 -and $ReviewerUniqueName -and
         $ReviewerUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
         throw 'account-mismatch'
     }
@@ -1126,12 +1135,13 @@ function Invoke-ActivePrIntake {
         [int[]]$CanaryPullRequestIds,
         [scriptblock]$BeforePersist,
         [Collections.IDictionary]$CreationState,
-        [string]$ReviewerUniqueName,
+        [string]$ExpectedPrincipalName,
+        [Collections.IDictionary]$ExpectedIdentity,
         [switch]$Run
     )
     Assert-IntakeConfig $Config
     if ($Config.schemaVersion -eq 3 -and $Run -and
-        $ReviewerUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+        $ExpectedPrincipalName -cnotmatch '^[^@\s]+@[^@\s]+$') {
         throw 'account-mismatch'
     }
     if ($PSBoundParameters.ContainsKey('CanaryPullRequestIds')) {
@@ -1166,7 +1176,11 @@ function Invoke-ActivePrIntake {
     if ($Config.schemaVersion -in @(2, 3)) {
         $preflight = & $Provider Identity @{
             timeoutMilliseconds = [int]$Config.limits.maxSeconds * 1000 }
-        Assert-IntakeAccount $preflight $Config $ReviewerUniqueName
+        Assert-IntakeAccount $preflight $Config $ExpectedPrincipalName
+        if ($Config.schemaVersion -eq 3 -and $ExpectedIdentity) {
+            Assert-IntakeAccount $ExpectedIdentity $Config $ExpectedPrincipalName
+            Assert-IntakeAliasContinuity $preflight $ExpectedIdentity
+        }
         $preflightReads = 1
         if ($null -ne $preflight['readCount']) {
             $preflightReads += Assert-IntakeNumber $preflight.readCount `
@@ -1285,7 +1299,10 @@ function Invoke-ActivePrIntake {
         $cutoff = [DateTime]::UtcNow.ToString('o')
         try {
                 $identity = Invoke-IntakeRead $Provider Identity @{} $Config ([ref]$reads) $clock
-                Assert-IntakeAccount $identity $Config $ReviewerUniqueName
+                Assert-IntakeAccount $identity $Config $ExpectedPrincipalName
+                if ($Config.schemaVersion -eq 3) {
+                    Assert-IntakeAliasContinuity $identity $preflight
+                }
                 $first = Get-IntakePass $Provider $Config ([ref]$reads) $clock 1 $cutoff
                 $envelope.pages.first = $first.pages
                 $second = Get-IntakePass $Provider $Config ([ref]$reads) $clock 2 $cutoff
@@ -1543,7 +1560,7 @@ function Invoke-ActivePrIntake {
                                     pullRequestId = $id; iterationId = $before.iterationId
                                 } $Config ([ref]$reads) $clock
                                 $entry.discussion = Get-IntakeDiscussionCounts $discussion `
-                                    $Config $before $ReviewerUniqueName
+                                    $Config $before ([string]$identity['uniqueName'])
                                 if ($null -eq $lines) {
                                     throw 'line-count-unavailable'
                                 }

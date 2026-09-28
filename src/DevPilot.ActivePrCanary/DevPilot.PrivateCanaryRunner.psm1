@@ -303,6 +303,9 @@ function Invoke-PrivateCanaryEvaluation {
         throw 'canary-principal-drift'
     }
     $results = [Collections.Generic.List[object]]::new()
+    $reviewerAdoUniqueName = if ($identity.Contains('uniqueName')) {
+        [string]$identity.uniqueName
+    } else { $null }
     foreach ($head in $selected) {
         $declaration = $head.declaration
         $id = [int]$head.pullRequestId
@@ -392,7 +395,7 @@ function Invoke-PrivateCanaryEvaluation {
             pullRequestId = $id; iterationId = $declaration.iterationId
         }
         [void](Get-ActivePrDiscussionCounts $discussion $intakeConfig `
-                $declaration $ExpectedAccountUniqueName)
+                $declaration $reviewerAdoUniqueName)
         $evaluations = [Collections.Generic.List[object]]::new()
         $findingCount = 0
         foreach ($ruleId in $script:CanaryRules) {
@@ -421,7 +424,7 @@ function Invoke-PrivateCanaryEvaluation {
             }
             $evaluation = Invoke-BoundedCandidateParser $config $binding `
                 $declaration $files.ToArray() $discussion $intakeConfig `
-                ([int]$config.limits.maxFindingsPerHead) $ExpectedAccountUniqueName
+                ([int]$config.limits.maxFindingsPerHead) $reviewerAdoUniqueName
             if ($evaluation.state -cnotin @('evaluated', 'unknown') -or
                 $evaluation.findings -gt [int]$config.limits.maxFindingsPerHead) {
                 throw 'canary-evaluation-invalid'
@@ -469,7 +472,7 @@ function Invoke-PrivateCanaryEvaluation {
             pullRequestId = $id; iterationId = $declaration.iterationId
         }
         [void](Get-ActivePrDiscussionCounts $after $intakeConfig `
-                $declaration $ExpectedAccountUniqueName)
+                $declaration $reviewerAdoUniqueName)
         if ((Get-PrivateCanaryDigest $discussion) -cne
             (Get-PrivateCanaryDigest $after)) {
             throw 'canary-discussion-drift'
