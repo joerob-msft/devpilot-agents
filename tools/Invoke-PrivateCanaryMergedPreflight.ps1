@@ -1,0 +1,28 @@
+#!/usr/bin/env pwsh
+#requires -Version 7.0
+<#
+.SYNOPSIS
+    Verifies the reviewed merged master source without creating state.
+.DESCRIPTION
+    Disabled without -Run. A reviewed repository-owned immutable source pin
+    must exist before any ADO request is made. No private root is used.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$Organization,
+    [string]$AzureCliPath = 'az',
+    [switch]$Run
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path $PSScriptRoot -Parent
+Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.ActivePrCanary.psm1')
+if (-not $Run) {
+    @{ state = 'disabled'; providerReads = 0; providerWrites = 0 } |
+        ConvertTo-Json
+    return
+}
+$expected = Get-CanaryWorkAccountUpn $AzureCliPath
+Invoke-CanaryMergedMasterPreflight -Organization $Organization `
+    -ExpectedAccountUniqueName $expected -RepositoryRoot $repo `
+    -AzureCliPath $AzureCliPath -Run | ConvertTo-Json -Depth 8

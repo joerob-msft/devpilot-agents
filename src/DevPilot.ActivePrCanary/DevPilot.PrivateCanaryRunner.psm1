@@ -62,7 +62,7 @@ function Assert-PrivateCanaryConfig {
     param([Collections.IDictionary]$Config, [Collections.IDictionary]$Intake,
         [Collections.IDictionary]$ProviderConfig,
         [Collections.IDictionary]$Registry)
-    if ($Config.schemaVersion -ne 2 -or
+    if ($Config.schemaVersion -ne 3 -or
         $Config.kind -cne 'private-canary-signed-intake' -or
         $Config.principalProof -cne 'aad-graph-storage-key-v1' -or
         $Intake.schemaVersion -ne 2 -or
@@ -72,7 +72,7 @@ function Assert-PrivateCanaryConfig {
         $Config.enabled -cne $false -or $Config.readOnly -cne $true -or
         $Config.dryRun -cne $true -or $Config.writerEligible -cne $false -or
         $Config.modelEnabled -cne $false -or
-        $Config.sourceAuthority -cne 'unmerged-reviewed-pr-is-candidate-only' -or
+        $Config.sourceAuthority -cne 'merged-master-verified-read-only' -or
         $Config.organization -cne $Intake.organization -or
         $Config.organization -cne
             "https://dev.azure.com/$($ProviderConfig.repository.organization)" -or
@@ -85,7 +85,8 @@ function Assert-PrivateCanaryConfig {
         (ConvertTo-AgentCanonicalJson -InputObject $Config.expectedAccount) -cne
             (ConvertTo-AgentCanonicalJson -InputObject $ProviderConfig.expectedAccount) -or
         $Config.receiptDigest -cne $Registry.receiptDigest -or
-        $Registry.schemaVersion -ne 2 -or
+        $Registry.schemaVersion -ne 3 -or
+        $Registry.sourceAuthority -cne $Config.sourceAuthority -or
         $Registry.state -cne 'verified-not-evaluated' -or
         $Registry.evaluated -cne $false -or
         $Registry.writerEligible -cne $false -or
@@ -408,7 +409,7 @@ function Invoke-PrivateCanaryEvaluation {
                 length = if ($ruleId -ceq 'bpm-named-areequal-arguments@1') {
                     ([IO.File]::ReadAllBytes(
                             (Join-Path $RepositoryRoot $source.path))).Length
-                } else { 16286 }
+                } else { [int]$source.documentLength }
                 declarationDigest = $registryRule.declarationDigest
             }
             $evaluation = Invoke-BoundedCandidateParser $config $binding `
@@ -495,9 +496,9 @@ function Invoke-PrivateCanaryEvaluation {
         throw 'canary-principal-drift'
     }
     return [ordered]@{
-        schemaVersion = 2; kind = 'private-canary-read-only-evaluation'
-        state = 'candidate-only-read-only'
-        sourceAuthority = 'unmerged-reviewed-pr-is-candidate-only'
+        schemaVersion = 3; kind = 'private-canary-read-only-evaluation'
+        state = 'merged-master-read-only'
+        sourceAuthority = 'merged-master-verified-read-only'
         intakeGeneration = $intake.generation
         selected = $results.Count
         draft = [int]$intake.inventory.draft
