@@ -641,6 +641,54 @@ function Resolve-OwnerV2DiscussionReconciliation {
             }
         }
 
+        $legacyPattern = if ($capabilityId -ceq
+            'bpm-test-class-coverage@2') {
+            '<!--\s*devpilot-test-class-coverage:v1:[0-9a-f]{64}\s*-->'
+        } elseif ($capabilityId -ceq
+            'bpm-redundant-method-coverage@2') {
+            '<!--\s*devpilot-redundant-method-coverage:v1:[0-9a-f]{64}\s*-->'
+        } else { $null }
+        if ($legacyPattern) {
+            $anchor = $finding.anchor
+            $lines = if ($isRedundantMethod) {
+                @($finding.affectedAttributeLines)
+            } else { @([int]$anchor.line) }
+            $expectedPath = ConvertTo-OwnerV1WriterPath -Path (
+                [string]$anchor.path)
+            $legacyAtAnchor = @($Snapshot.Threads | Where-Object {
+                    $thread = $_
+                    if ($null -eq $thread.anchor -or
+                        [bool]$thread.isDeleted -or
+                        @($lines | Where-Object {
+                                [int]$thread.anchor.line -ge ([int]$_ - 2) -and
+                                [int]$thread.anchor.line -le [int]$_
+                            }).Count -eq 0) {
+                        return $false
+                    }
+                    $samePath = try {
+                        [string]::Equals($expectedPath,
+                            (ConvertTo-OwnerV1WriterPath -Path (
+                                    [string]$thread.anchor.path)),
+                            [StringComparison]::OrdinalIgnoreCase)
+                    } catch { $false }
+                    $samePath -and @($thread.comments | Where-Object {
+                            [string]$_.commentType -ceq 'text' -and
+                            -not [bool]$_.isDeleted -and
+                            [regex]::IsMatch([string]$_.body, $legacyPattern)
+                        }).Count -gt 0
+                }).Count -gt 0
+            if ($legacyAtAnchor) {
+                $finding.providerMarker = New-OwnerProviderMarker `
+                    -Value $markerKey -Integrity invalid
+                $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                    -Classification unknown -Reason 'legacy-coverage-marker-at-anchor' `
+                    -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                    -ThreadAvailability ambiguous
+                $counts.unknown++
+                continue
+            }
+        }
+
         if ($ambiguousReviewerMarkers -gt 0 -or $foreignMarkers -gt 0) {
             $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
             $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `

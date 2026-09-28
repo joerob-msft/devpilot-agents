@@ -539,7 +539,10 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
     }
     function Get-SignedIntakeCase {
         param([switch]$Code, [switch]$MissingUniqueName,
-            [switch]$CoverageOnly)
+            [switch]$CoverageOnly, [switch]$RedundantCode)
+        if ($RedundantCode -and -not $Code) {
+            throw 'redundant test requires C#'
+        }
         $inputCase = Get-RegistryCase -MissingUniqueName:$MissingUniqueName `
             -CoverageOnly:$CoverageOnly
         $root = $inputCase.case.root + '-signed'
@@ -568,7 +571,13 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         }
         $config = $inputCase.config
         $path = if ($Code) { '/Tests/Example.cs' } else { '/notes.txt' }
-        $content = if ($Code) {
+        $content = if ($RedundantCode) {
+            (@('using Microsoft.VisualStudio.TestTools.UnitTesting;',
+                'using System.Diagnostics.CodeAnalysis;',
+                '[TestClass]', '[ExcludeFromCodeCoverage]', 'class Example {',
+                '    [TestMethod]', '    [ExcludeFromCodeCoverage]',
+                '    public void Check() {}', '}') -join "`n") + "`n"
+        } elseif ($Code) {
             "using Microsoft.VisualStudio.TestTools.UnitTesting;`n[TestClass]`nclass Example {}`n"
         }
         else { 'synthetic' }
@@ -583,7 +592,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         $state.path = $path
         $state.content = $content
         $state.objectId = $objectId
-        $state.lines = if ($Code) { 3 } else { 1 }
+        $state.lines = if ($RedundantCode) { 9 } elseif ($Code) { 3 } else { 1 }
         $state.code = [bool]$Code
         $provider = {
             param($op, $request)
@@ -782,13 +791,14 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                 } else { 'FourRule' }) -Run
     }
     function New-RunnerThread($Case, [int]$Id, [string]$Body,
-        [switch]$Outdated) {
+        [switch]$Outdated, [int]$Line = 3) {
         return @{
             id = $Id; status = 'active'
             comments = @(@{ id = 1; author = $Case.input.config.expectedAccount
                     commentType = 'text'; content = $Body })
             threadContext = @{ filePath = $Case.state.path
-                rightFileStart = @{ line = 3 }; rightFileEnd = @{ line = 3 } }
+                rightFileStart = @{ line = $Line }
+                rightFileEnd = @{ line = $Line } }
             pullRequestThreadContext = @{
                 changeTrackingId = 1
                 iterationContext = @{
@@ -3339,6 +3349,45 @@ Describe 'Coverage-only signed read-only canary' {
                 capabilityId = 'bpm-test-ownership@1'; enabled = $false
                 evaluated = $false; writerEligible = $false } }
         { Invoke-RunnerCase $c } | Should -Throw
+    }
+    It 'makes a mixed exact v2 and legacy v1 marker at one anchor unknown' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        [void](Invoke-SignedIntakeCase $c)
+        $exact = Get-RunnerClassMarkerBody $c
+        $thread = New-RunnerThread $c 1 $exact
+        $thread.comments += @{
+            id = 2; author = $c.input.config.expectedAccount
+            commentType = 'text'
+            content = '<!-- devpilot-test-class-coverage:v1:' +
+                ('a' * 64) + ' -->'
+        }
+        $c.state.threads = @($thread)
+        $result = Invoke-RunnerCase $c
+        $class = $result.rules | Where-Object {
+            $_.capabilityId -ceq 'bpm-test-class-coverage@2'
+        }
+        $class.unknown | Should -Be $result.selected
+        $class.evaluated | Should -Be 0
+        $class.wouldCreate | Should -Be 0
+        $result.providerWrites | Should -Be 0
+    }
+    It 'evaluates the redundant rule separately and treats its legacy marker as unknown' {
+        $c = Get-SignedIntakeCase -Code -RedundantCode -CoverageOnly
+        [void](Invoke-SignedIntakeCase $c)
+        $result = Invoke-RunnerCase $c
+        $redundant = $result.rules | Where-Object {
+            $_.capabilityId -ceq 'bpm-redundant-method-coverage@2'
+        }
+        $redundant.wouldCreate | Should -Be $result.selected
+        $c.state.threads = @(New-RunnerThread $c 1 (
+                '<!-- devpilot-redundant-method-coverage:v1:' +
+                ('a' * 64) + ' -->') -Line 7)
+        $ambiguous = Invoke-RunnerCase $c
+        $redundant = $ambiguous.rules | Where-Object {
+            $_.capabilityId -ceq 'bpm-redundant-method-coverage@2'
+        }
+        $redundant.wouldCreate | Should -Be 0
+        $redundant.unknown | Should -BeGreaterThan 0
     }
     It 'rejects incomplete graph and throttles before state creation' {
         foreach ($failure in @('unknown-project', 'throttle-changes',
