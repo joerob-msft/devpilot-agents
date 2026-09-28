@@ -11,12 +11,28 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$StateRoot,
+    [string]$SourceSelectorPath,
+    [string]$SourceSelectorKeyPath,
+    [string]$MergedPinPath,
+    [string]$MergedPinKeyPath,
     [string]$AzureCliPath = 'az',
     [switch]$Run
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
+Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.ActivePrCanary.psm1')
 Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.PrivateCanaryRunner.psd1')
+$source = if ($Run) {
+    Read-CanaryPrivateSourceSelector -SelectorPath $SourceSelectorPath `
+        -KeyPath $SourceSelectorKeyPath -RepositoryRoot $repo
+} else { @{ selector = $null; key = $null } }
+$merged = if ($Run) {
+    Read-CanaryPrivateMergedPin -PinPath $MergedPinPath `
+        -KeyPath $MergedPinKeyPath -RepositoryRoot $repo `
+        -SourceSelector $source.selector
+} else { @{ envelope = $null; key = $null } }
 Invoke-PrivateCanaryEvaluation -StateRoot $StateRoot -RepositoryRoot $repo `
+    -SourceSelector $source.selector -SourceSelectorKey $source.key `
+    -MergedPinEnvelope $merged.envelope -MergedPinKey $merged.key `
     -AzureCliPath $AzureCliPath -Run:$Run | ConvertTo-Json -Depth 16

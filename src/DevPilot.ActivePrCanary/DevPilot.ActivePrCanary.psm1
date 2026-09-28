@@ -9,10 +9,16 @@ $script:OwnerCommit = 'f6db83436b48f48a8521095a888d79f67823bbb2'
 $script:OwnerHash = 'bc31bfea6b378dffe4a1b28475dc1cac4cd3ee1ab793db57895446ded829ab2f'
 $script:NamedSectionHash = 'b3935a2ac811353d1da72e9a310938679cf119963677bd2ebc90510aab85a03a'
 $script:NamedSectionLength = 412
+# The inherited Owner/Named pin has not been reviewed against the corrected source repository.
+$script:OwnerSourceReviewedInApprovedRepository = $false
 $script:DocumentPath = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md'
 $script:CoverageCommit = '7e6620ec40c9bc37c5a5e13d506053b0139c9206'
 $script:CoverageDocumentHash = '68a5cb1aa2604b971c8c446c77ef50f74409407f65eaa2e9389acd636cddacee'
 $script:CoverageDocumentLength = 16286
+# Real merged provenance belongs only in a separately reviewed ACL-private envelope.
+$script:MergedMasterPin = $null
+$script:ApprovedMergedPinSignature = $null
+$script:ReviewedMergedPinApprovalPublicKey = $null
 $script:StaticPolicies = @(
     @{ name = 'class'; index = 1; file = 'test-class-coverage' },
     @{ name = 'redundant'; index = 2; file = 'redundant-method-coverage' },
@@ -28,6 +34,92 @@ function Get-CanaryHash {
 function Get-CanaryTextHash {
     param([AllowEmptyString()][string]$Text)
     return Get-CanaryHash ([Text.Encoding]::UTF8.GetBytes($Text))
+}
+
+function Assert-CanarySourceSelector {
+    param([Collections.IDictionary]$Selector, [string]$Key,
+        [string]$Organization)
+    $fields = @('schemaVersion', 'kind', 'organization', 'projectName',
+        'repositoryName', 'signature')
+    if ($Selector -isnot [Collections.IDictionary] -or
+        $Selector.Count -ne $fields.Count) {
+        throw 'source-selector-invalid'
+    }
+    foreach ($field in $fields) {
+        if (-not $Selector.Contains($field)) {
+            throw 'source-selector-invalid'
+        }
+    }
+    if ($Selector.schemaVersion -ne 1 -or
+        $Selector.kind -cne 'private-canary-source-selector' -or
+        [string]$Selector.organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$' -or
+        [string]$Selector.projectName -cnotmatch '^[\w .-]{1,128}$' -or
+        [string]$Selector.projectName -in @('.', '..') -or
+        [string]$Selector.repositoryName -cnotmatch '^[A-Za-z0-9._-]{1,128}$' -or
+        [string]$Selector.repositoryName -in @('.', '..') -or
+        $Organization -cne [string]$Selector.organization -or
+        $Key -cnotmatch '^[A-Za-z0-9+/]{64}$' -or
+        [string]$Selector.signature -cnotmatch '^v1:hmac-sha256:[a-f0-9]{64}$') {
+        throw 'source-selector-invalid'
+    }
+    $expected = Get-CanarySignature $Selector $Key
+    if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+            [Convert]::FromHexString($Selector.signature.Substring(15)),
+            [Convert]::FromHexString($expected.Substring(15)))) {
+        throw 'source-selector-invalid'
+    }
+    return $Selector
+}
+
+function Assert-CanaryDiscoverySelector {
+    param([Collections.IDictionary]$Selector, [string]$Organization,
+        [int]$PullRequestId)
+    $fields = @('organization', 'projectName', 'repositoryName')
+    if ($Selector -isnot [Collections.IDictionary] -or
+        $Selector.Count -ne $fields.Count -or
+        $PullRequestId -ne 17307009) {
+        throw 'source-selector-invalid'
+    }
+    foreach ($field in $fields) {
+        if (-not $Selector.Contains($field)) {
+            throw 'source-selector-invalid'
+        }
+    }
+    if ([string]$Selector.organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$' -or
+        [string]$Selector.projectName -cnotmatch '^[\w .-]{1,128}$' -or
+        [string]$Selector.projectName -in @('.', '..') -or
+        [string]$Selector.repositoryName -cnotmatch '^[A-Za-z0-9._-]{1,128}$' -or
+        [string]$Selector.repositoryName -in @('.', '..') -or
+        $Organization -cne [string]$Selector.organization) {
+        throw 'source-selector-invalid'
+    }
+    return $Selector
+}
+
+function Read-CanaryPrivateSourceSelector {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$SelectorPath,
+        [Parameter(Mandatory)][string]$KeyPath,
+        [Parameter(Mandatory)][string]$RepositoryRoot)
+    try {
+        if (-not [IO.Path]::IsPathFullyQualified($SelectorPath) -or
+            -not [IO.Path]::IsPathFullyQualified($KeyPath) -or
+            (Test-AgentPathWithin $SelectorPath $RepositoryRoot) -or
+            (Test-AgentPathWithin $KeyPath $RepositoryRoot)) {
+            throw 'source-selector-invalid'
+        }
+        $selectorFile = Assert-AgentTrustedFile -Path $SelectorPath -Private
+        $keyFile = Assert-AgentTrustedFile -Path $KeyPath -Private
+        if ((Get-Item -LiteralPath $selectorFile).Length -gt 4096 -or
+            (Get-Item -LiteralPath $keyFile).Length -gt 256) {
+            throw 'source-selector-invalid'
+        }
+        $selector = Get-Content -LiteralPath $selectorFile -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 4
+        $key = (Get-Content -LiteralPath $keyFile -Raw).Trim()
+        return @{ selector = $selector; key = $key }
+    }
+    catch { throw 'source-selector-invalid' }
 }
 
 function Assert-CanarySource {
@@ -84,7 +176,8 @@ function Read-CanarySource {
 }
 
 function Get-CanaryCoverageDeclarations {
-    param([string]$Document, [string]$RepositoryId)
+    param([string]$Document, [string]$RepositoryId,
+        [string]$Commit = $script:CoverageCommit)
     $lines = [regex]::Split($Document, '\r\n|\n|\r')
     if ($lines.Count -lt 223) { throw 'coverage-source-section-mismatch' }
     $headingIndex = -1
@@ -106,7 +199,7 @@ function Get-CanaryCoverageDeclarations {
             $declaration = [ordered]@{
                 ruleId = $ruleIds[$i]
                 repositoryId = $RepositoryId.ToLowerInvariant()
-                commit = $script:CoverageCommit
+                commit = $Commit
                 path = $script:DocumentPath.Substring(1)
                 section = $heading
                 sectionHash = $sectionHash
@@ -126,17 +219,678 @@ function Get-CanaryCoverageDeclarations {
     )
 }
 
+function Assert-CanaryMergedPin {
+    param([Collections.IDictionary]$Pin)
+    if ($Pin -isnot [Collections.IDictionary] -or
+        $Pin.Count -ne 10 -or
+        [string]$Pin.sourceCommit -cne $script:CoverageCommit -or
+        [string]$Pin.mergeCommit -cnotmatch '^[a-f0-9]{40}$' -or
+        [string]$Pin.documentHash -cnotmatch '^[a-f0-9]{64}$' -or
+        [string]$Pin.documentHash -cne $script:CoverageDocumentHash -or
+        [string]$Pin.documentLength -cnotmatch '^[1-9][0-9]{0,5}$' -or
+        [int]$Pin.documentLength -ne $script:CoverageDocumentLength -or
+        [int]$Pin.documentLength -gt 262144 -or
+        [string]$Pin.blobId -cnotmatch '^[a-f0-9]{40}$' -or
+        [string]$Pin.sectionHash -cnotmatch '^v1:sha256:[a-f0-9]{64}$' -or
+        [string]$Pin.classLineHash -cnotmatch '^v1:sha256:[a-f0-9]{64}$' -or
+        [string]$Pin.redundantLineHash -cnotmatch '^v1:sha256:[a-f0-9]{64}$' -or
+        [string]$Pin.classDeclarationDigest -cnotmatch '^v1:sha256:[a-f0-9]{64}$' -or
+        [string]$Pin.redundantDeclarationDigest -cnotmatch '^v1:sha256:[a-f0-9]{64}$') {
+        throw 'merged-master-pin-unavailable'
+    }
+}
+
+function Get-CanaryReviewerApprovalBytes {
+    param([Collections.IDictionary]$Approval)
+    $unsigned = [ordered]@{}
+    foreach ($field in $Approval.Keys) {
+        if ([string]$field -cne 'signature') {
+            $unsigned[[string]$field] = $Approval[$field]
+        }
+    }
+    return ,([Text.Encoding]::UTF8.GetBytes(
+            (ConvertTo-AgentCanonicalJson -InputObject $unsigned)))
+}
+
+function Assert-CanaryReviewerApproval {
+    param([Collections.IDictionary]$Approval,
+        [Collections.IDictionary]$SourceSelector)
+    $publicKey = [string]$script:ReviewedMergedPinApprovalPublicKey
+    if ($Approval -isnot [Collections.IDictionary] -or
+        $Approval.Count -ne 7 -or
+        $publicKey -cnotmatch '^[A-Za-z0-9+/]{400,2048}={0,2}$') {
+        throw 'merged-master-review-approval-unavailable'
+    }
+    foreach ($field in @('schemaVersion', 'kind', 'sourcePullRequestId',
+            'selector', 'selectorSignature', 'pin', 'signature')) {
+        if (-not $Approval.Contains($field)) {
+            throw 'merged-master-review-approval-unavailable'
+        }
+    }
+    if (
+        $Approval.schemaVersion -ne 1 -or
+        $Approval.kind -cne 'reviewed-merged-master-source-approval' -or
+        [string]$Approval.sourcePullRequestId -cne '17307009' -or
+        $Approval.selector -isnot [Collections.IDictionary] -or
+        $Approval.selector.Count -ne 3 -or
+        $Approval.pin -isnot [Collections.IDictionary] -or
+        $SourceSelector -isnot [Collections.IDictionary] -or
+        [string]$Approval.selectorSignature -cne
+            [string]$SourceSelector.signature -or
+        [string]$Approval.signature -cnotmatch
+            '^v1:rsa-pss-sha256:[A-Za-z0-9+/]{400,1024}={0,2}$') {
+        throw 'merged-master-review-approval-unavailable'
+    }
+    foreach ($field in @('organization', 'projectName', 'repositoryName')) {
+        if (-not $Approval.selector.Contains($field) -or
+            [string]$Approval.selector[$field] -cne
+                [string]$SourceSelector[$field]) {
+            throw 'merged-master-review-approval-unavailable'
+        }
+        foreach ($field in @('sourceCommit', 'mergeCommit', 'documentHash',
+                'documentLength', 'blobId', 'sectionHash', 'classLineHash',
+                'redundantLineHash', 'classDeclarationDigest',
+                'redundantDeclarationDigest')) {
+            if (-not $Approval.pin.Contains($field)) {
+                throw 'merged-master-review-approval-unavailable'
+            }
+        }
+    }
+    try {
+        $keyBytes = [Convert]::FromBase64String($publicKey)
+        $signature = [Convert]::FromBase64String(
+            $Approval.signature.Substring('v1:rsa-pss-sha256:'.Length))
+        $rsa = [Security.Cryptography.RSA]::Create()
+        try {
+            $read = 0
+            $rsa.ImportSubjectPublicKeyInfo($keyBytes, [ref]$read)
+            if ($read -ne $keyBytes.Length -or $rsa.KeySize -lt 3072 -or
+                -not $rsa.VerifyData(
+                    (Get-CanaryReviewerApprovalBytes $Approval), $signature,
+                    [Security.Cryptography.HashAlgorithmName]::SHA256,
+                    [Security.Cryptography.RSASignaturePadding]::Pss)) {
+                throw 'merged-master-review-approval-unavailable'
+            }
+        }
+        finally { $rsa.Dispose() }
+    }
+    catch { throw 'merged-master-review-approval-unavailable' }
+    Assert-CanaryMergedPin $Approval.pin
+    $pin = [ordered]@{}
+    foreach ($field in $Approval.pin.Keys) {
+        $pin[[string]$field] = $Approval.pin[$field]
+    }
+    return $pin
+}
+
+function Assert-CanaryReviewedMergedPin {
+    param([Collections.IDictionary]$Envelope, [string]$Key,
+        [Collections.IDictionary]$SourceSelector)
+    $approval = [string]$script:ApprovedMergedPinSignature
+    if ($approval -cnotmatch '^v1:hmac-sha256:[a-f0-9]{64}$' -or
+        $Envelope -isnot [Collections.IDictionary] -or
+        $Envelope.Count -ne 5 -or
+        $Envelope.schemaVersion -ne 1 -or
+        $Envelope.kind -cne 'private-reviewed-merged-master-pin' -or
+        $Envelope.pin -isnot [Collections.IDictionary] -or
+        $SourceSelector -isnot [Collections.IDictionary] -or
+        [string]$Envelope.selectorSignature -cne
+            [string]$SourceSelector.signature -or
+        [string]$Envelope.selectorSignature -cnotmatch
+            '^v1:hmac-sha256:[a-f0-9]{64}$' -or
+        $Key -cnotmatch '^[A-Za-z0-9+/]{64}$' -or
+        [string]$Envelope.signature -cnotmatch
+            '^v1:hmac-sha256:[a-f0-9]{64}$') {
+        throw 'merged-master-pin-unavailable'
+    }
+    $signature = [Convert]::FromHexString($Envelope.signature.Substring(15))
+    if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+            $signature, [Convert]::FromHexString($approval.Substring(15))) -or
+        -not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+            $signature, [Convert]::FromHexString(
+                (Get-CanarySignature $Envelope $Key).Substring(15)))) {
+        throw 'merged-master-pin-unavailable'
+    }
+    Assert-CanaryMergedPin $Envelope.pin
+    return $Envelope.pin
+}
+
+function Read-CanaryPrivateMergedPin {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$PinPath,
+        [Parameter(Mandatory)][string]$KeyPath,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][Collections.IDictionary]$SourceSelector)
+    if ([string]$script:ApprovedMergedPinSignature -cnotmatch
+        '^v1:hmac-sha256:[a-f0-9]{64}$') {
+        throw 'merged-master-pin-unavailable'
+    }
+    try {
+        if (-not [IO.Path]::IsPathFullyQualified($PinPath) -or
+            -not [IO.Path]::IsPathFullyQualified($KeyPath) -or
+            (Test-AgentPathWithin $PinPath $RepositoryRoot) -or
+            (Test-AgentPathWithin $KeyPath $RepositoryRoot)) {
+            throw 'merged-master-pin-unavailable'
+        }
+        $pinFile = Assert-AgentTrustedFile -Path $PinPath -Private
+        $keyFile = Assert-AgentTrustedFile -Path $KeyPath -Private
+        if ((Get-Item -LiteralPath $pinFile).Length -gt 4096 -or
+            (Get-Item -LiteralPath $keyFile).Length -gt 256) {
+            throw 'merged-master-pin-unavailable'
+        }
+        $envelope = Get-Content -LiteralPath $pinFile -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 6
+        $key = (Get-Content -LiteralPath $keyFile -Raw).Trim()
+        [void](Assert-CanaryReviewedMergedPin $envelope $key $SourceSelector)
+        return @{ envelope = $envelope; key = $key }
+    }
+    catch { throw 'merged-master-pin-unavailable' }
+}
+
+function Read-CanaryPrivateReviewerApproval {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ApprovalPath,
+        [Parameter(Mandatory)][string]$RepositoryRoot)
+    try {
+        if (-not [IO.Path]::IsPathFullyQualified($ApprovalPath) -or
+            (Test-AgentPathWithin $ApprovalPath $RepositoryRoot)) {
+            throw 'merged-master-review-approval-unavailable'
+        }
+        $file = Assert-AgentTrustedFile -Path $ApprovalPath -Private
+        if ((Get-Item -LiteralPath $file).Length -gt 4096) {
+            throw 'merged-master-review-approval-unavailable'
+        }
+        return (Get-Content -LiteralPath $file -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 8)
+    }
+    catch { throw 'merged-master-review-approval-unavailable' }
+}
+
+function Assert-CanaryMergedMasterHead {
+    param([scriptblock]$Read, [string]$RepositoryId, [string]$ProjectId,
+        [Collections.IDictionary]$Pin, [string]$ExpectedMaster,
+        [Collections.IDictionary]$SourceSelector)
+    $request = @{ projectName = $SourceSelector.projectName; repositoryId = $RepositoryId }
+    $pr = & $Read PullRequest $request
+    $iterations = & $Read Iterations $request
+    if ($pr -isnot [Collections.IDictionary] -or
+        [string]$pr.pullRequestId -cne '17307009' -or
+        [string]$pr.repository.id -ine $RepositoryId -or
+        [string]$pr.repository.project.id -ine $ProjectId -or
+        [string]$pr.repository.project.name -cne [string]$SourceSelector.projectName -or
+        [string]$pr.status -cne 'completed' -or
+        [string]$pr.targetRefName -cne 'refs/heads/master' -or
+        [string]$pr.sourceRefName -cnotmatch
+            '^refs/heads/[A-Za-z0-9._/-]{1,512}$' -or
+        [string]$pr.lastMergeSourceCommit.commitId -ine $Pin.sourceCommit -or
+        [string]$pr.lastMergeCommit.commitId -ine $Pin.mergeCommit -or
+        $iterations.value -isnot [array] -or
+        $iterations.value.Count -lt 1 -or $iterations.value.Count -gt 200) {
+        throw 'merged-master-pr-unverified'
+    }
+    $seen = [Collections.Generic.HashSet[int]]::new()
+    foreach ($iteration in $iterations.value) {
+        $id = 0
+        if ($iteration -isnot [Collections.IDictionary] -or
+            -not [int]::TryParse([string]$iteration.id, [ref]$id) -or
+            $id -lt 1 -or -not $seen.Add($id) -or
+            [string]$iteration.sourceRefCommit.commitId -cnotmatch
+                '^[a-fA-F0-9]{40}$') {
+            throw 'merged-master-pr-unverified'
+        }
+    }
+    $latest = @($iterations.value | Sort-Object { [int]$_.id } |
+        Select-Object -Last 1)[0]
+    if ([string]$latest.sourceRefCommit.commitId -ine $Pin.sourceCommit) {
+        throw 'merged-master-pr-unverified'
+    }
+    $refs = & $Read Ref (@{ projectName = $SourceSelector.projectName
+            repositoryId = $RepositoryId; sourceRef = 'refs/heads/master' })
+    if ($refs.value -isnot [array] -or $refs.value.Count -gt 100) {
+        throw 'merged-master-ref-unverified'
+    }
+    $matched = @($refs.value | Where-Object name -CEQ 'refs/heads/master')
+    if ($matched.Count -ne 1 -or
+        [string]$matched[0].objectId -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        ($ExpectedMaster -and
+            [string]$matched[0].objectId -ine $ExpectedMaster)) {
+        throw 'merged-master-ref-unverified'
+    }
+    return ([string]$matched[0].objectId).ToLowerInvariant()
+}
+
+function Assert-CanaryMergedHistory {
+    param([scriptblock]$Read, [string]$RepositoryId,
+        [string]$MasterCommit, [string]$MergeCommit,
+        [Collections.IDictionary]$SourceSelector)
+    $pending = [Collections.Generic.Queue[string]]::new()
+    $visited = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    $pending.Enqueue($MasterCommit)
+    while ($pending.Count -gt 0) {
+        if ($visited.Count -ge 64) { throw 'merged-master-history-unproved' }
+        $id = $pending.Dequeue()
+        if (-not $visited.Add($id)) { continue }
+        $commit = & $Read Commit @{ projectName = $SourceSelector.projectName
+            repositoryId = $RepositoryId; commit = $id }
+        if ([string]$commit.commitId -ine $id -or
+            $commit.parents -isnot [array] -or
+            $commit.parents.Count -gt 16) {
+            throw 'merged-master-history-unproved'
+        }
+        if ($id -ieq $MergeCommit) { return }
+        foreach ($parent in $commit.parents) {
+            if ([string]$parent -cnotmatch '^[a-fA-F0-9]{40}$') {
+                throw 'merged-master-history-unproved'
+            }
+            if (-not $visited.Contains([string]$parent)) {
+                $pending.Enqueue(([string]$parent).ToLowerInvariant())
+            }
+        }
+    }
+    throw 'merged-master-history-unproved'
+}
+
+function Assert-CanaryMergedMasterProof {
+    param([scriptblock]$Read, [string]$RepositoryId, [string]$ProjectId,
+        [Collections.IDictionary]$Pin,
+        [Collections.IDictionary]$SourceSelector)
+    Assert-CanaryMergedPin $Pin
+    $master = Assert-CanaryMergedMasterHead $Read $RepositoryId $ProjectId `
+        $Pin '' $SourceSelector
+    Assert-CanaryMergedHistory $Read $RepositoryId $master $Pin.mergeCommit `
+        $SourceSelector
+    $merge = Read-CanaryVerifiedDocument $Read $RepositoryId `
+        $Pin.mergeCommit $SourceSelector
+    $current = Read-CanaryVerifiedDocument $Read $RepositoryId `
+        $master $SourceSelector
+    $bytes = [Text.Encoding]::UTF8.GetBytes($merge.text)
+    if ($bytes.Length -ne [int]$Pin.documentLength -or
+        (Get-CanaryHash $bytes) -cne $Pin.documentHash -or
+        $merge.blobId -cne $Pin.blobId -or
+        $current.blobId -cne $Pin.blobId -or
+        $current.text -cne $merge.text) {
+        throw 'merged-master-document-drift'
+    }
+    $declarations = @(Get-CanaryCoverageDeclarations $merge.text `
+            $RepositoryId $Pin.mergeCommit)
+    if ($declarations.Count -ne 2 -or
+        $declarations[0].sectionHash -cne $Pin.sectionHash -or
+        $declarations[1].sectionHash -cne $Pin.sectionHash -or
+        $declarations[0].policyLineHash -cne $Pin.classLineHash -or
+        $declarations[1].policyLineHash -cne $Pin.redundantLineHash -or
+        $declarations[0].declarationDigest -cne $Pin.classDeclarationDigest -or
+        $declarations[1].declarationDigest -cne $Pin.redundantDeclarationDigest) {
+        throw 'merged-master-declaration-drift'
+    }
+    return @{ masterCommit = $master; mergeCommit = $Pin.mergeCommit
+        document = $merge; declarations = $declarations }
+}
+
+function Invoke-CanaryMergedMasterPreflight {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Organization,
+        [Parameter(Mandatory)][string]$ExpectedAccountUniqueName,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [string]$AzureCliPath = 'az', [scriptblock]$Read,
+        [Collections.IDictionary]$SourceSelector, [string]$SourceSelectorKey,
+        [Collections.IDictionary]$MergedPinEnvelope, [string]$MergedPinKey,
+        [switch]$Run)
+    if (-not $Run) {
+        return @{ state = 'disabled'; providerReads = 0; providerWrites = 0 }
+    }
+    if ($Organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$' -or
+        $ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$' -or
+        -not [IO.Path]::IsPathFullyQualified($RepositoryRoot)) {
+        throw 'merged-master-input-invalid'
+    }
+    [void](Assert-CanarySourceSelector $SourceSelector $SourceSelectorKey $Organization)
+    $mergedPin = Assert-CanaryReviewedMergedPin $MergedPinEnvelope `
+        $MergedPinKey $SourceSelector
+    $session = $null
+    try {
+        if (-not $Read) {
+            $session = New-PrivateCanaryBearerSession $RepositoryRoot $AzureCliPath
+            $deadline = [DateTime]::UtcNow.AddSeconds(120)
+            $aadGet = ${function:Invoke-CanaryAadGet}
+            $Read = {
+                param($Operation, $Request)
+                & $aadGet $session.client $session.token $Organization `
+                    $Operation $Request $deadline
+            }.GetNewClosure()
+        }
+        $budget = @{ count = 0 }
+        $bounded = {
+            param($Operation, $Request)
+            if ($budget.count -ge 120 -or $Operation -cnotin @(
+                    'IdentityProof', 'GraphUser', 'GraphStorageKey',
+                    'Project', 'Repository', 'PullRequest', 'Iterations',
+                    'Ref', 'Commit', 'Item', 'RawItem')) {
+                throw 'merged-master-read-budget'
+            }
+            $budget.count++
+            $result = & $Read $Operation $Request
+            if ($result -isnot [Collections.IDictionary]) {
+                throw 'merged-master-read-inaccessible'
+            }
+            return $result
+        }.GetNewClosure()
+        $identity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
+        $engineering = & $bounded Project @{ projectName = $SourceSelector.projectName }
+        $enghub = & $bounded Repository @{ projectName = $SourceSelector.projectName
+            repositoryName = $SourceSelector.repositoryName }
+        $guid = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
+        if ([string]$engineering.id -cnotmatch $guid -or
+            [string]$engineering.name -cne [string]$SourceSelector.projectName -or
+            [string]$enghub.id -cnotmatch $guid -or
+            [string]$enghub.name -cne [string]$SourceSelector.repositoryName -or
+            [string]$enghub.project.id -ine [string]$engineering.id -or
+            [string]$enghub.project.name -cne [string]$SourceSelector.projectName) {
+            throw 'merged-master-repository-mismatch'
+        }
+        $proof = Assert-CanaryMergedMasterProof $bounded `
+            ([string]$enghub.id).ToLowerInvariant() `
+            ([string]$engineering.id) $mergedPin $SourceSelector
+        [void](Assert-CanaryMergedMasterHead $bounded `
+            ([string]$enghub.id).ToLowerInvariant() `
+            ([string]$engineering.id) $mergedPin $proof.masterCommit `
+            $SourceSelector)
+        $finalIdentity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
+        Assert-CanaryAccountBinding $finalIdentity $identity
+        return @{ schemaVersion = 1; state = 'merged-master-proved-read-only'
+            reviewedSourceCommit = $mergedPin.sourceCommit
+            mergeCommit = $proof.mergeCommit; masterCommit = $proof.masterCommit
+            documentHash = 'v1:sha256:' + $mergedPin.documentHash
+            providerReads = $budget.count; providerWrites = 0 }
+    }
+    finally { if ($session) { $session.client.Dispose() } }
+}
+
+function Invoke-CanaryMergedMasterDiscovery {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Organization,
+        [Parameter(Mandatory)][string]$ExpectedAccountUniqueName,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [string]$AzureCliPath = 'az', [scriptblock]$Read,
+        [Collections.IDictionary]$SourceSelector,
+        [int]$SourcePullRequestId,
+        [switch]$Run)
+    if (-not $Run) {
+        return @{ state = 'disabled'; providerReads = 0; providerWrites = 0 }
+    }
+    if ($Organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$' -or
+        $ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$' -or
+        -not [IO.Path]::IsPathFullyQualified($RepositoryRoot)) {
+        throw 'merged-master-input-invalid'
+    }
+    [void](Assert-CanaryDiscoverySelector $SourceSelector $Organization `
+            $SourcePullRequestId)
+    $session = $null
+    try {
+        if (-not $Read) {
+            $session = New-PrivateCanaryBearerSession $RepositoryRoot $AzureCliPath
+            $deadline = [DateTime]::UtcNow.AddSeconds(120)
+            $aadGet = ${function:Invoke-CanaryAadGet}
+            $Read = {
+                param($Operation, $Request)
+                & $aadGet $session.client $session.token $Organization `
+                    $Operation $Request $deadline
+            }.GetNewClosure()
+        }
+        $budget = @{ count = 0 }
+        $bounded = {
+            param($Operation, $Request)
+            if ($budget.count -ge 120 -or $Operation -cnotin @(
+                    'IdentityProof', 'GraphUser', 'GraphStorageKey',
+                    'Project', 'Repository', 'PullRequest', 'Iterations',
+                    'Ref', 'Commit', 'Item', 'RawItem')) {
+                throw 'merged-master-read-budget'
+            }
+            $budget.count++
+            $result = & $Read $Operation $Request
+            if ($result -isnot [Collections.IDictionary]) {
+                throw 'merged-master-read-inaccessible'
+            }
+            return $result
+        }.GetNewClosure()
+        $identity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
+        $engineering = & $bounded Project @{ projectName = $SourceSelector.projectName }
+        $enghub = & $bounded Repository @{ projectName = $SourceSelector.projectName
+            repositoryName = $SourceSelector.repositoryName }
+        $guid = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
+        if ([string]$engineering.id -cnotmatch $guid -or
+            [string]$engineering.name -cne [string]$SourceSelector.projectName -or
+            [string]$enghub.id -cnotmatch $guid -or
+            [string]$enghub.name -cne [string]$SourceSelector.repositoryName -or
+            [string]$enghub.project.id -ine [string]$engineering.id -or
+            [string]$enghub.project.name -cne [string]$SourceSelector.projectName) {
+            throw 'merged-master-repository-mismatch'
+        }
+        $engId = ([string]$enghub.id).ToLowerInvariant()
+        $pr = & $bounded PullRequest @{
+            projectName = $SourceSelector.projectName; repositoryId = $engId }
+        if ($pr -isnot [Collections.IDictionary] -or
+            $pr.lastMergeCommit -isnot [Collections.IDictionary] -or
+            [string]$pr.lastMergeCommit.commitId -cnotmatch
+                '^[a-fA-F0-9]{40}$') {
+            throw 'merged-master-pr-unverified'
+        }
+        $provisional = @{ sourceCommit = $script:CoverageCommit
+            mergeCommit = ([string]$pr.lastMergeCommit.commitId).ToLowerInvariant() }
+        $master = Assert-CanaryMergedMasterHead $bounded $engId `
+            ([string]$engineering.id) $provisional '' $SourceSelector
+        Assert-CanaryMergedHistory $bounded $engId $master `
+            $provisional.mergeCommit $SourceSelector
+        $candidate = Read-CanaryVerifiedDocument $bounded $engId `
+            $script:CoverageCommit $SourceSelector
+        $candidateBytes = [Text.Encoding]::UTF8.GetBytes($candidate.text)
+        if ($candidateBytes.Length -ne $script:CoverageDocumentLength -or
+            (Get-CanaryHash $candidateBytes) -cne $script:CoverageDocumentHash) {
+            throw 'reviewed-source-bytes-mismatch'
+        }
+        $merge = Read-CanaryVerifiedDocument $bounded $engId `
+            $provisional.mergeCommit $SourceSelector
+        $current = Read-CanaryVerifiedDocument $bounded $engId $master `
+            $SourceSelector
+        $mergeBytes = [Text.Encoding]::UTF8.GetBytes($merge.text)
+        if ($mergeBytes.Length -ne $candidateBytes.Length -or
+            $merge.text -cne $candidate.text -or
+            $current.text -cne $merge.text -or
+            $current.blobId -cne $merge.blobId) {
+            throw 'merged-master-content-differs-human-review'
+        }
+        $reviewed = @(Get-CanaryCoverageDeclarations $candidate.text `
+                $engId $script:CoverageCommit)
+        $merged = @(Get-CanaryCoverageDeclarations $merge.text `
+                $engId $provisional.mergeCommit)
+        if ($reviewed.Count -ne 2 -or $merged.Count -ne 2 -or
+            $merged[0].sectionHash -cne $reviewed[0].sectionHash -or
+            $merged[1].sectionHash -cne $reviewed[1].sectionHash -or
+            $merged[0].policyLineHash -cne $reviewed[0].policyLineHash -or
+            $merged[1].policyLineHash -cne $reviewed[1].policyLineHash) {
+            throw 'merged-master-section-differs-human-review'
+        }
+        $pin = @{
+            sourceCommit = $script:CoverageCommit
+            mergeCommit = $provisional.mergeCommit
+            documentHash = Get-CanaryHash $mergeBytes
+            documentLength = $mergeBytes.Length
+            blobId = $merge.blobId
+            sectionHash = $merged[0].sectionHash
+            classLineHash = $merged[0].policyLineHash
+            redundantLineHash = $merged[1].policyLineHash
+            classDeclarationDigest = $merged[0].declarationDigest
+            redundantDeclarationDigest = $merged[1].declarationDigest
+        }
+        Assert-CanaryMergedPin $pin
+        [void](Assert-CanaryMergedMasterHead $bounded $engId `
+            ([string]$engineering.id) $provisional $master $SourceSelector)
+        $finalIdentity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
+        Assert-CanaryAccountBinding $finalIdentity $identity
+        return [ordered]@{
+            schemaVersion = 1
+            state = 'discovered-awaiting-provenance-pin-review'
+            candidateBytesMatch = $true
+            observedMasterCommit = $master
+            proposedPin = $pin
+            providerReads = $budget.count
+            providerWrites = 0
+        }
+    }
+    finally { if ($session) { $session.client.Dispose() } }
+}
+
+function Invoke-CanaryMergedPinProvisionCore {
+    [CmdletBinding()]
+    param([string]$StateRoot, [string]$RepositoryRoot,
+        [Collections.IDictionary]$SourceSelector, [string]$SourceSelectorKey,
+        [Collections.IDictionary]$ReviewerApproval,
+        [string]$ExpectedAccountUniqueName,
+        [string]$AzureCliPath = 'az', [scriptblock]$Read,
+        [switch]$Run)
+    if (-not $Run) {
+        return @{ state = 'disabled'; providerReads = 0
+            providerWrites = 0; privateFilesWritten = 0 }
+    }
+    if (-not [IO.Path]::IsPathFullyQualified($StateRoot) -or
+        -not [IO.Path]::IsPathFullyQualified($RepositoryRoot)) {
+        throw 'merged-master-private-root-invalid'
+    }
+    $root = [IO.Path]::GetFullPath($StateRoot)
+    $parent = Split-Path $root -Parent
+    if ((Split-Path $root -Leaf) -cnotmatch
+            '^private-merged-pin-[a-f0-9]{32}$' -or
+        (Test-AgentPathWithin $root $RepositoryRoot) -or
+        (Test-AgentPathWithin $RepositoryRoot $root) -or
+        (Test-Path -LiteralPath $root) -or
+        (Test-Path -LiteralPath "$root.staging")) {
+        throw 'merged-master-private-root-invalid'
+    }
+    try {
+        [void](Resolve-AgentTrustedRoot -Path $parent -Kind durable-state `
+                -RepositoryRoot $RepositoryRoot)
+    }
+    catch { throw 'merged-master-private-root-invalid' }
+    $organization = if ($SourceSelector) {
+        [string]$SourceSelector['organization']
+    } else { '' }
+    [void](Assert-CanarySourceSelector $SourceSelector $SourceSelectorKey `
+            $organization)
+    $approvedPin = Assert-CanaryReviewerApproval $ReviewerApproval $SourceSelector
+    if (-not $Read) {
+        $ExpectedAccountUniqueName = Get-CanaryWorkAccountUpn $AzureCliPath
+    } elseif ($ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+        throw 'canary-work-account-unavailable'
+    }
+    $selectorSignature = [string]$SourceSelector.signature
+    $route = @{ organization = $organization
+        projectName = [string]$SourceSelector.projectName
+        repositoryName = [string]$SourceSelector.repositoryName }
+    $proof = Invoke-CanaryMergedMasterDiscovery `
+        -Organization $organization `
+        -ExpectedAccountUniqueName $ExpectedAccountUniqueName `
+        -RepositoryRoot $RepositoryRoot -AzureCliPath $AzureCliPath `
+        -SourceSelector $route -SourcePullRequestId 17307009 `
+        -Read $Read -Run
+    if ($proof.state -cne 'discovered-awaiting-provenance-pin-review' -or
+        $proof.candidateBytesMatch -cne $true -or
+        $proof.proposedPin -isnot [Collections.IDictionary] -or
+        (ConvertTo-AgentCanonicalJson -InputObject $proof.proposedPin) -cne
+            (ConvertTo-AgentCanonicalJson -InputObject $approvedPin)) {
+        throw 'merged-master-review-approval-drift'
+    }
+    $staging = "$root.staging"
+    $created = $false
+    $published = $false
+    try {
+        if ((Test-Path -LiteralPath $root) -or
+            (Test-Path -LiteralPath $staging)) {
+            throw 'merged-master-private-root-invalid'
+        }
+        [void](Resolve-AgentTrustedRoot -Path $parent -Kind durable-state `
+                -RepositoryRoot $RepositoryRoot)
+        [void](Resolve-AgentTrustedRoot -Path $staging -Kind durable-state `
+                -RepositoryRoot $RepositoryRoot -Create `
+                -CreatedByCaller ([ref]$created))
+        if (-not $created) { throw 'merged-master-private-root-invalid' }
+        $key = [Convert]::ToBase64String(
+            [Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
+        $envelope = [ordered]@{
+            schemaVersion = 1; kind = 'private-reviewed-merged-master-pin'
+            selectorSignature = $selectorSignature
+            pin = $approvedPin; signature = ''
+        }
+        $envelope.signature = Get-CanarySignature $envelope $key
+        $keyPath = Join-Path $staging 'merged-pin.key'
+        $pinPath = Join-Path $staging 'merged-pin.json'
+        Write-CanaryPrivateFile $keyPath ([Text.Encoding]::UTF8.GetBytes($key))
+        Write-CanaryPrivateFile $pinPath ([Text.Encoding]::UTF8.GetBytes(
+                (ConvertTo-Json -InputObject $envelope -Depth 8 -Compress)))
+        [void](Assert-AgentTrustedFile -Path $keyPath `
+                -AllowedRoot $staging -Private)
+        [void](Assert-AgentTrustedFile -Path $pinPath `
+                -AllowedRoot $staging -Private)
+        [IO.Directory]::Move($staging, $root)
+        $published = $true
+        $created = $false
+        [void](Resolve-AgentTrustedRoot -Path $root -Kind durable-state `
+                -RepositoryRoot $RepositoryRoot)
+        [void](Assert-AgentTrustedFile -Path (Join-Path $root 'merged-pin.key') `
+                -AllowedRoot $root -Private)
+        [void](Assert-AgentTrustedFile -Path (Join-Path $root 'merged-pin.json') `
+                -AllowedRoot $root -Private)
+        return @{ state = 'private-source-pin-prepared-unactivated'
+            providerReads = $proof.providerReads; providerWrites = 0
+            privateFilesWritten = 2 }
+    }
+    catch {
+        $cleanup = if ($published) { $root } elseif ($created) { $staging }
+        if ($cleanup) {
+            try {
+                Remove-AgentContainedDirectory -Path $cleanup `
+                    -AllowedRoot $parent `
+                    -LeafPattern '^private-merged-pin-[a-f0-9]{32}(\.staging)?$'
+            }
+            catch { throw 'merged-master-private-cleanup-failed' }
+        }
+        throw 'merged-master-private-provision-failed'
+    }
+}
+
+function Invoke-PrivateCanaryMergedPinProvision {
+    [CmdletBinding()]
+    param([string]$StateRoot, [string]$RepositoryRoot,
+        [Collections.IDictionary]$SourceSelector, [string]$SourceSelectorKey,
+        [Collections.IDictionary]$ReviewerApproval,
+        [string]$AzureCliPath = 'az',
+        [switch]$Run)
+    if (-not $Run) {
+        return @{ state = 'disabled'; providerReads = 0
+            providerWrites = 0; privateFilesWritten = 0 }
+    }
+    return Invoke-CanaryMergedPinProvisionCore -StateRoot $StateRoot `
+        -RepositoryRoot $RepositoryRoot -SourceSelector $SourceSelector `
+        -SourceSelectorKey $SourceSelectorKey `
+        -ReviewerApproval $ReviewerApproval -AzureCliPath $AzureCliPath -Run
+}
+
 function Assert-CanaryCoverageSource {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][Collections.IDictionary]$ApprovedSources,
         [Parameter(Mandatory)][scriptblock]$Provider,
+        [Collections.IDictionary]$SourceSelector,
+        [string]$SourceSelectorKey,
         [switch]$Run
     )
     if (-not $Run) {
         return [ordered]@{ state = 'disabled'; headVerified = $false
             providerReads = 0; providerWrites = 0 }
     }
+    $sourceOrg = if ($SourceSelector) {
+        [string]$SourceSelector['organization']
+    } else { '' }
+    [void](Assert-CanarySourceSelector $SourceSelector $SourceSelectorKey $sourceOrg)
     $ruleIds = @('bpm-test-class-coverage@2',
         'bpm-redundant-method-coverage@2')
     $sources = @($ApprovedSources[$ruleIds[0]], $ApprovedSources[$ruleIds[1]])
@@ -144,8 +898,12 @@ function Assert-CanaryCoverageSource {
         $source = $sources[$i]
         Assert-CanarySource $source $script:DocumentPath $script:CoverageCommit
         if ([string]$source.ruleId -cne $ruleIds[$i] -or
-            [string]$source.projectName -cne 'Engineering' -or
-            [string]$source.repositoryName -cne 'EngHub' -or
+            [string]$source.organization -cne
+                [string]$SourceSelector.organization -or
+            [string]$source.projectName -cne
+                [string]$SourceSelector.projectName -or
+            [string]$source.repositoryName -cne
+                [string]$SourceSelector.repositoryName -or
             [string]$source.provenance -cne 'unmerged-reviewed-pr' -or
             [string]$source.reviewedPullRequestId -cne '17307009' -or
             [string]$source.reviewedHead -cne $script:CoverageCommit -or
@@ -272,6 +1030,30 @@ function Get-CanaryAadToken {
     catch { throw 'bootstrap-credential-unavailable' }
 }
 
+function Get-CanaryWorkAccountUpn {
+    param([string]$AzureCliPath)
+    try {
+        $command = Get-Command $AzureCliPath -CommandType Application,ExternalScript `
+            -ErrorAction Stop | Select-Object -First 1
+        $response = & $command.Source account show --output json `
+            --only-show-errors 2>$null | ConvertFrom-Json -AsHashtable -Depth 8
+        if ($LASTEXITCODE -ne 0 -or
+            $response -isnot [Collections.IDictionary] -or
+            $response.user -isnot [Collections.IDictionary] -or
+            $response.user.type -cne 'user' -or
+            $response.environmentName -cne 'AzureCloud' -or
+            [string]$response.tenantId -cnotmatch
+                '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+            [string]$response.id -cnotmatch
+                '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+            [string]$response.user.name -cnotmatch '^[^@\s]+@[^@\s]+$') {
+            throw 'canary-work-account-unavailable'
+        }
+        return [string]$response.user.name
+    }
+    catch { throw 'canary-work-account-unavailable' }
+}
+
 function New-PrivateCanaryBearerSession {
     param([string]$RepositoryRoot, [string]$AzureCliPath)
     $template = Get-Content -LiteralPath (Join-Path $RepositoryRoot `
@@ -386,6 +1168,15 @@ function Assert-CanaryAccountProof {
 function Assert-CanaryAccountBinding {
     param([Collections.IDictionary]$Actual,
         [Collections.IDictionary]$Expected)
+    if ($Expected.Count -eq 2 -and
+        $Expected.Contains('id') -and $Expected.Contains('descriptor')) {
+        if ($Actual -isnot [Collections.IDictionary] -or
+            [string]$Actual.id -ine [string]$Expected.id -or
+            [string]$Actual.descriptor -cne [string]$Expected.descriptor) {
+            throw 'canary-identity-drift'
+        }
+        return
+    }
     if ($Actual -isnot [Collections.IDictionary] -or
         $Expected -isnot [Collections.IDictionary] -or
         [string]$Actual.id -ine [string]$Expected.id -or
@@ -500,6 +1291,7 @@ function Invoke-CanaryAadGet {
     $remaining = [Math]::Max(1, [int]($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
     $cancel = [Threading.CancellationTokenSource]::new($remaining)
     $failureStatus = 0
+    $throttled = $false
     $phase = 'send'
     $decodeReason = ''
     try {
@@ -507,10 +1299,28 @@ function Invoke-CanaryAadGet {
             [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
             $cancel.Token).GetAwaiter().GetResult()
         try {
+            $failureStatus = [int]$response.StatusCode
+            $remainingExhausted = @($response.Headers | Where-Object {
+                $_.Key -match '(?i)^x-(?:ms-|vss-)?ratelimit-remaining(?:-.*)?$' -and
+                @($_.Value | Where-Object {
+                    [string]$_ -match '^\s*0\s*$'
+                }).Count -gt 0
+            }).Count -gt 0
+            $delay = @($response.Headers | Where-Object {
+                $_.Key -match '(?i)^x-(?:ms-|vss-)?ratelimit-delay$' -and
+                @($_.Value | Where-Object {
+                    [string]$_ -match '^\s*[1-9][0-9]*(?:\.[0-9]+)?\s*$'
+                }).Count -gt 0
+            }).Count -gt 0
+            if ($failureStatus -in @(429, 503) -or
+                $response.Headers.RetryAfter -or $remainingExhausted -or $delay) {
+                $throttled = $true
+                throw 'bootstrap-read-throttled'
+            }
             if (-not $response.IsSuccessStatusCode) {
-                $failureStatus = [int]$response.StatusCode
                 throw 'bootstrap-read-inaccessible'
             }
+            $failureStatus = 0
             $phase = 'read'
             if ($null -ne $response.Content.Headers.ContentLength -and
                     $response.Content.Headers.ContentLength -gt $limit) {
@@ -569,6 +1379,7 @@ function Invoke-CanaryAadGet {
         return $result
     }
     catch {
+        if ($throttled) { throw "bootstrap-read-throttled:$Operation" }
         if ($failureStatus -gt 0) {
             throw ('bootstrap-read-inaccessible:{0}:http-{1}' -f
                 $Operation, $failureStatus)
@@ -742,15 +1553,16 @@ function Invoke-PrivateCanaryIdentityDiagnostic {
 }
 
 function Assert-CanaryBootstrapHead {
-    param([scriptblock]$Read, [string]$RepositoryId, [string]$ProjectId)
-    $request = @{ projectName = 'Engineering'; repositoryId = $RepositoryId }
+    param([scriptblock]$Read, [string]$RepositoryId, [string]$ProjectId,
+        [Collections.IDictionary]$SourceSelector)
+    $request = @{ projectName = $SourceSelector.projectName; repositoryId = $RepositoryId }
     $pr = & $Read PullRequest $request
     $iterations = & $Read Iterations $request
     if ($pr -isnot [Collections.IDictionary] -or
         [string]$pr.pullRequestId -cne '17307009' -or
         [string]$pr.repository.id -ine $RepositoryId -or
         [string]$pr.repository.project.id -ine $ProjectId -or
-        [string]$pr.repository.project.name -cne 'Engineering' -or
+        [string]$pr.repository.project.name -cne [string]$SourceSelector.projectName -or
         [string]$pr.status -cne 'active' -or
         [string]$pr.sourceRefName -cnotmatch
             '^refs/heads/[A-Za-z0-9._/-]{1,512}$' -or
@@ -776,7 +1588,7 @@ function Assert-CanaryBootstrapHead {
         [string]$latest.id -cnotmatch '^[1-9][0-9]*$') {
         throw 'coverage-pr-head-unverified'
     }
-    $refs = & $Read Ref (@{ projectName = 'Engineering'
+    $refs = & $Read Ref (@{ projectName = $SourceSelector.projectName
             repositoryId = $RepositoryId; sourceRef = $pr.sourceRefName })
     $matched = @($refs.value | Where-Object name -CEQ $pr.sourceRefName)
     if ($refs.value -isnot [array] -or $refs.value.Count -gt 100 -or
@@ -787,8 +1599,9 @@ function Assert-CanaryBootstrapHead {
 }
 
 function Read-CanaryVerifiedDocument {
-    param([scriptblock]$Read, [string]$RepositoryId, [string]$Revision)
-    $request = @{ projectName = 'Engineering'; repositoryId = $RepositoryId
+    param([scriptblock]$Read, [string]$RepositoryId, [string]$Revision,
+        [Collections.IDictionary]$SourceSelector)
+    $request = @{ projectName = $SourceSelector.projectName; repositoryId = $RepositoryId
         path = $script:DocumentPath; commit = $Revision }
     $item = & $Read Item $request
     if ($item -isnot [Collections.IDictionary] -or
@@ -828,6 +1641,10 @@ function Invoke-PrivateCanaryBootstrap {
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [string]$AzureCliPath = 'az',
+        [Collections.IDictionary]$SourceSelector,
+        [string]$SourceSelectorKey,
+        [Collections.IDictionary]$MergedPinEnvelope,
+        [string]$MergedPinKey,
         [scriptblock]$Read,
         [switch]$Run
     )
@@ -848,6 +1665,12 @@ function Invoke-PrivateCanaryBootstrap {
     if (-not $Run) {
         return [ordered]@{ state = 'disabled'; providerReads = 0
             providerWrites = 0; signed = $false }
+    }
+    [void](Assert-CanarySourceSelector $SourceSelector $SourceSelectorKey $Organization)
+    $mergedPin = Assert-CanaryReviewedMergedPin $MergedPinEnvelope `
+        $MergedPinKey $SourceSelector
+    if (-not $script:OwnerSourceReviewedInApprovedRepository) {
+        throw 'owner-source-provenance-unreviewed'
     }
     $client = $null
     $created = $false
@@ -877,7 +1700,7 @@ function Invoke-PrivateCanaryBootstrap {
         $readBudget = @{ count = 0 }
         $bounded = {
             param($Operation, $Request)
-            if ($readBudget.count -ge 26) { throw 'bootstrap-read-budget' }
+            if ($readBudget.count -ge 120) { throw 'bootstrap-read-budget' }
             $readBudget.count++
             $result = & $Read $Operation $Request
             if ($result -isnot [Collections.IDictionary]) {
@@ -889,9 +1712,11 @@ function Invoke-PrivateCanaryBootstrap {
         $project = & $bounded Project @{ projectName = $ProjectName }
         $repository = & $bounded Repository @{
             projectName = $ProjectName; repositoryName = $RepositoryName }
-        $engineering = & $bounded Project @{ projectName = 'Engineering' }
+        $engineering = & $bounded Project @{
+            projectName = $SourceSelector.projectName }
         $enghub = & $bounded Repository @{
-            projectName = 'Engineering'; repositoryName = 'EngHub' }
+            projectName = $SourceSelector.projectName
+            repositoryName = $SourceSelector.repositoryName }
         $guid = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
         if ([string]$project.id -cnotmatch $guid -or
             [string]$project.name -cne $ProjectName -or
@@ -900,39 +1725,40 @@ function Invoke-PrivateCanaryBootstrap {
             [string]$repository.project.id -ine [string]$project.id -or
             [string]$repository.project.name -cne $ProjectName -or
             [string]$engineering.id -cnotmatch $guid -or
-            [string]$engineering.name -cne 'Engineering' -or
+            [string]$engineering.name -cne [string]$SourceSelector.projectName -or
             [string]$enghub.id -cnotmatch $guid -or
-            [string]$enghub.name -cne 'EngHub' -or
+            [string]$enghub.name -cne [string]$SourceSelector.repositoryName -or
             [string]$enghub.project.id -ine [string]$engineering.id -or
-            [string]$enghub.project.name -cne 'Engineering') {
+            [string]$enghub.project.name -cne [string]$SourceSelector.projectName) {
             throw 'bootstrap-repository-mismatch'
         }
         $engId = ([string]$enghub.id).ToLowerInvariant()
-        Assert-CanaryBootstrapHead $bounded $engId ([string]$engineering.id)
-        $commit = & $bounded Commit @{
-            projectName = 'Engineering'; repositoryId = $engId
-            commit = $script:CoverageCommit }
-        if ([string]$commit.commitId -ine $script:CoverageCommit) {
-            throw 'coverage-commit-unverified'
-        }
-        $ownerSource = Read-CanaryVerifiedDocument $bounded $engId $script:OwnerCommit
+        $proof = Assert-CanaryMergedMasterProof $bounded $engId `
+            ([string]$engineering.id) $mergedPin $SourceSelector
+        Assert-CanaryMergedHistory $bounded $engId $proof.masterCommit `
+            $script:OwnerCommit $SourceSelector
+        $ownerSource = Read-CanaryVerifiedDocument $bounded $engId `
+            $script:OwnerCommit $SourceSelector
+        $currentOwner = Read-CanaryVerifiedDocument $bounded $engId `
+            $proof.masterCommit $SourceSelector
         $ownerSection = Get-CanarySection $ownerSource.text '## Claim ownership'
         $namedSection = Get-CanaryRawSection $ownerSource.text `
             '## Named parameters for Assert'
+        $currentOwnerSection = Get-CanarySection $currentOwner.text '## Claim ownership'
+        $currentNamedSection = Get-CanaryRawSection $currentOwner.text `
+            '## Named parameters for Assert'
         if ((Get-CanaryTextHash $ownerSection) -cne $script:OwnerHash -or
+            $ownerSection -cne $currentOwnerSection -or
             (Get-CanaryTextHash $namedSection) -cne $script:NamedSectionHash -or
+            $namedSection -cne $currentNamedSection -or
             [Text.Encoding]::UTF8.GetByteCount($namedSection) -ne
                 $script:NamedSectionLength) {
             throw 'bootstrap-section-mismatch'
         }
-        $coverageSource = Read-CanaryVerifiedDocument $bounded $engId $script:CoverageCommit
-        $coverageBytes = [Text.Encoding]::UTF8.GetBytes($coverageSource.text)
-        if ($coverageBytes.Length -ne $script:CoverageDocumentLength -or
-            (Get-CanaryHash $coverageBytes) -cne $script:CoverageDocumentHash) {
-            throw 'coverage-source-bytes-mismatch'
-        }
-        $declarations = @(Get-CanaryCoverageDeclarations $coverageSource.text $engId)
-        Assert-CanaryBootstrapHead $bounded $engId ([string]$engineering.id)
+        $declarations = $proof.declarations
+        [void](Assert-CanaryMergedMasterHead $bounded $engId `
+            ([string]$engineering.id) $mergedPin `
+            $proof.masterCommit $SourceSelector)
         $finalIdentity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
         Assert-CanaryAccountBinding $finalIdentity $identity
         $policyPath = 'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
@@ -957,13 +1783,13 @@ function Invoke-PrivateCanaryBootstrap {
                 id = ([string]$repository.id).ToLowerInvariant()
             }
             projectId = ([string]$project.id).ToLowerInvariant()
-            expectedAccount = $identity
-            operator = [ordered]@{
-                expectedCliUpn = [string]$identity.principalName
-            }
+            expectedAccount = [ordered]@{
+                id = $identity.id; descriptor = $identity.descriptor }
         }
         $engSource = [ordered]@{
-            projectName = 'Engineering'; repositoryName = 'EngHub'
+            organization = $Organization
+            projectName = $SourceSelector.projectName
+            repositoryName = $SourceSelector.repositoryName
             repositoryId = $engId; path = $script:DocumentPath
         }
         $owner = [ordered]@{} + $engSource
@@ -992,13 +1818,15 @@ function Invoke-PrivateCanaryBootstrap {
             $source = [ordered]@{} + $engSource
             $source.approved = $true
             $source.ruleId = $declarations[$i].ruleId
-            $source.commit = $script:CoverageCommit
-            $source.provenance = 'unmerged-reviewed-pr'
+            $source.commit = $proof.mergeCommit
+            $source.provenance = 'reviewed-merged-master-read-only'
             $source.reviewedPullRequestId = 17307009
             $source.reviewedHead = $script:CoverageCommit
-            $source.headVerified = $true
-            $source.documentHash = 'v1:sha256:' + $script:CoverageDocumentHash
-            $source.blobId = $coverageSource.blobId
+            $source.mergeCommit = $proof.mergeCommit
+            $source.masterCommit = $proof.masterCommit
+            $source.documentHash = 'v1:sha256:' + $mergedPin.documentHash
+            $source.documentLength = $mergedPin.documentLength
+            $source.blobId = $proof.document.blobId
             $source.section = $declarations[$i].section
             $source.sectionHash = $declarations[$i].sectionHash
             $source.policyLine = $declarations[$i].policyLine
@@ -1027,10 +1855,10 @@ function Invoke-PrivateCanaryBootstrap {
                     })))
         $rules['bpm-named-areequal-arguments@1'] = $namedRule
         $manifest = [ordered]@{
-            schemaVersion = 3; kind = 'private-read-only-canary-sources'
-            sourceAuthority = 'unmerged-reviewed-pr-is-candidate-only'
+            schemaVersion = 6; kind = 'private-merged-master-canary-sources'
+            sourceAuthority = 'merged-master-verified-read-only'
             accountProofDigest = 'v1:sha256:' + (Get-CanaryTextHash (
-                ConvertTo-AgentCanonicalJson -InputObject $identity))
+                ConvertTo-AgentCanonicalJson -InputObject $providerConfig.expectedAccount))
             verifiedUtc = [DateTime]::UtcNow.ToString('o')
             namedSection = $namedSectionSource
             rules = $rules
@@ -1050,8 +1878,8 @@ function Invoke-PrivateCanaryBootstrap {
             state = 'prepared-read-only'; signed = $false
             canaryExecuted = $false; providerReads = $readBudget.count
             providerWrites = 0
-            ruleCount = 4; candidateCount = 2
-            documentHash = 'v1:sha256:' + $script:CoverageDocumentHash
+            ruleCount = 4; mergedRuleCount = 2
+            documentHash = 'v1:sha256:' + $mergedPin.documentHash
             localCommit = $localCommit
         }
     }
@@ -1073,13 +1901,25 @@ function New-VerifiedCanaryRuleRegistry {
         [Parameter(Mandatory)][Collections.IDictionary]$ApprovedSources,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [scriptblock]$Read,
+        [string]$ExpectedAccountUniqueName,
+        [Collections.IDictionary]$SourceSelector,
+        [string]$SourceSelectorKey,
+        [Collections.IDictionary]$MergedPinEnvelope,
+        [string]$MergedPinKey,
         [switch]$Run
     )
     if (-not $Run) {
         return [ordered]@{ state = 'disabled'; providerReads = 0
             providerWrites = 0; evaluated = $false; writerEligible = $false }
     }
-    if (-not $Read -or -not [IO.Path]::IsPathFullyQualified($RepositoryRoot) -or
+    $mergedPin = Assert-CanaryReviewedMergedPin $MergedPinEnvelope `
+        $MergedPinKey $SourceSelector
+    if (-not $script:OwnerSourceReviewedInApprovedRepository) {
+        throw 'owner-source-provenance-unreviewed'
+    }
+    if (-not $Read -or
+        $ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$' -or
+        -not [IO.Path]::IsPathFullyQualified($RepositoryRoot) -or
         $ProviderConfig.provider -cne 'AzureDevOps' -or
         $ProviderConfig.repository -isnot [Collections.IDictionary] -or
         $ProviderConfig.expectedAccount -isnot [Collections.IDictionary] -or
@@ -1093,24 +1933,23 @@ function New-VerifiedCanaryRuleRegistry {
         [string]$ProviderConfig.expectedAccount.id -cnotmatch
             '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
         [string]$ProviderConfig.expectedAccount.descriptor -cnotmatch '^\S{1,512}$' -or
-        [string]$ProviderConfig.expectedAccount.principalName -cnotmatch
-            '^[^@\s]+@[^@\s]+$' -or
-        [string]$ProviderConfig.operator.expectedCliUpn -ine
-            [string]$ProviderConfig.expectedAccount.principalName -or
-        ($ProviderConfig.expectedAccount.Contains('uniqueName') -and
-            [string]$ProviderConfig.expectedAccount.uniqueName -ine
-                [string]$ProviderConfig.expectedAccount.principalName) -or
-        $ApprovedSources.schemaVersion -ne 3 -or
-        $ApprovedSources.kind -cne 'private-read-only-canary-sources' -or
+        $ProviderConfig.expectedAccount.Count -ne 2 -or
+        -not $ProviderConfig.expectedAccount.Contains('id') -or
+        -not $ProviderConfig.expectedAccount.Contains('descriptor') -or
+        $ProviderConfig.Contains('operator') -or
+        $ApprovedSources.schemaVersion -ne 6 -or
+        $ApprovedSources.kind -cne 'private-merged-master-canary-sources' -or
         $ApprovedSources.accountProofDigest -cne ('v1:sha256:' +
             (Get-CanaryTextHash (ConvertTo-AgentCanonicalJson `
                 -InputObject $ProviderConfig.expectedAccount))) -or
         $ApprovedSources.sourceAuthority -cne
-            'unmerged-reviewed-pr-is-candidate-only' -or
+            'merged-master-verified-read-only' -or
         $ApprovedSources.rules -isnot [Collections.IDictionary] -or
         $ApprovedSources.rules.Count -ne 4) {
         throw 'canary-receipt-invalid'
     }
+    [void](Assert-CanarySourceSelector $SourceSelector $SourceSelectorKey `
+            ([string]$ProviderConfig.repository.organization))
     $rules = $ApprovedSources.rules
     $owner = $rules['bpm-test-ownership@1']
     $namedSection = $ApprovedSources['namedSection']
@@ -1120,11 +1959,15 @@ function New-VerifiedCanaryRuleRegistry {
     $engId = [string]$owner.repositoryId
     foreach ($source in @($owner, $namedSection, $class, $redundant)) {
         $expectedCommit = if ($source -eq $class -or $source -eq $redundant) {
-            $script:CoverageCommit
+            $mergedPin.mergeCommit
         } else { $script:OwnerCommit }
         Assert-CanarySource $source $script:DocumentPath $expectedCommit
-        if ([string]$source.projectName -cne 'Engineering' -or
-            [string]$source.repositoryName -cne 'EngHub' -or
+        if ([string]$source.organization -cne
+                [string]$ProviderConfig.repository.organization -or
+            [string]$source.projectName -cne
+                [string]$SourceSelector.projectName -or
+            [string]$source.repositoryName -cne
+                [string]$SourceSelector.repositoryName -or
             [string]$source.repositoryId -cne $engId -or
             [string]$source.blobId -cnotmatch '^[a-f0-9]{40}$') {
             throw 'canary-receipt-invalid'
@@ -1153,7 +1996,7 @@ function New-VerifiedCanaryRuleRegistry {
     $readBudget = @{ count = 0 }
     $bounded = {
         param($Operation, $Request)
-        if ($readBudget.count -ge 26 -or $Operation -cnotin @('IdentityProof',
+        if ($readBudget.count -ge 120 -or $Operation -cnotin @('IdentityProof',
                 'GraphUser', 'GraphStorageKey', 'Project',
                 'Repository', 'PullRequest', 'Iterations', 'Ref', 'Commit',
                 'Item', 'RawItem')) {
@@ -1166,17 +2009,18 @@ function New-VerifiedCanaryRuleRegistry {
         }
         return $answer
     }.GetNewClosure()
-    $identity = Assert-CanaryAccountProof $bounded `
-        ([string]$ProviderConfig.expectedAccount.principalName)
+    $identity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
     $projectName = [string]$ProviderConfig.repository.project
     $project = & $bounded Project @{ projectName = $projectName }
     $repo = & $bounded Repository @{
         projectName = $projectName
         repositoryName = [string]$ProviderConfig.repository.name
     }
-    $engineering = & $bounded Project @{ projectName = 'Engineering' }
+    $engineering = & $bounded Project @{
+        projectName = $SourceSelector.projectName }
     $enghub = & $bounded Repository @{
-        projectName = 'Engineering'; repositoryName = 'EngHub'
+        projectName = $SourceSelector.projectName
+        repositoryName = $SourceSelector.repositoryName
     }
     Assert-CanaryAccountBinding $identity $ProviderConfig.expectedAccount
     if ([string]$project.id -ine [string]$ProviderConfig.projectId -or
@@ -1187,53 +2031,53 @@ function New-VerifiedCanaryRuleRegistry {
         [string]$repo.project.name -cne $projectName -or
         [string]$engineering.id -cnotmatch
             '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
-        [string]$engineering.name -cne 'Engineering' -or
+        [string]$engineering.name -cne [string]$SourceSelector.projectName -or
         [string]$enghub.id -ine $engId -or
-        [string]$enghub.name -cne 'EngHub' -or
+        [string]$enghub.name -cne [string]$SourceSelector.repositoryName -or
         [string]$enghub.project.id -ine [string]$engineering.id -or
-        [string]$enghub.project.name -cne 'Engineering') {
+        [string]$enghub.project.name -cne [string]$SourceSelector.projectName) {
         throw 'canary-identity-drift'
     }
-    Assert-CanaryBootstrapHead $bounded $engId ([string]$engineering.id)
-    $commit = & $bounded Commit @{
-        projectName = 'Engineering'; repositoryId = $engId
-        commit = $script:CoverageCommit
-    }
-    if ([string]$commit.commitId -ine $script:CoverageCommit) {
-        throw 'coverage-commit-unverified'
-    }
-    $ownerSource = Read-CanaryVerifiedDocument $bounded $engId $script:OwnerCommit
+    $proof = Assert-CanaryMergedMasterProof $bounded $engId `
+        ([string]$engineering.id) $mergedPin $SourceSelector
+    Assert-CanaryMergedHistory $bounded $engId $proof.masterCommit `
+        $script:OwnerCommit $SourceSelector
+    $ownerSource = Read-CanaryVerifiedDocument $bounded $engId `
+        $script:OwnerCommit $SourceSelector
+    $currentOwner = Read-CanaryVerifiedDocument $bounded $engId `
+        $proof.masterCommit $SourceSelector
     $ownerBytes = Get-CanarySection $ownerSource.text '## Claim ownership'
     $namedBytes = Get-CanaryRawSection $ownerSource.text `
         '## Named parameters for Assert'
+    $currentOwnerBytes = Get-CanarySection $currentOwner.text '## Claim ownership'
+    $currentNamedBytes = Get-CanaryRawSection $currentOwner.text `
+        '## Named parameters for Assert'
     if ($ownerSource.blobId -cne $owner.blobId -or
         (Get-CanaryTextHash $ownerBytes) -cne $script:OwnerHash -or
+        $ownerBytes -cne $currentOwnerBytes -or
         [Text.Encoding]::UTF8.GetByteCount($ownerBytes) -ne
             [int]$owner.sectionLength -or
         (Get-CanaryTextHash $namedBytes) -cne $script:NamedSectionHash -or
+        $namedBytes -cne $currentNamedBytes -or
         [Text.Encoding]::UTF8.GetByteCount($namedBytes) -ne
             $script:NamedSectionLength) {
         throw 'canary-section-drift'
     }
-    $coverageSource = Read-CanaryVerifiedDocument $bounded $engId $script:CoverageCommit
-    $coverageBytes = [Text.Encoding]::UTF8.GetBytes($coverageSource.text)
-    if ($coverageBytes.Length -ne $script:CoverageDocumentLength -or
-        (Get-CanaryHash $coverageBytes) -cne $script:CoverageDocumentHash) {
-        throw 'coverage-source-bytes-mismatch'
-    }
-    $declarations = @(Get-CanaryCoverageDeclarations $coverageSource.text $engId)
+    $declarations = $proof.declarations
     $candidateSources = @($class, $redundant)
     for ($i = 0; $i -lt 2; $i++) {
         $source = $candidateSources[$i]
         $expected = $declarations[$i]
         if ($source.ruleId -cne $expected.ruleId -or
-            $source.provenance -cne 'unmerged-reviewed-pr' -or
+            $source.provenance -cne 'reviewed-merged-master-read-only' -or
             $source.reviewedPullRequestId -ne 17307009 -or
             $source.reviewedHead -cne $script:CoverageCommit -or
-            $source.headVerified -cne $true -or
+            $source.mergeCommit -cne $proof.mergeCommit -or
+            $source.masterCommit -cne $proof.masterCommit -or
+            $source.documentLength -ne $mergedPin.documentLength -or
             $source.documentHash -cne
-                ('v1:sha256:' + $script:CoverageDocumentHash) -or
-            $source.blobId -cne $coverageSource.blobId -or
+                ('v1:sha256:' + $mergedPin.documentHash) -or
+            $source.blobId -cne $proof.document.blobId -or
             $source.section -cne $expected.section -or
             $source.sectionHash -cne $expected.sectionHash -or
             $source.policyLine -ne $expected.policyLine -or
@@ -1242,9 +2086,10 @@ function New-VerifiedCanaryRuleRegistry {
             throw 'coverage-receipt-drift'
         }
     }
-    Assert-CanaryBootstrapHead $bounded $engId ([string]$engineering.id)
-    $finalIdentity = Assert-CanaryAccountProof $bounded `
-        ([string]$ProviderConfig.expectedAccount.principalName)
+    [void](Assert-CanaryMergedMasterHead $bounded $engId `
+        ([string]$engineering.id) $mergedPin `
+        $proof.masterCommit $SourceSelector)
+    $finalIdentity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
     Assert-CanaryAccountBinding $finalIdentity $identity
     $path = 'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
     if ($named -isnot [Collections.IDictionary] -or
@@ -1292,7 +2137,7 @@ function New-VerifiedCanaryRuleRegistry {
             sourceAuthority = if ($ruleId -in @(
                     'bpm-test-class-coverage@2',
                     'bpm-redundant-method-coverage@2')) {
-                'verified-unmerged-candidate-only'
+                'verified-merged-master-read-only'
             } elseif ($ruleId -eq 'bpm-named-areequal-arguments@1') {
                 'repository-local-commit'
             } else { 'pinned-owner-section' }
@@ -1304,10 +2149,10 @@ function New-VerifiedCanaryRuleRegistry {
         }
     }
     return [ordered]@{
-        schemaVersion = 2
+        schemaVersion = 5
         kind = 'verified-read-only-canary-registry'
         state = 'verified-not-evaluated'
-        sourceAuthority = 'unmerged-reviewed-pr-is-candidate-only'
+        sourceAuthority = 'merged-master-verified-read-only'
         receiptDigest = 'v1:sha256:' + (Get-CanaryTextHash (
                 ConvertTo-AgentCanonicalJson -InputObject ([ordered]@{
                         schemaVersion = $ApprovedSources.schemaVersion
@@ -1335,6 +2180,11 @@ function Invoke-PrivateCanaryRuleRegistry {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [string]$AzureCliPath = 'az',
         [Collections.IDictionary]$BearerSession,
+        [string]$ExpectedAccountUniqueName,
+        [Collections.IDictionary]$SourceSelector,
+        [string]$SourceSelectorKey,
+        [Collections.IDictionary]$MergedPinEnvelope,
+        [string]$MergedPinKey,
         [switch]$Run
     )
     if (-not $Run) {
@@ -1344,6 +2194,14 @@ function Invoke-PrivateCanaryRuleRegistry {
     $organization = [string]$ProviderConfig.repository.organization
     if ($organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$') {
         throw 'canary-receipt-invalid'
+    }
+    [void](Assert-CanarySourceSelector $SourceSelector $SourceSelectorKey $organization)
+    [void](Assert-CanaryReviewedMergedPin $MergedPinEnvelope `
+            $MergedPinKey $SourceSelector)
+    if (-not $BearerSession) {
+        $ExpectedAccountUniqueName = Get-CanaryWorkAccountUpn $AzureCliPath
+    } elseif ($ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+        throw 'canary-work-account-unavailable'
     }
     $owned = $null
     try {
@@ -1367,7 +2225,9 @@ function Invoke-PrivateCanaryRuleRegistry {
         }.GetNewClosure()
         return New-VerifiedCanaryRuleRegistry -ProviderConfig $ProviderConfig `
             -ApprovedSources $ApprovedSources -RepositoryRoot $RepositoryRoot `
-            -Read $read -Run
+            -Read $read -ExpectedAccountUniqueName $ExpectedAccountUniqueName `
+            -SourceSelector $SourceSelector -SourceSelectorKey $SourceSelectorKey `
+            -MergedPinEnvelope $MergedPinEnvelope -MergedPinKey $MergedPinKey -Run
     }
     finally { if ($owned) { $owned.client.Dispose() } }
 }
@@ -1381,6 +2241,11 @@ function Invoke-PrivateCanarySignedIntake {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][int[]]$CanaryPullRequestIds,
         [string]$AzureCliPath = 'az',
+        [string]$ExpectedAccountUniqueName,
+        [Collections.IDictionary]$SourceSelector,
+        [string]$SourceSelectorKey,
+        [Collections.IDictionary]$MergedPinEnvelope,
+        [string]$MergedPinKey,
         [scriptblock]$Read,
         [scriptblock]$Provider,
         [switch]$Run
@@ -1406,6 +2271,15 @@ function Invoke-PrivateCanarySignedIntake {
     if ([bool]$Read -ne [bool]$Provider) {
         throw 'bound-transport-invalid'
     }
+    [void](Assert-CanarySourceSelector $SourceSelector $SourceSelectorKey `
+            ([string]$ProviderConfig.repository.organization))
+    [void](Assert-CanaryReviewedMergedPin $MergedPinEnvelope `
+            $MergedPinKey $SourceSelector)
+    if (-not $Read) {
+        $ExpectedAccountUniqueName = Get-CanaryWorkAccountUpn $AzureCliPath
+    } elseif ($ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+        throw 'canary-work-account-unavailable'
+    }
     $session = $null
     $created = $false
     $root = $null
@@ -1414,7 +2288,12 @@ function Invoke-PrivateCanarySignedIntake {
         $session = New-PrivateCanaryBearerSession $RepositoryRoot $AzureCliPath
     }
     $registryArgs = @{ ProviderConfig = $ProviderConfig
-        ApprovedSources = $ApprovedSources; RepositoryRoot = $RepositoryRoot; Run = $true }
+        ApprovedSources = $ApprovedSources; RepositoryRoot = $RepositoryRoot
+        ExpectedAccountUniqueName = $ExpectedAccountUniqueName
+        SourceSelector = $SourceSelector
+        SourceSelectorKey = $SourceSelectorKey
+        MergedPinEnvelope = $MergedPinEnvelope
+        MergedPinKey = $MergedPinKey; Run = $true }
     if ($Read) {
         $registryArgs.Read = $Read
         $registry = New-VerifiedCanaryRuleRegistry @registryArgs
@@ -1433,8 +2312,8 @@ function Invoke-PrivateCanarySignedIntake {
     $intake.projectName = [string]$ProviderConfig.repository.project
     $intake.projectId = [string]$ProviderConfig.projectId
     $intake.repositoryId = [string]$ProviderConfig.repository.id
-    $intake.schemaVersion = 2
-    $intake.principalProof = 'aad-graph-storage-key-v1'
+    $intake.schemaVersion = 3
+    $intake.principalProof = 'aad-graph-storage-key-alias-free-v2'
     $intake.expectedAccount = $ProviderConfig.expectedAccount
     $intake.enabled = $true
     $intake.pagination = [ordered]@{ mode = 'created-time-keyset' }
@@ -1446,10 +2325,15 @@ function Invoke-PrivateCanarySignedIntake {
     if (-not $Provider) {
         $Provider = New-ActivePrAzureDevOpsProvider -Config $intake `
             -BearerToken $session.token -BoundClient $session.client `
-            -VerifyReadPrincipal
+            -VerifyReadPrincipal -ExpectedPrincipalName $ExpectedAccountUniqueName
     }
     $preflight = & $Provider Identity @{ timeoutMilliseconds = 120000 }
     Assert-CanaryAccountBinding $preflight $ProviderConfig.expectedAccount
+    if ([string]$preflight.principalName -ine $ExpectedAccountUniqueName -or
+        ($preflight.Contains('uniqueName') -and
+            [string]$preflight.uniqueName -ine $ExpectedAccountUniqueName)) {
+        throw 'canary-principal-drift'
+    }
     $preflightReads = 1
     if ($null -ne $preflight['readCount']) {
         $extra = 0
@@ -1519,7 +2403,9 @@ function Invoke-PrivateCanarySignedIntake {
     $cohort = Invoke-ActivePrIntake -Config $intake -Provider $Provider `
         -StateRoot $root -RepositoryRoot $RepositoryRoot `
         -CanaryPullRequestIds $CanaryPullRequestIds -BeforePersist $beforePersist `
-        -CreationState $creationState -Run
+        -CreationState $creationState `
+        -ExpectedPrincipalName $ExpectedAccountUniqueName `
+        -ExpectedIdentity $preflight -Run
     $created = $creationState.created
     if (-not $created -or $null -eq $gate.pins -or
         $null -eq $gate.finalRegistry) {
@@ -1528,9 +2414,9 @@ function Invoke-PrivateCanarySignedIntake {
     $pins = $gate.pins
     $finalRegistry = $gate.finalRegistry
     $config = [ordered]@{
-        schemaVersion = 2
+        schemaVersion = 5
         kind = 'private-canary-signed-intake'
-        principalProof = 'aad-graph-storage-key-v1'
+        principalProof = 'aad-graph-storage-key-alias-free-v2'
         enabled = $false
         readOnly = $true
         dryRun = $true
@@ -1540,7 +2426,7 @@ function Invoke-PrivateCanarySignedIntake {
         projectId = $intake.projectId
         repositoryId = $intake.repositoryId
         expectedAccount = $intake.expectedAccount
-        sourceAuthority = 'unmerged-reviewed-pr-is-candidate-only'
+        sourceAuthority = 'merged-master-verified-read-only'
         receiptDigest = $registry.receiptDigest
         intakeGeneration = $cohort.generation
         intakeConfigDigest = $cohort.binding.configDigest
@@ -1915,6 +2801,11 @@ function Invoke-ActivePrCanaryQualification {
 }
 
 Export-ModuleMember -Function Invoke-ActivePrCanaryQualification,
-    Assert-CanaryCoverageSource, Invoke-PrivateCanaryBootstrap,
+    Assert-CanaryCoverageSource, Invoke-CanaryMergedMasterPreflight,
+    Invoke-CanaryMergedMasterDiscovery, Invoke-PrivateCanaryMergedPinProvision,
+    Get-CanaryWorkAccountUpn,
+    Read-CanaryPrivateSourceSelector, Read-CanaryPrivateMergedPin,
+    Read-CanaryPrivateReviewerApproval,
+    Invoke-PrivateCanaryBootstrap,
     New-VerifiedCanaryRuleRegistry, Invoke-PrivateCanaryRuleRegistry,
     Invoke-PrivateCanarySignedIntake, Invoke-PrivateCanaryIdentityDiagnostic

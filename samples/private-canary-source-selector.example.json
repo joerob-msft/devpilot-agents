@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "kind": "private-canary-source-selector",
+  "organization": "example-org",
+  "projectName": "ExampleSource",
+  "repositoryName": "ExamplePolicyRepo",
+  "signature": "v1:hmac-sha256:<sign-with-a-private-random-key>"
+}

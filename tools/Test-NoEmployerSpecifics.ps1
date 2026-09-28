@@ -12,7 +12,7 @@
     than left to code review.
 
     Exempt by design:
-      samples/  - sample configs exist precisely to show filled-in real values
+      samples/  - generic examples (private selector samples are checked below)
       tools/    - this checker necessarily contains the patterns it looks for
       node_modules/ - installed third-party dependencies are not toolkit code
       .git/
@@ -30,7 +30,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $rules = @(
-    @{ Name = 'ADO organization'; Pattern = '\bmsazure\b' }
+    @{ Name = 'ADO organization URL'; Pattern = 'https://dev\.azure\.com/(?!(?:example(?:-org|org)?|other)\b)[A-Za-z0-9_-]+' }
     @{ Name = 'Employer repo/product names'; Pattern = '\b(AAPT|Antares|ApiHub)\b' }
     @{ Name = 'Corporate email addresses'; Pattern = '[A-Za-z0-9._%+-]+@microsoft\.com' }
     @{ Name = 'Internal host names'; Pattern = '\b[a-z0-9-]+\.(visualstudio\.com|kusto\.windows\.net|azuresre\.ai)\b' }
@@ -89,6 +89,97 @@ function Test-PathExcluded {
 }
 
 $findings = New-Object System.Collections.Generic.List[object]
+
+$sampleRoot = Join-Path $RepoRoot 'samples'
+if (Test-Path -LiteralPath $sampleRoot) {
+    $fictionalOrganization = '^(?:https://dev\.azure\.com/)?(?:example(?:-org|org)?|other|contoso|sample(?:[-_][A-Za-z0-9_-]+)?|synthetic(?:[-_][A-Za-z0-9_-]+)?|test(?:[-_][A-Za-z0-9_-]+)?|demo(?:[-_][A-Za-z0-9_-]+)?|my(?:[-_][A-Za-z0-9_-]+)?)$'
+    $fictionalName = '(?i)^(?:example|sample|synthetic|test|demo|my|contoso)(?:(?:[-_. ][A-Za-z0-9._ -]+)|(?:Project|Repo|Repository|Org|Organization|Source|PolicyRepo))?$'
+    $adoUrl = 'https://(?:dev\.azure\.com/(?<modernOrg>[A-Za-z0-9_-]+)|(?<legacyOrg>[A-Za-z0-9_-]+)\.visualstudio\.com)(?:(?:/(?<project>(?!_apis(?:/|$)|_git(?:/|$))[A-Za-z0-9._~%+-]+))?(?:/(?:_git/(?<repository>[A-Za-z0-9._~%+-]+)|_apis(?:/(?<api>[A-Za-z0-9._~%+/-]+))?))?)?'
+    foreach ($file in (Get-ChildItem -LiteralPath $sampleRoot -Recurse -File -Filter '*.json')) {
+        $samplePath = [IO.Path]::GetRelativePath($RepoRoot, $file.FullName)
+        $raw = Get-Content -LiteralPath $file.FullName -Raw
+        $isSelectorFile = $file.Name -like 'private-canary-source-selector*.json'
+        $config = $raw | ConvertFrom-Json -AsHashtable
+        $repository = if ($config -is [Collections.IDictionary] -and
+            $config.Contains('repository')) { $config.repository } else { $null }
+        $organizations = @()
+        if ($config -is [Collections.IDictionary] -and
+            $config.Contains('organization')) {
+            $organizations += [string]$config.organization
+        }
+        if ($repository -is [Collections.IDictionary] -and
+            $repository.Contains('organization')) {
+            $organizations += [string]$repository.organization
+        }
+        $names = @()
+        if ($config -is [Collections.IDictionary] -and
+            ($config.Contains('organization') -or $isSelectorFile -or
+                ($config.Contains('provider') -and
+                    $config.provider -ceq 'AzureDevOps'))) {
+            foreach ($name in @('projectName', 'repositoryName')) {
+                if ($config.Contains($name)) { $names += [string]$config[$name] }
+            }
+            if ($repository -is [Collections.IDictionary]) {
+                foreach ($name in @('project', 'name')) {
+                    if ($repository.Contains($name)) {
+                        $names += [string]$repository[$name]
+                    }
+                }
+            }
+        }
+        $badAdoUrl = $false
+        $normalized = ConvertTo-Json -InputObject $config -Depth 50 -Compress
+        foreach ($match in [regex]::Matches($normalized, $adoUrl,
+                [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+            $org = if ($match.Groups['modernOrg'].Success) {
+                $match.Groups['modernOrg'].Value
+            } else { $match.Groups['legacyOrg'].Value }
+            $project = $match.Groups['project'].Value
+            $repositoryName = $match.Groups['repository'].Value
+            $api = $match.Groups['api'].Value
+            if ($api -match '(?:^|/)repositories/([^/]+)') {
+                $repositoryName = $Matches[1]
+            }
+            if ($org -cnotmatch $fictionalOrganization -or
+                ($project -and $project -cne '_apis' -and
+                    $project -cnotmatch $fictionalName) -or
+                ($repositoryName -and
+                    $repositoryName -cnotmatch $fictionalName)) {
+                $badAdoUrl = $true
+                break
+            }
+        }
+        if ($badAdoUrl -or
+            @($organizations | Where-Object {
+                    $_ -cnotmatch $fictionalOrganization
+                }).Count -gt 0 -or
+            @($names | Where-Object { $_ -cnotmatch $fictionalName }).Count -gt 0) {
+            [void]$findings.Add([pscustomobject]@{
+                    File = $samplePath; Line = 0
+                    Rule = 'Sample selectors must be fictional'
+                    Text = 'Unapproved sample source metadata'
+                })
+        }
+        if (-not $isSelectorFile -and
+            (-not $config.ContainsKey('kind') -or
+                $config.kind -cne 'private-canary-source-selector')) { continue }
+        $isFictional = $file.FullName -ceq (Join-Path $sampleRoot `
+                'private-canary-source-selector.example.json') -and
+            $config.Count -eq 6 -and $config.schemaVersion -eq 1 -and
+            $config.kind -ceq 'private-canary-source-selector' -and
+            $config.organization -ceq 'example-org' -and
+            $config.projectName -ceq 'ExampleSource' -and
+            $config.repositoryName -ceq 'ExamplePolicyRepo' -and
+            $config.signature -ceq 'v1:hmac-sha256:<sign-with-a-private-random-key>'
+        if (-not $isFictional) {
+            [void]$findings.Add([pscustomobject]@{
+                    File = $samplePath; Line = 0
+                    Rule = 'Private selector sample must be fictional'
+                    Text = 'Unapproved private selector sample'
+                })
+        }
+    }
+}
 
 foreach ($file in (Get-ChildItem -LiteralPath $RepoRoot -Recurse -File)) {
     $rel = $file.FullName.Substring($RepoRoot.Length).TrimStart('\', '/')

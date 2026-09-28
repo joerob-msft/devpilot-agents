@@ -4,6 +4,15 @@ BeforeAll {
     Import-Module (Join-Path $repo 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
     Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.ActivePrCanary.psm1') -Force
     $module = Get-Module DevPilot.ActivePrCanary
+    $script:sourceKey = 'b' * 64
+    $script:sourceSelector = [ordered]@{
+        schemaVersion = 1; kind = 'private-canary-source-selector'
+        organization = 'example-org'; projectName = 'ExampleSource'
+        repositoryName = 'ExamplePolicyRepo'; signature = ''
+    }
+    $script:sourceSelector.signature = & $module {
+        param($Selector, $Key) Get-CanarySignature $Selector $Key
+    } $script:sourceSelector $script:sourceKey
     $script:originalCoverageSource = & $module {
         @{ hash = $script:CoverageDocumentHash
             length = $script:CoverageDocumentLength }
@@ -52,7 +61,8 @@ BeforeAll {
                     [Text.Encoding]::UTF8.GetBytes($canonical))).ToLowerInvariant()
             $sources[$rule.id] = @{
                 approved = $true; ruleId = $rule.id
-                projectName = 'Engineering'; repositoryName = 'EngHub'
+                organization = 'example-org'
+                projectName = 'ExampleSource'; repositoryName = 'ExamplePolicyRepo'
                 repositoryId = $id; commit = $commit; path = $path
                 provenance = 'unmerged-reviewed-pr'; reviewedPullRequestId = 17307009
                 reviewedHead = $commit
@@ -84,7 +94,8 @@ Describe 'Immutable unmerged coverage source binding' {
     It 'returns two distinct declaration digests without asserting a current head or signing' {
         $c = Get-CoverageSourceCase
         $result = Assert-CanaryCoverageSource -ApprovedSources $c.sources `
-            -Provider $c.provider -Run
+            -Provider $c.provider -SourceSelector $script:sourceSelector `
+            -SourceSelectorKey $script:sourceKey -Run
         (@($result.Keys) -join ',') | Should -Be (
             @('schemaVersion', 'state', 'provenance', 'reviewCaution',
                 'reviewedPullRequestId', 'reviewedHead', 'headVerified',
@@ -124,7 +135,8 @@ Describe 'Immutable unmerged coverage source binding' {
                 declaration { $rule.declarationDigest = 'v1:sha256:' + ('0' * 64) }
             }
             { Assert-CanaryCoverageSource -ApprovedSources $c.sources `
-                    -Provider $c.provider -Run } | Should -Throw
+                    -Provider $c.provider -SourceSelector $script:sourceSelector `
+                    -SourceSelectorKey $script:sourceKey -Run } | Should -Throw
             if ($failure -ne 'declaration') { $c.state.calls | Should -Be 0 }
         }
     }
@@ -133,7 +145,8 @@ Describe 'Immutable unmerged coverage source binding' {
         $c.state.content = $c.state.content.Replace(
             'Exclude every test-project class.', 'Include every test-project class.')
         { Assert-CanaryCoverageSource -ApprovedSources $c.sources `
-                -Provider $c.provider -Run } | Should -Throw '*coverage-source-bytes-mismatch*'
+                -Provider $c.provider -SourceSelector $script:sourceSelector `
+                -SourceSelectorKey $script:sourceKey -Run } | Should -Throw '*coverage-source-bytes-mismatch*'
         $c = Get-CoverageSourceCase
         $c.state.content = $c.state.content.Replace(
             'Exclude every test-project class.', "## Unexpected`nTest class text.")
@@ -148,6 +161,7 @@ Describe 'Immutable unmerged coverage source binding' {
                 & (Get-Module DevPilot.ActivePrCanary) { $script:CoverageDocumentHash })
         }
         { Assert-CanaryCoverageSource -ApprovedSources $c.sources `
-                -Provider $c.provider -Run } | Should -Throw '*coverage-source-section-mismatch*'
+                -Provider $c.provider -SourceSelector $script:sourceSelector `
+                -SourceSelectorKey $script:sourceKey -Run } | Should -Throw '*coverage-source-section-mismatch*'
     }
 }

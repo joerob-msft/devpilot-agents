@@ -2,17 +2,14 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-    Prepares ACL-private read-only canary inputs from verified AAD GETs.
+    Verifies the reviewed merged master source without creating state.
 .DESCRIPTION
-    Disabled unless -Run is supplied. Preparation stops before intake,
-    dispatcher execution, HMAC signing, or any provider write.
+    Disabled without -Run. A reviewed repository-owned immutable source pin
+    must exist before any ADO request is made. No private root is used.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$Organization,
-    [Parameter(Mandatory)][string]$ProjectName,
-    [Parameter(Mandatory)][string]$RepositoryName,
-    [Parameter(Mandatory)][string]$StateRoot,
     [string]$SourceSelectorPath,
     [string]$SourceSelectorKeyPath,
     [string]$MergedPinPath,
@@ -25,8 +22,8 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 Import-Module (Join-Path $repo 'src\DevPilot.ActivePrCanary\DevPilot.ActivePrCanary.psm1')
 if (-not $Run) {
-    @{ state = 'disabled'; signed = $false; providerReads = 0
-        providerWrites = 0 } | ConvertTo-Json
+    @{ state = 'disabled'; providerReads = 0; providerWrites = 0 } |
+        ConvertTo-Json
     return
 }
 $source = Read-CanaryPrivateSourceSelector -SelectorPath $SourceSelectorPath `
@@ -35,10 +32,8 @@ $merged = Read-CanaryPrivateMergedPin -PinPath $MergedPinPath `
     -KeyPath $MergedPinKeyPath -RepositoryRoot $repo `
     -SourceSelector $source.selector
 $expected = Get-CanaryWorkAccountUpn $AzureCliPath
-Invoke-PrivateCanaryBootstrap -Organization $Organization `
-    -ProjectName $ProjectName -RepositoryName $RepositoryName `
-    -ExpectedAccountUniqueName $expected `
+Invoke-CanaryMergedMasterPreflight -Organization $Organization `
+    -ExpectedAccountUniqueName $expected -RepositoryRoot $repo `
     -SourceSelector $source.selector -SourceSelectorKey $source.key `
     -MergedPinEnvelope $merged.envelope -MergedPinKey $merged.key `
-    -StateRoot $StateRoot -RepositoryRoot $repo `
-    -AzureCliPath $AzureCliPath -Run:$Run | ConvertTo-Json -Depth 8
+    -AzureCliPath $AzureCliPath -Run | ConvertTo-Json -Depth 8

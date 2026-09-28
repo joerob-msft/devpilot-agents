@@ -192,7 +192,13 @@ function Get-IntakeBearerRoute {
 function Assert-IntakeConfig {
     param([Collections.IDictionary]$Config)
     $guidPattern = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
-    if ($Config.schemaVersion -notin @(1, 2) -or
+    if ($Config.schemaVersion -notin @(1, 2, 3) -or
+        ($Config.schemaVersion -eq 3 -and
+            ($Config.principalProof -cne 'aad-graph-storage-key-alias-free-v2' -or
+                $Config.expectedAccount -isnot [Collections.IDictionary] -or
+                $Config.expectedAccount.Count -ne 2 -or
+                -not $Config.expectedAccount.Contains('id') -or
+                -not $Config.expectedAccount.Contains('descriptor'))) -or
         ($Config.schemaVersion -eq 2 -and
             ($Config.principalProof -cne 'aad-graph-storage-key-v1' -or
                 [string]$Config.expectedAccount.principalName -cnotmatch
@@ -254,17 +260,31 @@ function Assert-IntakeConfig {
 }
 
 function Assert-IntakeAccount {
-    param([Collections.IDictionary]$Actual, [Collections.IDictionary]$Config)
+    param([Collections.IDictionary]$Actual, [Collections.IDictionary]$Config,
+        [string]$ExpectedPrincipalName)
     $expected = $Config.expectedAccount
     if ($Actual -isnot [Collections.IDictionary] -or
         [string]$Actual.id -ine [string]$expected.id -or
         [string]$Actual.descriptor -cne [string]$expected.descriptor -or
+        ($Config.schemaVersion -eq 3 -and
+            ([string]$Actual.principalName -ine $ExpectedPrincipalName -or
+                ($Actual.Contains('uniqueName') -and
+                    [string]$Actual.uniqueName -ine $ExpectedPrincipalName))) -or
         ($Config.schemaVersion -eq 2 -and
             ([string]$Actual.principalName -ine [string]$expected.principalName -or
                 ($Actual.Contains('uniqueName') -ne
                     $expected.Contains('uniqueName')))) -or
         ($expected.Contains('uniqueName') -and
             [string]$Actual.uniqueName -ine [string]$expected.uniqueName)) {
+        throw 'account-mismatch'
+    }
+}
+
+function Assert-IntakeAliasContinuity {
+    param([Collections.IDictionary]$Actual, [Collections.IDictionary]$Previous)
+    if ($Actual.Contains('uniqueName') -ne $Previous.Contains('uniqueName') -or
+        ($Actual.Contains('uniqueName') -and
+            [string]$Actual.uniqueName -ine [string]$Previous.uniqueName)) {
         throw 'account-mismatch'
     }
 }
@@ -721,7 +741,11 @@ function Assert-IntakeHead {
 
 function Get-IntakeDiscussionCounts {
     param([Collections.IDictionary]$Response, [Collections.IDictionary]$Config,
-        [Collections.IDictionary]$Head)
+        [Collections.IDictionary]$Head, [string]$ReviewerUniqueName)
+    if ($Config.schemaVersion -eq 3 -and $ReviewerUniqueName -and
+        $ReviewerUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+        throw 'account-mismatch'
+    }
     if ($Response.threads -isnot [array] -or $Response.threads.Count -gt
         [int]$Config.limits.maxThreads -or $null -eq $Response.count -or
         (Assert-IntakeNumber $Response.count threadCount 0 2000) -ne
@@ -762,7 +786,9 @@ function Get-IntakeDiscussionCounts {
     $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
         -Id ([string]$Config.expectedAccount.id) `
         -Descriptor ([string]$Config.expectedAccount.descriptor) `
-        -UniqueName ([string]$Config.expectedAccount['uniqueName'])
+        -UniqueName $(if ($Config.schemaVersion -eq 3) {
+                $ReviewerUniqueName
+            } else { [string]$Config.expectedAccount['uniqueName'] })
     $rawResponse = [ordered]@{
         count = $uniqueThreads.Count
         value = @($uniqueThreads)
@@ -874,10 +900,11 @@ function Get-ActivePrDiscussionCounts {
     [CmdletBinding()]
     param([Parameter(Mandatory)][Collections.IDictionary]$Response,
         [Parameter(Mandatory)][Collections.IDictionary]$Config,
-        [Parameter(Mandatory)][Collections.IDictionary]$Head)
+        [Parameter(Mandatory)][Collections.IDictionary]$Head,
+        [string]$ReviewerUniqueName)
     Assert-IntakeConfig $Config
     $verified = Assert-IntakeHead $Head ([int]$Head.pullRequestId) $Config
-    return Get-IntakeDiscussionCounts $Response $Config $verified
+    return Get-IntakeDiscussionCounts $Response $Config $verified $ReviewerUniqueName
 }
 
 function Get-ActivePrDiscussionSnapshot {
@@ -885,7 +912,8 @@ function Get-ActivePrDiscussionSnapshot {
     param([Parameter(Mandatory)][Collections.IDictionary]$Response,
         [Parameter(Mandatory)][Collections.IDictionary]$Config,
         [Parameter(Mandatory)][Collections.IDictionary]$Head,
-        [Parameter(Mandatory)][object]$Contract)
+        [Parameter(Mandatory)][object]$Contract,
+        [string]$ReviewerUniqueName)
     Assert-IntakeConfig $Config
     $verified = Assert-IntakeHead $Head ([int]$Head.pullRequestId) $Config
     $request = $Contract.Request
@@ -897,7 +925,7 @@ function Get-ActivePrDiscussionSnapshot {
         [string]$request.TargetRef -cne $verified.targetRef) {
         throw 'discussion-head-mismatch'
     }
-    [void](Get-IntakeDiscussionCounts $Response $Config $verified)
+    [void](Get-IntakeDiscussionCounts $Response $Config $verified $ReviewerUniqueName)
     $threads = [Collections.Generic.List[object]]::new()
     foreach ($thread in $Response.threads) {
         $copy = [ordered]@{}
@@ -914,7 +942,9 @@ function Get-ActivePrDiscussionSnapshot {
     $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
         -Id ([string]$Config.expectedAccount.id) `
         -Descriptor ([string]$Config.expectedAccount.descriptor) `
-        -UniqueName ([string]$Config.expectedAccount['uniqueName'])
+        -UniqueName $(if ($Config.schemaVersion -eq 3) {
+                $ReviewerUniqueName
+            } else { [string]$Config.expectedAccount['uniqueName'] })
     $convertPage = Get-Command ConvertTo-OwnerAzureDevOpsDiscussionPage
     $handler = {
         param($operation, $arguments)
@@ -1105,9 +1135,15 @@ function Invoke-ActivePrIntake {
         [int[]]$CanaryPullRequestIds,
         [scriptblock]$BeforePersist,
         [Collections.IDictionary]$CreationState,
+        [string]$ExpectedPrincipalName,
+        [Collections.IDictionary]$ExpectedIdentity,
         [switch]$Run
     )
     Assert-IntakeConfig $Config
+    if ($Config.schemaVersion -eq 3 -and $Run -and
+        $ExpectedPrincipalName -cnotmatch '^[^@\s]+@[^@\s]+$') {
+        throw 'account-mismatch'
+    }
     if ($PSBoundParameters.ContainsKey('CanaryPullRequestIds')) {
         if ($CanaryPullRequestIds.Count -lt 1 -or $CanaryPullRequestIds.Count -gt 2 -or
             @($CanaryPullRequestIds | Where-Object { $_ -lt 1 }).Count -gt 0 -or
@@ -1122,7 +1158,7 @@ function Invoke-ActivePrIntake {
         return New-IntakeDisabledSummary -Config $Config
     }
     $deferred = $null -ne $BeforePersist
-    if ($deferred -and ($Config.schemaVersion -ne 2 -or
+    if ($deferred -and ($Config.schemaVersion -notin @(2, 3) -or
             -not $PSBoundParameters.ContainsKey('CanaryPullRequestIds') -or
             $Config.projectEvidence.enabled -cne $true -or
             $null -eq $CreationState -or
@@ -1137,10 +1173,14 @@ function Invoke-ActivePrIntake {
         $CreationState.root = [IO.Path]::GetFullPath($StateRoot)
     }
     $preflightReads = 0
-    if ($Config.schemaVersion -eq 2) {
+    if ($Config.schemaVersion -in @(2, 3)) {
         $preflight = & $Provider Identity @{
             timeoutMilliseconds = [int]$Config.limits.maxSeconds * 1000 }
-        Assert-IntakeAccount $preflight $Config
+        Assert-IntakeAccount $preflight $Config $ExpectedPrincipalName
+        if ($Config.schemaVersion -eq 3 -and $ExpectedIdentity) {
+            Assert-IntakeAccount $ExpectedIdentity $Config $ExpectedPrincipalName
+            Assert-IntakeAliasContinuity $preflight $ExpectedIdentity
+        }
         $preflightReads = 1
         if ($null -ne $preflight['readCount']) {
             $preflightReads += Assert-IntakeNumber $preflight.readCount `
@@ -1217,7 +1257,7 @@ function Invoke-ActivePrIntake {
                 projectId = ([string]$Config.projectId).ToLowerInvariant()
                 repositoryId = ([string]$Config.repositoryId).ToLowerInvariant()
                 configDigest = Get-IntakeDigest $Config
-                accountProofDigest = if ($Config.schemaVersion -eq 2) {
+                accountProofDigest = if ($Config.schemaVersion -in @(2, 3)) {
                     Get-IntakeDigest $Config.expectedAccount
                 } else { $null }
             }
@@ -1259,7 +1299,10 @@ function Invoke-ActivePrIntake {
         $cutoff = [DateTime]::UtcNow.ToString('o')
         try {
                 $identity = Invoke-IntakeRead $Provider Identity @{} $Config ([ref]$reads) $clock
-                Assert-IntakeAccount $identity $Config
+                Assert-IntakeAccount $identity $Config $ExpectedPrincipalName
+                if ($Config.schemaVersion -eq 3) {
+                    Assert-IntakeAliasContinuity $identity $preflight
+                }
                 $first = Get-IntakePass $Provider $Config ([ref]$reads) $clock 1 $cutoff
                 $envelope.pages.first = $first.pages
                 $second = Get-IntakePass $Provider $Config ([ref]$reads) $clock 2 $cutoff
@@ -1516,7 +1559,8 @@ function Invoke-ActivePrIntake {
                                 $discussion = Invoke-IntakeRead $Provider Discussions @{
                                     pullRequestId = $id; iterationId = $before.iterationId
                                 } $Config ([ref]$reads) $clock
-                                $entry.discussion = Get-IntakeDiscussionCounts $discussion $Config $before
+                                $entry.discussion = Get-IntakeDiscussionCounts $discussion `
+                                    $Config $before ([string]$identity['uniqueName'])
                                 if ($null -eq $lines) {
                                     throw 'line-count-unavailable'
                                 }
@@ -1871,7 +1915,8 @@ function New-ActivePrAzureDevOpsProvider {
     param([Parameter(Mandatory)][Collections.IDictionary]$Config,
         [string]$AzureCliPath = 'az', [switch]$Bootstrap,
         [scriptblock]$RawGet, [switch]$VerifyReadPrincipal,
-        [string]$BearerToken, [Net.Http.HttpClient]$BoundClient)
+        [string]$BearerToken, [Net.Http.HttpClient]$BoundClient,
+        [string]$ExpectedPrincipalName)
     if (($null -eq $BoundClient) -ne [string]::IsNullOrEmpty($BearerToken) -or
         ($null -ne $BoundClient -and
             ($BearerToken -cnotmatch '^[A-Za-z0-9._~+/=-]{40,8192}$' -or
@@ -1893,9 +1938,15 @@ function New-ActivePrAzureDevOpsProvider {
         Assert-IntakeConfig $Config
     }
     $org = [string]$Config.organization
+    if ($Config.schemaVersion -eq 3 -and
+        ($null -eq $BoundClient -or
+            $ExpectedPrincipalName -cnotmatch '^[^@\s]+@[^@\s]+$')) {
+        throw 'bound-transport-invalid'
+    }
     if ($null -ne $BoundClient -and
-        ($Config.schemaVersion -ne 2 -or
-            $Config.principalProof -cne 'aad-graph-storage-key-v1' -or
+        (($Config.schemaVersion -eq 2 -and
+                $Config.principalProof -cne 'aad-graph-storage-key-v1') -or
+            $Config.schemaVersion -notin @(2, 3) -or
             $org -cnotmatch '^https://dev\.azure\.com/[A-Za-z0-9_-]+/?$')) {
         throw 'bound-transport-invalid'
     }
@@ -2205,12 +2256,17 @@ function New-ActivePrAzureDevOpsProvider {
                             [string]$Config.expectedAccount.id -or
                         $descriptor -cne
                             [string]$Config.expectedAccount.descriptor -or
-                        ($Config.expectedAccount.Contains('uniqueName') -ne
-                            ($null -ne $identity.uniqueName)) -or
+                        ($Config.schemaVersion -eq 2 -and
+                            $Config.expectedAccount.Contains('uniqueName') -ne
+                                ($null -ne $identity.uniqueName)) -or
                         ($null -ne $identity.uniqueName -and
                             ([string]$identity.uniqueName -cnotmatch '^[^@\s]+@[^@\s]+$' -or
                                 [string]$identity.uniqueName -ine
-                                    [string]$Config.expectedAccount.principalName))) {
+                                    $(if ($Config.schemaVersion -eq 3) {
+                                        $ExpectedPrincipalName
+                                    } else {
+                                        [string]$Config.expectedAccount.principalName
+                                    })))) {
                         throw 'account-mismatch'
                     }
                     $graphUrl = "https://vssps.dev.azure.com/$boundOrg/_apis/graph"
@@ -2228,16 +2284,22 @@ function New-ActivePrAzureDevOpsProvider {
                     if ([string]$user.descriptor -cne $descriptor -or
                         [string]$user.subjectKind -cne 'user' -or
                         [string]$user.principalName -ine
-                            [string]$Config.expectedAccount.principalName -or
+                            $(if ($Config.schemaVersion -eq 3) {
+                                $ExpectedPrincipalName
+                            } else {
+                                [string]$Config.expectedAccount.principalName
+                            }) -or
                         [string]$storage.value -cnotmatch $guid -or
                         [string]$storage.value -ine [string]$identity.id -or
                         [string]$identity.id -ine
                             [string]$Config.expectedAccount.id -or
                         $descriptor -cne
                             [string]$Config.expectedAccount.descriptor -or
-                        ($Config.expectedAccount.Contains('uniqueName') -ne
-                            ($null -ne $identity.uniqueName)) -or
-                        ($Config.expectedAccount.Contains('uniqueName') -and
+                        ($Config.schemaVersion -eq 2 -and
+                            $Config.expectedAccount.Contains('uniqueName') -ne
+                                ($null -ne $identity.uniqueName)) -or
+                        ($Config.schemaVersion -eq 2 -and
+                            $Config.expectedAccount.Contains('uniqueName') -and
                             [string]$identity.uniqueName -ine
                                 [string]$Config.expectedAccount.uniqueName)) {
                         throw 'account-mismatch'

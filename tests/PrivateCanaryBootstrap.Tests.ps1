@@ -23,6 +23,8 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
     public bool FailTransport = false;
     public bool Oversize = false;
     public bool InvalidJson = false;
+    public bool ThrottleHint = false;
+    public string BudgetRemaining;
     public byte[] Body;
     public byte[] GraphUserBody;
     public byte[] StorageKeyBody;
@@ -70,6 +72,15 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
         if (ContentEncoding != null) {
             response.Content.Headers.ContentEncoding.Add(ContentEncoding);
         }
+        if (ThrottleHint) {
+            response.Headers.RetryAfter =
+                new System.Net.Http.Headers.RetryConditionHeaderValue(
+                    TimeSpan.FromSeconds(1));
+        }
+        if (BudgetRemaining != null) {
+            response.Headers.Add("x-ms-ratelimit-remaining-resource",
+                BudgetRemaining);
+        }
         return Task.FromResult(response);
     }
 }
@@ -87,6 +98,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
     public List<string> Tokens = new List<string>();
     public bool OmitUniqueName = false;
     public bool DriftStorageKey = false;
+    public bool DriftGraphUpn = false;
     public bool ThrottleInventory = false;
     public bool TooLarge = false;
     public bool DriftRef = false;
@@ -115,7 +127,8 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             body = "{\"authenticatedUser\":{\"id\":\"33333333-3333-3333-3333-333333333333\",\"subjectDescriptor\":\"aad.synthetic\"" +
                 (OmitUniqueName ? "" : ",\"uniqueName\":\"service@example.invalid\"") + "}}";
         } else if (path.EndsWith("/graph/users/aad.synthetic")) {
-            body = "{\"descriptor\":\"aad.synthetic\",\"subjectKind\":\"user\",\"principalName\":\"service@example.invalid\"}";
+            body = "{\"descriptor\":\"aad.synthetic\",\"subjectKind\":\"user\",\"principalName\":\"" +
+                (DriftGraphUpn ? "other@example.invalid" : "service@example.invalid") + "\"}";
         } else if (path.EndsWith("/graph/storagekeys/aad.synthetic")) {
             body = "{\"value\":\"" + (DriftStorageKey
                 ? "44444444-4444-4444-4444-444444444444"
@@ -200,7 +213,11 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         @{ owner = $script:OwnerHash; named = $script:NamedSectionHash
             namedLength = $script:NamedSectionLength
             coverage = $script:CoverageDocumentHash
-            coverageLength = $script:CoverageDocumentLength }
+            coverageLength = $script:CoverageDocumentLength
+            mergedPin = $script:MergedMasterPin
+            approvedPinSignature = $script:ApprovedMergedPinSignature
+            reviewerPublicKey = $script:ReviewedMergedPinApprovalPublicKey
+            ownerReviewed = $script:OwnerSourceReviewedInApprovedRepository }
     }
     $script:ownerDocument = "## Claim ownership`nSynthetic owner rule.`n" +
         "## Named parameters for Assert`nSynthetic named rule.`n" +
@@ -209,6 +226,23 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         @('Synthetic convention.') * 219 +
         @('Every class uses an exclusion.', '',
             'Method exclusion is redundant.', '', '## Other', 'End.')) -join "`n"
+    $script:coverageDocument += "`n" + $script:ownerDocument
+    $script:sourceKey = 'b' * 64
+    $script:sourceSelector = [ordered]@{
+        schemaVersion = 1; kind = 'private-canary-source-selector'
+        organization = 'example-org'; projectName = 'ExampleSource'
+        repositoryName = 'ExamplePolicyRepo'; signature = ''
+    }
+    $script:sourceSelector.signature = & $module {
+        param($Selector, $Key)
+        Get-CanarySignature $Selector $Key
+    } $script:sourceSelector $script:sourceKey
+    $script:sourceOrg = $script:sourceSelector.organization
+    $script:sourcePrId = 17307009
+    $script:discoverySelector = @{
+        organization = $script:sourceOrg; projectName = 'ExampleSource'
+        repositoryName = 'ExamplePolicyRepo'
+    }
     function Get-BootstrapHash([byte[]]$Bytes) {
         [Convert]::ToHexString(
             [Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
@@ -234,6 +268,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
     }
     & $module {
         param($OwnerDocument, $CoverageDocument)
+        $script:OwnerSourceReviewedInApprovedRepository = $true
         $script:OwnerHash = Get-CanaryTextHash (
             Get-CanarySection $OwnerDocument '## Claim ownership')
         $named = Get-CanaryRawSection $OwnerDocument '## Named parameters for Assert'
@@ -242,7 +277,71 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         $bytes = [Text.Encoding]::UTF8.GetBytes($CoverageDocument)
         $script:CoverageDocumentHash = Get-CanaryHash $bytes
         $script:CoverageDocumentLength = $bytes.Length
+        $declarations = @(Get-CanaryCoverageDeclarations $CoverageDocument `
+                '44444444-4444-4444-4444-444444444444' ('d' * 40))
+        $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+        $blobId = [Convert]::ToHexString(
+            [Security.Cryptography.SHA1]::HashData(
+                [byte[]]($header + $bytes))).ToLowerInvariant()
+        $script:MergedMasterPin = @{
+            sourceCommit = $script:CoverageCommit
+            mergeCommit = 'd' * 40
+            documentHash = $script:CoverageDocumentHash
+            documentLength = $bytes.Length
+            blobId = $blobId
+            sectionHash = $declarations[0].sectionHash
+            classLineHash = $declarations[0].policyLineHash
+            redundantLineHash = $declarations[1].policyLineHash
+            classDeclarationDigest = $declarations[0].declarationDigest
+            redundantDeclarationDigest = $declarations[1].declarationDigest
+        }
     } $script:ownerDocument $script:coverageDocument
+    $script:mergedKey = 'c' * 64
+    $script:mergedEnvelope = [ordered]@{
+        schemaVersion = 1; kind = 'private-reviewed-merged-master-pin'
+        selectorSignature = $script:sourceSelector.signature
+        pin = & $module { $script:MergedMasterPin }
+        signature = ''
+    }
+    function Set-SyntheticMergedApproval {
+        $script:mergedEnvelope.signature = & $module {
+            param($Envelope, $Key)
+            Get-CanarySignature $Envelope $Key
+        } $script:mergedEnvelope $script:mergedKey
+        & $module {
+            param($Signature)
+            $script:ApprovedMergedPinSignature = $Signature
+        } $script:mergedEnvelope.signature
+    }
+    Set-SyntheticMergedApproval
+    $script:reviewerRsa = [Security.Cryptography.RSA]::Create(3072)
+    & $module {
+        param($Key)
+        $script:ReviewedMergedPinApprovalPublicKey = $Key
+    } ([Convert]::ToBase64String($script:reviewerRsa.ExportSubjectPublicKeyInfo()))
+    $script:reviewerApproval = [ordered]@{
+        schemaVersion = 1; kind = 'reviewed-merged-master-source-approval'
+        sourcePullRequestId = 17307009
+        selector = [ordered]@{
+            organization = $script:sourceOrg
+            projectName = $script:sourceSelector.projectName
+            repositoryName = $script:sourceSelector.repositoryName
+        }
+        selectorSignature = $script:sourceSelector.signature
+        pin = $script:mergedEnvelope.pin
+        signature = ''
+    }
+    function Set-SyntheticReviewerApproval($Approval) {
+        $bytes = & (Get-Module DevPilot.ActivePrCanary) {
+            param($Value)
+            Get-CanaryReviewerApprovalBytes $Value
+        } $Approval
+        $Approval.signature = 'v1:rsa-pss-sha256:' +
+            [Convert]::ToBase64String($script:reviewerRsa.SignData(
+                    $bytes, [Security.Cryptography.HashAlgorithmName]::SHA256,
+                    [Security.Cryptography.RSASignaturePadding]::Pss))
+    }
+    Set-SyntheticReviewerApproval $script:reviewerApproval
     function Get-BootstrapCase {
         $root = Join-Path $env:USERPROFILE (
             '.copilot\private-bootstrap-pester-' + [guid]::NewGuid().ToString('N'))
@@ -253,7 +352,9 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             owner = $script:ownerDocument
             coverage = $script:coverageDocument
             head = '7e6620ec40c9bc37c5a5e13d506053b0139c9206'
+            master = 'e' * 40
             headChecks = 0
+            refChecks = 0
         }
         $projectId = '22222222-2222-2222-2222-222222222222'
         $repoId = '11111111-1111-1111-1111-111111111111'
@@ -264,7 +365,22 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             param($op, $request)
             $state.reads.Add($op) | Out-Null
             $text = if ($request.commit -ceq $ownerCommit) {
-                $state.owner
+                if ($state.wrong -eq 'owner-content') {
+                    $state.owner.Replace('Synthetic owner rule.',
+                        'Changed owner rule.')
+                } elseif ($state.wrong -eq 'named-content') {
+                    $state.owner.Replace('Synthetic named rule.',
+                        'Changed named rule.')
+                } else { $state.owner }
+            } elseif ($request.commit -ceq $state.head -and
+                $state.wrong -eq 'candidate-content') {
+                $state.coverage + ' changed on reviewed source'
+            } elseif ($request.commit -ceq ('d' * 40) -and
+                $state.wrong -eq 'merge-content') {
+                $state.coverage + ' changed at merge'
+            } elseif ($request.commit -ceq $state.master -and
+                $state.wrong -eq 'master-content') {
+                $state.coverage + ' changed on master'
             } else { $state.coverage }
             $bytes = [Text.Encoding]::UTF8.GetBytes($text)
             $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
@@ -295,8 +411,11 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                         } else { '33333333-3333-3333-3333-333333333333' } }
                 }
                 Project {
-                    if ($request.projectName -ceq 'Engineering') {
-                        return @{ id = $engProjectId; name = 'Engineering' }
+                    if ($request.projectName -ceq 'ExampleSource') {
+                        return @{ id = $engProjectId
+                            name = if ($state.wrong -eq 'source-project') {
+                                'WrongSource'
+                            } else { 'ExampleSource' } }
                     }
                     return @{ id = $projectId
                         name = if ($state.wrong -eq 'project') {
@@ -304,9 +423,14 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                         } else { 'ExampleProject' } }
                 }
                 Repository {
-                    if ($request.projectName -ceq 'Engineering') {
-                        return @{ id = $engRepoId; name = 'EngHub'
-                            project = @{ id = $engProjectId; name = 'Engineering' } }
+                    if ($request.projectName -ceq 'ExampleSource') {
+                        return @{ id = if ($state.wrong -eq 'source-repo-id') {
+                                'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+                            } else { $engRepoId }
+                            name = if ($state.wrong -eq 'source-repo') {
+                                'WrongRepo'
+                            } else { 'ExamplePolicyRepo' }
+                            project = @{ id = $engProjectId; name = 'ExampleSource' } }
                     }
                     return @{ id = $repoId
                         name = if ($state.wrong -eq 'repository') {
@@ -316,10 +440,15 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                 }
                 PullRequest {
                     $state.headChecks++
-                    return @{ pullRequestId = 17307009; status = 'active'
+                    return @{ pullRequestId = 17307009
+                        status = if ($state.wrong -eq 'active-pr') {
+                            'active'
+                        } else { 'completed' }
+                        targetRefName = 'refs/heads/master'
                         sourceRefName = 'refs/heads/synthetic-review'
                         repository = @{ id = $engRepoId
-                            project = @{ id = $engProjectId; name = 'Engineering' } }
+                            project = @{ id = $engProjectId; name = 'ExampleSource' } }
+                        lastMergeCommit = @{ commitId = 'd' * 40 }
                         lastMergeSourceCommit = @{ commitId = if (
                                 $state.wrong -eq 'head-drift' -and
                                 $state.headChecks -gt 1) {
@@ -331,16 +460,29 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                                 sourceRefCommit = @{ commitId = $state.head } }) }
                 }
                 Ref {
-                    return @{ value = @(@{ name = 'refs/heads/synthetic-review'
-                                objectId = $state.head }) }
+                    $state.refChecks++
+                    return @{ value = @(@{ name = 'refs/heads/master'
+                                objectId = if ($state.wrong -eq 'master-ref-drift' -and
+                                    $state.refChecks -gt 1) {
+                                    'f' * 40
+                                } else { $state.master } }) }
                 }
                 Commit {
+                    if ($state.wrong -eq 'no-ancestry') {
+                        return @{ commitId = $request.commit
+                            parents = @('b' * 40) }
+                    }
                     return @{ commitId = if ($state.wrong -eq 'commit') {
                             'a' * 40
-                        } else { $request.commit } }
+                        } else { $request.commit }
+                        parents = @(if ($request.commit -ceq ('d' * 40)) {
+                                if ($state.wrong -eq 'owner-no-ancestry') {
+                                    'b' * 40
+                                } else { $ownerCommit }
+                            } else { 'd' * 40 }) }
                 }
                 Item {
-                    if ($request.projectName -cne 'Engineering' -or
+                    if ($request.projectName -cne 'ExampleSource' -or
                         $request.repositoryId -cne $engRepoId -or
                         $request.path -cne
                             '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md') {
@@ -365,9 +507,37 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         }.GetNewClosure()
         return @{ root = $root; state = $state; provider = $provider }
     }
+    function Get-ProvisionCase {
+        $case = Get-BootstrapCase
+        $case.root = Join-Path $env:USERPROFILE (
+            '.copilot\private-merged-pin-' + [guid]::NewGuid().ToString('N'))
+        $script:roots.Add($case.root)
+        $script:roots.Add("$($case.root).staging")
+        return $case
+    }
+    function Invoke-ProvisionCase($Case, $Approval = $script:reviewerApproval) {
+        if ([object]::ReferenceEquals($Approval, $script:reviewerApproval)) {
+            $Approval.pin = $script:mergedEnvelope.pin
+            Set-SyntheticReviewerApproval $Approval
+        }
+        & (Get-Module DevPilot.ActivePrCanary) {
+            param($Root, $Repository, $Selector, $SelectorKey, $Reviewed,
+                $Provider)
+            Invoke-CanaryMergedPinProvisionCore -StateRoot $Root `
+                -RepositoryRoot $Repository -SourceSelector $Selector `
+                -SourceSelectorKey $SelectorKey -ReviewerApproval $Reviewed `
+                -ExpectedAccountUniqueName 'service@example.invalid' `
+                -Read $Provider -Run
+        } $Case.root $repo $script:sourceSelector $script:sourceKey `
+            $Approval $Case.provider
+    }
     function Invoke-BootstrapCase($Case) {
-        Invoke-PrivateCanaryBootstrap -Organization 'example-org' `
+        Invoke-PrivateCanaryBootstrap -Organization $script:sourceOrg `
             -ProjectName 'ExampleProject' -RepositoryName 'ExampleRepo' `
+            -SourceSelector $script:sourceSelector `
+            -SourceSelectorKey $script:sourceKey `
+            -MergedPinEnvelope $script:mergedEnvelope `
+            -MergedPinKey $script:mergedKey `
             -ExpectedAccountUniqueName 'service@example.invalid' `
             -StateRoot $Case.root -RepositoryRoot $repo -Read $Case.provider -Run
     }
@@ -389,7 +559,12 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
     function Invoke-RegistryCase($InputCase) {
         New-VerifiedCanaryRuleRegistry -ProviderConfig $InputCase.config `
             -ApprovedSources $InputCase.sources -RepositoryRoot $repo `
-            -Read $InputCase.case.provider -Run
+            -Read $InputCase.case.provider `
+            -SourceSelector $script:sourceSelector `
+            -SourceSelectorKey $script:sourceKey `
+            -MergedPinEnvelope $script:mergedEnvelope `
+            -MergedPinKey $script:mergedKey `
+            -ExpectedAccountUniqueName 'service@example.invalid' -Run
     }
     function Get-SignedIntakeCase {
         param([switch]$Code, [switch]$MissingUniqueName)
@@ -442,7 +617,27 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             $state.calls.Add($op) | Out-Null
             switch -CaseSensitive ($op) {
                 Identity {
-                    return $config.expectedAccount
+                    $identity = @{ id = $config.expectedAccount.id
+                        descriptor = $config.expectedAccount.descriptor
+                        principalName = if ($state.wrong -eq 'identity-upn') {
+                            'other@example.invalid'
+                        } else { 'service@example.invalid' } }
+                    $identityReads = @($state.calls | Where-Object {
+                            $_ -eq 'Identity'
+                        }).Count
+                    if ((-not $MissingUniqueName -and
+                            $state.wrong -ne 'alias-added') -or
+                        ($state.wrong -eq 'alias-added' -and
+                            $identityReads -gt 1)) {
+                        $identity.uniqueName = if ($state.wrong -eq 'identity-alias') {
+                            'other@example.invalid'
+                        } else { 'service@example.invalid' }
+                    }
+                    if ($state.wrong -eq 'alias-removed' -and
+                        $identityReads -gt 1) {
+                        $identity.Remove('uniqueName')
+                    }
+                    return $identity
                 }
                 ListPage {
                     if ($request.skip -ne 0 -or $request.top -ne 51 -or
@@ -591,10 +786,20 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         Invoke-PrivateCanarySignedIntake -ProviderConfig $Case.input.config `
             -ApprovedSources $Case.input.sources -StateRoot $Case.root `
             -RepositoryRoot $repo -CanaryPullRequestIds @(17007699, 17109075) `
+            -SourceSelector $script:sourceSelector `
+            -SourceSelectorKey $script:sourceKey `
+            -MergedPinEnvelope $script:mergedEnvelope `
+            -MergedPinKey $script:mergedKey `
+            -ExpectedAccountUniqueName 'service@example.invalid' `
             -Read $Case.read -Provider $Case.provider -Run
     }
     function Invoke-RunnerCase($Case) {
         Invoke-PrivateCanaryEvaluation -StateRoot $Case.root `
+            -SourceSelector $script:sourceSelector `
+            -SourceSelectorKey $script:sourceKey `
+            -MergedPinEnvelope $script:mergedEnvelope `
+            -MergedPinKey $script:mergedKey `
+            -ExpectedAccountUniqueName 'service@example.invalid' `
             -RepositoryRoot $repo -Read $Case.read -Provider $Case.provider -Run
     }
     function New-RunnerThread($Case, [int]$Id, [string]$Body,
@@ -651,8 +856,9 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                     -TargetCommit $head.targetCommit -TargetRef $head.targetRef `
                     -RuleRepositoryId $source.repositoryId `
                     -RulePath $source.path.TrimStart('/') -RuleCommit $source.commit `
-                    -RuleSection $ruleId -RuleHash $rule.sourceHash -RuleLength 16286 `
-                    -ConfigId 'private-canary-signed-intake-v1' `
+                    -RuleSection $ruleId -RuleHash $rule.sourceHash `
+                    -RuleLength $source.documentLength `
+                    -ConfigId 'private-merged-master-canary-v1' `
                     -ConfigDigest ('v1:sha256:' + (Get-BootstrapHash (
                                 [Text.Encoding]::UTF8.GetBytes(
                                     (ConvertTo-AgentCanonicalJson $config))))) `
@@ -698,7 +904,12 @@ AfterAll {
         $script:NamedSectionLength = $Previous.namedLength
         $script:CoverageDocumentHash = $Previous.coverage
         $script:CoverageDocumentLength = $Previous.coverageLength
+        $script:MergedMasterPin = $Previous.mergedPin
+        $script:ApprovedMergedPinSignature = $Previous.approvedPinSignature
+        $script:ReviewedMergedPinApprovalPublicKey = $Previous.reviewerPublicKey
+        $script:OwnerSourceReviewedInApprovedRepository = $Previous.ownerReviewed
     } $script:old
+    $script:reviewerRsa.Dispose()
     foreach ($root in $script:roots) {
         if (Test-Path -LiteralPath $root) {
             Remove-Item -LiteralPath $root -Recurse -Force
@@ -706,7 +917,722 @@ AfterAll {
     }
 }
 Describe 'Read-only private canary input bootstrap' {
+    Describe 'Independent source-only private pin provisioner' {
+        It 'defaults off without approval, identity, ADO, or files' {
+            $c = Get-ProvisionCase
+            $result = Invoke-PrivateCanaryMergedPinProvision `
+                -StateRoot $c.root -RepositoryRoot $repo
+            $result.state | Should -Be 'disabled'
+            $result.privateFilesWritten | Should -Be 0
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+            { Invoke-PrivateCanaryMergedPinProvision `
+                    -StateRoot $c.root -RepositoryRoot $repo `
+                    -Read $c.provider -Run } | Should -Throw
+            $c.state.reads.Count | Should -Be 0
+            $json = & (Join-Path $repo 'tools\Provision-PrivateCanaryMergedPin.ps1')
+            ($json | ConvertFrom-Json -AsHashtable).state | Should -Be 'disabled'
+        }
+        It 'requires the pinned independent reviewer key before any GET or state' {
+            $c = Get-ProvisionCase
+            $module = Get-Module DevPilot.ActivePrCanary
+            $key = & $module { $script:ReviewedMergedPinApprovalPublicKey }
+            try {
+                & $module { $script:ReviewedMergedPinApprovalPublicKey = $null }
+                { Invoke-ProvisionCase $c } |
+                    Should -Throw '*merged-master-review-approval-unavailable*'
+                $c.state.reads.Count | Should -Be 0
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+            }
+            finally {
+                & $module {
+                    param($Key)
+                    $script:ReviewedMergedPinApprovalPublicKey = $Key
+                } $key
+            }
+        }
+        It 'rejects tampered approval, selector, and versions before source GET' {
+            foreach ($failure in @('signature', 'selector', 'pin', 'version',
+                    'kind', 'pull-request', 'public-key', 'missing-field',
+                    'source-commit')) {
+                $c = Get-ProvisionCase
+                $approval = [ordered]@{}
+                foreach ($field in $script:reviewerApproval.Keys) {
+                    $approval[$field] = $script:reviewerApproval[$field]
+                }
+                $approval.pin = @{} + $script:mergedEnvelope.pin
+                $approval.selector = @{} + $script:reviewerApproval.selector
+                Set-SyntheticReviewerApproval $approval
+                $module = Get-Module DevPilot.ActivePrCanary
+                $key = & $module { $script:ReviewedMergedPinApprovalPublicKey }
+                try {
+                    switch ($failure) {
+                        signature { $approval.signature =
+                            'v1:rsa-pss-sha256:' + ('A' * 512) }
+                        selector { $approval.selector.projectName = 'WrongSource' }
+                        pin { $approval.pin.mergeCommit = 'a' * 40 }
+                        version { $approval.schemaVersion = 2
+                            Set-SyntheticReviewerApproval $approval }
+                        kind { $approval.kind = 'active-candidate-approval'
+                            Set-SyntheticReviewerApproval $approval }
+                        'pull-request' {
+                            $approval.sourcePullRequestId = 7
+                            Set-SyntheticReviewerApproval $approval
+                        }
+                        'public-key' {
+                            & $module {
+                                $script:ReviewedMergedPinApprovalPublicKey =
+                                    [Convert]::ToBase64String(
+                                        [Security.Cryptography.RSA]::Create(
+                                            3072).ExportSubjectPublicKeyInfo())
+                            }
+                        }
+                        'missing-field' {
+                            $approval.Remove('pin')
+                            $approval.extra = 'not-an-approved-field'
+                        }
+                        'source-commit' {
+                            $approval.pin.sourceCommit = 'a' * 40
+                            Set-SyntheticReviewerApproval $approval
+                        }
+                    }
+                    { Invoke-ProvisionCase $c $approval } |
+                        Should -Throw -Because $failure
+                    $c.state.reads.Count | Should -Be 0
+                    Test-Path -LiteralPath $c.root | Should -BeFalse
+                }
+                finally {
+                    & $module {
+                        param($PublicKey)
+                        $script:ReviewedMergedPinApprovalPublicKey = $PublicKey
+                    } $key
+                }
+            }
+        }
+        It 'compares every approved pin field after fresh same-bearer proof' {
+            foreach ($field in @('mergeCommit', 'blobId', 'sectionHash',
+                    'classLineHash', 'redundantLineHash',
+                    'classDeclarationDigest', 'redundantDeclarationDigest')) {
+                $c = Get-ProvisionCase
+                $approval = [ordered]@{}
+                foreach ($name in $script:reviewerApproval.Keys) {
+                    $approval[$name] = $script:reviewerApproval[$name]
+                }
+                $approval.pin = @{} + $script:mergedEnvelope.pin
+                $approval.pin[$field] = if ($field -eq 'mergeCommit' -or
+                    $field -eq 'blobId') { 'a' * 40 } else {
+                    'v1:sha256:' + ('a' * 64) }
+                Set-SyntheticReviewerApproval $approval
+                { Invoke-ProvisionCase $c $approval } |
+                    Should -Throw -Because $field
+                $c.state.reads.Count | Should -BeGreaterThan 0
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+                Test-Path -LiteralPath "$($c.root).staging" | Should -BeFalse
+            }
+        }
+        It 'keeps the new root absent throughout all source and final identity reads' {
+            $c = Get-ProvisionCase
+            $original = $c.provider
+            $root = $c.root
+            $observed = [Collections.Generic.List[string]]::new()
+            $c.provider = {
+                param($op, $request)
+                if ((Test-Path -LiteralPath $root) -or
+                    (Test-Path -LiteralPath "$root.staging")) {
+                    $observed.Add($op)
+                }
+                & $original $op $request
+            }.GetNewClosure()
+            $result = Invoke-ProvisionCase $c
+            $result.state | Should -Be 'private-source-pin-prepared-unactivated'
+            $observed.Count | Should -Be 0
+            $c.state.reads[-1] | Should -Be 'GraphStorageKey'
+        }
+        It 'prepares only a synthetic ACL-private unactivated pin after final proof' {
+            $c = Get-ProvisionCase
+            $result = Invoke-ProvisionCase $c
+            $result.state | Should -Be 'private-source-pin-prepared-unactivated'
+            $result.privateFilesWritten | Should -Be 2
+            $result.providerWrites | Should -Be 0
+            $result.providerReads | Should -Be $c.state.reads.Count
+            @($c.state.reads | Where-Object { $_ -eq 'GraphStorageKey' }).Count |
+                Should -Be 2
+            $keyPath = Join-Path $c.root 'merged-pin.key'
+            $pinPath = Join-Path $c.root 'merged-pin.json'
+            [void](Assert-AgentTrustedFile $keyPath -AllowedRoot $c.root -Private)
+            [void](Assert-AgentTrustedFile $pinPath -AllowedRoot $c.root -Private)
+            $envelope = Get-Content $pinPath -Raw |
+                ConvertFrom-Json -AsHashtable
+            $envelope.pin.Count | Should -Be 10
+            $envelope.selectorSignature |
+                Should -Be $script:sourceSelector.signature
+            $module = Get-Module DevPilot.ActivePrCanary
+            $old = & $module { $script:ApprovedMergedPinSignature }
+            try {
+                { Read-CanaryPrivateMergedPin -PinPath $pinPath `
+                        -KeyPath $keyPath -RepositoryRoot $repo `
+                        -SourceSelector $script:sourceSelector } |
+                    Should -Throw '*merged-master-pin-unavailable*'
+                & $module {
+                    param($Signature)
+                    $script:ApprovedMergedPinSignature = $Signature
+                } $envelope.signature
+                $loaded = Read-CanaryPrivateMergedPin -PinPath $pinPath `
+                    -KeyPath $keyPath -RepositoryRoot $repo `
+                    -SourceSelector $script:sourceSelector
+                $loaded.envelope.pin.mergeCommit | Should -Be ('d' * 40)
+            }
+            finally {
+                & $module {
+                    param($Signature)
+                    $script:ApprovedMergedPinSignature = $Signature
+                } $old
+            }
+            (ConvertTo-Json -InputObject $result) |
+                Should -Not -Match 'ExampleSource|service@example.invalid|private-merged-pin|mergeCommit|aad.synthetic'
+            Test-Path -LiteralPath "$($c.root).staging" | Should -BeFalse
+        }
+        It 'leaves no root on active, changed, unproved, identity or throttle failure' {
+            foreach ($failure in @('active-pr', 'merge-content',
+                    'master-content', 'no-ancestry', 'graph-upn',
+                    'master-ref-drift', 'throttle')) {
+                $c = Get-ProvisionCase
+                if ($failure -eq 'throttle') {
+                    $original = $c.provider
+                    $c.provider = {
+                        param($op, $request)
+                        if ($op -ceq 'RawItem') { throw 'read-throttled' }
+                        & $original $op $request
+                    }.GetNewClosure()
+                } else { $c.state.wrong = $failure }
+                { Invoke-ProvisionCase $c } | Should -Throw -Because $failure
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+                Test-Path -LiteralPath "$($c.root).staging" | Should -BeFalse
+                @($c.state.reads | Where-Object {
+                        $_ -in @('Write', 'Post', 'ListPage')
+                    }).Count | Should -Be 0
+            }
+        }
+        It 'never uses an existing or repository-contained root and cleans a partial write' {
+            $c = Get-ProvisionCase
+            New-Item -ItemType Directory -Path $c.root | Out-Null
+            { Invoke-ProvisionCase $c } |
+                Should -Throw '*merged-master-private-root-invalid*'
+            Test-Path -LiteralPath $c.root | Should -BeTrue
+            $c.state.reads.Count | Should -Be 0
+            $alias = Join-Path $c.root (
+                '..\' + (Split-Path $c.root -Leaf))
+            $c.root = $alias
+            { Invoke-ProvisionCase $c } |
+                Should -Throw '*merged-master-private-root-invalid*'
+            Test-Path -LiteralPath ([IO.Path]::GetFullPath($alias)) |
+                Should -BeTrue
+            $c.state.reads.Count | Should -Be 0
+            $c.root = Join-Path $repo (
+                'private-merged-pin-' + [guid]::NewGuid().ToString('N'))
+            { Invoke-ProvisionCase $c } |
+                Should -Throw '*merged-master-private-root-invalid*'
+            $c.state.reads.Count | Should -Be 0
+            $c = Get-ProvisionCase
+            Mock Write-CanaryPrivateFile -ModuleName DevPilot.ActivePrCanary {
+                throw 'synthetic-write-failed'
+            } -ParameterFilter { $Path -like '*merged-pin.json' }
+            { Invoke-ProvisionCase $c } |
+                Should -Throw '*merged-master-private-provision-failed*'
+            $c.state.reads.Count | Should -BeGreaterThan 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+            Test-Path -LiteralPath "$($c.root).staging" | Should -BeFalse
+        }
+        It 'rejects a repo-contained or missing reviewer approval file without a GET' {
+            $c = Get-ProvisionCase
+            { Read-CanaryPrivateReviewerApproval -ApprovalPath (
+                    Join-Path $repo 'samples\private-canary-source-selector.example.json') `
+                    -RepositoryRoot $repo } |
+                Should -Throw '*merged-master-review-approval-unavailable*'
+            { Read-CanaryPrivateReviewerApproval -ApprovalPath (
+                    Join-Path (Split-Path $c.root -Parent) 'absent-approval.json') `
+                    -RepositoryRoot $repo } |
+                Should -Throw '*merged-master-review-approval-unavailable*'
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
+    }
+    It 'discovers only sanitized unapproved metadata with no pin, state, or writes' {
+        $c = Get-BootstrapCase
+        $module = Get-Module DevPilot.ActivePrCanary
+        $syntheticPin = & $module { $script:MergedMasterPin }
+        try {
+            & $module { $script:MergedMasterPin = $null }
+            $result = Invoke-CanaryMergedMasterDiscovery `
+                -Organization $script:sourceOrg `
+                -ExpectedAccountUniqueName 'service@example.invalid' `
+                -SourceSelector $script:discoverySelector `
+                -SourcePullRequestId $script:sourcePrId `
+                -RepositoryRoot $repo -Read $c.provider -Run
+            $result.state | Should -Be 'discovered-awaiting-provenance-pin-review'
+            $result.candidateBytesMatch | Should -BeTrue
+            $result.proposedPin.mergeCommit | Should -Be ('d' * 40)
+            $result.proposedPin.sourceCommit |
+                Should -Be '7e6620ec40c9bc37c5a5e13d506053b0139c9206'
+            $result.observedMasterCommit | Should -Be ('e' * 40)
+            $result.proposedPin.documentHash |
+                Should -Be $syntheticPin.documentHash
+            $result.proposedPin.classDeclarationDigest |
+                Should -Not -Be $result.proposedPin.redundantDeclarationDigest
+            @($c.state.reads | Where-Object { $_ -eq 'GraphStorageKey' }).Count |
+                Should -Be 2
+            @($c.state.reads | Where-Object {
+                    $_ -eq 'RawItem'
+                }).Count | Should -Be 3
+            $result.providerWrites | Should -Be 0
+            (ConvertTo-Json -InputObject $result -Depth 10) |
+                Should -Not -Match 'service@example.invalid|Synthetic convention|/documentation|aad.synthetic|bearer'
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
+        finally {
+            & $module { param($Pin) $script:MergedMasterPin = $Pin } $syntheticPin
+        }
+    }
+    It 'refuses discovery for active, changed, unproved, or mismatched identity' {
+        foreach ($failure in @('source-project', 'source-repo',
+                'source-repo-id',
+                'active-pr', 'candidate-content',
+                'merge-content', 'master-content', 'no-ancestry',
+                'master-ref-drift', 'graph-upn')) {
+            $c = Get-BootstrapCase
+            $c.state.wrong = $failure
+            { Invoke-CanaryMergedMasterDiscovery -Organization $script:sourceOrg `
+                    -ExpectedAccountUniqueName 'service@example.invalid' `
+                    -SourceSelector $script:discoverySelector `
+                    -SourcePullRequestId $script:sourcePrId `
+                    -RepositoryRoot $repo -Read $c.provider -Run } |
+                Should -Throw -Because $failure
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+            @($c.state.reads | Where-Object {
+                    $_ -in @('Write', 'Post', 'ListPage')
+                }).Count | Should -Be 0
+        }
+    }
+    It 'rejects even self-consistent newly pinned content before a GET' {
+        $c = Get-BootstrapCase
+        $module = Get-Module DevPilot.ActivePrCanary
+        $originalPin = & $module { @{} + $script:MergedMasterPin }
+        try {
+            & $module {
+                $script:MergedMasterPin.documentHash = 'a' * 64
+                $script:MergedMasterPin.documentLength++
+                $script:MergedMasterPin.sectionHash = 'v1:sha256:' + 'a' * 64
+            }
+            { Invoke-BootstrapCase $c } |
+                Should -Throw '*merged-master-pin-unavailable*'
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
+        finally {
+            & $module { param($Pin) $script:MergedMasterPin = $Pin } $originalPin
+            $script:mergedEnvelope.pin = $originalPin
+            Set-SyntheticMergedApproval
+        }
+    }
+    It 'rejects independently wrong section, line, and declaration pins' {
+        $module = Get-Module DevPilot.ActivePrCanary
+        foreach ($field in @('sectionHash', 'classLineHash',
+                'redundantLineHash', 'classDeclarationDigest',
+                'redundantDeclarationDigest')) {
+            $c = Get-BootstrapCase
+            $originalPin = & $module { @{} + $script:MergedMasterPin }
+            try {
+                & $module {
+                    param($Name)
+                    $script:MergedMasterPin[$Name] = 'v1:sha256:' + 'a' * 64
+                } $field
+                Set-SyntheticMergedApproval
+                { Invoke-BootstrapCase $c } |
+                    Should -Throw '*merged-master-declaration-drift*' -Because $field
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+            }
+            finally {
+                & $module { param($Pin) $script:MergedMasterPin = $Pin } $originalPin
+                $script:mergedEnvelope.pin = $originalPin
+                Set-SyntheticMergedApproval
+            }
+        }
+    }
+    It 'refuses a different organization before any GET or state' {
+        $c = Get-BootstrapCase
+        { Invoke-CanaryMergedMasterDiscovery -Organization 'wrong-org' `
+                -ExpectedAccountUniqueName 'service@example.invalid' `
+                -SourceSelector $script:discoverySelector `
+                -SourcePullRequestId $script:sourcePrId `
+                -RepositoryRoot $repo -Read $c.provider -Run } |
+            Should -Throw '*source-selector-invalid*'
+        $c.state.reads.Count | Should -Be 0
+        Test-Path -LiteralPath $c.root | Should -BeFalse
+    }
+    It 'rejects a malformed selector or wrong PR before a GET or state' {
+        $c = Get-BootstrapCase
+        $selector = @{} + $script:discoverySelector
+        $selector.projectName = '..'
+        { Invoke-CanaryMergedMasterDiscovery -Organization $script:sourceOrg `
+                -ExpectedAccountUniqueName 'service@example.invalid' `
+                -SourceSelector $selector -SourcePullRequestId $script:sourcePrId `
+                -RepositoryRoot $repo -Read $c.provider -Run } |
+            Should -Throw '*source-selector-invalid*'
+        { Invoke-CanaryMergedMasterDiscovery -Organization $script:sourceOrg `
+                -ExpectedAccountUniqueName 'service@example.invalid' `
+                -SourceSelector $script:discoverySelector `
+                -SourcePullRequestId 1 `
+                -RepositoryRoot $repo -Read $c.provider -Run } |
+            Should -Throw '*source-selector-invalid*'
+        $c.state.reads.Count | Should -Be 0
+        Test-Path -LiteralPath $c.root | Should -BeFalse
+    }
+    It 'fails closed on a plausible wrong source route after bounded reads, without state' {
+        $c = Get-BootstrapCase
+        $wrong = @{} + $script:discoverySelector
+        $wrong.projectName = 'WrongSource'
+        { Invoke-CanaryMergedMasterDiscovery -Organization $script:sourceOrg `
+                -ExpectedAccountUniqueName 'service@example.invalid' `
+                -SourceSelector $wrong -SourcePullRequestId $script:sourcePrId `
+                -RepositoryRoot $repo -Read $c.provider -Run } | Should -Throw
+        $c.state.reads.Count | Should -BeGreaterThan 0
+        $c.state.reads.Count | Should -BeLessOrEqual 5
+        Test-Path -LiteralPath $c.root | Should -BeFalse
+    }
+    It 'cannot load a tracked fictional sample as operator authority' {
+        { Read-CanaryPrivateSourceSelector `
+                -SelectorPath (Join-Path $repo `
+                    'samples\private-canary-source-selector.example.json') `
+                -KeyPath (Join-Path $repo `
+                    'samples\private-canary-source-selector.example.json') `
+                -RepositoryRoot $repo } |
+            Should -Throw '*source-selector-invalid*'
+    }
+    It 'rejects non-fictional private-selector samples in the hygiene check' {
+        $sampleRoot = Join-Path $TestDrive 'samples'
+        [void](New-Item -ItemType Directory -Path $sampleRoot -Force)
+        $example = Join-Path $repo `
+            'samples\private-canary-source-selector.example.json'
+        $target = Join-Path $sampleRoot `
+            'private-canary-source-selector.example.json'
+        Copy-Item -LiteralPath $example -Destination $target
+        $check = Join-Path $repo 'tools\Test-NoEmployerSpecifics.ps1'
+        $null = & pwsh -NoProfile -File $check -RepoRoot $TestDrive
+        $LASTEXITCODE | Should -Be 0
+        $bad = Get-Content -LiteralPath $target -Raw |
+            ConvertFrom-Json -AsHashtable
+        $bad.projectName = 'UnexpectedSource'
+        $bad | ConvertTo-Json | Set-Content -LiteralPath $target
+        $output = & pwsh -NoProfile -File $check -RepoRoot $TestDrive
+        $LASTEXITCODE | Should -Be 1
+        ($output -join "`n") | Should -Match `
+            'Private selector sample must be fictional'
+    }
+    It 'rejects a production-looking bare organization or URL in generic samples' {
+        $sampleRoot = Join-Path $TestDrive 'samples'
+        [void](New-Item -ItemType Directory -Path $sampleRoot -Force)
+        $check = Join-Path $repo 'tools\Test-NoEmployerSpecifics.ps1'
+        $target = Join-Path $sampleRoot 'sample.config.json'
+        @{ organization = 'enterprise-tenant' } | ConvertTo-Json |
+            Set-Content -LiteralPath $target
+        $output = & pwsh -NoProfile -File $check -RepoRoot $TestDrive
+        $LASTEXITCODE | Should -Be 1
+        ($output -join "`n") | Should -Match 'Sample selectors must be fictional'
+        @{ organization = ('https://dev.azure.com/' + 'enterprise-tenant') } |
+            ConvertTo-Json | Set-Content -LiteralPath $target
+        $output = & pwsh -NoProfile -File $check -RepoRoot $TestDrive
+        $LASTEXITCODE | Should -Be 1
+        ($output -join "`n") | Should -Match 'Sample selectors must be fictional'
+    }
+    It 'rejects legacy source URLs, API repository routes and disguised names' {
+        $fixtureRoot = Join-Path $TestDrive 'legacy-url-fixture'
+        $sampleRoot = Join-Path $fixtureRoot 'samples'
+        [void](New-Item -ItemType Directory -Path $sampleRoot -Force)
+        $check = Join-Path $repo 'tools\Test-NoEmployerSpecifics.ps1'
+        $target = Join-Path $sampleRoot 'sample.config.json'
+        $legacyHost = 'visualstudio.com'
+        @{ sourceUrl = "https://example.$legacyHost/ExampleProject/_git/ExampleRepo" } |
+            ConvertTo-Json | Set-Content -LiteralPath $target
+        $null = & pwsh -NoProfile -File $check -RepoRoot $fixtureRoot
+        $LASTEXITCODE | Should -Be 0
+        @{ sourceUrl = "https://example.$legacyHost/_apis/git/repositories/ExampleRepo" } |
+            ConvertTo-Json | Set-Content -LiteralPath $target
+        $null = & pwsh -NoProfile -File $check -RepoRoot $fixtureRoot
+        $LASTEXITCODE | Should -Be 0
+        foreach ($url in @(
+                "https://tenant.$legacyHost/Project/_git/Repo",
+                "https://example.$legacyHost/ExampleProject/_apis/git/repositories/EnterpriseRepo",
+                "https://example.$legacyHost/_apis/git/repositories/EnterpriseRepo",
+                'https://dev.azure.com/example-org/_apis/git/repositories/EnterpriseRepo',
+                'https://dev.azure.com/example-org/ExampleProject/_git/EnterpriseRepo')) {
+            @{ sourceUrl = $url } | ConvertTo-Json |
+                Set-Content -LiteralPath $target
+            $output = & pwsh -NoProfile -File $check -RepoRoot $fixtureRoot
+            $LASTEXITCODE | Should -Be 1
+            ($output -join "`n") | Should -Match `
+                'Sample selectors must be fictional'
+        }
+        @{ organization = 'example-org'; projectName = 'myServiceRepo' } |
+            ConvertTo-Json | Set-Content -LiteralPath $target
+        $output = & pwsh -NoProfile -File $check -RepoRoot $fixtureRoot
+        $LASTEXITCODE | Should -Be 1
+        ($output -join "`n") | Should -Match 'Sample selectors must be fictional'
+    }
+    It 'inspects nested sample JSON for org-scoped legacy source routes' {
+        $fixtureRoot = Join-Path $TestDrive 'nested-url-fixture'
+        $sampleRoot = Join-Path $fixtureRoot 'samples'
+        $nested = Join-Path $sampleRoot 'subdir'
+        [void](New-Item -ItemType Directory -Path $nested -Force)
+        $target = Join-Path $nested 'sample.config.json'
+        $legacyHost = 'visualstudio.com'
+        @{ sourceUrl = "https://tenant.$legacyHost/_apis/git/repositories/EnterpriseRepo" } |
+            ConvertTo-Json | Set-Content -LiteralPath $target
+        $check = Join-Path $repo 'tools\Test-NoEmployerSpecifics.ps1'
+        $output = & pwsh -NoProfile -File $check -RepoRoot $fixtureRoot
+        $LASTEXITCODE | Should -Be 1
+        ($output -join "`n") | Should -Match 'Sample selectors must be fictional'
+        ($output -join "`n") | Should -Match 'subdir'
+    }
+    It 'keeps inherited Owner and Named provenance unapproved until separately reviewed' {
+        $c = Get-BootstrapCase
+        $module = Get-Module DevPilot.ActivePrCanary
+        try {
+            & $module { $script:OwnerSourceReviewedInApprovedRepository = $false }
+            { Invoke-BootstrapCase $c } |
+                Should -Throw '*owner-source-provenance-unreviewed*'
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
+        finally {
+            & $module { $script:OwnerSourceReviewedInApprovedRepository = $true }
+        }
+    }
+    It 'refuses separate Owner ancestry and raw-source drift before private state' {
+        foreach ($failure in @('owner-no-ancestry', 'owner-content',
+                'named-content')) {
+            $c = Get-BootstrapCase
+            $c.state.wrong = $failure
+            { Invoke-BootstrapCase $c } | Should -Throw -Because $failure
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+            @($c.state.reads | Where-Object { $_ -in @('Write', 'Post') }).Count |
+                Should -Be 0
+        }
+    }
+    It 'has no live source pin and stops the stateless gate before any GET or state' {
+        $c = Get-BootstrapCase
+        $module = Get-Module DevPilot.ActivePrCanary
+        $syntheticPin = & $module { $script:MergedMasterPin }
+        $approved = & $module { $script:ApprovedMergedPinSignature }
+        try {
+            & $module {
+                $script:MergedMasterPin = $null
+                $script:ApprovedMergedPinSignature = $null
+            }
+            { Invoke-CanaryMergedMasterPreflight -Organization $script:sourceOrg `
+                    -ExpectedAccountUniqueName 'service@example.invalid' `
+                    -SourceSelector $script:sourceSelector `
+                    -SourceSelectorKey $script:sourceKey `
+                    -MergedPinEnvelope $script:mergedEnvelope `
+                    -MergedPinKey $script:mergedKey `
+                    -RepositoryRoot $repo -Read $c.provider -Run } |
+                Should -Throw '*merged-master-pin-unavailable*'
+            { Invoke-BootstrapCase $c } |
+                Should -Throw '*merged-master-pin-unavailable*'
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
+        finally {
+            & $module {
+                param($Pin, $Signature)
+                $script:MergedMasterPin = $Pin
+                $script:ApprovedMergedPinSignature = $Signature
+            } $syntheticPin $approved
+        }
+    }
+    It 'rejects an unapproved private pin before reading any private file or making a GET' {
+        $c = Get-BootstrapCase
+        $module = Get-Module DevPilot.ActivePrCanary
+        $approved = & $module { $script:ApprovedMergedPinSignature }
+        try {
+            & $module { $script:ApprovedMergedPinSignature = $null }
+            { Read-CanaryPrivateMergedPin -PinPath 'unread-pin' `
+                    -KeyPath 'unread-key' -RepositoryRoot $repo `
+                    -SourceSelector $script:sourceSelector } |
+                Should -Throw '*merged-master-pin-unavailable*'
+            { Invoke-BootstrapCase $c } |
+                Should -Throw '*merged-master-pin-unavailable*'
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
+        finally {
+            & $module {
+                param($Signature)
+                $script:ApprovedMergedPinSignature = $Signature
+            } $approved
+        }
+    }
+    It 'loads only an external ACL-private, approval-bound synthetic pin' {
+        $c = Get-BootstrapCase
+        $created = $false
+        $root = Resolve-AgentTrustedRoot -Path $c.root -Kind durable-state `
+            -RepositoryRoot $repo -Create -CreatedByCaller ([ref]$created)
+        $created | Should -BeTrue
+        $pinPath = Join-Path $root 'synthetic-merged-pin.json'
+        $keyPath = Join-Path $root 'synthetic-merged-pin.key'
+        $module = Get-Module DevPilot.ActivePrCanary
+        & $module {
+            param($PinPath, $KeyPath, $Envelope, $Key)
+            Write-CanaryPrivateFile $PinPath ([Text.Encoding]::UTF8.GetBytes(
+                    (ConvertTo-Json -InputObject $Envelope -Depth 8 -Compress)))
+            Write-CanaryPrivateFile $KeyPath ([Text.Encoding]::UTF8.GetBytes($Key))
+        } $pinPath $keyPath $script:mergedEnvelope $script:mergedKey
+        $loaded = Read-CanaryPrivateMergedPin -PinPath $pinPath `
+            -KeyPath $keyPath -RepositoryRoot $repo `
+            -SourceSelector $script:sourceSelector
+        $loaded.envelope.signature | Should -Be $script:mergedEnvelope.signature
+        $loaded.envelope.pin.mergeCommit | Should -Be ('d' * 40)
+        { Read-CanaryPrivateMergedPin -PinPath (
+                Join-Path $repo 'samples\private-canary-source-selector.example.json') `
+                -KeyPath $keyPath -RepositoryRoot $repo `
+                -SourceSelector $script:sourceSelector } |
+            Should -Throw '*merged-master-pin-unavailable*'
+        $c.state.reads.Count | Should -Be 0
+    }
+    It 'rejects changed, mismatched, and previous-version private pins before any GET' {
+        foreach ($failure in @('selector', 'pin', 'signature', 'key',
+                'version', 'kind', 'approval')) {
+            $c = Get-BootstrapCase
+            $pin = @{} + $script:mergedEnvelope.pin
+            $envelope = [ordered]@{}
+            foreach ($field in $script:mergedEnvelope.Keys) {
+                $envelope[$field] = $script:mergedEnvelope[$field]
+            }
+            $envelope.pin = $pin
+            $key = $script:mergedKey
+            $module = Get-Module DevPilot.ActivePrCanary
+            $originalApproval = & $module { $script:ApprovedMergedPinSignature }
+            try {
+                switch ($failure) {
+                    selector { $envelope.selectorSignature =
+                        'v1:hmac-sha256:' + ('a' * 64) }
+                    pin { $pin.mergeCommit = 'a' * 40 }
+                    signature { $envelope.signature =
+                        'v1:hmac-sha256:' + ('a' * 64) }
+                    key { $key = 'd' * 64 }
+                    version { $envelope.schemaVersion = 2 }
+                    kind { $envelope.kind = 'private-active-candidate-pin' }
+                    approval {
+                        & $module {
+                            $script:ApprovedMergedPinSignature =
+                                'v1:hmac-sha256:' + ('a' * 64)
+                        }
+                    }
+                }
+                { Invoke-CanaryMergedMasterPreflight `
+                        -Organization $script:sourceOrg `
+                        -ExpectedAccountUniqueName 'service@example.invalid' `
+                        -SourceSelector $script:sourceSelector `
+                        -SourceSelectorKey $script:sourceKey `
+                        -MergedPinEnvelope $envelope -MergedPinKey $key `
+                        -RepositoryRoot $repo -Read $c.provider -Run } |
+                    Should -Throw '*merged-master-pin-unavailable*' -Because $failure
+                $c.state.reads.Count | Should -Be 0
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+            }
+            finally {
+                & $module {
+                    param($Signature)
+                    $script:ApprovedMergedPinSignature = $Signature
+                } $originalApproval
+            }
+        }
+    }
+    It 'proves a completed PR and advanced master in memory and rechecks the account' {
+        $c = Get-BootstrapCase
+        $c.state.master = 'f' * 40
+        $proof = Invoke-CanaryMergedMasterPreflight -Organization $script:sourceOrg `
+            -ExpectedAccountUniqueName 'service@example.invalid' `
+            -SourceSelector $script:sourceSelector `
+            -SourceSelectorKey $script:sourceKey `
+            -MergedPinEnvelope $script:mergedEnvelope `
+            -MergedPinKey $script:mergedKey `
+            -RepositoryRoot $repo -Read $c.provider -Run
+        $proof.state | Should -Be 'merged-master-proved-read-only'
+        $proof.mergeCommit | Should -Be ('d' * 40)
+        $proof.masterCommit | Should -Be ('f' * 40)
+        $proof.providerWrites | Should -Be 0
+        @($c.state.reads | Where-Object { $_ -eq 'GraphStorageKey' }).Count |
+            Should -Be 2
+        Test-Path -LiteralPath $c.root | Should -BeFalse
+    }
+    It 'rejects active PR, changed master bytes and unproved history before a root' {
+        foreach ($failure in @('active-pr', 'master-content',
+                'master-ref-drift', 'no-ancestry')) {
+            $c = Get-BootstrapCase
+            $c.state.wrong = $failure
+            { Invoke-BootstrapCase $c } | Should -Throw -Because $failure
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+            @($c.state.reads | Where-Object {
+                    $_ -in @('Write', 'Post')
+                }).Count | Should -Be 0
+        }
+    }
+    It 'rejects changed merged section and either declaration line independently' {
+        $module = Get-Module DevPilot.ActivePrCanary
+        foreach ($failure in @('section', 'class-line', 'redundant-line')) {
+            $c = Get-BootstrapCase
+            $originalPin = & $module { @{} + $script:MergedMasterPin }
+            try {
+                $c.state.coverage = switch ($failure) {
+                    section { $c.state.coverage.Replace(
+                        '## Synthetic project policy', '## Changed project policy') }
+                    'class-line' { $c.state.coverage.Replace(
+                        'Every class uses an exclusion.', 'Class excludes coverage.') }
+                    'redundant-line' { $c.state.coverage.Replace(
+                        'Method exclusion is redundant.', 'Redundant method changed.') }
+                }
+                & $module {
+                    param($Document, $RebindSection)
+                    $bytes = [Text.Encoding]::UTF8.GetBytes($Document)
+                    $header = [Text.Encoding]::ASCII.GetBytes(
+                        "blob $($bytes.Length)`0")
+                    $script:MergedMasterPin.documentHash = Get-CanaryHash $bytes
+                    $script:MergedMasterPin.documentLength = $bytes.Length
+                    $script:MergedMasterPin.blobId = [Convert]::ToHexString(
+                        [Security.Cryptography.SHA1]::HashData(
+                            [byte[]]($header + $bytes))).ToLowerInvariant()
+                    if ($RebindSection) {
+                        $declarations = @(Get-CanaryCoverageDeclarations $Document `
+                            '44444444-4444-4444-4444-444444444444' ('d' * 40))
+                        $script:MergedMasterPin.sectionHash =
+                            $declarations[0].sectionHash
+                    }
+                } $c.state.coverage ($failure -ne 'section')
+                { Invoke-BootstrapCase $c } |
+                    Should -Throw '*merged-master-pin-unavailable*'
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+            }
+            finally {
+                & $module { param($Pin) $script:MergedMasterPin = $Pin } $originalPin
+                $script:mergedEnvelope.pin = $originalPin
+                Set-SyntheticMergedApproval
+            }
+        }
+    }
     Describe 'Signed GET-only candidate evaluation runner' {
+        It 'rejects a stale merged approval before opening runner state or making a GET' {
+            $c = Get-BootstrapCase
+            { Invoke-PrivateCanaryEvaluation -StateRoot $c.root `
+                    -RepositoryRoot $repo -SourceSelector $script:sourceSelector `
+                    -SourceSelectorKey $script:sourceKey `
+                    -MergedPinEnvelope $script:mergedEnvelope `
+                    -MergedPinKey ('d' * 64) `
+                    -ExpectedAccountUniqueName 'service@example.invalid' `
+                    -Read $c.provider -Provider $c.provider -Run } |
+                Should -Throw '*merged-master-pin-unavailable*'
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
         It 'remains disabled without opening even a nonexistent private root' {
             $c = Get-SignedIntakeCase
             $result = Invoke-PrivateCanaryEvaluation -StateRoot $c.root `
@@ -722,7 +1648,7 @@ Describe 'Read-only private canary input bootstrap' {
             [void](Invoke-SignedIntakeCase $c)
             $c.state.calls.Clear()
             $result = Invoke-RunnerCase $c
-            $result.state | Should -Be 'candidate-only-read-only'
+            $result.state | Should -Be 'merged-master-read-only'
             $result.selected | Should -Be 2
             $result.draft | Should -Be 1
             $result.skipped | Should -Be 1
@@ -789,7 +1715,7 @@ Describe 'Read-only private canary input bootstrap' {
                     'schema-downgrade' {
                         Sign-RunnerConfig $c {
                             param($value)
-                            $value.schemaVersion = 1
+                            $value.schemaVersion = 4
                         }
                     }
                     head { $c.state.wrong = 'stale-head' }
@@ -802,6 +1728,17 @@ Describe 'Read-only private canary input bootstrap' {
                         $_ -notin @('Identity', 'Head', 'Changes', 'Discussions')
                     }).Count | Should -Be 0
             }
+        }
+        It 'rejects a correctly re-signed previous-version dispatcher' {
+            $c = Get-SignedIntakeCase
+            [void](Invoke-SignedIntakeCase $c)
+            $c.state.calls.Clear()
+            Sign-RunnerConfig $c {
+                param($value)
+                $value.schemaVersion = 4
+            }
+            { Invoke-RunnerCase $c } | Should -Throw '*canary-config-invalid*'
+            $c.state.calls.Count | Should -Be 0
         }
         It 'rejects altered source blob and mixed project ownership after signing' {
             foreach ($failure in @('blob-content', 'mixed-project')) {
@@ -844,7 +1781,7 @@ Describe 'Read-only private canary input bootstrap' {
             $c = Get-SignedIntakeCase -Code
             [void](Invoke-SignedIntakeCase $c)
             $body = Get-RunnerClassMarkerBody $c
-            $body | Should -Match 'unmerged candidate-only convention'
+            $body | Should -Match 'merged-master read-only convention'
             $body | Should -Not -Match 'User-approved convention'
             $c.state.threads = @(New-RunnerThread $c 1 $body)
             $single = Invoke-RunnerCase $c
@@ -901,7 +1838,7 @@ Describe 'Read-only private canary input bootstrap' {
     }
     It 'defaults off with zero reads, writes, or private state' {
         $c = Get-BootstrapCase
-        $result = Invoke-PrivateCanaryBootstrap -Organization 'example-org' `
+        $result = Invoke-PrivateCanaryBootstrap -Organization $script:sourceOrg `
             -ProjectName 'ExampleProject' -RepositoryName 'ExampleRepo' `
             -ExpectedAccountUniqueName 'service@example.invalid' `
             -StateRoot $c.root -RepositoryRoot $repo -Read $c.provider
@@ -918,10 +1855,10 @@ Describe 'Read-only private canary input bootstrap' {
         $signed.state | Should -Be 'signed-intake-not-evaluated'
         $dispatcher = Get-Content (Join-Path $c.root 'canary-dispatcher.json') `
             -Raw | ConvertFrom-Json -AsHashtable
-        $dispatcher.schemaVersion | Should -Be 2
+        $dispatcher.schemaVersion | Should -Be 5
         $dispatcher.expectedAccount.Contains('uniqueName') | Should -BeFalse
         $result = Invoke-RunnerCase $c
-        $result.schemaVersion | Should -Be 2
+        $result.schemaVersion | Should -Be 5
         $result.providerWrites | Should -Be 0
         $result.modelToolInvocations | Should -Be 0
         $c.state.threads = @(New-RunnerThread $c 1 'Exclude from code coverage.')
@@ -935,6 +1872,55 @@ Describe 'Read-only private canary input bootstrap' {
         $ambiguous = Invoke-RunnerCase $c
         $ambiguous.rules[1].unknown | Should -Be 2
         $ambiguous.rules[1].wouldCreate | Should -Be 0
+        $unprovenAlias = New-RunnerThread $c 1 'Exclude from code coverage.'
+        $unprovenAlias.comments[0].author.uniqueName = 'other@example.invalid'
+        $c.state.threads = @($unprovenAlias)
+        $immutableMatch = Invoke-RunnerCase $c
+        $immutableMatch.rules[1].humanCovered | Should -Be 2
+        $immutableMatch.rules[1].wouldCreate | Should -Be 0
+        $c.state.threads = @(New-RunnerThread $c 1 (Get-RunnerClassMarkerBody $c))
+        $matchedMarker = Invoke-RunnerCase $c
+        $matchedMarker.rules[1].unknown | Should -BeLessThan 2
+        $matchedMarker.rules[1].humanCovered | Should -Be 0
+        $matchedMarker.rules[1].wouldCreate | Should -Be 0
+    }
+    It 'uses only a token-bound ADO alias to disambiguate conflicting authors' {
+        $c = Get-SignedIntakeCase -Code
+        [void](Invoke-SignedIntakeCase $c)
+        foreach ($body in @('Exclude from code coverage.',
+                (Get-RunnerClassMarkerBody $c))) {
+            $conflict = New-RunnerThread $c 1 $body
+            $conflict.comments[0].author.uniqueName = 'other@example.invalid'
+            $c.state.threads = @($conflict)
+            $result = Invoke-RunnerCase $c
+            $result.rules[1].unknown | Should -Be 2
+            $result.rules[1].humanCovered | Should -Be 0
+            $result.rules[1].wouldCreate | Should -Be 0
+        }
+    }
+    It 'rejects alias presence and value drift within a runner invocation' {
+        foreach ($mode in @('added', 'removed', 'changed')) {
+            $c = Get-SignedIntakeCase -Code -MissingUniqueName:($mode -eq 'added')
+            [void](Invoke-SignedIntakeCase $c)
+            $original = $c.provider
+            $seen = @{ count = 0 }
+            $c.provider = {
+                param($operation, $request)
+                $answer = & $original $operation $request
+                if ($operation -eq 'Identity') {
+                    $seen.count++
+                    if ($seen.count -eq 2) {
+                        switch ($mode) {
+                            added { $answer.uniqueName = 'service@example.invalid' }
+                            removed { $answer.Remove('uniqueName') }
+                            changed { $answer.uniqueName = 'other@example.invalid' }
+                        }
+                    }
+                }
+                return $answer
+            }.GetNewClosure()
+            { Invoke-RunnerCase $c } | Should -Throw '*canary-principal-drift*'
+        }
     }
     It 'refuses a half-injected credential path without creating state' {
         $c = Get-SignedIntakeCase
@@ -956,6 +1942,25 @@ Describe 'Read-only private canary input bootstrap' {
             Test-Path $c.root | Should -BeFalse
         }
         Describe 'Signed four-source intake handoff without evaluation' {
+            It 'rejects a changed merged pin before signed intake GET or state' {
+                $c = Get-RegistryCase
+                $root = $c.case.root + '-unapproved'
+                $script:roots.Add($root)
+                $c.case.state.reads.Clear()
+                { Invoke-PrivateCanarySignedIntake `
+                        -ProviderConfig $c.config -ApprovedSources $c.sources `
+                        -StateRoot $root -RepositoryRoot $repo `
+                        -CanaryPullRequestIds @(17007699) `
+                        -SourceSelector $script:sourceSelector `
+                        -SourceSelectorKey $script:sourceKey `
+                        -MergedPinEnvelope $script:mergedEnvelope `
+                        -MergedPinKey ('d' * 64) `
+                        -ExpectedAccountUniqueName 'service@example.invalid' `
+                        -Read $c.case.provider -Provider $c.case.provider -Run } |
+                    Should -Throw '*merged-master-pin-unavailable*'
+                $c.case.state.reads.Count | Should -Be 0
+                Test-Path -LiteralPath $root | Should -BeFalse
+            }
             It 'defaults off with no source reads, state, signing, or model' {
                 $c = Get-SignedIntakeCase
                 $c.input.case.state.reads.Clear()
@@ -1035,8 +2040,36 @@ Describe 'Read-only private canary input bootstrap' {
                             -AllowedRoot $c.root -Private)
                 }
             }
+            It 'persists no CLI UPN, Graph principalName, ADO alias, or alias digest' {
+                $c = Get-SignedIntakeCase -Code
+                [void](Invoke-SignedIntakeCase $c)
+                foreach ($root in @($c.input.case.root, $c.root)) {
+                    foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -File) {
+                        $text = [Text.Encoding]::UTF8.GetString(
+                            [IO.File]::ReadAllBytes($file.FullName))
+                        $text | Should -Not -Match `
+                            'service@example.invalid|principalName|uniqueName|expectedCliUpn'
+                    }
+                }
+                $config = Get-Content -LiteralPath (
+                    Join-Path $c.root 'canary-dispatcher.json') -Raw |
+                    ConvertFrom-Json -AsHashtable
+                $config.schemaVersion | Should -Be 5
+                $config.principalProof |
+                    Should -Be 'aad-graph-storage-key-alias-free-v2'
+                $config.expectedAccount.Count | Should -Be 2
+                $config.expectedAccount.Keys | Should -Contain 'id'
+                $config.expectedAccount.Keys | Should -Contain 'descriptor'
+                $intake = Get-Content -LiteralPath (
+                    Join-Path $c.root 'canary-intake.json') -Raw |
+                    ConvertFrom-Json -AsHashtable
+                $intake.schemaVersion | Should -Be 3
+                (Invoke-RunnerCase $c).providerWrites | Should -Be 0
+            }
             It 'refuses split inventory, stale heads, fake graph and forged receipt before signing' {
-                foreach ($failure in @('split-page', 'stale-head', 'fake-graph',
+                foreach ($failure in @('identity-upn', 'identity-alias',
+                        'alias-added', 'alias-removed',
+                        'split-page', 'stale-head', 'fake-graph',
                         'forged-receipt', 'cursor-collision', 'late-head',
                         'provider-drift', 'throttle-final')) {
                     $c = Get-SignedIntakeCase
@@ -1232,12 +2265,12 @@ Describe 'Read-only private canary input bootstrap' {
             $result.evaluated | Should -BeFalse
             $result.writerEligible | Should -BeFalse
             $result.providerWrites | Should -Be 0
-            $result.providerReads | Should -Be 21
+            $result.providerReads | Should -Be 29
             $result.rules.Count | Should -Be 4
             $result.rules['bpm-test-ownership@1'].sourceAuthority |
                 Should -Be 'pinned-owner-section'
             $result.rules['bpm-test-class-coverage@2'].sourceAuthority |
-                Should -Be 'verified-unmerged-candidate-only'
+                Should -Be 'verified-merged-master-read-only'
             $result.rules['bpm-test-class-coverage@2'].declarationDigest |
                 Should -Not -Be $result.rules['bpm-redundant-method-coverage@2'].declarationDigest
             $result.rules['bpm-named-areequal-arguments@1'].sourceAuthority |
@@ -1252,14 +2285,35 @@ Describe 'Read-only private canary input bootstrap' {
                 Should -Not -Be $inputCase.sources.namedSection.sectionHash
         }
         It 'rejects wrong or missing receipts and independently mutated Owner and Named pins' {
-            foreach ($failure in @('schema', 'identity-digest', 'missing',
+            foreach ($failure in @('schema', 'previous-v3', 'previous-v5',
+                    'identity-digest', 'missing', 'source-organization',
+                    'source-project', 'source-repository',
                     'owner', 'owner-length',
                     'named-section', 'named-blob', 'class', 'redundant',
-                    'class-head', 'named-policy', 'named-digest', 'repository',
+                    'class-master', 'named-policy', 'named-digest', 'repository',
                     'project')) {
                 $inputCase = Get-RegistryCase
                 switch ($failure) {
                     schema { $inputCase.sources.schemaVersion = 2 }
+                    'previous-v3' {
+                        $inputCase.sources.schemaVersion = 5
+                        $inputCase.sources.kind = 'private-read-only-canary-sources'
+                        $inputCase.sources.sourceAuthority =
+                            'unmerged-reviewed-pr-is-candidate-only'
+                    }
+                    'previous-v5' { $inputCase.sources.schemaVersion = 5 }
+                    'source-organization' {
+                        $inputCase.sources.rules['bpm-test-ownership@1'].organization =
+                            'wrong-org'
+                    }
+                    'source-project' {
+                        $inputCase.sources.rules['bpm-test-class-coverage@2'].projectName =
+                            'WrongSource'
+                    }
+                    'source-repository' {
+                        $inputCase.sources.rules['bpm-redundant-method-coverage@2'].repositoryName =
+                            'WrongRepo'
+                    }
                     'identity-digest' {
                         $inputCase.sources.accountProofDigest = 'v1:sha256:' + 'a' * 64
                     }
@@ -1286,9 +2340,9 @@ Describe 'Read-only private canary input bootstrap' {
                         $inputCase.sources.rules['bpm-redundant-method-coverage@2'].declarationDigest =
                             'v1:sha256:' + ('a' * 64)
                     }
-                    'class-head' {
-                        $inputCase.sources.rules['bpm-test-class-coverage@2'].headVerified =
-                            $false
+                    'class-master' {
+                        $inputCase.sources.rules['bpm-test-class-coverage@2'].masterCommit =
+                            'f' * 40
                     }
                     'named-policy' {
                         $inputCase.sources.rules['bpm-named-areequal-arguments@1'].policyHash =
@@ -1343,7 +2397,7 @@ Describe 'Read-only private canary input bootstrap' {
         $result.canaryExecuted | Should -BeFalse
         $result.providerWrites | Should -Be 0
         $result.ruleCount | Should -Be 4
-        $c.state.reads.Count | Should -BeLessOrEqual 26
+        $c.state.reads.Count | Should -BeLessOrEqual 120
         $c.state.reads[-1] | Should -Be 'GraphStorageKey'
         @($c.state.reads | Where-Object { $_ -in @('ListPage', 'Head', 'Changes',
                     'Discussions', 'Write', 'Post') }).Count | Should -Be 0
@@ -1354,11 +2408,14 @@ Describe 'Read-only private canary input bootstrap' {
         $config.projectId | Should -Be '22222222-2222-2222-2222-222222222222'
         $config.repository.id | Should -Be '11111111-1111-1111-1111-111111111111'
         $config.expectedAccount.descriptor | Should -Be 'aad.synthetic'
-        $config.expectedAccount.principalName | Should -Be 'service@example.invalid'
-        $manifest.schemaVersion | Should -Be 3
+        $config.expectedAccount.Count | Should -Be 2
+        $config.expectedAccount.Contains('principalName') | Should -BeFalse
+        $config.Contains('operator') | Should -BeFalse
+        $manifest.schemaVersion | Should -Be 6
         $manifest.rules.Count | Should -Be 4
         $manifest.namedSection.commit | Should -Be $manifest.rules['bpm-test-ownership@1'].commit
-        $manifest.rules['bpm-test-class-coverage@2'].headVerified | Should -BeTrue
+        $manifest.rules['bpm-test-class-coverage@2'].masterCommit |
+            Should -Be ('e' * 40)
         $manifest.rules['bpm-test-class-coverage@2'].declarationDigest |
             Should -Not -Be $manifest.rules['bpm-redundant-method-coverage@2'].declarationDigest
         $manifest.rules['bpm-named-areequal-arguments@1'].provenance |
@@ -1446,7 +2503,7 @@ Describe 'Read-only private canary input bootstrap' {
             (& $read Project @{ projectName = 'ExampleProject' }).id |
                 Should -Be 'synthetic'
             (& $read Identity @{}).descriptor | Should -Be 'aad.synthetic'
-            $request = @{ projectName = 'Engineering'
+            $request = @{ projectName = 'ExampleSource'
                 repositoryId = '44444444-4444-4444-4444-444444444444'
                 commit = '7e6620ec40c9bc37c5a5e13d506053b0139c9206'
                 path = '/documentation/EngineeringProcesses/Conventions/AutomatedTests.md' }
@@ -1459,6 +2516,7 @@ Describe 'Read-only private canary input bootstrap' {
                     $_ -match 'synthetic-bearer'
                 }).Count | Should -Be 0
             $handler.Paths[3] | Should -Match 'versionDescriptor.versionType=commit'
+                $handler.Paths[2] | Should -Match '/ExampleSource/_apis/git/repositories/44444444-4444-4444-4444-444444444444/items\?'
             { & $read Project @{ projectName = '..' } } | Should -Throw
             $malicious = $request.Clone()
             $malicious.commit = 'malicious'
@@ -1496,6 +2554,36 @@ Describe 'Read-only private canary input bootstrap' {
             $handler.Paths.Count | Should -Be 1
         }
         finally { $client.Dispose() }
+    }
+    It 'accepts ordinary remaining-budget telemetry and stops on real throttle' {
+        foreach ($mode in @('budget', '429', '503', 'retry-after', 'exhausted')) {
+            $handler = [CanarySyntheticHandler]::new()
+            if ($mode -in @('429', '503')) {
+                $handler.Status = [Net.HttpStatusCode][int]$mode
+            }
+            if ($mode -eq 'retry-after') { $handler.ThrottleHint = $true }
+            if ($mode -eq 'budget') { $handler.BudgetRemaining = '8' }
+            if ($mode -eq 'exhausted') { $handler.BudgetRemaining = '0' }
+            $client = [Net.Http.HttpClient]::new($handler)
+            $module = Get-Module DevPilot.ActivePrCanary
+            try {
+                $read = {
+                    & $module {
+                        param($Client)
+                        Invoke-CanaryAadGet $Client 'synthetic-bearer' `
+                            'example-org' 'Project' @{ projectName = 'ExampleSource' } `
+                            ([DateTime]::UtcNow.AddSeconds(5))
+                    } $client
+                }
+                if ($mode -eq 'budget') {
+                    (& $read).id | Should -Be 'synthetic'
+                } else {
+                    { & $read } | Should -Throw '*bootstrap-read-throttled:Project*'
+                }
+                $handler.Paths.Count | Should -Be 1
+            }
+            finally { $client.Dispose() }
+        }
     }
     It 'redacts transport failures before any state creation or provider write' {
         $handler = [CanarySyntheticHandler]::new()
@@ -1961,6 +3049,47 @@ Describe 'Read-only private canary input bootstrap' {
             $handler.Paths[18] | Should -Match '/trees/'
         }
         finally { $client.Dispose() }
+    }
+    It 'binds alias-free intake v3 to an ephemeral UPN and immutable Graph proof' {
+        $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `
+            -Raw | ConvertFrom-Json -AsHashtable
+        $config.schemaVersion = 3
+        $config.principalProof = 'aad-graph-storage-key-alias-free-v2'
+        $config.expectedAccount = @{
+            id = '33333333-3333-3333-3333-333333333333'
+            descriptor = 'aad.synthetic' }
+        $config.enabled = $true
+        foreach ($mode in @('match', 'upn', 'storage', 'wrong-cli')) {
+            $handler = [CanaryBoundGetHandler]::new()
+            $handler.DriftGraphUpn = $mode -eq 'upn'
+            $handler.DriftStorageKey = $mode -eq 'storage'
+            $client = [Net.Http.HttpClient]::new($handler)
+            try {
+                $expected = if ($mode -eq 'wrong-cli') {
+                    'other@example.invalid'
+                } else { 'service@example.invalid' }
+                $provider = New-ActivePrAzureDevOpsProvider -Config $config `
+                    -BoundClient $client -BearerToken ('b' * 100) `
+                    -ExpectedPrincipalName $expected -VerifyReadPrincipal
+                if ($mode -eq 'match') {
+                    $identity = & $provider Identity @{ timeoutMilliseconds = 5000 }
+                    $identity.id | Should -Be $config.expectedAccount.id
+                    $identity.principalName | Should -Be $expected
+                    $handler.Tokens.Count | Should -Be 3
+                } else {
+                    { & $provider Identity @{ timeoutMilliseconds = 5000 } } |
+                        Should -Throw '*account-mismatch*'
+                }
+                $handler.Paths.Count | Should -Be $(if ($mode -eq 'wrong-cli') {
+                        1
+                    } else { 3 })
+                @($handler.Tokens | Where-Object { $_ -cne ('b' * 100) }).Count |
+                    Should -Be 0
+            }
+            finally { $client.Dispose() }
+        }
+        ($config | ConvertTo-Json -Depth 10) |
+            Should -Not -Match 'service@example.invalid|principalName|uniqueName'
     }
     It 'proves a selected PR project graph through one bearer and rejects broken HTTP evidence' {
         $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `

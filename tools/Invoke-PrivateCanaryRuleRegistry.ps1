@@ -11,6 +11,10 @@
 param(
     [Parameter(Mandatory)][string]$ProviderConfigPath,
     [Parameter(Mandatory)][string]$ApprovedSourcesPath,
+    [string]$SourceSelectorPath,
+    [string]$SourceSelectorKeyPath,
+    [string]$MergedPinPath,
+    [string]$MergedPinKeyPath,
     [string]$AzureCliPath = 'az',
     [switch]$Run
 )
@@ -30,6 +34,17 @@ $providerConfig = Get-Content -LiteralPath $ProviderConfigPath -Raw |
     ConvertFrom-Json -AsHashtable -Depth 32
 $approvedSources = Get-Content -LiteralPath $ApprovedSourcesPath -Raw |
     ConvertFrom-Json -AsHashtable -Depth 32
+$source = if ($Run) {
+    Read-CanaryPrivateSourceSelector -SelectorPath $SourceSelectorPath `
+        -KeyPath $SourceSelectorKeyPath -RepositoryRoot $repo
+} else { @{ selector = $null; key = $null } }
+$merged = if ($Run) {
+    Read-CanaryPrivateMergedPin -PinPath $MergedPinPath `
+        -KeyPath $MergedPinKeyPath -RepositoryRoot $repo `
+        -SourceSelector $source.selector
+} else { @{ envelope = $null; key = $null } }
 Invoke-PrivateCanaryRuleRegistry -ProviderConfig $providerConfig `
     -ApprovedSources $approvedSources -RepositoryRoot $repo `
+    -SourceSelector $source.selector -SourceSelectorKey $source.key `
+    -MergedPinEnvelope $merged.envelope -MergedPinKey $merged.key `
     -AzureCliPath $AzureCliPath -Run:$Run | ConvertTo-Json -Depth 12
