@@ -137,7 +137,9 @@ function Assert-CanaryMergedPin {
         [string]$Pin.sourceCommit -cne $script:CoverageCommit -or
         [string]$Pin.mergeCommit -cnotmatch '^[a-f0-9]{40}$' -or
         [string]$Pin.documentHash -cnotmatch '^[a-f0-9]{64}$' -or
+        [string]$Pin.documentHash -cne $script:CoverageDocumentHash -or
         [string]$Pin.documentLength -cnotmatch '^[1-9][0-9]{0,5}$' -or
+        [int]$Pin.documentLength -ne $script:CoverageDocumentLength -or
         [int]$Pin.documentLength -gt 262144 -or
         [string]$Pin.blobId -cnotmatch '^[a-f0-9]{40}$' -or
         [string]$Pin.sectionHash -cnotmatch '^v1:sha256:[a-f0-9]{64}$' -or
@@ -331,6 +333,132 @@ function Invoke-CanaryMergedMasterPreflight {
             mergeCommit = $proof.mergeCommit; masterCommit = $proof.masterCommit
             documentHash = 'v1:sha256:' + $script:MergedMasterPin.documentHash
             providerReads = $budget.count; providerWrites = 0 }
+    }
+    finally { if ($session) { $session.client.Dispose() } }
+}
+
+function Invoke-CanaryMergedMasterDiscovery {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Organization,
+        [Parameter(Mandatory)][string]$ExpectedAccountUniqueName,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [string]$AzureCliPath = 'az', [scriptblock]$Read, [switch]$Run)
+    if (-not $Run) {
+        return @{ state = 'disabled'; providerReads = 0; providerWrites = 0 }
+    }
+    if ($Organization -cnotmatch '^[A-Za-z0-9_-]{1,128}$' -or
+        $ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$' -or
+        -not [IO.Path]::IsPathFullyQualified($RepositoryRoot)) {
+        throw 'merged-master-input-invalid'
+    }
+    $session = $null
+    try {
+        if (-not $Read) {
+            $session = New-PrivateCanaryBearerSession $RepositoryRoot $AzureCliPath
+            $deadline = [DateTime]::UtcNow.AddSeconds(120)
+            $aadGet = ${function:Invoke-CanaryAadGet}
+            $Read = {
+                param($Operation, $Request)
+                & $aadGet $session.client $session.token $Organization `
+                    $Operation $Request $deadline
+            }.GetNewClosure()
+        }
+        $budget = @{ count = 0 }
+        $bounded = {
+            param($Operation, $Request)
+            if ($budget.count -ge 120 -or $Operation -cnotin @(
+                    'IdentityProof', 'GraphUser', 'GraphStorageKey',
+                    'Project', 'Repository', 'PullRequest', 'Iterations',
+                    'Ref', 'Commit', 'Item', 'RawItem')) {
+                throw 'merged-master-read-budget'
+            }
+            $budget.count++
+            $result = & $Read $Operation $Request
+            if ($result -isnot [Collections.IDictionary]) {
+                throw 'merged-master-read-inaccessible'
+            }
+            return $result
+        }.GetNewClosure()
+        $identity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
+        $engineering = & $bounded Project @{ projectName = 'Engineering' }
+        $enghub = & $bounded Repository @{ projectName = 'Engineering'
+            repositoryName = 'EngHub' }
+        $guid = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
+        if ([string]$engineering.id -cnotmatch $guid -or
+            [string]$engineering.name -cne 'Engineering' -or
+            [string]$enghub.id -cnotmatch $guid -or
+            [string]$enghub.name -cne 'EngHub' -or
+            [string]$enghub.project.id -ine [string]$engineering.id) {
+            throw 'merged-master-repository-mismatch'
+        }
+        $engId = ([string]$enghub.id).ToLowerInvariant()
+        $pr = & $bounded PullRequest @{
+            projectName = 'Engineering'; repositoryId = $engId }
+        if ($pr -isnot [Collections.IDictionary] -or
+            $pr.lastMergeCommit -isnot [Collections.IDictionary] -or
+            [string]$pr.lastMergeCommit.commitId -cnotmatch
+                '^[a-fA-F0-9]{40}$') {
+            throw 'merged-master-pr-unverified'
+        }
+        $provisional = @{ sourceCommit = $script:CoverageCommit
+            mergeCommit = ([string]$pr.lastMergeCommit.commitId).ToLowerInvariant() }
+        $master = Assert-CanaryMergedMasterHead $bounded $engId `
+            ([string]$engineering.id) $provisional ''
+        Assert-CanaryMergedHistory $bounded $engId $master $provisional.mergeCommit
+        $candidate = Read-CanaryVerifiedDocument $bounded $engId `
+            $script:CoverageCommit
+        $candidateBytes = [Text.Encoding]::UTF8.GetBytes($candidate.text)
+        if ($candidateBytes.Length -ne $script:CoverageDocumentLength -or
+            (Get-CanaryHash $candidateBytes) -cne $script:CoverageDocumentHash) {
+            throw 'reviewed-source-bytes-mismatch'
+        }
+        $merge = Read-CanaryVerifiedDocument $bounded $engId `
+            $provisional.mergeCommit
+        $current = Read-CanaryVerifiedDocument $bounded $engId $master
+        $mergeBytes = [Text.Encoding]::UTF8.GetBytes($merge.text)
+        if ($mergeBytes.Length -ne $candidateBytes.Length -or
+            $merge.text -cne $candidate.text -or
+            $current.text -cne $merge.text -or
+            $current.blobId -cne $merge.blobId) {
+            throw 'merged-master-content-differs-human-review'
+        }
+        $reviewed = @(Get-CanaryCoverageDeclarations $candidate.text `
+                $engId $script:CoverageCommit)
+        $merged = @(Get-CanaryCoverageDeclarations $merge.text `
+                $engId $provisional.mergeCommit)
+        if ($reviewed.Count -ne 2 -or $merged.Count -ne 2 -or
+            $merged[0].sectionHash -cne $reviewed[0].sectionHash -or
+            $merged[1].sectionHash -cne $reviewed[1].sectionHash -or
+            $merged[0].policyLineHash -cne $reviewed[0].policyLineHash -or
+            $merged[1].policyLineHash -cne $reviewed[1].policyLineHash) {
+            throw 'merged-master-section-differs-human-review'
+        }
+        $pin = @{
+            sourceCommit = $script:CoverageCommit
+            mergeCommit = $provisional.mergeCommit
+            documentHash = Get-CanaryHash $mergeBytes
+            documentLength = $mergeBytes.Length
+            blobId = $merge.blobId
+            sectionHash = $merged[0].sectionHash
+            classLineHash = $merged[0].policyLineHash
+            redundantLineHash = $merged[1].policyLineHash
+            classDeclarationDigest = $merged[0].declarationDigest
+            redundantDeclarationDigest = $merged[1].declarationDigest
+        }
+        Assert-CanaryMergedPin $pin
+        [void](Assert-CanaryMergedMasterHead $bounded $engId `
+            ([string]$engineering.id) $provisional $master)
+        $finalIdentity = Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName
+        Assert-CanaryAccountBinding $finalIdentity $identity
+        return [ordered]@{
+            schemaVersion = 1
+            state = 'discovered-awaiting-human-source-review'
+            candidateBytesMatch = $true
+            observedMasterCommit = $master
+            proposedPin = $pin
+            providerReads = $budget.count
+            providerWrites = 0
+        }
     }
     finally { if ($session) { $session.client.Dispose() } }
 }
@@ -741,17 +869,28 @@ function Invoke-CanaryAadGet {
             [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
             $cancel.Token).GetAwaiter().GetResult()
         try {
-            if (-not $response.IsSuccessStatusCode) {
-                $failureStatus = [int]$response.StatusCode
-                throw 'bootstrap-read-inaccessible'
-            }
-            if ($response.Headers.RetryAfter -or
-                @($response.Headers | Where-Object {
-                    $_.Key -match '(?i)^(?:x-ms-ratelimit-|x-ratelimit-)'
-                }).Count -gt 0) {
+            $failureStatus = [int]$response.StatusCode
+            $remainingExhausted = @($response.Headers | Where-Object {
+                $_.Key -match '(?i)^x-(?:ms-|vss-)?ratelimit-remaining(?:-.*)?$' -and
+                @($_.Value | Where-Object {
+                    [string]$_ -match '^\s*0\s*$'
+                }).Count -gt 0
+            }).Count -gt 0
+            $delay = @($response.Headers | Where-Object {
+                $_.Key -match '(?i)^x-(?:ms-|vss-)?ratelimit-delay$' -and
+                @($_.Value | Where-Object {
+                    [string]$_ -match '^\s*[1-9][0-9]*(?:\.[0-9]+)?\s*$'
+                }).Count -gt 0
+            }).Count -gt 0
+            if ($failureStatus -in @(429, 503) -or
+                $response.Headers.RetryAfter -or $remainingExhausted -or $delay) {
                 $throttled = $true
                 throw 'bootstrap-read-throttled'
             }
+            if (-not $response.IsSuccessStatusCode) {
+                throw 'bootstrap-read-inaccessible'
+            }
+            $failureStatus = 0
             $phase = 'read'
             if ($null -ne $response.Content.Headers.ContentLength -and
                     $response.Content.Headers.ContentLength -gt $limit) {
@@ -810,11 +949,11 @@ function Invoke-CanaryAadGet {
         return $result
     }
     catch {
+        if ($throttled) { throw "bootstrap-read-throttled:$Operation" }
         if ($failureStatus -gt 0) {
             throw ('bootstrap-read-inaccessible:{0}:http-{1}' -f
                 $Operation, $failureStatus)
         }
-        if ($throttled) { throw "bootstrap-read-throttled:$Operation" }
         if ($Operation -cin @('Identity', 'IdentityProof') -and
             $phase -ceq 'decode' -and
             $decodeReason -cin @('encoded-response', 'non-json-media',
@@ -2143,7 +2282,7 @@ function Invoke-ActivePrCanaryQualification {
 
 Export-ModuleMember -Function Invoke-ActivePrCanaryQualification,
     Assert-CanaryCoverageSource, Invoke-CanaryMergedMasterPreflight,
-    Get-CanaryWorkAccountUpn,
+    Invoke-CanaryMergedMasterDiscovery, Get-CanaryWorkAccountUpn,
     Invoke-PrivateCanaryBootstrap,
     New-VerifiedCanaryRuleRegistry, Invoke-PrivateCanaryRuleRegistry,
     Invoke-PrivateCanarySignedIntake, Invoke-PrivateCanaryIdentityDiagnostic

@@ -157,18 +157,38 @@ The CLI validates its fixed, Int64-safe JSON result before emitting it; it
 does not persist observations. An uncaptured result cannot be reconstructed
 by retrying under an exhausted GET authorization.
 
-`tools/Invoke-PrivateCanaryMergedPreflight.ps1` is a **stateless** read-only
-merged-master source gate, disabled without `-Run`. Its repository-owned
+`tools/Discover-PrivateCanaryMergedMaster.ps1` is the separate **default-off,
+stateless discovery** command. With an explicitly authorized single operator
+and `-Run` it uses one freshly acquired bearer for bounded GETs only, checks
+ConnectionData/Graph user/storage-key identity against the in-memory Azure
+CLI user UPN, and attests the completed reviewed PR, immutable merge commit,
+current master ancestry and exact ref, and raw Git item/blob at the reviewed
+candidate commit, merge commit, and current master. The candidate document
+must match the independently reviewed SHA-256 and byte length below. Merge
+and current-master raw bytes must be byte-identical to that candidate, and
+the distinct class/redundant section and policy-line hashes must agree.
+After rechecking PR/ref/identity it returns only immutable commit, blob,
+document, section, line, and recomputed merge-commit declaration digests
+marked `discovered-awaiting-human-source-review`: no path, raw payload,
+account, token, header, private file or state, signing, or write. Any byte
+or section change, incomplete ancestry, drift, or throttle stops without a
+pin; changed content requires separate human review. Identical bytes retain
+the user's reviewed content approval but **do not** automatically establish
+merged provenance or update the pin.
+
+`tools/Invoke-PrivateCanaryMergedPreflight.ps1` is the separate **stateless**
+read-only merged-master source gate, disabled without `-Run`. Its repository-owned
 `MergedMasterPin` is intentionally **unset**: the reported merge is not an
 independently observed and reviewed immutable commit or document digest.
 Until that pin is reviewed and committed, `-Run` fails
 `merged-master-pin-unavailable` before any ADO request. Never populate it
 from a synthetic fixture, from the previously reviewed *source* commit, or
-by assuming a squash/rebase merge preserves its blob bytes. An authorized
-single operator must separately observe the completed PR, merge commit,
-master history/ref, item Git blob and raw document and review the SHA-256,
-byte length, object ID, section hash, two policy-line hashes, and distinct
-declaration digests before updating this repo-owned pin. No live ADO GET or
+by assuming a squash/rebase merge preserves its blob bytes. After authorized
+stateless discovery and independent provenance review, update this repo-owned
+pin in a separate commit and rerun exact-head CI. Pin validation requires
+the **same independently reviewed candidate document digest and length**,
+while section/line hashes are verified against those exact bytes and the
+merge-commit-bound declaration digests are recomputed. No live ADO GET or
 private state was used to populate it in this layer.
 
 `tools/Initialize-PrivateActivePrCanaryInputs.ps1` is a **preparation-only**

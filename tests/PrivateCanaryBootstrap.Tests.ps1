@@ -24,6 +24,7 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
     public bool Oversize = false;
     public bool InvalidJson = false;
     public bool ThrottleHint = false;
+    public string BudgetRemaining;
     public byte[] Body;
     public byte[] GraphUserBody;
     public byte[] StorageKeyBody;
@@ -75,6 +76,10 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
             response.Headers.RetryAfter =
                 new System.Net.Http.Headers.RetryConditionHeaderValue(
                     TimeSpan.FromSeconds(1));
+        }
+        if (BudgetRemaining != null) {
+            response.Headers.Add("x-ms-ratelimit-remaining-resource",
+                BudgetRemaining);
         }
         return Task.FromResult(response);
     }
@@ -292,6 +297,12 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             $state.reads.Add($op) | Out-Null
             $text = if ($request.commit -ceq $ownerCommit) {
                 $state.owner
+            } elseif ($request.commit -ceq $state.head -and
+                $state.wrong -eq 'candidate-content') {
+                $state.coverage + ' changed on reviewed source'
+            } elseif ($request.commit -ceq ('d' * 40) -and
+                $state.wrong -eq 'merge-content') {
+                $state.coverage + ' changed at merge'
             } elseif ($request.commit -ceq $state.master -and
                 $state.wrong -eq 'master-content') {
                 $state.coverage + ' changed on master'
@@ -752,6 +763,75 @@ AfterAll {
     }
 }
 Describe 'Read-only private canary input bootstrap' {
+    It 'discovers only sanitized unapproved metadata with no pin, state, or writes' {
+        $c = Get-BootstrapCase
+        $module = Get-Module DevPilot.ActivePrCanary
+        $syntheticPin = & $module { $script:MergedMasterPin }
+        try {
+            & $module { $script:MergedMasterPin = $null }
+            $result = Invoke-CanaryMergedMasterDiscovery `
+                -Organization 'example-org' `
+                -ExpectedAccountUniqueName 'service@example.invalid' `
+                -RepositoryRoot $repo -Read $c.provider -Run
+            $result.state | Should -Be 'discovered-awaiting-human-source-review'
+            $result.candidateBytesMatch | Should -BeTrue
+            $result.proposedPin.mergeCommit | Should -Be ('d' * 40)
+            $result.proposedPin.sourceCommit |
+                Should -Be '7e6620ec40c9bc37c5a5e13d506053b0139c9206'
+            $result.observedMasterCommit | Should -Be ('e' * 40)
+            $result.proposedPin.documentHash |
+                Should -Be $syntheticPin.documentHash
+            $result.proposedPin.classDeclarationDigest |
+                Should -Not -Be $result.proposedPin.redundantDeclarationDigest
+            @($c.state.reads | Where-Object { $_ -eq 'GraphStorageKey' }).Count |
+                Should -Be 2
+            @($c.state.reads | Where-Object {
+                    $_ -eq 'RawItem'
+                }).Count | Should -Be 3
+            $result.providerWrites | Should -Be 0
+            (ConvertTo-Json -InputObject $result -Depth 10) |
+                Should -Not -Match 'service@example.invalid|Synthetic convention|/documentation|aad.synthetic|bearer'
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
+        finally {
+            & $module { param($Pin) $script:MergedMasterPin = $Pin } $syntheticPin
+        }
+    }
+    It 'refuses discovery for active, changed, unproved, or mismatched identity' {
+        foreach ($failure in @('active-pr', 'candidate-content',
+                'merge-content', 'master-content', 'no-ancestry',
+                'master-ref-drift', 'graph-upn')) {
+            $c = Get-BootstrapCase
+            $c.state.wrong = $failure
+            { Invoke-CanaryMergedMasterDiscovery -Organization 'example-org' `
+                    -ExpectedAccountUniqueName 'service@example.invalid' `
+                    -RepositoryRoot $repo -Read $c.provider -Run } |
+                Should -Throw -Because $failure
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+            @($c.state.reads | Where-Object {
+                    $_ -in @('Write', 'Post', 'ListPage')
+                }).Count | Should -Be 0
+        }
+    }
+    It 'rejects even self-consistent newly pinned content before a GET' {
+        $c = Get-BootstrapCase
+        $module = Get-Module DevPilot.ActivePrCanary
+        $originalPin = & $module { @{} + $script:MergedMasterPin }
+        try {
+            & $module {
+                $script:MergedMasterPin.documentHash = 'a' * 64
+                $script:MergedMasterPin.documentLength++
+                $script:MergedMasterPin.sectionHash = 'v1:sha256:' + 'a' * 64
+            }
+            { Invoke-BootstrapCase $c } |
+                Should -Throw '*merged-master-pin-unavailable*'
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
+        finally {
+            & $module { param($Pin) $script:MergedMasterPin = $Pin } $originalPin
+        }
+    }
     It 'has no live source pin and stops the stateless gate before any GET or state' {
         $c = Get-BootstrapCase
         $module = Get-Module DevPilot.ActivePrCanary
@@ -829,7 +909,7 @@ Describe 'Read-only private canary input bootstrap' {
                     }
                 } $c.state.coverage ($failure -ne 'section')
                 { Invoke-BootstrapCase $c } |
-                    Should -Throw '*merged-master-declaration-drift*'
+                    Should -Throw '*merged-master-pin-unavailable*'
                 Test-Path -LiteralPath $c.root | Should -BeFalse
             }
             finally {
@@ -1646,20 +1726,31 @@ Describe 'Read-only private canary input bootstrap' {
         }
         finally { $client.Dispose() }
     }
-    It 'never retries a throttled source GET, including successful throttle hints' {
-        foreach ($status in @(429, 503, 200)) {
+    It 'accepts ordinary remaining-budget telemetry and stops on real throttle' {
+        foreach ($mode in @('budget', '429', '503', 'retry-after', 'exhausted')) {
             $handler = [CanarySyntheticHandler]::new()
-            $handler.Status = [Net.HttpStatusCode]$status
-            $handler.ThrottleHint = $status -eq 200
+            if ($mode -in @('429', '503')) {
+                $handler.Status = [Net.HttpStatusCode][int]$mode
+            }
+            if ($mode -eq 'retry-after') { $handler.ThrottleHint = $true }
+            if ($mode -eq 'budget') { $handler.BudgetRemaining = '8' }
+            if ($mode -eq 'exhausted') { $handler.BudgetRemaining = '0' }
             $client = [Net.Http.HttpClient]::new($handler)
             $module = Get-Module DevPilot.ActivePrCanary
             try {
-                { & $module {
+                $read = {
+                    & $module {
                         param($Client)
                         Invoke-CanaryAadGet $Client 'synthetic-bearer' `
                             'example-org' 'Project' @{ projectName = 'Engineering' } `
                             ([DateTime]::UtcNow.AddSeconds(5))
-                    } $client } | Should -Throw
+                    } $client
+                }
+                if ($mode -eq 'budget') {
+                    (& $read).id | Should -Be 'synthetic'
+                } else {
+                    { & $read } | Should -Throw '*bootstrap-read-throttled:Project*'
+                }
                 $handler.Paths.Count | Should -Be 1
             }
             finally { $client.Dispose() }
