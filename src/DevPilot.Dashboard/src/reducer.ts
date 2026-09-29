@@ -389,6 +389,11 @@ export class OperationsReducer {
           reportPath: getString(data, "reportPath"), finalRecommendation: getString(data, "finalRecommendation"),
           diagnostic: getString(data, "diagnostic"), eligibilityReasons: getStringArray(data, "eligibilityReasons"),
           collectionStatus: getString(data, "collectionStatus"), lastFamilyId: getString(data, "lastFamilyId"),
+          snapshots: data.snapshots === undefined ? null : getNumber(data, "snapshots"),
+          decisions: data.decisions === undefined ? null : getNumber(data, "decisions"),
+          sweepId: getString(data, "sweepId"), sweepPages: getNumber(data, "sweepPages"),
+          refreshRemaining: getNumber(data, "refreshRemaining"), consecutiveFailures: getNumber(data, "consecutiveFailures"),
+          sweepReason: getString(data, "sweepReason"),
         };
         state.modelActivity = `Observer policy: ${state.observer.finalRecommendation}; diagnostic: ${state.observer.diagnostic}`;
         state.writes = "none";

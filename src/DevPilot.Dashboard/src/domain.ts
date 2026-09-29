@@ -96,6 +96,8 @@ export interface InstanceState {
     studyId: string; mode: string; families: number; admissions: number; eligibleAgreement: number;
     deadline: string; reportPath: string; finalRecommendation: string; diagnostic: string; eligibilityReasons: string[];
     collectionStatus: string; lastFamilyId: string;
+    snapshots: number | null; decisions: number | null; sweepId: string; sweepPages: number; refreshRemaining: number;
+    consecutiveFailures: number; sweepReason: string;
   };
   key: string;
   agent: AgentRole;

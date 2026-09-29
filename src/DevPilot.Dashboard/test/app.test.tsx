@@ -550,6 +550,8 @@ test("observer native details distinguish policy, diagnostic and capture gaps wi
     finalRecommendation: "NEEDS_HUMAN_REVIEW", diagnostic: "APPROVE",
     eligibilityReasons: ["POLICY_MISSING", "CAPTURE_INCOMPLETE"],
     collectionStatus: "incomplete", lastFamilyId: "fixture:1",
+    snapshots: 28, decisions: 0, sweepId: "durable-sweep", sweepPages: 20,
+    refreshRemaining: 1, consecutiveFailures: 0,
   } }));
   let setup: TestRendererSetup | undefined;
   try {
@@ -564,6 +566,8 @@ test("observer native details distinguish policy, diagnostic and capture gaps wi
     assert.match(frame, /Model-only diagnostic \(not policy approval\): APPROVE/);
     assert.match(frame, /Families: 25; evaluations admitted: 0; eligible human comparisons: 0/);
     assert.match(frame, /Capture incomplete/);
+    assert.match(frame, /Stored snapshots: 28; decisions: 0/);
+    assert.match(frame, /inventory pages: 20; refresh remaining: 1/);
     assert.match(frame, /No approval authorization/);
     setup.mockInput.pressEscape();
     setup.mockInput.pressKey("m");

@@ -20,6 +20,10 @@ from replay import (CapabilityError, Cancelled, FixtureProvider, assert_output_r
 
 # The consumer allows 600 seconds of collection; leave time for transport teardown.
 COLLECTOR_TIMEOUT_SECONDS = 660
+MAX_SWEEP_PAGES = 10000
+MAX_SWEEP_FAILURES = 3
+MAX_NO_PROGRESS_PAGES = 3
+REFRESH_MAX_AGE_SECONDS = 300
 
 
 def utc_now() -> str:
@@ -45,6 +49,15 @@ class Ledger:
         self.root = root
         self.db = sqlite3.connect(root / "observer.sqlite", timeout=0)
         self.db.row_factory = sqlite3.Row
+        # Reject a frozen older engine before adding tables or changing its journal mode.
+        try:
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='study'").fetchone():
+                current = self.db.execute("SELECT * FROM study").fetchone()
+                if current and (current["id"] != config["studyId"] or current["frozen"] != frozen):
+                    raise ContractError("OBSERVER_STUDY_FINGERPRINT_MISMATCH_NEW_STUDY_REQUIRED")
+        except (ContractError, sqlite3.Error):
+            self.db.close()
+            raise
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript("""
@@ -60,8 +73,16 @@ class Ledger:
           CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY, captured TEXT, payload TEXT);
           CREATE TABLE IF NOT EXISTS guidance(id TEXT PRIMARY KEY, payload TEXT);
           CREATE TABLE IF NOT EXISTS adjudications(id TEXT PRIMARY KEY, captured TEXT, payload TEXT);
+          CREATE TABLE IF NOT EXISTS sweeps(id TEXT PRIMARY KEY, request TEXT);
+          CREATE TABLE IF NOT EXISTS sweep_progress(id INTEGER PRIMARY KEY, sweep TEXT, captured TEXT, payload TEXT);
+          CREATE TABLE IF NOT EXISTS sweep_pages(sweep TEXT, ordinal INTEGER, cursor TEXT, signature TEXT, PRIMARY KEY(sweep,ordinal));
+          CREATE TABLE IF NOT EXISTS sweep_members(sweep TEXT, family TEXT, pr TEXT, PRIMARY KEY(sweep,family));
+          CREATE TABLE IF NOT EXISTS sweep_refreshes(sweep TEXT, ordinal INTEGER, family TEXT, pr TEXT, PRIMARY KEY(sweep,ordinal));
+          CREATE TABLE IF NOT EXISTS sweep_attempts(id TEXT PRIMARY KEY, sweep TEXT, slot TEXT, request TEXT);
+          CREATE TABLE IF NOT EXISTS decision_context(id TEXT PRIMARY KEY, payload TEXT, observation TEXT);
         """)
-        for table in ("study", "captures", "enrollments", "observations", "snapshots", "admissions", "decisions", "outcomes", "gaps", "reports", "guidance", "adjudications"):
+        for table in ("study", "captures", "enrollments", "observations", "snapshots", "admissions", "decisions", "outcomes", "gaps", "reports", "guidance", "adjudications",
+                      "sweeps", "sweep_progress", "sweep_pages", "sweep_members", "sweep_refreshes", "sweep_attempts", "decision_context"):
             for operation in ("UPDATE", "DELETE"):
                 self.db.execute(f"CREATE TRIGGER IF NOT EXISTS immutable_{table}_{operation} BEFORE {operation} ON {table} "
                                 "BEGIN SELECT RAISE(ABORT,'immutable observer history'); END")
@@ -88,7 +109,74 @@ class Ledger:
         return [{"familyId": row["family"], "pullRequestId": row["pr"]}
                 for row in self.db.execute("SELECT family,pr FROM enrollments ORDER BY family")]
 
-    def ingest(self, page: dict[str, Any], request: dict[str, Any], pipeline: str) -> list[str]:
+    def progress(self) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT payload FROM sweep_progress ORDER BY id DESC LIMIT 1").fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_progress(self, state: dict[str, Any], now: str) -> None:
+        self.db.execute("INSERT INTO sweep_progress(sweep,captured,payload) VALUES(?,?,?)",
+                        (state["id"], instant(now), canonical(state)))
+
+    def sweep(self, config: dict[str, Any], now: str) -> dict[str, Any]:
+        state = self.progress()
+        if state and state["phase"] != "complete":
+            return state
+        request = {"schemaVersion": 1, "purpose": "INVENTORY", "studyId": config["studyId"],
+                   "captureId": uuid.uuid4().hex, "startedAt": now, "cursor": None,
+                   "trackedPullRequests": self.tracked(), "maxItems": config["maxItems"],
+                   "collectorConfigSha256": config["collector"]["configSha256"]}
+        validate(request, "observation-request")
+        state = {"id": request["captureId"], "phase": "inventory", "cursor": None, "pages": 0,
+                 "refreshIndex": 0, "failures": 0, "noProgress": 0, "reason": None}
+        with self.db:
+            self.db.execute("INSERT INTO sweeps VALUES(?,?)", (state["id"], canonical(request)))
+            self.save_progress(state, now)
+        return state
+
+    def inventory_progress(self, state: dict[str, Any], page: dict[str, Any]) -> None:
+        cursor = page["page"]["nextCursor"]
+        signature = digest(sorted((item["familyId"], item["pullRequestId"]) for item in page["inventory"]))
+        previous = self.db.execute("SELECT signature FROM sweep_pages WHERE sweep=? ORDER BY ordinal DESC LIMIT 1",
+                                   (state["id"],)).fetchone()
+        repeat = previous and previous["signature"] == signature
+        self.db.execute("INSERT INTO sweep_pages VALUES(?,?,?,?)",
+                        (state["id"], state["pages"], canonical(page["page"]["cursor"]), signature))
+        for item in page["inventory"]:
+            self.db.execute("INSERT OR IGNORE INTO sweep_members VALUES(?,?,?)",
+                            (state["id"], item["familyId"], item["pullRequestId"]))
+        state = {**state, "pages": state["pages"] + 1, "cursor": cursor, "failures": 0, "reason": None,
+                 "noProgress": state["noProgress"] + 1 if repeat else 0}
+        if cursor is not None and self.db.execute("SELECT 1 FROM sweep_pages WHERE sweep=? AND cursor=?",
+                                                 (state["id"], canonical(cursor))).fetchone():
+            state.update(phase="blocked", reason="PAGINATION_CYCLE")
+        elif not page["page"]["complete"] and state["noProgress"] >= MAX_NO_PROGRESS_PAGES:
+            state.update(phase="blocked", reason="PAGINATION_NO_PROGRESS")
+        elif page["page"]["complete"]:
+            initial = json.loads(self.db.execute("SELECT request FROM sweeps WHERE id=?", (state["id"],)).fetchone()[0])
+            known = {item["familyId"] for item in initial["trackedPullRequests"]}
+            members = {row["family"]: row["pr"] for row in self.db.execute(
+                "SELECT family,pr FROM sweep_members WHERE sweep=? ORDER BY family", (state["id"],))}
+            pending = {row["family"] for row in self.db.execute(
+                "SELECT DISTINCT family FROM snapshots WHERE key NOT IN (SELECT snapshot FROM decisions)")}
+            # Newly discovered families get a reconciliation even when the initial tracked set was empty.
+            targets = []
+            for family in sorted(members):
+                latest = self.db.execute("SELECT state,payload FROM observations WHERE family=? ORDER BY captured DESC,id DESC LIMIT 1",
+                                         (family,)).fetchone()
+                if (latest["state"] == "ACTIVE" and not json.loads(latest["payload"])["isDraft"]
+                        and (family not in known or family in pending)):
+                    targets.append(family)
+            for index, family in enumerate(targets):
+                self.db.execute("INSERT INTO sweep_refreshes VALUES(?,?,?,?)", (state["id"], index, family, members[family]))
+            state["phase"] = "refresh" if targets else "complete"
+        elif state["pages"] >= MAX_SWEEP_PAGES:
+            state.update(phase="blocked", reason="PAGINATION_PAGE_LIMIT")
+        if state["phase"] == "blocked":
+            self.gap(state["reason"], None, "Sweep blocked, never complete. Inspect receipts; corrected configuration/code requires a new study.", utc_now())
+        self.save_progress(state, page["window"]["completedAt"])
+
+    def ingest(self, page: dict[str, Any], request: dict[str, Any], pipeline: str,
+               sweep_state: dict[str, Any] | None = None) -> list[str]:
         validate_page(page, request)
         page_id = page["captureId"] + ":" + digest(page["page"]["cursor"])
         existing = self.db.execute("SELECT payload FROM captures WHERE id=?", (page_id,)).fetchone()
@@ -162,6 +250,8 @@ class Ledger:
                 else:
                     self.db.execute("INSERT INTO outcomes VALUES(?,?,?,?)",
                                     (outcome["id"], outcome["familyId"], instant(outcome["capturedAt"]), canonical(outcome)))
+            if sweep_state is not None:
+                self.inventory_progress(sweep_state, page)
         return keys
 
     def admit(self, key: str, config: dict[str, Any], now: str) -> str | None:
@@ -197,22 +287,33 @@ def prospective_eligible(observation: dict[str, Any]) -> bool:
 
 
 async def assess_pending(ledger: Ledger, config: dict[str, Any], pipeline: str,
-                         provider_factory, now=utc_now, cancel_file: Path | None = None) -> None:
+                         provider_factory, now=utc_now, cancel_file: Path | None = None,
+                         refreshed: dict[str, Any] | None = None) -> None:
     import json
     evaluation = config["evaluation"]
     rows = ledger.db.execute("SELECT * FROM snapshots WHERE key NOT IN (SELECT snapshot FROM decisions) "
                              "ORDER BY captured,key").fetchall()
     fatal = ledger.db.execute("SELECT 1 FROM gaps WHERE code='MODEL_RUNTIME_BLOCKED' LIMIT 1").fetchone()
     for row in rows:
+        if refreshed is not None and row["family"] != refreshed["familyId"]:
+            continue
         is_cancelled(cancel_file)
         if ledger.expired(now()):
             break
+        if refreshed is not None and (timestamp(now()) - timestamp(refreshed["capturedAt"])).total_seconds() > REFRESH_MAX_AGE_SECONDS:
+            with ledger.db:
+                ledger.gap("REFRESH_EXPIRED", row["family"], "Refresh aged before admission; defer to a later sweep.", now())
+            break
         bundle, observation = json.loads(row["payload"]), json.loads(row["observation"])
+        if refreshed is not None and row["key"] == refreshed["key"]:
+            bundle, observation = refreshed["bundle"], refreshed["observation"]
         current = ledger.db.execute("SELECT key FROM snapshots WHERE family=? ORDER BY captured DESC,rowid DESC LIMIT 1",
                                     (row["family"],)).fetchone()
         latest_observation = ledger.db.execute("SELECT * FROM observations WHERE family=? ORDER BY captured DESC,id DESC LIMIT 1",
                                               (row["family"],)).fetchone()
-        if latest_observation and (latest_observation["state"] != "ACTIVE"
+        if refreshed is not None and row["key"] != refreshed["key"]:
+            status = "SUPERSEDED_BEFORE_ASSESSMENT"
+        elif latest_observation and (latest_observation["state"] != "ACTIVE"
                                    or latest_observation["approval"] == "APPROVED"
                                    or not json.loads(latest_observation["payload"])["hasSnapshot"]):
             status = "LATEST_OBSERVATION_INELIGIBLE"
@@ -242,6 +343,9 @@ async def assess_pending(ledger: Ledger, config: dict[str, Any], pipeline: str,
         admission = ledger.admit(row["key"], config, started) if will_infer else uuid.uuid4().hex
         if admission is None:
             continue
+        with ledger.db:
+            ledger.db.execute("INSERT INTO decision_context VALUES(?,?,?)",
+                              (admission, canonical(bundle), canonical(observation)))
         try:
             provider = provider_factory(bundle) if will_infer else NoModelProvider(evaluation["model"])
             result = await evaluate(bundle, provider, evaluation["deadlineSeconds"], evaluation["maxAttempts"],
@@ -275,7 +379,9 @@ class NoModelProvider:
 def report(ledger: Ledger, now: str) -> dict[str, Any]:
     import json
     decisions = []
-    for row in ledger.db.execute("SELECT d.*,s.family,s.payload,s.observation FROM decisions d JOIN snapshots s ON s.key=d.snapshot ORDER BY finished,id"):
+    for row in ledger.db.execute(
+            "SELECT d.*,s.family,COALESCE(c.payload,s.payload) payload,COALESCE(c.observation,s.observation) observation "
+            "FROM decisions d JOIN snapshots s ON s.key=d.snapshot LEFT JOIN decision_context c ON c.id=d.id ORDER BY finished,d.id"):
         item = dict(row)
         item["bundle"] = json.loads(item.pop("payload"))
         item["observation"] = json.loads(item["observation"])
@@ -357,12 +463,42 @@ def report(ledger: Ledger, now: str) -> dict[str, Any]:
             "modelOnlyDiagnostic": result["modelOnlyDiagnostic"] if result else None,
             "reasons": [b["code"] for b in result["blockers"]] if result else [item["status"]],
         }
+    sweep = ledger.progress()
+    collection = {"collectionStatus": "not_started", "sweepId": "", "sweepPages": 0, "refreshRemaining": 0,
+                  "consecutiveFailures": 0, "sweepReason": ""}
+    blockers = []
+    if sweep:
+        remaining = ledger.db.execute("SELECT COUNT(*) FROM sweep_refreshes WHERE sweep=? AND ordinal>=?",
+                                      (sweep["id"], sweep["refreshIndex"])).fetchone()[0]
+        status = ("blocked" if sweep["phase"] == "blocked" else "capture_failed" if sweep["failures"] else
+                  {"inventory": "in_progress", "refresh": "reconciling", "complete": "complete"}[sweep["phase"]])
+        collection.update(collectionStatus=status, sweepId=sweep["id"], sweepPages=sweep["pages"],
+                          refreshRemaining=remaining, consecutiveFailures=sweep["failures"], sweepReason=sweep["reason"] or "")
+        if sweep["phase"] == "inventory":
+            blockers.append("INVENTORY_SWEEP_PENDING")
+        if sweep["phase"] == "refresh":
+            blockers.append("FRESH_RECONCILIATION_PENDING")
+        if sweep["reason"]:
+            blockers.append(sweep["reason"])
+    evaluation = json.loads(ledger.study["config"])["evaluation"]
+    if evaluation["mode"] == "collection-only":
+        blockers.append("COLLECTION_ONLY")
+    elif (ledger.db.execute("SELECT COUNT(*) FROM admissions").fetchone()[0] >= evaluation["studyLimit"]
+          or ledger.db.execute("SELECT COUNT(*) FROM admissions WHERE substr(admitted,1,10)=?", (instant(now)[:10],)).fetchone()[0]
+          >= evaluation["dailyLimit"]):
+        blockers.append("EVALUATION_BUDGET_BLOCKED")
+    if ledger.db.execute("SELECT 1 FROM gaps WHERE code='MODEL_RUNTIME_BLOCKED' LIMIT 1").fetchone():
+        blockers.append("MODEL_RUNTIME_BLOCKED")
+    if ledger.expired(now):
+        blockers.append("STUDY_EXPIRED")
     return {
         "schemaVersion": 1, "studyId": ledger.study["id"], "startedAt": ledger.study["started"],
         "deadline": ledger.study["deadline"], "asOf": instant(now), "final": ledger.expired(now),
         "authorization": "NONE", "cohorts": cohorts, "outcomes": len(outcomes),
         "livePolicyAgreement": {"eligible": len(matching), "excluded": excluded, "confusionMatrix": matrix, "matches": matching},
         "admissions": ledger.db.execute("SELECT COUNT(*) FROM admissions").fetchone()[0],
+        "snapshots": ledger.db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0],
+        "decisions": len(decisions), "collection": collection, "admissionBlockers": blockers,
         "gaps": [dict(row) for row in ledger.db.execute("SELECT code,COUNT(*) count FROM gaps GROUP BY code ORDER BY code")],
         "latest": list(latest.values()), "backendVersion": None,
         "humanAdjudications": [json.loads(row["payload"]) for row in ledger.db.execute("SELECT payload FROM adjudications ORDER BY captured,id")],
@@ -382,6 +518,10 @@ def persist_report(ledger: Ledger, now: str) -> dict[str, Any]:
         atomic_write(root / (name + ".json"), canonical(value) + "\n")
         lines = ["# Sign-off observer", "", f"Study: {value['studyId']}; deadline: {value['deadline']}", "",
                  value["limitations"], "", "Final policy and model-only diagnostics are distinct.", "",
+                 f"Collection: {value['collection']['collectionStatus']}; sweep: {value['collection']['sweepId']}; "
+                 f"inventory pages: {value['collection']['sweepPages']}; refresh remaining: {value['collection']['refreshRemaining']}.",
+                 f"Stored snapshots: {value['snapshots']}; decisions: {value['decisions']}; admissions: {value['admissions']}.",
+                 "Admission blockers: " + (", ".join(value["admissionBlockers"]) or "none") + ".", "",
                  "| Family | Final policy | Model-only diagnostic | Gaps |", "|---|---|---|---|"]
         for row in value["latest"]:
             safe_family = row["familyId"].replace("|", "\\|").replace("\n", " ")
@@ -453,6 +593,7 @@ async def collect_page(config: dict[str, Any], request: dict[str, Any], folder: 
             raise ContractError("COLLECTOR_EXIT_" + str(process.returncode))
         page = load_json(output_path)
         validate_page(page, request)
+        atomic_write(folder / "accepted.json", canonical({"requestHash": digest(request), "pageHash": digest(page)}) + "\n")
         return page
     except (TimeoutError, Cancelled, asyncio.CancelledError) as error:
         code = "COLLECTOR_TIMEOUT" if isinstance(error, TimeoutError) else "COLLECTOR_CANCELLED"
@@ -472,6 +613,101 @@ async def collect_page(config: dict[str, Any], request: dict[str, Any], folder: 
             raise CapabilityError(code + "_DIAGNOSTIC_WRITE_FAILED_REQUIRES_CONTAINMENT_CLEANUP") from None
         # Outer Job Object contains MCP grandchildren; stop rather than launch another collector.
         raise CapabilityError(code + "_REQUIRES_CONTAINMENT_CLEANUP") from None
+
+
+async def capture_chunk(ledger: Ledger, config: dict[str, Any], pipeline: str, provider,
+                        toolkit: Path, pwsh: str, cancel_file: Path | None, now=utc_now) -> dict[str, Any]:
+    state = ledger.sweep(config, now())
+    for _ in range(config["maxPages"]):
+        is_cancelled(cancel_file)
+        if ledger.expired(now()) or state["phase"] in ("complete", "blocked"):
+            break
+        definition = json.loads(ledger.db.execute("SELECT request FROM sweeps WHERE id=?", (state["id"],)).fetchone()[0])
+        target = None
+        slot = f"{state['phase']}:{state['pages'] if state['phase'] == 'inventory' else state['refreshIndex']}"
+        if state["phase"] == "inventory":
+            request = {**definition, "cursor": state["cursor"]}
+        else:
+            target = ledger.db.execute("SELECT * FROM sweep_refreshes WHERE sweep=? AND ordinal=?",
+                                       (state["id"], state["refreshIndex"])).fetchone()
+            request = {**definition, "purpose": "REFRESH", "captureId": uuid.uuid4().hex,
+                       "startedAt": now(), "cursor": None, "maxItems": 1,
+                       "trackedPullRequests": [{"familyId": target["family"], "pullRequestId": target["pr"]}]}
+        # Accepted inventory receipts survive a crash between collector return and the SQLite commit.
+        # Refreshes are always recaptured after interruption, never replayed as current evidence.
+        page = None
+        if target is None:
+            previous = ledger.db.execute("SELECT * FROM sweep_attempts WHERE sweep=? AND slot=? ORDER BY rowid DESC LIMIT 1",
+                                         (state["id"], slot)).fetchone()
+            if previous:
+                folder = ledger.root / "captures" / state["id"] / previous["id"]
+                if (folder / "accepted.json").is_file():
+                    receipt = load_json(folder / "accepted.json")
+                    page = load_json(folder / "response.json")
+                    if (receipt != {"requestHash": digest(request), "pageHash": digest(page)}
+                            or previous["request"] != canonical(request)):
+                        raise ContractError("SWEEP_RECEIPT_MISMATCH")
+        if page is None:
+            attempt = uuid.uuid4().hex
+            folder = ledger.root / "captures" / state["id"] / attempt
+            folder.mkdir(parents=True)
+            with ledger.db:
+                ledger.db.execute("INSERT INTO sweep_attempts VALUES(?,?,?,?)", (attempt, state["id"], slot, canonical(request)))
+        try:
+            if page is None:
+                page = await collect_page(config, request, folder, toolkit, pwsh, cancel_file)
+            ledger.ingest(page, request, pipeline, state if target is None else None)
+        except CapabilityError:
+            failures = state["failures"] + 1
+            with ledger.db:
+                ledger.save_progress({**state, "failures": failures, "reason": "COLLECTOR_INTERRUPTED",
+                                      "phase": "blocked" if failures >= MAX_SWEEP_FAILURES else state["phase"]}, now())
+            raise
+        except (ContractError, OSError) as error:
+            failures = state["failures"] + 1
+            state = {**state, "failures": failures, "reason": "CAPTURE_FAILED",
+                     "phase": "blocked" if failures >= MAX_SWEEP_FAILURES else state["phase"]}
+            with ledger.db:
+                ledger.gap("CAPTURE_FAILED", None, type(error).__name__ + ":" +
+                           (str(error) if isinstance(error, ContractError) else "IO_ERROR"), now())
+                ledger.save_progress(state, now())
+            break
+        if target is None:
+            state = ledger.progress()
+            continue
+        snapshots = page["snapshots"]
+        if snapshots:
+            snapshot = snapshots[0]
+            key = snapshot_key(snapshot["bundle"], snapshot["observation"], pipeline)
+            row = ledger.db.execute("SELECT key FROM snapshots WHERE key=?", (key,)).fetchone()
+            latest = ledger.db.execute("SELECT captured FROM observations WHERE family=? ORDER BY captured DESC,id DESC LIMIT 1",
+                                       (target["family"],)).fetchone()
+            if row and latest and instant(page["window"]["completedAt"]) == latest["captured"]:
+                await assess_pending(ledger, config, pipeline, provider, now, cancel_file,
+                                     refreshed={"familyId": target["family"], "key": key,
+                                                "capturedAt": snapshot["observation"]["capturedAt"],
+                                                "bundle": snapshot["bundle"], "observation": snapshot["observation"]})
+            else:
+                with ledger.db:
+                    ledger.gap("REFRESH_INELIGIBLE", target["family"],
+                               "Refresh is out of order or conflicts with frozen guidance; no inference.", now())
+        else:
+            with ledger.db:
+                ledger.gap("REFRESH_UNAVAILABLE", target["family"],
+                           "No current snapshot; no inference. Reconcile again on a later sweep.", now())
+        remaining = ledger.db.execute("SELECT 1 FROM sweep_refreshes WHERE sweep=? AND ordinal>?",
+                                      (state["id"], state["refreshIndex"])).fetchone()
+        state = {**state, "refreshIndex": state["refreshIndex"] + 1, "failures": 0, "reason": None,
+                 "phase": "refresh" if remaining else "complete"}
+        with ledger.db:
+            ledger.save_progress(state, now())
+        if ledger.db.execute("SELECT 1 FROM gaps WHERE code='MODEL_RUNTIME_BLOCKED' LIMIT 1").fetchone():
+            break
+    if state["phase"] != "complete":
+        with ledger.db:
+            ledger.gap("INVENTORY_INCOMPLETE" if state["phase"] in ("inventory", "blocked") else "RECONCILIATION_PENDING",
+                       None, "Bounded sweep retained; no absence or completion inferred.", now())
+    return state
 
 
 async def worker(args) -> int:
@@ -531,53 +767,30 @@ async def worker(args) -> int:
                 is_cancelled(args.cancel_file)
                 events.cycle += 1
                 events.emit("cycle.started")
-                request = {"schemaVersion": 1, "studyId": config["studyId"], "captureId": uuid.uuid4().hex,
-                           "startedAt": utc_now(), "cursor": None, "trackedPullRequests": ledger.tracked(),
-                           "maxItems": config["maxItems"], "collectorConfigSha256": config["collector"]["configSha256"]}
-                seen = set()
-                complete = False
-                for page_number in range(config["maxPages"]):
-                    folder = root / "captures" / request["captureId"] / str(page_number)
-                    folder.mkdir(parents=True)
-                    try:
-                        page = await collect_page(config, request, folder, Path(__file__).resolve().parents[2], args.pwsh, args.cancel_file)
-                        ledger.ingest(page, request, pipeline)
-                    except (ContractError, OSError) as error:
-                        with ledger.db:
-                            ledger.gap("CAPTURE_FAILED", None, type(error).__name__ + ":" + (str(error) if isinstance(error, ContractError) else "IO_ERROR"), utc_now())
-                        events.emit("cycle.failed", {"reason": "Capture failed; preserved gaps and prior history."}, "error")
-                        break
-                    if page["page"]["complete"]:
-                        complete = True
-                        break
-                    cursor = page["page"]["nextCursor"]
-                    if cursor in seen:
-                        with ledger.db:
-                            ledger.gap("PAGINATION_CYCLE", None, "Repeated continuation token.", utc_now())
-                        break
-                    seen.add(cursor)
-                    request = {**request, "cursor": cursor}
-                if not complete:
-                    with ledger.db:
-                        ledger.gap("INVENTORY_INCOMPLETE", None, "No terminal page; no absence or completion inferred.", utc_now())
-                if complete:
-                    blocked_before = ledger.db.execute("SELECT 1 FROM gaps WHERE code='MODEL_RUNTIME_BLOCKED' LIMIT 1").fetchone()
-                    await assess_pending(ledger, config, pipeline, provider, cancel_file=args.cancel_file)
-                    if not blocked_before and ledger.db.execute("SELECT 1 FROM gaps WHERE code='MODEL_RUNTIME_BLOCKED' LIMIT 1").fetchone():
-                        persist_report(ledger, utc_now())
-                        raise CapabilityError("MODEL_RUNTIME_BLOCKED_RESTART_COLLECTION_ONLY_AFTER_CONTAINMENT_CLEANUP")
+                blocked_before = ledger.db.execute("SELECT 1 FROM gaps WHERE code='MODEL_RUNTIME_BLOCKED' LIMIT 1").fetchone()
+                sweep = await capture_chunk(ledger, config, pipeline, provider, toolkit, args.pwsh, args.cancel_file)
+                complete = sweep["phase"] == "complete"
+                if not blocked_before and ledger.db.execute("SELECT 1 FROM gaps WHERE code='MODEL_RUNTIME_BLOCKED' LIMIT 1").fetchone():
+                    persist_report(ledger, utc_now())
+                    raise CapabilityError("MODEL_RUNTIME_BLOCKED_RESTART_COLLECTION_ONLY_AFTER_CONTAINMENT_CLEANUP")
                 value = persist_report(ledger, utc_now())
                 events.emit("observer.updated", {"studyId": config["studyId"], "mode": config["evaluation"]["mode"],
                     "families": sum(c["families"] for c in value["cohorts"].values()), "admissions": value["admissions"],
                     "eligibleAgreement": value["livePolicyAgreement"]["eligible"], "deadline": value["deadline"],
                     "reportPath": str(root / "reports" / "latest.md"),
-                    "collectionStatus": "complete" if complete else "incomplete",
+                    **value["collection"],
+                    "snapshots": value["snapshots"], "decisions": value["decisions"],
                     "lastFamilyId": value["latest"][-1]["familyId"] if value["latest"] else "",
                     "finalRecommendation": value["latest"][-1]["recommendation"] if value["latest"] else "NEEDS_HUMAN_REVIEW",
                     "diagnostic": (value["latest"][-1]["modelOnlyDiagnostic"] or {}).get("recommendation", "none") if value["latest"] else "none",
-                    "eligibilityReasons": (value["latest"][-1]["reasons"] if value["latest"] else ["NO_SNAPSHOTS"])
-                        + ([] if complete else ["CAPTURE_INCOMPLETE"])})
-                events.emit("cycle.completed", {"result": "observed" if complete else "partial", "scanned": len(ledger.tracked())})
+                    "eligibilityReasons": (value["latest"][-1]["reasons"] if value["latest"] else
+                                           ["NO_DECISIONS" if value["snapshots"] else "NO_SNAPSHOTS"])
+                        + value["admissionBlockers"]})
+                events.emit("cycle.failed" if sweep["reason"] else "cycle.completed",
+                            {"result": "observed" if complete else "partial", "scanned": len(ledger.tracked()),
+                             "reason": sweep["reason"] or ""})
+                if sweep["phase"] == "blocked":
+                    return 2
                 if args.once:
                     if not complete:
                         return 2
@@ -590,9 +803,12 @@ async def worker(args) -> int:
                     await asyncio.sleep(min(5, max(0, stop - asyncio.get_running_loop().time())))
             persist_report(ledger, utc_now())
             return 0
-        except (CapabilityError, Cancelled, asyncio.CancelledError) as error:
+        except (CapabilityError, Cancelled, asyncio.CancelledError, ContractError, OSError) as error:
             with ledger.db:
-                code = str(error) if isinstance(error, CapabilityError) else "CANCELLED"
+                code = (str(error) if isinstance(error, (CapabilityError, ContractError)) else
+                        "IO_ERROR" if isinstance(error, OSError) else "CANCELLED")
+                if isinstance(error, (ContractError, OSError)) and ledger.progress():
+                    ledger.save_progress({**ledger.progress(), "phase": "blocked", "reason": code}, utc_now())
                 ledger.gap("WORKER_INTERRUPTED", None,
                            code + ": owner exits for containment cleanup; unchanged-pipeline restart preserves admission and deadline.",
                            utc_now())

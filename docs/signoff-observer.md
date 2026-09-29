@@ -107,7 +107,9 @@ Observer-only attended TUI (no operational roles, broker, or manual actions):
   -ObserverConfigFile $config -ObserverPythonPath $python -PreviewOnly -Continuous
 ```
 
-Use `-Once` for one bounded capture. Closing this TUI stops **its own** worker
+Use `-Once` for one bounded **chunk**, not necessarily a full inventory sweep.
+An unfinished chunk exits 2 with durable progress; repeat the same command to
+continue its saved cursor. Closing this TUI stops **its own** worker
 tree. `-Golden`, `-Operational`, manual-role switches, and reviewer/handler
 configuration are rejected in observer-only selection.
 
@@ -200,11 +202,69 @@ Authoritative versioned JSON Schemas are shipped under
 | `observer-adjudication` | Separate explicit human judgment of a persisted decision |
 | `observer-delivery` | Separate private-operator report delivery authorization/configuration |
 
-Pages must terminate explicitly; absence is never interpreted as completion.
-Incomplete pagination records a gap and admits no assessments that cycle.
-One-shot failed/incomplete capture exits 2, not success. Private per-capture
-`collector.stderr.log` receipts retain operator diagnostics; they never enter
-model inputs, event messages, or public reports.
+`observation-request.purpose` is optional: omission explicitly means `INVENTORY`.
+`REFRESH` is a closed, singleton selection: exactly one trusted
+`trackedPullRequests` entry, `maxItems:1`, and `cursor:null`. The collector must
+re-read that exact PR and its current source/target/code/intent/policy/checks,
+not rerun an active-list or configured smoke selection. Its response must be
+terminal, contain no other family's inventory/outcomes, and use a current
+capture cutoff at or after the request start. Missing/terminal PRs retain their
+explicit inventory/gaps/outcomes rather than fabricating an evaluable snapshot.
+The four collector CLI arguments and page response schema are unchanged.
+
+### Durable bounded inventory and freshness
+
+`maxPages` bounds **collector calls per chunk**, including singleton refreshes.
+Hitting it no longer discards the cursor or restarts the active list at zero.
+Each inventory sweep freezes its capture ID, start time, and tracked-PR list.
+Validated page ingestion and continuation are committed together in append-only
+SQLite history. A restart resumes that same sweep and cursor; new enrollments
+cannot shift the frozen known-list offsets. Successful transport receipts can
+recover an inventory page after a crash before ingestion. Attempts use unique
+directories; prior requests, responses, and diagnostics are not overwritten.
+
+Pages must terminate explicitly before **any** model admission. A terminal page
+is observed traversal exhaustion, not proof of an atomic provider inventory.
+Offset pagination can miss or repeat entries under churn, and transient states
+remain gaps. Finite inventories larger than one chunk, including both active
+and tracked reconciliation phases, now make durable progress. No completion
+guarantee is made for adversarial continuous growth.
+
+After terminal inventory, a fixed reconciliation queue covers newly discovered
+active non-draft families and active non-draft families with pending snapshots.
+Proven draft/terminal inventory is not refreshed for inference. This also handles
+new candidates when the sweep began with an empty tracked set. Each candidate
+gets a new `REFRESH` capture immediately before assessment; only that refreshed
+family/version can be admitted. No stored snapshot substitutes for a missing,
+out-of-order, unstable, or stale refresh. Refreshes older than five minutes at
+admission are deferred to a later sweep. Refreshes are never replayed as current
+evidence after a crash. A changed head/evidence supersedes the queued version;
+unchanged evidence still deduplicates predictions, while the actual refreshed
+input/cutoff/baseline used for a new decision is preserved separately and
+immutably. Same-model two-assessment and approval-policy rules are unchanged.
+
+Successful pages reset the consecutive failure count. Three consecutive
+collector failures/interrupted attempts, a repeated continuation token, three
+consecutive repetitions of page membership, or 10,000 nonterminal inventory
+pages block the sweep explicitly. These are guards, **never completion**.
+Before a persistent block, an unchanged-pipeline restart may retry the same
+cursor using a new attempt directory. After a persistent block, restarting
+does not issue further collector/model calls: inspect private receipts and
+correct the collector/configuration, then initialize a new study. There is no
+automatic endless retry or ledger-reset switch. The original seven-day deadline,
+cancellation, admission reservations, and process containment remain enforced.
+
+One-shot unfinished/failed/blocked chunks exit 2, not success. Timeout/cancellation
+still exits for outer descendant containment cleanup. Private per-attempt
+`collector.stderr.log` and interruption receipts retain operator diagnostics;
+they never enter model inputs, event messages, or public reports.
+
+**Upgrade:** this changes the frozen engine/schema fingerprint. Preserve old
+study directories, including incomplete sweeps and zero-admission history.
+Do not edit an old ledger/config to accept the new engine or reinterpret its
+past results. Stop the owning process deliberately and initialize a new private
+study with the updated toolkit and compatible collector. Initialization is not
+a study launch; restarting a new study does not extend its original deadline.
 
 The per-page outer collector limit is **660 seconds**, allowing the consumer's
 600-second transport deadline plus 60 seconds for teardown. This is separate
@@ -288,6 +348,12 @@ deadline) `final` JSON/Markdown pointers. The dashboard shows capture health,
 families/admissions/comparisons, the last evaluated family's final policy
 separately from its diagnostic, eligibility gaps, deadline, and report path.
 An incomplete capture stays visibly actionable.
+Collection health distinguishes `in_progress` inventory, `reconciling`,
+`capture_failed`, persistently `blocked`, and `complete`. Reports/dashboard
+show sweep ID, cumulative inventory pages, remaining refreshes, consecutive
+failures, admission blockers, and separate stored-snapshot/decision/admission
+counts. `NO_DECISIONS` is not `NO_SNAPSHOTS`; a healthy heartbeat alone does not
+demonstrate collection progress or model coverage.
 
 Reports retain natural/synthetic/unknown families, decisions, abstentions,
 no-prediction and censored denominators. Prospective policy agreement selects

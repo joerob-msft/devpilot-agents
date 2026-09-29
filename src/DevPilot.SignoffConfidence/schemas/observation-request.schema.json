@@ -5,6 +5,7 @@
   "required": ["schemaVersion", "studyId", "captureId", "startedAt", "cursor", "trackedPullRequests", "maxItems", "collectorConfigSha256"],
   "properties": {
     "schemaVersion": {"const": 1},
+    "purpose": {"enum": ["INVENTORY", "REFRESH"]},
     "studyId": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
     "captureId": {"$ref": "urn:devpilot:signoff:bundle:1#/$defs/id"},
     "startedAt": {"type": "string", "format": "date-time"},
@@ -18,5 +19,12 @@
     },
     "maxItems": {"type": "integer", "minimum": 1, "maximum": 25},
     "collectorConfigSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
-  }
+  },
+  "allOf": [{
+    "if": {"required": ["purpose"], "properties": {"purpose": {"const": "REFRESH"}}},
+    "then": {"properties": {
+      "cursor": {"type": "null"}, "maxItems": {"const": 1},
+      "trackedPullRequests": {"minItems": 1, "maxItems": 1}
+    }}
+  }]
 }

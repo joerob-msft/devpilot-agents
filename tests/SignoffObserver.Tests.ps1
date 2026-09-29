@@ -93,6 +93,50 @@ Describe 'Sign-off observer contained adapter and role ceiling' {
         $LASTEXITCODE | Should -Be 130
     }
 
+    It 'continues a durable sweep across real Once processes and refreshes only after terminal inventory' -Skip:(-not $IsWindows) {
+        $configPath = New-TestObserverConfig 'chunked' 'offline'
+        $paged = Join-Path $script:private 'paged-collector.ps1'
+        $paging = @'
+$page.page.cursor = $request.cursor
+if ($request.purpose -eq 'INVENTORY' -and $request.cursor -ne 'second') {
+    $page.inventory = @()
+    $page.snapshots = @()
+    $page.page.complete = $false
+    $page.page.nextCursor = if ($null -eq $request.cursor) { 'first' } else { 'second' }
+}
+'@
+        (Get-Content $script:collector -Raw).Replace('[IO.File]::WriteAllText', ($paging + "`n[IO.File]::WriteAllText")) |
+            Set-Content -LiteralPath $paged
+        $config = Get-Content $configPath -Raw | ConvertFrom-Json -AsHashtable
+        $config.maxPages = 1
+        $config.collector.scriptPath = $paged
+        $config.collector.scriptSha256 = (Get-FileHash $paged).Hash.ToLowerInvariant()
+        $config | ConvertTo-Json -Depth 10 | Set-Content $configPath
+        $sweepId = $null
+        foreach ($step in 1..4) {
+            & pwsh -NoProfile -File $script:entry -ConfigFile $configPath -PythonPath $script:python -Once
+            $LASTEXITCODE | Should -Be $(if ($step -eq 4) { 0 } else { 2 })
+            $report = Get-Content (Join-Path $script:private 'chunked\reports\latest.json') -Raw | ConvertFrom-Json
+            if ($step -eq 1) { $sweepId = $report.collection.sweepId }
+            $report.collection.sweepId | Should -Be $sweepId
+            $report.admissions | Should -Be $(if ($step -eq 4) { 1 } else { 0 })
+            if ($step -eq 3) {
+                $report.snapshots | Should -Be 1
+                $report.decisions | Should -Be 0
+                $report.collection.collectionStatus | Should -Be 'reconciling'
+            }
+        }
+        $report.collection.collectionStatus | Should -Be 'complete'
+        $report.collection.sweepPages | Should -Be 3
+        $report.latest[0].recommendation | Should -Be 'APPROVE'
+        $report.authorization | Should -Be 'NONE'
+        $requests = @(Get-ChildItem (Join-Path $script:private 'chunked\captures') -Filter request.json -Recurse |
+            Get-Content -Raw | ConvertFrom-Json)
+        $requests.Count | Should -Be 4
+        @($requests | Where-Object purpose -eq 'REFRESH').Count | Should -Be 1
+        @($requests | Where-Object purpose -eq 'INVENTORY' | Select-Object -ExpandProperty captureId -Unique).Count | Should -Be 1
+    }
+
     It 'returns nonzero and retains private diagnostics for a failed collector' -Skip:(-not $IsWindows) {
         $configPath = New-TestObserverConfig 'collector-failed'
         $failingScript = Join-Path $script:private 'failing-collector.ps1'
@@ -112,7 +156,7 @@ Describe 'Sign-off observer contained adapter and role ceiling' {
         Get-Content $receipt.FullName -Raw | Should -Match 'synthetic collector unavailable'
         $events = Get-ChildItem (Join-Path $root 'logs\events\signoff-observer') -Filter '*.jsonl' |
             Get-Content | ConvertFrom-Json
-        ($events | Where-Object eventType -eq 'observer.updated').data.collectionStatus | Should -Be 'incomplete'
+        ($events | Where-Object eventType -eq 'observer.updated').data.collectionStatus | Should -Be 'capture_failed'
     }
 
     It 'never grants observer mutations or manual delegation, including outside preview' {

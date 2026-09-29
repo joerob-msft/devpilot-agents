@@ -66,6 +66,13 @@ def validate_page(page: dict[str, Any], request: dict[str, Any]) -> None:
     ids = [item["familyId"] for item in page["inventory"]]
     if len(ids) != len(set(ids)):
         raise ContractError("DUPLICATE_INVENTORY_FAMILY")
+    if request.get("purpose", "INVENTORY") == "REFRESH":
+        target = request["trackedPullRequests"][0]
+        if not page["page"]["complete"]:
+            raise ContractError("REFRESH_MUST_BE_TERMINAL")
+        if any(item["familyId"] != target["familyId"] or item["pullRequestId"] != target["pullRequestId"]
+               for item in page["inventory"]) or any(item["familyId"] != target["familyId"] for item in page["outcomes"]):
+            raise ContractError("REFRESH_FAMILY_MISMATCH")
     snapshot_ids = [item["bundle"]["familyId"] for item in page["snapshots"]]
     if len(snapshot_ids) != len(set(snapshot_ids)):
         raise ContractError("DUPLICATE_SNAPSHOT_FAMILY")
@@ -76,6 +83,8 @@ def validate_page(page: dict[str, Any], request: dict[str, Any]) -> None:
             raise ContractError("PROSPECTIVE_CAPTURE_FORBIDS_LABELS_AND_HISTORICAL_COHORT")
         if not start <= timestamp(observation["capturedAt"]) <= end:
             raise ContractError("SNAPSHOT_OUTSIDE_CAPTURE_WINDOW")
+        if request.get("purpose") == "REFRESH" and timestamp(bundle["provenance"]["cutoff"]) < timestamp(request["startedAt"]):
+            raise ContractError("REFRESH_REQUIRES_CURRENT_CAPTURE")
         if timestamp(bundle["provenance"]["cutoff"]) > timestamp(observation["capturedAt"]):
             raise ContractError("SNAPSHOT_CUTOFF_AFTER_CAPTURE")
         if timestamp(bundle["provenance"]["exportedAt"]) > end:

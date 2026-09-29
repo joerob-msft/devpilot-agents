@@ -59,6 +59,7 @@ test("simple observer details keep diagnostic distinct from policy and show deno
   assert.match(details, /Last snapshot final policy \(not study-wide\): NEEDS_HUMAN_REVIEW/);
   assert.match(details, /Model-only diagnostic \(not policy approval\): APPROVE/);
   assert.match(details, /Families: 25; evaluations admitted: 0; eligible human comparisons: 0/);
+  assert.match(details, /Stored snapshots: not reported; decisions: not reported/);
   assert.match(details, /POLICY_MISSING/);
   assert.match(details, /No approval authorization/);
 });
@@ -78,6 +79,23 @@ test("observer updates cannot change a legacy role's state", () => {
   reducer.apply(event(1, "agent.started", {}, "review-handler"));
   reducer.apply(event(2, "observer.updated", progress, "review-handler"));
   assert.equal(reducer.get("review-handler:study-worker")?.observer, undefined);
+});
+
+test("bounded inventory progress distinguishes stored snapshots from missing decisions and failures", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(event(1, "agent.started"));
+  reducer.apply(event(2, "observer.updated", { ...progress, collectionStatus: "in_progress",
+    snapshots: 28, decisions: 0, sweepId: "durable-sweep", sweepPages: 20, refreshRemaining: 0,
+    consecutiveFailures: 0, eligibilityReasons: ["NO_DECISIONS", "INVENTORY_SWEEP_PENDING"] }));
+  let row = simpleInstanceRow(reducer.get("signoff-observer:study-worker")!);
+  assert.match(row.details.join("\n"), /Stored snapshots: 28; decisions: 0/);
+  assert.match(row.details.join("\n"), /inventory pages: 20/);
+  assert.doesNotMatch(row.details.join("\n"), /NO_SNAPSHOTS|Capture incomplete/);
+  reducer.apply(event(3, "observer.updated", { ...progress, collectionStatus: "blocked",
+    sweepReason: "PAGINATION_NO_PROGRESS", consecutiveFailures: 3 }));
+  row = simpleInstanceRow(reducer.get("signoff-observer:study-worker")!);
+  assert.equal(row.attention, true);
+  assert.match(row.details.join("\n"), /PAGINATION_NO_PROGRESS/);
 });
 
 test("tailer discovers headless and alongside observer event directories", async () => {

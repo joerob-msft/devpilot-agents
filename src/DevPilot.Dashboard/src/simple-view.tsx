@@ -84,7 +84,8 @@ export function simpleCapability(name: string): string {
 export function simpleInstanceRow(state: InstanceState): SimpleRow {
   const now = Date.now();
   const event = state.timeline.at(-1);
-  const failure = (state.observer?.collectionStatus === "incomplete" ? "Capture incomplete; inspect private capture diagnostics and report gaps." : "") ||
+  const failure = (state.observer && ["incomplete", "capture_failed", "blocked"].includes(state.observer.collectionStatus)
+    ? `Capture ${state.observer.collectionStatus}; inspect private capture diagnostics and report gaps. ${state.observer.sweepReason}` : "") ||
     state.blocked?.reason || (state.status === "failed" ? state.completion?.reason : "") ||
     state.sourceDiagnostics.at(-1)?.message || "";
   const outcome = state.completion?.result || (state.exitObservedMs !== null ? "Interrupted / outcome unknown" : "Not reported");
@@ -112,6 +113,8 @@ export function simpleInstanceRow(state: InstanceState): SimpleRow {
         `Study: ${state.observer.studyId} | ${state.observer.mode} | deadline ${state.observer.deadline}`,
         `Last capture: ${state.observer.collectionStatus || "unknown"}; last evaluated family: ${state.observer.lastFamilyId || "none"}`,
         `Families: ${state.observer.families}; evaluations admitted: ${state.observer.admissions}; eligible human comparisons: ${state.observer.eligibleAgreement}`,
+        `Stored snapshots: ${state.observer.snapshots ?? "not reported"}; decisions: ${state.observer.decisions ?? "not reported"}`,
+        `Sweep: ${state.observer.sweepId || "not reported"}; inventory pages: ${state.observer.sweepPages}; refresh remaining: ${state.observer.refreshRemaining}; consecutive failures: ${state.observer.consecutiveFailures}`,
         `Last snapshot final policy (not study-wide): ${state.observer.finalRecommendation}`,
         `Model-only diagnostic (not policy approval): ${state.observer.diagnostic}`,
         `Eligibility gaps: ${state.observer.eligibilityReasons.join(", ") || "none"}`,
