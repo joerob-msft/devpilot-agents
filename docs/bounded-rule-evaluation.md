@@ -212,15 +212,17 @@ continuity in memory but **does not** create a durable pin or activate a rule.
 
 `tools/Provision-PrivateCanaryMergedPin.ps1` is a separate **default-off,
 source-only** provisioner; this public layer does not authorize running it
-against a live service. The user's approved private source URL supplies the
-selector; the signed selector/key must remain outside the public repository.
-The exported module entry point accepts the selector in memory to avoid
-putting confidential values in process arguments or logs. No separate human
-RSA signing key or public approval-signature release is required for this
-**GET-only** source binding.
+against a live service. The user's accepted private source URL supplies the
+organization, project, repository, reviewed PR and document selectors in
+memory (or CLI parameters on a trusted machine without command-line history
+or logging). The module entry point accepts a three-field route in memory;
+the reviewed PR ID and document path must exactly match the repository-owned
+contract before account access or any GET. No pre-existing signed selector,
+private selector key, human RSA key, or public approval-signature release is
+required for this **GET-only** source binding.
 
-Before any new private directory or key, the provisioner verifies the
-signed source selector, then performs a **fresh stateless**
+Before any new private directory or key, the provisioner validates those
+exact input selectors, then performs a **fresh stateless**
 completed-PR, merge/current-master ancestry and raw candidate/merge/master
 document proof with class/redundant section, line and declaration hashes. It
 also checks the signed-in work principal and Graph user/storage key on the
@@ -230,9 +232,13 @@ actual repository GUID, merge commit, current master, blob, section, line
 and distinct merge-bound declarations must all prove consistent. No source
 SHA is assumed to equal a squash/rebase merge SHA. Any drift or throttle
 stops with **no** new private root and no retry. Only after those checks does
-it generate a random key and write an ACL-private envelope in a newly
-created external staging directory, validate its files, and rename the
-directory into place. On a partial failure it cleans only a newly attributed,
+it generate separate random selector and pin integrity keys, write both the
+signed selector and merged-pin envelope into a newly created ACL-private
+external staging directory, validate all four files, and rename the
+directory into place. The resulting selector/key and pin/key are the
+inputs for later gated read-only consumers; their HMACs protect private
+artifact integrity, not independent human source approval. On a partial
+failure it cleans only a newly attributed,
 exactly named contained directory; an existing or aliased target is never
 overwritten or removed. Success reports only fixed state and read/write
 counts, not selectors, identity, source text, hashes, signature, key, or path.

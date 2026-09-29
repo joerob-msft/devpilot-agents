@@ -656,7 +656,8 @@ function Invoke-CanaryMergedMasterDiscovery {
 function Invoke-CanaryMergedPinProvisionCore {
     [CmdletBinding()]
     param([string]$StateRoot, [string]$RepositoryRoot,
-        [Collections.IDictionary]$SourceSelector, [string]$SourceSelectorKey,
+        [Collections.IDictionary]$SourceSelector, [int]$SourcePullRequestId,
+        [string]$DocumentPath,
         [string]$ExpectedAccountUniqueName,
         [string]$AzureCliPath = 'az', [scriptblock]$Read,
         [switch]$Run)
@@ -685,15 +686,17 @@ function Invoke-CanaryMergedPinProvisionCore {
     catch { throw 'merged-master-private-root-invalid' }
     $organization = if ($SourceSelector) {
         [string]$SourceSelector['organization']
-    } else { ''     }
-    [void](Assert-CanarySourceSelector $SourceSelector $SourceSelectorKey `
-            $organization)
+    } else { '' }
+    if ($DocumentPath -cne $script:DocumentPath) {
+        throw 'source-selector-invalid'
+    }
+    [void](Assert-CanaryDiscoverySelector $SourceSelector $organization `
+            $SourcePullRequestId)
     if (-not $Read) {
         $ExpectedAccountUniqueName = Get-CanaryWorkAccountUpn $AzureCliPath
     } elseif ($ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
         throw 'canary-work-account-unavailable'
     }
-    $selectorSignature = [string]$SourceSelector.signature
     $route = @{ organization = $organization
         projectName = [string]$SourceSelector.projectName
         repositoryName = [string]$SourceSelector.repositoryName }
@@ -701,7 +704,7 @@ function Invoke-CanaryMergedPinProvisionCore {
         -Organization $organization `
         -ExpectedAccountUniqueName $ExpectedAccountUniqueName `
         -RepositoryRoot $RepositoryRoot -AzureCliPath $AzureCliPath `
-        -SourceSelector $route -SourcePullRequestId 17307009 `
+        -SourceSelector $route -SourcePullRequestId $SourcePullRequestId `
         -Read $Read -Run
     if ($proof.state -cne 'discovered-merged-source-no-state' -or
         $proof.candidateBytesMatch -cne $true -or
@@ -727,35 +730,64 @@ function Invoke-CanaryMergedPinProvisionCore {
                 -RepositoryRoot $RepositoryRoot -Create `
                 -CreatedByCaller ([ref]$created))
         if (-not $created) { throw 'merged-master-private-root-invalid' }
+        $selectorKey = [Convert]::ToBase64String(
+            [Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
+        $selector = [ordered]@{
+            schemaVersion = 1; kind = 'private-canary-source-selector'
+            organization = $route.organization
+            projectName = $route.projectName
+            repositoryName = $route.repositoryName
+            signature = ''
+        }
+        $selector.signature = Get-CanarySignature $selector $selectorKey
+        [void](Assert-CanarySourceSelector $selector $selectorKey $organization)
         $key = [Convert]::ToBase64String(
             [Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
         $envelope = [ordered]@{
             schemaVersion = 1; kind = 'private-reviewed-merged-master-pin'
-            selectorSignature = $selectorSignature
+            selectorSignature = $selector.signature
             pin = $verifiedPin; signature = ''
         }
         $envelope.signature = Get-CanarySignature $envelope $key
+        $selectorKeyPath = Join-Path $staging 'source-selector.key'
+        $selectorPath = Join-Path $staging 'source-selector.json'
         $keyPath = Join-Path $staging 'merged-pin.key'
         $pinPath = Join-Path $staging 'merged-pin.json'
+        Write-CanaryPrivateFile $selectorKeyPath (
+            [Text.Encoding]::UTF8.GetBytes($selectorKey))
+        Write-CanaryPrivateFile $selectorPath ([Text.Encoding]::UTF8.GetBytes(
+                (ConvertTo-Json -InputObject $selector -Depth 4 -Compress)))
         Write-CanaryPrivateFile $keyPath ([Text.Encoding]::UTF8.GetBytes($key))
         Write-CanaryPrivateFile $pinPath ([Text.Encoding]::UTF8.GetBytes(
                 (ConvertTo-Json -InputObject $envelope -Depth 8 -Compress)))
-        [void](Assert-AgentTrustedFile -Path $keyPath `
-                -AllowedRoot $staging -Private)
-        [void](Assert-AgentTrustedFile -Path $pinPath `
-                -AllowedRoot $staging -Private)
+        foreach ($path in @($selectorKeyPath, $selectorPath, $keyPath, $pinPath)) {
+            [void](Assert-AgentTrustedFile -Path $path `
+                    -AllowedRoot $staging -Private)
+        }
         [IO.Directory]::Move($staging, $root)
         $published = $true
         $created = $false
         [void](Resolve-AgentTrustedRoot -Path $root -Kind durable-state `
                 -RepositoryRoot $RepositoryRoot)
-        [void](Assert-AgentTrustedFile -Path (Join-Path $root 'merged-pin.key') `
-                -AllowedRoot $root -Private)
-        [void](Assert-AgentTrustedFile -Path (Join-Path $root 'merged-pin.json') `
-                -AllowedRoot $root -Private)
+        foreach ($name in @('source-selector.key', 'source-selector.json',
+                'merged-pin.key', 'merged-pin.json')) {
+            [void](Assert-AgentTrustedFile -Path (Join-Path $root $name) `
+                    -AllowedRoot $root -Private)
+        }
+        $savedSelector = Read-CanaryPrivateSourceSelector `
+            -SelectorPath (Join-Path $root 'source-selector.json') `
+            -KeyPath (Join-Path $root 'source-selector.key') `
+            -RepositoryRoot $RepositoryRoot
+        [void](Assert-CanarySourceSelector $savedSelector.selector `
+                $savedSelector.key $organization)
+        [void](Read-CanaryPrivateMergedPin `
+                -PinPath (Join-Path $root 'merged-pin.json') `
+                -KeyPath (Join-Path $root 'merged-pin.key') `
+                -RepositoryRoot $RepositoryRoot `
+                -SourceSelector $savedSelector.selector)
         return @{ state = 'private-source-pin-prepared-unactivated'
             providerReads = $proof.providerReads; providerWrites = 0
-            privateFilesWritten = 2 }
+            privateFilesWritten = 4 }
     }
     catch {
         $cleanup = if ($published) { $root } elseif ($created) { $staging }
@@ -774,7 +806,8 @@ function Invoke-CanaryMergedPinProvisionCore {
 function Invoke-PrivateCanaryMergedPinProvision {
     [CmdletBinding()]
     param([string]$StateRoot, [string]$RepositoryRoot,
-        [Collections.IDictionary]$SourceSelector, [string]$SourceSelectorKey,
+        [Collections.IDictionary]$SourceSelector, [int]$SourcePullRequestId,
+        [string]$DocumentPath,
         [string]$AzureCliPath = 'az',
         [switch]$Run)
     if (-not $Run) {
@@ -783,7 +816,8 @@ function Invoke-PrivateCanaryMergedPinProvision {
     }
     return Invoke-CanaryMergedPinProvisionCore -StateRoot $StateRoot `
         -RepositoryRoot $RepositoryRoot -SourceSelector $SourceSelector `
-        -SourceSelectorKey $SourceSelectorKey -AzureCliPath $AzureCliPath -Run
+        -SourcePullRequestId $SourcePullRequestId `
+        -DocumentPath $DocumentPath -AzureCliPath $AzureCliPath -Run
 }
 
 function Assert-CanaryCoverageSource {

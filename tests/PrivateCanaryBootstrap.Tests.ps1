@@ -241,6 +241,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         organization = $script:sourceOrg; projectName = 'ExampleSource'
         repositoryName = 'ExamplePolicyRepo'
     }
+    $script:documentSelector = & $module { $script:DocumentPath }
     function Get-BootstrapHash([byte[]]$Bytes) {
         [Convert]::ToHexString(
             [Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
@@ -481,16 +482,19 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         $script:roots.Add("$($case.root).staging")
         return $case
     }
-    function Invoke-ProvisionCase($Case, $Selector = $script:sourceSelector,
-        $SelectorKey = $script:sourceKey) {
+    function Invoke-ProvisionCase($Case, $Selector = $script:discoverySelector,
+        $PullRequestId = $script:sourcePrId,
+        $DocumentPath = $script:documentSelector) {
         & (Get-Module DevPilot.ActivePrCanary) {
-            param($Root, $Repository, $Selector, $SelectorKey, $Provider)
+            param($Root, $Repository, $Selector, $PullRequestId,
+                $DocumentPath, $Provider)
             Invoke-CanaryMergedPinProvisionCore -StateRoot $Root `
                 -RepositoryRoot $Repository -SourceSelector $Selector `
-                -SourceSelectorKey $SelectorKey `
+                -SourcePullRequestId $PullRequestId `
+                -DocumentPath $DocumentPath `
                 -ExpectedAccountUniqueName 'service@example.invalid' `
                 -Read $Provider -Run
-        } $Case.root $repo $Selector $SelectorKey `
+        } $Case.root $repo $Selector $PullRequestId $DocumentPath `
             $Case.provider
     }
     function Invoke-BootstrapCase($Case) {
@@ -892,29 +896,34 @@ Describe 'Read-only private canary input bootstrap' {
             $json = & (Join-Path $repo 'tools\Provision-PrivateCanaryMergedPin.ps1')
             ($json | ConvertFrom-Json -AsHashtable).state | Should -Be 'disabled'
         }
-        It 'rejects a changed selector signature before any GET or state' {
+        It 'rejects malformed route, wrong PR and wrong document before any GET or state' {
             $c = Get-ProvisionCase
             $selector = [ordered]@{}
-            foreach ($field in $script:sourceSelector.Keys) {
-                $selector[$field] = $script:sourceSelector[$field]
+            foreach ($field in $script:discoverySelector.Keys) {
+                $selector[$field] = $script:discoverySelector[$field]
             }
-            $selector.projectName = 'WrongSource'
+            $selector['signature'] = 'untrusted'
             { Invoke-ProvisionCase $c $selector } |
+                Should -Throw '*source-selector-invalid*'
+            [void]$selector.Remove('signature')
+            $selector.projectName = '../WrongSource'
+            { Invoke-ProvisionCase $c $selector } |
+                Should -Throw '*source-selector-invalid*'
+            { Invoke-ProvisionCase $c $script:discoverySelector 1 } |
+                Should -Throw '*source-selector-invalid*'
+            { Invoke-ProvisionCase $c $script:discoverySelector `
+                    $script:sourcePrId '/wrong.md' } |
                 Should -Throw '*source-selector-invalid*'
             $c.state.reads.Count | Should -Be 0
             Test-Path -LiteralPath $c.root | Should -BeFalse
         }
-        It 'rejects a signed but wrong source route after bounded reads without state' {
+        It 'rejects a plausible wrong source route after bounded reads without state' {
             $c = Get-ProvisionCase
             $selector = [ordered]@{}
-            foreach ($field in $script:sourceSelector.Keys) {
-                $selector[$field] = $script:sourceSelector[$field]
+            foreach ($field in $script:discoverySelector.Keys) {
+                $selector[$field] = $script:discoverySelector[$field]
             }
             $selector.projectName = 'OtherSource'
-            $selector.signature = & (Get-Module DevPilot.ActivePrCanary) {
-                param($Value, $Key)
-                Get-CanarySignature $Value $Key
-            } $selector $script:sourceKey
             { Invoke-ProvisionCase $c $selector } | Should -Throw
             $c.state.reads.Count | Should -BeGreaterThan 0
             Test-Path -LiteralPath $c.root | Should -BeFalse
@@ -941,31 +950,56 @@ Describe 'Read-only private canary input bootstrap' {
             $c = Get-ProvisionCase
             $result = Invoke-ProvisionCase $c
             $result.state | Should -Be 'private-source-pin-prepared-unactivated'
-            $result.privateFilesWritten | Should -Be 2
+            $result.privateFilesWritten | Should -Be 4
             $result.providerWrites | Should -Be 0
             $result.providerReads | Should -Be $c.state.reads.Count
             @($c.state.reads | Where-Object { $_ -eq 'GraphStorageKey' }).Count |
                 Should -Be 2
+            $selectorKeyPath = Join-Path $c.root 'source-selector.key'
+            $selectorPath = Join-Path $c.root 'source-selector.json'
             $keyPath = Join-Path $c.root 'merged-pin.key'
             $pinPath = Join-Path $c.root 'merged-pin.json'
+            [void](Assert-AgentTrustedFile $selectorKeyPath -AllowedRoot $c.root -Private)
+            [void](Assert-AgentTrustedFile $selectorPath -AllowedRoot $c.root -Private)
             [void](Assert-AgentTrustedFile $keyPath -AllowedRoot $c.root -Private)
             [void](Assert-AgentTrustedFile $pinPath -AllowedRoot $c.root -Private)
+            $source = Read-CanaryPrivateSourceSelector `
+                -SelectorPath $selectorPath -KeyPath $selectorKeyPath `
+                -RepositoryRoot $repo
+            $source.selector.organization | Should -Be $script:sourceOrg
+            $source.selector.projectName | Should -Be $script:discoverySelector.projectName
+            $source.selector.repositoryName |
+                Should -Be $script:discoverySelector.repositoryName
+            $source.key | Should -Not -Be $script:sourceKey
             $envelope = Get-Content $pinPath -Raw |
                 ConvertFrom-Json -AsHashtable
             $envelope.pin.Count | Should -Be 10
             $envelope.selectorSignature |
-                Should -Be $script:sourceSelector.signature
+                Should -Be $source.selector.signature
             $loaded = Read-CanaryPrivateMergedPin -PinPath $pinPath `
                 -KeyPath $keyPath -RepositoryRoot $repo `
-                -SourceSelector $script:sourceSelector
+                -SourceSelector $source.selector
             $loaded.envelope.pin.mergeCommit | Should -Be ('d' * 40)
+            $loaded.key | Should -Not -Be $source.key
             $module = Get-Module DevPilot.ActivePrCanary
             $expected = & $module { $script:MergedMasterPin }
             (ConvertTo-AgentCanonicalJson -InputObject $loaded.envelope.pin) |
                 Should -Be (ConvertTo-AgentCanonicalJson -InputObject $expected)
             (ConvertTo-Json -InputObject $result) |
-                Should -Not -Match 'ExampleSource|service@example.invalid|private-merged-pin|mergeCommit|aad.synthetic'
+                Should -Not -Match 'ExampleSource|service@example.invalid|private-merged-pin|mergeCommit|aad.synthetic|source-selector'
             Test-Path -LiteralPath "$($c.root).staging" | Should -BeFalse
+        }
+        It 'rejects CLI route mismatch before account or provider access' {
+            $c = Get-ProvisionCase
+            { & (Join-Path $repo 'tools\Provision-PrivateCanaryMergedPin.ps1') `
+                    -StateRoot $c.root -Organization $script:sourceOrg `
+                    -SourceProjectName 'ExampleSource' `
+                    -SourceRepositoryName 'ExamplePolicyRepo' `
+                    -SourcePullRequestId 1 `
+                    -SourceDocumentPath $script:documentSelector -Run } |
+                Should -Throw '*source-selector-invalid*'
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
         }
         It 'leaves no root on active, changed, unproved, identity or throttle failure' {
             foreach ($failure in @('active-pr', 'candidate-content',
@@ -1013,6 +1047,17 @@ Describe 'Read-only private canary input bootstrap' {
             Mock Write-CanaryPrivateFile -ModuleName DevPilot.ActivePrCanary {
                 throw 'synthetic-write-failed'
             } -ParameterFilter { $Path -like '*merged-pin.json' }
+            { Invoke-ProvisionCase $c } |
+                Should -Throw '*merged-master-private-provision-failed*'
+            $c.state.reads.Count | Should -BeGreaterThan 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+            Test-Path -LiteralPath "$($c.root).staging" | Should -BeFalse
+        }
+        It 'cleans a newly staged selector write failure without publishing any files' {
+            $c = Get-ProvisionCase
+            Mock Write-CanaryPrivateFile -ModuleName DevPilot.ActivePrCanary {
+                throw 'synthetic-write-failed'
+            } -ParameterFilter { $Path -like '*source-selector.json' }
             { Invoke-ProvisionCase $c } |
                 Should -Throw '*merged-master-private-provision-failed*'
             $c.state.reads.Count | Should -BeGreaterThan 0

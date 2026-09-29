@@ -4,14 +4,17 @@
 .SYNOPSIS
     Prepares an unactivated private merged-source pin after fresh proof.
 .DESCRIPTION
-    Default-off. Requires the user-authorized signed source selector and fresh
-    bounded same-bearer proof before creating an ACL-private directory.
+    Default-off. Verifies the user-accepted source route with a fresh bounded
+    same-bearer proof before creating any ACL-private selector or pin files.
 #>
 [CmdletBinding()]
 param(
     [string]$StateRoot,
-    [string]$SourceSelectorPath,
-    [string]$SourceSelectorKeyPath,
+    [string]$Organization,
+    [string]$SourceProjectName,
+    [string]$SourceRepositoryName,
+    [int]$SourcePullRequestId,
+    [string]$SourceDocumentPath,
     [string]$AzureCliPath = 'az',
     [switch]$Run
 )
@@ -24,10 +27,11 @@ if (-not $Run) {
         providerWrites = 0; privateFilesWritten = 0 } | ConvertTo-Json
     return
 }
-$source = Read-CanaryPrivateSourceSelector `
-    -SelectorPath $SourceSelectorPath -KeyPath $SourceSelectorKeyPath `
-    -RepositoryRoot $repo
+$source = @{ organization = $Organization
+    projectName = $SourceProjectName
+    repositoryName = $SourceRepositoryName }
 Invoke-PrivateCanaryMergedPinProvision -StateRoot $StateRoot `
-    -RepositoryRoot $repo -SourceSelector $source.selector `
-    -SourceSelectorKey $source.key `
+    -RepositoryRoot $repo -SourceSelector $source `
+    -SourcePullRequestId $SourcePullRequestId `
+    -DocumentPath $SourceDocumentPath `
     -AzureCliPath $AzureCliPath -Run | ConvertTo-Json
