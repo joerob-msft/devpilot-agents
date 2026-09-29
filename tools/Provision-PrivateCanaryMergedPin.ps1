@@ -2,17 +2,16 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-    Prepares an unactivated, reviewer-approved private merged-source pin.
+    Prepares an unactivated private merged-source pin after fresh proof.
 .DESCRIPTION
-    Default-off. Requires independently signed approval and fresh bounded
-    same-bearer source proof before creating an external ACL-private directory.
+    Default-off. Requires the user-authorized signed source selector and fresh
+    bounded same-bearer proof before creating an ACL-private directory.
 #>
 [CmdletBinding()]
 param(
     [string]$StateRoot,
     [string]$SourceSelectorPath,
     [string]$SourceSelectorKeyPath,
-    [string]$ReviewerApprovalPath,
     [string]$AzureCliPath = 'az',
     [switch]$Run
 )
@@ -28,9 +27,7 @@ if (-not $Run) {
 $source = Read-CanaryPrivateSourceSelector `
     -SelectorPath $SourceSelectorPath -KeyPath $SourceSelectorKeyPath `
     -RepositoryRoot $repo
-$approval = Read-CanaryPrivateReviewerApproval `
-    -ApprovalPath $ReviewerApprovalPath -RepositoryRoot $repo
 Invoke-PrivateCanaryMergedPinProvision -StateRoot $StateRoot `
     -RepositoryRoot $repo -SourceSelector $source.selector `
-    -SourceSelectorKey $source.key -ReviewerApproval $approval `
+    -SourceSelectorKey $source.key `
     -AzureCliPath $AzureCliPath -Run | ConvertTo-Json

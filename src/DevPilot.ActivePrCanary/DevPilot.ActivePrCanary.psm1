@@ -15,10 +15,8 @@ $script:DocumentPath = '/documentation/EngineeringProcesses/Conventions/Automate
 $script:CoverageCommit = '7e6620ec40c9bc37c5a5e13d506053b0139c9206'
 $script:CoverageDocumentHash = '68a5cb1aa2604b971c8c446c77ef50f74409407f65eaa2e9389acd636cddacee'
 $script:CoverageDocumentLength = 16286
-# Real merged provenance belongs only in a separately reviewed ACL-private envelope.
+# The merged source is acquired only through fresh, user-authorized read-only proof.
 $script:MergedMasterPin = $null
-$script:ApprovedMergedPinSignature = $null
-$script:ReviewedMergedPinApprovalPublicKey = $null
 $script:StaticPolicies = @(
     @{ name = 'class'; index = 1; file = 'test-class-coverage' },
     @{ name = 'redundant'; index = 2; file = 'redundant-method-coverage' },
@@ -221,8 +219,20 @@ function Get-CanaryCoverageDeclarations {
 
 function Assert-CanaryMergedPin {
     param([Collections.IDictionary]$Pin)
+    $fields = @('sourceCommit', 'mergeCommit', 'documentHash',
+        'documentLength', 'blobId', 'sectionHash', 'classLineHash',
+        'redundantLineHash', 'classDeclarationDigest',
+        'redundantDeclarationDigest')
     if ($Pin -isnot [Collections.IDictionary] -or
-        $Pin.Count -ne 10 -or
+        $Pin.Count -ne $fields.Count) {
+        throw 'merged-master-pin-unavailable'
+    }
+    foreach ($field in $fields) {
+        if (-not $Pin.Contains($field)) {
+            throw 'merged-master-pin-unavailable'
+        }
+    }
+    if (
         [string]$Pin.sourceCommit -cne $script:CoverageCommit -or
         [string]$Pin.mergeCommit -cnotmatch '^[a-f0-9]{40}$' -or
         [string]$Pin.documentHash -cnotmatch '^[a-f0-9]{64}$' -or
@@ -240,96 +250,20 @@ function Assert-CanaryMergedPin {
     }
 }
 
-function Get-CanaryReviewerApprovalBytes {
-    param([Collections.IDictionary]$Approval)
-    $unsigned = [ordered]@{}
-    foreach ($field in $Approval.Keys) {
-        if ([string]$field -cne 'signature') {
-            $unsigned[[string]$field] = $Approval[$field]
-        }
-    }
-    return ,([Text.Encoding]::UTF8.GetBytes(
-            (ConvertTo-AgentCanonicalJson -InputObject $unsigned)))
-}
-
-function Assert-CanaryReviewerApproval {
-    param([Collections.IDictionary]$Approval,
-        [Collections.IDictionary]$SourceSelector)
-    $publicKey = [string]$script:ReviewedMergedPinApprovalPublicKey
-    if ($Approval -isnot [Collections.IDictionary] -or
-        $Approval.Count -ne 7 -or
-        $publicKey -cnotmatch '^[A-Za-z0-9+/]{400,2048}={0,2}$') {
-        throw 'merged-master-review-approval-unavailable'
-    }
-    foreach ($field in @('schemaVersion', 'kind', 'sourcePullRequestId',
-            'selector', 'selectorSignature', 'pin', 'signature')) {
-        if (-not $Approval.Contains($field)) {
-            throw 'merged-master-review-approval-unavailable'
-        }
-    }
-    if (
-        $Approval.schemaVersion -ne 1 -or
-        $Approval.kind -cne 'reviewed-merged-master-source-approval' -or
-        [string]$Approval.sourcePullRequestId -cne '17307009' -or
-        $Approval.selector -isnot [Collections.IDictionary] -or
-        $Approval.selector.Count -ne 3 -or
-        $Approval.pin -isnot [Collections.IDictionary] -or
-        $SourceSelector -isnot [Collections.IDictionary] -or
-        [string]$Approval.selectorSignature -cne
-            [string]$SourceSelector.signature -or
-        [string]$Approval.signature -cnotmatch
-            '^v1:rsa-pss-sha256:[A-Za-z0-9+/]{400,1024}={0,2}$') {
-        throw 'merged-master-review-approval-unavailable'
-    }
-    foreach ($field in @('organization', 'projectName', 'repositoryName')) {
-        if (-not $Approval.selector.Contains($field) -or
-            [string]$Approval.selector[$field] -cne
-                [string]$SourceSelector[$field]) {
-            throw 'merged-master-review-approval-unavailable'
-        }
-        foreach ($field in @('sourceCommit', 'mergeCommit', 'documentHash',
-                'documentLength', 'blobId', 'sectionHash', 'classLineHash',
-                'redundantLineHash', 'classDeclarationDigest',
-                'redundantDeclarationDigest')) {
-            if (-not $Approval.pin.Contains($field)) {
-                throw 'merged-master-review-approval-unavailable'
-            }
-        }
-    }
-    try {
-        $keyBytes = [Convert]::FromBase64String($publicKey)
-        $signature = [Convert]::FromBase64String(
-            $Approval.signature.Substring('v1:rsa-pss-sha256:'.Length))
-        $rsa = [Security.Cryptography.RSA]::Create()
-        try {
-            $read = 0
-            $rsa.ImportSubjectPublicKeyInfo($keyBytes, [ref]$read)
-            if ($read -ne $keyBytes.Length -or $rsa.KeySize -lt 3072 -or
-                -not $rsa.VerifyData(
-                    (Get-CanaryReviewerApprovalBytes $Approval), $signature,
-                    [Security.Cryptography.HashAlgorithmName]::SHA256,
-                    [Security.Cryptography.RSASignaturePadding]::Pss)) {
-                throw 'merged-master-review-approval-unavailable'
-            }
-        }
-        finally { $rsa.Dispose() }
-    }
-    catch { throw 'merged-master-review-approval-unavailable' }
-    Assert-CanaryMergedPin $Approval.pin
-    $pin = [ordered]@{}
-    foreach ($field in $Approval.pin.Keys) {
-        $pin[[string]$field] = $Approval.pin[$field]
-    }
-    return $pin
-}
-
 function Assert-CanaryReviewedMergedPin {
     param([Collections.IDictionary]$Envelope, [string]$Key,
         [Collections.IDictionary]$SourceSelector)
-    $approval = [string]$script:ApprovedMergedPinSignature
-    if ($approval -cnotmatch '^v1:hmac-sha256:[a-f0-9]{64}$' -or
-        $Envelope -isnot [Collections.IDictionary] -or
-        $Envelope.Count -ne 5 -or
+    if ($Envelope -isnot [Collections.IDictionary] -or
+        $Envelope.Count -ne 5) {
+        throw 'merged-master-pin-unavailable'
+    }
+    foreach ($field in @('schemaVersion', 'kind', 'selectorSignature',
+            'pin', 'signature')) {
+        if (-not $Envelope.Contains($field)) {
+            throw 'merged-master-pin-unavailable'
+        }
+    }
+    if (
         $Envelope.schemaVersion -ne 1 -or
         $Envelope.kind -cne 'private-reviewed-merged-master-pin' -or
         $Envelope.pin -isnot [Collections.IDictionary] -or
@@ -345,14 +279,16 @@ function Assert-CanaryReviewedMergedPin {
     }
     $signature = [Convert]::FromHexString($Envelope.signature.Substring(15))
     if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
-            $signature, [Convert]::FromHexString($approval.Substring(15))) -or
-        -not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
             $signature, [Convert]::FromHexString(
                 (Get-CanarySignature $Envelope $Key).Substring(15)))) {
         throw 'merged-master-pin-unavailable'
     }
     Assert-CanaryMergedPin $Envelope.pin
-    return $Envelope.pin
+    $pin = [ordered]@{}
+    foreach ($field in $Envelope.pin.Keys) {
+        $pin[[string]$field] = $Envelope.pin[$field]
+    }
+    return $pin
 }
 
 function Read-CanaryPrivateMergedPin {
@@ -361,10 +297,6 @@ function Read-CanaryPrivateMergedPin {
         [Parameter(Mandatory)][string]$KeyPath,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][Collections.IDictionary]$SourceSelector)
-    if ([string]$script:ApprovedMergedPinSignature -cnotmatch
-        '^v1:hmac-sha256:[a-f0-9]{64}$') {
-        throw 'merged-master-pin-unavailable'
-    }
     try {
         if (-not [IO.Path]::IsPathFullyQualified($PinPath) -or
             -not [IO.Path]::IsPathFullyQualified($KeyPath) -or
@@ -385,25 +317,6 @@ function Read-CanaryPrivateMergedPin {
         return @{ envelope = $envelope; key = $key }
     }
     catch { throw 'merged-master-pin-unavailable' }
-}
-
-function Read-CanaryPrivateReviewerApproval {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$ApprovalPath,
-        [Parameter(Mandatory)][string]$RepositoryRoot)
-    try {
-        if (-not [IO.Path]::IsPathFullyQualified($ApprovalPath) -or
-            (Test-AgentPathWithin $ApprovalPath $RepositoryRoot)) {
-            throw 'merged-master-review-approval-unavailable'
-        }
-        $file = Assert-AgentTrustedFile -Path $ApprovalPath -Private
-        if ((Get-Item -LiteralPath $file).Length -gt 4096) {
-            throw 'merged-master-review-approval-unavailable'
-        }
-        return (Get-Content -LiteralPath $file -Raw |
-            ConvertFrom-Json -AsHashtable -Depth 8)
-    }
-    catch { throw 'merged-master-review-approval-unavailable' }
 }
 
 function Assert-CanaryMergedMasterHead {
@@ -729,7 +642,7 @@ function Invoke-CanaryMergedMasterDiscovery {
         Assert-CanaryAccountBinding $finalIdentity $identity
         return [ordered]@{
             schemaVersion = 1
-            state = 'discovered-awaiting-provenance-pin-review'
+            state = 'discovered-merged-source-no-state'
             candidateBytesMatch = $true
             observedMasterCommit = $master
             proposedPin = $pin
@@ -744,7 +657,6 @@ function Invoke-CanaryMergedPinProvisionCore {
     [CmdletBinding()]
     param([string]$StateRoot, [string]$RepositoryRoot,
         [Collections.IDictionary]$SourceSelector, [string]$SourceSelectorKey,
-        [Collections.IDictionary]$ReviewerApproval,
         [string]$ExpectedAccountUniqueName,
         [string]$AzureCliPath = 'az', [scriptblock]$Read,
         [switch]$Run)
@@ -773,10 +685,9 @@ function Invoke-CanaryMergedPinProvisionCore {
     catch { throw 'merged-master-private-root-invalid' }
     $organization = if ($SourceSelector) {
         [string]$SourceSelector['organization']
-    } else { '' }
+    } else { ''     }
     [void](Assert-CanarySourceSelector $SourceSelector $SourceSelectorKey `
             $organization)
-    $approvedPin = Assert-CanaryReviewerApproval $ReviewerApproval $SourceSelector
     if (-not $Read) {
         $ExpectedAccountUniqueName = Get-CanaryWorkAccountUpn $AzureCliPath
     } elseif ($ExpectedAccountUniqueName -cnotmatch '^[^@\s]+@[^@\s]+$') {
@@ -792,12 +703,15 @@ function Invoke-CanaryMergedPinProvisionCore {
         -RepositoryRoot $RepositoryRoot -AzureCliPath $AzureCliPath `
         -SourceSelector $route -SourcePullRequestId 17307009 `
         -Read $Read -Run
-    if ($proof.state -cne 'discovered-awaiting-provenance-pin-review' -or
+    if ($proof.state -cne 'discovered-merged-source-no-state' -or
         $proof.candidateBytesMatch -cne $true -or
-        $proof.proposedPin -isnot [Collections.IDictionary] -or
-        (ConvertTo-AgentCanonicalJson -InputObject $proof.proposedPin) -cne
-            (ConvertTo-AgentCanonicalJson -InputObject $approvedPin)) {
-        throw 'merged-master-review-approval-drift'
+        $proof.proposedPin -isnot [Collections.IDictionary]) {
+        throw 'merged-master-proof-unavailable'
+    }
+    Assert-CanaryMergedPin $proof.proposedPin
+    $verifiedPin = [ordered]@{}
+    foreach ($field in $proof.proposedPin.Keys) {
+        $verifiedPin[[string]$field] = $proof.proposedPin[$field]
     }
     $staging = "$root.staging"
     $created = $false
@@ -818,7 +732,7 @@ function Invoke-CanaryMergedPinProvisionCore {
         $envelope = [ordered]@{
             schemaVersion = 1; kind = 'private-reviewed-merged-master-pin'
             selectorSignature = $selectorSignature
-            pin = $approvedPin; signature = ''
+            pin = $verifiedPin; signature = ''
         }
         $envelope.signature = Get-CanarySignature $envelope $key
         $keyPath = Join-Path $staging 'merged-pin.key'
@@ -861,7 +775,6 @@ function Invoke-PrivateCanaryMergedPinProvision {
     [CmdletBinding()]
     param([string]$StateRoot, [string]$RepositoryRoot,
         [Collections.IDictionary]$SourceSelector, [string]$SourceSelectorKey,
-        [Collections.IDictionary]$ReviewerApproval,
         [string]$AzureCliPath = 'az',
         [switch]$Run)
     if (-not $Run) {
@@ -870,8 +783,7 @@ function Invoke-PrivateCanaryMergedPinProvision {
     }
     return Invoke-CanaryMergedPinProvisionCore -StateRoot $StateRoot `
         -RepositoryRoot $RepositoryRoot -SourceSelector $SourceSelector `
-        -SourceSelectorKey $SourceSelectorKey `
-        -ReviewerApproval $ReviewerApproval -AzureCliPath $AzureCliPath -Run
+        -SourceSelectorKey $SourceSelectorKey -AzureCliPath $AzureCliPath -Run
 }
 
 function Assert-CanaryCoverageSource {
@@ -2805,7 +2717,6 @@ Export-ModuleMember -Function Invoke-ActivePrCanaryQualification,
     Invoke-CanaryMergedMasterDiscovery, Invoke-PrivateCanaryMergedPinProvision,
     Get-CanaryWorkAccountUpn,
     Read-CanaryPrivateSourceSelector, Read-CanaryPrivateMergedPin,
-    Read-CanaryPrivateReviewerApproval,
     Invoke-PrivateCanaryBootstrap,
     New-VerifiedCanaryRuleRegistry, Invoke-PrivateCanaryRuleRegistry,
     Invoke-PrivateCanarySignedIntake, Invoke-PrivateCanaryIdentityDiagnostic

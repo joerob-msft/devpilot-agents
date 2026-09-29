@@ -215,8 +215,6 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             coverage = $script:CoverageDocumentHash
             coverageLength = $script:CoverageDocumentLength
             mergedPin = $script:MergedMasterPin
-            approvedPinSignature = $script:ApprovedMergedPinSignature
-            reviewerPublicKey = $script:ReviewedMergedPinApprovalPublicKey
             ownerReviewed = $script:OwnerSourceReviewedInApprovedRepository }
     }
     $script:ownerDocument = "## Claim ownership`nSynthetic owner rule.`n" +
@@ -308,40 +306,8 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             param($Envelope, $Key)
             Get-CanarySignature $Envelope $Key
         } $script:mergedEnvelope $script:mergedKey
-        & $module {
-            param($Signature)
-            $script:ApprovedMergedPinSignature = $Signature
-        } $script:mergedEnvelope.signature
     }
     Set-SyntheticMergedApproval
-    $script:reviewerRsa = [Security.Cryptography.RSA]::Create(3072)
-    & $module {
-        param($Key)
-        $script:ReviewedMergedPinApprovalPublicKey = $Key
-    } ([Convert]::ToBase64String($script:reviewerRsa.ExportSubjectPublicKeyInfo()))
-    $script:reviewerApproval = [ordered]@{
-        schemaVersion = 1; kind = 'reviewed-merged-master-source-approval'
-        sourcePullRequestId = 17307009
-        selector = [ordered]@{
-            organization = $script:sourceOrg
-            projectName = $script:sourceSelector.projectName
-            repositoryName = $script:sourceSelector.repositoryName
-        }
-        selectorSignature = $script:sourceSelector.signature
-        pin = $script:mergedEnvelope.pin
-        signature = ''
-    }
-    function Set-SyntheticReviewerApproval($Approval) {
-        $bytes = & (Get-Module DevPilot.ActivePrCanary) {
-            param($Value)
-            Get-CanaryReviewerApprovalBytes $Value
-        } $Approval
-        $Approval.signature = 'v1:rsa-pss-sha256:' +
-            [Convert]::ToBase64String($script:reviewerRsa.SignData(
-                    $bytes, [Security.Cryptography.HashAlgorithmName]::SHA256,
-                    [Security.Cryptography.RSASignaturePadding]::Pss))
-    }
-    Set-SyntheticReviewerApproval $script:reviewerApproval
     function Get-BootstrapCase {
         $root = Join-Path $env:USERPROFILE (
             '.copilot\private-bootstrap-pester-' + [guid]::NewGuid().ToString('N'))
@@ -515,21 +481,17 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         $script:roots.Add("$($case.root).staging")
         return $case
     }
-    function Invoke-ProvisionCase($Case, $Approval = $script:reviewerApproval) {
-        if ([object]::ReferenceEquals($Approval, $script:reviewerApproval)) {
-            $Approval.pin = $script:mergedEnvelope.pin
-            Set-SyntheticReviewerApproval $Approval
-        }
+    function Invoke-ProvisionCase($Case, $Selector = $script:sourceSelector,
+        $SelectorKey = $script:sourceKey) {
         & (Get-Module DevPilot.ActivePrCanary) {
-            param($Root, $Repository, $Selector, $SelectorKey, $Reviewed,
-                $Provider)
+            param($Root, $Repository, $Selector, $SelectorKey, $Provider)
             Invoke-CanaryMergedPinProvisionCore -StateRoot $Root `
                 -RepositoryRoot $Repository -SourceSelector $Selector `
-                -SourceSelectorKey $SelectorKey -ReviewerApproval $Reviewed `
+                -SourceSelectorKey $SelectorKey `
                 -ExpectedAccountUniqueName 'service@example.invalid' `
                 -Read $Provider -Run
-        } $Case.root $repo $script:sourceSelector $script:sourceKey `
-            $Approval $Case.provider
+        } $Case.root $repo $Selector $SelectorKey `
+            $Case.provider
     }
     function Invoke-BootstrapCase($Case) {
         Invoke-PrivateCanaryBootstrap -Organization $script:sourceOrg `
@@ -905,11 +867,8 @@ AfterAll {
         $script:CoverageDocumentHash = $Previous.coverage
         $script:CoverageDocumentLength = $Previous.coverageLength
         $script:MergedMasterPin = $Previous.mergedPin
-        $script:ApprovedMergedPinSignature = $Previous.approvedPinSignature
-        $script:ReviewedMergedPinApprovalPublicKey = $Previous.reviewerPublicKey
         $script:OwnerSourceReviewedInApprovedRepository = $Previous.ownerReviewed
     } $script:old
-    $script:reviewerRsa.Dispose()
     foreach ($root in $script:roots) {
         if (Test-Path -LiteralPath $root) {
             Remove-Item -LiteralPath $root -Recurse -Force
@@ -917,8 +876,8 @@ AfterAll {
     }
 }
 Describe 'Read-only private canary input bootstrap' {
-    Describe 'Independent source-only private pin provisioner' {
-        It 'defaults off without approval, identity, ADO, or files' {
+    Describe 'User-authorized source-only private pin provisioner' {
+        It 'defaults off without identity, ADO, or files' {
             $c = Get-ProvisionCase
             $result = Invoke-PrivateCanaryMergedPinProvision `
                 -StateRoot $c.root -RepositoryRoot $repo
@@ -933,102 +892,32 @@ Describe 'Read-only private canary input bootstrap' {
             $json = & (Join-Path $repo 'tools\Provision-PrivateCanaryMergedPin.ps1')
             ($json | ConvertFrom-Json -AsHashtable).state | Should -Be 'disabled'
         }
-        It 'requires the pinned independent reviewer key before any GET or state' {
+        It 'rejects a changed selector signature before any GET or state' {
             $c = Get-ProvisionCase
-            $module = Get-Module DevPilot.ActivePrCanary
-            $key = & $module { $script:ReviewedMergedPinApprovalPublicKey }
-            try {
-                & $module { $script:ReviewedMergedPinApprovalPublicKey = $null }
-                { Invoke-ProvisionCase $c } |
-                    Should -Throw '*merged-master-review-approval-unavailable*'
-                $c.state.reads.Count | Should -Be 0
-                Test-Path -LiteralPath $c.root | Should -BeFalse
+            $selector = [ordered]@{}
+            foreach ($field in $script:sourceSelector.Keys) {
+                $selector[$field] = $script:sourceSelector[$field]
             }
-            finally {
-                & $module {
-                    param($Key)
-                    $script:ReviewedMergedPinApprovalPublicKey = $Key
-                } $key
-            }
+            $selector.projectName = 'WrongSource'
+            { Invoke-ProvisionCase $c $selector } |
+                Should -Throw '*source-selector-invalid*'
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
         }
-        It 'rejects tampered approval, selector, and versions before source GET' {
-            foreach ($failure in @('signature', 'selector', 'pin', 'version',
-                    'kind', 'pull-request', 'public-key', 'missing-field',
-                    'source-commit')) {
-                $c = Get-ProvisionCase
-                $approval = [ordered]@{}
-                foreach ($field in $script:reviewerApproval.Keys) {
-                    $approval[$field] = $script:reviewerApproval[$field]
-                }
-                $approval.pin = @{} + $script:mergedEnvelope.pin
-                $approval.selector = @{} + $script:reviewerApproval.selector
-                Set-SyntheticReviewerApproval $approval
-                $module = Get-Module DevPilot.ActivePrCanary
-                $key = & $module { $script:ReviewedMergedPinApprovalPublicKey }
-                try {
-                    switch ($failure) {
-                        signature { $approval.signature =
-                            'v1:rsa-pss-sha256:' + ('A' * 512) }
-                        selector { $approval.selector.projectName = 'WrongSource' }
-                        pin { $approval.pin.mergeCommit = 'a' * 40 }
-                        version { $approval.schemaVersion = 2
-                            Set-SyntheticReviewerApproval $approval }
-                        kind { $approval.kind = 'active-candidate-approval'
-                            Set-SyntheticReviewerApproval $approval }
-                        'pull-request' {
-                            $approval.sourcePullRequestId = 7
-                            Set-SyntheticReviewerApproval $approval
-                        }
-                        'public-key' {
-                            & $module {
-                                $script:ReviewedMergedPinApprovalPublicKey =
-                                    [Convert]::ToBase64String(
-                                        [Security.Cryptography.RSA]::Create(
-                                            3072).ExportSubjectPublicKeyInfo())
-                            }
-                        }
-                        'missing-field' {
-                            $approval.Remove('pin')
-                            $approval.extra = 'not-an-approved-field'
-                        }
-                        'source-commit' {
-                            $approval.pin.sourceCommit = 'a' * 40
-                            Set-SyntheticReviewerApproval $approval
-                        }
-                    }
-                    { Invoke-ProvisionCase $c $approval } |
-                        Should -Throw -Because $failure
-                    $c.state.reads.Count | Should -Be 0
-                    Test-Path -LiteralPath $c.root | Should -BeFalse
-                }
-                finally {
-                    & $module {
-                        param($PublicKey)
-                        $script:ReviewedMergedPinApprovalPublicKey = $PublicKey
-                    } $key
-                }
+        It 'rejects a signed but wrong source route after bounded reads without state' {
+            $c = Get-ProvisionCase
+            $selector = [ordered]@{}
+            foreach ($field in $script:sourceSelector.Keys) {
+                $selector[$field] = $script:sourceSelector[$field]
             }
-        }
-        It 'compares every approved pin field after fresh same-bearer proof' {
-            foreach ($field in @('mergeCommit', 'blobId', 'sectionHash',
-                    'classLineHash', 'redundantLineHash',
-                    'classDeclarationDigest', 'redundantDeclarationDigest')) {
-                $c = Get-ProvisionCase
-                $approval = [ordered]@{}
-                foreach ($name in $script:reviewerApproval.Keys) {
-                    $approval[$name] = $script:reviewerApproval[$name]
-                }
-                $approval.pin = @{} + $script:mergedEnvelope.pin
-                $approval.pin[$field] = if ($field -eq 'mergeCommit' -or
-                    $field -eq 'blobId') { 'a' * 40 } else {
-                    'v1:sha256:' + ('a' * 64) }
-                Set-SyntheticReviewerApproval $approval
-                { Invoke-ProvisionCase $c $approval } |
-                    Should -Throw -Because $field
-                $c.state.reads.Count | Should -BeGreaterThan 0
-                Test-Path -LiteralPath $c.root | Should -BeFalse
-                Test-Path -LiteralPath "$($c.root).staging" | Should -BeFalse
-            }
+            $selector.projectName = 'OtherSource'
+            $selector.signature = & (Get-Module DevPilot.ActivePrCanary) {
+                param($Value, $Key)
+                Get-CanarySignature $Value $Key
+            } $selector $script:sourceKey
+            { Invoke-ProvisionCase $c $selector } | Should -Throw
+            $c.state.reads.Count | Should -BeGreaterThan 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
         }
         It 'keeps the new root absent throughout all source and final identity reads' {
             $c = Get-ProvisionCase
@@ -1066,34 +955,21 @@ Describe 'Read-only private canary input bootstrap' {
             $envelope.pin.Count | Should -Be 10
             $envelope.selectorSignature |
                 Should -Be $script:sourceSelector.signature
+            $loaded = Read-CanaryPrivateMergedPin -PinPath $pinPath `
+                -KeyPath $keyPath -RepositoryRoot $repo `
+                -SourceSelector $script:sourceSelector
+            $loaded.envelope.pin.mergeCommit | Should -Be ('d' * 40)
             $module = Get-Module DevPilot.ActivePrCanary
-            $old = & $module { $script:ApprovedMergedPinSignature }
-            try {
-                { Read-CanaryPrivateMergedPin -PinPath $pinPath `
-                        -KeyPath $keyPath -RepositoryRoot $repo `
-                        -SourceSelector $script:sourceSelector } |
-                    Should -Throw '*merged-master-pin-unavailable*'
-                & $module {
-                    param($Signature)
-                    $script:ApprovedMergedPinSignature = $Signature
-                } $envelope.signature
-                $loaded = Read-CanaryPrivateMergedPin -PinPath $pinPath `
-                    -KeyPath $keyPath -RepositoryRoot $repo `
-                    -SourceSelector $script:sourceSelector
-                $loaded.envelope.pin.mergeCommit | Should -Be ('d' * 40)
-            }
-            finally {
-                & $module {
-                    param($Signature)
-                    $script:ApprovedMergedPinSignature = $Signature
-                } $old
-            }
+            $expected = & $module { $script:MergedMasterPin }
+            (ConvertTo-AgentCanonicalJson -InputObject $loaded.envelope.pin) |
+                Should -Be (ConvertTo-AgentCanonicalJson -InputObject $expected)
             (ConvertTo-Json -InputObject $result) |
                 Should -Not -Match 'ExampleSource|service@example.invalid|private-merged-pin|mergeCommit|aad.synthetic'
             Test-Path -LiteralPath "$($c.root).staging" | Should -BeFalse
         }
         It 'leaves no root on active, changed, unproved, identity or throttle failure' {
-            foreach ($failure in @('active-pr', 'merge-content',
+            foreach ($failure in @('active-pr', 'candidate-content',
+                    'merge-content',
                     'master-content', 'no-ancestry', 'graph-upn',
                     'master-ref-drift', 'throttle')) {
                 $c = Get-ProvisionCase
@@ -1143,19 +1019,6 @@ Describe 'Read-only private canary input bootstrap' {
             Test-Path -LiteralPath $c.root | Should -BeFalse
             Test-Path -LiteralPath "$($c.root).staging" | Should -BeFalse
         }
-        It 'rejects a repo-contained or missing reviewer approval file without a GET' {
-            $c = Get-ProvisionCase
-            { Read-CanaryPrivateReviewerApproval -ApprovalPath (
-                    Join-Path $repo 'samples\private-canary-source-selector.example.json') `
-                    -RepositoryRoot $repo } |
-                Should -Throw '*merged-master-review-approval-unavailable*'
-            { Read-CanaryPrivateReviewerApproval -ApprovalPath (
-                    Join-Path (Split-Path $c.root -Parent) 'absent-approval.json') `
-                    -RepositoryRoot $repo } |
-                Should -Throw '*merged-master-review-approval-unavailable*'
-            $c.state.reads.Count | Should -Be 0
-            Test-Path -LiteralPath $c.root | Should -BeFalse
-        }
     }
     It 'discovers only sanitized unapproved metadata with no pin, state, or writes' {
         $c = Get-BootstrapCase
@@ -1169,7 +1032,7 @@ Describe 'Read-only private canary input bootstrap' {
                 -SourceSelector $script:discoverySelector `
                 -SourcePullRequestId $script:sourcePrId `
                 -RepositoryRoot $repo -Read $c.provider -Run
-            $result.state | Should -Be 'discovered-awaiting-provenance-pin-review'
+            $result.state | Should -Be 'discovered-merged-source-no-state'
             $result.candidateBytesMatch | Should -BeTrue
             $result.proposedPin.mergeCommit | Should -Be ('d' * 40)
             $result.proposedPin.sourceCommit |
@@ -1418,60 +1281,47 @@ Describe 'Read-only private canary input bootstrap' {
                 Should -Be 0
         }
     }
-    It 'has no live source pin and stops the stateless gate before any GET or state' {
+    It 'has no public source pin and rejects missing private input before GET or state' {
         $c = Get-BootstrapCase
         $module = Get-Module DevPilot.ActivePrCanary
         $syntheticPin = & $module { $script:MergedMasterPin }
-        $approved = & $module { $script:ApprovedMergedPinSignature }
         try {
-            & $module {
-                $script:MergedMasterPin = $null
-                $script:ApprovedMergedPinSignature = $null
-            }
+            & $module { $script:MergedMasterPin = $null }
             { Invoke-CanaryMergedMasterPreflight -Organization $script:sourceOrg `
                     -ExpectedAccountUniqueName 'service@example.invalid' `
                     -SourceSelector $script:sourceSelector `
                     -SourceSelectorKey $script:sourceKey `
-                    -MergedPinEnvelope $script:mergedEnvelope `
+                    -MergedPinEnvelope $null `
                     -MergedPinKey $script:mergedKey `
                     -RepositoryRoot $repo -Read $c.provider -Run } |
                 Should -Throw '*merged-master-pin-unavailable*'
-            { Invoke-BootstrapCase $c } |
+            { Invoke-PrivateCanaryBootstrap -Organization $script:sourceOrg `
+                    -ProjectName 'ExampleProject' -RepositoryName 'ExampleRepo' `
+                    -SourceSelector $script:sourceSelector `
+                    -SourceSelectorKey $script:sourceKey `
+                    -MergedPinEnvelope $null -MergedPinKey $script:mergedKey `
+                    -ExpectedAccountUniqueName 'service@example.invalid' `
+                    -StateRoot $c.root -RepositoryRoot $repo `
+                    -Read $c.provider -Run } |
                 Should -Throw '*merged-master-pin-unavailable*'
             $c.state.reads.Count | Should -Be 0
             Test-Path -LiteralPath $c.root | Should -BeFalse
         }
         finally {
-            & $module {
-                param($Pin, $Signature)
-                $script:MergedMasterPin = $Pin
-                $script:ApprovedMergedPinSignature = $Signature
-            } $syntheticPin $approved
+            & $module { param($Pin) $script:MergedMasterPin = $Pin } $syntheticPin
         }
     }
-    It 'rejects an unapproved private pin before reading any private file or making a GET' {
+    It 'rejects missing private files before making a GET' {
         $c = Get-BootstrapCase
-        $module = Get-Module DevPilot.ActivePrCanary
-        $approved = & $module { $script:ApprovedMergedPinSignature }
-        try {
-            & $module { $script:ApprovedMergedPinSignature = $null }
-            { Read-CanaryPrivateMergedPin -PinPath 'unread-pin' `
-                    -KeyPath 'unread-key' -RepositoryRoot $repo `
-                    -SourceSelector $script:sourceSelector } |
-                Should -Throw '*merged-master-pin-unavailable*'
-            { Invoke-BootstrapCase $c } |
-                Should -Throw '*merged-master-pin-unavailable*'
-            $c.state.reads.Count | Should -Be 0
-            Test-Path -LiteralPath $c.root | Should -BeFalse
-        }
-        finally {
-            & $module {
-                param($Signature)
-                $script:ApprovedMergedPinSignature = $Signature
-            } $approved
-        }
+        { Read-CanaryPrivateMergedPin -PinPath (Join-Path $c.root 'absent.json') `
+                -KeyPath (Join-Path $c.root 'absent.key') `
+                -RepositoryRoot $repo `
+                -SourceSelector $script:sourceSelector } |
+            Should -Throw '*merged-master-pin-unavailable*'
+        $c.state.reads.Count | Should -Be 0
+        Test-Path -LiteralPath $c.root | Should -BeFalse
     }
-    It 'loads only an external ACL-private, approval-bound synthetic pin' {
+    It 'loads only an external ACL-private integrity-bound synthetic pin' {
         $c = Get-BootstrapCase
         $created = $false
         $root = Resolve-AgentTrustedRoot -Path $c.root -Kind durable-state `
@@ -1500,7 +1350,7 @@ Describe 'Read-only private canary input bootstrap' {
     }
     It 'rejects changed, mismatched, and previous-version private pins before any GET' {
         foreach ($failure in @('selector', 'pin', 'signature', 'key',
-                'version', 'kind', 'approval')) {
+                'version', 'kind', 'missing-field')) {
             $c = Get-BootstrapCase
             $pin = @{} + $script:mergedEnvelope.pin
             $envelope = [ordered]@{}
@@ -1509,42 +1359,63 @@ Describe 'Read-only private canary input bootstrap' {
             }
             $envelope.pin = $pin
             $key = $script:mergedKey
-            $module = Get-Module DevPilot.ActivePrCanary
-            $originalApproval = & $module { $script:ApprovedMergedPinSignature }
-            try {
-                switch ($failure) {
-                    selector { $envelope.selectorSignature =
-                        'v1:hmac-sha256:' + ('a' * 64) }
-                    pin { $pin.mergeCommit = 'a' * 40 }
-                    signature { $envelope.signature =
-                        'v1:hmac-sha256:' + ('a' * 64) }
-                    key { $key = 'd' * 64 }
-                    version { $envelope.schemaVersion = 2 }
-                    kind { $envelope.kind = 'private-active-candidate-pin' }
-                    approval {
-                        & $module {
-                            $script:ApprovedMergedPinSignature =
-                                'v1:hmac-sha256:' + ('a' * 64)
-                        }
-                    }
+            switch ($failure) {
+                selector { $envelope.selectorSignature =
+                    'v1:hmac-sha256:' + ('a' * 64) }
+                pin { $pin.mergeCommit = 'a' * 40 }
+                signature { $envelope.signature =
+                    'v1:hmac-sha256:' + ('a' * 64) }
+                key { $key = 'd' * 64 }
+                version { $envelope.schemaVersion = 2 }
+                kind { $envelope.kind = 'private-active-candidate-pin' }
+                'missing-field' {
+                    $envelope.Remove('pin')
+                    $envelope.extra = 'not-a-pin'
                 }
-                { Invoke-CanaryMergedMasterPreflight `
-                        -Organization $script:sourceOrg `
-                        -ExpectedAccountUniqueName 'service@example.invalid' `
-                        -SourceSelector $script:sourceSelector `
-                        -SourceSelectorKey $script:sourceKey `
-                        -MergedPinEnvelope $envelope -MergedPinKey $key `
-                        -RepositoryRoot $repo -Read $c.provider -Run } |
-                    Should -Throw '*merged-master-pin-unavailable*' -Because $failure
-                $c.state.reads.Count | Should -Be 0
-                Test-Path -LiteralPath $c.root | Should -BeFalse
             }
-            finally {
-                & $module {
-                    param($Signature)
-                    $script:ApprovedMergedPinSignature = $Signature
-                } $originalApproval
+            { Invoke-CanaryMergedMasterPreflight `
+                    -Organization $script:sourceOrg `
+                    -ExpectedAccountUniqueName 'service@example.invalid' `
+                    -SourceSelector $script:sourceSelector `
+                    -SourceSelectorKey $script:sourceKey `
+                    -MergedPinEnvelope $envelope -MergedPinKey $key `
+                    -RepositoryRoot $repo -Read $c.provider -Run } |
+                Should -Throw '*merged-master-pin-unavailable*' -Because $failure
+            $c.state.reads.Count | Should -Be 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
+    }
+    It 'rejects a correctly re-signed but unproved merge or rule pin after GET' {
+        foreach ($field in @('mergeCommit', 'sectionHash',
+                'classLineHash', 'redundantLineHash',
+                'classDeclarationDigest', 'redundantDeclarationDigest')) {
+            $c = Get-BootstrapCase
+            $pin = @{} + $script:mergedEnvelope.pin
+            $pin[$field] = if ($field -eq 'mergeCommit') {
+                'a' * 40
+            } else { 'v1:sha256:' + ('a' * 64) }
+            $envelope = [ordered]@{}
+            foreach ($name in $script:mergedEnvelope.Keys) {
+                $envelope[$name] = $script:mergedEnvelope[$name]
             }
+            $envelope.pin = $pin
+            $envelope.signature = & (Get-Module DevPilot.ActivePrCanary) {
+                param($Value, $Key)
+                Get-CanarySignature $Value $Key
+            } $envelope $script:mergedKey
+            { Invoke-CanaryMergedMasterPreflight `
+                    -Organization $script:sourceOrg `
+                    -ExpectedAccountUniqueName 'service@example.invalid' `
+                    -SourceSelector $script:sourceSelector `
+                    -SourceSelectorKey $script:sourceKey `
+                    -MergedPinEnvelope $envelope -MergedPinKey $script:mergedKey `
+                    -RepositoryRoot $repo -Read $c.provider -Run } |
+                Should -Throw -Because $field
+            $c.state.reads.Count | Should -BeGreaterThan 0
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+            @($c.state.reads | Where-Object {
+                    $_ -in @('Write', 'Post')
+                }).Count | Should -Be 0
         }
     }
     It 'proves a completed PR and advanced master in memory and rechecks the account' {
@@ -1620,7 +1491,7 @@ Describe 'Read-only private canary input bootstrap' {
         }
     }
     Describe 'Signed GET-only candidate evaluation runner' {
-        It 'rejects a stale merged approval before opening runner state or making a GET' {
+        It 'rejects a wrong private pin key before opening runner state or GET' {
             $c = Get-BootstrapCase
             { Invoke-PrivateCanaryEvaluation -StateRoot $c.root `
                     -RepositoryRoot $repo -SourceSelector $script:sourceSelector `

@@ -204,34 +204,31 @@ and current-master raw bytes must be byte-identical to that candidate, and
 the distinct class/redundant section and policy-line hashes must agree.
 After rechecking PR/ref/identity it returns only immutable commit, blob,
 document, section, line, and recomputed merge-commit declaration digests
-marked `discovered-awaiting-provenance-pin-review`: no path, raw payload,
+marked `discovered-merged-source-no-state`: no path, raw payload,
 account, token, header, private file or state, signing, or write. Any byte
 or section change, incomplete ancestry, drift, or throttle stops without a
-pin; changed content requires separate human review. Identical bytes retain
-the user's reviewed content approval but **do not** automatically establish
-merged provenance or update the pin.
+pin; changed content cannot be auto-approved. Discovery proves source
+continuity in memory but **does not** create a durable pin or activate a rule.
 
 `tools/Provision-PrivateCanaryMergedPin.ps1` is a separate **default-off,
 source-only** provisioner; this public layer does not authorize running it
-against a live service. The trusted reviewer RSA-PSS public-key anchor is
-unset, and the reviewer keeps the corresponding private signing key
-inaccessible to the operator. An independently signed version 1 approval
-contains the exact three source selectors, their signed-selector binding,
-the reviewed PR ID, and the exact ten-field merged pin. The operator cannot
-replace the reviewer signature with an HMAC made using the operator's selector
-key. The approval and signed selector may be read only from already existing
-external ACL-private files; the module entry point also accepts them in
-memory to avoid putting confidential values in process arguments or logs.
-Neither approval, reviewer key, nor a production pin is provided by the
-sample or by this repository.
+against a live service. The user's approved private source URL supplies the
+selector; the signed selector/key must remain outside the public repository.
+The exported module entry point accepts the selector in memory to avoid
+putting confidential values in process arguments or logs. No separate human
+RSA signing key or public approval-signature release is required for this
+**GET-only** source binding.
 
 Before any new private directory or key, the provisioner verifies the
-reviewer's signature and source selector, then performs a **fresh stateless**
+signed source selector, then performs a **fresh stateless**
 completed-PR, merge/current-master ancestry and raw candidate/merge/master
 document proof with class/redundant section, line and declaration hashes. It
 also checks the signed-in work principal and Graph user/storage key on the
-same bearer before and after source reads. Every one of the ten discovered
-pin fields must match the independently approved pin. Any drift or throttle
+same bearer before and after source reads. The candidate's immutable commit,
+document SHA-256 and length remain pinned independently; the completed PR,
+actual repository GUID, merge commit, current master, blob, section, line
+and distinct merge-bound declarations must all prove consistent. No source
+SHA is assumed to equal a squash/rebase merge SHA. Any drift or throttle
 stops with **no** new private root and no retry. Only after those checks does
 it generate a random key and write an ACL-private envelope in a newly
 created external staging directory, validate its files, and rename the
@@ -240,26 +237,23 @@ exactly named contained directory; an existing or aliased target is never
 overwritten or removed. Success reports only fixed state and read/write
 counts, not selectors, identity, source text, hashes, signature, key, or path.
 No POST, comment, model, intake, Owner/Named proof, or writer authority is
-part of this operation. Its output remains **unactivated** until a separate
-reviewer-approved exact envelope binding is released; the public activation
-signature and independent Owner/Named gate remain unset. Do not run this
-provisioner for real or prepare real files without a subsequent explicit
-artifact handoff and fresh exact-head CI.
+part of this operation. The HMAC protects the private pin's integrity; it is
+not an independent approval or posting credential. Its output is source-only,
+not a completed canary evaluation. Do not run this provisioner for real or
+prepare real files without a subsequent explicit sole-operator artifact
+handoff and fresh exact-head CI. Owner/Named remain separately unapproved.
 
 `tools/Invoke-PrivateCanaryMergedPreflight.ps1` is the separate **stateless**
 read-only merged-master source gate, disabled without `-Run`. Its repository-owned
-`MergedMasterPin` and `ApprovedMergedPinSignature` are intentionally **unset**.
+`MergedMasterPin` is intentionally **unset**.
 Keep actual source selectors, merge commits, document and rule digests, and
 private keys out of public source, tests, samples, PR descriptions, and CI.
-The separately reviewed merged-master authority must be supplied through a
-version 1 ACL-private signed pin envelope and key outside the repository;
-the repository-owned approval signature remains unset until a separate,
-explicitly reviewed release decision. With it unset, `-Run` fails
-`merged-master-pin-unavailable` before any ADO request or private pin read.
-Never promote a synthetic fixture, a previously reviewed *source* commit,
-or an assumed squash/rebase blob into merged provenance. The approval signature
-must be bound to the exact reviewed private envelope; independently recheck
-that binding before any private artifact handoff. Pin validation requires
+The merged source must be supplied through a version 1 ACL-private HMAC
+envelope and key created only after the fresh source proof above. Without
+these external trusted files, `-Run` fails `merged-master-pin-unavailable`
+before any ADO request. Never promote a synthetic fixture, a previously
+reviewed *source* commit, or an assumed squash/rebase blob into merged
+provenance. Pin validation requires
 the **same independently reviewed candidate document digest and length**,
 while section/line hashes are verified against those exact bytes and the
 merge-commit-bound declaration digests are recomputed. No live ADO GET or
@@ -270,9 +264,9 @@ require the same external selector/key and reviewed merged-pin/key paths on
 `kind: private-reviewed-merged-master-pin`, `selectorSignature`, `pin`, and
 `signature`; the latter signs the canonical JSON of the four unsigned fields
 with a separate random 48-byte key encoded as 64 base64 characters. The
-envelope signature must equal the independently approved opaque signature,
-and its selector signature must equal the approved source selector's
-signature. A missing, changed, unsigned, mismatched, or previous-version
+envelope HMAC and selector signature must verify against their private keys
+and the user-approved source selector. A missing, changed, unsigned,
+mismatched, or previous-version
 envelope fails before source GETs or state. The
 stateless discovery command instead uses only its in-memory selector
 arguments and needs no private files before source proof.
