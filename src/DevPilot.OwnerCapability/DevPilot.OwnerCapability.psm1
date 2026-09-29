@@ -208,8 +208,12 @@ function Get-TestClassCoverageMarkerKey {
     if ($line -lt 1 -or [string]::IsNullOrWhiteSpace($symbol)) {
         throw 'Coverage finding has an incomplete class anchor.'
     }
+    $markerPrefix = if ([string]$request.CapabilityId -ceq
+        'bpm-test-class-coverage@2') {
+        'devpilot-test-class-coverage:v2'
+    } else { $script:TestClassCoverageMarkerPrefix }
     $material = @(
-        $script:TestClassCoverageMarkerPrefix
+        $markerPrefix
         [string]$request.RepositoryId
         [string]$request.PullRequestId
         [string]$request.SourceCommit
@@ -247,11 +251,15 @@ function Format-TestClassCoverageComment {
     $candidate = [string]$request.CapabilityId -ceq 'bpm-test-class-coverage@2'
     $classKind = if ($candidate) { 'test-project' } else { 'MSTest' }
     $authority = if ($candidate -and
-        $request.ConfigId -ceq 'private-merged-master-canary-v1') {
+        $request.ConfigId -cin @('private-merged-master-canary-v1',
+            'private-coverage-only-canary-v1')) {
         'Reviewed merged-master read-only convention'
     } elseif ($candidate) {
         'Reviewed unmerged candidate-only convention'
     } else { 'User-approved convention' }
+    $markerPrefix = if ($candidate) {
+        'devpilot-test-class-coverage:v2'
+    } else { $script:TestClassCoverageMarkerPrefix }
     return @(
         '**Test class coverage exclusion missing**'
         ''
@@ -261,7 +269,7 @@ function Format-TestClassCoverageComment {
         ''
         "${authority}: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
         ''
-        "<!-- ${script:TestClassCoverageMarkerPrefix}:$MarkerKey -->"
+        "<!-- ${markerPrefix}:$MarkerKey -->"
     ) -join "`n"
 }
 
@@ -309,8 +317,12 @@ function Get-RedundantMethodCoverageMarkerKey {
             throw 'Redundant coverage attribute anchors are not strictly ordered.'
         }
     }
+    $markerPrefix = if ([string]$request.CapabilityId -ceq
+        'bpm-redundant-method-coverage@2') {
+        'devpilot-redundant-method-coverage:v2'
+    } else { $script:RedundantMethodCoverageMarkerPrefix }
     $material = @(
-        $script:RedundantMethodCoverageMarkerPrefix
+        $markerPrefix
         [string]$request.RepositoryId
         [string]$request.PullRequestId
         [string]$request.SourceCommit
@@ -353,11 +365,15 @@ function Format-RedundantMethodCoverageComment {
     $candidate = [string]$request.CapabilityId -ceq 'bpm-redundant-method-coverage@2'
     $classKind = if ($candidate) { 'test-project' } else { 'MSTest' }
     $authority = if ($candidate -and
-        $request.ConfigId -ceq 'private-merged-master-canary-v1') {
+        $request.ConfigId -cin @('private-merged-master-canary-v1',
+            'private-coverage-only-canary-v1')) {
         'Reviewed merged-master read-only convention'
     } elseif ($candidate) {
         'Reviewed unmerged candidate-only convention'
     } else { 'User-approved convention' }
+    $markerPrefix = if ($candidate) {
+        'devpilot-redundant-method-coverage:v2'
+    } else { $script:RedundantMethodCoverageMarkerPrefix }
     return @(
         "**Redundant method-level coverage exclusions in one $classKind class**"
         ''
@@ -369,7 +385,7 @@ function Format-RedundantMethodCoverageComment {
         ''
         "${authority}: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
         ''
-        "<!-- ${script:RedundantMethodCoverageMarkerPrefix}:$MarkerKey -->"
+        "<!-- ${markerPrefix}:$MarkerKey -->"
     ) -join "`n"
 }
 
@@ -535,10 +551,16 @@ function Resolve-OwnerV2DiscussionReconciliation {
         '<!--\s*devpilot-named-areequal:v1:([0-9a-f]{64})\s*-->'
     }
     elseif ($isRedundantMethod) {
-        '<!--\s*devpilot-redundant-method-coverage:v1:([0-9a-f]{64})\s*-->'
+        '<!--\s*devpilot-redundant-method-coverage:v' +
+            $(if ($capabilityId -ceq 'bpm-redundant-method-coverage@2') {
+                    '2'
+                } else { '1' }) + ':([0-9a-f]{64})\s*-->'
     }
     elseif ($isCoverage) {
-        '<!--\s*devpilot-test-class-coverage:v1:([0-9a-f]{64})\s*-->'
+        '<!--\s*devpilot-test-class-coverage:v' +
+            $(if ($capabilityId -ceq 'bpm-test-class-coverage@2') {
+                    '2'
+                } else { '1' }) + ':([0-9a-f]{64})\s*-->'
     }
     else {
         '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
@@ -619,6 +641,54 @@ function Resolve-OwnerV2DiscussionReconciliation {
             }
         }
 
+        $legacyPattern = if ($capabilityId -ceq
+            'bpm-test-class-coverage@2') {
+            '<!--\s*devpilot-test-class-coverage:v1:[0-9a-f]{64}\s*-->'
+        } elseif ($capabilityId -ceq
+            'bpm-redundant-method-coverage@2') {
+            '<!--\s*devpilot-redundant-method-coverage:v1:[0-9a-f]{64}\s*-->'
+        } else { $null }
+        if ($legacyPattern) {
+            $anchor = $finding.anchor
+            $lines = if ($isRedundantMethod) {
+                @($finding.affectedAttributeLines)
+            } else { @([int]$anchor.line) }
+            $expectedPath = ConvertTo-OwnerV1WriterPath -Path (
+                [string]$anchor.path)
+            $legacyAtAnchor = @($Snapshot.Threads | Where-Object {
+                    $thread = $_
+                    if ($null -eq $thread.anchor -or
+                        [bool]$thread.isDeleted -or
+                        @($lines | Where-Object {
+                                [int]$thread.anchor.line -ge ([int]$_ - 2) -and
+                                [int]$thread.anchor.line -le [int]$_
+                            }).Count -eq 0) {
+                        return $false
+                    }
+                    $samePath = try {
+                        [string]::Equals($expectedPath,
+                            (ConvertTo-OwnerV1WriterPath -Path (
+                                    [string]$thread.anchor.path)),
+                            [StringComparison]::OrdinalIgnoreCase)
+                    } catch { $false }
+                    $samePath -and @($thread.comments | Where-Object {
+                            [string]$_.commentType -ceq 'text' -and
+                            -not [bool]$_.isDeleted -and
+                            [regex]::IsMatch([string]$_.body, $legacyPattern)
+                        }).Count -gt 0
+                }).Count -gt 0
+            if ($legacyAtAnchor) {
+                $finding.providerMarker = New-OwnerProviderMarker `
+                    -Value $markerKey -Integrity invalid
+                $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                    -Classification unknown -Reason 'legacy-coverage-marker-at-anchor' `
+                    -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                    -ThreadAvailability ambiguous
+                $counts.unknown++
+                continue
+            }
+        }
+
         if ($ambiguousReviewerMarkers -gt 0 -or $foreignMarkers -gt 0) {
             $finding.providerMarker = New-OwnerProviderMarker -Value $markerKey -Integrity invalid
             $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
@@ -678,15 +748,28 @@ function Resolve-OwnerV2DiscussionReconciliation {
                 catch { $false }
                 if (-not $samePath) { continue }
                 foreach ($comment in @($thread.comments)) {
+                    $otherCoverageMarker = $capabilityId -cin @(
+                        'bpm-test-class-coverage@2',
+                        'bpm-redundant-method-coverage@2') -and
+                        [regex]::IsMatch([string]$comment.body, $(if ($isCoverage) {
+                                '<!--\s*devpilot-test-class-coverage:v[12]:[0-9a-f]{64}\s*-->'
+                            } else {
+                                '<!--\s*devpilot-redundant-method-coverage:v[12]:[0-9a-f]{64}\s*-->'
+                            }))
                     if ([string]$comment.commentType -cne 'text' -or
                         [bool]$comment.isDeleted -or
                         (-not $isRedundantMethod -and
+                            -not $otherCoverageMarker -and
                             [string]$comment.body -cnotmatch $discussionPattern)) {
+                        continue
+                    }
+                    if ($otherCoverageMarker) {
+                        $ambiguousHuman = $true
                         continue
                     }
                     $containsReviewerMarker = [regex]::IsMatch(
                         [string]$comment.body,
-                        '<!--\s*devpilot-(?:owner-comment|test-class-coverage|redundant-method-coverage|named-areequal):v1:[0-9a-f]{64}\s*-->'
+                        '<!--\s*devpilot-(?:owner-comment|test-class-coverage|redundant-method-coverage|named-areequal):v[12]:[0-9a-f]{64}\s*-->'
                     )
                     $affirmativeCoverage = if ($isNamedAreEqual) {
                         $text = [string]$comment.body

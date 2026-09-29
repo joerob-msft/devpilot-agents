@@ -18,6 +18,7 @@ param(
     [string]$MergedPinPath,
     [string]$MergedPinKeyPath,
     [string]$AzureCliPath = 'az',
+    [ValidateSet('FourRule', 'CoverageOnly')][string]$Mode = 'FourRule',
     [switch]$Run
 )
 Set-StrictMode -Version Latest
@@ -41,4 +42,4 @@ Invoke-PrivateCanaryBootstrap -Organization $Organization `
     -SourceSelector $source.selector -SourceSelectorKey $source.key `
     -MergedPinEnvelope $merged.envelope -MergedPinKey $merged.key `
     -StateRoot $StateRoot -RepositoryRoot $repo `
-    -AzureCliPath $AzureCliPath -Run:$Run | ConvertTo-Json -Depth 8
+    -AzureCliPath $AzureCliPath -Mode $Mode -Run:$Run | ConvertTo-Json -Depth 8
