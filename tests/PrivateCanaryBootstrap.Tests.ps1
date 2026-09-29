@@ -3172,23 +3172,19 @@ Describe 'Coverage-only signed read-only canary' {
         $c.state.reads.Count | Should -Be 0
         Test-Path $c.root | Should -BeFalse
     }
-    It 'requires a separately reviewed pin before GET or private root' {
+    It 'requires the private source pin before GET or private root' {
         $c = Get-BootstrapCase
-        $module = Get-Module DevPilot.ActivePrCanary
-        $saved = & $module { $script:ApprovedMergedPinSignature }
-        try {
-            & $module { $script:ApprovedMergedPinSignature = $null }
-            { Invoke-BootstrapCase $c -CoverageOnly } |
-                Should -Throw '*merged-master-pin-unavailable*'
-            $c.state.reads.Count | Should -Be 0
-            Test-Path $c.root | Should -BeFalse
-        }
-        finally {
-            & $module {
-                param($Value)
-                $script:ApprovedMergedPinSignature = $Value
-            } $saved
-        }
+        { Invoke-PrivateCanaryBootstrap -Organization $script:sourceOrg `
+                -ProjectName 'ExampleProject' -RepositoryName 'ExampleRepo' `
+                -ExpectedAccountUniqueName 'service@example.invalid' `
+                -StateRoot $c.root -RepositoryRoot $repo `
+                -SourceSelector $script:sourceSelector `
+                -SourceSelectorKey $script:sourceKey `
+                -MergedPinEnvelope $null -MergedPinKey $script:mergedKey `
+                -Read $c.provider -Mode CoverageOnly -Run } |
+            Should -Throw '*merged-master-pin-unavailable*'
+        $c.state.reads.Count | Should -Be 0
+        Test-Path $c.root | Should -BeFalse
     }
     It 'prepares exactly two independently hashed receipts without Owner approval' {
         $c = Get-BootstrapCase
