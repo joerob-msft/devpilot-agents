@@ -989,15 +989,30 @@ Describe 'Read-only private canary input bootstrap' {
                 Should -Not -Match 'ExampleSource|service@example.invalid|private-merged-pin|mergeCommit|aad.synthetic|source-selector'
             Test-Path -LiteralPath "$($c.root).staging" | Should -BeFalse
         }
-        It 'rejects CLI route mismatch before account or provider access' {
+        It 'requires an in-process selector object and rejects wrapper mismatch before account access' {
             $c = Get-ProvisionCase
+            $sourceInput = @{
+                organization = $script:sourceOrg
+                projectName = 'ExampleSource'
+                repositoryName = 'ExamplePolicyRepo'
+                pullRequestId = 1
+                documentPath = $script:documentSelector
+            }
             { & (Join-Path $repo 'tools\Provision-PrivateCanaryMergedPin.ps1') `
-                    -StateRoot $c.root -Organization $script:sourceOrg `
-                    -SourceProjectName 'ExampleSource' `
-                    -SourceRepositoryName 'ExamplePolicyRepo' `
-                    -SourcePullRequestId 1 `
-                    -SourceDocumentPath $script:documentSelector -Run } |
+                    -StateRoot $c.root -SourceInput $sourceInput -Run } |
                 Should -Throw '*source-selector-invalid*'
+            [void]$sourceInput.Remove('repositoryName')
+            { & (Join-Path $repo 'tools\Provision-PrivateCanaryMergedPin.ps1') `
+                    -StateRoot $c.root -SourceInput $sourceInput -Run } |
+                Should -Throw '*source-selector-invalid*'
+            try {
+                & (Join-Path $repo 'tools\Provision-PrivateCanaryMergedPin.ps1') `
+                    -StateRoot $c.root -SourceInput 'synthetic-route' -Run
+                throw 'expected invalid source input'
+            }
+            catch {
+                $_.Exception.Message | Should -Be 'source-selector-invalid'
+            }
             $c.state.reads.Count | Should -Be 0
             Test-Path -LiteralPath $c.root | Should -BeFalse
         }

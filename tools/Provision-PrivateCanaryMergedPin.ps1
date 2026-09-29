@@ -6,15 +6,13 @@
 .DESCRIPTION
     Default-off. Verifies the user-accepted source route with a fresh bounded
     same-bearer proof before creating any ACL-private selector or pin files.
+    Run only within an existing PowerShell process with SourceInput held in
+    memory; do not pass source selectors through process arguments.
 #>
 [CmdletBinding()]
 param(
     [string]$StateRoot,
-    [string]$Organization,
-    [string]$SourceProjectName,
-    [string]$SourceRepositoryName,
-    [int]$SourcePullRequestId,
-    [string]$SourceDocumentPath,
+    [object]$SourceInput,
     [string]$AzureCliPath = 'az',
     [switch]$Run
 )
@@ -27,11 +25,21 @@ if (-not $Run) {
         providerWrites = 0; privateFilesWritten = 0 } | ConvertTo-Json
     return
 }
-$source = @{ organization = $Organization
-    projectName = $SourceProjectName
-    repositoryName = $SourceRepositoryName }
+if ($SourceInput -isnot [Collections.IDictionary] -or
+    $SourceInput.Count -ne 5) {
+    throw 'source-selector-invalid'
+}
+foreach ($field in @('organization', 'projectName', 'repositoryName',
+        'pullRequestId', 'documentPath')) {
+    if (-not $SourceInput.Contains($field)) {
+        throw 'source-selector-invalid'
+    }
+}
+$source = @{ organization = $SourceInput.organization
+    projectName = $SourceInput.projectName
+    repositoryName = $SourceInput.repositoryName }
 Invoke-PrivateCanaryMergedPinProvision -StateRoot $StateRoot `
     -RepositoryRoot $repo -SourceSelector $source `
-    -SourcePullRequestId $SourcePullRequestId `
-    -DocumentPath $SourceDocumentPath `
+    -SourcePullRequestId $SourceInput.pullRequestId `
+    -DocumentPath $SourceInput.documentPath `
     -AzureCliPath $AzureCliPath -Run | ConvertTo-Json

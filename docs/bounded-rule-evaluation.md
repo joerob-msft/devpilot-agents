@@ -214,9 +214,16 @@ continuity in memory but **does not** create a durable pin or activate a rule.
 source-only** provisioner; this public layer does not authorize running it
 against a live service. The user's accepted private source URL supplies the
 organization, project, repository, reviewed PR and document selectors in
-memory (or CLI parameters on a trusted machine without command-line history
-or logging). The module entry point accepts a three-field route in memory;
-the reviewed PR ID and document path must exactly match the repository-owned
+memory. The supported operator path imports the module in an existing
+PowerShell process and calls `Invoke-PrivateCanaryMergedPinProvision` with
+the already-held in-memory three-field `SourceSelector` object, reviewed
+`SourcePullRequestId`, and `DocumentPath`. The script wrapper only accepts
+an in-process `SourceInput` dictionary containing these five fields, not
+individual route-bearing string parameters. **Never** pass private selectors
+as literal `pwsh -File` or `pwsh -Command` arguments, write them into shell
+history or transcripts, or log them. Do not place them in public code or CI.
+No source selector or key file is needed before proof. The reviewed PR ID
+and document path must exactly match the repository-owned
 contract before account access or any GET. No pre-existing signed selector,
 private selector key, human RSA key, or public approval-signature release is
 required for this **GET-only** source binding.
