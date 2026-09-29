@@ -11,7 +11,7 @@ The separate receipt (`schemaVersion: 7`,
 `private-coverage-only-merged-sources`) binds each rule to its own
 merge-commit/repository declaration digest, section hash, and exact policy
 line hash. The registry (`schemaVersion: 6`) independently rechecks the
-approved signed private pin against the current master ref, ancestry, raw
+private source-only pin against the current master ref, ancestry, raw
 Git blob, full document, and both declarations, as well as the current
 same-bearer ConnectionData, Graph user/principal name, and Graph storage key.
 The signed intake config (`schemaVersion: 6`,
@@ -22,9 +22,9 @@ four-rule receipts/configs are not interchangeable. Source, identity, and
 selected graph/head proofs complete **before** creating a new private intake
 root, lock, key, or generation.
 
-After a separate review publishes the approval anchors and an operator
-installs the ACL-private pin, selector, and key outside this repository,
-the operator can use the
+Once the parent source-only pin contract is available and an operator
+explicitly provisions its ACL-private pin, selector, and key outside this
+repository, the operator can use the
 `tools/Initialize-PrivateCoverageCanaryInputs.ps1`,
 `tools/Invoke-PrivateCoverageRuleRegistry.ps1`,
 `tools/Invoke-PrivateCoverageSignedIntake.ps1`, and
@@ -33,9 +33,10 @@ entry point defaults off; `-Run` requires an explicit later operator handoff,
 private external paths, and a currently signed-in approved Microsoft work
 account. Never place private selectors, account aliases, principal names, or
 receipts in a public file, command transcript, CI job, or PR description.
-The public reviewed-pin signature and reviewer key anchors are intentionally
-unset: without a separate reviewed activation and private approval, the
-runnable path stops before source GET or state creation.
+No human RSA reviewer key or independent signoff is required for the accepted
+source convention. Until the separate real source-only handoff provisions its
+private pin, the runnable path remains unavailable; no live source GET or
+private state is authorized by this PR alone.
 
 Evaluation uses the existing bounded complete active-PR inventory, current
 non-draft/master heads, Git-bound changed lines and project graph, and
@@ -47,5 +48,5 @@ writer eligibility. Findings remain candidate-only and never trigger POST.
 The returned per-head/per-rule aggregates are **not** signed per-finding
 delivery receipts: individual anchors and reconciliation evidence are not
 persisted in a writer-consumable format. A future create-only writer remains
-blocked pending its own reviewed, ACL-private, signed per-finding evidence
+blocked pending its own ACL-private, signed per-finding evidence
 contract and separate authorization.
