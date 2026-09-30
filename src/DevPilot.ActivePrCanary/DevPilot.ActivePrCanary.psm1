@@ -2567,31 +2567,6 @@ function New-CanaryIntakeFailureDiagnostic {
             Select-Object -Unique)
     } else { @() }
     $checks = [Collections.Generic.List[string]]::new()
-    $selected = @($Selection | ForEach-Object {
-            $id = $_
-            $matches = @(if ($Cohort) {
-                    $Cohort.heads | Where-Object pullRequestId -EQ $id
-                })
-            $inventoryKnown = $Cohort -and
-                $Cohort.inventory.state -ceq 'complete' -and
-                $Cohort.populationKnown -ceq $true
-            $head = if ($matches.Count -eq 1) { $matches[0] } else { $null }
-            [ordered]@{
-                pullRequestId = $id
-                inventoryEligible = if ($inventoryKnown) {
-                    $null -ne $head -and $head.targetRef -ceq 'refs/heads/master'
-                } else { $null }
-                headProof = if ($head -and
-                    $head.status -cin @('pending', 'unknown', 'skipped')) {
-                    [string]$head.status
-                } else { 'unknown' }
-                reason = if ($head -and $head.reason -cin $safeReasons) {
-                    [string]$head.reason
-                } elseif ($head -and $head.status -ceq 'pending') {
-                    'rules-not-evaluated'
-                } else { 'unavailable' }
-            }
-        })
     if ($Cohort) {
         if ($Cohort.inventory.state -cne 'complete') {
             $checks.Add('inventory-incomplete')
@@ -2620,6 +2595,36 @@ function New-CanaryIntakeFailureDiagnostic {
                     $Cohort.inventory.excludedOtherTargets)) {
             $checks.Add('eligible-cardinality')
         }
+    }
+    $inventoryKnown = $Cohort -and $checks.Count -eq 0 -and
+        $null -ne $Cohort.inventory.nonDraft -and
+        $null -ne $Cohort.inventory.active -and
+        $null -ne $Cohort.inventory.draft -and
+        $null -ne $Cohort.inventory.eligible -and
+        $null -ne $Cohort.inventory.excludedOtherTargets
+    $selected = @($Selection | ForEach-Object {
+            $id = $_
+            $matches = @(if ($Cohort) {
+                    $Cohort.heads | Where-Object pullRequestId -EQ $id
+                })
+            $head = if ($matches.Count -eq 1) { $matches[0] } else { $null }
+            [ordered]@{
+                pullRequestId = $id
+                inventoryEligible = if ($inventoryKnown) {
+                    $null -ne $head -and $head.targetRef -ceq 'refs/heads/master'
+                } else { $null }
+                headProof = if ($head -and
+                    $head.status -cin @('pending', 'unknown', 'skipped')) {
+                    [string]$head.status
+                } else { 'unknown' }
+                reason = if ($head -and $head.reason -cin $safeReasons) {
+                    [string]$head.reason
+                } elseif ($head -and $head.status -ceq 'pending') {
+                    'rules-not-evaluated'
+                } else { 'unavailable' }
+            }
+        })
+    if ($Cohort) {
         if (@($selected | Where-Object {
                     $_.inventoryEligible -eq $false -or
                     $_.headProof -cne 'pending'
@@ -3052,36 +3057,48 @@ function Invoke-PrivateCanarySignedIntake {
                 $diagnostic.failureCode -ceq 'read-throttled') {
                 $diagnostic.throttleState = 'detected'
             }
+            if ($diagnostic.failureCode -ceq 'canary-source-drift') {
+                $diagnostic.driftState = 'detected'
+            }
             $FailureDiagnostic.Value = $diagnostic
         }
+        $cleanupFailed = $false
         if ($null -ne $creationState -and $creationState.created) {
-            $root = [string]$creationState.root
-            $canonical = [IO.Path]::GetFullPath($StateRoot)
-            $comparison = if ($IsWindows) {
-                [StringComparison]::OrdinalIgnoreCase
-            } else { [StringComparison]::Ordinal }
-            if (-not $root.Equals($canonical, $comparison) -or
-                (Test-AgentPathWithin $root $RepositoryRoot) -or
-                (Test-AgentPathWithin $RepositoryRoot $root)) {
-                throw 'canary-private-state-cleanup-failed'
-            }
-            $parent = [IO.Path]::GetDirectoryName($root)
-            if (-not $parent -or
-                $parent.Equals($root, $comparison)) {
-                throw 'canary-private-state-cleanup-failed'
-            }
             try {
+                $root = [string]$creationState.root
+                $canonical = [IO.Path]::GetFullPath($StateRoot)
+                $comparison = if ($IsWindows) {
+                    [StringComparison]::OrdinalIgnoreCase
+                } else { [StringComparison]::Ordinal }
+                if (-not $root.Equals($canonical, $comparison) -or
+                    (Test-AgentPathWithin $root $RepositoryRoot) -or
+                    (Test-AgentPathWithin $RepositoryRoot $root)) {
+                    throw 'canary-private-state-cleanup-failed'
+                }
+                $parent = [IO.Path]::GetDirectoryName($root)
+                if (-not $parent -or
+                    $parent.Equals($root, $comparison)) {
+                    throw 'canary-private-state-cleanup-failed'
+                }
                 Remove-AgentContainedDirectory -Path $root `
                     -AllowedRoot $parent -LeafPattern (
                         '^(?:' + [regex]::Escape(
                             [IO.Path]::GetFileName($root)) + ')$')
             }
-            catch { throw 'canary-private-state-cleanup-failed' }
+            catch { $cleanupFailed = $true }
         }
         if ($FailureDiagnostic) {
-            $FailureDiagnostic.Value.privateIntakePersisted =
-                Test-Path -LiteralPath $StateRoot
+            if ($cleanupFailed) {
+                $FailureDiagnostic.Value.failureCode =
+                    'canary-private-state-cleanup-failed'
+            }
+            try {
+                $FailureDiagnostic.Value.privateIntakePersisted =
+                    Test-Path -LiteralPath $StateRoot -ErrorAction Stop
+            }
+            catch { $FailureDiagnostic.Value.privateIntakePersisted = $null }
         }
+        if ($cleanupFailed) { throw 'canary-private-state-cleanup-failed' }
         throw $failure
     }
     finally { if ($session) { $session.client.Dispose() } }

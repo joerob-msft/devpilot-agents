@@ -62,8 +62,8 @@ try {
 }
 catch {
     if ($failureDiagnostic.Value) {
-        $failureDiagnostic.Value | ConvertTo-Json -Depth 10 -Compress
-        throw 'canary-signed-intake-blocked'
+        . (Join-Path $PSScriptRoot 'PrivateCanarySignedIntakeFailure.ps1')
+        Write-PrivateCanarySignedIntakeFailure $failureDiagnostic.Value
     }
     throw
 }

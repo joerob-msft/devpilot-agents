@@ -2152,11 +2152,78 @@ Describe 'Read-only private canary input bootstrap' {
                 } $cohort
                 $d.failedChecks | Should -Contain 'duplicate-entries'
                 $d.failedChecks | Should -Contain 'non-draft-cardinality'
-                $d.selected[0].inventoryEligible | Should -BeTrue
-                $d.selected[1].inventoryEligible | Should -BeFalse
+                $d.selected[0].inventoryEligible | Should -BeNullOrEmpty
+                $d.selected[1].inventoryEligible | Should -BeNullOrEmpty
                 $d.reasonCodes | Should -BeNullOrEmpty
                 $d.inventory.intakeReportedReads | Should -Be 8
                 ($d | ConvertTo-Json -Depth 8) | Should -Not -Match 'private detail'
+            }
+            It 'only reports selected eligibility after every inventory proof succeeds' {
+                $baseline = @{
+                    inventory = @{ state = 'complete'; active = 3
+                        nonDraft = 2; draft = 1; eligible = 1
+                        excludedOtherTargets = 1 }
+                    populationKnown = $true
+                    gapCounts = @{ enumerationUnknown = 0
+                        duplicateEntries = 0; drift = 0 }
+                    reasonCodes = @()
+                    heads = @(
+                        @{ pullRequestId = 17007699; status = 'pending'
+                            targetRef = 'refs/heads/master'
+                            reason = 'rules-incomplete' },
+                        @{ pullRequestId = 17109075; status = 'pending'
+                            targetRef = 'refs/heads/release'
+                            reason = 'rules-incomplete' })
+                    pages = @{ first = 1; second = 1 }
+                    readCount = 8
+                }
+                foreach ($mode in @('complete', 'inventory', 'population',
+                        'enumeration', 'duplicate', 'non-draft', 'active',
+                        'eligible')) {
+                    $cohort = ConvertFrom-Json -AsHashtable (
+                        ConvertTo-Json $baseline -Depth 10)
+                    switch ($mode) {
+                        inventory { $cohort.inventory.state = 'unknown' }
+                        population { $cohort.populationKnown = $false }
+                        enumeration { $cohort.gapCounts.enumerationUnknown = 1 }
+                        duplicate { $cohort.gapCounts.duplicateEntries = 1 }
+                        non-draft { $cohort.inventory.nonDraft = 3 }
+                        active { $cohort.inventory.active = 4 }
+                        eligible { $cohort.inventory.eligible = 2 }
+                    }
+                    $d = & (Get-Module DevPilot.ActivePrCanary) {
+                        param($Cohort)
+                        New-CanaryIntakeFailureDiagnostic $Cohort `
+                            @(17007699, 17109075) $null `
+                            @{ attempted = 4; completed = 4 } $null $null
+                    } $cohort
+                    if ($mode -eq 'complete') {
+                        $d.selected[0].inventoryEligible | Should -BeTrue
+                        $d.selected[1].inventoryEligible | Should -BeFalse
+                    } else {
+                        $d.selected[0].inventoryEligible | Should -BeNullOrEmpty
+                        $d.selected[1].inventoryEligible | Should -BeNullOrEmpty
+                        $d.failedChecks.Count | Should -BeGreaterThan 0
+                    }
+                }
+            }
+            It 'reports source drift even when the inventory itself is complete' {
+                $c = Get-SignedIntakeCase -Code -CoverageOnly
+                $provider = $c.provider
+                $config = $c.input.config
+                $c.provider = {
+                    param($Operation, $Request)
+                    if ($Operation -ceq 'ListPage') {
+                        $config.syntheticNote = 'changed-after-source-proof'
+                    }
+                    & $provider $Operation $Request
+                }.GetNewClosure()
+                $diagnostic = [ref]$null
+                { Invoke-SignedIntakeCase $c $diagnostic } |
+                    Should -Throw '*canary-source-drift*'
+                $diagnostic.Value.failureCode | Should -Be 'canary-source-drift'
+                $diagnostic.Value.driftState | Should -Be 'detected'
+                $diagnostic.Value.privateIntakePersisted | Should -BeFalse
             }
             It 'keeps actual failed GET attempts distinct from completed source and provider GETs' {
                 $provider = [ordered]@{ attemptedGets = 4; completedGets = 3
@@ -2253,6 +2320,55 @@ Describe 'Read-only private canary input bootstrap' {
                 @($c.state.calls | Where-Object {
                         $_ -in @('Write', 'Post')
                     }).Count | Should -Be 0
+            }
+            It 'reports a removed private intake root after a post-proof write failure' {
+                $c = Get-SignedIntakeCase -Code -CoverageOnly
+                Mock Write-CanaryPrivateFile -ModuleName DevPilot.ActivePrCanary {
+                    throw 'signed-file-failed'
+                } -ParameterFilter { $Path -like '*canary-dispatcher.json' }
+                $diagnostic = [ref]$null
+                { Invoke-SignedIntakeCase $c $diagnostic } |
+                    Should -Throw '*signed-file-failed*'
+                $diagnostic.Value.privateIntakePersisted | Should -BeFalse
+                $diagnostic.Value.failureCode | Should -Be 'canary-preflight-incomplete'
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+            }
+            It 'preserves cleanup failure and reports the retained private root' {
+                $c = Get-SignedIntakeCase -Code -CoverageOnly
+                Mock Write-CanaryPrivateFile -ModuleName DevPilot.ActivePrCanary {
+                    throw 'signed-file-failed'
+                } -ParameterFilter { $Path -like '*canary-dispatcher.json' }
+                Mock Remove-AgentContainedDirectory -ModuleName DevPilot.ActivePrCanary {
+                    throw 'private filesystem detail'
+                }
+                $diagnostic = [ref]$null
+                { Invoke-SignedIntakeCase $c $diagnostic } |
+                    Should -Throw '*canary-private-state-cleanup-failed*'
+                $diagnostic.Value.failureCode |
+                    Should -Be 'canary-private-state-cleanup-failed'
+                $diagnostic.Value.privateIntakePersisted | Should -BeTrue
+                Test-Path -LiteralPath $c.root | Should -BeTrue
+                ($diagnostic.Value | ConvertTo-Json -Depth 10) |
+                    Should -Not -Match 'private filesystem detail'
+            }
+            It 'preserves a typed cleanup failure in CLI-facing output' {
+                . (Join-Path $repo 'tools\PrivateCanarySignedIntakeFailure.ps1')
+                $diagnostic = [ordered]@{
+                    failureCode = 'canary-private-state-cleanup-failed'
+                    privateIntakePersisted = $true; state = 'blocked'
+                }
+                $output = [Collections.Generic.List[string]]::new()
+                $errorText = ''
+                try {
+                    Write-PrivateCanarySignedIntakeFailure $diagnostic |
+                        ForEach-Object { $output.Add([string]$_) }
+                }
+                catch { $errorText = $_.Exception.Message }
+                $errorText | Should -Be 'canary-private-state-cleanup-failed'
+                ($output.ToArray() -join '') |
+                    Should -Match '"privateIntakePersisted":true'
+                ($output.ToArray() -join '') |
+                    Should -Match '"failureCode":"canary-private-state-cleanup-failed"'
             }
             It 'removes only a root attributed to itself after partial ACL creation' {
                 $c = Get-SignedIntakeCase -Code

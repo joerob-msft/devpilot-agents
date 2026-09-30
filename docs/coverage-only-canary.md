@@ -33,6 +33,10 @@ account, or response body. Unknown counts remain `null`, not zero. This
 diagnostic does **not** relax the completeness gate, sign a config, or provide
 finding evidence. Failures from runs before this diagnostic existed cannot be
 attributed to a particular page, head, or throttle retrospectively.
+Selected eligibility is unknown until the whole inventory is complete; a
+cleanup failure reports `canary-private-state-cleanup-failed` with the private
+intake root's observed existence (`null` if it cannot be determined).
+
 HTTP 200 rate-limit remaining/limit/reset budget metadata alone, even when
 remaining is zero, is not a throttle signal; explicit 429/503, `Retry-After`,
 or a positive server-directed rate-limit delay stops the GET-only run.
