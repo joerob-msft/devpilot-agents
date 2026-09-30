@@ -39,12 +39,20 @@ identity, and selected graph/head proofs complete
 
 If signed intake cannot prove a complete inventory or selected head, it still
 exits with an error and creates no intake root. Its failure output contains a
-sanitized `private-canary-intake-failure-diagnostic`: allowlisted page and
-head reason codes, the failed completeness checks, per-selected-PR eligibility
-(`null` if unknown), and attempted/completed GET counts where the bound
+sanitized `private-canary-intake-failure-diagnostic`: exact allowlisted page and
+selected-head reason codes (including changed-file, graph, malformed-change,
+truncation, and resource-budget failures), the failed completeness checks,
+per-selected-PR eligibility (`null` if unknown), and attempted/completed GET
+counts where the bound
 transport can measure them. A throttle indicator stops the run without retry;
 an HTTP status may be reported as a number, never with a route, header value,
-account, or response body. Unknown counts remain `null`, not zero. This
+account, or response body. A selected `method` is `Head`, `Changes`, or
+`Discussions` only when a failed bound provider call for that selected PR was
+observed; its `stage` is then `provider-call`. Otherwise both are `unknown`.
+The transport's `completedGets` counts accepted bodies/JSON, not HTTP
+response headers; a separate HTTP response-header observer can therefore
+report a larger number without proving a throttle or policy drift. Unknown
+counts remain `null`, not zero. This
 diagnostic does **not** relax the completeness gate, sign a config, or provide
 finding evidence. Failures from runs before this diagnostic existed cannot be
 attributed to a particular page, head, or throttle retrospectively.

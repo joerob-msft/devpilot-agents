@@ -2181,6 +2181,156 @@ Describe 'Read-only private canary input bootstrap' {
                     Test-Path -LiteralPath $c.root | Should -BeFalse
                 }
             }
+            It 'preserves every selected intake safe code through the signed-intake failure diagnostic' {
+                $cases = @(
+                    @{ code = 'invalid-head'; method = 'Head' },
+                    @{ code = 'head-inconsistent'; method = 'Head' },
+                    @{ code = 'head-drift'; method = 'Head' },
+                    @{ code = 'file-budget'; method = 'Changes' },
+                    @{ code = 'line-budget'; method = 'Changes' },
+                    @{ code = 'line-count-unavailable'; method = 'Changes' },
+                    @{ code = 'account-mismatch'; method = 'Changes' },
+                    @{ code = 'change-list-truncated'; method = 'Changes' },
+                    @{ code = 'change-page-budget'; method = 'Changes' },
+                    @{ code = 'invalid-discussions'; method = 'Discussions' },
+                    @{ code = 'mutable-discussions'; method = 'Discussions' },
+                    @{ code = 'comment-budget'; method = 'Discussions' },
+                    @{ code = 'invalid-evaluator'; method = 'Changes' },
+                    @{ code = 'invalid-observation'; method = 'Changes' },
+                    @{ code = 'read-budget'; method = 'Changes' },
+                    @{ code = 'time-budget'; method = 'Changes' },
+                    @{ code = 'invalid-change'; method = 'Changes' },
+                    @{ code = 'invalid-item'; method = 'Changes' },
+                    @{ code = 'byte-budget'; method = 'Changes' },
+                    @{ code = 'diff-budget'; method = 'Changes' },
+                    @{ code = 'unsupported-change'; method = 'Changes' },
+                    @{ code = 'project-identity-unknown'; method = 'Changes' }
+                )
+                $intakeSource = Get-Content -LiteralPath (
+                    Join-Path $repo 'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psm1') -Raw
+                $selectedCatch = [regex]::Match($intakeSource,
+                    '(?s)\$reason -cnotin @\((?<codes>.*?)\)\) \{\s*\$reason = ''provider-inaccessible''')
+                $selectedCatch.Success | Should -BeTrue
+                $upstreamCodes = @([regex]::Matches(
+                        $selectedCatch.Groups['codes'].Value,
+                        "'(?<code>[a-z][a-z0-9-]*)'") |
+                    ForEach-Object { $_.Groups['code'].Value } |
+                    Sort-Object -Unique)
+                @(Compare-Object $upstreamCodes @($cases.code | Sort-Object -Unique)) |
+                    Should -BeNullOrEmpty
+                foreach ($test in $cases) {
+                    $c = Get-SignedIntakeCase -CoverageOnly -Code
+                    $inner = $c.provider
+                    $method = $test.method
+                    $code = $test.code
+                    $c.provider = {
+                        param($operation, $request)
+                        if ($operation -ceq $method -and
+                            $request.pullRequestId -eq 17007699) {
+                            throw $code
+                        }
+                        & $inner $operation $request
+                    }.GetNewClosure()
+                    $diagnostic = [ref]$null
+                    { Invoke-SignedIntakeCase $c $diagnostic } |
+                        Should -Throw -Because $code
+                    $d = $diagnostic.Value
+                    $d.failureCode | Should -Be 'canary-head-or-evidence-unknown' -Because $code
+                    $d.selected[0].reason | Should -BeExactly $code
+                    $d.selected[0].method | Should -BeExactly $method
+                    $d.selected[0].stage | Should -Be 'provider-call'
+                    $d.selected[0].headProof | Should -Be 'unknown'
+                    $d.selected[0].inventoryEligible | Should -BeTrue
+                    $d.selected[1].headProof | Should -Be 'pending'
+                    $d.selected[1].method | Should -Be 'unknown'
+                    $d.selected[1].stage | Should -Be 'unknown'
+                    $d.provider.attemptedCalls |
+                        Should -Be ($d.provider.completedCalls + 1)
+                    $d.provider.attemptedGets | Should -BeNullOrEmpty
+                    $d.provider.completedGets | Should -BeNullOrEmpty
+                    $d.privateIntakePersisted | Should -BeFalse
+                    $d.signed | Should -BeFalse
+                    $d.writerEligible | Should -BeFalse
+                    $d.providerWrites | Should -Be 0
+                    Test-Path -LiteralPath $c.root | Should -BeFalse
+                }
+            }
+            It 'redacts unapproved provider errors and does not invent validation method or transport counts' {
+                $c = Get-SignedIntakeCase -CoverageOnly -Code
+                $inner = $c.provider
+                $c.provider = {
+                    param($operation, $request)
+                    if ($operation -ceq 'Changes' -and
+                        $request.pullRequestId -eq 17007699) {
+                        throw 'private route /secret/account@example.invalid and key'
+                    }
+                    & $inner $operation $request
+                }.GetNewClosure()
+                $diagnostic = [ref]$null
+                { Invoke-SignedIntakeCase $c $diagnostic } | Should -Throw
+                $d = $diagnostic.Value
+                $d.selected[0].reason | Should -Be 'provider-inaccessible'
+                $d.selected[0].method | Should -Be 'Changes'
+                $d.selected[0].stage | Should -Be 'provider-call'
+                $d.selected[0].inventoryEligible | Should -BeTrue
+                $d.privateIntakePersisted | Should -BeFalse
+                $d.provider.attemptedGets | Should -BeNullOrEmpty
+                $d.provider.completedGets | Should -BeNullOrEmpty
+                ($d | ConvertTo-Json -Depth 12) |
+                    Should -Not -Match 'private route|/secret|account@example.invalid|and key'
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+
+                $validated = Get-SignedIntakeCase -CoverageOnly -Code
+                $validProvider = $validated.provider
+                $validated.provider = {
+                    param($operation, $request)
+                    $answer = & $validProvider $operation $request
+                    if ($operation -ceq 'Changes' -and
+                        $request.pullRequestId -eq 17007699) {
+                        $answer.files[0].spans[0].startLine = 2
+                    }
+                    return $answer
+                }.GetNewClosure()
+                $validationDiagnostic = [ref]$null
+                { Invoke-SignedIntakeCase $validated $validationDiagnostic } |
+                    Should -Throw
+                $v = $validationDiagnostic.Value
+                $v.selected[0].reason | Should -Be 'invalid-change'
+                $v.selected[0].method | Should -Be 'unknown'
+                $v.selected[0].stage | Should -Be 'unknown'
+                $v.provider.attemptedCalls | Should -Be $v.provider.completedCalls
+                $v.privateIntakePersisted | Should -BeFalse
+                Test-Path -LiteralPath $validated.root | Should -BeFalse
+            }
+            It 'keeps each selected failing provider method separate' {
+                $c = Get-SignedIntakeCase -CoverageOnly -Code
+                $inner = $c.provider
+                $c.provider = {
+                    param($operation, $request)
+                    if ($operation -ceq 'Changes' -and
+                        $request.pullRequestId -eq 17007699) {
+                        throw 'invalid-change'
+                    }
+                    if ($operation -ceq 'Discussions' -and
+                        $request.pullRequestId -eq 17109075) {
+                        throw 'invalid-discussions'
+                    }
+                    & $inner $operation $request
+                }.GetNewClosure()
+                $diagnostic = [ref]$null
+                { Invoke-SignedIntakeCase $c $diagnostic } | Should -Throw
+                $d = $diagnostic.Value
+                $d.selected[0].reason | Should -Be 'invalid-change'
+                $d.selected[0].method | Should -Be 'Changes'
+                $d.selected[1].reason | Should -Be 'invalid-discussions'
+                $d.selected[1].method | Should -Be 'Discussions'
+                @($d.selected | Where-Object stage -NE 'provider-call').Count |
+                    Should -Be 0
+                $d.provider.attemptedCalls |
+                    Should -Be ($d.provider.completedCalls + 2)
+                $d.privateIntakePersisted | Should -BeFalse
+                Test-Path -LiteralPath $c.root | Should -BeFalse
+            }
             It 'distinguishes inventory duplicates and cardinality without assuming eligibility' {
                 $cohort = @{
                     inventory = @{ state = 'complete'; active = 4

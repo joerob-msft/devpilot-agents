@@ -2590,7 +2590,11 @@ function New-CanaryIntakeFailureDiagnostic {
         'page-inaccessible', 'provider-inaccessible', 'head-drift',
         'head-inconsistent', 'invalid-head', 'iteration-inaccessible',
         'project-identity-unknown', 'unknown-heads', 'diff-budget',
-        'duplicate-list-entries-reconciled')
+        'duplicate-list-entries-reconciled', 'file-budget', 'line-budget',
+        'line-count-unavailable', 'change-list-truncated', 'change-page-budget',
+        'invalid-discussions', 'mutable-discussions', 'comment-budget',
+        'invalid-evaluator', 'invalid-observation', 'invalid-change',
+        'invalid-item', 'byte-budget', 'unsupported-change')
     $reasons = if ($Cohort) {
         @($Cohort.reasonCodes | Where-Object { $_ -cin $safeReasons } |
             Select-Object -Unique)
@@ -2633,10 +2637,19 @@ function New-CanaryIntakeFailureDiagnostic {
         $null -ne $Cohort.inventory.excludedOtherTargets
     $selected = @($Selection | ForEach-Object {
             $id = $_
-            $matches = @(if ($Cohort) {
+            $matchingHeads = @(if ($Cohort) {
                     $Cohort.heads | Where-Object pullRequestId -EQ $id
                 })
-            $head = if ($matches.Count -eq 1) { $matches[0] } else { $null }
+            $head = if ($matchingHeads.Count -eq 1) {
+                $matchingHeads[0]
+            } else { $null }
+            $failedMethod = if ($head -and
+                $ProviderCalls['failedMethods'] -is [Collections.IDictionary] -and
+                $ProviderCalls['failedMethods'].Contains($id) -and
+                $ProviderCalls['failedMethods'][$id] -cin @('Head', 'Changes',
+                    'Discussions')) {
+                [string]$ProviderCalls['failedMethods'][$id]
+            } else { 'unknown' }
             [ordered]@{
                 pullRequestId = $id
                 inventoryEligible = if ($inventoryKnown) {
@@ -2651,6 +2664,10 @@ function New-CanaryIntakeFailureDiagnostic {
                 } elseif ($head -and $head.status -ceq 'pending') {
                     'rules-not-evaluated'
                 } else { 'unavailable' }
+                method = $failedMethod
+                stage = if ($failedMethod -cne 'unknown') {
+                    'provider-call'
+                } else { 'unknown' }
                 limitKind = if ($head -and
                     $head.reason -ceq 'diff-budget') {
                     'maxDiffCells'
@@ -2819,7 +2836,8 @@ function Invoke-PrivateCanarySignedIntake {
     $creationState = @{ created = $false }
     $registry = $null
     $gate = @{ pins = $null; finalRegistry = $null; cohort = $null }
-    $providerCalls = @{ attempted = 0; completed = 0; failureCode = $null }
+    $providerCalls = @{ attempted = 0; completed = 0; failureCode = $null
+        failedMethods = @{} }
     $transportTelemetry = $null
     $sourceTelemetry = $null
     try {
@@ -2891,6 +2909,15 @@ function Invoke-PrivateCanarySignedIntake {
             return $answer
         }
         catch {
+            $selectedId = 0
+            if ($operation -cin @('Head', 'Changes', 'Discussions') -and
+                $request -is [Collections.IDictionary] -and
+                $request.Contains('pullRequestId') -and
+                [int]::TryParse([string]$request.pullRequestId,
+                    [ref]$selectedId) -and
+                $selectedId -in $CanaryPullRequestIds) {
+                $providerCalls.failedMethods[$selectedId] = $operation
+            }
             if ($_.Exception.Message -ceq 'read-throttled') {
                 $providerCalls.failureCode = 'read-throttled'
             }
