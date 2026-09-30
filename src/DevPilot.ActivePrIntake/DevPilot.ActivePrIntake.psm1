@@ -627,16 +627,21 @@ function Get-IntakePass {
     $seen = @{}
     $duplicates = 0
     $offset = 0
-    $size = [int]$Config.limits.pageSize
     $total = $null
     $keyset = $null -ne $Config['pagination']
+    $size = if ($keyset) {
+        [Math]::Min([int]$Config.limits.pageSize, 199)
+    } else { [int]$Config.limits.pageSize }
     $cursor = $Cutoff
     $shortPage = $false
+    $lastBoundaryId = $null
+    $terminalProbe = $false
     for ($page = 0; $page -lt [int]$Config.limits.maxPages; $page++) {
         $request = @{ pass = $Pass; skip = $offset; top = $size }
         if ($keyset) {
             $request.skip = 0
-            $request.top = $size + 1
+            # Reserve a lookahead even when the service echoes the boundary row.
+            $request.top = $size + 2
             $request.maxTime = $cursor
         }
         $raw = Invoke-IntakeRead $Provider 'ListPage' $request $Config $Reads $Clock
@@ -645,14 +650,22 @@ function Get-IntakePass {
             throw 'invalid-page'
         }
         if ($keyset) {
+            if ($terminalProbe) {
+                if ($raw.items.Count -ne 0) {
+                    throw 'missing-page:keyset-terminal-unproved'
+                }
+                return @{ seen = $seen; duplicates = $duplicates; pages = $page + 1 }
+            }
             if ($raw.items.Count -eq 0) {
                 return @{ seen = $seen; duplicates = $duplicates; pages = $page + 1 }
             }
-            if ($shortPage) { throw 'missing-page' }
+            $originalCount = $raw.items.Count
             $windowTime = [DateTimeOffset]::Parse($cursor,
                 [Globalization.CultureInfo]::InvariantCulture)
             $times = [Collections.Generic.List[DateTimeOffset]]::new()
-            foreach ($item in $raw.items) {
+            $echo = $false
+            for ($index = 0; $index -lt $raw.items.Count; $index++) {
+                $item = $raw.items[$index]
                 $date = [DateTimeOffset]::MinValue
                 if ($item -isnot [Collections.IDictionary] -or
                     [string]$item.creationDate -cnotmatch
@@ -660,13 +673,56 @@ function Get-IntakePass {
                     -not [DateTimeOffset]::TryParseExact(
                         [string]$item.creationDate, 'yyyy-MM-ddTHH:mm:ss.FFFFFFFK',
                         [Globalization.CultureInfo]::InvariantCulture,
-                        [Globalization.DateTimeStyles]::None, [ref]$date) -or
-                    $date -ge $windowTime -or
-                    ($times.Count -gt 0 -and $date -gt $times[$times.Count - 1])) {
-                    throw 'mutable-page'
+                        [Globalization.DateTimeStyles]::None, [ref]$date)) {
+                    throw 'mutable-page:keyset-invalid-date'
+                }
+                if ($date -gt $windowTime) {
+                    throw 'mutable-page:keyset-newer'
+                }
+                if ($date -eq $windowTime) {
+                    if ($index -ne 0 -or $null -eq $lastBoundaryId) {
+                        throw 'mutable-page:keyset-unseen-equal'
+                    }
+                    $id = 0
+                    if (-not [int]::TryParse([string]$item.pullRequestId,
+                            [ref]$id) -or $id -ne $lastBoundaryId -or
+                        -not $seen.ContainsKey([string]$id)) {
+                        throw 'mutable-page:keyset-unseen-equal'
+                    }
+                    if ([string]$item.status -cne 'active' -or
+                        $item.isDraft -isnot [bool] -or
+                        [string]$item.targetRef -cnotmatch '^refs/heads/[^~^:?*\[\\]+$' -or
+                        ([string]$item.targetRef).Length -gt 512 -or
+                        $seen[[string]$id].digest -cne (Get-IntakeDigest ([ordered]@{
+                                pullRequestId = $id; status = 'active'
+                                isDraft = [bool]$item.isDraft
+                                targetRef = [string]$item.targetRef
+                            }))) {
+                        throw 'mutable-page:keyset-changed-echo'
+                    }
+                    $echo = $true
+                    continue
+                }
+                if ($times.Count -gt 0 -and
+                    $date -gt $times[$times.Count - 1]) {
+                    throw 'mutable-page:keyset-order'
                 }
                 $times.Add($date)
             }
+            if ($echo) {
+                $raw.items = @($raw.items | Select-Object -Skip 1)
+                $raw.count = $raw.items.Count
+                if ($raw.items.Count -eq 0) {
+                    if ($originalCount -ge $request.top) {
+                        throw 'missing-page:keyset-terminal-unproved'
+                    }
+                    # An echo alone is not an empty-page exhaustion proof.
+                    $cursor = $windowTime.AddTicks(-1).UtcDateTime.ToString('o')
+                    $terminalProbe = $true
+                    continue
+                }
+            }
+            if ($shortPage) { throw 'missing-page' }
             $take = [Math]::Min($size, $raw.items.Count)
             if ($raw.items.Count -gt $size -and
                 $times[$size] -eq $times[$size - 1]) {
@@ -675,7 +731,7 @@ function Get-IntakePass {
             $raw.items = @($raw.items | Select-Object -First $take)
             $raw.count = $take
             $cursor = $times[$take - 1].UtcDateTime.ToString('o')
-            $shortPage = $times.Count -lt ($size + 1)
+            $shortPage = ($originalCount - [int]$echo) -le $size
             if ($seen.Count + $take -gt [int]$Config.limits.maxPullRequests) {
                 throw 'pr-budget'
             }
@@ -705,11 +761,14 @@ function Get-IntakePass {
             $key = [string]$id
             $digest = Get-IntakeDigest $value
             if ($seen.ContainsKey($key)) {
-                if ($keyset) { throw 'mutable-page' }
+                if ($keyset) { throw 'mutable-page:keyset-duplicate' }
                 $duplicates++
                 if ($seen[$key].digest -cne $digest) { throw 'mutable-page' }
             }
             else { $seen[$key] = @{ digest = $digest; value = $value } }
+        }
+        if ($keyset) {
+            $lastBoundaryId = [int]$raw.items[$raw.items.Count - 1].pullRequestId
         }
         if ($seen.Count -gt [int]$Config.limits.maxPullRequests) { throw 'pr-budget' }
         if ($keyset) { continue }
@@ -1762,6 +1821,14 @@ function Invoke-ActivePrIntake {
             if ($deferred -and $reason -ceq 'read-throttled') {
                 throw
             }
+            $detail = $null
+            if ($reason -cmatch '^mutable-page:(keyset-(?:invalid-date|newer|unseen-equal|changed-echo|order|duplicate))$') {
+                $detail = $Matches[1]
+                $reason = 'mutable-page'
+            } elseif ($reason -ceq 'missing-page:keyset-terminal-unproved') {
+                $detail = 'keyset-terminal-unproved'
+                $reason = 'missing-page'
+            }
             if ($reason -cnotin @('account-mismatch', 'invalid-page', 'mutable-page',
                     'page-cursor-collision',
                     'canary-not-in-complete-eligible-inventory',
@@ -1771,6 +1838,7 @@ function Invoke-ActivePrIntake {
             $envelope.counts.error = 1
             $envelope.state = 'unknown'
             [void]$reasons.Add($reason)
+            if ($detail) { [void]$reasons.Add($detail) }
         }
         $envelope.reasonCodes = @($reasons)
         if ($envelope.inventory.state -ceq 'unknown') {

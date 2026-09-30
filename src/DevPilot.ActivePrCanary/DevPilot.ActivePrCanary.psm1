@@ -2558,6 +2558,9 @@ function New-CanaryIntakeFailureDiagnostic {
         [Collections.IDictionary]$ProviderCalls, [object]$RegistryReads,
         [Collections.IDictionary]$SourceTelemetry)
     $safeReasons = @('account-mismatch', 'invalid-page', 'mutable-page',
+        'keyset-invalid-date', 'keyset-newer', 'keyset-unseen-equal',
+        'keyset-changed-echo', 'keyset-order', 'keyset-duplicate',
+        'keyset-terminal-unproved',
         'page-cursor-collision', 'canary-not-in-complete-eligible-inventory',
         'missing-page', 'page-budget', 'pr-budget', 'read-budget', 'time-budget',
         'page-inaccessible', 'provider-inaccessible', 'head-drift',

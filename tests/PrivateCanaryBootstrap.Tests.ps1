@@ -656,7 +656,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                     if ($state.wrong -eq 'inaccessible-page') {
                         throw 'private route and account must not escape'
                     }
-                    if ($request.skip -ne 0 -or $request.top -ne 51 -or
+                    if ($request.skip -ne 0 -or $request.top -ne 52 -or
                         [string]$request.maxTime -cnotmatch
                             '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z$') {
                         throw 'unbounded or offset inventory'
@@ -3664,6 +3664,63 @@ Describe 'Coverage-only signed read-only canary' {
                     $_.reason -cne 'not-attempted' -or
                     $_.status -cne 'unknown')
             }).Count | Should -Be 0
+    }
+    It 'signs only after both inclusive-echo passes prove selected coverage heads' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        $inner = $c.provider
+        $rows = $c.state.rows
+        $c.provider = {
+            param($operation, $request)
+            $response = & $inner $operation $request
+            if ($operation -ceq 'ListPage') {
+                $echo = @($rows | Where-Object {
+                        $_.creationDate -ceq $request.maxTime
+                    })
+                if ($echo.Count -eq 1) {
+                    $response.items = @($echo[0]) + @(
+                        $response.items | Select-Object -First ($request.top - 1))
+                    $response.count = $response.items.Count
+                }
+            }
+            return $response
+        }.GetNewClosure()
+        $signed = Invoke-SignedIntakeCase $c
+        $signed.state | Should -Be 'signed-intake-not-evaluated'
+        $signed.selected | Should -Be 2
+        $signed.inventory.active | Should -Be 4
+        $signed.inventory.eligible | Should -Be 2
+        $signed.inventory.pagesFirst | Should -Be 3
+        $signed.inventory.pagesSecond | Should -Be 3
+        $signed.providerWrites | Should -Be 0
+        $signed.writerEligible | Should -BeFalse
+    }
+    It 'does not create signed intake state for a changed boundary echo' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        $inner = $c.provider
+        $rows = $c.state.rows
+        $c.provider = {
+            param($operation, $request)
+            $response = & $inner $operation $request
+            if ($operation -ceq 'ListPage') {
+                $echo = @($rows | Where-Object {
+                        $_.creationDate -ceq $request.maxTime
+                    })
+                if ($echo.Count -eq 1) {
+                    $changed = @{} + $echo[0]
+                    $changed.targetRef = 'refs/heads/other'
+                    $response.items = @($changed) + @($response.items)
+                    $response.count = $response.items.Count
+                }
+            }
+            return $response
+        }.GetNewClosure()
+        $diagnostic = [ref]$null
+        { Invoke-SignedIntakeCase $c $diagnostic } |
+            Should -Throw '*canary-inventory-unknown*'
+        $diagnostic.Value.reasonCodes | Should -Contain 'keyset-changed-echo'
+        $diagnostic.Value.selected[0].inventoryEligible | Should -BeNullOrEmpty
+        $diagnostic.Value.privateIntakePersisted | Should -BeFalse
+        Test-Path -LiteralPath $c.root | Should -BeFalse
     }
     It 'does not promote a legacy marker or a forged config to coverage authority' {
         $c = Get-SignedIntakeCase -Code -CoverageOnly

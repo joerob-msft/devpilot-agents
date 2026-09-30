@@ -26,6 +26,8 @@ BeforeAll {
         $state = @{ rows = $rows; calls = [Collections.Generic.List[string]]::new()
             drift = 0; failPage = 0; failHead = 0
             reorder = $false; duplicate = $false
+            inclusiveMaxTime = $false; mixedExclusive = $false
+            keysetListCalls = 0
             noTotal = $false; listCap = 0
             comments = @(); changeLines = 3; omitEvidence = $false; headVisits = @{}
             sourceContent = $null
@@ -41,14 +43,22 @@ BeforeAll {
                         uniqueName = $config.expectedAccount.uniqueName }
                 }
                 ListPage {
+                    if ($null -ne $config['pagination']) {
+                        $state.keysetListCalls++
+                    }
                     if ($state.failPage -eq $request.skip + 1) { throw 'private provider diagnostic' }
                     $top = if ($state.listCap -gt 0) {
                         [Math]::Min($request.top, $state.listCap)
                     } else { $request.top }
                     if ($null -ne $config['pagination']) {
                         $items = @($state.rows | Where-Object {
-                                [DateTimeOffset]::Parse($_.creationDate) -lt
-                                    [DateTimeOffset]::Parse($request.maxTime)
+                                $date = [DateTimeOffset]::Parse($_.creationDate)
+                                $bound = [DateTimeOffset]::Parse($request.maxTime)
+                                if ($state.inclusiveMaxTime -and
+                                    (-not $state.mixedExclusive -or
+                                        $state.keysetListCalls -le 2)) {
+                                    $date -le $bound
+                                } else { $date -lt $bound }
                             } | Select-Object -First $top)
                     } else {
                         $items = @($state.rows | Select-Object -Skip $request.skip -First $top)
@@ -418,6 +428,146 @@ Describe 'Active PR read-only intake' {
         $e.inventory.cutoffUtc | Should -Match 'Z$'
         $e.counts.deferred | Should -Be 345
         $e.rules[0].evaluated | Should -Be 0
+    }
+    It 'counts each PR once across inclusive boundary echoes and an empty terminal probe' {
+        $c = New-IntakeCase -Count 150 -PageSize 50 -MaxHeads 2
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        $c.state.inclusiveMaxTime = $true
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeTrue
+        $e.inventory.state | Should -Be 'complete'
+        $e.inventory.active | Should -Be 150
+        $e.inventory.nonDraft | Should -Be 150
+        $e.inventory.eligible | Should -Be 150
+        $e.gapCounts.duplicateEntries | Should -Be 0
+        $e.pages.first | Should -Be 5
+        $e.pages.second | Should -Be 5
+        $e.counts.deferred | Should -Be 148
+        $c.state.keysetListCalls | Should -Be 10
+    }
+    It 'preserves complete membership if a later page switches from inclusive to exclusive' {
+        $c = New-IntakeCase -Count 7 -PageSize 2 -MaxHeads 2
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        $c.state.inclusiveMaxTime = $true
+        $c.state.mixedExclusive = $true
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeTrue -Because (
+            'mixed keyset must be complete: ' + ($e.reasonCodes -join ','))
+        $e.inventory.active | Should -Be 7
+        $e.gapCounts.duplicateEntries | Should -Be 0
+    }
+    It 'reserves an echo and lookahead within the maximum provider page cap' {
+        $c = New-IntakeCase -Count 200 -PageSize 200 -MaxHeads 2
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        $c.state.inclusiveMaxTime = $true
+        $inner = $c.provider
+        $state = $c.state
+        $c.provider = {
+            param($op, $request)
+            if ($op -eq 'ListPage' -and $request.top -ne 201) {
+                throw 'page exceeds bounded provider cap'
+            }
+            & $inner $op $request
+        }.GetNewClosure()
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeTrue
+        $e.inventory.active | Should -Be 200
+        $e.gapCounts.duplicateEntries | Should -Be 0
+    }
+    It 'rejects unseen equal-time IDs, changed echoes and newer rows' {
+        foreach ($mode in @('unseen', 'changed', 'newer', 'second-equal')) {
+            $c = New-IntakeCase -Count 7 -PageSize 2
+            $c.config.pagination = @{ mode = 'created-time-keyset' }
+            $c.state.inclusiveMaxTime = $true
+            $inner = $c.provider
+            $state = $c.state
+            $c.provider = {
+                param($op, $request)
+                $response = & $inner $op $request
+                if ($op -eq 'ListPage' -and $request.pass -eq 1 -and
+                    $state.keysetListCalls -eq 2) {
+                    $position = if ($mode -eq 'second-equal') { 1 } else { 0 }
+                    $copy = @{} + $response.items[$position]
+                    switch ($mode) {
+                        unseen { $copy.pullRequestId = 99 }
+                        changed { $copy.targetRef = 'refs/heads/release' }
+                        newer {
+                            $copy.creationDate = [DateTimeOffset]::Parse(
+                                $request.maxTime).AddTicks(1).UtcDateTime.ToString('o')
+                        }
+                        second-equal {
+                            $copy.creationDate = [string]$request.maxTime
+                        }
+                    }
+                    $response.items[$position] = $copy
+                }
+                return $response
+            }.GetNewClosure()
+            $e = Invoke-IntakeCase $c
+            $e.populationKnown | Should -BeFalse -Because $mode
+            $e.inventory.active | Should -BeNullOrEmpty
+            $e.reasonCodes | Should -Contain 'mutable-page'
+            $e.reasonCodes | Should -Contain $(switch ($mode) {
+                    unseen { 'keyset-unseen-equal' }
+                    changed { 'keyset-changed-echo' }
+                    newer { 'keyset-newer' }
+                    second-equal { 'keyset-unseen-equal' }
+                })
+        }
+    }
+    It 'rejects repeated non-boundary IDs and full pages of echoes' {
+        $c = New-IntakeCase -Count 7 -PageSize 2
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        $c.state.inclusiveMaxTime = $true
+        $c.state.rows[4].pullRequestId = 3
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeFalse
+        $e.reasonCodes | Should -Contain 'keyset-duplicate'
+
+        $c = New-IntakeCase -Count 7 -PageSize 2
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        $c.state.inclusiveMaxTime = $true
+        $inner = $c.provider
+        $state = $c.state
+        $c.provider = {
+            param($op, $request)
+            $response = & $inner $op $request
+            if ($op -eq 'ListPage' -and $request.pass -eq 1 -and
+                $state.keysetListCalls -eq 2) {
+                $response.items = @(
+                    1..$request.top | ForEach-Object { @{} + $response.items[0] })
+                $response.count = $response.items.Count
+            }
+            return $response
+        }.GetNewClosure()
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeFalse
+        $e.reasonCodes | Should -Contain 'keyset-unseen-equal'
+    }
+    It 'does not treat a small echo-only page as proof of exhaustion' {
+        $c = New-IntakeCase -Count 4 -PageSize 2
+        $c.config.pagination = @{ mode = 'created-time-keyset' }
+        $c.state.inclusiveMaxTime = $true
+        $inner = $c.provider
+        $state = $c.state
+        $c.provider = {
+            param($op, $request)
+            $response = & $inner $op $request
+            if ($op -eq 'ListPage' -and $request.pass -eq 1 -and
+                $state.keysetListCalls -eq 4) {
+                $response.items = @(@{
+                        pullRequestId = 99; status = 'active'; isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationDate = [DateTimeOffset]::Parse(
+                            $request.maxTime).AddTicks(-1).UtcDateTime.ToString('o') })
+                $response.count = 1
+            }
+            return $response
+        }.GetNewClosure()
+        $e = Invoke-IntakeCase $c
+        $e.populationKnown | Should -BeFalse
+        $e.reasonCodes | Should -Contain 'missing-page'
+        $e.reasonCodes | Should -Contain 'keyset-terminal-unproved'
     }
     It 'fails closed on a keyset boundary tie, duplicate, or split short page' {
         $c = New-IntakeCase -Count 7

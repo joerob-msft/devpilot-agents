@@ -37,6 +37,15 @@ Selected eligibility is unknown until the whole inventory is complete; a
 cleanup failure reports `canary-private-state-cleanup-failed` with the private
 intake root's observed existence (`null` if it cannot be determined).
 
+The two-pass created-time inventory tolerates an inclusive `maxTime` boundary
+only when the first row exactly echoes the preceding page's consumed PR ID
+and its canonical inventory fingerprint. The echo is not counted twice.
+An extra lookahead preserves boundary-tie detection even when a page includes
+an echo; an echo-only short page requires an empty stricter-bound terminal
+probe. Unseen equal-time PRs, changed echoes, newer or unsorted rows, missing
+pages, and conflicting two-pass populations remain incomplete and cannot
+create signed intake state.
+
 HTTP 200 rate-limit remaining/limit/reset budget metadata alone, even when
 remaining is zero, is not a throttle signal; explicit 429/503, `Retry-After`,
 or a positive server-directed rate-limit delay stops the GET-only run.
