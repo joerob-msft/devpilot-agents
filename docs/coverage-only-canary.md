@@ -50,12 +50,22 @@ account, or response body. A selected `method` is `Head`, `Changes`, or
 `Discussions` only when a failed bound provider call for that selected PR was
 observed; its `stage` is then `provider-call`. Otherwise both are `unknown`.
 The transport's `completedGets` counts accepted bodies/JSON, not HTTP
-response headers; a separate HTTP response-header observer can therefore
-report a larger number without proving a throttle or policy drift. Unknown
-counts remain `null`, not zero. This
+response headers; `responseHeadersCompleted` counts headers separately when
+the bound transport is available. A selected raw Item `byte-budget` can
+include only the observed effective cap, bytes read so far, optional declared
+length, and `headers` or `body-read` phase. A missing Content-Length does not
+establish the full file size. Unknown counts remain `null`, not zero. This
 diagnostic does **not** relax the completeness gate, sign a config, or provide
 finding evidence. Failures from runs before this diagnostic existed cannot be
 attributed to a particular page, head, or throttle retrospectively.
+The coverage-only intake allows at most 512 KiB per source file (up from the
+four-rule intake's 256 KiB); its 2 MiB aggregate source cap, validated blob
+hash and UTF-8 checks, complete project graph, changed-line proof, read/time
+limits, and runner recheck remain mandatory. This finite engineering limit
+does not imply that an unmeasured larger file qualifies: EOF beyond either
+cap or a RAW body disagreeing with its declared length fails closed without
+truncated evidence. The declared-length guard applies to every RAW Item;
+JSON and identity GET ceilings and the legacy four-rule 256 KiB cap are unchanged.
 Coverage source failures retain allowlisted receipt-drift, unproved snapshot
 lineage, changed snapshot document, and merged-master metadata/content
 reason codes instead of flattening

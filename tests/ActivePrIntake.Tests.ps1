@@ -11,7 +11,12 @@ using System.Threading;
 using System.Threading.Tasks;
 public sealed class IntakeSparseDiffHandler : HttpMessageHandler {
     public string Before, After, BeforeId, AfterId;
+    public string ChangedPath;
     public string Project, RootTreeId, RootTree, TestsTreeId, TestsTree;
+    public bool ChunkRaw, CancelRaw, CorruptRaw, EncodedRaw, NonJsonIdentity;
+    public long? DeclaredRawLength;
+    public byte[] RawAfterBytes;
+    public int RawItemCalls;
     protected override Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken) {
         if (request.Method != HttpMethod.Get ||
@@ -32,12 +37,18 @@ public sealed class IntakeSparseDiffHandler : HttpMessageHandler {
             body = "{\"value\":\"33333333-3333-3333-3333-333333333333\"}";
         else if (path.EndsWith("/changes"))
             body = query.Contains("$skip=0")
-                ? "{\"changeEntries\":[{\"changeTrackingId\":1,\"changeType\":\"edit\",\"item\":{\"path\":\"/Tests/Synthetic.cs\",\"objectId\":\"" + AfterId + "\",\"originalObjectId\":\"" + BeforeId + "\"}}],\"nextSkip\":0}"
+                ? "{\"changeEntries\":[{\"changeTrackingId\":1,\"changeType\":\"edit\",\"item\":{\"path\":\"" +
+                    (ChangedPath ?? "/Tests/Synthetic.cs") + "\",\"objectId\":\"" + AfterId +
+                    "\",\"originalObjectId\":\"" + BeforeId + "\"}}],\"nextSkip\":0}"
                 : "{\"changeEntries\":[],\"nextSkip\":0}";
         else if (path.EndsWith("/items")) {
             var project = query.Contains("/Tests/Tests.csproj");
+            if (raw) RawItemCalls++;
+            if (raw && !project && !old && CancelRaw)
+                throw new OperationCanceledException();
             body = raw ? (project ? Project : old ? Before : After)
-                : "{\"path\":\"/Tests/Synthetic.cs\",\"gitObjectType\":\"blob\",\"objectId\":\"" +
+                : "{\"path\":\"" + (ChangedPath ?? "/Tests/Synthetic.cs") +
+                    "\",\"gitObjectType\":\"blob\",\"objectId\":\"" +
                     (old ? BeforeId : AfterId) +
                     "\",\"isFolder\":false,\"contentMetadata\":{\"isBinary\":false,\"encoding\":65001,\"contentType\":\"text/plain\"},\"content\":" +
                     System.Text.Json.JsonSerializer.Serialize(old ? Before : After) + "}";
@@ -47,14 +58,55 @@ public sealed class IntakeSparseDiffHandler : HttpMessageHandler {
         else if (path.EndsWith("/trees/" + RootTreeId)) body = RootTree;
         else if (path.EndsWith("/trees/" + TestsTreeId)) body = TestsTree;
         else throw new InvalidOperationException("unexpected synthetic resource");
+        var bytes = raw && path.EndsWith("/items") &&
+            !query.Contains("/Tests/Tests.csproj") && !old && RawAfterBytes != null
+            ? RawAfterBytes : Encoding.UTF8.GetBytes(body);
+        if (raw && path.EndsWith("/items") &&
+            !query.Contains("/Tests/Tests.csproj") && !old && CorruptRaw)
+            bytes[0] ^= 1;
+        HttpContent content = ChunkRaw && raw
+            ? new StreamContent(new IntakeSyntheticChunkStream(bytes))
+            : new ByteArrayContent(bytes);
+        if (raw && path.EndsWith("/items") &&
+            !query.Contains("/Tests/Tests.csproj") && !old &&
+            DeclaredRawLength.HasValue)
+            content.Headers.ContentLength = DeclaredRawLength.Value;
         var response = new HttpResponseMessage(HttpStatusCode.OK) {
-            Content = new ByteArrayContent(Encoding.UTF8.GetBytes(body))
+            Content = content
         };
         response.Content.Headers.ContentType =
             new System.Net.Http.Headers.MediaTypeHeaderValue(
-                raw ? "application/octet-stream" : "application/json");
+                NonJsonIdentity && path.EndsWith("/connectionData")
+                    ? "text/plain" : raw ? "application/octet-stream" : "application/json");
+        if (EncodedRaw && raw && path.EndsWith("/items") &&
+            !query.Contains("/Tests/Tests.csproj") && !old)
+            response.Content.Headers.ContentEncoding.Add("gzip");
         return Task.FromResult(response);
     }
+}
+public sealed class IntakeSyntheticChunkStream : System.IO.Stream {
+    private readonly byte[] data;
+    private int position;
+    public IntakeSyntheticChunkStream(byte[] bytes) { data = bytes; }
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, int offset, int count) {
+        int n = Math.Min(Math.Min(count, 4096), data.Length - position);
+        if (n > 0) { Array.Copy(data, position, buffer, offset, n); position += n; }
+        return n;
+    }
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count,
+        CancellationToken token) {
+        token.ThrowIfCancellationRequested();
+        return Task.FromResult(Read(buffer, offset, count));
+    }
+    public override long Seek(long offset, System.IO.SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }
 '@
     $template = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') -Raw |
@@ -407,6 +459,65 @@ $answer | ConvertTo-Json -Depth 20 -Compress
                 default { throw 'unexpected raw operation' }
             }
         }.GetNewClosure()
+    }
+    function New-LargeBoundCase {
+        param([int]$FileBytes = 266240,
+            [string]$Path = '/Tests/Synthetic.cs')
+        $t = New-IntakeTransportCase
+        $t.case.config.schemaVersion = 3
+        $t.case.config.principalProof = 'aad-graph-storage-key-alias-free-v2'
+        $t.case.config.expectedAccount.Remove('uniqueName')
+        $t.case.config.pagination = @{ mode = 'created-time-keyset' }
+        $t.case.config.headProof = 'iteration-source-current-target-v1'
+        $t.case.config.projectEvidence.enabled = $true
+        $t.case.config.limits.maxFileBytes = 524288
+        $common = "//" + ('x' * ($FileBytes - 12)) + "`n"
+        $before = "//before`n" + $common
+        $after = "//after!`n" + $common
+        $old = New-TestBlob $Path $before
+        $new = New-TestBlob $Path $after
+        $project = New-TestBlob '/Tests/Tests.csproj' `
+            '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><IsTestProject>true</IsTestProject></PropertyGroup></Project>'
+        $tests = New-TestTree @(
+            @{ relativePath = $Path.Substring('/Tests/'.Length); mode = '100644'
+                gitObjectType = 'blob'; objectId = $new.objectId },
+            @{ relativePath = 'Tests.csproj'; mode = '100644'
+                gitObjectType = 'blob'; objectId = $project.objectId })
+        $rootTree = New-TestTree @(
+            @{ relativePath = 'Tests'; mode = '40000'
+                gitObjectType = 'tree'; objectId = $tests.objectId })
+        $handler = [IntakeSparseDiffHandler]::new()
+        $handler.Before = $before; $handler.After = $after
+        $handler.ChangedPath = $Path
+        $handler.BeforeId = $old.objectId; $handler.AfterId = $new.objectId
+        $handler.Project = $project.content
+        $handler.RootTreeId = $rootTree.objectId
+        $handler.RootTree = $rootTree | ConvertTo-Json -Depth 8 -Compress
+        $handler.TestsTreeId = $tests.objectId
+        $handler.TestsTree = $tests | ConvertTo-Json -Depth 8 -Compress
+        $handler.ChunkRaw = $true
+        return @{
+            case = $t; handler = $handler
+            client = [Net.Http.HttpClient]::new($handler)
+            request = @{
+                pullRequestId = 1; iterationId = 1
+                sourceCommit = $t.fixture.source
+                targetCommit = $t.fixture.target
+                commonCommit = $t.fixture.common
+                remainingReads = 100
+                includeProjectEvidence = $true
+                includeEvaluationFiles = $true
+            }
+        }
+    }
+    function New-LargeBoundProvider {
+        param($Case, [Collections.IDictionary]$Telemetry)
+        $provider = New-ActivePrAzureDevOpsProvider -Config $Case.case.case.config `
+            -BoundClient $Case.client -BearerToken ('s' * 100) `
+            -VerifyReadPrincipal -ExpectedPrincipalName 'service@example.invalid' `
+            -TransportTelemetry $Telemetry
+        & $provider Identity @{} | Out-Null
+        return $provider
     }
 }
 AfterAll {
@@ -1596,6 +1707,190 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
             $removed.addedLines | Should -Be 0
             $removed.deletedLines | Should -Be 1200
         }
+    }
+    It 'accepts fully attested coverage source above the former file cap with bounded RAW reads' {
+        $c = New-LargeBoundCase
+        $meter = @{ attemptedGets = 0; completedGets = 0; throttleEvents = 0 }
+        try {
+            $provider = New-LargeBoundProvider $c $meter
+            $changes = & $provider Changes $c.request
+            $changes.changedFiles | Should -Be 1
+            $changes.changedLines | Should -Be 2
+            $changes.files[0].spans[0].startLine | Should -Be 1
+            $changes.files[0].spans[0].endLine | Should -Be 1
+            $changes.evaluationFiles[0].content |
+                Should -BeExactly $c.handler.After
+            $changes.projectEvidence.complete | Should -BeTrue
+            $changes.projectEvidence.files[0].status | Should -Be 'complete'
+            $c.handler.RawItemCalls | Should -BeGreaterThan 2
+            $meter.attemptedGets | Should -Be $meter.completedGets
+            $meter.responseHeadersCompleted | Should -Be $meter.completedGets
+            $meter.lastByteBudget | Should -BeNullOrEmpty
+        }
+        finally { $c.client.Dispose() }
+    }
+    It 'reads a bounded changed non-C# file without claiming coverage rule scope' {
+        $c = New-LargeBoundCase -FileBytes 307200 `
+            -Path '/Tests/Synthetic.txt'
+        try {
+            $provider = New-LargeBoundProvider $c @{
+                attemptedGets = 0; completedGets = 0; throttleEvents = 0 }
+            $changes = & $provider Changes $c.request
+            $changes.changedFiles | Should -Be 1
+            $changes.changedLines | Should -Be 2
+            $changes.evaluationFiles[0].path |
+                Should -BeExactly '/Tests/Synthetic.txt'
+            $changes.evaluationFiles[0].content |
+                Should -BeExactly $c.handler.After
+            $changes.projectEvidence.files.Count | Should -Be 0
+            $c.handler.RawItemCalls | Should -Be 2
+        }
+        finally { $c.client.Dispose() }
+    }
+    It 'enforces exact file, streamed, declared and aggregate RAW byte limits' {
+        foreach ($scenario in @('exact', 'one-over', 'declared-over',
+                'aggregate', 'legacy')) {
+            $size = if ($scenario -in @('exact', 'one-over')) {
+                524288 + $(if ($scenario -eq 'one-over') { 1 } else { 0 })
+            } else { 266240 }
+            $c = New-LargeBoundCase -FileBytes $size
+            if ($scenario -eq 'one-over') {
+                [Text.Encoding]::UTF8.GetByteCount($c.handler.After) |
+                    Should -Be 524289
+            }
+            $meter = @{ attemptedGets = 0; completedGets = 0
+                throttleEvents = 0 }
+            try {
+                switch ($scenario) {
+                    'declared-over' { $c.handler.DeclaredRawLength = 524289 }
+                    aggregate { $c.case.case.config.limits.maxTotalBytes = $size + 1 }
+                    legacy { $c.case.case.config.limits.maxFileBytes = 262144 }
+                }
+                $provider = New-LargeBoundProvider $c $meter
+                if ($scenario -eq 'exact') {
+                    $changes = & $provider Changes $c.request
+                    $changes.projectEvidence.complete | Should -BeTrue
+                    $changes.evaluationFiles[0].content |
+                        Should -BeExactly $c.handler.After
+                    $meter.lastByteBudget | Should -BeNullOrEmpty
+                    continue
+                }
+                { & $provider Changes $c.request } |
+                    Should -Throw 'byte-budget' -Because "synthetic $scenario must reject"
+                $meter.lastByteBudget.endpointKind | Should -Be 'items'
+                $expectedCap = switch ($scenario) {
+                    aggregate { 1 }
+                    legacy { 262144 }
+                    default { 524288 }
+                }
+                $meter.lastByteBudget.effectiveCapBytes | Should -Be $expectedCap
+                $expectedDeclared = if ($scenario -eq 'declared-over') {
+                    524289
+                } else { $null }
+                $meter.lastByteBudget.declaredBytes | Should -Be $expectedDeclared
+                $expectedPhase = if ($scenario -eq 'declared-over') {
+                    'headers'
+                } else { 'body-read' }
+                $meter.lastByteBudget.phase | Should -Be $expectedPhase
+                if ($scenario -eq 'declared-over') {
+                    $meter.lastByteBudget.bytesRead | Should -Be 0
+                } elseif ($scenario -eq 'aggregate') {
+                    $meter.lastByteBudget.bytesRead | Should -Be 4096
+                } else {
+                    $meter.lastByteBudget.bytesRead |
+                        Should -BeGreaterThan $expectedCap
+                }
+                if ($scenario -ne 'declared-over') {
+                    $meter.lastByteBudget.bytesRead |
+                        Should -BeGreaterThan $meter.lastByteBudget.effectiveCapBytes
+                }
+                $meter.responseHeadersCompleted |
+                    Should -Be ($meter.completedGets + 1)
+            }
+            finally { $c.client.Dispose() }
+        }
+    }
+    It 'rejects a declared RAW length inconsistent with the bounded full body' {
+        $c = New-LargeBoundCase
+        $c.handler.DeclaredRawLength = 266239
+        $meter = @{ attemptedGets = 0; completedGets = 0
+            throttleEvents = 0 }
+        try {
+            $provider = New-LargeBoundProvider $c $meter
+            { & $provider Changes $c.request } |
+                Should -Throw 'read-inaccessible'
+            $meter.responseHeadersCompleted |
+                Should -Be ($meter.completedGets + 1)
+            $meter.lastByteBudget | Should -BeNullOrEmpty
+        }
+        finally { $c.client.Dispose() }
+    }
+    It 'rejects cancelled, encoded, hash-mismatched and non-UTF8 raw source' {
+        foreach ($scenario in @('cancel', 'encoded', 'hash', 'utf8')) {
+            $c = New-LargeBoundCase
+            $meter = @{ attemptedGets = 0; completedGets = 0
+                throttleEvents = 0 }
+            try {
+                switch ($scenario) {
+                    cancel { $c.handler.CancelRaw = $true }
+                    encoded { $c.handler.EncodedRaw = $true }
+                    hash { $c.handler.CorruptRaw = $true }
+                    utf8 {
+                        $bytes = [Text.Encoding]::UTF8.GetBytes($c.handler.After)
+                        $bytes[0] = 255
+                        $c.handler.RawAfterBytes = $bytes
+                        $header = [Text.Encoding]::ASCII.GetBytes(
+                            "blob $($bytes.Length)`0")
+                        $c.handler.AfterId = [Convert]::ToHexString(
+                            [Security.Cryptography.SHA1]::HashData(
+                                [byte[]]($header + $bytes))).ToLowerInvariant()
+                    }
+                }
+                $provider = New-LargeBoundProvider $c $meter
+                $expectedFailure = switch ($scenario) {
+                    cancel { 'time-budget' }
+                    encoded { 'read-inaccessible' }
+                    hash { 'invalid-item' }
+                    utf8 { 'unsupported-change' }
+                }
+                { & $provider Changes $c.request } |
+                    Should -Throw $expectedFailure
+                $meter.responseHeadersCompleted | Should -Be (
+                    $meter.completedGets +
+                    $(if ($scenario -eq 'encoded') { 1 } else { 0 }))
+                $meter.lastByteBudget | Should -BeNullOrEmpty
+            }
+            finally { $c.client.Dispose() }
+        }
+    }
+    It 'retains JSON content and byte limits independently of the RAW item ceiling' {
+        $c = New-LargeBoundCase
+        try {
+            $c.handler.NonJsonIdentity = $true
+            $provider = New-ActivePrAzureDevOpsProvider -Config $c.case.case.config `
+                -BoundClient $c.client -BearerToken ('s' * 100) `
+                -VerifyReadPrincipal -ExpectedPrincipalName 'service@example.invalid'
+            { & $provider Identity @{} } | Should -Throw 'read-inaccessible'
+        }
+        finally { $c.client.Dispose() }
+        $c = New-LargeBoundCase
+        try {
+            $telemetry = @{ attemptedGets = 0; completedGets = 0 }
+            & (Get-Module DevPilot.ActivePrIntake) {
+                param($Client, $TransportTelemetry)
+                { Invoke-IntakeBearerGet $Client ('s' * 100) `
+                    'https://dev.azure.com/example-org/_apis/connectionData?api-version=7.1' `
+                    ([DateTime]::UtcNow.AddSeconds(30)) 64 `
+                    -TransportTelemetry $TransportTelemetry } |
+                    Should -Throw 'byte-budget'
+            } $c.client $telemetry
+            $telemetry.lastByteBudget.endpointKind | Should -Be 'json'
+            $telemetry.lastByteBudget.phase | Should -Be 'headers'
+            $telemetry.lastByteBudget.effectiveCapBytes | Should -Be 64
+            $telemetry.responseHeadersCompleted | Should -Be 1
+            $telemetry.completedGets | Should -Be 0
+        }
+        finally { $c.client.Dispose() }
     }
     It 'verifies a sparse edit above the old matrix limit through the coverage-only provider' {
         $t = New-IntakeTransportCase

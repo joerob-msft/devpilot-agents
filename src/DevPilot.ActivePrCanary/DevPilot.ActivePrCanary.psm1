@@ -2650,6 +2650,11 @@ function New-CanaryIntakeFailureDiagnostic {
                     'Discussions')) {
                 [string]$ProviderCalls['failedMethods'][$id]
             } else { 'unknown' }
+            $byteBudget = if ($head -and $head.reason -ceq 'byte-budget' -and
+                $ProviderCalls['byteBudgets'] -is [Collections.IDictionary] -and
+                $ProviderCalls['byteBudgets'].Contains($id)) {
+                $ProviderCalls['byteBudgets'][$id]
+            } else { $null }
             [ordered]@{
                 pullRequestId = $id
                 inventoryEligible = if ($inventoryKnown) {
@@ -2668,11 +2673,27 @@ function New-CanaryIntakeFailureDiagnostic {
                 stage = if ($failedMethod -cne 'unknown') {
                     'provider-call'
                 } else { 'unknown' }
-                limitKind = if ($head -and
+                limitKind = if ($byteBudget) {
+                    'raw-item-byte-cap'
+                } elseif ($head -and
                     $head.reason -ceq 'diff-budget') {
                     'maxDiffCells'
                 } else { $null }
-                limitCount = $null
+                limitCount = if ($byteBudget) {
+                    [int]$byteBudget.effectiveCapBytes
+                } else { $null }
+                bytesRead = if ($byteBudget) {
+                    [long]$byteBudget.bytesRead
+                } else { $null }
+                declaredBytes = if ($byteBudget) {
+                    $byteBudget.declaredBytes
+                } else { $null }
+                endpointKind = if ($byteBudget) {
+                    'items'
+                } else { $null }
+                bodyPhase = if ($byteBudget) {
+                    [string]$byteBudget.phase
+                } else { 'unknown' }
             }
         })
     if ($Cohort) {
@@ -2723,6 +2744,9 @@ function New-CanaryIntakeFailureDiagnostic {
             } else { $null }
             completedGets = if ($TransportTelemetry) {
                 [int]$TransportTelemetry.completedGets
+            } else { $null }
+            responseHeadersCompleted = if ($TransportTelemetry) {
+                [int]$TransportTelemetry['responseHeadersCompleted']
             } else { $null }
             sourceRegistryCompletedGets = $RegistryReads
             sourceAttemptedGets = if ($SourceTelemetry) {
@@ -2837,7 +2861,7 @@ function Invoke-PrivateCanarySignedIntake {
     $registry = $null
     $gate = @{ pins = $null; finalRegistry = $null; cohort = $null }
     $providerCalls = @{ attempted = 0; completed = 0; failureCode = $null
-        failedMethods = @{} }
+        failedMethods = @{}; byteBudgets = @{} }
     $transportTelemetry = $null
     $sourceTelemetry = $null
     try {
@@ -2883,6 +2907,7 @@ function Invoke-PrivateCanarySignedIntake {
     $intake.pagination = [ordered]@{ mode = 'created-time-keyset' }
     if ($Mode -ceq 'CoverageOnly') {
         $intake.headProof = 'iteration-source-current-target-v1'
+        $intake.limits.maxFileBytes = 524288
     }
     $intake.projectEvidence.enabled = $true
     $intake.rules = @($registry.rules.Keys | ForEach-Object {
@@ -2903,6 +2928,9 @@ function Invoke-PrivateCanarySignedIntake {
     $Provider = {
         param($operation, $request)
         $providerCalls.attempted++
+        $startTransportGets = if ($transportTelemetry) {
+            [int]$transportTelemetry.attemptedGets
+        } else { $null }
         try {
             $answer = & $innerProvider $operation $request
             $providerCalls.completed++
@@ -2917,6 +2945,24 @@ function Invoke-PrivateCanarySignedIntake {
                     [ref]$selectedId) -and
                 $selectedId -in $CanaryPullRequestIds) {
                 $providerCalls.failedMethods[$selectedId] = $operation
+                $budget = if ($transportTelemetry) {
+                    $transportTelemetry['lastByteBudget']
+                } else { $null }
+                if ($_.Exception.Message -ceq 'byte-budget' -and
+                    $operation -ceq 'Changes' -and
+                    $budget -is [Collections.IDictionary] -and
+                    $budget.endpointKind -ceq 'items' -and
+                    $budget.phase -cin @('headers', 'body-read') -and
+                    $budget.attemptIndex -gt $startTransportGets -and
+                    $budget.effectiveCapBytes -ge 1 -and
+                    $budget.effectiveCapBytes -le 1048576) {
+                    $providerCalls.byteBudgets[$selectedId] = [ordered]@{
+                        effectiveCapBytes = [int]$budget.effectiveCapBytes
+                        bytesRead = [long]$budget.bytesRead
+                        declaredBytes = $budget.declaredBytes
+                        phase = [string]$budget.phase
+                    }
+                }
             }
             if ($_.Exception.Message -ceq 'read-throttled') {
                 $providerCalls.failureCode = 'read-throttled'

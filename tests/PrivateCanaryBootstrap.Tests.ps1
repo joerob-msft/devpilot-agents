@@ -2108,6 +2108,7 @@ Describe 'Read-only private canary input bootstrap' {
                     Join-Path $c.root 'canary-intake.json') -Raw |
                     ConvertFrom-Json -AsHashtable
                 $intake.schemaVersion | Should -Be 3
+                $intake.limits.maxFileBytes | Should -Be 262144
                 (Invoke-RunnerCase $c).providerWrites | Should -Be 0
             }
             It 'refuses split inventory, stale heads, fake graph and forged receipt before signing' {
@@ -2330,6 +2331,53 @@ Describe 'Read-only private canary input bootstrap' {
                     Should -Be ($d.provider.completedCalls + 2)
                 $d.privateIntakePersisted | Should -BeFalse
                 Test-Path -LiteralPath $c.root | Should -BeFalse
+            }
+            It 'reports only bound observed byte-budget counts without inventing full file size' {
+                $cohort = @{
+                    inventory = @{ state = 'complete'; active = 2
+                        nonDraft = 2; draft = 0; eligible = 2
+                        excludedOtherTargets = 0 }
+                    populationKnown = $true
+                    gapCounts = @{ enumerationUnknown = 0
+                        duplicateEntries = 0; drift = 0 }
+                    reasonCodes = @()
+                    heads = @(
+                        @{ pullRequestId = 101; status = 'unknown'
+                            targetRef = 'refs/heads/master'
+                            reason = 'byte-budget' },
+                        @{ pullRequestId = 202; status = 'pending'
+                            targetRef = 'refs/heads/master'
+                            reason = 'rules-incomplete' })
+                    pages = @{ first = 1; second = 1 }
+                    readCount = 9
+                }
+                $d = & (Get-Module DevPilot.ActivePrCanary) {
+                    param($Cohort)
+                    New-CanaryIntakeFailureDiagnostic $Cohort `
+                        @(101, 202) `
+                        @{ attemptedGets = 5; completedGets = 4
+                            responseHeadersCompleted = 5; throttleEvents = 0
+                            lastHttpStatus = $null } `
+                        @{ attempted = 2; completed = 1
+                            failedMethods = @{ 101 = 'Changes' }
+                            byteBudgets = @{ 101 = @{
+                                    effectiveCapBytes = 262144
+                                    bytesRead = 270336; declaredBytes = $null
+                                    phase = 'body-read' } } } $null $null
+                } $cohort
+                $d.selected[0].reason | Should -Be 'byte-budget'
+                $d.selected[0].limitKind | Should -Be 'raw-item-byte-cap'
+                $d.selected[0].limitCount | Should -Be 262144
+                $d.selected[0].bytesRead | Should -Be 270336
+                $d.selected[0].declaredBytes | Should -BeNullOrEmpty
+                $d.selected[0].bodyPhase | Should -Be 'body-read'
+                $d.selected[0].endpointKind | Should -Be 'items'
+                $d.selected[1].limitKind | Should -BeNullOrEmpty
+                $d.selected[1].bytesRead | Should -BeNullOrEmpty
+                $d.provider.completedGets | Should -Be 4
+                $d.provider.responseHeadersCompleted | Should -Be 5
+                $d.throttleState | Should -Be 'unknown'
+                $d.privateIntakePersisted | Should -BeNullOrEmpty
             }
             It 'distinguishes inventory duplicates and cardinality without assuming eligibility' {
                 $cohort = @{
@@ -4031,6 +4079,39 @@ Describe 'Coverage-only signed read-only canary' {
                 }).Count | Should -Be 0
         }
     }
+    It 'rechecks a larger bounded coverage source in the actual signed runner' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        $c.state.content += '// ' + ('x' * 266240) + "`n"
+        $c.state.lines = 4
+        $bytes = [Text.Encoding]::UTF8.GetBytes($c.state.content)
+        $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+        $c.state.objectId = [Convert]::ToHexString(
+            [Security.Cryptography.SHA1]::HashData(
+                [byte[]]($header + $bytes))).ToLowerInvariant()
+        $signed = Invoke-SignedIntakeCase $c
+        $signed.signed | Should -BeTrue
+        $result = Invoke-RunnerCase $c
+        $result.selected | Should -Be 2
+        $result.writerEligible | Should -BeFalse
+        $result.providerWrites | Should -Be 0
+        @($result.rules | Where-Object {
+                $_.capabilityId -in @('bpm-test-ownership@1',
+                    'bpm-named-areequal-arguments@1') -and
+                $_.reason -cne 'not-attempted'
+            }).Count | Should -Be 0
+
+        $oversized = Get-SignedIntakeCase -Code -CoverageOnly
+        $oversized.state.content += '// ' + ('y' * 524288) + "`n"
+        $oversized.state.lines = 4
+        $bytes = [Text.Encoding]::UTF8.GetBytes($oversized.state.content)
+        $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+        $oversized.state.objectId = [Convert]::ToHexString(
+            [Security.Cryptography.SHA1]::HashData(
+                [byte[]]($header + $bytes))).ToLowerInvariant()
+        (Invoke-SignedIntakeCase $oversized).signed | Should -BeTrue
+        { Invoke-RunnerCase $oversized } |
+            Should -Throw '*canary-source-unverified*'
+    }
     It 'signs advanced source master separately and rejects changes before private state' {
         $c = Get-SignedIntakeCase -Code -CoverageOnly
         $c.input.case.state.master = 'f' * 40
@@ -4041,6 +4122,11 @@ Describe 'Coverage-only signed read-only canary' {
             ConvertFrom-Json -AsHashtable
         $config.schemaVersion | Should -Be 8
         $config.sourceMasterCommit | Should -Be ('f' * 40)
+        $intakeConfig = Get-Content -LiteralPath (
+            Join-Path $c.root 'canary-intake.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $intakeConfig.limits.maxFileBytes | Should -Be 524288
+        $intakeConfig.limits.maxTotalBytes | Should -Be 2097152
         $c.input.sources.rules['bpm-test-class-coverage@2'].masterCommit |
             Should -Be ('e' * 40)
         (Invoke-RunnerCase $c).selected | Should -Be 2

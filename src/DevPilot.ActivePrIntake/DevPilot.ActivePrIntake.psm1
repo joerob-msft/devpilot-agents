@@ -46,11 +46,18 @@ function Invoke-IntakeBearerGet {
     $remaining = [Math]::Max(1, [int]($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
     $cancel = [Threading.CancellationTokenSource]::new($remaining)
     try {
-        if ($TransportTelemetry) { $TransportTelemetry.attemptedGets++ }
+        if ($TransportTelemetry) {
+            $TransportTelemetry['lastByteBudget'] = $null
+            $TransportTelemetry.attemptedGets++
+        }
         $response = $Client.SendAsync($request,
             [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
             $cancel.Token).GetAwaiter().GetResult()
         try {
+            if ($TransportTelemetry) {
+                $TransportTelemetry['responseHeadersCompleted'] =
+                    [int]$TransportTelemetry['responseHeadersCompleted'] + 1
+            }
             $status = [int]$response.StatusCode
             $delayed = @($response.Headers | Where-Object {
                 $_.Key -match '(?i)^x-(?:ms-|vss-)?ratelimit-delay$' -and
@@ -77,6 +84,16 @@ function Invoke-IntakeBearerGet {
             }
             if ($null -ne $response.Content.Headers.ContentLength -and
                 $response.Content.Headers.ContentLength -gt $MaxBytes) {
+                if ($TransportTelemetry) {
+                    $TransportTelemetry['lastByteBudget'] = [ordered]@{
+                        attemptIndex = [int]$TransportTelemetry.attemptedGets
+                        endpointKind = if ($Raw) { 'items' } else { 'json' }
+                        phase = 'headers'
+                        effectiveCapBytes = $MaxBytes
+                        bytesRead = 0
+                        declaredBytes = [long]$response.Content.Headers.ContentLength
+                    }
+                }
                 throw 'byte-budget'
             }
             $media = if ($response.Content.Headers.ContentType) {
@@ -93,8 +110,27 @@ function Invoke-IntakeBearerGet {
             try {
                 while (($n = $stream.ReadAsync($buffer, 0, $buffer.Length,
                             $cancel.Token).GetAwaiter().GetResult()) -gt 0) {
-                    if ($output.Length + $n -gt $MaxBytes) { throw 'byte-budget' }
+                    if ($output.Length + $n -gt $MaxBytes) {
+                        if ($TransportTelemetry) {
+                            $TransportTelemetry['lastByteBudget'] = [ordered]@{
+                                attemptIndex = [int]$TransportTelemetry.attemptedGets
+                                endpointKind = if ($Raw) { 'items' } else { 'json' }
+                                phase = 'body-read'
+                                effectiveCapBytes = $MaxBytes
+                                bytesRead = [long]($output.Length + $n)
+                                declaredBytes = if ($null -ne
+                                    $response.Content.Headers.ContentLength) {
+                                    [long]$response.Content.Headers.ContentLength
+                                } else { $null }
+                            }
+                        }
+                        throw 'byte-budget'
+                    }
                     $output.Write($buffer, 0, $n)
+                }
+                if ($Raw -and $null -ne $response.Content.Headers.ContentLength -and
+                    $output.Length -ne $response.Content.Headers.ContentLength) {
+                    throw 'read-inaccessible'
                 }
                 $bytes = $output.ToArray()
             }
