@@ -167,6 +167,7 @@ BeforeAll {
             items = @{}; trees = @{}; rootTreeId = $null
             threadResponse = $null
             drift = $false; refDrift = $false; rawIdentityMismatch = $false
+            historicSource = $null; historicTarget = $null
         }
         $fixturePath = Join-Path $case.root 'fixture.json'
         $log = Join-Path $case.root 'requests.log'
@@ -195,6 +196,12 @@ switch ($resource) {
             sourceRefName = 'refs/heads/feature'; targetRefName = 'refs/heads/master'
             repository = @{ id = '11111111-1111-1111-1111-111111111111'
                 project = @{ id = '22222222-2222-2222-2222-222222222222' } } }
+        if ($fixture.historicSource) {
+            $pr.lastMergeSourceCommit = @{ commitId = $fixture.historicSource }
+        }
+        if ($fixture.historicTarget) {
+            $pr.lastMergeTargetCommit = @{ commitId = $fixture.historicTarget }
+        }
         $answer = if ($route.Count) { $pr } else {
             $pageSkip = @($argv | Where-Object { $_ -like '$skip=*' })
             if ($pageSkip.Count -ne 1) { throw 'missing PR page offset' }
@@ -1348,6 +1355,14 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
         $e.heads[0].lineEvidence | Should -BeNullOrEmpty
         $t = New-IntakeTransportCase
         $t.fixture.refDrift = $true
+        $e = Invoke-TransportCase $t
+        $e.heads[0].reasonCode | Should -Be 'head-inconsistent'
+        $e.heads[0].lineEvidence | Should -BeNullOrEmpty
+    }
+    It 'retains the legacy four-rule historical-head gate' {
+        $t = New-IntakeTransportCase
+        $t.fixture.historicSource = 'e' * 40
+        $t.fixture.historicTarget = 'f' * 40
         $e = Invoke-TransportCase $t
         $e.heads[0].reasonCode | Should -Be 'head-inconsistent'
         $e.heads[0].lineEvidence | Should -BeNullOrEmpty

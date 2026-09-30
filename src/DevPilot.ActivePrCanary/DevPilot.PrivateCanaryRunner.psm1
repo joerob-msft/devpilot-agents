@@ -67,11 +67,14 @@ function Assert-PrivateCanaryConfig {
     $expectedRules = if ($coverage) {
         @('bpm-test-class-coverage@2', 'bpm-redundant-method-coverage@2')
     } else { $script:CanaryRules }
-    if ($Config.schemaVersion -ne $(if ($coverage) { 6 } else { 5 }) -or
+    if ($Config.schemaVersion -ne $(if ($coverage) { 7 } else { 5 }) -or
         $Config.kind -cne $(if ($coverage) {
                 'private-coverage-only-signed-intake'
             } else { 'private-canary-signed-intake' }) -or
         ($coverage -and $Config.mode -cne 'coverage-only') -or
+        ($coverage -and
+            ($Config.headProof -cne 'iteration-source-current-target-v1' -or
+                $Intake.headProof -cne $Config.headProof)) -or
         (-not $coverage -and $Config.Contains('mode')) -or
         $Config.principalProof -cne 'aad-graph-storage-key-alias-free-v2' -or
         $Intake.schemaVersion -ne 3 -or
@@ -164,13 +167,20 @@ function Assert-PrivateCanaryConfig {
 }
 
 function Assert-PrivateCanaryHead {
-    param([Collections.IDictionary]$Actual, [Collections.IDictionary]$Expected)
+    param([Collections.IDictionary]$Actual, [Collections.IDictionary]$Expected,
+        [switch]$RequireCurrentTarget)
     foreach ($name in @('pullRequestId', 'status', 'isDraft', 'sourceRef',
             'targetRef', 'iterationId', 'repositoryId', 'projectId',
             'sourceCommit', 'targetCommit', 'commonCommit')) {
         if ([string]$Actual[$name] -cne [string]$Expected[$name]) {
             throw 'canary-head-drift'
         }
+    }
+    if ($RequireCurrentTarget -and
+        ([string]$Expected.currentTargetCommit -cnotmatch '^[a-f0-9]{40}$' -or
+            [string]$Actual.currentTargetCommit -cne
+                [string]$Expected.currentTargetCommit)) {
+        throw 'canary-head-drift'
     }
     if ($Actual.status -cne 'active' -or $Actual.isDraft -cne $false -or
         $Actual.targetRef -cne 'refs/heads/master') {
@@ -305,12 +315,22 @@ function Invoke-PrivateCanaryEvaluation {
             throw 'canary-head-pin-invalid'
         }
         $head = $matchingHeads[0]
-        foreach ($name in @('sourceCommit', 'targetCommit', 'targetRef',
-                'iterationId', 'declarationDigest', 'lineEvidenceDigest',
-                'projectEvidenceDigest')) {
+        $pinFields = @('sourceCommit', 'targetCommit', 'targetRef',
+            'iterationId', 'declarationDigest', 'lineEvidenceDigest',
+            'projectEvidenceDigest')
+        if ($Mode -ceq 'CoverageOnly') {
+            $pinFields += 'currentTargetCommit'
+        }
+        foreach ($name in $pinFields) {
             if ([string]$pin[$name] -cne [string]$head[$name]) {
                 throw 'canary-head-pin-invalid'
             }
+        }
+        if ($Mode -ceq 'CoverageOnly' -and
+            ([string]$pin.currentTargetCommit -cnotmatch '^[a-f0-9]{40}$' -or
+                [string]$head.declaration.currentTargetCommit -cne
+                    [string]$pin.currentTargetCommit)) {
+            throw 'canary-head-pin-invalid'
         }
         $selected.Add($head)
     }
@@ -363,7 +383,8 @@ function Invoke-PrivateCanaryEvaluation {
     foreach ($head in $selected) {
         $declaration = $head.declaration
         $id = [int]$head.pullRequestId
-        Assert-PrivateCanaryHead (& $readOnly Head @{ pullRequestId = $id }) $declaration
+        Assert-PrivateCanaryHead (& $readOnly Head @{ pullRequestId = $id }) `
+            $declaration -RequireCurrentTarget:($Mode -ceq 'CoverageOnly')
         $changes = & $readOnly Changes @{
             pullRequestId = $id; iterationId = $declaration.iterationId
             sourceCommit = $declaration.sourceCommit
@@ -545,7 +566,8 @@ function Invoke-PrivateCanaryEvaluation {
             (Get-PrivateCanaryDigest $after)) {
             throw 'canary-discussion-drift'
         }
-        Assert-PrivateCanaryHead (& $readOnly Head @{ pullRequestId = $id }) $declaration
+        Assert-PrivateCanaryHead (& $readOnly Head @{ pullRequestId = $id }) `
+            $declaration -RequireCurrentTarget:($Mode -ceq 'CoverageOnly')
         $results.Add([ordered]@{ pullRequestId = $id; rules = @($evaluations.ToArray()) })
     }
     $summaryRules = if ($Mode -ceq 'CoverageOnly') {
@@ -606,7 +628,7 @@ function Invoke-PrivateCanaryEvaluation {
         }
     }
     return [ordered]@{
-        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 6 } else { 5 }
+        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 7 } else { 5 }
         kind = if ($Mode -ceq 'CoverageOnly') {
             'private-coverage-only-read-only-evaluation'
         } else { 'private-canary-read-only-evaluation' }

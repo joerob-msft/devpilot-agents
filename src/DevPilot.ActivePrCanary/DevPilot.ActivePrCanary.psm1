@@ -2564,6 +2564,7 @@ function New-CanaryIntakeFailureDiagnostic {
         'page-cursor-collision', 'canary-not-in-complete-eligible-inventory',
         'missing-page', 'page-budget', 'pr-budget', 'read-budget', 'time-budget',
         'page-inaccessible', 'provider-inaccessible', 'head-drift',
+        'head-inconsistent', 'invalid-head', 'iteration-inaccessible',
         'project-identity-unknown', 'unknown-heads', 'duplicate-list-entries-reconciled')
     $reasons = if ($Cohort) {
         @($Cohort.reasonCodes | Where-Object { $_ -cin $safeReasons } |
@@ -2826,6 +2827,9 @@ function Invoke-PrivateCanarySignedIntake {
     $intake.expectedAccount = $ProviderConfig.expectedAccount
     $intake.enabled = $true
     $intake.pagination = [ordered]@{ mode = 'created-time-keyset' }
+    if ($Mode -ceq 'CoverageOnly') {
+        $intake.headProof = 'iteration-source-current-target-v1'
+    }
     $intake.projectEvidence.enabled = $true
     $intake.rules = @($registry.rules.Keys | ForEach-Object {
             [ordered]@{ id = [string]$_; capability = [string]$_ }
@@ -2893,6 +2897,9 @@ function Invoke-PrivateCanarySignedIntake {
                 if ($heads.Count -ne 1 -or
                     $heads[0].status -cne 'pending' -or
                     $heads[0].targetRef -cne 'refs/heads/master' -or
+                    ($Mode -ceq 'CoverageOnly' -and
+                        [string]$heads[0].currentTargetCommit -cnotmatch
+                            '^[a-f0-9]{40}$') -or
                     $null -eq $heads[0].lineEvidence -or
                     [string]$heads[0].lineEvidenceDigest -cnotmatch '^[a-f0-9]{64}$' -or
                     $null -eq $heads[0].projectEvidence -or
@@ -2900,7 +2907,7 @@ function Invoke-PrivateCanarySignedIntake {
                     [string]$heads[0].projectEvidenceDigest -cnotmatch '^[a-f0-9]{64}$') {
                     throw 'canary-head-or-evidence-unknown'
                 }
-                [ordered]@{
+                $pin = [ordered]@{
                     pullRequestId = $id
                     sourceCommit = $heads[0].sourceCommit
                     targetCommit = $heads[0].targetCommit
@@ -2910,6 +2917,10 @@ function Invoke-PrivateCanarySignedIntake {
                     lineEvidenceDigest = $heads[0].lineEvidenceDigest
                     projectEvidenceDigest = $heads[0].projectEvidenceDigest
                 }
+                if ($Mode -ceq 'CoverageOnly') {
+                    $pin.currentTargetCommit = $heads[0].currentTargetCommit
+                }
+                $pin
             })
         if ($Read) {
             $finalRegistry = New-VerifiedCanaryRuleRegistry @registryArgs
@@ -2943,7 +2954,7 @@ function Invoke-PrivateCanarySignedIntake {
     $pins = $gate.pins
     $finalRegistry = $gate.finalRegistry
     $config = [ordered]@{
-        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 6 } else { 5 }
+        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 7 } else { 5 }
         kind = if ($Mode -ceq 'CoverageOnly') {
             'private-coverage-only-signed-intake'
         } else { 'private-canary-signed-intake' }
@@ -2987,7 +2998,10 @@ function Invoke-PrivateCanarySignedIntake {
         }
         signature = ''
     }
-    if ($Mode -ceq 'CoverageOnly') { $config.mode = 'coverage-only' }
+    if ($Mode -ceq 'CoverageOnly') {
+        $config.mode = 'coverage-only'
+        $config.headProof = 'iteration-source-current-target-v1'
+    }
     $key = [Convert]::ToBase64String(
         [Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
     $config.signature = Get-CanarySignature $config $key

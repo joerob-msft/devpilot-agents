@@ -14,13 +14,15 @@ line hash. The registry (`schemaVersion: 6`) independently rechecks the
 private source-only pin against the current master ref, ancestry, raw
 Git blob, full document, and both declarations, as well as the current
 same-bearer ConnectionData, Graph user/principal name, and Graph storage key.
-The signed intake config (`schemaVersion: 6`,
+The signed intake config (`schemaVersion: 7`,
 `private-coverage-only-signed-intake`) binds mode `coverage-only`, exactly
 those two IDs and digests, selected head/iteration, changed lines, complete
 test-project graph, and immutable two-pass inventory generation. Legacy
-four-rule receipts/configs are not interchangeable. Source, identity, and
-selected graph/head proofs complete **before** creating a new private intake
-root, lock, key, or generation.
+four-rule receipts/configs are not interchangeable. Earlier coverage-only
+signed configs without the distinct live target binding are rejected rather
+than upgraded in place; the accepted source receipt and private pin remain
+unchanged. Source, identity, and selected graph/head proofs complete
+**before** creating a new private intake root, lock, key, or generation.
 
 If signed intake cannot prove a complete inventory or selected head, it still
 exits with an error and creates no intake root. Its failure output contains a
@@ -45,6 +47,19 @@ an echo; an echo-only short page requires an empty stricter-bound terminal
 probe. Unseen equal-time PRs, changed echoes, newer or unsorted rows, missing
 pages, and conflicting two-pass populations remain incomplete and cannot
 create signed intake state.
+
+The PR's `lastMergeSourceCommit` and `lastMergeTargetCommit` describe heads
+at the last merge attempt, not necessarily the newest iteration. In
+coverage-only mode, `sourceCommit` is the newest iteration's source commit
+and must match the exact live source ref. The historical iteration
+`targetCommit` and `commonCommit` retain their changed-line and discussion
+baseline meaning. The distinct `currentTargetCommit` records the validated
+live target ref (which can have advanced since the iteration), is bound to
+the declaration digest and signed selected pin, and must remain unchanged
+through both intake and evaluation final-head checks. Missing, shifted,
+retargeted, or ambiguous refs remain unknown before any signed state.
+Per-selected-head diagnostic reasons distinguish inconsistent heads from
+transport failure without exposing refs or commits.
 
 HTTP 200 rate-limit remaining/limit/reset budget metadata alone, even when
 remaining is zero, is not a throttle signal; explicit 429/503, `Retry-After`,

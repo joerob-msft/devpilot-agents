@@ -269,6 +269,11 @@ function Assert-IntakeConfig {
             $Config.pagination.mode -cne 'created-time-keyset')) {
         throw 'Invalid intake pagination mode.'
     }
+    if ($null -ne $Config['headProof'] -and
+        ($Config.headProof -cne 'iteration-source-current-target-v1' -or
+            $Config.schemaVersion -ne 3 -or $null -eq $Config['pagination'])) {
+        throw 'Invalid intake head proof mode.'
+    }
     if ($Config.rules -isnot [array] -or $Config.rules.Count -eq 0 -or
         $Config.rules.Count -gt 32) { throw 'A bounded generic rule registry is required.' }
     if ([int]$Config.limits.maxPullRequests * $Config.rules.Count -gt 20000) {
@@ -802,11 +807,13 @@ function Assert-IntakeHead {
         ([string]$Head.targetRef).Length -gt 512 -or
         [string]$Head.sourceCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
         [string]$Head.targetCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        ($Config['headProof'] -ceq 'iteration-source-current-target-v1' -and
+            [string]$Head.currentTargetCommit -cnotmatch '^[a-fA-F0-9]{40}$') -or
         [string]$Head.commonCommit -cnotmatch '^[a-fA-F0-9]{40}$') {
         throw 'invalid-head'
     }
     [void](Assert-IntakeNumber $Head.iterationId iterationId 1 ([int]::MaxValue))
-    return [ordered]@{
+    $verified = [ordered]@{
         repositoryId = ([string]$Head.repositoryId).ToLowerInvariant()
         projectId = ([string]$Head.projectId).ToLowerInvariant()
         pullRequestId = $Id
@@ -819,6 +826,11 @@ function Assert-IntakeHead {
         status = [string]$Head.status
         isDraft = [bool]$Head.isDraft
     }
+    if ($Config['headProof'] -ceq 'iteration-source-current-target-v1') {
+        $verified.currentTargetCommit =
+            ([string]$Head.currentTargetCommit).ToLowerInvariant()
+    }
+    return $verified
 }
 
 function Get-IntakeDiscussionCounts {
@@ -1851,6 +1863,11 @@ function Invoke-ActivePrIntake {
             $head.targetCommit = if ($head.declaration) {
                 [string]$head.declaration.targetCommit
             } else { $null }
+            if ($Config['headProof'] -ceq 'iteration-source-current-target-v1') {
+                $head.currentTargetCommit = if ($head.declaration) {
+                    [string]$head.declaration.currentTargetCommit
+                } else { $null }
+            }
             $head.iterationId = if ($head.declaration) {
                 [int]$head.declaration.iterationId
             } else { $null }
@@ -2548,6 +2565,8 @@ function New-ActivePrAzureDevOpsProvider {
             }
             Head {
                 $id = [int]$Request.pullRequestId
+                $currentTargetProof =
+                    $Config['headProof'] -ceq 'iteration-source-current-target-v1'
                 if ($null -ne $Request['remainingReads'] -and
                     $Request.remainingReads -lt 4) { throw 'read-budget' }
                 $r = & $invoke 'git' 'pullRequests' @(
@@ -2557,14 +2576,17 @@ function New-ActivePrAzureDevOpsProvider {
                 $list = @($iterations.value)
                 if ($list.Count -eq 0 -or $list.Count -gt 200) { throw 'iteration-inaccessible' }
                 $last = $list | Sort-Object { [int]$_.id } | Select-Object -Last 1
-                if (($null -ne $r['lastMergeSourceCommit'] -and
-                        [string]$r.lastMergeSourceCommit.commitId -ine
-                        [string]$last.sourceRefCommit.commitId) -or
-                    ($null -ne $r['lastMergeTargetCommit'] -and
-                        [string]$r.lastMergeTargetCommit.commitId -ine
-                        [string]$last.targetRefCommit.commitId)) {
+                if (-not $currentTargetProof -and
+                    (($null -ne $r['lastMergeSourceCommit'] -and
+                            [string]$r.lastMergeSourceCommit.commitId -ine
+                            [string]$last.sourceRefCommit.commitId) -or
+                        ($null -ne $r['lastMergeTargetCommit'] -and
+                            [string]$r.lastMergeTargetCommit.commitId -ine
+                            [string]$last.targetRefCommit.commitId))) {
                     throw 'head-inconsistent'
                 }
+                $currentTargetCommit = $null
+                $ordinal = 0
                 foreach ($pair in @(
                         @([string]$r.sourceRefName, [string]$last.sourceRefCommit.commitId),
                         @([string]$r.targetRefName, [string]$last.targetRefCommit.commitId)
@@ -2577,11 +2599,18 @@ function New-ActivePrAzureDevOpsProvider {
                     if ($refs['value'] -isnot [array]) { throw 'head-inconsistent' }
                     $exact = @($refs.value | Where-Object { $_.name -ceq $pair[0] })
                     if ($exact.Count -ne 1 -or
-                        [string]$exact[0].objectId -ine $pair[1]) {
+                        [string]$exact[0].objectId -cnotmatch '^[a-fA-F0-9]{40}$' -or
+                        ($ordinal -eq 0 -or -not $currentTargetProof) -and
+                            [string]$exact[0].objectId -ine $pair[1]) {
                         throw 'head-inconsistent'
                     }
+                    if ($ordinal -eq 1) {
+                        $currentTargetCommit =
+                            ([string]$exact[0].objectId).ToLowerInvariant()
+                    }
+                    $ordinal++
                 }
-                return @{ pullRequestId = $r.pullRequestId
+                $head = @{ pullRequestId = $r.pullRequestId
                     repositoryId = $r.repository.id; projectId = $r.repository.project.id
                     status = $r.status; isDraft = $r.isDraft
                     sourceRef = $r.sourceRefName; targetRef = $r.targetRefName
@@ -2589,6 +2618,10 @@ function New-ActivePrAzureDevOpsProvider {
                     targetCommit = $last.targetRefCommit.commitId
                     commonCommit = $last.commonRefCommit.commitId; iterationId = $last.id
                     readCount = 4 }
+                if ($currentTargetProof) {
+                    $head.currentTargetCommit = $currentTargetCommit
+                }
+                return $head
             }
             Changes {
                 $id = [int]$Request.pullRequestId

@@ -114,6 +114,12 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
     public bool MissingInventory = false;
     public bool TooLarge = false;
     public bool DriftRef = false;
+    public bool HistoricSourceCommit = false;
+    public bool HistoricTargetCommit = false;
+    public bool AdvancedTargetRef = false;
+    public bool MalformedTargetRef = false;
+    public bool WrongRepository = false;
+    public bool Retarget = false;
     public bool GraphEnabled = false;
     public bool CorruptTree = false;
     public bool MissingProject = false;
@@ -153,9 +159,14 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         } else if (path.EndsWith("/pullRequests")) {
             body = "{\"value\":[],\"count\":0}";
         } else if (path.EndsWith("/pullRequests/7")) {
-            body = "{\"pullRequestId\":7,\"status\":\"active\",\"isDraft\":false,\"sourceRefName\":\"refs/heads/feature\",\"targetRefName\":\"refs/heads/master\",\"repository\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"project\":{\"id\":\"22222222-2222-2222-2222-222222222222\"}},\"lastMergeSourceCommit\":{\"commitId\":\"" +
-                new string('a', 40) + "\"},\"lastMergeTargetCommit\":{\"commitId\":\"" +
-                new string('b', 40) + "\"}}";
+            body = "{\"pullRequestId\":7,\"status\":\"active\",\"isDraft\":false,\"sourceRefName\":\"refs/heads/feature\",\"targetRefName\":\"refs/heads/" +
+                (Retarget ? "release" : "master") + "\",\"repository\":{\"id\":\"" +
+                (WrongRepository ? "99999999-9999-9999-9999-999999999999" :
+                    "11111111-1111-1111-1111-111111111111") +
+                "\",\"project\":{\"id\":\"22222222-2222-2222-2222-222222222222\"}},\"lastMergeSourceCommit\":{\"commitId\":\"" +
+                new string(HistoricSourceCommit ? 'd' : 'a', 40) +
+                "\"},\"lastMergeTargetCommit\":{\"commitId\":\"" +
+                new string(HistoricTargetCommit ? 'e' : 'b', 40) + "\"}}";
         } else if (path.EndsWith("/pullRequests/7/iterations")) {
             body = "{\"value\":[{\"id\":1,\"sourceRefCommit\":{\"commitId\":\"" +
                 new string('a', 40) + "\"},\"targetRefCommit\":{\"commitId\":\"" +
@@ -165,7 +176,10 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             var feature = request.RequestUri.Query.Contains("feature");
             body = "{\"value\":[{\"name\":\"refs/heads/" +
                 (feature ? "feature" : "master") + "\",\"objectId\":\"" +
-                new string(DriftRef ? 'f' : (feature ? 'a' : 'b'), 40) + "\"}]}";
+                (MalformedTargetRef && !feature ? "not-a-commit" :
+                    new string(DriftRef ? 'f' :
+                        (feature ? 'a' : (AdvancedTargetRef ? 'e' : 'b')), 40)) +
+                "\"}]}";
         } else if (path.EndsWith("/pullRequests/7/iterations/1/changes")) {
             if (GraphEnabled && !request.RequestUri.Query.Contains("skip=1")) {
                 body = "{\"changeEntries\":[{\"changeTrackingId\":1,\"changeType\":\"add\",\"item\":{\"path\":\"/Tests/Example.cs\",\"objectId\":\"" +
@@ -582,6 +596,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             calls = [Collections.Generic.List[string]]::new()
             wrong = ''
             visits = 0
+            currentTarget = 'd' * 40
             threads = @()
             discussionVisits = 0
             cutoff = $null
@@ -682,16 +697,34 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                     $state.visits++
                     $id = [int]$request.pullRequestId
                     $row = @($state.rows | Where-Object pullRequestId -EQ $id)[0]
-                    return @{ pullRequestId = $id
+                    $head = @{ pullRequestId = $id
                         repositoryId = $config.repository.id
                         projectId = $config.projectId
                         status = 'active'; isDraft = $false
                         sourceRef = 'refs/heads/feature'
-                        targetRef = $row.targetRef
+                        targetRef = if ($state.wrong -eq 'retarget') {
+                            'refs/heads/release'
+                        } else { $row.targetRef }
                         sourceCommit = if ($state.wrong -eq 'stale-head' -and
                             $state.visits -gt 1) { 'f' * 40 } else { 'a' * 40 }
                         targetCommit = 'b' * 40
-                        commonCommit = 'c' * 40; iterationId = 1 }
+                        commonCommit = if ($state.wrong -eq 'iteration-baseline-drift' -and
+                            $state.visits -gt 1) { 'f' * 40 } else { 'c' * 40 }
+                        iterationId = if ($state.wrong -eq 'iteration-baseline-drift' -and
+                            $state.visits -gt 1) { 2 } else { 1 } }
+                    if ($CoverageOnly) {
+                        $head.currentTargetCommit = if (
+                            $state.wrong -eq 'invalid-live-target') {
+                            'not-a-sha'
+                        } elseif (
+                            ($state.wrong -eq 'target-head-drift' -and
+                                $state.visits -gt 1) -or
+                            ($state.wrong -eq 'target-runner-drift' -and
+                                $state.visits -gt 2)) {
+                            'e' * 40
+                        } else { $state.currentTarget }
+                    }
+                    return $head
                 }
                 Changes {
                     if ($state.wrong -eq 'throttle-changes') {
@@ -749,7 +782,9 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                                 status = 'unknown'; attestationDigest = $null })
                     }
                     return @{ changedFiles = 1; changedLines = $state.lines
-                        baseCommit = $request.commonCommit
+                        baseCommit = if ($state.wrong -eq 'baseline-drift') {
+                            'f' * 40
+                        } else { $request.commonCommit }
                         files = @(@{ pathDigest = $digest
                                 originalPathDigest = $null; changeType = 'add'
                                 addedLines = $state.lines; deletedLines = 0
@@ -2206,6 +2241,20 @@ Describe 'Read-only private canary input bootstrap' {
                         $d.failedChecks.Count | Should -BeGreaterThan 0
                     }
                 }
+                $cohort = ConvertFrom-Json -AsHashtable (
+                    ConvertTo-Json $baseline -Depth 10)
+                $cohort.heads[0].status = 'unknown'
+                $cohort.heads[0].reason = 'head-inconsistent'
+                $d = & (Get-Module DevPilot.ActivePrCanary) {
+                    param($Cohort)
+                    New-CanaryIntakeFailureDiagnostic $Cohort `
+                        @(17007699, 17109075) $null `
+                        @{ attempted = 4; completed = 3 } $null $null
+                } $cohort
+                $d.selected[0].inventoryEligible | Should -BeTrue
+                $d.selected[0].headProof | Should -Be 'unknown'
+                $d.selected[0].reason | Should -Be 'head-inconsistent'
+                $d.failedChecks | Should -Contain 'selected-head-or-evidence-unknown'
             }
             It 'reports source drift even when the inventory itself is complete' {
                 $c = Get-SignedIntakeCase -Code -CoverageOnly
@@ -3463,6 +3512,65 @@ Describe 'Read-only private canary input bootstrap' {
             finally { $client.Dispose() }
         }
     }
+    It 'separately binds current target ref and historical iteration target in coverage mode' {
+        $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `
+            -Raw | ConvertFrom-Json -AsHashtable
+        $config.schemaVersion = 3
+        $config.principalProof = 'aad-graph-storage-key-alias-free-v2'
+        $config.expectedAccount = @{ id = '33333333-3333-3333-3333-333333333333'
+            descriptor = 'aad.synthetic' }
+        $config.enabled = $true
+        $config.pagination = @{ mode = 'created-time-keyset' }
+        $config.headProof = 'iteration-source-current-target-v1'
+        foreach ($mode in @('normal-advanced', 'historical-source',
+                'historical-target', 'wrong-source', 'wrong-repository',
+                'malformed-target', 'retarget')) {
+            $handler = [CanaryBoundGetHandler]::new()
+            $handler.AdvancedTargetRef = $true
+            $handler.HistoricSourceCommit = $mode -eq 'historical-source'
+            $handler.HistoricTargetCommit = $mode -eq 'historical-target'
+            $handler.DriftRef = $mode -eq 'wrong-source'
+            $handler.WrongRepository = $mode -eq 'wrong-repository'
+            $handler.MalformedTargetRef = $mode -eq 'malformed-target'
+            $handler.Retarget = $mode -eq 'retarget'
+            $client = [Net.Http.HttpClient]::new($handler)
+            try {
+                $telemetry = [ordered]@{ attemptedGets = 0; completedGets = 0
+                    throttleEvents = 0; lastHttpStatus = $null }
+                $provider = New-ActivePrAzureDevOpsProvider -Config $config `
+                    -BearerToken ('b' * 100) -BoundClient $client `
+                    -VerifyReadPrincipal -ExpectedPrincipalName 'service@example.invalid' `
+                    -TransportTelemetry $telemetry
+                [void](& $provider Identity @{ timeoutMilliseconds = 5000 })
+                if ($mode -in @('wrong-source', 'malformed-target', 'retarget')) {
+                    { & $provider Head @{ pullRequestId = 7
+                            remainingReads = 10; timeoutMilliseconds = 5000 } } |
+                        Should -Throw '*head-inconsistent*'
+                } else {
+                    $head = & $provider Head @{ pullRequestId = 7
+                        remainingReads = 10; timeoutMilliseconds = 5000 }
+                    if ($mode -eq 'wrong-repository') {
+                        { & (Get-Module DevPilot.ActivePrIntake) {
+                                param($Head, $Config)
+                                Assert-IntakeHead $Head 7 $Config
+                            } $head $config } | Should -Throw '*invalid-head*'
+                    } else {
+                        $verified = & (Get-Module DevPilot.ActivePrIntake) {
+                            param($Head, $Config)
+                            Assert-IntakeHead $Head 7 $Config
+                        } $head $config
+                        $verified.sourceCommit | Should -Be ('a' * 40)
+                        $verified.targetCommit | Should -Be ('b' * 40)
+                        $verified.commonCommit | Should -Be ('c' * 40)
+                        $verified.currentTargetCommit | Should -Be ('e' * 40)
+                        $handler.Paths.Count | Should -Be 7
+                        $telemetry.completedGets | Should -Be 7
+                    }
+                }
+            }
+            finally { $client.Dispose() }
+        }
+    }
     It 'counts actual bound GET attempts and surfaces only safe throttle or HTTP status' {
         $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `
             -Raw | ConvertFrom-Json -AsHashtable
@@ -3643,13 +3751,17 @@ Describe 'Coverage-only signed read-only canary' {
         $result.rules.Count | Should -Be 4
         $config = Get-Content (Join-Path $c.root 'canary-dispatcher.json') -Raw |
             ConvertFrom-Json -AsHashtable
-        $config.schemaVersion | Should -Be 6
+        $config.schemaVersion | Should -Be 7
         $config.mode | Should -Be 'coverage-only'
+        $config.headProof | Should -Be 'iteration-source-current-target-v1'
+        $config.heads[0].currentTargetCommit | Should -Be ('d' * 40)
+        $config.heads[0].targetCommit | Should -Be ('b' * 40)
         $config.rules.Count | Should -Be 2
         $config.rules[0].policyLineHash | Should -Match '^v1:sha256:'
         $config.writerEligible | Should -BeFalse
         $evaluated = Invoke-RunnerCase $c
         $evaluated.kind | Should -Be 'private-coverage-only-read-only-evaluation'
+        $evaluated.schemaVersion | Should -Be 7
         $evaluated.modelToolInvocations | Should -Be 0
         $evaluated.providerWrites | Should -Be 0
         $evaluated.writerEligible | Should -BeFalse
@@ -3781,12 +3893,69 @@ Describe 'Coverage-only signed read-only canary' {
     }
     It 'rejects incomplete graph and throttles before state creation' {
         foreach ($failure in @('unknown-project', 'throttle-changes',
-                'split-page', 'stale-head', 'alias-added', 'late-head')) {
+                'split-page', 'stale-head', 'target-head-drift',
+                'baseline-drift', 'iteration-baseline-drift',
+                'invalid-live-target', 'retarget', 'alias-added', 'late-head')) {
             $c = Get-SignedIntakeCase -Code -CoverageOnly
             $c.state.wrong = $failure
-            { Invoke-SignedIntakeCase $c } | Should -Throw
+            $diagnostic = [ref]$null
+            { Invoke-SignedIntakeCase $c $diagnostic } | Should -Throw
+            if ($failure -eq 'target-head-drift') {
+                $diagnostic.Value.selected[0].reason | Should -Be 'head-drift'
+                $diagnostic.Value.driftState | Should -Be 'detected'
+            }
             Test-Path $c.root | Should -BeFalse
         }
+    }
+    It 'rejects changed or absent coverage live-target bindings even with a valid signature' {
+        foreach ($mode in @('old-version', 'missing-proof', 'changed-pin',
+                'missing-pin', 'changed-declaration')) {
+            $c = Get-SignedIntakeCase -Code -CoverageOnly
+            [void](Invoke-SignedIntakeCase $c)
+            switch ($mode) {
+                'old-version' {
+                    Sign-RunnerConfig $c { param($config)
+                        $config.schemaVersion = 6
+                        $config.Remove('headProof')
+                        $config.heads[0].Remove('currentTargetCommit')
+                    }
+                }
+                'missing-proof' {
+                    Sign-RunnerConfig $c { param($config)
+                        $config.Remove('headProof')
+                    }
+                }
+                'changed-pin' {
+                    Sign-RunnerConfig $c { param($config)
+                        $config.heads[0].currentTargetCommit = 'e' * 40
+                    }
+                }
+                'missing-pin' {
+                    Sign-RunnerConfig $c { param($config)
+                        $config.heads[0].Remove('currentTargetCommit')
+                    }
+                }
+                'changed-declaration' {
+                    $root = Join-Path $c.root 'active-pr-intake-v1'
+                    $path = Join-Path $root 'cohort.json'
+                    $cohort = Get-Content -LiteralPath $path -Raw |
+                        ConvertFrom-Json -AsHashtable -Depth 32
+                    $cohort.heads[0].declaration.currentTargetCommit = 'e' * 40
+                    $text = ConvertTo-Json -InputObject $cohort -Depth 32
+                    [IO.File]::WriteAllText($path, $text)
+                    [IO.File]::WriteAllText((Join-Path (
+                            Join-Path $root 'generations') "$($cohort.generation).json"),
+                        $text)
+                }
+            }
+            { Invoke-RunnerCase $c } | Should -Throw -Because $mode
+        }
+    }
+    It 'rejects a target change during coverage evaluation after signed intake' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        [void](Invoke-SignedIntakeCase $c)
+        $c.state.wrong = 'target-runner-drift'
+        { Invoke-RunnerCase $c } | Should -Throw '*canary-head-drift*'
     }
     It 'rejects signature tampering before runner GET and head/discussion drift' {
         $c = Get-SignedIntakeCase -Code -CoverageOnly
