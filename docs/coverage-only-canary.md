@@ -81,9 +81,13 @@ transport failure without exposing refs or commits.
 Changed-line mapping retains the historical LCS matrix for diffs within
 `maxDiffCells`. Only coverage-only heads whose trimmed matrix exceeds that
 limit use a bounded exact shortest-edit-script search over the verified old
-and new line tokens. It counts diagonal steps and token comparisons against
-the same per-Changes-call `maxDiffCells` work budget, bounds retained frontier
-entries by that budget, and checks the existing deadline; exhaustion is
+and new line tokens. On this fallback, `maxDiffCells` bounds counted search
+and reconstruction operations (diagonals, token comparisons, edit steps,
+and span emission) **and**, separately, the sum of retained frontier entries
+and reconstruction indices/spans. These are backend-specific units, not
+quadratic matrix cells; the per-Changes-call remainder is never reset.
+Frontier allocations check the remaining retention budget first; the
+existing deadline applies to search and reconstruction. Exhaustion is
 `diff-budget` or `time-budget`, never a partial line proof. Equal-cost scripts
 on repeated lines may select different valid new-side anchors than the
 historical LCS tie order. Legacy four-rule mapping remains unchanged.

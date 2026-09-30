@@ -405,6 +405,7 @@ function Get-IntakeSparseLineDelta {
     $deleted = 0
     for ($d = $distance; $d -gt 0; $d--) {
         if ([DateTime]::UtcNow -ge $Deadline) { throw 'time-budget' }
+        if (++$work -gt $MaxCells) { throw 'diff-budget' }
         $k = $x - $y
         $index = [int](($k + $d) / 2)
         $previous = $trace[$d - 1]
@@ -430,6 +431,7 @@ function Get-IntakeSparseLineDelta {
             }
         }
         if ($insert) {
+            if (++$stored -gt $MaxCells) { throw 'diff-budget' }
             $inserted.Add($Prefix + $previousY)
         } else {
             $deleted++
@@ -452,17 +454,25 @@ function Get-IntakeSparseLineDelta {
     $start = 0
     $end = 0
     for ($index = $inserted.Count - 1; $index -ge 0; $index--) {
+        if (++$work -gt $MaxCells) { throw 'diff-budget' }
+        if ($work % 256 -eq 0 -and [DateTime]::UtcNow -ge $Deadline) {
+            throw 'time-budget'
+        }
         $line = $inserted[$index] + 1
         if ($start -eq 0) { $start = $line }
         elseif ($line -ne $end + 1) {
+            if (++$stored -gt $MaxCells) { throw 'diff-budget' }
             $spans.Add([ordered]@{ startLine = $start; endLine = $end })
             $start = $line
         }
         $end = $line
     }
     if ($start -gt 0) {
+        if ([DateTime]::UtcNow -ge $Deadline) { throw 'time-budget' }
+        if (++$stored -gt $MaxCells) { throw 'diff-budget' }
         $spans.Add([ordered]@{ startLine = $start; endLine = $end })
     }
+    if ([DateTime]::UtcNow -ge $Deadline) { throw 'time-budget' }
     return @{ addedLines = $inserted.Count; deletedLines = $deleted
         newLineCount = $After.Count; spans = @($spans.ToArray())
         cells = $work }

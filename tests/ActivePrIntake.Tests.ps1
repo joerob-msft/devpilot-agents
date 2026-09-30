@@ -1502,6 +1502,7 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
     It 'keeps the coverage-only sparse diff exact against the legacy small-input LCS oracle' {
         InModuleScope DevPilot.ActivePrIntake {
             $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            $pairs = [Collections.Generic.List[object]]::new()
             foreach ($oldLines in @('', 'a', 'a,a', 'a,b', 'a,b,a',
                     'b,a,b', 'a,a,b,a')) {
                 foreach ($newLines in @('', 'a', 'b', 'a,a', 'b,a',
@@ -1512,35 +1513,55 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
                     $new = if ($newLines) {
                         (($newLines -split ',') | ForEach-Object { "$_`n" }) -join ''
                     } else { '' }
-                    $before = Get-IntakeLineTokens $old
-                    $after = Get-IntakeLineTokens $new
-                    $oracle = Get-IntakeLineDelta $old $new 1000 20 $deadline
-                    $sparse = Get-IntakeSparseLineDelta $before $after 0 `
-                        $before.Count $after.Count 1000 $deadline
-                    ($sparse.addedLines + $sparse.deletedLines) |
-                        Should -Be ($oracle.addedLines + $oracle.deletedLines)
-                    $added = [Collections.Generic.HashSet[int]]::new()
-                    foreach ($span in $sparse.spans) {
-                        for ($line = $span.startLine; $line -le $span.endLine; $line++) {
-                            $added.Add($line - 1) | Should -BeTrue
-                        }
+                    $pairs.Add(@{ old = $old; new = $new })
+                }
+            }
+            foreach ($pair in @(
+                    @{ old = ''; new = '' },
+                    @{ old = "a`r`n"; new = "a`n" },
+                    @{ old = 'a'; new = "a`n" },
+                    @{ old = "a`n"; new = 'a' },
+                    @{ old = "a`r`n`n"; new = "a`n`r`n" }
+                )) { $pairs.Add($pair) }
+            foreach ($pair in $pairs) {
+                $before = Get-IntakeLineTokens $pair.old
+                $after = Get-IntakeLineTokens $pair.new
+                $oracle = Get-IntakeLineDelta $pair.old $pair.new 1000 20 $deadline
+                $sparse = Get-IntakeSparseLineDelta $before $after 0 `
+                    $before.Count $after.Count 1000 $deadline
+                $repeat = Get-IntakeSparseLineDelta $before $after 0 `
+                    $before.Count $after.Count 1000 $deadline
+                ($repeat | ConvertTo-Json -Compress -Depth 6) |
+                    Should -BeExactly ($sparse | ConvertTo-Json -Compress -Depth 6)
+                ($sparse.addedLines + $sparse.deletedLines) |
+                    Should -Be ($oracle.addedLines + $oracle.deletedLines)
+                $added = [Collections.Generic.HashSet[int]]::new()
+                foreach ($span in $sparse.spans) {
+                    for ($line = $span.startLine; $line -le $span.endLine; $line++) {
+                        $added.Add($line - 1) | Should -BeTrue
                     }
-                    $added.Count | Should -Be $sparse.addedLines
-                    $kept = @(
-                        for ($line = 0; $line -lt $after.Count; $line++) {
-                            if (-not $added.Contains($line)) { $after[$line] }
-                        }
-                    )
-                    $cursor = 0
-                    foreach ($line in $kept) {
+                }
+                $added.Count | Should -Be $sparse.addedLines
+                $cursor = 0
+                $removed = 0
+                $rebuilt = [Collections.Generic.List[string]]::new()
+                for ($index = 0; $index -lt $after.Count; $index++) {
+                    if ($added.Contains($index)) {
+                        $rebuilt.Add($after[$index])
+                    } else {
                         while ($cursor -lt $before.Count -and
-                            -not [string]::Equals($before[$cursor], $line,
-                                [StringComparison]::Ordinal)) { $cursor++ }
+                            -not [string]::Equals($before[$cursor], $after[$index],
+                                [StringComparison]::Ordinal)) {
+                            $cursor++; $removed++
+                        }
                         $cursor | Should -BeLessThan $before.Count
+                        $rebuilt.Add($before[$cursor])
                         $cursor++
                     }
-                    ($before.Count - $kept.Count) | Should -Be $sparse.deletedLines
                 }
+                $removed += $before.Count - $cursor
+                $removed | Should -Be $sparse.deletedLines
+                ($rebuilt.ToArray() -join '') | Should -BeExactly $pair.new
             }
         }
     }
@@ -1558,6 +1579,12 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
             $delta.spans.Count | Should -Be 2
             $delta.spans[0].startLine | Should -Be 1
             $delta.spans[1].startLine | Should -Be 1200
+            $exactBudget = Get-IntakeLineDelta $before $after $delta.cells 2500 `
+                ([DateTime]::UtcNow.AddSeconds(30)) -AllowSparseFallback
+            $exactBudget.cells | Should -Be $delta.cells
+            { Get-IntakeLineDelta $before $after ($delta.cells - 1) 2500 `
+                    ([DateTime]::UtcNow.AddSeconds(30)) -AllowSparseFallback } |
+                Should -Throw 'diff-budget'
             $added = Get-IntakeLineDelta '' ("$unicode`r`n" * 1200) `
                 1000000 2500 ([DateTime]::UtcNow.AddSeconds(30)) `
                 -AllowSparseFallback
