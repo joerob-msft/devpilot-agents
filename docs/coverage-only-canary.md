@@ -24,13 +24,14 @@ declaration, or moving
 master fails closed before signed state. The separately verified live master
 is bound across the initial and final intake proofs and signed as
 `sourceMasterCommit`, distinct from the unchanged historical receipt.
-The signed intake config (`schemaVersion: 8`,
+The signed intake config (`schemaVersion: 9`,
 `private-coverage-only-signed-intake`) binds mode `coverage-only`, exactly
 those two IDs and digests, selected head/iteration, changed lines, complete
 test-project graph, and immutable two-pass inventory generation. Legacy
 four-rule receipts/configs are not interchangeable. Earlier coverage-only
-signed configs without both distinct live source and target bindings are rejected rather
-than upgraded in place; the accepted source receipt and private pin remain
+signed configs, including `schemaVersion: 8`, are rejected rather than
+interpreted as scoped evidence or upgraded in place; the accepted source
+receipt and private pin remain
 unchanged. Evaluation checks the live source master against its signed intake
 binding both initially and after rule evaluation; a source branch advance
 with the same policy still aborts the in-flight operation as drift. Source,
@@ -58,13 +59,27 @@ establish the full file size. Unknown counts remain `null`, not zero. This
 diagnostic does **not** relax the completeness gate, sign a config, or provide
 finding evidence. Failures from runs before this diagnostic existed cannot be
 attributed to a particular page, head, or throttle retrospectively.
-The coverage-only intake allows at most 512 KiB per source file (up from the
-four-rule intake's 256 KiB); its 2 MiB aggregate source cap, validated blob
-hash and UTF-8 checks, complete project graph, changed-line proof, read/time
-limits, and runner recheck remain mandatory. This finite engineering limit
+The coverage-only intake allows at most 512 KiB per requested source file (up
+from the four-rule intake's 256 KiB). The complete, immutable changed-file
+manifest binds **every** change's path, old/new commit, object ID and
+body-review scope; its metadata-only records explicitly mean *not
+body-reviewed by these two rules*, not that the file or whole PR was reviewed
+or has zero changed lines. The separately versioned C# line proof and
+evaluation content cover only changed C# candidates, including helpers,
+generated sources, case-varied extensions and exact-path renames. Candidate
+scope alone does not establish test-project ownership: the complete source
+tree and verified project/import graph must prove all applicable test
+projects, not only MSTest classes. Necessary non-C# project/import text may
+still be read through that graph, not the generic changed-body diff. Unknown
+membership, unsupported source bytes and ambiguous graph evidence remain
+unknown, never an out-of-scope success. The 2 MiB changed-body and separate
+2 MiB graph-content caps, validated blob hash and UTF-8 checks, scoped
+changed-line proof, read/time limits, and complete-manifest runner recheck
+remain mandatory. No C#-scoped line count represents the entire PR.
+This finite engineering limit
 does not imply that an unmeasured larger file qualifies: EOF beyond either
 cap or a RAW body disagreeing with its declared length fails closed without
-truncated evidence. The declared-length guard applies to every RAW Item;
+truncated evidence. The declared-length guard applies to signed BoundClient RAW Item transport;
 JSON and identity GET ceilings and the legacy four-rule 256 KiB cap are unchanged.
 Coverage source failures retain allowlisted receipt-drift, unproved snapshot
 lineage, changed snapshot document, and merged-master metadata/content

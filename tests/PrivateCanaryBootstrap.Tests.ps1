@@ -615,6 +615,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             currentTarget = 'd' * 40
             threads = @()
             discussionVisits = 0
+            unrelatedChanges = 0
             cutoff = $null
             rows = @(
                 @{ pullRequestId = 17007699; status = 'active'
@@ -797,7 +798,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                                 objectId = $state.objectId
                                 status = 'unknown'; attestationDigest = $null })
                     }
-                    return @{ changedFiles = 1; changedLines = $state.lines
+                    $change = @{ changedFiles = 1; changedLines = $state.lines
                         baseCommit = if ($state.wrong -eq 'baseline-drift') {
                             'f' * 40
                         } else { $request.commonCommit }
@@ -818,6 +819,59 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                             complete = $state.wrong -ne 'unknown-project'
                             files = $receipt
                         } }
+                    if ($CoverageOnly) {
+                        if ($request.coverageBodyScope -cne
+                            'csharp-rule-candidates-v1') {
+                            throw 'invalid-change'
+                        }
+                        $change.Remove('changedLines')
+                        $change.scopedChangedFiles = 1
+                        $change.scopedChangedLines = $state.lines
+                        $change.scopedAddedLines = $state.lines
+                        $change.scopedDeletedLines = 0
+                        $manifestEntries = @([ordered]@{
+                                ordinal = 1
+                                changeTrackingId = 1
+                                pathDigest = $digest
+                                originalPathDigest = $null
+                                changeType = 'add'
+                                oldObjectId = $null
+                                newObjectId = $state.objectId
+                                bodyScope = 'csharp-body-diff'
+                                reason = $null
+                            })
+                        for ($i = 0; $i -lt $state.unrelatedChanges; $i++) {
+                            $assetPath = "/Tests/FictionalAsset$i.txt"
+                            $assetDigest = [Convert]::ToHexString(
+                                [Security.Cryptography.SHA256]::HashData(
+                                    [Text.Encoding]::UTF8.GetBytes(
+                                        (ConvertTo-Json $assetPath -Compress))
+                                )).ToLowerInvariant()
+                            $manifestEntries += [ordered]@{
+                                ordinal = $i + 2
+                                changeTrackingId = $i + 2
+                                pathDigest = $assetDigest
+                                originalPathDigest = $null
+                                changeType = 'edit'
+                                oldObjectId = '1' * 40
+                                newObjectId = if ($state.wrong -eq
+                                    'manifest-drift') { '3' * 40 } else {
+                                    '2' * 40 }
+                                bodyScope = 'metadata-only'
+                                reason = 'not-body-reviewed-for-coverage'
+                            }
+                        }
+                        $change.changedFiles += $state.unrelatedChanges
+                        $change.manifest = [ordered]@{
+                            schemaVersion = 1
+                            kind = 'coverage-only-complete-change-manifest'
+                            sourceCommit = $request.sourceCommit
+                            commonCommit = $request.commonCommit
+                            changedFiles = $change.changedFiles
+                            entries = @($manifestEntries)
+                        }
+                    }
+                    return $change
                 }
                 Discussions {
                     $state.discussionVisits++
@@ -915,6 +969,9 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                 $changes = & $Case.provider Changes @{
                     pullRequestId = $head.pullRequestId
                     sourceCommit = $head.sourceCommit; commonCommit = $head.commonCommit
+                    coverageBodyScope = if ($config['mode'] -ceq 'coverage-only') {
+                        'csharp-rule-candidates-v1'
+                    } else { $null }
                 }
                 $graph = $changes.evaluationFiles[0].projectEvidence
                 $digest = Get-BootstrapHash ([Text.Encoding]::UTF8.GetBytes(
@@ -937,7 +994,9 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                     -RulePath $source.path.TrimStart('/') -RuleCommit $source.commit `
                     -RuleSection $ruleId -RuleHash $rule.sourceHash `
                     -RuleLength $source.documentLength `
-                    -ConfigId 'private-merged-master-canary-v1' `
+                    -ConfigId $(if ($config['mode'] -ceq 'coverage-only') {
+                            'private-coverage-only-canary-v2'
+                        } else { 'private-merged-master-canary-v1' }) `
                     -ConfigDigest ('v1:sha256:' + (Get-BootstrapHash (
                                 [Text.Encoding]::UTF8.GetBytes(
                                     (ConvertTo-AgentCanonicalJson $config))))) `
@@ -4120,7 +4179,7 @@ Describe 'Coverage-only signed read-only canary' {
         $config = Get-Content -LiteralPath (
             Join-Path $c.root 'canary-dispatcher.json') -Raw |
             ConvertFrom-Json -AsHashtable
-        $config.schemaVersion | Should -Be 8
+        $config.schemaVersion | Should -Be 9
         $config.sourceMasterCommit | Should -Be ('f' * 40)
         $intakeConfig = Get-Content -LiteralPath (
             Join-Path $c.root 'canary-intake.json') -Raw |
@@ -4205,7 +4264,7 @@ Describe 'Coverage-only signed read-only canary' {
         $result.rules.Count | Should -Be 4
         $config = Get-Content (Join-Path $c.root 'canary-dispatcher.json') -Raw |
             ConvertFrom-Json -AsHashtable
-        $config.schemaVersion | Should -Be 8
+        $config.schemaVersion | Should -Be 9
         $config.mode | Should -Be 'coverage-only'
         $config.headProof | Should -Be 'iteration-source-current-target-v1'
         $config.sourceMasterCommit | Should -Be ('e' * 40)
@@ -4216,7 +4275,7 @@ Describe 'Coverage-only signed read-only canary' {
         $config.writerEligible | Should -BeFalse
         $evaluated = Invoke-RunnerCase $c
         $evaluated.kind | Should -Be 'private-coverage-only-read-only-evaluation'
-        $evaluated.schemaVersion | Should -Be 8
+        $evaluated.schemaVersion | Should -Be 9
         $evaluated.modelToolInvocations | Should -Be 0
         $evaluated.providerWrites | Should -Be 0
         $evaluated.writerEligible | Should -BeFalse
@@ -4231,6 +4290,50 @@ Describe 'Coverage-only signed read-only canary' {
                     $_.reason -cne 'not-attempted' -or
                     $_.status -cne 'unknown')
             }).Count | Should -Be 0
+    }
+    It 'rechecks a complete non-C# metadata manifest in the actual signed runner' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        $c.state.unrelatedChanges = 12
+        (Invoke-SignedIntakeCase $c).signed | Should -BeTrue
+        $intake = Get-Content -LiteralPath (
+            Join-Path $c.root 'active-pr-intake-v1\cohort.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $intake.schemaVersion | Should -Be 2
+        $intake.heads[0].lineEvidence.changedFiles | Should -Be 13
+        $intake.heads[0].lineEvidence.scopedChangedFiles | Should -Be 1
+        $intake.heads[0].lineEvidence.files.Count | Should -Be 1
+        $intake.heads[0].lineEvidence.manifest.entries.Count | Should -Be 13
+        $intake.heads[0].lineEvidence.Contains('changedLines') | Should -BeFalse
+        $evaluated = Invoke-RunnerCase $c
+        $evaluated.selected | Should -Be 2
+        $evaluated.rules[0].evaluated | Should -Be 2
+        $evaluated.writerEligible | Should -BeFalse
+        $evaluated.providerWrites | Should -Be 0
+        $c.state.wrong = 'manifest-drift'
+        { Invoke-RunnerCase $c } |
+            Should -Throw '*canary-changed-lines-drift*'
+    }
+    It 'rejects legacy or mismatched coverage scope even when a dispatcher is re-signed' {
+        foreach ($variant in @('legacy', 'missing', 'mismatch', 'owner')) {
+            $c = Get-SignedIntakeCase -Code -CoverageOnly
+            (Invoke-SignedIntakeCase $c).signed | Should -BeTrue
+            Sign-RunnerConfig $c {
+                param($config)
+                switch ($variant) {
+                    legacy { $config.schemaVersion = 8 }
+                    missing { $config.Remove('coverageBodyScope') }
+                    mismatch { $config.coverageBodyScope = 'unreviewed-other-language' }
+                    owner {
+                        $config.rules += @{
+                            capabilityId = 'bpm-test-ownership@1'
+                            enabled = $true; writerEligible = $true
+                        }
+                    }
+                }
+            }
+            { Invoke-RunnerCase $c } |
+                Should -Throw '*canary-config-invalid*'
+        }
     }
     It 'signs only after both inclusive-echo passes prove selected coverage heads' {
         $c = Get-SignedIntakeCase -Code -CoverageOnly

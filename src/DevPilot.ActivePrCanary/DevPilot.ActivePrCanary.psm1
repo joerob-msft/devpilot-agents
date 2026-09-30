@@ -2907,6 +2907,7 @@ function Invoke-PrivateCanarySignedIntake {
     $intake.pagination = [ordered]@{ mode = 'created-time-keyset' }
     if ($Mode -ceq 'CoverageOnly') {
         $intake.headProof = 'iteration-source-current-target-v1'
+        $intake.coverageBodyScope = 'csharp-rule-candidates-v1'
         $intake.limits.maxFileBytes = 524288
     }
     $intake.projectEvidence.enabled = $true
@@ -3066,7 +3067,7 @@ function Invoke-PrivateCanarySignedIntake {
     $pins = $gate.pins
     $finalRegistry = $gate.finalRegistry
     $config = [ordered]@{
-        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 8 } else { 5 }
+        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 9 } else { 5 }
         kind = if ($Mode -ceq 'CoverageOnly') {
             'private-coverage-only-signed-intake'
         } else { 'private-canary-signed-intake' }
@@ -3113,6 +3114,7 @@ function Invoke-PrivateCanarySignedIntake {
     if ($Mode -ceq 'CoverageOnly') {
         $config.mode = 'coverage-only'
         $config.headProof = 'iteration-source-current-target-v1'
+        $config.coverageBodyScope = $intake.coverageBodyScope
         $config.sourceMasterCommit = $registry.currentMasterCommit
     }
     $key = [Convert]::ToBase64String(

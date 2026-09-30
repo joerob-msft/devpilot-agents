@@ -12,6 +12,13 @@ using System.Threading.Tasks;
 public sealed class IntakeSparseDiffHandler : HttpMessageHandler {
     public string Before, After, BeforeId, AfterId;
     public string ChangedPath;
+    public string RenameFrom;
+    public System.Collections.Generic.SortedDictionary<string, string> UnrelatedOldIds =
+        new System.Collections.Generic.SortedDictionary<string, string>(StringComparer.Ordinal);
+    public System.Collections.Generic.SortedDictionary<string, string> UnrelatedNewIds =
+        new System.Collections.Generic.SortedDictionary<string, string>(StringComparer.Ordinal);
+    public int RawUnrelatedCalls, MetadataUnrelatedCalls, RawProjectCalls;
+    public bool WrongUnrelatedId, MissingTerminalPage;
     public string Project, RootTreeId, RootTree, TestsTreeId, TestsTree;
     public bool ChunkRaw, CancelRaw, CorruptRaw, EncodedRaw, NonJsonIdentity;
     public long? DeclaredRawLength;
@@ -35,23 +42,64 @@ public sealed class IntakeSparseDiffHandler : HttpMessageHandler {
             body = "{\"descriptor\":\"aad.synthetic-service-account\",\"subjectKind\":\"user\",\"principalName\":\"service@example.invalid\"}";
         else if (path.Contains("/graph/storagekeys/"))
             body = "{\"value\":\"33333333-3333-3333-3333-333333333333\"}";
-        else if (path.EndsWith("/changes"))
+        else if (path.EndsWith("/changes")) {
+            var entries = new System.Collections.Generic.List<object>();
+            if (RenameFrom == null)
+                entries.Add(new { changeTrackingId = 1, changeType = "edit",
+                    item = new { path = ChangedPath ?? "/Tests/Synthetic.cs",
+                        objectId = AfterId, originalObjectId = BeforeId } });
+            else
+                entries.Add(new { changeTrackingId = 1, changeType = "rename",
+                    originalPath = RenameFrom,
+                    item = new { path = ChangedPath ?? "/Tests/Synthetic.cs",
+                        objectId = AfterId, originalObjectId = BeforeId } });
+            var ordinal = 1;
+            foreach (var pair in UnrelatedNewIds) {
+                entries.Add(new { changeTrackingId = ++ordinal, changeType = "edit",
+                    item = new { path = pair.Key, objectId = pair.Value,
+                        originalObjectId = UnrelatedOldIds[pair.Key] } });
+            }
             body = query.Contains("$skip=0")
-                ? "{\"changeEntries\":[{\"changeTrackingId\":1,\"changeType\":\"edit\",\"item\":{\"path\":\"" +
-                    (ChangedPath ?? "/Tests/Synthetic.cs") + "\",\"objectId\":\"" + AfterId +
-                    "\",\"originalObjectId\":\"" + BeforeId + "\"}}],\"nextSkip\":0}"
-                : "{\"changeEntries\":[],\"nextSkip\":0}";
+                ? System.Text.Json.JsonSerializer.Serialize(new {
+                    changeEntries = entries, nextSkip = 0 })
+                : MissingTerminalPage
+                    ? "{\"changeEntries\":[{\"changeTrackingId\":1}],\"nextSkip\":0}"
+                    : "{\"changeEntries\":[],\"nextSkip\":0}";
+        }
         else if (path.EndsWith("/items")) {
             var project = query.Contains("/Tests/Tests.csproj");
+            string unrelatedPath = null;
+            foreach (var key in UnrelatedNewIds.Keys)
+                if (query.Contains(key)) { unrelatedPath = key; break; }
+            if (unrelatedPath != null) {
+                if (raw) {
+                    RawUnrelatedCalls++;
+                    if (!unrelatedPath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("unrelated body requested");
+                    body = new string(old ? 'x' : 'y', 307200);
+                } else {
+                    MetadataUnrelatedCalls++;
+                    body = System.Text.Json.JsonSerializer.Serialize(new {
+                        path = unrelatedPath, gitObjectType = "blob",
+                        objectId = WrongUnrelatedId && !old ?
+                            new string('f', 40) : old ?
+                            UnrelatedOldIds[unrelatedPath] :
+                            UnrelatedNewIds[unrelatedPath], isFolder = false });
+                }
+            } else {
             if (raw) RawItemCalls++;
+            if (raw && project) RawProjectCalls++;
             if (raw && !project && !old && CancelRaw)
                 throw new OperationCanceledException();
             body = raw ? (project ? Project : old ? Before : After)
-                : "{\"path\":\"" + (ChangedPath ?? "/Tests/Synthetic.cs") +
+                : "{\"path\":\"" + (old && RenameFrom != null ? RenameFrom :
+                    ChangedPath ?? "/Tests/Synthetic.cs") +
                     "\",\"gitObjectType\":\"blob\",\"objectId\":\"" +
                     (old ? BeforeId : AfterId) +
-                    "\",\"isFolder\":false,\"contentMetadata\":{\"isBinary\":false,\"encoding\":65001,\"contentType\":\"text/plain\"},\"content\":" +
-                    System.Text.Json.JsonSerializer.Serialize(old ? Before : After) + "}";
+                    "\",\"isFolder\":false,\"contentMetadata\":{\"isBinary\":false,\"encoding\":65001,\"contentType\":\"text/plain\"}" +
+                    (query.Contains("includeContent=false") ? "" : ",\"content\":" +
+                        System.Text.Json.JsonSerializer.Serialize(old ? Before : After)) + "}";
+            }
         } else if (path.EndsWith("/commits/" + new string('a', 40)))
             body = "{\"commitId\":\"" + new string('a', 40) +
                 "\",\"treeId\":\"" + RootTreeId + "\"}";
@@ -462,7 +510,9 @@ $answer | ConvertTo-Json -Depth 20 -Compress
     }
     function New-LargeBoundCase {
         param([int]$FileBytes = 266240,
-            [string]$Path = '/Tests/Synthetic.cs')
+            [string]$Path = '/Tests/Synthetic.cs',
+            [int]$UnrelatedCount = 0, [string]$RenameFrom,
+            [string]$UnrelatedExtension = '.txt')
         $t = New-IntakeTransportCase
         $t.case.config.schemaVersion = 3
         $t.case.config.principalProof = 'aad-graph-storage-key-alias-free-v2'
@@ -478,17 +528,28 @@ $answer | ConvertTo-Json -Depth 20 -Compress
         $new = New-TestBlob $Path $after
         $project = New-TestBlob '/Tests/Tests.csproj' `
             '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><IsTestProject>true</IsTestProject></PropertyGroup></Project>'
-        $tests = New-TestTree @(
+        $treeEntries = @(
             @{ relativePath = $Path.Substring('/Tests/'.Length); mode = '100644'
                 gitObjectType = 'blob'; objectId = $new.objectId },
             @{ relativePath = 'Tests.csproj'; mode = '100644'
                 gitObjectType = 'blob'; objectId = $project.objectId })
+        $handler = [IntakeSparseDiffHandler]::new()
+        for ($i = 0; $i -lt $UnrelatedCount; $i++) {
+            $file = "/Tests/Asset$i$UnrelatedExtension"
+            $oldAsset = New-TestBlob $file ('x' * 307200)
+            $newAsset = New-TestBlob $file ('y' * 307200)
+            $handler.UnrelatedOldIds.Add($file, $oldAsset.objectId)
+            $handler.UnrelatedNewIds.Add($file, $newAsset.objectId)
+            $treeEntries += @{ relativePath = "Asset$i$UnrelatedExtension"; mode = '100644'
+                gitObjectType = 'blob'; objectId = $newAsset.objectId }
+        }
+        $tests = New-TestTree $treeEntries
         $rootTree = New-TestTree @(
             @{ relativePath = 'Tests'; mode = '40000'
                 gitObjectType = 'tree'; objectId = $tests.objectId })
-        $handler = [IntakeSparseDiffHandler]::new()
         $handler.Before = $before; $handler.After = $after
         $handler.ChangedPath = $Path
+        if ($RenameFrom) { $handler.RenameFrom = $RenameFrom }
         $handler.BeforeId = $old.objectId; $handler.AfterId = $new.objectId
         $handler.Project = $project.content
         $handler.RootTreeId = $rootTree.objectId
@@ -1746,6 +1807,134 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
             $c.handler.RawItemCalls | Should -Be 2
         }
         finally { $c.client.Dispose() }
+    }
+    It 'binds a complete fictional asset corpus without requesting its changed bodies' {
+        $c = New-LargeBoundCase -FileBytes 1024 -UnrelatedCount 12
+        $c.case.case.config.coverageBodyScope = 'csharp-rule-candidates-v1'
+        $c.case.case.config.rules = @(
+            @{ id = 'bpm-test-class-coverage@2'
+                capability = 'bpm-test-class-coverage@2' },
+            @{ id = 'bpm-redundant-method-coverage@2'
+                capability = 'bpm-redundant-method-coverage@2' })
+        $c.request.coverageBodyScope = 'csharp-rule-candidates-v1'
+        $c.request.remainingReads = 150
+        try {
+            $provider = New-LargeBoundProvider $c @{
+                attemptedGets = 0; completedGets = 0; throttleEvents = 0 }
+            $changes = & $provider Changes $c.request
+            $changes.changedFiles | Should -Be 13
+            $changes.scopedChangedFiles | Should -Be 1
+            $changes.scopedChangedLines | Should -Be 2
+            $changes.Contains('changedLines') | Should -BeFalse
+            $changes.files.Count | Should -Be 1
+            $changes.evaluationFiles.Count | Should -Be 1
+            $changes.manifest.entries.Count | Should -Be 13
+            @($changes.manifest.entries | Where-Object {
+                    $_.bodyScope -ceq 'metadata-only' -and
+                    $_.reason -ceq 'not-body-reviewed-for-coverage' -and
+                    $_.oldObjectId -match '^[a-f0-9]{40}$' -and
+                    $_.newObjectId -match '^[a-f0-9]{40}$'
+                }).Count | Should -Be 12
+            (12 * 2 * 307200) | Should -BeGreaterThan 6MB
+            $c.handler.MetadataUnrelatedCalls | Should -Be 24
+            $c.handler.RawUnrelatedCalls | Should -Be 0
+            $c.handler.RawProjectCalls | Should -BeGreaterThan 0
+            $changes.projectEvidence.complete | Should -BeTrue
+            $changes.projectEvidence.files[0].status | Should -Be 'complete'
+        }
+        finally { $c.client.Dispose() }
+    }
+    It 'binds case-only C# renames to both exact paths and tolerates unchanged text' {
+        $c = New-LargeBoundCase -FileBytes 1024 `
+            -Path '/Tests/Synthetic.CS' `
+            -RenameFrom '/Tests/Synthetic.cs'
+        $c.case.case.config.coverageBodyScope = 'csharp-rule-candidates-v1'
+        $c.case.case.config.rules = @(
+            @{ id = 'bpm-test-class-coverage@2'
+                capability = 'bpm-test-class-coverage@2' },
+            @{ id = 'bpm-redundant-method-coverage@2'
+                capability = 'bpm-redundant-method-coverage@2' })
+        $c.request.coverageBodyScope = 'csharp-rule-candidates-v1'
+        $c.handler.After = $c.handler.Before
+        $c.handler.AfterId = $c.handler.BeforeId
+        $project = New-TestBlob '/Tests/Tests.csproj' $c.handler.Project
+        $renamedTree = New-TestTree @(
+            @{ relativePath = 'Synthetic.CS'; mode = '100644'
+                gitObjectType = 'blob'; objectId = $c.handler.AfterId },
+            @{ relativePath = 'Tests.csproj'; mode = '100644'
+                gitObjectType = 'blob'; objectId = $project.objectId })
+        $renamedRoot = New-TestTree @(
+            @{ relativePath = 'Tests'; mode = '40000'
+                gitObjectType = 'tree'; objectId = $renamedTree.objectId })
+        $c.handler.TestsTreeId = $renamedTree.objectId
+        $c.handler.TestsTree = $renamedTree | ConvertTo-Json -Depth 8 -Compress
+        $c.handler.RootTreeId = $renamedRoot.objectId
+        $c.handler.RootTree = $renamedRoot | ConvertTo-Json -Depth 8 -Compress
+        try {
+            $provider = New-LargeBoundProvider $c @{
+                attemptedGets = 0; completedGets = 0; throttleEvents = 0 }
+            $changes = & $provider Changes $c.request
+            $changes.changedFiles | Should -Be 1
+            $changes.scopedChangedFiles | Should -Be 1
+            $changes.scopedChangedLines | Should -Be 0
+            $changes.files[0].changeType | Should -Be 'rename'
+            $changes.files[0].spans.Count | Should -Be 0
+            $changes.manifest.entries[0].bodyScope | Should -Be 'csharp-body-diff'
+            $changes.manifest.entries[0].pathDigest |
+                Should -Not -Be $changes.manifest.entries[0].originalPathDigest
+            $changes.projectEvidence.complete | Should -BeTrue
+            $c.handler.RawUnrelatedCalls | Should -Be 0
+        }
+        finally { $c.client.Dispose() }
+    }
+    It 'keeps the unchanged aggregate cap on relevant C# sides' {
+        $c = New-LargeBoundCase -FileBytes 1024 -UnrelatedCount 4 `
+            -UnrelatedExtension '.cs'
+        $c.case.case.config.coverageBodyScope = 'csharp-rule-candidates-v1'
+        $c.case.case.config.rules = @(
+            @{ id = 'bpm-test-class-coverage@2'
+                capability = 'bpm-test-class-coverage@2' },
+            @{ id = 'bpm-redundant-method-coverage@2'
+                capability = 'bpm-redundant-method-coverage@2' })
+        $c.request.coverageBodyScope = 'csharp-rule-candidates-v1'
+        $c.request.remainingReads = 150
+        try {
+            $provider = New-LargeBoundProvider $c @{
+                attemptedGets = 0; completedGets = 0; throttleEvents = 0 }
+            { & $provider Changes $c.request } | Should -Throw 'byte-budget'
+            $c.handler.RawUnrelatedCalls | Should -BeGreaterThan 0
+        }
+        finally { $c.client.Dispose() }
+    }
+    It 'rejects a missing coverage scope or changed immutable asset metadata before body reads' {
+        foreach ($case in @('missing-mode', 'wrong-blob', 'missing-terminal')) {
+            $c = New-LargeBoundCase -FileBytes 1024 -UnrelatedCount 1
+            $c.case.case.config.coverageBodyScope = 'csharp-rule-candidates-v1'
+            $c.case.case.config.rules = @(
+                @{ id = 'bpm-test-class-coverage@2'
+                    capability = 'bpm-test-class-coverage@2' },
+                @{ id = 'bpm-redundant-method-coverage@2'
+                    capability = 'bpm-redundant-method-coverage@2' })
+            $c.request.coverageBodyScope = 'csharp-rule-candidates-v1'
+            if ($case -eq 'missing-mode') {
+                $c.request.Remove('coverageBodyScope')
+            } elseif ($case -eq 'wrong-blob') {
+                $c.handler.WrongUnrelatedId = $true
+            } else { $c.handler.MissingTerminalPage = $true }
+            try {
+                $provider = New-LargeBoundProvider $c @{
+                    attemptedGets = 0; completedGets = 0; throttleEvents = 0 }
+                { & $provider Changes $c.request } |
+                    Should -Throw $(switch ($case) {
+                            'missing-mode' { 'invalid-change' }
+                            'wrong-blob' { 'invalid-item' }
+                            default { 'change-list-truncated' }
+                        })
+                $c.handler.RawItemCalls | Should -Be 0
+                $c.handler.RawUnrelatedCalls | Should -Be 0
+            }
+            finally { $c.client.Dispose() }
+        }
     }
     It 'enforces exact file, streamed, declared and aggregate RAW byte limits' {
         foreach ($scenario in @('exact', 'one-over', 'declared-over',

@@ -285,6 +285,13 @@ AfterAll {
     }
 }
 Describe 'Bounded read-only scheduled rule evaluation' {
+    It 'refuses coverage-scoped intake in the legacy scheduled evaluator before a GET' {
+        $case = New-RuleCase -EnableCoverage
+        $case.intakeConfig.coverageBodyScope = 'csharp-rule-candidates-v1'
+        { Invoke-RuleCase $case } |
+            Should -Throw '*intake-incomplete-or-unbound*'
+        $case.state.calls.Count | Should -Be 0
+    }
     It 'does not read the provider or write state without the run switch or enablement' {
         $c = New-RuleCase
         $result = Invoke-BoundedRuleEvaluation -Config $c.config `

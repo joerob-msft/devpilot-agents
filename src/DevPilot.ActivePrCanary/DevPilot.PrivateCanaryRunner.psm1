@@ -67,11 +67,18 @@ function Assert-PrivateCanaryConfig {
     $expectedRules = if ($coverage) {
         @('bpm-test-class-coverage@2', 'bpm-redundant-method-coverage@2')
     } else { $script:CanaryRules }
-    if ($Config.schemaVersion -ne $(if ($coverage) { 8 } else { 5 }) -or
+    if ($Config.schemaVersion -ne $(if ($coverage) { 9 } else { 5 }) -or
         $Config.kind -cne $(if ($coverage) {
                 'private-coverage-only-signed-intake'
             } else { 'private-canary-signed-intake' }) -or
         ($coverage -and $Config.mode -cne 'coverage-only') -or
+        ($coverage -and
+            ($Config['coverageBodyScope'] -cne 'csharp-rule-candidates-v1' -or
+                $Intake['coverageBodyScope'] -cne
+                    $Config['coverageBodyScope'])) -or
+        (-not $coverage -and
+            ($Config.Contains('coverageBodyScope') -or
+                $Intake.Contains('coverageBodyScope'))) -or
         ($coverage -and
             ($Config.headProof -cne 'iteration-source-current-target-v1' -or
                 $Intake.headProof -cne $Config.headProof)) -or
@@ -237,7 +244,7 @@ function Invoke-PrivateCanaryEvaluation {
         throw 'canary-mode-invalid'
     }
     if ($Mode -ceq 'CoverageOnly' -and
-        ($config.schemaVersion -ne 8 -or
+        ($config.schemaVersion -ne 9 -or
             [string]$config.sourceMasterCommit -cnotmatch '^[a-f0-9]{40}$')) {
         throw 'canary-config-invalid'
     }
@@ -399,18 +406,52 @@ function Invoke-PrivateCanaryEvaluation {
             sourceCommit = $declaration.sourceCommit
             targetCommit = $declaration.targetCommit
             commonCommit = $declaration.commonCommit
+            coverageBodyScope = $intakeConfig['coverageBodyScope']
             includeEvaluationFiles = $true; includeProjectEvidence = $true
         }
         if ($changes.changedFiles -ne $head.lineEvidence.changedFiles -or
-            $changes.changedLines -ne $head.lineEvidence.changedLines -or
             $changes.baseCommit -cne $declaration.commonCommit -or
             $changes.files -isnot [array] -or
             (Get-PrivateCanaryDigest @($changes.files)) -cne
                 (Get-PrivateCanaryDigest @($head.lineEvidence.files)) -or
+            ($Mode -ceq 'CoverageOnly' -and
+                ($changes.Contains('changedLines') -or
+                    $changes.scopedChangedFiles -ne
+                        $head.lineEvidence.scopedChangedFiles -or
+                    $changes.scopedChangedLines -ne
+                        $head.lineEvidence.scopedChangedLines -or
+                    $changes.scopedAddedLines -ne
+                        $head.lineEvidence.scopedAddedLines -or
+                    $changes.scopedDeletedLines -ne
+                        $head.lineEvidence.scopedDeletedLines -or
+                    (Get-PrivateCanaryDigest $changes.manifest) -cne
+                        $head.lineEvidence.manifestDigest -or
+                    (Get-PrivateCanaryDigest $changes.manifest) -cne
+                        (Get-PrivateCanaryDigest $head.lineEvidence.manifest))) -or
+            ($Mode -ceq 'FourRule' -and
+                $changes.changedLines -ne $head.lineEvidence.changedLines) -or
             $changes.evaluationFiles -isnot [array] -or
             $changes.evaluationFiles.Count -ne
                 @($head.lineEvidence.files | Where-Object changeType -NE 'delete').Count) {
             throw 'canary-changed-lines-drift'
+        }
+        if ($Mode -ceq 'CoverageOnly') {
+            $coverageProof = [ordered]@{
+                schemaVersion = 2; kind = 'coverage-only-scoped-lines'
+                baseCommit = $changes.baseCommit
+                changedFiles = $changes.changedFiles
+                scopedChangedFiles = $changes.scopedChangedFiles
+                scopedChangedLines = $changes.scopedChangedLines
+                scopedAddedLines = $changes.scopedAddedLines
+                scopedDeletedLines = $changes.scopedDeletedLines
+                manifestDigest = Get-PrivateCanaryDigest $changes.manifest
+                manifest = $changes.manifest; files = $changes.files
+            }
+            try {
+                [void](Assert-ActivePrCoverageProof $coverageProof `
+                        $intakeConfig.limits)
+            }
+            catch { throw 'canary-changed-lines-drift' }
         }
         $expectedScope = [ordered]@{
             schemaVersion = 1; kind = 'source-bound-project-scope-summary-v1'
@@ -451,7 +492,7 @@ function Invoke-PrivateCanaryEvaluation {
             $blobId = [Convert]::ToHexString([Security.Cryptography.SHA1]::HashData(
                     [byte[]]($header + $bytes))).ToLowerInvariant()
             if ($blobId -cne $source.objectId) { throw 'canary-source-unverified' }
-            if ($source.path -cmatch '\.cs$') {
+            if ($source.path -match '\.cs$') {
                 $receipts = @($head.projectEvidence.files | Where-Object {
                         $_.pathDigest -ceq $proof.pathDigest -and
                         $_.objectId -ceq $source.objectId -and
@@ -639,7 +680,7 @@ function Invoke-PrivateCanaryEvaluation {
         }
     }
     return [ordered]@{
-        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 8 } else { 5 }
+        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 9 } else { 5 }
         kind = if ($Mode -ceq 'CoverageOnly') {
             'private-coverage-only-read-only-evaluation'
         } else { 'private-canary-read-only-evaluation' }

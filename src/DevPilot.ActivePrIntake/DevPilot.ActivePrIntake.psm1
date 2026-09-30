@@ -251,7 +251,24 @@ function Get-IntakeBearerRoute {
 function Assert-IntakeConfig {
     param([Collections.IDictionary]$Config)
     $guidPattern = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
+    $coverage = $Config['coverageBodyScope'] -ceq 'csharp-rule-candidates-v1'
     if ($Config.schemaVersion -notin @(1, 2, 3) -or
+        ($Config.Contains('coverageBodyScope') -and -not $coverage) -or
+        ($coverage -and ($Config.schemaVersion -ne 3 -or
+                $Config.headProof -cne 'iteration-source-current-target-v1' -or
+                $Config['projectEvidence'] -isnot
+                    [Collections.IDictionary] -or
+                $Config.projectEvidence.enabled -cne $true -or
+                $Config.rules -isnot [array] -or
+                $Config.rules.Count -ne 2 -or
+                @($Config.rules | Where-Object {
+                        [string]$_.id -cnotin @(
+                            'bpm-test-class-coverage@2',
+                            'bpm-redundant-method-coverage@2') -or
+                        [string]$_.capability -cne [string]$_.id
+                    }).Count -gt 0 -or
+                [string]$Config.rules[0].id -ceq
+                    [string]$Config.rules[1].id)) -or
         ($Config.schemaVersion -eq 3 -and
             ($Config.principalProof -cne 'aad-graph-storage-key-alias-free-v2' -or
                 $Config.expectedAccount -isnot [Collections.IDictionary] -or
@@ -321,6 +338,113 @@ function Assert-IntakeConfig {
             [string]$rule.capability -cnotmatch '^[a-zA-Z0-9_.@-]{1,100}$' -or
             -not $ids.Add([string]$rule.id)) { throw 'Invalid or repeated rule registry entry.' }
     }
+}
+
+function Assert-ActivePrCoverageProof {
+    param([Collections.IDictionary]$Evidence, [Collections.IDictionary]$Limits)
+    $manifest = $Evidence['manifest']
+    if ($Evidence.Count -notin @(11, 14) -or
+        $Evidence.schemaVersion -ne 2 -or
+        $Evidence.kind -cne 'coverage-only-scoped-lines' -or
+        $manifest -isnot [Collections.IDictionary] -or
+        $manifest.Count -ne 6 -or
+        $manifest.schemaVersion -ne 1 -or
+        $manifest.kind -cne 'coverage-only-complete-change-manifest' -or
+        [string]$manifest.sourceCommit -cnotmatch '^[a-f0-9]{40}$' -or
+        [string]$manifest.commonCommit -cnotmatch '^[a-f0-9]{40}$' -or
+        $Evidence.baseCommit -cne $manifest.commonCommit -or
+        $manifest.entries -isnot [array] -or
+        $Evidence.files -isnot [array] -or
+        [string]$Evidence.manifestDigest -cnotmatch '^[a-f0-9]{64}$' -or
+        (Get-IntakeDigest $manifest) -cne $Evidence.manifestDigest) {
+        throw 'invalid-change'
+    }
+    $all = Assert-IntakeNumber $Evidence.changedFiles changedFiles 1 ([int]$Limits.maxChangedFiles)
+    $scoped = Assert-IntakeNumber $Evidence.scopedChangedFiles scopedChangedFiles 0 $all
+    $lines = Assert-IntakeNumber $Evidence.scopedChangedLines scopedChangedLines 0 ([int]$Limits.maxChangedLines)
+    $added = Assert-IntakeNumber $Evidence.scopedAddedLines scopedAddedLines 0 $lines
+    $deleted = Assert-IntakeNumber $Evidence.scopedDeletedLines scopedDeletedLines 0 $lines
+    if ($manifest.changedFiles -ne $all -or $manifest.entries.Count -ne $all -or
+        $Evidence.files.Count -ne $scoped -or $added + $deleted -ne $lines -or
+        ($scoped -eq 0 -and $lines -ne 0)) {
+        throw 'invalid-change'
+    }
+    $tracking = [Collections.Generic.HashSet[int]]::new()
+    $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $scopedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $sumAdded = 0; $sumDeleted = 0; $scopedCount = 0
+    for ($index = 0; $index -lt $all; $index++) {
+        $entry = $manifest.entries[$index]
+        if ($entry -isnot [Collections.IDictionary] -or
+            $entry.Count -ne 9 -or
+            $entry.ordinal -ne ($index + 1) -or
+            [string]$entry.pathDigest -cnotmatch '^[a-f0-9]{64}$' -or
+            -not $paths.Add([string]$entry.pathDigest) -or
+            $entry.changeType -cnotin @('add', 'edit', 'delete', 'rename') -or
+            $entry.bodyScope -cnotin @('csharp-body-diff', 'metadata-only') -or
+            ($entry.bodyScope -ceq 'metadata-only' -and
+                $entry.reason -cne 'not-body-reviewed-for-coverage') -or
+            ($entry.bodyScope -ceq 'csharp-body-diff' -and
+                $null -ne $entry.reason) -or
+            ($entry.changeType -ceq 'rename' -and
+                ([string]$entry.originalPathDigest -cnotmatch '^[a-f0-9]{64}$' -or
+                    $entry.originalPathDigest -ceq $entry.pathDigest)) -or
+            ($entry.changeType -cne 'rename' -and
+                $null -ne $entry.originalPathDigest) -or
+            (($entry.changeType -ceq 'add') -ne
+                ($null -eq $entry.oldObjectId)) -or
+            (($entry.changeType -ceq 'delete') -ne
+                ($null -eq $entry.newObjectId)) -or
+            ($null -ne $entry.oldObjectId -and
+                [string]$entry.oldObjectId -cnotmatch '^[a-f0-9]{40}$') -or
+            ($null -ne $entry.newObjectId -and
+                [string]$entry.newObjectId -cnotmatch '^[a-f0-9]{40}$')) {
+            throw 'invalid-change'
+        }
+        $number = Assert-IntakeNumber $entry.changeTrackingId changeTrackingId 1 ([int]::MaxValue)
+        if (-not $tracking.Add($number)) { throw 'invalid-change' }
+        if ($entry.bodyScope -ceq 'metadata-only') { continue }
+        $scopedCount++
+        $proof = @($Evidence.files | Where-Object {
+                $_.pathDigest -ceq $entry.pathDigest
+            })
+        if ($proof.Count -ne 1 -or
+            $proof[0].Count -ne 7 -or
+            -not $scopedPaths.Add([string]$proof[0].pathDigest) -or
+            $proof[0].changeType -cne $entry.changeType -or
+            [string]$proof[0].originalPathDigest -cne
+                [string]$entry.originalPathDigest -or
+            $proof[0].spans -isnot [array]) {
+            throw 'invalid-change'
+        }
+        $plus = Assert-IntakeNumber $proof[0].addedLines addedLines 0 ([int]$Limits.maxChangedLines)
+        $minus = Assert-IntakeNumber $proof[0].deletedLines deletedLines 0 ([int]$Limits.maxChangedLines)
+        $newCount = Assert-IntakeNumber $proof[0].newLineCount newLineCount 0 1000000
+        if (($plus + $minus -lt 1 -and
+                $entry.changeType -cne 'rename') -or
+            ($entry.changeType -ceq 'add' -and $minus -ne 0) -or
+            ($entry.changeType -ceq 'delete' -and ($plus -ne 0 -or $newCount -ne 0))) {
+            throw 'invalid-change'
+        }
+        $covered = 0; $last = 0
+        foreach ($span in $proof[0].spans) {
+            if ($span -isnot [Collections.IDictionary]) { throw 'invalid-change' }
+            $start = Assert-IntakeNumber $span.startLine startLine 1 1000000
+            $end = Assert-IntakeNumber $span.endLine endLine $start 1000000
+            if ($start -le $last -or $end -gt $newCount) {
+                throw 'invalid-change'
+            }
+            $covered += $end - $start + 1
+            $last = $end
+        }
+        if ($covered -ne $plus) { throw 'invalid-change' }
+        $sumAdded += $plus; $sumDeleted += $minus
+    }
+    if ($scopedCount -ne $scoped -or
+        $sumAdded -ne $added -or $sumDeleted -ne $deleted) {
+        throw 'invalid-change'
+    }
+    return $true
 }
 
 function Assert-IntakeAccount {
@@ -747,7 +871,8 @@ function Get-IntakeSourceTree {
 
 function Assert-IntakeProjectScope {
     param([Collections.IDictionary]$Scope, [object[]]$Sources,
-        [string]$RepositoryId, [string]$SourceCommit, [int]$MaxFiles)
+        [string]$RepositoryId, [string]$SourceCommit, [int]$MaxFiles,
+        [switch]$CoverageOnly)
     if ($null -eq $Scope -or $Scope.schemaVersion -ne 1 -or
         $Scope.kind -cne 'source-bound-project-scope-summary-v1' -or
         $Scope.repositoryId -ine $RepositoryId -or
@@ -756,7 +881,10 @@ function Assert-IntakeProjectScope {
         $Scope.files.Count -gt $MaxFiles) {
         throw 'project-identity-unknown'
     }
-    $expected = @($Sources | Where-Object { $_.path -cmatch '\.cs$' })
+    $expected = @($Sources | Where-Object {
+            if ($CoverageOnly) { $_.path -match '\.cs$' }
+            else { $_.path -cmatch '\.cs$' }
+        })
     if ($Scope.files.Count -ne $expected.Count -or
         ($Scope.complete -and $expected.Count -gt 0 -and
             [string]$Scope.rootTreeId -cnotmatch '^[a-f0-9]{40}$') -or
@@ -1508,7 +1636,8 @@ function Invoke-ActivePrIntake {
             }
         }
         $envelope = [ordered]@{
-            schemaVersion = 1
+            schemaVersion = if ($Config['coverageBodyScope'] -eq
+                'csharp-rule-candidates-v1') { 2 } else { 1 }
             kind = 'active-pr-intake-cohort'
             generation = [guid]::NewGuid().ToString('N')
             generationOrdinal = if ($previous) {
@@ -1555,6 +1684,9 @@ function Invoke-ActivePrIntake {
             rules = @()
             unmetCapabilities = @()
             reasonCodes = @()
+        }
+        if ($envelope.schemaVersion -eq 2) {
+            $envelope.coverageBodyScope = $Config.coverageBodyScope
         }
         $envelope.generationFile = Join-Path 'generations' "$($envelope.generation).json"
         $reasons = [Collections.Generic.List[string]]::new()
@@ -1743,6 +1875,7 @@ function Invoke-ActivePrIntake {
                                     sourceCommit = $before.sourceCommit
                                     targetCommit = $before.targetCommit
                                     commonCommit = $before.commonCommit
+                                    coverageBodyScope = $Config['coverageBodyScope']
                                     includeProjectEvidence = ($null -ne $Config['projectEvidence'] -and
                                         $Config.projectEvidence.enabled -ceq $true)
                                     includeEvaluationFiles = ($null -ne $Config['projectEvidence'] -and
@@ -1750,23 +1883,51 @@ function Invoke-ActivePrIntake {
                                 } $Config ([ref]$reads) $clock
                                 $files = Assert-IntakeNumber $changes.changedFiles changedFiles 0 100000
                                 if ($files -gt [int]$Config.limits.maxChangedFiles) { throw 'file-budget' }
+                                $coverage = $Config['coverageBodyScope'] -ceq
+                                    'csharp-rule-candidates-v1'
                                 $lines = $null
-                                if ($null -ne $changes['changedLines']) {
+                                if ($coverage) {
+                                    $lines = Assert-IntakeNumber $changes.scopedChangedLines `
+                                        scopedChangedLines 0 1000000
+                                } elseif ($null -ne $changes['changedLines']) {
                                     $lines = Assert-IntakeNumber $changes.changedLines changedLines 0 1000000
                                     if ($lines -gt [int]$Config.limits.maxChangedLines) { throw 'line-budget' }
                                 }
                                 $evidence = $null
                                 if ($null -ne $lines) {
-                                    if ($files -eq 0 -or $lines -eq 0) {
+                                    if ($files -eq 0 -or (-not $coverage -and $lines -eq 0)) {
                                         throw 'unsupported-change'
                                     }
                                     if ($null -eq $changes['files']) {
                                         throw 'line-count-unavailable'
                                     }
                                     if ($changes.files -isnot [array] -or
-                                        $changes.files.Count -ne $files -or
+                                        ($coverage -and
+                                            ($changes.files.Count -ne
+                                                $changes.scopedChangedFiles -or
+                                                $changes.changedFiles -ne
+                                                    $changes.manifest.changedFiles)) -or
+                                        (-not $coverage -and
+                                            $changes.files.Count -ne $files) -or
                                         $changes['baseCommit'] -cne $before.commonCommit) {
                                         throw 'invalid-change'
+                                    }
+                                    if ($coverage) {
+                                        $scopedProof = [ordered]@{
+                                            schemaVersion = 2
+                                            kind = 'coverage-only-scoped-lines'
+                                            baseCommit = $before.commonCommit
+                                            changedFiles = $files
+                                            scopedChangedFiles = $changes.scopedChangedFiles
+                                            scopedChangedLines = $lines
+                                            scopedAddedLines = $changes.scopedAddedLines
+                                            scopedDeletedLines = $changes.scopedDeletedLines
+                                            manifestDigest = Get-IntakeDigest $changes.manifest
+                                            manifest = $changes.manifest
+                                            files = $changes.files
+                                        }
+                                        [void](Assert-ActivePrCoverageProof $scopedProof `
+                                                $Config.limits)
                                     }
                                     $added = 0
                                     $deleted = 0
@@ -1783,7 +1944,9 @@ function Invoke-ActivePrIntake {
                                         $plus = Assert-IntakeNumber $file.addedLines addedLines 0 1000000
                                         $minus = Assert-IntakeNumber $file.deletedLines deletedLines 0 1000000
                                         $newCount = Assert-IntakeNumber $file.newLineCount newLineCount 0 1000000
-                                        if ($plus + $minus -eq 0 -or
+                                        if (($plus + $minus -eq 0 -and
+                                                (-not $coverage -or
+                                                    $file.changeType -cne 'rename')) -or
                                             [string]$file.changeType -cnotin @(
                                                 'add', 'edit', 'delete', 'rename') -or
                                             ($file.changeType -ceq 'add' -and $minus -ne 0) -or
@@ -1815,11 +1978,20 @@ function Invoke-ActivePrIntake {
                                         configDigest = $envelope.binding.configDigest
                                         baseCommit = $before.commonCommit
                                         changedFiles = $files
-                                        changedLines = $lines
-                                        addedLines = $added
-                                        deletedLines = $deleted
-                                        files = $changes.files
                                     }
+                                    if ($coverage) {
+                                        foreach ($name in @('schemaVersion', 'kind',
+                                                'scopedChangedFiles', 'scopedChangedLines',
+                                                'scopedAddedLines', 'scopedDeletedLines',
+                                                'manifestDigest', 'manifest')) {
+                                            $evidence[$name] = $scopedProof[$name]
+                                        }
+                                    } else {
+                                        $evidence.changedLines = $lines
+                                        $evidence.addedLines = $added
+                                        $evidence.deletedLines = $deleted
+                                    }
+                                    $evidence.files = $changes.files
                                 }
                                 $discussion = Invoke-IntakeRead $Provider Discussions @{
                                     pullRequestId = $id; iterationId = $before.iterationId
@@ -1860,7 +2032,8 @@ function Invoke-ActivePrIntake {
                                         }
                                     }
                                     Assert-IntakeProjectScope $scope $changes.evaluationFiles `
-                                        $before.repositoryId $before.sourceCommit $files
+                                        $before.repositoryId $before.sourceCommit $files `
+                                        -CoverageOnly:$coverage
                                     $entry.projectEvidence = [ordered]@{
                                         schemaVersion = 1
                                         kind = 'source-bound-project-scope-summary-v1'
@@ -2795,6 +2968,14 @@ function New-ActivePrAzureDevOpsProvider {
                 return $head
             }
             Changes {
+                $coverageScope = $Config['coverageBodyScope'] -ceq
+                    'csharp-rule-candidates-v1'
+                if (($coverageScope -and $Request['coverageBodyScope'] -cne
+                        'csharp-rule-candidates-v1') -or
+                    (-not $coverageScope -and
+                        $null -ne $Request['coverageBodyScope'])) {
+                    throw 'invalid-change'
+                }
                 $id = [int]$Request.pullRequestId
                 $iteration = [int]$Request.iterationId
                 $remaining = if ($null -eq $Request['remainingReads']) {
@@ -2917,7 +3098,117 @@ function New-ActivePrAzureDevOpsProvider {
                 $evaluationFiles = [Collections.Generic.List[object]]::new()
                 $totalBytes = 0
                 $totalLines = 0
+                $scopedAdded = 0
+                $scopedDeleted = 0
                 $cellsLeft = [int]$Config.limits.maxDiffCells
+                $metadata = @{}
+                $manifestEntries = [Collections.Generic.List[object]]::new()
+                if ($coverageScope) {
+                    $ordinal = 0
+                    foreach ($change in $entries) {
+                        $ordinal++
+                        if ($change -isnot [Collections.IDictionary] -or
+                            $change.item -isnot [Collections.IDictionary] -or
+                            [string]$change.item.path -cnotmatch
+                                '^/[^?#\x00-\x1f]{1,2048}$' -or
+                            [string]$change.changeType -cnotin
+                                @('add', 'edit', 'delete', 'rename')) {
+                            throw 'invalid-change'
+                        }
+                        $path = [string]$change.item.path
+                        $kind = [string]$change.changeType
+                        if ($kind -eq 'rename' -and
+                            ([string]$change.originalPath -cnotmatch
+                                '^/[^?#\x00-\x1f]{1,2048}$' -or
+                                [string]$change.originalPath -ceq $path)) {
+                            throw 'unsupported-change'
+                        }
+                        $oldPath = if ($kind -eq 'rename') {
+                            [string]$change.originalPath
+                        } else { $path }
+                        $scope = if ($path -match '\.cs$' -or
+                            ($kind -eq 'rename' -and $oldPath -match '\.cs$')) {
+                            'csharp-body-diff'
+                        } else { 'metadata-only' }
+                        $oldId = $null; $newId = $null; $oldItem = $null
+                        if ($kind -ne 'add') {
+                            $oldItem = & $read 'items' $route @(
+                                "path=$oldPath",
+                                "versionDescriptor.version=$($Request.commonCommit)",
+                                'versionDescriptor.versionType=commit',
+                                'includeContent=false', 'includeContentMetadata=true') 65536
+                            if ($oldItem -isnot [Collections.IDictionary] -or
+                                [string]$oldItem.path -cne $oldPath -or
+                                [string]$oldItem.gitObjectType -cne 'blob' -or
+                                $oldItem['isFolder'] -eq $true -or
+                                $oldItem['isSymLink'] -eq $true -or
+                                $oldItem.Contains('content') -or
+                                ($scope -ceq 'csharp-body-diff' -and
+                                    $oldItem['contentMetadata'] -is
+                                        [Collections.IDictionary] -and
+                                    ($oldItem.contentMetadata['isBinary'] -eq
+                                        $true -or
+                                        ($null -ne
+                                            $oldItem.contentMetadata['encoding'] -and
+                                            [string]$oldItem.contentMetadata.encoding -cne
+                                                '65001'))) -or
+                                [string]$oldItem.objectId -cnotmatch
+                                    '^[a-fA-F0-9]{40}$' -or
+                                ($change.item['originalObjectId'] -and
+                                    [string]$change.item.originalObjectId -ine
+                                        [string]$oldItem.objectId)) {
+                                throw 'invalid-item'
+                            }
+                            $oldId = ([string]$oldItem.objectId).ToLowerInvariant()
+                        }
+                        if ($kind -ne 'delete') {
+                            if ([string]$change.item.objectId -cnotmatch
+                                '^[a-fA-F0-9]{40}$') { throw 'invalid-change' }
+                            $newItem = & $read 'items' $route @(
+                                "path=$path",
+                                "versionDescriptor.version=$($Request.sourceCommit)",
+                                'versionDescriptor.versionType=commit',
+                                'includeContent=false', 'includeContentMetadata=true') 65536
+                            if ($newItem -isnot [Collections.IDictionary] -or
+                                [string]$newItem.path -cne $path -or
+                                [string]$newItem.gitObjectType -cne 'blob' -or
+                                $newItem['isFolder'] -eq $true -or
+                                $newItem['isSymLink'] -eq $true -or
+                                $newItem.Contains('content') -or
+                                ($scope -ceq 'csharp-body-diff' -and
+                                    $newItem['contentMetadata'] -is
+                                        [Collections.IDictionary] -and
+                                    ($newItem.contentMetadata['isBinary'] -eq
+                                        $true -or
+                                        ($null -ne
+                                            $newItem.contentMetadata['encoding'] -and
+                                            [string]$newItem.contentMetadata.encoding -cne
+                                                '65001'))) -or
+                                [string]$newItem.objectId -ine
+                                    [string]$change.item.objectId) {
+                                throw 'invalid-item'
+                            }
+                            $newId = ([string]$newItem.objectId).ToLowerInvariant()
+                        }
+                        $metadata[[int]$change.changeTrackingId] = @{
+                            oldItem = $oldItem; scope = $scope
+                        }
+                        $manifestEntries.Add([ordered]@{
+                            ordinal = $ordinal
+                            changeTrackingId = [int]$change.changeTrackingId
+                            pathDigest = & $digest $path
+                            originalPathDigest = if ($kind -eq 'rename') {
+                                & $digest $oldPath
+                            } else { $null }
+                            changeType = $kind
+                            oldObjectId = $oldId; newObjectId = $newId
+                            bodyScope = $scope
+                            reason = if ($scope -eq 'metadata-only') {
+                                'not-body-reviewed-for-coverage'
+                            } else { $null }
+                        })
+                    }
+                }
                 foreach ($change in $entries) {
                     if ($change -isnot [Collections.IDictionary] -or
                         $change.item -isnot [Collections.IDictionary] -or
@@ -2940,17 +3231,24 @@ function New-ActivePrAzureDevOpsProvider {
                         throw 'unsupported-change'
                     }
                     $oldPath = if ($kind -eq 'rename') { [string]$change.originalPath } else { $path }
+                    if ($coverageScope -and
+                        $metadata[[int]$change.changeTrackingId].scope -eq
+                            'metadata-only') { continue }
                     $old = ''
                     $new = ''
                     $cap = [Math]::Min([int]$Config.limits.maxFileBytes,
                         [int]$Config.limits.maxTotalBytes - $totalBytes)
                     if ($cap -lt 1) { throw 'byte-budget' }
                     if ($kind -ne 'add') {
-                        $item = & $read 'items' $route @(
-                            "path=$oldPath", "versionDescriptor.version=$($Request.commonCommit)",
-                            'versionDescriptor.versionType=commit',
-                            "includeContent=$(!$rawEnabled)",
-                            'includeContentMetadata=true') ($cap * 6 + 65536)
+                        $item = if ($coverageScope) {
+                            $metadata[[int]$change.changeTrackingId].oldItem
+                        } else {
+                            & $read 'items' $route @(
+                                "path=$oldPath", "versionDescriptor.version=$($Request.commonCommit)",
+                                'versionDescriptor.versionType=commit',
+                                "includeContent=$(!$rawEnabled)",
+                                'includeContentMetadata=true') ($cap * 6 + 65536)
+                        }
                         $blob = if ($rawEnabled) {
                             if ([string]$item.path -cne $oldPath -or
                                 [string]$item.gitObjectType -cne 'blob' -or
@@ -3002,10 +3300,13 @@ function New-ActivePrAzureDevOpsProvider {
                             'iteration-source-current-target-v1')
                     $cellsLeft -= $delta.cells
                     $totalLines += $delta.addedLines + $delta.deletedLines
+                    $scopedAdded += $delta.addedLines
+                    $scopedDeleted += $delta.deletedLines
                     if ($totalLines -gt [int]$Config.limits.maxChangedLines) {
                         throw 'line-budget'
                     }
-                    if ($delta.addedLines + $delta.deletedLines -eq 0) {
+                    if ($delta.addedLines + $delta.deletedLines -eq 0 -and
+                        (-not $coverageScope -or $kind -ne 'rename')) {
                         throw 'unsupported-change'
                     }
                     $results.Add([ordered]@{
@@ -3029,7 +3330,8 @@ function New-ActivePrAzureDevOpsProvider {
                 $scopeSummary = $null
                 if ($Request['includeProjectEvidence'] -ceq $true) {
                     $sourceFiles = @($evaluationFiles.ToArray() | Where-Object {
-                            $_.path -cmatch '\.cs$'
+                            if ($coverageScope) { $_.path -match '\.cs$' }
+                            else { $_.path -cmatch '\.cs$' }
                         })
                     $scopeReceipts = [Collections.Generic.List[object]]::new()
                     $tree = $null
@@ -3134,9 +3436,35 @@ function New-ActivePrAzureDevOpsProvider {
                         files = @($scopeReceipts.ToArray())
                     }
                 }
-                $answer = @{ changedFiles = $entries.Count; changedLines = $totalLines
+                $answer = @{ changedFiles = $entries.Count
                     baseCommit = ([string]$Request.commonCommit).ToLowerInvariant()
                     files = @($results.ToArray()); readCount = $counter.used }
+                if ($coverageScope) {
+                    $answer.manifest = [ordered]@{
+                        schemaVersion = 1
+                        kind = 'coverage-only-complete-change-manifest'
+                        sourceCommit = ([string]$Request.sourceCommit).ToLowerInvariant()
+                        commonCommit = ([string]$Request.commonCommit).ToLowerInvariant()
+                        changedFiles = $entries.Count
+                        entries = @($manifestEntries.ToArray())
+                    }
+                    $answer.scopedChangedFiles = $results.Count
+                    $answer.scopedChangedLines = $totalLines
+                    $answer.scopedAddedLines = $scopedAdded
+                    $answer.scopedDeletedLines = $scopedDeleted
+                    [void](Assert-ActivePrCoverageProof ([ordered]@{
+                                schemaVersion = 2
+                                kind = 'coverage-only-scoped-lines'
+                                baseCommit = $answer.baseCommit
+                                changedFiles = $answer.changedFiles
+                                scopedChangedFiles = $answer.scopedChangedFiles
+                                scopedChangedLines = $answer.scopedChangedLines
+                                scopedAddedLines = $answer.scopedAddedLines
+                                scopedDeletedLines = $answer.scopedDeletedLines
+                                manifestDigest = & $digest $answer.manifest
+                                manifest = $answer.manifest; files = $answer.files
+                            }) $Config.limits)
+                } else { $answer.changedLines = $totalLines }
                 if ($Request['includeEvaluationFiles'] -ceq $true) {
                     $answer.evaluationFiles = @($evaluationFiles.ToArray())
                 }
@@ -3162,4 +3490,4 @@ function New-ActivePrAzureDevOpsProvider {
     return $handler
 }
 
-Export-ModuleMember -Function Invoke-ActivePrIntake, New-ActivePrAzureDevOpsProvider, Get-ActivePrDiscussionCounts, Get-ActivePrDiscussionSnapshot
+Export-ModuleMember -Function Invoke-ActivePrIntake, New-ActivePrAzureDevOpsProvider, Get-ActivePrDiscussionCounts, Get-ActivePrDiscussionSnapshot, Assert-ActivePrCoverageProof

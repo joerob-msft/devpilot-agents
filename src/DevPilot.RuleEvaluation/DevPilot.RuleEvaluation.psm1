@@ -230,13 +230,23 @@ function Assert-RuleProjectEvidence {
 function Assert-RuleIntake {
     param([string]$StateRoot, [Collections.IDictionary]$Config,
         [Collections.IDictionary]$IntakeConfig, [string]$RepositoryRoot)
+    $coverage = $IntakeConfig['coverageBodyScope'] -ceq
+        'csharp-rule-candidates-v1'
+    if ($coverage -and ($Config['mode'] -cne 'coverage-only' -or
+            $Config.schemaVersion -ne 9)) {
+        throw 'intake-incomplete-or-unbound'
+    }
     $root = Resolve-AgentTrustedRoot -Path (Join-Path $StateRoot 'active-pr-intake-v1') `
         -Kind durable-state -RepositoryRoot $RepositoryRoot
     $generationRoot = Resolve-AgentTrustedRoot -Path (Join-Path $root 'generations') `
         -Kind durable-state -RepositoryRoot $RepositoryRoot
     $latest = Read-RuleJson (Join-Path $root 'cohort.json')
     $intake = $latest.value
-    if ($intake.schemaVersion -ne 1 -or $intake.kind -cne 'active-pr-intake-cohort' -or
+    if ($intake.schemaVersion -ne $(if ($coverage) { 2 } else { 1 }) -or
+        ($coverage -and $intake['coverageBodyScope'] -cne
+            'csharp-rule-candidates-v1') -or
+        (-not $coverage -and $intake.Contains('coverageBodyScope')) -or
+        $intake.kind -cne 'active-pr-intake-cohort' -or
         [string]$intake.generation -cnotmatch '^[a-f0-9]{32}$' -or
         $intake.generationFile -cne (Join-Path 'generations' "$($intake.generation).json") -or
         $intake.inventory.state -cne 'complete' -or
@@ -328,13 +338,38 @@ function Assert-RuleIntake {
             $declaration.status -cne 'active' -or $declaration.isDraft -cne $false -or
             $declaration.projectId -ine $Config.projectId -or
             $declaration.repositoryId -ine $Config.repositoryId -or
-            $evidence.changedLines -lt 1 -or
-            $evidence.changedLines -ne $evidence.addedLines + $evidence.deletedLines -or
             $evidence.files -isnot [array] -or
-            $evidence.files.Count -ne $evidence.changedFiles -or
             $evidence.changedFiles -gt $IntakeConfig.limits.maxChangedFiles -or
-            $evidence.changedLines -gt $IntakeConfig.limits.maxChangedLines) {
+            (-not $coverage -and
+                ($evidence.changedLines -lt 1 -or
+                    $evidence.changedLines -ne
+                        $evidence.addedLines + $evidence.deletedLines -or
+                    $evidence.files.Count -ne $evidence.changedFiles -or
+                    $evidence.changedLines -gt
+                        $IntakeConfig.limits.maxChangedLines))) {
             throw 'intake-evidence-invalid'
+        }
+        if ($coverage) {
+            if ($evidence['manifest'] -isnot [Collections.IDictionary] -or
+                $evidence.manifest.sourceCommit -cne
+                    $declaration.sourceCommit -or
+                $evidence.manifest.commonCommit -cne
+                    $declaration.commonCommit -or
+                $evidence.Contains('changedLines') -or
+                $evidence.Contains('addedLines') -or
+                $evidence.Contains('deletedLines')) {
+                throw 'intake-evidence-invalid'
+            }
+            try {
+                [void](Assert-ActivePrCoverageProof $evidence `
+                        $IntakeConfig.limits)
+            }
+            catch { throw 'intake-evidence-invalid' }
+            Assert-RuleProjectEvidence $head $intake.generation
+            if ($head.projectEvidence -isnot [Collections.IDictionary]) {
+                throw 'intake-project-evidence-invalid'
+            }
+            continue
         }
         $added = 0; $deleted = 0
         $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -439,7 +474,7 @@ function Assert-RuleHead {
 
 function Get-RuleTestProjectScope {
     param([object]$Evidence, [string]$RepositoryId, [string]$SourceCommit,
-        [string]$Path, [string]$ObjectId)
+        [string]$Path, [string]$ObjectId, [switch]$CoverageOnly)
     if ($Evidence -isnot [Collections.IDictionary] -or
         ($Evidence.schemaVersion -isnot [int] -and
             $Evidence.schemaVersion -isnot [long]) -or
@@ -454,7 +489,11 @@ function Get-RuleTestProjectScope {
             '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
         [string]$SourceCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
         [string]$ObjectId -cnotmatch '^[a-fA-F0-9]{40}$' -or
-        $Path -cnotmatch '^/[^?#\x00-\x1f]{1,2048}\.cs$' -or
+        $(if ($CoverageOnly) {
+                $Path -notmatch '^/[^?#\x00-\x1f]{1,2048}\.cs$'
+            } else {
+                $Path -cnotmatch '^/[^?#\x00-\x1f]{1,2048}\.cs$'
+            }) -or
         $Evidence.projects -isnot [array] -or
         $Evidence.projects.Count -lt 1 -or $Evidence.projects.Count -gt 32) {
         return 'unknown'
@@ -463,7 +502,13 @@ function Get-RuleTestProjectScope {
     $testCount = 0
     foreach ($project in $Evidence.projects) {
         if ($project -isnot [Collections.IDictionary] -or
-            [string]$project.path -cnotmatch '^/[^?#\x00-\x1f]{1,2048}\.csproj$' -or
+            $(if ($CoverageOnly) {
+                    [string]$project.path -notmatch
+                        '^/[^?#\x00-\x1f]{1,2048}\.csproj$'
+                } else {
+                    [string]$project.path -cnotmatch
+                        '^/[^?#\x00-\x1f]{1,2048}\.csproj$'
+                }) -or
             [string]$project.objectId -cnotmatch '^[a-fA-F0-9]{40}$' -or
             $project.compileIncluded -cne $true -or
             $project.isTestProject -isnot [bool] -or
@@ -480,7 +525,8 @@ function Get-RuleTestProjectScope {
 function Get-RuleEvaluation {
     param([string]$Capability, [object[]]$Files, [int]$MaximumFindings,
         [object]$Contract, [AllowNull()][object]$Snapshot,
-        [string]$RepositoryId, [string]$SourceCommit)
+        [string]$RepositoryId, [string]$SourceCommit,
+        [switch]$CoverageOnly)
     $findings = 0; $unknown = 0; $projectUnknown = 0
     $boundFindings = [Collections.Generic.List[object]]::new()
     foreach ($file in $Files) {
@@ -490,7 +536,8 @@ function Get-RuleEvaluation {
         $projectDigest = ''
         if ($projectRule) {
             $scope = Get-RuleTestProjectScope $file.projectEvidence $RepositoryId `
-                $SourceCommit $file.path $file.objectId
+                $SourceCommit $file.path $file.objectId `
+                -CoverageOnly:$CoverageOnly
             if ($scope -eq 'unknown') { $unknown++; $projectUnknown++; continue }
             if ($scope -eq 'non-test') { continue }
             $projectDigest = Get-RuleDigest $file.projectEvidence
@@ -1271,6 +1318,10 @@ function Assert-BoundedCandidateIntake {
         repositoryId = $Dispatcher.repositoryId
         limits = @{ maxIntakeAgeMinutes = 15 }
     }
+    if ($Dispatcher['mode'] -ceq 'coverage-only') {
+        $validation.mode = 'coverage-only'
+        $validation.schemaVersion = $Dispatcher.schemaVersion
+    }
     return Assert-RuleIntake $StateRoot $validation $IntakeConfig $RepositoryRoot
 }
 
@@ -1279,6 +1330,14 @@ function Invoke-BoundedCandidateParser {
         [Collections.IDictionary]$Head, [object[]]$Files,
         [Collections.IDictionary]$Discussions, [Collections.IDictionary]$IntakeConfig,
         [int]$MaximumFindings, [string]$ReviewerAdoUniqueName)
+    if ($Dispatcher['mode'] -ceq 'coverage-only' -and
+        ($Dispatcher.schemaVersion -ne 9 -or
+            $IntakeConfig['coverageBodyScope'] -cne
+                'csharp-rule-candidates-v1' -or
+            $Rule.id -cnotin @('bpm-test-class-coverage@2',
+                'bpm-redundant-method-coverage@2'))) {
+        throw 'intake-incomplete-or-unbound'
+    }
     $contract = New-OwnerAcquisitionContract `
         -RepositoryId $Head.repositoryId -ProjectId $Head.projectId `
         -PullRequestId $Head.pullRequestId -SourceCommit $Head.sourceCommit `
@@ -1286,9 +1345,8 @@ function Invoke-BoundedCandidateParser {
         -RuleRepositoryId $Rule.repositoryId -RulePath $Rule.path `
         -RuleCommit $Rule.commit -RuleSection $Rule.section `
         -RuleHash $Rule.hash -RuleLength $Rule.length `
-        -ConfigId $(if ($Dispatcher['mode'] -ceq 'coverage-only' -and
-                $Dispatcher.schemaVersion -eq 6) {
-                'private-coverage-only-canary-v1'
+        -ConfigId $(if ($Dispatcher['mode'] -ceq 'coverage-only') {
+                'private-coverage-only-canary-v2'
             } elseif ($Dispatcher.schemaVersion -eq 5) {
                 'private-merged-master-canary-v1'
             } else { 'private-canary-signed-intake-v1' }) `
@@ -1298,7 +1356,8 @@ function Invoke-BoundedCandidateParser {
     $snapshot = Get-ActivePrDiscussionSnapshot $Discussions $IntakeConfig `
         $Head $contract $ReviewerAdoUniqueName
     return Get-RuleEvaluation $Rule.id $Files $MaximumFindings $contract `
-        $snapshot $Head.repositoryId $Head.sourceCommit
+        $snapshot $Head.repositoryId $Head.sourceCommit `
+        -CoverageOnly:($Dispatcher['mode'] -ceq 'coverage-only')
 }
 
 Export-ModuleMember -Function Invoke-BoundedRuleEvaluation,
