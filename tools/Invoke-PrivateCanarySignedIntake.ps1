@@ -50,9 +50,20 @@ $merged = if ($Run) {
         -KeyPath $MergedPinKeyPath -RepositoryRoot $repo `
         -SourceSelector $source.selector
 } else { @{ envelope = $null; key = $null } }
-Invoke-PrivateCanarySignedIntake -ProviderConfig $providerConfig `
-    -ApprovedSources $approvedSources -StateRoot $StateRoot `
-    -RepositoryRoot $repo -CanaryPullRequestIds $CanaryPullRequestIds `
-    -SourceSelector $source.selector -SourceSelectorKey $source.key `
-    -MergedPinEnvelope $merged.envelope -MergedPinKey $merged.key `
-    -AzureCliPath $AzureCliPath -Mode $Mode -Run:$Run | ConvertTo-Json -Depth 16
+$failureDiagnostic = [ref]$null
+try {
+    Invoke-PrivateCanarySignedIntake -ProviderConfig $providerConfig `
+        -ApprovedSources $approvedSources -StateRoot $StateRoot `
+        -RepositoryRoot $repo -CanaryPullRequestIds $CanaryPullRequestIds `
+        -SourceSelector $source.selector -SourceSelectorKey $source.key `
+        -MergedPinEnvelope $merged.envelope -MergedPinKey $merged.key `
+        -AzureCliPath $AzureCliPath -Mode $Mode -FailureDiagnostic $failureDiagnostic `
+        -Run:$Run | ConvertTo-Json -Depth 16
+}
+catch {
+    if ($failureDiagnostic.Value) {
+        $failureDiagnostic.Value | ConvertTo-Json -Depth 10 -Compress
+        throw 'canary-signed-intake-blocked'
+    }
+    throw
+}

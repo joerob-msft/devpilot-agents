@@ -29,7 +29,8 @@ function Get-IntakeDigest {
 
 function Invoke-IntakeBearerGet {
     param([Net.Http.HttpClient]$Client, [string]$Token, [string]$Url,
-        [DateTime]$Deadline, [int]$MaxBytes, [switch]$Raw)
+        [DateTime]$Deadline, [int]$MaxBytes, [switch]$Raw,
+        [Collections.IDictionary]$TransportTelemetry)
     if ([DateTime]::UtcNow -ge $Deadline -or $MaxBytes -lt 1 -or
         $MaxBytes -gt 16777216 -or
         $Url -cnotmatch '^https://(?:dev\.azure\.com|vssps\.dev\.azure\.com)/[A-Za-z0-9_-]+/' -or
@@ -45,15 +46,33 @@ function Invoke-IntakeBearerGet {
     $remaining = [Math]::Max(1, [int]($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
     $cancel = [Threading.CancellationTokenSource]::new($remaining)
     try {
+        if ($TransportTelemetry) { $TransportTelemetry.attemptedGets++ }
         $response = $Client.SendAsync($request,
             [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
             $cancel.Token).GetAwaiter().GetResult()
         try {
-            if ([int]$response.StatusCode -in @(429, 503)) { throw 'read-throttled' }
+            $status = [int]$response.StatusCode
+            $delayed = @($response.Headers | Where-Object {
+                $_.Key -match '(?i)^x-(?:ms-|vss-)?ratelimit-delay$' -and
+                @($_.Value | Where-Object {
+                    [string]$_ -match '^\s*(?:[1-9][0-9]*(?:\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)\s*$'
+                }).Count -gt 0
+            }).Count -gt 0
+            if ($status -in @(429, 503) -or $response.Headers.RetryAfter -or
+                $delayed) {
+                if ($TransportTelemetry) {
+                    $TransportTelemetry.throttleEvents++
+                    $TransportTelemetry.lastHttpStatus = $status
+                }
+                throw 'read-throttled'
+            }
             if (-not $response.IsSuccessStatusCode -or
                 $response.Headers.Contains('x-ms-continuationtoken') -or
                 $response.Headers.Contains('x-ms-continuation-token') -or
                 $response.Content.Headers.ContentEncoding.Count -gt 0) {
+                if ($TransportTelemetry -and -not $response.IsSuccessStatusCode) {
+                    $TransportTelemetry.lastHttpStatus = $status
+                }
                 throw 'read-inaccessible'
             }
             if ($null -ne $response.Content.Headers.ContentLength -and
@@ -80,7 +99,10 @@ function Invoke-IntakeBearerGet {
                 $bytes = $output.ToArray()
             }
             finally { $output.Dispose() }
-            if ($Raw) { return @{ bytes = $bytes } }
+            if ($Raw) {
+                if ($TransportTelemetry) { $TransportTelemetry.completedGets++ }
+                return @{ bytes = $bytes }
+            }
             if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and
                 $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) {
                 throw 'read-inaccessible'
@@ -93,6 +115,7 @@ function Invoke-IntakeBearerGet {
             if ($parsed -isnot [Collections.IDictionary]) {
                 throw 'read-inaccessible'
             }
+            if ($TransportTelemetry) { $TransportTelemetry.completedGets++ }
             return $parsed
         }
         finally { $response.Dispose() }
@@ -1916,7 +1939,8 @@ function New-ActivePrAzureDevOpsProvider {
         [string]$AzureCliPath = 'az', [switch]$Bootstrap,
         [scriptblock]$RawGet, [switch]$VerifyReadPrincipal,
         [string]$BearerToken, [Net.Http.HttpClient]$BoundClient,
-        [string]$ExpectedPrincipalName)
+        [string]$ExpectedPrincipalName,
+        [Collections.IDictionary]$TransportTelemetry)
     if (($null -eq $BoundClient) -ne [string]::IsNullOrEmpty($BearerToken) -or
         ($null -ne $BoundClient -and
             ($BearerToken -cnotmatch '^[A-Za-z0-9._~+/=-]{40,8192}$' -or
@@ -1978,7 +2002,7 @@ function New-ActivePrAzureDevOpsProvider {
                 & $boundRoute $boundOrg $project $Area $Resource $Route $Query
             }
             return & $boundGet $BoundClient $BearerToken $url `
-                $Deadline $MaxOutputBytes
+                $Deadline $MaxOutputBytes -TransportTelemetry $TransportTelemetry
         }
         $argv = if ($Area -eq 'token') {
             @('account', 'get-access-token', '--resource', $identityResource,
@@ -2152,7 +2176,8 @@ function New-ActivePrAzureDevOpsProvider {
                 $rawResult = & $boundGet $BoundClient $BearerToken $url $deadline `
                     $(if ($Operation -ceq 'Item') {
                             [int]$RawRequest.maxBytes
-                        } else { 65536 }) -Raw:($Operation -ceq 'Item')
+                        } else { 65536 }) -Raw:($Operation -ceq 'Item') `
+                    -TransportTelemetry $TransportTelemetry
                 if ($Operation -ceq 'Identity') {
                     $user = $rawResult.authenticatedUser
                     return @{ id = $user.id; descriptor = $user.subjectDescriptor
@@ -2277,10 +2302,10 @@ function New-ActivePrAzureDevOpsProvider {
                     $transportReads.Count += 2
                     $user = & $boundGet $BoundClient $BearerToken `
                         "$graphUrl/users/$escaped`?api-version=7.1-preview.1" `
-                        $deadline 65536
+                        $deadline 65536 -TransportTelemetry $TransportTelemetry
                     $storage = & $boundGet $BoundClient $BearerToken `
                         "$graphUrl/storagekeys/$escaped`?api-version=7.1" `
-                        $deadline 65536
+                        $deadline 65536 -TransportTelemetry $TransportTelemetry
                     if ([string]$user.descriptor -cne $descriptor -or
                         [string]$user.subjectKind -cne 'user' -or
                         [string]$user.principalName -ine

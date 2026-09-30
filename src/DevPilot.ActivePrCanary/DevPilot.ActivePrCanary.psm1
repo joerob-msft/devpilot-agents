@@ -1138,7 +1138,7 @@ function Assert-CanaryAccountBinding {
 function Invoke-CanaryAadGet {
     param([Net.Http.HttpClient]$Client, [string]$Token, [string]$Organization,
         [string]$Operation, [Collections.IDictionary]$Request,
-        [DateTime]$Deadline)
+        [DateTime]$Deadline, [Collections.IDictionary]$ReadTelemetry)
     $guid = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
     $sha = '^[a-f0-9]{40}$'
     $project = [string]$Request['projectName']
@@ -1246,24 +1246,24 @@ function Invoke-CanaryAadGet {
             $cancel.Token).GetAwaiter().GetResult()
         try {
             $failureStatus = [int]$response.StatusCode
-            $remainingExhausted = @($response.Headers | Where-Object {
-                $_.Key -match '(?i)^x-(?:ms-|vss-)?ratelimit-remaining(?:-.*)?$' -and
-                @($_.Value | Where-Object {
-                    [string]$_ -match '^\s*0\s*$'
-                }).Count -gt 0
-            }).Count -gt 0
             $delay = @($response.Headers | Where-Object {
                 $_.Key -match '(?i)^x-(?:ms-|vss-)?ratelimit-delay$' -and
                 @($_.Value | Where-Object {
-                    [string]$_ -match '^\s*[1-9][0-9]*(?:\.[0-9]+)?\s*$'
+                    [string]$_ -match '^\s*(?:[1-9][0-9]*(?:\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)\s*$'
                 }).Count -gt 0
             }).Count -gt 0
             if ($failureStatus -in @(429, 503) -or
-                $response.Headers.RetryAfter -or $remainingExhausted -or $delay) {
+                $response.Headers.RetryAfter -or $delay) {
                 $throttled = $true
+                if ($ReadTelemetry) {
+                    $ReadTelemetry.lastHttpStatus = $failureStatus
+                }
                 throw 'bootstrap-read-throttled'
             }
             if (-not $response.IsSuccessStatusCode) {
+                if ($ReadTelemetry) {
+                    $ReadTelemetry.lastHttpStatus = $failureStatus
+                }
                 throw 'bootstrap-read-inaccessible'
             }
             $failureStatus = 0
@@ -2480,6 +2480,7 @@ function Invoke-PrivateCanaryRuleRegistry {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [string]$AzureCliPath = 'az',
         [Collections.IDictionary]$BearerSession,
+        [Collections.IDictionary]$ReadTelemetry,
         [string]$ExpectedAccountUniqueName,
         [Collections.IDictionary]$SourceSelector,
         [string]$SourceSelectorKey,
@@ -2522,8 +2523,24 @@ function Invoke-PrivateCanaryRuleRegistry {
         $aadGet = ${function:Invoke-CanaryAadGet}
         $read = {
             param($Operation, $Request)
-            & $aadGet $session.client $session.token $organization `
-                $Operation $Request $deadline
+            if ($ReadTelemetry) { $ReadTelemetry.attemptedGets++ }
+            try {
+                $answer = & $aadGet $session.client $session.token $organization `
+                    $Operation $Request $deadline -ReadTelemetry $ReadTelemetry
+                if ($ReadTelemetry) { $ReadTelemetry.completedGets++ }
+                return $answer
+            }
+            catch {
+                if ($ReadTelemetry) {
+                    if ($_.Exception.Message -match '^bootstrap-read-throttled:') {
+                        $ReadTelemetry.throttleEvents++
+                    }
+                    if ($_.Exception.Message -match ':http-(\d{3})$') {
+                        $ReadTelemetry.lastHttpStatus = [int]$Matches[1]
+                    }
+                }
+                throw
+            }
         }.GetNewClosure()
         return New-VerifiedCanaryRuleRegistry -ProviderConfig $ProviderConfig `
             -ApprovedSources $ApprovedSources -RepositoryRoot $RepositoryRoot `
@@ -2533,6 +2550,172 @@ function Invoke-PrivateCanaryRuleRegistry {
             -Mode $Mode -Run
     }
     finally { if ($owned) { $owned.client.Dispose() } }
+}
+
+function New-CanaryIntakeFailureDiagnostic {
+    param([Collections.IDictionary]$Cohort, [int[]]$Selection,
+        [Collections.IDictionary]$TransportTelemetry,
+        [Collections.IDictionary]$ProviderCalls, [object]$RegistryReads,
+        [Collections.IDictionary]$SourceTelemetry)
+    $safeReasons = @('account-mismatch', 'invalid-page', 'mutable-page',
+        'page-cursor-collision', 'canary-not-in-complete-eligible-inventory',
+        'missing-page', 'page-budget', 'pr-budget', 'read-budget', 'time-budget',
+        'page-inaccessible', 'provider-inaccessible', 'head-drift',
+        'project-identity-unknown', 'unknown-heads', 'duplicate-list-entries-reconciled')
+    $reasons = if ($Cohort) {
+        @($Cohort.reasonCodes | Where-Object { $_ -cin $safeReasons } |
+            Select-Object -Unique)
+    } else { @() }
+    $checks = [Collections.Generic.List[string]]::new()
+    $selected = @($Selection | ForEach-Object {
+            $id = $_
+            $matches = @(if ($Cohort) {
+                    $Cohort.heads | Where-Object pullRequestId -EQ $id
+                })
+            $inventoryKnown = $Cohort -and
+                $Cohort.inventory.state -ceq 'complete' -and
+                $Cohort.populationKnown -ceq $true
+            $head = if ($matches.Count -eq 1) { $matches[0] } else { $null }
+            [ordered]@{
+                pullRequestId = $id
+                inventoryEligible = if ($inventoryKnown) {
+                    $null -ne $head -and $head.targetRef -ceq 'refs/heads/master'
+                } else { $null }
+                headProof = if ($head -and
+                    $head.status -cin @('pending', 'unknown', 'skipped')) {
+                    [string]$head.status
+                } else { 'unknown' }
+                reason = if ($head -and $head.reason -cin $safeReasons) {
+                    [string]$head.reason
+                } elseif ($head -and $head.status -ceq 'pending') {
+                    'rules-not-evaluated'
+                } else { 'unavailable' }
+            }
+        })
+    if ($Cohort) {
+        if ($Cohort.inventory.state -cne 'complete') {
+            $checks.Add('inventory-incomplete')
+        }
+        if ($Cohort.populationKnown -cne $true) {
+            $checks.Add('population-unknown')
+        }
+        if ($Cohort.gapCounts.enumerationUnknown -ne 0) {
+            $checks.Add('enumeration-gap')
+        }
+        if ($Cohort.gapCounts.duplicateEntries -ne 0) {
+            $checks.Add('duplicate-entries')
+        }
+        if ($null -ne $Cohort.inventory.nonDraft -and
+            $Cohort.inventory.nonDraft -ne $Cohort.heads.Count) {
+            $checks.Add('non-draft-cardinality')
+        }
+        if ($null -ne $Cohort.inventory.active -and
+            $Cohort.inventory.active -ne
+                ($Cohort.inventory.draft + $Cohort.inventory.nonDraft)) {
+            $checks.Add('active-cardinality')
+        }
+        if ($null -ne $Cohort.inventory.eligible -and
+            $Cohort.inventory.eligible -ne
+                ($Cohort.inventory.nonDraft -
+                    $Cohort.inventory.excludedOtherTargets)) {
+            $checks.Add('eligible-cardinality')
+        }
+        if (@($selected | Where-Object {
+                    $_.inventoryEligible -eq $false -or
+                    $_.headProof -cne 'pending'
+                }).Count -gt 0) {
+            $checks.Add('selected-head-or-evidence-unknown')
+        }
+    }
+    $driftDetected = $Cohort -and (
+        $Cohort.gapCounts.drift -gt 0 -or
+        @($reasons | Where-Object {
+                $_ -cin @('mutable-page', 'page-cursor-collision', 'head-drift')
+            }).Count -gt 0)
+    return [ordered]@{
+        schemaVersion = 1
+        kind = 'private-canary-intake-failure-diagnostic'
+        state = 'blocked'
+        failureCode = $null
+        failedChecks = @($checks.ToArray())
+        reasonCodes = $reasons
+        selected = $selected
+        inventory = if ($Cohort) {
+            [ordered]@{
+                state = if ($Cohort.inventory.state -cin @('complete', 'unknown')) {
+                    [string]$Cohort.inventory.state
+                } else { 'unknown' }
+                populationKnown = $Cohort.populationKnown -ceq $true
+                active = $Cohort.inventory.active
+                nonDraft = $Cohort.inventory.nonDraft
+                draft = $Cohort.inventory.draft
+                eligible = $Cohort.inventory.eligible
+                headCount = $Cohort.heads.Count
+                enumerationUnknown = [int]$Cohort.gapCounts.enumerationUnknown
+                duplicateEntries = [int]$Cohort.gapCounts.duplicateEntries
+                drift = [int]$Cohort.gapCounts.drift
+                firstPassPages = [int]$Cohort.pages.first
+                secondPassPages = [int]$Cohort.pages.second
+                intakeReportedReads = $Cohort.readCount
+            }
+        } else { $null }
+        provider = [ordered]@{
+            attemptedCalls = [int]$ProviderCalls.attempted
+            completedCalls = [int]$ProviderCalls.completed
+            attemptedGets = if ($TransportTelemetry) {
+                [int]$TransportTelemetry.attemptedGets
+            } else { $null }
+            completedGets = if ($TransportTelemetry) {
+                [int]$TransportTelemetry.completedGets
+            } else { $null }
+            sourceRegistryCompletedGets = $RegistryReads
+            sourceAttemptedGets = if ($SourceTelemetry) {
+                [int]$SourceTelemetry.attemptedGets
+            } else { $null }
+            sourceCompletedGets = if ($SourceTelemetry) {
+                [int]$SourceTelemetry.completedGets
+            } else { $null }
+            totalAttemptedGets = if ($SourceTelemetry -and $TransportTelemetry) {
+                [int]$SourceTelemetry.attemptedGets +
+                    [int]$TransportTelemetry.attemptedGets
+            } else { $null }
+            totalCompletedGets = if ($SourceTelemetry -and $TransportTelemetry) {
+                [int]$SourceTelemetry.completedGets +
+                    [int]$TransportTelemetry.completedGets
+            } else { $null }
+            throttleEvents = if ($SourceTelemetry -and $TransportTelemetry) {
+                [int]$SourceTelemetry.throttleEvents +
+                    [int]$TransportTelemetry.throttleEvents
+            } elseif ($TransportTelemetry) {
+                [int]$TransportTelemetry.throttleEvents
+            } elseif ($SourceTelemetry) {
+                [int]$SourceTelemetry.throttleEvents
+            } else { $null }
+            lastHttpStatus = if ($TransportTelemetry -and
+                $null -ne $TransportTelemetry.lastHttpStatus) {
+                $TransportTelemetry.lastHttpStatus
+            } elseif ($SourceTelemetry) {
+                $SourceTelemetry.lastHttpStatus
+            } else { $null }
+        }
+        throttleState = if (($TransportTelemetry -and
+                $TransportTelemetry.throttleEvents -gt 0) -or
+            ($SourceTelemetry -and $SourceTelemetry.throttleEvents -gt 0)) {
+            'detected'
+        } elseif ($TransportTelemetry -and $SourceTelemetry) {
+            'not-observed'
+        } else { 'unknown' }
+        driftState = if ($driftDetected) {
+            'detected'
+        } elseif ($Cohort -and $Cohort.inventory.state -ceq 'complete') {
+            'not-observed'
+        } else { 'unknown' }
+        privateIntakePersisted = $null
+        signed = $false
+        evaluated = $false
+        writerEligible = $false
+        providerWrites = 0
+    }
 }
 
 function Invoke-PrivateCanarySignedIntake {
@@ -2552,6 +2735,7 @@ function Invoke-PrivateCanarySignedIntake {
         [scriptblock]$Read,
         [scriptblock]$Provider,
         [ValidateSet('FourRule', 'CoverageOnly')][string]$Mode = 'FourRule',
+        [ref]$FailureDiagnostic,
         [switch]$Run
     )
     if ($CanaryPullRequestIds.Count -lt 1 -or $CanaryPullRequestIds.Count -gt 2 -or
@@ -2588,6 +2772,11 @@ function Invoke-PrivateCanarySignedIntake {
     $created = $false
     $root = $null
     $creationState = @{ created = $false }
+    $registry = $null
+    $gate = @{ pins = $null; finalRegistry = $null; cohort = $null }
+    $providerCalls = @{ attempted = 0; completed = 0; failureCode = $null }
+    $transportTelemetry = $null
+    $sourceTelemetry = $null
     try {
     if (-not $Read) {
         $session = New-PrivateCanaryBearerSession $RepositoryRoot $AzureCliPath
@@ -2604,6 +2793,11 @@ function Invoke-PrivateCanarySignedIntake {
         $registryArgs.Read = $Read
         $registry = New-VerifiedCanaryRuleRegistry @registryArgs
     } else {
+        $sourceTelemetry = [ordered]@{
+            attemptedGets = 0; completedGets = 0; throttleEvents = 0
+            lastHttpStatus = $null
+        }
+        $registryArgs.ReadTelemetry = $sourceTelemetry
         $registry = Invoke-PrivateCanaryRuleRegistry @registryArgs `
             -BearerSession $session
     }
@@ -2630,10 +2824,31 @@ function Invoke-PrivateCanarySignedIntake {
         })
     $intake.limits.maxHeadsPerRun = $CanaryPullRequestIds.Count
     if (-not $Provider) {
+        $transportTelemetry = [ordered]@{
+            attemptedGets = 0; completedGets = 0; throttleEvents = 0
+            lastHttpStatus = $null
+        }
         $Provider = New-ActivePrAzureDevOpsProvider -Config $intake `
             -BearerToken $session.token -BoundClient $session.client `
-            -VerifyReadPrincipal -ExpectedPrincipalName $ExpectedAccountUniqueName
+            -VerifyReadPrincipal -ExpectedPrincipalName $ExpectedAccountUniqueName `
+            -TransportTelemetry $transportTelemetry
     }
+    $innerProvider = $Provider
+    $Provider = {
+        param($operation, $request)
+        $providerCalls.attempted++
+        try {
+            $answer = & $innerProvider $operation $request
+            $providerCalls.completed++
+            return $answer
+        }
+        catch {
+            if ($_.Exception.Message -ceq 'read-throttled') {
+                $providerCalls.failureCode = 'read-throttled'
+            }
+            throw
+        }
+    }.GetNewClosure()
     $preflight = & $Provider Identity @{ timeoutMilliseconds = 120000 }
     Assert-CanaryAccountBinding $preflight $ProviderConfig.expectedAccount
     if ([string]$preflight.principalName -ine $ExpectedAccountUniqueName -or
@@ -2650,9 +2865,9 @@ function Invoke-PrivateCanarySignedIntake {
         }
         $preflightReads += $extra
     }
-    $gate = @{ pins = $null; finalRegistry = $null }
     $beforePersist = {
         param([Collections.IDictionary]$cohort)
+        $gate.cohort = $cohort
         if ($cohort.inventory.state -cne 'complete' -or
             $cohort.populationKnown -cne $true -or
             $cohort.gapCounts.enumerationUnknown -ne 0 -or
@@ -2820,6 +3035,25 @@ function Invoke-PrivateCanarySignedIntake {
     }
     catch {
         $failure = $_
+        if ($FailureDiagnostic) {
+            $diagnostic = New-CanaryIntakeFailureDiagnostic $gate.cohort `
+                $CanaryPullRequestIds $transportTelemetry $providerCalls `
+                $(if ($registry) { $registry.providerReads } else { $null }) `
+                $sourceTelemetry
+            $safeFailures = @('canary-inventory-unknown',
+                'canary-head-or-evidence-unknown', 'canary-source-drift',
+                'read-throttled', 'canary-principal-drift',
+                'canary-intake-not-verified', 'canary-state-root-must-be-new')
+            $diagnostic.failureCode = if ($failure.Exception.Message -cin
+                $safeFailures) {
+                [string]$failure.Exception.Message
+            } else { 'canary-preflight-incomplete' }
+            if ($providerCalls.failureCode -ceq 'read-throttled' -or
+                $diagnostic.failureCode -ceq 'read-throttled') {
+                $diagnostic.throttleState = 'detected'
+            }
+            $FailureDiagnostic.Value = $diagnostic
+        }
         if ($null -ne $creationState -and $creationState.created) {
             $root = [string]$creationState.root
             $canonical = [IO.Path]::GetFullPath($StateRoot)
@@ -2843,6 +3077,10 @@ function Invoke-PrivateCanarySignedIntake {
                             [IO.Path]::GetFileName($root)) + ')$')
             }
             catch { throw 'canary-private-state-cleanup-failed' }
+        }
+        if ($FailureDiagnostic) {
+            $FailureDiagnostic.Value.privateIntakePersisted =
+                Test-Path -LiteralPath $StateRoot
         }
         throw $failure
     }

@@ -22,6 +22,21 @@ four-rule receipts/configs are not interchangeable. Source, identity, and
 selected graph/head proofs complete **before** creating a new private intake
 root, lock, key, or generation.
 
+If signed intake cannot prove a complete inventory or selected head, it still
+exits with an error and creates no intake root. Its failure output contains a
+sanitized `private-canary-intake-failure-diagnostic`: allowlisted page and
+head reason codes, the failed completeness checks, per-selected-PR eligibility
+(`null` if unknown), and attempted/completed GET counts where the bound
+transport can measure them. A throttle indicator stops the run without retry;
+an HTTP status may be reported as a number, never with a route, header value,
+account, or response body. Unknown counts remain `null`, not zero. This
+diagnostic does **not** relax the completeness gate, sign a config, or provide
+finding evidence. Failures from runs before this diagnostic existed cannot be
+attributed to a particular page, head, or throttle retrospectively.
+HTTP 200 rate-limit remaining/limit/reset budget metadata alone, even when
+remaining is zero, is not a throttle signal; explicit 429/503, `Retry-After`,
+or a positive server-directed rate-limit delay stops the GET-only run.
+
 Once the parent source-only pin contract is available and an operator
 explicitly provisions its ACL-private pin, selector, and key outside this
 repository, the operator can use the

@@ -24,6 +24,7 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
     public bool Oversize = false;
     public bool InvalidJson = false;
     public bool ThrottleHint = false;
+    public bool DelayHint = false;
     public string BudgetRemaining;
     public byte[] Body;
     public byte[] GraphUserBody;
@@ -78,9 +79,14 @@ public sealed class CanarySyntheticHandler : HttpMessageHandler {
                 new System.Net.Http.Headers.RetryConditionHeaderValue(
                     TimeSpan.FromSeconds(1));
         }
+        if (DelayHint) {
+            response.Headers.Add("x-ms-ratelimit-delay", "0.5");
+        }
         if (BudgetRemaining != null) {
             response.Headers.Add("x-ms-ratelimit-remaining-resource",
                 BudgetRemaining);
+            response.Headers.Add("x-ms-ratelimit-limit-resource", "100");
+            response.Headers.Add("x-ms-ratelimit-reset-resource", "1");
         }
         return Task.FromResult(response);
     }
@@ -101,12 +107,18 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
     public bool DriftStorageKey = false;
     public bool DriftGraphUpn = false;
     public bool ThrottleInventory = false;
+    public bool ServiceUnavailableInventory = false;
+    public bool ThrottleHintInventory = false;
+    public bool DelayHintInventory = false;
+    public string InventoryRemaining = null;
+    public bool MissingInventory = false;
     public bool TooLarge = false;
     public bool DriftRef = false;
     public bool GraphEnabled = false;
     public bool CorruptTree = false;
     public bool MissingProject = false;
     public bool ThrottleTree = false;
+    public bool ThrottleGraphStorage = false;
     public bool IncompleteChanges = false;
     public string SourceFile;
     public string ProjectFile;
@@ -194,11 +206,30 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         }
         var response = new HttpResponseMessage(
             (ThrottleInventory && path.EndsWith("/pullRequests")) ||
+            (ThrottleGraphStorage && path.EndsWith("/graph/storagekeys/aad.synthetic")) ||
             (ThrottleTree && path.Contains("/trees/"))
-                ? (HttpStatusCode)429 : HttpStatusCode.OK) {
+                ? (HttpStatusCode)429 :
+            ServiceUnavailableInventory && path.EndsWith("/pullRequests")
+                ? HttpStatusCode.ServiceUnavailable :
+            MissingInventory && path.EndsWith("/pullRequests")
+                ? HttpStatusCode.NotFound : HttpStatusCode.OK) {
             Content = new ByteArrayContent(TooLarge ? new byte[65537] :
                 Encoding.UTF8.GetBytes(body))
         };
+        if (ThrottleHintInventory && path.EndsWith("/pullRequests")) {
+            response.Headers.RetryAfter =
+                new System.Net.Http.Headers.RetryConditionHeaderValue(
+                    TimeSpan.FromSeconds(1));
+        }
+        if (DelayHintInventory && path.EndsWith("/pullRequests")) {
+            response.Headers.Add("x-ms-ratelimit-delay", "0.5");
+        }
+        if (InventoryRemaining != null && path.EndsWith("/pullRequests")) {
+            response.Headers.Add("x-ms-ratelimit-remaining-resource",
+                InventoryRemaining);
+            response.Headers.Add("x-ms-ratelimit-limit-resource", "100");
+            response.Headers.Add("x-ms-ratelimit-reset-resource", "1");
+        }
         response.Content.Headers.ContentType =
             new System.Net.Http.Headers.MediaTypeHeaderValue(
                 path.EndsWith("/items") &&
@@ -622,6 +653,9 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                     return $identity
                 }
                 ListPage {
+                    if ($state.wrong -eq 'inaccessible-page') {
+                        throw 'private route and account must not escape'
+                    }
                     if ($request.skip -ne 0 -or $request.top -ne 51 -or
                         [string]$request.maxTime -cnotmatch
                             '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z$') {
@@ -764,7 +798,11 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
         return @{ input = $inputCase; root = $root; state = $state
             read = $read; provider = $provider }
     }
-    function Invoke-SignedIntakeCase($Case) {
+    function Invoke-SignedIntakeCase($Case, [ref]$FailureDiagnostic) {
+        $diagnosticArgs = @{}
+        if ($FailureDiagnostic) {
+            $diagnosticArgs.FailureDiagnostic = $FailureDiagnostic
+        }
         Invoke-PrivateCanarySignedIntake -ProviderConfig $Case.input.config `
             -ApprovedSources $Case.input.sources -StateRoot $Case.root `
             -RepositoryRoot $repo -CanaryPullRequestIds @(17007699, 17109075) `
@@ -774,6 +812,7 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             -MergedPinKey $script:mergedKey `
             -ExpectedAccountUniqueName 'service@example.invalid' `
             -Read $Case.read -Provider $Case.provider `
+            @diagnosticArgs `
             -Mode $(if ($Case.input.sources.mode -ceq 'coverage-only') {
                     'CoverageOnly'
                 } else { 'FourRule' }) -Run
@@ -2052,6 +2091,92 @@ Describe 'Read-only private canary input bootstrap' {
                         }).Count | Should -Be 0
                 }
             }
+            It 'preserves typed, selector-free inventory and transport diagnostics without state' {
+                foreach ($mode in @('split-page', 'inaccessible-page',
+                        'stale-head', 'throttle-changes')) {
+                    $c = Get-SignedIntakeCase -CoverageOnly -Code
+                    $c.state.wrong = $mode
+                    $diagnostic = [ref]$null
+                    { Invoke-SignedIntakeCase $c $diagnostic } |
+                        Should -Throw -Because $mode
+                    $d = $diagnostic.Value
+                    $d.state | Should -Be 'blocked'
+                    $d.signed | Should -BeFalse
+                    $d.privateIntakePersisted | Should -BeFalse
+                    $d.selected.Count | Should -Be 2
+                    $d.provider.attemptedCalls | Should -BeGreaterThan 0
+                    $d.provider.completedGets | Should -BeNullOrEmpty
+                    $d.provider.attemptedGets | Should -BeNullOrEmpty
+                    if ($mode -eq 'split-page') {
+                        $d.failureCode | Should -Be 'canary-inventory-unknown'
+                        $d.reasonCodes | Should -Contain 'missing-page'
+                        $d.failedChecks | Should -Contain 'enumeration-gap'
+                        $d.selected[0].inventoryEligible | Should -BeNullOrEmpty
+                    } elseif ($mode -eq 'inaccessible-page') {
+                        $d.reasonCodes | Should -Contain 'page-inaccessible'
+                        $d.failureCode | Should -Be 'canary-inventory-unknown'
+                    } elseif ($mode -eq 'stale-head') {
+                        $d.failureCode | Should -Be 'canary-head-or-evidence-unknown'
+                        $d.driftState | Should -Be 'detected'
+                        $d.selected[0].inventoryEligible | Should -BeTrue
+                    } else {
+                        $d.failureCode | Should -Be 'read-throttled'
+                        $d.throttleState | Should -Be 'detected'
+                        $d.provider.attemptedCalls |
+                            Should -BeGreaterThan $d.provider.completedCalls
+                    }
+                    ($d | ConvertTo-Json -Depth 10) |
+                        Should -Not -Match 'private route|ExampleSource|ExampleRepo|service@example.invalid'
+                    Test-Path -LiteralPath $c.root | Should -BeFalse
+                }
+            }
+            It 'distinguishes inventory duplicates and cardinality without assuming eligibility' {
+                $cohort = @{
+                    inventory = @{ state = 'complete'; active = 4
+                        nonDraft = 3; draft = 1; eligible = 2
+                        excludedOtherTargets = 1 }
+                    populationKnown = $true
+                    gapCounts = @{ enumerationUnknown = 0
+                        duplicateEntries = 1; drift = 0 }
+                    reasonCodes = @('private detail')
+                    heads = @(@{ pullRequestId = 17007699; status = 'pending'
+                            targetRef = 'refs/heads/master'; reason = 'rules-incomplete' })
+                    pages = @{ first = 2; second = 2 }
+                    readCount = 8
+                }
+                $d = & (Get-Module DevPilot.ActivePrCanary) {
+                    param($Cohort)
+                    New-CanaryIntakeFailureDiagnostic $Cohort `
+                        @(17007699, 17109075) $null `
+                        @{ attempted = 4; completed = 3 } $null $null
+                } $cohort
+                $d.failedChecks | Should -Contain 'duplicate-entries'
+                $d.failedChecks | Should -Contain 'non-draft-cardinality'
+                $d.selected[0].inventoryEligible | Should -BeTrue
+                $d.selected[1].inventoryEligible | Should -BeFalse
+                $d.reasonCodes | Should -BeNullOrEmpty
+                $d.inventory.intakeReportedReads | Should -Be 8
+                ($d | ConvertTo-Json -Depth 8) | Should -Not -Match 'private detail'
+            }
+            It 'keeps actual failed GET attempts distinct from completed source and provider GETs' {
+                $provider = [ordered]@{ attemptedGets = 4; completedGets = 3
+                    throttleEvents = 1; lastHttpStatus = 429 }
+                $source = [ordered]@{ attemptedGets = 24; completedGets = 24
+                    throttleEvents = 0; lastHttpStatus = $null }
+                $d = & (Get-Module DevPilot.ActivePrCanary) {
+                    param($Provider, $Source)
+                    New-CanaryIntakeFailureDiagnostic $null `
+                        @(17007699, 17109075) $Provider `
+                        @{ attempted = 2; completed = 1 } 24 $Source
+                } $provider $source
+                $d.provider.totalAttemptedGets | Should -Be 28
+                $d.provider.totalCompletedGets | Should -Be 27
+                $d.provider.throttleEvents | Should -Be 1
+                $d.provider.lastHttpStatus | Should -Be 429
+                $d.throttleState | Should -Be 'detected'
+                $d.selected[0].inventoryEligible | Should -BeNullOrEmpty
+                $d.privateIntakePersisted | Should -BeNullOrEmpty
+            }
             It 'keeps the private root absent through complete and failed signed-intake proofs' {
                 foreach ($mode in @('complete', 'split-page',
                         'unknown-project', 'stale-head', 'throttle-changes',
@@ -2510,14 +2635,17 @@ Describe 'Read-only private canary input bootstrap' {
         finally { $client.Dispose() }
     }
     It 'accepts ordinary remaining-budget telemetry and stops on real throttle' {
-        foreach ($mode in @('budget', '429', '503', 'retry-after', 'exhausted')) {
+        foreach ($mode in @('budget', 'budget-low', 'budget-zero',
+                '429', '503', 'retry-after', 'delay')) {
             $handler = [CanarySyntheticHandler]::new()
             if ($mode -in @('429', '503')) {
                 $handler.Status = [Net.HttpStatusCode][int]$mode
             }
             if ($mode -eq 'retry-after') { $handler.ThrottleHint = $true }
+            if ($mode -eq 'delay') { $handler.DelayHint = $true }
             if ($mode -eq 'budget') { $handler.BudgetRemaining = '8' }
-            if ($mode -eq 'exhausted') { $handler.BudgetRemaining = '0' }
+            if ($mode -eq 'budget-low') { $handler.BudgetRemaining = '1' }
+            if ($mode -eq 'budget-zero') { $handler.BudgetRemaining = '0' }
             $client = [Net.Http.HttpClient]::new($handler)
             $module = Get-Module DevPilot.ActivePrCanary
             try {
@@ -2529,7 +2657,7 @@ Describe 'Read-only private canary input bootstrap' {
                             ([DateTime]::UtcNow.AddSeconds(5))
                     } $client
                 }
-                if ($mode -eq 'budget') {
+                if ($mode -like 'budget*') {
                     (& $read).id | Should -Be 'synthetic'
                 } else {
                     { & $read } | Should -Throw '*bootstrap-read-throttled:Project*'
@@ -3183,14 +3311,23 @@ Describe 'Read-only private canary input bootstrap' {
             $handler.TooLarge = $mode -eq 'oversize'
             $client = [Net.Http.HttpClient]::new($handler)
             try {
+                $transport = [ordered]@{
+                    attemptedGets = 0; completedGets = 0
+                    throttleEvents = 0; lastHttpStatus = $null
+                }
                 $provider = New-ActivePrAzureDevOpsProvider -Config $config `
-                    -BearerToken ('b' * 100) -BoundClient $client -VerifyReadPrincipal
+                    -BearerToken ('b' * 100) -BoundClient $client -VerifyReadPrincipal `
+                    -TransportTelemetry $transport
                 if ($mode -eq 'throttle') {
                     [void](& $provider Identity @{ timeoutMilliseconds = 5000 })
                     { & $provider ListPage @{ skip = 0; top = 50
                             timeoutMilliseconds = 5000 } } |
                         Should -Throw '*read-throttled*'
                     $handler.Paths.Count | Should -Be 4
+                    $transport.attemptedGets | Should -Be 4
+                    $transport.completedGets | Should -Be 3
+                    $transport.throttleEvents | Should -Be 1
+                    $transport.lastHttpStatus | Should -Be 429
                 } elseif ($mode -eq 'ref-drift') {
                     [void](& $provider Identity @{ timeoutMilliseconds = 5000 })
                     { & $provider Head @{ pullRequestId = 7
@@ -3209,6 +3346,90 @@ Describe 'Read-only private canary input bootstrap' {
             }
             finally { $client.Dispose() }
         }
+    }
+    It 'counts actual bound GET attempts and surfaces only safe throttle or HTTP status' {
+        $config = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') `
+            -Raw | ConvertFrom-Json -AsHashtable
+        $config.schemaVersion = 2
+        $config.principalProof = 'aad-graph-storage-key-v1'
+        $config.expectedAccount.descriptor = 'aad.synthetic'
+        $config.expectedAccount.principalName = 'service@example.invalid'
+        $config.enabled = $true
+        foreach ($mode in @('rate-hint', 'rate-delay', '429', '503',
+                'budget-low', 'budget-zero', 'http-error')) {
+            $handler = [CanaryBoundGetHandler]::new()
+            $handler.ThrottleHintInventory = $mode -eq 'rate-hint'
+            $handler.DelayHintInventory = $mode -eq 'rate-delay'
+            $handler.ThrottleInventory = $mode -eq '429'
+            $handler.ServiceUnavailableInventory = $mode -eq '503'
+            if ($mode -eq 'budget-low') { $handler.InventoryRemaining = '1' }
+            if ($mode -eq 'budget-zero') { $handler.InventoryRemaining = '0' }
+            $handler.MissingInventory = $mode -eq 'http-error'
+            $client = [Net.Http.HttpClient]::new($handler)
+            try {
+                $transport = [ordered]@{
+                    attemptedGets = 0; completedGets = 0
+                    throttleEvents = 0; lastHttpStatus = $null
+                }
+                $provider = New-ActivePrAzureDevOpsProvider -Config $config `
+                    -BearerToken ('b' * 100) -BoundClient $client `
+                    -VerifyReadPrincipal -TransportTelemetry $transport
+                [void](& $provider Identity @{ timeoutMilliseconds = 5000 })
+                $read = { & $provider ListPage @{ skip = 0; top = 50
+                        timeoutMilliseconds = 5000 } }
+                if ($mode -like 'budget*') {
+                    (& $read).count | Should -Be 0
+                } else {
+                    { & $read } | Should -Throw $(if ($mode -ne 'http-error') {
+                            '*read-throttled*'
+                        } else { '*read-inaccessible*' })
+                }
+                $transport.attemptedGets | Should -Be 4
+                $transport.completedGets | Should -Be $(if (
+                        $mode -like 'budget*') { 4 } else { 3 })
+                $handler.Paths.Count | Should -Be 4
+                $transport.throttleEvents | Should -Be $(if (
+                        $mode -ne 'http-error' -and
+                        $mode -notlike 'budget*') { 1 } else { 0 })
+                $transport.lastHttpStatus | Should -Be $(if (
+                        $mode -in @('rate-hint', 'rate-delay')) { 200 } elseif (
+                        $mode -eq 'http-error') { 404 } elseif (
+                        $mode -like 'budget*') { $null } else { [int]$mode })
+                ($transport | ConvertTo-Json) |
+                    Should -Not -Match 'example-org|service@example.invalid|aad.synthetic'
+            }
+            finally { $client.Dispose() }
+        }
+    }
+    It 'preserves source registry GET attempts when a same-bearer Graph proof throttles' {
+        $c = Get-RegistryCase -CoverageOnly
+        $handler = [CanaryBoundGetHandler]::new()
+        $handler.ThrottleGraphStorage = $true
+        $client = [Net.Http.HttpClient]::new($handler)
+        try {
+            $telemetry = [ordered]@{
+                attemptedGets = 0; completedGets = 0
+                throttleEvents = 0; lastHttpStatus = $null
+            }
+            { Invoke-PrivateCanaryRuleRegistry -ProviderConfig $c.config `
+                    -ApprovedSources $c.sources -RepositoryRoot $repo `
+                    -SourceSelector $script:sourceSelector `
+                    -SourceSelectorKey $script:sourceKey `
+                    -MergedPinEnvelope $script:mergedEnvelope `
+                    -MergedPinKey $script:mergedKey `
+                    -ExpectedAccountUniqueName 'service@example.invalid' `
+                    -BearerSession @{ client = $client; token = ('b' * 100) } `
+                    -ReadTelemetry $telemetry -Mode CoverageOnly -Run } |
+                Should -Throw '*bootstrap-read-throttled:GraphStorageKey*'
+            $telemetry.attemptedGets | Should -Be 3
+            $telemetry.completedGets | Should -Be 2
+            $telemetry.throttleEvents | Should -Be 1
+            $telemetry.lastHttpStatus | Should -Be 429
+            $handler.Paths.Count | Should -Be 3
+            ($telemetry | ConvertTo-Json) |
+                Should -Not -Match 'example-org|service@example.invalid'
+        }
+        finally { $client.Dispose() }
     }
 }
 
