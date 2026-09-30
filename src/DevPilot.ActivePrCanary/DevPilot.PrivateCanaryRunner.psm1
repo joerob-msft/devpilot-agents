@@ -67,7 +67,7 @@ function Assert-PrivateCanaryConfig {
     $expectedRules = if ($coverage) {
         @('bpm-test-class-coverage@2', 'bpm-redundant-method-coverage@2')
     } else { $script:CanaryRules }
-    if ($Config.schemaVersion -ne $(if ($coverage) { 7 } else { 5 }) -or
+    if ($Config.schemaVersion -ne $(if ($coverage) { 8 } else { 5 }) -or
         $Config.kind -cne $(if ($coverage) {
                 'private-coverage-only-signed-intake'
             } else { 'private-canary-signed-intake' }) -or
@@ -75,6 +75,10 @@ function Assert-PrivateCanaryConfig {
         ($coverage -and
             ($Config.headProof -cne 'iteration-source-current-target-v1' -or
                 $Intake.headProof -cne $Config.headProof)) -or
+        ($coverage -and
+            ([string]$Config.sourceMasterCommit -cnotmatch '^[a-f0-9]{40}$' -or
+                [string]$Registry.currentMasterCommit -cne
+                    [string]$Config.sourceMasterCommit)) -or
         (-not $coverage -and $Config.Contains('mode')) -or
         $Config.principalProof -cne 'aad-graph-storage-key-alias-free-v2' -or
         $Intake.schemaVersion -ne 3 -or
@@ -100,7 +104,7 @@ function Assert-PrivateCanaryConfig {
         (ConvertTo-AgentCanonicalJson -InputObject $Config.expectedAccount) -cne
             (ConvertTo-AgentCanonicalJson -InputObject $ProviderConfig.expectedAccount) -or
         $Config.receiptDigest -cne $Registry.receiptDigest -or
-        $Registry.schemaVersion -ne $(if ($coverage) { 6 } else { 5 }) -or
+        $Registry.schemaVersion -ne $(if ($coverage) { 7 } else { 5 }) -or
         $Registry.kind -cne $(if ($coverage) {
                 'verified-coverage-only-canary-registry'
             } else { 'verified-read-only-canary-registry' }) -or
@@ -231,6 +235,11 @@ function Invoke-PrivateCanaryEvaluation {
             $config.mode -cne 'coverage-only') -or
         ($Mode -ceq 'FourRule' -and $config.Contains('mode'))) {
         throw 'canary-mode-invalid'
+    }
+    if ($Mode -ceq 'CoverageOnly' -and
+        ($config.schemaVersion -ne 8 -or
+            [string]$config.sourceMasterCommit -cnotmatch '^[a-f0-9]{40}$')) {
+        throw 'canary-config-invalid'
     }
     $providerConfig = Read-PrivateCanaryFile $root 'provider-config.json'
     $sources = Read-PrivateCanaryFile $root 'approved-sources.json'
@@ -622,13 +631,15 @@ function Invoke-PrivateCanaryEvaluation {
         if ($reads.count -gt [int]$config.limits.maxReads -or
             $clock.Elapsed.TotalSeconds -ge [int]$config.limits.maxSeconds -or
             $finalRegistry.receiptDigest -cne $registry.receiptDigest -or
+            $finalRegistry.currentMasterCommit -cne
+                $config.sourceMasterCommit -or
             (ConvertTo-AgentCanonicalJson $finalRegistry.rules) -cne
                 (ConvertTo-AgentCanonicalJson $registry.rules)) {
             throw 'canary-source-drift'
         }
     }
     return [ordered]@{
-        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 7 } else { 5 }
+        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 8 } else { 5 }
         kind = if ($Mode -ceq 'CoverageOnly') {
             'private-coverage-only-read-only-evaluation'
         } else { 'private-canary-read-only-evaluation' }

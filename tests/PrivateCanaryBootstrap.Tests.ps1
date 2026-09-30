@@ -368,6 +368,8 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             master = 'e' * 40
             headChecks = 0
             refChecks = 0
+            forwardMasterVisits = 0
+            sourceLineage = ''
         }
         $projectId = '22222222-2222-2222-2222-222222222222'
         $repoId = '11111111-1111-1111-1111-111111111111'
@@ -394,6 +396,9 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
             } elseif ($request.commit -ceq $state.master -and
                 $state.wrong -eq 'master-content') {
                 $state.coverage + ' changed on master'
+            } elseif ($request.commit -ceq ('e' * 40) -and
+                $state.wrong -eq 'snapshot-content') {
+                $state.coverage + ' changed at recorded snapshot'
             } else { $state.coverage }
             $bytes = [Text.Encoding]::UTF8.GetBytes($text)
             $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
@@ -485,6 +490,14 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                         return @{ commitId = $request.commit
                             parents = @('b' * 40) }
                     }
+                    if ($request.commit -ceq ('f' * 40)) {
+                        $state.forwardMasterVisits++
+                        if ($state.sourceLineage -eq 'malformed-after-proof' -and
+                            $state.forwardMasterVisits -gt 1) {
+                            return @{ commitId = $request.commit
+                                parents = @('not-a-commit') }
+                        }
+                    }
                     return @{ commitId = if ($state.wrong -eq 'commit') {
                             'a' * 40
                         } else { $request.commit }
@@ -492,6 +505,9 @@ public sealed class CanaryBoundGetHandler : HttpMessageHandler {
                                 if ($state.wrong -eq 'owner-no-ancestry') {
                                     'b' * 40
                                 } else { $ownerCommit }
+                            } elseif ($request.commit -ceq ('f' * 40) -and
+                                $state.sourceLineage -ne 'non-descendant') {
+                                'e' * 40
                             } else { 'd' * 40 }) }
                 }
                 Item {
@@ -3744,6 +3760,190 @@ Describe 'Coverage-only signed read-only canary' {
             { Invoke-RegistryCase $c } | Should -Throw -Because $failure
         }
     }
+    It 'keeps the recorded source snapshot historical while proving a forward master' {
+        $c = Get-RegistryCase -CoverageOnly
+        $receipt = ConvertTo-Json -InputObject $c.sources -Depth 16 -Compress
+        $c.case.state.master = 'f' * 40
+        $c.case.state.reads.Clear()
+        $registry = Invoke-RegistryCase $c
+        $registry.schemaVersion | Should -Be 7
+        $registry.currentMasterCommit | Should -Be ('f' * 40)
+        $registry.rules.Count | Should -Be 2
+        @($c.case.state.reads | Where-Object { $_ -ceq 'Commit' }).Count |
+            Should -Be 5
+        @($c.case.state.reads | Where-Object { $_ -ceq 'RawItem' }).Count |
+            Should -Be 3
+        (ConvertTo-Json -InputObject $c.sources -Depth 16 -Compress) |
+            Should -BeExactly $receipt
+        $c.sources.rules['bpm-test-class-coverage@2'].masterCommit |
+            Should -Be ('e' * 40)
+        $c.sources.rules['bpm-redundant-method-coverage@2'].masterCommit |
+            Should -Be ('e' * 40)
+        @($c.case.state.reads | Where-Object {
+                $_ -in @('Write', 'Post', 'ListPage')
+            }).Count | Should -Be 0
+    }
+    It 'retains the equal-tip fast path and reuses merge-pin ancestry' {
+        $equal = Get-RegistryCase -CoverageOnly
+        $equal.case.state.reads.Clear()
+        (Invoke-RegistryCase $equal).currentMasterCommit | Should -Be ('e' * 40)
+        @($equal.case.state.reads | Where-Object { $_ -ceq 'Commit' }).Count |
+            Should -Be 2
+        @($equal.case.state.reads | Where-Object { $_ -ceq 'RawItem' }).Count |
+            Should -Be 2
+
+        $merged = Get-RegistryCase -CoverageOnly
+        $merged.case.state.master = 'f' * 40
+        foreach ($rule in $merged.sources.rules.Values) {
+            $rule.masterCommit = 'd' * 40
+        }
+        $merged.case.state.reads.Clear()
+        (Invoke-RegistryCase $merged).currentMasterCommit | Should -Be ('f' * 40)
+        @($merged.case.state.reads | Where-Object { $_ -ceq 'Commit' }).Count |
+            Should -Be 3
+        @($merged.case.state.reads | Where-Object { $_ -ceq 'RawItem' }).Count |
+            Should -Be 2
+    }
+    It 'rejects rollback, unrelated or unproved source ancestry and changed bindings' {
+        foreach ($failure in @('rollback', 'non-descendant', 'unknown-ancestry',
+                'wrong-snapshot', 'different-snapshots', 'malformed-snapshot',
+                'changed-blob', 'changed-snapshot', 'changed-line',
+                'changed-declaration')) {
+            $c = Get-RegistryCase -CoverageOnly
+            switch ($failure) {
+                rollback { $c.case.state.master = 'd' * 40 }
+                'non-descendant' {
+                    $c.case.state.master = 'f' * 40
+                    $c.case.state.sourceLineage = 'non-descendant'
+                }
+                'unknown-ancestry' {
+                    $c.case.state.master = 'f' * 40
+                    $c.case.state.sourceLineage = 'malformed-after-proof'
+                }
+                'wrong-snapshot' {
+                    foreach ($rule in $c.sources.rules.Values) {
+                        $rule.masterCommit = 'a' * 40
+                    }
+                }
+                'different-snapshots' {
+                    $c.sources.rules['bpm-redundant-method-coverage@2'].masterCommit =
+                        'f' * 40
+                }
+                'malformed-snapshot' {
+                    $c.sources.rules['bpm-test-class-coverage@2'].masterCommit =
+                        'not-a-commit'
+                }
+                'changed-blob' { $c.case.state.wrong = 'master-content' }
+                'changed-snapshot' {
+                    $c.case.state.master = 'f' * 40
+                    $c.case.state.wrong = 'snapshot-content'
+                }
+                'changed-line' {
+                    $c.sources.rules['bpm-test-class-coverage@2'].policyLineHash =
+                        'v1:sha256:' + ('a' * 64)
+                }
+                'changed-declaration' {
+                    $c.sources.rules['bpm-redundant-method-coverage@2'].declarationDigest =
+                        'v1:sha256:' + ('a' * 64)
+                }
+            }
+            $expected = switch ($failure) {
+                { $_ -in @('rollback', 'non-descendant',
+                        'unknown-ancestry', 'wrong-snapshot') } {
+                    'coverage-source-master-lineage-unproved'
+                }
+                'changed-blob' { 'merged-master-document-drift' }
+                'changed-snapshot' { 'coverage-source-snapshot-drift' }
+                default { 'coverage-receipt-drift' }
+            }
+            { Invoke-RegistryCase $c } | Should -Throw "*$expected*" `
+                -Because $failure
+            @($c.case.state.reads | Where-Object {
+                    $_ -in @('Write', 'Post', 'ListPage')
+                }).Count | Should -Be 0
+        }
+    }
+    It 'signs advanced source master separately and rejects changes before private state' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        $c.input.case.state.master = 'f' * 40
+        $result = Invoke-SignedIntakeCase $c
+        $result.signed | Should -BeTrue
+        $config = Get-Content -LiteralPath (
+            Join-Path $c.root 'canary-dispatcher.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $config.schemaVersion | Should -Be 8
+        $config.sourceMasterCommit | Should -Be ('f' * 40)
+        $c.input.sources.rules['bpm-test-class-coverage@2'].masterCommit |
+            Should -Be ('e' * 40)
+        (Invoke-RunnerCase $c).selected | Should -Be 2
+
+        $moving = Get-SignedIntakeCase -Code -CoverageOnly
+        $prior = $moving.read
+        $source = $moving.input.case.state
+        $intake = $moving.state
+        $moving.read = {
+            param($operation, $request)
+            if ($operation -ceq 'Ref' -and
+                @($intake.calls | Where-Object { $_ -ceq 'ListPage' }).Count -gt 0) {
+                $source.master = 'f' * 40
+            }
+            & $prior $operation $request
+        }.GetNewClosure()
+        $diagnostic = [ref]$null
+        { Invoke-SignedIntakeCase $moving $diagnostic } |
+            Should -Throw '*canary-source-drift*'
+        $diagnostic.Value.failureCode | Should -Be 'canary-source-drift'
+        $diagnostic.Value.privateIntakePersisted | Should -BeFalse
+        Test-Path -LiteralPath $moving.root | Should -BeFalse
+    }
+    It 'reports the exact safe source preflight failure before inventory or state' {
+        foreach ($failure in @('changed-receipt', 'unproved-snapshot',
+                'changed-snapshot', 'changed-policy')) {
+            $c = Get-SignedIntakeCase -Code -CoverageOnly
+            switch ($failure) {
+                'changed-receipt' {
+                    $c.input.sources.rules['bpm-test-class-coverage@2'].policyLineHash =
+                        'v1:sha256:' + ('a' * 64)
+                }
+                'unproved-snapshot' {
+                    $c.input.case.state.master = 'f' * 40
+                    $c.input.case.state.sourceLineage = 'non-descendant'
+                }
+                'changed-snapshot' {
+                    $c.input.case.state.master = 'f' * 40
+                    $c.input.case.state.wrong = 'snapshot-content'
+                }
+                'changed-policy' { $c.input.case.state.wrong = 'master-content' }
+            }
+            $expected = switch ($failure) {
+                'changed-receipt' { 'coverage-receipt-drift' }
+                'unproved-snapshot' { 'coverage-source-master-lineage-unproved' }
+                'changed-snapshot' { 'coverage-source-snapshot-drift' }
+                'changed-policy' { 'merged-master-document-drift' }
+            }
+            $diagnostic = [ref]$null
+            { Invoke-SignedIntakeCase $c $diagnostic } |
+                Should -Throw "*$expected*"
+            $diagnostic.Value.failureCode | Should -Be $expected
+            $diagnostic.Value.provider.attemptedCalls | Should -Be 0
+            $c.input.case.state.reads.Count | Should -BeGreaterThan 0
+            $diagnostic.Value.provider.totalAttemptedGets |
+                Should -BeNullOrEmpty
+            Test-Path -LiteralPath $c.root | Should -BeFalse
+        }
+    }
+    It 'reports measured source-only GET counts before provider construction' {
+        $sourceTelemetry = @{ attemptedGets = 19; completedGets = 19
+            throttleEvents = 0; lastHttpStatus = $null }
+        $diagnostic = & (Get-Module DevPilot.ActivePrCanary) {
+            param($Telemetry)
+            New-CanaryIntakeFailureDiagnostic $null @(7) $null `
+                @{ attempted = 0; completed = 0 } $null $Telemetry
+        } $sourceTelemetry
+        $diagnostic.provider.totalAttemptedGets | Should -Be 19
+        $diagnostic.provider.totalCompletedGets | Should -Be 19
+        $diagnostic.provider.attemptedCalls | Should -Be 0
+    }
     It 'signs a two-rule intake and evaluates only coverage rules' {
         $c = Get-SignedIntakeCase -Code -CoverageOnly
         $result = Invoke-SignedIntakeCase $c
@@ -3751,9 +3951,10 @@ Describe 'Coverage-only signed read-only canary' {
         $result.rules.Count | Should -Be 4
         $config = Get-Content (Join-Path $c.root 'canary-dispatcher.json') -Raw |
             ConvertFrom-Json -AsHashtable
-        $config.schemaVersion | Should -Be 7
+        $config.schemaVersion | Should -Be 8
         $config.mode | Should -Be 'coverage-only'
         $config.headProof | Should -Be 'iteration-source-current-target-v1'
+        $config.sourceMasterCommit | Should -Be ('e' * 40)
         $config.heads[0].currentTargetCommit | Should -Be ('d' * 40)
         $config.heads[0].targetCommit | Should -Be ('b' * 40)
         $config.rules.Count | Should -Be 2
@@ -3761,7 +3962,7 @@ Describe 'Coverage-only signed read-only canary' {
         $config.writerEligible | Should -BeFalse
         $evaluated = Invoke-RunnerCase $c
         $evaluated.kind | Should -Be 'private-coverage-only-read-only-evaluation'
-        $evaluated.schemaVersion | Should -Be 7
+        $evaluated.schemaVersion | Should -Be 8
         $evaluated.modelToolInvocations | Should -Be 0
         $evaluated.providerWrites | Should -Be 0
         $evaluated.writerEligible | Should -BeFalse
@@ -3909,15 +4110,25 @@ Describe 'Coverage-only signed read-only canary' {
     }
     It 'rejects changed or absent coverage live-target bindings even with a valid signature' {
         foreach ($mode in @('old-version', 'missing-proof', 'changed-pin',
-                'missing-pin', 'changed-declaration')) {
+                'missing-pin', 'changed-declaration', 'missing-source-master',
+                'changed-source-master')) {
             $c = Get-SignedIntakeCase -Code -CoverageOnly
             [void](Invoke-SignedIntakeCase $c)
             switch ($mode) {
                 'old-version' {
                     Sign-RunnerConfig $c { param($config)
-                        $config.schemaVersion = 6
-                        $config.Remove('headProof')
-                        $config.heads[0].Remove('currentTargetCommit')
+                        $config.schemaVersion = 7
+                        $config.Remove('sourceMasterCommit')
+                    }
+                }
+                'missing-source-master' {
+                    Sign-RunnerConfig $c { param($config)
+                        $config.Remove('sourceMasterCommit')
+                    }
+                }
+                'changed-source-master' {
+                    Sign-RunnerConfig $c { param($config)
+                        $config.sourceMasterCommit = 'f' * 40
                     }
                 }
                 'missing-proof' {
@@ -3950,6 +4161,36 @@ Describe 'Coverage-only signed read-only canary' {
             }
             { Invoke-RunnerCase $c } | Should -Throw -Because $mode
         }
+    }
+    It 'rejects a live source master shift after rule evaluation at the final check' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        [void](Invoke-SignedIntakeCase $c)
+        $prior = $c.read
+        $source = $c.input.case.state
+        $intake = $c.state
+        $baseline = $intake.discussionVisits
+        $c.read = {
+            param($operation, $request)
+            if ($operation -ceq 'Ref' -and
+                $intake.discussionVisits -ge ($baseline + 4)) {
+                $source.master = 'f' * 40
+            }
+            & $prior $operation $request
+        }.GetNewClosure()
+        { Invoke-RunnerCase $c } | Should -Throw '*canary-source-drift*'
+        $intake.discussionVisits | Should -Be ($baseline + 4)
+        $source.master | Should -Be ('f' * 40)
+    }
+    It 'rejects an unsigned change to the newly bound live source master' {
+        $c = Get-SignedIntakeCase -Code -CoverageOnly
+        [void](Invoke-SignedIntakeCase $c)
+        Set-RunnerFile $c 'canary-dispatcher.json' {
+            param($config)
+            $config.sourceMasterCommit = 'f' * 40
+        }
+        $c.state.calls.Clear()
+        { Invoke-RunnerCase $c } | Should -Throw '*canary-signature-invalid*'
+        $c.state.calls.Count | Should -Be 0
     }
     It 'rejects a target change during coverage evaluation after signed intake' {
         $c = Get-SignedIntakeCase -Code -CoverageOnly

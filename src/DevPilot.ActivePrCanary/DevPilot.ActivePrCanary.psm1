@@ -2132,6 +2132,7 @@ function New-VerifiedCoverageCanaryRuleRegistry {
     $proof = Assert-CanaryMergedMasterProof $bounded $sourceId `
         ([string]$sourceProject.id) $pin $SourceSelector
     $registryRules = [ordered]@{}
+    $recordedMaster = $null
     foreach ($declaration in $proof.declarations) {
         $source = $ApprovedSources.rules[$declaration.ruleId]
         Assert-CanarySource $source $script:DocumentPath $proof.mergeCommit
@@ -2145,7 +2146,9 @@ function New-VerifiedCoverageCanaryRuleRegistry {
             $source.reviewedPullRequestId -ne 17307009 -or
             $source.reviewedHead -cne $script:CoverageCommit -or
             $source.mergeCommit -cne $proof.mergeCommit -or
-            $source.masterCommit -cne $proof.masterCommit -or
+            [string]$source.masterCommit -cnotmatch '^[a-f0-9]{40}$' -or
+            ($null -ne $recordedMaster -and
+                $source.masterCommit -cne $recordedMaster) -or
             $source.documentHash -cne ('v1:sha256:' + $pin.documentHash) -or
             $source.documentLength -ne $pin.documentLength -or
             $source.blobId -cne $proof.document.blobId -or
@@ -2156,6 +2159,7 @@ function New-VerifiedCoverageCanaryRuleRegistry {
             $source.declarationDigest -cne $declaration.declarationDigest) {
             throw 'coverage-receipt-drift'
         }
+        $recordedMaster = [string]$source.masterCommit
         $registryRules[$declaration.ruleId] = [ordered]@{
             id = $declaration.ruleId; enabled = $false; evaluated = $false
             writerEligible = $false
@@ -2166,15 +2170,35 @@ function New-VerifiedCoverageCanaryRuleRegistry {
             declarationDigest = $declaration.declarationDigest
         }
     }
+    if ($recordedMaster -cne $proof.masterCommit -and
+        $recordedMaster -cne $proof.mergeCommit) {
+        try {
+            Assert-CanaryMergedHistory $bounded $sourceId $proof.masterCommit `
+                $recordedMaster $SourceSelector
+        }
+        catch {
+            if ($_.Exception.Message -ceq 'merged-master-history-unproved') {
+                throw 'coverage-source-master-lineage-unproved'
+            }
+            throw
+        }
+        $recordedDocument = Read-CanaryVerifiedDocument $bounded $sourceId `
+            $recordedMaster $SourceSelector
+        if ($recordedDocument.blobId -cne $pin.blobId -or
+            $recordedDocument.text -cne $proof.document.text) {
+            throw 'coverage-source-snapshot-drift'
+        }
+    }
     [void](Assert-CanaryMergedMasterHead $bounded $sourceId `
             ([string]$sourceProject.id) $pin $proof.masterCommit `
             $SourceSelector)
     Assert-CanaryAccountBinding `
         (Assert-CanaryAccountProof $bounded $ExpectedAccountUniqueName) $identity
     return [ordered]@{
-        schemaVersion = 6; kind = 'verified-coverage-only-canary-registry'
+        schemaVersion = 7; kind = 'verified-coverage-only-canary-registry'
         mode = 'coverage-only'; state = 'verified-not-evaluated'
         sourceAuthority = 'merged-master-verified-read-only'
+        currentMasterCommit = $proof.masterCommit
         receiptDigest = 'v1:sha256:' + (Get-CanaryTextHash (
                 ConvertTo-AgentCanonicalJson ([ordered]@{
                         schemaVersion = $ApprovedSources.schemaVersion
@@ -2684,13 +2708,19 @@ function New-CanaryIntakeFailureDiagnostic {
             sourceCompletedGets = if ($SourceTelemetry) {
                 [int]$SourceTelemetry.completedGets
             } else { $null }
-            totalAttemptedGets = if ($SourceTelemetry -and $TransportTelemetry) {
+            totalAttemptedGets = if ($SourceTelemetry -and
+                ($TransportTelemetry -or $ProviderCalls.attempted -eq 0)) {
                 [int]$SourceTelemetry.attemptedGets +
-                    [int]$TransportTelemetry.attemptedGets
+                    $(if ($TransportTelemetry) {
+                        [int]$TransportTelemetry.attemptedGets
+                    } else { 0 })
             } else { $null }
-            totalCompletedGets = if ($SourceTelemetry -and $TransportTelemetry) {
+            totalCompletedGets = if ($SourceTelemetry -and
+                ($TransportTelemetry -or $ProviderCalls.attempted -eq 0)) {
                 [int]$SourceTelemetry.completedGets +
-                    [int]$TransportTelemetry.completedGets
+                    $(if ($TransportTelemetry) {
+                        [int]$TransportTelemetry.completedGets
+                    } else { 0 })
             } else { $null }
             throttleEvents = if ($SourceTelemetry -and $TransportTelemetry) {
                 [int]$SourceTelemetry.throttleEvents +
@@ -2929,6 +2959,9 @@ function Invoke-PrivateCanarySignedIntake {
                 -BearerSession $session
         }
         if ($finalRegistry.receiptDigest -cne $registry.receiptDigest -or
+            ($Mode -ceq 'CoverageOnly' -and
+                $finalRegistry.currentMasterCommit -cne
+                    $registry.currentMasterCommit) -or
             $finalRegistry.state -cne 'verified-not-evaluated' -or
             (ConvertTo-Json -InputObject $ApprovedSources -Depth 32 -Compress) -cne
                 $sourceSnapshot -or
@@ -2954,7 +2987,7 @@ function Invoke-PrivateCanarySignedIntake {
     $pins = $gate.pins
     $finalRegistry = $gate.finalRegistry
     $config = [ordered]@{
-        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 7 } else { 5 }
+        schemaVersion = if ($Mode -ceq 'CoverageOnly') { 8 } else { 5 }
         kind = if ($Mode -ceq 'CoverageOnly') {
             'private-coverage-only-signed-intake'
         } else { 'private-canary-signed-intake' }
@@ -3001,6 +3034,7 @@ function Invoke-PrivateCanarySignedIntake {
     if ($Mode -ceq 'CoverageOnly') {
         $config.mode = 'coverage-only'
         $config.headProof = 'iteration-source-current-target-v1'
+        $config.sourceMasterCommit = $registry.currentMasterCommit
     }
     $key = [Convert]::ToBase64String(
         [Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
@@ -3066,9 +3100,27 @@ function Invoke-PrivateCanarySignedIntake {
                 'canary-head-or-evidence-unknown', 'canary-source-drift',
                 'read-throttled', 'canary-principal-drift',
                 'canary-intake-not-verified', 'canary-state-root-must-be-new')
+            if ($Mode -ceq 'CoverageOnly') {
+                $safeFailures += @('coverage-receipt-drift',
+                    'coverage-receipt-invalid',
+                    'coverage-source-master-lineage-unproved',
+                    'coverage-source-snapshot-drift',
+                    'coverage-registry-identity-drift',
+                    'merged-master-history-unproved',
+                    'merged-master-pr-unverified',
+                    'merged-master-ref-unverified',
+                    'merged-master-document-drift',
+                    'merged-master-declaration-drift',
+                    'bootstrap-blob-unverified', 'canary-principal-mismatch',
+                    'canary-identity-drift')
+            }
             $diagnostic.failureCode = if ($failure.Exception.Message -cin
                 $safeFailures) {
                 [string]$failure.Exception.Message
+            } elseif ($Mode -ceq 'CoverageOnly' -and
+                $failure.Exception.Message -cmatch
+                    '^bootstrap-read-throttled:(IdentityProof|GraphUser|GraphStorageKey|Project|Repository|PullRequest|Iterations|Ref|Commit|Item|RawItem)$') {
+                'read-throttled'
             } else { 'canary-preflight-incomplete' }
             if ($providerCalls.failureCode -ceq 'read-throttled' -or
                 $diagnostic.failureCode -ceq 'read-throttled') {

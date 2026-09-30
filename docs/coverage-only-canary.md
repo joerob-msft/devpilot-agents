@@ -10,18 +10,31 @@ their zero `wouldCreate` counts are **not** zero-violation assessments.
 The separate receipt (`schemaVersion: 7`,
 `private-coverage-only-merged-sources`) binds each rule to its own
 merge-commit/repository declaration digest, section hash, and exact policy
-line hash. The registry (`schemaVersion: 6`) independently rechecks the
-private source-only pin against the current master ref, ancestry, raw
-Git blob, full document, and both declarations, as well as the current
+line hash. Its `masterCommit` records the master snapshot at receipt
+creation, not a freeze of the live branch. The registry (`schemaVersion: 7`)
+independently rechecks the private source-only pin against the current master
+ref, bounded ancestry to the approved merge and recorded receipt snapshot,
+raw Git blobs and full documents at the merge, recorded snapshot and live
+master, and both declarations, as well as the current
 same-bearer ConnectionData, Graph user/principal name, and Graph storage key.
-The signed intake config (`schemaVersion: 7`,
+An unchanged current tip needs no extra ancestry or document reads; a recorded
+snapshot equal to the merge commit reuses the existing merge proof. A
+non-descendant, unknown lineage, changed historical or live bytes or
+declaration, or moving
+master fails closed before signed state. The separately verified live master
+is bound across the initial and final intake proofs and signed as
+`sourceMasterCommit`, distinct from the unchanged historical receipt.
+The signed intake config (`schemaVersion: 8`,
 `private-coverage-only-signed-intake`) binds mode `coverage-only`, exactly
 those two IDs and digests, selected head/iteration, changed lines, complete
 test-project graph, and immutable two-pass inventory generation. Legacy
 four-rule receipts/configs are not interchangeable. Earlier coverage-only
-signed configs without the distinct live target binding are rejected rather
+signed configs without both distinct live source and target bindings are rejected rather
 than upgraded in place; the accepted source receipt and private pin remain
-unchanged. Source, identity, and selected graph/head proofs complete
+unchanged. Evaluation checks the live source master against its signed intake
+binding both initially and after rule evaluation; a source branch advance
+with the same policy still aborts the in-flight operation as drift. Source,
+identity, and selected graph/head proofs complete
 **before** creating a new private intake root, lock, key, or generation.
 
 If signed intake cannot prove a complete inventory or selected head, it still
@@ -35,6 +48,10 @@ account, or response body. Unknown counts remain `null`, not zero. This
 diagnostic does **not** relax the completeness gate, sign a config, or provide
 finding evidence. Failures from runs before this diagnostic existed cannot be
 attributed to a particular page, head, or throttle retrospectively.
+Coverage source failures retain allowlisted receipt-drift, unproved snapshot
+lineage, changed snapshot document, and merged-master metadata/content
+reason codes instead of flattening
+every preflight error to unknown; they do not authorize a receipt rewrite.
 Selected eligibility is unknown until the whole inventory is complete; a
 cleanup failure reports `canary-private-state-cleanup-failed` with the private
 intake root's observed existence (`null` if it cannot be determined).
