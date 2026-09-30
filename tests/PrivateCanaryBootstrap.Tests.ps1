@@ -2271,6 +2271,24 @@ Describe 'Read-only private canary input bootstrap' {
                 $d.selected[0].headProof | Should -Be 'unknown'
                 $d.selected[0].reason | Should -Be 'head-inconsistent'
                 $d.failedChecks | Should -Contain 'selected-head-or-evidence-unknown'
+                $cohort.heads[0].reason = 'diff-budget'
+                $d = & (Get-Module DevPilot.ActivePrCanary) {
+                    param($Cohort)
+                    New-CanaryIntakeFailureDiagnostic $Cohort `
+                        @(17007699, 17109075) $null `
+                        @{ attempted = 4; completed = 3 } $null $null
+                } $cohort
+                $d.selected[0].reason | Should -Be 'diff-budget'
+                $d.selected[0].limitKind | Should -Be 'maxDiffCells'
+                $d.selected[0].limitCount | Should -BeNullOrEmpty
+                $cohort.heads[0].reason = 'private-route-must-not-appear'
+                $d = & (Get-Module DevPilot.ActivePrCanary) {
+                    param($Cohort)
+                    New-CanaryIntakeFailureDiagnostic $Cohort `
+                        @(17007699, 17109075) $null `
+                        @{ attempted = 4; completed = 3 } $null $null
+                } $cohort
+                $d.selected[0].reason | Should -Be 'unavailable'
             }
             It 'reports source drift even when the inventory itself is complete' {
                 $c = Get-SignedIntakeCase -Code -CoverageOnly

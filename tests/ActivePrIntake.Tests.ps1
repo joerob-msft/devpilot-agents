@@ -2,6 +2,61 @@
 BeforeAll {
     $repo = Split-Path $PSScriptRoot -Parent
     Import-Module (Join-Path $repo 'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1') -Force
+    Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+public sealed class IntakeSparseDiffHandler : HttpMessageHandler {
+    public string Before, After, BeforeId, AfterId;
+    public string Project, RootTreeId, RootTree, TestsTreeId, TestsTree;
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        if (request.Method != HttpMethod.Get ||
+            request.Headers.Authorization?.Scheme != "Bearer" ||
+            (request.RequestUri.Host != "dev.azure.com" &&
+             request.RequestUri.Host != "vssps.dev.azure.com"))
+            throw new InvalidOperationException("unexpected synthetic transport");
+        var path = request.RequestUri.AbsolutePath;
+        var query = Uri.UnescapeDataString(request.RequestUri.Query);
+        var old = query.Contains(new string('d', 40));
+        var raw = request.Headers.Accept.ToString() == "application/octet-stream";
+        string body;
+        if (path.EndsWith("/connectionData"))
+            body = "{\"authenticatedUser\":{\"id\":\"33333333-3333-3333-3333-333333333333\",\"subjectDescriptor\":\"aad.synthetic-service-account\",\"uniqueName\":\"service@example.invalid\"}}";
+        else if (path.Contains("/graph/users/"))
+            body = "{\"descriptor\":\"aad.synthetic-service-account\",\"subjectKind\":\"user\",\"principalName\":\"service@example.invalid\"}";
+        else if (path.Contains("/graph/storagekeys/"))
+            body = "{\"value\":\"33333333-3333-3333-3333-333333333333\"}";
+        else if (path.EndsWith("/changes"))
+            body = query.Contains("$skip=0")
+                ? "{\"changeEntries\":[{\"changeTrackingId\":1,\"changeType\":\"edit\",\"item\":{\"path\":\"/Tests/Synthetic.cs\",\"objectId\":\"" + AfterId + "\",\"originalObjectId\":\"" + BeforeId + "\"}}],\"nextSkip\":0}"
+                : "{\"changeEntries\":[],\"nextSkip\":0}";
+        else if (path.EndsWith("/items")) {
+            var project = query.Contains("/Tests/Tests.csproj");
+            body = raw ? (project ? Project : old ? Before : After)
+                : "{\"path\":\"/Tests/Synthetic.cs\",\"gitObjectType\":\"blob\",\"objectId\":\"" +
+                    (old ? BeforeId : AfterId) +
+                    "\",\"isFolder\":false,\"contentMetadata\":{\"isBinary\":false,\"encoding\":65001,\"contentType\":\"text/plain\"},\"content\":" +
+                    System.Text.Json.JsonSerializer.Serialize(old ? Before : After) + "}";
+        } else if (path.EndsWith("/commits/" + new string('a', 40)))
+            body = "{\"commitId\":\"" + new string('a', 40) +
+                "\",\"treeId\":\"" + RootTreeId + "\"}";
+        else if (path.EndsWith("/trees/" + RootTreeId)) body = RootTree;
+        else if (path.EndsWith("/trees/" + TestsTreeId)) body = TestsTree;
+        else throw new InvalidOperationException("unexpected synthetic resource");
+        var response = new HttpResponseMessage(HttpStatusCode.OK) {
+            Content = new ByteArrayContent(Encoding.UTF8.GetBytes(body))
+        };
+        response.Content.Headers.ContentType =
+            new System.Net.Http.Headers.MediaTypeHeaderValue(
+                raw ? "application/octet-stream" : "application/json");
+        return Task.FromResult(response);
+    }
+}
+'@
     $template = Get-Content (Join-Path $repo 'samples\active-pr-intake.config.json') -Raw |
         ConvertFrom-Json -AsHashtable
     $script:roots = [Collections.Generic.List[string]]::new()
@@ -1442,6 +1497,168 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
             $onlyDeletion.spans.Count | Should -Be 0
             { Get-IntakeLineDelta 'old' 'new' 4 2 ([DateTime]::UtcNow.AddSeconds(-1)) } |
                 Should -Throw 'time-budget'
+        }
+    }
+    It 'keeps the coverage-only sparse diff exact against the legacy small-input LCS oracle' {
+        InModuleScope DevPilot.ActivePrIntake {
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            foreach ($oldLines in @('', 'a', 'a,a', 'a,b', 'a,b,a',
+                    'b,a,b', 'a,a,b,a')) {
+                foreach ($newLines in @('', 'a', 'b', 'a,a', 'b,a',
+                        'a,b,a', 'a,a,b,a')) {
+                    $old = if ($oldLines) {
+                        (($oldLines -split ',') | ForEach-Object { "$_`n" }) -join ''
+                    } else { '' }
+                    $new = if ($newLines) {
+                        (($newLines -split ',') | ForEach-Object { "$_`n" }) -join ''
+                    } else { '' }
+                    $before = Get-IntakeLineTokens $old
+                    $after = Get-IntakeLineTokens $new
+                    $oracle = Get-IntakeLineDelta $old $new 1000 20 $deadline
+                    $sparse = Get-IntakeSparseLineDelta $before $after 0 `
+                        $before.Count $after.Count 1000 $deadline
+                    ($sparse.addedLines + $sparse.deletedLines) |
+                        Should -Be ($oracle.addedLines + $oracle.deletedLines)
+                    $added = [Collections.Generic.HashSet[int]]::new()
+                    foreach ($span in $sparse.spans) {
+                        for ($line = $span.startLine; $line -le $span.endLine; $line++) {
+                            $added.Add($line - 1) | Should -BeTrue
+                        }
+                    }
+                    $added.Count | Should -Be $sparse.addedLines
+                    $kept = @(
+                        for ($line = 0; $line -lt $after.Count; $line++) {
+                            if (-not $added.Contains($line)) { $after[$line] }
+                        }
+                    )
+                    $cursor = 0
+                    foreach ($line in $kept) {
+                        while ($cursor -lt $before.Count -and
+                            -not [string]::Equals($before[$cursor], $line,
+                                [StringComparison]::Ordinal)) { $cursor++ }
+                        $cursor | Should -BeLessThan $before.Count
+                        $cursor++
+                    }
+                    ($before.Count - $kept.Count) | Should -Be $sparse.deletedLines
+                }
+            }
+        }
+    }
+    It 'maps duplicate lines and UTF-8/CRLF edge edits without approximating whole files' {
+        InModuleScope DevPilot.ActivePrIntake {
+            $unicode = [string][char]0x03bb
+            $before = ("$unicode`r`n" * 1200)
+            $after = "first`n" + ("$unicode`r`n" * 1198) + "last`n"
+            $delta = Get-IntakeLineDelta $before $after 1000000 2500 `
+                ([DateTime]::UtcNow.AddSeconds(30)) -AllowSparseFallback
+            $delta.cells | Should -BeLessThan 1000000
+            $delta.addedLines | Should -Be 2
+            $delta.deletedLines | Should -Be 2
+            $delta.newLineCount | Should -Be 1200
+            $delta.spans.Count | Should -Be 2
+            $delta.spans[0].startLine | Should -Be 1
+            $delta.spans[1].startLine | Should -Be 1200
+            $added = Get-IntakeLineDelta '' ("$unicode`r`n" * 1200) `
+                1000000 2500 ([DateTime]::UtcNow.AddSeconds(30)) `
+                -AllowSparseFallback
+            $added.addedLines | Should -Be 1200
+            $added.deletedLines | Should -Be 0
+            $removed = Get-IntakeLineDelta ("$unicode`r`n" * 1200) '' `
+                1000000 2500 ([DateTime]::UtcNow.AddSeconds(30)) `
+                -AllowSparseFallback
+            $removed.addedLines | Should -Be 0
+            $removed.deletedLines | Should -Be 1200
+        }
+    }
+    It 'verifies a sparse edit above the old matrix limit through the coverage-only provider' {
+        $t = New-IntakeTransportCase
+        $t.case.config.schemaVersion = 3
+        $t.case.config.principalProof = 'aad-graph-storage-key-alias-free-v2'
+        $t.case.config.expectedAccount.Remove('uniqueName')
+        $t.case.config.pagination = @{ mode = 'created-time-keyset' }
+        $t.case.config.headProof = 'iteration-source-current-target-v1'
+        $before = (0..1199 | ForEach-Object { "row-$_`n" }) -join ''
+        $after = "inserted`n" +
+            ((0..1198 | ForEach-Object { "row-$_`n" }) -join '')
+        $old = New-TestBlob '/Tests/Synthetic.cs' $before
+        $new = New-TestBlob '/Tests/Synthetic.cs' $after
+        $project = New-TestBlob '/Tests/Tests.csproj' `
+            '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><IsTestProject>true</IsTestProject></PropertyGroup></Project>'
+        $tests = New-TestTree @(
+            @{ relativePath = 'Synthetic.cs'; mode = '100644'
+                gitObjectType = 'blob'; objectId = $new.objectId }
+            @{ relativePath = 'Tests.csproj'; mode = '100644'
+                gitObjectType = 'blob'; objectId = $project.objectId })
+        $rootTree = New-TestTree @(
+            @{ relativePath = 'Tests'; mode = '40000'
+                gitObjectType = 'tree'; objectId = $tests.objectId })
+        $t.case.config.projectEvidence.enabled = $true
+        $t.fixture.items["$($t.fixture.common)|/Tests/Synthetic.cs"] = $old
+        $t.fixture.items["$($t.fixture.source)|/Tests/Synthetic.cs"] = $new
+        $t.fixture.pages['0'] = @{ changeEntries = @(
+                @{ changeTrackingId = 1; changeType = 'edit'; item = @{
+                        path = '/Tests/Synthetic.cs'; objectId = $new.objectId
+                        originalObjectId = $old.objectId } }
+            ); nextSkip = 0 }
+        $t.fixture | ConvertTo-Json -Depth 20 |
+            Set-Content -LiteralPath $t.path -Encoding utf8
+        $env:ACTIVE_PR_INTAKE_FIXTURE = $t.path
+        $env:ACTIVE_PR_INTAKE_TEST_LOG = $t.log
+        $handler = [IntakeSparseDiffHandler]::new()
+        $handler.Before = $before; $handler.After = $after
+        $handler.BeforeId = $old.objectId; $handler.AfterId = $new.objectId
+        $handler.Project = $project.content
+        $handler.RootTreeId = $rootTree.objectId
+        $handler.RootTree = $rootTree | ConvertTo-Json -Depth 8 -Compress
+        $handler.TestsTreeId = $tests.objectId
+        $handler.TestsTree = $tests | ConvertTo-Json -Depth 8 -Compress
+        $client = [Net.Http.HttpClient]::new($handler)
+        try {
+            $provider = New-ActivePrAzureDevOpsProvider -Config $t.case.config `
+                -BoundClient $client -BearerToken ('s' * 100) `
+                -VerifyReadPrincipal -ExpectedPrincipalName 'service@example.invalid'
+            & $provider Identity @{} | Out-Null
+            $request = @{
+                pullRequestId = 1; iterationId = 1
+                sourceCommit = $t.fixture.source; targetCommit = $t.fixture.target
+                commonCommit = $t.fixture.common; remainingReads = 100
+                includeProjectEvidence = $true; includeEvaluationFiles = $true
+            }
+            $changes = & $provider Changes $request
+            $changes.changedFiles | Should -Be 1
+            $changes.changedLines | Should -Be 2
+            $changes.files[0].spans.Count | Should -Be 1
+            $changes.files[0].spans[0].startLine | Should -Be 1
+            $changes.files[0].addedLines | Should -Be 1
+            $changes.files[0].deletedLines | Should -Be 1
+            $changes.projectEvidence.complete | Should -BeTrue
+            $changes.projectEvidence.files[0].status | Should -Be 'complete'
+            @($changes.evaluationFiles[0].projectEvidence.projects |
+                Where-Object isTestProject -EQ $true).Count | Should -Be 1
+            $t.case.config.Remove('headProof')
+            $t.case.config.Remove('principalProof')
+            $t.case.config.Remove('pagination')
+            $t.case.config.schemaVersion = 1
+            $t.case.config.expectedAccount.uniqueName = 'service@example.invalid'
+            $legacy = New-ActivePrAzureDevOpsProvider -Config $t.case.config `
+                -AzureCliPath $t.stub -RawGet (New-TestRawGet $t)
+            { & $legacy Changes $request } | Should -Throw 'diff-budget'
+            $t.case.config.schemaVersion = 3
+            $t.case.config.principalProof = 'aad-graph-storage-key-alias-free-v2'
+            $t.case.config.expectedAccount.Remove('uniqueName')
+            $t.case.config.pagination = @{ mode = 'created-time-keyset' }
+            $t.case.config.headProof = 'iteration-source-current-target-v1'
+            $t.case.config.limits.maxDiffCells = 100
+            $limited = New-ActivePrAzureDevOpsProvider -Config $t.case.config `
+                -BoundClient $client -BearerToken ('s' * 100) `
+                -VerifyReadPrincipal -ExpectedPrincipalName 'service@example.invalid'
+            & $limited Identity @{} | Out-Null
+            { & $limited Changes $request } | Should -Throw 'diff-budget'
+        }
+        finally {
+            $client.Dispose()
+            Remove-Item Env:\ACTIVE_PR_INTAKE_FIXTURE, Env:\ACTIVE_PR_INTAKE_TEST_LOG `
+                -ErrorAction SilentlyContinue
         }
     }
 }

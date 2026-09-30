@@ -78,6 +78,20 @@ retargeted, or ambiguous refs remain unknown before any signed state.
 Per-selected-head diagnostic reasons distinguish inconsistent heads from
 transport failure without exposing refs or commits.
 
+Changed-line mapping retains the historical LCS matrix for diffs within
+`maxDiffCells`. Only coverage-only heads whose trimmed matrix exceeds that
+limit use a bounded exact shortest-edit-script search over the verified old
+and new line tokens. It counts diagonal steps and token comparisons against
+the same per-Changes-call `maxDiffCells` work budget, bounds retained frontier
+entries by that budget, and checks the existing deadline; exhaustion is
+`diff-budget` or `time-budget`, never a partial line proof. Equal-cost scripts
+on repeated lines may select different valid new-side anchors than the
+historical LCS tie order. Legacy four-rule mapping remains unchanged.
+Selected-head `diff-budget` is a safe diagnostic, not finding evidence or
+permission to skip a changed file. Its limit kind is `maxDiffCells`; the
+failure diagnostic leaves the numeric limit `null` when it has not been
+passed a verified count, rather than inventing one.
+
 HTTP 200 rate-limit remaining/limit/reset budget metadata alone, even when
 remaining is zero, is not a throttle signal; explicit 429/503, `Retry-After`,
 or a positive server-directed rate-limit delay stops the GET-only run.

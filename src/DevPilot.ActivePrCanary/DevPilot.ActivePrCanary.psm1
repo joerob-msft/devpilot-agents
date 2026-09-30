@@ -2589,7 +2589,8 @@ function New-CanaryIntakeFailureDiagnostic {
         'missing-page', 'page-budget', 'pr-budget', 'read-budget', 'time-budget',
         'page-inaccessible', 'provider-inaccessible', 'head-drift',
         'head-inconsistent', 'invalid-head', 'iteration-inaccessible',
-        'project-identity-unknown', 'unknown-heads', 'duplicate-list-entries-reconciled')
+        'project-identity-unknown', 'unknown-heads', 'diff-budget',
+        'duplicate-list-entries-reconciled')
     $reasons = if ($Cohort) {
         @($Cohort.reasonCodes | Where-Object { $_ -cin $safeReasons } |
             Select-Object -Unique)
@@ -2650,6 +2651,11 @@ function New-CanaryIntakeFailureDiagnostic {
                 } elseif ($head -and $head.status -ceq 'pending') {
                     'rules-not-evaluated'
                 } else { 'unavailable' }
+                limitKind = if ($head -and
+                    $head.reason -ceq 'diff-budget') {
+                    'maxDiffCells'
+                } else { $null }
+                limitCount = $null
             }
         })
     if ($Cohort) {

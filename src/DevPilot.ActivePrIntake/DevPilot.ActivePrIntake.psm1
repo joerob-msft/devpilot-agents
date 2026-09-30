@@ -349,9 +349,128 @@ function Get-IntakeLineTokens {
     return ,$lines.ToArray()
 }
 
+function Get-IntakeSparseLineDelta {
+    param([string[]]$Before, [string[]]$After, [int]$Prefix,
+        [int]$OldCount, [int]$NewCount, [int]$MaxCells,
+        [DateTime]$Deadline)
+    $trace = [Collections.Generic.List[int[]]]::new()
+    $work = 0
+    $stored = 0
+    $found = $false
+    $distance = 0
+    for ($d = 0; $d -le $OldCount + $NewCount; $d++) {
+        if ([DateTime]::UtcNow -ge $Deadline) { throw 'time-budget' }
+        if ($stored + $d + 1 -gt $MaxCells) { throw 'diff-budget' }
+        $frontier = [int[]]::new($d + 1)
+        for ($index = 0; $index -le $d; $index++) {
+            if ($index % 32 -eq 0 -and [DateTime]::UtcNow -ge $Deadline) {
+                throw 'time-budget'
+            }
+            if (++$work -gt $MaxCells) { throw 'diff-budget' }
+            $k = 2 * $index - $d
+            $insert = $d -gt 0 -and ($index -eq 0 -or
+                ($index -lt $d -and
+                    $trace[$d - 1][$index - 1] -lt
+                        $trace[$d - 1][$index]))
+            $x = if ($d -eq 0) { 0 } elseif ($insert) {
+                $trace[$d - 1][$index]
+            } else { $trace[$d - 1][$index - 1] + 1 }
+            $y = $x - $k
+            while ($x -lt $OldCount -and $y -lt $NewCount) {
+                if (++$work -gt $MaxCells) { throw 'diff-budget' }
+                if ($work % 256 -eq 0 -and [DateTime]::UtcNow -ge $Deadline) {
+                    throw 'time-budget'
+                }
+                if (-not [string]::Equals($Before[$Prefix + $x],
+                        $After[$Prefix + $y], [StringComparison]::Ordinal)) {
+                    break
+                }
+                $x++; $y++
+            }
+            $frontier[$index] = $x
+            if ($x -eq $OldCount -and $y -eq $NewCount) {
+                $found = $true
+                $distance = $d
+                break
+            }
+        }
+        $trace.Add($frontier)
+        $stored += $frontier.Length
+        if ($found) { break }
+    }
+    if (-not $found) { throw 'diff-budget' }
+    $x = $OldCount
+    $y = $NewCount
+    $inserted = [Collections.Generic.List[int]]::new()
+    $deleted = 0
+    for ($d = $distance; $d -gt 0; $d--) {
+        if ([DateTime]::UtcNow -ge $Deadline) { throw 'time-budget' }
+        $k = $x - $y
+        $index = [int](($k + $d) / 2)
+        $previous = $trace[$d - 1]
+        $insert = $index -eq 0 -or ($index -lt $d -and
+            $previous[$index - 1] -lt $previous[$index])
+        $previousIndex = if ($insert) { $index } else { $index - 1 }
+        $previousK = if ($insert) { $k + 1 } else { $k - 1 }
+        $previousX = $previous[$previousIndex]
+        $previousY = $previousX - $previousK
+        $snakeX = $previousX + [int](-not $insert)
+        $snakeY = $previousY + [int]$insert
+        if ($snakeX -gt $x -or $snakeY -gt $y -or
+            $x - $snakeX -ne $y - $snakeY) { throw 'diff-budget' }
+        while ($x -gt $snakeX) {
+            $x--; $y--
+            if (++$work -gt $MaxCells) { throw 'diff-budget' }
+            if ($work % 256 -eq 0 -and [DateTime]::UtcNow -ge $Deadline) {
+                throw 'time-budget'
+            }
+            if (-not [string]::Equals($Before[$Prefix + $x],
+                    $After[$Prefix + $y], [StringComparison]::Ordinal)) {
+                throw 'diff-budget'
+            }
+        }
+        if ($insert) {
+            $inserted.Add($Prefix + $previousY)
+        } else {
+            $deleted++
+        }
+        $x = $previousX
+        $y = $previousY
+    }
+    if ($x -ne $y) { throw 'diff-budget' }
+    for ($i = 0; $i -lt $x; $i++) {
+        if (++$work -gt $MaxCells) { throw 'diff-budget' }
+        if ($work % 256 -eq 0 -and [DateTime]::UtcNow -ge $Deadline) {
+            throw 'time-budget'
+        }
+        if (-not [string]::Equals($Before[$Prefix + $i],
+                $After[$Prefix + $i], [StringComparison]::Ordinal)) {
+            throw 'diff-budget'
+        }
+    }
+    $spans = [Collections.Generic.List[object]]::new()
+    $start = 0
+    $end = 0
+    for ($index = $inserted.Count - 1; $index -ge 0; $index--) {
+        $line = $inserted[$index] + 1
+        if ($start -eq 0) { $start = $line }
+        elseif ($line -ne $end + 1) {
+            $spans.Add([ordered]@{ startLine = $start; endLine = $end })
+            $start = $line
+        }
+        $end = $line
+    }
+    if ($start -gt 0) {
+        $spans.Add([ordered]@{ startLine = $start; endLine = $end })
+    }
+    return @{ addedLines = $inserted.Count; deletedLines = $deleted
+        newLineCount = $After.Count; spans = @($spans.ToArray())
+        cells = $work }
+}
+
 function Get-IntakeLineDelta {
     param([string]$Old, [string]$New, [int]$MaxCells, [int]$MaxLines,
-        [DateTime]$Deadline)
+        [DateTime]$Deadline, [switch]$AllowSparseFallback)
     if ([DateTime]::UtcNow -ge $Deadline) { throw 'time-budget' }
     $before = Get-IntakeLineTokens $Old
     $after = Get-IntakeLineTokens $New
@@ -379,7 +498,13 @@ function Get-IntakeLineDelta {
     $oldCount = $n - $prefix - $suffix
     $newCount = $m - $prefix - $suffix
     $cells = [long]($oldCount + 1) * ($newCount + 1)
-    if ($cells -gt $MaxCells) { throw 'diff-budget' }
+    if ($cells -gt $MaxCells) {
+        if (-not $AllowSparseFallback -or $MaxCells -lt 1) {
+            throw 'diff-budget'
+        }
+        return Get-IntakeSparseLineDelta $before $after $prefix `
+            $oldCount $newCount $MaxCells $Deadline
+    }
     $width = $newCount + 1
     $table = [int[]]::new([int]$cells)
     for ($i = $oldCount - 1; $i -ge 0; $i--) {
@@ -2826,7 +2951,9 @@ function New-ActivePrAzureDevOpsProvider {
                         throw 'unsupported-change'
                     }
                     $delta = & $lineDelta $old $new $cellsLeft `
-                        ([int]$Config.limits.maxChangedLines * 2) $deadline
+                        ([int]$Config.limits.maxChangedLines * 2) $deadline `
+                        -AllowSparseFallback:($Config['headProof'] -ceq
+                            'iteration-source-current-target-v1')
                     $cellsLeft -= $delta.cells
                     $totalLines += $delta.addedLines + $delta.deletedLines
                     if ($totalLines -gt [int]$Config.limits.maxChangedLines) {
