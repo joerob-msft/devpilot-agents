@@ -81,6 +81,17 @@ does not imply that an unmeasured larger file qualifies: EOF beyond either
 cap or a RAW body disagreeing with its declared length fails closed without
 truncated evidence. The declared-length guard applies to signed BoundClient RAW Item transport;
 JSON and identity GET ceilings and the legacy four-rule 256 KiB cap are unchanged.
+The [ADO Item GET metadata contract](https://learn.microsoft.com/en-us/rest/api/azure/devops/git/items/get?view=azure-devops-rest-7.1)
+defaults `includeContent` to false. An absent, null, or empty `content`
+property on a metadata response is not body proof; nonempty or non-string
+content is rejected. A C# Item metadata encoding hint of 1252 (as well as
+65001) does not decode or authorize source bytes: the separate bounded RAW
+response must still pass strict UTF-8, EOF, control/LFS, and Git blob checks.
+For a selected `Changes` failure, a fresh allowlisted `invalid-item` metadata
+guard can identify only `old`/`new` and a fixed public predicate
+(`item-shape`, `unexpected-content`, `source-media`, or `object-id`).
+Without that guard the predicate remains unknown; no path, object ID,
+content, encoding value, or account appears in this diagnostic.
 Coverage source failures retain allowlisted receipt-drift, unproved snapshot
 lineage, changed snapshot document, and merged-master metadata/content
 reason codes instead of flattening

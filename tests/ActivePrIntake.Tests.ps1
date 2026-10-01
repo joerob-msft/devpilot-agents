@@ -19,6 +19,10 @@ public sealed class IntakeSparseDiffHandler : HttpMessageHandler {
         new System.Collections.Generic.SortedDictionary<string, string>(StringComparer.Ordinal);
     public int RawUnrelatedCalls, MetadataUnrelatedCalls, RawProjectCalls;
     public bool WrongUnrelatedId, MissingTerminalPage;
+    public string MetadataContentMode;
+    public int MetadataEncoding = 65001;
+    public bool MetadataBinary, MetadataWrongType, MetadataWrongPath,
+        MetadataWrongNewId, MetadataFolder, MetadataSymLink;
     public string Project, RootTreeId, RootTree, TestsTreeId, TestsTree;
     public bool ChunkRaw, CancelRaw, CorruptRaw, EncodedRaw, NonJsonIdentity;
     public long? DeclaredRawLength;
@@ -84,21 +88,36 @@ public sealed class IntakeSparseDiffHandler : HttpMessageHandler {
                         objectId = WrongUnrelatedId && !old ?
                             new string('f', 40) : old ?
                             UnrelatedOldIds[unrelatedPath] :
-                            UnrelatedNewIds[unrelatedPath], isFolder = false });
+                            UnrelatedNewIds[unrelatedPath], isFolder = false,
+                        content = (string)null });
                 }
             } else {
             if (raw) RawItemCalls++;
             if (raw && project) RawProjectCalls++;
             if (raw && !project && !old && CancelRaw)
                 throw new OperationCanceledException();
+            var metadataContent = MetadataContentMode == null ? "" :
+                ",\"content\":" + (MetadataContentMode == "null" ? "null" :
+                    System.Text.Json.JsonSerializer.Serialize(
+                        MetadataContentMode == "empty" ? (object)"" :
+                        MetadataContentMode == "wrong-type" ? 42 : "unexpected"));
             body = raw ? (project ? Project : old ? Before : After)
-                : "{\"path\":\"" + (old && RenameFrom != null ? RenameFrom :
+                : "{\"path\":\"" + (MetadataWrongPath ? "/Tests/Other.cs" :
+                    old && RenameFrom != null ? RenameFrom :
                     ChangedPath ?? "/Tests/Synthetic.cs") +
-                    "\",\"gitObjectType\":\"blob\",\"objectId\":\"" +
-                    (old ? BeforeId : AfterId) +
-                    "\",\"isFolder\":false,\"contentMetadata\":{\"isBinary\":false,\"encoding\":65001,\"contentType\":\"text/plain\"}" +
-                    (query.Contains("includeContent=false") ? "" : ",\"content\":" +
-                        System.Text.Json.JsonSerializer.Serialize(old ? Before : After)) + "}";
+                    "\",\"gitObjectType\":\"" + (MetadataWrongType ? "tree" : "blob") +
+                    "\",\"objectId\":\"" +
+                    (MetadataWrongNewId && !old ? new string('f', 40) :
+                        old ? BeforeId : AfterId) +
+                    "\",\"isFolder\":" + (MetadataFolder ? "true" : "false") +
+                    ",\"isSymLink\":" + (MetadataSymLink ? "true" : "false") +
+                    ",\"contentMetadata\":{\"isBinary\":" +
+                    (MetadataBinary ? "true" : "false") +
+                    ",\"encoding\":" + MetadataEncoding +
+                    ",\"contentType\":\"text/plain\"}" +
+                    (query.Contains("includeContent=false") ? metadataContent :
+                        ",\"content\":" + System.Text.Json.JsonSerializer.Serialize(
+                            old ? Before : After)) + "}";
             }
         } else if (path.EndsWith("/commits/" + new string('a', 40)))
             body = "{\"commitId\":\"" + new string('a', 40) +
@@ -1844,6 +1863,110 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
         }
         finally { $c.client.Dispose() }
     }
+    It 'accepts nullable or empty metadata-only content and ASCII labeled 1252 after verified RAW' {
+        foreach ($scenario in @('null', 'empty', '1252')) {
+            $c = New-LargeBoundCase -FileBytes 1024
+            $c.case.case.config.coverageBodyScope = 'csharp-rule-candidates-v1'
+            $c.case.case.config.rules = @(
+                @{ id = 'bpm-test-class-coverage@2'
+                    capability = 'bpm-test-class-coverage@2' },
+                @{ id = 'bpm-redundant-method-coverage@2'
+                    capability = 'bpm-redundant-method-coverage@2' })
+            $c.request.coverageBodyScope = 'csharp-rule-candidates-v1'
+            if ($scenario -eq '1252') { $c.handler.MetadataEncoding = 1252 }
+            else { $c.handler.MetadataContentMode = $scenario }
+            $meter = @{ attemptedGets = 0; completedGets = 0
+                throttleEvents = 0 }
+            try {
+                $provider = New-LargeBoundProvider $c $meter
+                $changes = & $provider Changes $c.request
+                $changes.manifest.entries.Count | Should -Be 1
+                $changes.scopedChangedFiles | Should -Be 1
+                $c.handler.RawItemCalls | Should -Be 3
+                $meter.lastItemGuard | Should -BeNullOrEmpty
+            }
+            finally { $c.client.Dispose() }
+        }
+    }
+    It 'rejects unexpected metadata content and invalid immutable Item shape before RAW' {
+        foreach ($scenario in @('nonempty', 'wrong-type', 'encoding',
+                'binary', 'wrong-path', 'wrong-id', 'folder', 'symlink', 'type')) {
+            $c = New-LargeBoundCase -FileBytes 1024
+            $c.case.case.config.coverageBodyScope = 'csharp-rule-candidates-v1'
+            $c.case.case.config.rules = @(
+                @{ id = 'bpm-test-class-coverage@2'
+                    capability = 'bpm-test-class-coverage@2' },
+                @{ id = 'bpm-redundant-method-coverage@2'
+                    capability = 'bpm-redundant-method-coverage@2' })
+            $c.request.coverageBodyScope = 'csharp-rule-candidates-v1'
+            switch ($scenario) {
+                nonempty { $c.handler.MetadataContentMode = 'nonempty' }
+                'wrong-type' { $c.handler.MetadataContentMode = 'wrong-type' }
+                encoding { $c.handler.MetadataEncoding = 1200 }
+                binary { $c.handler.MetadataBinary = $true }
+                'wrong-path' { $c.handler.MetadataWrongPath = $true }
+                'wrong-id' { $c.handler.MetadataWrongNewId = $true }
+                folder { $c.handler.MetadataFolder = $true }
+                symlink { $c.handler.MetadataSymLink = $true }
+                type { $c.handler.MetadataWrongType = $true }
+            }
+            $meter = @{ attemptedGets = 0; completedGets = 0
+                throttleEvents = 0 }
+            try {
+                $provider = New-LargeBoundProvider $c $meter
+                { & $provider Changes $c.request } | Should -Throw 'invalid-item'
+                $meter.lastItemGuard.side | Should -Be $(if ($scenario -eq 'wrong-id') {
+                        'new'
+                    } else { 'old' })
+                $meter.lastItemGuard.predicate | Should -Be $(
+                    switch ($scenario) {
+                        nonempty { 'unexpected-content' }
+                        'wrong-type' { 'unexpected-content' }
+                        encoding { 'source-media' }
+                        binary { 'source-media' }
+                        'wrong-id' { 'object-id' }
+                        default { 'item-shape' }
+                    })
+                $meter.lastItemGuard.attemptIndex |
+                    Should -Be $meter.attemptedGets
+                $c.handler.RawItemCalls | Should -Be 0
+                if ($scenario -eq 'nonempty') {
+                    $c.handler.MetadataContentMode = 'null'
+                    (& $provider Changes $c.request).scopedChangedFiles |
+                        Should -Be 1
+                    $meter.lastItemGuard | Should -BeNullOrEmpty
+                }
+            }
+            finally { $c.client.Dispose() }
+        }
+    }
+    It 'does not treat a 1252 metadata hint as permission to decode invalid RAW UTF-8' {
+        $c = New-LargeBoundCase -FileBytes 1024
+        $c.case.case.config.coverageBodyScope = 'csharp-rule-candidates-v1'
+        $c.case.case.config.rules = @(
+            @{ id = 'bpm-test-class-coverage@2'
+                capability = 'bpm-test-class-coverage@2' },
+            @{ id = 'bpm-redundant-method-coverage@2'
+                capability = 'bpm-redundant-method-coverage@2' })
+        $c.request.coverageBodyScope = 'csharp-rule-candidates-v1'
+        $c.handler.MetadataEncoding = 1252
+        $bytes = [Text.Encoding]::UTF8.GetBytes($c.handler.After)
+        $bytes[0] = 255
+        $c.handler.RawAfterBytes = $bytes
+        $header = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+        $c.handler.AfterId = [Convert]::ToHexString(
+            [Security.Cryptography.SHA1]::HashData(
+                [byte[]]($header + $bytes))).ToLowerInvariant()
+        $meter = @{ attemptedGets = 0; completedGets = 0
+            throttleEvents = 0 }
+        try {
+            $provider = New-LargeBoundProvider $c $meter
+            { & $provider Changes $c.request } |
+                Should -Throw 'unsupported-change'
+            $meter.lastItemGuard | Should -BeNullOrEmpty
+        }
+        finally { $c.client.Dispose() }
+    }
     It 'binds case-only C# renames to both exact paths and tolerates unchanged text' {
         $c = New-LargeBoundCase -FileBytes 1024 `
             -Path '/Tests/Synthetic.CS' `
@@ -1962,6 +2085,7 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
                     $changes.evaluationFiles[0].content |
                         Should -BeExactly $c.handler.After
                     $meter.lastByteBudget | Should -BeNullOrEmpty
+                    $meter.lastItemGuard | Should -BeNullOrEmpty
                     continue
                 }
                 { & $provider Changes $c.request } |

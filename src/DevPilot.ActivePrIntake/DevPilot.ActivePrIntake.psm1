@@ -796,6 +796,45 @@ function Assert-IntakeRawBlob {
     return @{ text = $text; bytes = $Bytes.Length }
 }
 
+function Assert-IntakeCoverageItem {
+    param([object]$Item, [string]$Path, [string]$ExpectedObjectId,
+        [string]$Scope, [string]$Side, [Collections.IDictionary]$Telemetry)
+    $predicate = $null
+    if ($Item -isnot [Collections.IDictionary] -or
+        [string]$Item.path -cne $Path -or
+        [string]$Item.gitObjectType -cne 'blob' -or
+        $Item['isFolder'] -eq $true -or
+        $Item['isSymLink'] -eq $true) {
+        $predicate = 'item-shape'
+    } elseif ($Item.Contains('content') -and
+        $null -ne $Item['content'] -and
+        ($Item['content'] -isnot [string] -or
+            $Item['content'] -cne '')) {
+        $predicate = 'unexpected-content'
+    } elseif ($Scope -ceq 'csharp-body-diff' -and
+        $Item['contentMetadata'] -is [Collections.IDictionary] -and
+        ($Item.contentMetadata['isBinary'] -eq $true -or
+            ($null -ne $Item.contentMetadata['encoding'] -and
+                [string]$Item.contentMetadata.encoding -cnotin @(
+                    '65001', '1252')))) {
+        $predicate = 'source-media'
+    } elseif ([string]$Item.objectId -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        ($ExpectedObjectId -and
+            [string]$Item.objectId -ine $ExpectedObjectId)) {
+        $predicate = 'object-id'
+    }
+    if ($predicate) {
+        if ($Telemetry) {
+            $Telemetry['lastItemGuard'] = [ordered]@{
+                side = $Side; predicate = $predicate
+                attemptIndex = [int]$Telemetry.attemptedGets
+            }
+        }
+        throw 'invalid-item'
+    }
+    return ([string]$Item.objectId).ToLowerInvariant()
+}
+
 function Get-IntakeSourceTree {
     param([scriptblock]$Read, [string[]]$Route, [string]$Commit,
         [int]$MaxEntries)
@@ -2681,6 +2720,7 @@ function New-ActivePrAzureDevOpsProvider {
     $assertNumber = ${function:Assert-IntakeNumber}
     $assertBlob = ${function:Assert-IntakeBlob}
     $assertRawBlob = ${function:Assert-IntakeRawBlob}
+    $assertCoverageItem = ${function:Assert-IntakeCoverageItem}
     $sourceTree = ${function:Get-IntakeSourceTree}
     $projectGraph = Get-Command Get-TestProjectGraphEvidence -ErrorAction Stop
     $lineDelta = ${function:Get-IntakeLineDelta}
@@ -2970,6 +3010,9 @@ function New-ActivePrAzureDevOpsProvider {
             Changes {
                 $coverageScope = $Config['coverageBodyScope'] -ceq
                     'csharp-rule-candidates-v1'
+                if ($coverageScope -and $TransportTelemetry) {
+                    $TransportTelemetry['lastItemGuard'] = $null
+                }
                 if (($coverageScope -and $Request['coverageBodyScope'] -cne
                         'csharp-rule-candidates-v1') -or
                     (-not $coverageScope -and
@@ -3137,29 +3180,9 @@ function New-ActivePrAzureDevOpsProvider {
                                 "versionDescriptor.version=$($Request.commonCommit)",
                                 'versionDescriptor.versionType=commit',
                                 'includeContent=false', 'includeContentMetadata=true') 65536
-                            if ($oldItem -isnot [Collections.IDictionary] -or
-                                [string]$oldItem.path -cne $oldPath -or
-                                [string]$oldItem.gitObjectType -cne 'blob' -or
-                                $oldItem['isFolder'] -eq $true -or
-                                $oldItem['isSymLink'] -eq $true -or
-                                $oldItem.Contains('content') -or
-                                ($scope -ceq 'csharp-body-diff' -and
-                                    $oldItem['contentMetadata'] -is
-                                        [Collections.IDictionary] -and
-                                    ($oldItem.contentMetadata['isBinary'] -eq
-                                        $true -or
-                                        ($null -ne
-                                            $oldItem.contentMetadata['encoding'] -and
-                                            [string]$oldItem.contentMetadata.encoding -cne
-                                                '65001'))) -or
-                                [string]$oldItem.objectId -cnotmatch
-                                    '^[a-fA-F0-9]{40}$' -or
-                                ($change.item['originalObjectId'] -and
-                                    [string]$change.item.originalObjectId -ine
-                                        [string]$oldItem.objectId)) {
-                                throw 'invalid-item'
-                            }
-                            $oldId = ([string]$oldItem.objectId).ToLowerInvariant()
+                            $oldId = & $assertCoverageItem $oldItem $oldPath `
+                                ([string]$change.item['originalObjectId']) `
+                                $scope 'old' $TransportTelemetry
                         }
                         if ($kind -ne 'delete') {
                             if ([string]$change.item.objectId -cnotmatch
@@ -3169,26 +3192,9 @@ function New-ActivePrAzureDevOpsProvider {
                                 "versionDescriptor.version=$($Request.sourceCommit)",
                                 'versionDescriptor.versionType=commit',
                                 'includeContent=false', 'includeContentMetadata=true') 65536
-                            if ($newItem -isnot [Collections.IDictionary] -or
-                                [string]$newItem.path -cne $path -or
-                                [string]$newItem.gitObjectType -cne 'blob' -or
-                                $newItem['isFolder'] -eq $true -or
-                                $newItem['isSymLink'] -eq $true -or
-                                $newItem.Contains('content') -or
-                                ($scope -ceq 'csharp-body-diff' -and
-                                    $newItem['contentMetadata'] -is
-                                        [Collections.IDictionary] -and
-                                    ($newItem.contentMetadata['isBinary'] -eq
-                                        $true -or
-                                        ($null -ne
-                                            $newItem.contentMetadata['encoding'] -and
-                                            [string]$newItem.contentMetadata.encoding -cne
-                                                '65001'))) -or
-                                [string]$newItem.objectId -ine
-                                    [string]$change.item.objectId) {
-                                throw 'invalid-item'
-                            }
-                            $newId = ([string]$newItem.objectId).ToLowerInvariant()
+                            $newId = & $assertCoverageItem $newItem $path `
+                                ([string]$change.item.objectId) $scope 'new' `
+                                $TransportTelemetry
                         }
                         $metadata[[int]$change.changeTrackingId] = @{
                             oldItem = $oldItem; scope = $scope

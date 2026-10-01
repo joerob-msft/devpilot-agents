@@ -2655,6 +2655,19 @@ function New-CanaryIntakeFailureDiagnostic {
                 $ProviderCalls['byteBudgets'].Contains($id)) {
                 $ProviderCalls['byteBudgets'][$id]
             } else { $null }
+            $itemGuard = if ($head -and $head.reason -ceq 'invalid-item' -and
+                $failedMethod -ceq 'Changes' -and
+                $ProviderCalls['itemGuards'] -is [Collections.IDictionary] -and
+                $ProviderCalls['itemGuards'].Contains($id)) {
+                $ProviderCalls['itemGuards'][$id]
+            } else { $null }
+            $safeItemGuard = if ($itemGuard -is [Collections.IDictionary] -and
+                $itemGuard.side -cin @('old', 'new') -and
+                $itemGuard.predicate -cin @('item-shape',
+                    'unexpected-content', 'source-media', 'object-id')) {
+                [ordered]@{ stage = 'metadata'; side = [string]$itemGuard.side
+                    predicate = [string]$itemGuard.predicate }
+            } else { $null }
             [ordered]@{
                 pullRequestId = $id
                 inventoryEligible = if ($inventoryKnown) {
@@ -2694,6 +2707,7 @@ function New-CanaryIntakeFailureDiagnostic {
                 bodyPhase = if ($byteBudget) {
                     [string]$byteBudget.phase
                 } else { 'unknown' }
+                itemGuard = $safeItemGuard
             }
         })
     if ($Cohort) {
@@ -2861,7 +2875,7 @@ function Invoke-PrivateCanarySignedIntake {
     $registry = $null
     $gate = @{ pins = $null; finalRegistry = $null; cohort = $null }
     $providerCalls = @{ attempted = 0; completed = 0; failureCode = $null
-        failedMethods = @{}; byteBudgets = @{} }
+        failedMethods = @{}; byteBudgets = @{}; itemGuards = @{} }
     $transportTelemetry = $null
     $sourceTelemetry = $null
     try {
@@ -2962,6 +2976,23 @@ function Invoke-PrivateCanarySignedIntake {
                         bytesRead = [long]$budget.bytesRead
                         declaredBytes = $budget.declaredBytes
                         phase = [string]$budget.phase
+                    }
+                }
+                $guard = if ($transportTelemetry) {
+                    $transportTelemetry['lastItemGuard']
+                } else { $null }
+                if ($_.Exception.Message -ceq 'invalid-item' -and
+                    $operation -ceq 'Changes' -and
+                    $guard -is [Collections.IDictionary] -and
+                    $guard.side -cin @('old', 'new') -and
+                    $guard.predicate -cin @('item-shape',
+                        'unexpected-content', 'source-media', 'object-id') -and
+                    $guard.attemptIndex -is [int] -and
+                    $guard.attemptIndex -gt $startTransportGets -and
+                    $guard.attemptIndex -le [int]$transportTelemetry.attemptedGets) {
+                    $providerCalls.itemGuards[$selectedId] = [ordered]@{
+                        side = [string]$guard.side
+                        predicate = [string]$guard.predicate
                     }
                 }
             }

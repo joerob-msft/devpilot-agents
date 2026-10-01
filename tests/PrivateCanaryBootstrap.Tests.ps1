@@ -2299,6 +2299,7 @@ Describe 'Read-only private canary input bootstrap' {
                     $d.selected[0].reason | Should -BeExactly $code
                     $d.selected[0].method | Should -BeExactly $method
                     $d.selected[0].stage | Should -Be 'provider-call'
+                    $d.selected[0].itemGuard | Should -BeNullOrEmpty
                     $d.selected[0].headProof | Should -Be 'unknown'
                     $d.selected[0].inventoryEligible | Should -BeTrue
                     $d.selected[1].headProof | Should -Be 'pending'
@@ -2437,6 +2438,58 @@ Describe 'Read-only private canary input bootstrap' {
                 $d.provider.responseHeadersCompleted | Should -Be 5
                 $d.throttleState | Should -Be 'unknown'
                 $d.privateIntakePersisted | Should -BeNullOrEmpty
+            }
+            It 'reports only fixed metadata guard names for a failing selected Changes call' {
+                $cohort = @{
+                    inventory = @{ state = 'complete'; active = 2
+                        nonDraft = 2; draft = 0; eligible = 2
+                        excludedOtherTargets = 0 }
+                    populationKnown = $true
+                    gapCounts = @{ enumerationUnknown = 0
+                        duplicateEntries = 0; drift = 0 }
+                    reasonCodes = @()
+                    heads = @(
+                        @{ pullRequestId = 101; status = 'unknown'
+                            targetRef = 'refs/heads/master'
+                            reason = 'invalid-item' },
+                        @{ pullRequestId = 202; status = 'pending'
+                            targetRef = 'refs/heads/master'
+                            reason = 'rules-incomplete' })
+                    pages = @{ first = 1; second = 1 }
+                    readCount = 9
+                }
+                $calls = @{ attempted = 2; completed = 1
+                    failedMethods = @{ 101 = 'Changes' }; byteBudgets = @{}
+                    itemGuards = @{ 101 = @{
+                            side = 'new'; predicate = 'unexpected-content'
+                            path = '/fictional-private-route'
+                            arbitrary = 'service@example.invalid'
+                        } } }
+                $diagnose = {
+                    param($Proof, $Calls)
+                    & (Get-Module DevPilot.ActivePrCanary) {
+                        param($Cohort, $ProviderCalls)
+                        New-CanaryIntakeFailureDiagnostic $Cohort `
+                            @(101, 202) $null $ProviderCalls $null $null
+                    } $Proof $Calls
+                }
+                $d = & $diagnose $cohort $calls
+                $d.selected[0].method | Should -Be 'Changes'
+                $d.selected[0].itemGuard.stage | Should -Be 'metadata'
+                $d.selected[0].itemGuard.side | Should -Be 'new'
+                $d.selected[0].itemGuard.predicate |
+                    Should -Be 'unexpected-content'
+                $d.selected[1].itemGuard | Should -BeNullOrEmpty
+                ($d | ConvertTo-Json -Depth 12) |
+                    Should -Not -Match '/fictional-private-route|service@example.invalid'
+
+                $calls.itemGuards[101].predicate = '/fictional-private-route'
+                (& $diagnose $cohort $calls).selected[0].itemGuard |
+                    Should -BeNullOrEmpty
+                $calls.itemGuards[101].predicate = 'unexpected-content'
+                $cohort.heads[0].reason = 'unsupported-change'
+                (& $diagnose $cohort $calls).selected[0].itemGuard |
+                    Should -BeNullOrEmpty
             }
             It 'distinguishes inventory duplicates and cardinality without assuming eligibility' {
                 $cohort = @{
