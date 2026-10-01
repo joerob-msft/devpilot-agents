@@ -23,6 +23,10 @@ The offline path guard recognizes `.cs` and `.CS` without normalizing Git path
 case: a case-variant discussion path is ambiguous, never HUMAN-covered.
 Case-variant or malformed DevPilot automation markers likewise block the
 diagnostic `wouldCreate` outcome.
+The diagnostic classifies a HUMAN thread as covered only for the shared
+Owner @2 affirmative comment predicate, a current context, and a matched
+reviewer identity; negated, questioning, incomplete, or stale advice is
+ambiguous, not proof of coverage.
 
 PR191 `Get-RuleEvaluation` returns per-finding digest, classification, and
 reason; `PrivateCanaryRunner` discards those outcomes and persists only an
@@ -69,6 +73,9 @@ the two-per-rule/run budget **across PRs**, and the five-per-rule/PR budget
 across rereads, independent of head or configuration. A busy or stale global
 lock, malformed event, broken chain, or uncertain attempt blocks retry without
 an automatic recovery path.
+Fixture root and child directories must already have private permissions and
+link-free ancestry before any lock or journal is created. New test-owned files
+are verified private before writing their contents.
 
 Production integration still requires a trusted root outside the repository,
 an independently verified signer and identity, serialized history whose

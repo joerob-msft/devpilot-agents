@@ -508,6 +508,27 @@ function New-OwnerV2DiscussionReconciliation {
     }
 }
 
+function Test-OwnerCoverageHumanAffirmation {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('bpm-test-class-coverage@2',
+            'bpm-redundant-method-coverage@2')]
+        [string]$CapabilityId,
+        [AllowEmptyString()][string]$Body
+    )
+    if ($CapabilityId -ceq 'bpm-test-class-coverage@2') {
+        return [regex]::IsMatch($Body,
+            '(?i)^\s*(?:(?:please|kindly)\s+)?(?:add\s+(?:an?\s+)?)?exclude\s+from\s+code\s+coverage\s*[.!]?\s*$')
+    }
+    return $Body -notmatch '(?i)\b(?:do\s+not|don''t|shouldn''t|keep|retain|must\s+not)\s+(?:remove|delete)\b' -and
+        $Body -notmatch '\?' -and
+        $Body -notmatch '(?i)\b(?:not|never|doesn''t|isn''t|aren''t)\s+(?:\w+\s+){0,3}(?:redundan\w*|unnecess\w*|cover\w*|exclu\w*)\b' -and
+        $Body -match '(?i)\bmethod(?:-level)?\b' -and
+        $Body -match '(?i)\b(?:class|class-level)\b' -and
+        $Body -match '(?i)\b(?:exclu\w*|cover\w*)\b' -and
+        $Body -match '(?i)\b(?:redundan\w*|unnecess\w*|no\s+need|no\s+effect|already|entire|whole)\b'
+}
+
 function Resolve-OwnerV2DiscussionReconciliation {
     [CmdletBinding()]
     param(
@@ -779,6 +800,13 @@ function Resolve-OwnerV2DiscussionReconciliation {
                         $text -match '(?i)\b(?:arguments?|parameters?|expected|actual)\b' -and
                         ($text -match '(?i)\b(?:AreEqual|assert|expected|actual)\b' -or
                             $text -match '(?i)^\s*(?:please\s+)?(?:use|add|prefer)\s+(?:the\s+)?named\s+(?:arguments?|parameters?)\s*[.!]?\s*$')
+                    }
+                    elseif ($capabilityId -cin @(
+                            'bpm-test-class-coverage@2',
+                            'bpm-redundant-method-coverage@2')) {
+                        Test-OwnerCoverageHumanAffirmation `
+                            -CapabilityId $capabilityId `
+                            -Body ([string]$comment.body)
                     }
                     elseif ($isRedundantMethod) {
                         $text = [string]$comment.body
@@ -2942,5 +2970,6 @@ Export-ModuleMember -Function @(
     'New-TestClassCoverageCapabilityAdapter',
     'New-OwnerV2CapabilityAdapter',
     'New-OwnerV2CapabilityLimits',
+    'Test-OwnerCoverageHumanAffirmation',
     'Resolve-OwnerV2DiscussionReconciliation'
 )

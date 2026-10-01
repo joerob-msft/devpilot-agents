@@ -29,6 +29,11 @@ InModuleScope DevPilot.CoverageV2Ledger {
                     $inherit, [Security.AccessControl.PropagationFlags]::None,
                     [Security.AccessControl.AccessControlType]::Allow))
             Set-Acl -LiteralPath $script:root -AclObject $acl
+        } else {
+            [IO.File]::SetUnixFileMode($script:root,
+                [IO.UnixFileMode]::UserRead -bor
+                [IO.UnixFileMode]::UserWrite -bor
+                [IO.UnixFileMode]::UserExecute)
         }
         $script:key = [byte[]]::new(32)
         [Array]::Fill[byte]($script:key, [byte]0x46)
@@ -69,6 +74,86 @@ InModuleScope DevPilot.CoverageV2Ledger {
                 } } |
                 Should -Throw '*coverage-v2-signed-finding-authority-unavailable*'
             Test-Path -LiteralPath $root | Should -BeFalse
+        }
+
+        It 'refuses a permissive fixture root before creating a lock or journal' {
+            $root = Join-Path $script:root (
+                '.coverage-v2-ledger-test-' + [guid]::NewGuid().ToString('N'))
+            [void](New-Item -ItemType Directory -Path $root)
+            try {
+                if ($IsWindows) {
+                    $acl = Get-Acl -LiteralPath $root
+                    $users = [Security.Principal.SecurityIdentifier]::new(
+                        [Security.Principal.WellKnownSidType]::BuiltinUsersSid,
+                        $null)
+                    $acl.AddAccessRule(
+                        [Security.AccessControl.FileSystemAccessRule]::new(
+                            $users,
+                            [Security.AccessControl.FileSystemRights]::ReadAndExecute,
+                            [Security.AccessControl.AccessControlType]::Allow))
+                    Set-Acl -LiteralPath $root -AclObject $acl
+                } else {
+                    [IO.File]::SetUnixFileMode($root,
+                        [IO.UnixFileMode]::UserRead -bor
+                        [IO.UnixFileMode]::UserWrite -bor
+                        [IO.UnixFileMode]::UserExecute -bor
+                        [IO.UnixFileMode]::GroupRead -bor
+                        [IO.UnixFileMode]::GroupExecute)
+                }
+                $p = New-FictionalLedgerRequest
+                $p.Root = $root
+                { Invoke-CoverageV2LedgerFixture @p -Operation Reserve } |
+                    Should -Throw '*coverage-v2-ledger-fixture-directory-invalid*'
+                Test-Path -LiteralPath (Join-Path $root 'locks') |
+                    Should -BeFalse
+                Test-Path -LiteralPath (Join-Path $root 'journal') |
+                    Should -BeFalse
+            }
+            finally { Remove-Item -LiteralPath $root -Force }
+        }
+
+        It 'refuses a linked ancestor inside the fixture before creating state' {
+            $target = Join-Path $script:root 'fictional-link-target'
+            $link = Join-Path $script:root 'fictional-link-ancestor'
+            [void](New-Item -ItemType Directory -Path $target)
+            if (-not $IsWindows) {
+                [IO.File]::SetUnixFileMode($target,
+                    [IO.UnixFileMode]::UserRead -bor
+                    [IO.UnixFileMode]::UserWrite -bor
+                    [IO.UnixFileMode]::UserExecute)
+            }
+            $leaf = '.coverage-v2-ledger-test-' +
+                [guid]::NewGuid().ToString('N')
+            $physical = Join-Path $target $leaf
+            [void](New-Item -ItemType Directory -Path $physical)
+            if (-not $IsWindows) {
+                [IO.File]::SetUnixFileMode($physical,
+                    [IO.UnixFileMode]::UserRead -bor
+                    [IO.UnixFileMode]::UserWrite -bor
+                    [IO.UnixFileMode]::UserExecute)
+            }
+            try {
+                $linkType = if ($IsWindows) { 'Junction' } else {
+                    'SymbolicLink'
+                }
+                [void](New-Item -ItemType $linkType -Path $link `
+                        -Target $target)
+                $p = New-FictionalLedgerRequest
+                $p.Root = Join-Path $link $leaf
+                { Invoke-CoverageV2LedgerFixture @p -Operation Reserve } |
+                    Should -Throw '*coverage-v2-ledger-fixture-directory-invalid*'
+                Test-Path -LiteralPath (Join-Path $physical 'locks') |
+                    Should -BeFalse
+                Test-Path -LiteralPath (Join-Path $physical 'journal') |
+                    Should -BeFalse
+            }
+            finally {
+                if (Test-Path -LiteralPath $link) {
+                    Remove-Item -LiteralPath $link -Force
+                }
+                Remove-Item -LiteralPath $physical -Force
+                Remove-Item -LiteralPath $target -Force
+            }
         }
 
         It 'records reservation, attempt and one explicit readback durably' {

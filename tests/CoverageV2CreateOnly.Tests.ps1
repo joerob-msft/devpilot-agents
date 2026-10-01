@@ -206,16 +206,18 @@ InModuleScope DevPilot.CoverageV2CreateOnly {
             return @{
                 anchor = @{ path = $Case.Intent.path; line = 12 }
                 status = 'active'
+                contextState = 'current'
                 sourceCommit = $Case.Intent.subject.sourceCommit
                 isDeleted = $false
                 isOutdated = $false
                 comments = @(@{
                     author = $Case.Human.Clone()
                     body = $(if ($Redundant) {
-                        'Fictional method attribute has redundant coverage exclusion.'
+                        'Please remove redundant method-level coverage exclusion since the class is already excluded.'
                     } else {
                         'Please exclude from code coverage.'
                     })
+                    reviewerIdentityState = 'matched'
                     commentType = 'text'
                     isDeleted = $false
                 })
@@ -451,6 +453,43 @@ InModuleScope DevPilot.CoverageV2CreateOnly {
             $c = New-FictionalCoverageCase -Redundant
             $c.Snapshot.threads = @((New-FictionalHumanThread $c -Redundant))
             Get-CoverageV2OfflineDecision @c | Should -Be 'humanCovered'
+        }
+
+        It 'refuses negated or incomplete HUMAN coverage advice as ambiguous' {
+            foreach ($case in @(
+                    @{ Redundant = $false
+                        Body = 'Do not exclude from code coverage.' },
+                    @{ Redundant = $true
+                        Body = 'Fictional method attribute has redundant coverage exclusion.' },
+                    @{ Redundant = $true
+                        Body = 'Do not remove the redundant method coverage exclusion from this class.' },
+                    @{ Redundant = $true
+                        Body = 'Should we remove redundant method-level coverage exclusion from this class?' }
+                )) {
+                $c = New-FictionalCoverageCase -Redundant:([bool]$case.Redundant)
+                $thread = New-FictionalHumanThread $c -Redundant:([bool]$case.Redundant)
+                $thread.comments[0].body = $case.Body
+                $c.Snapshot.threads = @($thread)
+                { Get-CoverageV2OfflineDecision @c } |
+                    Should -Throw '*coverage-v2-human-ambiguous*'
+            }
+        }
+
+        It 'requires current context and unambiguous matched HUMAN identity' {
+            foreach ($field in @('contextState', 'reviewerIdentityState')) {
+                foreach ($state in @('outdated', 'ambiguous', $null)) {
+                    $c = New-FictionalCoverageCase
+                    $thread = New-FictionalHumanThread $c
+                    if ($field -ceq 'contextState') {
+                        $thread.contextState = $state
+                    } else {
+                        $thread.comments[0].reviewerIdentityState = $state
+                    }
+                    $c.Snapshot.threads = @($thread)
+                    { Get-CoverageV2OfflineDecision @c } |
+                        Should -Throw '*coverage-v2-human-ambiguous*'
+                }
+            }
         }
 
         It 'refuses alias, partial identity, legacy marker, duplicate and stale discussion' {

@@ -383,14 +383,13 @@ function Get-CoverageV2OfflineDecision {
         }
         $comment = $thread.comments[0]
         Assert-CoverageV2Identity $comment.author $Human
-        if ($comment.isDeleted -cne $false -or
+        if ([string]$thread.contextState -cne 'current' -or
+            [string]$comment.reviewerIdentityState -cne 'matched' -or
+            $comment.isDeleted -cne $false -or
             [string]$comment.commentType -cne 'text' -or
-            [string]$comment.body -cnotmatch
-                $(if ($Intent.ruleId -ceq 'bpm-test-class-coverage@2') {
-                    '(?i)\bexclude\s+from\s+code\s+coverage\b'
-                } else {
-                    '(?i)\b(?:method|attribute)\b.*\b(?:coverage|exclusion)\b'
-                })) {
+            -not (Test-OwnerCoverageHumanAffirmation `
+                    -CapabilityId ([string]$Intent.ruleId) `
+                    -Body ([string]$comment.body))) {
             throw 'coverage-v2-human-ambiguous'
         }
         return 'humanCovered'

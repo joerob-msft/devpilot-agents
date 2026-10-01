@@ -48,19 +48,64 @@ function Assert-CoverageV2LedgerFixtureRoot {
         -not (Test-Path -LiteralPath $Root -PathType Container)) {
         throw 'coverage-v2-ledger-fixture-root-invalid'
     }
-    $item = Get-Item -LiteralPath $Root -Force
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'coverage-v2-ledger-fixture-root-invalid'
-    }
+    Assert-CoverageV2LedgerFixtureDirectory $Root $Root
 }
 
 function Assert-CoverageV2LedgerFixtureDirectory {
     param([string]$Root, [string]$Path)
     if (-not (Test-AgentPathWithin -Path $Path -Root $Root) -or
-        -not (Test-Path -LiteralPath $Path -PathType Container) -or
-        ((Get-Item -LiteralPath $Path -Force).Attributes -band
-            [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        -not (Test-Path -LiteralPath $Path -PathType Container)) {
         throw 'coverage-v2-ledger-fixture-directory-invalid'
+    }
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($current) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $null -ne $item.LinkType) {
+            throw 'coverage-v2-ledger-fixture-directory-invalid'
+        }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) { break }
+        $current = $parent
+    }
+    if ($IsWindows) {
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $system = [Security.Principal.SecurityIdentifier]::new(
+            [Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+        $administrators = [Security.Principal.SecurityIdentifier]::new(
+            [Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $owner = ([Security.Principal.NTAccount]$acl.Owner).Translate(
+            [Security.Principal.SecurityIdentifier])
+        if ($owner -ne $sid -and $owner -ne $administrators) {
+            throw 'coverage-v2-ledger-fixture-directory-invalid'
+        }
+        foreach ($rule in $acl.GetAccessRules($true, $true,
+                [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -eq
+                    [Security.AccessControl.AccessControlType]::Allow -and
+                $rule.IdentityReference -notin @($sid, $system, $administrators)) {
+                throw 'coverage-v2-ledger-fixture-directory-invalid'
+            }
+        }
+    } else {
+        $identity = if ($IsMacOS) {
+            (& /usr/bin/stat -f '%u' $Path).Trim()
+        } else {
+            (& /usr/bin/stat -c '%u' -- $Path).Trim()
+        }
+        $owner = (& /usr/bin/id -u).Trim()
+        $mode = [IO.File]::GetUnixFileMode($Path)
+        $private = [IO.UnixFileMode]::GroupRead -bor
+            [IO.UnixFileMode]::GroupWrite -bor
+            [IO.UnixFileMode]::GroupExecute -bor
+            [IO.UnixFileMode]::OtherRead -bor
+            [IO.UnixFileMode]::OtherWrite -bor
+            [IO.UnixFileMode]::OtherExecute
+        if ($identity -notmatch '^\d+$' -or $owner -notmatch '^\d+$' -or
+            $identity -cne $owner -or ($mode -band $private) -ne 0) {
+            throw 'coverage-v2-ledger-fixture-directory-invalid'
+        }
     }
 }
 
@@ -249,6 +294,12 @@ function Invoke-CoverageV2LedgerFixture {
         $path = Join-Path $Root $subdirectory
         if (-not (Test-Path -LiteralPath $path -PathType Container)) {
             [void](New-Item -ItemType Directory -Path $path -ErrorAction Stop)
+            if (-not $IsWindows) {
+                [IO.File]::SetUnixFileMode($path,
+                    [IO.UnixFileMode]::UserRead -bor
+                    [IO.UnixFileMode]::UserWrite -bor
+                    [IO.UnixFileMode]::UserExecute)
+            }
         }
         Assert-CoverageV2LedgerFixtureDirectory $Root $path
     }
@@ -260,6 +311,12 @@ function Invoke-CoverageV2LedgerFixture {
                 [IO.FileShare]::None)
         }
         catch [IO.IOException] { throw 'coverage-v2-ledger-busy-or-stale-lock' }
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($bucket.lockPath,
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        [void](Assert-AgentTrustedFile -Path $bucket.lockPath `
+                -AllowedRoot $Root -Private)
         $lock.WriteByte(1)
         $lock.Flush($true)
         $scanned = Read-CoverageV2LedgerHistory $Root `
@@ -341,6 +398,12 @@ function Invoke-CoverageV2LedgerFixture {
         if (-not (Test-Path -LiteralPath $bucket.path -PathType Container)) {
             [void](New-Item -ItemType Directory -Path $bucket.path `
                     -ErrorAction Stop)
+            if (-not $IsWindows) {
+                [IO.File]::SetUnixFileMode($bucket.path,
+                    [IO.UnixFileMode]::UserRead -bor
+                    [IO.UnixFileMode]::UserWrite -bor
+                    [IO.UnixFileMode]::UserExecute)
+            }
         }
         Assert-CoverageV2LedgerFixtureDirectory $Root $bucket.path
         $path = Join-Path $bucket.path (
@@ -349,7 +412,17 @@ function Invoke-CoverageV2LedgerFixture {
             (ConvertTo-AgentCanonicalJson -InputObject $record) + "`n")
         $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew,
             [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $stream.Write($bytes); $stream.Flush($true) }
+        try {
+            if (-not $IsWindows) {
+                [IO.File]::SetUnixFileMode($path,
+                    [IO.UnixFileMode]::UserRead -bor
+                    [IO.UnixFileMode]::UserWrite)
+            }
+            [void](Assert-AgentTrustedFile -Path $path `
+                    -AllowedRoot $bucket.path -Private)
+            $stream.Write($bytes)
+            $stream.Flush($true)
+        }
         finally { $stream.Dispose() }
         [void](Assert-AgentTrustedFile -Path $path `
                 -AllowedRoot $bucket.path -Private)

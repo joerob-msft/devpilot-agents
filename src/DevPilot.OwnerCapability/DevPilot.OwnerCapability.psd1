@@ -21,6 +21,7 @@
         'New-TestClassCoverageCapabilityAdapter',
         'New-OwnerV2CapabilityAdapter',
         'New-OwnerV2CapabilityLimits',
+        'Test-OwnerCoverageHumanAffirmation',
         'Resolve-OwnerV2DiscussionReconciliation'
     )
     CmdletsToExport = @()

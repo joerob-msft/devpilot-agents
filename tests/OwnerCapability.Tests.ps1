@@ -1166,7 +1166,8 @@ Describe 'Owner capability module surface' {
             'New-OwnerV2CapabilityAdapter',
             'New-OwnerV2CapabilityLimits',
             'New-TestClassCoverageCapabilityAdapter',
-            'Resolve-OwnerV2DiscussionReconciliation'
+            'Resolve-OwnerV2DiscussionReconciliation',
+            'Test-OwnerCoverageHumanAffirmation'
         )
     }
 }
