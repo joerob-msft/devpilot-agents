@@ -874,7 +874,8 @@ function Get-IntakeSourceTree {
                 $kind = [string]$item.gitObjectType
                 if (($kind -ceq 'tree' -and $mode -cne '40000') -or
                     ($kind -ceq 'blob' -and $mode -cnotin @('100644', '100755')) -or
-                    $kind -cnotin @('blob', 'tree')) {
+                    ($kind -ceq 'commit' -and $mode -cne '160000') -or
+                    $kind -cnotin @('blob', 'tree', 'commit')) {
                     throw 'project-identity-unknown'
                 }
                 $path = "$($directory.path)/$($item.relativePath)"
@@ -886,7 +887,9 @@ function Get-IntakeSourceTree {
                 $raw.Write($prefix, 0, $prefix.Length)
                 $hash = [Convert]::FromHexString($oid)
                 $raw.Write($hash, 0, $hash.Length)
-                $entries.Add(@{ path = $path; objectId = $oid; gitObjectType = $kind })
+                $entry = @{ path = $path; objectId = $oid; gitObjectType = $kind }
+                if ($kind -ceq 'commit') { $entry.mode = $mode }
+                $entries.Add($entry)
                 if ($kind -ceq 'tree') {
                     $queue.Enqueue(@{ path = $path; objectId = $oid })
                 }

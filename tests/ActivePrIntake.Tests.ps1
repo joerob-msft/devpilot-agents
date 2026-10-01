@@ -1517,6 +1517,54 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","uniqueNa
                 -ErrorAction SilentlyContinue
         }
     }
+    It 'verifies the complete Git tree with an opaque unrelated Gitlink' {
+        $t = New-IntakeTransportCase
+        $graph = Set-ProjectTreeCase $t
+        $root = New-TestTree @(
+            @{ relativePath = 'Tests'; mode = '40000'
+                gitObjectType = 'tree'; objectId = $graph.tests.objectId }
+            @{ relativePath = 'Vendor'; mode = '160000'
+                gitObjectType = 'commit'; objectId = 'e' * 40 }
+        )
+        $t.fixture.rootTreeId = $root.objectId
+        $t.fixture.trees[$root.objectId] = $root
+        $result = Invoke-TransportCase $t
+        $result.heads[0].projectEvidence.complete | Should -BeTrue
+        $result.heads[0].projectEvidence.files[0].status | Should -BeExactly 'complete'
+        $log = Get-Content -LiteralPath $t.log
+        @($log | Where-Object { $_ -match '\|Tree\|' }).Count | Should -Be 2
+    }
+
+    It 'keeps relevant Gitlinks and mismatched mode/type unknown after tree hashing' {
+        foreach ($case in @(
+                @{ kind = 'commit'; mode = '160000' },
+                @{ kind = 'tag'; mode = '160000' },
+                @{ kind = 'commit'; mode = '100644' }
+            )) {
+            $t = New-IntakeTransportCase
+            $graph = Set-ProjectTreeCase $t
+            $tests = New-TestTree @(
+                @{ relativePath = 'Fixture.cs'; mode = '100644'
+                    gitObjectType = 'blob'; objectId = $graph.file.objectId }
+                @{ relativePath = 'Tests.csproj'; mode = '100644'
+                    gitObjectType = 'blob'; objectId = $graph.project.objectId }
+                @{ relativePath = 'External'; mode = $case.mode
+                    gitObjectType = $case.kind; objectId = 'e' * 40 }
+            )
+            $root = New-TestTree @(
+                @{ relativePath = 'Tests'; mode = '40000'
+                    gitObjectType = 'tree'; objectId = $tests.objectId }
+            )
+            $t.fixture.rootTreeId = $root.objectId
+            $t.fixture.trees[$root.objectId] = $root
+            $t.fixture.trees[$tests.objectId] = $tests
+            $result = Invoke-TransportCase $t
+            $result.heads[0].projectEvidence.complete | Should -BeFalse
+            $result.heads[0].projectEvidence.files[0].status |
+                Should -BeExactly 'unknown'
+        }
+    }
+
     It 'fails project scope closed on missing owner, tree truncation, caps and head drift' {
         $t = New-IntakeTransportCase
         $graph = Set-ProjectTreeCase $t

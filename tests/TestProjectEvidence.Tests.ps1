@@ -113,6 +113,59 @@ Describe 'Source-bound C# Compile project evidence' {
         @($owners | Where-Object { -not $_.isTestProject }).Count | Should -Be 1
     }
 
+    It 'attests explicit Compile ownership with an unrelated opaque Gitlink' {
+        $graph = New-Graph '/Tests/Fixture.cs'
+        Add-ChangedFile $graph
+        Add-GraphBlob $graph '/Tests/Tests.csproj' @'
+<Project><PropertyGroup><IsTestProject>true</IsTestProject></PropertyGroup>
+<ItemGroup><Compile Include="Fixture.cs"/></ItemGroup></Project>
+'@
+        $graph.entries.Add(@{ path = '/Vendor/External'
+            objectId = 'e' * 40; gitObjectType = 'commit'; mode = '160000' })
+        (Invoke-Graph $graph).projects[0].isTestProject | Should -BeTrue
+    }
+
+    It 'rejects opaque Gitlinks that can change compile membership' {
+        $graph = New-Graph '/Tests/Fixture.cs'
+        Add-ChangedFile $graph
+        Add-GraphBlob $graph '/Tests/Tests.csproj' @'
+<Project Sdk="Microsoft.NET.Sdk">
+<PropertyGroup><IsTestProject>true</IsTestProject></PropertyGroup>
+</Project>
+'@
+        $graph.entries.Add(@{ path = '/Tests/External'
+            objectId = 'e' * 40; gitObjectType = 'commit'; mode = '160000' })
+        { Invoke-Graph $graph } | Should -Throw -ExpectedMessage 'project-identity-unknown'
+
+        $graph = New-Graph '/Shared/Fixture.cs'
+        Add-ChangedFile $graph
+        Add-GraphBlob $graph '/Tests/Tests.csproj' @'
+<Project><PropertyGroup><IsTestProject>true</IsTestProject></PropertyGroup>
+<ItemGroup><Compile Include="../Shared/**/*.cs"/></ItemGroup></Project>
+'@
+        $graph.entries.Add(@{ path = '/Shared/External'
+            objectId = 'e' * 40; gitObjectType = 'commit'; mode = '160000' })
+        { Invoke-Graph $graph } | Should -Throw -ExpectedMessage 'project-identity-unknown'
+    }
+
+    It 'rejects unbound or disguised Gitlink entries' {
+        foreach ($entry in @(
+                @{ path = '/Vendor/External'; objectId = 'e' * 40
+                    gitObjectType = 'commit'; mode = '100644' },
+                @{ path = '/Vendor/External.csproj'; objectId = 'e' * 40
+                    gitObjectType = 'commit'; mode = '160000' }
+            )) {
+            $graph = New-Graph '/Tests/Fixture.cs'
+            Add-ChangedFile $graph
+            Add-GraphBlob $graph '/Tests/Tests.csproj' @'
+<Project><PropertyGroup><IsTestProject>true</IsTestProject></PropertyGroup>
+<ItemGroup><Compile Include="Fixture.cs"/></ItemGroup></Project>
+'@
+            $graph.entries.Add($entry)
+            { Invoke-Graph $graph } | Should -Throw -ExpectedMessage 'project-identity-unknown'
+        }
+    }
+
     It 'refuses to assert the SDK default glob under excluded or hidden directories' {
         foreach ($path in @('/Tests/obj/Fixture.cs', '/Tests/bin/Fixture.cs',
                 '/Tests/.hidden/Fixture.cs')) {

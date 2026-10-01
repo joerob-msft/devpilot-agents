@@ -136,6 +136,15 @@ function Get-ItemPatternMatches {
             $entry.path -ceq $resolved)
         return ,@($entry.path)
     }
+    $wildcard = $resolved.IndexOfAny([char[]]@('*', '?'))
+    $fixedDirectory = $resolved.Substring(0,
+        $resolved.LastIndexOf('/', $wildcard) + 1)
+    foreach ($link in $State.Gitlinks) {
+        Assert-Evidence (-not $link.StartsWith($fixedDirectory,
+                [StringComparison]::OrdinalIgnoreCase) -and
+            -not $fixedDirectory.StartsWith("$link/",
+                [StringComparison]::OrdinalIgnoreCase))
+    }
     $segments = $resolved.Substring(1).Split('/')
     Assert-Evidence ($segments.Count -le 64)
     $regexParts = [System.Collections.Generic.List[string]]::new()
@@ -337,6 +346,7 @@ function Get-TestProjectGraphEvidence {
         $projects = [System.Collections.Generic.List[string]]::new()
         $sourceFiles = [System.Collections.Generic.List[string]]::new()
         $auxiliaryFiles = [System.Collections.Generic.List[string]]::new()
+        $gitlinks = [System.Collections.Generic.List[string]]::new()
         $pathCharacters = 0
         foreach ($entry in $Entries) {
             $entryPath = Get-Field $entry 'path'
@@ -344,8 +354,13 @@ function Get-TestProjectGraphEvidence {
             $type = Get-Field $entry 'gitObjectType'
             Assert-Evidence ($entryPath -is [string] -and $entryObjectId -is [string] -and
                 $entryObjectId -match '^[0-9a-fA-F]{40}$' -and
-                $type -cin @('blob', 'tree'))
+                $type -cin @('blob', 'tree', 'commit'))
             Assert-InventoryPath $entryPath ($type -ceq 'tree')
+            if ($type -ceq 'commit') {
+                Assert-Evidence ($entry.mode -ceq '160000' -and
+                    $entryPath -notmatch '(?i)\.(?:cs|csproj|props|targets|projitems)$')
+                $gitlinks.Add($entryPath)
+            }
             $pathCharacters += $entryPath.Length
             Assert-Evidence ($pathCharacters -le 4194304)
             Assert-Evidence (-not $inventory.ContainsKey($entryPath))
@@ -367,6 +382,7 @@ function Get-TestProjectGraphEvidence {
             $inventory[$Path].objectId -ieq $ObjectId -and
             $inventory[$Path].path -ceq $Path)
         $state = @{ Inventory = $inventory; SourceFiles = $sourceFiles.ToArray()
+            Gitlinks = $gitlinks.ToArray()
             ReadItem = $ReadItem; Text = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
             ReadCharacters = 0; PatternCount = 0; Comparisons = 0 }
         $owners = [System.Collections.Generic.List[object]]::new()
@@ -397,6 +413,10 @@ function Get-TestProjectGraphEvidence {
                 $hasSdkProject = $true
                 Assert-Evidence ($properties.ContainsKey('IsTestProject'))
                 $prefix = $directory.TrimEnd('/') + '/'
+                foreach ($link in $gitlinks) {
+                    Assert-Evidence (-not $link.StartsWith($prefix,
+                            [StringComparison]::OrdinalIgnoreCase))
+                }
                 if ($Path.StartsWith($prefix, [StringComparison]::Ordinal)) {
                     $relative = $Path.Substring($prefix.Length)
                     Assert-Evidence ($relative -notmatch '(?i)(^|/)(?:bin|obj|\.[^/]+)(/|$)')
