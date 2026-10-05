@@ -70,12 +70,12 @@ launch switch. Set positive daily/study admission limits deliberately.
 Changing modes/model/config/source/dependencies/runtime requires a **new study
 root**; it never reuses results from a different pipeline.
 
-For a stronger-model trial, use explicit `gpt-6-astra` and
-`deadlineSeconds:300`; it was enabled in the account's SDK catalog on
-2026-09-25. `claude-opus-5.5` was also enabled as an alternative for a separate
-study. Availability is rechecked, not guaranteed permanently, and neither
-catalog access nor the successful two-send `gpt-6-astra` public synthetic smoke
-proves sign-off accuracy.
+Model availability is account-specific and changes over time. Run the
+zero-generation authenticated catalog probe immediately before creating a
+study, then select an explicit currently enabled model with
+`deadlineSeconds:300`. On 2026-10-05, `gpt-6-sol` was enabled while
+`gpt-6-astra` was no longer offered. Catalog access and historical synthetic
+smokes do not prove sign-off accuracy.
 The two assessments, evidence requirements, and soft credit ceiling do not
 change with model selection.
 
@@ -153,12 +153,17 @@ example via its configured cancel file). Do not run a competing daemon.
 Preserve the old study directory and reports; do not change its frozen config.
 
 Create a **new** private study ID/root and event directory using the consumer's
-initializer. Select `gpt-6-astra`, the already provisioned runtime, a
-300-second deadline, and deliberate positive admission limits. For example,
+initializer. Select a currently catalog-enabled explicit model, the already
+provisioned runtime, a 300-second deadline, and deliberate positive admission limits. For example,
 100/day and 500/study are the current maximum limits, not unlimited access.
 Keep the consumer's normal full-inventory selection, not a selected-PR smoke
 list. Inspect the generated config, then use the validation command above.
 Validation is local only; it does not authenticate or authorize inference.
+For a separate selected-PR smoke, require final collection `complete`, no
+admission blockers, at least one admission and completed decision, and a
+populated `modelOnlyDiagnostic`. A historical `CAPTURE_FAILED` gap may remain
+after a later refresh succeeds; inspect the private receipt, but the recovered
+gap alone does not invalidate those final success conditions.
 
 Run the new config using the observer-only attended command with
 `-ObserverEnableModel`, or the foreground supervised worker with
@@ -247,6 +252,9 @@ Successful pages reset the consecutive failure count. Three consecutive
 collector failures/interrupted attempts, a repeated continuation token, three
 consecutive repetitions of page membership, or 10,000 nonterminal inventory
 pages block the sweep explicitly. These are guards, **never completion**.
+Frozen-guidance drift is a deterministic study-integrity failure and blocks
+immediately without consuming the transient collector retry budget. Preserve
+that study and initialize a new one; never continue with mixed guidance bytes.
 Before a persistent block, an unchanged-pipeline restart may retry the same
 cursor using a new attempt directory. After a persistent block, restarting
 does not issue further collector/model calls: inspect private receipts and

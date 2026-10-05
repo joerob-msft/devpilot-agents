@@ -141,7 +141,7 @@ C:\pilot\venv\Scripts\python.exe -m copilot download-runtime
   -PythonPath C:\pilot\venv\Scripts\python.exe `
   -RuntimePath C:\pilot\runtime-1.0.85\prebuilds\win32-x64\copilot-runtime.exe `
   -InputPath C:\pilot\cases -OutputRoot C:\pilot\live-result `
-  -Model gpt-6-astra -MaxCases 1 -MaxAttempts 1 -DeadlineSeconds 300 -MaxAiCredits 30
+  -Model gpt-6-sol -MaxCases 1 -MaxAttempts 1 -DeadlineSeconds 300 -MaxAiCredits 30
 ```
 
 The released `github-copilot-sdk==1.0.14` wheel pins runtime **1.0.85**; the SDK's
@@ -205,11 +205,11 @@ abstention without a model likewise does not need credentials.
 
 ### Model choice
 
-For the next deep-review trial, explicitly select **`gpt-6-astra`** rather
-than the earlier lightweight `gpt-5.4-mini` smoke model. The account-specific
-SDK catalog on 2026-09-25 reported it enabled; `claude-opus-5.5`,
-`gpt-6-sol`, and `gpt-5.6-sol` were also enabled alternatives. This is a
-trial recommendation, not evidence of superior sign-off accuracy. GitHub's
+For the next deep-review trial, run the zero-generation authenticated catalog
+probe immediately before initialization and choose an explicit enabled model.
+On 2026-10-05, `gpt-6-sol` was enabled while the previously recommended
+`gpt-6-astra` was no longer offered. This is a trial selection, not evidence
+of superior sign-off accuracy. GitHub's
 [model comparison](https://docs.github.com/en/copilot/reference/ai-models/model-comparison)
 describes task fit; evaluate real held-out outcomes before making quality
 claims.

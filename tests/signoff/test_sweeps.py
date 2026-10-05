@@ -137,6 +137,41 @@ class SweepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.count("sweep_attempts"), 4)
         self.assertEqual(self.count("admissions"), 0)
 
+    async def test_guidance_drift_blocks_immediately_without_retry(self):
+        self.size = 1
+
+        async def eligible(config, request, folder, *args):
+            page = await self.collector(config, request, folder, *args)
+            for inventory in page["inventory"]:
+                inventory["isDraft"] = False
+                if not page["snapshots"]:
+                    _, template = capture(self.minutes)
+                    snapshot = copy.deepcopy(template["snapshots"][0])
+                    snapshot["bundle"]["familyId"] = inventory["familyId"]
+                    snapshot["bundle"]["provenance"]["pullRequestId"] = inventory["pullRequestId"]
+                    page["snapshots"].append(snapshot)
+            return page
+
+        first = await self.chunk(eligible)
+        self.assertEqual(first["phase"], "complete")
+        self.assertEqual(self.count("admissions"), 1)
+        self.restart()
+        self.minutes = 2
+
+        async def drifting(config, request, folder, *args):
+            page = await eligible(config, request, folder, *args)
+            if page["snapshots"]:
+                page["snapshots"][0]["bundle"]["guidance"][0]["revision"] = "changed"
+            return page
+
+        state = await self.chunk(drifting)
+        self.assertEqual((state["phase"], state["reason"], state["failures"]),
+                         ("blocked", "GUIDANCE_CHANGED_NEW_STUDY_REQUIRED", 0))
+        self.assertEqual(self.count("admissions"), 1)
+        value = report(self.ledger, time_at(3))
+        self.assertIn("GUIDANCE_CHANGED_NEW_STUDY_REQUIRED", value["admissionBlockers"])
+        self.assertIn("GUIDANCE_CHANGED_NEW_STUDY_REQUIRED", [item["code"] for item in value["gaps"]])
+
     async def test_accepted_page_survives_precommit_crash_without_recollection(self):
         self.config["maxPages"] = 1
 

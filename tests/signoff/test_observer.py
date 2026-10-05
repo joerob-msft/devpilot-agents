@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from test_replay import FakeProvider, answer, bundle
 from contracts import ContractError, canonical, digest, make_prompt
-from observer import (COLLECTOR_TIMEOUT_SECONDS, Ledger, assess_pending, collect_page,
+from observer import (COLLECTOR_TIMEOUT_SECONDS, Ledger, StudyIntegrityError, assess_pending, collect_page,
                       import_adjudication, persist_report, report, snapshot_key)
 from observer_contracts import file_hash, validate_config, validate_page
 from replay import Cancelled, CapabilityError, exclusive_output
@@ -209,6 +209,25 @@ class ObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"historicalBenchmarkEligible":false', result)
         self.assertIn('"authorization":"NONE"', result)
 
+    async def test_exploratory_policy_validation_gaps_produce_model_only_diagnostic(self):
+        value = bundle()
+        for item in value["completeness"]:
+            if item["category"] in ("POLICY", "VALIDATION"):
+                item["status"] = "PARTIAL"
+        request, page = capture(0, value)
+        page["snapshots"][0]["observation"]["eligibilityReasons"] = ["POLICY_PARTIAL", "VALIDATION_PARTIAL"]
+        self.ledger.ingest(page, request, FROZEN)
+        self.config["evaluation"]["exploratory"] = True
+        await self.assess()
+        self.assertEqual(self.count("admissions"), 1)
+        self.assertEqual(len(self.provider.calls), 2)
+        decision = self.ledger.db.execute("SELECT status,result FROM decisions").fetchone()
+        self.assertEqual(decision["status"], "COMPLETED")
+        result = json.loads(decision["result"])
+        self.assertEqual(result["recommendation"], "NEEDS_HUMAN_REVIEW")
+        self.assertIsNotNone(result["modelOnlyDiagnostic"])
+        self.assertEqual(result["modelOnlyDiagnostic"]["recommendation"], "APPROVE")
+
     async def test_votes_and_capture_timestamps_do_not_trigger_assessments(self):
         self.ingest()
         await self.assess()
@@ -246,10 +265,10 @@ class ObserverTests(unittest.IsolatedAsyncioTestCase):
         await self.assess()
         changed = bundle()
         changed["guidance"][0]["revision"] = "changed"
-        self.ingest(2, changed)
-        await self.assess(3)
+        with self.assertRaisesRegex(StudyIntegrityError, "GUIDANCE_CHANGED_NEW_STUDY_REQUIRED"):
+            self.ingest(2, changed)
         self.assertEqual(self.count("admissions"), 1)
-        self.assertIn("GUIDANCE_CHANGED_NEW_STUDY_REQUIRED", [g["code"] for g in report(self.ledger, time_at(4))["gaps"]])
+        self.assertEqual(self.count("snapshots"), 1)
 
     async def test_deterministic_fail_and_missing_policy(self):
         changed = bundle()

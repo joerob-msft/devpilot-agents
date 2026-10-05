@@ -26,6 +26,10 @@ MAX_NO_PROGRESS_PAGES = 3
 REFRESH_MAX_AGE_SECONDS = 300
 
 
+class StudyIntegrityError(ContractError):
+    """A deterministic frozen-study violation that must not be retried."""
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -222,15 +226,11 @@ class Ledger:
                     continue
                 observation = snapshot["observation"]
                 if previous_snapshot and json.loads(previous_snapshot["payload"])["guidance"] != snapshot["bundle"]["guidance"]:
-                    self.gap("GUIDANCE_CHANGED_NEW_STUDY_REQUIRED", family, "The family's guidance set is frozen at first capture.", now)
-                    observation = {**observation, "eligibilityReasons":
-                                   list(dict.fromkeys(observation["eligibilityReasons"] + ["GUIDANCE_CHANGED"]))}
+                    raise StudyIntegrityError("GUIDANCE_CHANGED_NEW_STUDY_REQUIRED")
                 for guide in snapshot["bundle"]["guidance"]:
                     pinned = self.db.execute("SELECT payload FROM guidance WHERE id=?", (guide["id"],)).fetchone()
                     if pinned and pinned["payload"] != canonical(guide):
-                        self.gap("GUIDANCE_CHANGED_NEW_STUDY_REQUIRED", family, "Approved guidance is pinned by ID for this study.", now)
-                        observation = {**observation, "eligibilityReasons":
-                                       list(dict.fromkeys(observation["eligibilityReasons"] + ["GUIDANCE_CHANGED"]))}
+                        raise StudyIntegrityError("GUIDANCE_CHANGED_NEW_STUDY_REQUIRED")
                     elif not pinned:
                         self.db.execute("INSERT INTO guidance VALUES(?,?)", (guide["id"], canonical(guide)))
                 if inventory["isDraft"] and "DRAFT" not in observation["eligibilityReasons"]:
@@ -307,6 +307,12 @@ async def assess_pending(ledger: Ledger, config: dict[str, Any], pipeline: str,
         bundle, observation = json.loads(row["payload"]), json.loads(row["observation"])
         if refreshed is not None and row["key"] == refreshed["key"]:
             bundle, observation = refreshed["bundle"], refreshed["observation"]
+        completeness = {item["category"]: item["status"] for item in bundle["completeness"]}
+        complete_code_intent = all(completeness.get(category) == "COMPLETE" for category in ("CODE", "INTENT"))
+        approved_guidance = all(guide["approved"] for guide in bundle["guidance"])
+        exploratory_reasons = {"POLICY_PARTIAL", "POLICY_MISSING", "VALIDATION_PARTIAL", "VALIDATION_MISSING"}
+        exploratory_observation = (evaluation["exploratory"] and complete_code_intent and approved_guidance
+                                   and set(observation["eligibilityReasons"]).issubset(exploratory_reasons))
         current = ledger.db.execute("SELECT key FROM snapshots WHERE family=? ORDER BY captured DESC,rowid DESC LIMIT 1",
                                     (row["family"],)).fetchone()
         latest_observation = ledger.db.execute("SELECT * FROM observations WHERE family=? ORDER BY captured DESC,id DESC LIMIT 1",
@@ -320,7 +326,8 @@ async def assess_pending(ledger: Ledger, config: dict[str, Any], pipeline: str,
         elif current and current["key"] != row["key"]:
             # Old captures never regain admission when a later head/evidence version is observed.
             status = "SUPERSEDED_BEFORE_ASSESSMENT"
-        elif not observation["stable"] or observation["state"] != "ACTIVE" or observation["eligibilityReasons"]:
+        elif (not observation["stable"] or observation["state"] != "ACTIVE"
+              or (observation["eligibilityReasons"] and not exploratory_observation)):
             status = "OBSERVATION_INELIGIBLE"
         elif evaluation["mode"] == "collection-only":
             status = "COLLECTION_ONLY"
@@ -336,9 +343,7 @@ async def assess_pending(ledger: Ledger, config: dict[str, Any], pipeline: str,
             continue
         # Deterministic policy failures still produce a result without consuming model admissions.
         checks = prechecks(bundle, prospective=True)
-        complete_code_intent = all(c["status"] == "COMPLETE" for c in bundle["completeness"] if c["category"] in ("CODE", "INTENT"))
-        will_infer = not checks or (evaluation["exploratory"] and complete_code_intent
-                                   and all(g["approved"] for g in bundle["guidance"])
+        will_infer = not checks or (exploratory_observation
                                    and not any(b["code"] == "DETERMINISTIC_CODE_FAILURE" for b in checks))
         admission = ledger.admit(row["key"], config, started) if will_infer else uuid.uuid4().hex
         if admission is None:
@@ -657,6 +662,13 @@ async def capture_chunk(ledger: Ledger, config: dict[str, Any], pipeline: str, p
             if page is None:
                 page = await collect_page(config, request, folder, toolkit, pwsh, cancel_file)
             ledger.ingest(page, request, pipeline, state if target is None else None)
+        except StudyIntegrityError as error:
+            state = {**state, "reason": str(error), "phase": "blocked"}
+            with ledger.db:
+                ledger.gap(str(error), None,
+                           "Frozen guidance changed; preserve this study and initialize a new one.", now())
+                ledger.save_progress(state, now())
+            break
         except CapabilityError:
             failures = state["failures"] + 1
             with ledger.db:
