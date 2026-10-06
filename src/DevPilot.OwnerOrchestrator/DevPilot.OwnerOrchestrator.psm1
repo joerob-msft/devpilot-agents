@@ -10,6 +10,7 @@ Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContrac
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerModelRunner\DevPilot.OwnerModelRunner.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.RelationEvidence\DevPilot.RelationEvidence.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1"
 
 $script:OwnerV2ObservationSchemaPath = Join-Path $PSScriptRoot `
     '..\OwnerObserver\schemas\owner-observation.v1.json'
@@ -41,6 +42,13 @@ namespace DevPilot.OwnerOrchestrator
 
 $script:OwnerV2MaximumEntries = 32
 $script:RelationV2MaximumEntries = 10
+$script:NamedAreEqualCapabilityId = 'bpm-named-areequal-arguments@1'
+$script:NamedAreEqualCapabilityDigest =
+    'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a'
+$script:NamedAreEqualPolicyPath =
+    'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
+$script:NamedAreEqualPolicyDigest =
+    'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:OwnerV2DigestPattern = '^v1:sha256:[0-9a-f]{64}$'
 $script:OwnerV2CommitPattern = '^[0-9a-f]{40}$'
 $script:OwnerV2SafeIdPattern = '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
@@ -700,6 +708,40 @@ function ConvertTo-OwnerV2Declaration {
     if ([long]$Entry.rule.length -lt 1 -or [long]$Entry.rule.length -gt 134217728) {
         throw 'rule.length is outside the Owner v2 preview bounds.'
     }
+    $namedAreEqual =
+        [string]$Entry.capability.id -ceq $script:NamedAreEqualCapabilityId
+    if ($namedAreEqual) {
+        $policyPath = Join-Path $script:OwnerV2RepositoryRoot (
+            $script:NamedAreEqualPolicyPath.Replace(
+                '/', [IO.Path]::DirectorySeparatorChar))
+        $policyText = [IO.File]::ReadAllText(
+            $policyPath, [Text.UTF8Encoding]::new($false))
+        if ([string]$Entry.capability.digest -cne
+                $script:NamedAreEqualCapabilityDigest -or
+            [string]$Entry.rule.path -cne
+                $script:NamedAreEqualPolicyPath -or
+            [string]$Entry.rule.section -cne
+                $script:NamedAreEqualCapabilityId -or
+            [string]$Entry.rule.hash -cne
+                $script:NamedAreEqualPolicyDigest -or
+            [long]$Entry.rule.length -ne
+                [Text.Encoding]::UTF8.GetByteCount($policyText) -or
+            (Get-OwnerV2RawTextDigest -Value $policyText) -cne
+                $script:NamedAreEqualPolicyDigest -or
+            [string]$Entry.model.id -cne 'none' -or
+            [string]$Entry.model.digest -cne
+                (Get-OwnerV2RawTextDigest -Value 'none') -or
+            [string]$Entry.config.id -cne
+                'named-areequal-arguments-v1-user-approved' -or
+            [string]$Entry.config.digest -cne
+                (Get-OwnerV2RawTextDigest -Value 'named-areequal-arguments-v1-user-approved')) {
+            throw 'Named AreEqual manifest entry does not match the exact source-backed rule.'
+        }
+        if ($mode -ceq 'replay' -and
+            @($Entry.replay.modelRecords).Count -ne 0) {
+            throw 'Named AreEqual replay must not contain model records.'
+        }
+    }
 
     $contract = New-OwnerV2AcquisitionContract -Entry $Entry
     $replayRecords = @()
@@ -758,7 +800,9 @@ function ConvertTo-OwnerV2Declaration {
         capabilityKey = $contract.Binding.CapabilityKey
     }
     return [pscustomobject][ordered]@{
-        CapabilityKind = 'owner'
+        CapabilityKind = $(if ($namedAreEqual) {
+                'named-areequal'
+            } else { 'owner' })
         Identity = $identity
         StateDigest = $stateDigest
         Declaration = $declaration
@@ -1003,7 +1047,11 @@ function Read-OwnerV2Manifest {
     Assert-OwnerV2ExactKeys -Value $manifest -Name manifest -Expected @('schemaVersion', 'kind', 'entries')
     $kind = [string]$manifest.kind
     if ([int]$manifest.schemaVersion -ne 1 -or
-        $kind -cnotin @('owner-v2-preview-cohort', 'relation-v2-preview-cohort')) {
+        $kind -cnotin @(
+            'owner-v2-preview-cohort',
+            'relation-v2-preview-cohort',
+            'named-areequal-v2-preview-cohort'
+        )) {
         throw 'Preview manifest must use schemaVersion 1 and a supported bounded cohort kind.'
     }
     $entries = @($manifest.entries)
@@ -1021,7 +1069,14 @@ function Read-OwnerV2Manifest {
                 ConvertTo-RelationV2Declaration -Entry $_
             }
             else {
-                ConvertTo-OwnerV2Declaration -Entry $_
+                $entry = ConvertTo-OwnerV2Declaration -Entry $_
+                $expectedNamed =
+                    $kind -ceq 'named-areequal-v2-preview-cohort'
+                if ($expectedNamed -ne
+                    ([string]$entry.CapabilityKind -ceq 'named-areequal')) {
+                    throw 'Named AreEqual and Owner cohorts must have separate capability identities.'
+                }
+                $entry
             }
         } |
         Sort-Object -Property StateDigest)
@@ -1167,6 +1222,31 @@ function Invoke-OwnerV2Replay {
     $fixture = New-OwnerReplayFixture -Package $Entry.ManifestEntry.acquisition.package
     $acquisition = New-OwnerReplayAcquisitionAdapter -Contract $Entry.Contract `
         -Fixture $fixture -ExpectedPayloadDigest ([string]$Entry.Declaration.acquisitionPayloadDigest)
+    if ([string]$Entry.CapabilityKind -ceq 'named-areequal') {
+        $capability = New-NamedAreEqualCapabilityAdapter `
+            -CapabilityId ([string]$Entry.Declaration.capability.id) `
+            -CapabilityDigest ([string]$Entry.Declaration.capability.digest)
+        $result = Invoke-OwnerReviewPipeline -Binding $Entry.Contract.Binding `
+            -AcquisitionAdapter $acquisition -CapabilityAdapter $capability
+        if ($null -eq $result.evidence -or
+            $null -eq $result.validation -or
+            $null -eq $result.preview) {
+            $diagnostics = @($result.diagnostics | ForEach-Object {
+                    "$($_.code):$($_.message)"
+                }) -join '|'
+            throw "Named AreEqual facade did not complete: $diagnostics"
+        }
+        $observation = ConvertTo-OwnerV2Observation `
+            -PipelineResult $result `
+            -ImplementationId 'named-areequal-arguments-v1-orchestrator' `
+            -ImplementationVersion '1.0.0'
+        Assert-OwnerV2PipelineNoWrites `
+            -PipelineResult $result -Observation $observation
+        return [pscustomobject][ordered]@{
+            PipelineResult = $result
+            Observation = $observation
+        }
+    }
     $runnerFixture = New-OwnerModelReplayFixture -Records @($Entry.ReplayRecords)
     $runner = New-OwnerModelReplayRunner -Fixture $runnerFixture
     $capability = New-OwnerV2CapabilityAdapter -Runner $runner `
@@ -1255,6 +1335,14 @@ function Test-OwnerV2LiveRetryEligible {
     )
     if ([string]$Entry.Declaration.mode -cne 'live' -or -not $EnableLiveModel) {
         return $false
+    }
+    if ([string]$Entry.CapabilityKind -ceq 'named-areequal') {
+        return [int]$Record.schemaVersion -eq 2 -and
+            [string]$Record.modelExecutionState -ceq 'notAttempted' -and
+            [int]$Record.attempts -lt [int]$Record.maxAttempts -and
+            $null -ne $AcquisitionProvider -and
+            [string]$Record.incompleteReason -cnotin
+                $script:OwnerV2NonRecoverableRetryReasons
     }
     if ([int]$Record.schemaVersion -ne 2 -or
         [string]$Record.modelExecutionState -cne 'notAttempted' -or
@@ -1707,6 +1795,88 @@ function Invoke-RelationV2Live {
             else { $null })
         Acquisition = $snapshot
         Request = $request.Request
+    }
+}
+
+function Invoke-NamedAreEqualLive {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][bool]$Enabled,
+        [AllowNull()][object]$AcquisitionProvider
+    )
+
+    if (-not $Enabled) {
+        return New-OwnerV2LiveOutcome `
+            -Entry $Entry -Reason 'named-areequal-disabled'
+    }
+    if ($null -eq $AcquisitionProvider) {
+        return New-OwnerV2LiveOutcome `
+            -Entry $Entry -Reason 'acquisition-provider-unavailable'
+    }
+    $acquisition = New-OwnerProductionAcquisitionAdapter `
+        -Contract $Entry.Contract -Provider $AcquisitionProvider
+    $capability = New-NamedAreEqualCapabilityAdapter `
+        -CapabilityId ([string]$Entry.Declaration.capability.id) `
+        -CapabilityDigest ([string]$Entry.Declaration.capability.digest)
+    $result = Invoke-OwnerReviewPipeline -Binding $Entry.Contract.Binding `
+        -AcquisitionAdapter $acquisition -CapabilityAdapter $capability
+    if ($null -eq $result.evidence -or
+        $null -eq $result.validation -or
+        $null -eq $result.preview) {
+        $diagnostics = @($result.diagnostics | ForEach-Object {
+                "$($_.code):$($_.message)"
+            }) -join '|'
+        throw "Named AreEqual facade did not complete: $diagnostics"
+    }
+    $observation = ConvertTo-OwnerV2Observation `
+        -PipelineResult $result `
+        -ImplementationId 'named-areequal-arguments-v1-orchestrator' `
+        -ImplementationVersion '1.0.0'
+    if (@($observation.findings).Count -gt 0 -and
+        [string]$observation.lifecycle.status -ceq 'completed') {
+        $snapshot = $null
+        $failure = $null
+        try {
+            $snapshot = Get-OwnerDiscussionSnapshot `
+                -Contract $Entry.Contract -Provider $AcquisitionProvider `
+                -Limits (New-OwnerDiscussionLimits `
+                    -MaximumPages 20 -PageSize 100 `
+                    -MaximumThreads 1000 -MaximumComments 5000 `
+                    -MaximumBytes 4194304) `
+                -RequireAzureDevOpsProvenance
+        }
+        catch {
+            $failure = 'discussion-acquisition-failed'
+        }
+        try {
+            $observation = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $observation -Contract $Entry.Contract `
+                -Snapshot $snapshot -FailureReason $(if ($failure) {
+                    $failure
+                } else { 'discussion-acquisition-unavailable' })
+        }
+        catch {
+            $observation = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $observation -Contract $Entry.Contract `
+                -Snapshot $null `
+                -FailureReason 'discussion-reconciliation-failed'
+        }
+    }
+    $observationJson = $observation | ConvertTo-Json -Depth 64 -Compress
+    if (-not (Test-Json -Json $observationJson `
+            -SchemaFile $script:OwnerV2ObservationSchemaPath `
+            -ErrorAction Stop)) {
+        throw 'Named AreEqual observation failed the normalized observation schema.'
+    }
+    Assert-OwnerV2PipelineNoWrites `
+        -PipelineResult $result -Observation $observation
+    return [pscustomobject][ordered]@{
+        Observation = $observation
+        Telemetry = $null
+        State = $(if ([string]$observation.lifecycle.status -ceq 'completed') {
+                'completed'
+            } else { 'unknown' })
+        Reason = [string]$observation.execution.incompleteReason
     }
 }
 
@@ -2172,7 +2342,8 @@ function Invoke-OwnerV2PreviewRun {
                 Assert-OwnerV2RecordBinding -Record $record -Entry $entry
             }
             if ([string]$record.state -ceq 'completed' -and
-                [string]$entry.CapabilityKind -ceq 'owner' -and
+                [string]$entry.CapabilityKind -cin @(
+                    'owner', 'named-areequal') -and
                 [string]$entry.Declaration.mode -ceq 'live' -and
                 $null -ne $LiveAcquisitionProvider -and
                 (Test-Path -LiteralPath $observationPath -PathType Leaf)) {
@@ -2373,6 +2544,11 @@ function Invoke-OwnerV2PreviewRun {
                         -CredentialEnvironmentName $LiveCredentialEnvironmentName `
                         -MarkModelAttempted $markModelAttempted
                 }
+                elseif ([string]$entry.CapabilityKind -ceq 'named-areequal') {
+                    Invoke-NamedAreEqualLive -Entry $entry `
+                        -Enabled ([bool]$EnableLiveModel) `
+                        -AcquisitionProvider $LiveAcquisitionProvider
+                }
                 else {
                     Invoke-OwnerV2Live -Entry $entry `
                         -EnableLiveModel ([bool]$EnableLiveModel) `
@@ -2426,16 +2602,32 @@ function Invoke-OwnerV2PreviewRun {
                 $observation.lifecycle.incomplete = 'unknown'
                 $observation.lifecycle.pending = 'unknown'
                 $observation.execution.attempts = [int]$record.attempts
-                $observation.execution.modelStarts = 'unknown'
-                $observation.execution.latencyMs = 'unknown'
+                $observation.execution.modelStarts = $(if (
+                    [string]$entry.CapabilityKind -ceq 'named-areequal') {
+                        0
+                    } else { 'unknown' })
+                $observation.execution.latencyMs = $(if (
+                    [string]$entry.CapabilityKind -ceq 'named-areequal') {
+                        0
+                    } else { 'unknown' })
                 $observation.execution.refusalReason = $reason
                 $observation.execution.incompleteReason = $reason
                 $observation.measurements.execution.attempts =
                     New-OwnerMeasurement -Status measured -Value ([int]$record.attempts)
-                $observation.measurements.execution.modelStarts =
-                    New-OwnerMeasurement -Status unavailable -Reason $reason
-                $observation.measurements.execution.latencyMs =
-                    New-OwnerMeasurement -Status unavailable -Reason $reason
+                $observation.measurements.execution.modelStarts = $(if (
+                    [string]$entry.CapabilityKind -ceq 'named-areequal') {
+                        New-OwnerMeasurement -Status measured -Value 0
+                    }
+                    else {
+                        New-OwnerMeasurement -Status unavailable -Reason $reason
+                    })
+                $observation.measurements.execution.latencyMs = $(if (
+                    [string]$entry.CapabilityKind -ceq 'named-areequal') {
+                        New-OwnerMeasurement -Status measured -Value 0
+                    }
+                    else {
+                        New-OwnerMeasurement -Status unavailable -Reason $reason
+                    })
                 $observation.validationErrors = @([string]$_.Exception.Message)
             }
             $finalState = 'unknown'

@@ -167,6 +167,14 @@
               }
             ]
           },
+          "affectedCallCount": { "type": "integer", "minimum": 1, "maximum": 256 },
+          "affectedCallLines": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "items": { "type": "integer", "minimum": 1, "maximum": 200000 }
+          },
+          "callListTruncated": { "type": "boolean" },
           "reconciliation": { "$ref": "#/$defs/discussionReconciliation" },
           "binding": {
             "oneOf": [
@@ -190,7 +198,8 @@
           "ruleRef": { "$ref": "#/$defs/knownText" },
           "constructRef": { "$ref": "#/$defs/knownText" },
           "binding": { "oneOf": [{ "const": "unknown" }, { "$ref": "#/$defs/findingBinding" }] },
-          "writerEligible": { "const": false }
+          "writerEligible": { "const": false },
+          "affectedCallCount": { "type": "integer", "minimum": 0, "maximum": 256 }
         }
       }
     },
@@ -224,7 +233,8 @@
             "noOp": { "$ref": "#/$defs/countOrUnknown" },
             "wouldCreate": { "$ref": "#/$defs/countOrUnknown" },
             "wouldUpdate": { "$ref": "#/$defs/countOrUnknown" },
-            "unknown": { "$ref": "#/$defs/countOrUnknown" }
+            "unknown": { "$ref": "#/$defs/countOrUnknown" },
+            "humanCovered": { "$ref": "#/$defs/countOrUnknown" }
           }
         }
       }
@@ -284,7 +294,7 @@
       "additionalProperties": false,
       "required": ["classification", "reason", "bodySha256", "discussionSha256", "thread"],
       "properties": {
-        "classification": { "enum": ["wouldCreate", "wouldUpdate", "noOp", "unknown"] },
+        "classification": { "enum": ["wouldCreate", "wouldUpdate", "noOp", "humanCovered", "unknown"] },
         "reason": {
           "type": "string",
           "minLength": 1,

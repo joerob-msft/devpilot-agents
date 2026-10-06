@@ -3,6 +3,63 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-ApprovedOwnerV2ChangedSpans {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ChangeType,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SourceContent,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$TargetContent,
+        [string]$GitPath = 'git'
+    )
+
+    if ($ChangeType -match '(?i)^add') {
+        $count = [Math]::Max(
+            1, [regex]::Split($SourceContent, '\r?\n').Count)
+        return , @([ordered]@{ startLine = 1; endLine = $count })
+    }
+    if ($ChangeType -match '(?i)^delete') { return @() }
+    $tempRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        'owner-v2-diff-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tempRoot | Out-Null
+    $before = Join-Path $tempRoot 'before.txt'
+    $after = Join-Path $tempRoot 'after.txt'
+    try {
+        [IO.File]::WriteAllText(
+            $before, $TargetContent, [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText(
+            $after, $SourceContent, [Text.UTF8Encoding]::new($false))
+        $diff = @(& $GitPath --no-pager diff --no-index --unified=0 -- `
+                $before $after 2>$null)
+        if ($LASTEXITCODE -notin @(0, 1)) {
+            throw "Unable to derive changed-line spans for '$Path'."
+        }
+        $spans = [Collections.Generic.List[object]]::new()
+        foreach ($line in $diff) {
+            if ([string]$line -match
+                '^@@ -\d+(?:,\d+)? \+(?<start>\d+)(?:,(?<count>\d+))? @@') {
+                $start = [int]$Matches.start
+                $count = if ($Matches['count']) {
+                    [int]$Matches['count']
+                } else { 1 }
+                if ($count -gt 0) {
+                    [void]$spans.Add([ordered]@{
+                            startLine = $start
+                            endLine = $start + $count - 1
+                        })
+                }
+            }
+        }
+        return , $spans.ToArray()
+    }
+    finally {
+        Remove-Item -LiteralPath $before, $after `
+            -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tempRoot `
+            -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function New-ApprovedOwnerV2AzureDevOpsProvider {
     [CmdletBinding()]
     param(
@@ -152,6 +209,22 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
             '-o', 'json',
             '--only-show-errors'
         )
+        if ($response -isnot [Collections.IDictionary] -or
+            -not $response.Contains('content') -or
+            $response.content -isnot [string] -or
+            $response.contentMetadata -isnot [Collections.IDictionary] -or
+            -not $response.contentMetadata.Contains('contentType') -or
+            $response.contentMetadata.contentType -isnot [string] -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$response.contentMetadata.contentType) -or
+            (-not ([string]$response.contentMetadata.contentType).
+                StartsWith(
+                    'text/', [StringComparison]::OrdinalIgnoreCase) -and
+                [IO.Path]::GetExtension($Path) -ine '.cs') -or
+            [Text.Encoding]::UTF8.GetByteCount(
+                [string]$response.content) -gt 16777216) {
+            throw "Item content for '$Path' is unavailable or incomplete."
+        }
         return [string]$response.content
     }.GetNewClosure()
 
@@ -162,45 +235,25 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
             [Parameter(Mandatory)][string]$SourceCommit,
             [Parameter(Mandatory)][string]$TargetCommit
         )
-        $source = & $getItemContent $Path $SourceCommit
-        if ($ChangeType -match '(?i)^add') {
-            $count = [Math]::Max(1, [regex]::Split($source, '\r?\n').Count)
-            return , @([ordered]@{ startLine = 1; endLine = $count })
+        $deleted = $ChangeType -match '(?i)^delete'
+        $source = if ($deleted) {
+            ''
         }
-        if ($ChangeType -match '(?i)^delete') { return , @() }
-        $target = & $getItemContent $Path $TargetCommit
-        $tempRoot = Join-Path ([IO.Path]::GetTempPath()) (
-            'owner-v2-diff-' + [guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Path $tempRoot | Out-Null
-        $before = Join-Path $tempRoot 'before.txt'
-        $after = Join-Path $tempRoot 'after.txt'
-        try {
-            [IO.File]::WriteAllText($before, $target, [Text.UTF8Encoding]::new($false))
-            [IO.File]::WriteAllText($after, $source, [Text.UTF8Encoding]::new($false))
-            $diff = @(& $GitPath --no-pager diff --no-index --unified=0 -- $before $after 2>$null)
-            if ($LASTEXITCODE -notin @(0, 1)) {
-                throw "Unable to derive changed-line spans for '$Path'."
-            }
-            $spans = [Collections.Generic.List[object]]::new()
-            foreach ($line in $diff) {
-                if ([string]$line -match
-                    '^@@ -\d+(?:,\d+)? \+(?<start>\d+)(?:,(?<count>\d+))? @@') {
-                    $start = [int]$Matches.start
-                    $count = if ($Matches.count) { [int]$Matches.count } else { 1 }
-                    if ($count -gt 0) {
-                        [void]$spans.Add([ordered]@{
-                                startLine = $start
-                                endLine = $start + $count - 1
-                            })
-                    }
-                }
-            }
-            return , $spans.ToArray()
+        else {
+            & $getItemContent $Path $SourceCommit
         }
-        finally {
-            Remove-Item -LiteralPath $before, $after -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $tempRoot -Force -ErrorAction SilentlyContinue
+        $target = if ($ChangeType -match '(?i)^add') {
+            ''
         }
+        elseif ($deleted) {
+            ''
+        }
+        else {
+            & $getItemContent $Path $TargetCommit
+        }
+        return Get-ApprovedOwnerV2ChangedSpans `
+            -Path $Path -ChangeType $ChangeType `
+            -SourceContent $source -TargetContent $target -GitPath $GitPath
     }.GetNewClosure()
 
     $writeRequest = {

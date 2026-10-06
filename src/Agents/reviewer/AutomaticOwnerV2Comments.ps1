@@ -4,8 +4,24 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:AutomaticOwnerV2Capability = 'bpm-test-ownership@1'
+$script:AutomaticNamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
+$script:AutomaticNamedAreEqualRoot = 'named-areequal-v1'
 $script:AutomaticOwnerV2MaximumCreatesPerRun = 5
 $script:AutomaticOwnerV2MaximumCreatesPerPullRequest = 50
+
+function Read-AutomaticNamedAreEqualEvidence {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$StateRoot,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$Identity,
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$ToolkitConfigPath
+    )
+    return Read-ApprovedOwnerV2Evidence `
+        -StateRoot $StateRoot -Identity $Identity -RepoRoot $RepoRoot `
+        -ToolkitConfigPath $ToolkitConfigPath -Delivery named-areequal
+}
 
 function Get-AutomaticOwnerV2ExitCode {
     param([Parameter(Mandatory)][string]$Health)
@@ -63,8 +79,15 @@ function Initialize-AutomaticOwnerV2DeliveryRoot {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$DeliveryRoot,
-        [Parameter(Mandatory)][string]$RepoRoot
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [ValidateSet('owner', 'named-areequal')]
+        [string]$Delivery = 'owner'
     )
+    if ($Delivery -ceq 'named-areequal') {
+        $base = Resolve-AgentTrustedRoot -Path $DeliveryRoot `
+            -Kind durable-state -RepositoryRoot $RepoRoot -Create
+        $DeliveryRoot = Join-Path $base $script:AutomaticNamedAreEqualRoot
+    }
     $created = $false
     $root = Resolve-AgentTrustedRoot -Path $DeliveryRoot -Kind durable-state `
         -RepositoryRoot $RepoRoot -Create -CreatedByCaller ([ref]$created)
@@ -76,7 +99,10 @@ function Initialize-AutomaticOwnerV2DeliveryRoot {
             New-Item -ItemType Directory -Path $path | Out-Null
         }
     }
-    $keyPath = Join-Path $root 'keys\owner-v2-service-authorization.hmac'
+    $keyPath = Join-Path $root (
+        'keys\' + $(if ($Delivery -ceq 'named-areequal') {
+            'named-areequal-service-authorization.hmac'
+        } else { 'owner-v2-service-authorization.hmac' }))
     if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
         $bytes = [byte[]]::new(32)
         [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
@@ -87,8 +113,15 @@ function Initialize-AutomaticOwnerV2DeliveryRoot {
 }
 
 function Get-AutomaticOwnerV2ServiceKey {
-    param([Parameter(Mandatory)][string]$DeliveryRoot)
-    $path = Join-Path $DeliveryRoot 'keys\owner-v2-service-authorization.hmac'
+    param(
+        [Parameter(Mandatory)][string]$DeliveryRoot,
+        [ValidateSet('owner', 'named-areequal')]
+        [string]$Delivery = 'owner'
+    )
+    $path = Join-Path $DeliveryRoot (
+        'keys\' + $(if ($Delivery -ceq 'named-areequal') {
+            'named-areequal-service-authorization.hmac'
+        } else { 'owner-v2-service-authorization.hmac' }))
     [void](Assert-AgentTrustedFile -Path $path -AllowedRoot $DeliveryRoot -Private)
     $key = [IO.File]::ReadAllBytes($path)
     if ($key.Length -ne 32) {
@@ -99,18 +132,25 @@ function Get-AutomaticOwnerV2ServiceKey {
 
 function Get-AutomaticOwnerV2Configuration {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][Collections.IDictionary]$ToolkitConfig)
-    if (-not $ToolkitConfig.Contains('autoCreateOwnerComments')) {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$ToolkitConfig,
+        [ValidateSet('owner', 'named-areequal')]
+        [string]$Delivery = 'owner'
+    )
+    $configKey = if ($Delivery -ceq 'named-areequal') {
+        'autoCreateNamedAreEqualComments'
+    } else { 'autoCreateOwnerComments' }
+    if (-not $ToolkitConfig.Contains($configKey)) {
         return [pscustomobject][ordered]@{
             Enabled = $false
             PolicyPath = ''
             PolicySha256 = ''
         }
     }
-    $value = $ToolkitConfig.autoCreateOwnerComments
+    $value = $ToolkitConfig[$configKey]
     if ($value -is [bool]) {
         if ($value) {
-            throw 'autoCreateOwnerComments=true requires an exact signed policy binding.'
+            throw "$configKey=true requires an exact signed policy binding."
         }
         return [pscustomobject][ordered]@{
             Enabled = $false
@@ -119,11 +159,11 @@ function Get-AutomaticOwnerV2Configuration {
         }
     }
     if ($value -isnot [Collections.IDictionary]) {
-        throw 'autoCreateOwnerComments must be false or an exact configuration object.'
+        throw "$configKey must be false or an exact configuration object."
     }
     $enabledValue = Get-ApprovedOwnerV2Value $value 'enabled' $null
     if ($enabledValue -isnot [bool]) {
-        throw 'autoCreateOwnerComments.enabled must be an exact JSON boolean.'
+        throw "$configKey.enabled must be an exact JSON boolean."
     }
     $enabled = [bool]$enabledValue
     if (-not $enabled) {
@@ -131,7 +171,7 @@ function Get-AutomaticOwnerV2Configuration {
     }
     Assert-ApprovedOwnerV2ExactKeys -Value $value `
         -Expected @('enabled', 'policyPath', 'policySha256') `
-        -Name autoCreateOwnerComments
+        -Name $configKey
     $path = [string]$value.policyPath
     $sha256 = [string]$value.policySha256
     if (-not [IO.Path]::IsPathFullyQualified($path) -or
@@ -159,6 +199,19 @@ function New-AutomaticOwnerV2ServicePolicy {
     if ($MaxCreatesPerPullRequest -lt $MaxCreatesPerRun) {
         throw 'The per-PR create ceiling cannot be lower than the per-run ceiling.'
     }
+    $namedAreEqual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticNamedAreEqualCapability
+    if (-not $namedAreEqual -and
+        [string]$Evidence.Declaration.capability.id -cne
+            $script:AutomaticOwnerV2Capability) {
+        throw 'Automatic delivery evidence uses an unsupported capability.'
+    }
+    if ($namedAreEqual -and
+        [string]$Evidence.Declaration.rule.path -cne
+            $script:ApprovedNamedAreEqualPolicyPath) {
+        throw 'Named AreEqual requires its exact rule path.'
+    }
     $copy = {
         param($Value)
         return ConvertTo-ApprovedOwnerV2CanonicalJson $Value |
@@ -166,7 +219,9 @@ function New-AutomaticOwnerV2ServicePolicy {
     }
     return [ordered]@{
         schemaVersion = 1
-        kind = 'owner-v2-service-authorization-policy'
+        kind = $(if ($namedAreEqual) {
+                'named-areequal-v1-service-authorization-policy'
+            } else { 'owner-v2-service-authorization-policy' })
         enabled = $true
         policyId = $PolicyId
         repository = [ordered]@{
@@ -195,7 +250,9 @@ function New-AutomaticOwnerV2ServicePolicy {
         authority = [ordered]@{
             action = 'create'
             classification = 'wouldCreate'
-            construct = 'changed-mstest-method'
+            construct = $(if ($namedAreEqual) {
+                    'changed-mstest-method-areequal-calls'
+                } else { 'changed-mstest-method' })
             disposition = 'violation'
             updates = $false
             threadStatusWrites = $false
@@ -226,8 +283,17 @@ function Assert-AutomaticOwnerV2ServicePolicy {
         'rule', 'reviewerIdentity', 'implementation', 'limits', 'authority',
         'createdUtc'
     )
+    $namedAreEqual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticNamedAreEqualCapability
+    $expectedKind = if ($namedAreEqual) {
+        'named-areequal-v1-service-authorization-policy'
+    } else { 'owner-v2-service-authorization-policy' }
+    $expectedConstruct = if ($namedAreEqual) {
+        'changed-mstest-method-areequal-calls'
+    } else { 'changed-mstest-method' }
     if ([int]$Policy.schemaVersion -ne 1 -or
-        [string]$Policy.kind -cne 'owner-v2-service-authorization-policy' -or
+        [string]$Policy.kind -cne $expectedKind -or
         -not [bool]$Policy.enabled -or
         [string]$Policy.policyId -cnotmatch '^[a-z0-9][a-z0-9_.-]{2,63}$') {
         throw 'Automatic Owner service policy is disabled or unsupported.'
@@ -263,7 +329,7 @@ function Assert-AutomaticOwnerV2ServicePolicy {
     $authority = $Policy.authority
     if ([string]$authority.action -cne 'create' -or
         [string]$authority.classification -cne 'wouldCreate' -or
-        [string]$authority.construct -cne 'changed-mstest-method' -or
+        [string]$authority.construct -cne $expectedConstruct -or
         [string]$authority.disposition -cne 'violation' -or
         [bool]$authority.updates -or [bool]$authority.threadStatusWrites -or
         [bool]$authority.relationCapability -or
@@ -326,9 +392,14 @@ function New-AutomaticOwnerV2Event {
         [string]$ProviderWriteState = 'none',
         [AllowNull()][Collections.IDictionary]$Diagnostic = $null
     )
-    return [ordered]@{
+    $namedAreEqual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticNamedAreEqualCapability
+    $event = [ordered]@{
         schemaVersion = 1
-        kind = 'owner-v2-delivery-event'
+        kind = $(if ($namedAreEqual) {
+                'named-areequal-v2-delivery-event'
+            } else { 'owner-v2-delivery-event' })
         eventId = [guid]::NewGuid().ToString('N')
         runId = $RunId
         occurredUtc = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
@@ -359,6 +430,15 @@ function New-AutomaticOwnerV2Event {
         providerWriteState = $ProviderWriteState
         diagnostic = $Diagnostic
     }
+    if ($namedAreEqual) {
+        if ([string]$Selection.bodySha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'Named AreEqual audit requires an exact formatted body digest.'
+        }
+        $event['capabilityId'] =
+            $script:AutomaticNamedAreEqualCapability
+        $event.finding['bodySha256'] = [string]$Selection.bodySha256
+    }
+    return $event
 }
 
 function Get-AutomaticOwnerV2CommentUrl {
@@ -376,6 +456,35 @@ function Get-AutomaticOwnerV2CommentUrl {
     }
     return "$organization/$project/_git/$repository/pullrequest/" +
         "${PullRequestId}?_a=files&discussionId=$ThreadId"
+}
+
+function New-AutomaticNamedAreEqualReviewPackage {
+    param([Parameter(Mandatory)]$Evidence)
+    return [pscustomobject]@{
+        proposals = @($Evidence.Observation.findings |
+            Where-Object {
+                [string]$_.reconciliation.classification -cin @(
+                    'wouldCreate', 'noOp', 'humanCovered')
+            } | ForEach-Object {
+                Get-ApprovedOwnerV2Proposal `
+                    -Evidence $Evidence -Finding $_ `
+                    -Delivery named-areequal
+            } | Sort-Object findingId)
+    }
+}
+
+function Assert-AutomaticNamedAreEqualLiveNoOp {
+    param(
+        [Parameter(Mandatory)]$Snapshot,
+        [Parameter(Mandatory)][Collections.IDictionary]$Selection,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    $entry = Get-AutomaticOwnerV2ConfirmedEntry `
+        -Snapshot $Snapshot -Selection $Selection -NamedAreEqual `
+        -SourceCommit $SourceCommit
+    if ($null -eq $entry) {
+        throw 'Named AreEqual marker/body is not one exact current no-op.'
+    }
 }
 
 function Invoke-AutomaticOwnerV2Read {
@@ -402,6 +511,9 @@ function Assert-AutomaticOwnerV2EvidenceCurrent {
         [Parameter(Mandatory)]$Evidence,
         [Parameter(Mandatory)][Collections.IDictionary]$Intent
     )
+    $namedAreEqual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticNamedAreEqualCapability
     $bindings = [ordered]@{
         declarationSha256 =
             Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.declaration
@@ -409,7 +521,12 @@ function Assert-AutomaticOwnerV2EvidenceCurrent {
         recordSha256 = Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.record
         observationSha256 =
             Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.observation
-        telemetrySha256 = Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.telemetry
+        telemetrySha256 = $(if ($namedAreEqual) {
+                'not-applicable'
+            }
+            else {
+                Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.telemetry
+            })
         resultDigest = [string]$Evidence.Record.resultDigest
     }
     foreach ($entry in $bindings.GetEnumerator()) {
@@ -422,10 +539,14 @@ function Assert-AutomaticOwnerV2EvidenceCurrent {
 function Get-AutomaticOwnerV2ConfirmedEntry {
     param(
         [Parameter(Mandatory)]$Snapshot,
-        [Parameter(Mandatory)][Collections.IDictionary]$Selection
+        [Parameter(Mandatory)][Collections.IDictionary]$Selection,
+        [switch]$NamedAreEqual,
+        [string]$SourceCommit = ''
     )
     $entries = @(Get-ApprovedOwnerV2MarkerEntries -Snapshot $Snapshot `
-            -Marker ([string]$Selection.marker))
+            -Marker ([string]$Selection.marker) -Pattern $(if ($NamedAreEqual) {
+                '<!--\s*devpilot-named-areequal:v1:([0-9a-f]{64})\s*-->'
+            } else { $script:ApprovedOwnerV2MarkerPattern }))
     $confirmed = @($entries | Where-Object {
             [bool]$_.Comment.reviewerOwned -and
             [string]$_.Comment.reviewerIdentityState -ceq 'matched' -and
@@ -433,6 +554,20 @@ function Get-AutomaticOwnerV2ConfirmedEntry {
             -not [bool]$_.Comment.isDeleted
         })
     if ($confirmed.Count -eq 1 -and $entries.Count -eq 1) {
+        if ($NamedAreEqual -and (
+                [string]::IsNullOrWhiteSpace($SourceCommit) -or
+                [bool]$confirmed[0].Thread.isDeleted -or
+                [bool]$confirmed[0].Thread.isOutdated -or
+                [string]$confirmed[0].Thread.status -cne 'active' -or
+                [string]$confirmed[0].Thread.contextState -cne 'current' -or
+                [string]$confirmed[0].Thread.sourceCommit -cne $SourceCommit -or
+                $null -eq $confirmed[0].Thread.anchor -or
+                [string]$confirmed[0].Thread.anchor.path -ine
+                    [string]$Selection.path -or
+                [int]$confirmed[0].Thread.anchor.line -ne
+                    [int]$Selection.line)) {
+            throw "Finding '$($Selection.findingId)' readback is stale."
+        }
         return $confirmed[0]
     }
     if ($entries.Count -gt 0) {
@@ -451,11 +586,15 @@ function Get-AutomaticOwnerV2DeliveryHistory {
         [StringComparer]::Ordinal)
     $blocked = [Collections.Generic.HashSet[string]]::new(
         [StringComparer]::Ordinal)
+    $expectedKind = if ([string]$Evidence.Declaration.capability.id -ceq
+        $script:AutomaticNamedAreEqualCapability) {
+        'named-areequal-v2-delivery-event'
+    } else { 'owner-v2-delivery-event' }
     foreach ($file in @(Get-ChildItem -LiteralPath (
                     Join-Path $DeliveryRoot 'events') -Filter '*.json' -File `
                 -ErrorAction SilentlyContinue)) {
         $event = Read-ApprovedOwnerV2SignedRecord -Path $file.FullName -Key $Key
-        if ([string]$event.kind -cne 'owner-v2-delivery-event') {
+        if ([string]$event.kind -cne $expectedKind) {
             throw "Automatic Owner event '$($file.FullName)' is foreign."
         }
         if ([string]$event.subject.repositoryId -cne
@@ -487,6 +626,9 @@ function Repair-AutomaticOwnerV2Intents {
         [Parameter(Mandatory)]$Evidence
     )
     $events = [Collections.Generic.List[object]]::new()
+    $namedAreEqual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticNamedAreEqualCapability
     $intentRoot = Join-Path $DeliveryRoot "intents\$($Evidence.Identity)"
     $outcomeRoot = Join-Path $DeliveryRoot "outcomes\$($Evidence.Identity)"
     foreach ($file in @(Get-ChildItem -LiteralPath $intentRoot `
@@ -498,7 +640,10 @@ function Repair-AutomaticOwnerV2Intents {
             continue
         }
         $intent = Read-ApprovedOwnerV2SignedRecord -Path $file.FullName -Key $Key
-        if ([string]$intent.kind -cne 'owner-v2-service-create-intent' -or
+        $expectedIntentKind = if ($namedAreEqual) {
+            'named-areequal-v2-service-create-intent'
+        } else { 'owner-v2-service-create-intent' }
+        if ([string]$intent.kind -cne $expectedIntentKind -or
             [string]$intent.state.identity -cne [string]$Evidence.Identity) {
             throw "Automatic Owner intent '$($file.FullName)' is foreign."
         }
@@ -513,7 +658,30 @@ function Repair-AutomaticOwnerV2Intents {
             $entry = $null
             try {
                 $entry = Get-AutomaticOwnerV2ConfirmedEntry `
-                    -Snapshot $live.Snapshot -Selection $selection
+                    -Snapshot $live.Snapshot -Selection $selection `
+                    -NamedAreEqual:$namedAreEqual `
+                    -SourceCommit ([string]$Evidence.Declaration.head.sourceCommit)
+                if ($namedAreEqual -and $null -ne $entry) {
+                    $approval = [ordered]@{
+                        subject = $intent.subject
+                        provider = $Evidence.Provider
+                        operator = $intent.reviewerIdentity
+                    }
+                    if ([int]$live.Snapshot.CurrentIterationId -ne
+                        [int]$intent.currentIterationId) {
+                        throw 'Interrupted create belongs to an older iteration.'
+                    }
+                    $readback = Assert-ApprovedOwnerV2LiveRead `
+                        -Evidence $Evidence -Approval $approval -Live $live `
+                        -Selections @($selection) `
+                        -ExpectedSnapshotSha256 (
+                            ([string]$live.Snapshot.Digest).Substring(10)) `
+                        -Delivery named-areequal
+                    if ([string]$readback.Classifications[
+                            [string]$selection.findingId] -cne 'noOp') {
+                        throw 'Interrupted create has no current exact readback.'
+                    }
+                }
             }
             catch { $entry = $null }
             if ($null -ne $entry) {
@@ -548,7 +716,9 @@ function Repair-AutomaticOwnerV2Intents {
         }
         $outcome = [ordered]@{
             schemaVersion = 1
-            kind = 'owner-v2-service-create-outcome'
+            kind = $(if ($namedAreEqual) {
+                    'named-areequal-v2-service-create-outcome'
+                } else { 'owner-v2-service-create-outcome' })
             runId = [string]$intent.runId
             stateIdentity = [string]$Evidence.Identity
             status = $(if ($ambiguous -gt 0) {
@@ -581,11 +751,22 @@ function Invoke-AutomaticOwnerV2Comments {
         [ValidateRange(0, 5)][int]$MaximumCreates = 5
     )
     $runId = [guid]::NewGuid().ToString('N')
+    $namedAreEqual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticNamedAreEqualCapability
+    $resultKind = if ($namedAreEqual) {
+        'named-areequal-v2-automatic-delivery-result'
+    } else { 'owner-v2-automatic-delivery-result' }
     $events = [Collections.Generic.List[object]]::new()
     $repaired = @()
     $writes = 0
     $intentPath = $null
     $outcomePath = $null
+    if ($namedAreEqual -and
+        (Split-Path -Leaf ([IO.Path]::GetFullPath($DeliveryRoot))) -cne
+            $script:AutomaticNamedAreEqualRoot) {
+        throw 'Named AreEqual requires its separate private delivery root.'
+    }
     $lockPath = Join-Path $DeliveryRoot 'locks\delivery.lock'
     $lock = [IO.File]::Open(
         $lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite,
@@ -598,7 +779,7 @@ function Invoke-AutomaticOwnerV2Comments {
         catch {
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $resultKind
                 runId = $runId
                 health = 'refused'
                 providerWrites = 0
@@ -632,12 +813,78 @@ function Invoke-AutomaticOwnerV2Comments {
         $available = [Math]::Max(0, [Math]::Min($runLimit, $prRemaining))
 
         try {
-            $review = New-ApprovedOwnerV2ReviewPackage -Evidence $Evidence
+            if ($namedAreEqual) {
+                $historical = @($Evidence.Observation.findings | Where-Object {
+                        [string]$_.reconciliation.classification -ceq
+                            'unknown' -and
+                        [string]$_.reconciliation.reason -ceq
+                            'historical-human-review-needs-review'
+                    })
+                if ($historical.Count -gt 0) {
+                    foreach ($finding in $historical) {
+                        $marker = Get-NamedAreEqualMarkerKey `
+                            -Contract $Evidence.Contract -Finding $finding
+                        $body = Format-NamedAreEqualComment `
+                            -Contract $Evidence.Contract -Finding $finding `
+                            -MarkerKey $marker
+                        $selection = [ordered]@{
+                            findingId = [string]$finding.identity
+                            marker = $marker
+                            bodySha256 =
+                                Get-ApprovedOwnerV2TextSha256 $body
+                            path = [string]$finding.anchor.path
+                            line = [int]$finding.anchor.line
+                            symbol = [string]$finding.anchor.symbol
+                        }
+                        $event = New-AutomaticOwnerV2Event `
+                            -RunId $runId -Evidence $Evidence `
+                            -Selection $selection -Action none `
+                            -Outcome refused -RunHealth refused `
+                            -ThreadId $(if (
+                                [string]$finding.reconciliation.thread.
+                                    availability -ceq 'available') {
+                                    [long]$finding.reconciliation.thread.threadId
+                                } else { 0 }) `
+                            -Diagnostic (Get-AutomaticOwnerV2Diagnostic `
+                                -Code 'historical-human-review-needs-review' `
+                                -Message 'Historical human review requires operator review before automatic delivery.')
+                        [void](Write-AutomaticOwnerV2Event `
+                            -DeliveryRoot $DeliveryRoot -Event $event -Key $Key)
+                        [void]$events.Add($event)
+                    }
+                    return [pscustomobject][ordered]@{
+                        schemaVersion = 1
+                        kind = $resultKind
+                        runId = $runId
+                        health = 'refused'
+                        providerWrites = 0
+                        modelWrites = 0
+                        remainingWouldCreate = 0
+                        events = @($repaired + $events.ToArray())
+                        diagnostic = Get-AutomaticOwnerV2Diagnostic `
+                            -Code 'historical-human-review-needs-review' `
+                            -Message 'Historical human review blocked automatic delivery.'
+                    }
+                }
+                $proposals = @($Evidence.Observation.findings |
+                    Where-Object {
+                        [string]$_.reconciliation.classification -cin @(
+                            'wouldCreate', 'noOp', 'humanCovered')
+                    } | ForEach-Object {
+                        Get-ApprovedOwnerV2Proposal `
+                            -Evidence $Evidence -Finding $_ `
+                            -Delivery named-areequal
+                    } | Sort-Object findingId)
+                $review = [pscustomobject]@{ proposals = $proposals }
+            }
+            else {
+                $review = New-ApprovedOwnerV2ReviewPackage -Evidence $Evidence
+            }
         }
         catch {
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $resultKind
                 runId = $runId
                 health = 'refused'
                 providerWrites = 0
@@ -649,12 +896,31 @@ function Invoke-AutomaticOwnerV2Comments {
                     -Message 'Observation contains an ineligible Owner finding.'
             }
         }
+        if ($namedAreEqual -and @($review.proposals | Where-Object {
+                    [string]$_.classification -ceq 'humanCovered'
+                }).Count -gt 0) {
+            return [pscustomobject][ordered]@{
+                schemaVersion = 1
+                kind = $resultKind
+                runId = $runId
+                health = 'refused'
+                providerWrites = 0
+                modelWrites = 0
+                remainingWouldCreate = @($review.proposals | Where-Object {
+                        [string]$_.classification -ceq 'wouldCreate'
+                    }).Count
+                events = @($repaired + $events.ToArray())
+                diagnostic = Get-AutomaticOwnerV2Diagnostic `
+                    -Code 'current-human-review-covers-method' `
+                    -Message 'Current human review blocks automatic delivery for this method.'
+            }
+        }
         if (@($review.proposals | Where-Object {
                     [string]$_.classification -ceq 'wouldUpdate'
                 }).Count -gt 0) {
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $resultKind
                 runId = $runId
                 health = 'refused'
                 providerWrites = 0
@@ -688,7 +954,7 @@ function Invoke-AutomaticOwnerV2Comments {
             else { 'partial' }
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $resultKind
                 runId = $runId
                 health = $health
                 providerWrites = 0
@@ -731,7 +997,17 @@ function Invoke-AutomaticOwnerV2Comments {
                 -Kind 'owner-v2-discussion-snapshot'
             $liveState = Assert-ApprovedOwnerV2LiveRead `
                 -Evidence $Evidence -Approval $authorization -Live $initial `
-                -Selections $selections -ExpectedSnapshotSha256 $snapshot
+                -Selections $selections -ExpectedSnapshotSha256 $snapshot `
+                -Delivery $(if ($namedAreEqual) {
+                    'named-areequal'
+                } else { 'owner' })
+            if ($namedAreEqual -and @($selections | Where-Object {
+                        [string]$liveState.Classifications[
+                            [string]$_.findingId] -cnotin @(
+                                'wouldCreate', 'noOp')
+                    }).Count -gt 0) {
+                throw 'Named AreEqual live classification is not create-only eligible.'
+            }
             $iterationId = [int]$initial.Snapshot.CurrentIterationId
             if ($iterationId -lt 1) {
                 throw 'Current pull request iteration is missing.'
@@ -740,7 +1016,7 @@ function Invoke-AutomaticOwnerV2Comments {
         catch {
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
-                kind = 'owner-v2-automatic-delivery-result'
+                kind = $resultKind
                 runId = $runId
                 health = 'refused'
                 providerWrites = 0
@@ -755,7 +1031,9 @@ function Invoke-AutomaticOwnerV2Comments {
 
         $intent = [ordered]@{
             schemaVersion = 1
-            kind = 'owner-v2-service-create-intent'
+            kind = $(if ($namedAreEqual) {
+                    'named-areequal-v2-service-create-intent'
+                } else { 'owner-v2-service-create-intent' })
             runId = $runId
             policyDigest = Get-ApprovedOwnerV2Digest $Policy
             state = [ordered]@{
@@ -769,8 +1047,12 @@ function Invoke-AutomaticOwnerV2Comments {
                     Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.record
                 observationSha256 =
                     Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.observation
-                telemetrySha256 =
-                    Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.telemetry
+                telemetrySha256 = $(if ($namedAreEqual) {
+                        'not-applicable'
+                    }
+                    else {
+                        Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.telemetry
+                    })
             }
             subject = $authorization.subject
             currentIterationId = $iterationId
@@ -805,7 +1087,10 @@ function Invoke-AutomaticOwnerV2Comments {
                 $freshState = Assert-ApprovedOwnerV2LiveRead `
                     -Evidence $Evidence -Approval $authorization -Live $fresh `
                     -Selections @($selection) `
-                    -ExpectedSnapshotSha256 $expectedSnapshot
+                    -ExpectedSnapshotSha256 $expectedSnapshot `
+                    -Delivery $(if ($namedAreEqual) {
+                        'named-areequal'
+                    } else { 'owner' })
                 Assert-AutomaticOwnerV2EvidenceCurrent `
                     -Evidence $Evidence -Intent $intent
                 $classification = [string]$freshState.Classifications[
@@ -871,7 +1156,9 @@ function Invoke-AutomaticOwnerV2Comments {
                 $entry = $null
                 try {
                     $entry = Get-AutomaticOwnerV2ConfirmedEntry `
-                        -Snapshot $confirmed.Snapshot -Selection $selection
+                        -Snapshot $confirmed.Snapshot -Selection $selection `
+                        -NamedAreEqual:$namedAreEqual `
+                        -SourceCommit ([string]$Evidence.Declaration.head.sourceCommit)
                 }
                 catch { $entry = $null }
                 if ($null -eq $entry) {
@@ -944,7 +1231,9 @@ function Invoke-AutomaticOwnerV2Comments {
         }
         $outcomeRecord = [ordered]@{
             schemaVersion = 1
-            kind = 'owner-v2-service-create-outcome'
+            kind = $(if ($namedAreEqual) {
+                    'named-areequal-v2-service-create-outcome'
+                } else { 'owner-v2-service-create-outcome' })
             runId = $runId
             stateIdentity = [string]$Evidence.Identity
             status = $status
@@ -966,7 +1255,7 @@ function Invoke-AutomaticOwnerV2Comments {
         ) -Payload $outcomeRecord -Key $Key
         return [pscustomobject][ordered]@{
             schemaVersion = 1
-            kind = 'owner-v2-automatic-delivery-result'
+            kind = $resultKind
             runId = $runId
             health = $(if ($status -ceq 'completed') { 'healthy' }
                 elseif ($status -ceq 'operator-review-required') { 'refused' }

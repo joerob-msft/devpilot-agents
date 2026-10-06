@@ -12,8 +12,10 @@ param(
     [ValidatePattern('^$|^[0-9a-f]{64}$')][string]$Identity,
     [string]$ToolkitConfigPath,
     [string]$PolicyPath,
+    [ValidateSet('owner', 'named-areequal')]
+    [string]$Delivery = 'owner',
     [ValidatePattern('^[a-z0-9][a-z0-9_.-]{2,63}$')]
-    [string]$PolicyId = 'owner-v2-production',
+    [string]$PolicyId = '',
     [ValidateRange(1, 5)][int]$MaxCreatesPerRun = 5,
     [ValidateRange(1, 50)][int]$MaxCreatesPerPullRequest = 25,
     [AllowNull()][object]$DeliveryProvider,
@@ -36,8 +38,53 @@ Import-Module (Join-Path $RepoRoot `
 . (Join-Path $RepoRoot `
     'src\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
 
+$toolkitConfig = $null
+if ($Command -ceq 'invoke' -and $Delivery -ceq 'named-areequal') {
+    if ([string]::IsNullOrWhiteSpace($StateRoot) -or
+        [string]::IsNullOrWhiteSpace($Identity) -or
+        [string]::IsNullOrWhiteSpace($ToolkitConfigPath) -or
+        -not [IO.Path]::IsPathFullyQualified($StateRoot) -or
+        -not [IO.Path]::IsPathFullyQualified($ToolkitConfigPath)) {
+        throw 'invoke requires absolute state/config paths and an exact state identity.'
+    }
+    $toolkitConfig = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
+    $configured = Get-AutomaticOwnerV2Configuration `
+        -ToolkitConfig $toolkitConfig -Delivery $Delivery
+    if (-not $configured.Enabled) {
+        $disabledEvidence = Read-ApprovedOwnerV2Evidence `
+            -StateRoot $StateRoot -Identity $Identity -RepoRoot $RepoRoot `
+            -ToolkitConfigPath $ToolkitConfigPath -Delivery named-areequal
+        [pscustomobject][ordered]@{
+            schemaVersion = 1
+            kind = 'named-areequal-v2-automatic-delivery-result'
+            health = 'disabled'
+            providerWrites = 0
+            modelWrites = 0
+            remainingWouldCreate = @(
+                $disabledEvidence.Observation.findings | Where-Object {
+                    [string]$_.reconciliation.classification -ceq 'wouldCreate'
+                }).Count
+            events = @()
+        }
+        exit 0
+    }
+}
+
 $context = Initialize-AutomaticOwnerV2DeliveryRoot `
-    -DeliveryRoot $DeliveryRoot -RepoRoot $RepoRoot
+    -DeliveryRoot $DeliveryRoot -RepoRoot $RepoRoot -Delivery $Delivery
+if (-not $PolicyId) {
+    $PolicyId = if ($Delivery -ceq 'named-areequal') {
+        'named-areequal-v1-production'
+    } else { 'owner-v2-production' }
+}
+if ($Delivery -ceq 'named-areequal') {
+    if (-not $PSBoundParameters.ContainsKey('MaxCreatesPerRun')) {
+        $MaxCreatesPerRun = 2
+    }
+    if (-not $PSBoundParameters.ContainsKey('MaxCreatesPerPullRequest')) {
+        $MaxCreatesPerPullRequest = 5
+    }
+}
 if ($Command -ceq 'initialize-key') {
     [pscustomobject][ordered]@{
         schemaVersion = 1
@@ -58,8 +105,9 @@ if ([string]::IsNullOrWhiteSpace($StateRoot) -or
 }
 $evidence = Read-ApprovedOwnerV2Evidence -StateRoot $StateRoot `
     -Identity $Identity -RepoRoot $RepoRoot `
-    -ToolkitConfigPath $ToolkitConfigPath
-$key = Get-AutomaticOwnerV2ServiceKey -DeliveryRoot $context.Root
+    -ToolkitConfigPath $ToolkitConfigPath -Delivery $Delivery
+$key = Get-AutomaticOwnerV2ServiceKey `
+    -DeliveryRoot $context.Root -Delivery $Delivery
 
 if ($Command -ceq 'authorize-policy') {
     if ([string]::IsNullOrWhiteSpace($PolicyPath)) {
@@ -86,12 +134,17 @@ if ($Command -ceq 'authorize-policy') {
     exit 0
 }
 
-$toolkitConfig = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
-$automatic = Get-AutomaticOwnerV2Configuration -ToolkitConfig $toolkitConfig
+if ($null -eq $toolkitConfig) {
+    $toolkitConfig = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
+}
+$automatic = Get-AutomaticOwnerV2Configuration `
+    -ToolkitConfig $toolkitConfig -Delivery $Delivery
 if (-not $automatic.Enabled) {
     [pscustomobject][ordered]@{
         schemaVersion = 1
-        kind = 'owner-v2-automatic-delivery-result'
+        kind = $(if ($Delivery -ceq 'named-areequal') {
+                'named-areequal-v2-automatic-delivery-result'
+            } else { 'owner-v2-automatic-delivery-result' })
         health = 'disabled'
         providerWrites = 0
         modelWrites = 0

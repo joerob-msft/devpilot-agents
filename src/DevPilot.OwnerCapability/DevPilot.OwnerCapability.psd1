@@ -9,8 +9,11 @@
     PowerShellVersion = '7.0'
     FunctionsToExport = @(
         'ConvertTo-OwnerV2Observation',
+        'Format-NamedAreEqualComment',
         'Format-OwnerV1WriterComment',
+        'Get-NamedAreEqualMarkerKey',
         'Get-OwnerV1WriterMarkerKey',
+        'New-NamedAreEqualCapabilityAdapter',
         'New-OwnerSemanticRunner',
         'New-OwnerV2CapabilityAdapter',
         'New-OwnerV2CapabilityLimits',

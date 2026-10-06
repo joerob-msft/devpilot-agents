@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1"
 Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1"
 
 $limitsTypeName = 'DevPilot.OwnerCapability.OwnerV2CapabilityLimits'
 if (-not ($limitsTypeName -as [type])) {
@@ -45,6 +46,10 @@ $script:OwnerV1WriterCapability = 'bpm-test-ownership@1'
 $script:OwnerV1WriterVersion = 1
 $script:OwnerV1WriterRuleRef = 'rs0'
 $script:OwnerV1WriterMarkerPrefix = 'devpilot-owner-comment:v1'
+$script:NamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
+$script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a'
+$script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
+$script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -162,9 +167,105 @@ function Format-OwnerV1WriterComment {
     ) -join "`n"
 }
 
+function Get-NamedAreEqualMarkerKey {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding
+    )
+
+    $request = $Contract.Request
+    if ([string]$request.CapabilityId -cne $script:NamedAreEqualCapability -or
+        [string]$request.RuleSection -cne $script:NamedAreEqualCapability) {
+        throw 'Named AreEqual arguments require their independently bound rule.'
+    }
+    $anchor = $Finding.anchor
+    $source = $Finding.binding.source.representation
+    $lines = @($Finding.affectedCallLines)
+    if ($anchor -isnot [Collections.IDictionary] -or
+        $source -isnot [Collections.IDictionary] -or
+        [string]$Finding.disposition -cne 'violation' -or
+        [string]$Finding.constructRef -cnotmatch '^construct:[0-9a-f]{64}$' -or
+        [string]$source.constructIdentity -cne [string]$Finding.constructRef -or
+        [string]$source.path -cne [string]$anchor.path -or
+        [string]$source.symbol -cne [string]$anchor.symbol -or
+        [int]$source.startLine -ne [int]$anchor.line -or
+        [int]$source.endLine -ne [int]$anchor.line -or
+        [int]$anchor.line -lt 1 -or
+        ([string]$anchor.symbol).Length -gt 256 -or
+        [string]$anchor.symbol -cnotmatch
+            '^[\p{L}_][\p{L}\p{N}_]*(?:\.[\p{L}_][\p{L}\p{N}_]*)*$' -or
+        [int]$Finding.affectedCallCount -lt 1 -or
+        [int]$Finding.affectedCallCount -gt 256 -or
+        $lines.Count -ne [int]$Finding.affectedCallCount -or
+        $Finding.callListTruncated -isnot [bool] -or
+        [bool]$Finding.callListTruncated -ne
+            ([int]$Finding.affectedCallCount -gt 12) -or
+        [int]$lines[0] -ne [int]$anchor.line) {
+        throw 'Named AreEqual finding has no bounded changed method and call anchors.'
+    }
+    for ($index = 1; $index -lt $lines.Count; $index++) {
+        if ([int]$lines[$index] -le [int]$lines[$index - 1] -or
+            [int]$lines[$index] -gt 200000) {
+            throw 'Named AreEqual call anchors are not strictly ordered.'
+        }
+    }
+    $material = @(
+        $script:NamedAreEqualMarkerPrefix
+        [string]$request.RepositoryId
+        [string]$request.PullRequestId
+        [string]$request.SourceCommit
+        [string]$request.RuleRepositoryId
+        (ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+        [string]$request.RuleSection
+        [string]$request.RuleCommit
+        [string]$request.RuleHash
+        (ConvertTo-OwnerV1WriterPath -Path ([string]$anchor.path))
+        [string]$anchor.line
+        [string]$anchor.symbol
+    ) -join "`n"
+    return Get-OwnerV1WriterSha256 -Text $material
+}
+
+function Format-NamedAreEqualComment {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [Parameter(Mandatory)][string]$MarkerKey
+    )
+
+    if ($MarkerKey -cne (Get-NamedAreEqualMarkerKey `
+            -Contract $Contract -Finding $Finding)) {
+        throw 'Named AreEqual marker does not match the bound method finding.'
+    }
+    $request = $Contract.Request
+    $path = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path ([string]$Finding.anchor.path))
+    $symbol = ConvertTo-OwnerV1WriterMarkdownCode ([string]$Finding.anchor.symbol)
+    $count = [int]$Finding.affectedCallCount
+    $sample = @($Finding.affectedCallLines | Select-Object -First 12)
+    $lineSummary = $sample -join ', '
+    if ($count -gt $sample.Count) {
+        $lineSummary += " (first 12 of $count)"
+    }
+    $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+    return @(
+        '**Use named arguments for Assert.AreEqual in this test method**'
+        ''
+        "Method ``$symbol`` contains $count changed positional ``Assert.AreEqual`` call(s) at ``$path`` (lines $lineSummary). This comment is anchored at the first changed call, line $([int]$Finding.anchor.line)."
+        ''
+        'Name every supplied argument according to the selected overload. For MSTest, this commonly includes `expected:` and `actual:` (and further supplied arguments such as `delta:` or `message:`). Preserve the existing argument order and values.'
+        ''
+        "Convention: ``$rulePath`` / ``$([string]$request.RuleSection)`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+        ''
+        "<!-- ${script:NamedAreEqualMarkerPrefix}:$MarkerKey -->"
+    ) -join "`n"
+}
+
 function New-OwnerV2DiscussionReconciliation {
     param(
-        [Parameter(Mandatory)][ValidateSet('wouldCreate', 'wouldUpdate', 'noOp', 'unknown')]
+        [Parameter(Mandatory)]
+        [ValidateSet('wouldCreate', 'wouldUpdate', 'noOp', 'humanCovered', 'unknown')]
         [string]$Classification,
         [Parameter(Mandatory)][string]$Reason,
         [Parameter(Mandatory)][string]$DiscussionDigest,
@@ -189,6 +290,305 @@ function New-OwnerV2DiscussionReconciliation {
     }
 }
 
+function Resolve-NamedAreEqualDiscussionReconciliation {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)][object]$Contract,
+        [AllowNull()][DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]$Snapshot,
+        [Parameter(Mandatory)][string]$FailureReason
+    )
+
+    $counts = [ordered]@{
+        created = 0
+        updated = 0
+        noOp = 0
+        wouldCreate = 0
+        wouldUpdate = 0
+        unknown = 0
+        humanCovered = 0
+    }
+    $snapshotAvailable = $null -ne $Snapshot -and
+        $Snapshot.State -ceq 'complete' -and
+        $Snapshot.Digest -match $script:OwnerV2DigestPattern
+    $discussionDigest = if ($snapshotAvailable) {
+        $Snapshot.Digest.Substring(10)
+    }
+    else { 'unknown' }
+    $targetPattern =
+        '<!--\s*devpilot-named-areequal:v1:([0-9a-f]{64})\s*-->'
+    $anyMarkerPattern =
+        '<!--\s*devpilot-(?:owner-comment|test-class-coverage|redundant-method-coverage|named-areequal):v1:[0-9a-f]{64}\s*-->'
+
+    foreach ($finding in @($Observation.findings)) {
+        try {
+            $marker = Get-NamedAreEqualMarkerKey `
+                -Contract $Contract -Finding $finding
+            $body = Format-NamedAreEqualComment `
+                -Contract $Contract -Finding $finding -MarkerKey $marker
+        }
+        catch {
+            $finding.providerMarker = New-OwnerProviderMarker
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason 'marker-derivation-failed' `
+                -DiscussionDigest $discussionDigest -BodyDigest 'unknown'
+            $counts.unknown++
+            continue
+        }
+        $bodyDigest = Get-OwnerV1WriterSha256 -Text $body
+        if (-not $snapshotAvailable) {
+            $finding.providerMarker = New-OwnerProviderMarker
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason $FailureReason `
+                -DiscussionDigest unknown -BodyDigest $bodyDigest
+            $counts.unknown++
+            continue
+        }
+
+        $markerEntries = [Collections.Generic.List[object]]::new()
+        $foreignMarker = $false
+        $ambiguousIdentity = $false
+        foreach ($thread in @($Snapshot.Threads)) {
+            foreach ($comment in @($thread.comments)) {
+                if ([string]$comment.commentType -cne 'text' -or
+                    [bool]$comment.isDeleted) {
+                    continue
+                }
+                $matches = [regex]::Matches(
+                    [string]$comment.body, $targetPattern)
+                $target = @($matches | Where-Object {
+                        $_.Groups[1].Value -ceq $marker
+                    })
+                if ($target.Count -eq 0) { continue }
+                if ([string]$comment.reviewerIdentityState -ceq 'ambiguous') {
+                    $ambiguousIdentity = $true
+                    continue
+                }
+                if (-not [bool]$comment.reviewerOwned) {
+                    $foreignMarker = $true
+                    continue
+                }
+                [void]$markerEntries.Add([pscustomobject]@{
+                        Thread = $thread
+                        Comment = $comment
+                        Count = $target.Count
+                    })
+            }
+        }
+
+        if ($ambiguousIdentity -or $foreignMarker -or
+            $markerEntries.Count -gt 1 -or
+            ($markerEntries.Count -eq 1 -and
+                [int]$markerEntries[0].Count -ne 1)) {
+            $finding.providerMarker = New-OwnerProviderMarker `
+                -Value $marker -Integrity invalid
+            $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason 'duplicate-or-foreign-reviewer-marker' `
+                -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+                -ThreadAvailability ambiguous
+            $counts.unknown++
+            continue
+        }
+
+        if ($markerEntries.Count -eq 0) {
+            $affected = @($finding.affectedCallLines)
+            $currentHuman = [Collections.Generic.List[object]]::new()
+            $historicalHuman = [Collections.Generic.List[object]]::new()
+            $crossRuleMarker = $false
+            $ambiguousHuman = $false
+            foreach ($thread in @($Snapshot.Threads)) {
+                if ($null -eq $thread.anchor -or
+                    [string]$thread.anchor.path -ine [string]$finding.anchor.path -or
+                    [int]$thread.anchor.line -notin $affected) {
+                    continue
+                }
+                foreach ($comment in @($thread.comments)) {
+                    if ([string]$comment.commentType -cne 'text' -or
+                        [bool]$comment.isDeleted) {
+                        continue
+                    }
+                    if ([regex]::IsMatch(
+                            [string]$comment.body, $anyMarkerPattern)) {
+                        if (-not [bool]$thread.isDeleted -and
+                            -not [bool]$thread.isOutdated -and
+                            [string]$thread.status -ceq 'active' -and
+                            [string]$thread.contextState -ceq 'current' -and
+                            [string]$thread.sourceCommit -ceq
+                                [string]$Contract.Request.SourceCommit) {
+                            $crossRuleMarker = $true
+                        }
+                        continue
+                    }
+                    $text = [string]$comment.body
+                    $affirmative = $text -notmatch '\?' -and
+                        $text -notmatch
+                            '(?i)\b(?:do\s+not|don''t|shouldn''t|avoid|never)\s+(?:use|name|add)\b' -and
+                        $text -match '(?i)\b(?:named|name|label|explicit)\b' -and
+                        $text -match
+                            '(?i)\b(?:arguments?|parameters?|expected|actual)\b' -and
+                        ($text -match
+                            '(?i)\b(?:AreEqual|assert|expected|actual)\b' -or
+                            $text -match
+                            '(?i)^\s*(?:please\s+)?(?:use|add|prefer)\s+(?:the\s+)?named\s+(?:arguments?|parameters?)\s*[.!]?\s*$')
+                    if (-not $affirmative) { continue }
+                    if ([string]$comment.reviewerIdentityState -ceq
+                        'ambiguous') {
+                        $ambiguousHuman = $true
+                        continue
+                    }
+                    $current = -not [bool]$thread.isDeleted -and
+                        -not [bool]$thread.isOutdated -and
+                        [string]$thread.status -ceq 'active' -and
+                        [string]$thread.contextState -ceq 'current' -and
+                        [string]$thread.sourceCommit -ceq
+                            [string]$Contract.Request.SourceCommit
+                    if ($current) {
+                        [void]$currentHuman.Add([pscustomobject]@{
+                                Thread = $thread
+                                Comment = $comment
+                            })
+                    }
+                    else {
+                        [void]$historicalHuman.Add([pscustomobject]@{
+                                Thread = $thread
+                                Comment = $comment
+                            })
+                    }
+                }
+            }
+            if ($crossRuleMarker) {
+                $classification = 'unknown'
+                $reason = 'cross-rule-marker-at-anchor'
+            }
+            elseif ($ambiguousHuman) {
+                $classification = 'unknown'
+                $reason = 'human-reviewer-identity-ambiguous'
+            }
+            elseif ($currentHuman.Count -gt 0) {
+                $classification = 'humanCovered'
+                $reason = 'current-human-review-covers-method'
+            }
+            elseif ($historicalHuman.Count -gt 0) {
+                $classification = 'unknown'
+                $reason = 'historical-human-review-needs-review'
+            }
+            else {
+                $classification = 'wouldCreate'
+                $reason = 'reviewer-marker-not-found'
+            }
+            $integrity = if ($classification -cin @(
+                    'wouldCreate', 'humanCovered')) {
+                'verified'
+            }
+            else { 'invalid' }
+            $finding.providerMarker = New-OwnerProviderMarker `
+                -Value $marker -Integrity $integrity
+            $matchedHuman = if ($classification -ceq 'humanCovered') {
+                $currentHuman[0]
+            }
+            elseif ($reason -ceq 'historical-human-review-needs-review') {
+                $historicalHuman[0]
+            }
+            else { $null }
+            $arguments = @{
+                Classification = $classification
+                Reason = $reason
+                DiscussionDigest = $discussionDigest
+                BodyDigest = $bodyDigest
+            }
+            if ($null -ne $matchedHuman) {
+                $arguments.ThreadAvailability = 'available'
+                $arguments.ThreadId = [long]$matchedHuman.Thread.threadId
+                $arguments.CommentId = [long]$matchedHuman.Comment.commentId
+                $arguments.ThreadStatus = [string]$matchedHuman.Thread.status
+            }
+            $finding['reconciliation'] =
+                New-OwnerV2DiscussionReconciliation @arguments
+            $counts[$classification]++
+            continue
+        }
+
+        $entry = $markerEntries[0]
+        $thread = $entry.Thread
+        $comment = $entry.Comment
+        $trusted = $null -ne $thread.anchor -and
+            [string]$thread.anchor.path -ieq [string]$finding.anchor.path -and
+            [int]$thread.anchor.line -eq [int]$finding.anchor.line -and
+            -not [bool]$thread.isDeleted -and
+            -not [bool]$thread.isOutdated -and
+            [string]$thread.status -ceq 'active' -and
+            [string]$thread.contextState -ceq 'current' -and
+            [string]$thread.sourceCommit -ceq
+                [string]$Contract.Request.SourceCommit
+        $classification = if ($trusted -and
+            [string]$comment.body -ceq $body) {
+            'noOp'
+        }
+        else { 'unknown' }
+        $reason = if ($classification -ceq 'noOp') {
+            'reviewer-marker-body-current'
+        }
+        else { 'reviewer-marker-generation-unknown' }
+        $finding.providerMarker = New-OwnerProviderMarker `
+            -Value $marker -Integrity $(if ($classification -ceq 'noOp') {
+                'verified'
+            } else { 'invalid' })
+        $finding['reconciliation'] = New-OwnerV2DiscussionReconciliation `
+            -Classification $classification -Reason $reason `
+            -DiscussionDigest $discussionDigest -BodyDigest $bodyDigest `
+            -ThreadAvailability available -ThreadId ([long]$thread.threadId) `
+            -CommentId ([long]$comment.commentId) `
+            -ThreadStatus ([string]$thread.status)
+        $counts[$classification]++
+    }
+
+    $Observation.effects.dedupe = $counts
+    $artifacts = [Collections.Generic.List[object]]::new()
+    foreach ($artifact in @($Observation.sourceArtifacts)) {
+        if ([string](Get-OwnerV2Member -Value $artifact -Name kind) -cnotin @(
+                'owner-v2-discussion-snapshot',
+                'owner-v2-discussion-mapping',
+                'owner-v2-discussion-reviewer-identity',
+                'owner-v2-discussion-raw-page'
+            )) {
+            [void]$artifacts.Add($artifact)
+        }
+    }
+    if ($snapshotAvailable) {
+        [void]$artifacts.Add([ordered]@{
+                kind = 'owner-v2-discussion-snapshot'
+                sha256 = $Snapshot.Digest.Substring(10)
+                signature = 'not-applicable'
+            })
+        if ([string]$Snapshot.MappingDigest -match $script:OwnerV2DigestPattern) {
+            [void]$artifacts.Add([ordered]@{
+                    kind = 'owner-v2-discussion-mapping'
+                    sha256 = ([string]$Snapshot.MappingDigest).Substring(10)
+                    signature = 'not-applicable'
+                })
+        }
+        if ([string]$Snapshot.ReviewerIdentityDigest -match
+            $script:OwnerV2DigestPattern) {
+            [void]$artifacts.Add([ordered]@{
+                    kind = 'owner-v2-discussion-reviewer-identity'
+                    sha256 =
+                        ([string]$Snapshot.ReviewerIdentityDigest).Substring(10)
+                    signature = 'not-applicable'
+                })
+        }
+        foreach ($rawDigest in @($Snapshot.RawProvenanceDigests)) {
+            if ([string]$rawDigest -match $script:OwnerV2DigestPattern) {
+                [void]$artifacts.Add([ordered]@{
+                        kind = 'owner-v2-discussion-raw-page'
+                        sha256 = ([string]$rawDigest).Substring(10)
+                        signature = 'not-applicable'
+                    })
+            }
+        }
+    }
+    $Observation.sourceArtifacts = @($artifacts)
+    return $Observation
+}
+
 function Resolve-OwnerV2DiscussionReconciliation {
     [CmdletBinding()]
     param(
@@ -198,6 +598,13 @@ function Resolve-OwnerV2DiscussionReconciliation {
         [ValidatePattern('^[a-z][a-z0-9-]{0,127}$')]
         [string]$FailureReason = 'discussion-acquisition-unavailable'
     )
+
+    if ([string](Get-OwnerV2Member -Value $Observation -Name capability) -ceq
+        $script:NamedAreEqualCapability) {
+        return Resolve-NamedAreEqualDiscussionReconciliation `
+            -Observation $Observation -Contract $Contract -Snapshot $Snapshot `
+            -FailureReason $FailureReason
+    }
 
     $findings = @($Observation.findings)
     if ($findings.Count -eq 0 -or
@@ -1633,6 +2040,296 @@ function Invoke-OwnerV2CapabilityResponse {
     }
 }
 
+function Invoke-NamedAreEqualCapabilityResponse {
+    param(
+        [Parameter(Mandatory)][object]$Context,
+        [Parameter(Mandatory)][string]$CapabilityDigest,
+        [Parameter(Mandatory)]
+        [DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits
+    )
+
+    $binding = Get-OwnerV2Member -Value $Context -Name binding
+    $evidence = Get-OwnerV2Member -Value $Context -Name evidence
+    $bindingId = [string](Get-OwnerV2Member -Value $binding -Name BindingId)
+    $evidenceDigest = [string](Get-OwnerV2Member -Value $evidence -Name evidenceDigest)
+    $units = @(Get-OwnerV2Member -Value $evidence -Name evidenceUnits)
+    if ([string]::IsNullOrWhiteSpace($bindingId) -or
+        [string](Get-OwnerV2Member -Value $evidence -Name bindingId) -cne
+            $bindingId -or
+        $evidenceDigest -cnotmatch $script:OwnerV2DigestPattern) {
+        throw 'Named AreEqual capability did not preserve the facade evidence binding.'
+    }
+    $identityUnits = @($units | Where-Object {
+            [string]$_.unitId -ceq 'identity'
+        })
+    $ruleUnits = @($units | Where-Object {
+            [string]$_.unitId -ceq 'rule'
+        })
+    $files = @($units | Where-Object {
+            [string]$_.unitId -like 'file:*'
+        } | Sort-Object { [string]$_.unitId })
+    $diagnostics = [Collections.Generic.List[object]]::new()
+    $policyPath = Join-Path $PSScriptRoot `
+        'Policy\named-areequal-arguments.v1.txt'
+    $policyText = [IO.File]::ReadAllText(
+        $policyPath, [Text.UTF8Encoding]::new($false))
+    $policyDigest = Get-OwnerV2Digest -Value $policyText
+    if ($policyDigest -cne $script:NamedAreEqualPolicyDigest) {
+        throw 'Named AreEqual policy no longer matches the pinned source-backed version.'
+    }
+    $controlsComplete =
+        $identityUnits.Count -eq 1 -and
+        $ruleUnits.Count -eq 1 -and
+        [string]$identityUnits[0].state -ceq 'complete' -and
+        [string]$ruleUnits[0].state -ceq 'complete' -and
+        [string]$identityUnits[0].data.capabilityId -ceq
+            $script:NamedAreEqualCapability -and
+        [string]$identityUnits[0].data.capabilityDigest -ceq
+            $CapabilityDigest -and
+        [string]$ruleUnits[0].data.section -ceq
+            $script:NamedAreEqualCapability -and
+        [string]$ruleUnits[0].data.hash -ceq $policyDigest -and
+        [string]$ruleUnits[0].data.content -ceq $policyText -and
+        $files.Count -le $Limits.MaximumFiles
+    if (-not $controlsComplete) {
+        Add-OwnerV2Diagnostic -Diagnostics $diagnostics -Limits $Limits `
+            -Code 'named-areequal-rule-evidence-unknown' `
+            -Message 'The independently pinned named-argument policy, identity, or bounded files are unavailable.'
+        return [ordered]@{
+            schemaVersion = 1
+            bindingId = $bindingId
+            state = 'unknown'
+            assessments = New-OwnerV2UnknownEvidenceAssessments `
+                -EvidenceUnits $units -BindingId $bindingId
+            diagnostics = @($diagnostics)
+        }
+    }
+
+    $ruleData = $ruleUnits[0].data
+    $ruleRef = 'rule:' + (Get-OwnerV2Digest -Value ([ordered]@{
+                repositoryId = $ruleData.repositoryId
+                path = $ruleData.path
+                commit = $ruleData.commit
+                section = $ruleData.section
+                hash = $ruleData.hash
+            })).Substring(10)
+    $assessments = [Collections.Generic.List[object]]::new()
+    [void]$assessments.Add([ordered]@{
+            assessmentId =
+                'binding:' + (Get-OwnerV2Digest -Value "$bindingId|$ruleRef").
+                    Substring(10)
+            evidenceUnitIds = @('identity', 'rule')
+            state = 'complete'
+            findings = @()
+        })
+    $constructCount = 0
+    foreach ($file in $files) {
+        $id = [string]$file.unitId
+        $data = $file.data
+        $path = [string](Get-OwnerV2Member -Value $data -Name path)
+        $evidenceIds = @('identity', 'rule', $id)
+        $spans = if ($data -is [Collections.IDictionary]) {
+            @(Get-OwnerV2Member -Value $data -Name spans)
+        }
+        else { @() }
+        if ([string]$file.state -cne 'complete' -or
+            $data -isnot [Collections.IDictionary] -or
+            $data.content -isnot [string] -or
+            [string]::IsNullOrWhiteSpace($path) -or
+            ($path.EndsWith('.cs', [StringComparison]::OrdinalIgnoreCase) -and
+                ($spans.Count -eq 0 -or
+                    @($spans | Where-Object {
+                            [string]$_.state -cne 'complete'
+                        }).Count -gt 0))) {
+            [void]$assessments.Add([ordered]@{
+                    assessmentId =
+                        'file:' + (Get-OwnerV2Digest -Value "$bindingId|$id").
+                            Substring(10)
+                    evidenceUnitIds = $evidenceIds
+                    state = 'unknown'
+                    data = [ordered]@{
+                        state = 'uncovered'
+                        reason = 'file-evidence-unavailable'
+                        constructRef =
+                            'file:' + (Get-OwnerV2Digest `
+                                -Value "$bindingId|$id").Substring(10)
+                    }
+                    findings = @()
+                })
+            continue
+        }
+        $constructs = @()
+        if ($path.EndsWith('.cs', [StringComparison]::OrdinalIgnoreCase)) {
+            $constructs = @(Get-NamedAreEqualConstructs `
+                    -Content ([string]$data.content) -Spans $spans -Path $path)
+        }
+        if ($constructCount + $constructs.Count -gt
+            $Limits.MaximumSemanticUnits) {
+            Add-OwnerV2Diagnostic -Diagnostics $diagnostics -Limits $Limits `
+                -Code 'named-areequal-construct-cap-exhausted' `
+                -Message 'Changed assertion methods exceed the bounded construct capacity.' `
+                -UnitId $id
+            [void]$assessments.Add([ordered]@{
+                    assessmentId =
+                        'file:' + (Get-OwnerV2Digest -Value "$bindingId|$id").
+                            Substring(10)
+                    evidenceUnitIds = $evidenceIds
+                    state = 'unknown'
+                    data = [ordered]@{
+                        state = 'uncovered'
+                        reason = 'named-areequal-construct-cap-exhausted'
+                        constructRef =
+                            'file:' + (Get-OwnerV2Digest `
+                                -Value "$bindingId|$id").Substring(10)
+                    }
+                    findings = @()
+                })
+            continue
+        }
+        $constructCount += $constructs.Count
+        if ($constructs.Count -eq 0) {
+            [void]$assessments.Add([ordered]@{
+                    assessmentId =
+                        'file:' + (Get-OwnerV2Digest -Value "$bindingId|$id").
+                            Substring(10)
+                    evidenceUnitIds = $evidenceIds
+                    state = 'complete'
+                    findings = @()
+                })
+        }
+        foreach ($construct in $constructs) {
+            $material = [ordered]@{
+                bindingId = $bindingId
+                evidenceDigest = $evidenceDigest
+                capabilityId = $script:NamedAreEqualCapability
+                capabilityDigest = $CapabilityDigest
+                ruleRef = $ruleRef
+                evidenceUnitId = $id
+                path = $path
+                name = [string]$construct.name
+                startLine = [int]$construct.startLine
+                declarationLine = [int]$construct.declarationLine
+                endLine = [int]$construct.endLine
+                recognized = [bool]$construct.recognized
+                affectedCallCount = [int]$construct.affectedCallCount
+                affectedCallLines = @($construct.affectedCallLines)
+            }
+            $digest = (Get-OwnerV2Digest -Value $material).Substring(10)
+            $constructRef = "construct:$digest"
+            $assessmentId = "method:n:$digest"
+            $resolved = [bool]$construct.recognized -and
+                -not [string]::IsNullOrWhiteSpace([string]$construct.name) -and
+                [int]$construct.declarationLine -ge 1
+            $state = if (-not $resolved) {
+                'unknown'
+            }
+            elseif ([bool]$construct.hasPositional) {
+                'violation'
+            }
+            else { 'compliant' }
+            $finding = @()
+            if ($state -ceq 'violation') {
+                $findingData = [ordered]@{
+                    disposition = 'violation'
+                    eligibility = 'changed-assert-areequal-test-method'
+                    capabilityId = $script:NamedAreEqualCapability
+                    bindingId = $bindingId
+                    evidenceDigest = $evidenceDigest
+                    ruleRef = $ruleRef
+                    constructRef = $constructRef
+                    groupRef = $assessmentId
+                    headCommit = [string]$identityUnits[0].data.sourceCommit
+                    anchor = [ordered]@{
+                        path = $path
+                        line = [int]$construct.startLine
+                        symbol = [string]$construct.name
+                    }
+                    affectedCallCount = [int]$construct.affectedCallCount
+                    affectedCallLines = @($construct.affectedCallLines)
+                    callListTruncated = [bool]$construct.callListTruncated
+                }
+                $finding = @([ordered]@{
+                        findingId = 'named-areequal-v2:' +
+                            (Get-OwnerV2Digest -Value ([ordered]@{
+                                    bindingId = $bindingId
+                                    capabilityId =
+                                        $script:NamedAreEqualCapability
+                                    ruleRef = $ruleRef
+                                    constructRef = $constructRef
+                                    disposition = 'violation'
+                                })).Substring(10)
+                        summary =
+                            'Changed Assert.AreEqual calls in this test method require named arguments.'
+                        data = $findingData
+                    })
+            }
+            $outcomeData = if ($state -ceq 'violation') {
+                $null
+            }
+            else {
+                [ordered]@{
+                    state = $state
+                    reason = [string]$construct.reason
+                    constructRef = $constructRef
+                    path = $path
+                    startLine = [int]$construct.startLine
+                    endLine = [int]$construct.endLine
+                    symbol = $(if ($resolved) {
+                            [string]$construct.name
+                        } else { 'unrecognized' })
+                    affectedCallCount = [int]$construct.affectedCallCount
+                }
+            }
+            [void]$assessments.Add([ordered]@{
+                    assessmentId = $assessmentId
+                    evidenceUnitIds = $evidenceIds
+                    state = $(if ($state -ceq 'unknown') {
+                            'unknown'
+                        } else { 'complete' })
+                    data = $outcomeData
+                    findings = $finding
+                })
+        }
+    }
+    return [ordered]@{
+        schemaVersion = 1
+        bindingId = $bindingId
+        state = $(if (@($assessments | Where-Object {
+                        $_.state -ceq 'unknown'
+                    }).Count) {
+                'unknown'
+            }
+            else { 'complete' })
+        assessments = @($assessments)
+        diagnostics = @($diagnostics)
+    }
+}
+
+function New-NamedAreEqualCapabilityAdapter {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CapabilityId,
+        [Parameter(Mandatory)][string]$CapabilityDigest,
+        [DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits =
+            (New-OwnerV2CapabilityLimits)
+    )
+
+    if ($CapabilityId -cne $script:NamedAreEqualCapability -or
+        $CapabilityDigest -cne $script:NamedAreEqualDigest) {
+        throw 'Named AreEqual capability identity or digest is invalid.'
+    }
+    $capturedDigest = $CapabilityDigest
+    $capturedLimits = $Limits
+    $command = Get-Command Invoke-NamedAreEqualCapabilityResponse `
+        -CommandType Function
+    return New-OwnerPipelineAdapter -Stage capability `
+        -Name 'named-areequal-v1-capability' -Handler {
+        param($context)
+        return & $command -Context $context `
+            -CapabilityDigest $capturedDigest -Limits $capturedLimits
+    }.GetNewClosure()
+}
+
 function New-OwnerV2CapabilityAdapter {
     [CmdletBinding()]
     param(
@@ -1698,8 +2395,11 @@ function ConvertTo-OwnerV2Observation {
     $identity = Get-OwnerV2Member -Value $identityUnit -Name data
     $rule = Get-OwnerV2Member -Value $ruleUnit -Name data
     $assessments = @(Get-OwnerV2Member -Value $validation -Name assessments)
+    $capabilityId = [string](Get-OwnerV2Member -Value $identity -Name capabilityId)
+    $namedAreEqual = $capabilityId -ceq $script:NamedAreEqualCapability
     $methodAssessments = @($assessments | Where-Object {
-            [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'method:*'
+            [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like
+                $(if ($namedAreEqual) { 'method:n:*' } else { 'method:*' })
         })
     $outcomeAssessments = @($assessments | Where-Object {
             $null -ne (Get-OwnerV2Member -Value $_ -Name data)
@@ -1748,7 +2448,7 @@ function ConvertTo-OwnerV2Observation {
             -EndLine ([int](Get-OwnerV2Member -Value $anchor -Name line)) `
             -Symbol ([string](Get-OwnerV2Member -Value $anchor -Name symbol)) `
             -ConstructIdentity $constructRef
-        [void]$normalizedFindings.Add([ordered]@{
+        $normalizedFinding = [ordered]@{
                 identity = [string](Get-OwnerV2Member -Value $finding -Name findingId)
                 semanticKey = Get-OwnerSemanticFindingKey `
                     -Subject $observationSubject -Rule $observationRule `
@@ -1764,7 +2464,16 @@ function ConvertTo-OwnerV2Observation {
                     symbol = [string](Get-OwnerV2Member -Value $anchor -Name symbol)
                 }
                 binding = $binding
-            })
+            }
+        if ($namedAreEqual) {
+            $normalizedFinding.affectedCallCount =
+                [int](Get-OwnerV2Member -Value $data -Name affectedCallCount)
+            $normalizedFinding.affectedCallLines =
+                @(Get-OwnerV2Member -Value $data -Name affectedCallLines)
+            $normalizedFinding.callListTruncated =
+                [bool](Get-OwnerV2Member -Value $data -Name callListTruncated)
+        }
+        [void]$normalizedFindings.Add($normalizedFinding)
     }
     $normalizedOutcomes = [Collections.Generic.List[object]]::new()
     foreach ($assessment in $outcomeAssessments) {
@@ -1794,7 +2503,7 @@ function ConvertTo-OwnerV2Observation {
         else {
             'unknown'
         }
-        [void]$normalizedOutcomes.Add([ordered]@{
+        $normalizedOutcome = [ordered]@{
                 identity = 'owner-v2-outcome:' + (Get-OwnerV2Digest -Value ([ordered]@{
                             bindingId = [string](Get-OwnerV2Member -Value $validation -Name bindingId)
                             capabilityId = [string](Get-OwnerV2Member -Value $identity -Name capabilityId)
@@ -1812,7 +2521,12 @@ function ConvertTo-OwnerV2Observation {
                 constructRef = $constructRef
                 binding = $binding
                 writerEligible = $false
-            })
+            }
+        if ($namedAreEqual) {
+            $normalizedOutcome.affectedCallCount =
+                [int](Get-OwnerV2Member -Value $outcome -Name affectedCallCount)
+        }
+        [void]$normalizedOutcomes.Add($normalizedOutcome)
     }
     $sortedFindings = @($normalizedFindings | Sort-Object identity)
     $sortedOutcomes = @($normalizedOutcomes | Sort-Object identity)
@@ -1825,10 +2539,12 @@ function ConvertTo-OwnerV2Observation {
     $runnerAttemptCount = @($methodAssessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'method:r:*'
         }).Count
-    $modelStarts = 'unknown'
-    $modelStartsReason = 'runner-telemetry-not-requested'
-    $latencyMs = 'unknown'
-    $refusalReason = 'unknown'
+    $modelStarts = $(if ($namedAreEqual) { 0 } else { 'unknown' })
+    $modelStartsReason = $(if ($namedAreEqual) {
+            'deterministic-rule-no-model'
+        } else { 'runner-telemetry-not-requested' })
+    $latencyMs = $(if ($namedAreEqual) { 0 } else { 'unknown' })
+    $refusalReason = $(if ($namedAreEqual) { 'none' } else { 'unknown' })
     if ($null -ne $Runner) {
         Test-OwnerV2Runner -Runner $Runner
         if ($null -eq $Runner.PSObject.Properties['TelemetryProvider']) {
@@ -1998,8 +2714,11 @@ function ConvertTo-OwnerV2Observation {
 
 Export-ModuleMember -Function @(
     'ConvertTo-OwnerV2Observation',
+    'Format-NamedAreEqualComment',
     'Format-OwnerV1WriterComment',
+    'Get-NamedAreEqualMarkerKey',
     'Get-OwnerV1WriterMarkerKey',
+    'New-NamedAreEqualCapabilityAdapter',
     'New-OwnerSemanticRunner',
     'New-OwnerV2CapabilityAdapter',
     'New-OwnerV2CapabilityLimits',

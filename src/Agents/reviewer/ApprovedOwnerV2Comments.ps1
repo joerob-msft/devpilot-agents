@@ -5,6 +5,9 @@ $ErrorActionPreference = 'Stop'
 
 $script:ApprovedOwnerV2SchemaVersion = 1
 $script:ApprovedOwnerV2Capability = 'bpm-test-ownership@1'
+$script:ApprovedNamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
+$script:ApprovedNamedAreEqualPolicyPath =
+    'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
 $script:ApprovedOwnerV2MaximumSelections = 5
@@ -119,7 +122,9 @@ function Assert-ApprovedOwnerV2Record {
         [Parameter(Mandatory)][Collections.IDictionary]$Record,
         [Parameter(Mandatory)][Collections.IDictionary]$Declaration,
         [Parameter(Mandatory)][string]$Identity,
-        [Parameter(Mandatory)][Collections.IDictionary]$Observation
+        [Parameter(Mandatory)][Collections.IDictionary]$Observation,
+        [ValidateSet('attempted', 'notAttempted')]
+        [string]$ExpectedModelExecutionState = 'attempted'
     )
     $expected = @(
         'schemaVersion', 'kind', 'identity', 'stateDigest', 'mode', 'capabilityId',
@@ -138,7 +143,8 @@ function Assert-ApprovedOwnerV2Record {
         throw 'Owner v2 record is not one exact completed record.'
     }
     if ([int]$Record.schemaVersion -eq 2 -and
-        [string]$Record.modelExecutionState -cne 'attempted') {
+        [string]$Record.modelExecutionState -cne
+            $ExpectedModelExecutionState) {
         throw 'Completed Owner v2 record has an unexpected model execution state.'
     }
     $bindings = [ordered]@{
@@ -205,13 +211,20 @@ function Read-ApprovedOwnerV2Evidence {
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$Identity,
         [Parameter(Mandatory)][string]$RepoRoot,
-        [Parameter(Mandatory)][string]$ToolkitConfigPath
+        [Parameter(Mandatory)][string]$ToolkitConfigPath,
+        [ValidateSet('owner', 'named-areequal')]
+        [string]$Delivery = 'owner'
     )
     $state = [IO.Path]::GetFullPath($StateRoot)
+    $namedAreEqual = $Delivery -ceq 'named-areequal'
+    $expectedCapability = if ($namedAreEqual) {
+        $script:ApprovedNamedAreEqualCapability
+    }
+    else { $script:ApprovedOwnerV2Capability }
     $toolkitConfig = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
     $capability = $toolkitConfig.capability
     if ($capability -isnot [Collections.IDictionary] -or
-        [string]$capability.id -cne $script:ApprovedOwnerV2Capability -or
+        [string]$capability.id -cne $expectedCapability -or
         [string]$capability.implementationSha256 -cnotmatch '^[0-9a-f]{64}$') {
         throw 'Toolkit config has no exact Owner v2 capability binding.'
     }
@@ -252,11 +265,26 @@ function Read-ApprovedOwnerV2Evidence {
     $pin = Read-ApprovedOwnerV2Json $evidencePath
     $record = Read-ApprovedOwnerV2Json $recordPath
     $observation = Read-ApprovedOwnerV2Json $observationPath
-    $telemetry = Read-ApprovedOwnerV2Json $telemetryPath
+    $telemetry = if ($namedAreEqual) {
+        if (Test-Path -LiteralPath $telemetryPath -PathType Leaf) {
+            throw 'Model-free named AreEqual state unexpectedly contains telemetry.'
+        }
+        $null
+    }
+    else {
+        Read-ApprovedOwnerV2Json $telemetryPath
+    }
 
     if ([string]$declaration.kind -cne 'owner-v2-preview-declaration' -or
         [string]$declaration.mode -cne 'live' -or
-        [string]$declaration.capability.id -cne $script:ApprovedOwnerV2Capability -or
+        [string]$declaration.capability.id -cne $expectedCapability -or
+        ($namedAreEqual -and (
+            [string]$declaration.rule.path -cne
+                $script:ApprovedNamedAreEqualPolicyPath -or
+            [string]$declaration.rule.section -cne
+                $script:ApprovedNamedAreEqualCapability -or
+            [string]$declaration.config.id -cne
+                'named-areequal-arguments-v1-user-approved')) -or
         [string]$declaration.capability.digest -cne $capabilityDigest -or
         [string]$declaration.subject.projectId -cne
         [string]$subjectProvider.projectId -or
@@ -270,17 +298,22 @@ function Read-ApprovedOwnerV2Evidence {
     }
     if ([int]$observation.schemaVersion -ne 2 -or
         [string]$observation.kind -cne 'owner-observation' -or
-        [string]$observation.capability -cne $script:ApprovedOwnerV2Capability -or
+        [string]$observation.capability -cne $expectedCapability -or
         [string]$observation.lifecycle.status -cne 'completed' -or
         -not [bool]$observation.findingsComplete -or
         [int]$observation.counts.unknown -ne 0 -or
         [int]$observation.counts.uncovered -ne 0 -or
         [int]$observation.effects.providerWrites -ne 0 -or
-        [int]$observation.effects.writeToolInvocations -ne 0) {
+        [int]$observation.effects.writeToolInvocations -ne 0 -or
+        ($namedAreEqual -and
+            [int]$observation.execution.modelStarts -ne 0)) {
         throw 'Owner v2 observation is not a completed zero-write actionable result.'
     }
     Assert-ApprovedOwnerV2Record -Record $record -Declaration $declaration `
-        -Identity $Identity -Observation $observation
+        -Identity $Identity -Observation $observation `
+        -ExpectedModelExecutionState $(if ($namedAreEqual) {
+            'notAttempted'
+        } else { 'attempted' })
     $contract = New-ApprovedOwnerV2Contract -Declaration $declaration
     foreach ($entry in ([ordered]@{
             bindingId = $contract.Binding.BindingId
@@ -375,8 +408,69 @@ function Read-ApprovedOwnerV2Evidence {
 function Get-ApprovedOwnerV2Proposal {
     param(
         [Parameter(Mandatory)]$Evidence,
-        [Parameter(Mandatory)][Collections.IDictionary]$Finding
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [ValidateSet('owner', 'named-areequal')]
+        [string]$Delivery = 'owner'
     )
+    if ($Delivery -ceq 'named-areequal') {
+        if ([string]$Evidence.Declaration.capability.id -cne
+                $script:ApprovedNamedAreEqualCapability -or
+            [string]$Finding.identity -cnotmatch
+                '^named-areequal-v2:[0-9a-f]{64}$' -or
+            [string]$Finding.disposition -cne 'violation' -or
+            [string]$Finding.constructRef -cnotmatch
+                '^construct:[0-9a-f]{64}$' -or
+            $Finding.binding -isnot [Collections.IDictionary] -or
+            $Finding.anchor -isnot [Collections.IDictionary]) {
+            throw 'Only exact named AreEqual method findings are writer eligible.'
+        }
+        $source = $Finding.binding.source.representation
+        if ($source -isnot [Collections.IDictionary] -or
+            [string]$source.constructIdentity -cne
+                [string]$Finding.constructRef -or
+            [string]$source.path -cne [string]$Finding.anchor.path -or
+            [string]$source.symbol -cne [string]$Finding.anchor.symbol -or
+            [int]$source.startLine -ne [int]$Finding.anchor.line -or
+            [int]$source.endLine -ne [int]$Finding.anchor.line) {
+            throw 'Named AreEqual finding is not one exact method anchor.'
+        }
+        $classification = [string]$Finding.reconciliation.classification
+        if ($classification -cnotin @(
+                'wouldCreate', 'noOp', 'humanCovered')) {
+            throw 'Named AreEqual finding is not safely actionable.'
+        }
+        $marker = Get-NamedAreEqualMarkerKey `
+            -Contract $Evidence.Contract -Finding $Finding
+        $body = Format-NamedAreEqualComment `
+            -Contract $Evidence.Contract -Finding $Finding -MarkerKey $marker
+        $bodySha256 = Get-ApprovedOwnerV2TextSha256 $body
+        if ([string]$Finding.reconciliation.bodySha256 -cne
+                $bodySha256 -or
+            [string]$Finding.providerMarker.integrity -cne 'verified' -or
+            [string]$Finding.providerMarker.sha256 -cne
+                (Get-ApprovedOwnerV2TextSha256 $marker)) {
+            throw "Named AreEqual finding '$($Finding.identity)' does not match the exact formatter contract."
+        }
+        return [ordered]@{
+            findingId = [string]$Finding.identity
+            semanticKey = [string]$Finding.semanticKey
+            constructRef = [string]$Finding.constructRef
+            constructIdentity = [string]$Finding.binding.constructIdentity
+            path = [string]$Finding.anchor.path
+            line = [int]$Finding.anchor.line
+            symbol = [string]$Finding.anchor.symbol
+            marker = $marker
+            markerComment =
+                "<!-- devpilot-named-areequal:v1:$marker -->"
+            body = $body
+            bodySha256 = $bodySha256
+            classification = $classification
+            rationale = [string]$Finding.reconciliation.reason
+            affectedCallCount = [int]$Finding.affectedCallCount
+            affectedCallLines = @($Finding.affectedCallLines)
+            callListTruncated = [bool]$Finding.callListTruncated
+        }
+    }
     if ([string]$Finding.identity -notmatch '^owner-v2:[0-9a-f]{64}$' -or
         [string]$Finding.disposition -cne 'violation' -or
         [string]$Finding.constructRef -notmatch '^construct:[0-9a-f]{64}$' -or
@@ -768,13 +862,14 @@ function Assert-ApprovedOwnerV2ApprovalCurrent {
 function Get-ApprovedOwnerV2MarkerEntries {
     param(
         [Parameter(Mandatory)]$Snapshot,
-        [Parameter(Mandatory)][string]$Marker
+        [Parameter(Mandatory)][string]$Marker,
+        [string]$Pattern = $script:ApprovedOwnerV2MarkerPattern
     )
     $entries = [Collections.Generic.List[object]]::new()
     foreach ($thread in @($Snapshot.Threads)) {
         foreach ($comment in @($thread.comments)) {
             foreach ($match in [regex]::Matches(
-                    [string]$comment.body, $script:ApprovedOwnerV2MarkerPattern)) {
+                    [string]$comment.body, $Pattern)) {
                 if ([string]$match.Groups[1].Value -ceq $Marker) {
                     [void]$entries.Add([pscustomobject]@{
                             Thread = $thread
@@ -793,7 +888,9 @@ function Assert-ApprovedOwnerV2LiveRead {
         [Parameter(Mandatory)][Collections.IDictionary]$Approval,
         [Parameter(Mandatory)]$Live,
         [Parameter(Mandatory)][object[]]$Selections,
-        [Parameter(Mandatory)][string]$ExpectedSnapshotSha256
+        [Parameter(Mandatory)][string]$ExpectedSnapshotSha256,
+        [ValidateSet('owner', 'named-areequal')]
+        [string]$Delivery = 'owner'
     )
     $subject = $Approval.subject
     $pr = $Live.PullRequest
@@ -821,6 +918,7 @@ function Assert-ApprovedOwnerV2LiveRead {
         throw 'Live discussion snapshot changed; require a fresh scheduled observation and approval.'
     }
     foreach ($selection in $Selections) {
+        $namedAreEqual = $Delivery -ceq 'named-areequal'
         $anchors = @($Live.Anchors | Where-Object {
                 [string]$_.path -ieq [string]$selection.path -and
                 [int]$selection.line -ge [int]$_.startLine -and
@@ -829,8 +927,25 @@ function Assert-ApprovedOwnerV2LiveRead {
         if ($anchors.Count -ne 1 -or [int]$anchors[0].changeTrackingId -lt 1) {
             throw "Anchor '$($selection.path):$($selection.line)' is stale or ambiguous."
         }
+        if ($namedAreEqual) {
+            foreach ($line in @($selection.affectedCallLines)) {
+                $lineAnchors = @($Live.Anchors | Where-Object {
+                        [string]$_.path -ieq [string]$selection.path -and
+                        [int]$line -ge [int]$_.startLine -and
+                        [int]$line -le [int]$_.endLine
+                    })
+                if ($lineAnchors.Count -ne 1 -or
+                    [int]$lineAnchors[0].changeTrackingId -lt 1 -or
+                    [int]$lineAnchors[0].iterationId -ne
+                        [int]$Live.Snapshot.CurrentIterationId) {
+                    throw "Named AreEqual call '$($selection.path):$line' is stale or ambiguous."
+                }
+            }
+        }
         $entries = @(Get-ApprovedOwnerV2MarkerEntries -Snapshot $Live.Snapshot `
-                -Marker ([string]$selection.marker))
+                -Marker ([string]$selection.marker) -Pattern $(if ($namedAreEqual) {
+                    '<!--\s*devpilot-named-areequal:v1:([0-9a-f]{64})\s*-->'
+                } else { $script:ApprovedOwnerV2MarkerPattern }))
         if (@($entries | Where-Object {
                     -not [bool]$_.Comment.reviewerOwned -or
                     [string]$_.Comment.reviewerIdentityState -cne 'matched'
@@ -851,6 +966,7 @@ function Assert-ApprovedOwnerV2LiveRead {
                 ConvertFrom-Json -AsHashtable -Depth 32)
     }
     $mini = [ordered]@{
+        capability = [string]$Evidence.Observation.capability
         lifecycle = [ordered]@{ status = 'completed' }
         findings = $selectedFindings
         effects = [ordered]@{

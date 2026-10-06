@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "enabled": false,
+  "readOnly": true,
+  "dryRun": true,
+  "organization": "https://dev.azure.com/example-org",
+  "projectName": "ExampleProject",
+  "projectId": "22222222-2222-2222-2222-222222222222",
+  "repositoryId": "11111111-1111-1111-1111-111111111111",
+  "expectedAccount": {
+    "id": "33333333-3333-3333-3333-333333333333",
+    "descriptor": "aad.synthetic-service-account",
+    "uniqueName": "service@example.invalid"
+  },
+  "automationMarker": "[DevPilot-Automation:v1]",
+  "rules": [
+    {
+      "id": "bpm-named-areequal-arguments@1",
+      "capability": "bpm-named-areequal-arguments@1"
+    }
+  ],
+  "namedRule": {
+    "repositoryId": "devpilot-agents",
+    "path": "src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt",
+    "section": "bpm-named-areequal-arguments@1",
+    "hash": "v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4",
+    "length": 653
+  },
+  "toolkit": {
+    "ref": "refs/heads/example-named-rule",
+    "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "subjectProvider": {
+    "kind": "azure-devops-read-only-v1",
+    "organization": "https://dev.azure.com/example-org",
+    "projectName": "ExampleProject",
+    "projectId": "22222222-2222-2222-2222-222222222222",
+    "repositoryName": "ExampleRepository",
+    "repositoryId": "11111111-1111-1111-1111-111111111111",
+    "maximumFiles": 64,
+    "maximumBytes": 16777216,
+    "maximumReads": 128
+  },
+  "discussionProvider": {
+    "kind": "azure-devops-rest-owner-discussions-v1",
+    "mappingDigest": "v1:sha256:6d876e001cfd64dabb2e905287041caf0ee77a7ec713f767cf76ad2ef4c94d2d",
+    "reviewerIdentity": {
+      "id": "33333333-3333-3333-3333-333333333333",
+      "descriptor": "aad.synthetic-service-account",
+      "uniqueName": "service@example.invalid",
+      "digest": "v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "capability": {
+    "id": "bpm-named-areequal-arguments@1",
+    "implementationSha256": "7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a"
+  },
+  "autoCreateNamedAreEqualComments": false,
+  "limits": {
+    "pageSize": 50,
+    "maxPages": 512,
+    "maxPullRequests": 2000,
+    "maxHeadsPerRun": 2,
+    "maxReads": 3000,
+    "maxSeconds": 240,
+    "maxChangedFiles": 64,
+    "maxChangedLines": 5000,
+    "maxThreads": 500,
+    "maxComments": 2000
+  }
+}
