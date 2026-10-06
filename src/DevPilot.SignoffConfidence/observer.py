@@ -22,12 +22,17 @@ from replay import (CapabilityError, Cancelled, FixtureProvider, assert_output_r
 COLLECTOR_TIMEOUT_SECONDS = 660
 MAX_SWEEP_PAGES = 10000
 MAX_SWEEP_FAILURES = 3
+MAX_TRANSIENT_TRANSPORT_FAILURES = 12
 MAX_NO_PROGRESS_PAGES = 3
 REFRESH_MAX_AGE_SECONDS = 300
 
 
 class StudyIntegrityError(ContractError):
     """A deterministic frozen-study violation that must not be retried."""
+
+
+class TransientCollectorTransportError(ContractError):
+    """A safe, explicitly classified collector transport-start failure."""
 
 
 def utc_now() -> str:
@@ -595,6 +600,16 @@ async def collect_page(config: dict[str, Any], request: dict[str, Any], folder: 
                 except TimeoutError:
                     continue
         if process.returncode:
+            receipt_path = folder / "response.audit" / "collection-failed.json"
+            if receipt_path.is_file():
+                try:
+                    receipt = load_json(receipt_path)
+                except (ContractError, OSError, ValueError):
+                    receipt = None
+                if (isinstance(receipt, dict)
+                        and receipt.get("code") == "TRANSIENT_TRANSPORT_UNAVAILABLE"
+                        and receipt.get("phase") == "transport-open"):
+                    raise TransientCollectorTransportError("COLLECTOR_TRANSPORT_UNAVAILABLE")
             raise ContractError("COLLECTOR_EXIT_" + str(process.returncode))
         page = load_json(output_path)
         validate_page(page, request)
@@ -669,6 +684,15 @@ async def capture_chunk(ledger: Ledger, config: dict[str, Any], pipeline: str, p
                            "Frozen guidance changed; preserve this study and initialize a new one.", now())
                 ledger.save_progress(state, now())
             break
+        except TransientCollectorTransportError:
+            failures = state["failures"] + 1 if state["reason"] == "COLLECTOR_TRANSPORT_UNAVAILABLE" else 1
+            state = {**state, "failures": failures, "reason": "COLLECTOR_TRANSPORT_UNAVAILABLE",
+                     "phase": "blocked" if failures >= MAX_TRANSIENT_TRANSPORT_FAILURES else state["phase"]}
+            with ledger.db:
+                ledger.gap("COLLECTOR_TRANSPORT_UNAVAILABLE", None,
+                           "Collector transport startup was temporarily unavailable; the same cursor remains pending.", now())
+                ledger.save_progress(state, now())
+            break
         except CapabilityError:
             failures = state["failures"] + 1
             with ledger.db:
@@ -676,7 +700,7 @@ async def capture_chunk(ledger: Ledger, config: dict[str, Any], pipeline: str, p
                                       "phase": "blocked" if failures >= MAX_SWEEP_FAILURES else state["phase"]}, now())
             raise
         except (ContractError, OSError) as error:
-            failures = state["failures"] + 1
+            failures = state["failures"] + 1 if state["reason"] == "CAPTURE_FAILED" else 1
             state = {**state, "failures": failures, "reason": "CAPTURE_FAILED",
                      "phase": "blocked" if failures >= MAX_SWEEP_FAILURES else state["phase"]}
             with ledger.db:

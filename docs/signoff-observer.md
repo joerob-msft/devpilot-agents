@@ -252,6 +252,12 @@ Successful pages reset the consecutive failure count. Three consecutive
 collector failures/interrupted attempts, a repeated continuation token, three
 consecutive repetitions of page membership, or 10,000 nonterminal inventory
 pages block the sweep explicitly. These are guards, **never completion**.
+An allowlisted MCP transport-start timeout, closed startup session, or upstream
+transport error uses a separate budget of twelve consecutive polling cycles
+before blocking; at the default 900-second poll this allows up to three hours
+for external transport recovery. Any successful page resets that counter.
+Deterministic collector/contract failures retain the three-strike budget, and
+changing failure classes starts the applicable counter at one.
 Frozen-guidance drift is a deterministic study-integrity failure and blocks
 immediately without consuming the transient collector retry budget. Preserve
 that study and initialize a new one; never continue with mixed guidance bytes.

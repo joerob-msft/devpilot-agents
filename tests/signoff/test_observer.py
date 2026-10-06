@@ -13,7 +13,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from test_replay import FakeProvider, answer, bundle
 from contracts import ContractError, canonical, digest, make_prompt
-from observer import (COLLECTOR_TIMEOUT_SECONDS, Ledger, StudyIntegrityError, assess_pending, collect_page,
+from observer import (COLLECTOR_TIMEOUT_SECONDS, Ledger, StudyIntegrityError,
+                      TransientCollectorTransportError, assess_pending, collect_page,
                       import_adjudication, persist_report, report, snapshot_key)
 from observer_contracts import file_hash, validate_config, validate_page
 from replay import Cancelled, CapabilityError, exclusive_output
@@ -147,6 +148,25 @@ class ObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(COLLECTOR_TIMEOUT_SECONDS, 600 + 60)
         process.kill.assert_not_called()
         self.assertFalse((folder / "collector.interruption.json").exists())
+
+    async def test_collector_accepts_only_safe_transport_failure_receipts(self):
+        request, _ = capture()
+        for code, phase, expected in (
+            ("TRANSIENT_TRANSPORT_UNAVAILABLE", "transport-open", TransientCollectorTransportError),
+            ("COLLECTION_FAILED", "transport-open", ContractError),
+            ("TRANSIENT_TRANSPORT_UNAVAILABLE", "capture", ContractError),
+        ):
+            with self.subTest(code=code, phase=phase):
+                folder = self.root / (code + "-" + phase)
+                (folder / "response.audit").mkdir(parents=True)
+                (folder / "response.audit" / "collection-failed.json").write_text(canonical({
+                    "code": code, "phase": phase, "exceptionType": "RuntimeException",
+                    "calls": None, "reason": "Safe synthetic receipt.",
+                }), encoding="utf-8")
+                process = Mock(returncode=1, wait=AsyncMock(return_value=1))
+                with patch("observer.asyncio.create_subprocess_exec", AsyncMock(return_value=process)), \
+                        self.assertRaises(expected):
+                    await collect_page(self.config, request, folder, self.root, "unused-pwsh", None)
 
     async def test_collector_timeout_and_cancellation_keep_containment_fail_closed(self):
         for cause, code in ((TimeoutError(), "COLLECTOR_TIMEOUT"),

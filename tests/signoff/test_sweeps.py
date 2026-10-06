@@ -11,7 +11,8 @@ from unittest.mock import AsyncMock, patch
 
 from test_replay import FakeProvider
 from contracts import ContractError, canonical, digest
-from observer import Ledger, capture_chunk, persist_report, report
+from observer import (MAX_TRANSIENT_TRANSPORT_FAILURES, Ledger, TransientCollectorTransportError,
+                      capture_chunk, persist_report, report)
 from observer_contracts import validate, validate_page
 from replay import Cancelled, CapabilityError
 from test_observer import FROZEN, capture, time_at
@@ -136,6 +137,48 @@ class SweepTests(unittest.IsolatedAsyncioTestCase):
         unused.assert_not_called()
         self.assertEqual(self.count("sweep_attempts"), 4)
         self.assertEqual(self.count("admissions"), 0)
+
+    async def test_transient_transport_failures_use_longer_budget_and_recover(self):
+        self.config["maxPages"] = 1
+        state = await self.chunk()
+        for failures in range(1, 4):
+            self.restart()
+            state = await self.chunk(AsyncMock(side_effect=TransientCollectorTransportError(
+                "COLLECTOR_TRANSPORT_UNAVAILABLE")))
+            self.assertEqual(state["cursor"], "active:10")
+            self.assertEqual((state["failures"], state["reason"], state["phase"]),
+                             (failures, "COLLECTOR_TRANSPORT_UNAVAILABLE", "inventory"))
+        self.restart()
+        recovered = await self.chunk()
+        self.assertEqual((recovered["failures"], recovered["reason"]), (0, None))
+        self.assertEqual(recovered["cursor"], "active:20")
+
+    async def test_transient_transport_failures_block_at_separate_threshold(self):
+        self.config["maxPages"] = 1
+        await self.chunk()
+        for failures in range(1, MAX_TRANSIENT_TRANSPORT_FAILURES + 1):
+            self.restart()
+            state = await self.chunk(AsyncMock(side_effect=TransientCollectorTransportError(
+                "COLLECTOR_TRANSPORT_UNAVAILABLE")))
+            self.assertEqual(state["failures"], failures)
+        self.assertEqual((state["phase"], state["reason"]),
+                         ("blocked", "COLLECTOR_TRANSPORT_UNAVAILABLE"))
+        unused = AsyncMock()
+        await self.chunk(unused)
+        unused.assert_not_called()
+
+    async def test_failure_class_change_starts_the_new_counter_at_one(self):
+        self.config["maxPages"] = 1
+        await self.chunk()
+        self.restart()
+        transient = await self.chunk(AsyncMock(side_effect=TransientCollectorTransportError(
+            "COLLECTOR_TRANSPORT_UNAVAILABLE")))
+        self.assertEqual((transient["failures"], transient["reason"]),
+                         (1, "COLLECTOR_TRANSPORT_UNAVAILABLE"))
+        self.restart()
+        deterministic = await self.chunk(AsyncMock(side_effect=ContractError("COLLECTOR_EXIT_42")))
+        self.assertEqual((deterministic["failures"], deterministic["reason"], deterministic["phase"]),
+                         (1, "CAPTURE_FAILED", "inventory"))
 
     async def test_guidance_drift_blocks_immediately_without_retry(self):
         self.size = 1
