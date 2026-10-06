@@ -370,7 +370,7 @@ function Get-NamedAreEqualConstructs {
         if ($previous -cin @(
                 'class', 'struct', 'record', 'interface', 'enum', 'var') -or
             ($previous -cmatch '^@?[\p{L}_][\p{L}\p{N}_]*$' -and
-                $next -in @('=', ';', ',', ')', '{', '('))) {
+                $next -in @('=', '=>', ';', ',', ')', '{', '('))) {
             $assertShadowed = $true
             break
         }

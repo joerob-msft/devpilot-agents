@@ -220,6 +220,25 @@ class Checks {
         $result.Observation.effects.providerWrites | Should -Be 0
     }
 
+    It 'keeps an expression-bodied Assert property unknown and non-actionable' {
+        $source = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+class Foreign { public void AreEqual(int expected, int actual) {} }
+[TestClass]
+class Checks {
+    private Foreign Assert => new Foreign();
+    [TestMethod]
+    void Verify() { Assert.AreEqual(0, 1); }
+}
+'@
+        $result = Invoke-NamedTestReplay -Manifest (
+            New-NamedTestManifest -Content $source -First 7 -Last 7)
+        $result.Observation.lifecycle.status | Should -BeExactly incomplete
+        $result.Observation.counts.unknown | Should -Be 1
+        @($result.Observation.findings).Count | Should -Be 0
+        $result.Observation.effects.providerWrites | Should -Be 0
+    }
+
     It 'treats a current unmarked same-account human request as method coverage, not bot no-op' {
         $result = Invoke-NamedTestReplay -Manifest (New-NamedTestManifest)
         $contract = New-NamedTestContract -Entry $result.Entry

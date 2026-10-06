@@ -213,6 +213,34 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
             '[TestMethod] void Verify(Foreign.AssertionType Assert) {')
         (Parse-NamedAreEqual $parameter 11)[0].recognized | Should -BeFalse
 
+        $property = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+class Foreign { public void AreEqual(int x, int y) {} }
+[TestClass] class Checks {
+    private Foreign Assert => new Foreign();
+    [TestMethod] void Verify() { Assert.AreEqual(1, 2); }
+}
+'@
+        (Parse-NamedAreEqual $property 5)[0].recognized | Should -BeFalse
+
+        $autoProperty = $property.Replace(
+            'private Foreign Assert => new Foreign();',
+            'private Foreign Assert { get; } = new Foreign();')
+        (Parse-NamedAreEqual $autoProperty 5)[0].recognized |
+            Should -BeFalse
+
+        $accessorProperty = $property.Replace(
+            'private Foreign Assert => new Foreign();',
+            'private Foreign Assert { get => new Foreign(); }')
+        (Parse-NamedAreEqual $accessorProperty 5)[0].recognized |
+            Should -BeFalse
+
+        $localDeclaration = $source.Replace(
+            'Assert.AreEqual(0, actual: value, message: "x");',
+            'Foreign.AssertionType Assert = new(); Assert.AreEqual(0, value);')
+        (Parse-NamedAreEqual $localDeclaration 11)[0].recognized |
+            Should -BeFalse
+
         $otherSpelling = $source.Replace('Assert.AreEqual(0, actual: value, message: "x");',
             'Local.AreEqual(0, value);')
         (Parse-NamedAreEqual $otherSpelling 11).Count | Should -Be 0
