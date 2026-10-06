@@ -157,7 +157,7 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 class Assert { public static void AreEqual(int x, int y) {} }
 [TestClass] class Checks { [TestMethod] void Verify() { Assert.AreEqual(1, 2); } }
 '@
-        (Parse-NamedAreEqual $shadow 3)[0].recognized | Should -BeTrue
+        (Parse-NamedAreEqual $shadow 3)[0].recognized | Should -BeFalse
         $aliasedShadow = $source.Replace('M.Assert.AreEqual(1, 2);',
             'var M = new Other(); M.Assert.AreEqual(1, 2);')
         (Parse-NamedAreEqual $aliasedShadow 6)[0].recognized | Should -BeFalse
@@ -177,7 +177,7 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
         (Parse-NamedAreEqual $member 3)[0].recognized | Should -BeFalse
     }
 
-    It 'recognizes exact spelling despite ordinary imports, foreign Assert aliases, and shadowing' {
+    It 'recognizes ordinary imports but rejects foreign Assert aliases and shadowing' {
         $source = @'
 using System;
 using System.Linq;
@@ -187,25 +187,35 @@ using Three;
 using Four;
 using Five;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
-using Assert = Foreign.AssertionType;
 [TestClass] class Checks {
     [TestMethod] void Verify() {
         Assert.AreEqual(0, actual: value, message: "x");
     }
 }
 '@
-        $result = (Parse-NamedAreEqual $source 12)[0]
+        $result = (Parse-NamedAreEqual $source 11)[0]
         $result.recognized | Should -BeTrue
         $result.hasPositional | Should -BeTrue
-        $result.affectedCallLines | Should -Be @(12)
+        $result.affectedCallLines | Should -Be @(11)
+
+        $foreignAlias = $source.Replace(
+            'using Microsoft.VisualStudio.TestTools.UnitTesting;',
+            "using Microsoft.VisualStudio.TestTools.UnitTesting;`nusing Assert = Foreign.AssertionType;")
+        (Parse-NamedAreEqual $foreignAlias 12)[0].recognized |
+            Should -BeFalse
 
         $local = $source.Replace('Assert.AreEqual(0, actual: value, message: "x");',
             'var Assert = new Foreign.AssertionType(); Assert.AreEqual(0, value);')
-        (Parse-NamedAreEqual $local 12)[0].recognized | Should -BeTrue
+        (Parse-NamedAreEqual $local 11)[0].recognized | Should -BeFalse
+
+        $parameter = $source.Replace(
+            '[TestMethod] void Verify() {',
+            '[TestMethod] void Verify(Foreign.AssertionType Assert) {')
+        (Parse-NamedAreEqual $parameter 11)[0].recognized | Should -BeFalse
 
         $otherSpelling = $source.Replace('Assert.AreEqual(0, actual: value, message: "x");',
             'Local.AreEqual(0, value);')
-        (Parse-NamedAreEqual $otherSpelling 12).Count | Should -Be 0
+        (Parse-NamedAreEqual $otherSpelling 11).Count | Should -Be 0
     }
 
     It 'refuses overloaded methods and uncertain test-method structure' {

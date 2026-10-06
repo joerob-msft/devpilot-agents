@@ -348,6 +348,51 @@ function Read-ApprovedOwnerV2Evidence {
         [string]$toolkit.tree -cnotmatch '^[0-9a-f]{40}$') {
         throw 'Toolkit config has no exact toolkit head and tree.'
     }
+    $toolkitBinding = [ordered]@{
+        head = [string]$toolkit.head
+        tree = [string]$toolkit.tree
+        ref = [string]$toolkit.ref
+        configSha256 = Get-ApprovedOwnerV2FileSha256 $ToolkitConfigPath
+        formatterSha256 = Get-ApprovedOwnerV2FileSha256 (
+            Join-Path $RepoRoot `
+                'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psm1')
+        formatterManifestSha256 = Get-ApprovedOwnerV2FileSha256 (
+            Join-Path $RepoRoot `
+                'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1')
+        writerSha256 = Get-ApprovedOwnerV2FileSha256 (
+            Join-Path $RepoRoot `
+                'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1')
+        providerSha256 = Get-ApprovedOwnerV2FileSha256 (
+            Join-Path $RepoRoot `
+                'src\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
+        cliSha256 = Get-ApprovedOwnerV2FileSha256 (
+            Join-Path $RepoRoot 'tools\Invoke-ApprovedOwnerV2Comment.ps1')
+        automaticWriterSha256 = Get-ApprovedOwnerV2FileSha256 (
+            Join-Path $RepoRoot `
+                'src\Agents\reviewer\AutomaticOwnerV2Comments.ps1')
+        schedulerSha256 = Get-ApprovedOwnerV2FileSha256 (
+            Join-Path $RepoRoot 'tools\Invoke-OwnerV2ScheduledDelivery.ps1')
+    }
+    if ($namedAreEqual) {
+        $toolkitBinding['parserSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psm1')
+        $toolkitBinding['parserManifestSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1')
+        if ((Get-ApprovedOwnerV2SourceArtifact `
+                -Observation $observation `
+                -Kind 'named-areequal-parser-module') -cne
+                [string]$toolkitBinding.parserSha256 -or
+            (Get-ApprovedOwnerV2SourceArtifact `
+                -Observation $observation `
+                -Kind 'named-areequal-parser-manifest') -cne
+                [string]$toolkitBinding.parserManifestSha256) {
+            throw 'Named AreEqual observation parser binding is stale or foreign.'
+        }
+    }
     return [pscustomobject][ordered]@{
         StateRoot = $state
         CapabilityRoot = $root
@@ -365,29 +410,16 @@ function Read-ApprovedOwnerV2Evidence {
             observation = $observationPath
             telemetry = $telemetryPath
             toolkitConfig = [IO.Path]::GetFullPath($ToolkitConfigPath)
+            parser = $(if ($namedAreEqual) {
+                [IO.Path]::GetFullPath((Join-Path $RepoRoot `
+                    'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psm1'))
+            } else { $null })
+            parserManifest = $(if ($namedAreEqual) {
+                [IO.Path]::GetFullPath((Join-Path $RepoRoot `
+                    'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1'))
+            } else { $null })
         }
-        Toolkit = [ordered]@{
-            head = [string]$toolkit.head
-            tree = [string]$toolkit.tree
-            ref = [string]$toolkit.ref
-            configSha256 = Get-ApprovedOwnerV2FileSha256 $ToolkitConfigPath
-            formatterSha256 = Get-ApprovedOwnerV2FileSha256 (
-                Join-Path $RepoRoot 'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psm1')
-            formatterManifestSha256 = Get-ApprovedOwnerV2FileSha256 (
-                Join-Path $RepoRoot 'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1')
-            writerSha256 = Get-ApprovedOwnerV2FileSha256 (
-                Join-Path $RepoRoot 'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1')
-            providerSha256 = Get-ApprovedOwnerV2FileSha256 (
-                Join-Path $RepoRoot `
-                    'src\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
-            cliSha256 = Get-ApprovedOwnerV2FileSha256 (
-                Join-Path $RepoRoot 'tools\Invoke-ApprovedOwnerV2Comment.ps1')
-            automaticWriterSha256 = Get-ApprovedOwnerV2FileSha256 (
-                Join-Path $RepoRoot `
-                    'src\Agents\reviewer\AutomaticOwnerV2Comments.ps1')
-            schedulerSha256 = Get-ApprovedOwnerV2FileSha256 (
-                Join-Path $RepoRoot 'tools\Invoke-OwnerV2ScheduledDelivery.ps1')
-        }
+        Toolkit = $toolkitBinding
         Provider = [ordered]@{
             kind = [string]$discussionProvider.kind
             organization = [string]$subjectProvider.organization

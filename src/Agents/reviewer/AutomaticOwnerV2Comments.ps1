@@ -237,6 +237,24 @@ function New-AutomaticOwnerV2ServicePolicy {
         return ConvertTo-ApprovedOwnerV2CanonicalJson $Value |
             ConvertFrom-Json -AsHashtable -Depth 64
     }
+    $implementation = [ordered]@{
+        toolkitHead = [string]$Evidence.Toolkit.head
+        toolkitTree = [string]$Evidence.Toolkit.tree
+        formatterSha256 = [string]$Evidence.Toolkit.formatterSha256
+        formatterManifestSha256 =
+            [string]$Evidence.Toolkit.formatterManifestSha256
+        approvedWriterSha256 = [string]$Evidence.Toolkit.writerSha256
+        providerSha256 = [string]$Evidence.Toolkit.providerSha256
+        automaticWriterSha256 =
+            [string]$Evidence.Toolkit.automaticWriterSha256
+        schedulerSha256 = [string]$Evidence.Toolkit.schedulerSha256
+    }
+    if ($namedAreEqual) {
+        $implementation['parserSha256'] =
+            [string]$Evidence.Toolkit.parserSha256
+        $implementation['parserManifestSha256'] =
+            [string]$Evidence.Toolkit.parserManifestSha256
+    }
     return [ordered]@{
         schemaVersion = 1
         kind = $(if ($namedAreEqual) {
@@ -251,18 +269,7 @@ function New-AutomaticOwnerV2ServicePolicy {
         capability = & $copy $Evidence.Declaration.capability
         rule = & $copy $Evidence.Declaration.rule
         reviewerIdentity = & $copy $Evidence.Provider.reviewerIdentity
-        implementation = [ordered]@{
-            toolkitHead = [string]$Evidence.Toolkit.head
-            toolkitTree = [string]$Evidence.Toolkit.tree
-            formatterSha256 = [string]$Evidence.Toolkit.formatterSha256
-            formatterManifestSha256 =
-                [string]$Evidence.Toolkit.formatterManifestSha256
-            approvedWriterSha256 = [string]$Evidence.Toolkit.writerSha256
-            providerSha256 = [string]$Evidence.Toolkit.providerSha256
-            automaticWriterSha256 =
-                [string]$Evidence.Toolkit.automaticWriterSha256
-            schedulerSha256 = [string]$Evidence.Toolkit.schedulerSha256
-        }
+        implementation = $implementation
         limits = [ordered]@{
             maxCreatesPerRun = $MaxCreatesPerRun
             maxCreatesPerPullRequest = $MaxCreatesPerPullRequest
@@ -342,16 +349,45 @@ function Assert-AutomaticOwnerV2ServicePolicy {
             throw 'Automatic Owner toolkit implementation identity is invalid.'
         }
     }
-    foreach ($digest in @(
+    $implementationDigests = @(
             [string]$Policy.implementation.formatterSha256,
             [string]$Policy.implementation.formatterManifestSha256,
             [string]$Policy.implementation.approvedWriterSha256,
             [string]$Policy.implementation.providerSha256,
             [string]$Policy.implementation.automaticWriterSha256,
             [string]$Policy.implementation.schedulerSha256
-        )) {
+        )
+    if ($namedAreEqual) {
+        $implementationDigests += @(
+            [string]$Policy.implementation.parserSha256,
+            [string]$Policy.implementation.parserManifestSha256
+        )
+    }
+    foreach ($digest in $implementationDigests) {
         if ($digest -cnotmatch '^[0-9a-f]{64}$') {
             throw 'Automatic Owner implementation digest is invalid.'
+        }
+    }
+    if ($namedAreEqual) {
+        if ([string]::IsNullOrWhiteSpace(
+                [string]$Evidence.Paths.parser) -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$Evidence.Paths.parserManifest)) {
+            throw 'Named AreEqual evidence has no parser implementation paths.'
+        }
+        $currentParser =
+            Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.parser
+        $currentManifest =
+            Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.parserManifest
+        if ($currentParser -cne
+                [string]$Evidence.Toolkit.parserSha256 -or
+            $currentManifest -cne
+                [string]$Evidence.Toolkit.parserManifestSha256 -or
+            $currentParser -cne
+                [string]$Policy.implementation.parserSha256 -or
+            $currentManifest -cne
+                [string]$Policy.implementation.parserManifestSha256) {
+            throw 'Named AreEqual parser implementation changed.'
         }
     }
     $authority = $Policy.authority
@@ -556,6 +592,12 @@ function Assert-AutomaticOwnerV2EvidenceCurrent {
                 Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.telemetry
             })
         resultDigest = [string]$Evidence.Record.resultDigest
+    }
+    if ($namedAreEqual) {
+        $bindings['parserSha256'] =
+            Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.parser
+        $bindings['parserManifestSha256'] =
+            Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.parserManifest
     }
     foreach ($entry in $bindings.GetEnumerator()) {
         if ([string]$Intent.state[$entry.Key] -cne [string]$entry.Value) {
@@ -1057,6 +1099,31 @@ function Invoke-AutomaticOwnerV2Comments {
             }
         }
 
+        $intentState = [ordered]@{
+            identity = [string]$Evidence.Identity
+            resultDigest = [string]$Evidence.Record.resultDigest
+            declarationSha256 =
+                Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.declaration
+            evidenceSha256 =
+                Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.evidence
+            recordSha256 =
+                Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.record
+            observationSha256 =
+                Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.observation
+            telemetrySha256 = $(if ($namedAreEqual) {
+                    'not-applicable'
+                }
+                else {
+                    Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.telemetry
+                })
+        }
+        if ($namedAreEqual) {
+            $intentState['parserSha256'] =
+                Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.parser
+            $intentState['parserManifestSha256'] =
+                Get-ApprovedOwnerV2FileSha256 `
+                    $Evidence.Paths.parserManifest
+        }
         $intent = [ordered]@{
             schemaVersion = 1
             kind = $(if ($namedAreEqual) {
@@ -1064,24 +1131,7 @@ function Invoke-AutomaticOwnerV2Comments {
                 } else { 'owner-v2-service-create-intent' })
             runId = $runId
             policyDigest = Get-ApprovedOwnerV2Digest $Policy
-            state = [ordered]@{
-                identity = [string]$Evidence.Identity
-                resultDigest = [string]$Evidence.Record.resultDigest
-                declarationSha256 =
-                    Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.declaration
-                evidenceSha256 =
-                    Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.evidence
-                recordSha256 =
-                    Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.record
-                observationSha256 =
-                    Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.observation
-                telemetrySha256 = $(if ($namedAreEqual) {
-                        'not-applicable'
-                    }
-                    else {
-                        Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.telemetry
-                    })
-            }
+            state = $intentState
             subject = $authorization.subject
             currentIterationId = $iterationId
             discussionSnapshotSha256 = $snapshot

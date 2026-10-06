@@ -274,6 +274,7 @@ function Get-NamedAreEqualConstructs {
     $fileNamespace = ''
     $location = @{}
     $methodSymbols = @{}
+    $assertShadowed = $aliases.ContainsKey('Assert')
     for ($i = 0; $i -lt $tokens.Count; $i++) {
         $text = [string]$tokens[$i].text
         if ($text -eq '}') {
@@ -306,6 +307,7 @@ function Get-NamedAreEqualConstructs {
         elseif ($header -match '\b(class|struct|record)\s+(@?[\p{L}_][\p{L}\p{N}_]*)\b') {
             $kind = 'type'
             $name = $Matches[2] -replace '^@', ''
+            if ($name -ceq 'Assert') { $assertShadowed = $true }
             $testClass = Test-NamedAreEqualTestAttribute -Tokens $tokens -Pairs $pairs `
                 -First ($begin + 1) -Last ($i - 1) -ShortName TestClass `
                 -HasMstestImport ($mstestNamespace -cin $imports) -Aliases $aliases
@@ -357,6 +359,22 @@ function Get-NamedAreEqualConstructs {
             declarationLine = $(if ($kind -eq 'method') { $declarationLine } else { 0 })
             end = $(if ($pairs.ContainsKey($i)) { [int]$tokens[$pairs[$i]].line } else { [int]$tokens[$i].line }) })
     }
+    for ($i = 1; $i -lt $tokens.Count - 1; $i++) {
+        if ([string]$tokens[$i].text -cne 'Assert') { continue }
+        $previous = [string]$tokens[$i - 1].text
+        $next = [string]$tokens[$i + 1].text
+        if ($next -eq '.' -and $i + 2 -lt $tokens.Count -and
+            [string]$tokens[$i + 2].text -ceq 'AreEqual') {
+            continue
+        }
+        if ($previous -cin @(
+                'class', 'struct', 'record', 'interface', 'enum', 'var') -or
+            ($previous -cmatch '^@?[\p{L}_][\p{L}\p{N}_]*$' -and
+                $next -in @('=', ';', ',', ')', '{', '('))) {
+            $assertShadowed = $true
+            break
+        }
+    }
 
     $groups = @{}
     for ($i = 0; $i -lt $tokens.Count; $i++) {
@@ -401,7 +419,8 @@ function Get-NamedAreEqualConstructs {
             ($receiverStart -eq 0 -or $tokens[$receiverStart - 1].text -notin @('.', '::', '?', '!'))
         $testClass = @($contexts | Where-Object { $_.kind -eq 'type' -and $_.isTestClass })
         $exactAnchor = Test-CoverageChanged $start $start $ranges
-        $known = $exactSpelling -and -not $malformed -and $callValid -and $exactAnchor -and
+        $known = $exactSpelling -and -not $assertShadowed -and
+            -not $malformed -and $callValid -and $exactAnchor -and
             $method.Count -eq 1 -and $method[0].isTestMethod -and
             $testClass.Count -eq 1 -and $method[0].declarationLine -ge 1 -and
             $symbol.Length -gt 0 -and $symbol.Length -le 256 -and

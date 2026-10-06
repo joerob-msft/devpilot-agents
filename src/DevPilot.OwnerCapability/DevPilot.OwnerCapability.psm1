@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1"
 Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1"
-Import-Module "$PSScriptRoot\..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1" -Force
 
 $limitsTypeName = 'DevPilot.OwnerCapability.OwnerV2CapabilityLimits'
 if (-not ($limitsTypeName -as [type])) {

@@ -10,7 +10,7 @@ Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContrac
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerModelRunner\DevPilot.OwnerModelRunner.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.RelationEvidence\DevPilot.RelationEvidence.psd1"
-Import-Module "$PSScriptRoot\..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1" -Force
 
 $script:OwnerV2ObservationSchemaPath = Join-Path $PSScriptRoot `
     '..\OwnerObserver\schemas\owner-observation.v1.json'
@@ -49,6 +49,19 @@ $script:NamedAreEqualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
 $script:NamedAreEqualPolicyDigest =
     'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
+$script:NamedAreEqualParserPath = Join-Path $PSScriptRoot `
+    '..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psm1'
+$script:NamedAreEqualParserManifestPath = Join-Path $PSScriptRoot `
+    '..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1'
+$script:NamedAreEqualParserSha256AtImport =
+    ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+        [IO.File]::ReadAllBytes($script:NamedAreEqualParserPath)))).
+    ToLowerInvariant()
+$script:NamedAreEqualParserManifestSha256AtImport =
+    ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+        [IO.File]::ReadAllBytes(
+            $script:NamedAreEqualParserManifestPath)))).
+    ToLowerInvariant()
 $script:OwnerV2DigestPattern = '^v1:sha256:[0-9a-f]{64}$'
 $script:OwnerV2CommitPattern = '^[0-9a-f]{40}$'
 $script:OwnerV2SafeIdPattern = '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
@@ -1217,12 +1230,54 @@ function Assert-OwnerV2PipelineNoWrites {
     }
 }
 
+function Get-NamedAreEqualParserBinding {
+    $parserSha = ([Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [IO.File]::ReadAllBytes(
+                $script:NamedAreEqualParserPath)))).
+        ToLowerInvariant()
+    $manifestSha = ([Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [IO.File]::ReadAllBytes(
+                $script:NamedAreEqualParserManifestPath)))).
+        ToLowerInvariant()
+    if ($parserSha -cne $script:NamedAreEqualParserSha256AtImport -or
+        $manifestSha -cne
+            $script:NamedAreEqualParserManifestSha256AtImport) {
+        throw 'Named AreEqual parser bytes changed after module import.'
+    }
+    return [ordered]@{
+        parserSha256 = $parserSha
+        parserManifestSha256 = $manifestSha
+    }
+}
+
+function Add-NamedAreEqualParserArtifacts {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)][Collections.IDictionary]$Binding
+    )
+    $Observation.sourceArtifacts = @($Observation.sourceArtifacts) + @(
+        [ordered]@{
+            kind = 'named-areequal-parser-module'
+            sha256 = [string]$Binding.parserSha256
+            signature = 'not-applicable'
+        },
+        [ordered]@{
+            kind = 'named-areequal-parser-manifest'
+            sha256 = [string]$Binding.parserManifestSha256
+            signature = 'not-applicable'
+        }
+    )
+}
+
 function Invoke-OwnerV2Replay {
     param([Parameter(Mandatory)][object]$Entry)
     $fixture = New-OwnerReplayFixture -Package $Entry.ManifestEntry.acquisition.package
     $acquisition = New-OwnerReplayAcquisitionAdapter -Contract $Entry.Contract `
         -Fixture $fixture -ExpectedPayloadDigest ([string]$Entry.Declaration.acquisitionPayloadDigest)
     if ([string]$Entry.CapabilityKind -ceq 'named-areequal') {
+        $parserBinding = Get-NamedAreEqualParserBinding
         $capability = New-NamedAreEqualCapabilityAdapter `
             -CapabilityId ([string]$Entry.Declaration.capability.id) `
             -CapabilityDigest ([string]$Entry.Declaration.capability.digest)
@@ -1240,6 +1295,9 @@ function Invoke-OwnerV2Replay {
             -PipelineResult $result `
             -ImplementationId 'named-areequal-arguments-v1-orchestrator' `
             -ImplementationVersion '1.0.0'
+        [void](Get-NamedAreEqualParserBinding)
+        Add-NamedAreEqualParserArtifacts `
+            -Observation $observation -Binding $parserBinding
         Assert-OwnerV2PipelineNoWrites `
             -PipelineResult $result -Observation $observation
         return [pscustomobject][ordered]@{
@@ -1813,6 +1871,7 @@ function Invoke-NamedAreEqualLive {
         return New-OwnerV2LiveOutcome `
             -Entry $Entry -Reason 'acquisition-provider-unavailable'
     }
+    $parserBinding = Get-NamedAreEqualParserBinding
     $acquisition = New-OwnerProductionAcquisitionAdapter `
         -Contract $Entry.Contract -Provider $AcquisitionProvider
     $capability = New-NamedAreEqualCapabilityAdapter `
@@ -1832,6 +1891,9 @@ function Invoke-NamedAreEqualLive {
         -PipelineResult $result `
         -ImplementationId 'named-areequal-arguments-v1-orchestrator' `
         -ImplementationVersion '1.0.0'
+    [void](Get-NamedAreEqualParserBinding)
+    Add-NamedAreEqualParserArtifacts `
+        -Observation $observation -Binding $parserBinding
     if (@($observation.findings).Count -gt 0 -and
         [string]$observation.lifecycle.status -ceq 'completed') {
         $snapshot = $null

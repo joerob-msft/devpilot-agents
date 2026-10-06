@@ -202,7 +202,7 @@ Describe 'Bound named Assert.AreEqual method capability' {
                 -ManifestPath $path } | Should -Throw '*exact source-backed rule*'
     }
 
-    It 'applies call-site style to a different Assert type without claiming MSTest binding' {
+    It 'keeps a shadowed Assert receiver unknown and non-actionable' {
         $source = @'
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 class Assert { public static void AreEqual(int expected, int actual) {} }
@@ -214,20 +214,10 @@ class Checks {
 '@
         $result = Invoke-NamedTestReplay -Manifest (
             New-NamedTestManifest -Content $source -First 6 -Last 6)
-        $result.Observation.lifecycle.status | Should -BeExactly completed
-        $result.Observation.counts.unknown | Should -Be 0
-        @($result.Observation.findings).Count | Should -Be 1
-        $result.Observation.findings[0].anchor.line | Should -Be 6
+        $result.Observation.lifecycle.status | Should -BeExactly incomplete
+        $result.Observation.counts.unknown | Should -Be 1
+        @($result.Observation.findings).Count | Should -Be 0
         $result.Observation.effects.providerWrites | Should -Be 0
-        $contract = New-NamedTestContract -Entry $result.Entry
-        $thread = New-NamedTestThread -Contract $contract `
-            -Finding $result.Observation.findings[0] `
-            -Body 'Please use named arguments for Assert.AreEqual.' -ReviewerOwned $true
-        $snapshot = New-NamedTestDiscussion -Contract $contract -Threads @($thread)
-        $reconciled = Resolve-OwnerV2DiscussionReconciliation `
-            -Observation $result.Observation -Contract $contract -Snapshot $snapshot
-        $reconciled.findings[0].reconciliation.classification | Should -BeExactly humanCovered
-        $reconciled.effects.dedupe.wouldCreate | Should -Be 0
     }
 
     It 'treats a current unmarked same-account human request as method coverage, not bot no-op' {

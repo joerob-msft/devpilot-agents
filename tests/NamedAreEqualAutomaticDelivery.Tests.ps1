@@ -132,10 +132,27 @@ BeforeAll {
                 providerWrites = 0
                 writeToolInvocations = 0
             }
-            sourceArtifacts = @([ordered]@{
+            sourceArtifacts = @(
+                [ordered]@{
                     kind = 'owner-v2-discussion-snapshot'
                     sha256 = '9' * 64
-                })
+                    signature = 'not-applicable'
+                },
+                [ordered]@{
+                    kind = 'named-areequal-parser-module'
+                    sha256 = Get-ApprovedOwnerV2FileSha256 (
+                        Join-Path $repoRoot `
+                            'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psm1')
+                    signature = 'not-applicable'
+                },
+                [ordered]@{
+                    kind = 'named-areequal-parser-manifest'
+                    sha256 = Get-ApprovedOwnerV2FileSha256 (
+                        Join-Path $repoRoot `
+                            'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1')
+                    signature = 'not-applicable'
+                }
+            )
         }
         $root = Join-Path $script:namedTestRoot ([guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $root | Out-Null
@@ -145,6 +162,10 @@ BeforeAll {
             [IO.File]::WriteAllText($paths[$name], '{}')
         }
         $paths.telemetry = Join-Path $root 'telemetry.json'
+        $paths.parser = Join-Path $repoRoot `
+            'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psm1'
+        $paths.parserManifest = Join-Path $repoRoot `
+            'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1'
         $evidence = [pscustomobject]@{
             Identity = 'a' * 64
             Declaration = $declaration
@@ -168,6 +189,10 @@ BeforeAll {
                 providerSha256 = '4' * 64
                 automaticWriterSha256 = '6' * 64
                 schedulerSha256 = '7' * 64
+                parserSha256 =
+                    Get-ApprovedOwnerV2FileSha256 $paths.parser
+                parserManifestSha256 =
+                    Get-ApprovedOwnerV2FileSha256 $paths.parserManifest
             }
             Provider = [ordered]@{
                 kind = 'azure-devops-rest-owner-discussions-v1'
@@ -635,6 +660,52 @@ Describe 'Named AreEqual automatic delivery' {
             $result.diagnostic.code | Should -BeExactly policy-refused
             $provider.State.operations.Count | Should -Be 0
         }
+    }
+
+    It 'refuses parser module or manifest byte changes before intent or provider access' `
+        -TestCases @(
+            @{ Target = 'module' }
+            @{ Target = 'manifest' }
+        ) {
+        param($Target)
+        $context = New-NamedDeliveryContext
+        $source = if ($Target -ceq 'module') {
+            [string]$context.Evidence.Paths.parser
+        }
+        else {
+            [string]$context.Evidence.Paths.parserManifest
+        }
+        $copy = Join-Path $script:namedTestRoot (
+            "tampered-$Target-" + [guid]::NewGuid().ToString('N'))
+        [IO.File]::Copy($source, $copy)
+        if ($Target -ceq 'module') {
+            $context.Evidence.Paths.parser = $copy
+            $context.Evidence.Toolkit.parserSha256 =
+                Get-ApprovedOwnerV2FileSha256 $copy
+        }
+        else {
+            $context.Evidence.Paths.parserManifest = $copy
+            $context.Evidence.Toolkit.parserManifestSha256 =
+                Get-ApprovedOwnerV2FileSha256 $copy
+        }
+        $context.Policy = New-AutomaticOwnerV2ServicePolicy `
+            -Evidence $context.Evidence `
+            -PolicyId "named-parser-$Target"
+        [IO.File]::AppendAllText(
+            $copy, "`n# tampered", [Text.UTF8Encoding]::new($false))
+        $provider = New-NamedDeliveryProvider `
+            -Evidence $context.Evidence
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly 'refused'
+        $result.diagnostic.code | Should -BeExactly 'policy-refused'
+        $provider.State.operations.Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath (
+                Join-Path $context.Root 'intents') -File -Recurse) |
+            Should -HaveCount 0
     }
 
     It 'refuses malformed bounded method metadata before provider reads' `
