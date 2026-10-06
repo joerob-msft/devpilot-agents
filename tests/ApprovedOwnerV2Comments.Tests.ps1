@@ -996,6 +996,19 @@ Describe 'Approved Owner v2 live safety boundary' {
 }
 
 Describe 'Automatic Owner v2 create-only delivery' {
+    It 'preserves the existing Owner 5 per run and 50 per PR ceiling' {
+        $context = New-TestAutomaticOwnerV2Context
+        $policy = New-AutomaticOwnerV2ServicePolicy `
+            -Evidence $context.Evidence -PolicyId owner-existing-ceiling `
+            -MaxCreatesPerRun 5 -MaxCreatesPerPullRequest 50 `
+            -CreatedUtc '20260101T000000Z'
+        $policy.limits.maxCreatesPerRun | Should -Be 5
+        $policy.limits.maxCreatesPerPullRequest | Should -Be 50
+        { Assert-AutomaticOwnerV2ServicePolicy `
+                -Evidence $context.Evidence -Policy $policy } |
+            Should -Not -Throw
+    }
+
     It 'is disabled by default and fails closed on an unbound true value' {
         $disabled = Get-AutomaticOwnerV2Configuration -ToolkitConfig ([ordered]@{})
         $disabled.Enabled | Should -BeFalse

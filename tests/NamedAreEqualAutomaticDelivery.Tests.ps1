@@ -526,9 +526,94 @@ Describe 'Named AreEqual automatic delivery' {
         { Assert-AutomaticOwnerV2ServicePolicy -Evidence $context.Evidence `
                 -Policy $signed } | Should -Throw
         $signed.kind = 'named-areequal-v1-service-authorization-policy'
-        $signed.limits.maxCreatesPerPullRequest = 51
+        $signed.limits.maxCreatesPerPullRequest = 6
         { Assert-AutomaticOwnerV2ServicePolicy -Evidence $context.Evidence `
                 -Policy $signed } | Should -Throw '*ceilings*'
+        $signed.limits.maxCreatesPerPullRequest = 5
+        $signed.limits.maxCreatesPerRun = 3
+        { Assert-AutomaticOwnerV2ServicePolicy -Evidence $context.Evidence `
+                -Policy $signed } | Should -Throw '*ceilings*'
+    }
+
+    It 'rejects named policy construction above 2 per run or 5 per PR' {
+        $context = New-NamedDeliveryContext
+        $context.Policy.limits.maxCreatesPerRun | Should -Be 2
+        $context.Policy.limits.maxCreatesPerPullRequest | Should -Be 5
+        $exact = New-AutomaticOwnerV2ServicePolicy `
+            -Evidence $context.Evidence -PolicyId named-exact-boundary `
+            -MaxCreatesPerRun 2 -MaxCreatesPerPullRequest 5
+        { Assert-AutomaticOwnerV2ServicePolicy `
+                -Evidence $context.Evidence -Policy $exact } |
+            Should -Not -Throw
+        $lower = New-AutomaticOwnerV2ServicePolicy `
+            -Evidence $context.Evidence -PolicyId named-lower-boundary `
+            -MaxCreatesPerRun 1 -MaxCreatesPerPullRequest 1
+        { Assert-AutomaticOwnerV2ServicePolicy `
+                -Evidence $context.Evidence -Policy $lower } |
+            Should -Not -Throw
+        {
+            New-AutomaticOwnerV2ServicePolicy `
+                -Evidence $context.Evidence `
+                -PolicyId named-too-many-per-run `
+                -MaxCreatesPerRun 3 -MaxCreatesPerPullRequest 5
+        } | Should -Throw '*2 per run or 5 per pull request*'
+        {
+            New-AutomaticOwnerV2ServicePolicy `
+                -Evidence $context.Evidence `
+                -PolicyId named-too-many-per-pr `
+                -MaxCreatesPerRun 2 -MaxCreatesPerPullRequest 6
+        } | Should -Throw '*2 per run or 5 per pull request*'
+    }
+
+    It 'rejects correctly signed named policies above the hard ceilings' {
+        $context = New-NamedDeliveryContext
+        foreach ($case in @(
+                @{ Name = 'run'; Run = 3; Pr = 5 }
+                @{ Name = 'pr'; Run = 2; Pr = 6 }
+            )) {
+            $policy = ConvertTo-ApprovedOwnerV2CanonicalJson `
+                $context.Policy |
+                ConvertFrom-Json -AsHashtable -Depth 32
+            $policy.limits.maxCreatesPerRun = $case.Run
+            $policy.limits.maxCreatesPerPullRequest = $case.Pr
+            $path = Join-Path $context.Root (
+                "policies\correctly-signed-over-$($case.Name).json")
+            [void](Write-AutomaticOwnerV2ServicePolicy `
+                -Path $path -Policy $policy -Key $context.Key)
+            $loaded = Read-ApprovedOwnerV2SignedRecord `
+                -Path $path -Key $context.Key
+            { Assert-AutomaticOwnerV2ServicePolicy `
+                    -Evidence $context.Evidence -Policy $loaded } |
+                Should -Throw '*ceilings*'
+        }
+    }
+
+    It 'rejects explicit named overlimits before creating a root or key' {
+        $tool = Join-Path $repoRoot `
+            'tools\Invoke-AutomaticOwnerV2Delivery.ps1'
+        foreach ($case in @(
+                @{ Name = 'run'; Arguments = @(
+                    '-MaxCreatesPerRun', '3',
+                    '-MaxCreatesPerPullRequest', '5') }
+                @{ Name = 'pr'; Arguments = @(
+                    '-MaxCreatesPerRun', '2',
+                    '-MaxCreatesPerPullRequest', '6') }
+            )) {
+            $root = Join-Path $script:namedTestRoot (
+                "cli-over-$($case.Name)-" + [guid]::NewGuid().ToString('N'))
+            $arguments = @(
+                '-NoProfile', '-NonInteractive', '-File', $tool,
+                'initialize-key',
+                '-Delivery', 'named-areequal',
+                '-DeliveryRoot', $root,
+                '-RepoRoot', $repoRoot
+            ) + @($case.Arguments)
+            $output = @(& (Get-Command pwsh).Source @arguments 2>&1)
+            $LASTEXITCODE | Should -Not -Be 0
+            ($output -join "`n") | Should -Match `
+                'cannot exceed 2 creates per run or 5 per pull request'
+            Test-Path -LiteralPath $root | Should -BeFalse
+        }
     }
 
     It 'refuses an update-authorizing or foreign rule policy without provider access' {

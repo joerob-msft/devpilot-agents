@@ -8,6 +8,8 @@ $script:AutomaticNamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
 $script:AutomaticNamedAreEqualRoot = 'named-areequal-v1'
 $script:AutomaticOwnerV2MaximumCreatesPerRun = 5
 $script:AutomaticOwnerV2MaximumCreatesPerPullRequest = 50
+$script:AutomaticNamedAreEqualMaximumCreatesPerRun = 2
+$script:AutomaticNamedAreEqualMaximumCreatesPerPullRequest = 5
 
 function Read-AutomaticNamedAreEqualEvidence {
     [CmdletBinding()]
@@ -196,12 +198,23 @@ function New-AutomaticOwnerV2ServicePolicy {
         [ValidateRange(1, 50)][int]$MaxCreatesPerPullRequest = 25,
         [string]$CreatedUtc = ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))
     )
-    if ($MaxCreatesPerPullRequest -lt $MaxCreatesPerRun) {
-        throw 'The per-PR create ceiling cannot be lower than the per-run ceiling.'
-    }
     $namedAreEqual =
         [string]$Evidence.Declaration.capability.id -ceq
             $script:AutomaticNamedAreEqualCapability
+    if ($namedAreEqual) {
+        if (-not $PSBoundParameters.ContainsKey('MaxCreatesPerRun')) {
+            $MaxCreatesPerRun =
+                $script:AutomaticNamedAreEqualMaximumCreatesPerRun
+        }
+        if (-not $PSBoundParameters.ContainsKey(
+                'MaxCreatesPerPullRequest')) {
+            $MaxCreatesPerPullRequest =
+                $script:AutomaticNamedAreEqualMaximumCreatesPerPullRequest
+        }
+    }
+    if ($MaxCreatesPerPullRequest -lt $MaxCreatesPerRun) {
+        throw 'The per-PR create ceiling cannot be lower than the per-run ceiling.'
+    }
     if (-not $namedAreEqual -and
         [string]$Evidence.Declaration.capability.id -cne
             $script:AutomaticOwnerV2Capability) {
@@ -211,6 +224,13 @@ function New-AutomaticOwnerV2ServicePolicy {
         [string]$Evidence.Declaration.rule.path -cne
             $script:ApprovedNamedAreEqualPolicyPath) {
         throw 'Named AreEqual requires its exact rule path.'
+    }
+    if ($namedAreEqual -and (
+            $MaxCreatesPerRun -gt
+                $script:AutomaticNamedAreEqualMaximumCreatesPerRun -or
+            $MaxCreatesPerPullRequest -gt
+                $script:AutomaticNamedAreEqualMaximumCreatesPerPullRequest)) {
+        throw 'Named AreEqual service policy create ceilings exceed 2 per run or 5 per pull request.'
     }
     $copy = {
         param($Value)
@@ -300,10 +320,18 @@ function Assert-AutomaticOwnerV2ServicePolicy {
     }
     $runLimit = [int]$Policy.limits.maxCreatesPerRun
     $prLimit = [int]$Policy.limits.maxCreatesPerPullRequest
+    $maximumRun = if ($namedAreEqual) {
+        $script:AutomaticNamedAreEqualMaximumCreatesPerRun
+    }
+    else { $script:AutomaticOwnerV2MaximumCreatesPerRun }
+    $maximumPr = if ($namedAreEqual) {
+        $script:AutomaticNamedAreEqualMaximumCreatesPerPullRequest
+    }
+    else { $script:AutomaticOwnerV2MaximumCreatesPerPullRequest }
     if ($runLimit -lt 1 -or
-        $runLimit -gt $script:AutomaticOwnerV2MaximumCreatesPerRun -or
+        $runLimit -gt $maximumRun -or
         $prLimit -lt $runLimit -or
-        $prLimit -gt $script:AutomaticOwnerV2MaximumCreatesPerPullRequest) {
+        $prLimit -gt $maximumPr) {
         throw 'Automatic Owner service policy create ceilings are invalid.'
     }
     foreach ($digest in @(

@@ -38,6 +38,19 @@ Import-Module (Join-Path $RepoRoot `
 . (Join-Path $RepoRoot `
     'src\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
 
+if ($Delivery -ceq 'named-areequal') {
+    if (-not $PSBoundParameters.ContainsKey('MaxCreatesPerRun')) {
+        $MaxCreatesPerRun = 2
+    }
+    if (-not $PSBoundParameters.ContainsKey('MaxCreatesPerPullRequest')) {
+        $MaxCreatesPerPullRequest = 5
+    }
+    if ($MaxCreatesPerRun -gt 2 -or
+        $MaxCreatesPerPullRequest -gt 5) {
+        throw 'Named AreEqual policy limits cannot exceed 2 creates per run or 5 per pull request.'
+    }
+}
+
 $toolkitConfig = $null
 if ($Command -ceq 'invoke' -and $Delivery -ceq 'named-areequal') {
     if ([string]::IsNullOrWhiteSpace($StateRoot) -or
@@ -76,14 +89,6 @@ if (-not $PolicyId) {
     $PolicyId = if ($Delivery -ceq 'named-areequal') {
         'named-areequal-v1-production'
     } else { 'owner-v2-production' }
-}
-if ($Delivery -ceq 'named-areequal') {
-    if (-not $PSBoundParameters.ContainsKey('MaxCreatesPerRun')) {
-        $MaxCreatesPerRun = 2
-    }
-    if (-not $PSBoundParameters.ContainsKey('MaxCreatesPerPullRequest')) {
-        $MaxCreatesPerPullRequest = 5
-    }
 }
 if ($Command -ceq 'initialize-key') {
     [pscustomobject][ordered]@{
