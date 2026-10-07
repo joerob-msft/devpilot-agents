@@ -1586,9 +1586,22 @@ print(json.dumps({
                 -StderrBytes $stderrBytes)
         }
         try {
-            return ($text | ConvertFrom-Json -AsHashtable -Depth 32)
+            $parsed = ConvertFrom-Json -InputObject $text `
+                -AsHashtable -Depth 32 -NoEnumerate
+            if ($Area -ceq '__pull_requests__') {
+                if ($parsed -isnot [array]) {
+                    throw 'page-response-invalid'
+                }
+                Write-Output -NoEnumerate $parsed
+                return
+            }
+            return $parsed
         }
         catch {
+            if ([string]$_.Exception.Message -ceq
+                'page-response-invalid') {
+                throw
+            }
             throw 'response-invalid'
         }
     }.GetNewClosure()
@@ -1705,10 +1718,10 @@ print(json.dumps({
                 }
             }
             ListPage {
-                $listed = @(& $invoke '__pull_requests__' '' @() @(
+                $listed = & $invoke '__pull_requests__' '' @() @(
                         [string]$Request.skip,
                         [string]$Request.top
-                    ) $deadline)
+                    ) $deadline
                 if ($listed -isnot [array]) {
                     throw 'page-response-invalid'
                 }

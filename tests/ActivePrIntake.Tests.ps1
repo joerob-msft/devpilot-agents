@@ -1145,6 +1145,43 @@ switch ('$Mode') {
     ($diagnostic | ConvertTo-Json -Depth 8) |
         Should -Not -Match '99999999|command failed'
 }
+It 'requires a genuine top-level PR list array for <Name>' `
+    -Skip:(-not $IsWindows) -TestCases @(
+        @{ Name = 'null'; Body = 'null'; ExpectedCount = $null }
+        @{ Name = 'object'; Body = '{}'; ExpectedCount = $null }
+        @{ Name = 'scalar'; Body = '1'; ExpectedCount = $null }
+        @{ Name = 'empty'; Body = '[]'; ExpectedCount = 0 }
+        @{ Name = 'one'
+            Body = '[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}]'
+            ExpectedCount = 1 }
+        @{ Name = 'many'
+            Body = '[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}},{"pullRequestId":2,"status":"active","isDraft":true,"targetRefName":"refs/heads/feature","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}]'
+            ExpectedCount = 2 }
+    ) {
+    param($Name, $Body, $ExpectedCount)
+    $c = New-IntakeCase -Count 1
+    New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+    $stub = Join-Path $c.root "az-array-$Name.cmd"
+    "@echo off`r`necho $Body" |
+        Set-Content -LiteralPath $stub -Encoding ascii
+    $transport = New-ActivePrAzureDevOpsProvider `
+        -Config $c.config -AzureCliPath $stub `
+        -ConnectionDataToolPath $stub
+    if ($null -eq $ExpectedCount) {
+        { & $transport 'ListPage' @{
+                pass = 1; skip = 0; top = 3
+                timeoutMilliseconds = 3000
+            } } | Should -Throw 'page-response-invalid'
+    }
+    else {
+        $page = & $transport 'ListPage' @{
+            pass = 1; skip = 0; top = 3
+            timeoutMilliseconds = 3000
+        }
+        $page.items | Should -HaveCount $ExpectedCount
+        $page.count | Should -Be $ExpectedCount
+    }
+}
 It 'retains the first fixed <Operation> provider cause' `
     -TestCases @(
         @{ Operation = 'Head'; ExpectedReason = 'provider-contract'
