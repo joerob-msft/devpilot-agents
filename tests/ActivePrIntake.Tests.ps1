@@ -931,6 +931,23 @@ exit 7
     ($diagnostic | ConvertTo-Json -Depth 8) |
         Should -Not -Match 'private sentinel|forbidden'
 }
+It 'bounds captured AADSTS codes to ten digits' {
+    $valid = & (Get-Module DevPilot.ActivePrIntake) {
+        New-IntakeTransportFailure `
+            -Message read-inaccessible -NativeExitCode 1 `
+            -StderrBytes ([Text.Encoding]::UTF8.GetBytes(
+                'AADSTS1234567890'))
+    }
+    $valid.Data['externalErrorCode'] |
+        Should -BeExactly 'AADSTS1234567890'
+    $tooLong = & (Get-Module DevPilot.ActivePrIntake) {
+        New-IntakeTransportFailure `
+            -Message read-inaccessible -NativeExitCode 1 `
+            -StderrBytes ([Text.Encoding]::UTF8.GetBytes(
+                'AADSTS12345678901'))
+    }
+    $tooLong.Data.Contains('externalErrorCode') | Should -BeFalse
+}
 It 'does not let a private diagnostic write failure mask identity refusal' {
     $c = New-IntakeCase -Count 1
     $privateRoot = Join-Path $c.root 'active-pr-intake-v1'
@@ -944,16 +961,30 @@ exit 9
 '@ | Set-Content -LiteralPath $stub -Encoding utf8
     $transport = New-ActivePrAzureDevOpsProvider `
         -Config $c.config -AzureCliPath $stub
-    $result = Invoke-ActivePrIntake `
-        -Config $c.config -Provider $transport `
-        -StateRoot $c.root -RepositoryRoot $repo -Run
+    $originalError = [Console]::Error
+    $capturedError = [IO.StringWriter]::new()
+    try {
+        [Console]::SetError($capturedError)
+        $result = Invoke-ActivePrIntake `
+            -Config $c.config -Provider $transport `
+            -StateRoot $c.root -RepositoryRoot $repo -Run
 
-    $result.state | Should -BeExactly 'unknown'
-    $result.reasonCodes | Should -Be @('identity-read-inaccessible')
-    $result.readCount | Should -Be 1
-    Test-Path -LiteralPath (
-        Join-Path $privateRoot 'diagnostics') -PathType Leaf |
-        Should -BeTrue
+        $result.state | Should -BeExactly 'unknown'
+        $result.reasonCodes | Should -Be @('identity-read-inaccessible')
+        $result.readCount | Should -Be 1
+        Test-Path -LiteralPath (
+            Join-Path $privateRoot 'diagnostics') -PathType Leaf |
+            Should -BeTrue
+    }
+    finally {
+        [Console]::SetError($originalError)
+        $capturedText = $capturedError.ToString()
+        $capturedError.Dispose()
+    }
+    $capturedText.Trim() |
+        Should -BeExactly 'private-diagnostic-capture-failed'
+    $capturedText | Should -Not -Match `
+        'HTTP|authentication failed|diagnostics|intake-pester'
 }
 It 'treats local account UPN as metadata, not ADO identity authority' {
     $c = New-IntakeCase -Count 1

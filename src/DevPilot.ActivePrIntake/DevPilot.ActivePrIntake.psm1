@@ -77,7 +77,7 @@ function New-IntakeTransportFailure {
                 [int]$http.Groups['status'].Value
         }
         $externalCode = [regex]::Match(
-            $text, '(?i)\b(?<code>AADSTS\d{4,})\b')
+            $text, '(?i)\b(?<code>AADSTS\d{4,10})(?!\d)')
         if ($externalCode.Success) {
             $exception.Data['externalErrorCode'] =
                 $externalCode.Groups['code'].Value.ToUpperInvariant()
@@ -178,6 +178,8 @@ function Save-IntakePrivateFailure {
     catch {
         # Private diagnostics must never mask or alter the original
         # fail-closed intake predicate.
+        [Console]::Error.WriteLine(
+            'private-diagnostic-capture-failed')
     }
 }
 
