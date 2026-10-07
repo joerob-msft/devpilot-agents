@@ -1182,6 +1182,65 @@ It 'requires a genuine top-level PR list array for <Name>' `
         $page.count | Should -Be $ExpectedCount
     }
 }
+It 'uses strict UTF-8 for the installed Azure CLI Python host' `
+    -Skip:(-not $IsWindows) {
+    $azureCliCommands = @(Get-Command az -CommandType Application `
+            -ErrorAction Stop | Where-Object {
+            [IO.Path]::GetFileName($_.Source) -ceq 'az.cmd'
+        })
+    $azureCliCommands | Should -HaveCount 1
+    $python = Join-Path (
+        Split-Path -Parent (
+            Split-Path -Parent $azureCliCommands[0].Source)
+    ) 'python.exe'
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $python
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.Environment['AZ_INSTALLER'] = 'MSI'
+    foreach ($arg in @(
+            '-X', 'utf8', '-I', '-c',
+            'import json,sys; print(json.dumps({"encoding":sys.stdout.encoding,"values":["é","漢字"]},ensure_ascii=False))'
+        )) {
+        $start.ArgumentList.Add($arg)
+    }
+    $process = [Diagnostics.Process]::Start($start)
+    $bytes = [IO.MemoryStream]::new()
+    try {
+        $process.StandardOutput.BaseStream.CopyTo($bytes)
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        $process.ExitCode | Should -Be 0
+        $stderr | Should -BeNullOrEmpty
+        $text = [Text.UTF8Encoding]::new(
+            $false, $true).GetString($bytes.ToArray())
+        $json = $text | ConvertFrom-Json -AsHashtable
+        $json.encoding | Should -BeExactly 'utf-8'
+        $json.values | Should -Be @('é', '漢字')
+    }
+    finally {
+        $bytes.Dispose()
+        $process.Dispose()
+    }
+}
+It 'refuses invalid native output bytes without replacement decoding' `
+    -Skip:(-not $IsWindows) {
+    $c = New-IntakeCase -Count 1
+    New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+    $stub = Join-Path $c.root 'invalid output bytes.cmd'
+    @'
+@echo off
+pwsh -NoProfile -NonInteractive -Command "[Console]::OpenStandardOutput().WriteByte(233)"
+'@ | Set-Content -LiteralPath $stub -Encoding ascii
+    $transport = New-ActivePrAzureDevOpsProvider `
+        -Config $c.config -AzureCliPath $stub `
+        -ConnectionDataToolPath $stub
+    { & $transport 'ListPage' @{
+            pass = 1; skip = 0; top = 3
+            timeoutMilliseconds = 3000
+        } } | Should -Throw 'read-inaccessible'
+}
 It 'retains the first fixed <Operation> provider cause' `
     -TestCases @(
         @{ Operation = 'Head'; ExpectedReason = 'provider-contract'

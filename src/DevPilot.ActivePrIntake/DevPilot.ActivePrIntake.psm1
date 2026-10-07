@@ -60,6 +60,7 @@ function New-IntakeTransportFailure {
             $diagnosticException.GetType().Name) {
             'ArgumentException' { 'ArgumentException' }
             'CommandNotFoundException' { 'CommandNotFoundException' }
+            'DecoderFallbackException' { 'DecoderFallbackException' }
             'IOException' { 'IOException' }
             'InvalidOperationException' { 'InvalidOperationException' }
             'NotSupportedException' { 'NotSupportedException' }
@@ -334,6 +335,9 @@ function Invoke-IntakeRead {
                 'ArgumentException' { 'ArgumentException' }
                 'CommandNotFoundException' {
                     'CommandNotFoundException'
+                }
+                'DecoderFallbackException' {
+                    'DecoderFallbackException'
                 }
                 'IOException' { 'IOException' }
                 'InvalidOperationException' {
@@ -1439,7 +1443,38 @@ print(json.dumps({
             [void]$start.Environment.Remove('AZURE_DEVOPS_EXT_PAT')
             [void]$start.Environment.Remove('SYSTEM_ACCESSTOKEN')
             $extension = [IO.Path]::GetExtension($tool.Source)
-            if ($extension -in @('.cmd', '.bat')) {
+            $isAzureCliLauncher = $false
+            $azureCliPython = ''
+            if ($extension -ceq '.cmd' -and
+                [IO.Path]::GetFileName($tool.Source) -ceq 'az.cmd') {
+                $launcher = Get-Item -LiteralPath $tool.Source -Force
+                if (-not ($launcher.Attributes -band
+                        [IO.FileAttributes]::ReparsePoint) -and
+                    $launcher.Length -le 4096) {
+                    $launcherText = Get-Content -LiteralPath (
+                        $tool.Source) -Raw
+                    $azureCliPython = Join-Path (
+                        Split-Path -Parent (
+                            Split-Path -Parent $tool.Source)
+                    ) 'python.exe'
+                    $isAzureCliLauncher = $launcherText -match
+                        '(?im)^\s*SET AZ_INSTALLER=MSI\s*$' -and
+                        $launcherText -match
+                        '(?im)^\s*"%~dp0\\\.\.\\python\.exe"\s+-IBm\s+azure\.cli\s+%\*\s*$' -and
+                        (Test-Path -LiteralPath $azureCliPython `
+                            -PathType Leaf)
+                }
+            }
+            if ($isAzureCliLauncher) {
+                $start.FileName = $azureCliPython
+                $start.Environment['AZ_INSTALLER'] = 'MSI'
+                foreach ($arg in @(
+                        '-X', 'utf8', '-I', '-Bm', 'azure.cli'
+                    ) + $argv) {
+                    $start.ArgumentList.Add($arg)
+                }
+            }
+            elseif ($extension -in @('.cmd', '.bat')) {
                 if ($tool.Source -match '[%!"&|<>^]') {
                     throw 'read-inaccessible'
                 }
