@@ -879,6 +879,82 @@ if (`$args -notcontains 'connectionData') { exit 9 }
     { & $transport 'Identity' @{ timeoutMilliseconds = 3000 } } |
         Should -Throw $expected
 }
+It 'retains bounded private native identity failure metadata only' {
+    $c = New-IntakeCase -Count 1
+    New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+    $stub = Join-Path $c.root 'az-private-identity-failure.ps1'
+    @'
+[Console]::Error.Write('HTTP 403 forbidden AADSTS50076 private sentinel')
+exit 7
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+    $transport = New-ActivePrAzureDevOpsProvider `
+        -Config $c.config -AzureCliPath $stub
+    $result = Invoke-ActivePrIntake `
+        -Config $c.config -Provider $transport `
+        -StateRoot $c.root -RepositoryRoot $repo -Run
+
+    $result.state | Should -BeExactly 'unknown'
+    $result.reasonCodes | Should -Be @('identity-read-inaccessible')
+    ($result | ConvertTo-Json -Depth 32) |
+        Should -Not -Match 'private sentinel|403|forbidden'
+    $diagnostic = Get-ChildItem -LiteralPath (
+        Join-Path $c.root 'active-pr-intake-v1\diagnostics') `
+        -File -Filter '*.json' |
+        Select-Object -First 1 |
+        ForEach-Object {
+            Get-Content -LiteralPath $_.FullName -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 8
+        }
+    $diagnostic.kind |
+        Should -BeExactly 'active-pr-intake-private-failure'
+    $diagnostic.predicate | Should -BeExactly 'identity-read-inaccessible'
+    $diagnostic.identityStage | Should -BeExactly 'account'
+    $diagnostic.nativeExitCode | Should -Be 7
+    $diagnostic.httpStatus | Should -Be 403
+    $diagnostic.stderrCategory | Should -BeExactly 'authorization'
+    $diagnostic.externalErrorCode | Should -BeExactly 'AADSTS50076'
+    $diagnostic.stderrSha256 | Should -Match '^[0-9a-f]{64}$'
+    $diagnostic.stderrByteCount | Should -BeGreaterThan 0
+    (Get-Item -LiteralPath (
+            Get-ChildItem -LiteralPath (
+                Join-Path $c.root 'active-pr-intake-v1\diagnostics') `
+                -File -Filter '*.json' |
+                Select-Object -First 1
+        ).FullName).Length | Should -BeLessOrEqual 4096
+    ((Get-Item -LiteralPath (
+        Get-ChildItem -LiteralPath (
+            Join-Path $c.root 'active-pr-intake-v1\diagnostics') `
+            -File -Filter '*.json' |
+            Select-Object -First 1
+        ).FullName).Attributes -band
+        [IO.FileAttributes]::ReparsePoint) | Should -Be 0
+    ($diagnostic | ConvertTo-Json -Depth 8) |
+        Should -Not -Match 'private sentinel|forbidden'
+}
+It 'does not let a private diagnostic write failure mask identity refusal' {
+    $c = New-IntakeCase -Count 1
+    $privateRoot = Join-Path $c.root 'active-pr-intake-v1'
+    New-Item -ItemType Directory -Path $privateRoot -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $privateRoot 'diagnostics') `
+        -Value 'blocks diagnostic directory' -Encoding utf8
+    $stub = Join-Path $c.root 'az-private-diagnostic-block.ps1'
+    @'
+[Console]::Error.Write('HTTP 401 authentication failed')
+exit 9
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+    $transport = New-ActivePrAzureDevOpsProvider `
+        -Config $c.config -AzureCliPath $stub
+    $result = Invoke-ActivePrIntake `
+        -Config $c.config -Provider $transport `
+        -StateRoot $c.root -RepositoryRoot $repo -Run
+
+    $result.state | Should -BeExactly 'unknown'
+    $result.reasonCodes | Should -Be @('identity-read-inaccessible')
+    $result.readCount | Should -Be 1
+    Test-Path -LiteralPath (
+        Join-Path $privateRoot 'diagnostics') -PathType Leaf |
+        Should -BeTrue
+}
 It 'treats local account UPN as metadata, not ADO identity authority' {
     $c = New-IntakeCase -Count 1
     New-Item -ItemType Directory -Path $c.root -Force | Out-Null

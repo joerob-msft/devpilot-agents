@@ -28,6 +28,159 @@ function Get-IntakeDigest {
     ).ToLowerInvariant()
 }
 
+function New-IntakeTransportFailure {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [int]$NativeExitCode = -1,
+        [byte[]]$StderrBytes = [byte[]]::new(0),
+        [AllowNull()][Exception]$SourceException = $null
+    )
+    $exception = [InvalidOperationException]::new($Message)
+    if ($NativeExitCode -ge 0) {
+        $exception.Data['nativeExitCode'] = $NativeExitCode
+    }
+    if ($null -ne $SourceException) {
+        $exception.Data['hResult'] = $SourceException.HResult
+        if ($SourceException -is [ComponentModel.Win32Exception]) {
+            $exception.Data['nativeErrorCode'] =
+                $SourceException.NativeErrorCode
+        }
+    }
+    $exception.Data['stderrByteCount'] = $StderrBytes.Length
+    if ($StderrBytes.Length -gt 0) {
+        $exception.Data['stderrSha256'] =
+            [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData($StderrBytes)).
+            ToLowerInvariant()
+        $text = [Text.UTF8Encoding]::new($false, $false).
+            GetString($StderrBytes)
+        $exception.Data['stderrCategory'] = if ($text -match
+            '(?i)\b(?:401|unauthenticated|authentication|login|required)\b') {
+            'authentication'
+        }
+        elseif ($text -match
+            '(?i)\b(?:403|forbidden|permission|authorized|authorization)\b') {
+            'authorization'
+        }
+        elseif ($text -match
+            '(?i)\b(?:timeout|timed out|dns|network|connection|proxy|tls|ssl)\b') {
+            'network'
+        }
+        elseif ($text -match
+            '(?i)\b(?:extension|command|argument|resource|area|not found)\b') {
+            'command-or-extension'
+        }
+        else { 'unknown' }
+        $http = [regex]::Match($text, '(?<!\d)(?<status>[45]\d\d)(?!\d)')
+        if ($http.Success) {
+            $exception.Data['httpStatus'] =
+                [int]$http.Groups['status'].Value
+        }
+        $externalCode = [regex]::Match(
+            $text, '(?i)\b(?<code>AADSTS\d{4,})\b')
+        if ($externalCode.Success) {
+            $exception.Data['externalErrorCode'] =
+                $externalCode.Groups['code'].Value.ToUpperInvariant()
+        }
+    }
+    else {
+        $exception.Data['stderrSha256'] = $null
+        $exception.Data['stderrCategory'] = 'none'
+    }
+    return $exception
+}
+
+function Copy-IntakeFailureData {
+    param(
+        [Parameter(Mandatory)][Exception]$Source,
+        [Parameter(Mandatory)][Exception]$Destination,
+        [string]$IdentityStage = ''
+    )
+    foreach ($key in @($Source.Data.Keys)) {
+        $Destination.Data[[string]$key] = $Source.Data[$key]
+    }
+    if ($IdentityStage) {
+        $Destination.Data['identityStage'] = $IdentityStage
+    }
+}
+
+function Write-IntakePrivateFailure {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$Generation,
+        [Parameter(Mandatory)][Exception]$Exception
+    )
+    $allowedKeys = @(
+        'identityStage', 'nativeExitCode', 'hResult', 'nativeErrorCode',
+        'httpStatus', 'stderrCategory', 'externalErrorCode',
+        'stderrSha256', 'stderrByteCount'
+    )
+    if (@($allowedKeys | Where-Object {
+                $Exception.Data.Contains($_)
+            }).Count -eq 0) {
+        return
+    }
+    $diagnostics = Resolve-AgentTrustedRoot `
+        -Path (Join-Path $Root 'diagnostics') `
+        -Kind durable-state -RepositoryRoot $RepositoryRoot -Create
+    $record = [ordered]@{
+        schemaVersion = 1
+        kind = 'active-pr-intake-private-failure'
+        generation = $Generation
+        occurredUtc = [DateTime]::UtcNow.ToString('o')
+        predicate = [string]$Exception.Message
+        exceptionType = $Exception.GetType().Name
+        hResult = $Exception.Data['hResult']
+        nativeErrorCode = $Exception.Data['nativeErrorCode']
+        identityStage = $Exception.Data['identityStage']
+        nativeExitCode = $Exception.Data['nativeExitCode']
+        httpStatus = $Exception.Data['httpStatus']
+        stderrCategory = $Exception.Data['stderrCategory']
+        externalErrorCode = $Exception.Data['externalErrorCode']
+        stderrSha256 = $Exception.Data['stderrSha256']
+        stderrByteCount = $Exception.Data['stderrByteCount']
+    }
+    $path = Join-Path $diagnostics "$Generation.json"
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
+        (ConvertTo-Json -InputObject $record -Depth 8) + "`n")
+    if ($bytes.Length -gt 4096) {
+        throw 'Private intake failure record exceeded its bounded size.'
+    }
+    $stream = [IO.File]::Open(
+        $path,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    [void](Assert-AgentTrustedFile `
+        -Path $path -AllowedRoot $diagnostics -Private)
+}
+
+function Save-IntakePrivateFailure {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$Generation,
+        [Parameter(Mandatory)][Exception]$Exception
+    )
+    try {
+        Write-IntakePrivateFailure `
+            -Root $Root -RepositoryRoot $RepositoryRoot `
+            -Generation $Generation -Exception $Exception
+    }
+    catch {
+        # Private diagnostics must never mask or alter the original
+        # fail-closed intake predicate.
+    }
+}
+
 function Assert-IntakeConfig {
     param([Collections.IDictionary]$Config)
     $guidPattern = '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$'
@@ -871,7 +1024,13 @@ function Invoke-ActivePrIntake {
                 } else { 'enumerated' }
         }
         catch {
-            $reason = [string]$_.Exception.Message
+            $failure = $_.Exception
+            $originalReason = [string]$failure.Message
+            Save-IntakePrivateFailure `
+                -Root $root -RepositoryRoot $RepositoryRoot `
+                -Generation $envelope.generation `
+                -Exception $failure
+            $reason = $originalReason
             if ($reason -cnotin @('account-mismatch', 'invalid-page', 'mutable-page',
                     'missing-page', 'page-budget', 'pr-budget', 'read-budget',
                     'time-budget', 'identity-read-inaccessible',
@@ -1036,6 +1195,10 @@ function New-ActivePrAzureDevOpsProvider {
     $digestCommand = ${function:Get-IntakeDigest}
     $changedSpansCommand =
         ${function:Get-ApprovedOwnerV2ChangedSpans}
+    $newTransportFailureCommand =
+        ${function:New-IntakeTransportFailure}
+    $copyFailureDataCommand =
+        ${function:Copy-IntakeFailureData}
     $readCeiling = [int]$Config.limits.maxReads
     $transportReads = [pscustomobject]@{ Count = 0 }
     $invoke = {
@@ -1095,11 +1258,13 @@ function New-ActivePrAzureDevOpsProvider {
         $remaining = [int][Math]::Max(1, ($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
         $process = [Diagnostics.Process]::new()
         $process.StartInfo = $start
+        $error = $null
         try {
             if (-not $process.Start()) { throw 'read-inaccessible' }
             $outputBuffer = [byte[]]::new(8192)
             $errorBuffer = [byte[]]::new(4096)
             $output = [IO.MemoryStream]::new()
+            $error = [IO.MemoryStream]::new()
             try {
                 $outputRead = $process.StandardOutput.BaseStream.ReadAsync(
                     $outputBuffer, 0, $outputBuffer.Length)
@@ -1144,6 +1309,7 @@ function New-ActivePrAzureDevOpsProvider {
                                 if (-not $process.HasExited) { $process.Kill($true) }
                                 throw 'read-budget'
                             }
+                            $error.Write($errorBuffer, 0, $n)
                             $errorRead = $process.StandardError.BaseStream.ReadAsync(
                                 $errorBuffer, 0, $errorBuffer.Length)
                         }
@@ -1152,16 +1318,35 @@ function New-ActivePrAzureDevOpsProvider {
                 $text = [Text.UTF8Encoding]::new($false, $true).GetString(
                     $output.ToArray())
             }
-            finally { $output.Dispose() }
+            finally {
+                $output.Dispose()
+            }
             $remaining = [int][Math]::Max(1,
                 ($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
             if (-not $process.WaitForExit($remaining)) {
                 if (-not $process.HasExited) { $process.Kill($true) }
                 throw 'time-budget'
             }
-            if ($process.ExitCode -ne 0) { throw 'read-inaccessible' }
+            if ($process.ExitCode -ne 0) {
+                throw (& $newTransportFailureCommand `
+                    -Message 'read-inaccessible' `
+                    -NativeExitCode $process.ExitCode `
+                    -StderrBytes $error.ToArray())
+            }
         }
-        finally { $process.Dispose() }
+        catch {
+            if ([string]$_.Exception.Message -cin @(
+                    'time-budget', 'read-budget', 'read-inaccessible')) {
+                throw
+            }
+            throw (& $newTransportFailureCommand `
+                -Message 'read-inaccessible' `
+                -SourceException $_.Exception)
+        }
+        finally {
+            if ($null -ne $error) { $error.Dispose() }
+            $process.Dispose()
+        }
         if ([string]::IsNullOrWhiteSpace($text)) { throw 'read-inaccessible' }
         try {
             return ($text | ConvertFrom-Json -AsHashtable -Depth 32)
@@ -1218,7 +1403,12 @@ function New-ActivePrAzureDevOpsProvider {
                         'response-invalid') {
                         throw 'identity-response-invalid'
                     }
-                    throw 'identity-read-inaccessible'
+                    $failure = [InvalidOperationException]::new(
+                        'identity-read-inaccessible')
+                    & $copyFailureDataCommand `
+                        -Source $_.Exception -Destination $failure `
+                        -IdentityStage account
+                    throw $failure
                 }
                 if ($account -isnot [Collections.IDictionary] -or
                     $account.user -isnot [Collections.IDictionary] -or
@@ -1241,7 +1431,12 @@ function New-ActivePrAzureDevOpsProvider {
                         'response-invalid') {
                         throw 'identity-response-invalid'
                     }
-                    throw 'identity-read-inaccessible'
+                    $failure = [InvalidOperationException]::new(
+                        'identity-read-inaccessible')
+                    & $copyFailureDataCommand `
+                        -Source $_.Exception -Destination $failure `
+                        -IdentityStage connectionData
+                    throw $failure
                 }
                 if ($connection -isnot [Collections.IDictionary] -or
                     -not $connection.Contains('authenticatedUser')) {
