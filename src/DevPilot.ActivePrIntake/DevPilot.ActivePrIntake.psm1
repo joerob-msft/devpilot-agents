@@ -1258,7 +1258,7 @@ identity = get_connection_data(sys.argv[1]).authenticated_user
 print(json.dumps({
     'authenticatedUser': {
         'id': identity.id,
-        'descriptor': identity.descriptor
+        'descriptor': identity.subject_descriptor
     }
 }))
 '@

@@ -880,8 +880,10 @@ if "%~1"=="account" (
 It 'uses the installed SDK connectionData seam with the same private context' `
     -Skip:(-not $IsWindows) -TestCases @(
         @{ Mode = 'valid'; Expected = 'valid' }
-        @{ Mode = 'mismatch'; Expected = 'account-mismatch' }
-        @{ Mode = 'invalid'; Expected = 'identity-response-invalid' }
+        @{ Mode = 'mismatch-id'; Expected = 'account-mismatch' }
+        @{ Mode = 'mismatch-subject'; Expected = 'account-mismatch' }
+        @{ Mode = 'missing-subject'
+            Expected = 'identity-response-invalid' }
     ) {
     param($Mode, $Expected)
     $c = New-IntakeCase -Count 1
@@ -904,9 +906,10 @@ import json
 import os
 
 class Identity:
-    def __init__(self, identifier, descriptor):
+    def __init__(self, identifier, descriptor, subject_descriptor):
         self.id = identifier
         self.descriptor = descriptor
+        self.subject_descriptor = subject_descriptor
 
 class ConnectionData:
     def __init__(self, identity):
@@ -921,14 +924,22 @@ def get_connection_data(organization):
             'hasSystemToken': 'SYSTEM_ACCESSTOKEN' in os.environ
         }, stream)
     mode = os.environ['ACTIVE_PR_INTAKE_SDK_MODE']
-    if mode == 'mismatch':
+    if mode == 'mismatch-id':
         return ConnectionData(Identity(
-            '99999999-9999-9999-9999-999999999999', 'aad.other'))
-    if mode == 'invalid':
+            '99999999-9999-9999-9999-999999999999',
+            'legacy.synthetic-service-account',
+            'aad.synthetic-service-account'))
+    if mode == 'mismatch-subject':
         return ConnectionData(Identity(
-            '33333333-3333-3333-3333-333333333333', None))
+            '33333333-3333-3333-3333-333333333333',
+            'legacy.synthetic-service-account', 'aad.other'))
+    if mode == 'missing-subject':
+        return ConnectionData(Identity(
+            '33333333-3333-3333-3333-333333333333',
+            'aad.synthetic-service-account', None))
     return ConnectionData(Identity(
         '33333333-3333-3333-3333-333333333333',
+        'legacy.synthetic-service-account',
         'aad.synthetic-service-account'))
 '@ | Set-Content -LiteralPath (
         Join-Path $moduleRoot 'services.py') -Encoding utf8
