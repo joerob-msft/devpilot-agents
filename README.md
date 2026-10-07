@@ -200,6 +200,23 @@ What that does and does not buy you, stated precisely:
   finding — or an empty one with `recommendedVote: approve`. Structural
   validation cannot tell a genuine finding from a fabricated one.
 
+The reviewer supports two trusted execution modes through
+`review.panelMode`:
+
+- `single` preserves the ordinary one-model review. `-Model` may select any
+  code-allowlisted model.
+- `threeRound` runs a fixed toolkit-owned sequence: GPT-5.6 Terra performs an
+  independent scan, Grok 4.7 adversarially verifies it, and GPT-6.1 Sol is the
+  only finalizer allowed to emit `REVIEWER_RESULT_V3`. Prior-round output is
+  bounded and injected as explicitly untrusted JSON-string data. `-Model` must
+  be omitted or set to the finalizer.
+
+All rounds use the same read-only tool ceiling and share the configured cycle
+timeout. Reviewer launches disable built-in MCP servers and dynamic skill
+retrieval. Consumers may also list unrelated configured servers under
+`permissions.disableMcpServers`; startup rejects disabling a server named by
+`permissions.allowTools`.
+
 That last point is why the reviewer is preview-first, and why publishing a
 review you have actually read is a first-class mode rather than a re-run:
 

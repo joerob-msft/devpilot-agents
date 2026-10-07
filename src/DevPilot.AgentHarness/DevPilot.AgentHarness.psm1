@@ -48,6 +48,7 @@ $script:AgentHarnessSupportedModels = @(
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
+    "gpt-6.1-sol",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.3-codex",
@@ -56,6 +57,7 @@ $script:AgentHarnessSupportedModels = @(
     "gemini-3.1-pro-preview",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "grok-4.7",
     "grok-4.5",
     "mai-code-1-flash-picker"
 )
@@ -543,6 +545,9 @@ function Get-AgentCopilotArgs {
         [string[]]$AllowTools = @(),
         [string[]]$DenyTools = @(),
         [string]$Model,
+        [string[]]$DisableMcpServers = @(),
+        [switch]$DisableBuiltinMcps,
+        [switch]$DisableDynamicSkillRetrieval,
         [switch]$UseYolo,
         [string]$ResumeSessionId,
         [string[]]$SupportedModels,
@@ -560,6 +565,18 @@ function Get-AgentCopilotArgs {
     }
     if ($deny.Count -gt 0) {
         $engineArgs += @("--deny-tool=$($deny -join ', ')")
+    }
+    foreach ($server in @($DisableMcpServers | Select-Object -Unique)) {
+        if ($server -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
+            throw "Get-AgentCopilotArgs: invalid MCP server name '$server'."
+        }
+        $engineArgs += @("--disable-mcp-server", $server)
+    }
+    if ($DisableBuiltinMcps) {
+        $engineArgs += "--disable-builtin-mcps"
+    }
+    if ($DisableDynamicSkillRetrieval) {
+        $engineArgs += @("--dynamic-retrieval", "skills=off")
     }
     if ($Model) {
         $validated = Assert-AgentSupportedModel -ModelId $Model -SupportedModels $SupportedModels -Where "Get-AgentCopilotArgs -Model"
