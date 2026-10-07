@@ -181,6 +181,10 @@ function New-NamedBridgeAcquisitionProvider {
     $providerCommand = $Provider
     $assertHeadCommand = ${function:Assert-NamedBridgeHead}
     $digestCommand = ${function:Get-NamedBridgeDigest}
+    $discussionPageCommand = Get-Command `
+        -Name ConvertTo-OwnerAzureDevOpsDiscussionPage `
+        -Module DevPilot.OwnerAdapters -CommandType Function `
+        -ErrorAction Stop
     $namedPolicyPath = $script:NamedPolicyPath
     $namedPolicyDigest = $script:NamedPolicyDigest
     $namedCapability = $script:NamedCapability
@@ -308,7 +312,7 @@ function New-NamedBridgeAcquisitionProvider {
                     pullRequestId = [long]$prId
                     iterationId = [int]$expected.iterationId
                 }
-                return ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                return & $discussionPageCommand `
                     -Arguments $Arguments `
                     -RawResponse ([ordered]@{
                         value = @($raw.threads)

@@ -215,6 +215,84 @@ BeforeAll {
 }
 
 Describe 'Named AreEqual current PR bridge' {
+    It 'completes in a fresh process with only bridge imports' `
+        -TestCases @(
+            @{ Mode = 'empty'; ExpectedExit = 0
+                ExpectedState = 'completed' }
+            @{ Mode = 'human'; ExpectedExit = 0
+                ExpectedState = 'completed' }
+            @{ Mode = 'drift'; ExpectedExit = 1
+                ExpectedState = 'threw' }
+        ) {
+        param($Mode, $ExpectedExit, $ExpectedState)
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $configPath = Join-Path $TestDrive `
+            "fresh-$Mode-config.json"
+        [IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $config -Depth 32) + "`n",
+            [Text.UTF8Encoding]::new($false))
+        $state = Join-Path $TestDrive "fresh-$Mode-state"
+        $manifest = Join-Path $TestDrive `
+            "fresh-$Mode-manifest.json"
+        $fixture = Join-Path $PSScriptRoot `
+            'fixtures\Invoke-NamedAreEqualBridgeFreshProcess.ps1'
+        $pwsh = (Get-Command pwsh -CommandType Application |
+            Select-Object -First 1).Source
+        $output = @(& $pwsh -NoProfile -NonInteractive `
+            -File $fixture -ConfigPath $configPath `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepoRoot $repoRoot -DiscussionMode $Mode 2>&1)
+        $LASTEXITCODE | Should -Be $ExpectedExit `
+            -Because ($output -join "`n")
+        $result = ($output -join "`n") |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $result.state | Should -BeExactly $ExpectedState
+        if ($ExpectedExit -eq 0) {
+            $result.providerWrites | Should -Be 0
+            $result.modelWrites | Should -Be 0
+            $result.recordCount | Should -Be 1
+            $result.recordState | Should -BeExactly 'completed'
+            $result.calls | Should -Contain 'Discussions'
+            $result.observation.lifecycle.status |
+                Should -BeExactly 'completed'
+            $result.observation.capability |
+                Should -BeExactly `
+                'bpm-named-areequal-arguments@1'
+            $result.observation.execution.modelStarts |
+                Should -Be 0
+            $result.observation.effects.providerWrites |
+                Should -Be 0
+            $finding = @(
+                $result.observation.findings |
+                    Select-Object -First 1)
+            $finding | Should -HaveCount 1
+            $finding[0].anchor.path |
+                Should -BeExactly 'tests/Checks.cs'
+            $finding[0].anchor.line | Should -Be 6
+            if ($Mode -ceq 'human') {
+                $artifactKinds = @(
+                    $result.observation.sourceArtifacts.kind)
+                $artifactKinds | Should -Contain `
+                    'owner-v2-discussion-snapshot'
+                $artifactKinds | Should -Contain `
+                    'owner-v2-discussion-mapping'
+                $artifactKinds | Should -Contain `
+                    'owner-v2-discussion-reviewer-identity'
+                $artifactKinds | Should -Contain `
+                    'owner-v2-discussion-raw-page'
+                $result.observation.effects.dedupe.wouldCreate |
+                    Should -Be 1
+                $finding[0].reconciliation.discussionSha256 |
+                    Should -Match '^[0-9a-f]{64}$'
+            }
+        }
+        else {
+            $result.message | Should -Match 'head-drift'
+        }
+    }
+
     It 'is default-off with no reads or durable state' {
         $config = New-BridgeConfig
         $provider = New-BridgeProvider -Config $config
