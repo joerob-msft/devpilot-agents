@@ -754,15 +754,17 @@ else {
         try {
             @'
 $CliArguments = $args
-[IO.File]::AppendAllText($env:ACTIVE_PR_INTAKE_TEST_LOG, ($CliArguments -join '|') + "`n")
+[IO.File]::AppendAllText(
+    $env:ACTIVE_PR_INTAKE_TEST_LOG,
+    (ConvertTo-Json -InputObject ([string[]]$CliArguments) -Compress) + "`n")
 $global:LASTEXITCODE = 0
 if ($env:AZURE_DEVOPS_EXT_PAT -or $env:SYSTEM_ACCESSTOKEN) {
     exit 8
 }
 if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
     '{"user":{"name":"service@example.invalid"}}'
-} elseif ($CliArguments -contains 'connectionData') {
-    '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account","uniqueName":"service@example.invalid"}}'
+} elseif ($CliArguments -contains '-c') {
+    '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account"}}'
 } elseif ($CliArguments -contains 'pullRequestIterations') {
     '{"value":[{"id":1,"sourceRefCommit":{"commitId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"targetRefCommit":{"commitId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]}'
 } elseif ($CliArguments -contains 'pullRequestIterationChanges') {
@@ -777,24 +779,37 @@ if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
     '{"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}],"count":1}'
 }
 '@ | Set-Content -LiteralPath $stub -Encoding utf8
-            $transport = New-ActivePrAzureDevOpsProvider -Config $c.config -AzureCliPath $stub
+            $transport = New-ActivePrAzureDevOpsProvider `
+                -Config $c.config -AzureCliPath $stub `
+                -ConnectionDataToolPath $stub
             $identity = & $transport 'Identity' @{}
             $identity.uniqueName | Should -Be 'service@example.invalid'
             $page = & $transport 'ListPage' @{ pass = 1; skip = 0; top = 3 }
             $page.items[0].pullRequestId | Should -Be 1
-            $requests = Get-Content -LiteralPath $log
+            $requests = @(Get-Content -LiteralPath $log | ForEach-Object {
+                    , ($_ | ConvertFrom-Json)
+                })
             $requests.Count | Should -Be 3
-            $requests[0] | Should -Match '^account\|show\|'
-            $requests[0] | Should -Not -Match 'devops\|invoke|--organization'
-            $requests[1] | Should -Match '\|--http-method\|GET\|'
-            $requests[1] | Should -Match `
-                '\|--organization\|https://dev.azure.com/example-org\|'
-            $requests[1] | Should -Not -Match `
+            ($requests[0] -join '|') | Should -Match '^account\|show\|'
+            ($requests[0] -join '|') |
+                Should -Not -Match 'devops\|invoke|--organization'
+            ($requests[1] -join '|') |
+                Should -Match '^-I\|-c\|'
+            ($requests[1] -join '|') |
+                Should -Match 'get_connection_data'
+            ($requests[1] -join '|') | Should -Match `
+                '\|https://dev.azure.com/example-org$'
+            ($requests[1] -join '|') | Should -Not -Match `
                 'POST|PATCH|PUT|DELETE|--in-file'
-            $requests[1] | Should -Match '\|--area\|location\|'
-            $requests[1] | Should -Match '\|--resource\|connectionData\|'
-            $requests[2] | Should -Match 'project=ExampleProject'
-            $requests[2] | Should -Match `
+            ($requests[1] -join '|') | Should -Not -Match `
+                'devops\|invoke|\|location\||\|connectionData\|'
+            ($requests[2] -join '|') |
+                Should -Match '\|--http-method\|GET\|'
+            ($requests[2] -join '|') | Should -Match `
+                '\|--organization\|https://dev.azure.com/example-org\|'
+            ($requests[2] -join '|') |
+                Should -Match 'project=ExampleProject'
+            ($requests[2] -join '|') | Should -Match `
                 'repositoryId=11111111-1111-1111-1111-111111111111'
             $c.config.enabled = $true
             $liveShape = Invoke-ActivePrIntake -Config $c.config -Provider $transport `
@@ -805,9 +820,12 @@ if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
             $liveShape.rules[0].evaluated | Should -Be 0
             $liveShape.rules[0].pending | Should -Be 1
             $liveShape.unmetCapabilities | Should -BeNullOrEmpty
-            foreach ($request in (Get-Content -LiteralPath $log)) {
-                if ($request -notmatch '^account\|show\|') {
-                    $request | Should -Match '\|--http-method\|GET\|'
+            foreach ($request in @(Get-Content -LiteralPath $log |
+                    ForEach-Object { , ($_ | ConvertFrom-Json) })) {
+                $requestText = $request -join '|'
+                if ($requestText -notmatch '^account\|show\|' -and
+                    $requestText -notmatch '^-I\|-c\|') {
+                    $requestText | Should -Match '\|--http-method\|GET\|'
                 }
             }
             if ($IsWindows) {
@@ -823,17 +841,17 @@ echo %*>>"%ACTIVE_PR_INTAKE_CMD_LOG%"
 if "%~1"=="account" (
   echo {"user":{"name":"service@example.invalid"}}
 ) else (
-  echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account","uniqueName":"service@example.invalid"}}
+  echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account"}}
 )
 '@ | Set-Content -LiteralPath $cmd -Encoding ascii
-                $cmdTransport = New-ActivePrAzureDevOpsProvider -Config $c.config -AzureCliPath $cmd
+                $cmdTransport = New-ActivePrAzureDevOpsProvider `
+                    -Config $c.config -AzureCliPath $cmd `
+                    -ConnectionDataToolPath $stub
                 (& $cmdTransport 'Identity' @{ timeoutMilliseconds = 3000 }).id |
                     Should -Be '33333333-3333-3333-3333-333333333333'
                 $cmdRequests = @(Get-Content -LiteralPath $cmdLog)
-                $cmdRequests | Should -HaveCount 2
+                $cmdRequests | Should -HaveCount 1
                 $cmdRequests[0] | Should -Match '^"account" "show" '
-                $cmdRequests[1] | Should -Match `
-                    '"devops" "invoke".*"location".*"connectionData"'
             }
             $slowStub = Join-Path $c.root 'az-slow-stub.ps1'
             'Start-Sleep -Seconds 5' | Set-Content -LiteralPath $slowStub -Encoding utf8
@@ -859,6 +877,108 @@ if "%~1"=="account" (
             Restore-IntakeCredentialEnvironment $credentialSnapshot
         }
     }
+It 'uses the installed SDK connectionData seam with the same private context' `
+    -Skip:(-not $IsWindows) -TestCases @(
+        @{ Mode = 'valid'; Expected = 'valid' }
+        @{ Mode = 'mismatch'; Expected = 'account-mismatch' }
+        @{ Mode = 'invalid'; Expected = 'identity-response-invalid' }
+    ) {
+    param($Mode, $Expected)
+    $c = New-IntakeCase -Count 1
+    New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+    $configRoot = Join-Path $c.root "azure-config-$Mode"
+    $moduleRoot = Join-Path $configRoot (
+        'cliextensions\azure-devops\azext_devops\dev\common')
+    New-Item -ItemType Directory -Path $moduleRoot -Force | Out-Null
+    foreach ($package in @(
+            (Split-Path -Parent (Split-Path -Parent $moduleRoot)),
+            (Split-Path -Parent $moduleRoot),
+            $moduleRoot
+        )) {
+        '' | Set-Content -LiteralPath (
+            Join-Path $package '__init__.py') -Encoding utf8
+    }
+    $sdkLog = Join-Path $c.root "sdk-$Mode.json"
+    @'
+import json
+import os
+
+class Identity:
+    def __init__(self, identifier, descriptor):
+        self.id = identifier
+        self.descriptor = descriptor
+
+class ConnectionData:
+    def __init__(self, identity):
+        self.authenticated_user = identity
+
+def get_connection_data(organization):
+    with open(os.environ['ACTIVE_PR_INTAKE_SDK_LOG'], 'w',
+              encoding='utf-8') as stream:
+        json.dump({
+            'organization': organization,
+            'hasPat': 'AZURE_DEVOPS_EXT_PAT' in os.environ,
+            'hasSystemToken': 'SYSTEM_ACCESSTOKEN' in os.environ
+        }, stream)
+    mode = os.environ['ACTIVE_PR_INTAKE_SDK_MODE']
+    if mode == 'mismatch':
+        return ConnectionData(Identity(
+            '99999999-9999-9999-9999-999999999999', 'aad.other'))
+    if mode == 'invalid':
+        return ConnectionData(Identity(
+            '33333333-3333-3333-3333-333333333333', None))
+    return ConnectionData(Identity(
+        '33333333-3333-3333-3333-333333333333',
+        'aad.synthetic-service-account'))
+'@ | Set-Content -LiteralPath (
+        Join-Path $moduleRoot 'services.py') -Encoding utf8
+    $accountStub = Join-Path $c.root 'az-account-metadata.ps1'
+    @'
+if ($env:AZURE_DEVOPS_EXT_PAT -or $env:SYSTEM_ACCESSTOKEN) {
+    exit 8
+}
+'{"user":{"name":"local-profile@example.invalid"}}'
+'@ | Set-Content -LiteralPath $accountStub -Encoding utf8
+    $python = 'C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\python.exe'
+    Test-Path -LiteralPath $python -PathType Leaf | Should -BeTrue
+    $outerConfig = $env:AZURE_CONFIG_DIR
+    $credentialSnapshot = Set-IntakeCredentialSentinels
+    try {
+        $env:AZURE_CONFIG_DIR = $configRoot
+        $env:ACTIVE_PR_INTAKE_SDK_LOG = $sdkLog
+        $env:ACTIVE_PR_INTAKE_SDK_MODE = $Mode
+        $transport = New-ActivePrAzureDevOpsProvider `
+            -Config $c.config -AzureCliPath $accountStub `
+            -ConnectionDataToolPath $python
+        if ($Expected -ceq 'valid') {
+            $identity = & $transport 'Identity' @{
+                timeoutMilliseconds = 3000
+            }
+            $identity.id | Should -BeExactly $c.config.expectedAccount.id
+            $identity.descriptor |
+                Should -BeExactly $c.config.expectedAccount.descriptor
+            $identity.uniqueName |
+                Should -BeExactly $c.config.expectedAccount.uniqueName
+        }
+        else {
+            { & $transport 'Identity' @{
+                    timeoutMilliseconds = 3000
+                } } | Should -Throw $Expected
+        }
+        $sdkInvocation = Get-Content -LiteralPath $sdkLog -Raw |
+            ConvertFrom-Json -AsHashtable
+        $sdkInvocation.organization |
+            Should -BeExactly $c.config.organization
+        $sdkInvocation.hasPat | Should -BeFalse
+        $sdkInvocation.hasSystemToken | Should -BeFalse
+    }
+    finally {
+        $env:AZURE_CONFIG_DIR = $outerConfig
+        Remove-Item Env:\ACTIVE_PR_INTAKE_SDK_LOG,
+            Env:\ACTIVE_PR_INTAKE_SDK_MODE -ErrorAction SilentlyContinue
+        Restore-IntakeCredentialEnvironment $credentialSnapshot
+    }
+}
 It 'retains command resolution validation and empty response stages' `
     -Skip:(-not $IsWindows) -TestCases @(
         @{ Name = 'missing'; ExpectedStage = 'command-resolution'
@@ -941,11 +1061,12 @@ if (`$args -contains 'account' -and `$args -contains 'show') {
     '{"user":{"name":"service@example.invalid"}}'
     exit 0
 }
-if (`$args -notcontains 'connectionData') { exit 9 }
+if (`$args -notcontains '-c') { exit 9 }
 '$Body'
 "@ | Set-Content -LiteralPath $stub -Encoding utf8
     $transport = New-ActivePrAzureDevOpsProvider `
-        -Config $c.config -AzureCliPath $stub
+        -Config $c.config -AzureCliPath $stub `
+        -ConnectionDataToolPath $stub
     $expected = switch ($Name) {
         read { 'identity-read-inaccessible' }
         malformed { 'identity-response-invalid' }
@@ -1087,15 +1208,16 @@ It 'treats local account UPN as metadata, not ADO identity authority' {
 if ($args -contains 'account' -and $args -contains 'show') {
     '{"user":{"name":"different-local-profile@example.invalid"}}'
 }
-elseif ($args -contains 'connectionData') {
-    '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account","uniqueName":"service@example.invalid"}}'
+elseif ($args -contains '-c') {
+    '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account"}}'
 }
 else {
     exit 9
 }
 '@ | Set-Content -LiteralPath $stub -Encoding utf8
     $transport = New-ActivePrAzureDevOpsProvider `
-        -Config $c.config -AzureCliPath $stub
+        -Config $c.config -AzureCliPath $stub `
+        -ConnectionDataToolPath $stub
     $identity = & $transport 'Identity' @{
         timeoutMilliseconds = 3000
     }

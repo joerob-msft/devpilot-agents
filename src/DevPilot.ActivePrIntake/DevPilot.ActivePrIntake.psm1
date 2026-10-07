@@ -1217,7 +1217,11 @@ function Invoke-ActivePrIntake {
 
 function New-ActivePrAzureDevOpsProvider {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][Collections.IDictionary]$Config, [string]$AzureCliPath = 'az')
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Config,
+        [string]$AzureCliPath = 'az',
+        [Parameter(DontShow)][string]$ConnectionDataToolPath = ''
+    )
     Assert-IntakeConfig $Config
     $org = [string]$Config.organization
     $project = [string]$Config.projectName
@@ -1235,6 +1239,29 @@ function New-ActivePrAzureDevOpsProvider {
         ${function:Copy-IntakeFailureData}
     $readCeiling = [int]$Config.limits.maxReads
     $transportReads = [pscustomobject]@{ Count = 0 }
+    $connectionDataCommand = @'
+import json
+import os
+import sys
+
+config_root = os.environ.get('AZURE_CONFIG_DIR')
+if not config_root:
+    config_root = os.path.join(os.path.expanduser('~'), '.azure')
+extension_root = os.path.join(
+    config_root, 'cliextensions', 'azure-devops')
+if not os.path.isdir(extension_root):
+    raise RuntimeError('azure-devops extension unavailable')
+sys.path.insert(0, extension_root)
+from azext_devops.dev.common.services import get_connection_data
+
+identity = get_connection_data(sys.argv[1]).authenticated_user
+print(json.dumps({
+    'authenticatedUser': {
+        'id': identity.id,
+        'descriptor': identity.descriptor
+    }
+}))
+'@
     $invoke = {
         param([string]$Area, [string]$Resource, [string[]]$Route,
             [string[]]$Query, [DateTime]$Deadline)
@@ -1242,6 +1269,9 @@ function New-ActivePrAzureDevOpsProvider {
         $transportReads.Count++
         $argv = if ($Area -ceq '__account__') {
             @('account', 'show', '--only-show-errors', '-o', 'json')
+        }
+        elseif ($Area -ceq '__connection__') {
+            @('-I', '-c', $connectionDataCommand, $org)
         }
         else {
             $arguments = @(
@@ -1264,7 +1294,28 @@ function New-ActivePrAzureDevOpsProvider {
         }
         $transportStage = 'command-resolution'
         try {
-            $tools = @(Get-Command -Name $AzureCliPath `
+            $requestedTool = $AzureCliPath
+            if ($Area -ceq '__connection__') {
+                if ($ConnectionDataToolPath) {
+                    $requestedTool = $ConnectionDataToolPath
+                }
+                else {
+                    $azureTools = @(Get-Command -Name $AzureCliPath `
+                        -CommandType Application,ExternalScript `
+                        -ErrorAction Stop)
+                    if ($azureTools.Count -ne 1 -or
+                        [IO.Path]::GetExtension(
+                            $azureTools[0].Source) -cnotin @('.cmd', '.bat')) {
+                        throw [InvalidOperationException]::new(
+                            'read-inaccessible')
+                    }
+                    $requestedTool = Join-Path (
+                        Split-Path -Parent (
+                            Split-Path -Parent $azureTools[0].Source)
+                    ) 'python.exe'
+                }
+            }
+            $tools = @(Get-Command -Name $requestedTool `
                 -CommandType Application,ExternalScript -ErrorAction Stop)
             if ($tools.Count -ne 1) {
                 throw [InvalidOperationException]::new(
@@ -1496,8 +1547,8 @@ function New-ActivePrAzureDevOpsProvider {
                     throw 'identity-response-invalid'
                 }
                 try {
-                    $connection = & $invoke 'location' `
-                        'connectionData' @() @() $deadline
+                    $connection = & $invoke '__connection__' `
+                        '' @() @() $deadline
                 }
                 catch {
                     if ([string]$_.Exception.Message -cin @(
@@ -1524,16 +1575,12 @@ function New-ActivePrAzureDevOpsProvider {
                     $identity -isnot [Collections.IDictionary] -or
                     -not $identity.Contains('id') -or
                     -not $identity.Contains('descriptor') -or
-                    -not $identity.Contains('uniqueName') -or
                     $identity.id -isnot [string] -or
                     $identity.descriptor -isnot [string] -or
-                    $identity.uniqueName -isnot [string] -or
                     [string]$identity.id -cnotmatch
                         '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
                     [string]::IsNullOrWhiteSpace(
-                        [string]$identity.descriptor) -or
-                    [string]::IsNullOrWhiteSpace(
-                        [string]$identity.uniqueName)) {
+                        [string]$identity.descriptor)) {
                     throw 'identity-response-invalid'
                 }
                 if ([string]$identity.id -ine
@@ -1545,7 +1592,7 @@ function New-ActivePrAzureDevOpsProvider {
                 return @{
                     id = [string]$identity.id
                     descriptor = [string]$identity.descriptor
-                    uniqueName = [string]$identity.uniqueName
+                    uniqueName = [string]$Config.expectedAccount.uniqueName
                 }
             }
             ListPage {
