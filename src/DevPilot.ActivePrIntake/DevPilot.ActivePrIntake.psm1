@@ -1070,6 +1070,8 @@ function New-ActivePrAzureDevOpsProvider {
         $start.UseShellExecute = $false
         $start.RedirectStandardOutput = $true
         $start.RedirectStandardError = $true
+        [void]$start.Environment.Remove('AZURE_DEVOPS_EXT_PAT')
+        [void]$start.Environment.Remove('SYSTEM_ACCESSTOKEN')
         $extension = [IO.Path]::GetExtension($tool.Source)
         if ($extension -in @('.cmd', '.bat')) {
             if ($tool.Source -match '[%!"&|<>^]') { throw 'read-inaccessible' }
@@ -1161,7 +1163,12 @@ function New-ActivePrAzureDevOpsProvider {
         }
         finally { $process.Dispose() }
         if ([string]::IsNullOrWhiteSpace($text)) { throw 'read-inaccessible' }
-        return ($text | ConvertFrom-Json -AsHashtable -Depth 32)
+        try {
+            return ($text | ConvertFrom-Json -AsHashtable -Depth 32)
+        }
+        catch {
+            throw 'response-invalid'
+        }
     }.GetNewClosure()
     $getItem = {
         param(
@@ -1200,32 +1207,73 @@ function New-ActivePrAzureDevOpsProvider {
         switch -CaseSensitive ($Operation) {
             Identity {
                 try {
-                    $r = & $invoke '__account__' '' @() @() $deadline
+                    $account = & $invoke '__account__' '' @() @() $deadline
                 }
                 catch {
                     if ([string]$_.Exception.Message -cin @(
                             'time-budget', 'read-budget')) {
                         throw [string]$_.Exception.Message
                     }
+                    if ([string]$_.Exception.Message -ceq
+                        'response-invalid') {
+                        throw 'identity-response-invalid'
+                    }
                     throw 'identity-read-inaccessible'
                 }
-                if ($r -isnot [Collections.IDictionary] -or
-                    $r.user -isnot [Collections.IDictionary] -or
-                    -not $r.user.Contains('name') -or
-                    $r.user.name -isnot [string] -or
-                    [string]::IsNullOrWhiteSpace([string]$r.user.name)) {
+                if ($account -isnot [Collections.IDictionary] -or
+                    $account.user -isnot [Collections.IDictionary] -or
+                    -not $account.user.Contains('name') -or
+                    $account.user.name -isnot [string] -or
+                    [string]::IsNullOrWhiteSpace(
+                        [string]$account.user.name)) {
                     throw 'identity-response-invalid'
                 }
-                if ([string]$r.user.name -ine
-                    [string]$Config.expectedAccount.uniqueName) {
+                try {
+                    $connection = & $invoke 'location' `
+                        'connectionData' @() @() $deadline
+                }
+                catch {
+                    if ([string]$_.Exception.Message -cin @(
+                            'time-budget', 'read-budget')) {
+                        throw [string]$_.Exception.Message
+                    }
+                    if ([string]$_.Exception.Message -ceq
+                        'response-invalid') {
+                        throw 'identity-response-invalid'
+                    }
+                    throw 'identity-read-inaccessible'
+                }
+                if ($connection -isnot [Collections.IDictionary] -or
+                    -not $connection.Contains('authenticatedUser')) {
+                    throw 'identity-response-invalid'
+                }
+                $identity = $connection.authenticatedUser
+                if (
+                    $identity -isnot [Collections.IDictionary] -or
+                    -not $identity.Contains('id') -or
+                    -not $identity.Contains('descriptor') -or
+                    -not $identity.Contains('uniqueName') -or
+                    $identity.id -isnot [string] -or
+                    $identity.descriptor -isnot [string] -or
+                    $identity.uniqueName -isnot [string] -or
+                    [string]$identity.id -cnotmatch
+                        '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' -or
+                    [string]::IsNullOrWhiteSpace(
+                        [string]$identity.descriptor) -or
+                    [string]::IsNullOrWhiteSpace(
+                        [string]$identity.uniqueName)) {
+                    throw 'identity-response-invalid'
+                }
+                if ([string]$identity.id -ine
+                        [string]$Config.expectedAccount.id -or
+                    [string]$identity.descriptor -cne
+                        [string]$Config.expectedAccount.descriptor) {
                     throw 'account-mismatch'
                 }
                 return @{
-                    id = [string]$Config.expectedAccount.id
-                    descriptor =
-                        [string]$Config.expectedAccount.descriptor
-                    uniqueName =
-                        [string]$Config.expectedAccount.uniqueName
+                    id = [string]$identity.id
+                    descriptor = [string]$identity.descriptor
+                    uniqueName = [string]$identity.uniqueName
                 }
             }
             ListPage {

@@ -115,7 +115,8 @@ BeforeAll {
             [string]$SourceCommit = ('c' * 40),
             [ValidateRange(1, 8)][int]$MethodCount = 1,
             [string]$ChangeFailure = '',
-            [bool]$IsDraft = $false
+            [bool]$IsDraft = $false,
+            [AllowNull()][Collections.IDictionary]$IdentityOverride = $null
         )
         $calls = [Collections.Generic.List[string]]::new()
         $lines = [Collections.Generic.List[string]]::new()
@@ -153,7 +154,9 @@ BeforeAll {
             [void]$calls.Add([string]$Operation)
             switch ($Operation) {
                 'Identity' {
-                    return [ordered]@{} + $Config.expectedAccount
+                    return [ordered]@{} + $(if ($null -ne $IdentityOverride) {
+                        $IdentityOverride
+                    } else { $Config.expectedAccount })
                 }
                 'ListPage' {
                     if ([int]$Request.skip -eq 0) {
@@ -312,6 +315,29 @@ Describe 'Named AreEqual current PR bridge' {
         $result.intake.populationKnown | Should -BeTrue
         $result.intake.inventory.state | Should -BeExactly 'complete'
         $result.intake.inventory.eligible | Should -Be 0
+        Test-Path -LiteralPath $manifest | Should -BeFalse
+    }
+
+    It 'keeps local-profile A plus actual ADO principal B unknown' {
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $provider = New-BridgeProvider -Config $config `
+            -IdentityOverride ([ordered]@{
+                id = '99999999-9999-9999-9999-999999999999'
+                descriptor = 'aad.other-principal'
+                uniqueName = [string]$config.expectedAccount.uniqueName
+            })
+        $state = Join-Path $TestDrive 'identity-mismatch-state'
+        $manifest = Join-Path $TestDrive 'identity-mismatch-manifest.json'
+        $result = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $provider.Handler `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepositoryRoot $repoRoot -Run
+
+        $result.state | Should -BeExactly 'unknown'
+        $result.intake.reasonCodes | Should -Contain 'account-mismatch'
+        $result.intake.counts.attempted | Should -Be 0
+        @($result.records) | Should -HaveCount 0
         Test-Path -LiteralPath $manifest | Should -BeFalse
     }
 
