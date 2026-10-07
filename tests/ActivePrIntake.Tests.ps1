@@ -95,6 +95,48 @@ BeforeAll {
         Invoke-ActivePrIntake -Config $Case.config -Provider $Case.provider `
             -StateRoot $Case.root -RepositoryRoot $repo -Run
     }
+    function Save-IntakeCredentialEnvironment {
+        $environment = [Environment]::GetEnvironmentVariables(
+            [EnvironmentVariableTarget]::Process)
+        return [ordered]@{
+            patPresent = $environment.Contains('AZURE_DEVOPS_EXT_PAT')
+            patValue = [Environment]::GetEnvironmentVariable(
+                'AZURE_DEVOPS_EXT_PAT',
+                [EnvironmentVariableTarget]::Process)
+            systemPresent =
+                $environment.Contains('SYSTEM_ACCESSTOKEN')
+            systemValue = [Environment]::GetEnvironmentVariable(
+                'SYSTEM_ACCESSTOKEN',
+                [EnvironmentVariableTarget]::Process)
+        }
+    }
+    function Set-IntakeCredentialSentinels {
+        $snapshot = Save-IntakeCredentialEnvironment
+        [Environment]::SetEnvironmentVariable(
+            'AZURE_DEVOPS_EXT_PAT',
+            'must-not-reach-child',
+            [EnvironmentVariableTarget]::Process)
+        [Environment]::SetEnvironmentVariable(
+            'SYSTEM_ACCESSTOKEN',
+            'must-not-reach-child',
+            [EnvironmentVariableTarget]::Process)
+        return $snapshot
+    }
+    function Restore-IntakeCredentialEnvironment {
+        param([Collections.IDictionary]$Snapshot)
+        [Environment]::SetEnvironmentVariable(
+            'AZURE_DEVOPS_EXT_PAT',
+            $(if ([bool]$Snapshot.patPresent) {
+                [string]$Snapshot.patValue
+            } else { $null }),
+            [EnvironmentVariableTarget]::Process)
+        [Environment]::SetEnvironmentVariable(
+            'SYSTEM_ACCESSTOKEN',
+            $(if ([bool]$Snapshot.systemPresent) {
+                [string]$Snapshot.systemValue
+            } else { $null }),
+            [EnvironmentVariableTarget]::Process)
+    }
 }
 AfterAll {
     foreach ($root in $script:roots) {
@@ -707,6 +749,7 @@ else {
         New-Item -ItemType Directory -Path $c.root -Force | Out-Null
         $stub = Join-Path $c.root 'az-read-stub.ps1'
         $log = Join-Path $c.root 'az-requests.log'
+        $credentialSnapshot = Set-IntakeCredentialSentinels
         $env:ACTIVE_PR_INTAKE_TEST_LOG = $log
         try {
             @'
@@ -735,8 +778,6 @@ if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
 }
 '@ | Set-Content -LiteralPath $stub -Encoding utf8
             $transport = New-ActivePrAzureDevOpsProvider -Config $c.config -AzureCliPath $stub
-            $env:AZURE_DEVOPS_EXT_PAT = 'must-not-reach-child'
-            $env:SYSTEM_ACCESSTOKEN = 'must-not-reach-child'
             $identity = & $transport 'Identity' @{}
             $identity.uniqueName | Should -Be 'service@example.invalid'
             $page = & $transport 'ListPage' @{ pass = 1; skip = 0; top = 3 }
@@ -800,9 +841,9 @@ if "%~1"=="account" (
                 Should -Throw 'read-budget'
         }
         finally {
-            Remove-Item Env:\ACTIVE_PR_INTAKE_TEST_LOG,
-                Env:\AZURE_DEVOPS_EXT_PAT,
-                Env:\SYSTEM_ACCESSTOKEN -ErrorAction SilentlyContinue
+            Remove-Item Env:\ACTIVE_PR_INTAKE_TEST_LOG `
+                -ErrorAction SilentlyContinue
+            Restore-IntakeCredentialEnvironment $credentialSnapshot
         }
     }
 It 'preserves identity read and response failures as explicit predicates' `
@@ -863,5 +904,56 @@ else {
         Should -BeExactly $c.config.expectedAccount.descriptor
     $identity.uniqueName | Should -BeExactly `
         $c.config.expectedAccount.uniqueName
+}
+It 'restores caller credential environment when originally <State>' `
+    -TestCases @(
+        @{ State = 'absent' }
+        @{ State = 'present' }
+    ) {
+    param($State)
+    $outer = Save-IntakeCredentialEnvironment
+    try {
+        if ($State -ceq 'present') {
+            [Environment]::SetEnvironmentVariable(
+                'AZURE_DEVOPS_EXT_PAT',
+                'original-pat-value',
+                [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable(
+                'SYSTEM_ACCESSTOKEN',
+                'original-system-value',
+                [EnvironmentVariableTarget]::Process)
+        }
+        else {
+            [Environment]::SetEnvironmentVariable(
+                'AZURE_DEVOPS_EXT_PAT', $null,
+                [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable(
+                'SYSTEM_ACCESSTOKEN', $null,
+                [EnvironmentVariableTarget]::Process)
+        }
+        $expected = Save-IntakeCredentialEnvironment
+        $snapshot = Set-IntakeCredentialSentinels
+        try {
+            throw 'simulated assertion failure'
+        }
+        catch {
+            [string]$_.Exception.Message |
+                Should -BeExactly 'simulated assertion failure'
+        }
+        finally {
+            Restore-IntakeCredentialEnvironment $snapshot
+        }
+        $actual = Save-IntakeCredentialEnvironment
+        $actual.patPresent | Should -Be $expected.patPresent
+        $actual.systemPresent | Should -Be $expected.systemPresent
+        if ($State -ceq 'present') {
+            $actual.patValue | Should -BeExactly 'original-pat-value'
+            $actual.systemValue |
+                Should -BeExactly 'original-system-value'
+        }
+    }
+    finally {
+        Restore-IntakeCredentialEnvironment $outer
+    }
 }
 }
