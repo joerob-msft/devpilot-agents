@@ -31,19 +31,47 @@ function Get-IntakeDigest {
 function New-IntakeTransportFailure {
     param(
         [Parameter(Mandatory)][string]$Message,
+        [ValidateSet(
+            'command-resolution',
+            'command-validation',
+            'process-start',
+            'process-io',
+            'process-exit',
+            'response-empty'
+        )]
+        [string]$TransportStage = 'process-exit',
         [int]$NativeExitCode = -1,
         [byte[]]$StderrBytes = [byte[]]::new(0),
         [AllowNull()][Exception]$SourceException = $null
     )
     $exception = [InvalidOperationException]::new($Message)
+    $exception.Data['transportStage'] = $TransportStage
     if ($NativeExitCode -ge 0) {
         $exception.Data['nativeExitCode'] = $NativeExitCode
     }
     if ($null -ne $SourceException) {
-        $exception.Data['hResult'] = $SourceException.HResult
-        if ($SourceException -is [ComponentModel.Win32Exception]) {
+        $diagnosticException = $SourceException
+        if ($diagnosticException -is
+                [Management.Automation.MethodInvocationException] -and
+            $null -ne $diagnosticException.InnerException) {
+            $diagnosticException = $diagnosticException.InnerException
+        }
+        $exception.Data['underlyingExceptionType'] = switch (
+            $diagnosticException.GetType().Name) {
+            'ArgumentException' { 'ArgumentException' }
+            'CommandNotFoundException' { 'CommandNotFoundException' }
+            'IOException' { 'IOException' }
+            'InvalidOperationException' { 'InvalidOperationException' }
+            'NotSupportedException' { 'NotSupportedException' }
+            'RuntimeException' { 'RuntimeException' }
+            'UnauthorizedAccessException' { 'UnauthorizedAccessException' }
+            'Win32Exception' { 'Win32Exception' }
+            default { 'Other' }
+        }
+        $exception.Data['hResult'] = $diagnosticException.HResult
+        if ($diagnosticException -is [ComponentModel.Win32Exception]) {
             $exception.Data['nativeErrorCode'] =
-                $SourceException.NativeErrorCode
+                $diagnosticException.NativeErrorCode
         }
     }
     $exception.Data['stderrByteCount'] = $StderrBytes.Length
@@ -112,7 +140,8 @@ function Write-IntakePrivateFailure {
         [Parameter(Mandatory)][Exception]$Exception
     )
     $allowedKeys = @(
-        'identityStage', 'nativeExitCode', 'hResult', 'nativeErrorCode',
+        'identityStage', 'transportStage', 'underlyingExceptionType',
+        'nativeExitCode', 'hResult', 'nativeErrorCode',
         'httpStatus', 'stderrCategory', 'externalErrorCode',
         'stderrSha256', 'stderrByteCount'
     )
@@ -131,6 +160,9 @@ function Write-IntakePrivateFailure {
         occurredUtc = [DateTime]::UtcNow.ToString('o')
         predicate = [string]$Exception.Message
         exceptionType = $Exception.GetType().Name
+        transportStage = $Exception.Data['transportStage']
+        underlyingExceptionType =
+            $Exception.Data['underlyingExceptionType']
         hResult = $Exception.Data['hResult']
         nativeErrorCode = $Exception.Data['nativeErrorCode']
         identityStage = $Exception.Data['identityStage']
@@ -1230,39 +1262,72 @@ function New-ActivePrAzureDevOpsProvider {
             }
             $arguments
         }
-        $tool = Get-Command -Name $AzureCliPath -CommandType Application,ExternalScript -ErrorAction Stop
-        $start = [Diagnostics.ProcessStartInfo]::new()
-        $start.UseShellExecute = $false
-        $start.RedirectStandardOutput = $true
-        $start.RedirectStandardError = $true
-        [void]$start.Environment.Remove('AZURE_DEVOPS_EXT_PAT')
-        [void]$start.Environment.Remove('SYSTEM_ACCESSTOKEN')
-        $extension = [IO.Path]::GetExtension($tool.Source)
-        if ($extension -in @('.cmd', '.bat')) {
-            if ($tool.Source -match '[%!"&|<>^]') { throw 'read-inaccessible' }
-            $start.FileName = $env:ComSpec
-            $quoted = @($argv | ForEach-Object {
-                    if ($_ -match '[%!"&|<>^]') { throw 'read-inaccessible' }
-                    '"' + $_ + '"'
-                })
-            $start.Arguments = ('/d /s /c ""{0}" {1}"' -f $tool.Source, ($quoted -join ' '))
-        }
-        elseif ($extension -eq '.ps1') {
-            $start.FileName = (Get-Command pwsh -CommandType Application -ErrorAction Stop).Source
-            foreach ($arg in @('-NoProfile', '-NonInteractive', '-File', $tool.Source) + $argv) {
-                $start.ArgumentList.Add($arg)
+        $transportStage = 'command-resolution'
+        try {
+            $tools = @(Get-Command -Name $AzureCliPath `
+                -CommandType Application,ExternalScript -ErrorAction Stop)
+            if ($tools.Count -ne 1) {
+                throw [InvalidOperationException]::new(
+                    'read-inaccessible')
+            }
+            $tool = $tools[0]
+            $transportStage = 'command-validation'
+            $start = [Diagnostics.ProcessStartInfo]::new()
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            [void]$start.Environment.Remove('AZURE_DEVOPS_EXT_PAT')
+            [void]$start.Environment.Remove('SYSTEM_ACCESSTOKEN')
+            $extension = [IO.Path]::GetExtension($tool.Source)
+            if ($extension -in @('.cmd', '.bat')) {
+                if ($tool.Source -match '[%!"&|<>^]') {
+                    throw 'read-inaccessible'
+                }
+                $start.FileName = $env:ComSpec
+                $quoted = @($argv | ForEach-Object {
+                        if ($_ -match '[%!"&|<>^]') {
+                            throw 'read-inaccessible'
+                        }
+                        '"' + $_ + '"'
+                    })
+                $start.Arguments = (
+                    '/d /s /c ""{0}" {1}"' -f
+                    $tool.Source, ($quoted -join ' '))
+            }
+            elseif ($extension -eq '.ps1') {
+                $start.FileName = (Get-Command pwsh `
+                    -CommandType Application -ErrorAction Stop).Source
+                foreach ($arg in @(
+                        '-NoProfile',
+                        '-NonInteractive',
+                        '-File',
+                        $tool.Source
+                    ) + $argv) {
+                    $start.ArgumentList.Add($arg)
+                }
+            }
+            else {
+                $start.FileName = $tool.Source
+                foreach ($arg in $argv) {
+                    $start.ArgumentList.Add($arg)
+                }
             }
         }
-        else {
-            $start.FileName = $tool.Source
-            foreach ($arg in $argv) { $start.ArgumentList.Add($arg) }
+        catch {
+            throw (& $newTransportFailureCommand `
+                -Message 'read-inaccessible' `
+                -TransportStage $transportStage `
+                -SourceException $_.Exception)
         }
         $remaining = [int][Math]::Max(1, ($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
         $process = [Diagnostics.Process]::new()
         $process.StartInfo = $start
         $error = $null
+        $stderrBytes = [byte[]]::new(0)
+        $transportStage = 'process-start'
         try {
             if (-not $process.Start()) { throw 'read-inaccessible' }
+            $transportStage = 'process-io'
             $outputBuffer = [byte[]]::new(8192)
             $errorBuffer = [byte[]]::new(4096)
             $output = [IO.MemoryStream]::new()
@@ -1325,15 +1390,18 @@ function New-ActivePrAzureDevOpsProvider {
             }
             $remaining = [int][Math]::Max(1,
                 ($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            $transportStage = 'process-exit'
             if (-not $process.WaitForExit($remaining)) {
                 if (-not $process.HasExited) { $process.Kill($true) }
                 throw 'time-budget'
             }
+            $stderrBytes = $error.ToArray()
             if ($process.ExitCode -ne 0) {
                 throw (& $newTransportFailureCommand `
                     -Message 'read-inaccessible' `
+                    -TransportStage 'process-exit' `
                     -NativeExitCode $process.ExitCode `
-                    -StderrBytes $error.ToArray())
+                    -StderrBytes $stderrBytes)
             }
         }
         catch {
@@ -1343,13 +1411,20 @@ function New-ActivePrAzureDevOpsProvider {
             }
             throw (& $newTransportFailureCommand `
                 -Message 'read-inaccessible' `
+                -TransportStage $transportStage `
                 -SourceException $_.Exception)
         }
         finally {
             if ($null -ne $error) { $error.Dispose() }
             $process.Dispose()
         }
-        if ([string]::IsNullOrWhiteSpace($text)) { throw 'read-inaccessible' }
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            throw (& $newTransportFailureCommand `
+                -Message 'read-inaccessible' `
+                -TransportStage 'response-empty' `
+                -NativeExitCode 0 `
+                -StderrBytes $stderrBytes)
+        }
         try {
             return ($text | ConvertFrom-Json -AsHashtable -Depth 32)
         }

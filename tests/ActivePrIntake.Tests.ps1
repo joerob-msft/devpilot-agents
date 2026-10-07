@@ -811,9 +811,15 @@ if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
                 }
             }
             if ($IsWindows) {
-                $cmd = Join-Path $c.root 'az-read-stub.cmd'
+                $cmdRoot = Join-Path $c.root 'command path with spaces'
+                New-Item -ItemType Directory -Path $cmdRoot -Force |
+                    Out-Null
+                $cmd = Join-Path $cmdRoot 'az-read-stub.cmd'
+                $cmdLog = Join-Path $cmdRoot 'arguments.log'
+                $env:ACTIVE_PR_INTAKE_CMD_LOG = $cmdLog
                 @'
 @echo off
+echo %*>>"%ACTIVE_PR_INTAKE_CMD_LOG%"
 if "%~1"=="account" (
   echo {"user":{"name":"service@example.invalid"}}
 ) else (
@@ -823,6 +829,11 @@ if "%~1"=="account" (
                 $cmdTransport = New-ActivePrAzureDevOpsProvider -Config $c.config -AzureCliPath $cmd
                 (& $cmdTransport 'Identity' @{ timeoutMilliseconds = 3000 }).id |
                     Should -Be '33333333-3333-3333-3333-333333333333'
+                $cmdRequests = @(Get-Content -LiteralPath $cmdLog)
+                $cmdRequests | Should -HaveCount 2
+                $cmdRequests[0] | Should -Match '^"account" "show" '
+                $cmdRequests[1] | Should -Match `
+                    '"devops" "invoke".*"location".*"connectionData"'
             }
             $slowStub = Join-Path $c.root 'az-slow-stub.ps1'
             'Start-Sleep -Seconds 5' | Set-Content -LiteralPath $slowStub -Encoding utf8
@@ -843,9 +854,74 @@ if "%~1"=="account" (
         finally {
             Remove-Item Env:\ACTIVE_PR_INTAKE_TEST_LOG `
                 -ErrorAction SilentlyContinue
+            Remove-Item Env:\ACTIVE_PR_INTAKE_CMD_LOG `
+                -ErrorAction SilentlyContinue
             Restore-IntakeCredentialEnvironment $credentialSnapshot
         }
     }
+It 'retains command resolution validation and empty response stages' `
+    -Skip:(-not $IsWindows) -TestCases @(
+        @{ Name = 'missing'; ExpectedStage = 'command-resolution'
+            ExpectedType = 'CommandNotFoundException' }
+        @{ Name = 'metachar'; ExpectedStage = 'command-validation'
+            ExpectedType = 'RuntimeException' }
+        @{ Name = 'empty'; ExpectedStage = 'response-empty'
+            ExpectedType = $null }
+    ) {
+    param($Name, $ExpectedStage, $ExpectedType)
+    $c = New-IntakeCase -Count 1
+    New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+    $stateRoot = Join-Path $c.root "state-$Name"
+    $stub = switch ($Name) {
+        missing {
+            Join-Path $c.root 'missing command path\az-missing.cmd'
+        }
+        metachar {
+            $unsafeRoot = Join-Path $c.root 'unsafe&command'
+            New-Item -ItemType Directory -Path $unsafeRoot -Force |
+                Out-Null
+            $path = Join-Path $unsafeRoot 'az-refused.cmd'
+            '@echo off' | Set-Content -LiteralPath $path -Encoding ascii
+            $path
+        }
+        empty {
+            $emptyRoot = Join-Path $c.root 'empty command path'
+            New-Item -ItemType Directory -Path $emptyRoot -Force |
+                Out-Null
+            $path = Join-Path $emptyRoot 'az-empty.cmd'
+            "@echo off`r`nexit /b 0" |
+                Set-Content -LiteralPath $path -Encoding ascii
+            $path
+        }
+    }
+    $transport = New-ActivePrAzureDevOpsProvider `
+        -Config $c.config -AzureCliPath $stub
+    $result = Invoke-ActivePrIntake `
+        -Config $c.config -Provider $transport `
+        -StateRoot $stateRoot -RepositoryRoot $repo -Run
+
+    $result.state | Should -BeExactly 'unknown'
+    $result.reasonCodes | Should -Be @('identity-read-inaccessible')
+    $diagnostic = Get-ChildItem -LiteralPath (
+        Join-Path $stateRoot 'active-pr-intake-v1\diagnostics') `
+        -File -Filter '*.json' |
+        Select-Object -First 1 |
+        ForEach-Object {
+            Get-Content -LiteralPath $_.FullName -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 8
+        }
+    $diagnostic.identityStage | Should -BeExactly 'account'
+    $diagnostic.transportStage | Should -BeExactly $ExpectedStage
+    $diagnostic.underlyingExceptionType | Should -BeExactly $ExpectedType
+    if ($Name -ceq 'empty') {
+        $diagnostic.nativeExitCode | Should -Be 0
+        $diagnostic.stderrCategory | Should -BeExactly 'none'
+        $diagnostic.stderrByteCount | Should -Be 0
+        $diagnostic.stderrSha256 | Should -BeNullOrEmpty
+    }
+    ($diagnostic | ConvertTo-Json -Depth 8) |
+        Should -Not -Match 'missing command path|unsafe&command|empty command path'
+}
 It 'preserves identity read and response failures as explicit predicates' `
     -TestCases @(
         @{ Name = 'read'; ExitCode = 7; Body = '' }
@@ -909,6 +985,7 @@ exit 7
         Should -BeExactly 'active-pr-intake-private-failure'
     $diagnostic.predicate | Should -BeExactly 'identity-read-inaccessible'
     $diagnostic.identityStage | Should -BeExactly 'account'
+    $diagnostic.transportStage | Should -BeExactly 'process-exit'
     $diagnostic.nativeExitCode | Should -Be 7
     $diagnostic.httpStatus | Should -Be 403
     $diagnostic.stderrCategory | Should -BeExactly 'authorization'
@@ -947,6 +1024,22 @@ It 'bounds captured AADSTS codes to ten digits' {
                 'AADSTS12345678901'))
     }
     $tooLong.Data.Contains('externalErrorCode') | Should -BeFalse
+}
+It 'unwraps method invocation exceptions for native diagnostics' {
+    $native = [ComponentModel.Win32Exception]::new(2)
+    $wrapped = [Management.Automation.MethodInvocationException]::new(
+        'wrapped', $native)
+    $failure = & (Get-Module DevPilot.ActivePrIntake) {
+        param($Source)
+        New-IntakeTransportFailure `
+            -Message read-inaccessible `
+            -TransportStage process-start `
+            -SourceException $Source
+    } $wrapped
+    $failure.Data['underlyingExceptionType'] |
+        Should -BeExactly 'Win32Exception'
+    $failure.Data['nativeErrorCode'] | Should -Be 2
+    $failure.Data['hResult'] | Should -Be $native.HResult
 }
 It 'does not let a private diagnostic write failure mask identity refusal' {
     $c = New-IntakeCase -Count 1
