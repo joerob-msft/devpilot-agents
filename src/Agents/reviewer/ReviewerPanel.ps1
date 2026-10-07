@@ -104,7 +104,7 @@ function Get-ReviewerPanelProcessAnswer {
     return $answer
 }
 
-function Invoke-ReviewerParallelSeats {
+function Invoke-ReviewerParallelSeat {
     param(
         [Parameter(Mandatory)][hashtable[]]$Launches,
         [Parameter(Mandatory)][string]$HarnessPath,
@@ -113,14 +113,16 @@ function Invoke-ReviewerParallelSeats {
     if ($Launches.Count -lt 1 -or $Launches.Count -gt 3) { throw 'Parallel execution requires 1-3 seats.' }
     $jobs = [Collections.Generic.List[object]]::new()
     $control = [hashtable]::Synchronized(@{ Cancelled = $false })
+    $manifestPath = $HarnessPath
     try {
         foreach ($launch in $Launches) {
             $job = Start-ThreadJob -ScriptBlock {
-                param($Manifest, $Arguments, $Control)
-                Import-Module $Manifest -Force -ErrorAction Stop
-                $probe = { [bool]$Control.Cancelled }.GetNewClosure()
-                Invoke-TimedProcess @Arguments -CancellationProbe $probe
-            } -ArgumentList $HarnessPath, $launch, $control -ErrorAction Stop
+                Import-Module $using:manifestPath -Force -ErrorAction Stop
+                $childLaunch = $using:launch
+                $childControl = $using:control
+                $probe = { [bool]$childControl.Cancelled }.GetNewClosure()
+                Invoke-TimedProcess @childLaunch -CancellationProbe $probe
+            } -ErrorAction Stop
             $jobs.Add($job)
         }
         while (@($jobs | Where-Object State -eq 'Running').Count -gt 0 -or
@@ -190,7 +192,7 @@ function Invoke-ReviewerSkillPanel {
                     -RuntimeContext $RuntimeContext -Stage independent-seat -Records @{ requestedModel = [string]$_.model }
                 $seatLaunch
             })
-        $runs = Invoke-ReviewerParallelSeats -Launches $launches -HarnessPath $HarnessPath `
+        $runs = Invoke-ReviewerParallelSeat -Launches $launches -HarnessPath $HarnessPath `
             -CancellationProbe $CancellationProbe
         $records = @()
         for ($i = 0; $i -lt $runs.Count; $i++) {

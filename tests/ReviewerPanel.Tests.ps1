@@ -93,7 +93,7 @@ Describe 'canonical skill panel transport' {
         )
         $before = @(Get-Job).Count
         $timer = [Diagnostics.Stopwatch]::StartNew()
-        $results = Invoke-ReviewerParallelSeats -Launches $launches -HarnessPath $manifest
+        $results = Invoke-ReviewerParallelSeat -Launches $launches -HarnessPath $manifest
         $results.Count | Should -Be 2
         $results[0].StdOut | Should -Match 'seat-1'
         $results[1].StdOut | Should -Match 'seat-2'
@@ -113,7 +113,7 @@ Describe 'canonical skill panel transport' {
                CaptureStdOut = $true; CaptureStdErr = $true; TimeoutSeconds = 15; ContainDescendants = $true }
         )
         $before = @(Get-Job).Count
-        { Invoke-ReviewerParallelSeats -Launches $launches -HarnessPath $manifest -CancellationProbe { $true } } |
+        { Invoke-ReviewerParallelSeat -Launches $launches -HarnessPath $manifest -CancellationProbe { $true } } |
             Should -Throw '*cancelled*'
         @(Get-Job).Count | Should -Be $before
     }
@@ -149,7 +149,7 @@ Describe 'skill panel cycle failure boundaries' {
             }
             @{ ExitCode = 0; TimedOut = $false; Cancelled = $false; OutputDrained = $true; StdOut = $text; StdErr = '' }
         }
-        Mock Invoke-ReviewerParallelSeats {
+        Mock Invoke-ReviewerParallelSeat {
             param($Launches)
             @($Launches | ForEach-Object {
                     @{ ExitCode = 0; TimedOut = $false; Cancelled = $false; OutputDrained = $true; StdErr = ''
@@ -165,13 +165,13 @@ Describe 'skill panel cycle failure boundaries' {
         $result.Provenance.models | Should -Be @('gpt-5.6-terra', 'claude-opus-5', 'grok-4.6')
         $result.Provenance.seats.Count | Should -Be 3
         Should -Invoke Invoke-TimedProcess -Times 2 -Exactly
-        Should -Invoke Invoke-ReviewerParallelSeats -Times 1 -Exactly
+        Should -Invoke Invoke-ReviewerParallelSeat -Times 1 -Exactly
     }
     It 'never launches seats for a forged binding' {
         $script:cyclePlan.nonce = 'wrong'
         $result = Invoke-ReviewerSkillPanel @script:cycleParameters
         $result.FailureReason | Should -Match 'invalid.*plan'
-        Should -Invoke Invoke-ReviewerParallelSeats -Times 0
+        Should -Invoke Invoke-ReviewerParallelSeat -Times 0
     }
     It 'never synthesizes missing or malformed seat results' {
         $script:invalidSeat = $true
