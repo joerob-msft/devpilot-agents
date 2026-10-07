@@ -2006,7 +2006,8 @@ print(json.dumps({
                             -Path ([string]$entry.path) `
                             -ChangeType $changeType `
                             -SourceContent $sourceContent `
-                            -TargetContent $targetContent)
+                            -TargetContent $targetContent |
+                        ForEach-Object { $_ })
                     foreach ($span in $spans) {
                         $changedLines +=
                             [int]$span.endLine - [int]$span.startLine + 1

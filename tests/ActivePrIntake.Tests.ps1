@@ -742,6 +742,149 @@ else {
                 Env:\ACTIVE_PR_INTAKE_EMPTY_LOG -ErrorAction SilentlyContinue
         }
     }
+    It 'normalizes real shared git spans for <Mode> changes' `
+        -TestCases @(
+            @{ Mode = 'multi'; ExpectedLines = 3
+                ExpectedStarts = @(2, 10)
+                ExpectedEnds = @(2, 11)
+                ExpectedItems = 2 }
+            @{ Mode = 'zero'; ExpectedLines = 0
+                ExpectedStarts = @(); ExpectedEnds = @()
+                ExpectedItems = 2 }
+            @{ Mode = 'single'; ExpectedLines = 1
+                ExpectedStarts = @(2); ExpectedEnds = @(2)
+                ExpectedItems = 2 }
+            @{ Mode = 'add'; ExpectedLines = 3
+                ExpectedStarts = @(1); ExpectedEnds = @(3)
+                ExpectedItems = 1 }
+            @{ Mode = 'delete'; ExpectedLines = 0
+                ExpectedStarts = @(); ExpectedEnds = @()
+                ExpectedItems = 0 }
+        ) {
+        param(
+            $Mode,
+            $ExpectedLines,
+            $ExpectedStarts,
+            $ExpectedEnds,
+            $ExpectedItems
+        )
+        $c = New-IntakeCase -Count 1
+        New-Item -ItemType Directory -Path $c.root -Force |
+            Out-Null
+        $stub = Join-Path $c.root "az-real-spans-$Mode.ps1"
+        $log = Join-Path $c.root "item-real-spans-$Mode.log"
+        $env:ACTIVE_PR_INTAKE_SPAN_MODE = $Mode
+        $env:ACTIVE_PR_INTAKE_SPAN_LOG = $log
+        @'
+$arguments = $args
+$mode = $env:ACTIVE_PR_INTAKE_SPAN_MODE
+if ($arguments -contains 'pullRequestIterationChanges') {
+    if ($arguments -contains '$skip=1') {
+        '{"changeEntries":[],"count":0}'
+    }
+    else {
+        $changeType = if ($mode -eq 'add') { 'add' }
+            elseif ($mode -eq 'delete') { 'delete' }
+            else { 'edit' }
+        @{
+            changeEntries = @(@{
+                changeTrackingId = 1
+                changeType = $changeType
+                item = @{ path = '/tests/RealSpans.cs' }
+            })
+            count = 1
+            nextSkip = 1
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+}
+elseif ($arguments -contains 'items') {
+    [IO.File]::AppendAllText(
+        $env:ACTIVE_PR_INTAKE_SPAN_LOG,
+        ($arguments -join '|') + "`n")
+    $source = $arguments -contains (
+        'versionDescriptor.version=' + ('a' * 40))
+    $old = @(
+        'same-1', 'old-2', 'same-3', 'same-4',
+        'same-5', 'same-6', 'same-7', 'same-8',
+        'same-9', 'old-10', 'old-11', 'same-12'
+    ) -join "`n"
+    $content = switch ($mode) {
+        multi {
+            if ($source) {
+                @(
+                    'same-1', 'new-2', 'same-3', 'same-4',
+                    'same-5', 'same-6', 'same-7', 'same-8',
+                    'same-9', 'new-10', 'new-11', 'same-12'
+                ) -join "`n"
+            }
+            else { $old }
+        }
+        zero { $old }
+        single {
+            if ($source) {
+                @(
+                    'same-1', 'new-2', 'same-3', 'same-4',
+                    'same-5', 'same-6', 'same-7', 'same-8',
+                    'same-9', 'old-10', 'old-11', 'same-12'
+                ) -join "`n"
+            }
+            else { $old }
+        }
+        add { @('new-1', 'new-2', 'new-3') -join "`n" }
+        default { $old }
+    }
+    @{
+        content = $content
+        contentMetadata = @{ contentType = 'text/plain' }
+    } | ConvertTo-Json -Depth 4 -Compress
+}
+else {
+    exit 7
+}
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        try {
+            $provider = New-ActivePrAzureDevOpsProvider `
+                -Config $c.config -AzureCliPath $stub
+            $request = @{
+                pullRequestId = 1
+                iterationId = 1
+                sourceCommit = 'a' * 40
+                targetCommit = 'b' * 40
+                timeoutMilliseconds = 15000
+            }
+            $changes = & $provider 'Changes' $request
+            $changes.changedFiles | Should -Be 1
+            $changes.changedLines | Should -Be $ExpectedLines
+            @($changes.entries) | Should -HaveCount 1
+            $actualSpans = @($changes.entries[0].spans)
+            $actualSpans | Should -HaveCount @($ExpectedStarts).Count
+            for ($index = 0; $index -lt
+                @($ExpectedStarts).Count; $index++) {
+                $actualSpans[$index].startLine |
+                    Should -Be @($ExpectedStarts)[$index]
+                $actualSpans[$index].endLine |
+                    Should -Be @($ExpectedEnds)[$index]
+            }
+            $requests = if (Test-Path -LiteralPath $log) {
+                @(Get-Content -LiteralPath $log)
+            }
+            else { @() }
+            $requests | Should -HaveCount $ExpectedItems
+
+            if ($Mode -ceq 'multi') {
+                $c.config.limits.maxChangedLines = 2
+                $bounded = New-ActivePrAzureDevOpsProvider `
+                    -Config $c.config -AzureCliPath $stub
+                { & $bounded 'Changes' $request } |
+                    Should -Throw 'line-budget'
+            }
+        }
+        finally {
+            Remove-Item Env:\ACTIVE_PR_INTAKE_SPAN_MODE,
+                Env:\ACTIVE_PR_INTAKE_SPAN_LOG `
+                -ErrorAction SilentlyContinue
+        }
+    }
     It 'pins Azure CLI transport to GET, organization, project, repository and account' {
         $c = New-IntakeCase -Count 1
         $c.config.enabled = $false
