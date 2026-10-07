@@ -840,6 +840,8 @@ if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
 echo %*>>"%ACTIVE_PR_INTAKE_CMD_LOG%"
 if "%~1"=="account" (
   echo {"user":{"name":"service@example.invalid"}}
+) else if "%~1"=="devops" (
+  echo {"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}],"count":1}
 ) else (
   echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account"}}
 )
@@ -849,9 +851,17 @@ if "%~1"=="account" (
                     -ConnectionDataToolPath $stub
                 (& $cmdTransport 'Identity' @{ timeoutMilliseconds = 3000 }).id |
                     Should -Be '33333333-3333-3333-3333-333333333333'
+                $cmdPage = & $cmdTransport 'ListPage' @{
+                    pass = 1; skip = 0; top = 3
+                    timeoutMilliseconds = 3000
+                }
+                $cmdPage.items[0].pullRequestId | Should -Be 1
                 $cmdRequests = @(Get-Content -LiteralPath $cmdLog)
-                $cmdRequests | Should -HaveCount 1
+                $cmdRequests | Should -HaveCount 2
                 $cmdRequests[0] | Should -Match '^"account" "show" '
+                $cmdRequests[1] | Should -Match `
+                    '^"devops" "invoke".*"pullRequests".*' +
+                    '"searchCriteria.status=active".*"\$skip=0".*"\$top=3"'
             }
             $slowStub = Join-Path $c.root 'az-slow-stub.ps1'
             'Start-Sleep -Seconds 5' | Set-Content -LiteralPath $slowStub -Encoding utf8
@@ -1005,7 +1015,7 @@ It 'retains command resolution validation and empty response stages' `
         @{ Name = 'metachar'; ExpectedStage = 'command-validation'
             ExpectedType = 'RuntimeException' }
         @{ Name = 'empty'; ExpectedStage = 'response-empty'
-            ExpectedType = $null }
+            ExpectedType = 'InvalidOperationException' }
     ) {
     param($Name, $ExpectedStage, $ExpectedType)
     $c = New-IntakeCase -Count 1
@@ -1060,6 +1070,110 @@ It 'retains command resolution validation and empty response stages' `
     }
     ($diagnostic | ConvertTo-Json -Depth 8) |
         Should -Not -Match 'missing command path|unsafe&command|empty command path'
+}
+It 'retains fixed first provider causes without changing page refusal' `
+    -TestCases @(
+        @{ Mode = 'repository'; ExpectedReason = 'repository-mismatch'
+            ExpectedNativeExit = $null }
+        @{ Mode = 'count'; ExpectedReason = 'page-count-mismatch'
+            ExpectedNativeExit = $null }
+        @{ Mode = 'shape'; ExpectedReason = 'page-response-invalid'
+            ExpectedNativeExit = $null }
+        @{ Mode = 'native'; ExpectedReason = 'read-inaccessible'
+            ExpectedNativeExit = 7 }
+    ) {
+    param($Mode, $ExpectedReason, $ExpectedNativeExit)
+    $c = New-IntakeCase -Count 1
+    New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+    $stub = Join-Path $c.root "az-list-$Mode.ps1"
+    @"
+if (`$args -contains 'account' -and `$args -contains 'show') {
+    '{"user":{"name":"service@example.invalid"}}'
+    exit 0
+}
+if (`$args -contains '-c') {
+    '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account"}}'
+    exit 0
+}
+if (`$args -notcontains 'pullRequests') { exit 9 }
+switch ('$Mode') {
+    repository {
+        '{"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"99999999-9999-9999-9999-999999999999","project":{"id":"22222222-2222-2222-2222-222222222222"}}}],"count":1}'
+    }
+    count {
+        '{"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}],"count":2}'
+    }
+    shape {
+        '{"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111"}}],"count":1}'
+    }
+    native {
+        [Console]::Error.Write('command failed')
+        exit 7
+    }
+}
+"@ | Set-Content -LiteralPath $stub -Encoding utf8
+    $transport = New-ActivePrAzureDevOpsProvider `
+        -Config $c.config -AzureCliPath $stub `
+        -ConnectionDataToolPath $stub
+    $result = Invoke-ActivePrIntake `
+        -Config $c.config -Provider $transport `
+        -StateRoot $c.root -RepositoryRoot $repo -Run
+
+    $result.reasonCodes | Should -Be @('page-inaccessible')
+    $diagnostic = Get-ChildItem -LiteralPath (
+        Join-Path $c.root 'active-pr-intake-v1\diagnostics') `
+        -File -Filter '*.json' |
+        Select-Object -First 1 |
+        ForEach-Object {
+            Get-Content -LiteralPath $_.FullName -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 8
+        }
+    $diagnostic.providerOperation | Should -BeExactly 'ListPage'
+    $diagnostic.providerReason | Should -BeExactly $ExpectedReason
+    $diagnostic.nativeExitCode | Should -Be $ExpectedNativeExit
+    ($diagnostic | ConvertTo-Json -Depth 8) |
+        Should -Not -Match '99999999|command failed'
+}
+It 'retains the first fixed <Operation> provider cause' `
+    -TestCases @(
+        @{ Operation = 'Head'; ExpectedReason = 'provider-contract'
+            ExpectedPublicReason = 'provider-inaccessible' }
+        @{ Operation = 'Changes'
+            ExpectedReason = 'change-list-truncated'
+            ExpectedPublicReason = 'change-list-truncated' }
+        @{ Operation = 'Discussions'
+            ExpectedReason = 'invalid-discussions'
+            ExpectedPublicReason = 'invalid-discussions' }
+    ) {
+    param($Operation, $ExpectedReason, $ExpectedPublicReason)
+    $c = New-IntakeCase -Count 1
+    $baseProvider = $c.provider
+    $provider = {
+        param($RequestedOperation, $Request)
+        if ($RequestedOperation -ceq $Operation) {
+            throw $ExpectedReason
+        }
+        return & $baseProvider $RequestedOperation $Request
+    }.GetNewClosure()
+
+    $result = Invoke-ActivePrIntake `
+        -Config $c.config -Provider $provider `
+        -StateRoot $c.root -RepositoryRoot $repo -Run
+
+    $result.heads[0].reasonCode |
+        Should -BeExactly $ExpectedPublicReason
+    $diagnostic = Get-ChildItem -LiteralPath (
+        Join-Path $c.root 'active-pr-intake-v1\diagnostics') `
+        -File -Filter '*.json' |
+        Select-Object -First 1 |
+        ForEach-Object {
+            Get-Content -LiteralPath $_.FullName -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 8
+        }
+    $diagnostic.providerOperation |
+        Should -BeExactly $Operation
+    $diagnostic.providerReason |
+        Should -BeExactly $ExpectedReason
 }
 It 'preserves identity read and response failures as explicit predicates' `
     -TestCases @(

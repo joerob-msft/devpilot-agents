@@ -141,6 +141,7 @@ function Write-IntakePrivateFailure {
     )
     $allowedKeys = @(
         'identityStage', 'transportStage', 'underlyingExceptionType',
+        'providerOperation', 'providerReason',
         'nativeExitCode', 'hResult', 'nativeErrorCode',
         'httpStatus', 'stderrCategory', 'externalErrorCode',
         'stderrSha256', 'stderrByteCount'
@@ -163,6 +164,8 @@ function Write-IntakePrivateFailure {
         transportStage = $Exception.Data['transportStage']
         underlyingExceptionType =
             $Exception.Data['underlyingExceptionType']
+        providerOperation = $Exception.Data['providerOperation']
+        providerReason = $Exception.Data['providerReason']
         hResult = $Exception.Data['hResult']
         nativeErrorCode = $Exception.Data['nativeErrorCode']
         identityStage = $Exception.Data['identityStage']
@@ -178,6 +181,11 @@ function Write-IntakePrivateFailure {
         (ConvertTo-Json -InputObject $record -Depth 8) + "`n")
     if ($bytes.Length -gt 4096) {
         throw 'Private intake failure record exceeded its bounded size.'
+    }
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        [void](Assert-AgentTrustedFile `
+            -Path $path -AllowedRoot $diagnostics -Private)
+        return
     }
     $stream = [IO.File]::Open(
         $path,
@@ -263,9 +271,90 @@ function Invoke-IntakeRead {
     $Reads.Value++
     $Arguments.timeoutMilliseconds = [Math]::Max(1,
         [int]([int]$Config.limits.maxSeconds * 1000 - $Clock.ElapsedMilliseconds))
-    $answer = & $Provider $Operation $Arguments
-    if ($Clock.Elapsed.TotalSeconds -ge [int]$Config.limits.maxSeconds) { throw 'time-budget' }
-    if ($answer -isnot [Collections.IDictionary]) { throw 'provider-contract' }
+    try {
+        $answer = & $Provider $Operation $Arguments
+        if ($Clock.Elapsed.TotalSeconds -ge
+            [int]$Config.limits.maxSeconds) {
+            throw 'time-budget'
+        }
+        if ($answer -isnot [Collections.IDictionary]) {
+            throw 'provider-contract'
+        }
+    }
+    catch {
+        $source = $_.Exception
+        $sourceReason = [string]$source.Message
+        $safeProviderReasons = @(
+            'account-mismatch',
+            'change-list-truncated',
+            'change-page-budget',
+            'comment-budget',
+            'discussion-list-truncated',
+            'file-budget',
+            'head-inconsistent',
+            'identity-read-inaccessible',
+            'identity-response-invalid',
+            'invalid-discussions',
+            'invalid-head',
+            'item-content-unavailable',
+            'line-budget',
+            'mutable-discussions',
+            'page-count-mismatch',
+            'page-response-invalid',
+            'provider-contract',
+            'read-budget',
+            'read-inaccessible',
+            'repository-mismatch',
+            'response-invalid',
+            'time-budget',
+            'unsupported-operation'
+        )
+        $providerReason = if ($safeProviderReasons -ccontains
+            $sourceReason) {
+            $sourceReason
+        }
+        else {
+            'unexpected'
+        }
+        $message = if ($providerReason -ceq 'unexpected') {
+            'provider-inaccessible'
+        }
+        else {
+            $providerReason
+        }
+        $failure = [InvalidOperationException]::new($message)
+        Copy-IntakeFailureData `
+            -Source $source -Destination $failure
+        $failure.Data['providerOperation'] = $Operation
+        $failure.Data['providerReason'] = $providerReason
+        if (-not $failure.Data.Contains(
+                'underlyingExceptionType')) {
+            $failure.Data['underlyingExceptionType'] = switch (
+                $source.GetType().Name) {
+                'ArgumentException' { 'ArgumentException' }
+                'CommandNotFoundException' {
+                    'CommandNotFoundException'
+                }
+                'IOException' { 'IOException' }
+                'InvalidOperationException' {
+                    'InvalidOperationException'
+                }
+                'NotSupportedException' {
+                    'NotSupportedException'
+                }
+                'PropertyNotFoundException' {
+                    'PropertyNotFoundException'
+                }
+                'RuntimeException' { 'RuntimeException' }
+                'UnauthorizedAccessException' {
+                    'UnauthorizedAccessException'
+                }
+                'Win32Exception' { 'Win32Exception' }
+                default { 'Other' }
+            }
+        }
+        throw $failure
+    }
     return $answer
 }
 
@@ -1009,7 +1098,13 @@ function Invoke-ActivePrIntake {
                             }
                         }
                         catch {
-                            $reason = [string]$_.Exception.Message
+                            $failure = $_.Exception
+                            Save-IntakePrivateFailure `
+                                -Root $root `
+                                -RepositoryRoot $RepositoryRoot `
+                                -Generation $envelope.generation `
+                                -Exception $failure
+                            $reason = [string]$failure.Message
                             if ($reason -cnotin @('invalid-head', 'head-drift', 'file-budget',
                                     'line-budget', 'line-count-unavailable',
                                     'change-list-truncated', 'change-page-budget', 'invalid-discussions',
@@ -1598,9 +1693,30 @@ print(json.dumps({
             ListPage {
                 $r = & $invoke 'git' 'pullRequests' @("project=$project", "repositoryId=$repo") @(
                     'searchCriteria.status=active', "`$skip=$($Request.skip)", "`$top=$($Request.top)") $deadline
+                if ($r -isnot [Collections.IDictionary] -or
+                    -not $r.Contains('value') -or
+                    $r.value -isnot [array]) {
+                    throw 'page-response-invalid'
+                }
                 $items = @($r.value | ForEach-Object {
+                        if ($_ -isnot [Collections.IDictionary] -or
+                            -not $_.Contains('pullRequestId') -or
+                            -not $_.Contains('status') -or
+                            -not $_.Contains('isDraft') -or
+                            -not $_.Contains('targetRefName') -or
+                            -not $_.Contains('repository') -or
+                            $_.repository -isnot
+                                [Collections.IDictionary] -or
+                            -not $_.repository.Contains('id') -or
+                            -not $_.repository.Contains('project') -or
+                            $_.repository.project -isnot
+                                [Collections.IDictionary] -or
+                            -not $_.repository.project.Contains('id')) {
+                            throw 'page-response-invalid'
+                        }
                         if ([string]$_.repository.id -ine $repo -or
-                            [string]$_.repository.project.id -ine $projectId) {
+                            [string]$_.repository.project.id -ine
+                                $projectId) {
                             throw 'repository-mismatch'
                         }
                         @{ pullRequestId = $_.pullRequestId; status = $_.status
