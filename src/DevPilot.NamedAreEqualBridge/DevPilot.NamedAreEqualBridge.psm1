@@ -398,10 +398,16 @@ function Invoke-NamedAreEqualCurrentPrBridge {
             [string]$_.reasonCode -ceq 'rules-incomplete'
         })
     if ($selected.Count -lt 1) {
+        $knownEmpty = [bool]$intake.populationKnown -and
+            [string]$intake.inventory.state -ceq 'complete' -and
+            [int]$intake.counts.error -eq 0 -and
+            [int]$intake.inventory.eligible -eq 0
         return [pscustomobject][ordered]@{
             schemaVersion = 1
             kind = 'named-areequal-current-pr-bridge-result'
-            state = 'no-eligible-heads'
+            state = $(if ($knownEmpty) {
+                    'known-empty'
+                } else { 'unknown' })
             intake = $intake
             manifestPath = $null
             records = @()

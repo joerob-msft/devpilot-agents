@@ -713,8 +713,8 @@ else {
 $CliArguments = $args
 [IO.File]::AppendAllText($env:ACTIVE_PR_INTAKE_TEST_LOG, ($CliArguments -join '|') + "`n")
 $global:LASTEXITCODE = 0
-if ($CliArguments -contains 'connectionData') {
-    '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account","uniqueName":"service@example.invalid"}}'
+if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
+    '{"user":{"name":"service@example.invalid"}}'
 } elseif ($CliArguments -contains 'pullRequestIterations') {
     '{"value":[{"id":1,"sourceRefCommit":{"commitId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"targetRefCommit":{"commitId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]}'
 } elseif ($CliArguments -contains 'pullRequestIterationChanges') {
@@ -736,11 +736,13 @@ if ($CliArguments -contains 'connectionData') {
             $page.items[0].pullRequestId | Should -Be 1
             $requests = Get-Content -LiteralPath $log
             $requests.Count | Should -Be 2
-            foreach ($request in $requests) {
-                $request | Should -Match '\|--http-method\|GET\|'
-                $request | Should -Match '\|--organization\|https://dev.azure.com/example-org\|'
-                $request | Should -Not -Match 'POST|PATCH|PUT|DELETE|--in-file'
-            }
+            $requests[0] | Should -Match '^account\|show\|'
+            $requests[0] | Should -Not -Match 'devops\|invoke|--organization'
+            $requests[1] | Should -Match '\|--http-method\|GET\|'
+            $requests[1] | Should -Match `
+                '\|--organization\|https://dev.azure.com/example-org\|'
+            $requests[1] | Should -Not -Match `
+                'POST|PATCH|PUT|DELETE|--in-file'
             $requests[1] | Should -Match 'project=ExampleProject'
             $requests[1] | Should -Match 'repositoryId=11111111-1111-1111-1111-111111111111'
             $c.config.enabled = $true
@@ -753,13 +755,15 @@ if ($CliArguments -contains 'connectionData') {
             $liveShape.rules[0].pending | Should -Be 1
             $liveShape.unmetCapabilities | Should -BeNullOrEmpty
             foreach ($request in (Get-Content -LiteralPath $log)) {
-                $request | Should -Match '\|--http-method\|GET\|'
+                if ($request -notmatch '^account\|show\|') {
+                    $request | Should -Match '\|--http-method\|GET\|'
+                }
             }
             if ($IsWindows) {
                 $cmd = Join-Path $c.root 'az-read-stub.cmd'
                 @'
 @echo off
-echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account","uniqueName":"service@example.invalid"}}
+echo {"user":{"name":"service@example.invalid"}}
 '@ | Set-Content -LiteralPath $cmd -Encoding ascii
                 $cmdTransport = New-ActivePrAzureDevOpsProvider -Config $c.config -AzureCliPath $cmd
                 (& $cmdTransport 'Identity' @{ timeoutMilliseconds = 3000 }).id |
@@ -783,4 +787,32 @@ echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descript
         }
         finally { Remove-Item Env:\ACTIVE_PR_INTAKE_TEST_LOG -ErrorAction SilentlyContinue }
     }
+It 'preserves identity read and response failures as explicit predicates' `
+    -TestCases @(
+        @{ Name = 'read'; ExitCode = 7; Body = '' }
+        @{ Name = 'shape'; ExitCode = 0; Body = '{"user":{}}' }
+        @{ Name = 'account'; ExitCode = 0
+            Body = '{"user":{"name":"other@example.invalid"}}' }
+    ) {
+    param($Name, $ExitCode, $Body)
+    $c = New-IntakeCase -Count 1
+    New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+    $stub = Join-Path $c.root "az-identity-$Name.ps1"
+    @"
+if (`$args -notcontains 'account' -or `$args -notcontains 'show') {
+exit 9
+}
+if ($ExitCode -ne 0) { exit $ExitCode }
+'$Body'
+"@ | Set-Content -LiteralPath $stub -Encoding utf8
+    $transport = New-ActivePrAzureDevOpsProvider `
+        -Config $c.config -AzureCliPath $stub
+    $expected = switch ($Name) {
+        read { 'identity-read-inaccessible' }
+        shape { 'identity-response-invalid' }
+        account { 'account-mismatch' }
+    }
+    { & $transport 'Identity' @{ timeoutMilliseconds = 3000 } } |
+        Should -Throw $expected
+}
 }

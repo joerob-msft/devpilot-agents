@@ -874,7 +874,10 @@ function Invoke-ActivePrIntake {
             $reason = [string]$_.Exception.Message
             if ($reason -cnotin @('account-mismatch', 'invalid-page', 'mutable-page',
                     'missing-page', 'page-budget', 'pr-budget', 'read-budget',
-                    'time-budget')) { $reason = 'page-inaccessible' }
+                    'time-budget', 'identity-read-inaccessible',
+                    'identity-response-invalid')) {
+                $reason = 'page-inaccessible'
+            }
             $envelope.gaps.enumerationUnknown = 1
             $envelope.counts.error = 1
             $envelope.state = 'unknown'
@@ -1040,11 +1043,28 @@ function New-ActivePrAzureDevOpsProvider {
             [string[]]$Query, [DateTime]$Deadline)
         if ($transportReads.Count -ge $readCeiling) { throw 'read-budget' }
         $transportReads.Count++
-        $argv = @('devops', 'invoke', '--organization', $org, '--area', $Area,
-            '--resource', $Resource, '--http-method', 'GET', '--api-version', '7.1',
-            '-o', 'json', '--only-show-errors')
-        if ($Route.Count) { $argv += @('--route-parameters') + $Route }
-        if ($Query.Count) { $argv += @('--query-parameters') + $Query }
+        $argv = if ($Area -ceq '__account__') {
+            @('account', 'show', '--only-show-errors', '-o', 'json')
+        }
+        else {
+            $arguments = @(
+                'devops', 'invoke',
+                '--organization', $org,
+                '--area', $Area,
+                '--resource', $Resource,
+                '--http-method', 'GET',
+                '--api-version', '7.1',
+                '-o', 'json',
+                '--only-show-errors'
+            )
+            if ($Route.Count) {
+                $arguments += @('--route-parameters') + $Route
+            }
+            if ($Query.Count) {
+                $arguments += @('--query-parameters') + $Query
+            }
+            $arguments
+        }
         $tool = Get-Command -Name $AzureCliPath -CommandType Application,ExternalScript -ErrorAction Stop
         $start = [Diagnostics.ProcessStartInfo]::new()
         $start.UseShellExecute = $false
@@ -1179,11 +1199,33 @@ function New-ActivePrAzureDevOpsProvider {
         $deadline = [DateTime]::UtcNow.AddMilliseconds($budget)
         switch -CaseSensitive ($Operation) {
             Identity {
-                $r = & $invoke 'connection' 'connectionData' @() @() $deadline
+                try {
+                    $r = & $invoke '__account__' '' @() @() $deadline
+                }
+                catch {
+                    if ([string]$_.Exception.Message -cin @(
+                            'time-budget', 'read-budget')) {
+                        throw [string]$_.Exception.Message
+                    }
+                    throw 'identity-read-inaccessible'
+                }
+                if ($r -isnot [Collections.IDictionary] -or
+                    $r.user -isnot [Collections.IDictionary] -or
+                    -not $r.user.Contains('name') -or
+                    $r.user.name -isnot [string] -or
+                    [string]::IsNullOrWhiteSpace([string]$r.user.name)) {
+                    throw 'identity-response-invalid'
+                }
+                if ([string]$r.user.name -ine
+                    [string]$Config.expectedAccount.uniqueName) {
+                    throw 'account-mismatch'
+                }
                 return @{
-                    id = $r.authenticatedUser.id
-                    descriptor = $r.authenticatedUser.descriptor
-                    uniqueName = $r.authenticatedUser.uniqueName
+                    id = [string]$Config.expectedAccount.id
+                    descriptor =
+                        [string]$Config.expectedAccount.descriptor
+                    uniqueName =
+                        [string]$Config.expectedAccount.uniqueName
                 }
             }
             ListPage {

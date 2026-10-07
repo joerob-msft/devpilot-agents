@@ -114,7 +114,8 @@ BeforeAll {
             [Collections.IDictionary]$Config,
             [string]$SourceCommit = ('c' * 40),
             [ValidateRange(1, 8)][int]$MethodCount = 1,
-            [string]$ChangeFailure = ''
+            [string]$ChangeFailure = '',
+            [bool]$IsDraft = $false
         )
         $calls = [Collections.Generic.List[string]]::new()
         $lines = [Collections.Generic.List[string]]::new()
@@ -143,7 +144,7 @@ BeforeAll {
             targetCommit = 'd' * 40
             iterationId = 3
             status = 'active'
-            isDraft = $false
+            isDraft = $IsDraft
         }
         $spanDigest = Get-BridgeDigest 'span'
         $contentDigest = Get-BridgeTextDigest $content
@@ -160,7 +161,7 @@ BeforeAll {
                             items = @([ordered]@{
                                     pullRequestId = 42
                                     status = 'active'
-                                    isDraft = $false
+                                    isDraft = $IsDraft
                                     targetRef = 'refs/heads/master'
                                 })
                             count = 1
@@ -285,7 +286,7 @@ Describe 'Named AreEqual current PR bridge' {
             -StateRoot $state -ManifestPath $manifest `
             -RepositoryRoot $repoRoot -Run
 
-        $result.state | Should -BeExactly 'no-eligible-heads'
+        $result.state | Should -BeExactly 'unknown'
         $result.providerWrites | Should -Be 0
         $result.modelWrites | Should -Be 0
         @($result.records) | Should -HaveCount 0
@@ -294,6 +295,24 @@ Describe 'Named AreEqual current PR bridge' {
                 -ErrorAction SilentlyContinue |
             Where-Object { $_.Directory.Name -ceq 'observations' }) |
             Should -HaveCount 0
+    }
+
+    It 'uses known-empty only for a complete inventory with zero eligible heads' {
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $provider = New-BridgeProvider -Config $config -IsDraft $true
+        $state = Join-Path $TestDrive 'known-empty-state'
+        $manifest = Join-Path $TestDrive 'known-empty-manifest.json'
+        $result = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $provider.Handler `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepositoryRoot $repoRoot -Run
+
+        $result.state | Should -BeExactly 'known-empty'
+        $result.intake.populationKnown | Should -BeTrue
+        $result.intake.inventory.state | Should -BeExactly 'complete'
+        $result.intake.inventory.eligible | Should -Be 0
+        Test-Path -LiteralPath $manifest | Should -BeFalse
     }
 
     It 'preserves 2/5 quota across changed heads and fresh processes' {
