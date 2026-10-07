@@ -1224,6 +1224,88 @@ It 'uses strict UTF-8 for the installed Azure CLI Python host' `
         $process.Dispose()
     }
 }
+It 'builds the exact canonical Azure CLI production launch plan' `
+    -Skip:(-not $IsWindows) {
+    $azureCliCommands = @(Get-Command az -CommandType Application `
+            -ErrorAction Stop | Where-Object {
+            [IO.Path]::GetFileName($_.Source) -ceq 'az.cmd'
+        })
+    $azureCliCommands | Should -HaveCount 1
+    $arguments = [string[]]@(
+        'account', 'show', '--only-show-errors', '-o', 'json')
+    $outerPat = $env:AZURE_DEVOPS_EXT_PAT
+    $outerSystem = $env:SYSTEM_ACCESSTOKEN
+    $plan = & (Get-Module DevPilot.ActivePrIntake) {
+        param($Path, $Arguments)
+        Get-IntakeAzureCliLaunchPlan `
+            -ToolSource $Path -Arguments $Arguments
+    } $azureCliCommands[0].Source $arguments
+
+    $plan.fileName | Should -BeExactly (
+        Join-Path (
+            Split-Path -Parent (
+                Split-Path -Parent $azureCliCommands[0].Source)
+        ) 'python.exe')
+    $plan.argumentList | Should -Be @(
+        '-X', 'utf8', '-I', '-B', '-m', 'azure.cli',
+        'account', 'show', '--only-show-errors', '-o', 'json')
+    $plan.environment.AZ_INSTALLER | Should -BeExactly 'MSI'
+    $plan.environmentVariablesToRemove |
+        Should -Be @('AZURE_DEVOPS_EXT_PAT', 'SYSTEM_ACCESSTOKEN')
+    $env:AZURE_DEVOPS_EXT_PAT | Should -BeExactly $outerPat
+    $env:SYSTEM_ACCESSTOKEN | Should -BeExactly $outerSystem
+}
+It 'does not recognize modified or arbitrary command launchers' `
+    -Skip:(-not $IsWindows) {
+    $root = Join-Path $TestDrive 'launcher path with spaces'
+    $wbin = Join-Path $root 'wbin'
+    New-Item -ItemType Directory -Path $wbin -Force | Out-Null
+    '' | Set-Content -LiteralPath (
+        Join-Path $root 'python.exe') -Encoding ascii
+    $canonical = Join-Path $wbin 'az.cmd'
+    @'
+::
+:: Microsoft Azure CLI
+::
+@IF EXIST "%~dp0\..\python.exe" (
+  SET AZ_INSTALLER=MSI
+  "%~dp0\..\python.exe" -IBm azure.cli %*
+) ELSE (
+  echo Failed to load python executable.
+  exit /b 1
+)
+'@ | Set-Content -LiteralPath $canonical -Encoding ascii
+    $canonicalPlan = & (Get-Module DevPilot.ActivePrIntake) {
+        param($Path)
+        Get-IntakeAzureCliLaunchPlan `
+            -ToolSource $Path -Arguments @('version')
+    } $canonical
+    $canonicalPlan.argumentList | Should -Be @(
+        '-X', 'utf8', '-I', '-B', '-m', 'azure.cli', 'version')
+
+    $modifiedRoot = Join-Path $TestDrive 'modified launcher'
+    $modifiedWbin = Join-Path $modifiedRoot 'wbin'
+    New-Item -ItemType Directory -Path $modifiedWbin -Force |
+        Out-Null
+    '' | Set-Content -LiteralPath (
+        Join-Path $modifiedRoot 'python.exe') -Encoding ascii
+    $modified = Join-Path $modifiedWbin 'az.cmd'
+    (Get-Content -LiteralPath $canonical -Raw).Replace(
+        'SET AZ_INSTALLER=MSI',
+        "SET AZ_INSTALLER=MSI`r`nSET AZURE_CONFIG_DIR=private") |
+        Set-Content -LiteralPath $modified -Encoding ascii
+    $arbitrary = Join-Path $wbin 'tool.cmd'
+    '@echo off' | Set-Content -LiteralPath $arbitrary -Encoding ascii
+    & (Get-Module DevPilot.ActivePrIntake) {
+        param($Modified, $Arbitrary)
+        Get-IntakeAzureCliLaunchPlan `
+            -ToolSource $Modified -Arguments @('version') |
+            Should -BeNullOrEmpty
+        Get-IntakeAzureCliLaunchPlan `
+            -ToolSource $Arbitrary -Arguments @('version') |
+            Should -BeNullOrEmpty
+    } $modified $arbitrary
+}
 It 'refuses invalid native output bytes without replacement decoding' `
     -Skip:(-not $IsWindows) {
     $c = New-IntakeCase -Count 1

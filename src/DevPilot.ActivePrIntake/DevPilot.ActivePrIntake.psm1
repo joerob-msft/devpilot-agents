@@ -133,6 +133,68 @@ function Copy-IntakeFailureData {
     }
 }
 
+function Get-IntakeAzureCliLaunchPlan {
+    param(
+        [Parameter(Mandatory)][string]$ToolSource,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+    if ([IO.Path]::GetExtension($ToolSource) -cne '.cmd' -or
+        [IO.Path]::GetFileName($ToolSource) -cne 'az.cmd') {
+        return $null
+    }
+    $launcher = Get-Item -LiteralPath $ToolSource -Force
+    if ($launcher.Attributes -band [IO.FileAttributes]::ReparsePoint -or
+        $launcher.Length -gt 4096) {
+        return $null
+    }
+    $lines = @(Get-Content -LiteralPath $ToolSource | ForEach-Object {
+            ([string]$_).Trim()
+        } | Where-Object {
+            $_ -and -not $_.StartsWith('::')
+        })
+    $expected = @(
+        '@IF EXIST "%~dp0\..\python.exe" (',
+        'SET AZ_INSTALLER=MSI',
+        '"%~dp0\..\python.exe" -IBm azure.cli %*',
+        ') ELSE (',
+        'echo Failed to load python executable.',
+        'exit /b 1',
+        ')'
+    )
+    if ($lines.Count -ne $expected.Count) {
+        return $null
+    }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ($lines[$index] -cne $expected[$index]) {
+            return $null
+        }
+    }
+    $python = Join-Path (
+        Split-Path -Parent (
+            Split-Path -Parent $ToolSource)
+    ) 'python.exe'
+    $pythonItem = Get-Item -LiteralPath $python -Force `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $pythonItem -or
+        $pythonItem.Attributes -band
+            [IO.FileAttributes]::ReparsePoint) {
+        return $null
+    }
+    return [ordered]@{
+        fileName = $python
+        argumentList = [string[]]@(
+            '-X', 'utf8', '-I', '-B', '-m', 'azure.cli'
+        ) + $Arguments
+        environment = [ordered]@{
+            AZ_INSTALLER = 'MSI'
+        }
+        environmentVariablesToRemove = [string[]]@(
+            'AZURE_DEVOPS_EXT_PAT',
+            'SYSTEM_ACCESSTOKEN'
+        )
+    }
+}
+
 function Write-IntakePrivateFailure {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -1336,6 +1398,8 @@ function New-ActivePrAzureDevOpsProvider {
         ${function:New-IntakeTransportFailure}
     $copyFailureDataCommand =
         ${function:Copy-IntakeFailureData}
+    $azureCliLaunchPlanCommand =
+        ${function:Get-IntakeAzureCliLaunchPlan}
     $readCeiling = [int]$Config.limits.maxReads
     $transportReads = [pscustomobject]@{ Count = 0 }
     $connectionDataCommand = @'
@@ -1436,45 +1500,32 @@ print(json.dumps({
             }
             $tool = $tools[0]
             $transportStage = 'command-validation'
+            $extension = [IO.Path]::GetExtension($tool.Source)
+            $azureCliPlan = & $azureCliLaunchPlanCommand `
+                -ToolSource $tool.Source -Arguments $argv
             $start = [Diagnostics.ProcessStartInfo]::new()
             $start.UseShellExecute = $false
             $start.RedirectStandardOutput = $true
             $start.RedirectStandardError = $true
-            [void]$start.Environment.Remove('AZURE_DEVOPS_EXT_PAT')
-            [void]$start.Environment.Remove('SYSTEM_ACCESSTOKEN')
-            $extension = [IO.Path]::GetExtension($tool.Source)
-            $isAzureCliLauncher = $false
-            $azureCliPython = ''
-            if ($extension -ceq '.cmd' -and
-                [IO.Path]::GetFileName($tool.Source) -ceq 'az.cmd') {
-                $launcher = Get-Item -LiteralPath $tool.Source -Force
-                if (-not ($launcher.Attributes -band
-                        [IO.FileAttributes]::ReparsePoint) -and
-                    $launcher.Length -le 4096) {
-                    $launcherText = Get-Content -LiteralPath (
-                        $tool.Source) -Raw
-                    $azureCliPython = Join-Path (
-                        Split-Path -Parent (
-                            Split-Path -Parent $tool.Source)
-                    ) 'python.exe'
-                    $isAzureCliLauncher = $launcherText -match
-                        '(?im)^\s*SET AZ_INSTALLER=MSI\s*$' -and
-                        $launcherText -match
-                        '(?im)^\s*"%~dp0\\\.\.\\python\.exe"\s+-IBm\s+azure\.cli\s+%\*\s*$' -and
-                        (Test-Path -LiteralPath $azureCliPython `
-                            -PathType Leaf)
+            if ($null -ne $azureCliPlan) {
+                $start.FileName = [string]$azureCliPlan.fileName
+                foreach ($name in
+                    $azureCliPlan.environmentVariablesToRemove) {
+                    [void]$start.Environment.Remove($name)
                 }
-            }
-            if ($isAzureCliLauncher) {
-                $start.FileName = $azureCliPython
-                $start.Environment['AZ_INSTALLER'] = 'MSI'
-                foreach ($arg in @(
-                        '-X', 'utf8', '-I', '-Bm', 'azure.cli'
-                    ) + $argv) {
-                    $start.ArgumentList.Add($arg)
+                foreach ($entry in $azureCliPlan.environment.GetEnumerator()) {
+                    $start.Environment[[string]$entry.Key] =
+                        [string]$entry.Value
+                }
+                foreach ($arg in $azureCliPlan.argumentList) {
+                    $start.ArgumentList.Add([string]$arg)
                 }
             }
             elseif ($extension -in @('.cmd', '.bat')) {
+                [void]$start.Environment.Remove(
+                    'AZURE_DEVOPS_EXT_PAT')
+                [void]$start.Environment.Remove(
+                    'SYSTEM_ACCESSTOKEN')
                 if ($tool.Source -match '[%!"&|<>^]') {
                     throw 'read-inaccessible'
                 }
@@ -1490,6 +1541,10 @@ print(json.dumps({
                     $tool.Source, ($quoted -join ' '))
             }
             elseif ($extension -eq '.ps1') {
+                [void]$start.Environment.Remove(
+                    'AZURE_DEVOPS_EXT_PAT')
+                [void]$start.Environment.Remove(
+                    'SYSTEM_ACCESSTOKEN')
                 $start.FileName = (Get-Command pwsh `
                     -CommandType Application -ErrorAction Stop).Source
                 foreach ($arg in @(
@@ -1502,6 +1557,10 @@ print(json.dumps({
                 }
             }
             else {
+                [void]$start.Environment.Remove(
+                    'AZURE_DEVOPS_EXT_PAT')
+                [void]$start.Environment.Remove(
+                    'SYSTEM_ACCESSTOKEN')
                 $start.FileName = $tool.Source
                 foreach ($arg in $argv) {
                     $start.ArgumentList.Add($arg)
