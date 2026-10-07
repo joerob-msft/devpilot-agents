@@ -939,7 +939,15 @@ if ($env:AZURE_DEVOPS_EXT_PAT -or $env:SYSTEM_ACCESSTOKEN) {
 }
 '{"user":{"name":"local-profile@example.invalid"}}'
 '@ | Set-Content -LiteralPath $accountStub -Encoding utf8
-    $python = 'C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\python.exe'
+    $azureCliCommands = @(Get-Command az -CommandType Application `
+            -ErrorAction Stop | Where-Object {
+            [IO.Path]::GetExtension($_.Source) -ceq '.cmd'
+        })
+    $azureCliCommands | Should -HaveCount 1
+    $python = Join-Path (
+        Split-Path -Parent (
+            Split-Path -Parent $azureCliCommands[0].Source)
+    ) 'python.exe'
     Test-Path -LiteralPath $python -PathType Leaf | Should -BeTrue
     $outerConfig = $env:AZURE_CONFIG_DIR
     $credentialSnapshot = Set-IntakeCredentialSentinels
