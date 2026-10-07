@@ -447,7 +447,9 @@ Start-Sleep -Seconds 30
         $reviewer = Get-Content -LiteralPath "$PSScriptRoot\..\src\Agents\reviewer\Start-ReviewerAgent.ps1" -Raw
         $handler = Get-Content -LiteralPath "$PSScriptRoot\..\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1" -Raw
         $broker = Get-Content -LiteralPath "$PSScriptRoot\..\tools\Invoke-DevPilotAgentDispatch.ps1" -Raw
-        $reviewer | Should -Match 'Invoke-TimedProcess[\s\S]+-ContainDescendants'
+        $reviewer | Should -Match 'ContainDescendants\s*=\s*\$true'
+        $reviewer | Should -Match 'Invoke-TimedProcess @commonLaunch'
+        $reviewer | Should -Match 'Invoke-ReviewerSkillPanel -CommonLaunch \$commonLaunch'
         $handler | Should -Match 'ContainDescendants\s*=\s*\$true'
         $reviewer | Should -Match 'if \(\$ManualDispatchManifest -or \$LauncherWorkerManifest\) \{\r?\n\s*Initialize-AgentParentProcessContainment'
         $handler | Should -Match 'if \(\$ManualDispatchManifest -or \$LauncherWorkerManifest\) \{\r?\n\s*Initialize-AgentParentProcessContainment'

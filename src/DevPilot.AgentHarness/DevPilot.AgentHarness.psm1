@@ -57,6 +57,7 @@ $script:AgentHarnessSupportedModels = @(
     "gemini-3.1-pro-preview",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "grok-4.6",
     "grok-4.7",
     "grok-4.5",
     "mai-code-1-flash-picker"
@@ -548,6 +549,7 @@ function Get-AgentCopilotArgs {
         [string[]]$DisableMcpServers = @(),
         [switch]$DisableBuiltinMcps,
         [switch]$DisableDynamicSkillRetrieval,
+        [switch]$DisableDelegation,
         [switch]$UseYolo,
         [string]$ResumeSessionId,
         [string[]]$SupportedModels,
@@ -577,6 +579,9 @@ function Get-AgentCopilotArgs {
     }
     if ($DisableDynamicSkillRetrieval) {
         $engineArgs += @("--dynamic-retrieval", "skills=off")
+    }
+    if ($DisableDelegation) {
+        $engineArgs += "--excluded-tools=task,read_agent,write_agent,list_agents,run_dynamic_workflow"
     }
     if ($Model) {
         $validated = Assert-AgentSupportedModel -ModelId $Model -SupportedModels $SupportedModels -Where "Get-AgentCopilotArgs -Model"

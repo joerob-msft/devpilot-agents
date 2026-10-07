@@ -205,14 +205,22 @@ The reviewer supports two trusted execution modes through
 
 - `single` preserves the ordinary one-model review. `-Model` may select any
   code-allowlisted model.
-- `threeRound` runs a fixed toolkit-owned sequence: GPT-5.6 Terra performs an
-  independent scan, Grok 4.7 adversarially verifies it, and GPT-6.1 Sol is the
-  only finalizer allowed to emit `REVIEWER_RESULT_V3`. Prior-round output is
-  bounded and injected as explicitly untrusted JSON-string data. `-Model` must
-  be omitted or set to the finalizer.
+- `skillPanel` requires `reviewSkills.primary`. That skill selects up to three
+  distinct-provider reviewers from the advertised model-only contract and
+  synthesizes their independent reviews. The wrapper validates the typed plan,
+  runs the seats concurrently, validates each V3 record, and gives the skill
+  their bounded untrusted results. It does not own model preferences or review
+  methodology. `-Model` selects the planning/synthesis coordinator normally.
 
-All rounds use the same read-only tool ceiling and share the configured cycle
-timeout. Reviewer launches disable built-in MCP servers and dynamic skill
+All stages use the same read-only tool ceiling and share the configured cycle
+timeout. The wrapper limits execution to a planner, 1-3 independent seats, and
+one synthesis call. Invalid or missing seat results block synthesis. A degraded
+autonomous panel cannot approve. Native delegation is excluded from every
+reviewer process, preventing recursive panels. The adapter cannot yet replace
+seats or perform targeted re-review; the skill reports that requirement rather
+than claiming a missing review succeeded.
+
+Reviewer launches disable built-in MCP servers and dynamic skill
 retrieval. Consumers may also list unrelated configured servers under
 `permissions.disableMcpServers`; startup rejects disabling a server named by
 `permissions.allowTools`.

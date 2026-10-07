@@ -29,7 +29,7 @@
     "consecutiveFailureThreshold": 3
   },
   "review": {
-    "note": "targetRefName scopes the agent to pull requests aimed at the mainline. panelMode is single or threeRound; threeRound uses the toolkit-owned fixed model sequence. maxFindings is the per-PR posting cap; the finalizer is told the same number so it self-prioritizes instead of being truncated. postSeverities is what this repository is willing to have posted - findings at other severities are still reported in the preview file and counted in the summary.",
+    "note": "targetRefName scopes the agent to pull requests aimed at the mainline. panelMode defaults to single; skillPanel requires reviewSkills.primary and uses that skill's panel selection and synthesis policy through bounded independent processes. maxFindings is the per-PR posting cap; the model is told the same number so it self-prioritizes instead of being truncated. postSeverities is what this repository is willing to have posted - findings at other severities are still reported in the preview file and counted in the summary.",
     "targetRefName": "refs/heads/main",
     "panelMode": "single",
     "maxFindings": 8,
