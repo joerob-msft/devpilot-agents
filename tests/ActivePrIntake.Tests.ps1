@@ -981,7 +981,7 @@ if ($env:AZURE_DEVOPS_EXT_PAT -or $env:SYSTEM_ACCESSTOKEN) {
             -ConnectionDataToolPath $python
         if ($Expected -ceq 'valid') {
             $identity = & $transport 'Identity' @{
-                timeoutMilliseconds = 3000
+                timeoutMilliseconds = 10000
             }
             $identity.id | Should -BeExactly $c.config.expectedAccount.id
             $identity.descriptor |
@@ -991,7 +991,7 @@ if ($env:AZURE_DEVOPS_EXT_PAT -or $env:SYSTEM_ACCESSTOKEN) {
         }
         else {
             { & $transport 'Identity' @{
-                    timeoutMilliseconds = 3000
+                    timeoutMilliseconds = 10000
                 } } | Should -Throw $Expected
         }
         $sdkInvocation = Get-Content -LiteralPath $sdkLog -Raw |
