@@ -1368,6 +1368,20 @@ print(json.dumps({
         elseif ($Area -ceq '__connection__') {
             @('-I', '-c', $connectionDataCommand, $org)
         }
+        elseif ($Area -ceq '__pull_requests__') {
+            @(
+                'repos', 'pr', 'list',
+                '--organization', $org,
+                '--project', $project,
+                '--repository', $repo,
+                '--status', 'active',
+                '--skip', $Query[0],
+                '--top', $Query[1],
+                '--detect', 'false',
+                '-o', 'json',
+                '--only-show-errors'
+            )
+        }
         else {
             $arguments = @(
                 'devops', 'invoke',
@@ -1691,14 +1705,14 @@ print(json.dumps({
                 }
             }
             ListPage {
-                $r = & $invoke 'git' 'pullRequests' @("project=$project", "repositoryId=$repo") @(
-                    'searchCriteria.status=active', "`$skip=$($Request.skip)", "`$top=$($Request.top)") $deadline
-                if ($r -isnot [Collections.IDictionary] -or
-                    -not $r.Contains('value') -or
-                    $r.value -isnot [array]) {
+                $listed = @(& $invoke '__pull_requests__' '' @() @(
+                        [string]$Request.skip,
+                        [string]$Request.top
+                    ) $deadline)
+                if ($listed -isnot [array]) {
                     throw 'page-response-invalid'
                 }
-                $items = @($r.value | ForEach-Object {
+                $items = @($listed | ForEach-Object {
                         if ($_ -isnot [Collections.IDictionary] -or
                             -not $_.Contains('pullRequestId') -or
                             -not $_.Contains('status') -or
@@ -1722,9 +1736,6 @@ print(json.dumps({
                         @{ pullRequestId = $_.pullRequestId; status = $_.status
                             isDraft = $_.isDraft; targetRef = $_.targetRefName }
                     })
-                if ($null -ne $r['count'] -and $r['count'] -ne $items.Count) {
-                    throw 'page-count-mismatch'
-                }
                 return @{ items = $items; count = $items.Count }
             }
             Head {

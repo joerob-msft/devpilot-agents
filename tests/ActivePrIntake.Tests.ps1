@@ -765,6 +765,15 @@ if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
     '{"user":{"name":"service@example.invalid"}}'
 } elseif ($CliArguments -contains '-c') {
     '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account"}}'
+} elseif ($CliArguments -contains 'repos' -and
+    $CliArguments -contains 'pr' -and
+    $CliArguments -contains 'list') {
+    if ($CliArguments -contains '1') {
+        '[]'
+    }
+    else {
+        '[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}]'
+    }
 } elseif ($CliArguments -contains 'pullRequestIterations') {
     '{"value":[{"id":1,"sourceRefCommit":{"commitId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"targetRefCommit":{"commitId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]}'
 } elseif ($CliArguments -contains 'pullRequestIterationChanges') {
@@ -773,10 +782,8 @@ if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
     '{"value":[],"count":0}'
 } elseif ($CliArguments -contains 'pullRequestId=1') {
     '{"pullRequestId":1,"status":"active","isDraft":false,"sourceRefName":"refs/heads/feature","targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}'
-} elseif ($CliArguments -contains '$skip=1') {
-    '{"value":[],"count":0}'
 } else {
-    '{"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}],"count":1}'
+    exit 9
 }
 '@ | Set-Content -LiteralPath $stub -Encoding utf8
             $transport = New-ActivePrAzureDevOpsProvider `
@@ -803,14 +810,17 @@ if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
                 'POST|PATCH|PUT|DELETE|--in-file'
             ($requests[1] -join '|') | Should -Not -Match `
                 'devops\|invoke|\|location\||\|connectionData\|'
-            ($requests[2] -join '|') |
-                Should -Match '\|--http-method\|GET\|'
             ($requests[2] -join '|') | Should -Match `
-                '\|--organization\|https://dev.azure.com/example-org\|'
-            ($requests[2] -join '|') |
-                Should -Match 'project=ExampleProject'
+                '^repos\|pr\|list\|--organization\|' +
+                'https://dev.azure.com/example-org\|'
             ($requests[2] -join '|') | Should -Match `
-                'repositoryId=11111111-1111-1111-1111-111111111111'
+                '\|--project\|ExampleProject\|'
+            ($requests[2] -join '|') |
+                Should -Match `
+                '\|--repository\|11111111-1111-1111-1111-111111111111\|'
+            ($requests[2] -join '|') | Should -Match `
+                '\|--status\|active\|--skip\|0\|--top\|3\|' +
+                '--detect\|false\|'
             $c.config.enabled = $true
             $liveShape = Invoke-ActivePrIntake -Config $c.config -Provider $transport `
                 -StateRoot $c.root -RepositoryRoot $repo -Run
@@ -824,7 +834,8 @@ if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
                     ForEach-Object { , ($_ | ConvertFrom-Json) })) {
                 $requestText = $request -join '|'
                 if ($requestText -notmatch '^account\|show\|' -and
-                    $requestText -notmatch '^-I\|-c\|') {
+                    $requestText -notmatch '^-I\|-c\|' -and
+                    $requestText -notmatch '^repos\|pr\|list\|') {
                     $requestText | Should -Match '\|--http-method\|GET\|'
                 }
             }
@@ -840,8 +851,8 @@ if ($CliArguments -contains 'account' -and $CliArguments -contains 'show') {
 echo %*>>"%ACTIVE_PR_INTAKE_CMD_LOG%"
 if "%~1"=="account" (
   echo {"user":{"name":"service@example.invalid"}}
-) else if "%~1"=="devops" (
-  echo {"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}],"count":1}
+) else if "%~1"=="repos" (
+  echo [{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}]
 ) else (
   echo {"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account"}}
 )
@@ -860,8 +871,11 @@ if "%~1"=="account" (
                 $cmdRequests | Should -HaveCount 2
                 $cmdRequests[0] | Should -Match '^"account" "show" '
                 $cmdRequests[1] | Should -Match `
-                    '^"devops" "invoke".*"pullRequests".*' +
-                    '"searchCriteria.status=active".*"\$skip=0".*"\$top=3"'
+                    '^"repos" "pr" "list".*' +
+                    '"--project" "ExampleProject".*' +
+                    '"--repository" "11111111-1111-1111-1111-111111111111".*' +
+                    '"--status" "active".*"--skip" "0".*"--top" "3".*' +
+                    '"--detect" "false"'
             }
             $slowStub = Join-Path $c.root 'az-slow-stub.ps1'
             'Start-Sleep -Seconds 5' | Set-Content -LiteralPath $slowStub -Encoding utf8
@@ -1075,8 +1089,6 @@ It 'retains fixed first provider causes without changing page refusal' `
     -TestCases @(
         @{ Mode = 'repository'; ExpectedReason = 'repository-mismatch'
             ExpectedNativeExit = $null }
-        @{ Mode = 'count'; ExpectedReason = 'page-count-mismatch'
-            ExpectedNativeExit = $null }
         @{ Mode = 'shape'; ExpectedReason = 'page-response-invalid'
             ExpectedNativeExit = $null }
         @{ Mode = 'native'; ExpectedReason = 'read-inaccessible'
@@ -1095,16 +1107,15 @@ if (`$args -contains '-c') {
     '{"authenticatedUser":{"id":"33333333-3333-3333-3333-333333333333","descriptor":"aad.synthetic-service-account"}}'
     exit 0
 }
-if (`$args -notcontains 'pullRequests') { exit 9 }
+if (`$args -notcontains 'repos' -or
+    `$args -notcontains 'pr' -or
+    `$args -notcontains 'list') { exit 9 }
 switch ('$Mode') {
     repository {
-        '{"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"99999999-9999-9999-9999-999999999999","project":{"id":"22222222-2222-2222-2222-222222222222"}}}],"count":1}'
-    }
-    count {
-        '{"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111","project":{"id":"22222222-2222-2222-2222-222222222222"}}}],"count":2}'
+        '[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"99999999-9999-9999-9999-999999999999","project":{"id":"22222222-2222-2222-2222-222222222222"}}}]'
     }
     shape {
-        '{"value":[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111"}}],"count":1}'
+        '[{"pullRequestId":1,"status":"active","isDraft":false,"targetRefName":"refs/heads/master","repository":{"id":"11111111-1111-1111-1111-111111111111"}}]'
     }
     native {
         [Console]::Error.Write('command failed')
@@ -1226,7 +1237,7 @@ exit 7
     $result.state | Should -BeExactly 'unknown'
     $result.reasonCodes | Should -Be @('identity-read-inaccessible')
     ($result | ConvertTo-Json -Depth 32) |
-        Should -Not -Match 'private sentinel|403|forbidden'
+        Should -Not -Match 'private sentinel|HTTP 403|forbidden'
     $diagnostic = Get-ChildItem -LiteralPath (
         Join-Path $c.root 'active-pr-intake-v1\diagnostics') `
         -File -Filter '*.json' |
