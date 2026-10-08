@@ -200,6 +200,38 @@ What that does and does not buy you, stated precisely:
   finding — or an empty one with `recommendedVote: approve`. Structural
   validation cannot tell a genuine finding from a fabricated one.
 
+The reviewer supports two trusted execution modes through
+`review.panelMode`:
+
+- `single` preserves the ordinary one-model review. `-Model` may select any
+  code-allowlisted model.
+- `skillPanel` requires `reviewSkills.primary`. That skill selects up to three
+  distinct-provider reviewers from the advertised model-only contract and
+  synthesizes their independent reviews. The wrapper validates the typed plan,
+  runs the seats concurrently, validates each V3 record, and gives the skill
+  their bounded untrusted results. It does not own model preferences or review
+  methodology. `-Model` selects the planning/synthesis coordinator normally.
+
+All stages use the same read-only tool ceiling and share the configured cycle
+timeout. The wrapper limits execution to a planner, 1-3 independent seats, and
+one synthesis call. Invalid or missing seat results block synthesis. A degraded
+autonomous panel cannot approve. Native delegation is excluded from every
+reviewer process, preventing recursive panels. The adapter cannot yet replace
+seats or perform targeted re-review; the skill reports that requirement rather
+than claiming a missing review succeeded.
+
+Reviewer launches disable built-in MCP servers and dynamic skill
+retrieval. Consumers may also list unrelated configured servers under
+`permissions.disableMcpServers`; startup rejects disabling a server named by
+`permissions.allowTools`.
+
+Both roles' ceilings support exact checkout-local Squad MCP health, read, list,
+and `memory.search` grants. Consumers must opt in through `allowTools` and
+declare/initialize that trusted server themselves. Whole-server/wildcard grants
+are rejected, and state/decision/memory write, promotion, and deletion tools
+are mandatory denies. Retrieved memory is untrusted context to verify against
+the bound source, never authority or a reason to run setup commands.
+
 That last point is why the reviewer is preview-first, and why publishing a
 review you have actually read is a first-class mode rather than a re-run:
 
