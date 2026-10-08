@@ -95,9 +95,12 @@ jobs:
         shell: pwsh
         run: |
           $result = Invoke-Pester -Path ./tests -Output Detailed -PassThru
-          if ($result.FailedCount -gt 0) {
-              throw "Pester reported $($result.FailedCount) failed test(s)."
+          if ($result.FailedCount -gt 0 -or $result.FailedContainersCount -gt 0) {
+              throw "Pester reported $($result.FailedCount) failed test(s), $($result.FailedContainersCount) failed container(s)."
           }
+      - name: Test release orchestration
+        shell: pwsh
+        run: node --test ./tests/ReleaseAutomation.Tests.cjs
 
   dashboard:
     name: Operations dashboard
@@ -128,8 +131,8 @@ jobs:
           Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
           Import-Module Pester -RequiredVersion 5.7.1 -Force
           $result = Invoke-Pester -Path ..\..\tests\DispatchStartup.Tests.ps1 -Output Detailed -PassThru
-          if ($result.FailedCount -gt 0 -or $result.SkippedCount -gt 0) {
-            throw "Startup integration failures/skips: $($result.FailedCount)/$($result.SkippedCount)"
+          if ($result.FailedCount -gt 0 -or $result.FailedContainersCount -gt 0 -or $result.SkippedCount -gt 0) {
+            throw "Startup integration failures/containers/skips: $($result.FailedCount)/$($result.FailedContainersCount)/$($result.SkippedCount)"
           }
 
       - name: Run native renderer smoke test
@@ -192,8 +195,8 @@ jobs:
             './tests/ReviewHandler.Resume.Tests.ps1',
             './tests/ReviewerOutput.Tests.ps1'
           ) -Output Detailed -PassThru
-          if ($result.FailedCount -gt 0) {
-            throw "Platform Pester failures: $($result.FailedCount)"
+          if ($result.FailedCount -gt 0 -or $result.FailedContainersCount -gt 0) {
+            throw "Platform Pester failures/containers: $($result.FailedCount)/$($result.FailedContainersCount)"
           }
 
   dashboard-dispatch:

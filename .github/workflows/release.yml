@@ -297,8 +297,8 @@ jobs:
               -Data @{ ToolkitContractRoot = $installed.Root }
           )
           $consumerTests = Invoke-Pester -Container $containers -Output Detailed -PassThru
-          if ($consumerTests.FailedCount -gt 0 -or $consumerTests.SkippedCount -gt 0) {
-            throw "Consumer qualification failures/skips: $($consumerTests.FailedCount)/$($consumerTests.SkippedCount)."
+          if ($consumerTests.FailedCount -gt 0 -or $consumerTests.FailedContainersCount -gt 0 -or $consumerTests.SkippedCount -gt 0) {
+            throw "Consumer qualification failures/containers/skips: $($consumerTests.FailedCount)/$($consumerTests.FailedContainersCount)/$($consumerTests.SkippedCount)."
           }
           & (Join-Path $installed.Root 'tools\Invoke-InstalledReleaseQualification.ps1') `
             -ToolkitRoot $installed.Root -ExpectedVersion $env:RELEASE_VERSION `
