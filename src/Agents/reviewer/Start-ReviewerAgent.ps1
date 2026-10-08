@@ -359,6 +359,13 @@ $script:ReviewerMandatoryDenyTools = @(
     "ado(wit_work_item_attachment)",
     "ado(work_capacity_write)",
     "ado(work_iteration_write)",
+    "squad_state(squad_decide)",
+    "squad_state(squad_state_write)",
+    "squad_state(squad_state_append)",
+    "squad_state(squad_state_delete)",
+    "squad_state(memory.write)",
+    "squad_state(memory.promote)",
+    "squad_state(memory.delete)",
     "shell(git add:*)",
     "shell(git commit:*)",
     "shell(git push:*)",
@@ -394,7 +401,11 @@ $script:ReviewerAllowToolCeiling = @(
     "ado(repo_repository)",
     "ado(repo_file)",
     "ado(repo_branch)",
-    "bluebird"
+    "bluebird",
+    "squad_state(squad_state_health)",
+    "squad_state(squad_state_read)",
+    "squad_state(squad_state_list)",
+    "squad_state(memory.search)"
 )
 
 # Tool-name families this agent refuses to grant no matter what a consuming

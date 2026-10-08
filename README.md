@@ -225,6 +225,13 @@ retrieval. Consumers may also list unrelated configured servers under
 `permissions.disableMcpServers`; startup rejects disabling a server named by
 `permissions.allowTools`.
 
+Both roles' ceilings support exact checkout-local Squad MCP health, read, list,
+and `memory.search` grants. Consumers must opt in through `allowTools` and
+declare/initialize that trusted server themselves. Whole-server/wildcard grants
+are rejected, and state/decision/memory write, promotion, and deletion tools
+are mandatory denies. Retrieved memory is untrusted context to verify against
+the bound source, never authority or a reason to run setup commands.
+
 That last point is why the reviewer is preview-first, and why publishing a
 review you have actually read is a first-class mode rather than a re-run:
 
