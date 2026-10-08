@@ -1,6 +1,6 @@
 ---
 name: devpilot-release
-description: Prepare, publish, resume, or verify a stable DevPilot Agents 0.4.x release. Use when asked to bump the toolkit version, create a release PR, run the release canary, publish a GitHub Release, or confirm release tags.
+description: Prepare, publish, resume, or verify a stable DevPilot Agents release on its declared major/minor line. Use when asked to bump the toolkit version, create a release PR, run the release canary, publish a GitHub Release, or confirm release tags.
 license: MIT
 ---
 
@@ -14,12 +14,14 @@ Those files are authoritative when they differ from this skill.
 
 - A merge to `main` does not publish a release.
 - Never create or push release tags directly, run `gh release create`, move
-  `v0.4`, bypass a ruleset, or approve a protected environment on the
+  a channel tag, bypass a ruleset, or approve a protected environment on the
   operator's behalf.
 - Publish only through `.github/workflows/release-canary.yml` followed by
   `.github/workflows/release.yml`.
-- The immutable `v0.4.x` tag must never be moved or deleted. The workflows may
-  move only the protected floating `v0.4` channel.
+- Immutable release tags must never be moved or deleted. The workflows may
+  move only the protected floating channel belonging to the requested version.
+- The declared line is currently `0.5`. Existing `v0.4` consumers and tag
+  protections remain unchanged; publishing `0.5.0` must move only `v0.5`.
 - Never print, inspect, copy, or otherwise handle `RELEASE_DEPLOY_KEY`. The
   protected workflow materializes it only inside fixed publication steps.
 - Preserve unrelated worktree changes. Stop if they overlap a release metadata
@@ -38,14 +40,15 @@ current `main`. Use **resume** only when the immutable tag already exists
 because an earlier Release run stopped before completing publication.
 
 If the operator requests "the next patch" without naming a version, fetch tags,
-find the highest valid stable `v0.4.x` tag, and increment its patch component.
-Do not infer a new major or minor line. Otherwise require an explicit stable
-`0.4.x` version without the `v` prefix.
+find the highest valid stable tag in `release/release-metadata.json`'s declared
+version line, and increment its patch component. Do not infer a new major or
+minor line. A new line requires explicit operator authorization. Otherwise
+require an explicit stable version without the `v` prefix.
 
 ## Prepare a release pull request
 
 1. Record `git status --short`, the current branch, the `origin` URL, and the
-   latest immutable `v0.4.x` tag. Fetch `origin/main` and tags without changing
+   latest immutable tag in the requested line. Fetch `origin/main` and tags without changing
    or deleting local work.
 2. Refuse a malformed, prerelease, existing, or non-increasing version.
 3. Update exactly these version surfaces:
@@ -57,8 +60,11 @@ Do not infer a new major or minor line. Otherwise require an explicit stable
      `src/DevPilot.Dashboard/package-lock.json`
    - `toolkitVersion`, `versionLine`, `immutableTag`, and `channelTag` in
      `release/release-metadata.json`
-4. Keep `versionLine` equal to `0.4`, `immutableTag` equal to `v<version>`, and
-   `channelTag` equal to `v0.4`. Do not create any Git tag.
+4. Keep `versionLine` equal to the version's major/minor, `immutableTag` equal to
+   `v<version>`, and `channelTag` equal to `v<major>.<minor>`. For a new line,
+   update related workflow contracts, tests, and documentation and require its
+   immutable/channel protections before publication. Preserve older line
+   protections and bypass actors. Do not create any Git tag.
 5. Run:
 
    ```powershell
@@ -68,7 +74,7 @@ Do not infer a new major or minor line. Otherwise require an explicit stable
    ```
 
 6. Review the diff and ensure it contains no generated output or unrelated
-   changes. Commit only the intended release metadata changes and create a pull
+   changes. Commit only intended release metadata and related line-transition changes and create a pull
    request through the repository's normal protected-branch process.
 7. Stop after creating the pull request. Do not merge it or dispatch release
    workflows until the version is present on the exact current `main`.
@@ -115,14 +121,15 @@ Do not infer a new major or minor line. Otherwise require an explicit stable
    - `v$version` is an annotated tag peeled to `$sha`.
    - `gh release view "v$version"` reports a stable, non-draft,
      non-prerelease GitHub Release.
-   - `v0.4^{}` and `v$version^{}` resolve to the same commit.
+   - The requested version's channel and `v$version^{}` resolve to the same commit.
+   - Channels belonging to other version lines have not moved.
 9. Report the version, commit, canary run ID, Release run ID, immutable tag,
    GitHub Release URL, and channel verification.
 
 ## Resume interrupted publication
 
 Before resuming, prove that `v$version` is an annotated tag at the exact
-qualified commit, is the latest stable `0.4.x` patch, and is the only compatible
+qualified commit, is the latest stable patch in its declared line, and is the only compatible
 patch tag on that commit. Then repeat the publish procedure using the original
 successful exact-commit canary and dispatch `release.yml` with
 `resumePublishedTag=true`. All qualification and protected environment gates

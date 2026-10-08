@@ -14,11 +14,17 @@ it and are checked by `tools/Test-DevPilotVersion.ps1` in CI and release jobs:
 - the root package entries in `src/DevPilot.Dashboard/package-lock.json`
 - `release/release-metadata.json`
 
-A stable `0.4` line has two kinds of Git references:
+A stable `0.5` line has two kinds of Git references:
 
-- `v0.4.0`, `v0.4.1`, and later `v0.4.x` are annotated immutable release tags.
-- `v0.4` is an annotated floating channel tag. It may move only to a commit
-  that also has exactly one compatible immutable annotated `v0.4.x` tag.
+- `v0.5.0`, `v0.5.1`, and later `v0.5.x` are annotated immutable release tags.
+- `v0.5` is an annotated floating channel tag. It may move only to a commit
+  that also has exactly one compatible immutable annotated `v0.5.x` tag.
+
+The version line comes from the synchronized release metadata, not a fixed
+workflow constant. Publishing `0.5.0` advances only `v0.5`; it never advances
+`v0.4` or changes any immutable `v0.4.x` tag. Consumers following `0.4` stay
+on that line until they explicitly opt in to `0.5`. The `0.5.0` feature release
+adds canonical skill-driven autonomous panels and read-only local Squad memory.
 
 Consumers resolve a channel to a full 40-character commit before installation.
 They execute only the verified commit-addressed cache at
@@ -32,11 +38,11 @@ Ordinary `.github/workflows/ci.yml` remains the required `main` CI. The
 dedicated workflows are:
 
 - `release-canary.yml`: protected live, read-only ADO/WorkIQ qualification.
-- `release.yml`: new immutable patch publication and `v0.4` advancement.
-- `release-channel.yml`: rollback or repromotion of `v0.4` to an existing
+- `release.yml`: new immutable release publication and its major/minor channel advancement.
+- `release-channel.yml`: rollback or repromotion of a version's own channel to an existing
   qualified immutable patch.
 
-`release.yml` accepts an explicit stable `0.4.x` version, the exact current
+`release.yml` accepts an explicit stable version matching `VERSION`, the exact current
 `main` workflow commit, an exact candidate commit, and a successful canary run
 ID. Fresh publication requires the workflow and candidate commits to be the
 same current `main` commit. It refuses dirty, existing, malformed, prerelease,
@@ -52,7 +58,7 @@ job materialize the deploy key, create the annotated immutable tag, push it,
 and immediately remove the key. A separate read-only qualification job then
 resolves that immutable tag through the consumer installer and repeats final
 installed smoke tests. A final minimal protected job creates the stable GitHub
-Release and moves `v0.4` last, after rechecking that `main` still names the
+Release and moves only that version's major/minor channel last, after rechecking that `main` still names the
 qualified workflow commit. No repository-controlled candidate code executes
 in a job while a write credential is available.
 
@@ -64,7 +70,7 @@ and is the sole compatible patch tag on that commit. An existing Release must
 be stable. All deterministic, consumer, canary, and final installed gates run
 again before the channel can move.
 
-The live canary is **mandatory before advancing `v0.4`**. It performs three to
+The live canary is **mandatory before advancing any channel**. It performs three to
 five consecutive installed-candidate resolutions and fresh authenticated ADO
 and WorkIQ MCP sessions on a dedicated self-hosted Windows runner labeled
 `devpilot-canary`. Each attempt verifies repository identity, reads the
@@ -121,12 +127,20 @@ protected release environments:
 1. `main-required-ci`: target `main`; require pull requests, disallow force
    pushes and deletion, require the current CI checks, and require the branch
    to be up to date.
-2. `release-tag-creation`: target `v0.4` and `v0.4.*`; restrict tag creation;
+2. `release-tag-creation`: target `v0.4`, `v0.4.*`, `v0.5`, and `v0.5.*`; restrict tag creation;
    the release deploy key is the only bypass actor.
 3. `immutable-v0.4-patches`: target `v0.4.*`; restrict updates and deletions;
    configure no bypass actor, including the release deploy key.
 4. `v0.4-channel`: target exactly `v0.4`; restrict updates and deletions; the
    release deploy key is the only bypass actor.
+5. `immutable-v0.5-patches`: target `v0.5.*`; restrict updates and deletions;
+   configure no bypass actor, including the release deploy key.
+6. `v0.5-channel`: target exactly `v0.5`; restrict updates and deletions; the
+   release deploy key is the only bypass actor.
+
+Keep the `0.4` protections intact. A new version line requires its own immutable
+and channel rulesets before publication; a version-file bump alone is not a
+release. Never broaden bypass actors when adding that line.
 
 Environment approvers must verify the rulesets in repository settings before
 approving the first publication. The required `main` checks are:
@@ -156,7 +170,7 @@ request and dispatch the protected workflows after merge. The skill does not
 replace environment approvals, rulesets, or any qualification gate.
 
 1. Update `VERSION`, the harness manifest, dashboard package files, and release
-   metadata to the intended stable `0.4.x` value.
+   metadata to the intended stable version (currently `0.5.0`).
 2. Run `tools/Test-DevPilotVersion.ps1`.
 3. Run `tools/Invoke-DevPilotCi.ps1 -Mode WindowsComplete`.
 4. Merge through protected `main` and confirm every required CI check is green
@@ -168,11 +182,12 @@ replace environment approvals, rulesets, or any qualification gate.
 6. Run `Release` with the version, the exact current `main` commit as both
    `workflowCommit` and `candidateCommit`, and the canary run ID.
 7. Confirm the immutable annotated tag and stable GitHub Release exist.
-8. Confirm `v0.4^{}` and `v0.4.x^{}` resolve to the same qualified commit.
+8. Confirm the declared channel (currently `v0.5^{}`) and immutable release tag
+   resolve to the same qualified commit; confirm `v0.4` was not changed.
 9. Start a consumer twice: once online and once with remote access unavailable.
    Both launches must use the receipt's exact commit-addressed cache.
 
-Do not create `v0.4.0` manually. The first release is published only by
+Do not create `v0.5.0` manually. The first release on a new line is published only by
 `release.yml` after every gate above succeeds.
 
 ## Rollback
@@ -180,7 +195,7 @@ Do not create `v0.4.0` manually. The first release is published only by
 Rollback moves only the floating channel; immutable patch tags and GitHub
 Releases remain unchanged.
 
-1. Select a prior stable `v0.4.x` release at or above the consumers'
+1. Select a prior stable release in the consumers' major/minor line at or above their
    `minimumVersion`.
 2. Run `Release Canary` from the exact current `main` `workflowCommit`, in
    `exactVersion` mode, with the prior release commit as `candidateCommit`.
@@ -188,13 +203,13 @@ Releases remain unchanged.
    commit with the target version and successful canary run ID.
 4. The workflow re-resolves the annotated immutable tag, verifies the stable
    GitHub Release, installs it into an empty cache, repeats installed smoke
-   tests, and then moves `v0.4`.
+   tests, and then moves only the channel derived from the target version.
 5. Verify a fresh consumer resolution records the older qualified patch. An
    offline consumer may continue using its previous receipt until its next
    successful startup check; no running process is changed.
 
-Never delete or move an immutable patch tag to perform rollback. Never point
-`v0.4` directly with a local administrator token.
+Never delete or move an immutable patch tag to perform rollback. Never move
+any channel directly with a local administrator token.
 
 ## Trust and failure model
 
