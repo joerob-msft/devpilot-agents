@@ -742,6 +742,68 @@ else {
                 Env:\ACTIVE_PR_INTAKE_EMPTY_LOG -ErrorAction SilentlyContinue
         }
     }
+    It 'reads renamed target content from the original path' {
+        $c = New-IntakeCase -Count 1
+        New-Item -ItemType Directory -Path $c.root -Force |
+            Out-Null
+        $stub = Join-Path $c.root 'az-rename-content.ps1'
+        $log = Join-Path $c.root 'rename-item-requests.log'
+        $env:ACTIVE_PR_INTAKE_RENAME_LOG = $log
+        @'
+$arguments = $args
+if ($arguments -contains 'pullRequestIterationChanges') {
+    if ($arguments -contains '$skip=1') {
+        '{"changeEntries":[],"count":0}'
+    }
+    else {
+        '{"changeEntries":[{"changeTrackingId":1,"changeType":"rename","originalPath":"/tests/Old.cs","item":{"path":"/tests/New.cs"}}],"count":1,"nextSkip":1}'
+    }
+}
+elseif ($arguments -contains 'items') {
+    [IO.File]::AppendAllText(
+        $env:ACTIVE_PR_INTAKE_RENAME_LOG,
+        ($arguments -join '|') + "`n")
+    '{"content":"class C {}","contentMetadata":{"contentType":"text/plain"}}'
+}
+else {
+    exit 7
+}
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        try {
+            $transport = New-ActivePrAzureDevOpsProvider `
+                -Config $c.config -AzureCliPath $stub
+            $changes = & $transport 'Changes' @{
+                pullRequestId = 1
+                iterationId = 1
+                sourceCommit = 'a' * 40
+                targetCommit = 'b' * 40
+                timeoutMilliseconds = 15000
+            }
+            @($changes.entries) | Should -HaveCount 1
+            $changes.entries[0].path |
+                Should -BeExactly 'tests/New.cs'
+            $changes.entries[0].oldPath |
+                Should -BeExactly 'tests/Old.cs'
+            $requests = @(Get-Content -LiteralPath $log)
+            $requests | Should -HaveCount 2
+            $requests[0] |
+                Should -Match 'path=/tests/New\.cs'
+            $requests[0] |
+                Should -Match (
+                    'versionDescriptor\.version=' +
+                    ('a' * 40))
+            $requests[1] |
+                Should -Match 'path=/tests/Old\.cs'
+            $requests[1] |
+                Should -Match (
+                    'versionDescriptor\.version=' +
+                    ('b' * 40))
+        }
+        finally {
+            Remove-Item Env:\ACTIVE_PR_INTAKE_RENAME_LOG `
+                -ErrorAction SilentlyContinue
+        }
+    }
     It 'normalizes real shared git spans for <Mode> changes' `
         -TestCases @(
             @{ Mode = 'multi'; ExpectedLines = 3

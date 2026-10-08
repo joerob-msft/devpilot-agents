@@ -1036,6 +1036,60 @@ Describe 'Named AreEqual automatic delivery' {
         $second.health | Should -BeExactly refused
         $provider.State.writes | Should -Be 1
     }
+
+    It 'reserves unresolved intents across prior head identities for the same PR' {
+        $context = New-NamedDeliveryContext
+        $provider = New-NamedDeliveryProvider `
+            -Evidence $context.Evidence
+        $proposal = Get-ApprovedOwnerV2Proposal `
+            -Evidence $context.Evidence `
+            -Finding $context.Evidence.Observation.findings[0] `
+            -Delivery named-areequal
+        $oldIdentity = 'b' * 64
+        $intentPath = Join-Path $context.Root (
+            "intents\$oldIdentity\interrupted.json")
+        [void](Write-ApprovedOwnerV2SignedRecord `
+                -Path $intentPath -Key $context.Key `
+                -Payload ([ordered]@{
+                    schemaVersion = 1
+                    kind =
+                        'named-areequal-v2-service-create-intent'
+                    runId = 'interrupted'
+                    state = @{ identity = $oldIdentity }
+                    subject = [ordered]@{
+                        repositoryId =
+                            [string]$context.Evidence.Declaration.
+                                subject.repositoryId
+                        projectId =
+                            [string]$context.Evidence.Declaration.
+                                subject.projectId
+                        pullRequestId =
+                            [long]$context.Evidence.Declaration.
+                                subject.pullRequestId
+                        sourceCommit = 'c' * 40
+                        targetCommit =
+                            [string]$context.Evidence.Declaration.
+                                target.targetCommit
+                        targetRef =
+                            [string]$context.Evidence.Declaration.
+                                target.targetRef
+                    }
+                    rule = $context.Evidence.Declaration.rule
+                    capability =
+                        $context.Evidence.Declaration.capability
+                    selections = @($proposal)
+                }))
+
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly 'refused'
+        $result.providerWrites | Should -Be 0
+        $provider.State.writes | Should -Be 0
+        @($provider.State.operations) | Should -HaveCount 0
+    }
 }
 
 AfterAll {

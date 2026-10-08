@@ -8,7 +8,6 @@ param(
     [Parameter(Mandatory)][string]$AcquisitionPath,
     [string]$AzureCliPath = 'az',
     [ValidateRange(1, 4)][int]$MaximumHeadsThisRun = 4,
-    [ValidateCount(0, 8)][long[]]$AdditionalPullRequestId = @(),
     [switch]$Run,
     [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot)
 )
@@ -30,54 +29,6 @@ $intake = Invoke-ActivePrIntake `
     -StateRoot $StateRoot -RepositoryRoot $RepoRoot `
     -MaximumHeadsThisRun $MaximumHeadsThisRun `
     -IncludeTransientSnapshots -Run:$Run
-
-$additionalReadCount = 0
-foreach ($pullRequestId in @($AdditionalPullRequestId |
-        Sort-Object -Unique)) {
-    $key = [string]$pullRequestId
-    if ($intake.transientSnapshots.Contains($key)) {
-        continue
-    }
-    $before = & $provider 'Head' @{
-        pullRequestId = $pullRequestId
-    }
-    $additionalReadCount++
-    $changes = & $provider 'Changes' @{
-        pullRequestId = $pullRequestId
-        iterationId = [int]$before.iterationId
-        sourceCommit = [string]$before.sourceCommit
-        targetCommit = [string]$before.targetCommit
-    }
-    $additionalReadCount++
-    $discussions = & $provider 'Discussions' @{
-        pullRequestId = $pullRequestId
-        iterationId = [int]$before.iterationId
-    }
-    $additionalReadCount++
-    $after = & $provider 'Head' @{
-        pullRequestId = $pullRequestId
-    }
-    $additionalReadCount++
-    if ((Get-AgentCanonicalDigest -InputObject $before) -cne
-        (Get-AgentCanonicalDigest -InputObject $after)) {
-        throw 'Shared acquisition additional head drifted.'
-    }
-    $intake.transientSnapshots[$key] = [ordered]@{
-        schemaVersion = 1
-        kind = 'active-pr-transient-snapshot'
-        generation = [string]$intake.generation
-        head = $before
-        changes = $changes
-        discussions = $discussions
-        sourceDigest = Get-AgentCanonicalDigest -InputObject (
-            [ordered]@{
-                head = $before
-                changes = $changes
-                discussions = $discussions
-            })
-        selectionKind = 'pinned-applicable-rule-subject'
-    }
-}
 
 $directory = Resolve-AgentTrustedRoot `
     -Path (Split-Path -Parent $AcquisitionPath) `
@@ -151,16 +102,11 @@ $blobKeys = @($intake.transientSnapshots.GetEnumerator() |
             $_.declaration -is [Collections.IDictionary] -and
             [string]$_.reasonCode -ceq 'rules-incomplete'
         }).Count
-    additionalPrCount = @($AdditionalPullRequestId |
-        Sort-Object -Unique | Where-Object {
-            -not (@($intake.heads.pullRequestId) -contains $_)
-        }).Count
     totalUniquePrSnapshotCount =
         @($intake.transientSnapshots.Keys).Count
     uniqueContentBlobCount = $blobKeys.Count
     uniqueContentBlobKeys = $blobKeys
-    providerReadCount =
-        [int]$intake.readCount + $additionalReadCount
+    providerReadCount = [int]$intake.readCount
     providerWrites = 0
     modelWrites = 0
 } | ConvertTo-Json -Depth 32

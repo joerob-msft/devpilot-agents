@@ -712,6 +712,7 @@ function Get-AutomaticOwnerV2DeliveryHistory {
         if ([string]$event.kind -cne $expectedKind) {
             throw "Automatic Owner event '$($file.FullName)' is foreign."
         }
+
         if ([string]$event.subject.repositoryId -cne
             [string]$Evidence.Declaration.subject.repositoryId -or
             [long]$event.subject.pullRequestId -ne
@@ -855,6 +856,55 @@ function Repair-AutomaticOwnerV2Intents {
     return $events.ToArray()
 }
 
+function Get-AutomaticNamedAreEqualUnresolvedIntentMarkers {
+    param(
+        [Parameter(Mandatory)][string]$DeliveryRoot,
+        [Parameter(Mandatory)][byte[]]$Key,
+        [Parameter(Mandatory)]$Evidence
+    )
+    $markers = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    $intentsRoot = Join-Path $DeliveryRoot 'intents'
+    foreach ($file in @(Get-ChildItem -LiteralPath $intentsRoot `
+                -Recurse -Filter '*.json' -File `
+                -ErrorAction SilentlyContinue)) {
+        $identity = $file.Directory.Name
+        $outcomePath = Join-Path $DeliveryRoot (
+            "outcomes\$identity\$($file.Name)")
+        if (Test-Path -LiteralPath $outcomePath -PathType Leaf) {
+            [void](Read-ApprovedOwnerV2SignedRecord `
+                    -Path $outcomePath -Key $Key)
+            continue
+        }
+        $intent = Read-ApprovedOwnerV2SignedRecord `
+            -Path $file.FullName -Key $Key
+        if ([string]$intent.kind -cne
+                'named-areequal-v2-service-create-intent') {
+            continue
+        }
+        if ([string]$intent.subject.repositoryId -cne
+                [string]$Evidence.Declaration.subject.repositoryId -or
+            [long]$intent.subject.pullRequestId -ne
+                [long]$Evidence.Declaration.subject.pullRequestId -or
+            [string]$intent.rule.path -cne
+                [string]$Evidence.Declaration.rule.path -or
+            [string]$intent.rule.section -cne
+                [string]$Evidence.Declaration.rule.section -or
+            [string]$intent.capability.id -cne
+                [string]$Evidence.Declaration.capability.id) {
+            continue
+        }
+        foreach ($selection in @($intent.selections)) {
+            if ([string]$selection.marker -cmatch
+                '^[0-9a-f]{64}$') {
+                [void]$markers.Add(
+                    [string]$selection.marker)
+            }
+        }
+    }
+    return $markers
+}
+
 function Invoke-AutomaticOwnerV2Comments {
     [CmdletBinding()]
     param(
@@ -916,6 +966,15 @@ function Invoke-AutomaticOwnerV2Comments {
                 -Evidence $Evidence)
         $history = Get-AutomaticOwnerV2DeliveryHistory `
             -DeliveryRoot $DeliveryRoot -Key $Key -Evidence $Evidence
+        if ($namedAreEqual) {
+            $unresolved =
+                Get-AutomaticNamedAreEqualUnresolvedIntentMarkers `
+                    -DeliveryRoot $DeliveryRoot -Key $Key `
+                    -Evidence $Evidence
+            foreach ($marker in $unresolved) {
+                [void]$history.BlockedMarkers.Add($marker)
+            }
+        }
         $prRemaining = if ($history.BlockedMarkers.Count -gt 0) {
             0
         }
@@ -1418,8 +1477,14 @@ function Invoke-AutomaticNamedAreEqualBatch {
     if ($Evidence.Count -lt 1 -or $Evidence.Count -gt 4) {
         throw 'Named AreEqual batch requires one to four evidence records.'
     }
+    Assert-AutomaticOwnerV2ServicePolicy `
+        -Evidence $Evidence[0] -Policy $Policy
     $batchRunId = [guid]::NewGuid().ToString('N')
-    $remainingCreates = $MaximumCreates
+    $remainingCreates = [Math]::Min(
+        $MaximumCreates,
+        [Math]::Min(
+            [int]$Policy.limits.maxCreatesPerRun,
+            $script:AutomaticNamedAreEqualMaximumCreatesPerRun))
     $providerWrites = 0
     $remainingWouldCreate = 0
     $results = [Collections.Generic.List[object]]::new()

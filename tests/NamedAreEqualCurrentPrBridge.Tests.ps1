@@ -236,8 +236,8 @@ Describe 'Named AreEqual current PR bridge' {
                 ExpectedState = 'completed' }
             @{ Mode = 'human'; ExpectedExit = 0
                 ExpectedState = 'completed' }
-            @{ Mode = 'drift'; ExpectedExit = 1
-                ExpectedState = 'threw' }
+            @{ Mode = 'drift'; ExpectedExit = 0
+                ExpectedState = 'partial' }
         ) {
         param($Mode, $ExpectedExit, $ExpectedState)
         $config = New-BridgeConfig
@@ -268,7 +268,9 @@ Describe 'Named AreEqual current PR bridge' {
             $result.providerWrites | Should -Be 0
             $result.modelWrites | Should -Be 0
             $result.recordCount | Should -Be 1
-            $result.recordState | Should -BeExactly 'completed'
+            $result.recordState | Should -BeExactly $(if (
+                    $Mode -ceq 'drift'
+                ) { 'unknown' } else { 'completed' })
             $result.calls | Should -Contain 'Discussions'
             $result.observation.lifecycle.status |
                 Should -BeExactly 'completed'
@@ -303,8 +305,13 @@ Describe 'Named AreEqual current PR bridge' {
                     Should -Match '^[0-9a-f]{64}$'
             }
         }
-        else {
-            $result.message | Should -Match 'head-drift'
+        if ($Mode -ceq 'drift') {
+            @($result.outcomes | Where-Object {
+                    $_ -is [Collections.IDictionary] -and
+                    $_.Contains('stage') -and
+                    [string]$_['stage'] -ceq 'post-head' -and
+                    [string]$_['state'] -ceq 'unknown'
+                }) | Should -HaveCount 1
         }
     }
 
@@ -382,10 +389,14 @@ Describe 'Named AreEqual current PR bridge' {
             -StateRoot $state -ManifestPath $manifest `
             -RepositoryRoot $repoRoot -Run
 
-        $result.state | Should -BeExactly 'unknown'
+        $result.state | Should -BeExactly 'partial'
         $result.providerWrites | Should -Be 0
         $result.modelWrites | Should -Be 0
         @($result.records) | Should -HaveCount 0
+        @($result.outcomes | Where-Object {
+                [string]$_.stage -ceq 'snapshot' -and
+                [string]$_.state -ceq 'unknown'
+            }) | Should -HaveCount 1
         Test-Path -LiteralPath $manifest | Should -BeFalse
         @(Get-ChildItem -LiteralPath $state -Recurse -File `
                 -ErrorAction SilentlyContinue |

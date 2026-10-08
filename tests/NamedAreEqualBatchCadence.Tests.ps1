@@ -116,7 +116,8 @@ BeforeAll {
     function New-BatchBridgeProvider {
         param(
             [Parameter(Mandatory)]
-            [Collections.IDictionary]$Config
+            [Collections.IDictionary]$Config,
+            [int]$PostHeadFailureId = 0
         )
         $rows = @(1..4 | ForEach-Object {
                 [ordered]@{
@@ -129,6 +130,7 @@ BeforeAll {
         $digestCommand = Get-Command Get-BridgeTextDigest `
             -CommandType Function
         $calls = [Collections.Generic.List[string]]::new()
+        $headVisits = @{}
         $handler = {
             param($Operation, $Request)
             [void]$calls.Add(
@@ -150,6 +152,14 @@ BeforeAll {
                 }
                 Head {
                     $id = [int]$Request.pullRequestId
+                    if (-not $headVisits.ContainsKey($id)) {
+                        $headVisits[$id] = 0
+                    }
+                    $headVisits[$id]++
+                    if ($PostHeadFailureId -eq $id -and
+                        $headVisits[$id] -ge 3) {
+                        throw 'head-inconsistent'
+                    }
                     return @{
                         pullRequestId = $id
                         repositoryId = $Config.repositoryId
@@ -165,7 +175,7 @@ BeforeAll {
                 }
                 Changes {
                     $id = [int]$Request.pullRequestId
-                    $calls = if ($id -eq 4) {
+                    $callLines = if ($id -eq 4) {
                         @(1..100 | ForEach-Object {
                                 "        Assert.AreEqual($_, actual);"
                             })
@@ -180,7 +190,7 @@ BeforeAll {
                         '    [TestMethod]',
                         "    void Verify$id() {",
                         '        var actual = 1;'
-                    ) + $calls + @(
+                    ) + $callLines + @(
                         '    }',
                         '}'
                     )
@@ -269,6 +279,23 @@ Describe 'Named batch cadence' {
         }
         $revisedProvider =
             New-BatchIntakeProvider -Config $revised
+        $failedProvider = {
+            param($Operation, $Request)
+            if ($Operation -ceq 'ListPage') {
+                throw 'read-inaccessible'
+            }
+            return & $revisedProvider $Operation $Request
+        }.GetNewClosure()
+        $failedTransition = Invoke-ActivePrIntake `
+            -Config $revised -Provider $failedProvider `
+            -StateRoot $state -RepositoryRoot $repo `
+            -MaximumHeadsThisRun 4 -Run
+        $failedTransition.state |
+            Should -BeExactly 'unknown'
+        $failedTransition.binding.cursorTransitionApplied |
+            Should -BeTrue
+        $failedTransition.cursor.nextPullRequestId |
+            Should -Be 6
         $third = Invoke-ActivePrIntake `
             -Config $revised -Provider $revisedProvider `
             -StateRoot $state -RepositoryRoot $repo `
@@ -277,9 +304,10 @@ Describe 'Named batch cadence' {
         $third.binding.configDigest |
             Should -Not -BeExactly $second.binding.configDigest
         $third.binding.cursorTransitionApplied |
-            Should -BeTrue
+            Should -BeFalse
         $third.binding.cursorSourceConfigDigest |
-            Should -BeExactly $second.binding.configDigest
+            Should -BeExactly (
+                [string]$failedTransition.binding.configDigest)
         @($third.heads | Where-Object {
                 [string]$_.reasonCode -ceq 'rules-incomplete'
             }).pullRequestId |
@@ -289,6 +317,7 @@ Describe 'Named batch cadence' {
 
     It 'enforces one shared create budget of two across four identities' {
         $script:requested = [Collections.Generic.List[int]]::new()
+        Mock Assert-AutomaticOwnerV2ServicePolicy {}
         Mock Invoke-AutomaticOwnerV2Comments {
             param(
                 $Evidence,
@@ -323,7 +352,9 @@ Describe 'Named batch cadence' {
                 }
             })
         $result = Invoke-AutomaticNamedAreEqualBatch `
-            -Evidence $evidence -Policy @{} `
+            -Evidence $evidence -Policy @{
+                limits = @{ maxCreatesPerRun = 2 }
+            } `
             -DeliveryRoot $TestDrive -Key ([byte[]](1..32)) `
             -Provider { throw 'not invoked' } -MaximumCreates 2
 
@@ -335,7 +366,57 @@ Describe 'Named batch cadence' {
         $script:requested.ToArray() | Should -Be @(2, 1)
     }
 
-    It 'retains completed heads when one of four observations is incomplete' {
+    It 'honors a signed run ceiling of one across two identities' {
+        $script:requested = [Collections.Generic.List[int]]::new()
+        Mock Assert-AutomaticOwnerV2ServicePolicy {}
+        Mock Invoke-AutomaticOwnerV2Comments {
+            param(
+                $Evidence,
+                $Policy,
+                $DeliveryRoot,
+                $Key,
+                $Provider,
+                $MaximumCreates
+            )
+            [void]$script:requested.Add([int]$MaximumCreates)
+            return [pscustomobject]@{
+                health = 'healthy'
+                providerWrites = 1
+                modelWrites = 0
+                remainingWouldCreate = 0
+                events = @()
+            }
+        }
+        $evidence = @(1..2 | ForEach-Object {
+                [pscustomobject]@{
+                    Identity = ('{0:x64}' -f $_)
+                    Observation = @{
+                        findings = @(@{
+                                reconciliation = @{
+                                    classification =
+                                        'wouldCreate'
+                                }
+                            })
+                    }
+                }
+            })
+        $result = Invoke-AutomaticNamedAreEqualBatch `
+            -Evidence $evidence -Policy @{
+                limits = @{ maxCreatesPerRun = 1 }
+            } `
+            -DeliveryRoot $TestDrive `
+            -Key ([byte[]](1..32)) `
+            -Provider { throw 'not invoked' } `
+            -MaximumCreates 2
+
+        $result.providerWrites | Should -Be 1
+        $result.remainingCreates | Should -Be 0
+        @($result.results) | Should -HaveCount 1
+        @($result.deferred) | Should -HaveCount 1
+        $script:requested.ToArray() | Should -Be @(1)
+    }
+
+    It 'retains completed heads when one of four selected acquisitions is missing' {
         $config = New-BatchIntakeConfig
         $config.namedRule = [ordered]@{
             repositoryId = 'devpilot-agents'
@@ -394,7 +475,8 @@ Describe 'Named batch cadence' {
         $config.autoCreateNamedAreEqualComments = $false
         $config.limits.maxChangedFiles = 64
         $config.limits.maxChangedLines = 5000
-        $provider = New-BatchBridgeProvider -Config $config
+        $provider = New-BatchBridgeProvider `
+            -Config $config -PostHeadFailureId 3
         $state = Join-Path $TestDrive 'bridge-batch-state'
         $manifest = Join-Path $TestDrive 'bridge-batch-manifest.json'
         $preparedIntake = Invoke-ActivePrIntake `
@@ -402,6 +484,7 @@ Describe 'Named batch cadence' {
             -StateRoot $state -RepositoryRoot $repo `
             -MaximumHeadsThisRun 4 `
             -IncludeTransientSnapshots -Run
+        $preparedIntake.transientSnapshots.Remove('4')
         Mock Invoke-OwnerV2PreviewRun `
             -ModuleName DevPilot.NamedAreEqualBridge {
             param(
@@ -415,36 +498,28 @@ Describe 'Named batch cadence' {
             New-Item -ItemType Directory `
                 -Path $observationRoot -Force | Out-Null
             $records = @(
-                1..4 | ForEach-Object {
+                1..3 | ForEach-Object {
                     $identity = ('{0:x64}' -f $_)
-                    $completed = $_ -lt 4
                     [IO.File]::WriteAllText(
                         (Join-Path $observationRoot `
                             "$identity.json"),
                         ([ordered]@{
+                                subject = @{
+                                    pullRequestId = $_
+                                }
                                 lifecycle = @{
-                                    status = $(if ($completed) {
-                                            'completed'
-                                        } else { 'incomplete' })
+                                    status = 'completed'
                                 }
                                 counts = @{
-                                    unknown = $(if ($completed) {
-                                            0
-                                        } else { 1 })
+                                    unknown = 0
                                 }
-                                findingsComplete = $completed
+                                findingsComplete = $true
                                 validationErrors = @()
                             } | ConvertTo-Json -Depth 8))
                     [pscustomobject]@{
                         identity = $identity
-                        state = $(if ($completed) {
-                                'completed'
-                            } else { 'unknown' })
-                        reason = $(if ($completed) {
-                                'unknown'
-                            } else {
-                                'semantic-or-evidence-unknown'
-                            })
+                        state = 'completed'
+                        reason = 'unknown'
                     }
                 })
             return [pscustomobject]@{
@@ -460,14 +535,30 @@ Describe 'Named batch cadence' {
 
         $result.state | Should -BeExactly 'partial' `
             -Because ($result | ConvertTo-Json -Depth 8 -Compress)
-        @($result.records) | Should -HaveCount 4
-        $result.completedCount | Should -Be 3
-        $result.incompleteCount | Should -Be 1
+        @($result.records) | Should -HaveCount 3
+        $result.completedCount | Should -Be 2
+        $result.incompleteCount | Should -Be 2
         @($result.records | Where-Object {
                 [string]$_.state -ceq 'completed'
-            }) | Should -HaveCount 3
+            }) | Should -HaveCount 2
         @($result.records | Where-Object {
-                [string]$_.state -cne 'completed'
+                [string]$_.state -ceq 'unknown' -and
+                [string]$_.reason -ceq
+                    'post-evaluation-head-refused'
+            }) | Should -HaveCount 1
+        @($result.outcomes | Where-Object {
+                $_ -is [Collections.IDictionary] -and
+                $_.Contains('stage') -and
+                [string]$_['stage'] -ceq 'snapshot' -and
+                [long]$_['pullRequestId'] -eq 4 -and
+                [string]$_['state'] -ceq 'unknown'
+            }) | Should -HaveCount 1
+        @($result.outcomes | Where-Object {
+                $_ -is [Collections.IDictionary] -and
+                $_.Contains('stage') -and
+                [string]$_['stage'] -ceq 'post-head' -and
+                [long]$_['pullRequestId'] -eq 3 -and
+                [string]$_['state'] -ceq 'unknown'
             }) | Should -HaveCount 1
         @($provider.Calls | Where-Object {
                 $_ -like 'Changes:*'
@@ -479,6 +570,7 @@ Describe 'Named batch cadence' {
 
     It 'stops later identities after an ambiguous write' {
         $script:callCount = 0
+        Mock Assert-AutomaticOwnerV2ServicePolicy {}
         Mock Invoke-AutomaticOwnerV2Comments {
             $script:callCount++
             return [pscustomobject]@{
@@ -507,7 +599,9 @@ Describe 'Named batch cadence' {
                 }
             })
         $result = Invoke-AutomaticNamedAreEqualBatch `
-            -Evidence $evidence -Policy @{} `
+                -Evidence $evidence -Policy @{
+                    limits = @{ maxCreatesPerRun = 2 }
+                } `
             -DeliveryRoot $TestDrive -Key ([byte[]](1..32)) `
             -Provider { throw 'not invoked' } -MaximumCreates 2
 

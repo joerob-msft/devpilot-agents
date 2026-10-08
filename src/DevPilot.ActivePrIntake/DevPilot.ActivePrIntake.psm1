@@ -983,6 +983,11 @@ function Invoke-ActivePrIntake {
             reasonCodes = @()
         }
         $envelope.generationFile = Join-Path 'generations' "$($envelope.generation).json"
+        if ($previous -and $cursorBindingCompatible -and
+            $null -ne $previous.cursor.nextPullRequestId) {
+            $envelope.cursor.nextPullRequestId =
+                $previous.cursor.nextPullRequestId
+        }
         $reasons = [Collections.Generic.List[string]]::new()
         $heads = [Collections.Generic.List[object]]::new()
         $transientSnapshots = [ordered]@{}
@@ -2086,8 +2091,15 @@ print(json.dumps({
                         ''
                     }
                     else {
-                        $targetItem = & $getItem (
-                            [string]$entry.path) $targetCommit $deadline
+                        $targetPath = if (
+                            $changeType -match '(?i)rename' -and
+                            $entry.originalPath
+                        ) {
+                            [string]$entry.originalPath
+                        }
+                        else { [string]$entry.path }
+                        $targetItem = & $getItem `
+                            $targetPath $targetCommit $deadline
                         [string]$targetItem.content
                     }
                     $spans = @(& $changedSpansCommand `

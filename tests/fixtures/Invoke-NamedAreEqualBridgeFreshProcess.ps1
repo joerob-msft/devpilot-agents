@@ -178,6 +178,7 @@ try {
             [string]$record[0].state
         } else { $null }
         calls = @($calls)
+        outcomes = @($result.outcomes)
         observation = $observation
     } | ConvertTo-Json -Depth 32
 }

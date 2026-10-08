@@ -405,9 +405,9 @@ function Invoke-NamedAreEqualCurrentPrBridge {
     $snapshots = $intake.transientSnapshots
     [void]$intake.Remove('transientSnapshots')
     $selected = @($intake.heads | Where-Object {
-            $_.declaration -is [Collections.IDictionary] -and
             [string]$_.targetRef -ceq 'refs/heads/master' -and
-            [string]$_.reasonCode -ceq 'rules-incomplete'
+            [string]$_.reasonCode -cnotin @(
+                'not-selected', 'target-out-of-policy')
         })
     if ($selected.Count -lt 1) {
         $knownEmpty = [bool]$intake.populationKnown -and
@@ -430,38 +430,46 @@ function Invoke-NamedAreEqualCurrentPrBridge {
 
     $heads = [ordered]@{}
     $changes = [ordered]@{}
-    $entries = [Collections.Generic.List[object]]::new()
+    $entriesById = [ordered]@{}
+    $batchFailures = [Collections.Generic.List[object]]::new()
     foreach ($selectedHead in $selected) {
-        $head = [ordered]@{} + $selectedHead.declaration
-        $id = [string][long]$head.pullRequestId
-        if ($snapshots -isnot [Collections.IDictionary] -or
-            -not $snapshots.Contains($id)) {
-            throw 'named-shared-snapshot-missing'
+        $id = [string][long]$selectedHead.pullRequestId
+        try {
+            if ($selectedHead.declaration -isnot
+                    [Collections.IDictionary] -or
+                $snapshots -isnot [Collections.IDictionary] -or
+                -not $snapshots.Contains($id)) {
+                throw 'named-shared-snapshot-missing'
+            }
+            $head = [ordered]@{} + $selectedHead.declaration
+            $snapshot = $snapshots[$id]
+            Assert-NamedBridgeHead -Expected $head `
+                -Actual $snapshot.head
+            $changeSet = $snapshot.changes
+            if ($changeSet.entries -isnot [array] -or
+                [int]$changeSet.changedFiles -ne
+                    @($changeSet.entries).Count -or
+                $null -eq $changeSet.changedLines) {
+                throw 'changed-line-evidence-unavailable'
+            }
+            $heads[$id] = $head
+            $changes[$id] = $changeSet
+            $entriesById[$id] =
+                New-NamedBridgeManifestEntry `
+                    -Head $head -Config $Config `
+                    -SharedSnapshotDigest (
+                        [string]$snapshot.sourceDigest)
         }
-        $snapshot = $snapshots[$id]
-        Assert-NamedBridgeHead -Expected $head `
-            -Actual $snapshot.head
-        $changeSet = $snapshot.changes
-        if ($changeSet.entries -isnot [array] -or
-            [int]$changeSet.changedFiles -ne
-                @($changeSet.entries).Count -or
-            $null -eq $changeSet.changedLines) {
-            throw 'changed-line-evidence-unavailable'
+        catch {
+            [void]$batchFailures.Add([ordered]@{
+                    pullRequestId = [long]$selectedHead.pullRequestId
+                    identity = $null
+                    state = 'unknown'
+                    reason = 'acquisition-incomplete'
+                    stage = 'snapshot'
+                })
         }
-        $heads[$id] = $head
-        $changes[$id] = $changeSet
-        [void]$entries.Add(
-            (New-NamedBridgeManifestEntry -Head $head -Config $Config `
-                -SharedSnapshotDigest (
-                    [string]$snapshot.sourceDigest)))
     }
-
-    $manifest = [ordered]@{
-        schemaVersion = 1
-        kind = 'named-areequal-v2-preview-cohort'
-        entries = $entries.ToArray()
-    }
-    Write-NamedBridgeManifest -Path $ManifestPath -Manifest $manifest
     $policyPath = Join-Path $RepositoryRoot (
         $script:NamedPolicyPath.Replace(
             '/', [IO.Path]::DirectorySeparatorChar))
@@ -470,7 +478,9 @@ function Invoke-NamedAreEqualCurrentPrBridge {
     $acquisition = New-NamedBridgeAcquisitionProvider `
         -Config $Config -Heads $heads -Changes $changes `
         -Snapshots $snapshots -PolicyText $policyText
-    foreach ($head in $heads.Values) {
+    $acceptedIds = [Collections.Generic.List[string]]::new()
+    foreach ($pair in $heads.GetEnumerator()) {
+        $head = $pair.Value
         $arguments = @{
             repositoryId = [string]$head.repositoryId
             projectId = [string]$head.projectId
@@ -510,17 +520,62 @@ function Invoke-NamedAreEqualCurrentPrBridge {
                     continuationToken = $null
                     pageSize = 100
                 }))
+            [void]$acceptedIds.Add([string]$pair.Key)
         }
         catch {
-            throw "named-acquisition-preflight:$([string]$_.Exception.Message)"
+            [void]$batchFailures.Add([ordered]@{
+                    pullRequestId = [long]$head.pullRequestId
+                    identity = $null
+                    state = 'unknown'
+                    reason = 'acquisition-incomplete'
+                    stage = 'provider-preflight'
+                })
         }
     }
+    $acceptedHeads = [ordered]@{}
+    $acceptedChanges = [ordered]@{}
+    $acceptedSnapshots = [ordered]@{}
+    $acceptedEntries = [Collections.Generic.List[object]]::new()
+    foreach ($id in $acceptedIds) {
+        $acceptedHeads[$id] = $heads[$id]
+        $acceptedChanges[$id] = $changes[$id]
+        $acceptedSnapshots[$id] = $snapshots[$id]
+        [void]$acceptedEntries.Add($entriesById[$id])
+    }
+    if ($acceptedEntries.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            schemaVersion = 1
+            kind = 'named-areequal-current-pr-bridge-result'
+            state = 'partial'
+            intake = $intake
+            manifestPath = $null
+            records = @()
+            outcomes = $batchFailures.ToArray()
+            completedCount = 0
+            incompleteCount = $batchFailures.Count
+            providerWrites = 0
+            modelWrites = 0
+        }
+    }
+    $heads = $acceptedHeads
+    $changes = $acceptedChanges
+    $snapshots = $acceptedSnapshots
+    $acquisition = New-NamedBridgeAcquisitionProvider `
+        -Config $Config -Heads $heads -Changes $changes `
+        -Snapshots $snapshots -PolicyText $policyText
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        kind = 'named-areequal-v2-preview-cohort'
+        entries = $acceptedEntries.ToArray()
+    }
+    Write-NamedBridgeManifest -Path $ManifestPath -Manifest $manifest
     [void](Invoke-OwnerV2PreviewPrepare `
             -StateRoot $StateRoot -ManifestPath $ManifestPath)
     $manifestModel = & (Get-Module DevPilot.OwnerOrchestrator) {
         param($Path)
         Read-OwnerV2Manifest -ManifestPath $Path
     } $ManifestPath
+    $packageAccepted = [Collections.Generic.List[long]]::new()
     foreach ($entry in $manifestModel.Entries) {
         try {
             [void](& (Get-Module DevPilot.OwnerAdapters) {
@@ -530,21 +585,71 @@ function Invoke-NamedAreEqualCurrentPrBridge {
                     ConvertTo-OwnerAcquisitionResponse `
                         -Package $package -Contract $Contract
                 } $entry.Contract $acquisition)
+            [void]$packageAccepted.Add(
+                [long]$entry.Declaration.subject.pullRequestId)
         }
         catch {
-            throw "named-package-preflight:$([string]$_.Exception.Message):$([string]$_.ScriptStackTrace)"
+            [void]$batchFailures.Add([ordered]@{
+                    pullRequestId =
+                        [long]$entry.Declaration.subject.pullRequestId
+                    identity = $null
+                    state = 'unknown'
+                    reason = 'acquisition-incomplete'
+                    stage = 'package-preflight'
+                })
         }
+    }
+    if ($packageAccepted.Count -ne $manifestModel.Entries.Count) {
+        $manifest.entries = @($manifest.entries |
+            Where-Object {
+                $packageAccepted.Contains(
+                    [long]$_.subject.pullRequestId)
+            })
+        if (@($manifest.entries).Count -eq 0) {
+            return [pscustomobject][ordered]@{
+                schemaVersion = 1
+                kind = 'named-areequal-current-pr-bridge-result'
+                state = 'partial'
+                intake = $intake
+                manifestPath = $null
+                records = @()
+                outcomes = $batchFailures.ToArray()
+                completedCount = 0
+                incompleteCount = $batchFailures.Count
+                providerWrites = 0
+                modelWrites = 0
+            }
+        }
+        Write-NamedBridgeManifest `
+            -Path $ManifestPath -Manifest $manifest
+        $manifestModel = & (Get-Module DevPilot.OwnerOrchestrator) {
+            param($Path)
+            Read-OwnerV2Manifest -ManifestPath $Path
+        } $ManifestPath
     }
     $runResult = Invoke-OwnerV2PreviewRun `
         -StateRoot $StateRoot -ManifestPath $ManifestPath `
         -EnableLiveModel -LiveAcquisitionProvider $acquisition
-    foreach ($head in $heads.Values) {
-        $current = & $Provider 'Head' @{
-            pullRequestId = [long]$head.pullRequestId
+    $postHeadFailures = [Collections.Generic.HashSet[long]]::new()
+    foreach ($head in @($heads.Values | Where-Object {
+                $packageAccepted.Contains(
+                    [long]$_.pullRequestId)
+            })) {
+        try {
+            $current = & $Provider 'Head' @{
+                pullRequestId = [long]$head.pullRequestId
+            }
+            Assert-NamedBridgeHead -Expected $head -Actual $current
         }
-        Assert-NamedBridgeHead -Expected $head -Actual $current
+        catch {
+            [void]$postHeadFailures.Add(
+                [long]$head.pullRequestId)
+        }
     }
-    $outcomes = @($runResult.records | ForEach-Object {
+    $records = [Collections.Generic.List[object]]::new()
+    $matchedPostHeadFailures =
+        [Collections.Generic.HashSet[long]]::new()
+    $recordOutcomes = @($runResult.records | ForEach-Object {
             $record = $_
             $observation = Get-ChildItem -LiteralPath $StateRoot `
                 -Recurse -File -Filter "$($record.identity).json" |
@@ -555,10 +660,53 @@ function Invoke-NamedAreEqualCurrentPrBridge {
                     ConvertFrom-Json -AsHashtable -Depth 64
             }
             else { $null }
+            $pullRequestId = if (
+                $observationValue -is
+                    [Collections.IDictionary]
+            ) {
+                [long]$observationValue.subject.pullRequestId
+            }
+            else { 0 }
+            $postHeadRefused =
+                $pullRequestId -gt 0 -and
+                $postHeadFailures.Contains($pullRequestId)
+            if ($postHeadRefused) {
+                [void]$matchedPostHeadFailures.Add(
+                    $pullRequestId)
+            }
+            $recordValue = [ordered]@{}
+            if ($record -is [Collections.IDictionary]) {
+                foreach ($key in $record.Keys) {
+                    $recordValue[[string]$key] =
+                        $record[$key]
+                }
+            }
+            else {
+                foreach ($property in
+                    $record.PSObject.Properties) {
+                    $recordValue[$property.Name] =
+                        $property.Value
+                }
+            }
+            if ($postHeadRefused) {
+                $recordValue.state = 'unknown'
+                $recordValue.reason =
+                    'post-evaluation-head-refused'
+            }
+            [void]$records.Add(
+                [pscustomobject]$recordValue)
             [ordered]@{
                 identity = [string]$record.identity
-                state = [string]$record.state
-                reason = [string]$record.reason
+                pullRequestId = $pullRequestId
+                state = $(if ($postHeadRefused) {
+                        'unknown'
+                    } else { [string]$record.state })
+                reason = $(if ($postHeadRefused) {
+                        'post-evaluation-head-refused'
+                    } else { [string]$record.reason })
+                stage = $(if ($postHeadRefused) {
+                        'post-head'
+                    } else { 'evaluation' })
                 observationPath = $(if ($null -ne $observation) {
                         $observation.FullName
                     } else { $null })
@@ -588,12 +736,32 @@ function Invoke-NamedAreEqualCurrentPrBridge {
                     } else { @() })
             }
         })
+    foreach ($pullRequestId in $postHeadFailures) {
+        if (-not $matchedPostHeadFailures.Contains(
+                $pullRequestId)) {
+            [void]$batchFailures.Add([ordered]@{
+                    pullRequestId = $pullRequestId
+                    identity = $null
+                    state = 'unknown'
+                    reason =
+                        'post-evaluation-head-refused'
+                    stage = 'post-head'
+                })
+        }
+    }
+    $outcomes = @($batchFailures.ToArray()) +
+        @($recordOutcomes)
     $incomplete = @($outcomes | Where-Object {
-            [string]$_.state -cne 'completed' -or
-            [string]$_.observationStatus -cne 'completed' -or
-            -not [bool]$_.findingsComplete -or
-            [int]$_.unknown -ne 0 -or
-            @($_.validationErrors).Count -ne 0
+            [string]$_['state'] -cne 'completed' -or
+            -not $_.Contains('observationStatus') -or
+            [string]$_['observationStatus'] -cne
+                'completed' -or
+            -not $_.Contains('findingsComplete') -or
+            -not [bool]$_['findingsComplete'] -or
+            -not $_.Contains('unknown') -or
+            [int]$_['unknown'] -ne 0 -or
+            -not $_.Contains('validationErrors') -or
+            @($_['validationErrors']).Count -ne 0
         })
     return [pscustomobject][ordered]@{
         schemaVersion = 1
@@ -603,9 +771,9 @@ function Invoke-NamedAreEqualCurrentPrBridge {
             } else { 'partial' })
         intake = $intake
         manifestPath = [IO.Path]::GetFullPath($ManifestPath)
-        records = @($runResult.records)
-        outcomes = $outcomes
-        completedCount = @($runResult.records | Where-Object {
+        records = $records.ToArray()
+        outcomes = @($outcomes)
+        completedCount = @($records.ToArray() | Where-Object {
                 [string]$_.state -ceq 'completed'
             }).Count
         incompleteCount = $incomplete.Count
