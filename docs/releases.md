@@ -37,10 +37,43 @@ never updated.
 Ordinary `.github/workflows/ci.yml` remains the required `main` CI. The
 dedicated workflows are:
 
+- `release-auto.yml`: default-branch orchestration after successful version-bump
+  CI and an automation-started canary; dispatches the existing workflows only.
 - `release-canary.yml`: protected live, read-only ADO/WorkIQ qualification.
 - `release.yml`: new immutable release publication and its major/minor channel advancement.
 - `release-channel.yml`: rollback or repromotion of a version's own channel to an existing
   qualified immutable patch.
+
+### Automatic coordination
+
+Merging an increasing `VERSION` change arms automatic qualification once the
+exact-main push CI succeeds. Ordinary code merges do not start a release.
+The coordinator reads only protected default-branch code; it rejects PR/fork
+events and stale commits, requires every CI job to succeed, and dispatches
+`release-canary.yml`. When that automation-started exact-commit canary succeeds,
+it passes the verified run ID into `release.yml`.
+
+All existing canary, installed-qualification, and publication environment
+approvals remain. The coordinator has Actions write and Contents read only,
+does not receive the release deploy key, and cannot create releases or tags.
+It uses no PR artifacts or caches and never approves an environment.
+An independent manual canary or rollback canary does not authorize automatic
+publication.
+
+For an already-merged version or recovery before a tag exists, run **Release
+Automation** from `main` once. It selects the current synchronized version and
+requires green push CI for that exact commit; no SHA or canary ID is entered.
+Existing pending canaries and any prior release attempt are not duplicated.
+An existing immutable tag, failed canary, or interrupted release requires the
+explicit manual recovery procedures below, never an automatic tag repair or
+resume. If `main` advances, qualification must restart for the new commit.
+
+Before approving a new line, configure its creation, immutable, and channel
+rulesets. Coordination verifies their active patterns and restrictions before
+dispatch; environment approvers also verify bypass actors because read tokens
+may not expose them. Automation does not create rulesets or weaken older
+lines' protection. Pester container setup/teardown failures fail both CI and
+installed qualification even when all individual test assertions passed.
 
 `release.yml` accepts an explicit stable version matching `VERSION`, the exact current
 `main` workflow commit, an exact candidate commit, and a successful canary run
@@ -175,11 +208,14 @@ replace environment approvals, rulesets, or any qualification gate.
 3. Run `tools/Invoke-DevPilotCi.ps1 -Mode WindowsComplete`.
 4. Merge through protected `main` and confirm every required CI check is green
    for the exact commit.
-5. Run `Release Canary` with the exact current `main` commit as both
+5. Approve the automatic **Release Canary** for a merged version bump, or run
+   **Release Automation** once from `main` for an already-merged version.
+   It chains the existing protected workflows; approve their required gates.
+   For manual coordination, run `Release Canary` with the exact current `main` commit as both
    `workflowCommit` and `candidateCommit`, in `exactCommit` mode. Confirm the
    protected read-only workflow succeeds for at least three consecutive
    launches.
-6. Run `Release` with the version, the exact current `main` commit as both
+6. For manual coordination, run `Release` with the version, the exact current `main` commit as both
    `workflowCommit` and `candidateCommit`, and the canary run ID.
 7. Confirm the immutable annotated tag and stable GitHub Release exist.
 8. Confirm the declared channel (currently `v0.5^{}`) and immutable release tag

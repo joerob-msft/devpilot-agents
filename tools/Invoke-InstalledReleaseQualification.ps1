@@ -63,7 +63,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module Pester -RequiredVersion 5.7.1 -ErrorAction Stop
 $paths = @(ConvertFrom-Json -InputObject $env:DEVPILOT_INSTALLED_PESTER_PATHS)
 $result = Invoke-Pester -Path $paths -Output Detailed -PassThru
-if ($result.FailedCount -gt 0 -or $result.SkippedCount -gt 0) { exit 1 }
+if ($result.FailedCount -gt 0 -or $result.FailedContainersCount -gt 0 -or $result.SkippedCount -gt 0) { exit 1 }
 '@
     if ($LASTEXITCODE -ne 0) {
         throw 'Installed Golden Pester qualification failed or skipped a required test.'

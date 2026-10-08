@@ -17,7 +17,8 @@ Those files are authoritative when they differ from this skill.
   a channel tag, bypass a ruleset, or approve a protected environment on the
   operator's behalf.
 - Publish only through `.github/workflows/release-canary.yml` followed by
-  `.github/workflows/release.yml`.
+  `.github/workflows/release.yml`; `release-auto.yml` may coordinate these
+  existing workflows without owning publication or approvals.
 - Immutable release tags must never be moved or deleted. The workflows may
   move only the protected floating channel belonging to the requested version.
 - The declared line is currently `0.5`. Existing `v0.4` consumers and tag
@@ -31,6 +32,14 @@ An explicit request to prepare or bump a version authorizes repository edits
 and normal pull-request creation. Publishing requires an explicit request to
 release or publish the version. Resuming an interrupted publication requires
 an explicit request to resume it.
+
+An increasing version-bump merge arms automatic qualification after exact-main
+push CI. Human protected-environment approval remains the publication gate.
+Ordinary code merges do not arm a release. For an already-merged version,
+explicit publication authorization permits dispatching **Release Automation**
+from `main`; it passes the bound SHA and successful canary ID internally.
+Manual/rollback canaries do not independently authorize automatic publication,
+and interrupted releases are never automatically resumed.
 
 ## Select the operating mode
 
@@ -88,6 +97,17 @@ require an explicit stable version without the `v` prefix.
    version surface to match at that exact commit.
 3. Confirm the required `ci.yml` run for `$sha` completed successfully. Do not
    substitute a run for another commit or branch.
+   Verify the requested line's active tag protections, preserving older lines
+   and bypass actors. After explicit publication authorization, prefer:
+
+   ```powershell
+   gh workflow run release-auto.yml --ref main
+   ```
+
+   Verify that newly created coordinator is at `$sha`; follow its dispatched
+   canary and Release runs and their protected human approvals. It must not
+   reuse failed CI, skip a gate, duplicate a pending run, or resume an existing
+   immutable tag. The steps below remain the manual coordination path.
 4. Snapshot existing Release Canary workflow run IDs, then dispatch:
 
    ```powershell

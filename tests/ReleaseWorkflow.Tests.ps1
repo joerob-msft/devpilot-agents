@@ -8,6 +8,8 @@ BeforeAll {
     $installedQualification = Get-Content -LiteralPath (
         Join-Path $root 'tools\Invoke-InstalledReleaseQualification.ps1') -Raw
     $ciRunner = Get-Content -LiteralPath (Join-Path $root 'tools\Invoke-DevPilotCi.ps1') -Raw
+    $ci = Get-Content -LiteralPath (Join-Path $root '.github\workflows\ci.yml') -Raw
+    $automation = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release-auto.yml') -Raw
     function Get-WorkflowRunBlocks {
         param([Parameter(Mandatory)][string]$Text)
         @([regex]::Matches($Text, '(?m)^[ ]+run: \|\r?\n(?<body>(?:[ ]{10,}.*(?:\r?\n|$))*)') |
@@ -16,6 +18,39 @@ BeforeAll {
 }
 
 Describe 'Release publication boundary' {
+    It 'keeps release orchestration default-branch-only without publication credentials' {
+        $automation | Should -Match 'workflow_run:'
+        $automation | Should -Match 'workflows: \[CI, Release Canary\]'
+        $automation | Should -Match 'github.ref == ''refs/heads/main'''
+        $automation | Should -Match 'ref: \$\{\{ github.sha \}\}'
+        $automation | Should -Match 'cancel-in-progress: false'
+        $automation | Should -Match 'actions: write'
+        $automation | Should -Not -Match 'contents: write|RELEASE_DEPLOY_KEY|download-artifact|pull_request_target|environment:'
+        $automation | Should -Match 'Test-DevPilotVersion.ps1'
+        $ci | Should -Match 'node --test ./tests/ReleaseAutomation.Tests.cjs'
+    }
+
+    It 'rejects failed test containers even when every test assertion passed' {
+        $guard = [regex]::Match($ciRunner,
+            'if \(\$result.FailedCount[^\r\n]*\) \{ exit 1 \}').Value
+        $guard | Should -Not -BeNullOrEmpty
+        $pwsh = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+        foreach ($case in @(
+                @{ Failed = 0; Containers = 0; Exit = 0 },
+                @{ Failed = 0; Containers = 1; Exit = 1 },
+                @{ Failed = 1; Containers = 0; Exit = 1 }
+            )) {
+            $command = '$result = [pscustomobject]@{ FailedCount = ' +
+                $case.Failed + '; FailedContainersCount = ' + $case.Containers +
+                ' }; ' + $guard + '; exit 0'
+            & $pwsh -NoProfile -NonInteractive -Command $command
+            $LASTEXITCODE | Should -Be $case.Exit
+        }
+        foreach ($text in @($ci, $installedQualification, $release)) {
+            $text | Should -Match '\$(?:result|consumerTests).FailedContainersCount -gt 0'
+        }
+    }
+
     It 'keeps publication behind complete deterministic, installed, and live gates' {
         $release | Should -Match '(?s)publish-immutable:.*needs: \[windows-complete, platform-safety, canary-gate, installed-artifact\]'
         $release | Should -Match '(?s)immutable-smoke:.*needs: publish-immutable'

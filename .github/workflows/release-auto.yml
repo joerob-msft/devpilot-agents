@@ -1,0 +1,72 @@
+name: Release Automation
+run-name: Coordinate release from ${{ github.sha }}
+
+on:
+  workflow_run:
+    workflows: [CI, Release Canary]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devpilot-release-orchestration
+  cancel-in-progress: false
+
+jobs:
+  coordinate:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      # workflow_run uses default-branch code, never the triggering PR's checkout or artifacts.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Read synchronized version and version-bump intent
+        id: version
+        shell: pwsh
+        env:
+          WORKFLOW_COMMIT: ${{ github.sha }}
+        run: |
+          if ((git rev-parse HEAD).Trim() -cne $env:WORKFLOW_COMMIT) {
+            throw 'Automation checkout does not match its trusted default-branch commit.'
+          }
+          $version = ./tools/Test-DevPilotVersion.ps1
+          $previous = (git show HEAD^:VERSION).Trim()
+          if ($LASTEXITCODE -ne 0 -or
+              $previous -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'Cannot establish the preceding stable toolkit version.'
+          }
+          $changed = $previous -cne $version.Version
+          if ($changed -and [Version]$version.Version -le [Version]$previous) {
+            throw 'Automatic release requires an increasing version.'
+          }
+          "version=$($version.Version)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "changed=$($changed.ToString().ToLowerInvariant())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Coordinate existing protected release workflows
+        uses: actions/github-script@v8
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          VERSION_CHANGED: ${{ steps.version.outputs.changed }}
+          WORKFLOW_COMMIT: ${{ github.sha }}
+        with:
+          script: |
+            const coordinate = require('./.github/scripts/release-automation.cjs');
+            const result = await coordinate({
+              github, context, core,
+              version: process.env.RELEASE_VERSION,
+              versionChanged: process.env.VERSION_CHANGED === 'true',
+              workflowCommit: process.env.WORKFLOW_COMMIT,
+            });
+            await core.summary.addHeading('Release coordination')
+              .addRaw(result).write();

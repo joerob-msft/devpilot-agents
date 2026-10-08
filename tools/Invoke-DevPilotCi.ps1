@@ -35,7 +35,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module Pester -RequiredVersion 5.7.1 -ErrorAction Stop
 $paths = @(ConvertFrom-Json -InputObject $env:DEVPILOT_CI_PESTER_PATHS)
 $result = Invoke-Pester -Path $paths -Output Detailed -PassThru
-if ($result.FailedCount -gt 0) { exit 1 }
+if ($result.FailedCount -gt 0 -or $result.FailedContainersCount -gt 0) { exit 1 }
 '@
         if ($LASTEXITCODE -ne 0) { throw 'Pester qualification failed.' }
     }
@@ -111,6 +111,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Dashboard build failed.' }
 }
 finally { Pop-Location }
+
+& node --test (Join-Path $root 'tests\ReleaseAutomation.Tests.cjs')
+if ($LASTEXITCODE -ne 0) { throw 'Release orchestration tests failed.' }
 
 Invoke-DevPilotPesterIsolated -Path (Join-Path $root 'tests')
 
