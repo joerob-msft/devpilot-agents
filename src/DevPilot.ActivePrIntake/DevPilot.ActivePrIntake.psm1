@@ -321,6 +321,23 @@ function Assert-IntakeConfig {
             [string]$rule.capability -cnotmatch '^[a-zA-Z0-9_.@-]{1,100}$' -or
             -not $ids.Add([string]$rule.id)) { throw 'Invalid or repeated rule registry entry.' }
     }
+    if ($Config.Contains('cursorCompatibility')) {
+        $compatibility = $Config.cursorCompatibility
+        if ($compatibility -isnot [Collections.IDictionary] -or
+            [string]$compatibility.previousConfigDigest -cnotmatch
+                '^[0-9a-f]{64}$' -or
+            [string]$compatibility.previousToolkitHead -cnotmatch
+                '^[0-9a-f]{40}$' -or
+            [string]$compatibility.previousToolkitTree -cnotmatch
+                '^[0-9a-f]{40}$' -or
+            $Config.toolkit -isnot [Collections.IDictionary] -or
+            [string]$Config.toolkit.head -ceq
+                [string]$compatibility.previousToolkitHead -or
+            [string]$Config.toolkit.tree -ceq
+                [string]$compatibility.previousToolkitTree) {
+            throw 'Cursor compatibility binding is invalid.'
+        }
+    }
 }
 
 function Invoke-IntakeRead {
@@ -832,6 +849,8 @@ function Invoke-ActivePrIntake {
         [Parameter(Mandatory)][scriptblock]$Provider,
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][string]$RepositoryRoot,
+        [ValidateRange(0, 4)][int]$MaximumHeadsThisRun = 0,
+        [switch]$IncludeTransientSnapshots,
         [switch]$Run
     )
     Assert-IntakeConfig $Config
@@ -850,6 +869,8 @@ function Invoke-ActivePrIntake {
     try {
         $path = Join-Path $root 'cohort.json'
         $previous = $null
+        $cursorBindingCompatible = $false
+        $cursorTransitionApplied = $false
         if (Test-Path -LiteralPath $path) {
             $file = Get-Item -LiteralPath $path -Force
             if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint -or $file.Length -gt 8388608) {
@@ -886,6 +907,26 @@ function Invoke-ActivePrIntake {
                 [string]$previous.binding.repositoryId -ine [string]$Config.repositoryId) {
                 throw 'Intake state is bound to a different repository.'
             }
+            $currentConfigDigest = Get-IntakeDigest $Config
+            $cursorBindingCompatible =
+                [string]$previous.binding.configDigest -ceq
+                    $currentConfigDigest
+            if (-not $cursorBindingCompatible -and
+                $Config.Contains('cursorCompatibility') -and
+                $Config.cursorCompatibility -is
+                    [Collections.IDictionary] -and
+                [string]$previous.binding.configDigest -ceq
+                    [string]$Config.cursorCompatibility.
+                        previousConfigDigest) {
+                $cursorBindingCompatible = $true
+                $cursorTransitionApplied = $true
+            }
+        }
+        $effectiveMaximumHeads = if ($MaximumHeadsThisRun -gt 0) {
+            $MaximumHeadsThisRun
+        }
+        else {
+            [int]$Config.limits.maxHeadsPerRun
         }
         $envelope = [ordered]@{
             schemaVersion = 1
@@ -902,8 +943,16 @@ function Invoke-ActivePrIntake {
                 projectId = ([string]$Config.projectId).ToLowerInvariant()
                 repositoryId = ([string]$Config.repositoryId).ToLowerInvariant()
                 configDigest = Get-IntakeDigest $Config
+                cursorSourceConfigDigest = $(if ($previous) {
+                        [string]$previous.binding.configDigest
+                    } else { $null })
+                cursorTransitionApplied =
+                    $cursorTransitionApplied
             }
             mode = 'dry-run-read-only'
+            execution = [ordered]@{
+                maximumHeadsThisRun = $effectiveMaximumHeads
+            }
             writerEligible = $false
             autoPost = $false
             state = 'unknown'
@@ -936,6 +985,7 @@ function Invoke-ActivePrIntake {
         $envelope.generationFile = Join-Path 'generations' "$($envelope.generation).json"
         $reasons = [Collections.Generic.List[string]]::new()
         $heads = [Collections.Generic.List[object]]::new()
+        $transientSnapshots = [ordered]@{}
         $reads = 0
         $clock = [Diagnostics.Stopwatch]::StartNew()
         try {
@@ -1004,7 +1054,7 @@ function Invoke-ActivePrIntake {
                         -not $item.isDraft -and $item.targetRef -ceq 'refs/heads/master'
                     })
                 $start = 0
-                if ($previous -and $previous.binding.configDigest -ceq $envelope.binding.configDigest -and
+                if ($previous -and $cursorBindingCompatible -and
                     $null -ne $previous.cursor.nextPullRequestId -and $eligible.Count -gt 0) {
                     $target = Assert-IntakeNumber $previous.cursor.nextPullRequestId cursor 1 ([int]::MaxValue)
                     while ($start -lt $eligible.Count -and $eligible[$start] -lt $target) { $start++ }
@@ -1012,7 +1062,8 @@ function Invoke-ActivePrIntake {
                 }
                 $selected = [Collections.Generic.HashSet[int]]::new()
                 $selectedOrder = [Collections.Generic.List[int]]::new()
-                $limit = [Math]::Min($eligible.Count, [int]$Config.limits.maxHeadsPerRun)
+                $limit = [Math]::Min(
+                    $eligible.Count, $effectiveMaximumHeads)
                 for ($n = 0; $n -lt $limit; $n++) {
                     $candidate = $eligible[($start + $n) % $eligible.Count]
                     [void]$selected.Add($candidate)
@@ -1145,6 +1196,27 @@ function Invoke-ActivePrIntake {
                                     if ((Get-IntakeDigest $before) -cne (Get-IntakeDigest $after)) {
                                         throw 'head-drift'
                                     }
+                                }
+                                if ($IncludeTransientSnapshots) {
+                                    $transientSnapshots[[string]$id] =
+                                        [ordered]@{
+                                            schemaVersion = 1
+                                            kind =
+                                                'active-pr-transient-snapshot'
+                                            generation =
+                                                $envelope.generation
+                                            head = $before
+                                            changes = $changes
+                                            discussions = $discussion
+                                            sourceDigest =
+                                                Get-IntakeDigest (
+                                                    [ordered]@{
+                                                        head = $before
+                                                        changes = $changes
+                                                        discussions =
+                                                            $discussion
+                                                    })
+                                        }
                                 }
                                 $envelope.counts.evaluatedRules += @(
                                     $entry.rules | Where-Object state -eq 'evaluated'
@@ -1371,6 +1443,10 @@ function Invoke-ActivePrIntake {
             [IO.File]::Move($temp, $path, $true)
         }
         finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force } }
+        if ($IncludeTransientSnapshots) {
+            $envelope['transientSnapshots'] =
+                $transientSnapshots
+        }
         return $envelope
     }
     finally { $lock.Dispose() }
@@ -1932,6 +2008,12 @@ print(json.dumps({
                                 changeTrackingId = $trackingId
                                 path = ([string]$entry.item.path).TrimStart('/')
                                 changeType = [string]$entry.changeType
+                                originalPath = $(if (
+                                    $null -ne $entry['originalPath']
+                                ) {
+                                    ([string]$entry.originalPath).
+                                        TrimStart('/')
+                                } else { $null })
                             })
                     }
                     if ($seenChanges.Count -gt $maxFiles) { throw 'file-budget' }
@@ -1975,7 +2057,7 @@ print(json.dumps({
                             'text/', [StringComparison]::OrdinalIgnoreCase) -or
                         $isCSharp
                     if (-not $isText) {
-                        [void]$normalized.Add([ordered]@{
+                        $binaryChange = [ordered]@{
                                 changeTrackingId =
                                     [int]$entry.changeTrackingId
                                 path = [string]$entry.path
@@ -1990,7 +2072,13 @@ print(json.dumps({
                                     sourceCommit = $sourceCommit
                                     state = 'binary'
                                 })
-                            })
+                            }
+                        if ($changeType -match '(?i)rename' -and
+                            $entry.originalPath) {
+                            $binaryChange['oldPath'] =
+                                [string]$entry.originalPath
+                        }
+                        [void]$normalized.Add($binaryChange)
                         continue
                     }
                     $targetContent = if ($deleted -or
@@ -2021,7 +2109,7 @@ print(json.dumps({
                     if ($totalBytes -gt 16777216) {
                         throw 'read-budget'
                     }
-                    [void]$normalized.Add([ordered]@{
+                    $normalizedChange = [ordered]@{
                             changeTrackingId = [int]$entry.changeTrackingId
                             path = [string]$entry.path
                             changeType = $changeType
@@ -2048,7 +2136,13 @@ print(json.dumps({
                                         [Text.Encoding]::UTF8.GetBytes(
                                             $sourceContent))).
                                     ToLowerInvariant()
-                        })
+                        }
+                    if ($changeType -match '(?i)rename' -and
+                        $entry.originalPath) {
+                        $normalizedChange['oldPath'] =
+                            [string]$entry.originalPath
+                    }
+                    [void]$normalized.Add($normalizedChange)
                 }
                 return @{
                     changedFiles = $seenChanges.Count

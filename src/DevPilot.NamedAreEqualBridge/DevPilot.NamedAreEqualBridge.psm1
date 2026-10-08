@@ -105,7 +105,9 @@ function Assert-NamedBridgeHead {
 function New-NamedBridgeManifestEntry {
     param(
         [Parameter(Mandatory)][Collections.IDictionary]$Head,
-        [Parameter(Mandatory)][Collections.IDictionary]$Config
+        [Parameter(Mandatory)][Collections.IDictionary]$Config,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$SharedSnapshotDigest
     )
 
     $subject = [ordered]@{
@@ -160,6 +162,7 @@ function New-NamedBridgeManifestEntry {
                 capability = $capability
                 config = $configBinding
                 iterationId = [int]$Head.iterationId
+                sharedSnapshotDigest = $SharedSnapshotDigest
             })
         }
     }
@@ -167,10 +170,10 @@ function New-NamedBridgeManifestEntry {
 
 function New-NamedBridgeAcquisitionProvider {
     param(
-        [Parameter(Mandatory)][scriptblock]$Provider,
         [Parameter(Mandatory)][Collections.IDictionary]$Config,
         [Parameter(Mandatory)][Collections.IDictionary]$Heads,
         [Parameter(Mandatory)][Collections.IDictionary]$Changes,
+        [Parameter(Mandatory)][Collections.IDictionary]$Snapshots,
         [Parameter(Mandatory)][string]$PolicyText
     )
 
@@ -178,8 +181,6 @@ function New-NamedBridgeAcquisitionProvider {
         -Id ([string]$Config.expectedAccount.id) `
         -Descriptor ([string]$Config.expectedAccount.descriptor) `
         -UniqueName ([string]$Config.expectedAccount.uniqueName)
-    $providerCommand = $Provider
-    $assertHeadCommand = ${function:Assert-NamedBridgeHead}
     $digestCommand = ${function:Get-NamedBridgeDigest}
     $discussionPageCommand = Get-Command `
         -Name ConvertTo-OwnerAzureDevOpsDiscussionPage `
@@ -192,17 +193,15 @@ function New-NamedBridgeAcquisitionProvider {
         param($Operation, $Arguments)
         $prId = [string][long]$Arguments.pullRequestId
         if (-not $Heads.Contains($prId) -or
-            -not $Changes.Contains($prId)) {
+            -not $Changes.Contains($prId) -or
+            -not $Snapshots.Contains($prId)) {
             throw 'provider-contract'
         }
         $expected = $Heads[$prId]
         $changeSet = $Changes[$prId]
+        $snapshot = $Snapshots[$prId]
         switch ($Operation) {
             'GetSubject' {
-                $live = & $providerCommand 'Head' @{
-                    pullRequestId = [long]$prId
-                }
-                & $assertHeadCommand -Expected $expected -Actual $live
                 return [ordered]@{
                     schemaVersion = 1
                     repositoryId = [string]$expected.repositoryId
@@ -243,7 +242,7 @@ function New-NamedBridgeAcquisitionProvider {
                             }
                         })
                     changes = @($changeSet.entries | ForEach-Object {
-                        [ordered]@{
+                        $change = [ordered]@{
                             path = [string]$_.path
                             changeType = $(switch -Regex (
                                 [string]$_.changeType) {
@@ -257,6 +256,11 @@ function New-NamedBridgeAcquisitionProvider {
                             sourceDigest = [string]$_.sourceDigest
                             spans = @($_.spans)
                         }
+                        if ($change.changeType -ceq 'renamed' -and
+                            $_.oldPath) {
+                            $change['oldPath'] = [string]$_.oldPath
+                        }
+                        $change
                     })
                 }
             }
@@ -304,19 +308,12 @@ function New-NamedBridgeAcquisitionProvider {
                 }
             }
             'GetDiscussionPage' {
-                $live = & $providerCommand 'Head' @{
-                    pullRequestId = [long]$prId
-                }
-                & $assertHeadCommand -Expected $expected -Actual $live
-                $raw = & $providerCommand 'Discussions' @{
-                    pullRequestId = [long]$prId
-                    iterationId = [int]$expected.iterationId
-                }
                 return & $discussionPageCommand `
                     -Arguments $Arguments `
                     -RawResponse ([ordered]@{
-                        value = @($raw.threads)
-                        count = [int]$raw.count
+                        value = @($snapshot.discussions.threads)
+                        count =
+                            [int]$snapshot.discussions.count
                     }) `
                     -CurrentIteration ([ordered]@{
                         id = [int]$expected.iterationId
@@ -372,6 +369,8 @@ function Invoke-NamedAreEqualCurrentPrBridge {
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][string]$ManifestPath,
         [Parameter(Mandatory)][string]$RepositoryRoot,
+        [ValidateRange(0, 4)][int]$MaximumHeadsThisRun = 0,
+        [AllowNull()][Collections.IDictionary]$PreparedIntake = $null,
         [switch]$Run
     )
 
@@ -393,9 +392,18 @@ function Invoke-NamedAreEqualCurrentPrBridge {
         }
     }
 
-    $intake = Invoke-ActivePrIntake `
-        -Config $Config -Provider $Provider `
-        -StateRoot $StateRoot -RepositoryRoot $RepositoryRoot -Run
+    $intake = if ($null -ne $PreparedIntake) {
+        $PreparedIntake
+    }
+    else {
+        Invoke-ActivePrIntake `
+            -Config $Config -Provider $Provider `
+            -StateRoot $StateRoot -RepositoryRoot $RepositoryRoot `
+            -MaximumHeadsThisRun $MaximumHeadsThisRun `
+            -IncludeTransientSnapshots -Run
+    }
+    $snapshots = $intake.transientSnapshots
+    [void]$intake.Remove('transientSnapshots')
     $selected = @($intake.heads | Where-Object {
             $_.declaration -is [Collections.IDictionary] -and
             [string]$_.targetRef -ceq 'refs/heads/master' -and
@@ -426,16 +434,14 @@ function Invoke-NamedAreEqualCurrentPrBridge {
     foreach ($selectedHead in $selected) {
         $head = [ordered]@{} + $selectedHead.declaration
         $id = [string][long]$head.pullRequestId
-        $current = & $Provider 'Head' @{
-            pullRequestId = [long]$head.pullRequestId
+        if ($snapshots -isnot [Collections.IDictionary] -or
+            -not $snapshots.Contains($id)) {
+            throw 'named-shared-snapshot-missing'
         }
-        Assert-NamedBridgeHead -Expected $head -Actual $current
-        $changeSet = & $Provider 'Changes' @{
-            pullRequestId = [long]$head.pullRequestId
-            iterationId = [int]$head.iterationId
-            sourceCommit = [string]$head.sourceCommit
-            targetCommit = [string]$head.targetCommit
-        }
+        $snapshot = $snapshots[$id]
+        Assert-NamedBridgeHead -Expected $head `
+            -Actual $snapshot.head
+        $changeSet = $snapshot.changes
         if ($changeSet.entries -isnot [array] -or
             [int]$changeSet.changedFiles -ne
                 @($changeSet.entries).Count -or
@@ -445,7 +451,9 @@ function Invoke-NamedAreEqualCurrentPrBridge {
         $heads[$id] = $head
         $changes[$id] = $changeSet
         [void]$entries.Add(
-            (New-NamedBridgeManifestEntry -Head $head -Config $Config))
+            (New-NamedBridgeManifestEntry -Head $head -Config $Config `
+                -SharedSnapshotDigest (
+                    [string]$snapshot.sourceDigest)))
     }
 
     $manifest = [ordered]@{
@@ -460,8 +468,8 @@ function Invoke-NamedAreEqualCurrentPrBridge {
     $policyText = [IO.File]::ReadAllText(
         $policyPath, [Text.UTF8Encoding]::new($false))
     $acquisition = New-NamedBridgeAcquisitionProvider `
-        -Provider $Provider -Config $Config -Heads $heads `
-        -Changes $changes -PolicyText $policyText
+        -Config $Config -Heads $heads -Changes $changes `
+        -Snapshots $snapshots -PolicyText $policyText
     foreach ($head in $heads.Values) {
         $arguments = @{
             repositoryId = [string]$head.repositoryId
@@ -536,33 +544,71 @@ function Invoke-NamedAreEqualCurrentPrBridge {
         }
         Assert-NamedBridgeHead -Expected $head -Actual $current
     }
-    if (@($runResult.records | Where-Object {
-                [string]$_.state -cne 'completed'
-            }).Count -gt 0) {
-        $details = @($runResult.records | ForEach-Object {
-                $record = $_
-                $observation = Get-ChildItem -LiteralPath $StateRoot `
-                    -Recurse -File -Filter "$($record.identity).json" |
-                    Where-Object { $_.Directory.Name -ceq 'observations' } |
-                    Select-Object -First 1
-                $errors = if ($null -ne $observation) {
-                    @((Get-Content -LiteralPath $observation.FullName -Raw |
-                        ConvertFrom-Json -AsHashtable -Depth 32).
-                        validationErrors) -join '|'
-                }
-                else { '' }
-                "$($record.identity)=$($record.state)/$($record.reason)/$errors"
-            })
-        throw ('named-observation-incomplete:' +
-            ($details -join ','))
-    }
+    $outcomes = @($runResult.records | ForEach-Object {
+            $record = $_
+            $observation = Get-ChildItem -LiteralPath $StateRoot `
+                -Recurse -File -Filter "$($record.identity).json" |
+                Where-Object { $_.Directory.Name -ceq 'observations' } |
+                Select-Object -First 1
+            $observationValue = if ($null -ne $observation) {
+                Get-Content -LiteralPath $observation.FullName -Raw |
+                    ConvertFrom-Json -AsHashtable -Depth 64
+            }
+            else { $null }
+            [ordered]@{
+                identity = [string]$record.identity
+                state = [string]$record.state
+                reason = [string]$record.reason
+                observationPath = $(if ($null -ne $observation) {
+                        $observation.FullName
+                    } else { $null })
+                observationStatus = $(if (
+                        $observationValue -is
+                            [Collections.IDictionary]
+                    ) {
+                        [string]$observationValue.lifecycle.status
+                    } else { $null })
+                unknown = $(if (
+                        $observationValue -is
+                            [Collections.IDictionary]
+                    ) {
+                        [int]$observationValue.counts.unknown
+                    } else { $null })
+                findingsComplete = $(if (
+                        $observationValue -is
+                            [Collections.IDictionary]
+                    ) {
+                        [bool]$observationValue.findingsComplete
+                    } else { $false })
+                validationErrors = $(if (
+                        $observationValue -is
+                            [Collections.IDictionary]
+                    ) {
+                        @($observationValue.validationErrors)
+                    } else { @() })
+            }
+        })
+    $incomplete = @($outcomes | Where-Object {
+            [string]$_.state -cne 'completed' -or
+            [string]$_.observationStatus -cne 'completed' -or
+            -not [bool]$_.findingsComplete -or
+            [int]$_.unknown -ne 0 -or
+            @($_.validationErrors).Count -ne 0
+        })
     return [pscustomobject][ordered]@{
         schemaVersion = 1
         kind = 'named-areequal-current-pr-bridge-result'
-        state = 'completed'
+        state = $(if ($incomplete.Count -eq 0) {
+                'completed'
+            } else { 'partial' })
         intake = $intake
         manifestPath = [IO.Path]::GetFullPath($ManifestPath)
         records = @($runResult.records)
+        outcomes = $outcomes
+        completedCount = @($runResult.records | Where-Object {
+                [string]$_.state -ceq 'completed'
+            }).Count
+        incompleteCount = $incomplete.Count
         providerWrites = 0
         modelWrites = 0
     }

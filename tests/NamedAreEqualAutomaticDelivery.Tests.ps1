@@ -166,6 +166,12 @@ BeforeAll {
             'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psm1'
         $paths.parserManifest = Join-Path $repoRoot `
             'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1'
+        $paths.activePrIntake = Join-Path $repoRoot `
+            'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psm1'
+        $paths.namedBridge = Join-Path $repoRoot `
+            'src\DevPilot.NamedAreEqualBridge\DevPilot.NamedAreEqualBridge.psm1'
+        $paths.sharedAcquisitionTool = Join-Path $repoRoot `
+            'tools\Invoke-SharedReviewAcquisition.ps1'
         $evidence = [pscustomobject]@{
             Identity = 'a' * 64
             Declaration = $declaration
@@ -193,6 +199,25 @@ BeforeAll {
                     Get-ApprovedOwnerV2FileSha256 $paths.parser
                 parserManifestSha256 =
                     Get-ApprovedOwnerV2FileSha256 $paths.parserManifest
+                activePrIntakeSha256 =
+                    Get-ApprovedOwnerV2FileSha256 $paths.activePrIntake
+                activePrIntakeManifestSha256 =
+                    Get-ApprovedOwnerV2FileSha256 (
+                        Join-Path $repoRoot `
+                            'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1')
+                namedBridgeSha256 =
+                    Get-ApprovedOwnerV2FileSha256 $paths.namedBridge
+                namedBridgeManifestSha256 =
+                    Get-ApprovedOwnerV2FileSha256 (
+                        Join-Path $repoRoot `
+                            'src\DevPilot.NamedAreEqualBridge\DevPilot.NamedAreEqualBridge.psd1')
+                sharedAcquisitionToolSha256 =
+                    Get-ApprovedOwnerV2FileSha256 `
+                        $paths.sharedAcquisitionTool
+                namedCurrentPrToolSha256 =
+                    Get-ApprovedOwnerV2FileSha256 (
+                        Join-Path $repoRoot `
+                            'tools\Invoke-NamedAreEqualCurrentPr.ps1')
             }
             Provider = [ordered]@{
                 kind = 'azure-devops-rest-owner-discussions-v1'
@@ -470,6 +495,21 @@ BeforeAll {
                     uniqueName = $identity.UniqueName
                     digest = $adapter.AzureDevOpsReviewerIdentityDigest
                 }
+            }
+            sharedAcquisition = [ordered]@{
+                kind = 'devpilot-shared-review-acquisition-v1'
+                activePrIntakeSha256 =
+                    Get-ApprovedOwnerV2FileSha256 (
+                        Join-Path $repoRoot `
+                            'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psm1')
+                namedBridgeSha256 =
+                    Get-ApprovedOwnerV2FileSha256 (
+                        Join-Path $repoRoot `
+                            'src\DevPilot.NamedAreEqualBridge\DevPilot.NamedAreEqualBridge.psm1')
+                toolSha256 =
+                    Get-ApprovedOwnerV2FileSha256 (
+                        Join-Path $repoRoot `
+                            'tools\Invoke-SharedReviewAcquisition.ps1')
             }
         }
         $configPath = Join-Path $stateRoot 'named-config.json'

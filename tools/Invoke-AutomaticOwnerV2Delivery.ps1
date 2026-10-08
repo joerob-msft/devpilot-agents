@@ -4,12 +4,13 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('initialize-key', 'authorize-policy', 'invoke')]
+    [ValidateSet(
+        'initialize-key', 'authorize-policy', 'invoke', 'invoke-batch')]
     [string]$Command,
 
     [Parameter(Mandatory)][string]$DeliveryRoot,
     [string]$StateRoot,
-    [ValidatePattern('^$|^[0-9a-f]{64}$')][string]$Identity,
+    [ValidatePattern('^$|^[0-9a-f]{64}$')][string[]]$Identity,
     [string]$ToolkitConfigPath,
     [string]$PolicyPath,
     [ValidateSet('owner', 'named-areequal')]
@@ -51,10 +52,25 @@ if ($Delivery -ceq 'named-areequal') {
     }
 }
 
+$identities = @($Identity | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    })
+if ($Command -ceq 'invoke' -and $identities.Count -ne 1) {
+    throw 'invoke requires exactly one state identity.'
+}
+if ($Command -ceq 'invoke-batch' -and (
+        $Delivery -cne 'named-areequal' -or
+        $identities.Count -lt 1 -or
+        $identities.Count -gt 4 -or
+        @($identities | Sort-Object -Unique).Count -ne
+            $identities.Count)) {
+    throw 'invoke-batch requires one to four unique named AreEqual identities.'
+}
+
 $toolkitConfig = $null
-if ($Command -ceq 'invoke' -and $Delivery -ceq 'named-areequal') {
+if ($Command -cin @('invoke', 'invoke-batch') -and
+    $Delivery -ceq 'named-areequal') {
     if ([string]::IsNullOrWhiteSpace($StateRoot) -or
-        [string]::IsNullOrWhiteSpace($Identity) -or
         [string]::IsNullOrWhiteSpace($ToolkitConfigPath) -or
         -not [IO.Path]::IsPathFullyQualified($StateRoot) -or
         -not [IO.Path]::IsPathFullyQualified($ToolkitConfigPath)) {
@@ -64,20 +80,52 @@ if ($Command -ceq 'invoke' -and $Delivery -ceq 'named-areequal') {
     $configured = Get-AutomaticOwnerV2Configuration `
         -ToolkitConfig $toolkitConfig -Delivery $Delivery
     if (-not $configured.Enabled) {
-        $disabledEvidence = Read-ApprovedOwnerV2Evidence `
-            -StateRoot $StateRoot -Identity $Identity -RepoRoot $RepoRoot `
-            -ToolkitConfigPath $ToolkitConfigPath -Delivery named-areequal
-        [pscustomobject][ordered]@{
-            schemaVersion = 1
-            kind = 'named-areequal-v2-automatic-delivery-result'
-            health = 'disabled'
-            providerWrites = 0
-            modelWrites = 0
-            remainingWouldCreate = @(
-                $disabledEvidence.Observation.findings | Where-Object {
-                    [string]$_.reconciliation.classification -ceq 'wouldCreate'
-                }).Count
-            events = @()
+        $disabledResults = @($identities | ForEach-Object {
+                $disabledEvidence = Read-ApprovedOwnerV2Evidence `
+                    -StateRoot $StateRoot -Identity $_ `
+                    -RepoRoot $RepoRoot `
+                    -ToolkitConfigPath $ToolkitConfigPath `
+                    -Delivery named-areequal
+                [ordered]@{
+                    identity = $_
+                    result = [ordered]@{
+                        schemaVersion = 1
+                        kind =
+                            'named-areequal-v2-automatic-delivery-result'
+                        health = 'disabled'
+                        providerWrites = 0
+                        modelWrites = 0
+                        remainingWouldCreate = @(
+                            $disabledEvidence.Observation.findings |
+                            Where-Object {
+                                [string]$_.reconciliation.
+                                    classification -ceq 'wouldCreate'
+                            }).Count
+                        events = @()
+                    }
+                }
+            })
+        if ($Command -ceq 'invoke') {
+            [pscustomobject]$disabledResults[0].result
+        }
+        else {
+            [pscustomobject][ordered]@{
+                schemaVersion = 1
+                kind =
+                    'named-areequal-v2-automatic-delivery-batch-result'
+                batchRunId = 'disabled'
+                health = 'disabled'
+                providerWrites = 0
+                modelWrites = 0
+                remainingCreates = $MaxCreatesPerRun
+                remainingWouldCreate = @($disabledResults |
+                    ForEach-Object {
+                        [int]$_.result.remainingWouldCreate
+                    } | Measure-Object -Sum).Sum
+                results = $disabledResults
+                deferred = @()
+                events = @()
+            }
         }
         exit 0
     }
@@ -102,15 +150,20 @@ if ($Command -ceq 'initialize-key') {
 }
 
 if ([string]::IsNullOrWhiteSpace($StateRoot) -or
-    [string]::IsNullOrWhiteSpace($Identity) -or
     [string]::IsNullOrWhiteSpace($ToolkitConfigPath) -or
     -not [IO.Path]::IsPathFullyQualified($StateRoot) -or
     -not [IO.Path]::IsPathFullyQualified($ToolkitConfigPath)) {
     throw "$Command requires absolute state/config paths and an exact state identity."
 }
-$evidence = Read-ApprovedOwnerV2Evidence -StateRoot $StateRoot `
-    -Identity $Identity -RepoRoot $RepoRoot `
-    -ToolkitConfigPath $ToolkitConfigPath -Delivery $Delivery
+$evidenceList = @($identities | ForEach-Object {
+        Read-ApprovedOwnerV2Evidence -StateRoot $StateRoot `
+            -Identity $_ -RepoRoot $RepoRoot `
+            -ToolkitConfigPath $ToolkitConfigPath -Delivery $Delivery
+    })
+$evidence = if ($evidenceList.Count -gt 0) {
+    $evidenceList[0]
+}
+else { $null }
 $key = Get-AutomaticOwnerV2ServiceKey `
     -DeliveryRoot $context.Root -Delivery $Delivery
 
@@ -177,8 +230,16 @@ else {
         -ProviderConfigPath $ToolkitConfigPath `
         -AzureCliPath $AzureCliPath -GitPath $GitPath
 }
-$result = Invoke-AutomaticOwnerV2Comments -Evidence $evidence `
-    -Policy $policy -DeliveryRoot $context.Root -Key $key `
-    -Provider $provider -MaximumCreates $MaxCreatesPerRun
+$result = if ($Command -ceq 'invoke-batch') {
+    Invoke-AutomaticNamedAreEqualBatch `
+        -Evidence $evidenceList -Policy $policy `
+        -DeliveryRoot $context.Root -Key $key `
+        -Provider $provider -MaximumCreates $MaxCreatesPerRun
+}
+else {
+    Invoke-AutomaticOwnerV2Comments -Evidence $evidence `
+        -Policy $policy -DeliveryRoot $context.Root -Key $key `
+        -Provider $provider -MaximumCreates $MaxCreatesPerRun
+}
 $result
 exit (Get-AutomaticOwnerV2ExitCode -Health ([string]$result.health))

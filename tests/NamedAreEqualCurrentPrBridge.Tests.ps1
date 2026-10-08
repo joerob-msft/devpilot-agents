@@ -93,6 +93,21 @@ BeforeAll {
                 implementationSha256 =
                     '7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a'
             }
+            sharedAcquisition = [ordered]@{
+                kind = 'devpilot-shared-review-acquisition-v1'
+                activePrIntakeSha256 =
+                    (Get-FileHash (Join-Path $repoRoot `
+                        'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psm1') `
+                        -Algorithm SHA256).Hash.ToLowerInvariant()
+                namedBridgeSha256 =
+                    (Get-FileHash (Join-Path $repoRoot `
+                        'src\DevPilot.NamedAreEqualBridge\DevPilot.NamedAreEqualBridge.psm1') `
+                        -Algorithm SHA256).Hash.ToLowerInvariant()
+                toolSha256 =
+                    (Get-FileHash (Join-Path $repoRoot `
+                        'tools\Invoke-SharedReviewAcquisition.ps1') `
+                        -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
             autoCreateNamedAreEqualComments = $false
             limits = [ordered]@{
                 pageSize = 50

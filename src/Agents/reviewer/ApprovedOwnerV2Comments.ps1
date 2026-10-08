@@ -382,6 +382,42 @@ function Read-ApprovedOwnerV2Evidence {
             Get-ApprovedOwnerV2FileSha256 (
                 Join-Path $RepoRoot `
                     'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1')
+        $toolkitBinding['activePrIntakeSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                    Join-Path $RepoRoot `
+                        'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psm1')
+        $toolkitBinding['activePrIntakeManifestSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                    Join-Path $RepoRoot `
+                        'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1')
+        $toolkitBinding['namedBridgeSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                    Join-Path $RepoRoot `
+                        'src\DevPilot.NamedAreEqualBridge\DevPilot.NamedAreEqualBridge.psm1')
+        $toolkitBinding['namedBridgeManifestSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                    Join-Path $RepoRoot `
+                        'src\DevPilot.NamedAreEqualBridge\DevPilot.NamedAreEqualBridge.psd1')
+        $toolkitBinding['sharedAcquisitionToolSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                    Join-Path $RepoRoot `
+                        'tools\Invoke-SharedReviewAcquisition.ps1')
+        $toolkitBinding['namedCurrentPrToolSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                    Join-Path $RepoRoot `
+                        'tools\Invoke-NamedAreEqualCurrentPr.ps1')
+        $shared = $toolkitConfig.sharedAcquisition
+        if ($shared -isnot [Collections.IDictionary] -or
+            [string]$shared.kind -cne
+                    'devpilot-shared-review-acquisition-v1' -or
+            [string]$shared.activePrIntakeSha256 -cne
+                    [string]$toolkitBinding.activePrIntakeSha256 -or
+            [string]$shared.namedBridgeSha256 -cne
+                    [string]$toolkitBinding.namedBridgeSha256 -or
+            [string]$shared.toolSha256 -cne
+                    [string]$toolkitBinding.sharedAcquisitionToolSha256) {
+            throw 'Named shared acquisition implementation binding is invalid.'
+        }
         if ((Get-ApprovedOwnerV2SourceArtifact `
                 -Observation $observation `
                 -Kind 'named-areequal-parser-module') -cne
@@ -417,6 +453,18 @@ function Read-ApprovedOwnerV2Evidence {
             parserManifest = $(if ($namedAreEqual) {
                 [IO.Path]::GetFullPath((Join-Path $RepoRoot `
                     'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1'))
+            } else { $null })
+            activePrIntake = $(if ($namedAreEqual) {
+                [IO.Path]::GetFullPath((Join-Path $RepoRoot `
+                    'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psm1'))
+            } else { $null })
+            namedBridge = $(if ($namedAreEqual) {
+                [IO.Path]::GetFullPath((Join-Path $RepoRoot `
+                    'src\DevPilot.NamedAreEqualBridge\DevPilot.NamedAreEqualBridge.psm1'))
+            } else { $null })
+            sharedAcquisitionTool = $(if ($namedAreEqual) {
+                [IO.Path]::GetFullPath((Join-Path $RepoRoot `
+                    'tools\Invoke-SharedReviewAcquisition.ps1'))
             } else { $null })
         }
         Toolkit = $toolkitBinding

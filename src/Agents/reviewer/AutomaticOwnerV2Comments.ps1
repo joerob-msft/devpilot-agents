@@ -254,6 +254,17 @@ function New-AutomaticOwnerV2ServicePolicy {
             [string]$Evidence.Toolkit.parserSha256
         $implementation['parserManifestSha256'] =
             [string]$Evidence.Toolkit.parserManifestSha256
+        foreach ($name in @(
+                'activePrIntakeSha256',
+                'activePrIntakeManifestSha256',
+                'namedBridgeSha256',
+                'namedBridgeManifestSha256',
+                'sharedAcquisitionToolSha256',
+                'namedCurrentPrToolSha256'
+            )) {
+            $implementation[$name] =
+                [string]$Evidence.Toolkit[$name]
+        }
     }
     return [ordered]@{
         schemaVersion = 1
@@ -360,7 +371,16 @@ function Assert-AutomaticOwnerV2ServicePolicy {
     if ($namedAreEqual) {
         $implementationDigests += @(
             [string]$Policy.implementation.parserSha256,
-            [string]$Policy.implementation.parserManifestSha256
+            [string]$Policy.implementation.parserManifestSha256,
+            [string]$Policy.implementation.activePrIntakeSha256,
+            [string]$Policy.implementation.
+                activePrIntakeManifestSha256,
+            [string]$Policy.implementation.namedBridgeSha256,
+            [string]$Policy.implementation.
+                namedBridgeManifestSha256,
+            [string]$Policy.implementation.
+                sharedAcquisitionToolSha256,
+            [string]$Policy.implementation.namedCurrentPrToolSha256
         )
     }
     foreach ($digest in $implementationDigests) {
@@ -379,6 +399,15 @@ function Assert-AutomaticOwnerV2ServicePolicy {
             Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.parser
         $currentManifest =
             Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.parserManifest
+        $currentActivePrIntake =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.activePrIntake
+        $currentNamedBridge =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.namedBridge
+        $currentSharedAcquisition =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.sharedAcquisitionTool
         if ($currentParser -cne
                 [string]$Evidence.Toolkit.parserSha256 -or
             $currentManifest -cne
@@ -386,8 +415,15 @@ function Assert-AutomaticOwnerV2ServicePolicy {
             $currentParser -cne
                 [string]$Policy.implementation.parserSha256 -or
             $currentManifest -cne
-                [string]$Policy.implementation.parserManifestSha256) {
-            throw 'Named AreEqual parser implementation changed.'
+                [string]$Policy.implementation.parserManifestSha256 -or
+            $currentActivePrIntake -cne
+                [string]$Policy.implementation.activePrIntakeSha256 -or
+            $currentNamedBridge -cne
+                [string]$Policy.implementation.namedBridgeSha256 -or
+            $currentSharedAcquisition -cne
+                [string]$Policy.implementation.
+                    sharedAcquisitionToolSha256) {
+            throw 'Named AreEqual acquisition or parser implementation changed.'
         }
     }
     $authority = $Policy.authority
@@ -598,6 +634,15 @@ function Assert-AutomaticOwnerV2EvidenceCurrent {
             Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.parser
         $bindings['parserManifestSha256'] =
             Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.parserManifest
+        $bindings['activePrIntakeSha256'] =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.activePrIntake
+        $bindings['namedBridgeSha256'] =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.namedBridge
+        $bindings['sharedAcquisitionToolSha256'] =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.sharedAcquisitionTool
     }
     foreach ($entry in $bindings.GetEnumerator()) {
         if ([string]$Intent.state[$entry.Key] -cne [string]$entry.Value) {
@@ -837,6 +882,7 @@ function Invoke-AutomaticOwnerV2Comments {
             $script:AutomaticNamedAreEqualRoot) {
         throw 'Named AreEqual requires its separate private delivery root.'
     }
+
     $lockPath = Join-Path $DeliveryRoot 'locks\delivery.lock'
     $lock = [IO.File]::Open(
         $lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite,
@@ -1123,6 +1169,15 @@ function Invoke-AutomaticOwnerV2Comments {
             $intentState['parserManifestSha256'] =
                 Get-ApprovedOwnerV2FileSha256 `
                     $Evidence.Paths.parserManifest
+            $intentState['activePrIntakeSha256'] =
+                Get-ApprovedOwnerV2FileSha256 `
+                    $Evidence.Paths.activePrIntake
+            $intentState['namedBridgeSha256'] =
+                Get-ApprovedOwnerV2FileSha256 `
+                    $Evidence.Paths.namedBridge
+            $intentState['sharedAcquisitionToolSha256'] =
+                Get-ApprovedOwnerV2FileSha256 `
+                    $Evidence.Paths.sharedAcquisitionTool
         }
         $intent = [ordered]@{
             schemaVersion = 1
@@ -1348,4 +1403,99 @@ function Invoke-AutomaticOwnerV2Comments {
         }
     }
     finally { $lock.Dispose() }
+}
+
+function Invoke-AutomaticNamedAreEqualBatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$Evidence,
+        [Parameter(Mandatory)][Collections.IDictionary]$Policy,
+        [Parameter(Mandatory)][string]$DeliveryRoot,
+        [Parameter(Mandatory)][byte[]]$Key,
+        [Parameter(Mandatory)][scriptblock]$Provider,
+        [ValidateRange(0, 2)][int]$MaximumCreates = 2
+    )
+    if ($Evidence.Count -lt 1 -or $Evidence.Count -gt 4) {
+        throw 'Named AreEqual batch requires one to four evidence records.'
+    }
+    $batchRunId = [guid]::NewGuid().ToString('N')
+    $remainingCreates = $MaximumCreates
+    $providerWrites = 0
+    $remainingWouldCreate = 0
+    $results = [Collections.Generic.List[object]]::new()
+    $events = [Collections.Generic.List[object]]::new()
+    $deferred = [Collections.Generic.List[object]]::new()
+    $health = 'healthy'
+    for ($index = 0; $index -lt $Evidence.Count; $index++) {
+        $item = $Evidence[$index]
+        $wouldCreate = @($item.Observation.findings |
+            Where-Object {
+                [string]$_.reconciliation.classification -ceq
+                    'wouldCreate'
+            }).Count
+        if ($remainingCreates -eq 0 -and $wouldCreate -gt 0) {
+            [void]$deferred.Add([ordered]@{
+                    identity = [string]$item.Identity
+                    reason = 'scheduled-run-create-budget-exhausted'
+                    remainingWouldCreate = $wouldCreate
+                })
+            $remainingWouldCreate += $wouldCreate
+            $health = 'partial'
+            continue
+        }
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $item -Policy $Policy `
+            -DeliveryRoot $DeliveryRoot -Key $Key `
+            -Provider $Provider -MaximumCreates $remainingCreates
+        if ([int]$result.providerWrites -lt 0 -or
+            [int]$result.providerWrites -gt $remainingCreates) {
+            throw 'Named AreEqual batch delivery exceeded its shared budget.'
+        }
+        $providerWrites += [int]$result.providerWrites
+        $remainingCreates -= [int]$result.providerWrites
+        $remainingWouldCreate +=
+            [int]$result.remainingWouldCreate
+        [void]$results.Add([ordered]@{
+                identity = [string]$item.Identity
+                result = $result
+            })
+        foreach ($event in @($result.events)) {
+            [void]$events.Add($event)
+        }
+        if ([string]$result.health -cin @('partial', 'refused')) {
+            $health = [string]$result.health
+            for ($remainingIndex = $index + 1;
+                $remainingIndex -lt $Evidence.Count;
+                $remainingIndex++) {
+                $remainingEvidence = $Evidence[$remainingIndex]
+                $remainingCount = @(
+                    $remainingEvidence.Observation.findings |
+                    Where-Object {
+                        [string]$_.reconciliation.classification -ceq
+                            'wouldCreate'
+                    }).Count
+                [void]$deferred.Add([ordered]@{
+                        identity =
+                            [string]$remainingEvidence.Identity
+                        reason = 'prior-batch-delivery-incomplete'
+                        remainingWouldCreate = $remainingCount
+                    })
+                $remainingWouldCreate += $remainingCount
+            }
+            break
+        }
+    }
+    return [pscustomobject][ordered]@{
+        schemaVersion = 1
+        kind = 'named-areequal-v2-automatic-delivery-batch-result'
+        batchRunId = $batchRunId
+        health = $health
+        providerWrites = $providerWrites
+        modelWrites = 0
+        remainingCreates = $remainingCreates
+        remainingWouldCreate = $remainingWouldCreate
+        results = $results.ToArray()
+        deferred = $deferred.ToArray()
+        events = $events.ToArray()
+    }
 }
